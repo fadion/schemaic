@@ -3783,15 +3783,25 @@ impl Change {
             // Narrow on purpose: a grant at a named database or table is scoped
             // to a thing the user typed, and saying so every time would train
             // the block to be ignored where it means something.
+            //
+            // SQL Server's whole-server level is the server itself — a login's
+            // `VIEW SERVER STATE` reaches every session, not every database —
+            // so the sentence names that reach instead.
             Change::GrantPrivileges(c)
                 if c.level.kind() == crate::users::GrantLevelKind::Global =>
             {
-                vec![format!(
-                    "Grants {} to {} on every database on this server — including \
-                     databases that do not exist yet, not just the one being browsed.",
-                    Self::privilege_words(&c.privileges),
-                    c.account.display()
-                )]
+                let privs = Self::privilege_words(&c.privileges);
+                let who = c.account.display();
+                vec![match dialect {
+                    SqlDialect::MsSql => format!(
+                        "Grants {privs} to {who} on the whole server — the instance \
+                         itself, not the database being browsed."
+                    ),
+                    SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => format!(
+                        "Grants {privs} to {who} on every database on this server — including \
+                         databases that do not exist yet, not just the one being browsed."
+                    ),
+                }]
             }
             _ => Vec::new(),
         }
@@ -11285,11 +11295,11 @@ fn account_change_supported(dialect: SqlDialect, change: &Change) -> bool {
     // shape-aware; this is the capability that knows the answer
     // (`users::levels_for`), and it was consulted only by the form's picker.
     match change {
-        // …and the grantee: a SQL Server login holds no database
-        // privilege (`users::supports_grant_to`).
+        // …asked of the grantee's levels, not only the engine's: a SQL
+        // Server login is granted at the server and nowhere else, and a
+        // database user everywhere but there (`users::levels_for_account`).
         Change::GrantPrivileges(c) | Change::RevokePrivileges(c) => {
-            crate::users::levels_for(dialect).contains(&c.level.kind())
-                && crate::users::supports_grant_to(dialect, &c.account)
+            crate::users::levels_for_account(dialect, &c.account).contains(&c.level.kind())
         }
         // A role's member the same way, and an admin option only where
         // the engine's membership has one.
@@ -27157,6 +27167,63 @@ mod database_tests {
         }
     }
 
+    /// **SQL Server's levels are the grantee's.** A login granted on a
+    /// database, or a user granted at the server, is Msg 15151 on the server,
+    /// so the plan withholds each; each kind's own level emits, and a login's
+    /// role is the server's.
+    #[test]
+    fn a_sql_server_grant_is_withheld_at_the_other_kinds_level() {
+        use crate::users::{GrantLevel, Principal, PrincipalKind, PrivilegeChange, RoleChange};
+        use SqlDialect::MsSql;
+        let who = |name: &str, kind| Principal {
+            name: name.into(),
+            host: None,
+            kind,
+            system: false,
+            attributes: Vec::new(),
+            role_ambiguous: false,
+            login: None,
+        };
+        let login = who("app", PrincipalKind::Login);
+        let user = who("app_u", PrincipalKind::User);
+        let grant = |account: &Principal, level: GrantLevel| {
+            Change::GrantPrivileges(Box::new(PrivilegeChange {
+                account: account.clone(),
+                level,
+                privileges: vec!["VIEW SERVER STATE".into()],
+                with_grant_option: false,
+            }))
+        };
+        for c in [
+            grant(&login, GrantLevel::Database("shop".into())),
+            grant(&user, GrantLevel::Global),
+        ] {
+            let cs = account("app", MsSql, c);
+            assert!(cs.emit().is_empty(), "{:?}", cs.emit());
+            assert_eq!(cs.unsupported().len(), 1);
+        }
+        let cs = account("app", MsSql, grant(&login, GrantLevel::Global));
+        assert!(cs.unsupported().is_empty());
+        assert_eq!(
+            cs.emit(),
+            ["EXEC master.sys.sp_executesql N'GRANT VIEW SERVER STATE TO [app]';"]
+        );
+        let cs = account(
+            "app",
+            MsSql,
+            Change::GrantRole(Box::new(RoleChange {
+                role: who("dbcreator", PrincipalKind::Role),
+                member: login,
+                with_admin_option: false,
+            })),
+        );
+        assert!(cs.unsupported().is_empty());
+        assert_eq!(
+            cs.emit(),
+            ["ALTER SERVER ROLE [dbcreator] ADD MEMBER [app];"]
+        );
+    }
+
     /// The list is written out rather than derived, so a new account change has
     /// to be added here on purpose — the same bargain
     /// `every_container_change_the_engine_accepts_emits_a_statement` makes.
@@ -27357,6 +27424,34 @@ mod database_tests {
             risks[0].contains("every database"),
             "the sentence names the scope: {risks:?}"
         );
+    }
+
+    /// **SQL Server's whole-server level is the server, not its databases.**
+    /// `VIEW SERVER STATE` reaches every session on the instance and no
+    /// database's rows, so MySQL's "every database … including ones that do
+    /// not exist yet" would name the wrong reach — while the grant is still
+    /// server-wide, which is what the sentence has to say.
+    #[test]
+    fn a_sql_server_server_grant_names_the_server_not_its_databases() {
+        let c = Box::new(crate::users::PrivilegeChange {
+            account: crate::users::Principal {
+                name: "app".into(),
+                host: None,
+                kind: crate::users::PrincipalKind::Login,
+                system: false,
+                attributes: Vec::new(),
+                role_ambiguous: false,
+                login: None,
+            },
+            level: crate::users::GrantLevel::Global,
+            privileges: vec!["VIEW SERVER STATE".into()],
+            with_grant_option: false,
+        });
+        let risks = account("app", SqlDialect::MsSql, Change::GrantPrivileges(c)).destructive();
+        assert_eq!(risks.len(), 1, "{risks:?}");
+        assert!(risks[0].contains("VIEW SERVER STATE"), "{risks:?}");
+        assert!(risks[0].contains("whole server"), "{risks:?}");
+        assert!(!risks[0].contains("every database"), "{risks:?}");
     }
 
     /// And the arm is **narrow** — a grant at a named level still carries none,

@@ -3196,6 +3196,69 @@ async fn a_login_and_its_user_are_created_granted_reset_and_dropped() {
         server.statements
     );
 
+    // The login's own half: a server permission and a server role, in one
+    // plan run from the scratch database — where T-SQL refuses a server
+    // grant unless it is sent to `master` — and taken back the same way.
+    let server_grant = PrivilegeChange {
+        account: login.clone(),
+        level: GrantLevel::Global,
+        privileges: vec!["VIEW SERVER STATE".into()],
+        with_grant_option: true,
+    };
+    let server_role = RoleChange {
+        role: schemaic_core::users::Principal {
+            name: "dbcreator".into(),
+            host: None,
+            kind: PrincipalKind::Role,
+            system: true,
+            attributes: Vec::new(),
+            role_ambiguous: false,
+            login: None,
+        },
+        member: login.clone(),
+        with_admin_option: false,
+    };
+    run(accounts(
+        &name,
+        MS,
+        vec![
+            Change::GrantPrivileges(Box::new(server_grant.clone())),
+            Change::GrantRole(Box::new(server_role.clone())),
+        ],
+    )
+    .emit())
+    .await;
+    let server = s.db.fetch_grants(None, &login).await.expect("the login's");
+    for want in [
+        format!("GRANT VIEW SERVER STATE TO {q} WITH GRANT OPTION;"),
+        format!("ALTER SERVER ROLE [dbcreator] ADD MEMBER {q};"),
+    ] {
+        assert!(
+            server.statements.contains(&want),
+            "{want}\n{:#?}",
+            server.statements
+        );
+    }
+    run(accounts(
+        &name,
+        MS,
+        vec![
+            Change::RevokePrivileges(Box::new(server_grant)),
+            Change::RevokeRole(Box::new(server_role)),
+        ],
+    )
+    .emit())
+    .await;
+    let server = s.db.fetch_grants(None, &login).await.expect("the login's");
+    assert!(
+        !server
+            .statements
+            .iter()
+            .any(|x| x.contains("VIEW SERVER STATE") || x.contains("dbcreator")),
+        "{:#?}",
+        server.statements
+    );
+
     // A reset on the user row is the login's password.
     run(account(
         &name,

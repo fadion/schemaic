@@ -312,13 +312,13 @@ pub(crate) fn open_for_grant(
     if door_read_only {
         return;
     }
-    // A SQL Server login holds no database privilege — its user does — so the
-    // door refuses one, as the browser's dimmed button already does.
+    // An account with no level to be granted at is refused at the door, as
+    // the browser's absent button already refuses it.
     if !schemaic_core::users::supports_grant_to(from.dialect, account) {
         return;
     }
     d.session.update(|g| *g += 1);
-    reset_then_seed(d, d.grant_draft, initial_grant_draft(from.dialect));
+    reset_then_seed(d, d.grant_draft, initial_grant_draft(from.dialect, account));
     d.grant.set(Some(GrantTarget {
         // **The browser's captured target, not the live connection.**
         // `UsersTarget`'s own doc states the rule in the imperative — *"the
@@ -369,10 +369,12 @@ pub(crate) fn open_for_grant(
 /// `GRANT … ON *.*`.
 ///
 /// Its own function so that coupling is one call and one test rather than a
-/// literal in an opener and an assumption in a view.
-pub(crate) fn initial_grant_draft(dialect: SqlDialect) -> GrantDraft {
+/// literal in an opener and an assumption in a view. It takes the account
+/// because the levels are the account's: a SQL Server login has only the
+/// whole server, and opens there.
+pub(crate) fn initial_grant_draft(dialect: SqlDialect, account: &Principal) -> GrantDraft {
     GrantDraft {
-        level: users::default_grant_level(dialect),
+        level: users::default_grant_level(dialect, account),
         ..Default::default()
     }
 }
@@ -1068,9 +1070,12 @@ fn grant_form(
     match seed.subject {
         GrantSubject::Role => {
             // The browser's own account list behind the field, filtered to the
-            // roles — a shortcut, not a constraint: a role made since the
-            // browser opened can still be typed.
+            // roles — or a SQL Server login's server roles, which the browser
+            // does not list (`users::role_suggestions`). A shortcut, not a
+            // constraint: a role made since the browser opened can still be
+            // typed.
             let roles = overlay.users_state;
+            let member = target.account.clone();
             rows.push(
                 form_setting(
                     "Role",
@@ -1080,13 +1085,10 @@ fn grant_form(
                         seed.role.clone(),
                         "role_name",
                         move || match roles.get_untracked() {
-                            crate::UsersState::Loaded(list) => list
-                                .list
-                                .iter()
-                                .filter(|p| p.kind == PrincipalKind::Role)
-                                .map(|p| p.name.clone())
-                                .collect(),
-                            _ => Vec::new(),
+                            crate::UsersState::Loaded(list) => {
+                                users::role_suggestions(dialect, &member, &list.list)
+                            }
+                            _ => users::role_suggestions(dialect, &member, &[]),
                         },
                         // Reachable, and the reason this note exists: MySQL,
                         // MariaDB and PostgreSQL all have roles and a great many
@@ -1116,7 +1118,7 @@ fn grant_form(
             }
         }
         GrantSubject::Privileges => {
-            let levels = users::levels_for(dialect);
+            let levels = users::levels_for_account(dialect, &target.account);
             // **The draft's level, with no fallback of its own** — see
             // `initial_grant_draft`. `None` here means an engine with no levels,
             // which cannot reach this form, and the rest of the section is gated
@@ -1502,6 +1504,18 @@ fn modal_shell(
 mod form_shape_tests {
     use super::*;
 
+    fn an_account(kind: PrincipalKind) -> Principal {
+        Principal {
+            name: "app".into(),
+            host: None,
+            kind,
+            system: false,
+            attributes: Vec::new(),
+            role_ambiguous: false,
+            login: None,
+        }
+    }
+
     /// Every text field the account form has. Typing in one must not change what
     /// the form is made of.
     #[test]
@@ -1590,13 +1604,36 @@ mod form_shape_tests {
     /// change.
     #[test]
     fn the_grant_form_opens_holding_a_level_wherever_the_engine_has_one() {
-        for d in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite] {
-            assert_eq!(
-                initial_grant_draft(d).level.is_some(),
-                !users::levels_for(d).is_empty(),
-                "{d:?}"
-            );
+        for d in [
+            SqlDialect::MySql,
+            SqlDialect::Postgres,
+            SqlDialect::Sqlite,
+            SqlDialect::MsSql,
+        ] {
+            for kind in [PrincipalKind::User, PrincipalKind::Login] {
+                let a = an_account(kind);
+                assert_eq!(
+                    initial_grant_draft(d, &a).level.is_some(),
+                    !users::levels_for_account(d, &a).is_empty(),
+                    "{d:?} {kind:?}"
+                );
+            }
         }
+    }
+
+    /// **A SQL Server login opens on the whole server** — its only level, and
+    /// one its picker lists — where its user opens on a database.
+    #[test]
+    fn a_sql_server_login_opens_on_the_server() {
+        let d = SqlDialect::MsSql;
+        let login = an_account(PrincipalKind::Login);
+        let level = initial_grant_draft(d, &login).level;
+        assert_eq!(level, Some(users::GrantLevelKind::Global));
+        assert!(users::levels_for_account(d, &login).contains(&level.unwrap()));
+        assert_eq!(
+            initial_grant_draft(d, &an_account(PrincipalKind::User)).level,
+            Some(users::GrantLevelKind::Database)
+        );
     }
 
     /// **And it is never the whole server.** The composition, not the capability
@@ -1607,14 +1644,15 @@ mod form_shape_tests {
     /// clicks.
     #[test]
     fn the_level_it_opens_on_is_never_the_whole_server() {
-        for d in [SqlDialect::MySql, SqlDialect::Postgres] {
+        let a = an_account(PrincipalKind::User);
+        for d in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::MsSql] {
             assert_eq!(
-                initial_grant_draft(d).level,
-                users::default_grant_level(d),
+                initial_grant_draft(d, &a).level,
+                users::default_grant_level(d, &a),
                 "{d:?}"
             );
             assert_ne!(
-                initial_grant_draft(d).level,
+                initial_grant_draft(d, &a).level,
                 Some(users::GrantLevelKind::Global),
                 "{d:?} opens the grant form at the widest scope it has"
             );
@@ -1622,7 +1660,7 @@ mod form_shape_tests {
         // The one that regressed: MySQL lists Global first, and the opener used
         // to take it.
         assert_eq!(
-            initial_grant_draft(SqlDialect::MySql).level,
+            initial_grant_draft(SqlDialect::MySql, &a).level,
             Some(users::GrantLevelKind::Database)
         );
     }
@@ -1662,7 +1700,12 @@ mod form_shape_tests {
     #[test]
     fn every_privilege_list_fits_its_tab_span() {
         use schemaic_core::users::{levels_for, privileges_for};
-        for d in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite] {
+        for d in [
+            SqlDialect::MySql,
+            SqlDialect::Postgres,
+            SqlDialect::Sqlite,
+            SqlDialect::MsSql,
+        ] {
             for kind in levels_for(d) {
                 let n = privileges_for(d, *kind).len() as u32;
                 assert!(
@@ -1698,7 +1741,7 @@ mod form_shape_tests {
         });
 
         for dialect in [SqlDialect::MySql, SqlDialect::Postgres] {
-            let seed = initial_grant_draft(dialect);
+            let seed = initial_grant_draft(dialect, &an_account(PrincipalKind::User));
             assert!(seed.level.is_some(), "{dialect:?}: the seed has a level");
             reset_then_seed(d, d.grant_draft, seed.clone());
             assert_eq!(

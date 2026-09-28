@@ -1092,9 +1092,10 @@ fn actions_row(
     };
     // Built from an iterator rather than a tuple because the middle button is
     // absent on a role — see `reset`.
-    // **Privileges is absent on a SQL Server login**, as Reset password is on
-    // a role: a login holds no database privilege — its user does — so there
-    // is nothing for a dimmed button to promise (`users::supports_grant_to`).
+    // **Privileges is absent on an account with no level to be granted at**,
+    // as Reset password is on a role — nothing for a dimmed button to promise
+    // (`users::supports_grant_to`). Every account answers yes today; a SQL
+    // Server login's form offers the server's level and its roles.
     let grant =
         schemaic_core::users::supports_grant_to(target.dialect, p).then(|| grant.into_any());
     let buttons: Vec<AnyView> = [grant, reset, Some(drop.into_any())]

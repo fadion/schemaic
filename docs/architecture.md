@@ -3425,9 +3425,11 @@ existing prose was left alone.
     hands SQL Server to `tsql_supports` before anything else, so an account arm further down was
     unreachable for the one engine that needed it, and `tsql_supports` asks the same function
     rather than a second copy of the answer. SQL Server also brought **the grantee** into it —
-    `GrantPrivileges`/`RevokePrivileges` ask `users::supports_grant_to` of the account and
-    `GrantRole`/`RevokeRole` of the member, since a login holds no database permission (Msg 15151)
-    — and **the admin option**, refused on a role grant where `users::supports_role_admin_option`
+    `GrantPrivileges`/`RevokePrivileges` ask `users::levels_for_account` whether the account holds
+    the change's level, where they asked `levels_for` of the engine and `supports_grant_to` of the
+    account, since a login holds only server permissions and a user only database ones, each the
+    other's Msg 15151 (`a_sql_server_grant_is_withheld_at_the_other_kinds_level`), and
+    `GrantRole`/`RevokeRole` ask `supports_grant_to` of the member — and **the admin option**, refused on a role grant where `users::supports_role_admin_option`
     says the engine's membership has none.
     `ChangeSet::account_statements` emits them at the **end** of the plan, called from `emit_mysql`
     and `emit_postgres` beside `container_drops`, and last in `emit_mssql` too — it first sat after
@@ -3474,7 +3476,14 @@ existing prose was left alone.
     every database on the server — including databases that do not exist yet, which is the half the
     sentence says out loud — and it showed an empty risk block two entries from a revoke of `SELECT`
     on one table that warned. It was also the shortest path through that screen, the form having
-    opened pre-set to that level (`users::default_grant_level` is the other half of the fix). The arm
+    opened pre-set to that level (`users::default_grant_level` is the other half of the fix). **The
+    sentence is per-dialect**, because the level is not one reach: on SQL Server `Global` is a
+    login's server permission (`VIEW SERVER STATE`), which reaches the instance rather than every
+    database's rows, so it reads "on the whole server — the instance itself, not the database being
+    browsed". MySQL's sentence there would tell every grant to a login — which opens on that level
+    — that it reached databases that do not exist yet, naming the wrong reach. It still
+    warns, since the grant is still server-wide
+    (`a_sql_server_server_grant_names_the_server_not_its_databases`). The arm
     is narrow on purpose: a grant at a named database or table is scoped to a thing the user typed,
     and warning every time would train the block to be ignored where it means something. So the risk
     block
@@ -5488,8 +5497,9 @@ existing prose was left alone.
     database's users and roles, each user carrying its login as an attribute as well; the server's
     own logins (`NT AUTHORITY\…`, `NT SERVICE\…`, `##…`) and the database's `dbo`, `guest`,
     `INFORMATION_SCHEMA`, `sys`, `public` and fixed roles are `system`, kept and sorted last as every
-    engine's are. Its roles are the **database's**; a login's server roles are an attribute and a
-    read-back, not something the forms grant. `account_kinds(dialect)` is the New account form's
+    engine's are. Its listed roles are the **database's**; a login's server roles are an attribute
+    on its row and a read-back, and the grant form's Role shortcut offers them from
+    `role_suggestions` rather than from the list (below). `account_kinds(dialect)` is the New account form's
     Kind list — `[Login, User, Role]` on SQL Server, a login first because a user is mapped to one,
     `[User, Role]` elsewhere — and `blank_account_draft` opens on its first entry, on SQL Server
     with `AccountDraft::also_user` set: a new login brings a same-named user in the browser's
@@ -5498,10 +5508,14 @@ existing prose was left alone.
     `AccountDraft::login` is a new user's `FOR LOGIN`, empty for `WITHOUT LOGIN`.
     `takes_password(dialect, kind)` answers where the password row belongs — the user on MySQL and
     PostgreSQL, the **login** on SQL Server — and `account_form_blocker` refuses a login with no
-    password, a login being a SQL login by its password. **`supports_grant_to` is false for a SQL
-    Server login**: `GRANT … TO` a login is Msg 15151, the login not being a principal of the
-    database at all, so database permissions and memberships go to its user; `core::ddl` asks it of
-    a grant's grantee and a role's member, and the browser withholds Privileges on a login row.
+    password, a login being a SQL login by its password. **Where an account can be granted is asked
+    of the account** (`levels_for_account`, below): a login is a principal of the server and of no
+    database, a user or role of its database and of no server, so `GRANT SELECT … TO` a login and
+    `GRANT VIEW SERVER STATE TO` a user are each Msg 15151 (measured on SQL Server 2022).
+    `supports_grant_to` is computed from it — any level at all — and answers yes for every account
+    today; it was a blanket no for a login while only database levels were offered, which is what
+    kept Privileges off a login row. `core::ddl` asks it of a role's member, and the browser of the
+    row.
     `account_sql` is the account as **executed** SQL names it (`SHOW GRANTS FOR 'app'@'%'`),
     and it is deliberately **not** a fifth identifier quoter: MySQL spells an account as two *string
     literals*, so it goes through the one literal quoter (`schema::ddl_string` → `export::sql_literal`,
@@ -5615,15 +5629,24 @@ existing prose was left alone.
     which arms an engine offers: MySQL has `Global` and no `Schema`/`Sequence`, and **PostgreSQL has
     no `Global` at all** — a statement about PostgreSQL rather than a gap, since its cluster-wide
     powers are role *attributes* (`SUPERUSER`, `CREATEDB`, `REPLICATION`) carried on the role and set
-    with `ALTER ROLE`, not privileges `GRANT` can express. SQL Server offers `Database`, `Schema`
-    and `Table` — a database user's three securables, written `DATABASE::[d]`, `SCHEMA::[s]` and
-    `OBJECT::[s].[t]` by `GrantLevel::object_sql` — and no `Global`: its server-level permissions
-    (`GRANT VIEW SERVER STATE TO login`) are a login's, and are **not offered yet**, which is
-    unfinished work rather than a statement about the engine. SQLite gets an empty list rather than a
+    with `ALTER ROLE`, not privileges `GRANT` can express. SQL Server offers `Global` — the server
+    itself — then `Database`, `Schema` and `Table`, a database user's three securables, written
+    `DATABASE::[d]`, `SCHEMA::[s]` and `OBJECT::[s].[t]` by `GrantLevel::object_sql`, which writes
+    *nothing* for the server level, so `privilege_sql` leaves out the `ON`: a server permission names
+    no securable (`GRANT VIEW SERVER STATE TO [app]`). **`levels_for_account` is the half an account
+    actually gets** — `[Global]` for a login, the other three for a user or role, `levels_for`
+    unchanged on every other engine — and the level picker and `ddl::account_change_supported` both
+    read it rather than `levels_for`, so the form cannot offer a level the plan's gate then refuses
+    (`a_login_is_granted_at_the_server_and_a_user_below_it`). What is still unfinished on SQL
+    Server's accounts is a contained database user's own password (`CREATE USER … WITH PASSWORD`,
+    `ALTER USER … WITH PASSWORD`), and Azure SQL Database — whose `master` takes no server-level
+    `GRANT` of this kind — is untested. SQLite gets an empty list rather than a
     panic, `supports_user_admin` being the gate that should have stopped the caller.
     **`default_grant_level` is the level a grant form opens on, and it is deliberately not
-    `levels_for(dialect).first()`** — the widest level that is *not* `Global`, and `None` only where
-    the engine grants at no level at all. The first-entry spelling is right on PostgreSQL by
+    `levels_for(dialect).first()`** — the widest of the *account's* levels (`levels_for_account`)
+    that is not `Global`, `Global` only where that is the account's one level (a SQL Server login,
+    which therefore opens on the whole server), and `None` only where the engine grants at no level
+    at all. The first-entry spelling is right on PostgreSQL by
     accident, its list starting at `Database` for the reason just given; MySQL's does start at
     `Global`, and that level takes **no name fields**, so the form opened already satisfied at the
     widest scope the server has and its shortest path was `GRANT … ON *.*` from two clicks — tick a
@@ -5641,24 +5664,43 @@ existing prose was left alone.
     composition by ticking every box and running the result through `pg_grant_statements`.
     SQL Server's three lists are curated the way MySQL's global one is — the everyday permissions on
     each securable, not T-SQL's forty-odd (`ALTER ANY …`, `IMPERSONATE`, `TAKE OWNERSHIP`), which
-    stay a statement away in the editor.
+    stay a statement away in the editor. Its server level's fourteen (`CONNECT SQL` … `CONTROL
+    SERVER`) are curated the same way and are all present since SQL Server 2014: 2022's `VIEW SERVER
+    PERFORMANCE STATE` family is left out because an older server refuses it by name, and the
+    availability-group, endpoint and event-session permissions and `SHUTDOWN` stay a statement away
+    with the rest.
     `PrivilegeChange` + `privilege_sql(change, dialect, revoke)` write the `GRANT`/`REVOKE` — one
     struct for both directions, since what a revoke takes away is exactly what a grant gives, and
     `WITH GRANT OPTION` is ignored on the revoke side rather than given a second field nobody sets.
     **A SQL Server revoke always carries `CASCADE`**: without it, taking back a permission granted
     `WITH GRANT OPTION` is Msg 4611 (measured), and the form cannot know how the grant it is revoking
     was made; on one granted without the option `CASCADE` is accepted and does what the plain revoke
-    would (`a_sql_server_revoke_cascades_so_a_grantable_permission_can_be_taken_back`).
+    would (`a_sql_server_revoke_cascades_so_a_grantable_permission_can_be_taken_back`). **And a SQL
+    Server server-level statement is sent to `master`** — `EXEC master.sys.sp_executesql N'GRANT
+    VIEW SERVER STATE TO [app]'`, the private `tsql_in_master` — because T-SQL grants a server
+    permission only when the current database is `master` (Msg 4621 from any other, measured), and
+    an account plan runs through `Db::run_ddl` in the browser's database. `master`'s own
+    `sp_executesql` runs that one statement there, inside the plan's transaction — a rollback undoes
+    it, measured — and hands the session back, so a later statement in the same plan still runs in
+    the browser's database. **A `USE master` would do neither**, and is the tidier-looking spelling a
+    future editor should not reach for (`a_server_permission_runs_in_master_and_names_no_securable`).
+    The read-back (`mssql_grant_statements`, class `SERVER`) still prints the plain `GRANT … TO
+    [login];`, the wrapper being how the statement has to be sent rather than what was granted.
     It returns `None` for an empty privilege list, because `GRANT ON db.*` is a syntax error: the
     backstop *under* the form's own Apply gate, not the gate. `RoleChange` + `role_sql` are the
     membership pair, and `AccountDraft` + `account_draft_sql` the `CREATE USER`/`CREATE ROLE` — a
     role takes no host and no password on either engine, and an empty password emits **no clause at
     all**, which is a real account on both (PostgreSQL's must authenticate some other way, MySQL's
     has simply not been given one yet). **SQL Server's arms are T-SQL's own shapes, not the other
-    engines' with the keywords swapped.** `role_sql` is `ALTER ROLE [r] ADD|DROP MEMBER [m]`, a membership there
+    engines' with the keywords swapped.** `role_sql` is `ALTER ROLE [r] ADD|DROP MEMBER [m]` — or
+    `ALTER SERVER ROLE` when the member is a `Login`, the member deciding because a login belongs to
+    no database role and a user to no server role (`a_login_joins_a_server_role`) — a membership there
     being a statement about the role rather than a grant of it, with no admin option — so
     `supports_role_admin_option` is false there, `core::ddl` refuses a role grant asking for one and
-    the grant form hides the toggle. `account_draft_sql` hands SQL Server to `tsql_account_draft_sql`:
+    the grant form hides the toggle. `role_suggestions` is that form's Role shortcut: the browser's
+    listed roles, or for a SQL Server login — whose roles the browser does not list — the eight fixed
+    server roles (`MSSQL_FIXED_SERVER_ROLES`), 2022's `##MS_…##` roles left out since an older server
+    refuses them by name; a user-defined server role can still be typed. `account_draft_sql` hands SQL Server to `tsql_account_draft_sql`:
     `CREATE LOGIN [n] WITH PASSWORD = N'…'`, `CREATE USER [n] FOR LOGIN [l]` or `WITHOUT LOGIN`, and
     `CREATE ROLE [n]`; `drop_account_sql` writes `DROP LOGIN` for a login. **The login's password
     travels as typed, as MySQL's does, and not in the hashed `WITH PASSWORD = 0x… HASHED` form**,
@@ -11103,7 +11145,9 @@ existing prose was left alone.
   `ChangeSet::emit` → `Db::run_ddl` path: one plan creates the login and its user, which are listed
   linked; the login signs in; a grantable schema grant and a `db_datareader` membership read back as
   the sentences that made them, and the login's own `GRANT CONNECT SQL`; the schema grant is revoked,
-  the revoke `CASCADE` makes possible; a reset on the **user** row
+  the revoke `CASCADE` makes possible; the login's `VIEW SERVER STATE` and its `dbcreator`
+  membership are granted and revoked in one plan each from the scratch database, the path that
+  needs `master`; a reset on the **user** row
   changes the login's password, the old one then refused; and the drops leave neither behind.
   `ScratchLogin` drops the login on the way out, a login being the server's and outliving the
   scratch database. Server Activity is the one
@@ -16193,9 +16237,11 @@ existing prose was left alone.
     button hands it the whole `Principal`: asking the row's `PrincipalKind` put the offer on a MySQL
     8 role, which publishes no `is_role` and is therefore labelled `User`, and 8.4.11 accepted the
     `ALTER USER` behind it — see `core::users` for the measurement and the fingerprint that now
-    withholds it. **Privileges is absent on a SQL Server login on the same terms**: a login holds no
-    database permission — its user does, and `GRANT … TO` a login is Msg 15151 — so the button asks
-    `users::supports_grant_to` and `account_editor::open_for_grant` refuses the door as well. A
+    withholds it. **Privileges asks `users::supports_grant_to` on the same terms**, and
+    `account_editor::open_for_grant` refuses the door on the same answer. It was absent on a SQL
+    Server login while only database levels were offered — `GRANT … TO` a login at one is Msg 15151
+    — and is offered there now that the server level is, the answer being computed from
+    `levels_for_account` rather than kept as a list of exceptions. A
     login row wears `icons::KEY_ROUND` where a user wears `USER` and a role `USERS`, the key its
     users sign in with; a user mapped to a login of another name reads `name ← login`
     (`Principal::display`), so the link is on the row itself.
@@ -17454,14 +17500,16 @@ existing prose was left alone.
     `PrivilegeChange` and `ddl::grant_change` read and that their tests pin, and the free
     `action_label(bool) -> &'static str` gives it its two words. An enum invented for the form would
     be a second spelling of the same fact sitting one conversion away from the tested one.
-    It opens pre-picked to the widest level **below the whole server** (`users::default_grant_level`),
-    so the name fields mean something before the user has noticed the picker — it read
+    It opens pre-picked to the widest level **below the whole server** (`users::default_grant_level`,
+    asked of the account — a SQL Server login, whose one level is the server, opens there:
+    `a_sql_server_login_opens_on_the_server`), and its Level picker lists
+    `users::levels_for_account`, so a login is offered only the server and a user never is. So the name fields mean something before the user has noticed the picker — it read
     `levels_for(dialect).first()` until that argument turned out to be true on PostgreSQL and false
     on MySQL, whose list starts at `Global`, a level with no name fields to mean anything: the form
     opened already satisfied at server scope and two clicks emitted `GRANT … ON *.*`. And **changing
     the level clears the ticked privileges**: kept,
     they would carry `EVENT` down to a table level that has no such privilege and emit a statement
-    the server refuses. That pre-picking is `initial_grant_draft(dialect)`, its own function beside
+    the server refuses. That pre-picking is `initial_grant_draft(dialect, account)`, its own function beside
     the openers rather than a literal inside `open_for_grant`, because the **Level row exists only
     when the draft holds a level** — `if let Some(current) = seed.level`, and no row at all when it
     is `None`, since a dropdown with nothing in it is a worse answer than no row. **The row has no
@@ -17518,8 +17566,10 @@ existing prose was left alone.
     the statement about to be previewed would carry the clause. "With admin option" is absent where
     `users::supports_role_admin_option` says the engine's membership has none — SQL Server's
     `ALTER ROLE … ADD MEMBER` — and `core::ddl` refuses a role grant carrying one there regardless.
-    `open_for_grant` refuses a SQL Server **login** (`users::supports_grant_to`) beside its read-only
-    refusal, the browser having withheld Privileges on the row already.
+    `open_for_grant` asks `users::supports_grant_to` beside its read-only refusal — every account
+    passes it today, a SQL Server login included now that the server level exists. The Role field's
+    shortcut is `users::role_suggestions`: a login's server roles are not in the browser's list, so a
+    SQL Server login is offered the fixed server roles instead.
   - `ai_panel.rs` — AI Assistant panel (`ai_panel`/`message_bubble`/`render_segments`/`tool_chip`/
     `assistant_footer`). The two roles are drawn **asymmetrically**, and deliberately: the user's
     question is a shrink-wrapped right-aligned bubble on `bubble_user_bg`, while the assistant's turn

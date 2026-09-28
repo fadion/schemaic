@@ -1125,7 +1125,9 @@ pub fn redact_secrets(stmt: &str, dialect: SqlDialect) -> String {
 /// [`privileges_for`]. Nothing here is a `dialect ==` at a call site.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GrantLevel {
-    /// Every database on the server — MySQL's `*.*`.
+    /// Every database on the server — MySQL's `*.*` — or **the server itself**
+    /// on SQL Server, where a permission like `VIEW SERVER STATE` names no
+    /// securable at all and is a *login's* ([`levels_for_account`]).
     ///
     /// **PostgreSQL has no such level**, and this is a statement about
     /// PostgreSQL rather than a gap: its cluster-wide powers are *role
@@ -1182,7 +1184,8 @@ impl GrantLevel {
     }
 
     /// Everything after `ON`, already quoted — including PostgreSQL's object
-    /// keyword, which MySQL does not use.
+    /// keyword, which MySQL does not use — or empty where the grant names no
+    /// securable and so has no `ON` at all: SQL Server's server level.
     ///
     /// This is SQL that will be **executed**, so names go through
     /// [`crate::export::ident_sql`] and its unconditional quoting rather than
@@ -1190,7 +1193,10 @@ impl GrantLevel {
     fn object_sql(&self, dialect: SqlDialect) -> String {
         let q = |n: &str| crate::export::ident_sql(n, dialect);
         match self {
-            GrantLevel::Global => "*.*".to_string(),
+            GrantLevel::Global => match dialect {
+                SqlDialect::MsSql => String::new(),
+                SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => "*.*".to_string(),
+            },
             // **Every dialect named**, not `_ =>`. This is the file's only
             // dialect match, and a catch-all here answers for an engine nobody
             // has looked at: SQLite reaches this today only through a caller
@@ -1248,9 +1254,11 @@ pub fn levels_for(dialect: SqlDialect) -> &'static [GrantLevelKind] {
             GrantLevelKind::Table,
             GrantLevelKind::Sequence,
         ],
-        // A database user's three securables below the server. The server's own
-        // (`GRANT VIEW SERVER STATE TO login`) is a login's, and not offered yet.
+        // The server, which is a login's, and a database user's three
+        // securables below it — which account gets which is
+        // `levels_for_account`.
         SqlDialect::MsSql => &[
+            GrantLevelKind::Global,
             GrantLevelKind::Database,
             GrantLevelKind::Schema,
             GrantLevelKind::Table,
@@ -1262,8 +1270,34 @@ pub fn levels_for(dialect: SqlDialect) -> &'static [GrantLevelKind] {
     }
 }
 
-/// The level a grant form opens on — **the widest one that is not the whole
-/// server**, and `None` only where the engine grants at no level at all.
+/// The levels `p` can be granted at on `dialect` — [`levels_for`], narrowed
+/// by the account where the engine's accounts are not all granted alike.
+///
+/// **SQL Server splits them by kind.** A login is a principal of the server
+/// and of no database, so `GRANT SELECT … TO login` is Msg 15151; a database
+/// user or role is a principal of its database and of no server, so
+/// `GRANT VIEW SERVER STATE TO user` is Msg 15151 the other way. Each gets its
+/// own half of the engine's list, and the grant form and the plan's gate
+/// (`ddl::account_change_supported`) both read this, so neither can offer
+/// the other's half.
+pub fn levels_for_account(dialect: SqlDialect, p: &Principal) -> &'static [GrantLevelKind] {
+    match dialect {
+        SqlDialect::MsSql => match p.kind {
+            PrincipalKind::Login => &[GrantLevelKind::Global],
+            PrincipalKind::User | PrincipalKind::Role => &[
+                GrantLevelKind::Database,
+                GrantLevelKind::Schema,
+                GrantLevelKind::Table,
+            ],
+        },
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => levels_for(dialect),
+    }
+}
+
+/// The level a grant form for `account` opens on — **the widest one that is
+/// not the whole server**, the whole server only where the account has no
+/// narrower level (a SQL Server login, [`levels_for_account`]), and `None`
+/// only where the engine grants at no level at all.
 ///
 /// A capability rather than `levels_for(dialect).first()`, which is what the
 /// opener used to read. That spelling is right on PostgreSQL by accident:
@@ -1276,11 +1310,13 @@ pub fn levels_for(dialect: SqlDialect) -> &'static [GrantLevelKind] {
 /// Stated here so the answer is one the engine gives rather than one its list
 /// order gives, and so a fourth dialect inherits it by saying what it grants at
 /// rather than by the position of an entry.
-pub fn default_grant_level(dialect: SqlDialect) -> Option<GrantLevelKind> {
-    levels_for(dialect)
+pub fn default_grant_level(dialect: SqlDialect, account: &Principal) -> Option<GrantLevelKind> {
+    let levels = levels_for_account(dialect, account);
+    levels
         .iter()
         .copied()
         .find(|k| *k != GrantLevelKind::Global)
+        .or_else(|| levels.first().copied())
 }
 
 /// Every privilege `dialect` accepts at `level`, in the order its own
@@ -1339,6 +1375,28 @@ pub fn privileges_for(dialect: SqlDialect, level: GrantLevelKind) -> &'static [&
         (SqlDialect::Postgres, GrantLevelKind::Schema) => PgObjectKind::Schema.all_privileges(),
         (SqlDialect::Postgres, GrantLevelKind::Table) => PgObjectKind::Table.all_privileges(),
         (SqlDialect::Postgres, GrantLevelKind::Sequence) => PgObjectKind::Sequence.all_privileges(),
+        // A login's server permissions — the ones a DBA hands a monitoring,
+        // deployment or support login, every one present since SQL Server
+        // 2014. Not the ~50 of `sys.fn_builtin_permissions('SERVER')`:
+        // availability groups, endpoints, event sessions, `SHUTDOWN` and
+        // 2022's `VIEW SERVER PERFORMANCE STATE` family (which an older
+        // server refuses by name) stay a statement away.
+        (SqlDialect::MsSql, GrantLevelKind::Global) => &[
+            "CONNECT SQL",
+            "CONNECT ANY DATABASE",
+            "VIEW ANY DATABASE",
+            "VIEW ANY DEFINITION",
+            "VIEW SERVER STATE",
+            "SELECT ALL USER SECURABLES",
+            "ALTER TRACE",
+            "ADMINISTER BULK OPERATIONS",
+            "CREATE ANY DATABASE",
+            "ALTER ANY DATABASE",
+            "ALTER ANY LOGIN",
+            "ALTER ANY CONNECTION",
+            "IMPERSONATE ANY LOGIN",
+            "CONTROL SERVER",
+        ],
         // The permissions a database user is granted on each securable — the
         // everyday ones, not T-SQL's whole list of ~40 (`ALTER ANY …`,
         // `IMPERSONATE`, `TAKE OWNERSHIP`), which stay a statement away.
@@ -1417,8 +1475,13 @@ pub fn privilege_sql(c: &PrivilegeChange, dialect: SqlDialect, revoke: bool) -> 
     }
     let list = c.privileges.join(", ");
     let object = c.level.object_sql(dialect);
+    let on = if object.is_empty() {
+        String::new()
+    } else {
+        format!(" ON {object}")
+    };
     let account = account_sql(&c.account, dialect);
-    Some(if revoke {
+    let sql = if revoke {
         // T-SQL refuses to take back a permission granted `WITH GRANT OPTION`
         // without `CASCADE` (Msg 4611), and the form cannot know how the grant
         // was made; on one granted without it, `CASCADE` changes nothing.
@@ -1426,14 +1489,32 @@ pub fn privilege_sql(c: &PrivilegeChange, dialect: SqlDialect, revoke: bool) -> 
             SqlDialect::MsSql => " CASCADE",
             SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => "",
         };
-        format!("REVOKE {list} ON {object} FROM {account}{cascade}")
+        format!("REVOKE {list}{on} FROM {account}{cascade}")
     } else {
-        let mut sql = format!("GRANT {list} ON {object} TO {account}");
+        let mut sql = format!("GRANT {list}{on} TO {account}");
         if c.with_grant_option {
             sql.push_str(" WITH GRANT OPTION");
         }
         sql
+    };
+    Some(match (dialect, &c.level) {
+        (SqlDialect::MsSql, GrantLevel::Global) => tsql_in_master(&sql),
+        _ => sql,
     })
+}
+
+/// `sql` run in `master`, for that one statement: T-SQL grants a server
+/// permission only from there (Msg 4621 from any other database, measured on
+/// 2022), and the account plan runs in the browser's. `master`'s own
+/// `sp_executesql` runs in `master`'s context and hands the session back
+/// where it was, inside the plan's transaction — so a rollback still undoes
+/// it and a later statement in the same plan still runs where it expects.
+/// A `USE master` would do neither.
+fn tsql_in_master(sql: &str) -> String {
+    format!(
+        "EXEC master.sys.sp_executesql {}",
+        crate::schema::ddl_string(sql, SqlDialect::MsSql)
+    )
 }
 
 /// What the grant form is about.
@@ -1607,11 +1688,16 @@ pub fn role_sql(c: &RoleChange, dialect: SqlDialect, revoke: bool) -> String {
     let role = account_sql(&c.role, dialect);
     let member = account_sql(&c.member, dialect);
     // T-SQL's membership is a statement about the role, not a grant of it —
-    // and has no admin option (`supports_role_admin_option`).
+    // and has no admin option (`supports_role_admin_option`). A login's roles
+    // are the server's and a user's the database's, so the member says which.
     match dialect {
         SqlDialect::MsSql => {
             let verb = if revoke { "DROP" } else { "ADD" };
-            return format!("ALTER ROLE {role} {verb} MEMBER {member}");
+            let noun = match c.member.kind {
+                PrincipalKind::Login => "SERVER ROLE",
+                PrincipalKind::User | PrincipalKind::Role => "ROLE",
+            };
+            return format!("ALTER {noun} {role} {verb} MEMBER {member}");
         }
         SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => {}
     }
@@ -2126,15 +2212,55 @@ pub fn companion_user_draft(d: &AccountDraft, dialect: SqlDialect) -> Option<Acc
     })
 }
 
-/// Can database privileges and role memberships be granted to `p` here?
-/// Everywhere but to a **SQL Server login**, whose database access is the user
-/// mapped to it — `GRANT SELECT … TO login` is Msg 15151 there, since the
-/// login is not a principal of the database at all.
+/// Can privileges and role memberships be granted to `p` here — is there any
+/// level it can be granted at ([`levels_for_account`])?
+///
+/// **Computed, not a constant**, although every account on every engine with
+/// accounts answers yes today: a SQL Server login once answered no, while
+/// only database levels were offered, and the answer moved with the levels
+/// rather than with a second list of exceptions.
 pub fn supports_grant_to(dialect: SqlDialect, p: &Principal) -> bool {
-    match dialect {
-        SqlDialect::MsSql => p.kind != PrincipalKind::Login,
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => true,
+    !levels_for_account(dialect, p).is_empty()
+}
+
+/// SQL Server's fixed server roles, the ones every edition has — 2022's
+/// `##MS_…##` roles are left out, since an older server refuses them by name,
+/// and like a user-defined server role can still be typed.
+const MSSQL_FIXED_SERVER_ROLES: &[&str] = &[
+    "sysadmin",
+    "serveradmin",
+    "securityadmin",
+    "processadmin",
+    "setupadmin",
+    "bulkadmin",
+    "diskadmin",
+    "dbcreator",
+];
+
+/// The roles the grant form's Role field offers as a shortcut for `account`,
+/// out of the browser's `listed` accounts: its roles — or, for a SQL Server
+/// login, whose roles are the server's and which the browser does not list,
+/// the fixed server roles.
+pub fn role_suggestions(
+    dialect: SqlDialect,
+    account: &Principal,
+    listed: &[Principal],
+) -> Vec<String> {
+    let server_roles = match dialect {
+        SqlDialect::MsSql => account.kind == PrincipalKind::Login,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+    };
+    if server_roles {
+        return MSSQL_FIXED_SERVER_ROLES
+            .iter()
+            .map(|r| r.to_string())
+            .collect();
     }
+    listed
+        .iter()
+        .filter(|p| p.kind == PrincipalKind::Role)
+        .map(|p| p.name.clone())
+        .collect()
 }
 
 /// Does a role grant have an admin option (`WITH ADMIN OPTION`)? Not on SQL
@@ -3160,14 +3286,21 @@ mod tests {
         assert!(levels_for(SqlDialect::Sqlite).is_empty());
     }
 
-    /// **The level a grant form opens on is never the whole server.** Asked as
-    /// a capability, so an engine whose `levels_for` list happens to start at
-    /// its widest entry does not decide it by list order.
+    /// **The level a grant form opens on is never the whole server** for an
+    /// account with a narrower one. Asked as a capability, so an engine whose
+    /// `levels_for` list happens to start at its widest entry does not decide
+    /// it by list order. (A SQL Server login has no narrower one, and is
+    /// `a_login_is_granted_at_the_server_and_a_user_below_it`.)
     #[test]
     fn no_engine_opens_a_grant_on_the_whole_server() {
-        for d in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite] {
+        for d in [
+            SqlDialect::MySql,
+            SqlDialect::Postgres,
+            SqlDialect::Sqlite,
+            SqlDialect::MsSql,
+        ] {
             assert_ne!(
-                default_grant_level(d),
+                default_grant_level(d, &my_account()),
                 Some(GrantLevelKind::Global),
                 "{d:?} opens a grant form at the widest scope it has"
             );
@@ -3179,24 +3312,32 @@ mod tests {
     /// whether to show its Level row.
     #[test]
     fn the_level_a_grant_opens_on_is_one_the_picker_lists() {
-        for d in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite] {
-            match default_grant_level(d) {
-                Some(k) => assert!(levels_for(d).contains(&k), "{d:?} offers no {k:?}"),
+        let a = my_account();
+        for d in [
+            SqlDialect::MySql,
+            SqlDialect::Postgres,
+            SqlDialect::Sqlite,
+            SqlDialect::MsSql,
+        ] {
+            match default_grant_level(d, &a) {
+                Some(k) => assert!(
+                    levels_for_account(d, &a).contains(&k),
+                    "{d:?} offers no {k:?}"
+                ),
                 None => assert!(
-                    levels_for(d).is_empty(),
+                    levels_for_account(d, &a).is_empty(),
                     "{d:?} has levels but opens on none"
                 ),
             }
         }
-        // The two the form is reachable on both land on a named database.
-        assert_eq!(
-            default_grant_level(SqlDialect::MySql),
-            Some(GrantLevelKind::Database)
-        );
-        assert_eq!(
-            default_grant_level(SqlDialect::Postgres),
-            Some(GrantLevelKind::Database)
-        );
+        // The ones the form is reachable on all land on a named database.
+        for d in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::MsSql] {
+            assert_eq!(
+                default_grant_level(d, &a),
+                Some(GrantLevelKind::Database),
+                "{d:?}"
+            );
+        }
     }
 
     /// Every level an engine offers has something to grant at it — a picker
@@ -4272,18 +4413,18 @@ mod mssql_tests {
     }
 
     #[test]
-    fn sql_server_has_accounts_at_three_levels() {
+    fn sql_server_has_accounts_at_four_levels() {
         assert!(supports_users(MS) && supports_user_admin(MS));
         assert_eq!(
             levels_for(MS),
             [
+                GrantLevelKind::Global,
                 GrantLevelKind::Database,
                 GrantLevelKind::Schema,
                 GrantLevelKind::Table
             ]
         );
-        assert_eq!(default_grant_level(MS), Some(GrantLevelKind::Database));
-        for k in levels_for(MS) {
+        for k in levels_for_account(MS, &user("u", None)) {
             let privs = privileges_for(MS, *k);
             assert!(
                 privs.contains(&"SELECT") && privs.contains(&"CONTROL"),
@@ -4461,8 +4602,6 @@ mod mssql_tests {
             .as_deref(),
             Some("GRANT SELECT, INSERT ON DATABASE::[shop] TO [app_u] WITH GRANT OPTION")
         );
-        assert!(supports_grant_to(MS, &u));
-        assert!(!supports_grant_to(MS, &login("app")));
         assert!(supports_grant_to(SqlDialect::MySql, &user("x", None)));
         let r = RoleChange {
             role: Principal {
@@ -4482,6 +4621,112 @@ mod mssql_tests {
         );
         assert!(!supports_role_admin_option(MS));
         assert!(supports_role_admin_option(SqlDialect::Postgres));
+    }
+
+    /// **A login is granted at the server, and only there**; its database
+    /// access is the user mapped to it, granted below. So the levels a form
+    /// offers are the account's, not just the engine's, and the level it opens
+    /// on is the whole server exactly where there is no narrower one.
+    #[test]
+    fn a_login_is_granted_at_the_server_and_a_user_below_it() {
+        let l = login("app");
+        let u = user("app_u", Some("app"));
+        assert_eq!(levels_for_account(MS, &l), [GrantLevelKind::Global]);
+        assert_eq!(
+            levels_for_account(MS, &u),
+            [
+                GrantLevelKind::Database,
+                GrantLevelKind::Schema,
+                GrantLevelKind::Table
+            ]
+        );
+        for p in [&l, &u] {
+            for k in levels_for_account(MS, p) {
+                assert!(levels_for(MS).contains(k), "{k:?} is not the engine's");
+            }
+            assert!(supports_grant_to(MS, p), "{:?}", p.kind);
+        }
+        assert_eq!(default_grant_level(MS, &l), Some(GrantLevelKind::Global));
+        assert_eq!(default_grant_level(MS, &u), Some(GrantLevelKind::Database));
+        let privs = privileges_for(MS, GrantLevelKind::Global);
+        assert!(privs.contains(&"VIEW SERVER STATE"), "{privs:?}");
+        assert!(
+            !privs.contains(&"SELECT"),
+            "a database permission: {privs:?}"
+        );
+    }
+
+    /// **A server permission names no securable and runs in `master`** — the
+    /// one database T-SQL grants one from (Msg 4621 elsewhere, measured on
+    /// 2022). `master`'s own `sp_executesql` runs it there for that statement
+    /// alone, inside the plan's transaction, and leaves the session where it
+    /// was, so the rest of the plan still runs in the browser's database.
+    #[test]
+    fn a_server_permission_runs_in_master_and_names_no_securable() {
+        let c = PrivilegeChange {
+            account: login("o'brien"),
+            level: GrantLevel::Global,
+            privileges: vec!["VIEW SERVER STATE".into(), "ALTER TRACE".into()],
+            with_grant_option: true,
+        };
+        assert_eq!(
+            privilege_sql(&c, MS, false).as_deref(),
+            Some(
+                "EXEC master.sys.sp_executesql N'GRANT VIEW SERVER STATE, ALTER TRACE \
+                 TO [o''brien] WITH GRANT OPTION'"
+            )
+        );
+        assert_eq!(
+            privilege_sql(&c, MS, true).as_deref(),
+            Some(
+                "EXEC master.sys.sp_executesql N'REVOKE VIEW SERVER STATE, ALTER TRACE \
+                 FROM [o''brien] CASCADE'"
+            )
+        );
+    }
+
+    /// **A login's roles are the server's**: its membership is `ALTER SERVER
+    /// ROLE`, where a database user's is `ALTER ROLE` — the member says which,
+    /// since a login belongs to no database role and a user to no server one.
+    /// The form's shortcut lists the fixed server roles for a login and the
+    /// browser's database roles for anyone else.
+    #[test]
+    fn a_login_joins_a_server_role() {
+        let r = RoleChange {
+            role: Principal {
+                kind: PrincipalKind::Role,
+                ..login("dbcreator")
+            },
+            member: login("app"),
+            with_admin_option: false,
+        };
+        assert_eq!(
+            role_sql(&r, MS, false),
+            "ALTER SERVER ROLE [dbcreator] ADD MEMBER [app]"
+        );
+        assert_eq!(
+            role_sql(&r, MS, true),
+            "ALTER SERVER ROLE [dbcreator] DROP MEMBER [app]"
+        );
+        // The browser's listing: a login, a user and a database role.
+        let listed = [
+            login("app"),
+            user("app_u", Some("app")),
+            Principal {
+                kind: PrincipalKind::Role,
+                ..login("readers")
+            },
+        ];
+        let for_login = role_suggestions(MS, &login("app"), &listed);
+        assert!(
+            for_login.iter().any(|r| r == "sysadmin") && for_login.iter().any(|r| r == "dbcreator"),
+            "{for_login:?}"
+        );
+        assert!(!for_login.iter().any(|r| r == "readers"), "{for_login:?}");
+        assert_eq!(
+            role_suggestions(MS, &user("app_u", Some("app")), &listed),
+            ["readers"]
+        );
     }
 
     /// **A revoke carries `CASCADE` on SQL Server**, whatever the grant was.
