@@ -12448,13 +12448,14 @@ fn footer(ui: Ui) -> impl IntoView {
     let tx_mode = create_memo(move |_| active_tab().map(|t| t.tx_mode.get()).unwrap_or_default());
     let tx_state = create_memo(move |_| active_tab().map(|t| t.tx.get()).unwrap_or_default());
 
-    // Does the active tab's engine have a manual-transaction mode at all?
+    // Does the active tab's connection have a manual-transaction mode at all?
     //
-    // Not SQLite's or SQL Server's yet — `schemaic_core::tx::supports_manual_mode`
-    // says why for each. The segment is hidden rather than left clickable: a
-    // control that reports an error every time it is pressed is worse than one
-    // that isn't there, and the cluster below it (the pill, Commit, Rollback)
-    // only ever appears while a transaction is open, which can't happen here.
+    // Not SQLite's, nor a read-only SQL Server connection's —
+    // `schemaic_core::tx::offers_manual_mode` says why for each. The segment is
+    // hidden rather than left clickable: a control that reports an error every
+    // time it is pressed is worse than one that isn't there, and the cluster
+    // below it (the pill, Commit, Rollback) only ever appears while a
+    // transaction is open, which can't happen here.
     let conns_for_tx = ui.conn.connections;
     let manual_supported = create_memo(move |_| {
         let Some(tab) = active_tab() else { return true };
@@ -12463,8 +12464,9 @@ fn footer(ui: Ui) -> impl IntoView {
             cs.iter()
                 .find(|c| c.id == cid)
                 .map(|c| {
-                    schemaic_core::tx::supports_manual_mode(
+                    schemaic_core::tx::offers_manual_mode(
                         schemaic_core::intel::SqlDialect::from_db_type(&c.db_type),
+                        c.read_only,
                     )
                 })
                 // An unknown connection keeps the segment: hiding chrome on a

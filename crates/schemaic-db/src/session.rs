@@ -81,8 +81,35 @@ impl<T> Outcome<T> {
 }
 
 enum Backend {
-    MySql { conn: Conn, conn_id: u32 },
-    Postgres { client: Client },
+    MySql {
+        conn: Conn,
+        conn_id: u32,
+    },
+    Postgres {
+        client: Client,
+    },
+    /// Boxed: tiberius keeps its buffers inline, ten times the others' size.
+    MsSql {
+        client: Box<crate::mssql::MsClient>,
+    },
+}
+
+/// The three transaction statements the session issues itself, spelled per
+/// engine by [`Session::control_on`].
+#[derive(Clone, Copy)]
+enum Ctl {
+    Begin,
+    Commit,
+    Rollback,
+}
+
+/// The three steps of a savepoint the session puts around a write or a read,
+/// spelled per engine by [`Session::run_scope_sql`].
+#[derive(Clone, Copy)]
+enum ScopeStep {
+    Begin,
+    Release,
+    Undo,
 }
 
 /// One pinned connection, owned by one query tab in Manual mode.
@@ -244,17 +271,36 @@ impl Session {
                         .to_string(),
                 ));
             }
-            // **Not yet on SQL Server, and that one is unfinished work**: the
-            // pinned connection is a `tiberius::Client` behind this mutex like
-            // the other two, and it is simply not written. Refused for the same
-            // reason SQLite's is — a Manual tab that quietly auto-committed
-            // would break the one promise the mode makes.
+            // **SQL Server holds no read-only transaction**, so a read-only
+            // connection is refused a pinned session rather than given an
+            // unguarded one. Its fresh-connection guard is a transaction that
+            // is never committed (`mssql::fetch_query`), which cannot outlive
+            // one statement here: a Manual tab's `COMMIT` — typed, or the
+            // button — would commit whatever a hidden write had done. A
+            // read-only connection has nothing to commit, so Auto mode, where
+            // every statement is rolled back, loses it nothing.
             Engine::MsSql => {
-                return Err(DbError::Refused(
-                    "SQL Server connections don't support manual transaction mode yet — \
-                     statements run and commit as they are sent"
-                        .to_string(),
-                ));
+                if enforce == Some(crate::Enforce::ReadOnly) {
+                    return Err(DbError::Refused(
+                        "A read-only SQL Server connection runs in Auto mode: SQL Server \
+                         has no read-only transaction to hold a Manual tab in, and each \
+                         statement Auto mode runs is rolled back"
+                            .to_string(),
+                    ));
+                }
+                // `AsJudged` needs nothing, for the reason `mssql::fetch_query`
+                // gives. `XACT_ABORT` is left at its default, off: a failed
+                // statement leaves the transaction open and usable, which is
+                // what SQL Server's own tools do, and what `tx::TxEngine::MsSql`
+                // folds.
+                let mut client = crate::mssql::connect(db, database).await?;
+                let spid = crate::mssql::spid(&mut client).await;
+                (
+                    Backend::MsSql {
+                        client: Box::new(client),
+                    },
+                    spid,
+                )
             }
         };
         Ok(Arc::new(Session {
@@ -286,22 +332,41 @@ impl Session {
 
     /// Run a bare control statement (`BEGIN` / `COMMIT` / `ROLLBACK`) on the
     /// pinned connection.
-    async fn control(&self, sql: &str) -> Result<(), DbError> {
+    async fn control(&self, ctl: Ctl) -> Result<(), DbError> {
         let mut guard = self.inner.lock().await;
-        Session::control_on(&mut guard, sql).await
+        Session::control_on(&mut guard, ctl).await
     }
 
     /// The body of [`Session::control`], for callers already holding the lock.
-    async fn control_on(guard: &mut Backend, sql: &str) -> Result<(), DbError> {
+    ///
+    /// **T-SQL spells all three its own way.** A bare `BEGIN` opens a block
+    /// there, not a transaction; `COMMIT` inside nested `BEGIN TRAN`s only
+    /// lowers `@@TRANCOUNT`, so the button commits every level the tab opened;
+    /// and a `ROLLBACK` with nothing open is an error (Msg 3903) rather than a
+    /// warning, which a transaction the server already rolled back would hit.
+    async fn control_on(guard: &mut Backend, ctl: Ctl) -> Result<(), DbError> {
+        let generic = match ctl {
+            Ctl::Begin => "BEGIN",
+            Ctl::Commit => "COMMIT",
+            Ctl::Rollback => "ROLLBACK",
+        };
         match &mut *guard {
             Backend::MySql { conn, .. } => conn
-                .query_drop(sql)
+                .query_drop(generic)
                 .await
                 .map_err(|e| DbError::Query(e.to_string())),
             Backend::Postgres { client } => client
-                .batch_execute(sql)
+                .batch_execute(generic)
                 .await
                 .map_err(|e| DbError::Query(e.to_string())),
+            Backend::MsSql { client } => {
+                let sql = match ctl {
+                    Ctl::Begin => "BEGIN TRANSACTION",
+                    Ctl::Commit => "WHILE @@TRANCOUNT > 0 COMMIT TRANSACTION",
+                    Ctl::Rollback => "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION",
+                };
+                crate::mssql::drain(client, sql).await
+            }
         }
     }
 
@@ -321,7 +386,7 @@ impl Session {
         if self.in_tx.load(Ordering::SeqCst) {
             return Ok(());
         }
-        Session::control_on(&mut guard, "BEGIN")
+        Session::control_on(&mut guard, Ctl::Begin)
             .await
             .map_err(begin_failed)?;
         self.in_tx.store(true, Ordering::SeqCst);
@@ -364,10 +429,10 @@ impl Session {
         let r = if Session::block_is_aborted(&mut guard).await {
             // Leave the connection usable: the block has to end either way, and
             // `ROLLBACK` is the only statement that ends an aborted one.
-            let _ = Session::control_on(&mut guard, "ROLLBACK").await;
+            let _ = Session::control_on(&mut guard, Ctl::Rollback).await;
             Err(aborted_commit())
         } else {
-            Session::control_on(&mut guard, "COMMIT").await
+            Session::control_on(&mut guard, Ctl::Commit).await
         };
         self.in_tx.store(false, Ordering::SeqCst);
         r
@@ -387,17 +452,24 @@ impl Session {
     /// dead connection fails it too, and answering "aborted" for one is right
     /// for the only question being asked: nothing is going to be committed
     /// either way.
+    ///
+    /// **SQL Server says so outright**: `XACT_STATE()` is -1 for a *doomed*
+    /// transaction, whose `COMMIT` fails (Msg 3930). A dead connection answers
+    /// nothing, which reads as aborted for the reason above.
     async fn block_is_aborted(guard: &mut Backend) -> bool {
         match guard {
             Backend::MySql { .. } => false,
             Backend::Postgres { client } => client.batch_execute("SELECT 1").await.is_err(),
+            Backend::MsSql { client } => crate::mssql::tx_state(client)
+                .await
+                .is_none_or(|(_, state)| state == -1),
         }
     }
 
     /// Roll the transaction back. Also the way out of a PostgreSQL transaction
     /// that a failed statement aborted (`25P02`).
     pub async fn rollback(&self) -> Result<(), DbError> {
-        let r = self.control("ROLLBACK").await;
+        let r = self.control(Ctl::Rollback).await;
         self.in_tx.store(false, Ordering::SeqCst);
         r
     }
@@ -418,6 +490,11 @@ impl Session {
             Backend::Postgres { .. } => {
                 // Dropping the client ends the connection task.
             }
+            // The same quiet reset as MySQL's; the socket closes on drop.
+            Backend::MsSql { client } => {
+                let _ =
+                    crate::mssql::drain(client, "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION").await;
+            }
         }
     }
 
@@ -430,6 +507,9 @@ impl Session {
         match guard {
             Backend::MySql { conn, .. } => conn.ping().await.is_ok(),
             Backend::Postgres { client } => !client.is_closed(),
+            // tiberius has no liveness flag to read; the cheapest statement is
+            // the question.
+            Backend::MsSql { client } => crate::mssql::drain(client, "SELECT 1").await.is_ok(),
         }
     }
 
@@ -474,15 +554,30 @@ impl Session {
     /// Roll back to the write savepoint, reporting whether the server accepted
     /// it — which is the direct evidence that the transaction is alive.
     async fn undo_savepoint(guard: &mut Backend) -> bool {
-        Session::run_scope_sql(guard, TxScope::Savepoint.rollback_sql()).await
+        Session::run_scope_sql(guard, ScopeStep::Undo).await
     }
 
-    /// One statement of transaction bookkeeping, on either backend, reporting
+    /// One statement of transaction bookkeeping, on any backend, reporting
     /// whether the server took it.
-    async fn run_scope_sql(guard: &mut Backend, sql: &str) -> bool {
+    ///
+    /// **SQL Server is never asked**, and answers "not taken" for every step,
+    /// which leaves its reads unfenced and its failures unconfirmed here. A
+    /// T-SQL savepoint cannot be released, so its name stays live for the
+    /// rest of the transaction, and a rollback to it after an operation that
+    /// failed before setting its own would land on an *earlier* one — undoing
+    /// the user's statements since. It needs neither use: a cancelled read
+    /// does not abort a SQL Server transaction, and `mssql::write_on` reports
+    /// what its own savepoint's rollback achieved.
+    async fn run_scope_sql(guard: &mut Backend, step: ScopeStep) -> bool {
+        let sql = match step {
+            ScopeStep::Begin => TxScope::Savepoint.begin_sql(),
+            ScopeStep::Release => TxScope::Savepoint.commit_sql(),
+            ScopeStep::Undo => TxScope::Savepoint.rollback_sql(),
+        };
         match guard {
             Backend::MySql { conn, .. } => conn.query_drop(sql).await.is_ok(),
             Backend::Postgres { client } => client.batch_execute(sql).await.is_ok(),
+            Backend::MsSql { .. } => false,
         }
     }
 
@@ -506,7 +601,7 @@ impl Session {
     /// it was. Returns whether the fence is actually there — a server that
     /// refused the `SAVEPOINT` gets the old, honest classification.
     async fn fence_read(guard: &mut Backend) -> bool {
-        Session::run_scope_sql(guard, TxScope::Savepoint.begin_sql()).await
+        Session::run_scope_sql(guard, ScopeStep::Begin).await
     }
 
     /// Classify a read that ran behind [`Session::fence_read`].
@@ -519,18 +614,18 @@ impl Session {
         let mut out = Session::classify(guard, result).await;
         match out.stmt {
             StmtOutcome::Ok => {
-                let _ = Session::run_scope_sql(guard, TxScope::Savepoint.commit_sql()).await;
+                let _ = Session::run_scope_sql(guard, ScopeStep::Release).await;
             }
             // **Confirmed, not assumed** — `classify_isolated`'s rule. The
             // upgrade is claimed only if the server accepted the rollback, which
             // is the direct evidence that the transaction is alive.
             StmtOutcome::Failed if Session::undo_savepoint(guard).await => {
                 out.stmt = StmtOutcome::FailedIsolated;
-                let _ = Session::run_scope_sql(guard, TxScope::Savepoint.commit_sql()).await;
+                let _ = Session::run_scope_sql(guard, ScopeStep::Release).await;
             }
             StmtOutcome::Cancelled if Session::undo_savepoint(guard).await => {
                 out.stmt = StmtOutcome::CancelledIsolated;
-                let _ = Session::run_scope_sql(guard, TxScope::Savepoint.commit_sql()).await;
+                let _ = Session::run_scope_sql(guard, ScopeStep::Release).await;
             }
             _ => {}
         }
@@ -634,6 +729,15 @@ impl Session {
                 )
                 .await
             }
+            // `run_statement` owns the token here as on PostgreSQL: every step
+            // is raced against Stop and a Stop is the attention, on this
+            // connection. A result cut short at the row cap needs no draining
+            // for the next statement — tiberius resynchronises the stream at
+            // the start of every request (`flush_stream`).
+            Backend::MsSql { client } => {
+                let mut dest = crate::RowDest::Capped(row_cap);
+                crate::mssql::run_statement(client, sql, &mut dest, &cancel).await
+            }
         };
         // Same stamp `Db::fetch_query` applies, from this session's own scope —
         // which is the one the statement ran under, and need not be the tab's
@@ -674,6 +778,15 @@ impl Session {
             }
         }
         let mut out = Session::classify(&mut guard, result).await;
+        // **SQL Server is asked after every statement**, and its answer is the
+        // whole of it — see `tx::probes_after_every_statement` for why no text
+        // can decide it there.
+        if tx::probes_after_every_statement(self.tx_engine()) {
+            if out.stmt != StmtOutcome::ConnectionLost {
+                self.settle_from_server(&mut guard, &mut out.stmt).await;
+            }
+            return out;
+        }
         // **The successful statements whose text cannot decide this**, so they
         // ask the server instead of guessing. Two, for two different reasons,
         // and `tx::TxAfter::Ask` is what routes both here.
@@ -756,6 +869,8 @@ impl Session {
     /// commits a transaction out from under a statement, and its failure state is
     /// already reported exactly by `Poisoned`.
     async fn tx_alive(guard: &mut Backend) -> Option<bool> {
+        // SQL Server never asks this: `settle_from_server` reads its state
+        // after every operation instead.
         let Backend::MySql { conn, .. } = guard else {
             return None;
         };
@@ -770,6 +885,42 @@ impl Session {
         .ok()
         .flatten()
         .map(|n| n != 0)
+    }
+
+    /// **SQL Server's answer to what an operation did to the transaction**,
+    /// folded into this session's flag and into the outcome the pill reads —
+    /// the one probe `tx::probes_after_every_statement` names, asked after
+    /// every operation on this engine because no text can decide it.
+    ///
+    /// `@@TRANCOUNT` of 0 after an open transaction is a close: a success
+    /// there is `OkAndClosed` (a typed `COMMIT`, a `ROLLBACK` inside a batch's
+    /// `IF`), a failure `FailedAndRolledBack` (a deadlock victim, a
+    /// batch-aborting error — the server ended it). `XACT_STATE()` of -1 after
+    /// a failure is `FailedAndDoomed`: still open, and only a rollback ends it.
+    /// A probe that cannot be answered leaves everything as it was.
+    async fn settle_from_server(&self, guard: &mut Backend, stmt: &mut StmtOutcome) {
+        let Backend::MsSql { client } = guard else {
+            return;
+        };
+        let Some((count, state)) = crate::mssql::tx_state(client).await else {
+            return;
+        };
+        let was_open = self.in_tx.load(Ordering::SeqCst);
+        let open = count > 0;
+        self.in_tx.store(open, Ordering::SeqCst);
+        let failed = matches!(
+            stmt,
+            StmtOutcome::Failed
+                | StmtOutcome::Cancelled
+                | StmtOutcome::FailedIsolated
+                | StmtOutcome::CancelledIsolated
+        );
+        *stmt = match *stmt {
+            StmtOutcome::Ok if was_open && !open => StmtOutcome::OkAndClosed,
+            _ if failed && was_open && !open => StmtOutcome::FailedAndRolledBack,
+            _ if failed && state == -1 => StmtOutcome::FailedAndDoomed,
+            s => s,
+        };
     }
 
     /// This session's engine, in the vocabulary `schemaic_core::tx` speaks.
@@ -839,6 +990,37 @@ impl Session {
                     }
                 }
             }
+            // **Isolation is `write_on`'s own report, not a second rollback**:
+            // a T-SQL savepoint is never released, so rolling back to its name
+            // again could land on an earlier batch's — see `run_scope_sql`.
+            // Nothing written, or its savepoint rolled back and the server
+            // said so, is isolated; the probe then says whether the server
+            // itself ended or doomed the transaction.
+            Backend::MsSql { client } => {
+                let mut undone = None;
+                let r = crate::mssql::write_on(
+                    client,
+                    write,
+                    &cancel,
+                    crate::mssql::WriteScope::Savepoint,
+                    &mut undone,
+                )
+                .await;
+                let isolated = matches!(
+                    undone,
+                    None | Some(schemaic_core::model::Rollback::Complete)
+                );
+                let mut out = Session::classify(&mut guard, r).await;
+                out.stmt = match out.stmt {
+                    StmtOutcome::Failed if isolated => StmtOutcome::FailedIsolated,
+                    StmtOutcome::Cancelled if isolated => StmtOutcome::CancelledIsolated,
+                    s => s,
+                };
+                if out.stmt != StmtOutcome::ConnectionLost {
+                    self.settle_from_server(&mut guard, &mut out.stmt).await;
+                }
+                return out;
+            }
         };
         Session::classify_isolated(&mut guard, result).await
     }
@@ -897,6 +1079,8 @@ impl Session {
                     }
                 }
             }
+            // Raced against Stop inside, the attention on this connection.
+            Backend::MsSql { client } => crate::mssql::blob_on(client, r, &cancel).await,
         };
         // **And through `into_read` on the way out.** `fence_read` cannot set a
         // savepoint when there is no transaction to fence — PostgreSQL answers
@@ -906,11 +1090,16 @@ impl Session {
         // aborted" with Commit hidden and no exit that kept the work which came
         // next. MySQL accepts the savepoint outside a transaction, which is what
         // hid it.
-        let out = if fenced {
+        let mut out = if fenced {
             Session::classify_fenced(&mut guard, result).await
         } else {
             Session::classify(&mut guard, result).await
         };
+        if tx::probes_after_every_statement(self.tx_engine())
+            && out.stmt != StmtOutcome::ConnectionLost
+        {
+            self.settle_from_server(&mut guard, &mut out.stmt).await;
+        }
         out.into_read(in_tx())
     }
 
@@ -954,15 +1143,24 @@ impl Session {
                     }
                 }
             }
+            // Each row's read raced against Stop inside.
+            Backend::MsSql { client } => {
+                crate::mssql::refetch_on(client, template, rows, &cancel).await
+            }
         };
         // The same `into_read` as `fetch_blob`, and for the same reason: this
         // path calls no `ensure_tx` either, so it must not report a transaction
         // it did not open.
-        let out = if fenced {
+        let mut out = if fenced {
             Session::classify_fenced(&mut guard, result).await
         } else {
             Session::classify(&mut guard, result).await
         };
+        if tx::probes_after_every_statement(self.tx_engine())
+            && out.stmt != StmtOutcome::ConnectionLost
+        {
+            self.settle_from_server(&mut guard, &mut out.stmt).await;
+        }
         out.into_read(self.in_tx.load(Ordering::SeqCst))
     }
 }
@@ -985,10 +1183,10 @@ impl Session {
 pub fn tx_engine_of(engine: Engine) -> tx::TxEngine {
     match engine {
         Engine::Postgres => tx::TxEngine::Postgres,
-        // A failed T-SQL statement leaves its transaction open and usable, as
-        // MySQL's does — unless the session set `XACT_ABORT ON`, which is the
-        // session's own choice to make.
-        Engine::MySql | Engine::Sqlite | Engine::MsSql => tx::TxEngine::MySql,
+        // Its own: DDL that does not commit, and a transaction state the
+        // session reads from the server — see `tx::TxEngine::MsSql`.
+        Engine::MsSql => tx::TxEngine::MsSql,
+        Engine::MySql | Engine::Sqlite => tx::TxEngine::MySql,
     }
 }
 

@@ -351,8 +351,34 @@ fn describe_error(rows: &[(u32, String)]) -> Option<String> {
         .map(|(n, m)| server_message(m, *n, 0))
 }
 
+/// What the server says of this connection's transaction: `@@TRANCOUNT` —
+/// how many `BEGIN TRAN`s are open, 0 for none — and `XACT_STATE()`, which is
+/// -1 for a transaction that is open but can only be rolled back. `None` when
+/// the connection could not answer.
+pub(crate) async fn tx_state(client: &mut MsClient) -> Option<(i64, i64)> {
+    let stream = client
+        .simple_query("SELECT CAST(@@TRANCOUNT AS int), CAST(XACT_STATE() AS int)")
+        .await
+        .ok()?;
+    let row = stream.into_row().await.ok()??;
+    let count: i32 = row.get(0)?;
+    let state: i32 = row.get(1)?;
+    Some((i64::from(count), i64::from(state)))
+}
+
+/// This connection's `@@SPID` — the id Server Activity lists it under. `None`
+/// if the server did not answer, which costs only the recognition.
+pub(crate) async fn spid(client: &mut MsClient) -> Option<i64> {
+    let stream = client
+        .simple_query("SELECT CAST(@@SPID AS int)")
+        .await
+        .ok()?;
+    let row = stream.into_row().await.ok()??;
+    row.get::<i32, _>(0).map(i64::from)
+}
+
 /// Run a statement for its side effect alone, reading its whole answer.
-async fn drain(client: &mut MsClient, sql: &str) -> Result<(), DbError> {
+pub(crate) async fn drain(client: &mut MsClient, sql: &str) -> Result<(), DbError> {
     let mut stream = client.simple_query(sql).await.map_err(|e| db_err(&e))?;
     while let Some(item) = stream.next().await {
         item.map_err(|e| db_err(&e))?;
@@ -381,7 +407,7 @@ async fn drain(client: &mut MsClient, sql: &str) -> Result<(), DbError> {
 /// return until the statement's first result set — for an `UPDATE`, until it
 /// has finished — and a Stop there used to leave the stopping to the
 /// connection's close.
-async fn run_statement(
+pub(crate) async fn run_statement(
     client: &mut MsClient,
     sql: &str,
     dest: &mut RowDest,
@@ -2481,6 +2507,83 @@ async fn failed(client: &mut MsClient, msg: String) -> DbError {
     DbError::Query(format!("{msg}{}", undone.note()))
 }
 
+/// The savepoint a pinned session's write batches run under (its reads are not
+/// fenced on this engine — see `Session::run_scope_sql`) —
+/// T-SQL's spelling of the name `TxScope::Savepoint` uses on the other engines.
+pub(crate) const SAVEPOINT: &str = "schemaic_w";
+
+/// How [`write_on`] brackets a batch of grid edits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WriteScope {
+    /// Its own transaction, committed at the end — Auto mode, on a connection
+    /// opened for it.
+    Own,
+    /// A savepoint inside the transaction the caller holds — a Manual tab's
+    /// pinned session. T-SQL's is `SAVE TRANSACTION`, rolled back to by name
+    /// and never released; the transaction is the caller's to end.
+    Savepoint,
+}
+
+impl WriteScope {
+    async fn begin(self, client: &mut MsClient) -> Result<(), DbError> {
+        match self {
+            WriteScope::Own => drain(client, "BEGIN TRANSACTION").await,
+            WriteScope::Savepoint => drain(client, &format!("SAVE TRANSACTION {SAVEPOINT}")).await,
+        }
+    }
+
+    /// Undo the batch so far, and say whether it is known to be undone.
+    ///
+    /// **A savepoint's rollback leaves the session's settings alone**, so an
+    /// `IDENTITY_INSERT` the batch switched on is switched off again here: on a
+    /// pinned connection it would outlive the batch and refuse the tab's next
+    /// ordinary insert into that table (`Msg 545`).
+    async fn undo(self, client: &mut MsClient, identity_on: Option<&str>) -> Rollback {
+        match self {
+            WriteScope::Own => rollback(client).await,
+            WriteScope::Savepoint => {
+                let undone = drain(client, &format!("ROLLBACK TRANSACTION {SAVEPOINT}")).await;
+                if let Some(t) = identity_on {
+                    let _ = drain(client, &format!("SET IDENTITY_INSERT {t} OFF")).await;
+                }
+                match undone {
+                    Ok(()) => Rollback::Complete,
+                    Err(_) => Rollback::Unknown,
+                }
+            }
+        }
+    }
+
+    /// [`Self::undo`], with its answer recorded for the caller of `write_on`.
+    async fn undo_into(
+        self,
+        client: &mut MsClient,
+        identity_on: Option<&str>,
+        record: &mut Option<Rollback>,
+    ) -> Rollback {
+        let undone = self.undo(client, identity_on).await;
+        *record = Some(undone);
+        undone
+    }
+
+    /// A failed step's error. Under a savepoint the rollback note is left off:
+    /// the session answers for what survived, from `write_on`'s `undone`,
+    /// and "rolled back all changes" would claim the user's whole transaction.
+    fn failure(self, msg: String, undone: Rollback) -> DbError {
+        match self {
+            WriteScope::Own => DbError::Query(format!("{msg}{}", undone.note())),
+            WriteScope::Savepoint => DbError::Query(msg),
+        }
+    }
+
+    fn cancelled(self, undone: Rollback) -> DbError {
+        match self {
+            WriteScope::Own => cancelled_write(undone),
+            WriteScope::Savepoint => DbError::Cancelled,
+        }
+    }
+}
+
 /// Commit a batch of grid edits in one transaction, each statement required to
 /// affect exactly one row. Returns the rows written — equal to the statements
 /// run, by the 1-row guard.
@@ -2494,6 +2597,39 @@ pub(crate) async fn commit_writes(
     write: &GridWrite,
     cancel: CancellationToken,
 ) -> Result<u64, DbError> {
+    let Some(first) = write.plan().first().copied() else {
+        return Ok(0);
+    };
+    if cancel.is_cancelled() {
+        return Err(DbError::Cancelled);
+    }
+    let database = match first {
+        WriteStep::Delete(d) => &d.database,
+        WriteStep::Update(u) => &u.database,
+        WriteStep::Insert(i) => &i.database,
+    };
+    let mut client = connect(db, Some(database)).await?;
+    write_on(&mut client, write, &cancel, WriteScope::Own, &mut None).await
+}
+
+/// [`commit_writes`]' body, on a connection the caller holds, bracketed by
+/// `scope` — its own transaction, or a savepoint in the pinned session's.
+///
+/// `undone` is set to what the undo achieved whenever one ran, and left `None`
+/// when the batch failed before anything was written. **The pinned session
+/// reads it rather than rolling back to the savepoint again**, as the other
+/// engines' sessions confirm theirs: T-SQL cannot release a savepoint, so its
+/// name stays live for the rest of the transaction, and a second
+/// `ROLLBACK TRANSACTION schemaic_w` after a batch that failed before its own
+/// `SAVE` would land on an *earlier* batch's — silently undoing the user's
+/// statements since.
+pub(crate) async fn write_on(
+    client: &mut MsClient,
+    write: &GridWrite,
+    cancel: &CancellationToken,
+    scope: WriteScope,
+    undone: &mut Option<Rollback>,
+) -> Result<u64, DbError> {
     let plan = write.plan();
     let Some(first) = plan.first() else {
         return Ok(0);
@@ -2501,21 +2637,20 @@ pub(crate) async fn commit_writes(
     if cancel.is_cancelled() {
         return Err(DbError::Cancelled);
     }
-    let (database, schema, table) = match first {
-        WriteStep::Delete(d) => (&d.database, d.schema.as_deref(), &d.table),
-        WriteStep::Update(u) => (&u.database, u.schema.as_deref(), &u.table),
-        WriteStep::Insert(i) => (&i.database, i.schema.as_deref(), &i.table),
+    let (schema, table) = match first {
+        WriteStep::Delete(d) => (d.schema.as_deref(), &d.table),
+        WriteStep::Update(u) => (u.schema.as_deref(), &u.table),
+        WriteStep::Insert(i) => (i.schema.as_deref(), &i.table),
     };
-    let mut client = connect(db, Some(database)).await?;
-    let facts = column_facts(&mut client, schema, table).await?;
+    let facts = column_facts(client, schema, table).await?;
     if let Some(msg) = blank_refusal(write, &facts) {
         return Err(DbError::Refused(msg));
     }
-    drain(&mut client, "BEGIN TRANSACTION").await?;
+    scope.begin(client).await?;
     let mut total = 0u64;
     for step in plan {
         if cancel.is_cancelled() {
-            return Err(cancelled_write(rollback(&mut client).await));
+            return Err(scope.cancelled(scope.undo_into(client, None, undone).await));
         }
         let identity = match step {
             WriteStep::Insert(i) if sets_identity(i, &facts) => {
@@ -2524,11 +2659,12 @@ pub(crate) async fn commit_writes(
             _ => None,
         };
         if let Some(t) = &identity
-            && let Err(e) = drain(&mut client, &format!("SET IDENTITY_INSERT {t} ON")).await
+            && let Err(e) = drain(client, &format!("SET IDENTITY_INSERT {t} ON")).await
         {
-            return Err(failed(&mut client, err_text(e)).await);
+            let u = scope.undo_into(client, None, undone).await;
+            return Err(scope.failure(err_text(e), u));
         }
-        let affected = match execute_counted(&mut client, &statement_for(step), &cancel).await {
+        let affected = match execute_counted(client, &statement_for(step), cancel).await {
             Ok(Ran::Counted(n)) => n,
             // **Only an acknowledged attention lets the rollback be believed.**
             // The statement's future was dropped mid-reply; without the
@@ -2538,27 +2674,36 @@ pub(crate) async fn commit_writes(
             // engine. So nothing is sent: the server rolls back when the
             // connection closes, but this side did not see it.
             Ok(Ran::Stopped { in_step }) => {
-                let undone = if in_step {
-                    rollback(&mut client).await
+                let u = if in_step {
+                    scope.undo_into(client, identity.as_deref(), undone).await
                 } else {
+                    *undone = Some(Rollback::Unknown);
                     Rollback::Unknown
                 };
-                return Err(cancelled_write(undone));
+                return Err(scope.cancelled(u));
             }
-            Err(e) => return Err(failed(&mut client, err_text(e)).await),
+            Err(e) => {
+                let u = scope.undo_into(client, identity.as_deref(), undone).await;
+                return Err(scope.failure(err_text(e), u));
+            }
         };
         if let Some(t) = &identity
-            && let Err(e) = drain(&mut client, &format!("SET IDENTITY_INSERT {t} OFF")).await
+            && let Err(e) = drain(client, &format!("SET IDENTITY_INSERT {t} OFF")).await
         {
-            return Err(failed(&mut client, err_text(e)).await);
+            let u = scope.undo_into(client, identity.as_deref(), undone).await;
+            return Err(scope.failure(err_text(e), u));
         }
         if let Err(msg) = one_row_verdict(step, affected) {
-            return Err(failed(&mut client, msg).await);
+            let u = scope.undo_into(client, None, undone).await;
+            return Err(scope.failure(msg, u));
         }
         total += affected;
     }
-    if let Err(e) = drain(&mut client, "COMMIT TRANSACTION").await {
-        return Err(failed(&mut client, err_text(e)).await);
+    if scope == WriteScope::Own
+        && let Err(e) = drain(client, "COMMIT TRANSACTION").await
+    {
+        let u = scope.undo_into(client, None, undone).await;
+        return Err(scope.failure(err_text(e), u));
     }
     Ok(total)
 }
@@ -2606,11 +2751,20 @@ pub(crate) async fn refetch_rows(
         return Err(DbError::Cancelled);
     }
     let mut client = connect(db, Some(&template.database)).await?;
+    refetch_on(&mut client, template, rows, &cancel).await
+}
+
+/// [`refetch_rows`]' body, on a connection the caller holds — the pinned
+/// session's, the only one that sees rows its own transaction wrote.
+pub(crate) async fn refetch_on(
+    client: &mut MsClient,
+    template: &RefetchTemplate,
+    rows: &[RefetchRow],
+    cancel: &CancellationToken,
+) -> Result<Vec<(usize, Vec<Value>)>, DbError> {
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
-        if let Some(cells) =
-            first_row(&mut client, &refetch_statement(template, row), &cancel).await?
-        {
+        if let Some(cells) = first_row(client, &refetch_statement(template, row), cancel).await? {
             out.push((row.data_row, cells));
         }
     }
@@ -2628,6 +2782,16 @@ pub(crate) async fn fetch_blob(
         return Err(DbError::Cancelled);
     }
     let mut client = connect(db, Some(&r.database)).await?;
+    blob_on(&mut client, r, &cancel).await
+}
+
+/// [`fetch_blob`]'s body, on a connection the caller holds — the pinned
+/// session's, which sees bytes its own transaction wrote.
+pub(crate) async fn blob_on(
+    client: &mut MsClient,
+    r: &BlobRef,
+    cancel: &CancellationToken,
+) -> Result<Option<BlobValue>, DbError> {
     let b = blob_statement(r);
     let refs: Vec<&dyn tiberius::ToSql> =
         b.params.iter().map(|p| p as &dyn tiberius::ToSql).collect();
@@ -2661,7 +2825,7 @@ pub(crate) async fn fetch_blob(
     };
     match outcome {
         Some(v) => v,
-        None => Err(cancel_now(&mut client).await),
+        None => Err(cancel_now(client).await),
     }
 }
 

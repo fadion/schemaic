@@ -25,21 +25,61 @@ pub enum TxEngine {
     #[default]
     MySql,
     Postgres,
+    /// SQL Server: DDL is transactional, as PostgreSQL's is, so nothing
+    /// commits by side effect; a failed statement leaves the transaction open
+    /// and committable, as MySQL's does (`XACT_ABORT OFF`, the default) —
+    /// unless the server rolled it back itself or *doomed* it. Which of those
+    /// happened, and whether a `COMMIT` inside nested `BEGIN TRAN`s closed
+    /// anything, is read from the server ([`probes_after_every_statement`]).
+    MsSql,
 }
 
 /// Does `dialect` have a **Manual** transaction mode here — a pinned
 /// connection that holds a transaction until the user ends it?
 ///
 /// Not on SQLite, whose pinned connection would need a thread of its own (see
-/// `schemaic_db::Session::open`), and not yet on SQL Server, whose is simply not
-/// written. The footer asks this and hides the Auto/Manual segment where it is
-/// `false`: a control that reports an error every time it is pressed is worse
-/// than one that is not there. `Session::open` refusing both is the backstop.
+/// `schemaic_db::Session::open`). The footer asks this and hides the
+/// Auto/Manual segment where it is `false`: a control that reports an error
+/// every time it is pressed is worse than one that is not there.
+/// `Session::open` refusing it is the backstop.
 pub fn supports_manual_mode(dialect: crate::intel::SqlDialect) -> bool {
     use crate::intel::SqlDialect;
     match dialect {
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::MsSql => true,
+        SqlDialect::Sqlite => false,
+    }
+}
+
+/// Is Manual mode offered for a connection on `dialect` — [`supports_manual_mode`],
+/// narrowed by whether the connection is read-only?
+///
+/// A read-only connection's pinned session is held in a read-only transaction
+/// on MySQL and PostgreSQL. SQL Server has none, so `Session::open_enforced`
+/// refuses one there, and the footer asks this to leave the segment off rather
+/// than offer a mode whose every press ends in that refusal.
+pub fn offers_manual_mode(dialect: crate::intel::SqlDialect, read_only: bool) -> bool {
+    use crate::intel::SqlDialect;
+    let holds_read_only_transaction = match dialect {
         SqlDialect::MySql | SqlDialect::Postgres => true,
-        SqlDialect::Sqlite | SqlDialect::MsSql => false,
+        SqlDialect::MsSql | SqlDialect::Sqlite => false,
+    };
+    supports_manual_mode(dialect) && (!read_only || holds_read_only_transaction)
+}
+
+/// Does the pinned session read the transaction's state from the **server**
+/// after every statement — rather than from the statement's text, with a
+/// probe only where the text cannot decide?
+///
+/// SQL Server's. `@@TRANCOUNT` counts nested `BEGIN TRAN`s, so a `COMMIT` may
+/// close nothing; `ROLLBACK TRANSACTION s` is a savepoint's; a batch can end a
+/// transaction from inside an `IF` or a `TRY` the head keyword never sees; and
+/// the server rolls a transaction back itself for a deadlock victim or a
+/// batch-aborting error. One round trip per statement is the price of never
+/// guessing, on a mode whose promise is that nothing commits by surprise.
+pub fn probes_after_every_statement(engine: TxEngine) -> bool {
+    match engine {
+        TxEngine::MsSql => true,
+        TxEngine::MySql | TxEngine::Postgres => false,
     }
 }
 
@@ -120,15 +160,31 @@ pub enum StmtOutcome {
     /// server can tell those two apart, which is why this variant exists rather
     /// than a wider reading of `implicit_commit`: see [`failure_committed`].
     FailedAndCommitted,
+    /// It failed or was cancelled, **and the server rolled the transaction back
+    /// itself** — SQL Server's answer for a deadlock victim and for a
+    /// batch-aborting error, read as `@@TRANCOUNT` of 0 afterwards.
+    ///
+    /// [`FailedAndCommitted`](Self::FailedAndCommitted)'s mirror: the
+    /// transaction is gone either way, and the pill goes quiet either way, but
+    /// here everything since `BEGIN` is **undone** rather than permanent — so
+    /// the disclosure beside the error says that ([`failed_message`]).
+    FailedAndRolledBack,
+    /// It failed, and the transaction is still open but **doomed**: SQL
+    /// Server's `XACT_STATE()` of -1, where nothing can be committed and only a
+    /// `ROLLBACK` ends it — PostgreSQL's aborted state by another name, and
+    /// folded to the same [`TxState::Poisoned`].
+    FailedAndDoomed,
     /// It **succeeded**, and the transaction it was inside is gone — as reported
     /// by the connection rather than read off the statement.
     ///
     /// [`FailedAndCommitted`](Self::FailedAndCommitted)'s twin for the success
-    /// path, and it exists for the same reason: the text cannot decide it. The
-    /// one statement that reaches it is `SET autocommit`, whose effect on the
-    /// current transaction depends on the value the variable *had* —
-    /// [`TxAfter::Ask`] is what routes it to the probe, and this is how the
-    /// probe's answer reaches the pill, which cannot ask.
+    /// path, and it exists for the same reason: the text cannot decide it. On
+    /// MySQL it is `SET autocommit`, whose effect on the current transaction
+    /// depends on the value the variable *had*, and a replication `START` —
+    /// [`TxAfter::Ask`] routes them to the probe; on SQL Server it is every
+    /// statement after which `@@TRANCOUNT` reads 0 (a typed `COMMIT`, a
+    /// `ROLLBACK` inside a batch). Either way this is how the probe's answer
+    /// reaches the pill, which cannot ask.
     OkAndClosed,
     /// **Nothing happened to the transaction, whatever happened to the
     /// statement** — because there was no transaction for it to happen to.
@@ -182,8 +238,9 @@ pub enum TxState {
     Idle,
     /// Open, with the number of statements run inside it so far.
     Open { stmts: u32 },
-    /// PostgreSQL only: a statement errored, so the server rejects everything
-    /// until `ROLLBACK`. The count is kept for the pill.
+    /// A statement errored and only `ROLLBACK` goes on: PostgreSQL's aborted
+    /// block, and SQL Server's *doomed* transaction
+    /// ([`StmtOutcome::FailedAndDoomed`]). The count is kept for the pill.
     Poisoned { stmts: u32 },
     /// The pinned connection died with a transaction open — the work is gone.
     /// Reported rather than silently reconnected into a fresh, empty one.
@@ -297,6 +354,13 @@ impl TxState {
             {
                 TxState::Open { stmts }
             }
+            // **The server has said the transaction is gone**, which ends a
+            // poisoned one as surely as a healthy one. SQL Server's way out of
+            // a doomed transaction is a `ROLLBACK` its text cannot confirm —
+            // `tx_after` asks — so the probe's answer arrives as this, and
+            // without the arm the tab read "Tx aborted" for the rest of its
+            // life over no transaction at all.
+            TxState::Poisoned { .. } if outcome == StmtOutcome::OkAndClosed => TxState::Idle,
             TxState::Poisoned { stmts } => TxState::Poisoned { stmts },
             TxState::Idle | TxState::Open { .. } => {
                 let stmts = self.stmts();
@@ -331,8 +395,15 @@ impl TxState {
                     // the transaction in the aborted state.
                     StmtOutcome::Failed | StmtOutcome::Cancelled => match engine {
                         TxEngine::Postgres => TxState::Poisoned { stmts },
-                        TxEngine::MySql => TxState::Open { stmts },
+                        // SQL Server's worse cases reach here as outcomes of
+                        // their own, from the session's probe.
+                        TxEngine::MySql | TxEngine::MsSql => TxState::Open { stmts },
                     },
+                    // The server rolled it back — see
+                    // [`StmtOutcome::FailedAndRolledBack`].
+                    StmtOutcome::FailedAndRolledBack => TxState::Idle,
+                    // Open, and only a rollback ends it.
+                    StmtOutcome::FailedAndDoomed => TxState::Poisoned { stmts },
                     // The same, except the server has *said* the transaction is
                     // gone — see [`StmtOutcome::FailedAndCommitted`]. It is the
                     // one failure that ends a transaction rather than leaving it
@@ -576,6 +647,24 @@ pub enum TxAfter {
 ///    and `SET PASSWORD` — except the replication `START`s, which reach
 ///    [`TxAfter::Ask`] instead because the two engines disagree about them.
 pub fn tx_after(engine: TxEngine, sql: &str) -> TxAfter {
+    // **T-SQL's text decides none of it**, so its transaction statements ask:
+    // a `COMMIT` inside nested `BEGIN TRAN`s only lowers `@@TRANCOUNT`,
+    // `ROLLBACK TRANSACTION s` rolls back to a savepoint and leaves the
+    // transaction open, and a bare `BEGIN` opens a block rather than a
+    // transaction. Everything else is `Unchanged` — SQL Server's DDL does not
+    // commit — and the session reads the server after every statement anyway
+    // (`probes_after_every_statement`), so `Ask` only says the text is not to
+    // be trusted.
+    match engine {
+        TxEngine::MsSql => {
+            let d = crate::intel::SqlDialect::MsSql;
+            return match crate::sql::leading_keyword(sql, d).as_deref() {
+                Some("COMMIT" | "ROLLBACK" | "BEGIN" | "SAVE") => TxAfter::Ask,
+                _ => TxAfter::Unchanged,
+            };
+        }
+        TxEngine::MySql | TxEngine::Postgres => {}
+    }
     // The dialect only decides how the *lexer* reads the head keyword, and both
     // engines spell these the same, so MySQL's rules answer for both — the
     // superset (backslash escapes, `#` comments) can only end a token earlier,
@@ -733,15 +822,29 @@ pub fn failure_committed(engine: TxEngine, sql: &str, tx_alive: Option<bool>) ->
 /// halves. Only [`StmtOutcome::FailedAndCommitted`] gets it, which is only ever
 /// set when the server was asked and said the transaction was gone — see
 /// [`failure_committed`]. Every other outcome's message is returned untouched.
+///
+/// **SQL Server's two have their own sentences**: a transaction the server
+/// rolled back is gone the other way — everything in it undone, which the
+/// error rarely says — and a doomed one is still open but can only be rolled
+/// back, which the pill shows and the error does not explain.
 pub fn failed_message(message: &str, stmt: StmtOutcome) -> String {
-    if stmt != StmtOutcome::FailedAndCommitted {
-        return message.to_string();
+    match stmt {
+        StmtOutcome::FailedAndCommitted => format!(
+            "{message}\n\nThe transaction this ran in is gone: MySQL commits before it \
+             runs a DDL statement, so the statements already in it are permanent and \
+             Rollback will not undo them."
+        ),
+        StmtOutcome::FailedAndRolledBack => format!(
+            "{message}\n\nThe transaction this ran in is gone: SQL Server rolled it back, \
+             so every statement in it since it began is undone."
+        ),
+        StmtOutcome::FailedAndDoomed => format!(
+            "{message}\n\nThe transaction this ran in can no longer commit: SQL Server \
+             marked it uncommittable, so Rollback is the only way on, and it undoes \
+             every statement in it."
+        ),
+        _ => message.to_string(),
     }
-    format!(
-        "{message}\n\nThe transaction this ran in is gone: MySQL commits before it \
-         runs a DDL statement, so the statements already in it are permanent and \
-         Rollback will not undo them."
-    )
 }
 
 /// What a **cancelled** run has to say beyond "Cancelled", or `None` when the
@@ -766,12 +869,14 @@ pub fn failed_message(message: &str, stmt: StmtOutcome) -> String {
 /// without it — the same argument [`failed_message`] itself makes for being one
 /// function.
 pub fn cancelled_message(stmt: Option<StmtOutcome>) -> Option<String> {
-    (stmt == Some(StmtOutcome::FailedAndCommitted)).then(|| {
-        failed_message(
-            "The statement was cancelled.",
-            StmtOutcome::FailedAndCommitted,
-        )
-    })
+    match stmt {
+        Some(
+            s @ (StmtOutcome::FailedAndCommitted
+            | StmtOutcome::FailedAndRolledBack
+            | StmtOutcome::FailedAndDoomed),
+        ) => Some(failed_message("The statement was cancelled.", s)),
+        _ => None,
+    }
 }
 
 /// Did the statement timeout stop the **statement**, or something before it?
@@ -1035,6 +1140,118 @@ mod tests {
 
     const MY: TxEngine = TxEngine::MySql;
     const PG: TxEngine = TxEngine::Postgres;
+    const MS: TxEngine = TxEngine::MsSql;
+
+    /// **SQL Server has a Manual mode**, on a pinned connection whose
+    /// transaction state is read from the server after every statement rather
+    /// than off its text.
+    #[test]
+    fn sql_server_has_a_manual_mode_that_asks_the_server() {
+        use crate::intel::SqlDialect;
+        assert!(supports_manual_mode(SqlDialect::MsSql));
+        assert!(!supports_manual_mode(SqlDialect::Sqlite));
+        assert!(probes_after_every_statement(MS));
+        assert!(!probes_after_every_statement(MY) && !probes_after_every_statement(PG));
+    }
+
+    /// A read-only connection is offered Manual mode only where the engine
+    /// can hold it in a read-only transaction — not on SQL Server, whose
+    /// session refuses the open.
+    #[test]
+    fn a_read_only_connection_is_offered_manual_mode_where_the_engine_holds_one() {
+        use crate::intel::SqlDialect::*;
+        for d in [MySql, Postgres, MsSql] {
+            assert!(offers_manual_mode(d, false), "{d:?}");
+        }
+        assert!(offers_manual_mode(MySql, true) && offers_manual_mode(Postgres, true));
+        assert!(!offers_manual_mode(MsSql, true));
+        assert!(!offers_manual_mode(Sqlite, false) && !offers_manual_mode(Sqlite, true));
+    }
+
+    /// **T-SQL's transaction statements are asked about, not read.** A
+    /// `COMMIT` inside a nested `BEGIN TRAN` only lowers `@@TRANCOUNT`,
+    /// `ROLLBACK TRANSACTION s` is a savepoint's, and a bare `BEGIN` opens a
+    /// block, not a transaction — so none of them can be decided from the text,
+    /// and the session's probe settles each. **DDL does not commit**: SQL
+    /// Server's is transactional, which is why this is not MySQL's engine.
+    #[test]
+    fn t_sql_transaction_statements_are_asked_about_and_ddl_does_not_commit() {
+        for sql in [
+            "COMMIT",
+            "COMMIT TRANSACTION",
+            "ROLLBACK",
+            "ROLLBACK TRANSACTION sp1",
+            "BEGIN TRAN",
+            "BEGIN TRANSACTION t1",
+            "BEGIN TRY SELECT 1 END TRY BEGIN CATCH END CATCH",
+            "SAVE TRANSACTION sp1",
+            "/* x */ commit tran",
+        ] {
+            assert_eq!(tx_after(MS, sql), TxAfter::Ask, "{sql}");
+        }
+        for sql in [
+            "SELECT 1",
+            "CREATE TABLE t (a int)",
+            "DROP TABLE t",
+            "ALTER TABLE t ADD b int",
+            "TRUNCATE TABLE t",
+            "END",
+            "SET NOCOUNT ON",
+        ] {
+            assert_eq!(tx_after(MS, sql), TxAfter::Unchanged, "{sql}");
+            assert!(!implicit_commit(MS, sql), "{sql}");
+        }
+    }
+
+    /// **What the server says after a failure is what the pill shows.** SQL
+    /// Server may roll the transaction back itself — a deadlock victim, a
+    /// batch-aborting error — or leave it *doomed*, open but uncommittable
+    /// until a `ROLLBACK`, which is PostgreSQL's aborted state by another name.
+    /// An ordinary failure leaves it open and committable, as MySQL's does.
+    #[test]
+    fn a_sql_server_failure_folds_to_what_the_server_said() {
+        let open = TxState::Open { stmts: 2 };
+        assert_eq!(
+            open.on_statement(MS, "UPDATE t SET a = 1", StmtOutcome::Failed),
+            TxState::Open { stmts: 2 }
+        );
+        assert_eq!(
+            open.on_statement(MS, "UPDATE t SET a = 1", StmtOutcome::FailedAndRolledBack),
+            TxState::Idle
+        );
+        assert_eq!(
+            open.on_statement(MS, "UPDATE t SET a = 1", StmtOutcome::FailedAndDoomed),
+            TxState::Poisoned { stmts: 2 }
+        );
+        // A doomed transaction's way out is a ROLLBACK the probe confirmed —
+        // the fold has to let `OkAndClosed` out of `Poisoned`.
+        let doomed = TxState::Poisoned { stmts: 2 };
+        assert_eq!(
+            doomed.on_statement(MS, "ROLLBACK", StmtOutcome::OkAndClosed),
+            TxState::Idle
+        );
+        // And an ordinary statement leaves it doomed.
+        assert_eq!(
+            doomed.on_statement(MS, "SELECT 1", StmtOutcome::Ok),
+            TxState::Poisoned { stmts: 2 }
+        );
+    }
+
+    /// A transaction the server rolled back is disclosed beside the error, as
+    /// MySQL's implicit commit is: the pill going quiet is otherwise the only
+    /// thing that moved, and here everything since `BEGIN` is gone.
+    #[test]
+    fn a_rolled_back_transaction_is_disclosed() {
+        let m = failed_message(
+            "Transaction was deadlocked.",
+            StmtOutcome::FailedAndRolledBack,
+        );
+        assert!(m.starts_with("Transaction was deadlocked."), "{m}");
+        assert!(m.contains("rolled it back"), "{m}");
+        let c = cancelled_message(Some(StmtOutcome::FailedAndRolledBack)).expect("disclosed");
+        assert!(c.contains("rolled it back"), "{c}");
+        assert!(failed_message("x", StmtOutcome::FailedAndDoomed).contains("Rollback"));
+    }
 
     /// A statement whose connection died did nothing wrong; the bar offered
     /// *AI fix* over a healthy `SELECT` for it.

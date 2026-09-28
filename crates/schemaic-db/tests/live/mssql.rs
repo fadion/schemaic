@@ -2252,3 +2252,264 @@ async fn every_catalogued_builtin_is_one_the_server_knows() {
     }
     assert!(unknown.is_empty(), "{unknown:#?}");
 }
+
+// ── Manual transaction mode ─────────────────────────────────────────────────
+
+/// A pinned session on `s`'s database, with its lazy transaction opened.
+async fn manual(s: &Scratch) -> Arc<schemaic_db::session::Session> {
+    let session = schemaic_db::session::Session::open(&s.db, Some(&s.name))
+        .await
+        .expect("a pinned session");
+    session.ensure_tx().await.expect("BEGIN TRANSACTION");
+    session
+}
+
+/// Rows another connection can see — `READPAST`, since under READ COMMITTED
+/// a plain read would wait on the pinned session's locks until it ended.
+async fn committed_rows(s: &Scratch) -> String {
+    s.scalar("SELECT COUNT(*) FROM dbo.t WITH (READPAST)").await
+}
+
+/// One statement on the pinned session, for its outcome alone.
+async fn stmt(
+    session: &schemaic_db::session::Session,
+    sql: &str,
+) -> schemaic_core::tx::StmtOutcome {
+    session
+        .fetch_query(sql, 100, CancellationToken::new())
+        .await
+        .stmt
+}
+
+/// **Nothing commits until Commit, and Rollback undoes it.** The pinned
+/// session's writes are invisible outside it until the button, and gone
+/// after a rollback; the session reports its own server id (`@@SPID`).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_manual_session_commits_only_when_told() {
+    use schemaic_core::tx::StmtOutcome;
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("tx_manual").await;
+    s.exec("CREATE TABLE dbo.t (id int NOT NULL PRIMARY KEY)")
+        .await;
+    let session = manual(&s).await;
+    assert!(session.server_id().is_some_and(|id| id > 0));
+    assert_eq!(
+        stmt(&session, "INSERT dbo.t VALUES (1)").await,
+        StmtOutcome::Ok
+    );
+    assert_eq!(committed_rows(&s).await, "0", "not yet committed");
+    session.commit().await.expect("commit");
+    assert_eq!(committed_rows(&s).await, "1");
+
+    session.ensure_tx().await.expect("BEGIN");
+    assert_eq!(
+        stmt(&session, "INSERT dbo.t VALUES (2)").await,
+        StmtOutcome::Ok
+    );
+    session.rollback().await.expect("rollback");
+    assert_eq!(committed_rows(&s).await, "1", "the rollback undid it");
+    session.close().await;
+}
+
+/// **The server, not the text, decides what a T-SQL transaction statement
+/// did.** A `COMMIT` inside a nested `BEGIN TRAN` closes nothing; a
+/// `ROLLBACK TRANSACTION` to a savepoint keeps the transaction; a plain
+/// `COMMIT` closes it, and the next statement gets a fresh `BEGIN`.
+#[tokio::test(flavor = "multi_thread")]
+async fn t_sql_transaction_statements_are_settled_by_the_server() {
+    use schemaic_core::tx::StmtOutcome;
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("tx_tsql").await;
+    s.exec("CREATE TABLE dbo.t (id int NOT NULL PRIMARY KEY)")
+        .await;
+    let session = manual(&s).await;
+    assert_eq!(
+        stmt(&session, "INSERT dbo.t VALUES (1)").await,
+        StmtOutcome::Ok
+    );
+    assert_eq!(stmt(&session, "BEGIN TRAN").await, StmtOutcome::Ok);
+    assert_eq!(
+        stmt(&session, "COMMIT").await,
+        StmtOutcome::Ok,
+        "the inner level only"
+    );
+    assert_eq!(committed_rows(&s).await, "0");
+    assert_eq!(stmt(&session, "SAVE TRANSACTION sp").await, StmtOutcome::Ok);
+    assert_eq!(
+        stmt(&session, "INSERT dbo.t VALUES (2)").await,
+        StmtOutcome::Ok
+    );
+    assert_eq!(
+        stmt(&session, "ROLLBACK TRANSACTION sp").await,
+        StmtOutcome::Ok,
+        "still open"
+    );
+    assert_eq!(stmt(&session, "COMMIT").await, StmtOutcome::OkAndClosed);
+    assert_eq!(
+        committed_rows(&s).await,
+        "1",
+        "row 1 kept, row 2 rolled back"
+    );
+    // The next statement is in a new transaction, opened by `ensure_tx`.
+    session.ensure_tx().await.expect("BEGIN");
+    assert_eq!(
+        stmt(&session, "INSERT dbo.t VALUES (3)").await,
+        StmtOutcome::Ok
+    );
+    session.rollback().await.expect("rollback");
+    assert_eq!(committed_rows(&s).await, "1");
+    session.close().await;
+}
+
+/// **A failure leaves the transaction open — unless the server ended it.**
+/// A duplicate key fails and keeps what came before; with `XACT_ABORT ON`
+/// the same error rolls the transaction back, and the session says so.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failure_is_folded_as_the_server_left_the_transaction() {
+    use schemaic_core::tx::StmtOutcome;
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("tx_fail").await;
+    s.exec("CREATE TABLE dbo.t (id int NOT NULL PRIMARY KEY)")
+        .await;
+    let session = manual(&s).await;
+    assert_eq!(
+        stmt(&session, "INSERT dbo.t VALUES (1)").await,
+        StmtOutcome::Ok
+    );
+    assert_eq!(
+        stmt(&session, "INSERT dbo.t VALUES (1)").await,
+        StmtOutcome::Failed
+    );
+    session.commit().await.expect("still committable");
+    assert_eq!(committed_rows(&s).await, "1");
+
+    assert_eq!(stmt(&session, "SET XACT_ABORT ON").await, StmtOutcome::Ok);
+    session.ensure_tx().await.expect("BEGIN");
+    assert_eq!(
+        stmt(&session, "INSERT dbo.t VALUES (2)").await,
+        StmtOutcome::Ok
+    );
+    assert_eq!(
+        stmt(&session, "INSERT dbo.t VALUES (1)").await,
+        StmtOutcome::FailedAndRolledBack
+    );
+    assert_eq!(
+        committed_rows(&s).await,
+        "1",
+        "row 2 went with the rollback"
+    );
+    session.close().await;
+}
+
+/// **A grid edit on the pinned session is part of the transaction**, and a
+/// batch that fails is undone alone: the earlier statement survives, the
+/// failure is isolated, and a rollback undoes the lot.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_grid_edit_in_a_manual_session_is_isolated_and_uncommitted() {
+    use schemaic_core::tx::StmtOutcome;
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("tx_grid").await;
+    s.exec("CREATE TABLE dbo.t (id int NOT NULL PRIMARY KEY, v nvarchar(10) NULL)")
+        .await;
+    let session = manual(&s).await;
+    assert_eq!(
+        stmt(&session, "INSERT dbo.t VALUES (1, N'a')").await,
+        StmtOutcome::Ok
+    );
+    let ok = session
+        .commit_writes(
+            &GridWrite {
+                inserts: vec![row_insert(&s, "t", &[("id", txt("2")), ("v", txt("b"))])],
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(ok.stmt, StmtOutcome::Ok, "{:?}", ok.result);
+    let dup = session
+        .commit_writes(
+            &GridWrite {
+                inserts: vec![
+                    row_insert(&s, "t", &[("id", txt("3")), ("v", txt("c"))]),
+                    row_insert(&s, "t", &[("id", txt("1")), ("v", txt("x"))]),
+                ],
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(dup.stmt, StmtOutcome::FailedIsolated, "{:?}", dup.result);
+    // Row 3 went with its batch's savepoint; 1 and 2 are still there.
+    let seen = session
+        .fetch_query("SELECT COUNT(*) FROM dbo.t", 100, CancellationToken::new())
+        .await
+        .result
+        .expect("a count");
+    assert_eq!(seen.cell(0, 0).expect("a cell").display().to_string(), "2");
+    assert_eq!(committed_rows(&s).await, "0");
+    session.rollback().await.expect("rollback");
+    assert_eq!(committed_rows(&s).await, "0");
+    session.close().await;
+}
+
+/// **Stop on a pinned session stops the statement and keeps the
+/// transaction** — `XACT_ABORT` off, the attention aborts only the batch —
+/// and the connection answers the next statement.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stopped_statement_keeps_the_manual_transaction() {
+    use schemaic_core::tx::StmtOutcome;
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("tx_stop").await;
+    s.exec("CREATE TABLE dbo.t (id int NOT NULL PRIMARY KEY)")
+        .await;
+    let session = manual(&s).await;
+    assert_eq!(
+        stmt(&session, "INSERT dbo.t VALUES (1)").await,
+        StmtOutcome::Ok
+    );
+    let cancel = CancellationToken::new();
+    let stop = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        stop.cancel();
+    });
+    let out = session
+        .fetch_query("WAITFOR DELAY '00:00:05'", 100, cancel)
+        .await;
+    assert_eq!(out.stmt, StmtOutcome::Cancelled, "{:?}", out.result);
+    assert_eq!(
+        stmt(&session, "INSERT dbo.t VALUES (2)").await,
+        StmtOutcome::Ok
+    );
+    session.commit().await.expect("commit");
+    assert_eq!(committed_rows(&s).await, "2");
+    session.close().await;
+}
+
+/// A read-only connection is refused a pinned session: SQL Server holds no
+/// read-only transaction, so a Manual tab's Commit could keep a hidden write.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_only_connection_is_refused_a_manual_session() {
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("tx_ro").await;
+    let refused =
+        schemaic_db::session::Session::open_enforced(&s.db, Some(&s.name), Some(Enforce::ReadOnly))
+            .await;
+    assert!(
+        matches!(refused, Err(DbError::Refused(ref m)) if m.contains("Auto mode")),
+        "{:?}",
+        refused.err()
+    );
+}

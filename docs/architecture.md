@@ -8,9 +8,9 @@ statement about. All three engines now edit all three of those objects, and they
 differently, so ask the *narrow* capability (`ddl::supports_or_replace_view`,
 `ddl::supports_view_rename`) rather than the engine. **Microsoft SQL Server is a fourth, and a
 preview rather than a peer**: it connects, reads, validates, introspects, runs scripts, writes
-the grid's edits back, imports a file into a table, designs tables, edits views and drops a
-table, view or routine, and the trigger and routine editors, dump, the plan and Manual mode are
-switched off by capability — see `db::mssql`.
+the grid's edits back, imports a file into a table, designs tables, edits views, drops a
+table, view or routine and holds a Manual tab's transaction, and the trigger and routine editors,
+dump and the plan are switched off by capability — see `db::mssql`.
 
 This is the project's reference document: the crate/module map, the architecture invariants, the
 UI conventions, and the Floem hazards each subsystem is built on. `CLAUDE.md` at the repo root
@@ -5869,22 +5869,32 @@ existing prose was left alone.
     of its own: the band the app lays over a modal's backdrop to keep the title bar working has to
     stop exactly where the caption buttons begin. A count, not a width — the pixels are the UI's.
   - `tx.rs` — the **manual-transaction** state machine behind `TxMode::Manual` (no DB, no UI).
-    Two engines only: **SQLite has no manual mode**, so the status-bar segment offering it is
-    hidden on such a connection and `Session::open` refuses one — not because SQLite lacks
+    Three engines of the four: **SQLite has no manual mode**, so the status-bar segment offering it
+    is hidden on such a connection and `Session::open` refuses one — not because SQLite lacks
     transactions but because a pinned `rusqlite::Connection` is blocking and `!Sync`, needing a
     thread of its own and a channel, which is worth building deliberately rather than as a side
     effect of adding an engine. Running the tab's statements on fresh connections instead would
-    break the single promise the mode makes. **SQL Server has none yet either**, for the plainer
-    reason that its pinned session is not written; `supports_manual_mode` is the one answer for
-    both, an exhaustive `match` the footer asks (it asked `is_sqlite` before there was a second
-    engine without one), with `Session::open` refusing both as the backstop.
+    break the single promise the mode makes. `supports_manual_mode` is that answer, an exhaustive
+    `match` (the footer asked `is_sqlite` before there was a second engine without one; SQL Server
+    was that second engine until its pinned session was written, under `db::mssql`).
+    **`offers_manual_mode(dialect, read_only)` is what the footer actually asks** — its
+    `manual_supported` memo, with the connection's `read_only` — and it is `supports_manual_mode`
+    narrowed by whether the engine can hold a *read-only* transaction. MySQL and PostgreSQL can, so
+    a read-only connection's pinned session is a read-only one (`Session::open_enforced`, under
+    `schemaic-db`); SQL Server cannot, so `open_enforced` refuses a read-only SQL Server connection
+    a session, and the segment is left off there rather than offering a mode whose every press ends
+    in that refusal (`a_read_only_connection_is_offered_manual_mode_where_the_engine_holds_one`).
+    `Session::open`'s refusals stay as the backstop.
     `TxState::on_statement(engine, sql, outcome)` folds one statement into
     `Idle`/`Open{stmts}`/`Poisoned{stmts}`/`Lost`. It is a state machine rather than a bool because
     the engines diverge: PostgreSQL aborts the *whole* transaction on any error (`Poisoned` — only
     `ROLLBACK` gets out), MySQL survives a failed statement but silently commits on mid-transaction
-    DDL. `implicit_commit` is that list, read through the shared `leading_keyword` lexer; a **miss
-    is not harmless** — after one, a Rollback runs as a successful no-op and reports an undo that
-    never happened.
+    DDL, and SQL Server (`TxEngine::MsSql`) is a third model rather than either — its DDL is
+    transactional, so nothing commits by side effect, and a failed statement leaves the transaction
+    open and committable under `XACT_ABORT OFF`, the default, unless the server rolled it back
+    itself or *doomed* it (below). `implicit_commit` is MySQL's list, read through the shared
+    `leading_keyword` lexer; a **miss is not harmless** — after one, a Rollback runs as a successful
+    no-op and reports an undo that never happened.
     **What that list never named is the statements whose whole purpose is to close a transaction**,
     and three consequences came out of the gap. A typed `COMMIT`/`ROLLBACK` in a Manual tab left the
     session's `in_tx` true, so `ensure_tx` issued no `BEGIN` for the next statement and it ran with
@@ -5986,8 +5996,9 @@ existing prose was left alone.
     `None` — not asked, or the server could not answer — keeps the conservative reading that was
     there before the probe, rather than trading a silent no-op Rollback for its mirror, a pill
     saying *Idle* over a transaction whose next statement's `BEGIN` would commit it.
-    `StmtOutcome::FailedAndCommitted` is the confirmed case and the only outcome `failed_message`
-    appends its disclosure to, because that loss is otherwise invisible: the statements folded in are
+    `StmtOutcome::FailedAndCommitted` is the confirmed case and the first outcome `failed_message`
+    appended a disclosure to (SQL Server's two, below, are the others), because that loss is
+    otherwise invisible: the statements folded in are
     already permanent, **Rollback** succeeds and undoes nothing, and the pill going quiet is the
     only thing on screen that moved.
     **`cancelled_message` is the same disclosure for the arm that had none, and a Stop is not a
@@ -6049,6 +6060,33 @@ existing prose was left alone.
     `on_statement(Postgres, "SELECT", Cancelled)` is *supposed* to poison, and the pinned session
     has no test seam of its own at all, `Session::open` refusing SQLite so the in-memory backend
     cannot reach it.
+    **SQL Server's state is read off the server after every statement, because its text decides
+    none of it.** `probes_after_every_statement(engine)` is `true` for `TxEngine::MsSql` alone
+    (`sql_server_has_a_manual_mode_that_asks_the_server`): `@@TRANCOUNT` counts nested `BEGIN TRAN`s, so a typed `COMMIT` may close nothing; `ROLLBACK
+    TRANSACTION s` is a savepoint's and leaves the transaction open; a batch can end a transaction
+    inside an `IF` or a `TRY` the head keyword never sees; and the server rolls a transaction back
+    itself for a deadlock victim or a batch-aborting error. So `tx_after(MsSql, …)` answers `Ask`
+    for a leading `COMMIT`/`ROLLBACK`/`BEGIN`/`SAVE` — a bare `BEGIN` is a block in T-SQL, not a
+    transaction, where the other two engines' arm answers `Open` for it — and `Unchanged` for
+    everything else, with `implicit_commit` `false` throughout
+    (`t_sql_transaction_statements_are_asked_about_and_ddl_does_not_commit`). `Ask` there says only
+    that the text is not to be trusted; the session probes regardless (`Session::settle_from_server`,
+    under `db::mssql`), one round trip per statement, which is the price of never guessing on a mode
+    whose promise is that nothing commits by surprise. The probe's answers arrive as outcomes no text
+    could produce. `OkAndClosed` was already there. `StmtOutcome::FailedAndRolledBack` — the server
+    ended the transaction by rolling it back — folds to `Idle`, `FailedAndCommitted`'s mirror: the
+    transaction is gone and the pill quiet either way, but here everything since `BEGIN` is undone
+    rather than permanent. `StmtOutcome::FailedAndDoomed` — `XACT_STATE()` of -1, still open but
+    uncommittable until a `ROLLBACK` — folds to `Poisoned`, PostgreSQL's aborted state by another
+    name; an ordinary failure stays `Open` there, as on MySQL
+    (`a_sql_server_failure_folds_to_what_the_server_said`). **`Poisoned` has one more exit, and it
+    is load-bearing**: `Poisoned` + `OkAndClosed` → `Idle`. A doomed transaction's way out is a
+    `ROLLBACK` whose text cannot confirm it closed anything — `tx_after` asks — so the probe's answer
+    arrives as `OkAndClosed`, while the older exit arm matches only `Ok`; without the new arm the tab
+    read "Tx aborted" for the rest of its life over no transaction at all. `failed_message` and
+    `cancelled_message` carry a sentence for each new outcome, since neither loss is in the server's
+    error: that the rolled-back transaction's statements are undone, and that the doomed one can
+    only be rolled back (`a_rolled_back_transaction_is_disclosed`).
     `pill_text` is the status-bar string. It also owns what the user is told
     while a write **waits**: `write_blocking_tabs` (which of our own tabs' transactions a grid
     write could be queued behind — same connection scope as `ddl_blocking_tabs`, but excluding
@@ -9566,7 +9604,8 @@ existing prose was left alone.
   `Refused` exists because the variant is the provenance and this crate had been writing its own
   words as `Query`/`Connect`, so the bar and the modal offered *AI fix* or *Explain* on them. Its
   producers are `sqlite::open_target`'s three refusals, SQLite's "the SQLite worker failed: …" (a
-  `Query` once), `Session::open`'s SQLite manual-mode backstop (a `Connect` once),
+  `Query` once), `Session::open`'s SQLite manual-mode backstop (a `Connect` once) and
+  `Session::open_enforced`'s refusal of a read-only SQL Server connection (under `mssql.rs`),
   `mysql::unpinnable_mode` — `enforce_session`'s refusal when the server puts a quote-moving
   `sql_mode` back — `session::aborted_commit`, which `Session::commit` answers over a block that was
   already aborted, and the non-`Complete` arms of `mysql::cancelled_import`/`cancelled_write`
@@ -9650,8 +9689,8 @@ existing prose was left alone.
   unlikely. **The length and
   the bytes come out of one row of one statement**, never two queries: asked separately they can
   straddle another session's `UPDATE`, and the pair is what `BlobValue::truncated` reads to decide
-  whether a save would write a file that is not the data. `Session::fetch_blob` (MySQL and
-  PostgreSQL) runs the same body on the pinned connection for `Session::refetch_rows`' reason: a
+  whether a save would write a file that is not the data. `Session::fetch_blob` (MySQL,
+  PostgreSQL and SQL Server) runs the same body on the pinned connection for `Session::refetch_rows`' reason: a
   manual-transaction tab that has written a blob and not committed would otherwise open the panel
   on the pre-transaction bytes and call them current. Like every other `Session` call site, the app
   folds its `Outcome::stmt` into `TxState::on_statement`: a read is still a statement, and one that
@@ -9674,7 +9713,9 @@ existing prose was left alone.
   `fetch_blob` also gained `fetch_query`'s pre-dispatch `cancel.is_cancelled()` check on **both**
   sides of the connection lock: the overwhelmingly common cancellation there is the panel being
   dismissed, and `NotSent` is the one outcome that leaves an *open* transaction alone with no
-  bookkeeping at all.
+  bookkeeping at all. **SQL Server's reads are not fenced, and need not be**: `run_scope_sql`
+  answers `false` there without asking, because a T-SQL savepoint cannot be released, and a
+  cancelled read does not abort a SQL Server transaction — see `mssql.rs`.
   **Both reads also leave through `Outcome::into_read`, and that is the half the fence cannot
   cover.** `fence_read` has no savepoint to set when there is no transaction to fence — PostgreSQL
   answers `ERROR: SAVEPOINT can only be used in transaction blocks`, so `run_scope_sql` reports
@@ -9878,7 +9919,9 @@ existing prose was left alone.
   with the pinned connection put in the state **before any `BEGIN`**: `mysql::enforce_session`, now
   `pub(crate)` for it, on MySQL/MariaDB — a failure disconnects and fails the open — and `SET SESSION
   CHARACTERISTICS AS TRANSACTION READ ONLY` on PostgreSQL, so every transaction `ensure_tx` opens
-  for the tab's life is a read-only one. `Db::explain` takes a `read_only` flag, because `EXPLAIN
+  for the tab's life is a read-only one. SQL Server has no read-only transaction to hold, so there
+  the `ReadOnly` open is **refused** rather than granted an unguarded session (under `mssql.rs`).
+  `Db::explain` takes a `read_only` flag, because `EXPLAIN
   ANALYZE` *executes* the statement inside a transaction it always rolls back, and the rollback is
   not the guarantee it looks like: it undoes an InnoDB write but not a MyISAM or Aria one, and on
   PostgreSQL `setval`/`nextval` are never rolled back, so a measured `SELECT setval(…)` moved the
@@ -10624,13 +10667,13 @@ existing prose was left alone.
   `fetch_schema`, the monitor's `fetch_table`, `count_rows` (`COUNT_BIG`), table statistics from
   `sys.dm_db_partition_stats`, Server Activity, `run_script`, and the grid's write-back —
   `commit_writes`, `refetch_rows` and `fetch_blob` (below) — `import_rows` (below), and `run_ddl`,
-  for the table changes `supports_change` admits (below). `explain` and `run_server_ddl` answer
-  `DbError::Refused("… is not available for SQL Server yet.")`, and so does `Session::open`, as it
-  does for SQLite. **The refusals are the backstop, not the gate**: the app is kept off them by
+  for the table changes `supports_change` admits (below), and a Manual tab's pinned `Session`
+  (below). `explain` and `run_server_ddl` answer
+  `DbError::Refused("… is not available for SQL Server yet.")`. **The refusals are the backstop,
+  not the gate**: the app is kept off them by
   capabilities, each an exhaustive `match` with `MsSql` on `false`, asked at the UI site that
   offers the thing — `plan::supports_plan` for the editor's Plan entry; `dump::supports_dump` for
-  the tree's *Export ▸ SQL*; `tx::supports_manual_mode` for
-  the footer's Auto/Manual segment, which used to ask `is_sqlite`; `users::supports_users`, since
+  the tree's *Export ▸ SQL*; `users::supports_users`, since
   logins and the users mapped to them in each database are two catalogues the browser's one list
   fits neither half of; and
   `ddl::supports_change`, whose SQL Server answer comes before anything else and is
@@ -10673,7 +10716,9 @@ existing prose was left alone.
   cell unwritable until the write-back below landed, and it answers `true` for all four engines now
   — kept an exhaustive `match` rather than deleted, so the next engine, arriving without a
   write-back, has to say which side of it it is on. `import::supports_import` is the second, on
-  the same terms, since `import_rows` landed. Server Activity is the one
+  the same terms, since `import_rows` landed, and `tx::supports_manual_mode` the third, since the
+  pinned session below was written — though a *read-only* SQL Server connection is still not
+  offered the mode (`tx::offers_manual_mode`), and that one is about the engine. Server Activity is the one
   split that *is* about the engine: `KILL` ends a session, but no T-SQL statement cancels another
   session's request and leaves the session standing — a cancel is an attention sent by the owner's
   own client — so `activity::supports_kill_kind` says no to *Cancel query* there and
@@ -10727,8 +10772,10 @@ existing prose was left alone.
   connection's close. `run_script` holds one connection for the file, as on every engine, over
   statements the splitter has already cut at `GO` lines with each routine body kept whole
   (`core::sql`'s `batch_separator`), which is what SQL Server's own tools send. A failed T-SQL
-  statement leaves its transaction usable, as MySQL's does, so `tx_engine_of` maps it to MySQL's
-  model — unless the session set `XACT_ABORT ON`, which is its own choice to make.
+  statement leaves its transaction usable, as MySQL's does, but its DDL does not commit, so
+  `tx_engine_of` maps it to a model of its own, `tx::TxEngine::MsSql` (under `core::tx`) — and
+  what a failure did under `XACT_ABORT ON`, a session's own choice to make, is read off the server
+  rather than assumed (the pinned session, below).
   **Grid write-back is this engine's arm of *Write-back is transactional…*** (*Architecture
   invariants*). `commit_writes` connects to the batch's database — a `GridWrite` is one table's —
   runs `GridWrite::plan` step by step inside `BEGIN TRANSACTION` through `execute` with `@P1…`
@@ -10779,8 +10826,68 @@ existing prose was left alone.
   the position of.
   `a_stopped_commit_is_undone` pins it against a trigger that holds the edit five seconds — it
   asserts `DbError::Cancelled`, the row unchanged and the whole commit under 3 s, and failed against
-  the unpatched driver. There is no `TxScope`: with no Manual mode, the write's own transaction
-  is the only case there is.
+  the unpatched driver.
+  **`commit_writes` is a connect and `write_on`, the body the pinned session calls directly** —
+  `mysql.rs`'s shape — and `fetch_blob`/`refetch_rows` are a connect and `blob_on`/`refetch_on` on
+  the same terms, each read raced against Stop inside. The write is bracketed by `WriteScope`
+  rather than the shared `TxScope`, because T-SQL's savepoint is not the other engines'.
+  `WriteScope::Own` is everything above. `WriteScope::Savepoint` is `SAVE TRANSACTION schemaic_w`
+  (`SAVEPOINT`) inside the tab's transaction, undone by `ROLLBACK TRANSACTION schemaic_w`, never
+  committed — the transaction is the caller's to end — and its errors carry no rollback note, since
+  "rolled back all changes" there would claim the user's whole transaction. **Its undo also
+  switches off an `IDENTITY_INSERT` the batch left on**: a savepoint rollback leaves session
+  settings alone, and on a pinned connection the setting would outlive the batch and refuse the
+  tab's next ordinary insert into that table (Msg 545). **What the undo achieved goes out through
+  `write_on`'s `undone` parameter, and the session reads that rather than rolling back again**,
+  which is where this arm parts from the other engines' `classify_isolated`: a T-SQL savepoint
+  cannot be released, so its name stays live for the rest of the transaction, and a second
+  `ROLLBACK TRANSACTION schemaic_w` after a batch that failed before its own `SAVE` would land on an
+  *earlier* batch's — silently undoing the user's statements since. `undone` stays `None` when the
+  batch failed before anything was written.
+  **Manual mode is `Session`'s `Backend::MsSql` arm** — one pinned client, boxed because tiberius
+  keeps its buffers inline — and it holds the transaction as SQL Server's own tools do, with
+  `XACT_ABORT` left at its default, off. `Session::open_enforced` connects through `connect` and
+  learns `@@SPID` (`spid`) as the session's server id, which is what lets Server Activity recognise
+  the tab's own session, as MySQL's thread id and PostgreSQL's pid do. **It refuses a read-only
+  connection outright** (`DbError::Refused`, saying such a connection runs in Auto mode): SQL Server
+  has no read-only transaction, its fresh-connection guard is a transaction that is never committed
+  (`fetch_query`, above), and that cannot outlive one statement on a pinned session, where a typed
+  `COMMIT` or the button would keep whatever a hidden write had done. Auto mode loses such a
+  connection nothing, since it has nothing to commit, and `tx::offers_manual_mode` keeps the footer
+  from offering the mode there, so the refusal is the backstop. The session's own control
+  statements are T-SQL's (`Session::control_on`, over a private `Ctl`): `BEGIN TRANSACTION`,
+  because a bare `BEGIN` opens a block; `WHILE @@TRANCOUNT > 0 COMMIT TRANSACTION`, so the button
+  commits every nested level the tab opened rather than lowering the count by one; and
+  `IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION`, since a `ROLLBACK` with nothing open is an error
+  (Msg 3903) rather than a warning, which a transaction the server had already rolled back would
+  hit. `close` issues the same guarded rollback, `alive` is a `SELECT 1` (tiberius has no liveness
+  flag to read), and `block_is_aborted` is `XACT_STATE()` of -1 — a doomed transaction, whose
+  `COMMIT` fails with Msg 3930 — or no answer. **After every operation the session asks the
+  server** (`tx::probes_after_every_statement`; `core::tx` has why no text can decide it):
+  `tx_state` reads `@@TRANCOUNT` and `XACT_STATE()` in one round trip, and
+  `Session::settle_from_server` sets `in_tx` from the count and folds the answer into the outcome —
+  a success with the count at 0 after an open transaction is `OkAndClosed`, a failure there
+  `FailedAndRolledBack`, a failure with the state at -1 `FailedAndDoomed`, and a probe nobody
+  answers leaves everything as it was. `fetch_query`, `commit_writes`, `fetch_blob` and
+  `refetch_rows` all end in it, except over a lost connection, and `tx_alive` — MySQL's probe —
+  is never asked on this engine. `fetch_query` runs `run_statement` on the pinned client, and a result cut short at the
+  row cap needs no draining for the next statement: tiberius resynchronises the stream at the start
+  of every request (`flush_stream`). **`run_scope_sql` answers `false` for SQL Server without
+  asking**, over a private `ScopeStep`, for `write_on`'s reason — an unreleasable savepoint name —
+  so the pinned reads run unfenced, which costs nothing because a cancelled read does not abort a
+  SQL Server transaction. The grid's writes report isolation off `undone` instead: nothing
+  written, or the savepoint rolled back and the server saying so, is `FailedIsolated` or
+  `CancelledIsolated`, and the probe then says whether the server itself ended or doomed the
+  transaction. The live pins are `a_manual_session_commits_only_when_told`,
+  `t_sql_transaction_statements_are_settled_by_the_server` (a `COMMIT` inside a nested
+  `BEGIN TRAN` closes nothing, `ROLLBACK TRANSACTION sp` keeps the transaction, a plain `COMMIT` is
+  `OkAndClosed`), `a_failure_is_folded_as_the_server_left_the_transaction` (a duplicate key is
+  `Failed` and still committable; after `SET XACT_ABORT ON` the same error is
+  `FailedAndRolledBack`), `a_grid_edit_in_a_manual_session_is_isolated_and_uncommitted`,
+  `a_stopped_statement_keeps_the_manual_transaction` (a `WAITFOR` stopped, the transaction kept, the
+  next statement fine) and `a_read_only_connection_is_refused_a_manual_session`. Their outside view
+  reads `WITH (READPAST)`: under READ COMMITTED a plain read from a second connection waits on the
+  session's locks until the transaction ends.
   **`import_rows` is that discipline scaled to a file**, in the shape every engine's load takes
   (`Db::import_rows`, under `lib.rs` below): one `BEGIN TRANSACTION`, batches pulled through the
   shared `next_batch_off_executor`, each required to insert exactly its own rows or the whole
@@ -11391,8 +11498,7 @@ existing prose was left alone.
   that brings a real builtin within edit distance fails here where no membership test can see it.
   **`mssql.rs` is SQL Server's whole leg, and it is outside the macro for the opposite reason**:
   not because its subject is a data file but because the shared suite writes rows back, applies
-  DDL and pins sessions, and SQL Server still refuses the last and applies only a fraction of the
-  second.
+  DDL and pins sessions, and SQL Server applies only a fraction of the second.
   So it tests what the engine does do, on its own terms — ping and the database list, every type
   `cell_value` renders against the text SQL Server's tools print, `SELECT *` provenance, the
   read-only rollback (`a_read_only_session_rolls_back_what_a_select_hides`: a `SELECT … INTO`
@@ -11409,7 +11515,9 @@ existing prose was left alone.
   keeping their clustering and every
   AdventureWorksLT table round-tripping where that sample is installed, also under `mssql.rs`),
   a file import (four tests, from every row across batches to a cancel rolled back, under
-  `mssql.rs` too), and the
+  `mssql.rs` too), Manual mode on a pinned session (six tests, from
+  `a_manual_session_commits_only_when_told` to `a_read_only_connection_is_refused_a_manual_session`,
+  under `mssql.rs` as well), and the
   three catalogues only it has — `every_allowlisted_function_is_a_builtin` (the read gate's lists,
   by error 195), `every_builtin_snippet_runs`, and `every_catalogued_builtin_is_one_the_server_knows`
   (`core::mssql_builtins`, by the same error 195 and in the over-listing direction only, under
@@ -23507,17 +23615,21 @@ Re-introducing the anti-patterns these guard against is a regression:
   `sqlite::rebuild_fk_tests` pinning both cases — and the reading to keep is that a deviation
   towards *more* connections than the rule asks for is exactly as unsanctioned as one towards
   fewer.
-  In-transaction writes nest under a `SAVEPOINT` (`TxScope`) so the 1-row guard can roll back its own
+  In-transaction writes nest under a `SAVEPOINT` (`TxScope`; on SQL Server `SAVE TRANSACTION`,
+  `mssql::WriteScope::Savepoint`) so the 1-row guard can roll back its own
   batch without ending the user's transaction, and the transaction *state* is the pure, tested
   `schemaic_core::tx::TxState` — engine divergence (PG poisons on error, MySQL implicitly commits on
-  DDL) belongs there, not in UI conditionals. **Asking the server is the fallback wherever the
-  statement's text cannot carry the fact, and there are three such places.** The original is a
+  DDL, SQL Server's is read off the server) belongs there, not in UI conditionals. **Asking the
+  server is the fallback wherever the statement's text cannot carry the fact, and there are three
+  such places** on MySQL; on SQL Server it is not the fallback but the rule, the session asking
+  after every statement (`tx::probes_after_every_statement`, under `core::tx`), because there no
+  text decides it. The original is a
   *failed* statement: `implicit_commit` gates the round trip, `failure_committed` decides, and the
   outcome is `StmtOutcome::FailedAndCommitted`. The other two are *successful* statements sharing
   one line — a MySQL `SET autocommit` and a replication `START`, the two things `tx::tx_after` says
   `Ask` for — and both clear `in_tx` and upgrade the outcome to `StmtOutcome::OkAndClosed`, which
   is how the pill, which cannot ask, gets the answer too. The probe answers all three: `tx_alive`
-  (private to `session.rs`) tries `@@in_transaction` — MariaDB's, exact, no privilege needed, counts
+  (private to `session.rs`) tries, on MySQL, `@@in_transaction` — MariaDB's, exact, no privilege needed, counts
   a read-only transaction — and falls back to a scoped `information_schema.INNODB_TRX` count, which
   both servers have and which needs the `PROCESS` privilege the Server Activity panel already
   assumes. It misses a transaction that has done no InnoDB work, which is harmless here because one
