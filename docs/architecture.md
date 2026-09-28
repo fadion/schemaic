@@ -6306,10 +6306,35 @@ existing prose was left alone.
     noted form. DBeaver also keeps the instance in its own `host` field (`laptop\SQLEXPRESS`), so its
     reader splits it off there and notes it when the entry names no port, and its generic-driver
     fallback strips jTDS's `jtds:` as `parse_url` does
-    (`dbeaver_reads_a_named_instance_and_a_jtds_source`). **`redacted` knows the braces too**: a
-    password's value opened with `{` runs to the first `}` that is not a doubled `}}`, `;` and
-    spaces included, so a SQL Server URL that fails to parse shows none of `password={p;w=d}` in the
-    not-imported list — split at each `;`, it showed `w=d}` (`a_braced_password_is_redacted_whole`).
+    (`dbeaver_reads_a_named_instance_and_a_jtds_source`).
+    **A connection string with no scheme at all is SQL Server's too** — ADO.NET's
+    `Server=tcp:host\instance,port;Database=d;User Id=u;Password=p`, the shape `appsettings.json`
+    holds, and ODBC's and OLE DB's, which spell the same keywords around a `Driver` or `Provider`.
+    `looks_like_connection_string` decides on the first keyword alone — the server, the driver, the
+    provider or the database, which is what such strings open with — unless that first value holds
+    `://`, which is a variable named `DATABASE` holding a URL. It is asked **before**
+    `strip_env_assignment`, which would otherwise eat a `Server=` head as a variable name, and again
+    after it, for ASP.NET's `ConnectionStrings__Default="Server=…"`. `parse_connection_string`
+    **reads the driver rather than assuming it**: an ODBC string for MySQL is the same grammar, so a
+    `Driver`/`Provider` that `names_sql_server_driver` does not recognise is
+    `UrlError::UnknownScheme`, not a SQL Server row with a MySQL host. It reads the transport too —
+    `np:` named pipes and `(localdb)` are `UrlError::Transport`, since TCP is all Schemaic speaks,
+    while `lpc:`, `.` and `(local)` are this machine and become `localhost`. A named instance with
+    no port takes `NamedInstance` as the URL form does, and the TLS words go through
+    `apply_mssql_tls`, now the one reading both grammars share. `split_mssql_props` gained a
+    `quotes` flag for ADO.NET's `"…"`/`'…'` (a doubled quote standing for one), off for JDBC, which
+    has no such quoting — a JDBC password that merely starts with `"` is left alone. **A login
+    handed to Windows or Entra keeps the row and says so**: `Integrated Security`/`Trusted_Connection`
+    true or `SSPI`, or any `Authentication=` but `Sql Password`, carries `ImportNote::ExternalLogin`,
+    since Schemaic sends SQL logins only and the row cannot sign in until one is set
+    (`an_ado_net_connection_string_is_read_by_its_keywords`,
+    `an_odbc_connection_string_is_read_when_its_driver_is_sql_server`,
+    `an_ado_net_string_notes_what_it_cannot_carry_over`). **`redacted` knows the braces too**: a
+    password's value opened with `{` — or with ADO.NET's `"` or `'` — runs to the first matching
+    closer that is not doubled (`closing_quote`), `;` and spaces included, so a SQL Server string
+    that fails to parse shows none of `password={p;w=d}` or `Password="p;w=d"` in the not-imported
+    list — split at each `;`, it showed `w=d}` (`a_braced_password_is_redacted_whole`,
+    `a_quoted_password_is_redacted_whole`).
     **`split_userinfo` is where a URL comes apart, and the order is the whole point.** Everything
     past `://` is cut at the **last `@`** — an email address is an ordinary username — and only then
     is the remainder searched for a path, a `?` or a `#`. Both readers used to do it the other way

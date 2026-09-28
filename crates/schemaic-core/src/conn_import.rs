@@ -133,6 +133,11 @@ pub enum ImportNote {
     /// the host's *default* instance, if it has one, not the named one — and
     /// this says to set the instance's port.
     NamedInstance,
+    /// A SQL Server connection that signs in as the **Windows user** or through
+    /// **Microsoft Entra** (`Integrated Security`, `Authentication=Active
+    /// Directory …`) rather than with a SQL login. Schemaic sends a SQL login
+    /// only, so the row keeps the server and this says a login is wanted.
+    ExternalLogin,
 }
 
 impl ImportNote {
@@ -145,6 +150,7 @@ impl ImportNote {
             ImportNote::PasswordFromPgpass => "Password taken from your own .pgpass",
             ImportNote::PortAssumed => "The source named no port; this is the default",
             ImportNote::NamedInstance => "A named instance: set the port it listens on",
+            ImportNote::ExternalLogin => "Signs in with Windows or Entra: set a SQL login",
         }
     }
 }
@@ -463,9 +469,8 @@ fn redacted(name: &str) -> String {
     // separator on the end of its own part, so the text is rebuilt exactly.
     const SEPS: [char; 4] = ['&', '?', ';', ' '];
     // **A key, its `=` and its value can land in three different parts**, because
-    // ` ` is one of the separators. `Pwd = hunter2` — an ODBC-shaped DSN, which
-    // the paste field invites, `strip_env_assignment` existing to eat its
-    // `Server=` head — therefore never reached `split_once('=')` with the key and
+    // ` ` is one of the separators. `Pwd = hunter2` — an ODBC-shaped connection
+    // string, which the paste field reads — therefore never reached `split_once('=')` with the key and
     // the value together, and passed through whole. `Password=hunter2` unspaced
     // redacted correctly, which is why nothing caught it.
     //
@@ -473,15 +478,16 @@ fn redacted(name: &str) -> String {
     // a bare `Pwd`, kept across a bare `=` or a `Pwd=` with nothing after it,
     // and cleared by anything else — so `Pwd x y` redacts `x` and leaves `y`.
     let mut awaiting = false;
-    // **Inside a braced secret** — Microsoft's `password={a;b}`, whose value
-    // runs to the first `}` that is not a doubled `}}`, separators and all. Its
-    // parts are swallowed until that one; splitting at the `;` inside showed
-    // the rest of the password.
-    let mut in_brace = false;
+    // **Inside a braced or quoted secret** — Microsoft's `password={a;b}`, or
+    // ADO.NET's `Password="a;b"`, whose value runs to the first closer that is
+    // not a doubled one, separators and all. Its parts are swallowed until that
+    // one; splitting at the `;` inside showed the rest of the password. Holds
+    // the closer being waited for.
+    let mut in_quote: Option<u8> = None;
     for part in rest.split_inclusive(SEPS) {
-        if in_brace {
-            if let Some(close) = closing_brace(part) {
-                in_brace = false;
+        if let Some(closer) = in_quote {
+            if let Some(close) = closing_quote(part, closer) {
+                in_quote = None;
                 out.push_str(&part[close + 1..]);
             }
             continue;
@@ -498,12 +504,18 @@ fn redacted(name: &str) -> String {
                     out.push_str(key);
                     out.push_str("=…");
                     awaiting = false;
-                    if let Some(braced) = value.trim_start().strip_prefix('{')
-                        && closing_brace(braced).is_none()
+                    let value = value.trim_start();
+                    let closer = match value.bytes().next() {
+                        Some(b'{') => Some(b'}'),
+                        Some(q @ (b'"' | b'\'')) => Some(q),
+                        _ => None,
+                    };
+                    if let Some(closer) = closer
+                        && closing_quote(&value[1..], closer).is_none()
                     {
                         // The separator is the secret's too; the part that
-                        // closes the brace brings back what follows it.
-                        in_brace = true;
+                        // closes the quote brings back what follows it.
+                        in_quote = Some(closer);
                         continue;
                     }
                 } else {
@@ -529,14 +541,15 @@ fn redacted(name: &str) -> String {
     out
 }
 
-/// Where the brace a braced value opened closes in `s` — the first `}` that is
-/// not one of a doubled `}}` — or `None` when it does not close here.
-fn closing_brace(s: &str) -> Option<usize> {
+/// Where the brace or quote a quoted value opened closes in `s` — the first
+/// `closer` (`}`, `"` or `'`) that is not one of a doubled pair — or `None`
+/// when it does not close here.
+fn closing_quote(s: &str, closer: u8) -> Option<usize> {
     let b = s.as_bytes();
     let mut i = 0;
     while i < b.len() {
-        if b[i] == b'}' {
-            if b.get(i + 1) == Some(&b'}') {
+        if b[i] == closer {
+            if b.get(i + 1) == Some(&closer) {
                 i += 2;
                 continue;
             }
@@ -661,6 +674,9 @@ pub enum UrlError {
     BadPort(String),
     /// A `sqlite:` URL with no path after the scheme.
     NoPath,
+    /// A SQL Server connection string whose server is reached by a transport
+    /// other than TCP — named pipes, LocalDB. Carries the server as written.
+    Transport(String),
 }
 
 impl UrlError {
@@ -669,7 +685,8 @@ impl UrlError {
         match self {
             UrlError::Empty => "Paste a connection URL.".to_string(),
             UrlError::NoScheme => {
-                "No scheme — a URL starts with mysql://, postgresql://, sqlserver:// or sqlite:."
+                "No scheme — a URL starts with mysql://, postgresql://, sqlserver:// or sqlite:, \
+                 a SQL Server connection string with Server=."
                     .to_string()
             }
             UrlError::UnknownScheme(s) => {
@@ -680,6 +697,9 @@ impl UrlError {
             UrlError::NoHost => "No host in the URL.".to_string(),
             UrlError::BadPort(p) => format!("\"{p}\" is not a port number."),
             UrlError::NoPath => "No database file after sqlite:.".to_string(),
+            UrlError::Transport(s) => format!(
+                "\"{s}\" is reached over named pipes or LocalDB — Schemaic connects over TCP only."
+            ),
         }
     }
 }
@@ -699,12 +719,24 @@ pub fn parse_url(input: &str) -> Result<Connection, UrlError> {
     parse_url_noted(input).map(|(c, _)| c)
 }
 
-/// [`parse_url`], with the advisory notes the URL itself warrants — today one:
-/// a SQL Server named instance with no port ([`ImportNote::NamedInstance`]).
+/// [`parse_url`], with the advisory notes the URL itself warrants — a SQL
+/// Server named instance with no port ([`ImportNote::NamedInstance`]), and a
+/// connection string's Windows or Entra login ([`ImportNote::ExternalLogin`]).
+///
+/// **A connection string is tried before the `.env` strip**, which would eat
+/// its `Server=` head as a variable name — and after it too, for ASP.NET's
+/// `ConnectionStrings__Default="Server=…"`.
 fn parse_url_noted(input: &str) -> Result<(Connection, Vec<ImportNote>), UrlError> {
-    let raw = strip_env_assignment(strip_bom(input).trim());
+    let trimmed = strip_bom(input).trim();
+    if looks_like_connection_string(trimmed) {
+        return parse_connection_string(trimmed);
+    }
+    let raw = strip_env_assignment(trimmed);
     if raw.is_empty() {
         return Err(UrlError::Empty);
+    }
+    if looks_like_connection_string(raw) {
+        return parse_connection_string(raw);
     }
     // `jdbc:` is a wrapper around the URL the driver itself reads — and jTDS
     // wraps its `sqlserver:` once more.
@@ -771,7 +803,7 @@ fn parse_mssql_url(rest: &str) -> Result<(Connection, Vec<ImportNote>), UrlError
     c.database = percent_decode(path.split('/').next().unwrap_or(""));
     let mut port = port;
     let (mut encrypt, mut trust) = (None::<String>, false);
-    for (k, v) in split_mssql_props(props) {
+    for (k, v) in split_mssql_props(props, false) {
         if v.is_empty() {
             continue;
         }
@@ -792,14 +824,7 @@ fn parse_mssql_url(rest: &str) -> Result<(Connection, Vec<ImportNote>), UrlError
     }
     c.host = host;
     c.port = port.unwrap_or_else(|| default_port(MSSQL));
-    match (encrypt.as_deref(), trust) {
-        (Some("false" | "no" | "optional"), _) => c.tls.mode = SslMode::Disable,
-        (Some("strict"), _) => c.tls.mode = SslMode::VerifyFull,
-        (Some("true" | "yes" | "mandatory"), false) => c.tls.mode = SslMode::VerifyFull,
-        (Some("true" | "yes" | "mandatory"), true) | (None, true) => c.tls.mode = SslMode::Require,
-        // Unrecognised, or not said: the import's own floor.
-        _ => {}
-    }
+    apply_mssql_tls(&mut c, encrypt.as_deref(), trust);
     let notes = if instance.is_some() && port.is_none() {
         vec![ImportNote::NamedInstance]
     } else {
@@ -808,9 +833,138 @@ fn parse_mssql_url(rest: &str) -> Result<(Connection, Vec<ImportNote>), UrlError
     Ok((c, notes))
 }
 
+/// The Microsoft drivers' `encrypt` (normalised) and `trustServerCertificate`,
+/// onto the TLS ladder as those drivers mean them — the one reading JDBC's
+/// properties and ADO.NET's keywords share.
+fn apply_mssql_tls(c: &mut Connection, encrypt: Option<&str>, trust: bool) {
+    match (encrypt, trust) {
+        (Some("false" | "no" | "optional"), _) => c.tls.mode = SslMode::Disable,
+        (Some("strict"), _) => c.tls.mode = SslMode::VerifyFull,
+        (Some("true" | "yes" | "mandatory"), false) => c.tls.mode = SslMode::VerifyFull,
+        (Some("true" | "yes" | "mandatory"), true) | (None, true) => c.tls.mode = SslMode::Require,
+        // Unrecognised, or not said: the import's own floor.
+        _ => {}
+    }
+}
+
+/// Does this text read as an ADO.NET / ODBC / OLE DB **connection string** —
+/// `keyword=value;…` naming a server, with no scheme in front? The first
+/// keyword decides, as it does for every such string in the wild: they open
+/// with the server, the driver or the provider. A first value holding `://` is
+/// an environment variable named `DATABASE` whose value is a URL.
+fn looks_like_connection_string(s: &str) -> bool {
+    let Some((key, value)) = s.split_once('=') else {
+        return false;
+    };
+    !value.split(';').next().unwrap_or("").contains("://")
+        && matches!(
+            normalize_key(key).as_str(),
+            "server"
+                | "datasource"
+                | "address"
+                | "addr"
+                | "networkaddress"
+                | "driver"
+                | "provider"
+                | "initialcatalog"
+                | "database"
+        )
+}
+
+/// An ADO.NET connection string — `Server=tcp:host\instance,port;Database=d;
+/// User Id=u;Password=p;…`, the shape `appsettings.json` holds — or ODBC's and
+/// OLE DB's, which spell the same keywords around a `Driver` or `Provider`.
+///
+/// **The driver is read, not assumed**: an ODBC string names MySQL's driver in
+/// the same grammar, and one whose `Driver`/`Provider` is not SQL Server's is
+/// an unknown engine rather than a SQL Server with a MySQL host. **So is the
+/// transport**: `np:` (named pipes) and `(localdb)` are refused as
+/// [`UrlError::Transport`], since TCP is all Schemaic speaks; `lpc:` (shared
+/// memory) is this machine, which TCP reaches too. A login the string hands to
+/// Windows or Entra keeps the server and carries [`ImportNote::ExternalLogin`].
+fn parse_connection_string(s: &str) -> Result<(Connection, Vec<ImportNote>), UrlError> {
+    let mut c = blank(MSSQL);
+    let mut server = String::new();
+    let (mut encrypt, mut trust, mut external) = (None::<String>, false, false);
+    for (k, v) in split_mssql_props(s, true) {
+        if v.is_empty() {
+            continue;
+        }
+        match normalize_key(&k).as_str() {
+            "server" | "datasource" | "address" | "addr" | "networkaddress" => {
+                set_if_empty(&mut server, &v)
+            }
+            "database" | "initialcatalog" => set_if_empty(&mut c.database, &v),
+            "userid" | "uid" | "user" | "username" => set_if_empty(&mut c.user, &v),
+            "password" | "pwd" => set_if_empty(&mut c.password, &v),
+            "encrypt" => encrypt = Some(normalize_key(&v)),
+            "trustservercertificate" => trust = truthy(&v),
+            "integratedsecurity" | "trustedconnection" => {
+                external |= truthy(&v) || normalize_key(&v) == "sspi"
+            }
+            // `Sql Password` is a SQL login spelled out; every other method
+            // (`Active Directory Password`, `…Interactive`, `…Default`) is Entra.
+            "authentication" => external |= normalize_key(&v) != "sqlpassword",
+            "driver" | "provider" if !names_sql_server_driver(&v) => {
+                return Err(UrlError::UnknownScheme(v));
+            }
+            _ => {}
+        }
+    }
+    let server = server.trim();
+    let lower = server.to_ascii_lowercase();
+    if lower.starts_with("np:") || lower.starts_with("(localdb)") {
+        return Err(UrlError::Transport(server.to_string()));
+    }
+    let server = strip_prefix_ci(server, "tcp:")
+        .or_else(|| strip_prefix_ci(server, "lpc:"))
+        .unwrap_or(server)
+        .trim();
+    let (hostpart, port) = match server.rsplit_once(',') {
+        Some((h, p)) => (h.trim(), Some(parse_port(p.trim())?)),
+        None => (server, None),
+    };
+    let (host, instance) = match hostpart.split_once('\\') {
+        Some((h, i)) => (h.trim(), !i.trim().is_empty()),
+        None => (hostpart, false),
+    };
+    if host.is_empty() {
+        return Err(UrlError::NoHost);
+    }
+    c.host = match host.to_ascii_lowercase().as_str() {
+        "." | "(local)" => "localhost".to_string(),
+        _ => host.to_string(),
+    };
+    c.port = port.unwrap_or_else(|| default_port(MSSQL));
+    apply_mssql_tls(&mut c, encrypt.as_deref(), trust);
+    let mut notes = Vec::new();
+    if instance && port.is_none() {
+        notes.push(ImportNote::NamedInstance);
+    }
+    if external {
+        notes.push(ImportNote::ExternalLogin);
+    }
+    c.name = suggest_name(&c);
+    Ok((c, notes))
+}
+
+/// Is this ODBC `Driver` / OLE DB `Provider` one of SQL Server's? The ODBC
+/// drivers all say so by name (`ODBC Driver 18 for SQL Server`, `SQL Server
+/// Native Client 11.0`, plain `SQL Server`); the OLE DB providers do not.
+fn names_sql_server_driver(v: &str) -> bool {
+    let k = normalize_key(v);
+    k.contains("sqlserver")
+        || k.starts_with("sqlncli")
+        || k.starts_with("sqloledb")
+        || k.starts_with("msoledbsql")
+}
+
 /// Microsoft's `key=value;key=value`, where a value in braces is taken whole —
-/// `;` and `=` included — with a doubled `}}` standing for one `}`.
-fn split_mssql_props(s: &str) -> Vec<(String, String)> {
+/// `;` and `=` included — with a doubled `}}` standing for one `}`. With
+/// `quotes`, ADO.NET's `"…"` and `'…'` quote a value the same way, a doubled
+/// quote standing for one; JDBC has no such quoting, so a JDBC password that
+/// merely starts with `"` is left alone.
+fn split_mssql_props(s: &str, quotes: bool) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let mut chars = s.chars().peekable();
     loop {
@@ -829,13 +983,23 @@ fn split_mssql_props(s: &str) -> Vec<(String, String)> {
             break;
         }
         let mut value = String::new();
-        if chars.peek() == Some(&'{') {
+        // `Password = "x"`: the quote may follow a space, which the unquoted
+        // branch would trim anyway.
+        while chars.peek().is_some_and(|c| *c == ' ' || *c == '\t') {
+            chars.next();
+        }
+        let closer = match chars.peek() {
+            Some('{') => Some('}'),
+            Some(q @ ('"' | '\'')) if quotes => Some(*q),
+            _ => None,
+        };
+        if let Some(closer) = closer {
             chars.next();
             while let Some(ch) = chars.next() {
-                if ch == '}' {
-                    if chars.peek() == Some(&'}') {
+                if ch == closer {
+                    if chars.peek() == Some(&closer) {
                         chars.next();
-                        value.push('}');
+                        value.push(closer);
                         continue;
                     }
                     break;
@@ -2745,6 +2909,92 @@ mod tests {
         assert_eq!((c.host.as_str(), c.port), ("db", 50124));
     }
 
+    /// **An ADO.NET connection string has no scheme at all** — the shape an
+    /// `appsettings.json` holds — `keyword=value;…` with the server as
+    /// `[tcp:]host[\instance][,port]` and a value quoted in `"…"` or `'…'`.
+    #[test]
+    fn an_ado_net_connection_string_is_read_by_its_keywords() {
+        let c = url("Server=tcp:db.example,14330;Database=Sales;User Id=app;\
+             Password=\"p;w=d\";Encrypt=True;TrustServerCertificate=True");
+        assert!(crate::connection::is_mssql(&c.db_type), "{}", c.db_type);
+        assert_eq!((c.host.as_str(), c.port), ("db.example", 14330));
+        assert_eq!((c.database.as_str(), c.user.as_str()), ("Sales", "app"));
+        assert_eq!(c.password, "p;w=d");
+        assert_eq!(c.tls.mode, SslMode::Require);
+        assert_eq!(c.name, suggest_name(&c));
+        // The older keywords, and no port is 1433.
+        let c = url("Data Source=h;Initial Catalog=d;UID=u;PWD='it''s'");
+        assert_eq!((c.host.as_str(), c.port), ("h", 1433));
+        assert_eq!((c.database.as_str(), c.user.as_str()), ("d", "u"));
+        assert_eq!(c.password, "it's");
+        // `.` and `(local)` are this machine.
+        for local in [".", "(local)", "lpc:."] {
+            let c = url(&format!("Server={local};Database=d"));
+            assert_eq!(c.host, "localhost", "{local}");
+        }
+        // Keywords are case- and space-insensitive; TLS reads as JDBC's does.
+        let c = url("server = h ; ENCRYPT = false ; user id = u");
+        assert_eq!((c.host.as_str(), c.user.as_str()), ("h", "u"));
+        assert_eq!(c.tls.mode, SslMode::Disable);
+        let c = url("Server=h;Encrypt=Strict");
+        assert_eq!(c.tls.mode, SslMode::VerifyFull);
+    }
+
+    /// ODBC's form is the same keywords with `{…}` quoting and a `Driver` —
+    /// which is read, because an ODBC string names MySQL's driver just as
+    /// happily, and that one is not a SQL Server.
+    #[test]
+    fn an_odbc_connection_string_is_read_when_its_driver_is_sql_server() {
+        let c = url(
+            "Driver={ODBC Driver 18 for SQL Server};Server=h,1500;Database=d;UID=u;PWD={a;}}b}",
+        );
+        assert!(crate::connection::is_mssql(&c.db_type));
+        assert_eq!((c.host.as_str(), c.port), ("h", 1500));
+        assert_eq!(c.password, "a;}b");
+        let c = url("Provider=MSOLEDBSQL;Data Source=h;Initial Catalog=d");
+        assert_eq!(c.database, "d");
+        for other in [
+            "Driver={MySQL ODBC 8.0 Unicode Driver};Server=h;Database=d",
+            "Provider=Microsoft.ACE.OLEDB.12.0;Data Source=h",
+        ] {
+            assert!(parse_url(other).is_err(), "{other}");
+        }
+    }
+
+    /// The named-instance note, the `.env` wrapper ASP.NET's environment
+    /// variables use, and the transports Schemaic cannot reach — named pipes
+    /// and LocalDB — refused by what they are rather than misread as a host.
+    #[test]
+    fn an_ado_net_string_notes_what_it_cannot_carry_over() {
+        let scan = parse_url_scan("Server=db\\SQLEXPRESS;Database=d");
+        assert_eq!(scan.found[0].connection.host, "db");
+        assert!(scan.found[0].has(ImportNote::NamedInstance));
+        let c = url("Server=db\\SQLEXPRESS,1500;Database=d");
+        assert_eq!((c.host.as_str(), c.port), ("db", 1500));
+        let c = url("ConnectionStrings__Default=\"Server=h;Database=d\"");
+        assert_eq!((c.host.as_str(), c.database.as_str()), ("h", "d"));
+        for login in [
+            "Server=h;Database=d;Integrated Security=SSPI",
+            "Server=h;Trusted_Connection=yes",
+            "Server=h;Authentication=Active Directory Interactive;User Id=a@b.c",
+        ] {
+            let scan = parse_url_scan(login);
+            assert!(scan.found[0].has(ImportNote::ExternalLogin), "{login}");
+        }
+        let scan = parse_url_scan("Server=h;Integrated Security=false;User Id=u");
+        assert!(!scan.found[0].has(ImportNote::ExternalLogin));
+        for unreachable in [
+            "Server=np:\\\\host\\pipe\\sql\\query;Database=d",
+            "Server=(localdb)\\MSSQLLocalDB;Database=d",
+        ] {
+            assert!(
+                matches!(parse_url(unreachable), Err(UrlError::Transport(_))),
+                "{unreachable}"
+            );
+        }
+        assert_eq!(parse_url("Database=d;User Id=u"), Err(UrlError::NoHost));
+    }
+
     #[test]
     fn the_authority_beats_a_query_parameter_naming_the_same_thing() {
         let c = url("mysql://real:pw@h/d?user=other&password=other");
@@ -3145,6 +3395,22 @@ mod tests {
                 assert!(!out.contains(leak), "{raw} -> {out}");
             }
             assert!(out.ends_with(";user=u"), "{raw} -> {out}");
+        }
+    }
+
+    /// ADO.NET quotes a value in `"…"` or `'…'`, a doubled quote standing for
+    /// one — and a quoted password holds `;` as a braced one does.
+    #[test]
+    fn a_quoted_password_is_redacted_whole() {
+        for raw in [
+            "Server=np:h;Password=\"p;w=d x\";User Id=u",
+            "Server=np:h;Pwd='a''b;c';User Id=u",
+        ] {
+            let out = redacted(raw);
+            for leak in ["w=d", "p;", "x\"", "b;c", "a'"] {
+                assert!(!out.contains(leak), "{raw} -> {out}");
+            }
+            assert!(out.ends_with(";User Id=u"), "{raw} -> {out}");
         }
     }
 
