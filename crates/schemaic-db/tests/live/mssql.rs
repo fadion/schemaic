@@ -1208,7 +1208,12 @@ async fn every_sample_table_diffs_to_nothing_against_its_own_draft() {
         .cell(0, 0)
         .is_some_and(|c| c.display() == "1");
     if !installed {
-        eprintln!("AdventureWorksLT is not installed here; skipping the sample round trip");
+        // Through the locked stderr handle: libtest shows an `eprintln!` only
+        // for a failing test, which made this skip a silent green.
+        endpoint::note_leg_no_op(
+            "mssql",
+            "has no AdventureWorksLT here, so the sample round trip",
+        );
         return;
     }
     let schema = db

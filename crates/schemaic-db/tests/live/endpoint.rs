@@ -729,12 +729,14 @@ pub fn note_leg_skipped(name: &'static str) {
 /// otherwise repeat once per test, while this is about a *leg* — a different
 /// reason each time, and repeating it is the point.
 pub fn note_no_op(target: &'static Target, reason: &str) {
+    note_leg_no_op(target.name, reason);
+}
+
+/// [`note_no_op`] by the leg's name, for a leg that has no [`Target`] —
+/// [`OUTSIDE_THE_SUITE`]'s, as [`note_leg_skipped`] is `note_skipped`'s.
+pub fn note_leg_no_op(name: &str, reason: &str) {
     use std::io::Write as _;
     let mut err = std::io::stderr().lock();
-    let _ = writeln!(
-        err,
-        "live: {} {reason} — this test asserted nothing",
-        target.name
-    );
+    let _ = writeln!(err, "live: {name} {reason} — this test asserted nothing");
     let _ = err.flush();
 }
