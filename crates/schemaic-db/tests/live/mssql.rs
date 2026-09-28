@@ -3124,15 +3124,18 @@ async fn a_login_and_its_user_are_created_granted_reset_and_dropped() {
     );
 
     // A schema grant and a role, read back as the sentences that made them.
+    // The grant is grantable, so the revoke further down is the one T-SQL
+    // refuses without `CASCADE`.
+    let schema_grant = PrivilegeChange {
+        account: user.clone(),
+        level: GrantLevel::Schema("dbo".into()),
+        privileges: vec!["SELECT".into()],
+        with_grant_option: true,
+    };
     run(account(
         &name,
         MS,
-        Change::GrantPrivileges(Box::new(PrivilegeChange {
-            account: user.clone(),
-            level: GrantLevel::Schema("dbo".into()),
-            privileges: vec!["SELECT".into()],
-            with_grant_option: false,
-        })),
+        Change::GrantPrivileges(Box::new(schema_grant.clone())),
     )
     .emit())
     .await;
@@ -3159,7 +3162,7 @@ async fn a_login_and_its_user_are_created_granted_reset_and_dropped() {
     let q = format!("[{name}]");
     for want in [
         format!("GRANT CONNECT ON DATABASE::[{}] TO {q};", s.name),
-        format!("GRANT SELECT ON SCHEMA::[dbo] TO {q};"),
+        format!("GRANT SELECT ON SCHEMA::[dbo] TO {q} WITH GRANT OPTION;"),
         format!("ALTER ROLE [db_datareader] ADD MEMBER {q};"),
     ] {
         assert!(
@@ -3168,6 +3171,21 @@ async fn a_login_and_its_user_are_created_granted_reset_and_dropped() {
             grants.statements
         );
     }
+
+    // Taken back, grant option and all.
+    run(account(&name, MS, Change::RevokePrivileges(Box::new(schema_grant))).emit()).await;
+    let grants =
+        s.db.fetch_grants(Some(&s.name), &user)
+            .await
+            .expect("the grants");
+    assert!(
+        !grants
+            .statements
+            .iter()
+            .any(|x| x.contains("ON SCHEMA::[dbo]")),
+        "{:#?}",
+        grants.statements
+    );
     let server = s.db.fetch_grants(None, &login).await.expect("the login's");
     assert!(
         server

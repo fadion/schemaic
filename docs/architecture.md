@@ -5645,6 +5645,10 @@ existing prose was left alone.
     `PrivilegeChange` + `privilege_sql(change, dialect, revoke)` write the `GRANT`/`REVOKE` — one
     struct for both directions, since what a revoke takes away is exactly what a grant gives, and
     `WITH GRANT OPTION` is ignored on the revoke side rather than given a second field nobody sets.
+    **A SQL Server revoke always carries `CASCADE`**: without it, taking back a permission granted
+    `WITH GRANT OPTION` is Msg 4611 (measured), and the form cannot know how the grant it is revoking
+    was made; on one granted without the option `CASCADE` is accepted and does what the plain revoke
+    would (`a_sql_server_revoke_cascades_so_a_grantable_permission_can_be_taken_back`).
     It returns `None` for an empty privilege list, because `GRANT ON db.*` is a syntax error: the
     backstop *under* the form's own Apply gate, not the gate. `RoleChange` + `role_sql` are the
     membership pair, and `AccountDraft` + `account_draft_sql` the `CREATE USER`/`CREATE ROLE` — a
@@ -11097,8 +11101,9 @@ existing prose was left alone.
   through `users::mssql_grant_statements`. The live pin is
   `a_login_and_its_user_are_created_granted_reset_and_dropped`, through the real
   `ChangeSet::emit` → `Db::run_ddl` path: one plan creates the login and its user, which are listed
-  linked; the login signs in; a schema grant and a `db_datareader` membership read back as the
-  sentences that made them, and the login's own `GRANT CONNECT SQL`; a reset on the **user** row
+  linked; the login signs in; a grantable schema grant and a `db_datareader` membership read back as
+  the sentences that made them, and the login's own `GRANT CONNECT SQL`; the schema grant is revoked,
+  the revoke `CASCADE` makes possible; a reset on the **user** row
   changes the login's password, the old one then refused; and the drops leave neither behind.
   `ScratchLogin` drops the login on the way out, a login being the server's and outliving the
   scratch database. Server Activity is the one

@@ -1419,7 +1419,14 @@ pub fn privilege_sql(c: &PrivilegeChange, dialect: SqlDialect, revoke: bool) -> 
     let object = c.level.object_sql(dialect);
     let account = account_sql(&c.account, dialect);
     Some(if revoke {
-        format!("REVOKE {list} ON {object} FROM {account}")
+        // T-SQL refuses to take back a permission granted `WITH GRANT OPTION`
+        // without `CASCADE` (Msg 4611), and the form cannot know how the grant
+        // was made; on one granted without it, `CASCADE` changes nothing.
+        let cascade = match dialect {
+            SqlDialect::MsSql => " CASCADE",
+            SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => "",
+        };
+        format!("REVOKE {list} ON {object} FROM {account}{cascade}")
     } else {
         let mut sql = format!("GRANT {list} ON {object} TO {account}");
         if c.with_grant_option {
@@ -4443,7 +4450,7 @@ mod mssql_tests {
                 true
             )
             .as_deref(),
-            Some("REVOKE SELECT, INSERT ON OBJECT::[dbo].[t] FROM [app_u]")
+            Some("REVOKE SELECT, INSERT ON OBJECT::[dbo].[t] FROM [app_u] CASCADE")
         );
         assert_eq!(
             privilege_sql(
@@ -4475,6 +4482,42 @@ mod mssql_tests {
         );
         assert!(!supports_role_admin_option(MS));
         assert!(supports_role_admin_option(SqlDialect::Postgres));
+    }
+
+    /// **A revoke carries `CASCADE` on SQL Server**, whatever the grant was.
+    /// Without it, taking back a permission granted `WITH GRANT OPTION` is
+    /// Msg 4611 — measured on 2022 — and the form cannot know how the grant
+    /// was made. `CASCADE` on one granted without the option is accepted and
+    /// does the same as the plain revoke. The other engines keep their own.
+    #[test]
+    fn a_sql_server_revoke_cascades_so_a_grantable_permission_can_be_taken_back() {
+        let c = PrivilegeChange {
+            account: user("app_u", Some("app")),
+            level: GrantLevel::Database("shop".into()),
+            privileges: vec!["SELECT".into()],
+            with_grant_option: false,
+        };
+        assert_eq!(
+            privilege_sql(&c, MS, true).as_deref(),
+            Some("REVOKE SELECT ON DATABASE::[shop] FROM [app_u] CASCADE")
+        );
+        assert_eq!(
+            privilege_sql(&c, MS, false).as_deref(),
+            Some("GRANT SELECT ON DATABASE::[shop] TO [app_u]"),
+            "a grant has nothing to cascade"
+        );
+        let mut my = c.clone();
+        my.account = Principal {
+            name: "app".into(),
+            host: Some("%".into()),
+            kind: PrincipalKind::User,
+            ..login("app")
+        };
+        assert!(
+            !privilege_sql(&my, SqlDialect::MySql, true)
+                .unwrap()
+                .contains("CASCADE")
+        );
     }
 
     /// The two catalogues folded into one list: every login, then the
