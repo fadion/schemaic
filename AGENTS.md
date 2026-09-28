@@ -22,6 +22,7 @@ so it is absent from the UI rather than failing there; that one *is* unfinished 
 engines now lives in the *narrow* predicates that decide how an edit is performed rather than
 whether it is offered: `ddl::supports_or_replace_view`, `supports_view_rename`,
 `supports_column_reorder`, `supports_change`, `alter_column_disturbs_checks`,
+`alter_column_disturbs_dependents`,
 `stats::supports_table_stats` — and, for the *comparison* rather than any editor,
 `ddl::ref_schema_is_database` and `view_definition_is_qualified`, which ask whether a field the
 differ reads names the object or the database it was read from. Ask a **capability**, never an

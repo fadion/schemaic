@@ -2869,6 +2869,12 @@ impl Change {
             Change::PrimaryKey { from, to, .. } => match (from.is_empty(), to.is_empty()) {
                 (true, _) => format!("Add primary key ({})", to.join(", ")),
                 (_, true) => format!("Drop the primary key ({})", from.join(", ")),
+                // The same key, off and back on around a column change the
+                // engine refuses under it (`repair_tsql_dependents`).
+                _ if from == to => format!(
+                    "Rebuild the primary key ({}) around the column change",
+                    to.join(", ")
+                ),
                 _ => format!(
                     "Change the primary key from ({}) to ({})",
                     from.join(", "),
@@ -3176,6 +3182,17 @@ impl Change {
             Change::AlterColumn { from, to, .. } => alter_risks(from, to, dialect),
             Change::PrimaryKey { from, to, .. } if !from.is_empty() && to.is_empty() => {
                 vec!["Leaves the table without a primary key — rows can no longer be edited from the grid.".to_string()]
+            }
+            // The same key rebuilt (`repair_tsql_dependents`): nothing stops
+            // being unique, but on SQL Server a key is the table's clustered
+            // index as a rule, and dropping it rewrites the table twice.
+            Change::PrimaryKey { from, to, .. } if !from.is_empty() && from == to => {
+                vec![
+                    "Drops and re-adds the primary key around the column change. When \
+                     it is the clustered index this rewrites the whole table, and a \
+                     foreign key in another table that references it stops the plan."
+                        .to_string(),
+                ]
             }
             // **The swap case, which fell through this match to `Vec::new()`.**
             // A drop-to-nothing was the only guarded arm, so replacing the key
@@ -4234,8 +4251,22 @@ impl ChangeSet {
             }
         }
         for c in &admitted {
-            if let Change::AddIndex(ix) = c {
-                out.push(create_index_sql(ix, &q, d));
+            match c {
+                // A unique constraint goes back as one, under its name, not as
+                // a unique index: `sys.key_constraints` is where tools and a
+                // schema compare look for it, and the next read would see an
+                // index where the draft said constraint.
+                Change::AddIndex(ix) if ix.unique && ix.predicate.is_none() => match &ix.constraint
+                {
+                    Some(k) => out.push(format!(
+                        "ALTER TABLE {q} ADD CONSTRAINT {} UNIQUE ({});",
+                        ident(k),
+                        ix.key_sql(d)
+                    )),
+                    None => out.push(create_index_sql(ix, &q, d)),
+                },
+                Change::AddIndex(ix) => out.push(create_index_sql(ix, &q, d)),
+                _ => {}
             }
         }
         // Comments, by the columns' new names and the table's old one.
@@ -9194,6 +9225,217 @@ pub fn alter_column_disturbs_checks(dialect: SqlDialect) -> bool {
     }
 }
 
+/// Does changing a column's type on `dialect` fail while an index, a key, a
+/// foreign key or a check depends on it, so that the plan has to take them
+/// off and put them back itself?
+///
+/// - **SQL Server** refuses `ALTER COLUMN` then — Msg 5074 naming the
+///   dependent, then 4922 — for every kind of dependent, measured on 2022;
+///   which changes each kind survives is [`tsql_alter_disturbs`].
+/// - **MySQL**'s `MODIFY` and **PostgreSQL**'s `ALTER COLUMN … TYPE` rebuild
+///   the indexes and re-check the constraints themselves, and **SQLite**'s
+///   column change is the rebuild, which writes them from the draft.
+pub fn alter_column_disturbs_dependents(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MsSql => true,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+    }
+}
+
+/// What depends on a column, for [`tsql_alter_disturbs`] — each kind refuses a
+/// different set of changes.
+#[derive(Clone, Copy)]
+enum TsqlDependent {
+    /// An index, the primary key or a unique constraint.
+    Index,
+    ForeignKey,
+    Check,
+}
+
+/// Does altering `from` into `to` fail on SQL Server while `dep` depends on
+/// the column? **Measured on 2022, case by case**, since the documentation's
+/// list of exceptions is not the server's:
+///
+/// - **Nothing is disturbed** when only the name, default or comment changes:
+///   the type, collation and nullability restated as they were are accepted
+///   under anything.
+/// - **A nullability change alone** is refused under an index or key, and
+///   allowed under a foreign key or a check.
+/// - **Widening a `varchar`, `nvarchar` or `varbinary`** — the same type,
+///   a length no shorter, the same collation and nullability — is allowed
+///   under an index, the key, a unique constraint and a check, and refused
+///   under a foreign key. `max` is not a length here: widening to it under
+///   an index is refused.
+/// - **Anything else** — a new type or collation — is refused under all of
+///   them.
+fn tsql_alter_disturbs(from: &ColumnInfo, to: &ColumnInfo, dep: TsqlDependent) -> bool {
+    // An identity is `NOT NULL` whatever the draft says, as
+    // `tsql_alter_column` writes it.
+    let null_of = |c: &ColumnInfo| c.nullable && !c.auto_increment;
+    let collation =
+        |c: &ColumnInfo| blank_as_none(c.collation.as_deref()).map(str::to_ascii_lowercase);
+    let retyped = !from
+        .type_name
+        .trim()
+        .eq_ignore_ascii_case(to.type_name.trim())
+        || collation(from) != collation(to);
+    let renulled = null_of(from) != null_of(to);
+    if !retyped && !renulled {
+        return false;
+    }
+    let widening = !renulled
+        && collation(from) == collation(to)
+        && tsql_var_widening(&from.type_name, &to.type_name);
+    match dep {
+        TsqlDependent::Index => !widening,
+        TsqlDependent::ForeignKey => retyped,
+        TsqlDependent::Check => retyped && !widening,
+    }
+}
+
+/// Is `to` the variable-length type `from` is, no shorter? `varchar(10)` →
+/// `varchar(20)` is; `varchar(10)` → `nvarchar(20)`, → `varchar(max)` and
+/// `char(10)` → `char(20)` are not.
+fn tsql_var_widening(from: &str, to: &str) -> bool {
+    let parse = |t: &str| -> Option<(String, u32)> {
+        let t = t.trim().to_ascii_lowercase();
+        let (base, rest) = t.split_once('(')?;
+        let len = rest.strip_suffix(')')?.trim().parse().ok()?;
+        let base = base.trim();
+        matches!(base, "varchar" | "nvarchar" | "varbinary").then(|| (base.to_string(), len))
+    };
+    match (parse(from), parse(to)) {
+        (Some((a, m)), Some((b, n))) => a == b && n >= m,
+        _ => false,
+    }
+}
+
+/// [`diff`]'s repair where [`alter_column_disturbs_dependents`]: every index,
+/// key, foreign key and check a column change disturbs is dropped and added
+/// back as it was, in the draft's column names — `emit_mssql` already drops
+/// them before the columns change and adds them after.
+///
+/// **A dependent the plan already drops or re-adds is the draft's** and is
+/// left alone, as the check repair above leaves one. One the model cannot
+/// restate — a lossy index, one with included columns — is not touched: the
+/// server then refuses the change naming it, and the plan, one transaction,
+/// rolls back whole.
+fn repair_tsql_dependents(
+    current: &TableInfo,
+    renamed: &HashMap<String, String>,
+    changes: &mut Vec<Change>,
+) {
+    let altered: Vec<(ColumnInfo, ColumnInfo)> = changes
+        .iter()
+        .filter_map(|c| match c {
+            Change::AlterColumn { from, to, .. } => Some(((**from).clone(), (**to).clone())),
+            _ => None,
+        })
+        .collect();
+    if altered.is_empty() {
+        return;
+    }
+    let disturbs = |column: &str, dep: TsqlDependent| {
+        altered
+            .iter()
+            .any(|(f, t)| f.name.eq_ignore_ascii_case(column) && tsql_alter_disturbs(f, t, dep))
+    };
+    let mut touched_ix: HashSet<String> = HashSet::new();
+    let mut touched_fk: HashSet<String> = HashSet::new();
+    let mut touched_ck: HashSet<String> = HashSet::new();
+    let mut pk_touched = false;
+    for c in changes.iter() {
+        match c {
+            Change::DropIndex { name, .. } | Change::KeepLossyIndex { name } => {
+                touched_ix.insert(name.clone());
+            }
+            Change::AddIndex(ix) => {
+                touched_ix.insert(ix.name.clone());
+            }
+            Change::PrimaryKey { .. } => pk_touched = true,
+            Change::DropForeignKey { name } => {
+                touched_fk.insert(name.clone());
+            }
+            Change::AddForeignKey(fk) => {
+                touched_fk.insert(fk.name.clone());
+            }
+            Change::DropCheck { name } => {
+                touched_ck.insert(name.clone());
+            }
+            Change::AddCheck(ck) => {
+                touched_ck.insert(ck.name.clone());
+            }
+            _ => {}
+        }
+    }
+    let mut repairs: Vec<Change> = Vec::new();
+    for ix in &current.indexes {
+        if !ix.column_names().any(|c| disturbs(c, TsqlDependent::Index)) {
+            continue;
+        }
+        if ix.is_primary() {
+            if !pk_touched {
+                let key: Vec<String> = primary_key_of(current)
+                    .into_iter()
+                    .map(|c| renamed.get(&c).cloned().unwrap_or(c))
+                    .collect();
+                repairs.push(Change::PrimaryKey {
+                    from: key.clone(),
+                    to: key,
+                    drop_constraint: ix.constraint.clone(),
+                });
+            }
+        } else if !ix.lossy && !touched_ix.contains(&ix.name) {
+            repairs.push(Change::DropIndex {
+                name: ix.name.clone(),
+                constraint: ix.constraint.clone(),
+                unique: ix.unique,
+            });
+            repairs.push(Change::AddIndex(Box::new(rename_index(ix, renamed))));
+        }
+    }
+    for fk in &current.foreign_keys {
+        if !touched_fk.contains(&fk.name)
+            && fk
+                .columns
+                .iter()
+                .any(|c| disturbs(c, TsqlDependent::ForeignKey))
+        {
+            repairs.push(Change::DropForeignKey {
+                name: fk.name.clone(),
+            });
+            repairs.push(Change::AddForeignKey(Box::new(rename_fk(fk, renamed))));
+        }
+    }
+    for ck in &current.check_constraints {
+        if touched_ck.contains(&ck.name) {
+            continue;
+        }
+        let d = SqlDialect::MsSql;
+        let names = |col: &str| repoint_check_column(&ck.expression, col, col, d).is_some();
+        if !altered
+            .iter()
+            .any(|(f, t)| names(&f.name) && tsql_alter_disturbs(f, t, TsqlDependent::Check))
+        {
+            continue;
+        }
+        let mut expr = ck.expression.clone();
+        for (f, t) in altered.iter().filter(|(f, t)| f.name != t.name) {
+            if let Some(e) = repoint_check_column(&expr, &f.name, &t.name, d) {
+                expr = e;
+            }
+        }
+        repairs.push(Change::DropCheck {
+            name: ck.name.clone(),
+        });
+        repairs.push(Change::AddCheck(Box::new(CheckInfo {
+            expression: expr,
+            ..ck.clone()
+        })));
+    }
+    changes.extend(repairs);
+}
+
 /// Does a primary key make its columns `NOT NULL` on `dialect` of its own
 /// accord? MySQL, PostgreSQL and SQLite do; SQL Server refuses a key over a
 /// nullable column (Msg 8111), so [`diff`] makes the columns `NOT NULL` itself.
@@ -10642,6 +10884,12 @@ pub fn diff(current: &TableInfo, draft: &TableDraft, target: impl Into<Target>) 
                 changes.push(Change::AddCheck(Box::new(ck)));
             }
         }
+    }
+
+    // What else stands on a changed column, where the engine will not change
+    // it underneath them — after the check repair, whose pairs it leaves alone.
+    if alter_column_disturbs_dependents(dialect) {
+        repair_tsql_dependents(current, &renamed, &mut changes);
     }
 
     // Table-level options. On PostgreSQL only the comment exists, and the draft
@@ -13692,6 +13940,251 @@ mod tests {
                 "EXEC sp_rename N'[dbo].[o''k]', N'ok2';".to_string(),
             ]
         );
+    }
+
+    /// A table whose every column but `note` something depends on: the key
+    /// `pk_t`, the index `ix_a`, the unique constraint `uq_c`, the foreign key
+    /// `fk_f` and the check `ck_k`.
+    fn ms_dependents_table() -> TableInfo {
+        let col = |name: &str, ty: &str| ColumnInfo {
+            name: name.into(),
+            type_name: ty.into(),
+            nullable: name != "id",
+            primary_key: name == "id",
+            ..Default::default()
+        };
+        let mut pk = crate::schema::IndexInfo::plain("PRIMARY", vec!["id"], true);
+        pk.constraint = Some("pk_t".into());
+        let mut uq = crate::schema::IndexInfo::plain("uq_c", vec!["c"], true);
+        uq.constraint = Some("uq_c".into());
+        TableInfo {
+            name: "t".into(),
+            schema: Some("dbo".into()),
+            columns: vec![
+                col("id", "int"),
+                col("a", "int"),
+                col("c", "varchar(10)"),
+                col("f", "int"),
+                col("k", "int"),
+                col("note", "varchar(10)"),
+            ],
+            indexes: vec![
+                pk,
+                crate::schema::IndexInfo::plain("ix_a", vec!["a"], false),
+                uq,
+            ],
+            foreign_keys: vec![ForeignKeyInfo {
+                name: "fk_f".into(),
+                columns: vec!["f".into()],
+                ref_table: "p".into(),
+                ref_schema: Some("dbo".into()),
+                ref_columns: vec!["id".into()],
+                ..Default::default()
+            }],
+            check_constraints: vec![crate::schema::CheckInfo {
+                name: "ck_k".into(),
+                expression: "[k]>(0)".into(),
+                enforced: true,
+                validated: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// The summaries of `current` → `draft` on SQL Server, sorted.
+    fn ms_plan(current: &TableInfo, draft: &TableDraft) -> Vec<String> {
+        let mut v: Vec<String> = diff(current, draft, MsSql)
+            .changes
+            .iter()
+            .map(|c| c.summary())
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn retyped(t: &TableInfo, edits: &[(&str, &str, bool)]) -> TableDraft {
+        let mut d = TableDraft::from_table(t);
+        for (name, ty, nullable) in edits {
+            let c = d.columns.iter_mut().find(|c| c.info.name == *name).unwrap();
+            c.info.type_name = ty.to_string();
+            c.info.nullable = *nullable;
+        }
+        d
+    }
+
+    /// **SQL Server refuses `ALTER COLUMN` on a column anything depends on**
+    /// (Msg 5074 then 4922, measured on 2022 for every kind here), so a retype
+    /// takes each dependent off and puts it back — the key, the index, the
+    /// unique constraint, the foreign key and the check — and a column nothing
+    /// depends on is altered alone.
+    #[test]
+    fn sql_server_takes_a_retyped_columns_dependents_off_and_back_on() {
+        let t = ms_dependents_table();
+        let d = retyped(
+            &t,
+            &[
+                ("id", "bigint", false),
+                ("a", "bigint", true),
+                ("c", "nvarchar(10)", true),
+                ("f", "bigint", true),
+                ("k", "bigint", true),
+            ],
+        );
+        let plan = ms_plan(&t, &d);
+        for s in [
+            "Rebuild the primary key (id)",
+            "Drop index ix_a",
+            "Add index ix_a on (a)",
+            "Drop index uq_c",
+            "Add unique index uq_c on (c)",
+            "Drop foreign key fk_f",
+            "Drop check ck_k",
+        ] {
+            assert!(
+                plan.iter().any(|p| p.starts_with(s)),
+                "{s} not in {plan:#?}"
+            );
+        }
+        let cs = diff(&t, &d, MsSql);
+        assert!(cs.unsupported().is_empty(), "{:?}", cs.unsupported());
+        let stmts = cs.emit();
+        let at = |needle: &str| {
+            stmts
+                .iter()
+                .position(|s| s.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} not in {stmts:#?}"))
+        };
+        let alter = at("ALTER COLUMN [id]");
+        for drop in [
+            "DROP CONSTRAINT [pk_t]",
+            "DROP INDEX [ix_a]",
+            "DROP CONSTRAINT [uq_c]",
+            "DROP CONSTRAINT [fk_f]",
+            "DROP CONSTRAINT [ck_k]",
+        ] {
+            assert!(at(drop) < alter, "{drop} after the retype: {stmts:#?}");
+        }
+        for add in [
+            "ADD CONSTRAINT [pk_t] PRIMARY KEY ([id])",
+            "CREATE INDEX [ix_a]",
+            // Back as the constraint it was, not as a unique index.
+            "ADD CONSTRAINT [uq_c] UNIQUE ([c])",
+            "ADD CONSTRAINT [fk_f] FOREIGN KEY ([f])",
+            "ADD CONSTRAINT [ck_k] CHECK ([k]>(0))",
+        ] {
+            assert!(at(add) > alter, "{add} before the retype: {stmts:#?}");
+        }
+        // The key comes back: no risk sentence says it stops being unique.
+        assert!(
+            !cs.changes
+                .iter()
+                .flat_map(|c| c.risks(MsSql))
+                .any(|r| r.contains("no longer unique")),
+            "{:#?}",
+            cs.changes
+                .iter()
+                .flat_map(|c| c.risks(MsSql))
+                .collect::<Vec<_>>()
+        );
+        // A column nothing depends on is altered alone.
+        assert_eq!(
+            ms_plan(&t, &retyped(&t, &[("note", "nvarchar(40)", false)])).len(),
+            1
+        );
+    }
+
+    /// **What each kind of dependent survives, measured:** a nullability
+    /// change alone is refused under an index but not under a foreign key or a
+    /// check; widening a `varchar` is allowed under an index, a unique
+    /// constraint, the key and a check, and refused under a foreign key.
+    #[test]
+    fn sql_server_rebuilds_only_the_dependents_a_change_disturbs() {
+        let t = ms_dependents_table();
+        let plan = ms_plan(
+            &t,
+            &retyped(
+                &t,
+                &[
+                    ("a", "int", false),
+                    ("f", "int", false),
+                    ("k", "int", false),
+                ],
+            ),
+        );
+        assert!(
+            plan.iter().any(|p| p.starts_with("Drop index ix_a")),
+            "{plan:#?}"
+        );
+        assert!(
+            !plan
+                .iter()
+                .any(|p| p.contains("fk_f") || p.contains("ck_k")),
+            "{plan:#?}"
+        );
+
+        let mut t = ms_dependents_table();
+        t.columns[3].type_name = "varchar(10)".into(); // f
+        t.columns[4].type_name = "varchar(10)".into(); // k
+        t.check_constraints[0].expression = "[k]<>''".into();
+        let plan = ms_plan(
+            &t,
+            &retyped(
+                &t,
+                &[
+                    ("c", "varchar(20)", true),
+                    ("f", "varchar(20)", true),
+                    ("k", "varchar(max)", true),
+                ],
+            ),
+        );
+        assert!(!plan.iter().any(|p| p.contains("uq_c")), "{plan:#?}");
+        assert!(
+            plan.iter().any(|p| p.starts_with("Drop foreign key fk_f")),
+            "{plan:#?}"
+        );
+        // `max` is not a length, so it is not a widening the server allows.
+        assert!(
+            plan.iter().any(|p| p.starts_with("Drop check ck_k")),
+            "{plan:#?}"
+        );
+    }
+
+    /// A dependent the draft already drops or edits is the user's, and is not
+    /// taken off a second time; a changed default or a rename alone disturbs
+    /// nothing; and no other engine gets the repair — MySQL's `MODIFY` and
+    /// PostgreSQL's `ALTER TYPE` rebuild what depends on the column themselves.
+    #[test]
+    fn sql_server_leaves_a_drafted_dependent_to_the_draft() {
+        let t = ms_dependents_table();
+        let mut d = retyped(&t, &[("a", "bigint", true)]);
+        d.indexes.retain(|i| i.info.name != "ix_a");
+        let plan = ms_plan(&t, &d);
+        assert_eq!(
+            plan.iter().filter(|p| p.contains("ix_a")).count(),
+            1,
+            "{plan:#?}"
+        );
+        assert!(
+            !plan.iter().any(|p| p.starts_with("Add index ix_a")),
+            "{plan:#?}"
+        );
+
+        let mut d = TableDraft::from_table(&t);
+        d.columns[1].info.default = Some("0".into());
+        assert_eq!(ms_plan(&t, &d).len(), 1, "{:#?}", ms_plan(&t, &d));
+
+        let d = retyped(&t, &[("a", "bigint", true)]);
+        for dialect in [MySql, Postgres] {
+            let cs = diff(&t, &d, dialect);
+            assert!(
+                !cs.changes
+                    .iter()
+                    .any(|c| matches!(c, Change::DropIndex { .. })),
+                "{dialect:?}: {:?}",
+                cs.changes
+            );
+        }
     }
 
     /// **A SQL Server table diffs to nothing against its own draft** — the

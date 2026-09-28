@@ -3989,6 +3989,29 @@ existing prose was left alone.
     `repoint_check_column` (a **token walk** over `skip_noncode`, so `qty` never
     matches inside `qty_total`, inside `'qty'`, or in a comment; it reads T-SQL's
     `[qty]`, which opens and closes on different bytes, as a name too).
+    **A retype needs the same move on SQL Server, and for every kind of dependent.** `ALTER COLUMN`
+    is refused while an index, the key, a unique constraint, a foreign key or a check stands on the
+    column (Msg 5074 naming it, then 4922, measured on 2022), where MySQL's `MODIFY` and
+    PostgreSQL's `ALTER COLUMN … TYPE` rebuild and re-check them themselves and SQLite's column
+    change *is* the rebuild — so `alter_column_disturbs_dependents` is true there alone, and `diff`
+    runs `repair_tsql_dependents` after the check repair, whose pairs it then leaves alone. Which
+    change disturbs which kind is `tsql_alter_disturbs`, measured case by case because the
+    documented exceptions are not the server's: nothing is disturbed when only the name, default
+    or comment changes; a nullability change alone disturbs an index or key but not a foreign key
+    or a check; widening a `varchar`, `nvarchar` or `varbinary` — the same type, a length no
+    shorter, the same collation and nullability, `max` not counting as a length — disturbs a
+    foreign key only; any other change of type or collation disturbs all of them. Each disturbed dependent goes off and back on as it was, in the
+    draft's column names: an index or unique constraint as `DropIndex` + `AddIndex`, a foreign key
+    and a check as their pairs, and the key as a `Change::PrimaryKey` whose `from` equals its `to`,
+    under the constraint name introspection read. The preview summarises that one as *Rebuild the
+    primary key (…) around the column change*, not the swap's *no longer unique* sentence, and its
+    risk says what it does cost: a clustered key rewrites the table, and a foreign key in another
+    table referencing it stops the plan. **A dependent the draft already drops or adds is the
+    draft's**, as with the check repair; and a lossy index — included columns, say — is not
+    touched, so the server refuses the retype naming it and the plan, one transaction, rolls back
+    whole (`sql_server_takes_a_retyped_columns_dependents_off_and_back_on`,
+    `sql_server_rebuilds_only_the_dependents_a_change_disturbs`,
+    `sql_server_leaves_a_drafted_dependent_to_the_draft`).
     `DropCheck` carries a risk sentence though it deletes no data — the table stops
     guaranteeing something and nothing else says so — but `ChangeSet::destructive`
     suppresses it when the same name is re-added in the same plan, since every check
@@ -10600,7 +10623,7 @@ existing prose was left alone.
   constraint backs, `DROP INDEX [i] ON t` otherwise); then dropped columns, each after its
   default's drop; **then** the column renames, `EXEC sp_rename N'[s].[t].[c]', N'new',
   N'COLUMN';`; then altered columns (`tsql_alter_column`), added columns, the keys, checks and
-  foreign keys, the `CREATE INDEX`es; then the comments, by the columns' new names and the table's
+  foreign keys, the indexes; then the comments, by the columns' new names and the table's
   old one; and the table's own `sp_rename` last, the new name bare
   because the procedure takes it literally and brackets would become part of it — so every
   earlier statement names the table as it was (`sql_server_orders_a_designer_plan`, which also
@@ -10617,7 +10640,14 @@ existing prose was left alone.
   `]` — since that is how the server prints every predicate
   (`a_bracketed_column_in_a_check_is_repointed`,
   `a_sql_server_rename_under_an_unchanged_check_moves_the_check`). This was a known limit, failing
-  with Msg 15336, until it was.
+  with Msg 15336, until it was. **So was a retype under an index, the key, a foreign key or a
+  check**, refused by `ALTER COLUMN` (Msg 5074, then 4922) until `alter_column_disturbs_dependents`
+  had `diff` take each one it disturbs off and put it back (`repair_tsql_dependents`, under
+  `ddl.rs`). **A unique constraint goes back as one**, which is new with it: an `AddIndex` that
+  carries a `constraint` name and no predicate is written `ALTER TABLE … ADD CONSTRAINT [k] UNIQUE
+  (…)`, not `CREATE UNIQUE INDEX`, because `sys.key_constraints` is where tools and a schema compare
+  look for it and the next read would have seen an index where the draft said constraint. The
+  designer's own edit of a unique constraint goes through the same arm.
   **A default is dropped by a name looked up as the plan runs** (`tsql_drop_default`). T-SQL drops
   one only by its constraint's name, which introspection does not read and `ColumnInfo` does not
   carry — deliberately not added as a field: `columns_equal` has missed a new field four times (under
@@ -10712,10 +10742,13 @@ existing prose was left alone.
   check re-pointed around a rename, a nullable column keyed, a column added `WITH VALUES`, a
   disabled check still disabled, the key's name kept, and the result round-tripping;
   `comments_are_set_changed_and_cleared` sets, changes and clears table and column comments,
-  whether or not one was there and by the names the plan's renames leave, reading each back.
-  **Two known limits, both loud**: retyping a column an index or the primary key covers is refused
-  by the server while the index exists, and renaming a column a computed column references fails;
-  each fails the plan and rolls it back whole. Still not done: the view, routine and trigger
+  whether or not one was there and by the names the plan's renames leave, reading each back;
+  `a_retype_under_its_dependents_lands` retypes columns under the key, an index, a unique
+  constraint and a check, reads each back under its name — the unique one still a constraint —
+  with the data kept, the foreign key on a nullability-only change left on, and the result
+  round-tripping. **One known limit, loud**: a computed column referencing a column the plan
+  retypes or renames is not moved out of the way, so the retype fails with Msg 5074 or the rename
+  with 15336, and the plan rolls back whole. Still not done: the view, routine and trigger
   editors.
   **`DATABASE_LISTING` asks `HAS_DBACCESS` inside a `CASE`, and only of a multi-user database.**
   On one another session holds `SINGLE_USER`, that call took 2,174 ms against 150 ms (SQL Server
@@ -23634,7 +23667,7 @@ Re-introducing the anti-patterns these guard against is a regression:
   moved down to the narrower predicates that decide how an edit is *performed* rather than whether
   it is offered — `supports_or_replace_view` and `supports_view_rename`, both false on SQLite and
   only there, plus `supports_column_reorder`, `alter_column_disturbs_checks`,
-  `publishes_index_ddl` and `stats::supports_table_stats`; and, for the *comparison* rather than
+  `alter_column_disturbs_dependents`, `publishes_index_ddl` and `stats::supports_table_stats`; and, for the *comparison* rather than
   any editor, `ref_schema_is_database` and `view_definition_is_qualified`. **The same rule applies
   inside the emitter, and two loops there answered it by not asking.** `emit_sqlite`'s table-rename
   loop iterated `&self.changes` where every loop above it iterates `supported()`, and

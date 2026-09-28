@@ -1145,6 +1145,84 @@ async fn comments_are_set_changed_and_cleared() {
     assert_eq!(fresh.columns[1].comment.as_deref(), Some("units"));
 }
 
+/// **A retype under its dependents lands**: the key, an index, a unique
+/// constraint and a check come off, the columns change, and each goes back as
+/// it was — the unique constraint as a constraint — with the data kept and the
+/// table round-tripping to nothing. The foreign key's column changes only its
+/// nullability, which it survives, and it stays on.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_retype_under_its_dependents_lands() {
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("ddl_deps").await;
+    s.exec(
+        "CREATE TABLE dbo.p (id bigint NOT NULL PRIMARY KEY); \
+         INSERT dbo.p VALUES (7); \
+         CREATE TABLE dbo.t (id int NOT NULL CONSTRAINT pk_t PRIMARY KEY, a int NULL, \
+           c varchar(10) NULL CONSTRAINT uq_c UNIQUE, f int NULL, \
+           k int NULL CONSTRAINT ck_k CHECK (k > 0)); \
+         CREATE INDEX ix_a ON dbo.t (a); \
+         INSERT dbo.t VALUES (1, 2, 'x', NULL, 3)",
+    )
+    .await;
+    // The foreign key needs matching types, so it is added after the
+    // referenced key is bigint and `f` is retyped to it by the plan.
+    s.exec(
+        "ALTER TABLE dbo.t ALTER COLUMN f bigint NULL; \
+            ALTER TABLE dbo.t ADD CONSTRAINT fk_f FOREIGN KEY (f) REFERENCES dbo.p (id)",
+    )
+    .await;
+    let t = read_table(&s, "t").await;
+    let mut d = schemaic_core::ddl::TableDraft::from_table(&t);
+    for c in d.columns.iter_mut() {
+        match c.info.name.as_str() {
+            "id" | "a" | "k" => c.info.type_name = "bigint".into(),
+            "c" => c.info.type_name = "nvarchar(10)".into(),
+            // A nullability change alone, which the foreign key allows.
+            "f" => c.info.nullable = false,
+            _ => {}
+        }
+    }
+    s.exec("UPDATE dbo.t SET f = 7").await;
+    let stmts = apply_draft(&s, &t, &d).await;
+    let t2 = read_table(&s, "t").await;
+    let ty = |n: &str| {
+        t2.columns
+            .iter()
+            .find(|c| c.name == n)
+            .unwrap()
+            .type_name
+            .clone()
+    };
+    assert_eq!(
+        (ty("id"), ty("a"), ty("c"), ty("k")),
+        (
+            "bigint".into(),
+            "bigint".into(),
+            "nvarchar(10)".into(),
+            "bigint".into()
+        ),
+        "{stmts:#?}"
+    );
+    let uq = t2.indexes.iter().find(|i| i.name == "uq_c").expect("uq_c");
+    assert_eq!(uq.constraint.as_deref(), Some("uq_c"), "still a constraint");
+    assert!(t2.indexes.iter().any(|i| i.name == "ix_a"));
+    assert!(
+        t2.indexes
+            .iter()
+            .any(|i| i.is_primary() && i.constraint.as_deref() == Some("pk_t"))
+    );
+    assert_eq!(t2.foreign_keys[0].name, "fk_f");
+    assert_eq!(t2.check_constraints[0].name, "ck_k");
+    // The foreign key was only in the way of a retype, and `f`'s change was
+    // not one: it stayed on.
+    assert!(!stmts.iter().any(|s| s.contains("[fk_f]")), "{stmts:#?}");
+    assert_eq!(s.scalar("SELECT c FROM dbo.t WHERE id = 1").await, "x");
+    let again = schemaic_core::ddl::diff(&t2, &schemaic_core::ddl::TableDraft::from_table(&t2), MS);
+    assert!(again.changes.is_empty(), "{:?}", again.changes);
+}
+
 /// A primary key widened to two columns: dropped by the constraint name
 /// introspection read, and added over both.
 #[tokio::test(flavor = "multi_thread")]
