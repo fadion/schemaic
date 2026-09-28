@@ -15,7 +15,7 @@ writes, imports and edits **tables** (through the twelve-step rebuild — `ddl::
 rather than unfinished work (`db::session::Session::open` carries the reason). **SQL Server is a
 preview** (`db::mssql`, on a vendored `tiberius` — `vendor/tiberius/PATCHES.md`): it reads,
 introspects, runs scripts, writes grid edits back, imports files, designs tables, edits views, holds a Manual tab's
-transaction, shows query plans and dumps to `.sql`, and each thing it
+transaction, shows query plans, dumps to `.sql` and opens `sqlcmd`, and each thing it
 does not do yet is a capability answering no — `ddl::supports_change` (for the trigger and routine
 editors, and the column changes T-SQL's `ALTER COLUMN` cannot make), `users::supports_users` —
 so it is absent from the UI rather than failing there; that one *is* unfinished work. What differs between the

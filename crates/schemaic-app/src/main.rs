@@ -438,6 +438,42 @@ fn psql_shell(
     psql_shell_config(launcher, conn, db)
 }
 
+/// The SQL Server fourth: `sqlcmd`, the ODBC one or the Go rewrite — they
+/// share the name and the flags. `db` is optional, as for MySQL: without one
+/// the session opens in the login's default database.
+fn mssql_shell(
+    conn: &schemaic_core::connection::Connection,
+    db: Option<&str>,
+) -> Result<schemaic_term::ShellConfig, &'static str> {
+    let launcher = resolve_cli(&["sqlcmd"]).map_err(|e| {
+        if e == NO_CLIENT {
+            "No sqlcmd client found (PATH or WSL)."
+        } else {
+            e
+        }
+    })?;
+    mssql_shell_config(launcher, conn, db)
+}
+
+/// [`mssql_shell`]'s config: the argv is [`launch::sqlcmd_args`]'s, which
+/// refuses what `sqlcmd` cannot be told honestly, and the password travels as
+/// `SQLCMDPASSWORD`, which both clients read, never as `-P`.
+fn mssql_shell_config(
+    launcher: CliLauncher,
+    conn: &schemaic_core::connection::Connection,
+    db: Option<&str>,
+) -> Result<schemaic_term::ShellConfig, &'static str> {
+    // See `mysql_shell_config`'s copy: the refusal belongs to the builder.
+    if conn.uses_tunnel()
+        && let Some(why) = launch::tunnelled_verify_blocker(&conn.tls)
+    {
+        return Err(why);
+    }
+    let cli_args = launch::sqlcmd_args(&conn.host, conn.port, &conn.user, db, &conn.tls)?;
+    let env = vec![("SQLCMDPASSWORD".to_string(), conn.password.clone())];
+    Ok(wrap_launcher(launcher, cli_args, env))
+}
+
 /// The SQLite third: `sqlite3 <file>`.
 ///
 /// **Native only, deliberately** ([`resolve_native_cli`]). The other two clients
@@ -11721,14 +11757,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 // itself, which the config already names.
                 schemaic_db::Engine::Sqlite => sqlite_shell(&conn),
                 schemaic_db::Engine::MySql => mysql_shell(&conn, db.as_deref()),
-                // **Not launched yet.** `sqlcmd` takes the database after `-d`
-                // and its TLS as `-N`/`-C`, and neither has been through
-                // `core::launch` — how a server-supplied name after `-d` is
-                // parsed, and how a connection's mode maps to those two flags,
-                // is the validation every other client here got first.
-                schemaic_db::Engine::MsSql => {
-                    Err("Opening SQL Server's command-line client is not supported yet.")
-                }
+                // `sqlcmd`, through `core::launch::sqlcmd_args` — see there
+                // for how the database and the TLS rung reach its flags.
+                schemaic_db::Engine::MsSql => mssql_shell(&conn, db.as_deref()),
             };
             // Badge the panel only for a session that really is a client. The
             // no-client arm spawns a message instead, which is nobody's engine.
@@ -12948,9 +12979,9 @@ mod app_tests {
     use super::{
         Action, CheckAnswer, CliLauncher, ConnGate, ConnGateElse, Refusal, RunTimeout, gate1,
         gate1_on_tab, gate1_on_tab_answered, health_check_lets_through, inline_outcome,
-        mysql_shell_config, owning_tab_of, plan_refusal_text, plan_refused, psql_database,
-        psql_shell_config, resolve_cli_with, resolve_native_cli, sqlite_shell_config, test_outcome,
-        timeout_message, tx_engine, unique_name,
+        mssql_shell_config, mysql_shell_config, owning_tab_of, plan_refusal_text, plan_refused,
+        psql_database, psql_shell_config, resolve_cli_with, resolve_native_cli,
+        sqlite_shell_config, test_outcome, timeout_message, tx_engine, unique_name,
     };
     use floem::prelude::{SignalGet, SignalUpdate};
     use floem::reactive::RwSignal;
@@ -13327,7 +13358,11 @@ mod app_tests {
         )
         .expect("this file's own source");
         let body = schemaic_ui::source_gate::production_code(&src);
-        for builder in ["fn mysql_shell_config(", "fn psql_shell_config("] {
+        for builder in [
+            "fn mysql_shell_config(",
+            "fn psql_shell_config(",
+            "fn mssql_shell_config(",
+        ] {
             let at = body.find(builder).unwrap_or_else(|| {
                 panic!("{builder} is gone — this gate is stale");
             });
@@ -15303,6 +15338,38 @@ mod app_tests {
             ]
         );
         assert!(!cfg.args.iter().any(|a| a.contains("s3cr3t")));
+    }
+
+    /// `sqlcmd` reads the password from `SQLCMDPASSWORD` — never `-P`, which
+    /// would put it on the command line — and across WSL like the others.
+    #[test]
+    fn sqlcmd_shell_puts_password_in_env_not_argv() {
+        let c = Connection {
+            db_type: "SQL Server".into(),
+            ..conn()
+        };
+        let cfg = mssql_shell_config(CliLauncher::Native("sqlcmd"), &c, Some("shop")).unwrap();
+        assert_eq!(cfg.program, "sqlcmd");
+        assert_eq!(
+            cfg.args,
+            vec!["-Stcp:10.0.0.5,3307", "-Uroot", "-dshop", "-I", "-No"]
+        );
+        assert_eq!(
+            cfg.env,
+            vec![("SQLCMDPASSWORD".to_string(), "s3cr3t".to_string())]
+        );
+        assert!(
+            !cfg.args
+                .iter()
+                .any(|a| a.contains("s3cr3t") || a.starts_with("-P"))
+        );
+        let cfg = mssql_shell_config(CliLauncher::Wsl("sqlcmd"), &c, None).unwrap();
+        assert_eq!(cfg.program, "wsl.exe");
+        assert_eq!(&cfg.args[..2], ["-e", "sqlcmd"]);
+        assert!(
+            cfg.env
+                .contains(&("WSLENV".to_string(), "SQLCMDPASSWORD/u".to_string()))
+        );
     }
 
     #[test]

@@ -405,6 +405,83 @@ pub fn psql_cli_tls_env(tls: &crate::connection::Tls) -> Vec<(String, String)> {
     env
 }
 
+/// `sqlcmd`'s argv for a SQL Server session — the password travels as
+/// `SQLCMDPASSWORD`, never here.
+///
+/// **Every value is attached to its flag** (`-d<name>`, not `-d <name>`), so
+/// none can be read as an option by either `sqlcmd` — the ODBC one or the Go
+/// rewrite, which share the name and the flags. Measured against ODBC
+/// `sqlcmd` 18: the database is taken verbatim, so a name like
+/// `x;Encrypt=no;Server=192.0.2.1` opens *that database* on *this server* —
+/// there is no connection-string re-read to refuse, which is the difference
+/// from [`psql_target`]. The host is the one value `sqlcmd` parses
+/// (`host\instance`, `host,port`, a `np:` or `lpc:` prefix), so it is forced
+/// onto TCP with `tcp:` and one that would re-shape the address is refused.
+/// `-I` turns `QUOTED_IDENTIFIER` on, as every Schemaic session has it: the
+/// client's default is off, where an index on a computed column is Msg 1934.
+///
+/// The TLS rungs map onto what `sqlcmd` can express, measured the same way:
+/// `-No` is no encryption past the login (`disable`); `-Nm -C` encrypts
+/// without judging the certificate (`prefer` and `require` — SQL Server
+/// always offers TLS, so `prefer` has nothing to fall back from); `-Nm` alone
+/// verifies the chain and the name against the system store (`verify-ca`
+/// gets the name checked too, the stricter answer). A private CA file is
+/// refused: `sqlcmd` has no option for one (`-J` pins the server's own
+/// certificate, a different trust), and dropping it would verify against a
+/// store the connection did not ask for. So is a client certificate, for the
+/// same reason: TDS signs no one in by one, so there is nowhere to send it.
+pub fn sqlcmd_args(
+    host: &str,
+    port: u16,
+    user: &str,
+    database: Option<&str>,
+    tls: &crate::connection::Tls,
+) -> Result<Vec<String>, &'static str> {
+    use crate::connection::SslMode;
+    const HOST: &str = "This connection's host contains a character sqlcmd reads as part of the \
+        address (',', '\\', ';' or a ':' prefix). Set the port in its own field, and open it again.";
+    const CA: &str = "sqlcmd cannot verify against a CA file. Add the CA to the system's trust \
+        store and clear the connection's CA field, or open the connection in a query tab.";
+    const CLIENT_CERT: &str = "SQL Server does not sign in with a client certificate, so sqlcmd \
+        has nowhere to send this connection's. Clear the client certificate and key, and open \
+        it again.";
+    if tls.uses_client_cert() {
+        return Err(CLIENT_CERT);
+    }
+    let host = host.trim();
+    let prefixed = ["tcp:", "np:", "lpc:", "admin:"].iter().any(|p| {
+        host.get(..p.len())
+            .is_some_and(|s| s.eq_ignore_ascii_case(p))
+    });
+    if host.is_empty() || prefixed || host.contains([',', '\\', ';']) {
+        return Err(HOST);
+    }
+    let host = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    let mut args = vec![format!("-Stcp:{host},{port}"), format!("-U{user}")];
+    if let Some(db) = database.filter(|d| !d.is_empty()) {
+        args.push(format!("-d{db}"));
+    }
+    args.push("-I".to_string());
+    match tls.mode {
+        SslMode::Disable => args.push("-No".to_string()),
+        SslMode::Prefer | SslMode::Require => {
+            args.push("-Nm".to_string());
+            args.push("-C".to_string());
+        }
+        SslMode::VerifyCa | SslMode::VerifyFull => {
+            if tls.ca_file().is_some() {
+                return Err(CA);
+            }
+            args.push("-Nm".to_string());
+        }
+    }
+    Ok(args)
+}
+
 /// Why a client running *inside WSL* cannot honour `tls`, or `None`.
 ///
 /// The three certificate paths travel as argv or as environment values, and a
@@ -1061,5 +1138,102 @@ mod tests {
                 ("PGSSLKEY".to_string(), "/etc/c.key".to_string()),
             ]
         );
+    }
+
+    fn sqlcmd(host: &str, db: Option<&str>, mode: SslMode) -> Result<Vec<String>, &'static str> {
+        sqlcmd_args(
+            host,
+            1433,
+            "sa",
+            db,
+            &Tls {
+                mode,
+                ..Tls::default()
+            },
+        )
+    }
+
+    /// `sqlcmd`'s argv: the server forced onto TCP, every value **attached**
+    /// to its flag, so no value is ever read as an option — measured against
+    /// ODBC `sqlcmd` 18, a database named `-x` or `x;Server=192.0.2.1` opens
+    /// that database, verbatim, when passed this way — and `-I`, since the
+    /// client's `QUOTED_IDENTIFIER` is off by default and Schemaic's sessions
+    /// have it on.
+    #[test]
+    fn sqlcmd_takes_every_value_attached_to_its_flag() {
+        assert_eq!(
+            sqlcmd("db.example", Some("-x;Server=192.0.2.1"), SslMode::Require).unwrap(),
+            [
+                "-Stcp:db.example,1433",
+                "-Usa",
+                "-d-x;Server=192.0.2.1",
+                "-I",
+                "-Nm",
+                "-C"
+            ]
+        );
+        // No database: the login's default one, as the other clients do.
+        let args = sqlcmd("h", None, SslMode::Require).unwrap();
+        assert!(!args.iter().any(|a| a.starts_with("-d")), "{args:?}");
+        // An IPv6 literal is bracketed, as the drivers write it.
+        assert_eq!(
+            sqlcmd("::1", None, SslMode::Require).unwrap()[0],
+            "-Stcp:[::1],1433"
+        );
+    }
+
+    /// The host is the one value that is parsed — `host,port`, `host\instance`
+    /// — so what would re-shape it is refused rather than guessed at.
+    #[test]
+    fn a_host_sqlcmd_would_reparse_is_refused() {
+        for host in ["h,1500", "h\\SQLEXPRESS", "", "np:h", "h;x"] {
+            assert!(sqlcmd(host, None, SslMode::Require).is_err(), "{host:?}");
+        }
+    }
+
+    /// Each rung lands on the flags that make `sqlcmd` behave as Schemaic's
+    /// own connection does, or on a refusal where it cannot: measured, `-No`
+    /// leaves the session unencrypted, `-Nm -C` encrypts it without judging
+    /// the certificate, and `-Nm` alone verifies it (a self-signed one fails).
+    #[test]
+    fn each_tls_rung_lands_on_sqlcmds_flags() {
+        let tail = |mode| {
+            let a = sqlcmd("h", None, mode).unwrap();
+            a[a.iter().position(|x| x == "-I").unwrap() + 1..].to_vec()
+        };
+        assert_eq!(tail(SslMode::Disable), ["-No"]);
+        assert_eq!(tail(SslMode::Prefer), ["-Nm", "-C"]);
+        assert_eq!(tail(SslMode::Require), ["-Nm", "-C"]);
+        assert_eq!(tail(SslMode::VerifyCa), ["-Nm"]);
+        assert_eq!(tail(SslMode::VerifyFull), ["-Nm"]);
+        // A private CA is a file sqlcmd has no option for: `-J` pins the
+        // server's own certificate, which is a different trust.
+        let private = sqlcmd_args(
+            "h",
+            1433,
+            "sa",
+            None,
+            &Tls {
+                mode: SslMode::VerifyFull,
+                ca_path: "/etc/ca.crt".into(),
+                ..Tls::default()
+            },
+        );
+        assert!(private.is_err());
+        // A client certificate likewise: SQL Server signs no one in by one,
+        // and a session that silently leaves it out is not the one asked for.
+        let client = sqlcmd_args(
+            "h",
+            1433,
+            "sa",
+            None,
+            &Tls {
+                mode: SslMode::Require,
+                client_cert_path: "/etc/c.crt".into(),
+                client_key_path: "/etc/c.key".into(),
+                ..Tls::default()
+            },
+        );
+        assert!(client.is_err());
     }
 }

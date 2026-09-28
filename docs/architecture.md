@@ -8485,6 +8485,33 @@ existing prose was left alone.
     loopback address *is* the address and nothing is compared. A refusal rather than a silent drop to
     `require`, which would open a session that says TLS and checks nothing on a connection whose
     whole point is that it checks — the direction `SslMode::STRICTEST` already sends a guess.
+    `sqlcmd_args` is the SQL Server client's argv, and the one where the database name needs no
+    refusal at all. Every value is **attached to its flag** — `-d<name>`, `-U<user>`, `-S…` — so
+    neither `sqlcmd` (the ODBC one or the Go rewrite, which share the name and the flags) can read
+    one as an option, and the value itself is taken verbatim: measured against ODBC `sqlcmd` 18, a
+    database named `x;Encrypt=no;Server=192.0.2.1` opens *that database* on *this server*, and one
+    with a leading `-` does too, so there is no connection-string re-read for a `psql_target` to
+    refuse (`sqlcmd_takes_every_value_attached_to_its_flag`). Don't split a value off its flag to
+    tidy the argv: the attachment is what makes the leading `-` inert. The **host** is the one value
+    `sqlcmd` parses (`host\instance`, `host,port`, a `tcp:`/`np:`/`lpc:`/`admin:` prefix), so it is
+    forced onto TCP as `-Stcp:host,port` — an IPv6 literal bracketed — and a host holding `,`, `\`
+    or `;`, or already carrying one of those prefixes, is refused rather than guessed at
+    (`a_host_sqlcmd_would_reparse_is_refused`). `-I` is always sent: the client's
+    `QUOTED_IDENTIFIER` default is off, where an index over a computed column is Msg 1934, and every
+    Schemaic session has it on. TLS lands on the three things `sqlcmd` can say, each measured:
+    `disable` → `-No`, unencrypted; `prefer` and `require` → `-Nm -C`, encrypted with the
+    certificate not judged (SQL Server always offers TLS, so `prefer` has nothing to fall back
+    from); `verify-ca` and `verify-full` → `-Nm` alone, verified against the system store — a
+    self-signed certificate fails — which checks the name for `verify-ca` too, the stricter of the
+    two answers on offer (`each_tls_rung_lands_on_sqlcmds_flags`). **A private CA file is refused,
+    not dropped**: `sqlcmd` has no option for one — `-J` pins the server's own certificate, a
+    different trust — and dropping it would verify against a store the connection did not ask for.
+    A client certificate and key are refused the same way: TDS signs no one in by one, so there is
+    nowhere to send them, and a session that silently left them out is not the one asked for.
+    So no certificate path ever reaches this argv, which is why `mssql_shell_config` has no
+    `wsl_tls_blocker` to ask. The password travels as `SQLCMDPASSWORD`, which both clients read,
+    never as `-P` — `sqlcmd_shell_puts_password_in_env_not_argv` in `app/main.rs`, which pins its
+    `WSLENV` forwarding as well.
   - `cli_install.rs` — **putting the `schemaic` command on `PATH`, and taking it off again**: the
     decision half of Settings → General → Command line → Install / Remove and of the Windows
     uninstall hook, with the registry write, the symlink and the broadcast left to
@@ -11258,8 +11285,9 @@ existing prose was left alone.
   another are reported as the session blocking itself, which is no lock anyone else holds
   (`a_sql_server_blocker_is_an_edge_only_when_it_is_a_session`); `snippet` has an `mssql` scope
   with a five-snippet DMV pack (`every_builtin_snippet_runs`). In the app, the terminal's *open DB
-  client* answers "not supported yet": `sqlcmd` takes the database after `-d` and TLS as `-N`/`-C`, and
-  neither has been through `core::launch`.
+  client* opens `sqlcmd` (`mssql_shell`, with the WSL fallback the other network clients have),
+  its argv built — and refused where `sqlcmd` cannot be told the connection honestly — by
+  `core::launch::sqlcmd_args`; see there.
   SSH tunnels return a `TunnelHandle` (drop → port freed) with
   keepalives + TOFU host-key verification (`ssh_known_hosts.json`). **`russh` stays on 0.62
   deliberately**: 0.63 changes `Handler::check_server_key` to take a `&PublicKeyOrCertificate`
@@ -23560,7 +23588,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   takes its environment as a `Vec` and treats an empty one as meaningful — a client with no
   credential sets no variable and names none in `WSLENV`, which is not the same as passing an empty
   password. (It was `Option<(var, password)>` until the TLS settings had to travel the same road;
-  see `core::launch`.)
+  see `core::launch`.) `mssql_shell` is the fourth arm, and takes the WSL fallback — a host and a
+  port again.
   **The search in front of that `match` had a `?` where it wanted a `continue`.** `resolve_cli` takes
   a list of candidate names and `direct_spawn_verdict` refuses a `.cmd`/`.bat` image, which `cmd.exe`
   runs and which does not know what the `--` terminator in front of a server-supplied database name
@@ -24637,13 +24666,15 @@ Re-introducing the anti-patterns these guard against is a regression:
   the terminal panel, and no engine badge) and none of them can be forgotten at a call site. Don't
   add a second gate in a caller, and don't spell one of these decisions inline: `open_url` spawns
   whatever `launch::url_open_argv` hands it and decides nothing itself. **`tunnelled_verify_blocker`
-  was the refusal that lived only in a caller's `if`**, and it is asked inside both
-  `mysql_shell_config` and `psql_shell_config` now, beside `wsl_tls_blocker`. `open_db_cli` still
+  was the refusal that lived only in a caller's `if`**, and it is asked inside
+  `mysql_shell_config`, `psql_shell_config` and `mssql_shell_config` now — beside
+  `wsl_tls_blocker` in the first two; `sqlcmd` is handed no certificate path, so the third has none
+  to ask. `open_db_cli` still
   asks it earlier, where the endpoint is rewritten, so a verifying tunnelled connection is told why
   before it is told the tunnel is down — but the builder is the authority, because a second launch
   path would compile with the check absent.
-  `both_cli_builders_refuse_a_tunnelled_verifying_connection_themselves` reads both builders' spans
-  for it.
+  `both_cli_builders_refuse_a_tunnelled_verifying_connection_themselves` reads all three builders'
+  spans for it — the name is from when there were two.
 - **Every schema-search surface matches through one predicate.** The schema tree's filter box and
   the Find-Anywhere palette answer the same question over the same `DbSchema`, so they go through
   `schema::TableInfo::matches_search` (name or any column) and `schema::ObjectItem::matches_search`
