@@ -2944,9 +2944,9 @@ pub const DEPRECATED_ALIASES: &[&str] = &[
 /// per engine and one place to forget an engine rather than two. A separate
 /// `builtin_functions_are_authoritative` stood here and was deleted for saying
 /// the same thing a second time. `None` is not "no builtins" — it is "this app
-/// cannot say", which is the distinction the checker needs. **All three engines
-/// answer `Some` today, and the `None` arm stays because a fourth engine must
-/// land on it** rather than inherit whichever list is nearest: that is the whole
+/// cannot say", which is the distinction the checker needs. **All four engines
+/// answer `Some` today, SQL Server last, and a fifth must land on a `None` of its
+/// own** rather than inherit whichever list is nearest: that is the whole
 /// bug below, and `Option` is what keeps the fix from depending on somebody
 /// remembering to add an arm.
 ///
@@ -2988,11 +2988,9 @@ pub(crate) fn builtin_catalog(dialect: SqlDialect) -> Option<&'static [SqlFuncti
         SqlDialect::MySql => Some(FUNCTIONS),
         SqlDialect::Sqlite => Some(SQLITE_FUNCTIONS),
         SqlDialect::Postgres => Some(crate::pg_builtins::PG_FUNCTIONS),
-        // **None yet**, which turns the misspelled-function checker off and
-        // offers no builtins — the reason this function returns an `Option`.
-        // A catalog belongs here once one can be checked against a server, as
-        // PostgreSQL's is.
-        SqlDialect::MsSql => None,
+        // Hand-written — T-SQL's intrinsics are in no catalog view — and
+        // checked against the server's parser by `live::mssql`.
+        SqlDialect::MsSql => Some(crate::mssql_builtins::MSSQL_FUNCTIONS),
     }
 }
 
@@ -3186,7 +3184,7 @@ fn letter_mask(bytes: &[u8]) -> u64 {
 /// [`CatalogIndex`] for `dialect`, built on first use and kept for the process.
 ///
 /// One `OnceLock` per dialect rather than a map keyed by it: the set of dialects
-/// is closed and known at compile time, so a fourth engine is a compiler error
+/// is closed and known at compile time, so a fifth engine is a compiler error
 /// here rather than a silent miss at runtime.
 fn catalog_index(dialect: SqlDialect) -> Option<&'static CatalogIndex> {
     static MYSQL: std::sync::OnceLock<CatalogIndex> = std::sync::OnceLock::new();
@@ -3252,7 +3250,7 @@ pub(crate) fn offered_builtins(
 /// The flavour only ever *narrows* the list once it is known.
 pub(crate) fn is_offered_builtin(dialect: SqlDialect, flavour: ServerFlavour, name: &str) -> bool {
     match dialect {
-        // No catalog on SQL Server yet, so nothing reaches here to be offered.
+        // Both transcribed from a reference, which carries no plumbing to cut.
         SqlDialect::Sqlite | SqlDialect::MsSql => true,
         SqlDialect::Postgres => crate::pg_builtins::is_suggested(name),
         SqlDialect::MySql => {
@@ -12314,6 +12312,37 @@ mod tests {
         );
     }
 
+    /// **SQL Server answers for its own functions**, now that it has a catalog:
+    /// ordinary T-SQL is clean, and a typo of one of its builtins is caught.
+    #[test]
+    fn sql_server_measures_against_its_own_catalog() {
+        // Ordinary T-SQL — each call a builtin MySQL's list lacks, several of
+        // them near misses of MySQL names (`DATEADD` of `DATE_ADD`) — is clean.
+        for sql in [
+            "SELECT ISNULL(name, N'') FROM employees",
+            "SELECT DATEADD(day, 1, GETDATE()) FROM employees",
+            "SELECT EOMONTH(SYSDATETIME()) FROM employees",
+            "SELECT IIF(1 = 1, 'a', 'b'), DATEDIFF_BIG(day, 0, 1) FROM employees",
+            "SELECT TRY_CONVERT(int, name), FORMAT(1.5, 'N2') FROM employees",
+            "SELECT SCOPE_IDENTITY(), NEWID(), CHARINDEX('a', name) FROM employees",
+        ] {
+            let d = diag_d(sql, SqlDialect::MsSql);
+            assert!(
+                !d.iter().any(|x| x.message.contains("misspelled function")),
+                "{sql} on SQL Server: {d:?}"
+            );
+        }
+        // And a typo of one is caught.
+        assert!(
+            diag_d(
+                "SELECT DATEADDD(day, 1, GETDATE()) FROM employees",
+                SqlDialect::MsSql
+            )
+            .iter()
+            .any(|x| x.message.contains("misspelled function"))
+        );
+    }
+
     /// **SQLite answers for its own functions**, which is what having a catalog
     /// of them buys: `SQLITE_FUNCTIONS` exists, so
     /// `builtin_functions_are_authoritative` says yes for that dialect and the
@@ -12612,7 +12641,7 @@ mod tests {
     ///
     /// Stated as its own test because the whole design rests on it: an engine
     /// whose catalog the app does not have must keep the checker *off* rather
-    /// than inherit whichever list is nearest. All three answer `Some` now, so
+    /// than inherit whichever list is nearest. All four answer `Some` now, so
     /// what this guards is the cross-wiring rather than the `None`.
     #[test]
     fn only_the_engines_with_a_catalog_are_authoritative() {
@@ -12654,6 +12683,52 @@ mod tests {
                 && !catalog_knows(SqlDialect::Sqlite, "btrim"),
             "PostgreSQL's catalog leaked into another engine's"
         );
+        let mssql = builtin_catalog(SqlDialect::MsSql).expect("SQL Server's catalog");
+        assert_eq!(mssql.len(), crate::mssql_builtins::MSSQL_FUNCTIONS.len());
+        assert!(
+            catalog_knows(SqlDialect::MsSql, "datediff") && catalog_knows(SqlDialect::MsSql, "iif"),
+            "SQL Server's own is missing"
+        );
+        assert!(
+            !catalog_knows(SqlDialect::MsSql, "curdate"),
+            "SQL Server got MySQL's catalog"
+        );
+        assert!(
+            !catalog_knows(SqlDialect::MySql, "eomonth")
+                && !catalog_knows(SqlDialect::Postgres, "eomonth"),
+            "SQL Server's catalog leaked into another engine's"
+        );
+    }
+
+    /// The SQL Server catalog is sane, on the same terms as MySQL's, which it
+    /// resembles: written by hand, upper-case, one entry per name.
+    /// `live::mssql` is what holds each name to the server's parser.
+    #[test]
+    fn mssql_function_catalog_is_sane() {
+        use crate::mssql_builtins::MSSQL_FUNCTIONS;
+        assert!(
+            MSSQL_FUNCTIONS.len() > 200,
+            "only {} entries — a short catalog is how false positives come back",
+            MSSQL_FUNCTIONS.len()
+        );
+        let mut seen = std::collections::HashSet::new();
+        for f in MSSQL_FUNCTIONS {
+            assert!(seen.insert(f.name), "duplicate entry {}", f.name);
+            assert!(
+                f.name
+                    .bytes()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_'),
+                "non-canonical name: {}",
+                f.name
+            );
+            assert!(
+                f.signature.starts_with(f.name),
+                "{}'s signature does not name it: {}",
+                f.name,
+                f.signature
+            );
+            assert!(!f.summary.is_empty(), "{} has no summary", f.name);
+        }
     }
 
     /// The PostgreSQL catalog is sane, on the same terms the other two are.

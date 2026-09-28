@@ -1,7 +1,7 @@
 //! The PostgreSQL builtin function catalog, read off a real server.
 //!
-//! [`PG_FUNCTIONS`] is the third and last entry in `intel::builtin_catalog`, and
-//! the one that could not be written by hand. MySQL's and SQLite's builtins are
+//! [`PG_FUNCTIONS`] is the third entry in `intel::builtin_catalog`, and the one
+//! that could not be written by hand. MySQL's and SQLite's builtins are
 //! small closed sets their own documentation enumerates; PostgreSQL's are
 //! neither, and a partial list is worse than none — the typo checker speaks only
 //! about near misses of names it *holds*, so a name missing from a catalog that

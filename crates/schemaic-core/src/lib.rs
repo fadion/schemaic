@@ -37,6 +37,7 @@ pub mod jsontree;
 pub mod launch;
 pub mod model;
 pub mod monitor;
+pub mod mssql_builtins;
 pub mod pairs;
 pub mod palette;
 pub mod params;

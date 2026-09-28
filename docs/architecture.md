@@ -838,7 +838,8 @@ existing prose was left alone.
     MariaDB has `RETURNING` too.
     **The typo checker runs only where the app holds the engine's own catalog** — `builtin_catalog`
     answers that with one exhaustive `match` **returning the catalog itself**: `FUNCTIONS` for
-    MySQL, `SQLITE_FUNCTIONS` for SQLite, `PG_FUNCTIONS` for PostgreSQL, and `is_known_function` and
+    MySQL, `SQLITE_FUNCTIONS` for SQLite, `PG_FUNCTIONS` for PostgreSQL, `MSSQL_FUNCTIONS` for SQL
+    Server, and `is_known_function` and
     `is_probable_function_typo` take it as a parameter — as the `CatalogIndex` built from it rather
     than as the slice itself, which is the same catalog reached one hop further on. Reaching for the
     module-level `FUNCTIONS`
@@ -868,9 +869,10 @@ existing prose was left alone.
     **`is_offered_builtin` is where those two surfaces part company again**, because trusting a name
     and offering it are not the same question: `builtin_catalog` is what the checker **trusts**,
     whole, and `is_offered_builtin(dialect, flavour, name)` is what `rank`'s `ClauseCtx::Column` arm
-    filters it through before the popup sees it. MySQL's and SQLite's
+    filters it through before the popup sees it. MySQL's, SQLite's and SQL Server's
     catalogs were transcribed from their manuals and each already *is* the list a person would type,
-    so SQLite's arm is `true` outright and MySQL's is `true` but for the flavour split below;
+    so SQLite's and SQL Server's arms are `true` outright and MySQL's is `true` but for the flavour
+    split below;
     PostgreSQL's was read out of `pg_catalog`, so it carries the engine's
     own plumbing — `int4in`, `btint4cmp`, `texteq` — which the checker must keep knowing and the
     popup must not spend its forty rows on, and that arm asks `pg_builtins::is_suggested`.
@@ -893,11 +895,13 @@ existing prose was left alone.
     `to_char` made the list. SQLite could be written out by hand because its builtins are a small
     closed set its documentation enumerates; PostgreSQL's are not, and the honest source for them is
     `pg_catalog` on a real server, which is what `pg_builtins.rs` below was *generated* from. **The
-    `Option` outlives that**: all three engines answer `Some` today, and the `None` arm stays for the
-    *fourth*, which has to land on it rather than inherit whichever list is nearest — the original
-    bug, one engine further on. **SQL Server is that fourth, and it landed on `None`**: no
-    completion builtins and no misspelled-function checker until a catalog can be checked against a
-    server as PostgreSQL's is. Its reserved words (`MSSQL_RESERVED`, the documented list) are there
+    `Option` outlives that**: all four engines answer `Some` today, and the `None` arm stays for a
+    *fifth*, which has to land on it rather than inherit whichever list is nearest — the original
+    bug, one engine further on. **SQL Server was the fourth, and it landed on `None` first**: no
+    completion builtins, no signature help and no misspelled-function checker until a catalog could
+    be checked against a server as PostgreSQL's is. `mssql_builtins.rs` below is that catalog, and
+    what it is checked against is the server's parser, since T-SQL's builtins are in no catalog view
+    to diff it with. Its reserved words (`MSSQL_RESERVED`, the documented list) are there
     — T-SQL has no fallback like SQLite's, so its alias set and identifier set are one list.
     **The checker's exemption set is the other half of "a name this engine really has", and an
     extension's functions fell straight through it.** `function_typo_checks` passes anything in the
@@ -1063,9 +1067,9 @@ existing prose was left alone.
     quietly reading somebody else's list. Three short vectors rather than a fourth `OnceLock` keyed
     on the (dialect, flavour) pair: the flavour changes what is *offered* and nothing else in the
     struct, so splitting the whole index would rebuild the buckets and both hash sets three times
-    over to vary one field. On the other two dialects all three lists are the same.
-    **Three `OnceLock`s, one per `SqlDialect` arm, rather than one map keyed by the dialect** — the
-    set of engines is closed at compile time, so a fourth engine is a compiler error in the cache
+    over to vary one field. On the other three dialects all three lists are the same.
+    **Four `OnceLock`s, one per `SqlDialect` arm, rather than one map keyed by the dialect** — the
+    set of engines is closed at compile time, so a fifth engine is a compiler error in the cache
     too rather than a silent miss at runtime, which is `builtin_catalog`'s own argument one layer on.
     **`CatalogIndex::within(len, thresh, mask)` is the candidate set, and what makes skipping the
     rest sound is that both of its conditions are *necessary*.** Neither is sufficient and neither is
@@ -1442,6 +1446,45 @@ existing prose was left alone.
     but for the leading capital. `intel::f` is `pub(crate)` for this module alone, so 2,682 generated
     entries need no second spelling of the `SqlFunction` literal. What holds the file to a real server
     is `live::pg_catalog`, under `tests/live/` below.
+  - `mssql_builtins.rs` — the **SQL Server builtin catalog**, the fourth entry in
+    `intel::builtin_catalog`, and the one that could be neither generated nor diffed against the
+    server. Wiring it in is what turned completion's builtins, signature help and the
+    misspelled-function checker on for SQL Server tabs, all three of which had said nothing on the
+    `None` arm until then. `MSSQL_FUNCTIONS` is 267 entries, **written by hand** from Microsoft's
+    *Functions (Transact-SQL)* reference and grouped by its categories — aggregate, ranking and
+    analytic, conversion, date and time, logical, mathematical, bit manipulation, string, JSON,
+    system, metadata, security, cryptographic, text and image, rowset. By hand because there is
+    nothing to generate it from: PostgreSQL's comes out of `pg_catalog`, but T-SQL's intrinsics —
+    `LEN`, `DATEADD`, `ISNULL` — are in no catalog view at all, and `sys.all_objects` holds the
+    `sys.fn_*` system functions rather than these.
+    **What checks it is the parser.** A name T-SQL does not know fails to compile with Msg 195, *is
+    not a recognized built-in function name*; a builtin called with the wrong arguments fails some
+    other way; and nothing runs either time. So `live::mssql`'s
+    `every_catalogued_builtin_is_one_the_server_knows` calls every entry with no arguments — in
+    `FROM` for the rowset functions, bare for the niladic ones such as `CURRENT_TIMESTAMP` (an entry
+    whose signature has no `(`) — and fails only on a 195. It first asserts that a made-up name does
+    come back 195 on the same path, so the test can see a failure at all. **The check is
+    one-directional, and there is no oracle for the other direction**: it catches over-listing, the
+    mistake a list written from memory makes, while a builtin the list lacks goes unseen and costs a
+    squiggle only where the missing name is a near miss of one held — the partial-catalog failure
+    described under `intel.rs` above, which nothing here rules out. Green on SQL Server 2022.
+    **SQL Server 2022's set, on purpose**: 2025 adds `REGEXP_*`, `EDIT_DISTANCE`, `UNISTR`,
+    `PRODUCT` and `CURRENT_DATE`, which the tier's server does not have, so they wait for a leg that
+    can check them rather than being listed unchecked. Rowset functions (`OPENJSON`,
+    `STRING_SPLIT`, `GENERATE_SERIES`, `OPENROWSET` …) are listed too — they are called, in `FROM` —
+    and the oracle calls them there.
+    **Names are upper-case**, like MySQL's `FUNCTIONS` and unlike `SQLITE_FUNCTIONS` and
+    `PG_FUNCTIONS`, which costs nothing because `intel::CatalogIndex` lower-cases every catalog for
+    its lookups. Nothing is cut for the popup: `is_offered_builtin`'s SQL Server arm is `true`
+    outright, as SQLite's is, since a list transcribed from a reference carries no plumbing.
+    `intel::tests::mssql_function_catalog_is_sane` holds it to unique upper-case identifiers, a
+    signature that names its function, a non-empty summary and a floor of 200 entries;
+    `sql_server_measures_against_its_own_catalog` puts ordinary T-SQL — `ISNULL`, `DATEADD`,
+    `EOMONTH`, `IIF`, `TRY_CONVERT`, `SCOPE_IDENTITY` … — through the checker with no "misspelled
+    function", several of them near misses of MySQL names (`DATEADD` of `DATE_ADD`), and catches
+    `DATEADDD`; it was watched fail against the `None` arm.
+    `only_the_engines_with_a_catalog_are_authoritative` covers this catalog too, in both directions — SQL Server knows `datediff` and `iif` and not
+    MySQL's `curdate`, and neither MySQL nor PostgreSQL knows `eomonth`.
   - `filter.rs` — the header filter/sort bar: a dialect-aware `sqlparser` **AST rewrite** that
     splices a `WHERE`/`ORDER BY` into the `SELECT` that produced the result and hands back SQL to
     re-run — so filtering covers the whole table, not the loaded page. `build_query` rewrites only
@@ -8614,14 +8657,14 @@ existing prose was left alone.
       in the surface that *inserts* the word rather than the one that underlines it, so the arm asks
       `intel::offered_builtins(input.dialect, input.flavour)` — the one engine→catalog map, read
       through `intel::CatalogIndex` and `pub(crate)` for this caller — and reads its `None` as an empty
-      slice, leaving a fourth engine offered nothing rather than inheriting whichever list is
+      slice, leaving a fifth engine offered nothing rather than inheriting whichever list is
       nearest. `each_dialect_is_offered_its_own_builtins` asserts
       that through `rank` and not over the catalogs, because the catalogs were already right and the
       composition was what was broken; `ranked_on` is the existing `ranked` helper with the engine
       named, and `ranked` itself still passes `SqlDialect::MySql`, so every older test means what it
       did. **The size of PostgreSQL's catalog reaching the popup was the half that fix left open,
-      and the arm now filters through `intel::is_offered_builtin`** — `true` on MySQL and SQLite,
-      whose catalogs are already the user-facing list, and `pg_builtins::PG_SUGGESTED` membership on
+      and the arm now filters through `intel::is_offered_builtin`** — `true` on MySQL, SQLite and
+      SQL Server, whose catalogs are already the user-facing list, and `pg_builtins::PG_SUGGESTED` membership on
       PostgreSQL, so the tab is offered 863 names rather than 2,706 while the checker goes on
       trusting all of them. **That filter is precomputed now and the arm reads its answer**: it is a
       binary search on PostgreSQL, asked per candidate, so it ran 2,706 times per keystroke to
@@ -11367,8 +11410,10 @@ existing prose was left alone.
   AdventureWorksLT table round-tripping where that sample is installed, also under `mssql.rs`),
   a file import (four tests, from every row across batches to a cancel rolled back, under
   `mssql.rs` too), and the
-  two catalogues only it has — `every_allowlisted_function_is_a_builtin` (the read gate's lists,
-  by error 195) and `every_builtin_snippet_runs`. It is not a `Target`, so `endpoint.rs` carries
+  three catalogues only it has — `every_allowlisted_function_is_a_builtin` (the read gate's lists,
+  by error 195), `every_builtin_snippet_runs`, and `every_catalogued_builtin_is_one_the_server_knows`
+  (`core::mssql_builtins`, by the same error 195 and in the over-listing direction only, under
+  `mssql_builtins.rs`). It is not a `Target`, so `endpoint.rs` carries
   `OUTSIDE_THE_SUITE` for it, `leg_enabled` to answer `SCHEMAIC_IT_ENGINES` for a leg with no
   `Target`, and `note_leg_skipped` to say so when it is left out; its endpoint is
   `SCHEMAIC_IT_MSSQL_HOST`/`_PORT`/`_USER`/`_PASSWORD` (defaults `127.0.0.1`/`1433`/`sa`/
@@ -23314,8 +23359,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   `signature_help` all ask it now, which is that argument at the other end: three surfaces, one map,
   so a fourth engine is forgotten in one place rather than three — and it was three, for as long as
   the popup and then the signature bar named `FUNCTIONS` themselves. **The cache in front of it is
-  the same shape for the same reason**: `intel::catalog_index` is three `OnceLock`s, one per
-  `SqlDialect` arm, rather than one map keyed by the dialect, so a fourth engine is a compiler error
+  the same shape for the same reason**: `intel::catalog_index` is four `OnceLock`s, one per
+  `SqlDialect` arm, rather than one map keyed by the dialect, so a fifth engine is a compiler error
   there too rather than a cache nothing ever fills.
   **`SqlDialect` was one level too coarse for one of those surfaces, and in the opposite direction
   to the usual failure**: the usual one is a model that cannot say *unknown*, this one could not say

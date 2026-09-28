@@ -2200,3 +2200,55 @@ async fn every_builtin_snippet_runs() {
             .unwrap_or_else(|e| panic!("{}: {e}", snippet.name));
     }
 }
+
+/// **Every name the SQL Server catalog holds is a builtin this server knows.**
+///
+/// T-SQL's intrinsics are in no catalog view, so the list is hand-written
+/// (`core::mssql_builtins`), and the parser is its oracle: a name T-SQL does
+/// not know fails to compile with Msg 195, *is not a recognized built-in
+/// function name*, where a builtin called with the wrong arguments fails some
+/// other way — and nothing runs either time. So each entry is called with no
+/// arguments, in `FROM` for the rowset ones and bare for the niladic ones, and
+/// only a 195 fails the test. It checks the over-listing direction; a builtin
+/// the list lacks has no oracle.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_catalogued_builtin_is_one_the_server_knows() {
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("builtins").await;
+    // The oracle can see a failure: a name nobody has is a 195 on this path.
+    let bogus = s
+        .try_exec("SELECT SCHEMAIC_NO_SUCH_FUNCTION()")
+        .await
+        .expect_err("an unknown function");
+    assert!(bogus.to_string().contains("(Msg 195"), "{bogus}");
+    const ROWSET: &[&str] = &[
+        "CONTAINSTABLE",
+        "FREETEXTTABLE",
+        "GENERATE_SERIES",
+        "OPENDATASOURCE",
+        "OPENJSON",
+        "OPENQUERY",
+        "OPENROWSET",
+        "OPENXML",
+        "PREDICT",
+        "STRING_SPLIT",
+    ];
+    let mut unknown = Vec::new();
+    for f in schemaic_core::mssql_builtins::MSSQL_FUNCTIONS {
+        let call = if !f.signature.contains('(') {
+            format!("SELECT {}", f.name)
+        } else if ROWSET.contains(&f.name) {
+            format!("SELECT * FROM {}()", f.name)
+        } else {
+            format!("SELECT {}()", f.name)
+        };
+        if let Err(e) = s.try_exec(&call).await
+            && e.to_string().contains("(Msg 195")
+        {
+            unknown.push(format!("{}: {e}", f.name));
+        }
+    }
+    assert!(unknown.is_empty(), "{unknown:#?}");
+}
