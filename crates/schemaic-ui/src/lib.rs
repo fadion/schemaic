@@ -1334,6 +1334,11 @@ pub struct AccountTarget {
     /// PostgreSQL password is hashed (or not hashed) under. `None` keeps the
     /// SCRAM default; see `users::PasswordPolicy`.
     pub password_policy: Option<schemaic_core::users::PasswordPolicy>,
+    /// **SQL Server**: the database the browser listed is contained, so a new
+    /// user there may hold a password of its own — the form offers the
+    /// password row for one only then (`users::takes_password`). Read with the
+    /// list, like `password_policy`; `false` everywhere else.
+    pub contained: bool,
 }
 
 /// The grant editor's target; doubles as its open flag.

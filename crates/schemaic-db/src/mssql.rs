@@ -2820,6 +2820,18 @@ pub(crate) async fn fetch_principals(
     .await?
     .first()
     .is_some_and(|r| flag(r, 0));
+    // Whether a new user here may hold a password of its own — only a
+    // contained database takes one (Msg 33233 elsewhere).
+    let contained = match database {
+        Some(_) => query_rows(
+            &mut client,
+            "SELECT CAST(containment AS int) FROM sys.databases WHERE database_id = DB_ID()",
+        )
+        .await?
+        .first()
+        .is_some_and(|r| flag(r, 0)),
+        None => false,
+    };
     let mut notes: Vec<String> = Vec::new();
     if database.is_none() {
         notes.push(
@@ -2838,6 +2850,7 @@ pub(crate) async fn fetch_principals(
         list: from_mssql_rows(&logins, &users),
         note: (!notes.is_empty()).then(|| notes.join(" ")),
         password_policy: None,
+        contained,
     })
 }
 

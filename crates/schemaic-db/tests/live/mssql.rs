@@ -3214,6 +3214,7 @@ async fn a_login_and_its_user_are_created_granted_reset_and_dropped() {
             attributes: Vec::new(),
             role_ambiguous: false,
             login: None,
+            database_password: false,
         },
         member: login.clone(),
         with_admin_option: false,
@@ -3286,4 +3287,133 @@ async fn a_login_and_its_user_are_created_granted_reset_and_dropped() {
     run(account(&name, MS, Change::DropAccount(Box::new(login))).emit()).await;
     let list = s.db.fetch_principals(Some(&s.name)).await.unwrap().list;
     assert!(!list.iter().any(|p| p.name == name), "{list:?}");
+}
+
+/// **A contained user, end to end.** In a database made contained, the
+/// listing says so; a user created with a password of its own is listed with
+/// no login and as holding its password, signs in to that database with it,
+/// and after a reset on its row signs in with the new one only.
+///
+/// Needs the server's `contained database authentication` on — a server-wide
+/// setting this test reads rather than changes, and reports when it is off.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_contained_user_is_created_signs_in_and_is_reset() {
+    use schemaic_core::ddl::{Change, account};
+    use schemaic_core::users::{AccountDraft, PasswordReset, PrincipalKind};
+    if !enabled() {
+        return;
+    }
+    let allowed = base_db()
+        .fetch_query(
+            None,
+            "SELECT CAST(value_in_use AS int) FROM sys.configurations \
+             WHERE name = 'contained database authentication'",
+            1,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("the setting")
+        .cell(0, 0)
+        .is_some_and(|c| c.display() == "1");
+    if !allowed {
+        endpoint::note_leg_no_op(
+            "mssql",
+            "has contained database authentication off, so the contained user round trip",
+        );
+        return;
+    }
+    let s = Scratch::create("contained").await;
+    base_db()
+        .fetch_query(
+            None,
+            &format!("ALTER DATABASE [{}] SET CONTAINMENT = PARTIAL", s.name),
+            1,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("a contained database");
+    let name = format!("{PREFIX}{}_mssql_cuser", std::process::id());
+    let run = |stmts: Vec<String>| {
+        let db = s.db.clone();
+        let database = s.name.clone();
+        async move {
+            db.run_ddl(&database, &stmts, CancellationToken::new())
+                .await
+                .unwrap_or_else(|e| panic!("{e}\n{stmts:#?}"));
+        }
+    };
+    let signs_in = |password: &'static str| {
+        let db = Db::from_parts(
+            Engine::MsSql,
+            var("HOST", "127.0.0.1"),
+            var("PORT", "1433").parse().unwrap(),
+            name.clone(),
+            password.to_string(),
+            s.name.clone(),
+        );
+        let database = s.name.clone();
+        async move {
+            db.fetch_query(
+                Some(&database),
+                "SELECT USER_NAME()",
+                1,
+                CancellationToken::new(),
+            )
+            .await
+            .ok()
+            .and_then(|rs| rs.cell(0, 0).map(|c| c.display().to_string()))
+        }
+    };
+
+    let listed =
+        s.db.fetch_principals(Some(&s.name))
+            .await
+            .expect("the list");
+    assert!(listed.contained, "the listing sees the containment");
+    run(account(
+        &name,
+        MS,
+        Change::CreateAccount(Box::new(AccountDraft {
+            name: name.clone(),
+            kind: PrincipalKind::User,
+            password: "Schemaic_Pw1!".into(),
+            ..Default::default()
+        })),
+    )
+    .emit())
+    .await;
+    let user =
+        s.db.fetch_principals(Some(&s.name))
+            .await
+            .unwrap()
+            .list
+            .into_iter()
+            .find(|p| p.name == name)
+            .expect("the user");
+    assert_eq!(
+        (user.kind, user.login.as_deref(), user.database_password),
+        (PrincipalKind::User, None, true)
+    );
+    assert_eq!(
+        signs_in("Schemaic_Pw1!").await.as_deref(),
+        Some(name.as_str())
+    );
+
+    run(account(
+        &name,
+        MS,
+        Change::SetAccountPassword(Box::new(PasswordReset {
+            account: user,
+            password: "Schemaic_Pw2!".into(),
+            scram_salt: None,
+            password_policy: None,
+        })),
+    )
+    .emit())
+    .await;
+    assert!(signs_in("Schemaic_Pw1!").await.is_none(), "the old one");
+    assert_eq!(
+        signs_in("Schemaic_Pw2!").await.as_deref(),
+        Some(name.as_str())
+    );
 }

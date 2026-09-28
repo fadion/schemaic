@@ -855,6 +855,16 @@ fn loaded_policy(overlay: OverlayUi) -> Option<schemaic_core::users::PasswordPol
     })
 }
 
+/// Whether the listed database takes a user with a password of its own
+/// (`users::Principals::contained`), read with the list for the same reason.
+/// `false` until the list has loaded, which keeps the row away.
+fn loaded_contained(overlay: OverlayUi) -> bool {
+    overlay.users_state.with_untracked(|s| match s {
+        UsersState::Loaded(p) => p.contained,
+        _ => false,
+    })
+}
+
 /// **`+ New account`, at the foot of the list column** — the shape Manage
 /// Connections' `New connection` row has, and in the same place: under the list
 /// it adds to rather than beside the box that searches it, so the column reads
@@ -880,7 +890,14 @@ fn new_account_row(
         // The read-only refusal is inside `open_for_new`, so this launch is
         // guarded in the same step that launches it — the dimming says the
         // action is unavailable, this is what makes it so.
-        crate::account_editor::open_for_new(conn, ddl, &anchor, &database, loaded_policy(overlay));
+        crate::account_editor::open_for_new(
+            conn,
+            ddl,
+            &anchor,
+            &database,
+            loaded_policy(overlay),
+            loaded_contained(overlay),
+        );
     };
     let open_click = open.clone();
     in_ring_button(

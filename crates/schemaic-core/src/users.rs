@@ -162,6 +162,13 @@ pub struct Principal {
     /// and on every other engine.
     #[serde(default)]
     pub login: Option<String>,
+    /// **SQL Server**: a contained database user that signs in with a password
+    /// of its own — `authentication_type_desc = DATABASE` — rather than a
+    /// login's, which is what makes its password something to reset with
+    /// `ALTER USER`. `false` for a user `WITHOUT LOGIN` (`NONE`), which has no
+    /// password to reset (Msg 33234), and on every other engine.
+    #[serde(default)]
+    pub database_password: bool,
 }
 
 impl Principal {
@@ -416,6 +423,7 @@ pub fn from_mysql_rows(rows: &[MyUserRow]) -> Vec<Principal> {
                 // to carry MySQL's fingerprint is still not ambiguous.
                 role_ambiguous: r.is_role.is_none() && my_role_fingerprint(r),
                 login: None,
+                database_password: false,
             }
         })
         .collect();
@@ -599,6 +607,7 @@ pub fn from_pg_rows(rows: &[PgRoleRow]) -> Vec<Principal> {
                 // over to be uncertain about.
                 role_ambiguous: false,
                 login: None,
+                database_password: false,
             }
         })
         .collect();
@@ -894,6 +903,11 @@ pub struct Principals {
     /// and `None` where it could not be read. The account form stamps it on
     /// the plan it builds.
     pub password_policy: Option<PasswordPolicy>,
+    /// **SQL Server**: the listed database is contained
+    /// (`sys.databases.containment`), so a new user there may hold a password
+    /// of its own ([`takes_password`]). `false` on every other engine, and
+    /// with no database picked.
+    pub contained: bool,
 }
 
 impl Principals {
@@ -901,8 +915,7 @@ impl Principals {
     pub fn complete(list: Vec<Principal>) -> Self {
         Self {
             list,
-            note: None,
-            password_policy: None,
+            ..Default::default()
         }
     }
 }
@@ -1639,6 +1652,7 @@ impl GrantDraft {
                 // A role the user typed, not a row read back from a catalogue.
                 role_ambiguous: false,
                 login: None,
+                database_password: false,
             },
             member: account.clone(),
             with_admin_option: self.with_admin_option,
@@ -1768,6 +1782,14 @@ impl AccountDraft {
             // The draft says which of the two it is; nothing was inferred.
             role_ambiguous: false,
             login: Some(self.login.trim().to_string()).filter(|l| !l.is_empty()),
+            // A SQL Server user with no login and a password is the contained
+            // user `tsql_account_draft_sql` creates `WITH PASSWORD`.
+            database_password: match (dialect, self.kind) {
+                (SqlDialect::MsSql, PrincipalKind::User) => {
+                    self.login.trim().is_empty() && !self.password.is_empty()
+                }
+                _ => false,
+            },
         }
     }
 }
@@ -1804,6 +1826,17 @@ pub fn account_form_blocker(
     // passwordless one to make here.
     if draft.kind == PrincipalKind::Login && draft.password.is_empty() {
         return Some("A login needs a password.");
+    }
+    // A SQL Server user `FOR LOGIN` signs in with the login's password; a
+    // password of its own is a contained user's, which has no login. Held
+    // back rather than one of the two silently dropped. (`login` is SQL
+    // Server's alone, so no other engine's draft reaches this.)
+    if !resetting
+        && draft.kind == PrincipalKind::User
+        && !draft.login.trim().is_empty()
+        && !draft.password.is_empty()
+    {
+        return Some("A user for a login signs in with the login's password — leave this blank.");
     }
     if matches!(draft.kind, PrincipalKind::User | PrincipalKind::Login) && draft.password != confirm
     {
@@ -2077,10 +2110,12 @@ pub fn supports_password_reset(dialect: SqlDialect, p: &Principal) -> bool {
         return false;
     }
     match dialect {
-        // The password is the login's: a login row, or a user row through the
-        // login it maps to. A user with no login and a role have none.
+        // The password is the login's — a login row, or a user row through
+        // the login it maps to — or a contained user's own. A user `WITHOUT
+        // LOGIN` and a role have none.
         SqlDialect::MsSql => {
-            p.kind == PrincipalKind::Login || (p.kind == PrincipalKind::User && p.login.is_some())
+            p.kind == PrincipalKind::Login
+                || (p.kind == PrincipalKind::User && (p.login.is_some() || p.database_password))
         }
         SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => {
             p.kind == PrincipalKind::User && !p.role_ambiguous
@@ -2115,7 +2150,8 @@ pub fn set_password_sql(r: &PasswordReset, dialect: SqlDialect) -> Option<String
     {
         return None;
     }
-    // On SQL Server a user row's password is its login's.
+    // On SQL Server a user row's password is its login's, or — a contained
+    // user, with no login — its own, which `ALTER USER` sets.
     let who = match (dialect, r.account.kind, r.account.login.as_deref()) {
         (SqlDialect::MsSql, PrincipalKind::User, Some(login)) => {
             crate::export::ident_sql(login, dialect)
@@ -2125,6 +2161,9 @@ pub fn set_password_sql(r: &PasswordReset, dialect: SqlDialect) -> Option<String
     let (verb, clause) = match dialect {
         SqlDialect::MySql => ("ALTER USER", "IDENTIFIED BY"),
         SqlDialect::Postgres | SqlDialect::Sqlite => ("ALTER ROLE", "PASSWORD"),
+        SqlDialect::MsSql if r.account.kind == PrincipalKind::User && r.account.login.is_none() => {
+            ("ALTER USER", "WITH PASSWORD =")
+        }
         SqlDialect::MsSql => ("ALTER LOGIN", "WITH PASSWORD ="),
     };
     Some(format!(
@@ -2151,9 +2190,11 @@ pub fn drop_account_sql(p: &Principal, dialect: SqlDialect) -> String {
 
 /// SQL Server's `CREATE` for each kind: a **login** `WITH PASSWORD`, which is
 /// what makes it a SQL login; a database **user** `FOR LOGIN` the login it
-/// maps to, or `WITHOUT LOGIN` when there is none; a database **role**. The
-/// password travels as typed, as MySQL's does, since the hashed form (`0x…
-/// HASHED`) skips the server's password policy.
+/// maps to, `WITH PASSWORD` of its own when it has none but a password — a
+/// contained user, which only a contained database takes ([`takes_password`])
+/// — or `WITHOUT LOGIN` when it has neither; a database **role**. The password
+/// travels as typed, as MySQL's does, since the hashed form (`0x… HASHED`)
+/// skips the server's password policy.
 fn tsql_account_draft_sql(d: &AccountDraft) -> String {
     let dialect = SqlDialect::MsSql;
     let q = |n: &str| crate::export::ident_sql(n.trim(), dialect);
@@ -2161,6 +2202,10 @@ fn tsql_account_draft_sql(d: &AccountDraft) -> String {
     match d.kind {
         PrincipalKind::Login => format!(
             "CREATE LOGIN {name} WITH PASSWORD = {}",
+            crate::schema::ddl_string(&d.password, dialect)
+        ),
+        PrincipalKind::User if d.login.trim().is_empty() && !d.password.is_empty() => format!(
+            "CREATE USER {name} WITH PASSWORD = {}",
             crate::schema::ddl_string(&d.password, dialect)
         ),
         PrincipalKind::User if d.login.trim().is_empty() => {
@@ -2173,10 +2218,15 @@ fn tsql_account_draft_sql(d: &AccountDraft) -> String {
 
 /// Does an account of `kind` carry a password on `dialect` — the one the
 /// form's password row appears for? A user on MySQL and PostgreSQL; on SQL
-/// Server the **login**, whose password its users sign in with.
-pub fn takes_password(dialect: SqlDialect, kind: PrincipalKind) -> bool {
+/// Server the **login**, whose password its users sign in with — and a user
+/// where the database is `contained` ([`Principals::contained`]), which may
+/// hold a password of its own. Anywhere else `CREATE USER … WITH PASSWORD` is
+/// Msg 33233, so the row is not offered there rather than failing at Apply.
+pub fn takes_password(dialect: SqlDialect, kind: PrincipalKind, contained: bool) -> bool {
     match dialect {
-        SqlDialect::MsSql => kind == PrincipalKind::Login,
+        SqlDialect::MsSql => {
+            kind == PrincipalKind::Login || (kind == PrincipalKind::User && contained)
+        }
         SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => {
             kind == PrincipalKind::User
         }
@@ -2338,6 +2388,7 @@ pub fn from_mssql_rows(logins: &[MsLoginRow], users: &[MsUserRow]) -> Vec<Princi
         attributes: Vec::new(),
         role_ambiguous: false,
         login: None,
+        database_password: false,
     };
     let mut out: Vec<Principal> = Vec::new();
     for l in logins {
@@ -2373,6 +2424,10 @@ pub fn from_mssql_rows(logins: &[MsLoginRow], users: &[MsUserRow]) -> Vec<Princi
         };
         p.system = is_mssql_system_user(u);
         p.login = u.login.clone().filter(|l| !l.is_empty());
+        p.database_password = p.kind == PrincipalKind::User
+            && u.authentication
+                .as_deref()
+                .is_some_and(|a| a.trim().eq_ignore_ascii_case("DATABASE"));
         if let Some(l) = &p.login {
             p.attributes.push(("Login".into(), l.clone()));
         }
@@ -4401,6 +4456,7 @@ mod mssql_tests {
             attributes: Vec::new(),
             role_ambiguous: false,
             login: None,
+            database_password: false,
         }
     }
 
@@ -4491,15 +4547,25 @@ mod mssql_tests {
         );
     }
 
-    /// Which kind carries a password — SQL Server's login, every other
-    /// engine's user — and the user a new login may bring with it, `FOR` it
-    /// under its own name, in the same plan.
+    /// Which kind carries a password — SQL Server's login (and, in a
+    /// contained database, its user: see
+    /// `a_contained_user_is_created_and_reset_with_its_own_password`), every
+    /// other engine's user — and the user a new login may bring with it, `FOR`
+    /// it under its own name, in the same plan.
     #[test]
     fn a_new_login_may_bring_its_user_and_only_it_takes_the_password() {
-        assert!(takes_password(MS, PrincipalKind::Login));
-        assert!(!takes_password(MS, PrincipalKind::User));
-        assert!(takes_password(SqlDialect::MySql, PrincipalKind::User));
-        assert!(!takes_password(SqlDialect::Postgres, PrincipalKind::Role));
+        assert!(takes_password(MS, PrincipalKind::Login, false));
+        assert!(!takes_password(MS, PrincipalKind::User, false));
+        assert!(takes_password(
+            SqlDialect::MySql,
+            PrincipalKind::User,
+            false
+        ));
+        assert!(!takes_password(
+            SqlDialect::Postgres,
+            PrincipalKind::Role,
+            false
+        ));
         let mut d = AccountDraft {
             name: "app".into(),
             kind: PrincipalKind::Login,
@@ -4561,6 +4627,70 @@ mod mssql_tests {
             ..login("readers")
         };
         assert!(!supports_password_reset(MS, &role));
+    }
+
+    /// **A contained database user holds its own password** — authentication
+    /// `DATABASE` in the catalogue, no login behind it — so it is created
+    /// `WITH PASSWORD`, only where the database is contained (Msg 33233
+    /// elsewhere), and reset with `ALTER USER`. A user `WITHOUT LOGIN`
+    /// (`NONE`) has none to reset: Msg 33234, measured on 2022.
+    #[test]
+    fn a_contained_user_is_created_and_reset_with_its_own_password() {
+        let row = |name: &str, auth: &str| MsUserRow {
+            name: name.into(),
+            kind: "S".into(),
+            login: None,
+            authentication: Some(auth.into()),
+            default_schema: Some("dbo".into()),
+            fixed_role: false,
+            member_of: None,
+        };
+        let list = from_mssql_rows(&[], &[row("svc", "DATABASE"), row("nl", "NONE")]);
+        let find = |n: &str| list.iter().find(|p| p.name == n).expect(n).clone();
+        let (svc, nl) = (find("svc"), find("nl"));
+        assert!(svc.database_password && !nl.database_password);
+        assert!(supports_password_reset(MS, &svc));
+        assert!(!supports_password_reset(MS, &nl));
+        let reset = PasswordReset {
+            account: svc,
+            password: "n3w".into(),
+            scram_salt: None,
+            password_policy: None,
+        };
+        assert_eq!(
+            set_password_sql(&reset, MS).as_deref(),
+            Some("ALTER USER [svc] WITH PASSWORD = N'n3w'")
+        );
+
+        // Created: the password row is there only in a contained database.
+        assert!(takes_password(MS, PrincipalKind::User, true));
+        assert!(!takes_password(MS, PrincipalKind::User, false));
+        assert!(takes_password(MS, PrincipalKind::Login, false));
+        for other in [SqlDialect::MySql, SqlDialect::Postgres] {
+            assert!(
+                takes_password(other, PrincipalKind::User, false),
+                "{other:?}"
+            );
+        }
+        let mut d = AccountDraft {
+            name: "svc".into(),
+            kind: PrincipalKind::User,
+            password: "it's".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            account_draft_sql(&d, MS).as_deref(),
+            Some("CREATE USER [svc] WITH PASSWORD = N'it''s'")
+        );
+        assert!(account_form_blocker(&d, "it's", false).is_none());
+        assert!(
+            account_form_blocker(&d, "its", false).is_some(),
+            "confirmed"
+        );
+        // A user for a login signs in with the login's password, so the two
+        // together are held back rather than one silently dropped.
+        d.login = "app".into();
+        assert!(account_form_blocker(&d, "it's", false).is_some());
     }
 
     /// Grants name a securable by its class, and go to a database user or

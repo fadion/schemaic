@@ -5489,9 +5489,14 @@ existing prose was left alone.
     password and signs in; a database **user** (`sys.database_principals`, one database's) is what
     database permissions and role memberships are granted to, and is mapped to a login by SID. So
     `PrincipalKind` has a third arm, `Login` (no other engine has one), and `Principal::login` — a
-    `#[serde(default)]` `Option`, `None` on every other engine and on a user `WITHOUT LOGIN` —
-    carries a user's backing login as `SUSER_SNAME(sid)` reads it: that field is the link, and
-    what the list shows and a reset on the user row alters. `display` writes `name ← login` for a user mapped to
+    `#[serde(default)]` `Option`, `None` on every other engine and on a user with no login
+    (`WITHOUT LOGIN`, or contained) — carries a user's backing login as `SUSER_SNAME(sid)` reads
+    it: that field is the link, and what the list shows and a reset on the user row alters.
+    **A user with no login is one of two things, and only the catalogue can say which**:
+    `Principal::database_password` (`#[serde(default)]`, `false` everywhere else) is set by
+    `from_mssql_rows` for a user whose `authentication_type_desc` is `DATABASE` — a contained
+    database user, signing in with a password of its own — where a user `WITHOUT LOGIN` reads
+    `NONE` and refuses a password outright (Msg 33234, measured on SQL Server 2022). `display` writes `name ← login` for a user mapped to
     a login of another name, so the row shows the link and, `matches` being over `display`, a search
     for the login finds the user too. `from_mssql_rows` folds the logins first, then the browser
     database's users and roles, each user carrying its login as an attribute as well; the server's
@@ -5505,10 +5510,17 @@ existing prose was left alone.
     with `AccountDraft::also_user` set: a new login brings a same-named user in the browser's
     database **in the same plan** (`companion_user_draft`, `FOR` that login, no password of its
     own), since that pair is what giving someone access to a database takes there.
-    `AccountDraft::login` is a new user's `FOR LOGIN`, empty for `WITHOUT LOGIN`.
-    `takes_password(dialect, kind)` answers where the password row belongs — the user on MySQL and
-    PostgreSQL, the **login** on SQL Server — and `account_form_blocker` refuses a login with no
-    password, a login being a SQL login by its password. **Where an account can be granted is asked
+    `AccountDraft::login` is a new user's `FOR LOGIN`, empty for `WITHOUT LOGIN` or a contained
+    user; `AccountDraft::principal` sets `database_password` for a SQL Server user drafted with no
+    login and a non-empty password, the one `tsql_account_draft_sql` creates `WITH PASSWORD`.
+    `takes_password(dialect, kind, contained)` answers where the password row belongs — the user on
+    MySQL and PostgreSQL, the **login** on SQL Server, and a SQL Server user too where the database
+    is `contained` — and `account_form_blocker` refuses a login with no password, a login being a
+    SQL login by its password. **`contained` is `Principals::contained`, read with the list**,
+    because SQL Server takes a user's own password only in a contained database (`CONTAINMENT =
+    PARTIAL`; Msg 33233 anywhere else, measured on SQL Server 2022), and making a database
+    contained needs the server's `contained database authentication` on — so the row is offered
+    only where Apply can succeed, rather than offered everywhere and refused there. **Where an account can be granted is asked
     of the account** (`levels_for_account`, below): a login is a principal of the server and of no
     database, a user or role of its database and of no server, so `GRANT SELECT … TO` a login and
     `GRANT VIEW SERVER STATE TO` a user are each Msg 15151 (measured on SQL Server 2022).
@@ -5637,10 +5649,8 @@ existing prose was left alone.
     actually gets** — `[Global]` for a login, the other three for a user or role, `levels_for`
     unchanged on every other engine — and the level picker and `ddl::account_change_supported` both
     read it rather than `levels_for`, so the form cannot offer a level the plan's gate then refuses
-    (`a_login_is_granted_at_the_server_and_a_user_below_it`). What is still unfinished on SQL
-    Server's accounts is a contained database user's own password (`CREATE USER … WITH PASSWORD`,
-    `ALTER USER … WITH PASSWORD`), and Azure SQL Database — whose `master` takes no server-level
-    `GRANT` of this kind — is untested. SQLite gets an empty list rather than a
+    (`a_login_is_granted_at_the_server_and_a_user_below_it`). Azure SQL Database — whose `master`
+    takes no server-level `GRANT` of this kind — is untested. SQLite gets an empty list rather than a
     panic, `supports_user_admin` being the gate that should have stopped the caller.
     **`default_grant_level` is the level a grant form opens on, and it is deliberately not
     `levels_for(dialect).first()`** — the widest of the *account's* levels (`levels_for_account`)
@@ -5701,8 +5711,9 @@ existing prose was left alone.
     listed roles, or for a SQL Server login — whose roles the browser does not list — the eight fixed
     server roles (`MSSQL_FIXED_SERVER_ROLES`), 2022's `##MS_…##` roles left out since an older server
     refuses them by name; a user-defined server role can still be typed. `account_draft_sql` hands SQL Server to `tsql_account_draft_sql`:
-    `CREATE LOGIN [n] WITH PASSWORD = N'…'`, `CREATE USER [n] FOR LOGIN [l]` or `WITHOUT LOGIN`, and
-    `CREATE ROLE [n]`; `drop_account_sql` writes `DROP LOGIN` for a login. **The login's password
+    `CREATE LOGIN [n] WITH PASSWORD = N'…'`, `CREATE USER [n] FOR LOGIN [l]`, a contained user's
+    `CREATE USER [n] WITH PASSWORD = N'…'` where there is no login but a password, `WITHOUT LOGIN`
+    where there is neither, and `CREATE ROLE [n]`; `drop_account_sql` writes `DROP LOGIN` for a login. **The login's password
     travels as typed, as MySQL's does, and not in the hashed `WITH PASSWORD = 0x… HASHED` form**,
     because the hashed form skips the server's password policy — the same trade `PasswordPolicy`
     below makes on PostgreSQL, where a verifier the app computes is a decision the server did not
@@ -5716,7 +5727,9 @@ existing prose was left alone.
     own `GRANT` statements already read `ROLE` throughout — and `ALTER LOGIN … WITH PASSWORD =` on
     SQL Server, where a reset on a **user** row alters the login it maps to (`Principal::login`),
     the password being the login's; `a_login_and_its_user_are_created_granted_reset_and_dropped`
-    signs in with the new one and is refused with the old. **An empty password returns `None` rather
+    signs in with the new one and is refused with the old. A user with no login is a contained one
+    by the time it gets here — the gate below admits no other — and its reset is `ALTER USER [n]
+    WITH PASSWORD = N'…'`, pinned by `a_contained_user_is_created_and_reset_with_its_own_password`. **An empty password returns `None` rather
     than emitting**, which is the one place this parts company with the clause above:
     `ALTER USER … IDENTIFIED BY ''` is a legal statement that sets a *blank* password, where
     `CREATE`'s missing clause leaves one unset — a lock left open against a lock not yet fitted — so
@@ -5728,7 +5741,8 @@ existing prose was left alone.
     answered — and then asking the account, per engine since SQL Server's arrived: on MySQL and
     PostgreSQL `p.kind == PrincipalKind::User && !p.role_ambiguous`, a role taking no password on
     either, the same rule `account_draft_sql` applies to `CREATE`; on SQL Server a `Login`, or a
-    `User` with a login to alter, where a role and a user `WITHOUT LOGIN` have none. **It takes the whole `Principal` and not its
+    `User` with a login to alter or a password of its own (`database_password`), where a role and a
+    user `WITHOUT LOGIN` have none. **It takes the whole `Principal` and not its
     `PrincipalKind`, because the kind cannot say "I don't know."** It asked only the kind for a
     release, which is how the `role_ambiguous` finding above got in, and its own rustdoc asserted the
     premise that made that look sound — that the engine *rejects* a password on a role outright,
@@ -5794,7 +5808,10 @@ existing prose was left alone.
     required."), a create a name ("A name is required."), and a user — never a role, which has no
     password row to confirm — a second copy equal to the first ("Type the password again to confirm
     it." while it is empty, "The two passwords differ." once it is not). A create may still leave
-    the password blank, the two empty fields matching. Why it is typed twice is under the form.
+    the password blank, the two empty fields matching. A SQL Server user drafted with **both** a
+    login and a password is held back ("A user for a login signs in with the login's password —
+    leave this blank."), since `tsql_account_draft_sql` would otherwise drop one of the two
+    silently; `login` being SQL Server's alone, no other engine's draft reaches it. Why it is typed twice is under the form.
     `drop_account_sql` is the last, and like `DropDatabase` never
     `IF EXISTS`: the account came off the browser's list, so one that isn't there means the list is
     stale and a drop that dropped nothing is about to be reported as a success.
@@ -11134,7 +11151,9 @@ existing prose was left alone.
   groups, the `##…##` certificate logins left out, each login's server roles through
   `STRING_AGG`) and, with a database, `USER_LISTING` (that database's users and roles, each user's
   login as `SUSER_SNAME(sid)`, its role memberships); with no database it lists the logins alone
-  and its note says to pick one. **It also asks `HAS_PERMS_BY_NAME(…, 'VIEW ANY DEFINITION')`**,
+  and its note says to pick one. With a database it also reads that database's
+  `sys.databases.containment` (`WHERE database_id = DB_ID()`) into `Principals::contained`, which
+  is what puts a password row on the New account form's User (under `core::users`). **It also asks `HAS_PERMS_BY_NAME(…, 'VIEW ANY DEFINITION')`**,
   because a login without that permission is shown only the principals it may see — itself and
   little else — with no error to say so, which is the MySQL ladder's "one account out of eight"
   in another catalogue; the note says the list may be short. `mssql::fetch_grants` reads a login's
@@ -11150,7 +11169,17 @@ existing prose was left alone.
   needs `master`; a reset on the **user** row
   changes the login's password, the old one then refused; and the drops leave neither behind.
   `ScratchLogin` drops the login on the way out, a login being the server's and outliving the
-  scratch database. Server Activity is the one
+  scratch database. `a_contained_user_is_created_signs_in_and_is_reset` is the contained half: it
+  makes the scratch database `CONTAINMENT = PARTIAL`, sees the listing report it contained, creates
+  a user with its own password through the same plan path, finds it listed with no login and
+  `database_password` set, signs in with it, resets it on its row, and is then refused with the
+  old password and let in with the new. **It only reads the server-wide `contained database
+  authentication` setting**, never sets it — it is the server's, not the scratch database's — and
+  reports the leg a no-op through
+  `endpoint::note_leg_no_op` when it is off. CI's live job turns it on before the tests run, in its
+  *Enable contained database authentication* step (`sp_configure … 1; RECONFIGURE` through `docker
+  exec` on the throwaway service container), so there the round trip runs rather than reporting
+  itself skipped. Server Activity is the one
   split that *is* about the engine: `KILL` ends a session, but no T-SQL statement cancels another
   session's request and leaves the session standing — a cancel is an attention sent by the owner's
   own client — so `activity::supports_kill_kind` says no to *Cancel query* there and
@@ -12519,8 +12548,9 @@ existing prose was left alone.
   `a_grant_at_every_level_reads_back_naming_that_object` and
   `a_dropped_account_is_gone_from_the_list` — every one of them fanned to MariaDB 10.11, MySQL 8.4
   and PostgreSQL 16 by `live_suite!`. SQL Server is not a leg of that macro, so its accounts have
-  their own end-to-end test in `tests/live/mssql.rs`,
-  `a_login_and_its_user_are_created_granted_reset_and_dropped` (under `db::mssql`), and these call
+  their own end-to-end tests in `tests/live/mssql.rs`,
+  `a_login_and_its_user_are_created_granted_reset_and_dropped` and
+  `a_contained_user_is_created_signs_in_and_is_reset` (under `db::mssql`), and these call
   `fetch_principals(None)`, a database being an argument only SQL Server reads.
   **The list is the count**, and deliberately so: the sentence
   here used to say "the seven write tests … twenty-one in all" over an enumeration of seven that
@@ -17418,7 +17448,13 @@ existing prose was left alone.
     hands to `ddl_preview::preview_account`; never beside a reset). A User gets a *For login* field instead, empty meaning
     `WITHOUT LOGIN`. The password row follows `users::takes_password` rather than the Kind being
     `User`, since on SQL Server it is the login that holds the password and a user has none of its
-    own. Both rows are asked of whether the engine's kinds include `Login` — accounts split in two
+    own — **except in a contained database**, where the row appears for a User too, and a For login
+    left empty with a password filled makes it a contained user (`CREATE USER … WITH PASSWORD`).
+    Whether the database is contained rides on `AccountTarget::contained`, which
+    `users_view::loaded_contained` reads out of the loaded list beside `loaded_policy` (below) —
+    `false` until it has loaded, so the row stays off rather than appearing for a database the
+    server would refuse it in; a reset opens with `false`, since it is of an account that already
+    holds its password and whether a new one could is not its question. Both rows are asked of whether the engine's kinds include `Login` — accounts split in two
     — rather than of the engine. **The form holds a password — in `account_draft` and, typed a second time, in
     `DdlUi::account_confirm` — and nothing else in this crate does.** Both are blanked on every
     open — a form that reopened holding the last one would put a credential on screen nobody typed
@@ -17462,8 +17498,9 @@ existing prose was left alone.
     `users::account_form_blocker`/`account_form_ready`, so an empty Confirm reads "Type the password
     again to confirm it." and a mismatch "The two passwords differ." — checked by hand in the
     sandboxed app, where a match enabled Preview. A role has no password row and is not asked, nor
-    is a SQL Server user; a SQL Server login must have a password as well as its confirmation
-    ("A login needs a password.").
+    is a SQL Server user outside a contained database; a SQL Server login must have a password as
+    well as its confirmation ("A login needs a password."), and a user for a login must not have
+    one ("A user for a login signs in with the login's password — leave this blank.").
     **The field itself is
     `connection_form::masked_edit_field`**, the same one the three saved-connection secrets wear:
     this was the app's only *unmasked* secret field, so its real characters were on screen and a

@@ -188,13 +188,16 @@ fn door_read_only(conn: ConnUi, from: &UsersTarget) -> bool {
 /// lines, and `anchor_gate` is what holds both to it.
 ///
 /// `password_policy` is the server's, as the browser read it with the account
-/// list — stamped on the target so the plan honours it (`users::PasswordPolicy`).
+/// list — stamped on the target so the plan honours it (`users::PasswordPolicy`)
+/// — and `contained` is whether that list's database takes a user with a
+/// password of its own (`users::Principals::contained`).
 pub(crate) fn open_for_new(
     conn: ConnUi,
     d: DdlUi,
     from: &UsersTarget,
     database: &str,
     password_policy: Option<schemaic_core::users::PasswordPolicy>,
+    contained: bool,
 ) {
     // **No `edit_ctx` here at all.** These three read nothing else from it, and
     // what they did read was the switcher's flag — see `door_read_only`. A live
@@ -224,6 +227,7 @@ pub(crate) fn open_for_new(
         read_only: door_read_only,
         resetting: None,
         password_policy,
+        contained,
     }));
 }
 
@@ -291,6 +295,9 @@ pub(crate) fn open_for_reset(
         read_only: door_read_only,
         resetting: Some(account.clone()),
         password_policy,
+        // A reset is of an account that already holds its password; whether
+        // a new one could is not this form's question.
+        contained: false,
     }));
 }
 
@@ -746,8 +753,9 @@ fn account_form(
     }
 
     // The password is where the engine keeps it: a user's on MySQL and
-    // PostgreSQL, the login's on SQL Server (`users::takes_password`).
-    if schemaic_core::users::takes_password(target.dialect, kind) {
+    // PostgreSQL, the login's on SQL Server — and a contained database's
+    // user's own (`users::takes_password`).
+    if schemaic_core::users::takes_password(target.dialect, kind, target.contained) {
         rows.push(password_row(d, ring, target.dialect));
     }
 
@@ -1513,6 +1521,7 @@ mod form_shape_tests {
             attributes: Vec::new(),
             role_ambiguous: false,
             login: None,
+            database_password: false,
         }
     }
 
@@ -1797,6 +1806,7 @@ mod account_change_tests {
             attributes: Vec::new(),
             role_ambiguous: false,
             login: None,
+            database_password: false,
         }
     }
 
@@ -1933,6 +1943,7 @@ mod account_change_tests {
             read_only: false,
             resetting: None,
             password_policy: None,
+            contained: false,
         };
         let emit = |target: &AccountTarget| {
             ddl::account("app", SqlDialect::Postgres, preview_change(&draft, target))
@@ -1951,6 +1962,7 @@ mod account_change_tests {
             attributes: Vec::new(),
             role_ambiguous: false,
             login: None,
+            database_password: false,
         });
         target.password_policy = Some(schemaic_core::users::PasswordPolicy {
             encryption: schemaic_core::users::PasswordEncryption::Md5,

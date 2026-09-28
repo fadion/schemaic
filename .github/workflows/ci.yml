@@ -211,6 +211,15 @@ jobs:
       # neither of which pulls in floem.
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # **Contained database authentication on**, so SQL Server's contained-user
+      # round trip runs rather than reporting itself skipped. It is a server-wide
+      # setting, which is why the test only reads it and this step — on a
+      # throwaway container — is what sets it.
+      - name: Enable contained database authentication
+        run: >-
+          docker exec ${{ job.services.mssql.id }}
+          /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P Schemaic_2026 -C
+          -Q "EXEC sp_configure 'contained database authentication', 1; RECONFIGURE"
       # **The root account, not `schemaic`.** A `MYSQL_USER` created by the image
       # is granted rights on `MYSQL_DATABASE` alone, so it cannot create the
       # scratch database each test works in. PostgreSQL's `POSTGRES_USER` is the
