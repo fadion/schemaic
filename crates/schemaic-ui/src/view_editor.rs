@@ -289,7 +289,6 @@ fn form(ui: DdlUi, target: &ViewTarget, ring: FocusRing) -> AnyView {
     // MySQL's, and every option below belongs to exactly one of them.
     let my = target.dialect == SqlDialect::MySql;
     let pg = target.dialect == SqlDialect::Postgres;
-    let sqlite = target.dialect == SqlDialect::Sqlite;
 
     // No "In {database}" row: the modal title names the place now.
     let name = form_setting(
@@ -337,9 +336,9 @@ fn form(ui: DdlUi, target: &ViewTarget, ring: FocusRing) -> AnyView {
     // ── options ──────────────────────────────────────────────────────────────
     // Shown because they're *preserved*: a replace that doesn't restate them
     // resets them, so the form is where the user sees what's coming along.
-    // The one option two of the three engines spell the same way — SQLite has no
-    // check option at all.
-    let check: AnyView = if sqlite {
+    // The one option two of the engines spell the same way — SQLite has no
+    // check option at all, and SQL Server's stays in the body.
+    let check: AnyView = if !ddl::supports_view_check_option(target.dialect) {
         crate::widgets::nothing()
     } else {
         form_setting(
@@ -359,11 +358,11 @@ fn form(ui: DdlUi, target: &ViewTarget, ring: FocusRing) -> AnyView {
         .into_any()
     };
 
-    // SQLite's alone, and the only option it has. It matters more here than the
-    // others do anywhere: every edit to a SQLite view is a drop and a re-create,
-    // so a list that isn't restated is a view whose columns quietly take the
-    // body's names.
-    let sqlite_only: AnyView = if !sqlite {
+    // SQLite's and SQL Server's, and SQLite's only option. It matters more there
+    // than the others do anywhere: every edit to a SQLite view is a drop and a
+    // re-create, and T-SQL's `ALTER VIEW` resets what it is not told, so a list
+    // that isn't restated is a view whose columns quietly take the body's names.
+    let column_names: AnyView = if !ddl::view_keeps_column_list(target.dialect) {
         crate::widgets::nothing()
     } else {
         form_setting(
@@ -456,7 +455,7 @@ fn form(ui: DdlUi, target: &ViewTarget, ring: FocusRing) -> AnyView {
         body,
         form_section("Options").style(|s| s.margin_top(theme::scaled(4.0))),
         check,
-        sqlite_only,
+        column_names,
         mysql_only,
         recreate,
     ))

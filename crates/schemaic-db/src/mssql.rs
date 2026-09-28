@@ -1179,6 +1179,76 @@ fn view_select_body(definition: &str) -> String {
     definition.trim().to_string()
 }
 
+/// What a stored `CREATE VIEW`'s header says beside the name: the explicit
+/// column list, verbatim, and the attributes after `WITH` — which T-SQL's
+/// `ALTER VIEW` resets unless they are restated
+/// ([`schemaic_core::schema::ViewOptions::attributes`]).
+///
+/// The same walk as [`view_select_body`], stopping at the same `AS`: the
+/// first parenthesised group at depth 0 is the column list (a name cannot
+/// hold a parenthesis unless it is quoted, and a quoted one is skipped whole),
+/// and the words after `WITH` are the attributes. **Only `SCHEMABINDING` and
+/// `VIEW_METADATA` are kept** — these are spliced into a statement Schemaic
+/// runs, so a word this does not know is not carried. `ENCRYPTION` never
+/// reaches here: an encrypted view has no definition.
+fn view_header_options(definition: &str) -> schemaic_core::schema::ViewOptions {
+    use schemaic_core::sql::{is_word_byte, is_word_start, skip_noncode};
+    let b = definition.as_bytes();
+    let mut depth = 0usize;
+    let mut open: Option<usize> = None;
+    let mut column_list: Option<String> = None;
+    let mut after_with = false;
+    let mut attributes: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if let Some(j) = skip_noncode(b, i, MS) {
+            i = j;
+            continue;
+        }
+        let c = b[i];
+        if c == b'(' {
+            if depth == 0 && column_list.is_none() {
+                open = Some(i + 1);
+            }
+            depth += 1;
+        } else if c == b')' {
+            depth = depth.saturating_sub(1);
+            if depth == 0
+                && let Some(start) = open.take()
+            {
+                column_list =
+                    Some(definition[start..i].trim().to_string()).filter(|s| !s.is_empty());
+            }
+        } else if is_word_start(c) {
+            let start = i;
+            while i < b.len() && is_word_byte(b[i]) {
+                i += 1;
+            }
+            let word = &definition[start..i];
+            if depth == 0 {
+                if word.eq_ignore_ascii_case("AS") {
+                    break;
+                }
+                if word.eq_ignore_ascii_case("WITH") {
+                    after_with = true;
+                } else if after_with {
+                    let w = word.to_ascii_uppercase();
+                    if matches!(w.as_str(), "SCHEMABINDING" | "VIEW_METADATA") {
+                        attributes.push(w);
+                    }
+                }
+            }
+            continue;
+        }
+        i += 1;
+    }
+    schemaic_core::schema::ViewOptions {
+        column_list,
+        attributes,
+        ..Default::default()
+    }
+}
+
 /// What a routine is, from its `sys.objects.type`, and what it returns, given
 /// a scalar function's declared return type (its parameter 0).
 ///
@@ -1471,6 +1541,11 @@ async fn collect_schema(client: &mut MsClient) -> Result<DbSchema, DbError> {
         t.triggers = triggers_by.remove(&key).unwrap_or_default();
         if t.is_view {
             t.create_sql = view_sources.get(&key).cloned();
+            t.view_options = t.create_sql.as_deref().map(view_header_options);
+            // `dependent_ddl` stays empty on purpose: a view's only re-create
+            // here is a rename, and an `INSTEAD OF` trigger's stored text
+            // names the old view, so replaying it would address a view the
+            // plan has just dropped. The risk line says the triggers go.
         }
         for ix in &mut t.indexes {
             ix.constraint = idx_constraints
@@ -2686,6 +2761,30 @@ mod write_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A view's header says what `ALTER VIEW` would reset if it were not
+    /// restated: the column list, verbatim, and the attributes — only the two
+    /// known words, since they are spliced into DDL.
+    #[test]
+    fn a_view_header_yields_its_column_list_and_attributes() {
+        let o = view_header_options(
+            "CREATE VIEW [dbo].[v (x)] ( a, [b c] )\nWITH SCHEMABINDING, VIEW_METADATA AS SELECT 1 AS a, 2 AS [b c]",
+        );
+        assert_eq!(o.column_list.as_deref(), Some("a, [b c]"));
+        assert_eq!(o.attributes, ["SCHEMABINDING", "VIEW_METADATA"]);
+        // A comment in the header is not a word; a word after AS is the body's.
+        let o = view_header_options(
+            "create view dbo.v /* WITH SCHEMABINDING */ as select 1 as x with check option",
+        );
+        assert_eq!(o.column_list, None);
+        assert!(o.attributes.is_empty(), "{:?}", o.attributes);
+        // An unknown word is not carried into a statement.
+        let o = view_header_options("CREATE VIEW v WITH SCHEMABINDING, DROP AS SELECT 1 AS x");
+        assert_eq!(o.attributes, ["SCHEMABINDING"]);
+        // The parenthesis a body opens is not a column list.
+        let o = view_header_options("CREATE VIEW v AS (SELECT 1 AS x)");
+        assert_eq!(o.column_list, None);
+    }
 
     /// Seed and increment are spliced into `IDENTITY(…)`, so only integer
     /// text is kept — a `decimal(38,0)` identity's seed is wider than `i64`,

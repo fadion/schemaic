@@ -8,8 +8,9 @@ statement about. All three engines now edit all three of those objects, and they
 differently, so ask the *narrow* capability (`ddl::supports_or_replace_view`,
 `ddl::supports_view_rename`) rather than the engine. **Microsoft SQL Server is a fourth, and a
 preview rather than a peer**: it connects, reads, validates, introspects, runs scripts, writes
-the grid's edits back, creates a table and drops a table, view or routine, and every editor,
-import, dump, the plan and Manual mode are switched off by capability — see `db::mssql`.
+the grid's edits back, designs tables, edits views and drops a table, view or routine, and the
+trigger and routine editors, import, dump, the plan and Manual mode are switched off by
+capability — see `db::mssql`.
 
 This is the project's reference document: the crate/module map, the architecture invariants, the
 UI conventions, and the Floem hazards each subsystem is built on. `CLAUDE.md` at the repo root
@@ -3424,16 +3425,28 @@ existing prose was left alone.
     a real password where `CreateAccount`'s is blank, because `set_password_sql` refuses an empty one
     — a blank fixture would emit nothing and read exactly like an arm nobody wrote.
     What actually varies for views moved down a level, into
-    two narrower facts that are false on SQLite and only there. `supports_or_replace_view` — SQLite has no
+    two narrower facts that are false on SQLite — and the second on SQL Server too (below).
+    `supports_or_replace_view` — SQLite has no
     `CREATE OR REPLACE VIEW` in any form, so a redefinition there is a `DROP` plus a `CREATE`, the
     arm PostgreSQL already takes when `pg_replaceable` says no, reached unconditionally rather than
     on a body test. And `supports_view_rename` — SQLite has no verb that renames a view at all:
     `ALTER VIEW` is not a statement there, and `ALTER TABLE v RENAME TO v2` refuses with *"view v
     may not be altered"* (measured against the engine, not read off the grammar), so `diff_view`
     turns a bare rename into a re-create and the new name comes out of the `CREATE` half.
+    **SQL Server answers no as well, though `sp_rename` runs**: it renames the object and leaves
+    `sys.sql_modules` holding the old `CREATE VIEW` text, so the next *Script as CREATE* — its own
+    tools' or Schemaic's — builds the view under the old name, and Microsoft's advice is to drop and
+    re-create. That made SQL Server the first engine that can *replace* but not *rename*, and
+    `diff_view` had never met one: it forced the re-create only where the engine could not replace,
+    so a renamed SQL Server view would have come out as a `CREATE OR ALTER` under the old name plus a
+    `RenameView` nothing can write. It now forces `recreate` whenever `renamed &&
+    !supports_view_rename`, whatever the engine can replace
+    (`sql_server_renames_a_view_by_re_creating_it`).
     `ChangeSet::view_statements`' `RenameView` arm is therefore spelled out per dialect with a
-    `debug_assert!` on the SQLite one — unreachable by construction, and a `_ =>` there is exactly
-    what would hand SQLite MySQL's `RENAME TABLE`. **Triggers needed the reader before the
+    `debug_assert!` on the SQLite and SQL Server ones — unreachable by construction, and a `_ =>`
+    there is exactly what would hand SQLite MySQL's `RENAME TABLE`. The arm is guarded by
+    `supports_change`, as its `DropView` and `RefreshView` siblings are, so a refused rename writes
+    nothing rather than reaching them. **Triggers needed the reader before the
     emitter**; that is `sqlite_trigger_info`, below. The schema tree's
     table/view menu, the editor's right-click and the Create submenu each ask the predicate for the
     object in front of them and offer **nothing** where the answer is no (absent, not dimmed — "not
@@ -4132,12 +4145,25 @@ existing prose was left alone.
     never to drop**, and `ViewDraft::force_recreate` is the user's override.
     SQLite's is the pair of predicates above: every edit is a drop and a create, so nothing is
     carried through a *replace* there — it is carried through the re-create, which is why
-    `ViewOptions::column_list` had to be modelled (see `core::schema`). `create_view_sql`
+    `ViewOptions::column_list` had to be modelled (see `core::schema`). **SQL Server's is
+    `CREATE OR ALTER VIEW`** (2016 SP1 on), which `create_view_sql` writes where a replace is
+    asked for there: like MySQL's it replaces anything and keeps the view's grants and triggers —
+    but T-SQL's `ALTER VIEW` resets whatever it is not told, so the header is restated in full, the
+    column list and `ViewOptions::attributes` (`SCHEMABINDING`, `VIEW_METADATA`) with it; a
+    schema-bound view altered without the word comes back unbound and loses every index on it
+    (`sql_server_alters_a_view_in_place_restating_its_header`). Its only re-create is a rename
+    (above). `create_view_sql`
     asks per engine (`my`/`pg` locals) rather than `!pg`, which had been sorting SQLite onto
     MySQL's side and would have emitted `ALGORITHM`/`DEFINER`/`SQL SECURITY` at an engine that
-    has none of them; the check option is likewise MySQL-and-PostgreSQL only. `emit_sqlite`
-    now calls `view_statements`/`trigger_statements` rather than keeping a hand-rolled
-    `DropView` arm, so there is still one view emitter.
+    has none of them. The check option and the column list are capabilities of their own,
+    `supports_view_check_option` (MySQL, PostgreSQL) and `view_keeps_column_list` (SQLite, SQL
+    Server), asked by `create_view_sql` and `view_editor.rs` alike in place of an `== Sqlite` that
+    sorted SQL Server onto MySQL's side of both. SQL Server's `WITH CHECK OPTION` has neither
+    `CASCADED` nor `LOCAL` and stays in the body the user edits, where introspection leaves it.
+    `emit_sqlite` and `emit_mssql`
+    now call `view_statements` (and `emit_sqlite` `trigger_statements`) rather than keeping a
+    hand-rolled `DropView` arm, so there is still one view emitter; `tsql_supports` admits
+    `CreateView` and `ReplaceView`, which is what switched SQL Server's view editor on.
     The MySQL `ALGORITHM` a replace would reset arrives *after* the editor opens
     (`SchemaActions::view_algorithm` → `Db::view_algorithm`; see `schemaic-db`), and
     `view_editor::fetch_algorithm` patches **both** sides of the diff with it — writing
@@ -6477,14 +6503,19 @@ existing prose was left alone.
     idea for a view (check option, MySQL definer/security/algorithm, PG storage params +
     `materialized`) — `CREATE OR REPLACE VIEW` replaces the whole view, so what isn't restated
     resets, and `SQL SECURITY DEFINER → INVOKER` is a privilege change. `definer_sql` quotes the
-    two halves of a MySQL account. **`column_list` is SQLite's alone and arrives by the opposite
-    route**: the explicit `(x, y)` of `CREATE VIEW v (x, y) AS …`, held verbatim and without its
-    parentheses, `None` on the two engines that bake the names into the body they report. It has to
-    be modelled because *every* SQLite view edit is a drop-and-re-create
-    (`ddl::supports_or_replace_view`), so a list left behind would silently rename the view's
-    columns to whatever the body calls them; verbatim rather than a parsed `Vec<String>` because
-    SQLite hands the list back with whatever quoting it was written with and re-quoting it is a way
-    to change it. `TableInfo::create_ddl` — `CREATE TABLE`/`VIEW`, built on the
+    two halves of a MySQL account. **`column_list` is SQLite's and SQL Server's, and arrives by the
+    opposite route**: the explicit `(x, y)` of `CREATE VIEW v (x, y) AS …`, held verbatim and
+    without its parentheses, `None` on the two engines that bake the names into the body they report
+    (`ddl::view_keeps_column_list` is that split). It has to be modelled because *every* SQLite view
+    edit is a drop-and-re-create (`ddl::supports_or_replace_view`), and T-SQL's `ALTER VIEW` resets
+    what it is not told, so a list left behind would silently rename the view's columns to whatever
+    the body calls them; verbatim rather than a parsed `Vec<String>` because SQLite hands the list
+    back with whatever quoting it was written with and re-quoting it is a way to change it.
+    **`attributes` is SQL Server's alone** — `SCHEMABINDING` and `VIEW_METADATA`, upper-cased in
+    the header's order, empty elsewhere — restated for the same `ALTER VIEW` reason: a schema-bound
+    view altered without the word comes back unbound, which drops every index on it. `ENCRYPTION`
+    never appears, an encrypted view having no readable definition to edit. `db::mssql` reads both
+    off the stored definition's header. `TableInfo::create_ddl` — `CREATE TABLE`/`VIEW`, built on the
     above; its **view** branch delegates to `ddl::view_ddl` so Copy DDL, the MCP table-info tool
     and the apply path all emit through one view emitter (it used to have its own, which restated
     none of the options). **`TableInfo::implicit_key` is a capability, read rather than
@@ -6604,7 +6635,12 @@ existing prose was left alone.
     `a_views_triggers_are_kept_for_its_re_create_with_their_state` pins the replay and the disabled
     state it restates without a server — and the live tier's
     `a_recreated_view_keeps_the_triggers_the_drop_took`
-    gates on the arm the plan takes rather than on the engine. Deliberately the server's own statement
+    gates on the arm the plan takes rather than on the engine. **SQL Server leaves it empty for a
+    view, on purpose**: its one re-create is a rename (`ddl::supports_view_rename`), and an
+    `INSTEAD OF` trigger's stored text names the old view, so a replay would address a view the
+    plan has just dropped. The re-create's risk says instead that the grants and the `INSTEAD OF`
+    triggers go with the drop (`sql_server_renames_a_view_by_re_creating_it`); an edit that keeps
+    the name is a `CREATE OR ALTER` and drops nothing. Deliberately the server's own statement
     rather than a
     re-emission from `TriggerInfo` — and that stays the call now that `sqlite::triggers_of` *does*
     read a SQLite trigger into the model. The two are not redundant: the model is what the **editor**
@@ -10513,12 +10549,15 @@ existing prose was left alone.
   logins and the users mapped to them in each database are two catalogues the browser's one list
   fits neither half of; and
   `ddl::supports_change`, whose SQL Server answer comes before anything else and is
-  `tsql_supports`: a table's own changes, new or existing, plus the table, view and routine drops,
-  and nothing more. The four editor predicates compute from it, so it decides which editors open:
-  `supports_table_design` probes a column retype, which T-SQL's `ALTER COLUMN` writes, so the
-  designer opens on an existing table — in place, as on MySQL and PostgreSQL, with no rebuild —
-  while the view, trigger and routine editors each want a `Create` and a `Replace` besides their
-  drop and stay off (`sql_server_admits_the_table_changes_it_can_write`). What `tsql_supports`
+  `tsql_supports`: a table's own changes, new or existing, the table, view and routine drops, and
+  a view's `CreateView` and `ReplaceView`, and nothing more. The four editor predicates compute
+  from it, so it decides which editors open: `supports_table_design` probes a column retype, which
+  T-SQL's `ALTER COLUMN` writes, so the designer opens on an existing table — in place, as on MySQL
+  and PostgreSQL, with no rebuild — and `supports_view_editing` probes the create and the replace,
+  which `emit_mssql` writes through the shared `view_statements` (`CREATE OR ALTER VIEW`, under
+  `ddl.rs`), so the view editor opens too; the trigger and routine editors each want a `Create`
+  and a `Replace` besides their drop and stay off
+  (`sql_server_admits_the_table_changes_it_can_write`). What `tsql_supports`
   refuses is under `run_ddl` (below). The three drops needed no emitter
   change — `DROP TABLE`/`DROP VIEW` over `export::ident_sql`'s brackets were T-SQL already, and
   `RoutineInfo::signature_sql` already had an `MsSql` arm, the bare name, T-SQL having no
@@ -10537,11 +10576,12 @@ existing prose was left alone.
   `create_children`'s Table entry asks it of `Change::CreateTable`. **All three are offered on SQL
   Server now, because their statements emit** — Drop on a table or a view but not a materialized
   one, which the engine does not have; Drop on a routine row but not a type, whose statement is not
-  written; and *Table* as the Create menu's only child. A table is offered **Edit table** and
-  **Truncate** besides, now that `emit_mssql` writes them; a view only its Drop
+  written; and *Table* in the Create menu. A table is offered **Edit table** and
+  **Truncate** besides, now that `emit_mssql` writes them; a view **Edit view** with its Drop, and
+  the Create menu *View* after *Table*, now that it writes a view's create and replace
   (`object_menu_tests::sql_server_offers_its_table_changes_and_a_views_drop`,
   `a_standalone_objects_drop_is_offered_only_where_its_statement_emits`,
-  `create_menu_tests::sql_server_is_offered_only_a_table`). Unlike SQLite's gaps, all
+  `create_menu_tests::sql_server_is_offered_a_table_and_a_view`). Unlike SQLite's gaps, all
   of these are **unfinished work**, not statements about the engine. `edit::supports_grid_writes`
   was one of them and is the first to have come back: asked inside `analyze_edit`, it kept every
   cell unwritable until the write-back below landed, and it answers `true` for all four engines now
@@ -10807,8 +10847,19 @@ existing prose was left alone.
   back — with its value recomputed and the result round-tripping. That was a known limit, loud,
   until then: a computed column referencing a column the plan retyped or renamed was not moved out
   of the way, so the retype failed with Msg 5074 or the rename with 15336, and the plan rolled back
-  whole; `repair_tsql_dependents` now rebuilds it (under `ddl.rs`). Still not done: the view,
-  routine and trigger editors.
+  whole; `repair_tsql_dependents` now rebuilds it (under `ddl.rs`).
+  `a_view_is_altered_in_place_and_renamed` takes a schema-bound view with a column list and a
+  grant, alters its body and reads all three back, then renames it and reads the stored
+  definition naming the new name. Still not done: the routine and trigger editors.
+  **A view's header is read off its stored definition, in two halves by one walk.**
+  `view_select_body` is the `SELECT` — everything after the first `AS` outside parentheses,
+  strings, comments and quoted names, over `sql::skip_noncode` — and `view_header_options` is what
+  comes before it: the first parenthesised group at depth 0 as `ViewOptions::column_list`,
+  verbatim, and the words after `WITH` as `ViewOptions::attributes`, which `ALTER VIEW` resets
+  unless they are restated (under `schema.rs`). **Only `SCHEMABINDING` and `VIEW_METADATA` are
+  kept**, since the words are spliced into a statement Schemaic runs and one it does not know is
+  not carried (`a_view_header_yields_its_column_list_and_attributes`). `dependent_ddl` is left
+  empty for a view, deliberately — see `TableInfo::dependent_ddl`, under `schema.rs`.
   **`DATABASE_LISTING` asks `HAS_DBACCESS` inside a `CASE`, and only of a multi-user database.**
   On one another session holds `SINGLE_USER`, that call took 2,174 ms against 150 ms (SQL Server
   2022 CU27) — what an administrator's maintenance window would cost every tree refresh — and a
@@ -16038,8 +16089,13 @@ existing prose was left alone.
     *carried* through a replace, and the PG "re-create instead of replacing" toggle is the
     override for the cases `ddl::pg_replaceable` can't read off the statement.
     The form is built **per engine** — check option for MySQL and PostgreSQL, the security/definer
-    block for MySQL, the re-create toggle for PostgreSQL, and a SQLite-only "Column names" field
-    for `ViewOptions::column_list`. `needs_algorithm` asked `!= Postgres`, which sent a SQLite
+    block for MySQL, the re-create toggle for PostgreSQL, and a "Column names" field for
+    `ViewOptions::column_list` on SQLite and SQL Server. The first and last ask
+    `ddl::supports_view_check_option` and `ddl::view_keeps_column_list`; both were `== Sqlite`,
+    which, once SQL Server's editor opened, offered it a `CASCADED`/`LOCAL` picker nothing writes
+    and hid the column list its `ALTER VIEW` has to restate. SQL Server's attributes
+    (`SCHEMABINDING`, `VIEW_METADATA`) have no control: they are carried through the draft, not
+    edited. `needs_algorithm` asked `!= Postgres`, which sent a SQLite
     connection off to fetch a `SHOW CREATE VIEW` algorithm; it asks `== MySql`.
     `is_editable_view` is the entry point's gate — a materialized view reaches no editor, and
     the two things its context menu can still do to it are **Drop** and **Refresh view**
@@ -23715,19 +23771,21 @@ Re-introducing the anti-patterns these guard against is a regression:
   when the emitter's does, and a fourth engine gets whatever the change table says about it. SQL
   Server is that fourth, and the derivation is what switched its editors off and then one of them
   back on: `supports_change` answers for it before any arm is consulted (`tsql_supports`), admitting
-  a table's own changes and the table, view and routine drops — no emitter writes T-SQL's
-  `CREATE OR ALTER` for a view, trigger or routine yet — and every editor predicate follows with no
-  edit of its own. It held when the first four came on (a new table and the three drops): no editor
-  probes only them, so none opened. When `emit_mssql` learned `ALTER COLUMN`, the table designer
-  opened on an existing table by that alone, while the other three stayed shut
-  (`sql_server_admits_the_table_changes_it_can_write`). A menu
+  a table's own changes, the table, view and routine drops, and a view's create and replace — no
+  emitter writes T-SQL's `CREATE OR ALTER` for a trigger or routine yet — and every editor predicate
+  follows with no edit of its own. It held when the first four came on (a new table and the three
+  drops): no editor probes only them, so none opened. When `emit_mssql` learned `ALTER COLUMN`, the
+  table designer opened on an existing table by that alone, while the other three stayed shut
+  (`sql_server_admits_the_table_changes_it_can_write`); when it learned `CREATE OR ALTER VIEW`,
+  the view editor opened the same way. A menu
   entry with **no** predicate is the same failure with nothing to grep for — the designer's three
   entries were exactly that until `supports_table_design` existed. **Keep asking them, and keep them
   apart**:
   they are per-object questions the menus ask per object, and what differs between engines has
   moved down to the narrower predicates that decide how an edit is *performed* rather than whether
-  it is offered — `supports_or_replace_view` and `supports_view_rename`, both false on SQLite and
-  only there, plus `supports_column_reorder`, `alter_column_disturbs_checks`,
+  it is offered — `supports_or_replace_view`, false on SQLite alone, `supports_view_rename`, false
+  on SQLite and SQL Server, `supports_view_check_option` and `view_keeps_column_list`, plus
+  `supports_column_reorder`, `alter_column_disturbs_checks`,
   `alter_column_disturbs_dependents`, `publishes_index_ddl` and `stats::supports_table_stats`; and, for the *comparison* rather than
   any editor, `ref_schema_is_database` and `view_definition_is_qualified`. **The same rule applies
   inside the emitter, and two loops there answered it by not asking.** `emit_sqlite`'s table-rename

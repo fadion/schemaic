@@ -6195,12 +6195,12 @@ mod object_menu_tests {
     }
 
     /// **SQL Server's table menu is the table's own changes, and a view's is
-    /// Drop.** Drop was the one entry here not gated on a capability, and
-    /// before SQL Server had a `DROP` it was a red enabled item that asked
+    /// Edit and Drop.** Drop was the one entry here not gated on a capability,
+    /// and before SQL Server had a `DROP` it was a red enabled item that asked
     /// "This can't be undone" and could only end in a refusal. A table is
     /// offered Edit table and Truncate now that `emit_mssql` writes them; a
-    /// view is not offered Edit view (no `CREATE OR ALTER VIEW` yet), nor
-    /// triggers, and a materialized view — which the engine does not have —
+    /// view Edit view, now that it writes `CREATE OR ALTER VIEW`, and not
+    /// triggers; a materialized view — which the engine does not have —
     /// nothing at all. Import waits on `import_rows`.
     #[test]
     fn sql_server_offers_its_table_changes_and_a_views_drop() {
@@ -6211,9 +6211,12 @@ mod object_menu_tests {
         for materialized in [false, true] {
             let v = object_entries(Shape::View, MsSql, materialized);
             assert!(
-                !v.edit && !v.truncate && !v.triggers && !v.import && !v.refresh_view,
+                !v.truncate && !v.triggers && !v.import && !v.refresh_view,
                 "view (materialized: {materialized}): {v:?}"
             );
+            // The engine has no materialized view, so only a plain one's Edit
+            // is a question worth pinning.
+            assert!(v.edit || materialized, "view: {v:?}");
             assert_eq!(v.drop, !materialized, "view (materialized: {materialized})");
         }
         // The premise: a MariaDB sequence is still dropped, so the gate is about
@@ -6283,12 +6286,12 @@ mod create_menu_tests {
         );
     }
 
-    /// **SQL Server is offered a table and nothing else** — the one Create whose
-    /// statement it emits. Its views, routines and containers wait on their own
+    /// **SQL Server is offered a table and a view** — the Creates whose
+    /// statements it emits. Its routines and containers wait on their own
     /// `Create` arms, and are absent rather than dimmed.
     #[test]
-    fn sql_server_is_offered_only_a_table() {
-        assert_eq!(labels(SqlDialect::MsSql), vec!["Table"]);
+    fn sql_server_is_offered_a_table_and_a_view() {
+        assert_eq!(labels(SqlDialect::MsSql), vec!["Table", "View"]);
     }
 
     /// SQLite has no stored routines at all — not an unfinished emitter, an

@@ -1505,8 +1505,10 @@ impl CheckInfo {
 ///
 /// Most fields belong to one engine (as [`TableInfo::engine`] does): MySQL has
 /// the definer and the security type, PostgreSQL the storage parameters and
-/// materialization, SQLite the explicit column list. `check_option` is the one
-/// two of them spell the same way — SQLite has no form of it.
+/// materialization, SQL Server the attributes; the explicit column list is
+/// SQLite's and SQL Server's. `check_option` is the one MySQL and PostgreSQL
+/// spell the same way — SQLite has no form of it, and SQL Server's is in the
+/// body.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ViewOptions {
     /// `WITH {CASCADED|LOCAL} CHECK OPTION`, upper-cased. `None` for a view
@@ -1559,7 +1561,19 @@ pub struct ViewOptions {
     /// SQLite hands back whatever quoting the list was written with, and
     /// re-quoting a parsed list is a way to change it. The other two engines
     /// bake the names into the body they report, so this stays `None` there.
+    ///
+    /// **SQL Server has one too**, `CREATE VIEW v (x, y) AS …`, read off the
+    /// stored definition's header by `db::mssql` and restated for the same
+    /// reason: `ALTER VIEW` without it names the columns after the body.
     pub column_list: Option<String>,
+    /// **SQL Server's view attributes** — `SCHEMABINDING`, `VIEW_METADATA` —
+    /// upper-cased, in the order the header states them. Empty elsewhere.
+    ///
+    /// Restated because T-SQL's `ALTER VIEW` resets any it is not told: a
+    /// schema-bound view altered without the word comes back unbound, which
+    /// drops every index on it. `ENCRYPTION` never appears — an encrypted
+    /// view has no readable definition, so there is nothing to edit.
+    pub attributes: Vec<String>,
 }
 
 /// **Hand-written for one field.** Every other default here is "absent", which
@@ -1578,6 +1592,7 @@ impl Default for ViewOptions {
             materialized: false,
             populated: true,
             column_list: None,
+            attributes: Vec::new(),
         }
     }
 }

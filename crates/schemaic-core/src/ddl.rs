@@ -2751,6 +2751,17 @@ fn view_drop_cost(dialect: SqlDialect, restored: bool) -> &'static str {
             "Views that select from it stop resolving until it is back, and its \
              INSTEAD OF triggers are dropped with it."
         }
+        // No rules, and a view that selects from it is not dropped with it —
+        // it fails until the view is back, unless it is schema-bound, which
+        // blocks the drop and so the plan.
+        (SqlDialect::MsSql, true) => {
+            "Grants on it are dropped with it and aren't restored; its INSTEAD OF \
+             triggers are dropped too."
+        }
+        (SqlDialect::MsSql, false) => {
+            "Grants on it and its INSTEAD OF triggers are dropped with it and aren't \
+             restored."
+        }
         (_, true) => {
             "Dependent views, rules and grants are dropped with it and aren't \
              restored; its INSTEAD OF triggers are dropped too."
@@ -3283,6 +3294,10 @@ impl Change {
                     SqlDialect::Sqlite => {
                         "SQLite has no way to replace a view in place, so every edit \
                          to one — a rename included — takes this route."
+                    }
+                    SqlDialect::MsSql => {
+                        "SQL Server's sp_rename would leave the view's stored definition \
+                         naming the old one, so a rename takes this route."
                     }
                     _ => {
                         "PostgreSQL can't replace a view whose columns changed name, \
@@ -4146,7 +4161,6 @@ impl ChangeSet {
                 Change::CreateTable(t) => out.extend(create_table_sql(t, d)),
                 Change::DropTable => out.push(format!("DROP TABLE {q};")),
                 Change::TruncateTable => out.push(format!("TRUNCATE TABLE {q};")),
-                Change::DropView { materialized } => out.push(drop_view_sql(&q, *materialized)),
                 Change::DropRoutine(f) => out.push(format!(
                     "DROP {} {};",
                     f.kind.sql_keyword(),
@@ -4155,6 +4169,10 @@ impl ChangeSet {
                 _ => {}
             }
         }
+        // A view's own changes, through the builder every engine shares; each
+        // `CREATE VIEW` is its own statement, and so its own batch, as T-SQL
+        // requires.
+        out.extend(self.view_statements());
         // What covers the columns, before the columns — foreign keys first, of
         // everything: one that references this table's own key blocks the
         // key's drop.
@@ -5177,7 +5195,9 @@ impl ChangeSet {
                 // MySQL has no `ALTER VIEW … RENAME`; `RENAME TABLE` is what it
                 // renames a view with. Spelled out per engine rather than
                 // `_ =>`, which silently handed SQLite MySQL's statement.
-                Change::RenameView { to } => match d {
+                // Guarded as its siblings are, so a refused one writes nothing
+                // rather than reaching the arms below that cannot be reached.
+                Change::RenameView { to } if supports_change(d, c) => match d {
                     SqlDialect::Postgres => out.push(format!(
                         "ALTER VIEW {} RENAME TO {};",
                         self.qname(),
@@ -5195,12 +5215,11 @@ impl ChangeSet {
                     SqlDialect::Sqlite => {
                         debug_assert!(false, "SQLite has no statement that renames a view")
                     }
-                    // Unreachable too: no change reaches the emitter on SQL
-                    // Server (`supports_change`), and its rename is
-                    // `sp_rename`, which leaves the stored definition naming
-                    // the old view — the reason `supports_routine_rename` gives.
+                    // Unreachable too: SQL Server's rename is `sp_rename`,
+                    // which leaves the stored definition naming the old view
+                    // ([`supports_view_rename`]), so `diff_view` re-creates.
                     SqlDialect::MsSql => {
-                        debug_assert!(false, "no SQL Server view change reaches the emitter")
+                        debug_assert!(false, "SQL Server renames a view by re-creating it")
                     }
                 },
                 _ => {}
@@ -6146,7 +6165,10 @@ fn create_view_sql(v: &ViewDraft, name: &str, dialect: SqlDialect, replace: bool
     // Guarded on the capability as well as on the caller's answer: a `replace`
     // that reached SQLite would emit a statement the engine has no form of.
     if replace && supports_or_replace_view(dialect) {
-        sql.push_str("OR REPLACE ");
+        sql.push_str(match dialect {
+            SqlDialect::MsSql => "OR ALTER ",
+            SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => "OR REPLACE ",
+        });
     }
     if my {
         // MySQL's clause order is fixed: ALGORITHM, DEFINER, SQL SECURITY, VIEW.
@@ -6167,19 +6189,24 @@ fn create_view_sql(v: &ViewDraft, name: &str, dialect: SqlDialect, replace: bool
     }
     sql.push_str("VIEW ");
     sql.push_str(&qualified(name, v.schema.as_deref(), dialect));
-    // SQLite's explicit column list, restated because the re-create would
-    // otherwise rename the view's columns to whatever the body calls them.
-    if let Some(cols) = set(&o.column_list).filter(|_| dialect == SqlDialect::Sqlite) {
+    // The explicit column list SQLite and SQL Server keep, restated because a
+    // re-create — or T-SQL's `ALTER VIEW` — would otherwise rename the view's
+    // columns to whatever the body calls them.
+    if let Some(cols) = set(&o.column_list).filter(|_| view_keeps_column_list(dialect)) {
         sql.push_str(&format!(" ({cols})"));
     }
     if pg && !o.storage.is_empty() {
         sql.push_str(&format!(" WITH ({})", o.storage.join(", ")));
     }
+    // SQL Server's attributes. Only its introspection fills them.
+    if !o.attributes.is_empty() {
+        sql.push_str(&format!(" WITH {}", o.attributes.join(", ")));
+    }
     sql.push_str(" AS\n");
     sql.push_str(&view_body(&v.select));
     // A materialized view has no check option — it isn't updatable at all — and
-    // neither does SQLite, at any view.
-    if (my || pg)
+    // neither does SQLite, at any view; SQL Server's is in the body.
+    if supports_view_check_option(dialect)
         && !o.materialized
         && let Some(co) = set(&o.check_option).filter(|c| !c.eq_ignore_ascii_case("NONE"))
     {
@@ -8180,11 +8207,12 @@ pub fn checks_equal(a: &CheckInfo, b: &CheckInfo, dialect: SqlDialect) -> bool {
 
 /// Can `dialect` have its **views** edited here?
 ///
-/// All three, now — but they don't get there the same way, which is why the two
+/// All four, now — but they don't get there the same way, which is why the two
 /// predicates below exist rather than a `dialect == Postgres` at each site.
 /// SQLite has neither `CREATE OR REPLACE VIEW` nor a verb that renames a view,
-/// so every edit is a drop and a create; the other two replace in place and
-/// rename with a statement.
+/// so every edit is a drop and a create; MySQL and PostgreSQL replace in place
+/// and rename with a statement; SQL Server replaces in place
+/// (`CREATE OR ALTER`) and renames by re-creating.
 ///
 /// **The answer is computed, not stated.** This took a `SqlDialect` it discarded
 /// and returned `true`, which is the failure the *"ask a capability, never an
@@ -8311,14 +8339,42 @@ pub fn supports_database_charset(dialect: SqlDialect) -> bool {
 /// already takes when a replace won't do, reached unconditionally instead of on
 /// a body test.
 ///
-/// SQL Server has the statement under another spelling, `CREATE OR ALTER VIEW`,
-/// which the view emitter does not write — so it answers no until it does, and
-/// a redefinition there would take the `DROP` plus `CREATE` arm. View editing is
-/// not offered on it yet in any case ([`supports_view_editing`]).
+/// SQL Server has the statement under another spelling, `CREATE OR ALTER VIEW`
+/// (2016 SP1 on), which [`create_view_sql`] writes there. Like MySQL's it
+/// replaces anything, keeping the view's grants and triggers — as long as the
+/// header is restated, since `ALTER VIEW` resets what it is not told
+/// ([`crate::schema::ViewOptions::attributes`]).
 pub fn supports_or_replace_view(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::MsSql => true,
+        SqlDialect::Sqlite => false,
+    }
+}
+
+/// Does a view on `dialect` take a `WITH {CASCADED|LOCAL} CHECK OPTION` the
+/// emitter writes from [`crate::schema::ViewOptions::check_option`]?
+///
+/// MySQL and PostgreSQL. SQLite has no check option at all, and SQL Server's
+/// is `WITH CHECK OPTION` alone, with neither word — it stays in the body the
+/// user edits, where introspection leaves it, so a picker for the other two
+/// would offer a choice nothing writes.
+pub fn supports_view_check_option(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MySql | SqlDialect::Postgres => true,
         SqlDialect::Sqlite | SqlDialect::MsSql => false,
+    }
+}
+
+/// Does a view on `dialect` keep an explicit column list —
+/// `CREATE VIEW v (x, y) AS …` — that the body does not restate
+/// ([`crate::schema::ViewOptions::column_list`])?
+///
+/// SQLite and SQL Server; the other two bake the names into the body they
+/// report. Where it is kept it is restated, and the editor shows it.
+pub fn view_keeps_column_list(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::Sqlite | SqlDialect::MsSql => true,
+        SqlDialect::MySql | SqlDialect::Postgres => false,
     }
 }
 
@@ -8470,8 +8526,17 @@ pub fn refresh_view_change(t: &crate::schema::TableInfo) -> Option<Change> {
 /// `ALTER TABLE v RENAME TO …` refuses a view outright — *"view v may not be
 /// altered"*. A rename there rides along with the re-create every edit already
 /// performs, which is why [`diff_view`] treats a bare rename as a redefinition.
+///
+/// **SQL Server: no, though `sp_rename` runs.** It renames the object and
+/// leaves `sys.sql_modules` holding the old `CREATE VIEW` text, so the next
+/// *Script as CREATE* — its own tools' or Schemaic's — builds the view under
+/// the old name. Microsoft's advice is to drop and re-create, which is the
+/// arm [`diff_view`] takes, as [`supports_routine_rename`] does for a routine.
 pub fn supports_view_rename(dialect: SqlDialect) -> bool {
-    !matches!(dialect, SqlDialect::Sqlite)
+    match dialect {
+        SqlDialect::MySql | SqlDialect::Postgres => true,
+        SqlDialect::Sqlite | SqlDialect::MsSql => false,
+    }
 }
 
 /// Can `dialect` have its **triggers** edited here?
@@ -10524,9 +10589,10 @@ pub fn supports_change(dialect: SqlDialect, change: &Change) -> bool {
 /// column or turning a column into or out of one (the same). Also refused, as
 /// unfinished work: a column's position (T-SQL has no reorder), MariaDB's
 /// inline check, a primary key whose constraint name was
-/// not read (T-SQL drops it by name), and an unnamed check (the same). The
-/// view, trigger and routine editors need a `Create` and a `Replace` besides
-/// their drop, so they stay off.
+/// not read (T-SQL drops it by name), and an unnamed check (the same). A view
+/// is created and replaced (`CREATE OR ALTER VIEW`); its `RenameView` is never
+/// raised, a rename being a re-create. The trigger and routine editors need a
+/// `Create` and a `Replace` besides their drop, so they stay off.
 fn tsql_supports(change: &Change) -> bool {
     match change {
         Change::CreateTable(_)
@@ -10535,6 +10601,8 @@ fn tsql_supports(change: &Change) -> bool {
         | Change::DropView {
             materialized: false,
         }
+        | Change::CreateView(_)
+        | Change::ReplaceView { .. }
         | Change::DropRoutine(_)
         | Change::RenameTable { .. }
         | Change::DropColumn { .. }
@@ -11386,7 +11454,12 @@ pub fn diff_view(current: &TableInfo, draft: &ViewDraft, dialect: SqlDialect) ->
         // MySQL's `CREATE OR REPLACE VIEW` redefines anything, so among the
         // engines that *have* the statement the question — and the override —
         // is PostgreSQL's. SQLite doesn't have it and always re-creates.
+        //
+        // **And a rename the engine has no verb for re-creates even where it
+        // can replace**: SQL Server's `CREATE OR ALTER` keeps the name, and the
+        // `RenameView` below would be a change nothing can write.
         let recreate = !supports_or_replace_view(dialect)
+            || (renamed && !supports_view_rename(dialect))
             || (dialect == SqlDialect::Postgres
                 && (draft.force_recreate || {
                     let cols: Vec<String> =
@@ -13739,6 +13812,12 @@ mod tests {
                 materialized: false,
             },
             Change::DropRoutine(Box::default()),
+            Change::CreateView(Box::default()),
+            Change::ReplaceView {
+                draft: Box::default(),
+                recreate: false,
+                replay: Vec::new(),
+            },
             Change::CreateTable(Box::default()),
             Change::RenameTable { to: "u".into() },
             Change::RebuildComputedColumn {
@@ -13839,7 +13918,8 @@ mod tests {
                 comment: Some("people".into()),
             },
             Change::DropView { materialized: true },
-            Change::CreateView(Box::default()),
+            // Never raised — `diff_view` re-creates to rename.
+            Change::RenameView { to: "w".into() },
             Change::CreateRoutine(Box::default()),
             Change::DropDatabase { name: "d".into() },
         ];
@@ -13855,7 +13935,7 @@ mod tests {
         }
         assert!(supports_table_design(MsSql));
         assert!(!supports_column_reorder(MsSql));
-        assert!(!supports_view_editing(MsSql));
+        assert!(supports_view_editing(MsSql));
         assert!(!supports_routine_editing(MsSql));
         assert!(!supports_trigger_editing(MsSql));
     }
@@ -14504,6 +14584,90 @@ mod tests {
             ),
             "{stmts:#?}"
         );
+    }
+
+    /// A SQL Server view `dbo.v (a, b) WITH SCHEMABINDING` over `dbo.t`.
+    fn ms_view() -> TableInfo {
+        TableInfo {
+            name: "v".into(),
+            schema: Some("dbo".into()),
+            is_view: true,
+            view_definition: Some("SELECT id, d FROM dbo.t".into()),
+            view_options: Some(crate::schema::ViewOptions {
+                column_list: Some("a, b".into()),
+                attributes: vec!["SCHEMABINDING".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// **A SQL Server view is redefined in place with `CREATE OR ALTER`**,
+    /// restating its column list and its attributes — T-SQL's `ALTER VIEW`
+    /// resets whatever it is not told, so a schema-bound view would come back
+    /// unbound — in one statement, keeping the view's grants.
+    #[test]
+    fn sql_server_alters_a_view_in_place_restating_its_header() {
+        assert!(supports_view_editing(MsSql));
+        assert!(supports_or_replace_view(MsSql));
+        let t = ms_view();
+        let mut d = ViewDraft::from_table(&t).unwrap();
+        d.select = "SELECT id, d FROM dbo.t WHERE d > 0".into();
+        let cs = diff_view(&t, &d, MsSql);
+        assert!(cs.unsupported().is_empty(), "{:?}", cs.unsupported());
+        assert_eq!(
+            cs.emit(),
+            [
+                "CREATE OR ALTER VIEW [dbo].[v] (a, b) WITH SCHEMABINDING AS\n\
+              SELECT id, d FROM dbo.t WHERE d > 0;"
+            ]
+        );
+        // A new one is a plain CREATE VIEW, failing on a taken name.
+        let created = single(
+            "w",
+            Some("dbo"),
+            MsSql,
+            Change::CreateView(Box::new(ViewDraft {
+                select: "SELECT 1 AS one".into(),
+                ..ViewDraft::blank("w", Some("dbo".into()))
+            })),
+        )
+        .emit();
+        assert_eq!(created, ["CREATE VIEW [dbo].[w] AS\nSELECT 1 AS one;"]);
+        // Its own draft diffs to nothing.
+        assert!(diff_view(&t, &ViewDraft::from_table(&t).unwrap(), MsSql).is_empty());
+    }
+
+    /// **A rename is a re-create on SQL Server**: `sp_rename` leaves the stored
+    /// definition naming the old view, so the next *Script as CREATE* would
+    /// build it under that name. Nothing is replayed — an `INSTEAD OF`
+    /// trigger's stored text names the old view too — and the preview says
+    /// what the drop takes: the grants and those triggers.
+    #[test]
+    fn sql_server_renames_a_view_by_re_creating_it() {
+        assert!(!supports_view_rename(MsSql));
+        let t = ms_view();
+        let mut d = ViewDraft::from_table(&t).unwrap();
+        d.name = "v2".into();
+        let cs = diff_view(&t, &d, MsSql);
+        assert!(
+            !cs.changes
+                .iter()
+                .any(|c| matches!(c, Change::RenameView { .. })),
+            "{:?}",
+            cs.changes
+        );
+        assert_eq!(
+            cs.emit(),
+            [
+                "DROP VIEW [dbo].[v];",
+                "CREATE VIEW [dbo].[v2] (a, b) WITH SCHEMABINDING AS\nSELECT id, d FROM dbo.t;",
+            ]
+        );
+        let risks = cs.destructive().join(" ");
+        assert!(risks.contains("Grants on it"), "{risks}");
+        assert!(risks.contains("INSTEAD OF triggers"), "{risks}");
+        assert!(risks.contains("sp_rename"), "{risks}");
     }
 
     /// **A SQL Server table diffs to nothing against its own draft** — the

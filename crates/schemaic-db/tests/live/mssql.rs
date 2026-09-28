@@ -1273,6 +1273,72 @@ async fn a_column_under_a_computed_one_is_renamed_and_retyped() {
     assert!(again.changes.is_empty(), "{:?}", again.changes);
 }
 
+/// **A view is altered in place and renamed by re-creating it.** A
+/// schema-bound view with a column list and a grant: `CREATE OR ALTER`
+/// changes its body keeping all three — T-SQL's `ALTER VIEW` would drop the
+/// binding and the names if they were not restated — and a rename builds it
+/// again under the new name, whose stored definition then names it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_view_is_altered_in_place_and_renamed() {
+    use schemaic_core::ddl::{ViewDraft, diff_view};
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("ddl_view").await;
+    s.exec(
+        "CREATE TABLE dbo.t (id int NOT NULL PRIMARY KEY, d int); \
+         INSERT dbo.t VALUES (1, 0), (2, 5)",
+    )
+    .await;
+    s.exec("CREATE VIEW dbo.v (a, b) WITH SCHEMABINDING AS SELECT id, d FROM dbo.t")
+        .await;
+    s.exec("GRANT SELECT ON dbo.v TO public").await;
+    let v = read_table(&s, "v").await;
+    let o = v.view_options.clone().expect("options");
+    assert_eq!(o.column_list.as_deref(), Some("a, b"));
+    assert_eq!(o.attributes, ["SCHEMABINDING"]);
+
+    let mut d = ViewDraft::from_table(&v).expect("a view");
+    d.select = "SELECT id, d FROM dbo.t WHERE d > 0".into();
+    let stmts = diff_view(&v, &d, MS).emit();
+    s.db.run_ddl(&s.name, &stmts, CancellationToken::new())
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{stmts:#?}"));
+    assert_eq!(s.scalar("SELECT COUNT(*) FROM dbo.v").await, "1");
+    assert_eq!(s.scalar("SELECT b FROM dbo.v").await, "5", "still named b");
+    assert_eq!(
+        s.scalar("SELECT OBJECTPROPERTY(OBJECT_ID('dbo.v'), 'IsSchemaBound')")
+            .await,
+        "1"
+    );
+    assert_eq!(
+        s.scalar(
+            "SELECT COUNT(*) FROM sys.database_permissions \
+             WHERE major_id = OBJECT_ID('dbo.v') AND permission_name = 'SELECT'"
+        )
+        .await,
+        "1",
+        "the grant kept"
+    );
+    let v2 = read_table(&s, "v").await;
+    assert!(diff_view(&v2, &ViewDraft::from_table(&v2).unwrap(), MS).is_empty());
+
+    let mut d = ViewDraft::from_table(&v2).unwrap();
+    d.name = "w".into();
+    let stmts = diff_view(&v2, &d, MS).emit();
+    s.db.run_ddl(&s.name, &stmts, CancellationToken::new())
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{stmts:#?}"));
+    let w = read_table(&s, "w").await;
+    assert!(
+        w.create_sql.as_deref().unwrap_or_default().contains("[w]"),
+        "{:?}",
+        w.create_sql
+    );
+    assert_eq!(w.view_options.unwrap().attributes, ["SCHEMABINDING"]);
+    assert_eq!(s.scalar("SELECT b FROM dbo.w").await, "5");
+}
+
 /// A primary key widened to two columns: dropped by the constraint name
 /// introspection read, and added over both.
 #[tokio::test(flavor = "multi_thread")]

@@ -4170,12 +4170,12 @@ mod engine_comparison_gate {
         ),
         (
             "schemaic-core/ddl.rs",
-            21,
-            "Six of the twenty-one are in the capability definitions the \
-             rest of the app asks — `supports_view_rename`, \
-             `requires_named_checks`, `requires_rowid_key`, \
-             `strict_type_allowed`, and two in `supports_change` — and a \
-             comparison is how they answer. The other fifteen are DDL grammar \
+            19,
+            "Five of the nineteen are in the capability definitions the \
+             rest of the app asks — `requires_named_checks`, \
+             `requires_rowid_key`, `strict_type_allowed`, and two in \
+             `supports_change` — and a comparison is how they answer. The \
+             other fourteen are DDL grammar \
              inside the emitters and validators (`create_view_sql`, \
              `create_table_sql`, `client_script`'s `DELIMITER`, \
              `repoint_check_column`, the drafts' `validate`), where the engines \
@@ -4187,7 +4187,9 @@ mod engine_comparison_gate {
              exhaustive `match` now that SQL Server answers it too. 22 → 21: \
              `create_table_sql`'s trailing comments are a `match` — \
              PostgreSQL's `COMMENT ON`, SQL Server's extended properties — \
-             where they were an `if pg`.",
+             where they were an `if pg`. 21 → 19, with SQL Server's view \
+             editing: `supports_view_rename` is an exhaustive `match`, and \
+             `create_view_sql`'s column list asks `view_keeps_column_list`.",
         ),
         (
             "schemaic-core/filter.rs",
@@ -4289,11 +4291,14 @@ mod engine_comparison_gate {
         ),
         (
             "view_editor.rs",
-            4,
-            "View grammar: MySQL's `ALGORITHM=`/`SQL SECURITY`, PostgreSQL's \
-             `WITH CHECK OPTION` spelling, SQLite's absence of both. \
-             `supports_or_replace_view` and `supports_view_rename` carry the \
-             capability half and are called here.",
+            3,
+            "View grammar: MySQL's `ALGORITHM=`/`SQL SECURITY` and \
+             PostgreSQL's re-create toggle. `supports_or_replace_view` and \
+             `supports_view_rename` carry the capability half and are called \
+             here. 4 → 3: the check option and the column list ask \
+             `supports_view_check_option` and `view_keeps_column_list`, where \
+             they asked `== Sqlite` — which offered SQL Server a CASCADED/LOCAL \
+             picker nothing writes, and hid the column list it keeps.",
         ),
     ];
 
