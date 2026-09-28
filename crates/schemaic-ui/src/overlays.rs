@@ -6201,13 +6201,14 @@ mod object_menu_tests {
     /// offered Edit table and Truncate now that `emit_mssql` writes them; a
     /// view Edit view, now that it writes `CREATE OR ALTER VIEW`, and not
     /// triggers; a materialized view — which the engine does not have —
-    /// nothing at all. Import waits on `import_rows`.
+    /// nothing at all. A table is offered Import now that `import_rows` is
+    /// written.
     #[test]
     fn sql_server_offers_its_table_changes_and_a_views_drop() {
         use schemaic_core::intel::SqlDialect::MsSql;
         let t = object_entries(Shape::Table, MsSql, false);
-        assert!(t.edit && t.truncate && t.drop, "{t:?}");
-        assert!(!t.triggers && !t.import && !t.refresh_view, "{t:?}");
+        assert!(t.edit && t.truncate && t.drop && t.import, "{t:?}");
+        assert!(!t.triggers && !t.refresh_view, "{t:?}");
         for materialized in [false, true] {
             let v = object_entries(Shape::View, MsSql, materialized);
             assert!(

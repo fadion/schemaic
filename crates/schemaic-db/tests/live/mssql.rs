@@ -1339,6 +1339,148 @@ async fn a_view_is_altered_in_place_and_renamed() {
     assert_eq!(s.scalar("SELECT b FROM dbo.w").await, "5");
 }
 
+/// Import `rows` into `dbo.imp (id, name)` on `s`.
+async fn import_into(
+    s: &Scratch,
+    columns: &[&str],
+    rows: &mut (dyn Iterator<Item = Result<Vec<Value>, String>> + Send),
+    cancel: CancellationToken,
+) -> Result<u64, DbError> {
+    let columns: Vec<String> = columns.iter().map(|c| c.to_string()).collect();
+    s.db.import_rows(
+        schemaic_db::ImportTarget {
+            database: &s.name,
+            schema: Some("dbo"),
+            table: "imp",
+            columns: &columns,
+        },
+        rows,
+        cancel,
+    )
+    .await
+}
+
+/// **An import loads every row across batches** — text as `N'…'`, so a
+/// non-Latin name survives, a NULL as NULL — and an identity column the file
+/// supplies is written under `IDENTITY_INSERT`, which is off again after.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_import_loads_every_row_across_batches() {
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("import").await;
+    s.exec("CREATE TABLE dbo.imp (id int IDENTITY(1,1) PRIMARY KEY, name nvarchar(40) NULL)")
+        .await;
+    let n = schemaic_core::import::INSERT_BATCH_ROWS * 2 + 7;
+    let mut rows = (1..=n).map(|i| {
+        Ok(vec![
+            Value::Int(i as i64 * 10),
+            if i == 3 {
+                Value::Null
+            } else {
+                Value::Str(format!("Ωμέγα {i}"))
+            },
+        ])
+    });
+    let wrote = import_into(&s, &["id", "name"], &mut rows, CancellationToken::new())
+        .await
+        .expect("imported");
+    assert_eq!(wrote, n as u64);
+    assert_eq!(
+        s.scalar("SELECT COUNT(*) FROM dbo.imp").await,
+        n.to_string()
+    );
+    assert_eq!(
+        s.scalar("SELECT name FROM dbo.imp WHERE id = 20").await,
+        "Ωμέγα 2"
+    );
+    assert_eq!(
+        s.scalar("SELECT COUNT(*) FROM dbo.imp WHERE name IS NULL")
+            .await,
+        "1"
+    );
+    // Off again: an insert that leaves the identity to the server works.
+    s.exec("INSERT dbo.imp (name) VALUES (N'after')").await;
+}
+
+/// **A row the server refuses rolls the whole import back**, batches already
+/// sent included — a duplicate key past the first batch boundary.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_import_row_rolls_the_whole_import_back() {
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("import_dup").await;
+    s.exec("CREATE TABLE dbo.imp (id int NOT NULL PRIMARY KEY, name nvarchar(40) NULL)")
+        .await;
+    let collide_at = schemaic_core::import::INSERT_BATCH_ROWS + 10;
+    let mut rows = (1..=collide_at + 5).map(|i| {
+        let id = if i == collide_at { 1 } else { i as i64 };
+        Ok(vec![Value::Int(id), Value::Str(format!("r{i}"))])
+    });
+    let err = import_into(&s, &["id", "name"], &mut rows, CancellationToken::new())
+        .await
+        .expect_err("a duplicate key");
+    assert!(err.to_string().contains("Msg 2627"), "{err}");
+    assert_eq!(s.scalar("SELECT COUNT(*) FROM dbo.imp").await, "0");
+}
+
+/// **An empty field bound for a number is refused, not stored as 0** — the
+/// import rolls back whole and names the column and the row.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_imported_blank_number_is_refused_not_stored_as_zero() {
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("import_blank").await;
+    s.exec("CREATE TABLE dbo.imp (id int NOT NULL PRIMARY KEY, qty int NULL)")
+        .await;
+    let mut rows = (1..=3).map(|i| {
+        Ok(vec![
+            Value::Int(i),
+            Value::Str(if i == 3 { String::new() } else { i.to_string() }),
+        ])
+    });
+    let err = import_into(&s, &["id", "qty"], &mut rows, CancellationToken::new())
+        .await
+        .expect_err("refused");
+    assert!(matches!(err, DbError::Refused(_)), "{err:?}");
+    assert!(
+        err.to_string().contains("Row 3") && err.to_string().contains("qty"),
+        "{err}"
+    );
+    assert_eq!(s.scalar("SELECT COUNT(*) FROM dbo.imp").await, "0");
+}
+
+/// **Stop mid-import rolls back and says so.**
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancelled_import_rolls_back_and_says_so() {
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("import_stop").await;
+    s.exec("CREATE TABLE dbo.imp (id int NOT NULL PRIMARY KEY, name nvarchar(40) NULL)")
+        .await;
+    let per = schemaic_core::import::INSERT_BATCH_ROWS;
+    let mut rows = (1..=per * 6).map(move |i| {
+        if i % per == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        Ok(vec![Value::Int(i as i64), Value::Str(format!("row {i}"))])
+    });
+    let cancel = CancellationToken::new();
+    let stop = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        stop.cancel();
+    });
+    let err = import_into(&s, &["id", "name"], &mut rows, cancel)
+        .await
+        .expect_err("stopped");
+    assert!(matches!(err, DbError::Cancelled), "{err:?}");
+    assert_eq!(s.scalar("SELECT COUNT(*) FROM dbo.imp").await, "0");
+}
+
 /// A primary key widened to two columns: dropped by the constraint name
 /// introspection read, and added over both.
 #[tokio::test(flavor = "multi_thread")]

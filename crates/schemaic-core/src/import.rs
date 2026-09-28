@@ -787,13 +787,12 @@ pub fn coerce(
 
 /// Can a file be imported into a table on `dialect`?
 ///
-/// Not on SQL Server yet: its `import_rows` is not written, and the table
-/// menu's *Import* entry asks this so it is absent there rather than opening a
-/// wizard whose last step is a refusal.
+/// All four, SQL Server since `db::mssql::import_rows` was written. The table
+/// menu's *Import* entry asks this, so an engine without one has the entry
+/// absent rather than a wizard whose last step is a refusal.
 pub fn supports_import(dialect: SqlDialect) -> bool {
     match dialect {
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => true,
-        SqlDialect::MsSql => false,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => true,
     }
 }
 
@@ -812,8 +811,12 @@ pub fn supports_import(dialect: SqlDialect) -> bool {
 ///   emit. The integer is what SQLite's own `TRUE`/`FALSE` keywords produce.
 /// - **PostgreSQL** has a real boolean type and *rejects* the integer 1 for it,
 ///   but takes the quoted literal. It is the exception, not the default.
+/// - **SQL Server**'s is `bit`, which takes `1`/`0` as what they are.
 fn bool_literal_is_integer(dialect: SqlDialect) -> bool {
-    !matches!(dialect, SqlDialect::Postgres)
+    match dialect {
+        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => true,
+        SqlDialect::Postgres => false,
+    }
 }
 
 /// Everything needed to turn a file's bytes into fields — the dialect plus what

@@ -4201,11 +4201,6 @@ mod engine_comparison_gate {
              capability this could ask, and a reason to keep it on the list.",
         ),
         (
-            "schemaic-core/import.rs",
-            1,
-            "`bool_literal_is_integer` — a capability definition, named as one.",
-        ),
-        (
             "schemaic-core/schema.rs",
             6,
             "DDL grammar in the four `*_sql` emitters — a column definition, an              index clause, a sequence and a whole `CREATE TABLE`. The three              engines write different statements there rather than one statement              with a switch in it, and `is_bare_default` — the one site here that              really was a capability in disguise — now asks `default_grammar`,              and `follow_target` asks `ddl::ref_schema_is_database`.",

@@ -8,9 +8,9 @@ statement about. All three engines now edit all three of those objects, and they
 differently, so ask the *narrow* capability (`ddl::supports_or_replace_view`,
 `ddl::supports_view_rename`) rather than the engine. **Microsoft SQL Server is a fourth, and a
 preview rather than a peer**: it connects, reads, validates, introspects, runs scripts, writes
-the grid's edits back, designs tables, edits views and drops a table, view or routine, and the
-trigger and routine editors, import, dump, the plan and Manual mode are switched off by
-capability — see `db::mssql`.
+the grid's edits back, imports a file into a table, designs tables, edits views and drops a
+table, view or routine, and the trigger and routine editors, dump, the plan and Manual mode are
+switched off by capability — see `db::mssql`.
 
 This is the project's reference document: the crate/module map, the architecture invariants, the
 UI conventions, and the Floem hazards each subsystem is built on. `CLAUDE.md` at the repo root
@@ -2590,7 +2590,19 @@ existing prose was left alone.
     the view asked about — so the pin is a source gate in the view
     (`the_problem_list_discloses_its_own_cap_and_not_only_cores`).
     `build_insert` reuses `export::ident_sql`/`sql_literal`, so quoting can't drift
-    from the SQL export. Note JSON columns are the union of every object's keys and the mapping is
+    from the SQL export; it is the statement every engine's load runs, SQL Server's included, which
+    renders its batches as literals rather than binding them for a parameter ceiling (under
+    `db::mssql`). **Two capabilities decide what reaches it, and both are exhaustive `match`es.**
+    `supports_import` is the table menu's *Import* entry, so an engine without a load has the entry
+    absent rather than a wizard whose last step is a refusal; it answers yes for all four since
+    `db::mssql::import_rows` was written. `bool_literal_is_integer` is whether a coerced boolean
+    goes in as the integer `1`/`0` or the quoted `'true'`/`'false'`, and it was `MySql => integer,
+    _ => quoted`, written when the default arm meant PostgreSQL — which sorted SQLite onto the
+    wrong side: its `BOOLEAN` is a declared type with NUMERIC affinity, so `'true'` is kept as TEXT,
+    and TEXT in a boolean context is 0, so every row imported as true was invisible to `WHERE flag`
+    and returned by `WHERE NOT flag`. PostgreSQL, which rejects the integer for a real boolean, is
+    the exception rather than the default; SQL Server's `bit` takes `1`/`0`. With the second a
+    `match` too, this file has no entry left in `engine_comparison_gate`'s budget. Note JSON columns are the union of every object's keys and the mapping is
     built from a *sample* — `trim_to_mapping` drops keys that first appear past it (CSV keeps the
     field-count check, where a mismatch means a stray delimiter). An array and JSON Lines read
     through one path: `ArrayUnwrap` blanks the wrapping brackets + top-level commas as bytes
@@ -10568,13 +10580,13 @@ existing prose was left alone.
   `fetch_query` and `run_batch` (with `Enforce`, above), `prepare_check`, `fetch_table_list` and
   `fetch_schema`, the monitor's `fetch_table`, `count_rows` (`COUNT_BIG`), table statistics from
   `sys.dm_db_partition_stats`, Server Activity, `run_script`, and the grid's write-back —
-  `commit_writes`, `refetch_rows` and `fetch_blob` (below) — and `run_ddl`, for the table changes
-  `supports_change` admits (below). `explain`, `run_server_ddl` and `import_rows` answer
+  `commit_writes`, `refetch_rows` and `fetch_blob` (below) — `import_rows` (below), and `run_ddl`,
+  for the table changes `supports_change` admits (below). `explain` and `run_server_ddl` answer
   `DbError::Refused("… is not available for SQL Server yet.")`, and so does `Session::open`, as it
   does for SQLite. **The refusals are the backstop, not the gate**: the app is kept off them by
   capabilities, each an exhaustive `match` with `MsSql` on `false`, asked at the UI site that
-  offers the thing — `plan::supports_plan` for the editor's Plan entry; `import::supports_import` and
-  `dump::supports_dump` for the tree's *Import* and *Export ▸ SQL*; `tx::supports_manual_mode` for
+  offers the thing — `plan::supports_plan` for the editor's Plan entry; `dump::supports_dump` for
+  the tree's *Export ▸ SQL*; `tx::supports_manual_mode` for
   the footer's Auto/Manual segment, which used to ask `is_sqlite`; `users::supports_users`, since
   logins and the users mapped to them in each database are two catalogues the browser's one list
   fits neither half of; and
@@ -10607,7 +10619,8 @@ existing prose was left alone.
   Server now, because their statements emit** — Drop on a table or a view but not a materialized
   one, which the engine does not have; Drop on a routine row but not a type, whose statement is not
   written; and *Table* in the Create menu. A table is offered **Edit table** and
-  **Truncate** besides, now that `emit_mssql` writes them; a view **Edit view** with its Drop, and
+  **Truncate** besides, now that `emit_mssql` writes them, and **Import** now that `import_rows`
+  is written; a view **Edit view** with its Drop, and
   the Create menu *View* after *Table*, now that it writes a view's create and replace
   (`object_menu_tests::sql_server_offers_its_table_changes_and_a_views_drop`,
   `a_standalone_objects_drop_is_offered_only_where_its_statement_emits`,
@@ -10616,7 +10629,8 @@ existing prose was left alone.
   was one of them and is the first to have come back: asked inside `analyze_edit`, it kept every
   cell unwritable until the write-back below landed, and it answers `true` for all four engines now
   — kept an exhaustive `match` rather than deleted, so the next engine, arriving without a
-  write-back, has to say which side of it it is on. Server Activity is the one
+  write-back, has to say which side of it it is on. `import::supports_import` is the second, on
+  the same terms, since `import_rows` landed. Server Activity is the one
   split that *is* about the engine: `KILL` ends a session, but no T-SQL statement cancels another
   session's request and leaves the session standing — a cancel is an attention sent by the owner's
   own client — so `activity::supports_kill_kind` says no to *Cancel query* there and
@@ -10724,6 +10738,36 @@ existing prose was left alone.
   asserts `DbError::Cancelled`, the row unchanged and the whole commit under 3 s, and failed against
   the unpatched driver. There is no `TxScope`: with no Manual mode, the write's own transaction
   is the only case there is.
+  **`import_rows` is that discipline scaled to a file**, in the shape every engine's load takes
+  (`Db::import_rows`, under `lib.rs` below): one `BEGIN TRANSACTION`, batches pulled through the
+  shared `next_batch_off_executor`, each required to insert exactly its own rows or the whole
+  import rolls back. **The batches are literal SQL, not bound parameters** — the shared
+  `import::build_insert`, `N'…'` for text — where `commit_writes` binds: a bound batch spends a
+  parameter per cell, SQL Server takes at most 2,100 per request, and 500 rows of five columns is
+  already past it. The literal form has no such ceiling, and `INSERT_BATCH_ROWS`' 500 is under
+  T-SQL's 1,000-row limit on a `VALUES` list — and the constant is shared with three engines that
+  have no such limit, so raising it past 1,000 breaks this one alone. Both of the grid's guards come with it, read off the same `column_facts`.
+  **`import_blank_refusal` matters more here than `blank_refusal` does in the grid**: a CSV's empty
+  field is the ordinary spelling of "no value", and one the import's NULL rule did not catch
+  arrives as `''`, which this engine stores as `0` or `1900-01-01` and reports as success — for
+  every row of a column at once. It is asked of each batch before the batch runs, names the file's
+  row (1-based, counted across batches) and the column, and the import rolls back
+  (`an_imported_blank_number_is_refused_not_stored_as_zero`). An identity column among the
+  import's columns runs the **whole** import under `IDENTITY_INSERT` (`import_sets_identity`),
+  switched off before the `COMMIT` — once rather than per statement as the grid's is, since every
+  batch writes the same columns. **Stop is asked twice per batch** — at the top of the loop and
+  again once the batch has been read — and the batch in flight is raced through
+  `execute_counted`, the rollback trusted only after an acknowledged attention. The second ask is
+  load-bearing: reading a batch is where an import spends its time, so it is where Stop lands, and
+  left to the race the attention went to a request barely sent, the acknowledgement was not seen,
+  and a rollback nothing had prevented was reported as not known to have happened — which is how
+  the live `a_cancelled_import_rolls_back_and_says_so` failed before the check went in. The other
+  live pins are `an_import_loads_every_row_across_batches` (non-Latin text, a NULL, identity values
+  under `IDENTITY_INSERT`, and an insert that leaves the identity to the server working after it)
+  and `a_refused_import_row_rolls_the_whole_import_back` (a duplicate key past the first batch,
+  Msg 2627, 0 rows); `write_tests` pins the two predicates
+  (`an_imported_blank_is_refused_where_sql_server_would_convert_it`,
+  `an_import_wants_identity_insert_only_when_it_writes_the_identity`).
   **`run_ddl` wraps the whole plan in one `BEGIN TRANSACTION`**, since T-SQL's `CREATE TABLE`,
   `CREATE INDEX` and `DROP` are transactional, as PostgreSQL's are: a best-effort
   `lock_wait_sql(MsSql)` first, as on the other engines, then each statement raced against Stop. A
@@ -11105,10 +11149,9 @@ existing prose was left alone.
   `AnyCertificate`, which skips it. That costs nothing an attacker could use: where no certificate
   is trusted, an attacker presents their own and signs with it. The verifying modes keep the full
   check and so need a real certificate, which the auto-generated one never is.
-  `import_rows` is the bulk-load path, and it has an arm for **all three** full engines (SQL
-  Server's refuses, and `import::supports_import` keeps the wizard off it): `Engine::Postgres`
-  and `Engine::Sqlite` hand off to `pg::import_rows`/`sqlite::import_rows`, `Engine::MySql` falls
-  through to the body here, and the shape is the same in each — one transaction of batched multi-row
+  `import_rows` is the bulk-load path, and it has an arm for **all four** engines, each handing
+  off to its module's own (`pg::`, `sqlite::`, `mysql::` and `mssql::import_rows`, SQL Server's
+  under `mssql.rs` above), and the shape is the same in each — one transaction of batched multi-row
   `INSERT`s pulled from a `RowSource` iterator, each batch required to affect exactly as many rows
   as it carried — the `commit_writes` 1-row safety net scaled to a file, without its
   statement-per-row round-trips.
@@ -11322,7 +11365,8 @@ existing prose was left alone.
   what it did not change, an identity toggle withheld, a clustered index and a nonclustered key
   keeping their clustering and every
   AdventureWorksLT table round-tripping where that sample is installed, also under `mssql.rs`),
-  and the
+  a file import (four tests, from every row across batches to a cancel rolled back, under
+  `mssql.rs` too), and the
   two catalogues only it has — `every_allowlisted_function_is_a_builtin` (the read gate's lists,
   by error 195) and `every_builtin_snippet_runs`. It is not a `Target`, so `endpoint.rs` carries
   `OUTSIDE_THE_SUITE` for it, `leg_enabled` to answer `SCHEMAIC_IT_ENGINES` for a leg with no

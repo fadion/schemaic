@@ -1912,13 +1912,112 @@ pub(crate) async fn run_server_ddl(
     })
 }
 
+/// The SQL Server half of [`Db::import_rows`]: every row in one transaction,
+/// in `INSERT … VALUES` batches of up to [`schemaic_core::import::INSERT_BATCH_ROWS`]
+/// rows, each required to insert exactly its own rows.
+///
+/// **Literal statements, from the builder every engine shares**
+/// (`import::build_insert`), not bound ones as [`commit_writes`] uses: a
+/// bound batch would spend a parameter per cell, and SQL Server takes at most
+/// 2,100 per request — 500 rows of five columns is past it. The literal form
+/// has no such ceiling, and its 500 rows are under T-SQL's 1,000-row limit on
+/// a `VALUES` list. Quoting is `export::sql_literal`'s, `N'…'` for text.
+///
+/// **An empty field bound for a number or a date is refused before its batch
+/// runs** ([`import_blank_refusal`]), and the whole import rolls back: SQL
+/// Server would store `0` or `1900-01-01` and report success. An identity
+/// column in the list runs the import under `IDENTITY_INSERT`.
+///
+/// **Stop is `commit_writes`' rule**: checked between batches, and raced
+/// against the one in flight, with the rollback sent only after the server
+/// acknowledged the attention — otherwise the connection's close is what
+/// rolls it back, and the error says it is not known to have.
 pub(crate) async fn import_rows(
-    _db: &Db,
-    _target: crate::ImportTarget<'_>,
-    _rows: crate::RowSource<'_>,
-    _cancel: CancellationToken,
+    db: &Db,
+    target: crate::ImportTarget<'_>,
+    rows: crate::RowSource<'_>,
+    cancel: CancellationToken,
 ) -> Result<u64, DbError> {
-    Err(not_yet("Importing rows"))
+    if cancel.is_cancelled() {
+        return Err(DbError::Cancelled);
+    }
+    let mut client = connect(db, Some(target.database)).await?;
+    let facts = column_facts(&mut client, target.schema, target.table).await?;
+    let cols: Vec<&str> = target.columns.iter().map(String::as_str).collect();
+    let identity =
+        import_sets_identity(target.columns, &facts).then(|| qname(target.schema, target.table));
+    drain(&mut client, "BEGIN TRANSACTION").await?;
+    if let Some(t) = &identity
+        && let Err(e) = drain(&mut client, &format!("SET IDENTITY_INSERT {t} ON")).await
+    {
+        return Err(failed(&mut client, err_text(e)).await);
+    }
+    let mut total = 0u64;
+    // The row the byte ceiling held back from the previous batch — see
+    // `crate::next_batch`.
+    let mut held: Option<Vec<Value>> = None;
+    loop {
+        if cancel.is_cancelled() {
+            return Err(cancelled_import(rollback(&mut client).await));
+        }
+        let batch = match crate::next_batch_off_executor(rows, &mut held) {
+            Ok(Some(b)) => b,
+            Ok(None) => break,
+            Err(e) => return Err(failed(&mut client, err_text(e)).await),
+        };
+        // **Asked again once the batch is in hand**: reading it is where an
+        // import spends its time, so it is where Stop lands. Left to the race
+        // below, the attention went to a request barely sent, the server's
+        // acknowledgement was not seen, and the rollback — which nothing
+        // prevented — was reported as not known to have happened.
+        if cancel.is_cancelled() {
+            return Err(cancelled_import(rollback(&mut client).await));
+        }
+        if let Some(msg) = import_blank_refusal(target.columns, &facts, &batch, total) {
+            let undone = rollback(&mut client).await;
+            return Err(DbError::Refused(format!("{msg}{}", undone.note())));
+        }
+        let Some(sql) = schemaic_core::import::build_insert(
+            target.database,
+            target.schema,
+            target.table,
+            &cols,
+            &batch,
+            MS,
+        ) else {
+            continue;
+        };
+        let bound = Bound {
+            sql,
+            params: Vec::new(),
+        };
+        let affected = match execute_counted(&mut client, &bound, &cancel).await {
+            Ok(Ran::Counted(n)) => n,
+            Ok(Ran::Stopped { in_step }) => {
+                let undone = if in_step {
+                    rollback(&mut client).await
+                } else {
+                    Rollback::Unknown
+                };
+                return Err(cancelled_import(undone));
+            }
+            Err(e) => return Err(failed(&mut client, err_text(e)).await),
+        };
+        if affected != batch.len() as u64 {
+            let msg = format!("a batch of {} rows inserted {affected}", batch.len());
+            return Err(failed(&mut client, msg).await);
+        }
+        total += affected;
+    }
+    if let Some(t) = &identity
+        && let Err(e) = drain(&mut client, &format!("SET IDENTITY_INSERT {t} OFF")).await
+    {
+        return Err(failed(&mut client, err_text(e)).await);
+    }
+    if let Err(e) = drain(&mut client, "COMMIT TRANSACTION").await {
+        return Err(failed(&mut client, err_text(e)).await);
+    }
+    Ok(total)
 }
 
 // ── Schema changes ───────────────────────────────────────────────────────────
@@ -2229,6 +2328,50 @@ fn sets_identity(ins: &RowInsert, facts: &[ColumnFacts]) -> bool {
         .any(|(c, _)| fact(facts, c).is_some_and(|f| f.identity))
 }
 
+/// [`blank_refusal`] for an import batch: the refusal for the first empty
+/// string bound for a column SQL Server would convert it in, or `None`.
+/// `first_row` is how many rows earlier batches held, so the row named is the
+/// file's (1-based, header not counted).
+///
+/// **It matters more here than in the grid.** A CSV's empty field is the
+/// ordinary spelling of "no value", and unless the import's NULL rule caught
+/// it, it arrives as `''` — which this engine alone stores as `0` or
+/// `1900-01-01` and reports as success, for every row of a column at once.
+fn import_blank_refusal(
+    columns: &[String],
+    facts: &[ColumnFacts],
+    batch: &[Vec<Value>],
+    first_row: u64,
+) -> Option<String> {
+    for (i, row) in batch.iter().enumerate() {
+        for (col, v) in columns.iter().zip(row) {
+            let Value::Str(s) = v else { continue };
+            if !s.is_empty() {
+                continue;
+            }
+            if let Some(f) = fact(facts, col).filter(|f| !holds_text(&f.base_type)) {
+                return Some(format!(
+                    "Row {} has an empty value for {} ({}): SQL Server would store it as 0 or \
+                     1900-01-01 rather than refuse it. Import empty fields as NULL, or fill them in.",
+                    first_row + i as u64 + 1,
+                    col,
+                    f.base_type
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// Does an import into `columns` give an identity column a value? Then the
+/// whole import runs under `IDENTITY_INSERT`, which is one table's at a time
+/// and one import's for its length.
+fn import_sets_identity(columns: &[String], facts: &[ColumnFacts]) -> bool {
+    columns
+        .iter()
+        .any(|c| fact(facts, c).is_some_and(|f| f.identity))
+}
+
 /// The columns of the table a batch writes to.
 async fn column_facts(
     client: &mut MsClient,
@@ -2311,6 +2454,15 @@ fn cancelled_write(undone: Rollback) -> DbError {
     match undone {
         Rollback::Complete => DbError::Cancelled,
         undone => DbError::Refused(format!("Commit cancelled{}", undone.note())),
+    }
+}
+
+/// [`cancelled_write`] for an import, whose sentence names the import: the
+/// user stopped a file load, not a commit.
+fn cancelled_import(undone: Rollback) -> DbError {
+    match undone {
+        Rollback::Complete => DbError::Cancelled,
+        undone => DbError::Refused(format!("Import cancelled{}", undone.note())),
     }
 }
 
@@ -2755,6 +2907,53 @@ mod write_tests {
             &f
         ));
         assert!(!sets_identity(&insert(vec![]), &f));
+    }
+
+    /// **An imported empty field is refused where SQL Server would convert
+    /// it** — a CSV's blank quantity would otherwise land as `0` and a blank
+    /// date as `1900-01-01` — naming the column and the row, counted from the
+    /// first imported row. NULL, text columns and columns the catalogue does
+    /// not name pass.
+    #[test]
+    fn an_imported_blank_is_refused_where_sql_server_would_convert_it() {
+        let f = facts(&[("qty", "int", false), ("note", "nvarchar", false)]);
+        let cols = ["note".to_string(), "qty".to_string()];
+        let row = |note: &str, qty: Value| vec![Value::Str(note.into()), qty];
+        let ok = [row("", Value::Null), row("x", Value::Str("3".into()))];
+        assert_eq!(import_blank_refusal(&cols, &f, &ok, 0), None);
+        let bad = [row("a", Value::Int(1)), row("b", Value::Str(String::new()))];
+        let msg = import_blank_refusal(&cols, &f, &bad, 500).expect("refused");
+        assert!(msg.contains("qty") && msg.starts_with("Row 502 "), "{msg}");
+        // A column the catalogue does not know is the server's to judge.
+        let unknown = ["other".to_string()];
+        assert_eq!(
+            import_blank_refusal(&unknown, &f, &[vec![Value::Str(String::new())]], 0),
+            None
+        );
+    }
+
+    /// A stopped import whose rollback is not confirmed says it was the
+    /// *import* that was stopped — `cancelled_write`'s sentence says commit.
+    #[test]
+    fn a_stopped_import_is_called_an_import() {
+        assert!(matches!(
+            cancelled_import(Rollback::Complete),
+            DbError::Cancelled
+        ));
+        let msg = cancelled_import(Rollback::Unknown).to_string();
+        assert!(
+            msg.contains("Import cancelled") && !msg.contains("Commit"),
+            "{msg}"
+        );
+    }
+
+    /// `IDENTITY_INSERT` is wanted for an import exactly when its columns give
+    /// the identity a value.
+    #[test]
+    fn an_import_wants_identity_insert_only_when_it_writes_the_identity() {
+        let f = facts(&[("id", "int", true), ("name", "nvarchar", false)]);
+        assert!(import_sets_identity(&["ID".into(), "name".into()], &f));
+        assert!(!import_sets_identity(&["name".into()], &f));
     }
 }
 
