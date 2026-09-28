@@ -8975,8 +8975,15 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     });
                 },
             );
+            let database = target.database.clone();
             handle.spawn(async move {
-                let res = db.fetch_principals().await.map_err(|e| e.to_string());
+                // The browser's database: SQL Server's users are one
+                // database's (its logins, and the other engines' accounts,
+                // the server's).
+                let res = db
+                    .fetch_principals(database.as_deref())
+                    .await
+                    .map_err(|e| e.to_string());
                 report(res);
             });
         })

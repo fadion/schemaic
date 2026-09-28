@@ -3006,3 +3006,203 @@ async fn a_read_only_connection_is_refused_a_manual_session() {
         refused.err()
     );
 }
+
+/// A scratch **login**, dropped when it goes out of scope — a login is the
+/// server's, so the scratch database's drop does not take it.
+struct ScratchLogin(String);
+
+impl Drop for ScratchLogin {
+    fn drop(&mut self) {
+        let name = self.0.clone();
+        assert_scratch_name(&name);
+        let dropped = std::thread::spawn(move || {
+            tokio::runtime::Runtime::new()
+                .expect("a runtime for the teardown")
+                .block_on(base_db().fetch_query(
+                    None,
+                    &format!("IF SUSER_ID(N'{name}') IS NOT NULL DROP LOGIN [{name}]"),
+                    1,
+                    CancellationToken::new(),
+                ))
+        })
+        .join();
+        if !matches!(dropped, Ok(Ok(_))) && !std::thread::panicking() {
+            panic!("could not drop login {}: {dropped:?}", self.0);
+        }
+    }
+}
+
+/// **Accounts end to end, both halves.** A login and the user it brings are
+/// created in one plan and listed linked; the login signs in to the database
+/// through its user; grants at the schema and a role membership read back as
+/// the sentences that made them; a reset on the *user* row changes the
+/// *login's* password; and the drops leave neither behind.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_login_and_its_user_are_created_granted_reset_and_dropped() {
+    use schemaic_core::ddl::{Change, account, accounts};
+    use schemaic_core::users::{
+        AccountDraft, GrantLevel, PasswordReset, PrincipalKind, PrivilegeChange, RoleChange,
+        companion_user_draft,
+    };
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("accounts").await;
+    let name = format!("{PREFIX}{}_mssql_acct", std::process::id());
+    let _login = ScratchLogin(name.clone());
+    let run = |stmts: Vec<String>| {
+        let db = s.db.clone();
+        let database = s.name.clone();
+        async move {
+            db.run_ddl(&database, &stmts, CancellationToken::new())
+                .await
+                .unwrap_or_else(|e| panic!("{e}\n{stmts:#?}"));
+        }
+    };
+    let signs_in = |password: &'static str| {
+        let db = Db::from_parts(
+            Engine::MsSql,
+            var("HOST", "127.0.0.1"),
+            var("PORT", "1433").parse().unwrap(),
+            name.clone(),
+            password.to_string(),
+            s.name.clone(),
+        );
+        let database = s.name.clone();
+        async move {
+            db.fetch_query(
+                Some(&database),
+                "SELECT USER_NAME()",
+                1,
+                CancellationToken::new(),
+            )
+            .await
+            .ok()
+            .and_then(|rs| rs.cell(0, 0).map(|c| c.display().to_string()))
+        }
+    };
+
+    // One plan: the login, and the user it brings.
+    let draft = AccountDraft {
+        name: name.clone(),
+        kind: PrincipalKind::Login,
+        password: "Schemaic_Pw1!".into(),
+        also_user: true,
+        ..Default::default()
+    };
+    let user_draft = companion_user_draft(&draft, MS).expect("a user");
+    run(accounts(
+        &name,
+        MS,
+        vec![
+            Change::CreateAccount(Box::new(draft)),
+            Change::CreateAccount(Box::new(user_draft)),
+        ],
+    )
+    .emit())
+    .await;
+    let list =
+        s.db.fetch_principals(Some(&s.name))
+            .await
+            .expect("the accounts")
+            .list;
+    let login = list
+        .iter()
+        .find(|p| p.name == name && p.kind == PrincipalKind::Login)
+        .expect("the login")
+        .clone();
+    let user = list
+        .iter()
+        .find(|p| p.name == name && p.kind == PrincipalKind::User)
+        .expect("the user")
+        .clone();
+    assert_eq!(user.login.as_deref(), Some(name.as_str()), "linked");
+    assert!(list.iter().any(|p| p.name == "db_datareader" && p.system));
+    assert_eq!(
+        signs_in("Schemaic_Pw1!").await.as_deref(),
+        Some(name.as_str())
+    );
+
+    // A schema grant and a role, read back as the sentences that made them.
+    run(account(
+        &name,
+        MS,
+        Change::GrantPrivileges(Box::new(PrivilegeChange {
+            account: user.clone(),
+            level: GrantLevel::Schema("dbo".into()),
+            privileges: vec!["SELECT".into()],
+            with_grant_option: false,
+        })),
+    )
+    .emit())
+    .await;
+    let reader = list
+        .iter()
+        .find(|p| p.name == "db_datareader")
+        .unwrap()
+        .clone();
+    run(account(
+        &name,
+        MS,
+        Change::GrantRole(Box::new(RoleChange {
+            role: reader,
+            member: user.clone(),
+            with_admin_option: false,
+        })),
+    )
+    .emit())
+    .await;
+    let grants =
+        s.db.fetch_grants(Some(&s.name), &user)
+            .await
+            .expect("the grants");
+    let q = format!("[{name}]");
+    for want in [
+        format!("GRANT CONNECT ON DATABASE::[{}] TO {q};", s.name),
+        format!("GRANT SELECT ON SCHEMA::[dbo] TO {q};"),
+        format!("ALTER ROLE [db_datareader] ADD MEMBER {q};"),
+    ] {
+        assert!(
+            grants.statements.contains(&want),
+            "{want}\n{:#?}",
+            grants.statements
+        );
+    }
+    let server = s.db.fetch_grants(None, &login).await.expect("the login's");
+    assert!(
+        server
+            .statements
+            .iter()
+            .any(|x| x.starts_with("GRANT CONNECT SQL TO")),
+        "{:#?}",
+        server.statements
+    );
+
+    // A reset on the user row is the login's password.
+    run(account(
+        &name,
+        MS,
+        Change::SetAccountPassword(Box::new(PasswordReset {
+            account: user.clone(),
+            password: "Schemaic_Pw2!".into(),
+            scram_salt: None,
+            password_policy: None,
+        })),
+    )
+    .emit())
+    .await;
+    assert!(
+        signs_in("Schemaic_Pw1!").await.is_none(),
+        "the old one no longer works"
+    );
+    assert_eq!(
+        signs_in("Schemaic_Pw2!").await.as_deref(),
+        Some(name.as_str())
+    );
+
+    // The user, then the login.
+    run(account(&name, MS, Change::DropAccount(Box::new(user))).emit()).await;
+    run(account(&name, MS, Change::DropAccount(Box::new(login))).emit()).await;
+    let list = s.db.fetch_principals(Some(&s.name)).await.unwrap().list;
+    assert!(!list.iter().any(|p| p.name == name), "{list:?}");
+}

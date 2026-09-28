@@ -2701,6 +2701,212 @@ async fn column_facts(
         .collect())
 }
 
+// ── Accounts ─────────────────────────────────────────────────────────────────
+
+/// Every login — SQL (`S`), Windows (`U`) and Windows group (`G`) — with its
+/// server roles: `(name, type, disabled, default database, server roles)`.
+/// The `##…##` certificate logins are the server's plumbing and left out.
+const LOGIN_LISTING: &str = "SELECT sp.name, sp.type, CAST(sp.is_disabled AS int), \
+            sp.default_database_name, \
+            (SELECT STRING_AGG(r.name, ', ') WITHIN GROUP (ORDER BY r.name) \
+               FROM sys.server_role_members m \
+               JOIN sys.server_principals r ON r.principal_id = m.role_principal_id \
+              WHERE m.member_principal_id = sp.principal_id) \
+     FROM sys.server_principals sp \
+     WHERE sp.type IN ('S', 'U', 'G') AND sp.name NOT LIKE N'##%' \
+     ORDER BY sp.name";
+
+/// The current database's users and roles, with each user's login and every
+/// principal's role memberships: `(name, type, login, authentication, default
+/// schema, fixed role, member of)`.
+const USER_LISTING: &str = "SELECT dp.name, dp.type, SUSER_SNAME(dp.sid), \
+            dp.authentication_type_desc, dp.default_schema_name, CAST(dp.is_fixed_role AS int), \
+            (SELECT STRING_AGG(r.name, ', ') WITHIN GROUP (ORDER BY r.name) \
+               FROM sys.database_role_members m \
+               JOIN sys.database_principals r ON r.principal_id = m.role_principal_id \
+              WHERE m.member_principal_id = dp.principal_id) \
+     FROM sys.database_principals dp \
+     WHERE dp.type IN ('S', 'U', 'G', 'E', 'X', 'R') \
+     ORDER BY dp.name";
+
+/// A database principal's permissions in the current database: `(state,
+/// permission, class, schema, object, column)` — a schema's name for a
+/// schema's permission, an object's schema and name for an object's, and a
+/// column's name when the permission is on one.
+const DATABASE_PERMISSIONS: &str = "SELECT p.state, p.permission_name, p.class_desc, \
+            COALESCE(SCHEMA_NAME(o.schema_id), s.name), o.name, c.name \
+     FROM sys.database_permissions p \
+     LEFT JOIN sys.objects o ON p.class = 1 AND o.object_id = p.major_id \
+     LEFT JOIN sys.columns c ON p.class = 1 AND p.minor_id <> 0 \
+            AND c.object_id = p.major_id AND c.column_id = p.minor_id \
+     LEFT JOIN sys.schemas s ON p.class = 3 AND s.schema_id = p.major_id \
+     WHERE p.grantee_principal_id = DATABASE_PRINCIPAL_ID(@P1) \
+     ORDER BY p.class, 4, 5, 6, p.permission_name";
+
+/// The database roles a database principal is a member of.
+const DATABASE_ROLES_OF: &str = "SELECT r.name FROM sys.database_role_members m \
+     JOIN sys.database_principals r ON r.principal_id = m.role_principal_id \
+     WHERE m.member_principal_id = DATABASE_PRINCIPAL_ID(@P1) ORDER BY r.name";
+
+/// A login's server-level permissions: `(state, permission)`.
+const SERVER_PERMISSIONS: &str = "SELECT p.state, p.permission_name FROM sys.server_permissions p \
+     WHERE p.grantee_principal_id = SUSER_ID(@P1) AND p.class_desc = N'SERVER' \
+     ORDER BY p.permission_name";
+
+/// The server roles a login is a member of.
+const SERVER_ROLES_OF: &str = "SELECT r.name FROM sys.server_role_members m \
+     JOIN sys.server_principals r ON r.principal_id = m.role_principal_id \
+     WHERE m.member_principal_id = SUSER_ID(@P1) ORDER BY r.name";
+
+/// `sql` with the one name parameter `@P1`, every row's cells as text.
+async fn named_rows(
+    client: &mut MsClient,
+    sql: &str,
+    name: &str,
+) -> Result<Vec<Vec<Option<String>>>, DbError> {
+    let stream = client.query(sql, &[&name]).await.map_err(|e| db_err(&e))?;
+    let rows = stream.into_first_result().await.map_err(|e| db_err(&e))?;
+    Ok(rows
+        .iter()
+        .map(|r| (0..r.len()).map(|i| cell_text(r, i)).collect())
+        .collect())
+}
+
+/// Every login, and — with a database — that database's users and roles,
+/// folded into the browser's one list by `users::from_mssql_rows`, each user
+/// linked to its login. Without a database the note says where the users
+/// are; a login that may not view every principal is told why the list is
+/// short, since `sys.server_principals` shows such a login itself and little
+/// else, with no error to say so.
+pub(crate) async fn fetch_principals(
+    db: &Db,
+    database: Option<&str>,
+) -> Result<schemaic_core::users::Principals, DbError> {
+    use schemaic_core::users::{MsLoginRow, MsUserRow, Principals, from_mssql_rows};
+    let flag = |r: &[Option<String>], i: usize| cell(r, i) == "1";
+    let database = database.filter(|d| !d.is_empty());
+    let mut client = connect(db, database).await?;
+    let logins: Vec<MsLoginRow> = query_rows(&mut client, LOGIN_LISTING)
+        .await?
+        .iter()
+        .map(|r| MsLoginRow {
+            name: cell(r, 0),
+            kind: cell(r, 1),
+            disabled: flag(r, 2),
+            default_database: r.get(3).cloned().flatten(),
+            server_roles: r.get(4).cloned().flatten(),
+        })
+        .collect();
+    let users: Vec<MsUserRow> = match database {
+        Some(_) => query_rows(&mut client, USER_LISTING)
+            .await?
+            .iter()
+            .map(|r| MsUserRow {
+                name: cell(r, 0),
+                kind: cell(r, 1),
+                login: r.get(2).cloned().flatten(),
+                authentication: r.get(3).cloned().flatten(),
+                default_schema: r.get(4).cloned().flatten(),
+                fixed_role: flag(r, 5),
+                member_of: r.get(6).cloned().flatten(),
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    let sees_all = query_rows(
+        &mut client,
+        "SELECT CAST(HAS_PERMS_BY_NAME(NULL, NULL, 'VIEW ANY DEFINITION') AS int)",
+    )
+    .await?
+    .first()
+    .is_some_and(|r| flag(r, 0));
+    let mut notes: Vec<String> = Vec::new();
+    if database.is_none() {
+        notes.push(
+            "Only the server's logins are listed: pick a database to see its users and roles."
+                .to_string(),
+        );
+    }
+    if !sees_all {
+        notes.push(
+            "This login lacks VIEW ANY DEFINITION, so the server shows it only the \
+             principals it may see — the list may be short."
+                .to_string(),
+        );
+    }
+    Ok(Principals {
+        list: from_mssql_rows(&logins, &users),
+        note: (!notes.is_empty()).then(|| notes.join(" ")),
+        password_policy: None,
+    })
+}
+
+/// A principal's permissions as `GRANT`/`DENY` sentences: a login's at the
+/// server, with its server roles; a database user's or role's in `database`,
+/// with its database roles — through `users::mssql_grant_statements`.
+pub(crate) async fn fetch_grants(
+    db: &Db,
+    database: Option<&str>,
+    principal: &schemaic_core::users::Principal,
+) -> Result<schemaic_core::users::Grants, DbError> {
+    use schemaic_core::users::{
+        Grants, MsPermRow, PrincipalKind, mssql_grant_statements, mssql_server_role_statements,
+    };
+    let text = |r: &Vec<Option<String>>, i: usize| r.get(i).cloned().flatten();
+    let first = |rows: Vec<Vec<Option<String>>>| -> Vec<String> {
+        rows.into_iter()
+            .filter_map(|r| r.into_iter().next().flatten())
+            .collect()
+    };
+    if principal.kind == PrincipalKind::Login {
+        let mut client = connect(db, None).await?;
+        let perms: Vec<MsPermRow> = named_rows(&mut client, SERVER_PERMISSIONS, &principal.name)
+            .await?
+            .iter()
+            .map(|r| MsPermRow {
+                state: text(r, 0).unwrap_or_default(),
+                permission: text(r, 1).unwrap_or_default(),
+                class: "SERVER".to_string(),
+                ..MsPermRow::default()
+            })
+            .collect();
+        let roles = first(named_rows(&mut client, SERVER_ROLES_OF, &principal.name).await?);
+        let mut statements = mssql_grant_statements(&principal.name, "", &perms, &[]);
+        statements.extend(mssql_server_role_statements(&principal.name, &roles));
+        return Ok(Grants {
+            statements,
+            note: None,
+        });
+    }
+    let Some(database) = database.filter(|d| !d.is_empty()) else {
+        return Ok(Grants {
+            statements: Vec::new(),
+            note: Some(
+                "A database user's permissions are that database's — pick one to see them."
+                    .to_string(),
+            ),
+        });
+    };
+    let mut client = connect(db, Some(database)).await?;
+    let perms: Vec<MsPermRow> = named_rows(&mut client, DATABASE_PERMISSIONS, &principal.name)
+        .await?
+        .iter()
+        .map(|r| MsPermRow {
+            state: text(r, 0).unwrap_or_default(),
+            permission: text(r, 1).unwrap_or_default(),
+            class: text(r, 2).unwrap_or_default(),
+            schema: text(r, 3),
+            object: text(r, 4),
+            column: text(r, 5),
+        })
+        .collect();
+    let roles = first(named_rows(&mut client, DATABASE_ROLES_OF, &principal.name).await?);
+    Ok(Grants {
+        statements: mssql_grant_statements(&principal.name, database, &perms, &roles),
+        note: None,
+    })
+}
+
 /// What running one write statement came to.
 #[derive(Debug)]
 enum Ran {

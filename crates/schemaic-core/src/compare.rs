@@ -4781,6 +4781,8 @@ mod tests {
             name: "reporter".to_string(),
             host: "%".to_string(),
             kind: crate::users::PrincipalKind::User,
+            login: String::new(),
+            also_user: false,
             password: "hunter2-in-the-clear".to_string(),
             scram_salt: None,
             password_policy: None,

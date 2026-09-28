@@ -32,7 +32,7 @@ use crate::scratch::{PREFIX, Scratch, assert_scratch_name};
 async fn connected_principal(target: &'static Target) -> Principal {
     let list = target
         .base_db()
-        .fetch_principals()
+        .fetch_principals(None)
         .await
         .unwrap_or_else(|e| panic!("fetch_principals on {}: {e}", target.endpoint()));
     let want = target.user();
@@ -354,6 +354,8 @@ impl ScratchAccount {
             name: name.clone(),
             host: host.to_string(),
             kind,
+            login: String::new(),
+            also_user: false,
             password: password.to_string(),
             scram_salt,
             password_policy,
@@ -588,7 +590,7 @@ pub async fn an_account_created_at_a_host_is_listed_and_dropped_at_it(target: &'
     account.drop_as(&listed).await;
     let still_there = target
         .base_db()
-        .fetch_principals()
+        .fetch_principals(None)
         .await
         .unwrap_or_else(|e| panic!("fetch_principals: {e}"))
         .list
@@ -608,7 +610,7 @@ pub async fn an_account_created_at_a_host_is_listed_and_dropped_at_it(target: &'
 async fn listed_principal(target: &'static Target, account: &ScratchAccount) -> Principal {
     let list = target
         .base_db()
-        .fetch_principals()
+        .fetch_principals(None)
         .await
         .unwrap_or_else(|e| panic!("fetch_principals: {e}"));
     list.list
@@ -866,7 +868,7 @@ pub async fn a_server_password_policy_decides_what_is_stored(target: &'static Ta
     }
     let principals = target
         .base_db()
-        .fetch_principals()
+        .fetch_principals(None)
         .await
         .unwrap_or_else(|e| panic!("{}: principals: {e}", target.endpoint()));
     let read = principals
@@ -1176,7 +1178,7 @@ pub async fn a_created_role_is_one_the_server_accepts(target: &'static Target) {
 
     let listed = target
         .base_db()
-        .fetch_principals()
+        .fetch_principals(None)
         .await
         .unwrap_or_else(|e| panic!("fetch_principals: {e}"))
         .list
@@ -1520,7 +1522,7 @@ pub async fn a_dropped_account_is_gone_from_the_list(target: &'static Target) {
 
     let list = target
         .base_db()
-        .fetch_principals()
+        .fetch_principals(None)
         .await
         .unwrap_or_else(|e| panic!("fetch_principals: {e}"));
     assert!(

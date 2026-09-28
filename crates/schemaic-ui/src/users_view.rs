@@ -511,6 +511,8 @@ fn account_row(
             match kind {
                 PrincipalKind::User => icons::USER,
                 PrincipalKind::Role => icons::USERS,
+                // SQL Server's login: the key the users below it sign in with.
+                PrincipalKind::Login => icons::KEY_ROUND,
             },
             13.0,
         )
@@ -1071,7 +1073,9 @@ fn actions_row(
                             read_only,
                         },
                         &who.display(),
-                        schemaic_core::ddl::Change::DropAccount(Box::new(who.clone())),
+                        vec![schemaic_core::ddl::Change::DropAccount(Box::new(
+                            who.clone(),
+                        ))],
                     );
                 }
             }),
@@ -1088,7 +1092,12 @@ fn actions_row(
     };
     // Built from an iterator rather than a tuple because the middle button is
     // absent on a role — see `reset`.
-    let buttons: Vec<AnyView> = [Some(grant.into_any()), reset, Some(drop.into_any())]
+    // **Privileges is absent on a SQL Server login**, as Reset password is on
+    // a role: a login holds no database privilege — its user does — so there
+    // is nothing for a dimmed button to promise (`users::supports_grant_to`).
+    let grant =
+        schemaic_core::users::supports_grant_to(target.dialect, p).then(|| grant.into_any());
+    let buttons: Vec<AnyView> = [grant, reset, Some(drop.into_any())]
         .into_iter()
         .flatten()
         .collect();

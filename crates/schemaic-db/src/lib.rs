@@ -1784,15 +1784,23 @@ impl Db {
     /// `match` below picks a *catalogue*, and a fourth engine added to [`Engine`]
     /// should stop here with one honest sentence rather than fall through to
     /// `mysql.user` and fail a lookup deep inside a driver.
-    pub async fn fetch_principals(&self) -> Result<users::Principals, DbError> {
+    ///
+    /// `database` is where SQL Server's database users are read from — its
+    /// logins are the server's, its users one database's — and is ignored by
+    /// the two engines whose accounts are server-wide.
+    pub async fn fetch_principals(
+        &self,
+        database: Option<&str>,
+    ) -> Result<users::Principals, DbError> {
         if !users::supports_users(self.engine.dialect()) {
             return Err(DbError::Query(NO_USERS_MSG.to_string()));
         }
         match self.engine {
             Engine::Postgres => pg::fetch_principals(self).await,
             Engine::MySql => mysql::fetch_principals(self).await,
+            Engine::MsSql => mssql::fetch_principals(self, database).await,
             // Unreachable — `supports_users` above is the gate.
-            Engine::Sqlite | Engine::MsSql => Err(DbError::Query(NO_USERS_MSG.to_string())),
+            Engine::Sqlite => Err(DbError::Query(NO_USERS_MSG.to_string())),
         }
     }
 
@@ -1817,8 +1825,11 @@ impl Db {
             // own doc says and what `mysql::fetch_grants` declines to take a
             // parameter for.
             Engine::MySql => mysql::fetch_grants(self, principal).await,
+            // A login's server permissions, or a database user's or role's in
+            // `database`.
+            Engine::MsSql => mssql::fetch_grants(self, database, principal).await,
             // Unreachable — `supports_users` above is the gate.
-            Engine::Sqlite | Engine::MsSql => Err(DbError::Query(NO_USERS_MSG.to_string())),
+            Engine::Sqlite => Err(DbError::Query(NO_USERS_MSG.to_string())),
         }
     }
 }

@@ -42,22 +42,22 @@ use crate::text_ops::contains_ignore_ascii_case;
 /// So a SQLite connection is told that in a sentence, rather than shown an empty
 /// list that would read as "a server with no users".
 ///
-/// **SQL Server answers no for now, and that one *is* unfinished work.** Its
-/// accounts are two catalogues — server logins (`sys.server_principals`) and
-/// the users mapped to them inside each database (`sys.database_principals`)
-/// — with permissions granted at the server, the database and the schema. The
-/// browser's one list of `(name, kind)` rows fits neither half, so it is not
-/// offered until it has a model of its own.
+/// **SQL Server's accounts are two catalogues**, and the browser lists both:
+/// server logins (`sys.server_principals`), which hold the password, as
+/// [`PrincipalKind::Login`] rows, and the current database's users
+/// (`sys.database_principals`), which database privileges and role
+/// memberships are granted to, as `User` rows carrying the login they map to
+/// ([`Principal::login`]). Its roles are the database's.
 pub fn supports_users(dialect: SqlDialect) -> bool {
     match dialect {
-        SqlDialect::MySql | SqlDialect::Postgres => true,
-        SqlDialect::Sqlite | SqlDialect::MsSql => false,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::MsSql => true,
+        SqlDialect::Sqlite => false,
     }
 }
 
 /// Can accounts be *created and dropped* from here, not just read?
 ///
-/// Exactly [`supports_users`] today — both server engines spell `CREATE USER`,
+/// Exactly [`supports_users`] today — every server engine here spells `CREATE USER`,
 /// `DROP USER`, `GRANT` and `REVOKE` — and *computed* from it rather than
 /// spelling out a second `!= Sqlite`, so a fourth engine that can list accounts
 /// it may not create is one edit away rather than a second predicate to find.
@@ -77,6 +77,11 @@ pub enum PrincipalKind {
     User,
     /// A bag of privileges that is granted to accounts rather than logged into.
     Role,
+    /// **SQL Server's server login** — the half of its account that holds the
+    /// password and signs in. The other half, the per-database `User` a login
+    /// is mapped to, is what database privileges and role memberships are
+    /// granted to (`Principal::login` is the link). No other engine has one.
+    Login,
 }
 
 impl PrincipalKind {
@@ -85,6 +90,23 @@ impl PrincipalKind {
         match self {
             PrincipalKind::User => "User",
             PrincipalKind::Role => "Role",
+            PrincipalKind::Login => "Login",
+        }
+    }
+}
+
+/// The kinds of account the *New account* form offers on `dialect`, in the
+/// order it shows them: SQL Server's login first, since a user is mapped to
+/// one; a user and a role on the two engines whose catalogues are one list.
+pub fn account_kinds(dialect: SqlDialect) -> &'static [PrincipalKind] {
+    match dialect {
+        SqlDialect::MsSql => &[
+            PrincipalKind::Login,
+            PrincipalKind::User,
+            PrincipalKind::Role,
+        ],
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => {
+            &[PrincipalKind::User, PrincipalKind::Role]
         }
     }
 }
@@ -133,15 +155,27 @@ pub struct Principal {
     /// gate was later composed on top of that label:
     /// [`supports_password_reset`] refuses here rather than guessing.
     pub role_ambiguous: bool,
+    /// **SQL Server**: the login a database user is mapped to
+    /// (`SUSER_SNAME(sid)`), which may be named differently — the link
+    /// between a `User` row and its `Login` row, and where the user's password
+    /// lives. `None` for a user with no login (`WITHOUT LOGIN`, or contained),
+    /// and on every other engine.
+    #[serde(default)]
+    pub login: Option<String>,
 }
 
 impl Principal {
     /// How the account is written for a person: `app@%` on MySQL/MariaDB, the
     /// bare role name on PostgreSQL. Not SQL — see [`account_sql`] for that.
     pub fn display(&self) -> String {
-        match &self.host {
-            Some(h) => format!("{}@{}", self.name, h),
-            None => self.name.clone(),
+        match (&self.host, self.login.as_deref()) {
+            (Some(h), _) => format!("{}@{}", self.name, h),
+            // A SQL Server user mapped to a login of another name says which,
+            // so the list shows the link and a search for the login finds it.
+            (None, Some(l)) if self.kind == PrincipalKind::User && l != self.name => {
+                format!("{} ← {l}", self.name)
+            }
+            (None, _) => self.name.clone(),
         }
     }
 }
@@ -371,7 +405,8 @@ pub fn from_mysql_rows(rows: &[MyUserRow]) -> Vec<Principal> {
                 // `readers@`.
                 host: match kind {
                     PrincipalKind::Role => None,
-                    PrincipalKind::User => Some(r.host.clone()),
+                    // `Login` is SQL Server's; a MySQL row is never one.
+                    PrincipalKind::User | PrincipalKind::Login => Some(r.host.clone()),
                 },
                 kind,
                 system: is_mysql_system_account(&r.user),
@@ -380,6 +415,7 @@ pub fn from_mysql_rows(rows: &[MyUserRow]) -> Vec<Principal> {
                 // flag settles both directions, so a MariaDB row that happens
                 // to carry MySQL's fingerprint is still not ambiguous.
                 role_ambiguous: r.is_role.is_none() && my_role_fingerprint(r),
+                login: None,
             }
         })
         .collect();
@@ -562,6 +598,7 @@ pub fn from_pg_rows(rows: &[PgRoleRow]) -> Vec<Principal> {
                 // same column `kind` is folded from, so there is nothing left
                 // over to be uncertain about.
                 role_ambiguous: false,
+                login: None,
             }
         })
         .collect();
@@ -1176,7 +1213,12 @@ impl GrantLevel {
                 // T-SQL names a securable by its class: `ON DATABASE::[d]`.
                 SqlDialect::MsSql => format!("DATABASE::{}", q(d)),
             },
-            GrantLevel::Schema(s) => format!("SCHEMA {}", q(s)),
+            GrantLevel::Schema(s) => match dialect {
+                SqlDialect::MsSql => format!("SCHEMA::{}", q(s)),
+                SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => {
+                    format!("SCHEMA {}", q(s))
+                }
+            },
             GrantLevel::Table { qualifier, name } => match dialect {
                 SqlDialect::MySql => format!("{}.{}", q(qualifier), q(name)),
                 SqlDialect::Postgres | SqlDialect::Sqlite => {
@@ -1206,12 +1248,17 @@ pub fn levels_for(dialect: SqlDialect) -> &'static [GrantLevelKind] {
             GrantLevelKind::Table,
             GrantLevelKind::Sequence,
         ],
+        // A database user's three securables below the server. The server's own
+        // (`GRANT VIEW SERVER STATE TO login`) is a login's, and not offered yet.
+        SqlDialect::MsSql => &[
+            GrantLevelKind::Database,
+            GrantLevelKind::Schema,
+            GrantLevelKind::Table,
+        ],
         // Unreachable through the UI — `supports_user_admin` is the gate — and an
         // empty list rather than a panic, so a caller that skipped the gate gets
-        // a picker with nothing in it instead of a crash. SQL Server's levels
-        // (server, database, schema, object) wait on its account model; see
-        // `supports_users`.
-        SqlDialect::Sqlite | SqlDialect::MsSql => &[],
+        // a picker with nothing in it instead of a crash.
+        SqlDialect::Sqlite => &[],
     }
 }
 
@@ -1292,6 +1339,47 @@ pub fn privileges_for(dialect: SqlDialect, level: GrantLevelKind) -> &'static [&
         (SqlDialect::Postgres, GrantLevelKind::Schema) => PgObjectKind::Schema.all_privileges(),
         (SqlDialect::Postgres, GrantLevelKind::Table) => PgObjectKind::Table.all_privileges(),
         (SqlDialect::Postgres, GrantLevelKind::Sequence) => PgObjectKind::Sequence.all_privileges(),
+        // The permissions a database user is granted on each securable — the
+        // everyday ones, not T-SQL's whole list of ~40 (`ALTER ANY …`,
+        // `IMPERSONATE`, `TAKE OWNERSHIP`), which stay a statement away.
+        (SqlDialect::MsSql, GrantLevelKind::Database) => &[
+            "SELECT",
+            "INSERT",
+            "UPDATE",
+            "DELETE",
+            "EXECUTE",
+            "REFERENCES",
+            "VIEW DEFINITION",
+            "SHOWPLAN",
+            "CREATE TABLE",
+            "CREATE VIEW",
+            "CREATE PROCEDURE",
+            "CREATE FUNCTION",
+            "CREATE SCHEMA",
+            "ALTER",
+            "CONTROL",
+        ],
+        (SqlDialect::MsSql, GrantLevelKind::Schema) => &[
+            "SELECT",
+            "INSERT",
+            "UPDATE",
+            "DELETE",
+            "EXECUTE",
+            "REFERENCES",
+            "VIEW DEFINITION",
+            "ALTER",
+            "CONTROL",
+        ],
+        (SqlDialect::MsSql, GrantLevelKind::Table) => &[
+            "SELECT",
+            "INSERT",
+            "UPDATE",
+            "DELETE",
+            "REFERENCES",
+            "VIEW DEFINITION",
+            "ALTER",
+            "CONTROL",
+        ],
         // A level the engine does not have — `levels_for` never offers it, and an
         // empty list is what a form built from one should show.
         _ => &[],
@@ -1462,6 +1550,7 @@ impl GrantDraft {
                 attributes: Vec::new(),
                 // A role the user typed, not a row read back from a catalogue.
                 role_ambiguous: false,
+                login: None,
             },
             member: account.clone(),
             with_admin_option: self.with_admin_option,
@@ -1510,6 +1599,15 @@ pub struct RoleChange {
 pub fn role_sql(c: &RoleChange, dialect: SqlDialect, revoke: bool) -> String {
     let role = account_sql(&c.role, dialect);
     let member = account_sql(&c.member, dialect);
+    // T-SQL's membership is a statement about the role, not a grant of it —
+    // and has no admin option (`supports_role_admin_option`).
+    match dialect {
+        SqlDialect::MsSql => {
+            let verb = if revoke { "DROP" } else { "ADD" };
+            return format!("ALTER ROLE {role} {verb} MEMBER {member}");
+        }
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => {}
+    }
     if revoke {
         format!("REVOKE {role} FROM {member}")
     } else {
@@ -1529,6 +1627,14 @@ pub struct AccountDraft {
     /// what MySQL itself defaults an unqualified `CREATE USER` to.
     pub host: String,
     pub kind: PrincipalKind,
+    /// **SQL Server**: the login a new database user is `FOR`, or empty for
+    /// one `WITHOUT LOGIN`. Unused elsewhere.
+    pub login: String,
+    /// **SQL Server**: a new login also gets a user of its own name in the
+    /// browser's database, in the same plan ([`companion_user_draft`]) — what
+    /// "give this person access to this database" takes there. Unused
+    /// elsewhere.
+    pub also_user: bool,
     /// **Held in memory only, and never written anywhere but the statement.**
     /// Not persisted, not logged, and not carried into the browser's state — the
     /// draft is dropped as soon as the plan is built. See
@@ -1568,6 +1674,7 @@ impl AccountDraft {
             attributes: Vec::new(),
             // The draft says which of the two it is; nothing was inferred.
             role_ambiguous: false,
+            login: Some(self.login.trim().to_string()).filter(|l| !l.is_empty()),
         }
     }
 }
@@ -1600,7 +1707,13 @@ pub fn account_form_blocker(
     if !resetting && draft.name.trim().is_empty() {
         return Some("A name is required.");
     }
-    if draft.kind == PrincipalKind::User && draft.password != confirm {
+    // A SQL Server login is a SQL login by its password; there is no
+    // passwordless one to make here.
+    if draft.kind == PrincipalKind::Login && draft.password.is_empty() {
+        return Some("A login needs a password.");
+    }
+    if matches!(draft.kind, PrincipalKind::User | PrincipalKind::Login) && draft.password != confirm
+    {
         return Some(if confirm.is_empty() {
             "Type the password again to confirm it."
         } else {
@@ -1631,10 +1744,15 @@ pub fn account_draft_sql(d: &AccountDraft, dialect: SqlDialect) -> Option<String
     if d.name.trim().is_empty() {
         return None;
     }
+    match dialect {
+        SqlDialect::MsSql => return Some(tsql_account_draft_sql(d)),
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => {}
+    }
     let who = account_sql(&d.principal(dialect), dialect);
     let keyword = match d.kind {
         PrincipalKind::User => "CREATE USER",
         PrincipalKind::Role => "CREATE ROLE",
+        PrincipalKind::Login => "CREATE LOGIN",
     };
     let mut sql = format!("{keyword} {who}");
     if !d.password.is_empty() {
@@ -1648,8 +1766,8 @@ pub fn account_draft_sql(d: &AccountDraft, dialect: SqlDialect) -> Option<String
                     // password clause is a bare `PASSWORD`.
                     SqlDialect::Postgres | SqlDialect::Sqlite => "PASSWORD",
                     SqlDialect::MySql => "IDENTIFIED BY",
-                    // A contained database user; unreachable until SQL
-                    // Server's accounts are offered (`supports_users`).
+                    // Unreachable: SQL Server returned above, through
+                    // `tsql_account_draft_sql`, whose statements are its own.
                     SqlDialect::MsSql => "WITH PASSWORD =",
                 },
                 password_literal(
@@ -1862,7 +1980,19 @@ fn password_literal(
 /// classify the row, the way [`crate::intel`]'s column resolution refuses an
 /// unresolved name rather than guessing at one.
 pub fn supports_password_reset(dialect: SqlDialect, p: &Principal) -> bool {
-    supports_users(dialect) && p.kind == PrincipalKind::User && !p.role_ambiguous
+    if !supports_users(dialect) {
+        return false;
+    }
+    match dialect {
+        // The password is the login's: a login row, or a user row through the
+        // login it maps to. A user with no login and a role have none.
+        SqlDialect::MsSql => {
+            p.kind == PrincipalKind::Login || (p.kind == PrincipalKind::User && p.login.is_some())
+        }
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => {
+            p.kind == PrincipalKind::User && !p.role_ambiguous
+        }
+    }
 }
 
 /// `ALTER USER … IDENTIFIED BY` / `ALTER ROLE … PASSWORD`, or `None` where the
@@ -1892,7 +2022,13 @@ pub fn set_password_sql(r: &PasswordReset, dialect: SqlDialect) -> Option<String
     {
         return None;
     }
-    let who = account_sql(&r.account, dialect);
+    // On SQL Server a user row's password is its login's.
+    let who = match (dialect, r.account.kind, r.account.login.as_deref()) {
+        (SqlDialect::MsSql, PrincipalKind::User, Some(login)) => {
+            crate::export::ident_sql(login, dialect)
+        }
+        _ => account_sql(&r.account, dialect),
+    };
     let (verb, clause) = match dialect {
         SqlDialect::MySql => ("ALTER USER", "IDENTIFIED BY"),
         SqlDialect::Postgres | SqlDialect::Sqlite => ("ALTER ROLE", "PASSWORD"),
@@ -1915,8 +2051,273 @@ pub fn drop_account_sql(p: &Principal, dialect: SqlDialect) -> String {
     let keyword = match p.kind {
         PrincipalKind::User => "DROP USER",
         PrincipalKind::Role => "DROP ROLE",
+        PrincipalKind::Login => "DROP LOGIN",
     };
     format!("{keyword} {}", account_sql(p, dialect))
+}
+
+/// SQL Server's `CREATE` for each kind: a **login** `WITH PASSWORD`, which is
+/// what makes it a SQL login; a database **user** `FOR LOGIN` the login it
+/// maps to, or `WITHOUT LOGIN` when there is none; a database **role**. The
+/// password travels as typed, as MySQL's does, since the hashed form (`0x…
+/// HASHED`) skips the server's password policy.
+fn tsql_account_draft_sql(d: &AccountDraft) -> String {
+    let dialect = SqlDialect::MsSql;
+    let q = |n: &str| crate::export::ident_sql(n.trim(), dialect);
+    let name = q(&d.name);
+    match d.kind {
+        PrincipalKind::Login => format!(
+            "CREATE LOGIN {name} WITH PASSWORD = {}",
+            crate::schema::ddl_string(&d.password, dialect)
+        ),
+        PrincipalKind::User if d.login.trim().is_empty() => {
+            format!("CREATE USER {name} WITHOUT LOGIN")
+        }
+        PrincipalKind::User => format!("CREATE USER {name} FOR LOGIN {}", q(&d.login)),
+        PrincipalKind::Role => format!("CREATE ROLE {name}"),
+    }
+}
+
+/// Does an account of `kind` carry a password on `dialect` — the one the
+/// form's password row appears for? A user on MySQL and PostgreSQL; on SQL
+/// Server the **login**, whose password its users sign in with.
+pub fn takes_password(dialect: SqlDialect, kind: PrincipalKind) -> bool {
+    match dialect {
+        SqlDialect::MsSql => kind == PrincipalKind::Login,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => {
+            kind == PrincipalKind::User
+        }
+    }
+}
+
+/// The draft the *New account* form opens on: the engine's first kind
+/// ([`account_kinds`]), and on SQL Server a login that brings its user
+/// ([`AccountDraft::also_user`]) — what giving someone access to a database
+/// takes there. Blank otherwise, password included, every time.
+pub fn blank_account_draft(dialect: SqlDialect) -> AccountDraft {
+    let kind = account_kinds(dialect).first().copied().unwrap_or_default();
+    AccountDraft {
+        kind,
+        also_user: kind == PrincipalKind::Login,
+        ..AccountDraft::default()
+    }
+}
+
+/// The user a new SQL Server login brings with it when the form asks
+/// ([`AccountDraft::also_user`]): of the same name, `FOR` that login, with no
+/// password of its own. `None` for anything else.
+pub fn companion_user_draft(d: &AccountDraft, dialect: SqlDialect) -> Option<AccountDraft> {
+    let wanted = match dialect {
+        SqlDialect::MsSql => d.kind == PrincipalKind::Login && d.also_user,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+    };
+    (wanted && !d.name.trim().is_empty()).then(|| AccountDraft {
+        name: d.name.trim().to_string(),
+        kind: PrincipalKind::User,
+        login: d.name.trim().to_string(),
+        ..AccountDraft::default()
+    })
+}
+
+/// Can database privileges and role memberships be granted to `p` here?
+/// Everywhere but to a **SQL Server login**, whose database access is the user
+/// mapped to it — `GRANT SELECT … TO login` is Msg 15151 there, since the
+/// login is not a principal of the database at all.
+pub fn supports_grant_to(dialect: SqlDialect, p: &Principal) -> bool {
+    match dialect {
+        SqlDialect::MsSql => p.kind != PrincipalKind::Login,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => true,
+    }
+}
+
+/// Does a role grant have an admin option (`WITH ADMIN OPTION`)? Not on SQL
+/// Server, whose membership is `ALTER ROLE … ADD MEMBER` and nothing more.
+pub fn supports_role_admin_option(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => true,
+        SqlDialect::MsSql => false,
+    }
+}
+
+/// One `sys.server_principals` row of type `S` (SQL login), `U` (Windows
+/// login) or `G` (Windows group), with its server roles joined.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MsLoginRow {
+    pub name: String,
+    pub kind: String,
+    pub disabled: bool,
+    pub default_database: Option<String>,
+    pub server_roles: Option<String>,
+}
+
+/// One `sys.database_principals` row of the current database — a user
+/// (`S`, `U`, `G`, `E`, `X`) or a role (`R`) — with its login
+/// (`SUSER_SNAME(sid)`) and its role memberships joined.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MsUserRow {
+    pub name: String,
+    pub kind: String,
+    pub login: Option<String>,
+    pub authentication: Option<String>,
+    pub default_schema: Option<String>,
+    pub fixed_role: bool,
+    pub member_of: Option<String>,
+}
+
+/// One `sys.database_permissions` (or `sys.server_permissions`) row for a
+/// grantee: its `state` (`G`, `W` for with-grant-option, `D` for deny), the
+/// permission, the securable's `class_desc`, and the names that locate it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MsPermRow {
+    pub state: String,
+    pub permission: String,
+    pub class: String,
+    pub schema: Option<String>,
+    pub object: Option<String>,
+    pub column: Option<String>,
+}
+
+/// The server's own logins — `NT AUTHORITY\…`, `NT SERVICE\…` — and the
+/// database's own users and roles, kept but marked system, as every engine's
+/// are.
+fn is_mssql_system_login(name: &str) -> bool {
+    let n = name.to_ascii_uppercase();
+    n.starts_with("NT AUTHORITY\\") || n.starts_with("NT SERVICE\\") || n.starts_with("##")
+}
+
+fn is_mssql_system_user(r: &MsUserRow) -> bool {
+    r.fixed_role
+        || ["dbo", "guest", "INFORMATION_SCHEMA", "sys", "public"]
+            .iter()
+            .any(|s| r.name.eq_ignore_ascii_case(s))
+}
+
+/// SQL Server's two catalogues folded into the browser's one list: every
+/// login as a [`PrincipalKind::Login`] row, then the current database's users
+/// and roles, each user carrying the login it maps to in [`Principal::login`]
+/// and as an attribute — the link the browser shows.
+pub fn from_mssql_rows(logins: &[MsLoginRow], users: &[MsUserRow]) -> Vec<Principal> {
+    let blank = |p: &str| Principal {
+        name: p.to_string(),
+        host: None,
+        kind: PrincipalKind::Login,
+        system: false,
+        attributes: Vec::new(),
+        role_ambiguous: false,
+        login: None,
+    };
+    let mut out: Vec<Principal> = Vec::new();
+    for l in logins {
+        let mut p = blank(&l.name);
+        p.system = is_mssql_system_login(&l.name);
+        let kind = match l.kind.trim() {
+            "S" => "SQL login",
+            "U" => "Windows login",
+            "G" => "Windows group",
+            other => other,
+        };
+        p.attributes.push(("Type".into(), kind.to_string()));
+        if l.disabled {
+            p.attributes
+                .push(("Disabled".into(), yes_no(true).to_string()));
+        }
+        if let Some(db) = l.default_database.as_deref().filter(|s| !s.is_empty()) {
+            p.attributes
+                .push(("Default database".into(), db.to_string()));
+        }
+        if let Some(roles) = l.server_roles.as_deref().filter(|s| !s.is_empty()) {
+            p.attributes
+                .push(("Server roles".into(), roles.to_string()));
+        }
+        out.push(p);
+    }
+    for u in users {
+        let mut p = blank(&u.name);
+        p.kind = if u.kind.trim() == "R" {
+            PrincipalKind::Role
+        } else {
+            PrincipalKind::User
+        };
+        p.system = is_mssql_system_user(u);
+        p.login = u.login.clone().filter(|l| !l.is_empty());
+        if let Some(l) = &p.login {
+            p.attributes.push(("Login".into(), l.clone()));
+        }
+        if let Some(a) = u.authentication.as_deref().filter(|s| !s.is_empty()) {
+            p.attributes.push(("Authentication".into(), a.to_string()));
+        }
+        if let Some(s) = u.default_schema.as_deref().filter(|s| !s.is_empty()) {
+            p.attributes.push(("Default schema".into(), s.to_string()));
+        }
+        if let Some(m) = u.member_of.as_deref().filter(|s| !s.is_empty()) {
+            p.attributes.push(("Member of".into(), m.to_string()));
+        }
+        out.push(p);
+    }
+    sort_principals(&mut out);
+    out
+}
+
+/// A SQL Server principal's permissions as the sentences that recreate them,
+/// in catalogue order, each terminated: `GRANT`, `GRANT … WITH GRANT OPTION`
+/// (state `W`) and **`DENY`** (state `D`), which neither other engine has and
+/// which wins over any grant — then its role memberships as `ALTER ROLE …
+/// ADD MEMBER`. The securable is named by its class (`DATABASE::`,
+/// `SCHEMA::`, `OBJECT::`, a column list for a column's), as the grant
+/// editor writes it; a server-level permission (class `SERVER`, a login's)
+/// has no `ON`. A class this does not know is left out rather than guessed.
+pub fn mssql_grant_statements(
+    grantee: &str,
+    database: &str,
+    rows: &[MsPermRow],
+    member_of: &[String],
+) -> Vec<String> {
+    let d = SqlDialect::MsSql;
+    let q = |n: &str| crate::export::ident_sql(n, d);
+    let who = q(grantee);
+    let mut out = Vec::new();
+    for r in rows {
+        let on = match (r.class.as_str(), r.schema.as_deref(), r.object.as_deref()) {
+            ("DATABASE", _, _) => format!(" ON DATABASE::{}", q(database)),
+            ("SCHEMA", Some(s), _) => format!(" ON SCHEMA::{}", q(s)),
+            ("OBJECT_OR_COLUMN", Some(s), Some(o)) => {
+                let cols = r
+                    .column
+                    .as_deref()
+                    .map(|c| format!(" ({})", q(c)))
+                    .unwrap_or_default();
+                format!(" ON OBJECT::{}.{}{cols}", q(s), q(o))
+            }
+            ("SERVER", _, _) => String::new(),
+            _ => continue,
+        };
+        let (verb, tail) = match r.state.trim() {
+            "D" => ("DENY", ""),
+            "W" => ("GRANT", " WITH GRANT OPTION"),
+            "G" => ("GRANT", ""),
+            _ => continue,
+        };
+        out.push(format!(
+            "{verb} {}{on} TO {who}{tail};",
+            r.permission.trim()
+        ));
+    }
+    out.extend(
+        member_of
+            .iter()
+            .map(|role| format!("ALTER ROLE {} ADD MEMBER {who};", q(role))),
+    );
+    out
+}
+
+/// A login's server roles as `ALTER SERVER ROLE … ADD MEMBER` — the server's
+/// counterpart of [`mssql_grant_statements`]' database roles.
+pub fn mssql_server_role_statements(login: &str, roles: &[String]) -> Vec<String> {
+    let q = |n: &str| crate::export::ident_sql(n, SqlDialect::MsSql);
+    roles
+        .iter()
+        .map(|r| format!("ALTER SERVER ROLE {} ADD MEMBER {};", q(r), q(login)))
+        .collect()
 }
 
 #[cfg(test)]
@@ -1938,11 +2339,17 @@ mod tests {
         assert!(!supports_users(SqlDialect::Sqlite));
         assert!(supports_users(SqlDialect::MySql));
         assert!(supports_users(SqlDialect::Postgres));
+        assert!(supports_users(SqlDialect::MsSql));
     }
 
     #[test]
     fn admin_is_computed_from_browsing_rather_than_restated() {
-        for d in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite] {
+        for d in [
+            SqlDialect::MySql,
+            SqlDialect::Postgres,
+            SqlDialect::Sqlite,
+            SqlDialect::MsSql,
+        ] {
             assert_eq!(supports_user_admin(d), supports_users(d), "{d:?}");
         }
     }
@@ -3826,6 +4233,468 @@ mod tests {
         assert_eq!(
             drop_account_sql(&role, SqlDialect::Postgres),
             "DROP ROLE \"readers\""
+        );
+    }
+}
+
+/// SQL Server's accounts: a server **login** and the **database users** mapped
+/// to it, listed as two kinds of row and linked by the user's `login`.
+#[cfg(test)]
+mod mssql_tests {
+    use super::*;
+    const MS: SqlDialect = SqlDialect::MsSql;
+
+    fn login(name: &str) -> Principal {
+        Principal {
+            name: name.into(),
+            host: None,
+            kind: PrincipalKind::Login,
+            system: false,
+            attributes: Vec::new(),
+            role_ambiguous: false,
+            login: None,
+        }
+    }
+
+    fn user(name: &str, of: Option<&str>) -> Principal {
+        Principal {
+            kind: PrincipalKind::User,
+            login: of.map(str::to_string),
+            ..login(name)
+        }
+    }
+
+    #[test]
+    fn sql_server_has_accounts_at_three_levels() {
+        assert!(supports_users(MS) && supports_user_admin(MS));
+        assert_eq!(
+            levels_for(MS),
+            [
+                GrantLevelKind::Database,
+                GrantLevelKind::Schema,
+                GrantLevelKind::Table
+            ]
+        );
+        assert_eq!(default_grant_level(MS), Some(GrantLevelKind::Database));
+        for k in levels_for(MS) {
+            let privs = privileges_for(MS, *k);
+            assert!(
+                privs.contains(&"SELECT") && privs.contains(&"CONTROL"),
+                "{k:?}"
+            );
+        }
+        assert_eq!(
+            account_kinds(MS),
+            [
+                PrincipalKind::Login,
+                PrincipalKind::User,
+                PrincipalKind::Role
+            ]
+        );
+        assert_eq!(
+            account_kinds(SqlDialect::MySql),
+            [PrincipalKind::User, PrincipalKind::Role]
+        );
+    }
+
+    /// A login holds the password; a user is `FOR LOGIN` one, or `WITHOUT
+    /// LOGIN`; a role is a database role. Each dropped by its own verb.
+    #[test]
+    fn each_kind_is_created_and_dropped_by_its_own_statement() {
+        let draft = |kind, name: &str, login: &str, password: &str| AccountDraft {
+            name: name.into(),
+            kind,
+            login: login.into(),
+            password: password.into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            account_draft_sql(&draft(PrincipalKind::Login, "app", "", "it's"), MS).as_deref(),
+            Some("CREATE LOGIN [app] WITH PASSWORD = N'it''s'")
+        );
+        assert_eq!(
+            account_draft_sql(&draft(PrincipalKind::User, "app_u", "app", ""), MS).as_deref(),
+            Some("CREATE USER [app_u] FOR LOGIN [app]")
+        );
+        assert_eq!(
+            account_draft_sql(&draft(PrincipalKind::User, "svc", "", ""), MS).as_deref(),
+            Some("CREATE USER [svc] WITHOUT LOGIN")
+        );
+        assert_eq!(
+            account_draft_sql(&draft(PrincipalKind::Role, "readers", "", ""), MS).as_deref(),
+            Some("CREATE ROLE [readers]")
+        );
+        assert_eq!(drop_account_sql(&login("app"), MS), "DROP LOGIN [app]");
+        assert_eq!(
+            drop_account_sql(&user("app_u", Some("app")), MS),
+            "DROP USER [app_u]"
+        );
+        // A login needs a password to be a SQL login at all, and both halves
+        // of the confirm must agree.
+        let l = draft(PrincipalKind::Login, "app", "", "");
+        assert!(account_form_blocker(&l, "", false).is_some());
+        let l = draft(PrincipalKind::Login, "app", "", "pw");
+        assert!(account_form_blocker(&l, "pw", false).is_none());
+        assert!(account_form_blocker(&l, "px", false).is_some());
+        let u = draft(PrincipalKind::User, "u", "app", "");
+        assert!(
+            account_form_blocker(&u, "", false).is_none(),
+            "a user has no password here"
+        );
+    }
+
+    /// Which kind carries a password — SQL Server's login, every other
+    /// engine's user — and the user a new login may bring with it, `FOR` it
+    /// under its own name, in the same plan.
+    #[test]
+    fn a_new_login_may_bring_its_user_and_only_it_takes_the_password() {
+        assert!(takes_password(MS, PrincipalKind::Login));
+        assert!(!takes_password(MS, PrincipalKind::User));
+        assert!(takes_password(SqlDialect::MySql, PrincipalKind::User));
+        assert!(!takes_password(SqlDialect::Postgres, PrincipalKind::Role));
+        let mut d = AccountDraft {
+            name: "app".into(),
+            kind: PrincipalKind::Login,
+            password: "pw".into(),
+            also_user: true,
+            ..Default::default()
+        };
+        let u = companion_user_draft(&d, MS).expect("a user for it");
+        assert_eq!(
+            account_draft_sql(&u, MS).as_deref(),
+            Some("CREATE USER [app] FOR LOGIN [app]")
+        );
+        assert!(u.password.is_empty(), "the password stays the login's");
+        d.also_user = false;
+        assert!(companion_user_draft(&d, MS).is_none());
+        d.also_user = true;
+        assert!(companion_user_draft(&d, SqlDialect::MySql).is_none());
+        d.kind = PrincipalKind::User;
+        assert!(companion_user_draft(&d, MS).is_none());
+    }
+
+    /// The form opens on the first kind the engine offers — SQL Server's
+    /// login, bringing its user, since that is what giving someone access to a
+    /// database takes there — and on a user elsewhere, as before.
+    #[test]
+    fn the_new_account_form_opens_on_the_engines_first_kind() {
+        let d = blank_account_draft(MS);
+        assert_eq!((d.kind, d.also_user), (PrincipalKind::Login, true));
+        for other in [SqlDialect::MySql, SqlDialect::Postgres] {
+            assert_eq!(
+                blank_account_draft(other),
+                AccountDraft::default(),
+                "{other:?}"
+            );
+        }
+    }
+
+    /// **The password is the login's**, so a reset on a user row goes to the
+    /// login it maps to; a user with no login, or a role, has none to reset.
+    #[test]
+    fn a_password_reset_goes_to_the_login() {
+        let reset = |p: Principal| PasswordReset {
+            account: p,
+            password: "n3w".into(),
+            scram_salt: None,
+            password_policy: None,
+        };
+        assert_eq!(
+            set_password_sql(&reset(login("app")), MS).as_deref(),
+            Some("ALTER LOGIN [app] WITH PASSWORD = N'n3w'")
+        );
+        assert_eq!(
+            set_password_sql(&reset(user("app_u", Some("app"))), MS).as_deref(),
+            Some("ALTER LOGIN [app] WITH PASSWORD = N'n3w'")
+        );
+        assert!(!supports_password_reset(MS, &user("svc", None)));
+        let role = Principal {
+            kind: PrincipalKind::Role,
+            ..login("readers")
+        };
+        assert!(!supports_password_reset(MS, &role));
+    }
+
+    /// Grants name a securable by its class, and go to a database user or
+    /// role — a login holds no database privilege to grant.
+    #[test]
+    fn grants_and_roles_are_spelled_as_t_sql_spells_them() {
+        let c = |account: Principal, level: GrantLevel| PrivilegeChange {
+            account,
+            level,
+            privileges: vec!["SELECT".into(), "INSERT".into()],
+            with_grant_option: true,
+        };
+        let u = user("app_u", Some("app"));
+        assert_eq!(
+            privilege_sql(&c(u.clone(), GrantLevel::Schema("sales".into())), MS, false).as_deref(),
+            Some("GRANT SELECT, INSERT ON SCHEMA::[sales] TO [app_u] WITH GRANT OPTION")
+        );
+        assert_eq!(
+            privilege_sql(
+                &c(
+                    u.clone(),
+                    GrantLevel::Table {
+                        qualifier: "dbo".into(),
+                        name: "t".into()
+                    }
+                ),
+                MS,
+                true
+            )
+            .as_deref(),
+            Some("REVOKE SELECT, INSERT ON OBJECT::[dbo].[t] FROM [app_u]")
+        );
+        assert_eq!(
+            privilege_sql(
+                &c(u.clone(), GrantLevel::Database("shop".into())),
+                MS,
+                false
+            )
+            .as_deref(),
+            Some("GRANT SELECT, INSERT ON DATABASE::[shop] TO [app_u] WITH GRANT OPTION")
+        );
+        assert!(supports_grant_to(MS, &u));
+        assert!(!supports_grant_to(MS, &login("app")));
+        assert!(supports_grant_to(SqlDialect::MySql, &user("x", None)));
+        let r = RoleChange {
+            role: Principal {
+                kind: PrincipalKind::Role,
+                ..login("db_datareader")
+            },
+            member: u,
+            with_admin_option: false,
+        };
+        assert_eq!(
+            role_sql(&r, MS, false),
+            "ALTER ROLE [db_datareader] ADD MEMBER [app_u]"
+        );
+        assert_eq!(
+            role_sql(&r, MS, true),
+            "ALTER ROLE [db_datareader] DROP MEMBER [app_u]"
+        );
+        assert!(!supports_role_admin_option(MS));
+        assert!(supports_role_admin_option(SqlDialect::Postgres));
+    }
+
+    /// The two catalogues folded into one list: every login, then the
+    /// database's users and roles, each user carrying the login it maps to;
+    /// the server's own principals kept but marked system.
+    #[test]
+    fn logins_and_users_fold_into_one_linked_list() {
+        let logins = vec![
+            MsLoginRow {
+                name: "app".into(),
+                kind: "S".into(),
+                disabled: false,
+                default_database: Some("shop".into()),
+                server_roles: Some("dbcreator".into()),
+            },
+            MsLoginRow {
+                name: "NT AUTHORITY\\SYSTEM".into(),
+                kind: "U".into(),
+                disabled: false,
+                default_database: Some("master".into()),
+                server_roles: None,
+            },
+        ];
+        let users = vec![
+            MsUserRow {
+                name: "app_u".into(),
+                kind: "S".into(),
+                login: Some("app".into()),
+                authentication: Some("INSTANCE".into()),
+                default_schema: Some("dbo".into()),
+                fixed_role: false,
+                member_of: Some("db_datareader".into()),
+            },
+            MsUserRow {
+                name: "db_datareader".into(),
+                kind: "R".into(),
+                login: None,
+                authentication: None,
+                default_schema: None,
+                fixed_role: true,
+                member_of: None,
+            },
+            MsUserRow {
+                name: "dbo".into(),
+                kind: "S".into(),
+                login: Some("sa".into()),
+                authentication: Some("INSTANCE".into()),
+                default_schema: Some("dbo".into()),
+                fixed_role: false,
+                member_of: None,
+            },
+        ];
+        let list = from_mssql_rows(&logins, &users);
+        let find = |n: &str, k| list.iter().find(|p| p.name == n && p.kind == k).expect(n);
+        let l = find("app", PrincipalKind::Login);
+        assert!(!l.system);
+        assert!(
+            l.attributes
+                .contains(&("Server roles".into(), "dbcreator".into())),
+            "{:?}",
+            l.attributes
+        );
+        assert!(find("NT AUTHORITY\\SYSTEM", PrincipalKind::Login).system);
+        let u = find("app_u", PrincipalKind::User);
+        assert_eq!(u.login.as_deref(), Some("app"));
+        assert_eq!(u.display(), "app_u ← app");
+        assert!(
+            matches(u, "app ") || matches(u, "← app"),
+            "a search for the login finds it"
+        );
+        assert_eq!(find("app", PrincipalKind::Login).display(), "app");
+        assert!(u.attributes.contains(&("Login".into(), "app".into())));
+        assert!(
+            u.attributes
+                .contains(&("Member of".into(), "db_datareader".into()))
+        );
+        assert!(
+            find("db_datareader", PrincipalKind::Role).system,
+            "a fixed role"
+        );
+        assert!(find("dbo", PrincipalKind::User).system);
+        // The server's own sorted last, as on every engine.
+        assert!(!list.last().unwrap().name.is_empty() && list.last().unwrap().system);
+    }
+
+    /// Through the plan: each account change is a terminated statement of its
+    /// own, and what SQL Server cannot be asked — a database grant to a login,
+    /// a role with an admin option — is refused by `supports_change`, so the
+    /// preview says INCOMPLETE rather than emitting what the server refuses.
+    #[test]
+    fn a_sql_server_account_plan_emits_and_refuses_as_the_engine_does() {
+        use crate::ddl::{Change, account, supports_change};
+        let create = account(
+            "app",
+            MS,
+            Change::CreateAccount(Box::new(AccountDraft {
+                name: "app".into(),
+                kind: PrincipalKind::Login,
+                password: "pw".into(),
+                ..Default::default()
+            })),
+        );
+        assert_eq!(create.emit(), ["CREATE LOGIN [app] WITH PASSWORD = N'pw';"]);
+        let grant = |to: Principal| {
+            Change::GrantPrivileges(Box::new(PrivilegeChange {
+                account: to,
+                level: GrantLevel::Schema("dbo".into()),
+                privileges: vec!["SELECT".into()],
+                with_grant_option: false,
+            }))
+        };
+        assert!(supports_change(MS, &grant(user("app_u", Some("app")))));
+        assert!(!supports_change(MS, &grant(login("app"))));
+        let role = |admin| {
+            Change::GrantRole(Box::new(RoleChange {
+                role: Principal {
+                    kind: PrincipalKind::Role,
+                    ..login("db_datareader")
+                },
+                member: user("app_u", Some("app")),
+                with_admin_option: admin,
+            }))
+        };
+        assert!(supports_change(MS, &role(false)));
+        assert!(!supports_change(MS, &role(true)));
+        assert_eq!(
+            account("app_u", MS, role(false)).emit(),
+            ["ALTER ROLE [db_datareader] ADD MEMBER [app_u];"]
+        );
+    }
+
+    /// **A grant is stated on something the plan may create**, so SQL
+    /// Server's account statements come last, as every engine's do — a view
+    /// created and granted on in one plan is created first.
+    #[test]
+    fn a_sql_server_grant_follows_what_the_plan_creates() {
+        use crate::ddl::{Change, ChangeSet, ViewDraft};
+        let cs = ChangeSet {
+            table: "v".into(),
+            schema: Some("dbo".into()),
+            dialect: MS,
+            flavour: crate::schema::ServerFlavour::Unknown,
+            changes: vec![
+                Change::GrantPrivileges(Box::new(PrivilegeChange {
+                    account: user("app_u", Some("app")),
+                    level: GrantLevel::Table {
+                        qualifier: "dbo".into(),
+                        name: "v".into(),
+                    },
+                    privileges: vec!["SELECT".into()],
+                    with_grant_option: false,
+                })),
+                Change::CreateView(Box::new(ViewDraft {
+                    name: "v".into(),
+                    schema: Some("dbo".into()),
+                    select: "SELECT 1 AS a".into(),
+                    ..Default::default()
+                })),
+            ],
+        };
+        let sql = cs.emit();
+        let view = sql
+            .iter()
+            .position(|s| s.contains("VIEW"))
+            .expect("the view");
+        let grant = sql
+            .iter()
+            .position(|s| s.starts_with("GRANT"))
+            .expect("the grant");
+        assert!(view < grant, "{sql:#?}");
+    }
+
+    /// A principal's grants as the sentences that would recreate them —
+    /// `DENY` included, which neither other engine has — and its role
+    /// memberships as `ALTER ROLE … ADD MEMBER`.
+    #[test]
+    fn a_principals_permissions_read_back_as_t_sql() {
+        let rows = vec![
+            MsPermRow {
+                state: "G".into(),
+                permission: "CONNECT".into(),
+                class: "DATABASE".into(),
+                schema: None,
+                object: None,
+                column: None,
+            },
+            MsPermRow {
+                state: "W".into(),
+                permission: "SELECT".into(),
+                class: "SCHEMA".into(),
+                schema: Some("sales".into()),
+                object: None,
+                column: None,
+            },
+            MsPermRow {
+                state: "D".into(),
+                permission: "DELETE".into(),
+                class: "OBJECT_OR_COLUMN".into(),
+                schema: Some("dbo".into()),
+                object: Some("t".into()),
+                column: None,
+            },
+            MsPermRow {
+                state: "G".into(),
+                permission: "UPDATE".into(),
+                class: "OBJECT_OR_COLUMN".into(),
+                schema: Some("dbo".into()),
+                object: Some("t".into()),
+                column: Some("price".into()),
+            },
+        ];
+        assert_eq!(
+            mssql_grant_statements("app_u", "shop", &rows, &["db_datareader".to_string()]),
+            [
+                "GRANT CONNECT ON DATABASE::[shop] TO [app_u];",
+                "GRANT SELECT ON SCHEMA::[sales] TO [app_u] WITH GRANT OPTION;",
+                "DENY DELETE ON OBJECT::[dbo].[t] TO [app_u];",
+                "GRANT UPDATE ON OBJECT::[dbo].[t] ([price]) TO [app_u];",
+                "ALTER ROLE [db_datareader] ADD MEMBER [app_u];",
+            ]
         );
     }
 }

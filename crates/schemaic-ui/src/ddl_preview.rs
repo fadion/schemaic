@@ -362,7 +362,7 @@ pub(crate) fn container_preview(
 /// Send an **account** change — a create, a drop, a grant or a revoke — to the
 /// preview.
 ///
-/// The counterpart of [`preview_container`] for the six changes that have no
+/// The counterpart of [`preview_container`] for the seven changes that have no
 /// table *and* are not server-level: `ddl::account` builds the set, and
 /// [`preview_of`] reads the scope back off it, which for these is
 /// [`crate::DdlScope::Database`]. That is not an accident of the default — see
@@ -383,9 +383,9 @@ pub(crate) fn preview_account(
     ui: DdlUi,
     on: PlanTarget,
     subject: &str,
-    change: schemaic_core::ddl::Change,
+    changes: Vec<schemaic_core::ddl::Change>,
 ) {
-    let cs = schemaic_core::ddl::account(subject, on.dialect, change);
+    let cs = schemaic_core::ddl::accounts(subject, on.dialect, changes);
     open_preview(
         ui,
         preview_of(on.conn_id, &on.database, subject, &cs, on.read_only),

@@ -10,7 +10,8 @@ differently, so ask the *narrow* capability (`ddl::supports_or_replace_view`,
 preview rather than a peer**: it connects, reads, validates, introspects, runs scripts, writes
 the grid's edits back, imports a file into a table, designs tables, edits views, triggers and
 stored routines, drops a table, view or routine, holds a Manual tab's transaction, shows a query
-plan and dumps a database to a `.sql` file — see `db::mssql`.
+plan, dumps a database to a `.sql` file, and browses and administers its logins, database users
+and their grants — see `db::mssql`.
 
 This is the project's reference document: the crate/module map, the architecture invariants, the
 UI conventions, and the Floem hazards each subsystem is built on. `CLAUDE.md` at the repo root
@@ -3389,7 +3390,11 @@ existing prose was left alone.
     browser's write half — built by `ddl::account(subject, dialect, change)`, a sibling of
     `server_level` whose `subject` is the account's display name (`app@%`, or a bare role) and lands
     in `ChangeSet::table` only so the preview's title names what the plan is about; each change
-    carries its own account. `is_account_change` groups them because every downstream question is
+    carries its own account. `ddl::accounts(subject, dialect, changes)` is the same for several
+    changes about one subject in one plan, which only SQL Server's form raises today: a new login
+    and the user it brings (`users::companion_user_draft`), two `CreateAccount`s that
+    `account_statements` emits in the order they were given, the login first.
+    `is_account_change` groups them because every downstream question is
     the same question for all seven, and the load-bearing answer is that **they are not
     `is_server_level`**. An account belongs to the server, but the server-level route deliberately
     connects to no particular database, and a PostgreSQL `GRANT SELECT ON TABLE public.users` names
@@ -3397,7 +3402,9 @@ existing prose was left alone.
     happens to hold, or fail. So they take the ordinary in-database route, in the database the
     browser is showing privileges for, which is correct on both engines: MySQL's grant tables are
     server-wide and answer the same from any connection, and PostgreSQL's are exactly the ones the
-    browser was already scoped to (`an_account_change_takes_the_ordinary_in_database_route`).
+    browser was already scoped to (`an_account_change_takes_the_ordinary_in_database_route`). On
+    SQL Server that database is where half of them live: a database user, its permissions and its
+    role memberships belong to one database, the browser's, while a login is the server's.
     `supports_change` answers for them in an early arm asking `users::supports_user_admin`, so it
     and the browser that offers the action cannot drift about which engines have accounts at all —
     **and then asks `users::levels_for` for the two changes that carry a level.** That arm used to
@@ -3413,9 +3420,20 @@ existing prose was left alone.
     write — exactly the degradation the paragraph above describes, no INCOMPLETE header and Apply
     enabled over a plan that emits nothing at all. The browser withholds the button and
     `account_editor::open_for_reset` refuses the door, so this is the *third* gate rather than the
-    only one, which is why it is here and not left to those two.
+    only one, which is why it is here and not left to those two. **The arm is its own function now,
+    `account_change_supported`, because SQL Server could not reach it inline**: `supports_change`
+    hands SQL Server to `tsql_supports` before anything else, so an account arm further down was
+    unreachable for the one engine that needed it, and `tsql_supports` asks the same function
+    rather than a second copy of the answer. SQL Server also brought **the grantee** into it —
+    `GrantPrivileges`/`RevokePrivileges` ask `users::supports_grant_to` of the account and
+    `GrantRole`/`RevokeRole` of the member, since a login holds no database permission (Msg 15151)
+    — and **the admin option**, refused on a role grant where `users::supports_role_admin_option`
+    says the engine's membership has none.
     `ChangeSet::account_statements` emits them at the **end** of the plan, called from `emit_mysql`
-    and `emit_postgres` beside `container_drops` and filtered on `supports_change` like its
+    and `emit_postgres` beside `container_drops`, and last in `emit_mssql` too — it first sat after
+    the routines and before the views there, which would have granted on a view before creating
+    it (`a_sql_server_grant_follows_what_the_plan_creates`) — and filtered on
+    `supports_change` like its
     neighbours — a privilege is stated *on* something, so it comes after whatever the plan creates.
     Within the group the order is **create → set password → grant → revoke → drop**, the only one
     that composes: an
@@ -5377,11 +5395,10 @@ existing prose was left alone.
     engine produced it. `supports_users` is the capability (**false for SQLite, and that is a
     statement about SQLite rather than unfinished work**: it is a library linked into this process
     and its access control is the filesystem's — the database file's permissions, granted to an OS
-    user by the OS — so there is no account to browse and no statement that would create one; false
-    for SQL Server too, and *that* one is unfinished work — server logins and the users mapped to
-    them in each database are two catalogues, and the browser's one list of `(name, kind)` rows fits
-    neither half), and `supports_user_admin` is *computed* from it rather than spelling out a second `!= Sqlite`. A
-    `Principal` is `name`/`host`/`kind`/`system`/`attributes`/`role_ambiguous`, and the `Option`
+    user by the OS — so there is no account to browse and no statement that would create one; it
+    was false for SQL Server too, as unfinished work, and is true there now — see below for how the
+    one list takes SQL Server's two catalogues), and `supports_user_admin` is *computed* from it rather than spelling out a second `!= Sqlite`. A
+    `Principal` is `name`/`host`/`kind`/`system`/`attributes`/`role_ambiguous`/`login`, and the `Option`
     on `host` is the one place the two engines disagree about what an account *is*: on MySQL/MariaDB
     it **is** the `(user, host)` pair, where `'app'@'%'` and `'app'@'localhost'` are two accounts
     with different passwords and different privileges, while a PostgreSQL role is not host-scoped
@@ -5457,7 +5474,35 @@ existing prose was left alone.
     On PostgreSQL `rolcanlogin` is the
     user/role split, and it is the only split PostgreSQL makes; `from_pg_rows` lists only the
     attributes that are *set*, since a role with nine "No" rows is where `Superuser` stops standing
-    out. `account_sql` is the account as **executed** SQL names it (`SHOW GRANTS FOR 'app'@'%'`),
+    out.
+    **SQL Server splits an account in two, and the browser lists both halves, linked** — the model
+    chosen over listing either half alone. A server **login** (`sys.server_principals`) holds the
+    password and signs in; a database **user** (`sys.database_principals`, one database's) is what
+    database permissions and role memberships are granted to, and is mapped to a login by SID. So
+    `PrincipalKind` has a third arm, `Login` (no other engine has one), and `Principal::login` — a
+    `#[serde(default)]` `Option`, `None` on every other engine and on a user `WITHOUT LOGIN` —
+    carries a user's backing login as `SUSER_SNAME(sid)` reads it: that field is the link, and
+    what the list shows and a reset on the user row alters. `display` writes `name ← login` for a user mapped to
+    a login of another name, so the row shows the link and, `matches` being over `display`, a search
+    for the login finds the user too. `from_mssql_rows` folds the logins first, then the browser
+    database's users and roles, each user carrying its login as an attribute as well; the server's
+    own logins (`NT AUTHORITY\…`, `NT SERVICE\…`, `##…`) and the database's `dbo`, `guest`,
+    `INFORMATION_SCHEMA`, `sys`, `public` and fixed roles are `system`, kept and sorted last as every
+    engine's are. Its roles are the **database's**; a login's server roles are an attribute and a
+    read-back, not something the forms grant. `account_kinds(dialect)` is the New account form's
+    Kind list — `[Login, User, Role]` on SQL Server, a login first because a user is mapped to one,
+    `[User, Role]` elsewhere — and `blank_account_draft` opens on its first entry, on SQL Server
+    with `AccountDraft::also_user` set: a new login brings a same-named user in the browser's
+    database **in the same plan** (`companion_user_draft`, `FOR` that login, no password of its
+    own), since that pair is what giving someone access to a database takes there.
+    `AccountDraft::login` is a new user's `FOR LOGIN`, empty for `WITHOUT LOGIN`.
+    `takes_password(dialect, kind)` answers where the password row belongs — the user on MySQL and
+    PostgreSQL, the **login** on SQL Server — and `account_form_blocker` refuses a login with no
+    password, a login being a SQL login by its password. **`supports_grant_to` is false for a SQL
+    Server login**: `GRANT … TO` a login is Msg 15151, the login not being a principal of the
+    database at all, so database permissions and memberships go to its user; `core::ddl` asks it of
+    a grant's grantee and a role's member, and the browser withholds Privileges on a login row.
+    `account_sql` is the account as **executed** SQL names it (`SHOW GRANTS FOR 'app'@'%'`),
     and it is deliberately **not** a fifth identifier quoter: MySQL spells an account as two *string
     literals*, so it goes through the one literal quoter (`schema::ddl_string` → `export::sql_literal`,
     which already knows MySQL escapes a backslash inside a literal and PostgreSQL does not), and
@@ -5534,6 +5579,16 @@ existing prose was left alone.
     the same `pg_` prefix test `pg::roles` uses to keep those roles out of a *grantable* list, and
     they are kept in the browser deliberately, which is exactly why their powers have to be
     accounted for. Both notes now also admit ownership and superuser among their omissions.
+    **SQL Server has no `SHOW GRANTS` either, so `mssql_grant_statements` writes its list** from
+    `MsPermRow`s — `sys.database_permissions` for a user or role, `sys.server_permissions` for a
+    login — one statement per row, in catalogue order and ungrouped: `GRANT`, `GRANT … WITH GRANT
+    OPTION` for state `W`, and **`DENY`** for `D`, which neither other engine has and which beats any
+    grant, so a list without it would say nothing of what the account is refused. The securable is
+    named by its class as the grant form writes it — `DATABASE::`, `SCHEMA::`, `OBJECT::` with a
+    column list for a column's permission — a `SERVER`-class permission has no `ON`, and a class the
+    function does not know is **left out rather than guessed**. Role memberships follow as
+    `ALTER ROLE … ADD MEMBER`, and a login's server roles as `ALTER SERVER ROLE … ADD MEMBER`
+    (`mssql_server_role_statements`).
     **`redact_secrets` is why nothing here can put a credential on screen.** MariaDB's `SHOW GRANTS`
     carries the account's stored hash inline (`IDENTIFIED BY PASSWORD '*01E8…'`), and for
     `mysql_native_password` that hash *is* the credential — the client proves knowledge of it, so
@@ -5560,7 +5615,11 @@ existing prose was left alone.
     which arms an engine offers: MySQL has `Global` and no `Schema`/`Sequence`, and **PostgreSQL has
     no `Global` at all** — a statement about PostgreSQL rather than a gap, since its cluster-wide
     powers are role *attributes* (`SUPERUSER`, `CREATEDB`, `REPLICATION`) carried on the role and set
-    with `ALTER ROLE`, not privileges `GRANT` can express. SQLite gets an empty list rather than a
+    with `ALTER ROLE`, not privileges `GRANT` can express. SQL Server offers `Database`, `Schema`
+    and `Table` — a database user's three securables, written `DATABASE::[d]`, `SCHEMA::[s]` and
+    `OBJECT::[s].[t]` by `GrantLevel::object_sql` — and no `Global`: its server-level permissions
+    (`GRANT VIEW SERVER STATE TO login`) are a login's, and are **not offered yet**, which is
+    unfinished work rather than a statement about the engine. SQLite gets an empty list rather than a
     panic, `supports_user_admin` being the gate that should have stopped the caller.
     **`default_grant_level` is the level a grant form opens on, and it is deliberately not
     `levels_for(dialect).first()`** — the widest level that is *not* `Global`, and `None` only where
@@ -5580,6 +5639,9 @@ existing prose was left alone.
     and the set that reads back as `ALL PRIVILEGES` cannot disagree;
     `granting_every_postgres_table_privilege_reads_back_as_all_privileges` pins exactly that
     composition by ticking every box and running the result through `pg_grant_statements`.
+    SQL Server's three lists are curated the way MySQL's global one is — the everyday permissions on
+    each securable, not T-SQL's forty-odd (`ALTER ANY …`, `IMPERSONATE`, `TAKE OWNERSHIP`), which
+    stay a statement away in the editor.
     `PrivilegeChange` + `privilege_sql(change, dialect, revoke)` write the `GRANT`/`REVOKE` — one
     struct for both directions, since what a revoke takes away is exactly what a grant gives, and
     `WITH GRANT OPTION` is ignored on the revoke side rather than given a second field nobody sets.
@@ -5588,26 +5650,39 @@ existing prose was left alone.
     membership pair, and `AccountDraft` + `account_draft_sql` the `CREATE USER`/`CREATE ROLE` — a
     role takes no host and no password on either engine, and an empty password emits **no clause at
     all**, which is a real account on both (PostgreSQL's must authenticate some other way, MySQL's
-    has simply not been given one yet). `PasswordReset` + `set_password_sql` are the `ALTER` beside
+    has simply not been given one yet). **SQL Server's arms are T-SQL's own shapes, not the other
+    engines' with the keywords swapped.** `role_sql` is `ALTER ROLE [r] ADD|DROP MEMBER [m]`, a membership there
+    being a statement about the role rather than a grant of it, with no admin option — so
+    `supports_role_admin_option` is false there, `core::ddl` refuses a role grant asking for one and
+    the grant form hides the toggle. `account_draft_sql` hands SQL Server to `tsql_account_draft_sql`:
+    `CREATE LOGIN [n] WITH PASSWORD = N'…'`, `CREATE USER [n] FOR LOGIN [l]` or `WITHOUT LOGIN`, and
+    `CREATE ROLE [n]`; `drop_account_sql` writes `DROP LOGIN` for a login. **The login's password
+    travels as typed, as MySQL's does, and not in the hashed `WITH PASSWORD = 0x… HASHED` form**,
+    because the hashed form skips the server's password policy — the same trade `PasswordPolicy`
+    below makes on PostgreSQL, where a verifier the app computes is a decision the server did not
+    get to make. `PasswordReset` + `set_password_sql` are the `ALTER` beside
     that pair, and `PasswordReset` is deliberately **not** a second use of `AccountDraft`: a draft
     describes an account that does not exist yet and carries every field `CREATE` needs, while this
     names one the browser listed and carries the single field that is changing — handing `CREATE`'s
     shape to an `ALTER` is how a reset comes to reset the host as well. The statement is
     `ALTER USER … IDENTIFIED BY` on MySQL and `ALTER ROLE … PASSWORD` on PostgreSQL, `ROLE` there for
     a user too, since `ALTER USER` is an alias the manual keeps for compatibility and the browser's
-    own `GRANT` statements already read `ROLE` throughout. **An empty password returns `None` rather
+    own `GRANT` statements already read `ROLE` throughout — and `ALTER LOGIN … WITH PASSWORD =` on
+    SQL Server, where a reset on a **user** row alters the login it maps to (`Principal::login`),
+    the password being the login's; `a_login_and_its_user_are_created_granted_reset_and_dropped`
+    signs in with the new one and is refused with the old. **An empty password returns `None` rather
     than emitting**, which is the one place this parts company with the clause above:
     `ALTER USER … IDENTIFIED BY ''` is a legal statement that sets a *blank* password, where
     `CREATE`'s missing clause leaves one unset — a lock left open against a lock not yet fitted — so
     a caller who wants that has `DropAccount` or the engine's own client. An empty account name is
     refused on the same call, the backstop under the form's gate that `privilege_sql`'s empty list
-    is. `supports_password_reset(dialect, &Principal)` is the capability, *computed* as
-    `supports_users(dialect) && p.kind == PrincipalKind::User && !p.role_ambiguous` rather than
-    restated as a list of
-    engines: an engine with accounts has an `ALTER` for them, so the dialect half is a question
-    already answered and a fourth engine gets one answer instead of two, while the `kind` half is
-    real and not about the engine at all — a role takes no password on either, the same rule
-    `account_draft_sql` applies to `CREATE`. **It takes the whole `Principal` and not its
+    is. `supports_password_reset(dialect, &Principal)` is the capability, gated on
+    `supports_users(dialect)` rather than restating a list of
+    engines — an engine with accounts has an `ALTER` for them, so that half is a question already
+    answered — and then asking the account, per engine since SQL Server's arrived: on MySQL and
+    PostgreSQL `p.kind == PrincipalKind::User && !p.role_ambiguous`, a role taking no password on
+    either, the same rule `account_draft_sql` applies to `CREATE`; on SQL Server a `Login`, or a
+    `User` with a login to alter, where a role and a user `WITHOUT LOGIN` have none. **It takes the whole `Principal` and not its
     `PrincipalKind`, because the kind cannot say "I don't know."** It asked only the kind for a
     release, which is how the `role_ambiguous` finding above got in, and its own rustdoc asserted the
     premise that made that look sound — that the engine *rejects* a password on a role outright,
@@ -5620,8 +5695,10 @@ existing prose was left alone.
     carry `scram_salt: Option<scram::Salt>`; where `supports_password_verifier(dialect)` says yes
     and a salt is stamped, the clause is `PASSWORD '<scram::verifier>'` and the statement PostgreSQL
     logs and shows in `pg_stat_activity` carries no password (`core::scram` has the why). MySQL and
-    MariaDB answer no, because the server rewrites `IDENTIFIED BY` out of its own logs, and the
-    predicate is an exhaustive `match` so a fourth engine has to answer it. **The salt is stamped by
+    MariaDB answer no, because the server rewrites `IDENTIFIED BY` out of its own logs; SQL Server
+    answers no as well — it does take a hashed password for a login (`0x… HASHED`, in a format of
+    its own), but that form skips the password policy, which is why the login's is sent as typed
+    (above). The predicate is an exhaustive `match`, so a fourth engine has to answer it. **The salt is stamped by
     the form, never generated at emit**, so preview and Apply run one statement and the emitter stays
     pure — and `None` is the old behaviour, the password as typed, so a caller that forgets to stamp
     one sends a password the logs keep rather than locking the account out. A password
@@ -9655,6 +9732,10 @@ existing prose was left alone.
   into whichever scope note applies as its `extra`. Every one of them compares against the role's own oid,
   so a role dropped since the list was fetched yields an empty answer rather than an error. `pg_bool`
   is the small reader `simple_query`'s text protocol needs, which spells a boolean `t`/`f`.
+  **`Db::fetch_principals` takes a `database` because SQL Server's accounts are half one
+  database's**: the logins are the server's and the users one database's, so the app passes the
+  browser's database, and MySQL and PostgreSQL ignore it, their accounts being server-wide.
+  `mssql::fetch_principals` and `mssql::fetch_grants` are the SQL Server half, under `mssql.rs`.
   Populates each result column's
   `origin` (real table/column + key flags) from the wire protocol. Connection **identity** is the
   `Db` handle (`Db::connect(&Connection, tunnel_port)`), not a `mysql://…` URL — credentials go
@@ -10934,17 +11015,18 @@ existing prose was left alone.
   `sys.dm_db_partition_stats`, Server Activity, `run_script`, and the grid's write-back —
   `commit_writes`, `refetch_rows` and `fetch_blob` (below) — `import_rows` (below), and `run_ddl`,
   for the table changes `supports_change` admits (below), a Manual tab's pinned `Session`
-  (below), and `explain`, the estimated and the measured plan (below). `run_server_ddl` answers
+  (below), `explain`, the estimated and the measured plan (below), and the account browser's
+  `fetch_principals` and `fetch_grants` (below). `run_server_ddl` answers
   `DbError::Refused("… is not available for SQL Server yet.")`. **The refusals are the backstop,
   not the gate**: the app is kept off them by
   capabilities, each an exhaustive `match` with `MsSql` on `false`, asked at the UI site that
-  offers the thing — `users::supports_users`, since
-  logins and the users mapped to them in each database are two catalogues the browser's one list
-  fits neither half of; and
+  offers the thing — chief among them
   `ddl::supports_change`, whose SQL Server answer comes before anything else and is
   `tsql_supports`: a table's own changes, new or existing, the table, view and routine drops, a
-  view's `CreateView` and `ReplaceView`, a trigger's create, replace and drop, and a routine's
-  `CreateRoutine` and `ReplaceRoutine`, and nothing more. The four editor predicates compute
+  view's `CreateView` and `ReplaceView`, a trigger's create, replace and drop, a routine's
+  `CreateRoutine` and `ReplaceRoutine`, and the seven account changes, through the same
+  `account_change_supported` every engine's answer goes through (under `ddl.rs`) — and nothing
+  more. The four editor predicates compute
   from it, so it decides which editors open: `supports_table_design` probes a column retype, which
   T-SQL's `ALTER COLUMN` writes, so the designer opens on an existing table — in place, as on MySQL
   and PostgreSQL, with no rebuild — and `supports_view_editing` probes the create and the replace,
@@ -10998,7 +11080,28 @@ existing prose was left alone.
   `plan::supports_plan` is the fourth, since `explain` was written (below), and
   `dump::supports_dump` — the tree's *Export ▸ SQL* — the fifth, once `core::dump` carried an
   identity's values under `IDENTITY_INSERT` and closed every batch with `GO` (under `dump.rs`);
-  its live pin is `a_dump_restores_into_an_empty_database`. Server Activity is the one
+  its live pin is `a_dump_restores_into_an_empty_database`. `users::supports_users` is the sixth,
+  once the browser could list SQL Server's two catalogues as one — logins, and the browser
+  database's users linked to them (under `core::users`). It had said no because the one list of
+  `(name, kind)` rows fitted neither half; `PrincipalKind::Login` and `Principal::login` are what
+  made it fit both. `mssql::fetch_principals` reads `LOGIN_LISTING` (SQL and Windows logins and
+  groups, the `##…##` certificate logins left out, each login's server roles through
+  `STRING_AGG`) and, with a database, `USER_LISTING` (that database's users and roles, each user's
+  login as `SUSER_SNAME(sid)`, its role memberships); with no database it lists the logins alone
+  and its note says to pick one. **It also asks `HAS_PERMS_BY_NAME(…, 'VIEW ANY DEFINITION')`**,
+  because a login without that permission is shown only the principals it may see — itself and
+  little else — with no error to say so, which is the MySQL ladder's "one account out of eight"
+  in another catalogue; the note says the list may be short. `mssql::fetch_grants` reads a login's
+  server permissions and server roles on a connection to no database, and a user's or role's
+  database permissions and roles in the browser's database, noting when there is none; both fold
+  through `users::mssql_grant_statements`. The live pin is
+  `a_login_and_its_user_are_created_granted_reset_and_dropped`, through the real
+  `ChangeSet::emit` → `Db::run_ddl` path: one plan creates the login and its user, which are listed
+  linked; the login signs in; a schema grant and a `db_datareader` membership read back as the
+  sentences that made them, and the login's own `GRANT CONNECT SQL`; a reset on the **user** row
+  changes the login's password, the old one then refused; and the drops leave neither behind.
+  `ScratchLogin` drops the login on the way out, a login being the server's and outliving the
+  scratch database. Server Activity is the one
   split that *is* about the engine: `KILL` ends a session, but no T-SQL statement cancels another
   session's request and leaves the session standing — a cancel is an attention sent by the owner's
   own client — so `activity::supports_kill_kind` says no to *Cancel query* there and
@@ -12366,7 +12469,11 @@ existing prose was left alone.
   `a_granted_role_comes_back_and_a_revoke_takes_it_off`,
   `a_grant_at_every_level_reads_back_naming_that_object` and
   `a_dropped_account_is_gone_from_the_list` — every one of them fanned to MariaDB 10.11, MySQL 8.4
-  and PostgreSQL 16 by `live_suite!`. **The list is the count**, and deliberately so: the sentence
+  and PostgreSQL 16 by `live_suite!`. SQL Server is not a leg of that macro, so its accounts have
+  their own end-to-end test in `tests/live/mssql.rs`,
+  `a_login_and_its_user_are_created_granted_reset_and_dropped` (under `db::mssql`), and these call
+  `fetch_principals(None)`, a database being an argument only SQL Server reads.
+  **The list is the count**, and deliberately so: the sentence
   here used to say "the seven write tests … twenty-one in all" over an enumeration of seven that
   had already left three of them out, which is the failure `AGENTS.md` names — a stated total is one
   more thing to keep in step with the code, and the names are what a reader is actually looking for.
@@ -16020,7 +16127,8 @@ existing prose was left alone.
     blank-space menu) pass `ui.conn, ui.overlay`. It resets
     every signal it reads on the way in rather than on close, so a second opening cannot flash the
     previous server's accounts while the new list is in flight; the database it is given is the
-    active tab's, because that is the one PostgreSQL's schema and table privileges can be read from.
+    active tab's, because that is the one PostgreSQL's schema and table privileges can be read from
+    — and, on SQL Server, the one whose users are listed at all (`Db::fetch_principals` takes it).
     Two panes: a filtered account list (`users::filter_indices` over `matches`, one field over the
     whole `app@host` display name, asked **once** and read by both the rows and the footer's count)
     on the left, and the selected account's attributes and `GRANT` statements on the right. A
@@ -16080,7 +16188,12 @@ existing prose was left alone.
     button hands it the whole `Principal`: asking the row's `PrincipalKind` put the offer on a MySQL
     8 role, which publishes no `is_role` and is therefore labelled `User`, and 8.4.11 accepted the
     `ALTER USER` behind it — see `core::users` for the measurement and the fingerprint that now
-    withholds it.
+    withholds it. **Privileges is absent on a SQL Server login on the same terms**: a login holds no
+    database permission — its user does, and `GRANT … TO` a login is Msg 15151 — so the button asks
+    `users::supports_grant_to` and `account_editor::open_for_grant` refuses the door as well. A
+    login row wears `icons::KEY_ROUND` where a user wears `USER` and a role `USERS`, the key its
+    users sign in with; a user mapped to a login of another name reads `name ← login`
+    (`Principal::display`), so the link is on the row itself.
     The row sits in
     **the modal's own `FocusRing`, at 12, 13 and 14**: they built a `FocusRing::new()` of their own
     with no focus root stepping it, so clicking one focused it and Tab then cycled the pair forever
@@ -16648,7 +16761,7 @@ existing prose was left alone.
     (`SchemaPlan::subject_in` — "12 objects in shop") rather than an object, there being no single
     object to name, and the post-apply `refresh_db` already re-introspects a
     whole database, which is the right refresh for a plan that touched many of its objects.
-    **`preview_account` takes an `AccountPlanTarget` captured where the plan was raised**, not the
+    **`preview_account` takes a `PlanTarget` captured where the plan was raised**, not the
     live `edit_ctx`. `conn_id`, `dialect` and `read_only` come off the `AccountTarget`/`GrantTarget`
     the form was opened with — which is what those fields are *for*, and they were carried and never
     read while this re-derived all three from whichever connection the switcher pointed at now: a
@@ -16656,7 +16769,10 @@ existing prose was left alone.
     dialect, and the wrong connection's read-only flag decided whether Apply was offered. It is a
     struct rather than three more parameters because all three come from one place and have to stay
     together — taking them individually is how one call site comes to pass the live connection's
-    `read_only` beside the target's `conn_id`.
+    `read_only` beside the target's `conn_id`. **It takes a `Vec<Change>`, built into one set by
+    `ddl::accounts`**, because SQL Server's New account form can raise two: a login and the user it
+    brings, which it sends as one plan under one preview and one Apply. The account form passes
+    `account_editor::preview_changes`; the grant form and the browser's Drop pass one change each.
     **`open_for_table` takes a `DesignerFocus`** — `Table`, `Column(&str)` or
     `Key { index, foreign_key }` — which is the row the designer lands on once it opens, so the
     tree's column and key right-clicks (`Edit column`, and `Edit index` / `Edit foreign key` /
@@ -17245,7 +17361,14 @@ existing prose was left alone.
     In create mode its Kind picker comes first because it decides what the rest of
     the form means: a role takes no host and no password on either engine, so those fields **vanish
     rather than sitting there inert**, and Host is absent on PostgreSQL, which has no such thing at
-    all. **The form holds a password — in `account_draft` and, typed a second time, in
+    all. **On SQL Server the Kind list is `users::account_kinds` — Login, User, Role — and the form
+    opens on a Login** (`users::blank_account_draft`), with an *Also a user in `<db>`* toggle,
+    on by default, that adds the same-named user to the plan (`preview_changes`, which Preview
+    hands to `ddl_preview::preview_account`; never beside a reset). A User gets a *For login* field instead, empty meaning
+    `WITHOUT LOGIN`. The password row follows `users::takes_password` rather than the Kind being
+    `User`, since on SQL Server it is the login that holds the password and a user has none of its
+    own. Both rows are asked of whether the engine's kinds include `Login` — accounts split in two
+    — rather than of the engine. **The form holds a password — in `account_draft` and, typed a second time, in
     `DdlUi::account_confirm` — and nothing else in this crate does.** Both are blanked on every
     open — a form that reopened holding the last one would put a credential on screen nobody typed
     this time — cleared on Cancel (`ddl_preview::close_peers` empties `account_draft` and
@@ -17287,7 +17410,9 @@ existing prose was left alone.
     longer connect. The footer's reason and Preview's enable both come from
     `users::account_form_blocker`/`account_form_ready`, so an empty Confirm reads "Type the password
     again to confirm it." and a mismatch "The two passwords differ." — checked by hand in the
-    sandboxed app, where a match enabled Preview. A role has no password row and is not asked.
+    sandboxed app, where a match enabled Preview. A role has no password row and is not asked, nor
+    is a SQL Server user; a SQL Server login must have a password as well as its confirmation
+    ("A login needs a password.").
     **The field itself is
     `connection_form::masked_edit_field`**, the same one the three saved-connection secrets wear:
     this was the app's only *unmasked* secret field, so its real characters were on screen and a
@@ -17385,7 +17510,11 @@ existing prose was left alone.
     through `bound_toggle`, reading the draft, so a yes/no in this form reads as a yes/no everywhere
     else one appears. They shipped as an always-"Yes" button whose `current` parameter was ignored,
     so the two rows that exist only to show a state showed none of it: nothing on screen said whether
-    the statement about to be previewed would carry the clause.
+    the statement about to be previewed would carry the clause. "With admin option" is absent where
+    `users::supports_role_admin_option` says the engine's membership has none — SQL Server's
+    `ALTER ROLE … ADD MEMBER` — and `core::ddl` refuses a role grant carrying one there regardless.
+    `open_for_grant` refuses a SQL Server **login** (`users::supports_grant_to`) beside its read-only
+    refusal, the browser having withheld Privileges on the row already.
   - `ai_panel.rs` — AI Assistant panel (`ai_panel`/`message_bubble`/`render_segments`/`tool_chip`/
     `assistant_footer`). The two roles are drawn **asymmetrically**, and deliberately: the user's
     question is a shrink-wrapped right-aligned bubble on `bubble_user_bg`, while the assistant's turn

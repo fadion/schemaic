@@ -3222,6 +3222,7 @@ impl Change {
                 match d.kind {
                     crate::users::PrincipalKind::User => format!("Create user {who}"),
                     crate::users::PrincipalKind::Role => format!("Create role {}", d.name),
+                    crate::users::PrincipalKind::Login => format!("Create login {}", d.name),
                 }
             }
             Change::DropAccount(p) => {
@@ -4477,6 +4478,9 @@ impl ChangeSet {
                 out.push(tsql_rename(&q, to, None));
             }
         }
+        // Logins, users, roles and their grants **last**, as on every engine:
+        // a privilege is stated on something this plan may have just made.
+        out.extend(self.account_statements());
         // Every admitted change is written by one of the phases above, bar
         // `KeepLossyIndex`, whose statement is none. Admitted and not written
         // would be a change the plan silently drops; the test that walks both
@@ -11150,48 +11154,7 @@ pub fn supports_change(dialect: SqlDialect, change: &Change) -> bool {
     // engines have accounts at all — and so a fourth engine answers once, in
     // `users::supports_user_admin`, rather than here as well.
     if is_account_change(change) {
-        if !crate::users::supports_user_admin(dialect) {
-            return false;
-        }
-        // **And the level, for the two changes that carry one.** This arm used
-        // to answer for all seven variants on "does this engine have accounts",
-        // which made `unsupported()` blind to the one thing accounts can ask an
-        // engine for and not get: `GRANT … ON *.* ` has no PostgreSQL grammar
-        // and `ON SCHEMA` has no MySQL one. Blind meant no INCOMPLETE header,
-        // `apply`'s withheld guard silent, and Apply enabled over a statement
-        // the server will refuse. Every other narrow arm in this function is
-        // shape-aware; this is the capability that knows the answer
-        // (`users::levels_for`), and it was consulted only by the form's picker.
-        return match change {
-            Change::GrantPrivileges(c) | Change::RevokePrivileges(c) => {
-                crate::users::levels_for(dialect).contains(&c.level.kind())
-            }
-            // **And the account, for the one change that is about a password.**
-            // A role has none on either engine, so a reset of one is not a
-            // thing this engine can be asked for — the same shape as the level
-            // above, one field along. The whole `Principal` and not its `kind`,
-            // because on MySQL 8 the catalogue cannot tell a role from a
-            // locked account and `supports_password_reset` refuses on that
-            // uncertainty. Left to `set_password_sql` returning `None` it
-            // degraded to exactly what the comment above describes: no
-            // INCOMPLETE header, `apply`'s withheld guard silent, and Apply
-            // enabled over a plan that then emitted nothing at all. The browser
-            // never offers it and `open_for_reset` refuses it, so this is the
-            // third gate rather than the only one — which is why it is here and
-            // not left to the two above it.
-            //
-            // **Asked of the emitter, not of the capability beside it.** The
-            // arm read `supports_password_reset`, which is about the *account*,
-            // and `set_password_sql` refuses on two further grounds — an empty
-            // name and an empty password. So a blank-password reset passed here
-            // as "supported" and then emitted nothing: the same empty plan with
-            // no INCOMPLETE header this arm was written to stop, one field
-            // along. Deriving it means the predicate and the emitter cannot
-            // disagree about what is emittable, which is the only version of
-            // this that stays true as `set_password_sql` grows a fourth reason.
-            Change::SetAccountPassword(r) => crate::users::set_password_sql(r, dialect).is_some(),
-            _ => true,
-        };
+        return account_change_supported(dialect, change);
     }
     // **A database is a file on SQLite, and a file is not DDL.** Creating one
     // means writing a path the connection form owns, and dropping one means
@@ -11305,6 +11268,63 @@ pub fn supports_change(dialect: SqlDialect, change: &Change) -> bool {
     )
 }
 
+/// [`supports_change`] for an account change — one function, which
+/// [`tsql_supports`] asks too, so SQL Server's answer is the same capability
+/// the others give rather than a second copy of it.
+fn account_change_supported(dialect: SqlDialect, change: &Change) -> bool {
+    if !crate::users::supports_user_admin(dialect) {
+        return false;
+    }
+    // **And the level, for the two changes that carry one.** This arm used
+    // to answer for all seven variants on "does this engine have accounts",
+    // which made `unsupported()` blind to the one thing accounts can ask an
+    // engine for and not get: `GRANT … ON *.* ` has no PostgreSQL grammar
+    // and `ON SCHEMA` has no MySQL one. Blind meant no INCOMPLETE header,
+    // `apply`'s withheld guard silent, and Apply enabled over a statement
+    // the server will refuse. Every other narrow arm in this function is
+    // shape-aware; this is the capability that knows the answer
+    // (`users::levels_for`), and it was consulted only by the form's picker.
+    match change {
+        // …and the grantee: a SQL Server login holds no database
+        // privilege (`users::supports_grant_to`).
+        Change::GrantPrivileges(c) | Change::RevokePrivileges(c) => {
+            crate::users::levels_for(dialect).contains(&c.level.kind())
+                && crate::users::supports_grant_to(dialect, &c.account)
+        }
+        // A role's member the same way, and an admin option only where
+        // the engine's membership has one.
+        Change::GrantRole(r) | Change::RevokeRole(r) => {
+            crate::users::supports_grant_to(dialect, &r.member)
+                && (!r.with_admin_option || crate::users::supports_role_admin_option(dialect))
+        }
+        // **And the account, for the one change that is about a password.**
+        // A role has none on either engine, so a reset of one is not a
+        // thing this engine can be asked for — the same shape as the level
+        // above, one field along. The whole `Principal` and not its `kind`,
+        // because on MySQL 8 the catalogue cannot tell a role from a
+        // locked account and `supports_password_reset` refuses on that
+        // uncertainty. Left to `set_password_sql` returning `None` it
+        // degraded to exactly what the comment above describes: no
+        // INCOMPLETE header, `apply`'s withheld guard silent, and Apply
+        // enabled over a plan that then emitted nothing at all. The browser
+        // never offers it and `open_for_reset` refuses it, so this is the
+        // third gate rather than the only one — which is why it is here and
+        // not left to the two above it.
+        //
+        // **Asked of the emitter, not of the capability beside it.** The
+        // arm read `supports_password_reset`, which is about the *account*,
+        // and `set_password_sql` refuses on two further grounds — an empty
+        // name and an empty password. So a blank-password reset passed here
+        // as "supported" and then emitted nothing: the same empty plan with
+        // no INCOMPLETE header this arm was written to stop, one field
+        // along. Deriving it means the predicate and the emitter cannot
+        // disagree about what is emittable, which is the only version of
+        // this that stays true as `set_password_sql` grows a fourth reason.
+        Change::SetAccountPassword(r) => crate::users::set_password_sql(r, dialect).is_some(),
+        _ => true,
+    }
+}
+
 /// [`supports_change`] for SQL Server: the table's own changes, which
 /// [`ChangeSet::emit_mssql`] writes, and nothing the other editors need.
 ///
@@ -11322,6 +11342,8 @@ pub fn supports_change(dialect: SqlDialect, change: &Change) -> bool {
 /// routine's `RenameRoutine` is never raised, a rename being a re-create.
 fn tsql_supports(change: &Change) -> bool {
     match change {
+        // Logins, users, roles and grants: the shared account answer.
+        c if is_account_change(c) => account_change_supported(SqlDialect::MsSql, c),
         Change::CreateTrigger(_)
         | Change::ReplaceTrigger { .. }
         | Change::DropTrigger { .. }
@@ -13095,7 +13117,7 @@ pub fn grant_change(
     })
 }
 
-/// A one-change set for an **account** — the six changes
+/// A one-change set for an **account** — the seven changes
 /// [`ChangeSet::account_statements`] writes.
 ///
 /// Its own constructor for the reason [`server_level`] is one: `single`'s first
@@ -13110,6 +13132,19 @@ pub fn grant_change(
 /// leaves no choice about that.
 pub fn account(subject: &str, dialect: SqlDialect, change: Change) -> ChangeSet {
     single(subject, None, dialect, change)
+}
+
+/// [`account`] for several changes about one subject, in one plan — SQL
+/// Server's new login and the user it brings (`users::companion_user_draft`),
+/// which `account_statements` emits creates-first as it does every plan.
+pub fn accounts(subject: &str, dialect: SqlDialect, changes: Vec<Change>) -> ChangeSet {
+    ChangeSet {
+        table: subject.to_string(),
+        schema: None,
+        dialect,
+        flavour: ServerFlavour::Unknown,
+        changes,
+    }
 }
 
 #[cfg(test)]
@@ -13681,6 +13716,7 @@ mod tests {
                         system: false,
                         attributes: Vec::new(),
                         role_ambiguous: false,
+                        login: None,
                     },
                     level: crate::users::GrantLevel::Global,
                     privileges: vec!["SELECT".into()],

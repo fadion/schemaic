@@ -57,8 +57,8 @@ use schemaic_core::users::{
 use crate::table_designer::suggest_chevron;
 use crate::widgets::{
     ACTION_TAB, ActionKind, FocusRing, action_button, action_gap, autohide, focus_root_with_ring,
-    form_gap, form_section, form_setting, modal_footer_split, modal_h, modal_pad_h,
-    modal_title_owned, modal_w, panel_style,
+    form_gap, form_section, form_setting, form_setting_owned, modal_footer_split, modal_h,
+    modal_pad_h, modal_title_owned, modal_w, panel_style,
 };
 use crate::{
     AccountTarget, ConnUi, DdlUi, FieldCfg, GrantTarget, OverlayUi, UsersTarget, ddl_preview,
@@ -208,8 +208,13 @@ pub(crate) fn open_for_new(
     d.session.update(|g| *g += 1);
     // **Blank, every time.** The draft carries a password, and a form that
     // reopened holding the last one would put a credential on screen that
-    // nobody typed this time.
-    reset_then_seed(d, d.account_draft, AccountDraft::default());
+    // nobody typed this time. Opened on the engine's first kind — SQL
+    // Server's login, bringing its user (`users::blank_account_draft`).
+    reset_then_seed(
+        d,
+        d.account_draft,
+        schemaic_core::users::blank_account_draft(from.dialect),
+    );
     d.account.set(Some(AccountTarget {
         // **`from`, not `ctx`** — see the note above `open_for_grant`'s twin
         // line. `read_only` is the one field that stays live.
@@ -271,6 +276,8 @@ pub(crate) fn open_for_reset(
             name: account.name.clone(),
             host: account.host.clone().unwrap_or_default(),
             kind: account.kind,
+            login: account.login.clone().unwrap_or_default(),
+            also_user: false,
             password: String::new(),
             // Stamped when the plan is built (`account_change`), not here.
             scram_salt: None,
@@ -303,6 +310,11 @@ pub(crate) fn open_for_grant(
     // is the fault, not just the answer it gave.
     let door_read_only = door_read_only(conn, from);
     if door_read_only {
+        return;
+    }
+    // A SQL Server login holds no database privilege — its user does — so the
+    // door refuses one, as the browser's dimmed button already does.
+    if !schemaic_core::users::supports_grant_to(from.dialect, account) {
         return;
     }
     d.session.update(|g| *g += 1);
@@ -586,6 +598,20 @@ pub(crate) fn preview_change(draft: &AccountDraft, target: &AccountTarget) -> dd
     )
 }
 
+/// Every change the **Preview** button's plan carries: [`preview_change`], and
+/// — for a new SQL Server login the form asked to bring one — the user of its
+/// own name in this database (`users::companion_user_draft`), so the two land
+/// in one plan. Never beside a reset, which creates nothing.
+pub(crate) fn preview_changes(draft: &AccountDraft, target: &AccountTarget) -> Vec<ddl::Change> {
+    let mut out = vec![preview_change(draft, target)];
+    if target.resetting.is_none()
+        && let Some(user) = schemaic_core::users::companion_user_draft(draft, target.dialect)
+    {
+        out.push(ddl::Change::CreateAccount(Box::new(user)));
+    }
+    out
+}
+
 fn account_form(
     target: &AccountTarget,
     seed: &AccountDraft,
@@ -627,7 +653,8 @@ fn account_form(
             bound_dropdown(
                 draft,
                 kind,
-                vec![PrincipalKind::User, PrincipalKind::Role],
+                // SQL Server's login first, since a user is mapped to one.
+                schemaic_core::users::account_kinds(target.dialect).to_vec(),
                 PrincipalKind::label,
                 ring.clone(),
                 8,
@@ -681,7 +708,44 @@ fn account_form(
         );
     }
 
-    if kind == PrincipalKind::User {
+    // **SQL Server's two halves.** A user is `FOR` a login — named here, or
+    // left empty for one `WITHOUT LOGIN` — and a login may bring its user into
+    // this database in the same plan. Asked of the kinds the engine offers,
+    // not of the engine: `Login` exists only where accounts are split in two.
+    let split = schemaic_core::users::account_kinds(target.dialect).contains(&PrincipalKind::Login);
+    if split && kind == PrincipalKind::User {
+        rows.push(
+            form_setting(
+                "For login",
+                bound_field(
+                    draft,
+                    seed.login.clone(),
+                    FieldCfg {
+                        placeholder: "login — empty for a user without one",
+                        focus: Some((ring.clone(), 20)),
+                        ..Default::default()
+                    },
+                    |d, v| d.login = v.trim().to_string(),
+                ),
+            )
+            .into_any(),
+        );
+    }
+    if split && kind == PrincipalKind::Login {
+        rows.push(
+            form_setting_owned(
+                format!("Also a user in {}", target.database),
+                bound_toggle(draft, seed.also_user, ring.clone(), 20, |d, v| {
+                    d.also_user = v
+                }),
+            )
+            .into_any(),
+        );
+    }
+
+    // The password is where the engine keeps it: a user's on MySQL and
+    // PostgreSQL, the login's on SQL Server (`users::takes_password`).
+    if schemaic_core::users::takes_password(target.dialect, kind) {
         rows.push(password_row(d, ring, target.dialect));
     }
 
@@ -901,7 +965,7 @@ pub(crate) fn account_editor_overlay(d: DdlUi) -> impl IntoView {
                                     d,
                                     (&target).into(),
                                     &subject,
-                                    preview_change(&draft, &target),
+                                    preview_changes(&draft, &target),
                                 );
                             },
                         ),
@@ -1037,7 +1101,9 @@ fn grant_form(
                 )
                 .into_any(),
             );
-            if !seed.revoke {
+            // No admin option where the engine's membership has none — SQL
+            // Server's is `ALTER ROLE … ADD MEMBER` and nothing more.
+            if !seed.revoke && schemaic_core::users::supports_role_admin_option(target.dialect) {
                 rows.push(
                     form_setting(
                         "With admin option",
@@ -1321,7 +1387,7 @@ pub(crate) fn grant_editor_overlay(d: DdlUi, overlay: OverlayUi) -> impl IntoVie
                                         d,
                                         (&target).into(),
                                         &target.account.display(),
-                                        change,
+                                        vec![change],
                                     );
                                 }
                             },
@@ -1687,6 +1753,7 @@ mod account_change_tests {
             system: false,
             attributes: Vec::new(),
             role_ambiguous: false,
+            login: None,
         }
     }
 
@@ -1697,6 +1764,8 @@ mod account_change_tests {
             name: "  app  ".into(),
             host: "  %  ".into(),
             kind: PrincipalKind::User,
+            login: String::new(),
+            also_user: false,
             password: "hunter2".into(),
             scram_salt: None,
             password_policy: None,
@@ -1729,6 +1798,8 @@ mod account_change_tests {
             name: "somebody_else".into(),
             host: "%".into(),
             kind: PrincipalKind::User,
+            login: String::new(),
+            also_user: false,
             password: "hunter2".into(),
             scram_salt: None,
             password_policy: None,
@@ -1750,6 +1821,8 @@ mod account_change_tests {
             name: "ignored".into(),
             host: "ignored".into(),
             kind: PrincipalKind::User,
+            login: String::new(),
+            also_user: false,
             password: "hunter2".into(),
             scram_salt: None,
             password_policy: None,
@@ -1834,6 +1907,7 @@ mod account_change_tests {
             system: false,
             attributes: Vec::new(),
             role_ambiguous: false,
+            login: None,
         });
         target.password_policy = Some(schemaic_core::users::PasswordPolicy {
             encryption: schemaic_core::users::PasswordEncryption::Md5,
