@@ -2258,6 +2258,18 @@ pub enum Change {
         name: String,
         type_name: String,
     },
+    /// A computed column dropped and added back as `column` — reading the
+    /// names the plan leaves — around a change to a column it reads, which
+    /// SQL Server refuses while it stands (`repair_tsql_dependents`).
+    ///
+    /// **A change of its own, not a `DropColumn` and an `AddColumn`**, because
+    /// the preview must tell the two apart: this loses no data — the value is
+    /// the expression's — where a real drop of a column and an add of a
+    /// computed one under its name does, and a pair would have had to be read
+    /// as one or the other.
+    RebuildComputedColumn {
+        column: Box<ColumnInfo>,
+    },
     /// A column changed. `from.name != to.name` is a rename; `position` is set
     /// only when the column also moved (MySQL only).
     AlterColumn {
@@ -2818,6 +2830,11 @@ impl Change {
                 )
             }
             Change::DropColumn { name, .. } => format!("Drop column {name}"),
+            Change::RebuildComputedColumn { column } => format!(
+                "Rebuild computed column {} as ({}) around the column change",
+                column.name,
+                column.generated.as_deref().unwrap_or_default()
+            ),
             Change::AlterColumn {
                 from, to, position, ..
             } => {
@@ -3179,6 +3196,13 @@ impl Change {
             Change::DropColumn { name, .. } => {
                 vec![format!("Drops column {name} and all the data in it.")]
             }
+            // No data: the value is the expression's. What does change is
+            // where the column sits, and T-SQL has no way to put it back.
+            Change::RebuildComputedColumn { column } => vec![format!(
+                "Drops computed column {} and adds it back, so it moves to the end \
+                 of the table.",
+                column.name
+            )],
             Change::AlterColumn { from, to, .. } => alter_risks(from, to, dialect),
             Change::PrimaryKey { from, to, .. } if !from.is_empty() && to.is_empty() => {
                 vec!["Leaves the table without a primary key — rows can no longer be edited from the grid.".to_string()]
@@ -4158,9 +4182,19 @@ impl ChangeSet {
         // they cannot share: a rename onto the name of a column this plan
         // drops would otherwise collide with it (Msg 15335).
         for c in &admitted {
-            if let Change::DropColumn { name, .. } = c {
-                out.push(tsql_drop_default(&q, name));
-                out.push(format!("ALTER TABLE {q} DROP COLUMN {};", ident(name)));
+            match c {
+                Change::DropColumn { name, .. } => {
+                    out.push(tsql_drop_default(&q, name));
+                    out.push(format!("ALTER TABLE {q} DROP COLUMN {};", ident(name)));
+                }
+                // A computed column has no default to drop.
+                Change::RebuildComputedColumn { column } => {
+                    out.push(format!(
+                        "ALTER TABLE {q} DROP COLUMN {};",
+                        ident(&column.name)
+                    ));
+                }
+                _ => {}
             }
         }
         // Column renames, once nothing being dropped still names the column:
@@ -4201,6 +4235,10 @@ impl ChangeSet {
                     "ALTER TABLE {q} ADD {}{with_values};",
                     column.definition_sql(d)
                 ));
+            }
+            // Back once what it reads is renamed and altered.
+            if let Change::RebuildComputedColumn { column } = c {
+                out.push(format!("ALTER TABLE {q} ADD {};", column.definition_sql(d)));
             }
         }
         // The keys, checks and indexes over the columns as they now are.
@@ -4291,7 +4329,8 @@ impl ChangeSet {
                     };
                     out.push(on.set(to.comment.as_deref()));
                 }
-                Change::AddColumn { column, .. } => {
+                // A rebuilt column's went with it when it was dropped.
+                Change::AddColumn { column, .. } | Change::RebuildComputedColumn { column } => {
                     if let Some(cm) = blank_as_none(column.comment.as_deref()) {
                         let on = TsqlComment {
                             column: Some(&column.name),
@@ -9250,6 +9289,8 @@ enum TsqlDependent {
     Index,
     ForeignKey,
     Check,
+    /// A computed column reading the column.
+    Computed,
 }
 
 /// Does altering `from` into `to` fail on SQL Server while `dep` depends on
@@ -9268,6 +9309,10 @@ enum TsqlDependent {
 ///   an index is refused.
 /// - **Anything else** — a new type or collation — is refused under all of
 ///   them.
+/// - **A computed column survives none of it**, a widening or a nullability
+///   change included — and not a rename either (Msg 15336), which is not a
+///   question for this function since the name is not restated: the caller
+///   asks it separately.
 fn tsql_alter_disturbs(from: &ColumnInfo, to: &ColumnInfo, dep: TsqlDependent) -> bool {
     // An identity is `NOT NULL` whatever the draft says, as
     // `tsql_alter_column` writes it.
@@ -9290,6 +9335,7 @@ fn tsql_alter_disturbs(from: &ColumnInfo, to: &ColumnInfo, dep: TsqlDependent) -
         TsqlDependent::Index => !widening,
         TsqlDependent::ForeignKey => retyped,
         TsqlDependent::Check => retyped && !widening,
+        TsqlDependent::Computed => true,
     }
 }
 
@@ -9335,10 +9381,52 @@ fn repair_tsql_dependents(
     if altered.is_empty() {
         return;
     }
+    let d = SqlDialect::MsSql;
+    let reads = |expr: &str, col: &str| repoint_check_column(expr, col, col, d).is_some();
+    // The expression re-pointed at the columns' new names.
+    let repointed = |expr: &str| {
+        let mut expr = expr.to_string();
+        for (f, t) in altered.iter().filter(|(f, t)| f.name != t.name) {
+            if let Some(e) = repoint_check_column(&expr, &f.name, &t.name, d) {
+                expr = e;
+            }
+        }
+        expr
+    };
+    // **Computed columns first**, since what stands on one of them has to come
+    // off with it. One is rebuilt when it reads a column the plan renames or
+    // changes, and neither the draft's own edit nor its drop already covers it.
+    let drafted: HashSet<&str> = changes
+        .iter()
+        .filter_map(|c| match c {
+            Change::AlterColumn { from, .. } => Some(from.name.as_str()),
+            Change::DropColumn { name, .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    let rebuilt: Vec<ColumnInfo> = current
+        .columns
+        .iter()
+        .filter(|c| !drafted.contains(c.name.as_str()))
+        .filter_map(|c| {
+            let expr = c.generated.as_deref()?;
+            altered
+                .iter()
+                .any(|(f, t)| {
+                    reads(expr, &f.name)
+                        && (f.name != t.name || tsql_alter_disturbs(f, t, TsqlDependent::Computed))
+                })
+                .then(|| ColumnInfo {
+                    generated: Some(repointed(expr)),
+                    ..c.clone()
+                })
+        })
+        .collect();
     let disturbs = |column: &str, dep: TsqlDependent| {
-        altered
-            .iter()
-            .any(|(f, t)| f.name.eq_ignore_ascii_case(column) && tsql_alter_disturbs(f, t, dep))
+        rebuilt.iter().any(|c| c.name.eq_ignore_ascii_case(column))
+            || altered
+                .iter()
+                .any(|(f, t)| f.name.eq_ignore_ascii_case(column) && tsql_alter_disturbs(f, t, dep))
     };
     let mut touched_ix: HashSet<String> = HashSet::new();
     let mut touched_fk: HashSet<String> = HashSet::new();
@@ -9411,28 +9499,26 @@ fn repair_tsql_dependents(
         if touched_ck.contains(&ck.name) {
             continue;
         }
-        let d = SqlDialect::MsSql;
-        let names = |col: &str| repoint_check_column(&ck.expression, col, col, d).is_some();
-        if !altered
-            .iter()
-            .any(|(f, t)| names(&f.name) && tsql_alter_disturbs(f, t, TsqlDependent::Check))
+        let names = |col: &str| reads(&ck.expression, col);
+        let on_rebuilt = rebuilt.iter().any(|c| names(&c.name));
+        if !on_rebuilt
+            && !altered
+                .iter()
+                .any(|(f, t)| names(&f.name) && tsql_alter_disturbs(f, t, TsqlDependent::Check))
         {
             continue;
-        }
-        let mut expr = ck.expression.clone();
-        for (f, t) in altered.iter().filter(|(f, t)| f.name != t.name) {
-            if let Some(e) = repoint_check_column(&expr, &f.name, &t.name, d) {
-                expr = e;
-            }
         }
         repairs.push(Change::DropCheck {
             name: ck.name.clone(),
         });
         repairs.push(Change::AddCheck(Box::new(CheckInfo {
-            expression: expr,
+            expression: repointed(&ck.expression),
             ..ck.clone()
         })));
     }
+    repairs.extend(rebuilt.into_iter().map(|c| Change::RebuildComputedColumn {
+        column: Box::new(c),
+    }));
     changes.extend(repairs);
 }
 
@@ -10176,6 +10262,15 @@ pub fn supports_change(dialect: SqlDialect, change: &Change) -> bool {
         SqlDialect::MsSql => return tsql_supports(change),
         SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => {}
     }
+    // SQL Server's repair alone (`repair_tsql_dependents`): the other engines
+    // change a column under a computed one themselves, and no emitter of
+    // theirs writes it.
+    if matches!(change, Change::RebuildComputedColumn { .. }) {
+        return match dialect {
+            SqlDialect::MsSql => true,
+            SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+        };
+    }
     // **The one family that is narrower than "everything but SQLite".** A
     // scheduled event is MySQL's; PostgreSQL has no `CREATE EVENT` and SQLite no
     // scheduler, so this is asked before the blanket answer below rather than
@@ -10402,6 +10497,7 @@ fn tsql_supports(change: &Change) -> bool {
         | Change::DropRoutine(_)
         | Change::RenameTable { .. }
         | Change::DropColumn { .. }
+        | Change::RebuildComputedColumn { .. }
         | Change::AddIndex(_)
         | Change::DropIndex { .. }
         | Change::KeepLossyIndex { .. }
@@ -13602,6 +13698,12 @@ mod tests {
             Change::DropRoutine(Box::default()),
             Change::CreateTable(Box::default()),
             Change::RenameTable { to: "u".into() },
+            Change::RebuildComputedColumn {
+                column: Box::new(ColumnInfo {
+                    generated: Some("[a]*(2)".into()),
+                    ..ms_col("x", "int")
+                }),
+            },
             Change::AddColumn {
                 column: Box::new(ms_col("c", "int")),
                 position: None,
@@ -14185,6 +14287,84 @@ mod tests {
                 cs.changes
             );
         }
+    }
+
+    /// `s`, the computed `x AS ([s]*(2))` with an index and a comment, and the
+    /// computed `w AS ([id]+(1))`, which does not read `s`.
+    fn ms_computed_table() -> TableInfo {
+        let mut t = ms_dependents_table();
+        t.columns.truncate(1);
+        t.indexes.truncate(1);
+        t.foreign_keys.clear();
+        t.check_constraints.clear();
+        t.columns.push(ms_col("s", "int"));
+        t.columns.push(ColumnInfo {
+            generated: Some("[s]*(2)".into()),
+            comment: Some("doubled".into()),
+            ..ms_col("x", "int")
+        });
+        t.columns.push(ColumnInfo {
+            generated: Some("[id]+(1)".into()),
+            ..ms_col("w", "int")
+        });
+        t.indexes
+            .push(crate::schema::IndexInfo::plain("ix_x", vec!["x"], false));
+        t
+    }
+
+    /// **SQL Server will not rename or alter a column a computed column reads**
+    /// (Msg 15336, Msg 5074 — measured, and not even a nullability change or a
+    /// `varchar` widening), so the computed column is dropped before and added
+    /// back after, reading the new name, with what stands on it — its index,
+    /// its comment. It comes back at the end of the table, and the preview
+    /// says that rather than that its data is lost.
+    #[test]
+    fn sql_server_rebuilds_a_computed_column_around_what_it_reads() {
+        let t = ms_computed_table();
+        let mut d = TableDraft::from_table(&t);
+        d.columns[1].info.name = "s2".into();
+        let cs = diff(&t, &d, MsSql);
+        assert!(cs.unsupported().is_empty(), "{:?}", cs.unsupported());
+        let stmts = cs.emit();
+        let at = |needle: &str| {
+            stmts
+                .iter()
+                .position(|s| s.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} not in {stmts:#?}"))
+        };
+        assert!(at("DROP INDEX [ix_x]") < at("DROP COLUMN [x]"));
+        assert!(at("DROP COLUMN [x]") < at("N'COLUMN';"), "{stmts:#?}");
+        assert!(at("N'COLUMN';") < at("ADD [x] AS ([s2]*(2))"));
+        assert!(at("ADD [x] AS ([s2]*(2))") < at("CREATE INDEX [ix_x]"));
+        assert!(at("N'doubled'") > at("ADD [x] AS"));
+        assert!(!stmts.iter().any(|s| s.contains("[w]")), "{stmts:#?}");
+        let risks = cs.destructive();
+        assert!(
+            !risks.iter().any(|r| r.contains("all the data")),
+            "{risks:#?}"
+        );
+        assert!(
+            risks
+                .iter()
+                .any(|r| r.contains("x") && r.contains("end of the table")),
+            "{risks:#?}"
+        );
+
+        // A retype and a nullability change alone rebuild it too; a new
+        // default does not.
+        for (ty, nullable, rebuilt) in [("bigint", true, true), ("int", false, true)] {
+            let d = retyped(&t, &[("s", ty, nullable)]);
+            let plan = ms_plan(&t, &d);
+            assert_eq!(
+                plan.iter()
+                    .any(|p| p.starts_with("Rebuild computed column x")),
+                rebuilt,
+                "{ty} {nullable}: {plan:#?}"
+            );
+        }
+        let mut d = TableDraft::from_table(&t);
+        d.columns[1].info.default = Some("0".into());
+        assert_eq!(ms_plan(&t, &d).len(), 1, "{:#?}", ms_plan(&t, &d));
     }
 
     /// **A SQL Server table diffs to nothing against its own draft** — the
@@ -24931,7 +25111,7 @@ mod database_tests {
     /// claimed set *equals* `0..count`, so a duplicated or skipped index fails
     /// it too, which a length could not see.
     ///
-    /// The fifty-two names on the `None` side are not noise: they are the cost
+    /// The fifty-three names on the `None` side are not noise: they are the cost
     /// of the guarantee, and the compiler maintains them.
     fn account_variant_index(change: &Change) -> Option<usize> {
         match change {
@@ -24949,6 +25129,7 @@ mod database_tests {
             | Change::RenameTable { .. }
             | Change::AddColumn { .. }
             | Change::DropColumn { .. }
+            | Change::RebuildComputedColumn { .. }
             | Change::AlterColumn { .. }
             | Change::PrimaryKey { .. }
             | Change::AddIndex(_)

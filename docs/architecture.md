@@ -4000,18 +4000,38 @@ existing prose was left alone.
     or comment changes; a nullability change alone disturbs an index or key but not a foreign key
     or a check; widening a `varchar`, `nvarchar` or `varbinary` — the same type, a length no
     shorter, the same collation and nullability, `max` not counting as a length — disturbs a
-    foreign key only; any other change of type or collation disturbs all of them. Each disturbed dependent goes off and back on as it was, in the
+    foreign key only; any other change of type or collation disturbs all of them. **A computed
+    column survives none of it** — not a nullability change, not a widening, and not a rename
+    either (Msg 15336; the rest Msg 5074, measured on 2022) — so `tsql_alter_disturbs` answers yes
+    for one once anything but the name, default or comment changes, and the caller asks the rename
+    separately. Computed columns are worked out **first**, since what stands on a rebuilt one — an
+    index, the key, a foreign key, a check — is disturbed with it and goes off and back on too.
+    Each disturbed dependent goes off and back on as it was, in the
     draft's column names: an index or unique constraint as `DropIndex` + `AddIndex`, a foreign key
     and a check as their pairs, and the key as a `Change::PrimaryKey` whose `from` equals its `to`,
     under the constraint name introspection read. The preview summarises that one as *Rebuild the
     primary key (…) around the column change*, not the swap's *no longer unique* sentence, and its
     risk says what it does cost: a clustered key rewrites the table, and a foreign key in another
-    table referencing it stops the plan. **A dependent the draft already drops or adds is the
-    draft's**, as with the check repair; and a lossy index — included columns, say — is not
+    table referencing it stops the plan. A computed column goes off and back on as a
+    `Change::RebuildComputedColumn`, carrying the column with its expression re-pointed at the
+    plan's new names through `repoint_check_column`. **It is a variant of its own, not a
+    `DropColumn` plus an `AddColumn`**, because the preview has to tell it from a real drop of a
+    column and an add of a computed one under the same name, which does lose the column's data.
+    `emit_mssql` drops it among the dropped columns (it has no default to look up), adds it back
+    `ADD [x] AS (…)` after the added columns, and re-adds its comment in the comment phase, since
+    the extended property went with the drop. The preview summarises it as *Rebuild computed column
+    x as (…) around the column change*, and its risk names the one cost: nothing is lost, the value
+    being the expression's, but the column moves to the end of the table, T-SQL having no reorder.
+    `supports_change` is true for it on SQL Server and false elsewhere — an exhaustive `match` after
+    SQL Server's early return — because only SQL Server's `diff` raises it and no other emitter
+    writes it. **A dependent the draft already drops or adds is the
+    draft's**, as with the check repair — and so is a computed column the draft itself alters or
+    drops; and a lossy index — included columns, say — is not
     touched, so the server refuses the retype naming it and the plan, one transaction, rolls back
     whole (`sql_server_takes_a_retyped_columns_dependents_off_and_back_on`,
     `sql_server_rebuilds_only_the_dependents_a_change_disturbs`,
-    `sql_server_leaves_a_drafted_dependent_to_the_draft`).
+    `sql_server_leaves_a_drafted_dependent_to_the_draft`,
+    `sql_server_rebuilds_a_computed_column_around_what_it_reads`).
     `DropCheck` carries a risk sentence though it deletes no data — the table stops
     guaranteeing something and nothing else says so — but `ChangeSet::destructive`
     suppresses it when the same name is re-added in the same plan, since every check
@@ -10746,10 +10766,14 @@ existing prose was left alone.
   `a_retype_under_its_dependents_lands` retypes columns under the key, an index, a unique
   constraint and a check, reads each back under its name — the unique one still a constraint —
   with the data kept, the foreign key on a nullability-only change left on, and the result
-  round-tripping. **One known limit, loud**: a computed column referencing a column the plan
-  retypes or renames is not moved out of the way, so the retype fails with Msg 5074 or the rename
-  with 15336, and the plan rolls back whole. Still not done: the view, routine and trigger
-  editors.
+  round-tripping; `a_column_under_a_computed_one_is_renamed_and_retyped` renames and retypes the
+  column a persisted computed column reads, the computed one carrying an index and a comment, and
+  reads it back last in the table — reading the new name, still persisted, its index and comment
+  back — with its value recomputed and the result round-tripping. That was a known limit, loud,
+  until then: a computed column referencing a column the plan retyped or renamed was not moved out
+  of the way, so the retype failed with Msg 5074 or the rename with 15336, and the plan rolled back
+  whole; `repair_tsql_dependents` now rebuilds it (under `ddl.rs`). Still not done: the view,
+  routine and trigger editors.
   **`DATABASE_LISTING` asks `HAS_DBACCESS` inside a `CASE`, and only of a multi-user database.**
   On one another session holds `SINGLE_USER`, that call took 2,174 ms against 150 ms (SQL Server
   2022 CU27) — what an administrator's maintenance window would cost every tree refresh — and a

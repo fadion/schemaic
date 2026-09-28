@@ -1223,6 +1223,44 @@ async fn a_retype_under_its_dependents_lands() {
     assert!(again.changes.is_empty(), "{:?}", again.changes);
 }
 
+/// **A column a computed one reads is renamed and retyped**: the persisted
+/// computed column, its index and its comment come off and go back reading the
+/// new name — at the end of the table, since T-SQL has no reorder — with its
+/// values recomputed and the table round-tripping to nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_column_under_a_computed_one_is_renamed_and_retyped() {
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("ddl_computed").await;
+    s.exec(
+        "CREATE TABLE dbo.t (id int NOT NULL PRIMARY KEY, s int NULL, \
+           x AS (s * 2) PERSISTED, note int NULL); \
+         CREATE INDEX ix_x ON dbo.t (x); \
+         EXEC sp_addextendedproperty N'MS_Description', N'doubled', \
+           N'SCHEMA', N'dbo', N'TABLE', N't', N'COLUMN', N'x'; \
+         INSERT dbo.t (id, s) VALUES (1, 21)",
+    )
+    .await;
+    let t = read_table(&s, "t").await;
+    let mut d = schemaic_core::ddl::TableDraft::from_table(&t);
+    let col = d.columns.iter_mut().find(|c| c.info.name == "s").unwrap();
+    col.info.name = "s2".into();
+    col.info.type_name = "bigint".into();
+    let stmts = apply_draft(&s, &t, &d).await;
+    let t2 = read_table(&s, "t").await;
+    let names: Vec<&str> = t2.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["id", "s2", "note", "x"], "{stmts:#?}");
+    let x = &t2.columns[3];
+    assert_eq!(x.generated.as_deref(), Some("[s2]*(2)"));
+    assert!(x.generated_stored);
+    assert_eq!(x.comment.as_deref(), Some("doubled"));
+    assert!(t2.indexes.iter().any(|i| i.name == "ix_x"));
+    assert_eq!(s.scalar("SELECT x FROM dbo.t WHERE id = 1").await, "42");
+    let again = schemaic_core::ddl::diff(&t2, &schemaic_core::ddl::TableDraft::from_table(&t2), MS);
+    assert!(again.changes.is_empty(), "{:?}", again.changes);
+}
+
 /// A primary key widened to two columns: dropped by the constraint name
 /// introspection read, and added over both.
 #[tokio::test(flavor = "multi_thread")]
