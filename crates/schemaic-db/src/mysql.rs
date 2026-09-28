@@ -1403,6 +1403,7 @@ async fn collect_schema(conn: &mut Conn, database: &str) -> Result<DbSchema, DbE
                 // MySQL publishes no per-index `CREATE`; the model
                 // reconstructs one from the columns it read.
                 create_sql: None,
+                clustered: None,
             }
         })
         .collect();

@@ -3182,6 +3182,7 @@ fn table_indexes(conn: &SqliteConn, db: &str, table: &str) -> Result<Vec<IndexIn
             // renamed to — and absent for exactly the indexes SQLite declares
             // itself, which have no statement of their own to keep.
             create_sql: declared.get(&name).cloned(),
+            clustered: None,
         });
     }
     Ok(out)

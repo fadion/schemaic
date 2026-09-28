@@ -1292,15 +1292,14 @@ async fn collect_schema(client: &mut MsClient) -> Result<DbSchema, DbError> {
         .map(|r| {
             let mut column = IndexColumn::plain(cell(r, 5));
             column.descending = flag(r, 6);
-            // Heap and nonclustered rowstore (types 0 and 2) are what the model
-            // can say; a columnstore, XML or spatial index is not, and neither
-            // are included columns — which an edit would drop. **Nor is a
-            // clustered index other than the key's**: `IndexInfo` has no
-            // clustered flag, so recreating one writes a plain `CREATE INDEX`
-            // and the table becomes a heap. The primary key's is re-added by
-            // `ADD PRIMARY KEY`, which is clustered by default.
+            // Rowstore indexes — clustered and nonclustered, types 1 and 2 —
+            // are what the model can say; a columnstore, XML or spatial index
+            // is not, and neither are included columns, which an edit would
+            // drop. Clustering is `IndexInfo::clustered`: before it was
+            // modelled, a clustered index other than the key's had to be
+            // withheld, since recreating it plainly left the table a heap.
             let kind = int(r, 8);
-            let lossy = kind > 2 || flag(r, 9) || (kind == 1 && !flag(r, 4));
+            let lossy = kind > 2 || flag(r, 9);
             (
                 cell(r, 0),
                 IdxRow {
@@ -1312,6 +1311,7 @@ async fn collect_schema(client: &mut MsClient) -> Result<DbSchema, DbError> {
                     predicate: r.get(7).cloned().flatten().map(|p| strip_outer_parens(&p)),
                     lossy,
                     create_sql: None,
+                    clustered: Some(kind == 1),
                 },
             )
         })

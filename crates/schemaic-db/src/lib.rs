@@ -1881,6 +1881,9 @@ pub(crate) struct IdxRow {
     /// accessor. See [`schemaic_core::schema::IndexInfo::create_sql`] for the
     /// one job it does.
     pub create_sql: Option<String>,
+    /// SQL Server's `CLUSTERED` — see
+    /// [`schemaic_core::schema::IndexInfo::clustered`]. `None` elsewhere.
+    pub clustered: Option<bool>,
 }
 
 /// One `KEY_COLUMN_USAGE` row for a foreign key: `(table, constraint, column,
@@ -2021,6 +2024,7 @@ pub(crate) fn assemble_schema(
                 // PostgreSQL's `pg_get_indexdef` is a real one, and is what
                 // lets an index the model only partly read be emitted whole.
                 create_sql: r.create_sql.clone(),
+                clustered: r.clustered,
             });
         }
     }
@@ -3361,6 +3365,7 @@ mod tests {
             predicate: None,
             lossy: false,
             create_sql: None,
+            clustered: None,
         }
     }
 

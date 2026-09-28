@@ -229,6 +229,22 @@ pub struct IndexInfo {
     /// and if the model can't carry it the plan is refused instead
     /// (`ddl::ChangeSet::unsupported`).
     pub create_sql: Option<String>,
+    /// SQL Server's **`CLUSTERED`** (`Some(true)`): this index *is* the table's
+    /// rows, in its key order; `Some(false)` for a `NONCLUSTERED` one. `None`
+    /// on every other engine, which has no such choice — and for an index the
+    /// designer is making, which takes T-SQL's default (`CLUSTERED` for a key,
+    /// `NONCLUSTERED` otherwise).
+    ///
+    /// **Three states, not a flag**, because the key is the case that needs
+    /// the third: a `false` would have read every MySQL key as nonclustered.
+    ///
+    /// Modelled because restating one without it is a different table: a
+    /// clustered index recreated as a plain `CREATE INDEX` leaves the table a
+    /// heap, and a primary key that was `NONCLUSTERED` re-added with T-SQL's
+    /// default becomes the clustered one — or is refused, when another index
+    /// already is (Msg 1902). Without the field, a clustered index other than
+    /// the key's could only be withheld as [`IndexInfo::lossy`].
+    pub clustered: Option<bool>,
 }
 
 /// What a [`TableInfo`] actually **is** — the three answers
@@ -4327,8 +4343,9 @@ impl TableInfo {
         };
         if let Some(pk) = self.indexes.iter().find(|ix| ix.is_primary()) {
             lines.push(format!(
-                "  {}PRIMARY KEY ({})",
+                "  {}PRIMARY KEY{} ({})",
                 constraint(pk),
+                crate::ddl::key_clustering(pk.clustered, d),
                 pk.key_sql(d)
             ));
         } else {
@@ -4347,7 +4364,17 @@ impl TableInfo {
             .iter()
             .filter(|ix| !ix.is_primary() && ix.unique && ix.constraint.is_some())
         {
-            lines.push(format!("  {}UNIQUE ({})", constraint(ix), ix.key_sql(d)));
+            // And for a unique constraint or an index it is `NONCLUSTERED`.
+            let cl = if ix.clustered == Some(true) {
+                " CLUSTERED"
+            } else {
+                ""
+            };
+            lines.push(format!(
+                "  {}UNIQUE{cl} ({})",
+                constraint(ix),
+                ix.key_sql(d)
+            ));
         }
         for ck in &self.check_constraints {
             lines.push(format!(
@@ -4379,12 +4406,17 @@ impl TableInfo {
                 continue;
             }
             let uniq = if ix.unique { "UNIQUE " } else { "" };
+            let cl = if ix.clustered == Some(true) {
+                "CLUSTERED "
+            } else {
+                ""
+            };
             let filter = match &ix.predicate {
                 Some(p) => format!(" WHERE {p}"),
                 None => String::new(),
             };
             out.push_str(&format!(
-                "\nCREATE {uniq}INDEX {} ON {qname} ({}){filter};",
+                "\nCREATE {uniq}{cl}INDEX {} ON {qname} ({}){filter};",
                 q(&ix.name),
                 ix.key_sql(d),
             ));
@@ -7364,6 +7396,49 @@ mod tests {
         // A column the designer made has none, and gets the default counter.
         id.identity_spec = None;
         assert_eq!(id.tsql_definition(), "[id] bigint IDENTITY(1,1) NOT NULL");
+    }
+
+    /// Clustering is restated: a `NONCLUSTERED` key says so, and the index
+    /// that orders the table — a plain one, or a unique constraint — says
+    /// `CLUSTERED`. A copy written with T-SQL's defaults would be clustered on
+    /// the key, or refused (Msg 1902).
+    #[test]
+    fn create_ddl_sql_server_restates_clustering() {
+        let mut pk = IndexInfo::plain("PRIMARY", vec!["id"], true);
+        pk.constraint = Some("pk_t".into());
+        pk.clustered = Some(false);
+        let mut cx = IndexInfo::plain("cx", vec!["d"], false);
+        cx.clustered = Some(true);
+        let t = TableInfo {
+            schema: Some("dbo".into()),
+            name: "t".into(),
+            columns: vec![col("id", "int", false, true), col("d", "int", true, false)],
+            indexes: vec![pk, cx],
+            ..Default::default()
+        };
+        let ddl = t.create_ddl(crate::intel::SqlDialect::MsSql);
+        assert!(
+            ddl.contains("  CONSTRAINT [pk_t] PRIMARY KEY NONCLUSTERED ([id])\n"),
+            "{ddl}"
+        );
+        assert!(
+            ddl.contains("\nCREATE CLUSTERED INDEX [cx] ON [dbo].[t] ([d]);"),
+            "{ddl}"
+        );
+        let mut t = t;
+        t.indexes[0].clustered = Some(true);
+        t.indexes[1] = {
+            let mut uq = IndexInfo::plain("uq_d", vec!["d"], true);
+            uq.constraint = Some("uq_d".into());
+            uq.clustered = Some(false);
+            uq
+        };
+        let ddl = t.create_ddl(crate::intel::SqlDialect::MsSql);
+        assert!(
+            ddl.contains("  CONSTRAINT [pk_t] PRIMARY KEY ([id]),"),
+            "{ddl}"
+        );
+        assert!(ddl.contains("  CONSTRAINT [uq_d] UNIQUE ([d])"), "{ddl}");
     }
 
     /// A table's and its columns' comments are restated, as the extended

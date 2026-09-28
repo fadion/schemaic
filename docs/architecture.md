@@ -3810,7 +3810,24 @@ existing prose was left alone.
     `ColumnInfo::definition_sql`'s T-SQL arm (under `schema.rs`), and a check writes no
     `NOT ENFORCED` there (`CheckInfo::clause_sql`, asking `writes_not_enforced`), T-SQL having no
     such clause (`create_table_on_sql_server_writes_t_sql`,
-    `create_table_on_sql_server_writes_no_mysql_options`). Ordering
+    `create_table_on_sql_server_writes_no_mysql_options`).
+    **Clustering is written wherever T-SQL's default would be wrong, and the default differs by
+    kind**: a key is `CLUSTERED` unless it says otherwise, an index or a unique constraint
+    `NONCLUSTERED`. So `create_index_sql` writes `CREATE [UNIQUE] CLUSTERED INDEX` for an
+    `IndexInfo::clustered` of `Some(true)`, and `emit_mssql`'s unique-constraint re-add writes
+    `UNIQUE CLUSTERED` likewise, while `key_clustering` gives a key ` NONCLUSTERED` for `Some(false)`
+    and nothing otherwise — the one spelling `emit_mssql`'s `ADD … PRIMARY KEY`,
+    `create_table_sql`'s key clause and `tsql_create_ddl`'s key share. The key's clustering rides on
+    `TableDraft::primary_key_clustered`, which `from_table` reads off the `PRIMARY` index, and on
+    `Change::PrimaryKey::clustered`, which `diff` fills from the draft — so a key redrawn over other
+    columns keeps what it had — and `repair_tsql_dependents` from the key's own index. Either
+    default taken wrongly is a different table: a clustered index recreated plainly leaves the
+    table a heap, and a `NONCLUSTERED` key re-added plainly becomes the clustered one, or is refused
+    where another index already is (Msg 1902)
+    (`sql_server_recreates_a_clustered_index_clustered`,
+    `sql_server_keeps_a_nonclustered_primary_key_nonclustered`). `None` — every other engine, and a
+    key or index the designer is making — takes the default; the designer has no control for it.
+    Ordering
     is dependency-first (FKs and indexes off before the columns under them; keys back on
     after), and **the column clauses inside that are ordered by their dependencies rather than
     grouped by change kind** — `ColumnClause` carries the name a clause makes available and the name
@@ -4009,7 +4026,9 @@ existing prose was left alone.
     Each disturbed dependent goes off and back on as it was, in the
     draft's column names: an index or unique constraint as `DropIndex` + `AddIndex`, a foreign key
     and a check as their pairs, and the key as a `Change::PrimaryKey` whose `from` equals its `to`,
-    under the constraint name introspection read. The preview summarises that one as *Rebuild the
+    under the constraint name and with the clustering introspection read — a `NONCLUSTERED` key
+    re-added with T-SQL's default would come back clustered, or be refused beside a clustered
+    index (Msg 1902). The preview summarises that one as *Rebuild the
     primary key (…) around the column change*, not the swap's *no longer unique* sentence, and its
     risk says what it does cost: a clustered key rewrites the table, and a foreign key in another
     table referencing it stops the plan. A computed column goes off and back on as a
@@ -6506,6 +6525,17 @@ existing prose was left alone.
     takes. SQLite-only in effect: MySQL reports no per-key collation and PostgreSQL reports a
     non-default operator class as `lossy` already. It says nothing about NULL — that is a fact about
     the *table's* columns, which an index cannot see, and the two key resolvers add it.
+    **`IndexInfo::clustered` is SQL Server's `CLUSTERED` (`Some(true)`) or `NONCLUSTERED`
+    (`Some(false)`)**, `None` on every other engine and for an index the designer is making, which
+    takes T-SQL's default — `CLUSTERED` for a key, `NONCLUSTERED` otherwise. Three states rather
+    than a flag because the key is the case that needs the third: a `false` would have read every
+    MySQL key as nonclustered. It is modelled because restating an index without it is a different
+    table — a clustered one recreated as a plain `CREATE INDEX` leaves the table a heap, and a
+    `NONCLUSTERED` key re-added with the default becomes the clustered one, or is refused where
+    another index already is (Msg 1902) — and until it was, a clustered index other than the key's
+    could only be withheld as `lossy`. `tsql_create_ddl` restates it as `PRIMARY KEY NONCLUSTERED`,
+    `UNIQUE CLUSTERED` and `CREATE CLUSTERED INDEX`, writing only the side the default gets wrong
+    (`create_ddl_sql_server_restates_clustering`).
     **`classify_column_type` reads all three engines' spellings now**, the type name being what the
     icon in the schema tree, the ER diagram's cards and tooltips, the completion popup and Find
     Anywhere are chosen from. The MySQL and PostgreSQL gaps were closed one engine at a time and
@@ -10706,7 +10736,8 @@ existing prose was left alone.
   (`sql_server_alters_a_column_in_t_sqls_order`,
   `sql_server_writes_only_the_statements_a_column_change_needs`). **The same rule keeps the
   primary key's name**: it is re-added as `ADD CONSTRAINT [k] PRIMARY KEY (…)` from the
-  `drop_constraint` it was dropped by, T-SQL otherwise inventing a `PK__t__…`. **A nullable column
+  `drop_constraint` it was dropped by, T-SQL otherwise inventing a `PK__t__…` — and with
+  ` NONCLUSTERED` where it was, from `Change::PrimaryKey::clustered`. **A nullable column
   added with a default is added `WITH VALUES`**, filling the rows already there as MySQL and
   PostgreSQL do; without it SQL Server gives the default only to new rows and leaves every existing
   one `NULL` (`a_nullable_column_added_with_a_default_fills_existing_rows`). **A re-added check
@@ -10738,11 +10769,15 @@ existing prose was left alone.
   no reorder), MariaDB's inline check, and an unnamed check or a primary key whose constraint name
   wasn't read, since T-SQL drops both by name. A `TableOptions` is admitted only as the comment
   alone — engine and collation are MySQL's table options.
-  **Introspection marks a clustered index other than the primary key's `lossy`**: `IndexInfo` has
-  no clustered flag, so recreating one wrote a plain `CREATE INDEX` and left the table a heap; an
-  edit to one is now a `KeepLossyIndex` the preview names, and nothing is emitted for it
-  (`a_clustered_index_is_left_alone`). The key's own clustered index is not marked, since `ADD
-  PRIMARY KEY` is clustered by default. Every admitted change is
+  **Introspection reads clustering rather than withholding it**: `IdxRow::clustered` is
+  `Some(sys.indexes.type == 1)` (`IndexInfo::clustered`, under `schema.rs`), and an index is
+  `lossy` only for a type past 2 — columnstore, XML, spatial — or included columns. Before the
+  field a clustered index other than the key's was marked `lossy` too, and an edit to it withheld
+  as a `KeepLossyIndex`, since recreating it plainly left the table a heap; the emitter writes
+  `CLUSTERED` and `NONCLUSTERED` where T-SQL's default is wrong now (under `ddl.rs`), and
+  `a_clustered_index_and_a_nonclustered_key_keep_their_clustering` adds a column to a clustered
+  `cx` beside a `NONCLUSTERED` key, retypes the key's column, and reads both back as they were,
+  the result round-tripping. Every admitted change is
   written by one of the phases bar `KeepLossyIndex`, whose statement is none; the catch-all arms
   write nothing, and that has the opposite hazard — an admitted change one swallowed would vanish
   from the plan in silence — so `sql_server_admits_the_table_changes_it_can_write` walks both
@@ -10801,7 +10836,8 @@ existing prose was left alone.
   The rest of the engine's surface is in `core`: `TableInfo::create_ddl` has a T-SQL arm
   (`tsql_create_ddl` — the identity with the seed and increment `sys.identity_columns` reported,
   and `(1,1)` with a comment saying so only where they were not read, named primary-key and unique
-  constraints, checks, `AS (…) PERSISTED`, other indexes as separate
+  constraints and their clustering (`create_ddl_sql_server_restates_clustering`), checks,
+  `AS (…) PERSISTED`, other indexes as separate
   statements, the table's and columns' comments after them through `ddl::tsql_add_comment` — the
   same `sp_addextendedproperty` the emitter writes (`create_ddl_sql_server_restates_the_comments`)
   — and what it cannot restate named in a comment; a view is its stored definition), held
@@ -11202,7 +11238,8 @@ existing prose was left alone.
   `a_staged_edit_lands_on_its_row_and_reads_back` to `a_stopped_commit_is_undone`, under
   `mssql.rs` above), `run_ddl` and the designer's plans (nine tests, from a designed table and a
   failing plan rolled back whole to an existing table's edit landing as drafted, an edit keeping
-  what it did not change, an identity toggle withheld, a clustered index left alone and every
+  what it did not change, an identity toggle withheld, a clustered index and a nonclustered key
+  keeping their clustering and every
   AdventureWorksLT table round-tripping where that sample is installed, also under `mssql.rs`),
   and the
   two catalogues only it has — `every_allowlisted_function_is_a_builtin` (the read gate's lists,

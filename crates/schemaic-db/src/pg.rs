@@ -1903,6 +1903,8 @@ async fn collect_schema(client: &Client) -> Result<DbSchema, DbError> {
                     create_sql: Some(cell(r, 12))
                         .map(|d| schemaic_core::sql::terminated(&d, SqlDialect::Postgres))
                         .filter(|d| !d.trim().is_empty() && d.trim() != ";"),
+                    // `CLUSTER` is a one-off reorder there, not a kind of index.
+                    clustered: None,
                 },
             )
         })

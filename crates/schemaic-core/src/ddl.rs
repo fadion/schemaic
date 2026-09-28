@@ -206,6 +206,11 @@ pub struct TableDraft {
     /// Primary-key columns in key order, named as they are in this draft (so a
     /// renamed column appears under its new name).
     pub primary_key: Vec<String>,
+    /// The key's SQL Server clustering, as the table has it
+    /// ([`IndexInfo::clustered`] of its `PRIMARY` index) — carried so a copy
+    /// of the table, or a key redrawn, writes a `NONCLUSTERED` key as one.
+    /// `None` for a new table and on every other engine.
+    pub primary_key_clustered: Option<bool>,
     /// Non-primary indexes. The primary key is [`TableDraft::primary_key`], not
     /// an entry here.
     pub indexes: Vec<IndexDraft>,
@@ -243,6 +248,11 @@ impl TableDraft {
                 .map(ColumnDraft::existing)
                 .collect(),
             primary_key: primary_key_of(t),
+            primary_key_clustered: t
+                .indexes
+                .iter()
+                .find(|ix| ix.is_primary())
+                .and_then(|ix| ix.clustered),
             indexes: t
                 .indexes
                 .iter()
@@ -2293,6 +2303,11 @@ pub enum Change {
         from: Vec<String>,
         to: Vec<String>,
         drop_constraint: Option<String>,
+        /// SQL Server's clustering for the key added — the one it had
+        /// ([`IndexInfo::clustered`]), so a `NONCLUSTERED` key goes back
+        /// nonclustered rather than taking T-SQL's `CLUSTERED` default. `None`
+        /// takes the default, and is all the other engines ever carry.
+        clustered: Option<bool>,
     },
     AddIndex(Box<IndexInfo>),
     DropIndex {
@@ -4250,6 +4265,7 @@ impl ChangeSet {
                 Change::PrimaryKey {
                     to,
                     drop_constraint,
+                    clustered,
                     ..
                 } if !to.is_empty() => {
                     let named = drop_constraint
@@ -4257,7 +4273,8 @@ impl ChangeSet {
                         .map(|k| format!("CONSTRAINT {} ", ident(k)))
                         .unwrap_or_default();
                     out.push(format!(
-                        "ALTER TABLE {q} ADD {named}PRIMARY KEY ({});",
+                        "ALTER TABLE {q} ADD {named}PRIMARY KEY{} ({});",
+                        key_clustering(*clustered, d),
                         self.key_list(to)
                     ));
                 }
@@ -4296,9 +4313,15 @@ impl ChangeSet {
                 // index where the draft said constraint.
                 Change::AddIndex(ix) if ix.unique && ix.predicate.is_none() => match &ix.constraint
                 {
+                    // A unique constraint's default is `NONCLUSTERED` too.
                     Some(k) => out.push(format!(
-                        "ALTER TABLE {q} ADD CONSTRAINT {} UNIQUE ({});",
+                        "ALTER TABLE {q} ADD CONSTRAINT {} UNIQUE{} ({});",
                         ident(k),
+                        if ix.clustered == Some(true) {
+                            " CLUSTERED"
+                        } else {
+                            ""
+                        },
                         ix.key_sql(d)
                     )),
                     None => out.push(create_index_sql(ix, &q, d)),
@@ -6273,6 +6296,11 @@ fn fk_clause(fk: &ForeignKeyInfo, dialect: SqlDialect) -> String {
 
 fn create_index_sql(ix: &IndexInfo, qtable: &str, dialect: SqlDialect) -> String {
     let uniq = if ix.unique { "UNIQUE " } else { "" };
+    // T-SQL's default is `NONCLUSTERED`, so only the other is written.
+    let cluster = match dialect {
+        SqlDialect::MsSql if ix.clustered == Some(true) => "CLUSTERED ",
+        SqlDialect::MsSql | SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => "",
+    };
     let using = match &ix.method {
         Some(m) if writes_index_method(dialect) => format!(" USING {m}"),
         _ => String::new(),
@@ -6284,7 +6312,7 @@ fn create_index_sql(ix: &IndexInfo, qtable: &str, dialect: SqlDialect) -> String
     // The index name is never qualified — PostgreSQL puts an index in its
     // table's schema automatically and rejects `CREATE INDEX "s"."i"`.
     format!(
-        "CREATE {uniq}INDEX {} ON {qtable}{using} ({}){filter};",
+        "CREATE {uniq}{cluster}INDEX {} ON {qtable}{using} ({}){filter};",
         ddl_ident_in(&ix.name, dialect),
         ix.key_sql(dialect)
     )
@@ -6706,6 +6734,17 @@ fn writes_index_method(dialect: SqlDialect) -> bool {
     }
 }
 
+/// ` NONCLUSTERED` for a primary key that is one on SQL Server, and nothing
+/// otherwise: `CLUSTERED` is T-SQL's default for a key, and no other engine
+/// has the word. `crate::schema`'s *Script table as CREATE* writes its key
+/// through this too.
+pub(crate) fn key_clustering(clustered: Option<bool>, dialect: SqlDialect) -> &'static str {
+    match dialect {
+        SqlDialect::MsSql if clustered == Some(false) => " NONCLUSTERED",
+        SqlDialect::MsSql | SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => "",
+    }
+}
+
 /// `CREATE TABLE` (plus, on PostgreSQL, the statements its `CREATE TABLE` can't
 /// carry: indexes and comments).
 fn create_table_sql(d: &TableDraft, dialect: SqlDialect) -> Vec<String> {
@@ -6756,7 +6795,8 @@ fn create_table_sql(d: &TableDraft, dialect: SqlDialect) -> Vec<String> {
         .collect();
     if !d.primary_key.is_empty() && inline_key.is_none() {
         lines.push(format!(
-            "  PRIMARY KEY ({})",
+            "  PRIMARY KEY{} ({})",
+            key_clustering(d.primary_key_clustered, dialect),
             d.primary_key
                 .iter()
                 .map(|c| q(c))
@@ -9471,6 +9511,7 @@ fn repair_tsql_dependents(
                     from: key.clone(),
                     to: key,
                     drop_constraint: ix.constraint.clone(),
+                    clustered: ix.clustered,
                 });
             }
         } else if !ix.lossy && !touched_ix.contains(&ix.name) {
@@ -10654,6 +10695,8 @@ pub fn diff(current: &TableInfo, draft: &TableDraft, target: impl Into<Target>) 
                 .iter()
                 .find(|ix| ix.is_primary())
                 .and_then(|ix| ix.constraint.clone()),
+            // A key redrawn over other columns keeps the clustering it had.
+            clustered: draft.primary_key_clustered,
         });
     }
 
@@ -13717,6 +13760,7 @@ mod tests {
                 from: vec!["a".into()],
                 to: vec!["a".into(), "b".into()],
                 drop_constraint: Some("pk_t".into()),
+                clustered: None,
             },
             Change::AddIndex(Box::default()),
             Change::DropIndex {
@@ -13783,6 +13827,7 @@ mod tests {
                 from: vec!["a".into()],
                 to: vec!["b".into()],
                 drop_constraint: None,
+                clustered: None,
             },
             Change::DropCheck {
                 name: String::new(),
@@ -13998,6 +14043,7 @@ mod tests {
                     from: vec!["a".into()],
                     to: vec!["a".into(), "b".into()],
                     drop_constraint: Some("pk_ok".into()),
+                    clustered: None,
                 },
                 Change::DropIndex {
                     name: "uq".into(),
@@ -14365,6 +14411,99 @@ mod tests {
         let mut d = TableDraft::from_table(&t);
         d.columns[1].info.default = Some("0".into());
         assert_eq!(ms_plan(&t, &d).len(), 1, "{:#?}", ms_plan(&t, &d));
+    }
+
+    /// `id` under a `NONCLUSTERED` key `pk_t`, and the table's rows ordered by
+    /// the clustered index `cx` on `d`.
+    fn ms_clustered_table() -> TableInfo {
+        let mut t = ms_dependents_table();
+        t.columns.truncate(1);
+        t.columns.push(ms_col("d", "int"));
+        t.indexes.truncate(1);
+        t.indexes[0].clustered = Some(false);
+        t.foreign_keys.clear();
+        t.check_constraints.clear();
+        let mut cx = crate::schema::IndexInfo::plain("cx", vec!["d"], false);
+        cx.clustered = Some(true);
+        t.indexes.push(cx);
+        t
+    }
+
+    /// **A clustered index is recreated clustered**, so an edit to one is
+    /// applied rather than withheld — `CREATE INDEX` alone would leave the
+    /// table a heap.
+    #[test]
+    fn sql_server_recreates_a_clustered_index_clustered() {
+        let t = ms_clustered_table();
+        let mut d = TableDraft::from_table(&t);
+        d.indexes[0].info.columns.push(IndexColumn::plain("id"));
+        let cs = diff(&t, &d, MsSql);
+        assert!(cs.unsupported().is_empty(), "{:?}", cs.unsupported());
+        assert_eq!(
+            cs.emit(),
+            [
+                "DROP INDEX [cx] ON [dbo].[t];",
+                "CREATE CLUSTERED INDEX [cx] ON [dbo].[t] ([d], [id]);",
+            ]
+        );
+        // And a unique one that is a constraint goes back as a clustered one.
+        let mut uq = crate::schema::IndexInfo::plain("uq", vec!["d"], true);
+        uq.constraint = Some("uq".into());
+        uq.clustered = Some(true);
+        assert_eq!(
+            single("t", Some("dbo"), MsSql, Change::AddIndex(Box::new(uq))).emit(),
+            ["ALTER TABLE [dbo].[t] ADD CONSTRAINT [uq] UNIQUE CLUSTERED ([d]);"]
+        );
+        // No other engine has the word.
+        let mut ix = crate::schema::IndexInfo::plain("ix", vec!["d"], false);
+        ix.clustered = Some(true);
+        assert_eq!(
+            create_index_sql(&ix, "t", Postgres),
+            "CREATE INDEX \"ix\" ON t (\"d\");"
+        );
+    }
+
+    /// **A `NONCLUSTERED` key goes back nonclustered**: T-SQL's default for a
+    /// key is `CLUSTERED`, which would either reorder the table by it or, with
+    /// `cx` already clustered, be refused (Msg 1902). The same for a new
+    /// table the draft carries it into.
+    #[test]
+    fn sql_server_keeps_a_nonclustered_primary_key_nonclustered() {
+        let t = ms_clustered_table();
+        let cs = diff(&t, &retyped(&t, &[("id", "bigint", false)]), MsSql);
+        let stmts = cs.emit();
+        assert!(
+            stmts.contains(
+                &"ALTER TABLE [dbo].[t] ADD CONSTRAINT [pk_t] PRIMARY KEY NONCLUSTERED ([id]);"
+                    .to_string()
+            ),
+            "{stmts:#?}"
+        );
+        assert!(!stmts.iter().any(|s| s.contains("[cx]")), "{stmts:#?}");
+
+        let mut d = TableDraft::from_table(&t);
+        d.name = "copy".into();
+        let created = single("copy", Some("dbo"), MsSql, Change::CreateTable(Box::new(d))).emit();
+        assert!(
+            created[0].contains("CONSTRAINT [pk_t] PRIMARY KEY NONCLUSTERED ([id])")
+                || created[0].contains("PRIMARY KEY NONCLUSTERED ([id])"),
+            "{created:#?}"
+        );
+        assert_eq!(
+            created[1],
+            "CREATE CLUSTERED INDEX [cx] ON [dbo].[copy] ([d]);"
+        );
+        // A clustered key says nothing: it is the default.
+        let plain = ms_dependents_table();
+        let mut pk = plain.clone();
+        pk.indexes[0].clustered = Some(true);
+        let stmts = diff(&pk, &retyped(&pk, &[("id", "bigint", false)]), MsSql).emit();
+        assert!(
+            stmts.contains(
+                &"ALTER TABLE [dbo].[t] ADD CONSTRAINT [pk_t] PRIMARY KEY ([id]);".to_string()
+            ),
+            "{stmts:#?}"
+        );
     }
 
     /// **A SQL Server table diffs to nothing against its own draft** — the
@@ -15351,6 +15490,7 @@ mod tests {
             from: vec!["id".into()],
             to: vec!["email".into()],
             drop_constraint: None,
+            clustered: None,
         };
         assert!(!swap.risks(MySql).is_empty(), "a swapped primary key");
     }
@@ -21797,6 +21937,7 @@ mod sqlite_drop_tests {
                 from: vec!["id".into()],
                 to: vec![],
                 drop_constraint: None,
+                clustered: None,
             },
         ] {
             assert!(!supports_change(Sqlite, &c), "{c:?}");

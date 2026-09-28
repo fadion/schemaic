@@ -1397,12 +1397,14 @@ async fn a_designer_edit_keeps_what_it_did_not_change() {
     assert!(again.changes.is_empty(), "{:?}", again.changes);
 }
 
-/// **A clustered index other than the key's is kept as it is**, not
-/// recreated as a plain one — which would leave the table a heap. An edit to
-/// it is a `KeepLossyIndex` the preview names.
+/// **A clustered index is edited as one, and a nonclustered key stays one**:
+/// `cx` gains a column and comes back `CLUSTERED` rather than leaving the
+/// table a heap, and the `NONCLUSTERED` key, rebuilt around a retype, comes
+/// back nonclustered rather than taking T-SQL's default — which, with `cx`
+/// there, the server would refuse (Msg 1902).
 #[tokio::test(flavor = "multi_thread")]
-async fn a_clustered_index_is_left_alone() {
-    use schemaic_core::ddl::{Change, TableDraft};
+async fn a_clustered_index_and_a_nonclustered_key_keep_their_clustering() {
+    use schemaic_core::ddl::TableDraft;
     use schemaic_core::schema::IndexColumn;
     if !enabled() {
         return;
@@ -1414,23 +1416,27 @@ async fn a_clustered_index_is_left_alone() {
     )
     .await;
     let t = read_table(&s, "t").await;
-    assert!(t.indexes.iter().any(|i| i.name == "cx" && i.lossy));
-    let mut d = TableDraft::from_table(&t);
-    let cx = d
-        .indexes
-        .iter_mut()
-        .find(|i| i.info.name == "cx")
-        .expect("cx");
-    cx.info.columns.push(IndexColumn::plain("id"));
-    let cs = schemaic_core::ddl::diff(&t, &d, MS);
-    assert!(
-        cs.changes
+    let ix = |t: &schemaic_core::schema::TableInfo, name: &str| {
+        t.indexes
             .iter()
-            .any(|c| matches!(c, Change::KeepLossyIndex { .. })),
-        "{:?}",
-        cs.changes
-    );
-    assert!(cs.emit().is_empty(), "{:?}", cs.emit());
+            .find(|i| i.name == name)
+            .unwrap_or_else(|| panic!("{name} in {:?}", t.indexes))
+            .clone()
+    };
+    assert_eq!(ix(&t, "cx").clustered, Some(true));
+    assert!(!ix(&t, "cx").lossy);
+    assert_eq!(ix(&t, "PRIMARY").clustered, Some(false));
+
+    let mut d = TableDraft::from_table(&t);
+    d.indexes[0].info.columns.push(IndexColumn::plain("id"));
+    d.columns[0].info.type_name = "bigint".into();
+    let stmts = apply_draft(&s, &t, &d).await;
+    let t2 = read_table(&s, "t").await;
+    assert_eq!(ix(&t2, "cx").clustered, Some(true), "{stmts:#?}");
+    assert_eq!(ix(&t2, "cx").column_names().count(), 2);
+    assert_eq!(ix(&t2, "PRIMARY").clustered, Some(false), "{stmts:#?}");
+    let again = schemaic_core::ddl::diff(&t2, &TableDraft::from_table(&t2), MS);
+    assert!(again.changes.is_empty(), "{:?}", again.changes);
 }
 
 /// **An identity switched on is withheld, not applied** — T-SQL's `ALTER
