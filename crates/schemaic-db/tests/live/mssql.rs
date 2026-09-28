@@ -396,6 +396,149 @@ async fn a_plan_is_read_from_the_servers_showplan_and_changes_nothing() {
     ));
 }
 
+/// **A dump restores into an empty database as the one it was taken from**:
+/// `core::dump`'s file, its rows rendered by the export renderer as the app's
+/// writer renders them, cut at its `GO` lines by the script splitter and run by
+/// `run_script`. The identity keeps its gaps (so the foreign key onto it still
+/// holds) and counts on past them, the view and trigger open batches of their
+/// own, and the rowversion and computed column are the server's again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dump_restores_into_an_empty_database() {
+    use schemaic_core::dump::{DumpOptions, DumpStep, plan};
+    if !enabled() {
+        return;
+    }
+    let src = Scratch::create("dumpsrc").await;
+    src.exec(
+        "CREATE TABLE dbo.customers (id int IDENTITY(1,1) PRIMARY KEY, name nvarchar(50), \
+           seen datetime2(3), born date, paid decimal(10,2), rv rowversion, \
+           twice AS (paid * 2))",
+    )
+    .await;
+    src.exec(
+        "CREATE TABLE dbo.orders (id int IDENTITY(1,1) PRIMARY KEY, \
+           customer_id int NOT NULL REFERENCES dbo.customers(id), note nvarchar(max))",
+    )
+    .await;
+    src.exec(
+        "INSERT dbo.customers (name, seen, born, paid) VALUES \
+           (N'Ann', '2026-01-02 03:04:05.678', '1990-05-06', 12.50), \
+           (N'gone', NULL, NULL, NULL), (N'Zoë ''q''', NULL, NULL, 0.01); \
+         DELETE dbo.customers WHERE id = 2; \
+         INSERT dbo.orders (customer_id, note) VALUES (3, N'first'), (1, NULL)",
+    )
+    .await;
+    src.exec("CREATE VIEW dbo.v_orders AS SELECT o.id, c.name FROM dbo.orders o JOIN dbo.customers c ON c.id = o.customer_id")
+        .await;
+    src.exec("CREATE TRIGGER dbo.tr_orders ON dbo.orders AFTER INSERT AS SET NOCOUNT ON")
+        .await;
+
+    let schema = src
+        .db
+        .fetch_schema(&src.name, CancellationToken::new())
+        .await
+        .expect("the schema");
+    let chosen: Vec<String> = schema
+        .tables
+        .iter()
+        .map(|t| schemaic_core::schema::display_name(t.schema.as_deref(), &t.name))
+        .collect();
+    let dump = plan(&schema, &src.name, &chosen, DumpOptions::default(), MS);
+    let mut file = String::new();
+    for step in dump.steps {
+        match step {
+            DumpStep::Text(sql) => {
+                file.push_str(&sql);
+                file.push_str("\n\n");
+            }
+            DumpStep::Rows {
+                database,
+                insert_database,
+                schema,
+                table,
+                select,
+            } => {
+                let rs = src
+                    .db
+                    .fetch_query(Some(&database), &select, 10_000, CancellationToken::new())
+                    .await
+                    .expect("the rows");
+                let order: Vec<usize> = (0..rs.row_count()).collect();
+                let mut out = Vec::new();
+                schemaic_core::export::export_inserts_to(
+                    &mut out,
+                    &rs,
+                    &order,
+                    Some((&insert_database, schema.as_deref(), &table)),
+                    MS,
+                )
+                .unwrap();
+                file.push_str(&String::from_utf8(out).unwrap());
+                file.push('\n');
+            }
+        }
+    }
+    assert!(
+        file.contains("SET IDENTITY_INSERT [dbo].[customers] ON;"),
+        "{file}"
+    );
+
+    let dst = Scratch::create("dumpdst").await;
+    let mut splitter = schemaic_core::script::Splitter::new(MS);
+    let mut stmts = splitter.push_str(&file);
+    stmts.extend(splitter.finish());
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let feed = tokio::spawn(async move {
+        for s in stmts {
+            if tx.send(s).await.is_err() {
+                break;
+            }
+        }
+    });
+    let (end, _) = dst
+        .db
+        .run_script(&dst.name, rx, CancellationToken::new())
+        .await;
+    feed.await.unwrap();
+    assert!(
+        matches!(end, schemaic_core::script::ExecEnd::Done),
+        "{end:?}\n{file}"
+    );
+
+    let rows = "SELECT CONCAT(id, '|', name, '|', CONVERT(varchar(30), seen, 121), '|', born, '|', paid, '|', twice) \
+                FROM dbo.customers ORDER BY id";
+    let both = |s: &Scratch| {
+        let db = s.db.clone();
+        let name = s.name.clone();
+        async move {
+            let rs = db
+                .fetch_query(Some(&name), rows, 100, CancellationToken::new())
+                .await
+                .unwrap();
+            (0..rs.row_count())
+                .map(|r| rs.cell(r, 0).unwrap().display().to_string())
+                .collect::<Vec<_>>()
+        }
+    };
+    let restored = both(&dst).await;
+    assert_eq!(restored, both(&src).await);
+    assert!(restored[1].starts_with("3|Zoë 'q'|"), "{restored:?}");
+    assert_eq!(
+        dst.scalar("SELECT COUNT(*) FROM sys.foreign_keys").await,
+        "1"
+    );
+    assert_eq!(dst.scalar("SELECT COUNT(*) FROM dbo.v_orders").await, "2");
+    assert_eq!(
+        dst.scalar("SELECT COUNT(*) FROM sys.triggers WHERE name = 'tr_orders'")
+            .await,
+        "1"
+    );
+    // The identity counts on past the highest key the file carried.
+    dst.exec("INSERT dbo.customers (name) VALUES (N'next')")
+        .await;
+    assert_eq!(dst.scalar("SELECT MAX(id) FROM dbo.customers").await, "4");
+}
+
 /// Validation compiles without running: a missing table is reported by
 /// number, and a `DELETE` that checks clean deleted nothing.
 #[tokio::test(flavor = "multi_thread")]

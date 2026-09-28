@@ -285,17 +285,77 @@ pub fn cancel_note(name: &str, partial: bool) -> String {
 
 /// Can a database be dumped to a `.sql` file on `dialect`?
 ///
-/// Not on SQL Server yet. Its tables' DDL is written (`TableInfo::create_ddl`)
-/// and its literals are, but a dump's `INSERT`s would name every identity
-/// column, and SQL Server refuses an explicit value there without `SET
-/// IDENTITY_INSERT … ON` around the table's rows, which this module does not
-/// write. The Export menu's *SQL* entry asks this; the per-table formats read
-/// rows and write files, and are offered.
+/// Every engine can now — SQL Server's took [`identity_insert_sql`] around an
+/// identity table's rows and [`close_batches`]' `GO` lines — but the match
+/// stays exhaustive, so an engine added later has to answer it rather than
+/// inherit a yes. The Export menu's *SQL* entry asks this.
 pub fn supports_dump(dialect: SqlDialect) -> bool {
     match dialect {
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => true,
-        SqlDialect::MsSql => false,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => true,
     }
+}
+
+/// The statements that let a table's rows name its identity column, around
+/// them — or `None` where the engine has no such switch.
+///
+/// **SQL Server's, and the reason its identities are carried at all.** Its
+/// identity refuses an explicit value (`is_server_assigned` says so, for the
+/// grid and the import), except under `SET IDENTITY_INSERT t ON`, one table
+/// at a time per session. Carrying the values keeps every key the foreign keys
+/// onto the table name; renumbering them, the other engines' cost for
+/// PostgreSQL's `GENERATED ALWAYS`, would break each one. The server moves the
+/// identity's next value past the highest one inserted, so no resync follows.
+pub fn identity_insert_sql(dialect: SqlDialect, table: &str) -> Option<(String, String)> {
+    match dialect {
+        SqlDialect::MsSql => Some((
+            format!("SET IDENTITY_INSERT {table} ON;"),
+            format!("SET IDENTITY_INSERT {table} OFF;"),
+        )),
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => None,
+    }
+}
+
+/// Is `c` an identity a dump in `dialect` writes back under
+/// [`identity_insert_sql`], though the server would otherwise assign it?
+fn carries_identity(c: &crate::schema::ColumnInfo, dialect: SqlDialect) -> bool {
+    c.auto_increment && c.generated.is_none() && identity_insert_sql(dialect, "").is_some()
+}
+
+/// **Every statement closes its batch with `GO`**, on an engine whose scripts
+/// are cut into batches (`SqlDialect::batch_separator`) — SQL Server, where
+/// `CREATE VIEW`, `CREATE TRIGGER` and a routine must each open one, and a
+/// restore (`Db::run_script`, `sqlcmd`) splits the file at its `GO` lines. A
+/// row step is closed by a `GO` step after it; a comment needs none; a script
+/// already ending in one (`ddl::client_script`'s) gets no second.
+fn close_batches(steps: Vec<DumpStep>, dialect: SqlDialect) -> Vec<DumpStep> {
+    if !dialect.batch_separator() {
+        return steps;
+    }
+    let mut out = Vec::with_capacity(steps.len() * 2);
+    for step in steps {
+        match step {
+            DumpStep::Text(t)
+                if t.lines()
+                    .all(|l| l.trim().is_empty() || l.trim_start().starts_with("--")) =>
+            {
+                out.push(DumpStep::Text(t));
+            }
+            DumpStep::Text(t) => {
+                let body = t.trim_end();
+                let last = body[body.rfind('\n').map_or(0, |k| k + 1)..].trim_start();
+                if crate::sql::go_directive(last, 0, dialect).is_some() {
+                    out.push(DumpStep::Text(body.to_string()));
+                } else {
+                    out.push(DumpStep::Text(format!("{body}\nGO")));
+                }
+            }
+            rows @ DumpStep::Rows { .. } => {
+                out.push(rows);
+                out.push(DumpStep::Text("GO".to_string()));
+            }
+        }
+    }
+    out
 }
 
 /// The session switch that turns foreign-key enforcement off and back on, when
@@ -486,13 +546,17 @@ pub fn target_database_sql(dialect: SqlDialect, database: &str) -> Option<String
 ///
 /// [`crate::schema::ColumnInfo::is_server_assigned`] is the existing answer to exactly this
 /// question — the import path asks it for the same reason, about the same
-/// columns. **The cost is stated rather than hidden**: an identity column's
-/// values are not carried, so the restored rows are renumbered, which is why
-/// `plan` says so in the file.
-pub fn exported_columns(t: &TableInfo) -> Vec<&str> {
+/// columns. **The cost is stated rather than hidden**: such an identity
+/// column's values are not carried, so the restored rows are renumbered, which
+/// is why `plan` says so in the file.
+///
+/// **Except an identity the file can carry** ([`carries_identity`]) — SQL
+/// Server's, written back under [`identity_insert_sql`] — since renumbering
+/// the keys a foreign key names breaks the key.
+pub fn dump_columns(t: &TableInfo, dialect: SqlDialect) -> Vec<&str> {
     t.columns
         .iter()
-        .filter(|c| !c.is_server_assigned())
+        .filter(|c| !c.is_server_assigned() || carries_identity(c, dialect))
         .map(|c| c.name.as_str())
         .collect()
 }
@@ -614,7 +678,7 @@ pub fn picker_body(listing: Listing, tables: usize) -> PickerBody {
 ///
 /// **PostgreSQL only, and it is the difference between a restore that works and
 /// one that reports success and then fails.** The rows come back with their
-/// original keys — [`exported_columns`] carries a `serial` or a
+/// original keys — [`dump_columns`] carries a `serial` or a
 /// `GENERATED BY DEFAULT AS IDENTITY` column deliberately, because someone
 /// re-importing their own keys wants them — but an *explicit* insert does not
 /// advance the sequence behind the column. The restored table therefore holds
@@ -1165,27 +1229,40 @@ pub fn plan(
              -- exactly this reason; load the file whole.",
         );
     }
-    // **The columns the file cannot carry, named in it.** `exported_columns`
+    // **The columns the file cannot carry, named in it.** `dump_columns`
     // leaves out what the server assigns for itself, because an `INSERT` that
     // names one is an error rather than a value — but for an identity column that
     // also means the values are gone and the restored rows are renumbered. The
     // person replaying the file is the one who needs to know, and the same
     // silence about a `NULL`ed blob is what the tally exists to break.
+    // **Renumbered only when a lost column is a counter** (`auto_increment`):
+    // SQL Server carries its identities, so what it loses is a `rowversion` or
+    // a computed column, which the server recomputes rather than renumbers.
     if opts.data {
+        let mut renumbered = false;
         let lost: Vec<String> = order
             .iter()
             .flat_map(|&i| {
                 let t = &schema.tables[i];
                 t.columns
                     .iter()
-                    .filter(|c| c.is_server_assigned())
-                    .map(|c| crate::export::comment_text(&format!("{}.{}", t.name, c.name)))
+                    .filter(|c| c.is_server_assigned() && !carries_identity(c, dialect))
+                    .map(|c| (t, c))
+                    .collect::<Vec<_>>()
+            })
+            .map(|(t, c)| {
+                renumbered |= c.auto_increment;
+                crate::export::comment_text(&format!("{}.{}", t.name, c.name))
             })
             .collect();
         if !lost.is_empty() {
+            let tail = if renumbered {
+                " and the\n-- restored rows are renumbered: "
+            } else {
+                ":\n-- "
+            };
             header.push_str(&format!(
-                "\n--\n-- The server assigns {} itself, so {} not in this file and the\n\
-                 -- restored rows are renumbered: {}.",
+                "\n--\n-- The server assigns {} itself, so {} not in this file{tail}{}.",
                 crate::text::plural(lost.len(), "this column", "these columns"),
                 crate::text::plural(lost.len(), "its value is", "their values are"),
                 lost.join(", "),
@@ -1445,16 +1522,26 @@ pub fn plan(
                 text!(crate::ddl::client_script(&bodies, dialect));
             }
         }
-        // Named columns, never `*` — see [`exported_columns`]. A table the server
+        // Named columns, never `*` — see [`dump_columns`]. A table the server
         // fills entirely has nothing insertable and gets no data step at all;
         // `SELECT  FROM` would not even parse.
-        let cols = exported_columns(t);
+        let cols = dump_columns(t, dialect);
         // `shape()`, not `!is_view`: a sequence's eight `bigint` counter columns
-        // are server-assigned by nothing, so `exported_columns` keeps them all
+        // are server-assigned by nothing, so `dump_columns` keeps them all
         // and the file grew an `INSERT INTO sq1` under a structure step that
         // creates no `sq1` — the restore then stops there, and every later
         // table's structure and rows are never applied.
         if opts.data && t.shape() == TableShape::Table && !cols.is_empty() {
+            // An identity the rows carry needs its switch thrown around them.
+            let identity = t
+                .columns
+                .iter()
+                .any(|c| carries_identity(c, dialect))
+                .then(|| identity_insert_sql(dialect, &qname(t)))
+                .flatten();
+            if let Some((on, _)) = &identity {
+                text!(on.clone());
+            }
             steps.push(DumpStep::Rows {
                 database: database.to_string(),
                 // Whatever `target_database_sql` wrote is what the `INSERT`s
@@ -1473,6 +1560,9 @@ pub fn plan(
                     qualified_table(database, t.schema.as_deref(), &t.name, dialect)
                 ),
             });
+            if let Some((_, off)) = identity {
+                text!(off);
+            }
         }
     }
 
@@ -1525,7 +1615,7 @@ pub fn plan(
     }
 
     DumpPlan {
-        steps,
+        steps: close_batches(steps, dialect),
         tables: order.len(),
         cycles,
         missing,
@@ -1723,7 +1813,7 @@ pub fn folder_replace_prompt(folder: &str, replaced: &[String]) -> String {
 /// which write one file per table rather than one file for the set.
 ///
 /// **Not [`plan`] with the options turned down, and the row step is why.** A
-/// dump's `SELECT` names its columns through [`exported_columns`], which leaves
+/// dump's `SELECT` names its columns through [`dump_columns`], which leaves
 /// out everything the server assigns for itself: an `INSERT` that named an
 /// identity column would be an error rather than a value. A CSV of `orders`
 /// without `orders.id` is not the table, so this reads `*` — every column the
@@ -1748,7 +1838,7 @@ pub fn file_plan(
     // line that held only because `run_export` branches on `writes_folder()`
     // first — one new call site away from a corrupt file. With `Sql` the steps
     // below would render `INSERT`s from `SELECT *`, naming exactly the
-    // server-assigned columns [`exported_columns`] keeps out of them, and the
+    // server-assigned columns [`dump_columns`] keeps out of them, and the
     // file would fail at restore *after* its rows had landed.
     //
     // An empty plan, not a panic: the caller already reports one as "Nothing to
@@ -2192,7 +2282,7 @@ mod tests {
     /// says the format is never `Sql`, and today that holds only because
     /// `run_export` branches on `writes_folder()` before reaching it — one call
     /// site away from a corrupt file. `Sql` here would emit `INSERT`s built from
-    /// `SELECT *`, naming the identity columns `exported_columns` exists to keep
+    /// `SELECT *`, naming the identity columns `dump_columns` exists to keep
     /// out of them: a file that fails at restore, after the rows have landed.
     ///
     /// An empty plan rather than a panic, so the caller reports a refusal
@@ -3139,6 +3229,164 @@ mod tests {
         );
         assert!(!p.steps.iter().any(|s| matches!(s, DumpStep::Rows { .. })));
         assert!(text_of(&p).contains("CREATE TABLE"), "structure still goes");
+    }
+
+    /// A SQL Server table with an identity key, a `rowversion` and a computed
+    /// column — the three columns `is_server_assigned` answers yes for there.
+    fn mssql_orders() -> TableInfo {
+        let mut t = table("orders");
+        t.schema = Some("dbo".to_string());
+        t.columns[0].auto_increment = true;
+        t.columns[0].identity_always = true;
+        t.columns.push(ColumnInfo {
+            name: "rv".to_string(),
+            type_name: "rowversion".to_string(),
+            identity_always: true,
+            ..Default::default()
+        });
+        t.columns.push(server_assigned("total"));
+        t
+    }
+
+    /// **An identity's values are carried on SQL Server**, which will take an
+    /// explicit one under `SET IDENTITY_INSERT … ON` — so the restored rows
+    /// keep the keys every foreign key onto them names, rather than being
+    /// renumbered. What the server alone writes (a `rowversion`, a computed
+    /// column) stays out of the `INSERT` as on every engine, and is the only
+    /// thing the header says is lost.
+    #[test]
+    fn a_sql_server_identity_is_carried_inside_identity_insert() {
+        let s = schema_of(vec![mssql_orders(), {
+            let mut t = table("plain");
+            t.schema = Some("dbo".to_string());
+            t
+        }]);
+        let p = plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::MsSql,
+        );
+        assert_eq!(select_of(&p, "orders"), "SELECT [id] FROM [dbo].[orders]");
+        let file = file_of(&p);
+        let on = pos(&file, "SET IDENTITY_INSERT [dbo].[orders] ON;");
+        let rows = pos(&file, "<<rows orders:");
+        let off = pos(&file, "SET IDENTITY_INSERT [dbo].[orders] OFF;");
+        assert!(on < rows && rows < off, "{file}");
+        assert!(
+            !file.contains("IDENTITY_INSERT [dbo].[plain]"),
+            "a table with no identity needs no switch"
+        );
+        let header = text_of(&p);
+        assert!(
+            header.contains("orders.rv") && header.contains("orders.total"),
+            "{header}"
+        );
+        assert!(
+            !header.contains("orders.id"),
+            "the identity is carried: {header}"
+        );
+        assert!(!header.contains("renumbered"), "nothing is: {header}");
+        // And a structure-only file has no rows to switch it for.
+        let p = plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions {
+                data: false,
+                ..Default::default()
+            },
+            SqlDialect::MsSql,
+        );
+        assert!(!file_of(&p).contains("IDENTITY_INSERT"));
+    }
+
+    /// **Every statement closes its batch with `GO` on SQL Server.** `CREATE
+    /// VIEW` and `CREATE TRIGGER` must each open a batch of their own, and a
+    /// restore — `Db::run_script`, or `sqlcmd` — cuts the file at its `GO`
+    /// lines; without them the first view after a table's rows was Msg 111.
+    /// A comment needs none, and a script that already ends in one (the
+    /// triggers' `client_script`) gets no second.
+    #[test]
+    fn a_sql_server_dump_closes_every_batch_with_go() {
+        let mut t = mssql_orders();
+        t.triggers.push(TriggerInfo {
+            name: "tr".to_string(),
+            schema: Some("dbo".to_string()),
+            table: "orders".to_string(),
+            timing: TriggerTiming::After,
+            events: vec![TriggerEvent::Insert],
+            // SQL Server keeps the whole stored statement as the body.
+            action: TriggerAction::Body(
+                "CREATE TRIGGER dbo.tr ON dbo.orders AFTER INSERT AS SELECT 1".to_string(),
+            ),
+            ..Default::default()
+        });
+        let mut v = view("v");
+        v.schema = Some("dbo".to_string());
+        v.create_sql = Some("CREATE VIEW dbo.v AS SELECT 1 AS id".to_string());
+        let s = schema_of(vec![t, v]);
+        let p = plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::MsSql,
+        );
+        let file = file_of(&p);
+        for (i, step) in p.steps.iter().enumerate() {
+            match step {
+                DumpStep::Text(t)
+                    if t.lines()
+                        .all(|l| l.trim().is_empty() || l.starts_with("--")) =>
+                {
+                    assert!(!t.contains("\nGO"), "a comment needs no batch: {t}");
+                }
+                DumpStep::Text(t) if t.trim() == "GO" => {}
+                DumpStep::Text(t) => {
+                    assert!(
+                        t.trim_end().ends_with("\nGO"),
+                        "step {i} left its batch open: {t}"
+                    );
+                    assert!(!t.contains("GO\nGO") && !t.contains("GO\n\nGO"), "{t}");
+                }
+                DumpStep::Rows { .. } => assert!(
+                    matches!(p.steps.get(i + 1), Some(DumpStep::Text(t)) if t.trim() == "GO"),
+                    "the rows' batch is closed before whatever follows: {file}"
+                ),
+            }
+        }
+        // The view opens its own batch.
+        let before_view = &file[..pos(&file, "CREATE VIEW")];
+        assert!(before_view.trim_end().ends_with("GO"), "{file}");
+        // Nothing of the kind on an engine without batches.
+        let mut t = table("orders");
+        t.columns[0].auto_increment = true;
+        let s = schema_of(vec![t]);
+        let file = file_of(&plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::MySql,
+        ));
+        assert!(
+            !file.contains("\nGO") && !file.contains("IDENTITY_INSERT"),
+            "{file}"
+        );
+    }
+
+    #[test]
+    fn every_engine_can_be_dumped_to_a_sql_file() {
+        for d in [
+            SqlDialect::MySql,
+            SqlDialect::Postgres,
+            SqlDialect::Sqlite,
+            SqlDialect::MsSql,
+        ] {
+            assert!(supports_dump(d), "{d:?}");
+        }
     }
 
     #[test]

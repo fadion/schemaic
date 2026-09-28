@@ -9,8 +9,9 @@ differently, so ask the *narrow* capability (`ddl::supports_or_replace_view`,
 `ddl::supports_view_rename`) rather than the engine. **Microsoft SQL Server is a fourth, and a
 preview rather than a peer**: it connects, reads, validates, introspects, runs scripts, writes
 the grid's edits back, imports a file into a table, designs tables, edits views, drops a
-table, view or routine, holds a Manual tab's transaction and shows a query plan, and the trigger
-and routine editors and dump are switched off by capability — see `db::mssql`.
+table, view or routine, holds a Manual tab's transaction, shows a query plan and dumps a database
+to a `.sql` file, and the trigger and routine editors are switched off by capability — see
+`db::mssql`.
 
 This is the project's reference document: the crate/module map, the architecture invariants, the
 UI conventions, and the Floem hazards each subsystem is built on. `CLAUDE.md` at the repo root
@@ -2934,15 +2935,16 @@ existing prose was left alone.
     and the rule is stated in full under *Architecture invariants*.
     `a_newline_in_a_name_cannot_open_a_line_of_its_own` asserts it over the emitted plan rather than
     over the escaper, since a test of the escaper alone was green against the unfixed tree.
-    **The row `SELECT` names its columns and is never `SELECT *`.** `exported_columns` projects
+    **The row `SELECT` names its columns and is never `SELECT *`.** `dump_columns` projects
     everything `ColumnInfo::is_server_assigned` says the server does *not* fill for itself — the same
-    predicate `import::insert_columns` asks, about the same columns. The renderer names every column
+    predicate `import::insert_columns` asks, about the same columns — plus the one server-assigned
+    column a file can carry, SQL Server's identity (below). The renderer names every column
     the result carries, so `SELECT *` put generated columns and PostgreSQL `GENERATED ALWAYS AS
     IDENTITY` columns straight into the `INSERT` column list, which all three engines refuse (MySQL
     3105, SQLite *cannot INSERT into generated column*, PostgreSQL *cannot insert a non-DEFAULT
     value*) — the file died on its first row. PostgreSQL's identity would need an `OVERRIDING SYSTEM
-    VALUE` the shared renderer has no way to emit. **The cost:** an identity column's values are not
-    carried, so the restored rows are renumbered — which the **header names, column by column**,
+    VALUE` the shared renderer has no way to emit. **The cost:** such an identity column's values are
+    not carried, so the restored rows are renumbered — which the **header names, column by column**,
     alongside the cycle and dropped-constraint notices. The person replaying the file is the one who
     needs to know, and it is the same silence about a `NULL`ed blob that the tally exists to break;
     a file that carries every column says nothing, because a caveat printed on every dump is one
@@ -2953,6 +2955,37 @@ existing prose was left alone.
     `a_generated_column_is_never_selected_into_the_insert` — which also asserts the column is still
     *declared*, since it is only the `INSERT` it has to stay out of — and
     `a_table_the_server_fills_entirely_gets_no_data_step`.
+    **SQL Server's identity is the exception, and renumbering it was never an option.** It is
+    `identity_always` — the server refuses an explicit value — except under `SET IDENTITY_INSERT t
+    ON`, which a session may hold for one table at a time; and renumbering the keys a foreign key
+    points at breaks that key, on every row that names one. So `carries_identity` admits an
+    `auto_increment` column with no `generated` expression (not a `rowversion`, not a computed
+    column) wherever `identity_insert_sql` has a switch to throw — SQL Server alone, an exhaustive
+    `match` — and `plan` puts that table's `Rows` step between the `ON` and the `OFF`, a table
+    carrying no identity getting neither. No resync follows it, unlike PostgreSQL's
+    `sequence_resync_sql` below: the server moves the identity's next value past the highest one
+    inserted. The exception lives in `dump_columns`, the one projection, which took
+    `dialect` for it and absorbed the dialect-free `exported_columns` it replaced. **The header's lost-columns sentence says *renumbered* only when a lost column is a
+    counter** (`auto_increment`): on SQL Server what the file leaves out is a `rowversion` or a
+    computed column, which the server recomputes, and telling the person replaying it that their
+    rows were renumbered would be false (`a_sql_server_identity_is_carried_inside_identity_insert`,
+    which asserts the switch brackets the rows, the identity is absent from the header and the word
+    is too).
+    **On an engine whose scripts are cut into batches, every statement closes one.**
+    `close_batches` runs over the finished plan wherever `SqlDialect::batch_separator` is true —
+    SQL Server — and ends each `Text` step that is more than comments with a `GO` line, unless its
+    last line already is one (`ddl::client_script`'s trigger text carries its own), and puts a `GO`
+    step after each `Rows` step. `CREATE VIEW`, `CREATE TRIGGER` and a routine must each open a
+    batch of their own, and a restore — `Db::run_script` behind the script splitter, or `sqlcmd` —
+    cuts the file at its `GO` lines, so without them the first view after a table's rows failed
+    (Msg 111, per the test's doc) — `a_sql_server_dump_closes_every_batch_with_go`, which also
+    asserts MySQL's file carries neither a `GO` nor an `IDENTITY_INSERT`. The live pin is
+    `a_dump_restores_into_an_empty_database` in `tests/live/mssql.rs`: a scratch database with an
+    identity holding a gap, a `rowversion`, a computed column, a foreign key, a view, a trigger and
+    `datetime2`/`date`/`decimal`/Unicode values is dumped, rendered as the app's writer renders it,
+    split and replayed through `run_script` into an empty database, and compares equal row for row,
+    with the key, the view and the trigger present and the next identity continuing from the
+    highest carried. It failed against the unfixed `dump.rs`.
     **Foreign keys are restated after the data.** `create_ddl` deliberately emits none: for Copy DDL
     an omitted key still leaves a script that runs, which is why the ordering effort there went to
     types and views instead (`create_ddl_script`'s own account of it). A dump can't take that trade —
@@ -3064,7 +3097,7 @@ existing prose was left alone.
     customers because other objects depend on it* and never reached the rest. Dropping the dependants
     is right precisely here, because the section below is their `CREATE` and the closing constraints
     section puts the keys back. `sequence_resync_sql` closes the PostgreSQL restore:
-    `exported_columns` carries a `serial` or `GENERATED BY DEFAULT AS IDENTITY` column
+    `dump_columns` carries a `serial` or `GENERATED BY DEFAULT AS IDENTITY` column
     deliberately — someone
     re-importing their own keys wants them — but an *explicit* insert does not advance the sequence
     behind the column, so the restored table holds keys 1..10000 with its counter still at 1 and the
@@ -3083,7 +3116,7 @@ existing prose was left alone.
     looks exactly like a complete one, and only the sibling *preselect* case was ever named.
     **`file_plan` is the folder export beside `plan`, and deliberately not `plan` with its options
     turned down.** The five non-SQL formats write one file per table, and the row step is where the
-    two genuinely differ: a dump's `SELECT` names its columns through `exported_columns`, which
+    two genuinely differ: a dump's `SELECT` names its columns through `dump_columns`, which
     leaves out everything the server assigns for itself, while a CSV of `orders` without `orders.id`
     is not the table — so this reads `SELECT *`. Views are included for the mirror-image reason: a
     view gets structure and no rows in a dump because an `INSERT` into one is not a restore, and a
@@ -10729,8 +10762,7 @@ existing prose was left alone.
   `DbError::Refused("… is not available for SQL Server yet.")`. **The refusals are the backstop,
   not the gate**: the app is kept off them by
   capabilities, each an exhaustive `match` with `MsSql` on `false`, asked at the UI site that
-  offers the thing — `dump::supports_dump` for
-  the tree's *Export ▸ SQL*; `users::supports_users`, since
+  offers the thing — `users::supports_users`, since
   logins and the users mapped to them in each database are two catalogues the browser's one list
   fits neither half of; and
   `ddl::supports_change`, whose SQL Server answer comes before anything else and is
@@ -10776,7 +10808,10 @@ existing prose was left alone.
   the same terms, since `import_rows` landed, and `tx::supports_manual_mode` the third, since the
   pinned session below was written — though a *read-only* SQL Server connection is still not
   offered the mode (`tx::offers_manual_mode`), and that one is about the engine.
-  `plan::supports_plan` is the fourth, since `explain` was written (below). Server Activity is the one
+  `plan::supports_plan` is the fourth, since `explain` was written (below), and
+  `dump::supports_dump` — the tree's *Export ▸ SQL* — the fifth, once `core::dump` carried an
+  identity's values under `IDENTITY_INSERT` and closed every batch with `GO` (under `dump.rs`);
+  its live pin is `a_dump_restores_into_an_empty_database`. Server Activity is the one
   split that *is* about the engine: `KILL` ends a session, but no T-SQL statement cancels another
   session's request and leaves the session standing — a cancel is an attention sent by the owner's
   own client — so `activity::supports_kill_kind` says no to *Cancel query* there and
