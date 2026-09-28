@@ -2017,6 +2017,47 @@ impl ExecuteAs {
             ExecuteAs::User(u) => format!("'{}'", u.replace('\'', "''")),
         }
     }
+
+    /// What the editor's **Execute as** field holds: empty for none,
+    /// `CALLER`/`SELF`/`OWNER` in any case, else a user name — bare, or
+    /// quoted as T-SQL writes it, which is how a user named after a keyword
+    /// is told from the keyword. The inverse of [`Self::field_text`].
+    pub fn parse_field(text: &str) -> Option<ExecuteAs> {
+        let t = text.trim();
+        if t.is_empty() {
+            return None;
+        }
+        if let Some(inner) = t
+            .strip_prefix('\'')
+            .and_then(|s| s.strip_suffix('\''))
+            .filter(|_| t.len() >= 2)
+        {
+            return Some(ExecuteAs::User(inner.replace("''", "'")));
+        }
+        Some(match t.to_ascii_uppercase().as_str() {
+            "CALLER" => ExecuteAs::Caller,
+            "SELF" => ExecuteAs::SelfUser,
+            "OWNER" => ExecuteAs::Owner,
+            _ => ExecuteAs::User(t.to_string()),
+        })
+    }
+
+    /// The field's text for `who` — the keyword, the bare user name, or the
+    /// name quoted when it would otherwise read back as a keyword.
+    pub fn field_text(who: Option<&ExecuteAs>) -> String {
+        match who {
+            None => String::new(),
+            // Bare only where bare reads back as the same user.
+            Some(user @ ExecuteAs::User(u)) => {
+                if Self::parse_field(u).as_ref() == Some(user) {
+                    u.clone()
+                } else {
+                    user.sql()
+                }
+            }
+            Some(k) => k.sql(),
+        }
+    }
 }
 
 /// One option in a SQL Server routine's `WITH` list — each one a
@@ -2052,7 +2093,9 @@ impl TsqlRoutineOption {
 /// options, a procedure's `FOR REPLICATION`, and the fallbacks for one that
 /// cannot be rebuilt. Read by `db::mssql` through
 /// [`crate::ddl::tsql_routine_parts`], restated by [`RoutineInfo::create_sql`].
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+///
+/// **Equal as a set of options**, not as a list — see its `PartialEq`.
+#[derive(Clone, Debug, Default, Eq)]
 pub struct TsqlRoutine {
     /// In the order the stored text had them.
     pub options: Vec<TsqlRoutineOption>,
@@ -2083,6 +2126,142 @@ impl TsqlRoutine {
             self.options.retain(|o| *o != opt);
         }
     }
+
+    /// Put `new` in the slot the options matching `slot` hold — in place of
+    /// the first, the rest dropped — or append it; `None` empties the slot.
+    fn set_slot(
+        &mut self,
+        slot: impl Fn(&TsqlRoutineOption) -> bool,
+        new: Option<TsqlRoutineOption>,
+    ) {
+        let at = self.options.iter().position(&slot);
+        self.options.retain(|o| !slot(o));
+        if let Some(new) = new {
+            let at = at.unwrap_or(self.options.len()).min(self.options.len());
+            self.options.insert(at, new);
+        }
+    }
+
+    pub fn execute_as(&self) -> Option<&ExecuteAs> {
+        self.options.iter().find_map(|o| match o {
+            TsqlRoutineOption::ExecuteAs(who) => Some(who),
+            _ => None,
+        })
+    }
+
+    /// `WITH EXECUTE AS who`, or none — the default, `CALLER`.
+    pub fn set_execute_as(&mut self, who: Option<ExecuteAs>) {
+        self.set_slot(
+            |o| matches!(o, TsqlRoutineOption::ExecuteAs(_)),
+            who.map(TsqlRoutineOption::ExecuteAs),
+        );
+    }
+
+    /// A scalar function's stated `INLINE`; `None` leaves inlining to the
+    /// server, which inlines a function that qualifies.
+    pub fn inline(&self) -> Option<bool> {
+        self.options.iter().find_map(|o| match o {
+            TsqlRoutineOption::Inline(on) => Some(*on),
+            _ => None,
+        })
+    }
+
+    pub fn set_inline(&mut self, on: Option<bool>) {
+        self.set_slot(
+            |o| matches!(o, TsqlRoutineOption::Inline(_)),
+            on.map(TsqlRoutineOption::Inline),
+        );
+    }
+
+    pub fn returns_null_on_null_input(&self) -> bool {
+        self.has_option(&TsqlRoutineOption::ReturnsNullOnNullInput)
+    }
+
+    /// `RETURNS NULL ON NULL INPUT` on, or off. **Off is whichever spelling
+    /// `original` had** — `CALLED ON NULL INPUT` stated, or nothing, both the
+    /// default — so the toggle flipped and flipped back is no change.
+    pub fn set_null_input(&mut self, returns_null: bool, original: &TsqlRoutine) {
+        let clause = if returns_null {
+            TsqlRoutineOption::ReturnsNullOnNullInput
+        } else {
+            TsqlRoutineOption::CalledOnNullInput
+        };
+        let stated = returns_null || original.has_option(&TsqlRoutineOption::CalledOnNullInput);
+        self.set_slot(
+            |o| {
+                matches!(
+                    o,
+                    TsqlRoutineOption::ReturnsNullOnNullInput
+                        | TsqlRoutineOption::CalledOnNullInput
+                )
+            },
+            stated.then_some(clause),
+        );
+    }
+}
+
+/// **The options compare as a set.** T-SQL takes a `WITH` list in any order,
+/// so two routines differing only in it are the same routine — and a control
+/// that clears an option and sets it again appends it, wherever the stored
+/// text had it, which a list comparison would diff as an edit and an
+/// `ALTER` that changes nothing. The list still keeps the stored order, for
+/// the statement that restates it.
+impl PartialEq for TsqlRoutine {
+    fn eq(&self, other: &Self) -> bool {
+        let subset =
+            |a: &[TsqlRoutineOption], b: &[TsqlRoutineOption]| a.iter().all(|o| b.contains(o));
+        self.options.len() == other.options.len()
+            && subset(&self.options, &other.options)
+            && subset(&other.options, &self.options)
+            && self.for_replication == other.for_replication
+            && self.verbatim == other.verbatim
+            && self.hidden == other.hidden
+    }
+}
+
+/// A SQL Server routine's **shape** — each its own object type, so what
+/// `CREATE OR ALTER` cannot change (Msg 2010), and what decides which `WITH`
+/// options it may carry ([`TsqlShape::allows`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TsqlShape {
+    Procedure,
+    /// `RETURNS int` and the like.
+    Scalar,
+    /// `RETURNS TABLE` — one `RETURN (SELECT …)`.
+    InlineTable,
+    /// `RETURNS @t TABLE (…)`.
+    MultiStatementTable,
+}
+
+impl TsqlShape {
+    /// "A procedure", "An inline table-valued function", … — a sentence's
+    /// subject.
+    pub fn label_capitalised(self) -> &'static str {
+        match self {
+            TsqlShape::Procedure => "A procedure",
+            TsqlShape::Scalar => "A scalar function",
+            TsqlShape::InlineTable => "An inline table-valued function",
+            TsqlShape::MultiStatementTable => "A multi-statement table-valued function",
+        }
+    }
+
+    /// Can a routine of this shape carry `opt`? Measured on SQL Server 2022:
+    /// an inline table-valued function refuses every option but
+    /// `SCHEMABINDING` (and `NATIVE_COMPILATION`'s natively compiled
+    /// variant), a multi-statement one refuses the null-input clauses and
+    /// `INLINE` (Msg 487, *an invalid option was specified*), and only a
+    /// procedure takes `RECOMPILE`.
+    pub fn allows(self, opt: &TsqlRoutineOption) -> bool {
+        use TsqlRoutineOption as O;
+        match opt {
+            O::SchemaBinding | O::NativeCompilation => true,
+            O::Recompile => self == TsqlShape::Procedure,
+            O::ExecuteAs(_) => self != TsqlShape::InlineTable,
+            O::ReturnsNullOnNullInput | O::CalledOnNullInput | O::Inline(_) => {
+                self == TsqlShape::Scalar
+            }
+        }
+    }
 }
 
 /// A SQL Server trigger's place among the triggers on one event —
@@ -2091,6 +2270,24 @@ impl TsqlRoutine {
 pub enum FiringRank {
     First,
     Last,
+}
+
+impl FiringRank {
+    /// `first` or `last`, as a sentence says it.
+    pub fn label(self) -> &'static str {
+        match self {
+            FiringRank::First => "first",
+            FiringRank::Last => "last",
+        }
+    }
+
+    /// `First` or `Last`, as `sp_settriggerorder`'s `@order` takes it.
+    pub fn sql(self) -> &'static str {
+        match self {
+            FiringRank::First => "First",
+            FiringRank::Last => "Last",
+        }
+    }
 }
 
 /// What a **SQL Server** trigger carries beyond the shared model: the header
@@ -2121,6 +2318,26 @@ pub struct TsqlTrigger {
     /// not visible to this login. Shown and droppable, not editable: there is
     /// no body to rebuild it with.
     pub hidden: bool,
+}
+
+impl TsqlTrigger {
+    pub fn rank_on(&self, event: TriggerEvent) -> Option<FiringRank> {
+        self.rank
+            .iter()
+            .find_map(|(e, r)| (*e == event).then_some(*r))
+    }
+
+    /// Rank the trigger `First` or `Last` on `event`, or neither. One rank
+    /// per event, as `sp_settriggerorder` holds it, and the list kept in
+    /// event order — the order the reader builds it in, so a rank cleared and
+    /// set again is no change to diff.
+    pub fn set_rank(&mut self, event: TriggerEvent, rank: Option<FiringRank>) {
+        self.rank.retain(|(e, _)| *e != event);
+        if let Some(rank) = rank {
+            self.rank.push((event, rank));
+            self.rank.sort_by_key(|(e, _)| *e);
+        }
+    }
 }
 
 impl Default for TriggerInfo {
@@ -2162,6 +2379,20 @@ impl TriggerInfo {
     /// the editor is a validation error, not a reason to lock the form.
     pub fn is_editable(&self) -> bool {
         !self.constraint && self.tsql.verbatim.is_none() && !self.tsql.hidden
+    }
+
+    /// Fire on `event`, or stop. The events stay in declaration order — what
+    /// the emitter round-trips against — and an event switched off takes its
+    /// SQL Server rank with it, since `sp_settriggerorder` refuses one on an
+    /// event the trigger does not fire on (Msg 15125).
+    pub fn set_event(&mut self, event: TriggerEvent, on: bool) {
+        self.events.retain(|e| *e != event);
+        if on {
+            self.events.push(event);
+            self.events.sort();
+        } else {
+            self.tsql.set_rank(event, None);
+        }
     }
 
     /// This trigger with an ordering clause **the server could not resolve**
@@ -2343,7 +2574,23 @@ impl TriggerInfo {
     /// **Never appended to [`Self::tsql_statement`]'s text**: `CREATE TRIGGER`
     /// must be alone in its batch, and a statement after the body in the same
     /// batch is not run after the trigger — it *is* the trigger.
+    ///
+    /// The two halves are [`Self::tsql_rank_statements`] and
+    /// [`Self::tsql_disable_statement`], apart because an edit plan runs every
+    /// rank after every alter (see the former) where a dump can keep each
+    /// trigger's together.
     pub fn tsql_follow_ups(&self) -> Vec<String> {
+        let mut out = self.tsql_rank_statements();
+        out.extend(self.tsql_disable_statement());
+        out
+    }
+
+    /// `sp_settriggerorder` for each of the trigger's ranks. **In an edit
+    /// plan these run after every create and alter in it**, not after the
+    /// trigger's own: an event holds one `First` and one `Last` (Msg 15130),
+    /// and only an alter lets a trigger's go — so one trigger taking `First`
+    /// from another, or two swapping, needs both alters to have run first.
+    pub fn tsql_rank_statements(&self) -> Vec<String> {
         // A hidden trigger's statement is a comment — nothing was created, so
         // nothing may be ranked or disabled after it.
         if self.tsql.hidden {
@@ -2352,30 +2599,31 @@ impl TriggerInfo {
         let d = crate::intel::SqlDialect::MsSql;
         let name = qualified_ident(&self.name, self.schema.as_deref(), d);
         let lit = |s: &str| crate::export::sql_literal(&crate::model::Value::Str(s.to_string()), d);
-        let mut out: Vec<String> = self
-            .tsql
+        self.tsql
             .rank
             .iter()
             .map(|(event, rank)| {
-                let rank = match rank {
-                    FiringRank::First => "First",
-                    FiringRank::Last => "Last",
-                };
                 format!(
                     "EXEC sp_settriggerorder @triggername = {}, @order = {}, @stmttype = {};",
                     lit(&name),
-                    lit(rank),
+                    lit(rank.sql()),
                     lit(event.sql())
                 )
             })
-            .collect();
-        if self.enabled == TriggerEnabled::Disabled {
-            out.push(format!(
-                "DISABLE TRIGGER {name} ON {};",
-                qualified_ident(&self.table, self.schema.as_deref(), d)
-            ));
+            .collect()
+    }
+
+    /// `DISABLE TRIGGER` for a disabled one — see [`Self::tsql_follow_ups`].
+    pub fn tsql_disable_statement(&self) -> Option<String> {
+        if self.tsql.hidden || self.enabled != TriggerEnabled::Disabled {
+            return None;
         }
-        out
+        let d = crate::intel::SqlDialect::MsSql;
+        Some(format!(
+            "DISABLE TRIGGER {} ON {};",
+            qualified_ident(&self.name, self.schema.as_deref(), d),
+            qualified_ident(&self.table, self.schema.as_deref(), d)
+        ))
     }
 
     /// The `CREATE TRIGGER` that recreates this trigger exactly — the **one**
@@ -2909,6 +3157,18 @@ impl RoutineInfo {
             "c" | "internal"
         ) && self.tsql.verbatim.is_none()
             && !self.tsql.hidden
+    }
+
+    /// What kind of SQL Server object this routine is, read off its kind and
+    /// its `RETURNS` — see [`TsqlShape`].
+    pub fn tsql_shape(&self) -> TsqlShape {
+        let r = self.returns.trim();
+        match self.kind {
+            RoutineKind::Procedure => TsqlShape::Procedure,
+            RoutineKind::Function if r.eq_ignore_ascii_case("TABLE") => TsqlShape::InlineTable,
+            RoutineKind::Function if r.starts_with('@') => TsqlShape::MultiStatementTable,
+            RoutineKind::Function => TsqlShape::Scalar,
+        }
     }
 
     /// The routine's identity in SQL, as `DROP`/`ALTER`/`COMMENT ON` need it.
@@ -6046,6 +6306,200 @@ mod trigger_tests {
         let set = TriggerInfo::create_set_sql(std::slice::from_ref(&t), SqlDialect::MsSql);
         assert_eq!(set.len(), 1, "{set:?}");
         assert!(set[0].starts_with("-- "), "{set:?}");
+    }
+
+    /// **One rank per event, kept in event order.** `sp_settriggerorder`
+    /// holds one place per event — setting `Last` on an event ranked `First`
+    /// replaces it — and the list is compared whole, so a rank cleared and set
+    /// again has to land where the reader puts it or the diff sees an edit.
+    #[test]
+    fn a_trigger_rank_is_one_per_event_in_event_order() {
+        use TriggerEvent::{Delete, Insert, Update};
+        let mut t = TsqlTrigger {
+            rank: vec![(Insert, FiringRank::First), (Update, FiringRank::Last)],
+            ..Default::default()
+        };
+        let before = t.clone();
+        assert_eq!(t.rank_on(Insert), Some(FiringRank::First));
+        assert_eq!(t.rank_on(Delete), None);
+        t.set_rank(Insert, None);
+        assert_eq!(t.rank, [(Update, FiringRank::Last)]);
+        t.set_rank(Insert, Some(FiringRank::First));
+        assert_eq!(t, before, "cleared and set again is no change");
+        t.set_rank(Insert, Some(FiringRank::Last));
+        assert_eq!(
+            t.rank,
+            [(Insert, FiringRank::Last), (Update, FiringRank::Last)]
+        );
+        // Declaration order, `tgtype`'s: DELETE sorts before UPDATE.
+        t.set_rank(Delete, Some(FiringRank::First));
+        assert_eq!(
+            t.rank,
+            [
+                (Insert, FiringRank::Last),
+                (Delete, FiringRank::First),
+                (Update, FiringRank::Last)
+            ]
+        );
+    }
+
+    /// **An event switched off takes its rank with it** — `sp_settriggerorder`
+    /// refuses a rank on an event the trigger does not fire on (Msg 15125) —
+    /// and one switched on lands in declaration order, which is what the
+    /// emitter round-trips against.
+    #[test]
+    fn switching_an_event_off_drops_its_rank() {
+        use TriggerEvent::{Delete, Insert, Update};
+        let mut t = tsql_trigger();
+        t.tsql.rank = vec![(Update, FiringRank::First)];
+        t.set_event(Update, false);
+        assert_eq!(t.events, [Insert]);
+        assert!(t.tsql.rank.is_empty());
+        t.set_event(Update, true);
+        t.set_event(Delete, true);
+        assert_eq!(t.events, [Insert, Delete, Update]);
+        t.set_event(Update, true);
+        assert_eq!(t.events, [Insert, Delete, Update], "on twice is once");
+    }
+
+    /// The **Execute as** field: the three keywords in any case, a user name
+    /// bare or quoted, and empty for none — and back, quoting a user whose
+    /// name *is* a keyword so it does not read back as the keyword.
+    #[test]
+    fn execute_as_reads_and_writes_its_field() {
+        use ExecuteAs::*;
+        assert_eq!(ExecuteAs::parse_field(""), None);
+        assert_eq!(ExecuteAs::parse_field("  "), None);
+        assert_eq!(ExecuteAs::parse_field("caller"), Some(Caller));
+        assert_eq!(ExecuteAs::parse_field(" SELF "), Some(SelfUser));
+        assert_eq!(ExecuteAs::parse_field("Owner"), Some(Owner));
+        assert_eq!(
+            ExecuteAs::parse_field("app_reader"),
+            Some(User("app_reader".into()))
+        );
+        assert_eq!(
+            ExecuteAs::parse_field("'owner'"),
+            Some(User("owner".into()))
+        );
+        assert_eq!(
+            ExecuteAs::parse_field("'o''neil'"),
+            Some(User("o'neil".into()))
+        );
+        for who in [
+            None,
+            Some(Caller),
+            Some(SelfUser),
+            Some(Owner),
+            Some(User("app_reader".into())),
+            Some(User("OWNER".into())),
+            Some(User("o'neil".into())),
+        ] {
+            let text = ExecuteAs::field_text(who.as_ref());
+            assert_eq!(ExecuteAs::parse_field(&text), who, "{text:?}");
+        }
+        assert_eq!(ExecuteAs::field_text(Some(&SelfUser)), "SELF");
+        assert_eq!(ExecuteAs::field_text(Some(&User("self".into()))), "'self'");
+    }
+
+    /// **A routine's `WITH` list is a set.** T-SQL takes the options in any
+    /// order, so two lists holding the same ones are the same routine — which
+    /// is what lets a control clear an option and set it again without the
+    /// diff seeing an edit, wherever the stored text had put it.
+    #[test]
+    fn routine_options_compare_as_a_set() {
+        use TsqlRoutineOption as O;
+        let a = TsqlRoutine {
+            options: vec![O::ExecuteAs(ExecuteAs::Owner), O::Recompile],
+            ..Default::default()
+        };
+        let mut b = a.clone();
+        b.options.reverse();
+        assert_eq!(a, b);
+        b.options.pop();
+        assert_ne!(a, b);
+        b.options.push(O::SchemaBinding);
+        assert_ne!(a, b);
+    }
+
+    /// The slots a control edits — `EXECUTE AS`, `INLINE`, the null-input
+    /// clause — each hold one value, replaced in place or taken out, and
+    /// leave the rest of the list alone.
+    #[test]
+    fn a_routine_option_slot_holds_one_value() {
+        use TsqlRoutineOption as O;
+        let mut r = TsqlRoutine {
+            options: vec![O::ExecuteAs(ExecuteAs::Owner), O::SchemaBinding],
+            ..Default::default()
+        };
+        assert_eq!(r.execute_as(), Some(&ExecuteAs::Owner));
+        r.set_execute_as(Some(ExecuteAs::User("u".into())));
+        assert_eq!(
+            r.options,
+            [O::ExecuteAs(ExecuteAs::User("u".into())), O::SchemaBinding]
+        );
+        r.set_execute_as(None);
+        assert_eq!(r.options, [O::SchemaBinding]);
+        assert_eq!(r.execute_as(), None);
+
+        assert_eq!(r.inline(), None);
+        r.set_inline(Some(false));
+        assert_eq!(r.inline(), Some(false));
+        r.set_inline(Some(true));
+        assert_eq!(r.options, [O::SchemaBinding, O::Inline(true)]);
+        r.set_inline(None);
+        assert_eq!(r.options, [O::SchemaBinding]);
+    }
+
+    /// **The null-input toggle comes back to what was stored.** `CALLED ON
+    /// NULL INPUT` is the default, so a function may state it or not; on is
+    /// `RETURNS NULL ON NULL INPUT` in its place, and off is whichever
+    /// spelling of "called" the stored text had — so a toggle flipped and
+    /// flipped back is no change either way.
+    #[test]
+    fn the_null_input_toggle_returns_to_the_stored_spelling() {
+        use TsqlRoutineOption as O;
+        for stored in [vec![], vec![O::CalledOnNullInput, O::SchemaBinding]] {
+            let original = TsqlRoutine {
+                options: stored,
+                ..Default::default()
+            };
+            let mut r = original.clone();
+            assert!(!r.returns_null_on_null_input());
+            r.set_null_input(true, &original);
+            assert!(r.returns_null_on_null_input());
+            assert!(!r.has_option(&O::CalledOnNullInput), "{:?}", r.options);
+            r.set_null_input(false, &original);
+            assert_eq!(r, original);
+        }
+        // Stored on, switched off: the default, unstated.
+        let original = TsqlRoutine {
+            options: vec![O::ReturnsNullOnNullInput],
+            ..Default::default()
+        };
+        let mut r = original.clone();
+        r.set_null_input(false, &original);
+        assert!(r.options.is_empty());
+        r.set_null_input(true, &original);
+        assert_eq!(r, original);
+    }
+
+    /// A SQL Server routine's **shape** — what `CREATE OR ALTER` cannot
+    /// change, and what decides which `WITH` options it may carry.
+    #[test]
+    fn a_sql_server_routine_has_a_shape() {
+        let f = |kind, returns: &str| RoutineInfo {
+            kind,
+            returns: returns.into(),
+            ..Default::default()
+        };
+        use RoutineKind::{Function, Procedure};
+        assert_eq!(f(Procedure, "").tsql_shape(), TsqlShape::Procedure);
+        assert_eq!(f(Function, "int").tsql_shape(), TsqlShape::Scalar);
+        assert_eq!(f(Function, " table ").tsql_shape(), TsqlShape::InlineTable);
+        assert_eq!(
+            f(Function, "@t TABLE (a int)").tsql_shape(),
+            TsqlShape::MultiStatementTable
+        );
     }
 
     #[test]

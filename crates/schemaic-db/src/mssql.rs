@@ -1688,6 +1688,9 @@ async fn collect_schema(client: &mut MsClient) -> Result<DbSchema, DbError> {
                 t.events.sort();
             }
             t.tsql.rank.extend(rank.map(|k| (event, k)));
+            // Event order, which `TsqlTrigger::set_rank` keeps for the same
+            // reason.
+            t.tsql.rank.sort_by_key(|(e, _)| *e);
             continue;
         }
         let (action, mut tsql) = tsql_trigger_reading(r.get(6).and_then(|d| d.as_deref()));

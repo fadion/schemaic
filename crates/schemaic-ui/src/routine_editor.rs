@@ -639,14 +639,19 @@ fn routine_form(ui: DdlUi, target: &RoutineTarget, ring: FocusRing) -> AnyView {
     // resets. On PostgreSQL the sharpest is the `SET search_path` pinned to a
     // SECURITY DEFINER function; on MySQL it is the definer itself.
     let mut options: Vec<AnyView> = Vec::new();
-    // SQL Server's `WITH` options: the two a user reaches for, as toggles
-    // over `TsqlRoutine::set_option`, so the rest — `EXECUTE AS`, the
-    // null-input clauses, `INLINE` — keep their place and are restated
-    // untouched; and the comment, its `MS_Description` property. Its own arm
-    // rather than MySQL's `else`, whose characteristics T-SQL has none of.
+    // SQL Server's `WITH` options: `RECOMPILE` and `SCHEMABINDING` as toggles
+    // over `TsqlRoutine::set_option`; `EXECUTE AS`, the null-input clause and
+    // `INLINE` through the slot setters, each holding one value in place so
+    // an option the form does not touch keeps its place; and the comment, its
+    // `MS_Description` property. Its own arm rather than MySQL's `else`, whose
+    // characteristics T-SQL has none of. Which controls show is the shape's
+    // (`TsqlShape::allows`), read once at build like the rest of the form —
+    // a `RETURNS` edited to another shape is the validator's to name.
     match target.dialect {
         SqlDialect::MsSql => {
-            use schemaic_core::schema::TsqlRoutineOption as O;
+            use schemaic_core::schema::{ExecuteAs, TsqlRoutineOption as O};
+            let shape = draft.info.tsql_shape();
+            let original = draft.info.tsql.clone();
             if !is_function {
                 options.push(bound_toggle(
                     d,
@@ -668,6 +673,64 @@ fn routine_form(ui: DdlUi, target: &RoutineTarget, ring: FocusRing) -> AnyView {
                 TAB_OPT + 10,
                 |d, v| d.info.tsql.set_option(O::SchemaBinding, v),
             ));
+            if shape.allows(&O::ExecuteAs(ExecuteAs::Caller)) {
+                // One field rather than a picker and a name: `CALLER`,
+                // `SELF` and `OWNER` are the keywords, anything else a user,
+                // and a user named like a keyword is quoted — the round trip
+                // `ExecuteAs::parse_field` and `field_text` hold.
+                options.push(
+                    form_setting(
+                        "Execute as",
+                        bound_field(
+                            d,
+                            ExecuteAs::field_text(draft.info.tsql.execute_as()),
+                            FieldCfg {
+                                placeholder: "CALLER, SELF, OWNER or a user",
+                                mono: true,
+                                focus: Some((ring.clone(), TAB_OPT + 20)),
+                                ..Default::default()
+                            },
+                            |d, v| d.info.tsql.set_execute_as(ExecuteAs::parse_field(v)),
+                        )
+                        .style(move |s| s.width(field_w())),
+                    )
+                    .into_any(),
+                );
+            }
+            if shape.allows(&O::ReturnsNullOnNullInput) {
+                options.push(bound_toggle(
+                    d,
+                    "Returns NULL on NULL input",
+                    "RETURNS NULL ON NULL INPUT — the body doesn't run when an argument \
+                 is NULL.",
+                    draft.info.tsql.returns_null_on_null_input(),
+                    ring.clone(),
+                    TAB_OPT + 25,
+                    move |d, v| d.info.tsql.set_null_input(v, &original),
+                ));
+            }
+            if shape.allows(&O::Inline(true)) {
+                // Three states, not a toggle: unstated leaves inlining to the
+                // server, which inlines a function that qualifies.
+                options.push(
+                    form_setting(
+                        "Inlining",
+                        bound_choice(
+                            d,
+                            draft.info.tsql.inline(),
+                            vec![
+                                ("Automatic".to_string(), None),
+                                ("INLINE = ON".to_string(), Some(true)),
+                                ("INLINE = OFF".to_string(), Some(false)),
+                            ],
+                            ring.clone(),
+                            TAB_OPT + 30,
+                            |d, v| d.info.tsql.set_inline(v),
+                        ),
+                    )
+                    .into_any(),
+                );
+            }
             options.push(
                 form_setting(
                     "Comment",

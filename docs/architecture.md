@@ -4527,8 +4527,16 @@ existing prose was left alone.
     `supports_view_rename` makes for a view — and a `CREATE OR ALTER` cannot move a trigger to another
     table either (Msg 2110, measured on SQL Server 2022), which the modal, holding one table's set,
     never asks of it. `trigger_create_statements` is the one exhaustive `match` both routes go
-    through: MySQL's session wrap on one arm, and on SQL Server the statement followed by
-    `TriggerInfo::tsql_follow_ups` as statements of their own (under `schema.rs`). `emit_mssql` routes
+    through: MySQL's session wrap on one arm, and on SQL Server two lists — the statement and its
+    `DISABLE TRIGGER`, then its `sp_settriggerorder` ranks (`TriggerInfo::tsql_rank_statements`,
+    under `schema.rs`), which `trigger_statements` holds back until **every** create and alter in the
+    plan has run. **The ranks go last because only an alter lets a trigger's rank go**: an event on a
+    table holds one `First` and one `Last` (Msg 15130), so while each rank followed its own alter, a
+    plan moving `First` from one trigger to another, or swapping `First` and `Last` between two,
+    failed at the first rank — the alter that would have released it had not run yet
+    (`a_rank_moves_between_triggers_in_one_plan`; the swap is live in
+    `the_trigger_controls_rank_and_execute_as_on_the_server`). A disabled state has no such clash
+    and stays straight after its own trigger. `emit_mssql` routes
     `trigger_statements` beside `view_statements`, and `tsql_supports` admits the three trigger
     changes, which is all it took for `supports_trigger_editing(MsSql)` to answer yes
     (`sql_server_offers_the_trigger_editor`, `an_edited_sql_server_trigger_is_altered_in_place`,
@@ -4539,8 +4547,14 @@ existing prose was left alone.
     opened there. The SQL Server arm is T-SQL's grammar: no `BEFORE`, a view takes only `INSTEAD OF`
     while a table takes it as well as `AFTER`, statement level only, no `TRUNCATE`, no `WHEN`, no
     `UPDATE OF`, and a body rather than a function (`a_sql_server_trigger_draft_is_held_to_its_grammar`).
+    It refuses what `sp_settriggerorder` would, too, where the form can say so and the server's
+    message cannot: a rank on an `INSTEAD OF` trigger (Msg 15133) and a rank on an event the trigger
+    does not fire on (Msg 15125); two triggers holding the same rank on one event (Msg 15130) is
+    `TriggerSetDraft::validate`'s, since that clash is between triggers
+    (`a_rank_the_server_refuses_is_refused`).
     What the form offers is computed from the same facts — `trigger_timings(dialect, host)`,
-    `trigger_events`, `trigger_fires_on_several_events`, `supports_trigger_not_for_replication` — and
+    `trigger_events`, `trigger_fires_on_several_events`, `supports_trigger_not_for_replication`,
+    `supports_trigger_execute_as`, `supports_trigger_firing_rank` (the last three SQL Server's alone) — and
     `the_offered_timings_and_events_are_ones_the_validator_accepts` holds every offered timing and
     event to a clean validation on every engine and host, since an option offered and then refused is
     the form opening on an error. `TriggerSetDraft::validate` refuses a *change* to a trigger
@@ -4572,7 +4586,8 @@ existing prose was left alone.
     (measured: a `GRANT EXECUTE` survived one), so an edit is altered in place. **What it refuses is
     what `routine_signature_changed` asks there**, which is per-engine now: on SQL Server a change
     of **kind** (procedure ↔ function) or of a function's **shape** — scalar, inline table-valued
-    (`RETURNS TABLE`), multi-statement (`RETURNS @t TABLE (…)`), each its own object type — which
+    (`RETURNS TABLE`), multi-statement (`RETURNS @t TABLE (…)`), each its own object type and
+    compared as `RoutineInfo::tsql_shape` (`TsqlShape`, under `schema.rs`) — which
     `CREATE OR ALTER` answers with Msg 2010, *"incompatible object type"* (measured for a scalar
     turned inline table-valued and for a procedure turned function). The parameter list is *not*
     part of it, T-SQL having no overloading, so a new list or a scalar's new return type is the
@@ -4591,7 +4606,11 @@ existing prose was left alone.
     (`sql_server_offers_the_routine_editor`). `RoutineDraft::validate` has a SQL Server arm — every
     parameter named with `@`, the list cut at its top-level commas by `tsql_parameters` so neither
     `decimal(10, 2)` nor a `N'x, y'` default splits one — and `RoutineDraft::blank` already opened
-    on T-SQL that compiles (`a_new_sql_server_routine_opens_valid`).
+    on T-SQL that compiles (`a_new_sql_server_routine_opens_valid`). The same arm refuses a `WITH`
+    option the routine's shape cannot carry (`TsqlShape::allows`), because the server's Msg 487
+    names neither the option nor why, and `INLINE = ON` beside `EXECUTE AS`, which a scalar function
+    cannot be inlined with (Msg 16203, measured on SQL Server 2022)
+    (`a_sql_server_routine_option_its_shape_refuses_is_refused`).
   - `compare.rs` — **two databases, object by object**, and a chosen subset of the differences as
     one migration. The pure half of schema compare (the UI half is `ui/compare_view.rs`): no DB, no
     view code, nothing here runs anything (98 unit tests).
@@ -7180,7 +7199,18 @@ existing prose was left alone.
     **`TsqlTrigger` is what the shared model lacked**, on the "restate everything or it silently
     resets" rule again: an unstated `EXECUTE AS` (`ExecuteAs`) is `CALLER`, an unstated `NOT FOR
     REPLICATION` fires during replication, and the `First`/`Last` rank per event (`FiringRank`)
-    lives outside the statement altogether. Two fields say the parts cannot be trusted. `verbatim`
+    lives outside the statement altogether. **`set_rank` holds one rank per event and keeps the list
+    in `TriggerEvent` declaration order** (Insert, Delete, Update) — the order `db::mssql`'s reader
+    sorts it into as well — so a rank cleared and set again is no change to diff
+    (`a_trigger_rank_is_one_per_event_in_event_order`). `TriggerInfo::set_event` is the event
+    toggles' one write: it keeps the events in the same order and, switching one off, drops that
+    event's rank, since `sp_settriggerorder` refuses a rank on an event the trigger does not fire on
+    (Msg 15125) and the form would otherwise leave a draft only Apply could reject
+    (`switching_an_event_off_drops_its_rank`). `ExecuteAs::parse_field`/`field_text` are both
+    editors' single **Execute as** field: empty is none, `CALLER`/`SELF`/`OWNER` in any case, anything
+    else a user, bare or T-SQL-quoted — and `field_text` quotes a user whose bare name would read
+    back as the keyword (a user called `owner`), which is what makes the field a round trip
+    (`execute_as_reads_and_writes_its_field`). Two fields say the parts cannot be trusted. `verbatim`
     holds the stored text whole when `tsql_trigger_parts` could not read its header, and the arm
     restates it as it was, since a rebuild from what *was* read would drop the rest; `hidden` marks a
     trigger the server shows no text for (`WITH ENCRYPTION` — `definition` is NULL, measured — or
@@ -7193,7 +7223,10 @@ existing prose was left alone.
     statement's text.** Measured on SQL Server 2022, a `CREATE OR ALTER` keeps a disabled trigger
     disabled but resets `is_first` from 1 to 0, and a fresh `CREATE` fires whatever the trigger was;
     so each rank gets an `sp_settriggerorder` and a disabled trigger a `DISABLE TRIGGER`, on both
-    paths, one rule. They are separate statements because `CREATE TRIGGER` must be alone in its batch
+    paths, one rule. It is the two halves `tsql_rank_statements` and `tsql_disable_statement`
+    together, and they are apart because an edit plan runs every rank after every alter (under
+    `ddl.rs`, for Msg 15130) where a dump keeps each trigger's together. Both are statements of
+    their own, never text in the trigger's, because `CREATE TRIGGER` must be alone in its batch
     and anything after the body in that batch is not run after the trigger — it *is* the trigger
     (`a_sql_server_triggers_rank_and_disabled_state_follow_it`). **A hidden trigger has none**: its
     statement is a comment, so nothing was created, and a dump that then ranked or disabled it
@@ -7270,9 +7303,26 @@ existing prose was left alone.
     restated — measured on SQL Server 2022, an alter without `WITH RECOMPILE, EXECUTE AS OWNER` left
     neither; and `for_replication`. `options` is in the stored text's order, and **`set_option` is
     the toggle that keeps it**: switching one on appends it once, switching it off removes it and
-    leaves the rest in place, so a toggle turned on and off again is no change to diff
-    (`a_routine_option_toggles_without_disturbing_the_rest`) — a toggle that re-sorted the list would
-    make a phantom change of every routine it touched. `verbatim` and `hidden` are the trigger's two
+    leaves the rest in place (`a_routine_option_toggles_without_disturbing_the_rest`), so the
+    statement that restates the list writes it as the server had it. **Equality is not the list's,
+    though: `TsqlRoutine`'s `PartialEq` is hand-written and compares the options as a set**
+    (`routine_options_compare_as_a_set`), because T-SQL takes a `WITH` list in any order and an
+    option cleared and set again appends, wherever the stored text had it — which a list comparison
+    would diff as an edit, and an `ALTER` that changes nothing. `execute_as`/`set_execute_as`,
+    `inline`/`set_inline` and `returns_null_on_null_input`/`set_null_input` are the slot setters the
+    routine form's single-valued controls write through: each replaces its option in place or
+    removes it (`a_routine_option_slot_holds_one_value`). **`set_null_input`'s "off" is whichever
+    spelling the original had** — `CALLED ON NULL INPUT` stated, or nothing, both the default —
+    which is why it takes the routine as opened: the toggle turned on and off again restores the
+    text's own clause rather than one nobody wrote
+    (`the_null_input_toggle_returns_to_the_stored_spelling`). **`TsqlShape`** (`Procedure`,
+    `Scalar`, `InlineTable`, `MultiStatementTable`, read by `RoutineInfo::tsql_shape` off the kind
+    and `RETURNS` — `a_sql_server_routine_has_a_shape`) decides which options a routine may carry:
+    `TsqlShape::allows`, measured on SQL Server 2022, gives an inline table-valued function none of
+    `EXECUTE AS`, the null-input clauses or `INLINE`, a multi-statement one `EXECUTE AS` alone of
+    them, and `RECOMPILE` to a procedure only — pinned through the validator that asks it
+    (`a_sql_server_routine_option_its_shape_refuses_is_refused`, under `ddl.rs`). It is also what `ddl::routine_signature_changed`
+    compares, so one reading of the shape answers both questions. `verbatim` and `hidden` are the trigger's two
     fallbacks: the stored text restated whole when the parts could not read its header, a comment
     line saying so when the server shows no text (`WITH ENCRYPTION`, or no `VIEW DEFINITION`)
     (`a_sql_server_routine_the_parts_cannot_hold_is_restated_verbatim`). `is_editable` is false for
@@ -11592,9 +11642,11 @@ existing prose was left alone.
   altered, never dropped — and renames the second, and it reads the rank restored, the trigger still
   disabled, the rename landed and the encrypted one untouched, the round-trip gate holding again.
   The renamed one fires, the disabled one stays silent until it is enabled and then fires its edited
-  body, and a new `INSTEAD OF` trigger on a view fires in place of the write to it. Still not done:
-  a control for a trigger's
-  `EXECUTE AS` or its rank — both are read, kept and restated on apply, but the form offers neither.
+  body, and a new `INSTEAD OF` trigger on a view fires in place of the write to it.
+  `the_trigger_controls_rank_and_execute_as_on_the_server` is the form's controls on the same
+  terms: two triggers swap `First` and `Last` on `INSERT` in one plan — the case that needs every
+  rank set after every alter (under `ddl.rs`) — one takes `EXECUTE AS` a user, and an event switched
+  off takes its rank with it, each state reading back as written and diffing to nothing.
   `a_routine_is_altered_in_place_and_keeps_what_the_alter_resets` is the routine editor's leg: a
   procedure with two defaulted parameters (one a string default holding a comma), `WITH RECOMPILE,
   EXECUTE AS OWNER`, a grant and a comment, beside a scalar function written without `AS` and an
@@ -11603,12 +11655,17 @@ existing prose was left alone.
   asserted to carry no `DROP` — runs with the default kept and the grant, the options and the
   comment still there. A rename lands and restates the comment; the scalar made table-valued is
   recreated and returns its rows; and a procedure made from `RoutineDraft::blank` validates,
-  creates, runs and diffs to nothing.
+  creates, runs and diffs to nothing. `the_routine_controls_reach_the_server` writes through the
+  slots the form writes: a scalar function stored `WITH CALLED ON NULL INPUT` is given `RETURNS
+  NULL ON NULL INPUT`, `INLINE = OFF` and `EXECUTE AS OWNER` — and stops running its body on a
+  NULL — then turned back off, reading back as stored, the stated `CALLED ON NULL INPUT` included;
+  a procedure given `EXECUTE AS` a user returns that user from `USER_NAME()`.
   **A trigger is read from `TRIGGER_LISTING`, one row per event**, folded into one `TriggerInfo`
   each; the row carries `sys.trigger_events.is_first`/`is_last`, so the rank is per event, as
   `sp_settriggerorder` sets it. The events are sorted into `TriggerEvent`'s declaration order as
   they fold, the order the editor's toggles keep, since a catalogue order they re-sorted would be a
-  phantom change. The stored text goes through `tsql_trigger_reading`, pure: `tsql_trigger_parts`
+  phantom change — and so are the ranks, the order `TsqlTrigger::set_rank` keeps for the same
+  reason. The stored text goes through `tsql_trigger_reading`, pure: `tsql_trigger_parts`
   gives the body after the header's `AS` and the options; a header it cannot read keeps the whole
   text as `verbatim` (and as the body, for whatever displays it); a NULL `definition` is `hidden`
   (`a_stored_trigger_reads_into_its_parts_or_is_kept_whole`).
@@ -17081,10 +17138,19 @@ existing prose was left alone.
     lists come from `core::ddl` rather than a `(dialect, is_view)` match here — `trigger_timings`,
     `trigger_events`, and `trigger_fires_on_several_events` choosing between the event toggles and
     the one-event dropdown — and are held there to exactly what `TriggerDraft::validate` accepts.
-    `EXECUTE AS` and the firing rank have no control yet: the model keeps them and the apply path
-    restates them, so an edit leaves them as they were. `blank_trigger` opens a SQL Server trigger on
-    `AFTER` (a view's on `INSTEAD OF`), statement level and `NEW_BODY_MSSQL`, a `BEGIN SET NOCOUNT ON;
-    END` rather than MySQL's empty block, which T-SQL refuses as SQLite does
+    The event toggles write through `TriggerInfo::set_event` rather than editing `events` here, so
+    the order the emitter round-trips against and the rule that an event switched off drops its rank
+    live in core. **Beside each event toggle on SQL Server sits that event's rank** — `rank_choice`,
+    *Any order* / *Fires first* / *Fires last*, gated on `supports_trigger_firing_rank` — and it is
+    **read from the draft on every frame, not seeded once** as `bound_choice` is: switching the event
+    off clears the rank from under it, and a dropdown seeded at build would go on showing a rank
+    the draft no longer holds. Its select writes only a real change, since `update` notifies whatever
+    it writes. `INSTEAD OF` with a rank is left to the validator to name, as `UPDATE OF` is. An
+    **Execute as** field (`supports_trigger_execute_as`) follows NOT FOR REPLICATION, the same one
+    field as the routine form's over `ExecuteAs::parse_field`. The Tab order interleaves them: event
+    toggle `30 + 2n`, its rank `31 + 2n`, NOT FOR REPLICATION 45, Execute as 47.
+    `blank_trigger` opens a SQL Server trigger on `AFTER` (a view's on `INSTEAD OF`), statement
+    level and `NEW_BODY_MSSQL`, a `BEGIN SET NOCOUNT ON; END` rather than MySQL's empty block, which T-SQL refuses as SQLite does
     (`a_new_sql_server_trigger_opens_valid`). That per-engine shape is also why
     `blank_trigger`/`trigger_list` take a `SqlDialect` rather than a `pg: bool`, and why the
     MySQL-only `fetch_sources` (`SHOW CREATE TRIGGER`) is gated `== MySql` — whose reply is also why
@@ -17200,10 +17266,17 @@ existing prose was left alone.
     the section was an `if pg … else`, and the `else` would have offered a SQL Server routine
     MySQL's determinism, data access and definer, none of which T-SQL has. It is a `match
     target.dialect` now, and the SQL Server arm offers **Recompile** (procedures only — the walk
-    reads `RECOMPILE` on a procedure alone), **Schema binding** and **Comment** (the
-    `MS_Description` property). The two toggles write through `TsqlRoutine::set_option`, so the
-    options the form has no control for — `EXECUTE AS`, the null-input clauses, `INLINE` — keep
-    their place and are restated untouched, and a toggle flipped and flipped back is no change. The
+    reads `RECOMPILE` on a procedure alone), **Schema binding**, **Execute as** (one field over
+    `ExecuteAs::parse_field`, shared with the trigger form), and on a scalar function **Returns NULL
+    on NULL input** and **Inlining** — a dropdown rather than a toggle, *Automatic* / *INLINE = ON* /
+    *INLINE = OFF*, because unstated leaves inlining to the server — then **Comment** (the
+    `MS_Description` property). Which of the middle three show is `TsqlShape::allows`, read **once at
+    build** like the rest of the form, so a `RETURNS` edited into another shape is the validator's to
+    name rather than a form that rebuilds under the user. The two toggles write through
+    `TsqlRoutine::set_option` and the rest through the slot setters, each holding one value in place,
+    so an option the form does not touch keeps its place and is restated untouched; the null-input
+    toggle captures the routine as opened, because `set_null_input`'s "off" is the spelling the
+    original had, and a toggle flipped and flipped back is no change. The
     Parameters and Returns placeholders are a `match` per engine too, SQL Server's naming the `@`
     its parameters take and the `TABLE` a table function returns.
     **MySQL's body is fetched a
@@ -24676,7 +24749,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   on SQLite and SQL Server, `supports_view_check_option` and `view_keeps_column_list`,
   `supports_trigger_alter_in_place`, true on SQL Server alone, with the trigger form's
   `trigger_timings`, `trigger_events`, `trigger_fires_on_several_events` and
-  `supports_trigger_not_for_replication`, plus
+  `supports_trigger_not_for_replication`, `supports_trigger_execute_as` and
+  `supports_trigger_firing_rank`, plus
   `supports_column_reorder`, `alter_column_disturbs_checks`,
   `alter_column_disturbs_dependents`, `publishes_index_ddl` and `stats::supports_table_stats`; and, for the *comparison* rather than
   any editor, `ref_schema_is_database` and `view_definition_is_qualified`. **The same rule applies

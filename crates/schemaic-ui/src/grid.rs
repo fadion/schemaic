@@ -14877,14 +14877,11 @@ mod clear_tests {
             "connections.update(|cs| cs.retain(|c| c.id != id))",
             "Deleting a connection by id, same shape: the id came from the list              being filtered.",
         ),
-        // The two the gate could not see until it read the closure's whole
-        // span rather than one line of it. Both are real writes; neither is a
-        // signal-level collection clear.
-        (
-            "trigger_editor.rs",
-            "dr.info.events.retain(|e| *e != ev)",
-            "Not a collection signal: `d` is the object-editor draft and              `events` is a `Vec` field several levels inside it. The `update`              is the toggle's effect, which only runs when the checkbox's value              actually changed (`prev.is_some_and(|p| p != v)`), and it always              writes — the retain removes the event or the `push` below adds it              back. Guarding the signal would ask the wrong question anyway: the              subscribers have to rebuild because the draft changed.",
-        ),
+        // One the gate could not see until it read the closure's whole span
+        // rather than one line of it. A real write, not a signal-level
+        // collection clear. (There were two: the trigger form's event toggle
+        // was the other, until its retain moved into
+        // `schema::TriggerInfo::set_event`, where no signal is in reach.)
         (
             "schemaic-app/main.rs",
             "r.notes .retain(|n| *n != conn_import::ImportNote::AlreadySaved)",

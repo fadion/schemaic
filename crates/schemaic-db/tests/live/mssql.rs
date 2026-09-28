@@ -1832,6 +1832,203 @@ async fn a_trigger_is_altered_in_place_and_keeps_what_the_alter_resets() {
     );
 }
 
+/// **The editor's trigger controls reach the server.** Two triggers swap
+/// `First` and `Last` on `INSERT` in one plan — which needs every rank set
+/// after every alter, since an event holds one of each (Msg 15130) — one
+/// takes `EXECUTE AS` a user, and an event switched off takes its rank with
+/// it. Each state reads back as written, and diffs to nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_trigger_controls_rank_and_execute_as_on_the_server() {
+    use FiringRank::{First, Last};
+    use TriggerEvent::{Insert, Update};
+    use schemaic_core::ddl::{TriggerHost, TriggerSetDraft, diff_triggers};
+    use schemaic_core::schema::{ExecuteAs, FiringRank, TriggerEvent};
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("ddl_trigger_rank").await;
+    s.exec("CREATE TABLE dbo.t (id int NOT NULL PRIMARY KEY)")
+        .await;
+    s.exec("CREATE USER app_runner WITHOUT LOGIN").await;
+    s.exec("CREATE TRIGGER dbo.a ON dbo.t AFTER INSERT, UPDATE AS SET NOCOUNT ON")
+        .await;
+    s.exec("CREATE TRIGGER dbo.b ON dbo.t AFTER INSERT AS SET NOCOUNT ON")
+        .await;
+    s.exec(
+        "EXEC sp_settriggerorder @triggername = N'dbo.a', @order = N'First', @stmttype = N'INSERT'; \
+         EXEC sp_settriggerorder @triggername = N'dbo.a', @order = N'Last', @stmttype = N'UPDATE'; \
+         EXEC sp_settriggerorder @triggername = N'dbo.b', @order = N'Last', @stmttype = N'INSERT'",
+    )
+    .await;
+    let apply = |d: TriggerSetDraft, current: Vec<schemaic_core::schema::TriggerInfo>| {
+        let db = s.db.clone();
+        let name = s.name.clone();
+        async move {
+            let errs = d.validate(&current, MS, TriggerHost::Table);
+            assert!(errs.is_empty(), "{errs:?}");
+            let stmts = diff_triggers(&current, &d, MS).emit();
+            db.run_ddl(&name, &stmts, CancellationToken::new())
+                .await
+                .unwrap_or_else(|e| panic!("{e}\n{stmts:#?}"));
+        }
+    };
+    let rank_of = |t: &schemaic_core::schema::TableInfo, n: &str| {
+        t.triggers
+            .iter()
+            .find(|x| x.name == n)
+            .unwrap_or_else(|| panic!("{n}"))
+            .tsql
+            .clone()
+    };
+
+    let t = read_table(&s, "t").await;
+    assert_eq!(rank_of(&t, "a").rank, [(Insert, First), (Update, Last)]);
+    assert_eq!(rank_of(&t, "b").rank, [(Insert, Last)]);
+
+    // Swap First and Last on INSERT, and run `a` as a user.
+    let mut d = TriggerSetDraft::from_table(&t);
+    for x in &mut d.triggers {
+        match x.info.name.as_str() {
+            "a" => {
+                x.info.tsql.set_rank(Insert, Some(Last));
+                x.info.tsql.execute_as = ExecuteAs::parse_field("app_runner");
+            }
+            _ => x.info.tsql.set_rank(Insert, Some(First)),
+        }
+    }
+    apply(d, t.triggers.clone()).await;
+    let t = read_table(&s, "t").await;
+    assert_eq!(rank_of(&t, "a").rank, [(Insert, Last), (Update, Last)]);
+    assert_eq!(rank_of(&t, "b").rank, [(Insert, First)]);
+    assert_eq!(
+        rank_of(&t, "a").execute_as,
+        Some(ExecuteAs::User("app_runner".into()))
+    );
+    assert!(
+        diff_triggers(&t.triggers, &TriggerSetDraft::from_table(&t), MS)
+            .changes
+            .is_empty(),
+        "the round-trip gate"
+    );
+
+    // `a` stops firing on UPDATE, its rank there going with it; `b` drops
+    // its rank; `a` runs as its caller again.
+    let mut d = TriggerSetDraft::from_table(&t);
+    for x in &mut d.triggers {
+        match x.info.name.as_str() {
+            "a" => {
+                x.info.set_event(Update, false);
+                x.info.tsql.execute_as = None;
+            }
+            _ => x.info.tsql.set_rank(Insert, None),
+        }
+    }
+    apply(d, t.triggers.clone()).await;
+    let t = read_table(&s, "t").await;
+    let a = t.triggers.iter().find(|x| x.name == "a").unwrap();
+    assert_eq!(a.events, [Insert]);
+    assert_eq!(a.tsql.rank, [(Insert, Last)]);
+    assert_eq!(a.tsql.execute_as, None);
+    assert!(rank_of(&t, "b").rank.is_empty());
+}
+
+/// **The editor's routine controls reach the server**: a scalar function's
+/// null-input clause, `INLINE` and `EXECUTE AS`, and a procedure's `EXECUTE
+/// AS` a user — each written through the slot the form writes, read back as
+/// set, and diffing to nothing. The null-input toggle turned back off
+/// restores the `CALLED ON NULL INPUT` the text had stated.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_routine_controls_reach_the_server() {
+    use schemaic_core::ddl::{RoutineDraft, diff_routine};
+    use schemaic_core::schema::{ExecuteAs, RoutineInfo, TsqlRoutineOption as O};
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("ddl_routine_opts").await;
+    s.exec("CREATE USER app_runner WITHOUT LOGIN").await;
+    s.exec(
+        "CREATE FUNCTION dbo.f (@x int) RETURNS int WITH CALLED ON NULL INPUT \
+         AS BEGIN RETURN ISNULL(@x, -1) END",
+    )
+    .await;
+    s.exec("CREATE PROCEDURE dbo.p AS SELECT USER_NAME()").await;
+    let read = |n: &'static str| {
+        let db = s.db.clone();
+        let name = s.name.clone();
+        async move {
+            db.fetch_schema(&name, CancellationToken::new())
+                .await
+                .expect("the schema")
+                .routines
+                .iter()
+                .find(|r| r.name == n)
+                .unwrap_or_else(|| panic!("{n}"))
+                .as_ref()
+                .clone()
+        }
+    };
+    let apply = |cur: RoutineInfo, d: RoutineDraft| {
+        let db = s.db.clone();
+        let name = s.name.clone();
+        async move {
+            let errs = d.validate(MS);
+            assert!(errs.is_empty(), "{errs:?}");
+            let stmts = diff_routine(&cur, &d, MS).emit();
+            assert!(!stmts.is_empty(), "an edit");
+            db.run_ddl(&name, &stmts, CancellationToken::new())
+                .await
+                .unwrap_or_else(|e| panic!("{e}\n{stmts:#?}"));
+        }
+    };
+
+    let f = read("f").await;
+    assert_eq!(f.tsql.options, [O::CalledOnNullInput]);
+    let original = f.tsql.clone();
+    let mut d = RoutineDraft::from_info(&f);
+    d.info.tsql.set_null_input(true, &original);
+    d.info.tsql.set_inline(Some(false));
+    d.info.tsql.set_execute_as(Some(ExecuteAs::Owner));
+    apply(f.clone(), d).await;
+    let f2 = read("f").await;
+    assert!(f2.tsql.returns_null_on_null_input());
+    assert!(!f2.tsql.has_option(&O::CalledOnNullInput));
+    assert_eq!(f2.tsql.inline(), Some(false));
+    assert_eq!(f2.tsql.execute_as(), Some(&ExecuteAs::Owner));
+    assert_eq!(
+        s.scalar("SELECT ISNULL(CAST(dbo.f(NULL) AS varchar(5)), 'null')")
+            .await,
+        "null",
+        "the body no longer runs on NULL"
+    );
+    assert!(diff_routine(&f2, &RoutineDraft::from_info(&f2), MS).is_empty());
+
+    // Back off: the stated `CALLED ON NULL INPUT` returns; inlining is the
+    // server's choice again; the caller's rights.
+    let mut d = RoutineDraft::from_info(&f2);
+    d.info.tsql.set_null_input(false, &original);
+    d.info.tsql.set_inline(None);
+    d.info.tsql.set_execute_as(None);
+    apply(f2, d).await;
+    let f3 = read("f").await;
+    assert_eq!(f3.tsql, original, "as it was stored");
+    assert_eq!(s.scalar("SELECT dbo.f(NULL)").await, "-1");
+
+    // A procedure run as a user sees that user.
+    let p = read("p").await;
+    let mut d = RoutineDraft::from_info(&p);
+    d.info
+        .tsql
+        .set_execute_as(ExecuteAs::parse_field("app_runner"));
+    apply(p, d).await;
+    let p2 = read("p").await;
+    assert_eq!(
+        p2.tsql.execute_as(),
+        Some(&ExecuteAs::User("app_runner".into()))
+    );
+    assert_eq!(s.scalar("EXEC dbo.p").await, "app_runner");
+    assert!(diff_routine(&p2, &RoutineDraft::from_info(&p2), MS).is_empty());
+}
+
 /// Import `rows` into `dbo.imp (id, name)` on `s`.
 async fn import_into(
     s: &Scratch,

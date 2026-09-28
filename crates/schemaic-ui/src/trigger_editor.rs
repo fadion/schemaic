@@ -519,6 +519,64 @@ fn bound_choice(
     .into_any()
 }
 
+/// The rank dropdown's width — its longest label, not a field's.
+fn rank_w() -> f64 {
+    theme::scaled(120.0)
+}
+
+/// SQL Server's firing rank for the trigger at `i` on `event`: any order,
+/// first, or last. **Read from the draft on every frame** rather than seeded
+/// once as [`bound_choice`] is, because switching the event off clears the
+/// rank from under it (`TriggerInfo::set_event`) and the dropdown has to say
+/// so.
+fn rank_choice(
+    draft: RwSignal<TriggerSetDraft>,
+    i: usize,
+    event: TriggerEvent,
+    ring: FocusRing,
+    tabindex: u32,
+) -> AnyView {
+    use schemaic_core::schema::FiringRank;
+    const ANY: &str = "Any order";
+    const FIRST: &str = "Fires first";
+    const LAST: &str = "Fires last";
+    let label = |r: Option<FiringRank>| match r {
+        None => ANY,
+        Some(FiringRank::First) => FIRST,
+        Some(FiringRank::Last) => LAST,
+    };
+    focusable_owned_dropdown(
+        move || {
+            draft.with(|s| {
+                label(s.triggers.get(i).and_then(|t| t.info.tsql.rank_on(event))).to_string()
+            })
+        },
+        vec![ANY.into(), FIRST.into(), LAST.into()],
+        rank_w,
+        ring,
+        tabindex,
+        move |v: String| {
+            let rank = match v.as_str() {
+                FIRST => Some(FiringRank::First),
+                LAST => Some(FiringRank::Last),
+                _ => None,
+            };
+            // Only a real change is an edit: `update` notifies whatever it
+            // writes.
+            let held =
+                draft.with_untracked(|s| s.triggers.get(i).map(|t| t.info.tsql.rank_on(event)));
+            if held.is_some_and(|h| h != rank) {
+                draft.update(|s| {
+                    if let Some(t) = s.triggers.get_mut(i) {
+                        t.info.tsql.set_rank(event, rank);
+                    }
+                });
+            }
+        },
+    )
+    .into_any()
+}
+
 /// A list of free-text values as **rows**, not one comma-joined box.
 ///
 /// The separator-in-the-data rule, which both layers below this one already
@@ -788,40 +846,49 @@ fn form(
                 let v = on.get();
                 if prev.is_some_and(|p| p != v) {
                     d.update(|s| {
-                        let Some(dr) = s.triggers.get_mut(i) else {
-                            return;
-                        };
-                        dr.info.events.retain(|e| *e != ev);
-                        if v {
-                            dr.info.events.push(ev);
+                        // `set_event` keeps PostgreSQL's print order, which is
+                        // what the emitter round-trips against. That holds
+                        // because `TriggerEvent`'s declaration order *is*
+                        // `tgtype`'s bit order — see the type's own doc, and
+                        // the test in `schemaic-db` that pins the two together.
+                        // It did not hold when this comment was first written,
+                        // and saying so is what let a phantom drop-and-recreate
+                        // through review; the ordering is not obvious enough to
+                        // assert without naming where it is enforced. An event
+                        // switched off takes its SQL Server rank with it.
+                        if let Some(dr) = s.triggers.get_mut(i) {
+                            dr.info.set_event(ev, v);
                         }
-                        // Keep PostgreSQL's print order, which is what the
-                        // emitter round-trips against. That holds because
-                        // `TriggerEvent`'s declaration order *is* `tgtype`'s bit
-                        // order — see the type's own doc, and the test in
-                        // `schemaic-db` that pins the two together. It did not
-                        // hold when this comment was first written, and saying
-                        // so is what let a phantom drop-and-recreate through
-                        // review; the ordering is not obvious enough to assert
-                        // without naming where it is enforced.
-                        dr.info.events.sort();
                     });
                 }
                 v
             });
-            rows.push(
-                focusable_toggle_row(
-                    ev.sql(),
-                    match ev {
-                        TriggerEvent::Truncate => "Statement-level only.",
-                        _ => "",
-                    },
-                    on,
-                    ring.clone(),
-                    30 + n as u32,
-                )
-                .into_any(),
+            let toggle = focusable_toggle_row(
+                ev.sql(),
+                match ev {
+                    TriggerEvent::Truncate => "Statement-level only.",
+                    _ => "",
+                },
+                on,
+                ring.clone(),
+                30 + n as u32 * 2,
             );
+            // SQL Server's `sp_settriggerorder` rank, beside the event it is
+            // for. Read from the draft rather than seeded once, so the event's
+            // toggle clearing it (`set_event`) shows here; `INSTEAD OF` and a
+            // rank on an event it does not fire on are the validator's to
+            // name, as `UPDATE OF` is below.
+            let row: AnyView = if ddl::supports_trigger_firing_rank(target.dialect) {
+                h_stack((
+                    toggle.style(|s| s.flex_grow(1.0_f32)),
+                    rank_choice(d, i, ev, ring.clone(), 31 + n as u32 * 2),
+                ))
+                .style(|s| s.items_center().gap(theme::scaled(8.0)).width_full())
+                .into_any()
+            } else {
+                toggle.into_any()
+            };
+            rows.push(row);
         }
         v_stack_from_iter(rows)
             .style(|s| s.flex_col().gap(form_gap()).width_full())
@@ -879,8 +946,7 @@ fn form(
 
     // SQL Server's `NOT FOR REPLICATION`: the trigger stays silent while a
     // replication agent writes the table. Built only there, for `level`'s
-    // Tab-order reason. `EXECUTE AS` and the firing rank are kept by the model
-    // and restated on apply, but have no control yet.
+    // Tab-order reason. Its firing rank is beside each event, above.
     let not_for_replication: AnyView = if !ddl::supports_trigger_not_for_replication(target.dialect)
     {
         crate::widgets::nothing()
@@ -903,6 +969,32 @@ fn form(
             on,
             ring.clone(),
             45,
+        )
+        .into_any()
+    };
+
+    // SQL Server's `WITH EXECUTE AS`: whose rights the body runs with. One
+    // field, as the routine form's is — `ExecuteAs::parse_field` reads the
+    // keywords and a user, and quotes back a user named like a keyword.
+    let execute_as: AnyView = if !ddl::supports_trigger_execute_as(target.dialect) {
+        crate::widgets::nothing()
+    } else {
+        use schemaic_core::schema::ExecuteAs;
+        form_setting(
+            "Execute as",
+            bound_field(
+                d,
+                i,
+                ExecuteAs::field_text(draft.info.tsql.execute_as.as_ref()),
+                FieldCfg {
+                    placeholder: "CALLER, SELF, OWNER or a user",
+                    mono: true,
+                    focus: Some((ring.clone(), 47)),
+                    ..Default::default()
+                },
+                |d, v| d.info.tsql.execute_as = ExecuteAs::parse_field(v),
+            )
+            .style(move |s| s.width(field_w())),
         )
         .into_any()
     };
@@ -1017,6 +1109,7 @@ fn form(
         events,
         level,
         not_for_replication,
+        execute_as,
         form_section("Condition").style(move |s| {
             let s = s.margin_top(theme::scaled(4.0));
             if has_when { s } else { s.hide() }

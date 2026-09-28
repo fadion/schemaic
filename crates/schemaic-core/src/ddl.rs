@@ -1147,6 +1147,25 @@ impl TriggerDraft {
                 if t.events.contains(&TriggerEvent::Truncate) {
                     out.push("SQL Server has no TRUNCATE trigger.".to_string());
                 }
+                // `sp_settriggerorder`'s own refusals: no order at all for an
+                // `INSTEAD OF` trigger (Msg 15133), none on an event the
+                // trigger does not fire on (Msg 15125).
+                if t.timing == TriggerTiming::InsteadOf && !t.tsql.rank.is_empty() {
+                    out.push(
+                        "An INSTEAD OF trigger can't have a firing order — set each event \
+                         back to any order."
+                            .to_string(),
+                    );
+                }
+                for (event, rank) in &t.tsql.rank {
+                    if !t.events.contains(event) {
+                        out.push(format!(
+                            "It fires {} on {}, which it isn't a trigger for.",
+                            rank.label(),
+                            event.sql()
+                        ));
+                    }
+                }
                 if t.condition.as_deref().is_some_and(|c| !c.trim().is_empty()) {
                     out.push(
                         "SQL Server has no WHEN condition — put the test inside the body with IF."
@@ -1390,6 +1409,34 @@ impl TriggerSetDraft {
                 seen.push(name);
             }
         }
+        // SQL Server's firing order: one `First` and one `Last` per event on a
+        // table (Msg 15130). A set-wide rule, since the clash is between
+        // triggers — and empty on every other engine, which ranks nothing.
+        let mut places: Vec<(TriggerEvent, crate::schema::FiringRank, Vec<&str>)> = Vec::new();
+        for t in &self.triggers {
+            for &(event, rank) in &t.info.tsql.rank {
+                match places
+                    .iter_mut()
+                    .find(|(e, r, _)| *e == event && *r == rank)
+                {
+                    Some((_, _, names)) => names.push(&t.info.name),
+                    None => places.push((event, rank, vec![&t.info.name])),
+                }
+            }
+        }
+        for (event, rank, names) in places {
+            if let [head @ .., last] = names.as_slice()
+                && !head.is_empty()
+            {
+                out.push(format!(
+                    "Only one trigger can fire {} on {} — {} and {last} are {} set to.",
+                    rank.label(),
+                    event.sql(),
+                    head.join(", "),
+                    if head.len() == 1 { "both" } else { "all" }
+                ));
+            }
+        }
         out
     }
 }
@@ -1539,6 +1586,25 @@ impl RoutineDraft {
                 {
                     out.push(
                         "SQL Server names every parameter with @ — @sku varchar(20), @n int OUTPUT."
+                            .to_string(),
+                    );
+                }
+                // Each shape's `WITH` list is its own (`TsqlShape::allows`),
+                // and the server's refusal names neither the option nor why.
+                let shape = f.tsql_shape();
+                for opt in &f.tsql.options {
+                    if !shape.allows(opt) {
+                        out.push(format!(
+                            "{} can't take WITH {}.",
+                            shape.label_capitalised(),
+                            opt.sql()
+                        ));
+                    }
+                }
+                if f.tsql.inline() == Some(true) && f.tsql.execute_as().is_some() {
+                    out.push(
+                        "INLINE = ON can't be combined with EXECUTE AS — a function that runs \
+                         as someone else is never inlined."
                             .to_string(),
                     );
                 }
@@ -5437,12 +5503,17 @@ impl ChangeSet {
 
         let mut drops = Vec::new();
         let mut creates = Vec::new();
+        // SQL Server's ranks, last of all: every one after every alter, so a
+        // rank can pass from one trigger to another in the same plan.
+        let mut ranks = Vec::new();
         let mut made: Vec<String> = Vec::new();
         let mut push_create = |t: &TriggerInfo, or_alter: bool, made: &mut Vec<String>| {
             let resolved = t.with_resolvable_order(|named| {
                 survives(named) || made.iter().any(|m| same(m, named))
             });
-            creates.extend(trigger_create_statements(&resolved, or_alter, d));
+            let (statements, ranked) = trigger_create_statements(&resolved, or_alter, d);
+            creates.extend(statements);
+            ranks.extend(ranked);
             made.push(t.name.clone());
         };
         for c in &self.changes {
@@ -5462,6 +5533,7 @@ impl ChangeSet {
             }
         }
         drops.extend(creates);
+        drops.extend(ranks);
         drops
     }
 
@@ -7771,13 +7843,23 @@ fn routine_follow_ups(f: &RoutineInfo, before: Option<&RoutineInfo>, d: SqlDiale
 /// Server's are the trigger and then, as statements of their own, what the
 /// create or alter loses ([`TriggerInfo::tsql_follow_ups`]). `or_alter` is
 /// only ever `true` where [`supports_trigger_alter_in_place`] is.
-fn trigger_create_statements(t: &TriggerInfo, or_alter: bool, d: SqlDialect) -> Vec<String> {
+///
+/// **The second list is the ranks**, which the plan holds back until every
+/// trigger in it is written — see [`TriggerInfo::tsql_rank_statements`].
+fn trigger_create_statements(
+    t: &TriggerInfo,
+    or_alter: bool,
+    d: SqlDialect,
+) -> (Vec<String>, Vec<String>) {
     match d {
-        SqlDialect::MsSql => std::iter::once(t.tsql_statement(or_alter))
-            .chain(t.tsql_follow_ups())
-            .collect(),
+        SqlDialect::MsSql => (
+            std::iter::once(t.tsql_statement(or_alter))
+                .chain(t.tsql_disable_statement())
+                .collect(),
+            t.tsql_rank_statements(),
+        ),
         SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => {
-            session_wrapped_create(t, d)
+            (session_wrapped_create(t, d), Vec::new())
         }
     }
 }
@@ -8762,6 +8844,28 @@ pub fn trigger_fires_on_several_events(dialect: SqlDialect) -> bool {
 /// Does a trigger have SQL Server's `NOT FOR REPLICATION` — silent while a
 /// replication agent writes its table? No other engine here has the clause.
 pub fn supports_trigger_not_for_replication(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MsSql => true,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+    }
+}
+
+/// Does a trigger take SQL Server's `WITH EXECUTE AS` — a principal chosen
+/// from `CALLER`, `SELF`, `OWNER` or a user? MySQL's `DEFINER` answers a
+/// different question (an account, carried as `TriggerInfo::definer`), and
+/// PostgreSQL's rights are its function's.
+pub fn supports_trigger_execute_as(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MsSql => true,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+    }
+}
+
+/// Does a trigger take a **firing rank per event** — SQL Server's
+/// `sp_settriggerorder` `First`/`Last`? MySQL orders with `FOLLOWS` and
+/// `PRECEDES` against a named trigger instead, PostgreSQL by name, SQLite
+/// not at all — none a rank.
+pub fn supports_trigger_firing_rank(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MsSql => true,
         SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
@@ -12482,13 +12586,7 @@ pub fn routine_signature_changed(
     dialect: SqlDialect,
 ) -> bool {
     match dialect {
-        SqlDialect::MsSql => {
-            let shape = |f: &RoutineInfo| {
-                let r = f.returns.trim();
-                (f.kind, r.eq_ignore_ascii_case("TABLE"), r.starts_with('@'))
-            };
-            shape(current) != shape(draft)
-        }
+        SqlDialect::MsSql => current.tsql_shape() != draft.tsql_shape(),
         SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => {
             routine_identity_args(&draft.arguments, dialect)
                 != routine_identity_args(&current.arguments, dialect)
@@ -24430,13 +24528,54 @@ mod tsql_routine_plan_tests {
         d.info.arguments = "@a int, @b nvarchar(10) = N'x, y'".into();
         assert!(d.validate(MsSql).is_empty(), "{:?}", d.validate(MsSql));
     }
+
+    /// **An option the routine's shape refuses is refused here**, before the
+    /// server answers Msg 487 — measured on SQL Server 2022: an inline
+    /// table-valued function takes none of `EXECUTE AS`, the null-input
+    /// clauses or `INLINE`, a multi-statement one takes `EXECUTE AS` alone of
+    /// them — and so is `INLINE = ON` beside `EXECUTE AS`, which a scalar
+    /// function cannot be inlined with (Msg 16203).
+    #[test]
+    fn a_sql_server_routine_option_its_shape_refuses_is_refused() {
+        use crate::schema::{ExecuteAs, TsqlRoutineOption as O};
+        let owner = O::ExecuteAs(ExecuteAs::Owner);
+        let with = |returns: &str, options: Vec<O>| {
+            let mut f = RoutineInfo {
+                kind: RoutineKind::Function,
+                returns: returns.into(),
+                body: "BEGIN RETURN @a END".into(),
+                ..proc_r()
+            };
+            f.tsql.options = options;
+            RoutineDraft::from_info(&f).validate(MsSql)
+        };
+        let scalar_ok = vec![O::ReturnsNullOnNullInput, O::Inline(false), owner.clone()];
+        assert!(with("int", scalar_ok.clone()).is_empty());
+        assert!(with("int", vec![O::Inline(true)]).is_empty());
+        let both = with("int", vec![O::Inline(true), owner.clone()]);
+        assert!(both.iter().any(|e| e.contains("INLINE = ON")), "{both:?}");
+        for opt in [O::ReturnsNullOnNullInput, O::Inline(true), owner.clone()] {
+            let errs = with("TABLE", vec![opt.clone()]);
+            assert!(
+                errs.iter().any(|e| e.contains(&opt.sql())),
+                "{opt:?}: {errs:?}"
+            );
+        }
+        assert!(with("@t TABLE (a int)", vec![owner.clone()]).is_empty());
+        let errs = with("@t TABLE (a int)", vec![O::CalledOnNullInput]);
+        assert!(
+            errs.iter().any(|e| e.contains("CALLED ON NULL INPUT")),
+            "{errs:?}"
+        );
+        assert!(with("TABLE", vec![O::SchemaBinding]).is_empty());
+    }
 }
 
 #[cfg(test)]
 mod tsql_trigger_plan_tests {
     use super::*;
     use crate::intel::SqlDialect::MsSql;
-    use crate::schema::FiringRank;
+    use crate::schema::{FiringRank, TriggerEnabled};
 
     fn tr(name: &str) -> TriggerInfo {
         TriggerInfo {
@@ -24522,6 +24661,8 @@ mod tsql_trigger_plan_tests {
                 }
             }
             assert_eq!(supports_trigger_not_for_replication(d), d == MsSql);
+            assert_eq!(supports_trigger_execute_as(d), d == MsSql);
+            assert_eq!(supports_trigger_firing_rank(d), d == MsSql);
         }
         assert!(trigger_fires_on_several_events(MsSql));
         assert!(trigger_fires_on_several_events(SqlDialect::Postgres));
@@ -24563,6 +24704,97 @@ mod tsql_trigger_plan_tests {
                 "EXEC sp_settriggerorder @triggername = N'[dbo].[tr]', @order = N'First', \
                  @stmttype = N'INSERT';",
             ]
+        );
+    }
+
+    /// **Every rank is set after every alter**, so a rank can move between
+    /// triggers in one plan. `sp_settriggerorder` refuses a second `First` on
+    /// an event (Msg 15130) and only an alter lets go of one, so a trigger
+    /// taking `First` from its neighbour — or two swapping `First` and `Last`
+    /// — failed when each trigger's rank followed its own alter: the second
+    /// trigger's alter had not yet run when the first one's rank was set.
+    #[test]
+    fn a_rank_moves_between_triggers_in_one_plan() {
+        let rank = |name: &str, order: &str| {
+            format!(
+                "EXEC sp_settriggerorder @triggername = N'[dbo].[{name}]', @order = N'{order}', \
+                 @stmttype = N'INSERT';"
+            )
+        };
+        let mut a = tr("a");
+        let mut b = tr("b");
+        a.tsql
+            .set_rank(TriggerEvent::Insert, Some(FiringRank::First));
+        b.tsql
+            .set_rank(TriggerEvent::Insert, Some(FiringRank::Last));
+        let current = [a.clone(), b.clone()];
+        let mut d = set(current.to_vec());
+        d.triggers[0]
+            .info
+            .tsql
+            .set_rank(TriggerEvent::Insert, Some(FiringRank::Last));
+        d.triggers[1]
+            .info
+            .tsql
+            .set_rank(TriggerEvent::Insert, Some(FiringRank::First));
+        assert!(d.validate(&current, MsSql, TriggerHost::Table).is_empty());
+        let sql = diff_triggers(&current, &d, MsSql).emit();
+        assert_eq!(sql.len(), 4, "{sql:?}");
+        assert!(
+            sql[0].starts_with("CREATE OR ALTER TRIGGER [dbo].[a]"),
+            "{sql:?}"
+        );
+        assert!(
+            sql[1].starts_with("CREATE OR ALTER TRIGGER [dbo].[b]"),
+            "{sql:?}"
+        );
+        assert_eq!(sql[2..], [rank("a", "Last"), rank("b", "First")]);
+
+        // A disabled trigger stays disabled right after its own statement;
+        // only the ranks wait.
+        d.triggers[0].info.enabled = TriggerEnabled::Disabled;
+        let sql = diff_triggers(&current, &d, MsSql).emit();
+        assert_eq!(sql[1], "DISABLE TRIGGER [dbo].[a] ON [dbo].[t];", "{sql:?}");
+        assert_eq!(sql[3..], [rank("a", "Last"), rank("b", "First")]);
+    }
+
+    /// What `sp_settriggerorder` refuses, refused where the form can say so:
+    /// a rank on an event the trigger does not fire on (Msg 15125), any rank
+    /// on an `INSTEAD OF` trigger (Msg 15133), and two triggers in one place
+    /// on one event (Msg 15130) — the last across the set, since it is a
+    /// clash between triggers.
+    #[test]
+    fn a_rank_the_server_refuses_is_refused() {
+        let mut t = tr("a");
+        t.tsql.rank = vec![(TriggerEvent::Delete, FiringRank::First)];
+        let errs = TriggerDraft::from_info(&t).validate(MsSql, TriggerHost::Table);
+        assert!(errs.iter().any(|e| e.contains("DELETE")), "{errs:?}");
+
+        let mut t = tr("a");
+        t.timing = TriggerTiming::InsteadOf;
+        t.tsql
+            .set_rank(TriggerEvent::Insert, Some(FiringRank::Last));
+        let errs = TriggerDraft::from_info(&t).validate(MsSql, TriggerHost::Table);
+        assert!(errs.iter().any(|e| e.contains("INSTEAD OF")), "{errs:?}");
+
+        let mut a = tr("a");
+        let mut b = tr("b");
+        a.tsql
+            .set_rank(TriggerEvent::Insert, Some(FiringRank::First));
+        b.tsql
+            .set_rank(TriggerEvent::Insert, Some(FiringRank::Last));
+        let current = [a.clone(), b.clone()];
+        let mut d = set(current.to_vec());
+        assert!(d.validate(&current, MsSql, TriggerHost::Table).is_empty());
+        d.triggers[1]
+            .info
+            .tsql
+            .set_rank(TriggerEvent::Insert, Some(FiringRank::First));
+        let errs = d.validate(&current, MsSql, TriggerHost::Table);
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("first on INSERT") && e.contains("a") && e.contains("b")),
+            "{errs:?}"
         );
     }
 
