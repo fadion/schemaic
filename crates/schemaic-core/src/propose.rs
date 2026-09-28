@@ -209,18 +209,21 @@ pub enum ProposeError {
     UnknownAction(String),
 }
 
-/// The referential actions a foreign key may state, as both engines spell them.
+/// Is `action` a referential action a foreign key may state on `dialect`?
 ///
 /// A closed vocabulary, because [`crate::ddl`] writes the string straight after
 /// `ON DELETE ` — so an author who could put anything there could close the
-/// constraint and open another `alter_option`.
-const FK_ACTIONS: [&str; 5] = [
-    "CASCADE",
-    "SET NULL",
-    "SET DEFAULT",
-    "RESTRICT",
-    "NO ACTION",
-];
+/// constraint and open another `alter_option`. It is the designer's own list
+/// ([`crate::ddl::fk_actions`]), whose `None` entry is `NO ACTION`: this used to
+/// be a list of its own, the union of every engine's, and so accepted
+/// `RESTRICT` on SQL Server, which has none.
+fn is_fk_action(action: &str, dialect: SqlDialect) -> bool {
+    let action = action.trim();
+    crate::ddl::fk_actions(dialect)
+        .iter()
+        .map(|k| k.unwrap_or("NO ACTION"))
+        .any(|k| k.eq_ignore_ascii_case(action))
+}
 
 /// Every string this op contributes to a statement **verbatim**, checked before
 /// a single op is applied.
@@ -269,9 +272,7 @@ fn check_free_sql(op: &ProposedOp, dialect: SqlDialect) -> Result<(), ProposeErr
     };
     let action = |a: &Option<String>| -> Result<(), ProposeError> {
         match a {
-            Some(a) if !FK_ACTIONS.iter().any(|k| k.eq_ignore_ascii_case(a.trim())) => {
-                Err(ProposeError::UnknownAction(a.clone()))
-            }
+            Some(a) if !is_fk_action(a, dialect) => Err(ProposeError::UnknownAction(a.clone())),
             _ => Ok(()),
         }
     };
@@ -1505,6 +1506,33 @@ mod tests {
         // The real ones, in either casing.
         assert!(apply(&orders(), &fk("cascade"), SqlDialect::MySql).is_ok());
         assert!(apply(&orders(), &fk("SET NULL"), SqlDialect::MySql).is_ok());
+    }
+
+    /// The vocabulary is the engine's, not a union of all of them: SQL Server
+    /// has no `RESTRICT`, so a proposal naming it used to reach the preview and
+    /// fail at the server with `Incorrect syntax near 'RESTRICT'`.
+    #[test]
+    fn a_foreign_key_action_the_engine_lacks_is_refused() {
+        let fk = |action: &str| {
+            proposal(vec![ProposedOp::AddForeignKey(NewForeignKey {
+                name: Some("fk_c".into()),
+                columns: vec!["customer_id".into()],
+                ref_table: "customers".into(),
+                ref_columns: vec!["id".into()],
+                on_update: Some(action.into()),
+                ..Default::default()
+            })])
+        };
+        assert!(matches!(
+            apply(&orders(), &fk("restrict"), SqlDialect::MsSql),
+            Err(ProposeError::UnknownAction(_))
+        ));
+        assert!(apply(&orders(), &fk("RESTRICT"), SqlDialect::Postgres).is_ok());
+        // `NO ACTION` is every engine's, though the menu spells it `None`.
+        for d in [SqlDialect::MsSql, SqlDialect::MySql] {
+            assert!(apply(&orders(), &fk("NO ACTION"), d).is_ok(), "{d:?}");
+            assert!(apply(&orders(), &fk("CASCADE"), d).is_ok(), "{d:?}");
+        }
     }
 
     #[test]

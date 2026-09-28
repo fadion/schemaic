@@ -3202,7 +3202,8 @@ existing prose was left alone.
     **Four more came with SQL Server's Create table**, each an exhaustive `match` the designer asks
     where it had compared engines or asked nothing, and each for a field it offered and SQL Server
     could not take.
-    `fk_actions(dialect)` is the action dropdown's list, `FK_ACTIONS` less `RESTRICT` on SQL Server,
+    `fk_actions(dialect)` is the action dropdown's list — and `propose::is_fk_action`'s, under
+    `propose.rs` — `FK_ACTIONS` less `RESTRICT` on SQL Server,
     whose refusing action is `NO ACTION` — already the first entry — so the other was an entry whose
     every use is a syntax error. `supports_comments(dialect)` is MySQL's and PostgreSQL's: SQLite has
     no comments in the language, and SQL Server keeps them as extended properties
@@ -7552,7 +7553,12 @@ existing prose was left alone.
       rename carries its indexes and keys and a drop cascades to them; the result is run through
       `TableDraft::validate` before it is returned, so the designer's rules stand between the model
       and the preview. Column lookups match case-insensitively — a model routinely writes `Email`
-      for `email` — and keep the server's spelling.
+      for `email` — and keep the server's spelling. A foreign key's action is a closed vocabulary,
+      since `ddl` writes it straight after `ON DELETE `, and **it is the designer's own list**:
+      `is_fk_action` asks `ddl::fk_actions(dialect)`, its `None` entry read as `NO ACTION`. It used
+      to be a list of its own, the union of every engine's, so a proposal naming `RESTRICT` on SQL
+      Server reached the preview and failed at the server; it is `UnknownAction` now
+      (`a_foreign_key_action_the_engine_lacks_is_refused`).
       **`resolve_target` is the one resolver for *which table* a proposal is about**, and it is one
       function because the two ends of a proposal have to agree: the MCP tool checks the ops against
       a table and answers "Valid. Nothing has run.", and the card then builds the plan the user
