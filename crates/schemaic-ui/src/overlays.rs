@@ -1781,7 +1781,8 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     }
                     entries.push(export_submenu(&dump_ctx, &menu.name, None, None));
                     // On PostgreSQL a database node stands for its `public`
-                    // namespace (other namespaces get their own node), so a new
+                    // namespace, on SQL Server for `dbo` (other namespaces get
+                    // their own node), so a new
                     // table lands where the tree says it will.
                     {
                         let ns = crate::table_designer::default_schema(

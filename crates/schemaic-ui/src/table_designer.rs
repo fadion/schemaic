@@ -286,7 +286,8 @@ pub(crate) fn loaded_schema(
 }
 
 /// The namespace a *new* object in `database` should land in: `public` on
-/// PostgreSQL, `None` on MySQL (which has no level between database and table).
+/// PostgreSQL, `dbo` on SQL Server, `None` on MySQL (which has no level between
+/// database and table) — [`schemaic_core::schema::default_namespace`].
 ///
 /// **Derived from the dialect, refined by the loaded schema.** It used to be
 /// read off the loaded schema alone, on the grounds that this is the same
@@ -304,9 +305,7 @@ pub(crate) fn loaded_schema(
 /// database really does report its namespaces, and `schemas()` being empty is a
 /// genuine "this database has no namespace level" rather than "not looked yet".
 pub(crate) fn default_schema(conn: ConnUi, ui: SchemaUi, database: &str) -> Option<String> {
-    if edit_ctx(conn).dialect != schemaic_core::intel::SqlDialect::Postgres {
-        return None;
-    }
+    let namespace = schemaic_core::schema::default_namespace(edit_ctx(conn).dialect)?;
     let loaded_without_namespaces = ui.db_nodes.with_untracked(|nodes| {
         nodes
             .iter()
@@ -316,7 +315,7 @@ pub(crate) fn default_schema(conn: ConnUi, ui: SchemaUi, database: &str) -> Opti
                 _ => false,
             })
     });
-    (!loaded_without_namespaces).then(|| schemaic_core::schema::PG_DEFAULT_SCHEMA.to_string())
+    (!loaded_without_namespaces).then(|| namespace.to_string())
 }
 
 /// Every table name in a database, for the foreign-key target picker. Views are

@@ -4262,17 +4262,19 @@ mod engine_comparison_gate {
         ),
         (
             "table_designer.rs",
-            5,
+            4,
             "**Partly not clean.** `has_on_update == MySql` is a capability \
              question with no predicate — `supports_on_update_current_timestamp` \
              is the one this file is waiting for. The others are per-engine \
              *grammar*: MySQL's storage row, PostgreSQL's index method and \
-             partial-index fields, `NOT ENFORCED`, and the namespace a new \
-             table defaults to. 9 → 8: a new column's placeholder type is \
-             `ddl::default_new_column_type`. 8 → 5, with SQL Server's Create \
-             table: both comment fields ask `ddl::supports_comments`, the \
-             identity toggle `ddl::identity_wording`, and the index key hint \
-             `ddl::supports_index_prefix`.",
+             partial-index fields, and `NOT ENFORCED`. 9 → 8: a new column's \
+             placeholder type is `ddl::default_new_column_type`. 8 → 5, with \
+             SQL Server's Create table: both comment fields ask \
+             `ddl::supports_comments`, the identity toggle \
+             `ddl::identity_wording`, and the index key hint \
+             `ddl::supports_index_prefix`. 5 → 4: the namespace a new table \
+             defaults to is `schema::default_namespace`, which was the \
+             comparison sending SQL Server's into the login's schema.",
         ),
         (
             "trigger_editor.rs",

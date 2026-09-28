@@ -923,6 +923,27 @@ fn is_numeric_literal(n: &str) -> bool {
 /// off and single-schema statements stay exactly what they were.
 pub const PG_DEFAULT_SCHEMA: &str = "public";
 
+/// SQL Server's default namespace — where a database's own objects live unless
+/// someone made more.
+pub const MSSQL_DEFAULT_SCHEMA: &str = "dbo";
+
+/// The namespace a database row in the tree stands for on `dialect`, or `None`
+/// on an engine with no level between database and table.
+///
+/// **Written into a new object's statement, never left to the server.** An
+/// unqualified `CREATE TABLE` on SQL Server lands in the *login's* default
+/// schema, which for a login mapped with `DEFAULT_SCHEMA = sales` is not the
+/// `dbo` the row the user right-clicked stands for — the same trap as a
+/// PostgreSQL `search_path` that leads with `"$user"`.
+pub fn default_namespace(dialect: crate::intel::SqlDialect) -> Option<&'static str> {
+    use crate::intel::SqlDialect;
+    match dialect {
+        SqlDialect::Postgres => Some(PG_DEFAULT_SCHEMA),
+        SqlDialect::MsSql => Some(MSSQL_DEFAULT_SCHEMA),
+        SqlDialect::MySql | SqlDialect::Sqlite => None,
+    }
+}
+
 /// The namespace to qualify a table with in **user-facing** generated SQL, or
 /// `None` when the bare name is right. `schema` is a table's introspected
 /// namespace ([`TableInfo::schema`]): `None` on MySQL, which has no level between
@@ -7588,6 +7609,17 @@ mod tests {
     }
 
     // ── multi-schema (PostgreSQL namespaces) ──────────────────────────────
+
+    #[test]
+    fn default_namespace_names_each_engines_own() {
+        use crate::intel::SqlDialect::*;
+        assert_eq!(default_namespace(Postgres), Some("public"));
+        // Not the login's default schema: a login mapped to `sales` would
+        // otherwise create the table away from the `dbo` the tree row shows.
+        assert_eq!(default_namespace(MsSql), Some("dbo"));
+        assert_eq!(default_namespace(MySql), None);
+        assert_eq!(default_namespace(Sqlite), None);
+    }
 
     #[test]
     fn sql_qualifier_drops_the_search_path_default() {

@@ -15747,9 +15747,12 @@ existing prose was left alone.
     `supports_column_reorder` says no, and an identity toggled on an existing column is withheld in
     the preview rather than written. The Primary key toggle still leaves Nullable as it was, which
     SQL Server would refuse a key over (Msg 8111); `diff` makes the key's columns `NOT NULL` there
-    instead (`ddl::primary_key_implies_not_null`, under `mssql.rs`). A table created from a database row goes out unqualified,
-    landing in the login's default schema (usually `dbo`), because `default_schema` answers only for
-    PostgreSQL.
+    instead (`ddl::primary_key_implies_not_null`, under `mssql.rs`). A table created from a database row is
+    written `[dbo].[t]`: `default_schema` asks `schema::default_namespace` — `public`, `dbo`, or
+    `None` where there is no namespace level — where it had compared `!= Postgres`, and so sent the
+    statement out unqualified on SQL Server, landing in the *login's* default schema, which for a
+    login mapped with `DEFAULT_SCHEMA = sales` is not the `dbo` the row stands for. A loaded schema
+    with no namespaces still answers `None`.
     **Off `whole_ui_gate`'s list, 4 to zero, and the last four were the three opening paths and the
     overlay.** Those three write across `ddl`, `schema` and the peer editors, so they name all
     three — `open_for_table(ConnUi, SchemaUi, DdlUi, …)`, and the same for `preview_draft_edit` and
