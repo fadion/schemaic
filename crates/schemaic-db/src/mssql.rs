@@ -899,7 +899,8 @@ pub(crate) async fn fetch_table_list(db: &Db, database: &str) -> Result<DbSchema
 /// Every column of every user table and view: `(schema, table, column, type,
 /// max_length, precision, scale, user-defined type, nullable, identity,
 /// computed definition, persisted, default definition, collation (when not the
-/// database's), description, is rowversion, the type's schema)`.
+/// database's), description, is rowversion, the type's schema, identity seed,
+/// identity increment)`.
 const COLUMN_LISTING: &str = "SELECT s.name, o.name, c.name, ty.name, \
             c.max_length, c.precision, c.scale, CAST(ty.is_user_defined AS int), \
             CAST(c.is_nullable AS int), CAST(c.is_identity AS int), \
@@ -909,11 +910,14 @@ const COLUMN_LISTING: &str = "SELECT s.name, o.name, c.name, ty.name, \
                  AS sysname) THEN c.collation_name END, \
             CAST(ep.value AS nvarchar(4000)), \
             CAST(CASE WHEN ty.name = 'timestamp' THEN 1 ELSE 0 END AS int), \
-            SCHEMA_NAME(ty.schema_id) \
+            SCHEMA_NAME(ty.schema_id), \
+            CAST(idc.seed_value AS nvarchar(40)), CAST(idc.increment_value AS nvarchar(40)) \
      FROM sys.columns c \
      JOIN sys.objects o ON o.object_id = c.object_id \
      JOIN sys.schemas s ON s.schema_id = o.schema_id \
      JOIN sys.types ty ON ty.user_type_id = c.user_type_id \
+     LEFT JOIN sys.identity_columns idc \
+            ON idc.object_id = c.object_id AND idc.column_id = c.column_id \
      LEFT JOIN sys.computed_columns cc \
             ON cc.object_id = c.object_id AND cc.column_id = c.column_id \
      LEFT JOIN sys.default_constraints dc ON dc.object_id = c.default_object_id \
@@ -1080,6 +1084,19 @@ fn mssql_type_name(
         "float" if precision != 53 => format!("float({precision})"),
         _ => n,
     }
+}
+
+/// An identity's `(seed, increment)` from `sys.identity_columns`, kept only
+/// when both are integer text — they are spliced into `IDENTITY(…)`, so a
+/// value of any other shape is dropped, and the DDL falls back to `(1,1)` with
+/// the note that says so, rather than carry it.
+fn identity_spec(seed: &str, increment: &str) -> Option<(String, String)> {
+    let integer = |s: &str| {
+        let s = s.trim();
+        let digits = s.strip_prefix('-').unwrap_or(s);
+        (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())).then(|| s.to_string())
+    };
+    Some((integer(seed)?, integer(increment)?))
 }
 
 /// A stored expression without the parentheses SQL Server wraps it in:
@@ -1254,6 +1271,9 @@ async fn collect_schema(client: &mut MsClient) -> Result<DbSchema, DbError> {
                 // supplies it.
                 auto_increment: flag(&r, 9),
                 identity_always: flag(&r, 9) || flag(&r, 15),
+                identity_spec: flag(&r, 9)
+                    .then(|| identity_spec(r.get(17)?.as_deref()?, r.get(18)?.as_deref()?))
+                    .flatten(),
                 generated_stored: flag(&r, 11),
                 generated,
                 default: r.get(12).cloned().flatten().map(|d| strip_outer_parens(&d)),
@@ -2666,6 +2686,25 @@ mod write_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Seed and increment are spliced into `IDENTITY(…)`, so only integer
+    /// text is kept — a `decimal(38,0)` identity's seed is wider than `i64`,
+    /// which is why this is text at all.
+    #[test]
+    fn an_identity_spec_is_kept_only_as_integer_text() {
+        assert_eq!(
+            identity_spec("1000", "-5"),
+            Some(("1000".into(), "-5".into()))
+        );
+        assert_eq!(
+            identity_spec("99999999999999999999", "1"),
+            Some(("99999999999999999999".into(), "1".into()))
+        );
+        assert_eq!(identity_spec("1.5", "1"), None);
+        assert_eq!(identity_spec("1", "1) x"), None);
+        assert_eq!(identity_spec("-", "1"), None);
+        assert_eq!(identity_spec("", "1"), None);
+    }
 
     #[test]
     fn a_decimal_is_rendered_from_its_scaled_integer() {

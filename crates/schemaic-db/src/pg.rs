@@ -1982,6 +1982,7 @@ async fn collect_schema(client: &Client) -> Result<DbSchema, DbError> {
             default: a.default,
             auto_increment: a.auto_increment,
             identity_always: a.identity_always,
+            identity_spec: None,
             comment: r.get(8).cloned().flatten(),
             collation: r.get(9).cloned().flatten(),
             on_update: None,

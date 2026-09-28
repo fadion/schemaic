@@ -1486,7 +1486,7 @@ async fn a_tables_ddl_rebuilds_the_table_it_was_read_from() {
     let dst = Scratch::create("ddl_dst").await;
     src.exec(
         "CREATE TABLE dbo.t ( \
-           id int IDENTITY(1,1) CONSTRAINT pk_t PRIMARY KEY, \
+           id int IDENTITY(1000,-5) CONSTRAINT pk_t PRIMARY KEY, \
            [odd]]name] nvarchar(40) COLLATE Latin1_General_BIN NULL, \
            balance decimal(10,2) NOT NULL DEFAULT ((0)), \
            doubled AS (balance * 2) PERSISTED, \
@@ -1511,6 +1511,10 @@ async fn a_tables_ddl_rebuilds_the_table_it_was_read_from() {
         }
     };
     let original = read(&src).await;
+    assert_eq!(
+        original.columns[0].identity_spec,
+        Some(("1000".into(), "-5".into()))
+    );
     let ddl = original.create_ddl(MS);
     for stmt in schemaic_core::sql::executable_statements(&ddl, MS) {
         dst.exec(&stmt).await;
@@ -1521,12 +1525,13 @@ async fn a_tables_ddl_rebuilds_the_table_it_was_read_from() {
             .iter()
             .map(|c| {
                 format!(
-                    "{} {} null={} pk={} id={} def={:?} gen={:?} {} coll={:?}",
+                    "{} {} null={} pk={} id={} {:?} def={:?} gen={:?} {} coll={:?}",
                     c.name,
                     c.type_name,
                     c.nullable,
                     c.primary_key,
                     c.auto_increment,
+                    c.identity_spec,
                     c.default,
                     c.generated,
                     c.generated_stored,

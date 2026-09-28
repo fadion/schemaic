@@ -6359,11 +6359,18 @@ existing prose was left alone.
     **On SQL Server `definition_sql` hands off to `tsql_definition` first**, T-SQL's column differing
     from the shape the other arms share at most clauses. A computed column has no type —
     `[c] AS (expr)`, `PERSISTED` for a stored one and `NOT NULL` only then, the server refusing it on
-    a column computed on read; an identity is `IDENTITY(1,1)` and always `NOT NULL`, whatever the
-    draft says; and **a nullable column is written `NULL` out loud**, because a new column's
+    a column computed on read; an identity is `IDENTITY(seed,increment)` and always `NOT NULL`,
+    whatever the draft says; and **a nullable column is written `NULL` out loud**, because a new column's
     nullability otherwise follows the session's `ANSI_NULL_DFLT_*` settings and the same statement
     could make a different column from another client. `DEFAULT` goes through `is_bare_default`;
     there is no `ON UPDATE`, inline comment or `INVISIBLE`, T-SQL having none of them.
+    **The seed and increment are `ColumnInfo::identity_spec`**, the pair `db::mssql` reads from
+    `sys.identity_columns` — `None` for a column the designer is making, which gets `(1,1)`, and on
+    every other engine. Without it every recreate wrote `(1,1)`, renumbering a table whose ids start
+    at 1000 or count down. The pair is spliced into the DDL, so `mssql::identity_spec` keeps it only
+    as integer text and drops anything else back to `(1,1)` and the comment that says so
+    (`an_identity_spec_is_kept_only_as_integer_text`); `tsql_identity` is the one place both
+    emitters write it (`create_ddl_sql_server_restates_the_identity_it_read`).
     **`ColumnInfo::invisible` is `index_disabled_sql`'s argument one object down**: MySQL 8.0.23+
     and MariaDB 10.3+ mark a column `INVISIBLE`, which leaves it selectable by name and out of
     `SELECT *`, and that is the standard way to retire a column without breaking an application —
@@ -10719,8 +10726,9 @@ existing prose was left alone.
   one leaves it waiting, which is why every caller here bounds it with `CANCEL_TIMEOUT`. A re-vendor
   re-applies the list; when it is empty the directory and the `[patch]` entry go.
   The rest of the engine's surface is in `core`: `TableInfo::create_ddl` has a T-SQL arm
-  (`tsql_create_ddl` — `IDENTITY(1,1)` with a comment that the seed and increment are not read,
-  named primary-key and unique constraints, checks, `AS (…) PERSISTED`, other indexes as separate
+  (`tsql_create_ddl` — the identity with the seed and increment `sys.identity_columns` reported,
+  and `(1,1)` with a comment saying so only where they were not read, named primary-key and unique
+  constraints, checks, `AS (…) PERSISTED`, other indexes as separate
   statements and what it cannot restate named in a comment; a view is its stored definition), held
   to the server by `a_tables_ddl_rebuilds_the_table_it_was_read_from`; a trigger's DDL is its stored
   statement and a schema script closes each object's batch with `GO` (`TriggerInfo::create_sql`,

@@ -2336,6 +2336,7 @@ fn table_columns(conn: &SqliteConn, db: &str, table: &str) -> Result<Vec<ColumnI
             auto_increment: rowid_alias,
             sqlite_autoincrement: rowid_alias && declared_autoincrement,
             identity_always: false,
+            identity_spec: None,
             generated,
             generated_stored: hidden == 3,
             on_update: None,

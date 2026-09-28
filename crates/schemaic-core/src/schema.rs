@@ -48,6 +48,14 @@ pub struct ColumnInfo {
     /// into [`ColumnInfo::auto_increment`] made import offer to write a column
     /// the server would refuse. Always `false` on MySQL, which has no such form.
     pub identity_always: bool,
+    /// SQL Server's `IDENTITY(seed, increment)`, as the catalog reports them,
+    /// when the column is an identity that was *read* — `None` for one the
+    /// designer is making, which gets `(1,1)`, and on every other engine.
+    ///
+    /// Integer text, checked at the introspection boundary (`db::mssql`),
+    /// since it is spliced into DDL. Without it every recreate wrote `(1,1)`,
+    /// renumbering a table whose ids start at 1000 or count down.
+    pub identity_spec: Option<(String, String)>,
     /// A generated/computed column's expression, without the `AS (…)` wrapper.
     pub generated: Option<String>,
     /// **SQLite's `AUTOINCREMENT` keyword**, which is a narrower claim than
@@ -605,14 +613,24 @@ impl ColumnInfo {
         out
     }
 
+    /// ` IDENTITY(seed,increment)` for this column: the pair read from the
+    /// catalog, or `(1,1)` when there is none.
+    fn tsql_identity(&self) -> String {
+        match &self.identity_spec {
+            Some((seed, step)) => format!(" IDENTITY({seed},{step})"),
+            None => " IDENTITY(1,1)".to_string(),
+        }
+    }
+
     /// [`ColumnInfo::definition_sql`] in T-SQL, whose shape differs from the
     /// MySQL one the other arms share at most clauses.
     ///
     /// - **A computed column has no type**: `[c] AS (expr)`, `PERSISTED` for a
     ///   stored one, and `NOT NULL` only then (the server refuses it on a
     ///   column it computes on read).
-    /// - **The key counter is `IDENTITY(1,1)`**, and an identity is never
-    ///   nullable, so it is written `NOT NULL` whatever the draft says.
+    /// - **The key counter is `IDENTITY(seed,increment)`** — the ones read, or
+    ///   `(1,1)` for a new column — and an identity is never nullable, so it
+    ///   is written `NOT NULL` whatever the draft says.
     /// - **`NULL` is written out.** A new column's nullability otherwise
     ///   follows the session's `ANSI_NULL_DFLT_*` settings, so the same
     ///   statement could make a different column from another client.
@@ -635,7 +653,7 @@ impl ColumnInfo {
             out.push_str(&format!(" COLLATE {col}"));
         }
         if self.auto_increment {
-            out.push_str(" IDENTITY(1,1)");
+            out.push_str(&self.tsql_identity());
         }
         out.push_str(if self.nullable && !self.auto_increment {
             " NULL"
@@ -4244,8 +4262,8 @@ impl TableInfo {
     /// since T-SQL declares none inline that the model can say.
     ///
     /// **What it does not restate is said in a comment**, as the view arms
-    /// do: an identity's seed and increment are not in the model, so they read
-    /// `(1,1)`; an index with included columns or of a kind the model has no
+    /// do: an identity whose seed and increment were not read reads `(1,1)`
+    /// and says so; an index with included columns or of a kind the model has no
     /// field for is named rather than rebuilt without them; foreign keys, as
     /// on every engine here, are left to the script that orders them.
     fn tsql_create_ddl(&self) -> String {
@@ -4284,11 +4302,13 @@ impl TableInfo {
             }
             line.push_str(&c.type_name);
             if c.auto_increment {
-                line.push_str(" IDENTITY(1,1)");
-                notes.push(format!(
-                    "-- {}: the identity's seed and increment are not read, and are written (1,1).",
-                    crate::export::comment_text(&c.name)
-                ));
+                line.push_str(&c.tsql_identity());
+                if c.identity_spec.is_none() {
+                    notes.push(format!(
+                        "-- {}: the identity's seed and increment are not read, and are written (1,1).",
+                        crate::export::comment_text(&c.name)
+                    ));
+                }
             }
             if let Some(col) = c.collation.as_deref().filter(|s| !s.is_empty()) {
                 line.push_str(&format!(" COLLATE {col}"));
@@ -7302,6 +7322,36 @@ mod tests {
             // The empty needle is nobody's match, on either path.
             assert!(!object_name_matches(name, ""));
         }
+    }
+
+    /// An identity read with its seed and increment is restated with them —
+    /// `(1,1)` would renumber a table whose ids start at 1000 or count down —
+    /// and only one read without them says so.
+    #[test]
+    fn create_ddl_sql_server_restates_the_identity_it_read() {
+        let mut id = col("id", "bigint", false, true);
+        id.auto_increment = true;
+        id.identity_spec = Some(("1000".into(), "-5".into()));
+        let t = TableInfo {
+            schema: Some("dbo".into()),
+            name: "t".into(),
+            columns: vec![id.clone()],
+            ..Default::default()
+        };
+        let ddl = t.create_ddl(crate::intel::SqlDialect::MsSql);
+        assert!(
+            ddl.contains("  [id] bigint IDENTITY(1000,-5) NOT NULL"),
+            "{ddl}"
+        );
+        assert!(!ddl.contains("not read"), "{ddl}");
+        // The designer's emitter, for the same column added to another table.
+        assert_eq!(
+            id.tsql_definition(),
+            "[id] bigint IDENTITY(1000,-5) NOT NULL"
+        );
+        // A column the designer made has none, and gets the default counter.
+        id.identity_spec = None;
+        assert_eq!(id.tsql_definition(), "[id] bigint IDENTITY(1,1) NOT NULL");
     }
 
     /// SQL Server's table is written in its own shape — `IDENTITY`, named
