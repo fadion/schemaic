@@ -2390,6 +2390,7 @@ fn pg_fold_checks_and_triggers(
                     // what fires during replication apply.
                     enabled: TriggerEnabled::parse(&cell(r, 4)),
                     constraint: cell(r, 5) == "1",
+                    tsql: Default::default(),
                 }
             })
             .collect();

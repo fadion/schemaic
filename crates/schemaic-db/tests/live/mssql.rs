@@ -1543,6 +1543,159 @@ async fn a_view_is_altered_in_place_and_renamed() {
     assert_eq!(s.scalar("SELECT b FROM dbo.w").await, "5");
 }
 
+/// **A trigger is altered in place and keeps what the alter would reset.**
+/// Its header options come back through the parts (`EXECUTE AS`, `NOT FOR
+/// REPLICATION`), a disabled trigger stays disabled, the `First` rank any
+/// `ALTER TRIGGER` drops is set again, and the edited body fires. A rename is
+/// a drop and a create; a new `INSTEAD OF` trigger on a view fires in place of
+/// the write; an encrypted one is listed, hidden, and not editable. Each read
+/// back diffs to nothing against its own draft — the round-trip gate.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_trigger_is_altered_in_place_and_keeps_what_the_alter_resets() {
+    use schemaic_core::ddl::{TriggerDraft, TriggerSetDraft, diff_triggers};
+    use schemaic_core::schema::{
+        ExecuteAs, FiringRank, TriggerAction, TriggerEnabled, TriggerEvent, TriggerTiming,
+    };
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("ddl_trigger").await;
+    s.exec("CREATE TABLE dbo.t (id int NOT NULL PRIMARY KEY); CREATE TABLE dbo.log (what nvarchar(20))")
+        .await;
+    s.exec("CREATE VIEW dbo.v AS SELECT id FROM dbo.t").await;
+    s.exec(
+        "-- kept by the server, dropped by a rebuild\n\
+         create trigger dbo.tr_a on dbo.t with execute as owner after insert, delete \
+         not for replication as\nbegin\n  SET NOCOUNT ON;\nend",
+    )
+    .await;
+    s.exec("CREATE TRIGGER dbo.tr_b ON dbo.t AFTER UPDATE AS INSERT dbo.log VALUES (N'b')")
+        .await;
+    s.exec("CREATE TRIGGER dbo.tr_c ON dbo.t WITH ENCRYPTION AFTER INSERT AS SELECT 1")
+        .await;
+    s.exec("EXEC sp_settriggerorder @triggername = N'dbo.tr_a', @order = N'First', @stmttype = N'INSERT'")
+        .await;
+    s.exec("DISABLE TRIGGER dbo.tr_a ON dbo.t").await;
+
+    let t = read_table(&s, "t").await;
+    let tr = |t: &schemaic_core::schema::TableInfo, n: &str| {
+        t.triggers
+            .iter()
+            .find(|x| x.name == n)
+            .unwrap_or_else(|| panic!("{n} in {:?}", t.triggers))
+            .clone()
+    };
+    let a = tr(&t, "tr_a");
+    assert_eq!(
+        a.action,
+        TriggerAction::Body("begin\n  SET NOCOUNT ON;\nend".into())
+    );
+    assert_eq!(a.events, [TriggerEvent::Insert, TriggerEvent::Delete]);
+    assert_eq!(a.tsql.execute_as, Some(ExecuteAs::Owner));
+    assert!(a.tsql.not_for_replication);
+    assert_eq!(a.tsql.rank, [(TriggerEvent::Insert, FiringRank::First)]);
+    assert_eq!(a.enabled, TriggerEnabled::Disabled);
+    assert!(tr(&t, "tr_c").tsql.hidden && !tr(&t, "tr_c").is_editable());
+    assert!(
+        diff_triggers(&t.triggers, &TriggerSetDraft::from_table(&t), MS)
+            .changes
+            .is_empty(),
+        "the round-trip gate"
+    );
+
+    // Edit tr_a's body in place, rename tr_b, keep tr_c untouched.
+    let mut d = TriggerSetDraft::from_table(&t);
+    for x in &mut d.triggers {
+        match x.original.as_deref() {
+            Some("tr_a") => {
+                x.info.action = TriggerAction::Body("INSERT dbo.log VALUES (N'a')".into())
+            }
+            Some("tr_b") => x.info.name = "tr_b2".into(),
+            _ => {}
+        }
+    }
+    assert!(
+        d.validate(&t.triggers, MS, schemaic_core::ddl::TriggerHost::Table)
+            .is_empty()
+    );
+    let stmts = diff_triggers(&t.triggers, &d, MS).emit();
+    assert!(
+        !stmts
+            .iter()
+            .any(|x| x.contains("DROP TRIGGER [dbo].[tr_a]")),
+        "altered, not dropped: {stmts:#?}"
+    );
+    s.db.run_ddl(&s.name, &stmts, CancellationToken::new())
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{stmts:#?}"));
+    let t2 = read_table(&s, "t").await;
+    let a2 = tr(&t2, "tr_a");
+    assert_eq!(
+        a2.action,
+        TriggerAction::Body("INSERT dbo.log VALUES (N'a')".into())
+    );
+    assert_eq!(a2.tsql.execute_as, Some(ExecuteAs::Owner));
+    assert!(a2.tsql.not_for_replication);
+    assert_eq!(
+        a2.tsql.rank,
+        [(TriggerEvent::Insert, FiringRank::First)],
+        "rank restored"
+    );
+    assert_eq!(a2.enabled, TriggerEnabled::Disabled, "still disabled");
+    assert!(t2.triggers.iter().any(|x| x.name == "tr_b2"));
+    assert!(!t2.triggers.iter().any(|x| x.name == "tr_b"));
+    assert!(tr(&t2, "tr_c").tsql.hidden, "the encrypted one untouched");
+    assert!(
+        diff_triggers(&t2.triggers, &TriggerSetDraft::from_table(&t2), MS)
+            .changes
+            .is_empty(),
+        "the round-trip gate, after the write"
+    );
+    // The renamed one fires; the disabled one does not, until enabled.
+    s.exec("INSERT dbo.t VALUES (1); UPDATE dbo.t SET id = 2")
+        .await;
+    assert_eq!(
+        s.scalar("SELECT STRING_AGG(what, ',') FROM dbo.log").await,
+        "b"
+    );
+    s.exec("ENABLE TRIGGER dbo.tr_a ON dbo.t; INSERT dbo.t VALUES (3)")
+        .await;
+    assert_eq!(
+        s.scalar("SELECT STRING_AGG(what, ',') WITHIN GROUP (ORDER BY what) FROM dbo.log")
+            .await,
+        "a,b"
+    );
+
+    // A new INSTEAD OF trigger on the view, fired by a write to it.
+    let v = read_table(&s, "v").await;
+    let mut d = TriggerSetDraft::from_table(&v);
+    let mut fresh = TriggerDraft::blank("tr_v", "v", Some("dbo".into()));
+    fresh.info.timing = TriggerTiming::InsteadOf;
+    fresh.info.level = schemaic_core::schema::TriggerLevel::Statement;
+    fresh.info.events = vec![TriggerEvent::Insert];
+    fresh.info.action = TriggerAction::Body("INSERT dbo.log SELECT N'v' FROM inserted".into());
+    d.triggers.push(fresh);
+    assert!(
+        d.validate(&v.triggers, MS, schemaic_core::ddl::TriggerHost::View)
+            .is_empty()
+    );
+    let stmts = diff_triggers(&v.triggers, &d, MS).emit();
+    s.db.run_ddl(&s.name, &stmts, CancellationToken::new())
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{stmts:#?}"));
+    s.exec("INSERT dbo.v VALUES (9)").await;
+    assert_eq!(
+        s.scalar("SELECT COUNT(*) FROM dbo.log WHERE what = N'v'")
+            .await,
+        "1"
+    );
+    assert_eq!(
+        s.scalar("SELECT COUNT(*) FROM dbo.t WHERE id = 9").await,
+        "0",
+        "instead of"
+    );
+}
+
 /// Import `rows` into `dbo.imp (id, name)` on `s`.
 async fn import_into(
     s: &Scratch,
@@ -2012,10 +2165,10 @@ async fn introspection_reads_the_schema_as_declared() {
     assert_eq!(pk.constraint.as_deref(), Some("pk_c"));
     assert_eq!(c.triggers.len(), 1);
     assert_eq!(c.triggers[0].events.len(), 2);
-    // Its DDL is the statement the server stored, not one built around it.
+    // Its DDL is rebuilt from the parts the stored statement was read into.
     assert_eq!(
         c.triggers[0].create_sql(MS),
-        "CREATE TRIGGER dbo.tr ON dbo.customers AFTER INSERT, DELETE AS SET NOCOUNT ON;"
+        "CREATE TRIGGER [dbo].[tr] ON [dbo].[customers] AFTER INSERT, DELETE\nAS\nSET NOCOUNT ON"
     );
     let o = t("sales", "orders");
     assert_eq!(o.foreign_keys[0].ref_schema.as_deref(), Some("dbo"));

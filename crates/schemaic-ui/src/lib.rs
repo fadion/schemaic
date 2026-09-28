@@ -4170,12 +4170,12 @@ mod engine_comparison_gate {
         ),
         (
             "schemaic-core/ddl.rs",
-            19,
-            "Five of the nineteen are in the capability definitions the \
+            17,
+            "Five of the seventeen are in the capability definitions the \
              rest of the app asks — `requires_named_checks`, \
              `requires_rowid_key`, `strict_type_allowed`, and two in \
              `supports_change` — and a comparison is how they answer. The \
-             other fourteen are DDL grammar \
+             other twelve are DDL grammar \
              inside the emitters and validators (`create_view_sql`, \
              `create_table_sql`, `client_script`'s `DELIMITER`, \
              `repoint_check_column`, the drafts' `validate`), where the engines \
@@ -4189,7 +4189,11 @@ mod engine_comparison_gate {
              PostgreSQL's `COMMENT ON`, SQL Server's extended properties — \
              where they were an `if pg`. 21 → 19, with SQL Server's view \
              editing: `supports_view_rename` is an exhaustive `match`, and \
-             `create_view_sql`'s column list asks `view_keeps_column_list`.",
+             `create_view_sql`'s column list asks `view_keeps_column_list`. \
+             19 → 17, with SQL Server's trigger editing: \
+             `TriggerDraft::validate` is one exhaustive `match` over the \
+             engines where it was an `if pg … else if sqlite … else` chain, \
+             whose `else` had been validating SQL Server's triggers as MySQL's.",
         ),
         (
             "schemaic-core/filter.rs",
@@ -4278,11 +4282,16 @@ mod engine_comparison_gate {
         ),
         (
             "trigger_editor.rs",
-            8,
+            6,
             "Trigger grammar throughout: the body template, `INSTEAD OF` \
              timing, `FOR EACH ROW`, and PostgreSQL's separate function. \
              `supports_trigger_editing` already answers the capability half \
-             and this file calls it; what is left is which statement to write.",
+             and this file calls it; what is left is which statement to write. \
+             8 → 6, with SQL Server's trigger editing: the timing list is \
+             `ddl::trigger_timings` rather than a `(dialect, is_view)` match, \
+             and the events control asks `trigger_fires_on_several_events` and \
+             `trigger_events` where it asked `pg` — each held by a test to \
+             what `TriggerDraft::validate` accepts.",
         ),
         (
             "view_editor.rs",

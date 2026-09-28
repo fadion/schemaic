@@ -1074,10 +1074,11 @@ const CHECK_LISTING: &str = "SELECT s.name, t.name, ck.name, ck.definition, \
      ORDER BY s.name, t.name, ck.name";
 
 /// Every DML trigger on a table or view, one row per event: `(schema,
-/// table, trigger, instead of, disabled, event, definition)`.
+/// table, trigger, instead of, disabled, event, definition, first, last)` —
+/// the last two the event's `sp_settriggerorder` rank.
 const TRIGGER_LISTING: &str = "SELECT s.name, o.name, tr.name, \
             CAST(tr.is_instead_of_trigger AS int), CAST(tr.is_disabled AS int), \
-            te.type_desc, m.definition \
+            te.type_desc, m.definition, CAST(te.is_first AS int), CAST(te.is_last AS int) \
      FROM sys.triggers tr \
      JOIN sys.objects o ON o.object_id = tr.parent_id \
      JOIN sys.schemas s ON s.schema_id = o.schema_id \
@@ -1085,6 +1086,51 @@ const TRIGGER_LISTING: &str = "SELECT s.name, o.name, tr.name, \
      LEFT JOIN sys.sql_modules m ON m.object_id = tr.object_id \
      WHERE tr.parent_class = 1 AND tr.is_ms_shipped = 0 \
      ORDER BY s.name, o.name, tr.name, te.type";
+
+/// A trigger's stored text (`sys.sql_modules.definition`, `None` when the
+/// server shows none) read into its action and SQL Server parts.
+///
+/// Through `ddl::tsql_trigger_parts`: the body after the header's `AS`, and
+/// the options a `CREATE OR ALTER` must restate. A header the parts cannot
+/// hold keeps the whole text as `verbatim` (and as the body, for whatever
+/// displays it); no text at all — `WITH ENCRYPTION`, or no `VIEW DEFINITION`
+/// — is `hidden`. Neither is rebuilt (`TriggerInfo::is_editable`).
+fn tsql_trigger_reading(
+    definition: Option<&str>,
+) -> (
+    schemaic_core::schema::TriggerAction,
+    schemaic_core::schema::TsqlTrigger,
+) {
+    use schemaic_core::schema::{TriggerAction, TsqlTrigger};
+    let Some(def) = definition else {
+        return (
+            TriggerAction::Body(String::new()),
+            TsqlTrigger {
+                hidden: true,
+                ..TsqlTrigger::default()
+            },
+        );
+    };
+    match schemaic_core::ddl::tsql_trigger_parts(def) {
+        Some(p) => (
+            TriggerAction::Body(p.body),
+            TsqlTrigger {
+                execute_as: p.execute_as,
+                schemabinding: p.schemabinding,
+                native_compilation: p.native_compilation,
+                not_for_replication: p.not_for_replication,
+                ..TsqlTrigger::default()
+            },
+        ),
+        None => (
+            TriggerAction::Body(def.to_string()),
+            TsqlTrigger {
+                verbatim: Some(def.to_string()),
+                ..TsqlTrigger::default()
+            },
+        ),
+    }
+}
 
 /// Every procedure and function written in T-SQL: `(schema, name, type,
 /// definition, deterministic, description)`. CLR routines have no module
@@ -1382,8 +1428,8 @@ pub(crate) async fn fetch_schema(
 async fn collect_schema(client: &mut MsClient) -> Result<DbSchema, DbError> {
     use crate::{ColRow, IdxRow, assemble_schema, group_by};
     use schemaic_core::schema::{
-        CheckInfo, ColumnInfo, IndexColumn, RoutineInfo, TriggerAction, TriggerEnabled,
-        TriggerEvent, TriggerInfo, TriggerLevel, TriggerTiming,
+        CheckInfo, ColumnInfo, IndexColumn, RoutineInfo, TriggerEnabled, TriggerEvent, TriggerInfo,
+        TriggerLevel, TriggerTiming,
     };
     use std::collections::{HashMap, HashSet};
 
@@ -1566,13 +1612,28 @@ async fn collect_schema(client: &mut MsClient) -> Result<DbSchema, DbError> {
             "DELETE" => TriggerEvent::Delete,
             _ => continue,
         };
+        // The event's `sp_settriggerorder` rank, which any `ALTER TRIGGER`
+        // drops and `TriggerInfo::tsql_follow_ups` restates.
+        let rank = if flag(&r, 7) {
+            Some(schemaic_core::schema::FiringRank::First)
+        } else if flag(&r, 8) {
+            Some(schemaic_core::schema::FiringRank::Last)
+        } else {
+            None
+        };
         let list = triggers_by.entry((ns.clone(), table.clone())).or_default();
         if let Some(t) = list.iter_mut().find(|t| t.name == name) {
             if !t.events.contains(&event) {
                 t.events.push(event);
+                // Declaration order, which is what the editor's toggles keep —
+                // a catalogue order they re-sorted would be a phantom change.
+                t.events.sort();
             }
+            t.tsql.rank.extend(rank.map(|k| (event, k)));
             continue;
         }
+        let (action, mut tsql) = tsql_trigger_reading(r.get(6).and_then(|d| d.as_deref()));
+        tsql.rank.extend(rank.map(|k| (event, k)));
         list.push(TriggerInfo {
             name,
             schema: Some(ns),
@@ -1588,8 +1649,8 @@ async fn collect_schema(client: &mut MsClient) -> Result<DbSchema, DbError> {
             // `inserted` and `deleted`.
             level: TriggerLevel::Statement,
             condition: None,
-            // The whole stored `CREATE TRIGGER`, as SQL Server keeps it.
-            action: TriggerAction::Body(cell(&r, 6)),
+            // The body after the header's `AS` — see `tsql_trigger_reading`.
+            action,
             definer: None,
             order: None,
             sql_mode: None,
@@ -1603,6 +1664,7 @@ async fn collect_schema(client: &mut MsClient) -> Result<DbSchema, DbError> {
                 TriggerEnabled::Origin
             },
             constraint: false,
+            tsql,
         });
     }
 
@@ -3319,6 +3381,29 @@ mod tests {
             "x"
         ]));
         assert!(!is_showplan_set(&[]));
+    }
+
+    /// A stored trigger is read into its body and the header parts; one the
+    /// parts cannot hold keeps its whole text as `verbatim`, and one whose text
+    /// the server does not show (`WITH ENCRYPTION`) is `hidden` — both still
+    /// listed, neither rebuilt.
+    #[test]
+    fn a_stored_trigger_reads_into_its_parts_or_is_kept_whole() {
+        use schemaic_core::schema::{ExecuteAs, TriggerAction};
+        let (action, tsql) = tsql_trigger_reading(Some(
+            "create trigger dbo.tr on dbo.t with execute as owner after insert \
+             not for replication as\nset nocount on",
+        ));
+        assert_eq!(action, TriggerAction::Body("set nocount on".into()));
+        assert_eq!(tsql.execute_as, Some(ExecuteAs::Owner));
+        assert!(tsql.not_for_replication && tsql.verbatim.is_none() && !tsql.hidden);
+        let odd = "CREATE TRIGGER dbo.tr ON dbo.t FOR INSERT WITH APPEND AS SELECT 1";
+        let (action, tsql) = tsql_trigger_reading(Some(odd));
+        assert_eq!(tsql.verbatim.as_deref(), Some(odd));
+        assert_eq!(action, TriggerAction::Body(odd.into()));
+        let (action, tsql) = tsql_trigger_reading(None);
+        assert!(tsql.hidden);
+        assert_eq!(action, TriggerAction::Body(String::new()));
     }
 
     fn names(n: &[&str]) -> Vec<String> {

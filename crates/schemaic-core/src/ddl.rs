@@ -1001,8 +1001,6 @@ impl TriggerDraft {
     /// here instead.
     pub fn validate(&self, dialect: SqlDialect, host: TriggerHost) -> Vec<String> {
         let t = &self.info;
-        let pg = dialect == SqlDialect::Postgres;
-        let sqlite = dialect == SqlDialect::Sqlite;
         let view = host == TriggerHost::View;
         let mut out = Vec::new();
         if t.name.trim().is_empty() {
@@ -1018,136 +1016,196 @@ impl TriggerDraft {
         // `TriggerSetDraft::validate`, which is where the refusal lives now,
         // because it needs the server's copy to tell "this one is being
         // changed" from "this one is merely present".
-        if pg {
-            match &t.action {
-                TriggerAction::Function { name, .. } if name.trim().is_empty() => {
-                    out.push("A PostgreSQL trigger needs a function to execute.".to_string())
-                }
-                TriggerAction::Body(_) => out.push(
-                    "A PostgreSQL trigger runs a function, not a body — pick or write \
+        //
+        // **One arm per engine, exhaustively**: each is that engine's grammar,
+        // and a fifth has to write its own rather than inherit whichever branch
+        // an `if`/`else` chain let it fall into — which is how SQL Server's
+        // triggers were once validated as MySQL's.
+        match dialect {
+            SqlDialect::Postgres => {
+                match &t.action {
+                    TriggerAction::Function { name, .. } if name.trim().is_empty() => {
+                        out.push("A PostgreSQL trigger needs a function to execute.".to_string())
+                    }
+                    TriggerAction::Body(_) => out.push(
+                        "A PostgreSQL trigger runs a function, not a body — pick or write \
                      one to execute."
-                        .to_string(),
-                ),
-                _ => {}
-            }
-            // TRUNCATE fires once per statement; there are no rows to hand it.
-            if t.events.contains(&TriggerEvent::Truncate) && t.level == TriggerLevel::Row {
-                out.push("A TRUNCATE trigger has to be FOR EACH STATEMENT.".to_string());
-            }
-            if t.timing == TriggerTiming::InsteadOf && t.level != TriggerLevel::Row {
-                out.push("An INSTEAD OF trigger has to be FOR EACH ROW.".to_string());
-            }
-            // What the timing may be depends on what it fires on, and the two
-            // rules are exact opposites — measured on 16.14, verbatim:
-            // `"t" is a table … Tables cannot have INSTEAD OF triggers` and
-            // `"v" is a view … Views cannot have row-level BEFORE or AFTER
-            // triggers`. A statement-level `BEFORE`/`AFTER` on a view is fine,
-            // so this is narrower than "a view only takes INSTEAD OF".
-            if t.timing == TriggerTiming::InsteadOf && !view {
-                out.push(
-                    "Only a view can have an INSTEAD OF trigger — a table takes \
+                            .to_string(),
+                    ),
+                    _ => {}
+                }
+                // TRUNCATE fires once per statement; there are no rows to hand it.
+                if t.events.contains(&TriggerEvent::Truncate) && t.level == TriggerLevel::Row {
+                    out.push("A TRUNCATE trigger has to be FOR EACH STATEMENT.".to_string());
+                }
+                if t.timing == TriggerTiming::InsteadOf && t.level != TriggerLevel::Row {
+                    out.push("An INSTEAD OF trigger has to be FOR EACH ROW.".to_string());
+                }
+                // What the timing may be depends on what it fires on, and the two
+                // rules are exact opposites — measured on 16.14, verbatim:
+                // `"t" is a table … Tables cannot have INSTEAD OF triggers` and
+                // `"v" is a view … Views cannot have row-level BEFORE or AFTER
+                // triggers`. A statement-level `BEFORE`/`AFTER` on a view is fine,
+                // so this is narrower than "a view only takes INSTEAD OF".
+                if t.timing == TriggerTiming::InsteadOf && !view {
+                    out.push(
+                        "Only a view can have an INSTEAD OF trigger — a table takes \
                      BEFORE or AFTER."
-                        .to_string(),
-                );
-            }
-            if view && t.timing != TriggerTiming::InsteadOf && t.level == TriggerLevel::Row {
-                out.push(
-                    "A view's BEFORE or AFTER trigger has to be FOR EACH STATEMENT \
+                            .to_string(),
+                    );
+                }
+                if view && t.timing != TriggerTiming::InsteadOf && t.level == TriggerLevel::Row {
+                    out.push(
+                        "A view's BEFORE or AFTER trigger has to be FOR EACH STATEMENT \
                      — use INSTEAD OF to act on rows."
-                        .to_string(),
-                );
+                            .to_string(),
+                    );
+                }
             }
-        } else if sqlite {
-            // Every rule below is one SQLite states itself, quoted from 3.45:
-            // `cannot create INSTEAD OF trigger on table: emp`, `cannot create
-            // BEFORE trigger on view: v`, and a plain `syntax error` for the
-            // rest. They are refused here rather than at Apply because the
-            // modal can say which control is wrong, and because a `DROP` has
-            // already run by the time a `CREATE` fails.
-            if t.events.len() > 1 {
-                out.push(
-                    "SQLite fires a trigger on one event — make a separate trigger per event."
-                        .to_string(),
-                );
-            }
-            if t.events.contains(&TriggerEvent::Truncate) {
-                out.push("SQLite has no TRUNCATE trigger.".to_string());
-            }
-            // The two halves are exact opposites, as they are on PostgreSQL, but
-            // stricter: a view takes *only* INSTEAD OF here, at either level.
-            if t.timing == TriggerTiming::InsteadOf && !view {
-                out.push(
-                    "Only a view can have an INSTEAD OF trigger — a table takes \
+            SqlDialect::Sqlite => {
+                // Every rule below is one SQLite states itself, quoted from 3.45:
+                // `cannot create INSTEAD OF trigger on table: emp`, `cannot create
+                // BEFORE trigger on view: v`, and a plain `syntax error` for the
+                // rest. They are refused here rather than at Apply because the
+                // modal can say which control is wrong, and because a `DROP` has
+                // already run by the time a `CREATE` fails.
+                if t.events.len() > 1 {
+                    out.push(
+                        "SQLite fires a trigger on one event — make a separate trigger per event."
+                            .to_string(),
+                    );
+                }
+                if t.events.contains(&TriggerEvent::Truncate) {
+                    out.push("SQLite has no TRUNCATE trigger.".to_string());
+                }
+                // The two halves are exact opposites, as they are on PostgreSQL, but
+                // stricter: a view takes *only* INSTEAD OF here, at either level.
+                if t.timing == TriggerTiming::InsteadOf && !view {
+                    out.push(
+                        "Only a view can have an INSTEAD OF trigger — a table takes \
                      BEFORE or AFTER."
-                        .to_string(),
-                );
-            }
-            if view && t.timing != TriggerTiming::InsteadOf {
-                out.push(
-                    "A view's trigger has to be INSTEAD OF — SQLite has no BEFORE or \
+                            .to_string(),
+                    );
+                }
+                if view && t.timing != TriggerTiming::InsteadOf {
+                    out.push(
+                        "A view's trigger has to be INSTEAD OF — SQLite has no BEFORE or \
                      AFTER trigger on a view."
-                        .to_string(),
-                );
-            }
-            if t.level != TriggerLevel::Row {
-                out.push(
-                    "SQLite has only FOR EACH ROW triggers — there is no statement-level one."
-                        .to_string(),
-                );
-            }
-            if !t.update_columns.is_empty() && !t.events.contains(&TriggerEvent::Update) {
-                out.push("UPDATE OF names columns on an UPDATE trigger.".to_string());
-            }
-            match &t.action {
-                TriggerAction::Body(b) if b.trim().is_empty() => {
-                    out.push("A SQLite trigger needs a body.".to_string())
+                            .to_string(),
+                    );
                 }
-                // Not a style rule: SQLite's grammar has no bare-statement form,
-                // and `BEGIN END` with nothing between is a syntax error too.
-                TriggerAction::Body(b) if !is_begin_end_block(b) => out.push(
-                    "A SQLite trigger's body has to be a BEGIN … END block holding at \
+                if t.level != TriggerLevel::Row {
+                    out.push(
+                        "SQLite has only FOR EACH ROW triggers — there is no statement-level one."
+                            .to_string(),
+                    );
+                }
+                if !t.update_columns.is_empty() && !t.events.contains(&TriggerEvent::Update) {
+                    out.push("UPDATE OF names columns on an UPDATE trigger.".to_string());
+                }
+                match &t.action {
+                    TriggerAction::Body(b) if b.trim().is_empty() => {
+                        out.push("A SQLite trigger needs a body.".to_string())
+                    }
+                    // Not a style rule: SQLite's grammar has no bare-statement form,
+                    // and `BEGIN END` with nothing between is a syntax error too.
+                    TriggerAction::Body(b) if !is_begin_end_block(b) => out.push(
+                        "A SQLite trigger's body has to be a BEGIN … END block holding at \
                      least one statement."
-                        .to_string(),
-                ),
-                TriggerAction::Function { .. } => out.push(
-                    "A SQLite trigger runs a body, not a function — write the statements \
+                            .to_string(),
+                    ),
+                    TriggerAction::Function { .. } => out.push(
+                        "A SQLite trigger runs a body, not a function — write the statements \
                      to run."
-                        .to_string(),
-                ),
-                _ => {}
-            }
-        } else {
-            if t.events.len() > 1 {
-                out.push(
-                    "MySQL fires a trigger on one event — make a separate trigger per event."
-                        .to_string(),
-                );
-            }
-            if t.events.contains(&TriggerEvent::Truncate) {
-                out.push("MySQL has no TRUNCATE trigger.".to_string());
-            }
-            if t.timing == TriggerTiming::InsteadOf {
-                out.push("MySQL has no INSTEAD OF trigger — those are PostgreSQL's.".to_string());
-            }
-            if t.condition.as_deref().is_some_and(|c| !c.trim().is_empty()) {
-                out.push(
-                    "MySQL has no WHEN condition — put the test inside the body with IF."
-                        .to_string(),
-                );
-            }
-            if !t.update_columns.is_empty() {
-                out.push("MySQL has no UPDATE OF — a trigger sees every column.".to_string());
-            }
-            match &t.action {
-                TriggerAction::Body(b) if b.trim().is_empty() => {
-                    out.push("A MySQL trigger needs a body.".to_string())
+                            .to_string(),
+                    ),
+                    _ => {}
                 }
-                TriggerAction::Function { .. } => out.push(
-                    "A MySQL trigger runs a body, not a function — write the statements \
-                     to run."
+            }
+            SqlDialect::MsSql => {
+                // T-SQL's grammar, each rule the server's own: `AFTER` (or its
+                // synonym `FOR`) and `INSTEAD OF` are the only timings, `INSTEAD OF`
+                // is the only one a view takes, a trigger fires once per statement
+                // with its rows in `inserted` and `deleted`, and column tests are
+                // `UPDATE(col)` inside the body rather than a clause.
+                if t.timing == TriggerTiming::Before {
+                    out.push(
+                    "SQL Server has no BEFORE trigger — use INSTEAD OF to act before the write."
                         .to_string(),
-                ),
-                _ => {}
+                );
+                }
+                if view && t.timing != TriggerTiming::InsteadOf {
+                    out.push("A view's trigger has to be INSTEAD OF on SQL Server.".to_string());
+                }
+                if t.level != TriggerLevel::Statement {
+                    out.push(
+                        "SQL Server fires a trigger once per statement — read the rows from \
+                     inserted and deleted."
+                            .to_string(),
+                    );
+                }
+                if t.events.contains(&TriggerEvent::Truncate) {
+                    out.push("SQL Server has no TRUNCATE trigger.".to_string());
+                }
+                if t.condition.as_deref().is_some_and(|c| !c.trim().is_empty()) {
+                    out.push(
+                        "SQL Server has no WHEN condition — put the test inside the body with IF."
+                            .to_string(),
+                    );
+                }
+                if !t.update_columns.is_empty() {
+                    out.push(
+                        "SQL Server has no UPDATE OF — test UPDATE(column) inside the body."
+                            .to_string(),
+                    );
+                }
+                match &t.action {
+                    TriggerAction::Body(b) if b.trim().is_empty() => {
+                        out.push("A SQL Server trigger needs a body.".to_string())
+                    }
+                    TriggerAction::Function { .. } => out.push(
+                        "A SQL Server trigger runs a body, not a function — write the statements \
+                     to run."
+                            .to_string(),
+                    ),
+                    _ => {}
+                }
+            }
+            SqlDialect::MySql => {
+                if t.events.len() > 1 {
+                    out.push(
+                        "MySQL fires a trigger on one event — make a separate trigger per event."
+                            .to_string(),
+                    );
+                }
+                if t.events.contains(&TriggerEvent::Truncate) {
+                    out.push("MySQL has no TRUNCATE trigger.".to_string());
+                }
+                if t.timing == TriggerTiming::InsteadOf {
+                    out.push(
+                        "MySQL has no INSTEAD OF trigger — those are PostgreSQL's.".to_string(),
+                    );
+                }
+                if t.condition.as_deref().is_some_and(|c| !c.trim().is_empty()) {
+                    out.push(
+                        "MySQL has no WHEN condition — put the test inside the body with IF."
+                            .to_string(),
+                    );
+                }
+                if !t.update_columns.is_empty() {
+                    out.push("MySQL has no UPDATE OF — a trigger sees every column.".to_string());
+                }
+                match &t.action {
+                    TriggerAction::Body(b) if b.trim().is_empty() => {
+                        out.push("A MySQL trigger needs a body.".to_string())
+                    }
+                    TriggerAction::Function { .. } => out.push(
+                        "A MySQL trigger runs a body, not a function — write the statements \
+                     to run."
+                            .to_string(),
+                    ),
+                    _ => {}
+                }
             }
         }
         out
@@ -1303,6 +1361,15 @@ impl TriggerSetDraft {
                 out.push(format!(
                     "Schemaic can't edit the constraint trigger {} — it doesn't model \
                      the deferral settings one carries.",
+                    t.info.name
+                ));
+            } else if !t.info.is_editable() {
+                // SQL Server's unreadable or hidden trigger: see
+                // `TriggerInfo::is_editable`.
+                out.push(format!(
+                    "Schemaic can't edit the trigger {} — its definition is encrypted, \
+                     hidden from this login, or uses an option Schemaic doesn't model. \
+                     Change it in SQL instead.",
                     t.info.name
                 ));
             }
@@ -4173,6 +4240,10 @@ impl ChangeSet {
         // `CREATE VIEW` is its own statement, and so its own batch, as T-SQL
         // requires.
         out.extend(self.view_statements());
+        // A table's triggers, the same way — each `CREATE [OR ALTER] TRIGGER`
+        // its own statement, and what follows one (`tsql_follow_ups`) never in
+        // its text.
+        out.extend(self.trigger_statements());
         // What covers the columns, before the columns — foreign keys first, of
         // everything: one that references this table's own key blocks the
         // key's drop.
@@ -5234,7 +5305,9 @@ impl ChangeSet {
     /// [`ChangeSet::view_statements`] is: these are whole statements that can
     /// never share an `ALTER`, and a trigger change set contains nothing else.
     ///
-    /// A replace emits `DROP` then `CREATE` on **both** engines. PostgreSQL 14
+    /// A replace emits `DROP` then `CREATE` on MySQL, PostgreSQL and SQLite,
+    /// and on SQL Server for a rename; a SQL Server edit under the same name is
+    /// altered in place ([`supports_trigger_alter_in_place`]). PostgreSQL 14
     /// grew `CREATE OR REPLACE TRIGGER`, but using it would mean two apply paths
     /// for one edit and a version check to pick between them — and on PG the
     /// whole plan already runs in one transaction, so the drop-and-create is
@@ -5303,11 +5376,24 @@ impl ChangeSet {
         // until its own create runs. The residue is a draft whose `order` names
         // a trigger that neither exists nor is touched — the server refuses
         // that, as it did before, and no catalogue produces it.
+        // **Altered in place where the engine can**
+        // ([`supports_trigger_alter_in_place`]): a replace under its own name is
+        // then no drop at all, only a `CREATE OR ALTER`, and it neither leaves
+        // nor re-enters the set — which is what keeps the ordering walk below
+        // exact for it. A rename is still a drop and a create everywhere.
+        let in_place = |draft: &TriggerDraft| {
+            supports_trigger_alter_in_place(d)
+                && draft
+                    .original
+                    .as_deref()
+                    .is_none_or(|o| o.eq_ignore_ascii_case(&draft.info.name))
+        };
         let mut dropped: Vec<&str> = Vec::new();
         let mut planned: Vec<&str> = Vec::new();
         for c in &self.changes {
             match c {
                 Change::CreateTrigger(draft) => planned.push(&draft.info.name),
+                Change::ReplaceTrigger { draft } if in_place(draft) => {}
                 Change::ReplaceTrigger { draft } => {
                     dropped.push(draft.original.as_deref().unwrap_or(&draft.info.name));
                     planned.push(&draft.info.name);
@@ -5323,21 +5409,24 @@ impl ChangeSet {
         let mut drops = Vec::new();
         let mut creates = Vec::new();
         let mut made: Vec<String> = Vec::new();
-        let mut push_create = |t: &TriggerInfo, made: &mut Vec<String>| {
+        let mut push_create = |t: &TriggerInfo, or_alter: bool, made: &mut Vec<String>| {
             let resolved = t.with_resolvable_order(|named| {
                 survives(named) || made.iter().any(|m| same(m, named))
             });
-            creates.extend(session_wrapped_create(&resolved, d));
+            creates.extend(trigger_create_statements(&resolved, or_alter, d));
             made.push(t.name.clone());
         };
         for c in &self.changes {
             match c {
-                Change::CreateTrigger(draft) => push_create(&draft.info, &mut made),
+                Change::CreateTrigger(draft) => push_create(&draft.info, false, &mut made),
+                Change::ReplaceTrigger { draft } if in_place(draft) => {
+                    push_create(&draft.info, true, &mut made)
+                }
                 Change::ReplaceTrigger { draft } => {
                     // The drop addresses the name the server knows; the create
                     // builds the draft's, which is how a rename comes for free.
                     drops.push(drop(draft.original.as_deref().unwrap_or(&draft.info.name)));
-                    push_create(&draft.info, &mut made);
+                    push_create(&draft.info, false, &mut made);
                 }
                 Change::DropTrigger { name } => drops.push(drop(name)),
                 _ => {}
@@ -7600,6 +7689,24 @@ fn fks_equal(a: &ForeignKeyInfo, b: &ForeignKeyInfo) -> bool {
         && a.deferrable == b.deferrable
 }
 
+/// The statements that create — or, with `or_alter`, alter in place — one
+/// trigger in a plan.
+///
+/// MySQL's are wrapped in the session state it was written under; SQL
+/// Server's are the trigger and then, as statements of their own, what the
+/// create or alter loses ([`TriggerInfo::tsql_follow_ups`]). `or_alter` is
+/// only ever `true` where [`supports_trigger_alter_in_place`] is.
+fn trigger_create_statements(t: &TriggerInfo, or_alter: bool, d: SqlDialect) -> Vec<String> {
+    match d {
+        SqlDialect::MsSql => std::iter::once(t.tsql_statement(or_alter))
+            .chain(t.tsql_follow_ups())
+            .collect(),
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => {
+            session_wrapped_create(t, d)
+        }
+    }
+}
+
 /// A trigger's `CREATE`, wrapped in the session state it was created under.
 ///
 /// `CREATE TRIGGER` has **no clause** for `sql_mode`, `character_set_client` or
@@ -8539,14 +8646,79 @@ pub fn supports_view_rename(dialect: SqlDialect) -> bool {
     }
 }
 
+/// The timings the trigger form offers for `host` on `dialect` — each one
+/// [`TriggerDraft::validate`] accepts there, which a test holds them to.
+///
+/// `INSTEAD OF` is a view's on PostgreSQL and SQLite (a table refuses it), and
+/// SQLite's view takes nothing else; SQL Server has no `BEFORE` at all, and
+/// takes `INSTEAD OF` on a table as well as a view — only it, on a view.
+pub fn trigger_timings(dialect: SqlDialect, host: TriggerHost) -> Vec<TriggerTiming> {
+    use TriggerTiming::{After, Before, InsteadOf};
+    let view = host == TriggerHost::View;
+    match dialect {
+        SqlDialect::Postgres if view => vec![Before, After, InsteadOf],
+        SqlDialect::Sqlite if view => vec![InsteadOf],
+        SqlDialect::MsSql if view => vec![InsteadOf],
+        SqlDialect::MsSql => vec![After, InsteadOf],
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MySql => vec![Before, After],
+    }
+}
+
+/// The events a trigger may fire on — `TRUNCATE` PostgreSQL's alone.
+pub fn trigger_events(dialect: SqlDialect) -> &'static [TriggerEvent] {
+    use TriggerEvent::{Delete, Insert, Truncate, Update};
+    match dialect {
+        SqlDialect::Postgres => &[Insert, Update, Delete, Truncate],
+        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => &[Insert, Update, Delete],
+    }
+}
+
+/// May one trigger fire on several events (`INSERT OR UPDATE`, `INSERT,
+/// UPDATE`)? PostgreSQL's and SQL Server's may; MySQL's and SQLite's fire on
+/// exactly one — so the form is a row of toggles on two engines and a
+/// dropdown on the others.
+pub fn trigger_fires_on_several_events(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::Postgres | SqlDialect::MsSql => true,
+        SqlDialect::MySql | SqlDialect::Sqlite => false,
+    }
+}
+
+/// Does a trigger have SQL Server's `NOT FOR REPLICATION` — silent while a
+/// replication agent writes its table? No other engine here has the clause.
+pub fn supports_trigger_not_for_replication(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MsSql => true,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+    }
+}
+
+/// Does a trigger edited under its own name become one **altered in place**
+/// rather than dropped and created?
+///
+/// SQL Server's `CREATE OR ALTER TRIGGER`, alone: MySQL and SQLite have no
+/// form that alters one, and PostgreSQL's `CREATE OR REPLACE TRIGGER` (14+)
+/// is left unused for the reason `ChangeSet::trigger_statements` gives. On
+/// SQL Server the alter is what keeps the trigger's object id, permissions
+/// and — through [`TriggerInfo::tsql_follow_ups`] — its firing rank; a rename
+/// or a new trigger is still a create.
+pub fn supports_trigger_alter_in_place(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MsSql => true,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+    }
+}
+
 /// Can `dialect` have its **triggers** edited here?
 ///
-/// All three. SQLite was the holdout, and the thing that had to come first was
+/// All four. SQLite was a holdout, and the thing that had to come first was
 /// the *reader*, not the emitter: it keeps no catalogue of a trigger's parts, so
 /// until [`sqlite_trigger_info`] could parse `sqlite_master`'s `CREATE TRIGGER`
 /// text into [`crate::schema::TriggerInfo`], the list was empty — and an editor
 /// over an empty list shows a table's triggers as gone and offers to "add" one
-/// that already exists.
+/// that already exists. SQL Server was the other, for the same reason in a
+/// different shape: its catalogue keeps the parts but the text keeps the
+/// header options, so [`tsql_trigger_parts`] had to exist first.
 ///
 /// [`crate::schema::TableInfo::dependent_ddl`] still holds the same statements
 /// verbatim, and still is what a rebuild replays. The two are not redundant: the
@@ -9052,36 +9224,221 @@ pub fn unshadow(message: &str) -> String {
     message.replace(REBUILD_SUFFIX, "")
 }
 
-/// The twelve-step rebuild, as statements: the only way to change most of a
-/// SQLite table.
+/// What [`tsql_trigger_parts`] reads out of a stored T-SQL `CREATE TRIGGER`:
+/// the header options a `CREATE OR ALTER` must restate, and the body.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TsqlTriggerParts {
+    pub execute_as: Option<crate::schema::ExecuteAs>,
+    pub schemabinding: bool,
+    pub native_compilation: bool,
+    pub not_for_replication: bool,
+    /// Everything after the header's `AS`, verbatim but for the whitespace
+    /// around it.
+    pub body: String,
+}
+
+/// One token of T-SQL text, for [`tsql_trigger_parts`]' walk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TsqlTok<'a> {
+    Word(&'a str),
+    /// A string, a `[bracketed]` or `"quoted"` name — raw, quotes and all.
+    Quoted(&'a str),
+    Punct(u8),
+}
+
+/// A cursor over T-SQL tokens, comments and whitespace stepped over by the
+/// shared boundary lexer (`sql::skip_noncode`). `Copy`, so a peek is a copy.
+#[derive(Clone, Copy)]
+struct TsqlCursor<'a> {
+    s: &'a str,
+    i: usize,
+}
+
+impl<'a> TsqlCursor<'a> {
+    fn next(&mut self) -> Option<TsqlTok<'a>> {
+        let b = self.s.as_bytes();
+        let d = SqlDialect::MsSql;
+        loop {
+            while self.i < b.len() && b[self.i].is_ascii_whitespace() {
+                self.i += 1;
+            }
+            if self.i >= b.len() {
+                return None;
+            }
+            let at = self.i;
+            if let Some(j) = sql::skip_noncode(b, at, d) {
+                self.i = j.max(at + 1);
+                if matches!(b[at], b'-' | b'/') {
+                    continue;
+                }
+                return Some(TsqlTok::Quoted(&self.s[at..self.i]));
+            }
+            if sql::is_word_start(b[at]) {
+                let mut j = at + 1;
+                while j < b.len() && sql::is_word_byte(b[j]) {
+                    j += 1;
+                }
+                self.i = j;
+                return Some(TsqlTok::Word(&self.s[at..j]));
+            }
+            self.i = at + 1;
+            return Some(TsqlTok::Punct(b[at]));
+        }
+    }
+
+    fn peek(&self) -> Option<TsqlTok<'a>> {
+        let mut c = *self;
+        c.next()
+    }
+
+    /// Consume the next token if it is the keyword `kw`.
+    fn keyword(&mut self, kw: &str) -> bool {
+        match self.peek() {
+            Some(TsqlTok::Word(w)) if w.eq_ignore_ascii_case(kw) => {
+                self.next();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// A one- to four-part name: `t`, `[dbo].[t]`, `db.dbo.t`.
+    fn object_name(&mut self) -> Option<()> {
+        loop {
+            match self.next()? {
+                TsqlTok::Word(_) | TsqlTok::Quoted(_) => {}
+                _ => return None,
+            }
+            if self.peek() != Some(TsqlTok::Punct(b'.')) {
+                return Some(());
+            }
+            self.next();
+        }
+    }
+}
+
+/// A SQL Server DML trigger's stored `CREATE TRIGGER`, read into the parts a
+/// `CREATE OR ALTER` must restate and its body — or `None` when the parts
+/// cannot restate it.
 ///
-/// Its `ALTER TABLE` does `RENAME TABLE`, `RENAME COLUMN`, `ADD COLUMN` and
-/// `DROP COLUMN`. Everything else — a retype, a reorder, a key, a constraint —
-/// has to be done by building the table you wanted, moving the rows into it, and
-/// putting it where the old one was. The order is not negotiable and each step
-/// is destructive on its own, which is why this is one function with one test
-/// suite rather than a shape assembled at each call site:
+/// **Structure is read by a walk over the shared lexer, not through
+/// [`crate::intel`]**, and that is a stated exception: sqlparser 0.62's T-SQL
+/// `CREATE TRIGGER` knows neither the `WITH` options nor `NOT FOR REPLICATION`,
+/// and it parses the body as statements, which a real trigger's body often is
+/// not to it — so the AST answers `None` for the very triggers this exists to
+/// read. The walk is the grammar's header and nothing more,
+/// `CREATE [OR ALTER] TRIGGER name ON target [WITH option, …] {FOR | AFTER |
+/// INSTEAD OF} event, … [WITH APPEND] [NOT FOR REPLICATION] AS body`, over
+/// `sql::skip_noncode`, so a comment, a string and a bracketed name are never
+/// read as a keyword. That is what finds **the header's own `AS`**, past
+/// `EXECUTE AS`'s and any a name or a comment holds.
 ///
-/// 1. **create** the shadow table from `draft`, under a name nothing else holds;
-/// 2. **copy** the rows, column by column, mapping each new column to the old
-///    one it came from — that mapping is what makes a rename a rename rather
-///    than a drop and an add;
-/// 3. **drop** the original, which takes its indexes and triggers with it;
-/// 4. **rename** the shadow into its place;
-/// 5. **recreate** the indexes, *after* the rename — an index name is unique per
-///    schema in SQLite, so creating one before the old table is gone collides
-///    with the index it is replacing;
-/// 6. **replay** [`TableInfo::dependent_ddl`], the `CREATE` text of the triggers
-///    that hung off the table and went down with it.
-///
-/// The rows move with `INSERT … SELECT`, not `CREATE TABLE … AS SELECT`, because
-/// the latter takes its column types from the query rather than from the
-/// declaration and would quietly discard every constraint on the new table.
-///
-/// **A rename of the table itself is not part of this.** The rebuild always ends
-/// under the original name, and `ALTER TABLE … RENAME TO` is emitted after it —
-/// that statement is native, and letting SQLite perform it is what keeps the
-/// references in other tables' foreign keys pointing at the right place.
+/// `None` — shown and droppable, never rebuilt — for `WITH ENCRYPTION` (whose
+/// text the server does not keep), the obsolete `WITH APPEND`, an option not
+/// modelled, a DDL trigger (`ON DATABASE`, `ON ALL SERVER`), an event other
+/// than a DML one, and anything else not in that shape: rebuilding a trigger
+/// from the parts that *were* read would silently drop the rest.
+pub fn tsql_trigger_parts(definition: &str) -> Option<TsqlTriggerParts> {
+    use crate::schema::ExecuteAs;
+    let mut c = TsqlCursor {
+        s: definition,
+        i: 0,
+    };
+    let mut out = TsqlTriggerParts::default();
+    if !(c.keyword("CREATE") || c.keyword("ALTER")) {
+        return None;
+    }
+    if c.keyword("OR") && !c.keyword("ALTER") {
+        return None;
+    }
+    if !c.keyword("TRIGGER") {
+        return None;
+    }
+    c.object_name()?;
+    if !c.keyword("ON") {
+        return None;
+    }
+    if matches!(c.peek(), Some(TsqlTok::Word(w))
+        if w.eq_ignore_ascii_case("DATABASE") || w.eq_ignore_ascii_case("ALL"))
+    {
+        return None;
+    }
+    c.object_name()?;
+    if c.keyword("WITH") {
+        loop {
+            match c.next()? {
+                TsqlTok::Word(w) if w.eq_ignore_ascii_case("SCHEMABINDING") => {
+                    out.schemabinding = true
+                }
+                TsqlTok::Word(w) if w.eq_ignore_ascii_case("NATIVE_COMPILATION") => {
+                    out.native_compilation = true
+                }
+                TsqlTok::Word(w)
+                    if w.eq_ignore_ascii_case("EXECUTE") || w.eq_ignore_ascii_case("EXEC") =>
+                {
+                    if !c.keyword("AS") {
+                        return None;
+                    }
+                    out.execute_as = Some(match c.next()? {
+                        TsqlTok::Word(w) if w.eq_ignore_ascii_case("CALLER") => ExecuteAs::Caller,
+                        TsqlTok::Word(w) if w.eq_ignore_ascii_case("SELF") => ExecuteAs::SelfUser,
+                        TsqlTok::Word(w) if w.eq_ignore_ascii_case("OWNER") => ExecuteAs::Owner,
+                        TsqlTok::Quoted(q) if q.starts_with('\'') => ExecuteAs::User(
+                            q[1..q.len().saturating_sub(1).max(1)].replace("''", "'"),
+                        ),
+                        _ => return None,
+                    });
+                }
+                // `ENCRYPTION` among them — see above — and anything newer.
+                _ => return None,
+            }
+            if c.peek() != Some(TsqlTok::Punct(b',')) {
+                break;
+            }
+            c.next();
+        }
+    }
+    if c.keyword("INSTEAD") {
+        if !c.keyword("OF") {
+            return None;
+        }
+    } else if !(c.keyword("AFTER") || c.keyword("FOR")) {
+        return None;
+    }
+    loop {
+        match c.next()? {
+            TsqlTok::Word(w)
+                if ["INSERT", "UPDATE", "DELETE"]
+                    .iter()
+                    .any(|e| w.eq_ignore_ascii_case(e)) => {}
+            _ => return None,
+        }
+        if c.peek() != Some(TsqlTok::Punct(b',')) {
+            break;
+        }
+        c.next();
+    }
+    if c.keyword("WITH") {
+        // `WITH APPEND`, a compatibility-level-65 relic the parts do not carry.
+        return None;
+    }
+    if c.keyword("NOT") {
+        if !(c.keyword("FOR") && c.keyword("REPLICATION")) {
+            return None;
+        }
+        out.not_for_replication = true;
+    }
+    if !c.keyword("AS") {
+        return None;
+    }
+    let body = definition[c.i..].trim();
+    if body.is_empty() {
+        return None;
+    }
+    out.body = body.to_string();
+    Some(out)
+}
+
 /// One SQLite trigger, read out of the `CREATE TRIGGER` text `sqlite_master`
 /// stores. `None` for anything that isn't a readable `CREATE TRIGGER`.
 ///
@@ -9172,6 +9529,7 @@ pub fn sqlite_trigger_info(create_sql: &str) -> Option<TriggerInfo> {
         new_table: None,
         enabled: crate::schema::TriggerEnabled::default(),
         constraint: false,
+        tsql: crate::schema::TsqlTrigger::default(),
     })
 }
 
@@ -10154,6 +10512,36 @@ pub const FK_ON: &str = "PRAGMA foreign_keys = ON;";
 /// rather than only the one it writes.
 const ROWID_SPELLINGS: [&str; 3] = ["rowid", "_rowid_", "oid"];
 
+/// The twelve-step rebuild, as statements: the only way to change most of a
+/// SQLite table.
+///
+/// Its `ALTER TABLE` does `RENAME TABLE`, `RENAME COLUMN`, `ADD COLUMN` and
+/// `DROP COLUMN`. Everything else — a retype, a reorder, a key, a constraint —
+/// has to be done by building the table you wanted, moving the rows into it, and
+/// putting it where the old one was. The order is not negotiable and each step
+/// is destructive on its own, which is why this is one function with one test
+/// suite rather than a shape assembled at each call site:
+///
+/// 1. **create** the shadow table from `draft`, under a name nothing else holds;
+/// 2. **copy** the rows, column by column, mapping each new column to the old
+///    one it came from — that mapping is what makes a rename a rename rather
+///    than a drop and an add;
+/// 3. **drop** the original, which takes its indexes and triggers with it;
+/// 4. **rename** the shadow into its place;
+/// 5. **recreate** the indexes, *after* the rename — an index name is unique per
+///    schema in SQLite, so creating one before the old table is gone collides
+///    with the index it is replacing;
+/// 6. **replay** [`TableInfo::dependent_ddl`], the `CREATE` text of the triggers
+///    that hung off the table and went down with it.
+///
+/// The rows move with `INSERT … SELECT`, not `CREATE TABLE … AS SELECT`, because
+/// the latter takes its column types from the query rather than from the
+/// declaration and would quietly discard every constraint on the new table.
+///
+/// **A rename of the table itself is not part of this.** The rebuild always ends
+/// under the original name, and `ALTER TABLE … RENAME TO` is emitted after it —
+/// that statement is native, and letting SQLite perform it is what keeps the
+/// references in other tables' foreign keys pointing at the right place.
 pub fn sqlite_rebuild_sql(current: &TableInfo, draft: &TableDraft) -> Vec<String> {
     let d = SqlDialect::Sqlite;
     let q = |s: &str| ddl_ident_in(s, d);
@@ -10591,10 +10979,15 @@ pub fn supports_change(dialect: SqlDialect, change: &Change) -> bool {
 /// inline check, a primary key whose constraint name was
 /// not read (T-SQL drops it by name), and an unnamed check (the same). A view
 /// is created and replaced (`CREATE OR ALTER VIEW`); its `RenameView` is never
-/// raised, a rename being a re-create. The trigger and routine editors need a
-/// `Create` and a `Replace` besides their drop, so they stay off.
+/// raised, a rename being a re-create. A trigger is created, altered in place
+/// (`CREATE OR ALTER TRIGGER`, [`supports_trigger_alter_in_place`]) and
+/// dropped. The routine editor needs a `Create` and a `Replace` besides its
+/// drop, so it stays off.
 fn tsql_supports(change: &Change) -> bool {
     match change {
+        Change::CreateTrigger(_) | Change::ReplaceTrigger { .. } | Change::DropTrigger { .. } => {
+            true
+        }
         Change::CreateTable(_)
         | Change::DropTable
         | Change::TruncateTable
@@ -13937,7 +14330,7 @@ mod tests {
         assert!(!supports_column_reorder(MsSql));
         assert!(supports_view_editing(MsSql));
         assert!(!supports_routine_editing(MsSql));
-        assert!(!supports_trigger_editing(MsSql));
+        assert!(supports_trigger_editing(MsSql));
     }
 
     /// **One column renamed, retyped, made `NOT NULL` and given a new default,
@@ -23179,6 +23572,355 @@ mod sqlite_rebuild_tests {
 /// trigger's parts — `sqlite_master` holds the `CREATE TRIGGER` text and nothing
 /// else — so this is the one engine where introspection is a *parse*, and the
 /// editor is only as honest as it is.
+#[cfg(test)]
+mod tsql_trigger_read_tests {
+    use super::*;
+    use crate::schema::ExecuteAs;
+
+    fn parts(sql: &str) -> TsqlTriggerParts {
+        tsql_trigger_parts(sql).unwrap_or_else(|| panic!("should read: {sql}"))
+    }
+
+    /// The header as SQL Server stores it — the text as it was typed, a
+    /// leading comment and all — split into what `CREATE OR ALTER` must restate
+    /// and the body after the header's own `AS`.
+    #[test]
+    fn a_stored_trigger_splits_into_its_options_and_its_body() {
+        let p = parts(
+            "-- a leading comment\n/* block */ create   trigger [dbo].[tr_a] on dbo.t \
+             WITH EXECUTE AS OWNER after insert, update NOT FOR REPLICATION as\n\
+             begin\n  SET NOCOUNT ON; -- body\nend",
+        );
+        assert_eq!(p.execute_as, Some(ExecuteAs::Owner));
+        assert!(p.not_for_replication);
+        assert!(!p.schemabinding && !p.native_compilation);
+        assert_eq!(p.body, "begin\n  SET NOCOUNT ON; -- body\nend");
+        // What `CREATE OR ALTER` is stored as, and the bare form.
+        let p = parts("CREATE   TRIGGER dbo.tr_b ON dbo.t FOR DELETE AS SELECT 1");
+        assert_eq!((p.execute_as, p.not_for_replication), (None, false));
+        assert_eq!(p.body, "SELECT 1");
+        assert_eq!(
+            parts("CREATE OR ALTER TRIGGER t ON v INSTEAD OF INSERT AS SELECT 2").body,
+            "SELECT 2"
+        );
+    }
+
+    /// **The header's `AS` is not the first `AS`**: `EXECUTE AS` has its own,
+    /// a bracketed name may hold the word, and so may a comment — each is
+    /// stepped over by the shared lexer rather than matched as text.
+    #[test]
+    fn the_body_starts_at_the_headers_own_as() {
+        let p = parts(
+            "CREATE TRIGGER [AS].[x AS y] ON [s AS].[t] /* AS */ WITH EXECUTE AS 'o''neil', \
+             SCHEMABINDING, NATIVE_COMPILATION AFTER INSERT AS BEGIN ATOMIC WITH \
+             (TRANSACTION ISOLATION LEVEL = SNAPSHOT, LANGUAGE = N'us_english') SELECT 1 AS a END",
+        );
+        assert_eq!(p.execute_as, Some(ExecuteAs::User("o'neil".to_string())));
+        assert!(p.schemabinding && p.native_compilation);
+        assert!(p.body.starts_with("BEGIN ATOMIC"), "{}", p.body);
+        for (who, want) in [
+            ("CALLER", ExecuteAs::Caller),
+            ("self", ExecuteAs::SelfUser),
+            ("Owner", ExecuteAs::Owner),
+        ] {
+            let p = parts(&format!(
+                "CREATE TRIGGER t ON u WITH EXECUTE AS {who} AFTER UPDATE AS SELECT 1"
+            ));
+            assert_eq!(p.execute_as, Some(want), "{who}");
+        }
+    }
+
+    /// What the parts cannot restate is refused, not dropped: `ENCRYPTION`
+    /// (the text is not stored at all), the obsolete `WITH APPEND`, an option
+    /// Schemaic does not know, and anything not shaped like a DML trigger.
+    #[test]
+    fn a_header_the_parts_cannot_restate_is_unreadable() {
+        for sql in [
+            "CREATE TRIGGER t ON u WITH ENCRYPTION AFTER INSERT AS SELECT 1",
+            "CREATE TRIGGER t ON u FOR INSERT WITH APPEND AS SELECT 1",
+            "CREATE TRIGGER t ON u WITH SOMETHING_NEW AFTER INSERT AS SELECT 1",
+            "CREATE TRIGGER t ON DATABASE FOR CREATE_TABLE AS SELECT 1",
+            "CREATE TRIGGER t ON u AFTER INSERT SELECT 1",
+            "CREATE TRIGGER t ON u AFTER INSERT AS",
+            "CREATE PROCEDURE p AS SELECT 1",
+            "",
+            "CREATE TRIGGER t ON u AFTER INSERT, TRUNCATE AS SELECT 1",
+        ] {
+            assert!(tsql_trigger_parts(sql).is_none(), "{sql}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tsql_trigger_plan_tests {
+    use super::*;
+    use crate::intel::SqlDialect::MsSql;
+    use crate::schema::FiringRank;
+
+    fn tr(name: &str) -> TriggerInfo {
+        TriggerInfo {
+            name: name.into(),
+            schema: Some("dbo".into()),
+            table: "t".into(),
+            timing: TriggerTiming::After,
+            events: vec![TriggerEvent::Insert],
+            level: TriggerLevel::Statement,
+            action: TriggerAction::Body("SET NOCOUNT ON".into()),
+            ..Default::default()
+        }
+    }
+
+    fn set(triggers: Vec<TriggerInfo>) -> TriggerSetDraft {
+        TriggerSetDraft {
+            schema: Some("dbo".into()),
+            table: "t".into(),
+            triggers: triggers.iter().map(TriggerDraft::from_info).collect(),
+        }
+    }
+
+    /// **Every choice the trigger form offers is one the validator accepts**,
+    /// on every engine and host: the form's lists come from these capabilities,
+    /// so an option offered and then refused — the form opening on an error —
+    /// is a disagreement between them, caught here rather than by a user.
+    #[test]
+    fn the_offered_timings_and_events_are_ones_the_validator_accepts() {
+        for d in [
+            SqlDialect::MySql,
+            SqlDialect::Postgres,
+            SqlDialect::Sqlite,
+            MsSql,
+        ] {
+            for host in [TriggerHost::Table, TriggerHost::View] {
+                if d == SqlDialect::MySql && host == TriggerHost::View {
+                    continue; // MySQL takes no trigger on a view at all.
+                }
+                let timings = trigger_timings(d, host);
+                assert!(!timings.is_empty(), "{d:?} {host:?}");
+                for timing in timings {
+                    for &event in trigger_events(d) {
+                        // The one pairing PostgreSQL refuses by level rather
+                        // than by timing or event alone — `INSTEAD OF` is row
+                        // level, `TRUNCATE` statement level — and which the
+                        // validator names when it is picked.
+                        if timing == TriggerTiming::InsteadOf && event == TriggerEvent::Truncate {
+                            continue;
+                        }
+                        let mut t = tr("a");
+                        t.timing = timing;
+                        t.events = vec![event];
+                        // Each engine's own level for that pairing.
+                        t.level = match d {
+                            MsSql => TriggerLevel::Statement,
+                            SqlDialect::Postgres
+                                if event == TriggerEvent::Truncate
+                                    || (host == TriggerHost::View
+                                        && timing != TriggerTiming::InsteadOf) =>
+                            {
+                                TriggerLevel::Statement
+                            }
+                            _ => TriggerLevel::Row,
+                        };
+                        t.action = match d {
+                            SqlDialect::Postgres => TriggerAction::Function {
+                                name: "f".into(),
+                                args: Vec::new(),
+                            },
+                            SqlDialect::Sqlite => TriggerAction::Body("BEGIN SELECT 1; END".into()),
+                            _ => TriggerAction::Body("BEGIN SELECT 1; END".into()),
+                        };
+                        let errs = TriggerDraft {
+                            original: None,
+                            info: t,
+                        }
+                        .validate(d, host);
+                        assert!(
+                            errs.is_empty(),
+                            "{d:?} {host:?} {timing:?} {event:?}: {errs:?}"
+                        );
+                    }
+                }
+            }
+            assert_eq!(supports_trigger_not_for_replication(d), d == MsSql);
+        }
+        assert!(trigger_fires_on_several_events(MsSql));
+        assert!(trigger_fires_on_several_events(SqlDialect::Postgres));
+        assert!(!trigger_fires_on_several_events(SqlDialect::MySql));
+        assert!(!trigger_fires_on_several_events(SqlDialect::Sqlite));
+        assert!(!trigger_events(MsSql).contains(&TriggerEvent::Truncate));
+        assert!(trigger_events(SqlDialect::Postgres).contains(&TriggerEvent::Truncate));
+    }
+
+    #[test]
+    fn sql_server_offers_the_trigger_editor() {
+        assert!(supports_trigger_editing(MsSql));
+        assert!(supports_trigger_alter_in_place(MsSql));
+        for d in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite] {
+            assert!(!supports_trigger_alter_in_place(d), "{d:?}");
+        }
+    }
+
+    /// **An edit under the same name is altered in place** — `CREATE OR
+    /// ALTER`, no `DROP` — and what any alter drops, the firing rank, is set
+    /// again after it as a statement of its own.
+    #[test]
+    fn an_edited_sql_server_trigger_is_altered_in_place() {
+        let mut cur = tr("tr");
+        cur.tsql.rank = vec![(TriggerEvent::Insert, FiringRank::First)];
+        let mut d = set(vec![cur.clone()]);
+        assert!(
+            diff_triggers(std::slice::from_ref(&cur), &d, MsSql)
+                .changes
+                .is_empty()
+        );
+        d.triggers[0].info.action = TriggerAction::Body("SELECT 2".into());
+        d.triggers[0].info.events.push(TriggerEvent::Delete);
+        let sql = diff_triggers(std::slice::from_ref(&cur), &d, MsSql).emit();
+        assert_eq!(
+            sql,
+            [
+                "CREATE OR ALTER TRIGGER [dbo].[tr] ON [dbo].[t] AFTER INSERT, DELETE\nAS\nSELECT 2",
+                "EXEC sp_settriggerorder @triggername = N'[dbo].[tr]', @order = N'First', \
+                 @stmttype = N'INSERT';",
+            ]
+        );
+    }
+
+    /// A rename is a drop and a create — T-SQL cannot rename a trigger in
+    /// place (`sp_rename` leaves its stored text naming the old one) — with
+    /// every drop ahead of every create, as on the other engines.
+    #[test]
+    fn a_renamed_sql_server_trigger_is_dropped_and_created() {
+        let cur = tr("old");
+        let mut d = set(vec![cur.clone(), tr("gone")]);
+        d.triggers.remove(1);
+        d.triggers[0].info.name = "new".into();
+        let fresh = TriggerDraft {
+            original: None,
+            info: tr("added"),
+        };
+        d.triggers.push(fresh);
+        let sql = diff_triggers(&[cur, tr("gone")], &d, MsSql).emit();
+        assert_eq!(sql[0], "DROP TRIGGER [dbo].[gone];");
+        assert_eq!(sql[1], "DROP TRIGGER [dbo].[old];");
+        assert!(
+            sql[2].starts_with("CREATE TRIGGER [dbo].[new] ON [dbo].[t]"),
+            "{sql:?}"
+        );
+        assert!(
+            sql[3].starts_with("CREATE TRIGGER [dbo].[added]"),
+            "{sql:?}"
+        );
+        assert_eq!(sql.len(), 4);
+    }
+
+    /// What the engine refuses, refused where the form can say which control
+    /// is wrong — SQL Server has neither `BEFORE` nor a row-level trigger,
+    /// no `WHEN`, no `UPDATE OF` and no `TRUNCATE` event, and a view takes only
+    /// `INSTEAD OF`.
+    #[test]
+    fn a_sql_server_trigger_draft_is_held_to_its_grammar() {
+        let ok = |t: TriggerInfo, host| {
+            TriggerDraft {
+                original: None,
+                info: t,
+            }
+            .validate(MsSql, host)
+        };
+        assert!(ok(tr("a"), TriggerHost::Table).is_empty());
+        let mut v = tr("a");
+        v.timing = TriggerTiming::InsteadOf;
+        assert!(ok(v.clone(), TriggerHost::View).is_empty());
+        assert!(
+            ok(v, TriggerHost::Table).is_empty(),
+            "a table takes INSTEAD OF too"
+        );
+        type Case = (Box<dyn Fn(&mut TriggerInfo)>, TriggerHost);
+        let bad: Vec<Case> = vec![
+            (
+                Box::new(|t| t.timing = TriggerTiming::Before),
+                TriggerHost::Table,
+            ),
+            (Box::new(|_| {}), TriggerHost::View),
+            (
+                Box::new(|t| t.level = TriggerLevel::Row),
+                TriggerHost::Table,
+            ),
+            (
+                Box::new(|t| t.condition = Some("1 = 1".into())),
+                TriggerHost::Table,
+            ),
+            (
+                Box::new(|t| t.update_columns = vec!["a".into()]),
+                TriggerHost::Table,
+            ),
+            (
+                Box::new(|t| t.events.push(TriggerEvent::Truncate)),
+                TriggerHost::Table,
+            ),
+            (
+                Box::new(|t| t.action = TriggerAction::Body("  ".into())),
+                TriggerHost::Table,
+            ),
+            (
+                Box::new(|t| {
+                    t.action = TriggerAction::Function {
+                        name: "f".into(),
+                        args: Vec::new(),
+                    }
+                }),
+                TriggerHost::Table,
+            ),
+        ];
+        for (i, (edit, host)) in bad.into_iter().enumerate() {
+            let mut t = tr("a");
+            edit(&mut t);
+            assert!(!ok(t, host).is_empty(), "case {i}");
+        }
+    }
+
+    /// A trigger whose header could not be read, or whose text the server
+    /// does not show, may sit in the set and be dropped — but not be changed,
+    /// since the rebuild would drop what was not read.
+    #[test]
+    fn an_unreadable_sql_server_trigger_can_be_dropped_but_not_changed() {
+        let mut odd = tr("odd");
+        odd.tsql.verbatim =
+            Some("CREATE TRIGGER dbo.odd ON dbo.t FOR INSERT WITH APPEND AS SELECT 1".into());
+        let mut hidden = tr("hidden");
+        hidden.action = TriggerAction::Body(String::new());
+        hidden.tsql.hidden = true;
+        let current = vec![odd.clone(), hidden.clone(), tr("plain")];
+        let mut d = set(current.clone());
+        assert!(d.validate(&current, MsSql, TriggerHost::Table).is_empty());
+        d.triggers[2].info.action = TriggerAction::Body("SELECT 9".into());
+        assert!(
+            d.validate(&current, MsSql, TriggerHost::Table).is_empty(),
+            "a neighbour edits"
+        );
+        for i in [0, 1] {
+            let mut d = set(current.clone());
+            d.triggers[i].info.tsql.not_for_replication = true;
+            assert!(
+                !d.validate(&current, MsSql, TriggerHost::Table).is_empty(),
+                "{i}"
+            );
+        }
+        let mut d = set(current.clone());
+        d.triggers.truncate(1);
+        assert!(
+            d.validate(&current, MsSql, TriggerHost::Table).is_empty(),
+            "dropping is fine"
+        );
+        assert!(!crate::schema::TriggerInfo::is_editable(&odd));
+        assert!(!crate::schema::TriggerInfo::is_editable(&hidden));
+        assert!(crate::schema::TriggerInfo::is_editable(&tr("plain")));
+        // A body cleared *in the editor* is a validation error, not a lock.
+        let mut cleared = tr("plain");
+        cleared.action = TriggerAction::Body(String::new());
+        assert!(crate::schema::TriggerInfo::is_editable(&cleared));
+    }
+}
+
 #[cfg(test)]
 mod sqlite_trigger_read_tests {
     use super::*;

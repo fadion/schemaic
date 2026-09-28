@@ -6199,21 +6199,29 @@ mod object_menu_tests {
     /// and before SQL Server had a `DROP` it was a red enabled item that asked
     /// "This can't be undone" and could only end in a refusal. A table is
     /// offered Edit table and Truncate now that `emit_mssql` writes them; a
-    /// view Edit view, now that it writes `CREATE OR ALTER VIEW`, and not
-    /// triggers; a materialized view — which the engine does not have —
-    /// nothing at all. A table is offered Import now that `import_rows` is
-    /// written.
+    /// view Edit view, now that it writes `CREATE OR ALTER VIEW`; a
+    /// materialized view — which the engine does not have — nothing at all. A
+    /// table is offered Import now that `import_rows` is written, and both a
+    /// table and a plain view Triggers, now that `CREATE OR ALTER TRIGGER` is —
+    /// a view's `INSTEAD OF` being how one is written to at all.
     #[test]
     fn sql_server_offers_its_table_changes_and_a_views_drop() {
         use schemaic_core::intel::SqlDialect::MsSql;
         let t = object_entries(Shape::Table, MsSql, false);
-        assert!(t.edit && t.truncate && t.drop && t.import, "{t:?}");
-        assert!(!t.triggers && !t.refresh_view, "{t:?}");
+        assert!(
+            t.edit && t.truncate && t.drop && t.import && t.triggers,
+            "{t:?}"
+        );
+        assert!(!t.refresh_view, "{t:?}");
         for materialized in [false, true] {
             let v = object_entries(Shape::View, MsSql, materialized);
             assert!(
-                !v.truncate && !v.triggers && !v.import && !v.refresh_view,
+                !v.truncate && !v.import && !v.refresh_view,
                 "view (materialized: {materialized}): {v:?}"
+            );
+            assert_eq!(
+                v.triggers, !materialized,
+                "view (materialized: {materialized})"
             );
             // The engine has no materialized view, so only a plain one's Edit
             // is a question worth pinning.

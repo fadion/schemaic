@@ -104,6 +104,12 @@ const NEW_BODY: &str = "BEGIN\n    \nEND";
 /// open the form on the one validation error this constant exists to avoid.
 const NEW_BODY_SQLITE: &str = "BEGIN\n    SELECT 1;\nEND";
 
+/// The same for SQL Server, which refuses an empty `BEGIN … END` as SQLite
+/// does. `SET NOCOUNT ON` is what a T-SQL trigger opens with anyway: without
+/// it every statement in the body reports a row count to the client that
+/// wrote the table, which some drivers read as the write's own.
+const NEW_BODY_MSSQL: &str = "BEGIN\n    SET NOCOUNT ON;\n    \nEND";
+
 // ── opening ──────────────────────────────────────────────────────────────────
 
 /// **Takes `&SchemaActions` rather than the two fetches below it**, for
@@ -428,19 +434,26 @@ fn blank_trigger(
         },
         SqlDialect::Sqlite => TriggerAction::Body(NEW_BODY_SQLITE.to_string()),
         SqlDialect::MySql => TriggerAction::Body(NEW_BODY.to_string()),
-        // Not reached: trigger editing is not offered on SQL Server yet
-        // (`ddl::supports_trigger_editing`). T-SQL takes an empty block as
-        // SQLite does not, so MySQL's placeholder is the closer of the two.
-        SqlDialect::MsSql => TriggerAction::Body(NEW_BODY.to_string()),
+        SqlDialect::MsSql => {
+            // T-SQL has no `BEFORE` — the model's default — and fires once
+            // per statement, with the rows in `inserted` and `deleted`.
+            if !is_view {
+                draft.info.timing = TriggerTiming::After;
+            }
+            draft.info.level = TriggerLevel::Statement;
+            TriggerAction::Body(NEW_BODY_MSSQL.to_string())
+        }
     };
     draft
 }
 
 /// Whether this trigger is one Schemaic can edit — the form's gate, and the
-/// reason a constraint trigger shows its details read-only: the deferral
-/// settings one carries aren't modelled, so re-creating it would drop them.
+/// reason a constraint trigger shows its details read-only (the deferral
+/// settings one carries aren't modelled, so re-creating it would drop them),
+/// and a SQL Server one whose text is hidden or whose header could not be
+/// read. [`TriggerInfo::is_editable`] is the rule; this is its door here.
 pub(crate) fn is_editable_trigger(t: &TriggerInfo) -> bool {
-    !t.constraint
+    t.is_editable()
 }
 
 // ── bound controls ───────────────────────────────────────────────────────────
@@ -682,8 +695,20 @@ fn form(
     let sqlite = target.dialect == SqlDialect::Sqlite;
 
     // A constraint trigger is shown so it can be seen and removed, but its
-    // deferral settings aren't modelled, so editing it would silently drop them.
+    // deferral settings aren't modelled, so editing it would silently drop them;
+    // a SQL Server one with hidden or unreadable text, likewise.
     if !is_editable_trigger(&draft.info) {
+        let why = if draft.info.constraint {
+            "This is a constraint trigger. Schemaic doesn't model the deferral \
+             settings one carries, so it can be removed here but not edited — \
+             change it in SQL instead."
+        } else if draft.info.tsql.hidden {
+            "This trigger's definition is encrypted or hidden from this login, so \
+             it can be removed here but not edited."
+        } else {
+            "This trigger uses an option Schemaic doesn't model, so it can be \
+             removed here but not edited — change it in SQL instead."
+        };
         return v_stack((
             form_section("Trigger"),
             form_setting_owned(
@@ -691,12 +716,7 @@ fn form(
                 text(draft.info.name.clone())
                     .style(|s| s.color(theme::text()).font_size(theme::font_body())),
             ),
-            text(
-                "This is a constraint trigger. Schemaic doesn't model the deferral \
-                 settings one carries, so it can be removed here but not edited — \
-                 change it in SQL instead.",
-            )
-            .style(|s| {
+            text(why).style(|s| {
                 s.color(theme::text_dim())
                     .font_size(theme::font_label())
                     .max_width(theme::scaled(420.0))
@@ -722,7 +742,8 @@ fn form(
         .style(move |s| s.width(field_w())),
     );
 
-    // `INSTEAD OF` is **a view's alone** on both engines that have it: on a table
+    // `INSTEAD OF` is **a view's alone** on PostgreSQL and SQLite (SQL Server
+    // takes it on a table too): on a table
     // the server answers `Tables cannot have INSTEAD OF triggers` (PostgreSQL) or
     // `cannot create INSTEAD OF trigger on table` (SQLite), so offering it there
     // is the "hide what it can't express" rule broken in the direction that fails
@@ -731,16 +752,15 @@ fn form(
     // The two differ on the other half. PostgreSQL keeps `BEFORE`/`AFTER` on a
     // view's list — legal there statement-level — while SQLite refuses them
     // outright (`cannot create BEFORE trigger on view`), so a SQLite view is
-    // offered the one timing it can have. `TriggerDraft::validate` is the
-    // authority on all of it; this list is what keeps the form from opening on
-    // an error.
-    let timings: Vec<String> = match (target.dialect, target.is_view) {
-        (SqlDialect::Postgres, true) => {
-            vec!["BEFORE".into(), "AFTER".into(), "INSTEAD OF".into()]
-        }
-        (SqlDialect::Sqlite, true) => vec!["INSTEAD OF".into()],
-        _ => vec!["BEFORE".into(), "AFTER".into()],
-    };
+    // offered the one timing it can have; SQL Server has no `BEFORE` at all.
+    // `ddl::trigger_timings` is the list, held by a test to exactly what
+    // `TriggerDraft::validate` accepts — which is what keeps the form from
+    // opening on an error.
+    let timings: Vec<String> =
+        ddl::trigger_timings(target.dialect, ddl::TriggerHost::of(target.is_view))
+            .into_iter()
+            .map(|t| t.sql().to_string())
+            .collect();
     let timing = form_setting(
         "Timing",
         bound_choice(
@@ -756,20 +776,13 @@ fn form(
         ),
     );
 
-    // MySQL and SQLite fire on exactly one event, PostgreSQL on any combination
-    // — so this is a dropdown on two engines and a row of toggles on the third,
-    // rather than one control that lies about what the server accepts.
-    let events: AnyView = if pg {
+    // MySQL and SQLite fire on exactly one event, PostgreSQL and SQL Server on
+    // any combination (`ddl::trigger_fires_on_several_events`) — so this is a
+    // dropdown on two engines and a row of toggles on the others, rather than
+    // one control that lies about what the server accepts.
+    let events: AnyView = if ddl::trigger_fires_on_several_events(target.dialect) {
         let mut rows: Vec<AnyView> = Vec::new();
-        for (n, ev) in [
-            TriggerEvent::Insert,
-            TriggerEvent::Update,
-            TriggerEvent::Delete,
-            TriggerEvent::Truncate,
-        ]
-        .into_iter()
-        .enumerate()
-        {
+        for (n, &ev) in ddl::trigger_events(target.dialect).iter().enumerate() {
             let on = floem::reactive::create_rw_signal(draft.info.events.contains(&ev));
             create_effect(move |prev: Option<bool>| {
                 let v = on.get();
@@ -860,6 +873,36 @@ fn form(
                     };
                 },
             ),
+        )
+        .into_any()
+    };
+
+    // SQL Server's `NOT FOR REPLICATION`: the trigger stays silent while a
+    // replication agent writes the table. Built only there, for `level`'s
+    // Tab-order reason. `EXECUTE AS` and the firing rank are kept by the model
+    // and restated on apply, but have no control yet.
+    let not_for_replication: AnyView = if !ddl::supports_trigger_not_for_replication(target.dialect)
+    {
+        crate::widgets::nothing()
+    } else {
+        let on = floem::reactive::create_rw_signal(draft.info.tsql.not_for_replication);
+        create_effect(move |prev: Option<bool>| {
+            let v = on.get();
+            if prev.is_some_and(|p| p != v) {
+                d.update(|s| {
+                    if let Some(dr) = s.triggers.get_mut(i) {
+                        dr.info.tsql.not_for_replication = v;
+                    }
+                });
+            }
+            v
+        });
+        focusable_toggle_row(
+            "NOT FOR REPLICATION",
+            "Silent while a replication agent writes the table.",
+            on,
+            ring.clone(),
+            45,
         )
         .into_any()
     };
@@ -973,6 +1016,7 @@ fn form(
         timing,
         events,
         level,
+        not_for_replication,
         form_section("Condition").style(move |s| {
             let s = s.margin_top(theme::scaled(4.0));
             if has_when { s } else { s.hide() }
@@ -1791,6 +1835,52 @@ mod tests {
             &TableInfo::default()
         )));
         assert!(!crate::view_editor::is_editable_view(None));
+    }
+
+    /// **A new SQL Server trigger opens on no error**, on a table or a view:
+    /// `AFTER` (the default `BEFORE` is not T-SQL's), fired once per statement,
+    /// and a body that compiles — T-SQL refuses an empty `BEGIN … END`, the
+    /// placeholder MySQL's editor opens on.
+    #[test]
+    fn a_new_sql_server_trigger_opens_valid() {
+        use schemaic_core::ddl::TriggerHost;
+        for (is_view, host, timing) in [
+            (false, TriggerHost::Table, TriggerTiming::After),
+            (true, TriggerHost::View, TriggerTiming::InsteadOf),
+        ] {
+            let t = blank_trigger(
+                &[],
+                &[],
+                "t",
+                Some("dbo".into()),
+                SqlDialect::MsSql,
+                is_view,
+            );
+            assert_eq!(t.info.timing, timing);
+            assert_eq!(t.info.level, schemaic_core::schema::TriggerLevel::Statement);
+            assert!(
+                t.validate(SqlDialect::MsSql, host).is_empty(),
+                "{:?}",
+                t.validate(SqlDialect::MsSql, host)
+            );
+            let TriggerAction::Body(b) = &t.info.action else {
+                panic!("a body");
+            };
+            assert!(!b.contains("BEGIN\n    \nEND"), "{b}");
+        }
+    }
+
+    /// A SQL Server trigger whose text is hidden or whose header could not be
+    /// read shows read-only, like a constraint trigger.
+    #[test]
+    fn an_unreadable_sql_server_trigger_shows_read_only() {
+        let mut t = TriggerInfo::default();
+        assert!(is_editable_trigger(&t));
+        t.tsql.hidden = true;
+        assert!(!is_editable_trigger(&t));
+        t.tsql.hidden = false;
+        t.tsql.verbatim = Some("CREATE TRIGGER …".into());
+        assert!(!is_editable_trigger(&t));
     }
 
     /// Both "new object" buttons walk the suffixes now.

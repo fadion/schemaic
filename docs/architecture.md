@@ -8,9 +8,9 @@ statement about. All three engines now edit all three of those objects, and they
 differently, so ask the *narrow* capability (`ddl::supports_or_replace_view`,
 `ddl::supports_view_rename`) rather than the engine. **Microsoft SQL Server is a fourth, and a
 preview rather than a peer**: it connects, reads, validates, introspects, runs scripts, writes
-the grid's edits back, imports a file into a table, designs tables, edits views, drops a
-table, view or routine, holds a Manual tab's transaction, shows a query plan and dumps a database
-to a `.sql` file, and the trigger and routine editors are switched off by capability — see
+the grid's edits back, imports a file into a table, designs tables, edits views and triggers,
+drops a table, view or routine, holds a Manual tab's transaction, shows a query plan and dumps a
+database to a `.sql` file, and the routine editor is switched off by capability — see
 `db::mssql`.
 
 This is the project's reference document: the crate/module map, the architecture invariants, the
@@ -4298,8 +4298,9 @@ existing prose was left alone.
     **Triggers and stored routines** ride the same rails again:
     `TriggerSetDraft`/`TriggerDraft` → `diff_triggers` and `RoutineDraft` → `diff_routine`
     → `Change::{CreateTrigger, ReplaceTrigger, DropTrigger, CreateRoutine, ReplaceRoutine,
-    RenameRoutine, DropRoutine}` → the same preview. None of the three can *alter* a trigger,
-    so **every** edit is a drop-and-create and `ReplaceTrigger` is that pair — which is why
+    RenameRoutine, DropRoutine}` → the same preview. MySQL, PostgreSQL and SQLite cannot *alter* a
+    trigger here, so there **every** edit is a drop-and-create and `ReplaceTrigger` is that pair —
+    SQL Server's same-name edit is the one altered in place, below — which is why
     `trigger_statements` emits **all the drops, then all the creates** rather than each pair
     together: adjacent pairs collide the moment two triggers swap names, and on MySQL
     statement 1 has already committed when statement 2 fails, so the first trigger is simply
@@ -4444,6 +4445,52 @@ existing prose was left alone.
     `starts_with`, since a body may open with a comment and a `BEGIN` inside a string is not the
     block's own. It is refused in the modal rather than at Apply because the `DROP` has already run
     by the time the `CREATE` fails.
+    **SQL Server got here through a reader too, and that reader is a stated exception to the `intel`
+    invariant.** Its catalogue keeps a trigger's timing, events and state, but the header options a
+    `CREATE OR ALTER` must restate — `EXECUTE AS`, `SCHEMABINDING`, `NATIVE_COMPILATION`, `NOT FOR
+    REPLICATION` — live only in the stored text, so `tsql_trigger_parts` reads them out of it into
+    `TsqlTriggerParts`. It walks tokens (`TsqlCursor`) over `sql::skip_noncode` rather than asking
+    sqlparser, because 0.62's T-SQL `CREATE TRIGGER` knows neither the `WITH` options nor `NOT FOR
+    REPLICATION` and parses the body as statements, which a real trigger's body often is not to it —
+    so the AST answers `None` for exactly the triggers this exists to read. The walk is the grammar's
+    header and nothing more, and the thing it has to get right is **the header's own `AS`**, past
+    `EXECUTE AS`'s and any a bracketed name or a comment holds
+    (`the_body_starts_at_the_headers_own_as`). It answers `None` — the trigger then listed, droppable
+    and restated verbatim, never rebuilt — for `WITH ENCRYPTION`, the obsolete `WITH APPEND`, an
+    option it does not model, a DDL trigger (`ON DATABASE`, `ON ALL SERVER`) and a non-DML event
+    (`a_header_the_parts_cannot_restate_is_unreadable`), since a rebuild from the parts that *were*
+    read would silently drop the rest. Widening it to an option means modelling that option on
+    `TsqlTrigger` and restating it in `tsql_statement` in the same change; admitting a word the walk
+    merely skips is the silent drop this refuses.
+    **A same-name edit there is altered in place, not dropped and created.**
+    `supports_trigger_alter_in_place` answers yes for SQL Server alone (PostgreSQL's `CREATE OR
+    REPLACE TRIGGER` stays unused for the reason `trigger_statements` gives), and `trigger_statements`
+    then emits a `CREATE OR ALTER` with no `DROP`; the draft neither leaves nor re-enters the set,
+    which is what keeps the ordering walk exact for it. A rename stays a drop and a create on every
+    engine — `sp_rename` would leave the stored text naming the old trigger, the call
+    `supports_view_rename` makes for a view — and a `CREATE OR ALTER` cannot move a trigger to another
+    table either (Msg 2110, measured on SQL Server 2022), which the modal, holding one table's set,
+    never asks of it. `trigger_create_statements` is the one exhaustive `match` both routes go
+    through: MySQL's session wrap on one arm, and on SQL Server the statement followed by
+    `TriggerInfo::tsql_follow_ups` as statements of their own (under `schema.rs`). `emit_mssql` routes
+    `trigger_statements` beside `view_statements`, and `tsql_supports` admits the three trigger
+    changes, which is all it took for `supports_trigger_editing(MsSql)` to answer yes
+    (`sql_server_offers_the_trigger_editor`, `an_edited_sql_server_trigger_is_altered_in_place`,
+    `a_renamed_sql_server_trigger_is_dropped_and_created`).
+    **`TriggerDraft::validate` is one exhaustive `match dialect` now**, because of what the old shape
+    would have done: it was an `if pg … else if sqlite … else` chain, and the `else` validated a SQL
+    Server draft as MySQL's — refusing a second event and every `INSTEAD OF` — the moment the editor
+    opened there. The SQL Server arm is T-SQL's grammar: no `BEFORE`, a view takes only `INSTEAD OF`
+    while a table takes it as well as `AFTER`, statement level only, no `TRUNCATE`, no `WHEN`, no
+    `UPDATE OF`, and a body rather than a function (`a_sql_server_trigger_draft_is_held_to_its_grammar`).
+    What the form offers is computed from the same facts — `trigger_timings(dialect, host)`,
+    `trigger_events`, `trigger_fires_on_several_events`, `supports_trigger_not_for_replication` — and
+    `the_offered_timings_and_events_are_ones_the_validator_accepts` holds every offered timing and
+    event to a clean validation on every engine and host, since an option offered and then refused is
+    the form opening on an error. `TriggerSetDraft::validate` refuses a *change* to a trigger
+    `TriggerInfo::is_editable` says no to, on the constraint trigger's terms: it may sit in the set
+    while a neighbour is edited, and dropping it is fine
+    (`an_unreadable_sql_server_trigger_can_be_dropped_but_not_changed`).
   - `compare.rs` — **two databases, object by object**, and a chosen subset of the differences as
     one migration. The pure half of schema compare (the UI half is `ui/compare_view.rs`): no DB, no
     view code, nothing here runs anything (98 unit tests).
@@ -6902,12 +6949,41 @@ existing prose was left alone.
     body, no definer, no ordering clause, no session state and always `FOR EACH ROW` — so it is
     asked for by name rather than reached by falling off the end of a `!pg`. `update_columns` and
     `condition` are consequently **not** PostgreSQL-only fields: MySQL is the engine with neither.
-    **SQL Server's arm builds nothing** (`tsql_create_sql`): `sys.sql_modules.definition` is the
-    whole `CREATE TRIGGER`, `db::mssql` reads it into the body, and the arm hands it back, as
-    `RoutineInfo::create_sql` does a routine's. It used to fall through to MySQL's header and emit a
-    trigger inside a trigger, which Compare's DDL panes showed; a definition the server shows nobody
-    (`WITH ENCRYPTION`) comes back as a comment line saying so rather than half a statement
-    (`a_sql_server_trigger_is_its_stored_statement`).
+    **SQL Server's arm rebuilds the statement from its parts** (`tsql_create_sql`, which is
+    `tsql_statement(false)`; the apply path asks `tsql_statement(true)` for the `CREATE OR ALTER`).
+    It used to replay `sys.sql_modules.definition` whole, as `RoutineInfo::create_sql` does a
+    routine's — and before that it fell through to MySQL's header and emitted a trigger inside a
+    trigger, which Compare's DDL panes showed. Replaying is right until something can be edited:
+    then an edit to any part has to be the statement that runs, so the arm writes the header from
+    `TriggerInfo::tsql` and appends the body after `AS` verbatim, and the result reads back through
+    `ddl::tsql_trigger_parts` as the same parts — the round trip the editor rests on
+    (`a_sql_server_trigger_is_written_from_its_parts`). **The trade is the text outside the body**:
+    `sys.sql_modules` keeps the statement as typed — measured on SQL Server 2022, a comment ahead of
+    `CREATE` survives there, and a `CREATE OR ALTER` is stored as `CREATE   TRIGGER` — and a rebuild
+    keeps neither a comment ahead of `CREATE` or inside the header nor the header's own spelling, so
+    Copy DDL and the dump now show the rebuilt statement rather than the stored one
+    (`introspection_reads_the_schema_as_declared` asserts the rebuilt text on the live leg).
+    **`TsqlTrigger` is what the shared model lacked**, on the "restate everything or it silently
+    resets" rule again: an unstated `EXECUTE AS` (`ExecuteAs`) is `CALLER`, an unstated `NOT FOR
+    REPLICATION` fires during replication, and the `First`/`Last` rank per event (`FiringRank`)
+    lives outside the statement altogether. Two fields say the parts cannot be trusted. `verbatim`
+    holds the stored text whole when `tsql_trigger_parts` could not read its header, and the arm
+    restates it as it was, since a rebuild from what *was* read would drop the rest; `hidden` marks a
+    trigger the server shows no text for (`WITH ENCRYPTION` — `definition` is NULL, measured — or
+    not visible to this login), which comes back as a comment line saying so rather than half a
+    statement (`a_sql_server_trigger_the_parts_cannot_hold_is_restated_verbatim`).
+    **`TriggerInfo::is_editable` is the one gate over all three refusals** — not a constraint
+    trigger, not `verbatim`, not `hidden` — and it is asked of what the server *reported*, never of
+    the body: a body cleared in the editor is a validation error, not a reason to lock the form.
+    **`tsql_follow_ups` is what a create or an alter loses, and it is never appended to the
+    statement's text.** Measured on SQL Server 2022, a `CREATE OR ALTER` keeps a disabled trigger
+    disabled but resets `is_first` from 1 to 0, and a fresh `CREATE` fires whatever the trigger was;
+    so each rank gets an `sp_settriggerorder` and a disabled trigger a `DISABLE TRIGGER`, on both
+    paths, one rule. They are separate statements because `CREATE TRIGGER` must be alone in its batch
+    and anything after the body in that batch is not run after the trigger — it *is* the trigger
+    (`a_sql_server_triggers_rank_and_disabled_state_follow_it`). **A hidden trigger has none**: its
+    statement is a comment, so nothing was created, and a dump that then ranked or disabled it
+    would stop its restore at a trigger that does not exist.
     **`create_set_sql` is the whole-set form beside it, and the difference is `FOLLOWS`/`PRECEDES`.**
     That clause is a statement about the group as it stands when the statement runs, not a property
     of the trigger: both MySQL and MariaDB refuse one naming a trigger that is not there yet
@@ -6930,6 +7006,9 @@ existing prose was left alone.
     `core::ddl`'s `trigger_statements`, which asks a two-term version (created earlier in this plan,
     **or** surviving it) and says there what each term is for. A comparison between two databases
     would ask a third question, whether the *other* database holds the name; nothing asks it yet.
+    On SQL Server the set also carries each trigger's `tsql_follow_ups` straight after its create,
+    flattened in as statements of their own, so the dump and Copy DDL restate a rank and a disabled
+    state for the batch reason above.
     `CheckInfo::validated`/`inherited` are PostgreSQL's `NOT VALID` / `NO INHERIT`, carried and
     restated: they are part of the clause, and `pg_get_constraintdef` prints them *after* the
     parens, which is why `ddl::check_predicate` must strip them before peeling. **An unnamed check
@@ -10793,15 +10872,19 @@ existing prose was left alone.
   logins and the users mapped to them in each database are two catalogues the browser's one list
   fits neither half of; and
   `ddl::supports_change`, whose SQL Server answer comes before anything else and is
-  `tsql_supports`: a table's own changes, new or existing, the table, view and routine drops, and
-  a view's `CreateView` and `ReplaceView`, and nothing more. The four editor predicates compute
+  `tsql_supports`: a table's own changes, new or existing, the table, view and routine drops, a
+  view's `CreateView` and `ReplaceView`, and a trigger's create, replace and drop, and nothing
+  more. The four editor predicates compute
   from it, so it decides which editors open: `supports_table_design` probes a column retype, which
   T-SQL's `ALTER COLUMN` writes, so the designer opens on an existing table — in place, as on MySQL
   and PostgreSQL, with no rebuild — and `supports_view_editing` probes the create and the replace,
   which `emit_mssql` writes through the shared `view_statements` (`CREATE OR ALTER VIEW`, under
-  `ddl.rs`), so the view editor opens too; the trigger and routine editors each want a `Create`
-  and a `Replace` besides their drop and stay off
-  (`sql_server_admits_the_table_changes_it_can_write`). What `tsql_supports`
+  `ddl.rs`), so the view editor opens too; `supports_trigger_editing` probes all three trigger
+  changes, which `emit_mssql` writes through the shared `trigger_statements` (`CREATE OR ALTER
+  TRIGGER` for a same-name edit, under `ddl.rs`), so the trigger editor opens as well; the routine
+  editor wants a `Create` and a `Replace` besides its drop and stays off
+  (`sql_server_admits_the_table_changes_it_can_write`, `sql_server_offers_the_trigger_editor`).
+  What `tsql_supports`
   refuses is under `run_ddl` (below). The three drops needed no emitter
   change — `DROP TABLE`/`DROP VIEW` over `export::ident_sql`'s brackets were T-SQL already, and
   `RoutineInfo::signature_sql` already had an `MsSql` arm, the bare name, T-SQL having no
@@ -10823,7 +10906,9 @@ existing prose was left alone.
   written; and *Table* in the Create menu. A table is offered **Edit table** and
   **Truncate** besides, now that `emit_mssql` writes them, and **Import** now that `import_rows`
   is written; a view **Edit view** with its Drop, and
-  the Create menu *View* after *Table*, now that it writes a view's create and replace
+  the Create menu *View* after *Table*, now that it writes a view's create and replace; and both a
+  table and a plain view **Triggers**, now that it writes `CREATE OR ALTER TRIGGER`, a view's
+  `INSTEAD OF` being how one is written to at all
   (`object_menu_tests::sql_server_offers_its_table_changes_and_a_views_drop`,
   `a_standalone_objects_drop_is_offered_only_where_its_statement_emits`,
   `create_menu_tests::sql_server_is_offered_a_table_and_a_view`). Unlike SQLite's gaps, all
@@ -11215,7 +11300,25 @@ existing prose was left alone.
   whole; `repair_tsql_dependents` now rebuilds it (under `ddl.rs`).
   `a_view_is_altered_in_place_and_renamed` takes a schema-bound view with a column list and a
   grant, alters its body and reads all three back, then renames it and reads the stored
-  definition naming the new name. Still not done: the routine and trigger editors.
+  definition naming the new name.
+  `a_trigger_is_altered_in_place_and_keeps_what_the_alter_resets` is the trigger editor's leg: a
+  trigger written with a leading comment, `EXECUTE AS OWNER`, two events and `NOT FOR REPLICATION`,
+  ranked `First` on `INSERT` and disabled, beside a plain one and an encrypted one. It reads the
+  header options, the rank and the state back through the parts, the encrypted one `hidden` and not
+  editable, and the set diffing to nothing; then one plan edits the first one's body — asserted
+  altered, never dropped — and renames the second, and it reads the rank restored, the trigger still
+  disabled, the rename landed and the encrypted one untouched, the round-trip gate holding again.
+  The renamed one fires, the disabled one stays silent until it is enabled and then fires its edited
+  body, and a new `INSTEAD OF` trigger on a view fires in place of the write to it. Still not done: the routine editor, and a control for a trigger's
+  `EXECUTE AS` or its rank — both are read, kept and restated on apply, but the form offers neither.
+  **A trigger is read from `TRIGGER_LISTING`, one row per event**, folded into one `TriggerInfo`
+  each; the row carries `sys.trigger_events.is_first`/`is_last`, so the rank is per event, as
+  `sp_settriggerorder` sets it. The events are sorted into `TriggerEvent`'s declaration order as
+  they fold, the order the editor's toggles keep, since a catalogue order they re-sorted would be a
+  phantom change. The stored text goes through `tsql_trigger_reading`, pure: `tsql_trigger_parts`
+  gives the body after the header's `AS` and the options; a header it cannot read keeps the whole
+  text as `verbatim` (and as the body, for whatever displays it); a NULL `definition` is `hidden`
+  (`a_stored_trigger_reads_into_its_parts_or_is_kept_whole`).
   **A view's header is read off its stored definition, in two halves by one walk.**
   `view_select_body` is the `SELECT` — everything after the first `AS` outside parentheses,
   strings, comments and quoted names, over `sql::skip_noncode` — and `view_header_options` is what
@@ -11277,8 +11380,9 @@ existing prose was left alone.
   statements, the table's and columns' comments after them through `ddl::tsql_add_comment` — the
   same `sp_addextendedproperty` the emitter writes (`create_ddl_sql_server_restates_the_comments`)
   — and what it cannot restate named in a comment; a view is its stored definition), held
-  to the server, comments included, by `a_tables_ddl_rebuilds_the_table_it_was_read_from`; a trigger's DDL is its stored
-  statement and a schema script closes each object's batch with `GO` (`TriggerInfo::create_sql`,
+  to the server, comments included, by `a_tables_ddl_rebuilds_the_table_it_was_read_from`; a trigger's DDL is rebuilt from
+  the parts its stored statement was read into, with its rank and disabled state after it as
+  statements of their own, and a schema script closes each object's batch with `GO` (`TriggerInfo::create_sql`,
   `ddl::join_scripts`, both under `schema.rs`);
   `activity::from_mssql_rows`/`mssql_state` fold the session rows, drawing no blocking edge to a
   negative id (not a session) or to the session's own — a parallel query's threads waiting on one
@@ -16623,13 +16727,13 @@ existing prose was left alone.
   - `trigger_editor.rs` — the **trigger** modal, over `core::ddl`'s
     `TriggerSetDraft`. Reached from the schema context menu's per-table
     **Triggers…** entry — and from a **view's**, on every engine but MySQL, since `INSTEAD OF`
-    lives on PostgreSQL and on SQLite, where it is the only way a view is written to at all
-    (`overlays::object_entries`, which still excludes a materialized view: PostgreSQL refuses one
-    outright); same chrome, same seed-local-signals-then-write-back rule and same
+    lives on PostgreSQL, on SQLite and on SQL Server, and on the last two it is the only way a view
+    is written to at all (`overlays::object_entries`, which still excludes a materialized view:
+    PostgreSQL refuses one outright); same chrome, same seed-local-signals-then-write-back rule and same
     `ddl_preview` ending as `view_editor`. The trigger modal is the **designer's list-plus-form
     shape** — the table's triggers on the left, the selected one's form on the right, `+`/`−`
     under the list (no ↑/↓: list position is display order, while firing order is MySQL's
-    `FOLLOWS` and PostgreSQL's alphabetical) — so one plan can drop one trigger, edit another and
+    `FOLLOWS`, PostgreSQL's alphabetical and SQL Server's `sp_settriggerorder` rank) — so one plan can drop one trigger, edit another and
     add a third. It shares the designer's `selected`/`rev` signals, since only one of the two is
     ever open, and splits list-vs-form re-rendering the same way for the same reason.
     **It is deliberately not a designer tab**: what belongs there is what can be a *clause* of
@@ -16643,8 +16747,18 @@ existing prose was left alone.
     each was a bug waiting: **the form is
     per-engine because the objects are** (MySQL owns a body and one event; PG calls a function,
     takes several events and a `WHEN`; SQLite owns a body, one event, a `WHEN` and `UPDATE OF`
-    columns through a "Of columns" field, and offers a view only `INSTEAD OF`), so it *hides* what
-    an engine can't express rather than offering it and failing at apply — which is also why
+    columns through a "Of columns" field, and offers a view only `INSTEAD OF`; SQL Server owns a
+    body and several events, fires once per statement, takes `AFTER` or `INSTEAD OF` on a table and
+    only `INSTEAD OF` on a view, and has a **NOT FOR REPLICATION** toggle no other engine is built),
+    so it *hides* what an engine can't express rather than offering it and failing at apply. The
+    lists come from `core::ddl` rather than a `(dialect, is_view)` match here — `trigger_timings`,
+    `trigger_events`, and `trigger_fires_on_several_events` choosing between the event toggles and
+    the one-event dropdown — and are held there to exactly what `TriggerDraft::validate` accepts.
+    `EXECUTE AS` and the firing rank have no control yet: the model keeps them and the apply path
+    restates them, so an edit leaves them as they were. `blank_trigger` opens a SQL Server trigger on
+    `AFTER` (a view's on `INSTEAD OF`), statement level and `NEW_BODY_MSSQL`, a `BEGIN SET NOCOUNT ON;
+    END` rather than MySQL's empty block, which T-SQL refuses as SQLite does
+    (`a_new_sql_server_trigger_opens_valid`). That per-engine shape is also why
     `blank_trigger`/`trigger_list` take a `SqlDialect` rather than a `pg: bool`, and why the
     MySQL-only `fetch_sources` (`SHOW CREATE TRIGGER`) is gated `== MySql` — whose reply is also why
     **this overlay's `dyn_container` key is deliberately not the memo the routine and view editors
@@ -16674,8 +16788,11 @@ existing prose was left alone.
     never cleared while the routine modal is
     up** — its overlay just renders nothing — so closing that one reveals the half-filled trigger
     form intact, with no "return to trigger" flag to be a second source of truth. `is_editable_trigger`
-    is the entry point's gate: a constraint trigger's deferral settings aren't modelled, so it is
-    listed and droppable but not editable, the call a materialized view gets.
+    is the entry point's gate, and a door onto `TriggerInfo::is_editable` rather than a rule of its
+    own: a constraint trigger's deferral settings aren't modelled, and a SQL Server trigger whose
+    text is hidden or whose header could not be read has nothing to be rebuilt from, so each is
+    listed and droppable but not editable, the call a materialized view gets — the form shows the
+    name and a sentence saying which of the three it is (`an_unreadable_sql_server_trigger_shows_read_only`).
     **Which function a trigger names is asked in one place — `matching` — and the picker and the
     Edit button both ask it there.** `TriggerAction::Function::name` is emittable SQL on both
     producers, so *showing* it means mapping back through the fetched list: `fn_names` drops the
@@ -16712,7 +16829,7 @@ existing prose was left alone.
     construction because `v` came out of the options list. Resolving a display never fabricates an
     edit: `display_of` feeds the `sel` display signal and never the draft.
     **`TriggerTarget::sibling_triggers` is read at the door, because the modal cannot see far
-    enough.** On MySQL, MariaDB and SQLite a trigger name is unique across the whole *schema*
+    enough.** On MySQL, MariaDB, SQLite and SQL Server a trigger name is unique across the whole *schema*
     (`ddl::trigger_names_are_schema_scoped`), so the second table in a database to get a trigger
     through the `+` button was offered `new_trigger` again — accepted by the form, accepted by
     `TriggerSetDraft::validate`, which holds one table's set and legitimately checks only the narrow
@@ -23714,6 +23831,14 @@ Re-introducing the anti-patterns these guard against is a regression:
   allowlist in the read-only gate, asks about anything *spelled* as a call, where an AST visitor
   would ask only about the node shapes it knows and fail open on the rest — `core::sql`'s entry
   gives the reason in full. It is a refusal, never analysis a feature reads.
+  **The second stated exception is a reader, not a refusal**: `ddl::tsql_trigger_parts`, a token
+  walk (`TsqlCursor`) over `skip_noncode` that reads a SQL Server trigger's stored header into the
+  options a `CREATE OR ALTER` must restate. sqlparser 0.62's T-SQL `CREATE TRIGGER` knows neither
+  the `WITH` options nor `NOT FOR REPLICATION` and parses the body as statements, so the AST answers
+  `None` for the very triggers the editor has to read — `core::ddl`'s entry has the rest. It is held
+  to the grammar's header and nothing more, and anything outside that shape answers `None`, which
+  keeps the trigger listed and droppable but never rebuilt — so it may be widened only for a clause
+  the model then restates, since a word it merely skipped would be dropped by the rebuild.
 - **One connection per operation — except a Manual-mode tab, and a running script.** Every `Db` method opens a fresh
   connection, runs, and disconnects; that statelessness is why a dropped connection is never a
   problem. The *first* exception is manual-transaction mode: a tab set to `TxMode::Manual` pins one
@@ -24166,22 +24291,27 @@ Re-introducing the anti-patterns these guard against is a regression:
   and all three **derive** that from `supports_change` rather than returning a literal, which is the
   only form of "always true" that isn't a constant with a function's name on it: the answer changes
   when the emitter's does, and a fourth engine gets whatever the change table says about it. SQL
-  Server is that fourth, and the derivation is what switched its editors off and then one of them
-  back on: `supports_change` answers for it before any arm is consulted (`tsql_supports`), admitting
-  a table's own changes, the table, view and routine drops, and a view's create and replace — no
-  emitter writes T-SQL's `CREATE OR ALTER` for a trigger or routine yet — and every editor predicate
-  follows with no edit of its own. It held when the first four came on (a new table and the three
-  drops): no editor probes only them, so none opened. When `emit_mssql` learned `ALTER COLUMN`, the
-  table designer opened on an existing table by that alone, while the other three stayed shut
+  Server is that fourth, and the derivation is what switched its editors off and then turned them
+  back on one at a time: `supports_change` answers for it before any arm is consulted
+  (`tsql_supports`), admitting a table's own changes, the table, view and routine drops, a view's
+  create and replace and a trigger's create, replace and drop — no emitter writes T-SQL's `CREATE OR
+  ALTER` for a routine yet — and every editor predicate follows with no edit of its own. It held
+  when the first four came on (a new table and the three drops): no editor probes only them, so
+  none opened. When `emit_mssql` learned `ALTER COLUMN`, the table designer opened on an existing
+  table by that alone, while the other three stayed shut
   (`sql_server_admits_the_table_changes_it_can_write`); when it learned `CREATE OR ALTER VIEW`,
-  the view editor opened the same way. A menu
+  the view editor opened the same way, and when it learned `CREATE OR ALTER TRIGGER` so did the
+  trigger editor (`sql_server_offers_the_trigger_editor`). A menu
   entry with **no** predicate is the same failure with nothing to grep for — the designer's three
   entries were exactly that until `supports_table_design` existed. **Keep asking them, and keep them
   apart**:
   they are per-object questions the menus ask per object, and what differs between engines has
   moved down to the narrower predicates that decide how an edit is *performed* rather than whether
   it is offered — `supports_or_replace_view`, false on SQLite alone, `supports_view_rename`, false
-  on SQLite and SQL Server, `supports_view_check_option` and `view_keeps_column_list`, plus
+  on SQLite and SQL Server, `supports_view_check_option` and `view_keeps_column_list`,
+  `supports_trigger_alter_in_place`, true on SQL Server alone, with the trigger form's
+  `trigger_timings`, `trigger_events`, `trigger_fires_on_several_events` and
+  `supports_trigger_not_for_replication`, plus
   `supports_column_reorder`, `alter_column_disturbs_checks`,
   `alter_column_disturbs_dependents`, `publishes_index_ddl` and `stats::supports_table_stats`; and, for the *comparison* rather than
   any editor, `ref_schema_is_database` and `view_definition_is_qualified`. **The same rule applies

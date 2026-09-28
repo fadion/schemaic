@@ -1858,6 +1858,9 @@ pub struct TriggerInfo {
     /// deferral options one carries, so these are shown and droppable but not
     /// editable — the same call [`ViewOptions::materialized`] gets.
     pub constraint: bool,
+    /// **SQL Server**: the header options and firing order — see
+    /// [`TsqlTrigger`]. Default everywhere else.
+    pub tsql: TsqlTrigger,
 }
 
 /// What one `SHOW CREATE TRIGGER` round trip yields for a MySQL trigger: the
@@ -1993,6 +1996,67 @@ impl TriggerEnabled {
     }
 }
 
+/// A SQL Server trigger's `EXECUTE AS` — whose rights its body runs with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExecuteAs {
+    Caller,
+    /// `SELF` — whoever created or last altered it.
+    SelfUser,
+    Owner,
+    /// `EXECUTE AS 'user'`, the name unquoted.
+    User(String),
+}
+
+impl ExecuteAs {
+    /// As T-SQL writes it after `EXECUTE AS`.
+    pub fn sql(&self) -> String {
+        match self {
+            ExecuteAs::Caller => "CALLER".to_string(),
+            ExecuteAs::SelfUser => "SELF".to_string(),
+            ExecuteAs::Owner => "OWNER".to_string(),
+            ExecuteAs::User(u) => format!("'{}'", u.replace('\'', "''")),
+        }
+    }
+}
+
+/// A SQL Server trigger's place among the triggers on one event —
+/// `sp_settriggerorder`'s `First` and `Last`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FiringRank {
+    First,
+    Last,
+}
+
+/// What a **SQL Server** trigger carries beyond the shared model: the header
+/// options its `CREATE TRIGGER` restates, and the firing order that lives
+/// outside it.
+///
+/// Read out of the stored statement and the catalogue by `db::mssql`, the
+/// header through [`crate::ddl::tsql_trigger_parts`]. Every field is one a
+/// `CREATE OR ALTER` would otherwise reset: an unstated `EXECUTE AS` is
+/// `CALLER`, an unstated `NOT FOR REPLICATION` fires during replication, and
+/// **any** `ALTER TRIGGER` drops the trigger's `First`/`Last` rank (measured on
+/// SQL Server 2022), which is why [`TriggerInfo::tsql_follow_ups`] restates it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TsqlTrigger {
+    pub execute_as: Option<ExecuteAs>,
+    pub schemabinding: bool,
+    pub native_compilation: bool,
+    pub not_for_replication: bool,
+    /// `sys.trigger_events.is_first` / `is_last`, per event.
+    pub rank: Vec<(TriggerEvent, FiringRank)>,
+    /// **The stored statement, whole, when its header could not be read** —
+    /// `WITH APPEND`, an option Schemaic does not model, or a shape the parser
+    /// does not know. Such a trigger is shown, restated verbatim by Copy DDL
+    /// and the dump, and droppable, but not editable: rebuilding it from the
+    /// parts that *were* read would drop the rest.
+    pub verbatim: Option<String>,
+    /// **The server shows no text for it** — created `WITH ENCRYPTION`, or
+    /// not visible to this login. Shown and droppable, not editable: there is
+    /// no body to rebuild it with.
+    pub hidden: bool,
+}
+
 impl Default for TriggerInfo {
     /// A trigger fires unless the server says otherwise; defaulting to
     /// `Disabled` would emit a `DISABLE TRIGGER` after every create.
@@ -2016,11 +2080,24 @@ impl Default for TriggerInfo {
             new_table: None,
             enabled: TriggerEnabled::default(),
             constraint: false,
+            tsql: TsqlTrigger::default(),
         }
     }
 }
 
 impl TriggerInfo {
+    /// Can Schemaic rebuild this trigger from its parts? Not a PostgreSQL
+    /// constraint trigger (its deferral settings are not modelled), and not a
+    /// SQL Server one whose header could not be read or whose text the server
+    /// does not show ([`TsqlTrigger::verbatim`], [`TsqlTrigger::hidden`]).
+    /// Such a trigger is still listed and droppable.
+    ///
+    /// Asked of what the server reported, never of the body: a body cleared in
+    /// the editor is a validation error, not a reason to lock the form.
+    pub fn is_editable(&self) -> bool {
+        !self.constraint && self.tsql.verbatim.is_none() && !self.tsql.hidden
+    }
+
     /// This trigger with an ordering clause **the server could not resolve**
     /// taken off, judged by `exists`.
     ///
@@ -2087,28 +2164,94 @@ impl TriggerInfo {
         triggers: &[TriggerInfo],
         dialect: crate::intel::SqlDialect,
     ) -> Vec<String> {
+        // SQL Server's follow-ups ride along as statements of their own — see
+        // `tsql_follow_ups` for why they cannot share the trigger's text.
+        let follow_ups = |t: &TriggerInfo| match dialect {
+            crate::intel::SqlDialect::MsSql => t.tsql_follow_ups(),
+            crate::intel::SqlDialect::MySql
+            | crate::intel::SqlDialect::Postgres
+            | crate::intel::SqlDialect::Sqlite => Vec::new(),
+        };
         triggers
             .iter()
             .enumerate()
-            .map(|(i, t)| {
+            .flat_map(|(i, t)| {
                 let before = &triggers[..i];
-                t.with_resolvable_order(|n| before.iter().any(|e| e.name.eq_ignore_ascii_case(n)))
-                    .create_sql(dialect)
+                let create = t
+                    .with_resolvable_order(|n| {
+                        before.iter().any(|e| e.name.eq_ignore_ascii_case(n))
+                    })
+                    .create_sql(dialect);
+                std::iter::once(create).chain(follow_ups(t))
             })
             .collect()
     }
 
-    /// [`Self::create_sql`] for SQL Server: the trigger's stored statement.
-    ///
-    /// `db::mssql` reads the whole `CREATE TRIGGER` (`sys.sql_modules`) into
-    /// the body, for the reason `RoutineInfo::create_sql` hands a routine's
-    /// back: reassembling one from parts would be a second author of text the
-    /// server already has verbatim. Wrapped in the MySQL header this fell
-    /// through to, it came out as a trigger inside a trigger.
+    /// [`Self::create_sql`] for SQL Server: [`Self::tsql_statement`]'s `CREATE`.
     fn tsql_create_sql(&self) -> String {
+        self.tsql_statement(false)
+    }
+
+    /// The T-SQL `CREATE [OR ALTER] TRIGGER`, **rebuilt from the parts** —
+    /// the header [`TsqlTrigger`] holds, then the body after `AS` — so an
+    /// edit to any of them is the statement that runs. The body is verbatim,
+    /// comments and all, and the whole reads back through
+    /// [`crate::ddl::tsql_trigger_parts`] as the same parts, which is the
+    /// round trip the editor rests on.
+    ///
+    /// **The stored text is restated instead** when its header could not be
+    /// read (`TsqlTrigger::verbatim`), since rebuilding from the parts that
+    /// were read would drop the rest — and a trigger with no text at all (one
+    /// created `WITH ENCRYPTION`) gets a comment saying so. A rebuilt
+    /// statement is not terminated: the body is the user's, to the last byte,
+    /// and a restore's batch ends at its `GO` line rather than at a `;`. The
+    /// verbatim one is, as the stored text always was restated.
+    ///
+    /// This is the trigger alone. What a create or an alter loses — the
+    /// firing rank, the disabled state — is [`Self::tsql_follow_ups`], as
+    /// statements of their own.
+    pub fn tsql_statement(&self, or_alter: bool) -> String {
         let d = crate::intel::SqlDialect::MsSql;
+        if let Some(v) = &self.tsql.verbatim {
+            return crate::sql::terminated(v.trim(), d);
+        }
         match &self.action {
-            TriggerAction::Body(b) if !b.trim().is_empty() => crate::sql::terminated(b.trim(), d),
+            TriggerAction::Body(b) if !b.trim().is_empty() => {
+                let name = qualified_ident(&self.name, self.schema.as_deref(), d);
+                let table = qualified_ident(&self.table, self.schema.as_deref(), d);
+                let mut options: Vec<String> = Vec::new();
+                if self.tsql.native_compilation {
+                    options.push("NATIVE_COMPILATION".to_string());
+                }
+                if self.tsql.schemabinding {
+                    options.push("SCHEMABINDING".to_string());
+                }
+                if let Some(who) = &self.tsql.execute_as {
+                    options.push(format!("EXECUTE AS {}", who.sql()));
+                }
+                let with = if options.is_empty() {
+                    String::new()
+                } else {
+                    format!(" WITH {}", options.join(", "))
+                };
+                let events = self
+                    .events
+                    .iter()
+                    .map(|e| e.sql())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let nfr = if self.tsql.not_for_replication {
+                    " NOT FOR REPLICATION"
+                } else {
+                    ""
+                };
+                format!(
+                    "CREATE {}TRIGGER {name} ON {table}{with} {} {events}{nfr}\nAS\n{}",
+                    if or_alter { "OR ALTER " } else { "" },
+                    self.timing.sql(),
+                    b.trim()
+                )
+            }
             // `NULL` for one created `WITH ENCRYPTION`, which the server shows
             // nobody. Comment-safed: the name is the server's.
             TriggerAction::Body(_) => format!(
@@ -2123,6 +2266,52 @@ impl TriggerInfo {
         }
     }
 
+    /// The statements a SQL Server trigger's create or alter must be followed
+    /// by, each its own: `sp_settriggerorder` for every `First`/`Last` rank —
+    /// **any** `ALTER TRIGGER` drops one (measured on SQL Server 2022: an
+    /// `INSERT` trigger's `is_first` went from 1 to 0) — and `DISABLE TRIGGER`
+    /// for a disabled one, since a fresh `CREATE` fires. An alter keeps a
+    /// disabled trigger disabled; restating it there is harmless and keeps one
+    /// rule for both paths.
+    ///
+    /// **Never appended to [`Self::tsql_statement`]'s text**: `CREATE TRIGGER`
+    /// must be alone in its batch, and a statement after the body in the same
+    /// batch is not run after the trigger — it *is* the trigger.
+    pub fn tsql_follow_ups(&self) -> Vec<String> {
+        // A hidden trigger's statement is a comment — nothing was created, so
+        // nothing may be ranked or disabled after it.
+        if self.tsql.hidden {
+            return Vec::new();
+        }
+        let d = crate::intel::SqlDialect::MsSql;
+        let name = qualified_ident(&self.name, self.schema.as_deref(), d);
+        let lit = |s: &str| crate::export::sql_literal(&crate::model::Value::Str(s.to_string()), d);
+        let mut out: Vec<String> = self
+            .tsql
+            .rank
+            .iter()
+            .map(|(event, rank)| {
+                let rank = match rank {
+                    FiringRank::First => "First",
+                    FiringRank::Last => "Last",
+                };
+                format!(
+                    "EXEC sp_settriggerorder @triggername = {}, @order = {}, @stmttype = {};",
+                    lit(&name),
+                    lit(rank),
+                    lit(event.sql())
+                )
+            })
+            .collect();
+        if self.enabled == TriggerEnabled::Disabled {
+            out.push(format!(
+                "DISABLE TRIGGER {name} ON {};",
+                qualified_ident(&self.table, self.schema.as_deref(), d)
+            ));
+        }
+        out
+    }
+
     /// The `CREATE TRIGGER` that recreates this trigger exactly — the **one**
     /// trigger emitter, shared by Copy DDL, the round-trip gate and the apply
     /// path, for the same reason [`crate::ddl::view_ddl`] is one.
@@ -2131,7 +2320,7 @@ impl TriggerInfo {
     /// too: `CREATE TRIGGER` always produces an enabled one, so a plan that
     /// stopped at the create would quietly switch it back on.
     pub fn create_sql(&self, dialect: crate::intel::SqlDialect) -> String {
-        // SQL Server's is the statement it stored, not one built here.
+        // SQL Server's is rebuilt from its own parts — see `tsql_statement`.
         match dialect {
             crate::intel::SqlDialect::MsSql => return self.tsql_create_sql(),
             crate::intel::SqlDialect::MySql
@@ -5640,34 +5829,106 @@ mod trigger_tests {
         }
     }
 
-    /// **A SQL Server trigger is its stored statement.** `sys.sql_modules`
-    /// keeps the whole `CREATE TRIGGER` and `db::mssql` reads it into the body,
-    /// so wrapping it in MySQL's header wrote a trigger inside a trigger.
-    #[test]
-    fn a_sql_server_trigger_is_its_stored_statement() {
-        let t = TriggerInfo {
+    fn tsql_trigger() -> TriggerInfo {
+        TriggerInfo {
             name: "tr".into(),
             schema: Some("dbo".into()),
             table: "t".into(),
             timing: TriggerTiming::After,
-            events: vec![TriggerEvent::Insert],
-            action: TriggerAction::Body(
-                "CREATE TRIGGER dbo.tr ON dbo.t AFTER INSERT AS SET NOCOUNT ON".into(),
-            ),
+            events: vec![TriggerEvent::Insert, TriggerEvent::Update],
+            level: TriggerLevel::Statement,
+            action: TriggerAction::Body("SET NOCOUNT ON".into()),
             ..Default::default()
-        };
+        }
+    }
+
+    /// **A SQL Server trigger is rebuilt from its parts** — the header options
+    /// `CREATE OR ALTER` would otherwise reset, then the body after `AS` — and
+    /// the result reads back as the same parts, which is the round trip every
+    /// edit rests on.
+    #[test]
+    fn a_sql_server_trigger_is_written_from_its_parts() {
+        let mut t = tsql_trigger();
         assert_eq!(
             t.create_sql(SqlDialect::MsSql),
-            "CREATE TRIGGER dbo.tr ON dbo.t AFTER INSERT AS SET NOCOUNT ON;"
+            "CREATE TRIGGER [dbo].[tr] ON [dbo].[t] AFTER INSERT, UPDATE\nAS\nSET NOCOUNT ON"
         );
-        // One created `WITH ENCRYPTION` has no text anybody can read, and the
-        // DDL says so rather than writing half a statement.
+        t.timing = TriggerTiming::InsteadOf;
+        t.tsql.execute_as = Some(ExecuteAs::User("o'neil".into()));
+        t.tsql.schemabinding = true;
+        t.tsql.not_for_replication = true;
+        let sql = t.tsql_statement(true);
+        assert_eq!(
+            sql,
+            "CREATE OR ALTER TRIGGER [dbo].[tr] ON [dbo].[t] WITH SCHEMABINDING, \
+             EXECUTE AS 'o''neil' INSTEAD OF INSERT, UPDATE NOT FOR REPLICATION\nAS\nSET NOCOUNT ON"
+        );
+        let back = crate::ddl::tsql_trigger_parts(&sql).expect("it reads back");
+        assert_eq!(back.execute_as, t.tsql.execute_as);
+        assert!(back.schemabinding && back.not_for_replication && !back.native_compilation);
+        assert_eq!(back.body, "SET NOCOUNT ON");
+    }
+
+    /// A trigger whose header could not be read is restated as it was
+    /// stored; one with no text at all (`WITH ENCRYPTION`) says so rather than
+    /// writing half a statement.
+    #[test]
+    fn a_sql_server_trigger_the_parts_cannot_hold_is_restated_verbatim() {
+        let mut t = tsql_trigger();
+        t.tsql.verbatim =
+            Some("CREATE TRIGGER dbo.tr ON dbo.t FOR INSERT WITH APPEND AS SELECT 1".into());
+        assert_eq!(
+            t.create_sql(SqlDialect::MsSql),
+            "CREATE TRIGGER dbo.tr ON dbo.t FOR INSERT WITH APPEND AS SELECT 1;"
+        );
         let hidden = TriggerInfo {
             action: TriggerAction::Body(String::new()),
-            ..t
+            ..tsql_trigger()
         };
         let sql = hidden.create_sql(SqlDialect::MsSql);
         assert!(sql.starts_with("-- ") && !sql.contains("CREATE"), "{sql}");
+    }
+
+    /// **What a create or an alter loses is restated after it, as statements
+    /// of their own**: any `ALTER TRIGGER` drops a `First`/`Last` rank, and a
+    /// fresh `CREATE` fires though the trigger was disabled. Separate, never
+    /// appended — a statement after the body in the trigger's own batch would
+    /// *be* the body.
+    #[test]
+    fn a_sql_server_triggers_rank_and_disabled_state_follow_it() {
+        assert!(tsql_trigger().tsql_follow_ups().is_empty());
+        let mut t = tsql_trigger();
+        t.tsql.rank = vec![
+            (TriggerEvent::Insert, FiringRank::First),
+            (TriggerEvent::Update, FiringRank::Last),
+        ];
+        t.enabled = TriggerEnabled::Disabled;
+        assert_eq!(
+            t.tsql_follow_ups(),
+            [
+                "EXEC sp_settriggerorder @triggername = N'[dbo].[tr]', @order = N'First', \
+                 @stmttype = N'INSERT';",
+                "EXEC sp_settriggerorder @triggername = N'[dbo].[tr]', @order = N'Last', \
+                 @stmttype = N'UPDATE';",
+                "DISABLE TRIGGER [dbo].[tr] ON [dbo].[t];",
+            ]
+        );
+        // And the whole-set emitter a dump and Copy DDL use carries them, each
+        // its own statement.
+        let set = TriggerInfo::create_set_sql(std::slice::from_ref(&t), SqlDialect::MsSql);
+        assert_eq!(set.len(), 4, "{set:?}");
+        assert!(set[0].starts_with("CREATE TRIGGER"));
+        assert!(set[3].starts_with("DISABLE TRIGGER"));
+        // **A hidden trigger is not created, so nothing may follow it**: its
+        // "statement" is a comment, and a restore that then ran `DISABLE
+        // TRIGGER` or `sp_settriggerorder` on it would stop at a trigger that
+        // does not exist.
+        t.tsql.hidden = true;
+        t.action = TriggerAction::Body(String::new());
+        assert!(t.tsql_follow_ups().is_empty());
+        let set = TriggerInfo::create_set_sql(std::slice::from_ref(&t), SqlDialect::MsSql);
+        assert_eq!(set.len(), 1, "{set:?}");
+        assert!(set[0].starts_with("-- "), "{set:?}");
     }
 
     #[test]

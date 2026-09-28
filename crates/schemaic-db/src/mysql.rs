@@ -2142,6 +2142,7 @@ fn mysql_triggers(rows: &[MyTriggerRow]) -> Vec<TriggerInfo> {
             new_table: None,
             enabled: schemaic_core::schema::TriggerEnabled::Origin,
             constraint: false,
+            tsql: Default::default(),
         });
         prev = Some((table.clone(), timing.clone(), event.clone(), name.clone()));
     }
