@@ -9,8 +9,8 @@ differently, so ask the *narrow* capability (`ddl::supports_or_replace_view`,
 `ddl::supports_view_rename`) rather than the engine. **Microsoft SQL Server is a fourth, and a
 preview rather than a peer**: it connects, reads, validates, introspects, runs scripts, writes
 the grid's edits back, imports a file into a table, designs tables, edits views, drops a
-table, view or routine and holds a Manual tab's transaction, and the trigger and routine editors,
-dump and the plan are switched off by capability — see `db::mssql`.
+table, view or routine, holds a Manual tab's transaction and shows a query plan, and the trigger
+and routine editors and dump are switched off by capability — see `db::mssql`.
 
 This is the project's reference document: the crate/module map, the architecture invariants, the
 UI conventions, and the Floem hazards each subsystem is built on. `CLAUDE.md` at the repo root
@@ -2880,7 +2880,9 @@ existing prose was left alone.
     **The reader is `calamine`, and an imported `.xlsx` is the first untrusted XML this app has ever
     parsed** — a ZIP of it, from wherever the user got the file. `calamine` depends on quick-xml
     **0.41**, the version that fixes `RUSTSEC-2026-0194`/`0195`, and that is now the only quick-xml
-    in the tree: `cargo tree -i quick-xml` returns exactly one, 0.41.0, under calamine. There were
+    in the tree: `cargo tree -i quick-xml` returns exactly one, 0.41.0, under calamine — and under
+    `schemaic-core` itself, which now asks the same version directly to read SQL Server's plan
+    documents (`core::plan`), which arrive from the server rather than with the build. There were
     two for a while, the second a vulnerable 0.39 whose **only** consumer was `wayland-scanner`, a
     Linux-only build-time proc macro over Wayland's vendored protocol XML — not usvg/resvg, which
     parses SVG with roxmltree and never depended on either version, an attribution `deny.toml` had
@@ -7631,6 +7633,30 @@ existing prose was left alone.
     current instant. A caller that wants only the day still wants `Date::today`.
   - `plan.rs` — `QueryPlan::from_result` parses an `EXPLAIN` result into a table + heuristic
     warnings (full scan / filesort / temp table); `to_prompt_text` for the AI.
+    **SQL Server's plan is not a table but an XML document per statement**, and it is read into
+    the same tabular `QueryPlan` rather than a second shape the modal would have to learn: a result
+    whose one column is `SHOWPLAN_COLUMN` (`Microsoft SQL Server 2005 XML Showplan`, the name
+    `SET SHOWPLAN_XML` and `SET STATISTICS XML` answer under) goes to `showplan`, which walks each
+    document with `parse_showplan` over quick-xml — a direct dependency of `schemaic-core` for it,
+    at the 0.41 calamine already puts in the graph (under `import.rs`), because this document too
+    arrives from the server. Each `<RelOp>` is a row, indented two spaces per depth, as
+    `Physical (Logical)`, its *Object* `schema.table (index) alias` from the operator's own
+    `<Object>`, its estimated rows and cost, and — when the plan was measured — *Actual rows* and
+    *Executions* summed over `RunTimeCountersPerThread`. More than one planned statement gets a
+    heading row each; a statement with no plan (a `SET`, a `DECLARE`) contributes nothing, and a
+    batch with none at all is the one row *"No statement in this batch has a plan."* **A document
+    that does not read as a plan is shown verbatim under the reason** rather than as an empty table
+    that would claim there was no plan (`an_unreadable_showplan_is_shown_verbatim`). The heuristics
+    are the other engines' in T-SQL's names — `Table Scan` and `Clustered Index Scan` are
+    `FullScan`, `Sort` is `Filesort`, any `…Spool` is `TempTable` — and two kinds exist for
+    this engine alone, since no other plan carries them: `MissingIndex`, from the plan's
+    `<MissingIndexes>` with the impact the server expected, and `ServerWarning`, the plan's own
+    `<Warnings>` (no join predicate, a column with no statistics, a plan-affecting conversion…),
+    except that a spill to `tempdb` maps to `TempTable`. `supports_plan` answers yes for every
+    engine now and is kept an exhaustive `match`, so an engine added later has to answer it rather
+    than inherit the yes (`a_sql_server_showplan_becomes_one_row_per_operator`,
+    `a_sql_server_plan_warns_from_its_operators_and_its_own_advice`,
+    `a_measured_sql_server_plan_adds_the_actual_counts`).
   - **AI prompt + reply plumbing** (all pure, all dialect-aware — a prompt that hardcodes
     "MySQL/MariaDB" asks a Postgres connection for backtick-quoted SQL the server rejects):
     - `prompt.rs` — fences DB content so an embedded ` ``` ` can't escape into prose. Every prompt
@@ -9952,7 +9978,13 @@ existing prose was left alone.
   PostgreSQL `setval`/`nextval` are never rolled back, so a measured `SELECT setval(…)` moved the
   sequence for good. With the flag, `mysql::explain_in_rolled_back_tx` opens `START TRANSACTION READ
   ONLY` and `pg::explain` opens `BEGIN READ ONLY`, which refuse both; plain `EXPLAIN` only plans and
-  is untouched, and SQLite's `explain` never executes, so the flag is moot there. **What none of
+  is untouched, and SQLite's `explain` never executes, so the flag is moot there. SQL Server has
+  no read-only transaction to open, so `mssql::explain_setup` keeps the guarantee the other way
+  round: the measured plan runs inside a `BEGIN TRANSACTION` that is never committed, and with the
+  flag the statement must first pass `sql::read_only_reason` — `DbError::Refused` otherwise —
+  because that rollback cannot undo a procedure's effect outside the database, a sequence's
+  advance or a remote write, which are what that gate refuses by name. The estimated plan
+  (`SET SHOWPLAN_XML ON`) executes nothing and takes no guard (under `mssql.rs`). **What none of
   them guards is the person at the keyboard**: a `SET SESSION TRANSACTION READ WRITE` reaching the
   pinned session would lift it, as unticking the connection's read-only box would — though on a
   read-only connection that spelling is a `Block` first, `SET` being no read head to
@@ -10692,12 +10724,12 @@ existing prose was left alone.
   `fetch_schema`, the monitor's `fetch_table`, `count_rows` (`COUNT_BIG`), table statistics from
   `sys.dm_db_partition_stats`, Server Activity, `run_script`, and the grid's write-back —
   `commit_writes`, `refetch_rows` and `fetch_blob` (below) — `import_rows` (below), and `run_ddl`,
-  for the table changes `supports_change` admits (below), and a Manual tab's pinned `Session`
-  (below). `explain` and `run_server_ddl` answer
+  for the table changes `supports_change` admits (below), a Manual tab's pinned `Session`
+  (below), and `explain`, the estimated and the measured plan (below). `run_server_ddl` answers
   `DbError::Refused("… is not available for SQL Server yet.")`. **The refusals are the backstop,
   not the gate**: the app is kept off them by
   capabilities, each an exhaustive `match` with `MsSql` on `false`, asked at the UI site that
-  offers the thing — `plan::supports_plan` for the editor's Plan entry; `dump::supports_dump` for
+  offers the thing — `dump::supports_dump` for
   the tree's *Export ▸ SQL*; `users::supports_users`, since
   logins and the users mapped to them in each database are two catalogues the browser's one list
   fits neither half of; and
@@ -10743,7 +10775,8 @@ existing prose was left alone.
   write-back, has to say which side of it it is on. `import::supports_import` is the second, on
   the same terms, since `import_rows` landed, and `tx::supports_manual_mode` the third, since the
   pinned session below was written — though a *read-only* SQL Server connection is still not
-  offered the mode (`tx::offers_manual_mode`), and that one is about the engine. Server Activity is the one
+  offered the mode (`tx::offers_manual_mode`), and that one is about the engine.
+  `plan::supports_plan` is the fourth, since `explain` was written (below). Server Activity is the one
   split that *is* about the engine: `KILL` ends a session, but no T-SQL statement cancels another
   session's request and leaves the session standing — a cancel is an attention sent by the owner's
   own client — so `activity::supports_kill_kind` says no to *Cancel query* there and
@@ -10943,6 +10976,27 @@ existing prose was left alone.
   Msg 2627, 0 rows); `write_tests` pins the two predicates
   (`an_imported_blank_is_refused_where_sql_server_would_convert_it`,
   `an_import_wants_identity_insert_only_when_it_writes_the_identity`).
+  **`explain` answers with the server's own plan documents, and which batches go ahead of the
+  statement is `explain_setup`'s pure decision.** The estimated plan is `SET SHOWPLAN_XML ON`,
+  which compiles the batch and **executes none of it**, so it needs no guard and a write is as
+  welcome as a read. The measured plan runs the statement: `BEGIN TRANSACTION`, then
+  `SET STATISTICS XML ON`, and the connection is dropped uncommitted, so the work rolls back.
+  That rollback is the whole of the guarantee on this engine, since there is no read-only
+  transaction to open, and it does not undo a procedure's effect outside the database, a
+  sequence's advance or a remote write — so **on a read-only connection the statement must first
+  pass `sql::read_only_reason`**, the gate that refuses those by name, and anything it refuses is
+  `DbError::Refused` before a connection is made (`a_plan_is_set_up_by_whether_it_runs_the_statement`:
+  `EXEC dbo.p` and `SELECT NEXT VALUE FOR dbo.s` among the refusals). **Each `SET` is a batch of
+  its own**, which `SHOWPLAN_XML` requires. `plan_documents` then streams the statement and keeps
+  only the result sets `is_showplan_set` recognises — exactly one column, named `SHOWPLAN_COLUMN`
+  — because under `STATISTICS XML` the statement's own rows come first, in sets of their own
+  (`only_a_showplan_result_set_is_a_plan`); each read is raced against Stop and a Stop sends the
+  attention through `cancel_now`, as `run_statement` does. The documents go back as a
+  `ResultSet` under `SHOWPLAN_COLUMN`, so the app's `run_plan` → `QueryPlan::from_result` path is
+  the other engines' unchanged, and `core::plan` does the reading. The live pin is
+  `a_plan_is_read_from_the_servers_showplan_and_changes_nothing`: an estimated `DELETE` leaves all
+  three rows, a measured `SELECT` counts the two its scan returned, a measured `UPDATE` is rolled
+  back, and a measured `DELETE` on a read-only connection is refused.
   **`run_ddl` wraps the whole plan in one `BEGIN TRANSACTION`**, since T-SQL's `CREATE TABLE`,
   `CREATE INDEX` and `DROP` are transactional, as PostgreSQL's are: a best-effort
   `lock_wait_sql(MsSql)` first, as on the other engines, then each statement raced against Stop. A
@@ -15547,7 +15601,10 @@ existing prose was left alone.
     `width: 100%` *plus* a 12px margin, which is 24px too wide because margins sit outside the
     width — column-flex stretch subtracts them and a percentage does not.
   - `plan_view.rs` — Query Plan modal (`EXPLAIN`/`EXPLAIN ANALYZE` table + warnings + "Ask AI"),
-    via `TabsActions::run_plan` → `Db::explain`.
+    via `TabsActions::run_plan` → `Db::explain`. SQL Server's plan needed no change here: it
+    arrives as the same tabular `QueryPlan` (under `core::plan`), and the two warning kinds only
+    it produces, `MissingIndex` and `ServerWarning`, take the warning colour through the `_ =>`
+    arm that keeps `theme::error` for `FullScan` alone.
   - `properties.rs` — the **table properties** modal (`properties_overlay`), opened by setting
     `overlay.properties` — from a Table or View row's context menu, or from the RESULTS title bar's
     Properties icon for a result that names one table; an effect in the modal calls

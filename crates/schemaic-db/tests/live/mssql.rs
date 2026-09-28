@@ -325,6 +325,77 @@ async fn a_read_only_session_rolls_back_what_a_select_hides() {
     );
 }
 
+/// The plan is the server's XML, read into the plan table: the estimated
+/// form runs nothing (a `DELETE` planned deletes no row), the measured form
+/// counts what actually happened and is rolled back, and on a read-only
+/// connection the measured form refuses what the rollback cannot undo.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plan_is_read_from_the_servers_showplan_and_changes_nothing() {
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("plan").await;
+    s.exec("CREATE TABLE dbo.t (a int); INSERT dbo.t VALUES (1), (2), (3)")
+        .await;
+    let explain = |sql: &'static str, analyze: bool, read_only: bool| {
+        let db = s.db.clone();
+        let name = s.name.clone();
+        async move {
+            db.explain(
+                Some(&name),
+                sql,
+                analyze,
+                read_only,
+                CancellationToken::new(),
+            )
+            .await
+            .map(|rs| schemaic_core::plan::QueryPlan::from_result(&rs))
+        }
+    };
+
+    let plan = explain("DELETE FROM dbo.t WHERE a > 1", false, false)
+        .await
+        .expect("an estimated plan");
+    assert_eq!(plan.columns[0], "Operation", "{plan:?}");
+    assert!(
+        plan.rows.iter().any(|r| r[0].contains("Table Delete")),
+        "{plan:?}"
+    );
+    assert!(
+        plan.warnings
+            .iter()
+            .any(|w| w.kind == schemaic_core::plan::PlanWarningKind::FullScan),
+        "a heap is scanned: {plan:?}"
+    );
+    assert_eq!(s.scalar("SELECT COUNT(*) FROM dbo.t").await, "3");
+
+    let plan = explain("SELECT a FROM dbo.t WHERE a >= 2", true, true)
+        .await
+        .expect("a measured plan");
+    let actual = plan.columns.iter().position(|c| c == "Actual rows");
+    let scan = plan
+        .rows
+        .iter()
+        .find(|r| r[0].contains("Table Scan"))
+        .expect("the scan");
+    assert_eq!(scan[actual.expect("measured")], "2", "{plan:?}");
+
+    let plan = explain("UPDATE dbo.t SET a = a + 10", true, false)
+        .await
+        .expect("a measured write");
+    assert!(plan.columns.iter().any(|c| c == "Actual rows"), "{plan:?}");
+    assert_eq!(
+        s.scalar("SELECT MAX(a) FROM dbo.t").await,
+        "3",
+        "rolled back"
+    );
+
+    assert!(matches!(
+        explain("DELETE FROM dbo.t", true, true).await,
+        Err(DbError::Refused(_))
+    ));
+}
+
 /// Validation compiles without running: a missing table is reported by
 /// number, and a `DELETE` that checks clean deleted nothing.
 #[tokio::test(flavor = "multi_thread")]

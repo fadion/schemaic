@@ -5069,6 +5069,7 @@ dependencies = [
  "csv",
  "hmac 0.13.0",
  "md-5",
+ "quick-xml",
  "rust_xlsxwriter",
  "serde",
  "serde_json",

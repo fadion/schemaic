@@ -1722,17 +1722,120 @@ pub(crate) async fn fetch_table(
     db.fetch_query(Some(database), &sql, limit, cancel).await
 }
 
-/// No plan yet: T-SQL's is `SET SHOWPLAN_XML ON` (or `STATISTICS XML` for the
-/// measured form), an XML document the plan panel does not read.
+/// The statement's plan: one XML document per planned statement, as a result
+/// under [`schemaic_core::plan::SHOWPLAN_COLUMN`], which
+/// `QueryPlan::from_result` reads into the plan table.
+///
+/// `SET SHOWPLAN_XML ON` compiles the batch and **executes none of it** — the
+/// estimated plan. `SET STATISTICS XML ON` runs it and appends the measured
+/// plan after the statement's own results, which are read past; that runs
+/// inside a transaction that is never committed, as `Enforce::ReadOnly` does
+/// on [`fetch_query`], with the same limits (see [`explain_setup`]). Each `SET`
+/// goes in a batch of its own, which `SHOWPLAN_XML` requires.
 pub(crate) async fn explain(
-    _db: &Db,
-    _database: Option<&str>,
-    _sql: &str,
-    _analyze: bool,
-    _read_only: bool,
-    _cancel: CancellationToken,
+    db: &Db,
+    database: Option<&str>,
+    sql: &str,
+    analyze: bool,
+    read_only: bool,
+    cancel: CancellationToken,
 ) -> Result<ResultSet, DbError> {
-    Err(not_yet("The query plan"))
+    let setup = explain_setup(sql, analyze, read_only)?;
+    let mut client = connect(db, database).await?;
+    for step in setup {
+        drain(&mut client, step)
+            .await
+            .map_err(|e| DbError::Connect(format!("could not set up the plan: {e}")))?;
+    }
+    let docs = plan_documents(&mut client, sql, &cancel).await?;
+    // Dropped, not committed: a measured statement's work is rolled back.
+    let column = Column {
+        name: schemaic_core::plan::SHOWPLAN_COLUMN.to_string(),
+        type_name: "xml".to_string(),
+        origin: None,
+    };
+    Ok(ResultSet::from_rows(
+        vec![column],
+        docs.into_iter().map(|d| vec![Value::Str(d)]).collect(),
+    ))
+}
+
+/// The batches [`explain`] sends before the statement.
+///
+/// The measured form opens a transaction first, so what the statement does is
+/// rolled back with the connection — which does not undo a procedure's effect
+/// outside the database, a sequence's advance or a remote write. The editor's
+/// Analyze toggle is gated on `sql::contains_write`; **on a read-only
+/// connection** the statement must also pass `sql::read_only_reason`, the gate
+/// that refuses exactly those by name, since SQL Server has no read-only
+/// transaction to refuse them for it. The estimated form runs nothing and
+/// needs neither.
+fn explain_setup(
+    sql: &str,
+    analyze: bool,
+    read_only: bool,
+) -> Result<&'static [&'static str], DbError> {
+    if !analyze {
+        return Ok(&["SET SHOWPLAN_XML ON"]);
+    }
+    if read_only {
+        schemaic_core::sql::read_only_reason(sql, MS).map_err(DbError::Refused)?;
+    }
+    Ok(&["BEGIN TRANSACTION", "SET STATISTICS XML ON"])
+}
+
+/// Is a result set with these column names a plan document's?
+fn is_showplan_set(columns: &[&str]) -> bool {
+    matches!(columns, [only] if *only == schemaic_core::plan::SHOWPLAN_COLUMN)
+}
+
+/// Run `sql` and keep only the plan documents it answers with, raced against
+/// Stop as [`run_statement`] is.
+async fn plan_documents(
+    client: &mut MsClient,
+    sql: &str,
+    cancel: &CancellationToken,
+) -> Result<Vec<String>, DbError> {
+    let mut docs = Vec::new();
+    let mut cancelled = false;
+    'read: {
+        let opened = tokio::select! {
+            r = client.simple_query(sql) => Some(r),
+            _ = cancel.cancelled() => None,
+        };
+        let Some(opened) = opened else {
+            cancelled = true;
+            break 'read;
+        };
+        let mut stream = opened.map_err(|e| db_err(&e))?;
+        let mut in_plan = false;
+        loop {
+            let next = tokio::select! {
+                n = stream.next() => n,
+                _ = cancel.cancelled() => {
+                    cancelled = true;
+                    break;
+                }
+            };
+            let Some(item) = next else { break };
+            match item.map_err(|e| db_err(&e))? {
+                QueryItem::Metadata(meta) => {
+                    let names: Vec<&str> = meta.columns().iter().map(|c| c.name()).collect();
+                    in_plan = is_showplan_set(&names);
+                }
+                QueryItem::Row(row) if in_plan => {
+                    if let Some(Value::Str(doc)) = row.cells().next().map(|(_, d)| cell_value(d)) {
+                        docs.push(doc);
+                    }
+                }
+                QueryItem::Row(_) => {}
+            }
+        }
+    }
+    if cancelled {
+        return Err(cancel_now(client).await);
+    }
+    Ok(docs)
 }
 
 /// The exact row count, from `stats::count_rows_sql`'s `COUNT_BIG(*)`.
@@ -3177,6 +3280,46 @@ mod write_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The estimated plan executes nothing**, so it needs no guard and a
+    /// write is as welcome as a read; **the measured one runs the statement**,
+    /// inside a transaction opened first and never committed — and on a
+    /// read-only connection only after the headless read gate has passed it,
+    /// since that rollback cannot undo what `read_only_reason` refuses by name.
+    #[test]
+    fn a_plan_is_set_up_by_whether_it_runs_the_statement() {
+        assert_eq!(
+            explain_setup("DELETE FROM t", false, true).unwrap(),
+            ["SET SHOWPLAN_XML ON"]
+        );
+        assert_eq!(
+            explain_setup("SELECT 1", true, false).unwrap(),
+            ["BEGIN TRANSACTION", "SET STATISTICS XML ON"]
+        );
+        assert_eq!(
+            explain_setup("SELECT * FROM t", true, true).unwrap(),
+            ["BEGIN TRANSACTION", "SET STATISTICS XML ON"]
+        );
+        for write in ["DELETE FROM t", "EXEC dbo.p", "SELECT NEXT VALUE FOR dbo.s"] {
+            assert!(
+                matches!(explain_setup(write, true, true), Err(DbError::Refused(_))),
+                "{write}"
+            );
+        }
+    }
+
+    /// Only the plan's own result sets are kept: under `STATISTICS XML` the
+    /// statement's rows come first, in sets of their own.
+    #[test]
+    fn only_a_showplan_result_set_is_a_plan() {
+        assert!(is_showplan_set(&[schemaic_core::plan::SHOWPLAN_COLUMN]));
+        assert!(!is_showplan_set(&["id"]));
+        assert!(!is_showplan_set(&[
+            schemaic_core::plan::SHOWPLAN_COLUMN,
+            "x"
+        ]));
+        assert!(!is_showplan_set(&[]));
+    }
 
     fn names(n: &[&str]) -> Vec<String> {
         n.iter().map(|s| s.to_string()).collect()
