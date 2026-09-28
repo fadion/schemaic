@@ -1091,6 +1091,60 @@ async fn a_designer_edit_lands_as_drafted() {
     assert!(again.changes.is_empty(), "{:?}", again.changes);
 }
 
+/// **Comments are set, changed and cleared as `MS_Description`**, whether or
+/// not one was there — the plan looks it up as it runs — and by the names the
+/// plan's renames leave. Read back each time, and round-tripping to nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn comments_are_set_changed_and_cleared() {
+    use schemaic_core::ddl::TableDraft;
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("ddl_comment").await;
+    s.exec("CREATE TABLE dbo.t (id int NOT NULL PRIMARY KEY, qty int NULL)")
+        .await;
+    let t = read_table(&s, "t").await;
+    let mut d = TableDraft::from_table(&t);
+    d.comment = Some("stock's table".into());
+    let qty = d.columns.iter_mut().find(|c| c.info.name == "qty").unwrap();
+    qty.info.name = "amount".into();
+    qty.info.comment = Some("how many".into());
+    d.name = "t2".into();
+    let stmts = apply_draft(&s, &t, &d).await;
+    let t2 = read_table(&s, "t2").await;
+    assert_eq!(t2.comment.as_deref(), Some("stock's table"), "{stmts:#?}");
+    let amount = t2.columns.iter().find(|c| c.name == "amount").unwrap();
+    assert_eq!(amount.comment.as_deref(), Some("how many"));
+
+    // Changed where one is there, and cleared.
+    let mut d = TableDraft::from_table(&t2);
+    d.comment = None;
+    d.columns[1].info.comment = Some("units".into());
+    apply_draft(&s, &t2, &d).await;
+    let t3 = read_table(&s, "t2").await;
+    assert_eq!(t3.comment, None);
+    assert_eq!(t3.columns[1].comment.as_deref(), Some("units"));
+    let again = schemaic_core::ddl::diff(&t3, &TableDraft::from_table(&t3), MS);
+    assert!(again.changes.is_empty(), "{:?}", again.changes);
+
+    // A new table's are added after it.
+    let mut n = TableDraft::from_table(&t3);
+    n.name = "fresh".into();
+    n.comment = Some("new".into());
+    let create = schemaic_core::ddl::single(
+        "fresh",
+        Some("dbo"),
+        MS,
+        schemaic_core::ddl::Change::CreateTable(Box::new(n)),
+    );
+    s.db.run_ddl(&s.name, &create.emit(), CancellationToken::new())
+        .await
+        .expect("create");
+    let fresh = read_table(&s, "fresh").await;
+    assert_eq!(fresh.comment.as_deref(), Some("new"));
+    assert_eq!(fresh.columns[1].comment.as_deref(), Some("units"));
+}
+
 /// A primary key widened to two columns: dropped by the constraint name
 /// introspection read, and added over both.
 #[tokio::test(flavor = "multi_thread")]
@@ -1492,7 +1546,10 @@ async fn a_tables_ddl_rebuilds_the_table_it_was_read_from() {
            doubled AS (balance * 2) PERSISTED, \
            code varchar(8) NOT NULL CONSTRAINT uq_code UNIQUE, \
            CONSTRAINT ck_t CHECK (balance >= 0)); \
-         CREATE INDEX ix_bal ON dbo.t (balance DESC) WHERE balance > 0;",
+         CREATE INDEX ix_bal ON dbo.t (balance DESC) WHERE balance > 0; \
+         EXEC sp_addextendedproperty N'MS_Description', N'ledger', N'SCHEMA', N'dbo', N'TABLE', N't'; \
+         EXEC sp_addextendedproperty N'MS_Description', N'owed', \
+           N'SCHEMA', N'dbo', N'TABLE', N't', N'COLUMN', N'balance';",
     )
     .await;
     let read = |s: &Scratch| {
@@ -1525,7 +1582,7 @@ async fn a_tables_ddl_rebuilds_the_table_it_was_read_from() {
             .iter()
             .map(|c| {
                 format!(
-                    "{} {} null={} pk={} id={} {:?} def={:?} gen={:?} {} coll={:?}",
+                    "{} {} null={} pk={} id={} {:?} def={:?} gen={:?} {} coll={:?} {:?}",
                     c.name,
                     c.type_name,
                     c.nullable,
@@ -1535,12 +1592,14 @@ async fn a_tables_ddl_rebuilds_the_table_it_was_read_from() {
                     c.default,
                     c.generated,
                     c.generated_stored,
-                    c.collation
+                    c.collation,
+                    c.comment
                 )
             })
             .collect()
     };
     assert_eq!(cols(&copy), cols(&original), "{ddl}");
+    assert_eq!(copy.comment.as_deref(), Some("ledger"), "{ddl}");
     let idx = |t: &schemaic_core::schema::TableInfo| -> Vec<String> {
         let mut v: Vec<String> = t
             .indexes

@@ -4238,6 +4238,43 @@ impl ChangeSet {
                 out.push(create_index_sql(ix, &q, d));
             }
         }
+        // Comments, by the columns' new names and the table's old one.
+        let schema = self
+            .schema
+            .as_deref()
+            .unwrap_or(crate::schema::MSSQL_DEFAULT_SCHEMA);
+        let table = TsqlComment {
+            schema,
+            table: &self.table,
+            column: None,
+        };
+        for c in &admitted {
+            match c {
+                Change::AlterColumn { from, to, .. }
+                    if blank_as_none(from.comment.as_deref())
+                        != blank_as_none(to.comment.as_deref()) =>
+                {
+                    let on = TsqlComment {
+                        column: Some(&to.name),
+                        ..table
+                    };
+                    out.push(on.set(to.comment.as_deref()));
+                }
+                Change::AddColumn { column, .. } => {
+                    if let Some(cm) = blank_as_none(column.comment.as_deref()) {
+                        let on = TsqlComment {
+                            column: Some(&column.name),
+                            ..table
+                        };
+                        out.push(on.add(cm));
+                    }
+                }
+                Change::TableOptions {
+                    comment: Some(cm), ..
+                } => out.push(table.set(Some(cm))),
+                _ => {}
+            }
+        }
         for c in &admitted {
             if let Change::RenameTable { to } = c {
                 out.push(tsql_rename(&q, to, None));
@@ -6418,6 +6455,99 @@ fn tsql_drop_default(qtable: &str, column: &str) -> String {
     )
 }
 
+/// Where a SQL Server comment lives: the `MS_Description` extended property on
+/// `schema.table`, or on its `column`. It is what SSMS writes and what every
+/// SQL Server tool, `db::mssql`'s introspection included, reads as the
+/// comment.
+struct TsqlComment<'a> {
+    schema: &'a str,
+    table: &'a str,
+    column: Option<&'a str>,
+}
+
+impl TsqlComment<'_> {
+    /// The procedure arguments that name the object, level by level. The names
+    /// are string arguments, taken literally, so they are not bracketed.
+    fn path(&self) -> String {
+        let mut out = format!(
+            "@level0type = N'SCHEMA', @level0name = {}, @level1type = N'TABLE', @level1name = {}",
+            tsql_n(self.schema),
+            tsql_n(self.table)
+        );
+        if let Some(c) = self.column {
+            out.push_str(&format!(
+                ", @level2type = N'COLUMN', @level2name = {}",
+                tsql_n(c)
+            ));
+        }
+        out
+    }
+
+    fn call(&self, proc: &str, value: Option<&str>) -> String {
+        let value = value
+            .map(|v| format!("@value = {}, ", tsql_n(v)))
+            .unwrap_or_default();
+        format!(
+            "EXEC {proc} @name = N'MS_Description', {value}{}",
+            self.path()
+        )
+    }
+
+    /// Add the comment to an object that has none — one this plan creates.
+    fn add(&self, text: &str) -> String {
+        format!("{};", self.call("sp_addextendedproperty", Some(text)))
+    }
+
+    /// Set the comment to `text`, or clear it when `text` is empty or `None`,
+    /// **whether or not one is there** — which is looked up as the plan runs,
+    /// as [`tsql_drop_default`] looks up its constraint, rather than trusted
+    /// from a read that could be stale by Apply. One statement with no `;`
+    /// inside, for the same reason as that one.
+    fn set(&self, text: Option<&str>) -> String {
+        let q = |s: &str| ddl_ident_in(s, SqlDialect::MsSql);
+        let object = tsql_n(&format!("{}.{}", q(self.schema), q(self.table)));
+        let minor = match self.column {
+            Some(c) => format!(
+                "COLUMNPROPERTY(OBJECT_ID({object}), {}, 'ColumnId')",
+                tsql_n(c)
+            ),
+            None => "0".to_string(),
+        };
+        let exists = format!(
+            "EXISTS (SELECT 1 FROM sys.extended_properties WHERE class = 1 \
+             AND major_id = OBJECT_ID({object}) AND minor_id = {minor} \
+             AND name = N'MS_Description')"
+        );
+        match text.filter(|t| !t.is_empty()) {
+            Some(t) => format!(
+                "IF {exists} {} ELSE {};",
+                self.call("sp_updateextendedproperty", Some(t)),
+                self.call("sp_addextendedproperty", Some(t))
+            ),
+            None => format!(
+                "IF {exists} {};",
+                self.call("sp_dropextendedproperty", None)
+            ),
+        }
+    }
+}
+
+/// [`TsqlComment::add`] for `crate::schema`'s *Script table as CREATE*, which
+/// restates the comments it read the same way this module writes new ones.
+pub(crate) fn tsql_add_comment(
+    schema: &str,
+    table: &str,
+    column: Option<&str>,
+    text: &str,
+) -> String {
+    TsqlComment {
+        schema,
+        table,
+        column,
+    }
+    .add(text)
+}
+
 /// One column's `AlterColumn` in T-SQL, after its rename (so by `to.name`).
 ///
 /// **`ALTER COLUMN` restates type and nullability together**, since T-SQL
@@ -6509,14 +6639,12 @@ fn writes_index_method(dialect: SqlDialect) -> bool {
 /// `CREATE TABLE` (plus, on PostgreSQL, the statements its `CREATE TABLE` can't
 /// carry: indexes and comments).
 fn create_table_sql(d: &TableDraft, dialect: SqlDialect) -> Vec<String> {
-    let pg = dialect == SqlDialect::Postgres;
     // SQLite sides with PostgreSQL on indexes — they are statements of their own,
     // there being no inline `KEY` — and has neither engine's table options.
     let sqlite = dialect == SqlDialect::Sqlite;
     // SQL Server sides with them too — T-SQL has no inline non-key index — and
     // has none of MySQL's table options, nor a comment clause (its comments are
-    // extended properties, and `supports_comments` keeps the designer from
-    // taking one).
+    // extended properties, added after the table below).
     let separate_indexes = !inlines_indexes(dialect);
     let q = |s: &str| ddl_ident_in(s, dialect);
     let qname = qualified(&d.name, d.schema.as_deref(), dialect);
@@ -6642,20 +6770,52 @@ fn create_table_sql(d: &TableDraft, dialect: SqlDialect) -> Vec<String> {
             out.push(create_index_sql(&ix.info, &qname, dialect));
         }
     }
-    if pg {
-        if let Some(c) = d.comment.as_deref().filter(|c| !c.is_empty()) {
-            out.push(format!(
-                "COMMENT ON TABLE {qname} IS {};",
-                ddl_string(c, dialect)
-            ));
-        }
-        for c in &d.columns {
-            if let Some(cm) = c.info.comment.as_deref().filter(|s| !s.is_empty()) {
-                out.push(comment_on_column(&qname, &c.info.name, Some(cm), dialect));
+    // Comments that are statements of their own, once the table exists:
+    // MySQL's went into `COMMENT=` above, and SQLite has none.
+    match dialect {
+        SqlDialect::MySql | SqlDialect::Sqlite => {}
+        SqlDialect::Postgres => {
+            if let Some(c) = d.comment.as_deref().filter(|c| !c.is_empty()) {
+                out.push(format!(
+                    "COMMENT ON TABLE {qname} IS {};",
+                    ddl_string(c, dialect)
+                ));
+            }
+            for c in &d.columns {
+                if let Some(cm) = c.info.comment.as_deref().filter(|s| !s.is_empty()) {
+                    out.push(comment_on_column(&qname, &c.info.name, Some(cm), dialect));
+                }
             }
         }
+        // SQL Server's are extended properties.
+        SqlDialect::MsSql => create_table_tsql_comments(d, &mut out),
     }
     out
+}
+
+/// [`create_table_sql`]'s SQL Server comments: the new table's and its
+/// columns' `MS_Description` properties.
+fn create_table_tsql_comments(d: &TableDraft, out: &mut Vec<String>) {
+    let table = TsqlComment {
+        schema: d
+            .schema
+            .as_deref()
+            .unwrap_or(crate::schema::MSSQL_DEFAULT_SCHEMA),
+        table: &d.name,
+        column: None,
+    };
+    if let Some(c) = blank_as_none(d.comment.as_deref()) {
+        out.push(table.add(c));
+    }
+    for c in &d.columns {
+        if let Some(cm) = blank_as_none(c.info.comment.as_deref()) {
+            let on = TsqlComment {
+                column: Some(&c.info.name),
+                ..table
+            };
+            out.push(on.add(cm));
+        }
+    }
 }
 
 // ── Text forms the designer edits ────────────────────────────────────────────
@@ -6860,12 +7020,12 @@ pub fn supports_index_prefix(dialect: SqlDialect) -> bool {
 ///
 /// The designer shows its comment fields exactly where this is true, so a
 /// comment is never typed into a field whose text nothing writes. SQLite has
-/// no comments in the language; SQL Server keeps them as extended properties
-/// (`sp_addextendedproperty`), a statement of its own not written yet.
+/// no comments in the language; SQL Server keeps them as the `MS_Description`
+/// extended property, a statement of its own (`TsqlComment`).
 pub fn supports_comments(dialect: SqlDialect) -> bool {
     match dialect {
-        SqlDialect::MySql | SqlDialect::Postgres => true,
-        SqlDialect::Sqlite | SqlDialect::MsSql => false,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::MsSql => true,
+        SqlDialect::Sqlite => false,
     }
 }
 
@@ -9984,9 +10144,8 @@ pub fn supports_change(dialect: SqlDialect, change: &Change) -> bool {
 /// work:** switching an identity on or off (T-SQL cannot — the column is
 /// dropped and re-added, which loses its values), and changing a computed
 /// column or turning a column into or out of one (the same). Also refused, as
-/// unfinished work: a comment (T-SQL keeps them as extended properties, not
-/// written yet — `supports_comments`), a column's position (T-SQL has no
-/// reorder), MariaDB's inline check, a primary key whose constraint name was
+/// unfinished work: a column's position (T-SQL has no reorder), MariaDB's
+/// inline check, a primary key whose constraint name was
 /// not read (T-SQL drops it by name), and an unnamed check (the same). The
 /// view, trigger and routine editors need a `Create` and a `Replace` besides
 /// their drop, so they stay off.
@@ -10008,6 +10167,12 @@ fn tsql_supports(change: &Change) -> bool {
         | Change::DropForeignKey { .. }
         | Change::AddCheck(_) => true,
         Change::AddColumn { position, .. } => position.is_none(),
+        // The comment alone: engine and collation are MySQL's table options.
+        Change::TableOptions {
+            engine: None,
+            collation: None,
+            comment: Some(_),
+        } => true,
         Change::DropCheck { name } => !name.is_empty(),
         Change::PrimaryKey {
             from,
@@ -10015,8 +10180,8 @@ fn tsql_supports(change: &Change) -> bool {
             ..
         } => from.is_empty() || drop_constraint.is_some(),
         // **Admitted when everything that differs is something the emitter
-        // writes** — the rename, and `tsql_alter_column`'s type, collation,
-        // nullability and default — asked of `columns_equal`, the comparison
+        // writes** — the rename, `tsql_alter_column`'s type, collation,
+        // nullability and default, and the comment — asked of `columns_equal`, the comparison
         // that raised the change. A denylist of the fields it cannot write
         // would admit the next one nobody listed (`identity_always`,
         // `on_update`, …) as a change that emits nothing and never converges.
@@ -10033,6 +10198,7 @@ fn tsql_supports(change: &Change) -> bool {
                 collation: to.collation.clone(),
                 default: to.default.clone(),
                 primary_key: to.primary_key,
+                comment: to.comment.clone(),
                 ..(**from).clone()
             };
             position.is_none()
@@ -13011,8 +13177,9 @@ mod tests {
     }
 
     /// Nothing MySQL-only reaches a SQL Server statement even when the draft
-    /// carries it — an engine, a table collation, a comment, `ON UPDATE`,
-    /// `INVISIBLE`, an index method.
+    /// carries it — an engine, a table collation, a `COMMENT` clause (a
+    /// comment is an extended property there), `ON UPDATE`, `INVISIBLE`, an
+    /// index method.
     #[test]
     fn create_table_on_sql_server_writes_no_mysql_options() {
         let mut d = mssql_draft();
@@ -13036,6 +13203,118 @@ mod tests {
         ] {
             assert!(!sql.contains(word), "{word} in {sql}");
         }
+    }
+
+    /// **A SQL Server comment is the `MS_Description` extended property** —
+    /// what SSMS writes and every SQL Server tool reads — added after the
+    /// table that carries it, by the level path schema ▸ table ▸ column.
+    #[test]
+    fn create_table_on_sql_server_writes_comments_as_extended_properties() {
+        let mut d = mssql_draft();
+        d.comment = Some("people's list".into());
+        d.columns[1].info.comment = Some("login".into());
+        let stmts = create(&d, MsSql).emit();
+        assert_eq!(
+            &stmts[2..],
+            [
+                "EXEC sp_addextendedproperty @name = N'MS_Description', \
+                 @value = N'people''s list', @level0type = N'SCHEMA', @level0name = N'sales', \
+                 @level1type = N'TABLE', @level1name = N'people';",
+                "EXEC sp_addextendedproperty @name = N'MS_Description', \
+                 @value = N'login', @level0type = N'SCHEMA', @level0name = N'sales', \
+                 @level1type = N'TABLE', @level1name = N'people', \
+                 @level2type = N'COLUMN', @level2name = N'email';",
+            ]
+        );
+    }
+
+    /// **An edit sets a comment without knowing whether one is there**: the
+    /// property is updated if it exists and added if not, decided as the plan
+    /// runs — as `tsql_drop_default` looks its constraint up — and in one
+    /// statement with no `;` inside, so Open in editor keeps it whole. A
+    /// cleared comment drops the property, if there is one.
+    ///
+    /// **By the names the other phases leave**: a renamed column's comment
+    /// names it as renamed, and the table by its old name, which the table's
+    /// own rename — last — has not changed yet.
+    #[test]
+    fn sql_server_sets_and_clears_comments_by_the_names_the_plan_leaves() {
+        let from = ColumnInfo {
+            comment: Some("old".into()),
+            ..ms_col("qty", "int")
+        };
+        let to = ColumnInfo {
+            name: "amount".into(),
+            comment: Some("how many".into()),
+            ..from.clone()
+        };
+        let set = ChangeSet {
+            changes: vec![
+                ms_alter(from.clone(), to.clone()),
+                Change::TableOptions {
+                    engine: None,
+                    collation: None,
+                    comment: Some(String::new()),
+                },
+                Change::RenameTable { to: "t2".into() },
+            ],
+            ..single("t", Some("dbo"), MsSql, Change::DropTable)
+        };
+        assert!(set.changes.iter().all(|c| supports_change(MsSql, c)));
+        let stmts = set.emit();
+        let lookup = |minor: &str| {
+            format!(
+                "EXISTS (SELECT 1 FROM sys.extended_properties WHERE class = 1 \
+                 AND major_id = OBJECT_ID(N'[dbo].[t]') AND minor_id = {minor} \
+                 AND name = N'MS_Description')"
+            )
+        };
+        let col_path = "@level0type = N'SCHEMA', @level0name = N'dbo', \
+                        @level1type = N'TABLE', @level1name = N't', \
+                        @level2type = N'COLUMN', @level2name = N'amount'";
+        let column = format!(
+            "IF {} EXEC sp_updateextendedproperty @name = N'MS_Description', \
+             @value = N'how many', {col_path} \
+             ELSE EXEC sp_addextendedproperty @name = N'MS_Description', \
+             @value = N'how many', {col_path};",
+            lookup("COLUMNPROPERTY(OBJECT_ID(N'[dbo].[t]'), N'amount', 'ColumnId')")
+        );
+        let table = format!(
+            "IF {} EXEC sp_dropextendedproperty @name = N'MS_Description', \
+             @level0type = N'SCHEMA', @level0name = N'dbo', \
+             @level1type = N'TABLE', @level1name = N't';",
+            lookup("0")
+        );
+        let at = |s: &str| {
+            stmts
+                .iter()
+                .position(|x| x == s)
+                .unwrap_or_else(|| panic!("{s}\nnot in {stmts:#?}"))
+        };
+        let rename_col = stmts.iter().position(|s| s.contains("N'COLUMN';")).unwrap();
+        let rename_table = stmts.iter().position(|s| s.contains("N't2'")).unwrap();
+        assert!(rename_col < at(&column) && at(&column) < rename_table);
+        assert!(at(&table) < rename_table);
+        // A comment the column gains as it is added needs no lookup.
+        let added = single(
+            "t",
+            Some("dbo"),
+            MsSql,
+            Change::AddColumn {
+                column: Box::new(ColumnInfo {
+                    comment: Some("new".into()),
+                    ..ms_col("c", "int")
+                }),
+                position: None,
+            },
+        )
+        .emit();
+        assert_eq!(
+            added[1],
+            "EXEC sp_addextendedproperty @name = N'MS_Description', @value = N'new', \
+             @level0type = N'SCHEMA', @level0name = N'dbo', @level1type = N'TABLE', \
+             @level1name = N't', @level2type = N'COLUMN', @level2name = N'c';"
+        );
     }
 
     /// An `AlterColumn` on SQL Server from `from` to `to`.
@@ -13099,6 +13378,18 @@ mod tests {
             Change::DropForeignKey { name: "fk".into() },
             Change::AddCheck(Box::default()),
             Change::DropCheck { name: "ck".into() },
+            ms_alter(
+                ms_col("c", "int"),
+                ColumnInfo {
+                    comment: Some("counted".into()),
+                    ..ms_col("c", "int")
+                },
+            ),
+            Change::TableOptions {
+                engine: None,
+                collation: None,
+                comment: Some("people".into()),
+            },
         ];
         for c in &yes {
             assert!(supports_change(MsSql, c), "{c:?}");
@@ -13138,13 +13429,6 @@ mod tests {
                 },
             ),
             ms_alter(ms_col("c", "int"), computed),
-            ms_alter(
-                ms_col("c", "int"),
-                ColumnInfo {
-                    comment: Some("counted".into()),
-                    ..ms_col("c", "int")
-                },
-            ),
             Change::PrimaryKey {
                 from: vec!["a".into()],
                 to: vec!["b".into()],
@@ -13153,8 +13437,9 @@ mod tests {
             Change::DropCheck {
                 name: String::new(),
             },
+            // A table option other than the comment is MySQL's.
             Change::TableOptions {
-                engine: None,
+                engine: Some("InnoDB".into()),
                 collation: None,
                 comment: Some("people".into()),
             },
@@ -13806,8 +14091,10 @@ mod tests {
 
     #[test]
     fn comments_are_offered_where_they_are_written() {
-        assert!(supports_comments(MySql) && supports_comments(Postgres));
-        assert!(!supports_comments(Sqlite) && !supports_comments(MsSql));
+        assert!(
+            supports_comments(MySql) && supports_comments(Postgres) && supports_comments(MsSql)
+        );
+        assert!(!supports_comments(Sqlite));
     }
 
     /// Each engine names its server-assigned key its own way.

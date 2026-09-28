@@ -3205,10 +3205,11 @@ existing prose was left alone.
     `fk_actions(dialect)` is the action dropdown's list — and `propose::is_fk_action`'s, under
     `propose.rs` — `FK_ACTIONS` less `RESTRICT` on SQL Server,
     whose refusing action is `NO ACTION` — already the first entry — so the other was an entry whose
-    every use is a syntax error. `supports_comments(dialect)` is MySQL's and PostgreSQL's: SQLite has
-    no comments in the language, and SQL Server keeps them as extended properties
-    (`sp_addextendedproperty`), a statement not written yet, so both comment fields are hidden there
-    rather than typed into and dropped. `identity_wording(dialect)` is the key toggle's label and
+    every use is a syntax error. `supports_comments(dialect)` is false on SQLite alone, which has no
+    comments in the language, so both comment fields are hidden there rather than typed into and
+    dropped. It was false on SQL Server too until the emitter wrote that engine's comments, which
+    are the `MS_Description` extended property — a statement of its own, `TsqlComment`, under
+    `mssql.rs`. `identity_wording(dialect)` is the key toggle's label and
     hint, naming the keyword `definition_sql` writes — it read *Auto-increment (AUTO_INCREMENT)* on
     SQL Server. `supports_index_prefix(dialect)` is MySQL's alone, and the index key hint names the
     `bio(20)` prefix syntax only there; it named it on every engine but PostgreSQL.
@@ -3801,7 +3802,9 @@ existing prose was left alone.
     **SQL Server's `create_table_sql` sides with PostgreSQL and SQLite on indexes** — T-SQL has no
     inline non-key index, so each is a `CREATE [UNIQUE] INDEX` after the table, and
     `create_index_sql` writes no `USING` there (`writes_index_method`), the method clause not being
-    T-SQL's — and it takes none of MySQL's `ENGINE=`/`COLLATE=`/`COMMENT=`. So the split is asked of
+    T-SQL's — and it takes none of MySQL's `ENGINE=`/`COLLATE=`/`COMMENT=`: the table's and the
+    columns' comments follow the table as `sp_addextendedproperty` calls, as PostgreSQL's follow it
+    as `COMMENT ON` (`create_table_on_sql_server_writes_comments_as_extended_properties`). So the split is asked of
     two private capabilities, `inlines_indexes` and `takes_table_options`, both MySQL's alone, where
     it had been `!pg && !sqlite` — a test a fourth engine passes as MySQL. The columns are
     `ColumnInfo::definition_sql`'s T-SQL arm (under `schema.rs`), and a check writes no
@@ -10597,7 +10600,8 @@ existing prose was left alone.
   constraint backs, `DROP INDEX [i] ON t` otherwise); then dropped columns, each after its
   default's drop; **then** the column renames, `EXEC sp_rename N'[s].[t].[c]', N'new',
   N'COLUMN';`; then altered columns (`tsql_alter_column`), added columns, the keys, checks and
-  foreign keys, the `CREATE INDEX`es; and the table's own `sp_rename` last, the new name bare
+  foreign keys, the `CREATE INDEX`es; then the comments, by the columns' new names and the table's
+  old one; and the table's own `sp_rename` last, the new name bare
   because the procedure takes it literally and brackets would become part of it — so every
   earlier statement names the table as it was (`sql_server_orders_a_designer_plan`, which also
   doubles a quote inside `N'…'`, through `ddl_string` — `tsql_n` is that one literal rule, not a
@@ -10628,6 +10632,15 @@ existing prose was left alone.
   on a batch-separator dialect, since SQL Server's tools run a paste as one batch and two dropped
   columns' lookups each `DECLARE @df` — Msg 134 before anything ran
   (`a_copied_sql_server_plan_is_one_batch_a_statement`).
+  **A comment is the `MS_Description` extended property, and an edit sets it without trusting the
+  read** (`TsqlComment`). On a table the plan creates, or a column it adds, there is none yet, so
+  `add` is a plain `EXEC sp_addextendedproperty`. Anything else is `set`: `IF EXISTS (SELECT 1 FROM
+  sys.extended_properties …) EXEC sp_updateextendedproperty … ELSE EXEC sp_addextendedproperty …;`,
+  or, clearing it, the `IF EXISTS` in front of `sp_dropextendedproperty` alone — the existence
+  looked up as the plan runs, as `tsql_drop_default` looks up its constraint, so a read gone stale
+  by Apply cannot make it fail, and one statement with no `;` inside for that one's reason. The
+  procedures take their names as literal strings, so the level path is unbracketed `N'…'`s
+  (`sql_server_sets_and_clears_comments_by_the_names_the_plan_leaves`).
   `tsql_alter_column` restates **both** type and nullability, with the collation, whenever any of
   them changed, since T-SQL resets what `ALTER COLUMN` isn't told — a retype that left `NOT NULL`
   off would make the column nullable — and an identity is always altered `NOT NULL`. **A default
@@ -10663,17 +10676,18 @@ existing prose was left alone.
   there, but the emitter is right by construction now
   (`a_sql_server_schema_named_public_is_still_named`).
   **`tsql_supports`' `AlterColumn` arm is an allowlist.** It copies `to`'s name, type,
-  nullability, collation, default and key flag onto `from` — the fields `tsql_alter_column` and
-  the rename write — and admits the change only if that already equals `to` under `columns_equal`,
+  nullability, collation, default, key flag and comment onto `from` — the fields `tsql_alter_column`,
+  the rename and the comment phase write — and admits the change only if that already equals `to` under `columns_equal`,
   with no position, no inline check and neither side computed. A list of the fields it cannot
   write would have admitted the next one nobody listed (`identity_always`, `on_update`, …) as a
   change that emits nothing and so never converges; the comparison that raised the change is the
   one that knows every field (`a_sql_server_column_change_is_admitted_only_when_it_is_written`).
   **What it refuses comes in two kinds.** Facts about T-SQL's `ALTER COLUMN`: an identity switched
   on or off, and a computed column changed or a column turned into or out of one — each is a drop
-  and re-add, which would lose the column's values. Unfinished work: comments (extended
-  properties), a column's position (T-SQL has no reorder), MariaDB's inline check, and an unnamed
-  check or a primary key whose constraint name wasn't read, since T-SQL drops both by name.
+  and re-add, which would lose the column's values. Unfinished work: a column's position (T-SQL has
+  no reorder), MariaDB's inline check, and an unnamed check or a primary key whose constraint name
+  wasn't read, since T-SQL drops both by name. A `TableOptions` is admitted only as the comment
+  alone — engine and collation are MySQL's table options.
   **Introspection marks a clustered index other than the primary key's `lossy`**: `IndexInfo` has
   no clustered flag, so recreating one wrote a plain `CREATE INDEX` and left the table a heap; an
   edit to one is now a `KeepLossyIndex` the preview names, and nothing is emitted for it
@@ -10696,11 +10710,13 @@ existing prose was left alone.
   `a_designer_edit_keeps_what_it_did_not_change` holds the review's findings to
   the server at once — named defaults kept across a retype and untouched by a nullability change, a
   check re-pointed around a rename, a nullable column keyed, a column added `WITH VALUES`, a
-  disabled check still disabled, the key's name kept, and the result round-tripping.
+  disabled check still disabled, the key's name kept, and the result round-tripping;
+  `comments_are_set_changed_and_cleared` sets, changes and clears table and column comments,
+  whether or not one was there and by the names the plan's renames leave, reading each back.
   **Two known limits, both loud**: retyping a column an index or the primary key covers is refused
   by the server while the index exists, and renaming a column a computed column references fails;
-  each fails the plan and rolls it back whole. Still not done: comments, and the view, routine and
-  trigger editors.
+  each fails the plan and rolls it back whole. Still not done: the view, routine and trigger
+  editors.
   **`DATABASE_LISTING` asks `HAS_DBACCESS` inside a `CASE`, and only of a multi-user database.**
   On one another session holds `SINGLE_USER`, that call took 2,174 ms against 150 ms (SQL Server
   2022 CU27) — what an administrator's maintenance window would cost every tree refresh — and a
@@ -10729,8 +10745,10 @@ existing prose was left alone.
   (`tsql_create_ddl` — the identity with the seed and increment `sys.identity_columns` reported,
   and `(1,1)` with a comment saying so only where they were not read, named primary-key and unique
   constraints, checks, `AS (…) PERSISTED`, other indexes as separate
-  statements and what it cannot restate named in a comment; a view is its stored definition), held
-  to the server by `a_tables_ddl_rebuilds_the_table_it_was_read_from`; a trigger's DDL is its stored
+  statements, the table's and columns' comments after them through `ddl::tsql_add_comment` — the
+  same `sp_addextendedproperty` the emitter writes (`create_ddl_sql_server_restates_the_comments`)
+  — and what it cannot restate named in a comment; a view is its stored definition), held
+  to the server, comments included, by `a_tables_ddl_rebuilds_the_table_it_was_read_from`; a trigger's DDL is its stored
   statement and a schema script closes each object's batch with `GO` (`TriggerInfo::create_sql`,
   `ddl::join_scripts`, both under `schema.rs`);
   `activity::from_mssql_rows`/`mssql_state` fold the session rows, drawing no blocking edge to a
@@ -15751,8 +15769,8 @@ existing prose was left alone.
     `default_type`; it is `ddl::default_new_column_type` now — a value, not a capability — and the
     local function is gone, taking one of this file's admitted `engine_comparison_gate` comparisons
     (9 → 8) with it. **SQL Server's Create table took it 8 → 5**: both comment fields — table and
-    column — ask `ddl::supports_comments`, so SQL Server's are hidden rather than typed into and
-    dropped; the identity toggle asks `ddl::identity_wording`, having said *Auto-increment
+    column — ask `ddl::supports_comments`, so SQL Server's were hidden rather than typed into and
+    dropped, until the emitter wrote them and the predicate turned them back on; the identity toggle asks `ddl::identity_wording`, having said *Auto-increment
     (AUTO_INCREMENT)* there; the index key hint asks `ddl::supports_index_prefix`, having named
     MySQL's `bio(20)` prefix on every engine but PostgreSQL. The foreign-key action dropdown lists
     `ddl::fk_actions` besides, which has no `RESTRICT` on SQL Server. The designer opens on an

@@ -4389,6 +4389,18 @@ impl TableInfo {
                 ix.key_sql(d),
             ));
         }
+        let ns = self.schema.as_deref().unwrap_or(MSSQL_DEFAULT_SCHEMA);
+        let comments = std::iter::once((None, &self.comment)).chain(
+            self.columns
+                .iter()
+                .map(|c| (Some(c.name.as_str()), &c.comment)),
+        );
+        for (column, comment) in comments {
+            if let Some(text) = comment.as_deref().filter(|s| !s.is_empty()) {
+                out.push('\n');
+                out.push_str(&crate::ddl::tsql_add_comment(ns, &self.name, column, text));
+            }
+        }
         out
     }
 
@@ -7352,6 +7364,33 @@ mod tests {
         // A column the designer made has none, and gets the default counter.
         id.identity_spec = None;
         assert_eq!(id.tsql_definition(), "[id] bigint IDENTITY(1,1) NOT NULL");
+    }
+
+    /// A table's and its columns' comments are restated, as the extended
+    /// properties they were read from, after the table.
+    #[test]
+    fn create_ddl_sql_server_restates_the_comments() {
+        let mut id = col("id", "int", false, true);
+        id.comment = Some("the key".into());
+        let t = TableInfo {
+            schema: Some("sales".into()),
+            name: "t".into(),
+            comment: Some("people".into()),
+            columns: vec![id, col("n", "int", true, false)],
+            ..Default::default()
+        };
+        let ddl = t.create_ddl(crate::intel::SqlDialect::MsSql);
+        assert!(
+            ddl.ends_with(
+                ");\nEXEC sp_addextendedproperty @name = N'MS_Description', @value = N'people', \
+                 @level0type = N'SCHEMA', @level0name = N'sales', @level1type = N'TABLE', \
+                 @level1name = N't';\n\
+                 EXEC sp_addextendedproperty @name = N'MS_Description', @value = N'the key', \
+                 @level0type = N'SCHEMA', @level0name = N'sales', @level1type = N'TABLE', \
+                 @level1name = N't', @level2type = N'COLUMN', @level2name = N'id';"
+            ),
+            "{ddl}"
+        );
     }
 
     /// SQL Server's table is written in its own shape — `IDENTITY`, named
