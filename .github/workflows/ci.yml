@@ -205,6 +205,21 @@ jobs:
         options: >-
           --health-cmd="/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P Schemaic_2026 -C -Q 'SELECT 1'"
           --health-interval=10s --health-timeout=10s --health-retries=24
+      # **SQL Server 2025 too**, on 1434, for the leg's second run below. The
+      # builtin catalog spans both versions — 2025's names are a block of
+      # their own that a 2022 server is held to *not* knowing — so each
+      # direction needs a server that can answer it.
+      mssql2025:
+        image: mcr.microsoft.com/mssql/server:2025-latest
+        env:
+          ACCEPT_EULA: "Y"
+          MSSQL_PID: Developer
+          MSSQL_SA_PASSWORD: Schemaic_2026
+        ports:
+          - 1434:1433
+        options: >-
+          --health-cmd="/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P Schemaic_2026 -C -Q 'SELECT 1'"
+          --health-interval=10s --health-timeout=10s --health-retries=24
     steps:
       - uses: actions/checkout@v5
       # No GUI packages: this builds `schemaic-db` and `schemaic-core` only,
@@ -216,10 +231,11 @@ jobs:
       # setting, which is why the test only reads it and this step — on a
       # throwaway container — is what sets it.
       - name: Enable contained database authentication
-        run: >-
-          docker exec ${{ job.services.mssql.id }}
-          /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P Schemaic_2026 -C
-          -Q "EXEC sp_configure 'contained database authentication', 1; RECONFIGURE"
+        run: |
+          for id in ${{ job.services.mssql.id }} ${{ job.services.mssql2025.id }}; do
+            docker exec "$id" /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P Schemaic_2026 -C \
+              -Q "EXEC sp_configure 'contained database authentication', 1; RECONFIGURE"
+          done
       # **The root account, not `schemaic`.** A `MYSQL_USER` created by the image
       # is granted rights on `MYSQL_DATABASE` alone, so it cannot create the
       # scratch database each test works in. PostgreSQL's `POSTGRES_USER` is the
@@ -233,5 +249,15 @@ jobs:
           SCHEMAIC_IT_MYSQL_PASSWORD: schemaic
           SCHEMAIC_IT_PG_USER: schemaic
           SCHEMAIC_IT_PG_PASSWORD: schemaic
+          SCHEMAIC_IT_MSSQL_USER: sa
+          SCHEMAIC_IT_MSSQL_PASSWORD: Schemaic_2026
+      # The SQL Server leg again, on 2025. `SCHEMAIC_IT_ENGINES=mssql` leaves
+      # the other engines' legs to the step above; the `mssql::` filter keeps
+      # the run to that leg's own tests.
+      - name: Test (live, SQL Server 2025)
+        run: cargo test -p schemaic-db --features live-tests --test live -- mssql::
+        env:
+          SCHEMAIC_IT_ENGINES: mssql
+          SCHEMAIC_IT_MSSQL_PORT: "1434"
           SCHEMAIC_IT_MSSQL_USER: sa
           SCHEMAIC_IT_MSSQL_PASSWORD: Schemaic_2026

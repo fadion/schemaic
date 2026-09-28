@@ -12690,6 +12690,18 @@ mod tests {
             "SQL Server's own is missing"
         );
         assert!(
+            [
+                "regexp_like",
+                "unistr",
+                "product",
+                "current_date",
+                "json_objectagg"
+            ]
+            .iter()
+            .all(|n| catalog_knows(SqlDialect::MsSql, n)),
+            "SQL Server 2025's names are missing"
+        );
+        assert!(
             !catalog_knows(SqlDialect::MsSql, "curdate"),
             "SQL Server got MySQL's catalog"
         );

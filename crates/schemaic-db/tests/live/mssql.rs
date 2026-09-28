@@ -2702,21 +2702,45 @@ async fn every_builtin_snippet_runs() {
 /// function name*, where a builtin called with the wrong arguments fails some
 /// other way — and nothing runs either time. So each entry is called with no
 /// arguments, in `FROM` for the rowset ones and bare for the niladic ones, and
-/// only a 195 fails the test. It checks the over-listing direction; a builtin
-/// the list lacks has no oracle.
+/// only a 195 fails the test — or, for a rowset one, a 208, *invalid object
+/// name*, which is how `FROM` answers a name it does not know. It checks the
+/// over-listing direction; a builtin the list lacks has no oracle.
+///
+/// **Version-aware.** On a server older than 2025 the [`NEWER_THAN_2022`]
+/// block is excused — and held to the opposite answer, unknown, so the excuse
+/// cannot hide a name that server does have. On 2025 the scratch database
+/// turns `PREVIEW_FEATURES` on first, since five of that block parse only
+/// behind it.
 #[tokio::test(flavor = "multi_thread")]
 async fn every_catalogued_builtin_is_one_the_server_knows() {
     if !enabled() {
         return;
     }
     let s = Scratch::create("builtins").await;
-    // The oracle can see a failure: a name nobody has is a 195 on this path.
+    let major: u32 = s
+        .scalar("SELECT CAST(SERVERPROPERTY('ProductMajorVersion') AS int)")
+        .await
+        .parse()
+        .expect("a major version");
+    let has_2025 = major >= 17;
+    if has_2025 {
+        s.exec("ALTER DATABASE SCOPED CONFIGURATION SET PREVIEW_FEATURES = ON")
+            .await;
+    }
+    // The oracle can see a failure: a name nobody has is a 195 on this path,
+    // and a 208 in `FROM`.
     let bogus = s
         .try_exec("SELECT SCHEMAIC_NO_SUCH_FUNCTION()")
         .await
         .expect_err("an unknown function");
     assert!(bogus.to_string().contains("(Msg 195"), "{bogus}");
+    let bogus = s
+        .try_exec("SELECT * FROM SCHEMAIC_NO_SUCH_FUNCTION()")
+        .await
+        .expect_err("an unknown rowset function");
+    assert!(bogus.to_string().contains("(Msg 208"), "{bogus}");
     const ROWSET: &[&str] = &[
+        "AI_GENERATE_CHUNKS",
         "CONTAINSTABLE",
         "FREETEXTTABLE",
         "GENERATE_SERIES",
@@ -2726,24 +2750,95 @@ async fn every_catalogued_builtin_is_one_the_server_knows() {
         "OPENROWSET",
         "OPENXML",
         "PREDICT",
+        "REGEXP_MATCHES",
+        "REGEXP_SPLIT_TO_TABLE",
         "STRING_SPLIT",
     ];
     let mut unknown = Vec::new();
+    let mut not_new = Vec::new();
     for f in schemaic_core::mssql_builtins::MSSQL_FUNCTIONS {
-        let call = if !f.signature.contains('(') {
-            format!("SELECT {}", f.name)
+        let (call, not_known) = if !f.signature.contains('(') {
+            // A niladic name 2022 lacks is a keyword there (`CURRENT_DATE`,
+            // Msg 156) or a column it cannot find (207).
+            (format!("SELECT {}", f.name), ["(Msg 156", "(Msg 207"])
         } else if ROWSET.contains(&f.name) {
-            format!("SELECT * FROM {}()", f.name)
+            (
+                format!("SELECT * FROM {}()", f.name),
+                ["(Msg 208", "(Msg 195"],
+            )
         } else {
-            format!("SELECT {}()", f.name)
+            (format!("SELECT {}()", f.name), ["(Msg 195", "(Msg 195"])
         };
-        if let Err(e) = s.try_exec(&call).await
-            && e.to_string().contains("(Msg 195")
+        let err = s.try_exec(&call).await.err().map(|e| e.to_string());
+        let is_unknown = |e: &String| not_known.iter().any(|m| e.contains(m));
+        if !has_2025 && NEWER_THAN_2022.contains(&f.name) {
+            if !err.as_ref().is_some_and(is_unknown) {
+                not_new.push(format!("{}: {err:?}", f.name));
+            }
+            continue;
+        }
+        // Only 195/208 fail the known direction: a keyword or a column answer
+        // on a niladic name is not a verdict about builtins. `PREDICT` is the
+        // one rowset name the 208 cannot judge — with no `MODEL =` inside, both
+        // versions read `PREDICT()` as a table, and with one they report a
+        // corrupt model (Msg 39051), so it is checked by 195 alone.
+        let judged_by_208 = ROWSET.contains(&f.name) && f.name != "PREDICT";
+        if let Some(e) = err
+            && (e.contains("(Msg 195") || (judged_by_208 && e.contains("(Msg 208")))
         {
             unknown.push(format!("{}: {e}", f.name));
         }
     }
     assert!(unknown.is_empty(), "{unknown:#?}");
+    assert!(
+        not_new.is_empty(),
+        "excused as SQL Server 2025's but known to {major}: {not_new:#?}"
+    );
+}
+
+/// The names [`schemaic_core::mssql_builtins`] holds that a server before
+/// SQL Server 2025 (major version 17) does not — the catalog's last block,
+/// name for name. See [`every_catalogued_builtin_is_one_the_server_knows`].
+const NEWER_THAN_2022: &[&str] = &[
+    "REGEXP_LIKE",
+    "REGEXP_REPLACE",
+    "REGEXP_SUBSTR",
+    "REGEXP_INSTR",
+    "REGEXP_COUNT",
+    "REGEXP_MATCHES",
+    "REGEXP_SPLIT_TO_TABLE",
+    "EDIT_DISTANCE",
+    "EDIT_DISTANCE_SIMILARITY",
+    "JARO_WINKLER_DISTANCE",
+    "JARO_WINKLER_SIMILARITY",
+    "UNISTR",
+    "PRODUCT",
+    "CURRENT_DATE",
+    "BASE64_ENCODE",
+    "BASE64_DECODE",
+    "JSON_ARRAYAGG",
+    "JSON_OBJECTAGG",
+    "JSON_CONTAINS",
+    "VECTOR_DISTANCE",
+    "VECTOR_NORM",
+    "VECTOR_NORMALIZE",
+    "VECTORPROPERTY",
+    "AI_GENERATE_EMBEDDINGS",
+    "AI_GENERATE_CHUNKS",
+];
+
+/// **The excuse is the catalog's last block, exactly.** A name added to the
+/// 2025 block without this list fails 2022's oracle, and the reverse — a list
+/// entry the catalog has dropped — would excuse nothing; both are caught here
+/// without a server.
+#[test]
+fn the_2025_excuse_is_the_catalogs_last_block() {
+    let catalog = schemaic_core::mssql_builtins::MSSQL_FUNCTIONS;
+    let tail: Vec<&str> = catalog[catalog.len() - NEWER_THAN_2022.len()..]
+        .iter()
+        .map(|f| f.name)
+        .collect();
+    assert_eq!(tail, NEWER_THAN_2022);
 }
 
 // ── Manual transaction mode ─────────────────────────────────────────────────

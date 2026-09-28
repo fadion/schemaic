@@ -16,9 +16,11 @@
 //! by memory. The other direction, a builtin this list lacks, has no oracle, and
 //! costs a squiggle only where the missing name is a near miss of one held.
 //!
-//! **SQL Server 2022's set.** 2025 adds `REGEXP_*`, `EDIT_DISTANCE`, `UNISTR`,
-//! `PRODUCT` and `CURRENT_DATE`, which the tier's server does not have; they
-//! belong here once a leg can check them. Rowset functions (`OPENJSON`,
+//! **SQL Server 2022's set, then 2025's.** The names 2025 added — `REGEXP_*`,
+//! the fuzzy matchers, `UNISTR`, `PRODUCT`, `CURRENT_DATE`, the JSON
+//! aggregates, the vector and AI functions — are a block of their own at the
+//! end, because that is where the version line falls, and the oracle excuses
+//! exactly that block on a 2022 server. Rowset functions (`OPENJSON`,
 //! `STRING_SPLIT`, `GENERATE_SERIES`, `OPENROWSET`) are listed too — they are
 //! called, in `FROM` — and the oracle calls them there.
 //!
@@ -1202,5 +1204,144 @@ pub const MSSQL_FUNCTIONS: &[SqlFunction] = &[
         "PREDICT",
         "PREDICT(MODEL = model, DATA = source AS alias)",
         "Scores from a stored model (in FROM)",
+    ),
+    // ── New in SQL Server 2025 ───────────────────────────────────────────────
+    //
+    // Kept as one block rather than filed under their categories, because this
+    // is the version line: a 2022 server knows none of these, and
+    // `live::mssql`'s `NEWER_THAN_2022` carries the same names so the oracle
+    // excuses them there and holds them to the parser on a 2025 one. A tab on
+    // 2022 is offered them and cannot call them — the cheap direction, the
+    // same trade MariaDB's newer names make.
+    //
+    // The four fuzzy-matching functions and `AI_GENERATE_CHUNKS` are **preview
+    // features** in 2025: they parse only in a database with `PREVIEW_FEATURES`
+    // on, so without them a user who has turned it on gets a squiggle under
+    // correct SQL. `VECTOR_SEARCH` is documented but not in 17.0 CU9's parser
+    // even then, so it is not here.
+    f(
+        "REGEXP_LIKE",
+        "REGEXP_LIKE(string_expression, pattern_expression [, flags])",
+        "True when the string matches the regular expression (a predicate)",
+    ),
+    f(
+        "REGEXP_REPLACE",
+        "REGEXP_REPLACE(string_expression, pattern_expression [, string_replacement [, start [, occurrence [, flags]]]])",
+        "The string with regular-expression matches replaced",
+    ),
+    f(
+        "REGEXP_SUBSTR",
+        "REGEXP_SUBSTR(string_expression, pattern_expression [, start [, occurrence [, flags [, group]]]])",
+        "One regular-expression match of the string",
+    ),
+    f(
+        "REGEXP_INSTR",
+        "REGEXP_INSTR(string_expression, pattern_expression [, start [, occurrence [, return_option [, flags [, group]]]]])",
+        "Position of a regular-expression match",
+    ),
+    f(
+        "REGEXP_COUNT",
+        "REGEXP_COUNT(string_expression, pattern_expression [, start [, flags]])",
+        "Number of regular-expression matches",
+    ),
+    f(
+        "REGEXP_MATCHES",
+        "REGEXP_MATCHES(string_expression, pattern_expression [, flags])",
+        "Rows of the regular-expression matches (in FROM)",
+    ),
+    f(
+        "REGEXP_SPLIT_TO_TABLE",
+        "REGEXP_SPLIT_TO_TABLE(string_expression, pattern_expression [, flags])",
+        "Rows of the string split on a regular expression (in FROM)",
+    ),
+    f(
+        "EDIT_DISTANCE",
+        "EDIT_DISTANCE(character_expression, character_expression [, maximum_distance])",
+        "Damerau-Levenshtein distance between two strings (preview)",
+    ),
+    f(
+        "EDIT_DISTANCE_SIMILARITY",
+        "EDIT_DISTANCE_SIMILARITY(character_expression, character_expression)",
+        "Edit-distance similarity, 0 to 100 (preview)",
+    ),
+    f(
+        "JARO_WINKLER_DISTANCE",
+        "JARO_WINKLER_DISTANCE(character_expression, character_expression)",
+        "Jaro-Winkler distance between two strings (preview)",
+    ),
+    f(
+        "JARO_WINKLER_SIMILARITY",
+        "JARO_WINKLER_SIMILARITY(character_expression, character_expression)",
+        "Jaro-Winkler similarity, 0 to 100 (preview)",
+    ),
+    f(
+        "UNISTR",
+        "UNISTR('character_expression' [, 'unicode_escape_character'])",
+        "The string with its Unicode escapes decoded",
+    ),
+    f(
+        "PRODUCT",
+        "PRODUCT([ALL | DISTINCT] expression)",
+        "Product of the values",
+    ),
+    f(
+        "CURRENT_DATE",
+        "CURRENT_DATE",
+        "Current date (date), no parentheses",
+    ),
+    f(
+        "BASE64_ENCODE",
+        "BASE64_ENCODE(expression [, url_safe])",
+        "Base64 text of a varbinary value",
+    ),
+    f(
+        "BASE64_DECODE",
+        "BASE64_DECODE(expression)",
+        "The varbinary value of Base64 text",
+    ),
+    f(
+        "JSON_ARRAYAGG",
+        "JSON_ARRAYAGG(value_expression [ORDER BY …] [NULL ON NULL | ABSENT ON NULL])",
+        "The group's values as a JSON array",
+    ),
+    f(
+        "JSON_OBJECTAGG",
+        "JSON_OBJECTAGG(key : value [NULL ON NULL | ABSENT ON NULL])",
+        "The group's key/value pairs as a JSON object",
+    ),
+    f(
+        "JSON_CONTAINS",
+        "JSON_CONTAINS(target_expression, search_value_expression [, path_expression [, search_mode]])",
+        "1 when the JSON document contains the value",
+    ),
+    f(
+        "VECTOR_DISTANCE",
+        "VECTOR_DISTANCE(distance_metric, vector1, vector2)",
+        "Distance between two vectors ('cosine', 'euclidean' or 'dot')",
+    ),
+    f(
+        "VECTOR_NORM",
+        "VECTOR_NORM(vector, norm_type)",
+        "Norm of a vector ('norm1', 'norm2' or 'norminf')",
+    ),
+    f(
+        "VECTOR_NORMALIZE",
+        "VECTOR_NORMALIZE(vector, norm_type)",
+        "The vector scaled to unit length",
+    ),
+    f(
+        "VECTORPROPERTY",
+        "VECTORPROPERTY(vector, property)",
+        "A property of a vector ('Dimensions' or 'BaseType')",
+    ),
+    f(
+        "AI_GENERATE_EMBEDDINGS",
+        "AI_GENERATE_EMBEDDINGS(source USE MODEL model_identifier [PARAMETERS optional_json])",
+        "Embeddings of the text from an external model",
+    ),
+    f(
+        "AI_GENERATE_CHUNKS",
+        "AI_GENERATE_CHUNKS(SOURCE = text, CHUNK_TYPE = FIXED, CHUNK_SIZE = n [, OVERLAP = n])",
+        "Rows of the text cut into chunks (in FROM, preview)",
     ),
 ];

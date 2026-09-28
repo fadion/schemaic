@@ -1451,7 +1451,7 @@ existing prose was left alone.
     `intel::builtin_catalog`, and the one that could be neither generated nor diffed against the
     server. Wiring it in is what turned completion's builtins, signature help and the
     misspelled-function checker on for SQL Server tabs, all three of which had said nothing on the
-    `None` arm until then. `MSSQL_FUNCTIONS` is 267 entries, **written by hand** from Microsoft's
+    `None` arm until then. `MSSQL_FUNCTIONS` is 292 entries, **written by hand** from Microsoft's
     *Functions (Transact-SQL)* reference and grouped by its categories — aggregate, ranking and
     analytic, conversion, date and time, logical, mathematical, bit manipulation, string, JSON,
     system, metadata, security, cryptographic, text and image, rowset. By hand because there is
@@ -1463,15 +1463,42 @@ existing prose was left alone.
     other way; and nothing runs either time. So `live::mssql`'s
     `every_catalogued_builtin_is_one_the_server_knows` calls every entry with no arguments — in
     `FROM` for the rowset functions, bare for the niladic ones such as `CURRENT_TIMESTAMP` (an entry
-    whose signature has no `(`) — and fails only on a 195. It first asserts that a made-up name does
-    come back 195 on the same path, so the test can see a failure at all. **The check is
+    whose signature has no `(`) — and fails on a 195, or, for a rowset function, on the Msg 208
+    *invalid object name* that `FROM` answers for a name it does not know. That second verdict is
+    new, and it was a hole: a made-up rowset name in `FROM` is a 208 and never a 195, so until it
+    landed a bogus rowset entry passed. `PREDICT` alone is judged by 195 only, since an empty
+    `PREDICT()` reads as a table on both versions (and with a `MODEL =` reports Msg 39051, a corrupt
+    model). It first asserts that a made-up name does come back 195 bare and 208 in `FROM`, so the
+    test can see a failure on either path at all. **The check is
     one-directional, and there is no oracle for the other direction**: it catches over-listing, the
     mistake a list written from memory makes, while a builtin the list lacks goes unseen and costs a
     squiggle only where the missing name is a near miss of one held — the partial-catalog failure
-    described under `intel.rs` above, which nothing here rules out. Green on SQL Server 2022.
-    **SQL Server 2022's set, on purpose**: 2025 adds `REGEXP_*`, `EDIT_DISTANCE`, `UNISTR`,
-    `PRODUCT` and `CURRENT_DATE`, which the tier's server does not have, so they wait for a leg that
-    can check them rather than being listed unchecked. Rowset functions (`OPENJSON`,
+    described under `intel.rs` above, which nothing here rules out. Green on SQL Server 2022 and on
+    2025 (17.0.5005.3, RTM-CU9).
+    **SQL Server 2022's set, then 2025's.** The catalog ends with a *New in SQL Server 2025* block of
+    25 names — `REGEXP_*` (two of them rowset), the fuzzy matchers `EDIT_DISTANCE`,
+    `EDIT_DISTANCE_SIMILARITY` and the `JARO_WINKLER_*` pair, `UNISTR`, `PRODUCT`, `CURRENT_DATE`,
+    `BASE64_ENCODE`/`_DECODE`, `JSON_ARRAYAGG`/`JSON_OBJECTAGG`/`JSON_CONTAINS`, the `VECTOR_*`
+    family and `AI_GENERATE_EMBEDDINGS`/`AI_GENERATE_CHUNKS`. It was the 2022 set until the tier had
+    a 2025 server to check these against, and they were held back rather than listed unchecked.
+    **One block at the end, not filed under their categories, because that is the version line** —
+    and it is load-bearing: `live::mssql`'s `NEWER_THAN_2022` names the same 25, and the oracle
+    reads the server's `SERVERPROPERTY('ProductMajorVersion')`. Below 17 it excuses the block *and
+    holds it to the opposite answer* — each name must come back unknown (195 bare, 208 or 195 in
+    `FROM`, 156 or 207 for a niladic one, `CURRENT_DATE` being a keyword on 2022, Msg 156) — so the
+    excuse cannot hide a name 2022 in fact has; on 17 it turns `PREVIEW_FEATURES` on in the scratch
+    database first and holds the block to the parser like any other entry. The server-less
+    `the_2025_excuse_is_the_catalogs_last_block` pins `NEWER_THAN_2022` to the catalog's tail name
+    for name, so a 2025 name filed anywhere else, or added without the excuse, fails without a
+    server. **Five are preview features** — the four fuzzy matchers and `AI_GENERATE_CHUNKS` parse
+    only in a database with `PREVIEW_FEATURES` on — and are listed anyway, since leaving them out
+    squiggles correct SQL for the user who has turned it on. `VECTOR_SEARCH` is documented by
+    Microsoft but is not in 17.0 CU9's parser even then, so it is not listed. **The trade is the
+    cheap direction**: a tab on 2022 is offered these 25 and cannot call them, since nothing tells
+    the catalog which version is in front of the tab — the same trade `intel::FUNCTIONS`'s MariaDB 11
+    block makes against a 10.11 server (`live::mariadb_catalog`'s `NEWER_THAN_BASELINE`). The
+    checker, trusting the catalog whole, likewise stays silent on 2022 over a 2025 name it cannot
+    run; the server's own error is what the user sees there. Rowset functions (`OPENJSON`,
     `STRING_SPLIT`, `GENERATE_SERIES`, `OPENROWSET` …) are listed too — they are called, in `FROM` —
     and the oracle calls them there.
     **Names are upper-case**, like MySQL's `FUNCTIONS` and unlike `SQLITE_FUNCTIONS` and
@@ -11178,7 +11205,7 @@ existing prose was left alone.
   reports the leg a no-op through
   `endpoint::note_leg_no_op` when it is off. CI's live job turns it on before the tests run, in its
   *Enable contained database authentication* step (`sp_configure … 1; RECONFIGURE` through `docker
-  exec` on the throwaway service container), so there the round trip runs rather than reporting
+  exec` on each throwaway service container, 2022's and 2025's), so there the round trip runs rather than reporting
   itself skipped. Server Activity is the one
   split that *is* about the engine: `KILL` ends a session, but no T-SQL statement cancels another
   session's request and leaves the session standing — a cancel is an attention sent by the owner's
@@ -12060,13 +12087,19 @@ existing prose was left alone.
   under `mssql.rs` as well), and the
   three catalogues only it has — `every_allowlisted_function_is_a_builtin` (the read gate's lists,
   by error 195), `every_builtin_snippet_runs`, and `every_catalogued_builtin_is_one_the_server_knows`
-  (`core::mssql_builtins`, by the same error 195 and in the over-listing direction only, under
-  `mssql_builtins.rs`). It is not a `Target`, so `endpoint.rs` carries
+  (`core::mssql_builtins`, by the same error 195 — 208 for a rowset name in `FROM` — in the
+  over-listing direction only, and version-aware, under `mssql_builtins.rs`). It is not a `Target`, so `endpoint.rs` carries
   `OUTSIDE_THE_SUITE` for it, `leg_enabled` to answer `SCHEMAIC_IT_ENGINES` for a leg with no
   `Target`, and `note_leg_skipped` to say so when it is left out; its endpoint is
   `SCHEMAIC_IT_MSSQL_HOST`/`_PORT`/`_USER`/`_PASSWORD` (defaults `127.0.0.1`/`1433`/`sa`/
   `Schemaic_2026`, the local container's and CI's `mcr.microsoft.com/mssql/server:2022-latest`
-  service's). When enough of the suite answers, it joins the macro.
+  service's). **The leg runs twice in CI**, the second time against a `mssql2025` service
+  (`mcr.microsoft.com/mssql/server:2025-latest` on 1434) in its own *Test (live, SQL Server 2025)*
+  step — `--test live -- mssql::` under `SCHEMAIC_IT_ENGINES=mssql` and
+  `SCHEMAIC_IT_MSSQL_PORT=1434`, the other engines' legs being the first step's. The builtin
+  catalog spans both versions, and each direction of its version line needs a server that can
+  answer it; locally a `schemaic-mssql25` container on 1434 plays the same part. The whole leg is
+  green on 2025 (17.0.5005.3, RTM-CU9). When enough of the suite answers, it joins the macro.
   **`endpoint.rs` is where a leg comes from**, and it is the whole environment contract: three
   `SCHEMAIC_IT_<ENGINE>_HOST`/`_PORT`/`_USER`/`_PASSWORD` groups with localhost defaults (four with
   SQL Server's), plus `SCHEMAIC_IT_ENGINES` as the one way to run fewer than all of them. An *unreachable* endpoint is a
