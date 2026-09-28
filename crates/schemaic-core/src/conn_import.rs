@@ -57,6 +57,7 @@ const MYSQL: &str = "MySQL";
 const MARIADB: &str = "MariaDB";
 const POSTGRES: &str = "PostgreSQL";
 const SQLITE: &str = "SQLite";
+const MSSQL: &str = "SQL Server";
 
 /// Which tool a connection was read out of.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -126,6 +127,12 @@ pub enum ImportNote {
     /// `same_endpoint` compares the invented number too, so the row can also
     /// collapse against an unrelated one.
     PortAssumed,
+    /// A SQL Server **named instance** (`host\SQLEXPRESS`) with no port. The
+    /// drivers ask SQL Server Browser on UDP 1434 which port it listens on;
+    /// Schemaic does not, so the row carries the default port — which reaches
+    /// the host's *default* instance, if it has one, not the named one — and
+    /// this says to set the instance's port.
+    NamedInstance,
 }
 
 impl ImportNote {
@@ -137,6 +144,7 @@ impl ImportNote {
             ImportNote::UnexpandedPath => "Path contains an unexpanded macro",
             ImportNote::PasswordFromPgpass => "Password taken from your own .pgpass",
             ImportNote::PortAssumed => "The source named no port; this is the default",
+            ImportNote::NamedInstance => "A named instance: set the port it listens on",
         }
     }
 }
@@ -465,7 +473,19 @@ fn redacted(name: &str) -> String {
     // a bare `Pwd`, kept across a bare `=` or a `Pwd=` with nothing after it,
     // and cleared by anything else — so `Pwd x y` redacts `x` and leaves `y`.
     let mut awaiting = false;
+    // **Inside a braced secret** — Microsoft's `password={a;b}`, whose value
+    // runs to the first `}` that is not a doubled `}}`, separators and all. Its
+    // parts are swallowed until that one; splitting at the `;` inside showed
+    // the rest of the password.
+    let mut in_brace = false;
     for part in rest.split_inclusive(SEPS) {
+        if in_brace {
+            if let Some(close) = closing_brace(part) {
+                in_brace = false;
+                out.push_str(&part[close + 1..]);
+            }
+            continue;
+        }
         let (body, sep) = match part.chars().next_back().filter(|c| SEPS.contains(c)) {
             Some(c) => (&part[..part.len() - c.len_utf8()], Some(c)),
             None => (part, None),
@@ -478,6 +498,14 @@ fn redacted(name: &str) -> String {
                     out.push_str(key);
                     out.push_str("=…");
                     awaiting = false;
+                    if let Some(braced) = value.trim_start().strip_prefix('{')
+                        && closing_brace(braced).is_none()
+                    {
+                        // The separator is the secret's too; the part that
+                        // closes the brace brings back what follows it.
+                        in_brace = true;
+                        continue;
+                    }
                 } else {
                     out.push_str(body);
                     awaiting = secret;
@@ -499,6 +527,24 @@ fn redacted(name: &str) -> String {
         }
     }
     out
+}
+
+/// Where the brace a braced value opened closes in `s` — the first `}` that is
+/// not one of a doubled `}}` — or `None` when it does not close here.
+fn closing_brace(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'}' {
+            if b.get(i + 1) == Some(&b'}') {
+                i += 2;
+                continue;
+            }
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Does this parameter name hold a secret? The same spellings [`apply_params`]
@@ -623,10 +669,13 @@ impl UrlError {
         match self {
             UrlError::Empty => "Paste a connection URL.".to_string(),
             UrlError::NoScheme => {
-                "No scheme — a URL starts with mysql://, postgresql:// or sqlite:.".to_string()
+                "No scheme — a URL starts with mysql://, postgresql://, sqlserver:// or sqlite:."
+                    .to_string()
             }
             UrlError::UnknownScheme(s) => {
-                format!("Unknown scheme \"{s}\" — expected mysql, mariadb, postgresql or sqlite.")
+                format!(
+                    "Unknown scheme \"{s}\" — expected mysql, mariadb, postgresql, sqlserver or sqlite."
+                )
             }
             UrlError::NoHost => "No host in the URL.".to_string(),
             UrlError::BadPort(p) => format!("\"{p}\" is not a port number."),
@@ -647,13 +696,23 @@ impl UrlError {
 /// The connection comes back with `id: 0` and a suggested name; see the module
 /// docs.
 pub fn parse_url(input: &str) -> Result<Connection, UrlError> {
+    parse_url_noted(input).map(|(c, _)| c)
+}
+
+/// [`parse_url`], with the advisory notes the URL itself warrants — today one:
+/// a SQL Server named instance with no port ([`ImportNote::NamedInstance`]).
+fn parse_url_noted(input: &str) -> Result<(Connection, Vec<ImportNote>), UrlError> {
     let raw = strip_env_assignment(strip_bom(input).trim());
     if raw.is_empty() {
         return Err(UrlError::Empty);
     }
-    // `jdbc:` is a wrapper around the URL the driver itself reads.
+    // `jdbc:` is a wrapper around the URL the driver itself reads — and jTDS
+    // wraps its `sqlserver:` once more.
     let jdbc = strip_prefix_ci(raw, "jdbc:");
     let raw = jdbc.unwrap_or(raw);
+    let raw = jdbc
+        .and_then(|r| strip_prefix_ci(r, "jtds:"))
+        .unwrap_or(raw);
     let (scheme, rest) = split_scheme(raw).ok_or(UrlError::NoScheme)?;
     let engine = match engine_for_scheme(scheme) {
         Some(e) => e,
@@ -663,15 +722,149 @@ pub fn parse_url(input: &str) -> Result<Connection, UrlError> {
         None if rest.bytes().all(|b| b.is_ascii_digit()) => return Err(UrlError::NoScheme),
         None => return Err(UrlError::UnknownScheme(scheme.to_string())),
     };
+    let mut notes = Vec::new();
     let mut c = if is_sqlite(engine) {
         parse_sqlite_url(rest)?
+    } else if engine == MSSQL && (jdbc.is_some() || rest.contains(';')) {
+        // Microsoft's grammar — and Prisma's, which borrows it.
+        let (c, n) = parse_mssql_url(rest)?;
+        notes = n;
+        c
     } else if jdbc.is_some() {
         parse_server_url(engine, &jdbc_authority(engine, rest))?
     } else {
         parse_server_url(engine, rest)?
     };
     c.name = suggest_name(&c);
-    Ok(c)
+    Ok((c, notes))
+}
+
+/// A SQL Server URL in Microsoft's JDBC grammar —
+/// `//[host[\instance][:port]][/database][;property=value]…` — after its
+/// scheme. The path form is jTDS's; Prisma writes the same properties after
+/// `sqlserver://host:port`.
+///
+/// **Properties, not a query**, split at `;` except inside `{…}`, which is
+/// how the driver quotes a value holding one (`password={a;b}`). The
+/// authority wins over a property naming the same thing, as the query does
+/// for the other engines' URLs; `databaseName` and `database` are both the
+/// database. The TLS words are the Microsoft drivers', read as they mean
+/// them: `encrypt=true` verifies the certificate unless
+/// `trustServerCertificate` says not to, `strict` always does, and a trusted
+/// certificate with no `encrypt` is the drivers' encrypted default since 10.2.
+fn parse_mssql_url(rest: &str) -> Result<(Connection, Vec<ImportNote>), UrlError> {
+    let rest = rest.strip_prefix("//").unwrap_or(rest);
+    let (authority, props) = match rest.split_once(';') {
+        Some((a, p)) => (a, p),
+        None => (rest, ""),
+    };
+    let (hostport, path) = match authority.split_once('/') {
+        Some((a, b)) => (a, b),
+        None => (authority, ""),
+    };
+    let (hostpart, port) = split_host_port(hostport)?;
+    let (mut host, mut instance) = match hostpart.split_once('\\') {
+        Some((h, i)) => (h.to_string(), Some(i.to_string()).filter(|i| !i.is_empty())),
+        None => (hostpart, None),
+    };
+    let mut c = blank(MSSQL);
+    c.database = percent_decode(path.split('/').next().unwrap_or(""));
+    let mut port = port;
+    let (mut encrypt, mut trust) = (None::<String>, false);
+    for (k, v) in split_mssql_props(props) {
+        if v.is_empty() {
+            continue;
+        }
+        match normalize_key(&k).as_str() {
+            "databasename" | "database" | "initialcatalog" => set_if_empty(&mut c.database, &v),
+            "user" | "username" | "userid" | "uid" => set_if_empty(&mut c.user, &v),
+            "password" | "pwd" => set_if_empty(&mut c.password, &v),
+            "servername" | "server" => set_if_empty(&mut host, &v),
+            "portnumber" | "port" if port.is_none() => port = Some(parse_port(v.trim())?),
+            "instancename" if instance.is_none() => instance = Some(v),
+            "encrypt" => encrypt = Some(normalize_key(&v)),
+            "trustservercertificate" => trust = truthy(&v),
+            _ => {}
+        }
+    }
+    if host.trim().is_empty() {
+        return Err(UrlError::NoHost);
+    }
+    c.host = host;
+    c.port = port.unwrap_or_else(|| default_port(MSSQL));
+    match (encrypt.as_deref(), trust) {
+        (Some("false" | "no" | "optional"), _) => c.tls.mode = SslMode::Disable,
+        (Some("strict"), _) => c.tls.mode = SslMode::VerifyFull,
+        (Some("true" | "yes" | "mandatory"), false) => c.tls.mode = SslMode::VerifyFull,
+        (Some("true" | "yes" | "mandatory"), true) | (None, true) => c.tls.mode = SslMode::Require,
+        // Unrecognised, or not said: the import's own floor.
+        _ => {}
+    }
+    let notes = if instance.is_some() && port.is_none() {
+        vec![ImportNote::NamedInstance]
+    } else {
+        Vec::new()
+    };
+    Ok((c, notes))
+}
+
+/// Microsoft's `key=value;key=value`, where a value in braces is taken whole —
+/// `;` and `=` included — with a doubled `}}` standing for one `}`.
+fn split_mssql_props(s: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut chars = s.chars().peekable();
+    loop {
+        let mut key = String::new();
+        for ch in chars.by_ref() {
+            if ch == '=' || ch == ';' {
+                if ch == ';' {
+                    key.clear();
+                    continue;
+                }
+                break;
+            }
+            key.push(ch);
+        }
+        if key.trim().is_empty() && chars.peek().is_none() {
+            break;
+        }
+        let mut value = String::new();
+        if chars.peek() == Some(&'{') {
+            chars.next();
+            while let Some(ch) = chars.next() {
+                if ch == '}' {
+                    if chars.peek() == Some(&'}') {
+                        chars.next();
+                        value.push('}');
+                        continue;
+                    }
+                    break;
+                }
+                value.push(ch);
+            }
+            // Past the closing brace to the separator.
+            for ch in chars.by_ref() {
+                if ch == ';' {
+                    break;
+                }
+            }
+        } else {
+            for ch in chars.by_ref() {
+                if ch == ';' {
+                    break;
+                }
+                value.push(ch);
+            }
+            value = value.trim().to_string();
+        }
+        if !key.trim().is_empty() {
+            out.push((key.trim().to_string(), value));
+        }
+        if chars.peek().is_none() {
+            break;
+        }
+    }
+    out
 }
 
 /// The Connector/J and MariaDB Connector/J words for a clustered setup, which
@@ -719,12 +912,12 @@ fn parse_url_scan(text: &str) -> ImportScan {
         if line.trim().is_empty() {
             continue;
         }
-        match parse_url(line) {
-            Ok(c) => out.found.push(Imported {
+        match parse_url_noted(line) {
+            Ok((c, notes)) => out.found.push(Imported {
                 connection: c,
                 source: ImportSource::Url,
                 origin: String::new(),
-                notes: Vec::new(),
+                notes,
             }),
             Err(e) => out.skip(line.trim(), SkipReason::Unreadable(e.message())),
         }
@@ -884,6 +1077,8 @@ fn engine_for_scheme(scheme: &str) -> Option<&'static str> {
         // `file:` is SQLite's own URI scheme, and the context here is database
         // URLs — nothing else in this app would paste one.
         "sqlite" | "sqlite3" | "file" => Some(SQLITE),
+        // JDBC's and Prisma's `sqlserver`, SQLAlchemy's and node's `mssql`.
+        "sqlserver" | "mssql" => Some(MSSQL),
         _ => None,
     }
 }
@@ -1060,9 +1255,9 @@ pub fn parse_dbeaver(json: &str) -> ImportScan {
         // Start from the JDBC URL when it parses — it is the one field that
         // carries the query parameters — then let the explicit fields win, since
         // DBeaver edits those and rewrites the URL from them.
-        let mut c = match parse_url(&url) {
-            Ok(c) if same_engine(&c.db_type, engine) => c,
-            _ => blank(engine),
+        let (mut c, mut notes) = match parse_url_noted(&url) {
+            Ok((c, notes)) if same_engine(&c.db_type, engine) => (c, notes),
+            _ => (blank(engine), Vec::new()),
         };
         c.db_type = engine.to_string();
         if let Some(cfg) = cfg {
@@ -1079,6 +1274,16 @@ pub fn parse_dbeaver(json: &str) -> ImportScan {
                 overlay(&mut c.database, database);
             }
             dbeaver_handlers(&mut c, cfg);
+            // DBeaver keeps a SQL Server named instance in the host field, as
+            // `host\SQLEXPRESS`; with no port of its own it gets the note.
+            if engine == MSSQL
+                && let Some((host, instance)) = c.host.clone().split_once('\\')
+            {
+                c.host = host.to_string();
+                if !instance.is_empty() && str_at(cfg, "port").is_none() {
+                    notes.push(ImportNote::NamedInstance);
+                }
+            }
         }
         if !is_sqlite(engine) && c.host.trim().is_empty() {
             out.skip(name, SkipReason::NoServer);
@@ -1096,7 +1301,11 @@ pub fn parse_dbeaver(json: &str) -> ImportScan {
         // The folder DBeaver files it under, by the name it shows — which is all
         // a folder is here (`Connection::folder`), so the heading carries over.
         overlay(&mut c.folder, str_at(entry, "folder"));
-        out.found.push(imported(c, ImportSource::DBeaver));
+        let mut imp = imported(c, ImportSource::DBeaver);
+        for n in notes {
+            imp.note(n);
+        }
+        out.found.push(imp);
     }
     // DBeaver keys its connections by an internal id, so "the order in the file"
     // is not an order a user ever chose or would recognise — and `serde_json`
@@ -1119,9 +1328,14 @@ fn dbeaver_engine(provider: &str, driver: &str, url: &str) -> Option<&'static st
         "mysql" => Some(MYSQL),
         "postgresql" | "postgres" => Some(POSTGRES),
         "sqlite" => Some(SQLITE),
-        // A generic/JDBC data source names its engine only in the URL.
-        _ => split_scheme(strip_prefix_ci(url, "jdbc:").unwrap_or(url))
-            .and_then(|(s, _)| engine_for_scheme(s)),
+        "sqlserver" | "mssql" => Some(MSSQL),
+        // A generic/JDBC data source names its engine only in the URL — jTDS's
+        // behind one more prefix, as `parse_url` reads it.
+        _ => {
+            let bare = strip_prefix_ci(url, "jdbc:").unwrap_or(url);
+            let bare = strip_prefix_ci(bare, "jtds:").unwrap_or(bare);
+            split_scheme(bare).and_then(|(s, _)| engine_for_scheme(s))
+        }
     }
 }
 
@@ -1302,8 +1516,8 @@ fn parse_datagrip_project(xml: &str, local: Option<&str>, project: Option<&str>)
             );
             continue;
         }
-        let mut c = match parse_url(&url) {
-            Ok(c) => c,
+        let (mut c, url_notes) = match parse_url_noted(&url) {
+            Ok(parsed) => parsed,
             Err(UrlError::UnknownScheme(s)) => {
                 out.skip(
                     pick_name(&name, &url),
@@ -1329,6 +1543,9 @@ fn parse_datagrip_project(xml: &str, local: Option<&str>, project: Option<&str>)
         let mut imp = imported(c, ImportSource::DataGrip);
         if has_macro(&url) {
             imp.note(ImportNote::UnexpandedPath);
+        }
+        for n in url_notes {
+            imp.note(n);
         }
         out.found.push(imp);
     }
@@ -2454,6 +2671,80 @@ mod tests {
         assert_eq!(c.tls.mode, SslMode::Require);
     }
 
+    /// **Microsoft's JDBC URL has its own shape**: properties after `;`, not a
+    /// path and a query — `jdbc:sqlserver://host:port;databaseName=x;…` — which
+    /// DataGrip and DBeaver both store. A `{braced}` value may hold a `;`.
+    #[test]
+    fn a_sql_server_jdbc_url_is_read_by_its_properties() {
+        let c = url(
+            "jdbc:sqlserver://db.example:14330;databaseName=Sales;user=app;\
+             password={p;w=d};encrypt=true;trustServerCertificate=true",
+        );
+        assert!(crate::connection::is_mssql(&c.db_type), "{}", c.db_type);
+        assert_eq!((c.host.as_str(), c.port), ("db.example", 14330));
+        assert_eq!(c.database, "Sales");
+        assert_eq!(c.user, "app");
+        assert_eq!(c.password, "p;w=d");
+        assert_eq!(c.tls.mode, SslMode::Require);
+        // No port is 1433; `database` and `serverName` are the other spellings.
+        let c = url("jdbc:sqlserver://;serverName=h;database=d");
+        assert_eq!(
+            (c.host.as_str(), c.port, c.database.as_str()),
+            ("h", 1433, "d")
+        );
+        // Prisma's and jTDS's.
+        let c = url("sqlserver://h:1433;database=d;user=sa;password=x;encrypt=false");
+        assert_eq!((c.host.as_str(), c.user.as_str()), ("h", "sa"));
+        assert_eq!(c.tls.mode, SslMode::Disable);
+        let c = url("jdbc:jtds:sqlserver://h:1500/d;user=u");
+        assert_eq!(
+            (c.host.as_str(), c.port, c.database.as_str()),
+            ("h", 1500, "d")
+        );
+        assert_eq!(c.user, "u");
+        // SQLAlchemy's and node's, which are ordinary URLs.
+        let c = url("mssql+pyodbc://u:p%40ss@h:1433/d?driver=ODBC+Driver+18+for+SQL+Server");
+        assert!(crate::connection::is_mssql(&c.db_type));
+        assert_eq!((c.user.as_str(), c.password.as_str()), ("u", "p@ss"));
+        assert_eq!(c.database, "d");
+    }
+
+    /// `encrypt` and `trustServerCertificate` are the Microsoft drivers' TLS
+    /// words, read as those drivers mean them: `encrypt=true` verifies the
+    /// certificate unless it is trusted blindly, and `strict` always does.
+    #[test]
+    fn sql_server_tls_words_land_on_the_ladder() {
+        let mode = |q: &str| url(&format!("jdbc:sqlserver://h;{q}")).tls.mode;
+        assert_eq!(mode("encrypt=false"), SslMode::Disable);
+        assert_eq!(mode("encrypt=true"), SslMode::VerifyFull);
+        assert_eq!(mode("encrypt=strict"), SslMode::VerifyFull);
+        assert_eq!(
+            mode("encrypt=true;trustServerCertificate=true"),
+            SslMode::Require
+        );
+        // Trusting the certificate says the session is encrypted — the
+        // driver's default since 10.2 — and nothing more.
+        assert_eq!(mode("trustServerCertificate=true"), SslMode::Require);
+        // Said nothing: the import's own floor.
+        assert_eq!(mode("databaseName=d"), blank(MSSQL).tls.mode);
+    }
+
+    /// **A named instance has no port of its own to import** — SQL Server
+    /// Browser answers it on 1434, which Schemaic does not ask — so one with
+    /// no port keeps the host and says what to do; one with a port needs no
+    /// Browser, and the port is kept.
+    #[test]
+    fn a_sql_server_named_instance_is_imported_with_a_note() {
+        let scan = parse_url_scan("jdbc:sqlserver://db\\SQLEXPRESS;databaseName=d");
+        let found = &scan.found[0];
+        assert_eq!(found.connection.host, "db");
+        assert!(found.has(ImportNote::NamedInstance), "{:?}", found.notes);
+        let c = url("jdbc:sqlserver://db\\SQLEXPRESS:50123;databaseName=d");
+        assert_eq!((c.host.as_str(), c.port), ("db", 50123));
+        let c = url("jdbc:sqlserver://db;instanceName=SQLEXPRESS;portNumber=50124");
+        assert_eq!((c.host.as_str(), c.port), ("db", 50124));
+    }
+
     #[test]
     fn the_authority_beats_a_query_parameter_naming_the_same_thing() {
         let c = url("mysql://real:pw@h/d?user=other&password=other");
@@ -2839,6 +3130,24 @@ mod tests {
         );
     }
 
+    /// **A braced value is one value**, `;` and spaces inside it included —
+    /// Microsoft's quoting, which `parse_mssql_url` reads — so a SQL Server URL
+    /// that fails to parse shows none of its password in the not-imported
+    /// list. Split at each `;`, `password={p;w=d x}` showed `w=d x}`.
+    #[test]
+    fn a_braced_password_is_redacted_whole() {
+        for raw in [
+            "jdbc:sqlserver://h:99999;password={p;w=d x};user=u",
+            "jdbc:sqlserver://h:99999;pwd={a}}b;c};user=u",
+        ] {
+            let out = redacted(raw);
+            for leak in ["w=d", "p;", "x}", "b;c", "a}"] {
+                assert!(!out.contains(leak), "{raw} -> {out}");
+            }
+            assert!(out.ends_with(";user=u"), "{raw} -> {out}");
+        }
+    }
+
     /// **The reason is rendered beside the name and was never redacted.**
     /// `skip` redacts the name at the point it is made, and says so in its own
     /// doc; `SkipReason` carries parser-chosen text through a second accessor
@@ -2941,6 +3250,11 @@ mod tests {
         "oracle-5": {
           "provider": "oracle", "driver": "oracle_thin", "name": "Warehouse",
           "configuration": { "host": "ora.example", "port": "1521" }
+        },
+        "mssql-6": {
+          "provider": "sqlserver", "driver": "microsoft", "name": "Ledger",
+          "configuration": { "host": "sql.example", "port": "1433", "database": "books",
+                             "url": "jdbc:sqlserver://sql.example:1433;databaseName=books;encrypt=true;trustServerCertificate=true" }
         }
       }
     }"#;
@@ -2958,7 +3272,7 @@ mod tests {
     }
 
     #[test]
-    fn dbeaver_reads_the_four_engines_it_can_and_skips_the_one_it_cannot() {
+    fn dbeaver_reads_the_five_engines_it_can_and_skips_the_one_it_cannot() {
         let scan = parse_dbeaver(DBEAVER);
         let names: Vec<&str> = scan
             .found
@@ -2966,12 +3280,55 @@ mod tests {
             .map(|i| i.connection.name.as_str())
             .collect();
         // Sorted by name, not by DBeaver's internal ids.
-        assert_eq!(names, ["Analytics", "Legacy", "Notes", "Shop (prod)"]);
+        assert_eq!(
+            names,
+            ["Analytics", "Ledger", "Legacy", "Notes", "Shop (prod)"]
+        );
+        let ledger = row(&scan, "Ledger");
+        assert!(crate::connection::is_mssql(&ledger.db_type));
+        assert_eq!(
+            (ledger.host.as_str(), ledger.database.as_str()),
+            ("sql.example", "books")
+        );
+        assert_eq!(ledger.tls.mode, SslMode::Require);
         assert_eq!(scan.skipped.len(), 1);
         assert_eq!(scan.skipped[0].name, "Warehouse");
         assert_eq!(
             scan.skipped[0].reason,
             SkipReason::UnsupportedEngine("oracle_thin".to_string())
+        );
+    }
+
+    /// DBeaver keeps a SQL Server's named instance in its own `host` field, and
+    /// a generic data source may be jTDS: both come through as SQL Server, the
+    /// instance split off its host with the note that says to set the port.
+    #[test]
+    fn dbeaver_reads_a_named_instance_and_a_jtds_source() {
+        let scan = parse_dbeaver(
+            r#"{ "connections": {
+              "a": { "provider": "sqlserver", "driver": "microsoft", "name": "Express",
+                     "configuration": { "host": "laptop\\SQLEXPRESS", "database": "dev" } },
+              "b": { "provider": "generic", "driver": "jtds", "name": "Old",
+                     "configuration": { "url": "jdbc:jtds:sqlserver://old.example:1433/legacy" } }
+            } }"#,
+        );
+        assert!(scan.skipped.is_empty(), "{:?}", scan.skipped);
+        let express = scan
+            .found
+            .iter()
+            .find(|i| i.connection.name == "Express")
+            .unwrap();
+        assert_eq!(express.connection.host, "laptop");
+        assert!(
+            express.has(ImportNote::NamedInstance),
+            "{:?}",
+            express.notes
+        );
+        let old = row(&scan, "Old");
+        assert!(crate::connection::is_mssql(&old.db_type));
+        assert_eq!(
+            (old.host.as_str(), old.database.as_str()),
+            ("old.example", "legacy")
         );
     }
 
@@ -3129,6 +3486,38 @@ mod tests {
         assert_eq!(first.port, 3306);
         assert_eq!(first.database, "sakila");
         assert_eq!(first.user, "root");
+    }
+
+    /// DataGrip's SQL Server data sources — Microsoft's driver, and jTDS —
+    /// arrive through the same URL reader, named-instance note included.
+    #[test]
+    fn datagrip_reads_its_sql_server_data_sources() {
+        let scan = parse_datagrip(
+            r#"<project version="4"><component name="DataSourceManagerImpl">
+              <data-source source="LOCAL" name="Books" uuid="2-1">
+                <driver-ref>sqlserver.ms</driver-ref>
+                <jdbc-url>jdbc:sqlserver://sql.example:1433;database=books;encrypt=true;trustServerCertificate=true</jdbc-url>
+                <user-name>app</user-name>
+              </data-source>
+              <data-source source="LOCAL" name="Express" uuid="2-2">
+                <driver-ref>sqlserver.jb</driver-ref>
+                <jdbc-url>jdbc:sqlserver://laptop\SQLEXPRESS;databaseName=dev</jdbc-url>
+              </data-source>
+            </component></project>"#,
+        );
+        assert!(scan.skipped.is_empty(), "{:?}", scan.skipped);
+        let books = &scan.found[0];
+        assert!(crate::connection::is_mssql(&books.connection.db_type));
+        assert_eq!(books.connection.database, "books");
+        assert_eq!(books.connection.user, "app");
+        assert_eq!(books.connection.tls.mode, SslMode::Require);
+        let express = &scan.found[1];
+        assert_eq!(express.connection.host, "laptop");
+        assert!(
+            express.has(ImportNote::NamedInstance),
+            "{:?}",
+            express.notes
+        );
     }
 
     #[test]

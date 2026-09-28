@@ -6188,6 +6188,35 @@ existing prose was left alone.
     name, the database lost (`a_jdbc_sub_protocol_is_not_the_host`,
     `a_host_less_pgjdbc_url_is_localhost`) — and since project discovery reads every project the
     IDE lists, they arrived without the user picking the file.
+    **SQL Server has a grammar of its own, and it is not a URL's.** `engine_for_scheme` takes
+    `sqlserver` (JDBC, Prisma) and `mssql` (SQLAlchemy's `mssql+pyodbc`, node) as `MSSQL`, and jTDS's
+    `jdbc:jtds:sqlserver://` has its `jtds:` stripped under the `jdbc:` one. What follows is
+    Microsoft's `//[host[\instance][:port]][/database][;key=value]…` — properties after `;`, not a
+    path and a query — which is what DataGrip and DBeaver both store, so `parse_mssql_url` reads it
+    whenever the URL is JDBC or carries a `;` (the `/database` path is jTDS's, and Prisma writes the
+    same properties after `sqlserver://host:port`); an ordinary `mssql://u:p@h:1433/d` still goes
+    through `parse_server_url`. `split_mssql_props` splits at `;` **except inside `{…}`**, which is
+    how the driver quotes a value holding one (`password={p;w=d}`, `}}` for a literal `}`), and the
+    authority wins over a property naming the same thing, as the query does for the other engines.
+    `encrypt` and `trustServerCertificate` are read as the Microsoft drivers mean the words, not as
+    they read: `false`/`no`/`optional` is `Disable` (TDS still encrypts the login, and nothing after
+    it); `strict` is `VerifyFull`; `true`/`yes`/`mandatory` is `VerifyFull` too, or `Require` with a
+    trusted certificate; and `trustServerCertificate=true` alone is `Require`, being the drivers'
+    encrypted default since 10.2. A URL that says neither keeps the import's floor
+    (`sql_server_tls_words_land_on_the_ladder`). **`ImportNote::NamedInstance` is `PortAssumed`'s
+    honesty for a named instance** (`host\SQLEXPRESS`) with no port: the drivers ask SQL Server
+    Browser on UDP 1434 which port it listens on and Schemaic does not, so the row carries 1433 —
+    which reaches the host's *default* instance if it has one, not the named one — and the note says
+    to set the port (`a_sql_server_named_instance_is_imported_with_a_note`). It is the first note a
+    URL can warrant by itself, which is why `parse_url` is now a wrapper over the private
+    `parse_url_noted`, and `parse_url_scan`, the DataGrip reader and the DBeaver reader call the
+    noted form. DBeaver also keeps the instance in its own `host` field (`laptop\SQLEXPRESS`), so its
+    reader splits it off there and notes it when the entry names no port, and its generic-driver
+    fallback strips jTDS's `jtds:` as `parse_url` does
+    (`dbeaver_reads_a_named_instance_and_a_jtds_source`). **`redacted` knows the braces too**: a
+    password's value opened with `{` runs to the first `}` that is not a doubled `}}`, `;` and
+    spaces included, so a SQL Server URL that fails to parse shows none of `password={p;w=d}` in the
+    not-imported list — split at each `;`, it showed `w=d}` (`a_braced_password_is_redacted_whole`).
     **`split_userinfo` is where a URL comes apart, and the order is the whole point.** Everything
     past `://` is cut at the **last `@`** — an email address is an ordinary username — and only then
     is the remainder searched for a path, a `?` or a `#`. Both readers used to do it the other way
@@ -6210,7 +6239,8 @@ existing prose was left alone.
     A driver this app has no engine for is `Skipped` **by name** rather than bent onto the nearest
     engine: a MySQL connection silently pointed at an Oracle server is a worse answer than an
     honest omission, and the modal says how many were left behind. DBeaver names its engine twice
-    and only the *driver* distinguishes MariaDB (it ships under the `mysql` provider); its rows are
+    and only the *driver* distinguishes MariaDB (it ships under the `mysql` provider; SQL Server
+    under `sqlserver` or `mssql`); its rows are
     sorted by name because the file is a JSON object keyed by internal ids, so "the order in the
     file" is not an order anyone chose. **A connection's `folder` key carries over as its heading**,
     verbatim through `overlay`, so a blank or missing one leaves the row ungrouped
