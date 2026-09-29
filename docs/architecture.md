@@ -5537,7 +5537,8 @@ existing prose was left alone.
     `PrincipalKind` has a third arm, `Login` (no other engine has one), and `Principal::login` — a
     `#[serde(default)]` `Option`, `None` on every other engine and on a user with no login
     (`WITHOUT LOGIN`, or contained) — carries a user's backing login as `SUSER_SNAME(sid)` reads
-    it: that field is the link, and what the list shows and a reset on the user row alters.
+    it (on Azure SQL Database, which refuses that call, as the SID join finds it — under
+    `mssql.rs`): that field is the link, and what the list shows and a reset on the user row alters.
     **A user with no login is one of two things, and only the catalogue can say which**:
     `Principal::database_password` (`#[serde(default)]`, `false` everywhere else) is set by
     `from_mssql_rows` for a user whose `authentication_type_desc` is `DATABASE` — a contained
@@ -5566,7 +5567,8 @@ existing prose was left alone.
     because SQL Server takes a user's own password only in a contained database (`CONTAINMENT =
     PARTIAL`; Msg 33233 anywhere else, measured on SQL Server 2022), and making a database
     contained needs the server's `contained database authentication` on — so the row is offered
-    only where Apply can succeed, rather than offered everywhere and refused there. **Where an account can be granted is asked
+    only where Apply can succeed, rather than offered everywhere and refused there. Every Azure
+    SQL database takes one, whatever its `containment` reads, so there the flag is always set. **Where an account can be granted is asked
     of the account** (`levels_for_account`, below): a login is a principal of the server and of no
     database, a user or role of its database and of no server, so `GRANT SELECT … TO` a login and
     `GRANT VIEW SERVER STATE TO` a user are each Msg 15151 (measured on SQL Server 2022).
@@ -11287,9 +11289,16 @@ existing prose was left alone.
   groups, the `##…##` certificate logins left out, each login's server roles through
   `STRING_AGG`) and, with a database, `USER_LISTING` (that database's users and roles, each user's
   login as `SUSER_SNAME(sid)`, its role memberships); with no database it lists the logins alone
-  and its note says to pick one. With a database it also reads that database's
+  and its note says to pick one. **On Azure SQL Database (`EngineEdition` 5, `AZURE_SQL_DATABASE`)
+  it reads `AZURE_USER_LISTING` instead**, because Azure refuses `SUSER_SNAME` a parameter (Msg
+  40507) and the whole accounts listing failed there with it; that query finds the login by
+  joining `sys.server_principals` on the SID. It is not the one query for both on purpose: on a
+  server `SUSER_SNAME` also names a Windows user who has no login row of their own, which the join
+  cannot. With a database it also reads that database's
   `sys.databases.containment` (`WHERE database_id = DB_ID()`) into `Principals::contained`, which
-  is what puts a password row on the New account form's User (under `core::users`). **It also asks `HAS_PERMS_BY_NAME(…, 'VIEW ANY DEFINITION')`**,
+  is what puts a password row on the New account form's User (under `core::users`) — except on
+  Azure SQL Database, where `contained` is simply `true`: its `containment` reads 0, yet it accepts
+  a user with a password (Msg 33233 is what a genuinely uncontained database answers). **It also asks `HAS_PERMS_BY_NAME(…, 'VIEW ANY DEFINITION')`**,
   because a login without that permission is shown only the principals it may see — itself and
   little else — with no error to say so, which is the MySQL ladder's "one account out of eight"
   in another catalogue; the note says the list may be short. `mssql::fetch_grants` reads a login's
@@ -11315,7 +11324,11 @@ existing prose was left alone.
   `endpoint::note_leg_no_op` when it is off. CI's live job turns it on before the tests run, in its
   *Enable contained database authentication* step (`sp_configure … 1; RECONFIGURE` through `docker
   exec` on each throwaway service container, 2022's and 2025's), so there the round trip runs rather than reporting
-  itself skipped. Server Activity is the one
+  itself skipped. **A login cannot yet be created on Azure SQL Database**, and that is unfinished
+  work, not fixed: `CREATE LOGIN` runs there only in `master` (Msg 5001) while the account plan
+  runs in the user database, so the login round trip reports itself a no-op under
+  `mssql-on-azure` (in the live tier, below) rather than pinning a path that fails.
+  Server Activity is the one
   split that *is* about the engine: `KILL` ends a session, but no T-SQL statement cancels another
   session's request and leaves the session standing — a cancel is an attention sent by the owner's
   own client — so `activity::supports_kill_kind` says no to *Cancel query* there and
@@ -12274,6 +12287,34 @@ existing prose was left alone.
   cached token, and a SQL login is refused on the Entra-only server. The second connection's time is
   printed rather than asserted — about 0.4 s where it was run, against the CLI's second or two. Both
   were green locally when they landed.
+  **`mssql-on-azure` is the `mssql` leg's own tests run against Azure SQL Database**, opt-in like
+  the two above and in place of the local server when `SCHEMAIC_IT_ENGINES` names it (`on_azure`,
+  which `base_db` and `enabled` both ask). It cannot make a scratch database per test, because on
+  Azure a `CREATE DATABASE` is a new *billable* database outside the free offer. So
+  `Scratch::create` hands off to `Scratch::azure`, which takes the one existing database —
+  `SCHEMAIC_IT_MSSQL_AZURE_HOST`/`_DATABASE`, default `schemaic_it`, the Entra leg's — signed in
+  through the Azure CLI (`azure_base_db`, `VerifyFull`), and gives it to one test at a time: a
+  process-wide tokio mutex, `AZURE_TURN`, is locked for as long as the scratch's `_turn` field
+  lives (tokio's because it neither poisons on a panicking test nor makes the scratch `!Send`).
+  The database is emptied both before a test — a run stopped mid-test leaves its tables behind —
+  and in `Drop`, by the `WIPE` batch, which tries every drop (system versioning off, foreign
+  keys, database triggers, objects, types, XML schema collections, schemas, users, roles),
+  swallows each failure and repeats pass by pass while anything is left — dependency order found
+  by trying rather than worked out — then after ten passes fails naming what survived; it also
+  turns a database-scoped `PREVIEW_FEATURES` back off. Since that empties a whole database, it
+  has its own name guard, `assert_azure_scratch`, which allows only `schemaic_it` or the tier's
+  `schemaic_it_*`, checked on the way in and again on the way out. **A test may hold only one
+  Azure scratch at a time**: a second `Scratch::create` waits for the turn its own first holds,
+  and hangs that test and every one queued behind it — which is what
+  `a_tables_ddl_rebuilds_the_table_it_was_read_from` did with its second database, so on Azure it
+  drops the original and rebuilds it in place. What the one database cannot host says so through
+  `azure_cannot` (`note_leg_no_op`) and asserts nothing: `a_dump_restores_into_an_empty_database`,
+  which needs a second database, and the login round trip (above, under `mssql.rs`).
+  `a_contained_user_is_created_signs_in_and_is_reset` runs there without its sign-ins, the server
+  being Entra-only, and prints that it left them unchecked — its `listed.contained` is what pins
+  `fetch_principals`' Azure arm. `every_catalogued_builtin_is_one_the_server_knows` counts
+  `EngineEdition` 5 as having 2025's block, since Azure reports major version 12 whatever it runs.
+  The leg was 56 of 56 there when it landed, as on local 2022 and 2025.
   **`endpoint.rs` is where a leg comes from**, and it is the whole environment contract: three
   `SCHEMAIC_IT_<ENGINE>_HOST`/`_PORT`/`_USER`/`_PASSWORD` groups with localhost defaults (four with
   SQL Server's), plus `SCHEMAIC_IT_ENGINES` as the one way to run fewer than all of them. An *unreachable* endpoint is a
@@ -12281,9 +12322,10 @@ existing prose was left alone.
   this whole directory exists to avoid — so narrowing it costs a developer a deliberate sentence
   (`SCHEMAIC_IT_ENGINES=mariadb,pg`), and CI refuses that variable outright. **The one exception to
   "every leg runs" is `opt_in_leg_enabled`**, which answers yes only when `SCHEMAIC_IT_ENGINES`
-  names the leg — the two sign-in legs above, listed in `OUTSIDE_THE_SUITE` beside `mssql` so the
-  variable accepts their names. Left out, such a leg says so through `note_leg_skipped` like any
-  other. The cost is named rather than hidden: CI runs neither, so both sign-ins are covered only
+  names the leg — the two sign-in legs above and `mssql-on-azure`, listed in `OUTSIDE_THE_SUITE`
+  beside `mssql` so the variable accepts their names. Left out, such a leg says so through
+  `note_leg_skipped` like any other. The cost is named rather than hidden: CI runs none of the
+  three, so both sign-ins, and everything Azure SQL Database answers differently, are covered only
   where somebody runs them by hand.
   **The type matrix (`cases.rs`) is what the tier is for.** A value's journey from a column to a
   cell is decided by the driver, the wire protocol and this crate's decoding together, and `core`'s

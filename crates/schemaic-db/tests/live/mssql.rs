@@ -20,6 +20,15 @@
 //!
 //! Each test makes its own `schemaic_it_*` database and drops it, under the same
 //! name guard as every other leg ([`crate::scratch::assert_scratch_name`]).
+//!
+//! **`mssql-on-azure` runs the same tests against Azure SQL Database**, opt-in
+//! ([`endpoint::opt_in_leg_enabled`]) and in place of the local server when
+//! named. There a `CREATE DATABASE` is a new *billable* database outside the
+//! free offer, so the leg takes one existing database instead —
+//! `SCHEMAIC_IT_MSSQL_AZURE_HOST` / `_DATABASE`, the Entra leg's — signs in
+//! through the Azure CLI, gives it to one test at a time, and empties it before
+//! and after each ([`WIPE`]). What needs a second database or the server
+//! itself says so and asserts nothing ([`azure_cannot`]).
 
 use std::sync::Arc;
 
@@ -44,8 +53,114 @@ fn var(field: &str, default: &str) -> String {
     }
 }
 
+/// Is the leg pointed at Azure SQL Database (`mssql-on-azure`)?
+fn on_azure() -> bool {
+    endpoint::opt_in_leg_enabled("mssql-on-azure")
+}
+
+/// The one database `mssql-on-azure` works in.
+fn azure_database() -> String {
+    std::env::var("SCHEMAIC_IT_MSSQL_AZURE_DATABASE").unwrap_or("schemaic_it".into())
+}
+
+/// The wipe empties a whole database, so it is refused anything but the
+/// scratch names: `schemaic_it` itself, or the live tier's `schemaic_it_*`.
+fn assert_azure_scratch(name: &str) {
+    assert!(
+        name == "schemaic_it" || name.starts_with(PREFIX),
+        "mssql-on-azure only ever empties schemaic_it or {PREFIX}*; refusing {name:?}"
+    );
+}
+
+/// On Azure, skip a test the one shared database cannot host, loudly.
+fn azure_cannot(why: &str) -> bool {
+    if on_azure() {
+        endpoint::note_leg_no_op("mssql-on-azure", why);
+        return true;
+    }
+    false
+}
+
+/// Empties the database it runs in: every user object, schema, type, role and
+/// database user, and the database-scoped settings a test turns on. A pass
+/// tries each drop and swallows its failure, and passes repeat while anything
+/// is left — dependency order found by trying rather than worked out — then
+/// the batch fails naming what survived.
+const WIPE: &str = "SET NOCOUNT ON;
+DECLARE @todo TABLE (n int IDENTITY PRIMARY KEY, s nvarchar(max));
+DECLARE @pass int = 0, @n int, @s nvarchar(max), @left nvarchar(max);
+WHILE 1 = 1
+BEGIN
+    SET @pass += 1;
+    DELETE @todo;
+    INSERT @todo (s) SELECT s FROM (
+        SELECT 0 AS k, N'ALTER TABLE ' + QUOTENAME(SCHEMA_NAME(schema_id)) + N'.' + QUOTENAME(name)
+            + N' SET (SYSTEM_VERSIONING = OFF)' AS s FROM sys.tables WHERE temporal_type = 2
+        UNION ALL SELECT 1, N'ALTER TABLE ' + QUOTENAME(OBJECT_SCHEMA_NAME(parent_object_id)) + N'.'
+            + QUOTENAME(OBJECT_NAME(parent_object_id)) + N' DROP CONSTRAINT ' + QUOTENAME(name)
+            FROM sys.foreign_keys
+        UNION ALL SELECT 2, N'DROP TRIGGER ' + QUOTENAME(name) + N' ON DATABASE'
+            FROM sys.triggers WHERE parent_class = 0
+        UNION ALL SELECT CASE o.type WHEN 'U' THEN 4 ELSE 3 END,
+            N'DROP ' + CASE o.type WHEN 'V' THEN N'VIEW' WHEN 'P' THEN N'PROCEDURE'
+                WHEN 'U' THEN N'TABLE' WHEN 'SO' THEN N'SEQUENCE' WHEN 'SN' THEN N'SYNONYM'
+                ELSE N'FUNCTION' END
+            + N' ' + QUOTENAME(SCHEMA_NAME(o.schema_id)) + N'.' + QUOTENAME(o.name)
+            FROM sys.objects o
+            WHERE o.is_ms_shipped = 0 AND o.type IN ('V','P','U','SO','SN','FN','IF','TF','FS','FT')
+        UNION ALL SELECT 5, N'DROP TYPE ' + QUOTENAME(SCHEMA_NAME(schema_id)) + N'.' + QUOTENAME(name)
+            FROM sys.types WHERE is_user_defined = 1
+        UNION ALL SELECT 6, N'DROP XML SCHEMA COLLECTION ' + QUOTENAME(SCHEMA_NAME(schema_id)) + N'.'
+            + QUOTENAME(name) FROM sys.xml_schema_collections WHERE schema_id <> SCHEMA_ID('sys')
+        UNION ALL SELECT 7, N'DROP SCHEMA ' + QUOTENAME(name)
+            FROM sys.schemas WHERE schema_id > 4 AND schema_id < 16384
+        UNION ALL SELECT 8, N'DROP USER ' + QUOTENAME(name)
+            FROM sys.database_principals WHERE principal_id > 4 AND type <> 'R'
+        UNION ALL SELECT 9, N'DROP ROLE ' + QUOTENAME(name)
+            FROM sys.database_principals WHERE type = 'R' AND is_fixed_role = 0 AND principal_id > 0
+    ) todo ORDER BY k;
+    IF NOT EXISTS (SELECT 1 FROM @todo) BREAK;
+    IF @pass > 10
+    BEGIN
+        SET @left = (SELECT STRING_AGG(s, N'; ') FROM @todo);
+        THROW 50000, @left, 1;
+    END
+    SET @n = 0;
+    WHILE 1 = 1
+    BEGIN
+        SELECT TOP (1) @n = n, @s = s FROM @todo WHERE n > @n ORDER BY n;
+        IF @@ROWCOUNT = 0 BREAK;
+        BEGIN TRY EXEC (@s); END TRY BEGIN CATCH END CATCH;
+    END
+END
+IF EXISTS (SELECT 1 FROM sys.database_scoped_configurations
+           WHERE name = 'PREVIEW_FEATURES' AND CONVERT(nvarchar(20), value) IN (N'1', N'ON'))
+    BEGIN TRY ALTER DATABASE SCOPED CONFIGURATION SET PREVIEW_FEATURES = OFF; END TRY
+    BEGIN CATCH END CATCH;";
+
+/// The one database's turn: a test holds it for as long as its [`Scratch`]
+/// lives. A tokio mutex, as it neither poisons when a test panics nor makes
+/// the scratch `!Send`.
+static AZURE_TURN: std::sync::LazyLock<Arc<tokio::sync::Mutex<()>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Azure SQL Database, signed in as the Azure CLI's user, attached to no
+/// database — which there is `master`.
+fn azure_base_db() -> Db {
+    use schemaic_core::connection::{AuthMode, SslMode};
+    let host = std::env::var("SCHEMAIC_IT_MSSQL_AZURE_HOST")
+        .expect("SCHEMAIC_IT_MSSQL_AZURE_HOST names the Azure SQL server for mssql-on-azure");
+    Db::connect(
+        &sign_in_connection(host, 1433, "", AuthMode::AzureCli, SslMode::VerifyFull),
+        None,
+    )
+}
+
 /// The server, attached to no database.
 fn base_db() -> Db {
+    if on_azure() {
+        return azure_base_db();
+    }
     let port = var("PORT", "1433");
     Db::from_parts(
         Engine::MsSql,
@@ -63,10 +178,16 @@ fn base_db() -> Db {
 struct Scratch {
     name: String,
     db: Db,
+    /// On Azure, this test's turn at the one database, released only after
+    /// [`Drop`] has emptied it.
+    _turn: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 
 impl Scratch {
     async fn create(test: &str) -> Scratch {
+        if on_azure() {
+            return Scratch::azure().await;
+        }
         let name = format!("{PREFIX}{}_mssql_{test}", std::process::id());
         assert_scratch_name(&name);
         assert!(name.len() <= 128, "{name:?} is too long a database name");
@@ -80,7 +201,30 @@ impl Scratch {
         .await
         .unwrap_or_else(|e| panic!("could not create {name}: {e}"));
         let db = base.clone().with_database(Some(&name));
-        Scratch { name, db }
+        Scratch {
+            name,
+            db,
+            _turn: None,
+        }
+    }
+
+    /// `mssql-on-azure`'s scratch: the one database, emptied first — a run
+    /// stopped mid-test leaves its tables behind. **A test holds at most one**:
+    /// a second waits for the turn its own first holds, which hangs the test
+    /// and every one queued behind it.
+    async fn azure() -> Scratch {
+        let name = azure_database();
+        assert_azure_scratch(&name);
+        let turn = AZURE_TURN.clone().lock_owned().await;
+        let db = azure_base_db().with_database(Some(&name));
+        db.fetch_query(Some(&name), WIPE, 1, CancellationToken::new())
+            .await
+            .unwrap_or_else(|e| panic!("could not empty {name}: {e}"));
+        Scratch {
+            name,
+            db,
+            _turn: Some(turn),
+        }
     }
 
     /// Run a batch in the scratch database, panicking on a failure.
@@ -108,6 +252,20 @@ impl Scratch {
 impl Drop for Scratch {
     fn drop(&mut self) {
         let name = self.name.clone();
+        if self._turn.is_some() {
+            assert_azure_scratch(&name);
+            let db = self.db.clone();
+            let emptied = std::thread::spawn(move || {
+                tokio::runtime::Runtime::new()
+                    .expect("a runtime for the teardown")
+                    .block_on(db.fetch_query(Some(&name), WIPE, 1, CancellationToken::new()))
+            })
+            .join();
+            if !matches!(emptied, Ok(Ok(_))) && !std::thread::panicking() {
+                panic!("could not empty {}: {emptied:?}", self.name);
+            }
+            return;
+        }
         assert_scratch_name(&name);
         // A drop cannot await; a thread of its own with a runtime of its own,
         // as `scratch::Scratch`'s guard does.
@@ -133,7 +291,7 @@ impl Drop for Scratch {
 
 /// Skip, loudly, when the leg was left out.
 fn enabled() -> bool {
-    if endpoint::leg_enabled("mssql") {
+    if on_azure() || endpoint::leg_enabled("mssql") {
         return true;
     }
     endpoint::note_leg_skipped("mssql");
@@ -405,7 +563,7 @@ async fn a_plan_is_read_from_the_servers_showplan_and_changes_nothing() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_dump_restores_into_an_empty_database() {
     use schemaic_core::dump::{DumpOptions, DumpStep, plan};
-    if !enabled() {
+    if !enabled() || azure_cannot("restores into a second database, which it has not got") {
         return;
     }
     let src = Scratch::create("dumpsrc").await;
@@ -2562,14 +2720,19 @@ async fn introspection_reads_the_schema_as_declared() {
 
 /// **The DDL *Show DDL* writes builds the table it was read from.** Read a
 /// table, emit its `CREATE`, run that in a second database, and read the copy:
-/// the columns, keys, checks and indexes come back the same.
+/// the columns, keys, checks and indexes come back the same. On Azure, which
+/// has the one database, the original is dropped and rebuilt in place.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_tables_ddl_rebuilds_the_table_it_was_read_from() {
     if !enabled() {
         return;
     }
     let src = Scratch::create("ddl_src").await;
-    let dst = Scratch::create("ddl_dst").await;
+    let second = if on_azure() {
+        None
+    } else {
+        Some(Scratch::create("ddl_dst").await)
+    };
     src.exec(
         "CREATE TABLE dbo.t ( \
            id int IDENTITY(1000,-5) CONSTRAINT pk_t PRIMARY KEY, \
@@ -2605,10 +2768,17 @@ async fn a_tables_ddl_rebuilds_the_table_it_was_read_from() {
         Some(("1000".into(), "-5".into()))
     );
     let ddl = original.create_ddl(MS);
+    let dst = match &second {
+        Some(dst) => dst,
+        None => {
+            src.exec("DROP TABLE dbo.t").await;
+            &src
+        }
+    };
     for stmt in schemaic_core::sql::executable_statements(&ddl, MS) {
         dst.exec(&stmt).await;
     }
-    let copy = read(&dst).await;
+    let copy = read(dst).await;
     let cols = |t: &schemaic_core::schema::TableInfo| -> Vec<String> {
         t.columns
             .iter()
@@ -2903,7 +3073,8 @@ async fn every_builtin_snippet_runs() {
 /// name*, which is how `FROM` answers a name it does not know. It checks the
 /// over-listing direction; a builtin the list lacks has no oracle.
 ///
-/// **Version-aware.** On a server older than 2025 the [`NEWER_THAN_2022`]
+/// **Version-aware.** On a server older than 2025 — which Azure SQL Database
+/// never is, though its version number says 12 — the [`NEWER_THAN_2022`]
 /// block is excused — and held to the opposite answer, unknown, so the excuse
 /// cannot hide a name that server does have. On 2025 the scratch database
 /// turns `PREVIEW_FEATURES` on first, since five of that block parse only
@@ -2919,7 +3090,12 @@ async fn every_catalogued_builtin_is_one_the_server_knows() {
         .await
         .parse()
         .expect("a major version");
-    let has_2025 = major >= 17;
+    // Azure SQL Database (edition 5) reports 12 whatever it runs, and runs
+    // the newest engine.
+    let edition = s
+        .scalar("SELECT CAST(SERVERPROPERTY('EngineEdition') AS int)")
+        .await;
+    let has_2025 = major >= 17 || edition == "5";
     if has_2025 {
         s.exec("ALTER DATABASE SCOPED CONFIGURATION SET PREVIEW_FEATURES = ON")
             .await;
@@ -3336,7 +3512,12 @@ async fn a_login_and_its_user_are_created_granted_reset_and_dropped() {
         AccountDraft, GrantLevel, PasswordReset, PrincipalKind, PrivilegeChange, RoleChange,
         companion_user_draft,
     };
-    if !enabled() {
+    if !enabled()
+        || azure_cannot(
+            "takes CREATE LOGIN only in master, and the plan runs in the user database, \
+             so the login round trip",
+        )
+    {
         return;
     }
     let s = Scratch::create("accounts").await;
@@ -3588,25 +3769,34 @@ async fn a_login_and_its_user_are_created_granted_reset_and_dropped() {
 ///
 /// Needs the server's `contained database authentication` on — a server-wide
 /// setting this test reads rather than changes, and reports when it is off.
+/// Azure SQL Database has no such setting, every database there being
+/// contained already; its sign-ins are left out, as an Entra-only server
+/// refuses every password.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_contained_user_is_created_signs_in_and_is_reset() {
     use schemaic_core::ddl::{Change, account};
     use schemaic_core::users::{AccountDraft, PasswordReset, PrincipalKind};
+    // Nothing of the user's name in either: Azure refuses a password that
+    // shares part of it (Msg 40632).
+    const FIRST: &str = "Tq7#vLp2!xW9";
+    const SECOND: &str = "Rm4$kNz8?bJ3";
     if !enabled() {
         return;
     }
-    let allowed = base_db()
-        .fetch_query(
-            None,
-            "SELECT CAST(value_in_use AS int) FROM sys.configurations \
+    let azure = on_azure();
+    let allowed = azure
+        || base_db()
+            .fetch_query(
+                None,
+                "SELECT CAST(value_in_use AS int) FROM sys.configurations \
              WHERE name = 'contained database authentication'",
-            1,
-            CancellationToken::new(),
-        )
-        .await
-        .expect("the setting")
-        .cell(0, 0)
-        .is_some_and(|c| c.display() == "1");
+                1,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the setting")
+            .cell(0, 0)
+            .is_some_and(|c| c.display() == "1");
     if !allowed {
         endpoint::note_leg_no_op(
             "mssql",
@@ -3615,15 +3805,17 @@ async fn a_contained_user_is_created_signs_in_and_is_reset() {
         return;
     }
     let s = Scratch::create("contained").await;
-    base_db()
-        .fetch_query(
-            None,
-            &format!("ALTER DATABASE [{}] SET CONTAINMENT = PARTIAL", s.name),
-            1,
-            CancellationToken::new(),
-        )
-        .await
-        .expect("a contained database");
+    if !azure {
+        base_db()
+            .fetch_query(
+                None,
+                &format!("ALTER DATABASE [{}] SET CONTAINMENT = PARTIAL", s.name),
+                1,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("a contained database");
+    }
     let name = format!("{PREFIX}{}_mssql_cuser", std::process::id());
     let run = |stmts: Vec<String>| {
         let db = s.db.clone();
@@ -3668,7 +3860,7 @@ async fn a_contained_user_is_created_signs_in_and_is_reset() {
         Change::CreateAccount(Box::new(AccountDraft {
             name: name.clone(),
             kind: PrincipalKind::User,
-            password: "Schemaic_Pw1!".into(),
+            password: FIRST.into(),
             ..Default::default()
         })),
     )
@@ -3686,28 +3878,33 @@ async fn a_contained_user_is_created_signs_in_and_is_reset() {
         (user.kind, user.login.as_deref(), user.database_password),
         (PrincipalKind::User, None, true)
     );
-    assert_eq!(
-        signs_in("Schemaic_Pw1!").await.as_deref(),
-        Some(name.as_str())
-    );
+    if !azure {
+        assert_eq!(signs_in(FIRST).await.as_deref(), Some(name.as_str()));
+    }
 
     run(account(
         &name,
         MS,
         Change::SetAccountPassword(Box::new(PasswordReset {
             account: user,
-            password: "Schemaic_Pw2!".into(),
+            password: SECOND.into(),
             scram_salt: None,
             password_policy: None,
         })),
     )
     .emit())
     .await;
-    assert!(signs_in("Schemaic_Pw1!").await.is_none(), "the old one");
-    assert_eq!(
-        signs_in("Schemaic_Pw2!").await.as_deref(),
-        Some(name.as_str())
-    );
+    if azure {
+        // Past libtest's capture, as `endpoint::note_leg_no_op` writes.
+        use std::io::Write as _;
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "live: mssql-on-azure refuses every password — the contained user's sign-ins went unchecked"
+        );
+        return;
+    }
+    assert!(signs_in(FIRST).await.is_none(), "the old one");
+    assert_eq!(signs_in(SECOND).await.as_deref(), Some(name.as_str()));
 }
 
 // ── Signing in without a password ───────────────────────────────────────────

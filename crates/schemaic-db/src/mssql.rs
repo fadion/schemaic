@@ -2835,6 +2835,24 @@ const USER_LISTING: &str = "SELECT dp.name, dp.type, SUSER_SNAME(dp.sid), \
      WHERE dp.type IN ('S', 'U', 'G', 'E', 'X', 'R') \
      ORDER BY dp.name";
 
+/// [`USER_LISTING`] for Azure SQL Database, which refuses `SUSER_SNAME` a
+/// parameter (Msg 40507): the login is found by its SID instead. Not the one
+/// query for both, as on a server `SUSER_SNAME` also names a Windows user who
+/// has no login of their own, which the join cannot.
+const AZURE_USER_LISTING: &str = "SELECT dp.name, dp.type, \
+            (SELECT sp.name FROM sys.server_principals sp WHERE sp.sid = dp.sid), \
+            dp.authentication_type_desc, dp.default_schema_name, CAST(dp.is_fixed_role AS int), \
+            (SELECT STRING_AGG(r.name, ', ') WITHIN GROUP (ORDER BY r.name) \
+               FROM sys.database_role_members m \
+               JOIN sys.database_principals r ON r.principal_id = m.role_principal_id \
+              WHERE m.member_principal_id = dp.principal_id) \
+     FROM sys.database_principals dp \
+     WHERE dp.type IN ('S', 'U', 'G', 'E', 'X', 'R') \
+     ORDER BY dp.name";
+
+/// `SERVERPROPERTY('EngineEdition')` of Azure SQL Database.
+const AZURE_SQL_DATABASE: &str = "5";
+
 /// A database principal's permissions in the current database: `(state,
 /// permission, class, schema, object, column)` — a schema's name for a
 /// schema's permission, an object's schema and name for an object's, and a
@@ -2903,8 +2921,21 @@ pub(crate) async fn fetch_principals(
             server_roles: r.get(4).cloned().flatten(),
         })
         .collect();
+    let edition = query_rows(
+        &mut client,
+        "SELECT CAST(SERVERPROPERTY('EngineEdition') AS int)",
+    )
+    .await?
+    .first()
+    .map(|r| cell(r, 0))
+    .unwrap_or_default();
+    let user_listing = if edition == AZURE_SQL_DATABASE {
+        AZURE_USER_LISTING
+    } else {
+        USER_LISTING
+    };
     let users: Vec<MsUserRow> = match database {
-        Some(_) => query_rows(&mut client, USER_LISTING)
+        Some(_) => query_rows(&mut client, user_listing)
             .await?
             .iter()
             .map(|r| MsUserRow {
@@ -2927,8 +2958,10 @@ pub(crate) async fn fetch_principals(
     .first()
     .is_some_and(|r| flag(r, 0));
     // Whether a new user here may hold a password of its own — only a
-    // contained database takes one (Msg 33233 elsewhere).
+    // contained database takes one (Msg 33233 elsewhere), and every Azure SQL
+    // database does, though its `containment` reads 0.
     let contained = match database {
+        Some(_) if edition == AZURE_SQL_DATABASE => true,
         Some(_) => query_rows(
             &mut client,
             "SELECT CAST(containment AS int) FROM sys.databases WHERE database_id = DB_ID()",

@@ -588,9 +588,10 @@ fn engines_var() -> Option<Vec<String>> {
 
 /// Legs that are not a [`Target`], because the shared suite does not run on
 /// them — SQL Server's, which `crate::mssql` tests on its own terms until the
-/// engine answers enough of the suite to join it — and its two opt-in sign-in
-/// legs ([`opt_in_leg_enabled`]).
-pub const OUTSIDE_THE_SUITE: &[&str] = &["mssql", "mssql-windows", "mssql-azure"];
+/// engine answers enough of the suite to join it — its two opt-in sign-in
+/// legs, and the opt-in `mssql-on-azure`, which is `mssql`'s own tests run
+/// against Azure SQL Database ([`opt_in_leg_enabled`]).
+pub const OUTSIDE_THE_SUITE: &[&str] = &["mssql", "mssql-windows", "mssql-azure", "mssql-on-azure"];
 
 /// Was the leg called `name` asked for? [`Target::enabled`] for a leg that has
 /// no [`Target`].
@@ -608,7 +609,8 @@ pub fn leg_enabled(name: &str) -> bool {
 /// runner has and no container can be: SQL Server's Windows sign-in
 /// (`mssql-windows`), which needs a Windows SQL Server this process can reach
 /// with its own Windows identity, and its Entra sign-in (`mssql-azure`),
-/// which needs an Azure SQL database and a signed-in Azure CLI. Left out,
+/// which needs an Azure SQL database and a signed-in Azure CLI — as does
+/// `mssql-on-azure`, the `mssql` leg run there. Left out,
 /// such a leg says so on stderr ([`note_leg_skipped`]) as any other does.
 pub fn opt_in_leg_enabled(name: &str) -> bool {
     engines_var().is_some_and(|list| list.iter().any(|n| n == name))
