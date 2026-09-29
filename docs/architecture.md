@@ -4116,7 +4116,13 @@ existing prose was left alone.
     Server's live leg has the same half, `every_sample_table_diffs_to_nothing_against_its_own_draft`
     over every AdventureWorksLT table, skipped where that sample is not installed — which
     includes CI. It asks `sys.databases` whether the sample is there before it reads it, so an
-    introspection that fails on a machine that has it is a failure, not a skip.) The SQLite
+    introspection that fails on a machine that has it is a failure, not a skip. Its sibling
+    `a_real_schema_reads_and_every_table_round_trips` does the same over a database someone uses,
+    named by `SCHEMAIC_IT_MSSQL_REAL_DATABASE` on whichever leg runs — on `mssql-on-azure` one
+    beside `schemaic_it`, never a scratch name, which the leg's wipe would empty — and adds the
+    account list and each table's rebuild plan, built and never run; what the reading cannot
+    rebuild or edit is printed, not failed on, since a real schema is entitled to features
+    Schemaic does not restate.) The SQLite
     test found
     three shipped bugs on its first run (`CreateTable` unhandled by `emit_sqlite`,
     `validate` refusing an unnamed `CHECK`, and two unnamed checks pairing onto one

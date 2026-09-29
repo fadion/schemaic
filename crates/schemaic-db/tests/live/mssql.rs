@@ -1391,6 +1391,83 @@ async fn every_sample_table_diffs_to_nothing_against_its_own_draft() {
     }
 }
 
+/// **A real schema reads, and every table round-trips** — a database someone
+/// uses rather than a sample, named by `SCHEMAIC_IT_MSSQL_REAL_DATABASE` on
+/// whichever leg runs (on Azure its own database beside `schemaic_it`).
+/// **Read-only, and guarded so**: the name may not be a scratch one, which the
+/// leg's wipe would empty, and nothing here writes — the schema, the account
+/// list and each table's rebuild *plan*, never run. What the reading cannot
+/// rebuild or edit is printed rather than failed on, since a real schema is
+/// entitled to features Schemaic does not restate; a panic, a failed read or
+/// a table that is not its own draft is a failure.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_real_schema_reads_and_every_table_round_trips() {
+    use schemaic_core::ddl::TableDraft;
+    use std::io::Write as _;
+    if !enabled() {
+        return;
+    }
+    let Ok(database) = std::env::var("SCHEMAIC_IT_MSSQL_REAL_DATABASE") else {
+        endpoint::note_leg_no_op(
+            if on_azure() {
+                "mssql-on-azure"
+            } else {
+                "mssql"
+            },
+            "names no SCHEMAIC_IT_MSSQL_REAL_DATABASE, so the real-schema read",
+        );
+        return;
+    };
+    assert!(
+        !database.starts_with(PREFIX) && !database.starts_with("schemaic_it"),
+        "{database:?} is a scratch name — the wipe empties those, so a real schema is never one"
+    );
+    let db = base_db().with_database(Some(&database));
+    let schema = db
+        .fetch_schema(&database, CancellationToken::new())
+        .await
+        .unwrap_or_else(|e| panic!("reading {database}: {e}"));
+    assert!(!schema.tables.is_empty(), "{database} has no tables");
+    db.fetch_principals(Some(&database))
+        .await
+        .unwrap_or_else(|e| panic!("the accounts of {database}: {e}"));
+    let mut notes: Vec<String> = Vec::new();
+    for t in schema.tables.iter().filter(|t| !t.is_view) {
+        let who = format!("{}.{}", t.schema.as_deref().unwrap_or(""), t.name);
+        let own = TableDraft::from_table(t);
+        let cs = schemaic_core::ddl::diff(t, &own, MS);
+        assert!(cs.changes.is_empty(), "{who}: {:#?}", cs.changes);
+        if t.columns.len() > 1 {
+            let mut moved = own.clone();
+            let last = moved.columns.pop().unwrap();
+            moved.columns.insert(0, last);
+            let cs = schemaic_core::ddl::diff(t, &moved, MS);
+            let _ = cs.emit();
+            notes.extend(cs.unsupported().into_iter().map(|r| format!("{who}: {r}")));
+        }
+        notes.extend(
+            t.triggers
+                .iter()
+                .filter(|tr| !tr.is_editable())
+                .map(|tr| format!("{who}: trigger {} is not editable", tr.name)),
+        );
+    }
+    notes.extend(
+        schema
+            .routines
+            .iter()
+            .filter(|r| !r.is_editable())
+            .map(|r| format!("routine {} is not editable", r.name)),
+    );
+    let _ = writeln!(
+        std::io::stderr().lock(),
+        "live: {database}: {} tables read and round-tripped; {} notes{}",
+        schema.tables.iter().filter(|t| !t.is_view).count(),
+        notes.len(),
+        notes.iter().map(|n| format!("\n  {n}")).collect::<String>()
+    );
+}
+
 /// **A whole designer edit lands.** One column renamed, retyped, made
 /// `NOT NULL` and given a new default — its old default dropped first, which
 /// a retype needs — a column with a default dropped, a column added, a check
