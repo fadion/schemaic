@@ -2149,6 +2149,9 @@ pub(crate) async fn fetch_schema(db: &Db, cancel: CancellationToken) -> Result<D
                 referring_ddl,
                 without_rowid,
                 strict,
+                // SQL Server's: SQLite's rebuild never drops a table another
+                // one's key points at without `foreign_keys = OFF`.
+                referenced_by: Vec::new(),
             });
         }
         Ok(DbSchema {

@@ -4187,12 +4187,12 @@ mod engine_comparison_gate {
         ),
         (
             "schemaic-core/ddl.rs",
-            17,
-            "Five of the seventeen are in the capability definitions the \
+            16,
+            "Five of the sixteen are in the capability definitions the \
              rest of the app asks — `requires_named_checks`, \
              `requires_rowid_key`, `strict_type_allowed`, and two in \
              `supports_change` — and a comparison is how they answer. The \
-             other twelve are DDL grammar \
+             other eleven are DDL grammar \
              inside the emitters and validators (`create_view_sql`, \
              `create_table_sql`, `client_script`'s `DELIMITER`, \
              `repoint_check_column`, the drafts' `validate`), where the engines \
@@ -4210,7 +4210,10 @@ mod engine_comparison_gate {
              19 → 17, with SQL Server's trigger editing: \
              `TriggerDraft::validate` is one exhaustive `match` over the \
              engines where it was an `if pg … else if sqlite … else` chain, \
-             whose `else` had been validating SQL Server's triggers as MySQL's.",
+             whose `else` had been validating SQL Server's triggers as MySQL's. \
+             17 → 16, with SQL Server's table rebuild: `diff` asks \
+             `rebuilds_tables` where it asked `== Sqlite`, which would have \
+             kept the rebuild SQLite's alone.",
         ),
         (
             "schemaic-core/filter.rs",

@@ -1359,6 +1359,61 @@ pub struct TableInfo {
     /// declared types are advisory, and nothing in the plan or the result says
     /// so. It is the `strict` column of the same `pragma_table_list` row.
     pub strict: bool,
+    /// **The foreign keys on _other_ tables that reference this one** — SQL
+    /// Server only, and empty everywhere else ([`link_inbound_foreign_keys`]).
+    ///
+    /// Read for the T-SQL rebuild (`ddl::tsql_rebuild_sql`), which drops the
+    /// table in the middle: a key another table points at it refuses the
+    /// `DROP TABLE` (Msg 3726), so each is dropped first and put back after,
+    /// against the table as it comes out. Its own table's keys, a self-reference
+    /// among them, are [`TableInfo::foreign_keys`] and go down with it.
+    pub referenced_by: Vec<InboundForeignKey>,
+}
+
+/// A foreign key on another table that references this one
+/// ([`TableInfo::referenced_by`]): the table it is declared on, and the key as
+/// that table has it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InboundForeignKey {
+    pub schema: Option<String>,
+    pub table: String,
+    pub key: ForeignKeyInfo,
+}
+
+/// Fill every table's [`TableInfo::referenced_by`] from the others'
+/// [`TableInfo::foreign_keys`] — a key whose `ref_schema` and `ref_table` name
+/// the table, declared on a table other than it. Names compare exactly, as the
+/// catalogue gives both sides. A key naming no schema is taken to reference its
+/// own table's.
+pub fn link_inbound_foreign_keys(tables: &mut [TableInfo]) {
+    let inbound: Vec<(usize, InboundForeignKey)> = tables
+        .iter()
+        .flat_map(|from| {
+            from.foreign_keys.iter().filter_map(|fk| {
+                let ref_schema = fk.ref_schema.as_ref().or(from.schema.as_ref());
+                let to = tables.iter().position(|t| {
+                    !t.is_view && t.name == fk.ref_table && t.schema.as_ref() == ref_schema
+                })?;
+                let own = tables[to].name == from.name && tables[to].schema == from.schema;
+                (!own).then(|| {
+                    (
+                        to,
+                        InboundForeignKey {
+                            schema: from.schema.clone(),
+                            table: from.name.clone(),
+                            key: fk.clone(),
+                        },
+                    )
+                })
+            })
+        })
+        .collect();
+    for t in tables.iter_mut() {
+        t.referenced_by.clear();
+    }
+    for (to, fk) in inbound {
+        tables[to].referenced_by.push(fk);
+    }
 }
 
 /// One `CHECK` constraint: a name and the predicate it enforces.
@@ -7714,6 +7769,56 @@ mod tests {
             plain.definition_sql(crate::intel::SqlDialect::MySql),
             "`secret` varchar(64)"
         );
+    }
+
+    /// **Another table's key lands on the table it references**, by schema
+    /// and name — a key naming no schema taken as its own table's — and a
+    /// table's key on itself stays its own, as does one on a view or on a
+    /// same-named table in another schema.
+    #[test]
+    fn inbound_foreign_keys_land_on_the_table_they_reference() {
+        let fk = |name: &str, schema: Option<&str>, table: &str| ForeignKeyInfo {
+            name: name.into(),
+            ref_schema: schema.map(Into::into),
+            ref_table: table.into(),
+            ..Default::default()
+        };
+        let table = |schema: &str, name: &str, fks: Vec<ForeignKeyInfo>| TableInfo {
+            name: name.into(),
+            schema: Some(schema.into()),
+            foreign_keys: fks,
+            ..Default::default()
+        };
+        let mut tables = vec![
+            table("dbo", "p", vec![fk("self", Some("dbo"), "p")]),
+            table(
+                "dbo",
+                "child",
+                vec![fk("to_p", Some("dbo"), "p"), fk("bare", None, "p")],
+            ),
+            table("sales", "p", Vec::new()),
+            table("sales", "o", vec![fk("to_sales_p", Some("sales"), "p")]),
+        ];
+        link_inbound_foreign_keys(&mut tables);
+        let names = |t: &TableInfo| {
+            t.referenced_by
+                .iter()
+                .map(|i| {
+                    format!(
+                        "{}.{}.{}",
+                        i.schema.as_deref().unwrap_or(""),
+                        i.table,
+                        i.key.name
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&tables[0]), ["dbo.child.to_p", "dbo.child.bare"]);
+        assert!(tables[1].referenced_by.is_empty());
+        assert_eq!(names(&tables[2]), ["sales.o.to_sales_p"]);
+        // Linked twice, it holds each once.
+        link_inbound_foreign_keys(&mut tables);
+        assert_eq!(tables[0].referenced_by.len(), 2);
     }
 
     /// A `CREATE TABLE` that drops the table's checks recreates something that

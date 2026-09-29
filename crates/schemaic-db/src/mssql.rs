@@ -1866,6 +1866,9 @@ async fn collect_schema(client: &mut MsClient) -> Result<DbSchema, DbError> {
             }
         }
     }
+    // Once every key has its actions: the rebuild puts another table's key
+    // back as it was, `ON DELETE` and all.
+    schemaic_core::schema::link_inbound_foreign_keys(&mut tables);
 
     // Routines, with their parameters spelled as their `CREATE` has them.
     let mut params: HashMap<(String, String), (Vec<String>, Option<String>)> = HashMap::new();

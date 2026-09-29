@@ -3294,7 +3294,9 @@ existing prose was left alone.
     (T-SQL's `ALTER COLUMN`, `emit_mssql`), reached through the rebuild on SQLite, and either route
     counts (`table_design_is_offered_exactly_where_a_retype_emits`, over `SqlDialect::ALL`). `supports_column_reorder` is the one where the
     engines genuinely disagree: MySQL places a column with `AFTER`, SQLite is created in the draft's
-    order by the rebuild it is already doing, and PostgreSQL cannot move one at all. It is an
+    order by the rebuild it is already doing, SQL Server the same way through its own rebuild
+    (`tsql_rebuild_sql`, below — it answered no until that existed), and PostgreSQL cannot move one
+    at all. It is an
     exhaustive `match` rather than the `!= Postgres` it was spelled as at *both* its sites — in
     `diff`, which must not raise a move PostgreSQL has no statement for, and again on the designer's
     arrow buttons, which must not offer one. `supports_sequence_resync` is the newest of the family
@@ -3712,7 +3714,10 @@ existing prose was left alone.
     (`a_primary_keys_collation_is_withheld`, `a_column_named_after_a_clause_is_still_a_column`).
     `Change::RebuildTable(Box<Rebuild>)` is how it reaches a plan: `diff` inserts one at the
     **front** of the set the moment that set holds a change SQLite has no statement of its own for,
-    and that one change performs the whole set. It sits *beside* the changes it performs rather than
+    and that one change performs the whole set. Where it does so is `rebuilds_tables(dialect)` — an
+    exhaustive `match`, true on SQLite and SQL Server (`tsql_rebuild_sql`, below), false on MySQL
+    and PostgreSQL, which alter in place and whose refusals a rebuild would not make possible — and
+    it replaced the literal `dialect == SqlDialect::Sqlite` the insertion was spelled as. It sits *beside* the changes it performs rather than
     instead of them, so the preview still lists the user's edits in their own terms and one line
     says how they will happen. The trigger is "is there a change here with no statement of its own",
     not "is this an alter" — a set of nothing but the drops the engine does have keeps its direct
@@ -3813,6 +3818,69 @@ existing prose was left alone.
     index's predicate and an expression key live, so which columns the index uses is a question the
     model cannot answer, and it is asked of the whole table instead. A withheld index is not a
     warning to read past; the plan is refused until the user drops it or undoes the edit.
+    **SQL Server rebuilds too, through `tsql_rebuild_sql(current, draft)`**, for the three edits
+    T-SQL's `ALTER COLUMN` cannot make: an identity switched on or off, a column turned into or out
+    of a computed one, and a column put anywhere but last. Until then the first two were withheld
+    in the preview and the third was never offered; `tsql_supports` still refuses them one by one, and `diff` answers a set holding one with
+    the `RebuildTable` it now admits, by the rule above. The shape is SSMS's designer's rather than
+    SQLite's twelve steps — seven steps, each its own batch, all inside `Db::run_ddl`'s one
+    transaction, so a failure anywhere leaves the table as it was. (1) **A guard that stops the
+    plan before it touches anything**, one `DECLARE @t … CASE WHEN … END IF @why IS NOT NULL THROW
+    50000, @why, 1;` naming the first reason, wherever the table carries something the model does
+    not read and the `DROP TABLE` would take with it: permissions granted on it; a schema-bound
+    dependent; system versioning, memory optimisation, replication, change data capture or a lock
+    escalation setting; change tracking or a full-text index; partitioning, compression or a
+    filegroup other than the default; an extended property other than `MS_Description`; an index
+    option (fill factor, padding, `IGNORE_DUP_KEY`, row or page locks); a sparse, column-set,
+    `FILESTREAM`, `ROWGUIDCOL`, masked, encrypted, XML-schema-typed or hidden column; a foreign key
+    on it or to it that is disabled, untrusted or `NOT FOR REPLICATION`, or a check or an identity
+    that is; and a count of its indexes, own keys, inbound keys, checks or triggers that no longer
+    matches the reading the draft was made from. The alternative to each is a plan that succeeds
+    and reports nothing lost. The schema-bound test leaves out objects whose parent is the table
+    itself, because a check or default constraint is an object of its own, schema-bound to the
+    table it stands on — found live. (2) The default constraints' names, captured into the session
+    temp table `#schemaic_rebuild_defaults` (`TSQL_REBUILD_DEFAULTS`), since the model reads a
+    default's value and not its name, and one put back as `DF__t__a__5EBF139D` is not the one
+    scripts and a schema compare name; a `#` table because `run_ddl`'s one connection carries it
+    across the batches. (3) The keys **other tables** have on it (`TableInfo::referenced_by`, under
+    `schema.rs`) dropped, since each refuses the `DROP TABLE` (Msg 3726). (4) A bare shadow,
+    `<table>_schemaic_rebuild`, of the draft's columns alone — no key, index, check or default,
+    because a constraint's name is the schema's and the old table still holds each one. (5) The
+    rows, `INSERT … SELECT … WITH (TABLOCKX)`, under `SET IDENTITY_INSERT … ON`/`OFF` where an
+    identity column is copied into; a new column takes its default's expression in the `SELECT`,
+    which is what a new column's default does to the rows already there, and a new identity numbers
+    them itself. (6) `DROP TABLE` and an `sp_rename` of the shadow to the **draft's** name, so a
+    table rename is inside the rebuild rather than after it as on SQLite; where an identity is
+    kept, a `DBCC CHECKIDENT` reseed to the old table's `IDENT_CURRENT`, so values freed by
+    deleted rows are not handed out again — only forwards and only for a positive increment, and
+    built into a variable first because `EXEC (…)` takes only literals and variables (Msg 102,
+    measured). (7) What stood on it: the key under its old constraint name, the checks, the indexes
+    and unique constraints — through a synthetic `ChangeSet` that `emit_mssql` writes, so none of
+    them is a second spelling — then the table's own foreign keys, after the unique ones a
+    self-reference may name and with that self-reference re-pointed at the new name; the defaults
+    under their captured names; the comments; the triggers through `trigger_create_statements`,
+    disabled and ranked as they were, on the new name; the inbound keys re-added pointing at the new
+    name and the renamed columns; and the temp table dropped. Every statement but a trigger's own
+    is one batch with no `;` inside, because the preview's Open in editor splits at them
+    (`sql_server_rebuilds_what_alter_column_cannot` pins the order and that). `emit_mssql` returns
+    the rebuild alone when one is in the set: it writes the table the draft describes, name
+    included, so the set's other entries are already in it.
+    **Which columns the copy skips is asked of the type, not of `identity_always`**
+    (`tsql_server_filled`): a computed column and a `rowversion`/`timestamp`, whose values the
+    server makes. The reader sets `identity_always` on an identity too, while the designer's toggle
+    switches one off by `auto_increment` alone, so a switched-off identity was being left out of
+    the copy — found live. **What the reading already shows the rebuild cannot put back is
+    `unsupported()`'s answer** — `tsql_rebuild_refusals`, SQL Server's arm of an exhaustive `match`
+    on the dialect in the rebuild branch, where SQLite's is the list above: an index `lossy` there
+    (included columns, a columnstore, XML or spatial one) would come back without what was not
+    read, an encrypted trigger has no text to put back, and one kept verbatim names the table as it
+    was, which a rename leaves behind. The guard is the half only the server can answer.
+    `Change::risks` has a SQL Server arm saying what is put back, that the plan stops first on what
+    isn't, and the one thing neither half sees — statistics created by hand are not carried over —
+    and `Change::summary` for a rebuild is engine-neutral now. The unit pins are
+    `sql_server_rebuilds_what_alter_column_cannot`,
+    `a_sql_server_rebuild_copies_into_an_identity_and_fills_a_new_column` and
+    `a_sql_server_rebuild_refuses_what_it_cannot_put_back`; the live ones are under `mssql.rs`.
     `TableDraft` (the desired table; column/index/FK
     entries each carry the name they had on the server, which is what tells a *rename*
     from a drop-plus-add) → `diff(current, draft, dialect) -> ChangeSet` → `emit()`.
@@ -7185,6 +7253,18 @@ existing prose was left alone.
     `rebuild_strands_a_trigger` is the one reader, and the text is verbatim for the reason
     `dependent_ddl`'s is — a refusal built on a parse that doesn't round-trip triggers is the same
     argument against.
+    **`TableInfo::referenced_by` is the other engine's version of looking one table over**: the
+    foreign keys declared on *other* tables that reference this one, as `InboundForeignKey { schema,
+    table, key }`, SQL Server only and empty everywhere else. It exists for `ddl::tsql_rebuild_sql`,
+    which drops the table in the middle — a key another table has on it refuses that `DROP TABLE`
+    (Msg 3726), so each is dropped first and put back after, pointed at the table as it comes out.
+    A self-reference is not in it: that key is the table's own `foreign_keys` and goes down with it.
+    `link_inbound_foreign_keys(&mut [TableInfo])` fills it from every table's `foreign_keys`,
+    matching `ref_schema`/`ref_table` exactly and taking a key that names no schema to mean its own
+    table's; `db::mssql::collect_schema` calls it last, **after** the keys' actions are filled,
+    because the rebuild puts the other table's key back as it was, `ON DELETE` and all
+    (`inbound_foreign_keys_land_on_the_table_they_reference`). SQLite's reader sets it empty: its
+    rebuild drops nothing another table's key points at without `foreign_keys = OFF`.
     **The tree's Generate DDL entries are two `DbSchema` methods, one per altitude.**
     `create_ddl_script(schema, dialect)` emits one namespace in **dependency order** — the
     standalone types, then base tables, then views, then the sequences that stand on their own —
@@ -11259,7 +11339,8 @@ existing prose was left alone.
   more. The four editor predicates compute
   from it, so it decides which editors open: `supports_table_design` probes a column retype, which
   T-SQL's `ALTER COLUMN` writes, so the designer opens on an existing table — in place, as on MySQL
-  and PostgreSQL, with no rebuild — and `supports_view_editing` probes the create and the replace,
+  and PostgreSQL, except for the edits `ALTER COLUMN` cannot make, which rebuild the table
+  (`ddl::tsql_rebuild_sql`, under `ddl.rs`) — and `supports_view_editing` probes the create and the replace,
   which `emit_mssql` writes through the shared `view_statements` (`CREATE OR ALTER VIEW`, under
   `ddl.rs`), so the view editor opens too; `supports_trigger_editing` probes all three trigger
   changes, which `emit_mssql` writes through the shared `trigger_statements` (`CREATE OR ALTER
@@ -11743,12 +11824,18 @@ existing prose was left alone.
   write would have admitted the next one nobody listed (`identity_always`, `on_update`, …) as a
   change that emits nothing and so never converges; the comparison that raised the change is the
   one that knows every field (`a_sql_server_column_change_is_admitted_only_when_it_is_written`).
-  **What it refuses comes in two kinds.** Facts about T-SQL's `ALTER COLUMN`: an identity switched
-  on or off, and a computed column changed or a column turned into or out of one — each is a drop
-  and re-add, which would lose the column's values. Unfinished work: a column's position (T-SQL has
-  no reorder), MariaDB's inline check, and an unnamed check or a primary key whose constraint name
-  wasn't read, since T-SQL drops both by name. A `TableOptions` is admitted only as the comment
-  alone — engine and collation are MySQL's table options.
+  **What it refuses one change at a time, a rebuild does for the whole set.** Facts about T-SQL's
+  `ALTER COLUMN`: an identity switched on or off, a computed column changed or a column turned into
+  or out of one — in place each is a drop and re-add, which would lose the column's values — and a
+  column's position, T-SQL having no reorder. A set holding any of them is answered by `diff` with
+  a `RebuildTable`, which `tsql_supports` admits and `ddl::tsql_rebuild_sql` writes (under
+  `ddl.rs`); until it did, the first two were withheld in the preview and the reorder arrows were
+  off.
+  Besides those it refuses MariaDB's inline check, and an unnamed check or a primary key whose
+  constraint name wasn't read, since T-SQL drops both by name — and neither of those two is
+  reachable from a reading, the reader naming every key through `sys.indexes` and every check
+  through `sys.check_constraints`. A `TableOptions` is admitted only as the comment alone — engine
+  and collation are MySQL's table options.
   **Introspection reads clustering rather than withholding it**: `IdxRow::clustered` is
   `Some(sys.indexes.type == 1)` (`IndexInfo::clustered`, under `schema.rs`), and an index is
   `lossy` only for a type past 2 — columnstore, XML, spatial — or included columns. Before the
@@ -11771,7 +11858,16 @@ existing prose was left alone.
   re-defaults one column, drops a column that has a default, adds one, swaps a check, adds an index
   and renames the table in one plan, then reads it back with the data kept, the new default filling
   a new row and the result round-tripping; `a_primary_key_is_replaced` widens a key by its read
-  constraint name; `an_identity_toggle_is_withheld` gets one withheld change and an empty script;
+  constraint name; `an_identity_toggle_is_withheld_over_an_index_the_rebuild_cannot_restate`
+  switches an identity on over an index with included columns and gets the one refusal, naming it;
+  `a_moved_column_rebuilds_the_table_and_keeps_what_stood_on_it` moves a column and adds one with a
+  default, and reads back the rows, the key, check, unique index and defaults under their names,
+  the comments, a disabled trigger still disabled, another table's `ON DELETE CASCADE` key, an
+  identity carrying on past a deleted row rather than from the highest one left, and the result
+  round-tripping; `an_identity_switched_on_keeps_the_rows_values` numbers on from the highest;
+  `a_rebuild_is_refused_where_the_table_has_what_it_would_drop` has the guard refuse a table with a
+  grant on it and leave it as it was; `a_rebuild_under_a_new_name_switches_off_an_identity_and_computes_a_column`
+  does both in a renamed rebuild, the table's key on itself coming back pointed at the new name;
   `a_designer_edit_keeps_what_it_did_not_change` holds the review's findings to
   the server at once — named defaults kept across a retype and untouched by a nullability change, a
   check re-pointed around a rename, a nullable column keyed, a column added `WITH VALUES`, a
@@ -12290,9 +12386,10 @@ existing prose was left alone.
   statement, and of one still compiling behind another session's lock), activity (the poll's own
   session absent from it), the grid's write-back (seven tests, from
   `a_staged_edit_lands_on_its_row_and_reads_back` to `a_stopped_commit_is_undone`, under
-  `mssql.rs` above), `run_ddl` and the designer's plans (nine tests, from a designed table and a
+  `mssql.rs` above), `run_ddl` and the designer's plans (from a designed table and a
   failing plan rolled back whole to an existing table's edit landing as drafted, an edit keeping
-  what it did not change, an identity toggle withheld, a clustered index and a nonclustered key
+  what it did not change, an identity toggle withheld over an index the rebuild cannot restate, a
+  table rebuilt three ways and refused once by the rebuild's guard, a clustered index and a nonclustered key
   keeping their clustering and every
   AdventureWorksLT table round-tripping where that sample is installed, also under `mssql.rs`),
   a file import (four tests, from every row across batches to a cancel rolled back, under
@@ -17034,9 +17131,10 @@ existing prose was left alone.
     MySQL's `bio(20)` prefix on every engine but PostgreSQL. The foreign-key action dropdown lists
     `ddl::fk_actions` besides, which has no `RESTRICT` on SQL Server. The designer opens on an
     **existing** SQL Server table too, now that `supports_table_design` answers yes there
-    (`emit_mssql`'s phases are under `mssql.rs`); the reorder arrows stay off, since
-    `supports_column_reorder` says no, and an identity toggled on an existing column is withheld in
-    the preview rather than written. The Primary key toggle still leaves Nullable as it was, which
+    (`emit_mssql`'s phases are under `mssql.rs`); the reorder arrows appear there too, and an
+    identity toggled on an existing column is written, since `supports_column_reorder` says yes now
+    and both reach the table rebuild (`ddl::tsql_rebuild_sql`, under `ddl.rs`) — until it existed
+    the arrows were off and the identity toggle was withheld in the preview. The Primary key toggle still leaves Nullable as it was, which
     SQL Server would refuse a key over (Msg 8111); `diff` makes the key's columns `NOT NULL` there
     instead (`ddl::primary_key_implies_not_null`, under `mssql.rs`). A table created from a database row is
     written `[dbo].[t]`: `default_schema` asks `schema::default_namespace` — `public`, `dbo`, or
@@ -25013,7 +25111,7 @@ Re-introducing the anti-patterns these guard against is a regression:
   `trigger_timings`, `trigger_events`, `trigger_fires_on_several_events` and
   `supports_trigger_not_for_replication`, `supports_trigger_execute_as` and
   `supports_trigger_firing_rank`, plus
-  `supports_column_reorder`, `alter_column_disturbs_checks`,
+  `supports_column_reorder`, `rebuilds_tables`, `alter_column_disturbs_checks`,
   `alter_column_disturbs_dependents`, `publishes_index_ddl` and `stats::supports_table_stats`; and, for the *comparison* rather than
   any editor, `ref_schema_is_database` and `view_definition_is_qualified`. **The same rule applies
   inside the emitter, and two loops there answered it by not asking.** `emit_sqlite`'s table-rename

@@ -2507,23 +2507,26 @@ async fn a_clustered_index_and_a_nonclustered_key_keep_their_clustering() {
     assert!(again.changes.is_empty(), "{:?}", again.changes);
 }
 
-/// **An identity switched on is withheld, not applied** — T-SQL's `ALTER
-/// COLUMN` cannot, and the preview says so and keeps Apply closed rather
-/// than writing half the edit.
+/// **An identity switched on is a rebuild — withheld where the rebuild would
+/// drop an index it does not read whole**, here one with included columns,
+/// and the preview says which rather than applying a table without it.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_identity_toggle_is_withheld() {
+async fn an_identity_toggle_is_withheld_over_an_index_the_rebuild_cannot_restate() {
     use schemaic_core::ddl::TableDraft;
     if !enabled() {
         return;
     }
     let s = Scratch::create("ddl_ident").await;
-    s.exec("CREATE TABLE dbo.t (id int NOT NULL)").await;
+    s.exec("CREATE TABLE dbo.t (id int NOT NULL, a int, b int)")
+        .await;
+    s.exec("CREATE INDEX ix_a ON dbo.t (a) INCLUDE (b)").await;
     let t = read_table(&s, "t").await;
     let mut d = TableDraft::from_table(&t);
     d.columns[0].info.auto_increment = true;
     let cs = schemaic_core::ddl::diff(&t, &d, MS);
-    assert_eq!(cs.unsupported().len(), 1, "{:?}", cs.unsupported());
-    assert!(cs.emit().is_empty(), "{:?}", cs.emit());
+    let refused = cs.unsupported();
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert!(refused[0].contains("ix_a"), "{refused:?}");
 }
 
 /// **A key finds its row whatever its type** — as the grid read it back: a
@@ -4128,4 +4131,220 @@ async fn an_entra_sign_in_is_the_azure_clis_user() {
             .await
             .is_err()
     );
+}
+
+/// **A column moved is a table rebuilt, and everything on the table comes
+/// back.** The rows (identity values kept, a new column's default filling the
+/// old rows), the key, the check, the unique index, the defaults under their
+/// own names, the comments, a disabled trigger, and another table's foreign
+/// key with its `ON DELETE` — and the identity carries on from where the old
+/// table's stood, not from the highest row left. The round trip after it is
+/// empty.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_moved_column_rebuilds_the_table_and_keeps_what_stood_on_it() {
+    use schemaic_core::ddl::{Change, ColumnDraft, TableDraft};
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("rebuild").await;
+    for sql in [
+        "CREATE TABLE dbo.parent (id int IDENTITY(1,1) CONSTRAINT pk_parent PRIMARY KEY, \
+         code nvarchar(10) NOT NULL CONSTRAINT df_code DEFAULT (N'x'), \
+         qty int NULL CONSTRAINT ck_qty CHECK (qty >= 0), note nvarchar(50) NULL)",
+        "CREATE UNIQUE INDEX ux_code ON dbo.parent (code)",
+        "EXEC sp_addextendedproperty @name = N'MS_Description', @value = N'parents', \
+         @level0type = N'SCHEMA', @level0name = N'dbo', @level1type = N'TABLE', @level1name = N'parent'",
+        "EXEC sp_addextendedproperty @name = N'MS_Description', @value = N'a note', \
+         @level0type = N'SCHEMA', @level0name = N'dbo', @level1type = N'TABLE', \
+         @level1name = N'parent', @level2type = N'COLUMN', @level2name = N'note'",
+        "CREATE TRIGGER dbo.tr_parent ON dbo.parent AFTER INSERT AS SET NOCOUNT ON",
+        "DISABLE TRIGGER dbo.tr_parent ON dbo.parent",
+        "INSERT dbo.parent (code, qty, note) VALUES (N'a', 1, N'n1'), (N'b', 2, N'n2'), (N'c', 3, N'n3')",
+        "DELETE dbo.parent WHERE id = 3",
+        "CREATE TABLE dbo.child (id int PRIMARY KEY, parent_id int \
+         CONSTRAINT fk_child_parent REFERENCES dbo.parent (id) ON DELETE CASCADE)",
+        "INSERT dbo.child VALUES (1, 2)",
+    ] {
+        s.exec(sql).await;
+    }
+    let t = read_table(&s, "parent").await;
+    assert_eq!(t.referenced_by.len(), 1, "{:?}", t.referenced_by);
+    let mut d = TableDraft::from_table(&t);
+    let note = d.columns.remove(3);
+    d.columns.insert(0, note);
+    d.columns
+        .push(ColumnDraft::new(schemaic_core::schema::ColumnInfo {
+            name: "added".into(),
+            type_name: "int".into(),
+            nullable: false,
+            default: Some("7".into()),
+            ..Default::default()
+        }));
+    let cs = schemaic_core::ddl::diff(&t, &d, MS);
+    assert!(
+        matches!(cs.changes.first(), Some(Change::RebuildTable(_))),
+        "{:#?}",
+        cs.changes
+    );
+    apply_draft(&s, &t, &d).await;
+
+    let t2 = read_table(&s, "parent").await;
+    let names: Vec<&str> = t2.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["note", "id", "code", "qty", "added"]);
+    assert_eq!(
+        s.scalar(
+            "SELECT STRING_AGG(CONCAT(id, ':', code, ':', note, ':', added), ',') \
+             WITHIN GROUP (ORDER BY id) FROM dbo.parent"
+        )
+        .await,
+        "1:a:n1:7,2:b:n2:7"
+    );
+    assert_eq!(
+        s.scalar(
+            "SELECT STRING_AGG(name, ',') WITHIN GROUP (ORDER BY name) \
+             FROM sys.objects WHERE parent_object_id = OBJECT_ID(N'dbo.parent')"
+        )
+        .await
+        .split(',')
+        .filter(|n| !n.starts_with("DF__"))
+        .collect::<Vec<_>>(),
+        ["ck_qty", "df_code", "pk_parent", "tr_parent"]
+    );
+    assert_eq!(
+        s.scalar("SELECT COUNT(*) FROM sys.indexes WHERE name = N'ux_code'")
+            .await,
+        "1"
+    );
+    assert_eq!(
+        s.scalar("SELECT CAST(is_disabled AS int) FROM sys.triggers WHERE name = N'tr_parent'")
+            .await,
+        "1"
+    );
+    assert_eq!(t2.comment.as_deref(), Some("parents"));
+    assert_eq!(t2.columns[0].comment.as_deref(), Some("a note"));
+    assert_eq!(
+        s.scalar(
+            "SELECT delete_referential_action_desc FROM sys.foreign_keys \
+             WHERE name = N'fk_child_parent' AND referenced_object_id = OBJECT_ID(N'dbo.parent')"
+        )
+        .await,
+        "CASCADE"
+    );
+    s.exec("INSERT dbo.parent (code) VALUES (N'd')").await;
+    assert_eq!(
+        s.scalar("SELECT id FROM dbo.parent WHERE code = N'd'")
+            .await,
+        "4",
+        "the identity carries on past the deleted row"
+    );
+    let again = schemaic_core::ddl::diff(&t2, &TableDraft::from_table(&t2), MS);
+    assert!(again.changes.is_empty(), "{:#?}", again.changes);
+}
+
+/// **An identity switched on is a rebuild too**, keeping the values the rows
+/// had and numbering on from the highest.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_identity_switched_on_keeps_the_rows_values() {
+    use schemaic_core::ddl::TableDraft;
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("rebuild_id").await;
+    s.exec("CREATE TABLE dbo.t (id int NOT NULL CONSTRAINT pk_t PRIMARY KEY, v int)")
+        .await;
+    s.exec("INSERT dbo.t VALUES (5, 50), (9, 90)").await;
+    let t = read_table(&s, "t").await;
+    let mut d = TableDraft::from_table(&t);
+    d.columns[0].info.auto_increment = true;
+    apply_draft(&s, &t, &d).await;
+    s.exec("INSERT dbo.t (v) VALUES (100)").await;
+    assert_eq!(
+        s.scalar(
+            "SELECT STRING_AGG(CONCAT(id, ':', v), ',') WITHIN GROUP (ORDER BY id) FROM dbo.t"
+        )
+        .await,
+        "5:50,9:90,10:100"
+    );
+    let t2 = read_table(&s, "t").await;
+    assert!(t2.columns[0].auto_increment);
+}
+
+/// **The guard stops a rebuild before anything runs** where the table holds
+/// what the model does not — here a permission granted on it, which
+/// `DROP TABLE` would take — and the table is left as it was.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rebuild_is_refused_where_the_table_has_what_it_would_drop() {
+    use schemaic_core::ddl::TableDraft;
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("rebuild_guard").await;
+    s.exec("CREATE TABLE dbo.t (a int, b int)").await;
+    s.exec("INSERT dbo.t VALUES (1, 2)").await;
+    s.exec("GRANT SELECT ON dbo.t TO public").await;
+    let t = read_table(&s, "t").await;
+    let mut d = TableDraft::from_table(&t);
+    d.columns.swap(0, 1);
+    let stmts = schemaic_core::ddl::diff(&t, &d, MS).emit();
+    let refused =
+        s.db.run_ddl(&s.name, &stmts, CancellationToken::new())
+            .await
+            .expect_err("refused");
+    assert!(
+        refused
+            .to_string()
+            .contains("permissions are granted on it"),
+        "{refused}"
+    );
+    let t2 = read_table(&s, "t").await;
+    assert_eq!(t2.columns[0].name, "a");
+    assert_eq!(s.scalar("SELECT COUNT(*) FROM dbo.t").await, "1");
+}
+
+/// **The other rebuilds, at once, under a new name**: an identity switched
+/// off, a column turned computed, and a key the table has on itself — which
+/// goes down with it and comes back pointed at the new name.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rebuild_under_a_new_name_switches_off_an_identity_and_computes_a_column() {
+    use schemaic_core::ddl::TableDraft;
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("rebuild_more").await;
+    s.exec(
+        "CREATE TABLE dbo.node (id int IDENTITY(1,1) CONSTRAINT pk_node PRIMARY KEY, \
+         up int NULL CONSTRAINT fk_node_up REFERENCES dbo.node (id), \
+         qty int NOT NULL, twice int NULL)",
+    )
+    .await;
+    s.exec("INSERT dbo.node (up, qty, twice) VALUES (NULL, 2, 0), (1, 3, 0)")
+        .await;
+    let t = read_table(&s, "node").await;
+    let mut d = TableDraft::from_table(&t);
+    d.name = "tree".into();
+    d.columns[0].info.auto_increment = false;
+    d.columns[3].info.generated = Some("[qty]*(2)".into());
+    apply_draft(&s, &t, &d).await;
+    let t2 = read_table(&s, "tree").await;
+    assert!(!t2.columns[0].auto_increment);
+    assert!(t2.columns[3].generated.is_some());
+    assert_eq!(
+        s.scalar("SELECT STRING_AGG(CONCAT(id, ':', up, ':', twice), ',') WITHIN GROUP (ORDER BY id) FROM dbo.tree")
+            .await,
+        "1::4,2:1:6"
+    );
+    assert_eq!(
+        t2.foreign_keys
+            .iter()
+            .map(|f| (f.name.as_str(), f.ref_table.as_str()))
+            .collect::<Vec<_>>(),
+        [("fk_node_up", "tree")]
+    );
+    assert_eq!(
+        s.scalar("SELECT COUNT(*) FROM sys.objects WHERE name = N'node'")
+            .await,
+        "0"
+    );
+    let again = schemaic_core::ddl::diff(&t2, &TableDraft::from_table(&t2), MS);
+    assert!(again.changes.is_empty(), "{:#?}", again.changes);
 }

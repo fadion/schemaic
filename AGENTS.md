@@ -18,13 +18,12 @@ introspects, runs scripts, writes grid edits back, imports files, designs tables
 transaction, shows query plans, dumps to `.sql`, opens `sqlcmd`, edits triggers and routines,
 manages logins and database users (on Azure SQL Database contained and Entra users, its logins
 being `master`'s), and signs in with a SQL login, Windows (SSPI, in the Windows
-build) or Microsoft Entra through the Azure CLI, and each thing it
-does not do yet is a capability answering no — `ddl::supports_change` (for the column changes
-T-SQL's `ALTER COLUMN` cannot make) —
-so it is absent from the UI rather than failing there; that one *is* unfinished work. What differs between the
+build) or Microsoft Entra through the Azure CLI, and rebuilds a table for the column changes
+T-SQL's `ALTER COLUMN` cannot make (`ddl::tsql_rebuild_sql`, as SQLite's twelve-step rebuild
+does). What differs between the
 engines now lives in the *narrow* predicates that decide how an edit is performed rather than
 whether it is offered: `ddl::supports_or_replace_view`, `supports_view_rename`,
-`supports_column_reorder`, `supports_change`, `alter_column_disturbs_checks`,
+`supports_column_reorder`, `rebuilds_tables`, `supports_change`, `alter_column_disturbs_checks`,
 `alter_column_disturbs_dependents`,
 `stats::supports_table_stats` — alongside them the few that do decide whether a control is
 offered, because the clause behind it is one engine's alone:

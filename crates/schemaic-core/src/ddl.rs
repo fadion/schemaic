@@ -2989,8 +2989,8 @@ impl Change {
                 plural(d.columns.len())
             ),
             Change::RebuildTable(r) => format!(
-                "Rebuild {} — SQLite can't alter a table in place, so the rows are \
-                 copied into a new one and it takes the old one's place",
+                "Rebuild {} — this can't be altered in place, so the rows are copied \
+                 into a new table and it takes the old one's place",
                 r.current.name
             ),
             Change::DropTable => "Drop the table".to_string(),
@@ -3360,11 +3360,24 @@ impl Change {
             // The table really is dropped in the middle of this, so it belongs
             // in the destructive block even though the plan puts it back. What
             // protects the rows is that the whole procedure is one transaction.
-            Change::RebuildTable(r) => vec![format!(
-                "Drops {} and recreates it, copying every row across. \
-                 Anything about the table Schemaic didn't read is not carried over.",
-                r.current.name
-            )],
+            Change::RebuildTable(r) => vec![match dialect {
+                // Its guard refuses what it knows it would drop; what it
+                // cannot see is the statistics made by hand.
+                SqlDialect::MsSql => format!(
+                    "Drops {} and recreates it, copying every row across, and puts back its \
+                     keys, indexes, checks, defaults, comments and triggers and the foreign \
+                     keys other tables have on it. It stops before it starts if the table has \
+                     anything else Schemaic doesn't restate — permissions, a schema-bound \
+                     dependent, system versioning, replication, compression, index options. \
+                     Statistics created by hand are not carried over.",
+                    r.current.name
+                ),
+                SqlDialect::Sqlite | SqlDialect::MySql | SqlDialect::Postgres => format!(
+                    "Drops {} and recreates it, copying every row across. \
+                     Anything about the table Schemaic didn't read is not carried over.",
+                    r.current.name
+                ),
+            }],
             Change::DropTable => vec!["Drops the table and every row in it.".to_string()],
             Change::TruncateTable => {
                 vec!["Deletes every row in the table. This can't be undone.".to_string()]
@@ -4249,19 +4262,25 @@ impl ChangeSet {
         // where no faithful statement exists: the index was edited, or the plan
         // moves a column the unread part may name.
         if let Some(Change::RebuildTable(r)) = self.changes.iter().find(|c| is_rebuild(c)) {
-            return r
-                .draft
-                .indexes
-                .iter()
-                .filter_map(|ix| match sqlite_index_replay(&r.current, &r.draft, ix) {
-                    IndexReplay::Refuse(why) => Some(why),
-                    IndexReplay::Emit | IndexReplay::Verbatim(_) | IndexReplay::Skip => None,
-                })
-                .chain(rebuild_strands_a_trigger(&r.current, &r.draft))
-                .chain(rebuild_strands_a_generated_column(&r.current, &r.draft))
-                .chain(rebuild_cannot_restate(&r.current))
-                .chain(rebuild_refuses_a_virtual_table(&r.current))
-                .collect();
+            return match self.dialect {
+                // Its own rebuild, with its own list ([`tsql_rebuild_refusals`]).
+                SqlDialect::MsSql => tsql_rebuild_refusals(&r.current, &r.draft),
+                // `diff` raises a rebuild only where `rebuilds_tables`, so the
+                // other two never reach here.
+                SqlDialect::Sqlite | SqlDialect::MySql | SqlDialect::Postgres => r
+                    .draft
+                    .indexes
+                    .iter()
+                    .filter_map(|ix| match sqlite_index_replay(&r.current, &r.draft, ix) {
+                        IndexReplay::Refuse(why) => Some(why),
+                        IndexReplay::Emit | IndexReplay::Verbatim(_) | IndexReplay::Skip => None,
+                    })
+                    .chain(rebuild_strands_a_trigger(&r.current, &r.draft))
+                    .chain(rebuild_strands_a_generated_column(&r.current, &r.draft))
+                    .chain(rebuild_cannot_restate(&r.current))
+                    .chain(rebuild_refuses_a_virtual_table(&r.current))
+                    .collect(),
+            };
         }
         let mut out: Vec<String> = self
             .changes
@@ -4307,6 +4326,12 @@ impl ChangeSet {
     /// table as it was.
     fn emit_mssql(&self) -> Vec<String> {
         let d = self.dialect;
+        // A rebuild subsumes the set, as SQLite's does: it writes the table
+        // the draft describes — its name included — so every other entry is
+        // already in it.
+        if let Some(Change::RebuildTable(r)) = self.changes.iter().find(|c| is_rebuild(c)) {
+            return tsql_rebuild_sql(&r.current, &r.draft);
+        }
         let q = self.qname();
         let ident = |s: &str| ddl_ident_in(s, d);
         let admitted: Vec<&Change> = self
@@ -9151,7 +9176,8 @@ pub fn default_new_column_type(dialect: SqlDialect) -> &'static str {
 /// no such clause and needs none: a move is a change with no `ALTER` behind it,
 /// so it falls through to the rebuild, and the shadow table is created in the
 /// draft's column order — the move costs nothing beyond the rebuild already under
-/// way. PostgreSQL has neither: column order there is physical and no statement
+/// way. SQL Server is the same case through its own rebuild
+/// ([`tsql_rebuild_sql`]). PostgreSQL has neither: column order there is physical and no statement
 /// moves one, so a reordered draft is a preference the server has no way to
 /// honour, and arrows in the designer would promise an edit no statement can
 /// carry out.
@@ -9162,9 +9188,21 @@ pub fn default_new_column_type(dialect: SqlDialect) -> &'static str {
 /// one doesn't compile until someone has answered for it.
 pub fn supports_column_reorder(dialect: SqlDialect) -> bool {
     match dialect {
-        SqlDialect::MySql | SqlDialect::Sqlite => true,
-        // No statement moves a column there either.
-        SqlDialect::Postgres | SqlDialect::MsSql => false,
+        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => true,
+        SqlDialect::Postgres => false,
+    }
+}
+
+/// Does [`diff`] do what `dialect` has no statement for **by rebuilding the
+/// table** ([`Change::RebuildTable`])? SQLite, whose `ALTER TABLE` does four
+/// things ([`sqlite_rebuild_sql`]), and SQL Server, whose `ALTER COLUMN` cannot
+/// switch an identity, convert a computed column or move one
+/// ([`tsql_rebuild_sql`]). MySQL and PostgreSQL alter in place, and what they
+/// cannot alter a rebuild would not make possible.
+pub fn rebuilds_tables(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::Sqlite | SqlDialect::MsSql => true,
+        SqlDialect::MySql | SqlDialect::Postgres => false,
     }
 }
 
@@ -11173,6 +11211,445 @@ pub fn sqlite_rebuild_sql(current: &TableInfo, draft: &TableDraft) -> Vec<String
     out
 }
 
+/// The temporary table a T-SQL rebuild keeps the table's default constraint
+/// names in, from before the drop to after it — a `#` table, so it is the
+/// session's, and `Db::run_ddl`'s one connection carries it across batches.
+const TSQL_REBUILD_DEFAULTS: &str = "#schemaic_rebuild_defaults";
+
+/// A column whose values the server makes, so no `INSERT` names it: a
+/// computed one, and a `rowversion` — asked of its type, since the reader
+/// sets `identity_always` on an identity too, and the designer's toggle
+/// switches an identity off by `auto_increment` alone.
+fn tsql_server_filled(c: &ColumnInfo) -> bool {
+    let ty = c.type_name.trim();
+    c.generated.is_some()
+        || ty.eq_ignore_ascii_case("rowversion")
+        || ty.eq_ignore_ascii_case("timestamp")
+}
+
+/// **SQL Server's table rebuild** — what a change T-SQL's `ALTER TABLE` cannot
+/// make is done by: switching an identity on or off, turning a column into or
+/// out of a computed one, and putting a column anywhere but last. SSMS's
+/// designer does the same, and the shape is its: a shadow table in the draft's
+/// columns and order, the rows copied in, the table dropped, the shadow
+/// renamed into its place, and everything that stood on the table put back.
+///
+/// In order, each its own batch, every one inside `Db::run_ddl`'s one
+/// transaction — so a failure anywhere leaves the table as it was:
+///
+/// 1. **A guard that stops the plan before it starts** when the table carries
+///    anything the model does not, and so the rebuild would silently drop:
+///    permissions granted on it, a schema-bound dependent, system versioning,
+///    memory optimisation, replication or change tracking, a partition scheme
+///    or a filegroup other than the default, compression, an extended property
+///    other than its comments, an index option, a column feature (sparse,
+///    `FILESTREAM`, `ROWGUIDCOL`, masking, encryption, an XML schema), a
+///    disabled, untrusted or `NOT FOR REPLICATION` key — and a count of its
+///    indexes, keys, checks and triggers that no longer matches the reading
+///    the draft was made from. The alternative to each is a plan that
+///    succeeds and reports nothing lost.
+/// 2. The default constraints' names, kept in [`TSQL_REBUILD_DEFAULTS`]: the
+///    model reads a default's value and not its name, and a default put back
+///    under `DF__t__a__5EBF139D` is not the one scripts and a schema compare
+///    name.
+/// 3. The foreign keys **other tables** have on it ([`TableInfo::referenced_by`])
+///    dropped — each refuses the `DROP TABLE` (Msg 3726).
+/// 4. The shadow, `<table>_schemaic_rebuild`, of the draft's columns alone: no
+///    key, index, check or default, since a constraint's name is the schema's
+///    and the table still holds each one.
+/// 5. The rows, `IDENTITY_INSERT` on where an identity column is copied into.
+///    A column that is new takes its default's expression in the `SELECT`,
+///    which is what a new column's default does to the rows already there.
+/// 6. The table dropped, the shadow renamed to the draft's name, and an
+///    identity kept reseeded to where the old table's stood, so values freed
+///    by deleted rows are not handed out again.
+/// 7. The key, checks, indexes and unique constraints over the new table, its
+///    own foreign keys, the defaults under their names, the comments, the
+///    triggers (disabled and ranked as they were), and last the other tables'
+///    keys, pointed at it.
+pub fn tsql_rebuild_sql(current: &TableInfo, draft: &TableDraft) -> Vec<String> {
+    let d = SqlDialect::MsSql;
+    let q = |s: &str| ddl_ident_in(s, d);
+    let schema = current
+        .schema
+        .as_deref()
+        .unwrap_or(crate::schema::MSSQL_DEFAULT_SCHEMA);
+    let original = qualified(&current.name, Some(schema), d);
+    let shadow_name = format!("{}{REBUILD_SUFFIX}", current.name);
+    let shadow = qualified(&shadow_name, Some(schema), d);
+    let final_name = if draft.name.trim().is_empty() {
+        current.name.clone()
+    } else {
+        draft.name.clone()
+    };
+    let target = qualified(&final_name, Some(schema), d);
+    // A current column's name as the draft has it, for what names the table's
+    // columns from outside — another table's key.
+    let renamed = |old: &str| -> String {
+        draft
+            .columns
+            .iter()
+            .find(|c| c.original.as_deref() == Some(old))
+            .map(|c| c.info.name.clone())
+            .unwrap_or_else(|| old.to_string())
+    };
+    let same_table = |s: Option<&str>, t: &str| {
+        t == current.name && s.unwrap_or(crate::schema::MSSQL_DEFAULT_SCHEMA) == schema
+    };
+    let mut out = Vec::new();
+
+    // 1. The guard.
+    let own_keys = current.indexes.len();
+    let reasons: Vec<(String, &str)> = vec![
+        (
+            "EXISTS (SELECT 1 FROM sys.database_permissions WHERE class = 1 AND major_id = @t)"
+                .into(),
+            "permissions are granted on it",
+        ),
+        (
+            // Not its own: a check or default constraint is an object of its
+            // own, schema-bound to the table it stands on.
+            "EXISTS (SELECT 1 FROM sys.sql_expression_dependencies d WHERE d.referenced_id = @t \
+             AND d.is_schema_bound_reference = 1 AND d.referencing_id <> @t \
+             AND NOT EXISTS (SELECT 1 FROM sys.objects o WHERE o.object_id = d.referencing_id \
+             AND o.parent_object_id = @t))"
+                .into(),
+            "a schema-bound view or function depends on it",
+        ),
+        (
+            "EXISTS (SELECT 1 FROM sys.tables WHERE object_id = @t AND (temporal_type <> 0 \
+             OR is_memory_optimized = 1 OR is_replicated = 1 OR is_merge_published = 1 \
+             OR is_sync_tran_subscribed = 1 OR is_tracked_by_cdc = 1 OR lock_escalation <> 0))"
+                .into(),
+            "it is system-versioned, memory-optimised, replicated, tracked by change data \
+             capture or has a lock escalation setting",
+        ),
+        (
+            "EXISTS (SELECT 1 FROM sys.change_tracking_tables WHERE object_id = @t) \
+             OR EXISTS (SELECT 1 FROM sys.fulltext_indexes WHERE object_id = @t)"
+                .into(),
+            "it has change tracking or a full-text index",
+        ),
+        (
+            "EXISTS (SELECT 1 FROM sys.indexes i JOIN sys.data_spaces s \
+             ON s.data_space_id = i.data_space_id WHERE i.object_id = @t \
+             AND (s.type <> 'FG' OR s.is_default = 0)) \
+             OR EXISTS (SELECT 1 FROM sys.tables t JOIN sys.data_spaces s \
+             ON s.data_space_id = t.lob_data_space_id WHERE t.object_id = @t AND s.is_default = 0) \
+             OR EXISTS (SELECT 1 FROM sys.partitions WHERE object_id = @t AND data_compression <> 0)"
+                .into(),
+            "it is partitioned, compressed or stored off the default filegroup",
+        ),
+        (
+            "EXISTS (SELECT 1 FROM sys.extended_properties WHERE class = 1 AND major_id = @t \
+             AND name <> N'MS_Description')"
+                .into(),
+            "it carries extended properties other than its comments",
+        ),
+        (
+            "EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = @t AND index_id > 0 \
+             AND (fill_factor NOT IN (0, 100) OR ignore_dup_key = 1 OR is_padded = 1 \
+             OR allow_row_locks = 0 OR allow_page_locks = 0))"
+                .into(),
+            "an index sets a fill factor, padding, IGNORE_DUP_KEY or row or page locks",
+        ),
+        (
+            "EXISTS (SELECT 1 FROM sys.columns WHERE object_id = @t AND (is_sparse = 1 \
+             OR is_column_set = 1 OR is_filestream = 1 OR is_rowguidcol = 1 OR is_masked = 1 \
+             OR encryption_type IS NOT NULL OR xml_collection_id <> 0 OR is_hidden = 1))"
+                .into(),
+            "a column is sparse, a column set, hidden, FILESTREAM, ROWGUIDCOL, masked, \
+             encrypted or typed by an XML schema",
+        ),
+        (
+            "EXISTS (SELECT 1 FROM sys.foreign_keys WHERE (parent_object_id = @t \
+             OR referenced_object_id = @t) AND (is_disabled = 1 OR is_not_trusted = 1 \
+             OR is_not_for_replication = 1)) \
+             OR EXISTS (SELECT 1 FROM sys.check_constraints WHERE parent_object_id = @t \
+             AND is_not_for_replication = 1) \
+             OR EXISTS (SELECT 1 FROM sys.identity_columns WHERE object_id = @t \
+             AND is_not_for_replication = 1)"
+                .into(),
+            "a foreign key on it or to it is disabled, untrusted or NOT FOR REPLICATION, \
+             or a check or its identity is",
+        ),
+        (
+            format!(
+                "(SELECT COUNT(*) FROM sys.indexes WHERE object_id = @t AND index_id > 0 \
+                 AND is_hypothetical = 0) <> {own_keys} \
+                 OR (SELECT COUNT(*) FROM sys.foreign_keys WHERE parent_object_id = @t) <> {} \
+                 OR (SELECT COUNT(*) FROM sys.foreign_keys WHERE referenced_object_id = @t \
+                 AND parent_object_id <> @t) <> {} \
+                 OR (SELECT COUNT(*) FROM sys.check_constraints WHERE parent_object_id = @t) <> {} \
+                 OR (SELECT COUNT(*) FROM sys.triggers WHERE parent_id = @t) <> {}",
+                current.foreign_keys.len(),
+                current.referenced_by.len(),
+                current.check_constraints.len(),
+                current.triggers.len(),
+            ),
+            "its indexes, keys, checks or triggers changed since it was read - reopen it",
+        ),
+    ];
+    let cases = reasons
+        .iter()
+        .map(|(cond, why)| format!("WHEN {cond} THEN {}", tsql_n(why)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    out.push(format!(
+        "DECLARE @t int = OBJECT_ID({}) DECLARE @why nvarchar(400) = CASE {cases} END \
+         IF @why IS NOT NULL THROW 50000, @why, 1;",
+        tsql_n(&original),
+    ));
+
+    // 2. The defaults' names.
+    out.push(format!(
+        "SELECT c.name AS col, dc.name AS df INTO {TSQL_REBUILD_DEFAULTS} \
+         FROM sys.default_constraints dc JOIN sys.columns c \
+         ON c.object_id = dc.parent_object_id AND c.column_id = dc.parent_column_id \
+         WHERE dc.parent_object_id = OBJECT_ID({});",
+        tsql_n(&original)
+    ));
+
+    // 3. The other tables' keys, off.
+    for fk in &current.referenced_by {
+        out.push(format!(
+            "ALTER TABLE {} DROP CONSTRAINT {};",
+            qualified(&fk.table, fk.schema.as_deref(), d),
+            q(&fk.key.name)
+        ));
+    }
+
+    // 4. The shadow, columns alone.
+    let bare = |c: &ColumnInfo| ColumnInfo {
+        default: None,
+        primary_key: false,
+        comment: None,
+        ..c.clone()
+    };
+    let defs = draft
+        .columns
+        .iter()
+        .map(|c| format!("  {}", bare(&c.info).definition_sql(d)))
+        .collect::<Vec<_>>()
+        .join(",\n");
+    out.push(format!("CREATE TABLE {shadow} (\n{defs}\n);"));
+
+    // 5. The rows.
+    let from_col = |c: &ColumnDraft| -> Option<String> {
+        if tsql_server_filled(&c.info) {
+            return None;
+        }
+        match c
+            .original
+            .as_deref()
+            .filter(|o| current.columns.iter().any(|x| &x.name == o))
+        {
+            Some(o) => Some(q(o)),
+            // A new column: what its default gives the rows already there. A
+            // new identity numbers them itself.
+            None if c.info.auto_increment => None,
+            None => norm_default(c.info.default.as_deref()).map(|v| format!("({v})")),
+        }
+    };
+    let copied: Vec<(String, String)> = draft
+        .columns
+        .iter()
+        .filter_map(|c| from_col(c).map(|from| (q(&c.info.name), from)))
+        .collect();
+    if !copied.is_empty() {
+        let identity_in = draft.columns.iter().any(|c| {
+            c.info.auto_increment
+                && c.original
+                    .as_deref()
+                    .is_some_and(|o| current.columns.iter().any(|x| x.name == o))
+        });
+        let into = copied.iter().map(|(i, _)| i.as_str()).collect::<Vec<_>>();
+        let from = copied.iter().map(|(_, f)| f.as_str()).collect::<Vec<_>>();
+        let insert = format!(
+            "INSERT INTO {shadow} ({}) SELECT {} FROM {original} WITH (TABLOCKX)",
+            into.join(", "),
+            from.join(", ")
+        );
+        out.push(if identity_in {
+            format!("SET IDENTITY_INSERT {shadow} ON {insert} SET IDENTITY_INSERT {shadow} OFF;")
+        } else {
+            format!("{insert};")
+        });
+    }
+
+    // 6. The swap.
+    let keeps_identity = draft.columns.iter().any(|c| c.info.auto_increment)
+        && current.columns.iter().any(|c| c.auto_increment);
+    let rename = tsql_rename(&shadow, &final_name, None);
+    let rename = rename.trim_end_matches(';');
+    if keeps_identity {
+        let t = tsql_n(&target);
+        out.push(format!(
+            // `EXEC (…)` takes literals and variables only, so the reseed is
+            // spelled into one first.
+            "DECLARE @seed numeric(38, 0) = IDENT_CURRENT({}) DROP TABLE {original} {rename} \
+             DECLARE @reseed nvarchar(max) = N'DBCC CHECKIDENT (' + {} + N', RESEED, ' \
+             + CAST(@seed AS nvarchar(40)) + N') WITH NO_INFOMSGS' \
+             IF @seed IS NOT NULL AND IDENT_INCR({t}) > 0 AND @seed > IDENT_CURRENT({t}) \
+             EXEC (@reseed);",
+            tsql_n(&original),
+            tsql_n(&tsql_n(&target)),
+        ));
+    } else {
+        out.push(format!("DROP TABLE {original} {rename};"));
+    }
+
+    // 7. Everything that stood on it.
+    let pk_constraint = current
+        .indexes
+        .iter()
+        .find(|ix| ix.is_primary())
+        .and_then(|ix| ix.constraint.clone());
+    // A key naming this table names it as the draft does now.
+    let pointed = |fk: &ForeignKeyInfo| -> ForeignKeyInfo {
+        let mut fk = fk.clone();
+        if same_table(fk.ref_schema.as_deref(), &fk.ref_table) {
+            fk.ref_table = final_name.clone();
+            fk.ref_columns = fk.ref_columns.iter().map(|c| renamed(c)).collect();
+        }
+        fk
+    };
+    let mut over: Vec<Change> = Vec::new();
+    if !draft.primary_key.is_empty() {
+        over.push(Change::PrimaryKey {
+            from: Vec::new(),
+            to: draft.primary_key.clone(),
+            drop_constraint: pk_constraint,
+            clustered: draft.primary_key_clustered,
+        });
+    }
+    over.extend(
+        draft
+            .check_constraints
+            .iter()
+            .map(|ck| Change::AddCheck(Box::new(ck.info.clone()))),
+    );
+    over.extend(
+        draft
+            .indexes
+            .iter()
+            .map(|ix| Change::AddIndex(Box::new(ix.info.clone()))),
+    );
+    let set_on_it = |changes: Vec<Change>| ChangeSet {
+        table: final_name.clone(),
+        schema: Some(schema.to_string()),
+        dialect: d,
+        flavour: Default::default(),
+        changes,
+    };
+    out.extend(set_on_it(over).emit());
+    // Its own keys after its unique ones, which a self-reference may name.
+    out.extend(
+        set_on_it(
+            draft
+                .foreign_keys
+                .iter()
+                .map(|fk| Change::AddForeignKey(Box::new(pointed(&fk.info))))
+                .collect(),
+        )
+        .emit(),
+    );
+    for c in draft
+        .columns
+        .iter()
+        .filter(|c| !tsql_server_filled(&c.info))
+    {
+        let Some(v) = norm_default(c.info.default.as_deref()).filter(|_| !c.info.auto_increment)
+        else {
+            continue;
+        };
+        let was = c.original.as_deref().unwrap_or(&c.info.name);
+        let col = q(&c.info.name);
+        out.push(format!(
+            "DECLARE @df sysname = (SELECT df FROM {TSQL_REBUILD_DEFAULTS} WHERE col = {}) \
+             DECLARE @add nvarchar(max) = {} + ISNULL(N'CONSTRAINT ' + QUOTENAME(@df) + N' ', N'') \
+             + {} EXEC (@add);",
+            tsql_n(was),
+            tsql_n(&format!("ALTER TABLE {target} ADD ")),
+            tsql_n(&format!("DEFAULT ({v}) FOR {col}")),
+        ));
+    }
+    let on_table = TsqlComment {
+        schema,
+        table: &final_name,
+        object_type: "TABLE",
+        column: None,
+    };
+    if let Some(cm) = blank_as_none(draft.comment.as_deref()) {
+        out.push(on_table.add(cm));
+    }
+    for c in &draft.columns {
+        if let Some(cm) = blank_as_none(c.info.comment.as_deref()) {
+            let on = TsqlComment {
+                column: Some(&c.info.name),
+                ..on_table
+            };
+            out.push(on.add(cm));
+        }
+    }
+    let mut ranks = Vec::new();
+    for t in &current.triggers {
+        let mut t = t.clone();
+        t.table = final_name.clone();
+        let (statements, ranked) = trigger_create_statements(&t, false, d);
+        out.extend(statements);
+        ranks.extend(ranked);
+    }
+    out.extend(ranks);
+    for fk in &current.referenced_by {
+        out.push(format!(
+            "ALTER TABLE {} ADD {};",
+            qualified(&fk.table, fk.schema.as_deref(), d),
+            fk_clause(&pointed(&fk.key), d)
+        ));
+    }
+    out.push(format!("DROP TABLE {TSQL_REBUILD_DEFAULTS};"));
+    out
+}
+
+/// What a T-SQL rebuild ([`tsql_rebuild_sql`]) cannot put back from the
+/// model, said before anything runs — the half of its refusals the reading
+/// already shows, where the guard it opens with is the half only the server
+/// can answer. An index Schemaic does not read whole (included columns, a
+/// columnstore, XML or spatial one) would come back without what it did not
+/// read; a trigger whose text is encrypted has none to put back; one kept
+/// verbatim names the table as it was, which a rename leaves behind.
+fn tsql_rebuild_refusals(current: &TableInfo, draft: &TableDraft) -> Vec<String> {
+    let t = &current.name;
+    let mut out: Vec<String> = current
+        .indexes
+        .iter()
+        .filter(|ix| ix.lossy && !ix.is_primary())
+        .map(|ix| {
+            format!(
+                "Rebuilding {t} would drop the index {}: it has included columns or is a \
+                 columnstore, XML or spatial index, which Schemaic doesn't read whole",
+                ix.name
+            )
+        })
+        .collect();
+    let renamed = !draft.name.trim().is_empty() && draft.name != current.name;
+    for tr in &current.triggers {
+        if tr.tsql.hidden {
+            out.push(format!(
+                "Rebuilding {t} would drop the trigger {}: its text is encrypted",
+                tr.name
+            ));
+        } else if renamed && tr.tsql.verbatim.is_some() {
+            out.push(format!(
+                "Rebuilding {t} under a new name would leave the trigger {} naming the old one",
+                tr.name
+            ));
+        }
+    }
+    out
+}
+
 /// Can `dialect` express this one change as SQL [`ChangeSet::emit`] writes?
 ///
 /// It asks about a change **on its own** — a context-menu shortcut, which has a
@@ -11442,13 +11919,14 @@ fn account_change_supported(dialect: SqlDialect, change: &Change) -> bool {
 /// [`supports_change`] for SQL Server: the table's own changes, which
 /// [`ChangeSet::emit_mssql`] writes, and nothing the other editors need.
 ///
-/// **Refused, and each is a fact about `ALTER COLUMN` rather than unfinished
-/// work:** switching an identity on or off (T-SQL cannot — the column is
-/// dropped and re-added, which loses its values), and changing a computed
-/// column or turning a column into or out of one (the same). Also refused, as
-/// unfinished work: a column's position (T-SQL has no reorder), MariaDB's
-/// inline check, a primary key whose constraint name was
-/// not read (T-SQL drops it by name), and an unnamed check (the same). A view
+/// **Refused here, and done by [`tsql_rebuild_sql`] instead**, each a fact
+/// about `ALTER COLUMN`: switching an identity on or off, changing a computed
+/// column or turning a column into or out of one, and a column's position —
+/// [`diff`] answers a set holding one with a [`Change::RebuildTable`], which is
+/// admitted. Also refused: MariaDB's inline check, and a primary key whose
+/// constraint name was not read and an unnamed check, which T-SQL drops by
+/// name — neither reachable from a reading, since the reader names every key
+/// (`sys.indexes`) and every check (`sys.check_constraints`). A view
 /// is created and replaced (`CREATE OR ALTER VIEW`); its `RenameView` is never
 /// raised, a rename being a re-create. A trigger is created, altered in place
 /// (`CREATE OR ALTER TRIGGER`, [`supports_trigger_alter_in_place`]) and
@@ -11464,6 +11942,7 @@ fn tsql_supports(change: &Change) -> bool {
         | Change::CreateRoutine(_)
         | Change::ReplaceRoutine { .. } => true,
         Change::CreateTable(_)
+        | Change::RebuildTable(_)
         | Change::DropTable
         | Change::TruncateTable
         | Change::DropView {
@@ -12020,7 +12499,9 @@ pub fn diff(current: &TableInfo, draft: &TableDraft, target: impl Into<Target>) 
     // when anything beside it needs one — the rebuild writes the table the draft
     // describes, so the column is already in it, and emitting the `ADD COLUMN`
     // as well would add it twice.
-    if dialect == SqlDialect::Sqlite
+    //
+    // SQL Server rebuilds the same way, and by the same rule ([`rebuilds_tables`]).
+    if rebuilds_tables(dialect)
         && !changes.is_empty()
         && changes.iter().any(|c| !supports_change(dialect, c))
     {
@@ -14701,10 +15182,11 @@ mod tests {
     /// **SQL Server's table changes, and the ones T-SQL cannot make in place.**
     /// Every admitted change emits something — admitted and not written would
     /// be a change the plan silently drops — except `KeepLossyIndex`, whose
-    /// whole point is a risk line and no statement. Refused: an identity
-    /// switched on or off and a computed column changed (T-SQL's `ALTER COLUMN`
-    /// can do neither), a comment (extended properties, not written yet), a
-    /// materialized view, and the editors that need a `Create` and a `Replace`.
+    /// whole point is a risk line and no statement. Refused on its own: an
+    /// identity switched on or off and a computed column changed (T-SQL's
+    /// `ALTER COLUMN` can do neither, so `diff` rebuilds the table for them —
+    /// `sql_server_rebuilds_what_alter_column_cannot`), MySQL's table options,
+    /// a materialized view, and what is never raised.
     #[test]
     fn sql_server_admits_the_table_changes_it_can_write() {
         let yes = [
@@ -14841,10 +15323,216 @@ mod tests {
             );
         }
         assert!(supports_table_design(MsSql));
-        assert!(!supports_column_reorder(MsSql));
+        // Moved by the rebuild, as the refused changes above are.
+        assert!(supports_column_reorder(MsSql));
+        assert!(rebuilds_tables(MsSql));
         assert!(supports_view_editing(MsSql));
         assert!(supports_routine_editing(MsSql));
         assert!(supports_trigger_editing(MsSql));
+    }
+
+    /// A SQL Server table as the reader gives one: an identity key named
+    /// `pk_p`, a defaulted `code`, a check, a unique index, a trigger, and a
+    /// key `dbo.child` has on it.
+    fn ms_rebuild_table() -> TableInfo {
+        TableInfo {
+            name: "p".into(),
+            schema: Some("dbo".into()),
+            columns: vec![
+                ColumnInfo {
+                    auto_increment: true,
+                    identity_always: true,
+                    nullable: false,
+                    primary_key: true,
+                    ..ms_col("id", "int")
+                },
+                ColumnInfo {
+                    nullable: false,
+                    default: Some("N'x'".into()),
+                    comment: Some("the code".into()),
+                    ..ms_col("code", "nvarchar(10)")
+                },
+                ms_col("qty", "int"),
+            ],
+            indexes: vec![
+                IndexInfo {
+                    name: "PRIMARY".into(),
+                    unique: true,
+                    constraint: Some("pk_p".into()),
+                    columns: vec![crate::schema::IndexColumn::plain("id")],
+                    ..Default::default()
+                },
+                IndexInfo {
+                    name: "ux_code".into(),
+                    unique: true,
+                    columns: vec![crate::schema::IndexColumn::plain("code")],
+                    ..Default::default()
+                },
+            ],
+            check_constraints: vec![CheckInfo {
+                name: "ck_qty".into(),
+                expression: "[qty]>=(0)".into(),
+                enforced: true,
+                validated: true,
+                inherited: false,
+                column_level: false,
+            }],
+            triggers: vec![TriggerInfo {
+                name: "tr_p".into(),
+                schema: Some("dbo".into()),
+                table: "p".into(),
+                events: vec![crate::schema::TriggerEvent::Insert],
+                action: crate::schema::TriggerAction::Body("SET NOCOUNT ON".into()),
+                ..Default::default()
+            }],
+            referenced_by: vec![crate::schema::InboundForeignKey {
+                schema: Some("dbo".into()),
+                table: "child".into(),
+                key: ForeignKeyInfo {
+                    name: "fk_child_p".into(),
+                    columns: vec!["p_id".into()],
+                    ref_schema: Some("dbo".into()),
+                    ref_table: "p".into(),
+                    ref_columns: vec!["id".into()],
+                    on_delete: Some("CASCADE".into()),
+                    ..Default::default()
+                },
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// **What `ALTER COLUMN` cannot do, SQL Server does by rebuilding the
+    /// table** — an identity switched off, here, with the table renamed in
+    /// the same plan. The plan opens with its guard, keeps the defaults'
+    /// names across the drop, takes the other table's key off before the
+    /// drop, builds a bare shadow in the draft's order, copies the rows with
+    /// the identity's values, swaps the tables, puts back the key under its
+    /// name, the check, the index, the default by its kept name, the comment
+    /// and the trigger on the new name, and points the other table's key at
+    /// it — and says nothing withheld. Every statement is one batch with no
+    /// `;` inside, as the preview's Open in editor splits at them.
+    #[test]
+    fn sql_server_rebuilds_what_alter_column_cannot() {
+        let t = ms_rebuild_table();
+        let mut d = TableDraft::from_table(&t);
+        d.name = "q".into();
+        d.columns[0].info.auto_increment = false;
+        let cs = diff(&t, &d, MsSql);
+        assert!(
+            matches!(cs.changes.first(), Some(Change::RebuildTable(_))),
+            "{:#?}",
+            cs.changes
+        );
+        assert!(cs.unsupported().is_empty(), "{:?}", cs.unsupported());
+        let stmts = cs.emit();
+        let at = |needle: &str| {
+            stmts
+                .iter()
+                .position(|s| s.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} in {stmts:#?}"))
+        };
+        assert!(stmts[0].starts_with("DECLARE @t int = OBJECT_ID(N'[dbo].[p]')"));
+        assert!(stmts[0].ends_with("IF @why IS NOT NULL THROW 50000, @why, 1;"));
+        assert!(stmts[0].contains("referenced_object_id = @t AND parent_object_id <> @t) <> 1"));
+        assert_eq!(
+            stmts[at("CREATE TABLE")],
+            "CREATE TABLE [dbo].[p_schemaic_rebuild] (\n  [id] int NOT NULL,\n  \
+             [code] nvarchar(10) NOT NULL,\n  [qty] int NULL\n);"
+        );
+        assert_eq!(
+            stmts[at("INSERT INTO")],
+            "INSERT INTO [dbo].[p_schemaic_rebuild] ([id], [code], [qty]) \
+             SELECT [id], [code], [qty] FROM [dbo].[p] WITH (TABLOCKX);",
+            "no identity to insert into"
+        );
+        assert_eq!(
+            stmts[at("DROP TABLE [dbo].[p]")],
+            "DROP TABLE [dbo].[p] EXEC sp_rename N'[dbo].[p_schemaic_rebuild]', N'q';",
+            "no identity left to reseed"
+        );
+        let order = [
+            "THROW 50000",
+            "INTO #schemaic_rebuild_defaults",
+            "ALTER TABLE [dbo].[child] DROP CONSTRAINT [fk_child_p];",
+            "CREATE TABLE",
+            "INSERT INTO",
+            "DROP TABLE [dbo].[p]",
+            "ALTER TABLE [dbo].[q] ADD CONSTRAINT [pk_p] PRIMARY KEY ([id]);",
+            "ALTER TABLE [dbo].[q] ADD CONSTRAINT [ck_qty] CHECK ([qty]>=(0));",
+            "CREATE UNIQUE INDEX [ux_code] ON [dbo].[q] ([code]);",
+            "WHERE col = N'code'",
+            "@level1name = N'q', @level2type = N'COLUMN', @level2name = N'code'",
+            "CREATE TRIGGER [dbo].[tr_p] ON [dbo].[q]",
+            "ALTER TABLE [dbo].[child] ADD CONSTRAINT [fk_child_p] FOREIGN KEY ([p_id]) \
+             REFERENCES [dbo].[q] ([id]) ON DELETE CASCADE;",
+            "DROP TABLE #schemaic_rebuild_defaults;",
+        ];
+        let positions: Vec<usize> = order.iter().map(|n| at(n)).collect();
+        assert!(
+            positions.windows(2).all(|w| w[0] < w[1]),
+            "{positions:?}\n{stmts:#?}"
+        );
+        assert_eq!(positions.last(), Some(&(stmts.len() - 1)));
+        for s in stmts.iter().filter(|s| !s.starts_with("CREATE TRIGGER")) {
+            let body = s.trim_end().trim_end_matches(';');
+            assert!(
+                crate::sql::statement_ranges(body, MsSql).len() <= 1,
+                "a `;` inside: {s}"
+            );
+        }
+        // Nothing but the rebuild is written: the rename is in it.
+        assert!(!stmts.iter().any(|s| s.contains("N'[dbo].[p]', N'q'")));
+    }
+
+    /// **An identity kept is copied into and reseeded; a column moved is a
+    /// rebuild; a column added takes its default into the old rows.**
+    #[test]
+    fn a_sql_server_rebuild_copies_into_an_identity_and_fills_a_new_column() {
+        let t = ms_rebuild_table();
+        let mut d = TableDraft::from_table(&t);
+        d.columns.swap(1, 2);
+        d.columns.push(ColumnDraft::new(ColumnInfo {
+            nullable: false,
+            default: Some("7".into()),
+            ..ms_col("added", "int")
+        }));
+        let cs = diff(&t, &d, MsSql);
+        assert!(matches!(cs.changes.first(), Some(Change::RebuildTable(_))));
+        let stmts = cs.emit();
+        let insert = stmts.iter().find(|s| s.contains("INSERT INTO")).unwrap();
+        assert_eq!(
+            insert,
+            "SET IDENTITY_INSERT [dbo].[p_schemaic_rebuild] ON \
+             INSERT INTO [dbo].[p_schemaic_rebuild] ([id], [qty], [code], [added]) \
+             SELECT [id], [qty], [code], (7) FROM [dbo].[p] WITH (TABLOCKX) \
+             SET IDENTITY_INSERT [dbo].[p_schemaic_rebuild] OFF;"
+        );
+        let swap = stmts
+            .iter()
+            .find(|s| s.contains("DROP TABLE [dbo].[p]"))
+            .unwrap();
+        assert!(swap.starts_with("DECLARE @seed numeric(38, 0) = IDENT_CURRENT(N'[dbo].[p]')"));
+        assert!(swap.ends_with("EXEC (@reseed);"), "{swap}");
+    }
+
+    /// **What the rebuild cannot put back is said before anything runs**: an
+    /// index it does not read whole, and a trigger whose text is encrypted.
+    #[test]
+    fn a_sql_server_rebuild_refuses_what_it_cannot_put_back() {
+        let mut t = ms_rebuild_table();
+        t.indexes.push(IndexInfo {
+            name: "ix_inc".into(),
+            lossy: true,
+            columns: vec![crate::schema::IndexColumn::plain("qty")],
+            ..Default::default()
+        });
+        t.triggers[0].tsql.hidden = true;
+        let mut d = TableDraft::from_table(&t);
+        d.columns[0].info.auto_increment = false;
+        let refused = diff(&t, &d, MsSql).unsupported();
+        assert_eq!(refused.len(), 2, "{refused:?}");
+        assert!(refused[0].contains("ix_inc") && refused[1].contains("tr_p"));
     }
 
     /// **One column renamed, retyped, made `NOT NULL` and given a new default,
