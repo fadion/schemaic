@@ -14903,6 +14903,17 @@ existing prose was left alone.
     everything right. Eight of the seventeen call sites had noticed and were spelling
     `status.style(|s| s.min_width(0.0))` themselves; the other nine were not — a helper whose
     contract only holds if the caller repeats half of it is one that will keep being called wrong.
+    **`modal_footer_noted` is for a sentence too long to end in a `…` beside the buttons**: the note
+    gets a full-width row of its own above them, wrapping at the modal's width, with the actions
+    right-aligned below and never shrinking. **Never spell that as a `v_stack` handed to
+    `modal_footer`** — its actions slot is `flex_shrink(0)` and as wide as its content, so a
+    `width_full` inside it has no definite width to be a percentage of, and the sentence laid out on
+    one line at its natural length: Import Connections' "Added N connections." line took Close and
+    Import past the modal's right edge exactly that way. Here the note is a direct child of the bar,
+    whose width is the modal's. A caller whose note is sometimes absent hides it with
+    `Display::None` rather than leaving it empty, or the empty row still takes the column's gap. The
+    bar's own styling — full width, the modal's side padding, the top rule — is the private
+    `footer_bar`, which `modal_footer_split` and `modal_footer_noted` both call.
     **`footer_error` is that row's left half when a draft doesn't validate**, and it exists because
     there were six copies of it — byte-identical in five (`table_designer`, `trigger_editor`,
     `view_editor`, `event_editor`, `routine_editor`; `object_editor` differed only in the number) and
@@ -15759,7 +15770,12 @@ existing prose was left alone.
     the sentence it carries runs to ~190 characters, so the user read `Added 3 connections.
     Read-only and the en…` and the warning the line exists to deliver — that read-only and the
     environment badge are *not* carried over — never reached the screen at all. The slot had been
-    sized for the sentence it was first given. `skipped_sentence(skipped, hidden)` (pure, tested)
+    sized for the sentence it was first given. That row is `widgets::modal_footer_noted`'s. Its
+    first spelling, a `v_stack` of note and buttons handed to `modal_footer`, sat inside the actions
+    slot, which is sized to its content — so the note's `width_full` had nothing to resolve against,
+    the sentence never wrapped, and it pushed Close and Import off the modal's right edge instead.
+    The note is `Display::None` while it has nothing to say, so the empty row does not take the gap.
+    `skipped_sentence(skipped, hidden)` (pure, tested)
     names up to three left-out entries and counts the rest, returning `None` for an empty list *and*
     a zero `hidden` so a stray "0 entries were not imported" can't reach the screen. `hidden` is what
     `conn_import::SKIPPED_CAP` kept out of the list; it counts toward the total and nowhere else,

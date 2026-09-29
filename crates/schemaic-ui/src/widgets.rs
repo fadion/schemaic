@@ -2375,15 +2375,45 @@ pub(crate) fn modal_footer_split(
         empty().style(|s| s.flex_grow(1.0_f32).min_width(10.0).flex_shrink(1.0_f32)),
         container(actions).style(|s| s.flex_shrink(0.0_f32)),
     ))
-    .style(|s| {
-        s.width_full()
-            .flex_row()
-            .items_center()
-            .padding_horiz(modal_pad_h())
-            .padding_vert(theme::scaled(10.0))
-            .border_top(1.0)
-            .border_color(theme::border())
-    })
+    .style(|s| footer_bar(s.flex_row().items_center()))
+}
+
+/// [`modal_footer`] with a sentence on a full-width row of its own above the
+/// actions, wrapping at the modal's width — for an outcome too long to end in a
+/// `…` beside the buttons, as [`modal_footer_split`]'s status would.
+///
+/// **Never spell this as a `v_stack` handed to [`modal_footer`].** Its actions
+/// slot is `flex_shrink(0)` and sized to its content, so a `width_full` inside
+/// it has no width to be a percentage of: the sentence laid out on one line at
+/// its natural length and pushed the buttons past the modal's right edge —
+/// Import Connections' "Added N connections." line did exactly that. Here the
+/// note is a direct child of the bar, whose width is the modal's.
+///
+/// A caller whose note is sometimes absent hides it with `Display::None` rather
+/// than leaving it empty, or it still takes the row's gap.
+pub(crate) fn modal_footer_noted(
+    note: impl IntoView + 'static,
+    actions: impl IntoView + 'static,
+) -> impl IntoView {
+    v_stack((
+        note.style(|s| s.width_full().min_width(0.0)),
+        h_stack((
+            empty().style(|s| s.flex_grow(1.0_f32).min_width(0.0)),
+            container(actions).style(|s| s.flex_shrink(0.0_f32)),
+        ))
+        .style(|s| s.width_full().items_center()),
+    ))
+    .style(|s| footer_bar(s.flex_col().gap(theme::scaled(6.0))))
+}
+
+/// The bar both footers share: full width, the modal's side padding, and the
+/// rule that separates it from the body.
+fn footer_bar(s: floem::style::Style) -> floem::style::Style {
+    s.width_full()
+        .padding_horiz(modal_pad_h())
+        .padding_vert(theme::scaled(10.0))
+        .border_top(1.0)
+        .border_color(theme::border())
 }
 
 /// The validation message in a schema editor's footer — the left half of

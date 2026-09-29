@@ -557,6 +557,11 @@ fn footer(
     // Read-only and the en…` and the warning the line exists to deliver, that
     // read-only and the environment badge are *not* carried over, never reached
     // the screen at all. The slot was sized for the sentence it was first given.
+    //
+    // That row is `modal_footer_noted`'s, not a `v_stack` handed to
+    // `modal_footer`: its actions slot never shrinks and is as wide as its
+    // content, so the sentence there went unwrapped and took the buttons off the
+    // modal's right edge with it.
     let note = dyn_container(
         move || (imp.chosen.with(|c| c.is_empty()), imp.done.get()),
         move |(idle, done)| match done.filter(|_| idle) {
@@ -565,19 +570,24 @@ fn footer(
                     s.font_size(theme::font_label())
                         .color(theme::text_dim())
                         .width_full()
+                        .min_width(0.0)
                 })
                 .into_any(),
             None => empty().into_any(),
         },
     )
-    .style(|s| s.width_full().min_width(0.0));
+    // Hidden while there is nothing to say, or the empty row still takes the
+    // footer's gap.
+    .style(move |s| {
+        let shown = imp.chosen.with(|c| c.is_empty()) && imp.done.with(Option::is_some);
+        s.apply_if(!shown, |s| s.display(floem::style::Display::None))
+    });
 
     let bar = dyn_container(
         move || imp.chosen.with(|c| !c.is_empty()),
         move |any| {
             let (run, ring, close) = (run.clone(), ring.clone(), close.clone());
             h_stack((
-                empty().style(|s| s.flex_grow(1.0_f32).min_width(0.0)),
                 action_button(
                     "Close",
                     ActionKind::Neutral,
@@ -597,15 +607,12 @@ fn footer(
                     move || (run)(),
                 ),
             ))
-            .style(|s| s.items_center().width_full().gap(theme::scaled(8.0)))
+            .style(|s| s.items_center().gap(theme::scaled(8.0)))
             .into_any()
         },
-    )
-    .style(|s| s.width_full());
+    );
 
-    crate::widgets::modal_footer(
-        v_stack((note, bar)).style(|s| s.flex_col().width_full().gap(theme::scaled(6.0))),
-    )
+    crate::widgets::modal_footer_noted(note, bar)
 }
 
 /// The affirmative button's label, which counts what it is about to do.
