@@ -24,7 +24,10 @@ engines now lives in the *narrow* predicates that decide how an edit is performe
 whether it is offered: `ddl::supports_or_replace_view`, `supports_view_rename`,
 `supports_column_reorder`, `supports_change`, `alter_column_disturbs_checks`,
 `alter_column_disturbs_dependents`,
-`stats::supports_table_stats` — and, for the *comparison* rather than any editor,
+`stats::supports_table_stats` — alongside them the few that do decide whether a control is
+offered, because the clause behind it is one engine's alone:
+`ddl::supports_trigger_not_for_replication`, `supports_trigger_execute_as`,
+`supports_trigger_firing_rank` — and, for the *comparison* rather than any editor,
 `ddl::ref_schema_is_database` and `view_definition_is_qualified`, which ask whether a field the
 differ reads names the object or the database it was read from. Ask a **capability**, never an
 engine: a `dialect == Postgres` or `!= MySql` compiles cleanly while silently sorting a third
