@@ -97,9 +97,11 @@ impl PrincipalKind {
 
 /// The kinds of account the *New account* form offers on `dialect`, in the
 /// order it shows them: SQL Server's login first, since a user is mapped to
-/// one; a user and a role on the two engines whose catalogues are one list.
-pub fn account_kinds(dialect: SqlDialect) -> &'static [PrincipalKind] {
+/// one — unless its logins live elsewhere ([`AccountScope::logins_elsewhere`]);
+/// a user and a role on the two engines whose catalogues are one list.
+pub fn account_kinds(dialect: SqlDialect, scope: AccountScope) -> &'static [PrincipalKind] {
     match dialect {
+        SqlDialect::MsSql if scope.logins_elsewhere => &[PrincipalKind::User, PrincipalKind::Role],
         SqlDialect::MsSql => &[
             PrincipalKind::Login,
             PrincipalKind::User,
@@ -903,11 +905,45 @@ pub struct Principals {
     /// and `None` where it could not be read. The account form stamps it on
     /// the plan it builds.
     pub password_policy: Option<PasswordPolicy>,
-    /// **SQL Server**: the listed database is contained
-    /// (`sys.databases.containment`), so a new user there may hold a password
-    /// of its own ([`takes_password`]). `false` on every other engine, and
-    /// with no database picked.
+    /// What the *New account* form may make here, read with the list.
+    pub scope: AccountScope,
+}
+
+/// **SQL Server**: what the listed database lets the *New account* form make —
+/// facts about the server and the connection, read with the account list
+/// ([`Principals::scope`]), so the form offers what they allow and nothing it
+/// would only learn at Apply. Every field `false` on every other engine, which
+/// is also a server's answer: no containment, its logins its own, no Entra.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AccountScope {
+    /// The listed database is contained (`sys.databases.containment`, and
+    /// every Azure SQL database), so a new user there may hold a password of
+    /// its own ([`takes_password`]). `false` with no database picked.
     pub contained: bool,
+    /// **The server's logins live in another database and nothing sent from
+    /// here reaches them** — Azure SQL Database, whose logins are `master`'s:
+    /// a user database refuses `CREATE LOGIN` (Msg 5001) and
+    /// `master.sys.sp_executesql` (Msg 40515), shows no login in
+    /// `sys.server_principals`, and has no `sys.server_permissions` (Msg 208)
+    /// even in `master`. So no Login is offered ([`account_kinds`]) and none
+    /// is listed. Measured on Azure SQL Database (engine edition 5).
+    pub logins_elsewhere: bool,
+    /// The connection signed in through Microsoft Entra, so it may make an
+    /// Entra user (`CREATE USER … FROM EXTERNAL PROVIDER`,
+    /// [`AccountDraft::external`]) — which a connection signed in any other
+    /// way is refused (Msg 33159, as Microsoft documents it — the live tier
+    /// signs in to Azure only through Entra, so it is not measured).
+    pub entra_users: bool,
+}
+
+/// Can the *New account* form offer a **Microsoft Entra** user here
+/// ([`AccountDraft::external`])? SQL Server's alone, and only where the
+/// connection itself signed in through Entra ([`AccountScope::entra_users`]).
+pub fn supports_entra_users(dialect: SqlDialect, scope: AccountScope) -> bool {
+    match dialect {
+        SqlDialect::MsSql => scope.entra_users,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+    }
 }
 
 impl Principals {
@@ -1742,6 +1778,11 @@ pub struct AccountDraft {
     /// "give this person access to this database" takes there. Unused
     /// elsewhere.
     pub also_user: bool,
+    /// **SQL Server**: a database user made from Microsoft Entra
+    /// (`CREATE USER … FROM EXTERNAL PROVIDER`) — a person or group Entra
+    /// signs in, named as Entra knows them, with no login and no password.
+    /// Offered only where [`supports_entra_users`]. Unused elsewhere.
+    pub external: bool,
     /// **Held in memory only, and never written anywhere but the statement.**
     /// Not persisted, not logged, and not carried into the browser's state — the
     /// draft is dropped as soon as the plan is built. See
@@ -1821,6 +1862,18 @@ pub fn account_form_blocker(
     }
     if !resetting && draft.name.trim().is_empty() {
         return Some("A name is required.");
+    }
+    // An Entra user is signed in by Entra: no login stands behind it and no
+    // password is its own. Held back rather than either silently dropped —
+    // the fields can hold a value typed before the toggle hid them.
+    if !resetting && draft.external {
+        if draft.kind != PrincipalKind::User {
+            return Some("Only a database user is made from Microsoft Entra.");
+        }
+        if !draft.login.trim().is_empty() || !draft.password.is_empty() {
+            return Some("An Entra user has no login or password here — Entra signs it in.");
+        }
+        return None;
     }
     // A SQL Server login is a SQL login by its password; there is no
     // passwordless one to make here.
@@ -2200,6 +2253,7 @@ fn tsql_account_draft_sql(d: &AccountDraft) -> String {
     let q = |n: &str| crate::export::ident_sql(n.trim(), dialect);
     let name = q(&d.name);
     match d.kind {
+        PrincipalKind::User if d.external => format!("CREATE USER {name} FROM EXTERNAL PROVIDER"),
         PrincipalKind::Login => format!(
             "CREATE LOGIN {name} WITH PASSWORD = {}",
             crate::schema::ddl_string(&d.password, dialect)
@@ -2219,7 +2273,7 @@ fn tsql_account_draft_sql(d: &AccountDraft) -> String {
 /// Does an account of `kind` carry a password on `dialect` — the one the
 /// form's password row appears for? A user on MySQL and PostgreSQL; on SQL
 /// Server the **login**, whose password its users sign in with — and a user
-/// where the database is `contained` ([`Principals::contained`]), which may
+/// where the database is `contained` ([`AccountScope::contained`]), which may
 /// hold a password of its own. Anywhere else `CREATE USER … WITH PASSWORD` is
 /// Msg 33233, so the row is not offered there rather than failing at Apply.
 pub fn takes_password(dialect: SqlDialect, kind: PrincipalKind, contained: bool) -> bool {
@@ -2233,12 +2287,21 @@ pub fn takes_password(dialect: SqlDialect, kind: PrincipalKind, contained: bool)
     }
 }
 
+/// [`takes_password`] for the draft the form holds: never for a Microsoft
+/// Entra user ([`AccountDraft::external`]), which Entra signs in.
+pub fn draft_takes_password(dialect: SqlDialect, d: &AccountDraft, contained: bool) -> bool {
+    !(d.external && d.kind == PrincipalKind::User) && takes_password(dialect, d.kind, contained)
+}
+
 /// The draft the *New account* form opens on: the engine's first kind
 /// ([`account_kinds`]), and on SQL Server a login that brings its user
 /// ([`AccountDraft::also_user`]) — what giving someone access to a database
 /// takes there. Blank otherwise, password included, every time.
-pub fn blank_account_draft(dialect: SqlDialect) -> AccountDraft {
-    let kind = account_kinds(dialect).first().copied().unwrap_or_default();
+pub fn blank_account_draft(dialect: SqlDialect, scope: AccountScope) -> AccountDraft {
+    let kind = account_kinds(dialect, scope)
+        .first()
+        .copied()
+        .unwrap_or_default();
     AccountDraft {
         kind,
         also_user: kind == PrincipalKind::Login,
@@ -4488,7 +4551,7 @@ mod mssql_tests {
             );
         }
         assert_eq!(
-            account_kinds(MS),
+            account_kinds(MS, AccountScope::default()),
             [
                 PrincipalKind::Login,
                 PrincipalKind::User,
@@ -4496,7 +4559,7 @@ mod mssql_tests {
             ]
         );
         assert_eq!(
-            account_kinds(SqlDialect::MySql),
+            account_kinds(SqlDialect::MySql, AccountScope::default()),
             [PrincipalKind::User, PrincipalKind::Role]
         );
     }
@@ -4592,15 +4655,91 @@ mod mssql_tests {
     /// database takes there — and on a user elsewhere, as before.
     #[test]
     fn the_new_account_form_opens_on_the_engines_first_kind() {
-        let d = blank_account_draft(MS);
+        let d = blank_account_draft(MS, AccountScope::default());
         assert_eq!((d.kind, d.also_user), (PrincipalKind::Login, true));
         for other in [SqlDialect::MySql, SqlDialect::Postgres] {
             assert_eq!(
-                blank_account_draft(other),
+                blank_account_draft(other, AccountScope::default()),
                 AccountDraft::default(),
                 "{other:?}"
             );
         }
+    }
+
+    /// **Where the logins live elsewhere there is no Login to make** — Azure
+    /// SQL Database, whose logins are `master`'s and which refuses both
+    /// `CREATE LOGIN` (Msg 5001) and `master.sys.sp_executesql` (Msg 40515)
+    /// from a user database. The form opens on a user there, bringing
+    /// nothing.
+    #[test]
+    fn where_logins_live_elsewhere_the_form_offers_none() {
+        let elsewhere = AccountScope {
+            logins_elsewhere: true,
+            ..AccountScope::default()
+        };
+        assert_eq!(
+            account_kinds(MS, elsewhere),
+            [PrincipalKind::User, PrincipalKind::Role]
+        );
+        let d = blank_account_draft(MS, elsewhere);
+        assert_eq!((d.kind, d.also_user), (PrincipalKind::User, false));
+        assert_eq!(
+            account_kinds(MS, AccountScope::default())[0],
+            PrincipalKind::Login,
+            "a server keeps its logins"
+        );
+        // Other engines have no login to withhold.
+        assert_eq!(
+            account_kinds(SqlDialect::MySql, elsewhere),
+            [PrincipalKind::User, PrincipalKind::Role]
+        );
+    }
+
+    /// **A Microsoft Entra user is made from the external provider**, with no
+    /// login and no password — Entra signs it in. Offered only where the scope
+    /// says the connection can make one ([`supports_entra_users`]), and a
+    /// draft that also carries a login or a password is held back rather than
+    /// either being dropped.
+    #[test]
+    fn an_entra_user_is_created_from_the_external_provider() {
+        let d = AccountDraft {
+            name: "ana@contoso.com".into(),
+            kind: PrincipalKind::User,
+            external: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            account_draft_sql(&d, MS).as_deref(),
+            Some("CREATE USER [ana@contoso.com] FROM EXTERNAL PROVIDER")
+        );
+        assert!(account_form_blocker(&d, "", false).is_none());
+        let p = d.principal(MS);
+        assert!(p.login.is_none() && !p.database_password);
+        let with = |f: fn(&mut AccountDraft)| {
+            let mut x = d.clone();
+            f(&mut x);
+            account_form_blocker(&x, &x.password.clone(), false)
+        };
+        assert!(with(|x| x.password = "pw".into()).is_some());
+        assert!(with(|x| x.login = "ana".into()).is_some());
+        assert!(with(|x| x.kind = PrincipalKind::Role).is_some());
+        assert!(!draft_takes_password(MS, &d, true), "Entra holds it");
+        assert!(draft_takes_password(
+            MS,
+            &AccountDraft {
+                external: false,
+                ..d.clone()
+            },
+            true
+        ));
+
+        let entra = AccountScope {
+            entra_users: true,
+            ..AccountScope::default()
+        };
+        assert!(supports_entra_users(MS, entra));
+        assert!(!supports_entra_users(MS, AccountScope::default()));
+        assert!(!supports_entra_users(SqlDialect::Postgres, entra));
     }
 
     /// **The password is the login's**, so a reset on a user row goes to the

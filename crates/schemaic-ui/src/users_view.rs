@@ -855,13 +855,14 @@ fn loaded_policy(overlay: OverlayUi) -> Option<schemaic_core::users::PasswordPol
     })
 }
 
-/// Whether the listed database takes a user with a password of its own
-/// (`users::Principals::contained`), read with the list for the same reason.
-/// `false` until the list has loaded, which keeps the row away.
-fn loaded_contained(overlay: OverlayUi) -> bool {
+/// What the listed database lets the account form make
+/// (`users::Principals::scope`), read with the list for the same reason. The
+/// default until the list has loaded, which keeps the contained user's
+/// password row and the Entra toggle away.
+fn loaded_scope(overlay: OverlayUi) -> schemaic_core::users::AccountScope {
     overlay.users_state.with_untracked(|s| match s {
-        UsersState::Loaded(p) => p.contained,
-        _ => false,
+        UsersState::Loaded(p) => p.scope,
+        _ => Default::default(),
     })
 }
 
@@ -896,7 +897,7 @@ fn new_account_row(
             &anchor,
             &database,
             loaded_policy(overlay),
-            loaded_contained(overlay),
+            loaded_scope(overlay),
         );
     };
     let open_click = open.clone();

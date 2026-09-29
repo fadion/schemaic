@@ -356,6 +356,7 @@ impl ScratchAccount {
             kind,
             login: String::new(),
             also_user: false,
+            external: false,
             password: password.to_string(),
             scram_salt,
             password_policy,

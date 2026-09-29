@@ -4783,6 +4783,7 @@ mod tests {
             kind: crate::users::PrincipalKind::User,
             login: String::new(),
             also_user: false,
+            external: false,
             password: "hunter2-in-the-clear".to_string(),
             scram_salt: None,
             password_policy: None,

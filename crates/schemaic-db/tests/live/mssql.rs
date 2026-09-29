@@ -3853,7 +3853,7 @@ async fn a_contained_user_is_created_signs_in_and_is_reset() {
         s.db.fetch_principals(Some(&s.name))
             .await
             .expect("the list");
-    assert!(listed.contained, "the listing sees the containment");
+    assert!(listed.scope.contained, "the listing sees the containment");
     run(account(
         &name,
         MS,
@@ -3905,6 +3905,63 @@ async fn a_contained_user_is_created_signs_in_and_is_reset() {
     }
     assert!(signs_in(FIRST).await.is_none(), "the old one");
     assert_eq!(signs_in(SECOND).await.as_deref(), Some(name.as_str()));
+}
+
+/// **What the New account form may make is read with the list.** A server
+/// keeps its logins and lists them; Azure SQL Database's are `master`'s, so
+/// none is listed or offered there, and a connection signed in through Entra
+/// may make an Entra user — whose statement the server takes as one, answering
+/// a name Entra does not know with the principal it could not find rather than
+/// with a syntax error.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_account_scope_is_read_with_the_list() {
+    use schemaic_core::ddl::{Change, account};
+    use schemaic_core::users::{AccountDraft, PrincipalKind};
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("scope").await;
+    let listed =
+        s.db.fetch_principals(Some(&s.name))
+            .await
+            .expect("the list");
+    let logins = listed
+        .list
+        .iter()
+        .filter(|p| p.kind == PrincipalKind::Login)
+        .count();
+    if !on_azure() {
+        assert!(!listed.scope.logins_elsewhere && !listed.scope.entra_users);
+        assert!(logins > 0, "sa at least");
+        return;
+    }
+    assert!(listed.scope.logins_elsewhere, "{:?}", listed.scope);
+    assert!(listed.scope.entra_users, "signed in through the Azure CLI");
+    assert_eq!(logins, 0, "{:#?}", listed.list);
+    assert!(
+        listed.note.as_deref().is_some_and(|n| n.contains("master")),
+        "{:?}",
+        listed.note
+    );
+    let stmts = account(
+        "nobody",
+        MS,
+        Change::CreateAccount(Box::new(AccountDraft {
+            name: "schemaic-it-nobody@invalid.example".into(),
+            kind: PrincipalKind::User,
+            external: true,
+            ..Default::default()
+        })),
+    )
+    .emit();
+    let refused =
+        s.db.run_ddl(&s.name, &stmts, CancellationToken::new())
+            .await
+            .expect_err("no such principal");
+    assert!(
+        refused.to_string().contains("could not be found"),
+        "{refused}\n{stmts:#?}"
+    );
 }
 
 // ── Signing in without a password ───────────────────────────────────────────

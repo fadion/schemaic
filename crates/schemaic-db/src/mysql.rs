@@ -273,7 +273,7 @@ async fn collect_my_users(conn: &mut Conn) -> Result<users::Principals, DbError>
         note: Some(users::my_own_account_only_note()),
         // MySQL/MariaDB take no verifier, so there is no policy to honour.
         password_policy: None,
-        contained: false,
+        scope: users::AccountScope::default(),
     })
 }
 

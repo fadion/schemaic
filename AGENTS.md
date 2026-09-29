@@ -16,7 +16,8 @@ rather than unfinished work (`db::session::Session::open` carries the reason). *
 preview** (`db::mssql`, on a vendored `tiberius` — `vendor/tiberius/PATCHES.md`): it reads,
 introspects, runs scripts, writes grid edits back, imports files, designs tables, edits views, holds a Manual tab's
 transaction, shows query plans, dumps to `.sql`, opens `sqlcmd`, edits triggers and routines,
-manages logins and database users, and signs in with a SQL login, Windows (SSPI, in the Windows
+manages logins and database users (on Azure SQL Database contained and Entra users, its logins
+being `master`'s), and signs in with a SQL login, Windows (SSPI, in the Windows
 build) or Microsoft Entra through the Azure CLI, and each thing it
 does not do yet is a capability answering no — `ddl::supports_change` (for the column changes
 T-SQL's `ALTER COLUMN` cannot make) —

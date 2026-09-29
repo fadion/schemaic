@@ -2910,17 +2910,6 @@ pub(crate) async fn fetch_principals(
     let flag = |r: &[Option<String>], i: usize| cell(r, i) == "1";
     let database = database.filter(|d| !d.is_empty());
     let mut client = connect(db, database).await?;
-    let logins: Vec<MsLoginRow> = query_rows(&mut client, LOGIN_LISTING)
-        .await?
-        .iter()
-        .map(|r| MsLoginRow {
-            name: cell(r, 0),
-            kind: cell(r, 1),
-            disabled: flag(r, 2),
-            default_database: r.get(3).cloned().flatten(),
-            server_roles: r.get(4).cloned().flatten(),
-        })
-        .collect();
     let edition = query_rows(
         &mut client,
         "SELECT CAST(SERVERPROPERTY('EngineEdition') AS int)",
@@ -2929,6 +2918,26 @@ pub(crate) async fn fetch_principals(
     .first()
     .map(|r| cell(r, 0))
     .unwrap_or_default();
+    // Azure SQL Database's logins are `master`'s, and nothing sent from a
+    // user database reaches them (`users::AccountScope::logins_elsewhere`) —
+    // nor from `master` their server permissions, which have no catalogue
+    // there. So none is listed, rather than rows no form could act on.
+    let logins_elsewhere = edition == AZURE_SQL_DATABASE;
+    let logins: Vec<MsLoginRow> = if logins_elsewhere {
+        Vec::new()
+    } else {
+        query_rows(&mut client, LOGIN_LISTING)
+            .await?
+            .iter()
+            .map(|r| MsLoginRow {
+                name: cell(r, 0),
+                kind: cell(r, 1),
+                disabled: flag(r, 2),
+                default_database: r.get(3).cloned().flatten(),
+                server_roles: r.get(4).cloned().flatten(),
+            })
+            .collect()
+    };
     let user_listing = if edition == AZURE_SQL_DATABASE {
         AZURE_USER_LISTING
     } else {
@@ -2972,7 +2981,13 @@ pub(crate) async fn fetch_principals(
         None => false,
     };
     let mut notes: Vec<String> = Vec::new();
-    if database.is_none() {
+    if logins_elsewhere {
+        notes.push(
+            "Azure SQL Database keeps its logins in master, and they are not managed here: \
+             listed are the database's users and roles."
+                .to_string(),
+        );
+    } else if database.is_none() {
         notes.push(
             "Only the server's logins are listed: pick a database to see its users and roles."
                 .to_string(),
@@ -2989,7 +3004,11 @@ pub(crate) async fn fetch_principals(
         list: from_mssql_rows(&logins, &users),
         note: (!notes.is_empty()).then(|| notes.join(" ")),
         password_policy: None,
-        contained,
+        scope: schemaic_core::users::AccountScope {
+            contained,
+            logins_elsewhere,
+            entra_users: db.auth == schemaic_core::connection::AuthMode::AzureCli,
+        },
     })
 }
 

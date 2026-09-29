@@ -189,15 +189,15 @@ fn door_read_only(conn: ConnUi, from: &UsersTarget) -> bool {
 ///
 /// `password_policy` is the server's, as the browser read it with the account
 /// list — stamped on the target so the plan honours it (`users::PasswordPolicy`)
-/// — and `contained` is whether that list's database takes a user with a
-/// password of its own (`users::Principals::contained`).
+/// — and `scope` is what that list's database lets the form make
+/// (`users::Principals::scope`).
 pub(crate) fn open_for_new(
     conn: ConnUi,
     d: DdlUi,
     from: &UsersTarget,
     database: &str,
     password_policy: Option<schemaic_core::users::PasswordPolicy>,
-    contained: bool,
+    scope: schemaic_core::users::AccountScope,
 ) {
     // **No `edit_ctx` here at all.** These three read nothing else from it, and
     // what they did read was the switcher's flag — see `door_read_only`. A live
@@ -216,7 +216,7 @@ pub(crate) fn open_for_new(
     reset_then_seed(
         d,
         d.account_draft,
-        schemaic_core::users::blank_account_draft(from.dialect),
+        schemaic_core::users::blank_account_draft(from.dialect, scope),
     );
     d.account.set(Some(AccountTarget {
         // **`from`, not `ctx`** — see the note above `open_for_grant`'s twin
@@ -227,7 +227,7 @@ pub(crate) fn open_for_new(
         read_only: door_read_only,
         resetting: None,
         password_policy,
-        contained,
+        scope,
     }));
 }
 
@@ -282,6 +282,7 @@ pub(crate) fn open_for_reset(
             kind: account.kind,
             login: account.login.clone().unwrap_or_default(),
             also_user: false,
+            external: false,
             password: String::new(),
             // Stamped when the plan is built (`account_change`), not here.
             scram_salt: None,
@@ -295,9 +296,9 @@ pub(crate) fn open_for_reset(
         read_only: door_read_only,
         resetting: Some(account.clone()),
         password_policy,
-        // A reset is of an account that already holds its password; whether
-        // a new one could is not this form's question.
-        contained: false,
+        // A reset is of an account that already holds its password; what a
+        // new one could be is not this form's question.
+        scope: Default::default(),
     }));
 }
 
@@ -531,10 +532,11 @@ fn suggested_field<D: Clone + 'static>(
 /// The account form's **shape**: the one value that decides which fields exist.
 ///
 /// A role takes neither a host nor a password on either engine, so those two
-/// rows appear and vanish with the Kind — and nothing else about the draft
-/// changes what is on screen.
-pub(crate) fn account_form_shape(d: &AccountDraft) -> PrincipalKind {
-    d.kind
+/// rows appear and vanish with the Kind — and on SQL Server an Entra user takes
+/// neither a login nor a password, so those go with its toggle. Nothing else
+/// about the draft changes what is on screen.
+pub(crate) fn account_form_shape(d: &AccountDraft) -> (PrincipalKind, bool) {
+    (d.kind, d.external)
 }
 
 /// The grant form's **shape**: which fields exist depends on these three and on
@@ -663,7 +665,7 @@ fn account_form(
                 draft,
                 kind,
                 // SQL Server's login first, since a user is mapped to one.
-                schemaic_core::users::account_kinds(target.dialect).to_vec(),
+                schemaic_core::users::account_kinds(target.dialect, target.scope).to_vec(),
                 PrincipalKind::label,
                 ring.clone(),
                 8,
@@ -721,8 +723,26 @@ fn account_form(
     // left empty for one `WITHOUT LOGIN` — and a login may bring its user into
     // this database in the same plan. Asked of the kinds the engine offers,
     // not of the engine: `Login` exists only where accounts are split in two.
-    let split = schemaic_core::users::account_kinds(target.dialect).contains(&PrincipalKind::Login);
-    if split && kind == PrincipalKind::User {
+    // The engine's kinds, not this database's: where the logins live
+    // elsewhere a user is still made `FOR` one, only the login is not.
+    let split = schemaic_core::users::account_kinds(target.dialect, Default::default())
+        .contains(&PrincipalKind::Login);
+    // **An Entra user, where the connection can make one** — a person or
+    // group Entra signs in, so the login and password rows go with it.
+    let entra = schemaic_core::users::supports_entra_users(target.dialect, target.scope);
+    if entra && kind == PrincipalKind::User {
+        rows.push(
+            form_setting(
+                "Microsoft Entra",
+                bound_toggle(draft, seed.external, ring.clone(), 15, |d, v| {
+                    d.external = v
+                }),
+            )
+            .into_any(),
+        );
+    }
+    let external = entra && seed.external;
+    if split && kind == PrincipalKind::User && !external {
         rows.push(
             form_setting(
                 "For login",
@@ -754,8 +774,8 @@ fn account_form(
 
     // The password is where the engine keeps it: a user's on MySQL and
     // PostgreSQL, the login's on SQL Server — and a contained database's
-    // user's own (`users::takes_password`).
-    if schemaic_core::users::takes_password(target.dialect, kind, target.contained) {
+    // user's own (`users::takes_password`) — and never an Entra user's.
+    if schemaic_core::users::draft_takes_password(target.dialect, seed, target.scope.contained) {
         rows.push(password_row(d, ring, target.dialect));
     }
 
@@ -1562,6 +1582,12 @@ mod form_shape_tests {
             ..Default::default()
         };
         assert_ne!(account_form_shape(&user), account_form_shape(&role));
+        // The Entra toggle takes the login and password rows with it.
+        let entra = AccountDraft {
+            external: true,
+            ..Default::default()
+        };
+        assert_ne!(account_form_shape(&user), account_form_shape(&entra));
     }
 
     #[test]
@@ -1819,6 +1845,7 @@ mod account_change_tests {
             kind: PrincipalKind::User,
             login: String::new(),
             also_user: false,
+            external: false,
             password: "hunter2".into(),
             scram_salt: None,
             password_policy: None,
@@ -1853,6 +1880,7 @@ mod account_change_tests {
             kind: PrincipalKind::User,
             login: String::new(),
             also_user: false,
+            external: false,
             password: "hunter2".into(),
             scram_salt: None,
             password_policy: None,
@@ -1876,6 +1904,7 @@ mod account_change_tests {
             kind: PrincipalKind::User,
             login: String::new(),
             also_user: false,
+            external: false,
             password: "hunter2".into(),
             scram_salt: None,
             password_policy: None,
@@ -1943,7 +1972,7 @@ mod account_change_tests {
             read_only: false,
             resetting: None,
             password_policy: None,
-            contained: false,
+            scope: Default::default(),
         };
         let emit = |target: &AccountTarget| {
             ddl::account("app", SqlDialect::Postgres, preview_change(&draft, target))

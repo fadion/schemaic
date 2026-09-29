@@ -1336,11 +1336,13 @@ pub struct AccountTarget {
     /// PostgreSQL password is hashed (or not hashed) under. `None` keeps the
     /// SCRAM default; see `users::PasswordPolicy`.
     pub password_policy: Option<schemaic_core::users::PasswordPolicy>,
-    /// **SQL Server**: the database the browser listed is contained, so a new
-    /// user there may hold a password of its own — the form offers the
-    /// password row for one only then (`users::takes_password`). Read with the
-    /// list, like `password_policy`; `false` everywhere else.
-    pub contained: bool,
+    /// **SQL Server**: what the database the browser listed lets the form make
+    /// — a user with a password of its own where it is contained
+    /// (`users::takes_password`), no login where the logins live elsewhere
+    /// (`users::account_kinds`), an Entra user where the connection signed in
+    /// through Entra (`users::supports_entra_users`). Read with the list, like
+    /// `password_policy`; all `false` everywhere else.
+    pub scope: schemaic_core::users::AccountScope,
 }
 
 /// The grant editor's target; doubles as its open flag.

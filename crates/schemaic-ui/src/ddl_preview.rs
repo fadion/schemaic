@@ -1537,7 +1537,7 @@ mod tests {
             read_only: false,
             resetting: None,
             password_policy: None,
-            contained: false,
+            scope: Default::default(),
         }));
         d.grant.set(Some(crate::GrantTarget {
             conn_id: 1,
@@ -1726,7 +1726,7 @@ mod tests {
                     read_only: false,
                     resetting: None,
                     password_policy: None,
-                    contained: false,
+                    scope: Default::default(),
                 }))
             }),
             ("grant", |d| {

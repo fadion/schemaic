@@ -5537,8 +5537,10 @@ existing prose was left alone.
     `PrincipalKind` has a third arm, `Login` (no other engine has one), and `Principal::login` — a
     `#[serde(default)]` `Option`, `None` on every other engine and on a user with no login
     (`WITHOUT LOGIN`, or contained) — carries a user's backing login as `SUSER_SNAME(sid)` reads
-    it (on Azure SQL Database, which refuses that call, as the SID join finds it — under
-    `mssql.rs`): that field is the link, and what the list shows and a reset on the user row alters.
+    it (on Azure SQL Database, which refuses that call, as the SID join finds it — which from a
+    user database is never, since `sys.server_principals` there lists only the `##MS_…##` server
+    roles; under `mssql.rs`): that field is the link, and what the list shows and a reset on the
+    user row alters.
     **A user with no login is one of two things, and only the catalogue can say which**:
     `Principal::database_password` (`#[serde(default)]`, `false` everywhere else) is set by
     `from_mssql_rows` for a user whose `authentication_type_desc` is `DATABASE` — a contained
@@ -5551,24 +5553,49 @@ existing prose was left alone.
     `INFORMATION_SCHEMA`, `sys`, `public` and fixed roles are `system`, kept and sorted last as every
     engine's are. Its listed roles are the **database's**; a login's server roles are an attribute
     on its row and a read-back, and the grant form's Role shortcut offers them from
-    `role_suggestions` rather than from the list (below). `account_kinds(dialect)` is the New account form's
-    Kind list — `[Login, User, Role]` on SQL Server, a login first because a user is mapped to one,
-    `[User, Role]` elsewhere — and `blank_account_draft` opens on its first entry, on SQL Server
-    with `AccountDraft::also_user` set: a new login brings a same-named user in the browser's
-    database **in the same plan** (`companion_user_draft`, `FOR` that login, no password of its
-    own), since that pair is what giving someone access to a database takes there.
+    `role_suggestions` rather than from the list (below). `account_kinds(dialect, scope)` is the New
+    account form's Kind list — `[Login, User, Role]` on SQL Server, a login first because a user is
+    mapped to one, `[User, Role]` elsewhere, and `[User, Role]` on SQL Server too where
+    `scope.logins_elsewhere` (below) — and `blank_account_draft(dialect, scope)` opens on its first
+    entry, with `AccountDraft::also_user` set when that is a login: a new login brings a same-named
+    user in the browser's database **in the same plan** (`companion_user_draft`, `FOR` that login,
+    no password of its own), since that pair is what giving someone access to a database takes
+    there. Where the logins live elsewhere it opens on a User bringing nothing
+    (`where_logins_live_elsewhere_the_form_offers_none`).
     `AccountDraft::login` is a new user's `FOR LOGIN`, empty for `WITHOUT LOGIN` or a contained
     user; `AccountDraft::principal` sets `database_password` for a SQL Server user drafted with no
     login and a non-empty password, the one `tsql_account_draft_sql` creates `WITH PASSWORD`.
+    `AccountDraft::external` is the fourth kind of SQL Server user, a **Microsoft Entra** one —
+    `CREATE USER [x] FROM EXTERNAL PROVIDER`, a person or group Entra signs in, with no login and no
+    password — offered only where `supports_entra_users(dialect, scope)`, which is SQL Server's alone
+    and there `scope.entra_users`: the connection itself signed in through Entra, since one signed in
+    any other way is refused the statement (Msg 33159 — Microsoft's documentation, not measured here:
+    the live tier signs in to Azure only through Entra).
     `takes_password(dialect, kind, contained)` answers where the password row belongs — the user on
     MySQL and PostgreSQL, the **login** on SQL Server, and a SQL Server user too where the database
-    is `contained` — and `account_form_blocker` refuses a login with no password, a login being a
-    SQL login by its password. **`contained` is `Principals::contained`, read with the list**,
-    because SQL Server takes a user's own password only in a contained database (`CONTAINMENT =
-    PARTIAL`; Msg 33233 anywhere else, measured on SQL Server 2022), and making a database
-    contained needs the server's `contained database authentication` on — so the row is offered
-    only where Apply can succeed, rather than offered everywhere and refused there. Every Azure
-    SQL database takes one, whatever its `containment` reads, so there the flag is always set. **Where an account can be granted is asked
+    is `contained` — and `draft_takes_password(dialect, draft, contained)` is that question asked of
+    the draft the form holds, answering no for an Entra user whatever the database is. The form asks
+    the second; the first is what it is built from. `account_form_blocker` refuses a login with no
+    password, a login being a SQL login by its password, and holds back an external draft that is
+    not a User or that carries a login or a password — held back rather than either silently
+    dropped, because those fields can hold a value typed before the toggle hid them
+    (`an_entra_user_is_created_from_the_external_provider`).
+    **What the form may make is `Principals::scope`, an `AccountScope` read with the list** — three
+    `bool`s, every one `false` on every other engine, which is also an ordinary server's answer.
+    `contained` is the first, because SQL Server takes a user's own password only in a contained
+    database (`CONTAINMENT = PARTIAL`; Msg 33233 anywhere else, measured on SQL Server 2022), and
+    making a database contained needs the server's `contained database authentication` on — so the
+    row is offered only where Apply can succeed, rather than offered everywhere and refused there.
+    Every Azure SQL database takes one, whatever its `containment` reads, so there the flag is always
+    set. `logins_elsewhere` is the second: **Azure SQL Database's logins are `master`'s, and nothing
+    the account plan can send reaches them.** Measured there with a probe: in a user database
+    `CREATE LOGIN` is Msg 5001 and `master.sys.sp_executesql` Msg 40515; in `master` itself `CREATE`
+    and `DROP LOGIN` and `ALTER SERVER ROLE [##MS_…##] ADD MEMBER` work, but a server-level `GRANT`
+    is Msg 40521 and `sys.server_permissions` does not exist (Msg 208), so a login's grants could be
+    neither read nor written from anywhere. The decision is that Azure SQL Database offers **no
+    logins at all**, in `master` included — its accounts are the contained users above and Entra
+    users — rather than a Login kind that half works in one database. `entra_users` is the third.
+    It was a single `contained: bool` until the other two arrived. **Where an account can be granted is asked
     of the account** (`levels_for_account`, below): a login is a principal of the server and of no
     database, a user or role of its database and of no server, so `GRANT SELECT … TO` a login and
     `GRANT VIEW SERVER STATE TO` a user are each Msg 15151 (measured on SQL Server 2022).
@@ -5697,8 +5724,10 @@ existing prose was left alone.
     actually gets** — `[Global]` for a login, the other three for a user or role, `levels_for`
     unchanged on every other engine — and the level picker and `ddl::account_change_supported` both
     read it rather than `levels_for`, so the form cannot offer a level the plan's gate then refuses
-    (`a_login_is_granted_at_the_server_and_a_user_below_it`). Azure SQL Database — whose `master`
-    takes no server-level `GRANT` of this kind — is untested. SQLite gets an empty list rather than a
+    (`a_login_is_granted_at_the_server_and_a_user_below_it`). On Azure SQL Database `Global` is never
+    reached, because no login is listed or offered there (`AccountScope::logins_elsewhere`, above):
+    its `master` refuses a server-level `GRANT` (Msg 40521) and has no `sys.server_permissions` to
+    read one back from (Msg 208). SQLite gets an empty list rather than a
     panic, `supports_user_admin` being the gate that should have stopped the caller.
     **`default_grant_level` is the level a grant form opens on, and it is deliberately not
     `levels_for(dialect).first()`** — the widest of the *account's* levels (`levels_for_account`)
@@ -11294,11 +11323,19 @@ existing prose was left alone.
   40507) and the whole accounts listing failed there with it; that query finds the login by
   joining `sys.server_principals` on the SID. It is not the one query for both on purpose: on a
   server `SUSER_SNAME` also names a Windows user who has no login row of their own, which the join
-  cannot. With a database it also reads that database's
-  `sys.databases.containment` (`WHERE database_id = DB_ID()`) into `Principals::contained`, which
-  is what puts a password row on the New account form's User (under `core::users`) — except on
-  Azure SQL Database, where `contained` is simply `true`: its `containment` reads 0, yet it accepts
-  a user with a password (Msg 33233 is what a genuinely uncontained database answers). **It also asks `HAS_PERMS_BY_NAME(…, 'VIEW ANY DEFINITION')`**,
+  cannot. **There it also skips `LOGIN_LISTING` altogether** and sets
+  `AccountScope::logins_elsewhere`, with a note in place of the no-database one ("Azure SQL
+  Database keeps its logins in master, and they are not managed here…"): from a user database
+  `sys.server_principals` shows only the `##MS_…##` server roles and no login, and nothing the
+  account form could do to one would run (the measurements, and the decision, are under
+  `core::users`) — so none is listed rather than rows no form could act on. The edition is the
+  listing's first read for that reason. With a database it also reads that database's
+  `sys.databases.containment` (`WHERE database_id = DB_ID()`) into `AccountScope::contained`,
+  which is what puts a password row on the New account form's User (under `core::users`) — except
+  on Azure SQL Database, where `contained` is simply `true`: its `containment` reads 0, yet it
+  accepts a user with a password (Msg 33233 is what a genuinely uncontained database answers).
+  `AccountScope::entra_users` is `db.auth == AuthMode::AzureCli` — read off the connection, not the
+  server, and on every edition. **It also asks `HAS_PERMS_BY_NAME(…, 'VIEW ANY DEFINITION')`**,
   because a login without that permission is shown only the principals it may see — itself and
   little else — with no error to say so, which is the MySQL ladder's "one account out of eight"
   in another catalogue; the note says the list may be short. `mssql::fetch_grants` reads a login's
@@ -11324,10 +11361,15 @@ existing prose was left alone.
   `endpoint::note_leg_no_op` when it is off. CI's live job turns it on before the tests run, in its
   *Enable contained database authentication* step (`sp_configure … 1; RECONFIGURE` through `docker
   exec` on each throwaway service container, 2022's and 2025's), so there the round trip runs rather than reporting
-  itself skipped. **A login cannot yet be created on Azure SQL Database**, and that is unfinished
-  work, not fixed: `CREATE LOGIN` runs there only in `master` (Msg 5001) while the account plan
-  runs in the user database, so the login round trip reports itself a no-op under
-  `mssql-on-azure` (in the live tier, below) rather than pinning a path that fails.
+  itself skipped. **No login is created on Azure SQL Database, and that is decided rather than
+  unfinished**: `CREATE LOGIN` runs there only in `master` (Msg 5001) while the account plan runs
+  in the user database, and even `master` cannot read or write a login's server permissions, so the
+  form offers no Login there (under `core::users`) and the login round trip reports itself a no-op
+  under `mssql-on-azure` (in the live tier, below) rather than pinning a path that fails.
+  `the_account_scope_is_read_with_the_list` pins the scope: on a server neither `logins_elsewhere`
+  nor `entra_users` is set and a login is listed; on Azure both are set, no login is listed, the
+  note names `master`, and an Entra user for a name Entra does not know is refused as a principal
+  that "could not be found" — the statement taken as one rather than failing as syntax.
   Server Activity is the one
   split that *is* about the engine: `KILL` ends a session, but no T-SQL statement cancels another
   session's request and leaves the session standing — a cancel is an attention sent by the owner's
@@ -12311,8 +12353,9 @@ existing prose was left alone.
   `azure_cannot` (`note_leg_no_op`) and asserts nothing: `a_dump_restores_into_an_empty_database`,
   which needs a second database, and the login round trip (above, under `mssql.rs`).
   `a_contained_user_is_created_signs_in_and_is_reset` runs there without its sign-ins, the server
-  being Entra-only, and prints that it left them unchecked — its `listed.contained` is what pins
-  `fetch_principals`' Azure arm. `every_catalogued_builtin_is_one_the_server_knows` counts
+  being Entra-only, and prints that it left them unchecked — its `listed.scope.contained` is what
+  pins `fetch_principals`' Azure containment, and `the_account_scope_is_read_with_the_list` the
+  rest of that arm. `every_catalogued_builtin_is_one_the_server_knows` counts
   `EngineEdition` 5 as having 2025's block, since Azure reports major version 12 whatever it runs.
   The leg was 56 of 56 there when it landed, as on local 2022 and 2025.
   **`endpoint.rs` is where a leg comes from**, and it is the whole environment contract: three
@@ -17745,17 +17788,28 @@ existing prose was left alone.
     all. **On SQL Server the Kind list is `users::account_kinds` — Login, User, Role — and the form
     opens on a Login** (`users::blank_account_draft`), with an *Also a user in `<db>`* toggle,
     on by default, that adds the same-named user to the plan (`preview_changes`, which Preview
-    hands to `ddl_preview::preview_account`; never beside a reset). A User gets a *For login* field instead, empty meaning
-    `WITHOUT LOGIN`. The password row follows `users::takes_password` rather than the Kind being
+    hands to `ddl_preview::preview_account`; never beside a reset). On Azure SQL Database the list
+    is User and Role and the form opens on a User, its logins not being managed here (under
+    `core::users`). A User gets a *For login* field instead, empty meaning
+    `WITHOUT LOGIN`. The password row follows `users::draft_takes_password` rather than the Kind being
     `User`, since on SQL Server it is the login that holds the password and a user has none of its
     own — **except in a contained database**, where the row appears for a User too, and a For login
     left empty with a password filled makes it a contained user (`CREATE USER … WITH PASSWORD`).
-    Whether the database is contained rides on `AccountTarget::contained`, which
-    `users_view::loaded_contained` reads out of the loaded list beside `loaded_policy` (below) —
-    `false` until it has loaded, so the row stays off rather than appearing for a database the
-    server would refuse it in; a reset opens with `false`, since it is of an account that already
-    holds its password and whether a new one could is not its question. Both rows are asked of whether the engine's kinds include `Login` — accounts split in two
-    — rather than of the engine. **The form holds a password — in `account_draft` and, typed a second time, in
+    **Where the connection signed in through Entra (`users::supports_entra_users`) a User also gets
+    a *Microsoft Entra* toggle**, and turned on it takes *For login* and the password rows away with
+    it — an Entra user (`CREATE USER … FROM EXTERNAL PROVIDER`) has neither — which is why
+    `account_form_shape` is `(kind, external)` rather than the Kind alone (below).
+    Whether the database is contained, whether its logins live elsewhere and whether Entra users
+    may be made ride on `AccountTarget::scope` (`users::AccountScope`), which
+    `users_view::loaded_scope` reads out of the loaded list beside `loaded_policy` (below) — the
+    all-`false` default until it has loaded, so the contained user's password row and the Entra
+    toggle stay off rather than appearing for a database the server would refuse them in; a reset
+    opens with the default, since it is of an account that already holds its password and whether a
+    new one could is not its question. Both SQL Server rows are asked of whether the engine's kinds
+    include `Login` — accounts split in two — rather than of the engine, and **deliberately of the
+    engine's kinds (`account_kinds(dialect, Default::default())`), not this database's**: where the
+    logins live elsewhere the Kind list has no Login, yet a user there is still made `FOR` one, so
+    asking the scoped list would take *For login* off Azure with it. **The form holds a password — in `account_draft` and, typed a second time, in
     `DdlUi::account_confirm` — and nothing else in this crate does.** Both are blanked on every
     open — a form that reopened holding the last one would put a credential on screen nobody typed
     this time — cleared on Cancel (`ddl_preview::close_peers` empties `account_draft` and
@@ -17798,9 +17852,12 @@ existing prose was left alone.
     `users::account_form_blocker`/`account_form_ready`, so an empty Confirm reads "Type the password
     again to confirm it." and a mismatch "The two passwords differ." — checked by hand in the
     sandboxed app, where a match enabled Preview. A role has no password row and is not asked, nor
-    is a SQL Server user outside a contained database; a SQL Server login must have a password as
+    is a SQL Server user outside a contained database, nor an Entra user; a SQL Server login must have a password as
     well as its confirmation ("A login needs a password."), and a user for a login must not have
-    one ("A user for a login signs in with the login's password — leave this blank.").
+    one ("A user for a login signs in with the login's password — leave this blank."). An Entra
+    draft that is not a User, or that still holds a login or a password typed before its toggle hid
+    them, reads "Only a database user is made from Microsoft Entra." or "An Entra user has no login
+    or password here — Entra signs it in."
     **The field itself is
     `connection_form::masked_edit_field`**, the same one the three saved-connection secrets wear:
     this was the app's only *unmasked* secret field, so its real characters were on screen and a
@@ -17883,7 +17940,8 @@ existing prose was left alone.
     field rather than filled in, since a prefilled name on a form that grants privileges is a value
     nobody read.
     **Both forms' `dyn_container`s are keyed on a memo over the form's *shape*, never on the draft
-    signal** — `account_form_shape` (the Kind) and `grant_form_shape` (`(subject, revoke, level)`),
+    signal** — `account_form_shape` (`(kind, external)`, the Entra toggle deciding rows as the Kind
+    does) and `grant_form_shape` (`(subject, revoke, level)`),
     two pure functions naming the fields that decide which rows exist, because the values in those
     rows do not. Keyed off the draft, both rebuilt the entire form on every keystroke in a name
     field and on every privilege tag, tearing the field down mid-word and taking the caret with it:
