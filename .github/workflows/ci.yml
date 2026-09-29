@@ -251,13 +251,13 @@ jobs:
           SCHEMAIC_IT_PG_PASSWORD: schemaic
           SCHEMAIC_IT_MSSQL_USER: sa
           SCHEMAIC_IT_MSSQL_PASSWORD: Schemaic_2026
-      # The SQL Server leg again, on 2025. `SCHEMAIC_IT_ENGINES=mssql` leaves
-      # the other engines' legs to the step above; the `mssql::` filter keeps
-      # the run to that leg's own tests.
+      # The SQL Server leg again, on 2025. The `mssql::` filter keeps the run to
+      # that leg's own tests — *not* `SCHEMAIC_IT_ENGINES`, which the tier
+      # refuses in CI (`endpoint::engines_var`), since a leg it leaves out
+      # reports as a pass having asserted nothing.
       - name: Test (live, SQL Server 2025)
         run: cargo test -p schemaic-db --features live-tests --test live -- mssql::
         env:
-          SCHEMAIC_IT_ENGINES: mssql
           SCHEMAIC_IT_MSSQL_PORT: "1434"
           SCHEMAIC_IT_MSSQL_USER: sa
           SCHEMAIC_IT_MSSQL_PASSWORD: Schemaic_2026

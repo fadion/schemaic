@@ -12152,8 +12152,9 @@ existing prose was left alone.
   `Schemaic_2026`, the local container's and CI's `mcr.microsoft.com/mssql/server:2022-latest`
   service's). **The leg runs twice in CI**, the second time against a `mssql2025` service
   (`mcr.microsoft.com/mssql/server:2025-latest` on 1434) in its own *Test (live, SQL Server 2025)*
-  step — `--test live -- mssql::` under `SCHEMAIC_IT_ENGINES=mssql` and
-  `SCHEMAIC_IT_MSSQL_PORT=1434`, the other engines' legs being the first step's. The builtin
+  step — `--test live -- mssql::` under `SCHEMAIC_IT_MSSQL_PORT=1434`, the name filter rather
+  than `SCHEMAIC_IT_ENGINES` keeping it to that leg, since the tier refuses the variable in CI
+  (`endpoint::engines_var`: a leg it leaves out reports as a pass). The builtin
   catalog spans both versions, and each direction of its version line needs a server that can
   answer it; locally a `schemaic-mssql25` container on 1434 plays the same part. The whole leg is
   green on 2025 (17.0.5005.3, RTM-CU9). When enough of the suite answers, it joins the macro.
