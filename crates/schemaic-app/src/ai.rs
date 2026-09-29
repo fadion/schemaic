@@ -430,10 +430,17 @@ fn endpoint_from_value(v: &serde_json::Value) -> McpEndpoint {
     // connection opens when nothing is selected. Absent means the driver
     // guesses, which is what every blob written before the field meant.
     let conn_database = v.get("connection_database").and_then(|x| x.as_str());
+    // How the subprocess signs in. Absent — every blob written before the
+    // field — means a password, which is what those connections used.
+    let auth = v
+        .get("auth")
+        .and_then(|a| serde_json::from_value(a.clone()).ok())
+        .unwrap_or_default();
     McpEndpoint {
         db: Db::from_parts(engine, host, port, user, pass, file)
             .with_tls(tls)
-            .with_database(conn_database),
+            .with_database(conn_database)
+            .with_auth(auth),
         database,
         // Absent → on, matching the endpoint blobs written before the flag
         // existed (which also predate any tool that reads rows from schema).
@@ -481,7 +488,7 @@ fn endpoint_json(
         "host": host, "port": port, "user": user, "file": file,
         "database": database, "engine": db.engine().as_str(), "samples": samples,
         "schema": schema, "hidden": hidden, "tls": db.tls_plan(),
-        "connection_database": db.database(), "conn_id": conn_id
+        "connection_database": db.database(), "conn_id": conn_id, "auth": db.auth()
     })
     .to_string()
 }
@@ -4594,6 +4601,31 @@ mod tests {
         assert_eq!(parsed.db.parts(), ("host", 3306, "user", "", ""));
         assert_eq!(parsed.db.engine(), schemaic_db::Engine::Postgres);
         assert_eq!(parsed.database.as_deref(), Some("db1"));
+    }
+
+    /// **The subprocess signs in the way the app does.** A SQL Server
+    /// connection on Entra or Windows sign-in has no password for the
+    /// subprocess to read from the keyring, so a handoff that dropped the mode
+    /// would try a SQL login with an empty one and be refused. A blob written
+    /// before the key existed means a password, which is what it was.
+    #[test]
+    fn the_endpoint_handoff_carries_the_sign_in_mode() {
+        use schemaic_core::connection::AuthMode;
+        let db = Db::from_parts(
+            schemaic_db::Engine::MsSql,
+            "srv.database.windows.net".into(),
+            1433,
+            String::new(),
+            String::new(),
+            String::new(),
+        )
+        .with_auth(AuthMode::AzureCli);
+        let json = endpoint_json(&db, 7, None, true, true, &HashSet::new());
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(endpoint_from_value(&v).db.auth(), AuthMode::AzureCli);
+        let mut old = v.clone();
+        old.as_object_mut().unwrap().remove("auth");
+        assert_eq!(endpoint_from_value(&old).db.auth(), AuthMode::Password);
     }
 
     /// **The subprocess must reach the server the same way the app does.** The

@@ -654,6 +654,7 @@ mod tests {
             environment: crate::connection::Environment::None,
             ai_data: None,
             folder: String::new(),
+            auth: crate::connection::AuthMode::Password,
         }
     }
 

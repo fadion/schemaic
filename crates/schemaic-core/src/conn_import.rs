@@ -133,10 +133,12 @@ pub enum ImportNote {
     /// the host's *default* instance, if it has one, not the named one — and
     /// this says to set the instance's port.
     NamedInstance,
-    /// A SQL Server connection that signs in as the **Windows user** or through
-    /// **Microsoft Entra** (`Integrated Security`, `Authentication=Active
-    /// Directory …`) rather than with a SQL login. Schemaic sends a SQL login
-    /// only, so the row keeps the server and this says a login is wanted.
+    /// A SQL Server connection that signs in **a way Schemaic does not** — an
+    /// Entra method other than `Active Directory Default` (`…Password`,
+    /// `…Interactive`, `…Integrated`), or Windows sign-in in a build with no
+    /// Windows identity to present. The row keeps the server with a SQL login
+    /// and this says one is wanted. The two Schemaic has are carried over as
+    /// `AuthMode::Windows` and `AuthMode::AzureCli` instead.
     ExternalLogin,
 }
 
@@ -150,7 +152,7 @@ impl ImportNote {
             ImportNote::PasswordFromPgpass => "Password taken from your own .pgpass",
             ImportNote::PortAssumed => "The source named no port; this is the default",
             ImportNote::NamedInstance => "A named instance: set the port it listens on",
-            ImportNote::ExternalLogin => "Signs in with Windows or Entra: set a SQL login",
+            ImportNote::ExternalLogin => "Signs in a way Schemaic can't: set a SQL login",
         }
     }
 }
@@ -721,7 +723,8 @@ pub fn parse_url(input: &str) -> Result<Connection, UrlError> {
 
 /// [`parse_url`], with the advisory notes the URL itself warrants — a SQL
 /// Server named instance with no port ([`ImportNote::NamedInstance`]), and a
-/// connection string's Windows or Entra login ([`ImportNote::ExternalLogin`]).
+/// connection string's sign-in Schemaic does not have
+/// ([`ImportNote::ExternalLogin`]).
 ///
 /// **A connection string is tried before the `.env` strip**, which would eat
 /// its `Server=` head as a variable name — and after it too, for ASP.NET's
@@ -880,12 +883,17 @@ fn looks_like_connection_string(s: &str) -> bool {
 /// an unknown engine rather than a SQL Server with a MySQL host. **So is the
 /// transport**: `np:` (named pipes) and `(localdb)` are refused as
 /// [`UrlError::Transport`], since TCP is all Schemaic speaks; `lpc:` (shared
-/// memory) is this machine, which TCP reaches too. A login the string hands to
-/// Windows or Entra keeps the server and carries [`ImportNote::ExternalLogin`].
+/// memory) is this machine, which TCP reaches too. A Windows login becomes
+/// Windows sign-in and `Active Directory Default` the Azure CLI's, where the
+/// build offers them; any other sign-in keeps the server and carries
+/// [`ImportNote::ExternalLogin`].
 fn parse_connection_string(s: &str) -> Result<(Connection, Vec<ImportNote>), UrlError> {
     let mut c = blank(MSSQL);
     let mut server = String::new();
-    let (mut encrypt, mut trust, mut external) = (None::<String>, false, false);
+    let (mut encrypt, mut trust) = (None::<String>, false);
+    // The sign-in the string names, when it is not a SQL login: `Some(mode)`
+    // for one Schemaic has, `None` inside for an Entra method it does not.
+    let mut external: Option<Option<crate::connection::AuthMode>> = None;
     for (k, v) in split_mssql_props(s, true) {
         if v.is_empty() {
             continue;
@@ -899,12 +907,23 @@ fn parse_connection_string(s: &str) -> Result<(Connection, Vec<ImportNote>), Url
             "password" | "pwd" => set_if_empty(&mut c.password, &v),
             "encrypt" => encrypt = Some(normalize_key(&v)),
             "trustservercertificate" => trust = truthy(&v),
-            "integratedsecurity" | "trustedconnection" => {
-                external |= truthy(&v) || normalize_key(&v) == "sspi"
+            "integratedsecurity" | "trustedconnection"
+                if truthy(&v) || normalize_key(&v) == "sspi" =>
+            {
+                external = Some(Some(crate::connection::AuthMode::Windows));
             }
-            // `Sql Password` is a SQL login spelled out; every other method
-            // (`Active Directory Password`, `…Interactive`, `…Default`) is Entra.
-            "authentication" => external |= normalize_key(&v) != "sqlpassword",
+            // `Sql Password` is a SQL login spelled out; every other method is
+            // Entra. `Active Directory Default` is `DefaultAzureCredential`,
+            // whose chain tries the Azure CLI — the one Entra sign-in Schemaic
+            // has; the rest (`…Password`, `…Interactive`, `…Integrated`) are
+            // not it.
+            "authentication" => match normalize_key(&v).as_str() {
+                "sqlpassword" => {}
+                "activedirectorydefault" => {
+                    external = Some(Some(crate::connection::AuthMode::AzureCli))
+                }
+                _ => external = Some(None),
+            },
             "driver" | "provider" if !names_sql_server_driver(&v) => {
                 return Err(UrlError::UnknownScheme(v));
             }
@@ -941,8 +960,14 @@ fn parse_connection_string(s: &str) -> Result<(Connection, Vec<ImportNote>), Url
     if instance && port.is_none() {
         notes.push(ImportNote::NamedInstance);
     }
-    if external {
-        notes.push(ImportNote::ExternalLogin);
+    // A sign-in this build offers is carried over; any other keeps the
+    // server and says what to set.
+    match external {
+        Some(Some(mode)) if crate::connection::AuthMode::offered(MSSQL).contains(&mode) => {
+            c.auth = mode;
+        }
+        Some(_) => notes.push(ImportNote::ExternalLogin),
+        None => {}
     }
     c.name = suggest_name(&c);
     Ok((c, notes))
@@ -2695,6 +2720,7 @@ fn blank(db_type: &str) -> Connection {
         environment: Environment::default(),
         ai_data: None,
         folder: String::new(),
+        auth: crate::connection::AuthMode::Password,
     }
 }
 
@@ -2973,16 +2999,51 @@ mod tests {
         assert_eq!((c.host.as_str(), c.port), ("db", 1500));
         let c = url("ConnectionStrings__Default=\"Server=h;Database=d\"");
         assert_eq!((c.host.as_str(), c.database.as_str()), ("h", "d"));
+        // A Windows login becomes Windows sign-in where the build has it, and
+        // keeps the note where it does not.
         for login in [
             "Server=h;Database=d;Integrated Security=SSPI",
             "Server=h;Trusted_Connection=yes",
-            "Server=h;Authentication=Active Directory Interactive;User Id=a@b.c",
         ] {
             let scan = parse_url_scan(login);
-            assert!(scan.found[0].has(ImportNote::ExternalLogin), "{login}");
+            let found = &scan.found[0];
+            assert_eq!(
+                found.has(ImportNote::ExternalLogin),
+                !cfg!(windows),
+                "{login}"
+            );
+            assert_eq!(
+                found.connection.effective_auth(),
+                if cfg!(windows) {
+                    crate::connection::AuthMode::Windows
+                } else {
+                    crate::connection::AuthMode::Password
+                },
+                "{login}"
+            );
         }
+        // Entra's `Default` — whose chain tries the Azure CLI — becomes the
+        // Azure CLI's sign-in; any other Entra method keeps the note.
+        let scan =
+            parse_url_scan("Server=h.database.windows.net;Authentication=Active Directory Default");
+        assert!(!scan.found[0].has(ImportNote::ExternalLogin));
+        assert_eq!(
+            scan.found[0].connection.auth,
+            crate::connection::AuthMode::AzureCli
+        );
+        let scan =
+            parse_url_scan("Server=h;Authentication=Active Directory Interactive;User Id=a@b.c");
+        assert!(scan.found[0].has(ImportNote::ExternalLogin));
+        assert_eq!(
+            scan.found[0].connection.auth,
+            crate::connection::AuthMode::Password
+        );
         let scan = parse_url_scan("Server=h;Integrated Security=false;User Id=u");
         assert!(!scan.found[0].has(ImportNote::ExternalLogin));
+        assert_eq!(
+            scan.found[0].connection.auth,
+            crate::connection::AuthMode::Password
+        );
         for unreachable in [
             "Server=np:\\\\host\\pipe\\sql\\query;Database=d",
             "Server=(localdb)\\MSSQLLocalDB;Database=d",

@@ -3709,3 +3709,169 @@ async fn a_contained_user_is_created_signs_in_and_is_reset() {
         Some(name.as_str())
     );
 }
+
+// ── Signing in without a password ───────────────────────────────────────────
+
+/// A saved SQL Server connection signing in as `auth`, as the app builds one.
+fn sign_in_connection(
+    host: String,
+    port: u16,
+    database: &str,
+    auth: schemaic_core::connection::AuthMode,
+    tls: schemaic_core::connection::SslMode,
+) -> schemaic_core::connection::Connection {
+    use schemaic_core::connection::{Connection, Environment, SshTunnel, Tls};
+    Connection {
+        id: 1,
+        name: "sign-in".into(),
+        db_type: "SQL Server".into(),
+        host,
+        port,
+        user: String::new(),
+        password: String::new(),
+        file: String::new(),
+        database: database.into(),
+        ssh: SshTunnel::default(),
+        tls: Tls {
+            mode: tls,
+            ..Tls::default()
+        },
+        color: None,
+        prominent_color: false,
+        read_only: false,
+        cli_access: false,
+        environment: Environment::None,
+        ai_data: None,
+        folder: String::new(),
+        auth,
+    }
+}
+
+/// One scalar on `db`, in `database`.
+async fn signed_in_scalar(db: &Db, database: &str, sql: &str) -> String {
+    let rs = db
+        .fetch_query(Some(database), sql, 10, CancellationToken::new())
+        .await
+        .unwrap_or_else(|e| panic!("{e}\nstatement: {sql}"));
+    rs.cell(0, 0)
+        .map(|c| c.display().to_string())
+        .unwrap_or_else(|| panic!("{sql} returned no cell"))
+}
+
+/// **Windows sign-in is this process's own identity** — SSPI, the form's
+/// user and password never sent. The opt-in `mssql-windows` leg, against a
+/// Windows SQL Server this process can reach:
+/// `SCHEMAIC_IT_MSSQL_WINDOWS_HOST` / `_PORT`, by default `127.0.0.1` /
+/// `1435` (a local Developer instance moved off 1433, which WSL's container
+/// holds). The login the server sees is the Windows account running the test,
+/// authenticated by NTLM or Kerberos rather than as a SQL login.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_windows_sign_in_is_this_processs_own_identity() {
+    use schemaic_core::connection::{AuthMode, SslMode};
+    if !endpoint::opt_in_leg_enabled("mssql-windows") {
+        endpoint::note_leg_skipped("mssql-windows");
+        return;
+    }
+    let host = std::env::var("SCHEMAIC_IT_MSSQL_WINDOWS_HOST").unwrap_or("127.0.0.1".into());
+    let port = std::env::var("SCHEMAIC_IT_MSSQL_WINDOWS_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(1435);
+    // `Prefer`: the local instance's certificate is the one it generated
+    // for itself, which only a mode that trusts none accepts.
+    let conn = sign_in_connection(host, port, "", AuthMode::Windows, SslMode::Prefer);
+    assert_eq!(conn.effective_auth(), AuthMode::Windows);
+    let db = Db::connect(&conn, None);
+    db.ping(std::time::Duration::from_secs(20))
+        .await
+        .expect("a Windows sign-in");
+    let me = format!(
+        "{}\\{}",
+        std::env::var("USERDOMAIN").expect("USERDOMAIN"),
+        std::env::var("USERNAME").expect("USERNAME")
+    );
+    let login = signed_in_scalar(&db, "master", "SELECT SUSER_SNAME()").await;
+    assert!(login.eq_ignore_ascii_case(&me), "{login} is not {me}");
+    let scheme = signed_in_scalar(
+        &db,
+        "master",
+        "SELECT auth_scheme FROM sys.dm_exec_connections WHERE session_id = @@SPID",
+    )
+    .await;
+    assert!(
+        scheme == "NTLM" || scheme == "KERBEROS",
+        "signed in by {scheme}, not by Windows"
+    );
+    // The same connection with its (empty) password is refused — which is
+    // what makes the sign-in above the mode's doing.
+    let password = Db::connect(
+        &schemaic_core::connection::Connection {
+            auth: AuthMode::Password,
+            ..conn
+        },
+        None,
+    );
+    let refused = password
+        .ping(std::time::Duration::from_secs(20))
+        .await
+        .expect_err("an empty SQL login");
+    assert!(refused.to_string().contains("18456"), "{refused}");
+}
+
+/// **An Entra sign-in is the Azure CLI's user**, with a token the CLI mints
+/// and Schemaic never stores — and the second connection is handed the
+/// cached one rather than asking the CLI again. The opt-in `mssql-azure`
+/// leg, against an Azure SQL database with Entra sign-in and a signed-in
+/// `az`: `SCHEMAIC_IT_MSSQL_AZURE_HOST` (required, no default — it is
+/// somebody's own server) and `_DATABASE` (`schemaic_it`). Verified
+/// certificates, as Azure's are public.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_entra_sign_in_is_the_azure_clis_user() {
+    use schemaic_core::connection::{AuthMode, SslMode};
+    if !endpoint::opt_in_leg_enabled("mssql-azure") {
+        endpoint::note_leg_skipped("mssql-azure");
+        return;
+    }
+    let host = std::env::var("SCHEMAIC_IT_MSSQL_AZURE_HOST")
+        .expect("SCHEMAIC_IT_MSSQL_AZURE_HOST names the Azure SQL server for mssql-azure");
+    let database =
+        std::env::var("SCHEMAIC_IT_MSSQL_AZURE_DATABASE").unwrap_or("schemaic_it".into());
+    let conn = sign_in_connection(
+        host,
+        1433,
+        &database,
+        AuthMode::AzureCli,
+        SslMode::VerifyFull,
+    );
+    let db = Db::connect(&conn, None);
+    let login = signed_in_scalar(&db, &database, "SELECT SUSER_SNAME()").await;
+    assert!(login.contains('@'), "{login} is not an Entra user");
+    let again = std::time::Instant::now();
+    assert_eq!(
+        signed_in_scalar(&db, &database, "SELECT ORIGINAL_LOGIN()").await,
+        login
+    );
+    eprintln!(
+        "live: mssql-azure signed in as {login}; a second connection took {:?}",
+        again.elapsed()
+    );
+    // A SQL login is refused on an Entra-only server, which is what makes the
+    // assertion above one about the token rather than a password.
+    let password = Db::connect(
+        &sign_in_connection(
+            conn.host.clone(),
+            1433,
+            &database,
+            AuthMode::Password,
+            SslMode::VerifyFull,
+        ),
+        None,
+    );
+    assert!(
+        password
+            .fetch_query(Some(&database), "SELECT 1", 1, CancellationToken::new())
+            .await
+            .is_err()
+    );
+}

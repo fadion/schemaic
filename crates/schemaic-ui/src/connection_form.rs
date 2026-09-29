@@ -23,6 +23,7 @@ use floem::keyboard::{Key, NamedKey};
 use floem::prelude::*;
 use floem::reactive::create_effect;
 use schemaic_core::connection::AiData;
+use schemaic_core::connection::AuthMode;
 use schemaic_core::connection::Environment;
 use schemaic_core::connection::{ListedRow, listed_ids, listed_rows};
 
@@ -1348,17 +1349,82 @@ fn server_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
     ))
     .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full());
 
+    // How it signs in, where the engine offers more than a password — SQL
+    // Server's Windows and Entra sign-in (`AuthMode::offered`). Read once:
+    // this block is rebuilt when the engine changes, so the list is this
+    // engine's. The credentials below follow the mode, built per mode rather
+    // than hidden, for `engine_block`'s Tab-ring reason.
+    let modes = AuthMode::offered(&draft.db_type.get_untracked());
+    let auth_picker = if modes.len() > 1 {
+        v_stack((
+            text("Authentication").style(form_label_style),
+            focusable_dropdown(draft.auth, modes.clone(), AuthMode::label, ring.clone(), 68)
+                .style(|s| s.width(theme::scaled(240.0))),
+        ))
+        .style(|s| s.flex_col().gap(theme::scaled(6.0)))
+        .into_any()
+    } else {
+        crate::widgets::nothing()
+    };
+    let auth = draft.auth;
+    let ring_creds = ring.clone();
+    let credentials = dyn_container(
+        // The mode in force, not the stored one: a SQL Server connection
+        // switched to MySQL keeps its mode, and must still show a password.
+        move || {
+            let m = auth.get();
+            if modes.contains(&m) {
+                m
+            } else {
+                AuthMode::Password
+            }
+        },
+        move |m| match m {
+            AuthMode::Password => v_stack((
+                field("User", draft.user, ring_creds.clone(), 70)
+                    .style(|s| s.width(conn_field_w())),
+                masked_field("Password", draft.password, ring_creds.clone(), 80)
+                    .style(|s| s.width(conn_field_w())),
+            ))
+            .style(|s| s.flex_col().gap(theme::scaled(20.0)).width_full())
+            .into_any(),
+            AuthMode::Windows => form_hint(windows_sign_in_hint())
+                .style(|s| s.width_full())
+                .into_any(),
+            AuthMode::AzureCli => form_hint(
+                "Signs in as whoever is signed in to the Azure CLI (run `az login` first). \
+                 The token is fetched when a connection needs one and never saved.",
+            )
+            .style(|s| s.width_full())
+            .into_any(),
+        },
+    )
+    .style(|s| s.width_full());
+
     v_stack((
         host_port_row("Host", draft.host, "Port", draft.port, ring.clone(), 60),
         database_field,
-        field("User", draft.user, ring.clone(), 70).style(|s| s.width(conn_field_w())),
-        masked_field("Password", draft.password, ring.clone(), 80)
-            .style(|s| s.width(conn_field_w())),
+        auth_picker,
+        credentials,
         ssh_toggle,
         ssh_fields,
         tls_fields(draft, ring),
     ))
     .style(|s| s.flex_col().gap(theme::scaled(20.0)).width_full())
+}
+
+/// What Windows sign-in presents, named: the account this process runs as,
+/// which is the one SSPI hands the server. From the environment Windows sets
+/// for every process; without it, the sentence says so generically.
+fn windows_sign_in_hint() -> String {
+    let who = match (std::env::var("USERDOMAIN"), std::env::var("USERNAME")) {
+        (Ok(d), Ok(u)) if !d.is_empty() && !u.is_empty() => format!(" ({d}\\{u})"),
+        _ => String::new(),
+    };
+    format!(
+        "Signs in as the Windows account Schemaic runs as{who}. The server must know that \
+         account as a Windows login."
+    )
 }
 
 /// The half of the form a **SQLite** connection has instead: one path, and a
@@ -1461,6 +1527,9 @@ fn conn_form(
         // is permitted at all.
         draft.file.track();
         draft.database.track();
+        // How it signs in: a Test that passed as a SQL login says nothing about
+        // the Windows or Entra sign-in the picker now names.
+        draft.auth.track();
         conn_test.set(crate::TestState::Idle);
     });
 

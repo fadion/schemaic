@@ -430,14 +430,22 @@ pub fn psql_cli_tls_env(tls: &crate::connection::Tls) -> Vec<(String, String)> {
 /// certificate, a different trust), and dropping it would verify against a
 /// store the connection did not ask for. So is a client certificate, for the
 /// same reason: TDS signs no one in by one, so there is nowhere to send it.
+///
+/// **It signs in as the connection does** (`auth`, already the connection's
+/// `effective_auth`): `-U` for a SQL login, `-E` — a trusted connection, the
+/// same flag in both clients — for Windows sign-in, and a refusal for Entra,
+/// whose token `sqlcmd` has no way to be handed.
 pub fn sqlcmd_args(
     host: &str,
     port: u16,
+    auth: crate::connection::AuthMode,
     user: &str,
     database: Option<&str>,
     tls: &crate::connection::Tls,
 ) -> Result<Vec<String>, &'static str> {
-    use crate::connection::SslMode;
+    use crate::connection::{AuthMode, SslMode};
+    const ENTRA: &str = "sqlcmd cannot be handed the Azure CLI's sign-in token, so this \
+        connection cannot open in it. Open it in a query tab instead.";
     const HOST: &str = "This connection's host contains a character sqlcmd reads as part of the \
         address (',', '\\', ';' or a ':' prefix). Set the port in its own field, and open it again.";
     const CA: &str = "sqlcmd cannot verify against a CA file. Add the CA to the system's trust \
@@ -461,7 +469,12 @@ pub fn sqlcmd_args(
     } else {
         host.to_string()
     };
-    let mut args = vec![format!("-Stcp:{host},{port}"), format!("-U{user}")];
+    let sign_in = match auth {
+        AuthMode::Password => format!("-U{user}"),
+        AuthMode::Windows => "-E".to_string(),
+        AuthMode::AzureCli => return Err(ENTRA),
+    };
+    let mut args = vec![format!("-Stcp:{host},{port}"), sign_in];
     if let Some(db) = database.filter(|d| !d.is_empty()) {
         args.push(format!("-d{db}"));
     }
@@ -1144,6 +1157,7 @@ mod tests {
         sqlcmd_args(
             host,
             1433,
+            crate::connection::AuthMode::Password,
             "sa",
             db,
             &Tls {
@@ -1151,6 +1165,26 @@ mod tests {
                 ..Tls::default()
             },
         )
+    }
+
+    /// **`sqlcmd` signs in the way the connection does**: a SQL login as
+    /// `-U`, Windows sign-in as `-E` — a trusted connection, the process's own
+    /// identity, in both clients — with no user sent. An Entra connection is
+    /// refused: `sqlcmd` cannot be handed the Azure CLI's token, and falling
+    /// back to a SQL login would be a different sign-in than the one saved.
+    #[test]
+    fn sqlcmd_signs_in_the_way_the_connection_does() {
+        use crate::connection::AuthMode;
+        let args = |auth| sqlcmd_args("db.example", 1433, auth, "sa", None, &Tls::default());
+        assert!(
+            args(AuthMode::Password)
+                .unwrap()
+                .contains(&"-Usa".to_string())
+        );
+        let windows = args(AuthMode::Windows).unwrap();
+        assert!(windows.contains(&"-E".to_string()), "{windows:?}");
+        assert!(!windows.iter().any(|a| a.starts_with("-U")), "{windows:?}");
+        assert!(args(AuthMode::AzureCli).is_err());
     }
 
     /// `sqlcmd`'s argv: the server forced onto TCP, every value **attached**
@@ -1211,6 +1245,7 @@ mod tests {
         let private = sqlcmd_args(
             "h",
             1433,
+            crate::connection::AuthMode::Password,
             "sa",
             None,
             &Tls {
@@ -1225,6 +1260,7 @@ mod tests {
         let client = sqlcmd_args(
             "h",
             1433,
+            crate::connection::AuthMode::Password,
             "sa",
             None,
             &Tls {

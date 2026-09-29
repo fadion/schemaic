@@ -71,6 +71,7 @@
 //! that packet but keeps only the alias name + type, so it can't tell which real
 //! table/column a result cell came from.
 
+mod entra;
 pub mod mssql;
 pub mod mysql;
 pub mod pg;
@@ -505,6 +506,11 @@ pub struct Db {
     /// [`schemaic_core::connection::Connection::tls_plan`], so no driver here
     /// re-reads a mode. See [`tls`].
     pub(crate) tls: Option<schemaic_core::connection::TlsPlan>,
+    /// How this endpoint signs in — already resolved through
+    /// [`schemaic_core::connection::Connection::effective_auth`], so a mode
+    /// the engine does not offer never reaches a driver. Only SQL Server's
+    /// reads anything but the password ([`mssql`]).
+    pub(crate) auth: schemaic_core::connection::AuthMode,
 }
 
 /// **Hand-written, because the derived one printed the password.**
@@ -536,6 +542,7 @@ impl std::fmt::Debug for Db {
             .field("file", &self.file)
             .field("database", &self.database)
             .field("tls", &self.tls)
+            .field("auth", &self.auth)
             .finish()
     }
 }
@@ -575,6 +582,7 @@ impl Db {
         // Asked through the connection, so a name left behind by an engine
         // switch never reaches a driver that has no databases to open.
         let database = conn.default_database().unwrap_or_default().to_string();
+        let auth = conn.effective_auth();
         match tunnel_port.filter(|_| engine.is_networked()) {
             // **The certificate is still the far end's.** Rewriting the endpoint
             // to `127.0.0.1` would have `verify-full` compare a perfectly good
@@ -593,6 +601,7 @@ impl Db {
                     hostname_override: Some(conn.host.clone()),
                     ..p
                 }),
+                auth,
             },
             None => Db {
                 engine,
@@ -603,6 +612,7 @@ impl Db {
                 file,
                 database,
                 tls,
+                auth,
             },
         }
     }
@@ -631,7 +641,29 @@ impl Db {
             file,
             database: String::new(),
             tls: None,
+            auth: schemaic_core::connection::AuthMode::Password,
         }
+    }
+
+    /// This endpoint, signing in as `auth` — for the MCP subprocess, which
+    /// receives the mode in its endpoint alongside the parts
+    /// [`Self::from_parts`] takes, and for tests. Asked through the engine
+    /// here too, as [`Self::connect`] asks it through the connection, so an
+    /// endpoint cannot carry a mode its engine does not offer.
+    pub fn with_auth(mut self, auth: schemaic_core::connection::AuthMode) -> Db {
+        // `as_str` is a label `connection::is_mssql` and its siblings read.
+        let offered = schemaic_core::connection::AuthMode::offered(self.engine.as_str());
+        self.auth = if offered.contains(&auth) {
+            auth
+        } else {
+            schemaic_core::connection::AuthMode::Password
+        };
+        self
+    }
+
+    /// How this endpoint signs in.
+    pub fn auth(&self) -> schemaic_core::connection::AuthMode {
+        self.auth
     }
 
     /// The database this handle opens in when none is named, or `None`.
@@ -3207,6 +3239,7 @@ mod tests {
             environment: Default::default(),
             ai_data: None,
             folder: String::new(),
+            auth: Default::default(),
         };
         // No tunnel → direct host/port passthrough.
         let direct = Db::connect(&conn, None);
@@ -3254,6 +3287,7 @@ mod tests {
                 environment: Default::default(),
                 ai_data: None,
                 folder: String::new(),
+                auth: Default::default(),
             };
 
             let direct = Db::connect(&conn, None);
@@ -3304,6 +3338,7 @@ mod tests {
             environment: Default::default(),
             ai_data: None,
             folder: String::new(),
+            auth: Default::default(),
         };
         let db = Db::connect(&conn, Some(55001));
         assert_eq!(db.engine(), Engine::Sqlite);

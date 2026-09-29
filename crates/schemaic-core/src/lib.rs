@@ -22,6 +22,7 @@ pub mod ddl;
 pub mod diff;
 pub mod dump;
 pub mod edit;
+pub mod entra;
 pub mod erd;
 pub mod erd_export;
 pub mod expanded;

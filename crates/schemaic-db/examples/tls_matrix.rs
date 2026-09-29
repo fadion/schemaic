@@ -158,6 +158,7 @@ fn connection(db_type: &str, host: &str, port: u16, tls: Tls) -> Connection {
         environment: Environment::None,
         ai_data: None,
         folder: String::new(),
+        auth: Default::default(),
     }
 }
 

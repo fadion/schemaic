@@ -1386,6 +1386,7 @@ mod tests {
             environment: Default::default(),
             ai_data: None,
             folder: String::new(),
+            auth: Default::default(),
         }
     }
 

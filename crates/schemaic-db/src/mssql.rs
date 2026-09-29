@@ -64,14 +64,17 @@ fn not_yet(what: &str) -> DbError {
 /// The driver's configuration for this endpoint, scoped to `database` or, with
 /// none, to the connection's own — and with no database at all, to the login's
 /// default one, which is SQL Server's own answer and usually `master`.
-fn config(db: &Db, database: Option<&str>) -> Result<tiberius::Config, DbError> {
+///
+/// Async for one mode: an Entra sign-in needs a token first, from the Azure
+/// CLI or the cache in front of it ([`crate::entra`]).
+async fn config(db: &Db, database: Option<&str>) -> Result<tiberius::Config, DbError> {
     let mut cfg = tiberius::Config::new();
     cfg.host(&db.host);
     cfg.port(db.port);
     if let Some(d) = database.or(db.database()) {
         cfg.database(d);
     }
-    cfg.authentication(tiberius::AuthMethod::sql_server(&db.user, &db.pass));
+    cfg.authentication(auth_method(db).await?);
     cfg.application_name("Schemaic");
     // **No per-response deadline.** The driver's default is thirty seconds,
     // ADO.NET's `CommandTimeout`, which would end any query whose first row
@@ -81,22 +84,122 @@ fn config(db: &Db, database: Option<&str>) -> Result<tiberius::Config, DbError> 
     cfg.command_timeout(None);
     cfg.encryption(crate::tls::mssql_encryption(db.tls_plan()));
     cfg.rustls_client_config(crate::tls::mssql_client_config(db.tls_plan())?);
+    if is_azure_sql(&db.host) {
+        cfg.handshake_timeout(Some(AZURE_HANDSHAKE));
+    }
     Ok(cfg)
+}
+
+/// How long an Azure SQL login may take — a minute, where the driver's own
+/// bound is fifteen seconds. **A serverless database that has paused holds
+/// the login at the gateway while it resumes**, and measured on a free-offer
+/// database in Sweden Central that outlasted fifteen seconds: the first
+/// connection after an idle hour failed with a bare handshake timeout, and a
+/// second a minute later went straight through.
+const AZURE_HANDSHAKE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Is `host` an Azure SQL Database server — `<name>.database.windows.net`,
+/// or a sovereign cloud's spelling of it?
+fn is_azure_sql(host: &str) -> bool {
+    let h = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    [
+        ".database.windows.net",
+        ".database.chinacloudapi.cn",
+        ".database.usgovcloudapi.net",
+    ]
+    .iter()
+    .any(|s| h.ends_with(s))
+}
+
+/// The sentence for a login that timed out on an Azure SQL server: the
+/// likely reason, and what to do — the attempt itself is what wakes a paused
+/// database.
+fn azure_timeout_text() -> String {
+    format!(
+        "Azure SQL did not finish signing in within {} seconds. A serverless database that has \
+         paused takes about a minute to resume, and this attempt has woken it — connect again \
+         shortly.",
+        AZURE_HANDSHAKE.as_secs()
+    )
+}
+
+/// Azure SQL's *database is not currently available* — what a paused
+/// serverless database answers when the gateway does not hold the login
+/// instead (both were seen, minutes apart, on the same free-offer database).
+const AZURE_UNAVAILABLE: u32 = 40613;
+
+/// [`azure_timeout_text`]'s sibling for Msg 40613: the server's own words,
+/// then what they usually mean and what to do.
+fn azure_unavailable_text(server: &str) -> String {
+    format!(
+        "{server} A serverless database that has paused takes about a minute to resume, and this \
+         attempt has woken it — connect again shortly."
+    )
+}
+
+/// How the login packet signs in, per [`Db::auth`]:
+///
+/// - a password — a SQL Server login;
+/// - Windows — the identity this process runs as, through SSPI, so the form's
+///   user and password are not sent. Compiled on Windows alone (tiberius's
+///   `winauth`), and never reached elsewhere, since
+///   [`schemaic_core::connection::AuthMode::offered`] does not offer it there;
+/// - Entra — an Azure CLI access token, in the login's FedAuth extension.
+async fn auth_method(db: &Db) -> Result<tiberius::AuthMethod, DbError> {
+    use schemaic_core::connection::AuthMode;
+    match db.auth {
+        AuthMode::Password => Ok(tiberius::AuthMethod::sql_server(&db.user, &db.pass)),
+        #[cfg(windows)]
+        AuthMode::Windows => Ok(tiberius::AuthMethod::Integrated),
+        #[cfg(not(windows))]
+        AuthMode::Windows => Err(DbError::Refused(
+            "Windows sign-in is available only in the Windows build of Schemaic.".to_string(),
+        )),
+        AuthMode::AzureCli => Ok(tiberius::AuthMethod::aad_token(
+            crate::entra::sql_token().await?,
+        )),
+    }
 }
 
 /// Open a fresh connection. Follows one routing redirect, which is how Azure
 /// SQL's gateway hands a client to the node that serves its database.
+///
+/// **A refused Entra login forgets its token**, so the next attempt asks the
+/// Azure CLI again: a token the server will not take — the user signed in to
+/// the CLI as someone else since, or was removed — would otherwise be handed
+/// over until it expired.
 pub(crate) async fn connect(db: &Db, database: Option<&str>) -> Result<MsClient, DbError> {
-    let cfg = config(db, database)?;
-    match connect_with(cfg.clone()).await {
+    let cfg = config(db, database).await?;
+    let result = match connect_with(cfg.clone()).await {
         Err(tiberius::error::Error::Routing { host, port }) => {
             let mut routed = cfg;
             routed.host(&host);
             routed.port(port);
-            connect_with(routed).await.map_err(|e| connect_err(&e))
+            connect_with(routed).await
         }
-        other => other.map_err(|e| connect_err(&e)),
+        other => other,
+    };
+    if db.auth == schemaic_core::connection::AuthMode::AzureCli
+        && matches!(&result, Err(tiberius::error::Error::Server(t)) if t.code() == 18456)
+    {
+        crate::entra::forget();
     }
+    if is_azure_sql(&db.host) {
+        match &result {
+            Err(tiberius::error::Error::Io { kind, .. })
+                if *kind == std::io::ErrorKind::TimedOut =>
+            {
+                return Err(DbError::Connect(azure_timeout_text()));
+            }
+            // The other way a waking database answers: at once, with Msg 40613
+            // "not currently available", rather than by holding the login.
+            Err(e @ tiberius::error::Error::Server(t)) if t.code() == AZURE_UNAVAILABLE => {
+                return Err(DbError::Connect(azure_unavailable_text(&ms_text(e))));
+            }
+            _ => {}
+        }
+    }
+    result.map_err(|e| connect_err(&e))
 }
 
 async fn connect_with(cfg: tiberius::Config) -> tiberius::Result<MsClient> {
@@ -3627,6 +3730,35 @@ mod write_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **An Azure SQL server is told by its name**, in each cloud's spelling
+    /// and whatever the case or a trailing dot — and only it gets the longer
+    /// login bound a resuming serverless database needs.
+    #[test]
+    fn an_azure_sql_host_is_told_by_its_name() {
+        for h in [
+            "srv.database.windows.net",
+            "SRV.Database.Windows.Net.",
+            " srv.database.chinacloudapi.cn",
+            "srv.database.usgovcloudapi.net",
+        ] {
+            assert!(is_azure_sql(h), "{h}");
+        }
+        for h in [
+            "localhost",
+            "127.0.0.1",
+            "database.windows.net.evil.com",
+            "db.windows.net",
+        ] {
+            assert!(!is_azure_sql(h), "{h}");
+        }
+        assert!(azure_timeout_text().contains("60 seconds"));
+        let t = azure_unavailable_text("Database 'd' is not currently available. (Msg 40613)");
+        assert!(
+            t.starts_with("Database 'd'") && t.contains("connect again shortly"),
+            "{t}"
+        );
+    }
 
     /// **The estimated plan executes nothing**, so it needs no guard and a
     /// write is as welcome as a read; **the measured one runs the statement**,

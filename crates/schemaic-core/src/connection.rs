@@ -775,6 +775,86 @@ pub struct TlsPlan {
     pub hostname_override: Option<String>,
 }
 
+/// How a connection **signs in** — [`Connection::auth`].
+///
+/// A password is every engine's, and the default. The other two are SQL
+/// Server's ([`AuthMode::offered`]), and neither reads the form's user or
+/// password ([`AuthMode::uses_credentials`]):
+///
+/// - [`AuthMode::Windows`] presents the Windows identity the app runs as
+///   (SSPI), so there is nothing to store — and nothing on another OS to
+///   present, which is why it is offered on Windows alone.
+/// - [`AuthMode::AzureCli`] hands the server a Microsoft Entra access token
+///   from the Azure CLI's own sign-in (`az account get-access-token`), fetched
+///   when a connection needs one and never saved: the CLI holds the refresh,
+///   and the token names its user.
+///
+/// Deserialized through [`AuthModeRaw`], the persisted-enum shim.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(from = "AuthModeRaw")]
+pub enum AuthMode {
+    #[default]
+    Password,
+    Windows,
+    AzureCli,
+}
+
+/// Parsing shim for [`AuthMode`]; see [`crate::persist::RightPanelState`].
+#[derive(Deserialize)]
+enum AuthModeRaw {
+    Password,
+    Windows,
+    AzureCli,
+    #[serde(other)]
+    Unknown,
+}
+
+impl From<AuthModeRaw> for AuthMode {
+    fn from(raw: AuthModeRaw) -> Self {
+        match raw {
+            AuthModeRaw::Password => AuthMode::Password,
+            AuthModeRaw::Windows => AuthMode::Windows,
+            AuthModeRaw::AzureCli => AuthMode::AzureCli,
+            // A mode a newer build added: the password is what the form still
+            // holds, and the server says so plainly if it is not enough.
+            AuthModeRaw::Unknown => AuthMode::Password,
+        }
+    }
+}
+
+impl AuthMode {
+    /// The modes the engine `db_type` signs in with, in picker order, the
+    /// default first. Windows sign-in only in a Windows build — there is no
+    /// Windows identity for the process to present anywhere else.
+    pub fn offered(db_type: &str) -> Vec<AuthMode> {
+        let mut modes = vec![AuthMode::Password];
+        if is_mssql(db_type) {
+            if cfg!(windows) {
+                modes.push(AuthMode::Windows);
+            }
+            modes.push(AuthMode::AzureCli);
+        }
+        modes
+    }
+
+    /// Does this mode sign in with the form's user and password?
+    pub fn uses_credentials(self) -> bool {
+        match self {
+            AuthMode::Password => true,
+            AuthMode::Windows | AuthMode::AzureCli => false,
+        }
+    }
+
+    /// The picker's label.
+    pub fn label(self) -> &'static str {
+        match self {
+            AuthMode::Password => "User and password",
+            AuthMode::Windows => "Windows (this account)",
+            AuthMode::AzureCli => "Microsoft Entra (Azure CLI)",
+        }
+    }
+}
+
 /// A saved connection to a database server.
 ///
 /// [`Debug`] is hand-written and redacting — see the impl below the struct, and
@@ -872,6 +952,10 @@ pub struct Connection {
     /// a connection names it, and [`group_by_folder`] is what reads it.
     #[serde(default)]
     pub folder: String,
+    /// How it signs in ([`AuthMode`]); a password for every connection saved
+    /// before the field existed. Read through [`Self::effective_auth`].
+    #[serde(default)]
+    pub auth: AuthMode,
 }
 
 /// Redacting, for [`SshTunnel`]'s reasons — the DB password here, and the two
@@ -896,6 +980,7 @@ impl std::fmt::Debug for Connection {
             .field("environment", &self.environment)
             .field("ai_data", &self.ai_data)
             .field("folder", &self.folder)
+            .field("auth", &self.auth)
             .finish()
     }
 }
@@ -1064,6 +1149,19 @@ impl Connection {
     /// instead would plan a handshake for a SQLite file.
     pub fn tls_plan(&self) -> Option<TlsPlan> {
         self.uses_tls().then(|| self.tls.plan()).flatten()
+    }
+
+    /// How opening this connection signs in — [`Self::auth`] **asked through
+    /// the engine**, as [`Self::default_database`] is: a SQL Server
+    /// connection switched to MySQL keeps its mode with no control left that
+    /// could unset it, and a Windows mode read by a build on another OS has no
+    /// identity to present. Either signs in with the password.
+    pub fn effective_auth(&self) -> AuthMode {
+        if AuthMode::offered(&self.db_type).contains(&self.auth) {
+            self.auth
+        } else {
+            AuthMode::Password
+        }
     }
 
     /// The whole path of a SQLite connection's file, empty for any other engine.
@@ -1235,6 +1333,10 @@ impl Connection {
             && self.host == other.host
             && self.port == other.port
             && self.user == other.user
+            // Who signs in, as `user` is: Windows or Entra is another login,
+            // which may see other databases. The mode in force, so one left
+            // behind by an engine switch is no change.
+            && self.effective_auth() == other.effective_auth()
             && self.ssh.enabled == other.ssh.enabled
             && self.ssh.host == other.ssh.host
             && self.ssh.port == other.ssh.port
@@ -1253,7 +1355,7 @@ impl Connection {
     /// Save a MySQL connection with TLS **Disabled**, pin a tab to Manual so
     /// `open_session` builds a `Db` from the connection as it then stands, then
     /// change TLS mode to `Required` and press Save. Every one of the nine
-    /// fields `targets_same_server` compares is unchanged, so the invalidation
+    /// fields `targets_same_server` then compared was unchanged, so the invalidation
     /// block was skipped: the pinned `Session` kept running, and every statement
     /// in that tab — and its `COMMIT` — went on travelling in the clear,
     /// indefinitely, while the connection form, the status bar and every fresh
@@ -1871,6 +1973,7 @@ mod tests {
             environment: Environment::None,
             ai_data: None,
             folder: String::new(),
+            auth: AuthMode::Password,
         };
         assert_eq!(c.endpoint(), "db.example.com:3307");
         // A server connection has no file to label.
@@ -1969,6 +2072,93 @@ mod tests {
             environment: Environment::None,
             ai_data: None,
             folder: String::new(),
+            auth: AuthMode::Password,
+        }
+    }
+
+    // ── Authentication ──
+
+    /// **A connection saved before the field existed signs in with its
+    /// password**, and so does one naming a mode a newer build added: a
+    /// password is what every such file already meant, and failing the parse
+    /// would lose every connection in it.
+    #[test]
+    fn an_absent_or_unknown_auth_mode_is_a_password() {
+        let old: Connection = serde_json::from_str(
+            r#"{"id":1,"name":"n","host":"h","port":1433,"user":"u","password":""}"#,
+        )
+        .expect("an old file parses");
+        assert_eq!(old.auth, AuthMode::Password);
+        let newer: Connection = serde_json::from_str(
+            r#"{"id":1,"name":"n","host":"h","port":1433,"user":"u","password":"","auth":"Kerberos"}"#,
+        )
+        .expect("an unknown mode still parses");
+        assert_eq!(newer.auth, AuthMode::Password);
+        let back: Connection = serde_json::from_str(
+            &serde_json::to_string(&Connection {
+                auth: AuthMode::AzureCli,
+                ..conn()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(back.auth, AuthMode::AzureCli);
+    }
+
+    /// **Only SQL Server offers another way in**, and Windows sign-in only on
+    /// Windows, where the process has a Windows identity to present.
+    #[test]
+    fn sql_server_offers_windows_and_azure_sign_in() {
+        let mssql = AuthMode::offered("SQL Server");
+        assert_eq!(mssql[0], AuthMode::Password, "the default first");
+        assert!(mssql.contains(&AuthMode::AzureCli));
+        assert_eq!(mssql.contains(&AuthMode::Windows), cfg!(windows));
+        for other in ["MySQL", "MariaDB", "PostgreSQL", "SQLite"] {
+            assert_eq!(AuthMode::offered(other), [AuthMode::Password], "{other}");
+        }
+    }
+
+    /// **The mode a driver sees is asked through the engine**, as
+    /// [`Connection::default_database`] is: the picker is editable in place, so
+    /// a SQL Server connection switched to MySQL keeps its mode with no control
+    /// left that could unset it.
+    #[test]
+    fn a_mode_the_engine_does_not_offer_signs_in_with_the_password() {
+        let az = Connection {
+            db_type: "SQL Server".into(),
+            auth: AuthMode::AzureCli,
+            ..conn()
+        };
+        assert_eq!(az.effective_auth(), AuthMode::AzureCli);
+        let switched = Connection {
+            db_type: "MySQL".into(),
+            ..az.clone()
+        };
+        assert_eq!(switched.effective_auth(), AuthMode::Password);
+        let windows = Connection {
+            auth: AuthMode::Windows,
+            ..az
+        };
+        assert_eq!(
+            windows.effective_auth(),
+            if cfg!(windows) {
+                AuthMode::Windows
+            } else {
+                AuthMode::Password
+            }
+        );
+    }
+
+    /// Which of the form's sign-in fields a mode reads: a password mode both,
+    /// the others neither — Windows presents the process's own identity, and
+    /// the Azure CLI's token names its user.
+    #[test]
+    fn only_a_password_mode_reads_the_user_and_password() {
+        assert!(AuthMode::Password.uses_credentials());
+        assert!(!AuthMode::Windows.uses_credentials());
+        assert!(!AuthMode::AzureCli.uses_credentials());
+        for m in [AuthMode::Password, AuthMode::Windows, AuthMode::AzureCli] {
+            assert!(!m.label().is_empty() && !m.label().ends_with('…'));
         }
     }
 
@@ -2449,6 +2639,32 @@ mod tests {
         edited.ssh.password = "also corrected".into();
         edited.ssh.key_passphrase = "and this".into();
         assert!(conn().targets_same_server(&edited));
+    }
+
+    /// **A new sign-in is a different login**, as a new user is: Windows or
+    /// Entra signs in as somebody the SQL login was not, who may see other
+    /// databases — so the tree reloads, and a pinned Manual session or an MCP
+    /// subprocess signed in the old way is not left running as the old
+    /// account. Compared as the mode *in force*, so a SQL Server connection's
+    /// mode left behind by a switch to MySQL is not a change.
+    #[test]
+    fn a_new_sign_in_mode_is_a_different_login() {
+        let mssql = Connection {
+            db_type: "SQL Server".into(),
+            ..conn()
+        };
+        let entra = Connection {
+            auth: AuthMode::AzureCli,
+            ..mssql.clone()
+        };
+        assert!(!mssql.targets_same_server(&entra));
+        assert!(mssql.invalidates_open_connections(&entra));
+        let mysql = conn();
+        let stale = Connection {
+            auth: AuthMode::AzureCli,
+            ..conn()
+        };
+        assert!(mysql.targets_same_server(&stale), "not in force on MySQL");
     }
 
     /// **The seam, which is where this went wrong: the two predicates together.**
@@ -3018,6 +3234,7 @@ mod tls_tests {
             environment: Environment::None,
             ai_data: None,
             folder: String::new(),
+            auth: AuthMode::Password,
         }
     }
 

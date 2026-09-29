@@ -35,7 +35,8 @@ tokio-postgres = { workspace = true }
 rusqlite = { workspace = true }
 tiberius = { workspace = true }
 futures-util = { workspace = true }
-tokio = { workspace = true, features = ["net"] }
+# `process`: the Azure CLI, asked for a SQL Server sign-in token (`entra.rs`).
+tokio = { workspace = true, features = ["net", "process"] }
 # `compat`: tiberius speaks `futures` I/O, and the socket it is handed is
 # tokio's.
 tokio-util = { workspace = true, features = ["compat"] }
@@ -47,6 +48,13 @@ webpki-roots = { workspace = true }
 tokio-postgres-rustls = { workspace = true }
 ssh-key = { workspace = true }
 tracing = { workspace = true }
+
+# **Windows sign-in to SQL Server** (`AuthMode::Windows`): tiberius's
+# `winauth` is SSPI through the OS, pure Rust bindings and no system library,
+# which is why it is on for Windows alone — the Unix counterpart would be
+# GSSAPI and libkrb5, a system dependency for every Linux build.
+[target.'cfg(windows)'.dependencies]
+tiberius = { workspace = true, features = ["winauth"] }
 
 [dev-dependencies]
 # For `examples/tls_matrix.rs` only: it prints the crate's own debug logs, which

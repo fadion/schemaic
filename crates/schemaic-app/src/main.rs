@@ -469,8 +469,23 @@ fn mssql_shell_config(
     {
         return Err(why);
     }
-    let cli_args = launch::sqlcmd_args(&conn.host, conn.port, &conn.user, db, &conn.tls)?;
-    let env = vec![("SQLCMDPASSWORD".to_string(), conn.password.clone())];
+    use schemaic_core::connection::AuthMode;
+    let auth = conn.effective_auth();
+    // Windows sign-in is the Windows process's identity; `sqlcmd` inside WSL is
+    // a Linux process, which has none to present.
+    if auth == AuthMode::Windows && matches!(launcher, CliLauncher::Wsl(_)) {
+        return Err(
+            "Windows sign-in needs a Windows sqlcmd, and the one found is inside WSL. \
+             Install sqlcmd on Windows, or open the connection in a query tab.",
+        );
+    }
+    let cli_args = launch::sqlcmd_args(&conn.host, conn.port, auth, &conn.user, db, &conn.tls)?;
+    // A password only for a sign-in that sends one.
+    let env = if auth.uses_credentials() {
+        vec![("SQLCMDPASSWORD".to_string(), conn.password.clone())]
+    } else {
+        Vec::new()
+    };
     Ok(wrap_launcher(launcher, cli_args, env))
 }
 
@@ -15109,6 +15124,7 @@ mod app_tests {
             environment: Default::default(),
             ai_data: None,
             folder: String::new(),
+            auth: Default::default(),
         }
     }
 
@@ -15377,6 +15393,32 @@ mod app_tests {
             cfg.env
                 .contains(&("WSLENV".to_string(), "SQLCMDPASSWORD/u".to_string()))
         );
+    }
+
+    /// **A connection that signs in without a password sends none**: an
+    /// Entra one is refused outright (`launch::sqlcmd_args`), and a Windows
+    /// one runs `-E` with no `SQLCMDPASSWORD` — and only through a Windows
+    /// `sqlcmd`, since the one inside WSL is a Linux process with no Windows
+    /// identity to present.
+    #[test]
+    fn sqlcmd_shell_signs_in_without_a_password_where_the_connection_does() {
+        use schemaic_core::connection::AuthMode;
+        let entra = Connection {
+            db_type: "SQL Server".into(),
+            auth: AuthMode::AzureCli,
+            ..conn()
+        };
+        assert!(mssql_shell_config(CliLauncher::Native("sqlcmd"), &entra, None).is_err());
+        if cfg!(windows) {
+            let windows = Connection {
+                auth: AuthMode::Windows,
+                ..entra
+            };
+            let cfg = mssql_shell_config(CliLauncher::Native("sqlcmd"), &windows, None).unwrap();
+            assert!(cfg.args.contains(&"-E".to_string()), "{:?}", cfg.args);
+            assert!(cfg.env.is_empty(), "{:?}", cfg.env);
+            assert!(mssql_shell_config(CliLauncher::Wsl("sqlcmd"), &windows, None).is_err());
+        }
     }
 
     #[test]

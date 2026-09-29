@@ -2910,6 +2910,7 @@ mod tests {
             environment: Environment::Production,
             ai_data: None,
             folder: String::new(),
+            auth: crate::connection::AuthMode::Password,
         };
         let file = ConnectionsFile {
             connections: vec![c],

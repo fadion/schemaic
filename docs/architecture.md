@@ -6639,10 +6639,16 @@ existing prose was left alone.
     `apply_mssql_tls`, now the one reading both grammars share. `split_mssql_props` gained a
     `quotes` flag for ADO.NET's `"…"`/`'…'` (a doubled quote standing for one), off for JDBC, which
     has no such quoting — a JDBC password that merely starts with `"` is left alone. **A login
-    handed to Windows or Entra keeps the row and says so**: `Integrated Security`/`Trusted_Connection`
-    true or `SSPI`, or any `Authentication=` but `Sql Password`, carries `ImportNote::ExternalLogin`,
-    since Schemaic sends SQL logins only and the row cannot sign in until one is set
-    (`an_ado_net_connection_string_is_read_by_its_keywords`,
+    handed to Windows or Entra is carried over where Schemaic has that sign-in, and noted where it
+    has not**: `Integrated Security`/`Trusted_Connection` true or `SSPI` becomes
+    `connection::AuthMode::Windows`, and `Authentication=Active Directory Default` becomes
+    `AuthMode::AzureCli` — that method is `DefaultAzureCredential`, whose chain tries the Azure CLI,
+    the one Entra sign-in Schemaic has. Only where `AuthMode::offered` has the mode, though: Windows
+    sign-in on a non-Windows build, and every other Entra method (`…Password`, `…Interactive`,
+    `…Integrated`), keep the row on a password and carry `ImportNote::ExternalLogin` — *"Signs in a
+    way Schemaic can't: set a SQL login"* — since the row cannot sign in until one is set. `Sql
+    Password` is a SQL login spelled out and changes nothing. This is the ADO.NET/ODBC reader alone;
+    the JDBC one reads no sign-in keyword (`an_ado_net_connection_string_is_read_by_its_keywords`,
     `an_odbc_connection_string_is_read_when_its_driver_is_sql_server`,
     `an_ado_net_string_notes_what_it_cannot_carry_over`). **`redacted` knows the braces too**: a
     password's value opened with `{` — or with ADO.NET's `"` or `'` — runs to the first matching
@@ -6826,7 +6832,12 @@ existing prose was left alone.
     fail to compile over. `targets_same_server` is the "is this still the same server" test the schema
     tree's reload gates on (see `schema.rs`'s `SchemaState::begin_refresh`) — everything that
     decides which server the next query reaches and nothing else, so a rename or a colour can't
-    blank the tree and a repointed host can't leave another server's databases on it.
+    blank the tree and a repointed host can't leave another server's databases on it. **The sign-in
+    mode in force (`effective_auth`) is one of those things**, beside `user`: Windows or Entra signs
+    in as somebody the SQL login was not, who may see other databases, and an MCP subprocess or a
+    pinned Manual session left running as the old account would be the TLS lie below in another
+    shape (`a_new_sign_in_mode_is_a_different_login`). The connection form's Test result resets on
+    it for the same reason.
     **`invalidates_open_connections` is the wider question beside it, and it is wider by a socket
     that is not encrypted.** *Which server does the next query reach* is the tree's question; *is
     anything I have already opened still valid* is `save_conn`'s, and the two part company on the
@@ -6866,6 +6877,24 @@ existing prose was left alone.
     and honoured by `schema::first_bindable` (which is what makes a tab open where the form says it
     will) — and deliberately not the same thing as "no database at all", which `schemaic_db`'s
     `Scope::Server` spells separately.
+    **`AuthMode` is how a connection signs in**, and `Connection::auth` holds it:
+    `Password` — every engine's, and the default — `Windows` and `AzureCli`, the last two SQL
+    Server's. Neither of those reads the form's user or password (`uses_credentials`): Windows
+    presents the identity the app runs as, through SSPI, so there is nothing to store, and
+    `AzureCli` hands the server a Microsoft Entra token from the Azure CLI's own sign-in, fetched
+    when a connection needs one and never saved (`core/entra.rs`, `db/entra.rs`). `offered(db_type)`
+    is the one list, in picker order with the default first, and it is where the OS enters:
+    Windows sign-in is offered in a Windows build alone, a process anywhere else having no Windows
+    identity to present. **The mode a driver sees is `effective_auth`, asked through the engine as
+    `default_database` is** — the picker is editable in place, so a SQL Server connection switched
+    to MySQL keeps its mode with no control left that could unset it, and a `connections.json`
+    carried to a Linux machine holds a Windows mode that build cannot honour; both sign in with the
+    password (`a_mode_the_engine_does_not_offer_signs_in_with_the_password`). The field is
+    `#[serde(default)]` and deserializes through `AuthModeRaw`, the same `#[serde(other)]` shim as
+    the rest, degrading to `Password` — the password is what the file still holds, and the server
+    says so plainly if it is not enough (`an_absent_or_unknown_auth_mode_is_a_password`). A user and
+    password are kept under a mode that does not send them — the form's `to_connection` writes both
+    whatever the mode — so switching back to a password finds them where they were.
     **`Connection::trimmed` is the padding rule, and it is one answer because the form had made it
     seven times and omitted it five.** `to_connection` trimmed `port`, `file`, `database`, the SSH
     port and all three TLS paths and stored `host`, `user`, `ssh.host`, `ssh.user` and
@@ -8875,9 +8904,39 @@ existing prose was left alone.
     A client certificate and key are refused the same way: TDS signs no one in by one, so there is
     nowhere to send them, and a session that silently left them out is not the one asked for.
     So no certificate path ever reaches this argv, which is why `mssql_shell_config` has no
-    `wsl_tls_blocker` to ask. The password travels as `SQLCMDPASSWORD`, which both clients read,
+    `wsl_tls_blocker` to ask. **It signs in the way the connection does**, taking the caller's
+    `effective_auth`: `-U<user>` for a SQL login, `-E` — a trusted connection, the same flag in both
+    clients — for Windows sign-in with no user sent, and a refusal for Entra, since `sqlcmd` cannot
+    be handed the Azure CLI's token and falling back to a SQL login would be a different sign-in from
+    the one saved (`sqlcmd_signs_in_the_way_the_connection_does`). `mssql_shell_config` adds the one
+    refusal the argv cannot see: Windows sign-in through a WSL `sqlcmd`, a Linux process having no
+    Windows identity to present. The password travels as `SQLCMDPASSWORD`, which both clients read,
     never as `-P` — `sqlcmd_shell_puts_password_in_env_not_argv` in `app/main.rs`, which pins its
-    `WSLENV` forwarding as well.
+    `WSLENV` forwarding as well — and only for a mode that sends one (`uses_credentials`).
+  - `core/entra.rs` — **signing in to SQL Server with a Microsoft Entra token from the Azure CLI**:
+    the pure half of `AuthMode::AzureCli`, `db/entra.rs` being the half that runs it. The token is
+    the CLI's to mint and refresh — `az account get-access-token --resource
+    https://database.windows.net/` (`AZURE_SQL_RESOURCE`, the token's audience) answers with one for
+    whoever is signed in to it — and nothing here stores one. What lives here is what can be tested
+    without a CLI. `azure_cli_candidates` is where to look: every absolute `PATH` directory in order
+    (a relative entry skipped, for `agent_cli::which_on_path`'s trailing-`;` reason), then on Windows
+    the installer's own `%ProgramFiles%\Microsoft SDKs\Azure\CLI2\wbin\az.cmd`, which is what finds a
+    CLI installed after the app started and so missing from the `PATH` it inherited — seen on the
+    machine this was written on (`az_is_looked_for_on_path_then_where_the_installer_puts_it`).
+    **`azure_cli_token_argv` keeps `launch`'s first rule, and on Windows that takes a detour.** `az`
+    there is `az.cmd`, a batch file, and `CreateProcess` runs one through `cmd.exe`; the installer's
+    shim is two lines running the Python it ships, `"%~dp0\..\python.exe" -IBm azure.cli %*`, so this
+    runs that Python directly — found beside the shim (a virtualenv's `Scripts`) or one folder up (the
+    installer's `wbin`) — and a shim with no Python where one should be is **refused** rather than
+    handed to `cmd`, as `launch::direct_spawn_verdict` refuses one. Elsewhere `az` runs as found; it
+    is a script there too, the same named exception `xdg-open` is in `launch`, and every argument is
+    a constant (`the_token_request_runs_with_no_shell_in_between`). `parse_token` reads the CLI's JSON
+    — `accessToken`, and `expires_on` as an epoch number or, on some versions, a string — and refuses
+    anything else rather than guessing (`a_token_is_read_from_the_clis_answer`). **`AzureToken`'s
+    `Debug` is hand-written and redacts the token**, a bearer credential, for `Db`'s reason (*Connection
+    identity*, under the invariants); the same test asserts it never prints. `failure_text` turns the
+    CLI's stderr into a sentence a user can act on: a signed-out CLI says to run `az login`, anything
+    else keeps the CLI's own first line without its `ERROR:` prefix (`a_failure_says_what_to_do`).
   - `cli_install.rs` — **putting the `schemaic` command on `PATH`, and taking it off again**: the
     decision half of Settings → General → Command line → Install / Remove and of the Windows
     uninstall hook, with the registry write, the symlink and the broadcast left to
@@ -11266,6 +11325,49 @@ existing prose was left alone.
   own session (`session_id <> @@SPID`), as PostgreSQL's `pg_backend_pid()` and MySQL's
   `CONNECTION_ID()` do — without it every refresh listed the poll as a running session with a
   *Kill session* under it.
+  **It signs in three ways, and `auth_method` is the one place that decides which.** `Db` carries
+  an `auth`, set by `Db::connect` from `Connection::effective_auth`, by `Db::with_auth` — for the MCP
+  subprocess, and asked through the engine there too, so an endpoint cannot carry a mode its engine
+  does not offer — and read back by `Db::auth()`; `from_parts` is a password. `Password` is
+  `AuthMethod::sql_server`. `Windows` is `AuthMethod::Integrated`, SSPI through the OS, which is
+  tiberius's `winauth` feature — enabled for the Windows target alone in this crate's
+  `Cargo.toml`, since it is pure-Rust bindings there and the Unix counterpart would be GSSAPI over
+  `libkrb5`, a system dependency for every Linux build; elsewhere the arm is a refusal, never reached
+  because `AuthMode::offered` does not offer the mode. `AzureCli` is `AuthMethod::aad_token` over
+  `entra::sql_token()`, the login's FedAuth extension in stock tiberius — none of the vendored
+  patches is about it. That is why `config` is `async` now. **A refused Entra login forgets its
+  token** (Msg 18456 → `entra::forget`), so the next connection asks the CLI again rather than
+  handing over one the server will not take — the user signed in to the CLI as someone else since,
+  or was removed — until it expired.
+  **An Azure SQL host gets a minute to sign in, not fifteen seconds.** `is_azure_sql` tells one by
+  its name — `*.database.windows.net` and the two sovereign clouds' spellings, whatever the case or
+  a trailing dot, and not a host that merely contains the suffix (`an_azure_sql_host_is_told_by_its_name`)
+  — and `config` raises tiberius's handshake bound to `AZURE_HANDSHAKE` (60 s) for it. **A
+  serverless database that has paused holds the login at the gateway while it resumes**: measured
+  on a free-offer database in Sweden Central (auto-pause after an hour), the first login after an
+  idle spell outlasted fifteen seconds and failed with a bare handshake timeout, and a retry a
+  minute later went straight through. A timeout there is reported as `azure_timeout_text` — the
+  likely reason, and that this attempt has woken the database, so connect again shortly — rather
+  than as an I/O error that names neither. **A waking database has a second answer**, seen on the
+  same database minutes later: the gateway refuses at once with Msg 40613, *Database … is not
+  currently available*, rather than holding the login — so that code on an Azure host keeps the
+  server's words and gains the same sentence (`azure_unavailable_text`). The bound is on the whole
+  config, so the one routing redirect inherits it.
+  **`db/entra.rs` is the process half of the Entra sign-in**, the pure half and why it is shaped as
+  it is being `core/entra.rs`. **It caches the token in memory**, because every `Db` operation
+  opens its own connection (*One connection per operation*) and the CLI takes a second or two to
+  answer, so a token per connection would put that in front of every query. One cache for the
+  process — the token is the CLI's signed-in user's, for one resource, whichever connection asks —
+  handed out until `MARGIN_SECS` (five minutes) before its expiry, so a connection is never given
+  one that dies on the way, or for `UNDATED_SECS` (ten) when the CLI printed none
+  (`a_token_is_replaced_before_it_expires`). It is never written anywhere; the CLI keeps the
+  refresh. `fetch` finds `az` through `azure_cli_candidates`, spawns what `azure_cli_token_argv`
+  returns with stdin closed, bounded by `CLI_TIMEOUT` (60 s — a CLI's first run after an install
+  compiles its modules and can take tens of seconds), and on Windows with `CREATE_NO_WINDOW`, since
+  a GUI app's child otherwise gets a console window of its own, one flashing up per token. That
+  spawn is why this crate's `tokio` gained the `process` feature. The MCP subprocess is another
+  process and so has a cache of its own: it asks the CLI itself, and only the mode crosses in its
+  endpoint (under `ai.rs`).
   **Values arrive typed**, not as text — an `int` as an `i32`, a `decimal` as a scaled integer, a
   `datetime2` as a day count and ticks — so `cell_value` renders each to the text SQL Server's own
   tools print, and nothing in it is lossy: a `decimal` from its scaled integer, never through a
@@ -12158,12 +12260,31 @@ existing prose was left alone.
   catalog spans both versions, and each direction of its version line needs a server that can
   answer it; locally a `schemaic-mssql25` container on 1434 plays the same part. The whole leg is
   green on 2025 (17.0.5005.3, RTM-CU9). When enough of the suite answers, it joins the macro.
+  **The two sign-ins that are not a password have a leg each, and both are opt-in**, because no CI
+  runner has either endpoint and no container can be one. `mssql-windows` is
+  `a_windows_sign_in_is_this_processs_own_identity` (`cfg(windows)`), against
+  `SCHEMAIC_IT_MSSQL_WINDOWS_HOST`/`_PORT`, by default `127.0.0.1`/`1435` — a local SQL Server 2025
+  Developer instance moved off 1433, which WSL's container holds: `SUSER_SNAME()` is
+  `USERDOMAIN\USERNAME`, `sys.dm_exec_connections.auth_scheme` is `NTLM` or `KERBEROS`, and the same
+  connection in `Password` mode is refused with 18456, which is what makes the sign-in the mode's
+  doing. `mssql-azure` is `an_entra_sign_in_is_the_azure_clis_user`, against
+  `SCHEMAIC_IT_MSSQL_AZURE_HOST` — required, with no default, it being somebody's own server — and
+  `_DATABASE` (`schemaic_it`), under `VerifyFull` since Azure's certificates are public: the login is
+  an Entra UPN (it contains `@`), a second connection reads the same `ORIGINAL_LOGIN()` off the
+  cached token, and a SQL login is refused on the Entra-only server. The second connection's time is
+  printed rather than asserted — about 0.4 s where it was run, against the CLI's second or two. Both
+  were green locally when they landed.
   **`endpoint.rs` is where a leg comes from**, and it is the whole environment contract: three
   `SCHEMAIC_IT_<ENGINE>_HOST`/`_PORT`/`_USER`/`_PASSWORD` groups with localhost defaults (four with
   SQL Server's), plus `SCHEMAIC_IT_ENGINES` as the one way to run fewer than all of them. An *unreachable* endpoint is a
   hard failure rather than a skip — a tier that green-lights by not running is the failure mode
   this whole directory exists to avoid — so narrowing it costs a developer a deliberate sentence
-  (`SCHEMAIC_IT_ENGINES=mariadb,pg`), and CI refuses that variable outright.
+  (`SCHEMAIC_IT_ENGINES=mariadb,pg`), and CI refuses that variable outright. **The one exception to
+  "every leg runs" is `opt_in_leg_enabled`**, which answers yes only when `SCHEMAIC_IT_ENGINES`
+  names the leg — the two sign-in legs above, listed in `OUTSIDE_THE_SUITE` beside `mssql` so the
+  variable accepts their names. Left out, such a leg says so through `note_leg_skipped` like any
+  other. The cost is named rather than hidden: CI runs neither, so both sign-ins are covered only
+  where somebody runs them by hand.
   **The type matrix (`cases.rs`) is what the tier is for.** A value's journey from a column to a
   cell is decided by the driver, the wire protocol and this crate's decoding together, and `core`'s
   tests can only assert what `Value` does with text it is *given*. Each case is a column type, a
@@ -15530,6 +15651,20 @@ existing prose was left alone.
     behind the SSH key and all three certificate paths; folding them together also fixed the
     original, whose picker sat two Tab stops from the field it fills in while its own comment
     claimed otherwise.
+    **An *Authentication* picker appears only on an engine offering more than one mode** — SQL
+    Server's, through `AuthMode::offered` — between Database and the credentials, at tabindex 68 in
+    the gap the surrounding indices were spaced to leave. `DraftSignals::auth` is threaded through
+    create, load, reset and `to_connection` like the rest. The list is read once, untracked, because
+    `server_fields` is rebuilt when the engine changes. The credentials below are a `dyn_container`
+    keyed on the mode **in force**, not the stored one — a SQL Server connection switched to MySQL
+    keeps `AzureCli` in its draft and must still show a password — and each mode builds its own
+    child rather than hiding the fields, for the reason `conn_form`'s `engine_block` is built per
+    engine — a hidden field stays in the Tab ring, so Tab would land on a password nobody can see:
+    User and Password for a password, or a hint saying who the other two sign in as. Windows names the account from
+    `USERDOMAIN`/`USERNAME` (*"Signs in as the Windows account Schemaic runs as (DOMAIN\user). The
+    server must know that account as a Windows login."*), and Entra says *"Signs in as whoever is
+    signed in to the Azure CLI (run `az login` first). The token is fetched when a connection needs
+    one and never saved."*
   - `connection_import.rs` — the **Import Connections** modal, over `core::conn_import` and the
     app's `conn_sources`. Raised from the Manage Connections list ("Import from another client",
     below New connection and quieter than it: it is the first-run action, and the one nobody
@@ -21062,7 +21197,11 @@ existing prose was left alone.
   the plaintext DB password into the conversation, at every AI data level: Cursor's `Grep`, with
   the path sitting in `.cursor/mcp.json` inside the model's own working directory; Codex's read-only
   sandbox; Antigravity's `view_file`. The keyring is out of a file reader's reach, and since the
-  same blob rides Claude's config `env` map, that no longer holds the password either.
+  same blob rides Claude's config `env` map, that no longer holds the password either. **The
+  sign-in mode crosses as `"auth"`, and an Entra token does not cross at all**: `endpoint_from_value`
+  hands the mode to `Db::with_auth`, an absent one being a password as every blob written before
+  the field meant (`the_endpoint_handoff_carries_the_sign_in_mode`), and the subprocess asks the
+  Azure CLI for its own token through its own process's cache (`db/entra.rs`).
   `resolve_password` is pure with the lookup injected; `keyring_password(id)` is the real one —
   `conn::secrets::load_connections_readonly`, **never** the app's self-healing load, which may
   rewrite `connections.json` under the running app; the connection found by id; `hydrate_for_cli`,
@@ -24409,8 +24548,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   `schemaic.log` in cleartext, in the folder Settings offers an **Open folder** button for. A
   dependency that logs a secret gets a line in `CREDENTIAL_TARGETS`, appended last so the floor
   outranks an equal key; never a `debug!` we hope nobody enables.
-  **And it includes a `Debug` nobody has written a call site for yet.** All three types that carry a
-  credential have a hand-written one now. `Db` prints `pass: "<redacted>"` and everything else,
+  **And it includes a `Debug` nobody has written a call site for yet.** All four types that carry a
+  credential have a hand-written one now — the fourth, `core::entra::AzureToken`, below. `Db` prints `pass: "<redacted>"` and everything else,
   because the derived one printed the password: no site formats a `Db` today — the whole workspace
   was checked, which is what made the derive latent rather than live — but the type is threaded
   through nearly everything (`McpEndpoint`, `StartAiParams`, the dump and script runners), and the
@@ -24432,6 +24571,12 @@ Re-introducing the anti-patterns these guard against is a regression:
   secret out, and the host, user and key *path* still in, because a log line that cannot say which
   server it is about is worth nothing. Each struct's own doc already claimed the property; a derived
   `Debug` was an unguarded second spelling of the same leak.
+  **An Entra token is a credential too, and it is held to the same rule.** `AzureToken` — a bearer
+  token, as good as a password until it expires — was written with its redacting `Debug` from the
+  start (`a_token_is_read_from_the_clis_answer` asserts it never prints). It is never on an argv:
+  the request is `core::entra`'s constant arguments and the token comes back on the CLI's piped
+  stdout. It is never on disk: `db/entra.rs` holds it in process memory, the MCP endpoint carries
+  the mode and not the token, and `sqlcmd` is refused an Entra connection rather than handed one.
   **And it includes a script the user asked for a copy of.** The DDL preview's *Copy* and *Open in
   editor* both put their text somewhere durable — the OS clipboard, which on Windows persists in
   Clipboard History and cloud-syncs, and a query tab whose text the next session save writes into

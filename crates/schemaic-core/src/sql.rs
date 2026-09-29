@@ -4560,6 +4560,7 @@ mod tests {
                 environment: crate::connection::Environment::None,
                 ai_data: None,
                 folder: String::new(),
+                auth: crate::connection::AuthMode::Password,
             };
             let p = GuardPolicy::of(Some(&c), true, false);
             assert!(p.no_database, "{db_type}");
@@ -4707,6 +4708,7 @@ mod tests {
             environment: crate::connection::Environment::None,
             ai_data: None,
             folder: String::new(),
+            auth: crate::connection::AuthMode::Password,
         };
         assert!(GuardPolicy::of(Some(&c), false, false).read_only);
         assert!(matches!(
