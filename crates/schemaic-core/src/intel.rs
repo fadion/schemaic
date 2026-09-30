@@ -4984,10 +4984,11 @@ pub fn diagnostics(sql: &str, catalog: &Catalog, dialect: SqlDialect) -> Vec<Dia
             }
             Err(e) => {
                 // Don't nag about the fragment the user is still typing, nor
-                // about a statement the parser has no grammar for — see
-                // `parser_lacks_statement`.
-                if !is_typing_tail
-                    && !parser_lacks_statement(&tokenize_range(sql, lo, hi, dialect), dialect)
+                // about a statement or clause the parser has no grammar for —
+                // see `parser_lacks_statement` and `parser_lacks_clause_at`.
+                let toks = (!is_typing_tail).then(|| tokenize_range(sql, lo, hi, dialect));
+                if let Some(toks) = toks
+                    && !parser_lacks_statement(&toks, dialect)
                 {
                     let (loc, msg) = split_error_location(&e.to_string());
                     let range = match loc {
@@ -4997,11 +4998,13 @@ pub fn diagnostics(sql: &str, catalog: &Catalog, dialect: SqlDialect) -> Vec<Dia
                         }
                         None => (lo, hi),
                     };
-                    out.push(Diagnostic {
-                        range,
-                        severity: Severity::Error,
-                        message: friendly_syntax_message(&msg),
-                    });
+                    if !(loc.is_some() && parser_lacks_clause_at(&toks, range.0, dialect)) {
+                        out.push(Diagnostic {
+                            range,
+                            severity: Severity::Error,
+                            message: friendly_syntax_message(&msg),
+                        });
+                    }
                 }
             }
         }
@@ -6040,6 +6043,41 @@ fn parser_lacks_statement(toks: &[Token], dialect: SqlDialect) -> bool {
                 | ["CREATE", "CLUSTERED" | "NONCLUSTERED", ..]
                 | ["CREATE", "UNIQUE", "CLUSTERED" | "NONCLUSTERED", ..] => true,
                 _ => is_routine_statement(toks),
+            }
+        }
+    }
+}
+
+/// Does sqlparser's grammar for `dialect` lack the **clause** its parse error
+/// stopped on, at byte `at` — so that the error says nothing about the SQL?
+///
+/// [`parser_lacks_statement`]'s question asked of a position rather than a
+/// head, for T-SQL's grouping extensions inside an ordinary `SELECT`:
+/// `MsSqlDialect` leaves `supports_group_by_expr` off, so `GROUPING SETS (…)`
+/// reads `GROUPING` as a column and stops at `SETS`, and the older
+/// `GROUP BY a WITH ROLLUP` / `WITH CUBE` stop at `WITH`. All run on SQL
+/// Server 2022. Keyed on the token the error names, so an error anywhere else
+/// in the statement still reports. What the withheld error costs is the
+/// statement's AST checks — unknown tables and columns — which need a parse.
+fn parser_lacks_clause_at(toks: &[Token], at: usize, dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+        SqlDialect::MsSql => {
+            let Some(i) = toks.iter().position(|t| t.at == at) else {
+                return false;
+            };
+            let word = |j: usize| match toks.get(j) {
+                Some(Token {
+                    kind: TkKind::Word(w),
+                    quoted: false,
+                    ..
+                }) => Some(w.to_ascii_uppercase()),
+                _ => None,
+            };
+            match word(i).as_deref() {
+                Some("SETS") => i > 0 && word(i - 1).as_deref() == Some("GROUPING"),
+                Some("WITH") => matches!(word(i + 1).as_deref(), Some("ROLLUP" | "CUBE")),
+                _ => false,
             }
         }
     }
@@ -12644,6 +12682,43 @@ mod tests {
             diag_d("SELECT * FROM employees WHERE;", SqlDialect::MsSql)
                 .iter()
                 .any(|x| x.message.starts_with("Syntax error"))
+        );
+    }
+
+    /// **T-SQL's grouping extensions draw no syntax error.** sqlparser's
+    /// T-SQL grammar reads `GROUPING` as a column and stops at `SETS`, and has
+    /// no `WITH ROLLUP` / `WITH CUBE`; all four run on SQL Server 2022.
+    #[test]
+    fn t_sql_grouping_extensions_draw_no_syntax_error() {
+        let squiggled = [
+            "SELECT id FROM employees GROUP BY GROUPING SETS ((id), ());",
+            "SELECT id FROM employees GROUP BY id, GROUPING SETS ((id));",
+            "SELECT id FROM employees GROUP BY id WITH ROLLUP;",
+            "SELECT id FROM employees GROUP BY id WITH CUBE;",
+        ]
+        .into_iter()
+        .map(|sql| (sql, diag_d(sql, SqlDialect::MsSql)))
+        .filter(|(_, d)| !d.is_empty())
+        .collect::<Vec<_>>();
+        assert!(squiggled.is_empty(), "{squiggled:#?}");
+        // Only an error *on* the construct is withheld: one elsewhere in the
+        // same statement still reports.
+        assert!(
+            diag_d(
+                "SELECT id FROM employees WHERE GROUP BY id WITH ROLLUP;",
+                SqlDialect::MsSql
+            )
+            .iter()
+            .any(|x| x.message.starts_with("Syntax error"))
+        );
+        // A `WITH` the construct does not follow is still an error.
+        assert!(
+            diag_d(
+                "SELECT id FROM employees GROUP BY id WITH;",
+                SqlDialect::MsSql
+            )
+            .iter()
+            .any(|x| x.message.starts_with("Syntax error"))
         );
     }
 

@@ -742,7 +742,8 @@ existing prose was left alone.
     completion), and `diagnostics` → `Vec<Diagnostic>` (catalog-aware unknown-table, unknown-column via
     the per-scope resolver `colres` — qualified *and* unqualified, across subqueries/derived-tables/CTEs
     with correlation — reserved-keyword-alias errors, syntax errors on completed statements save
-    those sqlparser has no grammar for (`parser_lacks_statement`, below), and keyword-typo
+    those sqlparser has no grammar for (`parser_lacks_statement` and `parser_lacks_clause_at`,
+    below), and keyword-typo
     warnings). **AST for classification, `skip_noncode` for byte positions by default** —
     except `colres`, which uses sqlparser 0.62's now-accurate per-identifier *spans* (verified) so the
     same column name in an inner vs outer scope is placed independently. **A base table exposes more than
@@ -851,9 +852,16 @@ existing prose was left alone.
     `BEGIN … RETURN … END`, a procedure's bare `@x int` parameters, `WITH SCHEMABINDING` /
     `CALLED ON NULL INPUT` and a trigger's `WITH EXECUTE AS` (each ran clean on SQL Server 2022,
     per the function's doc). The server stays the authority for those, as for everything else;
-    the other three engines answer `false`. The same statements broke the alias check a second
-    way: a T-SQL header *ends* in a mandatory `AS` whose next word is the body's first statement,
-    so `AS SET`, `AS BEGIN` and `AS RETURN` were reserved-alias errors. `routine_body_as` finds
+    the other three engines answer `false`. `parser_lacks_clause_at` asks the same of the error's
+    *position* rather than the head, for T-SQL grouping inside an ordinary `SELECT`: `MsSqlDialect`
+    leaves `supports_group_by_expr` off, so `GROUPING SETS (…)` stops at `SETS` and `GROUP BY a
+    WITH ROLLUP`/`WITH CUBE` at `WITH` (all ran on SQL Server 2022; `ROLLUP(…)`/`CUBE(…)` already
+    parse as calls). It withholds the error only when the token named is `SETS` after `GROUPING`
+    or `WITH` before `ROLLUP`/`CUBE`, so an error elsewhere still reports — and such a statement
+    loses its unknown-table and -column checks, which need a parse
+    (`t_sql_grouping_extensions_draw_no_syntax_error`). The routine statements broke the alias
+    check a second way: a T-SQL header *ends* in a mandatory `AS` whose next word is the body's
+    first statement, so `AS SET`, `AS BEGIN` and `AS RETURN` were reserved-alias errors. `routine_body_as` finds
     that `AS` — the first outside parentheses not preceded by `EXECUTE`/`EXEC` — and the check
     skips it alone, so an alias inside the body is still checked
     (`t_sql_routine_exemptions_leave_the_body_checked`, `ordinary_t_sql_draws_no_squiggle`). It is
