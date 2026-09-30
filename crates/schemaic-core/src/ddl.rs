@@ -11638,8 +11638,9 @@ fn tsql_server_filled(c: &ColumnInfo) -> bool {
 ///    A column that is new takes its default's expression in the `SELECT`,
 ///    which is what a new column's default does to the rows already there.
 /// 6. The table dropped, the shadow renamed to the draft's name, and an
-///    identity kept reseeded to where the old table's stood, so values freed
-///    by deleted rows are not handed out again.
+///    identity kept reseeded past the last value the old table issued, so
+///    values freed by deleted rows are not handed out again — all of them
+///    deleted, or counting down, included.
 /// 7. The key, checks, indexes and unique constraints over the new table, its
 ///    own foreign keys, the defaults under their names, the comments, the
 ///    triggers (disabled and ranked as they were), and last the other tables'
@@ -11885,16 +11886,35 @@ pub fn tsql_rebuild_sql(current: &TableInfo, draft: &TableDraft) -> Vec<String> 
     let rename = rename.trim_end_matches(';');
     if keeps_identity {
         let t = tsql_n(&target);
+        let last = |of: &str| {
+            format!(
+                "(SELECT CAST(last_value AS numeric(38, 0)) FROM sys.identity_columns \
+                 WHERE object_id = OBJECT_ID({of}))"
+            )
+        };
         out.push(format!(
-            // `EXEC (…)` takes literals and variables only, so the reseed is
-            // spelled into one first.
-            "DECLARE @seed numeric(38, 0) = IDENT_CURRENT({}) DROP TABLE {original} {rename} \
+            // The old table's last value issued — `NULL` for one never
+            // inserted into, which `IDENT_CURRENT` answers with its seed — and
+            // the next value the new table would give from its own: its seed
+            // where it has had no insert (a copy of an emptied table), past
+            // its last value otherwise. It is reseeded only where that next
+            // value is not past the old table's last, in the increment's
+            // direction; and to the value wanted *itself* where it has had no
+            // insert, since `DBCC CHECKIDENT` then hands out the reseed value
+            // rather than the one after it. `EXEC (…)` takes literals and
+            // variables only, so the reseed is spelled into one first.
+            "DECLARE @last numeric(38, 0) = {} DROP TABLE {original} {rename} \
+             DECLARE @inc numeric(38, 0) = IDENT_INCR({t}) \
+             DECLARE @now numeric(38, 0) = {} \
+             DECLARE @next numeric(38, 0) = CASE WHEN @now IS NULL \
+             THEN CAST(IDENT_SEED({t}) AS numeric(38, 0)) ELSE @now + @inc END \
+             IF @last IS NOT NULL AND SIGN(@inc) * (@last + @inc - @next) > 0 BEGIN \
              DECLARE @reseed nvarchar(max) = N'DBCC CHECKIDENT (' + {} + N', RESEED, ' \
-             + CAST(@seed AS nvarchar(40)) + N') WITH NO_INFOMSGS' \
-             IF @seed IS NOT NULL AND IDENT_INCR({t}) > 0 AND @seed > IDENT_CURRENT({t}) \
-             EXEC (@reseed);",
-            tsql_n(&original),
-            tsql_n(&tsql_n(&target)),
+             + CAST(CASE WHEN @now IS NULL THEN @last + @inc ELSE @last END AS nvarchar(40)) \
+             + N') WITH NO_INFOMSGS' EXEC (@reseed) END;",
+            last(&tsql_n(&original)),
+            last(&t),
+            tsql_n(&t),
         ));
     } else {
         out.push(format!("DROP TABLE {original} {rename};"));
@@ -15928,8 +15948,43 @@ mod tests {
             .iter()
             .find(|s| s.contains("DROP TABLE [dbo].[p]"))
             .unwrap();
-        assert!(swap.starts_with("DECLARE @seed numeric(38, 0) = IDENT_CURRENT(N'[dbo].[p]')"));
-        assert!(swap.ends_with("EXEC (@reseed);"), "{swap}");
+        assert!(
+            swap.starts_with("DECLARE @last numeric(38, 0) = (SELECT CAST(last_value"),
+            "{swap}"
+        );
+        assert!(swap.ends_with("EXEC (@reseed) END;"), "{swap}");
+    }
+
+    /// **The reseed carries on from the last value the old table issued**
+    /// (S3.2-L1-01). `IDENT_CURRENT` could not tell a table emptied by
+    /// `DELETE` from one never inserted into, and `DBCC CHECKIDENT` makes the
+    /// reseed value itself the next one on a table that has had no insert —
+    /// which a shadow copied from an emptied table is — so the id issued last
+    /// came round again. So the old table's `last_value` is read (`NULL` for
+    /// one never inserted into), the next value the new table would give is
+    /// worked out from its own, and it is reseeded only where that is not past
+    /// the old one — in the increment's direction, so a descending identity
+    /// is carried on too rather than skipped.
+    #[test]
+    fn a_rebuild_reseeds_past_the_last_identity_value_issued() {
+        let t = ms_rebuild_table();
+        let mut d = TableDraft::from_table(&t);
+        d.columns.swap(1, 2);
+        let stmts = diff(&t, &d, MsSql).emit();
+        let swap = stmts
+            .iter()
+            .find(|s| s.contains("DROP TABLE [dbo].[p]"))
+            .unwrap();
+        for needle in [
+            "FROM sys.identity_columns WHERE object_id = OBJECT_ID(N'[dbo].[p]')",
+            "IDENT_SEED(N'[dbo].[p]')",
+            "SIGN(@inc)",
+            "WHEN @now IS NULL THEN @last + @inc ELSE @last END",
+        ] {
+            assert!(swap.contains(needle), "{needle} not in {swap}");
+        }
+        assert!(!swap.contains("> 0 AND @seed"), "{swap}");
+        assert_eq!(swap.matches(';').count(), 1, "one batch: {swap}");
     }
 
     /// **What the rebuild cannot put back is said before anything runs**: an

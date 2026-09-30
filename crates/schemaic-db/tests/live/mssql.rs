@@ -4955,6 +4955,69 @@ async fn an_identity_switched_on_keeps_the_rows_values() {
     assert!(t2.columns[0].auto_increment);
 }
 
+/// **A rebuild hands out no identity value the old table already issued** —
+/// not when every row was deleted, where the shadow has had no insert and
+/// `DBCC CHECKIDENT` makes the reseed value itself the next one, so the id
+/// last issued came round again (S3.2-L1-01); and not for a descending
+/// identity, which the reseed used to skip. Nor for a table never inserted
+/// into, which starts at its seed as before.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rebuild_reissues_no_identity_value() {
+    use schemaic_core::ddl::TableDraft;
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("rebuild_reseed").await;
+    // (table, identity, rows inserted, rows left, the next id wanted)
+    let cases = [
+        (
+            "emptied",
+            "IDENTITY(1,1)",
+            "(1, 1), (2, 2), (3, 3)",
+            "DELETE dbo.emptied",
+            "4",
+        ),
+        (
+            "kept",
+            "IDENTITY(1,1)",
+            "(1, 1), (2, 2), (3, 3)",
+            "DELETE dbo.kept WHERE a = 3",
+            "4",
+        ),
+        (
+            "down",
+            "IDENTITY(-1,-1)",
+            "(1, 1), (2, 2), (3, 3)",
+            "DELETE dbo.down WHERE a > 1",
+            "-4",
+        ),
+        ("fresh", "IDENTITY(1,1)", "", "", "1"),
+    ];
+    for (table, identity, rows, delete, next) in cases {
+        s.exec(&format!(
+            "CREATE TABLE dbo.{table} (id int {identity} PRIMARY KEY, a int NULL, b int NULL)"
+        ))
+        .await;
+        if !rows.is_empty() {
+            s.exec(&format!("INSERT dbo.{table} (a, b) VALUES {rows}"))
+                .await;
+            s.exec(delete).await;
+        }
+        let t = read_table(&s, table).await;
+        let mut d = TableDraft::from_table(&t);
+        d.columns.swap(1, 2);
+        apply_draft(&s, &t, &d).await;
+        s.exec(&format!("INSERT dbo.{table} (a, b) VALUES (9, 9)"))
+            .await;
+        assert_eq!(
+            s.scalar(&format!("SELECT id FROM dbo.{table} WHERE a = 9"))
+                .await,
+            next,
+            "{table}"
+        );
+    }
+}
+
 /// **The guard stops a rebuild before anything runs** where the table holds
 /// what the model does not — here a permission granted on it, which
 /// `DROP TABLE` would take — and the table is left as it was.

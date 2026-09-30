@@ -3954,8 +3954,17 @@ existing prose was left alone.
     which is what a new column's default does to the rows already there, and a new identity numbers
     them itself. (6) `DROP TABLE` and an `sp_rename` of the shadow to the **draft's** name, so a
     table rename is inside the rebuild rather than after it as on SQLite; where an identity is
-    kept, a `DBCC CHECKIDENT` reseed to the old table's `IDENT_CURRENT`, so values freed by
-    deleted rows are not handed out again — only forwards and only for a positive increment, and
+    kept, a `DBCC CHECKIDENT` reseed past the last value the old table issued, so values freed by
+    deleted rows are not handed out again. It reads `sys.identity_columns.last_value` rather than
+    `IDENT_CURRENT`, which answers a table never inserted into with its seed; it works out the next
+    value the new table would give — its seed where it has had no insert, past its own last value
+    otherwise — and reseeds only where that is not past the old table's last, in the increment's
+    direction (`SIGN(@inc)`), so a descending identity is carried on too. **Where the new table has
+    had no insert — a copy of a table whose rows were all deleted — it reseeds to the value wanted
+    itself**, because `DBCC CHECKIDENT` then hands out the reseed value rather than the one after
+    it: reseeding to the old last value reissued it (S3.2-L1-01, measured on 2022 and 2025;
+    `a_rebuild_reissues_no_identity_value` runs an emptied, a partly deleted, a descending and a
+    never-used identity). The statement is
     built into a variable first because `EXEC (…)` takes only literals and variables (Msg 102,
     measured). (7) What stood on it: the key under its old constraint name, the checks, the indexes
     and unique constraints — through a synthetic `ChangeSet` that `emit_mssql` writes, so none of
