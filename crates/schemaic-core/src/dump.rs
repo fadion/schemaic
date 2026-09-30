@@ -478,9 +478,25 @@ pub fn needs_fk_section(t: &TableInfo) -> bool {
 pub fn drop_cascade(dialect: SqlDialect) -> &'static str {
     match dialect {
         SqlDialect::Postgres => " CASCADE",
-        // T-SQL's `DROP TABLE` has no `CASCADE`.
+        // T-SQL's `DROP TABLE` has no `CASCADE`; `drops_up_front` is its
+        // answer.
         SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => "",
     }
+}
+
+/// Does the file drop everything it recreates **up front**, in a section of
+/// its own before any `CREATE`, rather than each object beside its `CREATE`?
+///
+/// **Where the engine has neither of the two answers above** — no session
+/// switch for foreign keys ([`fk_guard_sql`]) and no `DROP … CASCADE`
+/// ([`drop_cascade`]) — which is SQL Server. Tables are created parents
+/// first, so a `DROP TABLE` beside its `CREATE` found the child's key still
+/// standing, and replaying a default dump onto its source stopped at the
+/// first referenced table (Msg 3726); a schema-bound view blocks its table's
+/// drop the same way (Msg 3729). Computed from the two answers rather than
+/// matched on the engine, so an engine that gains either stops needing it.
+pub fn drops_up_front(dialect: SqlDialect) -> bool {
+    fk_guard_sql(dialect).is_none() && drop_cascade(dialect).is_empty()
 }
 
 /// The statements that make the file's own container before it is used —
@@ -1063,6 +1079,9 @@ struct Emitted {
     /// where a domain names the type it is built on.
     body: String,
     sql: String,
+    /// The statement that removes it first, where the file drops what it
+    /// recreates up front ([`drops_up_front`]) and the object is one it drops.
+    drop: Option<String>,
 }
 
 /// The whole file, as steps.
@@ -1420,6 +1439,11 @@ pub fn plan(
     // Carried with their names so the dependency walk below can edge one to
     // another; the strings alone said nothing about what they call.
     let mut routines: Vec<Emitted> = Vec::new();
+    let mut objects: Vec<Emitted> = Vec::new();
+    // The file drops what it recreates in one section before any `CREATE` —
+    // see `drops_up_front`. Asked once; the table loop and the routines both
+    // answer to it.
+    let up_front = opts.structure && opts.drop_if_exists && drops_up_front(dialect);
     // **`other_objects` alone, not `structure && other_objects`.** The modal
     // draws it as a peer of Structure and Data, so ticking it by itself asks for
     // a file of the database's types, sequences and routines — a coherent thing
@@ -1455,7 +1479,6 @@ pub fn plan(
                 )
             })
             .collect();
-        let mut objects: Vec<Emitted> = Vec::new();
         for kind in kinds {
             for o in schema.objects_all(kind) {
                 // `is_internal` is what keeps a `serial`'s own sequence out.
@@ -1475,6 +1498,16 @@ pub fn plan(
                         ObjectKind::Function | ObjectKind::Procedure | ObjectKind::Event
                     );
                     let sql = o.create_sql(dialect);
+                    // A routine the file recreates is dropped with the tables:
+                    // replayed onto its source, its `CREATE` otherwise stops
+                    // at a name that is already there.
+                    let drop = (up_front && o.routine().is_some()).then(|| {
+                        format!(
+                            "DROP {} IF EXISTS {};",
+                            kind.sql_keyword(),
+                            crate::schema::qualified_ident(o.name(), o.schema(), dialect)
+                        )
+                    });
                     let item = Emitted {
                         name: o.name().to_string(),
                         body: match (o.routine(), o.event()) {
@@ -1483,6 +1516,7 @@ pub fn plan(
                             _ => sql.clone(),
                         },
                         sql,
+                        drop,
                     };
                     if after_tables {
                         routines.push(item);
@@ -1492,14 +1526,76 @@ pub fn plan(
                 }
             }
         }
-        if !objects.is_empty() {
-            text!("-- Types and sequences".to_string());
-            // A domain over a domain is the same edge as a routine over a
-            // routine — `kinds` above orders Enum before Domain, and nothing
-            // ordered two Domains against each other.
-            for o in order_by_mention(objects, dialect) {
-                text!(o.sql);
+    }
+
+    // **Ordered against each other, not just against the tables.** The
+    // table→routine edge was the split above; the routine→routine edge had
+    // nothing at all, so two `LANGUAGE sql` functions came out in catalogue
+    // order and `CREATE FUNCTION a_total() … SELECT b_base()` ahead of
+    // `b_base` fails at `CREATE` under `check_function_bodies` — the very
+    // fact the split rests on — after the file's `DROP TABLE`s have run.
+    // Ordered here, before the drops, so those can run in the reverse.
+    let routines = order_by_mention(routines, dialect);
+
+    // ── What the file recreates, dropped before any of it is created ─────────
+    //
+    // Only where `drops_up_front` says so. The keys between the dumped tables
+    // go first, each only if it is there (a fresh database has none), then the
+    // views and tables in reverse creation order — views before the tables
+    // they read, a referencing table before the one it references — then the
+    // routines, which a computed column, a check or a schema-bound view may
+    // have been holding. A key from a table outside the export still blocks
+    // its target's drop, loudly: the file does not drop what it cannot put
+    // back.
+    if up_front {
+        let mut drops: Vec<String> = Vec::new();
+        for &i in &order {
+            let t = &schema.tables[i];
+            if t.is_view {
+                continue;
             }
+            for fk in &t.foreign_keys {
+                if fk.name.is_empty()
+                    || !order
+                        .iter()
+                        .any(|&j| fk_targets(fk, t, &schema.tables[j], home))
+                {
+                    continue;
+                }
+                let fk_name = match crate::schema::sql_qualifier(t.schema.as_deref()) {
+                    Some(s) => format!("{}.{}", q(s), q(&fk.name)),
+                    None => q(&fk.name),
+                };
+                drops.push(format!(
+                    "IF OBJECT_ID({}, N'F') IS NOT NULL ALTER TABLE {} DROP CONSTRAINT {};",
+                    crate::schema::ddl_string(&fk_name, dialect),
+                    qname(t),
+                    q(&fk.name)
+                ));
+            }
+        }
+        for &i in order.iter().rev() {
+            let t = &schema.tables[i];
+            if t.shape() == TableShape::Sequence {
+                continue;
+            }
+            let kw = if t.is_view { "VIEW" } else { "TABLE" };
+            drops.push(format!("DROP {kw} IF EXISTS {};", qname(t)));
+        }
+        drops.extend(routines.iter().rev().filter_map(|r| r.drop.clone()));
+        text!("-- Dropped first, to be recreated below".to_string());
+        for d in drops {
+            text!(d);
+        }
+    }
+
+    if !objects.is_empty() {
+        text!("-- Types and sequences".to_string());
+        // A domain over a domain is the same edge as a routine over a
+        // routine — `kinds` above orders Enum before Domain, and nothing
+        // ordered two Domains against each other.
+        for o in order_by_mention(objects, dialect) {
+            text!(o.sql);
         }
     }
 
@@ -1533,7 +1629,7 @@ pub fn plan(
             // dropping what the file cannot put back is destruction, not a dump,
             // which is the same reason `data_only_plans_no_create_and_no_drop`
             // gives one file down.
-            if opts.drop_if_exists && t.shape() != TableShape::Sequence {
+            if opts.drop_if_exists && !up_front && t.shape() != TableShape::Sequence {
                 let kw = if t.is_view { "VIEW" } else { "TABLE" };
                 text!(format!(
                     "DROP {kw} IF EXISTS {}{};",
@@ -1625,16 +1721,8 @@ pub fn plan(
     // ── Routines and events, once the tables they read exist ─────────────────
     if !routines.is_empty() {
         steps.push(DumpStep::Text("-- Routines and events".to_string()));
-        // **Ordered against each other, not just against the tables.** The
-        // table→routine edge was the split above; the routine→routine edge had
-        // nothing at all, so two `LANGUAGE sql` functions came out in catalogue
-        // order and `CREATE FUNCTION a_total() … SELECT b_base()` ahead of
-        // `b_base` fails at `CREATE` under `check_function_bodies` — the very
-        // fact the split rests on — after the file's `DROP TABLE`s have run.
-        let ordered: Vec<String> = order_by_mention(routines, dialect)
-            .into_iter()
-            .map(|r| r.sql)
-            .collect();
+        // Already ordered against each other, above the drops.
+        let ordered: Vec<String> = routines.into_iter().map(|r| r.sql).collect();
         // Through the client wrapper, so a MySQL compound body gets its
         // `DELIMITER` — the same rule the triggers above follow.
         steps.push(DumpStep::Text(crate::ddl::client_script(&ordered, dialect)));
@@ -3472,9 +3560,15 @@ mod tests {
                 ),
             }
         }
-        // The view opens its own batch.
+        // The view opens its own batch: the last line before it that is not a
+        // comment is a `GO`.
         let before_view = &file[..pos(&file, "CREATE VIEW")];
-        assert!(before_view.trim_end().ends_with("GO"), "{file}");
+        let last_code = before_view
+            .lines()
+            .rev()
+            .map(str::trim)
+            .find(|l| !l.is_empty() && !l.starts_with("--"));
+        assert_eq!(last_code, Some("GO"), "{file}");
         // Each routine closes its batch once, with a bare `GO`.
         pos(&file, "CREATE FUNCTION [dbo].[f_double]");
         pos(&file, "CREATE PROCEDURE [dbo].[p_touch]");
@@ -4261,6 +4355,64 @@ mod tests {
             text.contains(r#"DROP TABLE IF EXISTS "orders" CASCADE;"#),
             "{text}"
         );
+    }
+
+    /// **SQL Server has neither a session FK switch nor `DROP … CASCADE`**, so
+    /// a default dump replayed onto its source stopped at the first `DROP
+    /// TABLE` of a referenced table (Msg 3726) — the tables are created
+    /// parents first, so the child's key still stood. There the destructive
+    /// half is a section of its own, before any `CREATE`: the keys between the
+    /// dumped tables first (each only if it is there), then every view and
+    /// table children-first, then the routines the file recreates.
+    #[test]
+    fn a_sql_server_dump_drops_everything_it_recreates_before_creating_any_of_it() {
+        let mut parent = table("parent");
+        parent.schema = Some("dbo".to_string());
+        let mut child = refs(table("child"), "parent");
+        child.schema = Some("dbo".to_string());
+        let mut v = view("v");
+        v.schema = Some("dbo".to_string());
+        v.create_sql = Some("CREATE VIEW dbo.v AS SELECT 1 AS id".to_string());
+        let mut s = schema_of(vec![child, parent, v]);
+        s.routines
+            .push(std::sync::Arc::new(crate::schema::RoutineInfo {
+                name: "f".to_string(),
+                schema: Some("dbo".to_string()),
+                kind: crate::schema::RoutineKind::Function,
+                arguments: "@x int".to_string(),
+                returns: "int".to_string(),
+                body: "BEGIN RETURN @x; END".to_string(),
+                ..Default::default()
+            }));
+        let file = file_of(&plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::MsSql,
+        ));
+        let drop_fk = pos(
+            &file,
+            "IF OBJECT_ID(N'[dbo].[fk_child_parent]', N'F') IS NOT NULL \
+             ALTER TABLE [dbo].[child] DROP CONSTRAINT [fk_child_parent];",
+        );
+        let drop_view = pos(&file, "DROP VIEW IF EXISTS [dbo].[v];");
+        let drop_child = pos(&file, "DROP TABLE IF EXISTS [dbo].[child];");
+        let drop_parent = pos(&file, "DROP TABLE IF EXISTS [dbo].[parent];");
+        let drop_fn = pos(&file, "DROP FUNCTION IF EXISTS [dbo].[f];");
+        assert!(drop_fk < drop_view && drop_view < drop_child, "{file}");
+        assert!(drop_child < drop_parent && drop_parent < drop_fn, "{file}");
+        let first_create = pos(&file, "CREATE ");
+        assert!(drop_fn < first_create, "{file}");
+        assert_eq!(file.matches("DROP TABLE IF EXISTS").count(), 2, "{file}");
+        // The engines with a switch or a CASCADE keep the drop beside its
+        // `CREATE`.
+        for d in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite] {
+            let s = schema_of(vec![refs(table("child"), "parent"), table("parent")]);
+            let file = file_of(&plan(&s, "shop", &all(&s), DumpOptions::default(), d));
+            assert!(!file.contains("DROP CONSTRAINT"), "{d:?}: {file}");
+            assert!(!file.contains("DROP FUNCTION"), "{d:?}: {file}");
+        }
     }
 
     /// `USE shop` on a server with no `shop` is ERROR 1049 on line 1, and

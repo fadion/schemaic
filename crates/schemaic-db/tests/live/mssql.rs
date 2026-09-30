@@ -802,6 +802,15 @@ async fn a_dump_restores_into_an_empty_database() {
     ] {
         assert!(want.contains(fact), "{fact} in {want}");
     }
+    // Replayed onto a database that already holds all of it — the way a dump
+    // is most often tested. It stopped at the first referenced table's `DROP`
+    // (Msg 3726), the child's key still standing.
+    let again = Box::pin(restore_file(&dst, &file)).await;
+    assert!(
+        matches!(again, schemaic_core::script::ExecEnd::Done),
+        "{again:?}\n{file}"
+    );
+    assert_eq!(dst.scalar(facts).await, want);
     // The identity counts on past the highest key the file carried.
     dst.exec("INSERT dbo.customers (name) VALUES (N'next')")
         .await;
