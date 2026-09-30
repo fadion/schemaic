@@ -1695,6 +1695,12 @@ existing prose was left alone.
     `a_real_key_still_wins_over_a_projected_implicit_one` and
     `refetch_template_keys_on_the_implicit_key` — the last because a read-only key column is still
     part of the row the splice re-reads.
+    **A generated column is left out of `col_table` the same way**, read off the loaded
+    `TableInfo`'s `ColumnInfo::generated`: every engine refuses a value for one (SQL Server's
+    Msg 271 on a computed column), so its cell took an edit only the commit refused, and *Duplicate
+    row* — `cloned_row` copies every `text_editable` column — failed on every table that had one,
+    AdventureWorks' `Sales.SalesOrderHeader` among them. It stays a key or confirming column if it
+    is one; only writing to it is off (`a_generated_column_is_read_only_and_left_out_of_a_clone`).
     **And an implicit key nothing can confirm is a refusal, not a bare `rowid = ?`.**
     `confirm_columns` answers `Option<Vec<usize>>` — `Some(vec![])` for every real key on every
     engine, `None` when the key is implicit and the candidate set comes out *empty* — and

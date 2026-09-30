@@ -516,11 +516,27 @@ pub fn analyze_edit(
                 // `resolve_key` still refuses a binary column as a WHERE key,
                 // where the lossiness really is fatal and there is no
                 // byte-shaped way around it.
+                //
+                // A **generated** column is no column to write either: every
+                // engine refuses a value for one (SQL Server's Msg 271), so its
+                // cell took an edit only the commit refused, and Duplicate row
+                // — which copies every writable column — failed on any table
+                // that had one. It stays a key or confirming column if it is
+                // one; only writing to it is off.
+                let generated = || {
+                    let name = rs.columns[ci].origin.as_ref().map(|o| o.column.as_str());
+                    info.as_ref().is_some_and(|i| {
+                        i.columns
+                            .iter()
+                            .any(|c| Some(c.name.as_str()) == name && c.generated.is_some())
+                    })
+                };
                 let excluded = rs.columns[ci]
                     .origin
                     .as_ref()
                     .map(|o| o.implicit_key)
-                    .unwrap_or(false);
+                    .unwrap_or(false)
+                    || generated();
                 if !excluded {
                     col_table[ci] = Some(idx);
                 }
@@ -4016,6 +4032,39 @@ mod tests {
 
         // Out of range is an empty row, not a panic.
         assert!(cloned_row(&m, &r, &dirty, 9).is_empty());
+    }
+
+    /// **A generated column is read-only, and a clone leaves it out.** Every
+    /// engine refuses a value for one — SQL Server's Msg 271 on a computed
+    /// column, MySQL's and PostgreSQL's generated columns alike — so the cell
+    /// took an edit only the commit refused, and *Duplicate row* failed on
+    /// every table holding one (AdventureWorks' `SalesOrderHeader`).
+    #[test]
+    fn a_generated_column_is_read_only_and_left_out_of_a_clone() {
+        let r = ResultSet::from_rows(
+            vec![
+                col("id", "INT", "c", true, false),
+                col("p", "INT", "c", false, false),
+                col("d", "INT", "c", false, false),
+            ],
+            vec![vec![Value::Int(1), Value::Int(2), Value::Int(4)]],
+        );
+        let schema = |_db: &str, _s: Option<&str>, t: &str| {
+            (t == "c").then(|| {
+                let mut info =
+                    schema_with_pk("c", &["id"], &[("id", "int"), ("p", "int"), ("d", "int")]);
+                info.columns[2].generated = Some("([p]*(2))".into());
+                info
+            })
+        };
+        let m = analyze_edit(&r, schema);
+        assert!(m.text_editable(1));
+        assert!(!m.text_editable(2), "a computed column takes no value");
+        let clone = cloned_row(&m, &r, &DirtyCells::new(), 0);
+        assert_eq!(clone.get(&1), Some(&CellEdit::Text("2".into())));
+        assert!(!clone.contains_key(&2), "{clone:?}");
+        // The table stays writable through its other columns.
+        assert_eq!(m.insert_target().map(|t| t.table.as_str()), Some("c"));
     }
 
     /// The floor is a floor: at it, nothing is asked; one past it, it is.
