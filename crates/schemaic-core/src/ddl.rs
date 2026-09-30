@@ -7666,16 +7666,52 @@ pub const FK_ACTIONS: [Option<&str>; 5] = [
     Some("SET DEFAULT"),
 ];
 
-/// The referential actions the designer offers on `dialect`, in menu order.
-///
-/// **SQL Server has no `RESTRICT`.** Its refusing action is `NO ACTION`, which
-/// is already the first entry; offering the other would be an entry whose every
-/// use is `Incorrect syntax near 'RESTRICT'`.
+/// The referential actions the designer offers on `dialect`, in menu order —
+/// [`FK_ACTIONS`] less the ones the engine does not perform, asked of
+/// [`supports_fk_restrict`] and [`supports_fk_set_default`]. A schema
+/// proposal's action is checked against the same list (`propose`).
 pub fn fk_actions(dialect: SqlDialect) -> &'static [Option<&'static str>] {
-    const T_SQL: [Option<&str>; 4] = [None, Some("CASCADE"), Some("SET NULL"), Some("SET DEFAULT")];
+    const NO_RESTRICT: [Option<&str>; 4] =
+        [None, Some("CASCADE"), Some("SET NULL"), Some("SET DEFAULT")];
+    const NO_SET_DEFAULT: [Option<&str>; 4] =
+        [None, Some("RESTRICT"), Some("CASCADE"), Some("SET NULL")];
+    const NEITHER: [Option<&str>; 3] = [None, Some("CASCADE"), Some("SET NULL")];
+    match (
+        supports_fk_restrict(dialect),
+        supports_fk_set_default(dialect),
+    ) {
+        (true, true) => &FK_ACTIONS,
+        (false, true) => &NO_RESTRICT,
+        (true, false) => &NO_SET_DEFAULT,
+        (false, false) => &NEITHER,
+    }
+}
+
+/// Is `RESTRICT` a referential action on `dialect`?
+///
+/// **SQL Server has none.** Its refusing action is `NO ACTION`, which is
+/// already the first entry; offering the other would be an entry whose every
+/// use is `Incorrect syntax near 'RESTRICT'`.
+pub fn supports_fk_restrict(dialect: SqlDialect) -> bool {
     match dialect {
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => &FK_ACTIONS,
-        SqlDialect::MsSql => &T_SQL,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => true,
+        SqlDialect::MsSql => false,
+    }
+}
+
+/// Does `dialect` **perform** `ON DELETE`/`ON UPDATE SET DEFAULT`?
+///
+/// **InnoDB does not, on either server, and neither refuses the clause.**
+/// MariaDB 10.11 accepts it and stores `RESTRICT` (`SHOW CREATE TABLE` shows
+/// the key with no action); MySQL 8.4 stores it — `information_schema` answers
+/// `SET DEFAULT` — and then refuses the parent's delete with error 1451, as
+/// `RESTRICT` would (both measured). Offered there, it applied cleanly and
+/// enforced the opposite of what was chosen: deletes refused instead of
+/// re-pointed. PostgreSQL, SQLite and SQL Server all perform it.
+pub fn supports_fk_set_default(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MySql => false,
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => true,
     }
 }
 
@@ -17652,8 +17688,26 @@ mod tests {
     fn sql_server_is_offered_no_restrict() {
         assert!(!fk_actions(MsSql).contains(&Some("RESTRICT")));
         assert!(fk_actions(MsSql).contains(&Some("CASCADE")));
-        for d in [MySql, Postgres, Sqlite] {
+        for d in [Postgres, Sqlite] {
             assert_eq!(fk_actions(d), &FK_ACTIONS[..], "{d:?}");
+        }
+    }
+
+    /// **InnoDB has no `SET DEFAULT`**, whichever server: MariaDB 10.11
+    /// accepts `ON DELETE SET DEFAULT` and stores `RESTRICT`, MySQL 8.4 stores
+    /// the clause and refuses the parent's delete anyway (both measured). The
+    /// designer's "Set default" there applied cleanly and enforced the
+    /// opposite of the choice, so the list asks the capability and leaves it
+    /// out; every other engine performs it.
+    #[test]
+    fn set_default_is_offered_only_where_the_engine_performs_it() {
+        assert!(!supports_fk_set_default(MySql));
+        assert!(!fk_actions(MySql).contains(&Some("SET DEFAULT")));
+        assert!(fk_actions(MySql).contains(&Some("RESTRICT")));
+        assert!(fk_actions(MySql).contains(&None));
+        for d in [Postgres, Sqlite, MsSql] {
+            assert!(supports_fk_set_default(d), "{d:?}");
+            assert!(fk_actions(d).contains(&Some("SET DEFAULT")), "{d:?}");
         }
     }
 

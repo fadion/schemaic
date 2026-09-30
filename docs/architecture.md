@@ -3405,9 +3405,13 @@ existing prose was left alone.
     where it had compared engines or asked nothing, and each for a field it offered and SQL Server
     could not take.
     `fk_actions(dialect)` is the action dropdown's list — and `propose::is_fk_action`'s, under
-    `propose.rs` — `FK_ACTIONS` less `RESTRICT` on SQL Server,
-    whose refusing action is `NO ACTION` — already the first entry — so the other was an entry whose
-    every use is a syntax error. `supports_comments(dialect)` is false on SQLite alone, which has no
+    `propose.rs` — `FK_ACTIONS` less what two capabilities withhold. `supports_fk_restrict` is false
+    on SQL Server, whose refusing action is `NO ACTION` — already the first entry — so the other was
+    an entry whose every use is a syntax error. `supports_fk_set_default` is false on MySQL/MariaDB,
+    and there the failure is quieter: InnoDB performs no `SET DEFAULT` on either server and refuses
+    the clause on neither — MariaDB 10.11 stores `RESTRICT` in its place, MySQL 8.4 stores the
+    clause and then refuses the parent's delete as `RESTRICT` would (both measured) — so "Set
+    default" applied cleanly and enforced the opposite of the choice. `supports_comments(dialect)` is false on SQLite alone, which has no
     comments in the language, so both comment fields are hidden there rather than typed into and
     dropped. It was false on SQL Server too until the emitter wrote that engine's comments, which
     are the `MS_Description` extended property — a statement of its own, `TsqlComment`, under
@@ -8623,7 +8627,8 @@ existing prose was left alone.
       `is_fk_action` asks `ddl::fk_actions(dialect)`, its `None` entry read as `NO ACTION`. It used
       to be a list of its own, the union of every engine's, so a proposal naming `RESTRICT` on SQL
       Server reached the preview and failed at the server; it is `UnknownAction` now
-      (`a_foreign_key_action_the_engine_lacks_is_refused`).
+      (`a_foreign_key_action_the_engine_lacks_is_refused`), as is `SET DEFAULT` on MySQL, which
+      InnoDB accepts and never performs.
       **`resolve_target` is the one resolver for *which table* a proposal is about**, and it is one
       function because the two ends of a proposal have to agree: the MCP tool checks the ops against
       a table and answers "Valid. Nothing has run.", and the card then builds the plan the user

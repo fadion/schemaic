@@ -1533,6 +1533,17 @@ mod tests {
             assert!(apply(&orders(), &fk("NO ACTION"), d).is_ok(), "{d:?}");
             assert!(apply(&orders(), &fk("CASCADE"), d).is_ok(), "{d:?}");
         }
+        // InnoDB never performs `SET DEFAULT`: MariaDB 10.11 accepts the
+        // clause and stores `RESTRICT`, MySQL 8.4 stores it and refuses the
+        // delete anyway (both measured). A proposal naming it would apply and
+        // enforce the opposite of what it said.
+        assert!(matches!(
+            apply(&orders(), &fk("SET DEFAULT"), SqlDialect::MySql),
+            Err(ProposeError::UnknownAction(_))
+        ));
+        for d in [SqlDialect::Postgres, SqlDialect::Sqlite, SqlDialect::MsSql] {
+            assert!(apply(&orders(), &fk("SET DEFAULT"), d).is_ok(), "{d:?}");
+        }
     }
 
     #[test]
