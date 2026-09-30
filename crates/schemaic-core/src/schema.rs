@@ -1696,6 +1696,25 @@ pub struct TsqlModule {
     /// walks (`ddl::tsql_trigger_parts`, `tsql_routine_parts`,
     /// `tsql_view_parts`); in the round-trip gate as part of the module.
     pub header_comments: String,
+    /// **Created under `SET ANSI_NULLS OFF`** — `sys.sql_modules.
+    /// uses_ansi_nulls` is 0. Part of what the module *does*: under it
+    /// `WHERE d = NULL` matches the nulls, and ON it matches nothing.
+    ///
+    /// `CREATE` has no clause for it; the module takes the session's setting
+    /// when it is created. Schemaic's session is an ANSI-defaults one (and so
+    /// is SSMS's), so a module written OFF and edited here came back ON and
+    /// its results changed silently (measured on SQL Server 2022 and 2025: a
+    /// view's `COUNT(*)` went from 1 to 0). So the statement is wrapped in
+    /// `SET … OFF` and `SET … ON`, as statements — batches — of their own
+    /// ([`crate::ddl::tsql_settings_wrapped`]), the shape SQL Server's own
+    /// scripter writes, and the counterpart of MySQL's `sql_mode` wrapper.
+    /// `false`, the ANSI default, for anything not read.
+    pub ansi_nulls_off: bool,
+    /// **Created under `SET QUOTED_IDENTIFIER OFF`** —
+    /// `uses_quoted_identifier` is 0, which `sqlcmd` without `-I` produces.
+    /// Under it a `"x"` is a string; ON it is a column. Restated for
+    /// [`Self::ansi_nulls_off`]'s reason.
+    pub quoted_identifier_off: bool,
 }
 
 impl TsqlModule {
@@ -1704,6 +1723,7 @@ impl TsqlModule {
     pub fn with_header_comments(comments: impl Into<String>) -> Self {
         Self {
             header_comments: comments.into(),
+            ..Self::default()
         }
     }
 
@@ -2663,7 +2683,11 @@ impl TriggerInfo {
                         before.iter().any(|e| e.name.eq_ignore_ascii_case(n))
                     })
                     .create_sql(dialect);
-                std::iter::once(create).chain(follow_ups(t))
+                // A SQL Server trigger under the settings it was created with;
+                // no wrapper at the ANSI defaults, which every other engine's is.
+                crate::ddl::tsql_settings_wrapped(None, create, &t.tsql.module)
+                    .into_iter()
+                    .chain(follow_ups(t))
             })
             .collect()
     }
@@ -5124,16 +5148,20 @@ impl TableInfo {
                     crate::sql::terminated(sql, d)
                 ),
             };
-            // An indexed view's indexes after it, each in a batch of its own —
-            // `CREATE VIEW` must be alone in one — and one the model cannot
-            // restate named, as a table's is.
             let Some(draft) = crate::ddl::ViewDraft::from_table(self) else {
                 return create;
             };
-            let mut out = std::iter::once(create)
-                .chain(crate::ddl::view_index_statements(&draft, &self.name, d))
-                .collect::<Vec<_>>()
-                .join("\nGO\n");
+            // Under the settings it was created with, each `SET` a batch of
+            // its own (`ddl::tsql_settings_wrapped`); then an indexed view's
+            // indexes, each in a batch of its own too — `CREATE VIEW` must be
+            // alone in one — and one the model cannot restate named, as a
+            // table's is.
+            let mut out =
+                crate::ddl::tsql_settings_wrapped(None, create, &draft.options.tsql.module)
+                    .into_iter()
+                    .chain(crate::ddl::view_index_statements(&draft, &self.name, d))
+                    .collect::<Vec<_>>()
+                    .join("\nGO\n");
             for ix in draft.options.tsql.indexes.iter().filter(|ix| ix.lossy) {
                 out.push_str(&format!(
                     "\n-- Index {} has included columns, or is of a kind this script cannot \

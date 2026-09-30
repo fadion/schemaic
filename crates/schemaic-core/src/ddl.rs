@@ -5526,19 +5526,30 @@ impl ChangeSet {
                     // knows; a re-create drops that one and builds the draft's,
                     // which is how a rename comes along for free.
                     let server_name = draft.original.as_deref().unwrap_or(&draft.name);
+                    // A SQL Server view's creation-time settings around its
+                    // create — `tsql_settings_wrapped`; nothing elsewhere.
+                    let settings = &draft.options.tsql.module;
                     if *recreate {
                         out.push(drop_view_sql(
                             &qualified(server_name, draft.schema.as_deref(), d),
                             draft.options.materialized,
                         ));
-                        out.push(create_view_sql(draft, &draft.name, d, false));
+                        out.extend(tsql_settings_wrapped(
+                            None,
+                            create_view_sql(draft, &draft.name, d, false),
+                            settings,
+                        ));
                         out.extend(view_index_statements(draft, &draft.name, d));
                         // What the drop took with it, verbatim, after the view is
                         // back — the same replay a table rebuild does with
                         // `dependent_ddl`, for the same reason.
                         out.extend(replay.iter().cloned());
                     } else {
-                        out.push(create_view_sql(draft, server_name, d, true));
+                        out.extend(tsql_settings_wrapped(
+                            None,
+                            create_view_sql(draft, server_name, d, true),
+                            settings,
+                        ));
                         out.extend(view_index_statements(draft, server_name, d));
                     }
                 }
@@ -8441,8 +8452,10 @@ fn trigger_create_statements(
     d: SqlDialect,
 ) -> (Vec<String>, Vec<String>) {
     match d {
+        // Under the settings it was created with — `tsql_settings_wrapped`.
         SqlDialect::MsSql => (
-            std::iter::once(t.tsql_statement(or_alter))
+            tsql_settings_wrapped(None, t.tsql_statement(or_alter), &t.tsql.module)
+                .into_iter()
                 .chain(t.tsql_disable_statement())
                 .collect(),
             t.tsql_rank_statements(),
@@ -8451,6 +8464,39 @@ fn trigger_create_statements(
             (session_wrapped_create(t, d), Vec::new())
         }
     }
+}
+
+/// A SQL Server module's statement, wrapped in the two settings it was
+/// created under when either is off — [`crate::schema::TsqlModule::
+/// ansi_nulls_off`] and `quoted_identifier_off` — and the ANSI defaults put
+/// back after, each `SET` a statement of its own: `CREATE VIEW`/`TRIGGER`/
+/// `PROCEDURE` must be alone in its batch, and `QUOTED_IDENTIFIER` takes
+/// effect when the *next* batch is parsed. `Db::run_ddl` runs every statement
+/// of a plan as a batch on one connection, and a script's are cut at their
+/// `GO` lines, so both callers keep the setting for the create and only it.
+///
+/// Restored to `ON` rather than to whatever the session had: ON is what
+/// Schemaic's session and SQL Server's own tools open with, and T-SQL has no
+/// variable to save the old value in. `lead` runs inside the wrapper — a
+/// recreate's `DROP` — as [`session_wrapped`]'s does. Nothing is added for a
+/// module at the ANSI defaults, which is every module on the other engines.
+pub(crate) fn tsql_settings_wrapped(
+    lead: Option<String>,
+    create: String,
+    m: &crate::schema::TsqlModule,
+) -> Vec<String> {
+    let off: Vec<&str> = [
+        ("ANSI_NULLS", m.ansi_nulls_off),
+        ("QUOTED_IDENTIFIER", m.quoted_identifier_off),
+    ]
+    .into_iter()
+    .filter_map(|(setting, off)| off.then_some(setting))
+    .collect();
+    let mut out: Vec<String> = off.iter().map(|s| format!("SET {s} OFF;")).collect();
+    out.extend(lead);
+    out.push(create);
+    out.extend(off.iter().map(|s| format!("SET {s} ON;")));
+    out
 }
 
 /// A trigger's `CREATE`, wrapped in the session state it was created under.
@@ -8496,14 +8542,19 @@ pub(crate) fn session_wrapped(
     r: &RoutineInfo,
     d: SqlDialect,
 ) -> Vec<String> {
-    session_wrapped_with(
-        lead,
-        create,
-        r.sql_mode.as_deref(),
-        r.charset_client.as_deref(),
-        r.collation_connection.as_deref(),
-        d,
-    )
+    match d {
+        // SQL Server's creation-time settings are its own two, not MySQL's
+        // three — `tsql_settings_wrapped`.
+        SqlDialect::MsSql => tsql_settings_wrapped(lead, create, &r.tsql.module),
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => session_wrapped_with(
+            lead,
+            create,
+            r.sql_mode.as_deref(),
+            r.charset_client.as_deref(),
+            r.collation_connection.as_deref(),
+            d,
+        ),
+    }
 }
 
 /// The same wrapper for a scheduled event, with a fourth value the other two
@@ -17595,6 +17646,35 @@ mod tests {
         t.view_options.as_mut().unwrap().tsql.indexes =
             vec![ix("a_nix", "b", false, false), ix("cix", "a", true, true)];
         t
+    }
+
+    /// **A view created under `ANSI_NULLS OFF` is edited and scripted under
+    /// it.** Edited on an ANSI-defaults session, `WHERE d = NULL` stopped
+    /// matching the nulls and the view's rows changed silently (measured on
+    /// SQL Server 2022 and 2025: `COUNT(*)` 1, then 0).
+    #[test]
+    fn a_view_is_edited_under_the_settings_it_was_created_with() {
+        let mut t = ms_view();
+        t.view_options.as_mut().unwrap().tsql.module.ansi_nulls_off = true;
+        let mut d = ViewDraft::from_table(&t).unwrap();
+        d.select = "SELECT id, d FROM dbo.t WHERE d = NULL".into();
+        let sql = diff_view(&t, &d, MsSql).emit();
+        assert_eq!(sql.len(), 3, "{sql:#?}");
+        assert_eq!(sql[0], "SET ANSI_NULLS OFF;");
+        assert!(sql[1].starts_with("CREATE OR ALTER VIEW"), "{sql:#?}");
+        assert_eq!(sql[2], "SET ANSI_NULLS ON;");
+        let mut d = ViewDraft::from_table(&t).unwrap();
+        d.name = "v2".into();
+        let sql = diff_view(&t, &d, MsSql).emit();
+        assert_eq!(sql[1], "SET ANSI_NULLS OFF;", "{sql:#?}");
+        t.create_sql =
+            Some("CREATE VIEW dbo.v (a, b) WITH SCHEMABINDING AS SELECT id, d FROM dbo.t".into());
+        let ddl = t.create_ddl(MsSql);
+        assert!(
+            ddl.starts_with("SET ANSI_NULLS OFF;\nGO\nCREATE VIEW"),
+            "{ddl}"
+        );
+        assert!(ddl.ends_with(";\nGO\nSET ANSI_NULLS ON;"), "{ddl}");
     }
 
     /// **Any edit to an indexed view creates its indexes again.** T-SQL's
@@ -27035,6 +27115,48 @@ mod tsql_routine_plan_tests {
         assert_eq!(sql[0], "DROP PROCEDURE IF EXISTS [dbo].[r];");
     }
 
+    /// **A routine is edited, dropped-and-created and scripted under the
+    /// settings it was created with** — `SET ANSI_NULLS OFF` and `SET
+    /// QUOTED_IDENTIFIER OFF` as statements of their own before it, and the
+    /// ANSI defaults put back after. The recreate's `DROP` runs inside the
+    /// wrapper, as MySQL's does.
+    #[test]
+    fn a_routine_is_edited_under_the_settings_it_was_created_with() {
+        let mut cur = proc_r();
+        cur.tsql.module.ansi_nulls_off = true;
+        cur.tsql.module.quoted_identifier_off = true;
+        let sql = plan(&cur, |f| f.body = "SELECT @a WHERE @a = NULL".into());
+        assert_eq!(
+            sql[..2],
+            ["SET ANSI_NULLS OFF;", "SET QUOTED_IDENTIFIER OFF;"]
+        );
+        assert!(sql[2].starts_with("CREATE OR ALTER PROCEDURE"), "{sql:#?}");
+        assert_eq!(
+            sql[3..],
+            ["SET ANSI_NULLS ON;", "SET QUOTED_IDENTIFIER ON;"]
+        );
+        let sql = plan(&cur, |f| f.name = "r2".into());
+        assert_eq!(sql[2], "DROP PROCEDURE IF EXISTS [dbo].[r];");
+        assert_eq!(sql[4], "SET ANSI_NULLS ON;");
+        let script = crate::schema::ObjectItem::Routine(std::sync::Arc::new(cur)).create_sql(MsSql);
+        let batches: Vec<&str> = script
+            .split("\nGO")
+            .map(str::trim)
+            .filter(|b| !b.is_empty())
+            .collect();
+        assert_eq!(
+            batches[..2],
+            ["SET ANSI_NULLS OFF;", "SET QUOTED_IDENTIFIER OFF;"],
+            "{script}"
+        );
+        assert!(batches[2].starts_with("CREATE PROCEDURE"), "{script}");
+        assert_eq!(
+            batches[3..],
+            ["SET ANSI_NULLS ON;", "SET QUOTED_IDENTIFIER ON;"],
+            "{script}"
+        );
+    }
+
     /// **A procedure that heads a numbered group is never dropped by an
     /// edit.** `DROP PROCEDURE r` takes `r;2 … n` with it (measured on SQL
     /// Server 2022: `sys.numbered_procedures` went from 1 row to 0), while a
@@ -27344,6 +27466,35 @@ mod tsql_trigger_plan_tests {
         assert!(!trigger_fires_on_several_events(SqlDialect::Sqlite));
         assert!(!trigger_events(MsSql).contains(&TriggerEvent::Truncate));
         assert!(trigger_events(SqlDialect::Postgres).contains(&TriggerEvent::Truncate));
+    }
+
+    /// **A trigger created under `QUOTED_IDENTIFIER OFF` is edited under
+    /// it**, each `SET` a statement of its own — `CREATE TRIGGER` must be
+    /// alone in its batch — and the session put back after. Edited on an
+    /// ANSI-defaults session, its `"x"` literals became column names
+    /// (S7.1-L1-03). The dump restates it the same way.
+    #[test]
+    fn a_trigger_is_edited_under_the_settings_it_was_created_with() {
+        let mut cur = tr("tr");
+        cur.tsql.module.quoted_identifier_off = true;
+        let mut d = set(vec![cur.clone()]);
+        d.triggers[0].info.action = TriggerAction::Body("PRINT \"changed\"".into());
+        let sql = diff_triggers(std::slice::from_ref(&cur), &d, MsSql).emit();
+        assert_eq!(sql.len(), 3, "{sql:#?}");
+        assert_eq!(sql[0], "SET QUOTED_IDENTIFIER OFF;");
+        assert!(sql[1].starts_with("CREATE OR ALTER TRIGGER"), "{sql:#?}");
+        assert_eq!(sql[2], "SET QUOTED_IDENTIFIER ON;");
+        let dump = TriggerInfo::create_set_sql(std::slice::from_ref(&cur), MsSql);
+        assert_eq!(
+            dump.first().map(String::as_str),
+            Some("SET QUOTED_IDENTIFIER OFF;")
+        );
+        assert_eq!(
+            dump.get(2).map(String::as_str),
+            Some("SET QUOTED_IDENTIFIER ON;")
+        );
+        // The ANSI default is no wrapper at all.
+        assert_eq!(TriggerInfo::create_set_sql(&[tr("tr")], MsSql).len(), 1);
     }
 
     #[test]

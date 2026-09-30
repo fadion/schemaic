@@ -2227,6 +2227,111 @@ async fn a_modules_header_comments_survive_an_edit() {
     );
 }
 
+/// **A module created under `ANSI_NULLS OFF` or `QUOTED_IDENTIFIER OFF`
+/// keeps it through an edit.** `CREATE` has no clause for either; the module
+/// takes the session's, and Schemaic's is an ANSI-defaults one, so an edit
+/// re-filed each under ON and changed what it does: the view's `d = NULL`
+/// stopped matching, the trigger's `"x"` literal became a column. Each is
+/// read with its settings, edited, and still has them — and still does what
+/// it did.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_module_keeps_its_creation_settings_through_an_edit() {
+    use schemaic_core::ddl::{
+        RoutineDraft, TriggerSetDraft, ViewDraft, diff_routine, diff_triggers, diff_view,
+    };
+    use schemaic_core::schema::TriggerAction;
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("ddl_module_settings").await;
+    s.exec(
+        "CREATE TABLE dbo.t (id int NOT NULL PRIMARY KEY, d int NULL); \
+         CREATE TABLE dbo.audit (note varchar(20)); INSERT dbo.t VALUES (1, NULL)",
+    )
+    .await;
+    // `EXEC` compiles its batch under the settings the `SET`s just made.
+    s.exec(
+        "SET ANSI_NULLS OFF; EXEC ('CREATE VIEW dbo.v_an AS SELECT id FROM dbo.t WHERE d = NULL')",
+    )
+    .await;
+    s.exec(
+        "SET QUOTED_IDENTIFIER OFF; EXEC ('CREATE TRIGGER dbo.tr_qi ON dbo.t AFTER UPDATE AS \
+         INSERT dbo.audit VALUES (\"first\")')",
+    )
+    .await;
+    s.exec(
+        "SET ANSI_NULLS OFF; SET QUOTED_IDENTIFIER OFF; \
+         EXEC ('CREATE PROCEDURE dbo.p_an AS SELECT COUNT(*) FROM dbo.t WHERE d = NULL')",
+    )
+    .await;
+    let settings = |name: &'static str| {
+        let s = &s;
+        async move {
+            s.scalar(&format!(
+                "SELECT CONCAT(uses_ansi_nulls, uses_quoted_identifier) FROM sys.sql_modules \
+                 WHERE object_id = OBJECT_ID('dbo.{name}')"
+            ))
+            .await
+        }
+    };
+    let apply = |stmts: Vec<String>| {
+        let db = s.db.clone();
+        let name = s.name.clone();
+        async move {
+            db.run_ddl(&name, &stmts, CancellationToken::new())
+                .await
+                .unwrap_or_else(|e| panic!("{e}\n{stmts:#?}"));
+        }
+    };
+
+    let v = read_table(&s, "v_an").await;
+    assert!(v.view_options.as_ref().unwrap().tsql.module.ansi_nulls_off);
+    let mut d = ViewDraft::from_table(&v).unwrap();
+    assert!(diff_view(&v, &d, MS).is_empty());
+    d.select = "SELECT id, d FROM dbo.t WHERE d = NULL".into();
+    apply(diff_view(&v, &d, MS).emit()).await;
+    assert_eq!(settings("v_an").await, "01");
+    assert_eq!(
+        s.scalar("SELECT COUNT(*) FROM dbo.v_an").await,
+        "1",
+        "d = NULL still matches"
+    );
+
+    let t = read_table(&s, "t").await;
+    assert!(t.triggers[0].tsql.module.quoted_identifier_off);
+    let mut set = TriggerSetDraft::from_table(&t);
+    assert!(diff_triggers(&t.triggers, &set, MS).is_empty());
+    set.triggers[0].info.action =
+        TriggerAction::Body("INSERT dbo.audit VALUES (\"second\")".into());
+    apply(diff_triggers(&t.triggers, &set, MS).emit()).await;
+    assert_eq!(settings("tr_qi").await, "10");
+    s.exec("UPDATE dbo.t SET d = d").await;
+    assert_eq!(s.scalar("SELECT note FROM dbo.audit").await, "second");
+
+    let p =
+        s.db.fetch_schema(&s.name, CancellationToken::new())
+            .await
+            .unwrap()
+            .routines
+            .iter()
+            .find(|r| r.name == "p_an")
+            .unwrap()
+            .as_ref()
+            .clone();
+    assert!(p.tsql.module.ansi_nulls_off && p.tsql.module.quoted_identifier_off);
+    let mut d = RoutineDraft::from_info(&p);
+    assert!(diff_routine(&p, &d, MS).is_empty());
+    d.info.body = "SELECT COUNT(*) + 10 FROM dbo.t WHERE d = NULL".into();
+    apply(diff_routine(&p, &d, MS).emit()).await;
+    assert_eq!(settings("p_an").await, "00");
+    assert_eq!(s.scalar("EXEC dbo.p_an").await, "11");
+
+    // And a script of each puts it back as it was.
+    let ddl = read_table(&s, "v_an").await.create_ddl(MS);
+    replay(&s, &format!("DROP VIEW dbo.v_an;\nGO\n{ddl}\nGO")).await;
+    assert_eq!(settings("v_an").await, "01");
+}
+
 /// **A parameter's own `AS` is not the header's.** `@a AS int` and a
 /// parameter named `@as` are T-SQL the server takes; read with the list cut
 /// at the first `AS`, the first lost its type to the body and the second

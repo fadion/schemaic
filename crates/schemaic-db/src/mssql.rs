@@ -1294,9 +1294,12 @@ const FK_LISTING: &str = "SELECT s.name, t.name, fk.name, pc.name, rs.name, rt.n
      WHERE t.is_ms_shipped = 0 \
      ORDER BY s.name, t.name, fk.name, k.constraint_column_id";
 
-/// Every view's stored `CREATE VIEW`: `(schema, view, definition)`. `NULL`
-/// for one created `WITH ENCRYPTION`, which the server will not show anyone.
-const VIEW_LISTING: &str = "SELECT s.name, v.name, m.definition \
+/// Every view's stored `CREATE VIEW`: `(schema, view, definition, ANSI_NULLS,
+/// QUOTED_IDENTIFIER)`. `NULL` for one created `WITH ENCRYPTION`, which the
+/// server will not show anyone; the last two are the settings it was created
+/// under ([`module_settings`]).
+const VIEW_LISTING: &str = "SELECT s.name, v.name, m.definition, \
+            CAST(m.uses_ansi_nulls AS int), CAST(m.uses_quoted_identifier AS int) \
      FROM sys.views v \
      JOIN sys.schemas s ON s.schema_id = v.schema_id \
      LEFT JOIN sys.sql_modules m ON m.object_id = v.object_id \
@@ -1314,11 +1317,14 @@ const CHECK_LISTING: &str = "SELECT s.name, t.name, ck.name, ck.definition, \
      ORDER BY s.name, t.name, ck.name";
 
 /// Every DML trigger on a table or view, one row per event: `(schema,
-/// table, trigger, instead of, disabled, event, definition, first, last)` —
-/// the last two the event's `sp_settriggerorder` rank.
+/// table, trigger, instead of, disabled, event, definition, first, last,
+/// ANSI_NULLS, QUOTED_IDENTIFIER)` — first and last the event's
+/// `sp_settriggerorder` rank, the two after them the settings it was created
+/// under ([`module_settings`]).
 const TRIGGER_LISTING: &str = "SELECT s.name, o.name, tr.name, \
             CAST(tr.is_instead_of_trigger AS int), CAST(tr.is_disabled AS int), \
-            te.type_desc, m.definition, CAST(te.is_first AS int), CAST(te.is_last AS int) \
+            te.type_desc, m.definition, CAST(te.is_first AS int), CAST(te.is_last AS int), \
+            CAST(m.uses_ansi_nulls AS int), CAST(m.uses_quoted_identifier AS int) \
      FROM sys.triggers tr \
      JOIN sys.objects o ON o.object_id = tr.parent_id \
      JOIN sys.schemas s ON s.schema_id = o.schema_id \
@@ -1371,6 +1377,17 @@ fn tsql_trigger_reading(
             },
         ),
     }
+}
+
+/// The two creation-time settings `sys.sql_modules` keeps for a module —
+/// `uses_ansi_nulls` and `uses_quoted_identifier`, the cells at `at` and
+/// `at + 1` — onto `m`: off only where the server says `0`. A `NULL` (no
+/// module row visible) leaves the ANSI default, which is what a rebuild would
+/// have used anyway. See `schemaic_core::schema::TsqlModule::ansi_nulls_off`.
+fn module_settings(r: &[Option<String>], at: usize, m: &mut schemaic_core::schema::TsqlModule) {
+    let off = |i: usize| r.get(i).and_then(|c| c.as_deref()) == Some("0");
+    m.ansi_nulls_off = off(at);
+    m.quoted_identifier_off = off(at + 1);
 }
 
 /// What [`tsql_routine_reading`] fills in of a routine.
@@ -1433,11 +1450,13 @@ fn tsql_routine_reading(
 }
 
 /// Every procedure and function written in T-SQL: `(schema, name, type,
-/// definition, deterministic, description)`. CLR routines have no module
-/// text and are left out.
+/// definition, deterministic, description, ANSI_NULLS, QUOTED_IDENTIFIER)` —
+/// the last two the settings it was created under ([`module_settings`]). CLR
+/// routines have no module text and are left out.
 const ROUTINE_LISTING: &str = "SELECT s.name, o.name, o.type, m.definition, \
             CAST(COALESCE(OBJECTPROPERTY(o.object_id, 'IsDeterministic'), 0) AS int), \
-            CAST(ep.value AS nvarchar(4000)) \
+            CAST(ep.value AS nvarchar(4000)), \
+            CAST(m.uses_ansi_nulls AS int), CAST(m.uses_quoted_identifier AS int) \
      FROM sys.objects o \
      JOIN sys.schemas s ON s.schema_id = o.schema_id \
      JOIN sys.sql_modules m ON m.object_id = o.object_id \
@@ -1819,10 +1838,9 @@ async fn collect_schema(client: &mut MsClient) -> Result<DbSchema, DbError> {
             .await?
             .iter()
             .map(|r| {
-                (
-                    (cell(r, 0), cell(r, 1)),
-                    tsql_view_reading(r.get(2).and_then(|d| d.as_deref())),
-                )
+                let mut v = tsql_view_reading(r.get(2).and_then(|d| d.as_deref()));
+                module_settings(r, 3, &mut v.options.tsql.module);
+                ((cell(r, 0), cell(r, 1)), v)
             })
             .collect();
     let view_rows: Vec<(String, (String, String))> = view_readings
@@ -1908,6 +1926,7 @@ async fn collect_schema(client: &mut MsClient) -> Result<DbSchema, DbError> {
             continue;
         }
         let (action, mut tsql) = tsql_trigger_reading(r.get(6).and_then(|d| d.as_deref()));
+        module_settings(&r, 9, &mut tsql.module);
         tsql.rank.extend(rank.map(|k| (event, k)));
         list.push(TriggerInfo {
             name,
@@ -2032,6 +2051,7 @@ async fn collect_schema(client: &mut MsClient) -> Result<DbSchema, DbError> {
             read.tsql.numbered = numbered
                 .remove(&(ns.clone(), name.clone()))
                 .unwrap_or_default();
+            module_settings(&r, 6, &mut read.tsql.module);
             Arc::new(RoutineInfo {
                 name,
                 schema: Some(ns),

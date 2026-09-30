@@ -4724,6 +4724,27 @@ existing prose was left alone.
     when nothing is known — `None` means "not fetched", and inventing a session state is a change
     nobody asked for. It early-returns on `!= MySql`; the old `== Postgres` test would have handed
     SQLite `SET SESSION sql_mode = …`.
+    **SQL Server's half is `tsql_settings_wrapped`**, and `session_wrapped` is an exhaustive match
+    that hands a routine to it: T-SQL's creation-time settings are its own two, `ANSI_NULLS` and
+    `QUOTED_IDENTIFIER` (`TsqlModule`'s flags, under `schema.rs`, with the bug they fix), not
+    MySQL's three. When either is off it emits `SET … OFF;`, then `lead` (a recreate's `DROP`) and
+    the create, then `SET … ON;` — **each `SET` a statement of its own**, because `CREATE VIEW`/
+    `TRIGGER`/`PROCEDURE` must be alone in its batch and `QUOTED_IDENTIFIER` takes effect only when
+    the *next* batch is parsed; `run_ddl` runs each statement as a batch on one connection and a
+    script is cut at `GO`, so both keep the setting for the create and only it. Folding the `SET`s
+    into the create's statement would look tidier and break both. **It restores `ON`, not what the
+    session had** — ON is what Schemaic's session and SQL Server's own tools open with, and T-SQL
+    has no variable to save the old value in, so where MySQL's wrapper puts back a user variable
+    this one assumes. Every SQL Server module path goes through it: `trigger_create_statements`
+    (the edit plan and the table rebuild's trigger replay), `TriggerInfo::create_set_sql` (the
+    dump), `session_wrapped` (the routine plan and `ObjectItem::create_sql`'s Copy DDL and dump),
+    both `ReplaceView` arms of `view_statements`, and `TableInfo::tsql_create_ddl`'s view branch
+    (Copy DDL and the dump, the `SET`s as `GO` batches before the indexes). `alters_the_database`
+    already counted a `SET` as scaffolding. Nothing is added for a module at the ANSI defaults.
+    `a_view_is_edited_under_the_settings_it_was_created_with` and its trigger and routine siblings
+    pin it; live, `a_module_keeps_its_creation_settings_through_an_edit` (2022 and 2025) reads each
+    module with its settings, edits it and finds them still in `sys.sql_modules` and the module
+    behaving as before, and replays a view's script to the same end.
     **A routine's diff is per-engine at the *rename*, and that is the whole shape of
     `diff_routine`.** PostgreSQL replaces one in place (`supports_or_replace_routine`) and renames
     it with a statement of its own (`supports_routine_rename`), so a rename is a separate change
@@ -7591,6 +7612,16 @@ existing prose was left alone.
     whole, so a field added to it is compared without a second edit there
     (`a_triggers_header_comments_survive_its_rebuild` and its routine and view siblings, under
     `ddl.rs`; live, `a_modules_header_comments_survive_an_edit` on 2022 and 2025).
+    **Its two flags are the settings the module was created under** — `ansi_nulls_off` and
+    `quoted_identifier_off`, `sys.sql_modules.uses_ansi_nulls`/`uses_quoted_identifier` read as 0,
+    and `false`, the ANSI default, for anything not read. `CREATE` has no clause for either: a
+    module takes the session's setting when it is created, and Schemaic's session is an
+    ANSI-defaults one, so an edit re-filed a module written OFF under ON and its results changed
+    with nothing on screen to say so — measured on 2022 and 2025, a view created under
+    `ANSI_NULLS OFF` filtering `WHERE d = NULL` returned one row before an edit and none after, and
+    a `QUOTED_IDENTIFIER OFF` trigger's `"x"` literal became a column. Nothing read the two columns.
+    `ddl::tsql_settings_wrapped` restates them, the counterpart of MySQL's `sql_mode` wrapper
+    (both under `ddl.rs`).
     `TableInfo::create_ddl` — `CREATE TABLE`/`VIEW`, built on the
     above; its **view** branch delegates to `ddl::view_ddl` so Copy DDL, the MCP table-info tool
     and the apply path all emit through one view emitter (it used to have its own, which restated
@@ -12625,6 +12656,13 @@ existing prose was left alone.
   `view_select_body` and `view_header_options`, until the `v$as` they split and the guesses they
   fell back on moved it into core (under `ddl.rs`). `dependent_ddl` is left
   empty for a view, deliberately — see `TableInfo::dependent_ddl`, under `schema.rs`.
+  **`VIEW_LISTING`, `TRIGGER_LISTING` and `ROUTINE_LISTING` also read the settings each module was
+  created under** — `sys.sql_modules.uses_ansi_nulls` and `uses_quoted_identifier`, cast to `int`
+  — and `module_settings` sets `TsqlModule::ansi_nulls_off`/`quoted_identifier_off` after the
+  text's reading, whichever way the header walk went. A flag goes off only where the cell is `0`:
+  a NULL, no module row visible, leaves the ANSI default a rebuild would have used anyway. Nothing
+  read them before, and an edit silently re-filed a module written OFF under this session's ON
+  (why, and the measurement, under `schema.rs`; the wrapper that restates them under `ddl.rs`).
   **`VIEW_INDEX_LISTING` reads an indexed view's indexes** — `INDEX_LISTING`'s row shape over
   `sys.views`, so the table listing is untouched — and its rows are chained into the index rows
   `assemble_schema` folds, clustering and `lossy` read exactly as a table's, then moved off the
