@@ -5332,3 +5332,172 @@ async fn a_retype_is_refused_where_a_dependent_carries_what_it_would_drop() {
         );
     }
 }
+
+/// **Every arm of the rebuild's guard, run** (S3.2-L6-01). The guard is the
+/// rebuild's whole defence against a silent loss, and an arm whose catalogue
+/// predicate is wrong fails open — S3.2-L5-03 was exactly one that looked
+/// right and missed. One table per arm, the smallest that should trip it;
+/// each is read, its columns swapped (a rebuild), and the plan must be
+/// refused with that arm's reason and leave the table as it was. `after`
+/// runs between the read and the plan, for the arm about a stale reading.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_arm_of_the_rebuild_guard_refuses_its_table() {
+    use schemaic_core::ddl::TableDraft;
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("guard_arms").await;
+    struct Arm {
+        table: &'static str,
+        setup: &'static [&'static str],
+        after: &'static [&'static str],
+        says: &'static str,
+    }
+    let arms = [
+        Arm {
+            table: "g_perm",
+            setup: &["GRANT SELECT ON dbo.g_perm TO public"],
+            after: &[],
+            says: "permissions are granted on it",
+        },
+        Arm {
+            table: "g_bound",
+            setup: &["CREATE VIEW dbo.g_bound_v WITH SCHEMABINDING AS SELECT a FROM dbo.g_bound"],
+            after: &[],
+            says: "a schema-bound view or function depends on it",
+        },
+        Arm {
+            table: "g_esc",
+            setup: &["ALTER TABLE dbo.g_esc SET (LOCK_ESCALATION = DISABLE)"],
+            after: &[],
+            says: "has a lock escalation setting",
+        },
+        Arm {
+            table: "g_ct",
+            setup: &[
+                "ALTER DATABASE CURRENT SET CHANGE_TRACKING = ON",
+                "ALTER TABLE dbo.g_ct ENABLE CHANGE_TRACKING",
+            ],
+            after: &[],
+            says: "it has change tracking or a full-text index",
+        },
+        Arm {
+            table: "g_zip",
+            setup: &["ALTER TABLE dbo.g_zip REBUILD WITH (DATA_COMPRESSION = ROW)"],
+            after: &[],
+            says: "it is partitioned, compressed or stored off the default filegroup",
+        },
+        Arm {
+            table: "g_part",
+            setup: &[
+                "CREATE PARTITION FUNCTION g_pf (int) AS RANGE LEFT FOR VALUES (10)",
+                "CREATE PARTITION SCHEME g_ps AS PARTITION g_pf ALL TO ([PRIMARY])",
+                "CREATE UNIQUE NONCLUSTERED INDEX ux_g_part ON dbo.g_part (id) ON g_ps (id)",
+            ],
+            after: &[],
+            says: "it is partitioned, compressed or stored off the default filegroup",
+        },
+        Arm {
+            table: "g_prop",
+            setup: &["EXEC sp_addextendedproperty N'Owner', N'me', \
+                      N'SCHEMA', N'dbo', N'TABLE', N'g_prop'"],
+            after: &[],
+            says: "it carries extended properties other than its comments",
+        },
+        Arm {
+            table: "g_keydoc",
+            setup: &[
+                "EXEC sp_addextendedproperty N'MS_Description', N'the key', \
+                      N'SCHEMA', N'dbo', N'TABLE', N'g_keydoc', N'CONSTRAINT', N'pk_g_keydoc'",
+            ],
+            after: &[],
+            says: "its keys, indexes, checks, defaults or triggers carry extended properties",
+        },
+        Arm {
+            table: "g_ixdoc",
+            setup: &[
+                "CREATE INDEX ix_g_ixdoc ON dbo.g_ixdoc (a)",
+                "EXEC sp_addextendedproperty N'MS_Description', N'by a', \
+                 N'SCHEMA', N'dbo', N'TABLE', N'g_ixdoc', N'INDEX', N'ix_g_ixdoc'",
+            ],
+            after: &[],
+            says: "its keys, indexes, checks, defaults or triggers carry extended properties",
+        },
+        Arm {
+            table: "g_trdoc",
+            setup: &[
+                "CREATE TRIGGER dbo.tr_g_trdoc ON dbo.g_trdoc AFTER INSERT AS SET NOCOUNT ON",
+                "EXEC sp_addextendedproperty N'MS_Description', N'audits', \
+                 N'SCHEMA', N'dbo', N'TABLE', N'g_trdoc', N'TRIGGER', N'tr_g_trdoc'",
+            ],
+            after: &[],
+            says: "its keys, indexes, checks, defaults or triggers carry extended properties",
+        },
+        Arm {
+            table: "g_ff",
+            setup: &["CREATE INDEX ix_g_ff ON dbo.g_ff (a) WITH (FILLFACTOR = 70)"],
+            after: &[],
+            says: "an index sets a fill factor, padding, IGNORE_DUP_KEY or row or page locks",
+        },
+        Arm {
+            table: "g_off",
+            setup: &[
+                "CREATE INDEX ix_g_off ON dbo.g_off (a)",
+                "ALTER INDEX ix_g_off ON dbo.g_off DISABLE",
+            ],
+            after: &[],
+            says: "or is disabled",
+        },
+        Arm {
+            table: "g_sparse",
+            setup: &["ALTER TABLE dbo.g_sparse ADD s int SPARSE NULL"],
+            after: &[],
+            says: "a column is sparse, a column set, hidden",
+        },
+        Arm {
+            table: "g_fk",
+            setup: &[
+                "CREATE TABLE dbo.g_fk_p (id int PRIMARY KEY)",
+                "ALTER TABLE dbo.g_fk WITH NOCHECK ADD CONSTRAINT fk_g_fk FOREIGN KEY (b) \
+                 REFERENCES dbo.g_fk_p (id)",
+            ],
+            after: &[],
+            says: "a foreign key on it or to it is disabled, untrusted or NOT FOR REPLICATION",
+        },
+        Arm {
+            table: "g_stale",
+            setup: &[],
+            after: &["CREATE TRIGGER dbo.tr_g_stale ON dbo.g_stale AFTER INSERT AS SET NOCOUNT ON"],
+            says: "changed since it was read",
+        },
+    ];
+    for arm in arms {
+        let t = arm.table;
+        s.exec(&format!(
+            "CREATE TABLE dbo.{t} (id int NOT NULL CONSTRAINT pk_{t} PRIMARY KEY, \
+             a int NULL, b int NULL); INSERT dbo.{t} (id, a, b) VALUES (1, 2, 3)"
+        ))
+        .await;
+        for sql in arm.setup {
+            s.exec(sql).await;
+        }
+        let current = read_table(&s, t).await;
+        for sql in arm.after {
+            s.exec(sql).await;
+        }
+        let mut d = TableDraft::from_table(&current);
+        d.columns.swap(1, 2);
+        let refused = refused_draft(&s, &current, &d).await;
+        assert!(refused.contains(arm.says), "{t}: {refused}");
+        assert_eq!(
+            s.scalar(&format!(
+                "SELECT CONCAT(STRING_AGG(c.name, ',') WITHIN GROUP (ORDER BY c.column_id), \
+                 ':', (SELECT COUNT(*) FROM dbo.{t})) FROM sys.columns c \
+                 WHERE c.object_id = OBJECT_ID(N'dbo.{t}') AND c.name IN ('id', 'a', 'b')"
+            ))
+            .await,
+            "id,a,b:1",
+            "{t} unchanged"
+        );
+    }
+}

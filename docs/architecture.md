@@ -3912,15 +3912,34 @@ existing prose was left alone.
     not read and the `DROP TABLE` would take with it: permissions granted on it; a schema-bound
     dependent; system versioning, memory optimisation, replication, change data capture or a lock
     escalation setting; change tracking or a full-text index; partitioning, compression or a
-    filegroup other than the default; an extended property other than `MS_Description`; an index
-    option (fill factor, padding, `IGNORE_DUP_KEY`, row or page locks); a sparse, column-set,
+    filegroup other than the default; an extended property on the table or its columns other than
+    `MS_Description`; **any** extended property on what stands on the table — class 1 on an object
+    whose `parent_object_id` is the table (its key, default and check constraints, its triggers) or
+    class 7 on its indexes — a description included; an index option (fill factor, padding,
+    `IGNORE_DUP_KEY`, row or page locks) or a disabled index; a sparse, column-set,
     `FILESTREAM`, `ROWGUIDCOL`, masked, encrypted, XML-schema-typed or hidden column; a foreign key
     on it or to it that is disabled, untrusted or `NOT FOR REPLICATION`, or a check or an identity
     that is; and a count of its indexes, own keys, inbound keys, checks or triggers that no longer
     matches the reading the draft was made from. The alternative to each is a plan that succeeds
     and reports nothing lost. The schema-bound test leaves out objects whose parent is the table
     itself, because a check or default constraint is an object of its own, schema-bound to the
-    table it stands on — found live. (2) The default constraints' names, captured into the session
+    table it stands on — found live. **The arm about what stands on the table is the one that
+    looked covered and was not** (S3.2-L5-03): the table's arm read class 1 on the table's own id
+    alone, but a constraint's or a trigger's property sits on *its own* object id and an index's
+    is class 7, so none of them was seen — and the model reads only the table's and its columns'
+    comments, so an AdventureWorks-style schema with an `MS_Description` on every key and index
+    lost all of them on any column move, measured live on 2022, while the risk line promised that
+    "comments" came back. A disabled index is refused beside the index options because
+    `CREATE INDEX` builds it: it came back enabled. **Every arm is run live** by
+    `every_arm_of_the_rebuild_guard_refuses_its_table` (S3.2-L6-01) — one scratch table per arm,
+    the smallest that trips it, its columns swapped, the plan refused with that arm's reason and the
+    table left with its columns in order and its row kept. Before it nine of the then ten arms had
+    never run under a test, and an arm whose catalogue predicate is wrong fails open without a
+    sound, which is what the one above did; its four cases for the widening — a description on the
+    key, on an index and on a trigger, and the disabled index — were red, the plan applied, before
+    it, and it is green on 2022 and 2025. Full-text and
+    memory-optimised tables are not in it: the containers have no full-text service and no
+    memory-optimised filegroup. (2) The default constraints' names, captured into the session
     temp table `#schemaic_rebuild_defaults` (`TSQL_REBUILD_DEFAULTS`), since the model reads a
     default's value and not its name, and one put back as `DF__t__a__5EBF139D` is not the one
     scripts and a schema compare name; a `#` table because `run_ddl`'s one connection carries it
@@ -4008,10 +4027,16 @@ existing prose was left alone.
     was, which a rename leaves behind. The guard is the half only the server can answer.
     `Change::risks` has a SQL Server arm saying what is put back, that the plan stops first on what
     isn't, and the one thing neither half sees — statistics created by hand are not carried over —
-    and `Change::summary` for a rebuild is engine-neutral now. The unit pins are
+    and `Change::summary` for a rebuild is engine-neutral now. What it says is put back is named
+    whole — the keys, indexes, checks, defaults and triggers, *its own and its columns'* comments,
+    and the foreign keys other tables have on it — and what stops it includes a disabled index and
+    a description on a key, index, default, check or trigger, because a bare "comments" was the promise
+    S3.2-L5-03 found broken. The unit pins are
     `sql_server_rebuilds_what_alter_column_cannot`,
-    `a_sql_server_rebuild_copies_into_an_identity_and_fills_a_new_column` and
-    `a_sql_server_rebuild_refuses_what_it_cannot_put_back`; the live ones are under `mssql.rs`.
+    `a_sql_server_rebuild_copies_into_an_identity_and_fills_a_new_column`,
+    `a_sql_server_rebuild_refuses_what_it_cannot_put_back` and
+    `the_rebuild_guard_refuses_what_stands_on_the_table_that_it_would_drop`; the live ones are
+    under `mssql.rs`.
     `TableDraft` (the desired table; column/index/FK
     entries each carry the name they had on the server, which is what tells a *rename*
     from a drop-plus-add) → `diff(current, draft, dialect) -> ChangeSet` → `emit()`.
@@ -12680,7 +12705,9 @@ existing prose was left alone.
   `mssql.rs` above), `run_ddl` and the designer's plans (from a designed table and a
   failing plan rolled back whole to an existing table's edit landing as drafted, an edit keeping
   what it did not change, an identity toggle withheld over an index the rebuild cannot restate, a
-  table rebuilt three ways and refused once by the rebuild's guard, an in-place change refused by
+  table rebuilt three ways and refused once by the rebuild's guard, then by each of its arms in
+  turn (`every_arm_of_the_rebuild_guard_refuses_its_table`, fifteen tables, under the rebuild in
+  `ddl.rs` above), an in-place change refused by
   its own guard over a masked or sparse column and over a dependent a retype would re-create
   without what it carries, eight cases (`a_masked_or_sparse_column_is_not_altered_in_place`,
   `a_retype_is_refused_where_a_dependent_carries_what_it_would_drop`), the views and inline function

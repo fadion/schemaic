@@ -3365,11 +3365,13 @@ impl Change {
                 // cannot see is the statistics made by hand.
                 SqlDialect::MsSql => format!(
                     "Drops {} and recreates it, copying every row across, and puts back its \
-                     keys, indexes, checks, defaults, comments and triggers and the foreign \
-                     keys other tables have on it. It stops before it starts if the table has \
-                     anything else Schemaic doesn't restate — permissions, a schema-bound \
-                     dependent, system versioning, replication, compression, index options. \
-                     Statistics created by hand are not carried over.",
+                     keys, indexes, checks, defaults and triggers, its own and its columns' \
+                     comments, and the foreign keys other tables have on it. It stops before \
+                     it starts if the table has anything else Schemaic doesn't restate — \
+                     permissions, a schema-bound dependent, system versioning, replication, \
+                     compression, index options, a disabled index, a description on a key, \
+                     index, default, check or trigger. Statistics created by hand are not \
+                     carried over.",
                     r.current.name
                 ),
                 SqlDialect::Sqlite | SqlDialect::MySql | SqlDialect::Postgres => format!(
@@ -11613,7 +11615,10 @@ fn tsql_server_filled(c: &ColumnInfo) -> bool {
 ///    permissions granted on it, a schema-bound dependent, system versioning,
 ///    memory optimisation, replication or change tracking, a partition scheme
 ///    or a filegroup other than the default, compression, an extended property
-///    other than its comments, an index option, a column feature (sparse,
+///    other than its comments, any extended property on its keys, indexes,
+///    defaults, checks or triggers (a description included — the model reads
+///    only the table's and its columns'), an index option or a disabled index
+///    (a `CREATE INDEX` builds it), a column feature (sparse,
 ///    `FILESTREAM`, `ROWGUIDCOL`, masking, encryption, an XML schema), a
 ///    disabled, untrusted or `NOT FOR REPLICATION` key — and a count of its
 ///    indexes, keys, checks and triggers that no longer matches the reading
@@ -11723,11 +11728,24 @@ pub fn tsql_rebuild_sql(current: &TableInfo, draft: &TableDraft) -> Vec<String> 
             "it carries extended properties other than its comments",
         ),
         (
+            // What stands on it is an object of its own: a key's, a default's,
+            // a check's and a trigger's properties are class 1 on *their* ids,
+            // an index's class 7 — and the model reads none of them, comments
+            // included.
+            "EXISTS (SELECT 1 FROM sys.extended_properties e JOIN sys.objects o \
+             ON o.object_id = e.major_id WHERE e.class = 1 AND o.parent_object_id = @t) \
+             OR EXISTS (SELECT 1 FROM sys.extended_properties e WHERE e.class = 7 AND e.major_id = @t)"
+                .into(),
+            "its keys, indexes, checks, defaults or triggers carry extended properties, \
+             comments included",
+        ),
+        (
             "EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = @t AND index_id > 0 \
              AND (fill_factor NOT IN (0, 100) OR ignore_dup_key = 1 OR is_padded = 1 \
-             OR allow_row_locks = 0 OR allow_page_locks = 0))"
+             OR allow_row_locks = 0 OR allow_page_locks = 0 OR is_disabled = 1))"
                 .into(),
-            "an index sets a fill factor, padding, IGNORE_DUP_KEY or row or page locks",
+            "an index sets a fill factor, padding, IGNORE_DUP_KEY or row or page locks, \
+             or is disabled",
         ),
         (
             "EXISTS (SELECT 1 FROM sys.columns WHERE object_id = @t AND (is_sparse = 1 \
@@ -15931,6 +15949,33 @@ mod tests {
         let refused = diff(&t, &d, MsSql).unsupported();
         assert_eq!(refused.len(), 2, "{refused:?}");
         assert!(refused[0].contains("ix_inc") && refused[1].contains("tr_p"));
+    }
+
+    /// **The rebuild's guard sees what stands on the table, not only the
+    /// table** (S3.2-L5-03): a description on the key, an index, a default, a
+    /// check or a trigger is an extended property of *that* object — class 1
+    /// on its own id, or class 7 on the index — which the `DROP TABLE` takes
+    /// and the model never read; and a disabled index comes back built. The
+    /// preview's risk line no longer promises comments it cannot keep.
+    #[test]
+    fn the_rebuild_guard_refuses_what_stands_on_the_table_that_it_would_drop() {
+        let t = ms_rebuild_table();
+        let mut d = TableDraft::from_table(&t);
+        d.columns.swap(1, 2);
+        let cs = diff(&t, &d, MsSql);
+        let guard = &cs.emit()[0];
+        for needle in [
+            "o.parent_object_id = @t",
+            "e.class = 7 AND e.major_id = @t",
+            "is_disabled = 1",
+            "or is disabled",
+            "its keys, indexes, checks, defaults or triggers carry extended properties",
+        ] {
+            assert!(guard.contains(needle), "{needle} not in {guard}");
+        }
+        let risk = cs.destructive().join(" ");
+        assert!(risk.contains("its own and its columns' comments"), "{risk}");
+        assert!(risk.contains("a disabled index"), "{risk}");
     }
 
     /// **A rebuild refreshes what selects `*` from the table** (R3-L5-02): a
