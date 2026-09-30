@@ -4723,6 +4723,38 @@ impl Catalog {
         }
     }
 
+    /// The reference to judge a three-part name by — `r` names a table (and,
+    /// in `r.db`, a schema, `None` for `db..t`'s default one) in `database`.
+    ///
+    /// In the active database the schema-qualified (or bare) `r` itself; in
+    /// another loaded one, that database's table of the same name, whatever
+    /// its schema — the catalogue keys a database's tables by name, which can
+    /// only miss a mismatched schema, never invent a missing table. `None`
+    /// for a database this catalogue has not loaded, which nothing can judge.
+    fn in_database(&self, database: &str, r: &TableRef) -> Option<TableRef> {
+        let db = database.to_ascii_lowercase();
+        if self.active_db.as_deref() == Some(db.as_str()) {
+            Some(r.clone())
+        } else if self.loaded_dbs.contains(&db) {
+            Some(TableRef {
+                db: Some(database.to_string()),
+                ..r.clone()
+            })
+        } else {
+            None
+        }
+    }
+
+    /// A [`LocatedRef`] as the plain reference the other questions take —
+    /// through [`Catalog::in_database`] for a three-part name. `None` when
+    /// it cannot be judged.
+    fn resolve_located(&self, l: &LocatedRef) -> Option<TableRef> {
+        match &l.database {
+            None => Some(l.r.clone()),
+            Some(db) => self.in_database(db, &l.r),
+        }
+    }
+
     /// The columns of a resolved table reference, if known.
     fn columns_of(&self, r: &TableRef) -> Option<&Vec<String>> {
         match &r.db {
@@ -4846,16 +4878,88 @@ fn insert_precedes(toks: &[Token], i: usize) -> bool {
     prev.is_some_and(is_insert) || leading.is_some_and(is_insert)
 }
 
+/// The dotted name starting at `toks[i]` — `t`, `db.t`, `db.schema.t`, T-SQL's
+/// `db..t` or longer — as its parts, each with its token's span, and the index
+/// just past it. A part `..` leaves out (the default schema) is an empty
+/// string. `None` when `toks[i]` is not a word; a trailing `.` with nothing
+/// after it — a qualifier still being typed — is not consumed.
+#[allow(clippy::type_complexity)]
+fn dotted_name(toks: &[Token], i: usize) -> Option<(Vec<(String, (usize, usize))>, usize)> {
+    let word = |j: usize| match toks.get(j).map(|t| &t.kind) {
+        Some(TkKind::Word(w)) => Some((w.clone(), (toks[j].at, toks[j].end))),
+        _ => None,
+    };
+    let dot = |j: usize| matches!(toks.get(j).map(|t| &t.kind), Some(TkKind::Dot));
+    let mut parts = vec![word(i)?];
+    let mut j = i + 1;
+    loop {
+        if dot(j)
+            && let Some(p) = word(j + 1)
+        {
+            parts.push(p);
+            j += 2;
+        } else if dot(j)
+            && dot(j + 1)
+            && let Some(p) = word(j + 2)
+        {
+            parts.push((String::new(), (toks[j].end, toks[j].end)));
+            parts.push(p);
+            j += 3;
+        } else {
+            return Some((parts, j));
+        }
+    }
+}
+
+/// One table reference [`located_table_refs`] found: the reference, the span
+/// of its table-name token, and — for a three-part `db.schema.t` or `db..t` —
+/// the database it names, which [`Catalog::in_database`] resolves against.
+/// `r.db` then holds the schema (`None` for `..`).
+struct LocatedRef {
+    r: TableRef,
+    pos: (usize, usize),
+    database: Option<String>,
+}
+
+impl LocatedRef {
+    /// The qualifier as the user wrote it, for a message: `company.dbo`,
+    /// `company` for `company..t`, `dbo` for `dbo.t`.
+    fn written_qualifier(&self) -> Option<String> {
+        match (&self.database, &self.r.db) {
+            (Some(db), Some(schema)) => Some(format!("{db}.{schema}")),
+            (Some(db), None) => Some(db.clone()),
+            (None, q) => q.clone(),
+        }
+    }
+}
+
 /// All FROM/JOIN/UPDATE/INTO table references in `sql[lo..hi]`, each with the byte
 /// range of its *table-name* token (positions the AST can't reliably give). Unlike
 /// [`lexer_scope`] this ignores paren scoping — for a parsed statement we want
-/// every table reference in it.
+/// every table reference in it. A three-part name's database is dropped here —
+/// see [`located_table_refs`] for the whole answer.
 fn table_refs_with_pos(
     sql: &str,
     lo: usize,
     hi: usize,
     dialect: SqlDialect,
 ) -> Vec<(TableRef, (usize, usize))> {
+    located_table_refs(sql, lo, hi, dialect)
+        .into_iter()
+        .map(|l| (l.r, l.pos))
+        .collect()
+}
+
+/// [`table_refs_with_pos`] with each three-part name's database kept
+/// ([`LocatedRef`]).
+///
+/// **A T-SQL three-part name is `database.schema.table`**, and the scan took
+/// one optional `.name`, so `company.dbo.employees` read as the table `dbo`
+/// in `company` — a red ``Table `dbo` not found in `company`` on a query
+/// that runs — and `tempdb..#t` as the table `tempdb`. A name of four parts
+/// or more (a linked server's) is consumed and not registered: nothing here
+/// can judge it.
+fn located_table_refs(sql: &str, lo: usize, hi: usize, dialect: SqlDialect) -> Vec<LocatedRef> {
     let toks = tokenize_range(sql, lo, hi, dialect);
     let calls = enclosing_calls(&toks);
     let word = |k: &TkKind| -> Option<String> {
@@ -4908,24 +5012,28 @@ fn table_refs_with_pos(
             continue;
         }
         i += 1;
-        while let Some(mut name) = toks.get(i).and_then(|t| word(&t.kind)) {
-            if is_reserved_word(&name, dialect) {
+        while let Some(first) = toks.get(i).and_then(|t| word(&t.kind)) {
+            if is_reserved_word(&first, dialect) {
                 break;
             }
-            // The token's own span, not `at + name.len()`: `name` is the
-            // *unquoted* text, so recomputing underlines `"NoSuchTb` for a
-            // quoted identifier.
-            let mut pos = (toks[i].at, toks[i].end);
-            let mut db = None;
-            i += 1;
-            if matches!(toks.get(i).map(|t| &t.kind), Some(TkKind::Dot))
-                && let Some(second) = toks.get(i + 1).and_then(|t| word(&t.kind))
-            {
-                db = Some(name);
-                name = second;
-                pos = (toks[i + 1].at, toks[i + 1].end);
-                i += 2;
-            }
+            let Some((mut parts, next)) = dotted_name(&toks, i) else {
+                break;
+            };
+            i = next;
+            // The last part is the table, positioned by its token's own span,
+            // not `at + name.len()`: `name` is the *unquoted* text, so
+            // recomputing underlines `"NoSuchTb` for a quoted identifier.
+            let (name, pos) = parts.pop().unwrap_or_default();
+            // A linked server's four-part name: nothing to judge it by.
+            let judged = parts.len() <= 2;
+            let (db, database) = match parts.len() {
+                0 => (None, None),
+                1 => (parts.pop().map(|p| p.0), None),
+                _ => {
+                    let schema = parts.pop().map(|p| p.0).filter(|s| !s.is_empty());
+                    (schema, parts.pop().map(|p| p.0))
+                }
+            };
             let mut alias = None;
             match toks.get(i).map(|t| &t.kind) {
                 Some(TkKind::Word(a)) if a.eq_ignore_ascii_case("AS") => {
@@ -4951,7 +5059,13 @@ fn table_refs_with_pos(
                 }
                 _ => {}
             }
-            out.push((TableRef { name, alias, db }, pos));
+            if judged {
+                out.push(LocatedRef {
+                    r: TableRef { name, alias, db },
+                    pos,
+                    database,
+                });
+            }
             if is_from && matches!(toks.get(i).map(|t| &t.kind), Some(TkKind::Comma)) {
                 i += 1;
                 continue;
@@ -6256,10 +6370,10 @@ fn declaring_contexts(toks: &[Token], dialect: SqlDialect) -> Vec<bool> {
             TkKind::Word(w) if !t.quoted => {
                 let up = w.to_ascii_uppercase();
                 let declares = matches!(up.as_str(), "DECLARE" | "CREATE" | "ALTER");
-                if declares || heads.contains(&up.as_str()) {
-                    if let Some(slot) = open.last_mut() {
-                        *slot = Some(declares);
-                    }
+                if (declares || heads.contains(&up.as_str()))
+                    && let Some(slot) = open.last_mut()
+                {
+                    *slot = Some(declares);
                 }
             }
             _ => {}
@@ -6454,13 +6568,8 @@ fn alias_checks(sql: &str, lo: usize, hi: usize, dialect: SqlDialect, out: &mut 
             if is_reserved_word(&name, dialect) {
                 break; // a clause keyword, not a table name (`FROM WHERE …` etc.)
             }
-            i += 1;
-            // Optional `db.table`.
-            if matches!(toks.get(i).map(|t| &t.kind), Some(TkKind::Dot))
-                && toks.get(i + 1).and_then(|t| word(&t.kind)).is_some()
-            {
-                i += 2;
-            }
+            // The whole dotted name: `db.table`, `db.schema.table`, `db..table`.
+            i = dotted_name(&toks, i).map_or(i + 1, |(_, next)| next);
             // A `;` after the name ended the statement: what follows is the
             // next one's first word, not an alias.
             if toks.get(i).is_some_and(|t| t.after_semicolon) {
@@ -6562,19 +6671,23 @@ fn table_existence_checks(
         }
         _ => HashSet::new(),
     };
-    for (r, pos) in table_refs_with_pos(sql, lo, hi, dialect) {
-        if (r.db.is_none() && ctes.contains(&r.name.to_ascii_lowercase()))
-            || is_session_source(&r, dialect)
+    for l in located_table_refs(sql, lo, hi, dialect) {
+        let bare = l.r.db.is_none() && l.database.is_none();
+        if (bare && ctes.contains(&l.r.name.to_ascii_lowercase()))
+            || is_session_source(&l.r, dialect)
         {
             continue;
         }
+        let Some(r) = catalog.resolve_located(&l) else {
+            continue;
+        };
         if let TableStatus::NotFound = catalog.table_status(&r) {
-            let where_db =
-                r.db.as_deref()
-                    .map(|d| format!(" in `{d}`"))
-                    .unwrap_or_default();
+            let where_db = l
+                .written_qualifier()
+                .map(|d| format!(" in `{d}`"))
+                .unwrap_or_default();
             out.push(Diagnostic {
-                range: pos,
+                range: l.pos,
                 severity: Severity::Error,
                 message: format!("Table `{}` not found{where_db}", r.name),
             });
@@ -6593,7 +6706,11 @@ fn qualified_column_checks(
     dialect: SqlDialect,
     out: &mut Vec<Diagnostic>,
 ) {
-    let refs = table_refs_with_pos(sql, lo, hi, dialect);
+    // A three-part name resolves through its database, or not at all.
+    let refs: Vec<(TableRef, (usize, usize))> = located_table_refs(sql, lo, hi, dialect)
+        .into_iter()
+        .filter_map(|l| catalog.resolve_located(&l).map(|r| (r, l.pos)))
+        .collect();
     let toks = tokenize_range(sql, lo, hi, dialect);
     for w in toks.windows(3) {
         let (TkKind::Word(q), TkKind::Dot, TkKind::Word(col)) =
@@ -7340,9 +7457,22 @@ mod colres {
                     return;
                 }
                 let parts: Vec<String> = super::object_name_parts(name);
-                let (db, tname) = match parts.as_slice() {
-                    [t] => (None, t.clone()),
-                    [.., d, t] => (Some(d.clone()), t.clone()),
+                // `db.schema.t` (and `db..t`, whose schema part is empty) is
+                // judged through its database — see `Catalog::in_database` —
+                // and anything longer is a linked server's, which nothing
+                // here can judge.
+                let (db, tname, database) = match parts.as_slice() {
+                    [t] => (None, t.clone(), None),
+                    [d, t] => (Some(d.clone()), t.clone(), None),
+                    [database, schema, t] => (
+                        Some(schema.clone()).filter(|s| !s.is_empty()),
+                        t.clone(),
+                        Some(database.clone()),
+                    ),
+                    [_, _, _, _, ..] => {
+                        sources.push(open_src());
+                        return;
+                    }
                     [] => return,
                 };
                 let alias_name = alias.as_ref().map(|a| a.name.value.clone());
@@ -7360,6 +7490,7 @@ mod colres {
                 let shadowed = alias_name.as_ref().map(|_| tname.to_ascii_lowercase());
                 // A bare name matching a CTE resolves to the CTE's columns.
                 if db.is_none()
+                    && database.is_none()
                     && let Some((cols, body)) = ctes.get(&tname.to_ascii_lowercase())
                 {
                     sources.push(Src {
@@ -7376,13 +7507,17 @@ mod colres {
                     alias: alias_name,
                     db,
                 };
-                let cols = match catalog.table_status(&tref) {
+                let resolved = match &database {
+                    None => Some(tref),
+                    Some(d) => catalog.in_database(d, &tref),
+                };
+                let cols = match resolved.as_ref().map(|r| (catalog.table_status(r), r)) {
                     // The engine's undeclared columns join the introspected ones, so
                     // `rowid` on SQLite resolves through the same scope walk as a real
                     // column — including the ambiguity count, which is what SQLite
                     // itself reports for `rowid` over two tables.
-                    TableStatus::Found => catalog
-                        .columns_of(&tref)
+                    Some((TableStatus::Found, tref)) => catalog
+                        .columns_of(tref)
                         .map(|c| {
                             Cols::Known(
                                 c.iter()
@@ -13019,6 +13154,12 @@ mod tests {
             "CREATE PROCEDURE dbo.p @x AS int = 1, @y AS varchar(10) OUTPUT AS RETURN;",
             "DECLARE @t AS TABLE (a int);",
             "DECLARE @n int = (SELECT 1), @t AS TABLE (a int);",
+            // Three-part names and the default-schema `..` (S8-L1-06).
+            "SELECT id FROM company.dbo.employees;",
+            "SELECT e.id FROM company.dbo.employees e WHERE e.name = N'x';",
+            "SELECT id FROM tempdb..#t;",
+            "SELECT id FROM company..employees;",
+            "SELECT id FROM otherdb.dbo.anything;",
         ]
         .into_iter()
         .map(|sql| (sql, diag_d(sql, SqlDialect::MsSql)))
@@ -13143,6 +13284,53 @@ mod tests {
             diag_d("SELECT id FROM nosuchtable;", SqlDialect::MsSql)
                 .iter()
                 .any(|x| x.message.contains("not found"))
+        );
+    }
+
+    /// **A T-SQL three-part name is `database.schema.table`.** It was read as
+    /// `database.table`, so `company.dbo.employees` was ``Table `dbo` not
+    /// found in `company`` while the active database was `company`. Against a
+    /// catalogue that records the schema, a missing table is still reported,
+    /// under the database and schema it was looked for in.
+    #[test]
+    fn a_three_part_name_is_database_schema_table() {
+        let schema = DbSchema {
+            tables: vec![tbl_in("dbo", "employees", &["id", "name"])],
+            ..Default::default()
+        };
+        let cat = Catalog::build(&[("company", &schema)], Some("company"));
+        let d = |sql: &str| diagnostics(sql, &cat, SqlDialect::MsSql);
+        for sql in [
+            "SELECT id FROM company.dbo.employees;",
+            "SELECT e.name FROM company.dbo.employees e;",
+            "SELECT id FROM company..employees;",
+            "SELECT id FROM dbo.employees;",
+            // A schema this catalogue does not know, or another database,
+            // cannot be judged.
+            "SELECT id FROM company.sales.anything;",
+            "SELECT id FROM otherdb.dbo.anything;",
+            "SELECT id FROM srv.company.dbo.anything;",
+        ] {
+            assert!(d(sql).is_empty(), "{sql}: {:?}", d(sql));
+        }
+        let messages =
+            |sql: &str| -> Vec<String> { d(sql).into_iter().map(|x| x.message).collect() };
+        // The alias slot after a three-part name is still checked.
+        assert_eq!(
+            messages("SELECT id FROM company.dbo.employees or WHERE id = 1;"),
+            ["`or` is a reserved keyword and can't be used as an alias (quote it with brackets)"]
+        );
+        assert_eq!(
+            messages("SELECT id FROM company.dbo.nosuch;"),
+            ["Table `nosuch` not found in `company.dbo`"]
+        );
+        assert_eq!(
+            messages("SELECT id FROM company..nosuch;"),
+            ["Table `nosuch` not found in `company`"]
+        );
+        assert_eq!(
+            messages("SELECT e.nope FROM company.dbo.employees e;"),
+            ["Column `nope` not found in `employees`"]
         );
     }
 

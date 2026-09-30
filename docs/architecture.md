@@ -935,7 +935,17 @@ existing prose was left alone.
     sigil kept, `as_declares_a_type` passes the `AS` of `DECLARE @t AS TABLE (…)` (`TABLE` is
     reserved): the word before it is a variable and the nearest statement head is `DECLARE`,
     `CREATE` or `ALTER` (`declaring_contexts`, one forward pass), so `SELECT @x AS order` is still
-    flagged (`t_sql_prefixed_names_are_exempt_and_nothing_else_is`). The error's remedy
+    flagged (`t_sql_prefixed_names_are_exempt_and_nothing_else_is`).
+    **A T-SQL three-part name is `database.schema.table`**, and the scanners took one optional
+    `.name`, so `company.dbo.employees` was ``Table `dbo` not found in `company``` and
+    `tempdb..#t` the table `tempdb`. `dotted_name` reads every part (`..`'s missing schema an empty
+    one); `located_table_refs` keeps a three-part name's database beside the reference
+    (`LocatedRef`), and `Catalog::in_database` judges it — in the active database as the
+    schema-qualified (or, for `..`, bare) name, in another loaded one as that database's table of
+    the same name whatever its schema (which can miss a wrong schema but never invent a missing
+    table), and not at all in one never loaded. `colres` asks the same of the AST's parts, and a
+    linked server's four-part name is judged by nothing (`a_three_part_name_is_database_schema_table`).
+    The error's remedy
     names the engine's quote (backticks, double quotes, brackets); it said "backticks" on every
     engine, advice neither PostgreSQL nor SQL Server accepts
     (`a_reserved_alias_error_names_this_engines_quote`).
