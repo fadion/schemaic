@@ -9052,9 +9052,16 @@ mod tests {
     /// already records — "a completion popup that goes blank on a name the user
     /// quoted".
     ///
-    /// The two are not merged, and should not be: the `doubled` flag and the
-    /// asymmetric `]` close are `ident_quote`'s own, and belong to it. This
-    /// turns them into one *checked* fact instead.
+    /// The two are not merged, and should not be: the asymmetric `]` close is
+    /// `ident_quote`'s own, and belongs to it. This turns them into one
+    /// *checked* fact instead.
+    ///
+    /// **The `doubled` flag is no longer `ident_quote`'s alone**: whether `]]`
+    /// stands for a `]` inside `[…]` is also `SqlDialect::bracket_doubles`,
+    /// which the lexer asks. Were the two to disagree, `skip_noncode` would end
+    /// `[a]]b]` at one `]` while the tokenizer lifted the name out to the
+    /// other — the same blank popup, on the doubling half — so the flag is
+    /// compared too.
     #[test]
     fn the_two_quote_tables_agree_for_every_dialect_and_byte() {
         for d in DIALECTS {
@@ -9070,6 +9077,11 @@ mod tests {
                     open as char
                 );
             }
+            assert_eq!(
+                ident_quote(d, b'[').map(|(_, doubled)| doubled),
+                d.bracket_ident().then(|| d.bracket_doubles()),
+                "{d:?}: the two tables disagree on whether `]]` is a `]` inside `[…]`"
+            );
             // And nothing else opens one, on any dialect — the negative half,
             // so a table that said "yes" to everything would fail too.
             for open in *b"'(_a] " {
