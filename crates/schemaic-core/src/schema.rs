@@ -3399,10 +3399,24 @@ impl RoutineInfo {
             self.kind.sql_keyword()
         );
         let args = self.arguments.trim();
+        // A list kept verbatim may end in a `--` comment, which would run on
+        // over a `)` written after it on the same line — so that `)` goes on
+        // a line of its own. Asked of the shared lexer, as `create_view_sql`
+        // asks it before a `;`. A procedure's list is followed by a newline
+        // already.
+        let close = if !args.is_empty()
+            && crate::pairs::region_at(args, args.len() - 1, d) == crate::pairs::Region::Comment
+        {
+            "\n)"
+        } else {
+            ")"
+        };
         let mut out = match self.kind {
             RoutineKind::Procedure if args.is_empty() => head,
             RoutineKind::Procedure => format!("{head}\n    {args}"),
-            RoutineKind::Function => format!("{head} ({args})\nRETURNS {}", self.returns.trim()),
+            RoutineKind::Function => {
+                format!("{head} ({args}{close}\nRETURNS {}", self.returns.trim())
+            }
         };
         if !self.tsql.options.is_empty() {
             let opts: Vec<String> = self.tsql.options.iter().map(|o| o.sql()).collect();

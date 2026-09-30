@@ -2079,6 +2079,51 @@ async fn a_parameter_declared_with_as_reads_and_rebuilds_whole() {
     );
 }
 
+/// **A function whose parameter list ends in a `--` comment rebuilds into a
+/// statement the server takes.** Written back on one line, the comment
+/// swallowed the list's `)` (Msg 102) on every edit, Copy DDL and dump.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_parameter_list_ending_in_a_comment_rebuilds_and_replays() {
+    use schemaic_core::ddl::{RoutineDraft, diff_routine};
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("ddl_param_comment").await;
+    s.exec(
+        "CREATE FUNCTION dbo.f (\n  @a int -- the input\n)\nRETURNS int\nAS\nBEGIN RETURN @a END",
+    )
+    .await;
+    let f = || {
+        let db = s.db.clone();
+        let name = s.name.clone();
+        async move {
+            db.fetch_schema(&name, CancellationToken::new())
+                .await
+                .expect("the schema")
+                .routines
+                .iter()
+                .find(|r| r.name == "f")
+                .expect("f")
+                .as_ref()
+                .clone()
+        }
+    };
+    let cur = f().await;
+    assert!(cur.is_editable());
+    let mut d = RoutineDraft::from_info(&cur);
+    d.info.body = "BEGIN RETURN @a * 2 END".into();
+    let stmts = diff_routine(&cur, &d, MS).emit();
+    s.db.run_ddl(&s.name, &stmts, CancellationToken::new())
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{stmts:#?}"));
+    assert_eq!(s.scalar("SELECT dbo.f(21)").await, "42");
+
+    let ddl = schemaic_core::schema::ObjectItem::Routine(Arc::new(f().await)).create_sql(MS);
+    s.exec("DROP FUNCTION dbo.f").await;
+    replay(&s, &ddl).await;
+    assert_eq!(s.scalar("SELECT dbo.f(4)").await, "8");
+}
+
 /// **A numbered procedure group survives every plan the editor can build for
 /// its head.** `grp` is listed once and its text holds no `;`, so only
 /// `sys.numbered_procedures` shows `grp;2`: it is read, an edit in place keeps

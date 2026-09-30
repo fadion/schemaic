@@ -7872,6 +7872,13 @@ existing prose was left alone.
     has to be the statement that runs — the trigger arm's reasoning above, and its trade: text
     outside the body is the rebuilt spelling, not the stored one. The result reads back through
     `ddl::tsql_routine_parts` as the same parts (`a_sql_server_routine_is_written_from_its_parts`).
+    **A function's list that ends inside a `--` comment closes on a line of its own**, asked of
+    `pairs::region_at` as `create_view_sql` asks before its `;`: the list is kept verbatim, comment
+    and all, and written as `(@a int -- the input)` the comment swallowed the `)`, so every edit,
+    Copy DDL and dump of such a function was refused (Msg 102, measured on SQL Server 2022)
+    (`a_parameter_list_ending_in_a_line_comment_keeps_its_close`; live,
+    `a_parameter_list_ending_in_a_comment_rebuilds_and_replays`). A procedure's list is followed by
+    a newline already.
     **`RoutineInfo::tsql` (`TsqlRoutine`) is what the shared model lacked**, on the same "restate it
     or it resets" rule: `options`, a `Vec<TsqlRoutineOption>` (`Recompile`, `SchemaBinding`,
     `NativeCompilation`, `ReturnsNullOnNullInput`, `CalledOnNullInput`, `ExecuteAs`, and a scalar's

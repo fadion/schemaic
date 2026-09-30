@@ -26388,6 +26388,46 @@ mod tsql_routine_read_tests {
         );
     }
 
+    /// **A function's parameter list that ends in a `--` comment keeps its
+    /// `)`.** The list is kept verbatim, comment and all, and was written back
+    /// as `(@a int -- the input)` on one line, so the comment ran to the end of
+    /// the line and swallowed the `)`: every edit, Copy DDL and dump of such a
+    /// function was a statement the server refuses (Msg 102, measured on SQL
+    /// Server 2022). It closes on a line of its own now, and reads back as the
+    /// same parts.
+    #[test]
+    fn a_parameter_list_ending_in_a_line_comment_keeps_its_close() {
+        let stored = "CREATE FUNCTION dbo.f (\n  @a int -- the input\n)\nRETURNS int\nAS\nBEGIN RETURN @a END";
+        let p = parts(stored);
+        let f = RoutineInfo {
+            name: "f".into(),
+            schema: Some("dbo".into()),
+            kind: RoutineKind::Function,
+            arguments: p.arguments.clone(),
+            returns: p.returns.clone(),
+            body: p.body.clone(),
+            ..Default::default()
+        };
+        for or_alter in [false, true] {
+            let sql = f.create_sql(SqlDialect::MsSql, or_alter);
+            let back = parts(&sql);
+            assert_eq!(
+                (back.arguments, back.returns, back.body),
+                (p.arguments.clone(), p.returns.clone(), p.body.clone()),
+                "{sql}"
+            );
+        }
+        // A list with no comment stays on one line.
+        let f = RoutineInfo {
+            arguments: "@a int".into(),
+            ..f
+        };
+        assert!(
+            f.create_sql(SqlDialect::MsSql, false)
+                .starts_with("CREATE FUNCTION [dbo].[f] (@a int)\nRETURNS int")
+        );
+    }
+
     /// Refused, not dropped: `ENCRYPTION`, an unknown option, a numbered
     /// procedure (`p;2`), a CLR routine's `EXTERNAL NAME`, and anything that
     /// is not a routine's `CREATE`.
