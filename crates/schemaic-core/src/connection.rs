@@ -837,6 +837,25 @@ impl AuthMode {
         modes
     }
 
+    /// The mode that actually signs in on the engine `db_type`: this one where
+    /// [`Self::offered`] has it, and the password where it does not — a SQL
+    /// Server mode left on a connection switched to MySQL, or Windows read by a
+    /// build on another OS.
+    ///
+    /// **The one statement of the rule.** [`Connection::effective_auth`], the
+    /// MCP endpoint handoff (`schemaic_db::Db::with_auth`) and the connection
+    /// form's sign-in rows each wrote it out, and only the first was tested: a
+    /// change to one — a mode offered per build or per host — would have had
+    /// the form hide the password fields while the driver still sent one, or
+    /// the subprocess sign in unlike the app, with no test to notice.
+    pub fn in_force(self, db_type: &str) -> AuthMode {
+        if Self::offered(db_type).contains(&self) {
+            self
+        } else {
+            AuthMode::Password
+        }
+    }
+
     /// Does this mode sign in with the form's user and password?
     pub fn uses_credentials(self) -> bool {
         match self {
@@ -1155,13 +1174,10 @@ impl Connection {
     /// the engine**, as [`Self::default_database`] is: a SQL Server
     /// connection switched to MySQL keeps its mode with no control left that
     /// could unset it, and a Windows mode read by a build on another OS has no
-    /// identity to present. Either signs in with the password.
+    /// identity to present. Either signs in with the password
+    /// ([`AuthMode::in_force`]).
     pub fn effective_auth(&self) -> AuthMode {
-        if AuthMode::offered(&self.db_type).contains(&self.auth) {
-            self.auth
-        } else {
-            AuthMode::Password
-        }
+        self.auth.in_force(&self.db_type)
     }
 
     /// The whole path of a SQLite connection's file, empty for any other engine.
@@ -2159,6 +2175,47 @@ mod tests {
         assert!(!AuthMode::AzureCli.uses_credentials());
         for m in [AuthMode::Password, AuthMode::Windows, AuthMode::AzureCli] {
             assert!(!m.label().is_empty() && !m.label().ends_with('…'));
+        }
+    }
+
+    /// **The one rule for the mode in force**, which `effective_auth`, the
+    /// endpoint handoff (`Db::with_auth`) and the form's sign-in rows all ask:
+    /// an offered mode stands, and one the engine does not offer — a SQL
+    /// Server mode left on a MySQL connection, Windows in a build with no
+    /// Windows identity — signs in with the password.
+    #[test]
+    fn the_mode_in_force_is_an_offered_one_or_the_password() {
+        for engine in ["MySQL", "MariaDB", "PostgreSQL", "SQLite"] {
+            for m in [AuthMode::Password, AuthMode::Windows, AuthMode::AzureCli] {
+                assert_eq!(m.in_force(engine), AuthMode::Password, "{engine} {m:?}");
+            }
+        }
+        assert_eq!(
+            AuthMode::AzureCli.in_force("SQL Server"),
+            AuthMode::AzureCli
+        );
+        assert_eq!(
+            AuthMode::Password.in_force("SQL Server"),
+            AuthMode::Password
+        );
+        assert_eq!(
+            AuthMode::Windows.in_force("SQL Server"),
+            if cfg!(windows) {
+                AuthMode::Windows
+            } else {
+                AuthMode::Password
+            }
+        );
+        // And `effective_auth` is that rule, asked of the connection's own.
+        for db_type in ["MySQL", "SQL Server"] {
+            for auth in [AuthMode::Password, AuthMode::Windows, AuthMode::AzureCli] {
+                let c = Connection {
+                    db_type: db_type.into(),
+                    auth,
+                    ..conn()
+                };
+                assert_eq!(c.effective_auth(), auth.in_force(db_type));
+            }
         }
     }
 

@@ -1354,21 +1354,14 @@ fn server_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
     // this block is rebuilt when the engine changes, so the list is this
     // engine's. The credentials below follow the mode, built per mode rather
     // than hidden, for `engine_block`'s Tab-ring reason.
-    let modes = AuthMode::offered(&draft.db_type.get_untracked());
+    let engine = draft.db_type.get_untracked();
+    let modes = AuthMode::offered(&engine);
     let auth = draft.auth;
     // The mode in force, not the stored one: a SQL Server connection
     // switched to MySQL keeps its mode, and must still show a password.
-    let in_force = {
-        let modes = modes.clone();
-        move || {
-            let m = auth.get();
-            if modes.contains(&m) {
-                m
-            } else {
-                AuthMode::Password
-            }
-        }
-    };
+    // `AuthMode::in_force` — the rule the driver and the endpoint handoff
+    // ask — so the rows shown and the sign-in sent cannot disagree.
+    let in_force = move || auth.get().in_force(&engine);
     // A mode that needs no credentials says what it signs in as instead —
     // **under the picker, at its 6px**, as the Database field's hint sits under
     // it. In the column's 20px gap, where the fields go, it read as a field of
@@ -1404,19 +1397,27 @@ fn server_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
         crate::widgets::nothing()
     };
     let ring_creds = ring.clone();
-    let credentials = dyn_container(in_force.clone(), move |m| match m {
-        AuthMode::Password => v_stack((
+    // Built on `AuthMode::uses_credentials`, asked rather than matched: the
+    // rows exist exactly where the driver reads them.
+    let reads_credentials = {
+        let in_force = in_force.clone();
+        move || in_force().uses_credentials()
+    };
+    let credentials = dyn_container(reads_credentials.clone(), move |reads| {
+        if !reads {
+            return crate::widgets::nothing();
+        }
+        v_stack((
             field("User", draft.user, ring_creds.clone(), 70).style(|s| s.width(conn_field_w())),
             masked_field("Password", draft.password, ring_creds.clone(), 80)
                 .style(|s| s.width(conn_field_w())),
         ))
         .style(|s| s.flex_col().gap(theme::scaled(20.0)).width_full())
-        .into_any(),
-        AuthMode::Windows | AuthMode::AzureCli => crate::widgets::nothing(),
+        .into_any()
     })
     // `collapse_unless`, not just the `nothing()` inside: an empty box here
     // would still claim the column's 20px below the picker.
-    .style(move |s| crate::widgets::collapse_unless(s, in_force() == AuthMode::Password));
+    .style(move |s| crate::widgets::collapse_unless(s, reads_credentials()));
 
     v_stack((
         host_port_row("Host", draft.host, "Port", draft.port, ring.clone(), 60),

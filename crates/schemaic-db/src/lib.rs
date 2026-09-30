@@ -648,16 +648,12 @@ impl Db {
     /// This endpoint, signing in as `auth` — for the MCP subprocess, which
     /// receives the mode in its endpoint alongside the parts
     /// [`Self::from_parts`] takes, and for tests. Asked through the engine
-    /// here too, as [`Self::connect`] asks it through the connection, so an
-    /// endpoint cannot carry a mode its engine does not offer.
+    /// here too, by the same `AuthMode::in_force` [`Self::connect`] asks
+    /// through the connection, so an endpoint cannot carry a mode its engine
+    /// does not offer.
     pub fn with_auth(mut self, auth: schemaic_core::connection::AuthMode) -> Db {
         // `as_str` is a label `connection::is_mssql` and its siblings read.
-        let offered = schemaic_core::connection::AuthMode::offered(self.engine.as_str());
-        self.auth = if offered.contains(&auth) {
-            auth
-        } else {
-            schemaic_core::connection::AuthMode::Password
-        };
+        self.auth = auth.in_force(self.engine.as_str());
         self
     }
 
@@ -3131,6 +3127,43 @@ mod tests {
         // And a caller that named one is never redirected.
         let explicit = mysql_async::Opts::from(db.opts(Scope::Database(Some("other")), false));
         assert_eq!(explicit.db_name(), Some("other"));
+    }
+
+    /// **The endpoint handoff downgrades as the connection does**: a mode the
+    /// engine does not offer signs in with the password, by the same
+    /// `AuthMode::in_force` `Connection::effective_auth` asks — so the MCP
+    /// subprocess cannot sign in differently from the app.
+    #[test]
+    fn a_handoff_mode_the_engine_does_not_offer_signs_in_with_the_password() {
+        use schemaic_core::connection::AuthMode;
+        let on = |engine| {
+            Db::from_parts(
+                engine,
+                "h".into(),
+                1,
+                String::new(),
+                String::new(),
+                String::new(),
+            )
+        };
+        for engine in [
+            Engine::MySql,
+            Engine::Postgres,
+            Engine::Sqlite,
+            Engine::MsSql,
+        ] {
+            for m in [AuthMode::Password, AuthMode::Windows, AuthMode::AzureCli] {
+                assert_eq!(
+                    on(engine).with_auth(m).auth(),
+                    m.in_force(engine.as_str()),
+                    "{engine:?} {m:?}"
+                );
+            }
+        }
+        assert_eq!(
+            on(Engine::MySql).with_auth(AuthMode::AzureCli).auth(),
+            AuthMode::Password
+        );
     }
 
     /// The other end of the same conflation: an unopenable configured database

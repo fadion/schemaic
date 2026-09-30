@@ -7298,7 +7298,13 @@ existing prose was left alone.
     `default_database` is** — the picker is editable in place, so a SQL Server connection switched
     to MySQL keeps its mode with no control left that could unset it, and a `connections.json`
     carried to a Linux machine holds a Windows mode that build cannot honour; both sign in with the
-    password (`a_mode_the_engine_does_not_offer_signs_in_with_the_password`). The field is
+    password (`a_mode_the_engine_does_not_offer_signs_in_with_the_password`). **The rule itself is
+    `AuthMode::in_force(db_type)`, stated once** and asked by `effective_auth`, by `Db::with_auth`
+    for the MCP handoff and by the form's sign-in rows: each used to write it out, only the first
+    was tested, and a change to one would have had the form hide the password fields while the
+    driver still sent one, or the subprocess sign in unlike the app
+    (`the_mode_in_force_is_an_offered_one_or_the_password`,
+    `a_handoff_mode_the_engine_does_not_offer_signs_in_with_the_password`). The field is
     `#[serde(default)]` and deserializes through `AuthModeRaw`, the same `#[serde(other)]` shim as
     the rest, degrading to `Password` — the password is what the file still holds, and the server
     says so plainly if it is not enough (`an_absent_or_unknown_auth_mode_is_a_password`). A user and
@@ -11810,8 +11816,8 @@ existing prose was left alone.
   *Kill session* under it.
   **It signs in three ways, and `auth_method` is the one place that decides which.** `Db` carries
   an `auth`, set by `Db::connect` from `Connection::effective_auth`, by `Db::with_auth` — for the MCP
-  subprocess, and asked through the engine there too, so an endpoint cannot carry a mode its engine
-  does not offer — and read back by `Db::auth()`; `from_parts` is a password. `Password` is
+  subprocess, and asked through the engine there too by the same `AuthMode::in_force`, so an
+  endpoint cannot carry a mode its engine does not offer — and read back by `Db::auth()`; `from_parts` is a password. `Password` is
   `AuthMethod::sql_server`. `Windows` is `AuthMethod::Integrated`, SSPI through the OS, which is
   tiberius's `winauth` feature — enabled for the Windows target alone in this crate's
   `Cargo.toml`, since it is pure-Rust bindings there and the Unix counterpart would be GSSAPI over
@@ -16335,9 +16341,10 @@ existing prose was left alone.
     create, load, reset and `to_connection` like the rest. The list is read once, untracked, because
     `server_fields` is rebuilt when the engine changes. What follows the dropdown is keyed on the
     mode **in force**, not the stored one — a SQL Server connection switched to MySQL keeps
-    `AzureCli` in its draft and must still show a password — through one `in_force` closure. The
-    credentials are a `dyn_container` building User and Password for a password and `nothing()` for
-    the other two, each mode its own child rather than hidden fields, for the reason `conn_form`'s
+    `AzureCli` in its draft and must still show a password — through one `in_force` closure over
+    `AuthMode::in_force`, the rule the driver asks. The credentials are a `dyn_container` building
+    User and Password where the mode in force `uses_credentials` and `nothing()` where it does not,
+    each its own child rather than hidden fields, for the reason `conn_form`'s
     `engine_block` is built per engine — a hidden field stays in the Tab ring, so Tab would land on
     a password nobody can see. **The other two modes' hint is not a credentials arm but the
     picker's own third child** (`sign_in_hint`), under the dropdown at the stack's 6px as the
