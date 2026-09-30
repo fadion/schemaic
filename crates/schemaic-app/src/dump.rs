@@ -610,14 +610,15 @@ fn write(
                     // table is never mistaken for a finished one.
                     Some(Err(e)) => Err(std::io::Error::other(e)),
                 });
-                let tally = ExportFormat::Sql
-                    .stream_to(
-                        &mut w,
-                        &mut src,
-                        Some((source.0.as_str(), source.1.as_deref(), source.2.as_str())),
-                        dialect,
-                    )
-                    .map_err(|e| format!("Export failed: {e}"))?;
+                // Through the dump's own row renderer, which closes a SQL
+                // Server batch after every `INSERT` — `core::dump::render_rows`.
+                let tally = schemaic_core::dump::render_rows(
+                    &mut w,
+                    &mut src,
+                    (source.0.as_str(), source.1.as_deref(), source.2.as_str()),
+                    dialect,
+                )
+                .map_err(|e| format!("Export failed: {e}"))?;
                 // The fold is `ExportTally::absorb`'s, beside `note`, which
                 // answers the same question one level down.
                 total.absorb(tally);

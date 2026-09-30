@@ -326,8 +326,9 @@ fn carries_identity(c: &crate::schema::ColumnInfo, dialect: SqlDialect) -> bool 
 /// are cut into batches (`SqlDialect::batch_separator`) — SQL Server, where
 /// `CREATE VIEW`, `CREATE TRIGGER` and a routine must each open one, and a
 /// restore (`Db::run_script`, `sqlcmd`) splits the file at its `GO` lines. A
-/// row step is closed by a `GO` step after it; a comment needs none; a script
-/// already ending in one (`ddl::client_script`'s) gets no second.
+/// row step closes its own, one per `INSERT` ([`render_rows`]); a comment
+/// needs none; a script already ending in one (`ddl::client_script`'s) gets no
+/// second.
 fn close_batches(steps: Vec<DumpStep>, dialect: SqlDialect) -> Vec<DumpStep> {
     if !dialect.batch_separator() {
         return steps;
@@ -349,13 +350,39 @@ fn close_batches(steps: Vec<DumpStep>, dialect: SqlDialect) -> Vec<DumpStep> {
                     out.push(DumpStep::Text(format!("{body}\nGO")));
                 }
             }
-            rows @ DumpStep::Rows { .. } => {
-                out.push(rows);
-                out.push(DumpStep::Text("GO".to_string()));
-            }
+            rows @ DumpStep::Rows { .. } => out.push(rows),
         }
     }
     out
+}
+
+/// Render one [`DumpStep::Rows`] step: its rows, streamed from `src`, as the
+/// `INSERT`s the file carries into `target` — what `schemaic-app`'s dump
+/// writer runs for every such step, so the plan and the renderer agree on how
+/// the step's batches close.
+///
+/// **On a batch-separated engine every `INSERT` closes its own batch.** All
+/// of a table's statements used to share the one `GO` [`close_batches`] put
+/// after the step, and SQL Server refuses a batch longer than 65,536 network
+/// packets — 256 MB at the default 4 KB — so a `sqlcmd` restore of a large
+/// table was dropped mid-file ("Communication link failure"), and the app's
+/// own restore got through only because its script splitter also cut at every
+/// `;`. A statement is at most `export::INSERT_BATCH_BYTES` plus one row, so a
+/// batch per statement stays far inside the limit whatever the table's size.
+/// Session state the rows need — `SET IDENTITY_INSERT`, the transaction —
+/// outlives a `GO` on the one connection a restore holds.
+pub fn render_rows<W: std::io::Write>(
+    w: &mut W,
+    src: &mut dyn crate::export::RowChunks,
+    target: (&str, Option<&str>, &str),
+    dialect: SqlDialect,
+) -> std::io::Result<crate::export::ExportTally> {
+    let end = if dialect.batch_separator() {
+        ";\nGO\n"
+    } else {
+        ";\n"
+    };
+    crate::export::export_inserts_ending(w, src, Some(target), dialect, end)
 }
 
 /// The session switch that turns foreign-key enforcement off and back on, when
@@ -3699,9 +3726,11 @@ mod tests {
                     );
                     assert!(!t.contains("GO\nGO") && !t.contains("GO\n\nGO"), "{t}");
                 }
+                // The rows close their own batches, one per `INSERT`
+                // (`render_rows`), so nothing is added after the step.
                 DumpStep::Rows { .. } => assert!(
-                    matches!(p.steps.get(i + 1), Some(DumpStep::Text(t)) if t.trim() == "GO"),
-                    "the rows' batch is closed before whatever follows: {file}"
+                    !matches!(p.steps.get(i + 1), Some(DumpStep::Text(t)) if t.trim() == "GO"),
+                    "an empty batch after the rows: {file}"
                 ),
             }
         }
@@ -3796,6 +3825,58 @@ mod tests {
             ) > fk,
             "{file}"
         );
+    }
+
+    /// **A SQL Server rows step closes a batch after every `INSERT`.** All of a
+    /// table's statements shared one `GO` batch, and SQL Server refuses a batch
+    /// past 65,536 network packets (256 MB at the default size), so a `sqlcmd`
+    /// restore of a large table was dropped mid-file; the app's own restore got
+    /// through only because its splitter cut at every `;`. Each statement is at
+    /// most `INSERT_BATCH_BYTES` plus one row, so a batch per statement stays
+    /// far inside the limit whatever the table's size.
+    #[test]
+    fn a_sql_server_rows_step_closes_a_batch_after_every_insert() {
+        let rs = crate::model::ResultSet::from_rows(
+            vec![crate::model::Column {
+                name: "id".to_string(),
+                type_name: "int".to_string(),
+                origin: None,
+            }],
+            (0..600)
+                .map(|i| vec![crate::model::Value::Int(i)])
+                .collect(),
+        );
+        let order: Vec<usize> = (0..600).collect();
+        let render = |d: SqlDialect| {
+            let mut out = Vec::new();
+            let tally = render_rows(
+                &mut out,
+                &mut crate::export::OneChunk::new(&rs, &order),
+                ("shop", Some("dbo"), "t"),
+                d,
+            )
+            .unwrap();
+            assert_eq!(tally.rows, 600);
+            String::from_utf8(out).unwrap()
+        };
+        let sql = render(SqlDialect::MsSql);
+        let inserts = sql.matches("INSERT INTO").count();
+        assert_eq!(inserts, 3, "{sql}");
+        assert_eq!(sql.matches(";\nGO\n").count(), inserts, "{sql}");
+        assert!(sql.trim_end().ends_with("\nGO"), "closed at the end: {sql}");
+        // The split a restore makes: one statement per batch.
+        let mut splitter = crate::script::Splitter::new(SqlDialect::MsSql);
+        let mut batches = splitter.push_str(&sql);
+        batches.extend(splitter.finish());
+        assert!(
+            batches
+                .iter()
+                .all(|b| b.sql.matches("INSERT INTO").count() <= 1)
+        );
+        // No batches where the engine has none.
+        let sql = render(SqlDialect::MySql);
+        assert!(!sql.contains("GO"), "{sql}");
+        assert_eq!(sql.matches("INSERT INTO").count(), 3);
     }
 
     /// **A SQL Server dump says how its dates are written, before any of them.**

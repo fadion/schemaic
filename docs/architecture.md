@@ -3209,19 +3209,31 @@ existing prose was left alone.
     **On an engine whose scripts are cut into batches, every statement closes one.**
     `close_batches` runs over the finished plan wherever `SqlDialect::batch_separator` is true —
     SQL Server — and ends each `Text` step that is more than comments with a `GO` line, unless its
-    last line already is one (`ddl::client_script`'s trigger text carries its own), and puts a `GO`
-    step after each `Rows` step. `CREATE VIEW`, `CREATE TRIGGER` and a routine must each open a
+    last line already is one (`ddl::client_script`'s trigger text carries its own). **A `Rows` step
+    closes its own batches, one per `INSERT`**: `dump::render_rows` is the renderer the app's writer
+    runs for every such step (through `export::export_inserts_ending`, which ends each statement
+    `;\nGO\n` there), where the step used to share one `GO` placed after it. SQL Server refuses a
+    batch past 65,536 network packets — 256 MB at the default size — so a `sqlcmd` restore of a
+    large table was dropped mid-file, and the app's own restore got through only because its
+    splitter also cut at every `;`; a statement is at most `INSERT_BATCH_BYTES` plus a row, so a
+    batch per statement holds whatever the table's size
+    (`a_sql_server_rows_step_closes_a_batch_after_every_insert`). `CREATE VIEW`, `CREATE TRIGGER` and a routine must each open a
     batch of their own, and a restore — `Db::run_script` behind the script splitter, or `sqlcmd` —
     cuts the file at its `GO` lines, so without them the first view after a table's rows failed
     (Msg 111, per the test's doc) — `a_sql_server_dump_closes_every_batch_with_go`, which also
     asserts MySQL's file carries neither a `GO` nor an `IDENTITY_INSERT`. The live pin is
-    `a_dump_restores_into_an_empty_database` in `tests/live/mssql.rs`: a scratch database with an
-    identity holding a gap, a `rowversion`, a computed column, a foreign key, a view, a trigger, a
-    function, a procedure, `float`/`real` extremes and `datetime2`/`date`/`decimal`/Unicode values
-    is dumped, rendered as the app's writer renders it,
-    split and replayed through `run_script` into an empty database, and compares equal row for row,
-    with the key, the view and the trigger present and the next identity continuing from the
-    highest carried. It failed against the unfixed `dump.rs`.
+    `a_dump_restores_into_an_empty_database` in `tests/live/mssql.rs`, **one fixture that grows with
+    each restore bug**: a scratch database with an identity holding a gap, a `rowversion`, a
+    computed column, foreign keys, views, an audit trigger, a function and a procedure, a table
+    whose computed column, check and default call the function, a disabled check and key and an
+    untrusted check over violating rows, more rows than one `INSERT` carries, `float`/`real`
+    extremes and `datetime`/`smalldatetime`/`datetime2`/`date`/`decimal`/Unicode values is dumped,
+    its rows rendered through `render_rows` as the app's writer renders them, split and replayed
+    through `run_script` into an empty database under `SET LANGUAGE british`, then replayed a second
+    time onto that copy; each time one query per side (a debug build's poll frame grows with every
+    `await`, and the fixture overflowed a 2 MiB test thread) must read back the same rows,
+    constraint states, trigger and routine, and the next identity continues from the highest
+    carried. `SCHEMAIC_IT_KEEP_DUMP=<path>` keeps the file for a hand restore through `sqlcmd`.
     **Foreign keys are restated after the data.** `create_ddl` deliberately emits none: for Copy DDL
     an omitted key still leaves a script that runs, which is why the ordering effort there went to
     types and views instead (`create_ddl_script`'s own account of it). A dump can't take that trade —

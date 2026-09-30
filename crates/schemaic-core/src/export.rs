@@ -2723,7 +2723,22 @@ pub fn export_inserts_chunks<W: Write>(
     source: Option<(&str, Option<&str>, &str)>,
     dialect: SqlDialect,
 ) -> io::Result<ExportTally> {
+    export_inserts_ending(w, src, source, dialect, ";\n")
+}
+
+/// [`export_inserts_chunks`], closing each statement with `end` rather than
+/// `;\n` — what a dump uses to put a SQL Server batch separator after every
+/// `INSERT` (`dump::render_rows`), so no batch outgrows the server's limit
+/// however large the table.
+pub fn export_inserts_ending<W: Write>(
+    w: &mut W,
+    src: &mut dyn RowChunks,
+    source: Option<(&str, Option<&str>, &str)>,
+    dialect: SqlDialect,
+    end: &str,
+) -> io::Result<ExportTally> {
     let q = |s: &str| ident_sql(s, dialect);
+    let close_batch = |w: &mut W, open_rows: &mut usize| close_batch(w, open_rows, end);
     let table_sql = match source {
         Some((db, ns, table)) => qualified_table(db, ns, table, dialect),
         None => q("table"),
@@ -2834,9 +2849,9 @@ pub fn export_inserts_chunks<W: Write>(
 ///
 /// Every path that must not write inside a `VALUES` list goes through this: the
 /// `-- NOTE:` comment, the batch bounds, and the end of the export.
-fn close_batch<W: Write>(w: &mut W, open_rows: &mut usize) -> io::Result<()> {
+fn close_batch<W: Write>(w: &mut W, open_rows: &mut usize, end: &str) -> io::Result<()> {
     if *open_rows > 0 {
-        w.write_all(b";\n")?;
+        w.write_all(end.as_bytes())?;
         *open_rows = 0;
     }
     Ok(())

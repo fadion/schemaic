@@ -628,11 +628,11 @@ async fn dump_file(src: &Scratch, opts: schemaic_core::dump::DumpOptions) -> Str
                 .expect("the rows");
                 let order: Vec<usize> = (0..rs.row_count()).collect();
                 let mut out = Vec::new();
-                schemaic_core::export::export_inserts_to(
+                // The app's writer's renderer, batch separators and all.
+                schemaic_core::dump::render_rows(
                     &mut out,
-                    &rs,
-                    &order,
-                    Some((&insert_database, schema.as_deref(), &table)),
+                    &mut schemaic_core::export::OneChunk::new(&rs, &order),
+                    (&insert_database, schema.as_deref(), &table),
                     MS,
                 )
                 .unwrap();
@@ -748,17 +748,36 @@ async fn a_dump_restores_into_an_empty_database() {
     .await;
     src.exec("CREATE VIEW dbo.v_double AS SELECT dbo.f_double(id) AS d FROM dbo.customers")
         .await;
+    // More rows than one `INSERT` carries, so the table's rows are several
+    // statements — each closing its own `GO` batch.
+    src.exec(
+        "CREATE TABLE dbo.many (id int PRIMARY KEY, s nvarchar(40) NOT NULL); \
+         INSERT dbo.many (id, s) SELECT TOP (600) \
+           ROW_NUMBER() OVER (ORDER BY (SELECT NULL)), N'row' \
+           FROM sys.all_objects a CROSS JOIN sys.all_objects b;",
+    )
+    .await;
 
     let file = Box::pin(dump_file(&src, DumpOptions::default())).await;
-    assert!(
-        file.contains("SET IDENTITY_INSERT [dbo].[customers] ON;"),
-        "{file}"
-    );
-
     // For a hand check through `sqlcmd`: the file as the app would write it.
     if let Ok(path) = std::env::var("SCHEMAIC_IT_KEEP_DUMP") {
         std::fs::write(path, &file).expect("the kept dump");
     }
+    assert!(
+        file.contains("SET IDENTITY_INSERT [dbo].[customers] ON;"),
+        "{file}"
+    );
+    // Every `INSERT` closes its own batch: none outgrows the server's limit
+    // however large the table, and a restore does not lean on a `;` split.
+    assert!(
+        file.matches("INSERT INTO [dbo].[many]").count() > 1,
+        "{file}"
+    );
+    assert!(
+        file.split("\nGO\n")
+            .all(|batch| batch.matches("INSERT INTO").count() <= 1),
+        "{file}"
+    );
 
     let dst = Scratch::create("dumpdst").await;
     // Restored by a session whose language reads a date day-first, as a
@@ -795,6 +814,7 @@ async fn a_dump_restores_into_an_empty_database() {
         UNION ALL SELECT CONCAT('procedure|', name) FROM sys.procedures \
         UNION ALL SELECT CONCAT('f_double|', dbo.f_double(21)) \
         UNION ALL SELECT CONCAT('calc|', id, '|', dbl, '|', n) FROM dbo.calc \
+        UNION ALL SELECT CONCAT('many|', COUNT(*), '|', SUM(id)) FROM dbo.many \
         UNION ALL SELECT CONCAT('v_double|', SUM(d)) FROM dbo.v_double \
       ) x";
     let (want, got) = (src.scalar(facts).await, dst.scalar(facts).await);
@@ -815,6 +835,7 @@ async fn a_dump_restores_into_an_empty_database() {
         "f_double|42",
         "calc|2|4|8",
         "v_double|8",
+        "many|600|180300",
     ] {
         assert!(want.contains(fact), "{fact} in {want}");
     }
