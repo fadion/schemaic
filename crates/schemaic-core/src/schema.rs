@@ -5188,6 +5188,12 @@ impl TableInfo {
                 line.push_str(&format!("AS ({expr})"));
                 if c.generated_stored {
                     line.push_str(" PERSISTED");
+                    // As `tsql_definition` writes it: the `NOT NULL` of a
+                    // persisted computed column is a constraint the copy
+                    // must keep, and only a persisted one can carry it.
+                    if !c.nullable {
+                        line.push_str(" NOT NULL");
+                    }
                 }
                 lines.push(line);
                 continue;
@@ -8737,6 +8743,33 @@ mod tests {
             crate::sql::statement_ranges(&ddl, crate::intel::SqlDialect::MsSql).len(),
             2
         );
+    }
+
+    /// **A `PERSISTED NOT NULL` computed column keeps its `NOT NULL`.** It was
+    /// written `AS (…) PERSISTED` alone, so the copy's column was nullable and
+    /// took an `INSERT` the original refused — silently, unless a key over it
+    /// made the server add the `NOT NULL` itself. A computed column that is
+    /// not persisted cannot carry one, so only a persisted one says it.
+    #[test]
+    fn a_persisted_not_null_computed_column_keeps_its_not_null() {
+        let a = col("a", "int", true, false);
+        let mut k = col("k", "int", false, false);
+        k.generated = Some("CONVERT([int],[a])*(2)".into());
+        k.generated_stored = true;
+        let mut j = col("j", "int", true, false);
+        j.generated = Some("[a]+(1)".into());
+        let t = TableInfo {
+            schema: Some("dbo".into()),
+            name: "comp".into(),
+            columns: vec![a, k, j],
+            ..Default::default()
+        };
+        let ddl = t.create_ddl(crate::intel::SqlDialect::MsSql);
+        assert!(
+            ddl.contains("  [k] AS (CONVERT([int],[a])*(2)) PERSISTED NOT NULL,"),
+            "{ddl}"
+        );
+        assert!(ddl.contains("  [j] AS ([a]+(1))\n"), "{ddl}");
     }
 
     /// **A view's header is rebuilt under the name the catalogue gives it**,

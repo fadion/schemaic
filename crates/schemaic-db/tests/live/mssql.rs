@@ -3762,6 +3762,7 @@ async fn a_tables_ddl_rebuilds_the_table_it_was_read_from() {
            [odd]]name] nvarchar(40) COLLATE Latin1_General_BIN NULL, \
            balance decimal(10,2) NOT NULL DEFAULT ((0)), \
            doubled AS (balance * 2) PERSISTED, \
+           tripled AS (CONVERT(int, balance) * 3) PERSISTED NOT NULL, \
            code varchar(8) NOT NULL CONSTRAINT uq_code UNIQUE, \
            CONSTRAINT ck_t CHECK (balance >= 0)); \
          CREATE INDEX ix_bal ON dbo.t (balance DESC) WHERE balance > 0; \

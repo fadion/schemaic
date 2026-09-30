@@ -12912,7 +12912,9 @@ existing prose was left alone.
   (`tsql_create_ddl` — the identity with the seed and increment `sys.identity_columns` reported,
   and `(1,1)` with a comment saying so only where they were not read, named primary-key and unique
   constraints and their clustering (`create_ddl_sql_server_restates_clustering`), checks,
-  `AS (…) PERSISTED`, other indexes as separate
+  `AS (…) PERSISTED` — with the `NOT NULL` a persisted one may carry, as the designer's
+  `tsql_definition` writes it, which the copy otherwise dropped and so took rows the original
+  refused (`a_persisted_not_null_computed_column_keeps_its_not_null`) — other indexes as separate
   statements, the table's and columns' comments after them through `ddl::tsql_add_comment` — the
   same `sp_addextendedproperty` the emitter writes (`create_ddl_sql_server_restates_the_comments`)
   — and what it cannot restate named in a comment; a view is its stored definition **with the
