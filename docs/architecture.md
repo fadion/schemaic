@@ -11645,7 +11645,18 @@ existing prose was left alone.
   not `0.1` as an `f64`, so the key would match nothing — text converts to the column's own type
   instead, a string having the lowest precedence. A `u64` past `i64` goes as text too, other
   integers as `bigint`, strings as `nvarchar` (`keys_of_every_shape_find_their_row`: `real`,
-  `datetime2`, `uniqueidentifier` and `decimal` keys, as the grid read them back). The re-read is
+  `datetime2`, `uniqueidentifier` and `decimal` keys, as the grid read them back). **A `datetime` or
+  `smalldatetime` is the exception to "the server's own rendering converts back"**: it converts
+  `yyyy-mm-dd hh:mm:ss` under the session's `DATEFORMAT`, which a day-first login language
+  (`british`, and the German, French, Italian and Spanish installers' default) makes
+  year-*day*-month — deleting the 2 January row deleted 1 February and the 1-row net passed it,
+  measured on 2022. So `column_text` rewrites such a column's text, key and staged value alike, into
+  the ISO `T` form (`language_safe_datetime`: `2026-01-02T00:00:00.000`, a bare date as midnight),
+  which every language reads the same; the column's type comes from the same `ColumnFacts` the
+  guards read, so `refetch_on` and `blob_on` read them too, and the import rewrites each batch
+  (`language_safe_batch`). `date`, `datetime2` and `datetimeoffset` read `yyyy-mm-dd` as ISO already
+  and are left alone (`a_datetime_key_finds_its_row_under_a_day_first_login`, a `british` login, on
+  2022 and 2025). The re-read is
   `SELECT TOP (1)` by key and confirming columns, rendered by the same `cell_value` as the read that
   produced the grid; a binary cell is `DATALENGTH` plus a `SUBSTRING` to `FETCH_CAP` — `DATALENGTH`,
   not `LEN`, which counts characters and trims trailing blanks.

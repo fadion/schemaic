@@ -2405,6 +2405,7 @@ pub(crate) async fn import_rows(
             let undone = rollback(&mut client).await;
             return Err(DbError::Refused(format!("{msg}{}", undone.note())));
         }
+        let batch = language_safe_batch(target.columns, &facts, batch);
         let Some(sql) = schemaic_core::import::build_insert(
             target.database,
             target.schema,
@@ -2570,6 +2571,73 @@ fn hole(params: &mut Vec<ColumnData<'static>>, v: ColumnData<'static>) -> String
     format!("@P{}", params.len())
 }
 
+/// `yyyy-mm-dd[ hh:mm[:ss[.fraction]]]` in the ISO 8601 `T` form —
+/// `yyyy-mm-ddThh:mm:ss[.fraction]` — or `None` for any other text.
+///
+/// **The form every login language reads alike.** A `datetime` or
+/// `smalldatetime` converts `2026-01-02 00:00:00.000` under the session's
+/// `DATEFORMAT`, which a day-first language (`british`, and the German,
+/// French, Italian and Spanish installers' default) makes year-*day*-month:
+/// deleting the 2 January row in the grid deleted 1 February, and the 1-row
+/// net passed it (measured on 2022). The `T` form is read as ISO under every
+/// setting, and so is a bare date turned into midnight. `date`, `datetime2`
+/// and `datetimeoffset` read `yyyy-mm-dd` as ISO already.
+fn language_safe_datetime(text: &str) -> Option<String> {
+    let b = text.as_bytes();
+    let digits =
+        |r: std::ops::Range<usize>| b.get(r).is_some_and(|s| s.iter().all(u8::is_ascii_digit));
+    if !(digits(0..4)
+        && b.get(4) == Some(&b'-')
+        && digits(5..7)
+        && b.get(7) == Some(&b'-')
+        && digits(8..10))
+    {
+        return None;
+    }
+    let date = &text[..10];
+    let rest = &text[10..];
+    if rest.is_empty() {
+        return Some(format!("{date}T00:00:00"));
+    }
+    let time = rest.strip_prefix(' ').or_else(|| rest.strip_prefix('T'))?;
+    let (clock, fraction) = match time.split_once('.') {
+        Some((c, f)) if !f.is_empty() && f.bytes().all(|d| d.is_ascii_digit()) => (c, Some(f)),
+        Some(_) => return None,
+        None => (time, None),
+    };
+    let parts: Vec<&str> = clock.split(':').collect();
+    let two = |p: &str, max: u32| {
+        (1..=2).contains(&p.len())
+            && p.bytes().all(|d| d.is_ascii_digit())
+            && p.parse::<u32>().is_ok_and(|n| n <= max)
+    };
+    let (h, m, s) = match parts.as_slice() {
+        [h, m] if two(h, 23) && two(m, 59) => (h, m, "0"),
+        [h, m, s] if two(h, 23) && two(m, 59) && two(s, 59) => (h, m, *s),
+        _ => return None,
+    };
+    if fraction.is_some() && parts.len() != 3 {
+        return None;
+    }
+    let pad = |p: &str| format!("{p:0>2}");
+    Some(match fraction {
+        Some(f) => format!("{date}T{}:{}:{}.{f}", pad(h), pad(m), pad(s)),
+        None => format!("{date}T{}:{}:{}", pad(h), pad(m), pad(s)),
+    })
+}
+
+/// Text as `col` should receive it: a `datetime` or `smalldatetime` in the
+/// form every language reads alike ([`language_safe_datetime`]), anything
+/// else as it is.
+fn column_text(facts: &[ColumnFacts], col: &str, text: &str) -> String {
+    match fact(facts, col) {
+        Some(f) if matches!(f.base_type.as_str(), "datetime" | "smalldatetime") => {
+            language_safe_datetime(text).unwrap_or_else(|| text.to_string())
+        }
+        _ => text.to_string(),
+    }
+}
+
 /// A key value as a parameter.
 ///
 /// **A float goes as its text**, the digits the grid shows. A `real` column
@@ -2578,8 +2646,10 @@ fn hole(params: &mut Vec<ColumnData<'static>>, v: ColumnData<'static>) -> String
 /// *column's* type instead (a string has the lowest precedence), which is the
 /// value the grid read. Everything else textual is already text: a `decimal`, a
 /// date, a `uniqueidentifier` all arrive as the server's own rendering of them
-/// and convert back exactly.
-fn key_param(v: &Value) -> ColumnData<'static> {
+/// and convert back exactly — **except a `datetime` or `smalldatetime`**,
+/// whose rendering converts back under the login's date order, and so goes
+/// through [`column_text`].
+fn key_param(col: &str, v: &Value, facts: &[ColumnFacts]) -> ColumnData<'static> {
     let text = |s: String| ColumnData::String(Some(s.into()));
     match v {
         Value::Int(i) => ColumnData::I64(Some(*i)),
@@ -2587,7 +2657,7 @@ fn key_param(v: &Value) -> ColumnData<'static> {
             i64::try_from(*u).map_or_else(|_| text(u.to_string()), |i| ColumnData::I64(Some(i)))
         }
         Value::Float(f) => text(f.to_string()),
-        Value::Str(s) => text(s.clone()),
+        Value::Str(s) => text(column_text(facts, col, s)),
         // Never bound: `where_key` writes `IS NULL` for one.
         Value::Null => ColumnData::String(None),
     }
@@ -2595,11 +2665,11 @@ fn key_param(v: &Value) -> ColumnData<'static> {
 
 /// A staged cell as a parameter, or `None` for NULL — which is written as the
 /// literal, since a TDS parameter is typed and a NULL of one type is not a
-/// NULL of every other.
-fn cell_param(v: &CellEdit) -> Option<ColumnData<'static>> {
+/// NULL of every other. Text goes through [`column_text`], as a key does.
+fn cell_param(col: &str, v: &CellEdit, facts: &[ColumnFacts]) -> Option<ColumnData<'static>> {
     match v {
         CellEdit::Null => None,
-        CellEdit::Text(t) => Some(ColumnData::String(Some(t.clone().into()))),
+        CellEdit::Text(t) => Some(ColumnData::String(Some(column_text(facts, col, t).into()))),
         CellEdit::Bytes(b) => Some(ColumnData::Binary(Some(b.to_vec().into()))),
     }
 }
@@ -2607,13 +2677,21 @@ fn cell_param(v: &CellEdit) -> Option<ColumnData<'static>> {
 /// `[c] = @Pn` … ` AND ` …, with a NULL key value compared as `IS NULL`: T-SQL
 /// has no null-safe equality before 2022's `IS NOT DISTINCT FROM`, and `= NULL`
 /// is never true.
-fn where_key(key: &[(String, Value)], params: &mut Vec<ColumnData<'static>>) -> String {
+fn where_key(
+    key: &[(String, Value)],
+    facts: &[ColumnFacts],
+    params: &mut Vec<ColumnData<'static>>,
+) -> String {
     key.iter()
         .map(|(col, v)| {
             if v.is_null() {
                 format!("{} IS NULL", ident(col))
             } else {
-                format!("{} = {}", ident(col), hole(params, key_param(v)))
+                format!(
+                    "{} = {}",
+                    ident(col),
+                    hole(params, key_param(col, v, facts))
+                )
             }
         })
         .collect::<Vec<_>>()
@@ -2621,20 +2699,26 @@ fn where_key(key: &[(String, Value)], params: &mut Vec<ColumnData<'static>>) -> 
 }
 
 /// The value side of one staged cell: its placeholder, or `NULL`.
-fn cell_sql(v: &CellEdit, params: &mut Vec<ColumnData<'static>>) -> String {
-    match cell_param(v) {
+fn cell_sql(
+    col: &str,
+    v: &CellEdit,
+    facts: &[ColumnFacts],
+    params: &mut Vec<ColumnData<'static>>,
+) -> String {
+    match cell_param(col, v, facts) {
         Some(p) => hole(params, p),
         None => "NULL".to_string(),
     }
 }
 
 /// The statement for one step of a [`GridWrite`]. The `SET` values bind before
-/// the `WHERE`'s, the order they appear in the text.
-fn statement_for(step: WriteStep<'_>) -> Bound {
+/// the `WHERE`'s, the order they appear in the text. `facts` are the table's
+/// columns, for the types whose text is rewritten ([`column_text`]).
+fn statement_for(step: WriteStep<'_>, facts: &[ColumnFacts]) -> Bound {
     let mut params = Vec::new();
     let sql = match step {
         WriteStep::Delete(d) => {
-            let w = where_key(&d.key, &mut params);
+            let w = where_key(&d.key, facts, &mut params);
             format!(
                 "DELETE FROM {} WHERE {w}",
                 qname3(&d.database, d.schema.as_deref(), &d.table)
@@ -2644,10 +2728,12 @@ fn statement_for(step: WriteStep<'_>) -> Bound {
             let sets = u
                 .set
                 .iter()
-                .map(|(col, v)| format!("{} = {}", ident(col), cell_sql(v, &mut params)))
+                .map(|(col, v)| {
+                    format!("{} = {}", ident(col), cell_sql(col, v, facts, &mut params))
+                })
                 .collect::<Vec<_>>()
                 .join(", ");
-            let w = where_key(&u.key, &mut params);
+            let w = where_key(&u.key, facts, &mut params);
             format!(
                 "UPDATE {} SET {sets} WHERE {w}",
                 qname3(&u.database, u.schema.as_deref(), &u.table)
@@ -2663,7 +2749,7 @@ fn statement_for(step: WriteStep<'_>) -> Bound {
                 let vals = i
                     .cols
                     .iter()
-                    .map(|(_, v)| cell_sql(v, &mut params))
+                    .map(|(c, v)| cell_sql(c, v, facts, &mut params))
                     .collect::<Vec<_>>();
                 format!(
                     "INSERT INTO {table} ({}) VALUES ({})",
@@ -2678,7 +2764,7 @@ fn statement_for(step: WriteStep<'_>) -> Bound {
 
 /// One re-read row's `SELECT`: key columns, then the confirming ones, the order
 /// `edit::refetch_key` builds the values in.
-fn refetch_statement(template: &RefetchTemplate, row: &RefetchRow) -> Bound {
+fn refetch_statement(template: &RefetchTemplate, row: &RefetchRow, facts: &[ColumnFacts]) -> Bound {
     let mut params = Vec::new();
     let cols = template
         .columns
@@ -2693,7 +2779,7 @@ fn refetch_statement(template: &RefetchTemplate, row: &RefetchRow) -> Bound {
         .zip(&row.key)
         .map(|(&ci, v)| (template.columns[ci].clone(), v.clone()))
         .collect();
-    let w = where_key(&key, &mut params);
+    let w = where_key(&key, facts, &mut params);
     Bound {
         sql: format!(
             "SELECT TOP (1) {cols} FROM {} WHERE {w}",
@@ -2709,10 +2795,10 @@ fn refetch_statement(template: &RefetchTemplate, row: &RefetchRow) -> Bound {
 
 /// One binary cell's length and its first [`FETCH_CAP`] bytes. `DATALENGTH`,
 /// not `LEN`: the second counts characters and trims trailing blanks.
-fn blob_statement(r: &BlobRef) -> Bound {
+fn blob_statement(r: &BlobRef, facts: &[ColumnFacts]) -> Bound {
     let mut params = Vec::new();
     let col = ident(&r.column);
-    let w = where_key(&r.key, &mut params);
+    let w = where_key(&r.key, facts, &mut params);
     Bound {
         sql: format!(
             "SELECT TOP (1) DATALENGTH({col}), SUBSTRING({col}, 1, {FETCH_CAP}) FROM {} WHERE {w}",
@@ -3018,6 +3104,24 @@ fn import_blank_refusal(
         }
     }
     None
+}
+
+/// An import batch with every `datetime`/`smalldatetime` text rewritten by
+/// [`column_text`] — a file's `2026-01-02 10:30` is 2 January under every
+/// login language, as the grid's key is.
+fn language_safe_batch(
+    columns: &[String],
+    facts: &[ColumnFacts],
+    mut batch: Vec<Vec<Value>>,
+) -> Vec<Vec<Value>> {
+    for row in &mut batch {
+        for (col, v) in columns.iter().zip(row.iter_mut()) {
+            if let Value::Str(s) = v {
+                *s = column_text(facts, col, s);
+            }
+        }
+    }
+    batch
 }
 
 /// Does an import into `columns` give an identity column a value? Then the
@@ -3586,7 +3690,7 @@ pub(crate) async fn write_on(
             let u = scope.undo_into(client, None, undone).await;
             return Err(scope.failure(err_text(e), u));
         }
-        let affected = match execute_counted(client, &statement_for(step), cancel).await {
+        let affected = match execute_counted(client, &statement_for(step, &facts), cancel).await {
             Ok(Ran::Counted(n)) => n,
             // **Only an acknowledged attention lets the rollback be believed.**
             // The statement's future was dropped mid-reply; without the
@@ -3684,9 +3788,18 @@ pub(crate) async fn refetch_on(
     rows: &[RefetchRow],
     cancel: &CancellationToken,
 ) -> Result<Vec<(usize, Vec<Value>)>, DbError> {
+    // The key's types — a `datetime` key is rewritten as the write's was.
+    let facts = column_facts(
+        client,
+        &template.database,
+        template.schema.as_deref(),
+        &template.table,
+    )
+    .await?;
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
-        if let Some(cells) = first_row(client, &refetch_statement(template, row), cancel).await? {
+        let b = refetch_statement(template, row, &facts);
+        if let Some(cells) = first_row(client, &b, cancel).await? {
             out.push((row.data_row, cells));
         }
     }
@@ -3714,7 +3827,8 @@ pub(crate) async fn blob_on(
     r: &BlobRef,
     cancel: &CancellationToken,
 ) -> Result<Option<BlobValue>, DbError> {
-    let b = blob_statement(r);
+    let facts = column_facts(client, &r.database, r.schema.as_deref(), &r.table).await?;
+    let b = blob_statement(r, &facts);
     let refs: Vec<&dyn tiberius::ToSql> =
         b.params.iter().map(|p| p as &dyn tiberius::ToSql).collect();
     let read = async {
@@ -3805,7 +3919,7 @@ mod write_tests {
             ],
             vec![("id", Value::Int(7)), ("region", Value::Null)],
         );
-        let b = statement_for(WriteStep::Update(&e));
+        let b = statement_for(WriteStep::Update(&e), &[]);
         assert_eq!(
             b.sql,
             "UPDATE [shop].[dbo].[orders] SET [note] = @P1, [gone] = NULL, [photo] = @P2 \
@@ -3824,7 +3938,7 @@ mod write_tests {
     #[test]
     fn an_insert_with_nothing_set_takes_every_default() {
         let i = insert(vec![]);
-        let b = statement_for(WriteStep::Insert(&i));
+        let b = statement_for(WriteStep::Insert(&i), &[]);
         assert_eq!(b.sql, "INSERT INTO [shop].[dbo].[orders] DEFAULT VALUES");
         assert!(b.params.is_empty());
 
@@ -3832,7 +3946,7 @@ mod write_tests {
             ("qty", CellEdit::Text("3".into())),
             ("note", CellEdit::Null),
         ]);
-        let b = statement_for(WriteStep::Insert(&i));
+        let b = statement_for(WriteStep::Insert(&i), &[]);
         assert_eq!(
             b.sql,
             "INSERT INTO [shop].[dbo].[orders] ([qty], [note]) VALUES (@P1, NULL)"
@@ -3851,7 +3965,7 @@ mod write_tests {
                 ("line".into(), Value::Str("A".into())),
             ],
         };
-        let b = statement_for(WriteStep::Delete(&d));
+        let b = statement_for(WriteStep::Delete(&d), &[]);
         assert_eq!(
             b.sql,
             "DELETE FROM [shop].[sales].[order lines] WHERE [order_id] = @P1 AND [line] = @P2"
@@ -3869,7 +3983,7 @@ mod write_tests {
         );
         e.table = "t]1".into();
         e.schema = None;
-        let b = statement_for(WriteStep::Update(&e));
+        let b = statement_for(WriteStep::Update(&e), &[]);
         // No schema: `db..t`, T-SQL's spelling of the default one.
         assert_eq!(
             b.sql,
@@ -3877,8 +3991,90 @@ mod write_tests {
         );
         // And no database either: two-part, as before.
         e.database = String::new();
-        let b = statement_for(WriteStep::Update(&e));
+        let b = statement_for(WriteStep::Update(&e), &[]);
         assert_eq!(b.sql, "UPDATE [t]]1] SET [a]]b] = @P1 WHERE [id] = @P2");
+    }
+
+    /// **A `datetime`'s text goes in the ISO `T` form**, which SQL Server
+    /// reads the same under every login language: `yyyy-mm-dd hh:mm:ss` is
+    /// year-*day*-month under `british` (measured on 2022). The grid's own
+    /// spelling, a typed shorter one and a bare date are all rewritten;
+    /// anything else is the server's to read.
+    #[test]
+    fn a_datetime_is_written_in_the_form_every_language_reads_alike() {
+        let safe = language_safe_datetime;
+        assert_eq!(
+            safe("2026-01-02 00:00:00.000").as_deref(),
+            Some("2026-01-02T00:00:00.000")
+        );
+        assert_eq!(
+            safe("2026-03-04 10:30").as_deref(),
+            Some("2026-03-04T10:30:00")
+        );
+        assert_eq!(
+            safe("2026-03-04 9:05:07").as_deref(),
+            Some("2026-03-04T09:05:07")
+        );
+        assert_eq!(safe("2026-03-04").as_deref(), Some("2026-03-04T00:00:00"));
+        assert_eq!(
+            safe("2026-03-04T10:30:00.5").as_deref(),
+            Some("2026-03-04T10:30:00.5")
+        );
+        for other in [
+            "20260304",
+            "04/03/2026",
+            "2026-3-4",
+            "2026-03-04 10",
+            "now",
+            "",
+        ] {
+            assert_eq!(safe(other), None, "{other}");
+        }
+
+        // An import batch, the same way.
+        let cols = ["at".to_string(), "note".to_string()];
+        let batch = language_safe_batch(
+            &cols,
+            &facts(&[("at", "datetime", false)]),
+            vec![vec![
+                Value::Str("2026-01-02 10:30".into()),
+                Value::Str("2026-01-02 10:30".into()),
+            ]],
+        );
+        assert_eq!(
+            batch[0],
+            vec![
+                Value::Str("2026-01-02T10:30:00".into()),
+                Value::Str("2026-01-02 10:30".into())
+            ]
+        );
+
+        // Applied to exactly the two language-sensitive types, keys and values.
+        let f = facts(&[
+            ("at", "datetime", false),
+            ("sm", "smalldatetime", false),
+            ("d2", "datetime2", false),
+            ("note", "nvarchar", false),
+        ]);
+        let mut e = edit(
+            vec![
+                ("sm", CellEdit::Text("2026-03-04 10:30".into())),
+                ("d2", CellEdit::Text("2026-03-04 10:30".into())),
+                ("note", CellEdit::Text("2026-03-04 10:30".into())),
+            ],
+            vec![("at", Value::Str("2026-01-02 00:00:00.000".into()))],
+        );
+        e.schema = Some("dbo".into());
+        let b = statement_for(WriteStep::Update(&e), &f);
+        assert_eq!(
+            b.params,
+            vec![
+                text("2026-03-04T10:30:00"),
+                text("2026-03-04 10:30"),
+                text("2026-03-04 10:30"),
+                text("2026-01-02T00:00:00.000"),
+            ]
+        );
     }
 
     /// A float key goes as its text, so the server converts it to the
@@ -3887,16 +4083,12 @@ mod write_tests {
     /// goes as text too, rather than wrapping.
     #[test]
     fn a_float_key_is_compared_as_the_text_the_grid_shows() {
-        assert_eq!(key_param(&Value::Float(0.1)), text("0.1"));
-        assert_eq!(
-            key_param(&Value::UInt(u64::MAX)),
-            text(&u64::MAX.to_string())
-        );
-        assert_eq!(key_param(&Value::UInt(5)), ColumnData::I64(Some(5)));
-        assert_eq!(
-            key_param(&Value::Str("2008-06-01".into())),
-            text("2008-06-01")
-        );
+        let key = |v: Value| key_param("k", &v, &[]);
+        assert_eq!(key(Value::Float(0.1)), text("0.1"));
+        assert_eq!(key(Value::UInt(u64::MAX)), text(&u64::MAX.to_string()));
+        assert_eq!(key(Value::UInt(5)), ColumnData::I64(Some(5)));
+        // A column the facts do not name is not rewritten.
+        assert_eq!(key(Value::Str("2008-06-01".into())), text("2008-06-01"));
     }
 
     #[test]
@@ -3913,7 +4105,7 @@ mod write_tests {
             data_row: 4,
             key: vec![Value::Int(9), Value::Null],
         };
-        let b = refetch_statement(&t, &row);
+        let b = refetch_statement(&t, &row, &[]);
         assert_eq!(
             b.sql,
             "SELECT TOP (1) [id], [qty], [note] FROM [shop].[dbo].[orders] WHERE [id] = @P1 AND [qty] IS NULL"
@@ -3932,7 +4124,7 @@ mod write_tests {
             column: "ThumbNailPhoto".into(),
             key: vec![("ProductID".into(), Value::Int(680))],
         };
-        let b = blob_statement(&r);
+        let b = blob_statement(&r, &[]);
         assert_eq!(
             b.sql,
             format!(

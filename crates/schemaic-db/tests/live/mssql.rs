@@ -3842,6 +3842,144 @@ impl Drop for ScratchLogin {
     }
 }
 
+/// **A `datetime` key and a `datetime` value mean the same day under every
+/// login language.** Under `british` — the default for a German, French,
+/// Italian or Spanish installation — `yyyy-mm-dd hh:mm:ss` converts to
+/// `datetime` as year-*day*-month, so deleting the 2 January row in the grid
+/// deleted 1 February, and the 1-row net passed it (measured on 2022). The
+/// re-read keyed the same way, and a typed value went in day-swapped.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_datetime_key_finds_its_row_under_a_day_first_login() {
+    if !enabled() || azure_cannot("creates a login, so the day-first language") {
+        return;
+    }
+    let s = Scratch::create("dmy").await;
+    let name = format!("{PREFIX}{}_mssql_brit", std::process::id());
+    let _login = ScratchLogin(name.clone());
+    base_db()
+        .fetch_query(
+            None,
+            &format!(
+                "CREATE LOGIN [{name}] WITH PASSWORD = N'Brit_2026!pass', CHECK_POLICY = OFF, \
+                 DEFAULT_LANGUAGE = british"
+            ),
+            1,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("a british login");
+    s.exec(&format!(
+        "CREATE USER [{name}] FOR LOGIN [{name}]; ALTER ROLE db_owner ADD MEMBER [{name}]; \
+         CREATE TABLE dbo.d (at datetime NOT NULL PRIMARY KEY, sm smalldatetime NULL, \
+         v nvarchar(10) NULL); \
+         INSERT dbo.d VALUES ('20260102', '20260102', N'jan2'), ('20260201', '20260201', N'feb1')"
+    ))
+    .await;
+    let brit = Db::from_parts(
+        Engine::MsSql,
+        var("HOST", "127.0.0.1"),
+        var("PORT", "1433").parse().unwrap(),
+        name.clone(),
+        "Brit_2026!pass".to_string(),
+        s.name.clone(),
+    );
+    let lang = brit
+        .fetch_query(
+            Some(&s.name),
+            "SELECT @@LANGUAGE",
+            1,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("signed in");
+    assert_eq!(lang.cell(0, 0).unwrap().display().to_string(), "British");
+    // The key exactly as the grid read it, through this login.
+    let read = brit
+        .fetch_query(
+            Some(&s.name),
+            "SELECT at, sm FROM dbo.d WHERE v = N'jan2'",
+            1,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("a read");
+    let at = read.cell(0, 0).unwrap().display().to_string();
+    let sm = read.cell(0, 1).unwrap().display().to_string();
+    assert_eq!(at, "2026-01-02 00:00:00.000");
+    let key = |at: &str| vec![("at", Value::Str(at.into()))];
+    let edit = |set: &[(&str, CellEdit)], at: &str| GridWrite {
+        updates: vec![row_edit(&s, "d", set, &key(at))],
+        ..Default::default()
+    };
+    // A typed value, in the grid's own spelling, goes in as that day.
+    brit.commit_writes(
+        &edit(&[("sm", txt("2026-03-04 10:30"))], &at),
+        CancellationToken::new(),
+    )
+    .await
+    .expect("an edit of the jan2 row");
+    assert_eq!(
+        s.scalar("SELECT CONVERT(char(16), sm, 126) FROM dbo.d WHERE v = N'jan2'")
+            .await,
+        "2026-03-04T10:30"
+    );
+    // The re-read finds the row by the same key.
+    let reread = brit
+        .refetch_rows(
+            &RefetchTemplate {
+                database: s.name.clone(),
+                schema: Some("dbo".into()),
+                table: "d".into(),
+                columns: vec!["at".into(), "v".into()],
+                key_cols: vec![0],
+                confirm_cols: vec![],
+            },
+            &[RefetchRow {
+                data_row: 0,
+                key: vec![Value::Str(at.clone())],
+            }],
+            CancellationToken::new(),
+        )
+        .await
+        .expect("a re-read");
+    assert_eq!(reread[0].1[1].display().to_string(), "jan2");
+    // A smalldatetime key, too.
+    assert!(!sm.is_empty());
+    brit.commit_writes(
+        &GridWrite {
+            deletes: vec![row_delete(&s, "d", &key(&at))],
+            ..Default::default()
+        },
+        CancellationToken::new(),
+    )
+    .await
+    .expect("the jan2 row deleted");
+    assert_eq!(s.scalar("SELECT v FROM dbo.d").await, "feb1");
+    // An imported date is the file's day too.
+    let columns = vec!["at".to_string(), "v".to_string()];
+    let mut rows = std::iter::once(Ok(vec![
+        Value::Str("2026-01-03 08:00".into()),
+        Value::Str("jan3".into()),
+    ]));
+    brit.import_rows(
+        schemaic_db::ImportTarget {
+            database: &s.name,
+            schema: Some("dbo"),
+            table: "d",
+            columns: &columns,
+        },
+        &mut rows,
+        CancellationToken::new(),
+    )
+    .await
+    .expect("imported");
+    assert_eq!(
+        s.scalar("SELECT CONVERT(char(16), at, 126) FROM dbo.d WHERE v = N'jan3'")
+            .await,
+        "2026-01-03T08:00"
+    );
+}
+
 /// **Accounts end to end, both halves.** A login and the user it brings are
 /// created in one plan and listed linked; the login signs in to the database
 /// through its user; grants at the schema and a role membership read back as
