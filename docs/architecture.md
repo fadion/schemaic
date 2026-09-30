@@ -741,8 +741,9 @@ existing prose was left alone.
     mid-edit), `clause_context`/`clause_continuation` (caret context + expected-token model for
     completion), and `diagnostics` → `Vec<Diagnostic>` (catalog-aware unknown-table, unknown-column via
     the per-scope resolver `colres` — qualified *and* unqualified, across subqueries/derived-tables/CTEs
-    with correlation — reserved-keyword-alias errors, syntax errors on completed statements, and
-    keyword-typo warnings). **AST for classification, `skip_noncode` for byte positions by default** —
+    with correlation — reserved-keyword-alias errors, syntax errors on completed statements save
+    those sqlparser has no grammar for (`parser_lacks_statement`, below), and keyword-typo
+    warnings). **AST for classification, `skip_noncode` for byte positions by default** —
     except `colres`, which uses sqlparser 0.62's now-accurate per-identifier *spans* (verified) so the
     same column name in an inner vs outer scope is placed independently. **A base table exposes more than
     its introspected columns**, so both column checks add `SqlDialect::implicit_columns` — SQLite's
@@ -836,7 +837,39 @@ existing prose was left alone.
     on: it ends the table reference of a data-modifying statement, and without it the alias check
     read `RETURNING` as an alias for `zap` in `DELETE FROM zap RETURNING *` — reserved on
     PostgreSQL, so the standard archive idiom was squiggled as broken. **Not dialect-gated**, because
-    MariaDB has `RETURNING` too.
+    MariaDB has `RETURNING` too. **Nor is its `WITH` arm**, which opens a SQL Server table hint
+    (`FROM t e WITH (NOLOCK)`) — read as the reserved word used as an alias — since no engine here
+    takes `WITH` as one. The hint's inside needed a second fix in `colres`: sqlparser carries a
+    hint as an `Expr`, so the visitor resolved `NOLOCK` as a column (``Column `nolock` not
+    found``); `Collector::hints` records each `TableFactor::Table`'s `with_hints` ranges in
+    `pre_visit_table_factor`, and an expression inside one is skipped.
+    **T-SQL is where sqlparser 0.62's grammar runs out, and a SQL Server hand check found ordinary
+    T-SQL squiggled red.** `parser_lacks_statement` withholds the parse error — only that; the
+    typo, function-typo and alias checks still run over the statement — for what that grammar does
+    not carry: `RECONFIGURE`, `CREATE [UNIQUE] [NON]CLUSTERED INDEX`, and every
+    `CREATE`/`ALTER` of a procedure, function or trigger, since it fails on a scalar function's
+    `BEGIN … RETURN … END`, a procedure's bare `@x int` parameters, `WITH SCHEMABINDING` /
+    `CALLED ON NULL INPUT` and a trigger's `WITH EXECUTE AS` (each ran clean on SQL Server 2022,
+    per the function's doc). The server stays the authority for those, as for everything else;
+    the other three engines answer `false`. The same statements broke the alias check a second
+    way: a T-SQL header *ends* in a mandatory `AS` whose next word is the body's first statement,
+    so `AS SET`, `AS BEGIN` and `AS RETURN` were reserved-alias errors. `routine_body_as` finds
+    that `AS` — the first outside parentheses not preceded by `EXECUTE`/`EXEC` — and the check
+    skips it alone, so an alias inside the body is still checked
+    (`t_sql_routine_exemptions_leave_the_body_checked`, `ordinary_t_sql_draws_no_squiggle`). It is
+    gated by `routine_header_requires_as`, an exhaustive per-dialect `match` true only for SQL
+    Server, because MySQL's routines have no header `AS` and PostgreSQL's is optional
+    (`BEGIN ATOMIC` has none) — there the first `AS` may sit inside the body. The error's remedy
+    names the engine's quote (backticks, double quotes, brackets); it said "backticks" on every
+    engine, advice neither PostgreSQL nor SQL Server accepts
+    (`a_reserved_alias_error_names_this_engines_quote`).
+    **`NON_RESERVED_KEYWORDS` is legal keywords one edit from a curated one**, which the typo
+    checker would otherwise flag. It is dialect-free, since each is legal on some engine here and
+    which engine has which is `builtin_catalog`'s half of the question. The list was widened by
+    measurement, not memory: sqlparser's `ALL_KEYWORDS` run through the checker on each engine found
+    `AFTER` flagged on all four (one edit from `ALTER`), `SHOW TABLES` on MySQL and `GROUPING SETS`
+    on PostgreSQL, among others (`a_legal_keyword_one_edit_from_a_curated_one_is_not_a_typo`). The
+    other engines' keywords that run also flagged (`ZORDER`, `ILIKE` on MySQL) stay squiggled.
     **The typo checker runs only where the app holds the engine's own catalog** — `builtin_catalog`
     answers that with one exhaustive `match` **returning the catalog itself**: `FUNCTIONS` for
     MySQL, `SQLITE_FUNCTIONS` for SQLite, `PG_FUNCTIONS` for PostgreSQL, `MSSQL_FUNCTIONS` for SQL

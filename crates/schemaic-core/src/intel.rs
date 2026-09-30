@@ -3304,7 +3304,7 @@ pub fn function_names() -> impl Iterator<Item = &'static str> {
 /// keyword", which is a wider set. So [`reserved_words`] is folded in (a word
 /// the engine refuses as an identifier is certainly not a misspelling of one)
 /// together with [`CLAUSE_KEYWORDS`] and [`NON_RESERVED_KEYWORDS`], whose doc
-/// names the three words that were left over and how they were found. Widening
+/// names the words that were left over and how they were measured. Widening
 /// an *exemption* set can only stop a legal word being underlined; `selct` is in
 /// none of these lists and is still caught on every engine.
 fn static_words(dialect: SqlDialect) -> &'static std::collections::HashSet<String> {
@@ -4983,8 +4983,12 @@ pub fn diagnostics(sql: &str, catalog: &Catalog, dialect: SqlDialect) -> Vec<Dia
                 }
             }
             Err(e) => {
-                // Don't nag about the fragment the user is still typing.
-                if !is_typing_tail {
+                // Don't nag about the fragment the user is still typing, nor
+                // about a statement the parser has no grammar for — see
+                // `parser_lacks_statement`.
+                if !is_typing_tail
+                    && !parser_lacks_statement(&tokenize_range(sql, lo, hi, dialect), dialect)
+                {
                     let (loc, msg) = split_error_location(&e.to_string());
                     let range = match loc {
                         Some((line, col)) => {
@@ -5702,7 +5706,7 @@ fn reserved_words(dialect: SqlDialect) -> &'static [&'static str] {
 /// are not the same question**, and it had been using the second to answer the
 /// first. `SQL_KEYWORDS` is curated for a popup — forty rows, the words somebody
 /// wants suggested — while the checker must not underline *any* legal keyword.
-/// The three below are the whole gap, found by running every non-reserved
+/// The first three below were the gap found by running every non-reserved
 /// grammar keyword of all three engines through the checker rather than guessed
 /// at, and they are exactly the ones that sit one edit from a curated keyword:
 ///
@@ -5713,11 +5717,33 @@ fn reserved_words(dialect: SqlDialect) -> &'static [&'static str] {
 /// - `NULLS` — `ORDER BY x NULLS FIRST`, PostgreSQL and SQLite 3.30+. One edit
 ///   from `NULL`.
 ///
-/// Dialect-free, because each is legal on more than one of the three and the
+/// Dialect-free, because each is legal on at least one engine here and the
 /// checker's job is not to say which engine has which — that is
 /// [`builtin_catalog`]'s half of the set. A fourth word belongs here the moment
 /// it is measured, not when it is remembered.
-const NON_RESERVED_KEYWORDS: &[&str] = &["VALUE", "GROUPS", "NULLS"];
+///
+/// **The first measurement missed words, so this is the second.** Running every
+/// keyword sqlparser knows (`sqlparser::keywords::ALL_KEYWORDS`) through the
+/// checker on each engine found these still squiggled on SQL their engine runs,
+/// each one edit from a curated keyword:
+///
+/// - `AFTER` — a trigger's timing on all four engines, and MySQL's
+///   `ADD COLUMN … AFTER b`. One edit from `ALTER`; a SQL Server hand check found it.
+/// - `TABLES` — MySQL's `SHOW TABLES`, PostgreSQL's `GRANT … ON ALL TABLES`.
+/// - `FULL` — MySQL's `SHOW FULL TABLES`, where it is not reserved.
+/// - `SETS` — `GROUP BY GROUPING SETS (…)`, PostgreSQL and SQL Server.
+/// - `REINDEX` — a statement on PostgreSQL and SQLite.
+/// - `STABLE`, `INHERIT`, `REPLICA`, `CREATEDB`, `DEFAULTS` — PostgreSQL's
+///   function volatility, table inheritance, `REPLICA IDENTITY`, role option,
+///   and `LIKE t INCLUDING DEFAULTS`.
+/// - `INPLACE` — MySQL's `ALGORITHM=INPLACE`.
+///
+/// The rest of that run's hits are other engines' keywords (`ZORDER`, `ILIKE`
+/// on MySQL) and stay squiggled.
+const NON_RESERVED_KEYWORDS: &[&str] = &[
+    "VALUE", "GROUPS", "NULLS", "AFTER", "TABLES", "FULL", "SETS", "REINDEX", "STABLE", "INHERIT",
+    "REPLICA", "CREATEDB", "DEFAULTS", "INPLACE",
+];
 
 /// Words that can't be a bare **identifier** (a table or column name) but *can*
 /// be an alias, so [`is_reserved_word`] must not list them.
@@ -5800,6 +5826,11 @@ fn is_table_ref_continuation(word: &str) -> bool {
             // PostgreSQL, squiggled the standard archive idiom as broken.
             // MariaDB supports `RETURNING` too, so this is not dialect-gated.
             | "RETURNING"
+            // Opens a SQL Server table hint — `FROM child WITH (READPAST)`,
+            // `FROM t e WITH (NOLOCK)` — which the alias check read as the
+            // reserved word `WITH` used as an alias. No engine here takes `WITH`
+            // as an alias, so it ends the reference everywhere.
+            | "WITH"
     )
 }
 
@@ -5913,6 +5944,107 @@ fn enclosing_call_name(toks: &[Token], i: usize) -> Option<&str> {
     None
 }
 
+/// The first `n` words of a statement, upper-cased, stopping at the first
+/// token that is not an unquoted word — the statement's **head**, as the
+/// questions below read it.
+fn head_words(toks: &[Token], n: usize) -> Vec<String> {
+    toks.iter()
+        .map_while(|t| match &t.kind {
+            TkKind::Word(w) if !t.quoted => Some(w.to_ascii_uppercase()),
+            _ => None,
+        })
+        .take(n)
+        .collect()
+}
+
+/// Does the statement create or alter a **routine or trigger** —
+/// `CREATE [OR ALTER] PROC[EDURE] | FUNCTION | TRIGGER`, or `ALTER` one?
+fn is_routine_statement(toks: &[Token]) -> bool {
+    let w = head_words(toks, 4);
+    let w: Vec<&str> = w.iter().map(String::as_str).collect();
+    let kind = match w.as_slice() {
+        ["CREATE", "OR", "ALTER" | "REPLACE", kind, ..] => kind,
+        ["CREATE" | "ALTER", kind, ..] => kind,
+        _ => return false,
+    };
+    matches!(*kind, "PROC" | "PROCEDURE" | "FUNCTION" | "TRIGGER")
+}
+
+/// Does this dialect's routine and trigger header **end in a mandatory `AS`**,
+/// with the body after it?
+///
+/// T-SQL's does — `CREATE TRIGGER tr ON t AFTER INSERT AS SET NOCOUNT ON`,
+/// `… RETURNS int AS BEGIN … END`, `… RETURNS TABLE AS RETURN SELECT …` — and
+/// the word after that `AS` is the body's first statement, never an alias.
+/// MySQL's routines and every engine's other triggers have no such `AS`, and
+/// PostgreSQL's is optional (`BEGIN ATOMIC` has none), so there the first `AS`
+/// may sit inside the body, where an alias check belongs.
+fn routine_header_requires_as(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MsSql => true,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+    }
+}
+
+/// Index in `toks` of the `AS` that ends a routine's header, where
+/// [`routine_header_requires_as`] says there is one: the first `AS` outside
+/// parentheses that is not `EXECUTE AS`'s (`WITH EXECUTE AS OWNER`, an option
+/// inside the header). A parameter default's `CAST(1 AS int)` sits in
+/// parentheses.
+///
+/// The alias check read that `AS` as introducing an alias, so every T-SQL
+/// routine whose body opened on a reserved word — `SET`, `BEGIN`, `RETURN` —
+/// drew a red "reserved keyword … can't be used as an alias".
+fn routine_body_as(toks: &[Token], dialect: SqlDialect) -> Option<usize> {
+    if !routine_header_requires_as(dialect) || !is_routine_statement(toks) {
+        return None;
+    }
+    let mut depth = 0usize;
+    for (i, t) in toks.iter().enumerate() {
+        match &t.kind {
+            TkKind::LParen => depth += 1,
+            TkKind::RParen => depth = depth.saturating_sub(1),
+            TkKind::Word(w) if depth == 0 && !t.quoted && w.eq_ignore_ascii_case("AS") => {
+                let execute_as = i > 0
+                    && matches!(&toks[i - 1].kind, TkKind::Word(p)
+                        if p.eq_ignore_ascii_case("EXECUTE") || p.eq_ignore_ascii_case("EXEC"));
+                if !execute_as {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Does sqlparser's grammar for `dialect` **lack** the statement `toks` opens,
+/// so that its parse error says nothing about the SQL?
+///
+/// sqlparser's T-SQL grammar does not carry `RECONFIGURE`, `CREATE [UNIQUE]
+/// [NON]CLUSTERED INDEX`, or most routines — a scalar function's
+/// `BEGIN … RETURN … END`, a procedure's bare `@x int` parameters, a function's
+/// `WITH SCHEMABINDING` / `CALLED ON NULL INPUT` options, a trigger's `WITH
+/// EXECUTE AS` — and each ran clean on SQL Server 2022 under a red syntax error
+/// here. The server stays the authority: [`diagnostics`] reports no parse error
+/// for these and still runs its lexical checks over them — only the parse
+/// error is withheld.
+fn parser_lacks_statement(toks: &[Token], dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+        SqlDialect::MsSql => {
+            let w = head_words(toks, 3);
+            let w: Vec<&str> = w.iter().map(String::as_str).collect();
+            match w.as_slice() {
+                ["RECONFIGURE", ..]
+                | ["CREATE", "CLUSTERED" | "NONCLUSTERED", ..]
+                | ["CREATE", "UNIQUE", "CLUSTERED" | "NONCLUSTERED", ..] => true,
+                _ => is_routine_statement(toks),
+            }
+        }
+    }
+}
+
 /// Flag a reserved keyword used as an alias — explicit (`orders AS or`, `id AS key`)
 /// or implicit (`orders or`) — a syntax error unless backtick-quoted. Runs
 /// unconditionally: sqlparser is laxer than MySQL here (it *accepts* `AS or`), so
@@ -5921,15 +6053,25 @@ fn enclosing_call_name(toks: &[Token], i: usize) -> Option<&str> {
 /// SQL isn't squiggled.
 fn alias_checks(sql: &str, lo: usize, hi: usize, dialect: SqlDialect, out: &mut Vec<Diagnostic>) {
     let toks = tokenize_range(sql, lo, hi, dialect);
+    // The remedy names this engine's quote: backticks were SQL Server's and
+    // PostgreSQL's advice too, and neither accepts them.
+    let quote = match dialect {
+        SqlDialect::MySql => "backticks",
+        SqlDialect::Postgres | SqlDialect::Sqlite => "double quotes",
+        SqlDialect::MsSql => "brackets",
+    };
     let flag = |out: &mut Vec<Diagnostic>, at: usize, kw: &str| {
         out.push(Diagnostic {
             range: (at, at + kw.len()),
             severity: Severity::Error,
             message: format!(
-                "`{kw}` is a reserved keyword and can't be used as an alias (quote it with backticks)"
+                "`{kw}` is a reserved keyword and can't be used as an alias (quote it with {quote})"
             ),
         });
     };
+    // A T-SQL routine's header ends in an `AS` its body follows — see
+    // `routine_body_as`.
+    let body_as = routine_body_as(&toks, dialect);
     // Only a CTAS / view (`CREATE … AS SELECT`) legitimately puts a query *body*
     // after `AS`; in a plain SELECT, `col AS select` is a reserved-word alias mistake.
     let is_create = toks
@@ -5945,6 +6087,9 @@ fn alias_checks(sql: &str, lo: usize, hi: usize, dialect: SqlDialect, out: &mut 
             continue;
         };
         if !a.eq_ignore_ascii_case("AS") || !is_reserved_word(b, dialect) {
+            continue;
+        }
+        if body_as == Some(i) {
             continue;
         }
         // A CTAS/view body isn't an alias (`CREATE TABLE t AS SELECT …`).
@@ -6249,6 +6394,7 @@ mod colres {
             scopes: Vec::new(),
             refs: Vec::new(),
             gb: Vec::new(),
+            hints: Vec::new(),
         };
         let _ = ast.visit(&mut c);
         for r in &c.refs {
@@ -6300,6 +6446,12 @@ mod colres {
         refs: Vec<Ref>,
         /// `only_full_group_by` warnings collected per SELECT scope as it's pushed.
         gb: Vec<Diagnostic>,
+        /// Byte ranges of the SQL Server table hints seen so far —
+        /// `WITH (NOLOCK)`'s `NOLOCK`. sqlparser carries a hint as an `Expr`, so
+        /// the visitor reached `NOLOCK` as a column and reported
+        /// ``Column `nolock` not found``; an identifier inside one is a hint
+        /// name, never a reference.
+        hints: Vec<(usize, usize)>,
     }
 
     impl Visitor for Collector<'_> {
@@ -6404,7 +6556,22 @@ mod colres {
             ControlFlow::Continue(())
         }
 
+        /// Record a table's hints before the visitor descends into them — see
+        /// [`Collector::hints`].
+        fn pre_visit_table_factor(&mut self, t: &TableFactor) -> ControlFlow<()> {
+            if let TableFactor::Table { with_hints, .. } = t {
+                for h in with_hints {
+                    self.hints.push(to_range(self.stmt, self.lo, h.span()));
+                }
+            }
+            ControlFlow::Continue(())
+        }
+
         fn pre_visit_expr(&mut self, e: &Expr) -> ControlFlow<()> {
+            let at = to_range(self.stmt, self.lo, e.span());
+            if self.hints.iter().any(|h| h.0 <= at.0 && at.1 <= h.1) {
+                return ControlFlow::Continue(());
+            }
             match e {
                 Expr::Identifier(id) => self.refs.push(Ref {
                     qualifier: None,
@@ -11299,7 +11466,7 @@ mod tests {
         // MySQL keeps its own, and SQLite keeps SQLite's.
         assert!(flagged("SELECT curdate() FROM t", SqlDialect::MySql).is_empty());
         assert!(flagged("SELECT strftime(a, b) FROM t", SqlDialect::Sqlite).is_empty());
-        // **The three words no list held**, on every engine — the leftovers
+        // **The words no list held**, on every engine — the leftovers
         // after the catalog half went per-dialect, and the reason
         // `NON_RESERVED_KEYWORDS` exists. Each is one edit from a curated
         // completion keyword, which is what was flagging it.
@@ -11328,6 +11495,63 @@ mod tests {
                 "{dialect:?} stopped catching a keyword typo"
             );
         }
+    }
+
+    /// **Each engine's own statements, where the second measurement found a
+    /// legal keyword squiggled** — see [`NON_RESERVED_KEYWORDS`]. `AFTER` was
+    /// flagged on every engine, one edit from `ALTER`; `SHOW TABLES` on MySQL.
+    #[test]
+    fn a_legal_keyword_one_edit_from_a_curated_one_is_not_a_typo() {
+        let cat = Catalog::build(&[], None);
+        let squiggled = [
+            (SqlDialect::MySql, "SHOW TABLES;"),
+            (SqlDialect::MySql, "SHOW FULL TABLES;"),
+            (SqlDialect::MySql, "ALTER TABLE t ADD COLUMN c INT AFTER b;"),
+            (
+                SqlDialect::MySql,
+                "CREATE TRIGGER tr AFTER INSERT ON t FOR EACH ROW SET @a = 1;",
+            ),
+            (
+                SqlDialect::MySql,
+                "ALTER TABLE t ADD INDEX (a), ALGORITHM=INPLACE;",
+            ),
+            (
+                SqlDialect::Postgres,
+                "SELECT a FROM t GROUP BY GROUPING SETS ((a), ());",
+            ),
+            (SqlDialect::Postgres, "REINDEX TABLE t;"),
+            (
+                SqlDialect::Postgres,
+                "GRANT SELECT ON ALL TABLES IN SCHEMA public TO r;",
+            ),
+            (SqlDialect::Sqlite, "REINDEX t;"),
+            (
+                SqlDialect::Sqlite,
+                "CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END;",
+            ),
+            (
+                SqlDialect::MsSql,
+                "CREATE TRIGGER dbo.tr ON dbo.t AFTER INSERT AS SET NOCOUNT ON;",
+            ),
+        ]
+        .into_iter()
+        .map(|(d, sql)| {
+            let hits: Vec<_> = diagnostics(sql, &cat, d)
+                .into_iter()
+                .filter(|x| x.message.contains("misspelled keyword"))
+                .map(|x| sql[x.range.0..x.range.1].to_string())
+                .collect();
+            (d, sql, hits)
+        })
+        .filter(|(_, _, hits)| !hits.is_empty())
+        .collect::<Vec<_>>();
+        assert!(squiggled.is_empty(), "{squiggled:#?}");
+        // The checker still runs on SQL Server: `ALTR` is no keyword.
+        assert!(
+            diagnostics("SELECT * FROM t WHERE altr = 1", &cat, SqlDialect::MsSql)
+                .iter()
+                .any(|x| x.message.contains("misspelled keyword"))
+        );
     }
 
     #[test]
@@ -12341,6 +12565,105 @@ mod tests {
             .iter()
             .any(|x| x.message.contains("misspelled function"))
         );
+    }
+
+    /// **Ordinary T-SQL draws no squiggle.** Each statement below runs on SQL
+    /// Server 2022 and was reported squiggled from a hand check: a parse error
+    /// on a statement sqlparser's T-SQL grammar does not carry, a keyword
+    /// flagged as a misspelling, or a reserved word read as an alias.
+    #[test]
+    fn ordinary_t_sql_draws_no_squiggle() {
+        let squiggled = [
+            "RECONFIGURE;",
+            "RECONFIGURE WITH OVERRIDE;",
+            "CREATE CLUSTERED INDEX cx_parent_code ON dbo.parent (code);",
+            "CREATE NONCLUSTERED INDEX ix_parent_code ON dbo.parent (code);",
+            "CREATE UNIQUE CLUSTERED INDEX ux_parent_code ON dbo.parent (code);",
+            "CREATE TRIGGER dbo.tr_a ON dbo.parent AFTER INSERT AS SET NOCOUNT ON;",
+            "CREATE FUNCTION dbo.f_scalar (@x int) RETURNS int WITH CALLED ON NULL INPUT \
+             AS BEGIN RETURN @x * 2 END;",
+            "CREATE FUNCTION dbo.f_tvf (@x int) RETURNS TABLE AS RETURN SELECT @x AS x;",
+            "CREATE OR ALTER FUNCTION dbo.f (@x int) RETURNS int WITH EXECUTE AS CALLER \
+             AS BEGIN RETURN @x END;",
+            "CREATE PROCEDURE dbo.p @x int = NULL AS SET NOCOUNT ON;",
+            "ALTER PROC dbo.p @x int WITH RECOMPILE AS BEGIN RETURN END;",
+            "CREATE TRIGGER dbo.tr ON dbo.parent WITH EXECUTE AS OWNER AFTER INSERT \
+             AS SET NOCOUNT ON;",
+            "SELECT * FROM dbo.child WITH (READPAST);",
+            "SELECT * FROM employees WITH (NOLOCK);",
+            "SELECT * FROM employees e WITH (NOLOCK) JOIN departments d ON d.id = e.id;",
+        ]
+        .into_iter()
+        .map(|sql| (sql, diag_d(sql, SqlDialect::MsSql)))
+        .filter(|(_, d)| !d.is_empty())
+        .collect::<Vec<_>>();
+        assert!(squiggled.is_empty(), "{squiggled:#?}");
+    }
+
+    /// **What the T-SQL exemptions leave standing.** Withholding a routine's
+    /// parse error and passing its header's `AS` must not blind the checker:
+    /// a reserved alias inside the body is still caught, a statement the
+    /// parser does carry still reports its syntax error, and the only `AS`
+    /// skipped is the header's own.
+    #[test]
+    fn t_sql_routine_exemptions_leave_the_body_checked() {
+        let alias_errors = |sql: &str, dialect: SqlDialect| -> Vec<String> {
+            diag_d(sql, dialect)
+                .into_iter()
+                .filter(|x| x.message.contains("reserved keyword"))
+                .map(|x| sql[x.range.0..x.range.1].to_string())
+                .collect()
+        };
+        assert_eq!(
+            alias_errors(
+                "CREATE PROCEDURE dbo.p AS SELECT id AS order FROM employees;",
+                SqlDialect::MsSql
+            ),
+            vec!["order"]
+        );
+        // MySQL's routines have no header `AS`, so the first one is the body's
+        // and an alias mistake there is still flagged.
+        assert_eq!(
+            alias_errors(
+                "CREATE PROCEDURE p() SELECT id AS order FROM employees;",
+                SqlDialect::MySql
+            ),
+            vec!["order"]
+        );
+        // A table hint ends the reference, and a reserved alias before it is
+        // still one.
+        assert_eq!(
+            alias_errors(
+                "SELECT * FROM employees or WITH (NOLOCK);",
+                SqlDialect::MsSql
+            ),
+            vec!["or"]
+        );
+        // A SELECT the grammar carries still reports its syntax error.
+        assert!(
+            diag_d("SELECT * FROM employees WHERE;", SqlDialect::MsSql)
+                .iter()
+                .any(|x| x.message.starts_with("Syntax error"))
+        );
+    }
+
+    /// **The alias error's remedy names the engine's own quote.** It said
+    /// "backticks" on every engine, and only MySQL takes them.
+    #[test]
+    fn a_reserved_alias_error_names_this_engines_quote() {
+        for (dialect, quote) in [
+            (SqlDialect::MySql, "backticks"),
+            (SqlDialect::Postgres, "double quotes"),
+            (SqlDialect::Sqlite, "double quotes"),
+            (SqlDialect::MsSql, "brackets"),
+        ] {
+            let d = diag_d("SELECT id AS select FROM employees;", dialect);
+            assert!(
+                d.iter()
+                    .any(|x| x.message.ends_with(&format!("(quote it with {quote})"))),
+                "{dialect:?}: {d:?}"
+            );
+        }
     }
 
     /// **SQLite answers for its own functions**, which is what having a catalog
