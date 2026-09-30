@@ -839,8 +839,14 @@ existing prose was left alone.
     functions, not "any call"**, because the tempting rule ("a `(` directly preceded by a word is a
     call") sorts a subquery onto the wrong side: `FROM (SELECT …)`'s paren is also preceded by a
     word, namely `FROM`. Naming the functions cannot reach a subquery at all, and the standard's list
-    of them is closed. `enclosing_call_name` — the word before the innermost *unmatched* `(` — is the
-    shared primitive, and `as_introduces_a_type` is its second caller: `CAST(x AS CHAR)` puts a
+    of them is closed. `enclosing_calls` — for every token, the word before the innermost *unmatched*
+    `(` — is the shared primitive, computed **once per token list in one forward pass over a stack of
+    open parentheses**; it was a walk back from each `FROM` asked about, and a top-level `FROM` never
+    meets the `(` that stops it, so a pass cost O(`FROM`s × tokens) and diagnostics on a
+    16,000-line T-SQL procedure — one range to the end of its batch — took 1.6 s on the keystroke
+    path (`diagnostics_work_grows_linearly_with_a_long_range` counts the steps rather than timing
+    them, since a count fails reliably and a stopwatch does not). `as_introduces_a_type` is its
+    second caller: `CAST(x AS CHAR)` puts a
     **type** after `AS`, so every MySQL cast target that is also a reserved word (`CHAR`, `UNSIGNED`,
     `DECIMAL`, `BINARY`, `CHARACTER`) was squiggled as a botched alias; `SIGNED` escaped only by
     being absent from `MYSQL_RESERVED` and `CONVERT(a, CHAR)` by not using `AS`, which is what says
@@ -1265,6 +1271,10 @@ existing prose was left alone.
     `a_warning_does_not_swallow_the_error_inside_it` pins the composition and
     `dedup_keeps_a_covered_diagnostic_only_when_the_cover_is_no_weaker` the four severity
     combinations, which is what says the fix is about severity rather than about that one statement.
+    It is **one sweep after the sort**: everything kept starts no later than the diagnostic in hand,
+    so that one is covered exactly when a kept error (for an error) or any kept diagnostic (for a
+    warning) reaches as far, and two running maxima answer it. It compared each diagnostic with
+    every one kept before it, O(d²) on the flood a long routine could raise.
     **The false-positive corpus is only half a defence on its own, and that is why there are now two
     passes over it.** `diag_bare` builds `Catalog::build(&[], None)`, so `unqualified_db_loaded` is
     false, `table_status` answers `Unknown` for every unqualified reference, and

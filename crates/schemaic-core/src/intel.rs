@@ -4826,6 +4826,7 @@ fn table_refs_with_pos(
     dialect: SqlDialect,
 ) -> Vec<(TableRef, (usize, usize))> {
     let toks = tokenize_range(sql, lo, hi, dialect);
+    let calls = enclosing_calls(&toks);
     let word = |k: &TkKind| -> Option<String> {
         if let TkKind::Word(w) = k {
             Some(w.clone())
@@ -4850,7 +4851,7 @@ fn table_refs_with_pos(
         // arguments — see `from_separates_call_arguments`. A subquery's `FROM`
         // is still a table list, which is why this asks the *call's name* and
         // not the paren depth.
-        if is_from && from_separates_call_arguments(&toks, i) {
+        if is_from && from_separates_call_arguments(&toks, &calls, i) {
             i += 1;
             continue;
         }
@@ -5875,13 +5876,14 @@ fn is_implicit_alias(word: &str, dialect: SqlDialect) -> bool {
 /// reserved list, and `CONVERT(a, CHAR)` escaped by not using `AS` at all,
 /// which is what says the `AS` form is the whole of it.
 ///
-/// Answered by walking back to the nearest **unmatched** `(` and asking what
-/// word opened it, rather than off the AST: [`alias_checks`] runs
-/// unconditionally, including where the parse failed, because sqlparser accepts
-/// `AS or` and gating on a parse would miss the real thing this diagnostic is
-/// for. The tokenizer already emits `LParen`/`RParen`, so this adds no scanner.
-fn as_introduces_a_type(toks: &[Token], i: usize) -> bool {
-    enclosing_call_name(toks, i).is_some_and(|w| {
+/// Answered by asking what word opened the nearest **unmatched** `(`
+/// ([`enclosing_calls`], computed once for `toks`), rather than off the AST:
+/// [`alias_checks`] runs unconditionally, including where the parse failed,
+/// because sqlparser accepts `AS or` and gating on a parse would miss the real
+/// thing this diagnostic is for. The tokenizer already emits
+/// `LParen`/`RParen`, so this adds no scanner.
+fn as_introduces_a_type(toks: &[Token], calls: &[Option<usize>], i: usize) -> bool {
+    enclosing_call_name(toks, calls, i).is_some_and(|w| {
         matches!(
             w.to_ascii_uppercase().as_str(),
             "CAST" | "CONVERT" | "TRY_CAST" | "SAFE_CAST"
@@ -5911,8 +5913,8 @@ fn as_introduces_a_type(toks: &[Token], i: usize) -> bool {
 /// side, because `FROM (SELECT …)`'s paren is also directly preceded by a word,
 /// namely `FROM`. Naming the four functions cannot reach a subquery at all, and
 /// the standard's list of them is closed.
-fn from_separates_call_arguments(toks: &[Token], i: usize) -> bool {
-    enclosing_call_name(toks, i).is_some_and(|w| {
+fn from_separates_call_arguments(toks: &[Token], calls: &[Option<usize>], i: usize) -> bool {
+    enclosing_call_name(toks, calls, i).is_some_and(|w| {
         matches!(
             w.to_ascii_uppercase().as_str(),
             "EXTRACT" | "TRIM" | "SUBSTRING" | "SUBSTR" | "OVERLAY"
@@ -5920,31 +5922,55 @@ fn from_separates_call_arguments(toks: &[Token], i: usize) -> bool {
     })
 }
 
-/// The word immediately before the innermost **unmatched** `(` above `toks[i]`
-/// — the name of the call whose parentheses enclose it, if any.
+/// For every token, the index of the word immediately before the innermost
+/// **unmatched** `(` enclosing it — the call whose parentheses hold it, if any.
+/// A `(` itself answers for the parentheses around it, a `)` for the ones it
+/// closes. Read an entry through [`enclosing_call_name`].
 ///
-/// `None` when `toks[i]` is not inside parentheses, or when the `(` was opened
+/// `None` when the token is not inside parentheses, or when the `(` was opened
 /// by something other than a word. A *subquery's* `(` is also preceded by a
 /// word (`FROM (`, `IN (`, `EXISTS (`), so a caller decides on the **name**
-/// rather than on this returning `Some`.
-fn enclosing_call_name(toks: &[Token], i: usize) -> Option<&str> {
-    let mut depth = 0i32;
-    let mut j = i;
-    while j > 0 {
-        j -= 1;
-        match &toks[j].kind {
-            TkKind::RParen => depth += 1,
-            TkKind::LParen if depth > 0 => depth -= 1,
-            TkKind::LParen => {
-                return match toks.get(j.wrapping_sub(1)).map(|t| &t.kind) {
-                    Some(TkKind::Word(w)) if j > 0 => Some(w.as_str()),
-                    _ => None,
-                };
+/// rather than on a `Some`.
+///
+/// **One forward pass over a stack of open parentheses, for every token at
+/// once.** It was a walk back from each token asked about until an unmatched
+/// `(`, and a `FROM` at the top level never meets one, so every `FROM` walked
+/// to the range's first token: O(`FROM`s × tokens) per pass. A T-SQL routine
+/// body is one range to the end of its batch, and diagnostics on a
+/// 16,000-line procedure took 1.6 s on the keystroke path
+/// (`diagnostics_work_grows_linearly_with_a_long_range`).
+fn enclosing_calls(toks: &[Token]) -> Vec<Option<usize>> {
+    let mut out = Vec::with_capacity(toks.len());
+    let mut open: Vec<Option<usize>> = Vec::new();
+    for (i, t) in toks.iter().enumerate() {
+        #[cfg(test)]
+        work::tick(&work::CALL_SCAN);
+        out.push(open.last().copied().flatten());
+        match t.kind {
+            TkKind::LParen => open.push(
+                i.checked_sub(1)
+                    .filter(|&j| matches!(toks[j].kind, TkKind::Word(_))),
+            ),
+            TkKind::RParen => {
+                open.pop();
             }
             _ => {}
         }
     }
-    None
+    out
+}
+
+/// The name of the call whose parentheses enclose `toks[i]`, read off
+/// [`enclosing_calls`]' answer for the same tokens.
+fn enclosing_call_name<'a>(
+    toks: &'a [Token],
+    calls: &[Option<usize>],
+    i: usize,
+) -> Option<&'a str> {
+    match calls.get(i).copied().flatten().map(|j| &toks[j].kind) {
+        Some(TkKind::Word(w)) => Some(w.as_str()),
+        _ => None,
+    }
 }
 
 /// The first `n` words of a statement, upper-cased, stopping at the first
@@ -6098,6 +6124,7 @@ fn alias_checks(sql: &str, lo: usize, hi: usize, dialect: SqlDialect, out: &mut 
         SqlDialect::Postgres | SqlDialect::Sqlite => "double quotes",
         SqlDialect::MsSql => "brackets",
     };
+    let calls = enclosing_calls(&toks);
     let flag = |out: &mut Vec<Diagnostic>, at: usize, kw: &str| {
         out.push(Diagnostic {
             range: (at, at + kw.len()),
@@ -6135,7 +6162,7 @@ fn alias_checks(sql: &str, lo: usize, hi: usize, dialect: SqlDialect, out: &mut 
             continue;
         }
         // Nor is a cast's target type — see `as_introduces_a_type`.
-        if as_introduces_a_type(&toks, i) {
+        if as_introduces_a_type(&toks, &calls, i) {
             continue;
         }
         // `AS `select`` is legal — quoting is the whole remedy this diagnostic
@@ -7447,6 +7474,13 @@ fn friendly_syntax_message(msg: &str) -> String {
 /// — the statement will fail, and the user was told about the lesser of the two.
 /// Adding an `ON` brought the error back, which is what says the warning was the
 /// cause.
+///
+/// **One sweep after the sort.** Every diagnostic kept so far starts at or
+/// before the one in hand, so it is covered exactly when some kept one reaches
+/// at least as far — among the errors for an error, among all of them for a
+/// warning — and the two furthest reaches are all that needs remembering. It
+/// compared each diagnostic with every one kept before it, O(d²) on the flood
+/// a long routine can raise (`diagnostics_work_grows_linearly_with_a_long_range`).
 fn dedup_diagnostics(mut v: Vec<Diagnostic>) -> Vec<Diagnostic> {
     // Errors first so a Warning on the same span is the one dropped.
     v.sort_by(|a, b| {
@@ -7455,20 +7489,51 @@ fn dedup_diagnostics(mut v: Vec<Diagnostic>) -> Vec<Diagnostic> {
             .cmp(&b.range.0)
             .then((a.severity == Severity::Warning).cmp(&(b.severity == Severity::Warning)))
     });
-    let rank = |s: Severity| match s {
-        Severity::Error => 1u8,
-        Severity::Warning => 0,
-    };
+    // How far the kept errors, and the kept diagnostics of either severity,
+    // reach.
+    let (mut error_reach, mut any_reach) = (None::<usize>, None::<usize>);
     let mut out: Vec<Diagnostic> = Vec::new();
     for d in v {
-        let covered = out.iter().any(|e| {
-            e.range.0 <= d.range.0 && d.range.1 <= e.range.1 && rank(e.severity) >= rank(d.severity)
-        });
-        if !covered {
-            out.push(d);
+        #[cfg(test)]
+        work::tick(&work::DEDUP);
+        let reach = match d.severity {
+            Severity::Error => error_reach,
+            Severity::Warning => any_reach,
+        };
+        if reach.is_some_and(|r| d.range.1 <= r) {
+            continue;
         }
+        if d.severity == Severity::Error {
+            error_reach = error_reach.max(Some(d.range.1));
+        }
+        any_reach = any_reach.max(Some(d.range.1));
+        out.push(d);
     }
     out
+}
+
+/// Work counters for the complexity pins in the tests — `cfg(test)` only. A
+/// timing assertion cannot fail reliably on a shared machine; a count of the
+/// steps a scan took can, and it grows the same way the time does.
+#[cfg(test)]
+mod work {
+    use std::cell::Cell;
+    use std::thread::LocalKey;
+
+    thread_local! {
+        /// Tokens the enclosing-call scan has stepped over.
+        pub(super) static CALL_SCAN: Cell<usize> = const { Cell::new(0) };
+        /// Comparisons `dedup_diagnostics` has made.
+        pub(super) static DEDUP: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn tick(counter: &'static LocalKey<Cell<usize>>) {
+        counter.with(|n| n.set(n.get() + 1));
+    }
+
+    pub(super) fn read(counter: &'static LocalKey<Cell<usize>>) -> usize {
+        counter.with(Cell::get)
+    }
 }
 
 // ── FK-aware JOIN … ON completion ────────────────────────────────────────────
@@ -13485,6 +13550,116 @@ mod tests {
             ["a", "b"]
         );
         assert!(dedup_diagnostics(Vec::new()).is_empty());
+    }
+
+    /// **The one-pass enclosing-call scan answers what the walk back did**, for
+    /// every token: the word before the innermost unmatched `(`, a `(` for the
+    /// parentheses around it and a `)` for the ones it closes.
+    #[test]
+    fn enclosing_calls_names_the_innermost_open_call() {
+        let sql = "(a) SELECT CAST(x AS int), EXTRACT(YEAR FROM (SELECT d FROM t)) FROM u";
+        let toks = tokenize_range(sql, 0, sql.len(), SqlDialect::MySql);
+        let calls = enclosing_calls(&toks);
+        let named = |text: &str, nth: usize| {
+            let i = toks
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| &sql[t.at..t.end] == text)
+                .nth(nth)
+                .map(|(i, _)| i)
+                .unwrap();
+            enclosing_call_name(&toks, &calls, i)
+        };
+        // A `(` with no word before it names no call.
+        assert_eq!(named("a", 0), None);
+        assert_eq!(named("AS", 0), Some("CAST"));
+        assert_eq!(named("(", 1), None, "the `(` of CAST is outside it");
+        assert_eq!(
+            named(")", 1),
+            Some("CAST"),
+            "a `)` answers for what it closes"
+        );
+        assert_eq!(named("FROM", 0), Some("EXTRACT"));
+        // A subquery's `(` follows the word `FROM`, and that is the name a
+        // caller decides on.
+        assert_eq!(named("FROM", 1), Some("FROM"));
+        assert_eq!(named("FROM", 2), None, "the outer FROM is at the top level");
+        assert_eq!(named("u", 0), None);
+    }
+
+    /// **Diagnostics grow linearly with the text, however long one range is.**
+    ///
+    /// Every `FROM` asked whether it sat inside an `EXTRACT(…)`-style call by
+    /// walking back towards the range's first token, and a `FROM` at the top
+    /// level never meets the `(` that would stop it — so a pass cost
+    /// O(`FROM`s × tokens). A T-SQL routine body is one range to the end of its
+    /// batch, and a 16,000-line procedure took 1.6 s on the keystroke path.
+    /// `dedup_diagnostics` compared each diagnostic with every one kept before
+    /// it, O(d²) on a flood of them. Counted rather than timed: quadrupling the
+    /// input must not do much more than quadruple the steps, where a quadratic
+    /// scan multiplies them by sixteen.
+    #[test]
+    fn diagnostics_work_grows_linearly_with_a_long_range() {
+        let steps = |sql: &str, dialect: SqlDialect| {
+            let before = (work::read(&work::CALL_SCAN), work::read(&work::DEDUP));
+            diag_d(sql, dialect);
+            (
+                work::read(&work::CALL_SCAN) - before.0,
+                work::read(&work::DEDUP) - before.1,
+            )
+        };
+        let routine = |n: usize| {
+            let mut s = String::from("CREATE PROCEDURE dbo.p AS BEGIN\n");
+            for _ in 0..n {
+                s.push_str("SELECT id, name FROM employees WHERE id = 1;\n");
+            }
+            s.push_str("END");
+            s
+        };
+        // One statement with a `FROM` per branch.
+        let union = |n: usize| {
+            let mut s = String::from("SELECT id FROM employees");
+            for _ in 0..n {
+                s.push_str(" UNION ALL SELECT id FROM employees");
+            }
+            s.push(';');
+            s
+        };
+        for (what, small, large, dialect) in [
+            ("routine", routine(200), routine(800), SqlDialect::MsSql),
+            ("union", union(200), union(800), SqlDialect::MsSql),
+            ("union", union(200), union(800), SqlDialect::MySql),
+        ] {
+            let (scan_s, dedup_s) = steps(&small, dialect);
+            let (scan_l, dedup_l) = steps(&large, dialect);
+            assert!(
+                scan_l <= 5 * scan_s.max(1),
+                "{what} on {dialect:?}: the call scan took {scan_s} steps, then {scan_l} at 4x"
+            );
+            assert!(
+                dedup_l <= 5 * dedup_s.max(1),
+                "{what} on {dialect:?}: dedup took {dedup_s} steps, then {dedup_l} at 4x"
+            );
+        }
+        // A flood straight into the dedup.
+        let flood = |n: usize| {
+            (0..n)
+                .map(|i| Diagnostic {
+                    range: (i * 10, i * 10 + 5),
+                    severity: Severity::Error,
+                    message: String::new(),
+                })
+                .collect::<Vec<_>>()
+        };
+        let before = work::read(&work::DEDUP);
+        dedup_diagnostics(flood(500));
+        let small = work::read(&work::DEDUP) - before;
+        dedup_diagnostics(flood(2000));
+        let large = work::read(&work::DEDUP) - before - small;
+        assert!(
+            large <= 5 * small.max(1),
+            "dedup: {small} steps, then {large} at 4x"
+        );
     }
 
     /// **A reverse-edge JOIN suggestion keeps the server's own casing.**
