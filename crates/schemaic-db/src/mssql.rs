@@ -2393,6 +2393,18 @@ pub(crate) async fn import_rows(
             let undone = rollback(&mut client).await;
             return Err(DbError::Refused(format!("{msg}{}", undone.note())));
         }
+        let check = import_code_page_check(target.columns, &facts, &batch, total);
+        let refusal = match check.refusal {
+            Some(msg) => Some(msg),
+            None => match server_code_page_refusal(&mut client, &check.ask_server).await {
+                Ok(r) => r,
+                Err(e) => return Err(failed(&mut client, err_text(e)).await),
+            },
+        };
+        if let Some(msg) = refusal {
+            let undone = rollback(&mut client).await;
+            return Err(DbError::Refused(format!("{msg}{}", undone.note())));
+        }
         let Some(sql) = schemaic_core::import::build_insert(
             target.database,
             target.schema,
@@ -2687,10 +2699,188 @@ struct ColumnFacts {
     /// The base type — an alias type's underlying one — lower case.
     base_type: String,
     identity: bool,
+    /// The code page a `char`/`varchar`/`text` column stores its text in —
+    /// `65001` under a UTF-8 collation — and `0` for every other column,
+    /// whose text (if any) is Unicode.
+    code_page: u32,
+    /// The column's collation, for asking the server about a code page
+    /// [`code_page_fit`] cannot answer.
+    collation: Option<String>,
 }
 
-const COLUMN_FACTS: &str = "SELECT c.name, TYPE_NAME(c.system_type_id), c.is_identity \
+const COLUMN_FACTS: &str = "SELECT c.name, TYPE_NAME(c.system_type_id), c.is_identity, \
+            c.collation_name, CAST(COLLATIONPROPERTY(c.collation_name, 'CodePage') AS int) \
      FROM sys.columns c WHERE c.object_id = OBJECT_ID(@P1)";
+
+/// Does `base_type` store its text in a code page rather than as Unicode?
+fn holds_code_page_text(base_type: &str) -> bool {
+    matches!(base_type, "char" | "varchar" | "text")
+}
+
+/// Whether a value survives the conversion into a column's code page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fit {
+    Fits,
+    /// The first character the code page has no byte for — which SQL Server
+    /// writes as `?`, or as a best-fit look-alike (`Ω` as `O`), without a word.
+    Loses(char),
+    /// A code page this cannot read locally; the server has to be asked.
+    Unknown,
+}
+
+/// Does `text` survive SQL Server's conversion into `code_page`?
+///
+/// `0` is a Unicode column and `65001` a UTF-8 collation, both of which hold
+/// everything; ASCII fits every code page SQL Server stores a `varchar` in.
+/// The rest are the Windows code pages `encoding_rs` implements, asked
+/// strictly: a character with no byte there is a loss, never the best-fit
+/// substitute the server would pick. The two IBM code pages behind the
+/// `SQL_Latin1_General_CP437`/`CP850` collations are not among them, and
+/// answer [`Fit::Unknown`].
+fn code_page_fit(code_page: u32, text: &str) -> Fit {
+    use encoding_rs::{
+        BIG5, EUC_KR, GBK, SHIFT_JIS, WINDOWS_874, WINDOWS_1250, WINDOWS_1251, WINDOWS_1252,
+        WINDOWS_1253, WINDOWS_1254, WINDOWS_1255, WINDOWS_1256, WINDOWS_1257, WINDOWS_1258,
+    };
+    if code_page == 0 || code_page == 65001 || text.is_ascii() {
+        return Fit::Fits;
+    }
+    let enc = match code_page {
+        874 => WINDOWS_874,
+        932 => SHIFT_JIS,
+        936 => GBK,
+        949 => EUC_KR,
+        950 => BIG5,
+        1250 => WINDOWS_1250,
+        1251 => WINDOWS_1251,
+        1252 => WINDOWS_1252,
+        1253 => WINDOWS_1253,
+        1254 => WINDOWS_1254,
+        1255 => WINDOWS_1255,
+        1256 => WINDOWS_1256,
+        1257 => WINDOWS_1257,
+        1258 => WINDOWS_1258,
+        _ => return Fit::Unknown,
+    };
+    if !enc.encode(text).2 {
+        return Fit::Fits;
+    }
+    let mut buf = [0u8; 4];
+    text.chars()
+        .find(|c| !c.is_ascii() && enc.encode(c.encode_utf8(&mut buf)).2)
+        .map_or(Fit::Unknown, Fit::Loses)
+}
+
+/// What [`code_page_check`] found: the refusal for the first value its column
+/// cannot hold, and the values only the server can judge.
+#[derive(Debug, Default)]
+struct CodePageCheck<'a> {
+    refusal: Option<String>,
+    ask_server: Vec<(&'a ColumnFacts, &'a str)>,
+}
+
+/// The sentence for a value `col` cannot hold. `row` names an import's row.
+fn code_page_refusal(row: Option<u64>, f: &ColumnFacts, lost: Option<char>) -> String {
+    let what = match lost {
+        Some(c) => format!(
+            "`{c}`, which code page {} has no character for",
+            f.code_page
+        ),
+        None => "a character its code page has no character for".to_string(),
+    };
+    let head = match row {
+        Some(r) => format!("Row {r} has a value for {} ({})", f.name, f.base_type),
+        None => format!("A value for {} ({})", f.name, f.base_type),
+    };
+    format!(
+        "{head} holds {what}: SQL Server would store it as `?` rather than refuse it. \
+         Store the column as nvarchar, or remove the character."
+    )
+}
+
+/// [`blank_refusal`]'s twin for the other silent conversion: text written to
+/// a `char`/`varchar`/`text` column that its code page cannot hold, which
+/// SQL Server stores as `?` and reports as success.
+fn code_page_check<'a>(write: &'a GridWrite, facts: &'a [ColumnFacts]) -> CodePageCheck<'a> {
+    let staged = write
+        .updates
+        .iter()
+        .flat_map(|u| u.set.iter())
+        .chain(write.inserts.iter().flat_map(|i| i.cols.iter()));
+    let mut out = CodePageCheck::default();
+    for (col, v) in staged {
+        let CellEdit::Text(t) = v else { continue };
+        let Some(f) = fact(facts, col) else { continue };
+        match code_page_fit(f.code_page, t) {
+            Fit::Fits => {}
+            Fit::Loses(c) => {
+                out.refusal = Some(code_page_refusal(None, f, Some(c)));
+                return out;
+            }
+            Fit::Unknown => out.ask_server.push((f, t)),
+        }
+    }
+    out
+}
+
+/// [`code_page_check`] for an import batch, naming the file's row as
+/// [`import_blank_refusal`] does.
+fn import_code_page_check<'a>(
+    columns: &[String],
+    facts: &'a [ColumnFacts],
+    batch: &'a [Vec<Value>],
+    first_row: u64,
+) -> CodePageCheck<'a> {
+    let mut out = CodePageCheck::default();
+    for (i, row) in batch.iter().enumerate() {
+        for (col, v) in columns.iter().zip(row) {
+            let Value::Str(s) = v else { continue };
+            let Some(f) = fact(facts, col) else { continue };
+            match code_page_fit(f.code_page, s) {
+                Fit::Fits => {}
+                Fit::Loses(c) => {
+                    let row = first_row + i as u64 + 1;
+                    out.refusal = Some(code_page_refusal(Some(row), f, Some(c)));
+                    return out;
+                }
+                Fit::Unknown => out.ask_server.push((f, s)),
+            }
+        }
+    }
+    out
+}
+
+/// Ask the server whether each of `values` survives its column's collation —
+/// for the code pages [`code_page_fit`] cannot read — and answer the refusal
+/// for the first that does not. A collation name is spliced into the text, so
+/// one that is not a plain word is not asked about, and the server decides.
+async fn server_code_page_refusal(
+    client: &mut MsClient,
+    values: &[(&ColumnFacts, &str)],
+) -> Result<Option<String>, DbError> {
+    for (f, text) in values {
+        let Some(coll) = f
+            .collation
+            .as_deref()
+            .filter(|c| !c.is_empty() && c.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'))
+        else {
+            continue;
+        };
+        let sql = format!(
+            "SELECT CASE WHEN CAST(CAST(@P1 COLLATE {coll} AS varchar(max)) AS nvarchar(max)) \
+             COLLATE Latin1_General_BIN2 = @P1 COLLATE Latin1_General_BIN2 THEN 1 ELSE 0 END"
+        );
+        let stream = client
+            .query(sql.as_str(), &[text])
+            .await
+            .map_err(|e| db_err(&e))?;
+        let row = stream.into_row().await.map_err(|e| db_err(&e))?;
+        if row.as_ref().and_then(|r| cell_text(r, 0)).as_deref() == Some("0") {
+            return Ok(Some(code_page_refusal(None, f, None)));
+        }
+    }
+    Ok(None)
+}
 
 /// Does `base_type` hold text, so that an empty string is a value of it?
 fn holds_text(base_type: &str) -> bool {
@@ -2698,6 +2888,15 @@ fn holds_text(base_type: &str) -> bool {
         base_type,
         "char" | "varchar" | "nchar" | "nvarchar" | "text" | "ntext" | "xml" | "sql_variant"
     )
+}
+
+/// Would SQL Server convert this text to a zero or `1900-01-01` rather than
+/// refuse it, in a column whose type is not text? An empty string, and one
+/// made only of spaces: `' '` converts exactly as `''` does, while a tab, a
+/// line break or any other blank is refused by the server itself (Msg 245 for
+/// a number, 241 for a date — measured on 2022).
+fn converts_blank(t: &str) -> bool {
+    t.bytes().all(|b| b == b' ')
 }
 
 fn fact<'a>(facts: &'a [ColumnFacts], col: &str) -> Option<&'a ColumnFacts> {
@@ -2721,12 +2920,12 @@ fn blank_refusal(write: &GridWrite, facts: &[ColumnFacts]) -> Option<String> {
         .chain(write.inserts.iter().flat_map(|i| i.cols.iter()));
     for (col, v) in staged {
         let CellEdit::Text(t) = v else { continue };
-        if !t.is_empty() {
+        if !converts_blank(t) {
             continue;
         }
         if let Some(f) = fact(facts, col).filter(|f| !holds_text(&f.base_type)) {
             return Some(format!(
-                "An empty value can't be written to {} ({}): SQL Server would store it as \
+                "An empty or blank value can't be written to {} ({}): SQL Server would store it as \
                  0 or 1900-01-01 rather than refuse it. Set the cell to NULL, or type a value.",
                 col, f.base_type
             ));
@@ -2762,12 +2961,12 @@ fn import_blank_refusal(
     for (i, row) in batch.iter().enumerate() {
         for (col, v) in columns.iter().zip(row) {
             let Value::Str(s) = v else { continue };
-            if !s.is_empty() {
+            if !converts_blank(s) {
                 continue;
             }
             if let Some(f) = fact(facts, col).filter(|f| !holds_text(&f.base_type)) {
                 return Some(format!(
-                    "Row {} has an empty value for {} ({}): SQL Server would store it as 0 or \
+                    "Row {} has an empty or blank value for {} ({}): SQL Server would store it as 0 or \
                      1900-01-01 rather than refuse it. Import empty fields as NULL, or fill them in.",
                     first_row + i as u64 + 1,
                     col,
@@ -2802,10 +3001,20 @@ async fn column_facts(
     let rows = stream.into_first_result().await.map_err(|e| db_err(&e))?;
     Ok(rows
         .iter()
-        .map(|r| ColumnFacts {
-            name: cell_text(r, 0).unwrap_or_default(),
-            base_type: cell_text(r, 1).unwrap_or_default().to_ascii_lowercase(),
-            identity: cell_text(r, 2).as_deref() == Some("1"),
+        .map(|r| {
+            let base_type = cell_text(r, 1).unwrap_or_default().to_ascii_lowercase();
+            let code_page = if holds_code_page_text(&base_type) {
+                cell_text(r, 4).and_then(|c| c.parse().ok()).unwrap_or(0)
+            } else {
+                0
+            };
+            ColumnFacts {
+                name: cell_text(r, 0).unwrap_or_default(),
+                identity: cell_text(r, 2).as_deref() == Some("1"),
+                code_page,
+                collation: cell_text(r, 3),
+                base_type,
+            }
         })
         .collect())
 }
@@ -3307,6 +3516,13 @@ pub(crate) async fn write_on(
     if let Some(msg) = blank_refusal(write, &facts) {
         return Err(DbError::Refused(msg));
     }
+    let check = code_page_check(write, &facts);
+    if let Some(msg) = check.refusal {
+        return Err(DbError::Refused(msg));
+    }
+    if let Some(msg) = server_code_page_refusal(client, &check.ask_server).await? {
+        return Err(DbError::Refused(msg));
+    }
     scope.begin(client).await?;
     let mut total = 0u64;
     for step in plan {
@@ -3524,6 +3740,8 @@ mod write_tests {
                 name: n.to_string(),
                 base_type: t.to_string(),
                 identity: *id,
+                code_page: 0,
+                collation: None,
             })
             .collect()
     }
@@ -3716,6 +3934,105 @@ mod write_tests {
             ..Default::default()
         };
         assert_eq!(blank_refusal(&fine, &f), None);
+    }
+
+    /// **A value of spaces converts like an empty one.** SQL Server stores
+    /// `' '` in an `int` as `0`, in a `datetime` or `date` as `1900-01-01`, in
+    /// a `money` as `0.0000` and in a `float` or `bit` as `0`, exactly as it
+    /// does `''` (measured on 2022), so a stray space — a spreadsheet paste of
+    /// an empty-looking cell — went round the refusal. A tab, a line break or
+    /// an ideographic space it refuses itself (Msg 245/241), so those are left
+    /// to it. A text column keeps its spaces.
+    #[test]
+    fn a_whitespace_only_value_is_refused_like_an_empty_one() {
+        let f = facts(&[
+            ("qty", "int", false),
+            ("shipped", "datetime", false),
+            ("note", "nvarchar", false),
+        ]);
+        let set = |col: &str, v: &str| GridWrite {
+            updates: vec![edit(
+                vec![(col, CellEdit::Text(v.into()))],
+                vec![("id", Value::Int(1))],
+            )],
+            ..Default::default()
+        };
+        for blank in [" ", "   "] {
+            assert!(blank_refusal(&set("qty", blank), &f).is_some(), "{blank:?}");
+            assert!(
+                blank_refusal(&set("shipped", blank), &f).is_some(),
+                "{blank:?}"
+            );
+            assert_eq!(blank_refusal(&set("note", blank), &f), None, "{blank:?}");
+        }
+        assert_eq!(blank_refusal(&set("qty", " 3 "), &f), None);
+        assert_eq!(blank_refusal(&set("qty", "\t"), &f), None);
+        let cols = ["qty".to_string()];
+        let batch = [vec![Value::Str(" ".into())]];
+        assert!(import_blank_refusal(&cols, &f, &batch, 0).is_some());
+    }
+
+    /// **Whether text survives a column's code page is told before anything
+    /// runs.** Every code page SQL Server stores a `varchar` in holds ASCII,
+    /// a UTF-8 collation and a Unicode column hold everything, and the rest
+    /// are asked of the code page itself — `Ω` is not in 1252 and is in 1253.
+    /// The two IBM code pages `encoding_rs` lacks answer `Unknown`, which the
+    /// write settles by asking the server.
+    #[test]
+    fn a_code_page_says_which_characters_it_cannot_hold() {
+        assert_eq!(code_page_fit(1252, "café"), Fit::Fits);
+        assert_eq!(code_page_fit(1252, "Ωμέγα"), Fit::Loses('Ω'));
+        assert_eq!(code_page_fit(1252, "ab日本"), Fit::Loses('日'));
+        assert_eq!(code_page_fit(1253, "Ωμέγα"), Fit::Fits);
+        assert_eq!(code_page_fit(932, "日本"), Fit::Fits);
+        assert_eq!(code_page_fit(65001, "日本😀"), Fit::Fits);
+        assert_eq!(code_page_fit(0, "日本"), Fit::Fits);
+        assert_eq!(code_page_fit(850, "plain"), Fit::Fits);
+        assert_eq!(code_page_fit(850, "é"), Fit::Unknown);
+    }
+
+    /// **Text a `varchar` column's code page cannot hold is refused**, naming
+    /// the column and the character: SQL Server writes it as `?` and reports
+    /// success (measured on 2022, `Ωμέγα` into a Latin-1 `varchar` stored as
+    /// `Oµ??a`). An `nvarchar` takes it, and so does the same `varchar` given
+    /// text its code page has. A value whose fit only the server can tell is
+    /// handed back to be asked.
+    #[test]
+    fn text_a_varchar_cannot_hold_is_refused_before_it_becomes_a_question_mark() {
+        let mut f = facts(&[("v", "varchar", false), ("n", "nvarchar", false)]);
+        f[0].code_page = 1252;
+        f[0].collation = Some("SQL_Latin1_General_CP1_CI_AS".into());
+        let set = |col: &str, v: &str| GridWrite {
+            updates: vec![edit(
+                vec![(col, CellEdit::Text(v.into()))],
+                vec![("id", Value::Int(1))],
+            )],
+            ..Default::default()
+        };
+        let greek = set("v", "Ωμέγα");
+        let msg = code_page_check(&greek, &f).refusal.expect("refused");
+        assert!(
+            msg.contains('v') && msg.contains('Ω') && msg.contains("1252"),
+            "{msg}"
+        );
+        assert!(code_page_check(&set("v", "café"), &f).refusal.is_none());
+        assert!(code_page_check(&set("n", "Ωμέγα"), &f).refusal.is_none());
+        f[0].code_page = 850;
+        let accented = set("v", "é");
+        let check = code_page_check(&accented, &f);
+        assert!(check.refusal.is_none());
+        assert_eq!(check.ask_server.len(), 1);
+
+        f[0].code_page = 1252;
+        let cols = ["n".to_string(), "v".to_string()];
+        let batch = [
+            vec![Value::Str("日本".into()), Value::Str("ok".into())],
+            vec![Value::Str("x".into()), Value::Str("日本".into())],
+        ];
+        let msg = import_code_page_check(&cols, &f, &batch, 10)
+            .refusal
+            .expect("refused");
+        assert!(msg.starts_with("Row 12 ") && msg.contains('日'), "{msg}");
     }
 
     /// `IDENTITY_INSERT` is wanted exactly when an insert gives the identity

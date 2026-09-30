@@ -1016,12 +1016,28 @@ async fn an_empty_value_is_not_written_as_zero() {
     )
     .await
     .expect_err("refused");
-    assert!(err.to_string().contains("empty value"), "{err}");
+    assert!(err.to_string().contains("empty or blank value"), "{err}");
     assert_eq!(
         s.scalar("SELECT qty FROM dbo.t").await,
         "5",
         "an alias type is its base type"
     );
+    // A space converts just as `''` does.
+    commit(
+        &s,
+        GridWrite {
+            updates: vec![row_edit(
+                &s,
+                "t",
+                &[("qty", txt("  "))],
+                &[("id", Value::Int(1))],
+            )],
+            ..Default::default()
+        },
+    )
+    .await
+    .expect_err("a value of spaces is refused too");
+    assert_eq!(s.scalar("SELECT qty FROM dbo.t").await, "5");
     commit(
         &s,
         GridWrite {
@@ -2375,6 +2391,76 @@ async fn an_imported_blank_number_is_refused_not_stored_as_zero() {
         "{err}"
     );
     assert_eq!(s.scalar("SELECT COUNT(*) FROM dbo.imp").await, "0");
+}
+
+/// **Text a `varchar` column's code page cannot hold is refused, not stored
+/// as `?`** — through an import and through the grid — while text it can
+/// hold goes in, and so does the same text into an `nvarchar`. The code page
+/// 437 column is one `encoding_rs` cannot read, so the server is asked.
+#[tokio::test(flavor = "multi_thread")]
+async fn text_a_varchar_cannot_hold_is_refused_not_stored_as_question_marks() {
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("import_cp").await;
+    s.exec(
+        "CREATE TABLE dbo.imp (id int NOT NULL PRIMARY KEY, \
+         name varchar(40) COLLATE SQL_Latin1_General_CP1_CI_AS NULL, \
+         dos varchar(40) COLLATE SQL_Latin1_General_CP437_CI_AS NULL, \
+         wide nvarchar(40) NULL); \
+         INSERT dbo.imp (id, name) VALUES (100, 'seed')",
+    )
+    .await;
+    let mut rows = (1..=3).map(|i| {
+        Ok(vec![
+            Value::Int(i),
+            Value::Str(if i == 3 {
+                "Ωμέγα".into()
+            } else {
+                "café".into()
+            }),
+        ])
+    });
+    let err = import_into(&s, &["id", "name"], &mut rows, CancellationToken::new())
+        .await
+        .expect_err("refused");
+    assert!(matches!(err, DbError::Refused(_)), "{err:?}");
+    assert!(
+        err.to_string().contains("Row 3") && err.to_string().contains('Ω'),
+        "{err}"
+    );
+    assert_eq!(s.scalar("SELECT COUNT(*) FROM dbo.imp").await, "1");
+
+    let mut rows = std::iter::once(Ok(vec![Value::Int(1), Value::Str("Ωμέγα".into())]));
+    import_into(&s, &["id", "wide"], &mut rows, CancellationToken::new())
+        .await
+        .expect("an nvarchar holds it");
+
+    let set = |col: &str, v: &str| GridWrite {
+        updates: vec![row_edit(
+            &s,
+            "imp",
+            &[(col, txt(v))],
+            &[("id", Value::Int(100))],
+        )],
+        ..Default::default()
+    };
+    let err = commit(&s, set("name", "日本")).await.expect_err("refused");
+    assert!(err.to_string().contains('日'), "{err}");
+    let err = commit(&s, set("dos", "Ωμέγα")).await.expect_err("refused");
+    assert!(err.to_string().contains("dos"), "{err}");
+    assert_eq!(
+        s.scalar("SELECT name FROM dbo.imp WHERE id = 100").await,
+        "seed"
+    );
+    commit(&s, set("name", "café")).await.expect("1252 holds é");
+    commit(&s, set("dos", "é")).await.expect("437 holds é");
+    // Read back as `nvarchar`: the driver decodes no code page 437 text.
+    assert_eq!(
+        s.scalar("SELECT CAST(dos AS nvarchar(40)) FROM dbo.imp WHERE id = 100")
+            .await,
+        "é"
+    );
 }
 
 /// **Stop mid-import rolls back and says so.**

@@ -167,6 +167,10 @@ tokio-postgres-rustls = "0.14"
 # to text by `db::mssql::cell_value` from the wire types, like the other engines' text
 # paths, so there is no conversion layer in between to lose precision.
 tiberius = { version = "0.13", default-features = false, features = ["tds80", "rustls"] }
+# The code pages a SQL Server `varchar` column is stored in, so a write can tell
+# before it runs that a character would become `?` (`db::mssql::code_page_fit`).
+# Already in the tree through tiberius and calamine.
+encoding_rs = "0.8"
 # SSH tunnelling. Use the `ring` crypto backend instead of the default
 # `aws-lc-rs` to avoid the aws-lc-sys C/cmake build.
 russh = { version = "0.62", default-features = false, features = ["ring", "flate2", "rsa"] }

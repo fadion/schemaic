@@ -34,6 +34,7 @@ mysql_async = { workspace = true }
 tokio-postgres = { workspace = true }
 rusqlite = { workspace = true }
 tiberius = { workspace = true }
+encoding_rs = { workspace = true }
 futures-util = { workspace = true }
 # `process`: the Azure CLI, asked for a SQL Server sign-in token (`entra.rs`).
 tokio = { workspace = true, features = ["net", "process"] }

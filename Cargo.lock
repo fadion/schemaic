@@ -5153,6 +5153,7 @@ dependencies = [
 name = "schemaic-db"
 version = "0.30.0"
 dependencies = [
+ "encoding_rs",
  "futures-util",
  "mysql_async",
  "rusqlite",

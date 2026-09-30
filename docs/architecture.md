@@ -11635,14 +11635,40 @@ existing prose was left alone.
   `SELECT TOP (1)` by key and confirming columns, rendered by the same `cell_value` as the read that
   produced the grid; a binary cell is `DATALENGTH` plus a `SUBSTRING` to `FETCH_CAP` — `DATALENGTH`,
   not `LEN`, which counts characters and trims trailing blanks.
-  **Two guards the other engines do not need**, both read off `sys.columns` before the transaction
+  **Three guards the other engines do not need**, all read off `sys.columns` before the transaction
   opens (`COLUMN_FACTS` — the base type through `TYPE_NAME(system_type_id)`, so an alias type is
-  its base type, and `is_identity`). **SQL Server converts `''` where PostgreSQL refuses it** — `0`
+  its base type, `is_identity`, and `collation_name` with its `COLLATIONPROPERTY(…, 'CodePage')`).
+  **SQL Server converts `''` where PostgreSQL refuses it** — `0`
   for a number, `1900-01-01` for a date, `0` for a `bit` — and a cleared grid cell is `''`, so on
   this engine alone clearing a quantity would store zero and report success. `blank_refusal`
   refuses, with `DbError::Refused` and before anything runs, a batch that writes `''` to a column
   whose base type does not hold text (`an_empty_value_is_not_written_as_zero`, an alias type
-  included); a column the catalogue does not name is left to the server. And an insert that gives
+  included); a column the catalogue does not name is left to the server. **A value of spaces is
+  `''` to it as well** — measured on 2022, `' '` stores `0` in an `int`, `1900-01-01` in a
+  `datetime` or `date`, `0.0000` in a `money` and `0` in a `float` or `bit` — so `converts_blank`,
+  the one predicate both blank refusals ask, takes any run of ASCII spaces, and a stray space no
+  longer walks round the refusal (`a_whitespace_only_value_is_refused_like_an_empty_one`). A tab, a
+  line break or an ideographic space the server refuses itself (Msg 245/241), so only spaces are
+  refused here. **The other silent conversion is text a `char`/`varchar`/`text` column's code page
+  cannot hold**: the grid binds text as `nvarchar` and the import writes `N'…'`, so it reaches the
+  column whole, and the column stores what its code page lacks as `?` or a best-fit look-alike —
+  `Ωμέγα` into a Latin-1 `varchar` came back `Oµ??a`, measured — and reports success.
+  `ColumnFacts::code_page` is `0` for every other column and `65001` under a UTF-8 collation, and
+  `code_page_fit` answers locally with `encoding_rs` (a direct dependency now, already in the tree
+  through tiberius and calamine) for the Windows code pages — 874, 932, 936, 949, 950, 1250–1258 —
+  **strictly**: a character with no byte there is `Fit::Loses`, never the best-fit substitute the
+  server would pick. ASCII, `0` and `65001` always fit. The IBM code pages behind the
+  `SQL_Latin1_General_CP437`/`CP850` collations are not in `encoding_rs` and answer `Fit::Unknown`,
+  which `server_code_page_refusal` settles by asking — a
+  `CAST(CAST(@P1 COLLATE <coll> AS varchar(max)) AS nvarchar(max))` compared with `@P1` under
+  `Latin1_General_BIN2`, one round trip per such value — splicing the collation name only when it
+  is a plain word and leaving any other to the server unasked. `code_page_check` runs beside
+  `blank_refusal` and names the column and the character
+  (`text_a_varchar_cannot_hold_is_refused_before_it_becomes_a_question_mark`; live,
+  `text_a_varchar_cannot_hold_is_refused_not_stored_as_question_marks`, on 2022 and 2025). The local
+  answer is `encoding_rs`'s tables rather than the server's, and the live test holds the two to each
+  other for 1252 alone. All of these are asked in `write_on` before its `SAVE`/`BEGIN`, so a refusal
+  on the pinned session leaves `undone` at `None` (below). And an insert that gives
   an identity column a value needs `IDENTITY_INSERT` on — which, once on, refuses an insert that
   does *not* give one — so `sets_identity` has it switched on and off around that one statement,
   never for the batch (`inserts_take_defaults_identities_and_a_deleted_key`).
@@ -11736,13 +11762,15 @@ existing prose was left alone.
   parameter per cell, SQL Server takes at most 2,100 per request, and 500 rows of five columns is
   already past it. The literal form has no such ceiling, and `INSERT_BATCH_ROWS`' 500 is under
   T-SQL's 1,000-row limit on a `VALUES` list — and the constant is shared with three engines that
-  have no such limit, so raising it past 1,000 breaks this one alone. Both of the grid's guards come with it, read off the same `column_facts`.
+  have no such limit, so raising it past 1,000 breaks this one alone. All three of the grid's guards come with it, read off the same `column_facts`.
   **`import_blank_refusal` matters more here than `blank_refusal` does in the grid**: a CSV's empty
   field is the ordinary spelling of "no value", and one the import's NULL rule did not catch
   arrives as `''`, which this engine stores as `0` or `1900-01-01` and reports as success — for
   every row of a column at once. It is asked of each batch before the batch runs, names the file's
   row (1-based, counted across batches) and the column, and the import rolls back
-  (`an_imported_blank_number_is_refused_not_stored_as_zero`). An identity column among the
+  (`an_imported_blank_number_is_refused_not_stored_as_zero`). `import_code_page_check` follows it
+  on the same terms, naming the row and the character, the server asked after it for the IBM code
+  pages. An identity column among the
   import's columns runs the **whole** import under `IDENTITY_INSERT` (`import_sets_identity`),
   switched off before the `COMMIT` — once rather than per statement as the grid's is, since every
   batch writes the same columns. **Stop is asked twice per batch** — at the top of the loop and
@@ -12046,7 +12074,10 @@ existing prose was left alone.
   `flush_done_attention` answers `None` where a message ends without it, and `cancel_request`
   loops over messages, clearing `flushed` between them, until it arrives. A server that never sends
   one leaves it waiting, which is why every caller here bounds it with `CANCEL_TIMEOUT`. A re-vendor
-  re-applies the list; when it is empty the directory and the `[patch]` entry go.
+  re-applies the list; when it is empty the directory and the `[patch]` entry go. **One limit is
+  not patched**: the driver cannot decode `varchar` text in code page 437 at all ("Encoding error:
+  unsupported encoding (LCID 0x409, sort ID 32)"), so reading a `SQL_Latin1_General_CP437` column
+  fails, and the live code-page test reads its column back through `CAST(… AS nvarchar)`.
   The rest of the engine's surface is in `core`: `TableInfo::create_ddl` has a T-SQL arm
   (`tsql_create_ddl` — the identity with the seed and increment `sys.identity_columns` reported,
   and `(1,1)` with a comment saying so only where they were not read, named primary-key and unique
@@ -25579,7 +25610,10 @@ Re-introducing the anti-patterns these guard against is a regression:
   `qualified_table` names `schema.table`, never the database, since a two-part name there is
   schema-first. Its literals double only the quote and are **`N`-prefixed** — an unprefixed one is
   `varchar`, converted to the database's code page on the way in, so `'Ωμέγα'` can arrive as
-  `'?????'` (`a_sql_server_string_literal_is_national_and_doubles_only_the_quote`).
+  `'?????'` (`a_sql_server_string_literal_is_national_and_doubles_only_the_quote`). That is the
+  literal's half only: `N'…'` carries the text as far as the column, and a `varchar` column still
+  converts it to its own code page, with the same `?` — which `db::mssql`'s `code_page_check`
+  refuses before the write (see there).
   **The other half of a *conditional* quoter is which predicate the condition asks**, and that is
   the same bug by a second route: `ident_if_needed` and `filter::needs_quoting` ask
   `intel::must_quote_ident` (can this be a bare **identifier**), never `intel::is_reserved_word`
