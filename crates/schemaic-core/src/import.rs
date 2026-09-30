@@ -2689,7 +2689,16 @@ impl<R: std::io::Read> Iterator for RowIter<R> {
 /// Rows per `INSERT`. Bulk import is one transaction of batched statements
 /// rather than the grid write-back's statement-per-row: at 100k rows that's 100k
 /// server round-trips, which is minutes on a remote host.
+///
+/// SQL Server bounds it from above: a `VALUES` list of more than 1,000 rows is
+/// refused outright (Msg 10738), and `mssql::import_rows` sends batches of
+/// exactly this many. The assertion below makes raising it past that a build
+/// error rather than a failure only the live tier would see.
 pub const INSERT_BATCH_ROWS: usize = 500;
+const _: () = assert!(
+    INSERT_BATCH_ROWS <= 1000,
+    "SQL Server refuses a VALUES list of more than 1,000 rows (Msg 10738)"
+);
 
 /// And a **byte** ceiling, which a row count alone cannot stand in for.
 ///

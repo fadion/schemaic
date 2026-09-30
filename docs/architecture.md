@@ -11994,7 +11994,9 @@ existing prose was left alone.
   parameter per cell, SQL Server takes at most 2,100 per request, and 500 rows of five columns is
   already past it. The literal form has no such ceiling, and `INSERT_BATCH_ROWS`' 500 is under
   T-SQL's 1,000-row limit on a `VALUES` list — and the constant is shared with three engines that
-  have no such limit, so raising it past 1,000 breaks this one alone. All three of the grid's guards come with it, read off the same `column_facts`.
+  have no such limit, so raising it past 1,000 would break this one alone — which is why a
+  `const` assertion beside it (and beside `export::INSERT_BATCH_ROWS`, which batches a dump's
+  rows) makes that a build error. All three of the grid's guards come with it, read off the same `column_facts`.
   **`import_blank_refusal` matters more here than `blank_refusal` does in the grid**: a CSV's empty
   field is the ordinary spelling of "no value", and one the import's NULL rule did not catch
   arrives as `''`, which this engine stores as `0` or `1900-01-01` and reports as success — for

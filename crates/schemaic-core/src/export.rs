@@ -2653,8 +2653,16 @@ pub const INSERT_BATCH_BYTES: usize = 512 * 1024;
 /// And a row ceiling, for the same reason from the other direction: a table of
 /// narrow rows would otherwise put tens of thousands of tuples in one `VALUES`.
 /// Older SQLite builds cap a compound `VALUES` at `SQLITE_MAX_COMPOUND_SELECT`
-/// (500), and a parser is happier with a statement it can hold.
+/// (500), and a parser is happier with a statement it can hold. SQL Server
+/// refuses a `VALUES` list of more than 1,000 rows (Msg 10738), and a `.sql`
+/// dump of a SQL Server table is batched by this constant, so it is pinned at
+/// or below that by the assertion under it — nothing else would catch a raise,
+/// since the dump's live round-trip replays only a handful of rows.
 pub const INSERT_BATCH_ROWS: usize = 250;
+const _: () = assert!(
+    INSERT_BATCH_ROWS <= 1000,
+    "SQL Server refuses a VALUES list of more than 1,000 rows (Msg 10738)"
+);
 
 /// [`export_inserts`], streamed. Rows are batched into multi-row `INSERT`s (see
 /// [`INSERT_BATCH_BYTES`]); the table and column lists are computed once and
