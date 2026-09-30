@@ -1531,12 +1531,10 @@ pub fn privilege_sql(c: &PrivilegeChange, dialect: SqlDialect, revoke: bool) -> 
     };
     let account = account_sql(&c.account, dialect);
     let sql = if revoke {
-        // T-SQL refuses to take back a permission granted `WITH GRANT OPTION`
-        // without `CASCADE` (Msg 4611), and the form cannot know how the grant
-        // was made; on one granted without it, `CASCADE` changes nothing.
-        let cascade = match dialect {
-            SqlDialect::MsSql => " CASCADE",
-            SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => "",
+        let cascade = if revoke_cascades(dialect) {
+            " CASCADE"
+        } else {
+            ""
         };
         format!("REVOKE {list}{on} FROM {account}{cascade}")
     } else {
@@ -1550,6 +1548,36 @@ pub fn privilege_sql(c: &PrivilegeChange, dialect: SqlDialect, revoke: bool) -> 
         (SqlDialect::MsSql, GrantLevel::Global) => tsql_in_master(&sql),
         _ => sql,
     })
+}
+
+/// Does a revoke here carry `CASCADE` — take the privilege from everyone the
+/// account granted it on to, as well as from the account?
+///
+/// **SQL Server's always does.** T-SQL refuses to take back a permission
+/// granted `WITH GRANT OPTION` without it (Msg 4611), and the form cannot
+/// know how the grant was made; on one granted without the option it changes
+/// nothing. On one granted with it, it also deletes every grant the account
+/// made of it (measured on 2022: a user's re-grant went with the revoke), so
+/// the preview's risk sentence says so ([`crate::ddl::Change::risks`]).
+pub fn revoke_cascades(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MsSql => true,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+    }
+}
+
+/// Can an account here be **denied** a permission — a `DENY` that wins over
+/// any grant, which a `REVOKE` of that permission lifts?
+///
+/// SQL Server alone. It is why a revoke there can *give* access: a user in
+/// `db_datareader` who is denied `SELECT` on a table reads it again once the
+/// `SELECT` is revoked, since the revoke removes the denial and the role's
+/// grant stands (measured on 2022). The risk sentence says so.
+pub fn supports_deny(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MsSql => true,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+    }
 }
 
 /// `sql` run in `master`, for that one statement: T-SQL grants a server

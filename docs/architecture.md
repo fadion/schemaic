@@ -3599,7 +3599,18 @@ existing prose was left alone.
     the account drop's sentence says
     what is actually lost — **its privileges, not its data**, with no record of them left anywhere
     to put back — plus the surprise that anything still connected as it keeps running until it
-    disconnects. **Creating an account destroys nothing and is still the highest-consequence thing
+    disconnects. **A SQL Server login's drop has a sentence of its own**, since both halves of that
+    are false for it (measured on 2022): the server refuses the drop while the login has a session,
+    running or idle (Msg 15434), and its users in each database are left behind with every grant,
+    mapped to no login, which a login re-made under the name (a new SID) does not re-attach to. The
+    arm asks the account's kind, a login being SQL Server's alone
+    (`a_sql_server_login_drop_says_it_is_refused_while_connected_and_orphans_its_users`). **The
+    revoke's sentence grows two clauses where the engine has the facts**, each a capability in
+    `users`: `revoke_cascades` — the revoke carries `CASCADE`, so the privilege is also taken from
+    every account the grantee granted it on to — and `supports_deny` — revoking a privilege the
+    account is *denied* lifts the `DENY`, which gives access back through any role that grants it.
+    Both are SQL Server's and both were measured there, where the sentence said only "takes X away"
+    (`a_sql_server_revoke_says_it_cascades_and_can_lift_a_deny`). **Creating an account destroys nothing and is still the highest-consequence thing
     this module emits**, which is the call `DropCheck`'s "rows the constraint refused are accepted
     from now on" already makes: a blank password on MySQL is an account anyone who can reach the
     server can log in as, with no `IDENTIFIED BY` for `validate_password` to fire on, and a blank
@@ -6068,7 +6079,7 @@ existing prose was left alone.
     `PrivilegeChange` + `privilege_sql(change, dialect, revoke)` write the `GRANT`/`REVOKE` — one
     struct for both directions, since what a revoke takes away is exactly what a grant gives, and
     `WITH GRANT OPTION` is ignored on the revoke side rather than given a second field nobody sets.
-    **A SQL Server revoke always carries `CASCADE`**: without it, taking back a permission granted
+    **A SQL Server revoke always carries `CASCADE`** (`users::revoke_cascades`): without it, taking back a permission granted
     `WITH GRANT OPTION` is Msg 4611 (measured), and the form cannot know how the grant it is revoking
     was made; on one granted without the option `CASCADE` is accepted and does what the plain revoke
     would (`a_sql_server_revoke_cascades_so_a_grantable_permission_can_be_taken_back`). **And a SQL

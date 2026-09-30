@@ -3796,6 +3796,24 @@ impl Change {
             // the account's open connections keep running until they end on their
             // own, so the drop looks like it did nothing for as long as one of
             // them lasts.
+            //
+            // **A SQL Server login is the exception on both counts**, measured
+            // on 2022: the server refuses the drop while the login has a
+            // session, running or idle (Msg 15434), and its users in each
+            // database are not dropped with it — they stay, every grant intact,
+            // mapped to no login. A login made again under the name has a new
+            // SID and does not re-attach to them. Asked of the account, not the
+            // engine: a login is SQL Server's alone.
+            Change::DropAccount(p) if p.kind == crate::users::PrincipalKind::Login => {
+                vec![format!(
+                    "Drops the login {}. The server refuses while anything is connected \
+                     as it, so its sessions have to end first. Its users in each database \
+                     are not dropped: they stay, keeping their permissions, mapped to no \
+                     login — and a login made again under this name does not re-attach to \
+                     them without ALTER USER … WITH LOGIN.",
+                    p.display()
+                )]
+            }
             Change::DropAccount(p) => vec![format!(
                 "Drops {} and every privilege it holds. The grants are not recorded \
                  anywhere else, so putting the account back means granting them all \
@@ -3821,13 +3839,37 @@ impl Change {
             // means — something that worked stops working — but it destroys no
             // data and is undone by granting it back, which is what separates
             // this sentence from the one above.
-            Change::RevokePrivileges(c) => vec![format!(
-                "Takes {} away from {}. Anything relying on it — an application, a \
-                 job, a view someone else owns — starts failing at its next \
-                 statement.",
-                Self::privilege_words(&c.privileges),
-                c.account.display()
-            )],
+            //
+            // **Two engine facts extend it, each asked as a capability.** Where
+            // the revoke carries `CASCADE` (`users::revoke_cascades`) it also
+            // takes the privilege from everyone the account granted it on to;
+            // and where an account can be *denied* (`users::supports_deny`),
+            // revoking the privilege lifts a `DENY` of it, which gives access
+            // back wherever a role grants it. Both measured on SQL Server 2022,
+            // where the sentence named only the account.
+            Change::RevokePrivileges(c) => {
+                let what = Self::privilege_words(&c.privileges);
+                let who = c.account.display();
+                let mut s = format!(
+                    "Takes {what} away from {who}. Anything relying on it — an \
+                     application, a job, a view someone else owns — starts failing at \
+                     its next statement."
+                );
+                if crate::users::revoke_cascades(dialect) {
+                    s.push_str(&format!(
+                        " The revoke carries CASCADE, so it is also taken from every \
+                         account {who} granted it on to, and what runs as those accounts \
+                         fails the same way."
+                    ));
+                }
+                if crate::users::supports_deny(dialect) {
+                    s.push_str(&format!(
+                        " Where {who} is denied it instead (DENY), the revoke lifts the \
+                         denial — which gives access back if a role it belongs to grants it."
+                    ));
+                }
+                vec![s]
+            }
             Change::RevokeRole(c) => vec![format!(
                 "Takes the role {} away from {}, and with it every privilege the \
                  role carries.",
@@ -29460,6 +29502,93 @@ mod database_tests {
                 }
             )))
             .is_empty()
+        );
+    }
+
+    /// A SQL Server login and a database user, as the browser reads them.
+    fn ms_login_and_user() -> (crate::users::Principal, crate::users::Principal) {
+        let list = crate::users::from_mssql_rows(
+            &[crate::users::MsLoginRow {
+                name: "app".into(),
+                kind: "S".into(),
+                ..Default::default()
+            }],
+            &[crate::users::MsUserRow {
+                name: "app".into(),
+                kind: "S".into(),
+                login: Some("app".into()),
+                ..Default::default()
+            }],
+        );
+        let find = |k| list.iter().find(|p| p.kind == k).unwrap().clone();
+        (
+            find(crate::users::PrincipalKind::Login),
+            find(crate::users::PrincipalKind::User),
+        )
+    }
+
+    /// **A SQL Server login's drop is not a user's**, on both points the
+    /// shared sentence made (measured on 2022): the server *refuses* it while
+    /// the login has a session, running or idle (Msg 15434), where the
+    /// sentence said the sessions keep running; and its database users are
+    /// left behind with every grant they hold, mapped to no login, where the
+    /// sentence said the privileges go with it — a login made again under the
+    /// same name gets a new SID and does not re-attach to them.
+    #[test]
+    fn a_sql_server_login_drop_says_it_is_refused_while_connected_and_orphans_its_users() {
+        use crate::intel::SqlDialect::MsSql;
+        let (login, user) = ms_login_and_user();
+        let risk = account("app", MsSql, Change::DropAccount(Box::new(login))).destructive();
+        let text = risk.join(" ");
+        assert!(text.contains("refuses"), "{text}");
+        assert!(text.contains("connected"), "{text}");
+        assert!(text.contains("keeping their permissions"), "{text}");
+        assert!(!text.contains("keeps running"), "{text}");
+        assert!(!text.contains("every privilege it holds"), "{text}");
+        // A database user's drop does take its grants, as on the other engines.
+        let risk = account("app", MsSql, Change::DropAccount(Box::new(user))).destructive();
+        assert!(
+            risk.join(" ").contains("every privilege it holds"),
+            "{risk:?}"
+        );
+    }
+
+    /// **A SQL Server revoke says what its `CASCADE` and a `DENY` do** (both
+    /// measured on 2022): the statement always carries `CASCADE`, which takes
+    /// the permission from everyone the account granted it on to as well; and
+    /// revoking a permission the account is *denied* lifts the `DENY`, which
+    /// gives access back wherever a role grants it. The sentence named neither
+    /// and said only that it "takes X away". MySQL's revoke has neither.
+    #[test]
+    fn a_sql_server_revoke_says_it_cascades_and_can_lift_a_deny() {
+        use crate::intel::SqlDialect::MsSql;
+        let (_, user) = ms_login_and_user();
+        let revoke = Box::new(crate::users::PrivilegeChange {
+            account: user,
+            level: crate::users::GrantLevel::Schema("dbo".into()),
+            privileges: vec!["SELECT".into()],
+            with_grant_option: false,
+        });
+        let cs = account("app", MsSql, Change::RevokePrivileges(revoke));
+        assert!(
+            cs.emit().iter().any(|s| s.ends_with("CASCADE;")),
+            "{:?}",
+            cs.emit()
+        );
+        let text = cs.destructive().join(" ");
+        assert!(text.contains("granted it on to"), "{text}");
+        assert!(text.contains("DENY"), "{text}");
+        assert!(text.contains("gives access back"), "{text}");
+        let my = account(
+            "app@%",
+            MySql,
+            Change::RevokePrivileges(a_privilege_change(&["SELECT"])),
+        )
+        .destructive()
+        .join(" ");
+        assert!(
+            !my.contains("DENY") && !my.contains("granted it on to"),
+            "{my}"
         );
     }
 
