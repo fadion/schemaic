@@ -5723,12 +5723,18 @@ impl ChangeSet {
         // then no drop at all, only a `CREATE OR ALTER`, and it neither leaves
         // nor re-enters the set — which is what keeps the ordering walk below
         // exact for it. A rename is still a drop and a create everywhere.
+        //
+        // **The same name is the same bytes**, not an ASCII case-fold: whether
+        // `tr` and `TR` are one trigger is the database collation's call, so a
+        // rename by case alone is a drop and a create, which is right under
+        // either — taken as an alter, a case-sensitive database got a second
+        // trigger and both fired, and a case-insensitive one kept the old name.
         let in_place = |draft: &TriggerDraft| {
             supports_trigger_alter_in_place(d)
                 && draft
                     .original
                     .as_deref()
-                    .is_none_or(|o| o.eq_ignore_ascii_case(&draft.info.name))
+                    .is_none_or(|o| o == draft.info.name)
         };
         let mut dropped: Vec<&str> = Vec::new();
         let mut planned: Vec<&str> = Vec::new();
@@ -27552,6 +27558,27 @@ mod tsql_trigger_plan_tests {
         );
         // The ANSI default is no wrapper at all.
         assert_eq!(TriggerInfo::create_set_sql(&[tr("tr")], MsSql).len(), 1);
+    }
+
+    /// **A rename by case alone is a rename.** Whether `tr` and `TR` are one
+    /// name is the database collation's call, not ASCII case-folding's: taken
+    /// as an in-place alter, a case-sensitive database got a second trigger
+    /// and both fired (measured on SQL Server 2022: one insert, two audit
+    /// rows), and a case-insensitive one silently kept the old name. It drops
+    /// the name the server holds and creates the new one, which is right
+    /// under either collation.
+    #[test]
+    fn a_case_only_trigger_rename_drops_and_creates() {
+        let cur = tr("tr");
+        let mut d = set(vec![cur.clone()]);
+        d.triggers[0].info.name = "TR".into();
+        assert!(
+            d.validate(std::slice::from_ref(&cur), MsSql, TriggerHost::Table)
+                .is_empty()
+        );
+        let sql = diff_triggers(std::slice::from_ref(&cur), &d, MsSql).emit();
+        assert_eq!(sql[0], "DROP TRIGGER [dbo].[tr];", "{sql:#?}");
+        assert!(sql[1].starts_with("CREATE TRIGGER [dbo].[TR]"), "{sql:#?}");
     }
 
     /// A signed trigger's edit says it strips the signature, as a routine's

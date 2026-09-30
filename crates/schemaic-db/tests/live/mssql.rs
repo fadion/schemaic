@@ -2332,6 +2332,54 @@ async fn a_module_keeps_its_creation_settings_through_an_edit() {
     assert_eq!(settings("v_an").await, "01");
 }
 
+/// **A trigger renamed by case alone is renamed, and only once.** Taken as an
+/// in-place alter, a case-sensitive database got a second trigger `TR` beside
+/// `tr` and every insert fired both; a case-insensitive one kept `tr`. Here,
+/// under each collation, the plan leaves exactly one trigger, named `TR`,
+/// writing one row per insert.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_trigger_renamed_by_case_is_renamed_once() {
+    use schemaic_core::ddl::{TriggerSetDraft, diff_triggers};
+    if !enabled() || azure_cannot("changes the database's collation") {
+        return;
+    }
+    for collation in ["Latin1_General_CS_AS", "Latin1_General_CI_AS"] {
+        let s = Scratch::create("ddl_trigger_case").await;
+        base_db()
+            .fetch_query(
+                None,
+                &format!("ALTER DATABASE [{}] COLLATE {collation}", s.name),
+                1,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{collation}: {e}"));
+        s.exec("CREATE TABLE dbo.t (id int NOT NULL PRIMARY KEY); CREATE TABLE dbo.audit (id int)")
+            .await;
+        s.exec("CREATE TRIGGER dbo.tr ON dbo.t AFTER INSERT AS INSERT dbo.audit SELECT id FROM inserted")
+            .await;
+        let t = read_table(&s, "t").await;
+        let mut set = TriggerSetDraft::from_table(&t);
+        set.triggers[0].info.name = "TR".into();
+        let stmts = diff_triggers(&t.triggers, &set, MS).emit();
+        s.db.run_ddl(&s.name, &stmts, CancellationToken::new())
+            .await
+            .unwrap_or_else(|e| panic!("{collation}: {e}\n{stmts:#?}"));
+        assert_eq!(
+            s.scalar("SELECT STRING_AGG(name, ',') FROM sys.triggers")
+                .await,
+            "TR",
+            "{collation}"
+        );
+        s.exec("INSERT dbo.t VALUES (1)").await;
+        assert_eq!(
+            s.scalar("SELECT COUNT(*) FROM dbo.audit").await,
+            "1",
+            "{collation}"
+        );
+    }
+}
+
 /// **A signed module's edit says it strips the signature.** Any `CREATE OR
 /// ALTER` drops `ADD SIGNATURE`, which cannot be restated without the
 /// certificate's key, and the preview said only "Redefines p". Both the

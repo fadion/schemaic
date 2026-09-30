@@ -4869,7 +4869,13 @@ existing prose was left alone.
     engine — `sp_rename` would leave the stored text naming the old trigger, the call
     `supports_view_rename` makes for a view — and a `CREATE OR ALTER` cannot move a trigger to another
     table either (Msg 2110, measured on SQL Server 2022), which the modal, holding one table's set,
-    never asks of it. `trigger_create_statements` is the one exhaustive `match` both routes go
+    never asks of it. **"Same name" is the same bytes**, not an ASCII case-fold: whether `tr` and
+    `TR` are one trigger is the database collation's call, and the case-folding test took a rename by
+    case alone for an in-place alter — so a case-sensitive database got a second trigger and every
+    insert fired both (measured on SQL Server 2022: one insert, two audit rows), and a
+    case-insensitive one kept the old name. As a drop and a create it is right under either
+    (`a_case_only_trigger_rename_drops_and_creates`; live, `a_trigger_renamed_by_case_is_renamed_once`
+    under both collations, 2022 and 2025). `trigger_create_statements` is the one exhaustive `match` both routes go
     through: MySQL's session wrap on one arm, and on SQL Server two lists — the statement and its
     `DISABLE TRIGGER`, then its `sp_settriggerorder` ranks (`TriggerInfo::tsql_rank_statements`,
     under `schema.rs`), which `trigger_statements` holds back until **every** create and alter in the
