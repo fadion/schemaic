@@ -7622,6 +7622,17 @@ existing prose was left alone.
     a `QUOTED_IDENTIFIER OFF` trigger's `"x"` literal became a column. Nothing read the two columns.
     `ddl::tsql_settings_wrapped` restates them, the counterpart of MySQL's `sql_mode` wrapper
     (both under `ddl.rs`).
+    **`signed` is the one loss that cannot be restated**: `ADD SIGNATURE` leaves a row in
+    `sys.crypt_properties`, and any `CREATE OR ALTER` — every edit of a procedure, function or
+    trigger here — drops it (measured on SQL Server 2022), while signing again needs the
+    certificate's private key. Module signing is how a module is granted rights its callers lack, so
+    the edit silently broke every call that relied on it, and the preview said only "Redefines p".
+    `db::mssql`'s trigger and routine listings read it (`EXISTS` over `sys.crypt_properties`,
+    `class = 1`), and `ddl::signature_lost` puts a risk sentence under the `ReplaceRoutine` and
+    `ReplaceTrigger` arms, in place or recreated
+    (`editing_a_signed_routine_says_it_strips_the_signature` and its trigger sibling; live,
+    `a_signed_modules_edit_says_it_strips_the_signature` on 2022 and 2025, which also finds the
+    signature gone after the edit it warned of). A view cannot be signed.
     `TableInfo::create_ddl` — `CREATE TABLE`/`VIEW`, built on the
     above; its **view** branch delegates to `ddl::view_ddl` so Copy DDL, the MCP table-info tool
     and the apply path all emit through one view emitter (it used to have its own, which restated

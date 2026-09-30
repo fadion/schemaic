@@ -1715,6 +1715,15 @@ pub struct TsqlModule {
     /// Under it a `"x"` is a string; ON it is a column. Restated for
     /// [`Self::ansi_nulls_off`]'s reason.
     pub quoted_identifier_off: bool,
+    /// **The module is signed** — `ADD SIGNATURE` put a row for it in
+    /// `sys.crypt_properties`. Module signing is how a procedure or trigger
+    /// is granted rights its callers lack, and any `CREATE OR ALTER` — every
+    /// edit here — drops the signature (measured on SQL Server 2022), which
+    /// cannot be restated without the certificate's private key. So it is
+    /// said in the preview rather than restated
+    /// ([`crate::ddl::ChangeSet::destructive`]). Never set for a view, which
+    /// cannot be signed.
+    pub signed: bool,
 }
 
 impl TsqlModule {

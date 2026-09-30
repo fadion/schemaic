@@ -2332,6 +2332,83 @@ async fn a_module_keeps_its_creation_settings_through_an_edit() {
     assert_eq!(settings("v_an").await, "01");
 }
 
+/// **A signed module's edit says it strips the signature.** Any `CREATE OR
+/// ALTER` drops `ADD SIGNATURE`, which cannot be restated without the
+/// certificate's key, and the preview said only "Redefines p". Both the
+/// procedure and the trigger are read as signed, their plans name the loss,
+/// and — the reason the sentence is there — the applied edit really does
+/// leave them unsigned.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_signed_modules_edit_says_it_strips_the_signature() {
+    use schemaic_core::ddl::{RoutineDraft, TriggerSetDraft, diff_routine, diff_triggers};
+    use schemaic_core::schema::TriggerAction;
+    if !enabled() || azure_cannot("signs with a certificate the shared database may not allow") {
+        return;
+    }
+    let s = Scratch::create("ddl_signed").await;
+    s.exec("CREATE TABLE dbo.t (id int NOT NULL PRIMARY KEY)")
+        .await;
+    s.exec("CREATE PROCEDURE dbo.p_signed AS SELECT 1 AS s")
+        .await;
+    s.exec("CREATE TRIGGER dbo.tr_signed ON dbo.t AFTER INSERT AS SET NOCOUNT ON")
+        .await;
+    s.exec(
+        "CREATE CERTIFICATE zz_mod_cert ENCRYPTION BY PASSWORD = 'Pa55word!!zz' \
+         WITH SUBJECT = 'schemaic test'",
+    )
+    .await;
+    for name in ["p_signed", "tr_signed"] {
+        s.exec(&format!(
+            "ADD SIGNATURE TO dbo.{name} BY CERTIFICATE zz_mod_cert WITH PASSWORD = 'Pa55word!!zz'"
+        ))
+        .await;
+    }
+    let signatures = "SELECT COUNT(*) FROM sys.crypt_properties WHERE class = 1";
+    assert_eq!(s.scalar(signatures).await, "2");
+
+    let p =
+        s.db.fetch_schema(&s.name, CancellationToken::new())
+            .await
+            .unwrap()
+            .routines
+            .iter()
+            .find(|r| r.name == "p_signed")
+            .unwrap()
+            .as_ref()
+            .clone();
+    assert!(p.tsql.module.signed);
+    let mut d = RoutineDraft::from_info(&p);
+    d.info.body = "SELECT 2 AS s".into();
+    let plan = diff_routine(&p, &d, MS);
+    assert!(
+        plan.destructive().join(" ").contains("signature"),
+        "{:?}",
+        plan.destructive()
+    );
+    s.db.run_ddl(&s.name, &plan.emit(), CancellationToken::new())
+        .await
+        .unwrap();
+
+    let t = read_table(&s, "t").await;
+    assert!(t.triggers[0].tsql.module.signed);
+    let mut set = TriggerSetDraft::from_table(&t);
+    set.triggers[0].info.action = TriggerAction::Body("SET NOCOUNT OFF".into());
+    let plan = diff_triggers(&t.triggers, &set, MS);
+    assert!(
+        plan.destructive().join(" ").contains("signature"),
+        "{:?}",
+        plan.destructive()
+    );
+    s.db.run_ddl(&s.name, &plan.emit(), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        s.scalar(signatures).await,
+        "0",
+        "what the sentence warned of"
+    );
+}
+
 /// **A parameter's own `AS` is not the header's.** `@a AS int` and a
 /// parameter named `@as` are T-SQL the server takes; read with the list cut
 /// at the first `AS`, the first lost its type to the body and the second

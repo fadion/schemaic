@@ -2895,6 +2895,28 @@ fn unreplayable_rename(c: &Change) -> Option<String> {
     ))
 }
 
+/// The risk sentence for editing a **signed** SQL Server module
+/// ([`crate::schema::TsqlModule::signed`]): any `CREATE OR ALTER` or drop
+/// removes the signature, and it cannot be put back without the
+/// certificate's private key — so the rights the certificate granted the
+/// module stop applying, and callers who relied on them start failing.
+fn signature_lost(what: &str, name: &str) -> String {
+    format!(
+        "{} {name} is signed (ADD SIGNATURE), and any change to it removes the signature — \
+         Schemaic can't sign it again without the certificate's key. Whatever the certificate \
+         let it do stops working until you run ADD SIGNATURE again.",
+        capitalised(what)
+    )
+}
+
+/// `what` with its first letter upper-cased, for a sentence that starts with it.
+fn capitalised(what: &str) -> String {
+    let mut c = what.chars();
+    c.next()
+        .map(|f| f.to_uppercase().chain(c).collect())
+        .unwrap_or_default()
+}
+
 /// The refusal for a routine **recreate that would drop a numbered procedure
 /// group**, or `None` when the change is fine.
 ///
@@ -3610,12 +3632,18 @@ impl Change {
             // a create. That is safe where DDL is transactional and *isn't* on
             // MySQL, which commits each statement as it runs — so a rejected new
             // definition there leaves the table with no trigger at all.
-            Change::ReplaceTrigger { draft } => vec![format!(
-                "Re-creating trigger {} drops it first. Where DDL isn't \
-                 transactional (MySQL), a new definition the server rejects \
-                 leaves the table with no trigger.",
-                draft.info.name
-            )],
+            Change::ReplaceTrigger { draft } => {
+                let mut out = vec![format!(
+                    "Re-creating trigger {} drops it first. Where DDL isn't \
+                     transactional (MySQL), a new definition the server rejects \
+                     leaves the table with no trigger.",
+                    draft.info.name
+                )];
+                if draft.info.tsql.module.signed {
+                    out.push(signature_lost("trigger", &draft.info.name));
+                }
+                out
+            }
             // No data is lost and nothing is dropped, and it still has to be
             // said: a function is shared, so every trigger bound to it starts
             // doing something else the moment this runs — including triggers on
@@ -3681,6 +3709,10 @@ impl Change {
                          re-apply any GRANT and COMMENT afterwards.",
                         f.name
                     ));
+                }
+                // An alter drops a signature as surely as a drop does.
+                if server.tsql.module.signed {
+                    out.push(signature_lost(f.kind.label(), &server.name));
                 }
                 out
             }
@@ -27157,6 +27189,31 @@ mod tsql_routine_plan_tests {
         );
     }
 
+    /// **Editing a signed routine says it strips the signature.** Any
+    /// `CREATE OR ALTER` drops a module's `ADD SIGNATURE` (measured on SQL
+    /// Server 2022: `sys.crypt_properties` 1 row, then none), and it cannot be
+    /// restated without the certificate's private key — so the permissions the
+    /// certificate carried stop applying, and the preview said only
+    /// "Redefines p". The same holds for a recreate.
+    #[test]
+    fn editing_a_signed_routine_says_it_strips_the_signature() {
+        let mut cur = proc_r();
+        cur.tsql.module.signed = true;
+        let mut d = RoutineDraft::from_info(&cur);
+        d.info.body = "SELECT @a + 1".into();
+        let risks = diff_routine(&cur, &d, MsSql).destructive().join(" ");
+        assert!(risks.contains("signature"), "{risks}");
+        let mut d = RoutineDraft::from_info(&cur);
+        d.info.name = "r2".into();
+        let risks = diff_routine(&cur, &d, MsSql).destructive().join(" ");
+        assert!(risks.contains("signature"), "{risks}");
+        // Unsigned, nothing is said.
+        let mut d = RoutineDraft::from_info(&proc_r());
+        d.info.body = "SELECT @a + 1".into();
+        let risks = diff_routine(&proc_r(), &d, MsSql).destructive().join(" ");
+        assert!(!risks.contains("signature"), "{risks}");
+    }
+
     /// **A procedure that heads a numbered group is never dropped by an
     /// edit.** `DROP PROCEDURE r` takes `r;2 … n` with it (measured on SQL
     /// Server 2022: `sys.numbered_procedures` went from 1 row to 0), while a
@@ -27495,6 +27552,20 @@ mod tsql_trigger_plan_tests {
         );
         // The ANSI default is no wrapper at all.
         assert_eq!(TriggerInfo::create_set_sql(&[tr("tr")], MsSql).len(), 1);
+    }
+
+    /// A signed trigger's edit says it strips the signature, as a routine's
+    /// does — `CREATE OR ALTER TRIGGER` is the same statement kind.
+    #[test]
+    fn editing_a_signed_trigger_says_it_strips_the_signature() {
+        let mut cur = tr("tr");
+        cur.tsql.module.signed = true;
+        let mut d = set(vec![cur.clone()]);
+        d.triggers[0].info.action = TriggerAction::Body("SET NOCOUNT OFF".into());
+        let risks = diff_triggers(std::slice::from_ref(&cur), &d, MsSql)
+            .destructive()
+            .join(" ");
+        assert!(risks.contains("signature"), "{risks}");
     }
 
     #[test]
