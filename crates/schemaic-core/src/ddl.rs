@@ -4530,7 +4530,10 @@ impl ChangeSet {
                     ));
                 }
                 Change::AddForeignKey(fk) => {
-                    out.push(format!("ALTER TABLE {q} ADD {};", fk_clause(fk, d)));
+                    out.push(format!(
+                        "ALTER TABLE {q} ADD {};",
+                        fk_clause(fk, self.schema.as_deref(), d)
+                    ));
                 }
                 // A check keeps what it was: one added `WITH NOCHECK` (not
                 // trusted) is re-added so, sparing the rows already there, and
@@ -4992,7 +4995,7 @@ impl ChangeSet {
         }
         for c in &self.changes {
             if let Change::AddForeignKey(fk) = c {
-                cl.push(format!("ADD {}", fk_clause(fk, d)));
+                cl.push(format!("ADD {}", fk_clause(fk, self.schema.as_deref(), d)));
             }
         }
         for c in &self.changes {
@@ -5157,7 +5160,7 @@ impl ChangeSet {
         }
         for c in &self.changes {
             if let Change::AddForeignKey(fk) = c {
-                cl.push(format!("ADD {}", fk_clause(fk, d)));
+                cl.push(format!("ADD {}", fk_clause(fk, self.schema.as_deref(), d)));
             }
         }
         for c in &self.changes {
@@ -6546,17 +6549,51 @@ fn qualified(name: &str, schema: Option<&str>, dialect: SqlDialect) -> String {
     }
 }
 
+/// Does a bare table name in a statement about a table resolve in **that
+/// table's own namespace** on `dialect`, so that a foreign key whose
+/// [`ForeignKeyInfo::ref_schema`] is `None` — which the model reads as "the
+/// same one" — may be written unqualified?
+///
+/// - **MySQL**: yes — a bare name is the connection's database, the one the
+///   plan runs in, and a key's `None` there means this database.
+/// - **SQLite**: yes — one namespace (an attached database aside, which no
+///   key can reach).
+/// - **SQL Server**: no — a bare name resolves in the *login's* default
+///   schema, then `dbo`, never in the altered table's; a key added to
+///   `sales.orders` naming `customers` bound to `dbo.customers` (S3.1-L1-02,
+///   measured on 2022).
+/// - **PostgreSQL**: no — it resolves through `search_path`.
+pub fn bare_reference_is_own_namespace(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MySql | SqlDialect::Sqlite => true,
+        SqlDialect::Postgres | SqlDialect::MsSql => false,
+    }
+}
+
 /// `CONSTRAINT … FOREIGN KEY (…) REFERENCES … (…) [ON DELETE …] [ON UPDATE …]`,
 /// the one form both engines share (MySQL puts `ADD` in front of it, so does
 /// PostgreSQL; only the quoting differs).
-fn fk_clause(fk: &ForeignKeyInfo, dialect: SqlDialect) -> String {
+///
+/// `owner` is the namespace of the table the key stands on: what a `None`
+/// [`ForeignKeyInfo::ref_schema`] means, written out where the dialect's
+/// bare name would resolve somewhere else ([`bare_reference_is_own_namespace`]).
+fn fk_clause(fk: &ForeignKeyInfo, owner: Option<&str>, dialect: SqlDialect) -> String {
     let q = |s: &str| ddl_ident_in(s, dialect);
     let cols = |v: &[String]| v.iter().map(|c| q(c)).collect::<Vec<_>>().join(", ");
+    let ref_schema = fk
+        .ref_schema
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            owner
+                .filter(|s| !s.is_empty())
+                .filter(|_| !bare_reference_is_own_namespace(dialect))
+        });
     // On MySQL the referenced schema is a *database*; on PostgreSQL a namespace,
     // where `public` resolves unqualified.
     let target = match dialect {
-        SqlDialect::Postgres => qualified(&fk.ref_table, fk.ref_schema.as_deref(), dialect),
-        _ => match fk.ref_schema.as_deref().filter(|s| !s.is_empty()) {
+        SqlDialect::Postgres => qualified(&fk.ref_table, ref_schema, dialect),
+        _ => match ref_schema {
             Some(s) => format!("{}.{}", q(s), q(&fk.ref_table)),
             None => q(&fk.ref_table),
         },
@@ -7351,7 +7388,10 @@ fn create_table_sql(d: &TableDraft, dialect: SqlDialect) -> Vec<String> {
         }
     }
     for fk in &d.foreign_keys {
-        lines.push(format!("  {}", fk_clause(&fk.info, dialect)));
+        lines.push(format!(
+            "  {}",
+            fk_clause(&fk.info, d.schema.as_deref(), dialect)
+        ));
     }
     // Inline on both engines — a check is a table constraint, not an index, so
     // PostgreSQL has nothing to split out here.
@@ -11932,6 +11972,9 @@ pub fn tsql_rebuild_sql(current: &TableInfo, draft: &TableDraft) -> Vec<String> 
         if same_table(fk.ref_schema.as_deref(), &fk.ref_table) {
             fk.ref_table = final_name.clone();
             fk.ref_columns = fk.ref_columns.iter().map(|c| renamed(c)).collect();
+            // Named whole: another table's key is written on *its* table,
+            // whose namespace a bare name would not mean.
+            fk.ref_schema = Some(schema.to_string());
         }
         fk
     };
@@ -12026,7 +12069,7 @@ pub fn tsql_rebuild_sql(current: &TableInfo, draft: &TableDraft) -> Vec<String> 
         out.push(format!(
             "ALTER TABLE {} ADD {};",
             qualified(&fk.table, fk.schema.as_deref(), d),
-            fk_clause(&pointed(&fk.key), d)
+            fk_clause(&pointed(&fk.key), fk.schema.as_deref(), d)
         ));
     }
     // 8. What selects `*` from it, re-expanded against the new columns.
@@ -16583,6 +16626,80 @@ mod tests {
         )
         .emit();
         assert!(!stmts.iter().any(|s| s.contains("THROW")), "{stmts:#?}");
+    }
+
+    /// **A foreign key with no namespace names the table's own**
+    /// (S3.1-L1-02). The designer's picker lists the designed table's schema
+    /// and writes only `ref_table`, and the model reads a `None` namespace as
+    /// "the same one" — but T-SQL resolves a bare name in the login's default
+    /// schema, and PostgreSQL through `search_path`, so on a table outside
+    /// `dbo` the key bound to the default schema's same-named table. MySQL's
+    /// bare name is this database's, and SQLite has one namespace, so those
+    /// stay bare.
+    #[test]
+    fn a_foreign_key_with_no_namespace_names_the_tables_own() {
+        let fk = ForeignKeyInfo {
+            name: "fk_cust".into(),
+            columns: vec!["cust".into()],
+            ref_table: "customers".into(),
+            ref_columns: vec!["id".into()],
+            ..Default::default()
+        };
+        let add = |schema: Option<&str>, dialect| {
+            single(
+                "orders",
+                schema,
+                dialect,
+                Change::AddForeignKey(Box::new(fk.clone())),
+            )
+            .emit()
+            .join("\n")
+        };
+        let ms = add(Some("sales"), MsSql);
+        assert!(ms.contains("REFERENCES [sales].[customers] ([id])"), "{ms}");
+        let pg = add(Some("app"), Postgres);
+        assert!(pg.contains("REFERENCES \"app\".\"customers\""), "{pg}");
+        // `public` resolves unqualified, and the emitter leaves it off.
+        let pg = add(Some("public"), Postgres);
+        assert!(pg.contains("REFERENCES \"customers\""), "{pg}");
+        let my = add(Some("shop"), MySql);
+        assert!(my.contains("REFERENCES `customers`"), "{my}");
+        // A namespace the key names is kept, whatever the table's.
+        let dbo = single(
+            "orders",
+            Some("sales"),
+            MsSql,
+            Change::AddForeignKey(Box::new(ForeignKeyInfo {
+                ref_schema: Some("dbo".into()),
+                ..fk.clone()
+            })),
+        )
+        .emit()
+        .join("\n");
+        assert!(dbo.contains("REFERENCES [dbo].[customers]"), "{dbo}");
+
+        // A new table carries the same key the same way.
+        let mut d = TableDraft::blank("orders", Some("sales".into()));
+        d.columns.push(ColumnDraft::new(ms_col("cust", "int")));
+        d.foreign_keys.push(ForeignKeyDraft::new(fk.clone()));
+        let created = create(&d, MsSql).emit().join("\n");
+        assert!(
+            created.contains("REFERENCES [sales].[customers] ([id])"),
+            "{created}"
+        );
+
+        for (dialect, bare) in [
+            (MySql, true),
+            (Sqlite, true),
+            (Postgres, false),
+            (MsSql, false),
+        ] {
+            assert_eq!(
+                bare_reference_is_own_namespace(dialect),
+                bare,
+                "{dialect:?}"
+            );
+        }
     }
 
     /// **What each kind of dependent survives, measured:** a nullability

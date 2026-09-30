@@ -3451,6 +3451,27 @@ existing prose was left alone.
     getting either wrong is written down where it lands: two identical databases differ in every
     object holding one, and the migration carries the right database's name into a statement that
     runs against the left.
+    **One more asks where a bare name resolves, which decides how a foreign key's target is
+    *written*.** `bare_reference_is_own_namespace` asks whether a bare table name in a statement
+    about a table resolves in that table's own namespace, so that a key whose
+    `ForeignKeyInfo::ref_schema` is `None` — which the model, and `fks_equal`, read as "the same
+    one" — may go out unqualified: true on MySQL, where a bare name is the connection's database and
+    a key's `None` means this database, and on SQLite, which has one namespace; false on SQL Server,
+    where a bare name resolves in the *login's* default schema and then `dbo`, never in the altered
+    table's, and on PostgreSQL, where it resolves through `search_path`. `fk_clause(fk, owner,
+    dialect)` takes `owner`, the namespace of the table the key stands on, and writes a `None` key
+    qualified with it wherever the answer is no (`qualified` still drops `public`) — `emit_mssql`,
+    `emit_mysql` and `emit_postgres` pass the change set's schema, `create_table_sql` the draft's,
+    and the rebuild's inbound keys their own table's. The designer's foreign-key picker lists only
+    the designed table's schema and writes only `ref_table`, so on SQL Server a key added to
+    `sales.orders` naming `customers` bound to `dbo.customers`: orders for `sales` customers were
+    refused, and under `ON DELETE CASCADE` a delete in `dbo.customers` deleted `sales` orders
+    (S3.1-L1-02, measured on 2022). A new table's keys and an AI proposal's `NewForeignKey` with no
+    `ref_schema` went out the same way, and PostgreSQL had the same bare spelling from before.
+    `a_foreign_key_with_no_namespace_names_the_tables_own` pins the four answers and both spellings
+    — an added key and a created table's; the live
+    `a_designer_key_outside_dbo_references_its_own_schema` runs both doors against the server, on
+    2022 and 2025.
     **One more answers for a trigger's *identity*, which is the one place the three engines genuinely
     disagree about it.** `trigger_names_are_schema_scoped` asks whether a trigger's name has to be
     unique across the whole schema rather than only within its own table — measured on all four
@@ -3972,7 +3993,8 @@ existing prose was left alone.
     self-reference may name and with that self-reference re-pointed at the new name; the defaults
     under their captured names; the comments; the triggers through `trigger_create_statements`,
     disabled and ranked as they were, on the new name; the inbound keys re-added pointing at the new
-    name and the renamed columns. (8) The views and inline functions that select `*` from it
+    name and the renamed columns, and naming the table's schema outright — another table's key is
+    written on *its* table, whose namespace a bare name would not mean. (8) The views and inline functions that select `*` from it
     refreshed (`tsql_refresh_star_dependents`, below) — this step and its capture in (2) only
     where the table keeps its name — and then the defaults' temp table dropped.
     Every statement but a trigger's own
@@ -17491,7 +17513,11 @@ existing prose was left alone.
     `DEFAULT_SCHEMA = sales`) — the first table of a new database, the likeliest one to be created
     there — and a table comment in the same draft failed the plan instead, the comment naming
     `dbo`. No test can reach the branch that went, which lived in the view; the decision is
-    `default_namespace`'s now, pinned by `default_namespace_names_each_engines_own`.
+    `default_namespace`'s now, pinned by `default_namespace_names_each_engines_own`. A foreign key
+    is the same question one level down: the picker lists only the designed table's schema and
+    writes only `ref_table`, and a bare target on SQL Server bound the login's default schema's
+    table instead — `sales.orders` → `dbo.customers` (S3.1-L1-02) — so `ddl::fk_clause` names the
+    table's own schema wherever `bare_reference_is_own_namespace` says a bare name would not.
     **Off `whole_ui_gate`'s list, 4 to zero, and the last four were the three opening paths and the
     overlay.** Those three write across `ddl`, `schema` and the peer editors, so they name all
     three — `open_for_table(ConnUi, SchemaUi, DdlUi, …)`, and the same for `preview_draft_edit` and
@@ -25486,7 +25512,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   `supports_trigger_not_for_replication`, `supports_trigger_execute_as` and
   `supports_trigger_firing_rank`, plus
   `supports_column_reorder`, `rebuilds_tables`, `alter_column_disturbs_checks`,
-  `alter_column_disturbs_dependents`, `refreshes_star_dependents`, `publishes_index_ddl` and
+  `alter_column_disturbs_dependents`, `refreshes_star_dependents`, `publishes_index_ddl`,
+  `bare_reference_is_own_namespace` — which asks where a bare table name resolves, and so whether a
+  foreign key with no namespace may be written without one — and
   `stats::supports_table_stats`; and, for the *comparison* rather than
   any editor, `ref_schema_is_database` and `view_definition_is_qualified`. **The same rule applies
   inside the emitter, and two loops there answered it by not asking.** `emit_sqlite`'s table-rename

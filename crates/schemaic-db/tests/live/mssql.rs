@@ -5564,3 +5564,73 @@ async fn every_arm_of_the_rebuild_guard_refuses_its_table() {
         );
     }
 }
+
+/// **A designer key on a table outside `dbo` references its own schema's
+/// table** (S3.1-L1-02). The picker lists the designed table's schema and
+/// sets only the table name; written bare, the key bound to the login's
+/// default schema's same-named table — `dbo.customers` here — so orders for
+/// `sales` customers were refused and a cascade from `dbo` deleted `sales`
+/// orders. Both doors: a key added to an existing table, and one on a new
+/// table.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_designer_key_outside_dbo_references_its_own_schema() {
+    use schemaic_core::ddl::{ForeignKeyDraft, TableDraft};
+    use schemaic_core::schema::ForeignKeyInfo;
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("fk_schema").await;
+    for sql in [
+        "CREATE SCHEMA sales",
+        "CREATE TABLE dbo.customers (id int PRIMARY KEY); INSERT dbo.customers VALUES (1), (2)",
+        "CREATE TABLE sales.customers (id int PRIMARY KEY); INSERT sales.customers VALUES (7)",
+        "CREATE TABLE sales.orders (id int PRIMARY KEY, cust int NULL)",
+    ] {
+        s.exec(sql).await;
+    }
+    let key = |name: &str| ForeignKeyInfo {
+        name: name.into(),
+        columns: vec!["cust".into()],
+        ref_table: "customers".into(),
+        ref_columns: vec!["id".into()],
+        on_delete: Some("CASCADE".into()),
+        ..Default::default()
+    };
+    let schema =
+        s.db.fetch_schema(&s.name, CancellationToken::new())
+            .await
+            .expect("the schema");
+    let orders = schema
+        .tables
+        .iter()
+        .find(|t| t.schema.as_deref() == Some("sales") && t.name == "orders")
+        .expect("sales.orders")
+        .clone();
+    let mut d = TableDraft::from_table(&orders);
+    d.foreign_keys.push(ForeignKeyDraft::new(key("fk_cust")));
+    apply_draft(&s, &orders, &d).await;
+
+    let mut new = TableDraft::from_table(&orders);
+    new.name = "orders2".into();
+    new.foreign_keys = vec![ForeignKeyDraft::new(key("fk_cust2"))];
+    let stmts = schemaic_core::ddl::create(&new, MS).emit();
+    s.db.run_ddl(&s.name, &stmts, CancellationToken::new())
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{}", stmts.join("\n")));
+
+    assert_eq!(
+        s.scalar(
+            "SELECT STRING_AGG(CONCAT(name, ':', OBJECT_SCHEMA_NAME(referenced_object_id)), ',') \
+             WITHIN GROUP (ORDER BY name) FROM sys.foreign_keys"
+        )
+        .await,
+        "fk_cust:sales,fk_cust2:sales"
+    );
+    // An order for a `sales` customer is taken, and a `dbo` one refused.
+    s.exec("INSERT sales.orders VALUES (1, 7)").await;
+    assert!(
+        s.try_exec("INSERT sales.orders VALUES (2, 1)")
+            .await
+            .is_err()
+    );
+}
