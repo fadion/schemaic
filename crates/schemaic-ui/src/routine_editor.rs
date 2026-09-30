@@ -663,17 +663,22 @@ fn routine_form(ui: DdlUi, target: &RoutineTarget, ring: FocusRing) -> AnyView {
                     |d, v| d.info.tsql.set_option(O::Recompile, v),
                 ));
             }
-            options.push(bound_toggle(
-                d,
-                "Schema binding",
-                "WITH SCHEMABINDING — the tables and views it reads can't be changed out \
-             from under it.",
-                draft.info.tsql.has_option(&O::SchemaBinding),
-                ring.clone(),
-                TAB_OPT + 10,
-                |d, v| d.info.tsql.set_option(O::SchemaBinding, v),
-            ));
-            if shape.allows(&O::ExecuteAs(ExecuteAs::Caller)) {
+            let with = draft.info.tsql.options.clone();
+            // Not on an ordinary procedure, which SQL Server refuses it on
+            // (Msg 10796) — only a natively compiled one takes it.
+            if shape.allows(&O::SchemaBinding, &with) {
+                options.push(bound_toggle(
+                    d,
+                    "Schema binding",
+                    "WITH SCHEMABINDING — the tables and views it reads can't be changed out \
+                 from under it.",
+                    draft.info.tsql.has_option(&O::SchemaBinding),
+                    ring.clone(),
+                    TAB_OPT + 10,
+                    |d, v| d.info.tsql.set_option(O::SchemaBinding, v),
+                ));
+            }
+            if shape.allows(&O::ExecuteAs(ExecuteAs::Caller), &with) {
                 // One field rather than a picker and a name: `CALLER`,
                 // `SELF` and `OWNER` are the keywords, anything else a user,
                 // and a user named like a keyword is quoted — the round trip
@@ -697,7 +702,7 @@ fn routine_form(ui: DdlUi, target: &RoutineTarget, ring: FocusRing) -> AnyView {
                     .into_any(),
                 );
             }
-            if shape.allows(&O::ReturnsNullOnNullInput) {
+            if shape.allows(&O::ReturnsNullOnNullInput, &with) {
                 options.push(bound_toggle(
                     d,
                     "Returns NULL on NULL input",
@@ -709,7 +714,7 @@ fn routine_form(ui: DdlUi, target: &RoutineTarget, ring: FocusRing) -> AnyView {
                     move |d, v| d.info.tsql.set_null_input(v, &original),
                 ));
             }
-            if shape.allows(&O::Inline(true)) {
+            if shape.allows(&O::Inline(true), &with) {
                 // Three states, not a toggle: unstated leaves inlining to the
                 // server, which inlines a function that qualifies.
                 options.push(

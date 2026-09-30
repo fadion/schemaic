@@ -2300,16 +2300,27 @@ impl TsqlShape {
         }
     }
 
-    /// Can a routine of this shape carry `opt`? Measured on SQL Server 2022:
-    /// an inline table-valued function refuses every option but
-    /// `SCHEMABINDING` (and `NATIVE_COMPILATION`'s natively compiled
-    /// variant), a multi-statement one refuses the null-input clauses and
-    /// `INLINE` (Msg 487, *an invalid option was specified*), and only a
-    /// procedure takes `RECOMPILE`.
-    pub fn allows(self, opt: &TsqlRoutineOption) -> bool {
+    /// Can a routine of this shape carry `opt`, in a `WITH` list that is
+    /// `with`? Measured on SQL Server 2022: an inline table-valued function
+    /// refuses every option but `SCHEMABINDING` and `NATIVE_COMPILATION`, a
+    /// multi-statement one refuses the null-input clauses, `INLINE` and
+    /// `NATIVE_COMPILATION` (Msg 487, *an invalid option was specified*), and
+    /// only a procedure takes `RECOMPILE`.
+    ///
+    /// **`SCHEMABINDING` on a procedure depends on the rest of the list** —
+    /// the one cell that does, and why `with` is asked for. SQL Server takes
+    /// it only on a natively compiled procedure (Msg 10796, *supported only
+    /// for natively compiled modules*; 2022 and 2025 alike), where every
+    /// function takes it alone. The converse — a natively compiled module
+    /// *needs* `SCHEMABINDING` — is not a shape's refusal but a missing
+    /// option, and `RoutineDraft::validate` says it as one.
+    pub fn allows(self, opt: &TsqlRoutineOption, with: &[TsqlRoutineOption]) -> bool {
         use TsqlRoutineOption as O;
         match opt {
-            O::SchemaBinding | O::NativeCompilation => true,
+            O::SchemaBinding => {
+                self != TsqlShape::Procedure || with.contains(&O::NativeCompilation)
+            }
+            O::NativeCompilation => self != TsqlShape::MultiStatementTable,
             O::Recompile => self == TsqlShape::Procedure,
             O::ExecuteAs(_) => self != TsqlShape::InlineTable,
             O::ReturnsNullOnNullInput | O::CalledOnNullInput | O::Inline(_) => {

@@ -7697,8 +7697,16 @@ existing prose was left alone.
     and `RETURNS` — `a_sql_server_routine_has_a_shape`) decides which options a routine may carry:
     `TsqlShape::allows`, measured on SQL Server 2022, gives an inline table-valued function none of
     `EXECUTE AS`, the null-input clauses or `INLINE`, a multi-statement one `EXECUTE AS` alone of
-    them, and `RECOMPILE` to a procedure only — pinned through the validator that asks it
-    (`a_sql_server_routine_option_its_shape_refuses_is_refused`, under `ddl.rs`). It is also what `ddl::routine_signature_changed`
+    them and no `NATIVE_COMPILATION`, and `RECOMPILE` to a procedure only — pinned through the validator that asks it
+    (`a_sql_server_routine_option_its_shape_refuses_is_refused`, under `ddl.rs`). **One cell asks
+    the rest of the `WITH` list**, which is why `allows` takes it: a procedure takes `SCHEMABINDING`
+    only when natively compiled (Msg 10796, *supported only for natively compiled modules, and
+    required for those modules*, 2022 and 2025 alike), where every function takes it alone. The
+    cell was once `true` for every shape and never measured, so the form offered the toggle on an
+    ordinary procedure and Apply failed at the server; the message's other half — a natively
+    compiled module without `SCHEMABINDING` — is a missing option rather than a refused one, and the
+    validator names it separately
+    (`schema_binding_on_a_procedure_is_refused_unless_it_is_natively_compiled`). It is also what `ddl::routine_signature_changed`
     compares, so one reading of the shape answers both questions. `verbatim` and `hidden` are the trigger's two
     fallbacks: the stored text restated whole when the parts could not read its header, a comment
     line saying so when the server shows no text (`WITH ENCRYPTION`, or no `VIEW DEFINITION`)
@@ -17993,11 +18001,12 @@ existing prose was left alone.
     the section was an `if pg … else`, and the `else` would have offered a SQL Server routine
     MySQL's determinism, data access and definer, none of which T-SQL has. It is a `match
     target.dialect` now, and the SQL Server arm offers **Recompile** (procedures only — the walk
-    reads `RECOMPILE` on a procedure alone), **Schema binding**, **Execute as** (one field over
+    reads `RECOMPILE` on a procedure alone), **Schema binding** (not on an ordinary procedure,
+    which refuses it), **Execute as** (one field over
     `ExecuteAs::parse_field`, shared with the trigger form), and on a scalar function **Returns NULL
     on NULL input** and **Inlining** — a dropdown rather than a toggle, *Automatic* / *INLINE = ON* /
     *INLINE = OFF*, because unstated leaves inlining to the server — then **Comment** (the
-    `MS_Description` property). Which of the middle three show is `TsqlShape::allows`, read **once at
+    `MS_Description` property). Which of the middle four show is `TsqlShape::allows`, read **once at
     build** like the rest of the form, so a `RETURNS` edited into another shape is the validator's to
     name rather than a form that rebuilds under the user. The two toggles write through
     `TsqlRoutine::set_option` and the rest through the slot setters, each holding one value in place,

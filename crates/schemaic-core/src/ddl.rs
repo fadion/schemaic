@@ -1593,13 +1593,26 @@ impl RoutineDraft {
                 // and the server's refusal names neither the option nor why.
                 let shape = f.tsql_shape();
                 for opt in &f.tsql.options {
-                    if !shape.allows(opt) {
+                    if !shape.allows(opt, &f.tsql.options) {
                         out.push(format!(
                             "{} can't take WITH {}.",
                             shape.label_capitalised(),
                             opt.sql()
                         ));
                     }
+                }
+                // Msg 10796's other half: a natively compiled module is
+                // refused without it, on every shape that takes the option.
+                use crate::schema::TsqlRoutineOption as O;
+                if f.tsql.has_option(&O::NativeCompilation)
+                    && !f.tsql.has_option(&O::SchemaBinding)
+                    && shape.allows(&O::NativeCompilation, &f.tsql.options)
+                {
+                    out.push(
+                        "A natively compiled routine needs WITH SCHEMABINDING — SQL Server \
+                         requires the two together."
+                            .to_string(),
+                    );
                 }
                 if f.tsql.inline() == Some(true) && f.tsql.execute_as().is_some() {
                     out.push(
@@ -26317,6 +26330,69 @@ mod tsql_routine_plan_tests {
             "{errs:?}"
         );
         assert!(with("TABLE", vec![O::SchemaBinding]).is_empty());
+    }
+
+    /// **`SCHEMABINDING` and `NATIVE_COMPILATION` are one decision on SQL
+    /// Server**, measured on 2022 and 2025 alike: *"The SCHEMABINDING option is
+    /// supported only for natively compiled modules, and is required for those
+    /// modules"* (Msg 10796) is the answer to a procedure given the first alone
+    /// and to any module given the second alone. A procedure is the shape
+    /// where that bites — every function takes `SCHEMABINDING` by itself — and
+    /// the form offered the toggle there. A multi-statement table-valued
+    /// function takes no `NATIVE_COMPILATION` at all (Msg 487); a scalar, an
+    /// inline one and a procedure take it with `SCHEMABINDING`.
+    #[test]
+    fn schema_binding_on_a_procedure_is_refused_unless_it_is_natively_compiled() {
+        use crate::schema::{TsqlRoutineOption as O, TsqlShape};
+        let proc_with = |options: Vec<O>| {
+            let mut p = proc_r();
+            p.tsql.options = options;
+            RoutineDraft::from_info(&p).validate(MsSql)
+        };
+        let errs = proc_with(vec![O::SchemaBinding]);
+        assert!(errs.iter().any(|e| e.contains("SCHEMABINDING")), "{errs:?}");
+        assert!(proc_with(vec![O::NativeCompilation, O::SchemaBinding]).is_empty());
+        let fn_with = |returns: &str, options: Vec<O>| {
+            let mut f = RoutineInfo {
+                kind: RoutineKind::Function,
+                returns: returns.into(),
+                body: "BEGIN RETURN @a END".into(),
+                ..proc_r()
+            };
+            f.tsql.options = options;
+            RoutineDraft::from_info(&f).validate(MsSql)
+        };
+        // Natively compiled without it, on any shape that takes the option.
+        for errs in [
+            proc_with(vec![O::NativeCompilation]),
+            fn_with("int", vec![O::NativeCompilation]),
+        ] {
+            assert!(errs.iter().any(|e| e.contains("SCHEMABINDING")), "{errs:?}");
+        }
+        for returns in ["int", "TABLE"] {
+            assert!(
+                fn_with(returns, vec![O::NativeCompilation, O::SchemaBinding]).is_empty(),
+                "{returns}"
+            );
+            assert!(
+                fn_with(returns, vec![O::SchemaBinding]).is_empty(),
+                "{returns}"
+            );
+        }
+        let errs = fn_with(
+            "@t TABLE (a int)",
+            vec![O::NativeCompilation, O::SchemaBinding],
+        );
+        assert!(
+            errs.iter().any(|e| e.contains("NATIVE_COMPILATION")),
+            "{errs:?}"
+        );
+
+        // The form asks the same question for its toggle.
+        let plain: &[O] = &[];
+        assert!(!TsqlShape::Procedure.allows(&O::SchemaBinding, plain));
+        assert!(TsqlShape::Procedure.allows(&O::SchemaBinding, &[O::NativeCompilation]));
+        assert!(TsqlShape::Scalar.allows(&O::SchemaBinding, plain));
     }
 }
 
