@@ -5980,10 +5980,23 @@ existing prose was left alone.
     `MsPermRow`s — `sys.database_permissions` for a user or role, `sys.server_permissions` for a
     login — one statement per row, in catalogue order and ungrouped: `GRANT`, `GRANT … WITH GRANT
     OPTION` for state `W`, and **`DENY`** for `D`, which neither other engine has and which beats any
-    grant, so a list without it would say nothing of what the account is refused. The securable is
-    named by its class as the grant form writes it — `DATABASE::`, `SCHEMA::`, `OBJECT::` with a
-    column list for a column's permission — a `SERVER`-class permission has no `ON`, and a class the
-    function does not know is **left out rather than guessed**. Role memberships follow as
+    grant, so a list without it would say nothing of what the account is refused. **Every securable
+    class the catalogue reports is named**, in T-SQL's own keyword for it (the private
+    `mssql_securable`): `DATABASE::`, `SCHEMA::`, `OBJECT::` with a column list for a column's
+    permission, and past the four the grant form writes `LOGIN::`/`SERVER ROLE::` and
+    `USER::`/`ROLE::`/`APPLICATION ROLE::` (a principal's class split by the principal's type,
+    `MsPermRow::kind`), `ENDPOINT::`, `TYPE::`, `XML SCHEMA COLLECTION::`, `CERTIFICATE::`, the
+    keys, the Service Broker and full-text securables and `DATABASE SCOPED CREDENTIAL::` — each
+    keyword not always the class's name (`SYMMETRIC_KEYS` is `SYMMETRIC KEY::`, `SERVICE_CONTRACT`
+    is `CONTRACT::`). A `SERVER`-class permission has no `ON`. **It read four classes and dropped
+    the rest with nothing on screen**, and what it dropped was the escalation path: a login granted
+    `IMPERSONATE ON LOGIN::sa` — sysadmin one `EXECUTE AS` away — read as holding `CONNECT SQL`.
+    A row that still cannot be rendered — a class with no keyword here, such as an availability
+    group, or a securable whose name did not resolve — is left out rather than guessed, and
+    **`mssql_unshown_note` counts it** into `Grants::note`, naming the classes, as
+    `pg_implicit_note` does for what PostgreSQL's reader never reads
+    (`every_securable_class_reads_back_as_t_sql`, `a_permission_that_cannot_be_rendered_is_reported`).
+    Role memberships follow as
     `ALTER ROLE … ADD MEMBER`, and a login's server roles as `ALTER SERVER ROLE … ADD MEMBER`
     (`mssql_server_role_statements`).
     **`redact_secrets` is why nothing here can put a credential on screen.** MariaDB's `SHOW GRANTS`
@@ -11676,7 +11689,17 @@ existing prose was left alone.
   in another catalogue; the note says the list may be short. `mssql::fetch_grants` reads a login's
   server permissions and server roles on a connection to no database, and a user's or role's
   database permissions and roles in the browser's database, noting when there is none; both fold
-  through `users::mssql_grant_statements`. The live pin is
+  through `users::mssql_grant_statements`, and both read **every class**: `SERVER_PERMISSIONS`
+  names a login, server role or endpoint securable, `DATABASE_PERMISSIONS` a schema-scoped one
+  through `OBJECT_SCHEMA_NAME`/`OBJECT_NAME` (which name master's `sys.xp_cmdshell` too) and the
+  rest through one `LEFT JOIN` per catalogue view, each name `COLLATE DATABASE_DEFAULT` since the
+  views disagree (Msg 451 in the `CASE` otherwise); what comes back unnamed is
+  `mssql_unshown_note`'s. `every_class_of_permission_a_principal_holds_is_listed` pins it, on 2022,
+  2025 and Azure SQL Database (the database half; the login half needs a server): permissions on
+  a user, a role, a type, an XML schema collection and a column read back, **replaying them for
+  another user reproduces the same list** — so the sentences are statements the server takes —
+  and a login's `IMPERSONATE ON LOGIN::sa`, `CONTROL ON LOGIN::` and `CONNECT ON ENDPOINT::` are
+  listed. The live pin is
   `a_login_and_its_user_are_created_granted_reset_and_dropped`, through the real
   `ChangeSet::emit` → `Db::run_ddl` path: one plan creates the login and its user, which are listed
   linked; the login signs in; a grantable schema grant and a `db_datareader` membership read back as

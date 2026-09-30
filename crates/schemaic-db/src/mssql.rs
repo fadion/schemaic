@@ -3290,17 +3290,51 @@ const AZURE_USER_LISTING: &str = "SELECT dp.name, dp.type, \
 /// `SERVERPROPERTY('EngineEdition')` of Azure SQL Database.
 const AZURE_SQL_DATABASE: &str = "5";
 
-/// A database principal's permissions in the current database: `(state,
-/// permission, class, schema, object, column)` — a schema's name for a
-/// schema's permission, an object's schema and name for an object's, and a
-/// column's name when the permission is on one.
+/// A database principal's permissions in the current database, on **every**
+/// securable class: `(state, permission, class, schema, name, column,
+/// principal type)` — the schema of a schema-scoped securable (an object, a
+/// type, an XML schema collection) or of a schema's own permission, the
+/// securable's name, a column's name when the permission is on one, and a
+/// principal's type where the securable is a user or a role.
+///
+/// It read four classes (`sys.objects` joined, so not even a system object
+/// such as master's `sys.xp_cmdshell`), and `users::mssql_grant_statements`
+/// dropped the rest. `OBJECT_SCHEMA_NAME`/`OBJECT_NAME` name system objects
+/// too. Each name is `COLLATE DATABASE_DEFAULT`, since the catalogue views
+/// disagree (`Latin1_General_BIN` beside the database's own) and a `CASE`
+/// over them is Msg 451. A class with no branch here comes back unnamed, and
+/// `users::mssql_unshown_note` counts it.
 const DATABASE_PERMISSIONS: &str = "SELECT p.state, p.permission_name, p.class_desc, \
-            COALESCE(SCHEMA_NAME(o.schema_id), s.name), o.name, c.name \
+            CASE p.class WHEN 1 THEN OBJECT_SCHEMA_NAME(p.major_id) WHEN 3 THEN SCHEMA_NAME(p.major_id) \
+                 WHEN 6 THEN SCHEMA_NAME(ty.schema_id) WHEN 10 THEN SCHEMA_NAME(x.schema_id) END, \
+            CASE p.class WHEN 1 THEN OBJECT_NAME(p.major_id) \
+                 WHEN 4 THEN dp.name COLLATE DATABASE_DEFAULT WHEN 5 THEN a.name COLLATE DATABASE_DEFAULT \
+                 WHEN 6 THEN ty.name COLLATE DATABASE_DEFAULT WHEN 10 THEN x.name COLLATE DATABASE_DEFAULT \
+                 WHEN 15 THEN mt.name COLLATE DATABASE_DEFAULT WHEN 16 THEN sc.name COLLATE DATABASE_DEFAULT \
+                 WHEN 17 THEN sv.name COLLATE DATABASE_DEFAULT WHEN 18 THEN rsb.name COLLATE DATABASE_DEFAULT \
+                 WHEN 19 THEN rt.name COLLATE DATABASE_DEFAULT WHEN 23 THEN ftc.name COLLATE DATABASE_DEFAULT \
+                 WHEN 24 THEN sk.name COLLATE DATABASE_DEFAULT WHEN 25 THEN ce.name COLLATE DATABASE_DEFAULT \
+                 WHEN 26 THEN ak.name COLLATE DATABASE_DEFAULT WHEN 29 THEN fsl.name COLLATE DATABASE_DEFAULT \
+                 WHEN 31 THEN spl.name COLLATE DATABASE_DEFAULT WHEN 32 THEN dsc.name COLLATE DATABASE_DEFAULT END, \
+            COL_NAME(CASE WHEN p.class = 1 AND p.minor_id <> 0 THEN p.major_id END, p.minor_id), \
+            CASE p.class WHEN 4 THEN dp.type END \
      FROM sys.database_permissions p \
-     LEFT JOIN sys.objects o ON p.class = 1 AND o.object_id = p.major_id \
-     LEFT JOIN sys.columns c ON p.class = 1 AND p.minor_id <> 0 \
-            AND c.object_id = p.major_id AND c.column_id = p.minor_id \
-     LEFT JOIN sys.schemas s ON p.class = 3 AND s.schema_id = p.major_id \
+     LEFT JOIN sys.database_principals dp ON p.class = 4 AND dp.principal_id = p.major_id \
+     LEFT JOIN sys.assemblies a ON p.class = 5 AND a.assembly_id = p.major_id \
+     LEFT JOIN sys.types ty ON p.class = 6 AND ty.user_type_id = p.major_id \
+     LEFT JOIN sys.xml_schema_collections x ON p.class = 10 AND x.xml_collection_id = p.major_id \
+     LEFT JOIN sys.service_message_types mt ON p.class = 15 AND mt.message_type_id = p.major_id \
+     LEFT JOIN sys.service_contracts sc ON p.class = 16 AND sc.service_contract_id = p.major_id \
+     LEFT JOIN sys.services sv ON p.class = 17 AND sv.service_id = p.major_id \
+     LEFT JOIN sys.remote_service_bindings rsb ON p.class = 18 AND rsb.remote_service_binding_id = p.major_id \
+     LEFT JOIN sys.routes rt ON p.class = 19 AND rt.route_id = p.major_id \
+     LEFT JOIN sys.fulltext_catalogs ftc ON p.class = 23 AND ftc.fulltext_catalog_id = p.major_id \
+     LEFT JOIN sys.symmetric_keys sk ON p.class = 24 AND sk.symmetric_key_id = p.major_id \
+     LEFT JOIN sys.certificates ce ON p.class = 25 AND ce.certificate_id = p.major_id \
+     LEFT JOIN sys.asymmetric_keys ak ON p.class = 26 AND ak.asymmetric_key_id = p.major_id \
+     LEFT JOIN sys.fulltext_stoplists fsl ON p.class = 29 AND fsl.stoplist_id = p.major_id \
+     LEFT JOIN sys.registered_search_property_lists spl ON p.class = 31 AND spl.property_list_id = p.major_id \
+     LEFT JOIN sys.database_scoped_credentials dsc ON p.class = 32 AND dsc.credential_id = p.major_id \
      WHERE p.grantee_principal_id = DATABASE_PRINCIPAL_ID(@P1) \
      ORDER BY p.class, 4, 5, 6, p.permission_name";
 
@@ -3309,10 +3343,23 @@ const DATABASE_ROLES_OF: &str = "SELECT r.name FROM sys.database_role_members m 
      JOIN sys.database_principals r ON r.principal_id = m.role_principal_id \
      WHERE m.member_principal_id = DATABASE_PRINCIPAL_ID(@P1) ORDER BY r.name";
 
-/// A login's server-level permissions: `(state, permission)`.
-const SERVER_PERMISSIONS: &str = "SELECT p.state, p.permission_name FROM sys.server_permissions p \
-     WHERE p.grantee_principal_id = SUSER_ID(@P1) AND p.class_desc = N'SERVER' \
-     ORDER BY p.permission_name";
+/// A login's server-level permissions, on every class, in
+/// [`DATABASE_PERMISSIONS`]' shape: `(state, permission, class, schema, name,
+/// column, principal type)` — the server itself (no name), a login or a
+/// server role (`SERVER_PRINCIPAL`, told apart by type) or an endpoint.
+///
+/// It read class `SERVER` alone, so `IMPERSONATE ON LOGIN::sa` — which makes
+/// the login sysadmin one `EXECUTE AS` away — was never on the list, and the
+/// login read as holding `CONNECT SQL`. An availability group comes back
+/// unnamed, and `users::mssql_unshown_note` counts it.
+const SERVER_PERMISSIONS: &str = "SELECT p.state, p.permission_name, p.class_desc, NULL, \
+            CASE p.class WHEN 101 THEN sp.name WHEN 105 THEN e.name END, NULL, \
+            CASE p.class WHEN 101 THEN sp.type END \
+     FROM sys.server_permissions p \
+     LEFT JOIN sys.server_principals sp ON p.class = 101 AND sp.principal_id = p.major_id \
+     LEFT JOIN sys.endpoints e ON p.class = 105 AND e.endpoint_id = p.major_id \
+     WHERE p.grantee_principal_id = SUSER_ID(@P1) \
+     ORDER BY p.class, 5, p.permission_name";
 
 /// The server roles a login is a member of.
 const SERVER_ROLES_OF: &str = "SELECT r.name FROM sys.server_role_members m \
@@ -3459,6 +3506,7 @@ pub(crate) async fn fetch_grants(
 ) -> Result<schemaic_core::users::Grants, DbError> {
     use schemaic_core::users::{
         Grants, MsPermRow, PrincipalKind, mssql_grant_statements, mssql_server_role_statements,
+        mssql_unshown_note,
     };
     let text = |r: &Vec<Option<String>>, i: usize| r.get(i).cloned().flatten();
     let first = |rows: Vec<Vec<Option<String>>>| -> Vec<String> {
@@ -3466,24 +3514,29 @@ pub(crate) async fn fetch_grants(
             .filter_map(|r| r.into_iter().next().flatten())
             .collect()
     };
-    if principal.kind == PrincipalKind::Login {
-        let mut client = connect(db, None).await?;
-        let perms: Vec<MsPermRow> = named_rows(&mut client, SERVER_PERMISSIONS, &principal.name)
-            .await?
-            .iter()
+    // `SERVER_PERMISSIONS` and `DATABASE_PERMISSIONS` share one row shape.
+    let perm_rows = |rows: Vec<Vec<Option<String>>>| -> Vec<MsPermRow> {
+        rows.iter()
             .map(|r| MsPermRow {
                 state: text(r, 0).unwrap_or_default(),
                 permission: text(r, 1).unwrap_or_default(),
-                class: "SERVER".to_string(),
-                ..MsPermRow::default()
+                class: text(r, 2).unwrap_or_default(),
+                schema: text(r, 3),
+                object: text(r, 4),
+                column: text(r, 5),
+                kind: text(r, 6),
             })
-            .collect();
+            .collect()
+    };
+    if principal.kind == PrincipalKind::Login {
+        let mut client = connect(db, None).await?;
+        let perms = perm_rows(named_rows(&mut client, SERVER_PERMISSIONS, &principal.name).await?);
         let roles = first(named_rows(&mut client, SERVER_ROLES_OF, &principal.name).await?);
         let mut statements = mssql_grant_statements(&principal.name, "", &perms, &[]);
         statements.extend(mssql_server_role_statements(&principal.name, &roles));
         return Ok(Grants {
             statements,
-            note: None,
+            note: mssql_unshown_note(&perms),
         });
     }
     let Some(database) = database.filter(|d| !d.is_empty()) else {
@@ -3496,22 +3549,11 @@ pub(crate) async fn fetch_grants(
         });
     };
     let mut client = connect(db, Some(database)).await?;
-    let perms: Vec<MsPermRow> = named_rows(&mut client, DATABASE_PERMISSIONS, &principal.name)
-        .await?
-        .iter()
-        .map(|r| MsPermRow {
-            state: text(r, 0).unwrap_or_default(),
-            permission: text(r, 1).unwrap_or_default(),
-            class: text(r, 2).unwrap_or_default(),
-            schema: text(r, 3),
-            object: text(r, 4),
-            column: text(r, 5),
-        })
-        .collect();
+    let perms = perm_rows(named_rows(&mut client, DATABASE_PERMISSIONS, &principal.name).await?);
     let roles = first(named_rows(&mut client, DATABASE_ROLES_OF, &principal.name).await?);
     Ok(Grants {
         statements: mssql_grant_statements(&principal.name, database, &perms, &roles),
-        note: None,
+        note: mssql_unshown_note(&perms),
     })
 }
 

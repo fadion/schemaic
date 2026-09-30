@@ -4451,6 +4451,137 @@ async fn a_login_and_its_user_are_created_granted_reset_and_dropped() {
     assert!(!list.iter().any(|p| p.name == name), "{list:?}");
 }
 
+/// **Every class of permission a principal holds is on its list**, not the
+/// four the grant form writes. The list read the server's class `SERVER`
+/// alone and dropped the rest of the database's, so a login granted
+/// `IMPERSONATE ON LOGIN::sa` read as holding `CONNECT SQL`. In the database,
+/// permissions on a user, a role, a type and an XML schema collection read
+/// back as T-SQL, and **replaying them for another user reproduces the same
+/// list** — the sentences are statements the server takes, not a rendering.
+/// The server half (a login's `IMPERSONATE ON LOGIN::sa` and `CONNECT ON
+/// ENDPOINT::`) is not run on Azure SQL Database, whose logins are `master`'s.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_class_of_permission_a_principal_holds_is_listed() {
+    use schemaic_core::users::PrincipalKind;
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("perm_classes").await;
+    s.exec(
+        "CREATE USER grantee WITHOUT LOGIN; CREATE USER twin WITHOUT LOGIN; \
+         CREATE USER other WITHOUT LOGIN; CREATE ROLE r; \
+         CREATE TABLE dbo.t (id int PRIMARY KEY, v int);",
+    )
+    .await;
+    s.exec("CREATE TYPE dbo.zt FROM int;").await;
+    s.exec(
+        "CREATE XML SCHEMA COLLECTION dbo.zx AS N'<xsd:schema \
+         xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\"><xsd:element name=\"a\" \
+         type=\"xsd:int\"/></xsd:schema>';",
+    )
+    .await;
+    s.exec(
+        "GRANT IMPERSONATE ON USER::other TO grantee; \
+         GRANT ALTER ON ROLE::r TO grantee; \
+         GRANT CONTROL ON TYPE::dbo.zt TO grantee; \
+         GRANT REFERENCES ON XML SCHEMA COLLECTION::dbo.zx TO grantee WITH GRANT OPTION; \
+         GRANT SELECT ON OBJECT::dbo.t (v) TO grantee; \
+         DENY DELETE ON OBJECT::dbo.t TO grantee;",
+    )
+    .await;
+    let list =
+        s.db.fetch_principals(Some(&s.name))
+            .await
+            .expect("the accounts")
+            .list;
+    let user = |name: &str| {
+        list.iter()
+            .find(|p| p.name == name && p.kind == PrincipalKind::User)
+            .unwrap_or_else(|| panic!("{name} in {list:#?}"))
+            .clone()
+    };
+    let grants =
+        s.db.fetch_grants(Some(&s.name), &user("grantee"))
+            .await
+            .expect("the grants");
+    for want in [
+        "GRANT IMPERSONATE ON USER::[other] TO [grantee];",
+        "GRANT ALTER ON ROLE::[r] TO [grantee];",
+        "GRANT CONTROL ON TYPE::[dbo].[zt] TO [grantee];",
+        "GRANT REFERENCES ON XML SCHEMA COLLECTION::[dbo].[zx] TO [grantee] WITH GRANT OPTION;",
+        "GRANT SELECT ON OBJECT::[dbo].[t] ([v]) TO [grantee];",
+        "DENY DELETE ON OBJECT::[dbo].[t] TO [grantee];",
+    ] {
+        assert!(
+            grants.statements.iter().any(|s| s == want),
+            "{want}\n{:#?}",
+            grants.statements
+        );
+    }
+    assert_eq!(grants.note, None, "{:#?}", grants.statements);
+
+    // Replayed for `twin`, the same list comes back.
+    let replay: Vec<String> = grants
+        .statements
+        .iter()
+        .map(|s| s.replace("[grantee]", "[twin]"))
+        .collect();
+    s.exec(&replay.join(" ")).await;
+    let twin =
+        s.db.fetch_grants(Some(&s.name), &user("twin"))
+            .await
+            .expect("the twin's grants");
+    assert_eq!(twin.statements, replay);
+
+    if azure_cannot("keeps its logins in master, so the server half of the grant listing") {
+        return;
+    }
+    let name = format!("{PREFIX}{}_mssql_perm", std::process::id());
+    let target = format!("{PREFIX}{}_mssql_perm2", std::process::id());
+    // Dropped in reverse: the grantee first, as the server refuses to drop
+    // `target` while a permission on it is recorded as its grant (Msg 15173).
+    let _target = ScratchLogin(target.clone());
+    let _login = ScratchLogin(name.clone());
+    let base = base_db();
+    base.fetch_query(
+        None,
+        &format!(
+            "CREATE LOGIN [{name}] WITH PASSWORD = N'Schemaic_Pw1!', CHECK_POLICY = OFF; \
+             CREATE LOGIN [{target}] WITH PASSWORD = N'Schemaic_Pw1!', CHECK_POLICY = OFF; \
+             GRANT IMPERSONATE ON LOGIN::sa TO [{name}]; \
+             GRANT CONTROL ON LOGIN::[{target}] TO [{name}]; \
+             GRANT CONNECT ON ENDPOINT::[TSQL Default TCP] TO [{name}]; \
+             GRANT VIEW SERVER STATE TO [{name}];"
+        ),
+        1,
+        CancellationToken::new(),
+    )
+    .await
+    .expect("the login and its grants");
+    let logins = base.fetch_principals(None).await.expect("the logins").list;
+    let login = logins
+        .iter()
+        .find(|p| p.name == name && p.kind == PrincipalKind::Login)
+        .expect("the login")
+        .clone();
+    let server = base.fetch_grants(None, &login).await.expect("the login's");
+    let q = format!("[{name}]");
+    for want in [
+        format!("GRANT IMPERSONATE ON LOGIN::[sa] TO {q};"),
+        format!("GRANT CONTROL ON LOGIN::[{target}] TO {q};"),
+        format!("GRANT CONNECT ON ENDPOINT::[TSQL Default TCP] TO {q};"),
+        format!("GRANT VIEW SERVER STATE TO {q};"),
+        format!("GRANT CONNECT SQL TO {q};"),
+    ] {
+        assert!(
+            server.statements.contains(&want),
+            "{want}\n{:#?}",
+            server.statements
+        );
+    }
+    assert_eq!(server.note, None, "{:#?}", server.statements);
+}
+
 /// **A contained user, end to end.** In a database made contained, the
 /// listing says so; a user created with a password of its own is listed with
 /// no login and as holding its password, signs in to that database with it,

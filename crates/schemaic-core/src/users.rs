@@ -2412,7 +2412,10 @@ pub struct MsUserRow {
 
 /// One `sys.database_permissions` (or `sys.server_permissions`) row for a
 /// grantee: its `state` (`G`, `W` for with-grant-option, `D` for deny), the
-/// permission, the securable's `class_desc`, and the names that locate it.
+/// permission, the securable's `class_desc`, and the names that locate it —
+/// `schema` for a schema-scoped securable (an object, a type, an XML schema
+/// collection) or a schema itself, `object` for the securable's own name, and
+/// `column` for a column's permission.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MsPermRow {
     pub state: String,
@@ -2421,6 +2424,11 @@ pub struct MsPermRow {
     pub schema: Option<String>,
     pub object: Option<String>,
     pub column: Option<String>,
+    /// The securable principal's `type`, where one class covers several
+    /// kinds of principal: `DATABASE_PRINCIPAL` is a user, a role (`R`) or an
+    /// application role (`A`), `SERVER_PRINCIPAL` a login or a server role
+    /// (`R`) — each with its own keyword in the `ON` clause.
+    pub kind: Option<String>,
 }
 
 /// The server's own logins — `NT AUTHORITY\…`, `NT SERVICE\…` — and the
@@ -2513,52 +2521,141 @@ pub fn from_mssql_rows(logins: &[MsLoginRow], users: &[MsUserRow]) -> Vec<Princi
 /// in catalogue order, each terminated: `GRANT`, `GRANT … WITH GRANT OPTION`
 /// (state `W`) and **`DENY`** (state `D`), which neither other engine has and
 /// which wins over any grant — then its role memberships as `ALTER ROLE …
-/// ADD MEMBER`. The securable is named by its class (`DATABASE::`,
-/// `SCHEMA::`, `OBJECT::`, a column list for a column's), as the grant
-/// editor writes it; a server-level permission (class `SERVER`, a login's)
-/// has no `ON`. A class this does not know is left out rather than guessed.
+/// ADD MEMBER`. The securable is named by its class, in T-SQL's own keyword
+/// for it ([`mssql_securable`]) — every class the catalogue reports, not just
+/// the four the grant form writes; a server-level permission (class
+/// `SERVER`, a login's) has no `ON`. A row that cannot be rendered is left out
+/// rather than guessed, and [`mssql_unshown_note`] counts it.
 pub fn mssql_grant_statements(
     grantee: &str,
     database: &str,
     rows: &[MsPermRow],
     member_of: &[String],
 ) -> Vec<String> {
-    let d = SqlDialect::MsSql;
-    let q = |n: &str| crate::export::ident_sql(n, d);
+    let q = |n: &str| crate::export::ident_sql(n, SqlDialect::MsSql);
     let who = q(grantee);
-    let mut out = Vec::new();
-    for r in rows {
-        let on = match (r.class.as_str(), r.schema.as_deref(), r.object.as_deref()) {
-            ("DATABASE", _, _) => format!(" ON DATABASE::{}", q(database)),
-            ("SCHEMA", Some(s), _) => format!(" ON SCHEMA::{}", q(s)),
-            ("OBJECT_OR_COLUMN", Some(s), Some(o)) => {
-                let cols = r
-                    .column
-                    .as_deref()
-                    .map(|c| format!(" ({})", q(c)))
-                    .unwrap_or_default();
-                format!(" ON OBJECT::{}.{}{cols}", q(s), q(o))
-            }
-            ("SERVER", _, _) => String::new(),
-            _ => continue,
-        };
-        let (verb, tail) = match r.state.trim() {
-            "D" => ("DENY", ""),
-            "W" => ("GRANT", " WITH GRANT OPTION"),
-            "G" => ("GRANT", ""),
-            _ => continue,
-        };
-        out.push(format!(
-            "{verb} {}{on} TO {who}{tail};",
-            r.permission.trim()
-        ));
-    }
+    let mut out: Vec<String> = rows
+        .iter()
+        .filter_map(|r| {
+            let on = mssql_securable(r, database)?;
+            let (verb, tail) = mssql_verb(&r.state)?;
+            Some(format!(
+                "{verb} {}{on} TO {who}{tail};",
+                r.permission.trim()
+            ))
+        })
+        .collect();
     out.extend(
         member_of
             .iter()
             .map(|role| format!("ALTER ROLE {} ADD MEMBER {who};", q(role))),
     );
     out
+}
+
+/// `GRANT`, `GRANT … WITH GRANT OPTION` or `DENY` for a permission row's
+/// `state`; `None` for a state that is none of them.
+fn mssql_verb(state: &str) -> Option<(&'static str, &'static str)> {
+    match state.trim() {
+        "D" => Some(("DENY", "")),
+        "W" => Some(("GRANT", " WITH GRANT OPTION")),
+        "G" => Some(("GRANT", "")),
+        _ => None,
+    }
+}
+
+/// The ` ON <class>::<name>` a permission row's securable is written with —
+/// empty for class `SERVER`, which has none; `None` for a class this does not
+/// know, or a securable whose name the catalogue read did not resolve.
+///
+/// **Every class `sys.database_permissions` and `sys.server_permissions`
+/// report, as measured on SQL Server 2022.** It knew four, and the rest were
+/// dropped with nothing on screen: a login granted `IMPERSONATE ON LOGIN::sa`
+/// — which is sysadmin one `EXECUTE AS` away — read as holding `CONNECT SQL`.
+/// The keyword is not always the class's name: `SYMMETRIC_KEYS` is `SYMMETRIC
+/// KEY::`, `SERVICE_CONTRACT` is `CONTRACT::`, and a principal's class is
+/// split by the principal's type ([`MsPermRow::kind`]).
+fn mssql_securable(r: &MsPermRow, database: &str) -> Option<String> {
+    let q = |n: &str| crate::export::ident_sql(n, SqlDialect::MsSql);
+    let named = |keyword: &str| Some(format!(" ON {keyword}::{}", q(r.object.as_deref()?)));
+    let scoped = |keyword: &str| {
+        Some(format!(
+            " ON {keyword}::{}.{}",
+            q(r.schema.as_deref()?),
+            q(r.object.as_deref()?)
+        ))
+    };
+    let principal_role = r.kind.as_deref().map(str::trim) == Some("R");
+    match r.class.as_str() {
+        "SERVER" => Some(String::new()),
+        "DATABASE" => Some(format!(" ON DATABASE::{}", q(database))),
+        "SCHEMA" => Some(format!(" ON SCHEMA::{}", q(r.schema.as_deref()?))),
+        "OBJECT_OR_COLUMN" => {
+            let cols = r
+                .column
+                .as_deref()
+                .map(|c| format!(" ({})", q(c)))
+                .unwrap_or_default();
+            Some(format!("{}{cols}", scoped("OBJECT")?))
+        }
+        "TYPE" => scoped("TYPE"),
+        "XML_SCHEMA_COLLECTION" => scoped("XML SCHEMA COLLECTION"),
+        "SERVER_PRINCIPAL" if principal_role => named("SERVER ROLE"),
+        "SERVER_PRINCIPAL" => named("LOGIN"),
+        "DATABASE_PRINCIPAL" if principal_role => named("ROLE"),
+        "DATABASE_PRINCIPAL" if r.kind.as_deref().map(str::trim) == Some("A") => {
+            named("APPLICATION ROLE")
+        }
+        "DATABASE_PRINCIPAL" => named("USER"),
+        "ENDPOINT" => named("ENDPOINT"),
+        "ASSEMBLY" => named("ASSEMBLY"),
+        "MESSAGE_TYPE" => named("MESSAGE TYPE"),
+        "SERVICE_CONTRACT" => named("CONTRACT"),
+        "SERVICE" => named("SERVICE"),
+        "REMOTE_SERVICE_BINDING" => named("REMOTE SERVICE BINDING"),
+        "ROUTE" => named("ROUTE"),
+        "FULLTEXT_CATALOG" => named("FULLTEXT CATALOG"),
+        "FULLTEXT_STOPLIST" => named("FULLTEXT STOPLIST"),
+        "SEARCH_PROPERTY_LIST" => named("SEARCH PROPERTY LIST"),
+        "SYMMETRIC_KEYS" => named("SYMMETRIC KEY"),
+        "ASYMMETRIC_KEY" => named("ASYMMETRIC KEY"),
+        "CERTIFICATE" => named("CERTIFICATE"),
+        "DATABASE_SCOPED_CREDENTIAL" => named("DATABASE SCOPED CREDENTIAL"),
+        _ => None,
+    }
+}
+
+/// What [`mssql_grant_statements`] could not render out of `rows`, as the
+/// note the grants view shows under the list — how many permissions, on
+/// which classes — or `None` when every row was rendered.
+///
+/// A privilege screen that silently leaves a row out is the one way it can
+/// mislead, and the rows most likely to be left out are the unusual ones —
+/// an availability group, a class a newer server adds — which are exactly
+/// the ones an audit is looking for.
+pub fn mssql_unshown_note(rows: &[MsPermRow]) -> Option<String> {
+    let unshown: Vec<&MsPermRow> = rows
+        .iter()
+        .filter(|r| mssql_securable(r, "").is_none() || mssql_verb(&r.state).is_none())
+        .collect();
+    if unshown.is_empty() {
+        return None;
+    }
+    let mut classes: Vec<&str> = unshown.iter().map(|r| r.class.trim()).collect();
+    classes.sort_unstable();
+    classes.dedup();
+    let n = unshown.len();
+    Some(format!(
+        "{n} permission{} not shown here, on {}: the server reports {} this list \
+         cannot name.",
+        if n == 1 { " is" } else { "s are" },
+        classes.join(", "),
+        if n == 1 {
+            "it on a securable"
+        } else {
+            "them on securables"
+        }
+    ))
 }
 
 /// A login's server roles as `ALTER SERVER ROLE … ADD MEMBER` — the server's
@@ -5217,6 +5314,7 @@ mod mssql_tests {
                 schema: None,
                 object: None,
                 column: None,
+                kind: None,
             },
             MsPermRow {
                 state: "W".into(),
@@ -5225,6 +5323,7 @@ mod mssql_tests {
                 schema: Some("sales".into()),
                 object: None,
                 column: None,
+                kind: None,
             },
             MsPermRow {
                 state: "D".into(),
@@ -5233,6 +5332,7 @@ mod mssql_tests {
                 schema: Some("dbo".into()),
                 object: Some("t".into()),
                 column: None,
+                kind: None,
             },
             MsPermRow {
                 state: "G".into(),
@@ -5241,6 +5341,7 @@ mod mssql_tests {
                 schema: Some("dbo".into()),
                 object: Some("t".into()),
                 column: Some("price".into()),
+                kind: None,
             },
         ];
         assert_eq!(
@@ -5253,5 +5354,189 @@ mod mssql_tests {
                 "ALTER ROLE [db_datareader] ADD MEMBER [app_u];",
             ]
         );
+        assert_eq!(mssql_unshown_note(&rows), None, "every row was rendered");
+    }
+
+    /// **Every securable class the catalogue reports is rendered**, not the
+    /// four the grant form writes. `IMPERSONATE ON LOGIN::sa` is the case that
+    /// mattered: a login holding it can become sysadmin, and the list showed
+    /// `CONNECT SQL` and nothing else. Each keyword is T-SQL's own spelling of
+    /// the class (`SYMMETRIC_KEYS` is `SYMMETRIC KEY::`, `SERVICE_CONTRACT` is
+    /// `CONTRACT::`), a principal's class split by the principal's type, and a
+    /// system object such as `sys.xp_cmdshell` named like any other.
+    #[test]
+    fn every_securable_class_reads_back_as_t_sql() {
+        let row =
+            |state: &str, perm: &str, class: &str, schema: Option<&str>, object: &str| MsPermRow {
+                state: state.into(),
+                permission: perm.into(),
+                class: class.into(),
+                schema: schema.map(Into::into),
+                object: Some(object.into()),
+                ..MsPermRow::default()
+            };
+        let typed = |r: MsPermRow, kind: &str| MsPermRow {
+            kind: Some(kind.into()),
+            ..r
+        };
+        let cases = [
+            (
+                typed(row("G", "IMPERSONATE", "SERVER_PRINCIPAL", None, "sa"), "S"),
+                "GRANT IMPERSONATE ON LOGIN::[sa] TO [u];",
+            ),
+            (
+                typed(row("G", "ALTER", "SERVER_PRINCIPAL", None, "ops"), "R"),
+                "GRANT ALTER ON SERVER ROLE::[ops] TO [u];",
+            ),
+            (
+                row("G", "CONNECT", "ENDPOINT", None, "TSQL Default TCP"),
+                "GRANT CONNECT ON ENDPOINT::[TSQL Default TCP] TO [u];",
+            ),
+            (
+                typed(
+                    row("G", "IMPERSONATE", "DATABASE_PRINCIPAL", None, "dbo"),
+                    "S",
+                ),
+                "GRANT IMPERSONATE ON USER::[dbo] TO [u];",
+            ),
+            (
+                typed(row("G", "ALTER", "DATABASE_PRINCIPAL", None, "r"), "R"),
+                "GRANT ALTER ON ROLE::[r] TO [u];",
+            ),
+            (
+                typed(row("G", "ALTER", "DATABASE_PRINCIPAL", None, "app"), "A"),
+                "GRANT ALTER ON APPLICATION ROLE::[app] TO [u];",
+            ),
+            (
+                row("G", "CONTROL", "TYPE", Some("dbo"), "zt"),
+                "GRANT CONTROL ON TYPE::[dbo].[zt] TO [u];",
+            ),
+            (
+                row(
+                    "W",
+                    "REFERENCES",
+                    "XML_SCHEMA_COLLECTION",
+                    Some("dbo"),
+                    "zx",
+                ),
+                "GRANT REFERENCES ON XML SCHEMA COLLECTION::[dbo].[zx] TO [u] WITH GRANT OPTION;",
+            ),
+            (
+                row(
+                    "D",
+                    "EXECUTE",
+                    "OBJECT_OR_COLUMN",
+                    Some("sys"),
+                    "xp_cmdshell",
+                ),
+                "DENY EXECUTE ON OBJECT::[sys].[xp_cmdshell] TO [u];",
+            ),
+            (
+                row("G", "REFERENCES", "ASSEMBLY", None, "a"),
+                "GRANT REFERENCES ON ASSEMBLY::[a] TO [u];",
+            ),
+            (
+                row("G", "REFERENCES", "MESSAGE_TYPE", None, "m"),
+                "GRANT REFERENCES ON MESSAGE TYPE::[m] TO [u];",
+            ),
+            (
+                row("G", "REFERENCES", "SERVICE_CONTRACT", None, "c"),
+                "GRANT REFERENCES ON CONTRACT::[c] TO [u];",
+            ),
+            (
+                row("G", "SEND", "SERVICE", None, "s"),
+                "GRANT SEND ON SERVICE::[s] TO [u];",
+            ),
+            (
+                row("G", "CONTROL", "REMOTE_SERVICE_BINDING", None, "b"),
+                "GRANT CONTROL ON REMOTE SERVICE BINDING::[b] TO [u];",
+            ),
+            (
+                row("G", "CONTROL", "ROUTE", None, "rt"),
+                "GRANT CONTROL ON ROUTE::[rt] TO [u];",
+            ),
+            (
+                row("G", "REFERENCES", "FULLTEXT_CATALOG", None, "ftc"),
+                "GRANT REFERENCES ON FULLTEXT CATALOG::[ftc] TO [u];",
+            ),
+            (
+                row("G", "CONTROL", "SYMMETRIC_KEYS", None, "sk"),
+                "GRANT CONTROL ON SYMMETRIC KEY::[sk] TO [u];",
+            ),
+            (
+                row("G", "CONTROL", "CERTIFICATE", None, "ce"),
+                "GRANT CONTROL ON CERTIFICATE::[ce] TO [u];",
+            ),
+            (
+                row("G", "CONTROL", "ASYMMETRIC_KEY", None, "ak"),
+                "GRANT CONTROL ON ASYMMETRIC KEY::[ak] TO [u];",
+            ),
+            (
+                row("G", "CONTROL", "FULLTEXT_STOPLIST", None, "sl"),
+                "GRANT CONTROL ON FULLTEXT STOPLIST::[sl] TO [u];",
+            ),
+            (
+                row("G", "CONTROL", "SEARCH_PROPERTY_LIST", None, "spl"),
+                "GRANT CONTROL ON SEARCH PROPERTY LIST::[spl] TO [u];",
+            ),
+            (
+                row("G", "CONTROL", "DATABASE_SCOPED_CREDENTIAL", None, "cred"),
+                "GRANT CONTROL ON DATABASE SCOPED CREDENTIAL::[cred] TO [u];",
+            ),
+        ];
+        for (r, want) in &cases {
+            assert_eq!(
+                mssql_grant_statements("u", "shop", std::slice::from_ref(r), &[]),
+                [*want],
+                "{r:?}"
+            );
+        }
+        let rows: Vec<MsPermRow> = cases.into_iter().map(|(r, _)| r).collect();
+        assert_eq!(mssql_unshown_note(&rows), None);
+    }
+
+    /// **A row that cannot be rendered is counted, never silently dropped** —
+    /// a class this does not know, or one whose securable's name did not
+    /// resolve. The note names the classes, so a privilege screen that is
+    /// incomplete says where.
+    #[test]
+    fn a_permission_that_cannot_be_rendered_is_reported() {
+        let rows = vec![
+            MsPermRow {
+                state: "G".into(),
+                permission: "CONNECT SQL".into(),
+                class: "SERVER".into(),
+                ..MsPermRow::default()
+            },
+            MsPermRow {
+                state: "G".into(),
+                permission: "CONNECT".into(),
+                class: "AVAILABILITY GROUP".into(),
+                object: Some("ag1".into()),
+                ..MsPermRow::default()
+            },
+            MsPermRow {
+                state: "G".into(),
+                permission: "ALTER".into(),
+                class: "AVAILABILITY GROUP".into(),
+                object: Some("ag1".into()),
+                ..MsPermRow::default()
+            },
+            // Its name did not resolve.
+            MsPermRow {
+                state: "G".into(),
+                permission: "CONTROL".into(),
+                class: "TYPE".into(),
+                ..MsPermRow::default()
+            },
+        ];
+        assert_eq!(
+            mssql_grant_statements("u", "shop", &rows, &[]),
+            ["GRANT CONNECT SQL TO [u];"]
+        );
+        let note = mssql_unshown_note(&rows).expect("a note");
+        assert!(note.starts_with("3 permissions"), "{note}");
+        assert!(note.contains("AVAILABILITY GROUP"), "{note}");
+        assert!(note.contains("TYPE"), "{note}");
     }
 }
