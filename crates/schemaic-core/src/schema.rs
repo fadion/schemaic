@@ -1625,9 +1625,12 @@ pub struct ViewOptions {
     /// upper-cased, in the order the header states them. Empty elsewhere.
     ///
     /// Restated because T-SQL's `ALTER VIEW` resets any it is not told: a
-    /// schema-bound view altered without the word comes back unbound, which
-    /// drops every index on it. `ENCRYPTION` never appears — an encrypted
-    /// view has no readable definition, so there is nothing to edit.
+    /// schema-bound view altered without the word comes back unbound.
+    /// **Restating it does not keep the view's indexes** — `ALTER VIEW` drops
+    /// every index on a view either way (measured on SQL Server 2022 and
+    /// 2025); [`TsqlView::indexes`] is what puts them back. `ENCRYPTION` never
+    /// appears — an encrypted view has no readable definition, so there is
+    /// nothing to edit.
     pub attributes: Vec<String>,
     /// **SQL Server's** — what its view carries beyond the shared options.
     /// Default everywhere else.
@@ -1653,6 +1656,21 @@ pub struct TsqlView {
     pub hidden: bool,
     /// What every SQL Server module carries — see [`TsqlModule`].
     pub module: TsqlModule,
+    /// **An indexed view's indexes** — the unique clustered one that
+    /// materialises it, and any nonclustered ones on top — read from
+    /// `sys.indexes` over `sys.views`.
+    ///
+    /// Here rather than in [`TableInfo::indexes`], which is a table's and
+    /// what the grid, the designer and the comparison read. Read because
+    /// T-SQL's `ALTER VIEW` **drops every index on the view** — whether or
+    /// not `SCHEMABINDING` is restated (measured on SQL Server 2022 and 2025)
+    /// — and so does a recreate's `DROP VIEW`: the view stopped being
+    /// materialised, and every `WITH (NOEXPAND)` query against it started
+    /// failing, with nothing in the preview. The edit plan creates each one
+    /// again after the view, clustered first
+    /// ([`crate::ddl::ChangeSet::emit`]), and refuses where one is
+    /// [`IndexInfo::lossy`]; Copy DDL and the dump restate them the same way.
+    pub indexes: Vec<IndexInfo>,
 }
 
 /// What every **SQL Server module** — a view, a trigger, a procedure or a
@@ -1681,6 +1699,14 @@ pub struct TsqlModule {
 }
 
 impl TsqlModule {
+    /// A module whose header held `comments`, and nothing else known of it —
+    /// what a header walk alone can say.
+    pub fn with_header_comments(comments: impl Into<String>) -> Self {
+        Self {
+            header_comments: comments.into(),
+        }
+    }
+
     /// `statement` with the header comments in front of it, on lines of their
     /// own — the one place they are restated.
     pub fn restate(&self, statement: String) -> String {
@@ -5077,7 +5103,7 @@ impl TableInfo {
             // text restored another object — and a dump's `DROP VIEW IF
             // EXISTS` above it removed this one. Through the one view emitter
             // (`ddl::view_ddl`), on the parts `ddl::tsql_view_parts` reads.
-            return match crate::ddl::tsql_view_parts(sql) {
+            let create = match crate::ddl::tsql_view_parts(sql) {
                 Some(p) => {
                     let mut o = self.view_options.clone().unwrap_or_default();
                     o.column_list = p.column_list;
@@ -5098,6 +5124,24 @@ impl TableInfo {
                     crate::sql::terminated(sql, d)
                 ),
             };
+            // An indexed view's indexes after it, each in a batch of its own —
+            // `CREATE VIEW` must be alone in one — and one the model cannot
+            // restate named, as a table's is.
+            let Some(draft) = crate::ddl::ViewDraft::from_table(self) else {
+                return create;
+            };
+            let mut out = std::iter::once(create)
+                .chain(crate::ddl::view_index_statements(&draft, &self.name, d))
+                .collect::<Vec<_>>()
+                .join("\nGO\n");
+            for ix in draft.options.tsql.indexes.iter().filter(|ix| ix.lossy) {
+                out.push_str(&format!(
+                    "\n-- Index {} has included columns, or is of a kind this script cannot \
+                     restate; it is left out.",
+                    crate::export::comment_text(&ix.name)
+                ));
+            }
+            return out;
         }
         let mut lines: Vec<String> = Vec::new();
         let mut notes: Vec<String> = Vec::new();
@@ -8690,6 +8734,51 @@ mod tests {
         assert_eq!(
             v.create_ddl(ms),
             "-- lead\nCREATE VIEW [sales].[v2] (x) WITH SCHEMABINDING AS\nSELECT id FROM dbo.t;"
+        );
+    }
+
+    /// **An indexed view's script builds its indexes after it**, each in a
+    /// batch of its own (`CREATE VIEW` must be alone in one), the clustered
+    /// one first: a restore of the view alone left it unmaterialised, and
+    /// every `WITH (NOEXPAND)` query against it failing. One the model cannot
+    /// restate is named in a comment instead, as a table's is.
+    #[test]
+    fn create_ddl_sql_server_indexed_view_builds_its_indexes_after_it() {
+        let ix = |name: &str, col: &str, clustered: bool, lossy: bool| IndexInfo {
+            name: name.into(),
+            columns: vec![IndexColumn::plain(col)],
+            unique: clustered,
+            clustered: Some(clustered),
+            lossy,
+            ..Default::default()
+        };
+        let v = TableInfo {
+            schema: Some("dbo".into()),
+            name: "v".into(),
+            is_view: true,
+            create_sql: Some(
+                "CREATE VIEW dbo.v WITH SCHEMABINDING AS SELECT id, d FROM dbo.t".into(),
+            ),
+            view_options: Some(ViewOptions {
+                tsql: TsqlView {
+                    indexes: vec![
+                        ix("nix", "d", false, false),
+                        ix("cix", "id", true, false),
+                        ix("inc", "d", false, true),
+                    ],
+                    ..TsqlView::default()
+                },
+                ..ViewOptions::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            v.create_ddl(crate::intel::SqlDialect::MsSql),
+            "CREATE VIEW [dbo].[v] WITH SCHEMABINDING AS\nSELECT id, d FROM dbo.t;\nGO\n\
+             CREATE UNIQUE CLUSTERED INDEX [cix] ON [dbo].[v] ([id]);\nGO\n\
+             CREATE INDEX [nix] ON [dbo].[v] ([d]);\n\
+             -- Index inc has included columns, or is of a kind this script cannot restate; \
+             it is left out."
         );
     }
 

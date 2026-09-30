@@ -4600,8 +4600,23 @@ existing prose was left alone.
     asked for there: like MySQL's it replaces anything and keeps the view's grants and triggers —
     but T-SQL's `ALTER VIEW` resets whatever it is not told, so the header is restated in full, the
     column list and `ViewOptions::attributes` (`SCHEMABINDING`, `VIEW_METADATA`) with it; a
-    schema-bound view altered without the word comes back unbound and loses every index on it
-    (`sql_server_alters_a_view_in_place_restating_its_header`). Its only re-create is a rename
+    schema-bound view altered without the word comes back unbound
+    (`sql_server_alters_a_view_in_place_restating_its_header`). **Restating it does not keep an
+    indexed view's indexes**, which this passage used to imply: `ALTER VIEW` drops every index on a
+    view whatever its header says, and the rename's `DROP VIEW` does too (measured on 2022 and 2025
+    — `sys.indexes` for the view went from two rows to none), so any edit to an indexed view left it
+    un-materialised, with nothing in the preview. `view_statements` now follows the `CREATE OR ALTER`,
+    or the rename's `CREATE VIEW`, with `view_index_statements` — `create_index_sql` for each of
+    `TsqlView::indexes` (under `schema.rs`), on the name the view now has, **the clustered one
+    first**: it is what materialises the view, and a nonclustered index on a view is refused until
+    it exists. That sort is load-bearing, because the listing arrives in name order — the fixture
+    names its nonclustered index `a_nix` so that name order is the wrong one. Both `ReplaceView`
+    arms of the risks carry `view_indexes_rebuilt`, naming the indexes and saying they are built
+    again in the same transaction, which on a large view takes as long as building them did; the
+    in-place arm had no risk at all before. An `IndexInfo::lossy` one (included columns, a
+    non-rowstore kind) cannot be built again whole, so `lossy_view_index_refusal`, in
+    `unsupported()`, refuses the edit rather than bring the index back as less than it was
+    (`an_indexed_sql_server_views_edit_creates_its_indexes_again`). Its only re-create is a rename
     (above). `create_view_sql`
     asks per engine (`my`/`pg` locals) rather than `!pg`, which had been sorting SQLite onto
     MySQL's side and would have emitted `ALGORITHM`/`DEFINER`/`SQL SECURITY` at an engine that
@@ -7547,13 +7562,19 @@ existing prose was left alone.
     back with whatever quoting it was written with and re-quoting it is a way to change it.
     **`attributes` is SQL Server's alone** — `SCHEMABINDING` and `VIEW_METADATA`, upper-cased in
     the header's order, empty elsewhere — restated for the same `ALTER VIEW` reason: a schema-bound
-    view altered without the word comes back unbound, which drops every index on it. `ENCRYPTION`
-    never appears, an encrypted view having no readable definition to edit. `db::mssql` reads both
+    view altered without the word comes back unbound. Restating it does **not** keep the view's
+    indexes — `ALTER VIEW` drops every one either way (measured on 2022 and 2025), where this line
+    used to say the binding was what kept them; `TsqlView::indexes` is what puts them back.
+    `ENCRYPTION` never appears, an encrypted view having no readable definition to edit. `db::mssql` reads both
     off the stored definition's header, through `ddl::tsql_view_parts`. **`tsql: TsqlView` says
     whether it could** — `verbatim` for a header the walk could not read, `hidden` for a view the
     server shows no text for, default on every other engine — and either leaves the view listed
     and droppable but not editable (`ddl::view_is_editable`), the call `TsqlTrigger`'s fields of
-    the same names make for a trigger. **`TsqlModule` is what every SQL Server module carries beyond
+    the same names make for a trigger. **Its `indexes` are an indexed view's** — the unique
+    clustered one that materialises it and any nonclustered ones on it — moved there off
+    `TableInfo::indexes` by `db::mssql`, because that field is a table's and what the grid, the
+    designer and the comparison read, none of which should see a change; they are held only to be
+    built again after an edit and in the view's script (under `ddl.rs`). **`TsqlModule` is what every SQL Server module carries beyond
     its own parts** — one struct, as `module` on `TsqlView`, `TsqlTrigger` and `TsqlRoutine` alike,
     because what a rebuild loses is `sys.sql_modules`' text rather than anything about the object's
     kind. Its field `header_comments` is the stored statement's text before `CREATE`, verbatim —
@@ -7693,9 +7714,11 @@ existing prose was left alone.
     gates on the arm the plan takes rather than on the engine. **SQL Server leaves it empty for a
     view, on purpose**: its one re-create is a rename (`ddl::supports_view_rename`), and an
     `INSTEAD OF` trigger's stored text names the old view, so a replay would address a view the
-    plan has just dropped. The re-create's risk says instead that the grants and the `INSTEAD OF`
-    triggers go with the drop (`sql_server_renames_a_view_by_re_creating_it`); an edit that keeps
-    the name is a `CREATE OR ALTER` and drops nothing. Deliberately the server's own statement
+    plan has just dropped. The re-create's risk says instead that the grants, the description
+    (`MS_Description`) and the `INSTEAD OF` triggers go with the drop
+    (`sql_server_renames_a_view_by_re_creating_it`); an edit that keeps the name is a `CREATE OR
+    ALTER`, which drops nothing but an indexed view's indexes — and those are not a replay either:
+    the plan builds them again from `TsqlView::indexes` (under `ddl.rs`). Deliberately the server's own statement
     rather than a
     re-emission from `TriggerInfo` — and that stays the call now that `sqlite::triggers_of` *does*
     read a SQLite trigger into the model. The two are not redundant: the model is what the **editor**
@@ -12538,7 +12561,9 @@ existing prose was left alone.
   whole; `repair_tsql_dependents` now rebuilds it (under `ddl.rs`).
   `a_view_is_altered_in_place_and_renamed` takes a schema-bound view with a column list and a
   grant, alters its body and reads all three back, then renames it and reads the stored
-  definition naming the new name.
+  definition naming the new name; a unique clustered and a nonclustered index on it are read into
+  `TsqlView::indexes` (and not `TableInfo::indexes`), and are there again after the in-place
+  edit, after the rename under the new name, and after a replay of the view's own script.
   `a_trigger_is_altered_in_place_and_keeps_what_the_alter_resets` is the trigger editor's leg: a
   trigger written with a leading comment, `EXECUTE AS OWNER`, two events and `NOT FOR REPLICATION`,
   ranked `First` on `INSERT` and disabled, beside a plain one and an encrypted one. It reads the
@@ -12600,6 +12625,12 @@ existing prose was left alone.
   `view_select_body` and `view_header_options`, until the `v$as` they split and the guesses they
   fell back on moved it into core (under `ddl.rs`). `dependent_ddl` is left
   empty for a view, deliberately — see `TableInfo::dependent_ddl`, under `schema.rs`.
+  **`VIEW_INDEX_LISTING` reads an indexed view's indexes** — `INDEX_LISTING`'s row shape over
+  `sys.views`, so the table listing is untouched — and its rows are chained into the index rows
+  `assemble_schema` folds, clustering and `lossy` read exactly as a table's, then moved off the
+  view's `TableInfo::indexes` onto `TsqlView::indexes`, because `ALTER VIEW` and `DROP VIEW` both
+  take them and the edit plan has to build them again (under `ddl.rs`). The live
+  `a_view_is_altered_in_place_and_renamed` pins it end to end on 2022 and 2025.
   **`DATABASE_LISTING` asks `HAS_DBACCESS` inside a `CASE`, and never of a single-user database.**
   On one another session holds `SINGLE_USER`, that call took 2,174 ms against 150 ms (SQL Server
   2022 CU27; 1,997 ms re-measured for a plain login) — what an administrator's maintenance window
@@ -12678,9 +12709,13 @@ existing prose was left alone.
   `ddl::tsql_view_parts` and the one view emitter `ddl::view_ddl` — `sp_rename` leaves the stored
   text naming the old view, and a view created unqualified under a non-`dbo` default schema is
   stored as `CREATE VIEW v`, so restated verbatim the script created another object, and a dump's
-  own `DROP VIEW IF EXISTS` above it removed the real one (measured on SQL Server 2022); only a
-  header the walk cannot read is restated as written, under a `-- NOTE:` saying so
-  (`create_ddl_sql_server_view_is_rebuilt_under_its_catalogue_name`,
+  own `DROP VIEW IF EXISTS` above it removed the real one (measured on SQL Server 2022); an
+  indexed view's `TsqlView::indexes` follow it through `ddl::view_index_statements`, clustered
+  first, each in a `GO` batch of its own because `CREATE VIEW` must be alone in one, and one it
+  cannot restate named in a comment as a table's is
+  (`create_ddl_sql_server_indexed_view_builds_its_indexes_after_it`); only a
+  header the walk cannot read is restated as written, under a `-- NOTE:` saying so, its indexes
+  still after it (`create_ddl_sql_server_view_is_rebuilt_under_its_catalogue_name`,
   `create_ddl_sql_server_view_it_cannot_read_is_restated_with_a_note`; live,
   `a_views_script_names_the_view_the_catalogue_has`)), held
   to the server, comments included, by `a_tables_ddl_rebuilds_the_table_it_was_read_from`; a trigger's DDL is rebuilt from

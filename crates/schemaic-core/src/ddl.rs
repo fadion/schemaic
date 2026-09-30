@@ -2962,13 +2962,16 @@ fn view_drop_cost(dialect: SqlDialect, restored: bool) -> &'static str {
         // No rules, and a view that selects from it is not dropped with it —
         // it fails until the view is back, unless it is schema-bound, which
         // blocks the drop and so the plan.
+        // Its description (`MS_Description`) is an extended property of the
+        // view, and goes with it; its indexes, if it is an indexed view, are
+        // the plan's to put back (`view_indexes_rebuilt`).
         (SqlDialect::MsSql, true) => {
-            "Grants on it are dropped with it and aren't restored; its INSTEAD OF \
-             triggers are dropped too."
+            "Grants on it and its description are dropped with it and aren't restored; \
+             its INSTEAD OF triggers are dropped too."
         }
         (SqlDialect::MsSql, false) => {
-            "Grants on it and its INSTEAD OF triggers are dropped with it and aren't \
-             restored."
+            "Grants on it, its description and its INSTEAD OF triggers are dropped with it \
+             and aren't restored."
         }
         (_, true) => {
             "Dependent views, rules and grants are dropped with it and aren't \
@@ -3547,8 +3550,17 @@ impl Change {
                         if replay.len() == 1 { "is" } else { "are" },
                     ));
                 }
+                out.extend(view_indexes_rebuilt(draft));
                 out
             }
+            // **An indexed view's alter drops its indexes too** — T-SQL's
+            // `ALTER VIEW` always does — so the in-place redefinition, which
+            // is otherwise no risk at all, has this one.
+            Change::ReplaceView {
+                draft,
+                recreate: false,
+                ..
+            } => view_indexes_rebuilt(draft).into_iter().collect(),
             // **Nothing is lost and the plan may simply fail** — which is worth
             // a sentence for the same reason `KeepLossyIndex` is: the preview is
             // where the plan says what it won't do for you. Every existing row
@@ -4437,6 +4449,7 @@ impl ChangeSet {
             .collect();
         out.extend(self.changes.iter().filter_map(unreplayable_rename));
         out.extend(self.changes.iter().filter_map(numbered_group_refusal));
+        out.extend(self.changes.iter().filter_map(lossy_view_index_refusal));
         out
     }
 
@@ -5519,12 +5532,14 @@ impl ChangeSet {
                             draft.options.materialized,
                         ));
                         out.push(create_view_sql(draft, &draft.name, d, false));
+                        out.extend(view_index_statements(draft, &draft.name, d));
                         // What the drop took with it, verbatim, after the view is
                         // back — the same replay a table rebuild does with
                         // `dependent_ddl`, for the same reason.
                         out.extend(replay.iter().cloned());
                     } else {
                         out.push(create_view_sql(draft, server_name, d, true));
+                        out.extend(view_index_statements(draft, server_name, d));
                     }
                 }
                 // Guarded for the reason the `RefreshView` arm three lines down
@@ -6607,6 +6622,86 @@ fn create_view_sql(v: &ViewDraft, name: &str, dialect: SqlDialect, replace: bool
     sql.push(';');
     // A SQL Server view's header comments, in front; empty everywhere else.
     o.tsql.module.restate(sql)
+}
+
+/// The `CREATE INDEX` statements that put an indexed view's indexes back
+/// after its alter or re-create — SQL Server's `ALTER VIEW` and `DROP VIEW`
+/// both take every one ([`crate::schema::TsqlView::indexes`]). **The
+/// clustered index first**: it is what materialises the view, and a
+/// nonclustered index on a view is refused until it exists. One the model
+/// only partly read is left out here and refused by
+/// [`lossy_view_index_refusal`]. Empty for every view without indexes, which
+/// is every view on the other engines.
+pub(crate) fn view_index_statements(v: &ViewDraft, name: &str, d: SqlDialect) -> Vec<String> {
+    let qname = qualified(name, v.schema.as_deref(), d);
+    let mut indexes: Vec<&IndexInfo> = v
+        .options
+        .tsql
+        .indexes
+        .iter()
+        .filter(|ix| !ix.lossy)
+        .collect();
+    indexes.sort_by_key(|ix| ix.clustered != Some(true));
+    indexes
+        .into_iter()
+        .map(|ix| create_index_sql(ix, &qname, d))
+        .collect()
+}
+
+/// The risk sentence for an indexed view's edit: the indexes the alter or the
+/// drop takes, which the plan builds again after it
+/// ([`view_index_statements`]). `None` for a view without any.
+fn view_indexes_rebuilt(v: &ViewDraft) -> Option<String> {
+    let names: Vec<&str> = v
+        .options
+        .tsql
+        .indexes
+        .iter()
+        .filter(|ix| !ix.lossy)
+        .map(|ix| ix.name.as_str())
+        .collect();
+    if names.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "Redefining view {} drops its index{} ({}) — SQL Server's ALTER VIEW always does — \
+         and this plan builds {} again after it, in the same transaction. On a large view \
+         that takes as long as building {} did.",
+        v.original.as_deref().unwrap_or(&v.name),
+        if names.len() == 1 { "" } else { "es" },
+        names.join(", "),
+        if names.len() == 1 { "it" } else { "them" },
+        if names.len() == 1 { "it" } else { "them" },
+    ))
+}
+
+/// The refusal for a view edit **that would drop an index it cannot create
+/// again**, or `None` when the change is fine: an indexed view's index with
+/// included columns, or of a kind the model has no field for
+/// ([`IndexInfo::lossy`]), goes with the view's alter and could only come
+/// back without what was never read.
+fn lossy_view_index_refusal(c: &Change) -> Option<String> {
+    let Change::ReplaceView { draft, .. } = c else {
+        return None;
+    };
+    let lost: Vec<&str> = draft
+        .options
+        .tsql
+        .indexes
+        .iter()
+        .filter(|ix| ix.lossy)
+        .map(|ix| ix.name.as_str())
+        .collect();
+    if lost.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "Editing view {} drops its index{} {}, which Schemaic can't create again — it has \
+         included columns, or is of a kind Schemaic can't restate. Edit this view in SQL instead.",
+        draft.original.as_deref().unwrap_or(&draft.name),
+        if lost.len() == 1 { "" } else { "es" },
+        lost.join(", ")
+    ))
 }
 
 fn drop_view_sql(qname: &str, materialized: bool) -> String {
@@ -17486,6 +17581,69 @@ mod tests {
         assert!(risks.contains("sp_rename"), "{risks}");
     }
 
+    /// `ms_view` materialised: a unique clustered index and a nonclustered one.
+    fn ms_indexed_view() -> TableInfo {
+        let mut t = ms_view();
+        let ix = |name: &str, col: &str, unique: bool, clustered: bool| IndexInfo {
+            name: name.into(),
+            columns: vec![crate::schema::IndexColumn::plain(col)],
+            unique,
+            clustered: Some(clustered),
+            ..Default::default()
+        };
+        // In the catalogue's name order, which puts the nonclustered first.
+        t.view_options.as_mut().unwrap().tsql.indexes =
+            vec![ix("a_nix", "b", false, false), ix("cix", "a", true, true)];
+        t
+    }
+
+    /// **Any edit to an indexed view creates its indexes again.** T-SQL's
+    /// `ALTER VIEW` drops every index on the view whether or not
+    /// `SCHEMABINDING` is restated, and so does a recreate's `DROP VIEW`
+    /// (measured on SQL Server 2022 and 2025: `sys.indexes` for the view went
+    /// from two rows to none), so the view stopped being materialised and the
+    /// preview said nothing. The clustered one goes first — a nonclustered
+    /// index on a view needs it — and the risk names what is rebuilt.
+    #[test]
+    fn an_indexed_sql_server_views_edit_creates_its_indexes_again() {
+        let t = ms_indexed_view();
+        let mut d = ViewDraft::from_table(&t).unwrap();
+        d.select = "SELECT id, d FROM dbo.t WHERE d > 0".into();
+        let cs = diff_view(&t, &d, MsSql);
+        assert!(cs.unsupported().is_empty(), "{:?}", cs.unsupported());
+        let sql = cs.emit();
+        assert_eq!(sql.len(), 3, "{sql:#?}");
+        assert!(
+            sql[0].starts_with("CREATE OR ALTER VIEW [dbo].[v]"),
+            "{sql:#?}"
+        );
+        assert_eq!(
+            sql[1],
+            "CREATE UNIQUE CLUSTERED INDEX [cix] ON [dbo].[v] ([a]);"
+        );
+        assert_eq!(sql[2], "CREATE INDEX [a_nix] ON [dbo].[v] ([b]);");
+        let risks = cs.destructive().join(" ");
+        assert!(risks.contains("cix") && risks.contains("a_nix"), "{risks}");
+
+        // A rename re-creates the view, and the indexes go on the new name.
+        let mut d = ViewDraft::from_table(&t).unwrap();
+        d.name = "v2".into();
+        let sql = diff_view(&t, &d, MsSql).emit();
+        assert_eq!(sql[0], "DROP VIEW [dbo].[v];");
+        assert_eq!(
+            sql[2],
+            "CREATE UNIQUE CLUSTERED INDEX [cix] ON [dbo].[v2] ([a]);"
+        );
+
+        // An index the model only partly read cannot be put back: refused.
+        let mut t = ms_indexed_view();
+        t.view_options.as_mut().unwrap().tsql.indexes[0].lossy = true;
+        let mut d = ViewDraft::from_table(&t).unwrap();
+        d.select = "SELECT id, d FROM dbo.t WHERE d > 1".into();
+        let refused = diff_view(&t, &d, MsSql).unsupported();
+        assert!(refused.iter().any(|r| r.contains("a_nix")), "{refused:?}");
+    }
+
     /// **A SQL Server table diffs to nothing against its own draft** — the
     /// round-trip gate, over the shapes introspection reads there, each field
     /// set as `db::mssql::collect_schema` sets it:
@@ -26259,10 +26417,7 @@ mod tsql_trigger_read_tests {
             events: vec![TriggerEvent::Insert],
             action: crate::schema::TriggerAction::Body(p.body.clone()),
             tsql: crate::schema::TsqlTrigger {
-                module: crate::schema::TsqlModule {
-                    header_comments: p.header_comments.clone(),
-                    ..Default::default()
-                },
+                module: crate::schema::TsqlModule::with_header_comments(p.header_comments.clone()),
                 ..Default::default()
             },
             ..Default::default()
@@ -26533,10 +26688,7 @@ mod tsql_routine_read_tests {
             body: p.body.clone(),
             tsql: crate::schema::TsqlRoutine {
                 options: p.options.clone(),
-                module: crate::schema::TsqlModule {
-                    header_comments: p.header_comments.clone(),
-                    ..Default::default()
-                },
+                module: crate::schema::TsqlModule::with_header_comments(p.header_comments.clone()),
                 ..Default::default()
             },
             ..Default::default()
@@ -26696,10 +26848,9 @@ mod tsql_view_read_tests {
                 column_list: p.column_list.clone(),
                 attributes: p.attributes.clone(),
                 tsql: crate::schema::TsqlView {
-                    module: crate::schema::TsqlModule {
-                        header_comments: p.header_comments.clone(),
-                        ..Default::default()
-                    },
+                    module: crate::schema::TsqlModule::with_header_comments(
+                        p.header_comments.clone(),
+                    ),
                     ..Default::default()
                 },
                 ..ViewOptions::default()

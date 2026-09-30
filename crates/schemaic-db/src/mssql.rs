@@ -1252,6 +1252,30 @@ const INDEX_LISTING: &str = "SELECT s.name, t.name, \
      WHERE t.is_ms_shipped = 0 AND i.index_id > 0 AND i.is_hypothetical = 0 \
      ORDER BY s.name, t.name, i.name, ic.key_ordinal, ic.index_column_id";
 
+/// Every **indexed view's** indexes, in [`INDEX_LISTING`]'s shape — the
+/// unique clustered index that materialises the view and any nonclustered
+/// ones on it. Their own listing, over `sys.views`, so the table listing is
+/// untouched: they land in `TsqlView::indexes`, which the view's edit plan
+/// and script restate, since `ALTER VIEW` and `DROP VIEW` both take them.
+const VIEW_INDEX_LISTING: &str = "SELECT s.name, v.name, i.name, \
+            CAST(i.is_unique AS int), CAST(i.is_primary_key AS int), \
+            c.name, CAST(ic.is_descending_key AS int), i.filter_definition, i.type, \
+            CAST(CASE WHEN EXISTS (SELECT 1 FROM sys.index_columns x \
+                                    WHERE x.object_id = i.object_id \
+                                      AND x.index_id = i.index_id \
+                                      AND x.is_included_column = 1) \
+                 THEN 1 ELSE 0 END AS int), \
+            NULL \
+     FROM sys.indexes i \
+     JOIN sys.views v ON v.object_id = i.object_id \
+     JOIN sys.schemas s ON s.schema_id = v.schema_id \
+     JOIN sys.index_columns ic \
+            ON ic.object_id = i.object_id AND ic.index_id = i.index_id \
+           AND ((ic.is_included_column = 0 AND ic.key_ordinal > 0) OR i.type IN (5, 6)) \
+     JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id \
+     WHERE v.is_ms_shipped = 0 AND i.index_id > 0 AND i.is_hypothetical = 0 \
+     ORDER BY s.name, v.name, i.name, ic.key_ordinal, ic.index_column_id";
+
 /// Every foreign key's column pairs, in key order, with its actions:
 /// `(schema, table, constraint, column, ref schema, ref table, ref column,
 /// delete action, update action)`.
@@ -1335,10 +1359,7 @@ fn tsql_trigger_reading(
                 schemabinding: p.schemabinding,
                 native_compilation: p.native_compilation,
                 not_for_replication: p.not_for_replication,
-                module: TsqlModule {
-                    header_comments: p.header_comments,
-                    ..TsqlModule::default()
-                },
+                module: TsqlModule::with_header_comments(p.header_comments),
                 ..TsqlTrigger::default()
             },
         ),
@@ -1395,10 +1416,7 @@ fn tsql_routine_reading(
             tsql: TsqlRoutine {
                 options: p.options,
                 for_replication: p.for_replication,
-                module: TsqlModule {
-                    header_comments: p.header_comments,
-                    ..TsqlModule::default()
-                },
+                module: TsqlModule::with_header_comments(p.header_comments),
                 ..TsqlRoutine::default()
             },
         },
@@ -1597,10 +1615,7 @@ fn tsql_view_reading(definition: Option<&str>) -> TsqlViewReading {
                 column_list: p.column_list,
                 attributes: p.attributes,
                 tsql: TsqlView {
-                    module: TsqlModule {
-                        header_comments: p.header_comments,
-                        ..TsqlModule::default()
-                    },
+                    module: TsqlModule::with_header_comments(p.header_comments),
                     ..TsqlView::default()
                 },
                 ..ViewOptions::default()
@@ -1728,8 +1743,12 @@ async fn collect_schema(client: &mut MsClient) -> Result<DbSchema, DbError> {
         })
         .collect();
 
+    // An indexed view's indexes, in the same shape — folded onto the view
+    // and moved to `TsqlView::indexes` below.
+    let view_idx_all = query_rows(client, VIEW_INDEX_LISTING).await?;
     let idx_rows: Vec<(String, IdxRow)> = idx_all
         .iter()
+        .chain(&view_idx_all)
         .map(|r| {
             let mut column = IndexColumn::plain(cell(r, 5));
             column.descending = flag(r, 6);
@@ -1940,7 +1959,11 @@ async fn collect_schema(client: &mut MsClient) -> Result<DbSchema, DbError> {
             && let Some(v) = view_readings.remove(&key)
         {
             t.create_sql = v.create_sql;
-            t.view_options = Some(v.options);
+            let mut options = v.options;
+            // An indexed view's indexes are the view's to restate, not a
+            // table's for the grid and the designer to read.
+            options.tsql.indexes = std::mem::take(&mut t.indexes);
+            t.view_options = Some(options);
             // `dependent_ddl` stays empty on purpose: a view's only re-create
             // here is a rename, and an `INSTEAD OF` trigger's stored text
             // names the old view, so replaying it would address a view the

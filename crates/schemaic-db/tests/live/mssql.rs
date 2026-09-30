@@ -1813,10 +1813,26 @@ async fn a_view_is_altered_in_place_and_renamed() {
     s.exec("CREATE VIEW dbo.v (a, b) WITH SCHEMABINDING AS SELECT id, d FROM dbo.t")
         .await;
     s.exec("GRANT SELECT ON dbo.v TO public").await;
+    // Materialised: `ALTER VIEW` drops both of these, schema binding or not.
+    s.exec("CREATE UNIQUE CLUSTERED INDEX cix ON dbo.v (a)")
+        .await;
+    s.exec("CREATE NONCLUSTERED INDEX nix ON dbo.v (b)").await;
+    let indexes = |name: &'static str| {
+        let s = &s;
+        async move {
+            s.scalar(&format!(
+                "SELECT STRING_AGG(name, ',') WITHIN GROUP (ORDER BY name) FROM sys.indexes \
+                 WHERE object_id = OBJECT_ID('dbo.{name}') AND index_id > 0"
+            ))
+            .await
+        }
+    };
     let v = read_table(&s, "v").await;
     let o = v.view_options.clone().expect("options");
     assert_eq!(o.column_list.as_deref(), Some("a, b"));
     assert_eq!(o.attributes, ["SCHEMABINDING"]);
+    assert_eq!(o.tsql.indexes.len(), 2, "{:?}", o.tsql.indexes);
+    assert!(v.indexes.is_empty(), "a view's indexes are not a table's");
 
     let mut d = ViewDraft::from_table(&v).expect("a view");
     d.select = "SELECT id, d FROM dbo.t WHERE d > 0".into();
@@ -1840,6 +1856,7 @@ async fn a_view_is_altered_in_place_and_renamed() {
         "1",
         "the grant kept"
     );
+    assert_eq!(indexes("v").await, "cix,nix", "the indexes built again");
     let v2 = read_table(&s, "v").await;
     assert!(diff_view(&v2, &ViewDraft::from_table(&v2).unwrap(), MS).is_empty());
 
@@ -1857,6 +1874,16 @@ async fn a_view_is_altered_in_place_and_renamed() {
     );
     assert_eq!(w.view_options.unwrap().attributes, ["SCHEMABINDING"]);
     assert_eq!(s.scalar("SELECT b FROM dbo.w").await, "5");
+    assert_eq!(indexes("w").await, "cix,nix", "the indexes on the new name");
+
+    // Its script builds them after it, and replays.
+    let ddl = read_table(&s, "w").await.create_ddl(MS);
+    replay(
+        &s,
+        &format!("DROP VIEW IF EXISTS [dbo].[w];\nGO\n{ddl}\nGO"),
+    )
+    .await;
+    assert_eq!(indexes("w").await, "cix,nix", "the script restored them");
 }
 
 /// **A view is edited only when its header was read.** `v$as` is one name —
