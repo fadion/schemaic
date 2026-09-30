@@ -5036,8 +5036,10 @@ impl TableInfo {
     /// [`Self::create_ddl`] for SQL Server — what its own tools call *Script
     /// table as CREATE*, from the model.
     ///
-    /// A view is its stored `CREATE VIEW` verbatim (`sys.sql_modules`), which
-    /// `db::mssql` keeps in `create_sql`. A table is rebuilt: columns with
+    /// A view is its stored `CREATE VIEW` (`sys.sql_modules`, which `db::mssql`
+    /// keeps in `create_sql`) with the header rebuilt under the catalogue's
+    /// name — the stored text is restated as written, with a note, only where
+    /// its header does not read. A table is rebuilt: columns with
     /// their types, `IDENTITY`, nullability, collation, default and computed
     /// definitions; the primary key and every unique constraint under their
     /// own names; checks; then each other index as a statement of its own,
@@ -5057,16 +5059,43 @@ impl TableInfo {
         };
         let cname = crate::export::comment_text(&qname);
         if self.is_view {
-            return match self
+            let Some(sql) = self
                 .create_sql
                 .as_deref()
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-            {
-                Some(sql) => crate::sql::terminated(sql, d),
-                None => format!(
+            else {
+                return format!(
                     "-- The definition of view {cname} was not available (it may be \
                      encrypted, or not visible to this login)."
+                );
+            };
+            // **The header is rebuilt under the catalogue's name**, as SQL
+            // Server's own scripter does: `sp_rename` leaves the stored text
+            // naming the old view, and a view created unqualified under a
+            // non-`dbo` default schema is stored as `CREATE VIEW v`, so the
+            // text restored another object — and a dump's `DROP VIEW IF
+            // EXISTS` above it removed this one. Through the one view emitter
+            // (`ddl::view_ddl`), on the parts `ddl::tsql_view_parts` reads.
+            return match crate::ddl::tsql_view_parts(sql) {
+                Some(p) => {
+                    let mut o = self.view_options.clone().unwrap_or_default();
+                    o.column_list = p.column_list;
+                    o.attributes = p.attributes;
+                    o.tsql.module.header_comments = p.header_comments;
+                    o.tsql.verbatim = false;
+                    let v = TableInfo {
+                        view_definition: Some(p.body),
+                        view_options: Some(o),
+                        ..self.clone()
+                    };
+                    crate::ddl::view_ddl(&v, d).unwrap_or_default()
+                }
+                // The text is all there is; restated, and said to be.
+                None => format!(
+                    "-- NOTE: {cname}'s header could not be read, so its stored statement is \
+                     restated as written; it may name another view than {cname}.\n{}",
+                    crate::sql::terminated(sql, d)
                 ),
             };
         }
@@ -8629,19 +8658,59 @@ mod tests {
         );
     }
 
-    /// A view is its stored statement, verbatim.
+    /// **A view's header is rebuilt under the name the catalogue gives it**,
+    /// not restated as stored. `sp_rename` leaves `sys.sql_modules` naming the
+    /// old view, and a view created unqualified by a user whose default schema
+    /// is not `dbo` is stored as `CREATE VIEW v`, so the stored text restored
+    /// the view under another name or in another schema — and a dump's own
+    /// `DROP VIEW IF EXISTS` removed the real one (S1.3-L1-01, measured on SQL
+    /// Server 2022). The column list, the attributes and the header's comments
+    /// are kept; the body is the stored one.
     #[test]
-    fn create_ddl_sql_server_view_is_its_stored_statement() {
+    fn create_ddl_sql_server_view_is_rebuilt_under_its_catalogue_name() {
+        let ms = crate::intel::SqlDialect::MsSql;
         let v = TableInfo {
-            schema: Some("dbo".into()),
-            name: "v".into(),
+            schema: Some("sales".into()),
+            name: "v2".into(),
             is_view: true,
-            create_sql: Some("CREATE VIEW dbo.v AS SELECT 1 AS a".into()),
+            create_sql: Some("CREATE VIEW v1 AS SELECT 1 AS a".into()),
             ..Default::default()
         };
         assert_eq!(
-            v.create_ddl(crate::intel::SqlDialect::MsSql),
-            "CREATE VIEW dbo.v AS SELECT 1 AS a;"
+            v.create_ddl(ms),
+            "CREATE VIEW [sales].[v2] AS\nSELECT 1 AS a;"
+        );
+        let v = TableInfo {
+            create_sql: Some(
+                "-- lead\nCREATE VIEW dbo.v1 (x) WITH SCHEMABINDING AS SELECT id FROM dbo.t;"
+                    .into(),
+            ),
+            ..v
+        };
+        assert_eq!(
+            v.create_ddl(ms),
+            "-- lead\nCREATE VIEW [sales].[v2] (x) WITH SCHEMABINDING AS\nSELECT id FROM dbo.t;"
+        );
+    }
+
+    /// Where the header does not read, the stored text is all there is — it
+    /// is restated as written, **and says so**, since it may name another
+    /// view than the one the script is for.
+    #[test]
+    fn create_ddl_sql_server_view_it_cannot_read_is_restated_with_a_note() {
+        let v = TableInfo {
+            schema: Some("dbo".into()),
+            name: "v2".into(),
+            is_view: true,
+            create_sql: Some("CREATE VIEW v1 WITH SOMETHING_NEW AS SELECT 1 AS a".into()),
+            ..Default::default()
+        };
+        let ddl = v.create_ddl(crate::intel::SqlDialect::MsSql);
+        assert!(ddl.starts_with("-- NOTE: "), "{ddl}");
+        assert!(ddl.contains("[dbo].[v2]"), "{ddl}");
+        assert!(
+            ddl.ends_with("\nCREATE VIEW v1 WITH SOMETHING_NEW AS SELECT 1 AS a;"),
+            "{ddl}"
         );
     }
 

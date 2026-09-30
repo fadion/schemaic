@@ -12673,7 +12673,16 @@ existing prose was left alone.
   `AS (…) PERSISTED`, other indexes as separate
   statements, the table's and columns' comments after them through `ddl::tsql_add_comment` — the
   same `sp_addextendedproperty` the emitter writes (`create_ddl_sql_server_restates_the_comments`)
-  — and what it cannot restate named in a comment; a view is its stored definition), held
+  — and what it cannot restate named in a comment; a view is its stored definition **with the
+  header rebuilt under the catalogue's name**, as SQL Server's own scripter writes it, through
+  `ddl::tsql_view_parts` and the one view emitter `ddl::view_ddl` — `sp_rename` leaves the stored
+  text naming the old view, and a view created unqualified under a non-`dbo` default schema is
+  stored as `CREATE VIEW v`, so restated verbatim the script created another object, and a dump's
+  own `DROP VIEW IF EXISTS` above it removed the real one (measured on SQL Server 2022); only a
+  header the walk cannot read is restated as written, under a `-- NOTE:` saying so
+  (`create_ddl_sql_server_view_is_rebuilt_under_its_catalogue_name`,
+  `create_ddl_sql_server_view_it_cannot_read_is_restated_with_a_note`; live,
+  `a_views_script_names_the_view_the_catalogue_has`)), held
   to the server, comments included, by `a_tables_ddl_rebuilds_the_table_it_was_read_from`; a trigger's DDL is rebuilt from
   the parts its stored statement was read into, with its rank and disabled state after it as
   statements of their own, and a schema script closes each object's batch with `GO` (`TriggerInfo::create_sql`,

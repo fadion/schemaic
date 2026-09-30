@@ -1902,6 +1902,66 @@ async fn a_view_is_edited_only_when_its_header_was_read() {
     assert!(!ViewDraft::from_table(&enc).unwrap().validate(MS).is_empty());
 }
 
+/// **A view's script names the view the catalogue has**, not the one its
+/// stored text says. `sp_rename` leaves `sys.sql_modules` reading `CREATE
+/// VIEW dbo.v1`, and a user whose default schema is `sales` who writes
+/// `CREATE VIEW v` is stored unqualified; restated verbatim, a dump's
+/// `DROP VIEW IF EXISTS [dbo].[v2]` then created `v1` in its place. Each
+/// script, replayed as the dump writes it, puts back the view it is for.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_views_script_names_the_view_the_catalogue_has() {
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("ddl_view_script").await;
+    s.exec("CREATE VIEW dbo.v1 AS SELECT 1 AS a").await;
+    s.exec("EXEC sp_rename 'dbo.v1', 'v2'").await;
+    s.exec("CREATE SCHEMA sales").await;
+    s.exec(
+        "CREATE USER zz_mod_sales WITHOUT LOGIN WITH DEFAULT_SCHEMA = sales; \
+         GRANT CREATE VIEW TO zz_mod_sales; GRANT ALTER ON SCHEMA::sales TO zz_mod_sales",
+    )
+    .await;
+    s.exec("EXECUTE AS USER = 'zz_mod_sales'; EXEC ('CREATE VIEW v AS SELECT 2 AS a'); REVERT")
+        .await;
+    let schema =
+        s.db.fetch_schema(&s.name, CancellationToken::new())
+            .await
+            .expect("the schema");
+    let find = |ns: &str, n: &str| {
+        schema
+            .tables
+            .iter()
+            .find(|t| t.schema.as_deref() == Some(ns) && t.name == n)
+            .unwrap_or_else(|| panic!("{ns}.{n}"))
+            .clone()
+    };
+    let v2 = find("dbo", "v2");
+    assert!(
+        v2.create_sql.as_deref().unwrap_or_default().contains("v1"),
+        "the stored text"
+    );
+    let sales_v = find("sales", "v");
+    for (t, qname, want) in [(v2, "[dbo].[v2]", "1"), (sales_v, "[sales].[v]", "2")] {
+        let ddl = t.create_ddl(MS);
+        assert!(ddl.contains(&format!("CREATE VIEW {qname}")), "{ddl}");
+        replay(&s, &format!("DROP VIEW IF EXISTS {qname};\nGO\n{ddl}\nGO")).await;
+        assert_eq!(s.scalar(&format!("SELECT a FROM {qname}")).await, want);
+    }
+    assert_eq!(
+        s.scalar("SELECT COUNT(*) FROM sys.views WHERE name IN ('v1')")
+            .await,
+        "0"
+    );
+    assert_eq!(
+        s.scalar(
+            "SELECT COUNT(*) FROM sys.views WHERE SCHEMA_NAME(schema_id) = 'dbo' AND name = 'v'"
+        )
+        .await,
+        "0"
+    );
+}
+
 /// **A routine is altered in place and keeps what the alter would reset**:
 /// its parameters' defaults (which live only in the text), its `WITH`
 /// options, its grant and its comment. A rename is a drop and a create that
