@@ -562,9 +562,19 @@ fn footer(
     // `modal_footer`: its actions slot never shrinks and is as wide as its
     // content, so the sentence there went unwrapped and took the buttons off the
     // modal's right edge with it.
+    //
+    // **One decision, read twice.** What the row says and whether it is there
+    // at all are both this memo's (`outcome_note`): they were two closures
+    // re-deriving the same predicate — the content keyed on `done.filter(idle)`,
+    // the `Display::None` on `idle && done.is_some()` — which had to agree for
+    // the row to be neither an empty gap nor hidden over a sentence the user
+    // needs, and nothing but reading both said they were one.
+    let shown_note = floem::reactive::create_memo(move |_| {
+        outcome_note(imp.chosen.with(|c| c.is_empty()), imp.done.get())
+    });
     let note = dyn_container(
-        move || (imp.chosen.with(|c| c.is_empty()), imp.done.get()),
-        move |(idle, done)| match done.filter(|_| idle) {
+        move || shown_note.get(),
+        move |note| match note {
             Some(d) => text(d)
                 .style(|s| {
                     s.font_size(theme::font_label())
@@ -579,8 +589,8 @@ fn footer(
     // Hidden while there is nothing to say, or the empty row still takes the
     // footer's gap.
     .style(move |s| {
-        let shown = imp.chosen.with(|c| c.is_empty()) && imp.done.with(Option::is_some);
-        s.apply_if(!shown, |s| s.display(floem::style::Display::None))
+        let hidden = shown_note.with(Option::is_none);
+        s.apply_if(hidden, |s| s.display(floem::style::Display::None))
     });
 
     let bar = dyn_container(
@@ -626,6 +636,15 @@ fn import_label(count: usize) -> String {
     }
 }
 
+/// The footer's outcome line — the last import's "Added N connections." —
+/// shown only while `idle`, nothing being selected, so it never sits beside an
+/// enabled Import describing a previous press. `None` is both "no text" and
+/// "no row": the footer keys its content and its `Display::None` on this one
+/// answer.
+fn outcome_note(idle: bool, done: Option<String>) -> Option<String> {
+    done.filter(|_| idle)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -646,6 +665,21 @@ mod tests {
         assert_eq!(import_label(0), "Import");
         assert_eq!(import_label(1), "Import 1");
         assert_eq!(import_label(7), "Import 7");
+    }
+
+    /// The outcome line is there only once an import has finished and until
+    /// the next row is ticked — one answer for its text and its row alike.
+    #[test]
+    fn the_outcome_line_shows_only_between_an_import_and_the_next_selection() {
+        let added = || Some("Added 3 connections.".to_string());
+        assert_eq!(outcome_note(true, added()), added());
+        assert_eq!(
+            outcome_note(false, added()),
+            None,
+            "a fresh tick retires it"
+        );
+        assert_eq!(outcome_note(true, None), None, "nothing imported yet");
+        assert_eq!(outcome_note(false, None), None);
     }
 
     #[test]

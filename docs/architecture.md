@@ -16372,7 +16372,11 @@ existing prose was left alone.
     first spelling, a `v_stack` of note and buttons handed to `modal_footer`, sat inside the actions
     slot, which is sized to its content — so the note's `width_full` had nothing to resolve against,
     the sentence never wrapped, and it pushed Close and Import off the modal's right edge instead.
-    The note is `Display::None` while it has nothing to say, so the empty row does not take the gap.
+    The note is `Display::None` while it has nothing to say, so the empty row does not take the gap
+    — and **what it says and whether it is there are one memo over `outcome_note(idle, done)`**
+    (pure, tested), which keys the content and decides the `Display::None` alike. They were two
+    closures re-deriving one predicate, which had to agree for the row to be neither an empty gap
+    nor hidden over the warning it carries.
     `skipped_sentence(skipped, hidden)` (pure, tested)
     names up to three left-out entries and counts the rest, returning `None` for an empty list *and*
     a zero `hidden` so a stray "0 entries were not imported" can't reach the screen. `hidden` is what
