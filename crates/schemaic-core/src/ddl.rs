@@ -6605,7 +6605,8 @@ fn create_view_sql(v: &ViewDraft, name: &str, dialect: SqlDialect, replace: bool
         sql.push('\n');
     }
     sql.push(';');
-    sql
+    // A SQL Server view's header comments, in front; empty everywhere else.
+    o.tsql.module.restate(sql)
 }
 
 fn drop_view_sql(qname: &str, materialized: bool) -> String {
@@ -9958,6 +9959,8 @@ pub struct TsqlTriggerParts {
     /// Everything after the header's `AS`, verbatim but for the whitespace
     /// around it.
     pub body: String,
+    /// The header's comments — [`crate::schema::TsqlModule::header_comments`].
+    pub header_comments: String,
 }
 
 /// One token of T-SQL text, for [`tsql_trigger_parts`]' walk.
@@ -10080,6 +10083,7 @@ pub fn tsql_trigger_parts(definition: &str) -> Option<TsqlTriggerParts> {
     if !(c.keyword("CREATE") || c.keyword("ALTER")) {
         return None;
     }
+    let create_at = c.start;
     if c.keyword("OR") && !c.keyword("ALTER") {
         return None;
     }
@@ -10163,6 +10167,7 @@ pub fn tsql_trigger_parts(definition: &str) -> Option<TsqlTriggerParts> {
     if !c.keyword("AS") {
         return None;
     }
+    out.header_comments = tsql_header_comments(definition, create_at, c.start, &[]);
     let body = definition[c.i..].trim();
     if body.is_empty() {
         return None;
@@ -10181,6 +10186,8 @@ pub struct TsqlRoutineParts {
     pub options: Vec<crate::schema::TsqlRoutineOption>,
     pub for_replication: bool,
     pub body: String,
+    /// The header's comments — [`crate::schema::TsqlModule::header_comments`].
+    pub header_comments: String,
 }
 
 impl<'a> TsqlCursor<'a> {
@@ -10275,6 +10282,46 @@ fn tsql_strip_outer_parens(s: &str) -> &str {
     s[open_end..close_at].trim()
 }
 
+/// The comments of a T-SQL module's header — see
+/// [`crate::schema::TsqlModule::header_comments`]: the text before `CREATE`
+/// (`create_at`) verbatim, then each comment up to the header's end, one to a
+/// line, but for any inside a `kept` span — a part kept as text, which holds
+/// its own comments.
+///
+/// Walked over `sql::skip_noncode`, so a `--` inside a string or a quoted
+/// name is not a comment. The text before `CREATE` holds nothing else: the
+/// walks require `CREATE` to be the first token.
+fn tsql_header_comments(
+    s: &str,
+    create_at: usize,
+    header_end: usize,
+    kept: &[(usize, usize)],
+) -> String {
+    let b = s.as_bytes();
+    let mut out: Vec<&str> = Vec::new();
+    let lead = s[..create_at].trim();
+    if !lead.is_empty() {
+        out.push(lead);
+    }
+    let mut i = create_at;
+    while i < header_end {
+        if let Some(&(_, to)) = kept.iter().find(|&&(from, to)| from <= i && i < to) {
+            i = to;
+            continue;
+        }
+        match sql::skip_noncode(b, i, SqlDialect::MsSql) {
+            Some(j) => {
+                if matches!(b[i], b'-' | b'/') {
+                    out.push(s[i..j].trim_end());
+                }
+                i = j.max(i + 1);
+            }
+            None => i += 1,
+        }
+    }
+    out.join("\n")
+}
+
 /// A SQL Server procedure's or function's stored `CREATE`, read into the
 /// parts a `CREATE OR ALTER` must restate — or `None` when the parts cannot
 /// restate it.
@@ -10308,6 +10355,9 @@ pub fn tsql_routine_parts(definition: &str) -> Option<TsqlRoutineParts> {
     if !(c.keyword("CREATE") || c.keyword("ALTER")) {
         return None;
     }
+    let create_at = c.start;
+    // The spans kept as text, whose comments stay in them.
+    let mut kept: Vec<(usize, usize)> = Vec::new();
     if c.keyword("OR") && !c.keyword("ALTER") {
         return None;
     }
@@ -10330,12 +10380,13 @@ pub fn tsql_routine_parts(definition: &str) -> Option<TsqlRoutineParts> {
         let from = c.i;
         c.close_paren()?;
         out.arguments = definition[from..c.start].trim().to_string();
+        kept.push((from, c.start));
         if !c.keyword("RETURNS") {
             return None;
         }
+        let from = c.i;
         if matches!(c.peek(), Some(TsqlTok::Word(w)) if w.starts_with('@')) {
             // `RETURNS @t TABLE (…)` — a multi-statement table function.
-            let from = c.i;
             c.next();
             if !c.keyword("TABLE") {
                 return None;
@@ -10350,11 +10401,14 @@ pub fn tsql_routine_parts(definition: &str) -> Option<TsqlRoutineParts> {
                 .span_until(&["WITH", "AS", "BEGIN", "RETURN"])?
                 .to_string();
         }
+        kept.push((from, c.i));
         if out.returns.is_empty() {
             return None;
         }
     } else {
+        let from = c.i;
         out.arguments = tsql_strip_outer_parens(c.span_until(&["WITH", "FOR", "AS"])?).to_string();
+        kept.push((from, c.i));
     }
     if c.keyword("WITH") {
         loop {
@@ -10429,17 +10483,22 @@ pub fn tsql_routine_parts(definition: &str) -> Option<TsqlRoutineParts> {
         out.for_replication = true;
     }
     // A procedure's `AS` is required; a function may leave it out and start
-    // its body with `BEGIN` or `RETURN`.
-    if !c.keyword("AS") {
+    // its body with `BEGIN` or `RETURN` — and then whatever precedes that
+    // word is the body's.
+    let header_end = if c.keyword("AS") {
+        c.start
+    } else {
         let starts_body = matches!(c.peek(), Some(TsqlTok::Word(w))
             if w.eq_ignore_ascii_case("BEGIN") || w.eq_ignore_ascii_case("RETURN"));
         if !(function && starts_body) {
             return None;
         }
-    }
+        c.i
+    };
     if matches!(c.peek(), Some(TsqlTok::Word(w)) if w.eq_ignore_ascii_case("EXTERNAL")) {
         return None; // a CLR routine: `AS EXTERNAL NAME assembly.class.method`
     }
+    out.header_comments = tsql_header_comments(definition, create_at, header_end, &kept);
     let body = definition[c.i..].trim();
     if body.is_empty() {
         return None;
@@ -10460,6 +10519,8 @@ pub struct TsqlViewParts {
     /// Everything after the header's `AS`, verbatim but for the whitespace
     /// around it and a trailing `;`.
     pub body: String,
+    /// The header's comments — [`crate::schema::TsqlModule::header_comments`].
+    pub header_comments: String,
 }
 
 /// A SQL Server view's stored `CREATE VIEW`, read into the header a `CREATE
@@ -10490,6 +10551,8 @@ pub fn tsql_view_parts(definition: &str) -> Option<TsqlViewParts> {
     if !(c.keyword("CREATE") || c.keyword("ALTER")) {
         return None;
     }
+    let create_at = c.start;
+    let mut kept: Vec<(usize, usize)> = Vec::new();
     if c.keyword("OR") && !c.keyword("ALTER") {
         return None;
     }
@@ -10503,6 +10566,7 @@ pub fn tsql_view_parts(definition: &str) -> Option<TsqlViewParts> {
         c.close_paren()?;
         out.column_list =
             Some(definition[from..c.start].trim().to_string()).filter(|s| !s.is_empty());
+        kept.push((from, c.start));
     }
     if c.keyword("WITH") {
         loop {
@@ -10525,6 +10589,7 @@ pub fn tsql_view_parts(definition: &str) -> Option<TsqlViewParts> {
     if !c.keyword("AS") {
         return None;
     }
+    out.header_comments = tsql_header_comments(definition, create_at, c.start, &kept);
     let body = definition[c.i..].trim().trim_end_matches(';').trim_end();
     if body.is_empty() {
         return None;
@@ -26164,6 +26229,56 @@ mod tsql_trigger_read_tests {
         let p = parts("CREATE TRIGGER dbo.tr$as ON dbo.t$as AFTER INSERT AS SELECT 1 AS x");
         assert_eq!(p.body, "SELECT 1 AS x");
     }
+
+    /// SSMS's *New Trigger* template, as `sys.sql_modules` stores it
+    /// (measured on SQL Server 2022): the Author/Description block before
+    /// `CREATE`, and a comment between the header's parts.
+    const SSMS_TRIGGER: &str = "-- =============================================\n\
+        -- Author:\t\tJane\n\
+        -- Description:\taudit trigger\n\
+        -- =============================================\n\
+        CREATE TRIGGER dbo.tr_audit\n   ON  dbo.t\n   AFTER INSERT /* why: audit */\nAS\n\
+        BEGIN\n  SET NOCOUNT ON;\nEND";
+
+    /// **A trigger's header comments survive a rebuild.** The body box starts
+    /// after `AS`, so the editor never showed them, and every edit — and since
+    /// the rebuild, every dump and Copy DDL — dropped the only copy of the
+    /// object's documentation (S7.1-L1-04). They are kept, restated in front
+    /// of the rebuilt statement, and read back as the same parts.
+    #[test]
+    fn a_triggers_header_comments_survive_its_rebuild() {
+        let p = parts(SSMS_TRIGGER);
+        assert!(p.header_comments.contains("-- Author:\t\tJane"), "{p:?}");
+        assert!(p.header_comments.contains("/* why: audit */"), "{p:?}");
+        assert_eq!(p.body, "BEGIN\n  SET NOCOUNT ON;\nEND");
+        let t = TriggerInfo {
+            name: "tr_audit".into(),
+            schema: Some("dbo".into()),
+            table: "t".into(),
+            timing: TriggerTiming::After,
+            events: vec![TriggerEvent::Insert],
+            action: crate::schema::TriggerAction::Body(p.body.clone()),
+            tsql: crate::schema::TsqlTrigger {
+                module: crate::schema::TsqlModule {
+                    header_comments: p.header_comments.clone(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        for or_alter in [false, true] {
+            let sql = t.tsql_statement(or_alter);
+            assert!(sql.starts_with("-- ====="), "{sql}");
+            let back = parts(&sql);
+            assert_eq!(back.header_comments, p.header_comments, "{sql}");
+            assert_eq!(back.body, p.body);
+        }
+        assert_eq!(
+            parts("CREATE TRIGGER t ON u AFTER INSERT AS SELECT 1").header_comments,
+            ""
+        );
+    }
 }
 
 #[cfg(test)]
@@ -26388,6 +26503,60 @@ mod tsql_routine_read_tests {
         );
     }
 
+    /// **A routine's header comments survive a rebuild** — SSMS's template
+    /// block before `CREATE PROCEDURE`, and a comment between the header's
+    /// parts — where Copy DDL and the dump, rebuilt from the parts since the
+    /// routine editor came, dropped them. A comment inside the parameter list
+    /// or the `RETURNS` stays there, verbatim; the rest is restated in front of
+    /// the statement and reads back as the same parts.
+    #[test]
+    fn a_routines_header_comments_survive_its_rebuild() {
+        let stored = "-- =============================================\n\
+            -- Author:\t\tJane\n\
+            -- =============================================\n\
+            CREATE PROCEDURE dbo.p\n  @a int = 1, -- the first\n  @b int = 2 -- the last\n\
+            WITH /* why */ RECOMPILE\nAS\nSELECT @a + @b";
+        let p = parts(stored);
+        assert_eq!(p.arguments, "@a int = 1, -- the first\n  @b int = 2");
+        assert!(p.header_comments.contains("-- Author:\t\tJane"), "{p:?}");
+        assert!(p.header_comments.contains("-- the last"), "{p:?}");
+        assert!(p.header_comments.contains("/* why */"), "{p:?}");
+        assert!(
+            !p.header_comments.contains("the first"),
+            "kept in the list: {p:?}"
+        );
+        let r = RoutineInfo {
+            name: "p".into(),
+            schema: Some("dbo".into()),
+            kind: RoutineKind::Procedure,
+            arguments: p.arguments.clone(),
+            body: p.body.clone(),
+            tsql: crate::schema::TsqlRoutine {
+                options: p.options.clone(),
+                module: crate::schema::TsqlModule {
+                    header_comments: p.header_comments.clone(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        for or_alter in [false, true] {
+            let sql = r.create_sql(SqlDialect::MsSql, or_alter);
+            let back = parts(&sql);
+            assert_eq!(
+                (&back.header_comments, &back.arguments, &back.body),
+                (&p.header_comments, &p.arguments, &p.body),
+                "{sql}"
+            );
+        }
+        // A function's, with `RETURNS` and no `AS`.
+        let p =
+            parts("/* lead */ CREATE FUNCTION f (@x int) RETURNS int /* r */ BEGIN RETURN @x END");
+        assert_eq!(p.header_comments, "/* lead */");
+        assert_eq!(p.body, "/* r */ BEGIN RETURN @x END");
+    }
+
     /// **A function's parameter list that ends in a `--` comment keeps its
     /// `)`.** The list is kept verbatim, comment and all, and was written back
     /// as `(@a int -- the input)` on one line, so the comment ran to the end of
@@ -26500,6 +26669,49 @@ mod tsql_view_read_tests {
         let p = parts("CREATE VIEW dbo.v$as WITH SCHEMABINDING AS SELECT id FROM dbo.t");
         assert_eq!(p.attributes, ["SCHEMABINDING"]);
         assert_eq!(p.body, "SELECT id FROM dbo.t");
+    }
+
+    /// **A view's header comments survive its edit**: the block before
+    /// `CREATE` and a comment between the header's parts are kept and
+    /// restated in front of the rebuilt statement — the editor's box starts
+    /// after `AS`, so nothing on screen said an edit would drop them. A
+    /// comment inside the column list stays in it.
+    #[test]
+    fn a_views_header_comments_survive_its_rebuild() {
+        let p = parts(
+            "/* header comment */\n-- second\nCREATE VIEW dbo.v_c (a /* first */) /* why */ \
+             WITH SCHEMABINDING AS SELECT id FROM dbo.t",
+        );
+        assert_eq!(
+            p.header_comments,
+            "/* header comment */\n-- second\n/* why */"
+        );
+        assert_eq!(p.column_list.as_deref(), Some("a /* first */"));
+        let v = TableInfo {
+            name: "v_c".into(),
+            schema: Some("dbo".into()),
+            is_view: true,
+            view_definition: Some(p.body.clone()),
+            view_options: Some(ViewOptions {
+                column_list: p.column_list.clone(),
+                attributes: p.attributes.clone(),
+                tsql: crate::schema::TsqlView {
+                    module: crate::schema::TsqlModule {
+                        header_comments: p.header_comments.clone(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ..ViewOptions::default()
+            }),
+            ..TableInfo::default()
+        };
+        let mut d = ViewDraft::from_table(&v).unwrap();
+        d.select = "SELECT id FROM dbo.t WHERE id > 0".into();
+        let sql = diff_view(&v, &d, SqlDialect::MsSql).emit().join("\n");
+        let back = parts(&sql);
+        assert_eq!(back.header_comments, p.header_comments, "{sql}");
+        assert_eq!(back.column_list, p.column_list);
     }
 
     /// Refused, not guessed at: `ENCRYPTION`, an attribute Schemaic does not

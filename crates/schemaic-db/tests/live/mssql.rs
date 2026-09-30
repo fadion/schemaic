@@ -2033,6 +2033,113 @@ async fn a_routine_is_altered_in_place_and_keeps_what_the_alter_resets() {
     assert!(diff_routine(&fresh, &RoutineDraft::from_info(&fresh), MS).is_empty());
 }
 
+/// **A module's header comments survive an edit.** SSMS's template block
+/// before `CREATE`, and a comment between the header's parts, are stored in
+/// `sys.sql_modules`; the rebuild dropped them from every edit, and from a
+/// trigger's and a routine's Copy DDL and dump. Each reads back with them,
+/// diffs to nothing against its own draft, and keeps them through an edit.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_modules_header_comments_survive_an_edit() {
+    use schemaic_core::ddl::{
+        RoutineDraft, TriggerSetDraft, ViewDraft, diff_routine, diff_triggers, diff_view,
+    };
+    use schemaic_core::schema::TriggerAction;
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("ddl_header_comments").await;
+    s.exec("CREATE TABLE dbo.t (id int NOT NULL PRIMARY KEY); CREATE TABLE dbo.audit (id int)")
+        .await;
+    let template = "-- =============================================\n\
+                    -- Author:\t\tJane\n\
+                    -- =============================================\n";
+    s.exec(&format!(
+        "{template}CREATE TRIGGER dbo.tr_audit\n   ON  dbo.t\n   AFTER INSERT /* why: audit */\nAS\n\
+         BEGIN\n  SET NOCOUNT ON; INSERT dbo.audit SELECT id FROM inserted;\nEND"
+    ))
+    .await;
+    s.exec("/* header comment */ CREATE VIEW dbo.v_c AS SELECT id FROM dbo.t")
+        .await;
+    s.exec(&format!(
+        "{template}CREATE PROCEDURE dbo.p AS SELECT 1 AS n"
+    ))
+    .await;
+    let stored = |name: &'static str| {
+        let s = &s;
+        async move {
+            s.scalar(&format!(
+                "SELECT definition FROM sys.sql_modules WHERE object_id = OBJECT_ID('dbo.{name}')"
+            ))
+            .await
+        }
+    };
+    let apply = |stmts: Vec<String>| {
+        let db = s.db.clone();
+        let name = s.name.clone();
+        async move {
+            db.run_ddl(&name, &stmts, CancellationToken::new())
+                .await
+                .unwrap_or_else(|e| panic!("{e}\n{stmts:#?}"));
+        }
+    };
+
+    let t = read_table(&s, "t").await;
+    let tr = t.triggers[0].clone();
+    assert!(
+        tr.tsql.module.header_comments.contains("-- Author:"),
+        "{tr:?}"
+    );
+    assert!(tr.create_sql(MS).contains("/* why: audit */"));
+    let mut set = TriggerSetDraft::from_table(&t);
+    assert!(diff_triggers(&t.triggers, &set, MS).is_empty());
+    set.triggers[0].info.action = TriggerAction::Body(
+        "BEGIN\n  SET NOCOUNT ON; INSERT dbo.audit SELECT -id FROM inserted;\nEND".into(),
+    );
+    apply(diff_triggers(&t.triggers, &set, MS).emit()).await;
+    let after = stored("tr_audit").await;
+    assert!(
+        after.contains("-- Author:") && after.contains("/* why: audit */"),
+        "{after}"
+    );
+    assert!(after.contains("SELECT -id"), "{after}");
+
+    let v = read_table(&s, "v_c").await;
+    let mut d = ViewDraft::from_table(&v).unwrap();
+    assert!(diff_view(&v, &d, MS).is_empty());
+    d.select = "SELECT id FROM dbo.t WHERE id > 0".into();
+    apply(diff_view(&v, &d, MS).emit()).await;
+    let after = stored("v_c").await;
+    assert!(
+        after.contains("/* header comment */") && after.contains("id > 0"),
+        "{after}"
+    );
+
+    let p =
+        s.db.fetch_schema(&s.name, CancellationToken::new())
+            .await
+            .unwrap()
+            .routines
+            .iter()
+            .find(|r| r.name == "p")
+            .unwrap()
+            .as_ref()
+            .clone();
+    assert!(
+        schemaic_core::schema::ObjectItem::Routine(Arc::new(p.clone()))
+            .create_sql(MS)
+            .contains("-- Author:")
+    );
+    let mut d = RoutineDraft::from_info(&p);
+    assert!(diff_routine(&p, &d, MS).is_empty());
+    d.info.body = "SELECT 2 AS n".into();
+    apply(diff_routine(&p, &d, MS).emit()).await;
+    let after = stored("p").await;
+    assert!(
+        after.contains("-- Author:") && after.contains("SELECT 2"),
+        "{after}"
+    );
+}
+
 /// **A parameter's own `AS` is not the header's.** `@a AS int` and a
 /// parameter named `@as` are T-SQL the server takes; read with the list cut
 /// at the first `AS`, the first lost its type to the body and the second

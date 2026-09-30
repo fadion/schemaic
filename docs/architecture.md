@@ -4924,6 +4924,17 @@ existing prose was left alone.
     index without a word (`a_sql_server_view_it_cannot_read_is_not_edited`; live,
     `a_view_is_edited_only_when_its_header_was_read` on 2022 and 2025). Both kinds stay listed
     and droppable, as a trigger does.
+    **All three walks also hand back the header's comments** — `header_comments` on each parts
+    struct, bound for `TsqlModule` (under `schema.rs`), because the rebuild writes the header afresh
+    and the body box starts after `AS`. Each records where its `CREATE` token starts, where the
+    header ends — its own `AS`, or for a function with none the point the body starts — and the
+    spans it keeps as text (a parameter list, a column list, a `RETURNS`), and the private
+    `tsql_header_comments`
+    collects the text before `CREATE` verbatim and every comment after it up to the header's end,
+    skipping the kept spans, which carry their own. It walks `sql::skip_noncode` like the rest, so
+    a `--` inside a string or a bracketed name is not taken for a comment
+    (`a_triggers_header_comments_survive_its_rebuild`,
+    `a_routines_header_comments_survive_its_rebuild`, `a_views_header_comments_survive_its_rebuild`).
     **`supports_or_replace_routine(MsSql)` is true**: `CREATE OR ALTER` keeps the routine's grants
     (measured: a `GRANT EXECUTE` survived one), so an edit is altered in place. **What it refuses is
     what `routine_signature_changed` asks there**, which is per-engine now: on SQL Server a change
@@ -7542,7 +7553,24 @@ existing prose was left alone.
     whether it could** — `verbatim` for a header the walk could not read, `hidden` for a view the
     server shows no text for, default on every other engine — and either leaves the view listed
     and droppable but not editable (`ddl::view_is_editable`), the call `TsqlTrigger`'s fields of
-    the same names make for a trigger. `TableInfo::create_ddl` — `CREATE TABLE`/`VIEW`, built on the
+    the same names make for a trigger. **`TsqlModule` is what every SQL Server module carries beyond
+    its own parts** — one struct, as `module` on `TsqlView`, `TsqlTrigger` and `TsqlRoutine` alike,
+    because what a rebuild loses is `sys.sql_modules`' text rather than anything about the object's
+    kind. Its field `header_comments` is the stored statement's text before `CREATE`, verbatim —
+    SSMS's template Author/Description block is the usual one — then each comment between the
+    header's parts (`AFTER INSERT /* why */ AS`), one to a line; a comment inside a part kept as
+    text (a parameter list, a column list, a `RETURNS`) stays in that part. `restate` puts them in
+    front of a rebuilt statement on lines of their own, and is the one place they are restated:
+    `TriggerInfo::tsql_statement`, `RoutineInfo::tsql_create_sql` and `ddl::create_view_sql` (as
+    its last step, a no-op on every other engine) all end in it. They were dropped by every edit —
+    the header is rebuilt from parts and the editor's body box starts after `AS` — and, once the
+    trigger's and routine's Copy DDL and dump moved onto the rebuild, by every script of those too:
+    the object's only documentation gone, with nothing on screen to say so. It sits inside the
+    parts the round-trip gate compares — `TsqlRoutine`'s hand-written `PartialEq` compares `module`
+    whole, so a field added to it is compared without a second edit there
+    (`a_triggers_header_comments_survive_its_rebuild` and its routine and view siblings, under
+    `ddl.rs`; live, `a_modules_header_comments_survive_an_edit` on 2022 and 2025).
+    `TableInfo::create_ddl` — `CREATE TABLE`/`VIEW`, built on the
     above; its **view** branch delegates to `ddl::view_ddl` so Copy DDL, the MCP table-info tool
     and the apply path all emit through one view emitter (it used to have its own, which restated
     none of the options). **`TableInfo::implicit_key` is a capability, read rather than
@@ -7766,12 +7794,16 @@ existing prose was left alone.
     then an edit to any part has to be the statement that runs, so the arm writes the header from
     `TriggerInfo::tsql` and appends the body after `AS` verbatim, and the result reads back through
     `ddl::tsql_trigger_parts` as the same parts — the round trip the editor rests on
-    (`a_sql_server_trigger_is_written_from_its_parts`). **The trade is the text outside the body**:
+    (`a_sql_server_trigger_is_written_from_its_parts`). **The trade is the header's spelling**:
     `sys.sql_modules` keeps the statement as typed — measured on SQL Server 2022, a comment ahead of
     `CREATE` survives there, and a `CREATE OR ALTER` is stored as `CREATE   TRIGGER` — and a rebuild
-    keeps neither a comment ahead of `CREATE` or inside the header nor the header's own spelling, so
-    Copy DDL and the dump now show the rebuilt statement rather than the stored one
-    (`introspection_reads_the_schema_as_declared` asserts the rebuilt text on the live leg).
+    keeps the header's parts, not the way they were written, so Copy DDL and the dump now show the
+    rebuilt statement rather than the stored one (`introspection_reads_the_schema_as_declared`
+    asserts the rebuilt text on the live leg). **The header's comments are the exception, and were
+    not at first**: the rebuild dropped them — the SSMS template block ahead of `CREATE`, a comment
+    between the parts — from every edit, Copy DDL and dump, while `tsql_statement`'s own doc said
+    the body was kept "comments and all", true only after `AS`. They now travel in
+    `TsqlTrigger::module` and go back in front of the rebuilt statement (`TsqlModule`, above).
     **`TsqlTrigger` is what the shared model lacked**, on the "restate everything or it silently
     resets" rule again: an unstated `EXECUTE AS` (`ExecuteAs`) is `CALLER`, an unstated `NOT FOR
     REPLICATION` fires during replication, and the `First`/`Last` rank per event (`FiringRank`)
@@ -7869,8 +7901,9 @@ existing prose was left alone.
     on the next line, or `FUNCTION name (params)` then `RETURNS …`; the `WITH` options; a
     procedure's `FOR REPLICATION`; then `AS` and the body verbatim, unterminated as a trigger's is.
     It returned the stored text whole until the editor came, which is right until an edit to a part
-    has to be the statement that runs — the trigger arm's reasoning above, and its trade: text
-    outside the body is the rebuilt spelling, not the stored one. The result reads back through
+    has to be the statement that runs — the trigger arm's reasoning above, and its trade: the
+    header is the rebuilt spelling, not the stored one, but for its comments, which
+    `TsqlRoutine::module` carries back in front (`TsqlModule`, above). The result reads back through
     `ddl::tsql_routine_parts` as the same parts (`a_sql_server_routine_is_written_from_its_parts`).
     **A function's list that ends inside a `--` comment closes on a line of its own**, asked of
     `pairs::region_at` as `create_view_sql` asks before its `;`: the list is kept verbatim, comment
@@ -12538,11 +12571,13 @@ existing prose was left alone.
   they fold, the order the editor's toggles keep, since a catalogue order they re-sorted would be a
   phantom change — and so are the ranks, the order `TsqlTrigger::set_rank` keeps for the same
   reason. The stored text goes through `tsql_trigger_reading`, pure: `tsql_trigger_parts`
-  gives the body after the header's `AS` and the options; a header it cannot read keeps the whole
+  gives the body after the header's `AS`, the options and the header's comments (into
+  `TsqlTrigger::module`, `TsqlModule` under `schema.rs`); a header it cannot read keeps the whole
   text as `verbatim` (and as the body, for whatever displays it); a NULL `definition` is `hidden`
   (`a_stored_trigger_reads_into_its_parts_or_is_kept_whole`).
   **A routine's text goes through `tsql_routine_reading`**, pure, on the same terms: the parts
-  `tsql_routine_parts` reads give its parameter list, `RETURNS`, body and `TsqlRoutine`; a header
+  `tsql_routine_parts` reads give its parameter list, `RETURNS`, body and `TsqlRoutine`, the
+  header's comments in its `module`; a header
   it cannot read is `verbatim`; a NULL `definition` is `hidden`. **The text's parameter list wins
   whenever it reads**, over the one `PARAMETER_LISTING` builds from `sys.parameters`, because that
   one has no defaults (`has_default_value` is 0 for `@a int = 5`, measured) and fed back to `CREATE
@@ -12556,7 +12591,8 @@ existing prose was left alone.
   **A view's text goes through `tsql_view_reading`**, pure, on the same terms: the parts
   `ddl::tsql_view_parts` reads give the body after the header's own `AS`, the column list as
   `ViewOptions::column_list`, verbatim, and the attributes as `ViewOptions::attributes`, which
-  `ALTER VIEW` resets unless they are restated (under `schema.rs`); a header it cannot read keeps
+  `ALTER VIEW` resets unless they are restated (under `schema.rs`), and the header's comments as
+  `TsqlView::module`; a header it cannot read keeps
   the whole text as the body and as `create_sql` and is `TsqlView::verbatim`, with no attribute
   kept from a list it could not read whole; a NULL `definition` is `hidden` — so an encrypted view
   now has `view_options` at all, where it had `None`

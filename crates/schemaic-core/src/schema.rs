@@ -1651,6 +1651,45 @@ pub struct TsqlView {
     /// visible to this login. There is no body to rebuild it with, and one
     /// typed in its place would drop the encryption without a word.
     pub hidden: bool,
+    /// What every SQL Server module carries — see [`TsqlModule`].
+    pub module: TsqlModule,
+}
+
+/// What every **SQL Server module** — a view, a trigger, a procedure or a
+/// function — carries beyond its own parts: what a statement rebuilt from
+/// those parts would otherwise lose.
+///
+/// One struct for the three because the losses are the module's, not the
+/// object kind's: `sys.sql_modules` keeps the same text and settings for
+/// each.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TsqlModule {
+    /// **The comments of the stored statement's header**: the text before
+    /// `CREATE` verbatim — SSMS's template Author/Description block is the
+    /// usual one — then each comment between the header's parts, one to a
+    /// line. A comment inside a part kept as text (a parameter list, a column
+    /// list, a `RETURNS`) stays there instead.
+    ///
+    /// The rebuild writes them in front of the statement. They were dropped:
+    /// the header is rebuilt from its parts and the editor's body box starts
+    /// after `AS`, so an edit — and, once Copy DDL and the dump were moved onto
+    /// the rebuild, every script — discarded the only copy of the object's
+    /// documentation without anything on screen saying so. Read by the header
+    /// walks (`ddl::tsql_trigger_parts`, `tsql_routine_parts`,
+    /// `tsql_view_parts`); in the round-trip gate as part of the module.
+    pub header_comments: String,
+}
+
+impl TsqlModule {
+    /// `statement` with the header comments in front of it, on lines of their
+    /// own — the one place they are restated.
+    pub fn restate(&self, statement: String) -> String {
+        if self.header_comments.trim().is_empty() {
+            statement
+        } else {
+            format!("{}\n{statement}", self.header_comments.trim())
+        }
+    }
 }
 
 /// **Hand-written for one field.** Every other default here is "absent", which
@@ -2199,6 +2238,8 @@ pub struct TsqlRoutine {
     /// ([`crate::ddl::ChangeSet::unsupported`]); Copy DDL and the dump restate
     /// each member's text after the head's.
     pub numbered: Vec<(i32, String)>,
+    /// What every SQL Server module carries — see [`TsqlModule`].
+    pub module: TsqlModule,
 }
 
 impl TsqlRoutine {
@@ -2319,6 +2360,7 @@ impl PartialEq for TsqlRoutine {
             && self.verbatim == other.verbatim
             && self.hidden == other.hidden
             && self.numbered == other.numbered
+            && self.module == other.module
     }
 }
 
@@ -2432,6 +2474,8 @@ pub struct TsqlTrigger {
     /// not visible to this login. Shown and droppable, not editable: there is
     /// no body to rebuild it with.
     pub hidden: bool,
+    /// What every SQL Server module carries — see [`TsqlModule`].
+    pub module: TsqlModule,
 }
 
 impl TsqlTrigger {
@@ -2606,9 +2650,10 @@ impl TriggerInfo {
     /// The T-SQL `CREATE [OR ALTER] TRIGGER`, **rebuilt from the parts** —
     /// the header [`TsqlTrigger`] holds, then the body after `AS` — so an
     /// edit to any of them is the statement that runs. The body is verbatim,
-    /// comments and all, and the whole reads back through
-    /// [`crate::ddl::tsql_trigger_parts`] as the same parts, which is the
-    /// round trip the editor rests on.
+    /// comments and all; the header's own comments, which the rebuild would
+    /// otherwise drop, go in front of it ([`TsqlModule::header_comments`]);
+    /// and the whole reads back through [`crate::ddl::tsql_trigger_parts`] as
+    /// the same parts, which is the round trip the editor rests on.
     ///
     /// **The stored text is restated instead** when its header could not be
     /// read (`TsqlTrigger::verbatim`), since rebuilding from the parts that
@@ -2656,12 +2701,13 @@ impl TriggerInfo {
                 } else {
                     ""
                 };
-                format!(
+                // The header's comments in front — `TsqlModule::restate`.
+                self.tsql.module.restate(format!(
                     "CREATE {}TRIGGER {name} ON {table}{with} {} {events}{nfr}\nAS\n{}",
                     if or_alter { "OR ALTER " } else { "" },
                     self.timing.sql(),
                     b.trim()
-                )
+                ))
             }
             // `NULL` for one created `WITH ENCRYPTION`, which the server shows
             // nobody. Comment-safed: the name is the server's.
@@ -3426,7 +3472,8 @@ impl RoutineInfo {
             out.push_str("\nFOR REPLICATION");
         }
         out.push_str(&format!("\nAS\n{}", self.body.trim()));
-        out
+        // The header's comments in front — `TsqlModule::restate`.
+        self.tsql.module.restate(out)
     }
 
     /// What PostgreSQL assumes a function costs when the `CREATE` says nothing:

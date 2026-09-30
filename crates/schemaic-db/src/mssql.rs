@@ -1317,7 +1317,7 @@ fn tsql_trigger_reading(
     schemaic_core::schema::TriggerAction,
     schemaic_core::schema::TsqlTrigger,
 ) {
-    use schemaic_core::schema::{TriggerAction, TsqlTrigger};
+    use schemaic_core::schema::{TriggerAction, TsqlModule, TsqlTrigger};
     let Some(def) = definition else {
         return (
             TriggerAction::Body(String::new()),
@@ -1335,6 +1335,10 @@ fn tsql_trigger_reading(
                 schemabinding: p.schemabinding,
                 native_compilation: p.native_compilation,
                 not_for_replication: p.not_for_replication,
+                module: TsqlModule {
+                    header_comments: p.header_comments,
+                    ..TsqlModule::default()
+                },
                 ..TsqlTrigger::default()
             },
         ),
@@ -1371,7 +1375,7 @@ fn tsql_routine_reading(
     arguments: String,
     returns: String,
 ) -> TsqlRoutineReading {
-    use schemaic_core::schema::TsqlRoutine;
+    use schemaic_core::schema::{TsqlModule, TsqlRoutine};
     let Some(def) = definition else {
         return TsqlRoutineReading {
             arguments,
@@ -1391,6 +1395,10 @@ fn tsql_routine_reading(
             tsql: TsqlRoutine {
                 options: p.options,
                 for_replication: p.for_replication,
+                module: TsqlModule {
+                    header_comments: p.header_comments,
+                    ..TsqlModule::default()
+                },
                 ..TsqlRoutine::default()
             },
         },
@@ -1567,7 +1575,7 @@ struct TsqlViewReading {
 /// and as `create_sql`, and is `TsqlView::verbatim`; no text at all is
 /// `hidden`. Neither is edited (`ddl::view_is_editable`).
 fn tsql_view_reading(definition: Option<&str>) -> TsqlViewReading {
-    use schemaic_core::schema::{TsqlView, ViewOptions};
+    use schemaic_core::schema::{TsqlModule, TsqlView, ViewOptions};
     let Some(def) = definition else {
         return TsqlViewReading {
             body: String::new(),
@@ -1588,6 +1596,13 @@ fn tsql_view_reading(definition: Option<&str>) -> TsqlViewReading {
             options: ViewOptions {
                 column_list: p.column_list,
                 attributes: p.attributes,
+                tsql: TsqlView {
+                    module: TsqlModule {
+                        header_comments: p.header_comments,
+                        ..TsqlModule::default()
+                    },
+                    ..TsqlView::default()
+                },
                 ..ViewOptions::default()
             },
         },
