@@ -9458,6 +9458,10 @@ existing prose was left alone.
     identity*, under the invariants); the same test asserts it never prints. `failure_text` turns the
     CLI's stderr into a sentence a user can act on: a signed-out CLI says to run `az login`, anything
     else keeps the CLI's own first line without its `ERROR:` prefix (`a_failure_says_what_to_do`).
+    `azure_cli_profile` names the file whose change means the CLI's sign-in changed —
+    `AZURE_CONFIG_DIR`'s `azureProfile.json`, or `.azure`'s under the home directory — which
+    `db/entra.rs` keys its token cache on
+    (`the_cli_profile_is_under_its_config_dir_or_the_home_directory`).
   - `cli_install.rs` — **putting the `schemaic` command on `PATH`, and taking it off again**: the
     decision half of Settings → General → Command line → Install / Remove and of the Windows
     uninstall hook, with the registry write, the symlink and the broadcast left to
@@ -11926,7 +11930,17 @@ existing prose was left alone.
   handed out until `MARGIN_SECS` (five minutes) before its expiry, so a connection is never given
   one that dies on the way, or for `UNDATED_SECS` (ten) when the CLI printed none
   (`a_token_is_replaced_before_it_expires`). It is never written anywhere; the CLI keeps the
-  refresh. `fetch` finds `az` through `azure_cli_candidates`, spawns what `azure_cli_token_argv`
+  refresh. **And only under the CLI sign-in it came from** (`reusable`): the token names whoever
+  was signed in when it was minted, and after `az login` as someone else, or `az logout`, the cache
+  went on handing out the previous identity's — which the server accepts, being valid, and
+  `forget` runs only on a refusal — for up to an hour, while the MCP subprocess, with its own cache,
+  could sign in as the other. So each entry carries a `CliIdentity`, the modification time and
+  length of the CLI's profile (`core::entra::azure_cli_profile`: `AZURE_CONFIG_DIR`, or `.azure`
+  under the home directory), which `az login`, `az logout` and `az account set` all rewrite; only
+  its metadata is read, never its contents, and it is taken after the fetch in case the CLI touched
+  its own profile. A profile that cannot be read keys nothing, and such a token is reused for
+  `UNKEYED_SECS` (a minute) rather than its hour
+  (`a_token_is_not_handed_out_under_another_cli_sign_in`). `fetch` finds `az` through `azure_cli_candidates`, spawns what `azure_cli_token_argv`
   returns with stdin closed, bounded by `CLI_TIMEOUT` (60 s — a CLI's first run after an install
   compiles its modules and can take tens of seconds), and on Windows with `CREATE_NO_WINDOW`, since
   a GUI app's child otherwise gets a console window of its own, one flashing up per token. That

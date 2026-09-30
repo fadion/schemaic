@@ -8,6 +8,17 @@
 //! One cache for the process: the token is the CLI's signed-in user's, for
 //! one resource, whichever connection asks. Never written anywhere; the CLI
 //! keeps the refresh.
+//!
+//! **And only while the CLI is still signed in as the same identity.** The
+//! token names whoever was signed in when it was minted; after `az login` as
+//! someone else, or `az logout`, the cache went on handing out the previous
+//! identity's token — which the server accepts, being valid — for up to an
+//! hour, and the MCP subprocess, with its own cache, could run as the other
+//! one. So the cache is keyed on the CLI's profile file
+//! ([`entra::azure_cli_profile`]), which every one of those commands
+//! rewrites: its modification time and length, read as metadata, never its
+//! contents. A profile that cannot be read keys nothing, and then a token is
+//! reused only briefly ([`UNKEYED_SECS`]).
 
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -16,8 +27,32 @@ use schemaic_core::entra::{self, AzureToken};
 
 use crate::DbError;
 
-/// The token and the epoch second it stops being handed out.
-static CACHE: Mutex<Option<(AzureToken, i64)>> = Mutex::new(None);
+/// Which Azure CLI sign-in a token came from: its profile file's
+/// modification time and length, or `None` where it cannot be read.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct CliIdentity {
+    modified_ns: u128,
+    len: u64,
+}
+
+/// A token in the cache, with what decides whether it may be handed out.
+struct Cached {
+    token: AzureToken,
+    /// The epoch second it stops being handed out ([`usable_until`]).
+    until: i64,
+    /// When it was fetched, for a token with no identity to key it.
+    fetched_at: i64,
+    /// The CLI sign-in it came from.
+    identity: Option<CliIdentity>,
+}
+
+static CACHE: Mutex<Option<Cached>> = Mutex::new(None);
+
+/// How long a token is reused when the CLI's profile could not be read, so
+/// there is nothing to notice a changed sign-in by — long enough to cover a
+/// burst of per-operation connects, short enough that a switched identity is
+/// picked up within a minute.
+const UNKEYED_SECS: i64 = 60;
 
 /// How long before its expiry a token is replaced, so one handed to a
 /// connection is not already dead by the time the server reads it.
@@ -43,20 +78,57 @@ fn now() -> i64 {
         .unwrap_or(0)
 }
 
+/// May `cached` be handed out at `now`, with the CLI signed in as
+/// `identity`? Not past its expiry margin, not under another sign-in than
+/// the one it came from, and — with no identity to compare — not past
+/// [`UNKEYED_SECS`].
+fn reusable(cached: &Cached, now: i64, identity: Option<CliIdentity>) -> bool {
+    now < cached.until
+        && cached.identity == identity
+        && (identity.is_some() || now < cached.fetched_at + UNKEYED_SECS)
+}
+
+/// The Azure CLI sign-in as it stands: its profile's metadata.
+fn cli_identity() -> Option<CliIdentity> {
+    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" });
+    let config = std::env::var_os("AZURE_CONFIG_DIR");
+    let profile = entra::azure_cli_profile(config.as_deref(), home.as_deref())?;
+    let meta = std::fs::metadata(profile).ok()?;
+    let modified_ns = meta
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    Some(CliIdentity {
+        modified_ns,
+        len: meta.len(),
+    })
+}
+
 /// An access token for Azure SQL, from the cache or the CLI.
 pub(crate) async fn sql_token() -> Result<String, DbError> {
     let at = now();
+    let identity = cli_identity();
     if let Ok(cache) = CACHE.lock()
-        && let Some((t, until)) = cache.as_ref()
-        && at < *until
+        && let Some(cached) = cache.as_ref()
+        && reusable(cached, at, identity)
     {
-        return Ok(t.token.clone());
+        return Ok(cached.token.token.clone());
     }
     let fresh = fetch().await?;
     let until = usable_until(&fresh, at);
     let token = fresh.token.clone();
+    // The identity as it stands *after* the fetch, in case asking the CLI
+    // touched its own profile.
+    let identity = cli_identity();
     if let Ok(mut cache) = CACHE.lock() {
-        *cache = Some((fresh, until));
+        *cache = Some(Cached {
+            token: fresh,
+            until,
+            fetched_at: at,
+            identity,
+        });
     }
     Ok(token)
 }
@@ -134,5 +206,42 @@ mod tests {
             expires_at: None,
         };
         assert_eq!(usable_until(&undated, 1_000), 1_600);
+    }
+
+    /// **A token is handed out only under the CLI sign-in it came from.**
+    /// After `az login` as someone else, or `az logout`, the profile changes
+    /// and the cached token — the previous identity's, which the server would
+    /// still accept — is not handed out again; with no profile to read, a
+    /// token is reused only for a minute.
+    #[test]
+    fn a_token_is_not_handed_out_under_another_cli_sign_in() {
+        let a = Some(CliIdentity {
+            modified_ns: 1,
+            len: 100,
+        });
+        let b = Some(CliIdentity {
+            modified_ns: 2,
+            len: 100,
+        });
+        let cached = |identity| Cached {
+            token: AzureToken {
+                token: "t".into(),
+                expires_at: Some(10_000),
+            },
+            until: 9_700,
+            fetched_at: 1_000,
+            identity,
+        };
+        assert!(reusable(&cached(a), 5_000, a));
+        assert!(!reusable(&cached(a), 5_000, b), "az login as someone else");
+        assert!(!reusable(&cached(a), 5_000, None), "az logout");
+        assert!(
+            !reusable(&cached(None), 5_000, a),
+            "a profile that appeared"
+        );
+        assert!(!reusable(&cached(a), 9_700, a), "past the expiry margin");
+        // Unkeyed: a minute, not the token's hour.
+        assert!(reusable(&cached(None), 1_000 + UNKEYED_SECS - 1, None));
+        assert!(!reusable(&cached(None), 1_000 + UNKEYED_SECS, None));
     }
 }

@@ -11,7 +11,9 @@
 //! What lives here is what can be tested without a CLI: where to look for
 //! `az` ([`azure_cli_candidates`]), the argv that runs it
 //! ([`azure_cli_token_argv`]), reading its answer ([`parse_token`]) and
-//! saying what went wrong in words a user can act on ([`failure_text`]).
+//! saying what went wrong in words a user can act on ([`failure_text`]), and
+//! which file's change means the CLI's sign-in changed
+//! ([`azure_cli_profile`]).
 
 use std::path::{Path, PathBuf};
 
@@ -169,9 +171,53 @@ pub fn failure_text(stderr: &str) -> String {
     format!("The Azure CLI could not get a token: {first}")
 }
 
+/// Where the Azure CLI keeps its **profile** — which accounts are signed in
+/// and which is the default — given `AZURE_CONFIG_DIR` and the home directory
+/// (`USERPROFILE` on Windows, `HOME` elsewhere), or `None` with neither.
+///
+/// `az login` as someone else, `az logout` and `az account set` all rewrite
+/// it, so its change is the signal that a cached token names the wrong
+/// identity (`schemaic_db`'s `entra` keys its cache on it). Only its metadata
+/// is ever read, never its contents.
+pub fn azure_cli_profile(
+    config_dir: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    const PROFILE: &str = "azureProfile.json";
+    if let Some(dir) = config_dir.filter(|d| !d.is_empty()) {
+        return Some(Path::new(dir).join(PROFILE));
+    }
+    let home = home.filter(|h| !h.is_empty())?;
+    Some(Path::new(home).join(".azure").join(PROFILE))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The file whose change means the CLI's identity changed** — the
+    /// Azure CLI's profile, in `AZURE_CONFIG_DIR` when that is set and in
+    /// `.azure` under the home directory otherwise; `az login`, `az logout`
+    /// and `az account set` all rewrite it.
+    #[test]
+    fn the_cli_profile_is_under_its_config_dir_or_the_home_directory() {
+        use std::ffi::OsStr;
+        let home = Some(OsStr::new("H"));
+        assert_eq!(
+            azure_cli_profile(Some(OsStr::new("C")), home),
+            Some(Path::new("C").join("azureProfile.json"))
+        );
+        assert_eq!(
+            azure_cli_profile(Some(OsStr::new("")), home),
+            Some(Path::new("H").join(".azure").join("azureProfile.json"))
+        );
+        assert_eq!(
+            azure_cli_profile(None, home),
+            Some(Path::new("H").join(".azure").join("azureProfile.json"))
+        );
+        assert_eq!(azure_cli_profile(None, None), None);
+        assert_eq!(azure_cli_profile(None, Some(OsStr::new(""))), None);
+    }
 
     /// **`PATH` in order, relative entries skipped, then the installer's own
     /// folder on Windows** — which is what finds a CLI installed after the app
