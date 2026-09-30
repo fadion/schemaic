@@ -998,8 +998,13 @@ existing prose was left alone.
     completion builtins, no signature help and no misspelled-function checker until a catalog could
     be checked against a server as PostgreSQL's is. `mssql_builtins.rs` below is that catalog, and
     what it is checked against is the server's parser, since T-SQL's builtins are in no catalog view
-    to diff it with. Its reserved words (`MSSQL_RESERVED`, the documented list) are there
-    — T-SQL has no fallback like SQLite's, so its alias set and identifier set are one list.
+    to diff it with. Its reserved words (`MSSQL_RESERVED`, the documented list) are there, **less
+    six the parser takes as names anyway** — `DISK`, `DUMP`, `LOAD`, `PRECISION`, `SECURITYAUDIT`
+    and `WITHIN` ran as column alias, table alias and column name on SQL Server 2022 and 2025, and
+    the system views' own `t.prec AS precision` was a red reserved-alias error. Those six are
+    `alias_ok_but_unquotable`'s on this engine, so the quoter still brackets them; the live leg
+    `the_reserved_list_is_what_the_server_refuses_as_an_alias` compares every documented word's
+    `is_reserved_word` with the server's answer to `SELECT 1 AS <word>`.
     **The checker's exemption set is the other half of "a name this engine really has", and an
     extension's functions fell straight through it.** `function_typo_checks` passes anything in the
     catalog's `known_idents` — databases, tables, columns, namespaces and the schema's stored
@@ -1425,7 +1430,7 @@ existing prose was left alone.
     bare **identifier**, a table or column name, which is the question a quoter has: miss a word
     there and the SQL emitted does not parse. On MySQL and PostgreSQL the two coincide, so
     `alias_ok_but_unquotable` is empty for both — a reserved word is reserved everywhere and one
-    list answers both. SQLite is where they come apart, because its parser falls back to treating
+    list answers both. (SQL Server's holds the six documented words its parser accepts, above.) SQLite is where they come apart, because its parser falls back to treating
     most of its ~147 keywords as identifiers wherever the grammar allows one: `CAST`, `IF` and
     `RAISE` are refused as a bare name yet are perfectly good `AS` aliases. Until the two were
     split, `export::ident_if_needed` and `filter::needs_quoting` were asking the **alias** set, so

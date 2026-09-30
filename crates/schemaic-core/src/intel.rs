@@ -3329,6 +3329,7 @@ fn static_words(dialect: SqlDialect) -> &'static std::collections::HashSet<Strin
             .chain(CLAUSE_KEYWORDS.iter())
             .chain(NON_RESERVED_KEYWORDS.iter())
             .chain(reserved_words(dialect).iter())
+            .chain(alias_ok_but_unquotable(dialect).iter())
             .map(|k| k.to_ascii_lowercase())
             .chain(
                 builtin_catalog(dialect)
@@ -5519,10 +5520,13 @@ const SQLITE_RESERVED: &[&str] = &[
 ];
 
 /// SQL Server's reserved keywords — the list in its documentation, which the
-/// engine refuses as an unbracketed identifier or alias. (`WITHIN GROUP` is
-/// listed there as a phrase; `WITHIN` alone is the word that is reserved.)
-/// T-SQL has no fallback like SQLite's, so the alias set and the identifier set
-/// are one list.
+/// engine refuses as an unbracketed identifier or alias — **less the six it
+/// takes as aliases anyway**. `DISK`, `DUMP`, `LOAD`, `PRECISION`,
+/// `SECURITYAUDIT` and `WITHIN` (listed as the phrase `WITHIN GROUP`) ran as a
+/// column alias, an implicit table alias and a column name on SQL Server 2022
+/// and 2025 alike, and the system views' own `t.prec AS precision` drew a red
+/// reserved-alias error. They are [`alias_ok_but_unquotable`]'s on this
+/// engine, so the quoter still brackets them.
 const MSSQL_RESERVED: &[&str] = &[
     "ADD",
     "ALL",
@@ -5571,12 +5575,10 @@ const MSSQL_RESERVED: &[&str] = &[
     "DELETE",
     "DENY",
     "DESC",
-    "DISK",
     "DISTINCT",
     "DISTRIBUTED",
     "DOUBLE",
     "DROP",
-    "DUMP",
     "ELSE",
     "END",
     "ERRLVL",
@@ -5619,7 +5621,6 @@ const MSSQL_RESERVED: &[&str] = &[
     "LEFT",
     "LIKE",
     "LINENO",
-    "LOAD",
     "MERGE",
     "NATIONAL",
     "NOCHECK",
@@ -5644,7 +5645,6 @@ const MSSQL_RESERVED: &[&str] = &[
     "PERCENT",
     "PIVOT",
     "PLAN",
-    "PRECISION",
     "PRIMARY",
     "PRINT",
     "PROC",
@@ -5668,7 +5668,6 @@ const MSSQL_RESERVED: &[&str] = &[
     "RULE",
     "SAVE",
     "SCHEMA",
-    "SECURITYAUDIT",
     "SELECT",
     "SEMANTICKEYPHRASETABLE",
     "SEMANTICSIMILARITYDETAILSTABLE",
@@ -5707,7 +5706,6 @@ const MSSQL_RESERVED: &[&str] = &[
     "WHERE",
     "WHILE",
     "WITH",
-    "WITHIN",
     "WRITETEXT",
 ];
 
@@ -5785,10 +5783,21 @@ const NON_RESERVED_KEYWORDS: &[&str] = &[
 ///
 /// Empty on MySQL and PostgreSQL: there, a reserved word is reserved everywhere,
 /// and one list answers both questions. SQLite is the engine where the two
-/// questions come apart — see [`must_quote_ident`].
+/// questions come apart — see [`must_quote_ident`] — and SQL Server, whose
+/// documented list holds six words its parser accepts as names (see
+/// [`MSSQL_RESERVED`]); bracketing one costs nothing, and a later version may
+/// start refusing it.
 fn alias_ok_but_unquotable(dialect: SqlDialect) -> &'static [&'static str] {
     match dialect {
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::MsSql => &[],
+        SqlDialect::MySql | SqlDialect::Postgres => &[],
+        SqlDialect::MsSql => &[
+            "DISK",
+            "DUMP",
+            "LOAD",
+            "PRECISION",
+            "SECURITYAUDIT",
+            "WITHIN",
+        ],
         // `CAST(x AS t)`, `IF NOT EXISTS`, `RAISE(ABORT, …)` — each is a bare
         // keyword the parser commits to on sight in a name position, and each is
         // still accepted as an alias, where `AS` has already told it what follows.
@@ -12887,6 +12896,10 @@ mod tests {
              DECLARE c CURSOR FOR SELECT id FROM employees; OPEN c; \
              FETCH NEXT FROM c INTO @id; CLOSE c; DEALLOCATE c; END;",
             "SELECT * FROM employees PIVOT (MAX(salary) FOR name IN ([a], [b])) AS p;",
+            // Listed as reserved, and taken as aliases by SQL Server 2022 and
+            // 2025 alike — the system views' own `t.prec AS precision`.
+            "SELECT salary AS precision, id AS within, name AS disk FROM employees e;",
+            "SELECT id FROM employees load;",
         ]
         .into_iter()
         .map(|sql| (sql, diag_d(sql, SqlDialect::MsSql)))
@@ -14779,6 +14792,27 @@ mod tests {
         let t = scope.tables.first().expect("in scope");
         assert_eq!(t.name, "my.table");
         assert_eq!(t.db, None);
+    }
+
+    /// **SQL Server's documented reserved words it takes as aliases** stay
+    /// quoted as names — the quoter's cost of listing one wrongly is a pair of
+    /// brackets, and its cost of missing one is SQL that does not parse — while
+    /// the alias check lets them be.
+    #[test]
+    fn a_t_sql_word_legal_as_an_alias_is_still_quoted_as_a_name() {
+        for w in [
+            "DISK",
+            "DUMP",
+            "LOAD",
+            "PRECISION",
+            "SECURITYAUDIT",
+            "WITHIN",
+        ] {
+            assert!(!is_reserved_word(w, SqlDialect::MsSql), "{w}");
+            assert!(must_quote_ident(w, SqlDialect::MsSql), "{w}");
+        }
+        // The rest of the list is reserved for both questions.
+        assert!(is_reserved_word("USER", SqlDialect::MsSql));
     }
 
     /// The quoting decision itself, at the one place that makes it.
