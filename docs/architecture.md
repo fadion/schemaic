@@ -863,7 +863,7 @@ existing prose was left alone.
     keyword, so `INSERT IGNORE INTO t`, `REPLACE DELAYED INTO t` and PostgreSQL's data-modifying
     `WITH … INSERT INTO t` all still register their table.
     **`is_implicit_alias` is "is this bare word an alias" written once instead of three times, and
-    the order of its two tests is the bug it fixes.** `is_table_ref_continuation` first, because
+    the order of its two tests is the bug it fixes.** `ends_table_ref` first, because
     a join or clause keyword *ends* a table reference rather than naming it, and only then
     `is_reserved_word`. Only SQLite showed it: `MYSQL_RESERVED` and `PG_RESERVED` both carry
     `LEFT`/`INNER`/`CROSS`/`FULL`/`NATURAL`/`RIGHT`, so on those engines the reserved test alone
@@ -884,7 +884,21 @@ existing prose was left alone.
     takes `WITH` as one. The hint's inside needed a second fix in `colres`: sqlparser carries a
     hint as an `Expr`, so the visitor resolved `NOLOCK` as a column (``Column `nolock` not
     found``); `Collector::hints` records each `TableFactor::Table`'s `with_hints` ranges in
-    `pre_visit_table_factor`, and an expression inside one is skipped.
+    `pre_visit_table_factor`, and an expression inside one is skipped. `INTO` (MySQL's trailing
+    `SELECT … FROM t INTO @x`, a cursor's `FETCH … FROM c INTO @x`), T-SQL's second `FROM`
+    (`DELETE FROM t FROM t JOIN u …`) and `PIVOT`/`UNPIVOT` end a reference the same way.
+    **A statement's end ends one too, and the tokens could not see it**: a routine body is one
+    range holding many statements, the tokenizer dropped `;`, and `employees; SELECT` read exactly
+    like `employees SELECT` — a reserved-alias error per statement, on MySQL's `DELIMITER` bodies
+    as on T-SQL's. `Token::after_semicolon` is a flag rather than a token so no consumer that reads
+    adjacent tokens sees a different stream, and both scanners stop at it. T-SQL needs no `;` at
+    all, so `ends_table_ref` also asks `unterminated_statement_heads` — the words that begin a
+    statement where none needs a terminator, an exhaustive per-dialect `match` empty on the three
+    engines where `FROM t select` is the mistake the check exists for
+    (`a_statement_end_ends_the_table_reference_before_it`). A cursor is not a table either:
+    `fetch_precedes` reads `FETCH [NEXT | … | ABSOLUTE n] FROM c` (and PostgreSQL's `MOVE`) as
+    naming one, walking back over at most a direction and its count so a column named `first`
+    before a real `FROM` is left alone.
     **T-SQL is where sqlparser 0.62's grammar runs out, and a SQL Server hand check found ordinary
     T-SQL squiggled red.** `parser_lacks_statement` withholds the parse error — only that; the
     typo, function-typo and alias checks still run over the statement — for what that grammar does

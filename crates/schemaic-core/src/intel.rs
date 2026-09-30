@@ -3395,6 +3395,16 @@ struct Token {
     /// makes a reserved word legal as a name, so the alias checks must not flag
     /// it — and the scope resolver must still see the name.
     quoted: bool,
+    /// A `;` stands between this token and the one before it: a statement
+    /// ended there.
+    ///
+    /// A flag rather than a token of its own, so every consumer that reads
+    /// adjacent tokens sees the stream it always did. It is for the one
+    /// question a range holding several statements — a routine body — raises:
+    /// whether the word after a table name is its alias or the next
+    /// statement's first word. Without it `employees; SELECT` read exactly
+    /// like `employees SELECT`.
+    after_semicolon: bool,
 }
 
 /// The parts of an AST object name as their **unquoted** identifier text.
@@ -3463,12 +3473,15 @@ fn tokenize_range(sql: &str, lo: usize, hi: usize, dialect: SqlDialect) -> Vec<T
     let b = sql.as_bytes();
     let mut out = Vec::new();
     let mut i = lo;
-    let push = |out: &mut Vec<Token>, at: usize, end: usize, kind: TkKind| {
+    // A `;` seen since the last token — see `Token::after_semicolon`.
+    let mut semi = false;
+    let push = |out: &mut Vec<Token>, semi: &mut bool, at: usize, end: usize, kind: TkKind| {
         out.push(Token {
             at,
             end,
             kind,
             quoted: false,
+            after_semicolon: std::mem::take(semi),
         })
     };
     while i < hi {
@@ -3502,6 +3515,7 @@ fn tokenize_range(sql: &str, lo: usize, hi: usize, dialect: SqlDialect) -> Vec<T
                     end,
                     kind: TkKind::Word(text),
                     quoted: true,
+                    after_semicolon: std::mem::take(&mut semi),
                 });
             }
             i = end;
@@ -3518,15 +3532,22 @@ fn tokenize_range(sql: &str, lo: usize, hi: usize, dialect: SqlDialect) -> Vec<T
             while j < hi && is_word_byte(b[j]) {
                 j += 1;
             }
-            push(&mut out, s, j, TkKind::Word(sql[s..j].to_string()));
+            push(
+                &mut out,
+                &mut semi,
+                s,
+                j,
+                TkKind::Word(sql[s..j].to_string()),
+            );
             i = j;
             continue;
         }
         match c {
-            b'.' => push(&mut out, i, i + 1, TkKind::Dot),
-            b',' => push(&mut out, i, i + 1, TkKind::Comma),
-            b'(' => push(&mut out, i, i + 1, TkKind::LParen),
-            b')' => push(&mut out, i, i + 1, TkKind::RParen),
+            b'.' => push(&mut out, &mut semi, i, i + 1, TkKind::Dot),
+            b',' => push(&mut out, &mut semi, i, i + 1, TkKind::Comma),
+            b'(' => push(&mut out, &mut semi, i, i + 1, TkKind::LParen),
+            b')' => push(&mut out, &mut semi, i, i + 1, TkKind::RParen),
+            b';' => semi = true,
             _ => {}
         }
         i += 1;
@@ -4163,7 +4184,8 @@ fn lexer_scope(
                         // scanner, which is how `join_targets` came to offer
                         // `customers ON "LEFT".customer_id = customers.id`.
                         Some(TkKind::Word(a))
-                            if toks[i].quoted || is_implicit_alias(a, dialect) =>
+                            if !toks[i].after_semicolon
+                                && (toks[i].quoted || is_implicit_alias(a, dialect)) =>
                         {
                             alias = Some(a.clone());
                             i += 1;
@@ -4855,6 +4877,11 @@ fn table_refs_with_pos(
             i += 1;
             continue;
         }
+        // A cursor loop's `FETCH NEXT FROM c` names a cursor.
+        if is_from && fetch_precedes(&toks, i) {
+            i += 1;
+            continue;
+        }
         // **Only `INSERT INTO` / `REPLACE INTO` names a table.** `INTO` has
         // three other meanings and none of them does: PostgreSQL's legacy
         // `SELECT a INTO newtbl FROM t` names the table it is about to
@@ -4904,8 +4931,12 @@ fn table_refs_with_pos(
                 }
                 // See `is_implicit_alias`: a join or clause keyword here ends the
                 // reference, and asking `is_reserved_word` alone put SQLite's
-                // `LEFT` in the alias slot.
-                Some(TkKind::Word(a)) if toks[i].quoted || is_implicit_alias(a, dialect) => {
+                // `LEFT` in the alias slot. So does a `;` — the word after it
+                // begins the next statement.
+                Some(TkKind::Word(a))
+                    if !toks[i].after_semicolon
+                        && (toks[i].quoted || is_implicit_alias(a, dialect)) =>
+                {
                     alias = Some(a.clone());
                     i += 1;
                 }
@@ -5835,14 +5866,96 @@ fn is_table_ref_continuation(word: &str) -> bool {
             // reserved word `WITH` used as an alias. No engine here takes `WITH`
             // as an alias, so it ends the reference everywhere.
             | "WITH"
+            // MySQL's `SELECT … FROM t INTO @x`, and a cursor's
+            // `FETCH NEXT FROM c INTO @x` on every engine that has one.
+            | "INTO"
+            // T-SQL's second `FROM` — `DELETE FROM t FROM t JOIN u …`,
+            // `UPDATE t SET … FROM` — and its `PIVOT`/`UNPIVOT` operators.
+            // All three are reserved everywhere, so none is ever an alias.
+            | "FROM"
+            | "PIVOT"
+            | "UNPIVOT"
     )
+}
+
+/// The words that begin a statement **with no `;` before it** — so that one
+/// right after a table name ends the reference rather than aliasing it.
+///
+/// T-SQL needs no terminator between statements: `DELETE FROM t` on one line
+/// and `SET @n = @@ROWCOUNT` on the next are two statements, and a routine
+/// body is written that way throughout. Every engine that does need one
+/// answers with an empty list, since there `FROM t select` is the mistake the
+/// alias check is for. The same words sqlparser's T-SQL dialect refuses as a
+/// table alias, plus the statements it has no grammar for.
+fn unterminated_statement_heads(dialect: SqlDialect) -> &'static [&'static str] {
+    match dialect {
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => &[],
+        SqlDialect::MsSql => &[
+            "SELECT",
+            "INSERT",
+            "UPDATE",
+            "DELETE",
+            "MERGE",
+            "SET",
+            "DECLARE",
+            "EXEC",
+            "EXECUTE",
+            "PRINT",
+            "RAISERROR",
+            "THROW",
+            "RETURN",
+            "BREAK",
+            "CONTINUE",
+            "GOTO",
+            "IF",
+            "ELSE",
+            "WHILE",
+            "BEGIN",
+            "END",
+            "TRUNCATE",
+            "DROP",
+            "CREATE",
+            "ALTER",
+            "COMMIT",
+            "ROLLBACK",
+            "SAVE",
+            "WAITFOR",
+            "OPEN",
+            "CLOSE",
+            "FETCH",
+            "DEALLOCATE",
+            "GRANT",
+            "REVOKE",
+            "DENY",
+            "BULK",
+            "DBCC",
+            "KILL",
+            "CHECKPOINT",
+            "RECONFIGURE",
+            "BACKUP",
+            "RESTORE",
+            "REVERT",
+            "ENABLE",
+            "DISABLE",
+        ],
+    }
+}
+
+/// Does `word`, right after a table name, **end** the table reference: a
+/// clause or join keyword ([`is_table_ref_continuation`]), or the first word of
+/// the next statement where none needs a `;` ([`unterminated_statement_heads`])?
+fn ends_table_ref(word: &str, dialect: SqlDialect) -> bool {
+    is_table_ref_continuation(word)
+        || unterminated_statement_heads(dialect)
+            .iter()
+            .any(|h| h.eq_ignore_ascii_case(word))
 }
 
 /// Is `word` an **implicit** table alias — the bare word right after a table
 /// name, with no `AS`?
 ///
 /// Both tests, in that order, and it is the order that matters:
-/// [`is_table_ref_continuation`] first, because a join or clause keyword *ends*
+/// [`ends_table_ref`] first, because a join or clause keyword *ends*
 /// the table reference rather than naming it, and only then
 /// [`is_reserved_word`], which asks whether a word meant as an alias is legal
 /// unquoted.
@@ -5864,7 +5977,53 @@ fn is_table_ref_continuation(word: &str) -> bool {
 /// A **quoted** word is always an alias — `FROM orders "LEFT" JOIN …` really
 /// does name it — so the caller checks `Tk::quoted` before asking.
 fn is_implicit_alias(word: &str, dialect: SqlDialect) -> bool {
-    !is_table_ref_continuation(word) && !is_reserved_word(word, dialect)
+    !ends_table_ref(word, dialect) && !is_reserved_word(word, dialect)
+}
+
+/// Does a cursor `FETCH` (or PostgreSQL's `MOVE`) introduce the `FROM` at
+/// `toks[i]`, so that the name after it is a **cursor** rather than a table?
+///
+/// `FETCH [NEXT | PRIOR | FIRST | LAST | ABSOLUTE n | RELATIVE n] FROM c INTO
+/// @x` on T-SQL, `FETCH NEXT FROM c INTO x` in a MySQL routine, and
+/// PostgreSQL's `FETCH FORWARD 5 FROM c`. Read as a table list, every cursor
+/// loop drew ``Table `c` not found``. Walks back over at most the direction
+/// and its count, so `SELECT first FROM t` — a column named `first` — is
+/// still a table list.
+fn fetch_precedes(toks: &[Token], i: usize) -> bool {
+    let word = |j: usize| match toks.get(j) {
+        Some(Token {
+            kind: TkKind::Word(w),
+            quoted: false,
+            ..
+        }) => Some(w.to_ascii_uppercase()),
+        _ => None,
+    };
+    let fetch = |j: Option<usize>| {
+        j.and_then(word)
+            .is_some_and(|w| matches!(w.as_str(), "FETCH" | "MOVE"))
+    };
+    let direction = |w: &str| {
+        matches!(
+            w,
+            "NEXT"
+                | "PRIOR"
+                | "FIRST"
+                | "LAST"
+                | "ABSOLUTE"
+                | "RELATIVE"
+                | "FORWARD"
+                | "BACKWARD"
+                | "ALL"
+        )
+    };
+    // The words before the `FROM`, nearest first.
+    let (p1, p2, p3) = (i.checked_sub(1), i.checked_sub(2), i.checked_sub(3));
+    let w1 = p1.and_then(word);
+    let w2 = p2.and_then(word);
+    fetch(p1)
+        || (w1.as_deref().is_some_and(direction) && fetch(p2))
+        // `ABSOLUTE @n`, `FORWARD ALL`: a direction and its count.
+        || (w2.as_deref().is_some_and(direction) && w1.is_some() && fetch(p3))
 }
 
 /// Is the `AS` at `toks[i]` a **cast's** `AS` rather than an alias's?
@@ -6203,6 +6362,11 @@ fn alias_checks(sql: &str, lo: usize, hi: usize, dialect: SqlDialect, out: &mut 
             continue;
         }
         let is_from = kw.eq_ignore_ascii_case("FROM");
+        // A cursor's name is not a table's — see `fetch_precedes`.
+        if is_from && fetch_precedes(&toks, i) {
+            i += 1;
+            continue;
+        }
         i += 1;
         while let Some(name) = toks.get(i).and_then(|t| word(&t.kind)) {
             if is_reserved_word(&name, dialect) {
@@ -6215,6 +6379,11 @@ fn alias_checks(sql: &str, lo: usize, hi: usize, dialect: SqlDialect, out: &mut 
             {
                 i += 2;
             }
+            // A `;` after the name ended the statement: what follows is the
+            // next one's first word, not an alias.
+            if toks.get(i).is_some_and(|t| t.after_semicolon) {
+                break;
+            }
             // The alias slot right after the table name.
             match toks.get(i).map(|t| &t.kind) {
                 Some(TkKind::Word(a)) if a.eq_ignore_ascii_case("AS") => {
@@ -6225,8 +6394,9 @@ fn alias_checks(sql: &str, lo: usize, hi: usize, dialect: SqlDialect, out: &mut 
                 // quoted name is never a clause keyword ending the ref.
                 Some(TkKind::Word(_)) if toks[i].quoted => i += 1,
                 // A clause/join keyword ends this ref — not an alias (check before
-                // `is_reserved_word`, since these are reserved too).
-                Some(TkKind::Word(a)) if is_table_ref_continuation(a) => break,
+                // `is_reserved_word`, since these are reserved too) — and so,
+                // where no `;` is needed, does the next statement's first word.
+                Some(TkKind::Word(a)) if ends_table_ref(a, dialect) => break,
                 Some(TkKind::Word(a)) if is_reserved_word(a, dialect) => {
                     flag(out, toks[i].at, a);
                     break;
@@ -12707,6 +12877,16 @@ mod tests {
             "SELECT * FROM dbo.child WITH (READPAST);",
             "SELECT * FROM employees WITH (NOLOCK);",
             "SELECT * FROM employees e WITH (NOLOCK) JOIN departments d ON d.id = e.id;",
+            // A statement ending on a table name, then another (S8-L1-01).
+            "CREATE PROCEDURE dbo.p AS BEGIN SELECT id FROM employees; \
+             SELECT id FROM employees; END;",
+            "CREATE PROCEDURE dbo.p AS BEGIN DELETE FROM employees; SET NOCOUNT ON; END;",
+            "CREATE PROCEDURE dbo.p AS BEGIN SELECT id FROM employees e\n\
+             SELECT id FROM departments\nRETURN\nEND;",
+            "CREATE PROCEDURE dbo.p AS BEGIN DECLARE @id int; \
+             DECLARE c CURSOR FOR SELECT id FROM employees; OPEN c; \
+             FETCH NEXT FROM c INTO @id; CLOSE c; DEALLOCATE c; END;",
+            "SELECT * FROM employees PIVOT (MAX(salary) FOR name IN ([a], [b])) AS p;",
         ]
         .into_iter()
         .map(|sql| (sql, diag_d(sql, SqlDialect::MsSql)))
@@ -12759,6 +12939,78 @@ mod tests {
             diag_d("SELECT * FROM employees WHERE;", SqlDialect::MsSql)
                 .iter()
                 .any(|x| x.message.starts_with("Syntax error"))
+        );
+    }
+
+    /// **A statement's end ends the table reference before it.** A routine
+    /// body is one range holding many statements, and the tokens carried no
+    /// `;`, so `employees; SELECT` looked exactly like `employees SELECT` and
+    /// the next statement's first word was a reserved alias — once per
+    /// statement, on MySQL's `DELIMITER` bodies as on T-SQL's. On T-SQL, where
+    /// no `;` is needed, a word that begins a statement ends it as well.
+    /// A cursor is not a table: `FETCH … FROM c INTO @x` names one.
+    #[test]
+    fn a_statement_end_ends_the_table_reference_before_it() {
+        for (sql, dialect) in [
+            (
+                "DELIMITER //\nCREATE PROCEDURE p() BEGIN SELECT id FROM employees; \
+                 SELECT id FROM employees; END //\nDELIMITER ;",
+                SqlDialect::MySql,
+            ),
+            (
+                "DELIMITER //\nCREATE PROCEDURE p() BEGIN DECLARE x INT; \
+                 DECLARE c CURSOR FOR SELECT id FROM employees; OPEN c; \
+                 FETCH NEXT FROM c INTO x; CLOSE c; END //\nDELIMITER ;",
+                SqlDialect::MySql,
+            ),
+        ] {
+            let d = diag_d(sql, dialect);
+            assert!(d.is_empty(), "{sql} on {dialect:?}: {d:#?}");
+        }
+        let alias_errors = |sql: &str, dialect: SqlDialect| -> Vec<String> {
+            diag_d(sql, dialect)
+                .into_iter()
+                .filter(|x| x.message.contains("reserved keyword"))
+                .map(|x| sql[x.range.0..x.range.1].to_string())
+                .collect()
+        };
+        // T-SQL's second `FROM` ends the first reference too. Asked of the
+        // alias check itself: sqlparser has no grammar for the second `FROM`,
+        // and its syntax error on the same word would hide the alias error.
+        let sql = "DELETE FROM employees FROM employees e JOIN departments d ON d.id = e.dept_id;";
+        let mut out = Vec::new();
+        alias_checks(sql, 0, sql.len(), SqlDialect::MsSql, &mut out);
+        assert!(out.is_empty(), "{out:?}");
+        // A reserved alias right before the `;` is still one.
+        assert_eq!(
+            alias_errors(
+                "DELIMITER //\nCREATE PROCEDURE p() BEGIN SELECT id FROM employees or; END //",
+                SqlDialect::MySql
+            ),
+            vec!["or"]
+        );
+        assert_eq!(
+            alias_errors(
+                "CREATE PROCEDURE dbo.p AS BEGIN SELECT id FROM employees or; END;",
+                SqlDialect::MsSql
+            ),
+            vec!["or"]
+        );
+        // A statement's first word ends the reference only where statements
+        // need no terminator: MySQL's `FROM employees select` is still wrong.
+        let sql = "SELECT id FROM employees select;";
+        assert!(
+            diag_d(sql, SqlDialect::MySql)
+                .iter()
+                .any(|x| x.severity == Severity::Error && &sql[x.range.0..x.range.1] == "select"),
+            "{:?}",
+            diag_d(sql, SqlDialect::MySql)
+        );
+        // And a real table after `FETCH`'s neighbours is still checked.
+        assert!(
+            diag_d("SELECT id FROM nosuchtable;", SqlDialect::MsSql)
+                .iter()
+                .any(|x| x.message.contains("not found"))
         );
     }
 
