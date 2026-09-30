@@ -761,6 +761,11 @@ pub enum UrlError {
     /// is there is most likely a password, and the host is saved to
     /// `connections.json` in plaintext, so it is refused rather than repeated.
     UserinfoInHost,
+    /// A `Server=…;Database=…` connection string that does not say it is SQL
+    /// Server's — the grammar MySQL's Connector/NET and Npgsql write too — or
+    /// says it is not (a `Port` keyword, which SqlClient does not have).
+    /// Carries nothing: the string holds a password.
+    NotSqlServer,
 }
 
 impl UrlError {
@@ -786,6 +791,10 @@ impl UrlError {
             ),
             UrlError::UserinfoInHost => "The server name holds an @ — a user name or password \
                  goes in its own field, not in the server."
+                .to_string(),
+            UrlError::NotSqlServer => "This connection string doesn't say it is SQL Server's — \
+                 MySQL's and PostgreSQL's .NET drivers write the same keywords. Paste the \
+                 server's URL instead (mysql://, postgresql://, sqlserver://)."
                 .to_string(),
         }
     }
@@ -1023,11 +1032,21 @@ fn driver_verifies_by_default(driver: Option<&str>) -> bool {
 /// keyword decides, as it does for every such string in the wild: they open
 /// with the server, the driver or the provider. A first value holding `://` is
 /// an environment variable named `DATABASE` whose value is a URL.
+///
+/// **And at least two `keyword=value` pairs.** One is a `.env` assignment —
+/// `SERVER=0.0.0.0`, `DATA_SOURCE=warehouse` — which *Choose a file…* reads
+/// line by line by design; taken for a connection string, each became a
+/// preselected SQL Server row.
 fn looks_like_connection_string(s: &str) -> bool {
     let Some((key, value)) = s.split_once('=') else {
         return false;
     };
-    !value.split(';').next().unwrap_or("").contains("://")
+    let pairs = s
+        .split(';')
+        .filter(|p| p.split_once('=').is_some_and(|(k, _)| !k.trim().is_empty()))
+        .count();
+    pairs >= 2
+        && !value.split(';').next().unwrap_or("").contains("://")
         && matches!(
             normalize_key(key).as_str(),
             "server"
@@ -1065,7 +1084,9 @@ fn parse_connection_string(s: &str) -> Result<(Connection, Vec<ImportNote>), Url
     // The ODBC `Driver` / OLE DB `Provider`, when one is named: it decides
     // what the string's silence about encryption means.
     let mut driver: Option<String> = None;
-    for (k, v) in split_mssql_props(s, true) {
+    let props = split_mssql_props(s, true);
+    let keys: Vec<String> = props.iter().map(|(k, _)| normalize_key(k)).collect();
+    for (k, v) in props {
         if v.is_empty() {
             continue;
         }
@@ -1104,6 +1125,9 @@ fn parse_connection_string(s: &str) -> Result<(Connection, Vec<ImportNote>), Url
     }
     let server = server.trim();
     let lower = server.to_ascii_lowercase();
+    if driver.is_none() && !says_sql_server(&keys, &lower) {
+        return Err(UrlError::NotSqlServer);
+    }
     if lower.starts_with("np:") || lower.starts_with("(localdb)") {
         return Err(UrlError::Transport(server.to_string()));
     }
@@ -1159,6 +1183,54 @@ fn names_sql_server_driver(v: &str) -> bool {
         || k.starts_with("sqlncli")
         || k.starts_with("sqloledb")
         || k.starts_with("msoledbsql")
+}
+
+/// Does a connection string with no `Driver`/`Provider` say it is **SQL
+/// Server's** — `keys` its normalised keywords, `server` its lower-cased
+/// server value?
+///
+/// The grammar is not SQL Server's alone: MySQL's Connector/NET and Npgsql
+/// write `Server=…;Database=…;Password=…` too, and one imported as SQL
+/// Server sent the MySQL login to whatever answered on port 1433. So:
+///
+/// - **against** — a keyword SqlClient does not have and those drivers do:
+///   `Port` (SqlClient writes the port as `Server=h,1433`), `Host`,
+///   `Username`, `SslMode`, `Search Path`. Any of them decides it, even
+///   beside a keyword below;
+/// - **for** — a SQL Server-only keyword (`Initial Catalog`, `Data Source`,
+///   `User Id`, `Integrated Security`, `Trusted_Connection`, `Encrypt`,
+///   `TrustServerCertificate`, `MultipleActiveResultSets`, `Authentication`,
+///   `ApplicationIntent`, `Failover Partner`, `AttachDbFilename`), or a server
+///   only SQL Server's grammar writes: a `tcp:`/`np:`/`lpc:` prefix,
+///   `(localdb)`, `.`/`(local)`, a `,port` or a `\instance`.
+///
+/// Neither is not guessed: `Server=h;Database=d;Uid=u;Pwd=p` is a valid string
+/// for both SqlClient and Connector/NET.
+fn says_sql_server(keys: &[String], server: &str) -> bool {
+    const AGAINST: &[&str] = &["port", "host", "username", "sslmode", "searchpath"];
+    const FOR: &[&str] = &[
+        "initialcatalog",
+        "datasource",
+        "userid",
+        "integratedsecurity",
+        "trustedconnection",
+        "encrypt",
+        "trustservercertificate",
+        "multipleactiveresultsets",
+        "authentication",
+        "applicationintent",
+        "failoverpartner",
+        "attachdbfilename",
+    ];
+    if keys.iter().any(|k| AGAINST.contains(&k.as_str())) {
+        return false;
+    }
+    let shaped = ["tcp:", "np:", "lpc:", "(localdb)"]
+        .iter()
+        .any(|p| server.starts_with(p))
+        || matches!(server, "." | "(local)")
+        || server.contains([',', '\\']);
+    shaped || keys.iter().any(|k| FOR.contains(&k.as_str()))
 }
 
 /// Microsoft's `key=value;key=value`, where a value in braces is taken whole —
@@ -3290,7 +3362,7 @@ mod tests {
         assert!(scan.found[0].has(ImportNote::NamedInstance));
         let c = url("Server=db\\SQLEXPRESS,1500;Database=d");
         assert_eq!((c.host.as_str(), c.port), ("db", 1500));
-        let c = url("ConnectionStrings__Default=\"Server=h;Database=d\"");
+        let c = url("ConnectionStrings__Default=\"Server=h;Database=d;User Id=u\"");
         assert_eq!((c.host.as_str(), c.database.as_str()), ("h", "d"));
         // A Windows login becomes Windows sign-in where the build has it, and
         // keeps the note where it does not.
@@ -3347,6 +3419,49 @@ mod tests {
             );
         }
         assert_eq!(parse_url("Database=d;User Id=u"), Err(UrlError::NoHost));
+    }
+
+    /// **A connection string is SQL Server's only when it says so.** MySQL's
+    /// Connector/NET and Npgsql write the same `Server=…;Database=…` grammar,
+    /// so a string with no SQL Server driver, no SQL Server-only keyword and no
+    /// SQL Server-shaped server imported as SQL Server on 1433 with the MySQL
+    /// password, `Port=3306` dropped — and a `.env`'s `SERVER=0.0.0.0` became
+    /// a preselected row. One `KEY=value` is not a connection string at all.
+    #[test]
+    fn a_connection_string_is_sql_servers_only_when_it_says_so() {
+        for other in [
+            "Server=myhost;Port=3306;Database=shop;Uid=appuser;Pwd=MySqlPw;",
+            "ConnectionStrings__Default=Server=myhost;Port=3306;Database=shop;Uid=a;Pwd=p",
+            "Server=pghost;Port=5432;Database=app;User Id=u;Password=p",
+            "Server=pghost;Database=app;Username=u;Password=p",
+            "Server=h;Database=d;Uid=u;Pwd=MySqlPw",
+            "Server=h;Database=d",
+        ] {
+            let err = parse_url(other).expect_err(other);
+            assert_eq!(err, UrlError::NotSqlServer, "{other}");
+            assert!(!err.message().contains("MySqlPw"), "{other}");
+        }
+        // A `.env` line is one assignment, not a connection string.
+        let scan = parse_url_scan("SERVER=0.0.0.0\nADDRESS=0.0.0.0:3000\nDATA_SOURCE=warehouse\n");
+        assert!(scan.found.is_empty(), "{:?}", scan.found);
+        // Each kind of evidence is enough on its own.
+        for sql_server in [
+            "Driver={ODBC Driver 18 for SQL Server};Server=h;Database=d",
+            "Server=tcp:h;Database=d",
+            "Server=h,1433;Database=d",
+            "Server=h\\SQLEXPRESS;Database=d",
+            "Server=.;Database=d",
+            "Server=h;Initial Catalog=d",
+            "Data Source=h;Database=d",
+            "Server=h;Database=d;User Id=u;Password=p",
+            "Server=h;Integrated Security=true",
+            "Server=h;Database=d;TrustServerCertificate=true",
+            "Server=h;Database=d;Encrypt=true",
+            "Server=h;Database=d;MultipleActiveResultSets=true",
+        ] {
+            let c = parse_url(sql_server).unwrap_or_else(|e| panic!("{sql_server}: {e:?}"));
+            assert!(crate::connection::is_mssql(&c.db_type), "{sql_server}");
+        }
     }
 
     #[test]

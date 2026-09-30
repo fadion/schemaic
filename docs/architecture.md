@@ -7035,14 +7035,26 @@ existing prose was left alone.
     **A connection string with no scheme at all is SQL Server's too** — ADO.NET's
     `Server=tcp:host\instance,port;Database=d;User Id=u;Password=p`, the shape `appsettings.json`
     holds, and ODBC's and OLE DB's, which spell the same keywords around a `Driver` or `Provider`.
-    `looks_like_connection_string` decides on the first keyword alone — the server, the driver, the
+    `looks_like_connection_string` decides on the first keyword — the server, the driver, the
     provider or the database, which is what such strings open with — unless that first value holds
-    `://`, which is a variable named `DATABASE` holding a URL. It is asked **before**
+    `://`, which is a variable named `DATABASE` holding a URL, **and on there being at least two
+    pairs**: one is a `.env` assignment (`SERVER=0.0.0.0`, `DATA_SOURCE=warehouse`), and *Choose a
+    file…* reads a `.env` line by line, so each became a preselected SQL Server row. It is asked **before**
     `strip_env_assignment`, which would otherwise eat a `Server=` head as a variable name, and again
     after it, for ASP.NET's `ConnectionStrings__Default="Server=…"`. `parse_connection_string`
     **reads the driver rather than assuming it**: an ODBC string for MySQL is the same grammar, so a
     `Driver`/`Provider` that `names_sql_server_driver` does not recognise is
-    `UrlError::UnknownScheme`, not a SQL Server row with a MySQL host. It reads the transport too —
+    `UrlError::UnknownScheme`, not a SQL Server row with a MySQL host. **With no driver named, the
+    string has to say it is SQL Server's** (`says_sql_server`), because MySQL's Connector/NET and
+    Npgsql write the same `Server=…;Database=…` grammar, and the canonical Connector/NET string
+    imported as SQL Server on 1433 with the MySQL password, its `Port=3306` dropped. A keyword
+    SqlClient lacks and those drivers have — `Port` above all (SqlClient writes `Server=h,1433`),
+    `Host`, `Username`, `SslMode`, `Search Path` — decides against; a SQL Server-only keyword
+    (`Initial Catalog`, `Data Source`, `User Id`, `Integrated Security`, `Encrypt`,
+    `TrustServerCertificate`…) or a server only its grammar writes (`tcp:`, `np:`, `lpc:`,
+    `(localdb)`, `.`, `,port`, `\instance`) decides for; neither is `UrlError::NotSqlServer`, which
+    repeats nothing, rather than a guess — `Server=h;Database=d;Uid=u;Pwd=p` is valid for both
+    (`a_connection_string_is_sql_servers_only_when_it_says_so`). It reads the transport too —
     `np:` named pipes and `(localdb)` are `UrlError::Transport`, since TCP is all Schemaic speaks,
     while `lpc:`, `.` and `(local)` are this machine and become `localhost`. A named instance with
     no port takes `NamedInstance` as the URL form does, and the TLS words go through
