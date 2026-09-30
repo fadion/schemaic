@@ -332,6 +332,42 @@ async fn a_ping_and_the_database_list_reach_the_server() {
     }
 }
 
+/// **A database in maintenance is still listed for a login that may open
+/// it.** The listing left out every `RESTRICTED_USER` database and every
+/// `SINGLE_USER` one, so the database an administrator had just put in
+/// maintenance vanished from their tree — while opening it by name worked.
+/// A login holding `CONNECT ANY DATABASE` (`sa` here) now sees both; the
+/// single-user one whether or not a session holds it, since expanding it says
+/// which.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_database_in_maintenance_is_listed_for_a_login_that_may_open_it() {
+    if !enabled() || azure_cannot("creates no databases of its own, so the maintenance listing") {
+        return;
+    }
+    let restricted = Scratch::create("restricted").await;
+    let single = Scratch::create("single").await;
+    let base = base_db();
+    let alter = |name: &str, mode: &str| {
+        let base = base.clone();
+        let sql = format!("ALTER DATABASE [{name}] SET {mode} WITH ROLLBACK IMMEDIATE");
+        async move {
+            base.fetch_query(None, &sql, 1, CancellationToken::new())
+                .await
+                .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+        }
+    };
+    alter(&restricted.name, "RESTRICTED_USER").await;
+    alter(&single.name, "SINGLE_USER").await;
+    let names = base.fetch_databases().await;
+    // Back to normal before anything can fail, so the drops are ordinary.
+    alter(&restricted.name, "MULTI_USER").await;
+    alter(&single.name, "MULTI_USER").await;
+    let names = names.expect("a database list");
+    for scratch in [&restricted, &single] {
+        assert!(names.contains(&scratch.name), "{}: {names:?}", scratch.name);
+    }
+}
+
 /// Every value renders as the text SQL Server prints for it — the values at
 /// the edges of each type's range included.
 #[tokio::test(flavor = "multi_thread")]

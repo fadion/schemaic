@@ -12359,12 +12359,20 @@ existing prose was left alone.
   kept**, since the words are spliced into a statement Schemaic runs and one it does not know is
   not carried (`a_view_header_yields_its_column_list_and_attributes`). `dependent_ddl` is left
   empty for a view, deliberately — see `TableInfo::dependent_ddl`, under `schema.rs`.
-  **`DATABASE_LISTING` asks `HAS_DBACCESS` inside a `CASE`, and only of a multi-user database.**
+  **`DATABASE_LISTING` asks `HAS_DBACCESS` inside a `CASE`, and never of a single-user database.**
   On one another session holds `SINGLE_USER`, that call took 2,174 ms against 150 ms (SQL Server
-  2022 CU27) — what an administrator's maintenance window would cost every tree refresh — and a
-  plain `AND user_access = 0` beside it does not stop it being evaluated, since T-SQL promises no
-  order for `AND`. `CASE` does. Such a database could not be opened by this login while it is held
-  anyway, so it is left out; the four system databases (ids 1–4) are too.
+  2022 CU27; 1,997 ms re-measured for a plain login) — what an administrator's maintenance window
+  would cost every tree refresh — and a plain `AND user_access <> 1` beside it does not stop it
+  being evaluated, since T-SQL promises no order for `AND`. `CASE` does. A plain login cannot tell
+  a held single-user database from a free one without that stall, so for it one is left out, held
+  or not. **A `RESTRICTED_USER` database is asked like any other** — `HAS_DBACCESS` answers it at
+  once (4 ms) and correctly, 0 for a login that is not its `db_owner` — and **a login holding
+  `CONNECT ANY DATABASE` sees both kinds**, the short-circuit coming first in the `CASE`. The
+  listing once left every restricted and single-user database out for everyone, so the database
+  an administrator had just put in maintenance vanished from their tree while opening it by name
+  worked; expanding a held one now says it is held
+  (`a_database_in_maintenance_is_listed_for_a_login_that_may_open_it`, live). The four system
+  databases (ids 1–4) are left out.
   **The listing can also wait on a database another session is creating or dropping**, and that is
   why it reads `sys.databases WITH (READPAST)` and asks nothing per database of a login holding
   `CONNECT ANY DATABASE` (`sysadmin` does). Its catalogue row is held under a lock that reading
@@ -12375,11 +12383,17 @@ existing prose was left alone.
   `READPAST` scan took 0 ms, and with the short-circuit `sa`'s listing 0–4 ms. `READPAST` skips
   only the rows under that lock — a database mid-create or mid-drop, which the next refresh shows.
   **A plain login still asks `HAS_DBACCESS`, which still waits** (to 7.8 s measured), so
-  `listing_within` gives the access-checked query `ACCESS_CHECK_BUDGET`, three seconds, and on a
-  stall runs `DATABASE_LISTING_UNFILTERED` on a fresh connection in what is left of the five. The
-  cost is a list that may name a database this login cannot enter, which then says so when it is
-  expanded — the answer it had before the check existed. **Only a stall falls back**: an error from
-  the filtered query is returned as the answer, since a refused login would be refused again
+  `listing_within` signs in first, bounded by the whole five seconds, then gives the
+  access-checked **query** `ACCESS_CHECK_BUDGET`, three seconds, and on a stall runs
+  `DATABASE_LISTING_UNFILTERED` on a fresh connection in what is left of the five. **The sign-in
+  is not in the share**: it was, and a connect of 3–5 s — a Microsoft Entra one through the Azure
+  CLI — abandoned the filtered listing mid-connect and left the fallback's own connect the 2 s
+  remaining, failing a listing the one 5 s bound before it answered
+  (`a_slow_connect_is_not_charged_to_the_access_check`). The cost of the fallback is a list that
+  may name a database this login cannot enter, a restricted or held one included, which then says
+  so when it is expanded — the answer it had before the check existed. **Only a stall falls
+  back**: an error from the sign-in or the filtered query is returned as the answer, since a
+  refused login would be refused again
   (`the_fallback_is_bounded_and_an_error_is_not_retried`, beside
   `a_stalled_access_check_falls_back_to_the_unfiltered_listing` on a paused clock;
   `the_listings_read_past_a_database_mid_create` pins both queries' text). The live leg's

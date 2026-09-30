@@ -259,17 +259,26 @@ pub(crate) async fn ping(db: &Db, timeout: Duration) -> Result<(), DbError> {
 /// which is what expanding the node will need — the same reason PostgreSQL's
 /// listing asks `has_database_privilege`.
 ///
-/// **Asked only of a multi-user database, and inside a `CASE`.** On one that
+/// **Never asked of a single-user database, and inside a `CASE`.** On one that
 /// another session holds `SINGLE_USER`, `HAS_DBACCESS` takes about two
-/// seconds to answer (2,174 ms against 150 ms, SQL Server 2022 CU27) — what an
-/// administrator's maintenance window would cost every tree refresh — and a
-/// plain `AND user_access = 0` beside it does not stop it being evaluated,
-/// since T-SQL promises no order for `AND`. `CASE` does. Such a database could
-/// not be opened by this login anyway while it is held, so it is left out.
+/// seconds to answer (2,174 ms against 150 ms, SQL Server 2022 CU27; 1,997 ms
+/// re-measured for a plain login) — what an administrator's maintenance window
+/// would cost every tree refresh — and a plain `AND user_access <> 1` beside
+/// it does not stop it being evaluated, since T-SQL promises no order for
+/// `AND`. `CASE` does. Whether another session holds it is not something a
+/// plain login can see without that stall, so for such a login a single-user
+/// database is left out, held or not. A `RESTRICTED_USER` one is asked like any
+/// other: `HAS_DBACCESS` answers it at once (4 ms) and correctly — 0 for a
+/// login that is not `db_owner`, which could not open it (measured on 2022).
 ///
-/// **Nor is anything asked of a login that may enter any database** —
-/// `CONNECT ANY DATABASE`, which `sysadmin` holds — and **the catalogue is read
-/// `WITH (READPAST)`**. Both because a database another session is creating or
+/// **Nothing is asked of a login that may enter any database** —
+/// `CONNECT ANY DATABASE`, which `sysadmin` holds — which therefore sees every
+/// online database, restricted and single-user ones included: the listing used
+/// to leave both out for everyone, so the database an administrator had just
+/// put in maintenance vanished from their tree while opening it by name
+/// worked, and expanding a held single-user one says it is held. **The
+/// catalogue is read `WITH (READPAST)`**, and the short-circuit comes first,
+/// both because a database another session is creating or
 /// dropping holds its catalogue row under a lock that reading `sys.databases`
 /// and `HAS_DBACCESS` both wait on (`LCK_M_S`, and one `SET LOCK_TIMEOUT` does
 /// not govern): under six parallel create/drop loops the plain listing took up
@@ -280,60 +289,77 @@ pub(crate) async fn ping(db: &Db, timeout: Duration) -> Result<(), DbError> {
 /// which still waits (to 7.8 s measured); [`listing_within`] is what bounds it.
 const DATABASE_LISTING: &str = "SELECT name FROM sys.databases WITH (READPAST) \
      WHERE database_id > 4 AND state = 0 \
-       AND CASE WHEN user_access <> 0 THEN 0 \
-                WHEN HAS_PERMS_BY_NAME(NULL, NULL, 'CONNECT ANY DATABASE') = 1 THEN 1 \
+       AND CASE WHEN HAS_PERMS_BY_NAME(NULL, NULL, 'CONNECT ANY DATABASE') = 1 THEN 1 \
+                WHEN user_access = 1 THEN 0 \
                 ELSE HAS_DBACCESS(name) END = 1 \
      ORDER BY name";
 
 /// [`DATABASE_LISTING`] without the access check — what the tree shows when
-/// that check stalls. A database this login cannot enter then says so when it
-/// is expanded, which is the answer it would have had before the check existed.
+/// that check stalls. A database this login cannot enter, a restricted or a
+/// held single-user one included, then says so when it is expanded, which is
+/// the answer it would have had before the check existed.
 const DATABASE_LISTING_UNFILTERED: &str = "SELECT name FROM sys.databases WITH (READPAST) \
-     WHERE database_id > 4 AND state = 0 AND user_access = 0 \
+     WHERE database_id > 4 AND state = 0 \
      ORDER BY name";
 
-/// The share of the listing's budget the access-checked query gets before
+/// The share of the listing's budget the access-checked **query** gets before
 /// [`listing_within`] falls back; the rest is the unfiltered query's, which
-/// needs a connection of its own (the stalled one is dropped mid-query).
+/// needs a connection of its own (the stalled one is dropped mid-query). The
+/// sign-in is not in it: it bounds `HAS_DBACCESS`, which is all it is for.
 const ACCESS_CHECK_BUDGET: Duration = Duration::from_secs(3);
 
 /// List the user databases, sorted by name. Bounded by
 /// [`crate::PING_TIMEOUT`], as on every engine.
 pub(crate) async fn fetch_databases(db: &Db) -> Result<Vec<String>, DbError> {
-    let listing = |sql: &'static str| async move {
-        let mut client = connect(db, None).await?;
+    let rows_of = |mut client: MsClient, sql: &'static str| async move {
         let rows = query_rows(&mut client, sql).await?;
         Ok::<_, DbError>(rows.into_iter().map(|r| cell(&r, 0)).collect())
     };
-    listing_within(crate::PING_TIMEOUT, listing(DATABASE_LISTING), || {
-        listing(DATABASE_LISTING_UNFILTERED)
-    })
+    listing_within(
+        crate::PING_TIMEOUT,
+        connect(db, None),
+        |client| rows_of(client, DATABASE_LISTING),
+        || async {
+            let client = connect(db, None).await?;
+            rows_of(client, DATABASE_LISTING_UNFILTERED).await
+        },
+    )
     .await
 }
 
-/// Run `filtered` for [`ACCESS_CHECK_BUDGET`]; if it has not answered by then,
-/// run `unfiltered` in what is left of `budget`. An **error** from `filtered`
-/// is its answer and is returned as one — only a stall falls back, since a
-/// refused login would be refused again.
-async fn listing_within<F, G>(
+/// Sign in with `connect`, then run `filtered` on that connection for
+/// [`ACCESS_CHECK_BUDGET`]; if it has not answered by then, run `unfiltered`
+/// in what is left of `budget`. The whole is bounded by `budget`, and **the
+/// share times the query alone** — a sign-in that takes 3–5 s (Microsoft
+/// Entra's, through the Azure CLI) was charged to it, so the filtered listing
+/// was abandoned mid-connect and the fallback connected from scratch in what
+/// was left, failing a listing the one 5 s bound before it answered. An
+/// **error** from either the connect or `filtered` is the answer and is
+/// returned as one — only a stall falls back, since a refused login would be
+/// refused again.
+async fn listing_within<C, F, FF, U, UF>(
     budget: Duration,
-    filtered: impl std::future::Future<Output = Result<Vec<String>, DbError>>,
-    unfiltered: F,
+    connect: impl std::future::Future<Output = Result<C, DbError>>,
+    filtered: F,
+    unfiltered: U,
 ) -> Result<Vec<String>, DbError>
 where
-    F: FnOnce() -> G,
-    G: std::future::Future<Output = Result<Vec<String>, DbError>>,
+    F: FnOnce(C) -> FF,
+    FF: std::future::Future<Output = Result<Vec<String>, DbError>>,
+    U: FnOnce() -> UF,
+    UF: std::future::Future<Output = Result<Vec<String>, DbError>>,
 {
     let start = tokio::time::Instant::now();
     let timed_out = || DbError::Connect("timed out".to_string());
-    match tokio::time::timeout(ACCESS_CHECK_BUDGET.min(budget), filtered).await {
+    let left = |start: tokio::time::Instant| budget.saturating_sub(start.elapsed());
+    let client = tokio::time::timeout(budget, connect)
+        .await
+        .map_err(|_| timed_out())??;
+    match tokio::time::timeout(ACCESS_CHECK_BUDGET.min(left(start)), filtered(client)).await {
         Ok(answer) => answer,
-        Err(_) => {
-            let left = budget.saturating_sub(start.elapsed());
-            tokio::time::timeout(left, unfiltered())
-                .await
-                .map_err(|_| timed_out())?
-        }
+        Err(_) => tokio::time::timeout(left(start), unfiltered())
+            .await
+            .map_err(|_| timed_out())?,
     }
 }
 
@@ -4599,13 +4625,22 @@ mod tests {
         r
     }
 
+    /// A sign-in that takes `ms`, as [`listing_within`]'s `connect`.
+    async fn signed_in_after(ms: u64) -> Result<(), DbError> {
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+        Ok(())
+    }
+
     /// The access check answering in time is the listing — the unfiltered
     /// one is never asked.
     #[tokio::test(start_paused = true)]
     async fn a_listing_that_answers_in_time_is_the_filtered_one() {
-        let got = listing_within(crate::PING_TIMEOUT, after(1, Ok(names(&["a"]))), || async {
-            panic!("the fallback ran")
-        })
+        let got = listing_within(
+            crate::PING_TIMEOUT,
+            signed_in_after(0),
+            |()| after(1, Ok(names(&["a"]))),
+            || async { panic!("the fallback ran") },
+        )
         .await;
         assert_eq!(got.unwrap(), names(&["a"]));
     }
@@ -4618,7 +4653,8 @@ mod tests {
         let start = tokio::time::Instant::now();
         let got = listing_within(
             crate::PING_TIMEOUT,
-            after(60, Ok(names(&["filtered"]))),
+            signed_in_after(100),
+            |()| after(60, Ok(names(&["filtered"]))),
             || after(1, Ok(names(&["a", "b"]))),
         )
         .await;
@@ -4635,9 +4671,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn the_fallback_is_bounded_and_an_error_is_not_retried() {
         let start = tokio::time::Instant::now();
-        let got = listing_within(crate::PING_TIMEOUT, after(60, Ok(Vec::new())), || {
-            after(60, Ok(Vec::new()))
-        })
+        let got = listing_within(
+            crate::PING_TIMEOUT,
+            signed_in_after(0),
+            |()| after(60, Ok(Vec::new())),
+            || after(60, Ok(Vec::new())),
+        )
         .await;
         assert!(got.is_err());
         assert!(
@@ -4647,11 +4686,53 @@ mod tests {
         );
         let got = listing_within(
             crate::PING_TIMEOUT,
-            after(0, Err(DbError::Query("denied".into()))),
+            signed_in_after(0),
+            |()| after(0, Err(DbError::Query("denied".into()))),
             || async { panic!("the fallback ran") },
         )
         .await;
         assert!(matches!(got, Err(DbError::Query(m)) if m == "denied"));
+        // A sign-in that never finishes is bounded by the whole budget, and
+        // one that is refused is the answer.
+        let start = tokio::time::Instant::now();
+        let got = listing_within(
+            crate::PING_TIMEOUT,
+            signed_in_after(60_000),
+            |()| async { panic!("the query ran") },
+            || async { panic!("the fallback ran") },
+        )
+        .await;
+        assert!(matches!(got, Err(DbError::Connect(_))), "{got:?}");
+        assert!(start.elapsed() <= crate::PING_TIMEOUT);
+        let got = listing_within(
+            crate::PING_TIMEOUT,
+            async { Err::<(), _>(DbError::Connect("refused".into())) },
+            |()| async { panic!("the query ran") },
+            || async { panic!("the fallback ran") },
+        )
+        .await;
+        assert!(matches!(got, Err(DbError::Connect(m)) if m == "refused"));
+    }
+
+    /// **A slow sign-in is not a stalled access check.** A Microsoft Entra
+    /// connect can take 3–5 s (the Azure CLI's token, then the login), and the
+    /// access check's 3 s share used to include it: the filtered listing was
+    /// abandoned mid-connect and the fallback connected from scratch in the
+    /// 2 s left, so the tree said "timed out" where the one 5 s bound before
+    /// it answered. The share times the query alone.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_connect_is_not_charged_to_the_access_check() {
+        let got = listing_within(
+            crate::PING_TIMEOUT,
+            signed_in_after(3500),
+            |()| after(0, Ok(names(&["a"]))),
+            || async {
+                signed_in_after(3500).await?;
+                Ok(names(&["unfiltered"]))
+            },
+        )
+        .await;
+        assert_eq!(got.unwrap(), names(&["a"]));
     }
 
     /// Both listings skip a database whose catalogue row is locked (`READPAST`)
@@ -4667,6 +4748,18 @@ mod tests {
             .expect("the short-circuit");
         assert!(short_circuit < DATABASE_LISTING.find("HAS_DBACCESS").unwrap());
         assert!(!DATABASE_LISTING_UNFILTERED.contains("HAS_DBACCESS"));
+        // A single-user database never reaches `HAS_DBACCESS`, which stalls
+        // two seconds on a held one — but only after the short-circuit, so a
+        // login that may enter any database still sees it; and nothing
+        // filters on `user_access` outside the `CASE`, which is how a
+        // restricted database vanished from every tree.
+        let single = DATABASE_LISTING
+            .find("WHEN user_access = 1 THEN 0")
+            .expect("the single-user guard");
+        assert!(short_circuit < single);
+        assert!(single < DATABASE_LISTING.find("HAS_DBACCESS").unwrap());
+        assert_eq!(DATABASE_LISTING.matches("user_access").count(), 1);
+        assert!(!DATABASE_LISTING_UNFILTERED.contains("user_access"));
     }
 
     /// A view's header says what `ALTER VIEW` would reset if it were not
