@@ -26097,7 +26097,11 @@ Re-introducing the anti-patterns these guard against is a regression:
   claiming that an ordinary name raised no tooltip at all. Every name of fifteen characters or fewer,
   which is nearly all of them, therefore drew a small empty bordered chip on the app's most-hovered
   control; the results strip's chip had the same shape, falling back to `String::new()` for a panel
-  already removed. Both go through `tip_when` now. **This class has no gate, and the gate that was
+  already removed. Both go through `tip_when` now, and so does a **third** that the fix missed:
+  each row of the connection switcher menu in `overlays.rs`, whose tip — the full name and
+  endpoint, when either was elided — was a `String` left empty otherwise and handed to a bare
+  `.tooltip(…)`, so every ordinary row drew the same empty box on hover. It is an `Option<String>`
+  now, `None` when nothing was cut. **This class has no gate, and the gate that was
   written for it is why**: it scanned each `.tooltip(` closure for an emptiable expression and
   *passed against both of the bugs it was written for*, because both spelled the emptiness in the tip
   binding above rather than inside the closure — and nothing mechanical distinguishes "a tip that can
@@ -27237,8 +27241,11 @@ Re-introducing the anti-patterns these guard against is a regression:
   and the `min_width` variant lands the endpoints flush at the same right edge the explicit-`width`
   variant does. So do not go looking for a definite width here; the fix is the **order** — style the
   child, *then* wrap, then give the wrapper `width_full()` so the row has a width to resolve its own
-  `width_full()` against. This is the only menu in the app whose rows carry a tooltip, which is why
-  it is the only one that had it.
+  `width_full()` against. The wrap is `widgets::tip_when` now rather than a bare `.tooltip(…)` (see
+  *A tooltip that appears only sometimes* under *UI conventions*), and none of this moved:
+  `tip_when` returns the `.tooltip()` wrapper itself, so the row is still styled before the call
+  and the `width_full()` chained after it still lands on the wrapper. This is the only menu in the
+  app whose rows carry a tooltip, which is why it is the only one that had it.
 - **A `VirtualItemSize::Fixed` is a promise about the child's height, and the child has to keep it.**
   `virtual_stack` places child `i` at `i * item_size` and derives the range it builds from the same
   arithmetic, so a row whose real height is *assembled* — padding plus a parent `gap` — drifts

@@ -21,7 +21,6 @@ use schemaic_core::schema::{SchemaState, TableSource, db_visible};
 use schemaic_core::skeleton::{delete_skeleton, insert_skeleton, update_skeleton};
 
 use crate::consts::{chat_pad_h, chat_pad_v, db_menu_w};
-use crate::tooltip::TooltipExt;
 use crate::widgets::{
     ACTION_TAB, CURSOR_MENU_GAP, MenuEntry, autohide, box_menu_inset, cursor_menu_insets,
     dialog_button, first_enabled, focus_root, list_step_enabled, measure_text_px_at,
@@ -773,18 +772,21 @@ pub(crate) fn conn_menu_overlay(
                     // cut. Two connections sharing a 15-character prefix are
                     // otherwise indistinguishable here and in the header — the
                     // two places a connection is chosen — and this is the row
-                    // that chooses one. Empty when nothing was elided, so an
-                    // ordinary row raises no tooltip.
+                    // that chooses one. `None` when nothing was elided — and
+                    // through `tip_when`, which is the only thing that makes that
+                    // mean "no tooltip": this was an empty `String` handed to a
+                    // bare `tooltip()`, and every ordinary row drew a small empty
+                    // bordered box on hover, as the header's switcher once did.
                     let tip = match (name != c.name, endpoint != c.endpoint()) {
-                        (false, false) => String::new(),
-                        _ => format!(
+                        (false, false) => None,
+                        _ => Some(format!(
                             "{}
 {}",
                             c.name,
                             c.endpoint()
-                        ),
+                        )),
                     };
-                    h_stack((
+                    let row = h_stack((
                         dot,
                         // Name in the connection-list text colour; the dot carries status.
                         text(name).style(|s| s.color(theme::conn_list_text())),
@@ -810,16 +812,16 @@ pub(crate) fn conn_menu_overlay(
                     // the only menu in the app whose rows carry a tooltip, which
                     // is why it is the only one that had this.
                     .style(menu_item_style)
-                    .style(|s| s.padding_vert(theme::scaled(8.0)))
-                    .tooltip(move || text(tip.clone()).style(crate::widgets::tooltip_style))
-                    .on_click_stop(move |_| {
-                        (switch)(id);
-                        open.set(false);
-                    })
-                    // The wrapper `tooltip()` inserted, given the width the row
-                    // resolves its own `width_full` against.
-                    .style(|s| s.width_full())
-                    .into_any()
+                    .style(|s| s.padding_vert(theme::scaled(8.0)));
+                    crate::widgets::tip_when(row, move || tip.clone())
+                        .on_click_stop(move |_| {
+                            (switch)(id);
+                            open.set(false);
+                        })
+                        // The wrapper `tooltip()` inserted, given the width the row
+                        // resolves its own `width_full` against.
+                        .style(|s| s.width_full())
+                        .into_any()
                 },
             )
             .style(|s| s.flex_col());
