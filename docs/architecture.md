@@ -9879,8 +9879,8 @@ existing prose was left alone.
   `the_dispatcher_calls_every_engine_module_for_every_entry_point`. **`mssql.rs` is a fourth module
   and answers every name**, the unwritten ones with a refusal: it is in the first test's list and
   in `the_entry_point_list_is_what_the_dispatcher_actually_dispatches`'s intersection, whose
-  listed-⊆-called half is what holds its dispatch arms; the second test's own loop still names only
-  the first three.
+  listed-⊆-called half is what holds its dispatch arms, and the second test's own loop names all
+  four modules.
   **Flipping them to three is what found the last three doors.** `commit_writes`, `refetch_rows`
   and `fetch_blob` existed in `mysql.rs` only as `write_on`, `refetch_on` and `blob_on` — the
   bodies `session.rs` calls directly — while the dispatcher's arm was still inline, so the interface
