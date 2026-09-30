@@ -5886,7 +5886,17 @@ existing prose was left alone.
     password, a login being a SQL login by its password, and holds back an external draft that is
     not a User or that carries a login or a password — held back rather than either silently
     dropped, because those fields can hold a value typed before the toggle hid them
-    (`an_entra_user_is_created_from_the_external_provider`).
+    (`an_entra_user_is_created_from_the_external_provider`). **The Kind switch hides the password
+    rows the same way and is handled the other way: `account_form_as_shown` clears a password —
+    and its confirmation — that `draft_takes_password` says the form does not show**, and both the
+    statement and the blocker are read from what it returns. The form opens on a Login, so a
+    password is typed for one; switched to User on a database that is not contained, the value
+    stayed in the signals, and a user left without a login went out `CREATE USER … WITH PASSWORD`
+    (Msg 33233) rather than the `WITHOUT LOGIN` the form described, while one given a login held
+    Preview back under "leave this blank" with nothing on screen to blank. A reset keeps what was
+    typed, its one row being the password, and so does an Entra draft, for the held-back sentence
+    above (`a_password_the_kind_switch_hid_is_neither_emitted_nor_blocking`; the form's call site,
+    `the_preview_leaves_out_a_password_the_kind_switch_hid` under `account_editor.rs`).
     **What the form may make is `Principals::scope`, an `AccountScope` read with the list** — three
     `bool`s, every one `false` on every other engine, which is also an ordinary server's answer.
     `contained` is the first, because SQL Server takes a user's own password only in a contained
@@ -18328,6 +18338,8 @@ existing prose was left alone.
     `User`, since on SQL Server it is the login that holds the password and a user has none of its
     own — **except in a contained database**, where the row appears for a User too, and a For login
     left empty with a password filled makes it a contained user (`CREATE USER … WITH PASSWORD`).
+    A password the rows no longer show — typed for the Login the form opened on — is left out of
+    the Preview and its blocker (`users::account_form_as_shown`, through the private `shown`).
     **Where the connection signed in through Entra (`users::supports_entra_users`) a User also gets
     a *Microsoft Entra* toggle**, and turned on it takes *For login* and the password rows away with
     it — an Entra user (`CREATE USER … FROM EXTERNAL PROVIDER`) has neither — which is why

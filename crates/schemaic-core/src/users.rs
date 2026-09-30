@@ -1930,6 +1930,39 @@ pub fn account_form_blocker(
     None
 }
 
+/// The New account form's draft and confirmation **as the form shows them** —
+/// with a password neither row shows cleared from both — which is what the
+/// statement is built from and the Preview blocker reads.
+///
+/// **Kind hides the password rows without clearing them.** The form opens on
+/// a SQL Server login, so a password is typed for it; switching Kind to User on
+/// a database that is not contained hides the rows ([`draft_takes_password`])
+/// while the signals keep the value. A user left without a login then went out
+/// as `CREATE USER … WITH PASSWORD` — Msg 33233, instead of the `WITHOUT LOGIN`
+/// the form described — and one given a login held Preview back under "leave
+/// this blank" with no field on screen to blank. Emitting from what the form
+/// shows ends both.
+///
+/// A reset keeps what was typed: its one row is the password. So does a
+/// Microsoft Entra draft, whose blocker holds a hidden login or password back
+/// in a sentence of its own ([`account_form_blocker`]).
+pub fn account_form_as_shown(
+    dialect: SqlDialect,
+    draft: &AccountDraft,
+    confirm: &str,
+    scope: AccountScope,
+    resetting: bool,
+) -> (AccountDraft, String) {
+    let hidden =
+        !resetting && !draft.external && !draft_takes_password(dialect, draft, scope.contained);
+    if !hidden {
+        return (draft.clone(), confirm.to_string());
+    }
+    let mut shown = draft.clone();
+    shown.password.clear();
+    (shown, String::new())
+}
+
 /// `CREATE USER` / `CREATE ROLE`, or `None` for a draft with no name.
 ///
 /// **The password clause is in the statement, and the statement is shown in
@@ -4865,6 +4898,89 @@ mod mssql_tests {
         assert!(supports_entra_users(MS, entra));
         assert!(!supports_entra_users(MS, AccountScope::default()));
         assert!(!supports_entra_users(SqlDialect::Postgres, entra));
+    }
+
+    /// **A password typed for a login and hidden by switching Kind to User is
+    /// not in the draft the form describes.** The New account form opens on a
+    /// Login; switching to User on a database that is not contained hides the
+    /// password rows but kept what was typed, so a user left without a login
+    /// went out as `CREATE USER … WITH PASSWORD` (Msg 33233) instead of the
+    /// `WITHOUT LOGIN` the form described — and one given a login held
+    /// Preview back naming a field that was not on screen. Nothing the form
+    /// hides reaches the statement or the reason.
+    #[test]
+    fn a_password_the_kind_switch_hid_is_neither_emitted_nor_blocking() {
+        let plain = AccountScope::default();
+        let switched = AccountDraft {
+            name: "n".into(),
+            kind: PrincipalKind::User,
+            password: "pw".into(),
+            ..Default::default()
+        };
+        let (shown, confirm) = account_form_as_shown(MS, &switched, "pw", plain, false);
+        assert_eq!((shown.password.as_str(), confirm.as_str()), ("", ""));
+        assert_eq!(
+            account_draft_sql(&shown, MS).as_deref(),
+            Some("CREATE USER [n] WITHOUT LOGIN")
+        );
+        assert_eq!(account_form_blocker(&shown, &confirm, false), None);
+        let for_login = AccountDraft {
+            login: "app".into(),
+            ..switched.clone()
+        };
+        let (shown, confirm) = account_form_as_shown(MS, &for_login, "pw", plain, false);
+        assert_eq!(account_form_blocker(&shown, &confirm, false), None);
+        assert_eq!(
+            account_draft_sql(&shown, MS).as_deref(),
+            Some("CREATE USER [n] FOR LOGIN [app]")
+        );
+
+        // Where the row is shown, what was typed stands: a contained user's
+        // own password, a login's, and every reset.
+        let contained = AccountScope {
+            contained: true,
+            ..plain
+        };
+        assert_eq!(
+            account_form_as_shown(MS, &switched, "pw", contained, false).0,
+            switched
+        );
+        let login = AccountDraft {
+            kind: PrincipalKind::Login,
+            ..switched.clone()
+        };
+        assert_eq!(
+            account_form_as_shown(MS, &login, "pw", plain, false).0,
+            login
+        );
+        assert_eq!(
+            account_form_as_shown(MS, &switched, "pw", plain, true),
+            (switched.clone(), "pw".to_string())
+        );
+
+        // The rule, over every kind every engine offers: once shown, the
+        // blocker never speaks of a password the form does not show.
+        for d in [MS, SqlDialect::MySql, SqlDialect::Postgres] {
+            for scope in [plain, contained] {
+                for &kind in account_kinds(d, scope) {
+                    let typed = AccountDraft {
+                        name: "n".into(),
+                        kind,
+                        password: "pw".into(),
+                        ..Default::default()
+                    };
+                    if draft_takes_password(d, &typed, scope.contained) {
+                        continue;
+                    }
+                    let (shown, confirm) = account_form_as_shown(d, &typed, "px", scope, false);
+                    let why = account_form_blocker(&shown, &confirm, false);
+                    assert!(
+                        why.is_none_or(|w| !w.to_ascii_lowercase().contains("password")),
+                        "{d:?} {kind:?}: {why:?}"
+                    );
+                }
+            }
+        }
     }
 
     /// **The password is the login's**, so a reset on a user row goes to the

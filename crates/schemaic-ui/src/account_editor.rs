@@ -601,11 +601,26 @@ pub(crate) fn account_change(
 /// `None` kept the suite green while every PostgreSQL password went back into
 /// the server's logs as text — `None` being, by design, the silent fallback.
 pub(crate) fn preview_change(draft: &AccountDraft, target: &AccountTarget) -> ddl::Change {
+    // What the form shows, not what its signals still hold: a password the
+    // Kind switch hid is not in the statement (`users::account_form_as_shown`).
+    let (draft, _) = shown(draft, "", target);
     account_change(
-        draft,
+        &draft,
         target.resetting.as_ref(),
         fresh_salt(),
         target.password_policy,
+    )
+}
+
+/// `users::account_form_as_shown` for this form's target — the draft and
+/// confirmation the statement and the Preview blocker are both read from.
+fn shown(draft: &AccountDraft, confirm: &str, target: &AccountTarget) -> (AccountDraft, String) {
+    schemaic_core::users::account_form_as_shown(
+        target.dialect,
+        draft,
+        confirm,
+        target.scope,
+        target.resetting.is_some(),
     )
 }
 
@@ -937,6 +952,7 @@ pub(crate) fn account_editor_overlay(d: DdlUi) -> impl IntoView {
             // over an empty field and the plan would come back with nothing in
             // it, which reads as the app being broken.
             let resetting = target.resetting.is_some();
+            let status_target = target.clone();
             let status = dyn_container(
                 // `with`, not `get`: this re-runs on every edit of the draft and
                 // asks one question about one field, so cloning the whole
@@ -946,11 +962,13 @@ pub(crate) fn account_editor_overlay(d: DdlUi) -> impl IntoView {
                 // The reason is `users::account_form_blocker`'s, the same call
                 // `account_form_ready` makes for the button beside it — so the
                 // sentence and the dimming cannot disagree about what is
-                // missing, the confirmation included.
+                // missing, the confirmation included. Both read the form as
+                // shown, so a password the Kind switch hid is never the reason.
                 move || {
                     d.account_confirm.with(|confirm| {
                         d.account_draft.with(|a| {
-                            schemaic_core::users::account_form_blocker(a, confirm, resetting)
+                            let (a, confirm) = shown(a, confirm, &status_target);
+                            schemaic_core::users::account_form_blocker(&a, &confirm, resetting)
                         })
                     })
                 },
@@ -969,9 +987,10 @@ pub(crate) fn account_editor_overlay(d: DdlUi) -> impl IntoView {
                 move |(draft, confirm)| {
                     let target = preview_target.clone();
                     let ring = ring_actions.clone();
+                    let (shown_draft, shown_confirm) = shown(&draft, &confirm, &target);
                     let ready = schemaic_core::users::account_form_ready(
-                        &draft,
-                        &confirm,
+                        &shown_draft,
+                        &shown_confirm,
                         target.resetting.is_some(),
                     );
                     h_stack((
@@ -2001,6 +2020,35 @@ mod account_change_tests {
         let reset = emit(&target);
         assert!(reset.contains("PASSWORD 'md5"), "{reset}");
         assert!(!reset.contains("hunter2"), "{reset}");
+    }
+
+    /// **What the Preview button builds is what the form shows**: a password
+    /// typed for a SQL Server login and then hidden by switching Kind to User,
+    /// on a database that is not contained, is not in the plan — the user goes
+    /// out `WITHOUT LOGIN` rather than `WITH PASSWORD` (Msg 33233). The
+    /// composition of `users::account_form_as_shown` with this call site.
+    #[test]
+    fn the_preview_leaves_out_a_password_the_kind_switch_hid() {
+        let draft = AccountDraft {
+            name: "n".into(),
+            kind: PrincipalKind::User,
+            password: "pw".into(),
+            ..Default::default()
+        };
+        let target = AccountTarget {
+            conn_id: 1,
+            database: "db".into(),
+            dialect: SqlDialect::MsSql,
+            read_only: false,
+            resetting: None,
+            password_policy: None,
+            scope: Default::default(),
+        };
+        let emitted: Vec<String> = preview_changes(&draft, &target)
+            .into_iter()
+            .flat_map(|c| ddl::account("n", SqlDialect::MsSql, c).emit())
+            .collect();
+        assert_eq!(emitted, ["CREATE USER [n] WITHOUT LOGIN;"]);
     }
 
     /// A fresh salt per plan: two previews of the same password must not share
