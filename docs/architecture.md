@@ -763,7 +763,10 @@ existing prose was left alone.
     its head alone sent the table to `master` on an unscoped tab. The statement an `IF` guards is
     asked on its own, so `IF OBJECT_ID('t') IS NULL CREATE TABLE t` still needs one, and a `USE`
     answers for everything after it
-    (`a_sql_server_statement_behind_a_harmless_one_still_needs_a_database`). And
+    (`a_sql_server_statement_behind_a_harmless_one_still_needs_a_database`). `DATABASE` is
+    server-level only as a database's own name: `DATABASE SCOPED …`, `DATABASE CURRENT`,
+    `DATABASE AUDIT SPECIFICATION` and `DATABASE ENCRYPTION KEY` name the current database or
+    something in it, so they need one too — unscoped, they landed in `master`. And
     `no_database_failure` matches error 208,
     *Invalid object name*, as the hint that the statement ran somewhere other than meant.
   - `intel.rs` — the **SQL intelligence** layer (structure-aware, dialect-pluggable). Parses a
@@ -24378,7 +24381,15 @@ Re-introducing the anti-patterns these guard against is a regression:
   (`unterminated_write_words`): T-SQL needs no `;` between statements, and its backing session is
   a transaction rolled back rather than a refusal, so `SELECT 1 COMMIT EXEC('DELETE FROM t')`
   once read as one read whose `COMMIT` ended that transaction and whose procedure's writes stuck
-  (`a_sql_server_write_hidden_behind_a_read_is_still_a_write`). The missing-`WHERE` net had the
+  (`a_sql_server_write_hidden_behind_a_read_is_still_a_write`; `ADD` is among the words, for
+  `ADD SIGNATURE` and `ADD SENSITIVITY CLASSIFICATION`, a reserved word no unbracketed name can
+  be). **And a rollback is not the whole of SQL Server's read-only guarantee**, so on such a
+  connection `run_verdict` also asks `read_only_reason` (`SqlDialect::read_only_is_a_rollback`)
+  and Blocks what it refuses: a `RAISERROR … WITH LOG` or a function calling an extended procedure
+  writes nothing `contains_write` sees, and its effect outside the database outlived the
+  rolled-back transaction, measured on 2022 — the headless paths and Analyze already refused it on
+  the same connection, and the editor was the laxer gate
+  (`a_read_only_rollback_session_blocks_what_the_rollback_cannot_undo`). The missing-`WHERE` net had the
   same blind spot on the same engine — a bare `DELETE` below a scoped one borrowed its `WHERE` —
   and reads each statement of the range now (`sql::tsql_statements`, under `core::sql`).
   `main.rs`'s `session_enforce(connections, conn_id)` answers `Enforce::ReadOnly` for a read-only

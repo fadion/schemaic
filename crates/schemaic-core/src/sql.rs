@@ -146,6 +146,15 @@ impl SqlDialect {
     pub fn prefixed_names(self) -> bool {
         matches!(self, SqlDialect::MsSql)
     }
+
+    /// Is a read-only connection's session **only a transaction that is rolled
+    /// back**, rather than one the server refuses writes in? SQL Server's —
+    /// it has no read-only session to ask for (`db::mssql::fetch_query`) — so
+    /// what a rollback cannot undo, the text gate has to refuse, on every path
+    /// that runs on such a connection ([`run_verdict`]).
+    pub fn read_only_is_a_rollback(self) -> bool {
+        matches!(self, SqlDialect::MsSql)
+    }
 }
 
 /// If `b[i..]` starts a comment, return the index just past it. Handles `--`
@@ -2254,6 +2263,18 @@ fn mssql_needs_database(sql: &str) -> bool {
                 ) {
                     return true;
                 }
+                // `DATABASE SCOPED …`, `DATABASE CURRENT`, `DATABASE AUDIT
+                // SPECIFICATION` and `DATABASE ENCRYPTION KEY` name the current
+                // database or something inside it: on an unscoped tab, `master`.
+                if obj == "DATABASE" {
+                    let after = leading_keyword_end(rest, dialect)
+                        .map(|e| &rest[e..])
+                        .unwrap_or("");
+                    let next = leading_keyword(after, dialect).unwrap_or_default();
+                    if matches!(next.as_str(), "SCOPED" | "CURRENT" | "AUDIT" | "ENCRYPTION") {
+                        return true;
+                    }
+                }
             }
             _ => return true,
         }
@@ -2495,6 +2516,21 @@ pub fn run_verdict(stmts: &[String], policy: GuardPolicy) -> RunVerdict {
     let writes = || stmts.iter().any(|s| contains_write(s, policy.dialect));
     if policy.read_only && writes() {
         return RunVerdict::Block("Read-only connection.".to_string());
+    }
+    // **Where the read-only session is only a rollback, the rollback is not the
+    // whole guard.** A `RAISERROR … WITH LOG`, or a function that calls an
+    // extended procedure, writes nothing `contains_write` can see, and its
+    // effect outside the database outlives the rolled-back transaction —
+    // which is why the headless paths and Analyze ask `read_only_reason` on
+    // such a connection. The editor runs the same statement against the same
+    // guarantee, so it asks the same gate; anything laxer here would be a
+    // second gate.
+    if policy.read_only && policy.dialect.read_only_is_a_rollback() {
+        for s in stmts {
+            if let Err(reason) = read_only_reason(s, policy.dialect) {
+                return RunVerdict::Block(format!("Read-only connection: {reason}"));
+            }
+        }
     }
     if policy.no_database && stmts.iter().any(|s| needs_database(s, policy.dialect)) {
         // MySQL's own message, deliberately: there it is the *server* that
@@ -4537,6 +4573,10 @@ fn unterminated_write_words(dialect: SqlDialect) -> &'static [&'static str] {
         "CHECKPOINT",
         "SETUSER",
         "REVERT",
+        // `ADD SIGNATURE`, `ADD COUNTER SIGNATURE`, `ADD SENSITIVITY
+        // CLASSIFICATION`. A reserved word in T-SQL, so an unbracketed `add`
+        // is never a name.
+        "ADD",
     ]
 }
 
@@ -5197,12 +5237,18 @@ mod tests {
             "SELECT 1 DECLARE @x int SET @x = 1",
             "SELECT 1 DBCC FREEPROCCACHE",
             "SELECT * FROM OPENQUERY(srv, 'DELETE FROM t')",
+            // T-SQL's `ADD` statements, headless behind a read (measured on
+            // 2022: the batch classified the column).
+            "SELECT id FROM dbo.t\nADD SENSITIVITY CLASSIFICATION TO dbo.t.email WITH (LABEL = 'PII')",
+            "SELECT 1 ADD SIGNATURE TO dbo.p BY CERTIFICATE c",
+            "SELECT 1 ADD COUNTER SIGNATURE TO dbo.p BY CERTIFICATE c",
         ] {
             assert!(super::contains_write(sql, ms), "{sql}");
         }
-        // Reads stay reads.
+        // Reads stay reads — `add` bracketed as a name is a name.
         for sql in [
             "SELECT a FROM t WHERE a = N'EXEC'",
+            "SELECT [add] FROM t",
             "SELECT TOP (5) [commit] FROM t",
             "WITH c AS (SELECT 1 AS a) SELECT * FROM c",
         ] {
@@ -7980,6 +8026,52 @@ line */",
         );
     }
 
+    /// **On an engine whose read-only session is only a rollback, the editor
+    /// refuses what the rollback cannot undo** — as the headless gate and the
+    /// plan modal's Analyze already did on the same connection. A `RAISERROR …
+    /// WITH LOG` and a function calling an extended procedure are no writes to
+    /// `contains_write`, and their effect outside the database survived the
+    /// rolled-back transaction (measured on 2022).
+    #[test]
+    fn a_read_only_rollback_session_blocks_what_the_rollback_cannot_undo() {
+        let ms = GuardPolicy {
+            read_only: true,
+            dialect: SqlDialect::MsSql,
+            ..open_policy()
+        };
+        for sql in [
+            "SELECT 1 AS a RAISERROR('x', 1, 1) WITH LOG",
+            "SELECT dbo.note()",
+        ] {
+            assert!(
+                matches!(v(&[sql], ms), RunVerdict::Block(ref m) if m.starts_with("Read-only connection")),
+                "{sql}: {:?}",
+                v(&[sql], ms)
+            );
+        }
+        assert_eq!(v(&["SELECT * FROM t WHERE a = 1"], ms), RunVerdict::Allow);
+        assert_eq!(v(&["SELECT GETDATE()"], ms), RunVerdict::Allow);
+        // Writable, or on an engine with a real read-only session, nothing moves.
+        assert_eq!(
+            v(
+                &["SELECT dbo.note()"],
+                GuardPolicy {
+                    read_only: false,
+                    ..ms
+                }
+            ),
+            RunVerdict::Allow
+        );
+        for d in [SqlDialect::Postgres, SqlDialect::MySql] {
+            let p = GuardPolicy {
+                read_only: true,
+                dialect: d,
+                ..open_policy()
+            };
+            assert_eq!(v(&["SELECT my_func()"], p), RunVerdict::Allow, "{d:?}");
+        }
+    }
+
     // ── No database selected (PostgreSQL's hidden maintenance database) ──
 
     /// The sequence a fresh server invites: create the database, then create a
@@ -8057,6 +8149,15 @@ line */",
             "DELETE FROM users",
             "TRUNCATE TABLE users",
             "EXEC sp_rename 'a', 'b'",
+            // `DATABASE` followed by these names the *current* database, or
+            // something inside it — on an unscoped tab, `master`.
+            "ALTER DATABASE SCOPED CONFIGURATION SET MAXDOP = 1",
+            "ALTER DATABASE CURRENT SET RECOVERY SIMPLE",
+            "CREATE DATABASE SCOPED CREDENTIAL c WITH IDENTITY = 'x', SECRET = 'y'",
+            "CREATE DATABASE AUDIT SPECIFICATION a FOR SERVER AUDIT s",
+            "CREATE DATABASE ENCRYPTION KEY WITH ALGORITHM = AES_256 \
+             ENCRYPTION BY SERVER CERTIFICATE c",
+            "DROP DATABASE SCOPED CREDENTIAL c",
         ] {
             assert!(needs_database(sql, ms), "{sql}");
         }
