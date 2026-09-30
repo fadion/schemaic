@@ -7059,7 +7059,12 @@ existing prose was left alone.
     `TrustServerCertificate`…) or a server only its grammar writes (`tcp:`, `np:`, `lpc:`,
     `(localdb)`, `.`, `,port`, `\instance`) decides for; neither is `UrlError::NotSqlServer`, which
     repeats nothing, rather than a guess — `Server=h;Database=d;Uid=u;Pwd=p` is valid for both
-    (`a_connection_string_is_sql_servers_only_when_it_says_so`). It reads the transport too —
+    (`a_connection_string_is_sql_servers_only_when_it_says_so`). **A repeated keyword keeps the value
+    its driver would use** — the last in ADO.NET and OLE DB, SqlClient's documented rule for a base
+    string with an override a config transform appended, and the first under an ODBC `Driver`,
+    whose rule is the opposite — not the URL readers' first-wins, whose reason (the authority beats
+    a query parameter) a flat keyword list does not have
+    (`a_repeated_keyword_keeps_the_value_its_driver_uses`). It reads the transport too —
     `np:` named pipes and `(localdb)` are `UrlError::Transport`, since TCP is all Schemaic speaks,
     while `lpc:`, `.` and `(local)` are this machine and become `localhost`. A named instance with
     no port takes `NamedInstance` as the URL form does, and the TLS words go through

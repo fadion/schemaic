@@ -1095,19 +1095,34 @@ fn parse_connection_string(s: &str) -> Result<(Connection, Vec<ImportNote>), Url
     let mut driver: Option<String> = None;
     let props = split_mssql_props(s, true);
     let keys: Vec<String> = props.iter().map(|(k, _)| normalize_key(k)).collect();
+    // **A repeated keyword keeps the value its driver would use**: the last
+    // in ADO.NET and OLE DB (SqlClient's documented rule — a base string plus
+    // an override a config transform appended), the first under an ODBC
+    // `Driver`. Not the URL parsers' first-wins, whose reason — the authority
+    // beats a query parameter — a flat keyword list does not have.
+    let first_wins = keys.iter().any(|k| k == "driver");
+    let set = |dst: &mut String, v: &str| {
+        if first_wins {
+            set_if_empty(dst, v)
+        } else {
+            *dst = v.to_string()
+        }
+    };
+    let mut trust_seen = false;
     for (k, v) in props {
         if v.is_empty() {
             continue;
         }
         match normalize_key(&k).as_str() {
-            "server" | "datasource" | "address" | "addr" | "networkaddress" => {
-                set_if_empty(&mut server, &v)
+            "server" | "datasource" | "address" | "addr" | "networkaddress" => set(&mut server, &v),
+            "database" | "initialcatalog" => set(&mut c.database, &v),
+            "userid" | "uid" | "user" | "username" => set(&mut c.user, &v),
+            "password" | "pwd" => set(&mut c.password, &v),
+            "encrypt" if !(first_wins && encrypt.is_some()) => encrypt = Some(normalize_key(&v)),
+            "trustservercertificate" if !(first_wins && trust_seen) => {
+                trust = truthy(&v);
+                trust_seen = true;
             }
-            "database" | "initialcatalog" => set_if_empty(&mut c.database, &v),
-            "userid" | "uid" | "user" | "username" => set_if_empty(&mut c.user, &v),
-            "password" | "pwd" => set_if_empty(&mut c.password, &v),
-            "encrypt" => encrypt = Some(normalize_key(&v)),
-            "trustservercertificate" => trust = truthy(&v),
             key if sign_in.read(key, &v) => {}
             "driver" | "provider" if !names_sql_server_driver(&v) => {
                 return Err(UrlError::UnknownScheme(v));
@@ -3530,6 +3545,27 @@ mod tests {
             assert!(!row.has(ImportNote::ExternalLogin), "{sql}");
             assert_eq!(row.connection.password, "pw", "{sql}");
         }
+    }
+
+    /// **A repeated keyword keeps the value the driver would use**: the last
+    /// in ADO.NET and OLE DB (SqlClient's documented rule — a base string with
+    /// an override appended by a config transform), the first under an ODBC
+    /// `Driver`, whose rule is the opposite. Every arm kept the first, so the
+    /// row connected somewhere, or as someone, the application did not.
+    #[test]
+    fn a_repeated_keyword_keeps_the_value_its_driver_uses() {
+        let c = url("Server=h;Password=first;Password=second;User Id=u");
+        assert_eq!(c.password, "second");
+        let c = url("Server=a;Database=one;User Id=u;Server=b;Database=two;User Id=v");
+        assert_eq!(
+            (c.host.as_str(), c.database.as_str(), c.user.as_str()),
+            ("b", "two", "v")
+        );
+        let c = url("Provider=MSOLEDBSQL19;Data Source=a;Data Source=b");
+        assert_eq!(c.host, "b");
+        let c =
+            url("Driver={ODBC Driver 18 for SQL Server};Server=a;PWD=first;Server=b;PWD=second");
+        assert_eq!((c.host.as_str(), c.password.as_str()), ("a", "first"));
     }
 
     /// **A connection string is SQL Server's only when it says so.** MySQL's
