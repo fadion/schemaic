@@ -17445,8 +17445,17 @@ existing prose was left alone.
     written `[dbo].[t]`: `default_schema` asks `schema::default_namespace` — `public`, `dbo`, or
     `None` where there is no namespace level — where it had compared `!= Postgres`, and so sent the
     statement out unqualified on SQL Server, landing in the *login's* default schema, which for a
-    login mapped with `DEFAULT_SCHEMA = sales` is not the `dbo` the row stands for. A loaded schema
-    with no namespaces still answers `None`.
+    login mapped with `DEFAULT_SCHEMA = sales` is not the `dbo` the row stands for. **The dialect
+    alone decides it now**, and `default_schema` takes `ConnUi` alone. It used to be refined by the
+    loaded schema — `None` whenever `DbSchema::schemas()` came back empty, read as "this database
+    has no namespace level" — but that list is derived from the objects, so it is empty for *any*
+    database with none yet, while a SQL Server or PostgreSQL database always has its default
+    namespace. On an empty SQL Server database Create ▸ Table went out unqualified into the login's
+    default schema all the same (review finding S3.1-L1-03, measured with a user mapped
+    `DEFAULT_SCHEMA = sales`) — the first table of a new database, the likeliest one to be created
+    there — and a table comment in the same draft failed the plan instead, the comment naming
+    `dbo`. No test can reach the branch that went, which lived in the view; the decision is
+    `default_namespace`'s now, pinned by `default_namespace_names_each_engines_own`.
     **Off `whole_ui_gate`'s list, 4 to zero, and the last four were the three opening paths and the
     overlay.** Those three write across `ddl`, `schema` and the peer editors, so they name all
     three — `open_for_table(ConnUi, SchemaUi, DdlUi, …)`, and the same for `preview_draft_edit` and
@@ -17628,11 +17637,12 @@ existing prose was left alone.
     `routine_editor.rs`, `event_editor.rs` and `object_editor.rs`'s doors went rather than the way
     the five `…Ctx` modals did: **a door names the fetch it ends in**, so `open_for_view` takes
     `(ConnUi, SchemaUi, DdlUi, &ViewAlgoFn)` and the `fetch_algorithm` it ends in takes `(DdlUi,
-    &ViewAlgoFn, …)`, while `open_for_new` and `open_blank` take `(ConnUi, DdlUi)`,
-    `open_from_query` that plus the `SchemaUi` `default_schema` asks, and `open_editor` takes
-    `DdlUi` alone. A `ViewCtx` would have been the wrong answer here: these are not one modal's
-    views sharing a body of state, they are four separate entry points into it, and **three of the
-    four want no fetch at all** — a ctx would have handed the `ViewAlgoFn` to every one of them,
+    &ViewAlgoFn, …)`, while `open_for_new`, `open_blank` and `open_from_query` take `(ConnUi,
+    DdlUi)` — `open_from_query` took the `SchemaUi` too until `default_schema` stopped reading the
+    tree (under `table_designer.rs`) — and `open_editor` takes `DdlUi` alone. A `ViewCtx` would
+    have been the wrong answer here: these are not one modal's views sharing a body of state, they
+    are four separate entry points into it, and **three of the four want no fetch at all** — a ctx
+    would have handed the `ViewAlgoFn` to every one of them,
     which is the widening-dressed-as-a-convenience the `import_view.rs` entry already names, in its
     other form. Nothing about the modal's behaviour moved with it: on MariaDB a view's **Edit view**
     still opens with its body, check option, SQL security and definer, and the footer still reads
@@ -20298,8 +20308,10 @@ existing prose was left alone.
     spelling of the same `db_nodes` walk in a file that would then have to be kept in step with
     this one. `edit_ctx`, by contrast, reads `ui.conn.active_conn` and `ui.conn.connections` and
     touches the schema tree not at all, so it takes `ConnUi`;
-    `default_schema(conn: ConnUi, ui: SchemaUi, database: &str)` takes both, because it asks
-    `edit_ctx` for the dialect and then the tree whether the database's namespaces loaded.
+    `default_schema(conn: ConnUi, ui: SchemaUi, database: &str)` took both, because it asked
+    `edit_ctx` for the dialect and then the tree whether the database's namespaces loaded — and it
+    has since joined `edit_ctx` on `ConnUi` alone, the tree half having answered `None` for any
+    database with no objects yet (under `table_designer.rs`).
     What had held `edit_ctx` back was its **39 call
     sites** — the count, not the shape.
     **The narrowing propagated, and that is the real lesson of that pass** — the lesson
@@ -20510,8 +20522,8 @@ existing prose was left alone.
     went: **a door names the fetch it ends in**. `open_for_view` takes `(ConnUi, SchemaUi, DdlUi,
     &ViewAlgoFn)` and `fetch_algorithm(DdlUi, &ViewAlgoFn, …)` — the one function in the module that
     reaches the server — while `open_for_new` and `open_blank` take `(ConnUi, DdlUi)`,
-    `open_from_query` that plus the `SchemaUi` `default_schema` asks, and `open_editor` takes
-    `DdlUi`. A `ViewCtx` would have handed the `ViewAlgoFn` to all four doors: these are not one
+    `open_from_query` took that plus the `SchemaUi` `default_schema` then asked (the same pair
+    since `default_schema` stopped reading the tree), and `open_editor` takes `DdlUi`. A `ViewCtx` would have handed the `ViewAlgoFn` to all four doors: these are not one
     modal's views sharing a body of state, they are four separate entry points into it, and three of
     the four want no fetch at all — the "widening dressed as a convenience" `import_view.rs` already
     names, in its other form. **So a ctx is for a modal's *body*, where the same bundles are wanted

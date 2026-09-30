@@ -8886,7 +8886,7 @@ fn center(ui: Ui) -> impl IntoView {
         let ui = ui.clone();
         Rc::new(move |select: String| {
             if let Some(db) = active_db.get_untracked() {
-                view_editor::open_from_query(ui.conn, ui.schema, ui.ddl, &db, &select);
+                view_editor::open_from_query(ui.conn, ui.ddl, &db, &select);
             }
         })
     };
@@ -15693,7 +15693,8 @@ mod whole_ui_gate {
         //
         // 10 → 4: the six **shared readers** other modules call — `db_flavour`,
         // `loaded_table`, `loaded_schema` and `table_names` on `SchemaUi`,
-        // `edit_ctx` on `ConnUi`, `default_schema` on both — which is what the
+        // `edit_ctx` on `ConnUi`, `default_schema` on both (now on `ConnUi`
+        // alone, since it stopped reading the tree) — which is what the
         // entry above had put off as a change to shared helpers rather than to
         // this file. It is, and it took two *other* entries down with it —
         // `object_editor.rs` 5 → 4 and `trigger_editor.rs` 8 → 7 — because
@@ -15766,8 +15767,8 @@ mod whole_ui_gate {
         // have been the wrong answer here and the contrast is the point: these
         // are not one modal's views sharing a body of state, they are four
         // separate entry points into it, and three of the four want no fetch at
-        // all — `open_for_new` and `open_blank` take `(ConnUi, DdlUi)`,
-        // `open_from_query` that plus `SchemaUi`. A ctx would have handed the
+        // all — `open_for_new`, `open_blank` and `open_from_query` take
+        // `(ConnUi, DdlUi)`. A ctx would have handed the
         // `ViewAlgoFn` to every one of them.
         //
         // **`widgets.rs`'s entry was here, and what it said is why the sweep

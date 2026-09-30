@@ -183,14 +183,8 @@ pub(crate) fn open_for_new(conn: ConnUi, d: DdlUi, database: &str, schema: Optio
 ///
 /// The namespace comes from [`crate::table_designer::default_schema`], the same answer
 /// the tree's own Create view gives on a database node.
-pub(crate) fn open_from_query(
-    conn: ConnUi,
-    schema_ui: SchemaUi,
-    d: DdlUi,
-    database: &str,
-    select: &str,
-) {
-    let schema = crate::table_designer::default_schema(conn, schema_ui, database);
+pub(crate) fn open_from_query(conn: ConnUi, d: DdlUi, database: &str, select: &str) {
+    let schema = crate::table_designer::default_schema(conn);
     open_blank(conn, d, database, schema.as_deref(), select);
 }
 

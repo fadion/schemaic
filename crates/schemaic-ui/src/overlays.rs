@@ -1787,11 +1787,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     // their own node), so a new
                     // table lands where the tree says it will.
                     {
-                        let ns = crate::table_designer::default_schema(
-                            import_ui.conn,
-                            import_ui.schema,
-                            &menu.name,
-                        );
+                        let ns = crate::table_designer::default_schema(import_ui.conn);
                         entries.extend(create_submenu(
                             import_ui.conn,
                             import_ui.schema,

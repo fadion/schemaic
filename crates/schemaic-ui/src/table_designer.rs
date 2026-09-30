@@ -285,12 +285,12 @@ pub(crate) fn loaded_schema(
     })
 }
 
-/// The namespace a *new* object in `database` should land in: `public` on
+/// The namespace a *new* object on a database row should land in: `public` on
 /// PostgreSQL, `dbo` on SQL Server, `None` on MySQL (which has no level between
 /// database and table) — [`schemaic_core::schema::default_namespace`].
 ///
-/// **Derived from the dialect, refined by the loaded schema.** It used to be
-/// read off the loaded schema alone, on the grounds that this is the same
+/// **Derived from the dialect.** It used to be read off the loaded schema
+/// alone, on the grounds that this is the same
 /// question the tree answers by *showing* namespace nodes — but that made it
 /// answer `None` for a PostgreSQL database whose schema was still `Loading`, or
 /// had `Failed`, which is permanent. The statement then went out unqualified:
@@ -301,21 +301,16 @@ pub(crate) fn loaded_schema(
 /// entries in exactly the state where it couldn't say which namespace they
 /// targeted.
 ///
-/// The loaded schema still refines it, and that is worth keeping: a PostgreSQL
-/// database really does report its namespaces, and `schemas()` being empty is a
-/// genuine "this database has no namespace level" rather than "not looked yet".
-pub(crate) fn default_schema(conn: ConnUi, ui: SchemaUi, database: &str) -> Option<String> {
-    let namespace = schemaic_core::schema::default_namespace(edit_ctx(conn).dialect)?;
-    let loaded_without_namespaces = ui.db_nodes.with_untracked(|nodes| {
-        nodes
-            .iter()
-            .find(|n| n.database == database)
-            .is_some_and(|n| match n.schema.get_untracked() {
-                schemaic_core::schema::SchemaState::Loaded(s) => s.schemas().is_empty(),
-                _ => false,
-            })
-    });
-    (!loaded_without_namespaces).then(|| namespace.to_string())
+/// **The dialect alone decides it now.** The loaded schema used to refine it —
+/// `None` whenever [`DbSchema::schemas`](schemaic_core::schema::DbSchema::schemas)
+/// came back empty, read as "this database has no namespace level" — but that
+/// list is derived from the objects, so it is empty for *any* database with
+/// none yet, and a database of either engine always has its default namespace.
+/// On an empty SQL Server database Create ▸ Table went out unqualified and
+/// landed in the login's default schema (S3.1-L1-03) — the first table of a
+/// new database, the likeliest one to create there.
+pub(crate) fn default_schema(conn: ConnUi) -> Option<String> {
+    schemaic_core::schema::default_namespace(edit_ctx(conn).dialect).map(str::to_string)
 }
 
 /// Every table name in a database, for the foreign-key target picker. Views are
