@@ -1514,6 +1514,7 @@ pub fn plan(
     // trigger names its function, which has to exist first). `mysqldump`
     // writes triggers after the data for the same reason.
     let mut triggers: Vec<String> = Vec::new();
+    let mut held_checks: Vec<String> = Vec::new();
     for &i in &order {
         let t = &schema.tables[i];
         // The per-table header, and the site an attacker controls most cheaply —
@@ -1540,7 +1541,12 @@ pub fn plan(
                     drop_cascade(dialect)
                 ));
             }
-            text!(t.create_ddl(dialect));
+            // What must wait for the rows — SQL Server's disabled and untrusted
+            // checks, which go back `WITH NOCHECK` and would refuse the rows
+            // that violate them — is held for the section after the data.
+            let (create, held) = t.create_ddl_holding(dialect);
+            text!(create);
+            held_checks.extend(held);
             // **Through the shared client wrapper**, which is what puts
             // `DELIMITER` around a compound body on MySQL. Written raw, the file
             // died at the first `BEGIN … END` trigger with ERROR 1064 — after the
@@ -1638,6 +1644,12 @@ pub fn plan(
     if !triggers.is_empty() {
         steps.push(DumpStep::Text("-- Triggers".to_string()));
         steps.extend(triggers.into_iter().map(DumpStep::Text));
+    }
+
+    // ── Checks that were off, once the rows they spared are in ───────────────
+    if !held_checks.is_empty() {
+        steps.push(DumpStep::Text("-- Checks".to_string()));
+        steps.extend(held_checks.into_iter().map(DumpStep::Text));
     }
 
     // ── Foreign keys, once every table is filled ─────────────────────────────
@@ -3492,6 +3504,57 @@ mod tests {
         ));
         assert!(
             !file.contains("\nGO") && !file.contains("IDENTITY_INSERT"),
+            "{file}"
+        );
+    }
+
+    /// **A check or key that was off in the source is put back off, after the
+    /// rows.** SQL Server keeps a disabled or untrusted constraint over rows
+    /// that violate it; restated as an ordinary one the restore stopped at
+    /// those rows (Msg 547), and restated before them an untrusted check —
+    /// still enforced for new rows — refused them all the same.
+    #[test]
+    fn a_sql_server_constraint_that_was_off_is_restated_off_after_the_rows() {
+        let mut parent = table("parent");
+        parent.schema = Some("dbo".to_string());
+        let mut child = refs(table("child"), "parent");
+        child.schema = Some("dbo".to_string());
+        child.foreign_keys[0].not_enforced = true;
+        child.foreign_keys[0].not_validated = true;
+        child.check_constraints.push(crate::schema::CheckInfo {
+            name: "ck_id".to_string(),
+            expression: "[id]>(0)".to_string(),
+            enforced: true,
+            validated: false,
+            inherited: false,
+            column_level: false,
+        });
+        let s = schema_of(vec![parent, child]);
+        let file = file_of(&plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::MsSql,
+        ));
+        let rows = pos(&file, "<<rows child:");
+        let create = pos(&file, "CREATE TABLE [dbo].[child]");
+        assert!(!file[create..rows].contains("ck_id"), "{file}");
+        let check = pos(
+            &file,
+            "ALTER TABLE [dbo].[child] WITH NOCHECK ADD CONSTRAINT [ck_id] CHECK ([id]>(0));",
+        );
+        assert!(rows < check, "{file}");
+        let fk = pos(
+            &file,
+            "ALTER TABLE [dbo].[child] WITH NOCHECK ADD CONSTRAINT [fk_child_parent]",
+        );
+        assert!(rows < fk, "{file}");
+        assert!(
+            pos(
+                &file,
+                "ALTER TABLE [dbo].[child] NOCHECK CONSTRAINT [fk_child_parent];"
+            ) > fk,
             "{file}"
         );
     }

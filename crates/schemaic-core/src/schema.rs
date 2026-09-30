@@ -439,6 +439,21 @@ pub struct ForeignKeyInfo {
     /// engine and a silent drop on another, because the model had no field for
     /// either side to read.
     pub deferrable: Option<String>,
+    /// **SQL Server's disabled key** (`sys.foreign_keys.is_disabled`,
+    /// `ALTER TABLE … NOCHECK CONSTRAINT`): declared, and not checked. `false`
+    /// — the zero value, so every hand-built key is an ordinary one — on every
+    /// engine that has no such state.
+    ///
+    /// Carried because the server keeps a disabled key over rows that violate
+    /// it, and a key restated as an ordinary one validates them: a dump's
+    /// closing `ADD CONSTRAINT` failed over those rows (Msg 547) and the
+    /// restore stopped there.
+    pub not_enforced: bool,
+    /// **SQL Server's untrusted key** (`is_not_trusted`): enforced for new
+    /// rows, but added (or re-enabled) `WITH NOCHECK`, so the rows already
+    /// there were never validated and some may violate it. `false` on every
+    /// engine that does not report the state, for the reason `not_enforced` is.
+    pub not_validated: bool,
 }
 
 /// Backtick-quote a SQL identifier, doubling any embedded backtick.
@@ -4940,7 +4955,12 @@ impl TableInfo {
         // constraints, `AS (…) PERSISTED`, no `KEY` inline — so it has its own
         // emitter rather than a branch per clause through the MySQL one.
         match dialect {
-            crate::intel::SqlDialect::MsSql => return self.tsql_create_ddl(),
+            crate::intel::SqlDialect::MsSql => {
+                return std::iter::once(self.tsql_create_ddl())
+                    .chain(self.tsql_held_checks())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+            }
             crate::intel::SqlDialect::MySql
             | crate::intel::SqlDialect::Postgres
             | crate::intel::SqlDialect::Sqlite => {}
@@ -5090,6 +5110,52 @@ impl TableInfo {
             }
             format!("CREATE TABLE {qname} (\n{}\n);", lines.join(",\n"))
         }
+    }
+
+    /// [`Self::create_ddl`] split in two, for a file that loads the table's
+    /// rows in between: what creates the table, and the statements that must
+    /// wait until its rows are in. `create_ddl` is the two joined.
+    ///
+    /// **SQL Server's disabled and untrusted checks are the held half** — the
+    /// server keeps one over rows that violate it, so it goes back `WITH
+    /// NOCHECK` (and `NOCHECK CONSTRAINT` when disabled), and an untrusted one
+    /// is still enforced for every row inserted after it: added before the
+    /// dump's rows it refused them (Msg 547). Every other engine holds nothing
+    /// back here.
+    pub fn create_ddl_holding(&self, dialect: crate::intel::SqlDialect) -> (String, Vec<String>) {
+        match dialect {
+            crate::intel::SqlDialect::MsSql => (self.tsql_create_ddl(), self.tsql_held_checks()),
+            crate::intel::SqlDialect::MySql
+            | crate::intel::SqlDialect::Postgres
+            | crate::intel::SqlDialect::Sqlite => (self.create_ddl(dialect), Vec::new()),
+        }
+    }
+
+    /// The `ALTER TABLE`s that put back a SQL Server check which is disabled
+    /// or untrusted, as it was — see [`Self::create_ddl_holding`]. Through
+    /// [`crate::ddl::ChangeSet::emit`], whose `AddCheck` arm the rebuild
+    /// already restates such a check with, not a second spelling of it.
+    fn tsql_held_checks(&self) -> Vec<String> {
+        if self.is_view {
+            return Vec::new();
+        }
+        let held: Vec<crate::ddl::Change> = self
+            .check_constraints
+            .iter()
+            .filter(|ck| !(ck.enforced && ck.validated))
+            .map(|ck| crate::ddl::Change::AddCheck(Box::new(ck.clone())))
+            .collect();
+        if held.is_empty() {
+            return Vec::new();
+        }
+        crate::ddl::ChangeSet {
+            table: self.name.clone(),
+            schema: self.schema.clone(),
+            dialect: crate::intel::SqlDialect::MsSql,
+            flavour: ServerFlavour::Unknown,
+            changes: held,
+        }
+        .emit()
     }
 
     /// [`Self::create_ddl`] for SQL Server — what its own tools call *Script
@@ -5258,7 +5324,13 @@ impl TableInfo {
                 ix.key_sql(d)
             ));
         }
-        for ck in &self.check_constraints {
+        // Only a check that is on and trusted goes inline; one that is not is
+        // restated after the table, as it was (`tsql_held_checks`).
+        for ck in self
+            .check_constraints
+            .iter()
+            .filter(|ck| ck.enforced && ck.validated)
+        {
             lines.push(format!(
                 "  CONSTRAINT {} CHECK ({})",
                 q(&ck.name),
@@ -8770,6 +8842,66 @@ mod tests {
             "{ddl}"
         );
         assert!(ddl.contains("  [j] AS ([a]+(1))\n"), "{ddl}");
+    }
+
+    /// **A disabled or untrusted SQL Server check is added after the table,
+    /// as it was.** Written inside the `CREATE TABLE` it was enforced over
+    /// every row that followed, so a table holding rows the check had been
+    /// switched off for could not be restored (Msg 547), and where none did the
+    /// copy silently enforced a check the original did not. It goes back the
+    /// way the rebuild puts one back: `WITH NOCHECK ADD`, then `NOCHECK
+    /// CONSTRAINT` for a disabled one.
+    #[test]
+    fn a_sql_server_check_that_is_off_is_added_after_the_table_as_it_was() {
+        let ck = |name: &str, enforced: bool, validated: bool| CheckInfo {
+            name: name.into(),
+            expression: "[a]>(0)".into(),
+            enforced,
+            validated,
+            inherited: false,
+            column_level: false,
+        };
+        let t = TableInfo {
+            schema: Some("dbo".into()),
+            name: "t".into(),
+            columns: vec![col("a", "int", false, false)],
+            check_constraints: vec![
+                ck("ck_on", true, true),
+                ck("ck_off", false, false),
+                ck("ck_untrusted", true, false),
+            ],
+            ..Default::default()
+        };
+        let ddl = t.create_ddl(crate::intel::SqlDialect::MsSql);
+        let body_end = ddl.find("\n);").expect("the CREATE TABLE");
+        let (body, after) = ddl.split_at(body_end);
+        assert!(body.contains("CONSTRAINT [ck_on] CHECK ([a]>(0))"), "{ddl}");
+        assert!(
+            !body.contains("ck_off") && !body.contains("ck_untrusted"),
+            "{ddl}"
+        );
+        assert!(
+            after.contains(
+                "ALTER TABLE [dbo].[t] WITH NOCHECK ADD CONSTRAINT [ck_off] CHECK ([a]>(0));\n\
+                 ALTER TABLE [dbo].[t] NOCHECK CONSTRAINT [ck_off];"
+            ),
+            "{ddl}"
+        );
+        assert!(
+            after.contains(
+                "ALTER TABLE [dbo].[t] WITH NOCHECK ADD CONSTRAINT [ck_untrusted] CHECK ([a]>(0));"
+            ),
+            "{ddl}"
+        );
+        assert!(
+            !after.contains("NOCHECK CONSTRAINT [ck_untrusted]"),
+            "an untrusted check is still enforced: {ddl}"
+        );
+        // The dump's split: the same statements, held apart from the table.
+        let (create, held) = t.create_ddl_holding(crate::intel::SqlDialect::MsSql);
+        assert!(!create.contains("NOCHECK"), "{create}");
+        assert_eq!(held.len(), 3, "{held:?}");
+        assert_eq!(format!("{create}\n{}", held.join("\n")), ddl);
     }
 
     /// **A view's header is rebuilt under the name the catalogue gives it**,

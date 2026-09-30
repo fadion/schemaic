@@ -4726,11 +4726,27 @@ impl ChangeSet {
                         self.key_list(to)
                     ));
                 }
+                // A key keeps what it was, as a check does below: an untrusted
+                // one goes back `WITH NOCHECK`, sparing the rows already there,
+                // and a disabled one is disabled again — re-added as an
+                // ordinary key it validated every row, and a dump's closing
+                // section failed over the rows the source had let through.
                 Change::AddForeignKey(fk) => {
+                    let nocheck = if fk.not_validated || fk.not_enforced {
+                        "WITH NOCHECK "
+                    } else {
+                        ""
+                    };
                     out.push(format!(
-                        "ALTER TABLE {q} ADD {};",
+                        "ALTER TABLE {q} {nocheck}ADD {};",
                         fk_clause(fk, self.schema.as_deref(), d)
                     ));
+                    if fk.not_enforced && !fk.name.is_empty() {
+                        out.push(format!(
+                            "ALTER TABLE {q} NOCHECK CONSTRAINT {};",
+                            ident(&fk.name)
+                        ));
+                    }
                 }
                 // A check keeps what it was: one added `WITH NOCHECK` (not
                 // trusted) is re-added so, sparing the rows already there, and

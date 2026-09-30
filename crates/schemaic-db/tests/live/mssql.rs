@@ -590,6 +590,79 @@ async fn a_plan_is_read_from_the_servers_showplan_and_changes_nothing() {
     ));
 }
 
+/// Take a dump of every table in `src` and render it as the app's writer
+/// does: text steps verbatim, each rows step streamed from `src` through the
+/// export renderer.
+async fn dump_file(src: &Scratch, opts: schemaic_core::dump::DumpOptions) -> String {
+    use schemaic_core::dump::{DumpStep, plan};
+    let schema = Box::pin(src.db.fetch_schema(&src.name, CancellationToken::new()))
+        .await
+        .expect("the schema");
+    let chosen: Vec<String> = schema
+        .tables
+        .iter()
+        .map(|t| schemaic_core::schema::display_name(t.schema.as_deref(), &t.name))
+        .collect();
+    let dump = plan(&schema, &src.name, &chosen, opts, MS);
+    let mut file = String::new();
+    for step in dump.steps {
+        match step {
+            DumpStep::Text(sql) => {
+                file.push_str(&sql);
+                file.push_str("\n\n");
+            }
+            DumpStep::Rows {
+                database,
+                insert_database,
+                schema,
+                table,
+                select,
+            } => {
+                let rs = Box::pin(src.db.fetch_query(
+                    Some(&database),
+                    &select,
+                    10_000,
+                    CancellationToken::new(),
+                ))
+                .await
+                .expect("the rows");
+                let order: Vec<usize> = (0..rs.row_count()).collect();
+                let mut out = Vec::new();
+                schemaic_core::export::export_inserts_to(
+                    &mut out,
+                    &rs,
+                    &order,
+                    Some((&insert_database, schema.as_deref(), &table)),
+                    MS,
+                )
+                .unwrap();
+                file.push_str(&String::from_utf8(out).unwrap());
+                file.push('\n');
+            }
+        }
+    }
+    file
+}
+
+/// Run `file` into `dst` the way the app's Run file does: cut by the script
+/// splitter, drained by `run_script` on one connection.
+async fn restore_file(dst: &Scratch, file: &str) -> schemaic_core::script::ExecEnd {
+    let mut splitter = schemaic_core::script::Splitter::new(MS);
+    let mut stmts = splitter.push_str(file);
+    stmts.extend(splitter.finish());
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let feed = tokio::spawn(async move {
+        for s in stmts {
+            if tx.send(s).await.is_err() {
+                break;
+            }
+        }
+    });
+    let (end, _) = Box::pin(dst.db.run_script(&dst.name, rx, CancellationToken::new())).await;
+    feed.await.unwrap();
+    end
+}
+
 /// **A dump restores into an empty database as the one it was taken from**:
 /// `core::dump`'s file, its rows rendered by the export renderer as the app's
 /// writer renders them, cut at its `GO` lines by the script splitter and run by
@@ -598,7 +671,7 @@ async fn a_plan_is_read_from_the_servers_showplan_and_changes_nothing() {
 /// own, and the rowversion and computed column are the server's again.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_dump_restores_into_an_empty_database() {
-    use schemaic_core::dump::{DumpOptions, DumpStep, plan};
+    use schemaic_core::dump::DumpOptions;
     if !enabled() || azure_cannot("restores into a second database, which it has not got") {
         return;
     }
@@ -635,6 +708,20 @@ async fn a_dump_restores_into_an_empty_database() {
     .await;
     src.exec("CREATE VIEW dbo.v_orders AS SELECT o.id, c.name FROM dbo.orders o JOIN dbo.customers c ON c.id = o.customer_id")
         .await;
+    // Constraints switched off over rows that violate them: a disabled check
+    // and key, and a check re-enabled without validating (untrusted). Written
+    // as ordinary ones, the restore stopped at those rows (Msg 547).
+    src.exec(
+        "CREATE TABLE dbo.checked (id int PRIMARY KEY, a int, customer_id int, \
+           CONSTRAINT ck_pos CHECK (a > 0), CONSTRAINT ck_small CHECK (a < 100), \
+           CONSTRAINT fk_checked FOREIGN KEY (customer_id) REFERENCES dbo.customers(id)); \
+         ALTER TABLE dbo.checked NOCHECK CONSTRAINT ck_pos; \
+         ALTER TABLE dbo.checked NOCHECK CONSTRAINT ck_small; \
+         ALTER TABLE dbo.checked NOCHECK CONSTRAINT fk_checked; \
+         INSERT dbo.checked VALUES (1, -1, 999), (2, 150, NULL); \
+         ALTER TABLE dbo.checked CHECK CONSTRAINT ck_small;",
+    )
+    .await;
     // Floats a plain decimal cannot carry: T-SQL reads a literal with no
     // exponent as a `numeric`, which stops at 38 digits (Msg 1007).
     src.exec(
@@ -650,51 +737,7 @@ async fn a_dump_restores_into_an_empty_database() {
     src.exec("CREATE PROCEDURE dbo.p_count AS SELECT COUNT(*) FROM dbo.orders;")
         .await;
 
-    let schema = src
-        .db
-        .fetch_schema(&src.name, CancellationToken::new())
-        .await
-        .expect("the schema");
-    let chosen: Vec<String> = schema
-        .tables
-        .iter()
-        .map(|t| schemaic_core::schema::display_name(t.schema.as_deref(), &t.name))
-        .collect();
-    let dump = plan(&schema, &src.name, &chosen, DumpOptions::default(), MS);
-    let mut file = String::new();
-    for step in dump.steps {
-        match step {
-            DumpStep::Text(sql) => {
-                file.push_str(&sql);
-                file.push_str("\n\n");
-            }
-            DumpStep::Rows {
-                database,
-                insert_database,
-                schema,
-                table,
-                select,
-            } => {
-                let rs = src
-                    .db
-                    .fetch_query(Some(&database), &select, 10_000, CancellationToken::new())
-                    .await
-                    .expect("the rows");
-                let order: Vec<usize> = (0..rs.row_count()).collect();
-                let mut out = Vec::new();
-                schemaic_core::export::export_inserts_to(
-                    &mut out,
-                    &rs,
-                    &order,
-                    Some((&insert_database, schema.as_deref(), &table)),
-                    MS,
-                )
-                .unwrap();
-                file.push_str(&String::from_utf8(out).unwrap());
-                file.push('\n');
-            }
-        }
-    }
+    let file = Box::pin(dump_file(&src, DumpOptions::default())).await;
     assert!(
         file.contains("SET IDENTITY_INSERT [dbo].[customers] ON;"),
         "{file}"
@@ -706,80 +749,59 @@ async fn a_dump_restores_into_an_empty_database() {
     }
 
     let dst = Scratch::create("dumpdst").await;
-    let mut splitter = schemaic_core::script::Splitter::new(MS);
     // Restored by a session whose language reads a date day-first, as a
     // `british` (or German, French…) login's does: `datetime` reads
     // `2026-01-02 …` as the 1st of February there unless the file says how
     // its dates are written.
-    let mut stmts = splitter.push_str("SET LANGUAGE british;\nGO\n\n");
-    stmts.extend(splitter.push_str(&file));
-    stmts.extend(splitter.finish());
-    let (tx, rx) = tokio::sync::mpsc::channel(16);
-    let feed = tokio::spawn(async move {
-        for s in stmts {
-            if tx.send(s).await.is_err() {
-                break;
-            }
-        }
-    });
-    let (end, _) = dst
-        .db
-        .run_script(&dst.name, rx, CancellationToken::new())
-        .await;
-    feed.await.unwrap();
+    let end = Box::pin(restore_file(
+        &dst,
+        &format!("SET LANGUAGE british;\nGO\n\n{file}"),
+    ))
+    .await;
     assert!(
         matches!(end, schemaic_core::script::ExecEnd::Done),
         "{end:?}\n{file}"
     );
 
-    let rows = "SELECT CONCAT(id, '|', name, '|', CONVERT(varchar(30), seen, 121), '|', born, '|', \
-                paid, '|', twice, '|', CONVERT(varchar(30), dt, 121), '|', CONVERT(varchar(30), sdt, 120)) \
-                FROM dbo.customers ORDER BY id";
-    let both = |s: &Scratch| {
-        let db = s.db.clone();
-        let name = s.name.clone();
-        async move {
-            let rs = db
-                .fetch_query(Some(&name), rows, 100, CancellationToken::new())
-                .await
-                .unwrap();
-            (0..rs.row_count())
-                .map(|r| rs.cell(r, 0).unwrap().display().to_string())
-                .collect::<Vec<_>>()
-        }
-    };
-    let restored = both(&dst).await;
-    assert_eq!(restored, both(&src).await);
-    let floats = "SELECT STRING_AGG(CONCAT(id, '|', CONVERT(varchar(40), f, 3), '|', \
-                  CONVERT(varchar(40), r, 3)), ';') WITHIN GROUP (ORDER BY id) FROM dbo.floats";
-    assert_eq!(dst.scalar(floats).await, src.scalar(floats).await);
-    assert!(restored[1].starts_with("3|Zoë 'q'|"), "{restored:?}");
-    assert_eq!(
-        dst.scalar("SELECT COUNT(*) FROM sys.foreign_keys").await,
-        "1"
-    );
-    assert_eq!(dst.scalar("SELECT COUNT(*) FROM dbo.v_orders").await, "2");
-    assert_eq!(
-        dst.scalar("SELECT COUNT(*) FROM sys.triggers WHERE name = 'tr_orders'")
-            .await,
-        "1"
-    );
-    // The audit holds what the source's did — the trigger fired on none of
-    // the restored rows.
-    assert_eq!(
-        src.scalar("SELECT COUNT(*) FROM dbo.order_audit").await,
-        "2"
-    );
-    assert_eq!(
-        dst.scalar("SELECT COUNT(*) FROM dbo.order_audit").await,
-        "2"
-    );
-    assert_eq!(dst.scalar("SELECT dbo.f_double(21)").await, "42");
-    assert_eq!(
-        dst.scalar("SELECT COUNT(*) FROM sys.procedures WHERE name = 'p_count'")
-            .await,
-        "1"
-    );
+    // Everything the copy must agree with the source on, as one string per
+    // side — one query, not one `await` per fact: a debug build's poll frame
+    // grows with every await in the test, and this fixture keeps growing.
+    let facts = "SELECT STRING_AGG(CAST(f AS nvarchar(max)), NCHAR(10)) WITHIN GROUP (ORDER BY f) FROM ( \
+        SELECT CONCAT('customers|', id, '|', name, '|', CONVERT(varchar(30), seen, 121), '|', born, \
+               '|', paid, '|', twice, '|', CONVERT(varchar(30), dt, 121), '|', \
+               CONVERT(varchar(30), sdt, 120)) AS f FROM dbo.customers \
+        UNION ALL SELECT CONCAT('floats|', id, '|', CONVERT(varchar(40), f, 3), '|', \
+               CONVERT(varchar(40), r, 3)) FROM dbo.floats \
+        UNION ALL SELECT CONCAT('checked|', id, '|', a, '|', customer_id) FROM dbo.checked \
+        UNION ALL SELECT CONCAT('audit|', COUNT(*)) FROM dbo.order_audit \
+        UNION ALL SELECT CONCAT('v_orders|', COUNT(*)) FROM dbo.v_orders \
+        UNION ALL SELECT CONCAT('constraint|', name, ':', is_disabled, is_not_trusted) \
+               FROM sys.check_constraints \
+        UNION ALL SELECT CONCAT('constraint|', name, ':', is_disabled, is_not_trusted) \
+               FROM sys.foreign_keys \
+        UNION ALL SELECT CONCAT('trigger|', name) FROM sys.triggers \
+        UNION ALL SELECT CONCAT('procedure|', name) FROM sys.procedures \
+        UNION ALL SELECT CONCAT('f_double|', dbo.f_double(21)) \
+      ) x";
+    let (want, got) = (src.scalar(facts).await, dst.scalar(facts).await);
+    assert_eq!(got, want);
+    for fact in [
+        "customers|3|Zoë 'q'|",
+        // The audit holds what the source's did: the trigger fired on none of
+        // the restored rows.
+        "audit|2",
+        "v_orders|2",
+        // Each constraint is back in the state it was in, over the same rows.
+        "constraint|ck_pos:11",
+        "constraint|ck_small:01",
+        "constraint|fk_checked:11",
+        "checked|1|-1|999",
+        "trigger|tr_orders",
+        "procedure|p_count",
+        "f_double|42",
+    ] {
+        assert!(want.contains(fact), "{fact} in {want}");
+    }
     // The identity counts on past the highest key the file carried.
     dst.exec("INSERT dbo.customers (name) VALUES (N'next')")
         .await;

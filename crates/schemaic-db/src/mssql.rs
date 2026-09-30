@@ -1278,9 +1278,10 @@ const VIEW_INDEX_LISTING: &str = "SELECT s.name, v.name, i.name, \
 
 /// Every foreign key's column pairs, in key order, with its actions:
 /// `(schema, table, constraint, column, ref schema, ref table, ref column,
-/// delete action, update action)`.
+/// delete action, update action, disabled, not trusted)`.
 const FK_LISTING: &str = "SELECT s.name, t.name, fk.name, pc.name, rs.name, rt.name, rc.name, \
-            fk.delete_referential_action_desc, fk.update_referential_action_desc \
+            fk.delete_referential_action_desc, fk.update_referential_action_desc, \
+            CAST(fk.is_disabled AS int), CAST(fk.is_not_trusted AS int) \
      FROM sys.foreign_keys fk \
      JOIN sys.tables t ON t.object_id = fk.parent_object_id \
      JOIN sys.schemas s ON s.schema_id = t.schema_id \
@@ -1827,14 +1828,20 @@ async fn collect_schema(client: &mut MsClient) -> Result<DbSchema, DbError> {
             )
         })
         .collect();
-    // `(schema, table, constraint)` to `(on delete, on update)`.
-    type FkRules = HashMap<(String, String, String), (Option<String>, Option<String>)>;
+    // `(schema, table, constraint)` to `(on delete, on update, disabled, not
+    // trusted)`.
+    type FkRules = HashMap<(String, String, String), (Option<String>, Option<String>, bool, bool)>;
     let fk_rules: FkRules = fk_all
         .iter()
         .map(|r| {
             (
                 (cell(r, 0), cell(r, 1), cell(r, 2)),
-                (fk_action(&cell(r, 7)), fk_action(&cell(r, 8))),
+                (
+                    fk_action(&cell(r, 7)),
+                    fk_action(&cell(r, 8)),
+                    flag(r, 9),
+                    flag(r, 10),
+                ),
             )
         })
         .collect();
@@ -2002,11 +2009,14 @@ async fn collect_schema(client: &mut MsClient) -> Result<DbSchema, DbError> {
                 .cloned();
         }
         for fk in &mut t.foreign_keys {
-            if let Some((on_delete, on_update)) =
+            if let Some((on_delete, on_update, disabled, untrusted)) =
                 fk_rules.get(&(ns.clone(), t.name.clone(), fk.name.clone()))
             {
                 fk.on_delete = on_delete.clone();
                 fk.on_update = on_update.clone();
+                // Restated as they are — see `ForeignKeyInfo::not_enforced`.
+                fk.not_enforced = *disabled;
+                fk.not_validated = *untrusted;
             }
         }
     }

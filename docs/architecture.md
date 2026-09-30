@@ -3230,6 +3230,19 @@ existing prose was left alone.
     `create_sql` is `Some`** (`needs_fk_section`): SQLite's verbatim captured `CREATE TABLE` already
     carries the keys, and SQLite has no `ALTER TABLE … ADD CONSTRAINT` to restate them with. That
     question is asked of the *table*, never of the dialect — the data answers it directly.
+    **A constraint that was off in the source goes back off, after the rows.** SQL Server keeps a
+    disabled or untrusted check or key over rows that violate it; restated as an ordinary one the
+    restore stopped at those rows (Msg 547), and where none did the copy silently enforced what the
+    original had switched off. `ForeignKeyInfo::not_enforced`/`not_validated` carry the key's
+    state (`FK_LISTING` reads `is_disabled`/`is_not_trusted`; `false` on the engines with no such
+    state), and `ChangeSet::emit`'s SQL Server `AddForeignKey` arm restates it as its `AddCheck` arm
+    already did a check's — `WITH NOCHECK ADD`, then `NOCHECK CONSTRAINT` for a disabled one. The
+    check half is `TableInfo::create_ddl_holding`: the `CREATE TABLE` without such a check, and the
+    `ALTER TABLE`s that put it back, which `plan` writes in a `-- Checks` section after every table's
+    rows — an untrusted check is still enforced for new rows, so added before them it refused them
+    (`a_sql_server_constraint_that_was_off_is_restated_off_after_the_rows`; the live round trip
+    carries a disabled check and key and an untrusted check over violating rows and compares each
+    one's `is_disabled`/`is_not_trusted` on the copy).
     **And only a key whose target table is in the same file.** Exporting one table is a first-class
     action now — a table node's own *Export* — and `ALTER TABLE orders ADD CONSTRAINT … REFERENCES
     customers` in a file that never creates `customers` fails at restore: on PostgreSQL with no guard
@@ -12911,7 +12924,10 @@ existing prose was left alone.
   The rest of the engine's surface is in `core`: `TableInfo::create_ddl` has a T-SQL arm
   (`tsql_create_ddl` — the identity with the seed and increment `sys.identity_columns` reported,
   and `(1,1)` with a comment saying so only where they were not read, named primary-key and unique
-  constraints and their clustering (`create_ddl_sql_server_restates_clustering`), checks,
+  constraints and their clustering (`create_ddl_sql_server_restates_clustering`), checks — a
+  disabled or untrusted one not inline but after the table, `WITH NOCHECK ADD` and `NOCHECK
+  CONSTRAINT` through `ChangeSet::emit`, since inline it was enforced over the rows it had been
+  switched off for (`a_sql_server_check_that_is_off_is_added_after_the_table_as_it_was`) —,
   `AS (…) PERSISTED` — with the `NOT NULL` a persisted one may carry, as the designer's
   `tsql_definition` writes it, which the copy otherwise dropped and so took rows the original
   refused (`a_persisted_not_null_computed_column_keeps_its_not_null`) — other indexes as separate
