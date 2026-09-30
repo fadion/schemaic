@@ -28,8 +28,9 @@
 //! effort there went to types and views. A dump can't take that trade: a restore
 //! that silently drops every constraint is not a restore. So the file ends with a
 //! constraints section built from [`crate::ddl::ChangeSet::emit`], the emitter the
-//! apply path uses — not a second one. Triggers ride along with their table for
-//! the same reason.
+//! apply path uses — not a second one. Triggers are restated for the same
+//! reason, and for the same reason as the keys they come after the data: a
+//! trigger created before the rows fires on every one of them.
 //!
 //! That section is skipped for a table whose model carries **verbatim** DDL
 //! ([`crate::schema::TableInfo::create_sql`], which is SQLite's whole captured
@@ -1503,6 +1504,16 @@ pub fn plan(
     }
 
     // ── Each table: structure, then its rows ─────────────────────────────────
+    //
+    // **Its triggers are not written with it.** Created before the rows, every
+    // `INSERT` trigger fired once per restored row: an audit trigger appended a
+    // second copy of each audited row to a table the file had already filled,
+    // a stamping trigger rewrote every restored value, and the restore said
+    // nothing — on every engine. They are collected here, one set per table in
+    // file order, and written after the data and the routines (a PostgreSQL
+    // trigger names its function, which has to exist first). `mysqldump`
+    // writes triggers after the data for the same reason.
+    let mut triggers: Vec<String> = Vec::new();
     for &i in &order {
         let t = &schema.tables[i];
         // The per-table header, and the site an attacker controls most cheaply —
@@ -1542,9 +1553,11 @@ pub fn plan(
             // both servers refused it (`ERROR 3011` / `ERROR 4031`), after the
             // `DROP TABLE` above had already run. See
             // `TriggerInfo::with_resolvable_order`.
+            // **Held for the trailing section, not written here** — see
+            // `triggers` above.
             if !t.triggers.is_empty() {
                 let bodies = crate::schema::TriggerInfo::create_set_sql(&t.triggers, dialect);
-                text!(crate::ddl::client_script(&bodies, dialect));
+                triggers.push(crate::ddl::client_script(&bodies, dialect));
             }
         }
         // Named columns, never `*` — see [`dump_columns`]. A table the server
@@ -1619,6 +1632,12 @@ pub fn plan(
         // Through the client wrapper, so a MySQL compound body gets its
         // `DELIMITER` — the same rule the triggers above follow.
         steps.push(DumpStep::Text(crate::ddl::client_script(&ordered, dialect)));
+    }
+
+    // ── Triggers, once no restored row can fire them ─────────────────────────
+    if !triggers.is_empty() {
+        steps.push(DumpStep::Text("-- Triggers".to_string()));
+        steps.extend(triggers.into_iter().map(DumpStep::Text));
     }
 
     // ── Foreign keys, once every table is filled ─────────────────────────────
@@ -2992,6 +3011,43 @@ mod tests {
             SqlDialect::MySql,
         ));
         assert!(pos(&text, "CREATE TABLE") < pos(&text, "orders_ai"));
+    }
+
+    /// **A trigger is created after the rows it would fire on**, on every
+    /// engine. Created with its table, an `AFTER INSERT` audit trigger fired
+    /// once per restored row — the audit table ended up with its own dumped
+    /// rows plus a second copy of each, and a stamping trigger rewrote every
+    /// restored value — and the restore reported success. `mysqldump` writes
+    /// triggers after the data for the same reason.
+    #[test]
+    fn triggers_are_created_after_the_rows_they_would_fire_on() {
+        for d in [
+            SqlDialect::MySql,
+            SqlDialect::Postgres,
+            SqlDialect::Sqlite,
+            SqlDialect::MsSql,
+        ] {
+            let mut audit = table("audit");
+            let mut t = table("orders");
+            if d == SqlDialect::MsSql {
+                audit.schema = Some("dbo".to_string());
+                t.schema = Some("dbo".to_string());
+            }
+            t.triggers.push(TriggerInfo {
+                name: "orders_ai".to_string(),
+                schema: t.schema.clone(),
+                table: "orders".to_string(),
+                timing: TriggerTiming::After,
+                events: vec![TriggerEvent::Insert],
+                action: TriggerAction::Body("INSERT INTO audit VALUES (1)".to_string()),
+                ..Default::default()
+            });
+            let s = schema_of(vec![t, audit]);
+            let file = file_of(&plan(&s, "shop", &all(&s), DumpOptions::default(), d));
+            let trigger = pos(&file, "orders_ai");
+            assert!(pos(&file, "<<rows orders:") < trigger, "{d:?}: {file}");
+            assert!(pos(&file, "<<rows audit:") < trigger, "{d:?}: {file}");
+        }
     }
 
     // ── plan: the scaffolding, and the one composition that can be wrong ─────

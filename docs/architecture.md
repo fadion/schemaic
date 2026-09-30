@@ -3150,7 +3150,14 @@ existing prose was left alone.
     bottom, so the first `CREATE TRIGGER` named a trigger the file had not created yet and both
     servers refused it (`ERROR 3011` on MySQL 8.4.11, `ERROR 4031` on MariaDB 10.11.14) — after the
     `DROP TABLE` above it had already run against the target. `core::schema`'s entry has that rule in
-    full. Identifiers go through
+    full. **Each table's set is written in a trailing `-- Triggers` section, after every table's
+    rows and after the routines**, not beside its `CREATE TABLE`: created before the rows, an
+    `INSERT` trigger fired once per restored row on every engine — an audit trigger doubled its
+    audit table, a stamping trigger rewrote every restored value — and the restore reported success.
+    After the routines because a PostgreSQL trigger names its function, which must exist first.
+    `mysqldump` writes triggers after the data for the same reason
+    (`triggers_are_created_after_the_rows_they_would_fire_on`, over all four engines; the live
+    round trip's audit trigger restores an audit table of the source's size). Identifiers go through
     `export::ident_sql`/`qualified_table`, so a dump cannot quote differently from the SQL export.
     **The header's own comment lines are *escaped*, not quoted** — `export::comment_text`, and the
     two are different guarantees. Four lines here interpolate a schema-fetched name: the

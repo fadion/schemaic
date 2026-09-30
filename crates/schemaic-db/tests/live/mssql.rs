@@ -614,6 +614,15 @@ async fn a_dump_restores_into_an_empty_database() {
            customer_id int NOT NULL REFERENCES dbo.customers(id), note nvarchar(max))",
     )
     .await;
+    // An audit trigger, live before the rows: created before the restored
+    // rows, it fired once per row and doubled the audit table.
+    src.exec("CREATE TABLE dbo.order_audit (order_id int NOT NULL)")
+        .await;
+    src.exec(
+        "CREATE TRIGGER dbo.tr_orders ON dbo.orders AFTER INSERT AS \
+         SET NOCOUNT ON; INSERT dbo.order_audit (order_id) SELECT id FROM inserted;",
+    )
+    .await;
     src.exec(
         "INSERT dbo.customers (name, seen, born, paid, dt, sdt) VALUES \
            (N'Ann', '2026-01-02 03:04:05.678', '1990-05-06', 12.50, \
@@ -634,8 +643,6 @@ async fn a_dump_restores_into_an_empty_database() {
            (3, 1.2345678901234567e-30, 0.5)",
     )
     .await;
-    src.exec("CREATE TRIGGER dbo.tr_orders ON dbo.orders AFTER INSERT AS SET NOCOUNT ON")
-        .await;
     // A routine of each kind: the file used to close each one `GO;` + `GO`,
     // and the restore stopped at the first with Msg 102.
     src.exec("CREATE FUNCTION dbo.f_double (@x int) RETURNS int AS BEGIN RETURN @x * 2; END")
@@ -756,6 +763,16 @@ async fn a_dump_restores_into_an_empty_database() {
         dst.scalar("SELECT COUNT(*) FROM sys.triggers WHERE name = 'tr_orders'")
             .await,
         "1"
+    );
+    // The audit holds what the source's did — the trigger fired on none of
+    // the restored rows.
+    assert_eq!(
+        src.scalar("SELECT COUNT(*) FROM dbo.order_audit").await,
+        "2"
+    );
+    assert_eq!(
+        dst.scalar("SELECT COUNT(*) FROM dbo.order_audit").await,
+        "2"
     );
     assert_eq!(dst.scalar("SELECT dbo.f_double(21)").await, "42");
     assert_eq!(
