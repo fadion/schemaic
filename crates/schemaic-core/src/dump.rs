@@ -1082,6 +1082,119 @@ struct Emitted {
     /// The statement that removes it first, where the file drops what it
     /// recreates up front ([`drops_up_front`]) and the object is one it drops.
     drop: Option<String>,
+    /// A function — the one kind a table's expression or a view can call, so
+    /// the one [`routine_slots`] may move ahead of the tables.
+    function: bool,
+}
+
+/// Where each routine goes among the tables: `Some(k)` is "just before
+/// `order[k]`'s section" (`k == order.len()` after the last), `None` is the
+/// trailing routines section.
+///
+/// **A function a table or view calls is created before it.** SQL Server
+/// resolves one at `CREATE TABLE`/`CREATE VIEW` time, so a computed column, a
+/// check, a default or a view calling a function the file created afterwards
+/// stopped the restore (Msg 4121), and PostgreSQL resolves a default's and a
+/// view's function the same way. So a function a table's expressions or a
+/// view's definition name — and every function one of those calls, since it
+/// has to exist first — moves up, to just after the last table *it* names:
+/// the other half of the edge the trailing section exists for, a function
+/// reading a table that is not there yet (`check_function_bodies`). Where the
+/// two cannot both hold — a function reading a table whose own column calls
+/// it — the caller wins, since that is the statement that would fail.
+///
+/// Every other routine stays where it was, after the data. `routines` is
+/// already in dependency order among itself ([`order_by_mention`]), and names
+/// are matched as whole words in code, as that walk matches them.
+fn routine_slots(
+    routines: &[Emitted],
+    tables: &[TableInfo],
+    order: &[usize],
+    dialect: SqlDialect,
+) -> Vec<Option<usize>> {
+    // What each table's expressions and each view's definition say — the text
+    // a function has to exist for. Not the `CREATE`: a column named like a
+    // function is not a call.
+    let callers: Vec<String> = order
+        .iter()
+        .map(|&i| {
+            let t = &tables[i];
+            if t.is_view {
+                return t
+                    .create_sql
+                    .clone()
+                    .or_else(|| t.view_definition.clone())
+                    .unwrap_or_default();
+            }
+            let mut text: Vec<&str> = Vec::new();
+            for c in &t.columns {
+                text.extend(c.generated.as_deref());
+                text.extend(c.default.as_deref());
+            }
+            for ck in &t.check_constraints {
+                text.push(&ck.expression);
+            }
+            text.join("\n")
+        })
+        .collect();
+    // Each text lexed once, then asked about every name — `order_by_mention`'s
+    // rule, for its reason.
+    let caller_code: Vec<Vec<bool>> = callers
+        .iter()
+        .map(|t| crate::intel::code_mask(t, dialect))
+        .collect();
+    let body_code: Vec<Vec<bool>> = routines
+        .iter()
+        .map(|r| crate::intel::code_mask(&r.body, dialect))
+        .collect();
+    let caller_names = |k: usize, word: &str| {
+        !crate::intel::code_word_hits_in(&callers[k], &caller_code[k], word).is_empty()
+    };
+    let body_names = |i: usize, word: &str| {
+        !crate::intel::code_word_hits_in(&routines[i].body, &body_code[i], word).is_empty()
+    };
+    let n = routines.len();
+    // The latest slot each function may take: before the first table or
+    // view that calls it, then pulled earlier by every moved function that
+    // calls it — walked callers-first, which is `routines` reversed.
+    let mut latest: Vec<Option<usize>> = routines
+        .iter()
+        .map(|r| {
+            r.function
+                .then(|| (0..callers.len()).find(|&k| caller_names(k, &r.name)))
+                .flatten()
+        })
+        .collect();
+    for i in (0..n).rev() {
+        let Some(cap) = latest[i] else { continue };
+        for j in 0..i {
+            if routines[j].function && body_names(i, &routines[j].name) {
+                latest[j] = Some(latest[j].map_or(cap, |c| c.min(cap)));
+            }
+        }
+    }
+    // The earliest slot: after the last table or view it names, and after
+    // every moved function it calls.
+    let mut slots: Vec<Option<usize>> = vec![None; n];
+    for i in 0..n {
+        let Some(cap) = latest[i] else { continue };
+        let mut earliest = order
+            .iter()
+            .enumerate()
+            .filter(|&(_, &t)| body_names(i, &tables[t].name))
+            .map(|(k, _)| k + 1)
+            .max()
+            .unwrap_or(0);
+        for j in 0..i {
+            if let Some(s) = slots[j]
+                && body_names(i, &routines[j].name)
+            {
+                earliest = earliest.max(s);
+            }
+        }
+        slots[i] = Some(earliest.min(cap));
+    }
+    slots
 }
 
 /// The whole file, as steps.
@@ -1435,7 +1548,9 @@ pub fn plan(
     // tables, so it cannot be created until they do. With `check_function_bodies`
     // on — PostgreSQL's default — a `LANGUAGE sql` function naming a table that
     // is not there yet fails at `CREATE`, and the whole array used to be emitted
-    // ahead of the table loop.
+    // ahead of the table loop. **Except a function a table or view calls**,
+    // which has to exist before that table or view does — `routine_slots`
+    // moves it in just ahead of its first caller.
     // Carried with their names so the dependency walk below can edge one to
     // another; the strings alone said nothing about what they call.
     let mut routines: Vec<Emitted> = Vec::new();
@@ -1517,6 +1632,7 @@ pub fn plan(
                         },
                         sql,
                         drop,
+                        function: kind == ObjectKind::Function,
                     };
                     if after_tables {
                         routines.push(item);
@@ -1611,7 +1727,26 @@ pub fn plan(
     // writes triggers after the data for the same reason.
     let mut triggers: Vec<String> = Vec::new();
     let mut held_checks: Vec<String> = Vec::new();
-    for &i in &order {
+    // A function a table or view calls goes just before it — see
+    // `routine_slots`; `None` stays in the trailing section.
+    let slots = if opts.structure {
+        routine_slots(&routines, &schema.tables, &order, dialect)
+    } else {
+        vec![None; routines.len()]
+    };
+    let moved_to = |k: usize| -> Vec<String> {
+        routines
+            .iter()
+            .zip(&slots)
+            .filter(|(_, s)| **s == Some(k))
+            .map(|(r, _)| r.sql.clone())
+            .collect()
+    };
+    for (k, &i) in order.iter().enumerate() {
+        let moved = moved_to(k);
+        if !moved.is_empty() {
+            text!(crate::ddl::client_script(&moved, dialect));
+        }
         let t = &schema.tables[i];
         // The per-table header, and the site an attacker controls most cheaply —
         // see the header's `comment_text` note above.
@@ -1705,6 +1840,10 @@ pub fn plan(
             }
         }
     }
+    let moved = moved_to(order.len());
+    if !moved.is_empty() {
+        text!(crate::ddl::client_script(&moved, dialect));
+    }
 
     // ── Key counters, once the rows they have to clear are in ────────────────
     if opts.data {
@@ -1719,10 +1858,16 @@ pub fn plan(
     }
 
     // ── Routines and events, once the tables they read exist ─────────────────
-    if !routines.is_empty() {
+    // What nothing in the file calls; the rest went in ahead of their callers.
+    let ordered: Vec<String> = routines
+        .into_iter()
+        .zip(slots)
+        .filter(|(_, s)| s.is_none())
+        .map(|(r, _)| r.sql)
+        .collect();
+    if !ordered.is_empty() {
         steps.push(DumpStep::Text("-- Routines and events".to_string()));
         // Already ordered against each other, above the drops.
-        let ordered: Vec<String> = routines.into_iter().map(|r| r.sql).collect();
         // Through the client wrapper, so a MySQL compound body gets its
         // `DELIMITER` — the same rule the triggers above follow.
         steps.push(DumpStep::Text(crate::ddl::client_script(&ordered, dialect)));
@@ -4530,6 +4675,108 @@ mod tests {
             .expect("a routine section");
         let table_ddl = file.find("CREATE TABLE").expect("the table");
         assert!(table_ddl < routines, "{file}");
+    }
+
+    /// **A function a table or view calls is created before it.** SQL Server
+    /// resolves a function at `CREATE TABLE`/`CREATE VIEW` time, so a computed
+    /// column, a check, a default or a view calling one the file created later
+    /// stopped the restore (Msg 4121); PostgreSQL resolves a default's and a
+    /// view's function the same way. The function still comes after the tables
+    /// it reads, and one nothing calls stays in the trailing section.
+    #[test]
+    fn a_function_a_table_or_view_calls_is_created_before_it() {
+        let f = |name: &str, body: &str, schema: &str| {
+            std::sync::Arc::new(crate::schema::RoutineInfo {
+                name: name.to_string(),
+                schema: Some(schema.to_string()),
+                kind: crate::schema::RoutineKind::Function,
+                language: "sql".to_string(),
+                arguments: "@x int".to_string(),
+                returns: "int".to_string(),
+                body: body.to_string(),
+                ..Default::default()
+            })
+        };
+        // SQL Server: a computed column, a check and a view each call one.
+        let mut base = table("base");
+        base.schema = Some("dbo".to_string());
+        let mut calc = table("calc");
+        calc.schema = Some("dbo".to_string());
+        calc.columns.push(ColumnInfo {
+            name: "twice".to_string(),
+            generated: Some("[dbo].[f_double]([id])".to_string()),
+            ..Default::default()
+        });
+        calc.check_constraints.push(crate::schema::CheckInfo {
+            name: "ck".to_string(),
+            expression: "[dbo].[f_ok]([id])=(1)".to_string(),
+            enforced: true,
+            validated: true,
+            inherited: false,
+            column_level: false,
+        });
+        let mut v = view("v");
+        v.schema = Some("dbo".to_string());
+        v.create_sql =
+            Some("CREATE VIEW dbo.v AS SELECT dbo.f_view(id) AS n FROM dbo.base".to_string());
+        let mut s = schema_of(vec![base, calc, v]);
+        s.routines
+            .push(f("f_double", "BEGIN RETURN @x * 2; END", "dbo"));
+        s.routines.push(f("f_ok", "BEGIN RETURN 1; END", "dbo"));
+        // Reads `base`, so it waits for it, and the view waits for it.
+        s.routines.push(f(
+            "f_view",
+            "BEGIN RETURN (SELECT COUNT(*) FROM dbo.base WHERE id = @x); END",
+            "dbo",
+        ));
+        s.routines.push(f(
+            "f_unused",
+            "BEGIN RETURN (SELECT COUNT(*) FROM dbo.calc); END",
+            "dbo",
+        ));
+        let file = file_of(&plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::MsSql,
+        ));
+        let calc_at = pos(&file, "CREATE TABLE [dbo].[calc]");
+        assert!(
+            pos(&file, "CREATE FUNCTION [dbo].[f_double]") < calc_at,
+            "{file}"
+        );
+        assert!(
+            pos(&file, "CREATE FUNCTION [dbo].[f_ok]") < calc_at,
+            "{file}"
+        );
+        let f_view = pos(&file, "CREATE FUNCTION [dbo].[f_view]");
+        assert!(pos(&file, "CREATE TABLE [dbo].[base]") < f_view, "{file}");
+        assert!(f_view < pos(&file, "CREATE VIEW dbo.v"), "{file}");
+        assert!(
+            pos(&file, "-- Routines and events") < pos(&file, "CREATE FUNCTION [dbo].[f_unused]"),
+            "{file}"
+        );
+
+        // PostgreSQL: a table's default calls one that reads another table.
+        let mut a = table("a_src");
+        a.schema = Some("public".to_string());
+        let mut b = table("b_user");
+        b.schema = Some("public".to_string());
+        b.columns[0].default = Some("next_code()".to_string());
+        let mut s = schema_of(vec![a, b]);
+        s.routines
+            .push(f("next_code", "SELECT count(*) + 1 FROM a_src", "public"));
+        let file = file_of(&plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::Postgres,
+        ));
+        let func = pos(&file, "CREATE FUNCTION \"next_code\"");
+        assert!(pos(&file, "CREATE TABLE \"a_src\"") < func, "{file}");
+        assert!(func < pos(&file, "CREATE TABLE \"b_user\""), "{file}");
     }
 
     /// **And after the routines they call.**

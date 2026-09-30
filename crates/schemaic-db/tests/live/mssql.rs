@@ -736,6 +736,18 @@ async fn a_dump_restores_into_an_empty_database() {
         .await;
     src.exec("CREATE PROCEDURE dbo.p_count AS SELECT COUNT(*) FROM dbo.orders;")
         .await;
+    // A computed column, a check, a default and a view that call a function:
+    // SQL Server resolves it at CREATE TABLE/VIEW, and the file created every
+    // routine after the tables (Msg 4121).
+    src.exec(
+        "CREATE TABLE dbo.calc (id int PRIMARY KEY, dbl AS dbo.f_double(id), \
+           n int NOT NULL CONSTRAINT df_calc_n DEFAULT (dbo.f_double(4)), \
+           CONSTRAINT ck_calc CHECK (dbo.f_double(id) > 0)); \
+         INSERT dbo.calc (id) VALUES (1), (2);",
+    )
+    .await;
+    src.exec("CREATE VIEW dbo.v_double AS SELECT dbo.f_double(id) AS d FROM dbo.customers")
+        .await;
 
     let file = Box::pin(dump_file(&src, DumpOptions::default())).await;
     assert!(
@@ -782,6 +794,8 @@ async fn a_dump_restores_into_an_empty_database() {
         UNION ALL SELECT CONCAT('trigger|', name) FROM sys.triggers \
         UNION ALL SELECT CONCAT('procedure|', name) FROM sys.procedures \
         UNION ALL SELECT CONCAT('f_double|', dbo.f_double(21)) \
+        UNION ALL SELECT CONCAT('calc|', id, '|', dbl, '|', n) FROM dbo.calc \
+        UNION ALL SELECT CONCAT('v_double|', SUM(d)) FROM dbo.v_double \
       ) x";
     let (want, got) = (src.scalar(facts).await, dst.scalar(facts).await);
     assert_eq!(got, want);
@@ -799,6 +813,8 @@ async fn a_dump_restores_into_an_empty_database() {
         "trigger|tr_orders",
         "procedure|p_count",
         "f_double|42",
+        "calc|2|4|8",
+        "v_double|8",
     ] {
         assert!(want.contains(fact), "{fact} in {want}");
     }

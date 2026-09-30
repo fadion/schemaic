@@ -3472,7 +3472,18 @@ existing prose was left alone.
     `CREATE` that carries it**, and that is the part a tidy would get wrong: a PostgreSQL function's
     `CREATE` wraps its body in `$$ … $$`, which is exactly what `intel::code_mask` marks as *not*
     code — so asking the emitted statement finds nothing, every time, and the walk would be a no-op
-    that looked like a fix. The standalone-objects section
+    that looked like a fix. **`routine_slots` is the fourth, and the edge the other way.**
+    Routines go after the tables because a function reads them, but a table or view can call a
+    function too, and SQL Server resolves one at `CREATE TABLE`/`CREATE VIEW` time (PostgreSQL does
+    for a default and a view): a computed column, a check, a default or a view calling a function
+    the file created later stopped the restore (Msg 4121). So a function named by a table's
+    expressions (generated, default, check — not its `CREATE`, where a column named like a function
+    is no call) or a view's definition, and every function such a one calls, is written just ahead
+    of its first caller and after the last table or view it names itself; where both cannot hold,
+    the caller wins, being the statement that would fail. Every other routine stays in the trailing
+    section (`a_function_a_table_or_view_calls_is_created_before_it`, SQL Server and PostgreSQL; the
+    live round trip carries a table whose computed column, check and default call a function, and a
+    view that does). The standalone-objects section
     covers only the namespaces the chosen tables live in — a dump of `sales` has no business
     recreating `archive`'s types — and skips `ObjectItem::is_internal`, since a `serial`'s own
     sequence is created by the column's definition and restating it fails the load on a name that
