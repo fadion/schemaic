@@ -7095,7 +7095,12 @@ existing prose was left alone.
     tests are its only caller). The parameter half of `redacted` also spans separators now: ` ` is
     one of them, so an ODBC-shaped `Pwd = hunter2` — which the paste field invites — put its key, its
     `=` and its value in three different parts and never reached `split_once('=')` with the pair
-    together, while the unspaced `Password=hunter2` redacted correctly and hid that.
+    together, while the unspaced `Password=hunter2` redacted correctly and hid that. **A redacted
+    bare value runs to the next `;` or `&`, spaces included** (`in_value`): ADO.NET and ODBC values
+    are unquoted up to the `;`, so a space in a password is ordinary, and stopping at the first one
+    put `Password=… horse battery` in the not-imported list — for every `Transport`, `BadPort` or
+    unknown-driver refusal of such a string
+    (`a_password_holding_spaces_is_redacted_to_the_next_separator`).
     A driver this app has no engine for is `Skipped` **by name** rather than bent onto the nearest
     engine: a MySQL connection silently pointed at an Oracle server is a worse answer than an
     honest omission, and the modal says how many were left behind. DBeaver names its engine twice

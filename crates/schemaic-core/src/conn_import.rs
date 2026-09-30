@@ -530,8 +530,15 @@ fn redacted(name: &str) -> String {
     //
     // `awaiting` is "a password key has been seen and its value has not": set by
     // a bare `Pwd`, kept across a bare `=` or a `Pwd=` with nothing after it,
-    // and cleared by anything else — so `Pwd x y` redacts `x` and leaves `y`.
+    // and cleared by anything else.
     let mut awaiting = false;
+    // **Inside a bare secret that a space cut short** — `Password=correct horse
+    // battery`. ADO.NET and ODBC values are unquoted up to the `;`, so a space
+    // in a password is ordinary; the value was redacted to its first word and
+    // the rest shown in the not-imported list. Its parts are swallowed until
+    // one ends at a `;` or `&`, the separators that end a DSN's or a query's
+    // value.
+    let mut in_value = false;
     // **Inside a braced or quoted secret** — Microsoft's `password={a;b}`, or
     // ADO.NET's `Password="a;b"`, whose value runs to the first closer that is
     // not a doubled one, separators and all. Its parts are swallowed until that
@@ -550,6 +557,16 @@ fn redacted(name: &str) -> String {
             Some(c) => (&part[..part.len() - c.len_utf8()], Some(c)),
             None => (part, None),
         };
+        if in_value {
+            if let Some(c @ (';' | '&')) = sep {
+                in_value = false;
+                out.push(c);
+            }
+            continue;
+        }
+        // A redacted bare value that a space (or a `?`) cut short: the rest of
+        // it, up to the `;` or `&` that really ends it, is swallowed too.
+        let value_runs_on = !matches!(sep, None | Some(';' | '&'));
         match body.split_once('=') {
             Some((key, value)) => {
                 // An empty key is the `=` that follows a `Pwd` in the part before.
@@ -572,6 +589,10 @@ fn redacted(name: &str) -> String {
                         in_quote = Some(closer);
                         continue;
                     }
+                    if closer.is_none() && value_runs_on {
+                        in_value = true;
+                        continue;
+                    }
                 } else {
                     out.push_str(body);
                     awaiting = secret;
@@ -580,6 +601,10 @@ fn redacted(name: &str) -> String {
             None if awaiting && !body.trim().is_empty() => {
                 out.push('…');
                 awaiting = false;
+                if value_runs_on {
+                    in_value = true;
+                    continue;
+                }
             }
             None => {
                 out.push_str(body);
@@ -3741,6 +3766,47 @@ mod tests {
             }
             assert!(out.ends_with(";User Id=u"), "{raw} -> {out}");
         }
+    }
+
+    /// **A bare value runs to the next `;` or `&`, spaces included.** ADO.NET
+    /// and ODBC values are unquoted up to the `;`, so a space inside a password
+    /// is ordinary — and `redacted` stopped at the first one, so the
+    /// not-imported list showed `Password=… horse battery`.
+    #[test]
+    fn a_password_holding_spaces_is_redacted_to_the_next_separator() {
+        assert_eq!(
+            redacted("Server=x;Password=a b c;Database=d"),
+            "Server=x;Password=…;Database=d"
+        );
+        for raw in [
+            "Server=(localdb)\\MSSQLLocalDB;User Id=u;Password=correct horse battery",
+            "Server=h,notaport;User Id=u;Password=hunter2 staple x",
+            "Driver={MySQL ODBC 8.0 Driver};Server=h;Pwd=se cret;Database=d",
+            "Server=h;Pwd = two words;Database=d",
+        ] {
+            let out = redacted(raw);
+            for leak in ["horse", "battery", "staple", " x", "cret", "words"] {
+                assert!(!out.contains(leak), "{raw} -> {out}");
+            }
+        }
+        // Through `scan`, where the list is built.
+        let scan = parse_url_scan(
+            "Server=(localdb)\\MSSQLLocalDB;User Id=u;Password=correct horse battery",
+        );
+        let shown = format!(
+            "{} {}",
+            scan.skipped[0].name,
+            scan.skipped[0].reason.message()
+        );
+        assert!(
+            !shown.contains("horse") && !shown.contains("battery"),
+            "{shown}"
+        );
+        // A query parameter still ends at its `&`.
+        assert_eq!(
+            redacted("mysql://h/d?password=a b&ssl-mode=REQUIRED"),
+            "mysql://h/d?password=…&ssl-mode=REQUIRED"
+        );
     }
 
     /// **The reason is rendered beside the name and was never redacted.**
