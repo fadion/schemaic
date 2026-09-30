@@ -302,10 +302,16 @@ fn tokenize(sql: &str, dialect: SqlDialect) -> Vec<(Kind, &str)> {
             toks.push((Kind::Word, &sql[s..i]));
             continue;
         }
-        if is_word_byte(c) {
+        // **A T-SQL `@x`, `@@ROWCOUNT`, `#t` or `##g` is one word.** Left to
+        // the operator arm below, `@`/`#` became a `Punct` and `need_space`
+        // separated it from its name — `SELECT @ x` is Msg 137, `CREATE TABLE
+        // # t` Msg 102 — so one Format Code broke nearly every T-SQL script.
+        let prefix = crate::sql::t_sql_name_prefix(b, i, dialect);
+        if is_word_byte(c) || prefix > 0 {
             let s = i;
-            i += 1;
-            while i < n && is_word_byte(b[i]) {
+            i += prefix.max(1);
+            // `continues_name`, so `h#` and `f@x` stay whole on T-SQL.
+            while i < n && crate::sql::continues_name(b[i], dialect) {
                 i += 1;
             }
             // **A literal's prefix is part of the literal**, so the two are one
@@ -1399,5 +1405,37 @@ mod tests {
         // Elsewhere `go` is only a word.
         let mysql = super::format_sql("SELECT 1\nGO\n", IND, SqlDialect::MySql);
         assert!(!mysql.lines().any(|l| l == "GO"), "{mysql}");
+    }
+
+    /// **A T-SQL variable, system function or temporary table is one token.**
+    /// `@` and `#` fell to the operator arm, `need_space` separated them from
+    /// the name, and the formatted batch no longer compiled: `SELECT @ x` is
+    /// Msg 137, `SELECT @ @ VERSION` and `CREATE TABLE # t` are Msg 102
+    /// (measured on 2022). A name that *holds* one of these bytes — `h#`,
+    /// `f@x` — is one word too.
+    #[test]
+    fn a_t_sql_variable_or_temp_table_keeps_its_prefix() {
+        let d = SqlDialect::MsSql;
+        let sql = "select @x = @@ROWCOUNT, #t.a, ##g.b, dbo.h#(1), f@x from #t join ##g on 1=1; \
+                   DECLARE @s nvarchar(max) = N'x''y'; EXEC sp_executesql @s";
+        let out = super::format_sql(sql, IND, d);
+        for kept in [
+            "@x",
+            "@@ROWCOUNT",
+            "#t.a",
+            "##g.b",
+            "h#(1)",
+            "f@x",
+            "#t",
+            "##g",
+            "@s",
+        ] {
+            assert!(out.contains(kept), "{kept} split: {out}");
+        }
+        for split in ["@ ", "# "] {
+            assert!(!out.contains(split), "{split:?} in {out}");
+        }
+        assert_preserves(sql, d);
+        assert_eq!(crate::params::names(&out, d), crate::params::names(sql, d));
     }
 }

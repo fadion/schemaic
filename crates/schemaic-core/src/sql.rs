@@ -139,6 +139,13 @@ impl SqlDialect {
     pub(crate) fn batch_separator(self) -> bool {
         matches!(self, SqlDialect::MsSql)
     }
+
+    /// Do names take a `@`/`@@`/`#`/`##` prefix — a variable, a system
+    /// function, a temporary table? SQL Server only; see
+    /// [`t_sql_name_prefix`].
+    pub fn prefixed_names(self) -> bool {
+        matches!(self, SqlDialect::MsSql)
+    }
 }
 
 /// If `b[i..]` starts a comment, return the index just past it. Handles `--`
@@ -441,6 +448,48 @@ pub fn is_word_start(b: u8) -> bool {
 /// `a$$ … b$$` smuggle lived in.
 fn continues_dollar_name(b: u8) -> bool {
     is_word_byte(b) || b == b'$'
+}
+
+/// Can this byte continue a bare name on `dialect`, after its first byte?
+///
+/// [`is_word_byte`] plus each engine's extra continuation bytes: PostgreSQL's
+/// `$` ([`continues_dollar_name`]), and T-SQL's `$`, `#` and `@` — `dbo.h#`,
+/// `purge@now` and `v$as` are each one regular identifier there (measured on
+/// SQL Server 2022). MySQL and SQLite keep the plain word bytes.
+///
+/// Only a *continuation*: `@x` is a T-SQL variable and `#t` a temporary
+/// table, whose leading byte is a prefix rather than part of an ordinary
+/// word — [`t_sql_name_prefix`] measures those. The one definition every T-SQL
+/// scanner asks, so the read-only gate's call scan, the view header walk and
+/// the formatter cannot disagree about where a name ends — that disagreement
+/// is how `dbo.f@GETDATE()` reached the gate as a call to `GETDATE`.
+pub fn continues_name(b: u8, dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::Postgres => continues_dollar_name(b),
+        SqlDialect::MsSql => is_word_byte(b) || matches!(b, b'$' | b'#' | b'@'),
+        SqlDialect::MySql | SqlDialect::Sqlite => is_word_byte(b),
+    }
+}
+
+/// The length of a T-SQL name prefix at `b[i..]` — `@` (a variable), `@@` (a
+/// system function), `#` (a temporary table) or `##` (a global one) — when a
+/// name follows it; `0` otherwise, and always `0` on an engine whose names
+/// take no such prefix.
+///
+/// A prefix with no name after it (`a @ b`, `#` alone) is not one, so an
+/// operator a dialect spells with these bytes is left alone.
+pub fn t_sql_name_prefix(b: &[u8], i: usize, dialect: SqlDialect) -> usize {
+    if !dialect.prefixed_names() {
+        return 0;
+    }
+    let Some(&c) = b.get(i).filter(|&&c| c == b'@' || c == b'#') else {
+        return 0;
+    };
+    let len = if b.get(i + 1) == Some(&c) { 2 } else { 1 };
+    match b.get(i + len) {
+        Some(&n) if is_word_byte(n) => len,
+        _ => 0,
+    }
 }
 
 /// Is the `'` at `i` preceded by a standalone `E`/`e` prefix (not the tail of a
@@ -3594,13 +3643,17 @@ fn call_tokens(sql: &str, dialect: SqlDialect) -> Vec<CallTok<'_>> {
         } else if is_word_byte(c) {
             // `$` continues a name — `lower$(1)` calls `lower$` — which is why
             // `scan_dollar` opens no quote there; a number does not take one.
+            // On T-SQL `#` and `@` do too: `dbo.f@GETDATE()` calls
+            // `f@GETDATE`, not the allowlisted `GETDATE`.
             let start = i;
-            let continues = if is_word_start(c) {
-                continues_dollar_name
-            } else {
-                is_word_byte
-            };
-            while i < b.len() && continues(b[i]) {
+            let word = is_word_start(c);
+            while i < b.len()
+                && if word {
+                    continues_dollar_name(b[i]) || continues_name(b[i], dialect)
+                } else {
+                    is_word_byte(b[i])
+                }
+            {
                 i += 1;
             }
             toks.push(if is_word_start(c) {
@@ -7151,6 +7204,36 @@ mod tests {
                 super::read_only_reason(sql, SqlDialect::MsSql).is_err(),
                 "{sql}"
             );
+        }
+    }
+
+    /// **`#`, `@` and `$` continue a T-SQL name**, so `dbo.h#()` calls `h#`
+    /// and `dbo.f@GETDATE()` calls `f@GETDATE` — neither of them the
+    /// allowlisted name the scan used to stop at. Both are functions a server
+    /// creates (measured on 2022), and a call to one is what the allowlist is
+    /// there to refuse.
+    #[test]
+    fn a_t_sql_name_holding_hash_at_or_dollar_is_one_call() {
+        use super::read_only_reason as gate;
+        let ms = SqlDialect::MsSql;
+        for refused in [
+            "SELECT dbo.h#()",
+            "SELECT dbo.purge@now()",
+            "SELECT dbo.f@GETDATE()",
+            "SELECT dbo.g#GETDATE()",
+            "SELECT dbo.m$GETDATE()",
+            "SELECT h#(1)",
+        ] {
+            assert!(gate(refused, ms).is_err(), "{refused}");
+        }
+        // A variable and a temp table still read: `@` and `#` *begin* those
+        // names, and neither is followed by a call.
+        for ok in [
+            "SELECT @@ROWCOUNT, GETDATE()",
+            "SELECT a FROM #t WHERE a = @x",
+            "SELECT $1.50 + 1",
+        ] {
+            assert!(gate(ok, ms).is_ok(), "{ok}: {:?}", gate(ok, ms));
         }
     }
 

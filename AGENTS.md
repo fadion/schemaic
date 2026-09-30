@@ -143,7 +143,8 @@ substitute for the statement, and none of these is a style preference.
   which the ER diagram's find bar calls too), and Find-Anywhere searches names → objects → columns
   in that order, undebounced.
 - **Identifier scanning treats bytes `>= 0x80` as word bytes** — `sql::is_word_byte`/`is_word_start`
-  are the only definitions.
+  are the only definitions, and where a name *ends* per dialect (T-SQL's `#`/`@`/`$`) is
+  `sql::continues_name`.
 - **A Velopack channel name is app identity, like `--packId`** — add a name, never rename one;
   the names live only in `release.yml`, so the guard is a CI step there, not a `cargo test`. **The
   published package-repository identity is the same rule, second instance**: the Pages base URL,

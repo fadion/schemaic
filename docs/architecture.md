@@ -565,6 +565,15 @@ existing prose was left alone.
     allowlist replaced. And the parser is not PostgreSQL's: a statement it rejects would be refused
     outright, and one it reads differently from the server is the disagreement every text gate here
     has been bypassed through.
+    **Where a name ends is `sql::continues_name`, and on SQL Server that is past a `#`, `@` or `$`.**
+    `dbo.h#`, `purge@now` and `v$as` are each one regular identifier there (measured on 2022), and
+    the scan used to stop at the `#`/`@`: `SELECT dbo.h#()` was then no call at all and
+    `SELECT dbo.f@GETDATE()` a call to the allowlisted `GETDATE`, so an owner's function ran on
+    `schemaic query` and `run_query`, and what it did outside the database (`xp_logevent`) survived
+    the rolled-back transaction (review finding R1-L2-01). `call_tokens` continues a word with
+    `continues_dollar_name || continues_name`, past `$` on every engine and past `#`/`@` on SQL
+    Server alone; a *leading* `@`/`#` is still a `Punct`, so `@@ROWCOUNT` and `#t` read as before
+    (`a_t_sql_name_holding_hash_at_or_dollar_is_one_call`).
     **What is *not* a call is where the list's usability lives, and every rule is a name the
     allowlist never sees**, so each is written to be sound rather than generous. `PG_PAREN_KEYWORDS`
     holds only PostgreSQL's *reserved* and *column-name* keywords that the grammar puts before a `(`
@@ -8670,6 +8679,14 @@ existing prose was left alone.
     `None` on every other dialect, so there `go` is still a word
     (`a_sql_server_go_line_survives_formatting`, which asserts the formatted script splits into the
     original's statements, each formatted).
+    **A T-SQL `@x`, `@@ROWCOUNT`, `#t` or `##g` is one `Kind::Word`.** `@` and `#` fell to the
+    operator arm and `need_space` separated them from their name, so one Format Code broke nearly
+    every T-SQL script: `SELECT @ x` is Msg 137, `SELECT @ @ VERSION` and `CREATE TABLE # t` are
+    Msg 102 (measured on 2022; review finding S1.1-L1-02). The word arm takes the prefix
+    `sql::t_sql_name_prefix` measures — `0` unless a word byte follows it, so `a @ b` is left alone,
+    and `0` on every engine but SQL Server — and continues every word with `sql::continues_name`,
+    so a name that *holds* one of those bytes, `h#` or `f@x`, stays whole too
+    (`a_t_sql_variable_or_temp_table_keeps_its_prefix`).
   - `pairs.rs` — caret-driven, boundary-aware editor highlights + auto-close pairs (via
     `skip_noncode`): `auto_pair` (auto-close `()`/`''`/`""`/`` `` `` [MySQL] at code positions, wrap a
     selection, type-over a closer/quote already at the caret — respects string/comment regions and
@@ -25821,6 +25838,14 @@ Re-introducing the anti-patterns these guard against is a regression:
   lesson for the next sweep is that a violation does not have to look like a tokenizer: both of
   these are three lines inside a scan of something else, which is why grepping for the loops did not
   find them.
+  **Where a name *ends* is per-dialect, and that is one definition too**: `sql::continues_name`,
+  built on `is_word_byte` — PostgreSQL adds `$` (`continues_dollar_name`), T-SQL `$`, `#` and `@`,
+  MySQL and SQLite nothing — with `sql::t_sql_name_prefix` for the leading `@`/`@@`/`#`/`##` of a
+  T-SQL variable, system function or temporary table, `0` unless `SqlDialect::prefixed_names()`.
+  Two scanners split a name where SQL Server does not: the read-only gate's `call_tokens` ended
+  `dbo.f@GETDATE()` at the `@` and asked the allowlist about `GETDATE`, and `sqlfmt::tokenize` cut
+  `@x` from its `@`, so Format Code wrote back `@ x`, a batch that no longer compiled. A new T-SQL
+  scanner asks these two rather than adding the bytes locally.
 - **A Velopack channel name is app identity, like `--packId`: add a name, never rename one.** The
   three `release.yml` packs with — `win-x64`, `linux-x64`, `osx-arm64` — are explicit because a
   *default* channel (`win`, `linux`) reaches only the manifest name, so both platforms emit one
