@@ -1686,17 +1686,30 @@ impl RoutineDraft {
         if current.is_some_and(|c| c.name.eq_ignore_ascii_case(want)) {
             return None;
         }
+        // **What it costs is the plan runner's answer** (`ddl_is_transactional`):
+        // MySQL commits the `DROP` before the `CREATE` is refused, while SQL
+        // Server's plan is one transaction, whose refused `CREATE` takes the
+        // `DROP` back with it — "would destroy" there warned of a loss that
+        // cannot happen.
+        let what = self.info.kind.label();
+        let original = current.map_or("the original", |c| c.name.as_str());
         taken
             .iter()
             .any(|t| t.trim().eq_ignore_ascii_case(want))
             .then(|| {
-                format!(
-                    "A {} called {want} is already here. On this engine a rename is a \
-                     drop and a create, so applying this would destroy {} and leave \
-                     {want} as it was.",
-                    self.info.kind.label(),
-                    current.map_or("the original", |c| c.name.as_str()),
-                )
+                if ddl_is_transactional(dialect) {
+                    format!(
+                        "A {what} called {want} is already here. On this engine a rename is \
+                         a drop and a create, so the server refuses this one and nothing \
+                         changes — pick another name, or drop {want} first."
+                    )
+                } else {
+                    format!(
+                        "A {what} called {want} is already here. On this engine a rename is \
+                         a drop and a create, so applying this would destroy {original} and \
+                         leave {want} as it was."
+                    )
+                }
             })
     }
 }
@@ -3632,13 +3645,25 @@ impl Change {
             // a create. That is safe where DDL is transactional and *isn't* on
             // MySQL, which commits each statement as it runs — so a rejected new
             // definition there leaves the table with no trigger at all.
+            // **The sentence asks the plan's question** — `trigger_alters_in_place`
+            // — because it described a drop over SQL Server's in-place alter,
+            // which keeps the trigger's permissions and object id.
             Change::ReplaceTrigger { draft } => {
-                let mut out = vec![format!(
-                    "Re-creating trigger {} drops it first. Where DDL isn't \
-                     transactional (MySQL), a new definition the server rejects \
-                     leaves the table with no trigger.",
-                    draft.info.name
-                )];
+                let mut out = vec![if trigger_alters_in_place(draft, dialect) {
+                    format!(
+                        "Redefines trigger {} in place — it is not dropped, so its \
+                         permissions stay — and what it does on each write changes \
+                         from now on.",
+                        draft.info.name
+                    )
+                } else {
+                    format!(
+                        "Re-creating trigger {} drops it first. Where DDL isn't \
+                         transactional (MySQL), a new definition the server rejects \
+                         leaves the table with no trigger.",
+                        draft.original.as_deref().unwrap_or(&draft.info.name)
+                    )
+                }];
                 if draft.info.tsql.module.signed {
                     out.push(signature_lost("trigger", &draft.info.name));
                 }
@@ -3686,11 +3711,17 @@ impl Change {
                 // transactional DDL, so the `DROP` commits on its own and a
                 // rejected new definition leaves nothing behind at all.
                 if *recreate {
+                    // The one dropped is the one the server holds — under a
+                    // rename, not the name the draft asks for.
+                    let held = if server.name.is_empty() {
+                        draft.original.as_deref().unwrap_or(&f.name)
+                    } else {
+                        &server.name
+                    };
                     out.push(format!(
-                        "Re-creating {} drops it first. Where DDL isn't transactional \
+                        "Re-creating {held} drops it first. Where DDL isn't transactional \
                          (MySQL), a new definition the server rejects leaves no \
                          {} at all.",
-                        f.name,
                         f.kind.label()
                     ));
                     // **What is lost here is invisible in the SQL box by
@@ -3703,12 +3734,23 @@ impl Change {
                     // nothing equivalent it can restate for an ACL. So the
                     // sentence is the only place the loss can appear at all, and
                     // the change list is the consent gesture.
-                    out.push(format!(
-                        "Privileges granted on {} and its comment do not survive \
-                         being dropped, and this plan does not restore them — \
-                         re-apply any GRANT and COMMENT afterwards.",
-                        f.name
-                    ));
+                    //
+                    // **The comment half only where the plan does not put it
+                    // back** (`recreate_restates_routine_comment`): SQL Server's
+                    // sets it again after the create, and telling the user to
+                    // re-apply it asked for work already done.
+                    out.push(if recreate_restates_routine_comment(dialect) {
+                        format!(
+                            "Privileges granted on {held} do not survive being dropped, and \
+                             this plan does not restore them — re-apply any GRANT afterwards."
+                        )
+                    } else {
+                        format!(
+                            "Privileges granted on {held} and its comment do not survive \
+                             being dropped, and this plan does not restore them — \
+                             re-apply any GRANT and COMMENT afterwards."
+                        )
+                    });
                 }
                 // An alter drops a signature as surely as a drop does.
                 if server.tsql.module.signed {
@@ -5723,19 +5765,10 @@ impl ChangeSet {
         // then no drop at all, only a `CREATE OR ALTER`, and it neither leaves
         // nor re-enters the set — which is what keeps the ordering walk below
         // exact for it. A rename is still a drop and a create everywhere.
-        //
-        // **The same name is the same bytes**, not an ASCII case-fold: whether
-        // `tr` and `TR` are one trigger is the database collation's call, so a
-        // rename by case alone is a drop and a create, which is right under
-        // either — taken as an alter, a case-sensitive database got a second
-        // trigger and both fired, and a case-insensitive one kept the old name.
-        let in_place = |draft: &TriggerDraft| {
-            supports_trigger_alter_in_place(d)
-                && draft
-                    .original
-                    .as_deref()
-                    .is_none_or(|o| o == draft.info.name)
-        };
+        // Which replace that is — the same name, byte for byte — is
+        // `trigger_alters_in_place`'s, the question the preview's sentence
+        // asks too.
+        let in_place = |draft: &TriggerDraft| trigger_alters_in_place(draft, d);
         let mut dropped: Vec<&str> = Vec::new();
         let mut planned: Vec<&str> = Vec::new();
         for c in &self.changes {
@@ -9599,6 +9632,52 @@ pub fn supports_trigger_alter_in_place(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MsSql => true,
         SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+    }
+}
+
+/// Is this trigger replace **an alter in place** on `dialect` — the engine
+/// can alter one ([`supports_trigger_alter_in_place`]), and the draft keeps
+/// the name the server holds, byte for byte?
+///
+/// One predicate for the plan ([`ChangeSet::emit`]'s trigger statements)
+/// and the sentence the preview puts over it, which disagreed: the risk said
+/// "drops it first" over a plan that dropped nothing. **The same name is the
+/// same bytes**, not an ASCII case-fold — whether `tr` and `TR` are one
+/// trigger is the database collation's call, so a rename by case alone is a
+/// drop and a create, which is right under either; taken as an alter, a
+/// case-sensitive database got a second trigger and both fired, and a
+/// case-insensitive one kept the old name.
+fn trigger_alters_in_place(draft: &TriggerDraft, dialect: SqlDialect) -> bool {
+    supports_trigger_alter_in_place(dialect)
+        && draft
+            .original
+            .as_deref()
+            .is_none_or(|o| o == draft.info.name)
+}
+
+/// Does `dialect`'s plan runner apply a DDL plan **whole or not at all**?
+///
+/// PostgreSQL's, SQLite's and SQL Server's `Db::run_ddl` wrap the plan in one
+/// transaction and roll it back on the first error; MySQL commits each
+/// statement as it runs. It decides what a sentence may promise: a rename
+/// that is a drop and a create onto a taken name *destroys* the original on
+/// MySQL, and on the others is refused with nothing changed.
+pub fn ddl_is_transactional(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MySql => false,
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => true,
+    }
+}
+
+/// Does a routine's drop-and-create on `dialect` **put its comment back**?
+/// MySQL's `CREATE` carries a `COMMENT` clause, and SQL Server's plan sets the
+/// `MS_Description` again after it (`routine_follow_ups`); PostgreSQL's
+/// `COMMENT ON` is a statement the recreate does not repeat, and SQLite has
+/// no routines. What the recreate's risk sentence may say is lost.
+fn recreate_restates_routine_comment(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MySql | SqlDialect::MsSql => true,
+        SqlDialect::Postgres | SqlDialect::Sqlite => false,
     }
 }
 
@@ -27195,6 +27274,40 @@ mod tsql_routine_plan_tests {
         );
     }
 
+    /// **The recreate's sentences match the plan on SQL Server.** The plan
+    /// sets the comment again after the create (`routine_follow_ups`), so
+    /// "its comment does not survive … re-apply any COMMENT" told the user to
+    /// redo work already done; the one dropped is the name the server holds,
+    /// not the new one; and `run_ddl` runs the plan in one transaction, so a
+    /// rename onto a taken name is refused and nothing is destroyed —
+    /// `name_clash` said it would destroy the original.
+    #[test]
+    fn a_sql_server_routine_recreates_sentences_match_its_plan() {
+        let mut cur = proc_r();
+        cur.name = "grp".into();
+        cur.comment = Some("desc".into());
+        let mut d = RoutineDraft::from_info(&cur);
+        d.info.name = "grp2".into();
+        let risks = diff_routine(&cur, &d, MsSql).destructive().join(" ");
+        assert!(!risks.contains("COMMENT"), "{risks}");
+        assert!(risks.contains("Re-creating grp drops it first"), "{risks}");
+        assert!(risks.contains("GRANT"), "{risks}");
+        let clash = d
+            .name_clash(Some(&cur), &["grp".into(), "grp2".into()], MsSql)
+            .expect("still a clash worth saying");
+        assert!(!clash.contains("destroy"), "{clash}");
+        assert!(clash.contains("nothing changes"), "{clash}");
+        // MySQL's DDL is not transactional: there it would destroy.
+        let clash = d
+            .name_clash(
+                Some(&cur),
+                &["grp".into(), "grp2".into()],
+                SqlDialect::MySql,
+            )
+            .unwrap();
+        assert!(clash.contains("destroy"), "{clash}");
+    }
+
     /// **Editing a signed routine says it strips the signature.** Any
     /// `CREATE OR ALTER` drops a module's `ADD SIGNATURE` (measured on SQL
     /// Server 2022: `sys.crypt_properties` 1 row, then none), and it cannot be
@@ -27579,6 +27692,29 @@ mod tsql_trigger_plan_tests {
         let sql = diff_triggers(std::slice::from_ref(&cur), &d, MsSql).emit();
         assert_eq!(sql[0], "DROP TRIGGER [dbo].[tr];", "{sql:#?}");
         assert!(sql[1].starts_with("CREATE TRIGGER [dbo].[TR]"), "{sql:#?}");
+    }
+
+    /// **The preview says what the plan does**: a same-name SQL Server edit
+    /// is altered in place and drops nothing, and the risk said "Re-creating
+    /// trigger tr drops it first" over it — which reads as the permissions
+    /// and object id going, the very thing the alter keeps. A rename still
+    /// drops first, and says so.
+    #[test]
+    fn a_trigger_altered_in_place_is_not_said_to_be_dropped() {
+        let cur = tr("tr");
+        let mut d = set(vec![cur.clone()]);
+        d.triggers[0].info.action = TriggerAction::Body("SET NOCOUNT OFF".into());
+        let risks = diff_triggers(std::slice::from_ref(&cur), &d, MsSql)
+            .destructive()
+            .join(" ");
+        assert!(!risks.contains("drops it first"), "{risks}");
+        assert!(risks.contains("in place"), "{risks}");
+        let mut d = set(vec![cur.clone()]);
+        d.triggers[0].info.name = "tr2".into();
+        let risks = diff_triggers(std::slice::from_ref(&cur), &d, MsSql)
+            .destructive()
+            .join(" ");
+        assert!(risks.contains("drops it first"), "{risks}");
     }
 
     /// A signed trigger's edit says it strips the signature, as a routine's

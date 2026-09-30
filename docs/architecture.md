@@ -4873,7 +4873,8 @@ existing prose was left alone.
     `TR` are one trigger is the database collation's call, and the case-folding test took a rename by
     case alone for an in-place alter — so a case-sensitive database got a second trigger and every
     insert fired both (measured on SQL Server 2022: one insert, two audit rows), and a
-    case-insensitive one kept the old name. As a drop and a create it is right under either
+    case-insensitive one kept the old name. As a drop and a create it is right under either; the
+    test is `trigger_alters_in_place`, which the preview's risk sentence asks too
     (`a_case_only_trigger_rename_drops_and_creates`; live, `a_trigger_renamed_by_case_is_renamed_once`
     under both collations, 2022 and 2025). `trigger_create_statements` is the one exhaustive `match` both routes go
     through: MySQL's session wrap on one arm, and on SQL Server two lists — the statement and its
@@ -5009,7 +5010,19 @@ existing prose was left alone.
     sets it through `TsqlComment::set` after a create or a recreate when there is one, and after an
     in-place alter only when it changed (`a_sql_server_routines_comment_is_set_in_place`);
     `TsqlComment` gained `object_type` for it, the level-1 type being `PROCEDURE` or `FUNCTION`
-    rather than `TABLE`. `emit_mssql` now routes the shared `routine_statements`, whose drop arm
+    rather than `TABLE`. **The recreate's risk sentences were written for the other two engines
+    and had to learn this**: they told the user the comment "does not survive … re-apply any
+    COMMENT" over a plan that sets it again, and named the new name as the one dropped. The comment
+    half now asks `recreate_restates_routine_comment` (MySQL's `CREATE` carries a `COMMENT` clause,
+    SQL Server's plan sets it after; PostgreSQL's `COMMENT ON` is not repeated), the sentence names
+    the name the server holds, and `RoutineDraft::name_clash` asks `ddl_is_transactional` for its
+    consequence — on MySQL the `DROP` commits before the `CREATE` is refused, so the rename destroys
+    the original; SQL Server's `run_ddl` is one transaction, so the refused `CREATE` takes the
+    `DROP` back and nothing changes, which is what it now says
+    (`a_sql_server_routine_recreates_sentences_match_its_plan`). The trigger arm's "drops it first"
+    had the same fault over SQL Server's in-place alter; it asks `trigger_alters_in_place`, the
+    predicate `trigger_statements` plans with, and says the trigger is redefined in place
+    (`a_trigger_altered_in_place_is_not_said_to_be_dropped`). `emit_mssql` now routes the shared `routine_statements`, whose drop arm
     replaced the inline `DropRoutine` one it had, and `tsql_supports` admits `CreateRoutine` and
     `ReplaceRoutine`, which is what switched `supports_routine_editing(MsSql)` on
     (`sql_server_offers_the_routine_editor`). `RoutineDraft::validate` has a SQL Server arm — every
