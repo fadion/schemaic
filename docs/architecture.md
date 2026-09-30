@@ -4289,8 +4289,11 @@ existing prose was left alone.
     must be empty over captured fixtures from classicmodels/sakila/employees/world +
     PG world/chinook + two SQLite shapes (`ddl::tests::roundtrip`), and a SQL Server
     shape beside them (`a_sql_server_table_round_trips_through_its_draft`: an identity
-    key under a named constraint, a `getdate()` default, a collation, a persisted
-    computed column, a unique constraint, a check, an alias type) — extend those
+    key under a named `NONCLUSTERED` constraint with its seed and increment, a `rowversion`, a
+    `getdate()` default, a collation, a persisted computed column, a unique constraint, a
+    `CLUSTERED` descending index, a check, an alias type, table and column descriptions, and a
+    foreign key with actions whose referenced table carries it under `referenced_by` — each field
+    set as `collect_schema` sets it, which the test's doc states) — extend those
     fixtures rather than working around them, since any model-fidelity gap surfaces to
     the user as a phantom change. **On SQLite it is worse than a stray preview line**:
     a non-empty diff is what routes an edit through the twelve-step rebuild, so an
@@ -4336,7 +4339,12 @@ existing prose was left alone.
     report them, so the terms cost nothing there. The `users()` fixture populates all three now, so
     the round-trip gate actually covers them and the fixture's own doc — *every field the model
     carries is populated, so the round-trip test can't pass by leaving something empty* — is true
-    again. Also `key_list_text`/`parse_key_list` (the designer's `bio(20), age DESC`
+    again. **`identity_spec` was the fifth**, the same way round: SQL Server's reader and
+    `tsql_identity` learned the seed and increment and `columns_equal` did not, so a compare
+    between a table counting down from 1000 and one counting up from 1 answered `Same`. It compares
+    them now, `None` standing for the `(1,1)` the emitter writes for it, and T-SQL having no
+    `ALTER COLUMN` for an identity the difference goes to the rebuild
+    (`an_identity_seed_or_increment_is_a_change`). Also `key_list_text`/`parse_key_list` (the designer's `bio(20), age DESC`
     field) and `common_types`. **That round trip is asserted twice here, and a quoted paren used to
     break it**: `unwrap_parens` counted parens over raw `char_indices` and `split_keys` counted raw
     bytes, so a close paren inside a string literal ended the group early. A PostgreSQL index keyed
@@ -12093,7 +12101,7 @@ existing prose was left alone.
   designer's own edit of a unique constraint goes through the same arm.
   **A default is dropped by a name looked up as the plan runs** (`tsql_drop_default`). T-SQL drops
   one only by its constraint's name, which introspection does not read and `ColumnInfo` does not
-  carry — deliberately not added as a field: `columns_equal` has missed a new field four times (under
+  carry — deliberately not added as a field: `columns_equal` has missed a new field five times (under
   `ddl.rs`'s round-trip gate), and a constraint's name is not a property of the
   column. So the statement reads `sys.default_constraints` itself and cannot be stale. **It is one
   statement with no `;` inside** — `DECLARE @df … IF @df IS NOT NULL EXEC (N'ALTER TABLE …

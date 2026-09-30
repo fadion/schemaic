@@ -8094,6 +8094,20 @@ fn columns_equal(a: &ColumnInfo, b: &ColumnInfo, d: SqlDialect) -> bool {
         // column was marked for was silently not migrated. Inert on the two
         // engines that cannot report it, where the flag is always `false`.
         && a.invisible == b.invisible
+        // SQL Server's `IDENTITY(seed, increment)`, which `identity_spec` joined
+        // the model to restate and this did not compare — so a table counting
+        // down from 1000 and one counting up from 1 compared `Same`. `None` is
+        // what the emitter writes as `(1,1)`, so it compares as that; `None` on
+        // every other engine, where both sides are.
+        && (!a.auto_increment || identity_seed_step(a) == identity_seed_step(b))
+}
+
+/// A column's identity seed and increment as the emitter would write them —
+/// [`ColumnInfo::identity_spec`], or `(1,1)` when it has none.
+fn identity_seed_step(c: &ColumnInfo) -> (&str, &str) {
+    c.identity_spec
+        .as_ref()
+        .map_or(("1", "1"), |(seed, step)| (seed.as_str(), step.as_str()))
 }
 
 fn blank_as_none(s: Option<&str>) -> Option<&str> {
@@ -17128,14 +17142,30 @@ mod tests {
     }
 
     /// **A SQL Server table diffs to nothing against its own draft** — the
-    /// round-trip gate, over the shapes introspection reads there: an identity
-    /// key under a named constraint, a normalised default, a persisted computed
-    /// column, a collation, a unique constraint, a check and an alias type.
+    /// round-trip gate, over the shapes introspection reads there, each field
+    /// set as `db::mssql::collect_schema` sets it:
+    ///
+    /// - an identity key: `auto_increment` and `identity_always` both true
+    ///   (the reader sets the second for any column no `INSERT` supplies),
+    ///   `identity_spec` the catalogue's seed and increment as integer text;
+    /// - a `rowversion`, read as its system type `timestamp`, never nullable,
+    ///   `identity_always` and not `auto_increment`;
+    /// - a normalised default (outer parentheses stripped), a persisted
+    ///   computed column, a collation and an alias type;
+    /// - every rowstore index with `clustered: Some(kind == 1)` — here a
+    ///   `NONCLUSTERED` named key beside a `CLUSTERED` descending index, which
+    ///   is the pair a model without the field could not carry;
+    /// - a check, table and column descriptions (`MS_Description`);
+    /// - a foreign key with `ref_schema` always named and its actions as
+    ///   `fk_action` spells them (`NO_ACTION` is `None`, `SET_NULL` is
+    ///   `SET NULL`), and on the table it references the inbound copy
+    ///   `link_inbound_foreign_keys` files under `referenced_by`.
     #[test]
     fn a_sql_server_table_round_trips_through_its_draft() {
         let t = TableInfo {
             name: "orders".into(),
             schema: Some("sales".into()),
+            comment: Some("One row per order".into()),
             columns: vec![
                 ColumnInfo {
                     name: "id".into(),
@@ -17143,11 +17173,14 @@ mod tests {
                     nullable: false,
                     primary_key: true,
                     auto_increment: true,
+                    identity_always: true,
+                    identity_spec: Some(("1000".into(), "-5".into())),
                     ..Default::default()
                 },
                 ColumnInfo {
                     default: Some("getdate()".into()),
                     nullable: false,
+                    comment: Some("When it was placed".into()),
                     ..ms_col("placed", "datetime2(7)")
                 },
                 ColumnInfo {
@@ -17161,6 +17194,12 @@ mod tests {
                 },
                 ms_col("qty", "smallint"),
                 ms_col("phone", "[dbo].[Phone]"),
+                ColumnInfo {
+                    nullable: false,
+                    identity_always: true,
+                    ..ms_col("ver", "timestamp")
+                },
+                ms_col("customer_id", "int"),
             ],
             indexes: vec![
                 crate::schema::IndexInfo {
@@ -17168,6 +17207,7 @@ mod tests {
                     columns: vec![IndexColumn::plain("id")],
                     unique: true,
                     constraint: Some("PK_orders".into()),
+                    clustered: Some(false),
                     ..Default::default()
                 },
                 crate::schema::IndexInfo {
@@ -17175,9 +17215,29 @@ mod tests {
                     columns: vec![IndexColumn::plain("code")],
                     unique: true,
                     constraint: Some("UQ_code".into()),
+                    clustered: Some(false),
+                    ..Default::default()
+                },
+                crate::schema::IndexInfo {
+                    name: "CX_placed".into(),
+                    columns: vec![IndexColumn {
+                        descending: true,
+                        ..IndexColumn::plain("placed")
+                    }],
+                    clustered: Some(true),
                     ..Default::default()
                 },
             ],
+            foreign_keys: vec![crate::schema::ForeignKeyInfo {
+                name: "FK_orders_customer".into(),
+                columns: vec!["customer_id".into()],
+                ref_schema: Some("sales".into()),
+                ref_table: "customers".into(),
+                ref_columns: vec!["id".into()],
+                on_delete: Some("CASCADE".into()),
+                on_update: Some("SET NULL".into()),
+                ..Default::default()
+            }],
             check_constraints: vec![crate::schema::CheckInfo {
                 name: "CK_qty".into(),
                 expression: "[qty]>=(0)".into(),
@@ -17187,8 +17247,91 @@ mod tests {
             }],
             ..Default::default()
         };
-        let cs = diff(&t, &TableDraft::from_table(&t), MsSql);
-        assert!(cs.changes.is_empty(), "{:?}", cs.changes);
+        let customers = TableInfo {
+            name: "customers".into(),
+            schema: Some("sales".into()),
+            columns: vec![ColumnInfo {
+                name: "id".into(),
+                type_name: "int".into(),
+                nullable: false,
+                primary_key: true,
+                ..Default::default()
+            }],
+            indexes: vec![crate::schema::IndexInfo {
+                name: "PRIMARY".into(),
+                columns: vec![IndexColumn::plain("id")],
+                unique: true,
+                constraint: Some("PK_customers".into()),
+                clustered: Some(true),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut tables = [t, customers];
+        crate::schema::link_inbound_foreign_keys(&mut tables);
+        let [t, customers] = tables;
+        assert_eq!(
+            customers.referenced_by.len(),
+            1,
+            "the fixture links its key"
+        );
+        for t in [&t, &customers] {
+            let cs = diff(t, &TableDraft::from_table(t), MsSql);
+            assert!(cs.changes.is_empty(), "{}: {:?}", t.name, cs.changes);
+        }
+    }
+
+    /// **An identity's seed and increment are part of the column** — two
+    /// SQL Server tables whose `id` counts up from 1 and down from 1000 are
+    /// not the same table, and a compare used to call them so because
+    /// `columns_equal` never looked at `identity_spec`. A read identity with
+    /// the default `(1,1)` is the same as a designer one with none, which is
+    /// what `tsql_identity` writes for it.
+    #[test]
+    fn an_identity_seed_or_increment_is_a_change() {
+        let id = |spec: Option<(&str, &str)>| ColumnInfo {
+            name: "id".into(),
+            type_name: "int".into(),
+            nullable: false,
+            auto_increment: true,
+            identity_always: true,
+            identity_spec: spec.map(|(a, b)| (a.to_string(), b.to_string())),
+            ..Default::default()
+        };
+        assert!(!columns_equal(
+            &id(Some(("1000", "-5"))),
+            &id(Some(("1", "1"))),
+            MsSql
+        ));
+        assert!(!columns_equal(
+            &id(Some(("1", "2"))),
+            &id(Some(("1", "1"))),
+            MsSql
+        ));
+        assert!(!columns_equal(&id(Some(("1000", "-5"))), &id(None), MsSql));
+        assert!(columns_equal(&id(Some(("1", "1"))), &id(None), MsSql));
+        assert!(columns_equal(
+            &id(Some(("1000", "-5"))),
+            &id(Some(("1000", "-5"))),
+            MsSql
+        ));
+
+        // Through the diff, as a compare reaches it: the difference is a
+        // change, never an empty plan.
+        let t = ms_table(vec![id(Some(("1000", "-5")))], &["id"]);
+        let mut d = TableDraft::from_table(&t);
+        d.columns[0].info.identity_spec = Some(("1".into(), "1".into()));
+        let cs = diff(&t, &d, MsSql);
+        assert!(!cs.changes.is_empty(), "the seed change was dropped");
+        // T-SQL's `ALTER COLUMN` cannot restate an identity, so it is the
+        // rebuild that carries it — and its new table says the new pair.
+        let stmts = cs.emit();
+        assert!(
+            stmts
+                .iter()
+                .any(|s| s.starts_with("CREATE TABLE") && s.contains("[id] int IDENTITY(1,1)")),
+            "{stmts:#?}"
+        );
     }
 
     /// **Only PostgreSQL's `public` resolves unqualified.** Elsewhere the name
