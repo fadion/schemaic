@@ -3587,6 +3587,182 @@ async fn a_grid_edit_in_a_manual_session_is_isolated_and_uncommitted() {
     session.close().await;
 }
 
+/// **A pinned session writes the table its edit names, in whichever database
+/// that is** — not the same-named table in the session's own. A Manual tab
+/// pinned to A that read `B.dbo.t` and edited a row of it overwrote `A`'s
+/// `dbo.t` instead, and the re-read, on the same unqualified name, showed the
+/// typed value over the table the user never touched. The re-read and a
+/// binary cell's read name B too.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_manual_grid_edit_of_another_databases_table_lands_there() {
+    use schemaic_core::tx::StmtOutcome;
+    if !enabled() || on_azure() {
+        return;
+    }
+    let a = Scratch::create("tx_xdb_a").await;
+    let b = Scratch::create("tx_xdb_b").await;
+    for s in [&a, &b] {
+        s.exec(&format!(
+            "CREATE TABLE dbo.t (id int NOT NULL PRIMARY KEY, v nvarchar(20) NULL, \
+             bin varbinary(10) NULL); \
+             INSERT dbo.t VALUES (1, N'{}-orig', 0x{})",
+            if s.name == a.name { "a" } else { "b" },
+            if s.name == a.name { "AA" } else { "BB" },
+        ))
+        .await;
+    }
+    let session = manual(&a).await;
+    let out = session
+        .commit_writes(
+            &GridWrite {
+                updates: vec![row_edit(
+                    &b,
+                    "t",
+                    &[("v", txt("EDITED"))],
+                    &[("id", Value::Int(1))],
+                )],
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(out.stmt, StmtOutcome::Ok, "{:?}", out.result);
+    let template = RefetchTemplate {
+        database: b.name.clone(),
+        schema: Some("dbo".into()),
+        table: "t".into(),
+        columns: vec!["id".into(), "v".into()],
+        key_cols: vec![0],
+        confirm_cols: vec![],
+    };
+    let reread = session
+        .refetch_rows(
+            &template,
+            &[RefetchRow {
+                data_row: 0,
+                key: vec![Value::Int(1)],
+            }],
+            CancellationToken::new(),
+        )
+        .await
+        .result
+        .expect("a re-read");
+    assert_eq!(reread[0].1[1].display().to_string(), "EDITED");
+    let blob = session
+        .fetch_blob(
+            &BlobRef {
+                database: b.name.clone(),
+                schema: Some("dbo".into()),
+                table: "t".into(),
+                column: "bin".into(),
+                key: vec![("id".into(), Value::Int(1))],
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .result
+        .expect("a blob read")
+        .expect("a value");
+    assert_eq!(blob.bytes, vec![0xBB]);
+    session.commit().await.expect("commit");
+    session.close().await;
+    assert_eq!(b.scalar("SELECT v FROM dbo.t").await, "EDITED");
+    assert_eq!(a.scalar("SELECT v FROM dbo.t").await, "a-orig");
+}
+
+/// **A batch refused before its own `SAVE` undoes nothing** — no second
+/// `ROLLBACK TRANSACTION schemaic_w`, which would land on the previous
+/// batch's savepoint and silently take back the user's statements since.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_grid_batch_refused_before_its_savepoint_keeps_the_work_before_it() {
+    use schemaic_core::tx::StmtOutcome;
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("tx_presave").await;
+    s.exec("CREATE TABLE dbo.t (id int NOT NULL PRIMARY KEY, qty int NULL)")
+        .await;
+    let session = manual(&s).await;
+    let first = session
+        .commit_writes(
+            &GridWrite {
+                inserts: vec![row_insert(&s, "t", &[("id", txt("1")), ("qty", txt("5"))])],
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(first.stmt, StmtOutcome::Ok, "{:?}", first.result);
+    assert_eq!(
+        stmt(&session, "INSERT dbo.t VALUES (2, 6)").await,
+        StmtOutcome::Ok
+    );
+    let refused = session
+        .commit_writes(
+            &GridWrite {
+                updates: vec![row_edit(
+                    &s,
+                    "t",
+                    &[("qty", txt(""))],
+                    &[("id", Value::Int(1))],
+                )],
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(
+        matches!(refused.result, Err(DbError::Refused(_))),
+        "{:?}",
+        refused.result
+    );
+    assert_ne!(refused.stmt, StmtOutcome::FailedAndRolledBack);
+    let seen = session
+        .fetch_query("SELECT COUNT(*) FROM dbo.t", 10, CancellationToken::new())
+        .await
+        .result
+        .expect("a count");
+    assert_eq!(seen.cell(0, 0).expect("a cell").display().to_string(), "2");
+    session.commit().await.expect("commit");
+    session.close().await;
+    assert_eq!(committed_rows(&s).await, "2");
+}
+
+/// **A rolled-back identity insert switches `IDENTITY_INSERT` off again** —
+/// a savepoint's rollback leaves session settings alone, and left on it
+/// refuses the tab's next ordinary insert into the table (Msg 545).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_identity_insert_leaves_identity_insert_off() {
+    use schemaic_core::tx::StmtOutcome;
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("tx_ident").await;
+    s.exec(
+        "CREATE TABLE dbo.t (id int IDENTITY(1,1) PRIMARY KEY, v nvarchar(10) NULL); \
+         INSERT dbo.t (v) VALUES (N'one')",
+    )
+    .await;
+    let session = manual(&s).await;
+    let dup = session
+        .commit_writes(
+            &GridWrite {
+                inserts: vec![row_insert(&s, "t", &[("id", txt("1")), ("v", txt("dup"))])],
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(dup.stmt, StmtOutcome::FailedIsolated, "{:?}", dup.result);
+    assert_eq!(
+        stmt(&session, "INSERT dbo.t (v) VALUES (N'two')").await,
+        StmtOutcome::Ok
+    );
+    session.commit().await.expect("commit");
+    session.close().await;
+    assert_eq!(committed_rows(&s).await, "2");
+}
+
 /// **Stop on a pinned session stops the statement and keeps the
 /// transaction** — `XACT_ABORT` off, the attention aborts only the batch —
 /// and the connection answers the next statement.

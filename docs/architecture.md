@@ -11629,8 +11629,16 @@ existing prose was left alone.
   for the statement**: a trigger's statements report theirs first, in the same batch
   (`a_trigger_does_not_trip_the_one_row_guard`). The statements are `statement_for`,
   `refetch_statement` and `blob_statement`, pure and pinned in `write_tests`: every name through
-  `export::ident_sql`, qualified `[schema].[table]` whenever the schema is known, for `pg_qname`'s
-  reason; a NULL written as the literal `NULL` and never a parameter, since a TDS parameter is
+  `export::ident_sql`, qualified **`[database].[schema].[table]`** (`qname3`) whenever the
+  database is known — `db..t` without a schema, two-part without a database — and the column facts
+  read from that database's own `sys.columns`. **The database is part of the name because a pinned
+  session's connection is in the session's database, not the edit's**: a Manual tab pinned to A
+  that read `B.dbo.t` (or ran `USE`) and edited a row of it wrote A's same-named `dbo.t`, the 1-row
+  net passed because A had such a row, and the re-read — the same two-part name on the same
+  connection — showed the typed value over a table the user never touched
+  (`a_manual_grid_edit_of_another_databases_table_lands_there`, which failed against the two-part
+  names; `SET IDENTITY_INSERT` takes the three-part name too). A NULL written as the literal `NULL`
+  and never a parameter, since a TDS parameter is
   typed; a NULL key value compared as `IS NULL`, T-SQL having no null-safe equality before 2022's
   `IS NOT DISTINCT FROM`; an insert that sets nothing as `DEFAULT VALUES`. **A float key is bound
   as its text**: a `real` compared with an `f64` is widened to it, and `0.1` stored as a `real` is
@@ -11715,7 +11723,11 @@ existing prose was left alone.
   cannot be released, so its name stays live for the rest of the transaction, and a second
   `ROLLBACK TRANSACTION schemaic_w` after a batch that failed before its own `SAVE` would land on an
   *earlier* batch's — silently undoing the user's statements since. `undone` stays `None` when the
-  batch failed before anything was written.
+  batch failed before anything was written. Both decisions are pinned live:
+  `a_grid_batch_refused_before_its_savepoint_keeps_the_work_before_it` (a batch the blank refusal
+  stops before its `SAVE` leaves the earlier grid batch and the user's own `INSERT` in place) and
+  `a_failed_identity_insert_leaves_identity_insert_off` (a duplicate identity insert rolled back to
+  the savepoint, then an ordinary insert on the same session succeeds).
   **Manual mode is `Session`'s `Backend::MsSql` arm** — one pinned client, boxed because tiberius
   keeps its buffers inline — and it holds the transaction as SQL Server's own tools do, with
   `XACT_ABORT` left at its default, off. `Session::open_enforced` connects through `connect` and

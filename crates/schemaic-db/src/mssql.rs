@@ -2358,7 +2358,7 @@ pub(crate) async fn import_rows(
         return Err(DbError::Cancelled);
     }
     let mut client = connect(db, Some(target.database)).await?;
-    let facts = column_facts(&mut client, target.schema, target.table).await?;
+    let facts = column_facts(&mut client, target.database, target.schema, target.table).await?;
     let cols: Vec<&str> = target.columns.iter().map(String::as_str).collect();
     let identity =
         import_sets_identity(target.columns, &facts).then(|| qname(target.schema, target.table));
@@ -2530,6 +2530,32 @@ fn qname(schema: Option<&str>, table: &str) -> String {
     }
 }
 
+/// `[database].[schema].[table]` — [`qname`] with the database in front
+/// whenever it is known, for every statement the grid's write, re-read and
+/// blob read build.
+///
+/// **A pinned session's connection is in its own database, not the edit's.**
+/// A Manual tab pinned to A that read `B.dbo.t` and edited a row of it wrote
+/// the same-named `dbo.t` in A, and the re-read — the same two-part name on
+/// the same connection — read A's row back and showed the typed value over
+/// the table the user never touched. The 1-row net checks a count, not an
+/// identity, so nothing else could catch it. T-SQL takes a three-part name in
+/// every statement here (`SET IDENTITY_INSERT` included), and inside the
+/// pinned transaction.
+fn qname3(database: &str, schema: Option<&str>, table: &str) -> String {
+    if database.is_empty() {
+        return qname(schema, table);
+    }
+    // A three-part name needs its schema part; `db..t` would take the
+    // default schema, which is what a missing one means anyway.
+    format!(
+        "{}.{}.{}",
+        ident(database),
+        schema.map(ident).unwrap_or_default(),
+        ident(table)
+    )
+}
+
 /// A statement and the values its `@P1`, `@P2`… placeholders stand for, in
 /// placeholder order.
 #[derive(Debug, Default, PartialEq)]
@@ -2611,7 +2637,7 @@ fn statement_for(step: WriteStep<'_>) -> Bound {
             let w = where_key(&d.key, &mut params);
             format!(
                 "DELETE FROM {} WHERE {w}",
-                qname(d.schema.as_deref(), &d.table)
+                qname3(&d.database, d.schema.as_deref(), &d.table)
             )
         }
         WriteStep::Update(u) => {
@@ -2624,11 +2650,11 @@ fn statement_for(step: WriteStep<'_>) -> Bound {
             let w = where_key(&u.key, &mut params);
             format!(
                 "UPDATE {} SET {sets} WHERE {w}",
-                qname(u.schema.as_deref(), &u.table)
+                qname3(&u.database, u.schema.as_deref(), &u.table)
             )
         }
         WriteStep::Insert(i) => {
-            let table = qname(i.schema.as_deref(), &i.table);
+            let table = qname3(&i.database, i.schema.as_deref(), &i.table);
             if i.cols.is_empty() {
                 // Every column left to its default; `() VALUES ()` is not T-SQL.
                 format!("INSERT INTO {table} DEFAULT VALUES")
@@ -2671,7 +2697,11 @@ fn refetch_statement(template: &RefetchTemplate, row: &RefetchRow) -> Bound {
     Bound {
         sql: format!(
             "SELECT TOP (1) {cols} FROM {} WHERE {w}",
-            qname(template.schema.as_deref(), &template.table)
+            qname3(
+                &template.database,
+                template.schema.as_deref(),
+                &template.table
+            )
         ),
         params,
     }
@@ -2686,7 +2716,7 @@ fn blob_statement(r: &BlobRef) -> Bound {
     Bound {
         sql: format!(
             "SELECT TOP (1) DATALENGTH({col}), SUBSTRING({col}, 1, {FETCH_CAP}) FROM {} WHERE {w}",
-            qname(r.schema.as_deref(), &r.table)
+            qname3(&r.database, r.schema.as_deref(), &r.table)
         ),
         params,
     }
@@ -2708,9 +2738,21 @@ struct ColumnFacts {
     collation: Option<String>,
 }
 
-const COLUMN_FACTS: &str = "SELECT c.name, TYPE_NAME(c.system_type_id), c.is_identity, \
-            c.collation_name, CAST(COLLATIONPROPERTY(c.collation_name, 'CodePage') AS int) \
-     FROM sys.columns c WHERE c.object_id = OBJECT_ID(@P1)";
+/// The catalogue read behind [`ColumnFacts`], in `database`'s `sys.columns`
+/// — the table's own, which on a pinned session is not the connection's
+/// (see [`qname3`]); `@P1` is the table's three-part name.
+fn column_facts_sql(database: &str) -> String {
+    let catalogue = if database.is_empty() {
+        "sys.columns".to_string()
+    } else {
+        format!("{}.sys.columns", ident(database))
+    };
+    format!(
+        "SELECT c.name, TYPE_NAME(c.system_type_id), c.is_identity, \
+                c.collation_name, CAST(COLLATIONPROPERTY(c.collation_name, 'CodePage') AS int) \
+         FROM {catalogue} c WHERE c.object_id = OBJECT_ID(@P1)"
+    )
+}
 
 /// Does `base_type` store its text in a code page rather than as Unicode?
 fn holds_code_page_text(base_type: &str) -> bool {
@@ -2990,12 +3032,13 @@ fn import_sets_identity(columns: &[String], facts: &[ColumnFacts]) -> bool {
 /// The columns of the table a batch writes to.
 async fn column_facts(
     client: &mut MsClient,
+    database: &str,
     schema: Option<&str>,
     table: &str,
 ) -> Result<Vec<ColumnFacts>, DbError> {
-    let name = qname(schema, table);
+    let name = qname3(database, schema, table);
     let stream = client
-        .query(COLUMN_FACTS, &[&name.as_str()])
+        .query(column_facts_sql(database).as_str(), &[&name.as_str()])
         .await
         .map_err(|e| db_err(&e))?;
     let rows = stream.into_first_result().await.map_err(|e| db_err(&e))?;
@@ -3507,12 +3550,14 @@ pub(crate) async fn write_on(
     if cancel.is_cancelled() {
         return Err(DbError::Cancelled);
     }
-    let (schema, table) = match first {
-        WriteStep::Delete(d) => (d.schema.as_deref(), &d.table),
-        WriteStep::Update(u) => (u.schema.as_deref(), &u.table),
-        WriteStep::Insert(i) => (i.schema.as_deref(), &i.table),
+    // The database is part of the name here — see `qname3`: on a pinned
+    // session the connection is in the session's database, not the edit's.
+    let (database, schema, table) = match first {
+        WriteStep::Delete(d) => (&d.database, d.schema.as_deref(), &d.table),
+        WriteStep::Update(u) => (&u.database, u.schema.as_deref(), &u.table),
+        WriteStep::Insert(i) => (&i.database, i.schema.as_deref(), &i.table),
     };
-    let facts = column_facts(client, schema, table).await?;
+    let facts = column_facts(client, database, schema, table).await?;
     if let Some(msg) = blank_refusal(write, &facts) {
         return Err(DbError::Refused(msg));
     }
@@ -3531,7 +3576,7 @@ pub(crate) async fn write_on(
         }
         let identity = match step {
             WriteStep::Insert(i) if sets_identity(i, &facts) => {
-                Some(qname(i.schema.as_deref(), &i.table))
+                Some(qname3(&i.database, i.schema.as_deref(), &i.table))
             }
             _ => None,
         };
@@ -3763,7 +3808,7 @@ mod write_tests {
         let b = statement_for(WriteStep::Update(&e));
         assert_eq!(
             b.sql,
-            "UPDATE [dbo].[orders] SET [note] = @P1, [gone] = NULL, [photo] = @P2 \
+            "UPDATE [shop].[dbo].[orders] SET [note] = @P1, [gone] = NULL, [photo] = @P2 \
              WHERE [id] = @P3 AND [region] IS NULL"
         );
         assert_eq!(
@@ -3780,7 +3825,7 @@ mod write_tests {
     fn an_insert_with_nothing_set_takes_every_default() {
         let i = insert(vec![]);
         let b = statement_for(WriteStep::Insert(&i));
-        assert_eq!(b.sql, "INSERT INTO [dbo].[orders] DEFAULT VALUES");
+        assert_eq!(b.sql, "INSERT INTO [shop].[dbo].[orders] DEFAULT VALUES");
         assert!(b.params.is_empty());
 
         let i = insert(vec![
@@ -3790,7 +3835,7 @@ mod write_tests {
         let b = statement_for(WriteStep::Insert(&i));
         assert_eq!(
             b.sql,
-            "INSERT INTO [dbo].[orders] ([qty], [note]) VALUES (@P1, NULL)"
+            "INSERT INTO [shop].[dbo].[orders] ([qty], [note]) VALUES (@P1, NULL)"
         );
         assert_eq!(b.params, vec![text("3")]);
     }
@@ -3809,7 +3854,7 @@ mod write_tests {
         let b = statement_for(WriteStep::Delete(&d));
         assert_eq!(
             b.sql,
-            "DELETE FROM [sales].[order lines] WHERE [order_id] = @P1 AND [line] = @P2"
+            "DELETE FROM [shop].[sales].[order lines] WHERE [order_id] = @P1 AND [line] = @P2"
         );
         assert_eq!(b.params, vec![ColumnData::I64(Some(1)), text("A")]);
     }
@@ -3824,6 +3869,14 @@ mod write_tests {
         );
         e.table = "t]1".into();
         e.schema = None;
+        let b = statement_for(WriteStep::Update(&e));
+        // No schema: `db..t`, T-SQL's spelling of the default one.
+        assert_eq!(
+            b.sql,
+            "UPDATE [shop]..[t]]1] SET [a]]b] = @P1 WHERE [id] = @P2"
+        );
+        // And no database either: two-part, as before.
+        e.database = String::new();
         let b = statement_for(WriteStep::Update(&e));
         assert_eq!(b.sql, "UPDATE [t]]1] SET [a]]b] = @P1 WHERE [id] = @P2");
     }
@@ -3863,7 +3916,7 @@ mod write_tests {
         let b = refetch_statement(&t, &row);
         assert_eq!(
             b.sql,
-            "SELECT TOP (1) [id], [qty], [note] FROM [dbo].[orders] WHERE [id] = @P1 AND [qty] IS NULL"
+            "SELECT TOP (1) [id], [qty], [note] FROM [shop].[dbo].[orders] WHERE [id] = @P1 AND [qty] IS NULL"
         );
         assert_eq!(b.params, vec![ColumnData::I64(Some(9))]);
     }
@@ -3884,7 +3937,7 @@ mod write_tests {
             b.sql,
             format!(
                 "SELECT TOP (1) DATALENGTH([ThumbNailPhoto]), SUBSTRING([ThumbNailPhoto], 1, {FETCH_CAP}) \
-                 FROM [SalesLT].[Product] WHERE [ProductID] = @P1"
+                 FROM [shop].[SalesLT].[Product] WHERE [ProductID] = @P1"
             )
         );
     }
