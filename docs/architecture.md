@@ -3905,7 +3905,7 @@ existing prose was left alone.
     of a computed one, and a column put anywhere but last. Until then the first two were withheld
     in the preview and the third was never offered; `tsql_supports` still refuses them one by one, and `diff` answers a set holding one with
     the `RebuildTable` it now admits, by the rule above. The shape is SSMS's designer's rather than
-    SQLite's twelve steps — seven steps, each its own batch, all inside `Db::run_ddl`'s one
+    SQLite's twelve steps — eight steps, each its own batch, all inside `Db::run_ddl`'s one
     transaction, so a failure anywhere leaves the table as it was. (1) **A guard that stops the
     plan before it touches anything**, one `DECLARE @t … CASE WHEN … END IF @why IS NOT NULL THROW
     50000, @why, 1;` naming the first reason, wherever the table carries something the model does
@@ -3924,7 +3924,9 @@ existing prose was left alone.
     temp table `#schemaic_rebuild_defaults` (`TSQL_REBUILD_DEFAULTS`), since the model reads a
     default's value and not its name, and one put back as `DF__t__a__5EBF139D` is not the one
     scripts and a schema compare name; a `#` table because `run_ddl`'s one connection carries it
-    across the batches. (3) The keys **other tables** have on it (`TableInfo::referenced_by`, under
+    across the batches. Beside them, what selects `*` from the table
+    (`tsql_collect_star_dependents`, below) — here and not later because the `DROP TABLE` takes the
+    table's dependency rows with it. (3) The keys **other tables** have on it (`TableInfo::referenced_by`, under
     `schema.rs`) dropped, since each refuses the `DROP TABLE` (Msg 3726). (4) A bare shadow,
     `<table>_schemaic_rebuild`, of the draft's columns alone — no key, index, check or default,
     because a constraint's name is the schema's and the old table still holds each one. (5) The
@@ -3942,11 +3944,58 @@ existing prose was left alone.
     self-reference may name and with that self-reference re-pointed at the new name; the defaults
     under their captured names; the comments; the triggers through `trigger_create_statements`,
     disabled and ranked as they were, on the new name; the inbound keys re-added pointing at the new
-    name and the renamed columns; and the temp table dropped. Every statement but a trigger's own
+    name and the renamed columns. (8) The views and inline functions that select `*` from it
+    refreshed (`tsql_refresh_star_dependents`, below) — this step and its capture in (2) only
+    where the table keeps its name — and then the defaults' temp table dropped.
+    Every statement but a trigger's own
     is one batch with no `;` inside, because the preview's Open in editor splits at them
     (`sql_server_rebuilds_what_alter_column_cannot` pins the order and that). `emit_mssql` returns
     the rebuild alone when one is in the set: it writes the table the draft describes, name
     included, so the set's other entries are already in it.
+    **Every SQL Server plan that moves a table's columns refreshes what selects `*` from it** — the
+    rebuild and `emit_mssql` alike. A non-schema-bound view or inline table-valued function keeps
+    the column list its `*` expanded to and binds it to the table's columns **by position** until
+    `sp_refreshsqlmodule` re-expands it. Measured on 2022 and 2025: after a rebuild that put
+    `credit_limit` before `balance`, a `SELECT *` view read each under the other's name and
+    `UPDATE v SET balance = 0` zeroed `credit_limit` (R3-L5-02); after a `RebuildComputedColumn`
+    moved `c` last, one read `x` as `c` and an `UPDATE` of `x` wrote `y` (S3.2-L5-01); and a column
+    dropped beside one added leaves the count unchanged, so the view mislabels just as silently.
+    Which plans move columns is `tsql_moves_columns` — a `RebuildTable`, a `RebuildComputedColumn`
+    or a `DropColumn`; a rename or retype leaves the positions alone and an add alone appends.
+    Whether an engine needs the refresh at all is `refreshes_star_dependents(dialect)`, an exhaustive
+    `match` true on SQL Server alone: MySQL stores the expanded list by name, PostgreSQL by column
+    number but refuses to drop a column a view reads and cannot reorder one, and SQLite re-parses a
+    view at every use. It is two statements around the move, each one batch with no `;` inside.
+    `tsql_collect_star_dependents(table)`, run **before** the columns move, copies into the session
+    temp table `#schemaic_star_dependents` (`TSQL_STAR_DEPENDENTS`) everything whose `*` reads the
+    table, then whatever selects `*` from those, level by level to a cap of 32, out of
+    `sys.sql_dependencies` where `is_select_all = 1`. That catalogue is deprecated and is read
+    because it is the one that carries `is_select_all` — `sys.sql_expression_dependencies` does
+    not — and the flag is the point: a view that names its columns binds them by name and needs
+    nothing, and refreshing one that names a column the plan drops would fail the plan for no gain.
+    Were the catalogue removed, the statement fails and the plan rolls back whole, which is the
+    failure to want. `tsql_refresh_star_dependents()` then walks a cursor running
+    `EXEC sys.sp_refreshsqlmodule` on each kept object of type `V` or `IF`, nearest level first so a
+    view over a view re-expands against one already refreshed, and drops the temp table; a
+    procedure, a trigger or a multi-statement function expands its `*` at each compile and needs
+    nothing. **There is deliberately no `TRY … CATCH` around it**: a failed `sp_refreshsqlmodule`
+    rolls back the caller's whole transaction (measured), so swallowing the error would leave the
+    rest of the plan running auto-committed. A dependent that no longer compiles against the new
+    columns therefore fails the plan whole, and `ChangeSet::destructive()` says so beforehand in one
+    plan-level sentence — the plan's step rather than any one change's, so said once however many of
+    its changes move a column. Both `emit_mssql` and that sentence read one answer,
+    `ChangeSet::refreshes_star_dependents()`, so the preview cannot disagree with the script: the
+    dialect's capability and `tsql_moves_columns` over the admitted changes — **except a rebuild
+    that also renames the table** (`tsql_rebuild_keeps_name`), whose dependents all name the table
+    as it was, so a refresh there could only fail the plan, where a dependent left naming a table
+    that is gone fails loudly on its next read, as after any rename. In `emit_mssql` the capture
+    runs after the trigger statements and before anything covering the columns is dropped, and the
+    refresh after the comments and **before** the table's own `sp_rename`, since a dependent names
+    the table as it is and would not compile against a name that is gone. The unit pins are
+    `a_sql_server_rebuild_refreshes_what_selects_star_from_the_table`,
+    `a_rebuilt_computed_column_refreshes_what_selects_star_from_the_table` and
+    `only_a_plan_that_moves_columns_refreshes_what_selects_star`; the live ones, each red before the
+    fix, are under `mssql.rs`.
     **Which columns the copy skips is asked of the type, not of `identity_always`**
     (`tsql_server_filled`): a computed column and a `rowversion`/`timestamp`, whose values the
     server makes. The reader sets `identity_always` on an identity too, while the designer's toggle
@@ -4353,6 +4402,9 @@ existing prose was left alone.
     the extended property went with the drop. The preview summarises it as *Rebuild computed column
     x as (…) around the column change*, and its risk names the one cost: nothing is lost, the value
     being the expression's, but the column moves to the end of the table, T-SQL having no reorder.
+    That move is why a plan holding one also refreshes the views and inline functions that select
+    `*` from the table (`tsql_moves_columns`, above): bound by position, one read `x` as `c` and an
+    `UPDATE` of `x` through it wrote `y` (S3.2-L5-01).
     `supports_change` is true for it on SQL Server and false elsewhere — an exhaustive `match` after
     SQL Server's early return — because only SQL Server's `diff` raises it and no other emitter
     writes it. **A dependent the draft already drops or adds is the
@@ -11924,14 +11976,17 @@ existing prose was left alone.
   `signature_sql`. **It was `emit_mysql` through a `_`**, whose whole-table loop asks no
   capability, so a SQL Server Truncate went into the script as `TRUNCATE TABLE [dbo].[t];` in
   MySQL's grammar while the preview listed it as refused. **An edit of an existing table runs in
-  phases, and the order is T-SQL's, not a tidy one**: first the drops of what covers columns —
+  phases, and the order is T-SQL's, not a tidy one**: first, where the plan moves columns, what
+  selects `*` from the table captured (`tsql_collect_star_dependents`, under `ddl.rs`); then the
+  drops of what covers columns —
   foreign keys first of all, since one referencing the table's own key blocks the key's drop, then
   checks and the primary key (`DROP CONSTRAINT` by name), then indexes (`DROP CONSTRAINT` for one a
   constraint backs, `DROP INDEX [i] ON t` otherwise); then dropped columns, each after its
   default's drop; **then** the column renames, `EXEC sp_rename N'[s].[t].[c]', N'new',
   N'COLUMN';`; then altered columns (`tsql_alter_column`), added columns, the keys, checks and
   foreign keys, the indexes; then the comments, by the columns' new names and the table's
-  old one; and the table's own `sp_rename` last, the new name bare
+  old one; then those `SELECT *` dependents refreshed, while the table still has the name they
+  name; and the table's own `sp_rename` last, the new name bare
   because the procedure takes it literally and brackets would become part of it — so every
   earlier statement names the table as it was (`sql_server_orders_a_designer_plan`, which also
   doubles a quote inside `N'…'`, through `ddl_string` — `tsql_n` is that one literal rule, not a
@@ -12593,7 +12648,10 @@ existing prose was left alone.
   `mssql.rs` above), `run_ddl` and the designer's plans (from a designed table and a
   failing plan rolled back whole to an existing table's edit landing as drafted, an edit keeping
   what it did not change, an identity toggle withheld over an index the rebuild cannot restate, a
-  table rebuilt three ways and refused once by the rebuild's guard, a clustered index and a nonclustered key
+  table rebuilt three ways and refused once by the rebuild's guard, the views and inline function
+  that select `*` from a table refreshed after a rebuild, a rebuilt computed
+  column and a dropped column (`a_rebuild_refreshes_the_views_that_select_star_from_it` and its two
+  siblings), a clustered index and a nonclustered key
   keeping their clustering and every
   AdventureWorksLT table round-tripping where that sample is installed, also under `mssql.rs`),
   a file import (four tests, from every row across batches to a cancel rolled back, under
@@ -25345,7 +25403,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   `supports_trigger_not_for_replication`, `supports_trigger_execute_as` and
   `supports_trigger_firing_rank`, plus
   `supports_column_reorder`, `rebuilds_tables`, `alter_column_disturbs_checks`,
-  `alter_column_disturbs_dependents`, `publishes_index_ddl` and `stats::supports_table_stats`; and, for the *comparison* rather than
+  `alter_column_disturbs_dependents`, `refreshes_star_dependents`, `publishes_index_ddl` and
+  `stats::supports_table_stats`; and, for the *comparison* rather than
   any editor, `ref_schema_is_database` and `view_definition_is_qualified`. **The same rule applies
   inside the emitter, and two loops there answered it by not asking.** `emit_sqlite`'s table-rename
   loop iterated `&self.changes` where every loop above it iterates `supported()`, and

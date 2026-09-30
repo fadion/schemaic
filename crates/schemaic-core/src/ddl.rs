@@ -4221,7 +4221,8 @@ impl ChangeSet {
                 _ => None,
             })
             .collect();
-        self.changes
+        let mut out: Vec<String> = self
+            .changes
             .iter()
             .filter(|c| match c {
                 Change::DropCheck { name }
@@ -4230,7 +4231,42 @@ impl ChangeSet {
                 _ => true,
             })
             .flat_map(|c| c.risks(self.dialect))
-            .collect()
+            .collect();
+        // The plan's own step rather than any one change's: said once, however
+        // many of its changes move a column.
+        if self.refreshes_star_dependents() {
+            out.push(format!(
+                "Refreshes every view and inline function that selects * from {}: SQL Server \
+                 binds those to the table's columns by position, and would otherwise read and \
+                 write the wrong columns. The plan fails if one of them no longer compiles \
+                 against the new columns.",
+                self.table
+            ));
+        }
+        out
+    }
+
+    /// Does this plan end by refreshing what selects `*` from the table — the
+    /// one answer [`emit`](Self::emit) and [`destructive`](Self::destructive)
+    /// both read, so the preview's sentence cannot disagree with the script?
+    ///
+    /// Where [`refreshes_star_dependents`] and the plan moves columns
+    /// ([`tsql_moves_columns`]) — **except a rebuild that also renames the
+    /// table**: there every such dependent names the table as it was, so a
+    /// refresh could only fail the plan, where a dependent naming a table that
+    /// is gone fails loudly on its next read, as after any rename.
+    fn refreshes_star_dependents(&self) -> bool {
+        if !refreshes_star_dependents(self.dialect) {
+            return false;
+        }
+        match self.changes.iter().find(|c| is_rebuild(c)) {
+            Some(Change::RebuildTable(r)) => tsql_rebuild_keeps_name(&r.current, &r.draft),
+            _ => tsql_moves_columns(
+                self.changes
+                    .iter()
+                    .filter(|c| supports_change(self.dialect, c)),
+            ),
+        }
     }
 
     /// The changes in this set the dialect **can't express**, in plain language.
@@ -4360,6 +4396,12 @@ impl ChangeSet {
         // its own statement, and what follows one (`tsql_follow_ups`) never in
         // its text.
         out.extend(self.trigger_statements());
+        // What selects `*` from the table, kept while its columns still stand
+        // where they did, and refreshed below once they have moved.
+        let moves = self.refreshes_star_dependents();
+        if moves {
+            out.push(tsql_collect_star_dependents(&q));
+        }
         // What covers the columns, before the columns — foreign keys first, of
         // everything: one that references this table's own key blocks the
         // key's drop.
@@ -4573,6 +4615,11 @@ impl ChangeSet {
                 } => out.push(table.set(Some(cm))),
                 _ => {}
             }
+        }
+        // Before the table's rename: a dependent names the table as it is, and
+        // would not compile against a name that is gone.
+        if moves {
+            out.push(tsql_refresh_star_dependents());
         }
         for c in &admitted {
             if let Change::RenameTable { to } = c {
@@ -11216,6 +11263,108 @@ pub fn sqlite_rebuild_sql(current: &TableInfo, draft: &TableDraft) -> Vec<String
 /// session's, and `Db::run_ddl`'s one connection carries it across batches.
 const TSQL_REBUILD_DEFAULTS: &str = "#schemaic_rebuild_defaults";
 
+/// The temporary table a SQL Server plan keeps the table's `SELECT *`
+/// dependents in, from before its columns move to after — see
+/// [`tsql_collect_star_dependents`].
+const TSQL_STAR_DEPENDENTS: &str = "#schemaic_star_dependents";
+
+/// Does a SQL Server plan of these changes **move the table's columns** —
+/// change which column stands at which position? A rebuild writes them in
+/// the draft's order, a rebuilt computed column comes back last, and a
+/// dropped column shifts every one after it (and an added one then takes
+/// the freed position's place in the count).
+///
+/// It is the question [`tsql_refresh_star_dependents`] answers for: a
+/// non-schema-bound view or inline function that selects `*` keeps the
+/// columns it expanded to **by position**, so after any of these it reads
+/// one column under another's name, and an `UPDATE` through it writes the
+/// wrong column — silently, whenever the count comes out the same. A rename
+/// or retype leaves the positions alone, and an add alone appends.
+fn tsql_moves_columns<'a>(changes: impl IntoIterator<Item = &'a Change>) -> bool {
+    changes.into_iter().any(|c| {
+        matches!(
+            c,
+            Change::RebuildTable(_)
+                | Change::RebuildComputedColumn { .. }
+                | Change::DropColumn { .. }
+        )
+    })
+}
+
+/// Does `dialect` bind a view's `SELECT *` to the table's columns **by
+/// position**, so that a plan moving them must refresh the view afterwards?
+///
+/// - **SQL Server** does: a non-schema-bound view or inline function keeps
+///   the column list its `*` expanded to, and reads the table's columns by
+///   ordinal against it until `sp_refreshsqlmodule` re-expands it (measured
+///   on 2022 and 2025).
+/// - **MySQL** stores the expanded list by name, **PostgreSQL** by column
+///   number but refuses to drop a column a view reads and cannot reorder
+///   one, and **SQLite** re-parses the view's text at every use.
+pub fn refreshes_star_dependents(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MsSql => true,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+    }
+}
+
+/// Does a T-SQL rebuild put the table back under the name it had? A blank
+/// draft name is the old one, as [`tsql_rebuild_sql`] reads it.
+fn tsql_rebuild_keeps_name(current: &TableInfo, draft: &TableDraft) -> bool {
+    draft.name.trim().is_empty() || draft.name == current.name
+}
+
+/// The first half of a SQL Server plan's refresh of what selects `*` from
+/// `table` (qualified and quoted): every view, inline function — or anything
+/// else — whose `*` reads it, and then whatever selects `*` from *those*, by
+/// level, into [`TSQL_STAR_DEPENDENTS`]. Run **before** the columns move,
+/// since a rebuild's `DROP TABLE` takes the table's dependency rows with it.
+///
+/// `sys.sql_dependencies` rather than `sys.sql_expression_dependencies`
+/// because it is the catalogue that says `is_select_all`: a view that names
+/// its columns binds them by name and needs nothing, and refreshing one that
+/// names a column the plan drops would fail the plan for no gain. It is
+/// deprecated; were it removed, this statement fails and the plan rolls back
+/// whole, which is the failure to want.
+fn tsql_collect_star_dependents(table: &str) -> String {
+    format!(
+        "DECLARE @t int = OBJECT_ID({}) \
+         SELECT DISTINCT d.object_id, 1 AS lvl INTO {TSQL_STAR_DEPENDENTS} \
+         FROM sys.sql_dependencies d WHERE d.referenced_major_id = @t AND d.is_select_all = 1 \
+         DECLARE @more int = @@ROWCOUNT DECLARE @lvl int = 1 \
+         WHILE @more > 0 AND @lvl < 32 BEGIN SET @lvl += 1 \
+         INSERT {TSQL_STAR_DEPENDENTS} (object_id, lvl) SELECT DISTINCT d.object_id, @lvl \
+         FROM sys.sql_dependencies d JOIN {TSQL_STAR_DEPENDENTS} p \
+         ON p.object_id = d.referenced_major_id AND p.lvl = @lvl - 1 WHERE d.is_select_all = 1 \
+         SET @more = @@ROWCOUNT END;",
+        tsql_n(table)
+    )
+}
+
+/// The second half: `sp_refreshsqlmodule` on each view and inline function
+/// [`tsql_collect_star_dependents`] kept, the ones nearest the table first so
+/// a view over a view re-expands against a refreshed one. A procedure, a
+/// trigger or a multi-statement function expands its `*` each time it is
+/// compiled and needs nothing.
+///
+/// **No `TRY … CATCH` around it, on purpose**: a failed
+/// `sp_refreshsqlmodule` rolls back the caller's transaction (measured), so
+/// swallowing the error would leave the rest of the plan running
+/// auto-committed. A dependent that no longer compiles against the new
+/// columns fails the plan, whole.
+fn tsql_refresh_star_dependents() -> String {
+    format!(
+        "DECLARE @m nvarchar(600) DECLARE schemaic_refresh CURSOR LOCAL FAST_FORWARD FOR \
+         SELECT QUOTENAME(OBJECT_SCHEMA_NAME(s.object_id)) + N'.' + QUOTENAME(OBJECT_NAME(s.object_id)) \
+         FROM {TSQL_STAR_DEPENDENTS} s JOIN sys.objects o ON o.object_id = s.object_id \
+         WHERE o.type IN ('V', 'IF') GROUP BY s.object_id ORDER BY MAX(s.lvl) \
+         OPEN schemaic_refresh FETCH NEXT FROM schemaic_refresh INTO @m \
+         WHILE @@FETCH_STATUS = 0 BEGIN EXEC sys.sp_refreshsqlmodule @m \
+         FETCH NEXT FROM schemaic_refresh INTO @m END \
+         CLOSE schemaic_refresh DEALLOCATE schemaic_refresh DROP TABLE {TSQL_STAR_DEPENDENTS};"
+    )
+}
+
 /// A column whose values the server makes, so no `INSERT` names it: a
 /// computed one, and a `rowversion` — asked of its type, since the reader
 /// sets `identity_always` on an identity too, and the designer's toggle
@@ -11251,7 +11400,8 @@ fn tsql_server_filled(c: &ColumnInfo) -> bool {
 /// 2. The default constraints' names, kept in [`TSQL_REBUILD_DEFAULTS`]: the
 ///    model reads a default's value and not its name, and a default put back
 ///    under `DF__t__a__5EBF139D` is not the one scripts and a schema compare
-///    name.
+///    name. Beside them, what selects `*` from it
+///    ([`tsql_collect_star_dependents`]), while the catalogue still says so.
 /// 3. The foreign keys **other tables** have on it ([`TableInfo::referenced_by`])
 ///    dropped — each refuses the `DROP TABLE` (Msg 3726).
 /// 4. The shadow, `<table>_schemaic_rebuild`, of the draft's columns alone: no
@@ -11267,6 +11417,10 @@ fn tsql_server_filled(c: &ColumnInfo) -> bool {
 ///    own foreign keys, the defaults under their names, the comments, the
 ///    triggers (disabled and ranked as they were), and last the other tables'
 ///    keys, pointed at it.
+/// 8. The views and inline functions that select `*` from it refreshed
+///    ([`tsql_refresh_star_dependents`]): they keep that `*` bound to the old
+///    table's column positions, and would otherwise read and write the wrong
+///    columns.
 pub fn tsql_rebuild_sql(current: &TableInfo, draft: &TableDraft) -> Vec<String> {
     let d = SqlDialect::MsSql;
     let q = |s: &str| ddl_ident_in(s, d);
@@ -11409,6 +11563,13 @@ pub fn tsql_rebuild_sql(current: &TableInfo, draft: &TableDraft) -> Vec<String> 
          WHERE dc.parent_object_id = OBJECT_ID({});",
         tsql_n(&original)
     ));
+    // And what selects `*` from it, before the drop takes the rows that say so
+    // — unless the rebuild also renames the table
+    // (`ChangeSet::refreshes_star_dependents` says why).
+    let refresh = tsql_rebuild_keeps_name(current, draft);
+    if refresh {
+        out.push(tsql_collect_star_dependents(&original));
+    }
 
     // 3. The other tables' keys, off.
     for fk in &current.referenced_by {
@@ -11607,6 +11768,10 @@ pub fn tsql_rebuild_sql(current: &TableInfo, draft: &TableDraft) -> Vec<String> 
             qualified(&fk.table, fk.schema.as_deref(), d),
             fk_clause(&pointed(&fk.key), d)
         ));
+    }
+    // 8. What selects `*` from it, re-expanded against the new columns.
+    if refresh {
+        out.push(tsql_refresh_star_dependents());
     }
     out.push(format!("DROP TABLE {TSQL_REBUILD_DEFAULTS};"));
     out
@@ -15535,6 +15700,58 @@ mod tests {
         assert!(refused[0].contains("ix_inc") && refused[1].contains("tr_p"));
     }
 
+    /// **A rebuild refreshes what selects `*` from the table** (R3-L5-02): a
+    /// non-schema-bound view keeps its `*` bound to the old positions, so its
+    /// dependents are kept before the `DROP TABLE` takes the dependency rows
+    /// with it, and refreshed once everything is back on the new table.
+    #[test]
+    fn a_sql_server_rebuild_refreshes_what_selects_star_from_the_table() {
+        let t = ms_rebuild_table();
+        let mut d = TableDraft::from_table(&t);
+        d.columns.swap(1, 2);
+        let cs = diff(&t, &d, MsSql);
+        assert!(matches!(cs.changes.first(), Some(Change::RebuildTable(_))));
+        let stmts = cs.emit();
+        let at = |needle: &str| {
+            stmts
+                .iter()
+                .position(|s| s.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} not in {stmts:#?}"))
+        };
+        let collect = at("INTO #schemaic_star_dependents");
+        assert!(stmts[collect].starts_with("DECLARE @t int = OBJECT_ID(N'[dbo].[p]')"));
+        assert!(at("THROW 50000") < collect);
+        assert!(collect < at("DROP TABLE [dbo].[p]"), "{stmts:#?}");
+        let refresh = at("sp_refreshsqlmodule");
+        assert!(at("REFERENCES [dbo].[p] ([id])") < refresh, "{stmts:#?}");
+        assert!(at("CREATE TRIGGER") < refresh, "{stmts:#?}");
+        assert_eq!(refresh, stmts.len() - 2, "{stmts:#?}");
+        assert!(
+            cs.destructive()
+                .iter()
+                .any(|r| r.contains("selects * from p")),
+            "{:#?}",
+            cs.destructive()
+        );
+
+        // Under a new name, every such dependent names the old one: a refresh
+        // could only fail the plan, so there is none, and no sentence for it.
+        d.name = "q".into();
+        let cs = diff(&t, &d, MsSql);
+        let stmts = cs.emit();
+        assert!(
+            !stmts
+                .iter()
+                .any(|s| s.contains("#schemaic_star_dependents")),
+            "{stmts:#?}"
+        );
+        assert!(
+            !cs.destructive().iter().any(|r| r.contains("selects *")),
+            "{:#?}",
+            cs.destructive()
+        );
+    }
+
     /// **One column renamed, retyped, made `NOT NULL` and given a new default,
     /// in T-SQL's order.** The rename first, so every later statement names the
     /// new column; the old default dropped *before* the retype, since a default
@@ -15746,6 +15963,8 @@ mod tests {
         assert_eq!(
             stmts,
             vec![
+                // A dropped column moves the ones after it.
+                tsql_collect_star_dependents(q),
                 format!("ALTER TABLE {q} DROP CONSTRAINT [fk_x];"),
                 format!("ALTER TABLE {q} DROP CONSTRAINT [pk_ok];"),
                 format!("ALTER TABLE {q} DROP CONSTRAINT [uq_c];"),
@@ -15760,6 +15979,7 @@ mod tests {
                 format!("ALTER TABLE {q} ADD CONSTRAINT [pk_ok] PRIMARY KEY ([a], [b]);"),
                 format!("ALTER TABLE {q} ADD CONSTRAINT [ck_b] CHECK ([b] > 0);"),
                 format!("CREATE INDEX [ix_b] ON {q} ([b]);"),
+                tsql_refresh_star_dependents(),
                 "EXEC sp_rename N'[dbo].[o''k]', N'ok2';".to_string(),
             ]
         );
@@ -16086,6 +16306,83 @@ mod tests {
         let mut d = TableDraft::from_table(&t);
         d.columns[1].info.default = Some("0".into());
         assert_eq!(ms_plan(&t, &d).len(), 1, "{:#?}", ms_plan(&t, &d));
+    }
+
+    /// **A computed column rebuilt last refreshes what selects `*` from the
+    /// table** (S3.2-L5-01): its dependents are kept before the column comes
+    /// off, and refreshed once it is back — before the table's own rename,
+    /// after which they would name a table that is gone — and the preview
+    /// says so.
+    #[test]
+    fn a_rebuilt_computed_column_refreshes_what_selects_star_from_the_table() {
+        let t = ms_computed_table();
+        let mut d = TableDraft::from_table(&t);
+        d.columns[1].info.name = "s2".into();
+        d.name = "t2".into();
+        let cs = diff(&t, &d, MsSql);
+        let stmts = cs.emit();
+        let at = |needle: &str| {
+            stmts
+                .iter()
+                .position(|s| s.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} not in {stmts:#?}"))
+        };
+        let collect = at("INTO #schemaic_star_dependents");
+        assert!(stmts[collect].starts_with("DECLARE @t int = OBJECT_ID(N'[dbo].[t]')"));
+        assert!(collect < at("DROP COLUMN [x]"), "{stmts:#?}");
+        let refresh = at("sp_refreshsqlmodule");
+        assert!(at("ADD [x] AS ([s2]*(2))") < refresh, "{stmts:#?}");
+        assert!(at("CREATE INDEX [ix_x]") < refresh, "{stmts:#?}");
+        assert!(refresh < at("N'[dbo].[t]', N't2'"), "{stmts:#?}");
+        assert!(stmts[refresh].ends_with("DROP TABLE #schemaic_star_dependents;"));
+        for s in [&stmts[collect], &stmts[refresh]] {
+            assert_eq!(s.matches(';').count(), 1, "one statement: {s}");
+        }
+        assert!(
+            cs.destructive()
+                .iter()
+                .any(|r| r.contains("selects * from t") && r.contains("by position")),
+            "{:#?}",
+            cs.destructive()
+        );
+    }
+
+    /// **A dropped column shifts every column after it**, so its plan
+    /// refreshes what selects `*` too; an added column alone only appends,
+    /// and a rename or retype moves nothing, so theirs refresh nothing and
+    /// say nothing about it.
+    #[test]
+    fn only_a_plan_that_moves_columns_refreshes_what_selects_star() {
+        let t = ms_computed_table();
+        let refreshes = |t: &TableInfo, d: &TableDraft| {
+            let cs = diff(t, d, MsSql);
+            let emitted = cs.emit();
+            let refresh = emitted.iter().any(|s| s.contains("sp_refreshsqlmodule"));
+            let collect = emitted
+                .iter()
+                .any(|s| s.contains("INTO #schemaic_star_dependents"));
+            assert_eq!(refresh, collect, "{emitted:#?}");
+            let said = cs.destructive().iter().any(|r| r.contains("selects *"));
+            assert_eq!(refresh, said, "{:#?}", cs.destructive());
+            refresh
+        };
+        let mut dropped = TableDraft::from_table(&t);
+        dropped.columns.remove(3);
+        assert!(refreshes(&t, &dropped), "a dropped column");
+        let mut added = TableDraft::from_table(&t);
+        added.columns.push(ColumnDraft::new(ms_col("n", "int")));
+        assert!(!refreshes(&t, &added), "an added column");
+        // `qty`, which no computed column reads: renamed and retyped in place.
+        let r = ms_rebuild_table();
+        let mut renamed = TableDraft::from_table(&r);
+        renamed.columns[2].info.name = "quantity".into();
+        renamed.columns[2].info.type_name = "bigint".into();
+        assert!(!refreshes(&r, &renamed), "a renamed and retyped column");
+        // And no engine but SQL Server binds `*` by position.
+        for dialect in [MySql, Postgres, Sqlite] {
+            assert!(!refreshes_star_dependents(dialect), "{dialect:?}");
+        }
+        assert!(refreshes_star_dependents(MsSql));
     }
 
     /// `id` under a `NONCLUSTERED` key `pk_t`, and the table's rows ordered by
@@ -16528,7 +16825,9 @@ mod tests {
             ],
         };
         let script = client_script(&cs.emit(), MsSql);
-        assert_eq!(script.matches("\nGO").count(), 4, "{script}");
+        // Two defaults and two drops, between the `SELECT *` dependents kept
+        // and refreshed.
+        assert_eq!(script.matches("\nGO").count(), 6, "{script}");
         for batch in script.split("\nGO") {
             assert!(batch.matches("DECLARE @df").count() <= 1, "{batch}");
         }

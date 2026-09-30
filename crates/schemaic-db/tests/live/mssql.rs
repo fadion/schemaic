@@ -5034,3 +5034,146 @@ async fn a_rebuild_under_a_new_name_switches_off_an_identity_and_computes_a_colu
     let again = schemaic_core::ddl::diff(&t2, &TableDraft::from_table(&t2), MS);
     assert!(again.changes.is_empty(), "{:#?}", again.changes);
 }
+
+/// The views and the inline function over `dbo.<table>` that select `*` — a
+/// view, a view in another schema over that view, and an inline function —
+/// which SQL Server binds to the table's columns **by position** until they
+/// are refreshed.
+async fn star_dependents(s: &Scratch, table: &str) {
+    for sql in [
+        format!("CREATE VIEW dbo.{table}_v AS SELECT * FROM dbo.{table}"),
+        "CREATE SCHEMA rpt".to_string(),
+        format!("CREATE VIEW rpt.{table}_vv AS SELECT * FROM dbo.{table}_v"),
+        format!(
+            "CREATE FUNCTION dbo.{table}_f() RETURNS TABLE AS RETURN SELECT * FROM dbo.{table}"
+        ),
+    ] {
+        s.exec(&sql).await;
+    }
+}
+
+/// **A rebuild refreshes what selects `*` from the table.** Moving
+/// `credit_limit` before `balance` left a `SELECT *` view bound to the old
+/// positions: it showed each column under the other's name, and an `UPDATE`
+/// of `balance` through it zeroed `credit_limit` (R3-L5-02).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rebuild_refreshes_the_views_that_select_star_from_it() {
+    use schemaic_core::ddl::TableDraft;
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("rebuild_star").await;
+    s.exec("CREATE TABLE dbo.acct (id int PRIMARY KEY, balance int, credit_limit int)")
+        .await;
+    s.exec("INSERT dbo.acct VALUES (1, 1000, 50)").await;
+    star_dependents(&s, "acct").await;
+    let t = read_table(&s, "acct").await;
+    let mut d = TableDraft::from_table(&t);
+    d.columns.swap(1, 2);
+    apply_draft(&s, &t, &d).await;
+    for from in ["dbo.acct_v", "rpt.acct_vv", "dbo.acct_f()"] {
+        assert_eq!(
+            s.scalar(&format!(
+                "SELECT CONCAT(balance, ':', credit_limit) FROM {from}"
+            ))
+            .await,
+            "1000:50",
+            "{from} reads each column under its own name"
+        );
+    }
+    s.exec("UPDATE dbo.acct_v SET balance = 0 WHERE id = 1")
+        .await;
+    assert_eq!(
+        s.scalar("SELECT CONCAT(balance, ':', credit_limit) FROM dbo.acct")
+            .await,
+        "0:50",
+        "the write through the view landed on balance"
+    );
+    // A rebuild under a new name leaves its dependents naming the old one, as
+    // any rename does, and does not fail on refreshing them.
+    let t = read_table(&s, "acct").await;
+    let mut d = TableDraft::from_table(&t);
+    d.columns.swap(1, 2);
+    d.name = "acct2".into();
+    apply_draft(&s, &t, &d).await;
+    assert!(s.try_exec("SELECT * FROM dbo.acct_v").await.is_err());
+}
+
+/// **A computed column rebuilt around a rename refreshes what selects `*`.**
+/// Dropping `c` and adding it back moved it last, and a `SELECT *` view kept
+/// the old positions: it read `x` as `c`, and an `UPDATE` of `x` through it
+/// wrote `y` (S3.2-L5-01).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rebuilt_computed_column_refreshes_the_views_that_select_star() {
+    use schemaic_core::ddl::TableDraft;
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("computed_star").await;
+    s.exec("CREATE TABLE dbo.t4 (id int PRIMARY KEY, a int, c AS (a * 2), x int, y int)")
+        .await;
+    s.exec("INSERT dbo.t4 (id, a, x, y) VALUES (1, 10, 111, 222)")
+        .await;
+    star_dependents(&s, "t4").await;
+    let t = read_table(&s, "t4").await;
+    let mut d = TableDraft::from_table(&t);
+    d.columns[1].info.name = "a2".into();
+    apply_draft(&s, &t, &d).await;
+    for from in ["dbo.t4_v", "rpt.t4_vv", "dbo.t4_f()"] {
+        assert_eq!(
+            s.scalar(&format!(
+                "SELECT CONCAT(a2, ':', c, ':', x, ':', y) FROM {from}"
+            ))
+            .await,
+            "10:20:111:222",
+            "{from} reads each column under its own name"
+        );
+    }
+    s.exec("UPDATE dbo.t4_v SET x = 999 WHERE id = 1").await;
+    assert_eq!(
+        s.scalar("SELECT CONCAT(x, ':', y) FROM dbo.t4").await,
+        "999:222",
+        "the write through the view landed on x"
+    );
+}
+
+/// **A column dropped and another added in one plan refreshes what selects
+/// `*`**: the column count is unchanged, so a view bound by position read the
+/// new column's values under the dropped one's name, silently.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dropped_column_refreshes_the_views_that_select_star() {
+    use schemaic_core::ddl::{ColumnDraft, TableDraft};
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("drop_star").await;
+    s.exec("CREATE TABLE dbo.t (id int PRIMARY KEY, a int, b int)")
+        .await;
+    s.exec("INSERT dbo.t VALUES (1, 10, 20)").await;
+    star_dependents(&s, "t").await;
+    let t = read_table(&s, "t").await;
+    let mut d = TableDraft::from_table(&t);
+    d.columns.remove(2);
+    d.columns
+        .push(ColumnDraft::new(schemaic_core::schema::ColumnInfo {
+            name: "e".into(),
+            type_name: "int".into(),
+            nullable: true,
+            default: Some("99".into()),
+            ..Default::default()
+        }));
+    apply_draft(&s, &t, &d).await;
+    for from in ["dbo.t_v", "rpt.t_vv", "dbo.t_f()"] {
+        assert_eq!(
+            s.scalar(&format!(
+                "SELECT STRING_AGG(c.name, ',') WITHIN GROUP (ORDER BY c.column_id) \
+                 FROM sys.columns c WHERE c.object_id = OBJECT_ID(N'{}')",
+                from.trim_end_matches("()")
+            ))
+            .await,
+            "id,a,e",
+            "{from} names the table's columns as they now are"
+        );
+    }
+    assert_eq!(s.scalar("SELECT e FROM dbo.t_v").await, "99");
+}
