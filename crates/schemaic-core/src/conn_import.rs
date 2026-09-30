@@ -732,8 +732,12 @@ pub fn scan(files: &[SourceFile], existing: &[Connection]) -> ImportScan {
 /// host, a port, a user, a password or an SSH tunnel mean anything for it"* is
 /// verbatim the question here, and a `!is_sqlite` in its place is a spelling
 /// nothing can grep for when a fourth server-less engine arrives.
+///
+/// **And only for a sign-in that reads one** (`AuthMode::uses_credentials` of
+/// the mode in force): a Windows row whose string also named a `User Id` was
+/// flagged *No password in the source* for a sign-in that sends none.
 fn needs_password(c: &Connection) -> bool {
-    is_networked(&c.db_type) && !c.user.trim().is_empty()
+    is_networked(&c.db_type) && c.effective_auth().uses_credentials() && !c.user.trim().is_empty()
 }
 
 // ---------------------------------------------------------------------------
@@ -2722,7 +2726,9 @@ pub enum PgpassScope {
 /// case where a second copy is not wanted.
 ///
 /// The user is part of it. Two logins on one server are two connections — that
-/// is how a read-only reporting account is kept beside the owner's.
+/// is how a read-only reporting account is kept beside the owner's. So is the
+/// sign-in mode in force, for the same reason: Windows and Entra are other
+/// logins.
 pub fn same_endpoint(a: &Connection, b: &Connection) -> bool {
     if !same_engine(&a.db_type, &b.db_type) {
         return false;
@@ -2734,6 +2740,10 @@ pub fn same_endpoint(a: &Connection, b: &Connection) -> bool {
         && a.port == b.port
         && a.database.eq_ignore_ascii_case(&b.database)
         && a.user == b.user
+        // **Who signs in, as `user` is** — `Connection::targets_same_server`'s
+        // rule: a Windows row and an Entra row for one server are two logins,
+        // and collapsing them dropped one (or unticked it as `AlreadySaved`).
+        && a.effective_auth() == b.effective_auth()
         // **The tunnel is part of the target.** `host:port` names a machine only
         // once you know how it is reached: a direct row and a bastion row for
         // one `db.internal:5432` are two different servers, and collapsing them
@@ -5261,6 +5271,68 @@ mod tests {
         let mut pg = at("h", 3306, "d", "u");
         pg.db_type = POSTGRES.into();
         assert!(!same_endpoint(&at("h", 3306, "d", "u"), &pg));
+    }
+
+    /// **Who signs in is part of the endpoint**, as `user` is and as
+    /// `Connection::targets_same_server` already has it: a Windows row and an
+    /// Entra row for one server are two logins. They collapsed into one — the
+    /// Entra connection dropped by `dedupe`, or unticked as `AlreadySaved`
+    /// against a saved Windows one. And a sign-in that reads no password is not
+    /// missing one because the string named a user.
+    #[test]
+    fn the_sign_in_mode_is_part_of_the_endpoint_and_of_the_password_note() {
+        let scan = scan(
+            &[SourceFile {
+                source: ImportSource::Url,
+                path: String::new(),
+                text: "Server=h;Integrated Security=true\n\
+                       Server=h;Authentication=Active Directory Default\n"
+                    .into(),
+                local: None,
+            }],
+            &[],
+        );
+        let modes: Vec<_> = scan.found.iter().map(|i| i.connection.auth).collect();
+        assert_eq!(scan.found.len(), 2, "{modes:?}");
+        assert!(
+            modes.contains(&crate::connection::AuthMode::AzureCli),
+            "{modes:?}"
+        );
+        // A saved Windows connection does not make the Entra import a repeat.
+        let mut saved = parse_url("Server=h;Integrated Security=true").unwrap();
+        saved.auth = crate::connection::AuthMode::Windows;
+        let entra = parse_url("Server=h;Authentication=Active Directory Default").unwrap();
+        assert_eq!(
+            same_endpoint(&saved, &entra),
+            saved.effective_auth() == entra.effective_auth()
+        );
+        assert!(!same_endpoint(
+            &Connection {
+                auth: crate::connection::AuthMode::Password,
+                ..entra.clone()
+            },
+            &entra
+        ));
+        // Windows sign-in that names a user reads no password.
+        let scan = super::scan(
+            &[SourceFile {
+                source: ImportSource::Url,
+                path: String::new(),
+                text: "Server=h;Integrated Security=SSPI;User Id=u\n".into(),
+                local: None,
+            }],
+            &[],
+        );
+        let row = &scan.found[0];
+        assert_eq!(
+            row.has(ImportNote::NoPassword),
+            row.connection.effective_auth().uses_credentials(),
+            "{:?}",
+            row.notes
+        );
+        if cfg!(windows) {
+            assert!(!row.has(ImportNote::NoPassword));
+        }
     }
 
     #[test]

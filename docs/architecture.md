@@ -6904,7 +6904,12 @@ existing prose was left alone.
     keeping. `same_endpoint` is that identity, and deliberately *not* the app's `conn_id`, which a
     row that has never been saved cannot have: engine + host + port + database + user, or the file
     path on SQLite (separators normalised, since a JDBC URL writes `/` on a platform whose paths
-    use `\`). The **user is part of it** — two logins on one server are two connections.
+    use `\`). The **user is part of it** — two logins on one server are two connections — **and so
+    is the sign-in mode in force** (`effective_auth`), as in `Connection::targets_same_server`: a
+    Windows row and an Entra row for one server collapsed into one, the Entra connection dropped by
+    `dedupe` or unticked as `AlreadySaved` against a saved Windows one. `needs_password` asks the
+    mode too (`uses_credentials`), so a Windows row whose string named a `User Id` no longer says
+    *No password in the source* (`the_sign_in_mode_is_part_of_the_endpoint_and_of_the_password_note`).
     `merge_rows`/`merge_skipped` fold one source's result into a list already on screen, and they
     live here rather than at the three call sites because a paste, a picked file and a scan all add
     to the same list: the moment they disagree about ticking or about duplicates, the user gets a
