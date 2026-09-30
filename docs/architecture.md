@@ -4414,7 +4414,27 @@ existing prose was left alone.
     whole (`sql_server_takes_a_retyped_columns_dependents_off_and_back_on`,
     `sql_server_rebuilds_only_the_dependents_a_change_disturbs`,
     `sql_server_leaves_a_drafted_dependent_to_the_draft`,
-    `sql_server_rebuilds_a_computed_column_around_what_it_reads`).
+    `sql_server_rebuilds_a_computed_column_around_what_it_reads`). **One the model reads only in
+    part is refused before it is touched.** Put back from `IndexInfo`, an index states none of its
+    options: an `IGNORE_DUP_KEY` unique index came back without it, so the application's duplicate
+    inserts started failing; fill factor, page locks, compression, a disabled state and a
+    description went the same way, a key lost its fill factor, and a disabled, untrusted foreign
+    key came back enabled and trusted — each plan succeeding and reporting nothing lost
+    (S3.2-L5-02, measured). So `emit_mssql` opens with `tsql_in_place_guard`, the rebuild's kind of
+    guard over exactly what this plan re-creates rather than the whole table, whose `THROW` names
+    the object and ends *change it in SQL*: an index or unique constraint dropped and added back
+    under one name that carries a fill factor, padding, `IGNORE_DUP_KEY`, row or page locks off,
+    compression, a filegroup or partition scheme other than the default, a disabled state, or an
+    extended property on the index or on its key constraint; the primary key re-created (a
+    `Change::PrimaryKey` with both sides non-empty) carrying any of the same; a foreign key re-added
+    that is disabled, untrusted or `NOT FOR REPLICATION`, or carries an extended property; a check
+    re-added that is `NOT FOR REPLICATION` or carries one — its disabled and untrusted states the
+    re-add already restates (`WITH NOCHECK`, `NOCHECK CONSTRAINT`); and a rebuilt computed column
+    carrying an extended property other than the `MS_Description` the comment phase puts back.
+    **It refuses rather than restates**, as the rebuild's guard does. It keys on the name, not on who raised the pair, so
+    the designer's own edit of an index, foreign key or check that keeps its name is refused by the
+    same arm — deliberately, the loss being the same
+    (`re_creating_a_dependent_is_guarded_against_what_the_model_does_not_read`).
     `DropCheck` carries a risk sentence though it deletes no data — the table stops
     guaranteeing something and nothing else says so — but `ChangeSet::destructive`
     suppresses it when the same name is re-added in the same plan, since every check
@@ -11976,9 +11996,12 @@ existing prose was left alone.
   `signature_sql`. **It was `emit_mysql` through a `_`**, whose whole-table loop asks no
   capability, so a SQL Server Truncate went into the script as `TRUNCATE TABLE [dbo].[t];` in
   MySQL's grammar while the preview listed it as refused. **An edit of an existing table runs in
-  phases, and the order is T-SQL's, not a tidy one**: first, where the plan moves columns, what
-  selects `*` from the table captured (`tsql_collect_star_dependents`, under `ddl.rs`); then the
-  drops of what covers columns —
+  phases, and the order is T-SQL's, not a tidy one**: first the guard (`tsql_in_place_guard`,
+  under `ddl.rs`), one batch that `THROW`s before anything runs where the plan would re-create or
+  reset what the model does not read, by every object's name before the plan since it runs ahead
+  of the renames, and no statement at all where the plan re-creates nothing; then, where the plan
+  moves columns, what selects `*` from the table captured (`tsql_collect_star_dependents`, under
+  `ddl.rs`); then the drops of what covers columns —
   foreign keys first of all, since one referencing the table's own key blocks the key's drop, then
   checks and the primary key (`DROP CONSTRAINT` by name), then indexes (`DROP CONSTRAINT` for one a
   constraint backs, `DROP INDEX [i] ON t` otherwise); then dropped columns, each after its
@@ -12035,7 +12058,16 @@ existing prose was left alone.
   (`sql_server_sets_and_clears_comments_by_the_names_the_plan_leaves`).
   `tsql_alter_column` restates **both** type and nullability, with the collation, whenever any of
   them changed, since T-SQL resets what `ALTER COLUMN` isn't told — a retype that left `NOT NULL`
-  off would make the column nullable — and an identity is always altered `NOT NULL`. **A default
+  off would make the column nullable — and an identity is always altered `NOT NULL`. **What it
+  cannot restate, the plan refuses to reset**: the reset takes `MASKED` and `SPARSE` with it and
+  the model reads neither, so a retype, a nullability or a collation change left a masked column
+  readable in the clear while the plan reported success (S3.1-L1-01, measured on 2022 and 2025).
+  So wherever `tsql_alter_restates` says an `ALTER COLUMN` will be written — a change of type,
+  collation or nullability, a new default, name or comment leaving the definition alone — the
+  guard refuses the plan over a masked, sparse or column-set column, by its name before any
+  rename. `ROWGUIDCOL`, reset the same way, needs no arm: the server already refuses that
+  `ALTER COLUMN` (Msg 4928)
+  (`an_in_place_alter_column_is_refused_over_a_masked_or_sparse_column`). **A default
   is redone only when it changes, or around a change of type or collation**, which a default
   constraint blocks; a change of nullability alone leaves it, the server allowing that (measured).
   Defaults are compared through `norm_default`. **A default dropped and re-added keeps its name**:
@@ -12648,7 +12680,10 @@ existing prose was left alone.
   `mssql.rs` above), `run_ddl` and the designer's plans (from a designed table and a
   failing plan rolled back whole to an existing table's edit landing as drafted, an edit keeping
   what it did not change, an identity toggle withheld over an index the rebuild cannot restate, a
-  table rebuilt three ways and refused once by the rebuild's guard, the views and inline function
+  table rebuilt three ways and refused once by the rebuild's guard, an in-place change refused by
+  its own guard over a masked or sparse column and over a dependent a retype would re-create
+  without what it carries, eight cases (`a_masked_or_sparse_column_is_not_altered_in_place`,
+  `a_retype_is_refused_where_a_dependent_carries_what_it_would_drop`), the views and inline function
   that select `*` from a table refreshed after a rebuild, a rebuilt computed
   column and a dropped column (`a_rebuild_refreshes_the_views_that_select_star_from_it` and its two
   siblings), a clustered index and a nonclustered key

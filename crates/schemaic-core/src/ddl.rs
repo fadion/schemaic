@@ -4376,6 +4376,8 @@ impl ChangeSet {
             .filter(|c| supports_change(d, c))
             .collect();
         let mut out = Vec::new();
+        // First, what would make any of it lose what the model does not read.
+        out.extend(tsql_in_place_guard(&q, &admitted));
         // Whole objects.
         for c in &admitted {
             match c {
@@ -6964,7 +6966,7 @@ fn tsql_alter_column(q: &str, from: &ColumnInfo, to: &ColumnInfo) -> Vec<String>
     let col = ddl_ident_in(&to.name, d);
     let null_of = |c: &ColumnInfo| c.nullable && !c.auto_increment;
     let retyped = !types_equal(&from.type_name, &to.type_name, d) || from.collation != to.collation;
-    let altered = retyped || null_of(from) != null_of(to);
+    let altered = tsql_alter_restates(from, to);
     let old = norm_default(from.default.as_deref());
     let new = norm_default(to.default.as_deref());
     let redo = !defaults_equal(old.as_deref(), new.as_deref()) || (retyped && old.is_some());
@@ -7004,6 +7006,223 @@ fn tsql_alter_column(q: &str, from: &ColumnInfo, to: &ColumnInfo) -> Vec<String>
         _ => out.extend(alter.map(|a| format!("{a};"))),
     }
     out
+}
+
+/// Does [`tsql_alter_column`] restate the column — write an `ALTER COLUMN`
+/// — for this change? When its type, collation or nullability changes; a new
+/// default, name or comment leaves the column's definition alone.
+fn tsql_alter_restates(from: &ColumnInfo, to: &ColumnInfo) -> bool {
+    let null_of = |c: &ColumnInfo| c.nullable && !c.auto_increment;
+    !types_equal(&from.type_name, &to.type_name, SqlDialect::MsSql)
+        || from.collation != to.collation
+        || null_of(from) != null_of(to)
+}
+
+/// **SQL Server's guard for a plan that changes a table in place** — the
+/// counterpart of [`tsql_rebuild_sql`]'s, over what this plan re-creates
+/// rather than over the whole table: one batch opening the plan, which
+/// `THROW`s the first reason before anything runs, or `None` where the plan
+/// re-creates nothing. `q` is the table, qualified and quoted; every name is
+/// the one the object has **before** the plan, since the guard runs first.
+///
+/// - A column `ALTER COLUMN` restates ([`tsql_alter_restates`]) that is
+///   masked, sparse or a column set: T-SQL resets whatever the statement
+///   does not say, a mask and `SPARSE` included, and the model reads neither
+///   — so a retype, a nullability or a collation change left a masked column
+///   readable in the clear (S3.1-L1-01).
+/// - An index, unique constraint or primary key dropped and added back —
+///   `repair_tsql_dependents`' pairs around a retype, or an edit that keeps
+///   the name — carrying a fill factor, padding, `IGNORE_DUP_KEY`, row or
+///   page locks switched off, compression, a filegroup or partition scheme
+///   other than the default, a disabled state, or an extended property on
+///   it or its constraint: `CREATE INDEX` from [`IndexInfo`] states none of
+///   them (S3.2-L5-02).
+/// - A foreign key dropped and added back that is disabled, untrusted or
+///   `NOT FOR REPLICATION`, or carries an extended property — it came back
+///   enforced and trusted.
+/// - A check dropped and added back that is `NOT FOR REPLICATION` or
+///   carries an extended property; its disabled and untrusted states the
+///   re-add already restates.
+/// - A computed column rebuilt that carries an extended property other than
+///   its comment, which the re-add restates.
+///
+/// Refusing rather than restating, as the rebuild does: the alternative to
+/// each is a plan that succeeds and reports nothing lost.
+fn tsql_in_place_guard(q: &str, changes: &[&Change]) -> Option<String> {
+    let lit = |s: &str| tsql_n(s);
+    let names = |pick: fn(&Change) -> Option<&str>| -> Vec<&str> {
+        let mut v: Vec<&str> = changes.iter().filter_map(|c| pick(c)).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    };
+    let both = |a: Vec<&'_ str>, b: &[&str]| -> Vec<String> {
+        a.into_iter()
+            .filter(|n| b.contains(n))
+            .map(str::to_string)
+            .collect()
+    };
+    let added_ix = names(|c| match c {
+        Change::AddIndex(ix) => Some(ix.name.as_str()),
+        _ => None,
+    });
+    let indexes = both(
+        names(|c| match c {
+            Change::DropIndex { name, .. } => Some(name.as_str()),
+            _ => None,
+        }),
+        &added_ix,
+    );
+    let added_fk = names(|c| match c {
+        Change::AddForeignKey(fk) => Some(fk.name.as_str()),
+        _ => None,
+    });
+    let foreign_keys = both(
+        names(|c| match c {
+            Change::DropForeignKey { name } => Some(name.as_str()),
+            _ => None,
+        }),
+        &added_fk,
+    );
+    let added_ck = names(|c| match c {
+        Change::AddCheck(ck) => Some(ck.name.as_str()),
+        _ => None,
+    });
+    let checks = both(
+        names(|c| match c {
+            Change::DropCheck { name } => Some(name.as_str()),
+            _ => None,
+        }),
+        &added_ck,
+    );
+    let key = changes.iter().any(
+        |c| matches!(c, Change::PrimaryKey { from, to, .. } if !from.is_empty() && !to.is_empty()),
+    );
+    let restated: Vec<&str> = changes
+        .iter()
+        .filter_map(|c| match c {
+            Change::AlterColumn { from, to, .. } if tsql_alter_restates(from, to) => {
+                Some(from.name.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    let computed: Vec<&str> = changes
+        .iter()
+        .filter_map(|c| match c {
+            Change::RebuildComputedColumn { column } => Some(column.name.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    // What `CREATE INDEX` from the model does not state, for the index `which`
+    // picks out of `sys.indexes i`.
+    let index_carries = |which: &str| {
+        format!(
+            "EXISTS (SELECT 1 FROM sys.indexes i WHERE i.object_id = @t AND {which} \
+             AND (i.fill_factor NOT IN (0, 100) OR i.is_padded = 1 OR i.ignore_dup_key = 1 \
+             OR i.allow_row_locks = 0 OR i.allow_page_locks = 0 OR i.is_disabled = 1 \
+             OR EXISTS (SELECT 1 FROM sys.partitions p WHERE p.object_id = @t \
+             AND p.index_id = i.index_id AND p.data_compression <> 0) \
+             OR EXISTS (SELECT 1 FROM sys.data_spaces s WHERE s.data_space_id = i.data_space_id \
+             AND (s.type <> 'FG' OR s.is_default = 0)) \
+             OR EXISTS (SELECT 1 FROM sys.extended_properties e WHERE e.class = 7 \
+             AND e.major_id = @t AND e.minor_id = i.index_id) \
+             OR EXISTS (SELECT 1 FROM sys.key_constraints k JOIN sys.extended_properties e \
+             ON e.class = 1 AND e.major_id = k.object_id WHERE k.parent_object_id = @t \
+             AND k.unique_index_id = i.index_id)))"
+        )
+    };
+    let mut reasons: Vec<(String, String)> = Vec::new();
+    for col in &restated {
+        reasons.push((
+            format!(
+                "EXISTS (SELECT 1 FROM sys.columns WHERE object_id = @t AND name = {} \
+                 AND (is_masked = 1 OR is_sparse = 1 OR is_column_set = 1))",
+                lit(col)
+            ),
+            format!(
+                "The column {col} is masked or sparse, which ALTER COLUMN would silently drop \
+                 and Schemaic doesn't restate - change it in SQL"
+            ),
+        ));
+    }
+    if key {
+        reasons.push((
+            index_carries("i.is_primary_key = 1"),
+            "Re-creating the primary key would drop its fill factor, padding, locks, \
+             compression, filegroup, disabled state or extended properties, which Schemaic \
+             doesn't read - change it in SQL"
+                .to_string(),
+        ));
+    }
+    for ix in &indexes {
+        reasons.push((
+            index_carries(&format!("i.name = {}", lit(ix))),
+            format!(
+                "Re-creating the index {ix} would drop its fill factor, padding, \
+                 IGNORE_DUP_KEY, locks, compression, filegroup, disabled state or extended \
+                 properties, which Schemaic doesn't read - change it in SQL"
+            ),
+        ));
+    }
+    for fk in &foreign_keys {
+        reasons.push((
+            format!(
+                "EXISTS (SELECT 1 FROM sys.foreign_keys f WHERE f.parent_object_id = @t \
+                 AND f.name = {} AND (f.is_disabled = 1 OR f.is_not_trusted = 1 \
+                 OR f.is_not_for_replication = 1 OR EXISTS (SELECT 1 FROM sys.extended_properties e \
+                 WHERE e.class = 1 AND e.major_id = f.object_id)))",
+                lit(fk)
+            ),
+            format!(
+                "Re-creating the foreign key {fk} would enable and trust it, or drop its NOT FOR \
+                 REPLICATION or extended properties, which Schemaic doesn't read - change it in SQL"
+            ),
+        ));
+    }
+    for ck in &checks {
+        reasons.push((
+            format!(
+                "EXISTS (SELECT 1 FROM sys.check_constraints c WHERE c.parent_object_id = @t \
+                 AND c.name = {} AND (c.is_not_for_replication = 1 \
+                 OR EXISTS (SELECT 1 FROM sys.extended_properties e WHERE e.class = 1 \
+                 AND e.major_id = c.object_id)))",
+                lit(ck)
+            ),
+            format!(
+                "Re-creating the check {ck} would drop its NOT FOR REPLICATION or extended \
+                 properties, which Schemaic doesn't read - change it in SQL"
+            ),
+        ));
+    }
+    for col in &computed {
+        reasons.push((
+            format!(
+                "EXISTS (SELECT 1 FROM sys.extended_properties e WHERE e.class = 1 \
+                 AND e.major_id = @t AND e.minor_id = COLUMNPROPERTY(@t, {}, 'ColumnId') \
+                 AND e.name <> N'MS_Description')",
+                lit(col)
+            ),
+            format!(
+                "Re-creating the computed column {col} would drop its extended properties other \
+                 than its comment, which Schemaic doesn't read - change it in SQL"
+            ),
+        ));
+    }
+    if reasons.is_empty() {
+        return None;
+    }
+    let cases = reasons
+        .iter()
+        .map(|(cond, why)| format!("WHEN {cond} THEN {}", tsql_n(why)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    Some(format!(
+        "DECLARE @t int = OBJECT_ID({}) DECLARE @why nvarchar(2048) = CASE {cases} END \
+         IF @why IS NOT NULL THROW 50000, @why, 1;",
+        tsql_n(q)
+    ))
 }
 
 /// Can `dialect` declare a non-key index inside its `CREATE TABLE`? MySQL's
@@ -10368,7 +10587,10 @@ fn tsql_var_widening(from: &str, to: &str) -> bool {
 /// left alone, as the check repair above leaves one. One the model cannot
 /// restate — a lossy index, one with included columns — is not touched: the
 /// server then refuses the change naming it, and the plan, one transaction,
-/// rolls back whole.
+/// rolls back whole. One it reads but only in part — an index's options, a
+/// key's disabled state, a description — is taken off and put back only past
+/// [`tsql_in_place_guard`], which refuses the plan before it starts where the
+/// re-created object carries any of it.
 fn repair_tsql_dependents(
     current: &TableInfo,
     renamed: &HashMap<String, String>,
@@ -15344,6 +15566,17 @@ mod tests {
         }
     }
 
+    /// A SQL Server plan's statements without the guard that opens it
+    /// ([`tsql_in_place_guard`]), for the tests about what comes after.
+    fn unguarded(mut stmts: Vec<String>) -> Vec<String> {
+        if stmts.first().is_some_and(|s| {
+            s.starts_with("DECLARE @t int = OBJECT_ID(") && s.contains("THROW 50000")
+        }) {
+            stmts.remove(0);
+        }
+        stmts
+    }
+
     /// **SQL Server's table changes, and the ones T-SQL cannot make in place.**
     /// Every admitted change emits something — admitted and not written would
     /// be a change the plan silently drops — except `KeepLossyIndex`, whose
@@ -15778,6 +16011,10 @@ mod tests {
         };
         let cs = single("orders", Some("sales"), MsSql, ms_alter(from, to));
         let stmts = cs.emit();
+        for s in &stmts {
+            assert_eq!(s.matches(';').count(), 1, "one statement: {s}");
+        }
+        let stmts = unguarded(stmts);
         assert_eq!(
             stmts,
             vec![
@@ -15792,9 +16029,6 @@ mod tests {
                     .to_string(),
             ]
         );
-        for s in &stmts {
-            assert_eq!(s.matches(';').count(), 1, "one statement: {s}");
-        }
     }
 
     /// Only the default changed: no `ALTER COLUMN`. Only the type changed on a
@@ -15833,7 +16067,7 @@ mod tests {
         )
         .emit();
         assert_eq!(
-            stmts,
+            unguarded(stmts),
             vec!["ALTER TABLE [t] ALTER COLUMN [qty] int NOT NULL;"]
         );
 
@@ -15858,7 +16092,7 @@ mod tests {
         )
         .emit();
         assert_eq!(
-            stmts,
+            unguarded(stmts),
             vec!["ALTER TABLE [t] ALTER COLUMN [id] bigint NOT NULL;"]
         );
 
@@ -15886,7 +16120,7 @@ mod tests {
         )
         .emit();
         assert_eq!(
-            stmts,
+            unguarded(stmts),
             vec![
                 "ALTER TABLE [t] ALTER COLUMN [name] nvarchar(100) COLLATE Latin1_General_CS_AS NULL;"
             ]
@@ -15959,7 +16193,8 @@ mod tests {
             ],
         };
         let q = "[dbo].[o'k]";
-        let stmts = cs.emit();
+        // The key is re-created, so the plan opens with its guard.
+        let stmts = unguarded(cs.emit());
         assert_eq!(
             stmts,
             vec![
@@ -16135,6 +16370,119 @@ mod tests {
             ms_plan(&t, &retyped(&t, &[("note", "nvarchar(40)", false)])).len(),
             1
         );
+    }
+
+    /// **A dependent taken off and put back is refused where it carries what
+    /// the model does not read** (S3.2-L5-02): re-created from `IndexInfo` and
+    /// `ForeignKeyInfo`, an index came back without its `IGNORE_DUP_KEY`, fill
+    /// factor, locks, compression, disabled state or description, and a
+    /// disabled, untrusted foreign key came back enforced — silently. So the
+    /// plan opens with the rebuild's kind of guard over exactly the objects it
+    /// re-creates, by name, one batch, before anything runs.
+    #[test]
+    fn re_creating_a_dependent_is_guarded_against_what_the_model_does_not_read() {
+        let t = ms_dependents_table();
+        let d = retyped(
+            &t,
+            &[
+                ("id", "bigint", false),
+                ("a", "bigint", true),
+                ("c", "nvarchar(10)", true),
+                ("f", "bigint", true),
+                ("k", "bigint", true),
+            ],
+        );
+        let stmts = diff(&t, &d, MsSql).emit();
+        let guard = &stmts[0];
+        assert!(
+            guard.starts_with("DECLARE @t int = OBJECT_ID(N'[dbo].[t]')"),
+            "{stmts:#?}"
+        );
+        assert!(guard.ends_with("IF @why IS NOT NULL THROW 50000, @why, 1;"));
+        assert_eq!(guard.matches(';').count(), 1, "one batch: {guard}");
+        for needle in [
+            "i.is_primary_key = 1",
+            "i.name = N'ix_a'",
+            "i.name = N'uq_c'",
+            "f.name = N'fk_f'",
+            "c.name = N'ck_k'",
+            "ignore_dup_key = 1",
+            "fill_factor NOT IN (0, 100)",
+            "allow_page_locks = 0",
+            "i.is_disabled = 1",
+            "data_compression <> 0",
+            "e.class = 7",
+            "is_not_trusted = 1",
+            "f.is_disabled = 1",
+        ] {
+            assert!(guard.contains(needle), "{needle} not in {guard}");
+        }
+        // Only what the plan re-creates: `note` stands under nothing.
+        assert!(!guard.contains("note"), "{guard}");
+        // A plan that re-creates nothing has no guard.
+        let mut added = TableDraft::from_table(&t);
+        added.columns.push(ColumnDraft::new(ms_col("n", "int")));
+        assert!(
+            !diff(&t, &added, MsSql)
+                .emit()
+                .iter()
+                .any(|s| s.contains("THROW")),
+        );
+    }
+
+    /// **`ALTER COLUMN` resets what it is not told, a mask and `SPARSE`
+    /// included** (S3.1-L1-01): a retype, a nullability or a collation
+    /// change left a masked column in the clear. The model reads neither, so
+    /// the plan refuses, by the column's name before any rename, where the
+    /// statement restates the column — and not where only its default or
+    /// comment changes, which leaves the column alone.
+    #[test]
+    fn an_in_place_alter_column_is_refused_over_a_masked_or_sparse_column() {
+        let to = ColumnInfo {
+            nullable: false,
+            ..ms_col("email", "varchar(100)")
+        };
+        let stmts = single(
+            "orders",
+            Some("sales"),
+            MsSql,
+            ms_alter(ms_col("m", "varchar(100)"), to),
+        )
+        .emit();
+        let guard = &stmts[0];
+        assert!(
+            guard.starts_with("DECLARE @t int = OBJECT_ID(N'[sales].[orders]')"),
+            "{stmts:#?}"
+        );
+        for needle in [
+            "name = N'm'",
+            "is_masked = 1",
+            "is_sparse = 1",
+            "is_column_set = 1",
+        ] {
+            assert!(guard.contains(needle), "{needle} not in {guard}");
+        }
+        assert!(
+            stmts
+                .iter()
+                .position(|s| s.contains("ALTER COLUMN [email]"))
+                > Some(0)
+        );
+        // A new default alone restates nothing.
+        let stmts = single(
+            "orders",
+            Some("sales"),
+            MsSql,
+            ms_alter(
+                ms_col("m", "varchar(100)"),
+                ColumnInfo {
+                    default: Some("'x'".into()),
+                    ..ms_col("m", "varchar(100)")
+                },
+            ),
+        )
+        .emit();
+        assert!(!stmts.iter().any(|s| s.contains("THROW")), "{stmts:#?}");
     }
 
     /// **What each kind of dependent survives, measured:** a nullability
@@ -16412,7 +16760,7 @@ mod tests {
         let cs = diff(&t, &d, MsSql);
         assert!(cs.unsupported().is_empty(), "{:?}", cs.unsupported());
         assert_eq!(
-            cs.emit(),
+            unguarded(cs.emit()),
             [
                 "DROP INDEX [cx] ON [dbo].[t];",
                 "CREATE CLUSTERED INDEX [cx] ON [dbo].[t] ([d], [id]);",

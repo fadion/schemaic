@@ -5177,3 +5177,158 @@ async fn a_dropped_column_refreshes_the_views_that_select_star() {
     }
     assert_eq!(s.scalar("SELECT e FROM dbo.t_v").await, "99");
 }
+
+/// Diff `draft` against `current` and run it, expecting the server to refuse
+/// it: the refusal's text.
+async fn refused_draft(
+    s: &Scratch,
+    current: &schemaic_core::schema::TableInfo,
+    draft: &schemaic_core::ddl::TableDraft,
+) -> String {
+    let stmts = schemaic_core::ddl::diff(current, draft, MS).emit();
+    s.db.run_ddl(&s.name, &stmts, CancellationToken::new())
+        .await
+        .map(|()| panic!("applied:\n{}", stmts.join("\n")))
+        .unwrap_err()
+        .to_string()
+}
+
+/// **`ALTER COLUMN` is refused over a masked or sparse column** (S3.1-L1-01):
+/// it resets both, so making a masked column `NOT NULL`, or retyping a sparse
+/// one, left the first readable in the clear and the second dense, with the
+/// plan reporting success. Now it stops before it starts, the column keeps
+/// both, and a column with neither still changes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_masked_or_sparse_column_is_not_altered_in_place() {
+    use schemaic_core::ddl::TableDraft;
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("masked").await;
+    s.exec(
+        "CREATE TABLE dbo.sp (id int PRIMARY KEY, s int SPARSE NULL, \
+         m varchar(100) MASKED WITH (FUNCTION = 'email()') NULL, plain int NULL)",
+    )
+    .await;
+    s.exec("INSERT dbo.sp VALUES (1, 2, 'alice@example.com', 3)")
+        .await;
+    let t = read_table(&s, "sp").await;
+    type Edit = fn(&mut schemaic_core::schema::ColumnInfo);
+    let edits: [(&str, Edit); 3] = [
+        ("m", |c| c.nullable = false),
+        ("m", |c| c.type_name = "varchar(200)".into()),
+        ("s", |c| c.type_name = "bigint".into()),
+    ];
+    for (col, edit) in edits {
+        let mut d = TableDraft::from_table(&t);
+        edit(
+            &mut d
+                .columns
+                .iter_mut()
+                .find(|c| c.info.name == col)
+                .unwrap()
+                .info,
+        );
+        let refused = refused_draft(&s, &t, &d).await;
+        assert!(
+            refused.contains(&format!("column {col} is masked or sparse")),
+            "{refused}"
+        );
+    }
+    assert_eq!(
+        s.scalar(
+            "SELECT CONCAT(SUM(CAST(is_masked AS int)), ':', SUM(CAST(is_sparse AS int))) \
+             FROM sys.columns WHERE object_id = OBJECT_ID(N'dbo.sp')"
+        )
+        .await,
+        "1:1"
+    );
+    let mut d = TableDraft::from_table(&t);
+    d.columns[3].info.type_name = "bigint".into();
+    apply_draft(&s, &t, &d).await;
+    assert_eq!(read_table(&s, "sp").await.columns[3].type_name, "bigint");
+}
+
+/// **A dependent a retype takes off is not put back without what the model
+/// does not read** (S3.2-L5-02): an index came back without its
+/// `IGNORE_DUP_KEY`, fill factor, page locks, compression, disabled state or
+/// description, a key without its fill factor, and a disabled, untrusted
+/// foreign key came back enforced — each silently. One table per case; each
+/// plan is refused naming what it would have re-created, and the column keeps
+/// its type.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_retype_is_refused_where_a_dependent_carries_what_it_would_drop() {
+    use schemaic_core::ddl::TableDraft;
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("recreate_guard").await;
+    let cases: [(&str, &str, &str); 8] = [
+        (
+            "t_dup",
+            "CREATE UNIQUE INDEX ux ON dbo.t_dup (a) WITH (IGNORE_DUP_KEY = ON)",
+            "index ux",
+        ),
+        (
+            "t_ff",
+            "CREATE INDEX ix ON dbo.t_ff (a) WITH (FILLFACTOR = 60)",
+            "index ix",
+        ),
+        (
+            "t_locks",
+            "CREATE INDEX ix ON dbo.t_locks (a) WITH (ALLOW_PAGE_LOCKS = OFF)",
+            "index ix",
+        ),
+        (
+            "t_zip",
+            "CREATE INDEX ix ON dbo.t_zip (a) WITH (DATA_COMPRESSION = ROW)",
+            "index ix",
+        ),
+        (
+            "t_off",
+            "CREATE INDEX ix ON dbo.t_off (a); ALTER INDEX ix ON dbo.t_off DISABLE",
+            "index ix",
+        ),
+        (
+            "t_doc",
+            "CREATE INDEX ix ON dbo.t_doc (a); \
+             EXEC sp_addextendedproperty N'MS_Description', N'by a', N'SCHEMA', N'dbo', \
+             N'TABLE', N't_doc', N'INDEX', N'ix'",
+            "index ix",
+        ),
+        (
+            "t_fk",
+            "ALTER TABLE dbo.t_fk WITH NOCHECK ADD CONSTRAINT fk_b FOREIGN KEY (b) \
+             REFERENCES dbo.t_fk (a); ALTER TABLE dbo.t_fk NOCHECK CONSTRAINT fk_b",
+            "foreign key fk_b",
+        ),
+        (
+            "t_pk",
+            "ALTER TABLE dbo.t_pk DROP CONSTRAINT pk_t_pk; \
+             ALTER TABLE dbo.t_pk ADD CONSTRAINT pk_t_pk PRIMARY KEY (a) WITH (FILLFACTOR = 70)",
+            "primary key",
+        ),
+    ];
+    for (table, setup, names) in cases {
+        s.exec(&format!(
+            "CREATE TABLE dbo.{table} (a int NOT NULL CONSTRAINT pk_{table} PRIMARY KEY NONCLUSTERED, \
+             b int NULL)"
+        ))
+        .await;
+        // Both columns retyped, so a key from `b` to `a` still matches; the
+        // key on `a` is re-created in every case, and carries nothing but in
+        // the one about it.
+        s.exec(setup).await;
+        let t = read_table(&s, table).await;
+        let mut d = TableDraft::from_table(&t);
+        d.columns[0].info.type_name = "bigint".into();
+        d.columns[1].info.type_name = "bigint".into();
+        let refused = refused_draft(&s, &t, &d).await;
+        assert!(refused.contains(names), "{table}: {refused}");
+        assert_eq!(
+            read_table(&s, table).await.columns[0].type_name,
+            "int",
+            "{table} unchanged"
+        );
+    }
+}
