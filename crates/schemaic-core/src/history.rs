@@ -1376,6 +1376,23 @@ mod tests {
         }
     }
 
+    /// A SQL Server connection's `push` sees T-SQL's credential statements —
+    /// the composition, not only the predicate: this is where a login's
+    /// password reached `history.json` before `carries_credential` knew them.
+    #[test]
+    fn a_t_sql_credential_statement_is_not_recorded() {
+        for sql in [
+            "ALTER LOGIN sa WITH PASSWORD = N'hunter2'",
+            "CREATE DATABASE SCOPED CREDENTIAL c WITH IDENTITY = 'x', SECRET = 'hunter2'",
+            "CREATE MASTER KEY ENCRYPTION BY PASSWORD = 'hunter2'",
+            "EXEC sp_addlogin 'n', 'hunter2'",
+        ] {
+            let mut v = Vec::new();
+            let recorded = super::push(&mut v, entry(1, sql, 100), SqlDialect::MsSql);
+            assert!(!recorded && v.is_empty(), "should not be recorded: {sql}");
+        }
+    }
+
     #[test]
     fn an_ordinary_statement_naming_a_password_column_is_still_recorded() {
         // Omitting is the safe direction, but not at the cost of dropping every

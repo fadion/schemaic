@@ -6434,7 +6434,16 @@ existing prose was left alone.
     one spelling is a coin toss, `last_used` is `None`, the name gains ` copy`, and `scope` is
     inherited because the copy is for the same place as the original.
   - `history.rs` — query-history model (`push`/`clear_conn`/`preview`/`relative_time`),
-    persisted to `history.json`. An entry is written in **two passes** — `push` when the run
+    persisted to `history.json`. **A statement carrying a credential is not recorded at all**
+    (`sql::carries_credential`, asked inside `push` so no caller can skip it): `IDENTIFIED`,
+    `SET PASSWORD`, a `USER`/`ROLE` statement with `PASSWORD`, and T-SQL's own shapes — `CREATE`/
+    `ALTER LOGIN … PASSWORD`, `BY PASSWORD` (a master key, certificate or symmetric key), a
+    `CREDENTIAL … SECRET`, and the routines that take a password as a bare argument
+    (`sql::SECRET_CALLS`: `sp_addlogin`, `sp_password`, `ENCRYPTBYPASSPHRASE`…). SQL Server
+    arrived without the T-SQL words, so a typed `ALTER LOGIN … WITH PASSWORD` went to
+    `history.json` and its `.bak` in the clear; the rule is deliberately not per dialect, since
+    none of the words means anything else as a statement's shape.
+    An entry is written in **two passes** — `push` when the run
     launches, `finish` when it lands (duration, rows, `Outcome`) — because the two moments
     answer different questions: an entry has to exist while the query is still running (one the
     user cancels, or that the app doesn't outlive, is one they may most want back), and only

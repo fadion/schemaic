@@ -4613,7 +4613,21 @@ pub fn limited_select(dialect: SqlDialect, projection: &str, rest: &str, limit: 
 ///   and `GRANT … IDENTIFIED BY`;
 /// - a `SET` statement containing `PASSWORD` — `SET PASSWORD FOR … = …`;
 /// - a `CREATE`/`ALTER`/`DROP`/`GRANT`/`REVOKE` naming a `USER` or `ROLE` *and*
-///   `PASSWORD` — PostgreSQL's `CREATE ROLE … WITH PASSWORD '…'`.
+///   `PASSWORD` — PostgreSQL's `CREATE ROLE … WITH PASSWORD '…'` — or, as
+///   its second word, T-SQL's `LOGIN` (`ALTER LOGIN sa WITH PASSWORD = …`);
+/// - `BY PASSWORD` anywhere — T-SQL's `CREATE MASTER KEY ENCRYPTION BY
+///   PASSWORD`, `OPEN … DECRYPTION BY PASSWORD`, a certificate's or a
+///   symmetric key's;
+/// - a `CREATE`/`ALTER` naming a `CREDENTIAL` *and* a `SECRET` — T-SQL's
+///   `CREATE DATABASE SCOPED CREDENTIAL … SECRET = '…'`;
+/// - a call to one of [`SECRET_CALLS`], the system procedures and functions
+///   that take a password as a bare argument (`EXEC sp_addlogin 'n', 'pw'`),
+///   with no `PASSWORD` word for the rules above to find.
+///
+/// Not per dialect: none of these words means anything else as a statement's
+/// shape on any engine, and a rule asked of one engine only is the one a new
+/// engine arrives without — this function was never taught T-SQL when SQL
+/// Server came, and `CREATE LOGIN … WITH PASSWORD` went to `history.json`.
 ///
 /// Where it is imprecise it is imprecise toward omitting: a dropped history entry
 /// costs the user a scroll, a kept one writes their secret to disk.
@@ -4623,10 +4637,24 @@ pub fn carries_credential(sql: &str, dialect: SqlDialect) -> bool {
         if words.iter().any(|w| w == "IDENTIFIED") {
             return true;
         }
+        if words.iter().any(|w| SECRET_CALLS.contains(&w.as_str())) {
+            return true;
+        }
+        if words.windows(2).any(|p| p[0] == "BY" && p[1] == "PASSWORD") {
+            return true;
+        }
+        let head = words.first().map(|s| s.as_str());
+        if matches!(head, Some("CREATE" | "ALTER"))
+            && words.iter().any(|w| w == "CREDENTIAL")
+            && words.iter().any(|w| w == "SECRET")
+        {
+            return true;
+        }
         if !words.iter().any(|w| w == "PASSWORD") {
             continue;
         }
-        let names_a_principal = words.iter().any(|w| w == "USER" || w == "ROLE");
+        let names_a_principal = words.iter().any(|w| w == "USER" || w == "ROLE")
+            || words.get(1).is_some_and(|w| w == "LOGIN");
         match words.first().map(|s| s.as_str()) {
             Some("SET") => return true,
             Some("CREATE" | "ALTER" | "DROP" | "GRANT" | "REVOKE") if names_a_principal => {
@@ -4637,6 +4665,24 @@ pub fn carries_credential(sql: &str, dialect: SqlDialect) -> bool {
     }
     false
 }
+
+/// The routines whose arguments include a password in the clear, with no
+/// `PASSWORD` keyword in the statement — SQL Server's system procedures for
+/// logins, linked-server logins and application roles, and its passphrase
+/// and password-hash functions. Upper case, as [`word_tokens`] gives words.
+const SECRET_CALLS: &[&str] = &[
+    "SP_ADDLOGIN",
+    "SP_PASSWORD",
+    "SP_ADDLINKEDSRVLOGIN",
+    "SP_ADDAPPROLE",
+    "SP_SETAPPROLE",
+    "SP_APPROLEPASSWORD",
+    "SP_CONTROL_DBMASTERKEY_PASSWORD",
+    "ENCRYPTBYPASSPHRASE",
+    "DECRYPTBYPASSPHRASE",
+    "PWDENCRYPT",
+    "PWDCOMPARE",
+];
 
 #[cfg(test)]
 mod ident_at_tests {
@@ -6373,6 +6419,49 @@ mod tests {
         assert!(!carries_credential("SELECT 'IDENTIFIED BY' AS note"));
         assert!(!carries_credential("SELECT 1 -- IDENTIFIED BY 'x'"));
         assert!(!carries_credential("SELECT `password` FROM `user`"));
+    }
+
+    /// **T-SQL keeps its secrets in words the MySQL/PostgreSQL rules never
+    /// named**: its principal is a `LOGIN`, a credential's secret is `SECRET =`,
+    /// a key or certificate is protected `BY PASSWORD`, and the system
+    /// procedures take the password as a bare argument with no `PASSWORD` word
+    /// at all. Every one of these went into `history.json` in the clear.
+    #[test]
+    fn carries_credential_knows_t_sql_credential_statements() {
+        let ms = |s: &str| super::carries_credential(s, SqlDialect::MsSql);
+        for s in [
+            "CREATE LOGIN app WITH PASSWORD = N'hunter2'",
+            "ALTER LOGIN sa WITH PASSWORD = N'new' OLD_PASSWORD = N'old'",
+            "create login [app] with password = 'x' must_change, check_policy = on",
+            "CREATE DATABASE SCOPED CREDENTIAL c WITH IDENTITY = 'x', SECRET = 'p'",
+            "ALTER CREDENTIAL c WITH IDENTITY = 'x', SECRET = 'p'",
+            "CREATE MASTER KEY ENCRYPTION BY PASSWORD = 'p'",
+            "OPEN MASTER KEY DECRYPTION BY PASSWORD = 'p'",
+            "CREATE CERTIFICATE c ENCRYPTION BY PASSWORD = 'p' WITH SUBJECT = 's'",
+            "CREATE SYMMETRIC KEY k WITH ALGORITHM = AES_256 ENCRYPTION BY PASSWORD = 'p'",
+            "EXEC sp_addlogin 'n', 'pw'",
+            "EXECUTE master.dbo.sp_password 'old', 'new', 'n'",
+            "EXEC sp_addlinkedsrvlogin 'srv', 'false', NULL, 'u', 'pw'",
+            "EXEC sp_setapprole 'r', 'pw'",
+            "sp_addapprole 'r', 'pw'",
+            "SELECT ENCRYPTBYPASSPHRASE('pw', 'data')",
+            // Anywhere in a batch.
+            "SELECT 1; CREATE LOGIN app WITH PASSWORD = 'x'",
+        ] {
+            assert!(ms(s), "{s}");
+        }
+        // A column or a table that merely shares a word is not a credential.
+        for s in [
+            "SELECT password FROM logins",
+            "SELECT login, password FROM dbo.accounts",
+            "CREATE TABLE t (login varchar(20), password varchar(64))",
+            "UPDATE t SET secret = 1",
+            "SELECT 'BY PASSWORD' AS note",
+            "SELECT name FROM sys.credentials",
+            "SELECT 1 -- CREATE LOGIN a WITH PASSWORD = 'x'",
+        ] {
+            assert!(!ms(s), "{s}");
+        }
     }
 
     #[test]
