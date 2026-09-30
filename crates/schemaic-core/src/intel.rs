@@ -5174,13 +5174,301 @@ pub fn diagnostics(sql: &str, catalog: &Catalog, dialect: SqlDialect) -> Vec<Dia
     let last = ranges.len().saturating_sub(1);
     let mut out: Vec<Diagnostic> = Vec::new();
     for (idx, &(lo, hi)) in ranges.iter().enumerate() {
-        let terminated = sql.as_bytes().get(hi - 1) == Some(&b';');
-        let is_typing_tail = idx == last && !terminated;
-        statement_diagnostics(sql, lo, hi, is_typing_tail, catalog, dialect, &mut out);
-        typo_checks(sql, lo, hi, catalog, dialect, &mut out);
-        function_typo_checks(sql, lo, hi, catalog, dialect, &mut out);
+        range_diagnostics(sql, lo, hi, idx == last, catalog, dialect, &mut out);
     }
     dedup_diagnostics(out)
+}
+
+/// The diagnostics for one range of [`crate::sql::statement_ranges`],
+/// `sql[lo..hi]`; `is_last` when it is the buffer's last, whose unterminated
+/// end is the fragment still being typed.
+///
+/// **A range is not always one statement.** T-SQL needs no `;`, so a script in
+/// the language's normal style is one range, and so is a routine body or a
+/// `BEGIN … END` block wherever the editor keeps one together. The range is cut
+/// again into [`statement_units`] and each is checked alone: only the last
+/// unit of the last range is the typing tail, and an error in one statement
+/// hides nothing in the next. It was one unit, so the whole script was the
+/// typing tail — its parse error withheld and, a multi-statement blob never
+/// parsing, its table and column checks never run.
+fn range_diagnostics(
+    sql: &str,
+    lo: usize,
+    hi: usize,
+    is_last: bool,
+    catalog: &Catalog,
+    dialect: SqlDialect,
+    out: &mut Vec<Diagnostic>,
+) {
+    let terminated = sql.as_bytes().get(hi - 1) == Some(&b';');
+    let units = statement_units(sql, lo, hi, dialect);
+    let n = units.len();
+    for (k, &(ulo, uhi)) in units.iter().enumerate() {
+        let is_typing_tail = is_last && k + 1 == n && !terminated;
+        statement_diagnostics(sql, ulo, uhi, is_typing_tail, catalog, dialect, out);
+    }
+    typo_checks(sql, lo, hi, catalog, dialect, out);
+    function_typo_checks(sql, lo, hi, catalog, dialect, out);
+}
+
+/// Does `dialect` end a statement **without a `;`** — at the next one's first
+/// word? T-SQL does: `SET NOCOUNT ON` on one line and `SELECT …` on the next
+/// are two statements. Every other engine here needs the terminator.
+fn statements_need_no_terminator(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+        SqlDialect::MsSql => true,
+    }
+}
+
+/// `sql[lo..hi]` parsed as the statements it holds — without requiring a `;`
+/// between them where [`statements_need_no_terminator`], which is how the
+/// server reads them, so a cut [`statement_units`] could not be sure of costs
+/// nothing.
+fn parse_statements(
+    text: &str,
+    dialect: SqlDialect,
+) -> Result<Vec<sqlparser::ast::Statement>, sqlparser::parser::ParserError> {
+    let d = dialect.parser();
+    let mut options =
+        sqlparser::parser::ParserOptions::new().with_trailing_commas(d.supports_trailing_commas());
+    options.require_semicolon_stmt_delimiter = !statements_need_no_terminator(dialect);
+    sqlparser::parser::Parser::new(&*d)
+        .with_options(options)
+        .try_with_sql(text)?
+        .parse_statements()
+}
+
+/// The statements one range holds, as byte ranges that tile it: the range
+/// whole, except where [`statements_need_no_terminator`] — there it is cut
+/// before each statement's first word ([`tsql_statement_starts`]). A routine
+/// is one statement whatever it holds.
+fn statement_units(sql: &str, lo: usize, hi: usize, dialect: SqlDialect) -> Vec<(usize, usize)> {
+    if !statements_need_no_terminator(dialect) {
+        return vec![(lo, hi)];
+    }
+    let toks = tokenize_range(sql, lo, hi, dialect);
+    if is_routine_statement(&toks) {
+        return vec![(lo, hi)];
+    }
+    let mut out = Vec::new();
+    let mut from = lo;
+    for s in tsql_statement_starts(&toks) {
+        out.push((from, toks[s].at));
+        from = toks[s].at;
+    }
+    out.push((from, hi));
+    out
+}
+
+/// Where each T-SQL statement after the first begins, as indices into `toks`
+/// (one range's tokens) — at a `;`, or before a word that begins one.
+///
+/// **Not [`crate::sql::tsql_statements`]**, which finds where the statements
+/// the write guards ask about begin and can afford to cut in the wrong place:
+/// a fragment there is one no guard answers for. Here a wrong cut is a false
+/// syntax error on a working script — `INSERT INTO t (a)` cut from its
+/// `SELECT`, `ALTER TABLE t` from its `DROP COLUMN` — so this cuts only where a
+/// new statement must begin, and a cut it misses costs nothing: the unit is
+/// parsed without requiring `;` between statements ([`parse_statements`]),
+/// which is how the server reads it.
+///
+/// Only at the top level, outside a `CASE … END`, and never inside a
+/// `GRANT`/`REVOKE`/`DENY` (whose privilege list is made of these words) or a
+/// statement opened by control-of-flow — `IF`, `WHILE`, a `BEGIN … END`
+/// block — which the parser reads whole.
+fn tsql_statement_starts(toks: &[Token]) -> Vec<usize> {
+    // An unquoted word that can be a keyword: not a qualified name's part,
+    // not a variable or a temporary table.
+    let word = |j: usize| -> Option<String> {
+        let t = toks.get(j)?;
+        let TkKind::Word(w) = &t.kind else {
+            return None;
+        };
+        let qualified = j > 0 && matches!(toks[j - 1].kind, TkKind::Dot);
+        (!t.quoted && !qualified && !w.starts_with(['@', '#'])).then(|| w.to_ascii_uppercase())
+    };
+    let lparen = |j: usize| matches!(toks.get(j).map(|t| &t.kind), Some(TkKind::LParen));
+    let mut starts = Vec::new();
+    let mut depth = 0usize;
+    let mut st = TsqlStatement::begin(word(0), word(1));
+    for (i, t) in toks.iter().enumerate() {
+        match t.kind {
+            TkKind::LParen => {
+                depth += 1;
+                continue;
+            }
+            TkKind::RParen => {
+                depth = depth.saturating_sub(1);
+                continue;
+            }
+            _ if depth > 0 => continue,
+            _ => {}
+        }
+        if i == 0 {
+            st.observe(word(0).as_deref());
+            continue;
+        }
+        let w = word(i);
+        let prev = word(i - 1);
+        let next = word(i + 1);
+        let cut = t.after_semicolon
+            || w.as_deref().is_some_and(|w| {
+                st.cuts_before(w, prev.as_deref(), next.as_deref(), lparen(i + 1))
+            });
+        if cut {
+            starts.push(i);
+            st = TsqlStatement::begin(w.clone(), next);
+        }
+        st.observe(w.as_deref());
+    }
+    starts
+}
+
+/// What [`tsql_statement_starts`] knows of the statement it is inside.
+struct TsqlStatement {
+    /// Its first word.
+    head: Option<String>,
+    /// The verb it performs: the head, or for a `WITH` the statement its
+    /// common table expressions feed, once that is seen.
+    verb: Option<String>,
+    /// An `INSERT` has reached its rows — `SELECT`, `VALUES` or `EXEC`.
+    rows: bool,
+    /// An `UPDATE` has reached its `SET`.
+    set: bool,
+    /// Open `CASE`s, whose `END` and `ELSE` are theirs.
+    case: usize,
+    /// Opened by control-of-flow the parser reads whole: never cut inside.
+    whole: bool,
+}
+
+impl TsqlStatement {
+    fn begin(head: Option<String>, next: Option<String>) -> TsqlStatement {
+        let verb = head.clone().filter(|h| h != "WITH");
+        let whole = match head.as_deref() {
+            Some("IF" | "WHILE" | "ELSE" | "END") => true,
+            // A block, not `BEGIN TRAN`.
+            Some("BEGIN") => !matches!(
+                next.as_deref(),
+                Some("TRAN" | "TRANSACTION" | "WORK" | "DISTRIBUTED" | "DIALOG" | "CONVERSATION")
+            ),
+            _ => false,
+        };
+        TsqlStatement {
+            head,
+            verb,
+            rows: false,
+            set: false,
+            case: 0,
+            whole,
+        }
+    }
+
+    fn head_is(&self, heads: &[&str]) -> bool {
+        self.head.as_deref().is_some_and(|h| heads.contains(&h))
+    }
+
+    /// Does the word `w`, at the top level of this statement, begin the next
+    /// one? `prev`/`next` are the keyword-capable words either side of it,
+    /// `call` whether a `(` follows it.
+    fn cuts_before(&self, w: &str, prev: Option<&str>, next: Option<&str>, call: bool) -> bool {
+        if self.whole || self.head_is(&["GRANT", "REVOKE", "DENY"]) {
+            return false;
+        }
+        let is = |x: Option<&str>, set: &[&str]| x.is_some_and(|x| set.contains(&x));
+        // A `WITH`'s common table expressions, before the statement they feed.
+        let feeding = self.head.as_deref() == Some("WITH") && self.verb.is_none();
+        let inserting = self.verb.as_deref() == Some("INSERT") && !self.rows;
+        match w {
+            "SELECT" => {
+                !(is(prev, &["UNION", "ALL", "EXCEPT", "INTERSECT", "AS", "FOR"])
+                    || feeding
+                    || inserting)
+            }
+            "INSERT" => !(prev == Some("THEN") || feeding),
+            // `UPDATE(col)` is a trigger's function; `FOR UPDATE [OF]` a
+            // cursor's; `ON UPDATE CASCADE` a key's.
+            "UPDATE" => !(is(prev, &["THEN", "ON", "FOR", "OF"]) || call || feeding),
+            "DELETE" => !(is(prev, &["THEN", "ON"]) || feeding),
+            // `INNER MERGE JOIN` is a join hint.
+            "MERGE" => !(next == Some("JOIN") || feeding),
+            "SET" => {
+                !(is(prev, &["UPDATE", "DELETE"])
+                    || (self.verb.as_deref() == Some("UPDATE") && !self.set)
+                    || self.head_is(&["ALTER"]))
+            }
+            // `INSERT … EXEC p`, and `WITH EXECUTE AS` in an option list.
+            "EXEC" | "EXECUTE" => !(inserting || prev == Some("WITH")),
+            // `ALTER TABLE t ALTER COLUMN`/`DROP COLUMN`; another object's
+            // `CREATE TABLE`/`DROP VIEW` is another statement.
+            "CREATE" | "ALTER" | "DROP" => {
+                !(self.head_is(&["ALTER", "CREATE", "DROP"])
+                    && !is(
+                        next,
+                        &[
+                            "TABLE",
+                            "VIEW",
+                            "PROC",
+                            "PROCEDURE",
+                            "FUNCTION",
+                            "TRIGGER",
+                            "INDEX",
+                            "UNIQUE",
+                            "CLUSTERED",
+                            "NONCLUSTERED",
+                            "SCHEMA",
+                            "DATABASE",
+                            "TYPE",
+                            "SEQUENCE",
+                            "SYNONYM",
+                            "LOGIN",
+                            "USER",
+                            "ROLE",
+                            "STATISTICS",
+                        ],
+                    ))
+            }
+            // `OFFSET … ROWS FETCH NEXT n ROWS ONLY`.
+            "FETCH" => !is(prev, &["ROWS", "ROW"]),
+            // `ALTER DATABASE … WITH ROLLBACK IMMEDIATE`, `WITH GRANT OPTION`.
+            "ROLLBACK" | "GRANT" | "REVOKE" | "DENY" => prev != Some("WITH"),
+            // `ALTER TABLE t ENABLE TRIGGER`, `ALTER INDEX … DISABLE`.
+            "ENABLE" | "DISABLE" => !self.head_is(&["ALTER", "CREATE"]),
+            // `DROP TABLE IF EXISTS t`.
+            "IF" => !is(next, &["EXISTS", "NOT"]),
+            "END" | "ELSE" => self.case == 0,
+            "DECLARE" | "PRINT" | "RAISERROR" | "THROW" | "RETURN" | "WAITFOR" | "USE"
+            | "TRUNCATE" | "GOTO" | "BREAK" | "CONTINUE" | "OPEN" | "CLOSE" | "DEALLOCATE"
+            | "KILL" | "CHECKPOINT" | "DBCC" | "BACKUP" | "RESTORE" | "RECONFIGURE" | "SAVE"
+            | "COMMIT" | "REVERT" | "BULK" | "BEGIN" | "WHILE" => true,
+            _ => false,
+        }
+    }
+
+    /// Take in the word `w` (`None` for any other token) at this statement's
+    /// top level.
+    fn observe(&mut self, w: Option<&str>) {
+        let Some(w) = w else {
+            return;
+        };
+        match w {
+            "CASE" => self.case += 1,
+            "END" if self.case > 0 => self.case -= 1,
+            _ => {}
+        }
+        if self.head.as_deref() == Some("WITH")
+            && self.verb.is_none()
+            && matches!(w, "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "MERGE")
+        {
+            self.verb = Some(w.to_string());
+            return;
+        }
+        match (self.verb.as_deref(), w) {
+            (Some("INSERT"), "SELECT" | "VALUES" | "EXEC" | "EXECUTE") => self.rows = true,
+            (Some("UPDATE"), "SET") => self.set = true,
+            _ => {}
+        }
+    }
 }
 
 /// The parse-driven checks for one statement, `sql[lo..hi]`: its syntax error
@@ -5216,7 +5504,7 @@ fn statement_diagnostics(
     };
     let (tlo, thi) = (lo - base, hi - base);
     let mut found = Vec::new();
-    match sqlparser::parser::Parser::parse_sql(&*dialect.parser(), &text[tlo..thi]) {
+    match parse_statements(&text[tlo..thi], dialect) {
         Ok(asts) => {
             table_existence_checks(text, tlo, thi, catalog, dialect, &asts, &mut found);
             match asts.as_slice() {
@@ -13753,6 +14041,148 @@ mod tests {
             )
             .iter()
             .any(|x| x.message.starts_with("Syntax error"))
+        );
+    }
+
+    /// **A T-SQL script written without `;` is checked statement by
+    /// statement** (S8-L1-02). The range ran to the next `;` or `GO`, so a
+    /// script in the language's normal style was one range, and the last range
+    /// without a `;` is the fragment still being typed: its parse error was
+    /// withheld, and a multi-statement blob never parses, so no syntax error,
+    /// unknown table or unknown column showed anywhere in it. Only the final
+    /// statement is still being typed.
+    #[test]
+    fn a_t_sql_script_without_semicolons_is_checked_statement_by_statement() {
+        let d = |sql: &str| diag_d(sql, SqlDialect::MsSql);
+        let at = |sql: &str, x: &Diagnostic| sql[x.range.0..x.range.1].to_string();
+        // A syntax error on the middle statement, and nothing on the last.
+        let sql = "SELECT 1\nSELECT FROM employees WHERE\nSELECT 2";
+        let found = d(sql);
+        assert!(
+            found.iter().any(|x| x.message.starts_with("Syntax error")
+                && x.range.0 > sql.find('\n').unwrap()
+                && x.range.1 <= sql.rfind('\n').unwrap()),
+            "{found:?}"
+        );
+        // The table and column checks, with no reserved-alias error beside them.
+        let sql = "SELECT 1\nSELECT id FROM nosuchtable\n\
+                   SELECT id FROM employees e WHERE e.nosuchcol = 1\nSELECT 2";
+        let found = d(sql);
+        assert_eq!(
+            found.iter().map(|x| at(sql, x)).collect::<Vec<_>>(),
+            ["nosuchtable", "nosuchcol"],
+            "{found:?}"
+        );
+        // A statement that does not parse is reported, not only its typo.
+        let sql = "SELEC 1\nSELECT 2";
+        assert!(
+            d(sql).iter().any(|x| x.severity == Severity::Error),
+            "{:?}",
+            d(sql)
+        );
+        // The fragment still being typed is the last statement alone.
+        assert!(d("SELECT 1\nSELECT id FROM employees WHERE ").is_empty());
+        // And ordinary scripts, whose statements are cut nowhere they should
+        // not be, stay clean.
+        for sql in [
+            "SET NOCOUNT ON\nSELECT id FROM employees\n\
+             UPDATE employees SET name = N'x' WHERE id = 1\nDELETE FROM employees WHERE id = 2",
+            "INSERT INTO employees (id) SELECT id FROM departments\nSELECT 1",
+            "INSERT INTO employees (id) SELECT id FROM departments UNION ALL SELECT 2\nSELECT 1",
+            "WITH c AS (SELECT id FROM employees) SELECT id FROM c\nSELECT 2",
+            "ALTER TABLE employees DROP COLUMN salary\nALTER TABLE employees ADD bonus int",
+            "MERGE employees AS t USING departments AS s ON t.id = s.id \
+             WHEN MATCHED THEN UPDATE SET t.name = s.name \
+             WHEN NOT MATCHED THEN INSERT (id) VALUES (s.id);",
+            "SELECT id FROM employees ORDER BY id OFFSET 0 ROWS FETCH NEXT 5 ROWS ONLY\nSELECT 1",
+            "DECLARE @x int\nSET @x = 1\nSELECT @x",
+            "UPDATE employees SET name = d.name FROM employees JOIN departments d \
+             ON d.id = employees.dept_id\nSELECT 1",
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON employees TO public",
+            "CREATE TABLE t2 (a int NOT NULL, b int, CONSTRAINT fk FOREIGN KEY (b) \
+             REFERENCES employees (id) ON DELETE SET NULL ON UPDATE CASCADE)\nSELECT 1",
+            "DROP TABLE IF EXISTS t2\nSELECT 1",
+            "SELECT CASE WHEN id = 1 THEN 'a' ELSE 'b' END FROM employees\nSELECT 1",
+        ] {
+            assert!(d(sql).is_empty(), "{sql}: {:?}", d(sql));
+        }
+    }
+
+    /// **The T-SQL statement cuts, one by one** — where a statement must begin,
+    /// and nowhere a word merely continues the one before it.
+    #[test]
+    fn t_sql_statement_units_cut_only_where_a_statement_begins() {
+        let units = |sql: &str| -> Vec<String> {
+            statement_units(sql, 0, sql.len(), SqlDialect::MsSql)
+                .into_iter()
+                .map(|(lo, hi)| sql[lo..hi].trim().to_string())
+                .collect()
+        };
+        for (sql, want) in [
+            ("SELECT 1 SELECT 2", vec!["SELECT 1", "SELECT 2"]),
+            (
+                "SET NOCOUNT ON SELECT 1",
+                vec!["SET NOCOUNT ON", "SELECT 1"],
+            ),
+            ("SELECT 1; SELECT 2;", vec!["SELECT 1;", "SELECT 2;"]),
+            (
+                "DELETE FROM t SET @n = @@ROWCOUNT",
+                vec!["DELETE FROM t", "SET @n = @@ROWCOUNT"],
+            ),
+            (
+                "INSERT INTO t (a) SELECT 1 SELECT 2",
+                vec!["INSERT INTO t (a) SELECT 1", "SELECT 2"],
+            ),
+            (
+                "INSERT INTO t (a) EXEC p PRINT 1",
+                vec!["INSERT INTO t (a) EXEC p", "PRINT 1"],
+            ),
+            (
+                "UPDATE t SET a = 1 SET @x = 2",
+                vec!["UPDATE t SET a = 1", "SET @x = 2"],
+            ),
+            (
+                "DROP TABLE a DROP VIEW b",
+                vec!["DROP TABLE a", "DROP VIEW b"],
+            ),
+            ("SELECT x.select FROM t", vec!["SELECT x.select FROM t"]),
+            (
+                "SELECT (SELECT 1) SELECT 2",
+                vec!["SELECT (SELECT 1)", "SELECT 2"],
+            ),
+        ] {
+            assert_eq!(units(sql), want, "{sql}");
+        }
+        // Whole: each word continues the statement it is in.
+        for sql in [
+            "INSERT INTO t (a) VALUES (1)",
+            "SELECT a FROM t UNION ALL SELECT a FROM u",
+            "WITH c AS (SELECT 1 AS a) INSERT INTO t SELECT a FROM c",
+            "MERGE t USING u ON t.id = u.id WHEN MATCHED THEN UPDATE SET t.a = u.a \
+             WHEN NOT MATCHED THEN INSERT (a) VALUES (u.a) \
+             WHEN NOT MATCHED BY SOURCE THEN DELETE",
+            "ALTER TABLE t ALTER COLUMN a bigint",
+            "ALTER TABLE t DROP COLUMN a",
+            "ALTER TABLE t ENABLE TRIGGER tr",
+            "ALTER DATABASE d SET SINGLE_USER WITH ROLLBACK IMMEDIATE",
+            "CREATE TABLE t (a int REFERENCES u (id) ON DELETE SET NULL ON UPDATE CASCADE)",
+            "DECLARE c CURSOR FOR SELECT a FROM t FOR UPDATE OF a",
+            "SELECT a FROM t ORDER BY a OFFSET 0 ROWS FETCH NEXT 5 ROWS ONLY",
+            "GRANT SELECT, INSERT, UPDATE, DELETE, EXECUTE ON t TO u WITH GRANT OPTION",
+            "SELECT CASE WHEN a = 1 THEN 1 ELSE 2 END FROM t",
+            "DROP TABLE IF EXISTS t",
+            "SELECT * FROM t INNER MERGE JOIN u ON t.id = u.id",
+            "IF @x = 1 SELECT 1 ELSE SELECT 2",
+            "BEGIN SELECT 1 SELECT 2 END",
+            "CREATE PROCEDURE p AS SELECT 1 SELECT 2",
+        ] {
+            assert_eq!(units(sql), [sql], "{sql}");
+        }
+        // Every other engine's range is one statement: it needs the `;`.
+        let sql = "SELECT 1 SELECT 2";
+        assert_eq!(
+            statement_units(sql, 0, sql.len(), SqlDialect::MySql),
+            [(0, sql.len())]
         );
     }
 

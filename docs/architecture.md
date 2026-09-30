@@ -933,7 +933,23 @@ existing prose was left alone.
     it, while `FROM t WITH CUBE` — Msg 336 on the server — passed because only the next word was
     asked (`a_clause_the_parser_lacks_hides_nothing_after_it`,
     `t_sql_grouping_extensions_draw_no_syntax_error`). `OPTION` and `TABLESAMPLE` also end a table
-    reference, since the alias check read `FROM t OPTION (RECOMPILE)` as a reserved alias. The routine statements broke the alias
+    reference, since the alias check read `FROM t OPTION (RECOMPILE)` as a reserved alias.
+    **A range is not always one statement.** T-SQL needs no `;` (`statements_need_no_terminator`,
+    exhaustive per dialect), so a script in the language's normal style is one range — and the last
+    range without a `;` is the fragment still being typed, so its parse error was withheld and, a
+    multi-statement blob never parsing, its table and column checks never ran: no error anywhere in
+    such a script. `range_diagnostics` cuts each range again into `statement_units` and checks each
+    alone; only the last unit of the last range is the typing tail. The cuts (`tsql_statement_starts`)
+    are deliberately **not** `sql::tsql_statements`', which may cut wrongly because a fragment there
+    is one no guard answers for — here a wrong cut is a false syntax error (`INSERT INTO t (a)` cut
+    from its `SELECT`, `ALTER TABLE t` from its `DROP COLUMN`). So it cuts at a `;` and before a word
+    that can only begin a statement in its context (`TsqlStatement::cuts_before`: `SELECT` unless it
+    follows a set operator, `AS`, `FOR` or an `INSERT` still owed its rows; `SET` unless it is an
+    `UPDATE`'s first or follows `ON DELETE`; …), never inside a `CASE`, a `GRANT` or a
+    control-of-flow statement the parser reads whole — and a cut it misses costs nothing, because
+    `parse_statements` parses a unit without requiring `;` between statements, which is how the
+    server reads it (`a_t_sql_script_without_semicolons_is_checked_statement_by_statement`,
+    `t_sql_statement_units_cut_only_where_a_statement_begins`). The routine statements broke the alias
     check a second way: a T-SQL header *ends* in a mandatory `AS` whose next word is the body's
     first statement, so `AS SET`, `AS BEGIN` and `AS RETURN` were reserved-alias errors. `routine_body_as` finds
     that `AS` — the first outside parentheses not preceded by `EXECUTE`/`EXEC` nor by a parameter
