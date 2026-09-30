@@ -624,6 +624,14 @@ async fn a_dump_restores_into_an_empty_database() {
     .await;
     src.exec("CREATE VIEW dbo.v_orders AS SELECT o.id, c.name FROM dbo.orders o JOIN dbo.customers c ON c.id = o.customer_id")
         .await;
+    // Floats a plain decimal cannot carry: T-SQL reads a literal with no
+    // exponent as a `numeric`, which stops at 38 digits (Msg 1007).
+    src.exec(
+        "CREATE TABLE dbo.floats (id int PRIMARY KEY, f float, r real); \
+         INSERT dbo.floats VALUES (1, 1e300, 3.4028235e38), (2, -1e-40, 1e-40), \
+           (3, 1.2345678901234567e-30, 0.5)",
+    )
+    .await;
     src.exec("CREATE TRIGGER dbo.tr_orders ON dbo.orders AFTER INSERT AS SET NOCOUNT ON")
         .await;
     // A routine of each kind: the file used to close each one `GO;` + `GO`,
@@ -722,6 +730,9 @@ async fn a_dump_restores_into_an_empty_database() {
     };
     let restored = both(&dst).await;
     assert_eq!(restored, both(&src).await);
+    let floats = "SELECT STRING_AGG(CONCAT(id, '|', CONVERT(varchar(40), f, 3), '|', \
+                  CONVERT(varchar(40), r, 3)), ';') WITHIN GROUP (ORDER BY id) FROM dbo.floats";
+    assert_eq!(dst.scalar(floats).await, src.scalar(floats).await);
     assert!(restored[1].starts_with("3|Zoë 'q'|"), "{restored:?}");
     assert_eq!(
         dst.scalar("SELECT COUNT(*) FROM sys.foreign_keys").await,

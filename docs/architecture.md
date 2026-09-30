@@ -2333,7 +2333,13 @@ existing prose was left alone.
     `format::contrasting_bytes`, like the column cap's: every size in a ~51 KB window above 64 MiB
     otherwise read *"That file is 64.0 MB — the most that can be loaded is 64.0 MB."*
   - `export.rs` — CSV/JSON/SQL/Markdown/HTML/Excel export (incl. CSV formula-injection guard;
-    Markdown pipe/backslash escaping; HTML entity escaping). **Rows arrive through a pull source,
+    Markdown pipe/backslash escaping; HTML entity escaping). **`sql_literal` writes a float far
+    from 1 with an exponent** (`float_literal`: outside `1e-5..1e16`, `{f:e}`, the shortest digits
+    that read back exactly): Rust prints an `f64` without one, so `1e300` was a 301-digit integer,
+    which T-SQL reads as a `numeric` and refuses past 38 digits (Msg 1007, Msg 103 past 128
+    characters) — a SQL Server dump holding one could not be restored. The exponent form is a
+    float literal on all four engines; an ordinary value keeps the plain form
+    (`a_float_far_from_one_is_written_with_an_exponent`). **Rows arrive through a pull source,
     not as a `&ResultSet`**: `RowChunks::next_chunk` hands over one `RowChunk { rs, order }` at a
     time and `ExportFormat::stream_to` renders from it, returning an `ExportTally`. Every entry
     point took a whole result until the whole-table export landed, which made "export" mean
@@ -3204,7 +3210,8 @@ existing prose was left alone.
     asserts MySQL's file carries neither a `GO` nor an `IDENTITY_INSERT`. The live pin is
     `a_dump_restores_into_an_empty_database` in `tests/live/mssql.rs`: a scratch database with an
     identity holding a gap, a `rowversion`, a computed column, a foreign key, a view, a trigger, a
-    function, a procedure and `datetime2`/`date`/`decimal`/Unicode values is dumped, rendered as the app's writer renders it,
+    function, a procedure, `float`/`real` extremes and `datetime2`/`date`/`decimal`/Unicode values
+    is dumped, rendered as the app's writer renders it,
     split and replayed through `run_script` into an empty database, and compares equal row for row,
     with the key, the view and the trigger present and the next identity continuing from the
     highest carried. It failed against the unfixed `dump.rs`.

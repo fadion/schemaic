@@ -829,7 +829,7 @@ pub fn sql_literal(v: &Value, dialect: SqlDialect) -> String {
         Value::Int(i) => i.to_string(),
         Value::UInt(u) => u.to_string(),
         Value::Float(f) if !f.is_finite() => "NULL".to_string(),
-        Value::Float(f) => f.to_string(),
+        Value::Float(f) => float_literal(*f),
         Value::Str(s) => match dialect {
             SqlDialect::MySql => format!("'{}'", s.replace('\\', "\\\\").replace('\'', "''")),
             // SQLite is standard-conforming like Postgres and has no
@@ -841,6 +841,26 @@ pub fn sql_literal(v: &Value, dialect: SqlDialect) -> String {
             // the way in, so any character outside it arrives as `?`.
             SqlDialect::MsSql => format!("N'{}'", s.replace('\'', "''")),
         },
+    }
+}
+
+/// A finite `f64` as a literal every engine reads back as the same double.
+///
+/// **An exponent once the plain form grows long.** Rust prints an `f64` without
+/// one, so `1e300` is a 301-digit integer and `1e-40` a fraction of forty
+/// zeros. MySQL, PostgreSQL and SQLite take that, but T-SQL reads a literal
+/// with no exponent as a `numeric`, which stops at 38 digits (Msg 1007, and
+/// Msg 103 past 128 characters) — so a dump holding a `float` from `1e38` up,
+/// or small enough to need more than 38 digits, could not be restored. Both
+/// forms print the shortest digits that parse back exactly; the plain one is
+/// kept where it stays short (at most about twenty digits) because it is what
+/// a reader expects to see for `12.25`.
+fn float_literal(f: f64) -> String {
+    let a = f.abs();
+    if a != 0.0 && !(1e-5..1e16).contains(&a) {
+        format!("{f:e}")
+    } else {
+        f.to_string()
     }
 }
 
@@ -3781,6 +3801,41 @@ mod tests {
             sql_literal(&Value::Str("O'Hara".to_string()), MySql),
             "'O''Hara'"
         );
+    }
+
+    /// **A float far from 1 is written with an exponent.** Rust prints an `f64`
+    /// without one, so `1e300` became a 301-digit number and `1e-40` a
+    /// forty-zero fraction — which T-SQL reads as a `numeric` and refuses past
+    /// 38 digits (Msg 1007, Msg 103 past 128 characters), so a dump holding
+    /// either could not be restored. The exponent form is a float literal on
+    /// every engine and prints the shortest digits that read back exactly.
+    #[test]
+    fn a_float_far_from_one_is_written_with_an_exponent() {
+        for d in [MySql, Postgres, Sqlite, MsSql] {
+            for f in [
+                1e300,
+                -1e300,
+                1e-40,
+                f64::from(f32::MAX),
+                f64::MIN_POSITIVE,
+                1.234_567_890_123_456_7e-30,
+                1e16,
+            ] {
+                let lit = sql_literal(&Value::Float(f), d);
+                assert!(lit.contains('e'), "{d:?} {f}: {lit}");
+                assert!(lit.len() <= 24, "{d:?} {f}: {lit}");
+                assert_eq!(lit.parse::<f64>(), Ok(f), "{d:?}: {lit}");
+            }
+            // An ordinary value keeps the plain form a reader expects.
+            for (f, want) in [
+                (-0.5, "-0.5"),
+                (12.25, "12.25"),
+                (0.0, "0"),
+                (0.001, "0.001"),
+            ] {
+                assert_eq!(sql_literal(&Value::Float(f), d), want, "{d:?}");
+            }
+        }
     }
 
     #[test]
