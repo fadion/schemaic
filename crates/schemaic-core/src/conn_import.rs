@@ -392,16 +392,33 @@ impl ImportScan {
 /// (the authority ends at the first `/`, `?` or `#`) is asked first, and the
 /// whole-string search survives only as the fallback for the case it was added
 /// for, behind [`looks_like_userinfo`].
-fn split_userinfo(after: &str) -> (Option<&str>, &str) {
-    let boundary = after.find(['/', '?', '#']).unwrap_or(after.len());
+///
+/// `delims` are the characters that end the authority: [`URL_DELIMS`] for an
+/// ordinary URL, [`MSSQL_URL_DELIMS`] for Microsoft's grammar, whose
+/// properties start at a `;`.
+fn split_userinfo<'a>(after: &'a str, delims: &[char]) -> (Option<&'a str>, &'a str) {
+    let boundary = after.find(delims).unwrap_or(after.len());
     if let Some(i) = after[..boundary].rfind('@') {
         return (Some(&after[..i]), &after[i + 1..]);
     }
     match after.rfind('@') {
-        Some(i) if looks_like_userinfo(&after[..i]) => (Some(&after[..i]), &after[i + 1..]),
+        Some(i) if looks_like_userinfo(&after[..i], delims) => (Some(&after[..i]), &after[i + 1..]),
         _ => (None, after),
     }
 }
+
+/// RFC 3986's authority delimiters: the authority ends at the first of them.
+const URL_DELIMS: &[char] = &['/', '?', '#'];
+
+/// A SQL Server URL's (`sqlserver://h:1433;databaseName=d`): RFC 3986's, and
+/// the `;` Microsoft's properties begin at.
+///
+/// A superset of [`URL_DELIMS`], which is why [`redacted`] can keep using the
+/// ordinary set on a SQL Server URL: a shorter authority can only find an `@`
+/// the longer one also holds, and a shorter port candidate can only look *more*
+/// like a port, so the ordinary rule hides at least what this one takes as a
+/// userinfo.
+const MSSQL_URL_DELIMS: &[char] = &['/', '?', '#', ';'];
 
 /// Does everything before a candidate `@` that lies **past** the authority's
 /// RFC end still read as `user:password` rather than as `host[:port]/path?query`?
@@ -419,15 +436,48 @@ fn split_userinfo(after: &str) -> (Option<&str>, &str) {
 /// The case it gets wrong is a numeric password that also holds a delimiter
 /// (`admin:1234/x@host`), which is indistinguishable from `host:port/path` by
 /// any rule that does not know which server exists.
-fn looks_like_userinfo(head: &str) -> bool {
+fn looks_like_userinfo(head: &str, delims: &[char]) -> bool {
     let Some((user, secret)) = head.split_once(':') else {
         return false;
     };
-    if user.contains(['/', '?', '#']) {
+    if user.contains(delims) {
         return false;
     }
-    let port_like = &secret[..secret.find(['/', '?', '#']).unwrap_or(secret.len())];
+    let port_like = &secret[..secret.find(delims).unwrap_or(secret.len())];
     port_like.is_empty() || !port_like.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// [`split_userinfo`] for Microsoft's grammar, with one case the ordinary rule
+/// cannot decide and this one can: **a numeric password holding a `;`**
+/// (`sa:1234;x@h`). `1234` looks like a port, so the ordinary fallback refuses
+/// it — and the password's first half became the *port*, saved to
+/// `connections.json`. A `;` here starts a property, and a property is always
+/// `key=value`: an `@` in a `;`-segment with no `=` before it belongs to no
+/// property, so it ends a userinfo.
+///
+/// Only where nothing before the `@` is one of [`URL_DELIMS`], so that
+/// [`redacted`], which reads the ordinary grammar, finds this `@` inside its
+/// authority and hides the same password.
+fn split_mssql_userinfo(after: &str) -> (Option<&str>, &str) {
+    let split = split_userinfo(after, MSSQL_URL_DELIMS);
+    if split.0.is_some() {
+        return split;
+    }
+    let Some(i) = after.rfind('@') else {
+        return split;
+    };
+    let head = &after[..i];
+    let (user_part, _) = head.split_once(';').unwrap_or((head, ""));
+    let last_segment = head.rsplit(';').next().unwrap_or("");
+    let userinfo = head.contains(';')
+        && !head.contains(URL_DELIMS)
+        && user_part.contains(':')
+        && !last_segment.contains('=');
+    if userinfo {
+        (Some(head), &after[i + 1..])
+    } else {
+        split
+    }
 }
 
 /// `name` with anything that could be a password replaced by `…`.
@@ -448,7 +498,9 @@ fn redacted(name: &str) -> String {
             // [`split_userinfo`]'s rule, which is the same one `parse_server_url`
             // uses — the two must agree, or the entry the parser refused because
             // of a `/` in the password is the entry whose password is shown.
-            match split_userinfo(after) {
+            // The ordinary delimiters on a SQL Server URL too: see
+            // [`MSSQL_URL_DELIMS`] for why they hide at least as much.
+            match split_userinfo(after, URL_DELIMS) {
                 (Some(userinfo), tail) => {
                     match userinfo.split_once(':') {
                         Some((user, _)) => {
@@ -679,6 +731,11 @@ pub enum UrlError {
     /// A SQL Server connection string whose server is reached by a transport
     /// other than TCP — named pipes, LocalDB. Carries the server as written.
     Transport(String),
+    /// The server parsed with an `@` still in it — a `Server=user:password@host`,
+    /// or any grammar whose userinfo no parser took off. Carries nothing: what
+    /// is there is most likely a password, and the host is saved to
+    /// `connections.json` in plaintext, so it is refused rather than repeated.
+    UserinfoInHost,
 }
 
 impl UrlError {
@@ -702,6 +759,9 @@ impl UrlError {
             UrlError::Transport(s) => format!(
                 "\"{s}\" is reached over named pipes or LocalDB — Schemaic connects over TCP only."
             ),
+            UrlError::UserinfoInHost => "The server name holds an @ — a user name or password \
+                 goes in its own field, not in the server."
+                .to_string(),
         }
     }
 }
@@ -726,10 +786,25 @@ pub fn parse_url(input: &str) -> Result<Connection, UrlError> {
 /// connection string's sign-in Schemaic does not have
 /// ([`ImportNote::ExternalLogin`]).
 ///
+/// **Whatever the grammar, a host still holding an `@` is refused**
+/// ([`UrlError::UserinfoInHost`]): it is a user or a password no parser took
+/// off, and `host` is saved to `connections.json` in plaintext, where the
+/// keyring rule never looks. Asked once, here, rather than in each parser —
+/// the SQL Server URL was the parser that forgot.
+fn parse_url_noted(input: &str) -> Result<(Connection, Vec<ImportNote>), UrlError> {
+    let (c, notes) = parse_url_any(input)?;
+    if c.host.contains('@') {
+        return Err(UrlError::UserinfoInHost);
+    }
+    Ok((c, notes))
+}
+
+/// [`parse_url_noted`] before its host check: the grammar is chosen here.
+///
 /// **A connection string is tried before the `.env` strip**, which would eat
 /// its `Server=` head as a variable name — and after it too, for ASP.NET's
 /// `ConnectionStrings__Default="Server=…"`.
-fn parse_url_noted(input: &str) -> Result<(Connection, Vec<ImportNote>), UrlError> {
+fn parse_url_any(input: &str) -> Result<(Connection, Vec<ImportNote>), UrlError> {
     let trimmed = strip_bom(input).trim();
     if looks_like_connection_string(trimmed) {
         return parse_connection_string(trimmed);
@@ -787,11 +862,24 @@ fn parse_url_noted(input: &str) -> Result<(Connection, Vec<ImportNote>), UrlErro
 /// them: `encrypt=true` verifies the certificate unless
 /// `trustServerCertificate` says not to, `strict` always does, and a trusted
 /// certificate with no `encrypt` is the drivers' encrypted default since 10.2.
+///
+/// **The userinfo comes off first** — Prisma's, node's and SQLAlchemy's
+/// `sqlserver://user:password@host;…` — before the `;` split, for the reason
+/// [`parse_server_url`] takes it first: `;` is as legal in a password as `/`.
+/// Cutting at the `;` first made `user:password@host` the *host*, which is
+/// saved to `connections.json` in plaintext. node's `?encrypt=true` query
+/// after the path is read as properties too.
 fn parse_mssql_url(rest: &str) -> Result<(Connection, Vec<ImportNote>), UrlError> {
     let rest = rest.strip_prefix("//").unwrap_or(rest);
+    let (userinfo, rest) = split_mssql_userinfo(rest);
     let (authority, props) = match rest.split_once(';') {
         Some((a, p)) => (a, p),
         None => (rest, ""),
+    };
+    let authority = authority.split('#').next().unwrap_or("");
+    let (authority, query) = match authority.split_once('?') {
+        Some((a, q)) => (a, q),
+        None => (authority, ""),
     };
     let (hostport, path) = match authority.split_once('/') {
         Some((a, b)) => (a, b),
@@ -803,10 +891,17 @@ fn parse_mssql_url(rest: &str) -> Result<(Connection, Vec<ImportNote>), UrlError
         None => (hostpart, None),
     };
     let mut c = blank(MSSQL);
+    if let Some(ui) = userinfo {
+        let (u, p) = ui.split_once(':').unwrap_or((ui, ""));
+        c.user = percent_decode(u);
+        c.password = percent_decode(p);
+    }
     c.database = percent_decode(path.split('/').next().unwrap_or(""));
     let mut port = port;
     let (mut encrypt, mut trust) = (None::<String>, false);
-    for (k, v) in split_mssql_props(props, false) {
+    let mut pairs = parse_query(query);
+    pairs.extend(split_mssql_props(props, false));
+    for (k, v) in pairs {
         if v.is_empty() {
             continue;
         }
@@ -1141,7 +1236,7 @@ fn parse_server_url(engine: &str, rest: &str) -> Result<Connection, UrlError> {
     // path — all three of whose delimiters are legal password characters. See
     // [`split_userinfo`]: cutting at the first `/` put three characters of a
     // password into a *port* complaint on screen.
-    let (userinfo, rest) = split_userinfo(rest);
+    let (userinfo, rest) = split_userinfo(rest, URL_DELIMS);
     let rest = rest.split('#').next().unwrap_or("");
     let (before_q, query) = match rest.split_once('?') {
         Some((a, b)) => (a, b),
@@ -2933,6 +3028,78 @@ mod tests {
         assert_eq!((c.host.as_str(), c.port), ("db", 50123));
         let c = url("jdbc:sqlserver://db;instanceName=SQLEXPRESS;portNumber=50124");
         assert_eq!((c.host.as_str(), c.port), ("db", 50124));
+    }
+
+    /// **A SQL Server URL's userinfo comes off before its properties**, as
+    /// [`parse_server_url`]'s does. `parse_mssql_url` used to cut the authority
+    /// at the first `;` and hand the rest to `split_host_port`, so
+    /// `sa:S3cret@db.example.com:1433` became the *host* — written to
+    /// `connections.json` in plaintext, where no keyring rule looks, and into
+    /// the suggested name — and a `;` in the password put its first half on
+    /// screen as a "port".
+    #[test]
+    fn a_sql_server_url_takes_its_userinfo_off_before_its_properties() {
+        let c = url("sqlserver://sa:S3cret@db.example.com:1433;databaseName=app");
+        assert_eq!((c.host.as_str(), c.port), ("db.example.com", 1433));
+        assert_eq!((c.user.as_str(), c.password.as_str()), ("sa", "S3cret"));
+        assert_eq!(c.database, "app");
+        assert!(!c.name.contains("S3cret"), "{}", c.name);
+        // node's and SQLAlchemy's: a query after the path, its pairs split at `;`.
+        let c = url(
+            "mssql://sa:S3cret@db.example.com:1433/app?encrypt=true;trustServerCertificate=true",
+        );
+        assert_eq!(c.host, "db.example.com");
+        assert_eq!((c.user.as_str(), c.password.as_str()), ("sa", "S3cret"));
+        assert_eq!(c.database, "app");
+        assert_eq!(c.tls.mode, SslMode::Require);
+        // A `;` inside the password is the password's.
+        let c = url("mssql://sa:pa;ss@db.example.com/app");
+        assert_eq!(c.host, "db.example.com");
+        assert_eq!((c.user.as_str(), c.password.as_str()), ("sa", "pa;ss"));
+        assert_eq!(c.database, "app");
+        // …and so is a numeric one's, whose first half looks like a port.
+        let c = url("sqlserver://sa:1234;x@h:1500;databaseName=d");
+        assert_eq!((c.host.as_str(), c.port), ("h", 1500));
+        assert_eq!((c.user.as_str(), c.password.as_str()), ("sa", "1234;x"));
+        assert_eq!(c.database, "d");
+        // One that fails for another reason shows neither half in the list.
+        let scan = parse_url_scan("mssql://sa:pa;ss@:1433/app\nsqlserver://sa:1234;x@;d=1");
+        assert_eq!(scan.skipped.len(), 2, "{scan:?}");
+        for s in &scan.skipped {
+            let shown = format!("{} {}", s.name, s.reason.message());
+            assert!(
+                !shown.contains("pa;ss") && !shown.contains("ss@"),
+                "{shown}"
+            );
+            assert!(!shown.contains("1234"), "{shown}");
+        }
+        // Percent-escapes are decoded, and the authority beats a property.
+        let c = url("sqlserver://u%40corp:p%3Bw@h;user=other;password=other");
+        assert_eq!((c.user.as_str(), c.password.as_str()), ("u@corp", "p;w"));
+        assert_eq!(c.host, "h");
+        // An `@` in a property value is not a userinfo.
+        let c = url("jdbc:sqlserver://h:1433;user=alice@corp.com;password=x");
+        assert_eq!((c.host.as_str(), c.port), ("h", 1433));
+        assert_eq!(
+            (c.user.as_str(), c.password.as_str()),
+            ("alice@corp.com", "x")
+        );
+    }
+
+    /// Whatever grammar a string came in, **a host holding an `@` is refused**
+    /// rather than imported: it is a user or a password that no parser took
+    /// off, and `host` goes to `connections.json` in plaintext. The refusal
+    /// does not repeat the host.
+    #[test]
+    fn a_host_still_holding_an_at_sign_is_refused_without_repeating_it() {
+        for s in [
+            "Server=sa:Hunter2@db.example.com;Database=d",
+            "Data Source=sa@db.example.com,1433",
+        ] {
+            let err = parse_url(s).expect_err(s);
+            assert!(!err.message().contains("Hunter2"), "{s}: {}", err.message());
+            assert!(!err.message().contains("db.example.com"), "{s}");
+        }
     }
 
     /// **An ADO.NET connection string has no scheme at all** — the shape an

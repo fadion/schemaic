@@ -6977,7 +6977,17 @@ existing prose was left alone.
     path and a query — which is what DataGrip and DBeaver both store, so `parse_mssql_url` reads it
     whenever the URL is JDBC or carries a `;` (the `/database` path is jTDS's, and Prisma writes the
     same properties after `sqlserver://host:port`); an ordinary `mssql://u:p@h:1433/d` still goes
-    through `parse_server_url`. `split_mssql_props` splits at `;` **except inside `{…}`**, which is
+    through `parse_server_url`. **The userinfo comes off before the `;` split**, through
+    `split_mssql_userinfo`, as `parse_server_url` takes it off before the path: `parse_mssql_url`
+    used to cut the authority at the first `;` and never looked for an `@`, so
+    `sqlserver://sa:S3cret@db.example.com:1433;databaseName=app` imported with the host
+    `sa:S3cret@db.example.com` — into the suggested name, and into `connections.json` in plaintext,
+    `host` being no field the keyring rule ever sees — while `mssql://sa:pa;ss@h/app` was refused
+    with *"pa" is not a port number* under the paste field. The user and password are
+    percent-decoded, and node's and SQLAlchemy's `?encrypt=true` after the path is read as
+    properties rather than landing in the database name
+    (`a_sql_server_url_takes_its_userinfo_off_before_its_properties`). `split_mssql_props` splits
+    at `;` **except inside `{…}`**, which is
     how the driver quotes a value holding one (`password={p;w=d}`, `}}` for a literal `}`), and the
     authority wins over a property naming the same thing, as the query does for the other engines.
     `encrypt` and `trustServerCertificate` are read as the Microsoft drivers mean the words, not as
@@ -6995,7 +7005,12 @@ existing prose was left alone.
     noted form. DBeaver also keeps the instance in its own `host` field (`laptop\SQLEXPRESS`), so its
     reader splits it off there and notes it when the entry names no port, and its generic-driver
     fallback strips jTDS's `jtds:` as `parse_url` does
-    (`dbeaver_reads_a_named_instance_and_a_jtds_source`).
+    (`dbeaver_reads_a_named_instance_and_a_jtds_source`). **`parse_url_noted` refuses any parse
+    whose host still holds an `@`**, whatever the grammar — `Server=sa:pw@host` in an ADO.NET string
+    as much as a URL — with `UrlError::UserinfoInHost`, which carries nothing, since what it would
+    repeat is most likely a password. It is asked once there rather than in each parser, because
+    the SQL Server URL parser was the one that forgot; choosing the grammar moved beneath it into
+    the private `parse_url_any` (`a_host_still_holding_an_at_sign_is_refused_without_repeating_it`).
     **A connection string with no scheme at all is SQL Server's too** — ADO.NET's
     `Server=tcp:host\instance,port;Database=d;User Id=u;Password=p`, the shape `appsettings.json`
     holds, and ODBC's and OLE DB's, which spell the same keywords around a `Driver` or `Provider`.
@@ -7041,7 +7056,18 @@ existing prose was left alone.
     later scan. `/`, `?` and `#` are all legal in a password, and this module's own promise is to
     accept more than a strict URL parser would, so one function answers for both readers: the entry a
     parser refuses because of a `/` in the password is exactly the entry whose password would
-    otherwise be shown. **`SkipReason::message` is redacted for the same reason `ImportScan::skip`
+    otherwise be shown. The authority's delimiters are a parameter — `URL_DELIMS` (`/`, `?`, `#`)
+    for an ordinary URL, `MSSQL_URL_DELIMS` adding the `;` Microsoft's properties begin at — and
+    `redacted` keeps the ordinary set even on a SQL Server URL, because the one is a superset of the
+    other: a shorter authority can only find an `@` the longer one holds, and a shorter port
+    candidate only looks *more* like a port, so the ordinary rule hides at least what the SQL
+    Server rule takes as userinfo. `split_mssql_userinfo` decides the one case the fallback cannot,
+    a numeric password holding a `;` (`sa:1234;x@h`): `looks_like_userinfo` refuses it because
+    `1234` reads as a port, and the password's first half became the saved port. A property is
+    always `key=value`, so an `@` in a `;`-segment with no `=` before it ends a userinfo — but only
+    where nothing before the `@` is a `/`, `?` or `#`, so that `redacted` finds the same `@` inside
+    its own authority and hides the same password. **`SkipReason::message` is redacted for the
+    same reason `ImportScan::skip`
     redacts the name** — it is the render-facing accessor, and every variant carrying text carries
     text a *parser* chose out of the entry, so doing it at the one place both are rendered is what
     stops a fourth variant reopening it (`raw_message` is the unredacted form, and this module's own
