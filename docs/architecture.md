@@ -7310,6 +7310,28 @@ existing prose was left alone.
     says so plainly if it is not enough (`an_absent_or_unknown_auth_mode_is_a_password`). A user and
     password are kept under a mode that does not send them — the form's `to_connection` writes both
     whatever the mode — so switching back to a password finds them where they were.
+    **A sign-in has a TLS floor, and Entra's is `VerifyFull`, raised rather than asked for.** An
+    Entra access token is not a password for this server but a bearer token for
+    `https://database.windows.net/`, so for its hour of life it opens every Azure SQL database the
+    account can reach — and it used to travel over whatever the picker said. A hand-made
+    connection defaults to `Disable`, which on SQL Server is TDS `Off` with `AnyCertificate`
+    (`db/tls.rs`), so anyone on the path presenting any certificate received the token in the
+    login packet. `AuthMode::tls_floor` is `Disable` for the other two modes and `VerifyFull` for
+    `AzureCli`, and **`Connection::tls_mode_in_force` — the picked mode `stronger_of` the floor of
+    `effective_auth` — is what `uses_tls` and `tls_plan` read**, so the plan `Db::connect` builds,
+    and the one the MCP endpoint handoff serialises off `Db::tls_plan`, are raised, with the
+    connection's own CA path and client identity (`an_entra_sign_in_always_plans_a_verifying_handshake`).
+    Reading the stored mode at either of those two is the bug back. What the floor does not cover
+    is a SQL login's password under `Prefer` or `Require`, which has the same exposure and stays the
+    user's call: for the token that call costs far more and buys nothing, since Azure SQL presents
+    a publicly issued certificate `VerifyFull` accepts with no CA file, and a named CA still
+    anchors it for a server that does not. A floor rather than a refusal the user must answer, because raising the
+    mode can only fail loudly. The stored mode is never written — see the form's `tls_fields` for
+    why — so `tls_note` is the sentence that keeps the picked and connected modes from being two
+    things silently. `TlsPlan::verifies_server` is the rung read back off a plan (no plaintext
+    retry, no invalid certificate, the name checked), and `transport_refusal` compares a plan with
+    the floor for the driver's own check, which `mssql.rs` makes before any token is fetched
+    (`an_entra_token_is_refused_over_a_transport_that_verifies_nothing`).
     **`Connection::trimmed` is the padding rule, and it is one answer because the form had made it
     seven times and omitted it five.** `to_connection` trimmed `port`, `file`, `database`, the SSH
     port and all three TLS paths and stored `host`, `user`, `ssh.host`, `ssh.user` and
@@ -11824,7 +11846,16 @@ existing prose was left alone.
   `libkrb5`, a system dependency for every Linux build; elsewhere the arm is a refusal, never reached
   because `AuthMode::offered` does not offer the mode. `AzureCli` is `AuthMethod::aad_token` over
   `entra::sql_token()`, the login's FedAuth extension in stock tiberius — none of the vendored
-  patches is about it. That is why `config` is `async` now. **A refused Entra login forgets its
+  patches is about it. That is why `config` is `async` now. **`config` refuses an Entra sign-in
+  whose plan does not reach its TLS floor, and does it before the token is fetched**
+  (`AuthMode::transport_refusal` → `DbError::Refused`). A `Db` resolved from a connection already
+  carries the `VerifyFull` plan `Connection::tls_plan` raises it to (`connection.rs`), so this is
+  for a handle assembled from parts, which carries only the plan it was handed: with none, the
+  Azure CLI is never asked and nothing is dialled
+  (`an_entra_handle_without_a_verifying_plan_is_refused_before_the_token`). The raise is verified
+  live on the Azure SQL test bed — an Entra connection left at `Disable` signs in over a verifying
+  plan with `encrypt_option` `TRUE` (`an_entra_connection_left_at_disable_signs_in_verified`, the
+  opt-in `mssql-azure` leg). **A refused Entra login forgets its
   token** (Msg 18456 → `entra::forget`), so the next connection asks the CLI again rather than
   handing over one the server will not take — the user signed in to the CLI as someone else since,
   or was removed — until it expired.
@@ -12658,7 +12689,13 @@ existing prose was left alone.
   the handshake signature against the certificate's key, which needs the parse, so those modes get
   `AnyCertificate`, which skips it. That costs nothing an attacker could use: where no certificate
   is trusted, an attacker presents their own and signs with it. The verifying modes keep the full
-  check and so need a real certificate, which the auto-generated one never is.
+  check and so need a real certificate, which the auto-generated one never is. **That argument is
+  about the check, not about what the session is trusted to carry**, and for a while it was read
+  as the whole of it: an Entra token — a bearer token for every Azure SQL database the account can
+  reach, not a secret for this one server — went over `Off` + `AnyCertificate` whenever a
+  connection sat at the default `Disable`. That sign-in is raised to `VerifyFull` before a plan
+  reaches this module (`AuthMode::tls_floor`, under `connection.rs`), so nothing here changed: a
+  mode that trusts no certificate is still right for what the user chose to send over it.
   `import_rows` is the bulk-load path, and it has an arm for **all four** engines, each handing
   off to its module's own (`pg::`, `sqlite::`, `mysql::` and `mssql::import_rows`, SQL Server's
   under `mssql.rs` above), and the shape is the same in each — one transaction of batched multi-row
@@ -16328,6 +16365,13 @@ existing prose was left alone.
     `negotiates_tls`, so a sixth level would not need this view found and edited. An *empty* CA
     path under a verifying mode means **whatever the operating system trusts** (`db/tls.rs`), and
     the hint says so, because a blank required-looking field otherwise reads as unfinished.
+    **Under Entra sign-in with anything short of Verify full picked, a hint says the picker is not
+    what connects** (`tls_floor_note` → `AuthMode::tls_note` of the mode in force, hidden when it
+    is `None`): *"Microsoft Entra sign-in connects at Verify full
+    whatever is picked here: its token opens every Azure SQL database the account can reach."* A
+    note rather than writing the picker up to `VerifyFull`, deliberately: an effect cannot tell a
+    pick from a load, and raising on a load would edit a saved connection by opening it. The raise
+    itself is `Connection::tls_mode_in_force`, under `connection.rs`.
     Every TLS signal joins host/port/user/password
     in the effect that **invalidates a prior Test result**, since raising the mode or naming the
     wrong CA turns a working endpoint into a refused one and a green Test left standing over that

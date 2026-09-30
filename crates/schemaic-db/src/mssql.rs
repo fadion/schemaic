@@ -67,7 +67,16 @@ fn not_yet(what: &str) -> DbError {
 ///
 /// Async for one mode: an Entra sign-in needs a token first, from the Azure
 /// CLI or the cache in front of it ([`crate::entra`]).
+///
+/// **A sign-in whose TLS floor the plan does not reach is refused first**,
+/// before a token is fetched — an Entra token over a session that accepts any
+/// certificate (`AuthMode::transport_refusal`). A `Db` resolved from a
+/// connection already carries the raised plan (`Connection::tls_plan`); this
+/// is for one assembled from parts.
 async fn config(db: &Db, database: Option<&str>) -> Result<tiberius::Config, DbError> {
+    if let Some(why) = db.auth.transport_refusal(db.tls_plan()) {
+        return Err(DbError::Refused(why.to_string()));
+    }
     let mut cfg = tiberius::Config::new();
     cfg.host(&db.host);
     cfg.port(db.port);
@@ -4493,6 +4502,55 @@ mod write_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **An Entra handle with a plan that verifies nothing is refused before a
+    /// token is fetched** — the composition of `AuthMode::transport_refusal`
+    /// with the driver config every connect goes through. A handle from parts
+    /// (the MCP handoff) carries only the plan it was handed; with none, the
+    /// Azure CLI must never be asked, and nothing is dialled.
+    #[tokio::test]
+    async fn an_entra_handle_without_a_verifying_plan_is_refused_before_the_token() {
+        use schemaic_core::connection::{AuthMode, SslMode, Tls};
+        let entra = |mode: SslMode| {
+            Db::from_parts(
+                crate::Engine::MsSql,
+                "srv.database.windows.net".into(),
+                1433,
+                String::new(),
+                String::new(),
+                String::new(),
+            )
+            .with_auth(AuthMode::AzureCli)
+            .with_tls(
+                Tls {
+                    mode,
+                    ..Tls::default()
+                }
+                .plan(),
+            )
+        };
+        for mode in [
+            SslMode::Disable,
+            SslMode::Prefer,
+            SslMode::Require,
+            SslMode::VerifyCa,
+        ] {
+            match config(&entra(mode), None).await {
+                Err(DbError::Refused(why)) => assert!(why.contains("Verify full"), "{why}"),
+                other => panic!("{mode:?}: expected a refusal, got {:?}", other.map(|_| ())),
+            }
+        }
+        // A password handle over the same plans is configured as before.
+        let pw = Db::from_parts(
+            crate::Engine::MsSql,
+            "h".into(),
+            1433,
+            "sa".into(),
+            "x".into(),
+            String::new(),
+        );
+        assert!(config(&pw, None).await.is_ok());
+    }
 
     /// **An Azure SQL server is told by its name**, in each cloud's spelling
     /// and whatever the case or a trailing dot — and only it gets the longer

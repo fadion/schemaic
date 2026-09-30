@@ -4987,6 +4987,39 @@ async fn an_entra_sign_in_is_the_azure_clis_user() {
     );
 }
 
+/// **An Entra connection left at `Disable` still signs in, over a verified
+/// session.** The token is a bearer token for every Azure SQL database the
+/// account can reach, so `Connection::tls_plan` raises the plan to
+/// `VerifyFull` whatever the picker says — which Azure's public certificate
+/// passes with no CA file. The `mssql-azure` leg.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_entra_connection_left_at_disable_signs_in_verified() {
+    use schemaic_core::connection::{AuthMode, SslMode};
+    if !endpoint::opt_in_leg_enabled("mssql-azure") {
+        endpoint::note_leg_skipped("mssql-azure");
+        return;
+    }
+    let host = std::env::var("SCHEMAIC_IT_MSSQL_AZURE_HOST")
+        .expect("SCHEMAIC_IT_MSSQL_AZURE_HOST names the Azure SQL server for mssql-azure");
+    let database =
+        std::env::var("SCHEMAIC_IT_MSSQL_AZURE_DATABASE").unwrap_or("schemaic_it".into());
+    let conn = sign_in_connection(host, 1433, &database, AuthMode::AzureCli, SslMode::Disable);
+    let db = Db::connect(&conn, None);
+    assert!(
+        db.tls_plan().is_some_and(|p| p.verifies_server()),
+        "{:?}",
+        db.tls_plan()
+    );
+    let encrypted = signed_in_scalar(
+        &db,
+        &database,
+        "SELECT CAST(encrypt_option AS nvarchar(10)) FROM sys.dm_exec_connections \
+         WHERE session_id = @@SPID",
+    )
+    .await;
+    assert_eq!(encrypted, "TRUE");
+}
+
 /// **A column moved is a table rebuilt, and everything on the table comes
 /// back.** The rows (identity values kept, a new column's default filling the
 /// old rows), the key, the check, the unique index, the defaults under their

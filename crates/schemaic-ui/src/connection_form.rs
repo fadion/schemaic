@@ -1060,6 +1060,17 @@ pub(crate) fn manage_modal(conn: ConnUi, o: OverlayUi, actions: Rc<ConnActions>)
     })
 }
 
+/// The draft's [`AuthMode::tls_note`]: the line saying the sign-in in force
+/// connects at a stronger rung than the one picked, or `None`. Tracked, for
+/// the label and its style.
+fn tls_floor_note(draft: DraftSignals) -> Option<&'static str> {
+    draft
+        .auth
+        .get()
+        .in_force(&draft.db_type.get())
+        .tls_note(draft.tls_mode.get())
+}
+
 /// How the connection to the server is secured: the [`SslMode`] picker, and the
 /// certificate files that mode actually uses.
 ///
@@ -1119,6 +1130,23 @@ fn tls_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
             // of the rule the two comments below state: `display:none` takes
             // the box out of layout, an empty view does not.
             if mode.get().caveat(&draft.db_type.get()).is_none() {
+                s.hide()
+            } else {
+                s
+            }
+        }),
+        // **What the sign-in raises the picked rung to** — Microsoft Entra
+        // connects at Verify full whatever is picked (`AuthMode::tls_floor`,
+        // applied by `Connection::tls_plan`), so the picker and the wire are
+        // never silently two different things. A note rather than a write to
+        // the picker: an effect cannot tell a pick from a load, and raising
+        // on a load would edit a saved connection by opening it.
+        label(move || tls_floor_note(draft).unwrap_or_default().to_string()).style(move |s| {
+            let s = s
+                .width_full()
+                .font_size(theme::font_hint())
+                .color(theme::text_dim());
+            if tls_floor_note(draft).is_none() {
                 s.hide()
             } else {
                 s

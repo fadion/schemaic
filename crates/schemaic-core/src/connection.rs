@@ -775,6 +775,15 @@ pub struct TlsPlan {
     pub hostname_override: Option<String>,
 }
 
+impl TlsPlan {
+    /// Does this plan make the server prove it is the host asked for —
+    /// encryption with no plaintext retry, a trusted chain, and the name
+    /// checked? What `VerifyFull` plans.
+    pub fn verifies_server(&self) -> bool {
+        !self.fallback_to_plaintext && !self.accept_invalid_certs && !self.skip_hostname_check
+    }
+}
+
 /// How a connection **signs in** — [`Connection::auth`].
 ///
 /// A password is every engine's, and the default. The other two are SQL
@@ -862,6 +871,75 @@ impl AuthMode {
             AuthMode::Password => true,
             AuthMode::Windows | AuthMode::AzureCli => false,
         }
+    }
+
+    /// The weakest TLS this sign-in may travel over — [`SslMode::Disable`],
+    /// the ladder's bottom, for every mode but Entra's.
+    ///
+    /// **Entra's is [`SslMode::VerifyFull`]**, because what it hands over is
+    /// not a password for this server: a Microsoft Entra access token is a
+    /// bearer token for `https://database.windows.net/`, so for its hour of
+    /// life it opens *every* Azure SQL database the account can reach. A
+    /// session that accepts any certificate gives it to whoever answers on the
+    /// path. A SQL login's password under `Prefer` or `Require` has that
+    /// exposure too, and it stays the user's call; for the token the call
+    /// costs far more and buys nothing, since Azure SQL presents a publicly
+    /// issued certificate that `VerifyFull` accepts with no CA file (and a
+    /// named CA still anchors it for a server that does not).
+    ///
+    /// A floor, applied by [`Connection::tls_mode_in_force`], rather than a
+    /// refusal the user has to answer: raising it can only fail loudly.
+    pub fn tls_floor(self) -> SslMode {
+        match self {
+            AuthMode::Password | AuthMode::Windows => SslMode::Disable,
+            AuthMode::AzureCli => SslMode::VerifyFull,
+        }
+    }
+
+    /// Why this sign-in must not be sent over `plan`, or `None` when the plan
+    /// is at least [`Self::tls_floor`].
+    ///
+    /// The driver's own check, asked before a token is fetched: a `Db`
+    /// resolved from a [`Connection`] already carries the raised plan, but one
+    /// assembled from parts (the MCP endpoint handoff) is only as good as what
+    /// it was handed.
+    pub fn transport_refusal(self, plan: Option<&TlsPlan>) -> Option<&'static str> {
+        let floor = self.tls_floor();
+        let short = match plan {
+            None => floor.negotiates_tls(),
+            Some(p) => {
+                (floor.requires_tls() && p.fallback_to_plaintext)
+                    || (floor.verifies_certificate() && p.accept_invalid_certs)
+                    || (floor.verifies_hostname() && p.skip_hostname_check)
+            }
+        };
+        short.then_some(match self {
+            AuthMode::AzureCli => {
+                "Microsoft Entra sign-in needs SSL / TLS at Verify full: its token opens every \
+                 Azure SQL database the account can reach, so the server must prove its name \
+                 before it is handed one."
+            }
+            AuthMode::Password | AuthMode::Windows => {
+                "This sign-in needs a stronger SSL / TLS mode than the connection's."
+            }
+        })
+    }
+
+    /// The line under the form's TLS picker when this sign-in connects at a
+    /// stronger rung than `picked` — so the stored mode and the one connected
+    /// with are never silently two different things.
+    pub fn tls_note(self, picked: SslMode) -> Option<&'static str> {
+        self.tls_floor()
+            .protects_more_than(picked)
+            .then_some(match self {
+                AuthMode::AzureCli => {
+                    "Microsoft Entra sign-in connects at Verify full whatever is picked here: its \
+                 token opens every Azure SQL database the account can reach."
+                }
+                AuthMode::Password | AuthMode::Windows => {
+                    "This sign-in connects at a stronger mode than the one picked here."
+                }
+            })
     }
 
     /// The picker's label.
@@ -1138,8 +1216,11 @@ impl Connection {
     ///
     /// One answer, asked everywhere, rather than a second spelling of it at each
     /// driver.
+    ///
+    /// Of the mode **in force** ([`Self::tls_mode_in_force`]): an Entra
+    /// connection left at `Disable` still handshakes.
     pub fn uses_tls(&self) -> bool {
-        self.tls.mode.negotiates_tls() && is_networked(&self.db_type)
+        self.tls_mode_in_force().negotiates_tls() && is_networked(&self.db_type)
     }
 
     /// The database this connection opens in, or `None` for "let the driver
@@ -1166,8 +1247,29 @@ impl Connection {
     ///
     /// **The one entry point for the drivers.** Reaching for `conn.tls.plan()`
     /// instead would plan a handshake for a SQLite file.
+    ///
+    /// Planned from [`Self::tls_mode_in_force`], not the stored mode, so an
+    /// Entra connection handshakes at `VerifyFull` with the connection's own
+    /// CA file and client identity whatever its picker was left at.
     pub fn tls_plan(&self) -> Option<TlsPlan> {
-        self.uses_tls().then(|| self.tls.plan()).flatten()
+        self.uses_tls()
+            .then(|| {
+                Tls {
+                    mode: self.tls_mode_in_force(),
+                    ..self.tls.clone()
+                }
+                .plan()
+            })
+            .flatten()
+    }
+
+    /// The TLS mode this connection connects with: the one picked, raised to
+    /// the [`AuthMode::tls_floor`] of the sign-in in force. Today that raises
+    /// one thing — Microsoft Entra to `VerifyFull` — and a hand-made
+    /// connection defaults to `Disable`, which is why the raise is here, where
+    /// every driver's plan comes from, rather than left to the form.
+    pub fn tls_mode_in_force(&self) -> SslMode {
+        self.tls.mode.stronger_of(self.effective_auth().tls_floor())
     }
 
     /// How opening this connection signs in — [`Self::auth`] **asked through
@@ -2216,6 +2318,109 @@ mod tests {
                 };
                 assert_eq!(c.effective_auth(), auth.in_force(db_type));
             }
+        }
+    }
+
+    /// **An Entra sign-in always plans a verifying handshake**, whatever the
+    /// picker says. Its access token is a bearer token for every Azure SQL
+    /// database the account can reach, so handing it over a TLS session that
+    /// accepts any certificate gives it to whoever answers on the path — and
+    /// a hand-made connection's TLS defaults to `Disable`.
+    #[test]
+    fn an_entra_sign_in_always_plans_a_verifying_handshake() {
+        for mode in SslMode::ALL {
+            let c = Connection {
+                db_type: "SQL Server".into(),
+                auth: AuthMode::AzureCli,
+                tls: Tls {
+                    mode,
+                    ..Tls::default()
+                },
+                ..conn()
+            };
+            assert!(c.uses_tls(), "{mode:?}");
+            let plan = c.tls_plan().expect("an Entra connection handshakes");
+            assert!(plan.verifies_server(), "{mode:?}: {plan:?}");
+            assert_eq!(c.tls_mode_in_force(), SslMode::VerifyFull, "{mode:?}");
+        }
+        // A named CA still anchors it.
+        let c = Connection {
+            db_type: "SQL Server".into(),
+            auth: AuthMode::AzureCli,
+            tls: Tls {
+                mode: SslMode::Require,
+                ca_path: "/etc/corp-ca.pem".into(),
+                ..Tls::default()
+            },
+            ..conn()
+        };
+        assert_eq!(
+            c.tls_plan().and_then(|p| p.root_ca).as_deref(),
+            Some("/etc/corp-ca.pem")
+        );
+        // A password sign-in keeps the mode it was given — the existing policy.
+        let pw = Connection {
+            db_type: "SQL Server".into(),
+            ..conn()
+        };
+        assert!(pw.tls_plan().is_none());
+        assert_eq!(pw.tls_mode_in_force(), SslMode::Disable);
+        // And Entra left on a MySQL connection is not in force, so nor is its floor.
+        let switched = Connection {
+            db_type: "MySQL".into(),
+            auth: AuthMode::AzureCli,
+            ..conn()
+        };
+        assert!(switched.tls_plan().is_none());
+    }
+
+    /// The driver's own refusal, for a handle assembled from parts rather than
+    /// from a connection: an Entra token over a plan that does not make the
+    /// server prove its name is refused before one is fetched.
+    #[test]
+    fn an_entra_token_is_refused_over_a_transport_that_verifies_nothing() {
+        let plan = |mode| {
+            Tls {
+                mode,
+                ..Tls::default()
+            }
+            .plan()
+        };
+        for mode in [
+            SslMode::Disable,
+            SslMode::Prefer,
+            SslMode::Require,
+            SslMode::VerifyCa,
+        ] {
+            let why = AuthMode::AzureCli.transport_refusal(plan(mode).as_ref());
+            assert!(why.is_some_and(|w| w.contains("Verify full")), "{mode:?}");
+        }
+        assert_eq!(
+            AuthMode::AzureCli.transport_refusal(plan(SslMode::VerifyFull).as_ref()),
+            None
+        );
+        for m in [AuthMode::Password, AuthMode::Windows] {
+            for mode in SslMode::ALL {
+                assert_eq!(
+                    m.transport_refusal(plan(mode).as_ref()),
+                    None,
+                    "{m:?} {mode:?}"
+                );
+            }
+        }
+    }
+
+    /// The form's line under the TLS picker, when the sign-in raises what is
+    /// picked — so the stored rung and the one connected with are not
+    /// silently two different things.
+    #[test]
+    fn the_form_says_when_the_sign_in_raises_the_picked_tls() {
+        assert!(AuthMode::AzureCli.tls_note(SslMode::Disable).is_some());
+        assert!(AuthMode::AzureCli.tls_note(SslMode::VerifyCa).is_some());
+        assert_eq!(AuthMode::AzureCli.tls_note(SslMode::VerifyFull), None);
+        for mode in SslMode::ALL {
+            assert_eq!(AuthMode::Password.tls_note(mode), None);
+            assert_eq!(AuthMode::Windows.tls_note(mode), None);
         }
     }
 
