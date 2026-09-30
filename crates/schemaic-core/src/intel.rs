@@ -3330,6 +3330,8 @@ fn static_words(dialect: SqlDialect) -> &'static std::collections::HashSet<Strin
             .chain(NON_RESERVED_KEYWORDS.iter())
             .chain(reserved_words(dialect).iter())
             .chain(alias_ok_but_unquotable(dialect).iter())
+            // `OUTPUT inserted.id` — one edit from `INSERT`.
+            .chain(pseudo_tables(dialect).iter())
             .map(|k| k.to_ascii_lowercase())
             .chain(
                 builtin_catalog(dialect)
@@ -3527,10 +3529,16 @@ fn tokenize_range(sql: &str, lo: usize, hi: usize, dialect: SqlDialect) -> Vec<T
             continue;
         }
         let c = b[i];
-        if is_word_start(c) {
+        // A T-SQL variable, system function or temporary table keeps its
+        // `@`/`@@`/`#`/`##`, and a name runs on through the bytes its dialect
+        // continues one with (`sql::continues_name`): `#t` read as `t` was
+        // a confident ``Table `t` not found``, and `@x AS int` lost the
+        // variable that says the `AS` declares a type.
+        let prefix = crate::sql::t_sql_name_prefix(b, i, dialect);
+        if prefix > 0 || is_word_start(c) {
             let s = i;
-            let mut j = i + 1;
-            while j < hi && is_word_byte(b[j]) {
+            let mut j = i + prefix.max(1);
+            while j < hi && crate::sql::continues_name(b[j], dialect) {
                 j += 1;
             }
             push(
@@ -6186,8 +6194,10 @@ fn routine_header_requires_as(dialect: SqlDialect) -> bool {
 /// Index in `toks` of the `AS` that ends a routine's header, where
 /// [`routine_header_requires_as`] says there is one: the first `AS` outside
 /// parentheses that is not `EXECUTE AS`'s (`WITH EXECUTE AS OWNER`, an option
-/// inside the header). A parameter default's `CAST(1 AS int)` sits in
-/// parentheses.
+/// inside the header) nor a parameter's (`@x AS int` — a procedure's
+/// parameters take no parentheses, so the first `AS` was the parameter's and
+/// the real header `AS` then went through the alias check). A parameter
+/// default's `CAST(1 AS int)` sits in parentheses.
 ///
 /// The alias check read that `AS` as introducing an alias, so every T-SQL
 /// routine whose body opened on a reserved word — `SET`, `BEGIN`, `RETURN` —
@@ -6202,10 +6212,15 @@ fn routine_body_as(toks: &[Token], dialect: SqlDialect) -> Option<usize> {
             TkKind::LParen => depth += 1,
             TkKind::RParen => depth = depth.saturating_sub(1),
             TkKind::Word(w) if depth == 0 && !t.quoted && w.eq_ignore_ascii_case("AS") => {
-                let execute_as = i > 0
-                    && matches!(&toks[i - 1].kind, TkKind::Word(p)
-                        if p.eq_ignore_ascii_case("EXECUTE") || p.eq_ignore_ascii_case("EXEC"));
-                if !execute_as {
+                let after = |p: &Token| match &p.kind {
+                    TkKind::Word(p) => {
+                        p.eq_ignore_ascii_case("EXECUTE")
+                            || p.eq_ignore_ascii_case("EXEC")
+                            || is_variable(p, dialect)
+                    }
+                    _ => false,
+                };
+                if !(i > 0 && after(&toks[i - 1])) {
                     return Some(i);
                 }
             }
@@ -6213,6 +6228,60 @@ fn routine_body_as(toks: &[Token], dialect: SqlDialect) -> Option<usize> {
         }
     }
     None
+}
+
+/// Is `word` a variable — `@x`, a name with T-SQL's `@` prefix
+/// ([`crate::sql::t_sql_name_prefix`])? Always `false` on an engine whose
+/// tokens carry no prefix.
+fn is_variable(word: &str, dialect: SqlDialect) -> bool {
+    word.starts_with('@') && crate::sql::t_sql_name_prefix(word.as_bytes(), 0, dialect) > 0
+}
+
+/// For every token, whether the nearest statement head before it — within its
+/// own parentheses, else in the ones around them — **declares**: `DECLARE`, or
+/// a `CREATE`/`ALTER` (a routine's parameters). One forward pass, a slot per
+/// open parenthesis; read by [`as_declares_a_type`].
+fn declaring_contexts(toks: &[Token], dialect: SqlDialect) -> Vec<bool> {
+    let heads = unterminated_statement_heads(dialect);
+    // The latest head seen in each open group, innermost last.
+    let mut open: Vec<Option<bool>> = vec![None];
+    let mut out = Vec::with_capacity(toks.len());
+    for t in toks {
+        out.push(open.iter().rev().find_map(|h| *h).unwrap_or(false));
+        match &t.kind {
+            TkKind::LParen => open.push(None),
+            TkKind::RParen if open.len() > 1 => {
+                open.pop();
+            }
+            TkKind::Word(w) if !t.quoted => {
+                let up = w.to_ascii_uppercase();
+                let declares = matches!(up.as_str(), "DECLARE" | "CREATE" | "ALTER");
+                if declares || heads.contains(&up.as_str()) {
+                    if let Some(slot) = open.last_mut() {
+                        *slot = Some(declares);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Is the `AS` at `toks[i]` a **declaration's**, introducing a type rather
+/// than an alias — `DECLARE @t AS TABLE (a int)`, a routine parameter's
+/// `@x AS int`?
+///
+/// The word before it is a variable, and the nearest statement head before
+/// that is `DECLARE` or a `CREATE`/`ALTER` ([`declaring_contexts`], computed
+/// once for `toks`) — so `SELECT @x AS order` is still the reserved alias it
+/// is. `TABLE` is reserved, and the legal `DECLARE @t AS TABLE` drew a red
+/// alias error.
+fn as_declares_a_type(toks: &[Token], declaring: &[bool], i: usize, dialect: SqlDialect) -> bool {
+    i.checked_sub(1).is_some_and(|var| {
+        matches!(&toks[var].kind, TkKind::Word(w) if is_variable(w, dialect))
+            && declaring.get(var).copied().unwrap_or(false)
+    })
 }
 
 /// Does sqlparser's grammar for `dialect` **lack** the statement `toks` opens,
@@ -6293,6 +6362,7 @@ fn alias_checks(sql: &str, lo: usize, hi: usize, dialect: SqlDialect, out: &mut 
         SqlDialect::MsSql => "brackets",
     };
     let calls = enclosing_calls(&toks);
+    let declaring = declaring_contexts(&toks, dialect);
     let flag = |out: &mut Vec<Diagnostic>, at: usize, kw: &str| {
         out.push(Diagnostic {
             range: (at, at + kw.len()),
@@ -6329,8 +6399,11 @@ fn alias_checks(sql: &str, lo: usize, hi: usize, dialect: SqlDialect, out: &mut 
         if is_create && is_query_body_keyword(b) {
             continue;
         }
-        // Nor is a cast's target type — see `as_introduces_a_type`.
-        if as_introduces_a_type(&toks, &calls, i) {
+        // Nor is a cast's target type — see `as_introduces_a_type` — nor a
+        // declared variable's (`as_declares_a_type`).
+        if as_introduces_a_type(&toks, &calls, i)
+            || as_declares_a_type(&toks, &declaring, i, dialect)
+        {
             continue;
         }
         // `AS `select`` is legal — quoting is the whole remedy this diagnostic
@@ -6423,6 +6496,30 @@ fn alias_checks(sql: &str, lo: usize, hi: usize, dialect: SqlDialect, out: &mut 
     }
 }
 
+/// The tables a statement can read that **no catalogue holds**, by name —
+/// T-SQL's `inserted` and `deleted`, which a trigger body and an `OUTPUT`
+/// clause read. Empty on the engines whose trigger rows are `NEW`/`OLD`
+/// records rather than tables, where `inserted` is a table like any other.
+fn pseudo_tables(dialect: SqlDialect) -> &'static [&'static str] {
+    match dialect {
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => &[],
+        SqlDialect::MsSql => &["inserted", "deleted"],
+    }
+}
+
+/// Is `r` a source that lives in the session rather than the catalogue — a
+/// T-SQL temporary table (`#t`, `##g`), a table variable (`@t`) or a
+/// [`pseudo_tables`] entry? The table check cannot judge one absent, and
+/// said ``Table `t` not found`` of every `#t`: the active database is loaded,
+/// so `table_status` has no `Unknown` to fall back on.
+fn is_session_source(r: &TableRef, dialect: SqlDialect) -> bool {
+    r.db.is_none()
+        && (crate::sql::t_sql_name_prefix(r.name.as_bytes(), 0, dialect) > 0
+            || pseudo_tables(dialect)
+                .iter()
+                .any(|p| p.eq_ignore_ascii_case(&r.name)))
+}
+
 /// Unknown-table checks: flag a FROM/JOIN/UPDATE/INTO table reference the catalog
 /// definitively doesn't contain (only when the relevant database is loaded).
 /// `asts` is what the caller's own `parse_sql` returned for `sql[lo..hi]` —
@@ -6466,7 +6563,9 @@ fn table_existence_checks(
         _ => HashSet::new(),
     };
     for (r, pos) in table_refs_with_pos(sql, lo, hi, dialect) {
-        if r.db.is_none() && ctes.contains(&r.name.to_ascii_lowercase()) {
+        if (r.db.is_none() && ctes.contains(&r.name.to_ascii_lowercase()))
+            || is_session_source(&r, dialect)
+        {
             continue;
         }
         if let TableStatus::NotFound = catalog.table_status(&r) {
@@ -7457,14 +7556,17 @@ fn typo_checks(
             continue;
         }
         let c = b[i];
-        if is_word_start(c) {
+        // A T-SQL `@variable` or `#temp` table is a name, never a keyword:
+        // `@curdate` read as `curdate` was "looks like a misspelled keyword".
+        let prefix = crate::sql::t_sql_name_prefix(b, i, dialect);
+        if prefix > 0 || is_word_start(c) {
             let s = i;
-            let mut j = i + 1;
-            while j < hi && is_word_byte(b[j]) {
+            let mut j = i + prefix.max(1);
+            while j < hi && crate::sql::continues_name(b[j], dialect) {
                 j += 1;
             }
             let qualified = s > 0 && b[s - 1] == b'.';
-            if !qualified && is_probable_typo(&sql[s..j], catalog, dialect) {
+            if prefix == 0 && !qualified && is_probable_typo(&sql[s..j], catalog, dialect) {
                 out.push(Diagnostic {
                     range: (s, j),
                     severity: Severity::Warning,
@@ -12900,6 +13002,23 @@ mod tests {
             // 2025 alike — the system views' own `t.prec AS precision`.
             "SELECT salary AS precision, id AS within, name AS disk FROM employees e;",
             "SELECT id FROM employees load;",
+            // Sources no catalogue holds: temporary tables, table variables
+            // and a trigger's pseudo-tables (S8-L1-05).
+            "SELECT * FROM #t;",
+            "SELECT * FROM ##g;",
+            "SELECT a FROM @t;",
+            "INSERT INTO @t (a) VALUES (1);",
+            "CREATE TRIGGER dbo.tr ON dbo.employees AFTER INSERT AS SELECT id FROM inserted;",
+            "UPDATE employees SET name = N'x' OUTPUT inserted.id, deleted.id WHERE id = 1;",
+            // A variable's name is not a misspelled keyword.
+            "DECLARE @curdate datetime = GETDATE();",
+            // `@x AS int` declares a type, in a header and in a DECLARE
+            // (S8-L1-11).
+            "CREATE PROCEDURE dbo.p @x AS int AS SET NOCOUNT ON;",
+            "CREATE PROCEDURE dbo.p @x AS int AS BEGIN SELECT 1 END;",
+            "CREATE PROCEDURE dbo.p @x AS int = 1, @y AS varchar(10) OUTPUT AS RETURN;",
+            "DECLARE @t AS TABLE (a int);",
+            "DECLARE @n int = (SELECT 1), @t AS TABLE (a int);",
         ]
         .into_iter()
         .map(|sql| (sql, diag_d(sql, SqlDialect::MsSql)))
@@ -13022,6 +13141,46 @@ mod tests {
         // And a real table after `FETCH`'s neighbours is still checked.
         assert!(
             diag_d("SELECT id FROM nosuchtable;", SqlDialect::MsSql)
+                .iter()
+                .any(|x| x.message.contains("not found"))
+        );
+    }
+
+    /// **What the T-SQL name prefixes leave standing.** A `#`/`@` source and
+    /// a trigger's `inserted`/`deleted` are exempt from the table check, and
+    /// an `AS` after a variable declares a type — each exemption no wider than
+    /// that.
+    #[test]
+    fn t_sql_prefixed_names_are_exempt_and_nothing_else_is() {
+        let alias_errors = |sql: &str| -> Vec<String> {
+            diag_d(sql, SqlDialect::MsSql)
+                .into_iter()
+                .filter(|x| x.message.contains("reserved keyword"))
+                .map(|x| sql[x.range.0..x.range.1].to_string())
+                .collect()
+        };
+        // A missing table beside a temporary one is still missing, and is
+        // underlined whole.
+        let sql = "SELECT * FROM #t JOIN nosuchtable n ON n.id = #t.id;";
+        let d = diag_d(sql, SqlDialect::MsSql);
+        assert_eq!(
+            d.iter()
+                .map(|x| &sql[x.range.0..x.range.1])
+                .collect::<Vec<_>>(),
+            ["nosuchtable"],
+            "{d:?}"
+        );
+        // `@x AS order` in a select list is still a reserved alias; only a
+        // declaration's `AS` introduces a type.
+        assert_eq!(alias_errors("SELECT @x AS order;"), vec!["order"]);
+        assert_eq!(
+            alias_errors("CREATE PROCEDURE dbo.p @x AS int AS SELECT id AS order FROM employees;"),
+            vec!["order"]
+        );
+        // `inserted` is a pseudo-table only on T-SQL: elsewhere it is a table
+        // the catalogue answers for.
+        assert!(
+            diag_d("SELECT id FROM inserted;", SqlDialect::MySql)
                 .iter()
                 .any(|x| x.message.contains("not found"))
         );

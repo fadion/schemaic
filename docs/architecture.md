@@ -917,12 +917,25 @@ existing prose was left alone.
     (`t_sql_grouping_extensions_draw_no_syntax_error`). The routine statements broke the alias
     check a second way: a T-SQL header *ends* in a mandatory `AS` whose next word is the body's
     first statement, so `AS SET`, `AS BEGIN` and `AS RETURN` were reserved-alias errors. `routine_body_as` finds
-    that `AS` — the first outside parentheses not preceded by `EXECUTE`/`EXEC` — and the check
-    skips it alone, so an alias inside the body is still checked
+    that `AS` — the first outside parentheses not preceded by `EXECUTE`/`EXEC` nor by a parameter
+    (`@x AS int`: a procedure's parameters take no parentheses, so the parameter's `AS` won) — and
+    the check skips it alone, so an alias inside the body is still checked
     (`t_sql_routine_exemptions_leave_the_body_checked`, `ordinary_t_sql_draws_no_squiggle`). It is
     gated by `routine_header_requires_as`, an exhaustive per-dialect `match` true only for SQL
     Server, because MySQL's routines have no header `AS` and PostgreSQL's is optional
-    (`BEGIN ATOMIC` has none) — there the first `AS` may sit inside the body. The error's remedy
+    (`BEGIN ATOMIC` has none) — there the first `AS` may sit inside the body.
+    **T-SQL's name prefixes reach the tokens.** `tokenize_range` keeps a `@`/`@@`/`#`/`##` with
+    the name it prefixes (`sql::t_sql_name_prefix`) and runs a name on through the bytes its
+    dialect continues one with (`sql::continues_name`); `#t` read as `t` was ``Table `t` not
+    found``, and `@curdate` read as `curdate` a misspelled keyword (`typo_checks` scans the same
+    way and skips a prefixed name). `is_session_source` exempts a temporary table, a table
+    variable and `pseudo_tables` — T-SQL's `inserted`/`deleted`, which every trigger reads and the
+    typo check also exempts — from the table check, which cannot judge absent what lives in the
+    session; the per-dialect list is empty where trigger rows are `NEW`/`OLD` records. With the
+    sigil kept, `as_declares_a_type` passes the `AS` of `DECLARE @t AS TABLE (…)` (`TABLE` is
+    reserved): the word before it is a variable and the nearest statement head is `DECLARE`,
+    `CREATE` or `ALTER` (`declaring_contexts`, one forward pass), so `SELECT @x AS order` is still
+    flagged (`t_sql_prefixed_names_are_exempt_and_nothing_else_is`). The error's remedy
     names the engine's quote (backticks, double quotes, brackets); it said "backticks" on every
     engine, advice neither PostgreSQL nor SQL Server accepts
     (`a_reserved_alias_error_names_this_engines_quote`).
