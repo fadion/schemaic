@@ -853,6 +853,11 @@ existing prose was left alone.
     the `AS` form is the whole of it. It is answered off the token walk rather than the AST because
     `alias_checks` runs unconditionally, parse failure included — gating it on a parse would miss the
     real thing the diagnostic is for, since sqlparser *accepts* `AS or`.
+    **A function after `FROM`/`JOIN` is not a table** either: a table name is never followed by `(`
+    there on any engine here, and a rowset builtin read as one — T-SQL's `STRING_SPLIT`/`OPENJSON`/
+    `GENERATE_SERIES`, PostgreSQL's `generate_series`/`unnest` — was ``Table `…` not found``
+    (`a_function_in_from_is_not_a_missing_table`). After `INTO` the `(` opens a column list, and
+    that table is still judged.
     **`INTO` names a table only after `INSERT`/`REPLACE`** (`insert_precedes`), because the word has
     three other meanings and none of them does: PostgreSQL's legacy `SELECT a INTO newtbl FROM t`
     names the table it is about to *create*, and MySQL's `SELECT a INTO @x` and

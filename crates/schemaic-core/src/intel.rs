@@ -5024,8 +5024,14 @@ fn located_table_refs(sql: &str, lo: usize, hi: usize, dialect: SqlDialect) -> V
             // not `at + name.len()`: `name` is the *unquoted* text, so
             // recomputing underlines `"NoSuchTb` for a quoted identifier.
             let (name, pos) = parts.pop().unwrap_or_default();
-            // A linked server's four-part name: nothing to judge it by.
-            let judged = parts.len() <= 2;
+            // A linked server's four-part name: nothing to judge it by. Nor a
+            // function after `FROM`/`JOIN` — `STRING_SPLIT(…)`, PostgreSQL's
+            // `generate_series(…)`, a user's table-valued function — since a
+            // table name is never followed by `(` there. (After `INTO` the
+            // `(` opens a column list, and the table is still judged.)
+            let call = matches!(up.as_str(), "FROM" | "JOIN")
+                && matches!(toks.get(i).map(|t| &t.kind), Some(TkKind::LParen));
+            let judged = parts.len() <= 2 && !call;
             let (db, database) = match parts.len() {
                 0 => (None, None),
                 1 => (parts.pop().map(|p| p.0), None),
@@ -13160,6 +13166,12 @@ mod tests {
             "SELECT id FROM tempdb..#t;",
             "SELECT id FROM company..employees;",
             "SELECT id FROM otherdb.dbo.anything;",
+            // Rowset functions in FROM (S8-L1-09).
+            "SELECT value FROM STRING_SPLIT(N'a,b', N',');",
+            "SELECT * FROM OPENJSON(N'[1]') WITH (a int '$.a');",
+            "SELECT id FROM employees WHERE id IN (SELECT value FROM OPENJSON(@j));",
+            "SELECT value FROM GENERATE_SERIES(1, 5);",
+            "SELECT e.id FROM employees e JOIN dbo.fn_rows(1) r ON r.id = e.id;",
         ]
         .into_iter()
         .map(|sql| (sql, diag_d(sql, SqlDialect::MsSql)))
@@ -13285,6 +13297,30 @@ mod tests {
                 .iter()
                 .any(|x| x.message.contains("not found"))
         );
+    }
+
+    /// **A function in `FROM` is not a table.** A rowset builtin —
+    /// `generate_series`, `unnest` — read as a table name drew ``Table
+    /// `generate_series` not found``; a table name is never followed by `(`
+    /// there, on any engine here. An `INSERT`'s column list still is, and its
+    /// table is still checked.
+    #[test]
+    fn a_function_in_from_is_not_a_missing_table() {
+        for sql in [
+            "SELECT * FROM generate_series(1, 5);",
+            "SELECT * FROM unnest(ARRAY[1,2]) AS u(x);",
+            "SELECT g FROM generate_series(1, 3) g JOIN employees e ON e.id = g;",
+        ] {
+            let d = diag_d(sql, SqlDialect::Postgres);
+            assert!(d.is_empty(), "{sql}: {d:?}");
+        }
+        for dialect in [SqlDialect::Postgres, SqlDialect::MsSql, SqlDialect::MySql] {
+            let d = diag_d("INSERT INTO nosuchtable (a) VALUES (1);", dialect);
+            assert!(
+                d.iter().any(|x| x.message.contains("not found")),
+                "{dialect:?}: {d:?}"
+            );
+        }
     }
 
     /// **A T-SQL three-part name is `database.schema.table`.** It was read as
