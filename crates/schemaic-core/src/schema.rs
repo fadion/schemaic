@@ -2162,9 +2162,33 @@ pub struct TsqlRoutine {
     /// **The server shows no text for it** — `WITH ENCRYPTION`, or no
     /// `VIEW DEFINITION`. Droppable, not editable.
     pub hidden: bool,
+    /// **The other members of the numbered procedure group this procedure
+    /// heads** — `grp;2`, `grp;3`, … — as `(number, stored text)`, from
+    /// `sys.numbered_procedures`, in number order.
+    ///
+    /// Read because the head gives no sign of them: `sys.sql_modules` holds
+    /// one row for `grp`, whose text has no `;`, and a listing of
+    /// `sys.objects` names the group once. Yet `DROP PROCEDURE grp` drops
+    /// every member (measured on SQL Server 2022), so a recreate of the head —
+    /// a rename, a change of kind — destroyed code nothing on screen showed.
+    /// A `CREATE OR ALTER` of the head keeps them, so an edit in place is
+    /// allowed and a plan that would drop the head is refused
+    /// ([`crate::ddl::ChangeSet::unsupported`]); Copy DDL and the dump restate
+    /// each member's text after the head's.
+    pub numbered: Vec<(i32, String)>,
 }
 
 impl TsqlRoutine {
+    /// `grp;2, grp;3` — the numbered members of the group `name` heads, as
+    /// T-SQL spells them, for a sentence. Empty when there are none.
+    pub fn numbered_names(&self, name: &str) -> String {
+        self.numbered
+            .iter()
+            .map(|(n, _)| format!("{name};{n}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     pub fn has_option(&self, opt: &TsqlRoutineOption) -> bool {
         self.options.contains(opt)
     }
@@ -2271,6 +2295,7 @@ impl PartialEq for TsqlRoutine {
             && self.for_replication == other.for_replication
             && self.verbatim == other.verbatim
             && self.hidden == other.hidden
+            && self.numbered == other.numbered
     }
 }
 
@@ -4708,10 +4733,20 @@ impl ObjectItem {
             // emitter is deliberately shared with the apply path; the wrapper has
             // to be too, or four of the twelve fields the model carries reach the
             // server on one caller and are dropped on the other.
-            ObjectItem::Routine(r) => crate::ddl::client_script(
-                &crate::ddl::session_wrapped(None, r.create_sql(dialect, false), r, dialect),
-                dialect,
-            ),
+            //
+            // A SQL Server numbered group's other members follow the head, as
+            // stored — see `TsqlRoutine::numbered`; empty everywhere else.
+            ObjectItem::Routine(r) => {
+                let mut stmts =
+                    crate::ddl::session_wrapped(None, r.create_sql(dialect, false), r, dialect);
+                stmts.extend(
+                    r.tsql
+                        .numbered
+                        .iter()
+                        .map(|(_, text)| text.trim().to_string()),
+                );
+                crate::ddl::client_script(&stmts, dialect)
+            }
             // Through `client_script` for the same reason a routine is: this
             // `CREATE` carries no terminator of its own (the apply path sends it
             // whole) and its body may be a `BEGIN … END` full of `;`.
@@ -8524,6 +8559,35 @@ mod tests {
             v.create_ddl(crate::intel::SqlDialect::MsSql),
             "CREATE VIEW dbo.v AS SELECT 1 AS a;"
         );
+    }
+
+    /// **A numbered group's head scripts its members after it**, each in a
+    /// batch of its own and as the server stored it: the head's rebuilt
+    /// statement is the group's number 1 alone, and a dump that stopped there
+    /// restored a group missing `grp;2`.
+    #[test]
+    fn a_numbered_group_head_scripts_its_members() {
+        let r = RoutineInfo {
+            name: "grp".into(),
+            schema: Some("dbo".into()),
+            kind: RoutineKind::Procedure,
+            body: "SELECT 1".into(),
+            tsql: TsqlRoutine {
+                numbered: vec![(2, "CREATE PROCEDURE dbo.grp;2 AS SELECT 2".into())],
+                ..TsqlRoutine::default()
+            },
+            ..Default::default()
+        };
+        let sql =
+            ObjectItem::Routine(std::sync::Arc::new(r)).create_sql(crate::intel::SqlDialect::MsSql);
+        let head = sql
+            .find("CREATE PROCEDURE [dbo].[grp]\nAS\nSELECT 1")
+            .expect(&sql);
+        let member = sql
+            .find("CREATE PROCEDURE dbo.grp;2 AS SELECT 2")
+            .expect(&sql);
+        assert!(head < member, "{sql}");
+        assert!(sql[head..member].contains("\nGO\n"), "{sql}");
     }
 
     /// **A SQL Server script closes each object's batch with `GO`.** A view, a

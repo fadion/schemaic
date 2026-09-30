@@ -1421,6 +1421,17 @@ const ROUTINE_LISTING: &str = "SELECT s.name, o.name, o.type, m.definition, \
      WHERE o.type IN ('P', 'FN', 'IF', 'TF') AND o.is_ms_shipped = 0 \
      ORDER BY s.name, o.name";
 
+/// Every member of a numbered procedure group past the first: `(schema,
+/// procedure, number, definition)`. The first is the procedure itself, in
+/// `sys.sql_modules`; the rest live only here, and `DROP PROCEDURE` takes
+/// them all (`schemaic_core::schema::TsqlRoutine::numbered`).
+const NUMBERED_LISTING: &str = "SELECT s.name, o.name, np.procedure_number, np.definition \
+     FROM sys.numbered_procedures np \
+     JOIN sys.objects o ON o.object_id = np.object_id \
+     JOIN sys.schemas s ON s.schema_id = o.schema_id \
+     WHERE o.is_ms_shipped = 0 \
+     ORDER BY s.name, o.name, np.procedure_number";
+
 /// Every routine parameter, in order: `(schema, routine, parameter, type,
 /// max_length, precision, scale, user-defined, output)`. Parameter 0 is a
 /// scalar function's return type.
@@ -2001,6 +2012,15 @@ async fn collect_schema(client: &mut MsClient) -> Result<DbSchema, DbError> {
             entry.0.push(format!("{} {ty}{out}", cell(&r, 2)));
         }
     }
+    // A numbered group's members past the first, which the head's own text
+    // gives no sign of.
+    let mut numbered: HashMap<(String, String), Vec<(i32, String)>> = HashMap::new();
+    for r in query_rows(client, NUMBERED_LISTING).await? {
+        numbered
+            .entry((cell(&r, 0), cell(&r, 1)))
+            .or_default()
+            .push((int(&r, 2) as i32, cell(&r, 3)));
+    }
     let routines = query_rows(client, ROUTINE_LISTING)
         .await?
         .into_iter()
@@ -2011,11 +2031,14 @@ async fn collect_schema(client: &mut MsClient) -> Result<DbSchema, DbError> {
                 .unwrap_or_default();
             let (kind, returns) = routine_shape(&cell(&r, 2), returns);
             // The parts of the stored text — see `tsql_routine_reading`.
-            let read = tsql_routine_reading(
+            let mut read = tsql_routine_reading(
                 r.get(3).and_then(|d| d.as_deref()),
                 args.join(", "),
                 returns,
             );
+            read.tsql.numbered = numbered
+                .remove(&(ns.clone(), name.clone()))
+                .unwrap_or_default();
             Arc::new(RoutineInfo {
                 name,
                 schema: Some(ns),

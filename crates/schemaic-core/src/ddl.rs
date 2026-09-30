@@ -1621,6 +1621,19 @@ impl RoutineDraft {
                             .to_string(),
                     );
                 }
+                // A rename is a drop and a create here, and the drop takes the
+                // whole group — see `numbered_group_refusal`, which refuses the
+                // plan; this says so while the name is being typed.
+                if let Some(was) = self.original.as_deref()
+                    && was != f.name
+                    && !f.tsql.numbered.is_empty()
+                {
+                    out.push(format!(
+                        "{was} heads a numbered procedure group ({}), and renaming it would \
+                         drop them all. Keep the name to edit it.",
+                        f.tsql.numbered_names(was)
+                    ));
+                }
             }
             SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => {}
         }
@@ -2879,6 +2892,36 @@ fn unreplayable_rename(c: &Change) -> Option<String> {
     ))
 }
 
+/// The refusal for a routine **recreate that would drop a numbered procedure
+/// group**, or `None` when the change is fine.
+///
+/// `DROP PROCEDURE grp` drops `grp;2 … n` with it, and nothing can put them
+/// back: their text names the group's old name, and the model holds them only
+/// to script them ([`crate::schema::TsqlRoutine::numbered`]). A `CREATE OR
+/// ALTER` of the head keeps them (measured on SQL Server 2022), so only the
+/// plans that drop first — a rename, a change of kind — are refused, and the
+/// preview withholds Apply rather than let the drop run.
+fn numbered_group_refusal(c: &Change) -> Option<String> {
+    let Change::ReplaceRoutine {
+        server,
+        recreate: true,
+        ..
+    } = c
+    else {
+        return None;
+    };
+    if server.tsql.numbered.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{} heads a numbered procedure group ({}), and this plan drops it first, which \
+         drops every member of the group with it. Edit it under its own name and kind, \
+         which alters it in place and keeps them.",
+        server.name,
+        server.tsql.numbered_names(&server.name)
+    ))
+}
+
 /// What a view loses when it's dropped, on `dialect` — the sentence behind both
 /// the plain `DROP VIEW` and the recreate that has to drop first.
 ///
@@ -3626,6 +3669,14 @@ impl Change {
                 }
                 out
             }
+            // A numbered group's head goes with every member — the one drop
+            // here that takes more than the routine it names.
+            Change::DropRoutine(f) if !f.tsql.numbered.is_empty() => vec![format!(
+                "Drops {} {} and every member of its numbered group with it: {}.",
+                f.kind.label(),
+                f.name,
+                f.tsql.numbered_names(&f.name)
+            )],
             Change::DropRoutine(f) => vec![format!(
                 "Drops {} {}. PostgreSQL refuses while a trigger still uses it, so \
                  any that do have to be dropped first.",
@@ -4382,6 +4433,7 @@ impl ChangeSet {
             .map(Change::summary)
             .collect();
         out.extend(self.changes.iter().filter_map(unreplayable_rename));
+        out.extend(self.changes.iter().filter_map(numbered_group_refusal));
         out
     }
 
@@ -26267,6 +26319,46 @@ mod tsql_routine_plan_tests {
             f.body = "BEGIN RETURN 1 END".into();
         });
         assert_eq!(sql[0], "DROP PROCEDURE IF EXISTS [dbo].[r];");
+    }
+
+    /// **A procedure that heads a numbered group is never dropped by an
+    /// edit.** `DROP PROCEDURE r` takes `r;2 … n` with it (measured on SQL
+    /// Server 2022: `sys.numbered_procedures` went from 1 row to 0), while a
+    /// `CREATE OR ALTER` of the head keeps them — so the edit in place goes
+    /// through, and a rename, which on this engine is a drop and a create, is
+    /// refused by name before it can run. Dropping the head on purpose is
+    /// allowed, and its risk names what goes with it.
+    #[test]
+    fn a_numbered_group_head_is_altered_in_place_and_never_dropped() {
+        let mut cur = proc_r();
+        cur.tsql.numbered = vec![(2, "CREATE PROCEDURE dbo.r;2 AS SELECT 2".into())];
+
+        let mut d = RoutineDraft::from_info(&cur);
+        d.info.body = "SELECT @a + 1".into();
+        let cs = diff_routine(&cur, &d, MsSql);
+        assert!(cs.unsupported().is_empty(), "{:?}", cs.unsupported());
+        assert!(!cs.emit().iter().any(|s| s.starts_with("DROP")));
+
+        let mut d = RoutineDraft::from_info(&cur);
+        d.info.name = "r2".into();
+        assert!(
+            d.validate(MsSql).iter().any(|e| e.contains("r;2")),
+            "{:?}",
+            d.validate(MsSql)
+        );
+        let refused = diff_routine(&cur, &d, MsSql).unsupported();
+        assert!(refused.iter().any(|e| e.contains("r;2")), "{refused:?}");
+
+        // A change of kind is a drop and a create too.
+        let mut d = RoutineDraft::from_info(&cur);
+        d.info.kind = RoutineKind::Function;
+        d.info.returns = "int".into();
+        d.info.body = "BEGIN RETURN 1 END".into();
+        let refused = diff_routine(&cur, &d, MsSql).unsupported();
+        assert!(refused.iter().any(|e| e.contains("r;2")), "{refused:?}");
+
+        let risks = drop_routine(&cur, MsSql).destructive();
+        assert!(risks.iter().any(|r| r.contains("r;2")), "{risks:?}");
     }
 
     /// A comment edited on its own is set in place, whether or not one is

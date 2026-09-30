@@ -1373,6 +1373,30 @@ async fn read_table(s: &Scratch, name: &str) -> schemaic_core::schema::TableInfo
         .clone()
 }
 
+/// Run a script — Copy DDL's text, a dump — as a restore does: cut at its
+/// `GO` lines by the app's own splitter and fed to `Db::run_script`,
+/// panicking unless it runs to the end.
+async fn replay(s: &Scratch, script: &str) {
+    let mut splitter = schemaic_core::script::Splitter::new(MS);
+    // A file ends in a newline; a copied script's last `GO` may not.
+    let mut stmts = splitter.push_str(&format!("{script}\n"));
+    stmts.extend(splitter.finish());
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let feed = tokio::spawn(async move {
+        for st in stmts {
+            if tx.send(st).await.is_err() {
+                break;
+            }
+        }
+    });
+    let (end, _) = s.db.run_script(&s.name, rx, CancellationToken::new()).await;
+    feed.await.unwrap();
+    assert!(
+        matches!(end, schemaic_core::script::ExecEnd::Done),
+        "{end:?}\n{script}"
+    );
+}
+
 /// Diff `draft` against `current`, refuse nothing, and apply it.
 async fn apply_draft(
     s: &Scratch,
@@ -1964,6 +1988,75 @@ async fn a_routine_is_altered_in_place_and_keeps_what_the_alter_resets() {
     let all = read(&s).await;
     let fresh = find(&all, "fresh");
     assert!(diff_routine(&fresh, &RoutineDraft::from_info(&fresh), MS).is_empty());
+}
+
+/// **A numbered procedure group survives every plan the editor can build for
+/// its head.** `grp` is listed once and its text holds no `;`, so only
+/// `sys.numbered_procedures` shows `grp;2`: it is read, an edit in place keeps
+/// it, a rename — a drop and a create, which would take the group — is
+/// refused before it runs, and Copy DDL of the head scripts the member.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_numbered_procedure_group_survives_every_plan_for_its_head() {
+    use schemaic_core::ddl::{RoutineDraft, diff_routine};
+    if !enabled() || azure_cannot("Azure SQL Database has no numbered procedures") {
+        return;
+    }
+    let s = Scratch::create("ddl_numbered").await;
+    s.exec("CREATE PROCEDURE dbo.grp AS SELECT 1 AS n").await;
+    s.exec("CREATE PROCEDURE dbo.grp;2 AS SELECT 2 AS n").await;
+    let head = || {
+        let db = s.db.clone();
+        let name = s.name.clone();
+        async move {
+            db.fetch_schema(&name, CancellationToken::new())
+                .await
+                .expect("the schema")
+                .routines
+                .iter()
+                .find(|r| r.name == "grp")
+                .expect("grp")
+                .as_ref()
+                .clone()
+        }
+    };
+    let members = "SELECT COUNT(*) FROM sys.numbered_procedures";
+    let grp = head().await;
+    assert_eq!(grp.tsql.numbered.len(), 1, "{:?}", grp.tsql);
+    assert_eq!(grp.tsql.numbered[0].0, 2);
+    assert!(grp.tsql.numbered[0].1.contains("grp;2"));
+    assert!(grp.is_editable());
+    assert!(diff_routine(&grp, &RoutineDraft::from_info(&grp), MS).is_empty());
+
+    let mut d = RoutineDraft::from_info(&grp);
+    d.info.body = "SELECT 11 AS n".into();
+    let plan = diff_routine(&grp, &d, MS);
+    assert!(plan.unsupported().is_empty(), "{:?}", plan.unsupported());
+    let stmts = plan.emit();
+    s.db.run_ddl(&s.name, &stmts, CancellationToken::new())
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{stmts:#?}"));
+    assert_eq!(s.scalar("EXEC dbo.grp").await, "11");
+    assert_eq!(s.scalar(members).await, "1", "the edit in place kept grp;2");
+
+    let grp = head().await;
+    let mut d = RoutineDraft::from_info(&grp);
+    d.info.name = "grp_renamed".into();
+    assert!(!d.validate(MS).is_empty());
+    let plan = diff_routine(&grp, &d, MS);
+    assert!(
+        plan.unsupported().iter().any(|w| w.contains("grp;2")),
+        "{:?}",
+        plan.unsupported()
+    );
+
+    let ddl = schemaic_core::schema::ObjectItem::Routine(Arc::new(grp)).create_sql(MS);
+    assert!(ddl.contains("grp;2 AS SELECT 2 AS n"), "{ddl}");
+    // And the script is one the server takes back: dropped, then replayed.
+    s.exec("DROP PROCEDURE dbo.grp").await;
+    assert_eq!(s.scalar(members).await, "0", "the drop took the group");
+    replay(&s, &ddl).await;
+    assert_eq!(s.scalar(members).await, "1", "the script put grp;2 back");
+    assert_eq!(s.scalar("EXEC dbo.grp;2").await, "2");
 }
 
 /// **A trigger is altered in place and keeps what the alter would reset.**

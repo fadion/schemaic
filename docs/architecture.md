@@ -4884,8 +4884,9 @@ existing prose was left alone.
     list rebuilt from `sys.parameters` and fed back to `CREATE OR ALTER` would silently drop every
     default — the stored text is the only place one lives. A procedure's optional parentheses are
     taken off and written back without. It answers `None` — listed, droppable, restated verbatim,
-    never rebuilt — for `WITH ENCRYPTION`, an option it does not model, a numbered procedure
-    (`p;2`), a CLR routine's `EXTERNAL NAME` and anything else outside that shape
+    never rebuilt — for `WITH ENCRYPTION`, an option it does not model, a numbered group's member
+    (`p;2` — the group's head reads, and is handled below), a CLR routine's `EXTERNAL NAME` and
+    anything else outside that shape
     (`a_routine_header_the_parts_cannot_restate_is_unreadable`), on the trigger walk's rule that a
     word merely skipped is a word the rebuild drops (`a_stored_procedure_splits_into_its_parts`,
     `each_function_shape_splits_into_its_parts`).
@@ -4902,6 +4903,20 @@ existing prose was left alone.
     recreate, `sp_rename` leaving the stored text naming the old routine — the call
     `supports_view_rename` makes for a view — and it is the case the `diff_routine` rule above
     exists for (`a_renamed_or_reshaped_sql_server_routine_is_dropped_and_created`).
+    **Except where the routine heads a numbered procedure group**: `DROP PROCEDURE grp` takes
+    `grp;2 … n` with it (measured on SQL Server 2022: `sys.numbered_procedures` one row to none),
+    and nothing can put them back — their text names the group's old name, and the model holds them
+    only to script them (`TsqlRoutine::numbered`, under `schema.rs`). A rename planned exactly that
+    drop and create, with nothing on screen to warn of it, the head's own text having no `;`. A
+    `CREATE OR ALTER` of the head keeps them (measured), so an edit in place stays allowed and only
+    a plan that drops first is refused: `numbered_group_refusal`, chained into
+    `ChangeSet::unsupported` beside `unreplayable_rename`, answers a `ReplaceRoutine { recreate:
+    true }` over a head — a rename, a change of kind or shape — so the preview withholds Apply;
+    `RoutineDraft::validate`'s SQL Server arm says the same while the new name is being typed; and a
+    deliberate `DropRoutine`'s risk names every member that goes with it
+    (`a_numbered_group_head_is_altered_in_place_and_never_dropped`; live,
+    `a_numbered_procedure_group_survives_every_plan_for_its_head`, which Azure SQL Database skips
+    for having no numbered procedures).
     **What a create loses is its comment**, the `MS_Description` property, which a `CREATE` has no
     clause for and a recreate's `DROP` takes with it. `routine_follow_ups`, one exhaustive `match`,
     sets it through `TsqlComment::set` after a create or a recreate when there is one, and after an
@@ -7858,6 +7873,14 @@ existing prose was left alone.
     line saying so when the server shows no text (`WITH ENCRYPTION`, or no `VIEW DEFINITION`)
     (`a_sql_server_routine_the_parts_cannot_hold_is_restated_verbatim`). `is_editable` is false for
     both, beside `c` and `internal` — the same case: listed and droppable, nothing to edit.
+    **`numbered` is the rest of the numbered procedure group a procedure heads** — `grp;2`,
+    `grp;3`, as `(number, stored text)` from `sys.numbered_procedures`, in number order — read
+    because the head gives no sign of them: its text in `sys.sql_modules` has no `;` and
+    `sys.objects` lists the group once, yet `DROP PROCEDURE grp` takes every member (why the editor
+    refuses a plan that drops a head is under `ddl.rs`). It is in the hand-written `PartialEq`;
+    `numbered_names` spells the members `grp;2, grp;3` for a sentence; and `ObjectItem::create_sql`
+    — Copy DDL and the dump — restates each member's text after the head's, each its own `GO` batch
+    through `ddl::client_script` (`a_numbered_group_head_scripts_its_members`).
     `RoutineSource` is the MySQL body + session state, fetched lazily, and exists
     for exactly the reason `TriggerSource` does — `information_schema.ROUTINE_DEFINITION` resolves
     the body's escapes, and every edit on that engine begins with a `DROP` that commits on its own,
@@ -12480,7 +12503,11 @@ existing prose was left alone.
   one has no defaults (`has_default_value` is 0 for `@a int = 5`, measured) and fed back to `CREATE
   OR ALTER` it would drop every one; the catalogue's list and return type are kept only for a
   routine that cannot be rebuilt, where they are for display
-  (`a_stored_routine_reads_into_its_parts_or_is_kept_whole`).
+  (`a_stored_routine_reads_into_its_parts_or_is_kept_whole`). **`NUMBERED_LISTING` reads what the
+  routine listing cannot see** — a numbered group's members past the first, which live only in
+  `sys.numbered_procedures` — and `fetch_schema`'s routine loop attaches them to their head as
+  `TsqlRoutine::numbered` (under `schema.rs`; why a plan that drops a head is refused is under
+  `ddl.rs`).
   **A view's header is read off its stored definition, in two halves by one walk.**
   `view_select_body` is the `SELECT` — everything after the first `AS` outside parentheses,
   strings, comments and quoted names, over `sql::skip_noncode` — and `view_header_options` is what
