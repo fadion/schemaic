@@ -69,18 +69,19 @@ editing, and schema-aware intelligence, built to feel instant.
   same server-side cancellation the Cancel button does.
 - **Transactions** — a per-tab manual mode that pins one connection and waits for
   an explicit commit or rollback, with a status pill saying what is open and how
-  many statements are in it. MySQL/MariaDB and PostgreSQL; on SQLite the control
-  isn't shown, because there is no manual mode there yet.
+  many statements are in it. MySQL/MariaDB, PostgreSQL and SQL Server; on SQLite
+  the control isn't shown, because SQLite has no manual mode to offer.
 - **Schema editing** — a visual table designer (columns, indexes, foreign keys,
   CHECK constraints) plus editors for views and triggers, for stored functions
-  and procedures on MySQL/MariaDB and PostgreSQL, for PostgreSQL types, domains
+  and procedures on MySQL/MariaDB, PostgreSQL and SQL Server, for PostgreSQL types, domains
   and sequences, and for MySQL's scheduled events. Databases and schemas
   can be created and dropped, and a PostgreSQL materialized view refreshed, from
   the tree's own menus. Every change is shown as the SQL it will run,
   with anything destructive spelled out in plain language, before it runs. Tables,
-  views and triggers on all three engines — including SQLite, where a column
-  change is a table rebuild and the app generates, verifies and runs the whole
-  script for you.
+  views and triggers on every engine — including SQLite, where a column change is
+  a table rebuild and the app generates, verifies and runs the whole script for
+  you, and SQL Server, where the same is done for the column changes its
+  `ALTER COLUMN` cannot make.
 - **Compare schemas** — pair two databases object by object (tables, views,
   triggers, routines, events, enums, domains, sequences), tick the differences you
   want, and get one migration through the same preview and Apply as every other
@@ -96,14 +97,16 @@ editing, and schema-aware intelligence, built to feel instant.
   are renumbered rather than carrying their old ids.
 - **Users and privileges** — browse a server's accounts and roles, read one
   account's privileges as the actual `GRANT` statements, and create, drop, grant
-  or revoke through the ordinary DDL preview. MySQL/MariaDB and PostgreSQL;
-  server-owned accounts are shown read-only, and where a privilege could be held
+  or revoke through the ordinary DDL preview. MySQL/MariaDB, PostgreSQL and SQL
+  Server (its logins and each database's users); server-owned accounts are shown
+  read-only, and where a privilege could be held
   indirectly — through a role, ownership, or superuser — the pane says the list is
   direct grants only instead of implying it is the whole picture.
 - **Server activity** — the connection's live sessions, with a lock-wait banner,
-  and *Kill session* / *Cancel query* on any of them. MySQL/MariaDB and
-  PostgreSQL. Where the engine can't say what is blocking what, it still shows who
-  is waiting and admits it can't name the blocker.
+  and *Kill session* / *Cancel query* on any of them. MySQL/MariaDB, PostgreSQL
+  and SQL Server (*Kill session* only: SQL Server cannot cancel another session's
+  statement without ending the session). Where the engine can't say what is
+  blocking what, it still shows who is waiting and admits it can't name the blocker.
 - **Live Monitor** — watch a table and see inserts, updates and deletes as they
   land, down to which column changed; pause, clear or export the change log.
 - **Import** — load CSV / TSV / JSON (array or JSON Lines) / Excel `.xlsx` into a
@@ -122,12 +125,13 @@ editing, and schema-aware intelligence, built to feel instant.
   TLS from *prefer* through *verify-full* (client certificates included, verified
   against the OS trust store rather than a root set compiled in years ago), and
   SQLite by picking a file (no server, so no host, credentials or tunnel to fill
-  in). **SQL Server and Azure SQL are in preview**: SQL Server logins, querying,
-  scripts with `GO`, browsing the schema, table DDL, editing rows in the grid,
-  creating and editing tables in the designer, dropping tables, views and
-  procedures, exports, server activity and the AI panel's read access work;
-  importing, query plans, manual transactions and editing a view or routine are
-  not offered there yet. Per-connection
+  in). **SQL Server and Azure SQL are in preview**: signing in with a SQL login,
+  Windows authentication (in the Windows build) or Microsoft Entra through the
+  Azure CLI; querying, scripts with `GO`, browsing the schema, editing rows in the
+  grid, importing files, Manual-mode transactions, query plans, `.sql` dumps,
+  exports and server activity; creating and editing tables in the designer, and
+  editing views, triggers, procedures and functions; logins and database users;
+  a `sqlcmd` session; and the AI panel's read access. Per-connection
   colours, environment badges, and a read-only guard-rail on all of them — on SQL
   Server, which has no read-only session, a read runs in a transaction that is
   rolled back, and a login that can only read is the full guarantee. Coming from another client, you can import the servers you already
@@ -136,7 +140,7 @@ editing, and schema-aware intelligence, built to feel instant.
   its passwords encrypted or in the OS credential store, you're told so rather
   than left with a connection that silently won't open.
 - **Terminal** — an embedded shell, and a one-click `mysql` / `mariadb` / `psql` /
-  `sqlite3` session against the active connection — through the SSH tunnel when
+  `sqlite3` / `sqlcmd` session against the active connection — through the SSH tunnel when
   there is one, with the password passed by environment rather than on the command
   line, and for SQLite starting in the database file's own directory so `.output`
   and `.read` land where you'd expect.
