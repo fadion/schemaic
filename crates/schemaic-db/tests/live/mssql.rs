@@ -626,6 +626,12 @@ async fn a_dump_restores_into_an_empty_database() {
         .await;
     src.exec("CREATE TRIGGER dbo.tr_orders ON dbo.orders AFTER INSERT AS SET NOCOUNT ON")
         .await;
+    // A routine of each kind: the file used to close each one `GO;` + `GO`,
+    // and the restore stopped at the first with Msg 102.
+    src.exec("CREATE FUNCTION dbo.f_double (@x int) RETURNS int AS BEGIN RETURN @x * 2; END")
+        .await;
+    src.exec("CREATE PROCEDURE dbo.p_count AS SELECT COUNT(*) FROM dbo.orders;")
+        .await;
 
     let schema = src
         .db
@@ -724,6 +730,12 @@ async fn a_dump_restores_into_an_empty_database() {
     assert_eq!(dst.scalar("SELECT COUNT(*) FROM dbo.v_orders").await, "2");
     assert_eq!(
         dst.scalar("SELECT COUNT(*) FROM sys.triggers WHERE name = 'tr_orders'")
+            .await,
+        "1"
+    );
+    assert_eq!(dst.scalar("SELECT dbo.f_double(21)").await, "42");
+    assert_eq!(
+        dst.scalar("SELECT COUNT(*) FROM sys.procedures WHERE name = 'p_count'")
             .await,
         "1"
     );

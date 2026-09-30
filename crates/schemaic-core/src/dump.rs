@@ -342,8 +342,7 @@ fn close_batches(steps: Vec<DumpStep>, dialect: SqlDialect) -> Vec<DumpStep> {
             }
             DumpStep::Text(t) => {
                 let body = t.trim_end();
-                let last = body[body.rfind('\n').map_or(0, |k| k + 1)..].trim_start();
-                if crate::sql::go_directive(last, 0, dialect).is_some() {
+                if crate::ddl::ends_in_go(body, dialect) {
                     out.push(DumpStep::Text(body.to_string()));
                 } else {
                     out.push(DumpStep::Text(format!("{body}\nGO")));
@@ -3326,7 +3325,29 @@ mod tests {
         let mut v = view("v");
         v.schema = Some("dbo".to_string());
         v.create_sql = Some("CREATE VIEW dbo.v AS SELECT 1 AS id".to_string());
-        let s = schema_of(vec![t, v]);
+        let mut s = schema_of(vec![t, v]);
+        // A routine's `create_sql` is already a runnable script ending in `GO`;
+        // the routine section must not wrap it a second time (`GO;` is not a
+        // separator, and the restore stopped at it with Msg 102).
+        for (name, kind, returns) in [
+            ("f_double", crate::schema::RoutineKind::Function, "int"),
+            ("p_touch", crate::schema::RoutineKind::Procedure, ""),
+        ] {
+            s.routines
+                .push(std::sync::Arc::new(crate::schema::RoutineInfo {
+                    name: name.to_string(),
+                    schema: Some("dbo".to_string()),
+                    kind,
+                    arguments: if returns.is_empty() {
+                        String::new()
+                    } else {
+                        "@x int".to_string()
+                    },
+                    returns: returns.to_string(),
+                    body: "BEGIN\n  RETURN @x * 2;\nEND".to_string(),
+                    ..Default::default()
+                }));
+        }
         let p = plan(
             &s,
             "shop",
@@ -3360,6 +3381,22 @@ mod tests {
         // The view opens its own batch.
         let before_view = &file[..pos(&file, "CREATE VIEW")];
         assert!(before_view.trim_end().ends_with("GO"), "{file}");
+        // Each routine closes its batch once, with a bare `GO`.
+        pos(&file, "CREATE FUNCTION [dbo].[f_double]");
+        pos(&file, "CREATE PROCEDURE [dbo].[p_touch]");
+        assert!(
+            file.lines().all(|l| !l.trim().eq_ignore_ascii_case("GO;")),
+            "{file}"
+        );
+        let lines: Vec<&str> = file
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        assert!(
+            !lines.windows(2).any(|w| w[0] == "GO" && w[1] == "GO"),
+            "an empty batch: {file}"
+        );
         // Nothing of the kind on an engine without batches.
         let mut t = table("orders");
         t.columns[0].auto_increment = true;

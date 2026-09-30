@@ -8960,8 +8960,23 @@ pub fn client_script(stmts: &[String], dialect: SqlDialect) -> String {
     // `join_scripts` does for whole scripts. Its tools run a paste as one batch
     // otherwise, and two statements declaring the same variable — two dropped
     // columns' default lookups, say — are Msg 134 before anything runs.
+    //
+    // **A statement already closed by a `GO` is left alone.** A routine's
+    // `ObjectItem::create_sql` is this function's output, and the dump passed
+    // it through here a second time: `terminated` made its `GO` a `GO;`, which
+    // is not a separator, so `join_scripts` added another and every restore
+    // stopped at the first routine with Msg 102.
     if dialect.batch_separator() {
-        return join_scripts(stmts.iter().map(|s| terminated(s)), dialect);
+        return join_scripts(
+            stmts.iter().map(|s| {
+                if ends_in_go(s, dialect) {
+                    s.trim_end().to_string()
+                } else {
+                    terminated(s)
+                }
+            }),
+            dialect,
+        );
     }
     if dialect != SqlDialect::MySql || !stmts.iter().any(|s| needs_delimiter(s, dialect)) {
         return stmts
@@ -9001,8 +9016,7 @@ pub fn join_scripts(parts: impl IntoIterator<Item = String>, dialect: SqlDialect
         .filter(|p| !p.trim().is_empty())
         .map(|p| {
             let p = p.trim_end();
-            let last_line = p[p.rfind('\n').map_or(0, |k| k + 1)..].trim_start();
-            if sql::go_directive(last_line, 0, dialect).is_some() {
+            if ends_in_go(p, dialect) {
                 p.to_string()
             } else {
                 format!("{p}\nGO")
@@ -9010,6 +9024,13 @@ pub fn join_scripts(parts: impl IntoIterator<Item = String>, dialect: SqlDialect
         })
         .collect::<Vec<_>>()
         .join("\n\n")
+}
+
+/// Is the last line of `script` a batch separator (`GO`) in `dialect`?
+pub fn ends_in_go(script: &str, dialect: SqlDialect) -> bool {
+    let p = script.trim_end();
+    let last_line = p[p.rfind('\n').map_or(0, |k| k + 1)..].trim_start();
+    sql::go_directive(last_line, 0, dialect).is_some()
 }
 
 /// One statement, ending in the `;` a client splits on. A no-op for the many
@@ -18239,6 +18260,9 @@ mod tests {
         for batch in script.split("\nGO") {
             assert!(batch.matches("DECLARE @df").count() <= 1, "{batch}");
         }
+        // A script already closed by `GO` comes through unchanged — the dump
+        // wraps a routine's runnable `CREATE` again, and `GO;` is no separator.
+        assert_eq!(client_script(std::slice::from_ref(&script), MsSql), script);
     }
 
     /// SQL Server prints a check's column bracketed — `[qty]>=(0)` — so the

@@ -3203,8 +3203,8 @@ existing prose was left alone.
     (Msg 111, per the test's doc) — `a_sql_server_dump_closes_every_batch_with_go`, which also
     asserts MySQL's file carries neither a `GO` nor an `IDENTITY_INSERT`. The live pin is
     `a_dump_restores_into_an_empty_database` in `tests/live/mssql.rs`: a scratch database with an
-    identity holding a gap, a `rowversion`, a computed column, a foreign key, a view, a trigger and
-    `datetime2`/`date`/`decimal`/Unicode values is dumped, rendered as the app's writer renders it,
+    identity holding a gap, a `rowversion`, a computed column, a foreign key, a view, a trigger, a
+    function, a procedure and `datetime2`/`date`/`decimal`/Unicode values is dumped, rendered as the app's writer renders it,
     split and replayed through `run_script` into an empty database, and compares equal row for row,
     with the key, the view and the trigger present and the next identity continuing from the
     highest carried. It failed against the unfixed `dump.rs`.
@@ -12617,7 +12617,11 @@ existing prose was left alone.
   **A copied plan closes every statement with `GO`**: `client_script` goes through `join_scripts`
   on a batch-separator dialect, since SQL Server's tools run a paste as one batch and two dropped
   columns' lookups each `DECLARE @df` — Msg 134 before anything ran
-  (`a_copied_sql_server_plan_is_one_batch_a_statement`).
+  (`a_copied_sql_server_plan_is_one_batch_a_statement`). **A statement already closed by `GO`
+  passes through unchanged** (`ddl::ends_in_go`): a routine's `ObjectItem::create_sql` is
+  `client_script`'s own output, and the dump's routine section wrapped it again — `terminated`
+  made the `GO` a `GO;`, which is no separator, so every SQL Server dump holding a routine stopped
+  its restore at the first one with Msg 102.
   **A comment is the `MS_Description` extended property, and an edit sets it without trusting the
   read** (`TsqlComment`). On a table the plan creates, or a column it adds, there is none yet, so
   `add` is a plain `EXEC sp_addextendedproperty`. Anything else is `set`: `IF EXISTS (SELECT 1 FROM
