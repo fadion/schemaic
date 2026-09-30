@@ -1355,22 +1355,11 @@ fn server_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
     // engine's. The credentials below follow the mode, built per mode rather
     // than hidden, for `engine_block`'s Tab-ring reason.
     let modes = AuthMode::offered(&draft.db_type.get_untracked());
-    let auth_picker = if modes.len() > 1 {
-        v_stack((
-            text("Authentication").style(form_label_style),
-            focusable_dropdown(draft.auth, modes.clone(), AuthMode::label, ring.clone(), 68)
-                .style(|s| s.width(theme::scaled(240.0))),
-        ))
-        .style(|s| s.flex_col().gap(theme::scaled(6.0)))
-        .into_any()
-    } else {
-        crate::widgets::nothing()
-    };
     let auth = draft.auth;
-    let ring_creds = ring.clone();
-    let credentials = dyn_container(
-        // The mode in force, not the stored one: a SQL Server connection
-        // switched to MySQL keeps its mode, and must still show a password.
+    // The mode in force, not the stored one: a SQL Server connection
+    // switched to MySQL keeps its mode, and must still show a password.
+    let in_force = {
+        let modes = modes.clone();
         move || {
             let m = auth.get();
             if modes.contains(&m) {
@@ -1378,28 +1367,56 @@ fn server_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
             } else {
                 AuthMode::Password
             }
-        },
-        move |m| match m {
-            AuthMode::Password => v_stack((
-                field("User", draft.user, ring_creds.clone(), 70)
-                    .style(|s| s.width(conn_field_w())),
-                masked_field("Password", draft.password, ring_creds.clone(), 80)
-                    .style(|s| s.width(conn_field_w())),
-            ))
-            .style(|s| s.flex_col().gap(theme::scaled(20.0)).width_full())
-            .into_any(),
-            AuthMode::Windows => form_hint(windows_sign_in_hint())
-                .style(|s| s.width_full())
-                .into_any(),
-            AuthMode::AzureCli => form_hint(
-                "Signs in as whoever is signed in to the Azure CLI (run `az login` first). \
-                 The token is fetched when a connection needs one and never saved.",
-            )
+        }
+    };
+    // A mode that needs no credentials says what it signs in as instead —
+    // **under the picker, at its 6px**, as the Database field's hint sits under
+    // it. In the column's 20px gap, where the fields go, it read as a field of
+    // its own rather than a note about the choice above it.
+    let sign_in_hint = dyn_container(in_force.clone(), |m| match m {
+        AuthMode::Password => crate::widgets::nothing(),
+        AuthMode::Windows => form_hint(windows_sign_in_hint())
             .style(|s| s.width_full())
             .into_any(),
-        },
-    )
-    .style(|s| s.width_full());
+        AuthMode::AzureCli => form_hint(
+            "Signs in as whoever is signed in to the Azure CLI (run `az login` first). \
+             The token is fetched when a connection needs one and never saved.",
+        )
+        .style(|s| s.width_full())
+        .into_any(),
+    })
+    // Collapsed on a password, or its empty box would add the stack's 6px
+    // under the dropdown.
+    .style({
+        let in_force = in_force.clone();
+        move |s| crate::widgets::collapse_unless(s, in_force() != AuthMode::Password)
+    });
+    let auth_picker = if modes.len() > 1 {
+        v_stack((
+            text("Authentication").style(form_label_style),
+            focusable_dropdown(draft.auth, modes.clone(), AuthMode::label, ring.clone(), 68)
+                .style(|s| s.width(theme::scaled(240.0))),
+            sign_in_hint,
+        ))
+        .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full())
+        .into_any()
+    } else {
+        crate::widgets::nothing()
+    };
+    let ring_creds = ring.clone();
+    let credentials = dyn_container(in_force.clone(), move |m| match m {
+        AuthMode::Password => v_stack((
+            field("User", draft.user, ring_creds.clone(), 70).style(|s| s.width(conn_field_w())),
+            masked_field("Password", draft.password, ring_creds.clone(), 80)
+                .style(|s| s.width(conn_field_w())),
+        ))
+        .style(|s| s.flex_col().gap(theme::scaled(20.0)).width_full())
+        .into_any(),
+        AuthMode::Windows | AuthMode::AzureCli => crate::widgets::nothing(),
+    })
+    // `collapse_unless`, not just the `nothing()` inside: an empty box here
+    // would still claim the column's 20px below the picker.
+    .style(move |s| crate::widgets::collapse_unless(s, in_force() == AuthMode::Password));
 
     v_stack((
         host_port_row("Host", draft.host, "Port", draft.port, ring.clone(), 60),

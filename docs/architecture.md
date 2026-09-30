@@ -15854,12 +15854,20 @@ existing prose was left alone.
     Server's, through `AuthMode::offered` — between Database and the credentials, at tabindex 68 in
     the gap the surrounding indices were spaced to leave. `DraftSignals::auth` is threaded through
     create, load, reset and `to_connection` like the rest. The list is read once, untracked, because
-    `server_fields` is rebuilt when the engine changes. The credentials below are a `dyn_container`
-    keyed on the mode **in force**, not the stored one — a SQL Server connection switched to MySQL
-    keeps `AzureCli` in its draft and must still show a password — and each mode builds its own
-    child rather than hiding the fields, for the reason `conn_form`'s `engine_block` is built per
-    engine — a hidden field stays in the Tab ring, so Tab would land on a password nobody can see:
-    User and Password for a password, or a hint saying who the other two sign in as. Windows names the account from
+    `server_fields` is rebuilt when the engine changes. What follows the dropdown is keyed on the
+    mode **in force**, not the stored one — a SQL Server connection switched to MySQL keeps
+    `AzureCli` in its draft and must still show a password — through one `in_force` closure. The
+    credentials are a `dyn_container` building User and Password for a password and `nothing()` for
+    the other two, each mode its own child rather than hidden fields, for the reason `conn_form`'s
+    `engine_block` is built per engine — a hidden field stays in the Tab ring, so Tab would land on
+    a password nobody can see. **The other two modes' hint is not a credentials arm but the
+    picker's own third child** (`sign_in_hint`), under the dropdown at the stack's 6px as the
+    Database field's hint sits under its field. As a credentials arm it sat in the server column's
+    20px gap, over three times further from the dropdown, and read as a field of its own rather
+    than a note about the choice above it. Both containers are also styled
+    `widgets::collapse_unless` on the mode, not only emptied: an empty `dyn_container` is still a
+    box, and the credentials' would claim the column's 20px below the picker. The picker's stack is
+    `width_full` so the hint wraps at the column. Windows names the account from
     `USERDOMAIN`/`USERNAME` (*"Signs in as the Windows account Schemaic runs as (DOMAIN\user). The
     server must know that account as a Windows login."*), and Entra says *"Signs in as whoever is
     signed in to the Azure CLI (run `az login` first). The token is fetched when a connection needs
