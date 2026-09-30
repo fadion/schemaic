@@ -20673,8 +20673,9 @@ existing prose was left alone.
     progress readout, and a click on it mid-download would have nothing to apply.
 - `schemaic-app` — `main.rs` wires signals + callbacks and builds the `Ui`; also the `--mcp-serve`
   branch that runs the MCP server the AI panel talks to (the server is `schemaic-cli`'s `mcp.rs`,
-  handed the endpoint blob the app wrote), and the argv branch into the headless CLI
-  (`schemaic-cli`, below). `main` returns a `std::process::ExitCode` so the one-shot front ends can
+  handed the endpoint blob the app wrote, on `cli::run::block_on_own_stack`'s thread rather than the
+  main thread, for the stack reason the `cli/run.rs` entry gives), and the argv branch into the headless
+  CLI (`schemaic-cli`, below). `main` returns a `std::process::ExitCode` so the one-shot front ends can
   answer with one. A query tab's identity is `(conn_id, database)`;
   the app resolves `conn_id` → `Db` at run time (`db_for`), so a tab keeps its connection after a
   switch.
@@ -23696,7 +23697,17 @@ existing prose was left alone.
     had what it wanted, and any other write error is `Exit::Failed`
     (`a_closed_stdout_ends_quietly_and_any_other_write_error_fails`). The
     tokio runtime is **current-thread and built here**, mirroring `--mcp-serve`: one statement on
-    one connection has no use for a pool and would pay its startup. `list` builds a `ResultSet` and
+    one connection has no use for a pool and would pay its startup. **Both build it through
+    `block_on_own_stack`, on a scoped thread with `RUNTIME_STACK` (8 MiB), never on the main
+    thread**: `block_on` keeps the whole future on the calling thread's stack, and Windows gives the
+    main thread 1 MiB where Linux gives 8. In a debug build the MCP server's `list_schema` overflowed
+    it on every engine — the process died mid-call and the agent reported the server as
+    *connection closed* (reproduced against Azure SQL; the release build did not overflow on that
+    path) — and `schemaic version` overflowed too, since `dispatch`'s future carries every command's
+    state at once. The GUI never met it: its DB work runs on tokio's worker threads. A panic on the
+    runtime thread is resumed on the caller, so a bug still ends the process as it did before
+    (`a_future_larger_than_the_callers_stack_runs_on_its_own_thread`,
+    `a_panic_on_the_runtime_thread_reaches_the_caller`). `list` builds a `ResultSet` and
     hands it to the same renderers a query's rows go through, so `--format=json` means the same
     thing there as here and there is no second table-drawing path to keep in step. **Without
     `--all` it says on stderr how many it left out**, not only when it left out everything: a

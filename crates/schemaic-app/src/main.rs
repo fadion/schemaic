@@ -182,11 +182,10 @@ fn main() -> std::process::ExitCode {
                 std::process::exit(2);
             }
         };
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
+        // Off the main thread, whose 1 MiB on Windows `list_schema` overflowed
+        // — the agent saw the server die mid-call as *connection closed*.
+        schemaic_cli::run::block_on_own_stack(|| schemaic_cli::mcp::serve(endpoint))
             .expect("build tokio runtime");
-        rt.block_on(schemaic_cli::mcp::serve(endpoint));
         return std::process::ExitCode::SUCCESS;
     }
 

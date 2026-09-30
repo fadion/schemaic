@@ -142,6 +142,51 @@ fn hint(message: &str) {
     eprintln!("hint: {message}");
 }
 
+/// The stack a headless front end's runtime thread gets — Linux's main-thread
+/// default, and what `schemaic mcp` and `--mcp-serve` had there all along.
+///
+/// Reserved, not committed: the pages are touched only as deep as a call goes.
+const RUNTIME_STACK: usize = 8 << 20;
+
+/// Run the future `f` builds to completion on a **current-thread runtime of its
+/// own, on a thread with [`RUNTIME_STACK`] of stack** — for the two front ends
+/// that never build a window, this CLI's [`main`] and the app's `--mcp-serve`.
+///
+/// **Not on the calling thread, because that is the process's main thread**,
+/// and `block_on` keeps the whole future on its stack. Windows gives the main
+/// thread 1 MiB, where Linux gives 8: the MCP server's `list_schema` overflowed
+/// it on every engine, the process died mid-call, and the agent reported the
+/// tool's server as *connection closed* against a database the editor was
+/// querying fine. The GUI never met it — its work runs on tokio's worker
+/// threads, with 2 MiB each. A debug build overflowed on `schemaic version`,
+/// since [`dispatch`]'s future holds every command's state at once.
+///
+/// `f` builds the future on the new thread, so the future itself need not be
+/// `Send`. A panic there is resumed here, so a bug still ends the process the
+/// way it did on the main thread; `Err` is only the thread or the runtime
+/// failing to start.
+pub fn block_on_own_stack<F, Fut>(f: F) -> std::io::Result<Fut::Output>
+where
+    F: FnOnce() -> Fut + Send,
+    Fut: std::future::Future,
+    Fut::Output: Send,
+{
+    std::thread::scope(|s| {
+        let runner = std::thread::Builder::new()
+            .name("schemaic-runtime".to_string())
+            .stack_size(RUNTIME_STACK)
+            .spawn_scoped(s, move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                Ok(rt.block_on(f()))
+            })?;
+        runner
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    })
+}
+
 /// Parse, then run. The whole entry point, for both front ends.
 pub fn main<I, T>(argv: I) -> ExitCode
 where
@@ -164,18 +209,14 @@ where
     // **Current-thread, built here.** A CLI invocation is one statement on one
     // connection; a multi-thread pool would cost startup for nothing. This
     // mirrors `--mcp-serve`, which is the other front end that never builds a
-    // window.
-    let rt = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(rt) => rt,
+    // window — and, like it, not on the main thread: see `block_on_own_stack`.
+    match block_on_own_stack(|| dispatch(cli.command)) {
+        Ok(exit) => exit.into(),
         Err(e) => {
             warn(&format!("could not start: {e}"));
-            return Exit::Failed.into();
+            Exit::Failed.into()
         }
-    };
-    rt.block_on(dispatch(cli.command)).into()
+    }
 }
 
 async fn dispatch(command: Command) -> Exit {
@@ -1048,6 +1089,36 @@ fn default_database(flag: Option<&str>, conn: &Connection) -> Option<String> {
 mod tests {
     use super::*;
     use crate::args::Cli;
+
+    /// **A future larger than the calling thread's stack still runs.** The
+    /// headless front ends used to `block_on` on the main thread, which on
+    /// Windows has 1 MiB: `list_schema` overflowed it and the MCP server died
+    /// mid-call. The test thread here has 2 MiB, and the future holds 1.5 MiB
+    /// across an `.await`, so it lives in the future's own state — which
+    /// `block_on` keeps on the stack of whichever thread runs it, and which a
+    /// debug build copies more than once on the way there.
+    #[test]
+    fn a_future_larger_than_the_callers_stack_runs_on_its_own_thread() {
+        const LEN: usize = 3 << 19;
+        let n = block_on_own_stack(|| async {
+            let buf = [7u8; LEN];
+            tokio::task::yield_now().await;
+            std::hint::black_box(&buf)
+                .iter()
+                .map(|&b| b as usize)
+                .sum::<usize>()
+        })
+        .expect("the runtime starts");
+        assert_eq!(n, 7 * LEN);
+    }
+
+    /// **A panic on that thread is the caller's panic**, not a silent `Err`:
+    /// the front ends' behaviour on a bug stays what it was on the main thread.
+    #[test]
+    #[should_panic(expected = "boom")]
+    fn a_panic_on_the_runtime_thread_reaches_the_caller() {
+        let _ = block_on_own_stack(|| async { panic!("boom") });
+    }
 
     /// **A ping answers with which connection answered, and how fast** — a
     /// row, so `--format` means what it means everywhere; whole milliseconds,
