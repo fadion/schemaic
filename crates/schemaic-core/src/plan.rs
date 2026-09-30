@@ -445,6 +445,33 @@ fn unbracket(s: &str) -> String {
         .unwrap_or_else(|| s.to_string())
 }
 
+/// A multi-part name as a plan writes one — `[db].[dbo].[f]` — with each
+/// part's brackets off: `db.dbo.f`. A `.` inside brackets stays in its part.
+fn unbracket_parts(s: &str) -> String {
+    let mut out = String::new();
+    let mut chars = s.chars().peekable();
+    let mut quoted = false;
+    while let Some(c) = chars.next() {
+        match c {
+            '[' if !quoted => quoted = true,
+            ']' if quoted && chars.peek() == Some(&']') => {
+                chars.next();
+                out.push(']');
+            }
+            ']' if quoted => quoted = false,
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// One statement being read: its index in the output, and the `<RelOp>`s
+/// open around the reader inside it (indexes into its `ops`).
+struct OpenStatement {
+    at: usize,
+    ops: Vec<usize>,
+}
+
 /// What an element under `<Warnings>` means, in the words the table shows;
 /// one this does not know is named as the server named it.
 fn showplan_warning(
@@ -476,7 +503,20 @@ fn showplan_warning(
     (PlanWarningKind::ServerWarning, text)
 }
 
-/// Every planned statement one document holds, or why it is not a plan.
+/// Every planned statement one document holds, in document order, or why it
+/// is not a plan.
+///
+/// **Statements nest**, so the open ones are a stack. A scalar function's
+/// statements sit *inside* the calling query's `<StmtSimple>`, after its
+/// `<QueryPlan>`, under `<UDF><Statements>` (a procedure's under
+/// `<StoredProc>`), and an `IF`'s branches inside its `<StmtCond>`, whose own
+/// `<Condition>` carries the condition's plan. The reader kept one current
+/// statement and began a new one at every `<StmtSimple>`, so a function's plan
+/// replaced the query's — which was lost, warnings and all — and an `IF`'s
+/// condition, under no `<StmtSimple>`, was dropped. Each statement is placed
+/// in the output where it opens, so the query comes before the function it
+/// calls, and a statement inside a function or procedure is headed by whose
+/// it is.
 fn parse_showplan(doc: &str) -> Result<Vec<MsStatement>, String> {
     use quick_xml::XmlVersion;
     use quick_xml::events::{BytesStart, Event};
@@ -498,10 +538,11 @@ fn parse_showplan(doc: &str) -> Result<Vec<MsStatement>, String> {
             .collect()
     };
     let mut reader = quick_xml::Reader::from_str(doc);
-    let mut out = Vec::new();
-    let mut stmt: Option<MsStatement> = None;
-    // Indexes into `stmt.ops` of the `<RelOp>`s open around the reader.
-    let mut open: Vec<usize> = Vec::new();
+    let mut out: Vec<MsStatement> = Vec::new();
+    // The statements open around the reader, innermost last.
+    let mut stack: Vec<OpenStatement> = Vec::new();
+    // The functions and procedures open around it, as a heading names them.
+    let mut modules: Vec<String> = Vec::new();
     // Element depth inside a `<Warnings>`: 0 outside one, 1 at its children.
     let mut in_warnings = 0usize;
     let mut missing: Option<MissingIndex> = None;
@@ -514,15 +555,21 @@ fn parse_showplan(doc: &str) -> Result<Vec<MsStatement>, String> {
             Event::End(e) => {
                 match e.local_name().as_ref() {
                     b"RelOp" => {
-                        open.pop();
+                        if let Some(top) = stack.last_mut() {
+                            top.ops.pop();
+                        }
                     }
-                    b"StmtSimple" => {
-                        out.extend(stmt.take());
-                        open.clear();
+                    b"StmtSimple" | b"StmtCond" => {
+                        stack.pop();
+                    }
+                    b"UDF" | b"StoredProc" => {
+                        modules.pop();
                     }
                     b"MissingIndex" => {
-                        if let (Some(m), Some(s)) = (missing.as_mut(), stmt.as_mut()) {
-                            s.advice.push((PlanWarningKind::MissingIndex, m.message()));
+                        if let (Some(m), Some(top)) = (missing.as_mut(), stack.last()) {
+                            out[top.at]
+                                .advice
+                                .push((PlanWarningKind::MissingIndex, m.message()));
                             m.keys.clear();
                             m.include.clear();
                         }
@@ -546,29 +593,52 @@ fn parse_showplan(doc: &str) -> Result<Vec<MsStatement>, String> {
             }
             seen_root = true;
         }
+        // The innermost open statement, and the operator open innermost in it.
+        let top = stack.last().map(|t| (t.at, t.ops.last().copied()));
         if in_warnings == 1 {
             let warning = showplan_warning(name, &attr);
-            if let Some(s) = stmt.as_mut() {
-                match open.last() {
-                    Some(&i) => s.ops[i].warnings.push(warning),
+            if let Some((at, op)) = top {
+                let s = &mut out[at];
+                match op {
+                    Some(i) => s.ops[i].warnings.push(warning),
                     None => s.advice.push(warning),
                 }
             }
         }
         match name {
-            "StmtSimple" => {
-                stmt = Some(MsStatement {
-                    kind: attr("StatementType").unwrap_or_default(),
+            "StmtSimple" | "StmtCond" => {
+                let mut kind = attr("StatementType").unwrap_or_default();
+                if let Some(module) = modules.last() {
+                    kind.push_str(&format!(" in {module}"));
+                }
+                out.push(MsStatement {
+                    kind,
                     ..MsStatement::default()
                 });
-                if empty {
-                    out.extend(stmt.take());
+                if !empty {
+                    stack.push(OpenStatement {
+                        at: out.len() - 1,
+                        ops: Vec::new(),
+                    });
                 }
             }
+            "UDF" | "StoredProc" if !empty => {
+                let what = if name == "UDF" {
+                    "function"
+                } else {
+                    "procedure"
+                };
+                let proc = attr("ProcName").map(|p| unbracket_parts(&p));
+                modules.push(match proc {
+                    Some(p) => format!("{what} {p}"),
+                    None => format!("a {what}"),
+                });
+            }
             "RelOp" => {
-                if let Some(s) = stmt.as_mut() {
+                if let Some(t) = stack.last_mut() {
+                    let s = &mut out[t.at];
                     s.ops.push(MsOp {
-                        depth: open.len(),
+                        depth: t.ops.len(),
                         physical: attr("PhysicalOp").unwrap_or_default(),
                         logical: attr("LogicalOp").unwrap_or_default(),
                         est_rows: attr("EstimateRows").unwrap_or_default(),
@@ -576,13 +646,13 @@ fn parse_showplan(doc: &str) -> Result<Vec<MsStatement>, String> {
                         ..MsOp::default()
                     });
                     if !empty {
-                        open.push(s.ops.len() - 1);
+                        t.ops.push(s.ops.len() - 1);
                     }
                 }
             }
             "Object" if in_warnings == 0 => {
-                if let (Some(s), Some(&i)) = (stmt.as_mut(), open.last())
-                    && s.ops[i].object.is_none()
+                if let Some((at, Some(i))) = top
+                    && out[at].ops[i].object.is_none()
                 {
                     let part = |k: &str| attr(k).map(|v| unbracket(&v)).filter(|v| !v.is_empty());
                     let table = [part("Schema"), part("Table")]
@@ -597,15 +667,15 @@ fn parse_showplan(doc: &str) -> Result<Vec<MsStatement>, String> {
                     if let Some(alias) = part("Alias") {
                         object.push_str(&format!(" {alias}"));
                     }
-                    let op = &mut s.ops[i];
+                    let op = &mut out[at].ops[i];
                     op.table = (!table.is_empty()).then_some(table);
                     op.object = (!object.is_empty()).then_some(object);
                 }
             }
             "RunTimeCountersPerThread" => {
-                if let (Some(s), Some(&i)) = (stmt.as_mut(), open.last()) {
+                if let Some((at, Some(i))) = top {
                     let n = |k: &str| attr(k).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
-                    let op = &mut s.ops[i];
+                    let op = &mut out[at].ops[i];
                     op.actual_rows = Some(op.actual_rows.unwrap_or(0) + n("ActualRows"));
                     op.executions = Some(op.executions.unwrap_or(0) + n("ActualExecutions"));
                 }
@@ -932,6 +1002,75 @@ mod tests {
         // the estimated statement's actual cells are blank.
         assert_eq!(plan.rows[1].len(), 6);
         assert_eq!(plan.rows[1][4], "");
+    }
+
+    /// SQL Server 2022's own estimated plan (captured whole, from a scratch
+    /// database) of `SELECT id, dbo.f(v) AS n FROM dbo.t WHERE s = N'a'`,
+    /// `dbo.f` a scalar function `WITH INLINE = OFF`: the function's statements
+    /// sit **inside** the query's `<StmtSimple>`, after its `<QueryPlan>`,
+    /// under `<UDF><Statements>`.
+    const SHOWPLAN_UDF: &str = r#"<ShowPlanXML xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan" Version="1.564" Build="16.0.4295.3"><BatchSequence><Batch><Statements><StmtSimple StatementText="SELECT id, dbo.f(v) AS n FROM dbo.t WHERE s = N&apos;a&apos;" StatementId="1" StatementCompId="1" StatementType="SELECT" RetrievedFromCache="false" StatementSubTreeCost="0.00328466" StatementEstRows="1" SecurityPolicyApplied="false" StatementOptmLevel="TRIVIAL" QueryHash="0x1789A53103E6CE47" QueryPlanHash="0x663DEBD53ED321D1" CardinalityEstimationModelVersion="160"><StatementSetOptions QUOTED_IDENTIFIER="true" ARITHABORT="false" CONCAT_NULL_YIELDS_NULL="true" ANSI_NULLS="true" ANSI_PADDING="true" ANSI_WARNINGS="true" NUMERIC_ROUNDABORT="false"></StatementSetOptions><QueryPlan NonParallelPlanReason="TSQLUserDefinedFunctionsNotParallelizable" CachedPlanSize="24" CompileTime="373" CompileCPU="342" CompileMemory="136"><MemoryGrantInfo SerialRequiredMemory="0" SerialDesiredMemory="0" GrantedMemory="0" MaxUsedMemory="0"></MemoryGrantInfo><OptimizerHardwareDependentProperties EstimatedAvailableMemoryGrant="54289" EstimatedPagesCached="81433" EstimatedAvailableDegreeOfParallelism="12" MaxCompileMemory="7817112"></OptimizerHardwareDependentProperties><OptimizerStatsUsage><StatisticsInfo LastUpdate="2026-09-30T23:08:09.56" ModificationCount="0" SamplingPercent="100" Statistics="[_WA_Sys_00000003_35BCFE0A]" Table="[t]" Schema="[dbo]" Database="[zz_acct_s6]"></StatisticsInfo></OptimizerStatsUsage><RelOp NodeId="0" PhysicalOp="Compute Scalar" LogicalOp="Compute Scalar" EstimateRows="1" EstimateIO="0" EstimateCPU="1e-07" AvgRowSize="15" EstimatedTotalSubtreeCost="0.00328466" Parallel="0" EstimateRebinds="0" EstimateRewinds="0" EstimatedExecutionMode="Row"><OutputList><ColumnReference Database="[zz_acct_s6]" Schema="[dbo]" Table="[t]" Column="id"></ColumnReference><ColumnReference Column="Expr1002"></ColumnReference></OutputList><ComputeScalar><DefinedValues><DefinedValue><ColumnReference Column="Expr1002"></ColumnReference><ScalarOperator ScalarString="[zz_acct_s6].[dbo].[f]([zz_acct_s6].[dbo].[t].[v])"><UserDefinedFunction FunctionName="[zz_acct_s6].[dbo].[f]"><ScalarOperator><Identifier><ColumnReference Database="[zz_acct_s6]" Schema="[dbo]" Table="[t]" Column="v"></ColumnReference></Identifier></ScalarOperator></UserDefinedFunction></ScalarOperator></DefinedValue></DefinedValues><RelOp NodeId="1" PhysicalOp="Clustered Index Scan" LogicalOp="Clustered Index Scan" EstimateRows="1" EstimatedRowsRead="2" EstimateIO="0.003125" EstimateCPU="0.0001592" AvgRowSize="21" EstimatedTotalSubtreeCost="0.0032842" TableCardinality="2" Parallel="0" EstimateRebinds="0" EstimateRewinds="0" EstimatedExecutionMode="Row"><OutputList><ColumnReference Database="[zz_acct_s6]" Schema="[dbo]" Table="[t]" Column="id"></ColumnReference><ColumnReference Database="[zz_acct_s6]" Schema="[dbo]" Table="[t]" Column="v"></ColumnReference></OutputList><IndexScan Ordered="0" ForcedIndex="0" ForceScan="0" NoExpandHint="0" Storage="RowStore"><DefinedValues><DefinedValue><ColumnReference Database="[zz_acct_s6]" Schema="[dbo]" Table="[t]" Column="id"></ColumnReference></DefinedValue><DefinedValue><ColumnReference Database="[zz_acct_s6]" Schema="[dbo]" Table="[t]" Column="v"></ColumnReference></DefinedValue></DefinedValues><Object Database="[zz_acct_s6]" Schema="[dbo]" Table="[t]" Index="[PK__t__3213E83F90DFD4A8]" IndexKind="Clustered" Storage="RowStore"></Object><Predicate><ScalarOperator ScalarString="[zz_acct_s6].[dbo].[t].[s]=N&apos;a&apos;"><Compare CompareOp="EQ"><ScalarOperator><Identifier><ColumnReference Database="[zz_acct_s6]" Schema="[dbo]" Table="[t]" Column="s"></ColumnReference></Identifier></ScalarOperator><ScalarOperator><Const ConstValue="N&apos;a&apos;"></Const></ScalarOperator></Compare></ScalarOperator></Predicate></IndexScan></RelOp></ComputeScalar></RelOp></QueryPlan><UDF ProcName="[zz_acct_s6].[dbo].[f]"><Statements><StmtSimple StatementText="CREATE FUNCTION dbo.f (@x int) RETURNS int WITH INLINE = OFF AS&#xa;BEGIN&#xa;    DECLARE @r int;&#xa;    SELECT @r = COUNT(*) FROM dbo.t WHERE v &gt; @x" StatementId="2" StatementCompId="3" StatementType="SELECT" RetrievedFromCache="false" StatementSubTreeCost="0.00328566" StatementEstRows="1" SecurityPolicyApplied="false" StatementOptmLevel="TRIVIAL" QueryHash="0x22980B521DDE57DA" QueryPlanHash="0x3B6A83E2489AFA48" CardinalityEstimationModelVersion="160"><StatementSetOptions QUOTED_IDENTIFIER="true" ARITHABORT="false" CONCAT_NULL_YIELDS_NULL="true" ANSI_NULLS="true" ANSI_PADDING="true" ANSI_WARNINGS="true" NUMERIC_ROUNDABORT="false"></StatementSetOptions><QueryPlan CachedPlanSize="16" CompileTime="0" CompileCPU="0" CompileMemory="136"><MemoryGrantInfo SerialRequiredMemory="0" SerialDesiredMemory="0" GrantedMemory="0" MaxUsedMemory="0"></MemoryGrantInfo><OptimizerHardwareDependentProperties EstimatedAvailableMemoryGrant="54289" EstimatedPagesCached="81433" EstimatedAvailableDegreeOfParallelism="12" MaxCompileMemory="7817112"></OptimizerHardwareDependentProperties><RelOp NodeId="0" PhysicalOp="Compute Scalar" LogicalOp="Compute Scalar" EstimateRows="1" EstimateIO="0" EstimateCPU="0" AvgRowSize="11" EstimatedTotalSubtreeCost="0.00328566" Parallel="0" EstimateRebinds="0" EstimateRewinds="0" EstimatedExecutionMode="Row"><OutputList><ColumnReference Column="Expr1002"></ColumnReference></OutputList><ComputeScalar><DefinedValues><DefinedValue><ColumnReference Column="Expr1002"></ColumnReference><ScalarOperator ScalarString="CONVERT_IMPLICIT(int,[Expr1003],0)"><Convert DataType="int" Style="0" Implicit="1"><ScalarOperator><Identifier><ColumnReference Column="Expr1003"></ColumnReference></Identifier></ScalarOperator></Convert></ScalarOperator></DefinedValue></DefinedValues><RelOp NodeId="1" PhysicalOp="Stream Aggregate" LogicalOp="Aggregate" EstimateRows="1" EstimateIO="0" EstimateCPU="1.1e-06" AvgRowSize="11" EstimatedTotalSubtreeCost="0.00328566" Parallel="0" EstimateRebinds="0" EstimateRewinds="0" EstimatedExecutionMode="Row"><OutputList><ColumnReference Column="Expr1003"></ColumnReference></OutputList><StreamAggregate><DefinedValues><DefinedValue><ColumnReference Column="Expr1003"></ColumnReference><ScalarOperator ScalarString="Count(*)"><Aggregate AggType="countstar" Distinct="0"></Aggregate></ScalarOperator></DefinedValue></DefinedValues><RelOp NodeId="2" PhysicalOp="Clustered Index Scan" LogicalOp="Clustered Index Scan" EstimateRows="1" EstimatedRowsRead="2" EstimateIO="0.003125" EstimateCPU="0.0001592" AvgRowSize="11" EstimatedTotalSubtreeCost="0.0032842" TableCardinality="2" Parallel="0" EstimateRebinds="0" EstimateRewinds="0" EstimatedExecutionMode="Row"><OutputList></OutputList><IndexScan Ordered="0" ForcedIndex="0" ForceScan="0" NoExpandHint="0" Storage="RowStore"><DefinedValues></DefinedValues><Object Database="[zz_acct_s6]" Schema="[dbo]" Table="[t]" Index="[PK__t__3213E83F90DFD4A8]" IndexKind="Clustered" Storage="RowStore"></Object><Predicate><ScalarOperator ScalarString="[zz_acct_s6].[dbo].[t].[v]&gt;[@x]"><Compare CompareOp="GT"><ScalarOperator><Identifier><ColumnReference Database="[zz_acct_s6]" Schema="[dbo]" Table="[t]" Column="v"></ColumnReference></Identifier></ScalarOperator><ScalarOperator><Identifier><ColumnReference Column="@x"></ColumnReference></Identifier></ScalarOperator></Compare></ScalarOperator></Predicate></IndexScan></RelOp></StreamAggregate></RelOp></ComputeScalar></RelOp><ParameterList><ColumnReference Column="@x" ParameterDataType="int" ParameterCompiledValue="NULL"></ColumnReference></ParameterList></QueryPlan></StmtSimple><StmtSimple StatementText=";&#xa;    RETURN @r" StatementId="3" StatementCompId="4" StatementType="RETURN" RetrievedFromCache="false"></StmtSimple></Statements></UDF></StmtSimple></Statements></Batch></BatchSequence></ShowPlanXML>"#;
+
+    /// SQL Server 2022's own estimated plan (captured whole) of `IF EXISTS
+    /// (SELECT 1 FROM dbo.t WHERE v = 2) SELECT id FROM dbo.t WHERE s =
+    /// N'b'`: the condition's plan is a `<StmtCond>`'s `<Condition>`, and the
+    /// branch a `<StmtSimple>` inside its `<Then>`.
+    const SHOWPLAN_IF: &str = r#"<ShowPlanXML xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan" Version="1.564" Build="16.0.4295.3"><BatchSequence><Batch><Statements><StmtCond StatementText="IF EXISTS (SELECT 1 FROM dbo.t WHERE v = 2)" StatementId="1" StatementCompId="1" StatementType="COND WITH QUERY" RetrievedFromCache="false" StatementSubTreeCost="0.0032906" StatementEstRows="1" SecurityPolicyApplied="false" StatementOptmLevel="FULL" QueryHash="0x2C5778B6680D2163" QueryPlanHash="0x1FB8EF2D628E8B85" StatementOptmEarlyAbortReason="GoodEnoughPlanFound" CardinalityEstimationModelVersion="160"><StatementSetOptions QUOTED_IDENTIFIER="true" ARITHABORT="false" CONCAT_NULL_YIELDS_NULL="true" ANSI_NULLS="true" ANSI_PADDING="true" ANSI_WARNINGS="true" NUMERIC_ROUNDABORT="false"></StatementSetOptions><Condition><QueryPlan CachedPlanSize="16" CompileTime="195" CompileCPU="168" CompileMemory="216"><MemoryGrantInfo SerialRequiredMemory="0" SerialDesiredMemory="0" GrantedMemory="0" MaxUsedMemory="0"></MemoryGrantInfo><OptimizerHardwareDependentProperties EstimatedAvailableMemoryGrant="54289" EstimatedPagesCached="81433" EstimatedAvailableDegreeOfParallelism="12" MaxCompileMemory="7817112"></OptimizerHardwareDependentProperties><OptimizerStatsUsage><StatisticsInfo LastUpdate="2026-09-30T23:08:10.24" ModificationCount="0" SamplingPercent="100" Statistics="[_WA_Sys_00000002_35BCFE0A]" Table="[t]" Schema="[dbo]" Database="[zz_acct_s6]"></StatisticsInfo></OptimizerStatsUsage><RelOp NodeId="0" PhysicalOp="Compute Scalar" LogicalOp="Compute Scalar" EstimateRows="1" EstimateIO="0" EstimateCPU="1e-07" AvgRowSize="11" EstimatedTotalSubtreeCost="0.0032906" Parallel="0" EstimateRebinds="0" EstimateRewinds="0" EstimatedExecutionMode="Row"><OutputList><ColumnReference Column="Expr1003"></ColumnReference></OutputList><ComputeScalar><DefinedValues><DefinedValue><ColumnReference Column="Expr1003"></ColumnReference><ScalarOperator ScalarString="CASE WHEN [Expr1004] THEN (1) ELSE (0) END"><IF><Condition><ScalarOperator><Identifier><ColumnReference Column="Expr1004"></ColumnReference></Identifier></ScalarOperator></Condition><Then><ScalarOperator><Const ConstValue="(1)"></Const></ScalarOperator></Then><Else><ScalarOperator><Const ConstValue="(0)"></Const></ScalarOperator></Else></IF></ScalarOperator></DefinedValue></DefinedValues><RelOp NodeId="1" PhysicalOp="Nested Loops" LogicalOp="Left Semi Join" EstimateRows="1" EstimateIO="0" EstimateCPU="4.18e-06" AvgRowSize="9" EstimatedTotalSubtreeCost="0.0032905" Parallel="0" EstimateRebinds="0" EstimateRewinds="0" EstimatedExecutionMode="Row"><OutputList><ColumnReference Column="Expr1004"></ColumnReference></OutputList><NestedLoops Optimized="0"><DefinedValues><DefinedValue><ColumnReference Column="Expr1004"></ColumnReference></DefinedValue></DefinedValues><ProbeColumn><ColumnReference Column="Expr1004"></ColumnReference></ProbeColumn><RelOp NodeId="2" PhysicalOp="Constant Scan" LogicalOp="Constant Scan" EstimateRows="1" EstimateIO="0" EstimateCPU="1.157e-06" AvgRowSize="9" EstimatedTotalSubtreeCost="1.157e-06" Parallel="0" EstimateRebinds="0" EstimateRewinds="0" EstimatedExecutionMode="Row"><OutputList></OutputList><ConstantScan></ConstantScan></RelOp><RelOp NodeId="3" PhysicalOp="Clustered Index Scan" LogicalOp="Clustered Index Scan" EstimateRows="1" EstimatedRowsRead="2" EstimateIO="0.003125" EstimateCPU="0.0001592" AvgRowSize="11" EstimatedTotalSubtreeCost="0.0032842" TableCardinality="2" Parallel="0" EstimateRebinds="0" EstimateRewinds="0" EstimatedExecutionMode="Row"><OutputList></OutputList><IndexScan Ordered="0" ForcedIndex="0" ForceScan="0" NoExpandHint="0" Storage="RowStore"><DefinedValues></DefinedValues><Object Database="[zz_acct_s6]" Schema="[dbo]" Table="[t]" Index="[PK__t__3213E83F90DFD4A8]" IndexKind="Clustered" Storage="RowStore"></Object><Predicate><ScalarOperator ScalarString="[zz_acct_s6].[dbo].[t].[v]=(2)"><Compare CompareOp="EQ"><ScalarOperator><Identifier><ColumnReference Database="[zz_acct_s6]" Schema="[dbo]" Table="[t]" Column="v"></ColumnReference></Identifier></ScalarOperator><ScalarOperator><Const ConstValue="(2)"></Const></ScalarOperator></Compare></ScalarOperator></Predicate></IndexScan></RelOp></NestedLoops></RelOp></ComputeScalar></RelOp></QueryPlan></Condition><Then><Statements><StmtSimple StatementText=" SELECT id FROM dbo.t WHERE s = N&apos;b&apos;" StatementId="2" StatementCompId="2" StatementType="SELECT" RetrievedFromCache="false" StatementSubTreeCost="0.0032842" StatementEstRows="1" SecurityPolicyApplied="false" StatementOptmLevel="TRIVIAL" QueryHash="0xC880E133B782836E" QueryPlanHash="0x4A627152A98B55E4" CardinalityEstimationModelVersion="160" ParameterizedText="(@1 nvarchar(4000))SELECT [id] FROM [dbo].[t] WHERE [s]=@1"><StatementSetOptions QUOTED_IDENTIFIER="true" ARITHABORT="false" CONCAT_NULL_YIELDS_NULL="true" ANSI_NULLS="true" ANSI_PADDING="true" ANSI_WARNINGS="true" NUMERIC_ROUNDABORT="false"></StatementSetOptions><QueryPlan CachedPlanSize="24" CompileTime="0" CompileCPU="0" CompileMemory="112"><MemoryGrantInfo SerialRequiredMemory="0" SerialDesiredMemory="0" GrantedMemory="0" MaxUsedMemory="0"></MemoryGrantInfo><OptimizerHardwareDependentProperties EstimatedAvailableMemoryGrant="54289" EstimatedPagesCached="81433" EstimatedAvailableDegreeOfParallelism="12" MaxCompileMemory="7817112"></OptimizerHardwareDependentProperties><OptimizerStatsUsage><StatisticsInfo LastUpdate="2026-09-30T23:08:09.56" ModificationCount="0" SamplingPercent="100" Statistics="[_WA_Sys_00000003_35BCFE0A]" Table="[t]" Schema="[dbo]" Database="[zz_acct_s6]"></StatisticsInfo></OptimizerStatsUsage><RelOp NodeId="0" PhysicalOp="Clustered Index Scan" LogicalOp="Clustered Index Scan" EstimateRows="1" EstimatedRowsRead="2" EstimateIO="0.003125" EstimateCPU="0.0001592" AvgRowSize="17" EstimatedTotalSubtreeCost="0.0032842" TableCardinality="2" Parallel="0" EstimateRebinds="0" EstimateRewinds="0" EstimatedExecutionMode="Row"><OutputList><ColumnReference Database="[zz_acct_s6]" Schema="[dbo]" Table="[t]" Column="id"></ColumnReference></OutputList><IndexScan Ordered="0" ForcedIndex="0" ForceScan="0" NoExpandHint="0" Storage="RowStore"><DefinedValues><DefinedValue><ColumnReference Database="[zz_acct_s6]" Schema="[dbo]" Table="[t]" Column="id"></ColumnReference></DefinedValue></DefinedValues><Object Database="[zz_acct_s6]" Schema="[dbo]" Table="[t]" Index="[PK__t__3213E83F90DFD4A8]" IndexKind="Clustered" Storage="RowStore"></Object><Predicate><ScalarOperator ScalarString="[zz_acct_s6].[dbo].[t].[s]=[@1]"><Compare CompareOp="EQ"><ScalarOperator><Identifier><ColumnReference Database="[zz_acct_s6]" Schema="[dbo]" Table="[t]" Column="s"></ColumnReference></Identifier></ScalarOperator><ScalarOperator><Identifier><ColumnReference Column="@1"></ColumnReference></Identifier></ScalarOperator></Compare></ScalarOperator></Predicate></IndexScan></RelOp><ParameterList><ColumnReference Column="@1" ParameterDataType="nvarchar(4000)" ParameterCompiledValue="N&apos;b&apos;"></ColumnReference></ParameterList></QueryPlan></StmtSimple></Statements></Then></StmtCond></Statements></Batch></BatchSequence></ShowPlanXML>"#;
+
+    /// **A query calling a scalar function is shown its own plan, first**,
+    /// and the function's statement after it under a heading that says whose
+    /// it is. The function's `<StmtSimple>` is nested inside the query's, and
+    /// the reader started a new statement at every one — so the function's
+    /// plan replaced the query's, which vanished, warning and all.
+    #[test]
+    fn a_function_called_by_a_query_does_not_replace_the_querys_plan() {
+        let plan = QueryPlan::from_result(&showplan_rs(&[SHOWPLAN_UDF]));
+        let ops: Vec<&str> = plan.rows.iter().map(|r| r[0].as_str()).collect();
+        assert_eq!(
+            ops,
+            [
+                "Statement 1: SELECT",
+                "  Compute Scalar",
+                "    Clustered Index Scan",
+                "Statement 2: SELECT in function zz_acct_s6.dbo.f",
+                "  Compute Scalar",
+                "    Stream Aggregate (Aggregate)",
+                "      Clustered Index Scan",
+            ]
+        );
+        // The query's own cost, not the function's 0.00328566.
+        assert_eq!(plan.rows[1][3], "0.00328466");
+        assert_eq!(plan.rows[2][1], "dbo.t (PK__t__3213E83F90DFD4A8)");
+        // Each scan warns on its own row.
+        let scans: Vec<usize> = plan
+            .warnings
+            .iter()
+            .filter(|w| w.kind == PlanWarningKind::FullScan)
+            .map(|w| w.row)
+            .collect();
+        assert_eq!(scans, [2, 6]);
+    }
+
+    /// **An `IF`'s condition has a plan too**, under `<StmtCond>`'s
+    /// `<Condition>` rather than a `<StmtSimple>`, and the reader dropped it:
+    /// only the branch's plan was shown.
+    #[test]
+    fn an_if_conditions_plan_is_shown_before_its_branch() {
+        let plan = QueryPlan::from_result(&showplan_rs(&[SHOWPLAN_IF]));
+        let ops: Vec<&str> = plan.rows.iter().map(|r| r[0].as_str()).collect();
+        assert_eq!(
+            ops,
+            [
+                "Statement 1: COND WITH QUERY",
+                "  Compute Scalar",
+                "    Nested Loops (Left Semi Join)",
+                "      Constant Scan",
+                "      Clustered Index Scan",
+                "Statement 2: SELECT",
+                "  Clustered Index Scan",
+            ]
+        );
+        assert_eq!(plan.rows[1][3], "0.0032906");
     }
 
     /// A document that is not a plan is shown as the server sent it, with the

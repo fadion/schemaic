@@ -8466,7 +8466,17 @@ existing prose was left alone.
     `<Object>`, its estimated rows and cost, and — when the plan was measured — *Actual rows* and
     *Executions* summed over `RunTimeCountersPerThread`. More than one planned statement gets a
     heading row each; a statement with no plan (a `SET`, a `DECLARE`) contributes nothing, and a
-    batch with none at all is the one row *"No statement in this batch has a plan."* **A document
+    batch with none at all is the one row *"No statement in this batch has a plan."* **Statements
+    nest, so the open ones are a stack**, each placed in the output where it opens: a scalar
+    function's statements sit inside the calling query's `<StmtSimple>`, after its `<QueryPlan>`,
+    under `<UDF><Statements>` (a procedure's under `<StoredProc>`), and an `IF`'s branches inside
+    its `<StmtCond>`, whose `<Condition>` holds the condition's own plan (both captured from 2022,
+    and the same on 2025). The reader once kept one current statement and began afresh at every
+    `<StmtSimple>`, so a function's plan replaced the query's — which vanished, its warnings with
+    it — and an `IF`'s condition was dropped. Now the query comes first, the function's statement
+    after it headed *in function db.dbo.f*, and the condition before its branch
+    (`a_function_called_by_a_query_does_not_replace_the_querys_plan`,
+    `an_if_conditions_plan_is_shown_before_its_branch`, over the server's own documents). **A document
     that does not read as a plan is shown verbatim under the reason** rather than as an empty table
     that would claim there was no plan (`an_unreadable_showplan_is_shown_verbatim`). The heuristics
     are the other engines' in T-SQL's names — `Table Scan` and `Clustered Index Scan` are
