@@ -1990,6 +1990,52 @@ async fn a_routine_is_altered_in_place_and_keeps_what_the_alter_resets() {
     assert!(diff_routine(&fresh, &RoutineDraft::from_info(&fresh), MS).is_empty());
 }
 
+/// **A parameter's own `AS` is not the header's.** `@a AS int` and a
+/// parameter named `@as` are T-SQL the server takes; read with the list cut
+/// at the first `AS`, the first lost its type to the body and the second
+/// rebuilt into Msg 137. Each reads whole, and an edit to its body applies.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_parameter_declared_with_as_reads_and_rebuilds_whole() {
+    use schemaic_core::ddl::{RoutineDraft, diff_routine};
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("ddl_param_as").await;
+    s.exec("CREATE PROCEDURE dbo.p_as @a AS int = 5 WITH EXECUTE AS OWNER AS SELECT @a AS v")
+        .await;
+    s.exec("CREATE PROCEDURE dbo.p_kw @as int = 1 AS SELECT @as AS v")
+        .await;
+    let all =
+        s.db.fetch_schema(&s.name, CancellationToken::new())
+            .await
+            .expect("the schema")
+            .routines;
+    for (name, args, call, want) in [
+        ("p_as", "@a AS int = 5", "EXEC dbo.p_as", "50"),
+        ("p_kw", "@as int = 1", "EXEC dbo.p_kw", "10"),
+    ] {
+        let r = all.iter().find(|r| r.name == name).expect(name);
+        assert_eq!(r.arguments, args, "{name}");
+        assert!(r.is_editable(), "{name}");
+        let mut d = RoutineDraft::from_info(r);
+        d.info.body = d.info.body.replace("AS v", "* 10 AS v");
+        let stmts = diff_routine(r, &d, MS).emit();
+        s.db.run_ddl(&s.name, &stmts, CancellationToken::new())
+            .await
+            .unwrap_or_else(|e| panic!("{e}\n{stmts:#?}"));
+        assert_eq!(s.scalar(call).await, want, "{name}");
+    }
+    assert_eq!(
+        s.scalar(
+            "SELECT COUNT(*) FROM sys.sql_modules WHERE object_id = OBJECT_ID('dbo.p_as') \
+             AND execute_as_principal_id = -2"
+        )
+        .await,
+        "1",
+        "EXECUTE AS OWNER kept"
+    );
+}
+
 /// **A numbered procedure group survives every plan the editor can build for
 /// its head.** `grp` is listed once and its text holds no `;`, so only
 /// `sys.numbered_procedures` shows `grp;2`: it is read, an edit in place keeps

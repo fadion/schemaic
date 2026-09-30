@@ -4890,6 +4890,19 @@ existing prose was left alone.
     (`a_routine_header_the_parts_cannot_restate_is_unreadable`), on the trigger walk's rule that a
     word merely skipped is a word the rebuild drops (`a_stored_procedure_splits_into_its_parts`,
     `each_function_shape_splits_into_its_parts`).
+    **The cursor reads a name the way T-SQL spells one, and a parameter's own `AS` is not the
+    header's.** It used to end a word where `sql::is_word_byte` did, so `@as` was a `@` and the
+    keyword `AS`, and `tr$as` was `tr`, `$` and `as`. It now keeps a `@`/`@@`/`#`/`##` prefix on the
+    word (`sql::t_sql_name_prefix`) and runs on through `$`, `#` and `@` (`sql::continues_name`),
+    so `RETURNS @t TABLE` is matched as a word starting with `@` rather than a `@` punct. And
+    `span_until` never stops at an `AS` straight after a `@name` word, because `@a AS int` is how
+    T-SQL lets a procedure declare a parameter. Before, `CREATE PROCEDURE p @a AS int = 5 AS
+    SELECT @a` read the list as `@a` and the body as `int = 5 AS SELECT @a` — header text in the
+    body box, the `WITH` options behind it hidden — and `@as int = 1` read the list as `@` and
+    rebuilt into a statement the server refuses (Msg 137, measured on SQL Server 2022). `@with` and
+    `@for`, which used to answer `None`, now read as the parameters they are
+    (`a_parameters_own_as_is_not_the_headers`, `a_trigger_name_holding_a_dollar_is_one_name`; live,
+    `a_parameter_declared_with_as_reads_and_rebuilds_whole` on 2022 and 2025).
     **`supports_or_replace_routine(MsSql)` is true**: `CREATE OR ALTER` keeps the routine's grants
     (measured: a `GRANT EXECUTE` survived one), so an edit is altered in place. **What it refuses is
     what `routine_signature_changed` asks there**, which is per-engine now: on SQL Server a change
@@ -26439,9 +26452,11 @@ Re-introducing the anti-patterns these guard against is a regression:
   built on `is_word_byte` — PostgreSQL adds `$` (`continues_dollar_name`), T-SQL `$`, `#` and `@`,
   MySQL and SQLite nothing — with `sql::t_sql_name_prefix` for the leading `@`/`@@`/`#`/`##` of a
   T-SQL variable, system function or temporary table, `0` unless `SqlDialect::prefixed_names()`.
-  Two scanners split a name where SQL Server does not: the read-only gate's `call_tokens` ended
-  `dbo.f@GETDATE()` at the `@` and asked the allowlist about `GETDATE`, and `sqlfmt::tokenize` cut
-  `@x` from its `@`, so Format Code wrote back `@ x`, a batch that no longer compiled. A new T-SQL
+  Three scanners split a name where SQL Server does not: the read-only gate's `call_tokens` ended
+  `dbo.f@GETDATE()` at the `@` and asked the allowlist about `GETDATE`, `sqlfmt::tokenize` cut
+  `@x` from its `@`, so Format Code wrote back `@ x`, a batch that no longer compiled, and
+  `ddl::TsqlCursor`, the trigger and routine header walk, read a parameter `@as` as a `@` and the
+  keyword `AS`, so a procedure declaring one rebuilt into Msg 137. A new T-SQL
   scanner asks these two rather than adding the bytes locally.
 - **A Velopack channel name is app identity, like `--packId`: add a name, never rename one.** The
   three `release.yml` packs with — `win-x64`, `linux-x64`, `osx-arm64` — are explicit because a

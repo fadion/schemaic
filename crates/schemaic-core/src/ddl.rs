@@ -9961,9 +9961,13 @@ impl<'a> TsqlCursor<'a> {
                 }
                 return Some(TsqlTok::Quoted(&self.s[at..self.i]));
             }
-            if sql::is_word_start(b[at]) {
-                let mut j = at + 1;
-                while j < b.len() && sql::is_word_byte(b[j]) {
+            // A name is T-SQL's: its `@`/`@@`/`#`/`##` prefix kept on it, and
+            // run on through `$`, `#` and `@` (`sql::continues_name`) — so
+            // `@as` is a parameter and `v$as` a view, never the keyword `AS`.
+            let prefix = sql::t_sql_name_prefix(b, at, d);
+            if prefix > 0 || sql::is_word_start(b[at]) {
+                let mut j = at + prefix.max(1);
+                while j < b.len() && sql::continues_name(b[j], d) {
                     j += 1;
                 }
                 self.i = j;
@@ -10158,11 +10162,18 @@ impl<'a> TsqlCursor<'a> {
     /// The text from here up to — not including — the first token at paren
     /// depth 0 that is one of the keywords `stops`, trimmed, with the cursor
     /// left in front of that keyword. `None` when the text ends first.
+    ///
+    /// **An `AS` straight after a `@name` is that parameter's own** — `@a AS
+    /// int` is how T-SQL lets a procedure declare one — and never a stop: cut
+    /// there, the list lost its type and default to the body.
     fn span_until(&mut self, stops: &[&str]) -> Option<&'a str> {
         let from = self.i;
+        let mut after_parameter = false;
         loop {
             let before = *self;
-            match self.next()? {
+            let tok = self.next()?;
+            match tok {
+                TsqlTok::Word(w) if after_parameter && w.eq_ignore_ascii_case("AS") => {}
                 TsqlTok::Word(w) if stops.iter().any(|s| w.eq_ignore_ascii_case(s)) => {
                     *self = before;
                     return Some(self.s[from..before.i].trim());
@@ -10170,6 +10181,7 @@ impl<'a> TsqlCursor<'a> {
                 TsqlTok::Punct(b'(') => self.close_paren()?,
                 _ => {}
             }
+            after_parameter = matches!(tok, TsqlTok::Word(w) if w.starts_with('@'));
         }
     }
 }
@@ -10282,11 +10294,11 @@ pub fn tsql_routine_parts(definition: &str) -> Option<TsqlRoutineParts> {
         if !c.keyword("RETURNS") {
             return None;
         }
-        if c.peek() == Some(TsqlTok::Punct(b'@')) {
+        if matches!(c.peek(), Some(TsqlTok::Word(w)) if w.starts_with('@')) {
             // `RETURNS @t TABLE (…)` — a multi-statement table function.
             let from = c.i;
             c.next();
-            if !matches!(c.next()?, TsqlTok::Word(_)) || !c.keyword("TABLE") {
+            if !c.keyword("TABLE") {
                 return None;
             }
             if c.next()? != TsqlTok::Punct(b'(') {
@@ -26020,6 +26032,14 @@ mod tsql_trigger_read_tests {
             assert!(tsql_trigger_parts(sql).is_none(), "{sql}");
         }
     }
+
+    /// **A bare T-SQL name runs through `$`, `#` and `@`** (`sql::continues_name`),
+    /// so `tr$as` is one name and not `tr`, a stray `$` and the header's `AS`.
+    #[test]
+    fn a_trigger_name_holding_a_dollar_is_one_name() {
+        let p = parts("CREATE TRIGGER dbo.tr$as ON dbo.t$as AFTER INSERT AS SELECT 1 AS x");
+        assert_eq!(p.body, "SELECT 1 AS x");
+    }
 }
 
 #[cfg(test)]
@@ -26202,6 +26222,46 @@ mod tsql_routine_read_tests {
         assert!(sql.starts_with("-- ") && !sql.contains("CREATE"), "{sql}");
         assert!(!h.is_editable());
         assert!(routine(RoutineKind::Procedure, "", "", "SELECT 1").is_editable());
+    }
+
+    /// **A procedure parameter may carry an `AS` of its own** — `@a AS int`
+    /// is valid T-SQL, and so is a parameter named `@as` — and neither is the
+    /// header's. Cut at the first `AS`, the first put the type and default in
+    /// the body box and hid the `WITH` options, and the second rebuilt into a
+    /// statement the server refuses (Msg 137, measured on SQL Server 2022).
+    /// `@with` and `@for` are names too, not the words that end the list.
+    #[test]
+    fn a_parameters_own_as_is_not_the_headers() {
+        let p = parts("CREATE PROCEDURE dbo.p_as @a AS int = 5 AS SELECT @a AS v");
+        assert_eq!(
+            (p.arguments.as_str(), p.body.as_str()),
+            ("@a AS int = 5", "SELECT @a AS v")
+        );
+        let p = parts("CREATE PROCEDURE dbo.p @a AS int WITH EXECUTE AS OWNER AS SELECT @a");
+        assert_eq!(p.arguments, "@a AS int");
+        assert_eq!(p.options, [TsqlRoutineOption::ExecuteAs(ExecuteAs::Owner)]);
+        assert_eq!(p.body, "SELECT @a");
+        let p = parts("CREATE PROCEDURE dbo.p_kw @as int = 1 AS SELECT @as AS v");
+        assert_eq!(
+            (p.arguments.as_str(), p.body.as_str()),
+            ("@as int = 1", "SELECT @as AS v")
+        );
+        let p = parts("CREATE PROCEDURE p @with int, @for int AS SELECT @with + @for");
+        assert_eq!(p.arguments, "@with int, @for int");
+        // And the rebuilt statement reads back as the same parts.
+        let r = RoutineInfo {
+            name: "p_kw".into(),
+            schema: Some("dbo".into()),
+            kind: RoutineKind::Procedure,
+            arguments: "@as AS int = 1".into(),
+            body: "SELECT @as AS v".into(),
+            ..Default::default()
+        };
+        let back = parts(&r.create_sql(SqlDialect::MsSql, true));
+        assert_eq!(
+            (back.arguments.as_str(), back.body.as_str()),
+            ("@as AS int = 1", "SELECT @as AS v")
+        );
     }
 
     /// Refused, not dropped: `ENCRYPTION`, an unknown option, a numbered
