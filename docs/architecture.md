@@ -7069,10 +7069,16 @@ existing prose was left alone.
     sign-in on a non-Windows build, and every other Entra method (`…Password`, `…Interactive`,
     `…Integrated`), keep the row on a password and carry `ImportNote::ExternalLogin` — *"Signs in a
     way Schemaic can't: set a SQL login"* — since the row cannot sign in until one is set. `Sql
-    Password` is a SQL login spelled out and changes nothing. This is the ADO.NET/ODBC reader alone;
-    the JDBC one reads no sign-in keyword (`an_ado_net_connection_string_is_read_by_its_keywords`,
+    Password` is a SQL login spelled out and changes nothing (as is JDBC's `NotSpecified`). **An Entra
+    method Schemaic lacks keeps no password**: it is the account's Entra password, which the driver
+    sends to Entra, and a SQL login would hand it to the server. **The reading is one, shared by both
+    readers** (`MssqlSignIn`): it lived in the ADO.NET/ODBC reader alone, so a DataGrip or DBeaver
+    `jdbc-url` saying `integratedSecurity=true` or `authentication=ActiveDirectoryDefault` — the only
+    place those tools state the sign-in — arrived as a clean SQL-login row with an empty user that
+    failed with *Login failed for user ''* (`an_ado_net_connection_string_is_read_by_its_keywords`,
     `an_odbc_connection_string_is_read_when_its_driver_is_sql_server`,
-    `an_ado_net_string_notes_what_it_cannot_carry_over`). **`redacted` knows the braces too**: a
+    `an_ado_net_string_notes_what_it_cannot_carry_over`,
+    `a_jdbc_urls_sign_in_is_read_as_an_ado_net_strings_is`). **`redacted` knows the braces too**: a
     password's value opened with `{` — or with ADO.NET's `"` or `'` — runs to the first matching
     closer that is not doubled (`closing_quote`), `;` and spaces included, so a SQL Server string
     that fails to parse shows none of `password={p;w=d}` or `Password="p;w=d"` in the not-imported

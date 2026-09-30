@@ -137,8 +137,11 @@ pub enum ImportNote {
     /// Entra method other than `Active Directory Default` (`…Password`,
     /// `…Interactive`, `…Integrated`), or Windows sign-in in a build with no
     /// Windows identity to present. The row keeps the server with a SQL login
-    /// and this says one is wanted. The two Schemaic has are carried over as
-    /// `AuthMode::Windows` and `AuthMode::AzureCli` instead.
+    /// and this says one is wanted — without the password an Entra method
+    /// came with, which is the account's Entra password and no SQL login's.
+    /// The two Schemaic has are carried over as `AuthMode::Windows` and
+    /// `AuthMode::AzureCli` instead. Read from an ADO.NET string and a JDBC
+    /// URL alike (`MssqlSignIn`).
     ExternalLogin,
 }
 
@@ -940,6 +943,7 @@ fn parse_mssql_url(
     c.database = percent_decode(path.split('/').next().unwrap_or(""));
     let mut port = port;
     let (mut encrypt, mut trust) = (None::<String>, false);
+    let mut sign_in = MssqlSignIn::default();
     let mut pairs = parse_query(query);
     pairs.extend(split_mssql_props(props, false));
     for (k, v) in pairs {
@@ -955,7 +959,9 @@ fn parse_mssql_url(
             "instancename" if instance.is_none() => instance = Some(v),
             "encrypt" => encrypt = Some(normalize_key(&v)),
             "trustservercertificate" => trust = truthy(&v),
-            _ => {}
+            key => {
+                sign_in.read(key, &v);
+            }
         }
     }
     if host.trim().is_empty() {
@@ -964,11 +970,12 @@ fn parse_mssql_url(
     c.host = host;
     c.port = port.unwrap_or_else(|| default_port(MSSQL));
     apply_mssql_tls(&mut c, encrypt.as_deref(), trust, verifies_by_default);
-    let notes = if instance.is_some() && port.is_none() {
+    let mut notes = if instance.is_some() && port.is_none() {
         vec![ImportNote::NamedInstance]
     } else {
         Vec::new()
     };
+    sign_in.apply(&mut c, &mut notes);
     Ok((c, notes))
 }
 
@@ -1078,9 +1085,7 @@ fn parse_connection_string(s: &str) -> Result<(Connection, Vec<ImportNote>), Url
     let mut c = blank(MSSQL);
     let mut server = String::new();
     let (mut encrypt, mut trust) = (None::<String>, false);
-    // The sign-in the string names, when it is not a SQL login: `Some(mode)`
-    // for one Schemaic has, `None` inside for an Entra method it does not.
-    let mut external: Option<Option<crate::connection::AuthMode>> = None;
+    let mut sign_in = MssqlSignIn::default();
     // The ODBC `Driver` / OLE DB `Provider`, when one is named: it decides
     // what the string's silence about encryption means.
     let mut driver: Option<String> = None;
@@ -1099,23 +1104,7 @@ fn parse_connection_string(s: &str) -> Result<(Connection, Vec<ImportNote>), Url
             "password" | "pwd" => set_if_empty(&mut c.password, &v),
             "encrypt" => encrypt = Some(normalize_key(&v)),
             "trustservercertificate" => trust = truthy(&v),
-            "integratedsecurity" | "trustedconnection"
-                if truthy(&v) || normalize_key(&v) == "sspi" =>
-            {
-                external = Some(Some(crate::connection::AuthMode::Windows));
-            }
-            // `Sql Password` is a SQL login spelled out; every other method is
-            // Entra. `Active Directory Default` is `DefaultAzureCredential`,
-            // whose chain tries the Azure CLI — the one Entra sign-in Schemaic
-            // has; the rest (`…Password`, `…Interactive`, `…Integrated`) are
-            // not it.
-            "authentication" => match normalize_key(&v).as_str() {
-                "sqlpassword" => {}
-                "activedirectorydefault" => {
-                    external = Some(Some(crate::connection::AuthMode::AzureCli))
-                }
-                _ => external = Some(None),
-            },
+            key if sign_in.read(key, &v) => {}
             "driver" | "provider" if !names_sql_server_driver(&v) => {
                 return Err(UrlError::UnknownScheme(v));
             }
@@ -1161,17 +1150,73 @@ fn parse_connection_string(s: &str) -> Result<(Connection, Vec<ImportNote>), Url
     if instance && port.is_none() {
         notes.push(ImportNote::NamedInstance);
     }
-    // A sign-in this build offers is carried over; any other keeps the
-    // server and says what to set.
-    match external {
-        Some(Some(mode)) if crate::connection::AuthMode::offered(MSSQL).contains(&mode) => {
-            c.auth = mode;
-        }
-        Some(_) => notes.push(ImportNote::ExternalLogin),
-        None => {}
-    }
+    sign_in.apply(&mut c, &mut notes);
     c.name = suggest_name(&c);
     Ok((c, notes))
+}
+
+/// The sign-in a SQL Server string names, read keyword by keyword — **the one
+/// reading JDBC's properties and ADO.NET's keywords share.** It lived in the
+/// ADO.NET reader alone, so a DataGrip or DBeaver `jdbc-url` saying
+/// `integratedSecurity=true` or `authentication=ActiveDirectoryDefault` —
+/// the only place those tools state the sign-in — imported as a SQL login
+/// with an empty user and no note.
+#[derive(Default)]
+struct MssqlSignIn {
+    /// `None` for a SQL login; `Some(Some(mode))` for a sign-in Schemaic
+    /// has; `Some(None)` for an Entra method it does not.
+    external: Option<Option<crate::connection::AuthMode>>,
+}
+
+impl MssqlSignIn {
+    /// Read one keyword, `key` normalised — `true` when it was a sign-in one.
+    ///
+    /// `Integrated Security`/`Trusted_Connection` (ADO.NET) and
+    /// `integratedSecurity` (JDBC), true or `SSPI`, are Windows sign-in.
+    /// `authentication`'s `Sql Password` (and JDBC's `NotSpecified`) is a SQL
+    /// login spelled out; every other method is Entra's. `Active Directory
+    /// Default` is `DefaultAzureCredential`, whose chain tries the Azure CLI —
+    /// the one Entra sign-in Schemaic has; the rest (`…Password`,
+    /// `…Interactive`, `…Integrated`, `…ManagedIdentity`) are not it.
+    fn read(&mut self, key: &str, v: &str) -> bool {
+        use crate::connection::AuthMode;
+        match key {
+            "integratedsecurity" | "trustedconnection" => {
+                if truthy(v) || normalize_key(v) == "sspi" {
+                    self.external = Some(Some(AuthMode::Windows));
+                }
+                true
+            }
+            "authentication" => {
+                match normalize_key(v).as_str() {
+                    "sqlpassword" | "notspecified" => {}
+                    "activedirectorydefault" => self.external = Some(Some(AuthMode::AzureCli)),
+                    _ => self.external = Some(None),
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Carry the sign-in onto `c`. One this build offers becomes its mode;
+    /// any other keeps the server on a password and notes
+    /// [`ImportNote::ExternalLogin`]. **An Entra method Schemaic lacks keeps
+    /// no password**: it is the account's Entra password, which the driver
+    /// would have sent to Entra, and a SQL login would hand it to the server.
+    fn apply(self, c: &mut Connection, notes: &mut Vec<ImportNote>) {
+        match self.external {
+            Some(Some(mode)) if crate::connection::AuthMode::offered(MSSQL).contains(&mode) => {
+                c.auth = mode;
+            }
+            Some(Some(_)) => notes.push(ImportNote::ExternalLogin),
+            Some(None) => {
+                c.password.clear();
+                notes.push(ImportNote::ExternalLogin);
+            }
+            None => {}
+        }
+    }
 }
 
 /// Is this ODBC `Driver` / OLE DB `Provider` one of SQL Server's? The ODBC
@@ -3419,6 +3464,62 @@ mod tests {
             );
         }
         assert_eq!(parse_url("Database=d;User Id=u"), Err(UrlError::NoHost));
+    }
+
+    /// **A JDBC URL's sign-in is read as an ADO.NET string's is** — one reading
+    /// for both. `integratedSecurity=true` and `authentication=ActiveDirectory…`
+    /// were ignored, so DataGrip's and DBeaver's Windows and Entra connections
+    /// — whose `jdbc-url` is the only place those tools state the sign-in —
+    /// arrived as clean SQL-login rows that failed with `Login failed for user
+    /// ''`. And an Entra method Schemaic lacks does not keep its password: it
+    /// is an Entra password, which a SQL login would hand to the server.
+    #[test]
+    fn a_jdbc_urls_sign_in_is_read_as_an_ado_net_strings_is() {
+        use crate::connection::AuthMode;
+        let one = |s: &str| parse_url_scan(s).found.remove(0);
+        for windows in [
+            "jdbc:sqlserver://h:1433;integratedSecurity=true",
+            "Server=h;Integrated Security=true",
+        ] {
+            let row = one(windows);
+            assert_eq!(
+                row.has(ImportNote::ExternalLogin),
+                !cfg!(windows),
+                "{windows}"
+            );
+            assert_eq!(
+                row.connection.effective_auth(),
+                if cfg!(windows) {
+                    AuthMode::Windows
+                } else {
+                    AuthMode::Password
+                },
+                "{windows}"
+            );
+        }
+        let row = one("jdbc:sqlserver://h:1433;authentication=ActiveDirectoryDefault");
+        assert_eq!(row.connection.auth, AuthMode::AzureCli);
+        assert!(!row.has(ImportNote::ExternalLogin));
+        for entra in [
+            "jdbc:sqlserver://h:1433;authentication=ActiveDirectoryPassword;user=u@t.com;password=pw",
+            "Server=h;Authentication=Active Directory Password;User Id=u@t.com;Password=pw",
+        ] {
+            let row = one(entra);
+            assert!(row.has(ImportNote::ExternalLogin), "{entra}");
+            assert_eq!(row.connection.auth, AuthMode::Password, "{entra}");
+            assert_eq!(row.connection.password, "", "{entra}: an Entra password");
+            assert_eq!(row.connection.user, "u@t.com", "{entra}");
+        }
+        // A SQL login spelled out changes nothing.
+        for sql in [
+            "jdbc:sqlserver://h;authentication=SqlPassword;user=u;password=pw",
+            "jdbc:sqlserver://h;authentication=NotSpecified;user=u;password=pw",
+            "jdbc:sqlserver://h;integratedSecurity=false;user=u;password=pw",
+        ] {
+            let row = one(sql);
+            assert!(!row.has(ImportNote::ExternalLogin), "{sql}");
+            assert_eq!(row.connection.password, "pw", "{sql}");
+        }
     }
 
     /// **A connection string is SQL Server's only when it says so.** MySQL's
