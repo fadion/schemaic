@@ -1548,114 +1548,60 @@ fn encloses_whole(s: &str) -> bool {
     false
 }
 
-/// The `SELECT` a stored `CREATE VIEW` defines — everything after the `AS`
-/// that ends its header — or the whole text when there is no header to
-/// strip.
-///
-/// The header is `CREATE VIEW name [(columns)] [WITH options] AS`, so the
-/// first `AS` outside parentheses and outside strings, comments and quoted
-/// names is the one: a column list's names are inside its parentheses, and
-/// `WITH SCHEMABINDING` holds no `AS`.
-fn view_select_body(definition: &str) -> String {
-    let b = definition.as_bytes();
-    let mut depth = 0usize;
-    let mut i = 0;
-    while i < b.len() {
-        if let Some(j) = schemaic_core::sql::skip_noncode(b, i, MS) {
-            i = j;
-            continue;
-        }
-        let c = b[i];
-        if c == b'(' {
-            depth += 1;
-        } else if c == b')' {
-            depth = depth.saturating_sub(1);
-        } else if schemaic_core::sql::is_word_start(c) {
-            let start = i;
-            while i < b.len() && schemaic_core::sql::is_word_byte(b[i]) {
-                i += 1;
-            }
-            if depth == 0 && definition[start..i].eq_ignore_ascii_case("AS") {
-                return definition[i..]
-                    .trim()
-                    .trim_end_matches(';')
-                    .trim_end()
-                    .to_string();
-            }
-            continue;
-        }
-        i += 1;
-    }
-    definition.trim().to_string()
+/// What [`tsql_view_reading`] fills in of a view.
+struct TsqlViewReading {
+    /// The `SELECT` — `TableInfo::view_definition`.
+    body: String,
+    /// The stored statement — `TableInfo::create_sql`.
+    create_sql: Option<String>,
+    options: schemaic_core::schema::ViewOptions,
 }
 
-/// What a stored `CREATE VIEW`'s header says beside the name: the explicit
-/// column list, verbatim, and the attributes after `WITH` — which T-SQL's
-/// `ALTER VIEW` resets unless they are restated
+/// A view's stored text (`sys.sql_modules.definition`, `None` when the server
+/// shows none) read into its `SELECT` and the header `ALTER VIEW` resets
+/// unless it is restated — the column list and the attributes
 /// ([`schemaic_core::schema::ViewOptions::attributes`]).
 ///
-/// The same walk as [`view_select_body`], stopping at the same `AS`: the
-/// first parenthesised group at depth 0 is the column list (a name cannot
-/// hold a parenthesis unless it is quoted, and a quoted one is skipped whole),
-/// and the words after `WITH` are the attributes. **Only `SCHEMABINDING` and
-/// `VIEW_METADATA` are kept** — these are spliced into a statement Schemaic
-/// runs, so a word this does not know is not carried. `ENCRYPTION` never
-/// reaches here: an encrypted view has no definition.
-fn view_header_options(definition: &str) -> schemaic_core::schema::ViewOptions {
-    use schemaic_core::sql::{is_word_byte, is_word_start, skip_noncode};
-    let b = definition.as_bytes();
-    let mut depth = 0usize;
-    let mut open: Option<usize> = None;
-    let mut column_list: Option<String> = None;
-    let mut after_with = false;
-    let mut attributes: Vec<String> = Vec::new();
-    let mut i = 0;
-    while i < b.len() {
-        if let Some(j) = skip_noncode(b, i, MS) {
-            i = j;
-            continue;
-        }
-        let c = b[i];
-        if c == b'(' {
-            if depth == 0 && column_list.is_none() {
-                open = Some(i + 1);
-            }
-            depth += 1;
-        } else if c == b')' {
-            depth = depth.saturating_sub(1);
-            if depth == 0
-                && let Some(start) = open.take()
-            {
-                column_list =
-                    Some(definition[start..i].trim().to_string()).filter(|s| !s.is_empty());
-            }
-        } else if is_word_start(c) {
-            let start = i;
-            while i < b.len() && is_word_byte(b[i]) {
-                i += 1;
-            }
-            let word = &definition[start..i];
-            if depth == 0 {
-                if word.eq_ignore_ascii_case("AS") {
-                    break;
-                }
-                if word.eq_ignore_ascii_case("WITH") {
-                    after_with = true;
-                } else if after_with {
-                    let w = word.to_ascii_uppercase();
-                    if matches!(w.as_str(), "SCHEMABINDING" | "VIEW_METADATA") {
-                        attributes.push(w);
-                    }
-                }
-            }
-            continue;
-        }
-        i += 1;
-    }
-    schemaic_core::schema::ViewOptions {
-        column_list,
-        attributes,
-        ..Default::default()
+/// Through `ddl::tsql_view_parts`, the header walk the trigger and routine
+/// readers share. A header it cannot read keeps the whole text, as the body
+/// and as `create_sql`, and is `TsqlView::verbatim`; no text at all is
+/// `hidden`. Neither is edited (`ddl::view_is_editable`).
+fn tsql_view_reading(definition: Option<&str>) -> TsqlViewReading {
+    use schemaic_core::schema::{TsqlView, ViewOptions};
+    let Some(def) = definition else {
+        return TsqlViewReading {
+            body: String::new(),
+            create_sql: None,
+            options: ViewOptions {
+                tsql: TsqlView {
+                    hidden: true,
+                    ..TsqlView::default()
+                },
+                ..ViewOptions::default()
+            },
+        };
+    };
+    match schemaic_core::ddl::tsql_view_parts(def) {
+        Some(p) => TsqlViewReading {
+            body: p.body,
+            create_sql: Some(def.to_string()),
+            options: ViewOptions {
+                column_list: p.column_list,
+                attributes: p.attributes,
+                ..ViewOptions::default()
+            },
+        },
+        None => TsqlViewReading {
+            body: def.trim().to_string(),
+            create_sql: Some(def.to_string()),
+            options: ViewOptions {
+                tsql: TsqlView {
+                    verbatim: true,
+                    ..TsqlView::default()
+                },
+                ..ViewOptions::default()
+            },
+        },
     }
 }
 
@@ -1833,14 +1779,21 @@ async fn collect_schema(client: &mut MsClient) -> Result<DbSchema, DbError> {
         })
         .collect();
 
-    let view_all = query_rows(client, VIEW_LISTING).await?;
-    let view_rows: Vec<(String, (String, String))> = view_all
+    // Each view's stored text, read into its parts — see `tsql_view_reading`.
+    let mut view_readings: HashMap<(String, String), TsqlViewReading> =
+        query_rows(client, VIEW_LISTING)
+            .await?
+            .iter()
+            .map(|r| {
+                (
+                    (cell(r, 0), cell(r, 1)),
+                    tsql_view_reading(r.get(2).and_then(|d| d.as_deref())),
+                )
+            })
+            .collect();
+    let view_rows: Vec<(String, (String, String))> = view_readings
         .iter()
-        .map(|r| (cell(r, 0), (cell(r, 1), view_select_body(&cell(r, 2)))))
-        .collect();
-    let view_sources: HashMap<(String, String), String> = view_all
-        .iter()
-        .filter_map(|r| Some(((cell(r, 0), cell(r, 1)), r.get(2).cloned().flatten()?)))
+        .map(|((ns, name), v)| (ns.clone(), (name.clone(), v.body.clone())))
         .collect();
 
     // Partition per schema before folding — `assemble_schema` keys on the
@@ -1968,9 +1921,11 @@ async fn collect_schema(client: &mut MsClient) -> Result<DbSchema, DbError> {
         t.comment = comments.get(&key).cloned();
         t.check_constraints = checks_by.remove(&key).unwrap_or_default();
         t.triggers = triggers_by.remove(&key).unwrap_or_default();
-        if t.is_view {
-            t.create_sql = view_sources.get(&key).cloned();
-            t.view_options = t.create_sql.as_deref().map(view_header_options);
+        if t.is_view
+            && let Some(v) = view_readings.remove(&key)
+        {
+            t.create_sql = v.create_sql;
+            t.view_options = Some(v.options);
             // `dependent_ddl` stays empty on purpose: a view's only re-create
             // here is a rename, and an `INSTEAD OF` trigger's stored text
             // names the old view, so replaying it would address a view the
@@ -4843,28 +4798,30 @@ mod tests {
         assert!(!DATABASE_LISTING_UNFILTERED.contains("user_access"));
     }
 
-    /// A view's header says what `ALTER VIEW` would reset if it were not
-    /// restated: the column list, verbatim, and the attributes — only the two
-    /// known words, since they are spliced into DDL.
+    /// A view's stored text reads into its body and the header `ALTER VIEW`
+    /// would reset — through `ddl::tsql_view_parts`, whose own tests hold the
+    /// walk. What is here is what the reader does with each answer: parts
+    /// into the options, an unreadable header kept whole and `verbatim`, no
+    /// text at all `hidden`.
     #[test]
-    fn a_view_header_yields_its_column_list_and_attributes() {
-        let o = view_header_options(
-            "CREATE VIEW [dbo].[v (x)] ( a, [b c] )\nWITH SCHEMABINDING, VIEW_METADATA AS SELECT 1 AS a, 2 AS [b c]",
-        );
-        assert_eq!(o.column_list.as_deref(), Some("a, [b c]"));
-        assert_eq!(o.attributes, ["SCHEMABINDING", "VIEW_METADATA"]);
-        // A comment in the header is not a word; a word after AS is the body's.
-        let o = view_header_options(
-            "create view dbo.v /* WITH SCHEMABINDING */ as select 1 as x with check option",
-        );
-        assert_eq!(o.column_list, None);
-        assert!(o.attributes.is_empty(), "{:?}", o.attributes);
-        // An unknown word is not carried into a statement.
-        let o = view_header_options("CREATE VIEW v WITH SCHEMABINDING, DROP AS SELECT 1 AS x");
-        assert_eq!(o.attributes, ["SCHEMABINDING"]);
-        // The parenthesis a body opens is not a column list.
-        let o = view_header_options("CREATE VIEW v AS (SELECT 1 AS x)");
-        assert_eq!(o.column_list, None);
+    fn a_stored_view_reads_into_its_parts_or_is_kept_whole() {
+        let def = "CREATE VIEW dbo.v$as (a) WITH SCHEMABINDING AS SELECT id FROM dbo.t;";
+        let v = tsql_view_reading(Some(def));
+        assert_eq!(v.body, "SELECT id FROM dbo.t");
+        assert_eq!(v.create_sql.as_deref(), Some(def));
+        assert_eq!(v.options.column_list.as_deref(), Some("a"));
+        assert_eq!(v.options.attributes, ["SCHEMABINDING"]);
+        assert!(!v.options.tsql.verbatim && !v.options.tsql.hidden);
+
+        let odd = "CREATE VIEW v WITH SCHEMABINDING, SOMETHING_NEW AS SELECT 1 AS x";
+        let v = tsql_view_reading(Some(odd));
+        assert_eq!((v.body.as_str(), v.create_sql.as_deref()), (odd, Some(odd)));
+        assert!(v.options.tsql.verbatim);
+        assert!(v.options.attributes.is_empty(), "nothing guessed at");
+
+        let v = tsql_view_reading(None);
+        assert!(v.options.tsql.hidden);
+        assert_eq!((v.body.as_str(), v.create_sql), ("", None));
     }
 
     /// Seed and increment are spliced into `IDENTITY(…)`, so only integer
@@ -4931,25 +4888,6 @@ mod tests {
         assert_eq!(strip_outer_parens("(a)+(b)"), "(a)+(b)");
         assert_eq!(strip_outer_parens("([x)]>(1))"), "[x)]>(1)");
         assert_eq!(strip_outer_parens("0"), "0");
-    }
-
-    #[test]
-    fn a_view_body_is_what_follows_its_header() {
-        assert_eq!(
-            view_select_body("CREATE VIEW dbo.v AS SELECT a AS b FROM t"),
-            "SELECT a AS b FROM t"
-        );
-        assert_eq!(
-            view_select_body(
-                "create view [v AS x] (a, [AS]) with schemabinding\nAS\nSELECT 1 AS a;"
-            ),
-            "SELECT 1 AS a"
-        );
-        assert_eq!(
-            view_select_body("/* AS */ CREATE VIEW v AS -- AS\nSELECT 1"),
-            "-- AS\nSELECT 1"
-        );
-        assert_eq!(view_select_body("SELECT 1"), "SELECT 1");
     }
 
     /// **`sys.objects.type` is `char(2)`**, so a procedure's one-letter `P`

@@ -1859,6 +1859,49 @@ async fn a_view_is_altered_in_place_and_renamed() {
     assert_eq!(s.scalar("SELECT b FROM dbo.w").await, "5");
 }
 
+/// **A view is edited only when its header was read.** `v$as` is one name —
+/// read as `v` and the header's `AS`, the editor opened on `AS SELECT …` and
+/// Apply emitted `AS AS` — so it reads whole and an edit applies, schema
+/// binding kept. An encrypted view shows no text, and is listed and not
+/// editable rather than opened on an empty body.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_view_is_edited_only_when_its_header_was_read() {
+    use schemaic_core::ddl::{ViewDraft, diff_view, view_is_editable};
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("ddl_view_read").await;
+    s.exec("CREATE TABLE dbo.t (id int NOT NULL PRIMARY KEY); INSERT dbo.t VALUES (1), (2)")
+        .await;
+    s.exec("CREATE VIEW dbo.v$as WITH SCHEMABINDING AS SELECT id FROM dbo.t")
+        .await;
+    s.exec("CREATE VIEW dbo.v_enc WITH ENCRYPTION AS SELECT id FROM dbo.t")
+        .await;
+
+    let v = read_table(&s, "v$as").await;
+    let o = v.view_options.clone().expect("options");
+    assert_eq!(o.attributes, ["SCHEMABINDING"]);
+    assert_eq!(v.view_definition.as_deref(), Some("SELECT id FROM dbo.t"));
+    assert!(view_is_editable(&v));
+    let mut d = ViewDraft::from_table(&v).unwrap();
+    d.select = "SELECT id FROM dbo.t WHERE id > 1".into();
+    let stmts = diff_view(&v, &d, MS).emit();
+    s.db.run_ddl(&s.name, &stmts, CancellationToken::new())
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{stmts:#?}"));
+    assert_eq!(s.scalar("SELECT COUNT(*) FROM dbo.[v$as]").await, "1");
+    assert_eq!(
+        s.scalar("SELECT OBJECTPROPERTY(OBJECT_ID('dbo.[v$as]'), 'IsSchemaBound')")
+            .await,
+        "1"
+    );
+
+    let enc = read_table(&s, "v_enc").await;
+    assert!(enc.view_options.as_ref().is_some_and(|o| o.tsql.hidden));
+    assert!(!view_is_editable(&enc));
+    assert!(!ViewDraft::from_table(&enc).unwrap().validate(MS).is_empty());
+}
+
 /// **A routine is altered in place and keeps what the alter would reset**:
 /// its parameters' defaults (which live only in the text), its `WITH`
 /// options, its grant and its comment. A rename is a drop and a create that

@@ -868,6 +868,9 @@ impl ViewDraft {
                     .to_string(),
             );
         }
+        if let Some(why) = view_not_editable_reason(&self.options) {
+            out.push(why.to_string());
+        }
         out
     }
 }
@@ -9251,6 +9254,42 @@ pub fn is_materialized_view(t: &crate::schema::TableInfo) -> bool {
     t.is_view && t.view_options.as_ref().is_some_and(|o| o.materialized)
 }
 
+/// Is `t` a view **an editor here can open** — a view, not materialized, and
+/// one whose definition was read into parts?
+///
+/// The last clause is SQL Server's ([`crate::schema::TsqlView`]): a view the
+/// server shows no text for (`WITH ENCRYPTION`) opened on an empty body, and a
+/// body typed in its place was applied as a plain `CREATE OR ALTER`, dropping
+/// the encryption, the binding and every index with no word said; one whose
+/// header could not be read would be rebuilt from a guess. Both are listed and
+/// droppable, as the trigger editor leaves the same two cases.
+/// [`ViewDraft::validate`] refuses them too ([`view_not_editable_reason`]).
+pub fn view_is_editable(t: &crate::schema::TableInfo) -> bool {
+    t.is_view
+        && !is_materialized_view(t)
+        && t.view_options
+            .as_ref()
+            .is_none_or(|o| view_not_editable_reason(o).is_none())
+}
+
+/// Why a view with these options cannot be edited, when its definition was
+/// not read — see [`view_is_editable`]. `None` for every view that was.
+pub fn view_not_editable_reason(o: &ViewOptions) -> Option<&'static str> {
+    if o.tsql.hidden {
+        Some(
+            "This view's definition is encrypted or hidden from this login, so it can be \
+             removed here but not edited.",
+        )
+    } else if o.tsql.verbatim {
+        Some(
+            "This view's header says something Schemaic can't restate, so it can be removed \
+             here but not edited.",
+        )
+    } else {
+        None
+    }
+}
+
 /// The refresh `t` takes, or `None` if `t` is not a materialized view.
 ///
 /// **The whole decision in one place, so it can be tested as one.** The two
@@ -10402,6 +10441,91 @@ pub fn tsql_routine_parts(definition: &str) -> Option<TsqlRoutineParts> {
         return None; // a CLR routine: `AS EXTERNAL NAME assembly.class.method`
     }
     let body = definition[c.i..].trim();
+    if body.is_empty() {
+        return None;
+    }
+    out.body = body.to_string();
+    Some(out)
+}
+
+/// What [`tsql_view_parts`] reads out of a stored T-SQL `CREATE VIEW`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TsqlViewParts {
+    /// The explicit column list, verbatim and without its parentheses —
+    /// [`crate::schema::ViewOptions::column_list`].
+    pub column_list: Option<String>,
+    /// `SCHEMABINDING`, `VIEW_METADATA`, upper-cased, in the order stated —
+    /// [`crate::schema::ViewOptions::attributes`].
+    pub attributes: Vec<String>,
+    /// Everything after the header's `AS`, verbatim but for the whitespace
+    /// around it and a trailing `;`.
+    pub body: String,
+}
+
+/// A SQL Server view's stored `CREATE VIEW`, read into the header a `CREATE
+/// OR ALTER` must restate and the `SELECT` it defines — or `None` when the
+/// parts cannot restate it.
+///
+/// **The third header walk over [`TsqlCursor`], under the same stated
+/// exception** as [`tsql_trigger_parts`] and [`tsql_routine_parts`]: a view's
+/// body is the text an edit keeps verbatim, and an AST would re-print it. It
+/// was a hand-rolled byte scan in `db::mssql` that ended a word where
+/// `sql::is_word_byte` did, so `v$as` read as `v` and the header's `AS`, the
+/// editor opened on `AS SELECT …` and Apply emitted `AS AS` — and on a
+/// header it could not read it fell back to a guess rather than refusing.
+///
+/// The header is `CREATE [OR ALTER] VIEW name [(columns)] [WITH attribute,
+/// …] AS body`. `None` — listed, restated as stored, droppable, never rebuilt
+/// ([`crate::schema::TsqlView::verbatim`]) — for `WITH ENCRYPTION` (whose text
+/// the server does not keep), an attribute not modelled, and anything else
+/// not in that shape: rebuilding a view from the parts that were read would
+/// silently drop the rest.
+pub fn tsql_view_parts(definition: &str) -> Option<TsqlViewParts> {
+    let mut c = TsqlCursor {
+        s: definition,
+        i: 0,
+        start: 0,
+    };
+    let mut out = TsqlViewParts::default();
+    if !(c.keyword("CREATE") || c.keyword("ALTER")) {
+        return None;
+    }
+    if c.keyword("OR") && !c.keyword("ALTER") {
+        return None;
+    }
+    if !c.keyword("VIEW") {
+        return None;
+    }
+    c.object_name()?;
+    if c.peek() == Some(TsqlTok::Punct(b'(')) {
+        c.next();
+        let from = c.i;
+        c.close_paren()?;
+        out.column_list =
+            Some(definition[from..c.start].trim().to_string()).filter(|s| !s.is_empty());
+    }
+    if c.keyword("WITH") {
+        loop {
+            match c.next()? {
+                TsqlTok::Word(w)
+                    if w.eq_ignore_ascii_case("SCHEMABINDING")
+                        || w.eq_ignore_ascii_case("VIEW_METADATA") =>
+                {
+                    out.attributes.push(w.to_ascii_uppercase())
+                }
+                // `ENCRYPTION` among them — see above — and anything newer.
+                _ => return None,
+            }
+            if c.peek() != Some(TsqlTok::Punct(b',')) {
+                break;
+            }
+            c.next();
+        }
+    }
+    if !c.keyword("AS") {
+        return None;
+    }
+    let body = definition[c.i..].trim().trim_end_matches(';').trim_end();
     if body.is_empty() {
         return None;
     }
@@ -26281,6 +26405,133 @@ mod tsql_routine_read_tests {
             "",
         ] {
             assert!(tsql_routine_parts(sql).is_none(), "{sql}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tsql_view_read_tests {
+    use super::*;
+
+    fn parts(sql: &str) -> TsqlViewParts {
+        tsql_view_parts(sql).unwrap_or_else(|| panic!("should read: {sql}"))
+    }
+
+    /// A view's header says what `ALTER VIEW` would reset if it were not
+    /// restated — the column list, verbatim, and the attributes — and the body
+    /// is what follows the header's own `AS`, past every `AS` a quoted name, a
+    /// column list or a comment holds.
+    #[test]
+    fn a_stored_view_splits_into_its_header_and_body() {
+        let p = parts(
+            "CREATE VIEW [dbo].[v (x)] ( a, [b c] )\nWITH SCHEMABINDING, VIEW_METADATA AS \
+             SELECT 1 AS a, 2 AS [b c];",
+        );
+        assert_eq!(p.column_list.as_deref(), Some("a, [b c]"));
+        assert_eq!(p.attributes, ["SCHEMABINDING", "VIEW_METADATA"]);
+        assert_eq!(p.body, "SELECT 1 AS a, 2 AS [b c]");
+        let p =
+            parts("create view dbo.v /* WITH SCHEMABINDING */ as select 1 as x with check option");
+        assert_eq!(p.column_list, None);
+        assert!(p.attributes.is_empty(), "{:?}", p.attributes);
+        assert_eq!(p.body, "select 1 as x with check option");
+        let p = parts("create view [v AS x] (a, [AS]) with schemabinding\nAS\nSELECT 1 AS a;");
+        assert_eq!(p.body, "SELECT 1 AS a");
+        assert_eq!(
+            parts("/* AS */ CREATE VIEW v AS -- AS\nSELECT 1").body,
+            "-- AS\nSELECT 1"
+        );
+        // The parenthesis a body opens is not a column list.
+        let p = parts("CREATE OR ALTER VIEW v AS (SELECT 1 AS x)");
+        assert_eq!((p.column_list, p.body.as_str()), (None, "(SELECT 1 AS x)"));
+    }
+
+    /// **A bare T-SQL name runs through `$`, `#` and `@`**, so `v$as` is one
+    /// name: read as `v` and the header's `AS`, the editor opened on
+    /// `AS SELECT …`, Apply emitted `AS AS`, and a `WITH SCHEMABINDING` after
+    /// the false `AS` was dropped (R1-L2-04; the stored text is SQL Server
+    /// 2022's, verbatim).
+    #[test]
+    fn a_view_name_holding_a_dollar_is_one_name() {
+        assert_eq!(
+            parts("CREATE VIEW dbo.v$as AS SELECT 1 AS x").body,
+            "SELECT 1 AS x"
+        );
+        let p = parts("CREATE VIEW dbo.v$as WITH SCHEMABINDING AS SELECT id FROM dbo.t");
+        assert_eq!(p.attributes, ["SCHEMABINDING"]);
+        assert_eq!(p.body, "SELECT id FROM dbo.t");
+    }
+
+    /// Refused, not guessed at: `ENCRYPTION`, an attribute Schemaic does not
+    /// model, and anything not shaped like a view's `CREATE`. The walk this
+    /// replaced carried the known words of an unknown list and dropped the
+    /// rest, and answered the whole text for a header it could not find.
+    #[test]
+    fn a_view_header_the_parts_cannot_restate_is_unreadable() {
+        for sql in [
+            "CREATE VIEW v WITH ENCRYPTION AS SELECT 1 AS x",
+            "CREATE VIEW v WITH SCHEMABINDING, DROP AS SELECT 1 AS x",
+            "CREATE VIEW v SELECT 1 AS x",
+            "CREATE VIEW v AS",
+            "CREATE VIEW v AS ;",
+            "SELECT 1",
+            "CREATE TABLE t (a int)",
+            "",
+        ] {
+            assert!(tsql_view_parts(sql).is_none(), "{sql}");
+        }
+    }
+
+    /// **A view whose text the server hides, or whose header could not be
+    /// read, is not edited** — the trigger editor's rule for the same two
+    /// cases. An encrypted view opened on an empty body, and a body typed into
+    /// it applied as `CREATE OR ALTER VIEW … AS …`, unencrypted, unbound and
+    /// without a word (S7.1-L1-05). The gate is `view_is_editable`; the draft
+    /// refuses as well, for a caller that did not ask it.
+    #[test]
+    fn a_sql_server_view_it_cannot_read_is_not_edited() {
+        use crate::schema::{TsqlView, ViewOptions};
+        let view = |tsql: TsqlView| TableInfo {
+            name: "v".into(),
+            schema: Some("dbo".into()),
+            is_view: true,
+            view_definition: Some("SELECT 1 AS x".into()),
+            view_options: Some(ViewOptions {
+                tsql,
+                ..ViewOptions::default()
+            }),
+            ..TableInfo::default()
+        };
+        let plain = view(TsqlView::default());
+        assert!(view_is_editable(&plain));
+        assert!(
+            ViewDraft::from_table(&plain)
+                .unwrap()
+                .validate(SqlDialect::MsSql)
+                .is_empty()
+        );
+        for (tsql, says) in [
+            (
+                TsqlView {
+                    hidden: true,
+                    ..TsqlView::default()
+                },
+                "encrypted",
+            ),
+            (
+                TsqlView {
+                    verbatim: true,
+                    ..TsqlView::default()
+                },
+                "header",
+            ),
+        ] {
+            let v = view(tsql);
+            assert!(!view_is_editable(&v));
+            let errors = ViewDraft::from_table(&v)
+                .unwrap()
+                .validate(SqlDialect::MsSql);
+            assert!(errors.iter().any(|e| e.contains(says)), "{errors:?}");
         }
     }
 }

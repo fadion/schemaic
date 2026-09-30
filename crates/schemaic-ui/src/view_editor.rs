@@ -87,7 +87,11 @@ pub(crate) fn open_for_view(
     schema: Option<&str>,
     view: &str,
 ) {
-    let Some(info) = loaded_table(schema_ui, database, schema, view).filter(|t| t.is_view) else {
+    // The gate the menu entry is disabled by, asked again at the launch: an
+    // encrypted SQL Server view would otherwise open on an empty body.
+    let Some(info) =
+        loaded_table(schema_ui, database, schema, view).filter(|t| is_editable_view(Some(t)))
+    else {
         return;
     };
     let Some(draft) = ViewDraft::from_table(&info) else {
@@ -214,14 +218,15 @@ fn open_blank(conn: ConnUi, d: DdlUi, database: &str, schema: Option<&str>, body
 
 /// Whether this tree node is a view Schemaic can edit — the entry point's
 /// enabled/disabled test, and the reason a materialized view doesn't open a
-/// half-populated form: PostgreSQL has no `CREATE OR REPLACE` for one.
+/// half-populated form: PostgreSQL has no `CREATE OR REPLACE` for one — nor a
+/// SQL Server view whose text is encrypted or whose header could not be read.
 ///
-/// The materialized half is `ddl::is_materialized_view`'s, spelled once: the
-/// schema menu asks the same question to *offer* `Refresh view`, and two
+/// The decision is `ddl::view_is_editable`'s, spelled once: the schema menu
+/// asks `ddl::is_materialized_view` to *offer* `Refresh view`, and two
 /// hand-written copies of "is this a materialized view" are two chances for the
 /// editor and the menu to disagree about the same node.
 pub(crate) fn is_editable_view(info: Option<&schemaic_core::schema::TableInfo>) -> bool {
-    info.is_some_and(|t| t.is_view && !schemaic_core::ddl::is_materialized_view(t))
+    info.is_some_and(schemaic_core::ddl::view_is_editable)
 }
 
 // ── the form ─────────────────────────────────────────────────────────────────

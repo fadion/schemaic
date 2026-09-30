@@ -1928,6 +1928,28 @@ mod tests {
             &TableInfo::default()
         )));
         assert!(!crate::view_editor::is_editable_view(None));
+        // A SQL Server view whose text the server hides (`WITH ENCRYPTION`)
+        // opened on an empty body, and Apply dropped the encryption; one
+        // whose header could not be read would be rebuilt from a guess.
+        for tsql in [
+            schemaic_core::schema::TsqlView {
+                hidden: true,
+                ..Default::default()
+            },
+            schemaic_core::schema::TsqlView {
+                verbatim: true,
+                ..Default::default()
+            },
+        ] {
+            let v = TableInfo {
+                view_options: Some(ViewOptions {
+                    tsql: tsql.clone(),
+                    ..Default::default()
+                }),
+                ..view(false)
+            };
+            assert!(!crate::view_editor::is_editable_view(Some(&v)), "{tsql:?}");
+        }
     }
 
     /// **A new SQL Server trigger opens on no error**, on a table or a view:

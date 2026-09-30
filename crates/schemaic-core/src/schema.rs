@@ -1629,6 +1629,28 @@ pub struct ViewOptions {
     /// drops every index on it. `ENCRYPTION` never appears — an encrypted
     /// view has no readable definition, so there is nothing to edit.
     pub attributes: Vec<String>,
+    /// **SQL Server's** — what its view carries beyond the shared options.
+    /// Default everywhere else.
+    pub tsql: TsqlView,
+}
+
+/// What a **SQL Server** view carries beyond [`ViewOptions`]' shared fields:
+/// whether its stored text could be read into parts at all.
+///
+/// The header is read by [`crate::ddl::tsql_view_parts`]. A view it cannot
+/// read, or whose text the server does not show, is **listed, restated as
+/// stored and droppable, and not editable** — the call
+/// [`TsqlTrigger::verbatim`] and [`TsqlTrigger::hidden`] make for a trigger.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TsqlView {
+    /// **The header could not be read** — an attribute Schemaic does not
+    /// model, or a shape the walk does not know. The stored statement is kept
+    /// whole in [`TableInfo::create_sql`] and as the body, for display.
+    pub verbatim: bool,
+    /// **The server shows no text for it** — created `WITH ENCRYPTION`, or not
+    /// visible to this login. There is no body to rebuild it with, and one
+    /// typed in its place would drop the encryption without a word.
+    pub hidden: bool,
 }
 
 /// **Hand-written for one field.** Every other default here is "absent", which
@@ -1648,6 +1670,7 @@ impl Default for ViewOptions {
             populated: true,
             column_list: None,
             attributes: Vec::new(),
+            tsql: TsqlView::default(),
         }
     }
 }

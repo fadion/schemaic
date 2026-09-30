@@ -4903,6 +4903,27 @@ existing prose was left alone.
     `@for`, which used to answer `None`, now read as the parameters they are
     (`a_parameters_own_as_is_not_the_headers`, `a_trigger_name_holding_a_dollar_is_one_name`; live,
     `a_parameter_declared_with_as_reads_and_rebuilds_whole` on 2022 and 2025).
+    **A view's header is the third walk over the cursor**: `tsql_view_parts` reads `CREATE [OR
+    ALTER] VIEW name [(columns)] [WITH attribute, …] AS body` into `TsqlViewParts` — the column
+    list verbatim, the attributes (`SCHEMABINDING`, `VIEW_METADATA`, the two it models) and the
+    body after the header's own `AS`. It was a pair of byte scans in `db::mssql`,
+    `view_select_body` and `view_header_options`, that ended a word where `sql::is_word_byte` did
+    — the cursor's old bug — so `v$as` read as `v` and the header's `AS`: the editor opened on
+    `AS SELECT …`, Apply emitted `AS AS`, and a `WITH SCHEMABINDING` after the false `AS` was
+    dropped (`a_view_name_holding_a_dollar_is_one_name`). And where they could not read a header
+    they guessed — the whole text as the body, an unknown attribute dropped while the known ones
+    beside it were kept. It answers `None` now, on the trigger walk's rule, for `WITH ENCRYPTION`,
+    an attribute it does not model and any other shape
+    (`a_view_header_the_parts_cannot_restate_is_unreadable`); `db::mssql` marks such a view
+    `TsqlView::verbatim` (under `schema.rs`). **`view_is_editable` is the one gate over a view's
+    refusals** — a view, not materialized, and `view_not_editable_reason` silent, which it is
+    unless the view is `verbatim` or `hidden` — and `ViewDraft::validate` pushes the same reason,
+    for a caller that did not ask the gate. The encrypted case is the one that shipped: its
+    definition is NULL, so **Edit view** opened on an empty body, and a body typed there was
+    applied as a plain `CREATE OR ALTER VIEW`, dropping the encryption, the binding and every
+    index without a word (`a_sql_server_view_it_cannot_read_is_not_edited`; live,
+    `a_view_is_edited_only_when_its_header_was_read` on 2022 and 2025). Both kinds stay listed
+    and droppable, as a trigger does.
     **`supports_or_replace_routine(MsSql)` is true**: `CREATE OR ALTER` keeps the routine's grants
     (measured: a `GRANT EXECUTE` survived one), so an edit is altered in place. **What it refuses is
     what `routine_signature_changed` asks there**, which is per-engine now: on SQL Server a change
@@ -7517,7 +7538,11 @@ existing prose was left alone.
     the header's order, empty elsewhere — restated for the same `ALTER VIEW` reason: a schema-bound
     view altered without the word comes back unbound, which drops every index on it. `ENCRYPTION`
     never appears, an encrypted view having no readable definition to edit. `db::mssql` reads both
-    off the stored definition's header. `TableInfo::create_ddl` — `CREATE TABLE`/`VIEW`, built on the
+    off the stored definition's header, through `ddl::tsql_view_parts`. **`tsql: TsqlView` says
+    whether it could** — `verbatim` for a header the walk could not read, `hidden` for a view the
+    server shows no text for, default on every other engine — and either leaves the view listed
+    and droppable but not editable (`ddl::view_is_editable`), the call `TsqlTrigger`'s fields of
+    the same names make for a trigger. `TableInfo::create_ddl` — `CREATE TABLE`/`VIEW`, built on the
     above; its **view** branch delegates to `ddl::view_ddl` so Copy DDL, the MCP table-info tool
     and the apply path all emit through one view emitter (it used to have its own, which restated
     none of the options). **`TableInfo::implicit_key` is a capability, read rather than
@@ -12521,14 +12546,16 @@ existing prose was left alone.
   `sys.numbered_procedures` — and `fetch_schema`'s routine loop attaches them to their head as
   `TsqlRoutine::numbered` (under `schema.rs`; why a plan that drops a head is refused is under
   `ddl.rs`).
-  **A view's header is read off its stored definition, in two halves by one walk.**
-  `view_select_body` is the `SELECT` — everything after the first `AS` outside parentheses,
-  strings, comments and quoted names, over `sql::skip_noncode` — and `view_header_options` is what
-  comes before it: the first parenthesised group at depth 0 as `ViewOptions::column_list`,
-  verbatim, and the words after `WITH` as `ViewOptions::attributes`, which `ALTER VIEW` resets
-  unless they are restated (under `schema.rs`). **Only `SCHEMABINDING` and `VIEW_METADATA` are
-  kept**, since the words are spliced into a statement Schemaic runs and one it does not know is
-  not carried (`a_view_header_yields_its_column_list_and_attributes`). `dependent_ddl` is left
+  **A view's text goes through `tsql_view_reading`**, pure, on the same terms: the parts
+  `ddl::tsql_view_parts` reads give the body after the header's own `AS`, the column list as
+  `ViewOptions::column_list`, verbatim, and the attributes as `ViewOptions::attributes`, which
+  `ALTER VIEW` resets unless they are restated (under `schema.rs`); a header it cannot read keeps
+  the whole text as the body and as `create_sql` and is `TsqlView::verbatim`, with no attribute
+  kept from a list it could not read whole; a NULL `definition` is `hidden` — so an encrypted view
+  now has `view_options` at all, where it had `None`
+  (`a_stored_view_reads_into_its_parts_or_is_kept_whole`). The walk was two byte scans here,
+  `view_select_body` and `view_header_options`, until the `v$as` they split and the guesses they
+  fell back on moved it into core (under `ddl.rs`). `dependent_ddl` is left
   empty for a view, deliberately — see `TableInfo::dependent_ddl`, under `schema.rs`.
   **`DATABASE_LISTING` asks `HAS_DBACCESS` inside a `CASE`, and never of a single-user database.**
   On one another session holds `SINGLE_USER`, that call took 2,174 ms against 150 ms (SQL Server
@@ -17977,7 +18004,11 @@ existing prose was left alone.
     (`ObjectEntries::refresh_view`, over `ddl::refresh_view_change`), neither of which opens a
     form. Its materialized half is `ddl::is_materialized_view`, the same predicate the menu
     asks to *offer* the refresh: two hand-written copies are two chances for the editor and
-    the menu to disagree about one node.
+    the menu to disagree about one node. **The whole decision is `ddl::view_is_editable`'s now**,
+    which also refuses a SQL Server view whose text the server hides or whose header could not be
+    read (under `ddl.rs`): an encrypted one opened on an empty body, and Apply wrote it back
+    unencrypted. `open_for_view` asks it again at the launch rather than trusting the disabled
+    entry (`the_edit_gates_refuse_what_the_editors_cannot_express`, in `trigger_editor.rs`).
     **Off `whole_ui_gate`'s list, 6 to zero, and the six were exactly the opening path** — the
     overlay, the form and the two field helpers had come down a pass earlier. They went the way
     `routine_editor.rs`, `event_editor.rs` and `object_editor.rs`'s doors went rather than the way
@@ -25309,11 +25340,14 @@ Re-introducing the anti-patterns these guard against is a regression:
   options a `CREATE OR ALTER` must restate. sqlparser 0.62's T-SQL `CREATE TRIGGER` knows neither
   the `WITH` options nor `NOT FOR REPLICATION` and parses the body as statements, so the AST answers
   `None` for the very triggers the editor has to read — `core::ddl`'s entry has the rest. **Its
-  sibling `ddl::tsql_routine_parts` is the same exception, not a third**: the same cursor reading a
-  procedure's or function's header, for the same reason — the T-SQL routine grammar carries no
-  `WITH` options, and a body is text an AST would re-print rather than keep. Both are held
+  siblings `ddl::tsql_routine_parts` and `ddl::tsql_view_parts` are the same exception, not a
+  third and a fourth**: the same cursor reading a procedure's or function's header, and a view's,
+  for the same reason — the T-SQL routine grammar carries no `WITH` options, and a body is text an
+  AST would re-print rather than keep. **The view walk was an unstated reader until it moved
+  here**: a byte scan in `db::mssql` over `sql::is_word_byte`, which read `v$as` as `v` and the
+  header's `AS` and, on a header it could not find, guessed. All three are held
   to the grammar's header and nothing more, and anything outside that shape answers `None`, which
-  keeps the object listed and droppable but never rebuilt — so either may be widened only for a
+  keeps the object listed and droppable but never rebuilt — so any may be widened only for a
   clause the model then restates, since a word it merely skipped would be dropped by the rebuild.
 - **One connection per operation — except a Manual-mode tab, and a running script.** Every `Db` method opens a fresh
   connection, runs, and disconnects; that statelessness is why a dropped connection is never a
@@ -26452,11 +26486,13 @@ Re-introducing the anti-patterns these guard against is a regression:
   built on `is_word_byte` — PostgreSQL adds `$` (`continues_dollar_name`), T-SQL `$`, `#` and `@`,
   MySQL and SQLite nothing — with `sql::t_sql_name_prefix` for the leading `@`/`@@`/`#`/`##` of a
   T-SQL variable, system function or temporary table, `0` unless `SqlDialect::prefixed_names()`.
-  Three scanners split a name where SQL Server does not: the read-only gate's `call_tokens` ended
+  Four scanners split a name where SQL Server does not: the read-only gate's `call_tokens` ended
   `dbo.f@GETDATE()` at the `@` and asked the allowlist about `GETDATE`, `sqlfmt::tokenize` cut
-  `@x` from its `@`, so Format Code wrote back `@ x`, a batch that no longer compiled, and
+  `@x` from its `@`, so Format Code wrote back `@ x`, a batch that no longer compiled,
   `ddl::TsqlCursor`, the trigger and routine header walk, read a parameter `@as` as a `@` and the
-  keyword `AS`, so a procedure declaring one rebuilt into Msg 137. A new T-SQL
+  keyword `AS`, so a procedure declaring one rebuilt into Msg 137, and `db::mssql`'s view-header
+  scan read `v$as` as `v` and the header's `AS` — it is on the cursor now, as
+  `ddl::tsql_view_parts`. A new T-SQL
   scanner asks these two rather than adding the bytes locally.
 - **A Velopack channel name is app identity, like `--packId`: add a name, never rename one.** The
   three `release.yml` packs with — `win-x64`, `linux-x64`, `osx-arm64` — are explicit because a
