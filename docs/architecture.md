@@ -3287,7 +3287,14 @@ existing prose was left alone.
     TABLE`s in front of the transaction carry literals too, a column comment or a quoted default.
     And it is emitted **unconditionally** — `disable_fk_checks` and `wrap_transaction` choose how the
     load behaves, while this one is the file saying what it says. `mysqldump` pins the mode at the
-    head of every file for the same reason. **The `@SCHEMAIC_OLD_SQL_MODE` wrapper is MySQL's
+    head of every file for the same reason. **`date_format_sql` is its SQL Server sibling, emitted
+    beside it**: `SET DATEFORMAT ymd;`. `datetime` and `smalldatetime` read `2026-01-02 03:04:05`
+    by the session's language, so a restore by a `british` login (or a German, French, Italian or
+    Spanish one) swapped day and month up to the 12th, silently, and failed the batch from the 13th
+    (Msg 242). It is session state, so one line holds for every later `GO` batch on both restore
+    paths; there is no restore half, since T-SQL cannot read the format back
+    (`a_sql_server_dump_pins_its_date_format_before_any_row`; the live round trip restores under
+    `SET LANGUAGE british`). **The `@SCHEMAIC_OLD_SQL_MODE` wrapper is MySQL's
     session-variable syntax**, so this leans on `literal_mode_sql` answering for MySQL alone and
     carries a `debug_assert` saying so: a second dialect needing a statement there has to grow an
     arm here, not have its statement wrapped in these two. Whether a PostgreSQL *dump* should pin

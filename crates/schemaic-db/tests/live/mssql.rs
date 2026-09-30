@@ -606,7 +606,7 @@ async fn a_dump_restores_into_an_empty_database() {
     src.exec(
         "CREATE TABLE dbo.customers (id int IDENTITY(1,1) PRIMARY KEY, name nvarchar(50), \
            seen datetime2(3), born date, paid decimal(10,2), rv rowversion, \
-           twice AS (paid * 2))",
+           twice AS (paid * 2), dt datetime, sdt smalldatetime)",
     )
     .await;
     src.exec(
@@ -615,9 +615,11 @@ async fn a_dump_restores_into_an_empty_database() {
     )
     .await;
     src.exec(
-        "INSERT dbo.customers (name, seen, born, paid) VALUES \
-           (N'Ann', '2026-01-02 03:04:05.678', '1990-05-06', 12.50), \
-           (N'gone', NULL, NULL, NULL), (N'Zoë ''q''', NULL, NULL, 0.01); \
+        "INSERT dbo.customers (name, seen, born, paid, dt, sdt) VALUES \
+           (N'Ann', '2026-01-02 03:04:05.678', '1990-05-06', 12.50, \
+            '2026-01-02T03:04:05.677', '2026-01-02T03:04:00'), \
+           (N'gone', NULL, NULL, NULL, NULL, NULL), \
+           (N'Zoë ''q''', NULL, NULL, 0.01, '2026-03-25T10:00:00', '2026-03-25T10:00:00'); \
          DELETE dbo.customers WHERE id = 2; \
          INSERT dbo.orders (customer_id, note) VALUES (3, N'first'), (1, NULL)",
     )
@@ -691,9 +693,19 @@ async fn a_dump_restores_into_an_empty_database() {
         "{file}"
     );
 
+    // For a hand check through `sqlcmd`: the file as the app would write it.
+    if let Ok(path) = std::env::var("SCHEMAIC_IT_KEEP_DUMP") {
+        std::fs::write(path, &file).expect("the kept dump");
+    }
+
     let dst = Scratch::create("dumpdst").await;
     let mut splitter = schemaic_core::script::Splitter::new(MS);
-    let mut stmts = splitter.push_str(&file);
+    // Restored by a session whose language reads a date day-first, as a
+    // `british` (or German, French…) login's does: `datetime` reads
+    // `2026-01-02 …` as the 1st of February there unless the file says how
+    // its dates are written.
+    let mut stmts = splitter.push_str("SET LANGUAGE british;\nGO\n\n");
+    stmts.extend(splitter.push_str(&file));
     stmts.extend(splitter.finish());
     let (tx, rx) = tokio::sync::mpsc::channel(16);
     let feed = tokio::spawn(async move {
@@ -713,7 +725,8 @@ async fn a_dump_restores_into_an_empty_database() {
         "{end:?}\n{file}"
     );
 
-    let rows = "SELECT CONCAT(id, '|', name, '|', CONVERT(varchar(30), seen, 121), '|', born, '|', paid, '|', twice) \
+    let rows = "SELECT CONCAT(id, '|', name, '|', CONVERT(varchar(30), seen, 121), '|', born, '|', \
+                paid, '|', twice, '|', CONVERT(varchar(30), dt, 121), '|', CONVERT(varchar(30), sdt, 120)) \
                 FROM dbo.customers ORDER BY id";
     let both = |s: &Scratch| {
         let db = s.db.clone();

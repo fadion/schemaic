@@ -414,6 +414,28 @@ pub fn literal_mode_guard_sql(dialect: SqlDialect) -> Option<(String, &'static s
     ))
 }
 
+/// The statement that makes the restoring session read the file's date
+/// literals the way they were written — or `None` where they always are.
+///
+/// **SQL Server's `datetime` and `smalldatetime` read `2026-01-02 03:04:05`
+/// by the session's language.** Under a day-first one — `british`, and the
+/// defaults of German, French, Italian and Spanish logins — the string is
+/// year-*day*-month: the 2nd of January restores as the 1st of February, and
+/// the 25th of March fails the batch (Msg 242). `SET DATEFORMAT` is session
+/// state, so one line at the head of the file holds for every later `GO`
+/// batch on both restore paths — `Db::run_script`'s one connection and a
+/// `sqlcmd` session. The newer types (`date`, `datetime2`,
+/// `datetimeoffset`) read that form as ISO whatever the language says.
+///
+/// No restore half, unlike [`literal_mode_guard_sql`]: T-SQL has no
+/// statement that reads the session's current format back to put it there.
+pub fn date_format_sql(dialect: SqlDialect) -> Option<&'static str> {
+    match dialect {
+        SqlDialect::MsSql => Some("SET DATEFORMAT ymd;"),
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => None,
+    }
+}
+
 /// How this dialect opens and closes the load's transaction.
 pub fn transaction_sql(dialect: SqlDialect) -> (&'static str, &'static str) {
     match dialect {
@@ -1354,6 +1376,10 @@ pub fn plan(
     let literal_guard = literal_mode_guard_sql(dialect);
     if let Some((open, _)) = &literal_guard {
         text!(open.clone());
+    }
+    // Beside it, for the same reason: it decides what a date literal means.
+    if let Some(sql) = date_format_sql(dialect) {
+        text!(sql.to_string());
     }
 
     // The container before the thing that enters it: `USE shop` on a server that
@@ -3412,6 +3438,32 @@ mod tests {
             !file.contains("\nGO") && !file.contains("IDENTITY_INSERT"),
             "{file}"
         );
+    }
+
+    /// **A SQL Server dump says how its dates are written, before any of them.**
+    /// `datetime` reads `2026-01-02 …` by the session's language, so a restore
+    /// by a `british` login swapped every day and month up to the 12th and
+    /// failed on the 13th (Msg 242). Nothing of the kind on the other engines.
+    #[test]
+    fn a_sql_server_dump_pins_its_date_format_before_any_row() {
+        let s = schema_of(vec![mssql_orders()]);
+        let p = plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::MsSql,
+        );
+        let file = file_of(&p);
+        let pin = pos(&file, "SET DATEFORMAT ymd;");
+        assert!(pin < pos(&file, "CREATE TABLE"), "{file}");
+        assert!(pin < pos(&file, "BEGIN TRANSACTION"), "{file}");
+        assert!(pin < pos(&file, "<<rows orders:"), "{file}");
+        for d in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite] {
+            let s = schema_of(vec![table("orders")]);
+            let file = file_of(&plan(&s, "shop", &all(&s), DumpOptions::default(), d));
+            assert!(!file.contains("DATEFORMAT"), "{d:?}: {file}");
+        }
     }
 
     #[test]
