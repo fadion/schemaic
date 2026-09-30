@@ -2994,6 +2994,53 @@ pub(crate) fn builtin_catalog(dialect: SqlDialect) -> Option<&'static [SqlFuncti
     }
 }
 
+/// The builtins `dialect`'s catalogue says are written **without
+/// parentheses** — `SYSTEM_USER`, `SESSION_USER`, `CURRENT_USER` — lower-cased:
+/// an entry whose signature is its bare name. A parser that carries one as an
+/// identifier hands the column resolver a function, which it reported as
+/// ``Column `system_user` not found``. Built once per dialect.
+fn niladic_builtins(dialect: SqlDialect) -> &'static HashSet<String> {
+    static SETS: [std::sync::OnceLock<HashSet<String>>; 4] =
+        [const { std::sync::OnceLock::new() }; 4];
+    let slot = match dialect {
+        SqlDialect::MySql => 0,
+        SqlDialect::Postgres => 1,
+        SqlDialect::Sqlite => 2,
+        SqlDialect::MsSql => 3,
+    };
+    SETS[slot].get_or_init(|| {
+        builtin_catalog(dialect)
+            .unwrap_or(&[])
+            .iter()
+            .filter(|f| !f.signature.contains('('))
+            .map(|f| f.name.to_ascii_lowercase())
+            .collect()
+    })
+}
+
+/// The functions whose **first argument is a datepart keyword** — `DATEADD(day,
+/// 1, d)`, `DATEDIFF(month, a, b)` — which the parser carries as an identifier
+/// and the column resolver took for a column: a red ``Column `day` not
+/// found`` under the very signature help that says `DATEADD(datepart, …)`.
+/// MySQL's `TIMESTAMPDIFF(SECOND, a, b)` and `TIMESTAMPADD(MINUTE, 1, d)` are
+/// the same shape. PostgreSQL and SQLite spell a unit as a string or a keyword
+/// the grammar knows (`EXTRACT(DAY FROM …)`).
+fn datepart_functions(dialect: SqlDialect) -> &'static [&'static str] {
+    match dialect {
+        SqlDialect::Postgres | SqlDialect::Sqlite => &[],
+        SqlDialect::MySql => &["TIMESTAMPDIFF", "TIMESTAMPADD"],
+        SqlDialect::MsSql => &[
+            "DATEADD",
+            "DATEDIFF",
+            "DATEDIFF_BIG",
+            "DATENAME",
+            "DATEPART",
+            "DATETRUNC",
+            "DATE_BUCKET",
+        ],
+    }
+}
+
 /// One dialect's builtin catalog, arranged for the questions the editor asks of
 /// it on every keystroke rather than in the order it is written.
 ///
@@ -6762,8 +6809,9 @@ mod colres {
     use std::ops::ControlFlow;
 
     use sqlparser::ast::{
-        Cte, Expr, GroupByExpr, JoinConstraint, JoinOperator, Query, Select, SelectItem, SetExpr,
-        Spanned, Statement, TableAlias, TableFactor, TableWithJoins, Visit, Visitor,
+        Cte, Expr, FunctionArguments, GroupByExpr, JoinConstraint, JoinOperator, Query, Select,
+        SelectItem, SetExpr, Spanned, Statement, TableAlias, TableFactor, TableWithJoins, Visit,
+        Visitor,
     };
     use sqlparser::tokenizer::Span;
 
@@ -6855,12 +6903,14 @@ mod colres {
             // walk needs is the *names* a base table exposes undeclared, and that
             // keeps the engine question at this boundary.
             implicit: dialect.implicit_columns(),
+            niladic: super::niladic_builtins(dialect),
+            dateparts: super::datepart_functions(dialect),
             ctes: HashMap::new(),
             cte_frames: Vec::new(),
             scopes: Vec::new(),
             refs: Vec::new(),
             gb: Vec::new(),
-            hints: Vec::new(),
+            not_columns: Vec::new(),
         };
         let _ = ast.visit(&mut c);
         for r in &c.refs {
@@ -6891,6 +6941,13 @@ mod colres {
         /// added to every **base table** source — not to a derived table or a CTE,
         /// which expose only what their projection selects.
         implicit: &'static [&'static str],
+        /// The engine's builtins written without parentheses
+        /// ([`super::niladic_builtins`]): a bare identifier naming one is a
+        /// call, not a column.
+        niladic: &'static HashSet<String>,
+        /// The engine's datepart-taking functions
+        /// ([`super::datepart_functions`]), whose first argument is a keyword.
+        dateparts: &'static [&'static str],
         /// Populated as queries are visited. See [`Ctes`].
         ctes: Ctes,
         /// What each enclosing query put into [`Collector::ctes`], and what it
@@ -6912,12 +6969,13 @@ mod colres {
         refs: Vec<Ref>,
         /// `only_full_group_by` warnings collected per SELECT scope as it's pushed.
         gb: Vec<Diagnostic>,
-        /// Byte ranges of the SQL Server table hints seen so far —
-        /// `WITH (NOLOCK)`'s `NOLOCK`. sqlparser carries a hint as an `Expr`, so
-        /// the visitor reached `NOLOCK` as a column and reported
-        /// ``Column `nolock` not found``; an identifier inside one is a hint
-        /// name, never a reference.
-        hints: Vec<(usize, usize)>,
+        /// Byte ranges whose identifiers are **not column references**, seen
+        /// so far: the SQL Server table hints — `WITH (NOLOCK)`'s `NOLOCK`,
+        /// which sqlparser carries as an `Expr`, so the visitor reported
+        /// ``Column `nolock` not found`` — and a datepart function's first
+        /// argument (`DATEADD(day, …)`'s `day`). Each is recorded before the
+        /// visitor descends into it.
+        not_columns: Vec<(usize, usize)>,
     }
 
     impl Visitor for Collector<'_> {
@@ -7023,11 +7081,12 @@ mod colres {
         }
 
         /// Record a table's hints before the visitor descends into them — see
-        /// [`Collector::hints`].
+        /// [`Collector::not_columns`].
         fn pre_visit_table_factor(&mut self, t: &TableFactor) -> ControlFlow<()> {
             if let TableFactor::Table { with_hints, .. } = t {
                 for h in with_hints {
-                    self.hints.push(to_range(self.stmt, self.lo, h.span()));
+                    self.not_columns
+                        .push(to_range(self.stmt, self.lo, h.span()));
                 }
             }
             ControlFlow::Continue(())
@@ -7035,15 +7094,39 @@ mod colres {
 
         fn pre_visit_expr(&mut self, e: &Expr) -> ControlFlow<()> {
             let at = to_range(self.stmt, self.lo, e.span());
-            if self.hints.iter().any(|h| h.0 <= at.0 && at.1 <= h.1) {
+            if self.not_columns.iter().any(|h| h.0 <= at.0 && at.1 <= h.1) {
                 return ControlFlow::Continue(());
             }
             match e {
+                // A variable — `@x`, `@@ROWCOUNT` on SQL Server, `@x` and
+                // `@@version` on MySQL — keeps its sigil in the identifier and
+                // is never a column; nor is a builtin written without
+                // parentheses (`SYSTEM_USER`).
+                Expr::Identifier(id)
+                    if id.value.starts_with('@')
+                        || (id.quote_style.is_none()
+                            && self.niladic.contains(&id.value.to_ascii_lowercase())) => {}
                 Expr::Identifier(id) => self.refs.push(Ref {
                     qualifier: None,
                     col: id.value.to_ascii_lowercase(),
                     range: to_range(self.stmt, self.lo, id.span),
                 }),
+                // A datepart function's first argument is a keyword: record it
+                // before the visitor reaches it.
+                Expr::Function(f)
+                    if f.name.0.last().and_then(|p| p.as_ident()).is_some_and(|n| {
+                        self.dateparts
+                            .iter()
+                            .any(|d| d.eq_ignore_ascii_case(&n.value))
+                    }) =>
+                {
+                    if let FunctionArguments::List(list) = &f.args
+                        && let Some(first) = list.args.first()
+                    {
+                        self.not_columns
+                            .push(to_range(self.stmt, self.lo, first.span()));
+                    }
+                }
                 Expr::CompoundIdentifier(parts) if parts.len() >= 2 => {
                     let col = &parts[parts.len() - 1];
                     let qual = &parts[parts.len() - 2];
@@ -13087,11 +13170,11 @@ mod tests {
             "SELECT TRY_CONVERT(int, name), FORMAT(1.5, 'N2') FROM employees",
             "SELECT SCOPE_IDENTITY(), NEWID(), CHARINDEX('a', name) FROM employees",
         ] {
+            // No diagnostic at all, not merely no misspelled-function one:
+            // filtering to that message passed over ``Column `day` not
+            // found`` on the very statement listed here (S8-L1-04).
             let d = diag_d(sql, SqlDialect::MsSql);
-            assert!(
-                !d.iter().any(|x| x.message.contains("misspelled function")),
-                "{sql} on SQL Server: {d:?}"
-            );
+            assert!(d.is_empty(), "{sql} on SQL Server: {d:?}");
         }
         // And a typo of one is caught.
         assert!(
@@ -13101,6 +13184,77 @@ mod tests {
             )
             .iter()
             .any(|x| x.message.contains("misspelled function"))
+        );
+    }
+
+    /// **A datepart, a variable and a niladic builtin are not columns.**
+    /// `DATEADD(day, …)`'s first argument is a keyword the parser carries as
+    /// an identifier, `@x` is a variable (on MySQL as on SQL Server), and
+    /// `SYSTEM_USER` is a function written without parentheses — each was a
+    /// red ``Column `…` not found``. Only those: a real unknown column beside
+    /// them is still one.
+    #[test]
+    fn a_datepart_variable_or_niladic_builtin_is_not_a_column() {
+        for (sql, dialect) in [
+            (
+                "SELECT DATEPART(year, GETDATE()), DATENAME(month, GETDATE()) FROM employees;",
+                SqlDialect::MsSql,
+            ),
+            ("SELECT DATETRUNC(month, GETDATE());", SqlDialect::MsSql),
+            (
+                "SELECT DATEDIFF(day, e.id, 1) FROM employees e;",
+                SqlDialect::MsSql,
+            ),
+            ("SELECT id FROM employees WHERE id = @x;", SqlDialect::MsSql),
+            ("SELECT TOP (@n) * FROM employees;", SqlDialect::MsSql),
+            (
+                "SELECT id FROM employees WHERE salary > @@ROWCOUNT;",
+                SqlDialect::MsSql,
+            ),
+            (
+                "SELECT CURRENT_TIMESTAMP, SYSTEM_USER, SESSION_USER;",
+                SqlDialect::MsSql,
+            ),
+            ("SELECT id FROM employees WHERE id = @x;", SqlDialect::MySql),
+            ("SELECT @@version FROM employees;", SqlDialect::MySql),
+            (
+                "SELECT TIMESTAMPDIFF(SECOND, NOW(), NOW()) FROM employees;",
+                SqlDialect::MySql,
+            ),
+            (
+                "SELECT TIMESTAMPADD(MINUTE, 1, NOW()) FROM employees;",
+                SqlDialect::MySql,
+            ),
+        ] {
+            let d = diag_d(sql, dialect);
+            assert!(d.is_empty(), "{sql} on {dialect:?}: {d:?}");
+        }
+        let cols = |sql: &str, dialect: SqlDialect| -> Vec<String> {
+            diag_d(sql, dialect)
+                .into_iter()
+                .map(|x| sql[x.range.0..x.range.1].to_string())
+                .collect()
+        };
+        // The datepart is exempt, not the call's other arguments.
+        assert_eq!(
+            cols(
+                "SELECT DATEADD(day, nope, GETDATE()) FROM employees;",
+                SqlDialect::MsSql
+            ),
+            ["nope"]
+        );
+        // `day` is a datepart only as a datepart function's first argument.
+        assert_eq!(
+            cols("SELECT day FROM employees;", SqlDialect::MsSql),
+            ["day"]
+        );
+        // A variable is exempt, not the column beside it.
+        assert_eq!(
+            cols(
+                "SELECT nope FROM employees WHERE id = @x;",
+                SqlDialect::MySql
+            ),
+            ["nope"]
         );
     }
 

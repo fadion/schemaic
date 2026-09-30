@@ -888,8 +888,17 @@ existing prose was left alone.
     (`FROM t e WITH (NOLOCK)`) — read as the reserved word used as an alias — since no engine here
     takes `WITH` as one. The hint's inside needed a second fix in `colres`: sqlparser carries a
     hint as an `Expr`, so the visitor resolved `NOLOCK` as a column (``Column `nolock` not
-    found``); `Collector::hints` records each `TableFactor::Table`'s `with_hints` ranges in
-    `pre_visit_table_factor`, and an expression inside one is skipped. `INTO` (MySQL's trailing
+    found``); `Collector::not_columns` records each `TableFactor::Table`'s `with_hints` ranges in
+    `pre_visit_table_factor`, and an expression inside one is skipped. **Three more identifiers
+    the parser hands over are not columns**, all measured as red ``Column `…` not found``: a
+    datepart function's first argument (`DATEADD(day, …)`, and MySQL's `TIMESTAMPDIFF(SECOND,
+    …)` — `datepart_functions`, per dialect; the call's span goes into `not_columns` before the
+    visitor descends), a variable whose identifier keeps its `@` (`WHERE id = @x`, `@@ROWCOUNT` on
+    SQL Server, `@x`/`@@version` on MySQL), and a builtin the catalogue writes without parentheses
+    (`SYSTEM_USER` — `niladic_builtins`, read off `builtin_catalog` where an entry's signature is its
+    bare name). `sql_server_measures_against_its_own_catalog` had filtered its statements to the
+    misspelled-function message and so passed over ``Column `day` not found`` on the one it named;
+    it asserts no diagnostic at all now (`a_datepart_variable_or_niladic_builtin_is_not_a_column`). `INTO` (MySQL's trailing
     `SELECT … FROM t INTO @x`, a cursor's `FETCH … FROM c INTO @x`), T-SQL's second `FROM`
     (`DELETE FROM t FROM t JOIN u …`) and `PIVOT`/`UNPIVOT` end a reference the same way.
     **A statement's end ends one too, and the tokens could not see it**: a routine body is one
