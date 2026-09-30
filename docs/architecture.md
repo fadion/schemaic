@@ -7003,8 +7003,20 @@ existing prose was left alone.
     they read: `false`/`no`/`optional` is `Disable` (TDS still encrypts the login, and nothing after
     it); `strict` is `VerifyFull`; `true`/`yes`/`mandatory` is `VerifyFull` too, or `Require` with a
     trusted certificate; and `trustServerCertificate=true` alone is `Require`, being the drivers'
-    encrypted default since 10.2. A URL that says neither keeps the import's floor
-    (`sql_server_tls_words_land_on_the_ladder`). **`ImportNote::NamedInstance` is `PortAssumed`'s
+    encrypted default since 10.2. **A string that says neither takes its driver's default, not the
+    import's floor** (`apply_mssql_tls`'s `verifies_by_default`, `driver_verifies_by_default`):
+    the Microsoft drivers now encrypt and verify when told nothing — Microsoft.Data.SqlClient 4+
+    (an ADO.NET string with no `Driver`/`Provider`), mssql-jdbc 10.2+ and Prisma's URL, ODBC
+    Driver 18, OLE DB Driver 19 (`MSOLEDBSQL19`) — so those land on `VerifyFull`; jTDS, ODBC 17
+    and older, the Native Client, `SQLOLEDB` and OLE DB Driver 18 (`MSOLEDBSQL`) default off and
+    keep the floor. Reading every silent string as `Prefer` accepted any certificate where the
+    source had verified one. `System.Data.SqlClient` also defaulted off, and a bare ADO.NET string
+    does not say which client it was written for; the current one is the reading that fails loudly
+    against a self-signed server rather than silently against an attacker
+    (`sql_server_tls_words_land_on_the_ladder`,
+    `a_sql_server_string_silent_on_encryption_takes_its_drivers_default`). An ordinary
+    `mssql://u:p@h/d` URL with no `;` still goes through `parse_server_url`, which reads no
+    `encrypt`. **`ImportNote::NamedInstance` is `PortAssumed`'s
     honesty for a named instance** (`host\SQLEXPRESS`) with no port: the drivers ask SQL Server
     Browser on UDP 1434 which port it listens on and Schemaic does not, so the row carries 1433 —
     which reaches the host's *default* instance if it has one, not the named one — and the note says

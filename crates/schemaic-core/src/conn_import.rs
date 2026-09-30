@@ -820,9 +820,8 @@ fn parse_url_any(input: &str) -> Result<(Connection, Vec<ImportNote>), UrlError>
     // wraps its `sqlserver:` once more.
     let jdbc = strip_prefix_ci(raw, "jdbc:");
     let raw = jdbc.unwrap_or(raw);
-    let raw = jdbc
-        .and_then(|r| strip_prefix_ci(r, "jtds:"))
-        .unwrap_or(raw);
+    let jtds = jdbc.and_then(|r| strip_prefix_ci(r, "jtds:"));
+    let raw = jtds.unwrap_or(raw);
     let (scheme, rest) = split_scheme(raw).ok_or(UrlError::NoScheme)?;
     let engine = match engine_for_scheme(scheme) {
         Some(e) => e,
@@ -836,8 +835,9 @@ fn parse_url_any(input: &str) -> Result<(Connection, Vec<ImportNote>), UrlError>
     let mut c = if is_sqlite(engine) {
         parse_sqlite_url(rest)?
     } else if engine == MSSQL && (jdbc.is_some() || rest.contains(';')) {
-        // Microsoft's grammar — and Prisma's, which borrows it.
-        let (c, n) = parse_mssql_url(rest)?;
+        // Microsoft's grammar — and Prisma's, which borrows it. jTDS alone of
+        // the drivers writing it does not encrypt when told nothing.
+        let (c, n) = parse_mssql_url(rest, jtds.is_none())?;
         notes = n;
         c
     } else if jdbc.is_some() {
@@ -869,7 +869,14 @@ fn parse_url_any(input: &str) -> Result<(Connection, Vec<ImportNote>), UrlError>
 /// Cutting at the `;` first made `user:password@host` the *host*, which is
 /// saved to `connections.json` in plaintext. node's `?encrypt=true` query
 /// after the path is read as properties too.
-fn parse_mssql_url(rest: &str) -> Result<(Connection, Vec<ImportNote>), UrlError> {
+///
+/// `verifies_by_default` is whether the driver the URL was written for
+/// encrypts and verifies when it says nothing ([`apply_mssql_tls`]):
+/// mssql-jdbc since 10.2, Prisma and node do; jTDS does not.
+fn parse_mssql_url(
+    rest: &str,
+    verifies_by_default: bool,
+) -> Result<(Connection, Vec<ImportNote>), UrlError> {
     let rest = rest.strip_prefix("//").unwrap_or(rest);
     let (userinfo, rest) = split_mssql_userinfo(rest);
     let (authority, props) = match rest.split_once(';') {
@@ -922,7 +929,7 @@ fn parse_mssql_url(rest: &str) -> Result<(Connection, Vec<ImportNote>), UrlError
     }
     c.host = host;
     c.port = port.unwrap_or_else(|| default_port(MSSQL));
-    apply_mssql_tls(&mut c, encrypt.as_deref(), trust);
+    apply_mssql_tls(&mut c, encrypt.as_deref(), trust, verifies_by_default);
     let notes = if instance.is_some() && port.is_none() {
         vec![ImportNote::NamedInstance]
     } else {
@@ -934,15 +941,56 @@ fn parse_mssql_url(rest: &str) -> Result<(Connection, Vec<ImportNote>), UrlError
 /// The Microsoft drivers' `encrypt` (normalised) and `trustServerCertificate`,
 /// onto the TLS ladder as those drivers mean them — the one reading JDBC's
 /// properties and ADO.NET's keywords share.
-fn apply_mssql_tls(c: &mut Connection, encrypt: Option<&str>, trust: bool) {
+///
+/// **Not said is the driver's default, not the import's floor.**
+/// `verifies_by_default` says whether the driver the string was written for
+/// encrypts and verifies when told nothing — Microsoft.Data.SqlClient 4+,
+/// mssql-jdbc 10.2+, ODBC Driver 18 and OLE DB Driver 19 all do — and then
+/// silence is `VerifyFull`. Reading it as `Prefer` accepted any certificate
+/// where the source had verified one. See [`driver_verifies_by_default`].
+fn apply_mssql_tls(
+    c: &mut Connection,
+    encrypt: Option<&str>,
+    trust: bool,
+    verifies_by_default: bool,
+) {
     match (encrypt, trust) {
         (Some("false" | "no" | "optional"), _) => c.tls.mode = SslMode::Disable,
         (Some("strict"), _) => c.tls.mode = SslMode::VerifyFull,
         (Some("true" | "yes" | "mandatory"), false) => c.tls.mode = SslMode::VerifyFull,
         (Some("true" | "yes" | "mandatory"), true) | (None, true) => c.tls.mode = SslMode::Require,
-        // Unrecognised, or not said: the import's own floor.
+        (None, false) if verifies_by_default => c.tls.mode = SslMode::VerifyFull,
+        // Unrecognised, or not said to a driver that defaults off: the
+        // import's own floor.
         _ => {}
     }
+}
+
+/// Does the SQL Server client an ADO.NET / ODBC / OLE DB string names encrypt
+/// and verify the certificate **when the string says nothing**?
+///
+/// - no `Driver`/`Provider` — ADO.NET, read as Microsoft.Data.SqlClient, whose
+///   `Encrypt` defaults to true since 4.0 (`System.Data.SqlClient` defaulted
+///   off, and a string does not say which it was written for: the current
+///   one is the reading that fails loudly rather than silently);
+/// - `ODBC Driver 18 for SQL Server` and later — mandatory since 18;
+/// - `MSOLEDBSQL19` — OLE DB Driver 19, mandatory; the unversioned
+///   `MSOLEDBSQL` is 18, which defaults off.
+///
+/// Everything else — ODBC 17 and older, the Native Client, the old `SQL
+/// Server` driver, `SQLOLEDB` — defaults off.
+fn driver_verifies_by_default(driver: Option<&str>) -> bool {
+    let Some(d) = driver else {
+        return true;
+    };
+    let k = normalize_key(d);
+    let version_after = |prefix: &str| -> Option<u32> {
+        let at = k.find(prefix)? + prefix.len();
+        let digits: String = k[at..].chars().take_while(char::is_ascii_digit).collect();
+        digits.parse().ok()
+    };
+    version_after("odbcdriver").is_some_and(|v| v >= 18)
+        || version_after("msoledbsql").is_some_and(|v| v >= 19)
 }
 
 /// Does this text read as an ADO.NET / ODBC / OLE DB **connection string** —
@@ -989,6 +1037,9 @@ fn parse_connection_string(s: &str) -> Result<(Connection, Vec<ImportNote>), Url
     // The sign-in the string names, when it is not a SQL login: `Some(mode)`
     // for one Schemaic has, `None` inside for an Entra method it does not.
     let mut external: Option<Option<crate::connection::AuthMode>> = None;
+    // The ODBC `Driver` / OLE DB `Provider`, when one is named: it decides
+    // what the string's silence about encryption means.
+    let mut driver: Option<String> = None;
     for (k, v) in split_mssql_props(s, true) {
         if v.is_empty() {
             continue;
@@ -1022,6 +1073,7 @@ fn parse_connection_string(s: &str) -> Result<(Connection, Vec<ImportNote>), Url
             "driver" | "provider" if !names_sql_server_driver(&v) => {
                 return Err(UrlError::UnknownScheme(v));
             }
+            "driver" | "provider" => driver = Some(v),
             _ => {}
         }
     }
@@ -1050,7 +1102,12 @@ fn parse_connection_string(s: &str) -> Result<(Connection, Vec<ImportNote>), Url
         _ => host.to_string(),
     };
     c.port = port.unwrap_or_else(|| default_port(MSSQL));
-    apply_mssql_tls(&mut c, encrypt.as_deref(), trust);
+    apply_mssql_tls(
+        &mut c,
+        encrypt.as_deref(),
+        trust,
+        driver_verifies_by_default(driver.as_deref()),
+    );
     let mut notes = Vec::new();
     if instance && port.is_none() {
         notes.push(ImportNote::NamedInstance);
@@ -3010,8 +3067,52 @@ mod tests {
         // Trusting the certificate says the session is encrypted — the
         // driver's default since 10.2 — and nothing more.
         assert_eq!(mode("trustServerCertificate=true"), SslMode::Require);
-        // Said nothing: the import's own floor.
-        assert_eq!(mode("databaseName=d"), blank(MSSQL).tls.mode);
+        // Said nothing: what the driver it came from does by default.
+        assert_eq!(mode("databaseName=d"), SslMode::VerifyFull);
+    }
+
+    /// **A string that says nothing about encryption imports as its driver's
+    /// default**, and the Microsoft drivers now verify by default:
+    /// Microsoft.Data.SqlClient 4+ (`Encrypt` true), mssql-jdbc 10.2+
+    /// (`encrypt=true`), ODBC Driver 18 and OLE DB Driver 19 (mandatory).
+    /// Landing those on `Prefer` accepted any certificate where the source had
+    /// verified one — a SQL login's password, or an Entra token, to whoever
+    /// answered on the path. The drivers known to default off keep the import's
+    /// floor: jTDS, ODBC 17 and older, the Native Client, SQLOLEDB, and
+    /// OLE DB Driver 18 (`MSOLEDBSQL`).
+    #[test]
+    fn a_sql_server_string_silent_on_encryption_takes_its_drivers_default() {
+        let tls = |s: &str| url(s).tls.mode;
+        let floor = blank(MSSQL).tls.mode;
+        for verifies in [
+            "Server=db.corp;Database=d;User Id=u;Password=p",
+            "jdbc:sqlserver://db.corp;databaseName=d",
+            "sqlserver://db.corp:1433;database=d",
+            "Driver={ODBC Driver 18 for SQL Server};Server=db.corp;Database=d",
+            "Provider=MSOLEDBSQL19;Data Source=db.corp;Initial Catalog=d",
+        ] {
+            assert_eq!(tls(verifies), SslMode::VerifyFull, "{verifies}");
+        }
+        for off in [
+            "jdbc:jtds:sqlserver://db.corp:1433/d",
+            "Driver={ODBC Driver 17 for SQL Server};Server=db.corp;Database=d",
+            "Driver={SQL Server Native Client 11.0};Server=db.corp",
+            "Driver={SQL Server};Server=db.corp",
+            "Provider=SQLOLEDB;Data Source=db.corp",
+            "Provider=MSOLEDBSQL;Data Source=db.corp",
+        ] {
+            assert_eq!(tls(off), floor, "{off}");
+        }
+        // What the string does say still wins.
+        assert_eq!(tls("Server=db.corp;Encrypt=False"), SslMode::Disable);
+        assert_eq!(
+            tls("Server=db.corp;TrustServerCertificate=True"),
+            SslMode::Require
+        );
+        assert_eq!(
+            tls("Driver={ODBC Driver 17 for SQL Server};Server=h;Encrypt=yes"),
+            SslMode::VerifyFull
+        );
     }
 
     /// **A named instance has no port of its own to import** — SQL Server
