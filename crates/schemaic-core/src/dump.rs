@@ -121,6 +121,10 @@ pub enum DumpStep {
         schema: Option<String>,
         table: String,
         select: String,
+        /// The columns `select` asks the server to render as SQL, because a
+        /// text cell cannot carry them ([`literal_select`]), and in which
+        /// form — what [`render_rows`] writes them from.
+        server: Vec<(String, crate::export::ServerLiteral)>,
     },
 }
 
@@ -371,10 +375,14 @@ fn close_batches(steps: Vec<DumpStep>, dialect: SqlDialect) -> Vec<DumpStep> {
 /// batch per statement stays far inside the limit whatever the table's size.
 /// Session state the rows need — `SET IDENTITY_INSERT`, the transaction —
 /// outlives a `GO` on the one connection a restore holds.
+///
+/// `server` is the step's [`DumpStep::Rows::server`]: the columns written from
+/// the SQL the server rendered them as.
 pub fn render_rows<W: std::io::Write>(
     w: &mut W,
     src: &mut dyn crate::export::RowChunks,
     target: (&str, Option<&str>, &str),
+    server: &[(String, crate::export::ServerLiteral)],
     dialect: SqlDialect,
 ) -> std::io::Result<crate::export::ExportTally> {
     let end = if dialect.batch_separator() {
@@ -382,7 +390,102 @@ pub fn render_rows<W: std::io::Write>(
     } else {
         ";\n"
     };
-    crate::export::export_inserts_ending(w, src, Some(target), dialect, end)
+    crate::export::export_inserts_ending(w, src, Some(target), dialect, end, server)
+}
+
+/// What a dump's `SELECT` reads for column `c` when a text cell cannot carry
+/// its value: an expression the **server** renders as SQL, and the form the
+/// renderer checks it against — or `None` to read the column as it is.
+///
+/// **SQL Server's bytes and variants.** A `varbinary`, `binary` or `image`
+/// cell holds the `<n bytes>` placeholder, and so do the CLR types
+/// `hierarchyid`, `geography` and `geometry`: a dump wrote that text as the
+/// value (`N'<22 bytes>'`, refused on restore with Msg 24114), where other
+/// blobs are withheld as `NULL`, which a `NOT NULL` column refuses as well.
+/// Read as `0x` and hex instead, every one of them restores exactly — T-SQL
+/// converts the bytes back to the CLR type, SRID, Z and M included (measured
+/// on 2022). A `sql_variant` arrived as its value's text, so a `date` or
+/// `decimal` variant restored as an `nvarchar` one and compared differently;
+/// read as its base type and its value as text, it is written back as
+/// `CAST(… AS <base type>)`. The text forms are the exact, language-proof
+/// ones — `datetime` in the `T` form, a float with 17 digits (`CONVERT` style
+/// 3), money with 4, and every other date and time type through its own type:
+/// a variant's own text of one is style 0, `Jan  2 2026  3:04AM`, which drops
+/// the seconds (measured).
+///
+/// Every other engine reads its columns as they are: a blob there stays
+/// withheld and noted, as the export's own rule has it.
+pub fn literal_select(
+    c: &crate::schema::ColumnInfo,
+    dialect: SqlDialect,
+) -> Option<(String, crate::export::ServerLiteral)> {
+    match dialect {
+        SqlDialect::MsSql => {}
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => return None,
+    }
+    let col = ident_sql(&c.name, dialect);
+    let head = c
+        .type_name
+        .split(|ch: char| ch == '(' || ch.is_whitespace())
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match head.as_str() {
+        "binary" | "varbinary" | "image" | "hierarchyid" | "geography" | "geometry" => Some((
+            format!(
+                "CASE WHEN {col} IS NULL THEN NULL ELSE '0x' + \
+                 CONVERT(varchar(max), CAST({col} AS varbinary(max)), 2) END AS {col}"
+            ),
+            crate::export::ServerLiteral::Hex,
+        )),
+        "sql_variant" => {
+            let prop = |p: &str| format!("SQL_VARIANT_PROPERTY({col}, '{p}')");
+            let base = format!("CAST({} AS sysname)", prop("BaseType"));
+            let int = |p: &str| format!("CAST({} AS int)", prop(p));
+            Some((
+                format!(
+                    "CASE WHEN {col} IS NULL THEN NULL ELSE CONCAT(\
+                     {base}, \
+                     CASE WHEN {base} IN (N'decimal', N'numeric') \
+                          THEN CONCAT(N'(', {precision}, N',', {scale}, N')') \
+                          WHEN {base} IN (N'datetime2', N'time', N'datetimeoffset') \
+                          THEN CONCAT(N'(', {scale}, N')') \
+                          WHEN {base} IN (N'char', N'varchar', N'binary', N'varbinary') \
+                          THEN CONCAT(N'(', {len}, N')') \
+                          WHEN {base} IN (N'nchar', N'nvarchar') \
+                          THEN CONCAT(N'(', {len} / 2, N')') \
+                          ELSE N'' END, \
+                     CASE WHEN {base} IN (N'char', N'varchar', N'nchar', N'nvarchar') \
+                          THEN CONCAT(N' COLLATE ', CAST({collation} AS nvarchar(128))) \
+                          ELSE N'' END, \
+                     N'|', \
+                     CASE WHEN {base} IN (N'binary', N'varbinary') \
+                          THEN '0x' + CONVERT(varchar(max), CAST({col} AS varbinary(8000)), 2) \
+                          WHEN {base} IN (N'float', N'real') \
+                          THEN CONVERT(nvarchar(64), CAST({col} AS float), 3) \
+                          WHEN {base} IN (N'datetime', N'smalldatetime') \
+                          THEN CONVERT(nvarchar(64), CAST({col} AS datetime), 126) \
+                          WHEN {base} IN (N'money', N'smallmoney') \
+                          THEN CONVERT(nvarchar(64), CAST({col} AS money), 2) \
+                          WHEN {base} = N'date' \
+                          THEN CONVERT(nvarchar(64), CAST({col} AS date), 23) \
+                          WHEN {base} = N'time' \
+                          THEN CAST(CAST({col} AS time(7)) AS nvarchar(64)) \
+                          WHEN {base} = N'datetime2' \
+                          THEN CAST(CAST({col} AS datetime2(7)) AS nvarchar(64)) \
+                          WHEN {base} = N'datetimeoffset' \
+                          THEN CAST(CAST({col} AS datetimeoffset(7)) AS nvarchar(64)) \
+                          ELSE CAST({col} AS nvarchar(4000)) END) END AS {col}",
+                    precision = int("Precision"),
+                    scale = int("Scale"),
+                    len = int("MaxLength"),
+                    collation = prop("Collation"),
+                ),
+                crate::export::ServerLiteral::Variant,
+            ))
+        }
+        _ => None,
+    }
 }
 
 /// The session switch that turns foreign-key enforcement off and back on, when
@@ -1844,6 +1947,14 @@ pub fn plan(
             if let Some((on, _)) = &identity {
                 text!(on.clone());
             }
+            // What a text cell cannot carry, read as SQL the server renders.
+            let read_as: Vec<(&str, (String, crate::export::ServerLiteral))> = cols
+                .iter()
+                .filter_map(|&name| {
+                    let c = t.columns.iter().find(|c| c.name == name)?;
+                    Some((name, literal_select(c, dialect)?))
+                })
+                .collect();
             steps.push(DumpStep::Rows {
                 database: database.to_string(),
                 // Whatever `target_database_sql` wrote is what the `INSERT`s
@@ -1858,9 +1969,19 @@ pub fn plan(
                 table: t.name.clone(),
                 select: format!(
                     "SELECT {} FROM {}",
-                    cols.iter().map(|c| q(c)).collect::<Vec<_>>().join(", "),
+                    cols.iter()
+                        .map(|c| read_as
+                            .iter()
+                            .find(|(n, _)| n == c)
+                            .map_or_else(|| q(c), |(_, (expr, _))| expr.clone()))
+                        .collect::<Vec<_>>()
+                        .join(", "),
                     qualified_table(database, t.schema.as_deref(), &t.name, dialect)
                 ),
+                server: read_as
+                    .iter()
+                    .map(|(n, (_, form))| (n.to_string(), *form))
+                    .collect(),
             });
             if let Some((_, off)) = identity {
                 text!(off);
@@ -3853,6 +3974,7 @@ mod tests {
                 &mut out,
                 &mut crate::export::OneChunk::new(&rs, &order),
                 ("shop", Some("dbo"), "t"),
+                &[],
                 d,
             )
             .unwrap();
@@ -3877,6 +3999,175 @@ mod tests {
         let sql = render(SqlDialect::MySql);
         assert!(!sql.contains("GO"), "{sql}");
         assert_eq!(sql.matches("INSERT INTO").count(), 3);
+    }
+
+    /// **A SQL Server dump carries what a text cell cannot**: bytes — a
+    /// `varbinary`, an `image`, and the CLR types `hierarchyid`, `geography`
+    /// and `geometry`, whose serialisation keeps a geography's SRID and a
+    /// geometry's Z and M — and a `sql_variant`'s base type. The grid's cell
+    /// holds a `<n bytes>` placeholder for the first, which went into the file
+    /// as `N'<22 bytes>'` (Msg 24114 on restore), and plain text for the second,
+    /// so a `date` variant came back an `nvarchar` one. The dump's `SELECT` asks
+    /// the server for each as SQL text instead.
+    #[test]
+    fn a_sql_server_dump_reads_bytes_and_variants_as_literals() {
+        let mut t = table("t");
+        t.schema = Some("dbo".to_string());
+        for (name, ty) in [
+            ("h", "hierarchyid"),
+            ("g", "geography"),
+            ("i", "image"),
+            ("b", "varbinary(max)"),
+            ("v", "sql_variant"),
+            ("s", "nvarchar(10)"),
+        ] {
+            t.columns.push(ColumnInfo {
+                name: name.to_string(),
+                type_name: ty.to_string(),
+                nullable: true,
+                ..Default::default()
+            });
+        }
+        let s = schema_of(vec![t]);
+        let p = plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::MsSql,
+        );
+        let (select, server) = p
+            .steps
+            .iter()
+            .find_map(|s| match s {
+                DumpStep::Rows { select, server, .. } => Some((select.clone(), server.clone())),
+                _ => None,
+            })
+            .expect("a rows step");
+        for c in ["h", "g", "i", "b"] {
+            assert!(
+                select.contains(&format!(
+                    "CASE WHEN [{c}] IS NULL THEN NULL ELSE '0x' + \
+                     CONVERT(varchar(max), CAST([{c}] AS varbinary(max)), 2) END AS [{c}]"
+                )),
+                "{select}"
+            );
+        }
+        assert!(
+            select.contains("SQL_VARIANT_PROPERTY([v], 'BaseType')"),
+            "{select}"
+        );
+        assert!(
+            select.contains("[id], ") && select.contains(", [s] FROM"),
+            "{select}"
+        );
+        use crate::export::ServerLiteral::{Hex, Variant};
+        assert_eq!(
+            server,
+            vec![
+                ("h".to_string(), Hex),
+                ("g".to_string(), Hex),
+                ("i".to_string(), Hex),
+                ("b".to_string(), Hex),
+                ("v".to_string(), Variant),
+            ]
+        );
+        // Nothing of the kind on the other engines: their bytes stay withheld.
+        let mut t = table("t");
+        t.columns.push(ColumnInfo {
+            name: "b".to_string(),
+            type_name: "varbinary(10)".to_string(),
+            ..Default::default()
+        });
+        let s = schema_of(vec![t]);
+        let p = plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::MySql,
+        );
+        assert_eq!(select_of(&p, "t"), "SELECT `id`, `b` FROM `shop`.`t`");
+    }
+
+    /// **The server's text is checked before it is written as SQL.** Bytes
+    /// must be `0x` and hex digits and are written bare; a variant is its base
+    /// type — checked against the shape a type name has — and its value, which
+    /// goes through the one literal quoter. Anything else is `NULL`, and named
+    /// as withheld: a value a server supplies never reaches the file unquoted.
+    #[test]
+    fn server_rendered_literals_are_checked_and_quoted() {
+        let text = |s: &str| crate::model::Value::Str(s.to_string());
+        let rs = crate::model::ResultSet::from_rows(
+            ["id", "b", "v"]
+                .iter()
+                .map(|n| crate::model::Column {
+                    name: n.to_string(),
+                    type_name: "nvarchar".to_string(),
+                    origin: None,
+                })
+                .collect(),
+            vec![
+                vec![
+                    crate::model::Value::Int(1),
+                    text("0x0102"),
+                    text("decimal(5,2)|12.50"),
+                ],
+                vec![
+                    crate::model::Value::Int(2),
+                    text("0x"),
+                    text("varbinary(2)|0x0A0B"),
+                ],
+                vec![
+                    crate::model::Value::Int(3),
+                    crate::model::Value::Null,
+                    text("nvarchar(5) COLLATE Latin1_General_CI_AS|it's"),
+                ],
+                vec![
+                    crate::model::Value::Int(4),
+                    text("0x01); DROP TABLE t; --"),
+                    text("int); DROP TABLE t; --|1"),
+                ],
+                vec![
+                    crate::model::Value::Int(5),
+                    text("0x0G"),
+                    crate::model::Value::Null,
+                ],
+            ],
+        );
+        let order: Vec<usize> = (0..5).collect();
+        let mut out = Vec::new();
+        let tally = render_rows(
+            &mut out,
+            &mut crate::export::OneChunk::new(&rs, &order),
+            ("shop", Some("dbo"), "t"),
+            &[
+                ("b".to_string(), crate::export::ServerLiteral::Hex),
+                ("v".to_string(), crate::export::ServerLiteral::Variant),
+            ],
+            SqlDialect::MsSql,
+        )
+        .unwrap();
+        let sql = String::from_utf8(out).unwrap();
+        assert!(
+            sql.contains("(1, 0x0102, CAST(CAST(N'12.50' AS decimal(5,2)) AS sql_variant))"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("(2, 0x, CAST(CAST(0x0A0B AS varbinary(2)) AS sql_variant))"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains(
+                "(3, NULL, CAST(CAST(N'it''s' AS nvarchar(5)) COLLATE Latin1_General_CI_AS \
+                 AS sql_variant))"
+            ),
+            "{sql}"
+        );
+        assert!(sql.contains("(4, NULL, NULL)"), "{sql}");
+        assert!(sql.contains("(5, NULL, NULL)"), "{sql}");
+        assert!(!sql.contains("DROP TABLE"), "{sql}");
+        assert_eq!(tally.withheld, vec!["b".to_string(), "v".to_string()]);
     }
 
     /// **A SQL Server dump says how its dates are written, before any of them.**

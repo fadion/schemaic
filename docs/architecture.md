@@ -134,7 +134,12 @@ existing prose was left alone.
     `from_utf8_lossy`'d the bytes into mojibake, PostgreSQL handed over the text protocol's `\x…` —
     and the mojibake was a data bug rather than a cosmetic one: it *looks* like data, so a CSV or
     `INSERT` export wrote the replacement characters as the value and re-imported as the wrong
-    bytes. SQLite's was the honest answer and is now everyone's.
+    bytes. SQLite's was the honest answer and is now everyone's. `type_is_binary` names SQL
+    Server's `image`, `hierarchyid`, `geography` and `udt` (the wire's name for any CLR type) too:
+    they arrive as bytes and so as the placeholder, and unlisted, an export wrote `N'<22 bytes>'` as
+    the value where every other blob is withheld and noted
+    (`type_is_binary_covers_sql_servers_byte_carried_types`). A dump does better than withholding
+    them — see `dump::literal_select`.
     **The placeholder is the whole of what the grid holds** — the bytes are dropped at the wire on
     every engine and never enter a `ResultSet`, which is a deliberate bound rather than an
     oversight: a 200k-row result with a `LONGBLOB` column would otherwise be the whole table in RAM
@@ -3206,6 +3211,27 @@ existing prose was left alone.
     rows were renumbered would be false (`a_sql_server_identity_is_carried_inside_identity_insert`,
     which asserts the switch brackets the rows, the identity is absent from the header and the word
     is too).
+    **On SQL Server the dump carries what a text cell cannot, by asking the server for SQL.** A
+    `varbinary`, `binary` or `image` cell is the `<n bytes>` placeholder, and so are the CLR types
+    `hierarchyid`, `geography` and `geometry`; a `sql_variant` arrives as its value's text, so a
+    `date` or `decimal` variant restored as an `nvarchar` one and compared differently.
+    `literal_select` gives the rows step's `SELECT` an expression for each such column instead —
+    `'0x' + CONVERT(varchar(max), CAST(c AS varbinary(max)), 2)`, which T-SQL converts back to the
+    CLR type on insert with the SRID, Z and M kept (measured; style 2 because style 1 renders empty
+    bytes, the hierarchy's root among them, as an empty string), and for a variant its base type
+    with length, precision, scale and collation beside its value in an exact, language-proof text
+    form (a variant's own text of a date is style 0, `Jan  2 2026  3:04AM`, which drops the
+    seconds) — and names it in `DumpStep::Rows::server` with its `export::ServerLiteral` form. The
+    renderer writes those cells from the server's text **only after checking it**: bytes must be
+    `0x` and hex digits, a variant's type must have a system type name's shape and its value goes
+    through `sql_literal`, written `CAST(CAST(… AS <type>) AS sql_variant)` (the outer cast because
+    a multi-row `VALUES` gives a column one type, and a `date` beside a `decimal` is Msg 206); a cell
+    that fails is `NULL` and its column is named as withheld. Every other engine keeps its blobs
+    withheld and noted
+    (`a_sql_server_dump_reads_bytes_and_variants_as_literals`,
+    `server_rendered_literals_are_checked_and_quoted`; the live round trip's `blobs` table carries
+    each of those types and a variant of every base type, and compares bytes, SRID and every
+    variant property on the copy).
     **On an engine whose scripts are cut into batches, every statement closes one.**
     `close_batches` runs over the finished plan wherever `SqlDialect::batch_separator` is true —
     SQL Server — and ends each `Text` step that is more than comments with a `GO` line, unless its

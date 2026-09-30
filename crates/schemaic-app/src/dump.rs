@@ -62,6 +62,8 @@ enum Msg {
     Table {
         source: (String, Option<String>, String),
         rows: tokio::sync::mpsc::Receiver<ExportChunk>,
+        /// The step's server-rendered columns — `DumpStep::Rows::server`.
+        server: Vec<(String, schemaic_core::export::ServerLiteral)>,
     },
 }
 
@@ -151,6 +153,7 @@ pub(crate) async fn run(
                 schema,
                 table,
                 select,
+                server,
             } => {
                 index += 1;
                 // Best-effort: a full progress channel must never hold up a dump.
@@ -170,6 +173,7 @@ pub(crate) async fn run(
                         // `database`, the `INSERT`s name `insert_database`.
                         source: (insert_database, schema.clone(), table.clone()),
                         rows: row_rx,
+                        server,
                     })
                     .await
                     .is_err()
@@ -602,6 +606,7 @@ fn write(
             Msg::Table {
                 source,
                 rows: mut rows_rx,
+                server,
             } => {
                 let mut src = PullChunks::new(move || match rows_rx.blocking_recv() {
                     None => Ok(None),
@@ -611,11 +616,13 @@ fn write(
                     Some(Err(e)) => Err(std::io::Error::other(e)),
                 });
                 // Through the dump's own row renderer, which closes a SQL
-                // Server batch after every `INSERT` — `core::dump::render_rows`.
+                // Server batch after every `INSERT` and writes the columns the
+                // server rendered as SQL — `core::dump::render_rows`.
                 let tally = schemaic_core::dump::render_rows(
                     &mut w,
                     &mut src,
                     (source.0.as_str(), source.1.as_deref(), source.2.as_str()),
+                    &server,
                     dialect,
                 )
                 .map_err(|e| format!("Export failed: {e}"))?;

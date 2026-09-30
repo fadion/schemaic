@@ -2723,22 +2723,97 @@ pub fn export_inserts_chunks<W: Write>(
     source: Option<(&str, Option<&str>, &str)>,
     dialect: SqlDialect,
 ) -> io::Result<ExportTally> {
-    export_inserts_ending(w, src, source, dialect, ";\n")
+    export_inserts_ending(w, src, source, dialect, ";\n", &[])
+}
+
+/// How a column's cells were rendered as SQL **by the server**, for a column a
+/// text cell cannot carry — what a dump's `SELECT` asks SQL Server for
+/// (`dump::literal_select`).
+///
+/// **Checked before it is written, never trusted.** Every other value in the
+/// file goes through [`sql_literal`]; these are the one place the server's own
+/// text becomes SQL, so each form is validated to the shape it must have and
+/// a cell that fails is written `NULL` and named as withheld.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServerLiteral {
+    /// `0x` and hex digits — a `varbinary`, an `image`, or a CLR type's
+    /// serialisation, which T-SQL converts back on insert. Written bare.
+    Hex,
+    /// `<base type>|<value as text>` — a `sql_variant`, written
+    /// `CAST(CAST(<value> AS <base type>) AS sql_variant)` so the restored
+    /// variant keeps its base type; the base type may end ` COLLATE <name>`
+    /// for a character one.
+    Variant,
+}
+
+/// The literal a server-rendered cell becomes, or `None` when the text is not
+/// the shape its [`ServerLiteral`] form promises.
+fn server_literal(form: ServerLiteral, text: &str) -> Option<String> {
+    let hex = |s: &str| {
+        s.strip_prefix("0x")
+            .is_some_and(|h| h.bytes().all(|b| b.is_ascii_hexdigit()))
+    };
+    match form {
+        ServerLiteral::Hex => hex(text).then(|| text.to_string()),
+        ServerLiteral::Variant => {
+            let (ty, value) = text.split_once('|')?;
+            let (base, collation) = match ty.split_once(" COLLATE ") {
+                Some((b, c)) => (b, Some(c)),
+                None => (ty, None),
+            };
+            // A system type name with its length, precision or scale — and a
+            // collation is a bare name. Nothing else can reach the file here.
+            let (name, params) = match base.split_once('(') {
+                Some((n, rest)) => (n, Some(rest.strip_suffix(')')?)),
+                None => (base, None),
+            };
+            let word = |s: &str, ok: fn(u8) -> bool| !s.is_empty() && s.bytes().all(ok);
+            if !word(name, |b| b.is_ascii_lowercase() || b.is_ascii_digit())
+                || params.is_some_and(|p| {
+                    !p.split(',').all(|n| word(n, |b| b.is_ascii_digit()))
+                        || p.split(',').count() > 2
+                })
+                || collation.is_some_and(|c| !word(c, |b| b.is_ascii_alphanumeric() || b == b'_'))
+            {
+                return None;
+            }
+            let lit = if matches!(name, "binary" | "varbinary") {
+                hex(value).then(|| value.to_string())?
+            } else {
+                sql_literal(&Value::Str(value.to_string()), SqlDialect::MsSql)
+            };
+            // Wrapped in `sql_variant` itself as well: a multi-row `VALUES`
+            // gives each column one type across its rows, and a `date` beside
+            // a `decimal` is Msg 206 — as variants they are one type, and each
+            // keeps its base.
+            Some(match collation {
+                Some(c) => format!("CAST(CAST({lit} AS {base}) COLLATE {c} AS sql_variant)"),
+                None => format!("CAST(CAST({lit} AS {base}) AS sql_variant)"),
+            })
+        }
+    }
 }
 
 /// [`export_inserts_chunks`], closing each statement with `end` rather than
 /// `;\n` — what a dump uses to put a SQL Server batch separator after every
 /// `INSERT` (`dump::render_rows`), so no batch outgrows the server's limit
-/// however large the table.
+/// however large the table — and writing the columns named in `server` from
+/// the SQL the server rendered them as ([`ServerLiteral`]).
 pub fn export_inserts_ending<W: Write>(
     w: &mut W,
     src: &mut dyn RowChunks,
     source: Option<(&str, Option<&str>, &str)>,
     dialect: SqlDialect,
     end: &str,
+    server: &[(String, ServerLiteral)],
 ) -> io::Result<ExportTally> {
     let q = |s: &str| ident_sql(s, dialect);
     let close_batch = |w: &mut W, open_rows: &mut usize| close_batch(w, open_rows, end);
+    // Per column, the server's form, if it rendered it; set at the first
+    // chunk, beside the column list.
+    let mut forms: Vec<Option<ServerLiteral>> = Vec::new();
+    // Columns a server-rendered cell of which failed its check.
+    let mut refused: Vec<String> = Vec::new();
     let table_sql = match source {
         Some((db, ns, table)) => qualified_table(db, ns, table, dialect),
         None => q("table"),
@@ -2759,6 +2834,11 @@ pub fn export_inserts_ending<W: Write>(
                     .collect::<Vec<_>>()
                     .join(", ");
             noted = vec![false; c.rs.columns.len()];
+            forms =
+                c.rs.columns
+                    .iter()
+                    .map(|col| server.iter().find(|(n, _)| *n == col.name).map(|(_, f)| *f))
+                    .collect();
             first = false;
         }
         let dropped = dropped_binary_columns(c.rs, c.order);
@@ -2805,16 +2885,27 @@ pub fn export_inserts_ending<W: Write>(
                 if ci > 0 {
                     tuple.push_str(", ");
                 }
-                let lit =
-                    c.rs.cell(di, ci)
-                        .map(|cell| {
-                            if withheld_binary(&mask, ci, &cell) {
-                                "NULL".to_string()
-                            } else {
-                                sql_literal(&cell.to_value(), dialect)
+                let lit = c.rs.cell(di, ci).map(|cell| {
+                    let value = cell.to_value();
+                    match forms.get(ci).copied().flatten() {
+                        // The server's SQL, once it has passed its check.
+                        Some(_) if value.is_null() => "NULL".to_string(),
+                        Some(form) => match &value {
+                            Value::Str(s) => server_literal(form, s),
+                            _ => None,
+                        }
+                        .unwrap_or_else(|| {
+                            let name = &c.rs.columns[ci].name;
+                            if !refused.contains(name) {
+                                refused.push(name.clone());
                             }
-                        })
-                        .unwrap_or_else(|| "NULL".to_string());
+                            "NULL".to_string()
+                        }),
+                        None if withheld_binary(&mask, ci, &cell) => "NULL".to_string(),
+                        None => sql_literal(&value, dialect),
+                    }
+                });
+                let lit = lit.unwrap_or_else(|| "NULL".to_string());
                 tuple.push_str(&lit);
             }
             tuple.push(')');
@@ -2842,6 +2933,13 @@ pub fn export_inserts_ending<W: Write>(
         }
     }
     close_batch(w, &mut open_rows)?;
+    // A server-rendered cell that failed its check was written `NULL`; the
+    // column is named as withheld, the way a blob's is.
+    for name in refused {
+        if !tally.withheld.contains(&name) {
+            tally.withheld.push(name);
+        }
+    }
     Ok(tally)
 }
 

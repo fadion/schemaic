@@ -276,6 +276,13 @@ const BINARY_TYPES: &[&str] = &[
     "LONGBLOB",
     "BYTEA",
     "GEOMETRY",
+    // SQL Server's other byte-carried types: its legacy blob, and the CLR
+    // types it sends as their serialisation (`udt` is the wire's name for any
+    // of them). Unlisted, their `<n bytes>` placeholder was written as data.
+    "IMAGE",
+    "HIERARCHYID",
+    "GEOGRAPHY",
+    "UDT",
 ];
 
 /// Does this type name name a **bit-field** — MySQL's `BIT(M)`, PostgreSQL's
@@ -2327,6 +2334,18 @@ mod tests {
             "BYTEA",
             "GEOMETRY",
         ] {
+            assert!(type_is_binary(t), "{t} should be binary");
+        }
+    }
+
+    /// **SQL Server's other byte-carried types.** Its `image`, `hierarchyid`,
+    /// `geography` and any CLR type (`udt` on the wire) arrive as bytes and so
+    /// as the `<n bytes>` placeholder; unlisted, an export wrote that text as the
+    /// value — `N'<22 bytes>'` in a dump, which the restore refused (Msg 24114)
+    /// — where every other blob is withheld as `NULL` and noted.
+    #[test]
+    fn type_is_binary_covers_sql_servers_byte_carried_types() {
+        for t in ["image", "hierarchyid", "geography", "geometry", "udt"] {
             assert!(type_is_binary(t), "{t} should be binary");
         }
     }

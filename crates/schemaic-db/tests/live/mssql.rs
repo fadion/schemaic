@@ -617,6 +617,7 @@ async fn dump_file(src: &Scratch, opts: schemaic_core::dump::DumpOptions) -> Str
                 schema,
                 table,
                 select,
+                server,
             } => {
                 let rs = Box::pin(src.db.fetch_query(
                     Some(&database),
@@ -633,6 +634,7 @@ async fn dump_file(src: &Scratch, opts: schemaic_core::dump::DumpOptions) -> Str
                     &mut out,
                     &mut schemaic_core::export::OneChunk::new(&rs, &order),
                     (&insert_database, schema.as_deref(), &table),
+                    &server,
                     MS,
                 )
                 .unwrap();
@@ -748,6 +750,37 @@ async fn a_dump_restores_into_an_empty_database() {
     .await;
     src.exec("CREATE VIEW dbo.v_double AS SELECT dbo.f_double(id) AS d FROM dbo.customers")
         .await;
+    // What a text cell cannot carry: bytes (the CLR types among them, a
+    // geography off the default SRID and a geometry with Z and M, the
+    // hierarchy's root and an empty value, whose serialisations are empty)
+    // and a variant of each base type, which must come back as that type.
+    src.exec(
+        "CREATE TABLE dbo.blobs (id int PRIMARY KEY, h hierarchyid NOT NULL, g geography, \
+           gm geometry, i image, b varbinary(max), e varbinary(10) NOT NULL, v sql_variant); \
+         INSERT dbo.blobs VALUES (1, '/1/2/', \
+           geography::STGeomFromText('POINT(-122.34 47.65)', 4269), \
+           geometry::STGeomFromText('LINESTRING(0 0 1 2, 1 1 3 4)', 27700), 0x0102, 0xDEADBEEF, 0x, \
+           CAST('2026-01-02' AS date)); \
+         INSERT dbo.blobs (id, h, e, v) VALUES (2, '/', 0x01, CAST(12.50 AS decimal(5,2))); \
+         INSERT dbo.blobs (id, h, e, v) VALUES (3, '/3/', 0x02, \
+           CAST('2026-01-02T03:04:05.677' AS datetime)); \
+         INSERT dbo.blobs (id, h, e, v) VALUES (4, '/4/', 0x03, N'it''s é'); \
+         INSERT dbo.blobs (id, h, e, v) VALUES (5, '/5/', 0x04, CAST(0x0A0B AS varbinary(4))); \
+         INSERT dbo.blobs (id, h, e, v) VALUES (6, '/6/', 0x05, CAST(1e300 AS float)); \
+         INSERT dbo.blobs (id, h, e, v) VALUES (7, '/7/', 0x06, CAST(12.3456 AS money)); \
+         INSERT dbo.blobs (id, h, e, v) VALUES (8, '/8/', 0x07, CAST('03:04:05.678' AS time(3))); \
+         INSERT dbo.blobs (id, h, e, v) VALUES (9, '/9/', 0x08, \
+           CAST('2026-01-02 03:04:05.1234567 +02:00' AS datetimeoffset(7))); \
+         INSERT dbo.blobs (id, h, e, v) VALUES (10, '/10/', 0x09, CAST(1 AS bit)); \
+         INSERT dbo.blobs (id, h, e, v) VALUES (11, '/11/', 0x0A, CAST(0.1 AS real)); \
+         INSERT dbo.blobs (id, h, e, v) VALUES (12, '/12/', 0x0B, \
+           CAST('ab' AS char(4)) COLLATE Latin1_General_CS_AS); \
+         INSERT dbo.blobs (id, h, e, v) VALUES (13, '/13/', 0x0C, \
+           CAST('6F9619FF-8B86-D011-B42D-00C04FC964FF' AS uniqueidentifier)); \
+         INSERT dbo.blobs (id, h, e, v) VALUES (14, '/14/', 0x0D, 42); \
+         INSERT dbo.blobs (id, h, e, v) VALUES (15, '/15/', 0x0E, NULL);",
+    )
+    .await;
     // More rows than one `INSERT` carries, so the table's rows are several
     // statements — each closing its own `GO` batch.
     src.exec(
@@ -815,6 +848,32 @@ async fn a_dump_restores_into_an_empty_database() {
         UNION ALL SELECT CONCAT('f_double|', dbo.f_double(21)) \
         UNION ALL SELECT CONCAT('calc|', id, '|', dbl, '|', n) FROM dbo.calc \
         UNION ALL SELECT CONCAT('many|', COUNT(*), '|', SUM(id)) FROM dbo.many \
+        UNION ALL SELECT CONCAT('blobs|', id, '|', h.ToString(), '|', \
+               CONVERT(varchar(max), CAST(h AS varbinary(max)), 1), '|', \
+               CONVERT(varchar(max), CAST(g AS varbinary(max)), 1), '|', g.STSrid, '|', \
+               CONVERT(varchar(max), CAST(gm AS varbinary(max)), 1), '|', \
+               CONVERT(varchar(max), CAST(i AS varbinary(max)), 1), '|', \
+               CONVERT(varchar(max), b, 1), '|', DATALENGTH(e), CONVERT(varchar(max), e, 1), '|', \
+               CAST(SQL_VARIANT_PROPERTY(v, 'BaseType') AS sysname), '|', \
+               CAST(SQL_VARIANT_PROPERTY(v, 'Precision') AS int), '|', \
+               CAST(SQL_VARIANT_PROPERTY(v, 'Scale') AS int), '|', \
+               CAST(SQL_VARIANT_PROPERTY(v, 'MaxLength') AS int), '|', \
+               CAST(SQL_VARIANT_PROPERTY(v, 'Collation') AS sysname), '|', \
+               CASE WHEN CAST(SQL_VARIANT_PROPERTY(v, 'BaseType') AS sysname) IN ('float', 'real') \
+                    THEN CONVERT(nvarchar(64), CAST(v AS float), 3) \
+                    WHEN CAST(SQL_VARIANT_PROPERTY(v, 'BaseType') AS sysname) = 'datetime' \
+                    THEN CONVERT(nvarchar(64), CAST(v AS datetime), 126) \
+                    WHEN CAST(SQL_VARIANT_PROPERTY(v, 'BaseType') AS sysname) = 'money' \
+                    THEN CONVERT(nvarchar(64), CAST(v AS money), 2) \
+                    WHEN CAST(SQL_VARIANT_PROPERTY(v, 'BaseType') AS sysname) = 'varbinary' \
+                    THEN CONVERT(nvarchar(64), CAST(v AS varbinary(10)), 1) \
+                    WHEN CAST(SQL_VARIANT_PROPERTY(v, 'BaseType') AS sysname) = 'date' \
+                    THEN CONVERT(nvarchar(64), CAST(v AS date), 23) \
+                    WHEN CAST(SQL_VARIANT_PROPERTY(v, 'BaseType') AS sysname) = 'time' \
+                    THEN CAST(CAST(v AS time(7)) AS nvarchar(64)) \
+                    WHEN CAST(SQL_VARIANT_PROPERTY(v, 'BaseType') AS sysname) = 'datetimeoffset' \
+                    THEN CAST(CAST(v AS datetimeoffset(7)) AS nvarchar(64)) \
+                    ELSE CAST(v AS nvarchar(4000)) END) FROM dbo.blobs \
         UNION ALL SELECT CONCAT('v_double|', SUM(d)) FROM dbo.v_double \
       ) x";
     let (want, got) = (src.scalar(facts).await, dst.scalar(facts).await);
@@ -836,6 +895,23 @@ async fn a_dump_restores_into_an_empty_database() {
         "calc|2|4|8",
         "v_double|8",
         "many|600|180300",
+        // The geography off its default SRID, and the geometry's Z and M.
+        "blobs|1|/1/2/|0x5B40|0xAD100000010C",
+        "|4269|0x346C00000117",
+        "|0x0102|0xDEADBEEF|00x|date|10|0|3||2026-01-02",
+        // The hierarchy's root, whose serialisation is empty.
+        "blobs|2|/|||||||10x01|decimal|5|2|5||12.50",
+        "|datetime|23|3|8||2026-01-02T03:04:05.677",
+        "|nvarchar|0|0|8000|SQL_Latin1_General_CP1_CI_AS|it's é",
+        "|varbinary|0|0|4||0x0A0B",
+        "|float|53|0|8||1.0000000000000001e+300",
+        "|money|19|4|8||12.3456",
+        "|time|12|3|4||03:04:05.6780000",
+        "|datetimeoffset|34|7|10||2026-01-02 03:04:05.1234567 +02:00",
+        "|real|24|0|4||1.0000000149011612e-001",
+        "|char|0|0|4|Latin1_General_CS_AS|ab  ",
+        "|uniqueidentifier|0|0|16||6F9619FF-8B86-D011-B42D-00C04FC964FF",
+        "blobs|15|/15/|0xBE||||||10x0E||||||",
     ] {
         assert!(want.contains(fact), "{fact} in {want}");
     }
