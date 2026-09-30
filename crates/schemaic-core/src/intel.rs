@@ -5174,56 +5174,232 @@ pub fn diagnostics(sql: &str, catalog: &Catalog, dialect: SqlDialect) -> Vec<Dia
     let last = ranges.len().saturating_sub(1);
     let mut out: Vec<Diagnostic> = Vec::new();
     for (idx, &(lo, hi)) in ranges.iter().enumerate() {
-        let stmt = &sql[lo..hi];
         let terminated = sql.as_bytes().get(hi - 1) == Some(&b';');
         let is_typing_tail = idx == last && !terminated;
-        match sqlparser::parser::Parser::parse_sql(&*dialect.parser(), stmt) {
-            Ok(asts) => {
-                table_existence_checks(sql, lo, hi, catalog, dialect, &asts, &mut out);
-                match asts.as_slice() {
-                    // A single SELECT/query → per-scope column resolution (aware of
-                    // subqueries / derived tables / CTEs; qualified + unqualified).
-                    [ast @ sqlparser::ast::Statement::Query(_)] => {
-                        colres::check(sql, lo, hi, catalog, dialect, ast, &mut out)
-                    }
-                    // Other statements (UPDATE/DELETE/…) → the flat qualified scan.
-                    _ => qualified_column_checks(sql, lo, hi, catalog, dialect, &mut out),
-                }
-            }
-            Err(e) => {
-                // Don't nag about the fragment the user is still typing, nor
-                // about a statement or clause the parser has no grammar for —
-                // see `parser_lacks_statement` and `parser_lacks_clause_at`.
-                let toks = (!is_typing_tail).then(|| tokenize_range(sql, lo, hi, dialect));
-                if let Some(toks) = toks
-                    && !parser_lacks_statement(&toks, dialect)
-                {
-                    let (loc, msg) = split_error_location(&e.to_string());
-                    let range = match loc {
-                        Some((line, col)) => {
-                            let at = lo + offset_of_line_col(stmt, line, col);
-                            word_range_at(sql, at)
-                        }
-                        None => (lo, hi),
-                    };
-                    if !(loc.is_some() && parser_lacks_clause_at(&toks, range.0, dialect)) {
-                        out.push(Diagnostic {
-                            range,
-                            severity: Severity::Error,
-                            message: friendly_syntax_message(&msg),
-                        });
-                    }
-                }
-            }
-        }
+        statement_diagnostics(sql, lo, hi, is_typing_tail, catalog, dialect, &mut out);
         typo_checks(sql, lo, hi, catalog, dialect, &mut out);
         function_typo_checks(sql, lo, hi, catalog, dialect, &mut out);
-        // Reserved-keyword aliases (`orders AS or`, `orders or`) run unconditionally:
-        // sqlparser is laxer than MySQL here (it *accepts* `AS or`), so gating on a
-        // parse failure would miss the very case we want to flag.
-        alias_checks(sql, lo, hi, dialect, &mut out);
     }
     dedup_diagnostics(out)
+}
+
+/// The parse-driven checks for one statement, `sql[lo..hi]`: its syntax error
+/// (withheld on the fragment still being typed, `is_typing_tail`, and on a
+/// statement the parser has no grammar for — [`parser_lacks_statement`]); on a
+/// clean parse the table and column checks; and, unconditionally, the
+/// reserved-alias check.
+///
+/// **A clause the parser lacks is read past, not given up at.** Where
+/// [`grammar_gap_masks`] finds one — T-SQL's `OPTION (…)`, `WITH ROLLUP`,
+/// `GROUPING SETS (…)` — the statement is parsed with it overwritten by
+/// blanks, byte for byte, so every offset still lands where it did. The
+/// statement's only parse error used to be withheld when it landed on such a
+/// clause, and sqlparser stops at its first error, so a real error after the
+/// clause, and every check that needs a parse, went with it.
+fn statement_diagnostics(
+    sql: &str,
+    lo: usize,
+    hi: usize,
+    is_typing_tail: bool,
+    catalog: &Catalog,
+    dialect: SqlDialect,
+    out: &mut Vec<Diagnostic>,
+) {
+    let toks = tokenize_range(sql, lo, hi, dialect);
+    let masks = grammar_gap_masks(sql, &toks, dialect);
+    // The text the parser and the checks read. Masked or not, it is as long as
+    // the statement, so a position in it is a position in `sql` less `lo`.
+    let masked = (!masks.is_empty()).then(|| masked_text(sql, lo, hi, &masks));
+    let (text, base) = match &masked {
+        Some(m) => (m.as_str(), lo),
+        None => (sql, 0),
+    };
+    let (tlo, thi) = (lo - base, hi - base);
+    let mut found = Vec::new();
+    match sqlparser::parser::Parser::parse_sql(&*dialect.parser(), &text[tlo..thi]) {
+        Ok(asts) => {
+            table_existence_checks(text, tlo, thi, catalog, dialect, &asts, &mut found);
+            match asts.as_slice() {
+                // A single SELECT/query → per-scope column resolution (aware of
+                // subqueries / derived tables / CTEs; qualified + unqualified).
+                [ast @ sqlparser::ast::Statement::Query(_)] => {
+                    colres::check(text, tlo, thi, catalog, dialect, ast, &mut found)
+                }
+                // Other statements (UPDATE/DELETE/…) → the flat qualified scan.
+                _ => qualified_column_checks(text, tlo, thi, catalog, dialect, &mut found),
+            }
+        }
+        // Don't nag about the fragment the user is still typing, nor about a
+        // statement the parser has no grammar for.
+        Err(e) if !is_typing_tail && !parser_lacks_statement(&toks, dialect) => {
+            let (loc, msg) = split_error_location(&e.to_string());
+            let range = match loc {
+                Some((line, col)) => {
+                    let at = lo + offset_of_line_col(&text[tlo..thi], line, col);
+                    word_range_at(sql, at)
+                }
+                None => (lo, hi),
+            };
+            out.push(Diagnostic {
+                range,
+                severity: Severity::Error,
+                message: friendly_syntax_message(&msg),
+            });
+        }
+        Err(_) => {}
+    }
+    out.extend(found.into_iter().map(|mut d| {
+        d.range = (d.range.0 + base, d.range.1 + base);
+        d
+    }));
+    // Reserved-keyword aliases (`orders AS or`, `orders or`) run unconditionally:
+    // sqlparser is laxer than MySQL here (it *accepts* `AS or`), so gating on a
+    // parse failure would miss the very case we want to flag.
+    alias_checks(sql, lo, hi, dialect, out);
+}
+
+/// One stretch of a statement the parser has no grammar for — `from..to` in
+/// `sql` — to overwrite before parsing: `fill` at its start, blanks after.
+struct Mask {
+    from: usize,
+    to: usize,
+    fill: &'static str,
+}
+
+/// `sql[lo..hi]` with each mask overwritten: its `fill`, then a space for
+/// every remaining byte except a line break, so the text keeps its length and
+/// its lines — every byte offset, and every line a parse error names, stays
+/// where it was. A mask runs from a token's first byte to a token's last, so
+/// it replaces whole characters and the result is still UTF-8.
+fn masked_text(sql: &str, lo: usize, hi: usize, masks: &[Mask]) -> String {
+    let mut b = sql.as_bytes()[lo..hi].to_vec();
+    for m in masks {
+        let (from, to) = (m.from.max(lo) - lo, m.to.min(hi) - lo);
+        for c in &mut b[from..to] {
+            if !matches!(*c, b'\n' | b'\r') {
+                *c = b' ';
+            }
+        }
+        let fill = m.fill.as_bytes();
+        if from + fill.len() <= to {
+            b[from..from + fill.len()].copy_from_slice(fill);
+        }
+    }
+    String::from_utf8(b).unwrap_or_else(|_| sql[lo..hi].to_string())
+}
+
+/// The index of the `)` matching the `(` at `toks[open]`, if it closes in
+/// `toks`.
+fn matching_paren(toks: &[Token], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (j, t) in toks.iter().enumerate().skip(open) {
+        match t.kind {
+            TkKind::LParen => depth += 1,
+            TkKind::RParen => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(j);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The clauses in a statement that sqlparser's grammar for `dialect` lacks,
+/// as [`Mask`]s to read past rather than parse errors to report — see
+/// [`statement_diagnostics`]. Each is recognised where it really is one, so
+/// the same words anywhere else still reach the parser and still err.
+///
+/// T-SQL's, all run on SQL Server 2022 and 2025:
+/// - a query hint, `OPTION (RECOMPILE)`, at the top level;
+/// - `WITH ROLLUP` / `WITH CUBE` after a `GROUP BY` at the same depth — so
+///   `FROM t WITH CUBE`, which the server refuses (Msg 336), still errs;
+/// - `GROUPING SETS (…)`, which `MsSqlDialect` reads as a column `GROUPING`
+///   and stops at, filled with a literal so the `GROUP BY` stays a list (and
+///   so the grouping check, which bails on anything but a column, says
+///   nothing).
+fn grammar_gap_masks(sql: &str, toks: &[Token], dialect: SqlDialect) -> Vec<Mask> {
+    match dialect {
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => Vec::new(),
+        SqlDialect::MsSql => tsql_gap_masks(sql, toks),
+    }
+}
+
+/// [`grammar_gap_masks`]' T-SQL arm.
+fn tsql_gap_masks(_sql: &str, toks: &[Token]) -> Vec<Mask> {
+    let word = |j: usize| match toks.get(j) {
+        Some(Token {
+            kind: TkKind::Word(w),
+            quoted: false,
+            ..
+        }) => Some(w.to_ascii_uppercase()),
+        _ => None,
+    };
+    let lparen = |j: usize| matches!(toks.get(j).map(|t| &t.kind), Some(TkKind::LParen));
+    let mut out = Vec::new();
+    // Per open parenthesis: has this depth's query reached its `GROUP BY`?
+    let mut grouped: Vec<bool> = vec![false];
+    let mut i = 0;
+    while i < toks.len() {
+        match &toks[i].kind {
+            TkKind::LParen => grouped.push(false),
+            TkKind::RParen if grouped.len() > 1 => {
+                grouped.pop();
+            }
+            TkKind::Word(_) => match word(i).as_deref() {
+                Some("SELECT") => {
+                    if let Some(g) = grouped.last_mut() {
+                        *g = false;
+                    }
+                }
+                Some("GROUP") if word(i + 1).as_deref() == Some("BY") => {
+                    if let Some(g) = grouped.last_mut() {
+                        *g = true;
+                    }
+                }
+                Some("OPTION") if grouped.len() == 1 && lparen(i + 1) => {
+                    if let Some(close) = matching_paren(toks, i + 1) {
+                        out.push(Mask {
+                            from: toks[i].at,
+                            to: toks[close].end,
+                            fill: "",
+                        });
+                        i = close + 1;
+                        continue;
+                    }
+                }
+                Some("WITH")
+                    if grouped.last().copied().unwrap_or(false)
+                        && matches!(word(i + 1).as_deref(), Some("ROLLUP" | "CUBE")) =>
+                {
+                    out.push(Mask {
+                        from: toks[i].at,
+                        to: toks[i + 1].end,
+                        fill: "",
+                    });
+                    i += 2;
+                    continue;
+                }
+                Some("GROUPING") if word(i + 1).as_deref() == Some("SETS") && lparen(i + 2) => {
+                    if let Some(close) = matching_paren(toks, i + 2) {
+                        out.push(Mask {
+                            from: toks[i].at,
+                            to: toks[close].end,
+                            fill: "0",
+                        });
+                        i = close + 1;
+                        continue;
+                    }
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+        i += 1;
+    }
+    out
 }
 
 /// Keywords that legitimately follow `AS` without being an alias: a query/CTAS body
@@ -6059,6 +6235,11 @@ fn is_table_ref_continuation(word: &str) -> bool {
             | "FROM"
             | "PIVOT"
             | "UNPIVOT"
+            // A T-SQL query hint (`FROM t OPTION (RECOMPILE)`) and table
+            // sampling (`FROM t TABLESAMPLE (10 PERCENT)`); both reserved, so
+            // neither is ever an alias.
+            | "OPTION"
+            | "TABLESAMPLE"
     )
 }
 
@@ -6473,41 +6654,6 @@ fn parser_lacks_statement(toks: &[Token], dialect: SqlDialect) -> bool {
                 | ["CREATE", "CLUSTERED" | "NONCLUSTERED", ..]
                 | ["CREATE", "UNIQUE", "CLUSTERED" | "NONCLUSTERED", ..] => true,
                 _ => is_routine_statement(toks),
-            }
-        }
-    }
-}
-
-/// Does sqlparser's grammar for `dialect` lack the **clause** its parse error
-/// stopped on, at byte `at` — so that the error says nothing about the SQL?
-///
-/// [`parser_lacks_statement`]'s question asked of a position rather than a
-/// head, for T-SQL's grouping extensions inside an ordinary `SELECT`:
-/// `MsSqlDialect` leaves `supports_group_by_expr` off, so `GROUPING SETS (…)`
-/// reads `GROUPING` as a column and stops at `SETS`, and the older
-/// `GROUP BY a WITH ROLLUP` / `WITH CUBE` stop at `WITH`. All run on SQL
-/// Server 2022. Keyed on the token the error names, so an error anywhere else
-/// in the statement still reports. What the withheld error costs is the
-/// statement's AST checks — unknown tables and columns — which need a parse.
-fn parser_lacks_clause_at(toks: &[Token], at: usize, dialect: SqlDialect) -> bool {
-    match dialect {
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
-        SqlDialect::MsSql => {
-            let Some(i) = toks.iter().position(|t| t.at == at) else {
-                return false;
-            };
-            let word = |j: usize| match toks.get(j) {
-                Some(Token {
-                    kind: TkKind::Word(w),
-                    quoted: false,
-                    ..
-                }) => Some(w.to_ascii_uppercase()),
-                _ => None,
-            };
-            match word(i).as_deref() {
-                Some("SETS") => i > 0 && word(i - 1).as_deref() == Some("GROUPING"),
-                Some("WITH") => matches!(word(i + 1).as_deref(), Some("ROLLUP" | "CUBE")),
-                _ => false,
             }
         }
     }
@@ -13326,6 +13472,14 @@ mod tests {
             "SELECT id FROM employees WHERE id IN (SELECT value FROM OPENJSON(@j));",
             "SELECT value FROM GENERATE_SERIES(1, 5);",
             "SELECT e.id FROM employees e JOIN dbo.fn_rows(1) r ON r.id = e.id;",
+            // Query hints and table sampling (S8-L1-03).
+            "SELECT * FROM employees OPTION (RECOMPILE);",
+            "SELECT * FROM employees TABLESAMPLE (10 PERCENT);",
+            "SELECT * FROM employees TABLESAMPLE SYSTEM (10 PERCENT) REPEATABLE (5);",
+            "SELECT * FROM employees WHERE id = 1 OPTION (RECOMPILE);",
+            "SELECT id FROM employees GROUP BY id OPTION (MAXDOP 1, RECOMPILE);",
+            "SELECT id FROM employees GROUP BY id WITH ROLLUP HAVING COUNT(*) > 1 \
+             ORDER BY id OPTION (RECOMPILE);",
         ]
         .into_iter()
         .map(|sql| (sql, diag_d(sql, SqlDialect::MsSql)))
@@ -13580,8 +13734,9 @@ mod tests {
         .filter(|(_, d)| !d.is_empty())
         .collect::<Vec<_>>();
         assert!(squiggled.is_empty(), "{squiggled:#?}");
-        // Only an error *on* the construct is withheld: one elsewhere in the
-        // same statement still reports.
+        // Only the construct is read past: an error elsewhere in the same
+        // statement still reports (and see
+        // `a_clause_the_parser_lacks_hides_nothing_after_it`).
         assert!(
             diag_d(
                 "SELECT id FROM employees WHERE GROUP BY id WITH ROLLUP;",
@@ -13598,6 +13753,55 @@ mod tests {
             )
             .iter()
             .any(|x| x.message.starts_with("Syntax error"))
+        );
+    }
+
+    /// **A clause the parser lacks hides nothing after it** (S8-L1-10). The
+    /// statement's only parse error used to be withheld when it landed on
+    /// `WITH ROLLUP` or `GROUPING SETS`, and sqlparser stops at its first
+    /// error, so a real one after the construct, and the table and column
+    /// checks that need a parse, were lost with it; and `FROM t WITH CUBE`,
+    /// which SQL Server refuses (Msg 336), passed. The construct is read past
+    /// instead, where it really is one.
+    #[test]
+    fn a_clause_the_parser_lacks_hides_nothing_after_it() {
+        let syntax = |sql: &str| {
+            diag_d(sql, SqlDialect::MsSql)
+                .iter()
+                .any(|x| x.message.starts_with("Syntax error"))
+        };
+        // sqlparser takes `ORDER BY FROM` for a column named `from`; the server
+        // answers Msg 156. Either way it is an error, and it was reported as
+        // nothing at all.
+        let sql = "SELECT id FROM employees GROUP BY id WITH ROLLUP ORDER BY FROM;";
+        assert!(
+            diag_d(sql, SqlDialect::MsSql)
+                .iter()
+                .any(|x| x.severity == Severity::Error && &sql[x.range.0..x.range.1] == "FROM")
+        );
+        assert!(syntax(
+            "SELECT id FROM employees GROUP BY id WITH ROLLUP HAVING COUNT(*) >;"
+        ));
+        assert!(syntax(
+            "SELECT id FROM employees GROUP BY GROUPING SETS ((id)) HAVING COUNT(*) >;"
+        ));
+        assert!(syntax("SELECT id FROM employees OPTION (RECOMPILE) WHERE;"));
+        // `WITH CUBE` belongs after a `GROUP BY` and nowhere else.
+        assert!(!diag_d("SELECT * FROM employees WITH CUBE;", SqlDialect::MsSql).is_empty());
+        // The checks that need a parse are back.
+        let msgs = |sql: &str| -> Vec<String> {
+            diag_d(sql, SqlDialect::MsSql)
+                .into_iter()
+                .map(|x| x.message)
+                .collect()
+        };
+        assert_eq!(
+            msgs("SELECT id FROM nosuchtable GROUP BY id WITH ROLLUP;"),
+            ["Table `nosuchtable` not found"]
+        );
+        assert_eq!(
+            msgs("SELECT nope FROM employees WHERE id = 1 OPTION (RECOMPILE);"),
+            ["Column `nope` not found in `employees`"]
         );
     }
 

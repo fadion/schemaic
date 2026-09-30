@@ -777,7 +777,7 @@ existing prose was left alone.
     completion), and `diagnostics` → `Vec<Diagnostic>` (catalog-aware unknown-table, unknown-column via
     the per-scope resolver `colres` — qualified *and* unqualified, across subqueries/derived-tables/CTEs
     with correlation — reserved-keyword-alias errors, syntax errors on completed statements save
-    those sqlparser has no grammar for (`parser_lacks_statement` and `parser_lacks_clause_at`,
+    those sqlparser has no grammar for (`parser_lacks_statement` and `grammar_gap_masks`,
     below), and keyword-typo
     warnings). **AST for classification, `skip_noncode` for byte positions by default** —
     except `colres`, which uses sqlparser 0.62's now-accurate per-identifier *spans* (verified) so the
@@ -921,14 +921,19 @@ existing prose was left alone.
     `BEGIN … RETURN … END`, a procedure's bare `@x int` parameters, `WITH SCHEMABINDING` /
     `CALLED ON NULL INPUT` and a trigger's `WITH EXECUTE AS` (each ran clean on SQL Server 2022,
     per the function's doc). The server stays the authority for those, as for everything else;
-    the other three engines answer `false`. `parser_lacks_clause_at` asks the same of the error's
-    *position* rather than the head, for T-SQL grouping inside an ordinary `SELECT`: `MsSqlDialect`
-    leaves `supports_group_by_expr` off, so `GROUPING SETS (…)` stops at `SETS` and `GROUP BY a
-    WITH ROLLUP`/`WITH CUBE` at `WITH` (all ran on SQL Server 2022; `ROLLUP(…)`/`CUBE(…)` already
-    parse as calls). It withholds the error only when the token named is `SETS` after `GROUPING`
-    or `WITH` before `ROLLUP`/`CUBE`, so an error elsewhere still reports — and such a statement
-    loses its unknown-table and -column checks, which need a parse
-    (`t_sql_grouping_extensions_draw_no_syntax_error`). The routine statements broke the alias
+    the other three engines answer `false`. **A clause the grammar lacks inside an ordinary
+    statement is read past rather than given up at**: `grammar_gap_masks` finds T-SQL's query hint
+    `OPTION (…)` at the top level, `WITH ROLLUP`/`WITH CUBE` after a `GROUP BY` at the same depth,
+    and `GROUPING SETS (…)` (`MsSqlDialect` leaves `supports_group_by_expr` off, so that stopped at
+    `SETS`; all run on SQL Server 2022 and 2025), and `statement_diagnostics` parses the statement
+    with each overwritten — blanks, or a literal `0` where a `GROUP BY` item must remain — byte for
+    byte (`masked_text`), so every offset and line still lands where it did. The error used to be
+    *withheld* when it landed on such a clause, and sqlparser stops at its first error, so a real
+    one after it (`… WITH ROLLUP HAVING COUNT(*) >`) and every check that needs a parse went with
+    it, while `FROM t WITH CUBE` — Msg 336 on the server — passed because only the next word was
+    asked (`a_clause_the_parser_lacks_hides_nothing_after_it`,
+    `t_sql_grouping_extensions_draw_no_syntax_error`). `OPTION` and `TABLESAMPLE` also end a table
+    reference, since the alias check read `FROM t OPTION (RECOMPILE)` as a reserved alias. The routine statements broke the alias
     check a second way: a T-SQL header *ends* in a mandatory `AS` whose next word is the body's
     first statement, so `AS SET`, `AS BEGIN` and `AS RETURN` were reserved-alias errors. `routine_body_as` finds
     that `AS` — the first outside parentheses not preceded by `EXECUTE`/`EXEC` nor by a parameter
