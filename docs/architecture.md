@@ -6149,7 +6149,11 @@ existing prose was left alone.
     PostgreSQL `p.kind == PrincipalKind::User && !p.role_ambiguous`, a role taking no password on
     either, the same rule `account_draft_sql` applies to `CREATE`; on SQL Server a `Login`, or a
     `User` with a login to alter or a password of its own (`database_password`), where a role and a
-    user `WITHOUT LOGIN` have none. **It takes the whole `Principal` and not its
+    user `WITHOUT LOGIN` have none — and never an account Windows or Entra signs in
+    (`Principal::external_sign_in`, read off the catalogue's type: a login's `U`/`G`, a user's
+    `U`/`G`/`E`/`X`), where `ALTER LOGIN … WITH PASSWORD` is Msg 15080 (measured on 2022 against
+    the container's `BUILTIN\Administrators`, which the listing shows as an ordinary login;
+    `a_windows_login_or_its_user_is_offered_no_password_reset`). **It takes the whole `Principal` and not its
     `PrincipalKind`, because the kind cannot say "I don't know."** It asked only the kind for a
     release, which is how the `role_ambiguous` finding above got in, and its own rustdoc asserted the
     premise that made that look sound — that the engine *rejects* a password on a role outright,

@@ -4377,6 +4377,7 @@ async fn a_login_and_its_user_are_created_granted_reset_and_dropped() {
             role_ambiguous: false,
             login: None,
             database_password: false,
+            external_sign_in: false,
         },
         member: login.clone(),
         with_admin_option: false,

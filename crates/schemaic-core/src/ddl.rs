@@ -14880,6 +14880,7 @@ mod tests {
                         role_ambiguous: false,
                         login: None,
                         database_password: false,
+                        external_sign_in: false,
                     },
                     level: crate::users::GrantLevel::Global,
                     privileges: vec!["SELECT".into()],
@@ -29284,6 +29285,7 @@ mod database_tests {
             role_ambiguous: false,
             login: None,
             database_password: false,
+            external_sign_in: false,
         };
         let login = who("app", PrincipalKind::Login);
         let user = who("app_u", PrincipalKind::User);
@@ -29631,6 +29633,7 @@ mod database_tests {
                 role_ambiguous: false,
                 login: None,
                 database_password: false,
+                external_sign_in: false,
             },
             level: crate::users::GrantLevel::Global,
             privileges: vec!["VIEW SERVER STATE".into()],

@@ -1561,6 +1561,7 @@ mod form_shape_tests {
             role_ambiguous: false,
             login: None,
             database_password: false,
+            external_sign_in: false,
         }
     }
 
@@ -1852,6 +1853,7 @@ mod account_change_tests {
             role_ambiguous: false,
             login: None,
             database_password: false,
+            external_sign_in: false,
         }
     }
 
@@ -2011,6 +2013,7 @@ mod account_change_tests {
             role_ambiguous: false,
             login: None,
             database_password: false,
+            external_sign_in: false,
         });
         target.password_policy = Some(schemaic_core::users::PasswordPolicy {
             encryption: schemaic_core::users::PasswordEncryption::Md5,

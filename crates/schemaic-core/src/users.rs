@@ -171,6 +171,14 @@ pub struct Principal {
     /// password to reset (Msg 33234), and on every other engine.
     #[serde(default)]
     pub database_password: bool,
+    /// **SQL Server**: the account signs in through Windows or Microsoft
+    /// Entra, never with a password of this server's — a Windows login or
+    /// group (`sys.server_principals.type` `U`/`G`), or a database user of one
+    /// (`U`/`G`) or of Entra (`E`/`X`). `ALTER LOGIN … WITH PASSWORD` on it is
+    /// Msg 15080, so [`supports_password_reset`] does not offer one. `false`
+    /// for a SQL login and its users, and on every other engine.
+    #[serde(default)]
+    pub external_sign_in: bool,
 }
 
 impl Principal {
@@ -426,6 +434,7 @@ pub fn from_mysql_rows(rows: &[MyUserRow]) -> Vec<Principal> {
                 role_ambiguous: r.is_role.is_none() && my_role_fingerprint(r),
                 login: None,
                 database_password: false,
+                external_sign_in: false,
             }
         })
         .collect();
@@ -610,6 +619,7 @@ pub fn from_pg_rows(rows: &[PgRoleRow]) -> Vec<Principal> {
                 role_ambiguous: false,
                 login: None,
                 database_password: false,
+                external_sign_in: false,
             }
         })
         .collect();
@@ -1717,6 +1727,7 @@ impl GrantDraft {
                 role_ambiguous: false,
                 login: None,
                 database_password: false,
+                external_sign_in: false,
             },
             member: account.clone(),
             with_admin_option: self.with_admin_option,
@@ -1859,6 +1870,9 @@ impl AccountDraft {
                 }
                 _ => false,
             },
+            // A draft creates a SQL login or a user of one, or an Entra user,
+            // which has no login to reset through.
+            external_sign_in: false,
         }
     }
 }
@@ -2226,10 +2240,13 @@ pub fn supports_password_reset(dialect: SqlDialect, p: &Principal) -> bool {
     match dialect {
         // The password is the login's — a login row, or a user row through
         // the login it maps to — or a contained user's own. A user `WITHOUT
-        // LOGIN` and a role have none.
+        // LOGIN` and a role have none, and neither has an account Windows or
+        // Entra signs in (Msg 15080).
         SqlDialect::MsSql => {
-            p.kind == PrincipalKind::Login
-                || (p.kind == PrincipalKind::User && (p.login.is_some() || p.database_password))
+            !p.external_sign_in
+                && (p.kind == PrincipalKind::Login
+                    || (p.kind == PrincipalKind::User
+                        && (p.login.is_some() || p.database_password)))
         }
         SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => {
             p.kind == PrincipalKind::User && !p.role_ambiguous
@@ -2521,11 +2538,13 @@ pub fn from_mssql_rows(logins: &[MsLoginRow], users: &[MsUserRow]) -> Vec<Princi
         role_ambiguous: false,
         login: None,
         database_password: false,
+        external_sign_in: false,
     };
     let mut out: Vec<Principal> = Vec::new();
     for l in logins {
         let mut p = blank(&l.name);
         p.system = is_mssql_system_login(&l.name);
+        p.external_sign_in = matches!(l.kind.trim(), "U" | "G");
         let kind = match l.kind.trim() {
             "S" => "SQL login",
             "U" => "Windows login",
@@ -2555,6 +2574,9 @@ pub fn from_mssql_rows(logins: &[MsLoginRow], users: &[MsUserRow]) -> Vec<Princi
             PrincipalKind::User
         };
         p.system = is_mssql_system_user(u);
+        // A Windows user or group, or an Entra one: its login, if it has one,
+        // is not a SQL login either.
+        p.external_sign_in = matches!(u.kind.trim(), "U" | "G" | "E" | "X");
         p.login = u.login.clone().filter(|l| !l.is_empty());
         p.database_password = p.kind == PrincipalKind::User
             && u.authentication
@@ -4678,6 +4700,7 @@ mod mssql_tests {
             role_ambiguous: false,
             login: None,
             database_password: false,
+            external_sign_in: false,
         }
     }
 
@@ -5007,6 +5030,69 @@ mod mssql_tests {
             ..login("readers")
         };
         assert!(!supports_password_reset(MS, &role));
+    }
+
+    /// **A Windows login or group has no password here**, and neither has a
+    /// database user mapped to one — `ALTER LOGIN … WITH PASSWORD` on either is
+    /// Msg 15080, *"Cannot use parameter PASSWORD for a Windows login"*
+    /// (measured on 2022 against the container's `BUILTIN\Administrators`).
+    /// Read off the catalogue's type: a login's `U`/`G`, a user's `U`/`G` (a
+    /// Windows user or group) or `E`/`X` (Microsoft Entra). Reset password is
+    /// not offered there rather than failing at Apply. A SQL login, and a
+    /// user mapped to one, still are.
+    #[test]
+    fn a_windows_login_or_its_user_is_offered_no_password_reset() {
+        let login_row = |name: &str, kind: &str| MsLoginRow {
+            name: name.into(),
+            kind: kind.into(),
+            ..Default::default()
+        };
+        let user_row = |name: &str, kind: &str, login: &str| MsUserRow {
+            name: name.into(),
+            kind: kind.into(),
+            login: Some(login.into()),
+            ..Default::default()
+        };
+        let list = from_mssql_rows(
+            &[
+                login_row("BUILTIN\\Administrators", "G"),
+                login_row("CONTOSO\\ana", "U"),
+                login_row("app", "S"),
+            ],
+            &[
+                user_row("ana", "U", "CONTOSO\\ana"),
+                user_row("admins", "G", "BUILTIN\\Administrators"),
+                user_row("bo@contoso.com", "E", "bo@contoso.com"),
+                user_row("app_u", "S", "app"),
+            ],
+        );
+        let find = |n: &str| list.iter().find(|p| p.name == n).expect(n).clone();
+        for n in [
+            "BUILTIN\\Administrators",
+            "CONTOSO\\ana",
+            "ana",
+            "admins",
+            "bo@contoso.com",
+        ] {
+            let p = find(n);
+            assert!(!supports_password_reset(MS, &p), "{n}");
+            assert_eq!(
+                set_password_sql(
+                    &PasswordReset {
+                        account: p,
+                        password: "n3w".into(),
+                        scram_salt: None,
+                        password_policy: None,
+                    },
+                    MS
+                ),
+                None,
+                "{n}"
+            );
+        }
+        for n in ["app", "app_u"] {
+            assert!(supports_password_reset(MS, &find(n)), "{n}");
+        }
     }
 
     /// **A contained database user holds its own password** — authentication
