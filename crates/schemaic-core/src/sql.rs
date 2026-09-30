@@ -964,6 +964,71 @@ impl BodyScan {
     }
 }
 
+/// Where a scan through a SQL Server batch stands with respect to what a `;`
+/// must not cut.
+///
+/// **Each piece Run Everything or a `.sql` run sends is its own batch**, and a
+/// batch is T-SQL's unit of scope: a variable lives in one, and a `BEGIN …
+/// END` block, a `TRY … CATCH` and an `IF … ELSE` are each one statement to
+/// the server. Cut at their `;`s, `DECLARE @id int; SELECT @id = 5` failed at
+/// its second piece (Msg 137) and a block's first piece was a syntax error
+/// (Msg 102) — after the pieces before it had committed. So a `;` does not
+/// split inside a `BEGIN`/`CASE` block ([`Self::depth`]), nor directly before
+/// an `ELSE` (the scan's lookahead), and from a `DECLARE`, a `RETURN`, a
+/// `GOTO` or a label the rest of the batch is one piece ([`Self::whole`]), as
+/// sqlcmd would send it. Statements that share nothing still go one by one,
+/// each its own result.
+#[derive(Clone, Copy, Default)]
+struct BatchScope {
+    /// Open `BEGIN … END` and `CASE … END` blocks.
+    depth: u32,
+    /// A `BEGIN` whose next word says whether it opens a block —
+    /// `BEGIN TRAN` and its relatives do not.
+    begin_pending: bool,
+    /// An `END` just seen, and whether it closed a block — undone if the next
+    /// word makes it `END CONVERSATION`, a statement.
+    end_pending: Option<bool>,
+    /// The rest of the batch is one piece.
+    whole: bool,
+}
+
+impl BatchScope {
+    fn word(mut self, w: &str) -> BatchScope {
+        let is = |k: &str| w.eq_ignore_ascii_case(k);
+        if std::mem::take(&mut self.begin_pending)
+            && !(is("TRAN")
+                || is("TRANSACTION")
+                || is("DISTRIBUTED")
+                || is("DIALOG")
+                || is("CONVERSATION"))
+        {
+            self.depth += 1;
+        }
+        if let Some(closed) = self.end_pending.take()
+            && closed
+            && is("CONVERSATION")
+        {
+            self.depth += 1;
+        }
+        if is("BEGIN") {
+            self.begin_pending = true;
+        } else if is("CASE") {
+            self.depth += 1;
+        } else if is("END") {
+            self.end_pending = Some(self.depth > 0);
+            self.depth = self.depth.saturating_sub(1);
+        } else if is("DECLARE") || is("RETURN") || is("GOTO") {
+            self.whole = true;
+        }
+        self
+    }
+
+    /// May a `;` here end the statement? A `BEGIN;` is a block's own `BEGIN`.
+    fn holds(self) -> bool {
+        self.whole || self.depth > 0 || self.begin_pending
+    }
+}
+
 /// Where a scan through a SQLite statement stands with respect to a
 /// `CREATE TRIGGER` body.
 ///
@@ -1178,6 +1243,9 @@ fn scan_bounds(
     let mut scan = TriggerScan::Start;
     let track_bodies = dialect.batch_separator();
     let mut body = BodyScan::Start;
+    let mut batch = BatchScope::default();
+    // Is the next word the first of a statement — where `name:` is a label?
+    let mut first_word = true;
     while i < n {
         if let Some(j) = skip_noncode(b, i, dialect) {
             i = j;
@@ -1209,15 +1277,38 @@ fn scan_bounds(
             i = end;
             seg = end;
             body = BodyScan::Start;
+            batch = BatchScope::default();
+            first_word = true;
+            continue;
+        }
+        // `@x`, `@@ROWCOUNT`, `#t`: a name, never a keyword — `@declare`
+        // declares nothing.
+        if track_bodies && t_sql_name_prefix(b, i, dialect) > 0 {
+            i += t_sql_name_prefix(b, i, dialect);
+            while i < n && continues_name(b[i], dialect) {
+                i += 1;
+            }
+            first_word = false;
             continue;
         }
         if track_bodies && is_word_start(b[i]) {
             let start = i;
             let mut end = i + 1;
-            while end < n && is_word_byte(b[end]) {
+            while end < n && continues_name(b[end], dialect) {
                 end += 1;
             }
-            body = body.word(&sql[start..end]);
+            let w = &sql[start..end];
+            body = body.word(w);
+            // A word after a `.` is a qualified name's part, never a keyword.
+            if start == 0 || b[start - 1] != b'.' {
+                batch = batch.word(w);
+            }
+            // A label — `again:` opening a statement — is a `GOTO`'s target
+            // anywhere in the batch, so the batch goes whole from here.
+            if first_word && b.get(end) == Some(&b':') && b.get(end + 1) != Some(&b':') {
+                batch.whole = true;
+            }
+            first_word = false;
             i = end;
             continue;
         }
@@ -1262,6 +1353,23 @@ fn scan_bounds(
                 i += delim.len();
                 continue;
             }
+            if track_bodies {
+                first_word = true;
+                if batch.holds() {
+                    i += delim.len();
+                    continue;
+                }
+                // `IF … ; ELSE …` is one statement: look past the `;`.
+                match next_code_word(sql, i + delim.len(), dialect, at_eof) {
+                    Lookahead::Word(w) if w.eq_ignore_ascii_case("ELSE") => {
+                        i += delim.len();
+                        continue;
+                    }
+                    // Still arriving; the next chunk says.
+                    Lookahead::Pending => break,
+                    _ => {}
+                }
+            }
             // `;` is the server's own separator and stays; anything else is a
             // word the client invented and must not be sent.
             bounds.push(Bound {
@@ -1281,11 +1389,58 @@ fn scan_bounds(
             seg = i;
             scan = TriggerScan::Start;
             body = BodyScan::Start;
+            batch = BatchScope::default();
             continue;
         }
         i += 1;
     }
     bounds
+}
+
+/// What follows a point in the text, for [`scan_bounds`]' look past a `;`.
+enum Lookahead<'a> {
+    /// The next code token is this word.
+    Word(&'a str),
+    /// Something else, or the end of the script.
+    Other,
+    /// The buffer ends first, mid-script: the answer is in the next chunk.
+    Pending,
+}
+
+/// The first code word at or after `from`, over whitespace, comments and
+/// strings — or [`Lookahead::Pending`] when a chunked scan cannot tell yet.
+fn next_code_word(sql: &str, from: usize, dialect: SqlDialect, at_eof: bool) -> Lookahead<'_> {
+    let b = sql.as_bytes();
+    let mut j = from;
+    loop {
+        while b.get(j).is_some_and(u8::is_ascii_whitespace) {
+            j += 1;
+        }
+        if j >= b.len() {
+            return if at_eof {
+                Lookahead::Other
+            } else {
+                Lookahead::Pending
+            };
+        }
+        match skip_noncode(b, j, dialect) {
+            // An unterminated comment runs to the end of the buffer.
+            Some(k) if k >= b.len() && !at_eof => return Lookahead::Pending,
+            Some(k) if matches!(b[j], b'-' | b'/') => j = k,
+            _ => break,
+        }
+    }
+    if !is_word_start(b[j]) {
+        return Lookahead::Other;
+    }
+    let mut k = j + 1;
+    while k < b.len() && continues_name(b[k], dialect) {
+        k += 1;
+    }
+    if k >= b.len() && !at_eof {
+        return Lookahead::Pending;
+    }
+    Lookahead::Word(&sql[j..k])
 }
 
 /// Trim ASCII whitespace off both ends of `sql[lo..hi]`.
@@ -2104,6 +2259,16 @@ fn mssql_needs_database(sql: &str) -> bool {
         }
     }
     false
+}
+
+/// Does this piece hold more than one T-SQL statement — so that what follows
+/// its first result, or its row cap, is statements the server will still run?
+///
+/// [`tsql_statements`]' count, and so it errs toward *several*: a cut in the
+/// wrong place makes a reader drain a result it could have left, which costs
+/// time and never an outcome. `false` on every other engine.
+pub fn holds_several_statements(sql: &str, dialect: SqlDialect) -> bool {
+    tsql_statements(sql, dialect).len() > 1
 }
 
 /// The statements one T-SQL range holds; any other dialect's range, whole.
@@ -5113,6 +5278,81 @@ mod tests {
         for chunk in [1, 3, 7, 64] {
             assert_eq!(chunked(sql, d, chunk).len(), 3, "chunk {chunk}");
         }
+    }
+
+    /// **What lives in a T-SQL batch is never cut at a `;`.** A variable is
+    /// batch-scoped, a `BEGIN … END` block, a `TRY … CATCH` and an
+    /// `IF … ELSE` are one statement to the server, and each piece Run
+    /// Everything or a `.sql` run sends is its own batch — so `DECLARE @id
+    /// int; SELECT @id = 5; SELECT @id` failed at its second piece (Msg 137)
+    /// and the block's first piece was a syntax error (Msg 102), after the
+    /// pieces before had committed (measured on 2022). From a `DECLARE`, a
+    /// `RETURN`, a `GOTO` or a label, the rest of the batch goes whole, as
+    /// sqlcmd sends it; statements that share nothing still go one by one.
+    #[test]
+    fn a_t_sql_batch_scope_is_never_cut_at_a_semicolon() {
+        let d = SqlDialect::MsSql;
+        let one = |sql: &str| {
+            let stmts = super::executable_statements(sql, d);
+            assert_eq!(stmts.len(), 1, "{sql}\n{stmts:#?}");
+            for chunk in [1, 2, 5, 13, 64] {
+                assert_eq!(chunked(sql, d, chunk).len(), 1, "chunk {chunk}: {sql}");
+            }
+        };
+        one("DECLARE @id int;\nSELECT @id = 5;\nSELECT @id AS v;");
+        one(
+            "IF 1 = 1\nBEGIN\n  UPDATE t SET a = 1 WHERE id = 1;\n  UPDATE t SET a = 2 WHERE id = 2;\nEND",
+        );
+        one("BEGIN TRY SELECT 1/0; END TRY BEGIN CATCH SELECT ERROR_MESSAGE(); END CATCH");
+        one("IF 1 = 1 SELECT 1; ELSE SELECT 2;");
+        one("WHILE 1 = 0 BEGIN SELECT CASE WHEN 1 = 1 THEN 1 END; SELECT 2; END");
+        one("again: PRINT 1; GOTO again;");
+        one("IF NOT EXISTS (SELECT 1 FROM t) RETURN; DELETE FROM u;");
+        // Statements before the batch-scoped one still go on their own, and
+        // a `GO` ends the scope.
+        let stmts = super::executable_statements(
+            "SELECT 1; DECLARE @x int; SET @x = 1; SELECT @x;\nGO\nSELECT 2; SELECT 3;",
+            d,
+        );
+        assert_eq!(stmts.len(), 4, "{stmts:#?}");
+        assert!(
+            stmts[1].starts_with("DECLARE") && stmts[1].ends_with("SELECT @x;"),
+            "{stmts:#?}"
+        );
+        // A transaction's `BEGIN` opens no block, and neither does `END
+        // CONVERSATION`, so what follows them still splits.
+        for sql in [
+            "BEGIN TRAN; UPDATE t SET a = 1; COMMIT;",
+            "BEGIN TRANSACTION; UPDATE t SET a = 1; COMMIT TRANSACTION;",
+            "BEGIN DISTRIBUTED TRANSACTION; UPDATE t SET a = 1; COMMIT;",
+        ] {
+            assert_eq!(super::executable_statements(sql, d).len(), 3, "{sql}");
+        }
+        // A `@@` system function and a `#` temp table are no variables, and
+        // the words only count as code: in a string or a comment they are
+        // nothing.
+        assert_eq!(
+            super::executable_statements(
+                "SELECT @@ROWCOUNT; SELECT 'DECLARE'; -- BEGIN\nSELECT 3;",
+                d
+            )
+            .len(),
+            3
+        );
+        // A qualified name's part is no keyword, however it is spelled.
+        assert_eq!(
+            super::executable_statements("SELECT x.begin, x.declare FROM x; SELECT 2;", d).len(),
+            2
+        );
+        // Run at the caret takes the whole block.
+        let block = "IF 1 = 1\nBEGIN\n  UPDATE t SET a = 1;\n  UPDATE t SET a = 2;\nEND";
+        let caret = block.find("a = 2").unwrap();
+        assert_eq!(super::executable_at(block, caret, d), Some(block));
+        // Nothing changes on the other engines.
+        assert_eq!(
+            super::executable_statements("BEGIN; SELECT 1; END;", SqlDialect::Postgres).len(),
+            3
+        );
     }
 
     /// SQL Server's lexical rules otherwise: standard `--` comments, no `#`

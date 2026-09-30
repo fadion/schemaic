@@ -92,6 +92,21 @@ enum Backend {
     MsSql {
         client: Box<crate::mssql::MsClient>,
     },
+    /// A SQL Server connection closed because it fell out of step after a
+    /// Stop, with no new one to put in its place — see
+    /// [`Session::resync_after_stop`]. Everything on it answers
+    /// [`retired_error`]; the tab re-pins to go on.
+    Retired,
+}
+
+/// What a [`Backend::Retired`] session answers.
+fn retired_error() -> DbError {
+    DbError::Connect(
+        "this tab's connection was closed after a Stop the server did not acknowledge, \
+         and a new one could not be opened; its transaction was rolled back. Switch the \
+         tab to Auto and back to Manual to open another."
+            .to_string(),
+    )
 }
 
 /// The three transaction statements the session issues itself, spelled per
@@ -136,7 +151,9 @@ pub struct Session {
     /// kill leaves the tab holding a dead connection it has no way to notice.
     ///
     /// `None` only if the server declined to say, which neither engine does.
-    server_id: Option<i64>,
+    /// Behind a lock for the one time it changes: SQL Server's pinned
+    /// connection replaced after a Stop ([`Session::resync_after_stop`]).
+    server_id: std::sync::Mutex<Option<i64>>,
     inner: Mutex<Backend>,
     /// Whether a transaction is currently open on this connection.
     ///
@@ -307,7 +324,7 @@ impl Session {
             db: db.clone(),
             database: database.map(|s| s.to_string()),
             scope: std::sync::Mutex::new(database.map(|s| s.to_string())),
-            server_id,
+            server_id: std::sync::Mutex::new(server_id),
             inner: Mutex::new(backend),
             in_tx: AtomicBool::new(false),
         }))
@@ -318,7 +335,7 @@ impl Session {
     /// [`SessionInfo`](schemaic_core::activity::SessionInfo) row, which is how
     /// the app tells its own session apart from everyone else's.
     pub fn server_id(&self) -> Option<i64> {
-        self.server_id
+        self.server_id.lock().ok().and_then(|id| *id)
     }
 
     pub fn engine(&self) -> Engine {
@@ -367,6 +384,12 @@ impl Session {
                 };
                 crate::mssql::drain(client, sql).await
             }
+            // The server rolled back what the closed connection held, so a
+            // Rollback has nothing left to do; anything else cannot be done.
+            Backend::Retired => match ctl {
+                Ctl::Rollback => Ok(()),
+                Ctl::Begin | Ctl::Commit => Err(retired_error()),
+            },
         }
     }
 
@@ -463,6 +486,7 @@ impl Session {
             Backend::MsSql { client } => crate::mssql::tx_state(client)
                 .await
                 .is_none_or(|(_, state)| state == -1),
+            Backend::Retired => true,
         }
     }
 
@@ -495,6 +519,7 @@ impl Session {
                 let _ =
                     crate::mssql::drain(client, "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION").await;
             }
+            Backend::Retired => {}
         }
     }
 
@@ -510,6 +535,7 @@ impl Session {
             // tiberius has no liveness flag to read; the cheapest statement is
             // the question.
             Backend::MsSql { client } => crate::mssql::drain(client, "SELECT 1").await.is_ok(),
+            Backend::Retired => false,
         }
     }
 
@@ -577,7 +603,7 @@ impl Session {
         match guard {
             Backend::MySql { conn, .. } => conn.query_drop(sql).await.is_ok(),
             Backend::Postgres { client } => client.batch_execute(sql).await.is_ok(),
-            Backend::MsSql { .. } => false,
+            Backend::MsSql { .. } | Backend::Retired => false,
         }
     }
 
@@ -731,14 +757,23 @@ impl Session {
             }
             // `run_statement` owns the token here as on PostgreSQL: every step
             // is raced against Stop and a Stop is the attention, on this
-            // connection. A result cut short at the row cap needs no draining
-            // for the next statement — tiberius resynchronises the stream at
-            // the start of every request (`flush_stream`).
+            // connection. A lone statement's result cut short at the row cap
+            // needs no draining for the next statement — tiberius
+            // resynchronises the stream at the start of every request
+            // (`flush_stream`) — and a piece holding several is read to its
+            // end by `run_statement` itself.
             Backend::MsSql { client } => {
                 let mut dest = crate::RowDest::Capped(row_cap);
                 crate::mssql::run_statement(client, sql, &mut dest, &cancel).await
             }
+            Backend::Retired => Err(retired_error()),
         };
+        if matches!(result, Err(DbError::Cancelled)) && self.resync_after_stop(&mut guard).await {
+            return Outcome {
+                result,
+                stmt: StmtOutcome::ConnectionLost,
+            };
+        }
         // Same stamp `Db::fetch_query` applies, from this session's own scope —
         // which is the one the statement ran under, and need not be the tab's
         // current selection. See `ResultSet::database`.
@@ -887,17 +922,55 @@ impl Session {
         .map(|n| n != 0)
     }
 
+    /// After a Stop on SQL Server's pinned connection: is it still answering
+    /// its own requests? If not, it is replaced, and `true` says so — the
+    /// transaction it held is gone, which the caller reports as
+    /// [`StmtOutcome::ConnectionLost`].
+    ///
+    /// **An attention the server did not acknowledge leaves its reply on the
+    /// wire**, and every reply after that belongs to the request before it:
+    /// the next statement's grid showed the previous one's result, and the
+    /// transaction probe read another query's row and panicked the run task.
+    /// The driver now reads past an aborted request's own error to the
+    /// acknowledgement (`vendor/tiberius/PATCHES.md`, patch 5), so this is
+    /// what is left: an attention refused, or not acknowledged within
+    /// [`crate::CANCEL_TIMEOUT`]. Nothing further is sent on such a connection.
+    /// Dropping it closes the socket, and the server rolls back the transaction
+    /// and releases its locks; a fresh connection takes its place, so the tab's
+    /// next statement starts a new transaction. If none can be opened the
+    /// backend is [`Backend::Retired`].
+    async fn resync_after_stop(&self, guard: &mut Backend) -> bool {
+        let Backend::MsSql { client } = guard else {
+            return false;
+        };
+        if crate::mssql::answers_in_step(client).await {
+            return false;
+        }
+        *guard = match crate::mssql::connect(&self.db, self.database.as_deref()).await {
+            Ok(mut fresh) => {
+                let spid = crate::mssql::spid(&mut fresh).await;
+                if let Ok(mut id) = self.server_id.lock() {
+                    *id = spid;
+                }
+                Backend::MsSql {
+                    client: Box::new(fresh),
+                }
+            }
+            Err(_) => Backend::Retired,
+        };
+        self.in_tx.store(false, Ordering::SeqCst);
+        if let Ok(mut scope) = self.scope.lock() {
+            *scope = self.database.clone();
+        }
+        true
+    }
+
     /// **SQL Server's answer to what an operation did to the transaction**,
     /// folded into this session's flag and into the outcome the pill reads —
     /// the one probe `tx::probes_after_every_statement` names, asked after
-    /// every operation on this engine because no text can decide it.
-    ///
-    /// `@@TRANCOUNT` of 0 after an open transaction is a close: a success
-    /// there is `OkAndClosed` (a typed `COMMIT`, a `ROLLBACK` inside a batch's
-    /// `IF`), a failure `FailedAndRolledBack` (a deadlock victim, a
-    /// batch-aborting error — the server ended it). `XACT_STATE()` of -1 after
-    /// a failure is `FailedAndDoomed`: still open, and only a rollback ends it.
-    /// A probe that cannot be answered leaves everything as it was.
+    /// every operation on this engine because no text can decide it. The fold
+    /// itself is `tx::settle_from_server`, pure and tested arm by arm; a probe
+    /// that cannot be answered leaves everything as it was.
     async fn settle_from_server(&self, guard: &mut Backend, stmt: &mut StmtOutcome) {
         let Backend::MsSql { client } = guard else {
             return;
@@ -906,21 +979,8 @@ impl Session {
             return;
         };
         let was_open = self.in_tx.load(Ordering::SeqCst);
-        let open = count > 0;
-        self.in_tx.store(open, Ordering::SeqCst);
-        let failed = matches!(
-            stmt,
-            StmtOutcome::Failed
-                | StmtOutcome::Cancelled
-                | StmtOutcome::FailedIsolated
-                | StmtOutcome::CancelledIsolated
-        );
-        *stmt = match *stmt {
-            StmtOutcome::Ok if was_open && !open => StmtOutcome::OkAndClosed,
-            _ if failed && was_open && !open => StmtOutcome::FailedAndRolledBack,
-            _ if failed && state == -1 => StmtOutcome::FailedAndDoomed,
-            s => s,
-        };
+        self.in_tx.store(count > 0, Ordering::SeqCst);
+        *stmt = tx::settle_from_server(*stmt, was_open, count, state);
     }
 
     /// This session's engine, in the vocabulary `schemaic_core::tx` speaks.
@@ -1006,6 +1066,13 @@ impl Session {
                     &mut undone,
                 )
                 .await;
+                if matches!(r, Err(DbError::Cancelled)) && self.resync_after_stop(&mut guard).await
+                {
+                    return Outcome {
+                        result: r,
+                        stmt: StmtOutcome::ConnectionLost,
+                    };
+                }
                 let isolated = matches!(
                     undone,
                     None | Some(schemaic_core::model::Rollback::Complete)
@@ -1021,6 +1088,7 @@ impl Session {
                 }
                 return out;
             }
+            Backend::Retired => Err(retired_error()),
         };
         Session::classify_isolated(&mut guard, result).await
     }
@@ -1081,7 +1149,14 @@ impl Session {
             }
             // Raced against Stop inside, the attention on this connection.
             Backend::MsSql { client } => crate::mssql::blob_on(client, r, &cancel).await,
+            Backend::Retired => Err(retired_error()),
         };
+        if matches!(result, Err(DbError::Cancelled)) && self.resync_after_stop(&mut guard).await {
+            return Outcome {
+                result,
+                stmt: StmtOutcome::ConnectionLost,
+            };
+        }
         // **And through `into_read` on the way out.** `fence_read` cannot set a
         // savepoint when there is no transaction to fence — PostgreSQL answers
         // `ERROR: SAVEPOINT can only be used in transaction blocks`, which
@@ -1147,7 +1222,14 @@ impl Session {
             Backend::MsSql { client } => {
                 crate::mssql::refetch_on(client, template, rows, &cancel).await
             }
+            Backend::Retired => Err(retired_error()),
         };
+        if matches!(result, Err(DbError::Cancelled)) && self.resync_after_stop(&mut guard).await {
+            return Outcome {
+                result,
+                stmt: StmtOutcome::ConnectionLost,
+            };
+        }
         // The same `into_read` as `fetch_blob`, and for the same reason: this
         // path calls no `ensure_tx` either, so it must not report a transaction
         // it did not open.

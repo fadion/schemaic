@@ -810,6 +810,48 @@ pub fn failure_committed(engine: TxEngine, sql: &str, tx_alive: Option<bool>) ->
     implicit_commit(engine, sql) && tx_alive == Some(false)
 }
 
+/// **SQL Server's answer to what an operation did to the transaction**, folded
+/// into its outcome: `trancount` and `xact_state` are `@@TRANCOUNT` and
+/// `XACT_STATE()` read after it, `was_open` the session's belief before.
+///
+/// `@@TRANCOUNT` of 0 after an open transaction is a close: a success there is
+/// [`StmtOutcome::OkAndClosed`] (a typed `COMMIT`, a `ROLLBACK` inside a
+/// batch's `IF`), a failure [`StmtOutcome::FailedAndRolledBack`] (a deadlock
+/// victim, a batch-aborting error — the server ended it). `XACT_STATE()` of
+/// -1 after a failure is [`StmtOutcome::FailedAndDoomed`]: still open, and
+/// only a rollback ends it. Everything else is left as it was.
+///
+/// **No success is ever doomed here.** A `TRY … CATCH` that catches a
+/// dooming error raises nothing itself, but every operation the session runs
+/// is its own batch, and SQL Server rolls back an uncommittable transaction
+/// when its batch ends (Msg 3998) — so the statement arrives failed, over a
+/// closed transaction, and folds as `FailedAndRolledBack` (measured on 2022
+/// and 2025).
+///
+/// Pure, so each arm is tested; the session reads the two values and calls it
+/// (`Session::settle_from_server`).
+pub fn settle_from_server(
+    stmt: StmtOutcome,
+    was_open: bool,
+    trancount: i64,
+    xact_state: i64,
+) -> StmtOutcome {
+    let open = trancount > 0;
+    let failed = matches!(
+        stmt,
+        StmtOutcome::Failed
+            | StmtOutcome::Cancelled
+            | StmtOutcome::FailedIsolated
+            | StmtOutcome::CancelledIsolated
+    );
+    match stmt {
+        StmtOutcome::Ok if was_open && !open => StmtOutcome::OkAndClosed,
+        _ if failed && was_open && !open => StmtOutcome::FailedAndRolledBack,
+        _ if failed && xact_state == -1 => StmtOutcome::FailedAndDoomed,
+        s => s,
+    }
+}
+
 /// The message a failed statement carries, with what the error itself cannot say.
 ///
 /// A server error names what it refused. It does not mention that refusing it
@@ -1141,6 +1183,33 @@ mod tests {
     const MY: TxEngine = TxEngine::MySql;
     const PG: TxEngine = TxEngine::Postgres;
     const MS: TxEngine = TxEngine::MsSql;
+
+    /// **SQL Server's fold, one arm at a time**, from what the server says
+    /// after the operation: `@@TRANCOUNT` and `XACT_STATE()`. It lived in the
+    /// session with no test but a live one that exercised a single failure.
+    #[test]
+    fn sql_servers_answer_folds_into_the_outcome() {
+        use StmtOutcome::*;
+        let settle = settle_from_server;
+        // (outcome, was open, trancount, xact_state) -> outcome
+        assert_eq!(settle(Ok, true, 0, 0), OkAndClosed);
+        assert_eq!(settle(Ok, true, 1, 1), Ok);
+        assert_eq!(settle(Ok, false, 1, 1), Ok);
+        assert_eq!(settle(Ok, false, 0, 0), Ok);
+        for failed in [Failed, Cancelled, FailedIsolated, CancelledIsolated] {
+            assert_eq!(
+                settle(failed, true, 0, 0),
+                FailedAndRolledBack,
+                "{failed:?}"
+            );
+            assert_eq!(settle(failed, true, 1, -1), FailedAndDoomed, "{failed:?}");
+            assert_eq!(settle(failed, true, 1, 1), failed, "{failed:?}");
+            // Nothing was open to roll back.
+            assert_eq!(settle(failed, false, 0, 0), failed, "{failed:?}");
+        }
+        assert_eq!(settle(NotSent, true, 1, -1), NotSent);
+        assert_eq!(settle(Untouched, true, 0, 0), Untouched);
+    }
 
     /// **SQL Server has a Manual mode**, on a pinned connection whose
     /// transaction state is read from the server after every statement rather

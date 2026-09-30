@@ -2762,6 +2762,123 @@ async fn a_script_split_at_go_runs_as_sql_servers_tools_run_it() {
     assert_eq!(s.scalar("SELECT COUNT(*) FROM dbo.t").await, "2");
 }
 
+/// Run `script` as Run Everything does — split, then one connection — and
+/// answer each piece's outcome.
+async fn run_everything(s: &Scratch, script: &str, cap: usize) -> Vec<Result<ResultSet, DbError>> {
+    let stmts = schemaic_core::sql::executable_statements(script, MS);
+    let mut outcomes = Vec::new();
+    s.db.run_batch(
+        Some(&s.name),
+        &stmts,
+        cap,
+        CancellationToken::new(),
+        |_, r| outcomes.push(r),
+    )
+    .await;
+    outcomes
+}
+
+/// **A variable, a block and a `TRY … CATCH` run as SQL Server's own tools
+/// run them.** Split at their `;`s, each piece a batch of its own, the
+/// variable was undeclared by the second piece (Msg 137) and the block's first
+/// piece a syntax error (Msg 102), after the pieces before had committed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_batch_scoped_script_runs_whole() {
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("batch_scope").await;
+    s.exec(
+        "CREATE TABLE dbo.t (id int PRIMARY KEY, a int NULL); INSERT dbo.t VALUES (1, 0), (2, 0)",
+    )
+    .await;
+    let out = run_everything(
+        &s,
+        "DECLARE @id int;\nSELECT @id = 5;\nSELECT @id AS v;",
+        10,
+    )
+    .await;
+    assert_eq!(out.len(), 1, "{out:?}");
+    let rs = out[0].as_ref().expect("the variable is declared");
+    assert_eq!(rs.cell(0, 0).unwrap().display().to_string(), "5");
+
+    let out = run_everything(
+        &s,
+        "IF 1 = 1\nBEGIN\n  UPDATE dbo.t SET a = 1 WHERE id = 1;\n  UPDATE dbo.t SET a = 2 WHERE id = 2;\nEND",
+        10,
+    )
+    .await;
+    assert!(out.iter().all(Result::is_ok), "{out:?}");
+    assert_eq!(s.scalar("SELECT SUM(a) FROM dbo.t").await, "3");
+
+    let out = run_everything(
+        &s,
+        "BEGIN TRY SELECT 1/0 AS x; END TRY BEGIN CATCH SELECT ERROR_NUMBER() AS n; END CATCH",
+        10,
+    )
+    .await;
+    assert_eq!(out.len(), 1, "{out:?}");
+    assert!(out[0].is_ok(), "the error is caught: {out:?}");
+}
+
+/// **A batch's error is the batch's outcome, whatever it returned first.**
+/// The read stopped at a second result set, or at the row cap, and dropped
+/// the stream — and the driver raises an error only at the stream's end, so a
+/// failed batch was reported a success, and whether its trailing statements
+/// ran depended on how big the first result was.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_batch_reports_its_error_past_its_first_result() {
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("batch_err").await;
+    s.exec(
+        "CREATE TABLE dbo.w (id int PRIMARY KEY, v int NOT NULL); INSERT dbo.w VALUES (1, 0); \
+         SELECT TOP (5000) ROW_NUMBER() OVER (ORDER BY (SELECT 1)) AS n INTO dbo.big \
+         FROM sys.all_columns a CROSS JOIN sys.all_columns b",
+    )
+    .await;
+    let err = s
+        .try_exec("SELECT 1 AS a SELECT 1/0 AS b")
+        .await
+        .expect_err("the divide by zero is the batch's");
+    assert!(err.to_string().contains("Divide by zero"), "{err}");
+
+    // A failed first piece stops Run All before the second.
+    let out = run_everything(
+        &s,
+        "SELECT 1 AS a SELECT 1/0 AS b;\nGO\nUPDATE dbo.w SET v = 7",
+        10,
+    )
+    .await;
+    assert!(out[0].is_err(), "{out:?}");
+    assert!(matches!(out[1], Err(DbError::Cancelled)), "{out:?}");
+    assert_eq!(s.scalar("SELECT v FROM dbo.w").await, "0");
+
+    // Past the cap, a trailing statement in the same batch still runs —
+    // whatever the size of what came before — and the grid says it is cut.
+    let out = run_everything(&s, "SELECT n FROM dbo.big UPDATE dbo.w SET v = 55", 10).await;
+    let rs = out[0].as_ref().expect("the batch ran");
+    assert!(rs.truncated && rs.row_count() == 10, "{rs:?}");
+    assert_eq!(s.scalar("SELECT v FROM dbo.w").await, "55");
+    let out = run_everything(
+        &s,
+        "SELECT 1 AS a SELECT n FROM dbo.big UPDATE dbo.w SET v = v + 100",
+        10,
+    )
+    .await;
+    assert!(out[0].is_ok(), "{out:?}");
+    assert_eq!(s.scalar("SELECT v FROM dbo.w").await, "155");
+
+    // A statement's error in a batch the server runs on past it says so.
+    let err = s
+        .try_exec("INSERT dbo.w VALUES (1, 5)\nUPDATE dbo.w SET v = 9")
+        .await
+        .expect_err("the duplicate key");
+    assert!(err.to_string().contains("may have run"), "{err}");
+    assert_eq!(s.scalar("SELECT v FROM dbo.w").await, "9");
+}
+
 /// The schema reads back as it was declared.
 #[tokio::test(flavor = "multi_thread")]
 async fn introspection_reads_the_schema_as_declared() {
@@ -3492,6 +3609,47 @@ async fn t_sql_transaction_statements_are_settled_by_the_server() {
     session.close().await;
 }
 
+/// **A caught error that dooms the transaction ends it at the batch's end.**
+/// Under `XACT_ABORT ON`, a `TRY … CATCH` that catches a duplicate key raises
+/// nothing itself and leaves `XACT_STATE()` at -1 — but every statement the
+/// session runs is its own batch, and SQL Server rolls back an uncommittable
+/// transaction when its batch ends (Msg 3998). So no probe ever sees a doomed
+/// transaction after a success: the statement fails, the transaction is gone,
+/// and the fold says so.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_caught_error_that_dooms_the_transaction_rolls_it_back_at_the_batch_end() {
+    use schemaic_core::tx::StmtOutcome;
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("tx_doomed_ok").await;
+    s.exec("CREATE TABLE dbo.t (id int NOT NULL PRIMARY KEY); INSERT dbo.t VALUES (1)")
+        .await;
+    let session = manual(&s).await;
+    assert_eq!(stmt(&session, "SET XACT_ABORT ON").await, StmtOutcome::Ok);
+    assert_eq!(
+        stmt(&session, "INSERT dbo.t VALUES (2)").await,
+        StmtOutcome::Ok
+    );
+    let out = session
+        .fetch_query(
+            "BEGIN TRY INSERT dbo.t VALUES (1) END TRY BEGIN CATCH SELECT 'caught' AS c END CATCH",
+            10,
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(
+        out.stmt,
+        StmtOutcome::FailedAndRolledBack,
+        "{:?}",
+        out.result
+    );
+    let err = out.result.expect_err("the batch-end rollback is an error");
+    assert!(err.to_string().contains("3998"), "{err}");
+    session.close().await;
+    assert_eq!(committed_rows(&s).await, "1");
+}
+
 /// **A failure leaves the transaction open — unless the server ended it.**
 /// A duplicate key fails and keeps what came before; with `XACT_ABORT ON`
 /// the same error rolls the transaction back, and the session says so.
@@ -3797,6 +3955,57 @@ async fn a_stopped_statement_keeps_the_manual_transaction() {
     session.commit().await.expect("commit");
     assert_eq!(committed_rows(&s).await, "2");
     session.close().await;
+}
+
+/// **A Stop of a batch that has already raised an error keeps the connection
+/// in step.** The driver answered such an attention with the aborted batch's
+/// own error and left the acknowledgement on the wire, so every later reply
+/// belonged to the request before it — and the next statement panicked the
+/// run task reading another query's row as the transaction's state.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_after_an_error_leaves_the_manual_session_in_step() {
+    use schemaic_core::tx::StmtOutcome;
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("tx_stop_err").await;
+    s.exec("CREATE TABLE dbo.t (id int NOT NULL PRIMARY KEY)")
+        .await;
+    let session = manual(&s).await;
+    assert_eq!(
+        stmt(&session, "INSERT dbo.t VALUES (500)").await,
+        StmtOutcome::Ok
+    );
+    for stalled in [
+        "SELECT 1/0 AS x; WAITFOR DELAY '00:00:20'",
+        "RAISERROR('boom', 16, 1); WAITFOR DELAY '00:00:20'",
+    ] {
+        let cancel = CancellationToken::new();
+        let stop = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            stop.cancel();
+        });
+        let out = session.fetch_query(stalled, 100, cancel).await;
+        assert!(
+            matches!(
+                out.stmt,
+                StmtOutcome::Cancelled | StmtOutcome::CancelledIsolated
+            ),
+            "{stalled}: {:?} {:?}",
+            out.stmt,
+            out.result
+        );
+        let answer = session
+            .fetch_query("SELECT 42 AS answer", 10, CancellationToken::new())
+            .await
+            .result
+            .expect("the next statement's own reply");
+        assert_eq!(answer.cell(0, 0).unwrap().display().to_string(), "42");
+    }
+    session.commit().await.expect("commit");
+    session.close().await;
+    assert_eq!(committed_rows(&s).await, "1");
 }
 
 /// A read-only connection is refused a pinned session: SQL Server holds no

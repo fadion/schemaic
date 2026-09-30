@@ -221,20 +221,30 @@ where
     /// `Ok(None)` when the message ended without it: the server finishes its
     /// reply to the aborted request and may send the acknowledgement as a
     /// message of its own, so the caller reads on. schemaic patch (PATCHES.md)
+    ///
+    /// **An error the aborted request raised is that request's, not this
+    /// drain's answer.** `try_unfold` raises a message's recorded `ERROR` token
+    /// when the message ends, and returning it here left the acknowledgement
+    /// unread on the wire, so every later reply belonged to the request before
+    /// it. It ends the message like any other end, and the caller reads on.
+    /// schemaic patch (PATCHES.md)
     pub(crate) async fn flush_done_attention(self) -> crate::Result<Option<TokenDone>> {
         let mut stream = self.try_unfold();
 
         loop {
-            match stream.try_next().await? {
-                Some(ReceivedToken::Done(token))
-                | Some(ReceivedToken::DoneProc(token))
-                | Some(ReceivedToken::DoneInProc(token))
+            match stream.try_next().await {
+                Ok(Some(ReceivedToken::Done(token)))
+                | Ok(Some(ReceivedToken::DoneProc(token)))
+                | Ok(Some(ReceivedToken::DoneInProc(token)))
                     if token.is_attention() =>
                 {
                     return Ok(Some(token));
                 }
-                Some(_) => (),
-                None => return Ok(None),
+                Ok(Some(_)) => (),
+                // The end of the message: a clean one, or one that carried the
+                // aborted request's own error (only raised there).
+                Ok(None) | Err(Error::Server(_)) => return Ok(None),
+                Err(e) => return Err(e),
             }
         }
     }

@@ -366,7 +366,27 @@ existing prose was left alone.
     executing path drop both; the count is accepted and **not** honoured, a batch runs once. And
     `BodyScan`: a `CREATE`/`ALTER`/`CREATE OR ALTER` `PROC`/`FUNCTION`/`TRIGGER` takes the rest of
     its batch as its body, `;`s and all, so only a `GO` or the end ends it — SQLite's `TriggerScan`
-    problem with a different terminator. **`nested_block_comments` was a divergence the table did not have**:
+    problem with a different terminator. **And `BatchScope`: what lives in one batch is never cut at
+    a `;`.** Each piece Run Everything or a `.sql` run sends is a batch of its own, and a batch is
+    T-SQL's unit of scope — a variable lives in one, and a `BEGIN … END`, a `TRY … CATCH` and an
+    `IF … ELSE` are each one statement to the server — so cut at their `;`s, `DECLARE @id int;
+    SELECT @id = 5; SELECT @id` failed at its second piece (Msg 137) and a block's first piece was a
+    syntax error (Msg 102), after the pieces before it had committed (measured on 2022).
+    `scan_bounds` tracks it on `batch_separator` dialects alone. A `;` does not split inside a
+    `BEGIN`/`CASE` block, depth counted — `BEGIN TRAN[SACTION]`, `BEGIN DISTRIBUTED`, `DIALOG` and
+    `CONVERSATION` open none, and `END CONVERSATION` closes none — nor directly before an `ELSE`,
+    which `next_code_word` looks past the `;` for; its `Lookahead::Pending`, when a chunked scan's
+    buffer ends first, makes the splitter wait for the next block rather than cut. And from a
+    `DECLARE`, a `RETURN`, a `GOTO` or a label (`name:` opening a statement) the rest of the `GO`
+    batch is one piece (`BatchScope::whole`). A `@x`, `@@x` or `#t` is stepped over whole
+    (`t_sql_name_prefix`, `continues_name`), so `@declare` declares nothing. **It is a middle
+    ground, on purpose**: sending whole `GO` batches, as sqlcmd does, is the simpler rule and would
+    have collapsed Run Everything's per-statement results into one panel per batch, so statements
+    that share nothing still go one by one. The editor's statement bounds and Run at the caret read
+    the same scan, so the caret inside a block runs the whole block
+    (`a_t_sql_batch_scope_is_never_cut_at_a_semicolon`, chunked as well; live,
+    `a_batch_scoped_script_runs_whole`). The missing-`WHERE` guards lose nothing by the larger
+    piece, since `tsql_statements` (below) cuts at statement words and not at `;`. **`nested_block_comments` was a divergence the table did not have**:
     PostgreSQL nests `/* … */` and `skip_comment` ended every comment at its first `*/`, so a head
     after a nested comment was read from inside it — `/* a /* b */ c */ DELETE FROM t` ran its
     every-row DELETE with no ask — and a quote in the comment's tail opened a "string" that hid a
@@ -722,7 +742,10 @@ existing prose was left alone.
     `EXPLAIN`/`ANALYZE` — no T-SQL, but the prefixes `analyzed_statement` strips — stays whole. Every
     other dialect gets its range back whole
     (`every_sql_server_statement_in_a_range_is_judged_for_a_missing_where`, whose last assertion is
-    that MySQL still reads the first shape as one statement).
+    that MySQL still reads the first shape as one statement). `holds_several_statements` is the
+    same cut counted, for `db::mssql::run_statement`'s question of whether a result's end is the
+    piece's end; it errs toward *several*, since a cut in the wrong place drains a result that could
+    have been left — time, never an outcome.
     **`limited_select` is the one spelling of a generated row cap**, because T-SQL has no `LIMIT`
     and writes `TOP (n)` after `SELECT`: the generators had each written a trailing `LIMIT` into a
     `format!`, which is an engine assumption no census can find. `filter::table_query` and
@@ -6563,6 +6586,15 @@ existing prose was left alone.
     `cancelled_message` carry a sentence for each new outcome, since neither loss is in the server's
     error: that the rolled-back transaction's statements are undone, and that the doomed one can
     only be rolled back (`a_rolled_back_transaction_is_disclosed`).
+    **The fold from the probe's answer is `settle_from_server(stmt, was_open, trancount,
+    xact_state)`**, pure here and pinned arm by arm (`sql_servers_answer_folds_into_the_outcome`);
+    it had lived in the session, with no test but a live one exercising a single failure. **No
+    success folds to doomed, and that is not a missing arm.** A review expected one — a `TRY …
+    CATCH` that catches a dooming error raises nothing itself — but every operation the session
+    runs is its own batch, and SQL Server rolls back an uncommittable transaction when its batch
+    ends (Msg 3998), so the statement arrives failed over a closed transaction and folds
+    `FailedAndRolledBack` (live, `a_caught_error_that_dooms_the_transaction_rolls_it_back_at_the_batch_end`,
+    on 2022 and 2025).
     `pill_text` is the status-bar string. It also owns what the user is told
     while a write **waits**: `write_blocking_tabs` (which of our own tabs' transactions a grid
     write could be queued behind — same connection scope as `ddl_blocking_tabs`, but excluding
@@ -11591,8 +11623,17 @@ existing prose was left alone.
   moment before it ran, so `result_columns` uses it **only when it agrees with the wire** about how
   many columns there are and what they are called: an `IF … SELECT … ELSE SELECT …` can describe
   one shape and return another, and every cell would sit under another column's name and type.
-  That provenance is what the grid's write-back stands on (below). A read reports **one result set**: a second is logged and
-  the read stops there. **`prepare_check` is the same DMF, and not `SET NOEXEC ON`**, which was the
+  That provenance is what the grid's write-back stands on (below). A read reports **one result set**: a second is logged,
+  and **the read goes on to the stream's end regardless**, its rows dropped and its `DONE` counts
+  kept. tiberius raises a batch's error only when the stream ends, and `run_statement` used to
+  stop at a second result set, and at the row cap, and drop the stream — so a failed batch was
+  reported `Ok`, whether the statements after the stop ran depended on how much the first result
+  returned, and Run All went on past a piece that had failed. At the row cap it reads on only when
+  `sql::holds_several_statements` says the piece holds more than one statement, so a lone `SELECT`
+  still stops at the cap rather than draining a table. And a server error from such a piece
+  carries `batch_error`'s sentence: SQL Server runs a batch on past a statement's error unless the
+  error ends the batch, so a duplicate key followed by an `UPDATE` reports the duplicate while the
+  `UPDATE` commits (measured on 2022; `a_batch_reports_its_error_past_its_first_result`). **`prepare_check` is the same DMF, and not `SET NOEXEC ON`**, which was the
   first version: `NOEXEC` compiles without resolving names, so `SELECT * FROM nope` came back clean
   on SQL Server 2022, and a missing table is the error validation exists to show. The describe
   answers it as error 208 in a row; `describe_error` passes over its own 115xx answers (a temporary
@@ -11616,8 +11657,11 @@ existing prose was left alone.
   holds the read under 3 s. `simple_query` does not return until the statement's first
   result set — for an `UPDATE`, until it has finished — and a Stop there had been left to the
   connection's close. `run_script` holds one connection for the file, as on every engine, over
-  statements the splitter has already cut at `GO` lines with each routine body kept whole
-  (`core::sql`'s `batch_separator`), which is what SQL Server's own tools send. A failed T-SQL
+  pieces the splitter has already cut — at `GO` lines, and at the `;`s between statements that
+  share nothing, with each routine body and each batch-scoped run (a variable, a block, an
+  `IF … ELSE`) kept whole (`core::sql`'s `batch_separator` and `BatchScope`). That is **not** what
+  SQL Server's own tools send, which cut at `GO` alone; each piece here is a batch of its own, and
+  the scope rules are what keep a piece from splitting what a batch scopes. A failed T-SQL
   statement leaves its transaction usable, as MySQL's does, but its DDL does not commit, so
   `tx_engine_of` maps it to a model of its own, `tx::TxEngine::MsSql` (under `core::tx`) — and
   what a failure did under `XACT_ABORT ON`, a session's own choice to make, is read off the server
@@ -11760,14 +11804,41 @@ existing prose was left alone.
   `COMMIT` fails with Msg 3930 — or no answer. **After every operation the session asks the
   server** (`tx::probes_after_every_statement`; `core::tx` has why no text can decide it):
   `tx_state` reads `@@TRANCOUNT` and `XACT_STATE()` in one round trip, and
-  `Session::settle_from_server` sets `in_tx` from the count and folds the answer into the outcome —
-  a success with the count at 0 after an open transaction is `OkAndClosed`, a failure there
-  `FailedAndRolledBack`, a failure with the state at -1 `FailedAndDoomed`, and a probe nobody
-  answers leaves everything as it was. `fetch_query`, `commit_writes`, `fetch_blob` and
+  `Session::settle_from_server` sets `in_tx` from the count and folds the answer into the outcome
+  through `tx::settle_from_server` (under `core::tx`) — a success with the count at 0 after an open
+  transaction is `OkAndClosed`, a failure there `FailedAndRolledBack`, a failure with the state at
+  -1 `FailedAndDoomed`, and a probe nobody answers leaves everything as it was. `tx_state` and
+  `spid` read their rows with `try_get`, never `get`, which unwraps: a reply of the wrong shape —
+  a connection out of step answering an earlier request — panicked the run task rather than
+  answering `None`. `fetch_query`, `commit_writes`, `fetch_blob` and
   `refetch_rows` all end in it, except over a lost connection, and `tx_alive` — MySQL's probe —
-  is never asked on this engine. `fetch_query` runs `run_statement` on the pinned client, and a result cut short at the
+  is never asked on this engine. `fetch_query` runs `run_statement` on the pinned client, and a lone statement's result cut short at the
   row cap needs no draining for the next statement: tiberius resynchronises the stream at the start
-  of every request (`flush_stream`). **`run_scope_sql` answers `false` for SQL Server without
+  of every request (`flush_stream`).
+  **A Stop is followed by a question: does the connection still answer its own requests?** An
+  attention the server did not acknowledge leaves its reply on the wire, and every reply after it
+  belongs to the request before — the next statement's grid showing the previous one's result, the
+  transaction probe reading another query's row. The driver now reads past an aborted request's
+  own error to the acknowledgement (patch 5, below), which is how a Stop of a batch that had
+  already failed was falling out of step; what is left is an attention refused, or not
+  acknowledged within `CANCEL_TIMEOUT`. So after any `DbError::Cancelled` from those four
+  operations `Session::resync_after_stop` asks `answers_in_step` — a `SELECT CAST(<n> AS bigint)`
+  of a number only that call could have sent, bounded by `CANCEL_TIMEOUT` — which costs one round
+  trip per Stop. Out of step, **the pinned connection is replaced** — the one place a `Session`
+  swaps its own connection: nothing more is sent on the old one, and dropping it closes the socket, so
+  the server rolls the transaction back and releases its locks; a fresh `connect` takes its place,
+  `server_id` (behind a `std::sync::Mutex` now, for this one change) becomes the new `@@SPID` so
+  Server Activity still recognises the tab, `in_tx` and the scope reset, and the operation reports
+  `StmtOutcome::ConnectionLost` — the transaction is gone and the tab has to hear it. If no
+  connection can be opened the backend becomes `Backend::Retired`, whose statements, writes and
+  reads answer `retired_error` until the tab is switched to Auto and back — a Rollback is `Ok`,
+  the server having rolled back already, and a Commit is refused as an aborted transaction
+  (`block_is_aborted` answers `true` for it). The live pin is
+  `a_stop_after_an_error_leaves_the_manual_session_in_step` (a `SELECT 1/0` and a `RAISERROR`, each
+  before a `WAITFOR` that is stopped, then the next statement's own reply; 2022 and 2025), which
+  panicked before the driver fix. It covers the in-step branch only: an out-of-step connection,
+  and so the replacement, could not be produced live, and nothing tests it.
+  **`run_scope_sql` answers `false` for SQL Server without
   asking**, over a private `ScopeStep`, for `write_on`'s reason — an unreleasable savepoint name —
   so the pinned reads run unfenced, which costs nothing because a cancelled read does not abort a
   SQL Server transaction. The grid's writes report isolation off `undone` instead: nothing
@@ -11778,7 +11849,8 @@ existing prose was left alone.
   `BEGIN TRAN` closes nothing, `ROLLBACK TRANSACTION sp` keeps the transaction, a plain `COMMIT` is
   `OkAndClosed`), `a_failure_is_folded_as_the_server_left_the_transaction` (a duplicate key is
   `Failed` and still committable; after `SET XACT_ABORT ON` the same error is
-  `FailedAndRolledBack`), `a_grid_edit_in_a_manual_session_is_isolated_and_uncommitted`,
+  `FailedAndRolledBack`), `a_caught_error_that_dooms_the_transaction_rolls_it_back_at_the_batch_end`
+  (under `core::tx`), `a_grid_edit_in_a_manual_session_is_isolated_and_uncommitted`,
   `a_stopped_statement_keeps_the_manual_transaction` (a `WAITFOR` stopped, the transaction kept, the
   next statement fine) and `a_read_only_connection_is_refused_a_manual_session`. Their outside view
   reads `WITH (READPAST)`: under READ COMMITTED a plain read from a second connection waits on the
@@ -12102,7 +12174,12 @@ existing prose was left alone.
   **`cancel_query` reading past the aborted request's reply to the acknowledgement** —
   `flush_done_attention` answers `None` where a message ends without it, and `cancel_request`
   loops over messages, clearing `flushed` between them, until it arrives. A server that never sends
-  one leaves it waiting, which is why every caller here bounds it with `CANCEL_TIMEOUT`. A re-vendor
+  one leaves it waiting, which is why every caller here bounds it with `CANCEL_TIMEOUT`. **An
+  `Error::Server` at a message's end is that end, not the drain's answer**: the first version
+  returned it through `?`, so a Stop of a batch that had already failed (`SELECT 1/0; WAITFOR …`)
+  answered with the division's error and left the `DONE_ATTN` message unread, and every later reply
+  on the connection belonged to the request before it — the next statement panicked a pinned
+  session's transaction probe (measured on 2022 and 2025). Any other error still propagates. A re-vendor
   re-applies the list; when it is empty the directory and the `[patch]` entry go. **One limit is
   not patched**: the driver cannot decode `varchar` text in code page 437 at all ("Encoding error:
   unsupported encoding (LCID 0x409, sort ID 32)"), so reading a `SQL_Latin1_General_CP437` column
@@ -24792,7 +24869,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   `COMMIT` read the previous statement's reply, reported as success over **0 committed rows** on
   MySQL 8.4.11 and as failure over a row that *was* committed on MariaDB 10.11.14.
   `session::pg_cancel_gate` holds the shape for both engines — see `schemaic-db` for what each gate
-  can and cannot see.
+  can and cannot see. SQL Server's arm keeps the rule by the attention and its acknowledgement,
+  and a connection that no longer answers its own requests after a Stop is not trusted but
+  replaced, the tab told `ConnectionLost` (`Session::resync_after_stop`, under `mssql.rs`).
   **The second exception is `Db::run_script`**, and it is a genuine one rather than a long call:
   the connection is pinned for the length of the whole file. A script's statements are not
   independent. A dump opens with `SET FOREIGN_KEY_CHECKS = 0` (`dump::fk_guard_sql`), may carry its

@@ -517,9 +517,38 @@ pub(crate) async fn tx_state(client: &mut MsClient) -> Option<(i64, i64)> {
         .await
         .ok()?;
     let row = stream.into_row().await.ok()??;
-    let count: i32 = row.get(0)?;
-    let state: i32 = row.get(1)?;
+    // `try_get`, never `get`: `get` unwraps, so a reply of the wrong shape — a
+    // connection out of step answering an earlier request — panicked the
+    // run task instead of answering `None`.
+    let count: i32 = row.try_get(0).ok()??;
+    let state: i32 = row.try_get(1).ok()??;
     Some((i64::from(count), i64::from(state)))
+}
+
+/// Does this connection answer its own requests? Asked of a pinned connection
+/// after a Stop, since what an unacknowledged attention leaves on the wire
+/// makes every later reply the answer to the request before it.
+///
+/// A query only this call could have sent — its own number — whose reply must
+/// be that number, bounded by [`crate::CANCEL_TIMEOUT`]. Anything else, an
+/// error or no answer in time, is `false`.
+pub(crate) async fn answers_in_step(client: &mut MsClient) -> bool {
+    // Far from any number a user's query plausibly returned last.
+    static NEXT: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0x5C4E_1C00_0000_0000);
+    let nonce = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let probe = async {
+        let stream = client
+            .simple_query(format!("SELECT CAST({nonce} AS bigint)"))
+            .await
+            .ok()?;
+        let row = stream.into_row().await.ok()??;
+        row.try_get::<i64, _>(0).ok()?
+    };
+    matches!(
+        tokio::time::timeout(crate::CANCEL_TIMEOUT, probe).await,
+        Ok(Some(n)) if n == nonce as i64
+    )
 }
 
 /// This connection's `@@SPID` — the id Server Activity lists it under. `None`
@@ -530,7 +559,7 @@ pub(crate) async fn spid(client: &mut MsClient) -> Option<i64> {
         .await
         .ok()?;
     let row = stream.into_row().await.ok()??;
-    row.get::<i32, _>(0).map(i64::from)
+    row.try_get::<i32, _>(0).ok()?.map(i64::from)
 }
 
 /// Run a statement for its side effect alone, reading its whole answer.
@@ -550,7 +579,12 @@ pub(crate) async fn drain(client: &mut MsClient, sql: &str) -> Result<(), DbErro
 /// no source.
 ///
 /// **One result set per read**, as the other engines report: a second
-/// announces itself with its own metadata, and the read stops there.
+/// announces itself with its own metadata, and the read goes on past it to
+/// the stream's end, its rows dropped — the driver raises a batch's error only
+/// there, and dropping the stream decided by timing whether the statements
+/// after it ran. Past the row cap the same, when the piece holds more than one
+/// statement ([`schemaic_core::sql::holds_several_statements`]); a lone
+/// statement's remaining rows are left unread.
 ///
 /// A cancel is TDS's own **attention**, on this connection: the driver's
 /// `cancel_query` aborts the running batch and waits for the server to
@@ -582,11 +616,16 @@ pub(crate) async fn run_statement(
         return Err(cancel_now(client).await);
     };
     let chunk_capacity = dest.chunk_capacity();
+    // Statements after the first result's end are statements the server still
+    // runs, and whose error is the batch's: past the cap, read on for them.
+    let several = schemaic_core::sql::holds_several_statements(sql, MS);
 
     let mut grid: Option<ResultBuilder> = None;
     let mut truncated = false;
     let mut cancelled = false;
     let mut sets = 0usize;
+    // Past what the grid shows: rows are read and dropped, to the stream's end.
+    let mut draining = false;
     // A block rather than an early return on a Stop: the stream borrows the
     // client until the block ends, and the attention needs the client.
     let affected = 'read: {
@@ -599,9 +638,12 @@ pub(crate) async fn run_statement(
         };
         let Some(opened) = opened else {
             cancelled = true;
-            break 'read 0;
+            break 'read Ok(0);
         };
-        let mut stream = opened.map_err(|e| db_err(&e))?;
+        let mut stream = match opened {
+            Ok(stream) => stream,
+            Err(e) => break 'read Err(batch_error(db_err(&e), several)),
+        };
         loop {
             let next = tokio::select! {
                 n = stream.next() => n,
@@ -611,24 +653,44 @@ pub(crate) async fn run_statement(
                 }
             };
             let Some(item) = next else { break };
-            match item.map_err(|e| db_err(&e))? {
+            let item = match item {
+                Ok(item) => item,
+                Err(e) => break 'read Err(batch_error(db_err(&e), several)),
+            };
+            match item {
                 QueryItem::Metadata(meta) => {
                     sets += 1;
                     if sets > 1 {
-                        tracing::warn!(
-                            "batch returned more than one result set; reporting only the first"
-                        );
-                        break;
+                        // **Read on to the end, never stop here.** The driver
+                        // raises a batch's error only when its stream ends, so
+                        // a read that dropped the stream at the second result
+                        // reported a failed batch as a success — and dropping
+                        // it aborted the statements after, or not, depending
+                        // on how much the first result returned.
+                        if !draining {
+                            tracing::warn!(
+                                "batch returned more than one result set; reporting only the first"
+                            );
+                        }
+                        draining = true;
+                        continue;
                     }
                     let columns = result_columns(meta.columns(), described.as_deref());
                     grid = Some(ResultBuilder::with_capacity(columns, chunk_capacity));
                 }
+                QueryItem::Row(_) if draining => {}
                 QueryItem::Row(row) => {
                     let Some(builder) = grid.as_mut() else {
                         continue;
                     };
                     if builder.row_count() >= row_cap {
                         truncated = true;
+                        // A lone statement's remaining rows are its own, and
+                        // left unread; a batch's later statements are not.
+                        if several {
+                            draining = true;
+                            continue;
+                        }
                         break;
                     }
                     let cells: Vec<Value> = row.cells().map(|(_, d)| cell_value(d)).collect();
@@ -642,11 +704,12 @@ pub(crate) async fn run_statement(
         }
         // The statement's own count is the last one: a trigger's statements
         // report theirs first, in the same batch.
-        stream.rows_affected().last().copied().unwrap_or(0)
+        Ok(stream.rows_affected().last().copied().unwrap_or(0))
     };
     if cancelled {
         return Err(cancel_now(client).await);
     }
+    let affected = affected?;
     let Some(mut builder) = grid else {
         return Ok(ResultSet::affected_rows(Vec::new(), affected)
             .with_elapsed(start.elapsed().as_millis()));
@@ -655,6 +718,21 @@ pub(crate) async fn run_statement(
     builder.set_truncated(truncated);
     builder.set_elapsed(start.elapsed().as_millis());
     Ok(builder.finish())
+}
+
+/// A batch's error, with what SQL Server did after it said when the batch held
+/// more than one statement: a statement's error ends that statement, not the
+/// batch, unless the error is one that aborts the batch — so a duplicate key
+/// followed by an `UPDATE` reports the duplicate while the `UPDATE` commits
+/// (measured on 2022). Only the server's own errors are annotated.
+fn batch_error(e: DbError, several: bool) -> DbError {
+    match e {
+        DbError::Query(m) if several => DbError::Query(format!(
+            "{m}\nSQL Server runs a batch on past a statement's error unless the error ends \
+             the batch, so the statements after the failing one may have run."
+        )),
+        other => other,
+    }
 }
 
 /// Stop what this connection is running — the attention, bounded by

@@ -123,3 +123,15 @@ Stop was reported as a rollback that could not be confirmed.
   `flushed` between them so the next one is read from the wire, until the
   acknowledgement arrives. A server that never sends one leaves it waiting;
   every caller in `schemaic_db::mssql` bounds it with `CANCEL_TIMEOUT`.
+- `src/tds/stream/token.rs`, `flush_done_attention`: **an error the aborted
+  request had raised is that request's, not the drain's answer.** `try_unfold`
+  raises a message's recorded `ERROR` token when the message ends, and the
+  first version of this patch returned it through `?` — so a Stop of a batch
+  that had already failed (`SELECT 1/0; WAITFOR …`) answered with the
+  division's error and left the `DONE_ATTN` message unread, and every later
+  reply on the connection belonged to the request before it (the next
+  statement panicked a pinned session's transaction probe, measured on 2022
+  and 2025). An `Error::Server` at the end of a message now ends it like any
+  other end, and the loop reads on; any other error still propagates.
+  `schemaic-db`'s live `a_stop_after_an_error_leaves_the_manual_session_in_step`
+  failed against the first version.
