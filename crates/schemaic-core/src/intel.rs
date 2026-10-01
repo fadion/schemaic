@@ -2994,11 +2994,12 @@ pub(crate) fn builtin_catalog(dialect: SqlDialect) -> Option<&'static [SqlFuncti
     }
 }
 
-/// The builtins `dialect`'s catalogue says are written **without
-/// parentheses** — `SYSTEM_USER`, `SESSION_USER`, `CURRENT_USER` — lower-cased:
-/// an entry whose signature is its bare name. A parser that carries one as an
-/// identifier hands the column resolver a function, which it reported as
-/// ``Column `system_user` not found``. Built once per dialect.
+/// The builtins `dialect` calls **without parentheses** — `SYSTEM_USER`,
+/// `SESSION_USER`, `CURRENT_USER` — lower-cased: an entry of its catalogue
+/// whose signature is its bare name, and the engine's
+/// [`bare_called_builtins`]. A parser that carries one as an identifier hands
+/// the column resolver a function, which it reported as ``Column
+/// `system_user` not found``. Built once per dialect.
 fn niladic_builtins(dialect: SqlDialect) -> &'static HashSet<String> {
     static SETS: [std::sync::OnceLock<HashSet<String>>; 4] =
         [const { std::sync::OnceLock::new() }; 4];
@@ -3014,8 +3015,62 @@ fn niladic_builtins(dialect: SqlDialect) -> &'static HashSet<String> {
             .iter()
             .filter(|f| !f.signature.contains('('))
             .map(|f| f.name.to_ascii_lowercase())
+            .chain(
+                bare_called_builtins(dialect)
+                    .iter()
+                    .map(|n| n.to_ascii_lowercase()),
+            )
             .collect()
     })
+}
+
+/// The builtins `dialect` calls bare that its catalogue does **not** spell
+/// bare, so [`niladic_builtins`]' catalogue rule cannot find them. MySQL's
+/// catalogue writes `CURRENT_USER()` and `UTC_TIMESTAMP()`, which the engine
+/// also takes without the parentheses, and PostgreSQL's — generated from
+/// `pg_proc` — holds no bare form at all, as the grammar implements these
+/// rather than the catalogue; so on both the rule found nothing, and `SELECT
+/// CURRENT_USER` was a red ``Column `current_user` not found``. Each name here
+/// returned a value bare on the live servers (MariaDB 10.11 and MySQL 8;
+/// PostgreSQL 16), and each is a reserved word there (`current_schema` one
+/// that may name a function or a type, never a column), so a bare one is never
+/// a column — save `CURRENT_ROLE` on MySQL, which MariaDB calls bare and MySQL 8
+/// takes for a column: exempting it there only leaves such a column unchecked,
+/// where leaving it out squiggles MariaDB's correct SQL. Words an engine does
+/// not call bare stay off its list: MySQL's `USER`, `SESSION_USER` and
+/// `SYSTEM_USER` are columns bare (`mysql.user` has a `User`), as is
+/// PostgreSQL's `now`. SQLite's (`current_date`, …) and SQL Server's
+/// (`SYSTEM_USER`, …) are spelled bare by their catalogues already.
+fn bare_called_builtins(dialect: SqlDialect) -> &'static [&'static str] {
+    match dialect {
+        SqlDialect::MySql => &[
+            "CURRENT_DATE",
+            "CURRENT_TIME",
+            "CURRENT_TIMESTAMP",
+            "CURRENT_USER",
+            "CURRENT_ROLE",
+            "LOCALTIME",
+            "LOCALTIMESTAMP",
+            "UTC_DATE",
+            "UTC_TIME",
+            "UTC_TIMESTAMP",
+        ],
+        SqlDialect::Postgres => &[
+            "CURRENT_CATALOG",
+            "CURRENT_DATE",
+            "CURRENT_ROLE",
+            "CURRENT_SCHEMA",
+            "CURRENT_TIME",
+            "CURRENT_TIMESTAMP",
+            "CURRENT_USER",
+            "LOCALTIME",
+            "LOCALTIMESTAMP",
+            "SESSION_USER",
+            "SYSTEM_USER",
+            "USER",
+        ],
+        SqlDialect::Sqlite | SqlDialect::MsSql => &[],
+    }
 }
 
 /// The functions whose **first argument is a datepart keyword** — `DATEADD(day,
@@ -14194,6 +14249,70 @@ mod tests {
                 SqlDialect::MySql
             ),
             ["nope"]
+        );
+    }
+
+    /// **MySQL's and PostgreSQL's bare-called builtins are not columns
+    /// either.** Their catalogues spell each with parentheses (`CURRENT_USER()`,
+    /// `UTC_TIMESTAMP()`) or not at all, so the catalogue rule that exempts SQL
+    /// Server's `SYSTEM_USER` found none on these two engines, and every one
+    /// below — each run bare on MariaDB 10.11, MySQL 8 and PostgreSQL 16 — was
+    /// a red ``Column `…` not found``. Quoted, the same word is a column name
+    /// again and is still checked; and a word an engine does not call bare
+    /// (MySQL's `USER`, PostgreSQL's `now`) stays a column there.
+    #[test]
+    fn a_bare_called_builtin_is_not_a_column_on_mysql_or_postgres() {
+        for (sql, dialect) in [
+            ("SELECT CURRENT_USER;", SqlDialect::MySql),
+            (
+                "SELECT UTC_TIMESTAMP, UTC_TIME, UTC_DATE FROM employees;",
+                SqlDialect::MySql,
+            ),
+            (
+                "SELECT id FROM employees WHERE name = CURRENT_USER;",
+                SqlDialect::MySql,
+            ),
+            (
+                "SELECT LOCALTIME, LOCALTIMESTAMP, CURRENT_ROLE FROM employees;",
+                SqlDialect::MySql,
+            ),
+            ("SELECT current_schema;", SqlDialect::Postgres),
+            (
+                "SELECT id FROM employees WHERE name = current_role;",
+                SqlDialect::Postgres,
+            ),
+            (
+                "SELECT current_catalog, session_user, user, system_user FROM employees;",
+                SqlDialect::Postgres,
+            ),
+        ] {
+            let d = diag_d(sql, dialect);
+            assert!(d.is_empty(), "{sql} on {dialect:?}: {d:?}");
+        }
+        let cols = |sql: &str, dialect: SqlDialect| -> Vec<String> {
+            diag_d(sql, dialect)
+                .into_iter()
+                .map(|x| sql[x.range.0..x.range.1].to_string())
+                .collect()
+        };
+        assert_eq!(
+            cols("SELECT `current_user` FROM employees;", SqlDialect::MySql),
+            ["`current_user`"]
+        );
+        assert_eq!(
+            cols(
+                "SELECT \"current_schema\" FROM employees;",
+                SqlDialect::Postgres
+            ),
+            ["\"current_schema\""]
+        );
+        assert_eq!(
+            cols("SELECT user FROM employees;", SqlDialect::MySql),
+            ["user"]
+        );
+        assert_eq!(
+            cols("SELECT now FROM employees;", SqlDialect::Postgres),
+            ["now"]
         );
     }
 

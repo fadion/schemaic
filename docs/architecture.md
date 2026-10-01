@@ -899,9 +899,15 @@ existing prose was left alone.
     datepart function's first argument (`DATEADD(day, …)`, and MySQL's `TIMESTAMPDIFF(SECOND,
     …)` — `datepart_functions`, per dialect; the call's span goes into `not_columns` before the
     visitor descends), a variable whose identifier keeps its `@` (`WHERE id = @x`, `@@ROWCOUNT` on
-    SQL Server, `@x`/`@@version` on MySQL), and a builtin the catalogue writes without parentheses
+    SQL Server, `@x`/`@@version` on MySQL), and a builtin called without parentheses
     (`SYSTEM_USER` — `niladic_builtins`, read off `builtin_catalog` where an entry's signature is its
-    bare name). `sql_server_measures_against_its_own_catalog` had filtered its statements to the
+    bare name, plus `bare_called_builtins`, a per-dialect list of what the engine calls bare and
+    its catalogue does not spell so: that rule alone found **nothing** on MySQL, whose catalogue
+    writes `CURRENT_USER()`, or on PostgreSQL, whose generated one has no bare form, so `SELECT
+    CURRENT_USER` and `current_schema` stayed red — every name on the list was run bare on MariaDB,
+    MySQL 8 and PostgreSQL 16, and a quoted one is a column again,
+    `a_bare_called_builtin_is_not_a_column_on_mysql_or_postgres`).
+    `sql_server_measures_against_its_own_catalog` had filtered its statements to the
     misspelled-function message and so passed over ``Column `day` not found`` on the one it named;
     it asserts no diagnostic at all now (`a_datepart_variable_or_niladic_builtin_is_not_a_column`). `INTO` (MySQL's trailing
     `SELECT … FROM t INTO @x`, a cursor's `FETCH … FROM c INTO @x`), T-SQL's second `FROM`
