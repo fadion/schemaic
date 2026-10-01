@@ -5236,8 +5236,13 @@ existing prose was left alone.
     has no variable to save the old value in, so where MySQL's wrapper puts back a user variable
     this one assumes. Every SQL Server module path goes through it: `trigger_create_statements`
     (the edit plan and the table rebuild's trigger replay), `TriggerInfo::create_set_sql` (the
-    dump), `session_wrapped` (the routine plan and `ObjectItem::create_sql`'s Copy DDL and dump),
-    both `ReplaceView` arms of `view_statements`, and `TableInfo::tsql_create_ddl`'s view branch
+    dump), `session_wrapped` (the routine plan), `routine_create_statements`
+    (`ObjectItem::create_sql`'s Copy DDL and dump — through `tsql_settings_around`, which wraps a
+    numbered group's head **and its other members** in the one pair: `sys.sql_modules` keeps one
+    row of settings for the group, and members scripted after the closing `SET … ON` were created
+    under `ON`, a member's `"member"` string turning into a column, Msg 207 —
+    `a_numbered_groups_members_are_scripted_inside_its_settings`; live,
+    `a_numbered_groups_script_keeps_its_settings_for_its_members`), both `ReplaceView` arms of `view_statements`, and `TableInfo::tsql_create_ddl`'s view branch
     (Copy DDL and the dump, the `SET`s as `GO` batches before the indexes). `alters_the_database`
     already counted a `SET` as scaffolding. Nothing is added for a module at the ANSI defaults.
     `a_view_is_edited_under_the_settings_it_was_created_with` and its trigger and routine siblings

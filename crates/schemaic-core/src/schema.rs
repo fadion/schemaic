@@ -5015,26 +5015,12 @@ impl ObjectItem {
             // server on one caller and are dropped on the other.
             //
             // A SQL Server numbered group's other members follow the head, as
-            // stored — see `TsqlRoutine::numbered`; empty everywhere else. One
-            // the server shows no text for (an encrypted member) is a comment
-            // that names it, as an encrypted routine is: written as its empty
-            // text, it was a bare `;` that said nothing.
-            ObjectItem::Routine(r) => {
-                let mut stmts =
-                    crate::ddl::session_wrapped(None, r.create_sql(dialect, false), r, dialect);
-                stmts.extend(r.tsql.numbered.iter().map(|(n, text)| {
-                    if text.trim().is_empty() {
-                        format!(
-                            "-- The definition of procedure {} was not available (it may be \
-                             encrypted, or not visible to this login).",
-                            crate::export::comment_text(&format!("{};{n}", r.name))
-                        )
-                    } else {
-                        text.trim().to_string()
-                    }
-                }));
-                crate::ddl::client_script(&stmts, dialect)
-            }
+            // stored and inside the group's settings — see
+            // `ddl::routine_create_statements`; empty everywhere else.
+            ObjectItem::Routine(r) => crate::ddl::client_script(
+                &crate::ddl::routine_create_statements(r, dialect),
+                dialect,
+            ),
             // Through `client_script` for the same reason a routine is: this
             // `CREATE` carries no terminator of its own (the apply path sends it
             // whole) and its body may be a `BEGIN … END` full of `;`.
@@ -9683,6 +9669,40 @@ mod tests {
             .expect(&sql);
         assert!(head < member, "{sql}");
         assert!(sql[head..member].contains("\nGO\n"), "{sql}");
+    }
+
+    /// **A numbered group's members are created under the group's settings
+    /// too**: `sys.sql_modules` holds one row for the group, so its members
+    /// were created under the head's `QUOTED_IDENTIFIER`/`ANSI_NULLS`. They
+    /// were scripted after the wrapper had put both back `ON`, and a member's
+    /// `"member"` string became a column (Msg 207, measured on SQL Server
+    /// 2022; R2-L8-04).
+    #[test]
+    fn a_numbered_groups_members_are_scripted_inside_its_settings() {
+        let r = RoutineInfo {
+            name: "grp".into(),
+            schema: Some("dbo".into()),
+            kind: RoutineKind::Procedure,
+            body: "SELECT \"head\"".into(),
+            tsql: TsqlRoutine {
+                numbered: vec![(2, "CREATE PROCEDURE dbo.grp;2 AS SELECT \"member\"".into())],
+                module: TsqlModule {
+                    quoted_identifier_off: true,
+                    ansi_nulls_off: true,
+                    ..TsqlModule::default()
+                },
+                ..TsqlRoutine::default()
+            },
+            ..Default::default()
+        };
+        let sql =
+            ObjectItem::Routine(std::sync::Arc::new(r)).create_sql(crate::intel::SqlDialect::MsSql);
+        let member = sql.find("CREATE PROCEDURE dbo.grp;2").expect(&sql);
+        for setting in ["QUOTED_IDENTIFIER", "ANSI_NULLS"] {
+            let off = sql.find(&format!("SET {setting} OFF;")).expect(&sql);
+            let on = sql.find(&format!("SET {setting} ON;")).expect(&sql);
+            assert!(off < member && member < on, "{setting}: {sql}");
+        }
     }
 
     /// **A SQL Server script closes each object's batch with `GO`.** A view, a

@@ -3625,6 +3625,40 @@ async fn a_numbered_procedure_group_survives_every_plan_for_its_head() {
     assert_eq!(s.scalar("EXEC dbo.grp;2").await, "2");
 }
 
+/// **A numbered group's script creates its members under the group's
+/// settings.** A group created under `QUOTED_IDENTIFIER OFF` has `"member"`
+/// strings in its members; scripted after the wrapper had put the setting
+/// back `ON`, the member was created reading a column, and the restore
+/// stopped at Msg 207. Dropped and replayed, each still returns its string.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_numbered_groups_script_keeps_its_settings_for_its_members() {
+    if !enabled() || azure_cannot("Azure SQL Database has no numbered procedures") {
+        return;
+    }
+    let s = Scratch::create("ddl_numbered_qi").await;
+    s.exec(
+        "SET QUOTED_IDENTIFIER OFF; EXEC ('CREATE PROCEDURE dbo.qgrp AS SELECT \"head\" AS n'); \
+         EXEC ('CREATE PROCEDURE dbo.qgrp;2 AS SELECT \"member\" AS n')",
+    )
+    .await;
+    let grp =
+        s.db.fetch_schema(&s.name, CancellationToken::new())
+            .await
+            .unwrap()
+            .routines
+            .iter()
+            .find(|r| r.name == "qgrp")
+            .unwrap()
+            .as_ref()
+            .clone();
+    assert!(grp.tsql.module.quoted_identifier_off, "{:?}", grp.tsql);
+    let ddl = schemaic_core::schema::ObjectItem::Routine(Arc::new(grp)).create_sql(MS);
+    s.exec("DROP PROCEDURE dbo.qgrp").await;
+    replay(&s, &ddl).await;
+    assert_eq!(s.scalar("EXEC dbo.qgrp").await, "head", "{ddl}");
+    assert_eq!(s.scalar("EXEC dbo.qgrp;2").await, "member", "{ddl}");
+}
+
 /// **A trigger is altered in place and keeps what the alter would reset.**
 /// Its header options come back through the parts (`EXECUTE AS`, `NOT FOR
 /// REPLICATION`), a disabled trigger stays disabled, the `First` rank any

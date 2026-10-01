@@ -8651,6 +8651,20 @@ pub(crate) fn tsql_settings_wrapped(
     create: String,
     m: &crate::schema::TsqlModule,
 ) -> Vec<String> {
+    tsql_settings_around(lead, vec![create], m)
+}
+
+/// [`tsql_settings_wrapped`] around **several** statements created under the
+/// one module's settings — a numbered procedure group's head and its other
+/// members, which `sys.sql_modules` keeps a single row of settings for. The
+/// wrapper closes after the last of them: a member scripted after it was
+/// created under `ON` whatever the group had, and a member's `"member"`
+/// string became a column (Msg 207, measured on SQL Server 2022).
+pub(crate) fn tsql_settings_around(
+    lead: Option<String>,
+    creates: Vec<String>,
+    m: &crate::schema::TsqlModule,
+) -> Vec<String> {
     let off: Vec<&str> = [
         ("ANSI_NULLS", m.ansi_nulls_off),
         ("QUOTED_IDENTIFIER", m.quoted_identifier_off),
@@ -8660,9 +8674,45 @@ pub(crate) fn tsql_settings_wrapped(
     .collect();
     let mut out: Vec<String> = off.iter().map(|s| format!("SET {s} OFF;")).collect();
     out.extend(lead);
-    out.push(create);
+    out.extend(creates);
     out.extend(off.iter().map(|s| format!("SET {s} ON;")));
     out
+}
+
+/// A routine's `CREATE` under the session it was created with — and on SQL
+/// Server **the other members of the numbered group it heads** after it,
+/// inside the same wrapper ([`tsql_settings_around`]), each as stored
+/// ([`crate::schema::TsqlRoutine::numbered`]; empty everywhere else). What
+/// recreates the whole routine: Copy DDL and the dump.
+///
+/// A member the server shows no text for (an encrypted one) is a comment
+/// that names it, as an encrypted routine is: written as its empty text, it
+/// was a bare `;` that said nothing.
+pub(crate) fn routine_create_statements(r: &RoutineInfo, d: SqlDialect) -> Vec<String> {
+    let head = r.create_sql(d, false);
+    match d {
+        SqlDialect::MsSql => {
+            let members = r.tsql.numbered.iter().map(|(n, text)| {
+                if text.trim().is_empty() {
+                    format!(
+                        "-- The definition of procedure {} was not available (it may be \
+                         encrypted, or not visible to this login).",
+                        crate::export::comment_text(&format!("{};{n}", r.name))
+                    )
+                } else {
+                    text.trim().to_string()
+                }
+            });
+            tsql_settings_around(
+                None,
+                std::iter::once(head).chain(members).collect(),
+                &r.tsql.module,
+            )
+        }
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => {
+            session_wrapped(None, head, r, d)
+        }
+    }
 }
 
 /// A trigger's `CREATE`, wrapped in the session state it was created under.
