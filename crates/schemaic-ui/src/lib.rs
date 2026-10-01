@@ -1505,6 +1505,13 @@ pub struct DdlPreview {
     /// answer — a SQL Server plan touching a natively compiled module runs
     /// outside a transaction although the engine's other plans do not.
     pub whole: bool,
+    /// What runs **after the plan commits**, on a connection of its own:
+    /// `(table, batch)` per table whose columns the plan moves —
+    /// [`schemaic_core::ddl::ChangeSet::refresh_elsewhere`], the refresh of
+    /// other databases' views that select `*` from it. Shown in the SQL box
+    /// under its own heading, since it runs too; empty on every plan that
+    /// moves no column, and on every engine but SQL Server.
+    pub after_commit: Vec<(String, String)>,
 }
 
 /// Where a DDL plan runs, and therefore what has to be re-read afterwards.
@@ -1541,6 +1548,10 @@ pub struct DdlRunRequest {
     /// [`DdlPreview::whole`], passed through: under [`DdlScope::Database`],
     /// `true` takes `Db::run_ddl` and `false` `Db::run_ddl_piecewise`.
     pub whole: bool,
+    /// [`DdlPreview::after_commit`], passed through: each batch runs through
+    /// `Db::refresh_elsewhere` once the plan is in, and what it could not do
+    /// is [`DdlOutcome::Applied`]'s note.
+    pub after_commit: Vec<(String, String)>,
 }
 
 /// How a DDL apply ended.
@@ -1550,8 +1561,11 @@ pub struct DdlRunRequest {
 /// refuses (see [`widgets::exit_action`]), so an outcome the modal can't
 /// recognise leaves it stuck on "Applying…" with no way out.
 pub enum DdlOutcome {
-    /// The whole plan is in effect.
-    Applied,
+    /// The whole plan is in effect. The note, where there is one, is what the
+    /// work after its commit could not do ([`DdlRunRequest::after_commit`],
+    /// `ddl::elsewhere_report`): the plan stands, and the modal says so under
+    /// it in the error colour.
+    Applied(Option<String>),
     /// Carries a message that already says which statement failed and how much
     /// of the plan stuck (see `schemaic_db::DdlError`).
     Failed(String),

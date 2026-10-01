@@ -1241,6 +1241,17 @@ impl SchemaPlan {
         self.sets.iter().flat_map(ChangeSet::emit).collect()
     }
 
+    /// The batches to run **after the plan commits** — each set's
+    /// [`ChangeSet::refresh_elsewhere`], in set order, beside the table it is
+    /// for (what [`ddl::elsewhere_report`] names). Empty where no set moves a
+    /// table's columns.
+    pub fn refresh_elsewhere(&self) -> Vec<(String, String)> {
+        self.sets
+            .iter()
+            .filter_map(|s| s.refresh_elsewhere().map(|sql| (s.table.clone(), sql)))
+            .collect()
+    }
+
     /// The script as it may **leave** a preview — for the clipboard and for the
     /// editor tab, split on `;` by the app's own splitter.
     ///
@@ -1276,10 +1287,16 @@ impl SchemaPlan {
     /// the day a re-read MySQL body reaches a plan — the fix `needs_source`
     /// defers rather than forecloses — the wrapping has to be here already.
     pub fn editor_script(&self) -> String {
+        // After the whole plan, as Apply runs them ([`Self::refresh_elsewhere`]).
+        let stmts: Vec<String> = self
+            .emit()
+            .into_iter()
+            .chain(self.refresh_elsewhere().into_iter().map(|(_, sql)| sql))
+            .collect();
         format!(
             "{}{}",
             ddl::withheld_header(&self.unsupported()),
-            ddl::client_script(&self.emit(), self.dialect)
+            ddl::client_script(&stmts, self.dialect)
         )
     }
 

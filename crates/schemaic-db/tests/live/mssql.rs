@@ -8518,6 +8518,114 @@ async fn a_column_move_applies_in_a_contained_database() {
     );
 }
 
+/// **Another database's `SELECT *` views are refreshed after the plan
+/// commits** (R3-L5-01). A view in another database selecting `*` from the
+/// table by a three-part name, one through a synonym there, one over that
+/// view, and one over the table's own database's `*` view each kept the old
+/// positions after a column move — `UPDATE xv SET balance = 0` landed on
+/// `credit_limit` — while the preview said only that they would. The batch
+/// the plan carries for after its commit refreshes each, leaves one that
+/// names its columns alone, and names the one it could not refresh: in a
+/// read-only database.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_column_move_refreshes_other_databases_views_after_it_commits() {
+    use schemaic_core::ddl::{TableDraft, diff, elsewhere_report};
+    if !enabled() || azure_cannot("has no cross-database reference to refresh") {
+        return;
+    }
+    let a = Scratch::create("xdb_src").await;
+    let b = Scratch::create("xdb_views").await;
+    let c = Scratch::create("xdb_ro").await;
+    a.exec("CREATE TABLE dbo.acct (id int PRIMARY KEY, balance int, credit_limit int)")
+        .await;
+    a.exec("INSERT dbo.acct VALUES (1, 1000, 50)").await;
+    a.exec("CREATE VIEW dbo.acct_v AS SELECT * FROM dbo.acct")
+        .await;
+    let src = format!("[{}].dbo", a.name);
+    for sql in [
+        format!("CREATE VIEW dbo.xv AS SELECT * FROM {src}.acct"),
+        format!("CREATE SYNONYM dbo.s_acct FOR {src}.acct"),
+        "CREATE VIEW dbo.sv AS SELECT * FROM dbo.s_acct".to_string(),
+        "CREATE VIEW dbo.vv AS SELECT * FROM dbo.xv".to_string(),
+        format!("CREATE VIEW dbo.over_local AS SELECT * FROM {src}.acct_v"),
+        format!("CREATE VIEW dbo.named AS SELECT id, balance FROM {src}.acct"),
+    ] {
+        b.exec(&sql).await;
+    }
+    c.exec(&format!("CREATE VIEW dbo.rv AS SELECT * FROM {src}.acct"))
+        .await;
+    let read_only = |on: bool| {
+        let name = c.name.clone();
+        async move {
+            base_db()
+                .fetch_query(
+                    None,
+                    &format!(
+                        "ALTER DATABASE [{name}] SET {} WITH ROLLBACK IMMEDIATE",
+                        if on { "READ_ONLY" } else { "READ_WRITE" }
+                    ),
+                    1,
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("the database's mode");
+        }
+    };
+    read_only(true).await;
+
+    let t = read_table(&a, "acct").await;
+    let mut d = TableDraft::from_table(&t);
+    d.columns.swap(1, 2);
+    let batch = diff(&t, &d, MS)
+        .refresh_elsewhere()
+        .expect("a plan that moves columns refreshes elsewhere");
+    apply_draft(&a, &t, &d).await;
+    let rows = a.db.refresh_elsewhere(&a.name, &batch).await;
+    read_only(false).await;
+    let rows = rows.expect("the refresh ran");
+    let of = |db: &str| -> Vec<(String, bool)> {
+        rows.iter()
+            .filter(|r| r.database == db)
+            .filter_map(|r| r.module.clone().map(|m| (m, r.error.is_none())))
+            .collect()
+    };
+    let mut refreshed = of(&b.name);
+    refreshed.sort();
+    assert_eq!(
+        refreshed,
+        [
+            ("[dbo].[over_local]".to_string(), true),
+            ("[dbo].[sv]".to_string(), true),
+            ("[dbo].[vv]".to_string(), true),
+            ("[dbo].[xv]".to_string(), true),
+        ],
+        "every * view over it, and not the one naming its columns: {rows:?}"
+    );
+    for view in ["xv", "sv", "vv", "over_local"] {
+        assert_eq!(
+            b.scalar(&format!(
+                "SELECT CONCAT(balance, ':', credit_limit) FROM dbo.{view}"
+            ))
+            .await,
+            "1000:50",
+            "{view} reads each column under its own name"
+        );
+    }
+    b.exec("UPDATE dbo.xv SET balance = 0 WHERE id = 1").await;
+    assert_eq!(
+        a.scalar("SELECT CONCAT(balance, ':', credit_limit) FROM dbo.acct")
+            .await,
+        "0:50",
+        "the write through the other database's view landed on balance"
+    );
+    assert_eq!(of(&c.name), [("[dbo].[rv]".to_string(), false)], "{rows:?}");
+    let report = elsewhere_report("acct", &rows, None).expect("a failure to say");
+    assert!(
+        report.contains(&format!("{}.[dbo].[rv] (", c.name)) && report.contains("read-only"),
+        "{report}"
+    );
+}
+
 /// **A computed column rebuilt around a rename refreshes what selects `*`.**
 /// Dropping `c` and adding it back moved it last, and a `SELECT *` view kept
 /// the old positions: it read `x` as `c`, and an `UPDATE` of `x` through it

@@ -9290,7 +9290,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         *ddl_token.borrow_mut() = Some(token.clone());
                         let report = create_ext_action(
                             cx,
-                            move |(changed, res): (bool, Result<(), String>)| {
+                            move |(changed, res): (bool, Result<Option<String>, String>)| {
                                 // Refresh before reporting, so the modal's success
                                 // state and the tree can't be seen disagreeing for
                                 // a frame. `changed`, not `is_ok()`: a MySQL plan
@@ -9333,7 +9333,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                     }
                                 }
                                 (done)(match res {
-                                    Ok(()) => DdlOutcome::Applied,
+                                    Ok(note) => DdlOutcome::Applied(note),
                                     Err(e) => DdlOutcome::Failed(e),
                                 });
                             },
@@ -9342,6 +9342,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         // and the `Rc` holding it can't.
                         let (database, statements) = (req.database.clone(), req.statements.clone());
                         let whole = req.whole;
+                        let after_commit = req.after_commit.clone();
                         handle.spawn(async move {
                             let out = match scope {
                                 // The database named here is what the run must
@@ -9363,7 +9364,34 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                 }
                             };
                             let changed = schemaic_db::ddl_changed_schema(&out);
-                            report((changed, out.map_err(|e| e.to_string())));
+                            // **Once the plan is in, and only then**: the
+                            // refresh of other databases' `SELECT *` views
+                            // (`ChangeSet::refresh_elsewhere`), each batch on
+                            // a connection of its own. What it could not do is
+                            // the applied plan's note; the plan stands either
+                            // way.
+                            let out = match out {
+                                Ok(()) => {
+                                    let mut notes: Vec<String> = Vec::new();
+                                    for (table, sql) in &after_commit {
+                                        let note = match db.refresh_elsewhere(&database, sql).await
+                                        {
+                                            Ok(rows) => schemaic_core::ddl::elsewhere_report(
+                                                table, &rows, None,
+                                            ),
+                                            Err(e) => schemaic_core::ddl::elsewhere_report(
+                                                table,
+                                                &[],
+                                                Some(&e.to_string()),
+                                            ),
+                                        };
+                                        notes.extend(note);
+                                    }
+                                    Ok((!notes.is_empty()).then(|| notes.join("\n")))
+                                }
+                                Err(e) => Err(e.to_string()),
+                            };
+                            report((changed, out));
                         });
                     })
                 };

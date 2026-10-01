@@ -162,6 +162,25 @@ pub(crate) fn close_preview(d: crate::DdlUi) {
     d.sql.set(String::new());
 }
 
+/// What the preview's SQL box shows: every statement Apply sends — the plan's,
+/// and then, under a heading saying when, what runs after it commits
+/// ([`DdlPreview::after_commit`]). Generated DDL is never run unseen, and the
+/// after-commit batch is generated DDL too.
+fn sql_box_text(p: &DdlPreview) -> String {
+    let mut out = p.statements.join("\n\n");
+    if !p.after_commit.is_empty() {
+        out.push_str(
+            "\n\n-- After the plan commits, on a connection of its own and outside its \
+             transaction: the views in other databases that select * from the table.",
+        );
+        for (_, sql) in &p.after_commit {
+            out.push_str("\n\n");
+            out.push_str(sql);
+        }
+    }
+    out
+}
+
 /// Open the preview on a change set.
 ///
 /// Takes the `DdlUi` rather than the whole [`crate::Ui`] because that is all it uses,
@@ -183,7 +202,7 @@ pub(crate) fn open_preview(d: crate::DdlUi, preview: DdlPreview) {
     // clear — and that is the distinction `export_script` was written to draw.
     // A `DELIMITER` wrapper belongs to those two for the same reason; the wire
     // has never heard of it and neither has this box.
-    d.sql.set(preview.statements.join("\n\n"));
+    d.sql.set(sql_box_text(&preview));
     d.sql_rows.set(SQL_ROWS);
     d.error.set(None);
     d.applied.set(false);
@@ -245,6 +264,11 @@ pub(crate) fn preview_of(
         // forget.
         dialect: cs.dialect,
         whole: cs.runs_whole(),
+        after_commit: cs
+            .refresh_elsewhere()
+            .map(|sql| (cs.table.clone(), sql))
+            .into_iter()
+            .collect(),
     }
 }
 
@@ -323,6 +347,7 @@ pub(crate) fn preview_of_plan(
         read_only,
         dialect: plan.dialect,
         whole: plan.runs_whole(),
+        after_commit: plan.refresh_elsewhere(),
     }
 }
 
@@ -782,6 +807,7 @@ fn apply(d: DdlUi, conn: ConnUi, run_ddl: DdlFn) {
             scope: p.scope,
             statements: p.statements.clone(),
             whole: p.whole,
+            after_commit: p.after_commit.clone(),
         },
         Rc::new(move |res| {
             // The modal was closed and reopened on something else while this ran
@@ -791,8 +817,11 @@ fn apply(d: DdlUi, conn: ConnUi, run_ddl: DdlFn) {
             }
             d.applying.set(false);
             match res {
-                DdlOutcome::Applied => {
+                DdlOutcome::Applied(note) => {
                     d.applied.set(true);
+                    // What the work after the commit could not do — under the
+                    // success lines, in the error colour, and the plan stands.
+                    d.error.set(note);
                     // The draft behind this is now the server's state, so
                     // whichever editor opened it has nothing left to show.
                     close_editors(d);
@@ -1716,6 +1745,59 @@ mod tests {
         // clear is load-bearing rather than defence in depth.
         close_preview(d);
         assert!(d.sql.get_untracked().is_empty());
+    }
+
+    /// **What runs after the commit is shown, and goes with the request.** A
+    /// SQL Server plan that moves a column carries the refresh of other
+    /// databases' `SELECT *` views for after its commit (R3-L5-01) — DDL the
+    /// app generated and runs, so the box shows it under a heading that says
+    /// when, the Copy carries it, and the request hands it to the app beside
+    /// the plan. A plan that moves nothing carries none.
+    #[test]
+    fn the_sql_box_shows_what_runs_after_the_commit() {
+        use schemaic_core::schema::{ColumnInfo, TableInfo};
+        let col = |name: &str| ColumnInfo {
+            name: name.into(),
+            type_name: "int".into(),
+            nullable: true,
+            ..Default::default()
+        };
+        let t = TableInfo {
+            name: "acct".into(),
+            schema: Some("dbo".into()),
+            columns: vec![col("id"), col("a"), col("b")],
+            ..Default::default()
+        };
+        let mut d = schemaic_core::ddl::TableDraft::from_table(&t);
+        d.columns.remove(1);
+        let cs = schemaic_core::ddl::diff(&t, &d, SqlDialect::MsSql);
+        let p = preview_of(1, "db", "acct", &cs, false);
+        assert_eq!(p.after_commit.len(), 1, "{:?}", p.after_commit);
+        let (table, batch) = &p.after_commit[0];
+        assert_eq!(table, "acct");
+        assert!(p.script.contains(batch.as_str()), "the copy carries it");
+        let shown = sql_box_text(&p);
+        let heading = shown
+            .find("-- After the plan commits")
+            .unwrap_or_else(|| panic!("{shown}"));
+        assert!(shown[heading..].contains(batch.as_str()), "{shown}");
+        assert!(
+            p.statements
+                .iter()
+                .all(|s| shown[..heading].contains(s.as_str())),
+            "the plan first: {shown}"
+        );
+        let mut same = schemaic_core::ddl::TableDraft::from_table(&t);
+        same.columns[1].info.name = "a2".into();
+        let rename = preview_of(
+            1,
+            "db",
+            "acct",
+            &schemaic_core::ddl::diff(&t, &same, SqlDialect::MsSql),
+            false,
+        );
+        assert!(rename.after_commit.is_empty());
+        assert!(!sql_box_text(&rename).contains("After the plan commits"));
     }
 
     /// **The one editor a close must leave standing.** A PostgreSQL trigger has

@@ -3169,6 +3169,39 @@ pub(crate) async fn run_ddl(
     Ok(())
 }
 
+/// Run one `ddl::ChangeSet::refresh_elsewhere` batch in `database`, outside
+/// any transaction, and read its `(db, module, error)` rows.
+///
+/// **Under the plan's lock wait** (`lock_wait_sql`): a view another session
+/// holds is that view's failure, caught in the batch, not a refresh that never
+/// returns. **Run twice where the first fails whole**: the batch steps into
+/// every other database, and a `… WITH ROLLBACK IMMEDIATE` on one of them
+/// kills the session that is inside it (Msg 596) — the walk is a refresh, so
+/// running it again does nothing twice that matters.
+pub(crate) async fn refresh_elsewhere(
+    db: &Db,
+    database: &str,
+    sql: &str,
+) -> Result<Vec<schemaic_core::ddl::ElsewhereRefresh>, DbError> {
+    let once = || async {
+        let mut client = connect(db, Some(database)).await?;
+        let _ = drain(&mut client, &crate::lock_wait_sql(crate::Engine::MsSql)).await;
+        query_rows(&mut client, sql).await
+    };
+    let rows = match once().await {
+        Ok(rows) => rows,
+        Err(_) => once().await?,
+    };
+    Ok(rows
+        .iter()
+        .map(|r| schemaic_core::ddl::ElsewhereRefresh {
+            database: cell(r, 0),
+            module: r.get(1).cloned().flatten(),
+            error: r.get(2).cloned().flatten(),
+        })
+        .collect())
+}
+
 // ── Write-back ───────────────────────────────────────────────────────────────
 //
 // The grid's edits, re-reads and binary cells. The statements are built here,

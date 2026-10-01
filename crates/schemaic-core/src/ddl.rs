@@ -4641,8 +4641,10 @@ impl ChangeSet {
                  from {0}, directly or through a synonym: SQL Server binds those to the \
                  table's columns by position, and would otherwise read and write the wrong \
                  columns. The plan fails if one of them no longer compiles against the new \
-                 columns. One in another database that selects * from {0} is not refreshed \
-                 and reads and writes the wrong columns until it is (sp_refreshview).",
+                 columns. One in another database that selects * from {0} is refreshed after \
+                 the plan commits, outside its transaction: until then it reads the old \
+                 positions, and if its refresh fails the plan stays applied and the view is \
+                 named here.",
                 self.table
             ));
         }
@@ -4671,6 +4673,20 @@ impl ChangeSet {
                     .filter(|c| supports_change(self.dialect, c)),
             ),
         }
+    }
+
+    /// The batch to run **after this plan commits**, on its own connection to
+    /// the table's database — the refresh of other databases' views that select
+    /// `*` from the table ([`tsql_refresh_elsewhere`]) — or `None` where the
+    /// plan refreshes nothing ([`Self::refreshes_star_dependents`], the answer
+    /// the plan's own refresh and the preview's sentence read too). Its rows
+    /// are `(db, module, error)`, for [`elsewhere_report`].
+    ///
+    /// Not in [`Self::emit`]: that is the plan's transaction, and entering
+    /// every database from inside one is what was measured unworkable.
+    pub fn refresh_elsewhere(&self) -> Option<String> {
+        self.refreshes_star_dependents()
+            .then(|| tsql_refresh_elsewhere(&self.qname()))
     }
 
     /// The changes in this set the dialect **can't express**, in plain language.
@@ -5135,10 +5151,17 @@ impl ChangeSet {
     /// does — a function body there is dollar-quoted, which `skip_noncode`
     /// already sees through.
     pub fn editor_script(&self) -> String {
+        // What Apply runs after the commit, after the plan — so the copy does
+        // what Apply does, in the same order.
+        let stmts: Vec<String> = self
+            .emit()
+            .into_iter()
+            .chain(self.refresh_elsewhere())
+            .collect();
         format!(
             "{}{}",
             self.withheld_header(),
-            client_script(&self.emit(), self.dialect)
+            client_script(&stmts, self.dialect)
         )
     }
 
@@ -12842,6 +12865,192 @@ fn tsql_refresh_star_dependents() -> String {
     )
 }
 
+/// The work table [`tsql_refresh_elsewhere`] reports into, a row per view it
+/// refreshed or could not, and per database it did not search.
+const TSQL_ELSEWHERE: &str = "#schemaic_elsewhere";
+
+/// **The refresh of other databases' `SELECT *` views, run after the plan
+/// commits** — on its own connection to the table's database, outside any
+/// transaction — whose rows [`elsewhere_report`] reads: `(db, module, error)`.
+///
+/// No catalogue in the table's database lists a view in another one, and
+/// entering every database *inside* the plan's transaction was measured
+/// unworkable ([`tsql_collect_star_dependents`] has why: Msg 596, Msg 911).
+/// Outside one, each step holds its locks only while it runs, and a database
+/// dropped mid-walk is an ordinary caught error (Msg 911, measured on 2022).
+/// So it re-collects what selects `*` from the table here — the table moved,
+/// and the plan's refresh brought its own views into line — and then enters
+/// each other online, multi-user database through `<db>.sys.sp_executesql`,
+/// where whatever names one of those objects by a three-part name, or through
+/// a synonym, and may hold a `*`, is a first level; the walk goes on as the
+/// plan's own does, and each is refreshed in its own `TRY`, so one that fails
+/// — a read-only database, a view that no longer compiles — is named and the
+/// rest still go.
+///
+/// **`sys.databases WITH (READPAST)`, and no `HAS_DBACCESS`**: a database
+/// another session is creating or dropping holds its catalogue row under a
+/// lock both wait on (see `db::mssql`'s listing). A database this login may
+/// not enter is caught when entered, and one offline or single-user (where
+/// entering would take the one slot) is named as not searched. A snapshot is
+/// a frozen copy and not asked. Nothing on Azure SQL Database, which has no
+/// cross-database reference to find.
+///
+/// One batch, ending in its own `;`, so a client script closes it with `GO`.
+fn tsql_refresh_elsewhere(table: &str) -> String {
+    let d = TSQL_STAR_DEPENDENTS;
+    let e = TSQL_ELSEWHERE;
+    let walk = "INSERT #schemaic_found (object_id, sch, name, type, lvl) \
+         SELECT DISTINCT o.object_id, SCHEMA_NAME(o.schema_id), o.name, o.type, @lvl \
+         FROM (SELECT d.referencing_id AS id FROM sys.sql_expression_dependencies d \
+         JOIN #schemaic_found p ON p.lvl = @lvl - 1 AND d.referenced_entity_name = p.name \
+         WHERE d.referenced_server_name IS NULL \
+         AND ISNULL(NULLIF(d.referenced_database_name, N''), DB_NAME()) = DB_NAME() \
+         AND (d.referenced_id = p.object_id OR (d.referenced_id IS NULL \
+         AND (ISNULL(d.referenced_schema_name, N'') = N'' OR d.referenced_schema_name = p.sch))) \
+         UNION SELECT y.object_id FROM sys.synonyms y \
+         JOIN #schemaic_found p ON p.lvl = @lvl - 1 AND PARSENAME(y.base_object_name, 1) = p.name \
+         WHERE PARSENAME(y.base_object_name, 4) IS NULL \
+         AND ISNULL(PARSENAME(y.base_object_name, 3), DB_NAME()) = DB_NAME() \
+         AND (PARSENAME(y.base_object_name, 2) IS NULL OR PARSENAME(y.base_object_name, 2) = p.sch)) f";
+    // What may hold a `*` — the plan's own rule (`tsql_collect_star_dependents`).
+    let star = "JOIN sys.objects o ON o.object_id = f.id \
+         WHERE (o.type = 'SN' OR (o.type IN ('V', 'IF') AND (OBJECT_DEFINITION(o.object_id) IS NULL \
+         OR CHARINDEX(N'*', OBJECT_DEFINITION(o.object_id)) > 0)))";
+    let inner = format!(
+        "CREATE TABLE #schemaic_found (object_id int NOT NULL, \
+         sch sysname COLLATE CATALOG_DEFAULT NOT NULL, name sysname COLLATE CATALOG_DEFAULT NOT NULL, \
+         type char(2) NOT NULL, lvl int NOT NULL) \
+         INSERT #schemaic_found (object_id, sch, name, type, lvl) \
+         SELECT DISTINCT o.object_id, SCHEMA_NAME(o.schema_id), o.name, o.type, 1 \
+         FROM (SELECT d.referencing_id AS id FROM sys.sql_expression_dependencies d \
+         JOIN {d} p ON d.referenced_entity_name = p.name COLLATE CATALOG_DEFAULT \
+         WHERE d.referenced_server_name IS NULL AND d.referenced_database_name = @db \
+         AND (ISNULL(d.referenced_schema_name, N'') = N'' \
+         OR d.referenced_schema_name = p.sch COLLATE CATALOG_DEFAULT) \
+         UNION SELECT y.object_id FROM sys.synonyms y \
+         JOIN {d} p ON PARSENAME(y.base_object_name, 1) = p.name COLLATE CATALOG_DEFAULT \
+         WHERE PARSENAME(y.base_object_name, 4) IS NULL AND PARSENAME(y.base_object_name, 3) = @db \
+         AND (PARSENAME(y.base_object_name, 2) IS NULL \
+         OR PARSENAME(y.base_object_name, 2) = p.sch COLLATE CATALOG_DEFAULT)) f {star} \
+         DECLARE @lvl int = 1 WHILE @lvl < 32 BEGIN SET @lvl += 1 {walk} {star} \
+         AND NOT EXISTS (SELECT 1 FROM #schemaic_found x WHERE x.lvl = @lvl AND x.object_id = o.object_id) \
+         IF @@ROWCOUNT = 0 BREAK END \
+         DECLARE @m nvarchar(600) DECLARE schemaic_refresh CURSOR LOCAL FAST_FORWARD FOR \
+         SELECT QUOTENAME(sch) + N'.' + QUOTENAME(name) FROM #schemaic_found \
+         WHERE type IN ('V', 'IF') GROUP BY object_id, sch, name ORDER BY MAX(lvl) \
+         OPEN schemaic_refresh FETCH NEXT FROM schemaic_refresh INTO @m \
+         WHILE @@FETCH_STATUS = 0 BEGIN \
+         BEGIN TRY EXEC sys.sp_refreshsqlmodule @m INSERT {e} VALUES (DB_NAME(), @m, NULL) END TRY \
+         BEGIN CATCH INSERT {e} VALUES (DB_NAME(), @m, ERROR_MESSAGE()) END CATCH \
+         FETCH NEXT FROM schemaic_refresh INTO @m END \
+         CLOSE schemaic_refresh DEALLOCATE schemaic_refresh"
+    );
+    format!(
+        "SET NOCOUNT ON {collect} \
+         CREATE TABLE {e} (db sysname NOT NULL, module nvarchar(600) NULL, error nvarchar(4000) NULL) \
+         IF CAST(SERVERPROPERTY('EngineEdition') AS int) <> 5 BEGIN \
+         DECLARE @db sysname = DB_NAME() \
+         INSERT {e} (db, module, error) \
+         SELECT name, NULL, CASE WHEN state <> 0 THEN state_desc ELSE user_access_desc END \
+         FROM sys.databases WITH (READPAST) WHERE database_id <> DB_ID() AND name <> N'tempdb' \
+         AND source_database_id IS NULL AND (state <> 0 OR user_access <> 0) \
+         DECLARE @other sysname, @proc nvarchar(300) \
+         DECLARE schemaic_dbs CURSOR LOCAL FAST_FORWARD FOR \
+         SELECT name FROM sys.databases WITH (READPAST) WHERE database_id <> DB_ID() \
+         AND name <> N'tempdb' AND source_database_id IS NULL AND state = 0 AND user_access = 0 \
+         ORDER BY name \
+         OPEN schemaic_dbs FETCH NEXT FROM schemaic_dbs INTO @other \
+         WHILE @@FETCH_STATUS = 0 BEGIN \
+         SET @proc = QUOTENAME(@other) + N'.sys.sp_executesql' \
+         BEGIN TRY EXEC @proc {inner}, N'@db sysname', @db END TRY \
+         BEGIN CATCH INSERT {e} VALUES (@other, NULL, ERROR_MESSAGE()) END CATCH \
+         FETCH NEXT FROM schemaic_dbs INTO @other END \
+         CLOSE schemaic_dbs DEALLOCATE schemaic_dbs END \
+         SELECT db, module, error FROM {e} ORDER BY db, module \
+         DROP TABLE {e} DROP TABLE {d};",
+        collect = tsql_collect_star_dependents(table).trim_end_matches(';'),
+        inner = tsql_n(&inner),
+    )
+}
+
+/// One row of [`tsql_refresh_elsewhere`]'s report: a view or inline function
+/// in `database` refreshed (`error` `None`) or not, or — `module` `None` — a
+/// database not searched, and why.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ElsewhereRefresh {
+    pub database: String,
+    pub module: Option<String>,
+    pub error: Option<String>,
+}
+
+/// What the refresh after the commit ([`ChangeSet::refresh_elsewhere`]) could
+/// **not** do, as the sentence the applied plan's modal shows — or `None`
+/// where it did everything, which is what the preview already said it would.
+/// `failed` is the batch's own failure, where nothing was refreshed at all.
+///
+/// A view whose refresh failed is named, with the server's reason, since it
+/// still reads and writes by position; a database the walk could not enter is
+/// named as not searched, since a view there may be one. Each list stops at
+/// eight names, as [`crate::dump::folder_replace_prompt`]'s does.
+pub fn elsewhere_report(
+    table: &str,
+    rows: &[ElsewhereRefresh],
+    failed: Option<&str>,
+) -> Option<String> {
+    const SHOWN: usize = 8;
+    if let Some(e) = failed {
+        return Some(format!(
+            "The views in other databases that select * from {table} were not refreshed ({e}), \
+             and read and write the wrong columns until they are (sp_refreshview)."
+        ));
+    }
+    let list = |items: Vec<String>| {
+        let n = items.len();
+        let mut out = items.into_iter().take(SHOWN).collect::<Vec<_>>().join(", ");
+        if n > SHOWN {
+            out.push_str(&format!(", and {} more", n - SHOWN));
+        }
+        out
+    };
+    let unrefreshed: Vec<String> = rows
+        .iter()
+        .filter_map(|r| match (&r.module, &r.error) {
+            (Some(m), Some(e)) => Some(format!("{}.{m} ({e})", r.database)),
+            _ => None,
+        })
+        .collect();
+    let unsearched: Vec<String> = rows
+        .iter()
+        .filter(|r| r.module.is_none())
+        .map(|r| match &r.error {
+            Some(e) => format!("{} ({e})", r.database),
+            None => r.database.clone(),
+        })
+        .collect();
+    let mut out: Vec<String> = Vec::new();
+    if !unrefreshed.is_empty() {
+        let n = unrefreshed.len();
+        out.push(format!(
+            "{n} {} in another database that {} * from {table} could not be refreshed, and \
+             {} the wrong columns until {} (sp_refreshview): {}.",
+            crate::text::plural(n, "view", "views"),
+            crate::text::plural(n, "selects", "select"),
+            crate::text::plural(n, "reads and writes", "read and write"),
+            crate::text::plural(n, "it is", "they are"),
+            list(unrefreshed),
+        ));
+    }
+    if !unsearched.is_empty() {
+        let n = unsearched.len();
+        out.push(format!(
+            "{n} {} not searched for a view that selects * from {table}: {}.",
+            crate::text::plural(n, "database was", "databases were"),
+            list(unsearched),
+        ));
+    }
+    (!out.is_empty()).then(|| out.join("\n"))
+}
+
 /// A column whose values the server makes, so no `INSERT` names it: a
 /// computed one, and a `rowversion` — asked of its type, since the reader
 /// sets `identity_always` on an identity too, and the designer's toggle
@@ -18389,8 +18598,131 @@ mod tests {
         d.columns.swap(1, 2);
         let risk = diff(&t, &d, MsSql).destructive().join(" ");
         assert!(
-            risk.contains("One in another database that selects * from p is not refreshed"),
+            risk.contains(
+                "One in another database that selects * from p is refreshed after the plan \
+                 commits"
+            ),
             "{risk}"
+        );
+    }
+
+    /// **Another database's `SELECT *` views are refreshed after the plan
+    /// commits** (R3-L5-01): no catalogue in the table's database lists them,
+    /// and entering every database inside the plan's transaction held a lock
+    /// on each until commit (Msg 596 under any `ALTER DATABASE … WITH ROLLBACK
+    /// IMMEDIATE`) and was doomed by one dropped mid-walk (Msg 911) — measured.
+    /// So the plan carries a batch of its own, run on its own connection once
+    /// the plan is in: it re-collects the table's dependents here, then enters
+    /// each other online multi-user database with `sp_executesql` — never
+    /// asking `HAS_DBACCESS`, which waits on a database mid-create — and
+    /// refreshes, each in its own `TRY`, what selects `*` from any of them by a
+    /// three-part name or a synonym. Not in the plan's script, which runs in
+    /// the transaction; in the copy a client runs, after it.
+    #[test]
+    fn a_plan_that_moves_columns_refreshes_other_databases_after_it_commits() {
+        let t = ms_rebuild_table();
+        let mut d = TableDraft::from_table(&t);
+        d.columns.swap(1, 2);
+        let cs = diff(&t, &d, MsSql);
+        let batch = cs
+            .refresh_elsewhere()
+            .expect("a batch for after the commit");
+        for needle in [
+            "CREATE TABLE #schemaic_star_dependents",
+            "sys.databases WITH (READPAST)",
+            "state = 0 AND user_access = 0",
+            ".sys.sp_executesql",
+            "referenced_database_name = @db",
+            "COLLATE CATALOG_DEFAULT",
+            "BEGIN TRY",
+            "sp_refreshsqlmodule",
+            "SERVERPROPERTY('EngineEdition')",
+            "SELECT db, module, error FROM #schemaic_elsewhere",
+        ] {
+            assert!(batch.contains(needle), "{needle} not in {batch}");
+        }
+        assert!(!batch.contains("HAS_DBACCESS"), "{batch}");
+        assert!(
+            !cs.emit().iter().any(|s| s.contains("sys.databases")),
+            "not inside the plan's transaction"
+        );
+        assert!(
+            cs.editor_script().ends_with(&format!("{batch}\nGO")),
+            "{}",
+            cs.editor_script()
+        );
+        // Nothing to refresh where nothing moves, where the table is renamed
+        // too, or on an engine that binds `*` by name.
+        let mut renamed = d.clone();
+        renamed.name = "p2".into();
+        assert_eq!(diff(&t, &renamed, MsSql).refresh_elsewhere(), None);
+        let mut retyped = TableDraft::from_table(&t);
+        retyped.columns[1].info.name = "other".into();
+        assert_eq!(diff(&t, &retyped, MsSql).refresh_elsewhere(), None);
+        assert_eq!(diff(&t, &d, MySql).refresh_elsewhere(), None);
+    }
+
+    /// **What the refresh after the commit could not do is said, and nothing
+    /// else.** A view refreshed is what the preview promised; one whose refresh
+    /// failed still reads by position and is named with the server's reason,
+    /// and a database the walk could not enter — offline, single-user, not
+    /// this login's, gone — is named as not searched. The whole batch failing
+    /// says that nothing was refreshed. Long lists are cut, as a folder
+    /// export's prompt is.
+    #[test]
+    fn the_refresh_elsewhere_reports_what_it_could_not_do() {
+        let row = |db: &str, module: Option<&str>, error: Option<&str>| ElsewhereRefresh {
+            database: db.into(),
+            module: module.map(Into::into),
+            error: error.map(Into::into),
+        };
+        assert_eq!(elsewhere_report("acct", &[], None), None);
+        assert_eq!(
+            elsewhere_report("acct", &[row("b", Some("[dbo].[xv]"), None)], None),
+            None
+        );
+        let failed = elsewhere_report(
+            "acct",
+            &[
+                row("b", Some("[dbo].[xv]"), None),
+                row("c", Some("[dbo].[rv]"), Some("the database is read-only.")),
+            ],
+            None,
+        )
+        .expect("a failure");
+        assert_eq!(
+            failed,
+            "1 view in another database that selects * from acct could not be refreshed, and \
+             reads and writes the wrong columns until it is (sp_refreshview): c.[dbo].[rv] \
+             (the database is read-only.)."
+        );
+        let unsearched = elsewhere_report(
+            "acct",
+            &[
+                row("off", None, Some("OFFLINE")),
+                row("gone", None, Some("Database 'gone' does not exist.")),
+            ],
+            None,
+        )
+        .expect("databases not searched");
+        assert_eq!(
+            unsearched,
+            "2 databases were not searched for a view that selects * from acct: off (OFFLINE), \
+             gone (Database 'gone' does not exist.)."
+        );
+        let many: Vec<ElsewhereRefresh> = (0..10)
+            .map(|i| row(&format!("d{i}"), None, Some("OFFLINE")))
+            .collect();
+        let cut = elsewhere_report("acct", &many, None).unwrap();
+        assert!(cut.starts_with("10 databases were not searched"), "{cut}");
+        assert!(cut.ends_with("d7 (OFFLINE), and 2 more."), "{cut}");
+        assert_eq!(
+            elsewhere_report("acct", &[], Some("connection reset")).as_deref(),
+            Some(
+                "The views in other databases that select * from acct were not refreshed \
+                 (connection reset), and read and write the wrong columns until they are \
+                 (sp_refreshview)."
+            )
         );
     }
 

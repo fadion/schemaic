@@ -4664,15 +4664,41 @@ existing prose was left alone.
     catalogue is always `Latin1_General_100_CI_AS_KS_WS_SC` — and there the join was Msg 468, so no
     plan that moves a column could be applied in a contained database
     (`the_star_collector_compares_under_the_catalogues_collation`; live,
-    `a_column_move_applies_in_a_contained_database`). **A
-    view in another database is not looked for, and the preview's sentence says so**, naming
-    `sp_refreshview`: no catalogue in this database lists one, and entering every database from
-    inside the plan's transaction was built and measured on 2022 before it was dropped — the
+    `a_column_move_applies_in_a_contained_database`). **A view in another database is not looked
+    for inside the plan**: no catalogue in this database lists one, and entering every database
+    from inside the plan's transaction was built and measured on 2022 before it was dropped — the
     transaction then holds a shared lock on each database it entered until it commits, so for a
     rebuild's whole copy any `ALTER DATABASE`/`DROP DATABASE` on the server waits on the plan or,
     `WITH ROLLBACK IMMEDIATE`, kills it (Msg 596 — the live tier's own scratch teardown did it on the
     first run), and a database dropped between the listing and its turn dooms the transaction even
-    inside a `CATCH` (Msg 911, `XACT_STATE()` -1). `tsql_refresh_star_dependents()` then walks a
+    inside a `CATCH` (Msg 911, `XACT_STATE()` -1). **It is refreshed after the plan commits
+    instead** (R3-L5-01): `ChangeSet::refresh_elsewhere()` — `Some` exactly where
+    `refreshes_star_dependents()` is — is one batch (`tsql_refresh_elsewhere`) the preview carries
+    beside the plan (`DdlPreview::after_commit`, shown in the SQL box under its own heading and
+    appended to the copied script), and the app runs it through `Db::refresh_elsewhere` on a
+    connection of its own once `run_ddl` has returned `Ok`. Outside a transaction each step holds
+    its locks only while it runs, and a database gone mid-walk is an ordinary caught error (Msg
+    911, measured). The batch re-runs the collector in the table's database, then for each other
+    database in `sys.databases WITH (READPAST)` that is online and multi-user (never asking
+    `HAS_DBACCESS`, which waits on a database mid-create; a snapshot is not asked) enters it with
+    `<db>.sys.sp_executesql` and walks as the plan does from whatever names a collected object by a
+    three-part name or through a synonym — so a view there over this database's own `*` view is
+    found too — and refreshes each in its own `TRY`, writing `(db, module, error)` rows; one offline
+    or single-user is a row with no module, and Azure SQL Database, with no cross-database reference
+    to find, is skipped. `Db::refresh_elsewhere` sets the plan's lock wait and runs the batch twice
+    where the first fails whole, since a `WITH ROLLBACK IMMEDIATE` on a database the walk is inside
+    kills its session. `ddl::elsewhere_report` turns the rows into what the walk could not do — a
+    view whose refresh failed, named with the server's reason, and a database not searched, each
+    list cut at eight — and that is `DdlOutcome::Applied`'s note, shown under the success lines in
+    the error colour, the plan standing either way. A view the walk refreshed was promised, and is
+    not repeated (`a_plan_that_moves_columns_refreshes_other_databases_after_it_commits`,
+    `the_refresh_elsewhere_reports_what_it_could_not_do`,
+    `the_sql_box_shows_what_runs_after_the_commit`; live,
+    `a_column_move_refreshes_other_databases_views_after_it_commits`, with views by three-part
+    name, through a synonym, over a view, over this database's own `*` view, one naming its
+    columns, and one in a read-only database). The cost is a window: between the commit and the
+    refresh such a view reads the old positions, which the preview's sentence says. Inside the
+    plan, after the collector, `tsql_refresh_star_dependents()` walks a
     cursor running `EXEC sys.sp_refreshsqlmodule` on each kept object of type `V` or `IF`, nearest
     level first so a view over a view re-expands against one already refreshed, and drops the temp
     table; a synonym needs nothing, and a procedure, a trigger or a multi-statement function

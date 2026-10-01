@@ -2307,6 +2307,27 @@ impl Db {
         }
     }
 
+    /// Run a plan's **after-commit batch** —
+    /// [`ChangeSet::refresh_elsewhere`](schemaic_core::ddl::ChangeSet::refresh_elsewhere),
+    /// the refresh of other databases' `SELECT *` views — on a connection of
+    /// its own to `database`, once the plan itself is in, and read back what it
+    /// refreshed and what it could not. [`schemaic_core::ddl::elsewhere_report`]
+    /// turns that into the sentence the applied plan shows.
+    ///
+    /// No transaction and no cancel: the plan is already committed, and the
+    /// batch's own `TRY`s keep one failure from stopping the rest. Only SQL
+    /// Server has such a batch; on the other engines there is nothing to run.
+    pub async fn refresh_elsewhere(
+        &self,
+        database: &str,
+        sql: &str,
+    ) -> Result<Vec<schemaic_core::ddl::ElsewhereRefresh>, DbError> {
+        match self.engine {
+            Engine::MsSql => mssql::refresh_elsewhere(self, database, sql).await,
+            Engine::Postgres | Engine::Sqlite | Engine::MySql => Ok(Vec::new()),
+        }
+    }
+
     /// Run a **server-level** DDL plan — `CREATE DATABASE` / `DROP DATABASE`,
     /// the two changes `ddl::is_server_level` marks.
     ///
