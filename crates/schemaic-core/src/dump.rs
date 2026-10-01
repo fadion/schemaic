@@ -56,7 +56,10 @@ pub struct DumpOptions {
     /// which fails on the first column typed as one of the database's enums, so
     /// it is on by default.
     pub other_objects: bool,
-    /// `DROP TABLE IF EXISTS` before each `CREATE`.
+    /// `DROP TABLE IF EXISTS` before each `CREATE` — and, where the file
+    /// drops up front ([`drops_up_front`]) inside its transaction, every
+    /// routine in the dumped namespaces too ([`drop_before_create_hint`] is
+    /// how the modal says so). Never what the file cannot put back as it is.
     pub drop_if_exists: bool,
     /// Wrap the load in one transaction.
     ///
@@ -663,6 +666,26 @@ pub fn refuse_if_present_sql(dialect: SqlDialect, object: &str, why: &str) -> Op
             crate::schema::ddl_string(why, dialect),
         )),
         SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => None,
+    }
+}
+
+/// The hint under the modal's *Drop before create* toggle on `dialect` —
+/// the only consent the export asks for what a replay of the file drops.
+///
+/// **Where the file drops up front ([`drops_up_front`]) it says the
+/// routines too.** There the toggle also drops and replaces every function
+/// and procedure in the dumped schemas, used by the tables or not, so a
+/// replay of an older dump puts older routine code in place of newer — and
+/// the hint spoke of tables alone, which is all it means on the other
+/// engines.
+pub fn drop_before_create_hint(dialect: SqlDialect) -> &'static str {
+    if drops_up_front(dialect) {
+        "Drop each table and view before its CREATE, so the file loads onto a database that \
+         already holds them. With One transaction it also replaces every routine in their \
+         schemas, and stops before dropping anything it cannot put back as it is."
+    } else {
+        "DROP TABLE IF EXISTS before each CREATE, so the file loads onto a database \
+         that already holds these tables."
     }
 }
 
@@ -1987,6 +2010,9 @@ pub fn plan(
     // `(object, label)` for each refusal, and the label of each kept one.
     let mut refused: Vec<(String, String)> = Vec::new();
     let mut kept: Vec<String> = Vec::new();
+    // The routines a replay drops and recreates — every one in the dumped
+    // namespaces, used by the tables or not, which the header names.
+    let mut replaced: Vec<String> = Vec::new();
     let mut hold = |h: Hold, name: String| match h {
         Hold::Keep => kept.push(name),
         Hold::Refuse { object, why } => refused.push((object, format!("{name} ({why})"))),
@@ -2069,6 +2095,7 @@ pub fn plan(
                             hold(h, display_name(r.schema.as_deref(), &r.name));
                             return None;
                         }
+                        replaced.push(display_name(r.schema.as_deref(), &r.name));
                         Some(format!(
                             "DROP {} IF EXISTS {};",
                             kind.sql_keyword(),
@@ -2483,7 +2510,20 @@ pub fn plan(
         steps.push(DumpStep::Text(close.to_string()));
     }
 
-    // ── The header's last word: what a replay leaves standing ────────────────
+    // ── The header's last word: what a replay replaces and leaves standing ───
+    //
+    // The routines first: the toggle that drops them is the export's only
+    // consent, and they are not what anyone ticked.
+    if !replaced.is_empty() {
+        let n = replaced.len();
+        header.push_str(&format!(
+            "\n--\n-- Replayed onto a database that already holds them, this file replaces {n} {} in these schemas,\n\
+             -- used by the tables above or not, with the {} it carries: {}.",
+            crate::text::plural(n, "routine", "routines"),
+            crate::text::plural(n, "version", "versions"),
+            crate::export::comment_text(&replaced.join(", ")),
+        ));
+    }
     let refused: Vec<String> = refused.into_iter().map(|(_, label)| label).collect();
     if !refused.is_empty() {
         let n = refused.len();
@@ -5023,6 +5063,56 @@ mod tests {
             two.contains("any of these") && two.ends_with("as they are: a, b."),
             "{two}"
         );
+    }
+
+    /// **The *Drop before create* toggle says what it drops.** On an engine
+    /// that drops up front it also replaces every routine in the dumped
+    /// schemas, used by the tables or not — a replay of an older dump puts
+    /// older routine code in place of newer — while the toggle spoke of
+    /// tables alone, and so did the file. Both say so now, computed from
+    /// `drops_up_front` rather than the engine.
+    #[test]
+    fn the_drop_toggle_and_the_header_name_the_routines_a_replay_replaces() {
+        for d in [
+            SqlDialect::MySql,
+            SqlDialect::Postgres,
+            SqlDialect::Sqlite,
+            SqlDialect::MsSql,
+        ] {
+            let hint = drop_before_create_hint(d);
+            assert_eq!(hint.contains("routine"), drops_up_front(d), "{d:?}: {hint}");
+            assert!(hint.contains("CREATE"), "{d:?}: {hint}");
+        }
+        let mut t = table("orders");
+        t.schema = Some("dbo".to_string());
+        let mut s = schema_of(vec![t]);
+        s.routines
+            .push(std::sync::Arc::new(crate::schema::RoutineInfo {
+                name: "p_report".to_string(),
+                schema: Some("dbo".to_string()),
+                kind: crate::schema::RoutineKind::Procedure,
+                body: "SELECT 1".to_string(),
+                ..Default::default()
+            }));
+        let header = text_of(&plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::MsSql,
+        ));
+        assert!(
+            header.contains("replaces 1 routine in these schemas")
+                && header.contains("dbo.p_report"),
+            "{header}"
+        );
+        // Without the transaction no routine is dropped, and nothing is said.
+        let opts = DumpOptions {
+            wrap_transaction: false,
+            ..Default::default()
+        };
+        let header = text_of(&plan(&s, "shop", &all(&s), opts, SqlDialect::MsSql));
+        assert!(!header.contains("replaces"), "{header}");
     }
 
     /// **A replay never drops a graph table.** An edge's rows are not in the

@@ -18272,7 +18272,12 @@ existing prose was left alone.
     offered on a **read-only** connection, unlike Import — it reads the server and writes a local
     file. The code keeps the `dump` name throughout, for the reason `core::dump`'s entry gives. It
     collects a table selection and — for `Sql` — the six `DumpOptions`, and hands both to
-    `SchemaActions::dump_run`; nothing here builds SQL.
+    `SchemaActions::dump_run`; nothing here builds SQL. **The *Drop before create* hint is
+    `dump::drop_before_create_hint(dialect)`**, the only consent the export asks for what a replay
+    drops: on SQL Server (`drops_up_front`) the toggle also replaces every routine in the dumped
+    schemas, used by the tables or not, while the hint spoke of tables alone — so a replay of an
+    older dump silently put older routine code in place of newer. The file's header names those
+    routines too (`the_drop_toggle_and_the_header_name_the_routines_a_replay_replaces`).
     **One panel serves all six, and the split is asked as a capability.** Which entry was clicked is
     `DumpTarget::format`, and `DumpTarget::writes_folder()` — `!matches!(format, Sql)`, written once
     — is what the modal branches on: the title (`Export sakila to CSV`, the one thing about this

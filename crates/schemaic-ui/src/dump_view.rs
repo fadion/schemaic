@@ -641,8 +641,8 @@ fn dump_options(d: crate::DumpUi, dialect: SqlDialect, ring: FocusRing) -> impl 
         form_section("Replaying"),
         crate::settings::focusable_toggle_row(
             "Drop before create",
-            "DROP TABLE IF EXISTS before each CREATE, so the file loads onto a database \
-             that already holds these tables.",
+            // What it drops differs by engine — see the core function.
+            schemaic_core::dump::drop_before_create_hint(dialect),
             d.drop_if_exists,
             ring.clone(),
             TAB_OPTS + 30,
