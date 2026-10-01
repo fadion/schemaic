@@ -3993,6 +3993,10 @@ existing prose was left alone.
     hint, naming the keyword `definition_sql` writes — it read *Auto-increment (AUTO_INCREMENT)* on
     SQL Server. `supports_index_prefix(dialect)` is MySQL's alone, and the index key hint names the
     `bio(20)` prefix syntax only there; it named it on every engine but PostgreSQL.
+    `supports_index_include(dialect)` sits beside it, true on SQL Server and PostgreSQL and false on
+    MySQL and SQLite, which have no `INCLUDE` clause: the index form builds its *Include* field only
+    where it is true, and `IndexInfo::include_sql` writes nothing where it is false (below, and
+    under `schema.rs`).
     **Three more answer for things outside the designer entirely.** `enforces_declared_byte_length`
     asks whether a column's *declared* type binds how many bytes a value in it may hold: MySQL's is a
     promise, enforced with `ERROR 1406: Data too long`; PostgreSQL's `bytea` declares no length to
@@ -4772,8 +4776,11 @@ existing prose was left alone.
     the copy — found live. **What the reading already shows the rebuild cannot put back is
     `unsupported()`'s answer** — `tsql_rebuild_refusals`, SQL Server's arm of an exhaustive `match`
     on the dialect in the rebuild branch, where SQLite's is the list above: an index `lossy` there
-    (included columns, a columnstore, XML or spatial one) would come back without what was not
-    read, an encrypted trigger has no text to put back, a **signed** one (`TsqlModule::signed`)
+    (a columnstore, XML or spatial one; one with included columns was too, refusing five of
+    WideWorldImporters' 48 tables, until `IndexInfo::include` held them and the rebuild restated
+    them through `create_index_sql` —
+    `a_sql_server_rebuild_restates_an_index_with_included_columns`) would come back without what
+    was not read, an encrypted trigger has no text to put back, a **signed** one (`TsqlModule::signed`)
     would come back from its text without its `ADD SIGNATURE`, which only the certificate's private
     key could restate — the rights the certificate's user held for it stopped applying, every DML
     on the table failing or a `TRY…CATCH` in the trigger quietly ending its auditing (S2-L5-05) —
@@ -4962,6 +4969,21 @@ existing prose was left alone.
     (`sql_server_recreates_a_clustered_index_clustered`,
     `sql_server_keeps_a_nonclustered_primary_key_nonclustered`). `None` — every other engine, and a
     key or index the designer is making — takes the default; the designer has no control for it.
+    **An index's included columns are `IndexInfo::include`, and `create_index_sql` writes them**
+    after the key list and before `WHERE`, through `include_sql` — so the designer's `AddIndex`, an
+    indexed view's indexes, the T-SQL rebuild and SQLite's replay all go through it, the last
+    writing nothing (`an_index_restates_its_included_columns`). Every place that reads an index's
+    columns reads the list as well. `indexes_equal` compares it, or an edit of
+    the list alone diffs as nothing and never lands (`an_include_only_edit_is_an_index_change`).
+    `rename_index` and `TableDraft::move_references` carry a rename into it, so an index on a
+    renamed column compares unchanged. `TableDraft::remove_column` takes a removed column off the
+    list and **keeps the index** — a key column still takes the index with it — so the diff drops
+    the index ahead of the `DROP COLUMN`, which T-SQL would otherwise refuse, and adds it back
+    without the column (`an_include_follows_a_rename_and_a_removal`, which pins the draft's half).
+    `validate` refuses a list naming no column (*"Index X includes c, which isn't a column."*,
+    `an_include_naming_no_column_is_refused`) and deliberately **not** a key column repeated in the
+    list: SQL Server refuses that (Msg 1909) and PostgreSQL 16 accepts it, both measured, so it is
+    the server's question, asked by the server.
     Ordering
     is dependency-first (FKs and indexes off before the columns under them; keys back on
     after), and **the column clauses inside that are ordered by their dependencies rather than
@@ -5165,7 +5187,10 @@ existing prose was left alone.
     column (Msg 5074 naming it, then 4922, measured on 2022), where MySQL's `MODIFY` and
     PostgreSQL's `ALTER COLUMN … TYPE` rebuild and re-check them themselves and SQLite's column
     change *is* the rebuild — so `alter_column_disturbs_dependents` is true there alone, and `diff`
-    runs `repair_tsql_dependents` after the check repair, whose pairs it then leaves alone. Which
+    runs `repair_tsql_dependents` after the check repair, whose pairs it then leaves alone. An
+    index stands on a column it only `INCLUDE`s as much as on a key column — T-SQL refuses the
+    `ALTER COLUMN` naming it either way (Msg 5074) — so the repair reads `IndexInfo::include`
+    beside the key, and `rename_index` re-points both. Which
     change disturbs which kind is `tsql_alter_disturbs`, measured case by case because the
     documented exceptions are not the server's: nothing is disturbed when only the name, default
     or comment changes; a nullability change alone disturbs an index or key but not a foreign key
@@ -5202,7 +5227,7 @@ existing prose was left alone.
     SQL Server's early return — because only SQL Server's `diff` raises it and no other emitter
     writes it. **A dependent the draft already drops or adds is the
     draft's**, as with the check repair — and so is a computed column the draft itself alters or
-    drops; and a lossy index — included columns, say — is not
+    drops; and a lossy index — a columnstore, say — is not
     touched, so the server refuses the retype naming it and the plan, one transaction, rolls back
     whole (`sql_server_takes_a_retyped_columns_dependents_off_and_back_on`,
     `sql_server_rebuilds_only_the_dependents_a_change_disturbs`,
@@ -5334,8 +5359,9 @@ existing prose was left alone.
     names its nonclustered index `a_nix` so that name order is the wrong one. Both `ReplaceView`
     arms of the risks carry `view_indexes_rebuilt`, naming the indexes and saying they are built
     again in the same transaction, which on a large view takes as long as building them did; the
-    in-place arm had no risk at all before. An `IndexInfo::lossy` one (included columns, a
-    non-rowstore kind) cannot be built again whole, so `lossy_view_index_refusal`, in
+    in-place arm had no risk at all before. An `IndexInfo::lossy` one (a columnstore, XML or
+    spatial index — one with included columns was too, and is built again with them now) cannot
+    be built again whole, so `lossy_view_index_refusal`, in
     `unsupported()`, refuses the edit rather than bring the index back as less than it was
     (`an_indexed_sql_server_views_edit_creates_its_indexes_again`). **That refusal covers only
     what the model knows it missed**: `IndexInfo` has no fill factor, padding, lock options,
@@ -6260,8 +6286,8 @@ existing prose was left alone.
     `ddl::schema_body_is_emittable` rather than `dialect == SqlDialect::MySql`, so nobody is sent
     after a body they have no use for and a fourth engine has to be answered for rather than sorted
     silently onto one side. `CompareEntry::uncertain` is a match over
-    an `IndexInfo::lossy` index — a PostgreSQL index whose expression keys, opclasses, `INCLUDE`
-    columns, storage parameters or `NULLS NOT DISTINCT` the model never read (see `schemaic-db` for
+    an `IndexInfo::lossy` index — a PostgreSQL index whose expression keys, opclasses, constraint's
+    `INCLUDE` list, storage parameters or `NULLS NOT DISTINCT` the model never read (see `schemaic-db` for
     what widened that list), so two of them compare equal whatever the server holds; the verdict
     stands as the
     best the model can do, and a tree drawing it like a fully-read match would be overclaiming. It is
@@ -8642,6 +8668,20 @@ existing prose was left alone.
     could only be withheld as `lossy`. `tsql_create_ddl` restates it as `PRIMARY KEY NONCLUSTERED`,
     `UNIQUE CLUSTERED` and `CREATE CLUSTERED INDEX`, writing only the side the default gets wrong
     (`create_ddl_sql_server_restates_clustering`).
+    **`IndexInfo::include` is an index's included columns, in order** — `INCLUDE (…)`, carried in
+    the index's leaf rows without being part of its key, on SQL Server and PostgreSQL (11 on), and
+    empty on MySQL and SQLite, which have no such clause (`ddl::supports_index_include`). It is
+    modelled rather than left to `lossy`, which is what it was, and on SQL Server that cost three
+    things at once: an index with one could not be edited, nor restated by a rebuild — which
+    refused five of WideWorldImporters' 48 tables over it — nor written into a dump.
+    `include_sql` is the one spelling, ` INCLUDE (…)` after the key list and before `WHERE`, or
+    nothing where the list is empty or the engine has no clause; `ddl::create_index_sql` and
+    `create_ddl`'s two hand-rolled index emitters — PostgreSQL's model path and `tsql_create_ddl`
+    — all write it. `create_ddl_sql_server_writes_t_sql` restates a covering index with
+    `INCLUDE ([balance])` and leaves a columnstore `ix_cs` out under the note, which now reads
+    *"is a columnstore, XML or spatial index, or another kind this script cannot restate; it is left
+    out"* for a table and an indexed view alike — it began *"has included columns, or…"*. How the
+    designer's plan keeps the list through a rename, a removal and a retype is under `ddl.rs`.
     **`classify_column_type` reads all three engines' spellings now**, the type name being what the
     icon in the schema tree, the ER diagram's cards and tooltips, the completion popup and Find
     Anywhere are chosen from. The MySQL and PostgreSQL gaps were closed one engine at a time and
@@ -8689,12 +8729,17 @@ existing prose was left alone.
     `create_ddl`'s PG arm emits each non-primary index from the model, except one the model only
     partly read — an `IndexInfo::lossy` one with a `create_sql` — which is emitted as the server's own
     `pg_get_indexdef` text instead. Emitting that one from the model is not merely different but
-    wrong: there is no field for an `INCLUDE` list, `NULLS NOT DISTINCT` or a storage parameter, so a
-    structure dump of `CREATE INDEX ix ON t (a, b) INCLUDE (c, d)` restored an index that no longer
-    covers — with no edit anywhere and the dump reporting success. A **fully** read index keeps the
-    model's emission, which is the one the designer's preview and the compare pane are written
-    against, and `create_ddl_postgres_emits_a_lossy_index_from_the_servers_own_text` asserts both
-    halves so the fix cannot quietly change every PostgreSQL table's DDL.
+    wrong: there is no field for `NULLS NOT DISTINCT` or a storage parameter — nor was there for an
+    `INCLUDE` list, and a structure dump of `CREATE INDEX ix ON t (a, b) INCLUDE (c, d)` restored an
+    index that no longer covered, with no edit anywhere and the dump reporting success. A **fully**
+    read index keeps the model's emission, which is the one the designer's preview and the compare
+    pane are written against, and `create_ddl_postgres_emits_a_lossy_index_from_the_servers_own_text`
+    asserts both halves so the fix cannot quietly change every PostgreSQL table's DDL. A plain
+    index's `INCLUDE` list is that second half now — read into `IndexInfo::include` and written by
+    `include_sql` as `INCLUDE ("c", "d")`, which the same test checks — while one on a primary-key
+    or unique **constraint**'s index stays lossy and goes out as the server's text, since the model
+    restates a key as a column list and a unique constraint as `ADD CONSTRAINT … UNIQUE`, and
+    neither carries the clause (under `pg.rs`).
     **`TableInfo::dependent_ddl` is the same fidelity call made for the rebuild**: the `CREATE` text
     of the objects that go down with the table and have to be put back — SQLite's triggers, filled
     by `sqlite::trigger_statements`, empty for a **table** on the two engines that alter one in place
@@ -11718,7 +11763,13 @@ existing prose was left alone.
   against the unfixed tree. MariaDB 10.11 rejects `((a + b))` outright and PostgreSQL keeps
   `pg_get_indexdef`'s whole text so is correctly not lossy — two of the three legs could not
   reproduce it, which is the same reason two servers hid it originally
-  (`Target::expression_index_sql`). PostgreSQL
+  (`Target::expression_index_sql`). **An `IdxRow` is one column of one index, keyed or
+  included**: `IdxRow::included` sends the row's column name to `IndexInfo::include` rather than
+  to the key, and `assemble_schema`'s fold finds or creates the index first and then pushes onto
+  whichever list the row belongs to, in arrival order — the readers sort key rows first. Folded
+  into the key, a covering `(a) INCLUDE (b)` would read as `(a, b)`, a different index that a
+  rebuild or an edit would then create (`assemble_schema_folds_included_columns_apart_from_the_key`).
+  SQL Server and PostgreSQL set the flag; MySQL and SQLite never do. PostgreSQL
   from **`pg_catalog`, not `information_schema`** — `format_type(atttypid, atttypmod)` is the only
   source of the *declared* type (`udt_name` gives `varchar`, losing the `(45)`), plus
   `pg_get_expr` for defaults and `attidentity`/`attgenerated`. **That leaves two PostgreSQL
@@ -11814,9 +11865,20 @@ existing prose was left alone.
   before the four-line read was added.
   **`index_list_sql` reports one row per key position, and its `lossy` term is what the model
   admits it did not read.** It was a non-default opclass and a non-default `indoption`; it is now
-  also `ix.indnatts > ix.indnkeyatts` (an `INCLUDE` column, which lives past the key columns and is
-  dropped by the ordinality join before `pg_attribute` is consulted) and `ic.reloptions IS NOT NULL`
-  (a storage parameter such as `fillfactor`, which nothing had asked for). **`NULLS NOT DISTINCT`
+  also `ic.reloptions IS NOT NULL` (a storage parameter such as `fillfactor`, which nothing had
+  asked for) and `ix.indnatts > ix.indnkeyatts AND pgc.conname IS NOT NULL` — an `INCLUDE` list on
+  a primary-key or unique **constraint**'s index, which stays lossy because neither restatement
+  carries one: the model holds a key as a column list and writes a unique constraint as
+  `ADD CONSTRAINT … UNIQUE`. **A plain index's `INCLUDE` list is read**, into
+  `IndexInfo::include`. `indkey` is `indnatts` long and carries the list past the key, but
+  `indoption` is only `indnkeyatts` long, so the `indoption` unnest is a `LEFT JOIN` — as an inner
+  join it dropped every `INCLUDE` position before `pg_attribute` was consulted, and the
+  `indnatts > indnkeyatts` term, then unconditional, was the admission — `descending` is
+  `COALESCE`d to false for the positions it no longer reaches, and a trailing
+  `k.ord > ix.indnkeyatts AS included` marks each row the fold sends to the list (under `lib.rs`).
+  The live `a_partly_read_index_says_so_and_is_emitted_whole` reads `ix_inc (a, b) INCLUDE (c)` as
+  key `[a, b]`, list `[c]` and not lossy, its dump round trip still passing, while `ix_nd` and
+  `ix_ff` stay lossy. **`NULLS NOT DISTINCT`
   cannot be asked of the catalogue at all**, and that is the load-bearing part:
   `pg_index.indnullsnotdistinct` is PostgreSQL **15**, the server parses the whole statement before
   it runs it, and naming a column a 13 or 14 has not fails the *entire* introspection — both are
@@ -11828,7 +11890,8 @@ existing prose was left alone.
   in. The same `pg_get_indexdef` column fills `IdxRow::create_sql`, so PostgreSQL now carries the
   server's own statement per index the way SQLite always has, which is what `TableInfo::create_ddl`
   replays for a lossy one. Both new terms are string-tested on the query
-  (`lossy_no_longer_covers_what_the_model_can_hold`), and
+  (`lossy_no_longer_covers_what_the_model_can_hold`, which pins the `LEFT JOIN` and the
+  `included` column too), and
   `a_nulls_not_distinct_index_is_read_as_lossy_from_its_own_ddl` asserts the fourth is answered from
   the text **and** that the PG 15 column is still absent from the query.
   **`col_meta_sql` is the other primary-key reader in this file, and the two disagreed.** It is
@@ -11838,9 +11901,13 @@ existing prose was left alone.
   reads by position) and each has a wrong answer that produces a plausible grid rather than an
   error. The key was the wrong one: `PRIMARY KEY … INCLUDE` has been legal since PostgreSQL 11 and
   `pg_index.indkey` is `indnatts` long, so an unbounded `unnest(i.indkey)` counted an INCLUDE column
-  into the primary key; the subquery is bounded by `indnkeyatts` now. `index_list_sql` gets the same
-  question right **by accident**, inner-joining `unnest(ix.indoption)`, which is only `indnkeyatts`
-  long — so the answer depended on whether the schema tree had introspected the table yet, an
+  into the primary key; the subquery is bounded by `indnkeyatts` now. `index_list_sql` got the same
+  question right only **by accident**, inner-joining `unnest(ix.indoption)`, which is only
+  `indnkeyatts` long — and that join is a `LEFT JOIN` now, to read a plain index's `INCLUDE` list,
+  so `pk_set` excludes an `included` row by name rather than leaning on it, since the primary
+  index's included rows now arrive with an `attname` the old filter would have counted into the
+  key. The two readers disagreeing meant the answer depended on whether the schema tree had
+  introspected the table yet, an
   everyday difference for a table created since the last refresh, where `edit::resolve_key`'s
   no-schema branch trusts these wire flags. With `PRIMARY KEY (id) INCLUDE (payload)` the key came
   out `[id, payload]`: a binary `payload` made the whole grid silently read-only, and a non-binary
@@ -13020,9 +13087,10 @@ existing prose was left alone.
   sequences, alias types, synonyms and XML schema collections are read into `TsqlObject` for the
   dump alone (under `dump.rs`), with no tree entry, editor or comparison; a named instance's port
   is not asked of SQL Server Browser and has to be given (`ImportNote::NamedInstance`, under
-  `conn_import.rs`); and an index with included columns, or a columnstore, XML or spatial one, is
-  read as `IndexInfo::lossy` rather than authored, so a rebuild and a view edit refuse to touch it
-  rather than drop it (`tsql_rebuild_refusals`, `lossy_view_index_refusal`). **The refusals are the backstop,
+  `conn_import.rs`); and a columnstore, XML or spatial index is read as `IndexInfo::lossy` rather
+  than authored, so a rebuild and a view edit refuse to touch it rather than drop it
+  (`tsql_rebuild_refusals`, `lossy_view_index_refusal`). An index with included columns was on
+  this list too, and is not now: they are read and restated (below). **The refusals are the backstop,
   not the gate**: the app is kept off them by
   capabilities, each an exhaustive `match` with `MsSql` on `false`, asked at the UI site that
   offers the thing — chief among them
@@ -13739,13 +13807,25 @@ existing prose was left alone.
   and collation are MySQL's table options.
   **Introspection reads clustering rather than withholding it**: `IdxRow::clustered` is
   `Some(sys.indexes.type == 1)` (`IndexInfo::clustered`, under `schema.rs`), and an index is
-  `lossy` only for a type past 2 — columnstore, XML, spatial — or included columns. Before the
+  `lossy` only for a type past 2 — columnstore, XML, spatial — or for the graph-column marker
+  (under the dump, below). Before the
   field a clustered index other than the key's was marked `lossy` too, and an edit to it withheld
   as a `KeepLossyIndex`, since recreating it plainly left the table a heap; the emitter writes
   `CLUSTERED` and `NONCLUSTERED` where T-SQL's default is wrong now (under `ddl.rs`), and
   `a_clustered_index_and_a_nonclustered_key_keep_their_clustering` adds a column to a clustered
   `cx` beside a `NONCLUSTERED` key, retypes the key's column, and reads both back as they were,
-  the result round-tripping. Every admitted change is
+  the result round-tripping. **Included columns are read the same way, rather than withheld.**
+  Column 9 of `INDEX_LISTING` and `VIEW_INDEX_LISTING` is each row's own `is_included_column`,
+  where it was an `EXISTS` asking whether the index had any — which made the whole index `lossy`,
+  so it could not be edited, restated by a rebuild or written into a dump — and `IdxRow::included`
+  carries it to the fold (under `lib.rs`). The join admits a row with `key_ordinal > 0`, an
+  included one, or any row of a columnstore, and the `ORDER BY` puts `is_included_column` ahead
+  of `key_ordinal`, so the key comes first and the list keeps its own order. **The flag is forced
+  to 0 for types 5 and 6, and that is load-bearing**: a columnstore has no key columns, SQL Server
+  listing its columns with `key_ordinal` 0 *and* flagged as included, so taken at its word it
+  would fold into an index with an empty key; read as key rows, as before, it stays the `lossy`
+  index the refusals and the dump's note name. A partitioning column outside the key, neither
+  keyed nor included, is still left out. Every admitted change is
   written by one of the phases bar `KeepLossyIndex`, whose statement is none; the catch-all arms
   write nothing, and that has the opposite hazard — an admitted change one swallowed would vanish
   from the plan in silence — so `sql_server_admits_the_table_changes_it_can_write` walks both
@@ -13760,7 +13840,11 @@ existing prose was left alone.
   and renames the table in one plan, then reads it back with the data kept, the new default filling
   a new row and the result round-tripping; `a_primary_key_is_replaced` widens a key by its read
   constraint name; `an_identity_toggle_is_withheld_over_an_index_the_rebuild_cannot_restate`
-  switches an identity on over an index with included columns and gets the one refusal, naming it;
+  switches an identity on over a nonclustered columnstore index and gets the one refusal, naming it
+  (it planted an index with included columns until those were read);
+  `a_rebuild_keeps_an_indexs_included_columns` reads `(a DESC) INCLUDE (c, b) WHERE a > 0` back as
+  key `[a]` and list `[c, b]`, not lossy, rebuilds the table around it by an identity toggle,
+  reads it back equal with a diff of nothing, then lands an edit of the list alone;
   `a_moved_column_rebuilds_the_table_and_keeps_what_stood_on_it` moves a column and adds one with a
   default, and reads back the rows, the key, check, unique index and defaults under their names,
   the comments, a disabled trigger still disabled, another table's `ON DELETE CASCADE` key, an
@@ -13997,7 +14081,8 @@ existing prose was left alone.
   `a_sql_server_graph_temporal_or_memory_optimised_table_is_not_scripted_as_a_plain_one`); the
   internal columns are left out of `column_listing` by `graph_type`, the index keyed on nothing
   but graph ids is dropped and one naming another graph column is withheld as `lossy` — other indexes as separate
-  statements, the table's and columns' comments after them through `ddl::tsql_add_comment` — the
+  statements, their `INCLUDE` lists with them (`IndexInfo::include_sql`; a columnstore, XML or
+  spatial one is the lossy kind left out under a note, `create_ddl_sql_server_writes_t_sql`), the table's and columns' comments after them through `ddl::tsql_add_comment` — the
   same `sp_addextendedproperty` the emitter writes (`create_ddl_sql_server_restates_the_comments`)
   — and what it cannot restate named in a comment; a view is its stored definition **with the
   header rebuilt under the catalogue's name**, as SQL Server's own scripter writes it, through
@@ -14416,7 +14501,8 @@ existing prose was left alone.
   `a_staged_edit_lands_on_its_row_and_reads_back` to `a_stopped_commit_is_undone`, under
   `mssql.rs` above), `run_ddl` and the designer's plans (from a designed table and a
   failing plan rolled back whole to an existing table's edit landing as drafted, an edit keeping
-  what it did not change, an identity toggle withheld over an index the rebuild cannot restate, a
+  what it did not change, an identity toggle withheld over an index the rebuild cannot restate and
+  one rebuilding around an index's included columns, a
   table rebuilt three ways and refused once by the rebuild's guard, then by each of its arms in
   turn (`every_arm_of_the_rebuild_guard_refuses_its_table`, twenty-one tables, under the rebuild in
   `ddl.rs` above), an in-place change refused by
@@ -19193,7 +19279,10 @@ existing prose was left alone.
     column — ask `ddl::supports_comments`, so SQL Server's were hidden rather than typed into and
     dropped, until the emitter wrote them and the predicate turned them back on; the identity toggle asks `ddl::identity_wording`, having said *Auto-increment
     (AUTO_INCREMENT)* there; the index key hint asks `ddl::supports_index_prefix`, having named
-    MySQL's `bio(20)` prefix on every engine but PostgreSQL. The foreign-key action dropdown lists
+    MySQL's `bio(20)` prefix on every engine but PostgreSQL. The index form's *Include* field, after
+    *Columns*, is built only where `ddl::supports_index_include` answers yes — SQL Server and
+    PostgreSQL — and parses through `ddl::parse_name_list` into `IndexInfo::include`, so a list is
+    never typed where no emitter would write it. The foreign-key action dropdown lists
     `ddl::fk_actions` besides, which has no `RESTRICT` on SQL Server. The designer opens on an
     **existing** SQL Server table too, now that `supports_table_design` answers yes there
     (`emit_mssql`'s phases are under `mssql.rs`); the reorder arrows appear there too, and an

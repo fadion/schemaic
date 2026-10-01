@@ -1914,8 +1914,9 @@ pub(crate) struct ColRow {
     pub column: ColumnInfo,
 }
 
-/// One key-column of one index, plus the index-level attributes carried on every
-/// row of it (they repeat per key column; the first row wins).
+/// One column of one index — a key column, or an included one
+/// ([`IdxRow::included`]) — plus the index-level attributes carried on every
+/// row of it (they repeat per column; the first row wins).
 #[derive(Clone)]
 pub(crate) struct IdxRow {
     pub table: String,
@@ -1942,6 +1943,10 @@ pub(crate) struct IdxRow {
     /// SQL Server's `CLUSTERED` — see
     /// [`schemaic_core::schema::IndexInfo::clustered`]. `None` elsewhere.
     pub clustered: Option<bool>,
+    /// This row's column is **included** rather than keyed — it goes to
+    /// [`schemaic_core::schema::IndexInfo::include`] by name. SQL Server and
+    /// PostgreSQL only; always `false` on MySQL and SQLite.
+    pub included: bool,
 }
 
 /// One `KEY_COLUMN_USAGE` row for a foreign key: `(table, constraint, column,
@@ -2063,27 +2068,36 @@ pub(crate) fn assemble_schema(
             continue;
         };
         let table = &mut tables[ti];
-        if let Some(existing) = table.indexes.iter_mut().find(|x| x.name == r.index) {
-            existing.columns.push(r.column.clone());
+        let at = match table.indexes.iter().position(|x| x.name == r.index) {
+            Some(at) => at,
+            None => {
+                table.indexes.push(IndexInfo {
+                    name: r.index.clone(),
+                    unique: r.unique,
+                    foreign: false, // set by the column-match pass below
+                    method: r.method.clone(),
+                    predicate: r.predicate.clone(),
+                    lossy: r.lossy,
+                    // Constraint-backed indexes are tagged by the engine's own
+                    // fetch afterwards (PostgreSQL only); the catalogue rows
+                    // folded here don't carry it.
+                    constraint: None,
+                    // MySQL keeps no statement per index and leaves this
+                    // `None`; PostgreSQL's `pg_get_indexdef` is a real one, and
+                    // is what lets an index the model only partly read be
+                    // emitted whole.
+                    create_sql: r.create_sql.clone(),
+                    clustered: r.clustered,
+                    ..Default::default()
+                });
+                table.indexes.len() - 1
+            }
+        };
+        let ix = &mut table.indexes[at];
+        if r.included {
+            ix.include.push(r.column.name.clone());
         } else {
-            table.indexes.push(IndexInfo {
-                name: r.index.clone(),
-                columns: vec![r.column.clone()],
-                unique: r.unique,
-                foreign: false, // set by the column-match pass below
-                method: r.method.clone(),
-                predicate: r.predicate.clone(),
-                lossy: r.lossy,
-                // Constraint-backed indexes are tagged by the engine's own fetch
-                // afterwards (PostgreSQL only); the catalogue rows folded here
-                // don't carry it.
-                constraint: None,
-                // MySQL keeps no statement per index and leaves this `None`;
-                // PostgreSQL's `pg_get_indexdef` is a real one, and is what
-                // lets an index the model only partly read be emitted whole.
-                create_sql: r.create_sql.clone(),
-                clustered: r.clustered,
-            });
+            ix.columns.push(r.column.clone());
         }
     }
 
@@ -3520,6 +3534,7 @@ mod tests {
             lossy: false,
             create_sql: None,
             clustered: None,
+            included: false,
         }
     }
 
@@ -3625,6 +3640,24 @@ mod tests {
         let pk = t.indexes.iter().find(|i| i.name == "PRIMARY").unwrap();
         assert!(pk.unique); // NON_UNIQUE = 0
         assert!(pk.is_primary());
+    }
+
+    /// **An included column's row joins the include list, not the key** — in
+    /// arrival order, the readers sorting key rows first. Folded into the key,
+    /// a covering index `(a) INCLUDE (b)` would read as `(a, b)`: a different
+    /// index, which a rebuild or an edit would then create.
+    #[test]
+    fn assemble_schema_folds_included_columns_apart_from_the_key() {
+        let tables = [(s("t"), s("BASE TABLE"))];
+        let included = |col: &str| IdxRow {
+            included: true,
+            ..ir("t", "ix_cover", 1, col)
+        };
+        let idx = [ir("t", "ix_cover", 1, "a"), included("c"), included("b")];
+        let schema = assemble_schema(None, &tables, &[], &[], &idx, &[]);
+        let ix = &schema.tables[0].indexes[0];
+        assert_eq!(ix.column_names().collect::<Vec<_>>(), vec!["a"]);
+        assert_eq!(ix.include, vec!["c".to_string(), "b".to_string()]);
     }
 
     #[test]

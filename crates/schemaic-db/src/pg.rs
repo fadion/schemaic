@@ -1406,9 +1406,16 @@ use crate::{ColRow, IdxRow, group_by};
 /// fetch can be partitioned per schema before folding.
 type InSchema<T> = (String, T);
 
-/// Every index of every browsable schema, one row per **key position** in
-/// `indkey` order (`unnest(…) WITH ORDINALITY` preserves it). See the comment at
-/// its call site for what each of the trailing columns is for.
+/// Every index of every browsable schema, one row per **position** in `indkey`
+/// order (`unnest(…) WITH ORDINALITY` preserves it) — the key's, then the
+/// `INCLUDE` list's, which `indkey` carries past `indnkeyatts` and
+/// `indoption` does not, hence the `LEFT JOIN` on the latter and `included`.
+/// See the comment at its call site for what each of the trailing columns is
+/// for.
+///
+/// **An `INCLUDE` on a constraint's index stays lossy**: the model holds a
+/// primary key as a column list and a unique constraint is restated as
+/// `ADD CONSTRAINT … UNIQUE`, and neither restatement carries one.
 fn index_list_sql() -> String {
     format!(
         "SELECT n.nspname, c.relname, \
@@ -1422,11 +1429,12 @@ fn index_list_sql() -> String {
                           WHERE NOT o.opcdefault) \
                  OR EXISTS (SELECT 1 FROM unnest(ix.indoption::int2[]) AS p(opt) \
                              WHERE opt NOT IN (0, 3)) \
-                 OR ix.indnatts > ix.indnkeyatts \
+                 OR (ix.indnatts > ix.indnkeyatts AND pgc.conname IS NOT NULL) \
                  OR ic.reloptions IS NOT NULL) AS lossy, \
                 pg_get_indexdef(ix.indexrelid, k.ord::int, true) AS keydef, \
-                (o.opt & 1) <> 0 AS descending, \
-                pg_get_indexdef(ix.indexrelid) AS idxdef \
+                COALESCE((o.opt & 1) <> 0, false) AS descending, \
+                pg_get_indexdef(ix.indexrelid) AS idxdef, \
+                k.ord > ix.indnkeyatts AS included \
          FROM pg_index ix \
          JOIN pg_class c ON c.oid = ix.indrelid \
          JOIN pg_class ic ON ic.oid = ix.indexrelid \
@@ -1435,7 +1443,7 @@ fn index_list_sql() -> String {
          LEFT JOIN pg_constraint pgc \
                 ON pgc.conindid = ic.oid AND pgc.contype IN ('p', 'u') \
          JOIN unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord) ON true \
-         JOIN unnest(ix.indoption) WITH ORDINALITY AS o(opt, oord) ON o.oord = k.ord \
+         LEFT JOIN unnest(ix.indoption) WITH ORDINALITY AS o(opt, oord) ON o.oord = k.ord \
          LEFT JOIN pg_attribute a \
                 ON a.attrelid = ix.indrelid AND a.attnum = k.attnum AND a.attnum > 0 \
          WHERE {} \
@@ -1906,15 +1914,17 @@ async fn collect_schema(client: &Client) -> Result<DbSchema, DbError> {
                         .filter(|d| !d.trim().is_empty() && d.trim() != ";"),
                     // `CLUSTER` is a one-off reorder there, not a kind of index.
                     clustered: None,
+                    included: cell(r, 13) == "t",
                 },
             )
         })
         .collect();
-    // Primary-key columns = the columns of the primary index (`indisprimary`),
-    // keyed by (schema, table, column) so two namespaces don't share a PK set.
+    // Primary-key columns = the key columns of the primary index
+    // (`indisprimary`) — not its `INCLUDE` list — keyed by (schema, table,
+    // column) so two namespaces don't share a PK set.
     let pk_set: HashSet<(String, String, String)> = idx_all
         .iter()
-        .filter(|r| cell(r, 5) == "t" && !cell(r, 4).is_empty())
+        .filter(|r| cell(r, 5) == "t" && !cell(r, 4).is_empty() && cell(r, 13) != "t")
         .map(|r| (cell(r, 0), cell(r, 1), cell(r, 4)))
         .collect();
 
@@ -5750,13 +5760,20 @@ mod index_key_tests {
             sql.contains("NOT o.opcdefault"),
             "a non-default operator class is still unreadable per column"
         );
-        // And the three that were read as *absent* while `lossy` said the index
-        // was read in full. `INCLUDE` columns live past `indnkeyatts` and the
-        // ordinality join drops them; a storage parameter is `pg_class.
-        // reloptions`, which nothing asked for.
+        // And the ones that were read as *absent* while `lossy` said the index
+        // was read in full. `INCLUDE` columns live past `indnkeyatts`: a plain
+        // index's are read into `IndexInfo::include` now — the option join is
+        // a LEFT JOIN, since `indoption` stops at the key — and only a
+        // constraint's stays lossy, no restatement of one carrying it. A
+        // storage parameter is `pg_class.reloptions`, which nothing asked for.
         assert!(
-            sql.contains("ix.indnatts > ix.indnkeyatts"),
-            "an INCLUDE list is not something the model can hold"
+            sql.contains("(ix.indnatts > ix.indnkeyatts AND pgc.conname IS NOT NULL)"),
+            "a constraint's INCLUDE list is not something the model can hold"
+        );
+        assert!(
+            sql.contains("LEFT JOIN unnest(ix.indoption)")
+                && sql.contains("k.ord > ix.indnkeyatts AS included"),
+            "a plain index's INCLUDE list is read, apart from its key"
         );
         assert!(
             sql.contains("ic.reloptions IS NOT NULL"),

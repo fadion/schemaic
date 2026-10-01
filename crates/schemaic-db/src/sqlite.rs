@@ -3170,6 +3170,8 @@ fn table_indexes(conn: &SqliteConn, db: &str, table: &str) -> Result<Vec<IndexIn
                 name.clone()
             },
             columns,
+            // SQLite has no `INCLUDE`: a covering index is just more key.
+            include: Vec::new(),
             unique,
             foreign: false,
             method: None,

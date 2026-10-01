@@ -5665,8 +5665,8 @@ async fn a_clustered_index_and_a_nonclustered_key_keep_their_clustering() {
 }
 
 /// **An identity switched on is a rebuild — withheld where the rebuild would
-/// drop an index it does not read whole**, here one with included columns,
-/// and the preview says which rather than applying a table without it.
+/// drop an index it does not read whole**, here a columnstore one, and the
+/// preview says which rather than applying a table without it.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_identity_toggle_is_withheld_over_an_index_the_rebuild_cannot_restate() {
     use schemaic_core::ddl::TableDraft;
@@ -5676,14 +5676,76 @@ async fn an_identity_toggle_is_withheld_over_an_index_the_rebuild_cannot_restate
     let s = Scratch::create("ddl_ident").await;
     s.exec("CREATE TABLE dbo.t (id int NOT NULL, a int, b int)")
         .await;
-    s.exec("CREATE INDEX ix_a ON dbo.t (a) INCLUDE (b)").await;
+    s.exec("CREATE NONCLUSTERED COLUMNSTORE INDEX ix_cs ON dbo.t (a, b)")
+        .await;
     let t = read_table(&s, "t").await;
     let mut d = TableDraft::from_table(&t);
     d.columns[0].info.auto_increment = true;
     let cs = schemaic_core::ddl::diff(&t, &d, MS);
     let refused = cs.unsupported();
     assert_eq!(refused.len(), 1, "{refused:?}");
-    assert!(refused[0].contains("ix_a"), "{refused:?}");
+    assert!(refused[0].contains("ix_cs"), "{refused:?}");
+}
+
+/// **An index's included columns are read apart from its key, and a rebuild
+/// restates them** — the shape five of WideWorldImporters' tables have, which
+/// the rebuild refused while the model could not hold one. Read back, the
+/// table compares equal to the draft, so nothing was dropped on the way.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rebuild_keeps_an_indexs_included_columns() {
+    use schemaic_core::ddl::TableDraft;
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("ddl_include").await;
+    s.exec("CREATE TABLE dbo.t (id int NOT NULL, a int, b int, c nvarchar(10))")
+        .await;
+    s.exec("CREATE INDEX ix_a ON dbo.t (a DESC) INCLUDE (c, b) WHERE a > 0")
+        .await;
+    let t = read_table(&s, "t").await;
+    let ix = t.indexes.iter().find(|i| i.name == "ix_a").expect("ix_a");
+    assert_eq!(ix.column_names().collect::<Vec<_>>(), vec!["a"]);
+    assert!(ix.columns[0].descending);
+    assert_eq!(ix.include, vec!["c".to_string(), "b".to_string()]);
+    assert!(!ix.lossy);
+
+    let mut d = TableDraft::from_table(&t);
+    d.columns[0].info.auto_increment = true;
+    let stmts = apply_draft(&s, &t, &d).await;
+    assert!(
+        stmts.iter().any(|st| st.contains("INCLUDE ([c], [b])")),
+        "{stmts:#?}"
+    );
+    let t2 = read_table(&s, "t").await;
+    let ix2 = t2.indexes.iter().find(|i| i.name == "ix_a").expect("ix_a");
+    assert_eq!(ix2.include, ix.include, "{stmts:#?}");
+    assert_eq!(ix2.predicate, ix.predicate);
+    let again = schemaic_core::ddl::diff(&t2, &TableDraft::from_table(&t2), MS);
+    assert!(again.changes.is_empty(), "{:?}", again.changes);
+
+    // And an edit of the list alone lands, as an index change.
+    let mut d = TableDraft::from_table(&t2);
+    let at = d
+        .indexes
+        .iter()
+        .position(|i| i.info.name == "ix_a")
+        .unwrap();
+    d.indexes[at].info.include = vec!["b".into()];
+    apply_draft(&s, &t2, &d).await;
+    let t3 = read_table(&s, "t").await;
+    let ix3 = t3.indexes.iter().find(|i| i.name == "ix_a").expect("ix_a");
+    assert_eq!(ix3.include, vec!["b".to_string()]);
+
+    // And a column the index only includes can be dropped: the plan takes the
+    // index off first, which T-SQL otherwise refuses, and keeps it.
+    let mut d = TableDraft::from_table(&t3);
+    let b = d.columns.iter().position(|c| c.info.name == "b").unwrap();
+    d.remove_column(b, MS);
+    let stmts = apply_draft(&s, &t3, &d).await;
+    let t4 = read_table(&s, "t").await;
+    assert!(t4.columns.iter().all(|c| c.name != "b"), "{stmts:#?}");
+    let ix4 = t4.indexes.iter().find(|i| i.name == "ix_a").expect("ix_a");
+    assert!(ix4.include.is_empty(), "{stmts:#?}");
 }
 
 /// **A key finds its row whatever its type** — as the grid read it back: a

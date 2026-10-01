@@ -1405,6 +1405,8 @@ async fn collect_schema(conn: &mut Conn, database: &str) -> Result<DbSchema, DbE
                 // reconstructs one from the columns it read.
                 create_sql: None,
                 clustered: None,
+                // MySQL has no `INCLUDE`.
+                included: false,
             }
         })
         .collect();

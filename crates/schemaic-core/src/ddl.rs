@@ -344,6 +344,7 @@ impl TableDraft {
         self.primary_key.iter_mut().for_each(swap);
         for ix in &mut self.indexes {
             ix.info.columns.iter_mut().for_each(|c| swap(&mut c.name));
+            ix.info.include.iter_mut().for_each(swap);
         }
         for fk in &mut self.foreign_keys {
             fk.info.columns.iter_mut().for_each(swap);
@@ -512,6 +513,12 @@ impl TableDraft {
         self.primary_key.retain(|c| *c != name);
         self.indexes
             .retain(|ix| !ix.info.columns.iter().any(|c| c.name == name));
+        // An index that only *includes* the column keeps its key, and loses
+        // the column from its list — the diff re-creates it without, ahead of
+        // the drop T-SQL would otherwise refuse.
+        for ix in &mut self.indexes {
+            ix.info.include.retain(|c| *c != name);
+        }
         self.foreign_keys
             .retain(|fk| !fk.info.columns.contains(&name));
         // **The check predicate is the one collection not in `key_name` space**,
@@ -593,6 +600,15 @@ impl TableDraft {
                         ix.info.name, c.name
                     ));
                 }
+            }
+            // Not refused here: a key column in the list as well, which SQL
+            // Server refuses (Msg 1909) and PostgreSQL accepts — the server's
+            // question, asked by the server.
+            for c in ix.info.include.iter().filter(|c| !known(c)) {
+                out.push(format!(
+                    "Index {} includes {c}, which isn't a column.",
+                    ix.info.name
+                ));
             }
         }
         // Foreign keys were the last section without a uniqueness arm, though
@@ -7213,10 +7229,10 @@ fn tsql_view_index_guard(qname: &str, v: &ViewDraft, server: &[IndexInfo]) -> Op
 }
 
 /// The refusal for a view edit **that would drop an index it cannot create
-/// again**, or `None` when the change is fine: an indexed view's index with
-/// included columns, or of a kind the model has no field for
-/// ([`IndexInfo::lossy`]), goes with the view's alter and could only come
-/// back without what was never read.
+/// again**, or `None` when the change is fine: an indexed view's index of a
+/// kind the model has no field for ([`IndexInfo::lossy`] — a columnstore, XML
+/// or spatial one; included columns are modelled) goes with the view's alter
+/// and could only come back without what was never read.
 ///
 /// **And a view created from a reading** (the comparison's create) with such
 /// an index: the view would arrive without it, the plan saying nothing.
@@ -7250,16 +7266,16 @@ fn lossy_view_index_refusal(c: &Change) -> Option<String> {
     let plural = if lost.len() == 1 { "" } else { "es" };
     Some(if created {
         format!(
-            "Creating view {} can't create its index{plural} {} — it has included columns, or is \
-             of a kind Schemaic can't restate. Create this view in SQL instead.",
+            "Creating view {} can't create its index{plural} {} — a columnstore, XML or spatial \
+             index, or another kind Schemaic can't restate. Create this view in SQL instead.",
             draft.name,
             lost.join(", ")
         )
     } else {
         format!(
-            "Editing view {} drops its index{plural} {}, which Schemaic can't create again — it \
-             has included columns, or is of a kind Schemaic can't restate. Edit this view in SQL \
-             instead.",
+            "Editing view {} drops its index{plural} {}, which Schemaic can't create again — a \
+             columnstore, XML or spatial index, or another kind Schemaic can't restate. Edit this \
+             view in SQL instead.",
             draft.original.as_deref().unwrap_or(&draft.name),
             lost.join(", ")
         )
@@ -7419,9 +7435,10 @@ fn create_index_sql(ix: &IndexInfo, qtable: &str, dialect: SqlDialect) -> String
     // The index name is never qualified — PostgreSQL puts an index in its
     // table's schema automatically and rejects `CREATE INDEX "s"."i"`.
     format!(
-        "CREATE {uniq}{cluster}INDEX {} ON {qtable}{using} ({}){filter};",
+        "CREATE {uniq}{cluster}INDEX {} ON {qtable}{using} ({}){}{filter};",
         ddl_ident_in(&ix.name, dialect),
-        ix.key_sql(dialect)
+        ix.key_sql(dialect),
+        ix.include_sql(dialect)
     )
 }
 
@@ -8483,6 +8500,17 @@ pub fn supports_index_prefix(dialect: SqlDialect) -> bool {
     }
 }
 
+/// Can an index carry **included columns** (`INCLUDE (…)`, [`IndexInfo::include`])
+/// on `dialect`? SQL Server's and PostgreSQL's (11 on); MySQL and SQLite have
+/// no such clause, so the designer offers no field there and no emitter writes
+/// one.
+pub fn supports_index_include(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MsSql | SqlDialect::Postgres => true,
+        SqlDialect::MySql | SqlDialect::Sqlite => false,
+    }
+}
+
 /// Can a table and its columns carry a comment the emitter writes on `dialect`?
 ///
 /// The designer shows its comment fields exactly where this is true, so a
@@ -8943,6 +8971,7 @@ fn indexes_equal(a: &IndexInfo, b: &IndexInfo) -> bool {
     a.name == b.name
         && a.unique == b.unique
         && a.columns == b.columns
+        && a.include == b.include
         && a.method == b.method
         && a.predicate == b.predicate
 }
@@ -11905,7 +11934,7 @@ fn tsql_var_widening(from: &str, to: &str) -> bool {
 ///
 /// **A dependent the plan already drops or re-adds is the draft's** and is
 /// left alone, as the check repair above leaves one. One the model cannot
-/// restate — a lossy index, one with included columns — is not touched: the
+/// restate — a lossy index (a columnstore, XML or spatial one) — is not touched: the
 /// server then refuses the change naming it, and the plan, one transaction,
 /// rolls back whole. One it reads but only in part — an index's options, a
 /// key's disabled state, a description — is taken off and put back only past
@@ -12003,7 +12032,13 @@ fn repair_tsql_dependents(
     }
     let mut repairs: Vec<Change> = Vec::new();
     for ix in &current.indexes {
-        if !ix.column_names().any(|c| disturbs(c, TsqlDependent::Index)) {
+        // An included column holds the index to the column as a key one does:
+        // T-SQL refuses the `ALTER COLUMN` naming it either way (Msg 5074).
+        if !ix
+            .column_names()
+            .chain(ix.include.iter().map(String::as_str))
+            .any(|c| disturbs(c, TsqlDependent::Index))
+        {
             continue;
         }
         if ix.is_primary() {
@@ -13673,9 +13708,9 @@ fn tsql_late_arm(probe: &str, cond: &str, why: &str) -> String {
 /// What a T-SQL rebuild ([`tsql_rebuild_sql`]) cannot put back from the
 /// model, said before anything runs — the half of its refusals the reading
 /// already shows, where the guard it opens with is the half only the server
-/// can answer. An index Schemaic does not read whole (included columns, a
-/// columnstore, XML or spatial one) would come back without what it did not
-/// read; a trigger whose text is encrypted has none to put back; a signed one
+/// can answer. An index Schemaic does not read whole (a columnstore, XML or
+/// spatial one — included columns it reads) would come back without what it
+/// did not read; a trigger whose text is encrypted has none to put back; a signed one
 /// would come back unsigned (S2-L5-05); one kept verbatim names the table as
 /// it was, which a rename leaves behind.
 fn tsql_rebuild_refusals(current: &TableInfo, draft: &TableDraft) -> Vec<String> {
@@ -13686,8 +13721,8 @@ fn tsql_rebuild_refusals(current: &TableInfo, draft: &TableDraft) -> Vec<String>
         .filter(|ix| ix.lossy && !ix.is_primary())
         .map(|ix| {
             format!(
-                "Rebuilding {t} would drop the index {}: it has included columns or is a \
-                 columnstore, XML or spatial index, which Schemaic doesn't read whole",
+                "Rebuilding {t} would drop the index {}: it is a columnstore, XML or spatial \
+                 index, or another kind Schemaic doesn't read whole",
                 ix.name
             )
         })
@@ -14835,13 +14870,19 @@ fn reorder_moves(changes: &mut [Change], moved: &[String]) {
     }
 }
 
-/// The same index with its key columns renamed — so an index on a column the
-/// draft renamed compares as unchanged rather than as a drop and a create.
+/// The same index with its key and included columns renamed — so an index on
+/// a column the draft renamed compares as unchanged rather than as a drop and
+/// a create.
 fn rename_index(ix: &IndexInfo, renamed: &HashMap<String, String>) -> IndexInfo {
     let mut out = ix.clone();
     for c in &mut out.columns {
         if let Some(n) = renamed.get(&c.name) {
             c.name = n.clone();
+        }
+    }
+    for c in &mut out.include {
+        if let Some(n) = renamed.get(c) {
+            *c = n.clone();
         }
     }
     out
@@ -17704,6 +17745,164 @@ mod tests {
         }
         assert!(!swap.contains("> 0 AND @seed"), "{swap}");
         assert_eq!(swap.matches(';').count(), 1, "one batch: {swap}");
+    }
+
+    /// An index over `qty` covering `code` — the shape five of
+    /// WideWorldImporters' tables have, which a rebuild refused while the
+    /// model could not hold an included column.
+    fn covering(include: &[&str]) -> IndexInfo {
+        IndexInfo {
+            name: "ix_cover".into(),
+            columns: vec![crate::schema::IndexColumn::plain("qty")],
+            include: include.iter().map(|c| c.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// **An index's included columns are restated where the engine has
+    /// them**, after the key list and before a filter — T-SQL's and
+    /// PostgreSQL's grammar alike — and nowhere else.
+    #[test]
+    fn an_index_restates_its_included_columns() {
+        let ix = covering(&["code", "id"]);
+        assert_eq!(
+            single(
+                "p",
+                Some("dbo"),
+                MsSql,
+                Change::AddIndex(Box::new(ix.clone()))
+            )
+            .emit(),
+            vec!["CREATE INDEX [ix_cover] ON [dbo].[p] ([qty]) INCLUDE ([code], [id]);"]
+        );
+        let filtered = IndexInfo {
+            predicate: Some("qty > 0".into()),
+            ..ix.clone()
+        };
+        assert_eq!(
+            single(
+                "p",
+                Some("public"),
+                Postgres,
+                Change::AddIndex(Box::new(filtered))
+            )
+            .emit(),
+            vec![
+                "CREATE INDEX \"ix_cover\" ON \"public\".\"p\" (\"qty\") INCLUDE (\"code\", \"id\") \
+                 WHERE qty > 0;"
+            ]
+        );
+        for d in [MsSql, Postgres] {
+            assert!(supports_index_include(d), "{d:?}");
+        }
+        for d in [MySql, Sqlite] {
+            assert!(!supports_index_include(d), "{d:?}");
+        }
+    }
+
+    /// **The included columns are part of what an index is**: changing only
+    /// them is an index change, or the edit diffs as nothing and never lands.
+    #[test]
+    fn an_include_only_edit_is_an_index_change() {
+        let mut t = ms_rebuild_table();
+        t.indexes.push(covering(&["code"]));
+        let mut d = TableDraft::from_table(&t);
+        let ix = d
+            .indexes
+            .iter_mut()
+            .find(|ix| ix.info.name == "ix_cover")
+            .unwrap();
+        ix.info.include = vec!["id".into()];
+        let stmts = diff(&t, &d, MsSql).emit();
+        assert!(
+            stmts.iter().any(|s| s.contains("INCLUDE ([id])")),
+            "{stmts:?}"
+        );
+    }
+
+    /// A renamed column is renamed in an include list as in a key, so the
+    /// index compares unchanged; a removed one leaves the list, and the index
+    /// stays — T-SQL refuses to drop a column an index includes, so the plan
+    /// re-creates the index without it, ahead of the drop.
+    #[test]
+    fn an_include_follows_a_rename_and_a_removal() {
+        let mut t = ms_rebuild_table();
+        t.indexes.push(covering(&["code"]));
+        let mut d = TableDraft::from_table(&t);
+        d.rename_column(1, "sku");
+        let ix = |d: &TableDraft| {
+            d.indexes
+                .iter()
+                .find(|ix| ix.info.name == "ix_cover")
+                .map(|ix| ix.info.include.clone())
+        };
+        assert_eq!(ix(&d), Some(vec!["sku".to_string()]));
+        let renamed = diff(&t, &d, MsSql);
+        assert!(
+            !renamed
+                .changes
+                .iter()
+                .any(|c| matches!(c, Change::DropIndex { name, .. } if name == "ix_cover")),
+            "{:?}",
+            renamed.changes
+        );
+        d.remove_column(1, MsSql);
+        assert_eq!(ix(&d), Some(Vec::new()));
+
+        // And the plan takes the index off before the column, and puts it back
+        // without it after.
+        let mut d = TableDraft::from_table(&t);
+        d.remove_column(1, MsSql);
+        let stmts = unguarded(diff(&t, &d, MsSql).emit());
+        let at = |needle: &str| {
+            stmts
+                .iter()
+                .position(|s| s.contains(needle))
+                .unwrap_or_else(|| panic!("no {needle} in {stmts:#?}"))
+        };
+        let (drop_ix, drop_col, add_ix) = (
+            at("DROP INDEX [ix_cover]"),
+            at("DROP COLUMN [code]"),
+            at("CREATE INDEX [ix_cover] ON [dbo].[p] ([qty]);"),
+        );
+        assert!(drop_ix < drop_col && drop_col < add_ix, "{stmts:#?}");
+    }
+
+    /// An include list names columns of the table.
+    #[test]
+    fn an_include_naming_no_column_is_refused() {
+        let mut t = ms_rebuild_table();
+        t.indexes.push(covering(&["nope"]));
+        let errs = TableDraft::from_table(&t).validate(MsSql);
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("ix_cover") && e.contains("nope")),
+            "{errs:?}"
+        );
+        let mut t = ms_rebuild_table();
+        t.indexes.push(covering(&["code"]));
+        let errs = TableDraft::from_table(&t).validate(MsSql);
+        assert!(!errs.iter().any(|e| e.contains("ix_cover")), "{errs:?}");
+    }
+
+    /// **A rebuild restates an index with included columns** rather than
+    /// refusing the table, which is what it did while the model could not hold
+    /// one; a columnstore, XML or spatial index still stops it.
+    #[test]
+    fn a_sql_server_rebuild_restates_an_index_with_included_columns() {
+        let mut t = ms_rebuild_table();
+        t.indexes.push(covering(&["code"]));
+        let mut d = TableDraft::from_table(&t);
+        d.columns[0].info.auto_increment = false;
+        let plan = diff(&t, &d, MsSql);
+        assert!(plan.unsupported().is_empty(), "{:?}", plan.unsupported());
+        let stmts = plan.emit();
+        assert!(
+            stmts.iter().any(
+                |s| s.contains("CREATE INDEX [ix_cover] ON [dbo].[p] ([qty]) INCLUDE ([code])")
+            ),
+            "{stmts:?}"
+        );
     }
 
     /// **What the rebuild cannot put back is said before anything runs**: an

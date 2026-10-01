@@ -1518,16 +1518,19 @@ fn table_kind_listing(cat: Catalogue) -> String {
     )
 }
 
-/// Every index's key columns, in key order: `(schema, table, index, unique,
-/// primary key, column, descending, filter, type, has included columns,
-/// constraint, the column's graph type)`. The primary key's index is renamed `PRIMARY`, as PostgreSQL's
-/// is, so `IndexInfo::is_primary` and the DDL treat it the one way; its real
-/// name is kept as the constraint's.
+/// Every index's key columns, in key order, then its included ones, in theirs:
+/// `(schema, table, index, unique, primary key, column, descending, filter,
+/// type, included, constraint, the column's graph type)`. The primary key's
+/// index is renamed `PRIMARY`, as PostgreSQL's is, so `IndexInfo::is_primary`
+/// and the DDL treat it the one way; its real name is kept as the
+/// constraint's.
 ///
 /// **A columnstore index has no key columns** — its columns are listed with
 /// `key_ordinal` 0 and flagged as included — so it is read by its columns, in
-/// their order, or a key-only join drops it and the table's DDL left it out
-/// without the note every other index it cannot restate gets.
+/// their order, as key rows (`included` 0), or a key-only join drops it and
+/// the table's DDL left it out without the note every other index it cannot
+/// restate gets. A partitioning column outside the key (`key_ordinal` 0, not
+/// included) is no column of the index's own, and is left out.
 fn index_listing(cat: Catalogue) -> String {
     INDEX_LISTING.replace(
         "{graph_type}",
@@ -1544,11 +1547,7 @@ const INDEX_LISTING: &str = "SELECT s.name, t.name, \
             CASE WHEN i.is_primary_key = 1 THEN 'PRIMARY' ELSE i.name END, \
             CAST(i.is_unique AS int), CAST(i.is_primary_key AS int), \
             c.name, CAST(ic.is_descending_key AS int), i.filter_definition, i.type, \
-            CAST(CASE WHEN EXISTS (SELECT 1 FROM sys.index_columns x \
-                                    WHERE x.object_id = i.object_id \
-                                      AND x.index_id = i.index_id \
-                                      AND x.is_included_column = 1) \
-                 THEN 1 ELSE 0 END AS int), \
+            CAST(CASE WHEN i.type IN (5, 6) THEN 0 ELSE ic.is_included_column END AS int), \
             CASE WHEN i.is_primary_key = 1 OR i.is_unique_constraint = 1 THEN i.name END, \
             {graph_type} \
      FROM sys.indexes i \
@@ -1556,10 +1555,10 @@ const INDEX_LISTING: &str = "SELECT s.name, t.name, \
      JOIN sys.schemas s ON s.schema_id = t.schema_id \
      JOIN sys.index_columns ic \
             ON ic.object_id = i.object_id AND ic.index_id = i.index_id \
-           AND ((ic.is_included_column = 0 AND ic.key_ordinal > 0) OR i.type IN (5, 6)) \
+           AND (ic.key_ordinal > 0 OR ic.is_included_column = 1 OR i.type IN (5, 6)) \
      JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id \
      WHERE t.is_ms_shipped = 0 AND i.index_id > 0 AND i.is_hypothetical = 0 \
-     ORDER BY s.name, t.name, i.name, ic.key_ordinal, ic.index_column_id";
+     ORDER BY s.name, t.name, i.name, ic.is_included_column, ic.key_ordinal, ic.index_column_id";
 
 /// Every **indexed view's** indexes, in [`INDEX_LISTING`]'s shape — the
 /// unique clustered index that materialises the view and any nonclustered
@@ -1569,21 +1568,17 @@ const INDEX_LISTING: &str = "SELECT s.name, t.name, \
 const VIEW_INDEX_LISTING: &str = "SELECT s.name, v.name, i.name, \
             CAST(i.is_unique AS int), CAST(i.is_primary_key AS int), \
             c.name, CAST(ic.is_descending_key AS int), i.filter_definition, i.type, \
-            CAST(CASE WHEN EXISTS (SELECT 1 FROM sys.index_columns x \
-                                    WHERE x.object_id = i.object_id \
-                                      AND x.index_id = i.index_id \
-                                      AND x.is_included_column = 1) \
-                 THEN 1 ELSE 0 END AS int), \
+            CAST(CASE WHEN i.type IN (5, 6) THEN 0 ELSE ic.is_included_column END AS int), \
             NULL \
      FROM sys.indexes i \
      JOIN sys.views v ON v.object_id = i.object_id \
      JOIN sys.schemas s ON s.schema_id = v.schema_id \
      JOIN sys.index_columns ic \
             ON ic.object_id = i.object_id AND ic.index_id = i.index_id \
-           AND ((ic.is_included_column = 0 AND ic.key_ordinal > 0) OR i.type IN (5, 6)) \
+           AND (ic.key_ordinal > 0 OR ic.is_included_column = 1 OR i.type IN (5, 6)) \
      JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id \
      WHERE v.is_ms_shipped = 0 AND i.index_id > 0 AND i.is_hypothetical = 0 \
-     ORDER BY s.name, v.name, i.name, ic.key_ordinal, ic.index_column_id";
+     ORDER BY s.name, v.name, i.name, ic.is_included_column, ic.key_ordinal, ic.index_column_id";
 
 /// Every foreign key's column pairs, in key order, with its actions:
 /// `(schema, table, constraint, column, ref schema, ref table, ref column,
@@ -2137,15 +2132,15 @@ async fn collect_schema(client: &mut MsClient) -> Result<DbSchema, DbError> {
             let mut column = IndexColumn::plain(cell(r, 5));
             column.descending = flag(r, 6);
             // Rowstore indexes — clustered and nonclustered, types 1 and 2 —
-            // are what the model can say; a columnstore, XML or spatial index
-            // is not, and neither are included columns, which an edit would
-            // drop. Clustering is `IndexInfo::clustered`: before it was
+            // are what the model can say, included columns and all
+            // (`IndexInfo::include`); a columnstore, XML or spatial index is
+            // not. Clustering is `IndexInfo::clustered`: before it was
             // modelled, a clustered index other than the key's had to be
             // withheld, since recreating it plainly left the table a heap.
             let kind = int(r, 8);
             // `lossy` in the graph column: an index over a graph table's
             // internal columns, marked above.
-            let lossy = kind > 2 || flag(r, 9) || cell(r, 11) == "lossy";
+            let lossy = kind > 2 || cell(r, 11) == "lossy";
             (
                 cell(r, 0),
                 IdxRow {
@@ -2158,6 +2153,7 @@ async fn collect_schema(client: &mut MsClient) -> Result<DbSchema, DbError> {
                     lossy,
                     create_sql: None,
                     clustered: Some(kind == 1),
+                    included: flag(r, 9),
                 },
             )
         })

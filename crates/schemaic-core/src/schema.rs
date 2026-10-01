@@ -161,6 +161,16 @@ impl IndexColumn {
 pub struct IndexInfo {
     pub name: String,
     pub columns: Vec<IndexColumn>,
+    /// The **included** columns, in order — `INCLUDE (…)`, carried in the
+    /// index's leaf rows without being part of its key, on SQL Server and
+    /// PostgreSQL (11 on). Empty on MySQL and SQLite, which have no such
+    /// clause ([`crate::ddl::supports_index_include`]).
+    ///
+    /// Modelled rather than left to [`IndexInfo::lossy`], which is what it was:
+    /// an index with one could be neither edited, nor restated by a SQL Server
+    /// rebuild — which refused five of WideWorldImporters' 48 tables over it —
+    /// nor written into a SQL Server dump.
+    pub include: Vec<String>,
     pub unique: bool,
     /// True if this index backs a FOREIGN KEY constraint.
     pub foreign: bool,
@@ -352,6 +362,23 @@ impl IndexInfo {
             unique,
             ..Default::default()
         }
+    }
+
+    /// ` INCLUDE ([a], [b])` — the clause after the key list, with its leading
+    /// space — or nothing when there are no included columns, or `dialect` has
+    /// no such clause ([`crate::ddl::supports_index_include`]). The one
+    /// spelling for every emitter that writes an index: the designer's plan,
+    /// Copy DDL and a dump.
+    pub fn include_sql(&self, dialect: crate::intel::SqlDialect) -> String {
+        if self.include.is_empty() || !crate::ddl::supports_index_include(dialect) {
+            return String::new();
+        }
+        let cols: Vec<String> = self
+            .include
+            .iter()
+            .map(|c| ddl_ident_in(c, dialect))
+            .collect();
+        format!(" INCLUDE ({})", cols.join(", "))
     }
 
     /// The parenthesised key list, with each column's prefix length and sort
@@ -5373,9 +5400,10 @@ impl TableInfo {
                 // its table's schema automatically, and `CREATE INDEX "s"."i"` is
                 // a syntax error.
                 out.push_str(&format!(
-                    "\nCREATE {uniq}INDEX {} ON {qname}{using} ({}){filter};",
+                    "\nCREATE {uniq}INDEX {} ON {qname}{using} ({}){}{filter};",
                     q(&ix.name),
                     ix.key_sql(dialect),
+                    ix.include_sql(dialect),
                 ));
             }
             out
@@ -5552,8 +5580,8 @@ impl TableInfo {
                     .join("\nGO\n");
             for ix in draft.options.tsql.indexes.iter().filter(|ix| ix.lossy) {
                 out.push_str(&format!(
-                    "\n-- Index {} has included columns, or is of a kind this script cannot \
-                     restate; it is left out.",
+                    "\n-- Index {} is a columnstore, XML or spatial index, or another kind \
+                     this script cannot restate; it is left out.",
                     crate::export::comment_text(&ix.name)
                 ));
             }
@@ -5707,8 +5735,8 @@ impl TableInfo {
         {
             if ix.lossy {
                 out.push_str(&format!(
-                    "\n-- Index {} has included columns, or is of a kind this script \
-                     cannot restate; it is left out.",
+                    "\n-- Index {} is a columnstore, XML or spatial index, or another kind \
+                     this script cannot restate; it is left out.",
                     crate::export::comment_text(&ix.name)
                 ));
                 continue;
@@ -5724,9 +5752,10 @@ impl TableInfo {
                 None => String::new(),
             };
             out.push_str(&format!(
-                "\nCREATE {uniq}{cl}INDEX {} ON {qname} ({}){filter};",
+                "\nCREATE {uniq}{cl}INDEX {} ON {qname} ({}){}{filter};",
                 q(&ix.name),
                 ix.key_sql(d),
+                ix.include_sql(d),
             ));
         }
         let ns = self.schema.as_deref().unwrap_or(MSSQL_DEFAULT_SCHEMA);
@@ -9470,12 +9499,14 @@ mod tests {
         uq.constraint = Some("uq_bal".into());
         let plain = IndexInfo::plain("ix_d", vec!["doubled"], false);
         let mut covering = IndexInfo::plain("ix_cover", vec!["id"], false);
-        covering.lossy = true;
+        covering.include = vec!["balance".into()];
+        let mut columnstore = IndexInfo::plain("ix_cs", vec!["id"], false);
+        columnstore.lossy = true;
         let t = TableInfo {
             schema: Some("dbo".into()),
             name: "t]x".into(),
             columns: vec![id, bal, doubled],
-            indexes: vec![pk, uq, plain, covering],
+            indexes: vec![pk, uq, plain, covering, columnstore],
             check_constraints: vec![CheckInfo {
                 name: "ck_b".into(),
                 expression: "[balance]>=(0)".into(),
@@ -9514,20 +9545,24 @@ mod tests {
             "{ddl}"
         );
         assert!(
-            ddl.contains("-- Index ix_cover has included columns"),
+            ddl.contains("\nCREATE INDEX [ix_cover] ON [dbo].[t]]x] ([id]) INCLUDE ([balance]);"),
             "{ddl}"
         );
-        assert!(!ddl.contains("CREATE INDEX [ix_cover]"), "{ddl}");
+        assert!(
+            ddl.contains("-- Index ix_cs is a columnstore, XML or spatial index"),
+            "{ddl}"
+        );
+        assert!(!ddl.contains("CREATE INDEX [ix_cs]"), "{ddl}");
         assert!(ddl.starts_with("-- id: the identity's seed"), "{ddl}");
         assert!(
             !ddl.contains("AUTO_INCREMENT") && !ddl.contains('`'),
             "{ddl}"
         );
         // Every line that is not a comment is T-SQL the lexer ends where the
-        // server does: two statements after the table's.
+        // server does: the table and its two indexes.
         assert_eq!(
             crate::sql::statement_ranges(&ddl, crate::intel::SqlDialect::MsSql).len(),
-            2
+            3
         );
     }
 
@@ -10021,8 +10056,8 @@ mod tests {
                  SELECT id, d FROM dbo.t;\nGO\n\
                  CREATE UNIQUE CLUSTERED INDEX [cix] ON [dbo].[v] ([id]);\nGO\n\
                  CREATE INDEX [nix] ON [dbo].[v] ([d]);\n\
-                 -- Index inc has included columns, or is of a kind this script cannot restate; \
-                 it is left out."
+                 -- Index inc is a columnstore, XML or spatial index, or another kind this \
+                 script cannot restate; it is left out."
             )
         );
     }
@@ -10318,10 +10353,12 @@ mod tests {
     /// **An index the model only partly read is emitted from the server's own
     /// statement**, because emitting it from the model is not merely different
     /// but wrong. Measured on PostgreSQL 16.15: `CREATE INDEX ix ON inc (a, b)
-    /// INCLUDE (c, d)` is reported as two key rows and nothing else, so the
-    /// model's emission restored an index that no longer covers — on a
+    /// INCLUDE (c, d)` was reported as two key rows and nothing else, so the
+    /// model's emission restored an index that no longer covered — on a
     /// structure dump with no edit anywhere, reported as a success. `NULLS NOT
-    /// DISTINCT` and a storage parameter are the same shape.
+    /// DISTINCT` and a storage parameter are the same shape; a plain index's
+    /// `INCLUDE` list is read now ([`IndexInfo::include`]) and emitted from the
+    /// model, which the last half of this test checks.
     #[test]
     fn create_ddl_postgres_emits_a_lossy_index_from_the_servers_own_text() {
         let mut t = TableInfo {
@@ -10349,6 +10386,14 @@ mod tests {
         assert!(!sql.contains("INCLUDE"), "{sql}");
         assert!(
             sql.contains("CREATE INDEX \"ix_inc\" ON \"inc\" (\"a\");"),
+            "{sql}"
+        );
+
+        // An included column the model *does* hold is the model's emission too.
+        t.indexes[0].include = vec!["c".into(), "d".into()];
+        let sql = t.create_ddl(crate::intel::SqlDialect::Postgres);
+        assert!(
+            sql.contains("CREATE INDEX \"ix_inc\" ON \"inc\" (\"a\") INCLUDE (\"c\", \"d\");"),
             "{sql}"
         );
     }

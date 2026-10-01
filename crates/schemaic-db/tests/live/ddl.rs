@@ -950,12 +950,13 @@ async fn assert_matches_draft(
 /// table recreates the index narrower, and a structure dump rewrites it with **no
 /// edit at all** and reports success.
 ///
-/// Three shapes, each of which `pg_index` reports in a place the per-key-column
-/// query cannot see: `INCLUDE` columns live past `indnkeyatts` and are dropped
-/// by the ordinality join before `pg_attribute` is consulted;
-/// `NULLS NOT DISTINCT` is a column of `pg_index` that PostgreSQL 15 added, so
-/// it cannot even be named in a query that must also parse on 13 and 14; and a
-/// storage parameter is `pg_class.reloptions`, which nothing asked for.
+/// Two shapes, each of which `pg_index` reports in a place the per-column
+/// query cannot see: `NULLS NOT DISTINCT` is a column of `pg_index` that
+/// PostgreSQL 15 added, so it cannot even be named in a query that must also
+/// parse on 13 and 14; and a storage parameter is `pg_class.reloptions`,
+/// which nothing asked for. A third, `INCLUDE` columns past `indnkeyatts`, was
+/// one until the list was read into `IndexInfo::include` — so `ix_inc` here is
+/// asserted read whole instead.
 ///
 /// Gated on the capability rather than the engine, the way the reorder above is
 /// — but the shapes are **PostgreSQL's**, it being the only leg in this tier
@@ -984,7 +985,23 @@ pub async fn a_partly_read_index_says_so_and_is_emitted_whole(target: &'static T
     }
 
     let current = table_of(&scratch, "t").await;
-    for name in ["ix_inc", "ix_nd", "ix_ff"] {
+    // **The `INCLUDE` list is read now, not withheld**: key and included
+    // columns apart, and the index whole, so an edit restates it and a dump
+    // writes it from the model.
+    let inc = current
+        .indexes
+        .iter()
+        .find(|i| i.name == "ix_inc")
+        .unwrap_or_else(|| panic!("{}: no index ix_inc", target.name));
+    assert_eq!(
+        inc.column_names().collect::<Vec<_>>(),
+        vec!["a", "b"],
+        "{}: the included column was read into the key",
+        target.name
+    );
+    assert_eq!(inc.include, vec!["c".to_string()], "{}", target.name);
+    assert!(!inc.lossy, "{}: ix_inc was still withheld", target.name);
+    for name in ["ix_nd", "ix_ff"] {
         let ix = current
             .indexes
             .iter()
@@ -1012,7 +1029,7 @@ pub async fn a_partly_read_index_says_so_and_is_emitted_whole(target: &'static T
     // And the emitted DDL keeps what the model has no field for — the dump path,
     // which reaches `create_ddl` with no edit anywhere.
     let ddl_text = current.create_ddl(dialect);
-    for clause in ["INCLUDE (c)", "NULLS NOT DISTINCT", "fillfactor"] {
+    for clause in ["INCLUDE (\"c\")", "NULLS NOT DISTINCT", "fillfactor"] {
         assert!(
             ddl_text.contains(clause),
             "{}: emitted DDL dropped {clause}:\n{ddl_text}",

@@ -1732,6 +1732,32 @@ fn index_form(d: DdlUi, target: &DesignerTarget, ring: FocusRing) -> AnyView {
         crate::widgets::nothing()
     };
 
+    // Built only where the engine has `INCLUDE`, for `pg_only`'s reason.
+    let include: AnyView = if ddl::supports_index_include(dialect) {
+        form_setting(
+            "Include",
+            field_with_hint(
+                bound_field(
+                    d.draft,
+                    ix.include.join(", "),
+                    list_field_w,
+                    "",
+                    ring.clone(),
+                    25,
+                    move |d, v| {
+                        if let Some(x) = d.indexes.get_mut(i) {
+                            x.info.include = parse_name_list(v);
+                        }
+                    },
+                ),
+                "Comma-separated columns carried in the index but not part of its key.",
+            ),
+        )
+        .into_any()
+    } else {
+        crate::widgets::nothing()
+    };
+
     v_stack((
         form_setting(
             "Name",
@@ -1768,6 +1794,7 @@ fn index_form(d: DdlUi, target: &DesignerTarget, ring: FocusRing) -> AnyView {
                 key_hint,
             ),
         ),
+        include,
         bound_toggle(
             d.draft,
             "Unique",
