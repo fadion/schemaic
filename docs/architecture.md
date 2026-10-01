@@ -3268,6 +3268,14 @@ existing prose was left alone.
     `create_sql` is `Some`** (`needs_fk_section`): SQLite's verbatim captured `CREATE TABLE` already
     carries the keys, and SQLite has no `ALTER TABLE … ADD CONSTRAINT` to restate them with. That
     question is asked of the *table*, never of the dialect — the data answers it directly.
+    **A table no `CREATE` from the model restates is left out of the file and named in its
+    header** — a system-versioned table, its history table, a memory-optimised table
+    (`TsqlTableKind::unrestatable`): kept, its `DROP` destroyed what the file could not put back and
+    its rows landed in nothing. Out of `order`, a key onto one is counted with the keys to tables
+    outside the export. A graph edge is restated, empty, and the header says why: an edge names
+    the nodes it joins by node id, and a restore gives every node a new one; a node's rows are
+    carried (`a_table_the_file_cannot_restate_is_named_and_left_out`; the live round trip's node
+    comes back a node with its rows, its edge an empty edge, and its temporal pair absent).
     **A constraint that was off in the source goes back off, after the rows.** SQL Server keeps a
     disabled or untrusted check or key over rows that violate it; restated as an ordinary one the
     restore stopped at those rows (Msg 547), and where none did the copy silently enforced what the
@@ -12992,7 +13000,14 @@ existing prose was left alone.
   switched off for (`a_sql_server_check_that_is_off_is_added_after_the_table_as_it_was`) —,
   `AS (…) PERSISTED` — with the `NOT NULL` a persisted one may carry, as the designer's
   `tsql_definition` writes it, which the copy otherwise dropped and so took rows the original
-  refused (`a_persisted_not_null_computed_column_keeps_its_not_null`) — other indexes as separate
+  refused (`a_persisted_not_null_computed_column_keeps_its_not_null`) — a graph table `AS NODE`
+  or `AS EDGE` and a temporal or memory-optimised one not at all (`TsqlTableKind`, read by
+  `TABLE_KIND_LISTING`; its `unrestatable` reason in a comment, the sequence arm's rule, since
+  read as a plain table a node carried its internal `graph_id_…`/`$node_id_…` columns and refused
+  the original's rows, Msg 515, and a system-versioned table became two unrelated plain ones —
+  `a_sql_server_graph_temporal_or_memory_optimised_table_is_not_scripted_as_a_plain_one`); the
+  internal columns are left out of `COLUMN_LISTING` by `graph_type`, the index keyed on nothing
+  but graph ids is dropped and one naming another graph column is withheld as `lossy` — other indexes as separate
   statements, the table's and columns' comments after them through `ddl::tsql_add_comment` — the
   same `sp_addextendedproperty` the emitter writes (`create_ddl_sql_server_restates_the_comments`)
   — and what it cannot restate named in a comment; a view is its stored definition **with the

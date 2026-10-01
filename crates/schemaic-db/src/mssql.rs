@@ -1219,12 +1219,31 @@ const COLUMN_LISTING: &str = "SELECT s.name, o.name, c.name, ty.name, \
      LEFT JOIN sys.extended_properties ep \
             ON ep.class = 1 AND ep.major_id = c.object_id AND ep.minor_id = c.column_id \
            AND ep.name = 'MS_Description' \
-     WHERE o.type IN ('U', 'V') AND o.is_ms_shipped = 0 \
+     WHERE o.type IN ('U', 'V') AND o.is_ms_shipped = 0 AND c.graph_type IS NULL \
      ORDER BY s.name, o.name, c.column_id";
+
+/// The tables that are more than their columns — `TsqlTableKind`: `(schema,
+/// table, node, edge, temporal type, memory-optimised, has edge constraints)`.
+///
+/// A graph table's internal columns (`graph_id_…`, `$node_id_…`, an edge's
+/// `$from_id_…`/`$to_id_…`) are left out of [`COLUMN_LISTING`] by their
+/// `graph_type`: they are the server's to add, `AS NODE`/`AS EDGE` restates
+/// them, and as ordinary columns they made a plain table that refused the
+/// original's rows (Msg 515). An edge constraint is an `EC` object, which a
+/// server before 2019 simply has none of.
+const TABLE_KIND_LISTING: &str = "SELECT s.name, t.name, CAST(t.is_node AS int), \
+            CAST(t.is_edge AS int), CAST(t.temporal_type AS int), \
+            CAST(t.is_memory_optimized AS int), \
+            CAST(CASE WHEN EXISTS (SELECT 1 FROM sys.objects ec \
+                                    WHERE ec.parent_object_id = t.object_id AND ec.type = 'EC') \
+                 THEN 1 ELSE 0 END AS int) \
+     FROM sys.tables t JOIN sys.schemas s ON s.schema_id = t.schema_id \
+     WHERE t.is_ms_shipped = 0 \
+       AND (t.is_node = 1 OR t.is_edge = 1 OR t.temporal_type <> 0 OR t.is_memory_optimized = 1)";
 
 /// Every index's key columns, in key order: `(schema, table, index, unique,
 /// primary key, column, descending, filter, type, has included columns,
-/// constraint)`. The primary key's index is renamed `PRIMARY`, as PostgreSQL's
+/// constraint, the column's graph type)`. The primary key's index is renamed `PRIMARY`, as PostgreSQL's
 /// is, so `IndexInfo::is_primary` and the DDL treat it the one way; its real
 /// name is kept as the constraint's.
 ///
@@ -1241,7 +1260,8 @@ const INDEX_LISTING: &str = "SELECT s.name, t.name, \
                                       AND x.index_id = i.index_id \
                                       AND x.is_included_column = 1) \
                  THEN 1 ELSE 0 END AS int), \
-            CASE WHEN i.is_primary_key = 1 OR i.is_unique_constraint = 1 THEN i.name END \
+            CASE WHEN i.is_primary_key = 1 OR i.is_unique_constraint = 1 THEN i.name END, \
+            c.graph_type \
      FROM sys.indexes i \
      JOIN sys.tables t ON t.object_id = i.object_id \
      JOIN sys.schemas s ON s.schema_id = t.schema_id \
@@ -1725,7 +1745,35 @@ async fn collect_schema(client: &mut MsClient) -> Result<DbSchema, DbError> {
     let flag = |r: &[Option<String>], i: usize| cell(r, i) == "1";
 
     let table_rows = query_rows(client, TABLE_LISTING).await?;
-    let idx_all = query_rows(client, INDEX_LISTING).await?;
+    let mut idx_all = query_rows(client, INDEX_LISTING).await?;
+    // **A graph table's internal index is the server's, like its internal
+    // columns**: one keyed on nothing but graph ids (`graph_type` 1, the
+    // `GRAPH_UNIQUE_INDEX_…` that `AS NODE`/`AS EDGE` makes) goes; one that
+    // names another graph column among its keys — `$from_id`/`$to_id`, say —
+    // is kept but withheld as `lossy`, since its key names columns the model
+    // leaves out.
+    {
+        type IdxKey = (String, String, String);
+        let mut graph: HashMap<IdxKey, (bool, bool)> = HashMap::new();
+        for r in &idx_all {
+            let g = r.get(11).cloned().flatten();
+            let e = graph
+                .entry((cell(r, 0), cell(r, 1), cell(r, 2)))
+                .or_insert((true, false));
+            e.0 &= g.as_deref() == Some("1");
+            e.1 |= g.is_some();
+        }
+        idx_all.retain(|r| {
+            let (all_ids, _) = graph[&(cell(r, 0), cell(r, 1), cell(r, 2))];
+            !all_ids
+        });
+        for r in &mut idx_all {
+            let (_, any) = graph[&(cell(r, 0), cell(r, 1), cell(r, 2))];
+            if any && r.len() > 11 {
+                r[11] = Some("lossy".to_string());
+            }
+        }
+    }
     let pk_set: HashSet<(String, String, String)> = idx_all
         .iter()
         .filter(|r| flag(r, 4))
@@ -1786,7 +1834,9 @@ async fn collect_schema(client: &mut MsClient) -> Result<DbSchema, DbError> {
             // modelled, a clustered index other than the key's had to be
             // withheld, since recreating it plainly left the table a heap.
             let kind = int(r, 8);
-            let lossy = kind > 2 || flag(r, 9);
+            // `lossy` in the graph column: an index over a graph table's
+            // internal columns, marked above.
+            let lossy = kind > 2 || flag(r, 9) || cell(r, 11) == "lossy";
             (
                 cell(r, 0),
                 IdxRow {
@@ -1982,11 +2032,29 @@ async fn collect_schema(client: &mut MsClient) -> Result<DbSchema, DbError> {
         .into_iter()
         .filter_map(|r| Some(((cell(&r, 0), cell(&r, 1)), r.get(2).cloned().flatten()?)))
         .collect();
+    let kinds: HashMap<(String, String), schemaic_core::schema::TsqlTableKind> =
+        query_rows(client, TABLE_KIND_LISTING)
+            .await?
+            .into_iter()
+            .map(|r| {
+                (
+                    (cell(&r, 0), cell(&r, 1)),
+                    schemaic_core::schema::TsqlTableKind {
+                        node: flag(&r, 2),
+                        edge: flag(&r, 3),
+                        temporal_type: u8::try_from(int(&r, 4)).unwrap_or(0),
+                        memory_optimized: flag(&r, 5),
+                        edge_constraints: flag(&r, 6),
+                    },
+                )
+            })
+            .collect();
 
     for t in &mut tables {
         let ns = t.schema.clone().unwrap_or_default();
         let key = (ns.clone(), t.name.clone());
         t.comment = comments.get(&key).cloned();
+        t.tsql_kind = kinds.get(&key).cloned().unwrap_or_default();
         t.check_constraints = checks_by.remove(&key).unwrap_or_default();
         t.triggers = triggers_by.remove(&key).unwrap_or_default();
         if t.is_view

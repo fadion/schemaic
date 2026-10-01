@@ -1383,6 +1383,55 @@ pub struct TableInfo {
     /// against the table as it comes out. Its own table's keys, a self-reference
     /// among them, are [`TableInfo::foreign_keys`] and go down with it.
     pub referenced_by: Vec<InboundForeignKey>,
+    /// **What a SQL Server table is besides its columns** — a graph node or
+    /// edge, a system-versioned table or its history, memory-optimised — the
+    /// default (a plain table) everywhere else. See [`TsqlTableKind`].
+    pub tsql_kind: TsqlTableKind,
+}
+
+/// What a SQL Server table is besides its columns, where that changes the
+/// `CREATE TABLE` that recreates it (`sys.tables`' `is_node`, `is_edge`,
+/// `temporal_type`, `is_memory_optimized`).
+///
+/// **Read so that no script builds a different table without saying so.**
+/// Unread, a graph node came out as a plain table carrying its internal
+/// `graph_id_…`/`$node_id_…` columns, which refused the original's rows
+/// (Msg 515); a system-versioned table came out as two unrelated plain tables
+/// and a restore silently stopped versioning. A node or edge is restated
+/// (`AS NODE`/`AS EDGE`, its internal columns being the server's to add); a
+/// temporal or memory-optimised table is not — its period, history link and
+/// storage have no place in the model — and a script says so instead of
+/// writing one ([`TableInfo::create_ddl`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TsqlTableKind {
+    /// `AS NODE`.
+    pub node: bool,
+    /// `AS EDGE`.
+    pub edge: bool,
+    /// The edge carries `CONNECTION` constraints, which the model does not
+    /// read.
+    pub edge_constraints: bool,
+    /// `sys.tables.temporal_type`: 1 for a history table, 2 for a
+    /// system-versioned one, 0 otherwise.
+    pub temporal_type: u8,
+    /// `MEMORY_OPTIMIZED = ON`.
+    pub memory_optimized: bool,
+}
+
+impl TsqlTableKind {
+    /// Why no `CREATE TABLE` from the model restates this table, or `None`
+    /// when one does.
+    pub fn unrestatable(&self) -> Option<&'static str> {
+        if self.memory_optimized {
+            Some("a memory-optimised table")
+        } else if self.temporal_type == 2 {
+            Some("a system-versioned temporal table")
+        } else if self.temporal_type == 1 {
+            Some("the history table of a system-versioned table")
+        } else {
+            None
+        }
+    }
 }
 
 /// A foreign key on another table that references this one
@@ -5136,7 +5185,7 @@ impl TableInfo {
     /// [`crate::ddl::ChangeSet::emit`], whose `AddCheck` arm the rebuild
     /// already restates such a check with, not a second spelling of it.
     fn tsql_held_checks(&self) -> Vec<String> {
-        if self.is_view {
+        if self.is_view || self.tsql_kind.unrestatable().is_some() {
             return Vec::new();
         }
         let held: Vec<crate::ddl::Change> = self
@@ -5246,8 +5295,23 @@ impl TableInfo {
             }
             return out;
         }
+        // **Not a plain table, and none is written in its place** — the
+        // sequence arm's rule in `create_ddl`: name the object, say what could
+        // not be restated, and leave the reader able to fix it.
+        if let Some(what) = self.tsql_kind.unrestatable() {
+            return format!(
+                "-- {cname} is {what}. Its period columns, history link and versioning, or its\n\
+                 -- memory-optimised storage, are not in what Schemaic reads, so this script\n\
+                 -- cannot restate it. Script it from the source server."
+            );
+        }
         let mut lines: Vec<String> = Vec::new();
         let mut notes: Vec<String> = Vec::new();
+        if self.tsql_kind.edge_constraints {
+            notes.push(format!(
+                "-- {cname}: its edge constraints (CONNECTION) are not read, and are left out."
+            ));
+        }
         for c in &self.columns {
             let mut line = format!("  {} ", q(&c.name));
             if let Some(expr) = c.generated.as_deref() {
@@ -5342,8 +5406,17 @@ impl TableInfo {
             out.push_str(n);
             out.push('\n');
         }
+        // A graph table says so; its internal columns and their index are the
+        // server's to add, and the reader leaves them out of the model.
+        let graph = if self.tsql_kind.node {
+            " AS NODE"
+        } else if self.tsql_kind.edge {
+            " AS EDGE"
+        } else {
+            ""
+        };
         out.push_str(&format!(
-            "CREATE TABLE {qname} (\n{}\n);",
+            "CREATE TABLE {qname} (\n{}\n){graph};",
             lines.join(",\n")
         ));
         for ix in self
@@ -8902,6 +8975,77 @@ mod tests {
         assert!(!create.contains("NOCHECK"), "{create}");
         assert_eq!(held.len(), 3, "{held:?}");
         assert_eq!(format!("{create}\n{}", held.join("\n")), ddl);
+    }
+
+    /// **A SQL Server table that is more than its columns is restated as what
+    /// it is, or not at all.** A graph node or edge goes back `AS NODE`/`AS
+    /// EDGE` (its internal columns being the server's to add); a temporal or
+    /// memory-optimised table cannot be restated from the model, and the
+    /// script says so rather than writing a plain table in its place.
+    #[test]
+    fn a_sql_server_graph_temporal_or_memory_optimised_table_is_not_scripted_as_a_plain_one() {
+        let base = |name: &str, kind: TsqlTableKind| TableInfo {
+            schema: Some("dbo".into()),
+            name: name.into(),
+            columns: vec![col("id", "int", false, false)],
+            tsql_kind: kind,
+            ..Default::default()
+        };
+        let d = crate::intel::SqlDialect::MsSql;
+        let node = base(
+            "n",
+            TsqlTableKind {
+                node: true,
+                ..Default::default()
+            },
+        )
+        .create_ddl(d);
+        assert!(
+            node.contains("CREATE TABLE [dbo].[n] (\n  [id] int NOT NULL\n) AS NODE;"),
+            "{node}"
+        );
+        let edge = base(
+            "e",
+            TsqlTableKind {
+                edge: true,
+                edge_constraints: true,
+                ..Default::default()
+            },
+        )
+        .create_ddl(d);
+        assert!(edge.contains("\n) AS EDGE;"), "{edge}");
+        assert!(
+            edge.contains("-- [dbo].[e]: its edge constraints"),
+            "{edge}"
+        );
+        for (kind, what) in [
+            (
+                TsqlTableKind {
+                    temporal_type: 2,
+                    ..Default::default()
+                },
+                "a system-versioned temporal table",
+            ),
+            (
+                TsqlTableKind {
+                    temporal_type: 1,
+                    ..Default::default()
+                },
+                "the history table of a system-versioned table",
+            ),
+            (
+                TsqlTableKind {
+                    memory_optimized: true,
+                    ..Default::default()
+                },
+                "a memory-optimised table",
+            ),
+        ] {
+            let ddl = base("t", kind).create_ddl(d);
+            assert!(!ddl.contains("CREATE TABLE"), "{ddl}");
+            assert!(ddl.lines().all(|l| l.starts_with("--")), "{ddl}");
+            assert!(ddl.contains(what), "{ddl}");
+        }
     }
 
     /// **A view's header is rebuilt under the name the catalogue gives it**,

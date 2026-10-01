@@ -1357,6 +1357,29 @@ pub fn plan(
         })
         .cloned()
         .collect();
+    // **A table no `CREATE` from the model restates is left out of the file
+    // and named in it** — a system-versioned or memory-optimised SQL Server
+    // table, whose structure step would be a comment (`create_ddl`). Kept, its
+    // `DROP` destroyed what the file could not put back and its rows landed in
+    // nothing. Out of `order`, a key onto it is one more key to a table outside
+    // the export, and is accounted for as one.
+    let mut unrestated: Vec<String> = Vec::new();
+    let order: Vec<usize> = order
+        .into_iter()
+        .filter(|&i| {
+            let t = &schema.tables[i];
+            match t.tsql_kind.unrestatable() {
+                Some(what) if !t.is_view => {
+                    unrestated.push(format!(
+                        "{} ({what})",
+                        display_name(t.schema.as_deref(), &t.name)
+                    ));
+                    false
+                }
+                _ => true,
+            }
+        })
+        .collect();
     if order.is_empty() {
         return DumpPlan {
             missing,
@@ -1564,6 +1587,38 @@ pub fn plan(
             crate::text::plural(missing.len(), "table", "tables"),
             crate::text::plural(missing.len(), "was", "were"),
             crate::export::comment_text(&missing.join(", ")),
+        ));
+    }
+    // The tables `order` left out because nothing here can restate them.
+    if !unrestated.is_empty() {
+        header.push_str(&format!(
+            "\n--\n-- {} {} ticked for export {} not in this file: Schemaic cannot restate {}\n\
+             -- from what it reads. Script {} from the source server: {}.",
+            unrestated.len(),
+            crate::text::plural(unrestated.len(), "table", "tables"),
+            crate::text::plural(unrestated.len(), "is", "are"),
+            crate::text::plural(unrestated.len(), "it", "them"),
+            crate::text::plural(unrestated.len(), "it", "them"),
+            crate::export::comment_text(&unrestated.join(", ")),
+        ));
+    }
+    // A graph edge's rows name the nodes they join by node id, and a restore
+    // assigns every node a fresh one: carried, they would join the wrong nodes
+    // or none. The edge itself is restated, empty.
+    let edges: Vec<String> = order
+        .iter()
+        .map(|&i| &schema.tables[i])
+        .filter(|t| t.tsql_kind.edge)
+        .map(|t| display_name(t.schema.as_deref(), &t.name))
+        .collect();
+    if opts.data && !edges.is_empty() {
+        header.push_str(&format!(
+            "\n--\n-- The rows of {} graph edge {} are not in this file: an edge names the nodes it\n\
+             -- joins by node id, and a restore gives every node a new one. {} created empty: {}.",
+            edges.len(),
+            crate::text::plural(edges.len(), "table", "tables"),
+            crate::text::plural(edges.len(), "It is", "They are"),
+            crate::export::comment_text(&edges.join(", ")),
         ));
     }
     // Said in the file, because the file is where it will be noticed: a restore
@@ -1936,7 +1991,8 @@ pub fn plan(
         // and the file grew an `INSERT INTO sq1` under a structure step that
         // creates no `sq1` — the restore then stops there, and every later
         // table's structure and rows are never applied.
-        if opts.data && t.shape() == TableShape::Table && !cols.is_empty() {
+        // And not a graph edge's, which the header explains.
+        if opts.data && t.shape() == TableShape::Table && !cols.is_empty() && !t.tsql_kind.edge {
             // An identity the rows carry needs its switch thrown around them.
             let identity = t
                 .columns
@@ -4168,6 +4224,73 @@ mod tests {
         assert!(sql.contains("(5, NULL, NULL)"), "{sql}");
         assert!(!sql.contains("DROP TABLE"), "{sql}");
         assert_eq!(tally.withheld, vec!["b".to_string(), "v".to_string()]);
+    }
+
+    /// **A table the file cannot restate is left out of it and named, not
+    /// written as a plain table.** A system-versioned or memory-optimised
+    /// table's `CREATE` is a comment, so its `DROP` would destroy what the file
+    /// cannot put back and its rows would land in nothing; a graph edge is
+    /// restated, but its rows point at node ids the restore assigns afresh, so
+    /// they are not carried. Each is said in the header.
+    #[test]
+    fn a_table_the_file_cannot_restate_is_named_and_left_out() {
+        let mk = |name: &str, kind: crate::schema::TsqlTableKind| TableInfo {
+            schema: Some("dbo".to_string()),
+            tsql_kind: kind,
+            ..table(name)
+        };
+        let s = schema_of(vec![
+            mk(
+                "hist",
+                crate::schema::TsqlTableKind {
+                    temporal_type: 2,
+                    ..Default::default()
+                },
+            ),
+            mk(
+                "node",
+                crate::schema::TsqlTableKind {
+                    node: true,
+                    ..Default::default()
+                },
+            ),
+            mk(
+                "edge",
+                crate::schema::TsqlTableKind {
+                    edge: true,
+                    ..Default::default()
+                },
+            ),
+            refs(mk("child", Default::default()), "hist"),
+        ]);
+        let p = plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::MsSql,
+        );
+        let file = file_of(&p);
+        assert!(!file.contains("[dbo].[hist]"), "{file}");
+        assert!(!file.contains("<<rows hist:"), "{file}");
+        let header = text_of(&p);
+        assert!(
+            header.contains("1 table ticked for export is not in this file")
+                && header.contains("dbo.hist (a system-versioned temporal table)"),
+            "{header}"
+        );
+        assert!(
+            header.contains("The rows of 1 graph edge table are not in this file"),
+            "{header}"
+        );
+        // The key onto it is one the file cannot restate either.
+        assert!(header.contains("1 foreign key is not restated"), "{header}");
+        assert!(file.contains("CREATE TABLE [dbo].[node] (\n  [id] int NOT NULL\n) AS NODE;"));
+        assert!(file.contains("<<rows node:"), "{file}");
+        assert!(file.contains(") AS EDGE;"), "{file}");
+        assert!(!file.contains("<<rows edge:"), "{file}");
+        assert!(header.contains("dbo.edge"), "{header}");
+        assert_eq!(p.tables, 3);
     }
 
     /// **A SQL Server dump says how its dates are written, before any of them.**

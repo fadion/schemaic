@@ -781,6 +781,23 @@ async fn a_dump_restores_into_an_empty_database() {
          INSERT dbo.blobs (id, h, e, v) VALUES (15, '/15/', 0x0E, NULL);",
     )
     .await;
+    // A graph node and edge, read as plain tables with their internal columns
+    // (the copy refused the node's rows, Msg 515), and a system-versioned
+    // table, which no CREATE from the model can restate.
+    src.exec(
+        "CREATE TABLE dbo.person (id int PRIMARY KEY, name nvarchar(20)) AS NODE; \
+         INSERT dbo.person (id, name) VALUES (1, N'a'), (2, N'b'); \
+         CREATE TABLE dbo.knows (since int) AS EDGE; \
+         INSERT dbo.knows ($from_id, $to_id, since) \
+           SELECT p1.$node_id, p2.$node_id, 2020 FROM dbo.person p1, dbo.person p2 \
+           WHERE p1.id = 1 AND p2.id = 2; \
+         CREATE TABLE dbo.versioned (id int PRIMARY KEY, v int, \
+           vf datetime2 GENERATED ALWAYS AS ROW START HIDDEN NOT NULL, \
+           vt datetime2 GENERATED ALWAYS AS ROW END HIDDEN NOT NULL, \
+           PERIOD FOR SYSTEM_TIME (vf, vt)) \
+           WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = dbo.versioned_history));",
+    )
+    .await;
     // More rows than one `INSERT` carries, so the table's rows are several
     // statements — each closing its own `GO` batch.
     src.exec(
@@ -811,6 +828,28 @@ async fn a_dump_restores_into_an_empty_database() {
             .all(|batch| batch.matches("INSERT INTO").count() <= 1),
         "{file}"
     );
+    // The graph tables as what they are, their internal columns the server's;
+    // the temporal pair named and left out.
+    assert!(
+        file.contains(
+            "CREATE TABLE [dbo].[person] (\n  [id] int NOT NULL,\n  [name] nvarchar(20) NULL,"
+        ),
+        "{file}"
+    );
+    assert!(
+        file.contains(") AS NODE;") && file.contains(") AS EDGE;"),
+        "{file}"
+    );
+    assert!(
+        !file.contains("graph_id") && !file.contains("$node_id"),
+        "{file}"
+    );
+    assert!(
+        file.contains("dbo.versioned (a system-versioned temporal table)")
+            && file.contains("dbo.versioned_history (the history table"),
+        "{file}"
+    );
+    assert!(!file.contains("CREATE TABLE [dbo].[versioned"), "{file}");
 
     let dst = Scratch::create("dumpdst").await;
     // Restored by a session whose language reads a date day-first, as a
@@ -878,6 +917,13 @@ async fn a_dump_restores_into_an_empty_database() {
       ) x";
     let (want, got) = (src.scalar(facts).await, dst.scalar(facts).await);
     assert_eq!(got, want);
+    // The node is a node again with its rows; the edge is an edge, created
+    // empty; the temporal table is not there to be mistaken for a copy.
+    let graph = "SELECT CONCAT((SELECT COUNT(*) FROM sys.tables WHERE name = 'person' AND is_node = 1), \
+                 '|', (SELECT STRING_AGG(CONCAT(id, name), ',') WITHIN GROUP (ORDER BY id) FROM dbo.person), \
+                 '|', (SELECT COUNT(*) FROM sys.tables WHERE name = 'knows' AND is_edge = 1), \
+                 '|', (SELECT COUNT(*) FROM dbo.knows), '|', OBJECT_ID('dbo.versioned'))";
+    assert_eq!(dst.scalar(graph).await, "1|1a,2b|1|0|");
     for fact in [
         "customers|3|Zoë 'q'|",
         // The audit holds what the source's did: the trigger fired on none of
