@@ -3485,6 +3485,77 @@ async fn an_indexed_views_edit_refuses_what_its_indexes_cannot_carry() {
     );
 }
 
+/// **A comparison does not count a signature as a difference, and says when
+/// its plan strips one.** A certificate is one database's, so the signed
+/// procedure and trigger on the target and their unsigned twins on the
+/// source were reported Differing, planned as alters that strip the target's
+/// signature and cannot sign, and reported again after Apply. Here they
+/// compare the same; once a body differs, the plan says it strips both
+/// signatures, and applying it does.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_comparison_leaves_a_signature_out_of_the_difference() {
+    use schemaic_core::compare::SchemaComparison;
+    if !enabled() || azure_cannot("signs with a certificate the shared database may not allow") {
+        return;
+    }
+    let target = Scratch::create("cmp_signed_target").await;
+    let source = Scratch::create("cmp_signed_source").await;
+    for s in [&target, &source] {
+        s.exec("CREATE TABLE dbo.t (id int NOT NULL PRIMARY KEY)")
+            .await;
+        s.exec("CREATE PROCEDURE dbo.p AS SELECT 1 AS s").await;
+        s.exec("CREATE TRIGGER dbo.tr ON dbo.t AFTER INSERT AS SET NOCOUNT ON")
+            .await;
+    }
+    target
+        .exec(
+            "CREATE CERTIFICATE zz_cmp_cert ENCRYPTION BY PASSWORD = 'Pa55word!!zz' \
+             WITH SUBJECT = 'schemaic test'",
+        )
+        .await;
+    for name in ["p", "tr"] {
+        target
+            .exec(&format!(
+                "ADD SIGNATURE TO dbo.{name} BY CERTIFICATE zz_cmp_cert WITH PASSWORD = 'Pa55word!!zz'"
+            ))
+            .await;
+    }
+    let read = |s: &Scratch| {
+        let db = s.db.clone();
+        let name = s.name.clone();
+        async move {
+            db.fetch_schema(&name, CancellationToken::new())
+                .await
+                .unwrap()
+        }
+    };
+    let c = SchemaComparison::of(&read(&target).await, &read(&source).await, MS);
+    let differing: Vec<String> = c.differences().map(|e| e.key()).collect();
+    assert!(differing.is_empty(), "{differing:?}");
+
+    source
+        .exec("CREATE OR ALTER PROCEDURE dbo.p AS SELECT 2 AS s")
+        .await;
+    source
+        .exec("CREATE OR ALTER TRIGGER dbo.tr ON dbo.t AFTER INSERT AS SET NOCOUNT OFF")
+        .await;
+    let (plan, again) = sync_modules(&target, &source).await;
+    let risks = plan.destructive().join(" ");
+    assert!(
+        risks.contains("Procedure p is signed") && risks.contains("Trigger tr is signed"),
+        "{risks}"
+    );
+    assert_eq!(
+        target
+            .scalar("SELECT COUNT(*) FROM sys.crypt_properties WHERE class = 1")
+            .await,
+        "0",
+        "the plan strips both, as it says"
+    );
+    let left: Vec<String> = again.differences().map(|e| e.key()).collect();
+    assert!(left.is_empty(), "{left:?}");
+}
+
 /// **A comparison's view alter names the target's indexes it drops.** The
 /// risk read the source's view's indexes, so a target's `cix` — which
 /// `ALTER VIEW` drops — went with an empty risk list. Synced, the plan names

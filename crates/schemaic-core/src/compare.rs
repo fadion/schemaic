@@ -5807,4 +5807,88 @@ mod tsql_module_tests {
         let risks = plan.destructive().join(" ");
         assert!(risks.contains("cix"), "{risks}");
     }
+
+    fn ms_procedure(body: &str, signed: bool) -> RoutineInfo {
+        RoutineInfo {
+            name: "p".into(),
+            schema: Some("dbo".into()),
+            kind: RoutineKind::Procedure,
+            body: body.into(),
+            tsql: crate::schema::TsqlRoutine {
+                module: TsqlModule {
+                    signed,
+                    ..TsqlModule::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn ms_trigger(body: &str, signed: bool) -> TriggerInfo {
+        let mut t = TriggerInfo {
+            name: "tr".into(),
+            table: "t".into(),
+            schema: Some("dbo".into()),
+            events: vec![crate::schema::TriggerEvent::Insert],
+            timing: crate::schema::TriggerTiming::After,
+            action: crate::schema::TriggerAction::Body(body.into()),
+            ..Default::default()
+        };
+        t.tsql.module.signed = signed;
+        t
+    }
+
+    fn signed_sides(target_signed: bool, target_body: &str) -> (DbSchema, DbSchema) {
+        let side = |signed: bool, body: &str| DbSchema {
+            tables: vec![TableInfo {
+                name: "t".into(),
+                schema: Some("dbo".into()),
+                triggers: vec![ms_trigger(body, signed)],
+                ..Default::default()
+            }],
+            routines: vec![std::sync::Arc::new(ms_procedure(body, signed))],
+            ..Default::default()
+        };
+        (
+            side(target_signed, target_body),
+            side(!target_signed, "SELECT 1"),
+        )
+    }
+
+    /// **A signature is not part of a module's definition** (S6.2-L1-01): a
+    /// certificate belongs to one database, so a signed procedure and
+    /// trigger matching the other side's text were reported Differing, and
+    /// the plan — a `CREATE OR ALTER` that strips the target's signature and
+    /// cannot sign — never resolved them.
+    #[test]
+    fn a_signature_alone_is_not_a_difference() {
+        for target_signed in [true, false] {
+            let (target, source) = signed_sides(target_signed, "SELECT 1");
+            let c = SchemaComparison::of(&target, &source, MS);
+            let left: Vec<String> = c.differences().map(|e| e.key()).collect();
+            assert!(left.is_empty(), "target signed {target_signed}: {left:?}");
+        }
+    }
+
+    /// **An alter that strips the target's signature says so, for a trigger
+    /// as for a procedure** — the trigger's sentence read the source's flag,
+    /// so a signed target trigger lost its signature with nothing said, and
+    /// an unsigned one was warned about a signature it did not have.
+    #[test]
+    fn an_alter_names_the_targets_signature_it_strips() {
+        let (target, source) = signed_sides(true, "SELECT 2");
+        let risks = SchemaComparison::of(&target, &source, MS)
+            .plan(|_| true)
+            .destructive()
+            .join(" ");
+        assert!(risks.contains("Trigger tr is signed"), "{risks}");
+        assert!(risks.contains("Procedure p is signed"), "{risks}");
+        let (target, source) = signed_sides(false, "SELECT 2");
+        let risks = SchemaComparison::of(&target, &source, MS)
+            .plan(|_| true)
+            .destructive()
+            .join(" ");
+        assert!(!risks.contains("signed"), "{risks}");
+    }
 }

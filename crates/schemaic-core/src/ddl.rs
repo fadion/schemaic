@@ -2628,6 +2628,12 @@ pub enum Change {
         /// change list's line have to answer the same question, and the
         /// line, which has no dialect, said "Re-create" over an alter.
         in_place: bool,
+        /// **The server's trigger is signed**
+        /// ([`crate::schema::TsqlModule::signed`]) — what any alter or drop
+        /// of it strips. The server's, not the draft's: in a comparison the
+        /// draft is the other side's trigger, and the risk read its flag, so
+        /// a signed target lost its signature with nothing said.
+        server_signed: bool,
     },
     DropTrigger {
         name: String,
@@ -3293,6 +3299,7 @@ impl Change {
             Change::ReplaceTrigger {
                 draft,
                 in_place: true,
+                ..
             } => format!("Redefine trigger {}", draft.info.name),
             Change::ReplaceTrigger { draft, .. } => {
                 let server = draft.original.as_deref().unwrap_or(&draft.info.name);
@@ -3702,7 +3709,11 @@ impl Change {
             // **The sentence asks the plan's question** — `trigger_alters_in_place`
             // — because it described a drop over SQL Server's in-place alter,
             // which keeps the trigger's permissions and object id.
-            Change::ReplaceTrigger { draft, in_place } => {
+            Change::ReplaceTrigger {
+                draft,
+                in_place,
+                server_signed,
+            } => {
                 let mut out = vec![if *in_place {
                     format!(
                         "Redefines trigger {} in place — it is not dropped, so its \
@@ -3718,8 +3729,12 @@ impl Change {
                         draft.original.as_deref().unwrap_or(&draft.info.name)
                     )
                 }];
-                if draft.info.tsql.module.signed {
-                    out.push(signature_lost("trigger", &draft.info.name));
+                // The server's trigger, the one the alter or the drop strips.
+                if *server_signed {
+                    out.push(signature_lost(
+                        "trigger",
+                        draft.original.as_deref().unwrap_or(&draft.info.name),
+                    ));
                 }
                 out
             }
@@ -5947,6 +5962,7 @@ impl ChangeSet {
                 Change::ReplaceTrigger {
                     draft,
                     in_place: true,
+                    ..
                 } => push_create(&draft.info, true, &mut made),
                 Change::ReplaceTrigger { draft, .. } => {
                     // The drop addresses the name the server knows; the create
@@ -10088,6 +10104,7 @@ pub fn supports_trigger_editing(dialect: SqlDialect) -> bool {
             &Change::ReplaceTrigger {
                 draft: Box::default(),
                 in_place: false,
+                server_signed: false,
             },
         )
         && supports_change(
@@ -14483,6 +14500,7 @@ pub fn diff_trigger(current: &TriggerInfo, draft: &TriggerDraft, dialect: SqlDia
         vec![Change::ReplaceTrigger {
             draft: Box::new(draft.clone()),
             in_place: trigger_alters_in_place(draft, dialect),
+            server_signed: current.tsql.module.signed,
         }]
     };
     ChangeSet {
@@ -14529,9 +14547,10 @@ pub fn diff_triggers(
         {
             // Unchanged: no statement. This is what the gate rests on.
             Some(cur) if d.info == *cur => {}
-            Some(_) => changes.push(Change::ReplaceTrigger {
+            Some(cur) => changes.push(Change::ReplaceTrigger {
                 draft: Box::new(d.clone()),
                 in_place: trigger_alters_in_place(d, dialect),
+                server_signed: cur.tsql.module.signed,
             }),
             // Either genuinely new, or naming a server trigger that has since
             // gone. Emitting a create either way lets the server be the one to

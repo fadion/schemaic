@@ -1745,7 +1745,9 @@ pub struct TsqlView {
 /// One struct for the three because the losses are the module's, not the
 /// object kind's: `sys.sql_modules` keeps the same text and settings for
 /// each.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+///
+/// **Equal without [`Self::signed`]** — see its `PartialEq`.
+#[derive(Clone, Debug, Default, Eq)]
 pub struct TsqlModule {
     /// **The comments of the stored statement's header**: the text before
     /// `CREATE` verbatim — SSMS's template Author/Description block is the
@@ -1789,6 +1791,29 @@ pub struct TsqlModule {
     /// ([`crate::ddl::ChangeSet::destructive`]). Never set for a view, which
     /// cannot be signed.
     pub signed: bool,
+}
+
+/// **A signature is state, not definition**, and no plan can restate it: a
+/// certificate belongs to one database, and signing needs its private key.
+/// Compared, a signed procedure or trigger whose text matched the other
+/// side's was a difference the comparison planned as a `CREATE OR ALTER` —
+/// which strips the target's signature and cannot sign — and reported again
+/// after every Apply. Every differ compares through this, so `signed` is
+/// read where it matters instead: the risk of a plan that alters a signed
+/// module on the server.
+impl PartialEq for TsqlModule {
+    fn eq(&self, other: &Self) -> bool {
+        // Destructured, so a field added later has to be placed here.
+        let TsqlModule {
+            header_comments,
+            ansi_nulls_off,
+            quoted_identifier_off,
+            signed: _,
+        } = self;
+        *header_comments == other.header_comments
+            && *ansi_nulls_off == other.ansi_nulls_off
+            && *quoted_identifier_off == other.quoted_identifier_off
+    }
 }
 
 impl TsqlModule {

@@ -8310,7 +8310,15 @@ existing prose was left alone.
     `ReplaceTrigger` arms, in place or recreated
     (`editing_a_signed_routine_says_it_strips_the_signature` and its trigger sibling; live,
     `a_signed_modules_edit_says_it_strips_the_signature` on 2022 and 2025, which also finds the
-    signature gone after the edit it warned of). A view cannot be signed.
+    signature gone after the edit it warned of). A view cannot be signed. **It is not part of the
+    module's equality** (`TsqlModule`'s hand-written `PartialEq`, destructured so a new field must
+    be placed): a certificate is one database's, so the comparison reported a signed module whose
+    text matched the other side's as Differing and planned an alter that strips the target's
+    signature and cannot sign — a difference no Apply resolved. The risk reads the **server's**
+    flag: `ReplaceRoutine::server`'s, and `ReplaceTrigger::server_signed`, since the trigger arm read
+    the draft's, which in a comparison is the source's
+    (`a_signature_alone_is_not_a_difference`, `an_alter_names_the_targets_signature_it_strips`,
+    under `compare.rs`; live, `a_comparison_leaves_a_signature_out_of_the_difference`).
     `TableInfo::create_ddl` — `CREATE TABLE`/`VIEW`, built on the
     above; its **view** branch delegates to `ddl::view_ddl` so Copy DDL, the MCP table-info tool
     and the apply path all emit through one view emitter (it used to have its own, which restated
