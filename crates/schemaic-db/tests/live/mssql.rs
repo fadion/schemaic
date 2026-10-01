@@ -6027,6 +6027,104 @@ async fn every_class_of_permission_a_principal_holds_is_listed() {
     assert_eq!(server.note, None, "{:#?}", server.statements);
 }
 
+/// **A table-level grant keeps the account's column denials.** The server's
+/// own `GRANT SELECT ON OBJECT::dbo.t` deletes a `DENY SELECT` on one of the
+/// table's columns — pinned here first, as the reason for the rest — so the
+/// grant form's plan reads the denials and issues them again after its grant:
+/// the column stays denied and the grant lands. Over a grant option the
+/// server refuses the bare re-denial (Msg 4611) and the plan applies nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_table_grant_keeps_the_accounts_column_denials() {
+    use schemaic_core::ddl::{Change, account};
+    use schemaic_core::users::{GrantLevel, PrincipalKind, PrivilegeChange};
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("col_deny").await;
+    s.exec(
+        "CREATE TABLE dbo.t (id int, ssn int, v int); INSERT dbo.t VALUES (1, 2, 3); \
+         CREATE USER grantee WITHOUT LOGIN; CREATE USER plain WITHOUT LOGIN; \
+         GRANT SELECT ON OBJECT::dbo.t TO grantee; GRANT SELECT ON OBJECT::dbo.t TO plain; \
+         DENY SELECT ON OBJECT::dbo.t (ssn) TO grantee; DENY SELECT ON OBJECT::dbo.t (ssn) TO plain; \
+         DENY UPDATE ON OBJECT::dbo.t (v) TO grantee;",
+    )
+    .await;
+    let denied = |who: &str| {
+        format!(
+            "SELECT COUNT(*) FROM sys.database_permissions WHERE class = 1 AND state = 'D' \
+             AND minor_id <> 0 AND major_id = OBJECT_ID(N'dbo.t') \
+             AND grantee_principal_id = DATABASE_PRINCIPAL_ID(N'{who}')"
+        )
+    };
+    // The server's behaviour, which is the reason: a plain grant lifts it.
+    s.exec("GRANT SELECT ON OBJECT::dbo.t TO plain").await;
+    assert_eq!(s.scalar(&denied("plain")).await, "0", "the server kept it");
+
+    let list =
+        s.db.fetch_principals(Some(&s.name))
+            .await
+            .expect("the accounts")
+            .list;
+    let grantee = list
+        .iter()
+        .find(|p| p.name == "grantee" && p.kind == PrincipalKind::User)
+        .expect("the user")
+        .clone();
+    let grant = |with_grant_option: bool| PrivilegeChange {
+        account: grantee.clone(),
+        level: GrantLevel::Table {
+            qualifier: "dbo".into(),
+            name: "t".into(),
+        },
+        privileges: vec!["SELECT".into(), "INSERT".into(), "UPDATE".into()],
+        with_grant_option,
+    };
+    let plan =
+        |c: PrivilegeChange| account("grantee", MS, Change::GrantPrivileges(Box::new(c))).emit();
+    s.db.run_ddl(&s.name, &plan(grant(false)), CancellationToken::new())
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    let grants =
+        s.db.fetch_grants(Some(&s.name), &grantee)
+            .await
+            .expect("the grants");
+    for want in [
+        "GRANT INSERT ON OBJECT::[dbo].[t] TO [grantee];",
+        "GRANT UPDATE ON OBJECT::[dbo].[t] TO [grantee];",
+        "DENY SELECT ON OBJECT::[dbo].[t] ([ssn]) TO [grantee];",
+        "DENY UPDATE ON OBJECT::[dbo].[t] ([v]) TO [grantee];",
+    ] {
+        assert!(
+            grants.statements.iter().any(|x| x == want),
+            "{want}\n{:#?}",
+            grants.statements
+        );
+    }
+    let read = s
+        .try_exec("EXECUTE AS USER = 'grantee'; SELECT ssn FROM dbo.t; REVERT;")
+        .await;
+    assert!(read.is_err(), "the denied column is readable: {read:?}");
+
+    // Grantable: the re-denial needs CASCADE, so nothing is applied.
+    let refused =
+        s.db.run_ddl(&s.name, &plan(grant(true)), CancellationToken::new())
+            .await;
+    assert!(refused.is_err(), "a grantable grant over a denial applied");
+    assert_eq!(s.scalar(&denied("grantee")).await, "2", "a denial was lost");
+    let grants =
+        s.db.fetch_grants(Some(&s.name), &grantee)
+            .await
+            .expect("the grants");
+    assert!(
+        !grants
+            .statements
+            .iter()
+            .any(|x| x.contains("WITH GRANT OPTION")),
+        "{:#?}",
+        grants.statements
+    );
+}
+
 /// **A contained user, end to end.** In a database made contained, the
 /// listing says so; a user created with a password of its own is listed with
 /// no login and as holding its password, signs in to that database with it,

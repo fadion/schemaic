@@ -1552,7 +1552,12 @@ pub fn privilege_sql(c: &PrivilegeChange, dialect: SqlDialect, revoke: bool) -> 
         if c.with_grant_option {
             sql.push_str(" WITH GRANT OPTION");
         }
-        sql
+        let kept = column_permissions_kept(c, dialect);
+        if kept.is_empty() {
+            sql
+        } else {
+            tsql_keeping_column_denies(&sql, c, &kept)
+        }
     };
     Some(match (dialect, &c.level) {
         (SqlDialect::MsSql, GrantLevel::Global) => tsql_in_master(&sql),
@@ -1588,6 +1593,83 @@ pub fn supports_deny(dialect: SqlDialect) -> bool {
         SqlDialect::MsSql => true,
         SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
     }
+}
+
+/// Does a **table-level** grant here delete the account's column-level `DENY`
+/// of the same permission?
+///
+/// SQL Server's does (measured on 2022 and 2025): with `DENY SELECT ON
+/// OBJECT::dbo.t (ssn)` in place, `GRANT SELECT ON OBJECT::dbo.t` leaves one
+/// row in `sys.database_permissions`, the table's grant, and `ssn` is readable
+/// — a denial the grant form never showed, gone without a word. A grant on the
+/// schema or the database leaves an object's `DENY` alone, so only the table
+/// level asks. [`privilege_sql`] keeps the denials ([`column_permissions_kept`]).
+pub fn table_grant_lifts_column_denies(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MsSql => true,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+    }
+}
+
+/// The permissions T-SQL grants or denies on a **column** — every other one is
+/// Msg 1020 with a column list (measured on 2022 and 2025 for `INSERT`,
+/// `DELETE`, `VIEW DEFINITION`, `ALTER` and `CONTROL`, the rest of the grant
+/// form's table list).
+const MSSQL_COLUMN_PERMISSIONS: &[&str] = &["SELECT", "UPDATE", "REFERENCES"];
+
+/// The permissions in a grant whose column-level `DENY`s the statement keeps
+/// ([`table_grant_lifts_column_denies`]) — upper-cased, in the grant's order —
+/// or none where nothing would be lifted: a revoke's business, a level above
+/// the table, an engine with no `DENY`, a list with no column permission.
+pub fn column_permissions_kept(c: &PrivilegeChange, dialect: SqlDialect) -> Vec<String> {
+    if !matches!(c.level, GrantLevel::Table { .. }) || !table_grant_lifts_column_denies(dialect) {
+        return Vec::new();
+    }
+    c.privileges
+        .iter()
+        .map(|p| p.trim().to_ascii_uppercase())
+        .filter(|p| MSSQL_COLUMN_PERMISSIONS.contains(&p.as_str()))
+        .collect()
+}
+
+/// `grant`, wrapped so the column `DENY`s it would delete survive it: they are
+/// read into a string of `DENY` statements before it, and that string runs
+/// after it — in one batch, inside the plan's transaction, so what is read is
+/// what is there when it applies and not what the form saw. **No `CASCADE`**:
+/// measured, `DENY … (ssn) TO u CASCADE` also deleted a table grant `u` had
+/// made to another user. Where the account holds the grant option on the table,
+/// the server refuses the bare re-denial (Msg 4611) and the plan rolls back —
+/// the denial kept, which is the way for this to fail. One statement with no
+/// `;` outside its literals, for the reason `ddl::tsql_drop_default` gives.
+fn tsql_keeping_column_denies(grant: &str, c: &PrivilegeChange, kept: &[String]) -> String {
+    let ms = SqlDialect::MsSql;
+    let lit = |s: &str| crate::schema::ddl_string(s, ms);
+    let q = |n: &str| crate::export::ident_sql(n, ms);
+    let object = match &c.level {
+        GrantLevel::Table { qualifier, name } => format!("{}.{}", q(qualifier), q(name)),
+        // `column_permissions_kept` keeps nothing at any other level.
+        _ => return grant.to_string(),
+    };
+    let account = &c.account;
+    let who = account_sql(account, ms);
+    format!(
+        "DECLARE @deny nvarchar(max) = N'' \
+         SELECT @deny += N'DENY ' + p.permission_name COLLATE DATABASE_DEFAULT \
+         + {on} + QUOTENAME(c.name) + {to} \
+         FROM sys.database_permissions AS p \
+         JOIN sys.columns AS c ON c.object_id = p.major_id AND c.column_id = p.minor_id \
+         WHERE p.class = 1 AND p.state = 'D' AND p.minor_id <> 0 \
+         AND p.major_id = OBJECT_ID({object_lit}) \
+         AND p.grantee_principal_id = DATABASE_PRINCIPAL_ID({name}) \
+         AND p.permission_name IN ({list}) \
+         {grant} \
+         EXEC sys.sp_executesql @deny",
+        on = lit(&format!(" ON OBJECT::{object} (")),
+        to = lit(&format!(") TO {who} ")),
+        object_lit = lit(&object),
+        name = lit(account.name.trim()),
+        list = kept.iter().map(|p| lit(p)).collect::<Vec<_>>().join(", "),
+    )
 }
 
 /// `sql` run in `master`, for that one statement: T-SQL grants a server
@@ -5361,6 +5443,94 @@ mod mssql_tests {
         );
     }
 
+    /// **A SQL Server table-level grant keeps the account's column DENYs.**
+    /// T-SQL deletes a column-level `DENY` of a permission when the same
+    /// permission is granted on the whole table (measured on 2022 and 2025):
+    /// `DENY SELECT ON dbo.t (ssn)` then `GRANT SELECT ON dbo.t` left `ssn`
+    /// readable. So the statement reads those denials first and issues them
+    /// again after the grant — one batch, with no `;` outside its literals, as
+    /// the preview's Copy splits at them. Only the column permissions are read
+    /// (`INSERT` has no column form), and nothing changes for a revoke, for a
+    /// level above the table, or on an engine with no `DENY`.
+    #[test]
+    fn a_sql_server_table_grant_denies_the_columns_it_would_lift_again() {
+        let c = PrivilegeChange {
+            account: user("o'brien", Some("app")),
+            level: GrantLevel::Table {
+                qualifier: "dbo".into(),
+                name: "t".into(),
+            },
+            privileges: vec!["SELECT".into(), "INSERT".into(), "UPDATE".into()],
+            with_grant_option: false,
+        };
+        assert_eq!(
+            privilege_sql(&c, MS, false).as_deref(),
+            Some(
+                "DECLARE @deny nvarchar(max) = N'' \
+                 SELECT @deny += N'DENY ' + p.permission_name COLLATE DATABASE_DEFAULT \
+                 + N' ON OBJECT::[dbo].[t] (' + QUOTENAME(c.name) + N') TO [o''brien] ' \
+                 FROM sys.database_permissions AS p \
+                 JOIN sys.columns AS c ON c.object_id = p.major_id AND c.column_id = p.minor_id \
+                 WHERE p.class = 1 AND p.state = 'D' AND p.minor_id <> 0 \
+                 AND p.major_id = OBJECT_ID(N'[dbo].[t]') \
+                 AND p.grantee_principal_id = DATABASE_PRINCIPAL_ID(N'o''brien') \
+                 AND p.permission_name IN (N'SELECT', N'UPDATE') \
+                 GRANT SELECT, INSERT, UPDATE ON OBJECT::[dbo].[t] TO [o'brien] \
+                 EXEC sys.sp_executesql @deny"
+            )
+        );
+        // The grant option rides on the grant, before the re-denial.
+        let grantable = PrivilegeChange {
+            with_grant_option: true,
+            ..c.clone()
+        };
+        assert!(
+            privilege_sql(&grantable, MS, false)
+                .unwrap()
+                .ends_with("TO [o'brien] WITH GRANT OPTION EXEC sys.sp_executesql @deny")
+        );
+        // No column permission in the list: nothing to keep, the plain grant.
+        let whole_rows = PrivilegeChange {
+            privileges: vec!["INSERT".into(), "DELETE".into()],
+            ..c.clone()
+        };
+        assert_eq!(
+            privilege_sql(&whole_rows, MS, false).as_deref(),
+            Some("GRANT INSERT, DELETE ON OBJECT::[dbo].[t] TO [o'brien]")
+        );
+        // A revoke is the plain revoke, and a schema grant the plain grant.
+        assert_eq!(
+            privilege_sql(&c, MS, true).as_deref(),
+            Some("REVOKE SELECT, INSERT, UPDATE ON OBJECT::[dbo].[t] FROM [o'brien] CASCADE")
+        );
+        let schema = PrivilegeChange {
+            level: GrantLevel::Schema("dbo".into()),
+            ..c.clone()
+        };
+        assert_eq!(
+            privilege_sql(&schema, MS, false).as_deref(),
+            Some("GRANT SELECT, INSERT, UPDATE ON SCHEMA::[dbo] TO [o'brien]")
+        );
+        assert_eq!(column_permissions_kept(&schema, MS), Vec::<String>::new());
+        assert_eq!(column_permissions_kept(&c, MS), ["SELECT", "UPDATE"]);
+        // MySQL has no DENY to keep.
+        let my = PrivilegeChange {
+            account: Principal {
+                host: Some("%".into()),
+                ..user("app", None)
+            },
+            ..c
+        };
+        assert_eq!(
+            column_permissions_kept(&my, SqlDialect::MySql),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            privilege_sql(&my, SqlDialect::MySql, false).as_deref(),
+            Some("GRANT SELECT, INSERT, UPDATE ON `dbo`.`t` TO 'app'@'%'")
+        );
+    }
+
     /// The two catalogues folded into one list: every login, then the
     /// database's users and roles, each user carrying the login it maps to;
     /// the server's own principals kept but marked system.
@@ -5526,7 +5696,9 @@ mod mssql_tests {
             .expect("the view");
         let grant = sql
             .iter()
-            .position(|s| s.starts_with("GRANT"))
+            // Not `starts_with`: a table grant on SQL Server opens by reading
+            // the column denials it keeps (`column_permissions_kept`).
+            .position(|s| s.contains("GRANT SELECT ON OBJECT::[dbo].[v]"))
             .expect("the grant");
         assert!(view < grant, "{sql:#?}");
     }

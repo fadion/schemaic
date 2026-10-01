@@ -4080,6 +4080,27 @@ impl Change {
                     ),
                 }]
             }
+            // **A table grant that would lift a column's `DENY`**, where the
+            // engine deletes one (`users::table_grant_lifts_column_denies`).
+            // The statement keeps them, which makes it the one grant whose SQL
+            // is not what the form described — so the sentence says what the
+            // extra lines are for, and the one case where the server refuses
+            // them: an account holding the grant option there (Msg 4611 without
+            // `CASCADE`, which would take a grant it had made with it).
+            Change::GrantPrivileges(c)
+                if !crate::users::column_permissions_kept(c, dialect).is_empty() =>
+            {
+                let kept =
+                    Self::privilege_words(&crate::users::column_permissions_kept(c, dialect));
+                let who = c.account.display();
+                vec![format!(
+                    "A table-level grant of {kept} deletes any DENY of it {who} has on one of \
+                     the table's columns, so the statement denies those columns to {who} again \
+                     straight after granting: a column {who} was denied stays denied. Where \
+                     {who} also holds the grant option on the table, the server refuses to \
+                     deny it again without CASCADE, and nothing is applied."
+                )]
+            }
             _ => Vec::new(),
         }
     }
@@ -4102,11 +4123,12 @@ impl Change {
     /// strong heading rather than losing it by omission.
     ///
     /// A **grant** joins it for the revoke's reason read backwards: it destroys
-    /// nothing and is undone by revoking it. Only the whole-server case reaches
-    /// this at all — the others carry no risk sentence for the heading to head —
-    /// and "This can't be undone" over a widened privilege would spend, on the
-    /// one plan that is genuinely a keystroke away from being taken back, the
-    /// heading `DROP USER` needs to keep.
+    /// nothing and is undone by revoking it. Only the whole-server case and a
+    /// SQL Server table grant that keeps its columns' denials reach this at all
+    /// — the others carry no risk sentence for the heading to head — and "This
+    /// can't be undone" over a widened privilege would spend, on the one plan
+    /// that is genuinely a keystroke away from being taken back, the heading
+    /// `DROP USER` needs to keep.
     fn risk_is_reversible(&self) -> bool {
         matches!(
             self,
@@ -31220,6 +31242,67 @@ mod database_tests {
         assert!(risks[0].contains("VIEW SERVER STATE"), "{risks:?}");
         assert!(risks[0].contains("whole server"), "{risks:?}");
         assert!(!risks[0].contains("every database"), "{risks:?}");
+    }
+
+    /// **A SQL Server table grant says why its statement denies columns
+    /// again.** The grant would delete a column-level `DENY` of the same
+    /// permission (measured on 2022 and 2025), so `users::privilege_sql` keeps
+    /// them — the one grant whose SQL is not what the form described, and it
+    /// previewed with an empty risk block while the plain grant it replaced
+    /// made a denied column readable. The sentence names the permissions it
+    /// keeps and the case the server refuses; the heading stays the grant's.
+    /// A grant with no column permission, and MySQL's table grant, say nothing.
+    #[test]
+    fn a_sql_server_table_grant_says_it_keeps_the_column_denials() {
+        let (_, user) = ms_login_and_user();
+        let grant = |privileges: &[&str]| {
+            Box::new(crate::users::PrivilegeChange {
+                account: user.clone(),
+                level: crate::users::GrantLevel::Table {
+                    qualifier: "dbo".into(),
+                    name: "t".into(),
+                },
+                privileges: privileges.iter().map(|p| p.to_string()).collect(),
+                with_grant_option: false,
+            })
+        };
+        let cs = account(
+            "app",
+            SqlDialect::MsSql,
+            Change::GrantPrivileges(grant(&["SELECT", "INSERT"])),
+        );
+        let risks = cs.destructive();
+        assert_eq!(risks.len(), 1, "{risks:?}");
+        assert!(risks[0].contains("DENY of it"), "{risks:?}");
+        assert!(risks[0].contains("stays denied"), "{risks:?}");
+        assert!(risks[0].contains("grant option"), "{risks:?}");
+        assert!(risks[0].contains("SELECT") && !risks[0].contains("INSERT"));
+        assert_eq!(cs.risk_heading(), "Before you apply");
+        assert!(
+            cs.emit()
+                .iter()
+                .any(|s| s.contains("EXEC sys.sp_executesql @deny")),
+            "{:?}",
+            cs.emit()
+        );
+        assert!(
+            account(
+                "app",
+                SqlDialect::MsSql,
+                Change::GrantPrivileges(grant(&["INSERT", "DELETE"]))
+            )
+            .destructive()
+            .is_empty()
+        );
+        let my = Box::new(crate::users::PrivilegeChange {
+            account: an_account(),
+            ..*grant(&["SELECT"])
+        });
+        assert!(
+            account("app@%", MySql, Change::GrantPrivileges(my))
+                .destructive()
+                .is_empty()
+        );
     }
 
     /// And the arm is **narrow** — a grant at a named level still carries none,

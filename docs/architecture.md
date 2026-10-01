@@ -3967,15 +3967,19 @@ existing prose was left alone.
     warns, since the grant is still server-wide
     (`a_sql_server_server_grant_names_the_server_not_its_databases`). The arm
     is narrow on purpose: a grant at a named database or table is scoped to a thing the user typed,
-    and warning every time would train the block to be ignored where it means something. So the risk
+    and warning every time would train the block to be ignored where it means something. **The one
+    named-level grant with a sentence is a SQL Server table grant that keeps its columns' denials**
+    (`users::column_permissions_kept`, below): its statement is not the one the form described, so
+    the sentence says what the extra lines do and when the server refuses them
+    (`a_sql_server_table_grant_says_it_keeps_the_column_denials`). So the risk
     block
     can no longer head itself "This can't be undone": `ChangeSet::risk_heading` reads **"Before you
     apply"** when every change in the set is `risk_is_reversible` — the two revokes, the create and
     now the grant,
     a deliberately narrow list so a fourth change inherits the strong heading rather than losing it
     by omission. The grant joins it for the revoke's reason read backwards: it destroys nothing and
-    is undone by revoking it, only the whole-server case has a risk sentence for the heading to head
-    at all, and "This can't be undone" over a widened privilege would spend, on the one plan that is
+    is undone by revoking it, only the whole-server case and that table grant have a risk sentence
+    for the heading to head at all, and "This can't be undone" over a widened privilege would spend, on the one plan that is
     genuinely a keystroke from being taken back, the heading `DROP USER` needs to keep.
     A revoke's own sentence says it destroys no data and is undone by granting it back,
     and it appeared under the strong heading two entries away from `DROP USER`, which is the one
@@ -6590,7 +6594,20 @@ existing prose was left alone.
     **A SQL Server revoke always carries `CASCADE`** (`users::revoke_cascades`): without it, taking back a permission granted
     `WITH GRANT OPTION` is Msg 4611 (measured), and the form cannot know how the grant it is revoking
     was made; on one granted without the option `CASCADE` is accepted and does what the plain revoke
-    would (`a_sql_server_revoke_cascades_so_a_grantable_permission_can_be_taken_back`). **And a SQL
+    would (`a_sql_server_revoke_cascades_so_a_grantable_permission_can_be_taken_back`). **A SQL
+    Server table-level grant keeps the account's column denials** (`users::table_grant_lifts_column_denies`):
+    T-SQL deletes a column's `DENY SELECT` when `SELECT` is granted on the whole table (measured on
+    2022 and 2025 — the denied column became readable, under an empty risk block), so for a grant
+    holding a column permission (`SELECT`, `UPDATE`, `REFERENCES`; `column_permissions_kept`) the
+    statement is one batch that reads those `DENY` rows into a string of statements, grants, and
+    runs the string — read inside the plan's transaction, so it is what is there at Apply rather
+    than what the form saw, and with no `;` outside its literals, as `tsql_drop_default` has.
+    **No `CASCADE` on the re-denial**: measured, `DENY … (ssn) TO u CASCADE` also deleted a table
+    grant `u` had made to someone else. So where the account holds the grant option on the table
+    the server refuses the bare re-denial (Msg 4611) and the plan rolls back — the denial kept, the
+    way for this to fail — and the risk sentence says so
+    (`a_table_grant_keeps_the_accounts_column_denials`, live). A grant on the schema or database
+    leaves an object's `DENY` alone (measured), so only the table level is wrapped. **And a SQL
     Server server-level statement is sent to `master`** — `EXEC master.sys.sp_executesql N'GRANT
     VIEW SERVER STATE TO [app]'`, the private `tsql_in_master` — because T-SQL grants a server
     permission only when the current database is `master` (Msg 4621 from any other, measured), and
