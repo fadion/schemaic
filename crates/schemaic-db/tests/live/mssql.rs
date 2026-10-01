@@ -1139,6 +1139,64 @@ async fn a_dump_restores_into_an_empty_database() {
     assert_eq!(dst.scalar("SELECT MAX(id) FROM dbo.customers").await, "4");
 }
 
+/// **A character `sql_variant` restores byte for byte, under its own
+/// collation, however long.** The scratch databases take the server's
+/// `SQL_Latin1_General_CP1_CI_AS`, so a Greek, Japanese or UTF-8 variant is
+/// one whose code page is not the restoring database's: the file converted
+/// it under the database's and restored `Oµ??a`. And one past 4,000
+/// characters was read through `nvarchar(4000)` and restored cut, with
+/// `Done`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dump_restores_character_variants_byte_for_byte() {
+    use schemaic_core::dump::DumpOptions;
+    if !enabled() || azure_cannot("restores into a second database, which it has not got") {
+        return;
+    }
+    let src = Scratch::create("varsrc").await;
+    src.exec(
+        "CREATE TABLE dbo.variants (id int PRIMARY KEY, v sql_variant); \
+         INSERT dbo.variants VALUES (1, CAST(N'Ωμέγα' COLLATE Greek_CI_AS AS varchar(10))); \
+         INSERT dbo.variants VALUES (2, CAST(N'価格 1200円' COLLATE Japanese_CI_AS AS varchar(20))); \
+         INSERT dbo.variants VALUES \
+           (3, CAST(REPLICATE(CAST('x' AS varchar(max)), 5000) AS varchar(6000))); \
+         INSERT dbo.variants VALUES (4, CAST(REPLICATE(CAST(N'Ωμ' AS nvarchar(max)), 2600) \
+           + N'END' COLLATE Greek_CS_AS AS varchar(8000))); \
+         INSERT dbo.variants VALUES (5, CAST(N'a' + NCHAR(1) + N'\"\\/' + NCHAR(13) + NCHAR(10) \
+           COLLATE Latin1_General_BIN2 AS char(8))); \
+         INSERT dbo.variants VALUES \
+           (6, CAST(N'Ωμέγα 😀' COLLATE Latin1_General_100_CI_AS_SC_UTF8 AS varchar(30))); \
+         INSERT dbo.variants VALUES (7, CAST(N'日本' COLLATE Japanese_CI_AS AS nchar(4))); \
+         INSERT dbo.variants VALUES (8, CAST(N'' COLLATE Greek_CI_AS AS varchar(5))); \
+         INSERT dbo.variants VALUES (9, CAST(N'it''s é' AS nvarchar(20)));",
+    )
+    .await;
+    let facts = "SELECT STRING_AGG(CAST(CONCAT(id, '|', \
+           CAST(SQL_VARIANT_PROPERTY(v, 'BaseType') AS sysname), '|', \
+           CAST(SQL_VARIANT_PROPERTY(v, 'MaxLength') AS int), '|', \
+           CAST(SQL_VARIANT_PROPERTY(v, 'Collation') AS sysname), '|', \
+           DATALENGTH(v), '|', CONVERT(varchar(max), CAST(v AS varbinary(8000)), 1)) \
+           AS nvarchar(max)), NCHAR(10)) WITHIN GROUP (ORDER BY id) FROM dbo.variants";
+    let want = src.scalar(facts).await;
+    // The source holds what it was meant to: the Greek bytes, not `?`s, and
+    // the long ones whole.
+    for fact in [
+        "1|varchar|10|Greek_CI_AS|5|0xD9ECDDE3E1",
+        "3|varchar|6000|SQL_Latin1_General_CP1_CI_AS|5000|0x7878",
+        "4|varchar|8000|Greek_CS_AS|5203|0xD9EC",
+    ] {
+        assert!(want.contains(fact), "{fact} in {want}");
+    }
+    let file = Box::pin(dump_file(&src, DumpOptions::default())).await;
+    let dst = Scratch::create("vardst").await;
+    let end = Box::pin(restore_file(&dst, &file)).await;
+    assert!(
+        matches!(end, schemaic_core::script::ExecEnd::Done),
+        "{end:?}\n{file}"
+    );
+    let got = dst.scalar(facts).await;
+    assert_eq!(got, want, "\n{file}");
+}
+
 /// **A replay stops before it drops anything where a graph table is there.**
 /// The file cannot put one back as it is — an edge's rows are not in it, and
 /// a node's would come back under new node ids — and it dropped them: replayed

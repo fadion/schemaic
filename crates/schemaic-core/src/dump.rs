@@ -422,6 +422,18 @@ pub fn render_rows<W: std::io::Write>(
 /// a variant's own text of one is style 0, `Jan  2 2026  3:04AM`, which drops
 /// the seconds (measured).
 ///
+/// **A character variant is read as the server's `FOR JSON` of it**, because
+/// `CAST(v AS nvarchar(max))` stops at 4,000 characters — the `max` is not
+/// honoured from a variant — while a `char`/`varchar` one holds up to 8,000,
+/// and a 5,000-character value restored cut to 4,000 with nothing said
+/// (measured on 2022 and 2025). `CAST(v AS varchar(8000))` would keep the
+/// length but converts to the *database's* code page, which a Greek variant
+/// in a Latin-1 database does not survive. `FOR JSON` converts under the
+/// variant's own collation, keeps the whole text and escapes every control
+/// character, where `FOR XML` refuses one (Msg 6841); it needs no
+/// compatibility level, unlike `OPENJSON`, so the document is unpacked by the
+/// renderer rather than the server.
+///
 /// Every other engine reads its columns as they are: a blob there stays
 /// withheld and noted, as the export's own rule has it.
 pub fn literal_select(
@@ -470,6 +482,8 @@ pub fn literal_select(
                      N'|', \
                      CASE WHEN {base} IN (N'binary', N'varbinary') \
                           THEN '0x' + CONVERT(varchar(max), CAST({col} AS varbinary(8000)), 2) \
+                          WHEN {base} IN (N'char', N'varchar', N'nchar', N'nvarchar') \
+                          THEN (SELECT {col} AS x FOR JSON PATH, WITHOUT_ARRAY_WRAPPER) \
                           WHEN {base} IN (N'float', N'real') \
                           THEN CONVERT(nvarchar(64), CAST({col} AS float), 3) \
                           WHEN {base} IN (N'datetime', N'smalldatetime') \
@@ -4638,6 +4652,13 @@ mod tests {
             select.contains("SQL_VARIANT_PROPERTY([v], 'BaseType')"),
             "{select}"
         );
+        // A character variant is read whole, by the server's `FOR JSON`:
+        // `CAST(v AS nvarchar(…))` stops at 4,000 characters however wide the
+        // target, and a `varchar` variant holds up to 8,000.
+        assert!(
+            select.contains("(SELECT [v] AS x FOR JSON PATH, WITHOUT_ARRAY_WRAPPER)"),
+            "{select}"
+        );
         assert!(
             select.contains("[id], ") && select.contains(", [s] FROM"),
             "{select}"
@@ -4702,7 +4723,7 @@ mod tests {
                 vec![
                     crate::model::Value::Int(3),
                     crate::model::Value::Null,
-                    text("nvarchar(5) COLLATE Latin1_General_CI_AS|it's"),
+                    text(r#"nvarchar(5) COLLATE Latin1_General_CI_AS|{"x":"it's"}"#),
                 ],
                 vec![
                     crate::model::Value::Int(4),
@@ -4740,7 +4761,7 @@ mod tests {
         );
         assert!(
             sql.contains(
-                "(3, NULL, CAST(CAST(N'it''s' AS nvarchar(5)) COLLATE Latin1_General_CI_AS \
+                "(3, NULL, CAST(CAST(N'it''s' COLLATE Latin1_General_CI_AS AS nvarchar(5)) \
                  AS sql_variant))"
             ),
             "{sql}"

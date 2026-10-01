@@ -3271,17 +3271,28 @@ existing prose was left alone.
     bytes, the hierarchy's root among them, as an empty string), and for a variant its base type
     with length, precision, scale and collation beside its value in an exact, language-proof text
     form (a variant's own text of a date is style 0, `Jan  2 2026  3:04AM`, which drops the
-    seconds) — and names it in `DumpStep::Rows::server` with its `export::ServerLiteral` form. The
-    renderer writes those cells from the server's text **only after checking it**: bytes must be
-    `0x` and hex digits, a variant's type must have a system type name's shape and its value goes
+    seconds) — and names it in `DumpStep::Rows::server` with its `export::ServerLiteral` form. **A
+    character variant's value is the server's `FOR JSON` of it** (`{"x":"…"}`): `CAST(v AS
+    nvarchar(max))` stops at 4,000 characters, the `max` not honoured from a variant, while a
+    `varchar` one holds 8,000, so a 5,000-character value restored cut with `Done`; `CAST(v AS
+    varchar(8000))` keeps the length but converts to the *database's* code page; `FOR XML` refuses a
+    control character (Msg 6841) and `OPENJSON` needs compatibility level 130 — so the renderer
+    unpacks the document itself. The renderer writes those cells from the server's text **only
+    after checking it**: bytes must be `0x` and hex digits, a variant's type must have a system type
+    name's shape, a character one's value must be that one-member document, and the text goes
     through `sql_literal`, written `CAST(CAST(… AS <type>) AS sql_variant)` (the outer cast because
-    a multi-row `VALUES` gives a column one type, and a `date` beside a `decimal` is Msg 206); a cell
-    that fails is `NULL` and its column is named as withheld. Every other engine keeps its blobs
-    withheld and noted
+    a multi-row `VALUES` gives a column one type, and a `date` beside a `decimal` is Msg 206) — **a
+    character one `CAST(CAST(N'…' COLLATE <c> AS <type>) AS sql_variant)`, the collation on the text
+    inside the cast**: after it, the cast has already converted under the restoring database's code
+    page and the `COLLATE` converts those bytes again, so a Greek variant restored into a Latin-1
+    database as `Oµ??a`. A cell that fails is `NULL` and its column is named as withheld. Every
+    other engine keeps its blobs withheld and noted
     (`a_sql_server_dump_reads_bytes_and_variants_as_literals`,
-    `server_rendered_literals_are_checked_and_quoted`; the live round trip's `blobs` table carries
-    each of those types and a variant of every base type, and compares bytes, SRID and every
-    variant property on the copy).
+    `server_rendered_literals_are_checked_and_quoted`,
+    `a_character_variant_converts_under_its_own_collation`; the live round trip's `blobs` table
+    carries each of those types and a variant of every base type, and compares bytes, SRID and
+    every variant property on the copy, and `a_dump_restores_character_variants_byte_for_byte`
+    compares the bytes of Greek, Japanese, UTF-8, control-character and 5,000-character variants).
     **On an engine whose scripts are cut into batches, every statement closes one.**
     `close_batches` runs over the finished plan wherever `SqlDialect::batch_separator` is true —
     SQL Server — and ends each `Text` step that is more than comments with a `GO` line, unless its

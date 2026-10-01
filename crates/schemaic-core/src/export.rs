@@ -2741,8 +2741,10 @@ pub enum ServerLiteral {
     Hex,
     /// `<base type>|<value as text>` — a `sql_variant`, written
     /// `CAST(CAST(<value> AS <base type>) AS sql_variant)` so the restored
-    /// variant keeps its base type; the base type may end ` COLLATE <name>`
-    /// for a character one.
+    /// variant keeps its base type. A character one's base type ends
+    /// ` COLLATE <name>`, its value is the `{"x":"…"}` document `FOR JSON`
+    /// made of it, and it is written
+    /// `CAST(CAST(<text> COLLATE <name> AS <base type>) AS sql_variant)`.
     Variant,
 }
 
@@ -2777,20 +2779,47 @@ fn server_literal(form: ServerLiteral, text: &str) -> Option<String> {
             {
                 return None;
             }
-            let lit = if matches!(name, "binary" | "varbinary") {
-                hex(value).then(|| value.to_string())?
-            } else {
-                sql_literal(&Value::Str(value.to_string()), SqlDialect::MsSql)
+            let lit = match name {
+                "binary" | "varbinary" => hex(value).then(|| value.to_string())?,
+                // The server's `FOR JSON` of the value — the one read that
+                // keeps a long one whole (`dump::literal_select`).
+                "char" | "varchar" | "nchar" | "nvarchar" => {
+                    let text = variant_json_text(value)?;
+                    sql_literal(&Value::Str(text), SqlDialect::MsSql)
+                }
+                _ => sql_literal(&Value::Str(value.to_string()), SqlDialect::MsSql),
             };
             // Wrapped in `sql_variant` itself as well: a multi-row `VALUES`
             // gives each column one type across its rows, and a `date` beside
             // a `decimal` is Msg 206 — as variants they are one type, and each
             // keeps its base.
+            //
+            // **The collation goes on the text, inside the cast.** A
+            // `CAST(N'…' AS varchar(n))` converts under the restoring
+            // database's code page, and a `COLLATE` after it converts those
+            // bytes again rather than the text: a Greek variant restored into
+            // a Latin-1 database as `Oµ??a` (measured on 2022 and 2025).
             Some(match collation {
-                Some(c) => format!("CAST(CAST({lit} AS {base}) COLLATE {c} AS sql_variant)"),
+                Some(c) => format!("CAST(CAST({lit} COLLATE {c} AS {base}) AS sql_variant)"),
                 None => format!("CAST(CAST({lit} AS {base}) AS sql_variant)"),
             })
         }
+    }
+}
+
+/// The text inside `{"x":"…"}` — the one-member document a character variant
+/// is read as (`SELECT v AS x FOR JSON PATH, WITHOUT_ARRAY_WRAPPER`) — or
+/// `None` for anything else.
+fn variant_json_text(doc: &str) -> Option<String> {
+    let serde_json::Value::Object(mut m) = serde_json::from_str(doc).ok()? else {
+        return None;
+    };
+    if m.len() != 1 {
+        return None;
+    }
+    match m.remove("x")? {
+        serde_json::Value::String(s) => Some(s),
+        _ => None,
     }
 }
 
@@ -3760,6 +3789,53 @@ mod tests {
         );
         assert_eq!(sql_literal(&Value::Int(-3), MsSql), "-3");
         assert_eq!(literal_mode_sql(MsSql), None);
+    }
+
+    /// **A character variant is converted under its own collation, and read
+    /// whole.** `CAST(N'Ωμέγα' AS varchar(10)) COLLATE Greek_CI_AS` converts
+    /// under the *restoring database's* code page and only then relabels the
+    /// bytes, so in a Latin-1 database the copy held `Oµ??a` (measured on 2022
+    /// and 2025); the `COLLATE` belongs on the text, before the cast. The value
+    /// arrives as the server's `FOR JSON` of it, since `CAST(v AS
+    /// nvarchar(max))` stops at 4,000 characters and a `varchar` variant holds
+    /// up to 8,000 (`dump::literal_select`).
+    #[test]
+    fn a_character_variant_converts_under_its_own_collation() {
+        let v = |text: &str| server_literal(ServerLiteral::Variant, text);
+        assert_eq!(
+            v(r#"varchar(10) COLLATE Greek_CI_AS|{"x":"Ωμέγα"}"#).as_deref(),
+            Some("CAST(CAST(N'Ωμέγα' COLLATE Greek_CI_AS AS varchar(10)) AS sql_variant)")
+        );
+        assert_eq!(
+            v(r#"nvarchar(5) COLLATE Latin1_General_CI_AS|{"x":"it's"}"#).as_deref(),
+            Some("CAST(CAST(N'it''s' COLLATE Latin1_General_CI_AS AS nvarchar(5)) AS sql_variant)")
+        );
+        // JSON's escapes are the server's, and they are undone exactly: a
+        // control character, a quote, a backslash and a solidus.
+        assert_eq!(
+            v(r#"char(6) COLLATE Latin1_General_BIN2|{"x":"a\u0001\"\\\/ "}"#).as_deref(),
+            Some(
+                "CAST(CAST(N'a\u{1}\"\\/ ' COLLATE Latin1_General_BIN2 AS char(6)) AS sql_variant)"
+            )
+        );
+        // Past 4,000 characters the text is whole: what the cap would have cut.
+        let long = "x".repeat(5000);
+        let lit = v(&format!(
+            r#"varchar(6000) COLLATE SQL_Latin1_General_CP1_CI_AS|{{"x":"{long}"}}"#
+        ))
+        .expect("a literal");
+        assert!(lit.contains(&format!("N'{long}'")), "{lit}");
+        // Anything but the one-member document the read asks for is not
+        // trusted: the cell is withheld rather than guessed at.
+        for bad in [
+            "varchar(5) COLLATE Greek_CI_AS|Ωμέγα",
+            r#"varchar(5) COLLATE Greek_CI_AS|{"x":1}"#,
+            r#"varchar(5) COLLATE Greek_CI_AS|{"y":"a"}"#,
+            r#"varchar(5) COLLATE Greek_CI_AS|{"x":"a","y":"b"}"#,
+            r#"varchar(5) COLLATE Greek_CI_AS|{"x":"a"} junk"#,
+        ] {
+            assert_eq!(v(bad), None, "{bad}");
+        }
     }
 
     /// SQL Server's own quoting is `[…]`, with a `]` doubled inside it. `"…"`
