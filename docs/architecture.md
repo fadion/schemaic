@@ -406,7 +406,9 @@ existing prose was left alone.
     write above the caret is shown before it runs
     (`run_at_the_caret_stops_at_the_carets_statement_in_a_batch_scope`,
     `ctrl_enter_outlines_a_batch_scoped_piece_before_running_it`). The missing-`WHERE` guards lose nothing by the larger
-    piece, since `tsql_statements` (below) cuts at statement words and not at `;`. **`nested_block_comments` was a divergence the table did not have**:
+    piece, since `tsql_statements` (below) cuts at statement words and not at `;` — and the `.sql`
+    panel's probe, which read a piece by its head and so missed everything after a `DECLARE`, now
+    counts through it too (`core::script`). **`nested_block_comments` was a divergence the table did not have**:
     PostgreSQL nests `/* … */` and `skip_comment` ended every comment at its first `*/`, so a head
     after a nested comment was read from inside it — `/* a /* b */ c */ DELETE FROM t` ran its
     every-row DELETE with no ask — and a quote in the comment's tail opened a "string" that hid a
@@ -756,7 +758,7 @@ existing prose was left alone.
     What it must not do is cut where the word continues the statement before it — a set operator's
     second `SELECT`, `MERGE`'s `THEN UPDATE`/`DELETE`/`INSERT`, a cursor's `FOR UPDATE`, a foreign
     key's `ON DELETE CASCADE`, `INNER MERGE JOIN`, `DROP … IF EXISTS`, an `ALTER TABLE`'s
-    `TRUNCATE`/`DROP PARTITION` — or anywhere after the head of a procedure, function, trigger or
+    `TRUNCATE`/`DROP PARTITION` and `DROP COLUMN`/`CONSTRAINT`/`PERIOD` — or anywhere after the head of a procedure, function, trigger or
     view, which is one statement whatever it holds, or of a `GRANT`/`REVOKE`/`DENY`, whose privilege
     list is made of those words. A leading `WITH` keeps the statement its CTEs feed, and text headed
     `EXPLAIN`/`ANALYZE` — no T-SQL, but the prefixes `analyzed_statement` strips — stays whole. Every
@@ -9672,7 +9674,17 @@ existing prose was left alone.
     where their kind alone would not be; `the_probe_counts_what_destroys_rows_by_another_name`), and
     whether the file opens its own
     transaction (`dump.rs`'s *Replaying → One
-    transaction* put one there, and the runner must not wrap an already-wrapped file). It is bounded
+    transaction* put one there, and the runner must not wrap an already-wrapped file). **It counts
+    the statements a piece holds, not the piece** (`sql::tsql_statements`; any other dialect's piece
+    is one): on T-SQL a piece is a batch, and from a `DECLARE` the rest of it is one piece
+    (`BatchScope`), so a migration opening with a variable probed as one `DECLARE` that destroyed
+    nothing over a `DELETE`, a `DROP COLUMN` and two `DROP`s
+    (`a_t_sql_script_counts_what_it_destroys_after_a_declare`). The transaction walk still indexes
+    pieces, because the `ran` that `durability` is asked about counts the pieces sent. And a T-SQL
+    `BEGIN` opens a transaction only as `BEGIN TRAN[SACTION]` or `BEGIN DISTRIBUTED`
+    (`opens_transaction`): a bare one opens a block, and read as an opener a `TRY … CATCH` made the
+    panel promise the file "lands whole or not at all" and report a later failure as undoing rows
+    that were committed (`a_t_sql_block_is_not_the_file_opening_a_transaction`). It is bounded
     by `PROBE_MAX_BYTES` — the same 8 MB as `SAMPLE_MAX_BYTES`, for the same reason: the user asked
     to *look* at a file — and by `PROBE_MAX_STATEMENTS`. Either bound sets `Probe::more`, and every
     count is then reported through `count_label` as a floor (`400+`), never rounded up to a total

@@ -2521,8 +2521,11 @@ pub(crate) fn tsql_statements(stmt: &str, dialect: SqlDialect) -> Vec<&str> {
                 "MERGE" => next == Some("JOIN"),
                 // `DROP TABLE IF EXISTS t` is one statement.
                 "IF" => prev.is_some() && next == Some("EXISTS"),
-                // An `ALTER TABLE`'s partition clause.
-                "TRUNCATE" | "DROP" => next == Some("PARTITION"),
+                // An `ALTER TABLE`'s partition clause, and its `DROP COLUMN`,
+                // `DROP CONSTRAINT` and `DROP PERIOD`, none of them a
+                // statement of their own.
+                "TRUNCATE" => next == Some("PARTITION"),
+                "DROP" => matches!(next, Some("PARTITION" | "COLUMN" | "CONSTRAINT" | "PERIOD")),
                 "CREATE" | "ALTER" | "DECLARE" | "WHILE" | "PRINT" | "EXEC" | "EXECUTE"
                 | "BEGIN" | "COMMIT" | "ROLLBACK" | "USE" | "RETURN" | "GRANT" | "REVOKE"
                 | "DENY" => false,
@@ -8800,6 +8803,25 @@ line */",
                 SqlDialect::MySql
             ),
             None
+        );
+    }
+
+    /// An `ALTER TABLE`'s `DROP COLUMN`/`CONSTRAINT`/`PERIOD` is a clause, not
+    /// a statement — cut there, the `.sql` panel counted the `ALTER` and its
+    /// `DROP` as two — while a `DROP` that names an object still begins one.
+    #[test]
+    fn an_alter_tables_drop_clause_is_no_statement_of_its_own() {
+        let ms = SqlDialect::MsSql;
+        for one in [
+            "ALTER TABLE t DROP COLUMN c",
+            "ALTER TABLE t DROP CONSTRAINT pk_t",
+            "ALTER TABLE t DROP PERIOD FOR SYSTEM_TIME",
+        ] {
+            assert_eq!(super::tsql_statements(one, ms), vec![one]);
+        }
+        assert_eq!(
+            super::tsql_statements("ALTER TABLE t ADD c int\nDROP TABLE u", ms),
+            vec!["ALTER TABLE t ADD c int", "DROP TABLE u"]
         );
     }
 

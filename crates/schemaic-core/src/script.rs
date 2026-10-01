@@ -434,6 +434,30 @@ fn is_destructive(sql: &str, kind: &str, dialect: SqlDialect) -> bool {
         || sql::drop_reason(sql, dialect).is_some()
 }
 
+/// Does this statement open a transaction — the file wrapping itself?
+///
+/// Both spellings our own dump writes — `START TRANSACTION` on MySQL, `BEGIN`
+/// on PostgreSQL and SQLite (`dump::transaction_sql`). **On a dialect whose
+/// batches scope a block, a bare `BEGIN` opens the block** — `BEGIN … END`,
+/// `BEGIN TRY` — and only `BEGIN TRAN[SACTION]` and `BEGIN DISTRIBUTED` open a
+/// transaction, as `sql::BatchScope` and `tx::tx_after` both read it. Counted
+/// as an opener, a `TRY … CATCH` made the panel promise the file "lands whole
+/// or not at all" and report a later failure as undoing rows that were
+/// committed.
+fn opens_transaction(sql: &str, kind: &str, dialect: SqlDialect) -> bool {
+    match kind {
+        "START" => true,
+        "BEGIN" if dialect.batch_separator() => matches!(
+            sql::leading_words(sql, 2, dialect)
+                .get(1)
+                .map(String::as_str),
+            Some("TRAN" | "TRANSACTION" | "DISTRIBUTED")
+        ),
+        "BEGIN" => true,
+        _ => false,
+    }
+}
+
 /// What the modal's red confirmation should say about a probe.
 ///
 /// **The gate was `p.destructive > 0` at the call site, and that is one state
@@ -773,42 +797,52 @@ pub fn probe<R: std::io::Read>(r: R, dialect: SqlDialect) -> std::io::Result<Pro
     let mut closed_at: Option<usize> = None;
     let mut destructive = 0usize;
     let mut unqualified = 0usize;
+    let mut statements = 0usize;
+    // **Each statement a piece holds, not the piece.** On T-SQL a piece is a
+    // batch, and from a `DECLARE` the rest of the batch is one piece
+    // (`sql::BatchScope`): read by its head, a migration that opened with a
+    // variable was one `DECLARE` that destroyed nothing. Every other dialect's
+    // piece is one statement and comes back whole. The transaction walk still
+    // counts in pieces, because `ran` — what `durability` is asked about — is
+    // the pieces the run sent.
     for (i, s) in stmts.iter().enumerate() {
-        // **Counted, not dropped.** A statement `statement_kind` cannot name is
-        // still a statement the run will send, and dropping it from the
-        // histogram made the summary and the list beneath it disagree — a
-        // `mysqldump` preamble read "3 statements" over a histogram of one, with
-        // nothing saying which number was wrong. It is also asked whether it
-        // destroys anything, which the old shape never did.
-        let kind = statement_kind(&s.sql, dialect).unwrap_or_else(|| UNCLASSIFIED.to_string());
-        // Both spellings our own dump writes — `START TRANSACTION` on MySQL,
-        // `BEGIN` on PostgreSQL and SQLite (`dump::transaction_sql`).
-        if kind == "BEGIN" || kind == "START" {
-            own_transaction = true;
-            opens += 1;
-            depth += 1;
-        } else if (kind == "COMMIT" || kind == "ROLLBACK") && depth > 0 {
-            depth -= 1;
-            if depth == 0 {
-                closed_at.get_or_insert(i + 1);
+        for one in sql::tsql_statements(&s.sql, dialect) {
+            statements += 1;
+            // **Counted, not dropped.** A statement `statement_kind` cannot
+            // name is still a statement the run will send, and dropping it
+            // from the histogram made the summary and the list beneath it
+            // disagree — a `mysqldump` preamble read "3 statements" over a
+            // histogram of one, with nothing saying which number was wrong. It
+            // is also asked whether it destroys anything, which the old shape
+            // never did.
+            let kind = statement_kind(one, dialect).unwrap_or_else(|| UNCLASSIFIED.to_string());
+            if opens_transaction(one, &kind, dialect) {
+                own_transaction = true;
+                opens += 1;
+                depth += 1;
+            } else if (kind == "COMMIT" || kind == "ROLLBACK") && depth > 0 {
+                depth -= 1;
+                if depth == 0 {
+                    closed_at.get_or_insert(i + 1);
+                }
             }
+            if is_destructive(one, &kind, dialect) {
+                destructive += 1;
+            }
+            // The run guard's every-row predicate, asked where the statements
+            // are — see `Probe::unqualified`. Not all of `unsafe_reason`: its
+            // `DROP` arm is destruction, which `is_destructive` counts above.
+            if sql::every_row_reason(one, dialect).is_some() {
+                unqualified += 1;
+            }
+            *counts.entry(kind).or_default() += 1;
         }
-        if is_destructive(&s.sql, &kind, dialect) {
-            destructive += 1;
-        }
-        // The run guard's every-row predicate, asked where the statements
-        // are — see `Probe::unqualified`. Not all of `unsafe_reason`: its
-        // `DROP` arm is destruction, which `is_destructive` counts above.
-        if sql::every_row_reason(&s.sql, dialect).is_some() {
-            unqualified += 1;
-        }
-        *counts.entry(kind).or_default() += 1;
     }
     let mut kinds: Vec<(String, usize)> = counts.into_iter().collect();
     kinds.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
     Ok(Probe {
-        statements: stmts.len(),
+        statements,
         kinds,
         more: truncated || capped,
         own_transaction,
@@ -1650,6 +1684,77 @@ mod tests {
         assert_eq!(p.statements, 1, "{:?}", p.kinds);
         assert_eq!(p.kinds, vec![("CREATE TRIGGER".to_string(), 1)]);
         assert!(!p.own_transaction);
+    }
+
+    fn probed_tsql(sql: &str) -> Probe {
+        probe(sql.as_bytes(), SqlDialect::MsSql).expect("a slice never fails to read")
+    }
+
+    /// **A T-SQL piece is a batch, and a batch holds statements.** From a
+    /// `DECLARE` the rest of the batch is one piece, and the probe classified
+    /// the piece by its head: a migration opening with a variable counted one
+    /// `DECLARE` and destroyed nothing, while it deleted rows, dropped a column
+    /// and dropped two objects — on the panel whose red line is the only
+    /// confirmation.
+    #[test]
+    fn a_t_sql_script_counts_what_it_destroys_after_a_declare() {
+        let p = probed_tsql(
+            "DECLARE @cutoff date = '2020-01-01';\n\
+             DELETE FROM orders WHERE placed < @cutoff;\n\
+             ALTER TABLE orders DROP COLUMN legacy_note;\n\
+             DROP PROCEDURE dbo.old_report;\n\
+             DROP VIEW dbo.v;",
+        );
+        assert_eq!(p.destructive, 4, "{:?}", p.kinds);
+        assert_eq!(p.statements, 5);
+        assert_eq!(
+            p.kinds.iter().map(|(_, n)| n).sum::<usize>(),
+            p.statements,
+            "{:?}",
+            p.kinds
+        );
+        // An unqualified write inside the scope is counted as well.
+        let p = probed_tsql("DECLARE @n int = 1;\nUPDATE t SET a = @n;");
+        assert_eq!(p.unqualified, 1, "{:?}", p.kinds);
+        // A procedure's body is not run by creating it.
+        let p = probed_tsql("CREATE PROCEDURE p AS BEGIN DELETE FROM t; DROP TABLE u; END");
+        assert_eq!(p.destructive, 0, "{:?}", p.kinds);
+        assert_eq!(p.statements, 1);
+    }
+
+    /// **A bare T-SQL `BEGIN` opens a block, not a transaction.** The probe
+    /// counted any `BEGIN` as the file opening its own, so a `TRY … CATCH`
+    /// read as "lands whole or not at all", and a failure after it was
+    /// reported as rolling back rows that were committed.
+    #[test]
+    fn a_t_sql_block_is_not_the_file_opening_a_transaction() {
+        let p = probed_tsql(
+            "INSERT INTO t VALUES (1);\nBEGIN TRY\n  INSERT INTO t VALUES (2);\nEND TRY\n\
+             BEGIN CATCH\n  THROW;\nEND CATCH;\nINSERT INTO t VALUES ('x');",
+        );
+        assert!(!p.own_transaction, "{:?}", p.kinds);
+        assert_eq!(p.atomic_through, None);
+        assert_eq!(durability(Some(&p), 2), Durability::Applied);
+        let p = probed_tsql("IF 1 = 1\nBEGIN\n  UPDATE t SET a = 1 WHERE id = 1;\nEND");
+        assert!(!p.own_transaction, "{:?}", p.kinds);
+        // T-SQL's own spellings still open one.
+        for open in [
+            "BEGIN TRAN",
+            "BEGIN TRANSACTION",
+            "BEGIN DISTRIBUTED TRANSACTION",
+        ] {
+            let p = probed_tsql(&format!("{open};\nINSERT INTO t VALUES (1);\nCOMMIT;"));
+            assert!(p.own_transaction, "{open}");
+            assert_eq!(p.atomic_through, Some(3), "{open}");
+        }
+        // A transaction a `TRY … CATCH` wraps is seen inside the block, and
+        // its piece is the whole of what it covers.
+        let p = probed_tsql(
+            "BEGIN TRY\n  BEGIN TRAN;\n  DELETE FROM t WHERE id = 1;\n  COMMIT;\nEND TRY\n\
+             BEGIN CATCH\n  IF @@TRANCOUNT > 0 ROLLBACK;\n  THROW;\nEND CATCH;",
+        );
+        assert!(p.own_transaction, "{:?}", p.kinds);
+        assert_eq!(p.atomic_through, Some(1));
     }
 
     /// **The state the view's `p.destructive > 0` gate could not express.** A
