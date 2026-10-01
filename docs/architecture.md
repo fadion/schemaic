@@ -5658,7 +5658,10 @@ existing prose was left alone.
     consequence — on MySQL the `DROP` commits before the `CREATE` is refused, so the rename destroys
     the original; SQL Server's `run_ddl` is one transaction, so the refused `CREATE` takes the
     `DROP` back and nothing changes, which is what it now says
-    (`a_sql_server_routine_recreates_sentences_match_its_plan`). The trigger arm's "drops it first"
+    (`a_sql_server_routine_recreates_sentences_match_its_plan`). **Except for a natively compiled
+    routine**, draft's side or server's: its plan runs piecewise (`ChangeSet::runs_whole`, under
+    `Db::run_ddl`), the `DROP` commits as on MySQL, and the sentence says the original is destroyed
+    (`a_natively_compiled_routine_renamed_onto_a_taken_name_says_it_is_destroyed`). The trigger arm's "drops it first"
     had the same fault over SQL Server's in-place alter; it asks `trigger_alters_in_place`, the
     predicate `trigger_statements` plans with, and says the trigger is redefined in place
     (`a_trigger_altered_in_place_is_not_said_to_be_dropped`). The change list's line above it
@@ -12243,6 +12246,27 @@ existing prose was left alone.
   stamps `DdlScope` onto the preview from `ddl::is_server_level`, `ddl_preview::apply` passes it
   through on the `DdlRunRequest`, and `app/main.rs` branches on it. Asking "is this a `CREATE
   DATABASE`?" of a `Vec<String>` would be the hand-rolled scanner this codebase keeps out.
+  **`DdlPreview::whole` rides the same road and picks between the two in-database runners.** It is
+  `ChangeSet::runs_whole` — `ddl_is_transactional` and `ddl_rolls_back_as_a_whole` for the engine,
+  less any change `ddl::touches_natively_compiled_module` answers yes for — and under
+  `DdlScope::Database` the app takes `run_ddl` when it is true and **`run_ddl_piecewise`** when it
+  is not. That runner exists because SQL Server refuses every `CREATE`, `ALTER` and `DROP` of a
+  natively compiled procedure, function or trigger inside a user transaction (Msg 12331, on 2022
+  and 2025), and `run_ddl` wrapped every SQL Server plan in one — so no edit, create or drop of such
+  a module could be applied at all. On SQL Server it is `mssql::run_ddl` with `whole: false` (see
+  `mssql.rs` below); on the other three it delegates to `run_ddl`, MySQL's being piecewise already
+  and PostgreSQL's and SQLite's transaction strictly more than a caller asking for this is owed.
+  **What it gives up is said before Apply, not discovered after it**: `ChangeSet::destructive` adds
+  the sentence that the plan runs a statement at a time, cannot be stopped, and leaves what ran
+  before a failure applied — on an engine whose plans otherwise run whole, which is why MySQL's
+  plans never carry it — and the preview offers no Stop, `exit_cancellable` asking `whole` beside
+  the engine. One answer for the runner, the Stop and the sentence, so the three cannot disagree;
+  a compare plan's is every set's (`SchemaPlan::runs_whole`), one such module taking the whole plan
+  out of the transaction. `Change::DropTrigger` gained `natively_compiled` for it, a trigger's
+  name alone being unable to say (`a_plan_touching_a_natively_compiled_module_does_not_run_whole`,
+  `a_natively_compiled_module_s_plan_runs_piecewise_and_cannot_be_stopped`; live,
+  `a_natively_compiled_module_is_edited_created_and_dropped_through_its_plan`, which Azure SQL
+  Database skips for wanting a memory-optimised filegroup).
   `DdlPreview::qualified` is read off the same set and is **not** the same question: it says whether
   the plan is *in* a database, and an account change answers `Database` to the first and `false` to
   the second — server-wide, but on the in-database runner.
@@ -13332,7 +13356,12 @@ existing prose was left alone.
   failure rolls back and reports `DdlError { at: i, applied: 0 }` — `applied` is always 0 here,
   a half-applied plan being a state this path never leaves behind. Stop sends the attention and
   rolls back **only if it was acknowledged**, `commit_writes`' rule for `commit_writes`' reason;
-  unacknowledged, the connection's close is what rolls the plan back. **The plan comes out of
+  unacknowledged, the connection's close is what rolls the plan back. **`whole: false` is the
+  exception to all of that, and `Db::run_ddl_piecewise` is its only caller**: no `BEGIN
+  TRANSACTION`, each statement committing as it runs, nothing rolled back, and a failure reporting
+  what is already in effect through `ddl::applied_count`, as MySQL's runner does — for the plan
+  that touches a natively compiled module, which Msg 12331 keeps out of a transaction (why, and how
+  the plan chooses, is under `Db::run_ddl` above). **The plan comes out of
   `emit_mssql`**, `ChangeSet::emit`'s own arm for SQL Server in an exhaustive `match`, which walks
   only the changes `supports_change` admits, whole objects through the helpers the other emitters
   share — `create_table_sql`, `DROP TABLE`, `TRUNCATE TABLE`, `drop_view_sql`, `DROP {kind}` over
@@ -26384,8 +26413,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   **A *constant* standing in for a capability is the same failure with no comparison left to grep
   for**, and three of that shape fell together. `ddl::normalize_type`'s `dialect == Postgres` became
   the private, exhaustive `TypeAliasing` (see `ddl.rs`), which is what stopped SQLite being
-  canonicalised by MySQL's alias table. `ddl_preview::exit_cancellable` takes an
-  `Option<SqlDialect>` where it had `.unwrap_or(SqlDialect::MySql)`: with no preview open there is
+  canonicalised by MySQL's alias table. `ddl_preview::exit_cancellable` takes an `Option` — of
+  the `DdlPreview` now, since the plan answers too (`DdlPreview::whole`, under `Db::run_ddl`) —
+  where it had `.unwrap_or(SqlDialect::MySql)`: with no preview open there is
   no engine to ask, and the guard was correct only by coincidence, `ddl_rolls_back_as_a_whole(MySql)`
   happening to be `false` — MySQL 8's atomic DDL is exactly the refinement that predicate exists to
   absorb, and the day it lands the absent case would have begun reporting *cancellable* with nothing
@@ -26883,6 +26913,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   `CREATE`/`DROP DATABASE` reach it through the same preview, from `ddl::server_level` →
   `ChangeSet::emit` → `ddl_preview::preview_container`, and it is a second *runner* rather than a
   second emitter — the two statements can take neither of `run_ddl`'s commitments (see it above).
+  `Db::run_ddl_piecewise` is a third runner on the same rule — `run_ddl` with its transaction left
+  out, for the plan SQL Server refuses inside one — and the plan chooses it
+  (`ChangeSet::runs_whole`), never the caller.
   Don't add a path that builds `ALTER`/`CREATE`/`DROP` text somewhere else, and
   don't add one that applies a plan without the preview — the preview is where the destructive
   consequence is stated in plain language and where "Open in editor" hands the script over.
@@ -26900,7 +26933,7 @@ Re-introducing the anti-patterns these guard against is a regression:
   `ui/compare_view.rs` builds a `SchemaPlan` from what is ticked and hands it to
   `ddl_preview::preview_of_plan`, which fills the same `DdlPreview` a one-table designer edit fills —
   so a compare plan takes the same preview, the same Apply and the same `Db::run_ddl`, and reads its
-  `scope` off every set's changes rather than letting the caller pick a runner. A compare that
+  `scope` and `whole` off every set's changes rather than letting the caller pick a runner. A compare that
   applied its own plan without the preview would be the path this rule forbids, and the aggregate is
   where doing so would be cheapest: it already holds every statement in order.
   **Nor is a plan applied in part**: what the dialect can't express is `ChangeSet::unsupported()`,

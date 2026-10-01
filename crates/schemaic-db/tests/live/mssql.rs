@@ -3555,31 +3555,14 @@ async fn a_natively_compiled_module_is_refused_what_the_server_refuses() {
         return;
     }
     let s = Scratch::create("ddl_native").await;
-    base_db()
-        .fetch_query(
-            None,
-            &format!(
-                "ALTER DATABASE [{n}] ADD FILEGROUP mo CONTAINS MEMORY_OPTIMIZED_DATA; \
-                 DECLARE @path nvarchar(400) = CONCAT(CAST(SERVERPROPERTY('InstanceDefaultDataPath') \
-                 AS nvarchar(300)), N'{n}_mo'); \
-                 EXEC (N'ALTER DATABASE [{n}] ADD FILE (NAME = N''mo'', FILENAME = N''' + @path \
-                 + N''') TO FILEGROUP mo')",
-                n = s.name
-            ),
-            1,
-            CancellationToken::new(),
-        )
-        .await
-        .expect("a memory-optimised filegroup");
-    let atomic =
-        "BEGIN ATOMIC WITH (TRANSACTION ISOLATION LEVEL = SNAPSHOT, LANGUAGE = N'us_english')";
+    memory_optimised_filegroup(&s).await;
     s.exec(&format!(
-        "CREATE PROCEDURE dbo.np WITH NATIVE_COMPILATION, SCHEMABINDING AS {atomic} SELECT 1 AS x END"
+        "CREATE PROCEDURE dbo.np WITH NATIVE_COMPILATION, SCHEMABINDING AS {ATOMIC} SELECT 1 AS x END"
     ))
     .await;
     s.exec(&format!(
         "CREATE FUNCTION dbo.nf (@a int) RETURNS int WITH NATIVE_COMPILATION, SCHEMABINDING AS \
-         {atomic} RETURN @a END"
+         {ATOMIC} RETURN @a END"
     ))
     .await;
     let all =
@@ -3614,6 +3597,132 @@ async fn a_natively_compiled_module_is_refused_what_the_server_refuses() {
             assert!(e.to_string().contains("10794"), "{e}");
         }
     }
+}
+
+/// The `BEGIN ATOMIC` header every natively compiled module's body opens with.
+const ATOMIC: &str =
+    "BEGIN ATOMIC WITH (TRANSACTION ISOLATION LEVEL = SNAPSHOT, LANGUAGE = N'us_english')";
+
+/// Give the scratch database the memory-optimised filegroup a natively
+/// compiled module or a memory-optimised table needs. Its file goes in the
+/// instance's default data directory, named for the database, so two legs
+/// running at once do not share one.
+async fn memory_optimised_filegroup(s: &Scratch) {
+    base_db()
+        .fetch_query(
+            None,
+            &format!(
+                "ALTER DATABASE [{n}] ADD FILEGROUP mo CONTAINS MEMORY_OPTIMIZED_DATA; \
+                 DECLARE @path nvarchar(400) = CONCAT(CAST(SERVERPROPERTY('InstanceDefaultDataPath') \
+                 AS nvarchar(300)), N'{n}_mo'); \
+                 EXEC (N'ALTER DATABASE [{n}] ADD FILE (NAME = N''mo'', FILENAME = N''' + @path \
+                 + N''') TO FILEGROUP mo')",
+                n = s.name
+            ),
+            1,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("a memory-optimised filegroup");
+}
+
+/// **A plan touching a natively compiled module applies.** SQL Server answers
+/// every `CREATE`, `ALTER` and `DROP` of one inside a user transaction with
+/// Msg 12331, and `Db::run_ddl` wrapped every plan in one — so no edit, create
+/// or drop of such a procedure or trigger could be applied from here at all.
+/// Each plan below says it cannot run whole, takes the runner that does not
+/// wrap it, and lands.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_natively_compiled_module_is_edited_created_and_dropped_through_its_plan() {
+    use schemaic_core::ddl::{
+        ChangeSet, RoutineDraft, TriggerSetDraft, create_routine, diff_routine, diff_triggers,
+        drop_routine, drop_trigger,
+    };
+    use schemaic_core::schema::TriggerAction;
+    if !enabled() || azure_cannot("adds a memory-optimised filegroup to the database") {
+        return;
+    }
+    let s = Scratch::create("ddl_native_plan").await;
+    memory_optimised_filegroup(&s).await;
+    s.exec(
+        "CREATE TABLE dbo.m (id int NOT NULL PRIMARY KEY NONCLUSTERED) \
+         WITH (MEMORY_OPTIMIZED = ON, DURABILITY = SCHEMA_ONLY); \
+         CREATE TABLE dbo.a (id int NOT NULL PRIMARY KEY NONCLUSTERED) \
+         WITH (MEMORY_OPTIMIZED = ON, DURABILITY = SCHEMA_ONLY)",
+    )
+    .await;
+    s.exec(&format!(
+        "CREATE PROCEDURE dbo.np WITH NATIVE_COMPILATION, SCHEMABINDING AS {ATOMIC} SELECT 1 AS x END"
+    ))
+    .await;
+    s.exec(&format!(
+        "CREATE TRIGGER dbo.tm ON dbo.m WITH NATIVE_COMPILATION, SCHEMABINDING AFTER INSERT AS \
+         {ATOMIC} INSERT dbo.a (id) SELECT id FROM inserted END"
+    ))
+    .await;
+    let apply = |cs: ChangeSet| {
+        let db = s.db.clone();
+        let name = s.name.clone();
+        async move {
+            let stmts = cs.emit();
+            assert!(!cs.runs_whole(), "{stmts:#?}");
+            db.run_ddl_piecewise(&name, &stmts, CancellationToken::new())
+                .await
+                .unwrap_or_else(|e| panic!("{e}\n{stmts:#?}"));
+        }
+    };
+    let routine = |name: &'static str| {
+        let s = &s;
+        async move {
+            s.db.fetch_schema(&s.name, CancellationToken::new())
+                .await
+                .unwrap()
+                .routines
+                .iter()
+                .find(|r| r.name == name)
+                .unwrap_or_else(|| panic!("no routine {name}"))
+                .as_ref()
+                .clone()
+        }
+    };
+
+    // An edit in place.
+    let np = routine("np").await;
+    let mut d = RoutineDraft::from_info(&np);
+    d.info.body = d.info.body.replace("SELECT 1 AS x", "SELECT 2 AS x");
+    apply(diff_routine(&np, &d, MS)).await;
+    assert_eq!(s.scalar("EXEC dbo.np").await, "2");
+
+    // A create, from the edited one under another name.
+    let mut d = RoutineDraft::from_info(&routine("np").await);
+    d.original = None;
+    d.info.name = "np2".into();
+    apply(create_routine(&d, MS)).await;
+    assert_eq!(s.scalar("EXEC dbo.np2").await, "2");
+
+    // A drop.
+    apply(drop_routine(&routine("np2").await, MS)).await;
+    assert_eq!(
+        s.scalar("SELECT COUNT(*) FROM sys.procedures WHERE name = 'np2'")
+            .await,
+        "0"
+    );
+
+    // A natively compiled trigger: an edit, then a drop.
+    let t = read_table(&s, "m").await;
+    assert!(t.triggers[0].tsql.native_compilation, "{t:?}");
+    let mut set = TriggerSetDraft::from_table(&t);
+    let TriggerAction::Body(body) = &set.triggers[0].info.action else {
+        panic!("{t:?}");
+    };
+    set.triggers[0].info.action =
+        TriggerAction::Body(body.replace("SELECT id FROM", "SELECT id + 10 FROM"));
+    apply(diff_triggers(&t.triggers, &set, MS)).await;
+    s.exec("INSERT dbo.m (id) VALUES (1)").await;
+    assert_eq!(s.scalar("SELECT MAX(id) FROM dbo.a").await, "11");
+    let t = read_table(&s, "m").await;
+    apply(drop_trigger(&t.triggers[0], MS)).await;
+    assert_eq!(s.scalar("SELECT COUNT(*) FROM sys.triggers").await, "0");
 }
 
 /// **A module created under `ANSI_NULLS OFF` or `QUOTED_IDENTIFIER OFF`

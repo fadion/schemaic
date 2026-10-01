@@ -1701,13 +1701,21 @@ impl RoutineDraft {
         // Server's plan is one transaction, whose refused `CREATE` takes the
         // `DROP` back with it — "would destroy" there warned of a loss that
         // cannot happen.
+        //
+        // **And the plan's, not only the engine's** (`ChangeSet::runs_whole`):
+        // a natively compiled routine's plan runs outside a transaction, so
+        // there the `DROP` commits before the `CREATE` is refused, as on MySQL.
+        use crate::schema::TsqlRoutineOption::NativeCompilation as Native;
+        let whole = ddl_is_transactional(dialect)
+            && !self.info.tsql.has_option(&Native)
+            && !current.is_some_and(|c| c.tsql.has_option(&Native));
         let what = self.info.kind.label();
         let original = current.map_or("the original", |c| c.name.as_str());
         taken
             .iter()
             .any(|t| t.trim().eq_ignore_ascii_case(want))
             .then(|| {
-                if ddl_is_transactional(dialect) {
+                if whole {
                     format!(
                         "A {what} called {want} is already here. On this engine a rename is \
                          a drop and a create, so the server refuses this one and nothing \
@@ -2637,6 +2645,11 @@ pub enum Change {
     },
     DropTrigger {
         name: String,
+        /// The trigger is **natively compiled**
+        /// ([`crate::schema::TsqlTrigger::native_compilation`]) — which
+        /// [`touches_natively_compiled_module`] has to know, and a name does
+        /// not say.
+        natively_compiled: bool,
     },
     /// Create a routine that doesn't exist yet — a plain `CREATE`, so a
     /// signature already taken fails instead of silently replacing someone
@@ -2903,6 +2916,38 @@ pub fn is_server_level(change: &Change) -> bool {
         change,
         Change::CreateDatabase(_) | Change::DropDatabase { .. }
     )
+}
+
+/// Does `change` create, alter or drop a **natively compiled module** — a SQL
+/// Server procedure, function or trigger declared `WITH NATIVE_COMPILATION`?
+///
+/// SQL Server refuses every such statement inside a user transaction (Msg
+/// 12331, measured on 2022 and 2025), which is what [`ChangeSet::runs_whole`]
+/// reads off it. Either side of a routine's redefinition counts: the `ALTER`
+/// addresses the module the server holds and compiles the one the draft
+/// describes. A trigger's is asked of the draft alone, which agrees with the
+/// server's on any plan the server would take: a natively compiled trigger
+/// stands only on a memory-optimised table, and every trigger there must be
+/// one. Only a T-SQL module carries the flag, so no engine is asked about:
+/// elsewhere it is never set.
+pub fn touches_natively_compiled_module(change: &Change) -> bool {
+    use crate::schema::TsqlRoutineOption::NativeCompilation as Native;
+    match change {
+        Change::CreateRoutine(d) => d.info.tsql.has_option(&Native),
+        Change::ReplaceRoutine { draft, server, .. } => {
+            draft.info.tsql.has_option(&Native) || server.tsql.has_option(&Native)
+        }
+        Change::RenameRoutine { from: r, .. } | Change::DropRoutine(r) => {
+            r.tsql.has_option(&Native)
+        }
+        Change::CreateTrigger(d) | Change::ReplaceTrigger { draft: d, .. } => {
+            d.info.tsql.native_compilation
+        }
+        Change::DropTrigger {
+            natively_compiled, ..
+        } => *natively_compiled,
+        _ => false,
+    }
 }
 
 /// The refusal for a view **rename** that would strand its dependents, or
@@ -3309,7 +3354,7 @@ impl Change {
                     format!("Re-create trigger {}", draft.info.name)
                 }
             }
-            Change::DropTrigger { name } => format!("Drop trigger {name}"),
+            Change::DropTrigger { name, .. } => format!("Drop trigger {name}"),
             Change::CreateRoutine(d) => {
                 format!("Create {} {}", d.info.kind.label(), d.info.name)
             }
@@ -3698,7 +3743,7 @@ impl Change {
             // Like `DropCheck`, this destroys no data and still has to be said:
             // whatever the trigger maintained — an audit row, a denormalized
             // total, a guard — silently stops happening on the next write.
-            Change::DropTrigger { name } => vec![format!(
+            Change::DropTrigger { name, .. } => vec![format!(
                 "Drops trigger {name}. Whatever it did on each write stops \
                  happening, and rows written from now on won't have it applied."
             )],
@@ -4558,6 +4603,7 @@ impl ChangeSet {
                 self.table
             ));
         }
+        out.extend(self.piecewise_risk());
         out
     }
 
@@ -5079,6 +5125,39 @@ impl ChangeSet {
         self.changes
             .iter()
             .all(|c| c.risk_is_reversible(self.dialect))
+    }
+
+    /// Does this plan run **whole or not at all** — inside the one transaction
+    /// `Db::run_ddl` wraps a plan in where [`ddl_is_transactional`]?
+    ///
+    /// The engine's answer, less what the plan itself refuses: SQL Server will
+    /// not create, alter or drop a natively compiled module inside a user
+    /// transaction ([`touches_natively_compiled_module`]), so such a plan has to
+    /// run a statement at a time (`Db::run_ddl_piecewise`) and cannot promise
+    /// what the engine's other plans do. Before this was asked, `run_ddl`
+    /// wrapped it anyway and no edit of such a module could be applied at all.
+    ///
+    /// **One answer for three readers** — the runner the preview hands the plan
+    /// to, whether its Stop rolls the plan back, and the sentence
+    /// [`ChangeSet::destructive`] adds — so the three cannot disagree.
+    pub fn runs_whole(&self) -> bool {
+        ddl_is_transactional(self.dialect)
+            && ddl_rolls_back_as_a_whole(self.dialect)
+            && !self.changes.iter().any(touches_natively_compiled_module)
+    }
+
+    /// The sentence a plan that does **not** [`run whole`](Self::runs_whole)
+    /// on an engine whose plans otherwise do carries, or `None`. MySQL's plans
+    /// never run whole, and say what failed and what stuck when one stops; a
+    /// natively compiled module is the case where an engine that does promise
+    /// it has to be told it cannot.
+    fn piecewise_risk(&self) -> Option<String> {
+        (ddl_is_transactional(self.dialect) && !self.runs_whole()).then(|| {
+            "SQL Server will not create, alter or drop a natively compiled module inside a \
+             transaction, so this plan runs one statement at a time and cannot be stopped: if \
+             a statement fails, the ones before it stay applied."
+                .to_string()
+        })
     }
 
     /// The script as it may **leave** the preview — for the clipboard, and for
@@ -5933,7 +6012,7 @@ impl ChangeSet {
                     dropped.push(draft.original.as_deref().unwrap_or(&draft.info.name));
                     planned.push(&draft.info.name);
                 }
-                Change::DropTrigger { name } => dropped.push(name),
+                Change::DropTrigger { name, .. } => dropped.push(name),
                 _ => {}
             }
         }
@@ -5970,7 +6049,7 @@ impl ChangeSet {
                     drops.push(drop(draft.original.as_deref().unwrap_or(&draft.info.name)));
                     push_create(&draft.info, false, &mut made);
                 }
-                Change::DropTrigger { name } => drops.push(drop(name)),
+                Change::DropTrigger { name, .. } => drops.push(drop(name)),
                 _ => {}
             }
         }
@@ -10125,6 +10204,7 @@ pub fn supports_trigger_editing(dialect: SqlDialect) -> bool {
             dialect,
             &Change::DropTrigger {
                 name: String::new(),
+                natively_compiled: false,
             },
         )
 }
@@ -10457,11 +10537,13 @@ pub fn schema_body_is_emittable(dialect: SqlDialect) -> bool {
 /// inside a modal over an unbounded operation (`REFRESH MATERIALIZED VIEW` is
 /// one statement and can run for hours); an allowed exit on MySQL loses the
 /// report of a half-applied plan.
+///
+/// The engine's answer. A plan that touches a natively compiled module runs
+/// outside a transaction even here — [`ChangeSet::runs_whole`] is the plan's.
 pub fn ddl_rolls_back_as_a_whole(dialect: SqlDialect) -> bool {
     match dialect {
-        // T-SQL DDL is transactional. `mssql::run_ddl` is not written yet (it
-        // refuses, and `supports_change` keeps every plan from it); wrapping
-        // the plan in one transaction is what it is to do.
+        // T-SQL DDL is transactional, and `mssql::run_ddl` wraps the plan in
+        // one transaction.
         SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => true,
         SqlDialect::MySql => false,
     }
@@ -14550,6 +14632,7 @@ pub fn diff_triggers(
         if !kept {
             changes.push(Change::DropTrigger {
                 name: cur.name.clone(),
+                natively_compiled: cur.tsql.native_compilation,
             });
         }
     }
@@ -14601,6 +14684,7 @@ pub fn drop_trigger(t: &TriggerInfo, dialect: SqlDialect) -> ChangeSet {
         flavour: ServerFlavour::Unknown,
         changes: vec![Change::DropTrigger {
             name: t.name.clone(),
+            natively_compiled: t.tsql.native_compilation,
         }],
     }
 }
@@ -28290,6 +28374,30 @@ mod tsql_routine_plan_tests {
         assert!(clash.contains("destroy"), "{clash}");
     }
 
+    /// **A natively compiled routine renamed onto a taken name is destroyed**,
+    /// as on MySQL: its plan runs outside a transaction
+    /// ([`ChangeSet::runs_whole`]), so the `DROP` commits before the `CREATE`
+    /// is refused — and the sentence, reading the engine alone, said nothing
+    /// changes. The plan's answer, from the draft's side or the server's.
+    #[test]
+    fn a_natively_compiled_routine_renamed_onto_a_taken_name_says_it_is_destroyed() {
+        use crate::schema::TsqlRoutineOption as O;
+        let mut cur = proc_r();
+        cur.name = "np".into();
+        cur.tsql.options = vec![O::NativeCompilation, O::SchemaBinding];
+        let taken = ["np".to_string(), "np2".to_string()];
+        let mut d = RoutineDraft::from_info(&cur);
+        d.info.name = "np2".into();
+        assert!(!diff_routine(&cur, &d, MsSql).runs_whole());
+        let clash = d.name_clash(Some(&cur), &taken, MsSql).unwrap();
+        assert!(clash.contains("would destroy np"), "{clash}");
+        // Compiled natively by the draft alone, the plan is as piecewise.
+        let mut plain = cur.clone();
+        plain.tsql.options.clear();
+        let clash = d.name_clash(Some(&plain), &taken, MsSql).unwrap();
+        assert!(clash.contains("would destroy np"), "{clash}");
+    }
+
     /// **Editing a signed routine says it strips the signature.** Any
     /// `CREATE OR ALTER` drops a module's `ADD SIGNATURE` (measured on SQL
     /// Server 2022: `sys.crypt_properties` 1 row, then none), and it cannot be
@@ -28546,6 +28654,107 @@ mod tsql_routine_plan_tests {
         assert!(TsqlShape::Procedure.allows(&O::Recompile, plain));
         assert!(!TsqlShape::Scalar.allows(&O::ReturnsNullOnNullInput, &native));
         assert!(TsqlShape::Scalar.allows(&O::ReturnsNullOnNullInput, plain));
+    }
+
+    /// **A plan touching a natively compiled module does not run whole**, and
+    /// says so. SQL Server refuses every `CREATE`, `ALTER` and `DROP` of one
+    /// inside a user transaction (Msg 12331, 2022 and 2025), and every plan
+    /// was wrapped in one — so none could be applied. Asked of each statement
+    /// kind that reaches such a module, routine and trigger, either side of a
+    /// redefinition; a plain module's plan still runs whole and says nothing.
+    #[test]
+    fn a_plan_touching_a_natively_compiled_module_does_not_run_whole() {
+        use crate::schema::TsqlRoutineOption as O;
+        let native = {
+            let mut p = proc_r();
+            p.tsql.options = vec![O::NativeCompilation, O::SchemaBinding];
+            p
+        };
+        let plain = proc_r();
+        let said = |cs: &ChangeSet| {
+            cs.destructive()
+                .iter()
+                .any(|r| r.contains("natively compiled") && r.contains("one statement at a time"))
+        };
+        let mut edited = RoutineDraft::from_info(&native);
+        edited.info.body = "BEGIN ATOMIC WITH (LANGUAGE = N'us_english') SELECT 2 END".into();
+        let mut unbound = RoutineDraft::from_info(&native);
+        unbound.info.tsql.options.clear();
+        for cs in [
+            diff_routine(&native, &edited, MsSql),
+            // Taking the option off still `ALTER`s the module the server holds.
+            diff_routine(&native, &unbound, MsSql),
+            create_routine(&RoutineDraft::from_info(&native), MsSql),
+            drop_routine(&native, MsSql),
+        ] {
+            assert!(!cs.is_empty());
+            assert!(!cs.runs_whole(), "{:?}", cs.changes);
+            assert!(said(&cs), "{:?}", cs.destructive());
+        }
+        let mut plain_edit = RoutineDraft::from_info(&plain);
+        plain_edit.info.body = "SELECT 2".into();
+        for cs in [
+            diff_routine(&plain, &plain_edit, MsSql),
+            drop_routine(&plain, MsSql),
+        ] {
+            assert!(cs.runs_whole(), "{:?}", cs.changes);
+            assert!(!said(&cs), "{:?}", cs.destructive());
+        }
+
+        let trigger = |native: bool| TriggerInfo {
+            name: "tm".into(),
+            schema: Some("dbo".into()),
+            table: "m".into(),
+            tsql: crate::schema::TsqlTrigger {
+                native_compilation: native,
+                schemabinding: native,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        for native in [true, false] {
+            let t = trigger(native);
+            let mut d = TriggerDraft::from_info(&t);
+            d.info.action = crate::schema::TriggerAction::Body("SET NOCOUNT ON".into());
+            for cs in [
+                diff_trigger(&t, &d, MsSql),
+                create_trigger(&TriggerDraft::from_info(&t), MsSql),
+                drop_trigger(&t, MsSql),
+                diff_triggers(
+                    std::slice::from_ref(&t),
+                    &TriggerSetDraft {
+                        table: "m".into(),
+                        schema: Some("dbo".into()),
+                        triggers: Vec::new(),
+                    },
+                    MsSql,
+                ),
+            ] {
+                assert!(!cs.is_empty());
+                assert_eq!(cs.runs_whole(), !native, "{native}: {:?}", cs.changes);
+                assert_eq!(said(&cs), native, "{native}: {:?}", cs.destructive());
+            }
+        }
+    }
+
+    /// **MySQL's plans never run whole, and that is not this sentence's to
+    /// say** — each statement commits as it runs whatever the plan holds, and
+    /// the failure report says what stuck.
+    #[test]
+    fn an_engine_without_transactional_ddl_never_runs_whole_and_adds_no_sentence() {
+        let cs = drop_routine(&proc_r(), SqlDialect::MySql);
+        assert!(!cs.runs_whole());
+        assert!(
+            !cs.destructive()
+                .iter()
+                .any(|r| r.contains("natively compiled")),
+            "{:?}",
+            cs.destructive()
+        );
+        for d in [SqlDialect::Postgres, SqlDialect::Sqlite] {
+            let cs = drop_routine(&proc_r(), d);
+            assert!(cs.runs_whole(), "{d:?}");
+        }
     }
 }
 

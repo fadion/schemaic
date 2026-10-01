@@ -1498,6 +1498,13 @@ pub struct DdlPreview {
     /// the answer half way through. Read through
     /// `ddl::ddl_rolls_back_as_a_whole`, never matched on here.
     pub dialect: SqlDialect,
+    /// Does the plan run **whole or not at all** — see
+    /// [`schemaic_core::ddl::ChangeSet::runs_whole`]. Off the change set, like
+    /// `scope`: it picks the runner (`Db::run_ddl` or `Db::run_ddl_piecewise`)
+    /// and decides whether Stop is offered, and both have to be the plan's
+    /// answer — a SQL Server plan touching a natively compiled module runs
+    /// outside a transaction although the engine's other plans do not.
+    pub whole: bool,
 }
 
 /// Where a DDL plan runs, and therefore what has to be re-read afterwards.
@@ -1531,6 +1538,9 @@ pub struct DdlRunRequest {
     pub database: String,
     pub scope: DdlScope,
     pub statements: Vec<String>,
+    /// [`DdlPreview::whole`], passed through: under [`DdlScope::Database`],
+    /// `true` takes `Db::run_ddl` and `false` `Db::run_ddl_piecewise`.
+    pub whole: bool,
 }
 
 /// How a DDL apply ended.

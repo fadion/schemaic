@@ -2235,6 +2235,9 @@ impl Db {
     ///   statement commits implicitly, so a transaction here would be theatre
     ///   (`tx::implicit_commit` models the same truth for the manual-transaction
     ///   path). The caller is told which statement failed and how many stuck.
+    /// * **SQL Server** and **SQLite** — one transaction, as PostgreSQL. A plan
+    ///   SQL Server refuses inside one (a natively compiled module) takes
+    ///   [`Db::run_ddl_piecewise`] instead.
     ///
     /// Runs on a fresh connection, like every other operation — a designer's
     /// Apply must not ride inside a tab's transaction. It can still *queue*
@@ -2268,9 +2271,39 @@ impl Db {
             // the reason is in `sqlite::run_ddl`, and it is not an optimisation.
             Engine::Sqlite => sqlite::run_ddl(self, stmts, cancel).await,
             Engine::MySql => mysql::run_ddl(self, database, stmts, cancel, fail).await,
-            // No plan reaches here from the app (`ddl::supports_change`); the
-            // arm is the backstop that says so.
-            Engine::MsSql => mssql::run_ddl(self, database, stmts, cancel).await,
+            // One transaction around the plan, as on PostgreSQL.
+            Engine::MsSql => mssql::run_ddl(self, database, stmts, true, cancel).await,
+        }
+    }
+
+    /// Run a generated DDL plan against `database` **a statement at a time,
+    /// with no transaction around it** — for the plan that cannot run inside
+    /// one, which `ddl::ChangeSet::runs_whole` answers off the changes.
+    ///
+    /// SQL Server refuses every `CREATE`, `ALTER` and `DROP` of a natively
+    /// compiled module inside a user transaction (Msg 12331), so a plan
+    /// touching one, wrapped as [`Db::run_ddl`] wraps every plan, could never
+    /// be applied. Here each statement commits as it runs and a failure reports
+    /// how many are already in effect ([`DdlError::applied`]), as MySQL's
+    /// plans always do — which is what the preview says before Apply.
+    ///
+    /// Only SQL Server has such a plan. MySQL's runner is already this one;
+    /// PostgreSQL's and SQLite's keep their transaction, which is strictly
+    /// more than a caller asking for this is owed.
+    pub async fn run_ddl_piecewise(
+        &self,
+        database: &str,
+        stmts: &[String],
+        cancel: CancellationToken,
+    ) -> Result<(), DdlError> {
+        if stmts.is_empty() {
+            return Ok(());
+        }
+        match self.engine {
+            Engine::MsSql => mssql::run_ddl(self, database, stmts, false, cancel).await,
+            Engine::Postgres | Engine::Sqlite | Engine::MySql => {
+                self.run_ddl(database, stmts, cancel).await
+            }
         }
     }
 

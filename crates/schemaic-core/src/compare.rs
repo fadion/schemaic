@@ -1321,6 +1321,15 @@ impl SchemaPlan {
         }
     }
 
+    /// Does the plan run **whole or not at all**? Every set's answer
+    /// ([`ChangeSet::runs_whole`]), since the plan is one run: one natively
+    /// compiled module in it takes the whole plan out of the transaction.
+    pub fn runs_whole(&self) -> bool {
+        ddl::ddl_is_transactional(self.dialect)
+            && ddl::ddl_rolls_back_as_a_whole(self.dialect)
+            && self.sets.iter().all(ChangeSet::runs_whole)
+    }
+
     /// Every destructive consequence, in plan order, **each named for the
     /// object it happens to**.
     ///

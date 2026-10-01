@@ -244,6 +244,7 @@ pub(crate) fn preview_of(
         // caller that had to remember to say is a caller that will one day
         // forget.
         dialect: cs.dialect,
+        whole: cs.runs_whole(),
     }
 }
 
@@ -321,6 +322,7 @@ pub(crate) fn preview_of_plan(
         script: plan.export_script(),
         read_only,
         dialect: plan.dialect,
+        whole: plan.runs_whole(),
     }
 }
 
@@ -779,6 +781,7 @@ fn apply(d: DdlUi, conn: ConnUi, run_ddl: DdlFn) {
             database: p.database.clone(),
             scope: p.scope,
             statements: p.statements.clone(),
+            whole: p.whole,
         },
         Rc::new(move |res| {
             // The modal was closed and reopened on something else while this ran
@@ -847,8 +850,13 @@ pub(crate) fn preview_title(connection: &str, p: &DdlPreview) -> String {
     }
 }
 
-/// May an apply in flight be stopped — from the preview's dialect, or from
-/// there being no preview.
+/// May an apply in flight be stopped — from the preview's plan, or from there
+/// being no preview.
+///
+/// **The plan's answer, not only its engine's** ([`DdlPreview::whole`]): a SQL
+/// Server plan touching a natively compiled module runs a statement at a time,
+/// so a Stop there would orphan the report of what already stuck, exactly as
+/// on MySQL.
 ///
 /// **`None` answers for itself.** The engine is what the *capability* is read
 /// off, so with nothing open there is no engine to ask, and the honest answer is
@@ -858,8 +866,8 @@ pub(crate) fn preview_title(connection: &str, p: &DdlPreview) -> String {
 /// is exactly the refinement `ddl_rolls_back_as_a_whole` exists to absorb, and
 /// the day it lands the absent case would have started reporting "cancellable"
 /// with nothing in the diff naming this modal.
-fn exit_cancellable(dialect: Option<SqlDialect>) -> bool {
-    dialect.is_some_and(schemaic_core::ddl::ddl_rolls_back_as_a_whole)
+fn exit_cancellable(p: Option<&DdlPreview>) -> bool {
+    p.is_some_and(|p| schemaic_core::ddl::ddl_rolls_back_as_a_whole(p.dialect) && p.whole)
 }
 
 /// What a **backdrop click** does — never [`exit_action`]'s `Cancel`.
@@ -917,8 +925,7 @@ pub(crate) fn ddl_preview_overlay(
     // no-preview case would start reporting "cancellable" with nothing in the
     // diff naming this modal. A constant in place of a capability is the rule's
     // second clause, and it leaves no comparison to grep for.
-    let cancellable =
-        move || exit_cancellable(d.preview.with_untracked(|p| p.as_ref().map(|p| p.dialect)));
+    let cancellable = move || d.preview.with_untracked(|p| exit_cancellable(p.as_ref()));
     let cancel_apply = ddl_cancel.clone();
     // An `Rc` rather than a bare closure: it now holds a cancel action, so it is
     // no longer `Copy` and the three exits share one.
@@ -1154,9 +1161,10 @@ pub(crate) fn ddl_preview_overlay(
                     // follows. While a *stoppable* apply runs it reads Stop, in
                     // Danger; where the engine cannot roll the plan back it
                     // stays disabled, because there is nothing to stop and the
-                    // half-applied report would have nowhere to go.
-                    let stoppable =
-                        busy && schemaic_core::ddl::ddl_rolls_back_as_a_whole(p.dialect);
+                    // half-applied report would have nowhere to go. The plan's
+                    // answer, through the exit's own predicate, so the word on
+                    // the button and what pressing it does cannot disagree.
+                    let stoppable = busy && exit_cancellable(Some(&p));
                     h_stack((
                         // "Back" only when there's somewhere to go back *to*. A
                         // context-menu shortcut opens this modal with nothing
@@ -1448,12 +1456,24 @@ mod tests {
     #[test]
     fn an_exit_with_no_preview_is_not_cancellable_on_anyones_behalf() {
         assert!(!super::exit_cancellable(None));
-        for dialect in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite] {
+        for dialect in [
+            SqlDialect::MySql,
+            SqlDialect::Postgres,
+            SqlDialect::Sqlite,
+            SqlDialect::MsSql,
+        ] {
+            let mut p = plan(7, false);
+            p.dialect = dialect;
+            p.whole = true;
             assert_eq!(
-                super::exit_cancellable(Some(dialect)),
+                super::exit_cancellable(Some(&p)),
                 schemaic_core::ddl::ddl_rolls_back_as_a_whole(dialect),
                 "a preview that is open reads the capability off its own engine ({dialect:?})"
             );
+            // And off its own plan: one that runs a statement at a time has
+            // nothing a Stop could roll back.
+            p.whole = false;
+            assert!(!super::exit_cancellable(Some(&p)), "{dialect:?}");
         }
         // And the outcome the guard produces from it: nothing is applying, so
         // the exit closes either way — which is why the line above is the check
@@ -1461,6 +1481,53 @@ mod tests {
         assert_eq!(
             super::exit_action(false, super::exit_cancellable(None)),
             super::ExitAction::Close
+        );
+    }
+
+    /// **A SQL Server plan touching a natively compiled module takes the
+    /// piecewise runner and offers no Stop** — read off the change set by
+    /// `preview_of` and handed to the request by `apply`, so neither the app
+    /// nor the footer re-derives it. Wrapped in a transaction as every other
+    /// plan there, SQL Server refused it outright (Msg 12331).
+    #[test]
+    fn a_natively_compiled_module_s_plan_runs_piecewise_and_cannot_be_stopped() {
+        use schemaic_core::schema::{RoutineInfo, RoutineKind, TsqlRoutineOption as O};
+        let mut r = RoutineInfo {
+            name: "np".into(),
+            schema: Some("dbo".into()),
+            kind: RoutineKind::Procedure,
+            body: "BEGIN ATOMIC WITH (LANGUAGE = N'us_english') SELECT 1 END".into(),
+            ..Default::default()
+        };
+        let plain = preview_of(
+            7,
+            "db",
+            "np",
+            &schemaic_core::ddl::drop_routine(&r, SqlDialect::MsSql),
+            false,
+        );
+        assert!(plain.whole && super::exit_cancellable(Some(&plain)));
+        r.tsql.options = vec![O::NativeCompilation, O::SchemaBinding];
+        let native = preview_of(
+            7,
+            "db",
+            "np",
+            &schemaic_core::ddl::drop_routine(&r, SqlDialect::MsSql),
+            false,
+        );
+        assert!(!native.whole);
+        assert!(!super::exit_cancellable(Some(&native)));
+        assert_eq!(
+            crate::widgets::exit_action(true, super::exit_cancellable(Some(&native))),
+            super::ExitAction::Ignore
+        );
+        assert!(
+            native
+                .destructive
+                .iter()
+                .any(|r| r.contains("one statement at a time")),
+            "{:?}",
+            native.destructive
         );
     }
 

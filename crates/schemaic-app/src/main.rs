@@ -9237,7 +9237,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let ddl_token: Rc<RefCell<Option<CancellationToken>>> = Rc::new(RefCell::new(None));
 
     // Fire the apply's token. The *decision* whether an exit may reach this is
-    // `ddl::ddl_rolls_back_as_a_whole`, asked in the modal; this only does it.
+    // `ddl::ddl_rolls_back_as_a_whole` and the plan's own `ChangeSet::runs_whole`,
+    // asked in the modal; this only does it.
     let ddl_cancel: Rc<dyn Fn()> = {
         let ddl_token = ddl_token.clone();
         Rc::new(move || {
@@ -9340,6 +9341,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         // Owned copies: the plan crosses onto a runtime worker,
                         // and the `Rc` holding it can't.
                         let (database, statements) = (req.database.clone(), req.statements.clone());
+                        let whole = req.whole;
                         handle.spawn(async move {
                             let out = match scope {
                                 // The database named here is what the run must
@@ -9350,8 +9352,14 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                     let avoid = Some(database.as_str()).filter(|d| !d.is_empty());
                                     db.run_server_ddl(avoid, &statements, token).await
                                 }
-                                schemaic_ui::DdlScope::Database => {
+                                // Read off the plan (`ChangeSet::runs_whole`):
+                                // SQL Server refuses a natively compiled
+                                // module's DDL inside a transaction.
+                                schemaic_ui::DdlScope::Database if whole => {
                                     db.run_ddl(&database, &statements, token).await
+                                }
+                                schemaic_ui::DdlScope::Database => {
+                                    db.run_ddl_piecewise(&database, &statements, token).await
                                 }
                             };
                             let changed = schemaic_db::ddl_changed_schema(&out);

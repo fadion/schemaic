@@ -3063,23 +3063,36 @@ pub(crate) async fn import_rows(
 /// server acknowledged — `commit_writes`' rule, for its reason: on a stream at
 /// an unknown point a `ROLLBACK` can read another request's answer as its own.
 /// Unacknowledged, the connection's close is what rolls the plan back.
+///
+/// **`whole: false` runs no transaction at all** — [`crate::Db::run_ddl_piecewise`],
+/// for the plan SQL Server refuses inside one: any `CREATE`, `ALTER` or `DROP`
+/// of a natively compiled module is Msg 12331 there. Each statement then
+/// commits as it runs, so a failure reports what is already in effect
+/// (`ddl::applied_count`), as MySQL's runner does, and nothing is rolled back.
 pub(crate) async fn run_ddl(
     db: &Db,
     database: &str,
     stmts: &[String],
+    whole: bool,
     cancel: CancellationToken,
 ) -> Result<(), crate::DdlError> {
     let fail = |at: usize, message: String| crate::DdlError {
         message,
         at,
-        applied: 0,
+        applied: if whole {
+            0
+        } else {
+            schemaic_core::ddl::applied_count(stmts, at, MS)
+        },
     };
     let mut client = connect(db, Some(database))
         .await
         .map_err(|e| fail(0, err_text(e)))?;
-    drain(&mut client, "BEGIN TRANSACTION")
-        .await
-        .map_err(|e| fail(0, err_text(e)))?;
+    if whole {
+        drain(&mut client, "BEGIN TRANSACTION")
+            .await
+            .map_err(|e| fail(0, err_text(e)))?;
+    }
     // Best-effort, as on the other engines: a plan that waits behind another
     // session's lock gives up rather than hanging the modal.
     let _ = drain(&mut client, &crate::lock_wait_sql(crate::Engine::MsSql)).await;
@@ -3094,16 +3107,21 @@ pub(crate) async fn run_ddl(
         match step {
             Some(Ok(())) => {}
             Some(Err(e)) => {
-                let _ = rollback(&mut client).await;
+                if whole {
+                    let _ = rollback(&mut client).await;
+                }
                 return Err(fail(i, err_text(e)));
             }
             None => {
-                if attention(&mut client).await {
+                if attention(&mut client).await && whole {
                     let _ = rollback(&mut client).await;
                 }
                 return Err(fail(i, "cancelled".to_string()));
             }
         }
+    }
+    if !whole {
+        return Ok(());
     }
     if let Err(e) = drain(&mut client, "COMMIT TRANSACTION").await {
         let _ = rollback(&mut client).await;
