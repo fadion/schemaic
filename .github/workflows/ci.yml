@@ -256,7 +256,7 @@ jobs:
       # refuses in CI (`endpoint::engines_var`), since a leg it leaves out
       # reports as a pass having asserted nothing.
       - name: Test (live, SQL Server 2025)
-        run: cargo test -p schemaic-db --features live-tests --test live -- mssql::
+        run: "cargo test -p schemaic-db --features live-tests --test live -- mssql::"
         env:
           SCHEMAIC_IT_MSSQL_PORT: "1434"
           SCHEMAIC_IT_MSSQL_USER: sa
