@@ -3616,10 +3616,19 @@ existing prose was left alone.
     `sequences`/`domains` because those have PostgreSQL's emitters, editor and compare behind them
     — a SQL Server sequence there was scripted with `OWNED BY` and offered an editor that applies
     nothing — and no surface but the dump reads this list. The dump writes them in the types
-    section in the order one can name another (collections, alias types, sequences, synonyms),
-    drops them after the routines where it drops up front, and moves each sequence's counter on to
-    the source's through `sp_sequence_get_range` beside its `CREATE`, since `ALTER SEQUENCE …
-    RESTART WITH` rewrites `start_value` (measured) and the rows carry their own values. **One
+    section in the order one can name another (collections, alias types, sequences, synonyms) and
+    moves each sequence's counter on to the source's through `sp_sequence_get_range` beside its
+    `CREATE`, since `ALTER SEQUENCE … RESTART WITH` rewrites `start_value` (measured) and the rows
+    carry their own values. **Only an object a chosen table names, in an exported namespace, and
+    not a sequence is replaced on a replay** — dropped after the routines where the file drops up
+    front and created plainly. Everything else is created under `IF … IS NULL EXEC(…)` with any
+    counter move inside the same `EXEC`, and never dropped: every object in the namespace used to
+    be, so replaying an older one-table dump rewound a sequence other tables draw from and their
+    next insert took a key already used (Msg 2627, measured), and one an unexported table's
+    default names refused its drop (Msg 3729). A sequence's position is state no script restates,
+    so it is left where it stands even when a chosen table names it
+    (`a_replay_never_drops_a_sequence_or_an_object_its_tables_do_not_name`; live,
+    `a_replay_leaves_a_sequence_where_it_stands`). **One
     outside the export's namespaces that a chosen table names is carried too** — WideWorldImporters
     keeps every key's sequence in a schema with no table in it, so the namespace rule alone left
     them all out — but it is not the file's to own: its schema is made if missing, it is created

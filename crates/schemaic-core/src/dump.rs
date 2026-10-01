@@ -1932,26 +1932,41 @@ pub fn plan(
                 if at != rank {
                     continue;
                 }
-                // Owned — in a namespace of the export — or only needed.
-                let owned = namespaces.contains(&o.schema);
-                if !owned && !carried_outside.iter().any(|c| std::ptr::eq(*c, o)) {
+                // In a namespace of the export, or only needed.
+                let in_namespace = namespaces.contains(&o.schema);
+                if !in_namespace && !carried_outside.iter().any(|c| std::ptr::eq(*c, o)) {
                     continue;
                 }
+                // **Replaced on a replay only where the file owns it and a
+                // script restates it whole**: in a namespace of the export,
+                // named by a chosen table, and not a sequence. Every object in
+                // the namespace used to be dropped and recreated, so replaying
+                // an older one-table dump rewound a sequence other tables draw
+                // from — their next insert took a key already used (Msg 2627,
+                // measured) — and one an unexported table's default names
+                // refused its drop (Msg 3729). A sequence's position is state
+                // no script carries; everything else is created only where it
+                // is missing and left standing.
+                let dropped = up_front
+                    && in_namespace
+                    && !matches!(o.kind, crate::schema::TsqlObjectKind::Sequence { .. })
+                    && tsql_named(schema, &order, &namespaces, o);
                 // A sequence's counter goes on from where the source's was —
-                // on one this file made: the rows carry their own values, so
-                // this need not wait for them, and moving on one a replay
-                // found already there would move it twice.
+                // on one this file made, inside the same `EXEC`: the rows
+                // carry their own values, so this need not wait for them, and
+                // moving on one a replay found already there would rewind or
+                // double it.
                 let restart = opts.data.then(|| o.restart_sql()).flatten();
-                let sql = match (owned, &restart) {
-                    (true, Some(r)) => format!("{}\n{r}", o.create_sql()),
-                    (true, None) => o.create_sql(),
-                    (false, r) => o.create_if_absent_sql(r.as_deref()),
+                let sql = if dropped {
+                    o.create_sql()
+                } else {
+                    o.create_if_absent_sql(restart.as_deref())
                 };
                 objects.push(Emitted {
                     name: o.name.clone(),
                     body: o.create_sql(),
                     sql,
-                    drop: (up_front && owned).then(|| o.drop_sql()),
+                    drop: dropped.then(|| o.drop_sql()),
                     function: false,
                 });
             }
@@ -4528,9 +4543,10 @@ mod tests {
     /// collections and synonyms its tables lean on.** None was read, so a
     /// table with a `NEXT VALUE FOR` default or an alias-typed column stopped
     /// the restore at its `CREATE TABLE` (Msg 208), and the header said
-    /// nothing. They go in before the tables, are dropped after them where the
-    /// file drops up front, and a sequence's counter is put back after the
-    /// rows; one in a namespace the export does not cover is named instead.
+    /// nothing. They go in before the tables, one a chosen table names is
+    /// dropped after them where the file drops up front (a sequence never is),
+    /// and a sequence's counter is moved on where the file made it; one in a
+    /// namespace the export does not cover is named instead.
     #[test]
     fn a_sql_server_dump_carries_the_objects_its_tables_name() {
         use crate::schema::{TsqlObject, TsqlObjectKind};
@@ -4618,18 +4634,17 @@ mod tests {
             "{file}"
         );
         let drop_table = pos(&file, "DROP TABLE IF EXISTS [dbo].[orders];");
-        assert!(
-            drop_table < pos(&file, "DROP SEQUENCE IF EXISTS [dbo].[seq];"),
-            "{file}"
-        );
+        // A sequence is never dropped — see
+        // `a_replay_never_drops_a_sequence_or_an_object_its_tables_do_not_name`.
+        assert!(!file.contains("DROP SEQUENCE"), "{file}");
         assert!(
             drop_table < pos(&file, "DROP TYPE IF EXISTS [dbo].[Phone];"),
             "{file}"
         );
         // Each counter goes on from where the source's was, beside its
-        // `CREATE` — inside the `EXEC` for the one only made where missing,
-        // so a replay that finds it there does not move it twice.
-        let moved = pos(&file, "@sequence_name = N'[dbo].[seq]', @range_size = 7,");
+        // `CREATE` — inside the `EXEC` that makes it only where missing, so a
+        // replay that finds it there does not move it again.
+        let moved = pos(&file, "@sequence_name = N''[dbo].[seq]'', @range_size = 7,");
         assert!(pos(&file, "CREATE SEQUENCE [dbo].[seq]") < moved, "{file}");
         assert!(moved < create_table, "{file}");
         let moved = pos(
@@ -4653,6 +4668,96 @@ mod tests {
         let header = text_of(&p);
         assert!(header.contains("Sequences.OrderID"), "{header}");
         assert!(!header.contains("CREATE SEQUENCE"), "{header}");
+    }
+
+    /// **A replay drops no sequence, and nothing the chosen tables do not
+    /// name.** Every object in an exported namespace was owned — dropped up
+    /// front and recreated — so replaying an older one-table dump rewound a
+    /// sequence other tables draw from, and their next insert took a key
+    /// already used (Msg 2627, measured); one an unexported table's default
+    /// names refused its drop instead (Msg 3729). A sequence carries state no
+    /// script restates, so it is only ever created where it is missing, its
+    /// counter moved on inside the same `EXEC`; an object no chosen table
+    /// names is created the same way and left standing.
+    #[test]
+    fn a_replay_never_drops_a_sequence_or_an_object_its_tables_do_not_name() {
+        use crate::schema::{TsqlObject, TsqlObjectKind};
+        let mut t = table("orders");
+        t.schema = Some("dbo".to_string());
+        t.columns[0].default = Some("NEXT VALUE FOR [dbo].[seq]".to_string());
+        t.columns.push(ColumnInfo {
+            name: "phone".to_string(),
+            type_name: "[dbo].[Phone]".to_string(),
+            ..Default::default()
+        });
+        let mut s = schema_of(vec![t]);
+        let seq = |name: &str| TsqlObject {
+            schema: Some("dbo".to_string()),
+            name: name.to_string(),
+            kind: TsqlObjectKind::Sequence {
+                data_type: "int".to_string(),
+                start: "1".to_string(),
+                increment: "1".to_string(),
+                min: "1".to_string(),
+                max: "1000".to_string(),
+                cycle: false,
+                cache: None,
+                last_used: Some("2".to_string()),
+            },
+        };
+        let alias = |name: &str| TsqlObject {
+            schema: Some("dbo".to_string()),
+            name: name.to_string(),
+            kind: TsqlObjectKind::AliasType {
+                base: "nvarchar(20)".to_string(),
+                nullable: true,
+            },
+        };
+        s.tsql_objects = vec![
+            seq("seq"),
+            seq("ctr"),
+            alias("Phone"),
+            alias("Other"),
+            TsqlObject {
+                schema: Some("dbo".to_string()),
+                name: "syn".to_string(),
+                kind: TsqlObjectKind::Synonym {
+                    target: vec!["dbo".to_string(), "orders".to_string()],
+                },
+            },
+        ];
+        let file = file_of(&plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::MsSql,
+        ));
+        assert!(!file.contains("DROP SEQUENCE"), "{file}");
+        assert!(!file.contains("DROP SYNONYM"), "{file}");
+        assert!(
+            !file.contains("DROP TYPE IF EXISTS [dbo].[Other]"),
+            "{file}"
+        );
+        // The one a chosen table names and a script restates whole is still
+        // the file's to replace.
+        let drop_phone = pos(&file, "DROP TYPE IF EXISTS [dbo].[Phone];");
+        assert!(pos(&file, "DROP TABLE IF EXISTS [dbo].[orders];") < drop_phone);
+        assert!(file.contains("\nCREATE TYPE [dbo].[Phone] FROM"), "{file}");
+        let create_table = pos(&file, "CREATE TABLE [dbo].[orders]");
+        for absent in [
+            "IF OBJECT_ID(N'[dbo].[seq]', N'SO') IS NULL EXEC(N'CREATE SEQUENCE",
+            "IF OBJECT_ID(N'[dbo].[ctr]', N'SO') IS NULL EXEC(N'CREATE SEQUENCE",
+            "IF TYPE_ID(N'[dbo].[Other]') IS NULL EXEC(N'CREATE TYPE",
+            "IF OBJECT_ID(N'[dbo].[syn]', N'SN') IS NULL EXEC(N'CREATE SYNONYM",
+        ] {
+            assert!(pos(&file, absent) < create_table, "{absent}\n{file}");
+        }
+        // The counter moves on only where the file made the sequence.
+        assert!(
+            file.contains("@sequence_name = N''[dbo].[seq]'', @range_size = 2,"),
+            "{file}"
+        );
     }
 
     /// **A SQL Server dump says how its dates are written, before any of them.**

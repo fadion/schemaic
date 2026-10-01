@@ -1222,6 +1222,43 @@ async fn a_replay_drops_a_schema_bound_function_between_its_tables() {
     }
 }
 
+/// **A replay rewinds no sequence.** One in an exported schema that no chosen
+/// table names — here drawn from by application code for a table left out of
+/// the export — was dropped and recreated at the dump's position, so the next
+/// key it handed out was one already used (Msg 2627).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replay_leaves_a_sequence_where_it_stands() {
+    use schemaic_core::dump::DumpOptions;
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("dump_seq").await;
+    s.exec("CREATE SCHEMA s2").await;
+    s.exec(
+        "CREATE SEQUENCE s2.ctr AS int START WITH 1; \
+         CREATE TABLE s2.invoices (id int PRIMARY KEY); \
+         INSERT s2.invoices VALUES (NEXT VALUE FOR s2.ctr), (NEXT VALUE FOR s2.ctr);",
+    )
+    .await;
+    s.exec("CREATE VIEW s2.v AS SELECT 1 AS one").await;
+    let file = Box::pin(dump_file_of(&s, DumpOptions::default(), |n| n == "s2.v")).await;
+    s.exec("INSERT s2.invoices VALUES (NEXT VALUE FOR s2.ctr), (NEXT VALUE FOR s2.ctr)")
+        .await;
+    let end = Box::pin(restore_file(&s, &file)).await;
+    assert!(
+        matches!(end, schemaic_core::script::ExecEnd::Done),
+        "{end:?}\n{file}"
+    );
+    s.exec("INSERT s2.invoices VALUES (NEXT VALUE FOR s2.ctr)")
+        .await;
+    assert_eq!(
+        s.scalar("SELECT CONCAT(COUNT(*), '|', MAX(id)) FROM s2.invoices")
+            .await,
+        "5|5",
+        "{file}"
+    );
+}
+
 /// Validation compiles without running: a missing table is reported by
 /// number, and a `DELETE` that checks clean deleted nothing.
 #[tokio::test(flavor = "multi_thread")]
