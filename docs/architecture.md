@@ -13147,12 +13147,22 @@ existing prose was left alone.
   only the rows under that lock — a database mid-create or mid-drop, which the next refresh shows.
   **A plain login still asks `HAS_DBACCESS`, which still waits** (to 7.8 s measured), so
   `listing_within` signs in first, bounded by the whole five seconds, then gives the
-  access-checked **query** `ACCESS_CHECK_BUDGET`, three seconds, and on a stall runs
-  `DATABASE_LISTING_UNFILTERED` on a fresh connection in what is left of the five. **The sign-in
+  access-checked **query** `access_check_share` of what is left, and on a stall runs
+  `DATABASE_LISTING_UNFILTERED` on a fresh connection in the rest of the five. **The sign-in
   is not in the share**: it was, and a connect of 3–5 s — a Microsoft Entra one through the Azure
   CLI — abandoned the filtered listing mid-connect and left the fallback's own connect the 2 s
   remaining, failing a listing the one 5 s bound before it answered
-  (`a_slow_connect_is_not_charged_to_the_access_check`). The cost of the fallback is a list that
+  (`a_slow_connect_is_not_charged_to_the_access_check`). **The fallback's sign-in is reserved
+  before the share is taken**, estimated as the connect just measured, plus
+  `FALLBACK_QUERY_ALLOWANCE` (500 ms) for its query; the check gets `ACCESS_CHECK_BUDGET`, three
+  seconds, or what is left beyond that reserve if less. The share was a flat `min(3 s, left)`,
+  and behind a 1.5 s connect — a remote server, a VPN, Azure SQL's redirect — a stalled check ran
+  to 4.5 s and left half a second for a second sign-in and a query, answering "timed out" where
+  the listing before the check had listed; the old test modelled a fallback with no sign-in at
+  all, so it never saw this (`a_stalled_access_check_leaves_the_fallback_its_own_sign_in`, connects
+  of 100 ms to 2 s, each fallback signing in for as long again). Where even the reserve does not
+  fit no fallback could finish, so the check is given all of what is left — the Entra sign-in
+  above is answered by the filtered query or not at all. The cost of the fallback is a list that
   may name a database this login cannot enter, a restricted or held one included, which then says
   so when it is expanded — the answer it had before the check existed. **Only a stall falls
   back**: an error from the sign-in or the filtered query is returned as the answer, since a

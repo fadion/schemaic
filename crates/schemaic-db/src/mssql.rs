@@ -311,11 +311,36 @@ const DATABASE_LISTING_UNFILTERED: &str = "SELECT name FROM sys.databases WITH (
      WHERE database_id > 4 AND state = 0 \
      ORDER BY name";
 
-/// The share of the listing's budget the access-checked **query** gets before
+/// The most of the listing's budget the access-checked **query** gets before
 /// [`listing_within`] falls back; the rest is the unfiltered query's, which
 /// needs a connection of its own (the stalled one is dropped mid-query). The
 /// sign-in is not in it: it bounds `HAS_DBACCESS`, which is all it is for.
 const ACCESS_CHECK_BUDGET: Duration = Duration::from_secs(3);
+
+/// What the fallback's unfiltered query is allowed beyond its sign-in — a
+/// `READPAST` scan of `sys.databases`, 0 ms locally, so this is round trips.
+const FALLBACK_QUERY_ALLOWANCE: Duration = Duration::from_millis(500);
+
+/// How long the access-checked query may run, given that the sign-in took
+/// `connected` and `left` remains of the budget.
+///
+/// **The fallback's own sign-in is reserved first**, estimated as the one just
+/// measured, with [`FALLBACK_QUERY_ALLOWANCE`] for its query. The check used
+/// to get `min(3 s, left)` and the fallback whatever was over, which behind a
+/// 1.5 s connect was half a second for a second sign-in and a query — so a
+/// stalled check answered "timed out" where the listing before it had listed,
+/// the arithmetic needing `2·connect + query < 2 s`. When even the reserve
+/// does not fit, no fallback could finish, and the check is given everything:
+/// a 3–5 s Entra sign-in (`a_slow_connect_is_not_charged_to_the_access_check`)
+/// is answered by the filtered query or not at all.
+fn access_check_share(connected: Duration, left: Duration) -> Duration {
+    let reserve = connected + FALLBACK_QUERY_ALLOWANCE;
+    if left > reserve {
+        ACCESS_CHECK_BUDGET.min(left - reserve)
+    } else {
+        left
+    }
+}
 
 /// List the user databases, sorted by name. Bounded by
 /// [`crate::PING_TIMEOUT`], as on every engine.
@@ -337,8 +362,9 @@ pub(crate) async fn fetch_databases(db: &Db) -> Result<Vec<String>, DbError> {
 }
 
 /// Sign in with `connect`, then run `filtered` on that connection for
-/// [`ACCESS_CHECK_BUDGET`]; if it has not answered by then, run `unfiltered`
-/// in what is left of `budget`. The whole is bounded by `budget`, and **the
+/// [`access_check_share`] — at most [`ACCESS_CHECK_BUDGET`], less what the
+/// fallback's own sign-in will need; if it has not answered by then, run
+/// `unfiltered` in what is left of `budget`. The whole is bounded by `budget`, and **the
 /// share times the query alone** — a sign-in that takes 3–5 s (Microsoft
 /// Entra's, through the Azure CLI) was charged to it, so the filtered listing
 /// was abandoned mid-connect and the fallback connected from scratch in what
@@ -364,7 +390,12 @@ where
     let client = tokio::time::timeout(budget, connect)
         .await
         .map_err(|_| timed_out())??;
-    match tokio::time::timeout(ACCESS_CHECK_BUDGET.min(left(start)), filtered(client)).await {
+    match tokio::time::timeout(
+        access_check_share(start.elapsed(), left(start)),
+        filtered(client),
+    )
+    .await
+    {
         Ok(answer) => answer,
         Err(_) => tokio::time::timeout(left(start), unfiltered())
             .await
@@ -5039,6 +5070,41 @@ mod tests {
         )
         .await;
         assert_eq!(got.unwrap(), names(&["a"]));
+    }
+
+    /// **The fallback signs in again, so its sign-in is reserved before the
+    /// access check is timed.** The check had `min(3 s, what is left)` and the
+    /// fallback the rest, which behind a 1.5 s connect — a remote server, a
+    /// VPN, Azure SQL's redirect — is half a second for a second sign-in and
+    /// a query: a stalled `HAS_DBACCESS` answered "timed out" where the
+    /// listing before it had listed. Modelled here as the real fallback is,
+    /// a connect as long as the first and then the query.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_access_check_leaves_the_fallback_its_own_sign_in() {
+        for connect_ms in [100, 1000, 1500, 2000] {
+            let start = tokio::time::Instant::now();
+            let got = listing_within(
+                crate::PING_TIMEOUT,
+                signed_in_after(connect_ms),
+                |()| after(60, Ok(names(&["filtered"]))),
+                || async move {
+                    signed_in_after(connect_ms).await?;
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    Ok(names(&["a", "b"]))
+                },
+            )
+            .await;
+            assert_eq!(
+                got.unwrap(),
+                names(&["a", "b"]),
+                "a {connect_ms} ms sign-in"
+            );
+            assert!(
+                start.elapsed() <= crate::PING_TIMEOUT,
+                "{:?}",
+                start.elapsed()
+            );
+        }
     }
 
     /// Both listings skip a database whose catalogue row is locked (`READPAST`)
