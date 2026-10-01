@@ -1958,6 +1958,32 @@ fn highlight_pick(sql: &str, lo: usize, hi: usize, highlight: RwSignal<Option<(u
     highlight.set(statement_has_neighbours(sql, lo, hi).then_some((lo, hi)));
 }
 
+/// Does Ctrl+Enter on `[lo, hi]` — [`schemaic_core::sql::run_current_range`]'s
+/// piece — open the run menu with that piece outlined, rather than just run?
+///
+/// When it has neighbours, as before; **and when the piece itself holds more
+/// than one statement**. A T-SQL batch scope makes everything from a `DECLARE`
+/// to the caret's statement one piece, and when that piece was the whole
+/// buffer a press aimed at the `SELECT` at its end ran the `DELETE` above it
+/// with nothing outlined. The menu and the outline answer this one question,
+/// as [`statement_has_neighbours`]' doc says they must.
+fn run_menu_wanted(sql: &str, lo: usize, hi: usize, dialect: SqlDialect) -> bool {
+    statement_has_neighbours(sql, lo, hi)
+        || schemaic_core::sql::holds_several_statements(&sql[lo..hi], dialect)
+}
+
+/// Outline what Run Current will run, when [`run_menu_wanted`] says there is a
+/// choice to show it for.
+fn highlight_run_pick(
+    sql: &str,
+    lo: usize,
+    hi: usize,
+    dialect: SqlDialect,
+    highlight: RwSignal<Option<(usize, usize)>>,
+) {
+    highlight.set(run_menu_wanted(sql, lo, hi, dialect).then_some((lo, hi)));
+}
+
 /// Per-line pixel boxes (x, y, w, h in `editor_area` coords) covering the picked
 /// statement's byte range `[lo, hi]`, for the DataGrip-style border. One box per
 /// line the statement touches, sized to that line's slice of the statement, so
@@ -2281,12 +2307,15 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         if run_menu.get().is_some() {
             if run_sel.get() == 0 {
                 let sql = query.get_untracked();
-                let (lo, hi) = statement_range(
+                let dia = dialect.get_untracked();
+                // What Run Current runs, which inside a T-SQL batch scope is
+                // shorter than the editor's statement.
+                let (lo, hi) = schemaic_core::sql::run_current_range(
                     &sql,
                     run_menu_offset.get_untracked(),
-                    dialect.get_untracked(),
+                    dia,
                 );
-                highlight_pick(&sql, lo, hi, highlight);
+                highlight_run_pick(&sql, lo, hi, dia, highlight);
             } else {
                 highlight.set(None);
             }
@@ -2823,15 +2852,19 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             let sql = query.get_untracked();
             editor_sig.with_untracked(|e| {
                 let offset = e.cursor.get_untracked().offset();
-                let (lo, hi) = statement_range(&sql, offset, dialect.get_untracked());
+                let dia = dialect.get_untracked();
+                // **What Run Current would run**, not the editor's statement:
+                // inside a T-SQL batch scope that is the scope's start through
+                // the caret's statement (`sql::run_current_range`).
+                let (lo, hi) = schemaic_core::sql::run_current_range(&sql, offset, dia);
                 // Multiple statements → highlight the one under the caret and open
                 // the Run Current / Run Everything menu at the caret. A lone
                 // statement just runs (no menu, no highlight).
-                // `statement_has_neighbours`, not a second spelling of it: the
-                // menu and the outline have to answer the same question, or one
-                // appears without the other.
-                if statement_has_neighbours(&sql, lo, hi) {
-                    highlight_pick(&sql, lo, hi, highlight);
+                // `run_menu_wanted`, not a second spelling of it: the menu and
+                // the outline have to answer the same question, or one appears
+                // without the other.
+                if run_menu_wanted(&sql, lo, hi, dia) {
+                    highlight_run_pick(&sql, lo, hi, dia, highlight);
                     run_menu_offset.set(offset);
                     run_sel.set(0);
                     let (_, below) = e.points_of_offset(offset, CursorAffinity::Backward);
@@ -6761,6 +6794,37 @@ mod geometry_tests {
         // recorded because it is a real consequence of the rule and not an
         // accident: the editor outlines the statement, and the menu opens.
         assert!(statement_has_neighbours("-- note\nSELECT 1", 8, 16));
+    }
+
+    /// **Ctrl+Enter shows what it is about to run whenever that is more than
+    /// one statement** — the composition of the key handler's range with its
+    /// menu gate. Inside a T-SQL batch scope the range Run Current takes is the
+    /// scope's start through the caret's statement; when that was the whole
+    /// buffer the gate saw no neighbours and the piece ran unshown, the
+    /// `DELETE` above a `SELECT` included.
+    #[test]
+    fn ctrl_enter_outlines_a_batch_scoped_piece_before_running_it() {
+        let ms = SqlDialect::MsSql;
+        let run_range = |sql: &str, needle: &str| {
+            schemaic_core::sql::run_current_range(sql, sql.find(needle).unwrap() + 1, ms)
+        };
+        // A write above the caret's `SELECT`, the piece the whole buffer.
+        let sql =
+            "DECLARE @id int = 1;\nDELETE FROM a WHERE id = @id;\nSELECT * FROM b WHERE id = @id;";
+        let (lo, hi) = run_range(sql, "SELECT");
+        assert_eq!((lo, hi), (0, sql.len()));
+        assert!(run_menu_wanted(sql, lo, hi, ms));
+        // A write below it is no longer run, and its presence opens the menu.
+        let sql =
+            "DECLARE @id int = 1;\nSELECT * FROM b WHERE id = @id;\nDELETE FROM a WHERE id = @id;";
+        let (lo, hi) = run_range(sql, "SELECT");
+        assert!(!sql[lo..hi].contains("DELETE"));
+        assert!(run_menu_wanted(sql, lo, hi, ms));
+        // A lone statement still just runs, on every engine.
+        let sql = "SELECT * FROM b";
+        let (lo, hi) = run_range(sql, "SELECT");
+        assert!(!run_menu_wanted(sql, lo, hi, ms));
+        assert!(!run_menu_wanted(sql, 0, sql.len(), SqlDialect::MySql));
     }
 
     /// The composition `cmdk_open_gate` could not see: it proves the four

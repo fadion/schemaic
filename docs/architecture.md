@@ -394,7 +394,18 @@ existing prose was left alone.
     that share nothing still go one by one. The editor's statement bounds and Run at the caret read
     the same scan, so the caret inside a block runs the whole block
     (`a_t_sql_batch_scope_is_never_cut_at_a_semicolon`, chunked as well; live,
-    `a_batch_scoped_script_runs_whole`). The missing-`WHERE` guards lose nothing by the larger
+    `a_batch_scoped_script_runs_whole`). **Run at the caret stops at the caret's statement**,
+    though: it took the scoped piece whole, so Ctrl+Enter on a `SELECT` below a `DECLARE` ran the
+    `DELETE` after it too, and when the piece was the whole buffer nothing outlined it.
+    `run_current_range` (which `executable_at` sends) cuts the piece again at the first `;` past the
+    caret that only `BatchScope::whole` held — `scan_bounds_with`'s `soft` list, never inside a
+    block nor before an `ELSE` — so the scope's start through the caret's statement runs, and the
+    statements below it do not. The editor's statement for completion and the AI actions stays the
+    whole piece, where the variable is declared. Ctrl+Enter opens the menu with that range outlined
+    whenever it has neighbours **or holds several statements** (`editor_pane::run_menu_wanted`), so a
+    write above the caret is shown before it runs
+    (`run_at_the_caret_stops_at_the_carets_statement_in_a_batch_scope`,
+    `ctrl_enter_outlines_a_batch_scoped_piece_before_running_it`). The missing-`WHERE` guards lose nothing by the larger
     piece, since `tsql_statements` (below) cuts at statement words and not at `;`. **`nested_block_comments` was a divergence the table did not have**:
     PostgreSQL nests `/* … */` and `skip_comment` ended every comment at its first `*/`, so a head
     after a nested comment was read from inside it — `/* a /* b */ c */ DELETE FROM t` ran its
@@ -25662,7 +25673,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   `core::script`'s streaming splitter (the script runner), and `executable_at` (Run Current, which
   was left behind by the first two and shipped a release sending `…END$$`). Anything that
   *executes* uses one of those three; anything that selects, highlights or measures keeps
-  `statement_range`. The other half of that
+  `statement_range` — save Run Current's own outline, which is `run_current_range`, the range
+  `executable_at` sends (shorter inside a T-SQL batch scope; see `BatchScope` above). The other half of that
   is `ddl::client_script` — what `ChangeSet::editor_script` and a routine's `Generate DDL` both go
   through — which asks `== MySql` before reaching for `DELIMITER $$` so a SQLite plan is never
   handed a directive the engine has never heard of, and **terminates every statement** on the way

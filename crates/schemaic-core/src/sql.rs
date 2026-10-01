@@ -1252,12 +1252,17 @@ pub fn executable_range(sql: &str, from: usize, bound: Bound, dialect: SqlDialec
 /// the full walk, and the boundaries produced before the stop are byte-for-byte
 /// the ones the full walk produces — this is the same lexer, cut short, not a
 /// second one.
-fn scan_bounds(
+///
+/// `soft`, when given, collects the `;`s **only the batch scope held** —
+/// [`BatchScope::whole`], outside any block and not before an `ELSE` — which
+/// are where Run at the caret may stop inside a piece ([`run_current_range`]).
+fn scan_bounds_with(
     sql: &str,
     dialect: SqlDialect,
     delim: &mut Vec<u8>,
     at_eof: bool,
     until: Option<usize>,
+    mut soft: Option<&mut Vec<usize>>,
 ) -> Vec<Bound> {
     let b = sql.as_bytes();
     let n = b.len();
@@ -1396,6 +1401,16 @@ fn scan_bounds(
             }
             if track_bodies {
                 if batch.holds() {
+                    if let Some(soft) = soft.as_deref_mut()
+                        && batch.depth == 0
+                        && !batch.begin_pending
+                        && !matches!(
+                            next_code_word(sql, i + delim.len(), dialect, at_eof),
+                            Lookahead::Word(w) if w.eq_ignore_ascii_case("ELSE")
+                        )
+                    {
+                        soft.push(i + delim.len());
+                    }
                     i += delim.len();
                     continue;
                 }
@@ -1435,6 +1450,18 @@ fn scan_bounds(
         i += 1;
     }
     bounds
+}
+
+/// [`scan_bounds_with`] with no interest in where the batch scope held a `;`
+/// — every caller but Run at the caret.
+fn scan_bounds(
+    sql: &str,
+    dialect: SqlDialect,
+    delim: &mut Vec<u8>,
+    at_eof: bool,
+    until: Option<usize>,
+) -> Vec<Bound> {
+    scan_bounds_with(sql, dialect, delim, at_eof, until, None)
 }
 
 /// What follows a point in the text, for [`scan_bounds`]' look past a `;`.
@@ -1531,10 +1558,21 @@ pub fn trim_range(sql: &str, lo: usize, hi: usize) -> (usize, usize) {
 /// that one has fifteen call sites and only this one may change behaviour. A
 /// range keeps its terminator because the editor selects and highlights with
 /// it; only the path that executes wants it off.
+///
+/// **And [`run_current_range`]'s piece, not [`statement_range`]'s**: inside a
+/// T-SQL batch scope it stops at the caret's own statement.
 pub fn executable_at(sql: &str, offset: usize, dialect: SqlDialect) -> Option<&str> {
+    let (lo, hi) = run_current_bounds(sql, offset, dialect);
+    executable_range(sql, lo, hi, dialect)
+}
+
+/// Where Run at the caret's piece starts, and the bound that ends it — see
+/// [`run_current_range`].
+fn run_current_bounds(sql: &str, offset: usize, dialect: SqlDialect) -> (usize, Bound) {
     let offset = offset.min(sql.len());
     let mut delim: Vec<u8> = vec![b';'];
-    let mut bounds = scan_bounds(sql, dialect, &mut delim, true, None);
+    let mut soft = Vec::new();
+    let mut bounds = scan_bounds_with(sql, dialect, &mut delim, true, None, Some(&mut soft));
     bounds.push(Bound {
         at: sql.len(),
         strip: 0,
@@ -1549,7 +1587,12 @@ pub fn executable_at(sql: &str, offset: usize, dialect: SqlDialect) -> Option<&s
     // final `;` is in a blank segment and means the statement before it.
     let (lo, hi) = trim_range(sql, bounds[k].at, bounds[k + 1].at);
     let k = if lo == hi && k > 0 { k - 1 } else { k };
-    executable_range(sql, bounds[k].at, bounds[k + 1], dialect)
+    let (lo, hi) = (bounds[k].at, bounds[k + 1]);
+    // The first `;` past the caret that only the batch scope held ends it.
+    match soft.iter().find(|&&s| s > offset && s > lo && s < hi.at) {
+        Some(&at) => (lo, Bound { at, strip: 0 }),
+        None => (lo, hi),
+    }
 }
 
 /// The trimmed byte range of the statement containing `offset`.
@@ -1589,6 +1632,28 @@ pub fn statement_range(sql: &str, offset: usize, dialect: SqlDialect) -> (usize,
         return trim_range(sql, bounds[k - 1], bounds[k]);
     }
     (lo, hi)
+}
+
+/// The trimmed byte range **Run at the caret runs** — the one the editor
+/// outlines before it does, and [`executable_at`]'s text.
+///
+/// [`statement_range`]'s, except inside a T-SQL batch scope. From a
+/// `DECLARE`, a `RETURN`, a `GOTO` or a label the rest of the `GO` batch is
+/// one piece ([`BatchScope::whole`]), which is right for Run Everything and a
+/// `.sql` run and was wrong here: Ctrl+Enter on a `SELECT` below a `DECLARE`
+/// ran every statement to the end of the batch, the `DELETE` after it
+/// included, and when the piece was the whole buffer nothing outlined it. So
+/// the piece is cut again at the first `;` past the caret that only the scope
+/// held — never inside a block, nor before an `ELSE` — and what runs is the
+/// scope's start through the caret's own statement: the variable it reads goes
+/// with it, the statements below it do not.
+///
+/// The editor's statement for everything else — completion, signature help,
+/// the AI actions — stays [`statement_range`]'s whole piece, which is where the
+/// variable a statement reads is declared.
+pub fn run_current_range(sql: &str, offset: usize, dialect: SqlDialect) -> (usize, usize) {
+    let (lo, hi) = run_current_bounds(sql, offset, dialect);
+    trim_range(sql, lo, hi.at)
 }
 
 /// Does `sql[lo..hi]` contain any actual SQL (not just whitespace + comments)?
@@ -5573,6 +5638,62 @@ mod tests {
         assert_eq!(
             super::executable_statements("BEGIN; SELECT 1; END;", SqlDialect::Postgres).len(),
             3
+        );
+    }
+
+    /// **Run at the caret runs up to the caret's statement, never past it.**
+    /// A `DECLARE` makes the rest of its batch one piece, and Run Current took
+    /// that piece whole: Ctrl+Enter on a `SELECT` below a `DECLARE` ran the
+    /// `DELETE` after it too. The piece is still cut where the batch scope
+    /// alone held a `;` — never inside a block or before an `ELSE` — so what
+    /// the caret's statement needs above it goes with it, and nothing below.
+    #[test]
+    fn run_at_the_caret_stops_at_the_carets_statement_in_a_batch_scope() {
+        let d = SqlDialect::MsSql;
+        fn at<'a>(sql: &'a str, needle: &str) -> &'a str {
+            let d = SqlDialect::MsSql;
+            let caret = sql.find(needle).unwrap() + 1;
+            let run = super::executable_at(sql, caret, d);
+            let (lo, hi) = super::run_current_range(sql, caret, d);
+            assert_eq!(run, Some(&sql[lo..hi]), "{sql}");
+            run.unwrap()
+        }
+        let sql = "DECLARE @id int = 42;\nSELECT * FROM orders WHERE customer = @id;\n\n\
+                   DELETE FROM orders WHERE customer = @id;";
+        assert_eq!(
+            at(sql, "SELECT"),
+            "DECLARE @id int = 42;\nSELECT * FROM orders WHERE customer = @id;"
+        );
+        assert_eq!(at(sql, "DECLARE"), "DECLARE @id int = 42;");
+        assert_eq!(at(sql, "DELETE"), sql);
+        // The editor's statement is still the whole piece: completion and
+        // signature help see the variable.
+        let caret = sql.find("SELECT").unwrap();
+        assert_eq!(super::statement_range(sql, caret, d), (0, sql.len()));
+        // A block and an `IF … ELSE` stay whole inside the scope.
+        let block = "DECLARE @i int = 0;\nWHILE @i < 2\nBEGIN\n  SET @i += 1;\n  PRINT @i;\nEND;\n\
+                     SELECT @i;";
+        assert_eq!(
+            at(block, "PRINT"),
+            &block[..block.find("END;").unwrap() + 4]
+        );
+        let branch = "DECLARE @x int = 1;\nIF @x = 1 SELECT 1;\nELSE SELECT 2;\nDELETE FROM t;";
+        assert_eq!(
+            at(branch, "SELECT 1"),
+            "DECLARE @x int = 1;\nIF @x = 1 SELECT 1;\nELSE SELECT 2;"
+        );
+        // A caret in the blank after the last statement still means it.
+        let tail = "DECLARE @x int = 1;\nSELECT @x;\n\n";
+        assert_eq!(
+            super::executable_at(tail, tail.len(), d),
+            Some("DECLARE @x int = 1;\nSELECT @x;")
+        );
+        // Outside a batch scope, and on the other engines, nothing changes.
+        let plain = "SELECT 1; DELETE FROM t;";
+        assert_eq!(at(plain, "SELECT"), "SELECT 1;");
+        assert_eq!(
+            super::run_current_range(sql, 30, SqlDialect::MySql),
+            super::statement_range(sql, 30, SqlDialect::MySql)
         );
     }
 
