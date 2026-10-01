@@ -7943,7 +7943,14 @@ existing prose was left alone.
     runs to the first closer that is not doubled, `;` and spaces included, so a SQL Server string
     that fails to parse shows none of `password={p;w=d}` or `Password="p;w=d"` in the not-imported
     list — split at each `;`, it showed `w=d}` (`a_braced_password_is_redacted_whole`,
-    `a_quoted_password_is_redacted_whole`). Every other value is read again by `redact_text`, so a
+    `a_quoted_password_is_redacted_whole`). **A server value's userinfo is hidden as a URL's is**:
+    the importer refuses a host still holding an `@` (`UrlError::UserinfoInHost`) because what is
+    in front of it is most likely a password, and `Server=sa:Hunter2@db` is no `Pwd=` and no URL,
+    so the refused entry's own text showed it. A value under any key `is_server_key` names — the
+    set `parse_connection_string` reads the server from, asked by both — or a SQL Server URL's
+    `serverName` goes through `redact_server_userinfo` first, which keeps the login up to the first
+    `:` and hides the rest up to the last `@` (`a_server_values_userinfo_is_hidden_like_a_urls`).
+    Every other value is read again by `redact_text`, so a
     URL or a `.env`-quoted string inside one is still found, to a nesting of `REDACT_DEPTH` (three):
     a bound, so that no input's nesting makes the redaction anything but linear. What is not a
     keyword string goes to `redact_url` — its userinfo through `split_userinfo` (below), where one

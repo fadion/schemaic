@@ -567,6 +567,11 @@ fn redact_keywords(list: &str, quotes: bool, depth: u8) -> String {
         out.push_str(&list[at..prop.raw.start]);
         if is_password_key(&prop.key) {
             out.push('…');
+        } else if is_server_key(&prop.key) || normalize_key(&prop.key) == "servername" {
+            // A server holding an `@` is refused for the userinfo in it, which
+            // is then hidden here as a URL's is.
+            let value = redact_server_userinfo(&list[prop.raw.clone()]);
+            out.push_str(&redact_text(&value, depth, false));
         } else {
             out.push_str(&redact_text(&list[prop.raw.clone()], depth, false));
         }
@@ -796,6 +801,36 @@ fn closing_quote(s: &str, closer: u8) -> Option<usize> {
 /// reads a password out of.
 fn is_password_key(k: &str) -> bool {
     matches!(normalize_key(k).as_str(), "password" | "pwd" | "pass")
+}
+
+/// Does this keyword name the server? The spellings [`parse_connection_string`]
+/// reads the server out of — and, for [`redacted`], a SQL Server URL's
+/// `serverName` property, which [`parse_mssql_url`] reads it from.
+fn is_server_key(k: &str) -> bool {
+    matches!(
+        normalize_key(k).as_str(),
+        "server" | "datasource" | "address" | "addr" | "networkaddress"
+    )
+}
+
+/// `value` — a server as written, quotes and all — with what is in front of
+/// its last `@` hidden as a URL's userinfo is ([`redact_url`]): the login up
+/// to the first `:` kept, the rest replaced by `…`, or all of it where there
+/// is no `:`. The importer refuses a host still holding an `@`
+/// ([`UrlError::UserinfoInHost`]) because that part is most likely a password,
+/// so the refused entry's own text must not show it either.
+fn redact_server_userinfo(value: &str) -> String {
+    let Some(at) = value.rfind('@') else {
+        return value.to_string();
+    };
+    let (head, host) = value.split_at(at);
+    // A quote the value opens with is kept, so the list reads as written.
+    let lead = head.len() - head.trim_start_matches(['"', '\'', '{', ' ']).len();
+    let (open, userinfo) = head.split_at(lead);
+    match userinfo.split_once(':') {
+        Some((user, _)) => format!("{open}{user}:…{host}"),
+        None => format!("{open}…{host}"),
+    }
 }
 
 /// One source file, already read. The app does the finding and the reading; this
@@ -1284,7 +1319,8 @@ fn parse_connection_string(s: &str) -> Result<(Connection, Vec<ImportNote>), Url
             continue;
         }
         match normalize_key(&k).as_str() {
-            "server" | "datasource" | "address" | "addr" | "networkaddress" => set(&mut server, &v),
+            // [`is_server_key`], which [`redacted`] asks too.
+            key if is_server_key(key) => set(&mut server, &v),
             "database" | "initialcatalog" => set(&mut c.database, &v),
             "userid" | "uid" | "user" | "username" => set(&mut c.user, &v),
             "password" | "pwd" => set(&mut c.password, &v),
@@ -4546,6 +4582,72 @@ mod tests {
         ] {
             assert_eq!(redacted(name), name);
         }
+    }
+
+    /// **A server value's userinfo is hidden as a URL's is.** The importer
+    /// refuses a host still holding an `@` (`UrlError::UserinfoInHost`) because
+    /// what is in front of it is most likely a password — and the refused
+    /// entry's own text then went to the not-imported list with that password
+    /// in it: `Server=sa:Hunter2@db` is no `Pwd=` and no URL, so no grammar
+    /// claimed it. Every key the importer reads a server from is asked.
+    #[test]
+    fn a_server_values_userinfo_is_hidden_like_a_urls() {
+        for (raw, leaks, kept) in [
+            (
+                "Server=sa:Hunter2@db.example.com;Database=d",
+                &["Hunter2"][..],
+                &["Server=sa:…@db.example.com", "Database=d"][..],
+            ),
+            (
+                "Data Source=tcp:sa:Hunter2@db,1433;Initial Catalog=d",
+                &["Hunter2"],
+                &["@db,1433", "Initial Catalog=d"],
+            ),
+            (
+                "Address=\"u:p;w@d@h\";Database=d",
+                &["p;w", "w@d"],
+                &["@h\"", "Database=d"],
+            ),
+            ("Addr=sa:Hunter2@h;Uid=u", &["Hunter2"], &["@h", "Uid=u"]),
+            (
+                "Network Address=a:Hunter2@h;Database=d",
+                &["Hunter2"],
+                &["@h"],
+            ),
+            // The `.env` wrapper the importer strips before reading.
+            (
+                "DB=\"Server=sa:Hunter2@h;Database=d\"",
+                &["Hunter2"],
+                &["@h", "Database=d"],
+            ),
+            // A SQL Server URL's `serverName` property is read as its server.
+            (
+                "jdbc:sqlserver://;serverName=sa:Hunter2@h;databaseName=d",
+                &["Hunter2"],
+                &["@h", "databaseName=d"],
+            ),
+        ] {
+            let out = redacted(raw);
+            for leak in leaks {
+                assert!(!out.contains(leak), "{raw} -> {out} shows {leak}");
+            }
+            for keep in kept {
+                assert!(out.contains(keep), "{raw} -> {out} lost {keep}");
+            }
+        }
+        // And through `scan`, where the list is built — the refusal is the
+        // importer's own.
+        let scan = parse_url_scan("Server=sa:Hunter2@db.example.com;Database=d");
+        assert_eq!(scan.skipped.len(), 1, "the entry is refused");
+        let shown = format!(
+            "{} {}",
+            scan.skipped[0].name,
+            scan.skipped[0].reason.message()
+        );
+        assert!(!shown.contains("Hunter2"), "{shown}");
+        // An `@` in a user name is not a server's, and stays as written.
+        let name = "Server=h;User Id=alice@corp.com;Database=d";
+        assert_eq!(redacted(name), name);
     }
 
     /// **The reason is rendered beside the name and was never redacted.**
