@@ -5118,7 +5118,7 @@ fn located_table_refs(sql: &str, lo: usize, hi: usize, dialect: SqlDialect) -> V
             continue;
         }
         // A cursor loop's `FETCH NEXT FROM c` names a cursor.
-        if is_from && fetch_precedes(&toks, i) {
+        if is_from && fetch_precedes(&toks, i, dialect) {
             i += 1;
             continue;
         }
@@ -7123,7 +7123,15 @@ fn is_implicit_alias(word: &str, dialect: SqlDialect) -> bool {
 /// loop drew ``Table `c` not found``. Walks back over at most the direction
 /// and its count, so `SELECT first FROM t` — a column named `first` — is
 /// still a table list.
-fn fetch_precedes(toks: &[Token], i: usize) -> bool {
+///
+/// **The verb is the dialect's ([`cursor_verbs`]), and a column is not one.**
+/// `FETCH`/`MOVE` were taken on every engine, so `SELECT id, move FROM
+/// nosuchtable` — `move` a non-reserved word on PostgreSQL and MySQL, and an
+/// ordinary column name — and SQLite's `SELECT fetch FROM …` skipped the table
+/// list. A word after a `.` is a qualified column (`e.move`, and `e.fetch`,
+/// since any keyword may follow a qualifier), and a verb the dialect does not
+/// reserve can be a column bare, so it is one only where a statement begins.
+fn fetch_precedes(toks: &[Token], i: usize, dialect: SqlDialect) -> bool {
     let word = |j: usize| match toks.get(j) {
         Some(Token {
             kind: TkKind::Word(w),
@@ -7133,8 +7141,15 @@ fn fetch_precedes(toks: &[Token], i: usize) -> bool {
         _ => None,
     };
     let fetch = |j: Option<usize>| {
-        j.and_then(word)
-            .is_some_and(|w| matches!(w.as_str(), "FETCH" | "MOVE"))
+        let Some((j, w)) = j.and_then(|j| word(j).map(|w| (j, w))) else {
+            return false;
+        };
+        let qualified = j
+            .checked_sub(1)
+            .is_some_and(|p| matches!(toks[p].kind, TkKind::Dot));
+        cursor_verbs(dialect).contains(&w.as_str())
+            && !qualified
+            && (is_reserved_word(&w, dialect) || j == 0 || toks[j].after_semicolon)
     };
     let direction = |w: &str| {
         matches!(
@@ -7158,6 +7173,19 @@ fn fetch_precedes(toks: &[Token], i: usize) -> bool {
         || (w1.as_deref().is_some_and(direction) && fetch(p2))
         // `ABSOLUTE @n`, `FORWARD ALL`: a direction and its count.
         || (w2.as_deref().is_some_and(direction) && w1.is_some() && fetch(p3))
+}
+
+/// The statements that read a **cursor** `FROM` a name, upper-cased:
+/// `FETCH` wherever the engine has cursors (T-SQL, a MySQL routine,
+/// PostgreSQL), and PostgreSQL's `MOVE`, which repositions one without
+/// reading it. SQLite has no cursors, so a `FROM` there always begins a table
+/// list.
+fn cursor_verbs(dialect: SqlDialect) -> &'static [&'static str] {
+    match dialect {
+        SqlDialect::Postgres => &["FETCH", "MOVE"],
+        SqlDialect::MySql | SqlDialect::MsSql => &["FETCH"],
+        SqlDialect::Sqlite => &[],
+    }
 }
 
 /// Is the `AS` at `toks[i]` a **cast's** `AS` rather than an alias's?
@@ -7598,7 +7626,7 @@ fn alias_checks(sql: &str, lo: usize, hi: usize, dialect: SqlDialect, out: &mut 
         }
         let is_from = kw.eq_ignore_ascii_case("FROM");
         // A cursor's name is not a table's — see `fetch_precedes`.
-        if is_from && fetch_precedes(&toks, i) {
+        if is_from && fetch_precedes(&toks, i, dialect) {
             i += 1;
             continue;
         }
@@ -14820,6 +14848,56 @@ mod tests {
             messages("SELECT id FROM hr.dbo.nosuch;"),
             ["Table `nosuch` not found in `hr.dbo`"]
         );
+    }
+
+    /// The text under each of `sql`'s ``Table `…` not found`` diagnostics,
+    /// in order.
+    fn missing_tables(sql: &str, dialect: SqlDialect) -> Vec<String> {
+        diag_d(sql, dialect)
+            .into_iter()
+            .filter(|x| x.message.starts_with("Table `"))
+            .map(|x| sql[x.range.0..x.range.1].to_string())
+            .collect()
+    }
+
+    /// **A column named `move` is not a cursor.** `fetch_precedes` took a
+    /// `FETCH` or `MOVE` right before `FROM` for a cursor statement on every
+    /// engine, so `SELECT id, move FROM nosuchtable` — `move` a non-reserved
+    /// word on PostgreSQL and MySQL, and an ordinary column name — never had
+    /// its table checked, nor did SQLite's `fetch`, an engine with no cursors.
+    /// Only PostgreSQL has `MOVE`, and a non-reserved verb is one only at a
+    /// statement's start; a qualified `e.move` is a column everywhere.
+    #[test]
+    fn a_column_named_move_or_fetch_is_not_a_cursor() {
+        for (sql, dialect) in [
+            ("SELECT id, move FROM nosuchtable;", SqlDialect::Postgres),
+            ("SELECT id, move FROM nosuchtable;", SqlDialect::MySql),
+            ("SELECT e.move FROM nosuchtable e;", SqlDialect::Postgres),
+            ("SELECT e.fetch FROM nosuchtable e;", SqlDialect::Postgres),
+            ("SELECT id, fetch FROM nosuchtable;", SqlDialect::Sqlite),
+            ("SELECT move FROM nosuchtable;", SqlDialect::MsSql),
+        ] {
+            assert_eq!(
+                missing_tables(sql, dialect),
+                ["nosuchtable"],
+                "{sql} on {dialect:?}"
+            );
+        }
+        // The cursor statements still name a cursor.
+        for (sql, dialect) in [
+            ("MOVE FORWARD 5 FROM c;", SqlDialect::Postgres),
+            ("MOVE NEXT FROM c;", SqlDialect::Postgres),
+            ("BEGIN; MOVE FROM c;", SqlDialect::Postgres),
+            ("FETCH FORWARD 5 FROM c;", SqlDialect::Postgres),
+            ("FETCH NEXT FROM c INTO @x;", SqlDialect::MsSql),
+            ("OPEN c FETCH NEXT FROM c INTO @x", SqlDialect::MsSql),
+        ] {
+            assert_eq!(
+                missing_tables(sql, dialect),
+                Vec::<String>::new(),
+                "{sql} on {dialect:?}"
+            );
+        }
     }
 
     /// **What the T-SQL name prefixes leave standing.** A `#`/`@` source and

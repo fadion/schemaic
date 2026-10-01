@@ -923,7 +923,11 @@ existing prose was left alone.
     (`a_statement_end_ends_the_table_reference_before_it`). A cursor is not a table either:
     `fetch_precedes` reads `FETCH [NEXT | … | ABSOLUTE n] FROM c` (and PostgreSQL's `MOVE`) as
     naming one, walking back over at most a direction and its count so a column named `first`
-    before a real `FROM` is left alone.
+    before a real `FROM` is left alone. The verb is the dialect's (`cursor_verbs`: `MOVE` on
+    PostgreSQL alone, nothing on SQLite, which has no cursors), never one after a `.` (`e.move` is a
+    column), and one the dialect does not reserve only where a statement begins — taken on every
+    engine and anywhere, `SELECT id, move FROM nosuchtable` skipped its table list
+    (`a_column_named_move_or_fetch_is_not_a_cursor`).
     **T-SQL is where sqlparser 0.62's grammar runs out, and a SQL Server hand check found ordinary
     T-SQL squiggled red.** `parser_lacks_statement` withholds the parse error — only that; the
     typo, function-typo and alias checks still run over the statement — for what that grammar does
