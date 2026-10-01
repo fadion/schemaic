@@ -1042,7 +1042,22 @@ existing prose was left alone.
     `WHILE`'s condition (up to the statement it governs) a `UnitKind::Condition` parsed as an
     expression, and the statements between are checked one by one, so the result is the same
     whether a block reaches the checker as one range or several
-    (`t_sql_control_of_flow_holds_checked_statements` asserts both). A routine's header, up to its
+    (`t_sql_control_of_flow_holds_checked_statements` asserts both). A condition can hold no token
+    of its own — `IF 1 = 1 BEGIN`, numbers and operators being none — so `tsql_units` marks it
+    from its keyword's end; it had taken the `BEGIN` for its condition. **Reading it as structure
+    lost the parser's one check of it, that it pairs up**, and `TsqlFlow` puts it back: a batch's
+    units, read across its ranges and reset at a `GO`, against a stack of what is open, on T-SQL's
+    own grammar — an `IF` governs one statement and takes an optional `ELSE` (the nearest open
+    `IF`'s), a `WHILE` one statement, a label counts as one (`IF @x = 1 lbl: ELSE …` runs), and
+    `END TRY` is followed at once by `BEGIN CATCH`, not even a `;` between (measured). An `ELSE`
+    with no `IF`, an `IF` with nothing before its `ELSE`, a stray `END`, an `END TRY` with no
+    `BEGIN CATCH` are errors where they stand; a block still open at the buffer's end is one unless
+    that end is the fragment still being typed. It also asks the two `;`s the rest of T-SQL does
+    without: before a `THROW` the statement must end with one (Msg 102 after a statement, `END`,
+    `BREAK`, `GOTO` or `END CATCH`; none needed after `BEGIN`, `ELSE`, a label, a condition or a
+    routine's `AS`), and a `MERGE` must (Msg 10713), which `range_diagnostics` asks of each unit
+    (`unbalanced_t_sql_control_of_flow_is_reported`,
+    `throw_and_merge_need_the_semicolon_sql_server_asks_for`). A routine's header, up to its
     body's `AS`, is a statement of its own, withheld as above, and **its body is checked like any
     script** — it was one unit whose parse error was withheld wholesale, so a body was never
     syntax-checked at all. The tokenizer reads a number as no token, so `@x < 0.0 SELECT` is not the

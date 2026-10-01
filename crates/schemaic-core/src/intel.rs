@@ -5455,10 +5455,34 @@ pub fn diagnostics(sql: &str, catalog: &Catalog, dialect: SqlDialect) -> Vec<Dia
     let ranges = crate::sql::statement_ranges(sql, dialect);
     let last = ranges.len().saturating_sub(1);
     let mut out: Vec<Diagnostic> = Vec::new();
+    let mut flow = TsqlFlow::new();
+    let mut prev_hi = 0;
     for (idx, &(lo, hi)) in ranges.iter().enumerate() {
-        range_diagnostics(sql, lo, hi, idx == last, catalog, dialect, &mut out);
+        if idx > 0 && gap_holds_go(sql, prev_hi, lo, dialect) {
+            flow.end_batch(true, &mut out);
+        }
+        range_diagnostics(
+            sql,
+            lo,
+            hi,
+            idx == last,
+            catalog,
+            dialect,
+            &mut flow,
+            &mut out,
+        );
+        prev_hi = hi;
+    }
+    if let Some(&(_, hi)) = ranges.last() {
+        flow.end_batch(range_is_terminated(sql, hi), &mut out);
     }
     dedup_diagnostics(out)
+}
+
+/// Does the range ending at byte `hi` end with its `;` — so that, the
+/// buffer's last, it is not the fragment still being typed?
+fn range_is_terminated(sql: &str, hi: usize) -> bool {
+    hi > 0 && sql.as_bytes().get(hi - 1) == Some(&b';')
 }
 
 /// The diagnostics for one range of [`crate::sql::statement_ranges`],
@@ -5473,6 +5497,7 @@ pub fn diagnostics(sql: &str, catalog: &Catalog, dialect: SqlDialect) -> Vec<Dia
 /// hides nothing in the next. It was one unit, so the whole script was the
 /// typing tail — its parse error withheld and, a multi-statement blob never
 /// parsing, its table and column checks never run.
+#[allow(clippy::too_many_arguments)]
 fn range_diagnostics(
     sql: &str,
     lo: usize,
@@ -5480,15 +5505,35 @@ fn range_diagnostics(
     is_last: bool,
     catalog: &Catalog,
     dialect: SqlDialect,
+    flow: &mut TsqlFlow,
     out: &mut Vec<Diagnostic>,
 ) {
-    let terminated = sql.as_bytes().get(hi - 1) == Some(&b';');
-    let units = statement_units(sql, lo, hi, dialect);
+    let terminated = range_is_terminated(sql, hi);
+    let units = units_of(sql, lo, hi, dialect);
     let n = units.len();
-    for (k, &(ulo, uhi, kind)) in units.iter().enumerate() {
+    for (k, u) in units.iter().enumerate() {
         let is_typing_tail = is_last && k + 1 == n && !terminated;
-        if kind != UnitKind::Structure {
-            unit_diagnostics(sql, ulo, uhi, kind, is_typing_tail, catalog, dialect, out);
+        if u.kind != UnitKind::Structure {
+            unit_diagnostics(
+                sql,
+                u.lo,
+                u.hi,
+                u.kind,
+                is_typing_tail,
+                catalog,
+                dialect,
+                out,
+            );
+        }
+        if statements_need_no_terminator(dialect) {
+            flow.step(u, out);
+            let ends_with_semicolon = units.get(k + 1).map_or(terminated, |n| n.after_semicolon);
+            if let Some(merge) = u.merge
+                && !ends_with_semicolon
+                && !is_typing_tail
+            {
+                flow_error(out, merge, "`MERGE` must end with `;`");
+            }
         }
     }
     typo_checks(sql, lo, hi, catalog, dialect, out);
@@ -5550,27 +5595,378 @@ fn parse_condition(text: &str, dialect: SqlDialect) -> Result<(), sqlparser::par
 /// one statement, except where [`statements_need_no_terminator`] — there
 /// [`tsql_units`] cuts it into statements, `IF`/`WHILE` conditions and the
 /// control-of-flow around them.
+#[cfg(test)]
 fn statement_units(
     sql: &str,
     lo: usize,
     hi: usize,
     dialect: SqlDialect,
 ) -> Vec<(usize, usize, UnitKind)> {
+    units_of(sql, lo, hi, dialect)
+        .into_iter()
+        .map(|u| (u.lo, u.hi, u.kind))
+        .collect()
+}
+
+/// One of a range's [`statement_units`], with what [`TsqlFlow`] reads of it.
+struct Unit {
+    lo: usize,
+    hi: usize,
+    kind: UnitKind,
+    /// Its first two keyword-capable words, upper-cased ([`tsql_keyword`]).
+    first: Option<String>,
+    second: Option<String>,
+    /// The span of its first word, and of its first two (`END TRY`).
+    at: (usize, usize),
+    at2: (usize, usize),
+    /// A `;` stands before it — or it opens its range, which only a `;`, a
+    /// `GO` or the buffer's start does.
+    after_semicolon: bool,
+    /// A label, `retry:`.
+    label: bool,
+    /// A routine's header, up to its body's `AS`.
+    header: bool,
+    /// The span of the `MERGE` the statement performs, if it is one.
+    merge: Option<(usize, usize)>,
+}
+
+/// [`statement_units`] with what the T-SQL flow checks read of each.
+fn units_of(sql: &str, lo: usize, hi: usize, dialect: SqlDialect) -> Vec<Unit> {
+    let whole = || Unit {
+        lo,
+        hi,
+        kind: UnitKind::Statement,
+        first: None,
+        second: None,
+        at: (lo, lo),
+        at2: (lo, lo),
+        after_semicolon: true,
+        label: false,
+        header: false,
+        merge: None,
+    };
     if !statements_need_no_terminator(dialect) {
-        return vec![(lo, hi, UnitKind::Statement)];
+        return vec![whole()];
     }
     let toks = tokenize_range(sql, lo, hi, dialect);
-    let marks = tsql_units(sql, &toks, dialect);
+    let marks = tsql_units(sql, hi, &toks, dialect);
     if marks.is_empty() {
-        return vec![(lo, hi, UnitKind::Statement)];
+        return vec![whole()];
     }
     let mut out = Vec::with_capacity(marks.len());
-    for (k, &(start, kind)) in marks.iter().enumerate() {
-        let from = if k == 0 { lo } else { toks[start].at };
-        let to = marks.get(k + 1).map_or(hi, |&(next, _)| toks[next].at);
-        out.push((from, to, kind));
+    for (k, &(from, start, kind)) in marks.iter().enumerate() {
+        let next = marks.get(k + 1).map(|&(at, next, _)| (at, next));
+        let stmt = &toks[start.min(toks.len())..next.map_or(toks.len(), |(_, n)| n)];
+        let first = stmt.first().map_or((from, from), |t| (t.at, t.end));
+        out.push(Unit {
+            lo: if k == 0 { lo } else { from },
+            hi: next.map_or(hi, |(at, _)| at),
+            kind,
+            first: tsql_keyword(stmt, 0),
+            second: tsql_keyword(stmt, 1),
+            at: first,
+            at2: (first.0, stmt.get(1).map_or(first.1, |t| t.end)),
+            after_semicolon: k == 0 || stmt.first().is_some_and(|t| t.after_semicolon),
+            label: is_label(sql, &toks, start),
+            header: kind == UnitKind::Statement && is_routine_statement(stmt),
+            merge: statement_verb(stmt)
+                .filter(|&j| {
+                    kind == UnitKind::Statement && tsql_keyword(stmt, j).as_deref() == Some("MERGE")
+                })
+                .map(|j| (stmt[j].at, stmt[j].end)),
+        });
     }
     out
+}
+
+/// What a T-SQL batch's control-of-flow holds open, read unit by unit
+/// ([`TsqlFlow::step`]) across the batch's ranges, and what it owes.
+///
+/// **Reading the control-of-flow as structure lost the parser's one check of
+/// it** — that it pairs up. sqlparser read a `BEGIN … END` or an `IF … ELSE`
+/// whole, so an `ELSE` with no `IF`, a `BEGIN` never closed or a stray `END`
+/// was a parse error; [`tsql_units`] made each keyword a unit of its own, and
+/// they were never compared again. This is the comparison: a stack of what is
+/// open, following T-SQL's own grammar — an `IF` governs one statement and
+/// takes an optional `ELSE` after it (the nearest open `IF`'s), a `WHILE` one
+/// statement, `END TRY` must be followed at once by `BEGIN CATCH` (not even a
+/// `;` between, measured). And the two places the server asks for a `;` that
+/// the rest of T-SQL does without: after the statement before a `THROW`
+/// (unless a `BEGIN`, `ELSE`, label, condition or routine header precedes
+/// it), and after a `MERGE` (Msg 10713) — [`range_diagnostics`] asks the
+/// second.
+#[derive(Default)]
+struct TsqlFlow {
+    /// What is open, innermost last, each with the span of what opened it.
+    open: Vec<(Frame, (usize, usize))>,
+    /// An `END TRY` just closed, owed its `BEGIN CATCH`: its span.
+    catch_owed: Option<(usize, usize)>,
+    /// The unit before is one a `THROW` may follow without a `;`.
+    throw_follows: bool,
+}
+
+/// One construct [`TsqlFlow`] holds open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Frame {
+    /// `BEGIN`, awaiting its `END`.
+    Block,
+    /// `BEGIN TRY`, awaiting its `END TRY`.
+    Try,
+    /// `BEGIN CATCH`, awaiting its `END CATCH`.
+    Catch,
+    /// An `IF` awaiting its statement.
+    IfBody,
+    /// An `IF` whose statement is done, which an `ELSE` may still follow.
+    IfElse,
+    /// An `ELSE` awaiting its statement.
+    ElseBody,
+    /// A `WHILE` awaiting its statement.
+    WhileBody,
+}
+
+/// An error [`TsqlFlow`] reports, over `range`.
+fn flow_error(out: &mut Vec<Diagnostic>, range: (usize, usize), message: &str) {
+    out.push(Diagnostic {
+        range,
+        severity: Severity::Error,
+        message: message.to_string(),
+    });
+}
+
+impl TsqlFlow {
+    fn new() -> TsqlFlow {
+        TsqlFlow {
+            throw_follows: true,
+            ..TsqlFlow::default()
+        }
+    }
+
+    fn top(&self) -> Option<Frame> {
+        self.open.last().map(|&(f, _)| f)
+    }
+
+    /// A statement has been read whole: an `IF`'s now waits to see whether
+    /// an `ELSE` follows, and an `ELSE`'s or a `WHILE`'s ends that construct
+    /// — itself a statement whole, so on outwards.
+    fn complete(&mut self) {
+        loop {
+            match self.top() {
+                Some(Frame::IfBody) => {
+                    if let Some(top) = self.open.last_mut() {
+                        top.0 = Frame::IfElse;
+                    }
+                    return;
+                }
+                Some(Frame::ElseBody | Frame::WhileBody) => {
+                    self.open.pop();
+                }
+                _ => return,
+            }
+        }
+    }
+
+    /// Something other than an `ELSE` came: each `IF` waiting for one is
+    /// whole without it.
+    fn settle(&mut self) {
+        while self.top() == Some(Frame::IfElse) {
+            self.open.pop();
+            self.complete();
+        }
+    }
+
+    /// [`Self::settle`], and report each `IF`, `ELSE` or `WHILE` left with
+    /// no statement to run.
+    fn drain(&mut self, out: &mut Vec<Diagnostic>) {
+        loop {
+            self.settle();
+            let message = match self.top() {
+                Some(Frame::IfBody) => "`IF` has no statement to run",
+                Some(Frame::ElseBody) => "`ELSE` has no statement to run",
+                Some(Frame::WhileBody) => "`WHILE` has no statement to run",
+                _ => return,
+            };
+            if let Some((_, at)) = self.open.pop() {
+                flow_error(out, at, message);
+            }
+            self.complete();
+        }
+    }
+
+    /// An `END`, `END TRY` or `END CATCH` over `at`, closing `frame`.
+    /// Reports one that closes nothing, or a block of another kind (which
+    /// it then closes, so one mistake is one error); `true` when it closed
+    /// what it names.
+    fn close(&mut self, frame: Frame, at: (usize, usize), out: &mut Vec<Diagnostic>) -> bool {
+        self.drain(out);
+        let message = match frame {
+            Frame::Try => "`END TRY` without a matching `BEGIN TRY`",
+            Frame::Catch => "`END CATCH` without a matching `BEGIN CATCH`",
+            _ => "`END` without a matching `BEGIN`",
+        };
+        match self.top() {
+            Some(f) if f == frame => {
+                self.open.pop();
+                true
+            }
+            Some(Frame::Block | Frame::Try | Frame::Catch) => {
+                self.open.pop();
+                flow_error(out, at, message);
+                false
+            }
+            _ => {
+                flow_error(out, at, message);
+                false
+            }
+        }
+    }
+
+    /// Read the next unit, `u`.
+    fn step(&mut self, u: &Unit, out: &mut Vec<Diagnostic>) {
+        let first = u.first.as_deref();
+        let second = u.second.as_deref();
+        if u.kind == UnitKind::Statement
+            && first == Some("THROW")
+            && !u.after_semicolon
+            && !self.throw_follows
+        {
+            flow_error(out, u.at, "The statement before `THROW` must end with `;`");
+        }
+        self.throw_follows = match u.kind {
+            UnitKind::Condition => true,
+            UnitKind::Statement => u.header,
+            UnitKind::Structure => u.label || matches!(first, Some("BEGIN" | "ELSE")),
+        };
+        let begin_catch =
+            u.kind == UnitKind::Structure && first == Some("BEGIN") && second == Some("CATCH");
+        if let Some(end_try) = self.catch_owed.take() {
+            if begin_catch && !u.after_semicolon {
+                self.open.push((Frame::Catch, u.at2));
+                return;
+            }
+            flow_error(out, end_try, "`END TRY` must be followed by `BEGIN CATCH`");
+            if begin_catch {
+                // Read as the `CATCH` it was meant for: one mistake, one error.
+                self.open.push((Frame::Catch, u.at2));
+                return;
+            }
+            self.complete();
+        }
+        // A statement cut off from the `IF`, `ELSE` or `WHILE` before it:
+        // `IF @x = 1; SELECT 2`.
+        if u.after_semicolon && first != Some("ELSE") {
+            self.drain(out);
+        }
+        match u.kind {
+            UnitKind::Condition => {}
+            UnitKind::Statement => {
+                self.settle();
+                self.complete();
+            }
+            UnitKind::Structure if u.label => {
+                // A label is the statement an `IF` governs, as the server
+                // reads it: `IF @x = 1 lbl: ELSE …` runs.
+                self.settle();
+                self.complete();
+            }
+            UnitKind::Structure => match (first, second) {
+                (Some("IF"), _) => {
+                    self.settle();
+                    self.open.push((Frame::IfBody, u.at));
+                }
+                (Some("WHILE"), _) => {
+                    self.settle();
+                    self.open.push((Frame::WhileBody, u.at));
+                }
+                (Some("ELSE"), _) => match self.open.last_mut() {
+                    Some(top) if top.0 == Frame::IfElse => *top = (Frame::ElseBody, u.at),
+                    Some(top) if top.0 == Frame::IfBody => {
+                        flow_error(out, top.1, "`IF` has no statement before its `ELSE`");
+                        *top = (Frame::ElseBody, u.at);
+                    }
+                    _ => flow_error(out, u.at, "`ELSE` without an `IF` before it"),
+                },
+                (Some("BEGIN"), Some("TRY")) => {
+                    self.settle();
+                    self.open.push((Frame::Try, u.at2));
+                }
+                (Some("BEGIN"), Some("CATCH")) => {
+                    self.settle();
+                    flow_error(out, u.at2, "`BEGIN CATCH` must follow an `END TRY`");
+                    self.open.push((Frame::Catch, u.at2));
+                }
+                (Some("BEGIN"), _) => {
+                    self.settle();
+                    self.open.push((Frame::Block, u.at));
+                }
+                (Some("END"), Some("TRY")) => {
+                    if self.close(Frame::Try, u.at2, out) {
+                        self.catch_owed = Some(u.at2);
+                    }
+                }
+                (Some("END"), Some("CATCH")) => {
+                    self.close(Frame::Catch, u.at2, out);
+                    self.complete();
+                }
+                (Some("END"), _) => {
+                    self.close(Frame::Block, u.at, out);
+                    self.complete();
+                }
+                // `GOTO`, `BREAK`, `CONTINUE`: statements.
+                _ => {
+                    self.settle();
+                    self.complete();
+                }
+            },
+        }
+    }
+
+    /// The batch has ended — at a `GO`, or the buffer's end. `report`
+    /// unless that end is the fragment still being typed, where a block not
+    /// yet closed is only a block not yet finished.
+    fn end_batch(&mut self, report: bool, out: &mut Vec<Diagnostic>) {
+        if report {
+            self.drain(out);
+            if let Some(end_try) = self.catch_owed.take() {
+                flow_error(out, end_try, "`END TRY` must be followed by `BEGIN CATCH`");
+            }
+            for &(frame, at) in &self.open {
+                let message = match frame {
+                    Frame::Try => "`BEGIN TRY` has no matching `END TRY`",
+                    Frame::Catch => "`BEGIN CATCH` has no matching `END CATCH`",
+                    _ => "`BEGIN` has no matching `END`",
+                };
+                flow_error(out, at, message);
+            }
+        }
+        *self = TsqlFlow::new();
+    }
+}
+
+/// Does `sql[from..to]` — the gap between two ranges — hold a `GO` line,
+/// ending a T-SQL batch?
+fn gap_holds_go(sql: &str, from: usize, to: usize, dialect: SqlDialect) -> bool {
+    let b = sql.as_bytes();
+    let mut line_start = from == 0 || b.get(from - 1) == Some(&b'\n');
+    let mut i = from;
+    while i < to {
+        // A comment: what follows it on its line is not at the line's start
+        // (a `--` comment stops before its line break, which resets it).
+        if let Some(j) = crate::sql::skip_noncode(b, i, dialect) {
+            line_start = false;
+            i = j;
+            continue;
+        }
+        match b[i] {
+            b'\n' => line_start = true,
+            b' ' | b'\t' | b'\r' => {}
+            _ if line_start && crate::sql::go_directive(sql, i, dialect).is_some() => {
+                return true;
+            }
+            _ => line_start = false,
+        }
+        i += 1;
+    }
+    false
 }
 
 /// An unquoted word at `toks[j]` that can be a keyword — not a qualified
@@ -5595,8 +5991,25 @@ fn is_label(sql: &str, toks: &[Token], j: usize) -> bool {
             .is_some_and(|t| b.get(t.end) == Some(&b':') && b.get(t.end + 1) != Some(&b':'))
 }
 
-/// One range's T-SQL units — each a starting index into `toks` and its
-/// [`UnitKind`], in order, the first at `0`.
+/// Does `sql[from..to]` hold anything but white space and comments?
+fn holds_code(sql: &str, from: usize, to: usize, dialect: SqlDialect) -> bool {
+    let b = sql.as_bytes();
+    let mut i = from;
+    while i < to.min(b.len()) {
+        let comment = b[i..].starts_with(b"--") || b[i..].starts_with(b"/*");
+        match crate::sql::skip_noncode(b, i, dialect) {
+            Some(j) if comment => i = j,
+            _ if b[i].is_ascii_whitespace() => i += 1,
+            _ => return true,
+        }
+    }
+    false
+}
+
+/// One range's T-SQL units — each the byte it starts at, the index into
+/// `toks` of its first token and its [`UnitKind`], in order, the first at
+/// token `0`. A unit's byte is its first token's, but for a condition that
+/// holds no token (`IF 1 = 1 BEGIN`), whose byte is its keyword's end.
 ///
 /// **Control-of-flow is read here rather than handed to the parser.**
 /// sqlparser's T-SQL grammar has no `TRY … CATCH`, label, `GOTO`, `BREAK` or
@@ -5612,26 +6025,36 @@ fn is_label(sql: &str, toks: &[Token], j: usize) -> bool {
 /// read the same way. The result does not depend on where the range was cut:
 /// a block handed over whole and the same block in several ranges give the
 /// same units.
-fn tsql_units(sql: &str, toks: &[Token], dialect: SqlDialect) -> Vec<(usize, UnitKind)> {
+fn tsql_units(
+    sql: &str,
+    hi: usize,
+    toks: &[Token],
+    dialect: SqlDialect,
+) -> Vec<(usize, usize, UnitKind)> {
     let word = |j: usize| tsql_keyword(toks, j);
     let mut marks = Vec::new();
     let mut i = 0;
     while i < toks.len() {
         if let Some(end) = tsql_structure_at(sql, toks, i) {
-            marks.push((i, UnitKind::Structure));
+            marks.push((toks[i].at, i, UnitKind::Structure));
             i = end;
             continue;
         }
         if matches!(word(i).as_deref(), Some("IF" | "WHILE")) {
-            marks.push((i, UnitKind::Structure));
+            marks.push((toks[i].at, i, UnitKind::Structure));
             let end = tsql_condition_end(sql, toks, i + 1);
-            if end > i + 1 {
-                marks.push((i + 1, UnitKind::Condition));
+            // A condition can hold no token at all — `IF 1 = 1 BEGIN`: a
+            // number and an operator are none — so it is marked from the
+            // keyword's end. It took the `BEGIN` for its own, which left the
+            // block's `END` unopened.
+            let to = toks.get(end).map_or(hi, |t| t.at);
+            if end > i + 1 || holds_code(sql, toks[i].end, to, dialect) {
+                marks.push((toks[i].end, i + 1, UnitKind::Condition));
             }
             i = end;
             continue;
         }
-        marks.push((i, UnitKind::Statement));
+        marks.push((toks[i].at, i, UnitKind::Statement));
         if is_routine_statement(&toks[i..]) {
             match routine_body_as(&toks[i..], dialect) {
                 Some(body) => i += body + 1,
@@ -5697,14 +6120,16 @@ fn tsql_condition_end(sql: &str, toks: &[Token], i: usize) -> usize {
             TkKind::LParen => depth += 1,
             TkKind::RParen => depth = depth.saturating_sub(1),
             _ if depth > 0 => {}
-            _ if j > i && (t.after_semicolon || is_label(sql, toks, j)) => return j,
+            // From the condition's first token on: one made of numbers and
+            // operators alone, `IF 1 = 1 BEGIN`, has none of its own.
+            _ if t.after_semicolon || is_label(sql, toks, j) => return j,
             _ => match tsql_keyword(toks, j).as_deref() {
                 Some("CASE") => case += 1,
                 Some("END") if case > 0 => case -= 1,
                 Some("ELSE") if case > 0 => {}
                 Some("UPDATE")
                     if matches!(toks.get(j + 1).map(|t| &t.kind), Some(TkKind::LParen)) => {}
-                Some(w) if j > i && (heads.contains(&w) || w == "WITH" || w == "USE") => {
+                Some(w) if heads.contains(&w) || w == "WITH" || w == "USE" => {
                     return j;
                 }
                 _ => {}
@@ -6404,6 +6829,31 @@ fn tsql_gap_masks(sql: &str, hi: usize, toks: &[Token]) -> Vec<Mask> {
         }
     }
     out
+}
+
+/// The index in `toks` of the verb a statement performs: its first word, or
+/// for a `WITH` the statement its CTEs feed (`INNER MERGE JOIN` is a join
+/// hint, not a `MERGE`). `None` for a `WITH` that feeds nothing yet.
+fn statement_verb(toks: &[Token]) -> Option<usize> {
+    if tsql_keyword(toks, 0).as_deref() != Some("WITH") {
+        return (!toks.is_empty()).then_some(0);
+    }
+    let mut depth = 0usize;
+    for (j, t) in toks.iter().enumerate() {
+        match t.kind {
+            TkKind::LParen => depth += 1,
+            TkKind::RParen => depth = depth.saturating_sub(1),
+            _ if depth > 0 => {}
+            _ => match tsql_keyword(toks, j).as_deref() {
+                Some("SELECT" | "INSERT" | "UPDATE" | "DELETE") => return Some(j),
+                Some("MERGE") if tsql_keyword(toks, j + 1).as_deref() != Some("JOIN") => {
+                    return Some(j);
+                }
+                _ => {}
+            },
+        }
+    }
+    None
 }
 
 /// For each of `toks`, the clause it stands in at its own depth — the last
@@ -15116,7 +15566,9 @@ mod tests {
         let (schema, db) = sample_catalog();
         let cat = Catalog::build(&[(db, &schema)], Some(db));
         let mut out = Vec::new();
-        range_diagnostics(sql, 0, sql.len(), true, &cat, dialect, &mut out);
+        let mut flow = TsqlFlow::new();
+        range_diagnostics(sql, 0, sql.len(), true, &cat, dialect, &mut flow, &mut out);
+        flow.end_batch(range_is_terminated(sql, sql.len()), &mut out);
         dedup_diagnostics(out)
     }
 
@@ -15903,6 +16355,197 @@ mod tests {
                 "{sql}: {d:?}"
             );
         }
+    }
+
+    /// The `Error` messages of `sql`'s T-SQL diagnostics, split and whole,
+    /// each with the text it underlines — asserted equal, since the answer
+    /// may not depend on where the ranges were cut.
+    fn tsql_errors(sql: &str) -> Vec<(String, String)> {
+        let errors = |d: Vec<Diagnostic>| -> Vec<(String, String)> {
+            d.into_iter()
+                .filter(|x| x.severity == Severity::Error)
+                .map(|x| (x.message, sql[x.range.0..x.range.1].to_string()))
+                .collect()
+        };
+        let split = errors(diag_d(sql, SqlDialect::MsSql));
+        let whole = errors(diag_whole(sql, SqlDialect::MsSql));
+        assert_eq!(split, whole, "{sql}");
+        split
+    }
+
+    /// **`THROW` and `MERGE` ask for the `;` the rest of T-SQL does without**
+    /// (S7.2-L1-07). Units are parsed without requiring a `;` between
+    /// statements, which is how the server reads them — except here: the
+    /// statement before a `THROW` must end with one (Msg 102 after a
+    /// statement, an `END`, a `BREAK`, a `GOTO` or an `END CATCH`), and a
+    /// `MERGE` must end with one (Msg 10713), each measured on SQL Server
+    /// 2022. A `THROW` straight after `BEGIN`, `ELSE`, a label, a condition
+    /// or a routine's `AS` needs none.
+    #[test]
+    fn throw_and_merge_need_the_semicolon_sql_server_asks_for() {
+        let throw = "The statement before `THROW` must end with `;`";
+        let merge = "`MERGE` must end with `;`";
+        for (sql, want, at) in [
+            ("SELECT 1\nTHROW 50000, 'x', 1;\nSELECT 2;", throw, "THROW"),
+            (
+                "IF 1 = 1 BEGIN PRINT 1 END THROW 50000, 'x', 1;",
+                throw,
+                "THROW",
+            ),
+            (
+                "BEGIN TRY SELECT 1 END TRY BEGIN CATCH PRINT 1 THROW END CATCH",
+                throw,
+                "THROW",
+            ),
+            (
+                "WHILE 1 = 1 BEGIN BREAK THROW 50000, 'x', 1 END",
+                throw,
+                "THROW",
+            ),
+            (
+                "MERGE employees AS t USING departments AS s ON t.id = s.id \
+                 WHEN MATCHED THEN UPDATE SET t.name = s.name\nSELECT 1;",
+                merge,
+                "MERGE",
+            ),
+            (
+                "WITH c AS (SELECT id FROM departments) MERGE employees AS t USING c \
+                 ON t.id = c.id WHEN MATCHED THEN DELETE\nSELECT 1;",
+                merge,
+                "MERGE",
+            ),
+        ] {
+            assert_eq!(
+                tsql_errors(sql),
+                [(want.to_string(), at.to_string())],
+                "{sql}"
+            );
+        }
+        for sql in [
+            "BEGIN TRY SELECT 1/0; END TRY BEGIN CATCH THROW; END CATCH",
+            "BEGIN TRY SELECT 1 END TRY BEGIN CATCH THROW END CATCH",
+            "SELECT 1;\nTHROW 50000, 'x', 1;",
+            "IF @x = 1 THROW 50000, 'x', 1;",
+            "BEGIN THROW 50000, 'x', 1 END",
+            "lbl: THROW 50000, 'x', 1;",
+            "IF @x = 1 PRINT 1 ELSE THROW 50000, 'x', 1;",
+            "CREATE PROCEDURE dbo.p AS THROW 50000, 'x', 1",
+            "MERGE employees AS t USING departments AS s ON t.id = s.id \
+             WHEN MATCHED THEN DELETE;\nSELECT 1;",
+            // Still being typed: the `;` may be the next key pressed.
+            "MERGE employees AS t USING departments AS s ON t.id = s.id \
+             WHEN MATCHED THEN DELETE",
+        ] {
+            assert_eq!(tsql_errors(sql), [], "{sql}");
+        }
+    }
+
+    /// **Unbalanced control-of-flow is reported** (S7.2-L1-06). Reading
+    /// `BEGIN … END`, `TRY … CATCH` and `IF … ELSE` as structure rather than
+    /// handing them to the parser lost the one check the parser had made:
+    /// that they pair up. SQL Server 2022 refuses each of these (Msg 156 or
+    /// 102), and runs each of the balanced ones.
+    #[test]
+    fn unbalanced_t_sql_control_of_flow_is_reported() {
+        for (sql, want, at) in [
+            (
+                "ELSE SELECT 1;\nSELECT 2;",
+                "`ELSE` without an `IF` before it",
+                "ELSE",
+            ),
+            (
+                "WHILE @x < 1 SELECT 1\nELSE SELECT 2;",
+                "`ELSE` without an `IF` before it",
+                "ELSE",
+            ),
+            (
+                "IF @x = 1 ELSE SELECT 1;\nSELECT 2;",
+                "`IF` has no statement before its `ELSE`",
+                "IF",
+            ),
+            (
+                "BEGIN SELECT 1;\nSELECT 2;",
+                "`BEGIN` has no matching `END`",
+                "BEGIN",
+            ),
+            (
+                "BEGIN TRY SELECT 1 END TRY\nSELECT 2;",
+                "`END TRY` must be followed by `BEGIN CATCH`",
+                "END TRY",
+            ),
+            (
+                "BEGIN TRY SELECT 1 END TRY;\nBEGIN CATCH PRINT 1 END CATCH",
+                "`END TRY` must be followed by `BEGIN CATCH`",
+                "END TRY",
+            ),
+            (
+                "SELECT 1\nEND\nSELECT 2;",
+                "`END` without a matching `BEGIN`",
+                "END",
+            ),
+            (
+                "BEGIN SELECT 1 END END;",
+                "`END` without a matching `BEGIN`",
+                "END",
+            ),
+            (
+                "CREATE PROCEDURE dbo.p AS BEGIN IF 1 = 1 BEGIN SELECT 1 SELECT 2 END;",
+                "`BEGIN` has no matching `END`",
+                "BEGIN",
+            ),
+            (
+                "BEGIN TRY SELECT 1 END CATCH;",
+                "`END CATCH` without a matching `BEGIN CATCH`",
+                "END CATCH",
+            ),
+            ("BEGIN IF @x = 1 END;", "`IF` has no statement to run", "IF"),
+            (
+                "BEGIN WHILE @x < 1\nEND;",
+                "`WHILE` has no statement to run",
+                "WHILE",
+            ),
+        ] {
+            let found = tsql_errors(sql);
+            assert_eq!(found.len(), 1, "{sql}: {found:?}");
+            assert_eq!(found[0].0, want, "{sql}: {found:?}");
+            assert!(found[0].1.starts_with(at), "{sql}: {found:?}");
+        }
+        for sql in [
+            "IF @x = 1 SELECT 1;\nELSE SELECT 2;",
+            "IF @x = 1 lbl: ELSE SELECT 2;",
+            "IF @x = 1\n  IF @x = 2 SELECT 1 ELSE SELECT 2\nELSE SELECT 3;",
+            "IF @x = 1 SELECT 1 ELSE IF @x = 2 SELECT 2 ELSE SELECT 3;",
+            "WHILE @x < 2 BEGIN SET @x += 1 IF @x = 2 BREAK ELSE CONTINUE END;",
+            "BEGIN TRY SELECT 1 END TRY\n-- a comment\nBEGIN CATCH PRINT 1 END CATCH",
+            "IF @x = 1 BEGIN TRY SELECT 1 END TRY BEGIN CATCH END CATCH ELSE SELECT 2;",
+            "CREATE PROCEDURE dbo.p AS BEGIN IF 1 = 1 BEGIN SELECT 1 END ELSE BEGIN SELECT 2 END END;",
+            "SELECT CASE WHEN id = 1 THEN 1 ELSE 2 END FROM employees;",
+            "BEGIN TRAN; SELECT 1; COMMIT;",
+            // Still being typed: the block's `END` is yet to come.
+            "CREATE PROCEDURE dbo.p AS BEGIN\nSELECT 1\n",
+        ] {
+            assert_eq!(tsql_errors(sql), [], "{sql}");
+        }
+        // A `GO` ends the batch, and what it holds open with it.
+        let errors = |sql: &str| -> Vec<String> {
+            diag_d(sql, SqlDialect::MsSql)
+                .into_iter()
+                .filter(|x| x.severity == Severity::Error)
+                .map(|x| x.message)
+                .collect()
+        };
+        assert_eq!(
+            errors("BEGIN\nSELECT 1\nGO\nSELECT 2;"),
+            ["`BEGIN` has no matching `END`"]
+        );
+        assert_eq!(
+            errors("BEGIN\nSELECT 1\nEND\nGO\nSELECT 2;"),
+            [] as [&str; 0]
+        );
+        assert_eq!(
+            errors("SELECT 1\nGO\nEND\nSELECT 2;"),
+            ["`END` without a matching `BEGIN`"]
+        );
     }
 
     /// **The T-SQL statement cuts, one by one** — where a statement must begin,
