@@ -10633,22 +10633,29 @@ fn tsql_parameters(list: &str) -> Vec<&str> {
 }
 
 /// `inner` when `s` is exactly `( inner )` — one pair of parens around the
-/// whole of it — else `s`. Walked over the lexer, so a paren in a string
-/// default does not count.
-fn tsql_strip_outer_parens(s: &str) -> &str {
+/// whole of it, comments aside — else `s` trimmed; with where the part kept
+/// as text starts in `s`: the `(` when stripped, else `0`. Walked over the
+/// lexer, so a paren in a string default does not count.
+///
+/// **A comment outside the parentheses is not the list's**: the list is
+/// written back without them, so one in front of the `(` belonged to neither
+/// part and every rebuild dropped it. The offset is what lets the caller hand
+/// it to the header's comments instead.
+fn tsql_strip_outer_parens(s: &str) -> (&str, usize) {
     let mut c = TsqlCursor { s, i: 0, start: 0 };
     if c.next() != Some(TsqlTok::Punct(b'(')) {
-        return s;
+        return (s.trim(), 0);
     }
+    let open_at = c.start;
     let open_end = c.i;
     if c.close_paren().is_none() {
-        return s;
+        return (s.trim(), 0);
     }
     let close_at = c.start;
     if c.next().is_some() {
-        return s;
+        return (s.trim(), 0);
     }
-    s[open_end..close_at].trim()
+    (s[open_end..close_at].trim(), open_at)
 }
 
 /// The comments of a T-SQL module's header — see
@@ -10776,8 +10783,10 @@ pub fn tsql_routine_parts(definition: &str) -> Option<TsqlRoutineParts> {
         }
     } else {
         let from = c.i;
-        out.arguments = tsql_strip_outer_parens(c.span_until(&["WITH", "FOR", "AS"])?).to_string();
-        kept.push((from, c.i));
+        c.span_until(&["WITH", "FOR", "AS"])?;
+        let (arguments, kept_at) = tsql_strip_outer_parens(&definition[from..c.i]);
+        out.arguments = arguments.to_string();
+        kept.push((from + kept_at, c.i));
     }
     if c.keyword("WITH") {
         loop {
@@ -27347,6 +27356,51 @@ mod tsql_routine_read_tests {
             parts("/* lead */ CREATE FUNCTION f (@x int) RETURNS int /* r */ BEGIN RETURN @x END");
         assert_eq!(p.header_comments, "/* lead */");
         assert_eq!(p.body, "/* r */ BEGIN RETURN @x END");
+    }
+
+    /// **A comment before a procedure's parenthesised parameter list is the
+    /// header's**, not lost with the parentheses: the list is written back
+    /// without them, and a comment between the name and the `(` belonged to
+    /// neither part, so every rebuild dropped it (S6.1-L1-06, stored verbatim
+    /// by SQL Server 2022). It reads back among the header's comments, and the
+    /// rebuilt statement keeps it.
+    #[test]
+    fn a_comment_before_a_procedures_parentheses_survives_its_rebuild() {
+        for (stored, comment) in [
+            (
+                "CREATE PROCEDURE dbo.p /* doc */ (@a int) AS SELECT @a AS a",
+                "/* doc */",
+            ),
+            (
+                "CREATE PROCEDURE dbo.p\n-- doc\n(@a int) AS SELECT @a AS a",
+                "-- doc",
+            ),
+            (
+                "CREATE PROCEDURE dbo.p (@a int) /* after */ AS SELECT @a AS a",
+                "/* after */",
+            ),
+        ] {
+            let p = parts(stored);
+            assert_eq!(p.arguments, "@a int", "{stored}");
+            assert_eq!(p.header_comments, comment, "{stored}");
+            let r = RoutineInfo {
+                name: "p".into(),
+                schema: Some("dbo".into()),
+                kind: RoutineKind::Procedure,
+                arguments: p.arguments.clone(),
+                body: p.body.clone(),
+                tsql: crate::schema::TsqlRoutine {
+                    module: crate::schema::TsqlModule::with_header_comments(
+                        p.header_comments.clone(),
+                    ),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let sql = r.create_sql(SqlDialect::MsSql, true);
+            assert!(sql.contains(comment), "{sql}");
+            assert_eq!(parts(&sql).header_comments, comment, "{sql}");
+        }
     }
 
     /// **A function's parameter list that ends in a `--` comment keeps its

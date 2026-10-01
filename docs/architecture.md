@@ -5425,7 +5425,10 @@ existing prose was left alone.
     `sys.parameters.has_default_value` is 0 for `@a int = 5` (measured on SQL Server 2022), so a
     list rebuilt from `sys.parameters` and fed back to `CREATE OR ALTER` would silently drop every
     default — the stored text is the only place one lives. A procedure's optional parentheses are
-    taken off and written back without. It answers `None` — listed, droppable, restated verbatim,
+    taken off and written back without — so a comment between the name and the `(` belongs to
+    neither part, and `tsql_strip_outer_parens` says where the `(` stands so the walk files it
+    among the header's comments; before, every rebuild dropped it
+    (`a_comment_before_a_procedures_parentheses_survives_its_rebuild`). It answers `None` — listed, droppable, restated verbatim,
     never rebuilt — for `WITH ENCRYPTION`, an option it does not model, a numbered group's member
     (`p;2` — the group's head reads, and is handled below), a CLR routine's `EXTERNAL NAME` and
     anything else outside that shape
@@ -8615,7 +8618,10 @@ existing prose was left alone.
     text's own clause rather than one nobody wrote
     (`the_null_input_toggle_returns_to_the_stored_spelling`). **`TsqlShape`** (`Procedure`,
     `Scalar`, `InlineTable`, `MultiStatementTable`, read by `RoutineInfo::tsql_shape` off the kind
-    and `RETURNS` — `a_sql_server_routine_has_a_shape`) decides which options a routine may carry:
+    and `RETURNS` — `a_sql_server_routine_has_a_shape` — past any comment the kept `RETURNS` text
+    opens with, since `RETURNS /* rows */ TABLE` read off the raw string was a scalar, offered the
+    options an inline function refuses and recreated on the comment's deletion:
+    `a_comment_in_front_of_a_functions_table_keeps_its_shape`) decides which options a routine may carry:
     `TsqlShape::allows`, measured on SQL Server 2022, gives an inline table-valued function none of
     `EXECUTE AS`, the null-input clauses or `INLINE`, a multi-statement one `EXECUTE AS` alone of
     them and no `NATIVE_COMPILATION`, and `RECOMPILE` to a procedure only — pinned through the validator that asks it

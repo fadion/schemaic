@@ -3445,12 +3445,31 @@ impl RoutineInfo {
 
     /// What kind of SQL Server object this routine is, read off its kind and
     /// its `RETURNS` — see [`TsqlShape`].
+    ///
+    /// **Read past the comments `RETURNS` keeps**: the part is text, and a
+    /// `RETURNS /* rows */ TABLE` read off the raw string was a scalar, so the
+    /// form offered the options an inline function refuses.
     pub fn tsql_shape(&self) -> TsqlShape {
-        let r = self.returns.trim();
+        use crate::intel::SqlDialect::MsSql;
+        let b = self.returns.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i].is_ascii_whitespace() {
+                i += 1;
+                continue;
+            }
+            match crate::sql::skip_noncode(b, i, MsSql) {
+                Some(j) if matches!(b[i], b'-' | b'/') => i = j.max(i + 1),
+                _ => break,
+            }
+        }
+        let r = &self.returns[i..];
         match self.kind {
             RoutineKind::Procedure => TsqlShape::Procedure,
-            RoutineKind::Function if r.eq_ignore_ascii_case("TABLE") => TsqlShape::InlineTable,
             RoutineKind::Function if r.starts_with('@') => TsqlShape::MultiStatementTable,
+            RoutineKind::Function if crate::sql::leading_words(r, 2, MsSql) == ["TABLE"] => {
+                TsqlShape::InlineTable
+            }
             RoutineKind::Function => TsqlShape::Scalar,
         }
     }
@@ -7252,6 +7271,42 @@ mod trigger_tests {
         assert_eq!(
             f(Function, "@t TABLE (a int)").tsql_shape(),
             TsqlShape::MultiStatementTable
+        );
+    }
+
+    /// **A comment in front of `TABLE` does not make a function scalar.** The
+    /// `RETURNS` part is kept as text, comments and all, and its shape was
+    /// read off the raw string — so `RETURNS /* rows */ TABLE` was a scalar,
+    /// the form offered the options an inline function refuses (Msg 487), and
+    /// deleting the comment turned the edit into a drop and a re-create
+    /// (S6.1-L1-07). Read as the stored text reads, through the header walk.
+    #[test]
+    fn a_comment_in_front_of_a_functions_table_keeps_its_shape() {
+        let shape = |stored: &str| {
+            let p = crate::ddl::tsql_routine_parts(stored).expect(stored);
+            RoutineInfo {
+                kind: p.kind,
+                returns: p.returns,
+                ..Default::default()
+            }
+            .tsql_shape()
+        };
+        assert_eq!(
+            shape(
+                "CREATE FUNCTION dbo.f(@a int) RETURNS /* rows */ TABLE AS RETURN (SELECT @a AS a)"
+            ),
+            TsqlShape::InlineTable
+        );
+        assert_eq!(
+            shape(
+                "CREATE FUNCTION dbo.f(@a int) RETURNS -- rows\n@t TABLE (a int) AS \
+                 BEGIN INSERT @t VALUES (@a); RETURN END"
+            ),
+            TsqlShape::MultiStatementTable
+        );
+        assert_eq!(
+            shape("CREATE FUNCTION dbo.f(@a int) RETURNS /* n */ int AS BEGIN RETURN @a END"),
+            TsqlShape::Scalar
         );
     }
 

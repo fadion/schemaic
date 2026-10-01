@@ -3064,11 +3064,12 @@ async fn a_modules_header_comments_survive_an_edit() {
 /// column list typed one column a line, each with a `--` note, is stored as
 /// typed; the rebuild closed it with `) AS` on the note's line, inside the
 /// comment, so its edit, its Copy DDL and a dump of it all failed with Msg
-/// 156. Edited, and its script replayed after a real drop, it is still the
-/// view it was.
+/// 156. A comment in front of a procedure's parenthesised parameters was
+/// dropped by every rebuild. Each is edited, and its script replayed after a
+/// real drop, and is still what it was.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_comment_where_a_modules_header_parts_meet_survives_its_rebuild() {
-    use schemaic_core::ddl::{ViewDraft, diff_view};
+    use schemaic_core::ddl::{RoutineDraft, ViewDraft, diff_routine, diff_view};
     if !enabled() {
         return;
     }
@@ -3096,6 +3097,67 @@ async fn a_comment_where_a_modules_header_parts_meet_survives_its_rebuild() {
     let ddl = read_table(&s, "v_lc").await.create_ddl(MS);
     replay(&s, &format!("DROP VIEW dbo.v_lc;\nGO\n{ddl}\nGO")).await;
     assert_eq!(s.scalar("SELECT name FROM dbo.v_lc").await, "3", "{ddl}");
+
+    // A comment in front of a procedure's parenthesised parameters, which
+    // the list is written back without.
+    s.exec("CREATE PROCEDURE dbo.p_doc /* doc */ (@a int) AS SELECT @a AS a")
+        .await;
+    let routine = |name: &'static str| {
+        let s = &s;
+        async move {
+            s.db.fetch_schema(&s.name, CancellationToken::new())
+                .await
+                .unwrap()
+                .routines
+                .iter()
+                .find(|r| r.name == name)
+                .unwrap()
+                .as_ref()
+                .clone()
+        }
+    };
+    let stored = |name: &'static str| {
+        let s = &s;
+        async move {
+            s.scalar(&format!(
+                "SELECT definition FROM sys.sql_modules WHERE object_id = OBJECT_ID('dbo.{name}')"
+            ))
+            .await
+        }
+    };
+    let p = routine("p_doc").await;
+    let mut d = RoutineDraft::from_info(&p);
+    assert!(diff_routine(&p, &d, MS).is_empty());
+    d.info.body = "SELECT @a + 1 AS a".into();
+    apply(diff_routine(&p, &d, MS).emit()).await;
+    let after = stored("p_doc").await;
+    assert!(
+        after.contains("/* doc */") && after.contains("@a + 1"),
+        "{after}"
+    );
+    let ddl =
+        schemaic_core::schema::ObjectItem::Routine(Arc::new(routine("p_doc").await)).create_sql(MS);
+    replay(&s, &format!("DROP PROCEDURE dbo.p_doc;\nGO\n{ddl}")).await;
+    assert!(stored("p_doc").await.contains("/* doc */"), "{ddl}");
+    assert_eq!(s.scalar("EXEC dbo.p_doc @a = 1").await, "2");
+
+    // A comment in front of `TABLE`: still an inline function, so taking the
+    // comment out is an alter in place, not a drop and a re-create.
+    s.exec(
+        "CREATE FUNCTION dbo.f_rows (@a int) RETURNS /* rows */ TABLE AS RETURN (SELECT @a AS a)",
+    )
+    .await;
+    let f = routine("f_rows").await;
+    assert_eq!(
+        f.tsql_shape(),
+        schemaic_core::schema::TsqlShape::InlineTable
+    );
+    let mut d = RoutineDraft::from_info(&f);
+    d.info.returns = "TABLE".into();
+    let stmts = diff_routine(&f, &d, MS).emit();
+    assert!(!stmts.iter().any(|x| x.starts_with("DROP")), "{stmts:#?}");
+    apply(stmts).await;
+    assert_eq!(s.scalar("SELECT a FROM dbo.f_rows(4)").await, "4");
 }
 
 /// **A module created under `ANSI_NULLS OFF` or `QUOTED_IDENTIFIER OFF`
