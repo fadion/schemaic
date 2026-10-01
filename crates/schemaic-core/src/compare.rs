@@ -5704,3 +5704,84 @@ mod tests {
         assert_eq!(ks.len(), before, "duplicate keys in {ks:?}");
     }
 }
+
+/// SQL Server's modules in a comparison: what the plan built from the other
+/// side's reading carries, and what it cannot.
+#[cfg(test)]
+mod tsql_module_tests {
+    use super::*;
+    use crate::schema::{IndexColumn, IndexInfo, TsqlModule, TsqlView, ViewOptions};
+
+    const MS: SqlDialect = SqlDialect::MsSql;
+
+    fn index(name: &str, col: &str, clustered: bool) -> IndexInfo {
+        IndexInfo {
+            name: name.into(),
+            columns: vec![IndexColumn::plain(col)],
+            unique: clustered,
+            clustered: Some(clustered),
+            ..Default::default()
+        }
+    }
+
+    fn ms_view(name: &str, body: &str, tsql: TsqlView) -> TableInfo {
+        TableInfo {
+            name: name.into(),
+            schema: Some("dbo".into()),
+            is_view: true,
+            view_definition: Some(body.into()),
+            view_options: Some(ViewOptions {
+                attributes: vec!["SCHEMABINDING".into()],
+                tsql,
+                ..ViewOptions::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn tables(t: Vec<TableInfo>) -> DbSchema {
+        DbSchema {
+            tables: t,
+            ..Default::default()
+        }
+    }
+
+    /// **A view only the source holds is created with its settings and its
+    /// indexes** (S6.2-L1-02): the plan was a bare `CREATE VIEW`, so a view
+    /// written under `ANSI_NULLS OFF` arrived ON and an indexed view arrived
+    /// unmaterialised, both seen only on a re-compare.
+    #[test]
+    fn a_missing_view_is_created_with_its_settings_and_its_indexes() {
+        let source = tables(vec![
+            ms_view(
+                "v",
+                "SELECT id, d FROM dbo.t WHERE d = NULL",
+                TsqlView {
+                    module: TsqlModule {
+                        ansi_nulls_off: true,
+                        ..TsqlModule::default()
+                    },
+                    ..TsqlView::default()
+                },
+            ),
+            ms_view(
+                "vi",
+                "SELECT id, d FROM dbo.t",
+                TsqlView {
+                    indexes: vec![index("cix", "id", true)],
+                    ..TsqlView::default()
+                },
+            ),
+        ]);
+        let plan = SchemaComparison::of(&tables(vec![]), &source, MS).plan(|_| true);
+        let sql = plan.emit();
+        let at = |s: &str| {
+            sql.iter()
+                .position(|x| x.starts_with(s))
+                .unwrap_or_else(|| panic!("{s}: {sql:#?}"))
+        };
+        assert!(at("SET ANSI_NULLS OFF;") < at("CREATE VIEW [dbo].[v]"));
+        assert!(at("CREATE VIEW [dbo].[v]") < at("SET ANSI_NULLS ON;"));
+        assert!(at("CREATE VIEW [dbo].[vi]") < at("CREATE UNIQUE CLUSTERED INDEX [cix]"));
+    }
+}

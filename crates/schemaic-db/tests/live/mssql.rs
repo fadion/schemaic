@@ -3340,6 +3340,76 @@ async fn a_module_keeps_its_creation_settings_through_an_edit() {
     assert_eq!(settings("v_an").await, "01");
 }
 
+/// Compare `target` with `source`, apply the whole plan to `target`, and
+/// compare again — returning the plan applied and the second comparison.
+async fn sync_modules(
+    target: &Scratch,
+    source: &Scratch,
+) -> (
+    schemaic_core::compare::SchemaPlan,
+    schemaic_core::compare::SchemaComparison,
+) {
+    use schemaic_core::compare::SchemaComparison;
+    let read = |s: &Scratch| {
+        let db = s.db.clone();
+        let name = s.name.clone();
+        async move {
+            db.fetch_schema(&name, CancellationToken::new())
+                .await
+                .expect("the schema")
+        }
+    };
+    let (t, src) = (read(target).await, read(source).await);
+    let plan = SchemaComparison::of(&t, &src, MS).plan(|_| true);
+    assert!(plan.unsupported().is_empty(), "{:?}", plan.unsupported());
+    let stmts = plan.emit();
+    target
+        .db
+        .run_ddl(&target.name, &stmts, CancellationToken::new())
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{stmts:#?}"));
+    let again = SchemaComparison::of(&read(target).await, &read(source).await, MS);
+    (plan, again)
+}
+
+/// **A comparison creates a missing view whole** — under the settings the
+/// source's was created with, and with its indexes. The plan was a bare
+/// `CREATE VIEW`, so a view written under `ANSI_NULLS OFF` arrived ON (its
+/// `d = NULL` matching nothing) and an indexed one unmaterialised, both seen
+/// only on the next comparison. Synced, each does on the target what it does
+/// on the source, and a second comparison finds nothing to do.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_comparison_creates_a_missing_view_with_its_settings_and_indexes() {
+    if !enabled() {
+        return;
+    }
+    let target = Scratch::create("cmp_view_target").await;
+    let source = Scratch::create("cmp_view_source").await;
+    for s in [&target, &source] {
+        s.exec("CREATE TABLE dbo.t (id int NOT NULL PRIMARY KEY, d int NULL); INSERT dbo.t VALUES (1, NULL)")
+            .await;
+    }
+    source
+        .exec("SET ANSI_NULLS OFF; EXEC ('CREATE VIEW dbo.v_an AS SELECT id FROM dbo.t WHERE d = NULL')")
+        .await;
+    source
+        .exec("CREATE VIEW dbo.v_ix WITH SCHEMABINDING AS SELECT id, d FROM dbo.t")
+        .await;
+    source
+        .exec("CREATE UNIQUE CLUSTERED INDEX cix ON dbo.v_ix (id)")
+        .await;
+    let (_, again) = sync_modules(&target, &source).await;
+    assert_eq!(target.scalar("SELECT COUNT(*) FROM dbo.v_an").await, "1");
+    assert_eq!(
+        target
+            .scalar("SELECT COUNT(*) FROM sys.indexes WHERE object_id = OBJECT_ID('dbo.v_ix') AND name = 'cix'")
+            .await,
+        "1"
+    );
+    let left: Vec<String> = again.differences().map(|e| e.key()).collect();
+    assert!(left.is_empty(), "{left:?}");
+}
+
 /// **A module's script restores it at the defaults through a session that
 /// has them off** — `sqlcmd`'s, whose `QUOTED_IDENTIFIER` is OFF unless given
 /// `-I`. The scripts stated a setting only when the module had it OFF, so

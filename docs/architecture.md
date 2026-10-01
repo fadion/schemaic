@@ -5120,7 +5120,15 @@ existing prose was left alone.
     non-rowstore kind) cannot be built again whole, so `lossy_view_index_refusal`, in
     `unsupported()`, refuses the edit rather than bring the index back as less than it was
     (`an_indexed_sql_server_views_edit_creates_its_indexes_again`). Its only re-create is a rename
-    (above). `create_view_sql`
+    (above). **`Change::CreateView` takes the same two steps** — the settings wrapper and
+    `view_index_statements` — with the summary naming the indexes and the lossy refusal matching it
+    too: the comparison creates a view only the source holds from the source's reading, which
+    carries both, and its bare `CREATE VIEW` filed it under the applying session's settings and
+    unmaterialised, seen only on the next comparison
+    (`a_sql_server_view_created_from_a_reading_keeps_its_settings_and_indexes`; through the
+    comparison, `a_missing_view_is_created_with_its_settings_and_its_indexes`; live,
+    `a_comparison_creates_a_missing_view_with_its_settings_and_indexes`). A view new from the
+    editor has neither, and gets the bare statement. `create_view_sql`
     asks per engine (`my`/`pg` locals) rather than `!pg`, which had been sorting SQLite onto
     MySQL's side and would have emitted `ALGORITHM`/`DEFINER`/`SQL SECURITY` at an engine that
     has none of them. The check option and the column list are capabilities of their own,

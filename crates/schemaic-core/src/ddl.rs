@@ -3223,7 +3223,25 @@ impl Change {
                 }
                 format!("Set the table's {}", parts.join(", "))
             }
-            Change::CreateView(d) => format!("Create view {}", d.name),
+            Change::CreateView(d) => {
+                let indexes: Vec<&str> = d
+                    .options
+                    .tsql
+                    .indexes
+                    .iter()
+                    .filter(|ix| !ix.lossy)
+                    .map(|ix| ix.name.as_str())
+                    .collect();
+                match indexes.len() {
+                    0 => format!("Create view {}", d.name),
+                    1 => format!("Create view {} and its index {}", d.name, indexes[0]),
+                    _ => format!(
+                        "Create view {} and its indexes {}",
+                        d.name,
+                        indexes.join(", ")
+                    ),
+                }
+            }
             Change::ReplaceView {
                 draft, recreate, ..
             } => {
@@ -5666,8 +5684,18 @@ impl ChangeSet {
         let mut out = Vec::new();
         for c in &self.changes {
             match c {
+                // Under its settings and with its indexes, as a re-create
+                // builds it: the comparison creates a view from the source's
+                // reading, which carries both, and a bare `CREATE VIEW` filed
+                // it under the session's settings, unmaterialised. A new view
+                // from the editor has neither, and gets the bare statement.
                 Change::CreateView(draft) => {
-                    out.push(create_view_sql(draft, &draft.name, d, false))
+                    out.extend(tsql_settings_wrapped(
+                        None,
+                        create_view_sql(draft, &draft.name, d, false),
+                        &draft.options.tsql.module,
+                    ));
+                    out.extend(view_index_statements(draft, &draft.name, d));
                 }
                 Change::ReplaceView {
                     draft,
@@ -6849,9 +6877,14 @@ fn view_indexes_rebuilt(v: &ViewDraft) -> Option<String> {
 /// included columns, or of a kind the model has no field for
 /// ([`IndexInfo::lossy`]), goes with the view's alter and could only come
 /// back without what was never read.
+///
+/// **And a view created from a reading** (the comparison's create) with such
+/// an index: the view would arrive without it, the plan saying nothing.
 fn lossy_view_index_refusal(c: &Change) -> Option<String> {
-    let Change::ReplaceView { draft, .. } = c else {
-        return None;
+    let (draft, created) = match c {
+        Change::ReplaceView { draft, .. } => (draft, false),
+        Change::CreateView(draft) => (draft, true),
+        _ => return None,
     };
     let lost: Vec<&str> = draft
         .options
@@ -6864,13 +6897,23 @@ fn lossy_view_index_refusal(c: &Change) -> Option<String> {
     if lost.is_empty() {
         return None;
     }
-    Some(format!(
-        "Editing view {} drops its index{} {}, which Schemaic can't create again — it has \
-         included columns, or is of a kind Schemaic can't restate. Edit this view in SQL instead.",
-        draft.original.as_deref().unwrap_or(&draft.name),
-        if lost.len() == 1 { "" } else { "es" },
-        lost.join(", ")
-    ))
+    let plural = if lost.len() == 1 { "" } else { "es" };
+    Some(if created {
+        format!(
+            "Creating view {} can't create its index{plural} {} — it has included columns, or is \
+             of a kind Schemaic can't restate. Create this view in SQL instead.",
+            draft.name,
+            lost.join(", ")
+        )
+    } else {
+        format!(
+            "Editing view {} drops its index{plural} {}, which Schemaic can't create again — it \
+             has included columns, or is of a kind Schemaic can't restate. Edit this view in SQL \
+             instead.",
+            draft.original.as_deref().unwrap_or(&draft.name),
+            lost.join(", ")
+        )
+    })
 }
 
 fn drop_view_sql(qname: &str, materialized: bool) -> String {
@@ -18339,6 +18382,37 @@ mod tests {
         let mut d = ViewDraft::from_table(&t).unwrap();
         d.select = "SELECT id, d FROM dbo.t WHERE d > 1".into();
         let refused = diff_view(&t, &d, MsSql).unsupported();
+        assert!(refused.iter().any(|r| r.contains("a_nix")), "{refused:?}");
+    }
+
+    /// **A view created from another's reading keeps its settings and its
+    /// indexes** — the comparison's create for a view only the source holds.
+    /// `Change::CreateView` was the one module create the settings wrapper
+    /// and the index rebuild never reached, so a view written under `ANSI_NULLS
+    /// OFF` arrived ON (its `d = NULL` matching nothing) and an indexed one
+    /// arrived unmaterialised (S6.2-L1-02). One whose index the model only
+    /// partly read is refused, as its edit is.
+    #[test]
+    fn a_sql_server_view_created_from_a_reading_keeps_its_settings_and_indexes() {
+        let mut t = ms_indexed_view();
+        t.view_options.as_mut().unwrap().tsql.module.ansi_nulls_off = true;
+        let cs = create_view(&ViewDraft::from_table(&t).unwrap(), MsSql);
+        assert!(cs.unsupported().is_empty(), "{:?}", cs.unsupported());
+        let sql = cs.emit();
+        assert_eq!(sql.len(), 5, "{sql:#?}");
+        assert_eq!(sql[0], "SET ANSI_NULLS OFF;");
+        assert!(sql[1].starts_with("CREATE VIEW [dbo].[v]"), "{sql:#?}");
+        assert_eq!(sql[2], "SET ANSI_NULLS ON;");
+        assert_eq!(
+            sql[3],
+            "CREATE UNIQUE CLUSTERED INDEX [cix] ON [dbo].[v] ([a]);"
+        );
+        assert_eq!(sql[4], "CREATE INDEX [a_nix] ON [dbo].[v] ([b]);");
+        let summary = cs.changes[0].summary();
+        assert!(summary.contains("cix"), "{summary}");
+
+        t.view_options.as_mut().unwrap().tsql.indexes[0].lossy = true;
+        let refused = create_view(&ViewDraft::from_table(&t).unwrap(), MsSql).unsupported();
         assert!(refused.iter().any(|r| r.contains("a_nix")), "{refused:?}");
     }
 
