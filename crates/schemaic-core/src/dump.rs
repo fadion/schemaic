@@ -7533,7 +7533,7 @@ mod tests {
         let held = pos(&file, "ADD CONSTRAINT \"c_pos\" CHECK ((id > 0)) NOT VALID");
         assert!(rows < held, "{file}");
         assert!(
-            file.contains("REFERENCES \"parent\" (\"id\") NOT VALID"),
+            file.contains("\"parent\" (\"id\") NOT VALID;"),
             "{file}"
         );
         // Copy DDL has no rows to wait for, and keeps the check inline.
