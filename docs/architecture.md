@@ -4416,8 +4416,13 @@ existing prose was left alone.
     `unsupported()`'s answer** — `tsql_rebuild_refusals`, SQL Server's arm of an exhaustive `match`
     on the dialect in the rebuild branch, where SQLite's is the list above: an index `lossy` there
     (included columns, a columnstore, XML or spatial one) would come back without what was not
-    read, an encrypted trigger has no text to put back, and one kept verbatim names the table as it
-    was, which a rename leaves behind. The guard is the half only the server can answer.
+    read, an encrypted trigger has no text to put back, a **signed** one (`TsqlModule::signed`)
+    would come back from its text without its `ADD SIGNATURE`, which only the certificate's private
+    key could restate — the rights the certificate's user held for it stopped applying, every DML
+    on the table failing or a `TRY…CATCH` in the trigger quietly ending its auditing (S2-L5-05) —
+    and one kept verbatim names the table as it was, which a rename leaves behind. The guard is the
+    half only the server can answer, and it asks `sys.crypt_properties` of the table's triggers too,
+    for a signature added after the reading (`a_rebuild_is_refused_over_a_signed_trigger`).
     `Change::risks` has a SQL Server arm saying what is put back, that the plan stops first on what
     isn't, and the one thing neither half sees — statistics created by hand are not carried over —
     and `Change::summary` for a rebuild is engine-neutral now. What it says is put back is named

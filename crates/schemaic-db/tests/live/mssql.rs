@@ -7404,6 +7404,60 @@ async fn every_arm_of_the_rebuild_guard_refuses_its_table() {
     }
 }
 
+/// **A rebuild is refused over a signed trigger** (S2-L5-05): it re-creates
+/// each trigger from its text, and the copy came back unsigned — whatever the
+/// certificate's user was granted for the trigger stopped applying, with the
+/// risk line saying the triggers were put back. The plan is withheld from the
+/// reading, and its guard refuses it from the server for a signature added
+/// after the table was read; the signature stands.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rebuild_is_refused_over_a_signed_trigger() {
+    use schemaic_core::ddl::TableDraft;
+    if !enabled() || azure_cannot("signs with a certificate the shared database may not allow") {
+        return;
+    }
+    let s = Scratch::create("rebuild_signed").await;
+    for sql in [
+        "CREATE TABLE dbo.r_sig (id int NOT NULL PRIMARY KEY, a int NULL, b int NULL)",
+        "CREATE TRIGGER dbo.tr_sig ON dbo.r_sig AFTER INSERT AS SET NOCOUNT ON",
+        "CREATE CERTIFICATE zz_rebuild_cert ENCRYPTION BY PASSWORD = 'Pa55word!!zz' \
+         WITH SUBJECT = 'schemaic test'",
+    ] {
+        s.exec(sql).await;
+    }
+    let unsigned = read_table(&s, "r_sig").await;
+    s.exec(
+        "ADD SIGNATURE TO dbo.tr_sig BY CERTIFICATE zz_rebuild_cert \
+         WITH PASSWORD = 'Pa55word!!zz'",
+    )
+    .await;
+    let t = read_table(&s, "r_sig").await;
+    let mut d = TableDraft::from_table(&t);
+    d.columns.swap(1, 2);
+    let withheld = schemaic_core::ddl::diff(&t, &d, MS).unsupported();
+    assert!(
+        withheld
+            .iter()
+            .any(|w| w.contains("signature on the trigger tr_sig")),
+        "{withheld:?}"
+    );
+    // Read before it was signed, the plan is the guard's to stop.
+    let mut d = TableDraft::from_table(&unsigned);
+    d.columns.swap(1, 2);
+    assert!(
+        schemaic_core::ddl::diff(&unsigned, &d, MS)
+            .unsupported()
+            .is_empty()
+    );
+    let refused = refused_draft(&s, &unsigned, &d).await;
+    assert!(refused.contains("a trigger on it is signed"), "{refused}");
+    assert_eq!(
+        s.scalar("SELECT COUNT(*) FROM sys.crypt_properties WHERE class = 1")
+            .await,
+        "1"
+    );
+}
+
 /// **A designer key on a table outside `dbo` references its own schema's
 /// table** (S3.1-L1-02). The picker lists the designed table's schema and
 /// sets only the table name; written bare, the key bound to the login's

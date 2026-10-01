@@ -12328,7 +12328,8 @@ fn tsql_server_filled(c: &ColumnInfo) -> bool {
 ///    comments, any extended property on its keys, indexes, defaults, checks
 ///    or triggers or on a key another table holds on it (a description
 ///    included — the model reads only the table's and its columns'), an index
-///    option or a disabled index (a `CREATE INDEX` builds it), a column
+///    option or a disabled index (a `CREATE INDEX` builds it), a signed
+///    trigger (re-created from its text, it comes back unsigned), a column
 ///    feature (sparse, hidden, generated always, `FILESTREAM`, `ROWGUIDCOL`,
 ///    masking, encryption, an XML schema, a sensitivity classification, a
 ///    bound rule or default), a disabled, untrusted or `NOT FOR REPLICATION`
@@ -12459,6 +12460,14 @@ pub fn tsql_rebuild_sql(current: &TableInfo, draft: &TableDraft) -> Vec<String> 
                 .into(),
             "its keys, indexes, checks, defaults or triggers carry extended properties, \
              comments included",
+        ),
+        (
+            // `tsql_rebuild_refusals` says so from the reading; this is the
+            // half for a signature added since.
+            "EXISTS (SELECT 1 FROM sys.crypt_properties c JOIN sys.triggers tr \
+             ON tr.object_id = c.major_id WHERE c.class = 1 AND tr.parent_id = @t)"
+                .into(),
+            "a trigger on it is signed",
         ),
         (
             // A key *another* table holds on it is that table's object, so the
@@ -12824,8 +12833,9 @@ fn tsql_late_arm(probe: &str, cond: &str, why: &str) -> String {
 /// already shows, where the guard it opens with is the half only the server
 /// can answer. An index Schemaic does not read whole (included columns, a
 /// columnstore, XML or spatial one) would come back without what it did not
-/// read; a trigger whose text is encrypted has none to put back; one kept
-/// verbatim names the table as it was, which a rename leaves behind.
+/// read; a trigger whose text is encrypted has none to put back; a signed one
+/// would come back unsigned (S2-L5-05); one kept verbatim names the table as
+/// it was, which a rename leaves behind.
 fn tsql_rebuild_refusals(current: &TableInfo, draft: &TableDraft) -> Vec<String> {
     let t = &current.name;
     let mut out: Vec<String> = current
@@ -12845,6 +12855,14 @@ fn tsql_rebuild_refusals(current: &TableInfo, draft: &TableDraft) -> Vec<String>
         if tr.tsql.hidden {
             out.push(format!(
                 "Rebuilding {t} would drop the trigger {}: its text is encrypted",
+                tr.name
+            ));
+        } else if tr.tsql.module.signed {
+            // Re-created from its text, it comes back unsigned, and only the
+            // certificate's private key could sign it again.
+            out.push(format!(
+                "Rebuilding {t} would drop the signature on the trigger {}, which can't be put \
+                 back without the certificate's private key",
                 tr.name
             ));
         } else if renamed && tr.tsql.verbatim.is_some() {
@@ -16829,6 +16847,31 @@ mod tests {
         let refused = diff(&t, &d, MsSql).unsupported();
         assert_eq!(refused.len(), 2, "{refused:?}");
         assert!(refused[0].contains("ix_inc") && refused[1].contains("tr_p"));
+    }
+
+    /// **A rebuild refuses a table whose trigger is signed** (S2-L5-05): it
+    /// re-creates each trigger from its text, which drops an `ADD SIGNATURE`,
+    /// and a signature cannot be restated without the certificate's private
+    /// key — so whatever the certificate's user was granted for the trigger
+    /// stopped applying, while the risk line said the triggers were put back.
+    /// Refused rather than warned, as the rebuild refuses what it cannot
+    /// restate; an unsigned trigger still rebuilds.
+    #[test]
+    fn a_sql_server_rebuild_refuses_a_signed_trigger() {
+        let mut t = ms_rebuild_table();
+        let mut d = TableDraft::from_table(&t);
+        d.columns.swap(1, 2);
+        assert!(diff(&t, &d, MsSql).unsupported().is_empty());
+        t.triggers[0].tsql.module.signed = true;
+        let refused = diff(&t, &d, MsSql).unsupported();
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert!(
+            refused[0].contains("signature on the trigger tr_p"),
+            "{refused:?}"
+        );
+        // And the guard asks the server, for a signature added since.
+        let guard = &diff(&t, &d, MsSql).emit()[0];
+        assert!(guard.contains("sys.crypt_properties"), "{guard}");
     }
 
     /// **The rebuild's guard sees what stands on the table, not only the
