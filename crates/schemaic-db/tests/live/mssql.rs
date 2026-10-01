@@ -7702,6 +7702,48 @@ async fn a_table_grant_keeps_the_accounts_column_denials() {
     );
 }
 
+/// A scratch database made **contained** (`CONTAINMENT = PARTIAL`), or `None`
+/// — noted as the leg's no-op, `what` naming what is skipped — where the
+/// server's `contained database authentication` is off. A server-wide setting
+/// this reads rather than changes. Azure SQL Database has no such setting,
+/// every database there being contained already.
+async fn contained_scratch(prefix: &str, what: &str) -> Option<Scratch> {
+    let azure = on_azure();
+    let allowed = azure
+        || base_db()
+            .fetch_query(
+                None,
+                "SELECT CAST(value_in_use AS int) FROM sys.configurations \
+             WHERE name = 'contained database authentication'",
+                1,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the setting")
+            .cell(0, 0)
+            .is_some_and(|c| c.display() == "1");
+    if !allowed {
+        endpoint::note_leg_no_op(
+            "mssql",
+            &format!("has contained database authentication off, so {what}"),
+        );
+        return None;
+    }
+    let s = Scratch::create(prefix).await;
+    if !azure {
+        base_db()
+            .fetch_query(
+                None,
+                &format!("ALTER DATABASE [{}] SET CONTAINMENT = PARTIAL", s.name),
+                1,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("a contained database");
+    }
+    Some(s)
+}
+
 /// **A contained user, end to end.** In a database made contained, the
 /// listing says so; a user created with a password of its own is listed with
 /// no login and as holding its password, signs in to that database with it,
@@ -7724,38 +7766,9 @@ async fn a_contained_user_is_created_signs_in_and_is_reset() {
         return;
     }
     let azure = on_azure();
-    let allowed = azure
-        || base_db()
-            .fetch_query(
-                None,
-                "SELECT CAST(value_in_use AS int) FROM sys.configurations \
-             WHERE name = 'contained database authentication'",
-                1,
-                CancellationToken::new(),
-            )
-            .await
-            .expect("the setting")
-            .cell(0, 0)
-            .is_some_and(|c| c.display() == "1");
-    if !allowed {
-        endpoint::note_leg_no_op(
-            "mssql",
-            "has contained database authentication off, so the contained user round trip",
-        );
+    let Some(s) = contained_scratch("contained", "the contained user round trip").await else {
         return;
-    }
-    let s = Scratch::create("contained").await;
-    if !azure {
-        base_db()
-            .fetch_query(
-                None,
-                &format!("ALTER DATABASE [{}] SET CONTAINMENT = PARTIAL", s.name),
-                1,
-                CancellationToken::new(),
-            )
-            .await
-            .expect("a contained database");
-    }
+    };
     let name = format!("{PREFIX}{}_mssql_cuser", std::process::id());
     let run = |stmts: Vec<String>| {
         let db = s.db.clone();
@@ -8472,6 +8485,37 @@ async fn a_rebuild_refreshes_the_views_that_select_star_from_it() {
     d.name = "acct2".into();
     apply_draft(&s, &t, &d).await;
     assert!(s.try_exec("SELECT * FROM dbo.acct_v").await.is_err());
+}
+
+/// **A column move applies in a contained database.** Its catalogue's
+/// collation is always `Latin1_General_100_CI_AS_KS_WS_SC` whatever the
+/// database's, and the `SELECT *` collector's work table was declared
+/// `COLLATE DATABASE_DEFAULT`, so its join with the catalogue was Msg 468 and
+/// every rebuild, rebuilt computed column and dropped column there failed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_column_move_applies_in_a_contained_database() {
+    use schemaic_core::ddl::TableDraft;
+    if !enabled() {
+        return;
+    }
+    let Some(s) = contained_scratch("contained_star", "the contained column move").await else {
+        return;
+    };
+    s.exec("CREATE TABLE dbo.acct (id int PRIMARY KEY, balance int, credit_limit int)")
+        .await;
+    s.exec("INSERT dbo.acct VALUES (1, 1000, 50)").await;
+    s.exec("CREATE VIEW dbo.acct_v AS SELECT * FROM dbo.acct")
+        .await;
+    let t = read_table(&s, "acct").await;
+    let mut d = TableDraft::from_table(&t);
+    d.columns.swap(1, 2);
+    apply_draft(&s, &t, &d).await;
+    assert_eq!(
+        s.scalar("SELECT CONCAT(balance, ':', credit_limit) FROM dbo.acct_v")
+            .await,
+        "1000:50",
+        "the view was refreshed"
+    );
 }
 
 /// **A computed column rebuilt around a rename refreshes what selects `*`.**

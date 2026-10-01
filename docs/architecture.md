@@ -4658,7 +4658,13 @@ existing prose was left alone.
     `is_select_all`, so the collector is **fail-safe rather than exact**: of the views and inline
     functions it keeps those whose text holds a `*` at all, or cannot be read. One that names its
     columns and writes a `*` elsewhere is refreshed for nothing, which costs nothing unless it
-    names a column the plan drops — and then the plan fails whole, the direction to fail in. **A
+    names a column the plan drops — and then the plan fails whole, the direction to fail in. **The
+    temp table's names are `COLLATE CATALOG_DEFAULT`**, the collation of the catalogue views it is
+    joined to: it was `DATABASE_DEFAULT`, which is the same until the database is contained, whose
+    catalogue is always `Latin1_General_100_CI_AS_KS_WS_SC` — and there the join was Msg 468, so no
+    plan that moves a column could be applied in a contained database
+    (`the_star_collector_compares_under_the_catalogues_collation`; live,
+    `a_column_move_applies_in_a_contained_database`). **A
     view in another database is not looked for, and the preview's sentence says so**, naming
     `sp_refreshview`: no catalogue in this database lists one, and entering every database from
     inside the plan's transaction was built and measured on 2022 before it was dropped — the

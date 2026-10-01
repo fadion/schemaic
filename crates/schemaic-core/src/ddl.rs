@@ -12782,12 +12782,19 @@ fn tsql_rebuild_keeps_name(current: &TableInfo, draft: &TableDraft) -> bool {
 /// (Msg 596, reproduced by the live tier's own teardown); and a database
 /// dropped between the listing and its turn dooms the transaction even
 /// caught (Msg 911, `XACT_STATE()` -1).
+///
+/// **The work table's names are `COLLATE CATALOG_DEFAULT`**, the collation
+/// the catalogue views it is joined to use. `DATABASE_DEFAULT` is the same
+/// thing until the database is contained, whose catalogue is always
+/// `Latin1_General_100_CI_AS_KS_WS_SC`: there the join was Msg 468, and no
+/// plan that moves a column could be applied
+/// (`the_star_collector_compares_under_the_catalogues_collation`).
 fn tsql_collect_star_dependents(table: &str) -> String {
     let d = TSQL_STAR_DEPENDENTS;
     format!(
         "DECLARE @t int = OBJECT_ID({}) \
-         CREATE TABLE {d} (object_id int NOT NULL, sch sysname COLLATE DATABASE_DEFAULT NOT NULL, \
-         name sysname COLLATE DATABASE_DEFAULT NOT NULL, type char(2) NOT NULL, lvl int NOT NULL) \
+         CREATE TABLE {d} (object_id int NOT NULL, sch sysname COLLATE CATALOG_DEFAULT NOT NULL, \
+         name sysname COLLATE CATALOG_DEFAULT NOT NULL, type char(2) NOT NULL, lvl int NOT NULL) \
          INSERT {d} VALUES (@t, OBJECT_SCHEMA_NAME(@t), OBJECT_NAME(@t), 'U', 0) \
          DECLARE @lvl int = 0 WHILE @lvl < 32 BEGIN SET @lvl += 1 \
          INSERT {d} (object_id, sch, name, type, lvl) \
@@ -18384,6 +18391,24 @@ mod tests {
         assert!(
             risk.contains("One in another database that selects * from p is not refreshed"),
             "{risk}"
+        );
+    }
+
+    /// **The collector compares names under the catalogue's collation, not the
+    /// database's.** In a contained database the two differ — its catalogue is
+    /// always `Latin1_General_100_CI_AS_KS_WS_SC` — and a work table declared
+    /// `COLLATE DATABASE_DEFAULT` met `sys.sql_expression_dependencies` in a
+    /// join SQL Server could not resolve (Msg 468, measured on 2022), so every
+    /// plan there that moves a column failed. `CATALOG_DEFAULT` is the
+    /// catalogue's own, and the database's wherever the two agree.
+    #[test]
+    fn the_star_collector_compares_under_the_catalogues_collation() {
+        let collect = tsql_collect_star_dependents("[dbo].[t]");
+        assert!(!collect.contains("DATABASE_DEFAULT"), "{collect}");
+        assert_eq!(
+            collect.matches("COLLATE CATALOG_DEFAULT").count(),
+            2,
+            "both name columns: {collect}"
         );
     }
 
