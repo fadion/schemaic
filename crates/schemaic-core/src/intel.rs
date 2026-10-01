@@ -5532,7 +5532,7 @@ fn range_is_terminated(sql: &str, hi: usize) -> bool {
 /// **A range is not always one statement.** T-SQL needs no `;`, so a script in
 /// the language's normal style is one range, and so is a routine body or a
 /// `BEGIN … END` block wherever the editor keeps one together. The range is cut
-/// again into [`statement_units`] and each is checked alone: only the last
+/// again into units ([`units_of`]) and each is checked alone: only the last
 /// unit of the last range is the typing tail, and an error in one statement
 /// hides nothing in the next. It was one unit, so the whole script was the
 /// typing tail — its parse error withheld and, a multi-statement blob never
@@ -5580,7 +5580,7 @@ fn range_diagnostics(
     function_typo_checks(sql, lo, hi, catalog, dialect, out);
 }
 
-/// What one of a range's [`statement_units`] is, to the checks.
+/// What one of a range's units ([`units_of`]) is, to the checks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum UnitKind {
     /// Statements, parsed and checked.
@@ -5605,7 +5605,7 @@ fn statements_need_no_terminator(dialect: SqlDialect) -> bool {
 
 /// `sql[lo..hi]` parsed as the statements it holds — without requiring a `;`
 /// between them where [`statements_need_no_terminator`], which is how the
-/// server reads them, so a cut [`statement_units`] could not be sure of costs
+/// server reads them, so a cut [`units_of`] could not be sure of costs
 /// nothing.
 fn parse_statements(
     text: &str,
@@ -5631,10 +5631,7 @@ fn parse_condition(text: &str, dialect: SqlDialect) -> Result<(), sqlparser::par
     Ok(())
 }
 
-/// The units one range holds, as byte ranges that tile it: the range whole,
-/// one statement, except where [`statements_need_no_terminator`] — there
-/// [`tsql_units`] cuts it into statements, `IF`/`WHILE` conditions and the
-/// control-of-flow around them.
+/// [`units_of`]'s byte ranges and kinds alone, which is what the tests ask.
 #[cfg(test)]
 fn statement_units(
     sql: &str,
@@ -5648,7 +5645,7 @@ fn statement_units(
         .collect()
 }
 
-/// One of a range's [`statement_units`], with what [`TsqlFlow`] reads of it.
+/// One of a range's units ([`units_of`]), with what [`TsqlFlow`] reads of it.
 struct Unit {
     lo: usize,
     hi: usize,
@@ -5670,7 +5667,11 @@ struct Unit {
     merge: Option<(usize, usize)>,
 }
 
-/// [`statement_units`] with what the T-SQL flow checks read of each.
+/// The units one range holds, as byte ranges that tile it: the range whole,
+/// one statement, except where [`statements_need_no_terminator`] — there
+/// [`tsql_units`] cuts it into statements, `IF`/`WHILE` conditions and the
+/// control-of-flow around them — each with what the T-SQL flow checks read
+/// of it.
 fn units_of(sql: &str, lo: usize, hi: usize, dialect: SqlDialect) -> Vec<Unit> {
     let whole = || Unit {
         lo,
@@ -7141,7 +7142,7 @@ fn tsql_gap_masks(sql: &str, lo: usize, hi: usize, toks: &[Token]) -> Vec<Mask> 
                     continue;
                 }
                 b'{' => {
-                    let kw = next(p + 1).map_or(p + 1, |q| q);
+                    let kw = next(p + 1).unwrap_or(p + 1);
                     let mut q = kw;
                     while q < end && b[q].is_ascii_alphabetic() {
                         q += 1;
