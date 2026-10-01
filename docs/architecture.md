@@ -27762,7 +27762,11 @@ Re-introducing the anti-patterns these guard against is a regression:
   `ddl::TsqlCursor`, the trigger and routine header walk, read a parameter `@as` as a `@` and the
   keyword `AS`, so a procedure declaring one rebuilt into Msg 137, and `db::mssql`'s view-header
   scan read `v$as` as `v` and the header's `AS` — it is on the cursor now, as
-  `ddl::tsql_view_parts`. A new T-SQL
+  `ddl::tsql_view_parts`. A fifth was the guards' `word_tokens`, which dropped the leading prefix
+  and read the rest, so `SELECT @delete = 1` was refused as a `DELETE` and `SELECT * FROM #update`
+  blocked on a read-only connection; it keeps the prefix on the word now (`@DELETE`, no keyword any
+  list holds), and the keyword spelled without one is read as before
+  (`a_t_sql_variable_spelled_like_a_keyword_is_no_write`). A new T-SQL
   scanner asks these two rather than adding the bytes locally.
 - **A Velopack channel name is app identity, like `--packId`: add a name, never rename one.** The
   three `release.yml` packs with — `win-x64`, `linux-x64`, `osx-arm64` — are explicit because a

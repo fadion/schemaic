@@ -4350,6 +4350,17 @@ fn word_tokens(sql: &str, dialect: SqlDialect) -> (Vec<String>, bool) {
             i = j;
             continue;
         }
+        // **A T-SQL `@x`, `@@x`, `#t` or `##t` keeps its prefix**, as every
+        // other T-SQL scanner here does: the prefix was dropped and the rest
+        // read as a word, so `SELECT @delete = 1` was refused as a `DELETE`.
+        // `@DELETE` is no keyword any list holds, and the keyword spelled
+        // without one is still read as before. `0` off SQL Server.
+        let prefix = t_sql_name_prefix(b, i, dialect);
+        if word.is_empty() && prefix > 0 {
+            word.extend_from_slice(&b[i..i + prefix]);
+            i += prefix;
+            continue;
+        }
         let c = b[i];
         if c == b';' {
             flush!();
@@ -8089,6 +8100,40 @@ mod tests {
         ] {
             assert!(gate(ok, ms).is_ok(), "{ok}: {:?}", gate(ok, ms));
         }
+    }
+
+    /// **A T-SQL variable or temporary table is a name, not the keyword it
+    /// spells.** The guards' word scan dropped the `@`/`#` and read the rest,
+    /// so `SELECT @delete = 1` was refused as a `DELETE` and `SELECT * FROM
+    /// #update` called a write — while every T-SQL scanner beside it keeps the
+    /// prefix on the name. The keyword itself is still the keyword.
+    #[test]
+    fn a_t_sql_variable_spelled_like_a_keyword_is_no_write() {
+        let ms = SqlDialect::MsSql;
+        for read in [
+            "SELECT @delete = 1",
+            "SELECT * FROM #update",
+            "SELECT @@ROWCOUNT AS drop_count, @insert",
+            "SELECT a FROM ##merge WHERE b = @truncate",
+        ] {
+            assert!(
+                super::read_only_reason(read, ms).is_ok(),
+                "{read}: {:?}",
+                super::read_only_reason(read, ms)
+            );
+            assert!(!super::contains_write(read, ms), "{read}");
+        }
+        for write in [
+            "SELECT @x = 1 DELETE FROM t",
+            "SELECT @x DELETE FROM t",
+            "SELECT * FROM #t; UPDATE t SET a = 1",
+            "SELECT @delete INTO t2 FROM t UPDATE t SET a = 1",
+        ] {
+            assert!(super::read_only_reason(write, ms).is_err(), "{write}");
+            assert!(super::contains_write(write, ms), "{write}");
+        }
+        // Off SQL Server `@` is no prefix, and nothing changes.
+        assert!(super::contains_write("SELECT @delete", SqlDialect::MySql));
     }
 
     // ── The gate's lexer half, per dialect ───────────────────────────────────
