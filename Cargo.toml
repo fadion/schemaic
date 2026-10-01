@@ -25,7 +25,7 @@ exclude = ["vendor"]
 private_intra_doc_links = "allow"
 
 [workspace.package]
-version = "0.30.0"
+version = "0.31.0"
 edition = "2024"
 license = "MIT"
 authors = ["Schemaic contributors"]
