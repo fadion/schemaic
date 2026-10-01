@@ -8496,7 +8496,11 @@ existing prose was left alone.
     signature is not in this script` ahead of its `CREATE`, a batch of its own, since a comment in
     the `CREATE`'s batch would be stored as part of the module
     (`copy_ddl_of_a_signed_routine_says_the_signature_is_not_in_it`; live, in
-    `a_replay_drops_no_module_it_cannot_restate_whole`).
+    `a_replay_drops_no_module_it_cannot_restate_whole`). **The dump says the same of a signed
+    trigger**: its script is `TriggerInfo::create_set_sql`, not `ObjectItem::create_sql`, so the
+    note there is a statement of its own ahead of the trigger's settings, which `client_script`
+    gives a batch apart (`a_signed_triggers_script_says_the_signature_is_not_in_it`; live, the same
+    leg).
     `TableInfo::create_ddl` — `CREATE TABLE`/`VIEW`, built on the
     above; its **view** branch delegates to `ddl::view_ddl` so Copy DDL, the MCP table-info tool
     and the apply path all emit through one view emitter (it used to have its own, which restated

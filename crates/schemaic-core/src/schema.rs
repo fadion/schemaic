@@ -2861,9 +2861,35 @@ impl TriggerInfo {
                 // both stated — a script's reader may be `sqlcmd`, whose
                 // `QUOTED_IDENTIFIER` is OFF (`ddl::tsql_settings_around`); no
                 // wrapper on the other engines.
+                //
+                // **A signed one says the signature is not in the script**, as a
+                // signed routine's Copy DDL does (`ObjectItem::create_sql`): no
+                // script carries `ADD SIGNATURE`, so it is created unsigned. A
+                // statement of its own, ahead of the settings, so the comment is
+                // not in the `CREATE`'s batch and stored with the trigger.
                 let wrapped = match dialect {
                     crate::intel::SqlDialect::MsSql => {
-                        crate::ddl::tsql_settings_scripted(create, &t.tsql.module, t.tsql.hidden)
+                        let mut out: Vec<String> = (t.tsql.module.signed && !t.tsql.hidden)
+                            .then(|| {
+                                format!(
+                                    "-- NOTE: trigger {} is signed, and the signature is not in \
+                                     this script: it is created unsigned. Sign it again (ADD \
+                                     SIGNATURE) after running this.",
+                                    crate::export::comment_text(&qualified_ident(
+                                        &t.name,
+                                        t.schema.as_deref(),
+                                        dialect
+                                    ))
+                                )
+                            })
+                            .into_iter()
+                            .collect();
+                        out.extend(crate::ddl::tsql_settings_scripted(
+                            create,
+                            &t.tsql.module,
+                            t.tsql.hidden,
+                        ));
+                        out
                     }
                     crate::intel::SqlDialect::MySql
                     | crate::intel::SqlDialect::Postgres
@@ -9796,6 +9822,38 @@ mod tests {
             .unwrap_or_else(|| panic!("{signed}"));
         let create = signed
             .find("CREATE PROCEDURE [dbo].[p]")
+            .expect("the CREATE");
+        assert!(note < create, "{signed}");
+        assert!(signed[note..create].contains("\nGO\n"), "{signed}");
+    }
+
+    /// **And so does a signed trigger, in the script the dump writes for it.**
+    /// The routine's note lives in `ObjectItem::create_sql`; a trigger's
+    /// script is `TriggerInfo::create_set_sql`, and a signed one went into
+    /// the file unannounced, to be created unsigned. The note is a statement
+    /// of its own, ahead of the trigger's settings, so `client_script` gives
+    /// it a batch apart from the `CREATE TRIGGER`'s.
+    #[test]
+    fn a_signed_triggers_script_says_the_signature_is_not_in_it() {
+        let d = crate::intel::SqlDialect::MsSql;
+        let mut t = TriggerInfo {
+            name: "tr".into(),
+            schema: Some("dbo".into()),
+            table: "t".into(),
+            timing: TriggerTiming::After,
+            events: vec![TriggerEvent::Insert],
+            action: TriggerAction::Body("SET NOCOUNT ON".into()),
+            ..Default::default()
+        };
+        let plain = crate::ddl::client_script(&TriggerInfo::create_set_sql(&[t.clone()], d), d);
+        assert!(!plain.contains("signed"), "{plain}");
+        t.tsql.module.signed = true;
+        let signed = crate::ddl::client_script(&TriggerInfo::create_set_sql(&[t], d), d);
+        let note = signed
+            .find("-- NOTE: trigger [dbo].[tr] is signed, and the signature is not in this script")
+            .unwrap_or_else(|| panic!("{signed}"));
+        let create = signed
+            .find("CREATE TRIGGER [dbo].[tr]")
             .expect("the CREATE");
         assert!(note < create, "{signed}");
         assert!(signed[note..create].contains("\nGO\n"), "{signed}");
