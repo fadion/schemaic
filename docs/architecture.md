@@ -3796,7 +3796,15 @@ existing prose was left alone.
     `a_sql_server_object_is_created_dropped_and_restarted_in_t_sql`; the live round trip carries a
     sequence in a table-less schema behind one default and one in `dbo` behind another, an alias
     type, a schema collection behind a typed `xml` column and a synonym a view reads through, and
-    compares each counter's next value on the copy and again after the replay).
+    compares each counter's next value on the copy and again after the replay). **So is one only a
+    routine the file creates names** (`tsql_named_by_routines`): the routines come with their
+    namespace whatever the tables name, and a `dbo` alias type that only an `s3` procedure's
+    parameter used was neither carried nor named, so the restore stopped at the procedure (Msg
+    2715). A parameter's or the return's type counts, bare or qualified, and the body by qualified
+    name only — bare, a name there is far more often a column or a variable, and one wrongly
+    carried makes a schema the restore did not need
+    (`an_object_only_a_dumped_routine_names_is_carried`; live,
+    `a_dump_carries_a_type_only_its_routines_name`).
     **What that namespace filter leaves out is now accounted for in the header** (`outside_dependencies`):
     the types and sequences the chosen tables' columns name that this file will not create, as
     display names, in the order they would have been emitted. Emitting only the chosen namespaces'

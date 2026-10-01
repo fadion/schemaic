@@ -1443,6 +1443,45 @@ fn tsql_named(
     })
 }
 
+/// Does a routine the file creates name SQL Server object `o` — a parameter's
+/// or the return's type (`@h [dbo].[Hash]`, `xml([dbo].[coll])`), or, by its
+/// qualified name, in the body (`NEXT VALUE FOR [seq].[n]`)?
+///
+/// **[`tsql_named`] asks only the tables**, and the routines of the export's
+/// namespaces are emitted whatever the tables name, so an alias type outside
+/// those namespaces that only a procedure's parameter used was neither
+/// carried nor named, and the restore stopped at that procedure (Msg 2715).
+/// A bare name in a body is not asked: there it is far more often a column
+/// or a variable than the object, and one wrongly carried makes a schema the
+/// restore did not need.
+fn tsql_named_by_routines(
+    schema: &DbSchema,
+    namespaces: &[Option<String>],
+    skip: &std::collections::HashSet<(Option<String>, String)>,
+    o: &crate::schema::TsqlObject,
+) -> bool {
+    let local = schema
+        .tsql_objects
+        .iter()
+        .any(|l| l.name == o.name && namespaces.contains(&l.schema));
+    let qualified = o.schema.as_ref().map(|ns| format!("{ns}.{}", o.name));
+    let strip = |text: &str| text.replace(['[', ']'], "");
+    schema
+        .routines
+        .iter()
+        .filter(|r| {
+            namespaces.contains(&r.schema) && !skip.contains(&(r.schema.clone(), r.name.clone()))
+        })
+        .any(|r| {
+            let sig = strip(&format!("{}\n{}", r.arguments, r.returns));
+            let body = strip(&r.body);
+            qualified
+                .as_deref()
+                .is_some_and(|q| names_identifier(&sig, q) || names_identifier(&body, q))
+                || (!local && names_identifier(&sig, &o.name))
+        })
+}
+
 /// Does `text` name `word` as a whole identifier?
 ///
 /// Byte-wise on [`crate::sql::is_word_byte`], the one definition of where an
@@ -2135,12 +2174,16 @@ pub fn plan(
     // out and the restore stopped at the first `NEXT VALUE FOR` (Msg 208).
     // One outside the export's namespaces is not the file's to own, so it is
     // created only where it is missing and never dropped.
+    // And one only a routine the file creates names, since the routines come
+    // with the namespace (`tsql_named_by_routines`).
     let carried_outside: Vec<&crate::schema::TsqlObject> = if opts.other_objects {
         schema
             .tsql_objects
             .iter()
             .filter(|o| {
-                !namespaces.contains(&o.schema) && tsql_named(schema, &order, &namespaces, o)
+                !namespaces.contains(&o.schema)
+                    && (tsql_named(schema, &order, &namespaces, o)
+                        || tsql_named_by_routines(schema, &namespaces, &dependent_routines, o))
             })
             .collect()
     } else {
@@ -5581,6 +5624,94 @@ mod tests {
         let header = text_of(&p);
         assert!(header.contains("Sequences.OrderID"), "{header}");
         assert!(!header.contains("CREATE SEQUENCE"), "{header}");
+    }
+
+    /// **An object outside the export that only a dumped routine names is
+    /// carried too.** The routines come with their namespace whatever the
+    /// tables name, and an alias type or XML schema collection in `dbo` that
+    /// only an `s3` procedure's parameter used was neither carried nor named:
+    /// the restore stopped at the procedure (Msg 2715, measured on 2022).
+    #[test]
+    fn an_object_only_a_dumped_routine_names_is_carried() {
+        use crate::schema::{TsqlObject, TsqlObjectKind};
+        let mut t = table("t");
+        t.schema = Some("s3".to_string());
+        let mut s = schema_of(vec![t]);
+        let proc = |name: &str, arguments: &str, body: &str| {
+            std::sync::Arc::new(crate::schema::RoutineInfo {
+                name: name.to_string(),
+                schema: Some("s3".to_string()),
+                kind: crate::schema::RoutineKind::Procedure,
+                language: "SQL".to_string(),
+                arguments: arguments.to_string(),
+                body: body.to_string(),
+                ..Default::default()
+            })
+        };
+        s.routines.push(proc(
+            "p",
+            "@h [dbo].[Hash], @x xml([dbo].[coll])",
+            "SELECT @h",
+        ));
+        s.routines
+            .push(proc("q", "", "SELECT NEXT VALUE FOR [dbo].[ctr]"));
+        // Named nowhere, bare in a body: not carried.
+        s.routines.push(proc("r", "", "SELECT other FROM t"));
+        let obj = |name: &str, kind| TsqlObject {
+            schema: Some("dbo".to_string()),
+            name: name.to_string(),
+            kind,
+        };
+        s.tsql_objects = vec![
+            obj(
+                "coll",
+                TsqlObjectKind::XmlSchemaCollection {
+                    definition: "<xsd:schema/>".to_string(),
+                },
+            ),
+            obj(
+                "Hash",
+                TsqlObjectKind::AliasType {
+                    base: "binary(4)".to_string(),
+                    nullable: false,
+                },
+            ),
+            obj(
+                "ctr",
+                TsqlObjectKind::Sequence {
+                    data_type: "int".to_string(),
+                    start: "1".to_string(),
+                    increment: "1".to_string(),
+                    min: "1".to_string(),
+                    max: "9".to_string(),
+                    cycle: false,
+                    cache: None,
+                    last_used: None,
+                },
+            ),
+            obj(
+                "other",
+                TsqlObjectKind::Synonym {
+                    target: vec!["x".to_string()],
+                },
+            ),
+        ];
+        let file = file_of(&plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::MsSql,
+        ));
+        let procedure = pos(&file, "CREATE PROCEDURE [s3].[p]");
+        for made in [
+            "IF TYPE_ID(N'[dbo].[Hash]') IS NULL EXEC(",
+            "WHERE name = N'coll' AND schema_id = SCHEMA_ID(N'dbo')) EXEC(",
+            "IF OBJECT_ID(N'[dbo].[ctr]', N'SO') IS NULL EXEC(",
+        ] {
+            assert!(pos(&file, made) < procedure, "{made}: {file}");
+        }
+        assert!(!file.contains("[dbo].[other]"), "{file}");
     }
 
     /// **A replay drops no sequence, and nothing the chosen tables do not

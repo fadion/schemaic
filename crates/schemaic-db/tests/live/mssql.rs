@@ -1582,6 +1582,41 @@ async fn a_dump_leaves_a_ledger_table_out_and_names_it() {
     );
 }
 
+/// **What only a dumped routine names is carried.** A `dbo` alias type that
+/// only an `s3` procedure's parameter used was neither carried nor named in a
+/// dump of `s3.t`, and the restore into an empty database stopped at the
+/// procedure (Msg 2715).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dump_carries_a_type_only_its_routines_name() {
+    use schemaic_core::dump::DumpOptions;
+    if !enabled() || azure_cannot("restores into a second database, which it has not got") {
+        return;
+    }
+    let src = Scratch::create("dump_rtypesrc").await;
+    src.exec("CREATE SCHEMA s3").await;
+    src.exec(
+        "CREATE TYPE dbo.Hash FROM binary(4) NOT NULL; \
+         CREATE TABLE s3.t (id int PRIMARY KEY); INSERT s3.t VALUES (1);",
+    )
+    .await;
+    src.exec("CREATE PROCEDURE s3.p @h dbo.Hash AS SELECT @h AS h")
+        .await;
+    let file = Box::pin(dump_file_of(&src, DumpOptions::default(), |n| n == "s3.t")).await;
+    let dst = Scratch::create("dump_rtypedst").await;
+    let end = Box::pin(restore_file(&dst, &file)).await;
+    assert!(
+        matches!(end, schemaic_core::script::ExecEnd::Done),
+        "{end:?}\n{file}"
+    );
+    assert_eq!(
+        dst.scalar(
+            "SELECT CONCAT(TYPE_NAME(TYPE_ID('dbo.Hash')), '|', OBJECT_ID('s3.p') / OBJECT_ID('s3.p'))"
+        )
+        .await,
+        "Hash|1"
+    );
+}
+
 /// **A synonym written `db..object` comes back as written.** `PARSENAME`'s
 /// missing schema part was dropped, so the copy's synonym read `[db].[t]` —
 /// schema `db` in the restoring database — and pointed at nothing (Msg 208).
