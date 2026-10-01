@@ -444,16 +444,25 @@ fn is_destructive(sql: &str, kind: &str, dialect: SqlDialect) -> bool {
 /// as an opener, a `TRY … CATCH` made the panel promise the file "lands whole
 /// or not at all" and report a later failure as undoing rows that were
 /// committed.
+///
+/// **Nor is MariaDB's `BEGIN NOT ATOMIC … END`**, a compound block run outside
+/// any routine, each statement in it autocommitted; counted as an opener, a
+/// failure after it was reported as rolling back what the block had
+/// committed. No engine's transaction `BEGIN` is followed by `NOT ATOMIC`, so
+/// the words decide it on every dialect.
 fn opens_transaction(sql: &str, kind: &str, dialect: SqlDialect) -> bool {
+    let words = || sql::leading_words(sql, 3, dialect);
     match kind {
         "START" => true,
         "BEGIN" if dialect.batch_separator() => matches!(
-            sql::leading_words(sql, 2, dialect)
-                .get(1)
-                .map(String::as_str),
+            words().get(1).map(String::as_str),
             Some("TRAN" | "TRANSACTION" | "DISTRIBUTED")
         ),
-        "BEGIN" => true,
+        "BEGIN" => {
+            let w = words();
+            !(w.get(1).map(String::as_str) == Some("NOT")
+                && w.get(2).map(String::as_str) == Some("ATOMIC"))
+        }
         _ => false,
     }
 }
@@ -1899,6 +1908,26 @@ mod tests {
         // A failure at the trailing `SET`: the rows are committed, and the
         // report must not claim otherwise.
         assert_eq!(durability(Some(&p), 4), Durability::Unknown);
+    }
+
+    /// **MariaDB's `BEGIN NOT ATOMIC … END` is a compound block, not a
+    /// transaction.** The probe counted its `BEGIN` as the file opening one,
+    /// so a block that autocommits each statement it holds was reported as
+    /// "nothing was applied" when a later statement failed.
+    #[test]
+    fn a_compound_block_is_not_the_file_opening_a_transaction() {
+        let p = probed(
+            "DELIMITER $$\nBEGIN NOT ATOMIC\n  INSERT INTO t VALUES (1);\n  \
+             INSERT INTO t VALUES (2);\nEND$$\nDELIMITER ;\nINSERT INTO t VALUES ('x');",
+        );
+        assert!(!p.own_transaction, "{:?}", p.kinds);
+        assert_eq!(p.atomic_through, None);
+        assert_eq!(durability(Some(&p), 1), Durability::Applied);
+        // `BEGIN` and `BEGIN WORK` still open one.
+        for open in ["BEGIN", "BEGIN WORK"] {
+            let p = probed(&format!("{open};\nINSERT INTO t VALUES (1);\nCOMMIT;"));
+            assert!(p.own_transaction, "{open}");
+        }
     }
 
     /// A transaction the probe never saw close still covers everything it read —

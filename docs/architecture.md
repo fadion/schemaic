@@ -10290,7 +10290,10 @@ existing prose was left alone.
     `BEGIN` opens a transaction only as `BEGIN TRAN[SACTION]` or `BEGIN DISTRIBUTED`
     (`opens_transaction`): a bare one opens a block, and read as an opener a `TRY … CATCH` made the
     panel promise the file "lands whole or not at all" and report a later failure as undoing rows
-    that were committed (`a_t_sql_block_is_not_the_file_opening_a_transaction`). It is bounded
+    that were committed (`a_t_sql_block_is_not_the_file_opening_a_transaction`). Nor does MariaDB's
+    `BEGIN NOT ATOMIC … END`, a compound block whose statements each autocommit, on any dialect —
+    no transaction `BEGIN` is followed by `NOT ATOMIC`
+    (`a_compound_block_is_not_the_file_opening_a_transaction`). It is bounded
     by `PROBE_MAX_BYTES` — the same 8 MB as `SAMPLE_MAX_BYTES`, for the same reason: the user asked
     to *look* at a file — and by `PROBE_MAX_STATEMENTS`. Either bound sets `Probe::more`, and every
     count is then reported through `count_label` as a floor (`400+`), never rounded up to a total
