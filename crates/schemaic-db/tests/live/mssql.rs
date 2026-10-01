@@ -679,6 +679,15 @@ async fn a_cursors_plan_is_read_as_its_own_statement() {
 /// does: text steps verbatim, each rows step streamed from `src` through the
 /// export renderer.
 async fn dump_file(src: &Scratch, opts: schemaic_core::dump::DumpOptions) -> String {
+    Box::pin(dump_file_of(src, opts, |_| true)).await
+}
+
+/// [`dump_file`] of the tables whose display name `pick` takes.
+async fn dump_file_of(
+    src: &Scratch,
+    opts: schemaic_core::dump::DumpOptions,
+    pick: impl Fn(&str) -> bool,
+) -> String {
     use schemaic_core::dump::{DumpStep, plan};
     let schema = Box::pin(src.db.fetch_schema(&src.name, CancellationToken::new()))
         .await
@@ -687,6 +696,7 @@ async fn dump_file(src: &Scratch, opts: schemaic_core::dump::DumpOptions) -> Str
         .tables
         .iter()
         .map(|t| schemaic_core::schema::display_name(t.schema.as_deref(), &t.name))
+        .filter(|n| pick(n))
         .collect();
     let dump = plan(&schema, &src.name, &chosen, opts, MS);
     let mut file = String::new();
@@ -1120,6 +1130,48 @@ async fn a_dump_restores_into_an_empty_database() {
     dst.exec("INSERT dbo.customers (name) VALUES (N'next')")
         .await;
     assert_eq!(dst.scalar("SELECT MAX(id) FROM dbo.customers").await, "4");
+}
+
+/// **Without *One transaction*, a replay that fails at a `DROP` has dropped
+/// only what it already put back.** A key from a table outside the export
+/// refuses its target's drop (Msg 3726); with every `DROP` up front, the
+/// tables and the view ahead of it were gone by then, and every `CREATE` was
+/// below the failure.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replay_without_its_transaction_fails_before_dropping_what_it_cannot_put_back() {
+    use schemaic_core::dump::DumpOptions;
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("dump_notx").await;
+    s.exec(
+        "CREATE TABLE dbo.customers (id int PRIMARY KEY); INSERT dbo.customers VALUES (1); \
+         CREATE TABLE dbo.products (id int PRIMARY KEY); INSERT dbo.products VALUES (1); \
+         CREATE TABLE dbo.orders (id int PRIMARY KEY, c int REFERENCES dbo.customers(id));",
+    )
+    .await;
+    s.exec("CREATE VIEW dbo.v_c AS SELECT id FROM dbo.customers")
+        .await;
+    let opts = DumpOptions {
+        wrap_transaction: false,
+        ..Default::default()
+    };
+    let file = Box::pin(dump_file_of(&s, opts, |n| n != "dbo.orders")).await;
+    let end = Box::pin(restore_file(&s, &file)).await;
+    assert!(
+        matches!(&end, schemaic_core::script::ExecEnd::Failed { message, .. } if message.contains("3726")),
+        "{end:?}\n{file}"
+    );
+    assert_eq!(
+        s.scalar(
+            "SELECT CONCAT(OBJECT_ID('dbo.products', 'U') / OBJECT_ID('dbo.products', 'U'), \
+             OBJECT_ID('dbo.v_c', 'V') / OBJECT_ID('dbo.v_c', 'V'), \
+             (SELECT COUNT(*) FROM dbo.customers))"
+        )
+        .await,
+        "111",
+        "{file}"
+    );
 }
 
 /// Validation compiles without running: a missing table is reported by

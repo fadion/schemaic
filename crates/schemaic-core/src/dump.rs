@@ -625,6 +625,10 @@ pub fn drop_cascade(dialect: SqlDialect) -> &'static str {
 /// first referenced table (Msg 3726); a schema-bound view blocks its table's
 /// drop the same way (Msg 3729). Computed from the two answers rather than
 /// matched on the engine, so an engine that gains either stops needing it.
+///
+/// [`plan`] writes the section only inside the file's own transaction
+/// ([`DumpOptions::wrap_transaction`]): it is safe to fail in only because a
+/// failure undoes it.
 pub fn drops_up_front(dialect: SqlDialect) -> bool {
     fk_guard_sql(dialect).is_none() && drop_cascade(dialect).is_empty()
 }
@@ -1818,7 +1822,16 @@ pub fn plan(
     // The file drops what it recreates in one section before any `CREATE` —
     // see `drops_up_front`. Asked once; the table loop and the routines both
     // answer to it.
-    let up_front = opts.structure && opts.drop_if_exists && drops_up_front(dialect);
+    //
+    // **Only inside the file's transaction.** The section is safe to fail in
+    // only because a failure undoes it: without one, a replay stopped at an
+    // up-front `DROP` — a key from a table outside the export (Msg 3726) —
+    // left everything dropped ahead of it gone, with every `CREATE` still
+    // below the failure. Without the transaction each table and view is
+    // dropped beside its own `CREATE`, as on the other engines, so a failure
+    // has dropped only what was already put back.
+    let up_front =
+        opts.structure && opts.drop_if_exists && opts.wrap_transaction && drops_up_front(dialect);
     // **`other_objects` alone, not `structure && other_objects`.** The modal
     // draws it as a peer of Structure and Data, so ticking it by itself asks for
     // a file of the database's types, sequences and routines — a coherent thing
@@ -5387,6 +5400,55 @@ mod tests {
             assert!(!file.contains("DROP CONSTRAINT"), "{d:?}: {file}");
             assert!(!file.contains("DROP FUNCTION"), "{d:?}: {file}");
         }
+    }
+
+    /// **Nothing is dropped up front without *One transaction*.** The section
+    /// puts every `DROP` ahead of every `CREATE`, so a replay that failed at
+    /// one of them — a key from a table outside the export (Msg 3726) — left
+    /// every object dropped ahead of it gone and never recreated; only the
+    /// transaction made the section safe to fail in. Without it each table and
+    /// view is dropped beside its own `CREATE`, as on the other engines, and
+    /// no routine or key is dropped at all.
+    #[test]
+    fn without_one_transaction_a_sql_server_file_drops_each_table_beside_its_create() {
+        let mut parent = table("parent");
+        parent.schema = Some("dbo".to_string());
+        let mut child = refs(table("child"), "parent");
+        child.schema = Some("dbo".to_string());
+        let mut v = view("v");
+        v.schema = Some("dbo".to_string());
+        v.create_sql = Some("CREATE VIEW dbo.v AS SELECT 1 AS id".to_string());
+        let mut s = schema_of(vec![child, parent, v]);
+        s.routines
+            .push(std::sync::Arc::new(crate::schema::RoutineInfo {
+                name: "f".to_string(),
+                schema: Some("dbo".to_string()),
+                kind: crate::schema::RoutineKind::Function,
+                arguments: "@x int".to_string(),
+                returns: "int".to_string(),
+                body: "BEGIN RETURN @x; END".to_string(),
+                ..Default::default()
+            }));
+        let opts = DumpOptions {
+            wrap_transaction: false,
+            ..Default::default()
+        };
+        let file = file_of(&plan(&s, "shop", &all(&s), opts, SqlDialect::MsSql));
+        assert!(!file.contains("-- Dropped first"), "{file}");
+        assert!(!file.contains("DROP FUNCTION"), "{file}");
+        assert!(!file.contains("DROP CONSTRAINT"), "{file}");
+        let create_parent = pos(&file, "CREATE TABLE [dbo].[parent]");
+        let drop_child = pos(&file, "DROP TABLE IF EXISTS [dbo].[child];");
+        assert!(pos(&file, "DROP TABLE IF EXISTS [dbo].[parent];") < create_parent);
+        assert!(create_parent < drop_child, "{file}");
+        assert!(
+            drop_child < pos(&file, "CREATE TABLE [dbo].[child]"),
+            "{file}"
+        );
+        assert!(
+            pos(&file, "DROP VIEW IF EXISTS [dbo].[v];") < pos(&file, "CREATE VIEW [dbo].[v]"),
+            "{file}"
+        );
     }
 
     /// `USE shop` on a server with no `shop` is ERROR 1049 on line 1, and
