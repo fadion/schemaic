@@ -5725,8 +5725,8 @@ fn tsql_condition_end(sql: &str, toks: &[Token], i: usize) -> usize {
 /// new statement must begin, and a cut it misses costs nothing: the unit is
 /// parsed without requiring `;` between statements ([`parse_statements`]),
 /// which is how the server reads it. Only at the top level, outside a
-/// `CASE … END`, and never inside a `GRANT`/`REVOKE`/`DENY`, whose privilege
-/// list is made of these words.
+/// `CASE … END`, and never inside a `GRANT`/`REVOKE`/`DENY` before its
+/// principals, since its privilege list is made of these words.
 fn tsql_statement_end(sql: &str, toks: &[Token], i: usize) -> usize {
     let word = |j: usize| tsql_keyword(toks, j);
     let lparen = |j: usize| matches!(toks.get(j).map(|t| &t.kind), Some(TkKind::LParen));
@@ -5779,6 +5779,9 @@ struct TsqlStatement {
     rows: bool,
     /// An `UPDATE` has reached its `SET`.
     set: bool,
+    /// A `GRANT`/`REVOKE`/`DENY` has reached its principals — its `TO`, or
+    /// a `REVOKE`'s `FROM`.
+    principals: bool,
     /// Open `CASE`s, whose `END` and `ELSE` are theirs.
     case: usize,
 }
@@ -5791,6 +5794,7 @@ impl TsqlStatement {
             verb,
             rows: false,
             set: false,
+            principals: false,
             case: 0,
         }
     }
@@ -5803,13 +5807,22 @@ impl TsqlStatement {
     /// one? `prev`/`next` are the keyword-capable words either side of it,
     /// `call` whether a `(` follows it.
     fn cuts_before(&self, w: &str, prev: Option<&str>, next: Option<&str>, call: bool) -> bool {
-        if self.head_is(&["GRANT", "REVOKE", "DENY"]) {
+        // A privilege list is made of these words — `GRANT SELECT, INSERT,
+        // UPDATE ON t` — so nothing cuts before the principals; after them a
+        // statement begins as anywhere else (`… TO public IF @@ERROR <> 0`).
+        if self.head_is(&["GRANT", "REVOKE", "DENY"]) && !self.principals {
             return false;
         }
         let is = |x: Option<&str>, set: &[&str]| x.is_some_and(|x| set.contains(&x));
         // A `WITH`'s common table expressions, before the statement they feed.
         let feeding = self.head.as_deref() == Some("WITH") && self.verb.is_none();
         let inserting = self.verb.as_deref() == Some("INSERT") && !self.rows;
+        // `ON UPDATE CASCADE`, `ON DELETE SET NULL` — a key's referential
+        // action, which reaches the top level only in an `ALTER TABLE … ADD
+        // CONSTRAINT` (a `CREATE TABLE`'s sits in its parentheses). Any other
+        // `ON` before a write is a `SET NOCOUNT ON`'s, and the write is the
+        // next statement.
+        let key_action = prev == Some("ON") && self.head_is(&["ALTER", "CREATE"]);
         match w {
             "SELECT" => {
                 !(is(prev, &["UNION", "ALL", "EXCEPT", "INTERSECT", "AS", "FOR"])
@@ -5818,9 +5831,9 @@ impl TsqlStatement {
             }
             "INSERT" => !(is(prev, &["THEN", "BULK"]) || feeding),
             // `UPDATE(col)` is a trigger's function; `FOR UPDATE [OF]` a
-            // cursor's; `ON UPDATE CASCADE` a key's.
-            "UPDATE" => !(is(prev, &["THEN", "ON", "FOR", "OF"]) || call || feeding),
-            "DELETE" => !(is(prev, &["THEN", "ON"]) || feeding),
+            // cursor's.
+            "UPDATE" => !(is(prev, &["THEN", "FOR", "OF"]) || key_action || call || feeding),
+            "DELETE" => !(prev == Some("THEN") || key_action || feeding),
             // `INNER MERGE JOIN` is a join hint.
             "MERGE" => !(next == Some("JOIN") || feeding),
             "SET" => {
@@ -5894,6 +5907,9 @@ impl TsqlStatement {
                             "COLUMN",
                             "CONSTRAINT",
                             "STATISTICS",
+                            // `DROP SECURITY POLICY`, `DROP AGGREGATE`.
+                            "POLICY",
+                            "AGGREGATE",
                         ],
                     ))
             }
@@ -5927,6 +5943,9 @@ impl TsqlStatement {
         match (self.verb.as_deref(), w) {
             (Some("INSERT"), "SELECT" | "VALUES" | "EXEC" | "EXECUTE") => self.rows = true,
             (Some("UPDATE"), "SET") => self.set = true,
+            (Some("GRANT" | "DENY" | "REVOKE"), "TO") | (Some("REVOKE"), "FROM") => {
+                self.principals = true
+            }
             _ => {}
         }
     }
@@ -15429,6 +15448,120 @@ mod tests {
             "SELECT CASE WHEN id = 1 THEN 'a' ELSE 'b' END FROM employees\nSELECT 1",
         ] {
             assert!(d(sql).is_empty(), "{sql}: {:?}", d(sql));
+        }
+    }
+
+    /// **A `SET <option> ON` ends before the write that follows it**
+    /// (S7.2-L1-01). The cut before `UPDATE`/`DELETE` skipped a previous word
+    /// of `ON` — meant for a key's `ON DELETE CASCADE` — and so caught the
+    /// `ON` of `SET NOCOUNT ON`, the first line of most procedures and
+    /// triggers: the write stayed glued to the `SET`, its own `SET` was cut
+    /// away, and each half drew a red syntax error. All of these run on SQL
+    /// Server 2022.
+    #[test]
+    fn a_set_option_on_does_not_glue_the_next_write_to_it() {
+        for sql in [
+            "SET NOCOUNT ON\nUPDATE employees SET name = N'x' WHERE id = 1\nSELECT 1",
+            "CREATE PROCEDURE dbo.p AS BEGIN SET NOCOUNT ON \
+             UPDATE employees SET name = N'x' WHERE id = 1 END",
+            "CREATE TRIGGER dbo.tr ON employees AFTER UPDATE AS SET NOCOUNT ON \
+             UPDATE e SET name = i.name FROM employees e JOIN inserted i ON i.id = e.id",
+            "SET XACT_ABORT ON\nUPDATE TOP (5) employees SET name = N'x'\nSELECT 1",
+            "SET ANSI_NULLS ON\nUPDATE employees WITH (ROWLOCK) SET name = N'x'\nSELECT 1",
+            "SET NOCOUNT ON\nDELETE TOP (10) FROM employees\nSELECT 1",
+            "SET NOCOUNT ON\nDELETE FROM employees FROM employees e \
+             JOIN departments d ON d.id = e.dept_id\nSELECT 1",
+        ] {
+            for d in [
+                diag_d(sql, SqlDialect::MsSql),
+                diag_whole(sql, SqlDialect::MsSql),
+            ] {
+                assert!(d.is_empty(), "{sql}: {d:?}");
+            }
+        }
+        let units = |sql: &str| -> Vec<String> {
+            statement_units(sql, 0, sql.len(), SqlDialect::MsSql)
+                .into_iter()
+                .map(|(lo, hi, _)| sql[lo..hi].trim().to_string())
+                .collect()
+        };
+        assert_eq!(
+            units("SET NOCOUNT ON UPDATE t SET a = 1"),
+            ["SET NOCOUNT ON", "UPDATE t SET a = 1"]
+        );
+        assert_eq!(
+            units("SET NOCOUNT ON DELETE FROM t"),
+            ["SET NOCOUNT ON", "DELETE FROM t"]
+        );
+        // A key's referential actions are still its own, at the top level of
+        // an `ALTER TABLE`.
+        for sql in [
+            "ALTER TABLE t ADD CONSTRAINT f FOREIGN KEY (a) REFERENCES u (id) ON DELETE CASCADE",
+            "ALTER TABLE t ADD CONSTRAINT f FOREIGN KEY (a) REFERENCES u (id) \
+             ON DELETE SET NULL ON UPDATE CASCADE",
+            // Both run on SQL Server 2022; `DROP PARTITION SCHEME IF EXISTS`
+            // does not (Msg 156), so it is no sibling of these.
+            "DROP SECURITY POLICY IF EXISTS p",
+            "DROP AGGREGATE IF EXISTS a",
+        ] {
+            assert_eq!(units(sql), [sql], "{sql}");
+        }
+    }
+
+    /// **A `GRANT`/`REVOKE`/`DENY` ends after its principals** (S7.2-L1-02).
+    /// Nothing cut inside one, to keep its privilege list — `SELECT, INSERT,
+    /// UPDATE` — whole, so without a `;` it swallowed the rest of the body:
+    /// control-of-flow after it was parsed again (a false error at `GOTO`),
+    /// and in an unterminated buffer the whole rest became the typing tail,
+    /// its errors withheld. The procedure runs on SQL Server 2022.
+    #[test]
+    fn a_grant_ends_after_its_principals() {
+        let units = |sql: &str| -> Vec<String> {
+            statement_units(sql, 0, sql.len(), SqlDialect::MsSql)
+                .into_iter()
+                .map(|(lo, hi, _)| sql[lo..hi].trim().to_string())
+                .collect()
+        };
+        assert_eq!(
+            units("GRANT SELECT ON employees TO public\nSELECT 1"),
+            ["GRANT SELECT ON employees TO public", "SELECT 1"]
+        );
+        assert_eq!(
+            units("REVOKE UPDATE, DELETE ON t FROM u DELETE FROM t"),
+            ["REVOKE UPDATE, DELETE ON t FROM u", "DELETE FROM t"]
+        );
+        assert_eq!(
+            units("DENY SELECT ON t TO u CASCADE SET NOCOUNT ON"),
+            ["DENY SELECT ON t TO u CASCADE", "SET NOCOUNT ON"]
+        );
+        // Before its principals, every word is the privilege list's.
+        for sql in [
+            "GRANT SELECT, INSERT, UPDATE, DELETE, EXECUTE ON t TO u WITH GRANT OPTION",
+            "GRANT CREATE TABLE, CREATE VIEW TO u",
+            "REVOKE GRANT OPTION FOR SELECT ON t FROM u CASCADE",
+            "GRANT SELECT ON t TO u AS dbo",
+        ] {
+            assert_eq!(units(sql), [sql], "{sql}");
+        }
+        let sql = "CREATE PROCEDURE dbo.p AS BEGIN\nGRANT SELECT ON employees TO public\n\
+                   IF @@ERROR <> 0\nGOTO err\nRETURN 0\nerr:\nRETURN 1\nEND";
+        for d in [
+            diag_d(sql, SqlDialect::MsSql),
+            diag_whole(sql, SqlDialect::MsSql),
+        ] {
+            assert!(d.is_empty(), "{sql}: {d:?}");
+        }
+        // And what follows it is checked, no longer the typing tail.
+        let sql = "CREATE PROCEDURE dbo.p AS BEGIN\nGRANT SELECT ON employees TO public\n\
+                   SELECT FROM WHERE\nPRINT 1\nEND";
+        for d in [
+            diag_d(sql, SqlDialect::MsSql),
+            diag_whole(sql, SqlDialect::MsSql),
+        ] {
+            assert!(
+                d.iter().any(|x| x.message.starts_with("Syntax error")),
+                "{sql}: {d:?}"
+            );
         }
     }
 

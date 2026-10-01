@@ -1012,7 +1012,15 @@ existing prose was left alone.
     at a `;`, a label and before a word that can only begin a statement in its context
     (`TsqlStatement::cuts_before`: `SELECT` unless it follows a set operator, `AS`, `FOR` or an
     `INSERT` still owed its rows; `SET` unless it is an `UPDATE`'s first or follows `ON DELETE`;
-    `IF` unless it is a `DROP TABLE IF EXISTS`; …), never inside a `CASE` or a `GRANT` — and a cut it
+    `UPDATE`/`DELETE` unless they follow `THEN` or, in an `ALTER`/`CREATE`, the `ON` of a key's
+    referential action — any other `ON` is a `SET NOCOUNT ON`'s, and exempting it glued the write
+    after it to the `SET` and cut away the write's own `SET`, two red errors on the first lines of
+    most procedures (`a_set_option_on_does_not_glue_the_next_write_to_it`); `IF` unless it is a
+    `DROP TABLE IF EXISTS`; …), never inside a `CASE`, nor in a `GRANT`/`REVOKE`/`DENY` before
+    its principals (its `TO`, a `REVOKE`'s `FROM`), whose privilege list is made of these words —
+    after them a statement begins as anywhere else, and without that cut a `GRANT` swallowed the
+    rest of a body, its `IF … GOTO` parsed again and, unterminated, all of it the typing tail
+    (`a_grant_ends_after_its_principals`) — and a cut it
     misses costs nothing, because `parse_statements` parses a unit without requiring `;` between
     statements, which is how the server reads it
     (`a_t_sql_script_without_semicolons_is_checked_statement_by_statement`,
