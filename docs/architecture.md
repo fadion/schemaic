@@ -3327,6 +3327,21 @@ existing prose was left alone.
     `await`, and the fixture overflowed a 2 MiB test thread) must read back the same rows,
     constraint states, trigger and routine, and the next identity continues from the highest
     carried. `SCHEMAIC_IT_KEEP_DUMP=<path>` keeps the file for a hand restore through `sqlcmd`.
+    **`sqlcmd` substitutes `$(name)` inside string literals**, from its variables and the
+    environment of the shell running it, and only its `-x` flag stops it: a row holding `cost
+    $(HOME) here` restored as `cost /home/mssql here`, with exit 0 (measured with ODBC sqlcmd 18 on
+    2022 and 2025; a `GO` or `!!` line inside a literal is *not* acted on). So every literal a
+    script writes goes through `export::script_literal`, which on such a client
+    (`export::client_substitutes_variables`) cuts the literal between each `$` and its `(` —
+    `(N'cost $' + N'(HOME) here')`, the same value with no reference in it, parenthesised so a
+    variant's `COLLATE` covers the whole, and its first piece `nvarchar(max)` past 4,000 units
+    because two shorter `nvarchar` pieces concatenate to at most 4,000
+    (`a_sql_server_script_literal_holds_no_sqlcmd_variable`; the export and *Copy as SQL INSERT*
+    share it). A module body, a default or a name is the server's text and must be restated as it
+    is, so where one holds a `$(` the dump's header says to restore with `sqlcmd -x` or *Run SQL
+    file* — in a sentence holding no `$(` of its own
+    (`a_definition_holding_a_sqlcmd_variable_is_named_in_the_header`); measured, the rows of such a
+    file restore byte-equal without `-x`, and the procedure body only with it.
     **Foreign keys are restated after the data.** `create_ddl` deliberately emits none: for Copy DDL
     an omitted key still leaves a script that runs, which is why the ordering effort there went to
     types and views instead (`create_ddl_script`'s own account of it). A dump can't take that trade —

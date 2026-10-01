@@ -2584,6 +2584,23 @@ pub fn plan(
             crate::export::comment_text(&kept.join(", ")),
         ));
     }
+    // **`sqlcmd` rewrites `$(name)` even inside a string literal**, from its
+    // variables and the environment, and only its `-x` flag stops it. The
+    // rows' literals hold no `$(` (`export::script_literal` cuts each one),
+    // but a module body, a default or a name is restated as the server has
+    // it — so where one holds a `$(`, the header says how to restore.
+    if crate::export::client_substitutes_variables(dialect)
+        && (header.contains("$(")
+            || steps
+                .iter()
+                .any(|s| matches!(s, DumpStep::Text(t) if t.contains("$("))))
+    {
+        header.push_str(
+            "\n--\n-- Some definitions below hold a `$` followed by `(`, which sqlcmd reads as a\n\
+             -- variable even inside a string: restore this file with `sqlcmd -x`, or with\n\
+             -- Run SQL file, to keep that text as it is.",
+        );
+    }
     steps.insert(0, DumpStep::Text(header));
 
     DumpPlan {
@@ -4711,6 +4728,49 @@ mod tests {
             SqlDialect::MySql,
         );
         assert_eq!(select_of(&p, "t"), "SELECT `id`, `b` FROM `shop`.`t`");
+    }
+
+    /// **A SQL Server file whose definitions hold `$(` says how to restore it
+    /// with `sqlcmd`.** `sqlcmd` substitutes `$(name)` even inside a string
+    /// literal, and a module body or a default is the server's text, which
+    /// the file must restate as it is — so where one holds a `$(`, the header
+    /// says to run the file with `-x`. The rows need no such word: their
+    /// literals hold no `$(` (`export::script_literal`).
+    #[test]
+    fn a_definition_holding_a_sqlcmd_variable_is_named_in_the_header() {
+        let header = |view_sql: &str| {
+            let mut t = table("t");
+            t.schema = Some("dbo".to_string());
+            let mut v = table("v");
+            v.schema = Some("dbo".to_string());
+            v.is_view = true;
+            v.create_sql = Some(view_sql.to_string());
+            let s = schema_of(vec![t, v]);
+            let p = plan(
+                &s,
+                "shop",
+                &all(&s),
+                DumpOptions::default(),
+                SqlDialect::MsSql,
+            );
+            assert!(
+                p.steps
+                    .iter()
+                    .any(|s| matches!(s, DumpStep::Text(t) if t.contains("CREATE VIEW"))),
+                "the view is in the file: {:?}",
+                p.steps
+            );
+            match &p.steps[0] {
+                DumpStep::Text(h) => h.clone(),
+                other => panic!("{other:?}"),
+            }
+        };
+        let h = header("CREATE VIEW [dbo].[v] AS SELECT N'$(HOME)' AS x");
+        assert!(h.contains("sqlcmd -x"), "{h}");
+        // The sentence itself holds no reference for sqlcmd to trip on.
+        assert!(!h.contains("$("), "{h}");
+        let h = header("CREATE VIEW [dbo].[v] AS SELECT N'$ (HOME)' AS x");
+        assert!(!h.contains("sqlcmd"), "{h}");
     }
 
     /// **A column typed by an alias is read as its base type.** Its

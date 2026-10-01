@@ -869,6 +869,47 @@ pub fn typed_literal(v: &Value, type_name: &str, dialect: SqlDialect) -> String 
     }
 }
 
+/// [`typed_literal`] for a statement written into a **script** — a file or a
+/// copy someone may run with the engine's command-line client: the SQL
+/// export, *Copy as SQL INSERT* and a dump's rows.
+///
+/// **`sqlcmd` rewrites `$(name)` inside a string literal**, from its
+/// scripting variables and the environment of the shell running it, and
+/// nothing in the file can turn that off (only its `-x` flag): a row holding
+/// `cost $(HOME) here` restored as `cost /home/mssql here`, `$(SQLCMDUSER)`
+/// as `sa`, and the run exited 0 (measured with ODBC sqlcmd 18 on 2022). So
+/// where the client does ([`client_substitutes_variables`]) the literal is
+/// cut between every `$` and the `(` after it — `(N'cost $' + N'(HOME) here')`
+/// is the same value with no reference left in it. Parenthesised, so a
+/// `COLLATE` after it covers all of it; and past 4,000 UTF-16 units the
+/// first piece is cast to `nvarchar(max)`, because two shorter `nvarchar`
+/// pieces concatenate to at most 4,000 (measured).
+pub fn script_literal(v: &Value, type_name: &str, dialect: SqlDialect) -> String {
+    let lit = typed_literal(v, type_name, dialect);
+    match v {
+        Value::Str(s) if client_substitutes_variables(dialect) && lit.contains("$(") => {
+            let body = lit.replace("$(", "$' + N'(");
+            match body.split_once("' + N'") {
+                Some((first, rest)) if s.encode_utf16().count() > 4000 => {
+                    format!("(CAST({first}' AS nvarchar(max)) + N'{rest})")
+                }
+                _ => format!("({body})"),
+            }
+        }
+        _ => lit,
+    }
+}
+
+/// Does the engine's command-line client substitute variables inside a
+/// string literal of a script it runs? `sqlcmd` does (`$(name)`); `psql`'s
+/// `:name` is left alone inside quotes, and `mysql` and `sqlite3` have none.
+pub fn client_substitutes_variables(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MsSql => true,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+    }
+}
+
 /// Does a column typed `type_name` read a date string by the session's
 /// language? SQL Server's `datetime` and `smalldatetime` do (`SET
 /// DATEFORMAT`, which `SET LANGUAGE` sets); its newer types read
@@ -2881,9 +2922,9 @@ fn server_literal(form: ServerLiteral, text: &str) -> Option<String> {
                 // keeps a long one whole (`dump::literal_select`).
                 "char" | "varchar" | "nchar" | "nvarchar" => {
                     let text = variant_json_text(value)?;
-                    sql_literal(&Value::Str(text), SqlDialect::MsSql)
+                    script_literal(&Value::Str(text), "", SqlDialect::MsSql)
                 }
-                _ => sql_literal(&Value::Str(value.to_string()), SqlDialect::MsSql),
+                _ => script_literal(&Value::Str(value.to_string()), "", SqlDialect::MsSql),
             };
             // Wrapped in `sql_variant` itself as well: a multi-row `VALUES`
             // gives each column one type across its rows, and a `date` beside
@@ -3027,7 +3068,7 @@ pub fn export_inserts_ending<W: Write>(
                             "NULL".to_string()
                         }),
                         None if withheld_binary(&mask, ci, &cell) => "NULL".to_string(),
-                        None => typed_literal(&value, &c.rs.columns[ci].type_name, dialect),
+                        None => script_literal(&value, &c.rs.columns[ci].type_name, dialect),
                     }
                 });
                 let lit = lit.unwrap_or_else(|| "NULL".to_string());
@@ -3936,11 +3977,65 @@ mod tests {
         assert!(sql.contains("('2026-01-02 09:00:00.000', "), "{sql}");
     }
 
+    /// **No `$(` is left inside a SQL Server script's literal.** `sqlcmd`
+    /// substitutes `$(name)` inside string literals, from its variables and
+    /// the environment: a row holding `cost $(HOME) here` restored as `cost
+    /// /home/mssql here` with exit code 0 (measured with ODBC sqlcmd 18). Cut
+    /// between the `$` and the `(`, the text is the same value and holds no
+    /// reference. Past 4,000 characters the first piece is `nvarchar(max)`,
+    /// since two shorter `nvarchar` pieces concatenate to at most 4,000
+    /// (measured).
+    #[test]
+    fn a_sql_server_script_literal_holds_no_sqlcmd_variable() {
+        let rs = |s: &str| {
+            ResultSet::from_rows(
+                vec![crate::model::Column {
+                    name: "s".to_string(),
+                    type_name: "nvarchar".to_string(),
+                    origin: None,
+                }],
+                vec![vec![Value::Str(s.to_string())]],
+            )
+        };
+        let sql = export_inserts(&rs("cost $(HOME) and $$(x' here"), &[0], None, MsSql);
+        assert!(
+            sql.contains("((N'cost $' + N'(HOME) and $$' + N'(x'' here'))"),
+            "{sql}"
+        );
+        assert!(!sql.contains("$("), "{sql}");
+        let long = format!("{}$(PATH)", "y".repeat(4000));
+        let sql = export_inserts(&rs(&long), &[0], None, MsSql);
+        assert!(
+            sql.contains(&format!(
+                "((CAST(N'{}$' AS nvarchar(max)) + N'(PATH)'))",
+                "y".repeat(4000)
+            )),
+            "{sql}"
+        );
+        // Untouched without a reference, and on the engines whose clients
+        // read a literal as it is.
+        assert!(export_inserts(&rs("$ (x)"), &[0], None, MsSql).contains("(N'$ (x)')"));
+        assert!(export_inserts(&rs("$(x)"), &[0], None, Postgres).contains("('$(x)')"));
+        // A variant's text the same way, inside its collation.
+        assert_eq!(
+            server_literal(
+                ServerLiteral::Variant,
+                r#"varchar(10) COLLATE Latin1_General_CI_AS|{"x":"a$(b)"}"#
+            )
+            .as_deref(),
+            Some(
+                "CAST(CAST((N'a$' + N'(b)') COLLATE Latin1_General_CI_AS AS varchar(10)) \
+                 AS sql_variant)"
+            )
+        );
+    }
+
     /// **A character variant is converted under its own collation, and read
     /// whole.** `CAST(N'Ωμέγα' AS varchar(10)) COLLATE Greek_CI_AS` converts
-    /// under the *restoring database's* code page and only then relabels the
-    /// bytes, so in a Latin-1 database the copy held `Oµ??a` (measured on 2022
-    /// and 2025); the `COLLATE` belongs on the text, before the cast. The value
+    /// under the *restoring database's* code page, and the `COLLATE` after it
+    /// converts those bytes again rather than the text, so in a Latin-1
+    /// database the copy held `Oµ??a` (measured on 2022 and 2025); the
+    /// `COLLATE` belongs on the text, before the cast. The value
     /// arrives as the server's `FOR JSON` of it, since `CAST(v AS
     /// nvarchar(max))` stops at 4,000 characters and a `varchar` variant holds
     /// up to 8,000 (`dump::literal_select`).
