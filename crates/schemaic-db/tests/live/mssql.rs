@@ -766,8 +766,41 @@ async fn restore_file(dst: &Scratch, file: &str) -> schemaic_core::script::ExecE
 /// `run_script`. The identity keeps its gaps (so the foreign key onto it still
 /// holds) and counts on past them, the view and trigger open batches of their
 /// own, and the rowversion and computed column are the server's again.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_dump_restores_into_an_empty_database() {
+///
+/// **Run on a stack of its own** ([`on_a_large_stack`]): a debug build's
+/// poll frame grows with every `await` in the body, and this fixture sat at
+/// the 2 MB test-thread limit, one more `await` from overflowing.
+#[test]
+fn a_dump_restores_into_an_empty_database() {
+    on_a_large_stack(dump_restores_into_an_empty_database);
+}
+
+/// Run `body` to the end on a thread with a 16 MB stack and a multi-thread
+/// runtime of its own — what `#[tokio::test(flavor = "multi_thread")]` gives
+/// a test, but on a thread whose stack a fixture this size cannot outgrow.
+/// A panic in it is the test's.
+fn on_a_large_stack<F, Fut>(body: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()>,
+{
+    let run = std::thread::Builder::new()
+        .stack_size(16 << 20)
+        .spawn(move || {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("a runtime")
+                .block_on(body());
+        })
+        .expect("a thread for the test");
+    if let Err(panic) = run.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// [`a_dump_restores_into_an_empty_database`]'s body.
+async fn dump_restores_into_an_empty_database() {
     use schemaic_core::dump::DumpOptions;
     if !enabled() || azure_cannot("restores into a second database, which it has not got") {
         return;

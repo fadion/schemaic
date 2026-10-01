@@ -3388,7 +3388,11 @@ existing prose was left alone.
     time onto that copy; each time one query per side (a debug build's poll frame grows with every
     `await`, and the fixture overflowed a 2 MiB test thread) must read back the same rows,
     constraint states, trigger and routine, and the next identity continues from the highest
-    carried. `SCHEMAIC_IT_KEEP_DUMP=<path>` keeps the file for a hand restore through `sqlcmd`.
+    carried. Even so it sat one `await` from the limit, so it runs on a thread of its own with a
+    16 MiB stack and its own runtime (`on_a_large_stack`), and each later restore shape — a view
+    reached through a function, a left-out temporal or ledger table and what reads it, a synonym's
+    empty part, a routine-only type — is a leg of its own beside it rather than one more await in
+    it. `SCHEMAIC_IT_KEEP_DUMP=<path>` keeps the file for a hand restore through `sqlcmd`.
     **`sqlcmd` substitutes `$(name)` inside string literals**, from its variables and the
     environment of the shell running it, and only its `-x` flag stops it: a row holding `cost
     $(HOME) here` restored as `cost /home/mssql here`, with exit 0 (measured with ODBC sqlcmd 18 on
