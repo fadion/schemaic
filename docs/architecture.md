@@ -4166,12 +4166,15 @@ existing prose was left alone.
     name — and the sentence says so, as the shared one it replaced had. The arm asks the account's
     kind, a login being SQL Server's alone
     (`a_sql_server_login_drop_says_it_is_refused_while_connected_and_orphans_its_users`). **The
-    revoke's sentence grows two clauses where the engine has the facts**, each a capability in
+    revoke's sentence grows three clauses where the engine has the facts**, each a capability in
     `users`: `revoke_cascades` — the revoke carries `CASCADE`, so the privilege is also taken from
-    every account the grantee granted it on to — and `supports_deny` — revoking a privilege the
-    account is *denied* lifts the `DENY`, which gives access back through any role that grants it.
-    Both are SQL Server's and both were measured there, where the sentence said only "takes X away"
-    (`a_sql_server_revoke_says_it_cascades_and_can_lift_a_deny`). **Creating an account destroys nothing and is still the highest-consequence thing
+    every account the grantee granted it on to — `supports_deny` — revoking a privilege the
+    account is *denied* lifts the `DENY`, which gives access back through any role that grants it
+    — and, on a table, `table_revoke_clears_columns` — every column-level grant and `DENY` of a
+    column permission goes with it. All three are SQL Server's and all were measured there, where
+    the sentence said only "takes X away"
+    (`a_sql_server_revoke_says_it_cascades_and_can_lift_a_deny`,
+    `a_sql_server_table_revoke_says_it_clears_the_columns_permissions`). **Creating an account destroys nothing and is still the highest-consequence thing
     this module emits**, which is the call `DropCheck`'s "rows the constraint refused are accepted
     from now on" already makes: a blank password on MySQL is an account anyone who can reach the
     server can log in as, with no `IDENTIFIED BY` for `validate_password` to fire on, and a blank
@@ -6937,7 +6940,13 @@ existing prose was left alone.
     the server refuses the bare re-denial (Msg 4611) and the plan rolls back — the denial kept, the
     way for this to fail — and the risk sentence says so
     (`a_table_grant_keeps_the_accounts_column_denials`, live). A grant on the schema or database
-    leaves an object's `DENY` alone (measured), so only the table level is wrapped. **And a SQL
+    leaves an object's `DENY` alone (measured), so only the table level is wrapped. **A table-level
+    revoke clears the columns too, and is left plain** (`users::table_revoke_clears_columns`):
+    `REVOKE SELECT ON OBJECT::dbo.t` deleted both a column's `DENY SELECT` and another column's
+    `GRANT SELECT`, while a `DENY UPDATE` on the same column stayed (measured on 2022 and 2025). A
+    revoke being how a permission is taken back, nothing is kept the way a grant keeps its denials;
+    the risk sentence names the permissions whose column rows go (`column_permissions_cleared`,
+    `a_sql_server_table_revoke_says_it_clears_the_columns_permissions`). **And a SQL
     Server server-level statement is sent to `master`** — `EXEC master.sys.sp_executesql N'GRANT
     VIEW SERVER STATE TO [app]'`, the private `tsql_in_master` — because T-SQL grants a server
     permission only when the current database is `master` (Msg 4621 from any other, measured), and

@@ -1632,6 +1632,39 @@ pub fn column_permissions_kept(c: &PrivilegeChange, dialect: SqlDialect) -> Vec<
         .collect()
 }
 
+/// Does a **table-level** revoke here also delete the account's column-level
+/// grants and `DENY`s of the same permission?
+///
+/// SQL Server's does (measured on 2022 and 2025): with `DENY SELECT ON
+/// OBJECT::dbo.t (ssn)` and `GRANT SELECT ON OBJECT::dbo.t (other)` in place,
+/// `REVOKE SELECT ON OBJECT::dbo.t` left no `SELECT` row for the account on the
+/// table at all, while its `DENY UPDATE` on `ssn` stayed. A revoke being the
+/// way to take a permission back, nothing is kept here as a grant keeps its
+/// denials — the preview says it instead ([`crate::ddl::Change::risks`]).
+/// MySQL's and PostgreSQL's column privileges are revoked only by naming the
+/// columns.
+pub fn table_revoke_clears_columns(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MsSql => true,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+    }
+}
+
+/// The permissions in a revoke whose column-level grants and `DENY`s it also
+/// deletes ([`table_revoke_clears_columns`]) — upper-cased, in the revoke's
+/// order — or none: a level above the table, an engine that keeps them, a
+/// list with no column permission.
+pub fn column_permissions_cleared(c: &PrivilegeChange, dialect: SqlDialect) -> Vec<String> {
+    if !matches!(c.level, GrantLevel::Table { .. }) || !table_revoke_clears_columns(dialect) {
+        return Vec::new();
+    }
+    c.privileges
+        .iter()
+        .map(|p| p.trim().to_ascii_uppercase())
+        .filter(|p| MSSQL_COLUMN_PERMISSIONS.contains(&p.as_str()))
+        .collect()
+}
+
 /// `grant`, wrapped so the column `DENY`s it would delete survive it: they are
 /// read into a string of `DENY` statements before it, and that string runs
 /// after it — in one batch, inside the plan's transaction, so what is read is
@@ -5643,6 +5676,17 @@ mod mssql_tests {
         );
         assert_eq!(column_permissions_kept(&schema, MS), Vec::<String>::new());
         assert_eq!(column_permissions_kept(&c, MS), ["SELECT", "UPDATE"]);
+        // A table revoke clears the same columns' permissions, which the
+        // preview names rather than keeps; a schema revoke clears none.
+        assert_eq!(column_permissions_cleared(&c, MS), ["SELECT", "UPDATE"]);
+        assert_eq!(
+            column_permissions_cleared(&schema, MS),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            column_permissions_cleared(&c, SqlDialect::Postgres),
+            Vec::<String>::new()
+        );
         // MySQL has no DENY to keep.
         let my = PrivilegeChange {
             account: Principal {

@@ -4133,7 +4133,7 @@ impl Change {
             // data and is undone by granting it back, which is what separates
             // this sentence from the one above.
             //
-            // **Two engine facts extend it, each asked as a capability.** Where
+            // **Engine facts extend it, each asked as a capability.** Where
             // the revoke carries `CASCADE` (`users::revoke_cascades`) it also
             // takes the privilege from everyone the account granted it on to;
             // and where an account can be *denied* (`users::supports_deny`),
@@ -4161,6 +4161,19 @@ impl Change {
                     s.push_str(&format!(
                         " Where {who} is denied it instead (DENY), the revoke lifts the \
                          denial — which gives access back if a role it belongs to grants it."
+                    ));
+                }
+                // On a table, the revoke takes the columns' permissions too
+                // (`users::table_revoke_clears_columns`, measured on 2022 and
+                // 2025): a column denied stops being denied, and one granted on
+                // its own stops being granted — neither of which "a DENY" said.
+                let cleared = crate::users::column_permissions_cleared(c, dialect);
+                if !cleared.is_empty() {
+                    s.push_str(&format!(
+                        " On a table it also deletes every column-level grant and DENY of {} \
+                         {who} has on the table's columns: a column {who} was denied is no \
+                         longer denied, and one granted on its own is no longer granted.",
+                        Self::privilege_words(&cleared)
                     ));
                 }
                 vec![s]
@@ -32087,6 +32100,53 @@ mod database_tests {
             !my.contains("DENY") && !my.contains("granted it on to"),
             "{my}"
         );
+    }
+
+    /// **A SQL Server revoke on a table also clears its columns** (measured on
+    /// 2022 and 2025): with `DENY SELECT ON OBJECT::dbo.t (ssn)` and `GRANT
+    /// SELECT ON OBJECT::dbo.t (other)` in place, `REVOKE SELECT ON
+    /// OBJECT::dbo.t` left neither — `ssn` no longer denied, `other` no longer
+    /// granted — while an `UPDATE` denial on the same column stayed. The
+    /// sentence said a revoke lifts "a DENY", which reads as the table's own.
+    /// Only a column permission is named, only at the table level, and MySQL's
+    /// table revoke leaves its column grants alone.
+    #[test]
+    fn a_sql_server_table_revoke_says_it_clears_the_columns_permissions() {
+        use crate::intel::SqlDialect::MsSql;
+        let (_, user) = ms_login_and_user();
+        let at = |level: crate::users::GrantLevel, privs: &[&str]| {
+            Box::new(crate::users::PrivilegeChange {
+                account: user.clone(),
+                level,
+                privileges: privs.iter().map(|s| s.to_string()).collect(),
+                with_grant_option: false,
+            })
+        };
+        let table = || crate::users::GrantLevel::Table {
+            qualifier: "dbo".into(),
+            name: "t".into(),
+        };
+        let risk = |dialect, c| {
+            account("app", dialect, Change::RevokePrivileges(c))
+                .destructive()
+                .join(" ")
+        };
+        let text = risk(MsSql, at(table(), &["SELECT", "INSERT"]));
+        assert!(
+            text.contains("column-level grant and DENY of SELECT"),
+            "{text}"
+        );
+        // `INSERT` has no column level on SQL Server, so nothing is said of it.
+        let insert = risk(MsSql, at(table(), &["INSERT"]));
+        assert!(!insert.contains("column-level"), "{insert}");
+        // A schema revoke leaves an object's columns alone.
+        let schema = risk(
+            MsSql,
+            at(crate::users::GrantLevel::Schema("dbo".into()), &["SELECT"]),
+        );
+        assert!(!schema.contains("column-level"), "{schema}");
+        let my = risk(MySql, at(table(), &["SELECT"]));
+        assert!(!my.contains("column-level"), "{my}");
     }
 
     /// **And a SQL Server revoke cannot be undone by granting it back**, which
