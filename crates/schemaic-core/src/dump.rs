@@ -1970,17 +1970,28 @@ pub fn plan(
     // fact the split rests on — after the file's `DROP TABLE`s have run.
     // Ordered here, before the drops, so those can run in the reverse.
     let routines = order_by_mention(routines, dialect);
+    // A function a table or view calls goes just before it — see
+    // `routine_slots`; `None` stays in the trailing section. Decided before
+    // the drops, which mirror it.
+    let slots = if opts.structure {
+        routine_slots(&routines, &schema.tables, &order, dialect)
+    } else {
+        vec![None; routines.len()]
+    };
 
     // ── What the file recreates, dropped before any of it is created ─────────
     //
     // Only where `drops_up_front` says so. The keys between the dumped tables
-    // go first, each only if it is there (a fresh database has none), then the
-    // views and tables in reverse creation order — views before the tables
-    // they read, a referencing table before the one it references — then the
-    // routines, which a computed column, a check or a schema-bound view may
-    // have been holding. A key from a table outside the export still blocks
-    // its target's drop, loudly: the file does not drop what it cannot put
-    // back.
+    // go first, each only if it is there (a fresh database has none), then
+    // everything else **in the mirror of the order the file creates it in**:
+    // the trailing routines, then each table or view with the functions moved
+    // in just ahead of it — views before the tables they read, a referencing
+    // table before the one it references, a function after the table whose
+    // column calls it and before the tables a schema-bound one reads. The
+    // routines went as one block after every table, which met the second edge
+    // (Msg 3729), and no single place for the block meets both. A key from a
+    // table outside the export still blocks its target's drop, loudly: the
+    // file does not drop what it cannot put back.
     if up_front {
         let mut drops: Vec<String> = Vec::new();
         for &i in &order {
@@ -2008,15 +2019,26 @@ pub fn plan(
                 ));
             }
         }
-        for &i in order.iter().rev() {
+        // The routines in slot `slot`, in the reverse of their creation order.
+        let routine_drops = |slot: Option<usize>| -> Vec<String> {
+            routines
+                .iter()
+                .zip(&slots)
+                .rev()
+                .filter(|(_, s)| **s == slot)
+                .filter_map(|(r, _)| r.drop.clone())
+                .collect()
+        };
+        drops.extend(routine_drops(None));
+        drops.extend(routine_drops(Some(order.len())));
+        for (k, &i) in order.iter().enumerate().rev() {
             let t = &schema.tables[i];
-            if t.shape() == TableShape::Sequence {
-                continue;
+            if t.shape() != TableShape::Sequence {
+                let kw = if t.is_view { "VIEW" } else { "TABLE" };
+                drops.push(format!("DROP {kw} IF EXISTS {};", qname(t)));
             }
-            let kw = if t.is_view { "VIEW" } else { "TABLE" };
-            drops.push(format!("DROP {kw} IF EXISTS {};", qname(t)));
+            drops.extend(routine_drops(Some(k)));
         }
-        drops.extend(routines.iter().rev().filter_map(|r| r.drop.clone()));
         // Then what the tables and routines were typed with or named — every
         // one of them is gone by here.
         drops.extend(objects.iter().rev().filter_map(|o| o.drop.clone()));
@@ -2046,13 +2068,6 @@ pub fn plan(
     // writes triggers after the data for the same reason.
     let mut triggers: Vec<String> = Vec::new();
     let mut held_checks: Vec<String> = Vec::new();
-    // A function a table or view calls goes just before it — see
-    // `routine_slots`; `None` stays in the trailing section.
-    let slots = if opts.structure {
-        routine_slots(&routines, &schema.tables, &order, dialect)
-    } else {
-        vec![None; routines.len()]
-    };
     let moved_to = |k: usize| -> Vec<String> {
         routines
             .iter()
@@ -5349,8 +5364,10 @@ mod tests {
     /// TABLE` of a referenced table (Msg 3726) — the tables are created
     /// parents first, so the child's key still stood. There the destructive
     /// half is a section of its own, before any `CREATE`: the keys between the
-    /// dumped tables first (each only if it is there), then every view and
-    /// table children-first, then the routines the file recreates.
+    /// dumped tables first (each only if it is there), then everything the
+    /// file recreates in the reverse of its creation order — every view and
+    /// table children-first, a routine nothing in the file calls ahead of
+    /// them all.
     #[test]
     fn a_sql_server_dump_drops_everything_it_recreates_before_creating_any_of_it() {
         let mut parent = table("parent");
@@ -5387,10 +5404,12 @@ mod tests {
         let drop_child = pos(&file, "DROP TABLE IF EXISTS [dbo].[child];");
         let drop_parent = pos(&file, "DROP TABLE IF EXISTS [dbo].[parent];");
         let drop_fn = pos(&file, "DROP FUNCTION IF EXISTS [dbo].[f];");
-        assert!(drop_fk < drop_view && drop_view < drop_child, "{file}");
-        assert!(drop_child < drop_parent && drop_parent < drop_fn, "{file}");
+        // `f` is called by nothing in the file, so it is created last and
+        // dropped first.
+        assert!(drop_fk < drop_fn && drop_fn < drop_view, "{file}");
+        assert!(drop_view < drop_child && drop_child < drop_parent, "{file}");
         let first_create = pos(&file, "CREATE ");
-        assert!(drop_fn < first_create, "{file}");
+        assert!(drop_parent < first_create, "{file}");
         assert_eq!(file.matches("DROP TABLE IF EXISTS").count(), 2, "{file}");
         // The engines with a switch or a CASCADE keep the drop beside its
         // `CREATE`.
@@ -5449,6 +5468,61 @@ mod tests {
             pos(&file, "DROP VIEW IF EXISTS [dbo].[v];") < pos(&file, "CREATE VIEW [dbo].[v]"),
             "{file}"
         );
+    }
+
+    /// **The up-front section drops in the mirror of the file's creation
+    /// order.** A schema-bound function holds the tables it reads, so it has to
+    /// go before them, and a table whose column calls it holds the function, so
+    /// it has to go after that table: the routines dropped as one block after
+    /// every table met the first edge (Msg 3729 on replay), and no single place
+    /// for the block meets both. Each function is dropped at the mirror of the
+    /// slot it is created in, and one nothing in the file calls — created
+    /// last — goes first.
+    #[test]
+    fn a_sql_server_dump_drops_in_the_reverse_of_its_creation_order() {
+        let f = |name: &str, body: &str| {
+            std::sync::Arc::new(crate::schema::RoutineInfo {
+                name: name.to_string(),
+                schema: Some("dbo".to_string()),
+                kind: crate::schema::RoutineKind::Function,
+                returns: "int".to_string(),
+                body: body.to_string(),
+                ..Default::default()
+            })
+        };
+        let mut t1 = table("t1");
+        t1.schema = Some("dbo".to_string());
+        let mut t2 = table("t2");
+        t2.schema = Some("dbo".to_string());
+        t2.columns.push(ColumnInfo {
+            name: "c".to_string(),
+            generated: Some("[dbo].[f_cnt]()".to_string()),
+            ..Default::default()
+        });
+        let mut s = schema_of(vec![t1, t2]);
+        s.routines.push(f(
+            "f_cnt",
+            "BEGIN RETURN (SELECT COUNT(*) FROM dbo.t1); END",
+        ));
+        s.routines
+            .push(f("f_sb", "BEGIN RETURN (SELECT COUNT(*) FROM dbo.t1); END"));
+        let file = file_of(&plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::MsSql,
+        ));
+        let drop_t1 = pos(&file, "DROP TABLE IF EXISTS [dbo].[t1];");
+        let drop_t2 = pos(&file, "DROP TABLE IF EXISTS [dbo].[t2];");
+        let drop_cnt = pos(&file, "DROP FUNCTION IF EXISTS [dbo].[f_cnt];");
+        let drop_sb = pos(&file, "DROP FUNCTION IF EXISTS [dbo].[f_sb];");
+        assert!(drop_t2 < drop_cnt && drop_cnt < drop_t1, "{file}");
+        assert!(drop_sb < drop_t2, "{file}");
+        // The creation order it mirrors.
+        let create_cnt = pos(&file, "CREATE FUNCTION [dbo].[f_cnt]");
+        assert!(pos(&file, "CREATE TABLE [dbo].[t1]") < create_cnt, "{file}");
+        assert!(create_cnt < pos(&file, "CREATE TABLE [dbo].[t2]"), "{file}");
     }
 
     /// `USE shop` on a server with no `shop` is ERROR 1049 on line 1, and

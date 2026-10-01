@@ -1174,6 +1174,54 @@ async fn a_replay_without_its_transaction_fails_before_dropping_what_it_cannot_p
     );
 }
 
+/// **A replay drops a schema-bound function between the tables it sits
+/// between.** It holds the table it reads (Msg 3729 on that table's drop) and
+/// is held by the table whose column calls it, so the drops have to mirror
+/// the creation order; one block of routine drops after every table stopped
+/// the replay.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replay_drops_a_schema_bound_function_between_its_tables() {
+    use schemaic_core::dump::DumpOptions;
+    if !enabled() || azure_cannot("restores into a second database, which it has not got") {
+        return;
+    }
+    let src = Scratch::create("dump_sbsrc").await;
+    src.exec("CREATE TABLE dbo.t1 (id int PRIMARY KEY); INSERT dbo.t1 VALUES (1), (2)")
+        .await;
+    src.exec(
+        "CREATE FUNCTION dbo.f_cnt () RETURNS int WITH SCHEMABINDING AS \
+         BEGIN RETURN (SELECT COUNT(*) FROM dbo.t1) END",
+    )
+    .await;
+    src.exec(
+        "CREATE FUNCTION dbo.f_sb () RETURNS TABLE WITH SCHEMABINDING AS \
+         RETURN SELECT id FROM dbo.t1",
+    )
+    .await;
+    src.exec(
+        "CREATE TABLE dbo.t2 (id int PRIMARY KEY, c AS dbo.f_cnt()); INSERT dbo.t2 (id) VALUES (7)",
+    )
+    .await;
+    let file = Box::pin(dump_file(&src, DumpOptions::default())).await;
+    let dst = Scratch::create("dump_sbdst").await;
+    for round in ["restore", "replay"] {
+        let end = Box::pin(restore_file(&dst, &file)).await;
+        assert!(
+            matches!(end, schemaic_core::script::ExecEnd::Done),
+            "{round}: {end:?}\n{file}"
+        );
+        assert_eq!(
+            dst.scalar(
+                "SELECT CONCAT((SELECT COUNT(*) FROM dbo.t1), '|', \
+                 (SELECT MAX(c) FROM dbo.t2), '|', (SELECT COUNT(*) FROM dbo.f_sb()))"
+            )
+            .await,
+            "2|2|2",
+            "{round}"
+        );
+    }
+}
+
 /// Validation compiles without running: a missing table is reported by
 /// number, and a `DELETE` that checks clean deleted nothing.
 #[tokio::test(flavor = "multi_thread")]

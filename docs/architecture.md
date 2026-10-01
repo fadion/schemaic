@@ -3451,10 +3451,16 @@ existing prose was left alone.
     section puts the keys back. **SQL Server has neither answer**, so it drops everything the file
     recreates up front (`drops_up_front`, computed from the two: no guard and no `CASCADE`): a
     `-- Dropped first` section before any `CREATE` drops each key between the dumped tables that
-    is there (`IF OBJECT_ID(…, N'F') IS NOT NULL ALTER TABLE … DROP CONSTRAINT`), then every view
-    and table in reverse creation order, then the routines the file recreates (`DROP FUNCTION`/`DROP
-    PROCEDURE IF EXISTS`, in reverse of their order), and the per-table `DROP` beside each `CREATE`
-    is not written. Beside its `CREATE`, the `DROP` of a referenced table found the child's key
+    is there (`IF OBJECT_ID(…, N'F') IS NOT NULL ALTER TABLE … DROP CONSTRAINT`), then everything
+    else in the exact mirror of the file's creation order — the trailing routines first, then each
+    view and table children-first with the functions `routine_slots` moved in ahead of it dropped
+    straight after it (`DROP FUNCTION`/`DROP PROCEDURE IF EXISTS`) — and the per-table `DROP`
+    beside each `CREATE` is not written. **The mirror is the only order that works**: a
+    schema-bound function holds the table it reads and is held by the table whose column calls
+    it, so the routines dropped as one block after every table stopped a replay at the read
+    table's drop (Msg 3729) and no single place for the block meets both edges
+    (`a_sql_server_dump_drops_in_the_reverse_of_its_creation_order`; live,
+    `a_replay_drops_a_schema_bound_function_between_its_tables`). Beside its `CREATE`, the `DROP` of a referenced table found the child's key
     still standing, since the tables are created parents first, and replaying a default dump onto its
     source stopped there (Msg 3726); a routine's `CREATE` would have stopped at a name already taken
     next. A key from a table outside the export still blocks its target's drop, loudly — the file
