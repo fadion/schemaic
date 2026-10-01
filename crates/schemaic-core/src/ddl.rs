@@ -8651,7 +8651,7 @@ pub(crate) fn tsql_settings_wrapped(
     create: String,
     m: &crate::schema::TsqlModule,
 ) -> Vec<String> {
-    tsql_settings_around(lead, vec![create], m)
+    tsql_settings_around(lead, vec![create], m, false)
 }
 
 /// [`tsql_settings_wrapped`] around **several** statements created under the
@@ -8660,23 +8660,53 @@ pub(crate) fn tsql_settings_wrapped(
 /// wrapper closes after the last of them: a member scripted after it was
 /// created under `ON` whatever the group had, and a member's `"member"`
 /// string became a column (Msg 207, measured on SQL Server 2022).
+///
+/// **`script` states both settings, whichever way they are** — for the text
+/// a client of unknown settings replays (Copy DDL, the dump), as SQL Server's
+/// own scripter does. `sqlcmd` opens with `QUOTED_IDENTIFIER` OFF unless
+/// given `-I`, so a script that stated only an OFF one re-filed every module
+/// at the defaults as OFF: its `"name"` identifiers became strings and an
+/// indexed view's index was refused (Msg 1935; measured with `sqlcmd` 18 on
+/// 2022 and 2025). A plan runs on Schemaic's own ANSI-defaults session and
+/// needs only the OFF ones.
 pub(crate) fn tsql_settings_around(
     lead: Option<String>,
     creates: Vec<String>,
     m: &crate::schema::TsqlModule,
+    script: bool,
 ) -> Vec<String> {
-    let off: Vec<&str> = [
+    let settings = [
         ("ANSI_NULLS", m.ansi_nulls_off),
         ("QUOTED_IDENTIFIER", m.quoted_identifier_off),
-    ]
-    .into_iter()
-    .filter_map(|(setting, off)| off.then_some(setting))
-    .collect();
-    let mut out: Vec<String> = off.iter().map(|s| format!("SET {s} OFF;")).collect();
+    ];
+    let mut out: Vec<String> = settings
+        .iter()
+        .filter(|(_, off)| *off || script)
+        .map(|(s, off)| format!("SET {s} {};", if *off { "OFF" } else { "ON" }))
+        .collect();
     out.extend(lead);
     out.extend(creates);
-    out.extend(off.iter().map(|s| format!("SET {s} ON;")));
+    out.extend(
+        settings
+            .iter()
+            .filter(|(_, off)| *off)
+            .map(|(s, _)| format!("SET {s} ON;")),
+    );
     out
+}
+
+/// [`tsql_settings_around`] for **a script** of one module: both settings
+/// stated. Nothing for a module the server shows no text for, whose
+/// "statement" is a comment saying so.
+pub(crate) fn tsql_settings_scripted(
+    create: String,
+    m: &crate::schema::TsqlModule,
+    hidden: bool,
+) -> Vec<String> {
+    if hidden {
+        return vec![create];
+    }
+    tsql_settings_around(None, vec![create], m, true)
 }
 
 /// A routine's `CREATE` under the session it was created with — and on SQL
@@ -8703,10 +8733,13 @@ pub(crate) fn routine_create_statements(r: &RoutineInfo, d: SqlDialect) -> Vec<S
                     text.trim().to_string()
                 }
             });
+            // A script, so both settings stated — but for a head the server
+            // shows no text for, whose statement is a comment.
             tsql_settings_around(
                 None,
                 std::iter::once(head).chain(members).collect(),
                 &r.tsql.module,
+                !r.tsql.hidden,
             )
         }
         SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => {
@@ -18256,7 +18289,7 @@ mod tests {
             Some("CREATE VIEW dbo.v (a, b) WITH SCHEMABINDING AS SELECT id, d FROM dbo.t".into());
         let ddl = t.create_ddl(MsSql);
         assert!(
-            ddl.starts_with("SET ANSI_NULLS OFF;\nGO\nCREATE VIEW"),
+            ddl.starts_with("SET ANSI_NULLS OFF;\nGO\nSET QUOTED_IDENTIFIER ON;\nGO\nCREATE VIEW"),
             "{ddl}"
         );
         assert!(ddl.ends_with(";\nGO\nSET ANSI_NULLS ON;"), "{ddl}");
@@ -28268,7 +28301,9 @@ mod tsql_trigger_plan_tests {
     /// it**, each `SET` a statement of its own — `CREATE TRIGGER` must be
     /// alone in its batch — and the session put back after. Edited on an
     /// ANSI-defaults session, its `"x"` literals became column names
-    /// (S7.1-L1-03). The dump restates it the same way.
+    /// (S7.1-L1-03). The dump restates it the same way, stating the setting
+    /// left ON too — its reader may be `sqlcmd`, whose `QUOTED_IDENTIFIER`
+    /// is OFF (S6.2-L1-03).
     #[test]
     fn a_trigger_is_edited_under_the_settings_it_was_created_with() {
         let mut cur = tr("tr");
@@ -28282,15 +28317,25 @@ mod tsql_trigger_plan_tests {
         assert_eq!(sql[2], "SET QUOTED_IDENTIFIER ON;");
         let dump = TriggerInfo::create_set_sql(std::slice::from_ref(&cur), MsSql);
         assert_eq!(
-            dump.first().map(String::as_str),
-            Some("SET QUOTED_IDENTIFIER OFF;")
+            dump.iter().map(String::as_str).take(2).collect::<Vec<_>>(),
+            ["SET ANSI_NULLS ON;", "SET QUOTED_IDENTIFIER OFF;"]
         );
         assert_eq!(
-            dump.get(2).map(String::as_str),
+            dump.get(3).map(String::as_str),
             Some("SET QUOTED_IDENTIFIER ON;")
         );
-        // The ANSI default is no wrapper at all.
-        assert_eq!(TriggerInfo::create_set_sql(&[tr("tr")], MsSql).len(), 1);
+        // The ANSI default is no wrapper at all on the plan's session, and
+        // both settings stated ON in a script.
+        let plain = tr("tr");
+        let mut d = set(vec![plain.clone()]);
+        d.triggers[0].info.action = TriggerAction::Body("PRINT 1".into());
+        assert_eq!(
+            diff_triggers(std::slice::from_ref(&plain), &d, MsSql)
+                .emit()
+                .len(),
+            1
+        );
+        assert_eq!(TriggerInfo::create_set_sql(&[tr("tr")], MsSql).len(), 3);
     }
 
     /// **A rename by case alone is a rename.** Whether `tr` and `TR` are one

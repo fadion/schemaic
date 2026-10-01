@@ -2760,11 +2760,19 @@ impl TriggerInfo {
                         before.iter().any(|e| e.name.eq_ignore_ascii_case(n))
                     })
                     .create_sql(dialect);
-                // A SQL Server trigger under the settings it was created with;
-                // no wrapper at the ANSI defaults, which every other engine's is.
-                crate::ddl::tsql_settings_wrapped(None, create, &t.tsql.module)
-                    .into_iter()
-                    .chain(follow_ups(t))
+                // A SQL Server trigger under the settings it was created with,
+                // both stated — a script's reader may be `sqlcmd`, whose
+                // `QUOTED_IDENTIFIER` is OFF (`ddl::tsql_settings_around`); no
+                // wrapper on the other engines.
+                let wrapped = match dialect {
+                    crate::intel::SqlDialect::MsSql => {
+                        crate::ddl::tsql_settings_scripted(create, &t.tsql.module, t.tsql.hidden)
+                    }
+                    crate::intel::SqlDialect::MySql
+                    | crate::intel::SqlDialect::Postgres
+                    | crate::intel::SqlDialect::Sqlite => vec![create],
+                };
+                wrapped.into_iter().chain(follow_ups(t))
             })
             .collect()
     }
@@ -5342,13 +5350,13 @@ impl TableInfo {
             let Some(draft) = crate::ddl::ViewDraft::from_table(self) else {
                 return create;
             };
-            // Under the settings it was created with, each `SET` a batch of
-            // its own (`ddl::tsql_settings_wrapped`); then an indexed view's
-            // indexes, each in a batch of its own too — `CREATE VIEW` must be
-            // alone in one — and one the model cannot restate named, as a
-            // table's is.
+            // Under the settings it was created with, both stated and each
+            // `SET` a batch of its own (`ddl::tsql_settings_scripted`); then
+            // an indexed view's indexes, each in a batch of its own too —
+            // `CREATE VIEW` must be alone in one — and one the model cannot
+            // restate named, as a table's is.
             let mut out =
-                crate::ddl::tsql_settings_wrapped(None, create, &draft.options.tsql.module)
+                crate::ddl::tsql_settings_scripted(create, &draft.options.tsql.module, false)
                     .into_iter()
                     .chain(crate::ddl::view_index_statements(&draft, &self.name, d))
                     .collect::<Vec<_>>()
@@ -7054,9 +7062,11 @@ mod trigger_tests {
         // And the whole-set emitter a dump and Copy DDL use carries them, each
         // its own statement.
         let set = TriggerInfo::create_set_sql(std::slice::from_ref(&t), SqlDialect::MsSql);
-        assert_eq!(set.len(), 4, "{set:?}");
-        assert!(set[0].starts_with("CREATE TRIGGER"));
-        assert!(set[3].starts_with("DISABLE TRIGGER"));
+        assert_eq!(set.len(), 6, "{set:?}");
+        // Both settings stated first — see `ddl::tsql_settings_scripted`.
+        assert_eq!(set[0], "SET ANSI_NULLS ON;");
+        assert!(set[2].starts_with("CREATE TRIGGER"));
+        assert!(set[5].starts_with("DISABLE TRIGGER"));
         // **A hidden trigger is not created, so nothing may follow it**: its
         // "statement" is a comment, and a restore that then ran `DISABLE
         // TRIGGER` or `sp_settriggerorder` on it would stop at a trigger that
@@ -9561,7 +9571,7 @@ mod tests {
         };
         assert_eq!(
             v.create_ddl(ms),
-            "CREATE VIEW [sales].[v2] AS\nSELECT 1 AS a;"
+            format!("{SCRIPT_SETTINGS}CREATE VIEW [sales].[v2] AS\nSELECT 1 AS a;")
         );
         let v = TableInfo {
             create_sql: Some(
@@ -9572,9 +9582,16 @@ mod tests {
         };
         assert_eq!(
             v.create_ddl(ms),
-            "-- lead\nCREATE VIEW [sales].[v2] (x) WITH SCHEMABINDING AS\nSELECT id FROM dbo.t;"
+            format!(
+                "{SCRIPT_SETTINGS}-- lead\nCREATE VIEW [sales].[v2] (x) WITH SCHEMABINDING AS\n\
+                 SELECT id FROM dbo.t;"
+            )
         );
     }
+
+    /// What a SQL Server module's script opens with at the ANSI defaults —
+    /// both settings stated (`ddl::tsql_settings_scripted`).
+    const SCRIPT_SETTINGS: &str = "SET ANSI_NULLS ON;\nGO\nSET QUOTED_IDENTIFIER ON;\nGO\n";
 
     /// **An indexed view's script builds its indexes after it**, each in a
     /// batch of its own (`CREATE VIEW` must be alone in one), the clustered
@@ -9613,11 +9630,14 @@ mod tests {
         };
         assert_eq!(
             v.create_ddl(crate::intel::SqlDialect::MsSql),
-            "CREATE VIEW [dbo].[v] WITH SCHEMABINDING AS\nSELECT id, d FROM dbo.t;\nGO\n\
-             CREATE UNIQUE CLUSTERED INDEX [cix] ON [dbo].[v] ([id]);\nGO\n\
-             CREATE INDEX [nix] ON [dbo].[v] ([d]);\n\
-             -- Index inc has included columns, or is of a kind this script cannot restate; \
-             it is left out."
+            format!(
+                "{SCRIPT_SETTINGS}CREATE VIEW [dbo].[v] WITH SCHEMABINDING AS\n\
+                 SELECT id, d FROM dbo.t;\nGO\n\
+                 CREATE UNIQUE CLUSTERED INDEX [cix] ON [dbo].[v] ([id]);\nGO\n\
+                 CREATE INDEX [nix] ON [dbo].[v] ([d]);\n\
+                 -- Index inc has included columns, or is of a kind this script cannot restate; \
+                 it is left out."
+            )
         );
     }
 
@@ -9634,7 +9654,10 @@ mod tests {
             ..Default::default()
         };
         let ddl = v.create_ddl(crate::intel::SqlDialect::MsSql);
-        assert!(ddl.starts_with("-- NOTE: "), "{ddl}");
+        assert!(
+            ddl.starts_with(&format!("{SCRIPT_SETTINGS}-- NOTE: ")),
+            "{ddl}"
+        );
         assert!(ddl.contains("[dbo].[v2]"), "{ddl}");
         assert!(
             ddl.ends_with("\nCREATE VIEW v1 WITH SOMETHING_NEW AS SELECT 1 AS a;"),
@@ -9703,6 +9726,79 @@ mod tests {
             let on = sql.find(&format!("SET {setting} ON;")).expect(&sql);
             assert!(off < member && member < on, "{setting}: {sql}");
         }
+    }
+
+    /// **A SQL Server module's script states both settings, whichever way
+    /// they are.** It stated them only when one was OFF, and `sqlcmd` opens
+    /// with `QUOTED_IDENTIFIER` OFF unless given `-I` — so a dump or Copy DDL
+    /// restored through it re-filed every module at the defaults as OFF:
+    /// measured with `sqlcmd` 18 on 2022 and 2025, its `"id"` became a string
+    /// and an indexed view's index was refused (Msg 1935; S6.2-L1-03). The
+    /// view, the routine and the trigger scripts each open with both `SET`s;
+    /// a plan, which runs on Schemaic's own ANSI-defaults session, does not.
+    #[test]
+    fn a_sql_server_modules_script_states_both_settings_at_the_defaults() {
+        use crate::intel::SqlDialect::MsSql;
+        let stated = |sql: &str, create: &str| {
+            let at = sql
+                .find(create)
+                .unwrap_or_else(|| panic!("{create}: {sql}"));
+            for s in ["SET ANSI_NULLS ON;", "SET QUOTED_IDENTIFIER ON;"] {
+                assert!(sql.find(s).is_some_and(|i| i < at), "{s}: {sql}");
+            }
+        };
+        let r = RoutineInfo {
+            name: "p".into(),
+            schema: Some("dbo".into()),
+            kind: RoutineKind::Procedure,
+            body: "SELECT \"id\" FROM dbo.t".into(),
+            ..Default::default()
+        };
+        stated(
+            &ObjectItem::Routine(std::sync::Arc::new(r)).create_sql(MsSql),
+            "CREATE PROCEDURE",
+        );
+        let v = TableInfo {
+            name: "v".into(),
+            schema: Some("dbo".into()),
+            is_view: true,
+            view_definition: Some("SELECT \"id\" AS a FROM dbo.t".into()),
+            create_sql: Some("CREATE VIEW dbo.v AS SELECT \"id\" AS a FROM dbo.t".into()),
+            view_options: Some(ViewOptions::default()),
+            ..Default::default()
+        };
+        stated(&v.create_ddl(MsSql), "CREATE VIEW");
+        let t = TriggerInfo {
+            name: "tr".into(),
+            table: "t".into(),
+            schema: Some("dbo".into()),
+            events: vec![TriggerEvent::Insert],
+            timing: TriggerTiming::After,
+            action: TriggerAction::Body("SET NOCOUNT ON".into()),
+            ..Default::default()
+        };
+        stated(
+            &TriggerInfo::create_set_sql(std::slice::from_ref(&t), MsSql).join("\n"),
+            "CREATE TRIGGER",
+        );
+        // OFF is stated OFF, and put back ON after.
+        let mut off = t.clone();
+        off.tsql.module.quoted_identifier_off = true;
+        let set = TriggerInfo::create_set_sql(std::slice::from_ref(&off), MsSql);
+        assert_eq!(
+            [&set[0], &set[1], &set[3]],
+            [
+                "SET ANSI_NULLS ON;",
+                "SET QUOTED_IDENTIFIER OFF;",
+                "SET QUOTED_IDENTIFIER ON;"
+            ],
+            "{set:?}"
+        );
+        // The plan's session is known, and nothing is added there.
+        let mut d = crate::ddl::ViewDraft::from_table(&v).unwrap();
+        d.select = "SELECT 1 AS a".into();
+        let plan = crate::ddl::diff_view(&v, &d, MsSql).emit();
+        assert!(!plan.iter().any(|s| s.starts_with("SET ")), "{plan:?}");
     }
 
     /// **A SQL Server script closes each object's batch with `GO`.** A view, a

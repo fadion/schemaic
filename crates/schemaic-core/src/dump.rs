@@ -611,6 +611,22 @@ pub fn date_format_sql(dialect: SqlDialect) -> Option<&'static str> {
     }
 }
 
+/// The settings a restoring SQL Server session must have for what the file
+/// creates — each a batch of its own, at the head beside
+/// [`date_format_sql`]; empty on the other engines.
+///
+/// **`sqlcmd` opens with `QUOTED_IDENTIFIER` OFF unless given `-I`**, and a
+/// filtered index, an index on a computed column and an indexed view's index
+/// are each refused under it (Msg 1934/1935). Every module's own script states
+/// both settings it was created under (`ddl::tsql_settings_around`); this is
+/// what the tables before them are created under.
+pub fn ansi_settings_sql(dialect: SqlDialect) -> &'static [&'static str] {
+    match dialect {
+        SqlDialect::MsSql => &["SET ANSI_NULLS ON;", "SET QUOTED_IDENTIFIER ON;"],
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => &[],
+    }
+}
+
 /// How this dialect opens and closes the load's transaction.
 pub fn transaction_sql(dialect: SqlDialect) -> (&'static str, &'static str) {
     match dialect {
@@ -1983,6 +1999,9 @@ pub fn plan(
     }
     // Beside it, for the same reason: it decides what a date literal means.
     if let Some(sql) = date_format_sql(dialect) {
+        text!(sql.to_string());
+    }
+    for sql in ansi_settings_sql(dialect) {
         text!(sql.to_string());
     }
 
@@ -5535,10 +5554,16 @@ mod tests {
         assert!(pin < pos(&file, "CREATE TABLE"), "{file}");
         assert!(pin < pos(&file, "BEGIN TRANSACTION"), "{file}");
         assert!(pin < pos(&file, "<<rows orders:"), "{file}");
+        // And the two settings a filtered or computed column's index needs,
+        // which `sqlcmd` without `-I` opens with off (S6.2-L1-03).
+        for s in ["SET ANSI_NULLS ON;", "SET QUOTED_IDENTIFIER ON;"] {
+            assert!(pos(&file, s) < pos(&file, "CREATE TABLE"), "{s}: {file}");
+        }
         for d in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite] {
             let s = schema_of(vec![table("orders")]);
             let file = file_of(&plan(&s, "shop", &all(&s), DumpOptions::default(), d));
             assert!(!file.contains("DATEFORMAT"), "{d:?}: {file}");
+            assert!(!file.contains("QUOTED_IDENTIFIER"), "{d:?}: {file}");
         }
     }
 

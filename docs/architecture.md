@@ -3507,7 +3507,11 @@ existing prose was left alone.
     (`a_sql_server_dump_pins_its_date_format_before_any_row`; the live round trip restores under
     `SET LANGUAGE british`). The rows' own literals no longer lean on it — `export::typed_literal`
     writes those two types in the `T` form — and the pin stays for whatever other date text the
-    file carries. **The `@SCHEMAIC_OLD_SQL_MODE` wrapper is MySQL's
+    file carries. **`ansi_settings_sql` follows it**: `SET ANSI_NULLS ON;` and `SET
+    QUOTED_IDENTIFIER ON;`, because `sqlcmd` opens with the second OFF unless given `-I`, and a
+    filtered index or a computed column's index is refused under it — each module's own script
+    states the settings it was created under (`ddl::tsql_settings_around`). **The
+    `@SCHEMAIC_OLD_SQL_MODE` wrapper is MySQL's
     session-variable syntax**, so this leans on `literal_mode_sql` answering for MySQL alone and
     carries a `debug_assert` saying so: a second dialect needing a statement there has to grow an
     arm here, not have its statement wrapped in these two. Whether a PostgreSQL *dump* should pin
@@ -5242,13 +5246,29 @@ existing prose was left alone.
     row of settings for the group, and members scripted after the closing `SET … ON` were created
     under `ON`, a member's `"member"` string turning into a column, Msg 207 —
     `a_numbered_groups_members_are_scripted_inside_its_settings`; live,
-    `a_numbered_groups_script_keeps_its_settings_for_its_members`), both `ReplaceView` arms of `view_statements`, and `TableInfo::tsql_create_ddl`'s view branch
-    (Copy DDL and the dump, the `SET`s as `GO` batches before the indexes). `alters_the_database`
-    already counted a `SET` as scaffolding. Nothing is added for a module at the ANSI defaults.
+    `a_numbered_groups_script_keeps_its_settings_for_its_members`), both `ReplaceView` arms of
+    `view_statements`, and `TableInfo::tsql_create_ddl`'s view branch (Copy DDL and the dump, the
+    `SET`s as `GO` batches before the indexes). `alters_the_database` already counted a `SET` as
+    scaffolding. **A plan adds nothing for a module at the ANSI defaults; a script states both
+    settings whichever way they are** (`tsql_settings_around`'s `script`, through
+    `tsql_settings_scripted` for a view's and a trigger's, and `routine_create_statements`), as SQL
+    Server's own scripter does. A plan runs on Schemaic's own ANSI-defaults session; a script's
+    reader may be `sqlcmd`, which opens with `QUOTED_IDENTIFIER` OFF unless given `-I` — and when
+    only an OFF setting was stated, a dump or Copy DDL restored through it re-filed every module at
+    the defaults as OFF: its `"id"` became the string `'id'`, an indexed view's index was refused
+    (Msg 1935), and which modules came out wrong depended on where an OFF module's closing `SET …
+    ON` fell in the file (measured with `sqlcmd` 18 on 2022 and 2025). A module the server shows
+    no text for is a comment, and gets no `SET`s. The dump's head states both `ON` too
+    (`dump::ansi_settings_sql`, beside `SET DATEFORMAT`), for the tables before any module — a
+    filtered index or a computed column's index is refused under `QUOTED_IDENTIFIER` OFF.
     `a_view_is_edited_under_the_settings_it_was_created_with` and its trigger and routine siblings
-    pin it; live, `a_module_keeps_its_creation_settings_through_an_edit` (2022 and 2025) reads each
-    module with its settings, edits it and finds them still in `sys.sql_modules` and the module
-    behaving as before, and replays a view's script to the same end.
+    pin it, with `a_sql_server_modules_script_states_both_settings_at_the_defaults`; live,
+    `a_module_keeps_its_creation_settings_through_an_edit` (2022 and 2025) reads each module with
+    its settings, edits it and finds them still in `sys.sql_modules` and the module behaving as
+    before, and replays a view's script to the same end, and
+    `a_modules_script_restores_its_settings_through_a_session_that_has_them_off` replays a view's,
+    an indexed view's and a procedure's script after `SET QUOTED_IDENTIFIER OFF` and `SET
+    ANSI_NULLS OFF` and finds each module back at `11`.
     **A routine's diff is per-engine at the *rename*, and that is the whole shape of
     `diff_routine`.** PostgreSQL replaces one in place (`supports_or_replace_routine`) and renames
     it with a statement of its own (`supports_routine_rename`), so a rename is a separate change

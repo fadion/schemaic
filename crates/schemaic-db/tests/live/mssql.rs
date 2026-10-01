@@ -3340,6 +3340,68 @@ async fn a_module_keeps_its_creation_settings_through_an_edit() {
     assert_eq!(settings("v_an").await, "01");
 }
 
+/// **A module's script restores it at the defaults through a session that
+/// has them off** — `sqlcmd`'s, whose `QUOTED_IDENTIFIER` is OFF unless given
+/// `-I`. The scripts stated a setting only when the module had it OFF, so
+/// through such a session every module at the defaults came back OFF: a
+/// view's `"id"` became the string `'id'`, and an indexed view's index was
+/// refused (Msg 1935). Replayed after a session that switched both off, each
+/// script puts its module back `11`, doing what it did.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_modules_script_restores_its_settings_through_a_session_that_has_them_off() {
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("ddl_script_settings").await;
+    s.exec("CREATE TABLE dbo.t (id int NOT NULL PRIMARY KEY); INSERT dbo.t VALUES (7)")
+        .await;
+    s.exec("CREATE VIEW dbo.v_on AS SELECT \"id\" AS a FROM dbo.t")
+        .await;
+    s.exec("CREATE VIEW dbo.v_ix WITH SCHEMABINDING AS SELECT id FROM dbo.t")
+        .await;
+    s.exec("CREATE UNIQUE CLUSTERED INDEX cix ON dbo.v_ix (id)")
+        .await;
+    s.exec("CREATE PROCEDURE dbo.p_on AS SELECT \"id\" AS a FROM dbo.t")
+        .await;
+    let settings = |name: &'static str| {
+        let s = &s;
+        async move {
+            s.scalar(&format!(
+                "SELECT CONCAT(uses_ansi_nulls, uses_quoted_identifier) FROM sys.sql_modules \
+                 WHERE object_id = OBJECT_ID('dbo.{name}')"
+            ))
+            .await
+        }
+    };
+    let off = "SET QUOTED_IDENTIFIER OFF;\nGO\nSET ANSI_NULLS OFF;\nGO\n";
+    for name in ["v_on", "v_ix"] {
+        let ddl = read_table(&s, name).await.create_ddl(MS);
+        replay(&s, &format!("{off}DROP VIEW dbo.{name};\nGO\n{ddl}\nGO")).await;
+        assert_eq!(settings(name).await, "11", "{ddl}");
+    }
+    assert_eq!(s.scalar("SELECT a FROM dbo.v_on").await, "7");
+    assert_eq!(
+        s.scalar("SELECT COUNT(*) FROM sys.indexes WHERE object_id = OBJECT_ID('dbo.v_ix') AND name = 'cix'")
+            .await,
+        "1",
+        "the index was built again"
+    );
+    let p =
+        s.db.fetch_schema(&s.name, CancellationToken::new())
+            .await
+            .unwrap()
+            .routines
+            .iter()
+            .find(|r| r.name == "p_on")
+            .unwrap()
+            .as_ref()
+            .clone();
+    let ddl = schemaic_core::schema::ObjectItem::Routine(Arc::new(p)).create_sql(MS);
+    replay(&s, &format!("{off}DROP PROCEDURE dbo.p_on;\nGO\n{ddl}")).await;
+    assert_eq!(settings("p_on").await, "11", "{ddl}");
+    assert_eq!(s.scalar("EXEC dbo.p_on").await, "7");
+}
+
 /// **A trigger renamed by case alone is renamed, and only once.** Taken as an
 /// in-place alter, a case-sensitive database got a second trigger `TR` beside
 /// `tr` and every insert fired both; a case-insensitive one kept `tr`. Here,
