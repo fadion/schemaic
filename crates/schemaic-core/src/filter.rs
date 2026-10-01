@@ -502,10 +502,9 @@ impl<'a> BrowseKey<'a> {
 /// is called.
 ///
 /// MySQL qualifies `` `db`.`table` `` (its connection is server-level).
-/// PostgreSQL emits the name its connection can already reach: bare in `public`,
-/// which resolves through `search_path`, and `"schema"."table"` in any other
-/// namespace — `schema` is the table's PostgreSQL namespace and is always `None`
-/// on MySQL, where the database *is* the namespace. **SQLite names the table
+/// PostgreSQL and SQL Server emit `schema.table` in every namespace, the default
+/// one included (see the arm) — `schema` is the table's namespace and is always
+/// `None` on MySQL, where the database *is* the namespace. **SQLite names the table
 /// alone**: a connection is one file, so there is no server-level qualifier to
 /// add, and `database` there is the schema name SQLite itself uses (`main`, or
 /// an `ATTACH`ed one) — qualifying with it would emit `main.t`, correct but noise
@@ -527,20 +526,14 @@ pub fn qualified_table_name(
             quote_if_needed(database, dialect),
             quote_if_needed(table, dialect)
         ),
-        SqlDialect::Postgres => match crate::schema::sql_qualifier(schema) {
-            Some(s) => format!(
-                "{}.{}",
-                quote_if_needed(s, dialect),
-                quote_if_needed(table, dialect)
-            ),
-            None => quote_if_needed(table, dialect),
-        },
         SqlDialect::Sqlite => quote_if_needed(table, dialect),
-        // Always schema-qualified, `dbo` included: an unqualified name
-        // resolves through the *login's* default schema, which need not be
-        // `dbo`, so the bare form would read a different table for a
-        // different user.
-        SqlDialect::MsSql => match schema {
+        // Always schema-qualified, `dbo` and `public` included: an unqualified
+        // name resolves through the *login's* default schema on SQL Server,
+        // which need not be `dbo`, and through `search_path` on PostgreSQL,
+        // whose stock first entry is `"$user"` — so the bare form would read a
+        // different table for a different user, while the tab's identity, and
+        // every write from its grid, stayed the one it was opened on.
+        SqlDialect::Postgres | SqlDialect::MsSql => match schema.filter(|s| !s.is_empty()) {
             Some(s) => format!(
                 "{}.{}",
                 quote_if_needed(s, dialect),
@@ -951,11 +944,14 @@ mod tests {
             tq_in(SqlDialect::Postgres, "sales", "orders", &["id"]),
             "SELECT * FROM sales.orders ORDER BY id ASC LIMIT 100"
         );
-        // `public` is on the search_path → the statement stays exactly what it
-        // was before multi-schema browsing existed.
+        // `public` is named too. A bare name resolves through `search_path`,
+        // whose stock first entry is `"$user"`: with a schema named after the
+        // login holding an `orders`, the tab opened on `public.orders` browsed
+        // that one — while its identity, and so every write from its grid, was
+        // `public.orders`, keyed on values read from the other table.
         assert_eq!(
             tq_in(SqlDialect::Postgres, "public", "orders", &["id"]),
-            "SELECT * FROM orders ORDER BY id ASC LIMIT 100"
+            "SELECT * FROM public.orders ORDER BY id ASC LIMIT 100"
         );
     }
 

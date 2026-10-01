@@ -395,9 +395,9 @@ pub async fn a_sequence_cannot_be_owned_across_namespaces(target: &'static Targe
     );
     let sql = seq.create_sql(target.engine.dialect());
     let ns = scratch.namespace.expect("a PostgreSQL namespace");
+    // `public` is named too, as in every statement that runs.
     assert!(
-        sql.contains(&format!("OWNED BY \"{ns}\".\"here_t\".\"id\""))
-            || (ns == "public" && sql.contains("OWNED BY \"here_t\".\"id\"")),
+        sql.contains(&format!("OWNED BY \"{ns}\".\"here_t\".\"id\"")),
         "{}: {sql}",
         target.name
     );
@@ -522,10 +522,12 @@ pub async fn a_join_across_namespaces_stays_two_tables(target: &'static Target) 
     scratch.teardown().await;
 }
 
-/// **The branch that qualifies generated DDL has never reached a server.**
+/// **The branch that qualifies generated DDL had never reached a server.**
 ///
-/// `schema::sql_qualifier` returns `None` for `public`, so the qualifying arm
-/// is taken only for a non-default schema — and every table in the DDL, view
+/// `schema::sql_qualifier` returned `None` for `public` and the emitter went
+/// through it, so the qualifying arm was taken only for a non-default schema
+/// (since then every schema is named, `public` included — see the two legs
+/// below) — and every table in the DDL, view
 /// and trigger tiers is addressed through `Scratch::qualified`, which resolves
 /// to `public` on the PostgreSQL leg and to the connection's own database on
 /// both MySQL legs. `alt_namespace` had three callers, all in this file, and
@@ -736,6 +738,262 @@ pub async fn public_ddl_does_not_land_in_the_logins_own_schema(target: &'static 
         "the login's own orders untouched"
     );
 
+    scratch.teardown().await;
+}
+
+/// **Every other statement that runs names `public` too** — the paths that
+/// built their names through `schema::sql_qualifier`, which leaves `public` off
+/// for display, after `ddl::qualified` stopped doing so for a plan's DDL.
+///
+/// The stock `search_path` is `"$user", public`, so with a schema named after
+/// the login a bare name reaches that schema first, and a bare `CREATE` lands
+/// in it whether or not it holds anything of the name:
+///
+/// - the enum rebuild created the new `mood` there, and its recast to
+///   `"public"."mood"` then failed the plan;
+/// - the trigger editor's `CREATE TRIGGER … ON "orders"` hung the trigger on the
+///   login's `orders`;
+/// - the routine editor's `DROP FUNCTION "f"(integer)` dropped the login's `f`;
+/// - the browse query and a key's Follow read the login's `orders` into a tab
+///   whose identity, and so every write from its grid, is `public.orders`;
+/// - a dump of `public` restored its `CREATE TABLE`s into the login's schema,
+///   and its `INSERT INTO "public"…` then failed.
+///
+/// Each pair exists on both sides where the failure is a silent one, so a
+/// statement aimed at the wrong object succeeds: the untouched one is the
+/// assertion. PostgreSQL alone, for the reason the leg above gives.
+pub async fn public_objects_are_named_in_every_statement_that_runs(target: &'static Target) {
+    use schemaic_core::ddl::{self, Change, ChangeSet, EnumDraft, TriggerDraft};
+    use schemaic_core::filter::{BrowseKey, Order, table_query};
+    use schemaic_core::intel::SqlDialect;
+    use schemaic_core::schema::{
+        ForeignKeyInfo, TriggerAction, TriggerEvent, TriggerInfo, TriggerLevel, TriggerTiming,
+        follow_target,
+    };
+    const PG: SqlDialect = SqlDialect::Postgres;
+
+    if target.engine.dialect() != PG {
+        crate::endpoint::note_no_op(target, "resolves a bare name in no per-login schema");
+        return;
+    }
+    let scratch = Scratch::create(target, "ns_user_paths").await;
+    for sql in [
+        "CREATE SCHEMA AUTHORIZATION CURRENT_USER",
+        "CREATE TYPE public.mood AS ENUM ('sad', 'ok')",
+        "CREATE TABLE public.people (id integer PRIMARY KEY, m public.mood)",
+        "INSERT INTO public.people VALUES (1, 'ok')",
+        "CREATE TABLE public.orders (id integer PRIMARY KEY, label text)",
+        "INSERT INTO public.orders VALUES (1, 'public')",
+        "CREATE FUNCTION public.f(a integer) RETURNS integer LANGUAGE sql AS 'SELECT 1'",
+        "CREATE FUNCTION public.audit_fn() RETURNS trigger LANGUAGE plpgsql \
+         AS 'BEGIN RETURN NEW; END'",
+    ] {
+        scratch.exec(sql).await;
+    }
+    let user = scratch.exec("SELECT current_user::text").await;
+    let user = user
+        .cell(0, 0)
+        .map(|c| c.display().to_string())
+        .expect("the login's name");
+    let own = schemaic_core::export::ident_sql(&user, PG);
+    for sql in [
+        format!("CREATE TABLE {own}.orders (id integer PRIMARY KEY, label text)"),
+        format!("INSERT INTO {own}.orders VALUES (1, 'own')"),
+        format!("CREATE FUNCTION {own}.f(a integer) RETURNS integer LANGUAGE sql AS 'SELECT 2'"),
+    ] {
+        scratch.exec(&sql).await;
+    }
+    let text = |sql: String| {
+        let scratch = &scratch;
+        async move {
+            scratch
+                .exec(&sql)
+                .await
+                .cell(0, 0)
+                .map(|c| c.display().to_string())
+                .unwrap_or_default()
+        }
+    };
+    // The precondition: a bare name finds the login's own object.
+    assert_eq!(text("SELECT label FROM orders".into()).await, "own");
+    let schema = scratch
+        .db
+        .fetch_schema(&scratch.database, CancellationToken::new())
+        .await
+        .unwrap_or_else(|e| panic!("introspecting {}: {e}", scratch.database));
+    let in_public = |s: &Option<String>| s.as_deref() == Some("public");
+
+    // ── The enum rebuild ────────────────────────────────────────────────────
+    let mood = schema
+        .enums
+        .iter()
+        .find(|e| e.name == "mood" && in_public(&e.schema))
+        .expect("public.mood")
+        .clone();
+    let mut draft = EnumDraft::from_info(&mood);
+    // Dropping a value is a rebuild; appending one would be `ADD VALUE`.
+    draft.info.values = vec!["ok".into()];
+    let deps = ddl::type_dependents(&schema, Some("public"), "mood");
+    scratch
+        .apply_plan(
+            &ddl::diff_enum(&mood, &draft, &deps, PG),
+            "rebuild public.mood",
+        )
+        .await;
+    assert_eq!(
+        text("SELECT enum_range(NULL::public.mood)::text".into()).await,
+        "{ok}",
+        "public.mood rebuilt"
+    );
+    assert_eq!(
+        text(format!(
+            "SELECT count(*)::text FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace \
+             WHERE t.typname = 'mood' AND n.nspname = current_user"
+        ))
+        .await,
+        "0",
+        "no mood in the login's schema"
+    );
+
+    // ── The trigger editor's create ────────────────────────────────────────
+    let trigger = TriggerInfo {
+        name: "t_audit".into(),
+        schema: Some("public".into()),
+        table: "orders".into(),
+        timing: TriggerTiming::After,
+        events: vec![TriggerEvent::Insert],
+        level: TriggerLevel::Row,
+        action: TriggerAction::Function {
+            name: "\"public\".\"audit_fn\"".into(),
+            args: vec![],
+        },
+        ..Default::default()
+    };
+    scratch
+        .apply_plan(
+            &ChangeSet {
+                table: "orders".into(),
+                schema: Some("public".into()),
+                dialect: PG,
+                flavour: Default::default(),
+                changes: vec![Change::CreateTrigger(Box::new(TriggerDraft::from_info(
+                    &trigger,
+                )))],
+            },
+            "a trigger on public.orders",
+        )
+        .await;
+    assert_eq!(
+        text(
+            "SELECT n.nspname::text FROM pg_trigger g JOIN pg_class c ON c.oid = g.tgrelid \
+             JOIN pg_namespace n ON n.oid = c.relnamespace WHERE g.tgname = 't_audit'"
+                .into()
+        )
+        .await,
+        "public",
+        "the trigger hangs off public.orders"
+    );
+
+    // ── The routine editor's drop ──────────────────────────────────────────
+    let f = schema
+        .routines
+        .iter()
+        .find(|r| r.name == "f" && in_public(&r.schema))
+        .expect("public.f");
+    scratch
+        .apply_plan(&ddl::drop_routine(f, PG), "drop public.f")
+        .await;
+    let fs = |ns: &'static str| {
+        format!(
+            "SELECT count(*)::text FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+             WHERE p.proname = 'f' AND n.nspname = {ns}"
+        )
+    };
+    assert_eq!(text(fs("'public'")).await, "0", "public.f dropped");
+    assert_eq!(
+        text(fs("current_user")).await,
+        "1",
+        "the login's own f untouched"
+    );
+
+    // ── The browse query, and a key's Follow ───────────────────────────────
+    let key = ["id".to_string()];
+    let browse = table_query(
+        PG,
+        &scratch.database,
+        Some("public"),
+        "orders",
+        BrowseKey::Columns(&key),
+        Order::Asc,
+        100,
+    );
+    let rs = scratch.exec(&browse).await;
+    let label = rs.columns.iter().position(|c| c.name == "label");
+    assert_eq!(
+        label
+            .and_then(|i| rs.cell(0, i))
+            .map(|c| c.display().to_string())
+            .as_deref(),
+        Some("public"),
+        "the browse query read public.orders: {browse}"
+    );
+    let follow = follow_target(
+        &ForeignKeyInfo {
+            name: "fk".into(),
+            columns: vec!["order_id".into()],
+            ref_schema: Some("public".into()),
+            ref_table: "orders".into(),
+            ref_columns: vec!["id".into()],
+            ..Default::default()
+        },
+        &[schemaic_core::model::Value::Int(1)],
+        &scratch.database,
+        PG,
+    )
+    .expect("a follow target");
+    let rs = scratch.exec(&follow.sql).await;
+    let label = rs.columns.iter().position(|c| c.name == "label");
+    assert_eq!(
+        label
+            .and_then(|i| rs.cell(0, i))
+            .map(|c| c.display().to_string())
+            .as_deref(),
+        Some("public"),
+        "the follow read public.orders: {}",
+        follow.sql
+    );
+
+    // ── A dump of `public`, restored into this database ────────────────────
+    let src = Scratch::create(target, "ns_user_dump").await;
+    for sql in [
+        "CREATE TABLE public.items (id serial PRIMARY KEY, label text)",
+        "INSERT INTO public.items (label) VALUES ('a'), ('b')",
+    ] {
+        src.exec(sql).await;
+    }
+    let file = Box::pin(crate::runtime::dump_file(&src)).await;
+    let end = Box::pin(crate::runtime::run_file(&scratch, &file)).await;
+    assert_eq!(
+        end,
+        schemaic_core::script::ExecEnd::Done,
+        "the restore:\n{file}"
+    );
+    assert_eq!(
+        text("SELECT count(*)::text FROM public.items".into()).await,
+        "2",
+        "the rows restored into public.items:\n{file}"
+    );
+    assert_eq!(
+        text(format!("SELECT (to_regclass('{own}.items') IS NULL)::text")).await,
+        "true",
+        "nothing restored into the login's schema:\n{file}"
+    );
+    // The counter was moved past the rows it restored.
+    scratch
+        .exec("INSERT INTO public.items (label) VALUES ('c')")
+        .await;
+
+    src.teardown().await;
     scratch.teardown().await;
 }
 

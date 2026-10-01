@@ -1872,7 +1872,11 @@ existing prose was left alone.
     `UPDATE` and the browse `SELECT` above it end up spelling the same table two ways. On SQL
     Server it always qualifies, because an unqualified name resolves through the *login's* default
     schema, which need not be `dbo` — the bare form would read a different table for a different
-    user — and the cap is `TOP (n)`, through `sql::limited_select`.
+    user — and the cap is `TOP (n)`, through `sql::limited_select`. **PostgreSQL takes the same arm,
+    `public` included**: a bare name resolves through `search_path`, whose stock first entry is
+    `"$user"`, so with a schema named after the login the bare `public` form read the login's
+    `orders` into a tab whose identity, and every write from its grid, stayed `public.orders`
+    (live, `public_objects_are_named_in_every_statement_that_runs`).
     **SQL Server's `]` is the one quote `sqlparser` will not escape**, and two rules follow from it.
     The sort column goes into the AST **already quoted** by the one quoter and wrapped as an
     unquoted `Ident`, which renders verbatim: `Ident::with_quote` took the quote character and
@@ -3564,6 +3568,12 @@ existing prose was left alone.
     through `qualified_table` and *does* name the database; without that line the file would create
     `orders` wherever the client is pointed and then insert into `shop`.`orders`.
     PostgreSQL needs none (both halves name the namespace) and SQLite has no qualifier at all.
+    **Both halves name it `public` included**, and so do the file's `DROP … IF EXISTS`, T-SQL's
+    `SET IDENTITY_INSERT` and up-front key drops, and `sequence_resync_sql`'s table — all through
+    `schema::qualified_ident` — so a `DROP` and its `CREATE` still name one table. `create_ddl`
+    used to leave `public` off while the rows named it: replayed into a database holding a schema
+    named after the login, the `CREATE TABLE`s landed there through `search_path` and the first
+    `INSERT INTO "public".…` failed (live, `public_objects_are_named_in_every_statement_that_runs`).
     What that line is **not** is a retarget: a `mysqldump` is replayed elsewhere by editing its one
     `USE`, because its `INSERT`s name the table bare, while these name `` `shop`.`orders` `` outright
     — so the file is locked to the database it came from, and that is **known debt rather than a
@@ -8604,8 +8614,10 @@ existing prose was left alone.
     **`TriggerInfo`/`TriggerAction`/`TriggerEvent`/`TriggerEnabled`/`TriggerSource`** are the
     trigger half, and carry three rules the
     same "restate everything or it silently resets" logic as `ViewOptions`.
-    `TriggerAction::Function::name` is **emittable SQL** on both producers — already quoted,
-    qualified when it isn't in `public` — never a bare identifier; it once meant both
+    `TriggerAction::Function::name` is **emittable SQL** on both producers — already quoted, and
+    qualified: always by the editor's `fn_sql` (`qualified_ident`, `public` included), by the
+    reader's `tgfoid::regproc::text` wherever `search_path` would not resolve it, which on a stock
+    server is every schema but `public` — never the raw `proname`; it once meant both
     depending on who wrote it, which bound triggers to `public`'s copy of a function picked
     from another schema. `TriggerEvent`'s **declaration order is load-bearing**: the derived
     `Ord` is what the UI sorts into and must be `pg_trigger.tgtype`'s bit order (`INSERT`,
@@ -8871,9 +8883,20 @@ existing prose was left alone.
     (an object in its own right), and `SequenceInfo::implicit_bounds`/`implicit_start` are why
     `create_sql` emits a clean statement instead of restating six clauses that say nothing;
     `last_value` is live state and deliberately takes no part in any diff. `qualified_ident` is
-    the one "qualify unless `public`, then quote both halves" builder every one of these (and
-    `RoutineInfo::signature_sql`) addresses its object through, and `find_by_ns` the one
-    namespace-lookup rule behind every `DbSchema::find_*`.
+    the one "qualify with whatever schema it has, then quote both halves" builder every one of
+    these (and `RoutineInfo::signature_sql`, `TriggerInfo::create_sql`'s table and
+    `TableInfo::create_ddl`) addresses its object through, and `find_by_ns` the one
+    namespace-lookup rule behind every `DbSchema::find_*`. **It names `public` like any other
+    schema**, and it used to leave it off through `sql_qualifier`, as the display name does —
+    but what it builds runs, and a bare name resolves through `search_path`, whose stock value is
+    `"$user", public`. Measured on PostgreSQL 16 with a schema named after the login: the enum
+    rebuild's `CREATE TYPE "mood"` (`recreate_type_sql`) landed in the login's schema and the
+    recast to `"public"."mood"` after it failed the plan; the routine editor's `DROP FUNCTION
+    "f"(integer)` dropped the login's own `f`; and `CREATE TRIGGER … ON "orders"` hung the trigger
+    on the login's `orders` (`public_objects_are_named_in_every_statement_that_runs`, each section
+    watched fail against the unfixed tree). `ddl::qualified` had made the same change for a plan's
+    DDL (under `schemaic-db`); `sql_qualifier` is now for display alone — `display_name` and
+    `dump::tables_in_namespace`, which matches display names.
     **`DbSchema::database` is the schema's own address, and deliberately not part of the schema.**
     It is *not* stamped onto the objects in it — `TableInfo::schema` is `None` on MySQL precisely
     because a database *is* its namespace there — and it rides on the struct because exactly one
@@ -13413,7 +13436,7 @@ existing prose was left alone.
   `match` — `diff` reads the draft's key columns as `NOT NULL` and the plan alters them before
   `ADD PRIMARY KEY` (`a_nullable_column_keyed_on_sql_server_is_made_not_null_first`). And
   **`ddl::qualified` writes every schema it is given, on every engine — PostgreSQL's `public`
-  included.** It went through `sql_qualifier`, which drops `public` for SQL the user reads, first
+  included.** It went through `sql_qualifier`, which drops `public` for a display name, first
   on every engine and then on PostgreSQL alone, "where it is what an unqualified name resolves
   to" — which it is not: a bare name resolves through `search_path`, whose stock value is
   `"$user", public`, so with a schema named after the login that holds a same-named table (the
@@ -13422,10 +13445,15 @@ existing prose was left alone.
   designer key to `customers` bound to the login's `customers` (S2-L5-02, measured on 16). The
   write path already qualified `public` for that reason (`db::pg::pg_qname`), and nothing in
   `schemaic-db` sets `search_path` on a connection. So the preview of a `public` table's plan now
-  reads `"public"."orders"`; `sql_qualifier` keeps the elision for SQL only shown, never run. A
+  reads `"public"."orders"`. `sql_qualifier` keeps the elision, but for display alone: the rest
+  of what *runs* had gone on building names through it — every standalone object's `CREATE`, a
+  routine's `DROP`, a trigger's table, `TableInfo::create_ddl` and so the dump, the browse query
+  and a key's Follow — and now names `public` through `schema::qualified_ident` and
+  `filter::qualified_table_name` (under `schema.rs`, `filter.rs` and `core/dump.rs`). A
   schema called `public` cannot be made on SQL Server (the `public` role holds the name, Msg 2714,
   measured) (`a_sql_server_schema_named_public_is_still_named`,
-  `public_ddl_does_not_land_in_the_logins_own_schema`).
+  `public_ddl_does_not_land_in_the_logins_own_schema`,
+  `public_objects_are_named_in_every_statement_that_runs`).
   **`tsql_supports`' `AlterColumn` arm is an allowlist.** It copies `to`'s name, type,
   nullability, collation, default, key flag and comment onto `from` — the fields `tsql_alter_column`,
   the rename and the comment phase write — and admits the change only if that already equals `to` under `columns_equal`,
@@ -19310,9 +19338,10 @@ existing prose was left alone.
     Edit button both ask it there.** `TriggerAction::Function::name` is emittable SQL on both
     producers, so *showing* it means mapping back through the fetched list: `fn_names` drops the
     quotes and compares against `fn_display`, which is always qualified. That exact comparison is
-    only half the answer, because `tgfoid::regproc::text` — and `fn_sql`'s `qualified_ident`, by the
-    same search-path rule — omit the schema whenever `search_path` already resolves the name, which
-    on a stock server is every function in `public`. So the stored SQL for the commonest trigger
+    only half the answer, because `tgfoid::regproc::text` omits the schema whenever `search_path`
+    already resolves the name, which on a stock server is every function in `public` (`fn_sql`'s
+    `qualified_ident` used to as well, and names `public` now — a function picked here is stored
+    `"public"."audit_fn"`). So the stored SQL for the commonest trigger
     there is the bare `audit_fn`, it matched nothing, and the picker listed that function **twice**
     (once as the "whatever the draft names stays selectable" fallback row, once as the real fetched
     row) with **Edit permanently disabled**, putting "edit the function this trigger calls" out of

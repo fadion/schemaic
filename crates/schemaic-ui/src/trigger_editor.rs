@@ -2042,10 +2042,12 @@ mod tests {
         assert_eq!(fn_display(&public), "public.audit_fn");
         assert_ne!(fn_display(&s22), fn_display(&public));
 
-        // What is emitted. `public` is dropped on the way out, which is the
-        // codebase's rule for every generated identifier.
+        // What is emitted. `public` is named too, which is the codebase's rule
+        // for every identifier in a statement that runs: a bare `audit_fn`
+        // resolves through `search_path`, whose stock first entry is
+        // `"$user"`, and bound the trigger to the login's own `audit_fn`.
         assert_eq!(fn_sql(&s22), "\"s22\".\"audit_fn\"");
-        assert_eq!(fn_sql(&public), "\"audit_fn\"");
+        assert_eq!(fn_sql(&public), "\"public\".\"audit_fn\"");
         // A name a bare identifier would get wrong is quoted, where the old
         // path emitted it raw and PostgreSQL answered `syntax error at or near
         // "Fn"`.

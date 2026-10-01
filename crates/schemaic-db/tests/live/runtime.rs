@@ -1034,7 +1034,7 @@ async fn column(scratch: &Scratch, sql: &str) -> Vec<String> {
 }
 
 /// A default dump of every table in `src`, as the app's writer writes it.
-async fn dump_file(src: &Scratch) -> String {
+pub(crate) async fn dump_file(src: &Scratch) -> String {
     use schemaic_core::dump::{DumpOptions, DumpStep, plan, render_rows};
     let dialect = src.dialect();
     let schema = Box::pin(src.db.fetch_schema(&src.database, CancellationToken::new()))
@@ -1095,7 +1095,7 @@ async fn dump_file(src: &Scratch) -> String {
 
 /// Run `file` into `dst` the way Run file does: the splitter, then
 /// `run_script` on one connection.
-async fn run_file(dst: &Scratch, file: &str) -> ExecEnd {
+pub(crate) async fn run_file(dst: &Scratch, file: &str) -> ExecEnd {
     let mut splitter = schemaic_core::script::Splitter::new(dst.dialect());
     let mut stmts = splitter.push_str(file);
     stmts.extend(splitter.finish());

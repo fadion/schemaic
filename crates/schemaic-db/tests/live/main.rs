@@ -188,6 +188,7 @@ live_suite!(
         a_join_across_namespaces_stays_two_tables,
         generated_ddl_lands_in_the_namespace_it_was_drafted_from,
         public_ddl_does_not_land_in_the_logins_own_schema,
+        public_objects_are_named_in_every_statement_that_runs,
     ],
     views: [
         an_introspected_view_diffs_to_nothing_against_its_own_draft,

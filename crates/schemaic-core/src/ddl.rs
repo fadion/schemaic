@@ -21673,7 +21673,7 @@ mod tests {
             assert_eq!(cs.changes.len(), 1);
             assert_eq!(
                 cs.emit(),
-                vec!["ALTER FUNCTION \"audit\"() RENAME TO \"audit2\";"]
+                vec!["ALTER FUNCTION \"public\".\"audit\"() RENAME TO \"audit2\";"]
             );
         }
 
@@ -21688,11 +21688,11 @@ mod tests {
             let sql = diff_routine(&f, &d, Postgres).emit();
             assert_eq!(sql.len(), 2);
             assert!(
-                sql[0].contains("CREATE OR REPLACE FUNCTION \"audit\"()"),
+                sql[0].contains("CREATE OR REPLACE FUNCTION \"public\".\"audit\"()"),
                 "{sql:?}"
             );
             assert!(
-                sql[1].starts_with("ALTER FUNCTION \"audit\"() RENAME TO"),
+                sql[1].starts_with("ALTER FUNCTION \"public\".\"audit\"() RENAME TO"),
                 "{sql:?}"
             );
         }
@@ -21716,11 +21716,11 @@ mod tests {
             let sql = cs.emit();
             assert_eq!(sql.len(), 2, "{sql:?}");
             assert_eq!(
-                sql[0], "DROP FUNCTION IF EXISTS \"tally\"(a integer);",
+                sql[0], "DROP FUNCTION IF EXISTS \"public\".\"tally\"(a integer);",
                 "{sql:?}"
             );
             assert!(
-                sql[1].starts_with("CREATE FUNCTION \"tally\"(a integer, b integer)"),
+                sql[1].starts_with("CREATE FUNCTION \"public\".\"tally\"(a integer, b integer)"),
                 "{sql:?}"
             );
             // No `OR REPLACE`: this is not a replacement of anything.
@@ -21897,11 +21897,11 @@ mod tests {
             let sql = diff_routine(&f, &d, Postgres).emit();
             assert_eq!(sql.len(), 2, "{sql:?}");
             assert_eq!(
-                sql[0], "DROP FUNCTION IF EXISTS \"tally\"(a integer);",
+                sql[0], "DROP FUNCTION IF EXISTS \"public\".\"tally\"(a integer);",
                 "{sql:?}"
             );
             assert!(
-                sql[1].starts_with("CREATE FUNCTION \"tally2\"(a bigint)"),
+                sql[1].starts_with("CREATE FUNCTION \"public\".\"tally2\"(a bigint)"),
                 "{sql:?}"
             );
         }
@@ -22134,13 +22134,13 @@ mod tests {
 
             assert_eq!(
                 drop_routine(&f, Postgres).emit(),
-                vec!["DROP FUNCTION \"f\"(a integer, b boolean);"]
+                vec!["DROP FUNCTION \"public\".\"f\"(a integer, b boolean);"]
             );
             let mut d = RoutineDraft::from_info(&f);
             d.info.name = "g".into();
             assert_eq!(
                 diff_routine(&f, &d, Postgres).emit(),
-                vec!["ALTER FUNCTION \"f\"(a integer, b boolean) RENAME TO \"g\";"]
+                vec!["ALTER FUNCTION \"public\".\"f\"(a integer, b boolean) RENAME TO \"g\";"]
             );
             // …and the `CREATE` keeps the default it would otherwise lose.
             assert!(
@@ -22163,7 +22163,7 @@ mod tests {
             f.settings = vec!["search_path=public".into()];
             let sql = f.create_sql(Postgres, true);
             assert!(
-                sql.starts_with("CREATE OR REPLACE FUNCTION \"audit\"()"),
+                sql.starts_with("CREATE OR REPLACE FUNCTION \"public\".\"audit\"()"),
                 "{sql}"
             );
             assert!(sql.contains("RETURNS trigger"), "{sql}");
@@ -22198,13 +22198,16 @@ mod tests {
         }
 
         /// By signature, not by name: an overload makes a bare name ambiguous.
+        /// And by its schema, `public` included: a bare name resolves through
+        /// `search_path`, whose stock first entry is `"$user"`, so a schema
+        /// named after the login holding an `audit(int, text)` lost that one.
         #[test]
         fn drop_routine_names_the_signature() {
             let mut f = fnc();
             f.arguments = "a integer, b text".into();
             assert_eq!(
                 drop_routine(&f, Postgres).emit(),
-                vec!["DROP FUNCTION \"audit\"(a integer, b text);"]
+                vec!["DROP FUNCTION \"public\".\"audit\"(a integer, b text);"]
             );
         }
 
@@ -22449,7 +22452,7 @@ mod tests {
             f.arguments = "a integer".into();
             assert_eq!(
                 drop_routine(&f, Postgres).emit(),
-                vec!["DROP FUNCTION \"audit\"(a integer);"]
+                vec!["DROP FUNCTION \"public\".\"audit\"(a integer);"]
             );
         }
 
@@ -22475,7 +22478,7 @@ mod tests {
             p.returns = "integer".into();
             let sql = p.create_sql(Postgres, true);
             assert!(
-                sql.starts_with("CREATE OR REPLACE PROCEDURE \"settle\"()"),
+                sql.starts_with("CREATE OR REPLACE PROCEDURE \"public\".\"settle\"()"),
                 "{sql}"
             );
             assert!(!sql.contains("RETURNS"), "{sql}");
@@ -25416,8 +25419,11 @@ mod object_tests {
             diff_enum(&cur, &d, &deps, Postgres).emit(),
             vec![
                 "ALTER TYPE \"public\".\"mood\" RENAME TO \"mood_schemaic_old\";",
-                "CREATE TYPE \"mood\" AS ENUM ('ok', 'happy');\n\
-                 COMMENT ON TYPE \"mood\" IS 'how it went';",
+                // Named with its schema like everything else here: a bare
+                // `CREATE TYPE` lands in the first schema on `search_path` that
+                // exists, and the stock one leads with `"$user"`.
+                "CREATE TYPE \"public\".\"mood\" AS ENUM ('ok', 'happy');\n\
+                 COMMENT ON TYPE \"public\".\"mood\" IS 'how it went';",
                 "ALTER TABLE \"public\".\"people\" ALTER COLUMN \"m\" DROP DEFAULT;",
                 "ALTER TABLE \"public\".\"people\" ALTER COLUMN \"m\" TYPE \"public\".\"mood\" \
                  USING \"m\"::text::\"public\".\"mood\";",

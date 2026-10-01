@@ -969,9 +969,9 @@ fn is_numeric_literal(n: &str) -> bool {
     }
 }
 
-/// PostgreSQL's default namespace. It is always on the stock `search_path`, so a
-/// table in it resolves unqualified — which is why [`sql_qualifier`] leaves it
-/// off and single-schema statements stay exactly what they were.
+/// PostgreSQL's default namespace. It is always on the stock `search_path`, but
+/// *after* `"$user"` — so a display name leaves it off ([`sql_qualifier`]) and a
+/// statement that runs names it ([`qualified_ident`]).
 pub const PG_DEFAULT_SCHEMA: &str = "public";
 
 /// SQL Server's default namespace — where a database's own objects live unless
@@ -995,17 +995,22 @@ pub fn default_namespace(dialect: crate::intel::SqlDialect) -> Option<&'static s
     }
 }
 
-/// The namespace to qualify a table with in **user-facing** generated SQL, or
-/// `None` when the bare name is right. `schema` is a table's introspected
-/// namespace ([`TableInfo::schema`]): `None` on MySQL, which has no level between
-/// database and table, and `Some` on PostgreSQL.
+/// The namespace a **display name** carries, or `None` when the bare name is
+/// what a person reads. `schema` is a table's introspected namespace
+/// ([`TableInfo::schema`]): `None` on MySQL, which has no level between database
+/// and table, and `Some` on PostgreSQL.
 ///
-/// `public` is deliberately dropped: it's on the default `search_path`, so the
-/// statement the user sees stays clean and identical to the single-schema case.
-/// (The *write* path doesn't use this — `commit_writes`/`refetch_rows` qualify
-/// unconditionally, since that SQL is invisible and must not depend on
-/// `search_path` at all — and neither does the DDL a plan runs,
-/// `ddl::qualified`: a stock `search_path` leads with `"$user"`.)
+/// `public` is deliberately dropped, so the tree, a tab title and a picker read
+/// the same as in the single-schema case. **Never for SQL that runs**, nor SQL
+/// the user is handed to run: a bare name resolves through `search_path`, and the
+/// stock one is `"$user", public`, so with a schema named after the login a bare
+/// `CREATE` lands there and every other statement reaches that schema's
+/// same-named object first. The write path (`commit_writes`/`refetch_rows`),
+/// the DDL a plan runs (`ddl::qualified`), every object's `CREATE`
+/// ([`qualified_ident`]), the browse query (`filter::qualified_table_name`) and
+/// a dump's restore all name `public`; what is left here is
+/// [`display_name`] and the dump picker's namespace filter, which matches
+/// display names.
 /// **Case-sensitively** `public`, and only that. PostgreSQL identifiers are
 /// case-sensitive once quoted, so a schema literally named `"PUBLIC"` is a
 /// different schema from `public` — and folding it away made every statement
@@ -1174,15 +1179,26 @@ pub fn shown_database<'a>(database: Option<&'a str>, loaded: &[String]) -> Optio
 /// The counterpart to [`display_name`] — one is what a person reads, this is what
 /// a statement addresses — and the single builder for it, since every standalone
 /// object (table, view, type, domain, sequence, function) needs the identical
-/// "qualify unless it's `public`, then quote both halves" rule. It had been
-/// written out inline in three places before the object emitters would have made
-/// it six.
+/// "qualify with whatever schema it has, then quote both halves" rule. It had
+/// been written out inline in three places before the object emitters would have
+/// made it six.
+///
+/// **PostgreSQL's `public` is named like any other schema.** It used to be left
+/// off through [`sql_qualifier`], as the display name leaves it off — but what
+/// this builds runs (a dump's restore, the enum and domain rebuild, the trigger
+/// editor's apply), and a bare name resolves through `search_path`, whose stock
+/// value is `"$user", public`. A bare `CREATE` lands in the first of those that
+/// exists, so a database holding a schema named after the login received the
+/// rebuilt `mood` of `public.mood`'s rebuild — which the recast after it,
+/// addressing `"public"."mood"`, then failed on — and every other statement
+/// reached that schema's same-named object first. `ddl::qualified` made the same
+/// change for the DDL a plan runs.
 pub fn qualified_ident(
     name: &str,
     schema: Option<&str>,
     dialect: crate::intel::SqlDialect,
 ) -> String {
-    match sql_qualifier(schema) {
+    match schema.filter(|s| !s.is_empty()) {
         Some(s) => format!(
             "{}.{}",
             ddl_ident_in(s, dialect),
@@ -3023,10 +3039,8 @@ impl TriggerInfo {
         // name rather than reached by falling off the end of a `!pg`.
         let sqlite = dialect == crate::intel::SqlDialect::Sqlite;
         let q = |s: &str| ddl_ident_in(s, dialect);
-        let qtable = match sql_qualifier(self.schema.as_deref()) {
-            Some(s) => format!("{}.{}", q(s), q(&self.table)),
-            None => q(&self.table),
-        };
+        // `public` named too — the apply path runs this (see `qualified_ident`).
+        let qtable = qualified_ident(&self.table, self.schema.as_deref(), dialect);
         // `UPDATE OF a, b` is part of the event, not a clause after it.
         let events = self
             .events
@@ -5203,11 +5217,10 @@ impl TableInfo {
         // `ddl_ident_in` while the columns three lines up used this closure.
         // **Invariant:** one identifier quoter.
         let q = |s: &str| ddl_ident_in(s, dialect);
-        // The table's own name, schema-qualified when it isn't in `public`.
-        let qname = match sql_qualifier(self.schema.as_deref()) {
-            Some(s) => format!("{}.{}", q(s), q(&self.name)),
-            None => q(&self.name),
-        };
+        // The table's own name, schema-qualified — `public` included, since a
+        // dump restores this and a bare `CREATE` lands in `"$user"` when that
+        // schema exists (see `qualified_ident`).
+        let qname = qualified_ident(&self.name, self.schema.as_deref(), dialect);
         // **A sequence's columns are its counter, not its definition.** MariaDB
         // stores one as an eight-column table whose *row* holds the start,
         // increment, bounds and cache — none of which is in the catalogue this
@@ -5712,10 +5725,10 @@ pub struct FollowTarget {
 /// FK's `ref_schema` for a cross-database reference) and backtick-escapes idents.
 /// On **PostgreSQL** the referenced table lives in the *same* database (a FK can't
 /// cross databases; `ref_schema` there is a namespace like `public`), so the
-/// target database is `default_schema` and the table is double-quoted — bare when
-/// the reference lands in `public` (resolved via `search_path`, as before) and
-/// `"schema"."table"` when it crosses into another namespace. Values are rendered
-/// as safe SQL literals so the query runs verbatim.
+/// target database is `default_schema` and the table is double-quoted as
+/// `"schema"."table"` — `public` included, since a bare name resolves through
+/// `search_path`, whose stock first entry is `"$user"` (see [`qualified_ident`]).
+/// Values are rendered as safe SQL literals so the query runs verbatim.
 pub fn follow_target(
     fk: &ForeignKeyInfo,
     values: &[Value],
@@ -5766,11 +5779,10 @@ pub fn follow_target(
         .join(" AND ");
     let sql = if same_database {
         // Connected to `database` directly → the name only needs the namespace,
-        // and only when that isn't the search-path default.
-        let name = match sql_qualifier(schema.as_deref()) {
-            Some(s) => format!("{}.{}", quote(s), quote(&table)),
-            None => quote(&table),
-        };
+        // `public` included: the tab this opens is `public.<table>` to every
+        // write from its grid, and a bare name read whatever `search_path`
+        // reached first (see `qualified_ident`).
+        let name = qualified_ident(&table, schema.as_deref(), dialect);
         format!("SELECT * FROM {name} WHERE {where_sql}")
     } else {
         format!(
@@ -7574,14 +7586,16 @@ mod trigger_tests {
     }
 
     #[test]
-    fn pg_joins_events_with_or_and_omits_public() {
+    fn pg_joins_events_with_or_and_names_public() {
         let sql = pg_trigger().create_sql(SqlDialect::Postgres);
+        // `public` is named: the trigger editor runs this statement, and a bare
+        // `ON "orders"` resolves through `search_path`, whose stock first entry
+        // is `"$user"` — a schema named after the login that holds an `orders`
+        // received the trigger meant for `public.orders`.
         assert!(
-            sql.contains("AFTER INSERT OR UPDATE ON \"orders\""),
+            sql.contains("AFTER INSERT OR UPDATE ON \"public\".\"orders\""),
             "{sql}"
         );
-        // `public` is on the default search_path — same rule as sql_qualifier.
-        assert!(!sql.contains("\"public\""), "{sql}");
         assert!(sql.contains("EXECUTE FUNCTION audit_fn();"), "{sql}");
     }
 
@@ -7638,7 +7652,7 @@ mod trigger_tests {
         // CREATE TRIGGER always makes an enabled one, so stopping at the create
         // would silently switch it back on.
         assert!(
-            sql.contains("ALTER TABLE \"orders\" DISABLE TRIGGER \"audit_upd\";"),
+            sql.contains("ALTER TABLE \"public\".\"orders\" DISABLE TRIGGER \"audit_upd\";"),
             "{sql}"
         );
     }
@@ -7658,7 +7672,9 @@ mod trigger_tests {
             t.enabled = state;
             let sql = t.create_sql(SqlDialect::Postgres);
             assert!(
-                sql.contains(&format!("ALTER TABLE \"orders\" {clause} \"audit_upd\";")),
+                sql.contains(&format!(
+                    "ALTER TABLE \"public\".\"orders\" {clause} \"audit_upd\";"
+                )),
                 "{state:?}: {sql}"
             );
         }
@@ -7686,7 +7702,10 @@ mod trigger_tests {
         let refs = sql.find("REFERENCING").expect("clause");
         let each = sql.find("FOR EACH").expect("level");
         assert!(refs < each, "{sql}");
-        assert!(sql.find("ON \"orders\"").expect("table") < refs, "{sql}");
+        assert!(
+            sql.find("ON \"public\".\"orders\"").expect("table") < refs,
+            "{sql}"
+        );
     }
 
     #[test]
@@ -10555,16 +10574,30 @@ mod tests {
         );
     }
 
+    /// **`public` is named too.** This is what a dump restores: a bare
+    /// `CREATE TABLE "orders"` lands in the first schema on `search_path` that
+    /// exists, and the stock one leads with `"$user"` — so a database holding a
+    /// schema named after the restoring login received every table of a
+    /// `public` dump, and the `DROP TABLE IF EXISTS "orders"` in front of it
+    /// dropped that schema's own `orders`.
     #[test]
-    fn create_ddl_postgres_public_stays_unqualified() {
+    fn create_ddl_postgres_names_public() {
         let t = TableInfo {
             name: "orders".to_string(),
             schema: Some("public".to_string()),
             columns: vec![col("id", "integer", false, true)],
+            indexes: vec![IndexInfo::plain("orders_ts", vec!["id"], false)],
             ..Default::default()
         };
         let ddl = t.create_ddl(crate::intel::SqlDialect::Postgres);
-        assert!(ddl.starts_with("CREATE TABLE \"orders\" ("), "{ddl}");
+        assert!(
+            ddl.starts_with("CREATE TABLE \"public\".\"orders\" ("),
+            "{ddl}"
+        );
+        assert!(
+            ddl.contains("CREATE INDEX \"orders_ts\" ON \"public\".\"orders\" (\"id\");"),
+            "{ddl}"
+        );
     }
 
     #[test]
@@ -11093,11 +11126,15 @@ mod tests {
     }
 
     #[test]
-    fn follow_target_postgres_same_db_unqualified_double_quoted() {
+    fn follow_target_postgres_same_db_names_public_double_quoted() {
         use crate::intel::SqlDialect;
         // Postgres: ref_schema is a namespace ('public'), but the target opens the
-        // *current* database (default_schema); table is unqualified + double-quoted,
-        // string escaped, NULL → IS NULL.
+        // *current* database (default_schema); the table is double-quoted and
+        // named with its namespace, string escaped, NULL → IS NULL. `public` is
+        // named too: the bare name resolved through `search_path`, whose stock
+        // first entry is `"$user"`, so a schema named after the login holding a
+        // `country` was the table the follow opened — while the tab's identity,
+        // and so every write from its grid, was `public.country`.
         let f = fk(&["cc"], Some("public"), "country", &["code"]);
         let ft = follow_target(
             &f,
@@ -11110,7 +11147,7 @@ mod tests {
         assert_eq!(ft.table, "country");
         assert_eq!(
             ft.sql,
-            "SELECT * FROM \"country\" WHERE \"code\" = 'O''Hara'"
+            "SELECT * FROM \"public\".\"country\" WHERE \"code\" = 'O''Hara'"
         );
     }
 
@@ -11155,7 +11192,10 @@ mod tests {
             SqlDialect::Postgres,
         )
         .unwrap();
-        assert_eq!(ft.sql, r#"SELECT * FROM "files" WHERE "path" = 'C:\tmp'"#);
+        assert_eq!(
+            ft.sql,
+            r#"SELECT * FROM "public"."files" WHERE "path" = 'C:\tmp'"#
+        );
 
         // MySQL still doubles it, because there `\` escapes.
         let m =
@@ -11191,11 +11231,15 @@ mod tests {
 
     use crate::intel::SqlDialect::Postgres;
 
+    /// **`public` is named, as every schema is.** A bare name resolves through
+    /// `search_path`, whose stock first entry is `"$user"`: a `CREATE TYPE
+    /// "mood"` lands in a schema named after the login whenever one exists, and
+    /// any other statement reaches that schema's same-named object first.
     #[test]
-    fn qualified_ident_drops_public_and_quotes_both_halves() {
+    fn qualified_ident_names_public_and_quotes_both_halves() {
         assert_eq!(
             qualified_ident("mood", Some("public"), Postgres),
-            "\"mood\""
+            "\"public\".\"mood\""
         );
         assert_eq!(qualified_ident("mood", None, Postgres), "\"mood\"");
         assert_eq!(
@@ -11219,7 +11263,7 @@ mod tests {
         };
         assert_eq!(
             e.create_sql(Postgres),
-            "CREATE TYPE \"mood\" AS ENUM ('sad', 'it''s ok');"
+            "CREATE TYPE \"public\".\"mood\" AS ENUM ('sad', 'it''s ok');"
         );
     }
 
@@ -11268,7 +11312,7 @@ mod tests {
         let sql = d.create_sql(Postgres);
         assert_eq!(
             sql,
-            "CREATE DOMAIN \"email\" AS character varying(255)\n  \
+            "CREATE DOMAIN \"public\".\"email\" AS character varying(255)\n  \
              DEFAULT ''::character varying\n  NOT NULL\n  \
              CONSTRAINT \"email_shaped\" CHECK (VALUE ~ '@'::text);"
         );
@@ -11326,7 +11370,10 @@ mod tests {
             schema: Some("public".into()),
             ..Default::default()
         };
-        assert_eq!(s.create_sql(Postgres), "CREATE SEQUENCE \"counter\";");
+        assert_eq!(
+            s.create_sql(Postgres),
+            "CREATE SEQUENCE \"public\".\"counter\";"
+        );
     }
 
     #[test]
@@ -11345,7 +11392,7 @@ mod tests {
         };
         assert_eq!(
             s.create_sql(Postgres),
-            "CREATE SEQUENCE \"odds\"\n  AS integer\n  INCREMENT BY 2\n  \
+            "CREATE SEQUENCE \"public\".\"odds\"\n  AS integer\n  INCREMENT BY 2\n  \
              MAXVALUE 99\n  START WITH 3\n  CACHE 10\n  CYCLE;"
         );
         // MINVALUE is absent because 1 *is* the implicit ascending minimum.
@@ -11734,7 +11781,7 @@ mod tests {
             r.create_sql(crate::intel::SqlDialect::Postgres, true),
             // Unqualified: `qualified_ident` leaves `public` off, as every
             // other emitter here does.
-            "CREATE OR REPLACE FUNCTION \"f\"(x integer)\n\
+            "CREATE OR REPLACE FUNCTION \"public\".\"f\"(x integer)\n\
              RETURNS integer\n\
              LANGUAGE sql\n\
              IMMUTABLE\n\

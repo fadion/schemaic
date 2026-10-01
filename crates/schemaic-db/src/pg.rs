@@ -36,12 +36,13 @@
 //! Cross-*database* references remain out of scope — PostgreSQL itself doesn't
 //! support them.
 //!
-//! **Two qualification rules, on purpose.** User-facing SQL (the editor's
-//! open-table statement, FK-follow, DDL) uses `schemaic_core::schema::
-//! sql_qualifier`, which drops `public` so single-schema statements stay clean.
-//! The write path (`commit_writes`/`refetch_rows`/`fetch_table`) uses `pg_qname`,
-//! which qualifies **always** — that SQL is never shown and must not resolve
-//! through `search_path`.
+//! **One qualification rule for SQL that runs: `public` is named.** The write
+//! path (`commit_writes`/`refetch_rows`/`fetch_table`) uses `pg_qname`, and the
+//! SQL core generates — the editor's open-table statement, FK-follow, DDL, a
+//! dump — `schemaic_core::schema::qualified_ident` and its siblings; both name
+//! every schema, since a bare name resolves through `search_path`, whose stock
+//! first entry is `"$user"`. Only a *display* name drops `public`
+//! (`schemaic_core::schema::sql_qualifier`).
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -3766,9 +3767,8 @@ pub(crate) fn pg_ident_for_test(name: &str) -> String {
 /// A table name for the **write path**, qualified with its namespace whenever one
 /// is known — including `public`.
 ///
-/// Deliberately unlike the user-facing
-/// [`sql_qualifier`](schemaic_core::schema::sql_qualifier), which drops `public`
-/// to keep the editor's SQL clean: nothing here is ever shown, and an `UPDATE`
+/// Unlike a display name ([`sql_qualifier`](schemaic_core::schema::sql_qualifier)
+/// drops `public`), and like every statement core generates to run: an `UPDATE`
 /// that resolves through `search_path` could hit a different table than the one
 /// the row was read from. `None` (MySQL-shaped origins, or a Postgres result
 /// whose namespace couldn't be resolved) falls back to the bare name.

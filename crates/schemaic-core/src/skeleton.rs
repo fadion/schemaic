@@ -591,13 +591,17 @@ mod tests {
         let mut t = actor();
         t.schema = Some("sales".to_string());
         // Postgres: the connection is already inside the database, so the
-        // namespace is the qualifier (and `public` needs none).
+        // namespace is the qualifier — `public` included, since a bare name
+        // resolves through `search_path` and the stock one leads with `"$user"`.
         assert!(
             delete_skeleton(SqlDialect::Postgres, "shop", &t)
                 .starts_with("DELETE FROM sales.actor")
         );
         t.schema = Some("public".to_string());
-        assert!(delete_skeleton(SqlDialect::Postgres, "shop", &t).starts_with("DELETE FROM actor"));
+        assert!(
+            delete_skeleton(SqlDialect::Postgres, "shop", &t)
+                .starts_with("DELETE FROM public.actor")
+        );
         // SQLite: one file, nothing to qualify with.
         t.schema = None;
         assert!(delete_skeleton(SqlDialect::Sqlite, "main", &t).starts_with("DELETE FROM actor"));

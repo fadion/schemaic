@@ -1091,10 +1091,9 @@ pub fn sequence_resync_sql(t: &TableInfo, dialect: SqlDialect) -> Vec<String> {
         return Vec::new();
     }
     let q = |s: &str| ident_sql(s, dialect);
-    let table = match crate::schema::sql_qualifier(t.schema.as_deref()) {
-        Some(s) => format!("{}.{}", q(s), q(&t.name)),
-        None => q(&t.name),
-    };
+    // `public` named, as in the `CREATE` and the rows: a bare name resolves
+    // through `search_path`, which leads with `"$user"`.
+    let table = crate::schema::qualified_ident(&t.name, t.schema.as_deref(), dialect);
     t.columns
         .iter()
         .filter(|c| c.auto_increment && c.generated.is_none())
@@ -2138,12 +2137,11 @@ pub fn plan(
         ns.dedup();
         ns
     };
-    // The same qualification `TableInfo::create_ddl` uses, so a `DROP` names the
-    // table its `CREATE` is about to make.
-    let qname = |t: &TableInfo| match crate::schema::sql_qualifier(t.schema.as_deref()) {
-        Some(s) => format!("{}.{}", q(s), q(&t.name)),
-        None => q(&t.name),
-    };
+    // The same qualification `TableInfo::create_ddl` uses — the one builder,
+    // which names `public` too — so a `DROP` names the table its `CREATE` is
+    // about to make.
+    let qname =
+        |t: &TableInfo| crate::schema::qualified_ident(&t.name, t.schema.as_deref(), dialect);
 
     // ── The closing constraints, decided *first* ─────────────────────────────
     //
@@ -2848,10 +2846,8 @@ pub fn plan(
                 {
                     continue;
                 }
-                let fk_name = match crate::schema::sql_qualifier(t.schema.as_deref()) {
-                    Some(s) => format!("{}.{}", q(s), q(&fk.name)),
-                    None => q(&fk.name),
-                };
+                let fk_name =
+                    crate::schema::qualified_ident(&fk.name, t.schema.as_deref(), dialect);
                 drops.push(format!(
                     "IF OBJECT_ID({}, N'F') IS NOT NULL ALTER TABLE {} DROP CONSTRAINT {};",
                     crate::schema::ddl_string(&fk_name, dialect),
@@ -6930,11 +6926,17 @@ mod tests {
             DumpOptions::default(),
             SqlDialect::Postgres,
         ));
-        // `public` is the default namespace, so `sql_qualifier` leaves it off —
-        // the point here is the ` CASCADE`, and that the `DROP` still names the
-        // table its `CREATE` is about to make.
+        // The point here is the ` CASCADE`, and that the `DROP` names the table
+        // its `CREATE` is about to make — `public` included, as every executed
+        // name is: a bare one resolves through `search_path`, whose stock first
+        // entry is `"$user"`, and dropped a schema named after the restoring
+        // login's own `orders`.
         assert!(
-            text.contains(r#"DROP TABLE IF EXISTS "orders" CASCADE;"#),
+            text.contains(r#"DROP TABLE IF EXISTS "public"."orders" CASCADE;"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"CREATE TABLE "public"."orders" ("#),
             "{text}"
         );
     }
@@ -7320,9 +7322,15 @@ mod tests {
             DumpOptions::default(),
             SqlDialect::Postgres,
         ));
-        let func = pos(&file, "CREATE FUNCTION \"next_code\"");
-        assert!(pos(&file, "CREATE TABLE \"a_src\"") < func, "{file}");
-        assert!(func < pos(&file, "CREATE TABLE \"b_user\""), "{file}");
+        let func = pos(&file, "CREATE FUNCTION \"public\".\"next_code\"");
+        assert!(
+            pos(&file, "CREATE TABLE \"public\".\"a_src\"") < func,
+            "{file}"
+        );
+        assert!(
+            func < pos(&file, "CREATE TABLE \"public\".\"b_user\""),
+            "{file}"
+        );
     }
 
     /// **What reads a table the file leaves out is left out with it, and
@@ -7524,7 +7532,7 @@ mod tests {
             DumpOptions::default(),
             SqlDialect::Postgres,
         ));
-        let create = pos(&file, "CREATE TABLE \"t\"");
+        let create = pos(&file, "CREATE TABLE \"public\".\"t\"");
         let rows = pos(&file, "<<rows t:");
         let table_ddl = &file[create..rows];
         assert!(table_ddl.contains("CONSTRAINT \"c_ok\" CHECK"), "{file}");
@@ -8061,7 +8069,16 @@ mod tests {
         let setval = file.find("setval").expect("a setval");
         let rows = file.find("<<rows orders").expect("the data step");
         assert!(rows < setval, "the counter is set from the rows: {file}");
-        assert!(file.contains("pg_get_serial_sequence"), "{file}");
+        // The table is named with its namespace, `public` included: a bare
+        // name resolves through `search_path`, so a schema named after the
+        // login holding an `orders` had *its* counter set from *its* rows.
+        assert!(
+            file.contains(
+                "pg_get_serial_sequence('\"public\".\"orders\"', 'id') AS s, \
+                 (SELECT MAX(\"id\") FROM \"public\".\"orders\")"
+            ),
+            "{file}"
+        );
         // A column with no sequence behind it, and an empty table, both have to
         // be no-ops rather than errors.
         assert!(
