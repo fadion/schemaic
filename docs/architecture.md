@@ -7413,10 +7413,17 @@ existing prose was left alone.
     `sqlserver` (JDBC, Prisma) and `mssql` (SQLAlchemy's `mssql+pyodbc`, node) as `MSSQL`, and jTDS's
     `jdbc:jtds:sqlserver://` has its `jtds:` stripped under the `jdbc:` one. What follows is
     Microsoft's `//[host[\instance][:port]][/database][;key=value]…` — properties after `;`, not a
-    path and a query — which is what DataGrip and DBeaver both store, so `parse_mssql_url` reads it
-    whenever the URL is JDBC or carries a `;` (the `/database` path is jTDS's, and Prisma writes the
-    same properties after `sqlserver://host:port`); an ordinary `mssql://u:p@h:1433/d` still goes
-    through `parse_server_url`. **The userinfo comes off before the `;` split**, through
+    path and a query — which is what DataGrip and DBeaver both store (the `/database` path is
+    jTDS's, and Prisma writes the same properties after `sqlserver://host:port`). **`parse_mssql_url`
+    reads every SQL Server-scheme URL**, the plain `mssql://u:p@h:1433/d?encrypt=true` node and
+    SQLAlchemy write included, its `?` query split at `&` and `;` alike. Only a JDBC URL or one
+    carrying a `;` used to come here; every other went to `parse_server_url`, which has no
+    `encrypt`, no `trustServerCertificate` and no driver default, so node-mssql's documented
+    `mssql://app:pw@db.corp:1433/shop?encrypt=true` — and a bare `mssql://…/shop` — imported at
+    `Prefer`, any certificate accepted, while the same URL with `;trustServerCertificate=false`
+    beside it imported at `VerifyFull`
+    (`a_sql_server_url_reads_its_tls_words_whatever_its_query_separator`). **The userinfo comes off
+    before the `;` split**, through
     `split_mssql_userinfo`, as `parse_server_url` takes it off before the path: `parse_mssql_url`
     used to cut the authority at the first `;` and never looked for an `@`, so
     `sqlserver://sa:S3cret@db.example.com:1433;databaseName=app` imported with the host
@@ -7436,17 +7443,19 @@ existing prose was left alone.
     encrypted default since 10.2. **A string that says neither takes its driver's default, not the
     import's floor** (`apply_mssql_tls`'s `verifies_by_default`, `driver_verifies_by_default`):
     the Microsoft drivers now encrypt and verify when told nothing — Microsoft.Data.SqlClient 4+
-    (an ADO.NET string with no `Driver`/`Provider`), mssql-jdbc 10.2+ and Prisma's URL, ODBC
-    Driver 18, OLE DB Driver 19 (`MSOLEDBSQL19`) — so those land on `VerifyFull`; jTDS, ODBC 17
-    and older, the Native Client, `SQLOLEDB` and OLE DB Driver 18 (`MSOLEDBSQL`) default off and
-    keep the floor. Reading every silent string as `Prefer` accepted any certificate where the
+    (an ADO.NET string with no `Driver`/`Provider`), mssql-jdbc 10.2+, Prisma's URL and node's
+    tedious, ODBC Driver 18, OLE DB Driver 19 (`MSOLEDBSQL19`) — so those land on `VerifyFull`;
+    jTDS, pymssql's FreeTDS (an `mssql+pymssql` scheme), ODBC 17 and older, the Native Client,
+    `SQLOLEDB` and OLE DB Driver 18 (`MSOLEDBSQL`) default off and keep the floor. A URL's `driver=`
+    — SQLAlchemy's `mssql+pyodbc://…?driver=ODBC+Driver+18+for+SQL+Server` — overrides what its
+    scheme implies, as a connection string's `Driver` does, so 18 verifies and 17 keeps the floor.
+    Reading every silent string as `Prefer` accepted any certificate where the
     source had verified one. `System.Data.SqlClient` also defaulted off, and a bare ADO.NET string
     does not say which client it was written for; the current one is the reading that fails loudly
     against a self-signed server rather than silently against an attacker
     (`sql_server_tls_words_land_on_the_ladder`,
-    `a_sql_server_string_silent_on_encryption_takes_its_drivers_default`). An ordinary
-    `mssql://u:p@h/d` URL with no `;` still goes through `parse_server_url`, which reads no
-    `encrypt`. **`ImportNote::NamedInstance` is `PortAssumed`'s
+    `a_sql_server_string_silent_on_encryption_takes_its_drivers_default`).
+    **`ImportNote::NamedInstance` is `PortAssumed`'s
     honesty for a named instance** (`host\SQLEXPRESS`) with no port: the drivers ask SQL Server
     Browser on UDP 1434 which port it listens on and Schemaic does not, so the row carries 1433 —
     which reaches the host's *default* instance if it has one, not the named one — and the note says

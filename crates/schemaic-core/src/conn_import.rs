@@ -1025,10 +1025,16 @@ fn parse_url_any(input: &str) -> Result<(Connection, Vec<ImportNote>), UrlError>
     let mut notes = Vec::new();
     let mut c = if is_sqlite(engine) {
         parse_sqlite_url(rest)?
-    } else if engine == MSSQL && (jdbc.is_some() || rest.contains(';')) {
-        // Microsoft's grammar — and Prisma's, which borrows it. jTDS alone of
-        // the drivers writing it does not encrypt when told nothing.
-        let (c, n) = parse_mssql_url(rest, jtds.is_none())?;
+    } else if engine == MSSQL {
+        // Microsoft's grammar — and Prisma's, which borrows it, and the plain
+        // URL node and SQLAlchemy write, which it reads as a superset. Only a
+        // URL holding a `;` used to come here, so `?encrypt=true&…` went to the
+        // ordinary reader, which has no TLS words for SQL Server, and imported
+        // at `Prefer`.
+        // jTDS and pymssql (FreeTDS) alone of the drivers writing one do not
+        // encrypt when told nothing.
+        let quiet = jtds.is_some() || scheme.to_ascii_lowercase().ends_with("+pymssql");
+        let (c, n) = parse_mssql_url(rest, !quiet)?;
         notes = n;
         c
     } else if jdbc.is_some() {
@@ -1059,11 +1065,15 @@ fn parse_url_any(input: &str) -> Result<(Connection, Vec<ImportNote>), UrlError>
 /// [`parse_server_url`] takes it first: `;` is as legal in a password as `/`.
 /// Cutting at the `;` first made `user:password@host` the *host*, which is
 /// saved to `connections.json` in plaintext. node's `?encrypt=true` query
-/// after the path is read as properties too.
+/// after the path is read as properties too — **every** SQL Server URL is
+/// read here, the plain `mssql://…?encrypt=true&…` node and SQLAlchemy write
+/// included, since the ordinary reader has none of these words.
 ///
 /// `verifies_by_default` is whether the driver the URL was written for
 /// encrypts and verifies when it says nothing ([`apply_mssql_tls`]):
-/// mssql-jdbc since 10.2, Prisma and node do; jTDS does not.
+/// mssql-jdbc since 10.2, Prisma and node's tedious do; jTDS and pymssql do
+/// not. A `driver=` naming an ODBC driver (SQLAlchemy's pyodbc) overrides it
+/// with that driver's own default ([`driver_verifies_by_default`]).
 fn parse_mssql_url(
     rest: &str,
     verifies_by_default: bool,
@@ -1098,6 +1108,7 @@ fn parse_mssql_url(
     let mut port = port;
     let (mut encrypt, mut trust) = (None::<String>, false);
     let mut sign_in = MssqlSignIn::default();
+    let mut driver: Option<String> = None;
     let mut pairs = parse_query(query);
     pairs.extend(split_mssql_props(props, false));
     for (k, v) in pairs {
@@ -1113,6 +1124,8 @@ fn parse_mssql_url(
             "instancename" if instance.is_none() => instance = Some(v),
             "encrypt" => encrypt = Some(normalize_key(&v)),
             "trustservercertificate" => trust = truthy(&v),
+            // SQLAlchemy's `mssql+pyodbc://…?driver=ODBC+Driver+18+…`.
+            "driver" => driver = Some(v),
             key => {
                 sign_in.read(key, &v);
             }
@@ -1123,6 +1136,12 @@ fn parse_mssql_url(
     }
     c.host = host;
     c.port = port.unwrap_or_else(|| default_port(MSSQL));
+    // A named ODBC driver decides what silence means, as it does in a
+    // connection string.
+    let verifies_by_default = match driver.as_deref() {
+        Some(d) => driver_verifies_by_default(Some(d)),
+        None => verifies_by_default,
+    };
     apply_mssql_tls(&mut c, encrypt.as_deref(), trust, verifies_by_default);
     let mut notes = if instance.is_some() && port.is_none() {
         vec![ImportNote::NamedInstance]
@@ -3492,6 +3511,52 @@ mod tests {
             tls("Driver={ODBC Driver 17 for SQL Server};Server=h;Encrypt=yes"),
             SslMode::VerifyFull
         );
+    }
+
+    /// **node-mssql's and SQLAlchemy's `mssql://` URL is read for its TLS
+    /// words whichever separator its query uses.** Only a URL holding a `;`
+    /// reached the Microsoft-grammar reader; the rest went to the ordinary
+    /// one, which has no `encrypt` and no driver default, so `?encrypt=true`
+    /// imported at `Prefer` — any certificate accepted, the SQL login's
+    /// password to whoever answered — where `;trustServerCertificate=false`
+    /// beside it imported at `VerifyFull`.
+    #[test]
+    fn a_sql_server_url_reads_its_tls_words_whatever_its_query_separator() {
+        let tls = |s: &str| url(s).tls.mode;
+        let floor = blank(MSSQL).tls.mode;
+        for verifies in [
+            "mssql://app:pw@db.corp:1433/shop?encrypt=true",
+            "mssql://app:pw@db.corp:1433/shop?encrypt=true&trustServerCertificate=false",
+            "mssql://app:pw@db.corp:1433/shop?encrypt=true;trustServerCertificate=false",
+            "sqlserver://app:pw@db.corp:1433/shop?encrypt=true",
+            // tedious encrypts and verifies when told nothing.
+            "mssql://app:pw@db.corp:1433/shop",
+            // ODBC Driver 18's encryption is mandatory.
+            "mssql+pyodbc://app:pw@db.corp:1433/shop?driver=ODBC+Driver+18+for+SQL+Server",
+        ] {
+            assert_eq!(tls(verifies), SslMode::VerifyFull, "{verifies}");
+        }
+        assert_eq!(
+            tls("mssql://app:pw@db.corp/shop?encrypt=true&trustServerCertificate=true"),
+            SslMode::Require
+        );
+        assert_eq!(
+            tls("mssql://app:pw@db.corp/shop?encrypt=false"),
+            SslMode::Disable
+        );
+        // The drivers that default off keep the import's floor.
+        for off in [
+            "mssql+pyodbc://app:pw@db.corp/shop?driver=ODBC+Driver+17+for+SQL+Server",
+            "mssql+pymssql://app:pw@db.corp/shop",
+        ] {
+            assert_eq!(tls(off), floor, "{off}");
+        }
+        // And the rest of the URL reads as it did.
+        let c =
+            url("mssql://app:p%40ss@db.corp:1500/shop?encrypt=true&trustServerCertificate=true");
+        assert_eq!((c.host.as_str(), c.port), ("db.corp", 1500));
+        assert_eq!((c.user.as_str(), c.password.as_str()), ("app", "p@ss"));
+        assert_eq!(c.database, "shop");
     }
 
     /// **A named instance has no port of its own to import** — SQL Server
