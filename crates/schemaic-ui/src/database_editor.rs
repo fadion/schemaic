@@ -1,5 +1,5 @@
 //! The form for creating a **container**: a database, or one of PostgreSQL's
-//! namespaces inside one.
+//! or SQL Server's namespaces inside one.
 //!
 //! The smallest of the schema editors, and deliberately so — a name, and the one
 //! or two options the engine has that are safe to offer. Everything a server
@@ -11,7 +11,7 @@
 //! module rather than an arm of [`crate::object_editor`]:
 //!
 //! * **It only ever creates.** There is no `current`, no diff and no change
-//!   count: a container is dropped from its own row's menu, and neither engine
+//!   count: a container is dropped from its own row's menu, and no engine
 //!   offers a rename that is safe to perform. The footer counts nothing, so it
 //!   says what will be made instead.
 //! * **A database's plan is server-level** ([`crate::DdlScope::Server`]) and a
@@ -349,8 +349,11 @@ fn form(
     let owns = ddl::supports_owners(target.dialect);
     // A namespace takes no character set on any engine — it is a name in a
     // catalogue, not a store — so this asks the *kind* as well as the engine.
-    let charsets =
-        target.kind == ContainerKind::Database && ddl::supports_database_charset(target.dialect);
+    let database = target.kind == ContainerKind::Database;
+    let charsets = database && ddl::supports_database_charset(target.dialect);
+    // Apart from the character set: SQL Server takes a collation and no
+    // character set, its collation naming the code page.
+    let collations = database && ddl::supports_database_collation(target.dialect);
     if charsets {
         rows.push(
             form_setting(
@@ -369,6 +372,9 @@ fn form(
             )
             .into_any(),
         );
+    }
+    if collations {
+        let offered = ddl::database_collations(target.dialect);
         rows.push(
             form_setting(
                 "Collation",
@@ -377,12 +383,7 @@ fn form(
                     overlay,
                     draft.collation.clone(),
                     "server default",
-                    || {
-                        ddl::MYSQL_COLLATIONS
-                            .iter()
-                            .map(|c| c.to_string())
-                            .collect()
-                    },
+                    move || offered.iter().map(|c| c.to_string()).collect(),
                     "No collations to suggest",
                     &ring,
                     30,

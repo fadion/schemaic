@@ -10,11 +10,11 @@ differently, so ask the *narrow* capability (`ddl::supports_or_replace_view`,
 full one, as MySQL/MariaDB and PostgreSQL are**: it connects, reads, validates, introspects, runs
 scripts, writes the grid's edits back, imports a file into a table, designs tables, edits views,
 triggers and stored routines, drops a table, view or routine, holds a Manual tab's transaction,
-shows a query plan, dumps a database to a `.sql` file, and browses and administers its logins,
-database users and their grants. What it does not do yet is named rather than left to a label: it
-creates and drops no **database** (a schema inside one it does), and its sequences, alias types,
-synonyms and XML schema collections are read for the dump alone, with no tree entry, editor or
-comparison — see `db::mssql`.
+shows a query plan, dumps a database to a `.sql` file, creates and drops a database or a schema
+inside one, and browses and administers its logins, database users and their grants. What it does
+not do yet is named rather than left to a label: its sequences, alias types, synonyms and XML
+schema collections are read for the dump alone, with no tree entry, editor or comparison — see
+`db::mssql`.
 
 This is the project's reference document: the crate/module map, the architecture invariants, the
 UI conventions, and the Floem hazards each subsystem is built on. `CLAUDE.md` at the repo root
@@ -4064,8 +4064,8 @@ existing prose was left alone.
     `match`, not a comparison: it is a fact about each engine's namespace rather than a capability
     computed from a statement, so there is no `supports_change` to derive it from.
     `supports_database_editing` and `supports_namespace_editing` are the newest pair, for the
-    **container** the rest of this module's objects live in: `CREATE`/`DROP DATABASE` on MySQL and
-    PostgreSQL, and PostgreSQL's and SQL Server's `CREATE`/`DROP SCHEMA`. They are two predicates
+    **container** the rest of this module's objects live in: `CREATE`/`DROP DATABASE` on MySQL,
+    PostgreSQL and SQL Server, and PostgreSQL's and SQL Server's `CREATE`/`DROP SCHEMA`. They are two predicates
     rather than one because MySQL answers them *differently* — its `CREATE SCHEMA` is a synonym for
     `CREATE DATABASE`, one level up from what the change means, so a single "supports containers"
     answer would have offered `Create schema` there and quietly made a database. SQLite answers no
@@ -4090,7 +4090,8 @@ existing prose was left alone.
     the kind of claim a later edit builds a real bug on;
     `a_container_is_created_first_and_dropped_last` hand-builds the mixed set nothing produces
     yet. `is_server_level` splits them again along a different seam — the database pair
-    runs on a connection that names no database and outside any transaction, the namespace pair on
+    runs on a connection that names no database (on SQL Server, one attached to `master`) and
+    outside any transaction, the namespace pair on
     the ordinary in-database path — which is what `DdlScope` and `Db::run_server_ddl` are for.
     `DROP SCHEMA` is never `CASCADE`, the same call `DropObject` makes: cascading drops every
     table in the namespace, so the server is left to refuse and name what is still in there.
@@ -4105,6 +4106,34 @@ existing prose was left alone.
     `sql_server_creates_the_namespace_before_the_table_in_it`; live, on SQL Server 2022 and 2025,
     `a_namespace_is_created_with_its_table_and_dropped_only_when_empty`, whose drop of a schema
     still holding its table is refused and leaves both).
+    **It takes the database pair as well**, through the same two functions and
+    `DatabaseDraft::create_sql`, and `tsql_supports` admits both, so `supports_database_editing`
+    answers yes there and the gear's *Create database*, the Create menu's *Database* and a database
+    node's **Drop** are offered (`sql_server_creates_and_drops_a_database`); the run is
+    `mssql::run_server_ddl`'s. What it brought with it is the one option it takes: a **collation**,
+    and no character set, its collation naming the code page. That is why
+    `supports_database_collation` (MySQL and SQL Server) is a capability of its own beside
+    `supports_database_charset`, which stays MySQL's alone — one predicate for the pair would either
+    have offered SQL Server a character set or withheld its collation
+    (`a_collation_is_offered_where_a_database_takes_one`). `database_collations(dialect)` is the
+    shortcut list the form offers beside the field — `MYSQL_COLLATIONS`, `MSSQL_COLLATIONS`, or
+    nothing where a database takes no collation — and SQL Server's five open on
+    `SQL_Latin1_General_CP1_CI_AS`, the default an English-locale install is set up with, with the
+    server's own `sys.fn_helpcollations()` the authority on the rest.
+    **T-SQL's `COLLATE` takes a bare name and nothing else**: `COLLATE [x]` and `COLLATE 'x'` are
+    both Msg 102 (measured on 2022), so this is the one name `create_sql` writes unquoted — MySQL's
+    stays a string literal, the form `mysqldump` writes. Don't "fix" it by routing it through
+    `ident_sql`; the brackets are the syntax error. Unquoted means gated instead:
+    `is_collation_name` (ASCII letters, digits and underscores, non-empty — which every collation
+    on every engine that takes one is) must hold, or **no clause is written at all** rather than
+    text spliced into the statement; and so the dropped clause is never a silent one,
+    `DatabaseDraft::validate` refuses the same name in the form's words — *"A collation name holds
+    only letters, digits and underscores."* — the one option a client can judge, where every other
+    is the server's question (`a_collation_is_a_bare_name_and_nothing_else_is_one`, whose collation
+    ends `; DROP DATABASE x`; `every_offered_sql_server_collation_lands_in_the_clause`). Each of
+    `create_sql`'s clauses is gated on the capability that answers for it rather than on the field
+    being set, since a draft outlives the form it came from: a draft carrying a character set, a
+    collation and an owner emits for SQL Server with the collation alone.
     **Seven account changes join them in not addressing `ChangeSet::table`** — `CreateAccount`,
     `SetAccountPassword`, `DropAccount`, `Grant`/`RevokePrivileges` and `Grant`/`RevokeRole`, the
     Users and privileges
@@ -4118,7 +4147,7 @@ existing prose was left alone.
     `is_account_change` groups them because every downstream question is
     the same question for all seven, and the load-bearing answer is that **they are not
     `is_server_level`**. An account belongs to the server, but the server-level route deliberately
-    connects to no particular database, and a PostgreSQL `GRANT SELECT ON TABLE public.users` names
+    connects to no particular database (on SQL Server, always `master`), and a PostgreSQL `GRANT SELECT ON TABLE public.users` names
     an object in *one database's* catalogue — it would grant on whatever the maintenance database
     happens to hold, or fail. So they take the ordinary in-database route, in the database the
     browser is showing privileges for, which is correct on both engines: MySQL's grant tables are
@@ -12408,6 +12437,12 @@ existing prose was left alone.
   — role and database sharing a name is the default PostgreSQL setup). SQLite's arm is an error
   with a sentence in it rather than a statement: a database there is a file, so creating one is
   the connection form's business and dropping one would be deleting the user's file off disk.
+  SQL Server's arm attaches to **`master`**, never the target — which is being made, or must hold
+  no session, one in it being what makes `DROP DATABASE` refuse as *currently in use* — so it has
+  no `avoid` to honour, `master` never being a database it creates or drops. T-SQL refuses
+  `CREATE DATABASE` inside a transaction too (Msg 226, measured), so each statement is its own
+  batch and commits as it runs, `applied` being the index of the one that failed; Stop sends the
+  attention, and there is nothing to roll back (`mssql.rs` below).
   Which path a plan takes is **decided where the `Change` still is a `Change`** — `preview_of`
   stamps `DdlScope` onto the preview from `ddl::is_server_level`, `ddl_preview::apply` passes it
   through on the `DdlRunRequest`, and `app/main.rs` branches on it. Asking "is this a `CREATE
@@ -12969,15 +13004,19 @@ existing prose was left alone.
   `commit_writes`, `refetch_rows` and `fetch_blob` (below) — `import_rows` (below), and `run_ddl`,
   for the table changes `supports_change` admits (below), a Manual tab's pinned `Session`
   (below), `explain`, the estimated and the measured plan (below), and the account browser's
-  `fetch_principals` and `fetch_grants` (below). `run_server_ddl` — a database's create and drop —
-  is the one entry point not written, and answers
-  `DbError::Refused("… is not available for SQL Server yet.")`. **What it does not do yet is named
-  here rather than left to a label**: the engine was called a preview until the rest was written,
-  and the word had come to read as half-built, which it is not. A database's create and drop are
-  that refusal, and `tsql_supports` refuses `CreateDatabase` and `DropDatabase` ahead of it. A
-  schema's are no longer on this list: `CreateSchema` and `DropSchema` fell to `tsql_supports`'s
-  catch-all `false`, which also withheld whole any comparison into a database lacking a schema
-  other than the four every database has, until `emit_mssql` wrote them (under `ddl.rs`);
+  `fetch_principals` and `fetch_grants` (below), and `run_server_ddl`, a database's create and
+  drop, attached to `master` and untransacted (under `lib.rs`'s `run_server_ddl`, above). That was
+  the last entry point to be written, and the `not_yet` helper went with it: nothing on SQL Server
+  answers `DbError::Refused("… is not available for SQL Server yet.")` any more. **What it does
+  not do yet is named here rather than left to a label**: the engine was called a preview until
+  the rest was written, and the word had come to read as half-built, which it is not. Containers
+  are no longer on this list. A schema's create and drop fell to `tsql_supports`'s catch-all
+  `false`, which also withheld whole any comparison into a database lacking a schema other than
+  the four every database has, until `emit_mssql` wrote them; a database's were refused by name
+  there, ahead of `run_server_ddl`'s refusal, until that was written (both under `ddl.rs`; live,
+  `a_database_is_created_with_its_collation_and_dropped` on 2022 and 2025, which skips on Azure
+  SQL Database — a created database there is a new billable one — so `master` taking the two
+  statements on Azure is the code's word, not a measurement). Still on it:
   sequences, alias types, synonyms and XML schema collections are read into `TsqlObject` for the
   dump alone (under `dump.rs`), with no tree entry, editor or comparison; a named instance's port
   is not asked of SQL Server Browser and has to be given (`ImportNote::NamedInstance`, under
@@ -12990,8 +13029,8 @@ existing prose was left alone.
   `ddl::supports_change`, whose SQL Server answer comes before anything else and is
   `tsql_supports`: a table's own changes, new or existing, the table, view and routine drops, a
   view's `CreateView` and `ReplaceView`, a trigger's create, replace and drop, a routine's
-  `CreateRoutine` and `ReplaceRoutine`, a namespace's `CreateSchema` and `DropSchema`, and the
-  seven account changes, through the same
+  `CreateRoutine` and `ReplaceRoutine`, a namespace's `CreateSchema` and `DropSchema`, a
+  database's `CreateDatabase` and `DropDatabase`, and the seven account changes, through the same
   `account_change_supported` every engine's answer goes through (under `ddl.rs`) — and nothing
   more. The four editor predicates compute
   from it, so it decides which editors open: `supports_table_design` probes a column retype, which
@@ -13034,9 +13073,12 @@ existing prose was left alone.
   `INSTEAD OF` being how one is written to at all; and the Create menu *Function* and *Procedure*,
   now that it writes `CREATE OR ALTER PROCEDURE`/`FUNCTION` — the entries `create_children` gates
   on `supports_routine_editing`, so nothing in the menu changed but the test's expected list; and
-  last the Create menu *Schema* and a schema node's **Drop**, both gated on
+  the Create menu *Schema* and a schema node's **Drop**, both gated on
   `ddl::supports_namespace_editing`, now that it writes `CREATE`/`DROP SCHEMA` — the same: the
-  predicate computes from `supports_change`, so only the expected lists moved
+  predicate computes from `supports_change`, so only the expected lists moved; and last the
+  Create menu *Database*, the gear's and the blank space's *Create database* and a database
+  node's **Drop**, all gated on `ddl::supports_database_editing`, now that `run_server_ddl` runs
+  `CREATE`/`DROP DATABASE` — the same again
   (`object_menu_tests::sql_server_offers_its_table_changes_and_a_views_drop`,
   `a_standalone_objects_drop_is_offered_only_where_its_statement_emits`,
   `create_menu_tests::sql_server_is_offered_what_it_emits`,
@@ -19741,9 +19783,10 @@ existing prose was left alone.
   - `database_editor.rs` — the **container** form: a database, or one of PostgreSQL's or SQL
     Server's namespaces inside one, over `core::ddl`'s `DatabaseDraft`. The smallest of the schema
     editors and the only one that **only ever creates** — there is no `current`, no diff and
-    no change count, because a container is dropped from its own row's menu and neither engine
-    offers a rename that is safe to perform (MySQL withdrew `RENAME DATABASE` in 5.1.23;
-    PostgreSQL's needs every session off the database). The footer therefore says what will be
+    no change count, because a container is dropped from its own row's menu and a rename is
+    offered on no engine — MySQL and PostgreSQL have none that is safe to perform (MySQL withdrew
+    `RENAME DATABASE` in 5.1.23; PostgreSQL's needs every session off the database), and no reason
+    is recorded for SQL Server's. The footer therefore says what will be
     made rather than counting changes, and the panel takes its height from its content, since
     it is two to four rows tall depending on the engine.
     **Three homes.** The schema tree's **Create ▸ Database / Schema**, the SCHEMA gear's
@@ -19780,17 +19823,25 @@ existing prose was left alone.
     `MenuEntry::disabled` alone. One refusal at the door is the only version that survives a
     fifth home. The entries stay dimmed, because that is what *says* the action is unavailable.
     The option fields are per-engine and **absent** rather than dimmed where the engine has
-    none — asked as `ddl::supports_owners` / `supports_database_charset` rather than as
-    `dialect ==` tests, which is what both were written as first. MySQL gets `Character set` /
-    `Collation`, PostgreSQL gets `Owner`, SQL Server's schema gets neither (a name and nothing
-    else, both predicates being false there), and PostgreSQL's `ENCODING` is deliberately not
+    none — asked as `ddl::supports_owners` / `supports_database_charset` /
+    `supports_database_collation` rather than as `dialect ==` tests, which is what the first two
+    were written as first, and the last two of a *database* only, a namespace being a name in a
+    catalogue rather than a store. MySQL gets `Character set` / `Collation`, PostgreSQL gets
+    `Owner`, SQL Server's database gets `Collation` alone — T-SQL takes no character set, its
+    collation naming the code page, which is why the collation is a predicate of its own rather
+    than the charset's other half — and SQL Server's schema a name and nothing else,
+    `supports_owners` being false there and the other two asked of a database only. PostgreSQL's
+    `ENCODING` is deliberately not
     offered at all: the server refuses it unless the locale clauses and `TEMPLATE template0`
     agree, so a field for it would mostly produce *"new encoding is incompatible with the
     encoding of the template database"*.
     All three are **free text with a `suggest_chevron` beside them**, the designer's
     column-type pattern, because every value they take is per-server and per-version — a
     collation only MariaDB has, a role created five minutes ago. The MySQL lists are the
-    constants `ddl::MYSQL_CHARSETS`/`MYSQL_COLLATIONS`; the collations are deliberately **not**
+    constants `ddl::MYSQL_CHARSETS`/`MYSQL_COLLATIONS`, and the Collation row is offered
+    `ddl::database_collations(dialect)`, which is the latter on MySQL and `MSSQL_COLLATIONS` on SQL
+    Server — free text there too, though `DatabaseDraft::validate` refuses a collation that is not
+    a bare name, since T-SQL can write no other (under `ddl.rs`); the collations are deliberately **not**
     filtered by the chosen character set, since filtering would make it a picker that has to be
     *right*. Owner's list is `Db::roles` (`left(rolname, 3) <> 'pg_'`, **not** a `NOT LIKE
     'pg\_%'` whose escape only survives while `standard_conforming_strings` is on), fetched on
@@ -26779,8 +26830,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   `Session::open` refuses it (see `core::tx` above for why the pinned form needs its own design).
   **But the unit is the *operation*, and an operation is not a statement.** A batch, a DDL plan, an
   import and a script are each **one** — which is why `run_ddl` and `import_rows` hold a connection
-  across many statements (as does `run_server_ddl`, on the two engines that have containers to run
-  it against) without any of them being named as exceptions either, and why `Db::run_batch` is not
+  across many statements (as does `run_server_ddl`, on the three engines that have databases to
+  create and drop) without any of them being named as exceptions either, and why `Db::run_batch` is not
   a third: its own doc has always promised one connection for a batch, and the other two engines
   always gave it. Its SQLite arm read that sentence per-statement instead and opened a connection
   each, on the reasoning — written into the code — that there is no `USE` to carry and no session
@@ -27197,7 +27248,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   back on one at a time: `supports_change` answers for it before any arm is consulted
   (`tsql_supports`), admitting a table's own changes, the table, view and routine drops, a view's
   create and replace, a trigger's create, replace and drop, a routine's create and replace, and a
-  namespace's create and drop — and every editor predicate follows with no edit of its own. It held
+  namespace's and a database's create and drop — and every editor predicate follows with no edit
+  of its own. It held
   when the first four came on (a new table and the three drops): no editor probes only them, so
   none opened. When `emit_mssql` learned `ALTER COLUMN`, the table designer opened on an existing
   table by that alone, while the other three stayed shut
@@ -27205,7 +27257,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   the view editor opened the same way, and when it learned `CREATE OR ALTER TRIGGER` so did the
   trigger editor (`sql_server_offers_the_trigger_editor`), and with `CREATE OR ALTER
   PROCEDURE`/`FUNCTION` the routine editor (`sql_server_offers_the_routine_editor`), and with
-  `CREATE`/`DROP SCHEMA` `supports_namespace_editing` and so the namespace form. A menu
+  `CREATE`/`DROP SCHEMA` `supports_namespace_editing` and so the namespace form, and with
+  `CREATE`/`DROP DATABASE` `supports_database_editing` and the database form. A menu
   entry with **no** predicate is the same failure with nothing to grep for — the designer's three
   entries were exactly that until `supports_table_design` existed. **Keep asking them, and keep them
   apart**:

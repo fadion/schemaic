@@ -55,11 +55,6 @@ const MS: SqlDialect = SqlDialect::MsSql;
 /// I/O, hence the compat wrapper.
 pub(crate) type MsClient = tiberius::Client<Compat<TcpStream>>;
 
-/// What an unfinished entry point answers.
-fn not_yet(what: &str) -> DbError {
-    DbError::Refused(format!("{what} is not available for SQL Server yet."))
-}
-
 // ── Connecting ───────────────────────────────────────────────────────────────
 
 /// The driver's configuration for this endpoint, scoped to `database` or, with
@@ -2951,23 +2946,52 @@ pub(crate) async fn run_script(
     (end, ran)
 }
 
-// ── Not written yet ──────────────────────────────────────────────────────────
-//
-// Answers the whole interface's name (`ENGINE_ENTRY_POINTS`), and refuses: no
-// path in the app reaches it for SQL Server — the capability gates above it
-// answer no — and one that does is told so in a sentence.
-
+/// SQL Server's arm of [`crate::Db::run_server_ddl`] — `CREATE DATABASE` and
+/// `DROP DATABASE`, PostgreSQL's two commitments in T-SQL's terms:
+///
+/// - **Attached to `master`**, never to the target, which is being made (so
+///   cannot be opened) or dropped (so must not be — a session in it is what
+///   makes `DROP DATABASE` refuse with *currently in use*). `master` is also
+///   where Azure SQL Database takes both statements. `avoid` needs no use:
+///   `master` is never a database this creates or drops.
+/// - **No transaction.** T-SQL refuses `CREATE DATABASE` inside one —
+///   *"not allowed within multi-statement transaction"* (Msg 226) — so each
+///   statement commits as it runs, and `applied` counts the ones that did.
+///
+/// Stop sends the attention, as [`run_ddl`]'s does; there is nothing to roll
+/// back.
 pub(crate) async fn run_server_ddl(
-    _db: &Db,
+    db: &Db,
     _avoid: Option<&str>,
-    _stmts: &[String],
-    _cancel: CancellationToken,
+    stmts: &[String],
+    cancel: CancellationToken,
 ) -> Result<(), crate::DdlError> {
-    Err(crate::DdlError {
-        message: not_yet("Creating or dropping a database").to_string(),
-        at: 0,
-        applied: 0,
-    })
+    let fail = |at: usize, message: String| crate::DdlError {
+        message,
+        at,
+        applied: at,
+    };
+    let mut client = connect(db, Some("master"))
+        .await
+        .map_err(|e| fail(0, err_text(e)))?;
+    for (i, sql) in stmts.iter().enumerate() {
+        let step = {
+            let run = drain(&mut client, sql);
+            tokio::select! {
+                r = run => Some(r),
+                _ = cancel.cancelled() => None,
+            }
+        };
+        match step {
+            Some(Ok(())) => {}
+            Some(Err(e)) => return Err(fail(i, err_text(e))),
+            None => {
+                attention(&mut client).await;
+                return Err(fail(i, "cancelled".to_string()));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The SQL Server half of [`Db::import_rows`]: every row in one transaction,

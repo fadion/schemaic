@@ -2549,6 +2549,64 @@ async fn a_table_a_view_and_a_procedure_are_dropped() {
     );
 }
 
+/// **A database is created with its collation and dropped**, each plan through
+/// `run_server_ddl` — attached to `master`, outside a transaction, which T-SQL
+/// requires of `CREATE DATABASE` — with the plan exactly as the emitter writes
+/// it, the collation a bare name.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_database_is_created_with_its_collation_and_dropped() {
+    use schemaic_core::ddl::{self, Change, DatabaseDraft};
+    if !enabled() || azure_cannot("creating a database would be a new billable one") {
+        return;
+    }
+    let name = format!("{PREFIX}{}_mssql_created", std::process::id());
+    assert_scratch_name(&name);
+    let base = base_db();
+    let create = ddl::server_level(
+        &name,
+        MS,
+        Change::CreateDatabase(Box::new(DatabaseDraft {
+            collation: Some("Latin1_General_100_CI_AS_SC_UTF8".into()),
+            ..DatabaseDraft::blank(&name)
+        })),
+    )
+    .emit();
+    base.run_server_ddl(Some(&name), &create, CancellationToken::new())
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{}", create.join("\n")));
+    let collation = base
+        .fetch_query(
+            None,
+            &format!("SELECT collation_name FROM sys.databases WHERE name = N'{name}'"),
+            1,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("the catalogue");
+    let drop = ddl::server_level(&name, MS, Change::DropDatabase { name: name.clone() }).emit();
+    let dropped = base
+        .run_server_ddl(Some(&name), &drop, CancellationToken::new())
+        .await;
+    assert_eq!(
+        collation.cell(0, 0).map(|c| c.display().to_string()),
+        Some("Latin1_General_100_CI_AS_SC_UTF8".to_string())
+    );
+    dropped.unwrap_or_else(|e| panic!("{e}\n{}", drop.join("\n")));
+    let left = base
+        .fetch_query(
+            None,
+            &format!("SELECT COUNT(*) FROM sys.databases WHERE name = N'{name}'"),
+            1,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("the catalogue");
+    assert_eq!(
+        left.cell(0, 0).map(|c| c.display().to_string()),
+        Some("0".to_string())
+    );
+}
+
 /// **A namespace is created and dropped in the plan's transaction**, and
 /// `CREATE SCHEMA` — which T-SQL wants first in its batch — runs as the
 /// emitter writes it, ahead of a table in the same plan. A drop of one still

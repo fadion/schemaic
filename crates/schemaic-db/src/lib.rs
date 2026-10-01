@@ -2338,9 +2338,11 @@ impl Db {
     ///   cannot be connected to, and one being dropped must not be — PostgreSQL
     ///   refuses outright, and MySQL leaves the session pointed at a database
     ///   that no longer exists. `avoid` is the target, so the PostgreSQL arm can
-    ///   keep it out of the maintenance candidates.
-    /// - There is **no transaction**. PostgreSQL refuses both statements inside
-    ///   one, which is precisely what `run_ddl` wraps every plan in. Nothing is
+    ///   keep it out of the maintenance candidates; SQL Server's attaches to
+    ///   `master`, which is never one.
+    /// - There is **no transaction**. PostgreSQL and SQL Server refuse
+    ///   `CREATE DATABASE` inside one, which is precisely what `run_ddl` wraps
+    ///   every plan in. Nothing is
     ///   lost: a server-level plan is one statement, so there is no second one
     ///   for a rollback to protect.
     ///

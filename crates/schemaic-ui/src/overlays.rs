@@ -6293,14 +6293,20 @@ mod create_menu_tests {
         );
     }
 
-    /// **SQL Server is offered a table, a view, its routines and a schema** —
-    /// the Creates whose statements it emits. A database waits on its own
-    /// runner, and is absent rather than dimmed.
+    /// **SQL Server is offered a table, a view, its routines and both
+    /// containers** — the Creates whose statements it emits.
     #[test]
     fn sql_server_is_offered_what_it_emits() {
         assert_eq!(
             labels(SqlDialect::MsSql),
-            vec!["Table", "View", "Function", "Procedure", "Schema"]
+            vec![
+                "Table",
+                "View",
+                "Function",
+                "Procedure",
+                "Database",
+                "Schema"
+            ]
         );
     }
 

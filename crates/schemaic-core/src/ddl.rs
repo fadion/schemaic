@@ -681,15 +681,16 @@ impl TableDraft {
 /// module's objects live in, which until now could only be made from a shell.
 ///
 /// There is no `original` and no diff: a database is created or dropped and
-/// never altered from here. Renaming one is not an operation either engine
-/// offers (MySQL withdrew `RENAME DATABASE` in 5.1.23 as unsafe, PostgreSQL's
-/// `ALTER DATABASE … RENAME TO` needs every session off it), so the editor
-/// offers what the servers do and nothing more.
+/// never altered from here. Renaming one is not offered (MySQL withdrew
+/// `RENAME DATABASE` in 5.1.23 as unsafe; PostgreSQL's `ALTER DATABASE …
+/// RENAME TO` and SQL Server's `ALTER DATABASE … MODIFY NAME` both need every
+/// other session off it), so the editor offers what the servers do safely and
+/// nothing more.
 ///
-/// **Every option field is per-engine, and both are optional.** The form only
+/// **Every option field is per-engine, and each is optional.** The form only
 /// shows the ones its dialect has, and `None` means "let the server choose",
 /// which is the answer that always works — a `CREATE DATABASE` with no clauses
-/// inherits the server or template default on all three.
+/// inherits the server or template default on every engine that has one.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DatabaseDraft {
     pub name: String,
@@ -699,8 +700,9 @@ pub struct DatabaseDraft {
     /// so a form field for it would mostly produce `new encoding is incompatible
     /// with the encoding of the template database`.
     pub charset: Option<String>,
-    /// **MySQL only**, `COLLATE`. `None` on PostgreSQL for the reason above —
-    /// `LC_COLLATE` there carries the same template restriction.
+    /// **MySQL and SQL Server**, `COLLATE` ([`supports_database_collation`]).
+    /// `None` on PostgreSQL for the reason above — `LC_COLLATE` there carries
+    /// the same template restriction.
     pub collation: Option<String>,
     /// **PostgreSQL only**, `OWNER`. `None` on MySQL, which has no owner: a
     /// database there is reached through grants and belongs to nobody.
@@ -719,16 +721,27 @@ impl DatabaseDraft {
     /// What stops this draft being applied, in the form's own words — empty when
     /// nothing does.
     ///
-    /// Only the name, because only the name has an answer the form can know.
-    /// A character set that doesn't exist, an owner role that doesn't, a name
-    /// already taken — every one of those is the *server's* question, and
-    /// guessing at them here would mean a form that refuses what the server
-    /// would have accepted. The one thing a client can be sure of is that a
-    /// database with no name is not a request.
+    /// The name, and the collation's spelling, because only those have an
+    /// answer the form can know. A character set that doesn't exist, an owner
+    /// role that doesn't, a name already taken — every one of those is the
+    /// *server's* question, and guessing at them here would mean a form that
+    /// refuses what the server would have accepted. What a client can be sure
+    /// of is that a database with no name is not a request, and that a
+    /// collation that is not a bare name ([`is_collation_name`]) is none.
     pub fn validate(&self) -> Vec<String> {
         let mut out = Vec::new();
         if self.name.trim().is_empty() {
             out.push("The name can't be empty.".to_string());
+        }
+        // The one option a client *can* judge: SQL Server takes a collation as a
+        // bare name, unquotable, so a name that is not one cannot be written at
+        // all — and no engine's collation holds anything else.
+        if self
+            .collation
+            .as_deref()
+            .is_some_and(|c| !c.trim().is_empty() && !is_collation_name(c.trim()))
+        {
+            out.push("A collation name holds only letters, digits and underscores.".to_string());
         }
         out
     }
@@ -742,7 +755,8 @@ impl DatabaseDraft {
     ///
     /// **Each optional clause is gated on the capability that answers for it**,
     /// not merely on the field being set. The form asks
-    /// [`supports_database_charset`] and [`supports_owners`] before showing the
+    /// [`supports_database_charset`], [`supports_database_collation`] and
+    /// [`supports_owners`] before showing the
     /// rows, so on the engine that built a draft the two agree — but the draft
     /// is a value that outlives the form it came from, and this function takes
     /// the dialect as an argument, which is a promise that any dialect is a
@@ -760,15 +774,31 @@ impl DatabaseDraft {
         // `mysqldump` writes. It also keeps a typo in the form field from
         // becoming a syntax error rather than the server's own "Unknown
         // character set" — which is the message that tells the user what to fix.
-        if supports_database_charset(dialect) {
-            if let Some(cs) = self.charset.as_deref().filter(|s| !s.trim().is_empty()) {
-                out.push_str(&format!(
-                    " CHARACTER SET {}",
-                    ddl_string(cs.trim(), dialect)
-                ));
-            }
-            if let Some(coll) = self.collation.as_deref().filter(|s| !s.trim().is_empty()) {
-                out.push_str(&format!(" COLLATE {}", ddl_string(coll.trim(), dialect)));
+        if supports_database_charset(dialect)
+            && let Some(cs) = self.charset.as_deref().filter(|s| !s.trim().is_empty())
+        {
+            out.push_str(&format!(
+                " CHARACTER SET {}",
+                ddl_string(cs.trim(), dialect)
+            ));
+        }
+        if supports_database_collation(dialect)
+            && let Some(coll) = self.collation.as_deref().filter(|s| !s.trim().is_empty())
+        {
+            let coll = coll.trim();
+            match dialect {
+                // MySQL's slot takes a string, for the charset's reason above.
+                SqlDialect::MySql => {
+                    out.push_str(&format!(" COLLATE {}", ddl_string(coll, dialect)))
+                }
+                // T-SQL's takes a bare name and nothing else — bracketed or
+                // quoted, it is a syntax error (measured). `validate` refuses a
+                // name that is not one; this writes no clause for it rather than
+                // splicing text into the statement.
+                SqlDialect::MsSql if is_collation_name(coll) => {
+                    out.push_str(&format!(" COLLATE {coll}"))
+                }
+                SqlDialect::MsSql | SqlDialect::Postgres | SqlDialect::Sqlite => {}
             }
         }
         // An owner *is* a role identifier, so this one is quoted as one.
@@ -8604,6 +8634,33 @@ pub const MYSQL_COLLATIONS: [&str; 5] = [
     "latin1_swedish_ci",
 ];
 
+/// SQL Server collations offered beside the free-text field — a shortcut, as
+/// [`MYSQL_COLLATIONS`] is, with the server's own `sys.fn_helpcollations()`
+/// the authority on the rest.
+///
+/// `SQL_Latin1_General_CP1_CI_AS` first, because it is the default an
+/// English-locale install is set up with and so what an existing database most
+/// likely has; then its Windows-collation counterpart, the version-100 UTF-8
+/// one (2019 on) for new work that wants `varchar` to hold Unicode, a
+/// case-sensitive one, and the binary one code-point comparison wants.
+pub const MSSQL_COLLATIONS: [&str; 5] = [
+    "SQL_Latin1_General_CP1_CI_AS",
+    "Latin1_General_CI_AS",
+    "Latin1_General_100_CI_AS_SC_UTF8",
+    "Latin1_General_CS_AS",
+    "Latin1_General_BIN2",
+];
+
+/// The collations offered beside `dialect`'s Collation field — empty where a
+/// database takes none ([`supports_database_collation`]).
+pub fn database_collations(dialect: SqlDialect) -> &'static [&'static str] {
+    match dialect {
+        SqlDialect::MySql => &MYSQL_COLLATIONS,
+        SqlDialect::MsSql => &MSSQL_COLLATIONS,
+        SqlDialect::Postgres | SqlDialect::Sqlite => &[],
+    }
+}
+
 // ── Type + default equivalence ───────────────────────────────────────────────
 
 /// A declared type taken apart: its base keyword(s) and whatever was inside the
@@ -9773,7 +9830,7 @@ pub fn supports_view_editing(dialect: SqlDialect) -> bool {
 /// Can `dialect` create and drop **databases** — the container everything else
 /// in this module lives in?
 ///
-/// True on MySQL and PostgreSQL. False on SQLite, where a database is a file:
+/// True on MySQL, PostgreSQL and SQL Server. False on SQLite, where a database is a file:
 /// see [`supports_change`]'s arm for why that is a refusal rather than a
 /// filesystem action wearing a DDL preview.
 ///
@@ -9857,13 +9914,39 @@ pub fn supports_owners(dialect: SqlDialect) -> bool {
 /// An exhaustive `match`, for the reason [`supports_owners`] gives.
 ///
 /// SQL Server takes a collation (`CREATE DATABASE … COLLATE`) and no
-/// character set — the collation implies the code page — so the pair of fields
-/// does not fit it.
+/// character set — the collation implies the code page — which is why the
+/// collation is a capability of its own, [`supports_database_collation`].
 pub fn supports_database_charset(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MySql => true,
         SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => false,
     }
+}
+
+/// Does `dialect` take a **collation** on `CREATE DATABASE`?
+///
+/// MySQL and SQL Server do. Apart from [`supports_database_charset`] because
+/// SQL Server takes the one and not the other — its collation names the code
+/// page — and one predicate for the pair would have either offered it a
+/// character set or withheld its collation. PostgreSQL's `LC_COLLATE` is not
+/// offered, for the template reason that predicate gives.
+///
+/// An exhaustive `match`, for the reason [`supports_owners`] gives.
+pub fn supports_database_collation(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MySql | SqlDialect::MsSql => true,
+        SqlDialect::Postgres | SqlDialect::Sqlite => false,
+    }
+}
+
+/// Is `name` spelled as a collation — ASCII letters, digits and underscores,
+/// and at least one of them?
+///
+/// Every collation on every engine that takes one is, and T-SQL needs it to
+/// be: its `COLLATE` takes the bare name, which no quoting can stand in for,
+/// so [`DatabaseDraft::create_sql`] writes only a name this accepts.
+pub fn is_collation_name(name: &str) -> bool {
+    !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
 /// Can `dialect` redefine a view **in place**, with `CREATE OR REPLACE VIEW`?
@@ -13738,8 +13821,8 @@ pub fn supports_change(dialect: SqlDialect, change: &Change) -> bool {
     // behind a SQL preview that had no SQL in it. Absent, not dimmed.
     if is_server_level(change) {
         return match dialect {
-            SqlDialect::MySql | SqlDialect::Postgres => true,
-            SqlDialect::Sqlite | SqlDialect::MsSql => false,
+            SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::MsSql => true,
+            SqlDialect::Sqlite => false,
         };
     }
     // **MySQL cannot move a generated column between `VIRTUAL` and `STORED`**,
@@ -13917,7 +14000,8 @@ fn account_change_supported(dialect: SqlDialect, change: &Change) -> bool {
 /// dropped, and so is a routine (`CREATE OR ALTER PROCEDURE`/`FUNCTION`); a
 /// routine's `RenameRoutine` is never raised, a rename being a re-create. A
 /// namespace is created and dropped (`CREATE`/`DROP SCHEMA`) — a schema
-/// *inside* the database, as PostgreSQL's is and MySQL's is not.
+/// *inside* the database, as PostgreSQL's is and MySQL's is not — and so is a
+/// database, with a collation and nothing else.
 fn tsql_supports(change: &Change) -> bool {
     match change {
         // A namespace: `container_creates`/`container_drops` write it, each its
@@ -13925,6 +14009,10 @@ fn tsql_supports(change: &Change) -> bool {
         // Never `CASCADE` (T-SQL has none), so one still holding anything is
         // refused by the server, as on PostgreSQL.
         Change::CreateSchema { .. } | Change::DropSchema { .. } => true,
+        // A database: server-level, so `ddl_preview` sends it to
+        // `mssql::run_server_ddl`, attached to `master` and outside any
+        // transaction — T-SQL refuses `CREATE DATABASE` inside one.
+        Change::CreateDatabase(_) | Change::DropDatabase { .. } => true,
         // Logins, users, roles and grants: the shared account answer.
         c if is_account_change(c) => account_change_supported(SqlDialect::MsSql, c),
         Change::CreateTrigger(_)
@@ -17319,6 +17407,8 @@ mod tests {
             Change::DropSchema {
                 name: "sales".into(),
             },
+            Change::CreateDatabase(Box::new(DatabaseDraft::blank("d"))),
+            Change::DropDatabase { name: "d".into() },
         ];
         for c in &yes {
             assert!(supports_change(MsSql, c), "{c:?}");
@@ -17376,7 +17466,6 @@ mod tests {
             Change::DropView { materialized: true },
             // Never raised — `diff_view` re-creates to rename.
             Change::RenameView { to: "w".into() },
-            Change::DropDatabase { name: "d".into() },
         ];
         for c in &no {
             assert!(!supports_change(MsSql, c), "{c:?}");
@@ -33093,6 +33182,109 @@ mod database_tests {
         );
         assert!(drop.unsupported().is_empty(), "{:?}", drop.unsupported());
         assert_eq!(drop.emit(), vec!["DROP SCHEMA [sales];".to_string()]);
+    }
+
+    /// **SQL Server creates and drops a database**, with a collation and no
+    /// character set — the collation implies the code page — and no owner
+    /// clause, since `supports_owners` is false there.
+    #[test]
+    fn sql_server_creates_and_drops_a_database() {
+        use crate::intel::SqlDialect::MsSql;
+        assert!(supports_database_editing(MsSql));
+        assert_eq!(
+            create_db(DatabaseDraft::blank("shop"), MsSql).emit(),
+            vec!["CREATE DATABASE [shop];".to_string()]
+        );
+        let d = DatabaseDraft {
+            name: "shop".into(),
+            charset: Some("utf8mb4".into()),
+            collation: Some("Latin1_General_100_CI_AS_SC_UTF8".into()),
+            owner: Some("app".into()),
+        };
+        assert_eq!(
+            create_db(d, MsSql).emit(),
+            vec!["CREATE DATABASE [shop] COLLATE Latin1_General_100_CI_AS_SC_UTF8;".to_string()]
+        );
+        assert_eq!(
+            drop_db("shop", MsSql).emit(),
+            vec!["DROP DATABASE [shop];".to_string()]
+        );
+        for c in [
+            Change::CreateDatabase(Box::new(DatabaseDraft::blank("shop"))),
+            Change::DropDatabase {
+                name: "shop".into(),
+            },
+        ] {
+            assert!(is_server_level(&c), "{c:?}");
+        }
+    }
+
+    /// **T-SQL takes a collation as a bare name only** — `COLLATE
+    /// [Latin1_General_CI_AS]` and `COLLATE 'Latin1_General_CI_AS'` are both
+    /// syntax errors (measured, SQL Server 2022) — so it cannot be quoted, and
+    /// the draft refuses a name that is anything but letters, digits and
+    /// underscores, which every collation on every engine that takes one is.
+    /// The emitter writes no clause for such a name rather than splicing it.
+    #[test]
+    fn a_collation_is_a_bare_name_and_nothing_else_is_one() {
+        use crate::intel::SqlDialect::MsSql;
+        let d = DatabaseDraft {
+            name: "shop".into(),
+            collation: Some("Latin1_General_CI_AS; DROP DATABASE x".into()),
+            ..Default::default()
+        };
+        assert!(
+            d.validate().iter().any(|e| e.contains("collation")),
+            "{:?}",
+            d.validate()
+        );
+        assert_eq!(
+            create_db(d, MsSql).emit(),
+            vec!["CREATE DATABASE [shop];".to_string()]
+        );
+        assert!(
+            DatabaseDraft {
+                collation: Some("utf8mb4_0900_ai_ci".into()),
+                ..DatabaseDraft::blank("shop")
+            }
+            .validate()
+            .is_empty()
+        );
+    }
+
+    /// The collation is its own capability, apart from the character set:
+    /// MySQL takes both, SQL Server only the collation, PostgreSQL neither.
+    #[test]
+    fn a_collation_is_offered_where_a_database_takes_one() {
+        use crate::intel::SqlDialect::MsSql;
+        assert!(supports_database_collation(MySql));
+        assert!(supports_database_collation(MsSql));
+        assert!(!supports_database_collation(Postgres));
+        assert!(!supports_database_collation(Sqlite));
+        assert!(!supports_database_charset(MsSql));
+    }
+
+    /// Every collation offered beside SQL Server's field lands in its clause
+    /// as offered, and passes the draft's own check.
+    #[test]
+    fn every_offered_sql_server_collation_lands_in_the_clause() {
+        use crate::intel::SqlDialect::MsSql;
+        // Each engine is offered its own list, and one with none is offered none.
+        assert_eq!(database_collations(MsSql), &MSSQL_COLLATIONS);
+        assert_eq!(database_collations(MySql), &MYSQL_COLLATIONS);
+        assert!(database_collations(Postgres).is_empty());
+        assert!(database_collations(Sqlite).is_empty());
+        for coll in MSSQL_COLLATIONS {
+            let d = DatabaseDraft {
+                collation: Some(coll.into()),
+                ..DatabaseDraft::blank("shop")
+            };
+            assert!(d.validate().is_empty(), "{coll}");
+            assert_eq!(
+                create_db(d, MsSql).emit(),
+                vec![format!("CREATE DATABASE [shop] COLLATE {coll};")]
+            );
+        }
     }
 
     /// A namespace a comparison has to create goes **ahead of** the table that
