@@ -5993,7 +5993,18 @@ existing prose was left alone.
     `an_unticked_objects_namespace_is_not_created`). It is read off the entries' own statuses,
     `DbSchema` holding no list of namespaces, and is empty on MySQL and SQLite by construction rather
     than by a dialect test — neither has a level between the database and the table, so every object's
-    namespace there is `None` (`an_engine_with_no_namespaces_never_creates_one`).
+    namespace there is `None` (`an_engine_with_no_namespaces_never_creates_one`). **Read off the
+    entries, a target holding no objects reads no namespaces at all**, so comparing into an empty
+    SQL Server database planned "Create schema dbo" — a change SQL Server's plans refuse, which
+    withheld the whole plan — and into an empty PostgreSQL one `CREATE SCHEMA "public"`, refused as
+    already there along with the migration's transaction. A namespace every database comes with
+    (`ddl::namespace_comes_with_every_database`: SQL Server's `dbo`, `guest`, `sys`,
+    `INFORMATION_SCHEMA`; PostgreSQL's `public`, `pg_catalog`, `information_schema`) is never one of
+    them. PostgreSQL's `public` can be dropped, and into a database where it has been the plan's
+    first `CREATE TABLE public.…` is refused and rolled back — the trade for a plan that applies into
+    every database that still has it (`a_namespace_every_database_comes_with_is_not_planned`; live,
+    `a_comparison_into_an_empty_database_does_not_create_dbo`). An *empty* namespace of the user's
+    own on the target is still read as missing, and its `CREATE SCHEMA` refused as there.
     **`is_planned`, `selection_note` and `SchemaPlan::subject` are decisions, and they were in the
     view.** `is_planned(entry, selected)` — `selected.contains(&e.key()) && !e.needs_source() &&
     !e.unplannable()` — is the

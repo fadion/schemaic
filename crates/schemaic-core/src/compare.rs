@@ -525,7 +525,10 @@ pub struct SchemaComparison {
     ///
     /// Empty on MySQL and SQLite by construction rather than by a dialect test:
     /// neither has a level between the database and the table, so every
-    /// object's namespace there is `None`.
+    /// object's namespace there is `None`. Never one every database comes with
+    /// ([`ddl::namespace_comes_with_every_database`]) — SQL Server's `dbo`,
+    /// PostgreSQL's `public` — which a target holding no objects reads no sign
+    /// of, and which is there all the same.
     pub new_namespaces: Vec<String>,
     /// Constraint and index names a table this comparison drops still holds and
     /// a table it creates needs — see [`occupied_names`], which is what a table
@@ -801,9 +804,12 @@ impl SchemaComparison {
             )
         };
         let left_ns = namespaces(on_left);
+        // A namespace every database comes with is there whether or not an
+        // object in it was read — an empty target reads none at all.
         let new_namespaces: Vec<String> = namespaces(on_right)
             .into_iter()
             .filter(|ns| !left_ns.contains(ns))
+            .filter(|ns| !ddl::namespace_comes_with_every_database(ns, dialect))
             .collect();
 
         SchemaComparison {
@@ -3391,6 +3397,58 @@ mod tests {
                 .iter()
                 .all(|s| !s.contains("CREATE SCHEMA"))
         );
+    }
+
+    /// **A namespace every database comes with is not created.** A target
+    /// holding no objects reads no namespaces at all, so comparing into an
+    /// empty SQL Server database planned "Create schema dbo" ahead of every
+    /// table — a change SQL Server's plans refuse, so the whole plan was
+    /// withheld — and into an empty PostgreSQL one `CREATE SCHEMA "public"`,
+    /// which the server refuses as already there, and with it the transaction
+    /// the migration runs in. A namespace of the user's own is still planned.
+    #[test]
+    fn a_namespace_every_database_comes_with_is_not_planned() {
+        let in_ns = |ns: &str, name: &str| TableInfo {
+            name: name.to_string(),
+            schema: Some(ns.to_string()),
+            columns: vec![col("id", "int")],
+            ..Default::default()
+        };
+        for (dialect, ns) in [(SqlDialect::MsSql, "dbo"), (SqlDialect::Postgres, "public")] {
+            let c = SchemaComparison::of(
+                &schema_of(vec![]),
+                &schema_of(vec![in_ns(ns, "t")]),
+                dialect,
+            );
+            assert!(
+                c.new_namespaces.is_empty(),
+                "{dialect:?}: {:?}",
+                c.new_namespaces
+            );
+            let plan = c.plan(|_| true);
+            assert!(
+                plan.unsupported().is_empty(),
+                "{dialect:?}: {:?}",
+                plan.unsupported()
+            );
+            let stmts = plan.emit();
+            assert!(
+                stmts.iter().all(|s| !s.contains("CREATE SCHEMA")),
+                "{dialect:?}: {stmts:?}"
+            );
+            assert!(
+                stmts.iter().any(|s| s.contains("CREATE TABLE")),
+                "{dialect:?}: {stmts:?}"
+            );
+        }
+        for dialect in [SqlDialect::MsSql, SqlDialect::Postgres] {
+            let c = SchemaComparison::of(
+                &schema_of(vec![]),
+                &schema_of(vec![in_ns("sales", "t")]),
+                dialect,
+            );
+            assert_eq!(c.new_namespaces, vec!["sales".to_string()], "{dialect:?}");
+        }
     }
 
     // ── the two sentences about a count ──────────────────────────────────────

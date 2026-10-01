@@ -2894,6 +2894,35 @@ pub fn is_namespace_change(change: &Change) -> bool {
     )
 }
 
+/// Does **every database** on `dialect` come with the namespace `name`, so a
+/// plan never has to create it?
+///
+/// What the schema comparison asks before planning a `CREATE SCHEMA`
+/// ([`crate::compare::SchemaComparison::new_namespaces`]), which it reads off
+/// the objects each side holds — so a target with no objects reads no
+/// namespaces at all. Comparing into an empty SQL Server database planned
+/// "Create schema dbo", a change SQL Server's plans refuse, and so withheld the
+/// whole plan; into an empty PostgreSQL one, `CREATE SCHEMA "public"`, which the
+/// server refuses as already there, taking the migration's transaction with it.
+///
+/// SQL Server's `dbo`, `guest`, `sys` and `INFORMATION_SCHEMA` are in every
+/// database and cannot be dropped. PostgreSQL's `pg_catalog` and
+/// `information_schema` are the same; **`public` is in every database created
+/// from the default template but can be dropped**. That is the trade taken:
+/// where it has been dropped, the plan's first `CREATE TABLE public.…` is
+/// refused and the transaction rolls the plan back — loud, and nothing changed
+/// — where planning it refused the plan into every database that still has
+/// it, which is nearly all of them. MySQL and SQLite have no such level, and no
+/// object there carries a namespace for this to be asked about.
+pub fn namespace_comes_with_every_database(name: &str, dialect: SqlDialect) -> bool {
+    let builtin: &[&str] = match dialect {
+        SqlDialect::MsSql => &["dbo", "guest", "sys", "INFORMATION_SCHEMA"],
+        SqlDialect::Postgres => &["public", "pg_catalog", "information_schema"],
+        SqlDialect::MySql | SqlDialect::Sqlite => &[],
+    };
+    builtin.contains(&name)
+}
+
 /// Is `change` **server-level** — about a database as a whole rather than about
 /// anything inside one?
 ///
@@ -31281,6 +31310,34 @@ mod database_tests {
             name: "sales".into()
         }));
         assert!(!is_server_level(&Change::DropTable));
+    }
+
+    /// The namespaces a comparison never plans to create: each engine's own,
+    /// spelled as the server spells them, and nothing on an engine without the
+    /// level.
+    #[test]
+    fn only_a_namespace_every_database_has_comes_with_it() {
+        use SqlDialect::MsSql;
+        for (d, ns) in [
+            (MsSql, "dbo"),
+            (MsSql, "guest"),
+            (MsSql, "INFORMATION_SCHEMA"),
+            (Postgres, "public"),
+            (Postgres, "pg_catalog"),
+        ] {
+            assert!(namespace_comes_with_every_database(ns, d), "{d:?} {ns}");
+        }
+        for (d, ns) in [
+            (MsSql, "sales"),
+            (MsSql, "public"),
+            (Postgres, "dbo"),
+            (Postgres, "sales"),
+            (Postgres, ""),
+            (MySql, "dbo"),
+            (Sqlite, "main"),
+        ] {
+            assert!(!namespace_comes_with_every_database(ns, d), "{d:?} {ns}");
+        }
     }
 
     // ── accounts ─────────────────────────────────────────────────────────────

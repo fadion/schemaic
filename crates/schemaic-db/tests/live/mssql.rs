@@ -3862,6 +3862,36 @@ async fn sync_modules(
     (plan, again)
 }
 
+/// **A comparison into an empty database applies.** A target holding no
+/// objects reads no namespaces, so the plan opened with "Create schema dbo" —
+/// a change SQL Server's plans refuse — and the whole plan was withheld. `dbo`
+/// is in every database; synced, the target holds the source's table and a
+/// second comparison finds nothing to do.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_comparison_into_an_empty_database_does_not_create_dbo() {
+    if !enabled() {
+        return;
+    }
+    let target = Scratch::create("cmp_empty_target").await;
+    let source = Scratch::create("cmp_empty_source").await;
+    source
+        .exec("CREATE TABLE dbo.t (id int NOT NULL PRIMARY KEY, d int NULL)")
+        .await;
+    let (plan, again) = sync_modules(&target, &source).await;
+    assert!(
+        plan.emit().iter().all(|s| !s.contains("CREATE SCHEMA")),
+        "{:#?}",
+        plan.emit()
+    );
+    assert_eq!(
+        target
+            .scalar("SELECT COUNT(*) FROM sys.tables WHERE name = 't'")
+            .await,
+        "1"
+    );
+    assert_eq!(again.differences().count(), 0);
+}
+
 /// **A comparison creates a missing view whole** — under the settings the
 /// source's was created with, and with its indexes. The plan was a bare
 /// `CREATE VIEW`, so a view written under `ANSI_NULLS OFF` arrived ON (its
