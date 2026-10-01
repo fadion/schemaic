@@ -461,10 +461,13 @@ fn continues_dollar_name(b: u8) -> bool {
 
 /// Can this byte continue a bare name on `dialect`, after its first byte?
 ///
-/// [`is_word_byte`] plus each engine's extra continuation bytes: PostgreSQL's
-/// `$` ([`continues_dollar_name`]), and T-SQL's `$`, `#` and `@` — `dbo.h#`,
+/// [`is_word_byte`] plus each engine's extra continuation bytes: `$` on all
+/// four ([`continues_dollar_name`]) — MySQL's bare identifier is
+/// `[0-9a-zA-Z$_]`, SQLite's tokenizer continues one through `$`, and `a$b`
+/// is one name on PostgreSQL — and T-SQL's `#` and `@` besides: `dbo.h#`,
 /// `purge@now` and `v$as` are each one regular identifier there (measured on
-/// SQL Server 2022). MySQL and SQLite keep the plain word bytes.
+/// SQL Server 2022). MySQL and SQLite were said to keep the plain word bytes,
+/// and Format Code wrote a valid `a$b` back as the syntax error `a $ b`.
 ///
 /// Only a *continuation*: `@x` is a T-SQL variable and `#t` a temporary
 /// table, whose leading byte is a prefix rather than part of an ordinary
@@ -474,9 +477,8 @@ fn continues_dollar_name(b: u8) -> bool {
 /// is how `dbo.f@GETDATE()` reached the gate as a call to `GETDATE`.
 pub fn continues_name(b: u8, dialect: SqlDialect) -> bool {
     match dialect {
-        SqlDialect::Postgres => continues_dollar_name(b),
-        SqlDialect::MsSql => is_word_byte(b) || matches!(b, b'$' | b'#' | b'@'),
-        SqlDialect::MySql | SqlDialect::Sqlite => is_word_byte(b),
+        SqlDialect::MsSql => continues_dollar_name(b) || matches!(b, b'#' | b'@'),
+        SqlDialect::Postgres | SqlDialect::MySql | SqlDialect::Sqlite => continues_dollar_name(b),
     }
 }
 
@@ -2381,7 +2383,10 @@ pub(crate) fn tsql_statements(stmt: &str, dialect: SqlDialect) -> Vec<&str> {
         let c = b[i];
         if is_word_start(c) {
             let s = i;
-            while i < b.len() && is_word_byte(b[i]) {
+            i += 1;
+            // To where `continues_name` ends the name, so `a$delete` and
+            // `h#update` are one word each and no `DELETE`/`UPDATE`.
+            while i < b.len() && continues_name(b[i], dialect) {
                 i += 1;
             }
             // `@delete` is a variable, `#update` a temporary table and
@@ -4250,7 +4255,12 @@ fn word_tokens(sql: &str, dialect: SqlDialect) -> (Vec<String>, bool) {
         if c == b';' {
             flush!();
             ended = true;
-        } else if is_word_byte(c) {
+        } else if is_word_byte(c) || (!word.is_empty() && continues_name(c, dialect)) {
+            // A name runs on where `continues_name` says — through `$` on every
+            // engine, `#`/`@` on T-SQL — so `a$delete` is one column and not a
+            // `DELETE`. Only a continuation: an empty word does not start at
+            // `$`, PostgreSQL's `$1`.
+            //
             // Invariant 11's third site here. The ASCII rule flushed at every
             // byte `>= 0x80`, so `cafédelete` arrived as the two tokens `CAFÃ`
             // and `DELETE` and `contains_write` answered true for a `SELECT`.
@@ -6690,6 +6700,77 @@ mod tests {
         }
         assert!(!carries_credential("SELECT master_password FROM t"));
         assert!(!carries_credential("START TRANSACTION"));
+    }
+
+    /// **A client terminator glued to `END` is not a misspelled keyword.**
+    /// With `$` continuing a MySQL name, a range closed by `DELIMITER $`'s
+    /// terminator ends in the one word `END$` — which the typo check, one edit
+    /// from `END`, flagged. No keyword holds a `$`, so a word that does is a
+    /// name.
+    #[test]
+    fn a_dollar_terminator_after_end_draws_no_typo_warning() {
+        let cat = crate::intel::Catalog::build(&[], None);
+        for s in [
+            "DELIMITER $\nCREATE PROCEDURE p() BEGIN SELECT 1; END$\nDELIMITER ;",
+            "DELIMITER $$\nCREATE PROCEDURE p() BEGIN SELECT 1; END$$\nDELIMITER ;",
+            "SELECT a$b FROM t$x",
+        ] {
+            let d = crate::intel::diagnostics(s, &cat, SqlDialect::MySql);
+            assert!(
+                !d.iter().any(|d| d.message.contains("misspelled")),
+                "{s}: {d:?}"
+            );
+        }
+    }
+
+    /// **Where a name ends is `continues_name`'s answer, for every engine.**
+    /// MySQL (`[0-9a-zA-Z$_]`), SQLite, PostgreSQL and SQL Server all continue
+    /// a bare name through `$`, so `a$delete` is one column — but MySQL and
+    /// SQLite were said to stop at it.
+    #[test]
+    fn a_dollar_continues_a_name_on_every_engine() {
+        for d in [
+            SqlDialect::MySql,
+            SqlDialect::Sqlite,
+            SqlDialect::Postgres,
+            SqlDialect::MsSql,
+        ] {
+            assert!(super::continues_name(b'$', d), "{d:?}");
+            assert!(super::continues_name(b'a', d), "{d:?}");
+            assert!(!super::continues_name(b' ', d), "{d:?}");
+        }
+        // A continuation only: `$` begins no name.
+        assert!(!super::is_word_start(b'$'));
+    }
+
+    /// **The guards' word scanners end a name where `continues_name` says.**
+    /// `word_tokens` and `tsql_statements` stopped at `$` on every engine, so
+    /// `SELECT a$delete FROM t` — one column — read as a `DELETE`: refused by
+    /// the read-only gate on all four, blocked on a read-only connection, and
+    /// on SQL Server cut into `a$` | `delete FROM t` for a "DELETE without
+    /// WHERE" confirm over a read.
+    #[test]
+    fn a_name_holding_a_dollar_is_not_the_keyword_after_it() {
+        for d in [
+            SqlDialect::MySql,
+            SqlDialect::Sqlite,
+            SqlDialect::Postgres,
+            SqlDialect::MsSql,
+        ] {
+            for s in ["SELECT a$delete FROM t", "SELECT v$truncate FROM t"] {
+                assert_eq!(super::read_only_reason(s, d), Ok(()), "{d:?}: {s}");
+                assert!(!super::contains_write(s, d), "{d:?}: {s}");
+                assert_eq!(super::first_unsafe(s, d), None, "{d:?}: {s}");
+            }
+        }
+        let ms = SqlDialect::MsSql;
+        assert_eq!(
+            super::first_unsafe("DELETE FROM dbo.a$update WHERE id = 1", ms),
+            None
+        );
+        // The keyword itself is still seen.
+        assert!(super::first_unsafe("SELECT a$ FROM t; DELETE FROM t", ms).is_some());
+        assert!(super::read_only_reason("SELECT 1; DELETE FROM t", SqlDialect::MySql).is_err());
     }
 
     #[test]

@@ -9511,7 +9511,8 @@ existing prose was left alone.
     `sql::t_sql_name_prefix` measures — `0` unless a word byte follows it, so `a @ b` is left alone,
     and `0` on every engine but SQL Server — and continues every word with `sql::continues_name`,
     so a name that *holds* one of those bytes, `h#` or `f@x`, stays whole too
-    (`a_t_sql_variable_or_temp_table_keeps_its_prefix`).
+    (`a_t_sql_variable_or_temp_table_keeps_its_prefix`), and so does `a$b` on every engine
+    (`a_dollar_inside_a_name_keeps_the_name_whole`).
   - `pairs.rs` — caret-driven, boundary-aware editor highlights + auto-close pairs (via
     `skip_noncode`): `auto_pair` (auto-close `()`/`''`/`""`/`` `` `` [MySQL] at code positions, wrap a
     selection, type-over a closer/quote already at the caret — respects string/comment regions and
@@ -26961,9 +26962,18 @@ Re-introducing the anti-patterns these guard against is a regression:
   these are three lines inside a scan of something else, which is why grepping for the loops did not
   find them.
   **Where a name *ends* is per-dialect, and that is one definition too**: `sql::continues_name`,
-  built on `is_word_byte` — PostgreSQL adds `$` (`continues_dollar_name`), T-SQL `$`, `#` and `@`,
-  MySQL and SQLite nothing — with `sql::t_sql_name_prefix` for the leading `@`/`@@`/`#`/`##` of a
+  built on `is_word_byte` — every engine adds `$` (`continues_dollar_name`: MySQL's bare
+  identifier is `[0-9a-zA-Z$_]`, SQLite's tokenizer continues one through it), T-SQL `#` and `@`
+  besides — with `sql::t_sql_name_prefix` for the leading `@`/`@@`/`#`/`##` of a
   T-SQL variable, system function or temporary table, `0` unless `SqlDialect::prefixed_names()`.
+  MySQL and SQLite were said to add nothing, so Format Code wrote a valid `a$b` back as the syntax
+  error `a $ b` there (review finding R1-L2-03); and the guards' own word scanners, `word_tokens`
+  (the read-only gate's deny-list and `contains_write`) and `tsql_statements`, stopped at `$` on
+  every engine, so `SELECT a$delete FROM t` — one column — was refused as a `DELETE` by the gate,
+  blocked on a read-only connection, and on SQL Server cut into `a$` | `delete FROM t` for a
+  "DELETE without WHERE" confirm (R1-L2-04). Both walk with `continues_name` now. One cost of the
+  wider word: a range closed by `DELIMITER $`'s terminator ends in the word `END$`, so
+  `intel::is_probable_typo` refuses any word holding a `$` — no keyword does.
   Four scanners split a name where SQL Server does not: the read-only gate's `call_tokens` ended
   `dbo.f@GETDATE()` at the `@` and asked the allowlist about `GETDATE`, `sqlfmt::tokenize` cut
   `@x` from its `@`, so Format Code wrote back `@ x`, a batch that no longer compiled,

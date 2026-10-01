@@ -1438,4 +1438,26 @@ mod tests {
         assert_preserves(sql, d);
         assert_eq!(crate::params::names(&out, d), crate::params::names(sql, d));
     }
+
+    /// **A `$` inside a name is part of it on every engine.** MySQL's bare
+    /// identifier is `[0-9a-zA-Z$_]` and SQLite's tokenizer continues one
+    /// through `$`, but `continues_name` stopped both at it, so Format Code
+    /// wrote `a $ b` — a syntax error on both, from a valid `a$b`.
+    #[test]
+    fn a_dollar_inside_a_name_keeps_the_name_whole() {
+        for d in [
+            SqlDialect::MySql,
+            SqlDialect::Sqlite,
+            SqlDialect::Postgres,
+            SqlDialect::MsSql,
+        ] {
+            let sql = "select a$b, c from t$x where a$b = 1";
+            let out = super::format_sql(sql, IND, d);
+            for kept in ["a$b", "t$x"] {
+                assert!(out.contains(kept), "{d:?}: {kept} split: {out}");
+            }
+            assert!(!out.contains(" $ "), "{d:?}: {out}");
+            assert_preserves(sql, d);
+        }
+    }
 }

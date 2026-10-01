@@ -5413,7 +5413,9 @@ fn table_hint_end(toks: &[Token], i: usize, dialect: SqlDialect) -> Option<usize
 /// schema ident) but a near-miss of a keyword. Conservative (short words + distant
 /// matches ignored) to avoid flagging legitimate identifiers.
 fn is_probable_typo(word: &str, catalog: &Catalog, dialect: SqlDialect) -> bool {
-    if word.len() < 4 {
+    // No keyword holds a `$`, so a word that does is a name — or `END` with a
+    // `DELIMITER $` terminator glued on, one edit from the keyword.
+    if word.len() < 4 || word.contains('$') {
         return false;
     }
     let lw = word.to_ascii_lowercase();
