@@ -3933,34 +3933,44 @@ impl Change {
             // thing that is actually lost is every grant it ever received, with
             // no record of them left to put back.
             //
-            // It also names the sessions, which is the surprise: on both engines
-            // the account's open connections keep running until they end on their
-            // own, so the drop looks like it did nothing for as long as one of
-            // them lasts.
+            // It also names the sessions, which is the surprise: on MySQL and
+            // PostgreSQL the account's open connections keep running until they
+            // end on their own, so the drop looks like it did nothing for as
+            // long as one of them lasts. **On SQL Server a user's are cut off**
+            // (`users::drop_user_cuts_off_sessions`, measured on 2022 and 2025):
+            // their next statement in that database fails, Msg 916.
             //
-            // **A SQL Server login is the exception on both counts**, measured
-            // on 2022: the server refuses the drop while the login has a
-            // session, running or idle (Msg 15434), and its users in each
+            // **A SQL Server login is the exception on every count**, measured
+            // on 2022 and 2025: the server refuses the drop while the login has
+            // a session, running or idle (Msg 15434); its users in each
             // database are not dropped with it — they stay, every grant intact,
-            // mapped to no login. A login made again under the name has a new
-            // SID and does not re-attach to them. Asked of the account, not the
-            // engine: a login is SQL Server's alone.
+            // mapped to no login, and a login made again under the name has a
+            // new SID and does not re-attach to them; and what *does* go is its
+            // own server permissions and server-role memberships, which nothing
+            // else records. Asked of the account, not the engine: a login is
+            // SQL Server's alone.
             Change::DropAccount(p) if p.kind == crate::users::PrincipalKind::Login => {
                 vec![format!(
-                    "Drops the login {}. The server refuses while anything is connected \
-                     as it, so its sessions have to end first. Its users in each database \
-                     are not dropped: they stay, keeping their permissions, mapped to no \
-                     login — and a login made again under this name does not re-attach to \
-                     them without ALTER USER … WITH LOGIN.",
+                    "Drops the login {}, and with it every server permission and server-role \
+                     membership it holds — recorded nowhere else, so a login made again under \
+                     this name starts without them. The server refuses while anything is \
+                     connected as it, so its sessions have to end first. Its users in each \
+                     database are not dropped: they stay, keeping their permissions, mapped to \
+                     no login, and a new login of this name does not re-attach to them without \
+                     ALTER USER … WITH LOGIN.",
                     p.display()
                 )]
             }
             Change::DropAccount(p) => vec![format!(
                 "Drops {} and every privilege it holds. The grants are not recorded \
                  anywhere else, so putting the account back means granting them all \
-                 again from memory. Anything still connected as it keeps running \
-                 until it disconnects.",
-                p.display()
+                 again from memory. {}",
+                p.display(),
+                if crate::users::drop_user_cuts_off_sessions(dialect) {
+                    "Anything connected as it fails at its next statement in this database."
+                } else {
+                    "Anything still connected as it keeps running until it disconnects."
+                }
             )],
             // **A reset is not undoable, which is the part that surprises.**
             // Nothing is destroyed and the account keeps every privilege it
@@ -31149,12 +31159,24 @@ mod database_tests {
         assert!(text.contains("keeping their permissions"), "{text}");
         assert!(!text.contains("keeps running"), "{text}");
         assert!(!text.contains("every privilege it holds"), "{text}");
-        // A database user's drop does take its grants, as on the other engines.
-        let risk = account("app", MsSql, Change::DropAccount(Box::new(user))).destructive();
-        assert!(
-            risk.join(" ").contains("every privilege it holds"),
-            "{risk:?}"
-        );
+        // What it does take, measured on 2022 and 2025: its own server
+        // permissions and server-role memberships, which a login made again
+        // under the name does not get back.
+        assert!(text.contains("server permission"), "{text}");
+        assert!(text.contains("server-role"), "{text}");
+        // A database user's drop does take its grants, as on the other engines
+        // — and a session using it there fails at its next statement (Msg 916,
+        // measured on both), where the sentence said it kept running.
+        let risk = account("app", MsSql, Change::DropAccount(Box::new(user)))
+            .destructive()
+            .join(" ");
+        assert!(risk.contains("every privilege it holds"), "{risk}");
+        assert!(risk.contains("next statement"), "{risk}");
+        assert!(!risk.contains("keeps running"), "{risk}");
+        let my = account("app@%", MySql, Change::DropAccount(Box::new(an_account())))
+            .destructive()
+            .join(" ");
+        assert!(my.contains("keeps running"), "{my}");
     }
 
     /// **A SQL Server revoke says what its `CASCADE` and a `DENY` do** (both

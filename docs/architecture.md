@@ -3934,11 +3934,17 @@ existing prose was left alone.
     the account drop's sentence says
     what is actually lost — **its privileges, not its data**, with no record of them left anywhere
     to put back — plus the surprise that anything still connected as it keeps running until it
-    disconnects. **A SQL Server login's drop has a sentence of its own**, since both halves of that
-    are false for it (measured on 2022): the server refuses the drop while the login has a session,
-    running or idle (Msg 15434), and its users in each database are left behind with every grant,
-    mapped to no login, which a login re-made under the name (a new SID) does not re-attach to. The
-    arm asks the account's kind, a login being SQL Server's alone
+    disconnects. **On SQL Server a user's sessions do not keep running** but fail at their next
+    statement in that database (Msg 916 — measured on 2022 and 2025 with a session that waited
+    through the `DROP USER`), so the clause asks `users::drop_user_cuts_off_sessions`. **A SQL
+    Server login's drop has a sentence of its own**, since both halves of that are false for it
+    (measured on 2022 and 2025): the server refuses the drop while the login has a session, running
+    or idle (Msg 15434), and its users in each database are left behind with every grant, mapped to
+    no login, which a login re-made under the name (a new SID) does not re-attach to. What it does
+    lose is its own — every server permission and server-role membership, `VIEW SERVER STATE` and
+    `dbcreator` in the measurement, recorded nowhere else and absent from a login re-made under the
+    name — and the sentence says so, as the shared one it replaced had. The arm asks the account's
+    kind, a login being SQL Server's alone
     (`a_sql_server_login_drop_says_it_is_refused_while_connected_and_orphans_its_users`). **The
     revoke's sentence grows two clauses where the engine has the facts**, each a capability in
     `users`: `revoke_cascades` — the revoke carries `CASCADE`, so the privilege is also taken from

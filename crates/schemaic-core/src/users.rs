@@ -2466,6 +2466,22 @@ pub fn blank_password_signs_in(dialect: SqlDialect) -> bool {
     }
 }
 
+/// Does dropping a user here **cut off the sessions using it** — fail their
+/// next statement — rather than leave them running until they disconnect?
+///
+/// SQL Server's does, measured on 2022 and 2025: a session signed in through
+/// the user's login ran a `SELECT`, `DROP USER` succeeded while it waited, and
+/// its next statement in that database — `SELECT DB_NAME()` included — failed
+/// with Msg 916, the login no longer let in. MySQL's and PostgreSQL's keep
+/// running until they end on their own, which is what the drop's sentence says
+/// there ([`crate::ddl::Change::risks`]).
+pub fn drop_user_cuts_off_sessions(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MsSql => true,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+    }
+}
+
 /// [`takes_password`] for the draft the form holds: never for a Microsoft
 /// Entra user ([`AccountDraft::external`]), which Entra signs in.
 pub fn draft_takes_password(dialect: SqlDialect, d: &AccountDraft, contained: bool) -> bool {
