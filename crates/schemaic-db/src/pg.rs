@@ -2009,7 +2009,8 @@ async fn collect_schema(client: &Client) -> Result<DbSchema, DbError> {
             "SELECT n.nspname, c.relname, con.conname, a.attname, \
                     rn.nspname, rc.relname, ra.attname, \
                     con.confdeltype, con.confupdtype, \
-                    con.confmatchtype, con.condeferrable, con.condeferred \
+                    con.confmatchtype, con.condeferrable, con.condeferred, \
+                    con.convalidated \
              FROM pg_constraint con \
              JOIN pg_class c ON c.oid = con.conrelid \
              JOIN pg_namespace n ON n.oid = c.relnamespace \
@@ -2056,11 +2057,16 @@ async fn collect_schema(client: &Client) -> Result<DbSchema, DbError> {
     // composite key, and the second turns a constraint an application relies on
     // deferring into one checked at statement time, so a restored copy refuses
     // inserts the original accepted.
+    //
+    // **And `convalidated`**: a key added `NOT VALID` spares the rows already
+    // there, and restated as an ordinary one it validates them — a dump's
+    // closing `ADD CONSTRAINT` failed over the orphans the source kept.
     type FkRule = (
         Option<String>,
         Option<String>,
         Option<String>,
         Option<String>,
+        bool,
     );
     let fk_rules: HashMap<(String, String, String), FkRule> = fk_all
         .iter()
@@ -2072,6 +2078,8 @@ async fn collect_schema(client: &Client) -> Result<DbSchema, DbError> {
                     fk_action(&cell(r, 8)),
                     fk_match(&cell(r, 9)),
                     fk_deferrable(&cell(r, 10), &cell(r, 11)),
+                    // `bool` arrives as `t`/`f`.
+                    cell(r, 12) == "f",
                 ),
             )
         })
@@ -2250,13 +2258,14 @@ async fn collect_schema(client: &Client) -> Result<DbSchema, DbError> {
                 .cloned();
         }
         for fk in &mut t.foreign_keys {
-            if let Some((on_delete, on_update, match_type, deferrable)) =
+            if let Some((on_delete, on_update, match_type, deferrable, not_validated)) =
                 fk_rules.get(&(ns.clone(), t.name.clone(), fk.name.clone()))
             {
                 fk.on_delete = on_delete.clone();
                 fk.on_update = on_update.clone();
                 fk.match_type = match_type.clone();
                 fk.deferrable = deferrable.clone();
+                fk.not_validated = *not_validated;
             }
         }
     }

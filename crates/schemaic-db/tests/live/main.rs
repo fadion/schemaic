@@ -172,6 +172,7 @@ live_suite!(
         a_cancelled_import_on_a_non_transactional_table_says_the_rows_remain,
         a_refused_write_says_which_value_the_server_refused,
         a_dump_with_compound_bodies_restores_through_run_file,
+        a_not_valid_constraint_restores_over_the_rows_it_spares,
     ],
     streaming: [
         a_streamed_export_delivers_every_row,

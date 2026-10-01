@@ -2947,9 +2947,10 @@ pub fn plan(
                     drop_cascade(dialect)
                 ));
             }
-            // What must wait for the rows — SQL Server's disabled and untrusted
-            // checks, which go back `WITH NOCHECK` and would refuse the rows
-            // that violate them — is held for the section after the data.
+            // What must wait for the rows — a check the server keeps over
+            // rows that violate it, SQL Server's disabled or untrusted one
+            // and PostgreSQL's `NOT VALID` one, which inline would refuse
+            // them — is held for the section after the data.
             let (create, held) = t.create_ddl_holding(dialect);
             text!(create);
             held_checks.extend(held);
@@ -7482,6 +7483,68 @@ mod tests {
             assert!(file.contains(what), "{what}: {file}");
         }
         assert_eq!(p.tables, 1);
+    }
+
+    /// **A PostgreSQL check or key added `NOT VALID` goes back so, after the
+    /// rows.** Inside `CREATE TABLE` PostgreSQL ignores the clause and
+    /// validates the check, so the dump's own rows that violate it failed
+    /// the restore (measured on 16), and the transaction rolled it all back;
+    /// the key was read as an ordinary one, and its closing `ADD CONSTRAINT`
+    /// validated the orphans the source had kept.
+    #[test]
+    fn a_postgres_not_valid_check_and_key_go_back_not_valid_after_the_rows() {
+        let mut parent = table("parent");
+        parent.schema = Some("public".to_string());
+        let mut t = refs(table("t"), "parent");
+        t.schema = Some("public".to_string());
+        t.foreign_keys[0].not_validated = true;
+        t.check_constraints = vec![
+            crate::schema::CheckInfo {
+                name: "c_pos".to_string(),
+                expression: "(id > 0)".to_string(),
+                validated: false,
+                ..Default::default()
+            },
+            crate::schema::CheckInfo {
+                name: "c_ok".to_string(),
+                expression: "(id < 100)".to_string(),
+                ..Default::default()
+            },
+        ];
+        let s = schema_of(vec![parent, t]);
+        let file = file_of(&plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::Postgres,
+        ));
+        let create = pos(&file, "CREATE TABLE \"t\"");
+        let rows = pos(&file, "<<rows t:");
+        let table_ddl = &file[create..rows];
+        assert!(table_ddl.contains("CONSTRAINT \"c_ok\" CHECK"), "{file}");
+        assert!(!table_ddl.contains("c_pos"), "{file}");
+        let held = pos(&file, "ADD CONSTRAINT \"c_pos\" CHECK ((id > 0)) NOT VALID");
+        assert!(rows < held, "{file}");
+        assert!(
+            file.contains("REFERENCES \"parent\" (\"id\") NOT VALID"),
+            "{file}"
+        );
+        // Copy DDL has no rows to wait for, and keeps the check inline.
+        assert!(
+            s.tables[1]
+                .create_ddl(SqlDialect::Postgres)
+                .contains("CONSTRAINT \"c_pos\" CHECK ((id > 0)) NOT VALID"),
+        );
+        // The engines whose inline form holds keep it there.
+        for d in [SqlDialect::MySql, SqlDialect::Sqlite] {
+            assert!(!crate::schema::unvalidated_check_waits_for_rows(d));
+            assert!(!crate::schema::writes_not_valid(d));
+        }
+        assert!(crate::schema::unvalidated_check_waits_for_rows(
+            SqlDialect::MsSql
+        ));
+        assert!(!crate::schema::writes_not_valid(SqlDialect::MsSql));
     }
 
     /// **The modal names what the file left out, and one space separates its

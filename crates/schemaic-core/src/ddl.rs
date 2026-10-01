@@ -7213,6 +7213,12 @@ fn fk_clause(fk: &ForeignKeyInfo, owner: Option<&str>, dialect: SqlDialect) -> S
     if let Some(d) = &fk.deferrable {
         out.push_str(&format!(" {d}"));
     }
+    // A key added sparing the rows already there goes back so: re-added as
+    // an ordinary one it validated them, and a dump's closing section failed
+    // over the orphans the source had kept.
+    if fk.not_validated && crate::schema::writes_not_valid(dialect) {
+        out.push_str(" NOT VALID");
+    }
     out
 }
 

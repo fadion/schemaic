@@ -1033,6 +1033,159 @@ async fn column(scratch: &Scratch, sql: &str) -> Vec<String> {
         .collect()
 }
 
+/// A default dump of every table in `src`, as the app's writer writes it.
+async fn dump_file(src: &Scratch) -> String {
+    use schemaic_core::dump::{DumpOptions, DumpStep, plan, render_rows};
+    let dialect = src.dialect();
+    let schema = Box::pin(src.db.fetch_schema(&src.database, CancellationToken::new()))
+        .await
+        .expect("the schema");
+    let chosen: Vec<String> = schema
+        .tables
+        .iter()
+        .map(|t| schemaic_core::schema::display_name(t.schema.as_deref(), &t.name))
+        .collect();
+    let dump = plan(
+        &schema,
+        &src.database,
+        &chosen,
+        DumpOptions::default(),
+        dialect,
+    );
+    let mut file = String::new();
+    for step in dump.steps {
+        match step {
+            DumpStep::Text(sql) => {
+                file.push_str(&sql);
+                file.push_str("\n\n");
+            }
+            DumpStep::Rows {
+                database,
+                insert_database,
+                schema,
+                table,
+                select,
+                server,
+            } => {
+                let rs = Box::pin(src.db.fetch_query(
+                    Some(&database),
+                    &select,
+                    10_000,
+                    CancellationToken::new(),
+                ))
+                .await
+                .expect("the rows");
+                let order: Vec<usize> = (0..rs.row_count()).collect();
+                let mut out = Vec::new();
+                render_rows(
+                    &mut out,
+                    &mut schemaic_core::export::OneChunk::new(&rs, &order),
+                    (&insert_database, schema.as_deref(), &table),
+                    &server,
+                    dialect,
+                )
+                .expect("the rows render");
+                file.push_str(&String::from_utf8(out).expect("UTF-8 rows"));
+                file.push('\n');
+            }
+        }
+    }
+    file
+}
+
+/// Run `file` into `dst` the way Run file does: the splitter, then
+/// `run_script` on one connection.
+async fn run_file(dst: &Scratch, file: &str) -> ExecEnd {
+    let mut splitter = schemaic_core::script::Splitter::new(dst.dialect());
+    let mut stmts = splitter.push_str(file);
+    stmts.extend(splitter.finish());
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let feed = tokio::spawn(async move {
+        for s in stmts {
+            if tx.send(s).await.is_err() {
+                break;
+            }
+        }
+    });
+    let (end, _) = Box::pin(
+        dst.db
+            .run_script(&dst.database, rx, CancellationToken::new()),
+    )
+    .await;
+    feed.await.expect("the feeding task must not panic");
+    end
+}
+
+/// **A constraint added sparing the rows already there restores over
+/// them.** PostgreSQL ignores `NOT VALID` inside `CREATE TABLE` and
+/// validates the check there, so a dump that wrote it with the table had its
+/// own violating row refused and the transaction rolled the restore back;
+/// a `NOT VALID` key was read as an ordinary one, and its closing `ADD
+/// CONSTRAINT` validated the orphan. Both now go back `NOT VALID`, after
+/// the rows. The question is asked of the engine's capability: where no
+/// constraint can be `NOT VALID`, there is nothing to restore over.
+pub async fn a_not_valid_constraint_restores_over_the_rows_it_spares(target: &'static Target) {
+    let src = Scratch::create(target, "dump_notvalid").await;
+    if !schemaic_core::schema::writes_not_valid(src.dialect()) {
+        crate::endpoint::note_no_op(target, "no constraint here can be NOT VALID");
+        src.teardown().await;
+        return;
+    }
+    let (p, t) = (src.qualified("p"), src.qualified("t"));
+    src.exec(&format!("CREATE TABLE {p} (id INTEGER PRIMARY KEY)"))
+        .await;
+    src.exec(&format!(
+        "CREATE TABLE {t} (id INTEGER PRIMARY KEY, x INTEGER, pid INTEGER)"
+    ))
+    .await;
+    src.exec(&format!("INSERT INTO {p} VALUES (1)")).await;
+    src.exec(&format!("INSERT INTO {t} VALUES (1, -1, 999), (2, 5, 1)"))
+        .await;
+    src.exec(&format!(
+        "ALTER TABLE {t} ADD CONSTRAINT c_pos CHECK (x > 0) NOT VALID"
+    ))
+    .await;
+    src.exec(&format!(
+        "ALTER TABLE {t} ADD CONSTRAINT f_p FOREIGN KEY (pid) REFERENCES {p} (id) NOT VALID"
+    ))
+    .await;
+    let file = dump_file(&src).await;
+    let dst = Scratch::create(target, "dump_notvalid_dst").await;
+    let end = run_file(&dst, &file.replace(&src.database, &dst.database)).await;
+    assert_eq!(
+        end,
+        ExecEnd::Done,
+        "{}: the dump did not restore:\n{file}",
+        target.name
+    );
+    assert_eq!(
+        column(
+            &dst,
+            &format!(
+                "SELECT conname || ':' || convalidated FROM pg_constraint \
+                 WHERE conrelid = '{}'::regclass AND contype IN ('c', 'f') ORDER BY conname",
+                dst.qualified("t")
+            )
+        )
+        .await,
+        ["c_pos:false", "f_p:false"],
+        "{}: the constraints, as they were\n{file}",
+        target.name
+    );
+    assert_eq!(
+        column(
+            &dst,
+            &format!("SELECT x FROM {} ORDER BY id", dst.qualified("t"))
+        )
+        .await,
+        ["-1", "5"],
+        "{}: the rows they spare",
+        target.name
+    );
+    dst.teardown().await;
+    src.teardown().await;
+}
+
 /// **A dump holding a compound trigger and a routine restores into an empty
 /// database through Run file** — `core::dump`'s plan, its rows rendered as the
 /// app's writer renders them, cut by the script splitter and run by

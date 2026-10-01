@@ -451,8 +451,10 @@ pub struct ForeignKeyInfo {
     pub not_enforced: bool,
     /// **SQL Server's untrusted key** (`is_not_trusted`): enforced for new
     /// rows, but added (or re-enabled) `WITH NOCHECK`, so the rows already
-    /// there were never validated and some may violate it. `false` on every
-    /// engine that does not report the state, for the reason `not_enforced` is.
+    /// there were never validated and some may violate it — and
+    /// **PostgreSQL's `NOT VALID` one** (`convalidated` false), the same
+    /// state. `false` on every engine that does not report it, for the reason
+    /// `not_enforced` is.
     pub not_validated: bool,
 }
 
@@ -1454,6 +1456,38 @@ impl TsqlTableKind {
         } else {
             None
         }
+    }
+}
+
+/// Does `dialect` keep a check or key **over rows that violate it** — one
+/// added unvalidated, or switched off — in a form a `CREATE TABLE` cannot
+/// recreate, so that a script loading rows must add it only after them?
+///
+/// SQL Server's `WITH NOCHECK` and `NOCHECK CONSTRAINT` are clauses of
+/// `ALTER TABLE` alone, and PostgreSQL ignores `NOT VALID` inside `CREATE
+/// TABLE` and validates the constraint there (measured on 16), so on both a
+/// dump that wrote it with the table had its own rows refused. MySQL's `NOT
+/// ENFORCED` holds inline, and SQLite has no such state.
+/// [`TableInfo::create_ddl_holding`] asks it; a key always comes after the
+/// rows in a dump, so it is only ever restated in its own `ALTER TABLE`.
+pub fn unvalidated_check_waits_for_rows(dialect: crate::intel::SqlDialect) -> bool {
+    use crate::intel::SqlDialect as D;
+    match dialect {
+        D::MsSql | D::Postgres => true,
+        D::MySql | D::Sqlite => false,
+    }
+}
+
+/// Does `dialect` write `NOT VALID` on a constraint added without checking
+/// the rows already there ([`CheckInfo::validated`],
+/// [`ForeignKeyInfo::not_validated`])? PostgreSQL's spelling; SQL Server's
+/// is `WITH NOCHECK`, a clause of the `ALTER TABLE` rather than of the
+/// constraint.
+pub fn writes_not_valid(dialect: crate::intel::SqlDialect) -> bool {
+    use crate::intel::SqlDialect as D;
+    match dialect {
+        D::Postgres => true,
+        D::MsSql | D::MySql | D::Sqlite => false,
     }
 }
 
@@ -5128,7 +5162,7 @@ impl TableInfo {
         match dialect {
             crate::intel::SqlDialect::MsSql => {
                 return std::iter::once(self.tsql_create_ddl())
-                    .chain(self.tsql_held_checks())
+                    .chain(self.held_checks(dialect))
                     .collect::<Vec<_>>()
                     .join("\n");
             }
@@ -5285,28 +5319,45 @@ impl TableInfo {
 
     /// [`Self::create_ddl`] split in two, for a file that loads the table's
     /// rows in between: what creates the table, and the statements that must
-    /// wait until its rows are in. `create_ddl` is the two joined.
+    /// wait until its rows are in.
     ///
-    /// **SQL Server's disabled and untrusted checks are the held half** — the
-    /// server keeps one over rows that violate it, so it goes back `WITH
+    /// **A check the engine keeps over rows that violate it is the held
+    /// half**, wherever [`unvalidated_check_waits_for_rows`] says the engine
+    /// has one. SQL Server's disabled or untrusted check goes back `WITH
     /// NOCHECK` (and `NOCHECK CONSTRAINT` when disabled), and an untrusted one
     /// is still enforced for every row inserted after it: added before the
-    /// dump's rows it refused them (Msg 547). Every other engine holds nothing
-    /// back here.
+    /// dump's rows it refused them (Msg 547). PostgreSQL's `NOT VALID` one is
+    /// validated when written inside `CREATE TABLE` — the clause is ignored
+    /// there — so the dump's own rows failed the restore, and goes back
+    /// `ADD … NOT VALID` after them. On SQL Server `create_ddl` is the two
+    /// joined; elsewhere it keeps the check inline, a script with no rows.
     pub fn create_ddl_holding(&self, dialect: crate::intel::SqlDialect) -> (String, Vec<String>) {
+        use crate::intel::SqlDialect as D;
+        if !unvalidated_check_waits_for_rows(dialect) {
+            return (self.create_ddl(dialect), Vec::new());
+        }
         match dialect {
-            crate::intel::SqlDialect::MsSql => (self.tsql_create_ddl(), self.tsql_held_checks()),
-            crate::intel::SqlDialect::MySql
-            | crate::intel::SqlDialect::Postgres
-            | crate::intel::SqlDialect::Sqlite => (self.create_ddl(dialect), Vec::new()),
+            D::MsSql => (self.tsql_create_ddl(), self.held_checks(dialect)),
+            D::Postgres | D::MySql | D::Sqlite => {
+                let kept = TableInfo {
+                    check_constraints: self
+                        .check_constraints
+                        .iter()
+                        .filter(|ck| ck.enforced && ck.validated)
+                        .cloned()
+                        .collect(),
+                    ..self.clone()
+                };
+                (kept.create_ddl(dialect), self.held_checks(dialect))
+            }
         }
     }
 
-    /// The `ALTER TABLE`s that put back a SQL Server check which is disabled
-    /// or untrusted, as it was — see [`Self::create_ddl_holding`]. Through
+    /// The `ALTER TABLE`s that put back a check which is disabled or not
+    /// validated, as it was — see [`Self::create_ddl_holding`]. Through
     /// [`crate::ddl::ChangeSet::emit`], whose `AddCheck` arm the rebuild
     /// already restates such a check with, not a second spelling of it.
-    fn tsql_held_checks(&self) -> Vec<String> {
+    fn held_checks(&self, dialect: crate::intel::SqlDialect) -> Vec<String> {
         if self.is_view || self.tsql_kind.unrestatable().is_some() {
             return Vec::new();
         }
@@ -5322,7 +5373,7 @@ impl TableInfo {
         crate::ddl::ChangeSet {
             table: self.name.clone(),
             schema: self.schema.clone(),
-            dialect: crate::intel::SqlDialect::MsSql,
+            dialect,
             flavour: ServerFlavour::Unknown,
             changes: held,
         }

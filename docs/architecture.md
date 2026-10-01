@@ -3449,7 +3449,20 @@ existing prose was left alone.
     rows — an untrusted check is still enforced for new rows, so added before them it refused them
     (`a_sql_server_constraint_that_was_off_is_restated_off_after_the_rows`; the live round trip
     carries a disabled check and key and an untrusted check over violating rows and compares each
-    one's `is_disabled`/`is_not_trusted` on the copy).
+    one's `is_disabled`/`is_not_trusted` on the copy). **PostgreSQL's `NOT VALID` is the same
+    state**, and `create_ddl_holding` holds it back wherever `schema::unvalidated_check_waits_for_rows`
+    says the engine keeps a constraint over rows that violate it in a form `CREATE TABLE` cannot
+    recreate — not wherever the engine is SQL Server, which is what it asked before: PostgreSQL
+    ignores `NOT VALID` inside `CREATE TABLE` and validates the check there (measured on 16), so the
+    dump's own violating rows failed the restore and its transaction rolled everything back. The
+    check now goes back `ADD … NOT VALID` in the `-- Checks` section; Copy DDL, which loads no
+    rows, keeps it inline. The key half: `pg::fetch_schema` reads `convalidated` into
+    `not_validated`, which it never did, so a `NOT VALID` key's closing `ADD CONSTRAINT` validated
+    the orphans the source had kept, and `ddl::fk_clause` writes `NOT VALID` where
+    `schema::writes_not_valid` says the engine spells it so
+    (`a_postgres_not_valid_check_and_key_go_back_not_valid_after_the_rows`; live,
+    `a_not_valid_constraint_restores_over_the_rows_it_spares`, a no-op on the engines with no
+    such state).
     **And only a key whose target table is in the same file.** Exporting one table is a first-class
     action now — a table node's own *Export* — and `ALTER TABLE orders ADD CONSTRAINT … REFERENCES
     customers` in a file that never creates `customers` fails at restore: on PostgreSQL with no guard
