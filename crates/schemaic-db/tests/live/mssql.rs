@@ -2107,6 +2107,91 @@ async fn a_table_a_view_and_a_procedure_are_dropped() {
     );
 }
 
+/// **The editor's checker and the server agree on T-SQL's edges**
+/// (S7.2-L1-01 … L1-08). Each procedure body below is one the checker reads
+/// as clean — a `SET NOCOUNT ON` before a write, a `GRANT` before an `IF`, the
+/// constructs SQL Server's own modules hold that sqlparser's grammar lacks —
+/// and each must compile here; each batch after it is one the checker flags
+/// and the server must refuse. Either half failing means a rule in
+/// `intel::diagnostics` stands on a claim about the server that is not true
+/// of this version.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_t_sql_the_checker_passes_compiles_and_what_it_flags_is_refused() {
+    use schemaic_core::intel::{Catalog, Severity, diagnostics};
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("checker_edges").await;
+    s.exec(
+        "CREATE TABLE dbo.employees (id int NOT NULL PRIMARY KEY, name nvarchar(max), \
+         salary int, dept_id int); CREATE TABLE dbo.departments (id int, name nvarchar(50))",
+    )
+    .await;
+    s.exec(
+        "CREATE FUNCTION dbo.f2 (@a nvarchar(10), @b int = 1) RETURNS int AS BEGIN RETURN 1 END",
+    )
+    .await;
+    let catalog = Catalog::build(&[], None);
+    let errors = |sql: &str| {
+        diagnostics(sql, &catalog, MS)
+            .into_iter()
+            .filter(|d| d.severity == Severity::Error)
+            .map(|d| d.message)
+            .collect::<Vec<_>>()
+    };
+    let bodies = [
+        "SET NOCOUNT ON\nUPDATE dbo.employees SET name = N'x' WHERE id = 1",
+        "SET XACT_ABORT ON\nDELETE TOP (10) FROM dbo.employees",
+        "GRANT SELECT ON dbo.employees TO public\nIF @@ERROR <> 0 PRINT 1",
+        "IF 1 = 1 BEGIN PRINT 1 END ELSE BEGIN PRINT 2 END",
+        "BEGIN TRY SELECT 1 END TRY\n-- a comment\nBEGIN CATCH THROW END CATCH",
+        "DECLARE @x int = 1\nIF @x = 1 lbl: ELSE PRINT 2",
+        "SELECT PARSE('1.5' AS decimal(10,2)) AS p",
+        "DECLARE @i int = 1\nSET @i += 1\nSELECT @i += 1",
+        "CREATE TABLE #t (id int NOT NULL PRIMARY KEY CLUSTERED, b int UNIQUE NONCLUSTERED, )",
+        "DECLARE @t TABLE (a int PRIMARY KEY CLUSTERED)",
+        "ALTER TABLE dbo.employees NOCHECK CONSTRAINT ALL",
+        "SELECT e.id FROM dbo.employees e INNER HASH JOIN dbo.departments d ON d.id = e.dept_id",
+        "UPDATE dbo.employees SET name.WRITE(N'x', NULL, NULL) WHERE id = 1",
+        "SELECT COUNT(*) FROM dbo.employees WITH (NOWAIT NOLOCK)",
+        "SELECT id AS N'job_id' FROM dbo.employees",
+        "WITH XMLNAMESPACES (N'urn:x' AS x) SELECT 1 AS a",
+        "IF 1 < = 2 PRINT 1",
+        "SELECT 0X00, {fn LCASE(N'A')}",
+        "SELECT * FROM ::fn_listextendedproperty(NULL, NULL, NULL, NULL, NULL, NULL, NULL)",
+        "DECLARE @r int\nSELECT @r = dbo.f2(N'x', DEFAULT)",
+        "GRANT SELECT ON OBJECT::dbo.employees TO public",
+        "DROP SYNONYM dbo.nope",
+    ];
+    for (n, body) in bodies.iter().enumerate() {
+        let sql = format!("CREATE PROCEDURE dbo.p{n} AS\nBEGIN\n{body}\nEND");
+        assert_eq!(errors(&sql), Vec::<String>::new(), "the checker: {sql}");
+        s.try_exec(&sql)
+            .await
+            .unwrap_or_else(|e| panic!("the server refused what the checker passes: {e}\n{sql}"));
+    }
+    let refused = [
+        "ELSE SELECT 1;\nSELECT 2;",
+        "BEGIN SELECT 1;\nSELECT 2;",
+        "BEGIN TRY SELECT 1 END TRY;\nBEGIN CATCH PRINT 1 END CATCH",
+        "SELECT 1\nEND\nSELECT 2;",
+        "SELECT 1\nTHROW 50000, 'x', 1;",
+        "MERGE dbo.employees AS t USING dbo.departments AS s ON t.id = s.id \
+         WHEN MATCHED THEN DELETE\nSELECT 1;",
+        "SELECT id FROM dbo.employees WHERE id *= 1;",
+        "SELECT * FROM dbo.employees option;",
+        "DECLARE @t TABLE (a int, );",
+        "SELECT e.id FROM dbo.employees e HASH JOIN dbo.departments d ON d.id = e.dept_id;",
+    ];
+    for sql in refused {
+        assert!(!errors(sql).is_empty(), "the checker passes: {sql}");
+        assert!(
+            s.try_exec(sql).await.is_err(),
+            "the server ran what the checker flags: {sql}"
+        );
+    }
+}
+
 /// The table `name` in `dbo`, as introspection reads it.
 async fn read_table(s: &Scratch, name: &str) -> schemaic_core::schema::TableInfo {
     let schema =
