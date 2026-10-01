@@ -8007,6 +8007,70 @@ fn is_session_source(r: &TableRef, dialect: SqlDialect) -> bool {
                 .any(|p| p.eq_ignore_ascii_case(&r.name)))
 }
 
+/// Can an `UPDATE`'s or `DELETE`'s **target name an alias** that the
+/// statement's own `FROM` defines — T-SQL's `UPDATE e SET … FROM employees
+/// e`, `DELETE e FROM employees e`? Elsewhere a write's target is a table
+/// (MySQL's multi-table `UPDATE a JOIN b` names tables), and a name spelled
+/// like an alias is still one to look up.
+fn write_target_may_name_an_alias(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+        SqlDialect::MsSql => true,
+    }
+}
+
+/// Where `sql[lo..hi]`'s write **target** begins — the name after `UPDATE
+/// [TOP (n)]` or `DELETE [TOP (n)] [FROM]`, a `WITH`'s CTEs first — when
+/// [`write_target_may_name_an_alias`]; otherwise, or for any other
+/// statement, `None`.
+fn write_target_at(sql: &str, lo: usize, hi: usize, dialect: SqlDialect) -> Option<usize> {
+    if !write_target_may_name_an_alias(dialect) {
+        return None;
+    }
+    let toks = tokenize_range(sql, lo, hi, dialect);
+    let word = |j: usize| tsql_keyword(&toks, j);
+    let lparen = |j: usize| matches!(toks.get(j).map(|t| &t.kind), Some(TkKind::LParen));
+    let verb = match word(0).as_deref() {
+        Some("UPDATE" | "DELETE") => 0,
+        Some("WITH") => {
+            let mut depth = 0usize;
+            let mut found = None;
+            for (k, t) in toks.iter().enumerate() {
+                match t.kind {
+                    TkKind::LParen => depth += 1,
+                    TkKind::RParen => depth = depth.saturating_sub(1),
+                    _ if depth == 0
+                        && matches!(word(k).as_deref(), Some("UPDATE" | "DELETE"))
+                        && !lparen(k + 1) =>
+                    {
+                        found = Some(k);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            found?
+        }
+        _ => return None,
+    };
+    let mut j = verb + 1;
+    if word(j).as_deref() == Some("TOP") && lparen(j + 1) {
+        j = matching_paren(&toks, j + 1)? + 1;
+    }
+    if word(verb).as_deref() == Some("DELETE") && word(j).as_deref() == Some("FROM") {
+        j += 1;
+    }
+    match toks.get(j) {
+        Some(
+            t @ Token {
+                kind: TkKind::Word(_),
+                ..
+            },
+        ) => Some(t.at),
+        _ => None,
+    }
+}
+
 /// Unknown-table checks: flag a FROM/JOIN/UPDATE/INTO table reference the catalog
 /// definitively doesn't contain (only when the relevant database is loaded).
 /// `asts` is what the caller's own `parse_sql` returned for `sql[lo..hi]` —
@@ -8050,18 +8114,23 @@ fn table_existence_checks(
         _ => HashSet::new(),
     };
     let refs = located_table_refs(sql, lo, hi, dialect);
-    // T-SQL's `UPDATE e SET … FROM employees e`: the `UPDATE` names an alias
-    // its own `FROM` defines, not a table.
+    // T-SQL's `UPDATE e SET … FROM employees e`: the write's target names an
+    // alias its own `FROM` defines, not a table — the target alone, and only
+    // where the dialect has that form.
     let aliases: HashSet<String> = refs
         .iter()
         .filter_map(|l| l.r.alias.as_ref().map(|a| a.to_ascii_lowercase()))
         .collect();
+    let target = if aliases.is_empty() {
+        None
+    } else {
+        write_target_at(sql, lo, hi, dialect)
+    };
     for l in refs {
         let bare = l.r.db.is_none() && l.database.is_none();
         let name = l.r.name.to_ascii_lowercase();
-        if (bare && (ctes.contains(&name) || aliases.contains(&name)))
-            || is_session_source(&l.r, dialect)
-        {
+        let names_an_alias = target == Some(l.pos.0) && aliases.contains(&name);
+        if (bare && (ctes.contains(&name) || names_an_alias)) || is_session_source(&l.r, dialect) {
             continue;
         }
         let Some(r) = catalog.resolve_located(&l) else {
@@ -14820,6 +14889,64 @@ mod tests {
         for s in crate::snippet::builtins(SqlDialect::MsSql) {
             let d = diag_d(&s.body, SqlDialect::MsSql);
             assert!(d.is_empty(), "{}: {d:?}", s.name);
+        }
+    }
+
+    /// **Only a T-SQL write's target may name an alias its own `FROM`
+    /// defines** (S7.2-L1-09). The exemption for `UPDATE e … FROM employees
+    /// e` skipped every bare reference spelled like any alias in the
+    /// statement, on every engine, so a missing table that happened to share
+    /// an alias's name was never reported — each engine refuses these.
+    #[test]
+    fn only_a_write_target_may_name_its_own_alias() {
+        for (sql, dialect, want) in [
+            (
+                "SELECT * FROM employees nosuch, nosuch;",
+                SqlDialect::Postgres,
+                "nosuch",
+            ),
+            (
+                "SELECT * FROM nosuchtable employees, employees nosuchtable;",
+                SqlDialect::MySql,
+                "nosuchtable",
+            ),
+            (
+                "SELECT * FROM [nosuch] departments, departments nosuch;",
+                SqlDialect::Sqlite,
+                "nosuch",
+            ),
+            (
+                "SELECT * FROM employees nosuch, nosuch;",
+                SqlDialect::MsSql,
+                "nosuch",
+            ),
+            (
+                "UPDATE employees SET name = N'x' FROM nosuch JOIN employees nosuch ON 1 = 1;",
+                SqlDialect::MsSql,
+                "nosuch",
+            ),
+            // MySQL's multi-table `UPDATE` names tables, never another's alias.
+            (
+                "UPDATE e JOIN employees e ON 1 = 1 SET e.name = 'x';",
+                SqlDialect::MySql,
+                "e",
+            ),
+        ] {
+            let d = diag_d(sql, dialect);
+            assert!(
+                d.iter()
+                    .any(|x| x.message == format!("Table `{want}` not found")),
+                "{dialect:?} {sql}: {d:?}"
+            );
+        }
+        for sql in [
+            "UPDATE e SET e.name = d.name FROM employees e JOIN departments d ON d.id = e.dept_id;",
+            "UPDATE TOP (5) e SET e.name = N'x' FROM employees e;",
+            "DELETE e FROM employees e WHERE e.id = 1;",
+            "DELETE FROM e FROM employees e JOIN departments d ON d.id = e.dept_id;",
+        ] {
+            let d = diag_d(sql, SqlDialect::MsSql);
+            assert!(d.is_empty(), "{sql}: {d:?}");
         }
     }
 

@@ -1060,7 +1060,12 @@ existing prose was left alone.
     way and skips a prefixed name). `is_session_source` exempts a temporary table, a table
     variable and `pseudo_tables` — T-SQL's `inserted`/`deleted`, which every trigger reads and the
     typo check also exempts — from the table check, which cannot judge absent what lives in the
-    session; the per-dialect list is empty where trigger rows are `NEW`/`OLD` records. With the
+    session; the per-dialect list is empty where trigger rows are `NEW`/`OLD` records. A T-SQL
+    write's target may name the alias its own `FROM` defines (`UPDATE e SET … FROM employees e`),
+    so `write_target_at` exempts that target alone, where `write_target_may_name_an_alias` (an
+    exhaustive per-dialect `match`, SQL Server's alone — MySQL's multi-table `UPDATE` names
+    tables); exempting every bare reference spelled like any alias in the statement hid a missing
+    table on all four engines (`only_a_write_target_may_name_its_own_alias`). With the
     sigil kept, `as_declares_a_type` passes the `AS` of `DECLARE @t AS TABLE (…)` (`TABLE` is
     reserved): the word before it is a variable and the nearest statement head is `DECLARE`,
     `CREATE` or `ALTER` (`declaring_contexts`, one forward pass), so `SELECT @x AS order` is still
