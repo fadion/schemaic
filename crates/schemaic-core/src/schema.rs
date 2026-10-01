@@ -5106,10 +5106,35 @@ impl ObjectItem {
             // A SQL Server numbered group's other members follow the head, as
             // stored and inside the group's settings — see
             // `ddl::routine_create_statements`; empty everywhere else.
-            ObjectItem::Routine(r) => crate::ddl::client_script(
-                &crate::ddl::routine_create_statements(r, dialect, true),
-                dialect,
-            ),
+            //
+            // **A signed module says the signature is not in the script**, as
+            // `tsql_create_ddl` says what a table's cannot restate: no script
+            // carries `ADD SIGNATURE`, so the copy is created unsigned and every
+            // call that leant on the certificate's rights fails on permissions.
+            // A statement of its own, closed by its own `GO`: a comment in the
+            // `CREATE`'s batch would be stored as part of the module.
+            ObjectItem::Routine(r) => {
+                let mut stmts: Vec<String> = r
+                    .tsql
+                    .module
+                    .signed
+                    .then(|| {
+                        format!(
+                            "-- NOTE: {} {} is signed, and the signature is not in this script: it \
+                             is created unsigned. Sign it again (ADD SIGNATURE) after running this.",
+                            r.kind.label(),
+                            crate::export::comment_text(&qualified_ident(
+                                &r.name,
+                                r.schema.as_deref(),
+                                dialect
+                            ))
+                        )
+                    })
+                    .into_iter()
+                    .collect();
+                stmts.extend(crate::ddl::routine_create_statements(r, dialect, true));
+                crate::ddl::client_script(&stmts, dialect)
+            }
             // Through `client_script` for the same reason a routine is: this
             // `CREATE` carries no terminator of its own (the apply path sends it
             // whole) and its body may be a `BEGIN … END` full of `;`.
@@ -9725,6 +9750,36 @@ mod tests {
             syn.create_sql(),
             "CREATE SYNONYM [Sequences].[s] FOR [other].[dbo].[t]]x];"
         );
+    }
+
+    /// **Copy DDL of a signed routine says the signature is not in it.** No
+    /// script carries `ADD SIGNATURE`, so the copy is created unsigned and a
+    /// call leaning on the certificate's rights fails on permissions — and
+    /// the script said nothing. The note is a batch of its own, since a
+    /// comment in the `CREATE`'s batch would be stored with the module.
+    #[test]
+    fn copy_ddl_of_a_signed_routine_says_the_signature_is_not_in_it() {
+        let d = crate::intel::SqlDialect::MsSql;
+        let mut r = RoutineInfo {
+            name: "p".into(),
+            schema: Some("dbo".into()),
+            kind: RoutineKind::Procedure,
+            language: "SQL".into(),
+            body: "SELECT 1 AS n;".into(),
+            ..Default::default()
+        };
+        let plain = ObjectItem::Routine(std::sync::Arc::new(r.clone())).create_sql(d);
+        assert!(!plain.contains("signed"), "{plain}");
+        r.tsql.module.signed = true;
+        let signed = ObjectItem::Routine(std::sync::Arc::new(r)).create_sql(d);
+        let note = signed
+            .find("-- NOTE: procedure [dbo].[p] is signed, and the signature is not in this script")
+            .unwrap_or_else(|| panic!("{signed}"));
+        let create = signed
+            .find("CREATE PROCEDURE [dbo].[p]")
+            .expect("the CREATE");
+        assert!(note < create, "{signed}");
+        assert!(signed[note..create].contains("\nGO\n"), "{signed}");
     }
 
     /// **A synonym's target keeps its parts in their places.** `db..t` —

@@ -8393,6 +8393,11 @@ existing prose was left alone.
     the draft's, which in a comparison is the source's
     (`a_signature_alone_is_not_a_difference`, `an_alter_names_the_targets_signature_it_strips`,
     under `compare.rs`; live, `a_comparison_leaves_a_signature_out_of_the_difference`).
+    **Copy DDL and the dump say so of a signed routine**: `ObjectItem::create_sql` writes `-- NOTE: … is signed, and the
+    signature is not in this script` ahead of its `CREATE`, a batch of its own, since a comment in
+    the `CREATE`'s batch would be stored as part of the module
+    (`copy_ddl_of_a_signed_routine_says_the_signature_is_not_in_it`; live, in
+    `a_replay_drops_no_module_it_cannot_restate_whole`).
     `TableInfo::create_ddl` — `CREATE TABLE`/`VIEW`, built on the
     above; its **view** branch delegates to `ddl::view_ddl` so Copy DDL, the MCP table-info tool
     and the apply path all emit through one view emitter (it used to have its own, which restated

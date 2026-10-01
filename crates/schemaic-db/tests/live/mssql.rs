@@ -1439,6 +1439,11 @@ async fn a_replay_drops_no_module_it_cannot_restate_whole() {
         .await;
     }
     let file = Box::pin(dump_file(&s, DumpOptions::default())).await;
+    // And the file says the signature is not in it.
+    assert!(
+        file.contains("-- NOTE: procedure [dbo].[ok] is signed, and the signature is not in"),
+        "{file}"
+    );
     let end = Box::pin(restore_file(&s, &file)).await;
     assert!(refused(&end, "signed"), "{end:?}\n{file}");
     assert_eq!(s.scalar(present).await, "1021", "{file}");
