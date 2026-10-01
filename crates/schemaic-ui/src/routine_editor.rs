@@ -652,7 +652,10 @@ fn routine_form(ui: DdlUi, target: &RoutineTarget, ring: FocusRing) -> AnyView {
             use schemaic_core::schema::{ExecuteAs, TsqlRoutineOption as O};
             let shape = draft.info.tsql_shape();
             let original = draft.info.tsql.clone();
-            if !is_function {
+            let with = draft.info.tsql.options.clone();
+            // Asked of the shape like the rest: a natively compiled procedure
+            // refuses it (Msg 10794).
+            if shape.allows(&O::Recompile, &with) {
                 options.push(bound_toggle(
                     d,
                     "Recompile",
@@ -663,7 +666,6 @@ fn routine_form(ui: DdlUi, target: &RoutineTarget, ring: FocusRing) -> AnyView {
                     |d, v| d.info.tsql.set_option(O::Recompile, v),
                 ));
             }
-            let with = draft.info.tsql.options.clone();
             // Not on an ordinary procedure, which SQL Server refuses it on
             // (Msg 10796) — only a natively compiled one takes it.
             if shape.allows(&O::SchemaBinding, &with) {

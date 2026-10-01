@@ -3160,6 +3160,81 @@ async fn a_comment_where_a_modules_header_parts_meet_survives_its_rebuild() {
     assert_eq!(s.scalar("SELECT a FROM dbo.f_rows(4)").await, "4");
 }
 
+/// **A natively compiled module refuses `RECOMPILE` and `RETURNS NULL ON
+/// NULL INPUT`** (Msg 10794), and the routine form offered both: the
+/// validator passed, the preview showed the statement and Apply failed at
+/// the server. Here the validator refuses each, and the server, given the
+/// plan anyway, refuses it too — while the options the validator lets
+/// through (`CALLED ON NULL INPUT`) apply.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_natively_compiled_module_is_refused_what_the_server_refuses() {
+    use schemaic_core::ddl::{RoutineDraft, diff_routine};
+    use schemaic_core::schema::TsqlRoutineOption as O;
+    if !enabled() || azure_cannot("adds a memory-optimised filegroup to the database") {
+        return;
+    }
+    let s = Scratch::create("ddl_native").await;
+    base_db()
+        .fetch_query(
+            None,
+            &format!(
+                "ALTER DATABASE [{n}] ADD FILEGROUP mo CONTAINS MEMORY_OPTIMIZED_DATA; \
+                 DECLARE @path nvarchar(400) = CONCAT(CAST(SERVERPROPERTY('InstanceDefaultDataPath') \
+                 AS nvarchar(300)), N'{n}_mo'); \
+                 EXEC (N'ALTER DATABASE [{n}] ADD FILE (NAME = N''mo'', FILENAME = N''' + @path \
+                 + N''') TO FILEGROUP mo')",
+                n = s.name
+            ),
+            1,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("a memory-optimised filegroup");
+    let atomic =
+        "BEGIN ATOMIC WITH (TRANSACTION ISOLATION LEVEL = SNAPSHOT, LANGUAGE = N'us_english')";
+    s.exec(&format!(
+        "CREATE PROCEDURE dbo.np WITH NATIVE_COMPILATION, SCHEMABINDING AS {atomic} SELECT 1 AS x END"
+    ))
+    .await;
+    s.exec(&format!(
+        "CREATE FUNCTION dbo.nf (@a int) RETURNS int WITH NATIVE_COMPILATION, SCHEMABINDING AS \
+         {atomic} RETURN @a END"
+    ))
+    .await;
+    let all =
+        s.db.fetch_schema(&s.name, CancellationToken::new())
+            .await
+            .unwrap()
+            .routines;
+    let find = |n: &str| all.iter().find(|r| r.name == n).unwrap().as_ref().clone();
+    for (name, add, refused) in [
+        ("np", O::Recompile, true),
+        ("nf", O::ReturnsNullOnNullInput, true),
+        ("nf", O::CalledOnNullInput, false),
+    ] {
+        let r = find(name);
+        assert!(r.tsql.has_option(&O::NativeCompilation), "{r:?}");
+        let mut d = RoutineDraft::from_info(&r);
+        d.info.tsql.options.push(add.clone());
+        let errs = d.validate(MS);
+        assert_eq!(!errs.is_empty(), refused, "{name} {add:?}: {errs:?}");
+        // Run outside a transaction: inside one, any DDL on a natively
+        // compiled module is Msg 12331, which would hide the answer asked.
+        let stmts = diff_routine(&r, &d, MS).emit();
+        assert_eq!(stmts.len(), 1, "{stmts:#?}");
+        let ran = s.try_exec(&stmts[0]).await;
+        assert_eq!(
+            ran.is_err(),
+            refused,
+            "{name} {add:?}: {:?}\n{stmts:#?}",
+            ran.err()
+        );
+        if let Err(e) = ran {
+            assert!(e.to_string().contains("10794"), "{e}");
+        }
+    }
+}
+
 /// **A module created under `ANSI_NULLS OFF` or `QUOTED_IDENTIFIER OFF`
 /// keeps it through an edit.** `CREATE` has no clause for either; the module
 /// takes the session's, and Schemaic's is an ANSI-defaults one, so an edit

@@ -1597,11 +1597,21 @@ impl RoutineDraft {
                 let shape = f.tsql_shape();
                 for opt in &f.tsql.options {
                     if !shape.allows(opt, &f.tsql.options) {
-                        out.push(format!(
-                            "{} can't take WITH {}.",
-                            shape.label_capitalised(),
-                            opt.sql()
-                        ));
+                        // Refused for the rest of the list, not the shape: a
+                        // natively compiled module's (Msg 10794).
+                        out.push(if shape.allows(opt, &[]) {
+                            format!(
+                                "{} can't take WITH {} once it is natively compiled.",
+                                shape.label_capitalised(),
+                                opt.sql()
+                            )
+                        } else {
+                            format!(
+                                "{} can't take WITH {}.",
+                                shape.label_capitalised(),
+                                opt.sql()
+                            )
+                        });
                     }
                 }
                 // Msg 10796's other half: a natively compiled module is
@@ -28076,6 +28086,30 @@ mod tsql_routine_plan_tests {
         assert!(!TsqlShape::Procedure.allows(&O::SchemaBinding, plain));
         assert!(TsqlShape::Procedure.allows(&O::SchemaBinding, &[O::NativeCompilation]));
         assert!(TsqlShape::Scalar.allows(&O::SchemaBinding, plain));
+
+        // **A natively compiled module refuses `RECOMPILE` and `RETURNS NULL
+        // ON NULL INPUT`** (Msg 10794, *not supported with natively compiled
+        // modules*; 2022 and 2025 alike), and the form offered both
+        // (S6.1-L1-04). `CALLED ON NULL INPUT` and `EXECUTE AS` it takes.
+        let native = vec![O::NativeCompilation, O::SchemaBinding];
+        let with = |mut v: Vec<O>, o: O| {
+            v.push(o);
+            v
+        };
+        let errs = proc_with(with(native.clone(), O::Recompile));
+        assert!(errs.iter().any(|e| e.contains("RECOMPILE")), "{errs:?}");
+        let errs = fn_with("int", with(native.clone(), O::ReturnsNullOnNullInput));
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("RETURNS NULL ON NULL INPUT")),
+            "{errs:?}"
+        );
+        assert!(fn_with("int", with(native.clone(), O::CalledOnNullInput)).is_empty());
+        assert!(proc_with(vec![O::Recompile]).is_empty());
+        assert!(!TsqlShape::Procedure.allows(&O::Recompile, &native));
+        assert!(TsqlShape::Procedure.allows(&O::Recompile, plain));
+        assert!(!TsqlShape::Scalar.allows(&O::ReturnsNullOnNullInput, &native));
+        assert!(TsqlShape::Scalar.allows(&O::ReturnsNullOnNullInput, plain));
     }
 }
 

@@ -2524,18 +2524,21 @@ impl TsqlShape {
     /// function takes it alone. The converse — a natively compiled module
     /// *needs* `SCHEMABINDING` — is not a shape's refusal but a missing
     /// option, and `RoutineDraft::validate` says it as one.
+    ///
+    /// **And a natively compiled module refuses `RECOMPILE` and `RETURNS NULL
+    /// ON NULL INPUT`** — Msg 10794, *not supported with natively compiled
+    /// modules*, measured on 2022 and 2025 — where it takes `EXECUTE AS`,
+    /// `INLINE` and `CALLED ON NULL INPUT`.
     pub fn allows(self, opt: &TsqlRoutineOption, with: &[TsqlRoutineOption]) -> bool {
         use TsqlRoutineOption as O;
+        let native = with.contains(&O::NativeCompilation);
         match opt {
-            O::SchemaBinding => {
-                self != TsqlShape::Procedure || with.contains(&O::NativeCompilation)
-            }
+            O::SchemaBinding => self != TsqlShape::Procedure || native,
             O::NativeCompilation => self != TsqlShape::MultiStatementTable,
-            O::Recompile => self == TsqlShape::Procedure,
+            O::Recompile => self == TsqlShape::Procedure && !native,
             O::ExecuteAs(_) => self != TsqlShape::InlineTable,
-            O::ReturnsNullOnNullInput | O::CalledOnNullInput | O::Inline(_) => {
-                self == TsqlShape::Scalar
-            }
+            O::ReturnsNullOnNullInput => self == TsqlShape::Scalar && !native,
+            O::CalledOnNullInput | O::Inline(_) => self == TsqlShape::Scalar,
         }
     }
 }

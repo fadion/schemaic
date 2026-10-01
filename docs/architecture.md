@@ -8625,15 +8625,20 @@ existing prose was left alone.
     `TsqlShape::allows`, measured on SQL Server 2022, gives an inline table-valued function none of
     `EXECUTE AS`, the null-input clauses or `INLINE`, a multi-statement one `EXECUTE AS` alone of
     them and no `NATIVE_COMPILATION`, and `RECOMPILE` to a procedure only — pinned through the validator that asks it
-    (`a_sql_server_routine_option_its_shape_refuses_is_refused`, under `ddl.rs`). **One cell asks
+    (`a_sql_server_routine_option_its_shape_refuses_is_refused`, under `ddl.rs`). **Three cells ask
     the rest of the `WITH` list**, which is why `allows` takes it: a procedure takes `SCHEMABINDING`
     only when natively compiled (Msg 10796, *supported only for natively compiled modules, and
-    required for those modules*, 2022 and 2025 alike), where every function takes it alone. The
-    cell was once `true` for every shape and never measured, so the form offered the toggle on an
-    ordinary procedure and Apply failed at the server; the message's other half — a natively
-    compiled module without `SCHEMABINDING` — is a missing option rather than a refused one, and the
+    required for those modules*, 2022 and 2025 alike), where every function takes it alone; and a
+    natively compiled module takes neither `RECOMPILE` nor `RETURNS NULL ON NULL INPUT` (Msg 10794,
+    *not supported with natively compiled modules*, both versions), though it takes `EXECUTE AS`,
+    `INLINE` and `CALLED ON NULL INPUT`. Each cell was once answered by the shape alone, so the form
+    offered the toggle and Apply failed at the server — the Recompile toggle did not ask `allows`
+    at all, and asks it now like the others. The validator says *once it is natively compiled*
+    when the shape alone would take the option; the message's other half — a natively compiled
+    module without `SCHEMABINDING` — is a missing option rather than a refused one, and the
     validator names it separately
-    (`schema_binding_on_a_procedure_is_refused_unless_it_is_natively_compiled`). It is also what `ddl::routine_signature_changed`
+    (`schema_binding_on_a_procedure_is_refused_unless_it_is_natively_compiled`; live,
+    `a_natively_compiled_module_is_refused_what_the_server_refuses`). It is also what `ddl::routine_signature_changed`
     compares, so one reading of the shape answers both questions. `verbatim` and `hidden` are the trigger's two
     fallbacks: the stored text restated whole when the parts could not read its header, a comment
     line saying so when the server shows no text (`WITH ENCRYPTION`, or no `VIEW DEFINITION`)
