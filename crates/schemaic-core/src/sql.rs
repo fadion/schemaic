@@ -1146,6 +1146,25 @@ pub fn statement_bounds_open(sql: &str, dialect: SqlDialect, state: &mut ScanSta
     scan_bounds(sql, dialect, &mut state.delim, false, None)
 }
 
+/// [`statement_bounds_open`] for the **last** chunk of a script: the end of
+/// `sql` is the end of the input, so nothing waits for more — a final `GO`
+/// with no newline is a separator, and a `;` with nothing after it ends its
+/// statement — and the end itself closes the last statement.
+pub fn statement_bounds_closing(
+    sql: &str,
+    dialect: SqlDialect,
+    state: &mut ScanState,
+) -> Vec<Bound> {
+    let mut bounds = scan_bounds(sql, dialect, &mut state.delim, true, None);
+    if bounds.last().is_none_or(|b| b.at < sql.len()) {
+        bounds.push(Bound {
+            at: sql.len(),
+            strip: 0,
+        });
+    }
+    bounds
+}
+
 /// Byte offsets bounding each top-level statement: `[0, after-`;`, …, len]`.
 /// `;` inside strings / identifiers / comments does not split, on MySQL a
 /// `DELIMITER` directive changes what does (see [`delimiter_directive`]), and on

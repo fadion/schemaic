@@ -9327,9 +9327,14 @@ existing prose was left alone.
     sent" that both paths ask. Confirmed against MariaDB: `CREATE TRIGGER … END$$` is a 1064,
     `… END` creates the trigger.
     `Splitter` is the whole of it: `push` takes the next block's **bytes** and returns the
-    `Statement`s it completed, `finish` yields the last one (a script's final statement need not
+    `Statement`s it completed, `finish` yields what is left (a script's final statement need not
     carry a terminator, and a runner that dropped it would replay a dump one statement short,
-    silently). The splitting itself is `sql::statement_bounds_open` — the one boundary lexer, made
+    silently). `finish` rescans the tail **as the end of the input**
+    (`sql::statement_bounds_closing`) and may yield more than one: mid-file a `GO` line with no
+    newline may still become `GOTO`, and a `;` whose next word has not arrived cannot yet say
+    whether an `ELSE` follows, so the scan waits — and the tail it waited with was sent whole, `GO`
+    and all, when `finish` returned it as one statement
+    (`a_last_go_with_no_newline_is_never_sent`). The splitting itself is `sql::statement_bounds_open` — the one boundary lexer, made
     resumable — so what this module owns is the *discipline* around it: **it only ever drains up to
     a boundary the scan actually found.** That single rule is what makes a block boundary landing
     inside a string, a comment, a dollar-quoted body or a `DELIMITER` directive a non-event: an

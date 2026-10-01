@@ -170,10 +170,10 @@ fn read(
     }
 
     // The last statement need not carry a terminator.
-    if let Some(stmt) = splitter.finish()
-        && tx.blocking_send(stmt).is_err()
-    {
-        return ReadEnd::Stopped;
+    for stmt in splitter.finish() {
+        if tx.blocking_send(stmt).is_err() {
+            return ReadEnd::Stopped;
+        }
     }
     let _ = progress.send(ScriptProgress {
         bytes_done: splitter.consumed(),

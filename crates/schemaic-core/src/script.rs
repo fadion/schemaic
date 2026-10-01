@@ -246,29 +246,39 @@ impl Splitter {
         out
     }
 
-    /// The end of the file: whatever is still held is the last statement, whether
-    /// or not it carries a terminator.
+    /// The end of the file: whatever is still held, scanned once more **as the
+    /// end of the input** — the last statement, whether or not it carries a
+    /// terminator, and any a mid-file scan held back waiting for more.
+    ///
+    /// Not one statement: a buffer the chunked scan could not cut — a final
+    /// `GO` with no newline after it, which mid-file may still become `GOTO`,
+    /// or a `;` whose next word had not arrived — is cut here, and was sent
+    /// whole, `GO` and all, when this returned the tail as one statement.
     ///
     /// Also flushes a trailing incomplete UTF-8 sequence as `U+FFFD` — a file
     /// that ends mid-character is truncated, and losing the last character is a
     /// better report than losing the last statement.
-    pub fn finish(&mut self) -> Option<Statement> {
+    pub fn finish(&mut self) -> Vec<Statement> {
         if !self.carry.is_empty() {
             self.carry.clear();
             self.buf.push('\u{FFFD}');
         }
-        let lo = sql::trim_range(&self.buf, 0, self.buf.len()).0;
-        // No terminator was found, so there is none to strip — but the same
-        // function decides what counts as a statement.
-        let end = sql::Bound {
-            at: self.buf.len(),
-            strip: 0,
-        };
-        let out = sql::executable_range(&self.buf, 0, end, self.dialect).map(|text| Statement {
-            sql: text.to_string(),
-            line: self.line + newlines(&self.buf[..lo]) as u64,
-            offset: self.offset + lo as u64,
-        });
+        let bounds = sql::statement_bounds_closing(&self.buf, self.dialect, &mut self.state);
+        let mut out = Vec::new();
+        let mut walked = 0usize;
+        let mut line = self.line;
+        for w in bounds.windows(2) {
+            let lo = sql::trim_range(&self.buf, w[0].at, w[1].at).0;
+            line += newlines(&self.buf[walked..lo]) as u64;
+            walked = lo;
+            if let Some(text) = sql::executable_range(&self.buf, w[0].at, w[1], self.dialect) {
+                out.push(Statement {
+                    sql: text.to_string(),
+                    line,
+                    offset: self.offset + lo as u64,
+                });
+            }
+        }
         self.offset += self.buf.len() as u64;
         self.buf.clear();
         out
@@ -1116,6 +1126,34 @@ mod tests {
             let stmts = run(sql, SqlDialect::MySql, block);
             assert_eq!(stmts.len(), 1, "at a {block}-byte read");
             assert_eq!(stmts[0].sql, sql, "at a {block}-byte read");
+        }
+    }
+
+    /// **A final `GO` with no newline after it is still a separator.** Mid-file
+    /// such a line may be the front of `GOTO`, so the scan waits for more; at
+    /// the end of the file there is no more, and the tail went to the server
+    /// whole, `GO` and all — "Incorrect syntax near 'GO'" on Copy DDL text
+    /// ending `…;\nGO`. Cut anywhere, the answer is the whole-file one.
+    #[test]
+    fn a_last_go_with_no_newline_is_never_sent() {
+        let d = SqlDialect::MsSql;
+        for file in [
+            "SELECT 1;\nGO",
+            "CREATE PROCEDURE p AS SELECT 1;\nGO",
+            "SELECT 1\nGO",
+            "IF 1 = 1 SELECT 1;\nGO",
+        ] {
+            for chunk in [1, 3, 7, 64] {
+                let mut sp = Splitter::new(d);
+                let mut out = Vec::new();
+                for piece in file.as_bytes().chunks(chunk) {
+                    out.extend(sp.push(piece));
+                }
+                out.extend(sp.finish());
+                let sqls: Vec<&str> = out.iter().map(|s| s.sql.as_str()).collect();
+                assert_eq!(sqls.len(), 1, "{file:?} chunk {chunk}: {sqls:?}");
+                assert!(!sqls[0].contains("GO"), "{file:?} chunk {chunk}: {sqls:?}");
+            }
         }
     }
 
