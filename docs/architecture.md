@@ -7193,8 +7193,17 @@ existing prose was left alone.
     error: that the rolled-back transaction's statements are undone, and that the doomed one can
     only be rolled back (`a_rolled_back_transaction_is_disclosed`).
     **The fold from the probe's answer is `settle_from_server(stmt, was_open, trancount,
-    xact_state)`**, pure here and pinned arm by arm (`sql_servers_answer_folds_into_the_outcome`);
-    it had lived in the session, with no test but a live one exercising a single failure. **No
+    xact_state, commits)`**, pure here and pinned arm by arm (`sql_servers_answer_folds_into_the_outcome`);
+    it had lived in the session, with no test but a live one exercising a single failure.
+    **`@@TRANCOUNT` of 0 reads the same after a commit as after a rollback**, so `commits` —
+    `text_commits`, a `COMMIT` among the statement's `sql::tsql_statements` — turns a failure over a
+    closed transaction into `StmtOutcome::FailedAfterCommit` (→ `Idle`), whose sentence says what
+    came before the `COMMIT` is likely committed. A T-SQL piece is a batch, and from a `DECLARE`
+    the rest of it is one piece, so `DECLARE @id int = 1; UPDATE …; COMMIT; SELECT 1/0;` failed as
+    one and was reported as undoing a debit another connection could read; a user who believed it
+    ran the debit twice (`a_failure_after_a_pieces_own_commit_is_not_reported_rolled_back`; live,
+    `a_piece_that_commits_then_fails_is_not_reported_rolled_back`, on 2022 and 2025). A `COMMIT`
+    inside a procedure the piece calls is out of the text's sight and folds as before. **No
     success folds to doomed, and that is not a missing arm.** A review expected one — a `TRY …
     CATCH` that catches a dooming error raises nothing itself — but every operation the session
     runs is its own batch, and SQL Server rolls back an uncommittable transaction when its batch
@@ -12670,7 +12679,9 @@ existing prose was left alone.
   `tx_state` reads `@@TRANCOUNT` and `XACT_STATE()` in one round trip, and
   `Session::settle_from_server` sets `in_tx` from the count and folds the answer into the outcome
   through `tx::settle_from_server` (under `core::tx`) — a success with the count at 0 after an open
-  transaction is `OkAndClosed`, a failure there `FailedAndRolledBack`, a failure with the state at
+  transaction is `OkAndClosed`, a failure there `FailedAndRolledBack` — or `FailedAfterCommit`
+  when the user's statement holds a `COMMIT` of its own (`tx::text_commits`, which only
+  `fetch_query` passes) — a failure with the state at
   -1 `FailedAndDoomed`, and a probe nobody answers leaves everything as it was. `tx_state` and
   `spid` read their rows with `try_get`, never `get`, which unwraps: a reply of the wrong shape —
   a connection out of step answering an earlier request — panicked the run task rather than

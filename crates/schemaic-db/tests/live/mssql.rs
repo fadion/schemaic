@@ -4816,6 +4816,42 @@ async fn a_failure_is_folded_as_the_server_left_the_transaction() {
     session.close().await;
 }
 
+/// **A piece that commits and then fails is not reported rolled back.** From
+/// its `DECLARE` the text is one piece, so its `COMMIT` and the failure after
+/// it reach the server as one batch, and `@@TRANCOUNT` then reads 0 exactly as
+/// after a rollback. The tab said "every statement in it since it began is
+/// undone" over a debit another connection could read.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_piece_that_commits_then_fails_is_not_reported_rolled_back() {
+    use schemaic_core::tx::StmtOutcome;
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("tx_commit_fail").await;
+    s.exec("CREATE TABLE dbo.t (id int NOT NULL PRIMARY KEY, bal int NOT NULL); INSERT dbo.t VALUES (1, 100)")
+        .await;
+    let pieces = schemaic_core::sql::executable_statements(
+        "DECLARE @id int = 1;\nUPDATE dbo.t SET bal = bal - 10 WHERE id = @id;\nCOMMIT;\n\
+         SELECT 1/0 AS boom;",
+        MS,
+    );
+    assert_eq!(pieces.len(), 1, "{pieces:#?}");
+    let session = manual(&s).await;
+    let out = session
+        .fetch_query(&pieces[0], 10, CancellationToken::new())
+        .await;
+    assert_eq!(out.stmt, StmtOutcome::FailedAfterCommit, "{:?}", out.result);
+    let err = out.result.expect_err("the divide by zero");
+    let shown = schemaic_core::tx::failed_message(&err.to_string(), out.stmt);
+    assert!(shown.contains("likely committed"), "{shown}");
+    session.close().await;
+    assert_eq!(
+        s.scalar("SELECT bal FROM dbo.t WHERE id = 1").await,
+        "90",
+        "the debit is committed"
+    );
+}
+
 /// **A grid edit on the pinned session is part of the transaction**, and a
 /// batch that fails is undone alone: the earlier statement survives, the
 /// failure is isolated, and a rollback undoes the lot.

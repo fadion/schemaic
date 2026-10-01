@@ -819,7 +819,11 @@ impl Session {
         // can decide it there.
         if tx::probes_after_every_statement(self.tx_engine()) {
             if out.stmt != StmtOutcome::ConnectionLost {
-                self.settle_from_server(&mut guard, &mut out.stmt).await;
+                // A piece is a batch, and one that committed before it failed
+                // leaves `@@TRANCOUNT` at 0 just as a rollback does.
+                let commits = tx::text_commits(self.tx_engine(), sql);
+                self.settle_from_server(&mut guard, &mut out.stmt, commits)
+                    .await;
             }
             return out;
         }
@@ -971,8 +975,10 @@ impl Session {
     /// the one probe `tx::probes_after_every_statement` names, asked after
     /// every operation on this engine because no text can decide it. The fold
     /// itself is `tx::settle_from_server`, pure and tested arm by arm; a probe
-    /// that cannot be answered leaves everything as it was.
-    async fn settle_from_server(&self, guard: &mut Backend, stmt: &mut StmtOutcome) {
+    /// that cannot be answered leaves everything as it was. `commits` is
+    /// `tx::text_commits` of the user's statement — `false` for the session's
+    /// own operations, which never commit.
+    async fn settle_from_server(&self, guard: &mut Backend, stmt: &mut StmtOutcome, commits: bool) {
         let Backend::MsSql { client } = guard else {
             return;
         };
@@ -981,7 +987,7 @@ impl Session {
         };
         let was_open = self.in_tx.load(Ordering::SeqCst);
         self.in_tx.store(count > 0, Ordering::SeqCst);
-        *stmt = tx::settle_from_server(*stmt, was_open, count, state);
+        *stmt = tx::settle_from_server(*stmt, was_open, count, state, commits);
     }
 
     /// This session's engine, in the vocabulary `schemaic_core::tx` speaks.
@@ -1085,7 +1091,8 @@ impl Session {
                     s => s,
                 };
                 if out.stmt != StmtOutcome::ConnectionLost {
-                    self.settle_from_server(&mut guard, &mut out.stmt).await;
+                    self.settle_from_server(&mut guard, &mut out.stmt, false)
+                        .await;
                 }
                 return out;
             }
@@ -1174,7 +1181,8 @@ impl Session {
         if tx::probes_after_every_statement(self.tx_engine())
             && out.stmt != StmtOutcome::ConnectionLost
         {
-            self.settle_from_server(&mut guard, &mut out.stmt).await;
+            self.settle_from_server(&mut guard, &mut out.stmt, false)
+                .await;
         }
         out.into_read(in_tx())
     }
@@ -1242,7 +1250,8 @@ impl Session {
         if tx::probes_after_every_statement(self.tx_engine())
             && out.stmt != StmtOutcome::ConnectionLost
         {
-            self.settle_from_server(&mut guard, &mut out.stmt).await;
+            self.settle_from_server(&mut guard, &mut out.stmt, false)
+                .await;
         }
         out.into_read(self.in_tx.load(Ordering::SeqCst))
     }

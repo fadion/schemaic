@@ -174,6 +174,20 @@ pub enum StmtOutcome {
     /// `ROLLBACK` ends it — PostgreSQL's aborted state by another name, and
     /// folded to the same [`TxState::Poisoned`].
     FailedAndDoomed,
+    /// It failed or was cancelled over a transaction that is gone, **and its
+    /// own text committed** — so what it did before the failure is likely
+    /// permanent, not undone.
+    ///
+    /// [`FailedAndRolledBack`](Self::FailedAndRolledBack) is the server's
+    /// answer `@@TRANCOUNT` of 0 reads as, and it reads the same after a
+    /// commit: a T-SQL piece is a batch, and from a `DECLARE` the rest of the
+    /// batch is one piece, so `DECLARE @id int = 1; UPDATE …; COMMIT; SELECT
+    /// 1/0;` failed over a closed transaction and was reported as undoing the
+    /// `UPDATE` another connection could already read (measured on 2022). A
+    /// user who believed it ran the debit twice. The text says a `COMMIT` ran
+    /// or may have run, and the probe cannot tell which, so the disclosure
+    /// says so rather than either certainty ([`failed_message`]).
+    FailedAfterCommit,
     /// It **succeeded**, and the transaction it was inside is gone — as reported
     /// by the connection rather than read off the statement.
     ///
@@ -400,8 +414,11 @@ impl TxState {
                         TxEngine::MySql | TxEngine::MsSql => TxState::Open { stmts },
                     },
                     // The server rolled it back — see
-                    // [`StmtOutcome::FailedAndRolledBack`].
-                    StmtOutcome::FailedAndRolledBack => TxState::Idle,
+                    // [`StmtOutcome::FailedAndRolledBack`] — or the piece
+                    // committed it itself; gone either way.
+                    StmtOutcome::FailedAndRolledBack | StmtOutcome::FailedAfterCommit => {
+                        TxState::Idle
+                    }
                     // Open, and only a rollback ends it.
                     StmtOutcome::FailedAndDoomed => TxState::Poisoned { stmts },
                     // The same, except the server has *said* the transaction is
@@ -828,6 +845,12 @@ pub fn failure_committed(engine: TxEngine, sql: &str, tx_alive: Option<bool>) ->
 /// closed transaction, and folds as `FailedAndRolledBack` (measured on 2022
 /// and 2025).
 ///
+/// **Unless the operation's own text commits** — `commits`, which is
+/// [`text_commits`] of the statement. `@@TRANCOUNT` reads 0 after a `COMMIT`
+/// exactly as after a rollback, and a failure after a piece's own `COMMIT`
+/// folded as rolled back over work another connection could read; it is
+/// [`StmtOutcome::FailedAfterCommit`] instead.
+///
 /// Pure, so each arm is tested; the session reads the two values and calls it
 /// (`Session::settle_from_server`).
 pub fn settle_from_server(
@@ -835,6 +858,7 @@ pub fn settle_from_server(
     was_open: bool,
     trancount: i64,
     xact_state: i64,
+    commits: bool,
 ) -> StmtOutcome {
     let open = trancount > 0;
     let failed = matches!(
@@ -846,9 +870,31 @@ pub fn settle_from_server(
     );
     match stmt {
         StmtOutcome::Ok if was_open && !open => StmtOutcome::OkAndClosed,
+        _ if failed && was_open && !open && commits => StmtOutcome::FailedAfterCommit,
         _ if failed && was_open && !open => StmtOutcome::FailedAndRolledBack,
         _ if failed && xact_state == -1 => StmtOutcome::FailedAndDoomed,
         s => s,
+    }
+}
+
+/// Does `sql` hold a `COMMIT` of its own — so that a transaction found closed
+/// after it failed may have been committed by it rather than rolled back?
+///
+/// [`settle_from_server`]'s `commits`, and **SQL Server's question alone**:
+/// it is the engine whose pieces are batches, where a `COMMIT` can stand in
+/// the middle of one (`sql::tsql_statements` finds it, after a `;` or none,
+/// inside an `IF` or a block). A `COMMIT` in a procedure the piece calls is
+/// out of its sight; the probe's answer then folds as before. `false` on
+/// every other engine, whose session never asks.
+pub fn text_commits(engine: TxEngine, sql: &str) -> bool {
+    match engine {
+        TxEngine::MsSql => {
+            let d = crate::intel::SqlDialect::MsSql;
+            crate::sql::tsql_statements(sql, d)
+                .iter()
+                .any(|s| crate::sql::leading_keyword(s, d).as_deref() == Some("COMMIT"))
+        }
+        TxEngine::MySql | TxEngine::Postgres => false,
     }
 }
 
@@ -885,6 +931,11 @@ pub fn failed_message(message: &str, stmt: StmtOutcome) -> String {
              marked it uncommittable, so Rollback is the only way on, and it undoes \
              every statement in it."
         ),
+        StmtOutcome::FailedAfterCommit => format!(
+            "{message}\n\nThe transaction this ran in has ended, and this ran a COMMIT of \
+             its own before it failed, so what came before that COMMIT is likely \
+             committed rather than undone. Check the data before running any of it again."
+        ),
         _ => message.to_string(),
     }
 }
@@ -915,7 +966,8 @@ pub fn cancelled_message(stmt: Option<StmtOutcome>) -> Option<String> {
         Some(
             s @ (StmtOutcome::FailedAndCommitted
             | StmtOutcome::FailedAndRolledBack
-            | StmtOutcome::FailedAndDoomed),
+            | StmtOutcome::FailedAndDoomed
+            | StmtOutcome::FailedAfterCommit),
         ) => Some(failed_message("The statement was cancelled.", s)),
         _ => None,
     }
@@ -1190,7 +1242,8 @@ mod tests {
     #[test]
     fn sql_servers_answer_folds_into_the_outcome() {
         use StmtOutcome::*;
-        let settle = settle_from_server;
+        let settle =
+            |s, was_open, count, state| settle_from_server(s, was_open, count, state, false);
         // (outcome, was open, trancount, xact_state) -> outcome
         assert_eq!(settle(Ok, true, 0, 0), OkAndClosed);
         assert_eq!(settle(Ok, true, 1, 1), Ok);
@@ -1209,6 +1262,60 @@ mod tests {
         }
         assert_eq!(settle(NotSent, true, 1, -1), NotSent);
         assert_eq!(settle(Untouched, true, 0, 0), Untouched);
+    }
+
+    /// **A piece that committed and then failed is not reported rolled
+    /// back.** `@@TRANCOUNT` reads 0 after a `COMMIT` as after a rollback,
+    /// and on 2022 `DECLARE @id int = 1; UPDATE …; COMMIT; SELECT 1/0;` —
+    /// one piece, from its `DECLARE` — folded as "every statement in it since
+    /// it began is undone" over a debit another connection could read.
+    #[test]
+    fn a_failure_after_a_pieces_own_commit_is_not_reported_rolled_back() {
+        use StmtOutcome::*;
+        let piece = "DECLARE @id int = 1;\nUPDATE dbo.acct SET bal = bal - 10 WHERE id = @id;\n\
+                     COMMIT;\nSELECT 1/0 AS boom;";
+        assert!(text_commits(MS, piece));
+        for failed in [Failed, Cancelled] {
+            assert_eq!(
+                settle_from_server(failed, true, 0, 0, text_commits(MS, piece)),
+                FailedAfterCommit,
+                "{failed:?}"
+            );
+        }
+        // Without a closed transaction the commit changes nothing.
+        assert_eq!(settle_from_server(Failed, true, 1, 1, true), Failed);
+        assert_eq!(settle_from_server(Ok, true, 0, 0, true), OkAndClosed);
+        // The fold and the words.
+        let open = TxState::Open { stmts: 2 };
+        assert_eq!(
+            open.on_statement(MS, piece, FailedAfterCommit),
+            TxState::Idle
+        );
+        let m = failed_message("Divide by zero error encountered.", FailedAfterCommit);
+        assert!(
+            m.contains("likely committed") && !m.contains("is undone"),
+            "{m}"
+        );
+        assert!(cancelled_message(Some(FailedAfterCommit)).is_some());
+        // The `COMMIT` is found wherever a statement can stand, and only as one.
+        for commits in [
+            "UPDATE t SET a = 1 COMMIT SELECT 1/0",
+            "IF @@TRANCOUNT > 0 COMMIT TRANSACTION",
+            "BEGIN TRY UPDATE t SET a = 1; COMMIT; END TRY BEGIN CATCH THROW; END CATCH",
+        ] {
+            assert!(text_commits(MS, commits), "{commits}");
+        }
+        for not in [
+            "UPDATE t SET a = 1",
+            "SELECT 'COMMIT' AS c",
+            "SELECT [commit] FROM t",
+            "ROLLBACK",
+            "-- COMMIT\nSELECT 1",
+        ] {
+            assert!(!text_commits(MS, not), "{not}");
+        }
+        // No other engine's session asks.
+        assert!(!text_commits(MY, "COMMIT") && !text_commits(PG, "COMMIT"));
     }
 
     /// **SQL Server has a Manual mode**, on a pinned connection whose
