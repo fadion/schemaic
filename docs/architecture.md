@@ -3951,7 +3951,12 @@ existing prose was left alone.
     server can log in as, with no `IDENTIFIED BY` for `validate_password` to fire on, and a blank
     host means `%` — every machine on the network. The form discloses the host default and what of
     the password the preview shows (`users::password_hint`); nothing said what leaving it *blank*
-    produces.
+    produces. **The password sentence is asked of the engine** (`users::blank_password_signs_in`),
+    and SQL Server answers no: a `FOR LOGIN` user is reached only through its login's password, a
+    `WITHOUT LOGIN` user cannot sign in, an Entra user is Entra's, and the sentence's advice — set
+    one "with ALTER USER afterwards" — is Msg 33234 outside a contained database (measured on 2022
+    and 2025). It had sat on every SQL Server user, the companion user the New account form brings
+    by default included, so the engine's commonest plan previewed a false alarm.
     **One grant carries a consequence too, where no grant carried one at all.** Every arm above
     describes what a plan takes away or rewrites; a `GrantPrivileges` whose level is
     `GrantLevel::Global` is the case where what it *gives* is the risk. `GRANT DROP ON *.*` reaches

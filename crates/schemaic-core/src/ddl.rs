@@ -4026,9 +4026,13 @@ impl Change {
             // `IDENTIFIED BY` for `validate_password` to fire on. The form
             // discloses the host default and that the password shows in the
             // preview; nothing said what leaving it blank produces.
+            //
+            // Asked of the engine as a capability (`users::blank_password_signs_in`):
+            // no SQL Server user made without a password can be signed in to
+            // without one, and the sentence sat on every one of them.
             Change::CreateAccount(d) if d.kind == crate::users::PrincipalKind::User => {
                 let mut out = Vec::new();
-                if d.password.is_empty() {
+                if d.password.is_empty() && crate::users::blank_password_signs_in(dialect) {
                     out.push(format!(
                         "{} will have no password: anyone who can reach the server can log \
                          in as it. Set one here, or with ALTER USER afterwards.",
@@ -31350,12 +31354,6 @@ mod database_tests {
         );
     }
 
-    /// **A blank password is the highest-consequence thing this module emits,
-    /// and it had no arm.** `CREATE USER 'app'@'%';` fell through to
-    /// `_ => Vec::new()`, so the preview's risk block hid itself and Apply came
-    /// up blue — over an account any host on the network can log in as with no
-    /// password, and one MySQL's `validate_password` does not fire on because
-    /// there is no `IDENTIFIED BY` to check.
     /// **The heading has to agree with the sentence under it.** A revoke's own
     /// risk says it "destroys no data and is undone by granting it back", and it
     /// appeared under "This can't be undone" — in the one modal where that
@@ -31442,6 +31440,19 @@ mod database_tests {
         );
     }
 
+    /// **A blank password is the highest-consequence thing this module emits,
+    /// and it had no arm.** `CREATE USER 'app'@'%';` fell through to
+    /// `_ => Vec::new()`, so the preview's risk block hid itself and Apply came
+    /// up blue — over an account any host on the network can log in as with no
+    /// password, and one MySQL's `validate_password` does not fire on because
+    /// there is no `IDENTIFIED BY` to check.
+    ///
+    /// **Only where a blank password is an open sign-in**
+    /// (`users::blank_password_signs_in`). On SQL Server no user made without
+    /// one can be signed in to without one — a `FOR LOGIN` user goes through
+    /// its login's password, a `WITHOUT LOGIN` user cannot sign in, an Entra
+    /// user is Entra's — and the sentence sat on the companion user the New
+    /// account form adds by default, the engine's commonest plan.
     #[test]
     fn a_passwordless_account_says_so_before_it_is_created() {
         let draft = |password: &str, host: &str| {
@@ -31481,6 +31492,47 @@ mod database_tests {
             ..Default::default()
         }));
         assert!(risks(MySql, role).is_empty());
+
+        // SQL Server: the login the form opens on, with the user it brings —
+        // `FOR` the login, no password of its own — and the users it can make
+        // alone. None of them is anyone's to sign in to.
+        let ms = SqlDialect::MsSql;
+        let login = crate::users::AccountDraft {
+            name: "app".into(),
+            kind: crate::users::PrincipalKind::Login,
+            also_user: true,
+            password: "S3cret!x".into(),
+            ..Default::default()
+        };
+        let companion = crate::users::companion_user_draft(&login, ms).expect("its user");
+        let plan = accounts(
+            "app",
+            ms,
+            vec![
+                Change::CreateAccount(Box::new(login)),
+                Change::CreateAccount(Box::new(companion)),
+            ],
+        );
+        assert!(plan.destructive().is_empty(), "{:?}", plan.destructive());
+        for user in [
+            crate::users::AccountDraft {
+                name: "u".into(),
+                login: "app".into(),
+                ..Default::default()
+            },
+            crate::users::AccountDraft {
+                name: "n".into(),
+                ..Default::default()
+            },
+            crate::users::AccountDraft {
+                name: "someone@example.com".into(),
+                external: true,
+                ..Default::default()
+            },
+        ] {
+            let said = risks(ms, Change::CreateAccount(Box::new(user.clone())));
+            assert!(said.is_empty(), "{user:?}: {said:?}");
+        }
     }
 
     /// **The mapping the two toggles make**, which is the one thing about this

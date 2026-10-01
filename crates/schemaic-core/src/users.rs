@@ -2447,6 +2447,25 @@ pub fn takes_password(dialect: SqlDialect, kind: PrincipalKind, contained: bool)
     }
 }
 
+/// Is a **user created here with no password one that signs in without one**
+/// — the case the preview warns of ([`crate::ddl::Change::risks`])?
+///
+/// MySQL's is: an empty authentication string accepts an empty password from
+/// any host the account names. PostgreSQL's signs in wherever `pg_hba.conf`
+/// trusts it, which the app cannot see, so it is warned of rather than assumed
+/// safe. **SQL Server's never is**: a user `FOR LOGIN` is reached only through
+/// its login's password, one `WITHOUT LOGIN` cannot sign in at all, and an
+/// Entra user is signed in by Entra — and the advice to set one with `ALTER
+/// USER` is refused outside a contained database (Msg 33234, measured on 2022
+/// and 2025). The sentence sat on the user the New account form brings with a
+/// login by default, that engine's commonest plan.
+pub fn blank_password_signs_in(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MySql | SqlDialect::Postgres => true,
+        SqlDialect::MsSql | SqlDialect::Sqlite => false,
+    }
+}
+
 /// [`takes_password`] for the draft the form holds: never for a Microsoft
 /// Entra user ([`AccountDraft::external`]), which Entra signs in.
 pub fn draft_takes_password(dialect: SqlDialect, d: &AccountDraft, contained: bool) -> bool {
