@@ -1274,8 +1274,6 @@ fn scan_bounds(
     let track_bodies = dialect.batch_separator();
     let mut body = BodyScan::Start;
     let mut batch = BatchScope::default();
-    // Is the next word the first of a statement — where `name:` is a label?
-    let mut first_word = true;
     while i < n {
         if let Some(j) = skip_noncode(b, i, dialect) {
             i = j;
@@ -1308,7 +1306,6 @@ fn scan_bounds(
             seg = end;
             body = BodyScan::Start;
             batch = BatchScope::default();
-            first_word = true;
             continue;
         }
         // `@x`, `@@ROWCOUNT`, `#t`: a name, never a keyword — `@declare`
@@ -1318,7 +1315,6 @@ fn scan_bounds(
             while i < n && continues_name(b[i], dialect) {
                 i += 1;
             }
-            first_word = false;
             continue;
         }
         if track_bodies && is_word_start(b[i]) {
@@ -1333,12 +1329,18 @@ fn scan_bounds(
             if start == 0 || b[start - 1] != b'.' {
                 batch = batch.word(w);
             }
-            // A label — `again:` opening a statement — is a `GOTO`'s target
-            // anywhere in the batch, so the batch goes whole from here.
-            if first_word && b.get(end) == Some(&b':') && b.get(end + 1) != Some(&b':') {
+            // A label — `again:` — is a `GOTO`'s target anywhere in the
+            // batch, so the batch goes whole from here. **Wherever it stands**,
+            // not only after a `;`: T-SQL needs no `;` before a statement, so
+            // `SELECT 1\nagain:` opens one, and a word directly before a single
+            // `:` is a label and nothing else outside a string — `::` is a
+            // scope qualifier, and a qualified name's part is no label.
+            if b.get(end) == Some(&b':')
+                && b.get(end + 1) != Some(&b':')
+                && (start == 0 || b[start - 1] != b'.')
+            {
                 batch.whole = true;
             }
-            first_word = false;
             i = end;
             continue;
         }
@@ -1393,7 +1395,6 @@ fn scan_bounds(
                 continue;
             }
             if track_bodies {
-                first_word = true;
                 if batch.holds() {
                     i += delim.len();
                     continue;
@@ -5505,6 +5506,12 @@ mod tests {
             }
         };
         one("DECLARE @id int;\nSELECT @id = 5;\nSELECT @id AS v;");
+        // A label opens a statement whether or not a `;` closed the one before
+        // it — T-SQL needs none — so its `GOTO` stays in its batch. Cut there,
+        // `GOTO again` went alone (Msg 133) after the write before it had
+        // committed.
+        one("SELECT 1\nagain:\nPRINT 2;\nGOTO again");
+        one("UPDATE t SET a = 1 WHERE id = 1\nretry:\nPRINT 2;\nGOTO retry;");
         one(
             "IF 1 = 1\nBEGIN\n  UPDATE t SET a = 1 WHERE id = 1;\n  UPDATE t SET a = 2 WHERE id = 2;\nEND",
         );
@@ -5548,6 +5555,15 @@ mod tests {
         assert_eq!(
             super::executable_statements("SELECT x.begin, x.declare FROM x; SELECT 2;", d).len(),
             2
+        );
+        // A `::` scope qualifier and a time in a string are no label.
+        assert_eq!(
+            super::executable_statements(
+                "GRANT SELECT ON SCHEMA::dbo TO u; SELECT '10:30'; SELECT 2;",
+                d
+            )
+            .len(),
+            3
         );
         // Run at the caret takes the whole block.
         let block = "IF 1 = 1\nBEGIN\n  UPDATE t SET a = 1;\n  UPDATE t SET a = 2;\nEND";

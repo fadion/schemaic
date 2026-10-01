@@ -382,8 +382,12 @@ existing prose was left alone.
     `CONVERSATION` open none, and `END CONVERSATION` closes none — nor directly before an `ELSE`,
     which `next_code_word` looks past the `;` for; its `Lookahead::Pending`, when a chunked scan's
     buffer ends first, makes the splitter wait for the next block rather than cut. And from a
-    `DECLARE`, a `RETURN`, a `GOTO` or a label (`name:` opening a statement) the rest of the `GO`
-    batch is one piece (`BatchScope::whole`). A `@x`, `@@x` or `#t` is stepped over whole
+    `DECLARE`, a `RETURN`, a `GOTO` or a label the rest of the `GO` batch is one piece
+    (`BatchScope::whole`). A label is any word directly before a single `:` — `::` is a scope
+    qualifier, a qualified name's part is none — **wherever it stands**: the scan once took one only
+    after a `;`, a `GO` or the start, and T-SQL needs no `;`, so `SELECT 1\nagain:\nPRINT 2;\nGOTO
+    again` sent `GOTO again` alone (Msg 133, measured on 2022) after the piece before it had run. A
+    `@x`, `@@x` or `#t` is stepped over whole
     (`t_sql_name_prefix`, `continues_name`), so `@declare` declares nothing. **It is a middle
     ground, on purpose**: sending whole `GO` batches, as sqlcmd does, is the simpler rule and would
     have collapsed Run Everything's per-statement results into one panel per batch, so statements
