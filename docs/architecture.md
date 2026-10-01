@@ -8851,7 +8851,13 @@ existing prose was left alone.
     and shows each side's members in its DDL pane; a group only the source holds is created whole,
     `Change::CreateRoutine` going through `ddl::routine_create_statements` like the script
     (`a_numbered_groups_members_are_shown_not_planned_and_created_with_it`; live,
-    `a_comparison_creates_a_numbered_group_whole`).
+    `a_comparison_creates_a_numbered_group_whole`). **Except a group with a member the source
+    shows no text for** (an encrypted `grp;2`): created, that member was the comment above inside
+    the plan, the group arrived head-only and Apply reported a success, so such a group is given
+    the empty set and disclosed through `omission_note`, as an unread routine is
+    (`a_group_whose_member_the_source_could_not_read_is_disclosed_not_created`; live,
+    `a_comparison_discloses_a_group_whose_member_the_source_encrypts`). Where both sides hold the
+    group the members are not planned, so the pair is drafted as before.
     `RoutineSource` is the MySQL body + session state, fetched lazily, and exists
     for exactly the reason `TriggerSource` does — `information_schema.ROUTINE_DEFINITION` resolves
     the body's escapes, and every edit on that engine begins with a `DROP` that commits on its own,

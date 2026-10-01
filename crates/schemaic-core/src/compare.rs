@@ -2167,8 +2167,16 @@ fn routine_entry(
     // cannot vouch for. A group only the source holds is created with them
     // (`ddl::routine_create_statements`). Empty everywhere else.
     let members_differ = matches!((l, r), (Some(l), Some(r)) if l.tsql.numbered != r.tsql.numbered);
+    // **And a group that is created with a member the source shows no text
+    // for** — an encrypted `grp;2` — has nothing to create that member with:
+    // `routine_create_statements` writes a comment in its place, so the group
+    // arrived head-only and the Apply reported a success. Only where it is
+    // created: a pair's draft takes the target's members, so the source's
+    // are never planned there.
+    let unread_member =
+        l.is_none() && r.is_some_and(|r| r.tsql.numbered.iter().any(|(_, t)| t.trim().is_empty()));
     let changes = match (l, r) {
-        _ if unread_source => empty_set(&any.name, any.schema.as_deref(), dialect),
+        _ if unread_source || unread_member => empty_set(&any.name, any.schema.as_deref(), dialect),
         (Some(l), Some(r)) => {
             let mut draft = RoutineDraft::from_info(r);
             draft.info.tsql.numbered = l.tsql.numbered.clone();
@@ -6134,5 +6142,35 @@ mod tsql_module_tests {
             .position(|s| s == member)
             .unwrap_or_else(|| panic!("{sql:#?}"));
         assert!(head < at, "{sql:#?}");
+    }
+
+    /// **A group only the source holds, with a member it shows no text for,
+    /// is disclosed rather than created without it.** An encrypted `grp;2`
+    /// became a comment statement inside the plan, so the group was created
+    /// head-only and the Apply reported a success over a member that never
+    /// arrived — the unread routine's case one level down. Where the target
+    /// holds the group the members are not planned at all, so the pair is
+    /// still drafted, and the readable members of a group still create.
+    #[test]
+    fn a_group_whose_member_the_source_could_not_read_is_disclosed_not_created() {
+        let readable = "CREATE PROCEDURE dbo.grp;2 AS SELECT 2";
+        let source = group(&[(2, readable), (3, "")]);
+        let c = SchemaComparison::of(&DbSchema::default(), &source, MS);
+        let e = c.entries.iter().find(|e| e.name == "grp").expect("grp");
+        assert!(e.unplannable(), "{:#?}", e.changes.emit());
+        let plan = c.plan(|_| true);
+        assert!(plan.emit().is_empty(), "{:#?}", plan.emit());
+        assert!(
+            plan.omitted
+                .iter()
+                .any(|o| o.contains("grp") && o.contains("could not be read")),
+            "{:?}",
+            plan.omitted
+        );
+
+        // Both sides hold it: the head is drafted with the target's members.
+        let c = SchemaComparison::of(&group(&[]), &source, MS);
+        let e = c.entries.iter().find(|e| e.name == "grp").expect("grp");
+        assert!(!e.unplannable() && e.uncertain, "{:?}", e.status);
     }
 }

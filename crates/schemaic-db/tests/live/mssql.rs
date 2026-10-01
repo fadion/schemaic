@@ -4149,8 +4149,8 @@ async fn a_comparison_creates_a_numbered_group_whole() {
     }
     let target = Scratch::create("cmp_grp_target").await;
     let source = Scratch::create("cmp_grp_source").await;
-    // Something in `dbo` on each side: a target with nothing in it reads no
-    // `dbo`, and the plan would open by creating one.
+    // Something besides the group on each side, so the second round's target
+    // is not empty.
     for s in [&target, &source] {
         s.exec("CREATE TABLE dbo.t (id int NOT NULL PRIMARY KEY)")
             .await;
@@ -4182,6 +4182,45 @@ async fn a_comparison_creates_a_numbered_group_whole() {
     let e = c.entries.iter().find(|e| e.name == "grp").expect("grp");
     assert!(!e.status.is_difference() && e.uncertain, "{:?}", e.status);
     assert!(e.right_ddl.contains("grp;3"), "{}", e.right_ddl);
+}
+
+/// **A group whose member the source encrypts is disclosed, not created
+/// without it.** The member arrived as a comment in the plan, so the group
+/// was created head-only and the Apply reported a success. Now the plan
+/// leaves the group out and names it, and the target is left without one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_comparison_discloses_a_group_whose_member_the_source_encrypts() {
+    use schemaic_core::compare::SchemaComparison;
+    if !enabled() || azure_cannot("Azure SQL Database has no numbered procedures") {
+        return;
+    }
+    let target = Scratch::create("cmp_grp_enc_target").await;
+    let source = Scratch::create("cmp_grp_enc_source").await;
+    source
+        .exec("CREATE PROCEDURE dbo.ge AS SELECT 1 AS n")
+        .await;
+    source
+        .exec("CREATE PROCEDURE dbo.ge;2 WITH ENCRYPTION AS SELECT 2 AS n")
+        .await;
+    let read = |s: &Scratch| {
+        let db = s.db.clone();
+        let name = s.name.clone();
+        async move {
+            db.fetch_schema(&name, CancellationToken::new())
+                .await
+                .unwrap()
+        }
+    };
+    let src = read(&source).await;
+    let ge = src.routines.iter().find(|r| r.name == "ge").expect("ge");
+    assert_eq!(ge.tsql.numbered.len(), 1, "{:?}", ge.tsql);
+    let plan = SchemaComparison::of(&read(&target).await, &src, MS).plan(|_| true);
+    assert!(plan.emit().is_empty(), "{:#?}", plan.emit());
+    assert!(
+        plan.omitted.iter().any(|o| o.contains("ge")),
+        "{:?}",
+        plan.omitted
+    );
 }
 
 /// **A comparison's view alter names the target's indexes it drops.** The
