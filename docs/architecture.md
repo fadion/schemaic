@@ -7513,8 +7513,18 @@ existing prose was left alone.
     failed with *Login failed for user ''* (`an_ado_net_connection_string_is_read_by_its_keywords`,
     `an_odbc_connection_string_is_read_when_its_driver_is_sql_server`,
     `an_ado_net_string_notes_what_it_cannot_carry_over`,
-    `a_jdbc_urls_sign_in_is_read_as_an_ado_net_strings_is`). **`redacted` hides a password for as
-    far as the importer would read it, so it reads each shape with the importer's own grammar** —
+    `a_jdbc_urls_sign_in_is_read_as_an_ado_net_strings_is`). **Its keywords repeat by the rule
+    above** — the last, or the first under an ODBC `Driver` (`MssqlSignIn::new(first_wins)`), and
+    the last in a JDBC URL's properties. They were read first-to-set and never cleared, so a base
+    string's `Integrated Security=true` with `Integrated Security=false;User Id=u;Password=p`
+    appended imported as Windows sign-in, and `Authentication=ActiveDirectoryDefault` overridden by
+    `SqlPassword` as the Azure CLI's — a different principal from the SQL login the application
+    signs in as (`a_repeated_sign_in_keyword_keeps_the_value_its_driver_uses`). The two families
+    are held apart (`integrated`, `authentication`) and resolved only by `external`, since a false
+    `Integrated Security` says nothing about an `Authentication`: `Sql Password` is a SQL login, an
+    Entra method decides over `Integrated Security` (SqlClient refuses the two together), and only
+    with neither, or `NotSpecified`, does a true `Integrated Security` mean Windows.
+    **`redacted` hides a password for as far as the importer would read it, so it reads each shape with the importer's own grammar** —
     a separator scan was the previous answer and kept being one character short of it. A keyword
     string is found as `parse_url_any` would find it (`keyword_list`: `looks_like_connection_string`
     on the text, or on what `strip_env_assignment` unwraps) or, for the whole entry only (`outer`),

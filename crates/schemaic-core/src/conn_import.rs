@@ -1239,7 +1239,6 @@ fn parse_connection_string(s: &str) -> Result<(Connection, Vec<ImportNote>), Url
     let mut c = blank(MSSQL);
     let mut server = String::new();
     let (mut encrypt, mut trust) = (None::<String>, false);
-    let mut sign_in = MssqlSignIn::default();
     // The ODBC `Driver` / OLE DB `Provider`, when one is named: it decides
     // what the string's silence about encryption means.
     let mut driver: Option<String> = None;
@@ -1251,6 +1250,7 @@ fn parse_connection_string(s: &str) -> Result<(Connection, Vec<ImportNote>), Url
     // `Driver`. Not the URL parsers' first-wins, whose reason — the authority
     // beats a query parameter — a flat keyword list does not have.
     let first_wins = keys.iter().any(|k| k == "driver");
+    let mut sign_in = MssqlSignIn::new(first_wins);
     let set = |dst: &mut String, v: &str| {
         if first_wins {
             set_if_empty(dst, v)
@@ -1330,14 +1330,33 @@ fn parse_connection_string(s: &str) -> Result<(Connection, Vec<ImportNote>), Url
 /// `integratedSecurity=true` or `authentication=ActiveDirectoryDefault` —
 /// the only place those tools state the sign-in — imported as a SQL login
 /// with an empty user and no note.
+///
+/// **A repeated keyword keeps the value its driver uses, as every other
+/// keyword does** — the last, or the first under an ODBC `Driver`
+/// (`first_wins`). Each was read first-to-set and never cleared, so a base
+/// string's `Integrated Security=true` with an appended `=false` imported as
+/// Windows sign-in, the user's own identity sent where the application signed
+/// in as a SQL login. The two keyword families are held apart, because a
+/// false `Integrated Security` says nothing about an `Authentication`.
 #[derive(Default)]
 struct MssqlSignIn {
-    /// `None` for a SQL login; `Some(Some(mode))` for a sign-in Schemaic
-    /// has; `Some(None)` for an Entra method it does not.
-    external: Option<Option<crate::connection::AuthMode>>,
+    /// Whether a repeat is ignored rather than overriding — ODBC's rule.
+    first_wins: bool,
+    /// `Integrated Security`/`Trusted_Connection`, as last (or first) said.
+    integrated: Option<bool>,
+    /// `Authentication`, normalised, as last (or first) said.
+    authentication: Option<String>,
 }
 
 impl MssqlSignIn {
+    /// A reading under the repeat rule `first_wins` (see the type).
+    fn new(first_wins: bool) -> Self {
+        MssqlSignIn {
+            first_wins,
+            ..Default::default()
+        }
+    }
+
     /// Read one keyword, `key` normalised — `true` when it was a sign-in one.
     ///
     /// `Integrated Security`/`Trusted_Connection` (ADO.NET) and
@@ -1348,23 +1367,36 @@ impl MssqlSignIn {
     /// the one Entra sign-in Schemaic has; the rest (`…Password`,
     /// `…Interactive`, `…Integrated`, `…ManagedIdentity`) are not it.
     fn read(&mut self, key: &str, v: &str) -> bool {
-        use crate::connection::AuthMode;
+        let first_wins = self.first_wins;
         match key {
             "integratedsecurity" | "trustedconnection" => {
-                if truthy(v) || normalize_key(v) == "sspi" {
-                    self.external = Some(Some(AuthMode::Windows));
+                if !(first_wins && self.integrated.is_some()) {
+                    self.integrated = Some(truthy(v) || normalize_key(v) == "sspi");
                 }
                 true
             }
             "authentication" => {
-                match normalize_key(v).as_str() {
-                    "sqlpassword" | "notspecified" => {}
-                    "activedirectorydefault" => self.external = Some(Some(AuthMode::AzureCli)),
-                    _ => self.external = Some(None),
+                if !(first_wins && self.authentication.is_some()) {
+                    self.authentication = Some(normalize_key(v));
                 }
                 true
             }
             _ => false,
+        }
+    }
+
+    /// `None` for a SQL login; `Some(Some(mode))` for a sign-in Schemaic
+    /// has; `Some(None)` for an Entra method it does not. An Entra method
+    /// decides over `Integrated Security` (SqlClient refuses the two
+    /// together; the Entra reading is the one that keeps no password), and a
+    /// `Sql Password` spelled out over it too.
+    fn external(&self) -> Option<Option<crate::connection::AuthMode>> {
+        use crate::connection::AuthMode;
+        match self.authentication.as_deref() {
+            Some("sqlpassword") => None,
+            Some("activedirectorydefault") => Some(Some(AuthMode::AzureCli)),
+            Some(m) if m != "notspecified" => Some(None),
+            _ => (self.integrated == Some(true)).then_some(Some(AuthMode::Windows)),
         }
     }
 
@@ -1374,7 +1406,7 @@ impl MssqlSignIn {
     /// no password**: it is the account's Entra password, which the driver
     /// would have sent to Entra, and a SQL login would hand it to the server.
     fn apply(self, c: &mut Connection, notes: &mut Vec<ImportNote>) {
-        match self.external {
+        match self.external() {
             Some(Some(mode)) if crate::connection::AuthMode::offered(MSSQL).contains(&mode) => {
                 c.auth = mode;
             }
@@ -3746,6 +3778,54 @@ mod tests {
         let c =
             url("Driver={ODBC Driver 18 for SQL Server};Server=a;PWD=first;Server=b;PWD=second");
         assert_eq!((c.host.as_str(), c.password.as_str()), ("a", "first"));
+    }
+
+    /// **The sign-in keywords follow the same rule as every other**: the last
+    /// in ADO.NET and JDBC, the first under an ODBC `Driver`. They were read
+    /// first-to-set and never cleared, so a base string's `Integrated
+    /// Security=true` with an appended `=false` imported as Windows sign-in —
+    /// the user's own identity sent to a server the application reached as SQL
+    /// login `u` — and an `Authentication=SqlPassword` override as Entra.
+    #[test]
+    fn a_repeated_sign_in_keyword_keeps_the_value_its_driver_uses() {
+        use crate::connection::AuthMode;
+        let one = |s: &str| parse_url_scan(s).found.remove(0);
+        for sql_login in [
+            "Server=tcp:h;Integrated Security=true;Integrated Security=false;User Id=u;Password=p",
+            "Server=tcp:h;Trusted_Connection=yes;Integrated Security=false;User Id=u;Password=p",
+            "Server=tcp:h;Authentication=ActiveDirectoryDefault;Authentication=SqlPassword;\
+             User Id=u;Password=p",
+            "Server=tcp:h;Authentication=Active Directory Password;Authentication=Sql Password;\
+             User Id=u;Password=p",
+            "jdbc:sqlserver://h;integratedSecurity=true;integratedSecurity=false;user=u;password=p",
+            "jdbc:sqlserver://h;authentication=ActiveDirectoryDefault;authentication=SqlPassword;\
+             user=u;password=p",
+            "Driver={ODBC Driver 18 for SQL Server};Server=h;Trusted_Connection=no;\
+             Trusted_Connection=yes;UID=u;PWD=p",
+        ] {
+            let row = one(sql_login);
+            assert_eq!(
+                row.connection.effective_auth(),
+                AuthMode::Password,
+                "{sql_login}"
+            );
+            assert!(!row.has(ImportNote::ExternalLogin), "{sql_login}");
+            assert_eq!(row.connection.password, "p", "{sql_login}");
+        }
+        // The other way round, the override is the external sign-in.
+        let row =
+            one("Server=tcp:h;Authentication=SqlPassword;Authentication=ActiveDirectoryDefault");
+        assert_eq!(row.connection.auth, AuthMode::AzureCli);
+        let row = one("Server=tcp:h;Integrated Security=false;Integrated Security=SSPI");
+        assert_eq!(row.has(ImportNote::ExternalLogin), !cfg!(windows));
+        if cfg!(windows) {
+            assert_eq!(row.connection.effective_auth(), AuthMode::Windows);
+        }
+        let row = one(
+            "Driver={ODBC Driver 18 for SQL Server};Server=h;Trusted_Connection=yes;\
+             Trusted_Connection=no;UID=u",
+        );
+        assert_eq!(row.has(ImportNote::ExternalLogin), !cfg!(windows));
     }
 
     /// **A connection string is SQL Server's only when it says so.** MySQL's
