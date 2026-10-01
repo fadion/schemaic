@@ -3260,10 +3260,17 @@ existing prose was left alone.
     its primary button all say Export, while `dump_run`, `DumpPlan` and `app::dump` keep the code
     name; the module doc is where the two vocabularies are reconciled, and it is what to read before
     "fixing" a `dump_` name that sits behind a menu called Export.
-    **It joins two emitters that already existed and adds no third.** Structure is
-    `TableInfo::create_ddl` (which routes a view on to `ddl::view_ddl`), the closing constraints are
-    a `ddl::ChangeSet` of `Change::AddForeignKey` through `ChangeSet::emit` — the emitter the apply
-    path uses — and the rows are `export::ExportFormat::Sql`, streamed by the app. Triggers are
+    **It joins the emitters that already existed.** Structure is `TableInfo::create_ddl_holding`
+    (`create_ddl` split around the rows, which routes a view on to `ddl::view_ddl`), the closing
+    constraints are a `ddl::ChangeSet` of `Change::AddForeignKey` through `ChangeSet::emit` — the
+    emitter the apply path uses — and the rows are `dump::render_rows`, streamed by the app, which
+    shares `export::export_inserts_ending` with the grid's SQL export: on MySQL, PostgreSQL and
+    SQLite the two write the same statements, while on SQL Server each `INSERT` closes its own
+    `GO` batch and binary, CLR and variant columns go out as the literals the server rendered,
+    which the grid's export does not write. **SQL Server has emitters of the dump's own**, for
+    what nothing else here scripts: `TsqlObject::create_sql`, `create_if_absent_sql`, `drop_sql`
+    and `restart_sql` for its sequences, alias types, XML schema collections and synonyms, and the
+    up-front `DROP … IF EXISTS` and `refuse_if_present_sql` statements of a replay. Triggers are
     `TriggerInfo::create_set_sql`, the **whole-set** form and not one `create_sql` per trigger: the
     catalogue gives a group's leader `PRECEDES <successor>` and a restore reads the file top to
     bottom, so the first `CREATE TRIGGER` named a trigger the file had not created yet and both
@@ -24164,8 +24171,12 @@ existing prose was left alone.
     `AllRows` branch with one difference that drives the whole module — an export is one statement
     into one file and a dump is **many**, so the writer has to outlive each table. A single blocking
     task owns the file and reads `Msg`s: a `Text` is written as it arrives, and a `Table` carries the
-    *receiving end* of that table's row channel, which the writer drains through `ExportFormat::Sql`,
-    so a dump's `INSERT`s and the grid's SQL export are the same statements by construction. Rows are
+    *receiving end* of that table's row channel, which the writer drains through
+    `dump::render_rows`. That shares `export::export_inserts_ending` with the grid's SQL export, so
+    on MySQL, PostgreSQL and SQLite a dump's `INSERT`s and the export's are the same statements;
+    on a batch-separated engine they are not — on SQL Server each `INSERT` closes its own `GO`
+    batch, and binary, CLR and variant columns are written from the literals the server rendered
+    (`DumpStep::Rows::server`), neither of which the grid's export writes. Rows are
     read at `EXPORT_CHUNK_ROWS` with the same bound of two blocks in flight, and the `.part`-sibling
     + atomic-rename guarantee is the export's unchanged — `part_of` builds that sibling through
     `export::part_path`, the one function that decides the suffix, because the modal's cancel

@@ -9,8 +9,14 @@
 //! So the file is written by a single blocking task that reads [`Msg`]s: a
 //! `Text` is written as it arrives, and a `Table` carries the *receiving end* of
 //! that table's row channel, which the writer then drains through
-//! [`ExportFormat::Sql`] — the same renderer the grid's SQL export uses, so a
-//! dump's `INSERT`s and an export's are the same statements by construction.
+//! [`schemaic_core::dump::render_rows`]. That shares
+//! `export::export_inserts_ending` with the grid's SQL export
+//! ([`ExportFormat::Sql`]), so on MySQL, PostgreSQL and SQLite a dump's
+//! `INSERT`s and an export's are the same statements — but not on a
+//! batch-separated engine: on SQL Server every `INSERT` closes its own `GO`
+//! batch, and the binary, CLR and variant columns are written from the
+//! literals the server rendered (`DumpStep::Rows::server`), neither of which
+//! the grid's export writes.
 //!
 //! **The destination is not opened until the dump has succeeded.** Rows go to a
 //! `.part` sibling that is renamed over the target at the end, which is atomic

@@ -3,12 +3,18 @@
 //!
 //! Both halves of a dump already existed and had never been joined:
 //! [`crate::schema::TableInfo::create_ddl`] is the structure (Copy DDL's own
-//! emitter) and [`crate::export::ExportFormat::Sql`] is the data (one `INSERT`
-//! per row, streamed). This module decides **what goes in the file and in what
+//! emitter, split around the rows by `create_ddl_holding`) and the grid's SQL
+//! export ([`crate::export::ExportFormat::Sql`]) is the data (one `INSERT` per
+//! row, streamed). This module decides **what goes in the file and in what
 //! order**; it writes nothing and connects to nothing, so every decision in it
 //! is unit-testable. `schemaic-app` executes the plan — a [`DumpStep::Text`] is
-//! written straight out, a [`DumpStep::Rows`] is streamed through the export
-//! renderer into the same writer.
+//! written straight out, a [`DumpStep::Rows`] is streamed through
+//! [`render_rows`] into the same writer. That shares the export's renderer,
+//! `export_inserts_ending`, but is not the export: on a batch-separated engine
+//! every `INSERT` closes its own `GO` batch, and the columns a text cell cannot
+//! carry are written from the literals the server rendered
+//! ([`DumpStep::Rows::server`]). SQL Server's standalone objects have emitters
+//! of their own here and in [`crate::schema::TsqlObject`].
 //!
 //! **A dump is written, never run.** The file is the user's to replay, which is
 //! the same side of the "generated DDL is never run silently" invariant Copy DDL
