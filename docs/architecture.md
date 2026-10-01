@@ -985,9 +985,12 @@ existing prose was left alone.
     query hint `OPTION (…)` at the top level, `WITH ROLLUP`/`WITH CUBE` after a `GROUP BY` at the
     same depth, and `GROUPING SETS (…)` (`MsSqlDialect` leaves `supports_group_by_expr` off, so
     that stopped at `SETS`; all run on SQL Server 2022 and 2025) — and, for the statements a body
-    holds, a compound assignment's operator (`SET @i += 1`), `NEXT VALUE FOR seq`, `EXEC @rc = p`
-    and an `EXEC`'s positional `OUTPUT`/`OUT`, a cursor's options and `FOR READ ONLY`,
-    `PARSE`/`TRY_PARSE`'s `AS type USING culture`, `TOP (n)` after `DELETE`/`UPDATE`/`INSERT`, a
+    holds, a compound assignment's operator where an assignment stands (`SET @i += 1`, an
+    `UPDATE`'s `SET col *= 2`; `compound_assignment_at` — in a `WHERE`, `*=` is the outer-join
+    operator SQL Server removed and refuses, and blanking it anywhere passed it), `NEXT VALUE FOR
+    seq`, `EXEC @rc = p` and an `EXEC`'s positional `OUTPUT`/`OUT`, a cursor's options and `FOR
+    READ ONLY`, `PARSE`/`TRY_PARSE`'s `AS type USING culture` to the call's own `)` (the first `)`
+    was `decimal(10,2)`'s), `TOP (n)` after `DELETE`/`UPDATE`/`INSERT`, a
     table hint on a write's target, `DELETE FROM t FROM …`'s first `FROM`, `CREATE INDEX`'s `WITH
     (…)` and filegroup, and a trigger's `UPDATE(col)` (filled as a call) — and `unit_diagnostics`
     parses the statement with each overwritten — blanks, or a literal where an expression must
@@ -998,8 +1001,12 @@ existing prose was left alone.
     one after it (`… WITH ROLLUP HAVING COUNT(*) >`) and every check that needs a parse went with
     it, while `FROM t WITH CUBE` — Msg 336 on the server — passed because only the next word was
     asked (`a_clause_the_parser_lacks_hides_nothing_after_it`,
-    `t_sql_grouping_extensions_draw_no_syntax_error`). `OPTION` and `TABLESAMPLE` also end a table
-    reference, since the alias check read `FROM t OPTION (RECOMPILE)` as a reserved alias.
+    `t_sql_grouping_extensions_draw_no_syntax_error`). `TABLESAMPLE` also ends a table reference,
+    and so does `OPTION` with its `(` after it, since the alias check read `FROM t OPTION
+    (RECOMPILE)` as a reserved alias — a bare `FROM t option` is that mistake still, refused by SQL
+    Server and MySQL 8 (`a_read_past_rule_covers_only_its_construct`). The function-typo check asks
+    nothing of a word right after `AS`, a type (`AS numeric(5)`) or an alias's column list (`AS
+    v(x)`) and never a call (`parse_to_a_parameterised_type_draws_no_error`).
     **A range is not always one statement.** T-SQL needs no `;` (`statements_need_no_terminator`,
     exhaustive per dialect), so a script in the language's normal style is one range — and the last
     range without a `;` is the fragment still being typed, so its parse error was withheld and, a

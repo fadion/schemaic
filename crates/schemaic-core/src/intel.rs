@@ -6129,13 +6129,14 @@ fn dotted_name_start(toks: &[Token], end: usize) -> Option<usize> {
 ///   and stops at, filled with a literal so the `GROUP BY` stays a list (and
 ///   so the grouping check, which bails on anything but a column, says
 ///   nothing);
-/// - a compound assignment's operator, `SET @i += 1` → `SET @i  = 1`;
+/// - a compound assignment's operator, `SET @i += 1` → `SET @i  = 1` — only
+///   where an assignment stands ([`compound_assignment_at`]);
 /// - `NEXT VALUE FOR seq [OVER (…)]`, filled with a literal;
 /// - `EXEC @rc = p` — a procedure's return code — and `OUT` for `OUTPUT`
 ///   after an argument;
 /// - a cursor's options, `DECLARE c CURSOR LOCAL FAST_FORWARD FOR …`, and its
 ///   trailing `FOR READ ONLY`;
-/// - `PARSE`/`TRY_PARSE`'s `AS type [USING culture]`;
+/// - `PARSE`/`TRY_PARSE`'s `AS type [USING culture]`, to the call's `)`;
 /// - `TOP (n)` right after `DELETE`/`UPDATE`/`INSERT`, a table hint on their
 ///   target (`INSERT INTO t WITH (ROWLOCK) …`), and the first `FROM` of
 ///   `DELETE FROM t FROM t JOIN …`;
@@ -6280,7 +6281,9 @@ fn tsql_gap_masks(sql: &str, hi: usize, toks: &[Token]) -> Vec<Mask> {
                     i += 3;
                     continue;
                 }
-                // `PARSE('1' AS int USING 'en-US')`: everything from the `AS`.
+                // `PARSE('1' AS int USING 'en-US')`: everything from the `AS`
+                // to the `)` that closes the call — not a type's own, as in
+                // `AS decimal(10,2)`.
                 Some("AS")
                     if matches!(
                         calls.last().and_then(|c| c.as_deref()),
@@ -6288,7 +6291,14 @@ fn tsql_gap_masks(sql: &str, hi: usize, toks: &[Token]) -> Vec<Mask> {
                     ) =>
                 {
                     let mut j = i;
-                    while j < toks.len() && !matches!(toks[j].kind, TkKind::RParen) {
+                    let mut inner = 0usize;
+                    while let Some(t) = toks.get(j) {
+                        match t.kind {
+                            TkKind::LParen => inner += 1,
+                            TkKind::RParen if inner == 0 => break,
+                            TkKind::RParen => inner -= 1,
+                            _ => {}
+                        }
                         j += 1;
                     }
                     // Up to the `)` itself: a culture is a string, no token.
@@ -6373,8 +6383,11 @@ fn tsql_gap_masks(sql: &str, hi: usize, toks: &[Token]) -> Vec<Mask> {
     }
     // A compound assignment's operator: `+=`, `-=`, `*=`, `/=`, `%=`, `&=`,
     // `|=`, `^=` — code bytes only, from the first token to the statement's
-    // end (`SET @s += N'…'` ends on a string, which is no token).
+    // end (`SET @s += N'…'` ends on a string, which is no token) — and only
+    // where an assignment stands (`compound_assignment_at`): a `*=` in a
+    // `WHERE` is the outer-join operator SQL Server removed, and refuses.
     if let Some(first) = toks.first() {
+        let clauses = clause_of_each_token(toks);
         let mut p = first.at;
         while p < hi.min(b.len()) {
             if let Some(q) = crate::sql::skip_noncode(b, p, SqlDialect::MsSql) {
@@ -6383,6 +6396,7 @@ fn tsql_gap_masks(sql: &str, hi: usize, toks: &[Token]) -> Vec<Mask> {
             }
             if matches!(b[p], b'+' | b'-' | b'*' | b'/' | b'%' | b'&' | b'|' | b'^')
                 && b.get(p + 1) == Some(&b'=')
+                && compound_assignment_at(toks, &clauses, p)
             {
                 mask(&mut out, p, p + 1, "");
             }
@@ -6390,6 +6404,74 @@ fn tsql_gap_masks(sql: &str, hi: usize, toks: &[Token]) -> Vec<Mask> {
         }
     }
     out
+}
+
+/// For each of `toks`, the clause it stands in at its own depth — the last
+/// `SET`, `SELECT`, `FROM`, `WHERE`, … before it outside any parentheses it
+/// is not in — or `None` before the first. One forward pass.
+fn clause_of_each_token(toks: &[Token]) -> Vec<Option<&'static str>> {
+    const CLAUSES: &[&str] = &[
+        "SET", "SELECT", "FROM", "WHERE", "ON", "HAVING", "GROUP", "ORDER", "VALUES", "OUTPUT",
+        "WHEN", "THEN", "INTO", "USING",
+    ];
+    let mut open: Vec<Option<&'static str>> = vec![None];
+    let mut out = Vec::with_capacity(toks.len());
+    for (k, t) in toks.iter().enumerate() {
+        match t.kind {
+            TkKind::LParen => {
+                out.push(open.last().copied().flatten());
+                open.push(None);
+                continue;
+            }
+            TkKind::RParen if open.len() > 1 => {
+                open.pop();
+            }
+            _ => {}
+        }
+        if let Some(w) = tsql_keyword(toks, k)
+            && let Some(c) = CLAUSES.iter().find(|c| **c == w)
+            && let Some(slot) = open.last_mut()
+        {
+            *slot = Some(c);
+        }
+        out.push(open.last().copied().flatten());
+    }
+    out
+}
+
+/// Does the operator at byte `p` — `+` of `+=` and its siblings — stand where
+/// T-SQL takes a compound assignment? Right after a name (`@v`, `col`,
+/// `t.col`) that opens an assignment: a variable's in a `SET` or a `SELECT`
+/// list, or a column's in an `UPDATE`'s (or a `MERGE`'s) `SET` list — the
+/// name being the clause's first or following a `,`. `clauses` is
+/// [`clause_of_each_token`] for `toks`.
+fn compound_assignment_at(toks: &[Token], clauses: &[Option<&'static str>], p: usize) -> bool {
+    // The token the operator follows: the last that ends at or before it.
+    let k = toks.partition_point(|t| t.end <= p);
+    let Some(name) = k.checked_sub(1) else {
+        return false;
+    };
+    let Some(start) = dotted_name_start(toks, k) else {
+        return false;
+    };
+    let variable = matches!(&toks[name].kind, TkKind::Word(w) if w.starts_with('@'));
+    let opens = match start.checked_sub(1).map(|j| &toks[j]) {
+        Some(Token {
+            kind: TkKind::Comma,
+            ..
+        }) => true,
+        Some(_) => matches!(
+            tsql_keyword(toks, start - 1).as_deref(),
+            Some("SET" | "SELECT")
+        ),
+        None => false,
+    };
+    opens
+        && match clauses.get(start).copied().flatten() {
+            Some("SET") => true,
+            Some("SELECT") => variable,
+            _ => false,
+        }
 }
 
 /// Keywords that legitimately follow `AS` without being an alias: a query/CTAS body
@@ -7225,10 +7307,11 @@ fn is_table_ref_continuation(word: &str) -> bool {
             | "FROM"
             | "PIVOT"
             | "UNPIVOT"
-            // A T-SQL query hint (`FROM t OPTION (RECOMPILE)`) and table
-            // sampling (`FROM t TABLESAMPLE (10 PERCENT)`); both reserved, so
-            // neither is ever an alias.
-            | "OPTION"
+            // Table sampling, `FROM t TABLESAMPLE (10 PERCENT)`; reserved, so
+            // never an alias. (A T-SQL query hint's `OPTION` ends a reference
+            // only with its `(` after it — `alias_checks` asks — since a bare
+            // `FROM t option` is a reserved word used as an alias, which SQL
+            // Server and MySQL 8 both refuse.)
             | "TABLESAMPLE"
     )
 }
@@ -7876,6 +7959,13 @@ fn alias_checks(sql: &str, lo: usize, hi: usize, dialect: SqlDialect, out: &mut 
                 // `is_reserved_word`, since these are reserved too) — and so,
                 // where no `;` is needed, does the next statement's first word.
                 Some(TkKind::Word(a)) if ends_table_ref(a, dialect) => break,
+                // A query hint, `FROM t OPTION (RECOMPILE)`.
+                Some(TkKind::Word(a))
+                    if a.eq_ignore_ascii_case("OPTION")
+                        && matches!(toks.get(i + 1).map(|t| &t.kind), Some(TkKind::LParen)) =>
+                {
+                    break;
+                }
                 Some(TkKind::Word(a)) if is_reserved_word(a, dialect) => {
                     flag(out, toks[i].at, a);
                     break;
@@ -9078,9 +9168,14 @@ fn function_typo_checks(
     };
     let b = sql.as_bytes();
     let mut i = lo;
+    // The last word was `AS`, with only white space since: what follows is a
+    // type (`CAST(x AS numeric(5))`, `PARSE(s AS decimal(10,2))`) or an
+    // alias's column list (`AS v(x)`), never a call.
+    let mut after_as = false;
     while i < hi {
         if let Some(j) = skip_noncode(b, i, dialect) {
             i = j.min(hi);
+            after_as = false;
             continue;
         }
         let c = b[i];
@@ -9099,7 +9194,9 @@ fn function_typo_checks(
             let word = &sql[s..j];
             let lw = word.to_ascii_lowercase();
             let qualified = s > lo && b[s - 1] == b'.';
+            let typed = std::mem::replace(&mut after_as, word.eq_ignore_ascii_case("AS"));
             if is_call
+                && !typed
                 && !qualified
                 && !is_known_function(index, &lw)
                 && !is_sql_keyword(word)
@@ -9115,6 +9212,9 @@ fn function_typo_checks(
             }
             i = j;
             continue;
+        }
+        if !c.is_ascii_whitespace() {
+            after_as = false;
         }
         i += 1;
     }
@@ -14723,6 +14823,65 @@ mod tests {
         }
     }
 
+    /// **A read-past rule covers its construct and nothing wider**
+    /// (S7.2-L1-08). The compound-assignment mask blanked a `*=` anywhere in a
+    /// statement, so the removed outer-join operator in a `WHERE` passed; and
+    /// `OPTION` ended every table reference, so `FROM t option` — a reserved
+    /// word as an alias — passed too. SQL Server 2022 refuses both (Msg 102),
+    /// and MySQL 8 the second (1064); each assignment below runs on 2022.
+    #[test]
+    fn a_read_past_rule_covers_only_its_construct() {
+        for (sql, dialect) in [
+            ("SELECT id FROM employees WHERE id *= 1;", SqlDialect::MsSql),
+            (
+                "SELECT id FROM employees WHERE id = 1 AND @x += 1;",
+                SqlDialect::MsSql,
+            ),
+            ("SELECT * FROM employees option;", SqlDialect::MsSql),
+            ("SELECT * FROM employees option;", SqlDialect::MySql),
+        ] {
+            let errors = diag_d(sql, dialect)
+                .into_iter()
+                .filter(|x| x.severity == Severity::Error)
+                .count();
+            assert_eq!(errors, 1, "{dialect:?} {sql}: {:?}", diag_d(sql, dialect));
+        }
+        for sql in [
+            "SET @i += 1;",
+            "SET @s += N'x';",
+            "SELECT @s += 1;",
+            "SELECT @a = 1, @b -= 2;",
+            "UPDATE employees SET salary += 1, name = N'x';",
+            "UPDATE employees SET name = N'x', salary *= 2 WHERE id = 1;",
+            "UPDATE e SET e.salary /= 2 FROM employees e;",
+            "UPDATE employees SET salary = (SELECT 1), dept_id |= 4;",
+            "MERGE employees AS t USING departments AS s ON t.id = s.id \
+             WHEN MATCHED THEN UPDATE SET t.salary += 1;",
+            "SELECT * FROM employees OPTION (RECOMPILE);",
+            "SELECT * FROM employees e OPTION (MAXDOP 1);",
+        ] {
+            let d = diag_d(sql, SqlDialect::MsSql);
+            assert!(d.is_empty(), "{sql}: {d:?}");
+        }
+    }
+
+    /// **`PARSE`'s target type keeps its own parentheses** (S7.2-L1-05). The
+    /// read-past mask ran from the `AS` to the first `)`, which for
+    /// `AS decimal(10,2)` is the type's, so `,2)` was left behind and one more
+    /// `)` closed the call early. Each runs on SQL Server 2022.
+    #[test]
+    fn parse_to_a_parameterised_type_draws_no_error() {
+        for sql in [
+            "SELECT PARSE('1.5' AS decimal(10,2));",
+            "SELECT TRY_PARSE(N'2024-01-02' AS datetime2(3) USING 'en-US') AS d;",
+            "SELECT TRY_PARSE(@s AS numeric(5)) FROM employees;",
+            "SELECT ABS(TRY_PARSE(@s AS decimal(10, 2))) + 1 FROM employees;",
+        ] {
+            let d = diag_d(sql, SqlDialect::MsSql);
+            assert!(d.is_empty(), "{sql}: {d:?}");
+        }
+    }
+
     /// **What T-SQL's read-past clauses leave standing** (S8-L1-07): each
     /// mask covers its clause and nothing else, so an error beside it, and the
     /// table and column checks, still report; and an `UPDATE`'s target is
@@ -14758,6 +14917,10 @@ mod tests {
             ),
             (
                 "SELECT TRY_PARSE(nope AS int) FROM employees;",
+                "Column `nope` not found",
+            ),
+            (
+                "SELECT TRY_PARSE(nope AS decimal(10,2)) FROM employees;",
                 "Column `nope` not found",
             ),
         ] {
