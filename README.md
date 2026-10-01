@@ -1,8 +1,8 @@
 # Schemaic
 
-A fast, native SQL editor for MySQL, MariaDB, PostgreSQL, and SQLite — with SQL
-Server in preview — written in Rust, with an editable results grid, visual schema
-editing, and schema-aware intelligence, built to feel instant.
+A fast, native SQL editor for MySQL, MariaDB, PostgreSQL, SQL Server and SQLite,
+written in Rust, with an editable results grid, visual schema editing, and
+schema-aware intelligence, built to feel instant.
 
 <p align="center">
   <img src="assets/screenshot.png" alt="Schemaic — SQL editor and results grid" width="820">
@@ -125,7 +125,7 @@ editing, and schema-aware intelligence, built to feel instant.
   TLS from *prefer* through *verify-full* (client certificates included, verified
   against the OS trust store rather than a root set compiled in years ago), and
   SQLite by picking a file (no server, so no host, credentials or tunnel to fill
-  in). **SQL Server and Azure SQL are in preview**: signing in with a SQL login,
+  in). **SQL Server and Azure SQL**: signing in with a SQL login,
   Windows authentication (in the Windows build) or Microsoft Entra through the
   Azure CLI; querying, scripts with `GO`, browsing the schema, editing rows in the
   grid, importing files, Manual-mode transactions, query plans, `.sql` dumps,

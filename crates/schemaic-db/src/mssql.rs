@@ -2,15 +2,15 @@
 //! patched, see `vendor/tiberius/PATCHES.md`.
 //!
 //! Dispatched to from [`crate::Db`]'s public methods when the connection's
-//! engine is [`crate::Engine::MsSql`]. **A preview, not parity.** What is here:
-//! connect, list databases, run queries, batches and `.sql` scripts,
-//! non-executing validation (`prepare_check`), schema introspection, table
-//! statistics, server activity, the grid's write-back (`commit_writes`,
-//! `refetch_rows`, `fetch_blob`) and the schema changes `ddl::supports_change`
-//! allows it (`run_ddl`). The other entry points that write (`import_rows`,
-//! `run_server_ddl`) and `explain` answer with a refusal naming SQL Server until
-//! they are written, so a caller that skips the capability gates is told so
-//! rather than handed another engine's SQL.
+//! engine is [`crate::Engine::MsSql`]. What is here: connect, list databases,
+//! run queries, batches and `.sql` scripts, non-executing validation
+//! (`prepare_check`), schema introspection, table statistics, server activity,
+//! query plans (`explain`), file import (`import_rows`), the grid's write-back
+//! (`commit_writes`, `refetch_rows`, `fetch_blob`) and the schema changes
+//! `ddl::supports_change` allows it (`run_ddl`). The one entry point not
+//! written is `run_server_ddl` — creating or dropping a database — which
+//! answers with a refusal naming SQL Server, so a caller that skips the
+//! capability gates is told so rather than handed another engine's SQL.
 //!
 //! **Values come over TDS typed**, not as text: an `int` arrives as an `i32`,
 //! a `decimal` as a scaled integer, a `datetime2` as a day count and a count of
@@ -2953,9 +2953,9 @@ pub(crate) async fn run_script(
 
 // ── Not written yet ──────────────────────────────────────────────────────────
 //
-// Each answers the whole interface's name (`ENGINE_ENTRY_POINTS`), and each
-// refuses: no path in the app reaches them for SQL Server — the capability
-// gates above them answer no — and one that does is told so in a sentence.
+// Answers the whole interface's name (`ENGINE_ENTRY_POINTS`), and refuses: no
+// path in the app reaches it for SQL Server — the capability gates above it
+// answer no — and one that does is told so in a sentence.
 
 pub(crate) async fn run_server_ddl(
     _db: &Db,

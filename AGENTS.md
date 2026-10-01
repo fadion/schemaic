@@ -9,18 +9,21 @@ siblings, and the MCP server both `schemaic mcp` and the AI panel run; no Floem)
 `schemaic-term`, `schemaic-ui` (the Floem views), `schemaic-app` (signal wiring, the panel's
 `--mcp-serve` branch, the CLI's argv branch).
 
-**Four engines, and they are not equal.** MySQL/MariaDB and PostgreSQL are full; SQLite reads,
-writes, imports and edits **tables** (through the twelve-step rebuild — `ddl::sqlite_rebuild_sql`),
-**views** and **triggers**, but has **no manual-transaction mode** — a statement about SQLite
-rather than unfinished work (`db::session::Session::open` carries the reason). **SQL Server is a
-preview** (`db::mssql`, on a vendored `tiberius` — `vendor/tiberius/PATCHES.md`): it reads,
-introspects, runs scripts, writes grid edits back, imports files, designs tables, edits views, holds a Manual tab's
-transaction, shows query plans, dumps to `.sql`, opens `sqlcmd`, edits triggers and routines,
-manages logins and database users (on Azure SQL Database contained and Entra users, its logins
-being `master`'s), and signs in with a SQL login, Windows (SSPI, in the Windows
+**Four engines, and they are not equal.** MySQL/MariaDB, PostgreSQL and SQL Server are full;
+SQLite reads, writes, imports and edits **tables** (through the twelve-step rebuild —
+`ddl::sqlite_rebuild_sql`), **views** and **triggers**, but has **no manual-transaction mode** — a
+statement about SQLite rather than unfinished work (`db::session::Session::open` carries the
+reason). **SQL Server** (`db::mssql`, on a vendored `tiberius` — `vendor/tiberius/PATCHES.md`)
+reads, introspects, runs scripts, writes grid edits back, imports files, designs tables, edits
+views, holds a Manual tab's transaction, shows query plans, dumps to `.sql`, opens `sqlcmd`, edits
+triggers and routines, manages logins and database users (on Azure SQL Database contained and Entra
+users, its logins being `master`'s), and signs in with a SQL login, Windows (SSPI, in the Windows
 build) or Microsoft Entra through the Azure CLI, and rebuilds a table for the column changes
 T-SQL's `ALTER COLUMN` cannot make (`ddl::tsql_rebuild_sql`, as SQLite's twelve-step rebuild
-does). What differs between the
+does). What it does not do yet is named, not implied by a label: creating or dropping a
+**database or schema** (`mssql::run_server_ddl` refuses, and `ddl::supports_change` answers no
+through `tsql_supports`), and **sequences, alias types, synonyms and XML schema collections** are
+read for the dump but have no tree entry, editor or comparison. What differs between the
 engines now lives in the *narrow* predicates that decide how an edit is performed rather than
 whether it is offered: `ddl::supports_or_replace_view`, `supports_view_rename`,
 `supports_column_reorder`, `rebuilds_tables`, `supports_change`, `alter_column_disturbs_checks`,

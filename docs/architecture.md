@@ -7,11 +7,14 @@ has no manual-transaction mode — see `db::session`'s `Session::open` for what 
 statement about. All three engines now edit all three of those objects, and they get there
 differently, so ask the *narrow* capability (`ddl::supports_or_replace_view`,
 `ddl::supports_view_rename`) rather than the engine. **Microsoft SQL Server is a fourth, and a
-preview rather than a peer**: it connects, reads, validates, introspects, runs scripts, writes
-the grid's edits back, imports a file into a table, designs tables, edits views, triggers and
-stored routines, drops a table, view or routine, holds a Manual tab's transaction, shows a query
-plan, dumps a database to a `.sql` file, and browses and administers its logins, database users
-and their grants — see `db::mssql`.
+full one, as MySQL/MariaDB and PostgreSQL are**: it connects, reads, validates, introspects, runs
+scripts, writes the grid's edits back, imports a file into a table, designs tables, edits views,
+triggers and stored routines, drops a table, view or routine, holds a Manual tab's transaction,
+shows a query plan, dumps a database to a `.sql` file, and browses and administers its logins,
+database users and their grants. What it does not do yet is named rather than left to a label: it
+creates and drops no **database** and no **schema**, and its sequences, alias types, synonyms and
+XML schema collections are read for the dump alone, with no tree entry, editor or comparison — see
+`db::mssql`.
 
 This is the project's reference document: the crate/module map, the architecture invariants, the
 UI conventions, and the Floem hazards each subsystem is built on. `CLAUDE.md` at the repo root
@@ -11359,8 +11362,8 @@ existing prose was left alone.
     and `the_wider_scan_reaches_the_keyring_store` asserts this file is among what it reads —
     `ui/source_gate.rs` has the per-label floors.
 - `schemaic-db` — MySQL/MariaDB (`mysql_async`) in `mysql.rs`, PostgreSQL in `pg.rs`,
-  SQLite in `sqlite.rs`, SQL Server (`tiberius`, vendored) in `mssql.rs` — a preview, see its
-  entry — SSH tunnels in `ssh.rs`, and
+  SQLite in `sqlite.rs`, SQL Server (`tiberius`, vendored) in `mssql.rs`, SSH tunnels in
+  `ssh.rs`, and
   the pinned manual-transaction connection in `session.rs`.
   **Three engines and three modules — the move is finished.** For most of the crate's life MySQL
   had no module: its bodies were inline in `lib.rs`, so `pg.rs` and `sqlite.rs` were peers of each
@@ -12941,8 +12944,8 @@ existing prose was left alone.
   reason — a `Session` cannot exist without a live connection, and reading MySQL's forgiving model
   as PostgreSQL's poisoned one is the difference between "still committable" and "discard
   everything".
-  **`mssql.rs` is the fourth engine — SQL Server over TDS, through `tiberius` 0.13 — and a preview,
-  not parity.** What it does: connect (following **one** routing redirect, which is how Azure SQL's
+  **`mssql.rs` is the fourth engine — SQL Server over TDS, through `tiberius` 0.13.** What it does:
+  connect (following **one** routing redirect, which is how Azure SQL's
   gateway hands a client to the node that serves its database), `ping`, the database list,
   `fetch_query` and `run_batch` (with `Enforce`, above), `prepare_check`, `fetch_table_list` and
   `fetch_schema`, the monitor's `fetch_table`, `count_rows` (`COUNT_BIG`), table statistics from
@@ -12950,8 +12953,20 @@ existing prose was left alone.
   `commit_writes`, `refetch_rows` and `fetch_blob` (below) — `import_rows` (below), and `run_ddl`,
   for the table changes `supports_change` admits (below), a Manual tab's pinned `Session`
   (below), `explain`, the estimated and the measured plan (below), and the account browser's
-  `fetch_principals` and `fetch_grants` (below). `run_server_ddl` answers
-  `DbError::Refused("… is not available for SQL Server yet.")`. **The refusals are the backstop,
+  `fetch_principals` and `fetch_grants` (below). `run_server_ddl` — a database's create and drop —
+  is the one entry point not written, and answers
+  `DbError::Refused("… is not available for SQL Server yet.")`. **What it does not do yet is named
+  here rather than left to a label**: the engine was called a preview until the rest was written,
+  and the word had come to read as half-built, which it is not. A database's create and drop are
+  that refusal; a schema's are `CreateSchema` and `DropSchema`, which fall to `tsql_supports`'s
+  catch-all `false` (under `ddl.rs`), so a comparison into a database that lacks a schema other
+  than the four every database has (`ddl::namespace_comes_with_every_database`) is withheld whole;
+  sequences, alias types, synonyms and XML schema collections are read into `TsqlObject` for the
+  dump alone (under `dump.rs`), with no tree entry, editor or comparison; a named instance's port
+  is not asked of SQL Server Browser and has to be given (`ImportNote::NamedInstance`, under
+  `conn_import.rs`); and an index with included columns, or a columnstore, XML or spatial one, is
+  read as `IndexInfo::lossy` rather than authored, so a rebuild and a view edit refuse to touch it
+  rather than drop it (`tsql_rebuild_refusals`, `lossy_view_index_refusal`). **The refusals are the backstop,
   not the gate**: the app is kept off them by
   capabilities, each an exhaustive `match` with `MsSql` on `false`, asked at the UI site that
   offers the thing — chief among them
@@ -13003,8 +13018,10 @@ existing prose was left alone.
   on `supports_routine_editing`, so nothing in the menu changed but the test's expected list
   (`object_menu_tests::sql_server_offers_its_table_changes_and_a_views_drop`,
   `a_standalone_objects_drop_is_offered_only_where_its_statement_emits`,
-  `create_menu_tests::sql_server_is_offered_a_table_a_view_and_its_routines`). Unlike SQLite's gaps, all
-  of these are **unfinished work**, not statements about the engine. `edit::supports_grid_writes`
+  `create_menu_tests::sql_server_is_offered_a_table_a_view_and_its_routines`). Unlike SQLite's gaps,
+  the capabilities that said no for want of code were **unfinished work**, not statements about the
+  engine; the noes that *are* about it — the materialized view above, a read-only connection's
+  Manual mode and *Cancel query* below — say so where they stand. `edit::supports_grid_writes`
   was one of them and is the first to have come back: asked inside `analyze_edit`, it kept every
   cell unwritable until the write-back below landed, and it answers `true` for all four engines now
   — kept an exhaustive `match` rather than deleted, so the next engine, arriving without a
