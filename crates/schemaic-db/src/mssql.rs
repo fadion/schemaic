@@ -5047,7 +5047,8 @@ mod tests {
     /// missing, one at a time, so no listing leans on another's answer.
     #[test]
     fn a_listing_names_no_catalogue_column_the_server_has_not_got() {
-        let gated: [(&str, fn(&mut Catalogue)); 7] = [
+        type Without = fn(&mut Catalogue);
+        let gated: [(&str, Without); 7] = [
             ("graph_type", |c| c.graph_type = false),
             ("is_node", |c| c.graph_tables = false),
             ("temporal_type", |c| c.temporal_type = false),

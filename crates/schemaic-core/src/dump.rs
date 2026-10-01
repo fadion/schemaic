@@ -1463,7 +1463,7 @@ fn tsql_named(
 fn tsql_named_by_routines(
     schema: &DbSchema,
     namespaces: &[Option<String>],
-    skip: &std::collections::HashSet<(Option<String>, String)>,
+    skip: &RoutineKeys,
     o: &crate::schema::TsqlObject,
 ) -> bool {
     let local = schema
@@ -1657,6 +1657,9 @@ fn binds_at_create(r: &crate::schema::RoutineInfo) -> bool {
             && r.returns.trim().eq_ignore_ascii_case("TABLE"))
 }
 
+/// Routines by `(namespace, name)`.
+type RoutineKeys = std::collections::HashSet<(Option<String>, String)>;
+
 /// What has to be left out of the file **with** the tables in `gone` (indices
 /// into `schema.tables`), which it does not create: every view in `order`
 /// reading one, every table in `order` whose expressions call a routine
@@ -1674,11 +1677,7 @@ fn dependents_left_out(
     order: &[usize],
     gone: &[usize],
     dialect: SqlDialect,
-) -> (
-    std::collections::HashSet<usize>,
-    std::collections::HashSet<(Option<String>, String)>,
-    Vec<String>,
-) {
+) -> (std::collections::HashSet<usize>, RoutineKeys, Vec<String>) {
     let mut out_tables = std::collections::HashSet::new();
     let mut out_routines = std::collections::HashSet::new();
     let mut labels = Vec::new();
@@ -7532,10 +7531,7 @@ mod tests {
         assert!(!table_ddl.contains("c_pos"), "{file}");
         let held = pos(&file, "ADD CONSTRAINT \"c_pos\" CHECK ((id > 0)) NOT VALID");
         assert!(rows < held, "{file}");
-        assert!(
-            file.contains("\"parent\" (\"id\") NOT VALID;"),
-            "{file}"
-        );
+        assert!(file.contains("\"parent\" (\"id\") NOT VALID;"), "{file}");
         // Copy DDL has no rows to wait for, and keeps the check inline.
         assert!(
             s.tables[1]
