@@ -980,7 +980,10 @@ existing prose was left alone.
     synonym, table type, queue and the like, `CREATE`/`UPDATE STATISTICS`, `INSERT … EXEC`, a
     `DELETE t WHERE` with no `FROM`, and the T-SQL forms of `ALTER TABLE` (`ALTER COLUMN`, `ADD …
     DEFAULT … FOR`, `[NO]CHECK`, `SWITCH`, …). The server stays the authority for those, as for
-    everything else; the other three engines answer `false`. **A clause the grammar lacks inside an
+    everything else. MySQL and SQLite answer `false`; PostgreSQL withholds a `DO` block's alone,
+    which its grammar lacks outright and whose body is a string to the lexer, so nothing inside it
+    went unchecked before — a `DO;` with no body still errs (`a_postgres_do_block_draws_no_error`).
+    **A clause the grammar lacks inside an
     ordinary statement is read past rather than given up at**: `grammar_gap_masks` finds T-SQL's
     query hint `OPTION (…)` at the top level, `WITH ROLLUP`/`WITH CUBE` after a `GROUP BY` at the
     same depth, and `GROUPING SETS (…)` (`MsSqlDialect` leaves `supports_group_by_expr` off, so

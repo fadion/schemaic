@@ -6006,7 +6006,7 @@ fn unit_diagnostics(
         }
         // Don't nag about the fragment the user is still typing, nor about a
         // statement the parser has no grammar for.
-        Err(e) if !is_typing_tail && !parser_lacks_statement(&toks, dialect) => {
+        Err(e) if !is_typing_tail && !parser_lacks_statement(sql, &toks, dialect) => {
             let (loc, msg) = split_error_location(&e.to_string());
             let range = match loc {
                 Some((line, col)) => {
@@ -7763,9 +7763,36 @@ fn as_declares_a_type(toks: &[Token], declaring: &[bool], i: usize, dialect: Sql
 /// `REBUILD`, `ENABLE`/`DISABLE`, `SET (…)`). Where a construct is a clause
 /// rather than a whole statement it is read past instead
 /// ([`grammar_gap_masks`]), which keeps the rest of the statement checked.
-fn parser_lacks_statement(toks: &[Token], dialect: SqlDialect) -> bool {
+///
+/// PostgreSQL's: a `DO` block, which sqlparser has no grammar for at all —
+/// `DO $$ … $$`, `DO LANGUAGE plpgsql '…'`. Its body is a string to the
+/// lexer, so nothing inside it goes unchecked that was checked before; a `DO`
+/// with no body after it (`DO;`) still errs.
+///
+/// `toks` are `sql`'s.
+fn parser_lacks_statement(sql: &str, toks: &[Token], dialect: SqlDialect) -> bool {
     match dialect {
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+        SqlDialect::MySql | SqlDialect::Sqlite => false,
+        SqlDialect::Postgres => match toks.first() {
+            Some(t)
+                if !t.quoted
+                    && matches!(&t.kind, TkKind::Word(w) if w.eq_ignore_ascii_case("DO")) =>
+            {
+                let b = sql.as_bytes();
+                let mut p = t.end;
+                while b.get(p).is_some_and(u8::is_ascii_whitespace) {
+                    p += 1;
+                }
+                // The body: a dollar-quoted or ordinary string, `E'…'` too.
+                let body = match b.get(p) {
+                    Some(b'$' | b'\'') => true,
+                    Some(b'E' | b'e') => b.get(p + 1) == Some(&b'\''),
+                    _ => false,
+                };
+                body || head_words(toks, 2).get(1).is_some_and(|w| w == "LANGUAGE")
+            }
+            _ => false,
+        },
         SqlDialect::MsSql => {
             let w = head_words(toks, 4);
             let w: Vec<&str> = w.iter().map(String::as_str).collect();
@@ -14890,6 +14917,29 @@ mod tests {
             let d = diag_d(&s.body, SqlDialect::MsSql);
             assert!(d.is_empty(), "{}: {d:?}", s.name);
         }
+    }
+
+    /// **PostgreSQL's `DO` block is a statement the parser lacks**
+    /// (S7.2-L1-04), and drew "Expected: an SQL statement, found: DO". Its
+    /// body is a string to the lexer, so withholding the parse error loses
+    /// nothing inside it. PostgreSQL 16 runs each of these.
+    #[test]
+    fn a_postgres_do_block_draws_no_error() {
+        for sql in [
+            "DO $$ BEGIN RAISE NOTICE 'x'; END $$;\nSELECT 1;",
+            "DO LANGUAGE plpgsql $$ BEGIN PERFORM 1; END $$;",
+            "DO $body$ BEGIN NULL; END $body$ LANGUAGE plpgsql;",
+            "DO 'BEGIN NULL; END';",
+        ] {
+            let d = diag_d(sql, SqlDialect::Postgres);
+            assert!(d.is_empty(), "{sql}: {d:?}");
+        }
+        // A `DO` with no body is still the error it is.
+        let d = diag_d("DO;\nSELECT 1;", SqlDialect::Postgres);
+        assert!(
+            d.iter().any(|x| x.message.starts_with("Syntax error")),
+            "{d:?}"
+        );
     }
 
     /// **Only a T-SQL write's target may name an alias its own `FROM`
