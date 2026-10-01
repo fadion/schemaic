@@ -3997,7 +3997,9 @@ impl Change {
             // and where an account can be *denied* (`users::supports_deny`),
             // revoking the privilege lifts a `DENY` of it, which gives access
             // back wherever a role grants it. Both measured on SQL Server 2022,
-            // where the sentence named only the account.
+            // where the sentence named only the account — and either one
+            // means granting it back does not undo the revoke, so there it
+            // takes the strong heading (`risk_is_reversible`).
             Change::RevokePrivileges(c) => {
                 let what = Self::privilege_words(&c.privileges);
                 let who = c.account.display();
@@ -4143,14 +4145,23 @@ impl Change {
     /// can't be undone" over a widened privilege would spend, on the one plan
     /// that is genuinely a keystroke away from being taken back, the heading
     /// `DROP USER` needs to keep.
-    fn risk_is_reversible(&self) -> bool {
-        matches!(
-            self,
-            Change::RevokePrivileges(_)
-                | Change::RevokeRole(_)
-                | Change::CreateAccount(_)
-                | Change::GrantPrivileges(_)
-        )
+    ///
+    /// **A revoke is reversible only where granting it back restores it**,
+    /// which is not SQL Server: there the revoke carries `CASCADE`
+    /// (`users::revoke_cascades`), so the grants it took from accounts the
+    /// grantee had granted it to do not come back, and it lifts a `DENY`
+    /// (`users::supports_deny`), which a grant turns into a grant rather than
+    /// restoring. Its own sentence says both, and the mild heading over it
+    /// said the opposite. Asked of the engine's facts, so a revoke elsewhere
+    /// keeps the heading its reason earns.
+    fn risk_is_reversible(&self, dialect: SqlDialect) -> bool {
+        match self {
+            Change::RevokePrivileges(_) => {
+                !crate::users::revoke_cascades(dialect) && !crate::users::supports_deny(dialect)
+            }
+            Change::RevokeRole(_) | Change::CreateAccount(_) | Change::GrantPrivileges(_) => true,
+            _ => false,
+        }
     }
 }
 
@@ -4997,7 +5008,9 @@ impl ChangeSet {
     /// comparing headings as strings and silently agreeing with all of them the
     /// day one is reworded.
     pub fn risk_reversible(&self) -> bool {
-        self.changes.iter().all(Change::risk_is_reversible)
+        self.changes
+            .iter()
+            .all(|c| c.risk_is_reversible(self.dialect))
     }
 
     /// The script as it may **leave** the preview — for the clipboard, and for
@@ -31215,6 +31228,36 @@ mod database_tests {
         assert!(
             !my.contains("DENY") && !my.contains("granted it on to"),
             "{my}"
+        );
+    }
+
+    /// **And a SQL Server revoke cannot be undone by granting it back**, which
+    /// is the reason a revoke is headed "Before you apply": granting the
+    /// privilege again restores neither the grants its `CASCADE` took from
+    /// other accounts nor a `DENY` it lifted — over which the grant widens
+    /// access further. The heading said the opposite of the sentence it headed.
+    /// MySQL's revoke has neither, and keeps the mild heading.
+    #[test]
+    fn a_sql_server_revoke_is_headed_as_one_that_cannot_be_undone() {
+        let (_, user) = ms_login_and_user();
+        let revoke = Box::new(crate::users::PrivilegeChange {
+            account: user,
+            level: crate::users::GrantLevel::Schema("dbo".into()),
+            privileges: vec!["SELECT".into()],
+            with_grant_option: false,
+        });
+        assert_eq!(
+            account("app", SqlDialect::MsSql, Change::RevokePrivileges(revoke)).risk_heading(),
+            "This can't be undone"
+        );
+        assert_eq!(
+            account(
+                "app@%",
+                MySql,
+                Change::RevokePrivileges(a_privilege_change(&["SELECT"]))
+            )
+            .risk_heading(),
+            "Before you apply"
         );
     }
 

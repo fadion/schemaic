@@ -3995,7 +3995,12 @@ existing prose was left alone.
     A revoke's own sentence says it destroys no data and is undone by granting it back,
     and it appeared under the strong heading two entries away from `DROP USER`, which is the one
     modal where that heading has to keep its meaning. It is here rather than in the view because it
-    is a claim about the changes.
+    is a claim about the changes. **A SQL Server revoke is not on the list**, since that reason is
+    false there: its `CASCADE` takes the privilege from accounts the grantee granted it to and its
+    revoke lifts a `DENY`, and granting it back restores neither — over a lifted `DENY` the grant
+    widens access further — so `risk_is_reversible` takes the dialect and a revoke is reversible
+    only where neither `users::revoke_cascades` nor `users::supports_deny` holds
+    (`a_sql_server_revoke_is_headed_as_one_that_cannot_be_undone`).
     **What leaves the preview is `ChangeSet::export_script`, and it carries no password.** A
     `CREATE USER … IDENTIFIED BY 'hunter2'` was the one plan this app emits that holds a plaintext
     credential — `ALTER USER … IDENTIFIED BY` is the second — and both exits from the modal put it
