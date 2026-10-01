@@ -3060,6 +3060,44 @@ async fn a_modules_header_comments_survive_an_edit() {
     );
 }
 
+/// **A comment where a header's parts meet survives the rebuild.** A view's
+/// column list typed one column a line, each with a `--` note, is stored as
+/// typed; the rebuild closed it with `) AS` on the note's line, inside the
+/// comment, so its edit, its Copy DDL and a dump of it all failed with Msg
+/// 156. Edited, and its script replayed after a real drop, it is still the
+/// view it was.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_comment_where_a_modules_header_parts_meet_survives_its_rebuild() {
+    use schemaic_core::ddl::{ViewDraft, diff_view};
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("ddl_header_line_comments").await;
+    s.exec(
+        "CREATE VIEW dbo.v_lc (\n  id, -- the key\n  name -- display\n) AS SELECT 1 AS a, 2 AS b",
+    )
+    .await;
+    let apply = |stmts: Vec<String>| {
+        let db = s.db.clone();
+        let name = s.name.clone();
+        async move {
+            db.run_ddl(&name, &stmts, CancellationToken::new())
+                .await
+                .unwrap_or_else(|e| panic!("{e}\n{stmts:#?}"));
+        }
+    };
+
+    let v = read_table(&s, "v_lc").await;
+    let mut d = ViewDraft::from_table(&v).unwrap();
+    assert!(diff_view(&v, &d, MS).is_empty());
+    d.select = "SELECT 1 AS a, 3 AS b".into();
+    apply(diff_view(&v, &d, MS).emit()).await;
+    assert_eq!(s.scalar("SELECT name FROM dbo.v_lc").await, "3");
+    let ddl = read_table(&s, "v_lc").await.create_ddl(MS);
+    replay(&s, &format!("DROP VIEW dbo.v_lc;\nGO\n{ddl}\nGO")).await;
+    assert_eq!(s.scalar("SELECT name FROM dbo.v_lc").await, "3", "{ddl}");
+}
+
 /// **A module created under `ANSI_NULLS OFF` or `QUOTED_IDENTIFIER OFF`
 /// keeps it through an edit.** `CREATE` has no clause for either; the module
 /// takes the session's, and Schemaic's is an ANSI-defaults one, so an edit

@@ -6740,9 +6740,18 @@ fn create_view_sql(v: &ViewDraft, name: &str, dialect: SqlDialect, replace: bool
     sql.push_str(&qualified(name, v.schema.as_deref(), dialect));
     // The explicit column list SQLite and SQL Server keep, restated because a
     // re-create — or T-SQL's `ALTER VIEW` — would otherwise rename the view's
-    // columns to whatever the body calls them.
+    // columns to whatever the body calls them. The list is kept verbatim and
+    // may end in a `--` comment — SQL Server stores the one-column-a-line
+    // style as typed — which would run on over a `) AS` written after it on
+    // the same line, so that `)` then goes on a line of its own, as a
+    // function's parameter list closes.
     if let Some(cols) = set(&o.column_list).filter(|_| view_keeps_column_list(dialect)) {
-        sql.push_str(&format!(" ({cols})"));
+        let close = if pairs::region_at(cols, cols.len() - 1, dialect) == pairs::Region::Comment {
+            "\n)"
+        } else {
+            ")"
+        };
+        sql.push_str(&format!(" ({cols}{close}"));
     }
     if pg && !o.storage.is_empty() {
         sql.push_str(&format!(" WITH ({})", o.storage.join(", ")));
@@ -27494,6 +27503,45 @@ mod tsql_view_read_tests {
         let back = parts(&sql);
         assert_eq!(back.header_comments, p.header_comments, "{sql}");
         assert_eq!(back.column_list, p.column_list);
+    }
+
+    /// **A column list that ends in a `--` comment is closed on a line of its
+    /// own** — the multi-line style SQL Server stores as typed. Written on one
+    /// line, the `) AS` sat inside the comment, and every edit, Copy DDL and
+    /// dump restore of the view failed with Msg 156 (S6.1-L1-02, measured on
+    /// 2022). The function's parameter list had the same fix already.
+    #[test]
+    fn a_view_column_list_ending_in_a_line_comment_is_closed_after_it() {
+        let stored = "CREATE VIEW dbo.v (\n  id, -- the key\n  name -- display\n) AS SELECT 1 AS id, 2 AS name";
+        let p = parts(stored);
+        assert_eq!(
+            p.column_list.as_deref(),
+            Some("id, -- the key\n  name -- display")
+        );
+        let v = TableInfo {
+            name: "v".into(),
+            schema: Some("dbo".into()),
+            is_view: true,
+            view_definition: Some(p.body.clone()),
+            view_options: Some(ViewOptions {
+                column_list: p.column_list.clone(),
+                ..ViewOptions::default()
+            }),
+            ..TableInfo::default()
+        };
+        // Copy DDL and the dump, then an edit's plan: each reads back whole.
+        let copied = view_ddl(&v, SqlDialect::MsSql).unwrap();
+        let mut d = ViewDraft::from_table(&v).unwrap();
+        d.select = "SELECT 1 AS id, 3 AS name".into();
+        let edited = diff_view(&v, &d, SqlDialect::MsSql).emit().join("\n");
+        for (sql, body) in [
+            (&copied, "SELECT 1 AS id, 2 AS name"),
+            (&edited, "SELECT 1 AS id, 3 AS name"),
+        ] {
+            let back = parts(sql);
+            assert_eq!(back.column_list, p.column_list, "{sql}");
+            assert_eq!(back.body, body, "{sql}");
+        }
     }
 
     /// Refused, not guessed at: `ENCRYPTION`, an attribute Schemaic does not
