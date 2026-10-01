@@ -3598,6 +3598,31 @@ fn tokenize_range(sql: &str, lo: usize, hi: usize, dialect: SqlDialect) -> Vec<T
             i = j;
             continue;
         }
+        // A number is no token, and its decimal point is not a qualifier's
+        // dot: `@x < 0.0 SELECT …` read as `@x . SELECT`, a qualified name,
+        // which hid the `SELECT` that begins the next T-SQL statement.
+        let digit = |j: usize| b.get(j).is_some_and(u8::is_ascii_digit);
+        let after_name =
+            i > lo && (is_word_byte(b[i - 1]) || matches!(b[i - 1], b']' | b'"' | b'`'));
+        if c.is_ascii_digit() || (c == b'.' && digit(i + 1) && !after_name) {
+            let mut j = i + 1;
+            while j < hi
+                && (b[j].is_ascii_alphanumeric()
+                    || b[j] == b'_'
+                    || (b[j] == b'.' && digit(j + 1))
+                    || (matches!(b[j], b'+' | b'-')
+                        && matches!(b[j - 1], b'e' | b'E')
+                        && digit(j + 1)))
+            {
+                j += 1;
+            }
+            // `1.` is a number too.
+            if j < hi && b[j] == b'.' && !b.get(j + 1).is_some_and(|&n| is_word_start(n)) {
+                j += 1;
+            }
+            i = j;
+            continue;
+        }
         match c {
             b'.' => push(&mut out, &mut semi, i, i + 1, TkKind::Dot),
             b',' => push(&mut out, &mut semi, i, i + 1, TkKind::Comma),
@@ -5203,12 +5228,27 @@ fn range_diagnostics(
     let terminated = sql.as_bytes().get(hi - 1) == Some(&b';');
     let units = statement_units(sql, lo, hi, dialect);
     let n = units.len();
-    for (k, &(ulo, uhi)) in units.iter().enumerate() {
+    for (k, &(ulo, uhi, kind)) in units.iter().enumerate() {
         let is_typing_tail = is_last && k + 1 == n && !terminated;
-        statement_diagnostics(sql, ulo, uhi, is_typing_tail, catalog, dialect, out);
+        if kind != UnitKind::Structure {
+            unit_diagnostics(sql, ulo, uhi, kind, is_typing_tail, catalog, dialect, out);
+        }
     }
     typo_checks(sql, lo, hi, catalog, dialect, out);
     function_typo_checks(sql, lo, hi, catalog, dialect, out);
+}
+
+/// What one of a range's [`statement_units`] is, to the checks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UnitKind {
+    /// Statements, parsed and checked.
+    Statement,
+    /// An `IF`/`WHILE` condition, parsed as an expression and checked.
+    Condition,
+    /// Control-of-flow the checker reads itself rather than hands to the
+    /// parser: `BEGIN`/`END` (with `TRY`/`CATCH`), `ELSE`, `IF`, `WHILE`, a
+    /// label, `GOTO`, `BREAK`, `CONTINUE`.
+    Structure,
 }
 
 /// Does `dialect` end a statement **without a `;`** — at the next one's first
@@ -5239,30 +5279,186 @@ fn parse_statements(
         .parse_statements()
 }
 
-/// The statements one range holds, as byte ranges that tile it: the range
-/// whole, except where [`statements_need_no_terminator`] — there it is cut
-/// before each statement's first word ([`tsql_statement_starts`]). A routine
-/// is one statement whatever it holds.
-fn statement_units(sql: &str, lo: usize, hi: usize, dialect: SqlDialect) -> Vec<(usize, usize)> {
+/// `text` parsed as one expression — an `IF`/`WHILE` condition — and nothing
+/// after it.
+fn parse_condition(text: &str, dialect: SqlDialect) -> Result<(), sqlparser::parser::ParserError> {
+    let d = dialect.parser();
+    let mut p = sqlparser::parser::Parser::new(&*d).try_with_sql(text)?;
+    p.parse_expr()?;
+    p.expect_token(&sqlparser::tokenizer::Token::EOF)?;
+    Ok(())
+}
+
+/// The units one range holds, as byte ranges that tile it: the range whole,
+/// one statement, except where [`statements_need_no_terminator`] — there
+/// [`tsql_units`] cuts it into statements, `IF`/`WHILE` conditions and the
+/// control-of-flow around them.
+fn statement_units(
+    sql: &str,
+    lo: usize,
+    hi: usize,
+    dialect: SqlDialect,
+) -> Vec<(usize, usize, UnitKind)> {
     if !statements_need_no_terminator(dialect) {
-        return vec![(lo, hi)];
+        return vec![(lo, hi, UnitKind::Statement)];
     }
     let toks = tokenize_range(sql, lo, hi, dialect);
-    if is_routine_statement(&toks) {
-        return vec![(lo, hi)];
+    let marks = tsql_units(sql, &toks, dialect);
+    if marks.is_empty() {
+        return vec![(lo, hi, UnitKind::Statement)];
     }
-    let mut out = Vec::new();
-    let mut from = lo;
-    for s in tsql_statement_starts(&toks) {
-        out.push((from, toks[s].at));
-        from = toks[s].at;
+    let mut out = Vec::with_capacity(marks.len());
+    for (k, &(start, kind)) in marks.iter().enumerate() {
+        let from = if k == 0 { lo } else { toks[start].at };
+        let to = marks.get(k + 1).map_or(hi, |&(next, _)| toks[next].at);
+        out.push((from, to, kind));
     }
-    out.push((from, hi));
     out
 }
 
-/// Where each T-SQL statement after the first begins, as indices into `toks`
-/// (one range's tokens) — at a `;`, or before a word that begins one.
+/// An unquoted word at `toks[j]` that can be a keyword — not a qualified
+/// name's part, not a variable or a temporary table — upper-cased.
+fn tsql_keyword(toks: &[Token], j: usize) -> Option<String> {
+    let t = toks.get(j)?;
+    let TkKind::Word(w) = &t.kind else {
+        return None;
+    };
+    let qualified = j > 0 && matches!(toks[j - 1].kind, TkKind::Dot);
+    (!t.quoted && !qualified && !w.starts_with(['@', '#'])).then(|| w.to_ascii_uppercase())
+}
+
+/// Is `toks[j]` a T-SQL **label** — `retry:`, a word with a `:` right after
+/// it? (`lbl :` is not one: SQL Server refuses it, measured. `::` is a scope
+/// qualifier, `SCHEMA::dbo`.)
+fn is_label(sql: &str, toks: &[Token], j: usize) -> bool {
+    let b = sql.as_bytes();
+    tsql_keyword(toks, j).is_some()
+        && toks
+            .get(j)
+            .is_some_and(|t| b.get(t.end) == Some(&b':') && b.get(t.end + 1) != Some(&b':'))
+}
+
+/// One range's T-SQL units — each a starting index into `toks` and its
+/// [`UnitKind`], in order, the first at `0`.
+///
+/// **Control-of-flow is read here rather than handed to the parser.**
+/// sqlparser's T-SQL grammar has no `TRY … CATCH`, label, `GOTO`, `BREAK` or
+/// `CONTINUE`, and it reads a `BEGIN … END` block or an `IF … ELSE` whole — so
+/// one construct it lacks anywhere inside took the whole block down, and a
+/// `;` inside a block, where the editor's statement bounds cut, left it an
+/// unclosed `BEGIN`. Each keyword is [`UnitKind::Structure`]; an `IF`'s or
+/// `WHILE`'s condition, up to the statement it governs, is a
+/// [`UnitKind::Condition`]; and the statements between, found by
+/// [`tsql_statement_end`], are checked one by one. A routine's header, up to
+/// the `AS` its body follows ([`routine_body_as`]), is a statement of its own
+/// — [`parser_lacks_statement`] withholds its parse error — and its body is
+/// read the same way. The result does not depend on where the range was cut:
+/// a block handed over whole and the same block in several ranges give the
+/// same units.
+fn tsql_units(sql: &str, toks: &[Token], dialect: SqlDialect) -> Vec<(usize, UnitKind)> {
+    let word = |j: usize| tsql_keyword(toks, j);
+    let mut marks = Vec::new();
+    let mut i = 0;
+    while i < toks.len() {
+        if let Some(end) = tsql_structure_at(sql, toks, i) {
+            marks.push((i, UnitKind::Structure));
+            i = end;
+            continue;
+        }
+        if matches!(word(i).as_deref(), Some("IF" | "WHILE")) {
+            marks.push((i, UnitKind::Structure));
+            let end = tsql_condition_end(sql, toks, i + 1);
+            if end > i + 1 {
+                marks.push((i + 1, UnitKind::Condition));
+            }
+            i = end;
+            continue;
+        }
+        marks.push((i, UnitKind::Statement));
+        if is_routine_statement(&toks[i..]) {
+            match routine_body_as(&toks[i..], dialect) {
+                Some(body) => i += body + 1,
+                None => break,
+            }
+            continue;
+        }
+        i = tsql_statement_end(sql, toks, i);
+    }
+    marks
+}
+
+/// If a control-of-flow keyword stands at `toks[i]`, the index just past it:
+/// `BEGIN` (a block — not `BEGIN TRAN`, `DISTRIBUTED`, `DIALOG` or
+/// `CONVERSATION`, nor `BEGIN ATOMIC`'s options, which it swallows), `BEGIN
+/// TRY`/`CATCH`, `END` (not `END CONVERSATION`) with its `TRY`/`CATCH`,
+/// `ELSE`, a label, `GOTO` and its label, `BREAK`, `CONTINUE`.
+fn tsql_structure_at(sql: &str, toks: &[Token], i: usize) -> Option<usize> {
+    let word = |j: usize| tsql_keyword(toks, j);
+    if is_label(sql, toks, i) {
+        return Some(i + 1);
+    }
+    match word(i)?.as_str() {
+        "BEGIN" => match word(i + 1).as_deref() {
+            Some("TRAN" | "TRANSACTION" | "WORK" | "DISTRIBUTED" | "DIALOG" | "CONVERSATION") => {
+                None
+            }
+            Some("TRY" | "CATCH") => Some(i + 2),
+            // A natively compiled body's `BEGIN ATOMIC WITH (…)`.
+            Some("ATOMIC") => {
+                let with = i + 2;
+                match (word(with).as_deref(), toks.get(with + 1).map(|t| &t.kind)) {
+                    (Some("WITH"), Some(TkKind::LParen)) => {
+                        Some(matching_paren(toks, with + 1).map_or(toks.len(), |c| c + 1))
+                    }
+                    _ => Some(i + 2),
+                }
+            }
+            _ => Some(i + 1),
+        },
+        "END" => match word(i + 1).as_deref() {
+            Some("CONVERSATION") => None,
+            Some("TRY" | "CATCH") => Some(i + 2),
+            _ => Some(i + 1),
+        },
+        "ELSE" | "BREAK" | "CONTINUE" => Some(i + 1),
+        "GOTO" => Some(if word(i + 1).is_some() { i + 2 } else { i + 1 }),
+        _ => None,
+    }
+}
+
+/// Where an `IF`'s or `WHILE`'s condition, starting at `toks[i]`, ends: at the
+/// first top-level word — outside a `CASE` — that begins the statement it
+/// governs, a label, or a `;`. A condition's subqueries sit in parentheses, so
+/// no statement's first word stands at its top level, bar a trigger's
+/// `UPDATE(col)`.
+fn tsql_condition_end(sql: &str, toks: &[Token], i: usize) -> usize {
+    let heads = unterminated_statement_heads(SqlDialect::MsSql);
+    let mut depth = 0usize;
+    let mut case = 0usize;
+    for (j, t) in toks.iter().enumerate().skip(i) {
+        match &t.kind {
+            TkKind::LParen => depth += 1,
+            TkKind::RParen => depth = depth.saturating_sub(1),
+            _ if depth > 0 => {}
+            _ if j > i && (t.after_semicolon || is_label(sql, toks, j)) => return j,
+            _ => match tsql_keyword(toks, j).as_deref() {
+                Some("CASE") => case += 1,
+                Some("END") if case > 0 => case -= 1,
+                Some("ELSE") if case > 0 => {}
+                Some("UPDATE")
+                    if matches!(toks.get(j + 1).map(|t| &t.kind), Some(TkKind::LParen)) => {}
+                Some(w) if j > i && (heads.contains(&w) || w == "WITH" || w == "USE") => {
+                    return j;
+                }
+                _ => {}
+            },
+        }
+    }
+    toks.len()
+}
+
+/// Where the T-SQL statement starting at `toks[i]` ends — at a `;`, a label,
+/// or a word that begins the next statement ([`TsqlStatement::cuts_before`]).
 ///
 /// **Not [`crate::sql::tsql_statements`]**, which finds where the statements
 /// the write guards ask about begin and can afford to cut in the wrong place:
@@ -5271,28 +5467,19 @@ fn statement_units(sql: &str, lo: usize, hi: usize, dialect: SqlDialect) -> Vec<
 /// `SELECT`, `ALTER TABLE t` from its `DROP COLUMN` — so this cuts only where a
 /// new statement must begin, and a cut it misses costs nothing: the unit is
 /// parsed without requiring `;` between statements ([`parse_statements`]),
-/// which is how the server reads it.
-///
-/// Only at the top level, outside a `CASE … END`, and never inside a
-/// `GRANT`/`REVOKE`/`DENY` (whose privilege list is made of these words) or a
-/// statement opened by control-of-flow — `IF`, `WHILE`, a `BEGIN … END`
-/// block — which the parser reads whole.
-fn tsql_statement_starts(toks: &[Token]) -> Vec<usize> {
-    // An unquoted word that can be a keyword: not a qualified name's part,
-    // not a variable or a temporary table.
-    let word = |j: usize| -> Option<String> {
-        let t = toks.get(j)?;
-        let TkKind::Word(w) = &t.kind else {
-            return None;
-        };
-        let qualified = j > 0 && matches!(toks[j - 1].kind, TkKind::Dot);
-        (!t.quoted && !qualified && !w.starts_with(['@', '#'])).then(|| w.to_ascii_uppercase())
-    };
+/// which is how the server reads it. Only at the top level, outside a
+/// `CASE … END`, and never inside a `GRANT`/`REVOKE`/`DENY`, whose privilege
+/// list is made of these words.
+fn tsql_statement_end(sql: &str, toks: &[Token], i: usize) -> usize {
+    let word = |j: usize| tsql_keyword(toks, j);
     let lparen = |j: usize| matches!(toks.get(j).map(|t| &t.kind), Some(TkKind::LParen));
-    let mut starts = Vec::new();
+    let mut st = TsqlStatement::begin(word(i));
+    st.observe(word(i).as_deref());
     let mut depth = 0usize;
-    let mut st = TsqlStatement::begin(word(0), word(1));
-    for (i, t) in toks.iter().enumerate() {
+    if lparen(i) {
+        depth = 1;
+    }
+    for (j, t) in toks.iter().enumerate().skip(i + 1) {
         match t.kind {
             TkKind::LParen => {
                 depth += 1;
@@ -5305,27 +5492,26 @@ fn tsql_statement_starts(toks: &[Token]) -> Vec<usize> {
             _ if depth > 0 => continue,
             _ => {}
         }
-        if i == 0 {
-            st.observe(word(0).as_deref());
-            continue;
-        }
-        let w = word(i);
-        let prev = word(i - 1);
-        let next = word(i + 1);
+        let w = word(j);
         let cut = t.after_semicolon
+            || is_label(sql, toks, j)
             || w.as_deref().is_some_and(|w| {
-                st.cuts_before(w, prev.as_deref(), next.as_deref(), lparen(i + 1))
+                st.cuts_before(
+                    w,
+                    word(j - 1).as_deref(),
+                    word(j + 1).as_deref(),
+                    lparen(j + 1),
+                )
             });
         if cut {
-            starts.push(i);
-            st = TsqlStatement::begin(w.clone(), next);
+            return j;
         }
         st.observe(w.as_deref());
     }
-    starts
+    toks.len()
 }
 
-/// What [`tsql_statement_starts`] knows of the statement it is inside.
+/// What [`tsql_statement_end`] knows of the statement it is inside.
 struct TsqlStatement {
     /// Its first word.
     head: Option<String>,
@@ -5338,29 +5524,17 @@ struct TsqlStatement {
     set: bool,
     /// Open `CASE`s, whose `END` and `ELSE` are theirs.
     case: usize,
-    /// Opened by control-of-flow the parser reads whole: never cut inside.
-    whole: bool,
 }
 
 impl TsqlStatement {
-    fn begin(head: Option<String>, next: Option<String>) -> TsqlStatement {
+    fn begin(head: Option<String>) -> TsqlStatement {
         let verb = head.clone().filter(|h| h != "WITH");
-        let whole = match head.as_deref() {
-            Some("IF" | "WHILE" | "ELSE" | "END") => true,
-            // A block, not `BEGIN TRAN`.
-            Some("BEGIN") => !matches!(
-                next.as_deref(),
-                Some("TRAN" | "TRANSACTION" | "WORK" | "DISTRIBUTED" | "DIALOG" | "CONVERSATION")
-            ),
-            _ => false,
-        };
         TsqlStatement {
             head,
             verb,
             rows: false,
             set: false,
             case: 0,
-            whole,
         }
     }
 
@@ -5372,7 +5546,7 @@ impl TsqlStatement {
     /// one? `prev`/`next` are the keyword-capable words either side of it,
     /// `call` whether a `(` follows it.
     fn cuts_before(&self, w: &str, prev: Option<&str>, next: Option<&str>, call: bool) -> bool {
-        if self.whole || self.head_is(&["GRANT", "REVOKE", "DENY"]) {
+        if self.head_is(&["GRANT", "REVOKE", "DENY"]) {
             return false;
         }
         let is = |x: Option<&str>, set: &[&str]| x.is_some_and(|x| set.contains(&x));
@@ -5385,7 +5559,7 @@ impl TsqlStatement {
                     || feeding
                     || inserting)
             }
-            "INSERT" => !(prev == Some("THEN") || feeding),
+            "INSERT" => !(is(prev, &["THEN", "BULK"]) || feeding),
             // `UPDATE(col)` is a trigger's function; `FOR UPDATE [OF]` a
             // cursor's; `ON UPDATE CASCADE` a key's.
             "UPDATE" => !(is(prev, &["THEN", "ON", "FOR", "OF"]) || call || feeding),
@@ -5434,8 +5608,38 @@ impl TsqlStatement {
             "ROLLBACK" | "GRANT" | "REVOKE" | "DENY" => prev != Some("WITH"),
             // `ALTER TABLE t ENABLE TRIGGER`, `ALTER INDEX … DISABLE`.
             "ENABLE" | "DISABLE" => !self.head_is(&["ALTER", "CREATE"]),
-            // `DROP TABLE IF EXISTS t`.
-            "IF" => !is(next, &["EXISTS", "NOT"]),
+            // `DROP TABLE IF EXISTS t`, `ALTER TABLE t DROP COLUMN IF EXISTS c`
+            // — and only there, right after the kind of object: `SELECT 1 IF
+            // EXISTS (…)` and `DROP TABLE t IF EXISTS (…)` hold an `IF`.
+            "IF" => {
+                !(self.head_is(&["DROP", "ALTER"])
+                    && next == Some("EXISTS")
+                    && is(
+                        prev,
+                        &[
+                            "TABLE",
+                            "VIEW",
+                            "PROC",
+                            "PROCEDURE",
+                            "FUNCTION",
+                            "TRIGGER",
+                            "INDEX",
+                            "SCHEMA",
+                            "TYPE",
+                            "SEQUENCE",
+                            "SYNONYM",
+                            "DATABASE",
+                            "USER",
+                            "ROLE",
+                            "DEFAULT",
+                            "RULE",
+                            "ASSEMBLY",
+                            "COLUMN",
+                            "CONSTRAINT",
+                            "STATISTICS",
+                        ],
+                    ))
+            }
             "END" | "ELSE" => self.case == 0,
             "DECLARE" | "PRINT" | "RAISERROR" | "THROW" | "RETURN" | "WAITFOR" | "USE"
             | "TRUNCATE" | "GOTO" | "BREAK" | "CONTINUE" | "OPEN" | "CLOSE" | "DEALLOCATE"
@@ -5471,11 +5675,11 @@ impl TsqlStatement {
     }
 }
 
-/// The parse-driven checks for one statement, `sql[lo..hi]`: its syntax error
-/// (withheld on the fragment still being typed, `is_typing_tail`, and on a
-/// statement the parser has no grammar for — [`parser_lacks_statement`]); on a
-/// clean parse the table and column checks; and, unconditionally, the
-/// reserved-alias check.
+/// The parse-driven checks for one unit, `sql[lo..hi]` — statements, or an
+/// `IF`/`WHILE` condition parsed as an expression: its syntax error (withheld
+/// on the fragment still being typed, `is_typing_tail`, and on a statement the
+/// parser has no grammar for — [`parser_lacks_statement`]); on a clean parse
+/// the table and column checks; and, unconditionally, the reserved-alias check.
 ///
 /// **A clause the parser lacks is read past, not given up at.** Where
 /// [`grammar_gap_masks`] finds one — T-SQL's `OPTION (…)`, `WITH ROLLUP`,
@@ -5484,17 +5688,19 @@ impl TsqlStatement {
 /// statement's only parse error used to be withheld when it landed on such a
 /// clause, and sqlparser stops at its first error, so a real error after the
 /// clause, and every check that needs a parse, went with it.
-fn statement_diagnostics(
+#[allow(clippy::too_many_arguments)]
+fn unit_diagnostics(
     sql: &str,
     lo: usize,
     hi: usize,
+    kind: UnitKind,
     is_typing_tail: bool,
     catalog: &Catalog,
     dialect: SqlDialect,
     out: &mut Vec<Diagnostic>,
 ) {
     let toks = tokenize_range(sql, lo, hi, dialect);
-    let masks = grammar_gap_masks(sql, &toks, dialect);
+    let masks = grammar_gap_masks(sql, hi, &toks, dialect);
     // The text the parser and the checks read. Masked or not, it is as long as
     // the statement, so a position in it is a position in `sql` less `lo`.
     let masked = (!masks.is_empty()).then(|| masked_text(sql, lo, hi, &masks));
@@ -5504,7 +5710,11 @@ fn statement_diagnostics(
     };
     let (tlo, thi) = (lo - base, hi - base);
     let mut found = Vec::new();
-    match parse_statements(&text[tlo..thi], dialect) {
+    let parsed = match kind {
+        UnitKind::Condition => parse_condition(&text[tlo..thi], dialect).map(|()| Vec::new()),
+        UnitKind::Statement | UnitKind::Structure => parse_statements(&text[tlo..thi], dialect),
+    };
+    match parsed {
         Ok(asts) => {
             table_existence_checks(text, tlo, thi, catalog, dialect, &asts, &mut found);
             match asts.as_slice() {
@@ -5513,7 +5723,8 @@ fn statement_diagnostics(
                 [ast @ sqlparser::ast::Statement::Query(_)] => {
                     colres::check(text, tlo, thi, catalog, dialect, ast, &mut found)
                 }
-                // Other statements (UPDATE/DELETE/…) → the flat qualified scan.
+                // Other statements (UPDATE/DELETE/…), and a condition, → the
+                // flat qualified scan.
                 _ => qualified_column_checks(text, tlo, thi, catalog, dialect, &mut found),
             }
         }
@@ -5595,9 +5806,43 @@ fn matching_paren(toks: &[Token], open: usize) -> Option<usize> {
     None
 }
 
+/// Does the keyword `w` stand at the top level of `toks`, at or after `from`?
+/// (Parentheses opened before `from` are taken as closed.)
+fn top_level_word_after(toks: &[Token], from: usize, w: &str) -> bool {
+    let mut depth = 0usize;
+    for (k, t) in toks.iter().enumerate().skip(from) {
+        match t.kind {
+            TkKind::LParen => depth += 1,
+            TkKind::RParen => depth = depth.saturating_sub(1),
+            _ if depth == 0 && tsql_keyword(toks, k).as_deref() == Some(w) => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// The index of the first token of the dotted name that ends just before
+/// `toks[end]` — `t`, `dbo.t`, `[db]..t` — or `None` when no name ends there.
+fn dotted_name_start(toks: &[Token], end: usize) -> Option<usize> {
+    let is_word = |k: usize| matches!(toks.get(k).map(|t| &t.kind), Some(TkKind::Word(_)));
+    let is_dot = |k: usize| matches!(toks.get(k).map(|t| &t.kind), Some(TkKind::Dot));
+    let mut k = end.checked_sub(1).filter(|&k| is_word(k))?;
+    loop {
+        let mut d = k;
+        while d > 0 && is_dot(d - 1) {
+            d -= 1;
+        }
+        if d < k && d > 0 && is_word(d - 1) {
+            k = d - 1;
+        } else {
+            return Some(k);
+        }
+    }
+}
+
 /// The clauses in a statement that sqlparser's grammar for `dialect` lacks,
 /// as [`Mask`]s to read past rather than parse errors to report — see
-/// [`statement_diagnostics`]. Each is recognised where it really is one, so
+/// [`unit_diagnostics`]. Each is recognised where it really is one, so
 /// the same words anywhere else still reach the parser and still err.
 ///
 /// T-SQL's, all run on SQL Server 2022 and 2025:
@@ -5607,34 +5852,63 @@ fn matching_paren(toks: &[Token], open: usize) -> Option<usize> {
 /// - `GROUPING SETS (…)`, which `MsSqlDialect` reads as a column `GROUPING`
 ///   and stops at, filled with a literal so the `GROUP BY` stays a list (and
 ///   so the grouping check, which bails on anything but a column, says
-///   nothing).
-fn grammar_gap_masks(sql: &str, toks: &[Token], dialect: SqlDialect) -> Vec<Mask> {
+///   nothing);
+/// - a compound assignment's operator, `SET @i += 1` → `SET @i  = 1`;
+/// - `NEXT VALUE FOR seq [OVER (…)]`, filled with a literal;
+/// - `EXEC @rc = p` — a procedure's return code — and `OUT` for `OUTPUT`
+///   after an argument;
+/// - a cursor's options, `DECLARE c CURSOR LOCAL FAST_FORWARD FOR …`, and its
+///   trailing `FOR READ ONLY`;
+/// - `PARSE`/`TRY_PARSE`'s `AS type [USING culture]`;
+/// - `TOP (n)` right after `DELETE`/`UPDATE`/`INSERT`, a table hint on their
+///   target (`INSERT INTO t WITH (ROWLOCK) …`), and the first `FROM` of
+///   `DELETE FROM t FROM t JOIN …`;
+/// - `CREATE INDEX`'s `WITH (…)` options and its filegroup (`ON [PRIMARY]`);
+/// - a trigger's `UPDATE(col)`, which reads as an `UPDATE` statement and is
+///   filled as a call.
+///
+/// `toks` are the statement's, which ends at byte `hi`.
+fn grammar_gap_masks(sql: &str, hi: usize, toks: &[Token], dialect: SqlDialect) -> Vec<Mask> {
     match dialect {
         SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => Vec::new(),
-        SqlDialect::MsSql => tsql_gap_masks(sql, toks),
+        SqlDialect::MsSql => tsql_gap_masks(sql, hi, toks),
     }
 }
 
 /// [`grammar_gap_masks`]' T-SQL arm.
-fn tsql_gap_masks(_sql: &str, toks: &[Token]) -> Vec<Mask> {
-    let word = |j: usize| match toks.get(j) {
-        Some(Token {
-            kind: TkKind::Word(w),
-            quoted: false,
-            ..
-        }) => Some(w.to_ascii_uppercase()),
-        _ => None,
-    };
+fn tsql_gap_masks(sql: &str, hi: usize, toks: &[Token]) -> Vec<Mask> {
+    let b = sql.as_bytes();
+    let word = |j: usize| tsql_keyword(toks, j);
     let lparen = |j: usize| matches!(toks.get(j).map(|t| &t.kind), Some(TkKind::LParen));
+    let variable = |j: usize| matches!(toks.get(j), Some(Token { kind: TkKind::Word(w), quoted: false, .. }) if w.starts_with('@'));
+    // The first byte after `toks[j]` that is not white space.
+    let after = |j: usize| {
+        let mut p = toks[j].end;
+        while b.get(p).is_some_and(u8::is_ascii_whitespace) {
+            p += 1;
+        }
+        p
+    };
+    let mask = |out: &mut Vec<Mask>, from: usize, to: usize, fill: &'static str| {
+        out.push(Mask { from, to, fill })
+    };
+    let head = word(0);
     let mut out = Vec::new();
     // Per open parenthesis: has this depth's query reached its `GROUP BY`?
     let mut grouped: Vec<bool> = vec![false];
+    // The call each open parenthesis belongs to, upper-cased.
+    let mut calls: Vec<Option<String>> = vec![None];
     let mut i = 0;
     while i < toks.len() {
+        let depth0 = grouped.len() == 1;
         match &toks[i].kind {
-            TkKind::LParen => grouped.push(false),
+            TkKind::LParen => {
+                grouped.push(false);
+                calls.push(i.checked_sub(1).and_then(word));
+            }
             TkKind::RParen if grouped.len() > 1 => {
                 grouped.pop();
+                calls.pop();
             }
             TkKind::Word(_) => match word(i).as_deref() {
                 Some("SELECT") => {
@@ -5647,13 +5921,9 @@ fn tsql_gap_masks(_sql: &str, toks: &[Token]) -> Vec<Mask> {
                         *g = true;
                     }
                 }
-                Some("OPTION") if grouped.len() == 1 && lparen(i + 1) => {
+                Some("OPTION") if depth0 && lparen(i + 1) => {
                     if let Some(close) = matching_paren(toks, i + 1) {
-                        out.push(Mask {
-                            from: toks[i].at,
-                            to: toks[close].end,
-                            fill: "",
-                        });
+                        mask(&mut out, toks[i].at, toks[close].end, "");
                         i = close + 1;
                         continue;
                     }
@@ -5662,30 +5932,186 @@ fn tsql_gap_masks(_sql: &str, toks: &[Token]) -> Vec<Mask> {
                     if grouped.last().copied().unwrap_or(false)
                         && matches!(word(i + 1).as_deref(), Some("ROLLUP" | "CUBE")) =>
                 {
-                    out.push(Mask {
-                        from: toks[i].at,
-                        to: toks[i + 1].end,
-                        fill: "",
-                    });
+                    mask(&mut out, toks[i].at, toks[i + 1].end, "");
                     i += 2;
                     continue;
                 }
                 Some("GROUPING") if word(i + 1).as_deref() == Some("SETS") && lparen(i + 2) => {
                     if let Some(close) = matching_paren(toks, i + 2) {
-                        out.push(Mask {
-                            from: toks[i].at,
-                            to: toks[close].end,
-                            fill: "0",
-                        });
+                        mask(&mut out, toks[i].at, toks[close].end, "0");
                         i = close + 1;
                         continue;
                     }
+                }
+                Some("NEXT")
+                    if word(i + 1).as_deref() == Some("VALUE")
+                        && word(i + 2).as_deref() == Some("FOR") =>
+                {
+                    let mut end = dotted_name(toks, i + 3).map_or(i + 3, |(_, next)| next);
+                    if word(end).as_deref() == Some("OVER")
+                        && lparen(end + 1)
+                        && let Some(close) = matching_paren(toks, end + 1)
+                    {
+                        end = close + 1;
+                    }
+                    mask(&mut out, toks[i].at, toks[end - 1].end, "0");
+                    i = end;
+                    continue;
+                }
+                // `EXEC @rc = p …`: the return code's variable and its `=`.
+                Some("EXEC" | "EXECUTE")
+                    if variable(i + 1) && b.get(after(i + 1)) == Some(&b'=') =>
+                {
+                    mask(&mut out, toks[i + 1].at, after(i + 1) + 1, "");
+                    i += 2;
+                    continue;
+                }
+                // An `EXEC`'s output arguments: `@v OUTPUT` given by position,
+                // which the parser takes only by name, and `OUT`, `OUTPUT`'s
+                // short form. Only in an `EXEC`: elsewhere `… = @x OUTPUT
+                // inserted.id` opens a write's `OUTPUT` clause.
+                Some("OUT" | "OUTPUT")
+                    if i > 0
+                        && variable(i - 1)
+                        && matches!(head.as_deref(), Some("EXEC" | "EXECUTE")) =>
+                {
+                    mask(&mut out, toks[i].at, toks[i].end, "");
+                }
+                // A cursor's options, between `CURSOR` and `FOR` — in a
+                // `DECLARE`, or a cursor variable's `SET @c = CURSOR …`.
+                Some("CURSOR") if matches!(head.as_deref(), Some("DECLARE" | "SET")) && depth0 => {
+                    let mut j = i + 1;
+                    while word(j).is_some_and(|w| w != "FOR") {
+                        j += 1;
+                    }
+                    if j > i + 1 {
+                        mask(&mut out, toks[i + 1].at, toks[j - 1].end, "");
+                    }
+                    // ISO's `DECLARE c INSENSITIVE SCROLL CURSOR FOR`: the
+                    // words between the cursor's name and `CURSOR`.
+                    if head.as_deref() == Some("DECLARE") && i > 2 {
+                        mask(&mut out, toks[2].at, toks[i - 1].end, "");
+                    }
+                    i = j;
+                    continue;
+                }
+                Some("FOR")
+                    if depth0
+                        && word(i + 1).as_deref() == Some("READ")
+                        && word(i + 2).as_deref() == Some("ONLY") =>
+                {
+                    mask(&mut out, toks[i].at, toks[i + 2].end, "");
+                    i += 3;
+                    continue;
+                }
+                // `PARSE('1' AS int USING 'en-US')`: everything from the `AS`.
+                Some("AS")
+                    if matches!(
+                        calls.last().and_then(|c| c.as_deref()),
+                        Some("PARSE" | "TRY_PARSE")
+                    ) =>
+                {
+                    let mut j = i;
+                    while j < toks.len() && !matches!(toks[j].kind, TkKind::RParen) {
+                        j += 1;
+                    }
+                    // Up to the `)` itself: a culture is a string, no token.
+                    let to = toks.get(j).map_or(hi, |t| t.at);
+                    mask(&mut out, toks[i].at, to, "");
+                    i = j;
+                    continue;
+                }
+                // `DELETE TOP (10) FROM t`, `UPDATE TOP (5) t SET …`.
+                Some("TOP")
+                    if i == 1
+                        && matches!(head.as_deref(), Some("DELETE" | "UPDATE" | "INSERT"))
+                        && lparen(i + 1) =>
+                {
+                    if let Some(close) = matching_paren(toks, i + 1) {
+                        mask(&mut out, toks[i].at, toks[close].end, "");
+                        i = close + 1;
+                        continue;
+                    }
+                }
+                // `DELETE FROM t FROM t JOIN u …`: the first `FROM`, leaving
+                // the `DELETE t FROM …` the parser has.
+                Some("FROM")
+                    if i == 1
+                        && head.as_deref() == Some("DELETE")
+                        && top_level_word_after(toks, i + 1, "FROM") =>
+                {
+                    mask(&mut out, toks[i].at, toks[i].end, "");
+                }
+                // A table hint on a write's target: `INSERT INTO t WITH (…)`,
+                // `UPDATE t WITH (ROWLOCK) SET`, `MERGE t WITH (HOLDLOCK) …`.
+                Some("WITH")
+                    if depth0
+                        && lparen(i + 1)
+                        && dotted_name_start(toks, i).is_some_and(|k| {
+                            k > 0
+                                && matches!(
+                                    word(k - 1).as_deref(),
+                                    Some("INTO" | "UPDATE" | "DELETE" | "INSERT" | "MERGE")
+                                )
+                        }) =>
+                {
+                    if let Some(close) = matching_paren(toks, i + 1) {
+                        mask(&mut out, toks[i].at, toks[close].end, "");
+                        i = close + 1;
+                        continue;
+                    }
+                }
+                // `CREATE [UNIQUE] INDEX … WITH (ONLINE = ON) ON [PRIMARY]`.
+                Some("WITH")
+                    if depth0
+                        && lparen(i + 1)
+                        && head.as_deref() == Some("CREATE")
+                        && (1..3).any(|k| word(k).as_deref() == Some("INDEX")) =>
+                {
+                    if let Some(close) = matching_paren(toks, i + 1) {
+                        mask(&mut out, toks[i].at, toks[close].end, "");
+                        i = close + 1;
+                        continue;
+                    }
+                }
+                Some("ON")
+                    if depth0
+                        && head.as_deref() == Some("CREATE")
+                        && (1..3).any(|k| word(k).as_deref() == Some("INDEX"))
+                        && (0..i).any(|k| word(k).as_deref() == Some("ON")) =>
+                {
+                    // The filegroup or partition scheme, to the statement's end.
+                    let end = toks.len();
+                    mask(&mut out, toks[i].at, toks[end - 1].end, "");
+                    break;
+                }
+                // A trigger's `IF UPDATE(col)` is a call.
+                Some("UPDATE") if lparen(i + 1) => {
+                    mask(&mut out, toks[i].at, toks[i].end, "ABS");
                 }
                 _ => {}
             },
             _ => {}
         }
         i += 1;
+    }
+    // A compound assignment's operator: `+=`, `-=`, `*=`, `/=`, `%=`, `&=`,
+    // `|=`, `^=` — code bytes only, from the first token to the statement's
+    // end (`SET @s += N'…'` ends on a string, which is no token).
+    if let Some(first) = toks.first() {
+        let mut p = first.at;
+        while p < hi.min(b.len()) {
+            if let Some(q) = crate::sql::skip_noncode(b, p, SqlDialect::MsSql) {
+                p = q;
+                continue;
+            }
+            if matches!(b[p], b'+' | b'-' | b'*' | b'/' | b'%' | b'&' | b'|' | b'^')
+                && b.get(p + 1) == Some(&b'=')
+            {
+                mask(&mut out, p, p + 1, "");
+            }
+            p += 1;
+        }
     }
     out
 }
@@ -6931,16 +7357,76 @@ fn as_declares_a_type(toks: &[Token], declaring: &[bool], i: usize, dialect: Sql
 /// here. The server stays the authority: [`diagnostics`] reports no parse error
 /// for these and still runs its lexical checks over them — only the parse
 /// error is withheld.
+///
+/// **And the statements a routine body is made of**, now that a body's
+/// statements are parsed one by one ([`tsql_units`]) — each ordinary T-SQL
+/// that sqlparser's grammar lacks, measured by running the diagnostics over
+/// every `sys.all_sql_modules` definition on SQL Server 2022: `SAVE TRAN`,
+/// `BEGIN`/`COMMIT`/`ROLLBACK TRAN` with a name or `WITH MARK`, `BEGIN
+/// DISTRIBUTED TRAN`, `EXECUTE AS …` and `REVERT`, `DBCC`, `CHECKPOINT`, `BULK
+/// INSERT`, `BACKUP`/`RESTORE`, `WAITFOR` (whose `(RECEIVE …)` form it lacks),
+/// `ENABLE`/`DISABLE TRIGGER`, a cursor's `FETCH` (with no direction, or into a
+/// list) and a cursor variable's `SET @c = CURSOR …`, `OPEN`/`CLOSE` of a key,
+/// Service Broker's `END CONVERSATION`, `BEGIN DIALOG`, `SEND` and `RECEIVE`,
+/// `CREATE` of a `STATISTICS`, `SYNONYM`, `SEQUENCE`, `TYPE`, `QUEUE`,
+/// `SERVICE`, `ROUTE`, `CONTRACT`, `MESSAGE TYPE` or `EVENT NOTIFICATION` (and
+/// `ALTER` of most of them), `UPDATE STATISTICS`, an `INSERT … EXEC`, a
+/// `DELETE t WHERE …` without `FROM`, and the T-SQL forms of
+/// `ALTER TABLE` (`ALTER COLUMN`, `ADD … DEFAULT … FOR`, `[NO]CHECK`, `SWITCH`,
+/// `REBUILD`, `ENABLE`/`DISABLE`, `SET (…)`). Where a construct is a clause
+/// rather than a whole statement it is read past instead
+/// ([`grammar_gap_masks`]), which keeps the rest of the statement checked.
 fn parser_lacks_statement(toks: &[Token], dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
         SqlDialect::MsSql => {
-            let w = head_words(toks, 3);
+            let w = head_words(toks, 4);
             let w: Vec<&str> = w.iter().map(String::as_str).collect();
+            let top = |word: &str| top_level_word_after(toks, 1, word);
             match w.as_slice() {
-                ["RECONFIGURE", ..]
+                [
+                    "RECONFIGURE" | "SAVE" | "REVERT" | "DBCC" | "CHECKPOINT" | "BULK" | "ENABLE"
+                    | "DISABLE" | "FETCH" | "SEND" | "RECEIVE" | "BACKUP" | "RESTORE" | "WAITFOR",
+                    ..,
+                ]
                 | ["CREATE", "CLUSTERED" | "NONCLUSTERED", ..]
-                | ["CREATE", "UNIQUE", "CLUSTERED" | "NONCLUSTERED", ..] => true,
+                | ["CREATE", "UNIQUE", "CLUSTERED" | "NONCLUSTERED", ..]
+                | ["BEGIN", "DISTRIBUTED" | "DIALOG" | "CONVERSATION", ..]
+                | [
+                    "BEGIN" | "COMMIT" | "ROLLBACK",
+                    "TRAN" | "TRANSACTION" | "WORK",
+                    _,
+                    ..,
+                ]
+                | ["EXECUTE" | "EXEC", "AS", ..]
+                | ["OPEN" | "CLOSE", "SYMMETRIC" | "MASTER" | "ALL", ..]
+                | ["END", "CONVERSATION", ..]
+                | ["UPDATE", "STATISTICS", ..]
+                | [
+                    "CREATE",
+                    "STATISTICS" | "SYNONYM" | "SEQUENCE" | "TYPE" | "QUEUE" | "SERVICE" | "ROUTE"
+                    | "CONTRACT" | "MESSAGE" | "EVENT",
+                    ..,
+                ] => true,
+                [
+                    "ALTER",
+                    "QUEUE" | "SERVICE" | "ROUTE" | "SEQUENCE" | "SYNONYM" | "MESSAGE" | "CONTRACT"
+                    | "EVENT",
+                    ..,
+                ] => true,
+                ["INSERT", ..] => top("EXEC") || top("EXECUTE"),
+                // `DELETE t WHERE …`, `DELETE TOP (n) t WHERE …`.
+                ["DELETE", ..] => !top("FROM"),
+                // A cursor variable's `SET @c = CURSOR … FOR SELECT …`.
+                ["SET", ..] => top("CURSOR"),
+                ["ALTER", "TABLE", ..] => {
+                    ["NOCHECK", "SWITCH", "REBUILD", "ENABLE", "DISABLE", "SET"]
+                        .iter()
+                        .any(|w| top(w))
+                        || top_level_word_after(toks, 2, "ALTER")
+                        || (top("DEFAULT") && top("FOR"))
+                        || (top("WITH") && top("CHECK"))
+                }
                 _ => is_routine_statement(toks),
             }
         }
@@ -6985,6 +7471,7 @@ fn alias_checks(sql: &str, lo: usize, hi: usize, dialect: SqlDialect, out: &mut 
             _ => None,
         })
         .is_some_and(|w| w == "CREATE");
+    let creates_type = head_words(&toks, 2) == ["CREATE", "TYPE"];
     // Explicit `AS <reserved>` — table OR column alias, anywhere.
     for (i, w) in toks.windows(2).enumerate() {
         let (TkKind::Word(a), TkKind::Word(b)) = (&w[0].kind, &w[1].kind) else {
@@ -6996,8 +7483,18 @@ fn alias_checks(sql: &str, lo: usize, hi: usize, dialect: SqlDialect, out: &mut 
         if body_as == Some(i) {
             continue;
         }
-        // A CTAS/view body isn't an alias (`CREATE TABLE t AS SELECT …`).
-        if is_create && is_query_body_keyword(b) {
+        // `EXECUTE AS USER = 'x'` names whom to run as, not an alias.
+        if i > 0
+            && matches!(&toks[i - 1].kind, TkKind::Word(p)
+                if p.eq_ignore_ascii_case("EXECUTE") || p.eq_ignore_ascii_case("EXEC"))
+        {
+            continue;
+        }
+        // A CTAS/view body isn't an alias (`CREATE TABLE t AS SELECT …`),
+        // nor a table type's `CREATE TYPE t AS TABLE (…)`.
+        if is_create
+            && (is_query_body_keyword(b) || (creates_type && b.eq_ignore_ascii_case("TABLE")))
+        {
             continue;
         }
         // Nor is a cast's target type — see `as_introduces_a_type` — nor a
@@ -7158,9 +7655,17 @@ fn table_existence_checks(
         }
         _ => HashSet::new(),
     };
-    for l in located_table_refs(sql, lo, hi, dialect) {
+    let refs = located_table_refs(sql, lo, hi, dialect);
+    // T-SQL's `UPDATE e SET … FROM employees e`: the `UPDATE` names an alias
+    // its own `FROM` defines, not a table.
+    let aliases: HashSet<String> = refs
+        .iter()
+        .filter_map(|l| l.r.alias.as_ref().map(|a| a.to_ascii_lowercase()))
+        .collect();
+    for l in refs {
         let bare = l.r.db.is_none() && l.database.is_none();
-        if (bare && ctes.contains(&l.r.name.to_ascii_lowercase()))
+        let name = l.r.name.to_ascii_lowercase();
+        if (bare && (ctes.contains(&name) || aliases.contains(&name)))
             || is_session_source(&l.r, dialect)
         {
             continue;
@@ -13768,12 +14273,203 @@ mod tests {
             "SELECT id FROM employees GROUP BY id OPTION (MAXDOP 1, RECOMPILE);",
             "SELECT id FROM employees GROUP BY id WITH ROLLUP HAVING COUNT(*) > 1 \
              ORDER BY id OPTION (RECOMPILE);",
+            // Control-of-flow (S8-L1-07): blocks, `TRY … CATCH`, `IF`/`WHILE`,
+            // labels — at the top level and in a routine's body.
+            "BEGIN TRY SELECT 1/0; END TRY BEGIN CATCH THROW; END CATCH",
+            "IF EXISTS (SELECT 1 FROM employees) BEGIN SELECT 1; END",
+            "BEGIN SELECT 1; END",
+            "WHILE @i < 10 BEGIN SET @i = @i + 1 END;",
+            "lbl: PRINT 1;",
+            "GOTO lbl;",
+            "IF @x = 1 SELECT 1 ELSE SELECT 2;",
+            "IF NOT EXISTS (SELECT 1 FROM employees WHERE id = @id) \
+             INSERT INTO employees (id) VALUES (@id) \
+             ELSE UPDATE employees SET name = N'x' WHERE id = @id;",
+            "WHILE 1 = 1 BEGIN IF @i > 3 BREAK; SET @i = @i + 1; CONTINUE; END",
+            "CREATE PROCEDURE dbo.p @id int AS BEGIN SET NOCOUNT ON; BEGIN TRY BEGIN TRAN; \
+             UPDATE employees SET salary = salary + 1 WHERE id = @id; COMMIT; END TRY \
+             BEGIN CATCH IF @@TRANCOUNT > 0 ROLLBACK; THROW; END CATCH END;",
+            "CREATE TRIGGER dbo.tr ON dbo.employees AFTER UPDATE AS BEGIN \
+             IF UPDATE(salary) BEGIN SELECT id FROM inserted; END END;",
+            "CREATE FUNCTION dbo.f (@x int) RETURNS @r TABLE (a int) AS BEGIN \
+             INSERT @r SELECT @x RETURN END;",
+            "retry:\nBEGIN TRY\n  SELECT 1\nEND TRY\nBEGIN CATCH\n  GOTO retry\nEND CATCH",
+            // Statements and clauses the grammar lacks (S8-L1-07).
+            "SET @i += 1;",
+            "WHILE @i < 10 BEGIN SET @i += 1 END;",
+            "SET @s += N'x';",
+            "SAVE TRANSACTION sp1;",
+            "ROLLBACK TRANSACTION sp1;",
+            "BEGIN TRANSACTION t1;",
+            "COMMIT TRAN t1;",
+            "SELECT NEXT VALUE FOR dbo.seq;",
+            "INSERT INTO employees (id) VALUES (NEXT VALUE FOR dbo.seq);",
+            "CREATE INDEX ix ON employees (id) INCLUDE (name) WITH (ONLINE = ON);",
+            "CREATE UNIQUE INDEX ux ON employees (id) WITH (FILLFACTOR = 90) ON [PRIMARY];",
+            "ALTER TABLE employees ADD CONSTRAINT df_x DEFAULT 0 FOR salary;",
+            "ALTER TABLE employees ALTER COLUMN salary bigint NOT NULL;",
+            "ALTER TABLE employees WITH CHECK CHECK CONSTRAINT ALL;",
+            "EXECUTE AS USER = 'x';",
+            "REVERT;",
+            "DECLARE c CURSOR LOCAL FAST_FORWARD FOR SELECT id FROM employees;",
+            "DECLARE c INSENSITIVE SCROLL CURSOR FOR SELECT id FROM employees FOR READ ONLY;",
+            "SET @c = CURSOR LOCAL FAST_FORWARD FOR SELECT id FROM employees;",
+            "FETCH c INTO @a, @b;",
+            "INSERT INTO employees (id) EXEC dbo.p;",
+            "EXEC @rc = dbo.p @a = 1, @b OUTPUT, @c OUT;",
+            "DBCC CHECKDB;",
+            "CHECKPOINT;",
+            "BULK INSERT employees FROM 'c:\\x.csv' WITH (FIELDTERMINATOR = ',');",
+            "OPEN SYMMETRIC KEY k DECRYPTION BY CERTIFICATE c;",
+            "SELECT TRY_PARSE('1' AS int), PARSE('1' AS int USING 'en-US');",
+            "DELETE TOP (10) FROM employees;",
+            "DELETE employees WHERE id = 1;",
+            "DELETE FROM employees FROM employees e JOIN departments d ON d.id = e.dept_id;",
+            "UPDATE e SET e.name = d.name FROM employees e JOIN departments d ON d.id = e.dept_id;",
+            "INSERT INTO employees WITH (TABLOCK) (id) VALUES (1);",
+            "CREATE STATISTICS s ON employees (id);",
+            "UPDATE STATISTICS employees;",
+            "CREATE SEQUENCE dbo.seq START WITH 1 INCREMENT BY 1;",
+            "CREATE TYPE dbo.t AS TABLE (a int);",
+            "ENABLE TRIGGER tr ON employees;",
+            "DISABLE TRIGGER ALL ON DATABASE;",
+            "RESTORE FILELISTONLY FROM DISK = N'x.bak';",
+            "WAITFOR DELAY '00:00:01';",
+            "IF UPDATE(salary) PRINT 1;",
+            "DROP TABLE IF EXISTS #t;",
         ]
         .into_iter()
         .map(|sql| (sql, diag_d(sql, SqlDialect::MsSql)))
         .filter(|(_, d)| !d.is_empty())
         .collect::<Vec<_>>();
         assert!(squiggled.is_empty(), "{squiggled:#?}");
+    }
+
+    /// **The app's own SQL Server snippets draw no squiggle** — the starter
+    /// pack a DBA opens first, each live-tested against the server.
+    #[test]
+    fn the_sql_server_starter_snippets_are_clean() {
+        for s in crate::snippet::builtins(SqlDialect::MsSql) {
+            let d = diag_d(&s.body, SqlDialect::MsSql);
+            assert!(d.is_empty(), "{}: {d:?}", s.name);
+        }
+    }
+
+    /// **What T-SQL's read-past clauses leave standing** (S8-L1-07): each
+    /// mask covers its clause and nothing else, so an error beside it, and the
+    /// table and column checks, still report; and an `UPDATE`'s target is
+    /// exempt only when its own `FROM` defines it as an alias.
+    #[test]
+    fn t_sql_clauses_read_past_hide_nothing_beside_them() {
+        for (sql, want) in [
+            ("SET @i += ;", "Syntax error"),
+            ("EXEC @rc = dbo.p @a = ;", "Syntax error"),
+            (
+                "SELECT NEXT VALUE FOR dbo.seq FROM nosuchtable;",
+                "Table `nosuchtable` not found",
+            ),
+            (
+                "DELETE TOP (10) FROM nosuchtable;",
+                "Table `nosuchtable` not found",
+            ),
+            (
+                "INSERT INTO nosuchtable WITH (TABLOCK) (id) VALUES (1);",
+                "Table `nosuchtable` not found",
+            ),
+            (
+                "DECLARE c CURSOR LOCAL FOR SELECT e.nope FROM employees e;",
+                "Column `nope` not found",
+            ),
+            (
+                "UPDATE e SET e.nope = 1 FROM employees e;",
+                "Column `nope` not found",
+            ),
+            (
+                "UPDATE nosuchtable SET a = 1;",
+                "Table `nosuchtable` not found",
+            ),
+            (
+                "SELECT TRY_PARSE(nope AS int) FROM employees;",
+                "Column `nope` not found",
+            ),
+        ] {
+            let d = diag_d(sql, SqlDialect::MsSql);
+            assert!(
+                d.iter().any(|x| x.message.starts_with(want)),
+                "{sql}: {d:?}"
+            );
+        }
+    }
+
+    /// The diagnostics of `sql` handed over as **one range** — a T-SQL block the
+    /// editor's statement bounds keep together, or a batch they leave whole —
+    /// as `diag_d` hands over whatever ranges `statement_ranges` cuts.
+    fn diag_whole(sql: &str, dialect: SqlDialect) -> Vec<Diagnostic> {
+        let (schema, db) = sample_catalog();
+        let cat = Catalog::build(&[(db, &schema)], Some(db));
+        let mut out = Vec::new();
+        range_diagnostics(sql, 0, sql.len(), true, &cat, dialect, &mut out);
+        dedup_diagnostics(out)
+    }
+
+    /// **Control-of-flow is read, not parsed, and what it holds is checked**
+    /// (S8-L1-07). `BEGIN … END`, `TRY … CATCH`, `IF`/`WHILE`, labels and
+    /// `GOTO` are outside sqlparser's T-SQL grammar or read whole by it, and a
+    /// `;` inside a block cut it where the parser needed it together. Each is
+    /// now structure: the statements it holds, and an `IF`'s condition, are
+    /// parsed and checked one by one — the same whether the block reaches the
+    /// checker as one range or several.
+    #[test]
+    fn t_sql_control_of_flow_holds_checked_statements() {
+        let blocks = [
+            "BEGIN TRY SELECT 1/0; END TRY BEGIN CATCH THROW; END CATCH",
+            "IF EXISTS (SELECT 1 FROM employees) BEGIN SELECT 1; SELECT 2; END ELSE BEGIN PRINT 1; END",
+            "WHILE 1 = 1 BEGIN IF @i > 3 BREAK; SET @i = @i + 1; CONTINUE; END",
+            "CREATE PROCEDURE dbo.p @id int AS BEGIN SET NOCOUNT ON; BEGIN TRY BEGIN TRAN; \
+             UPDATE employees SET salary = salary + 1 WHERE id = @id; COMMIT; END TRY \
+             BEGIN CATCH IF @@TRANCOUNT > 0 ROLLBACK; THROW; END CATCH END;",
+            "SELECT CASE WHEN id = 1 THEN 1 ELSE 2 END FROM employees; BEGIN SELECT 1; END",
+        ];
+        for sql in blocks {
+            let (split, whole) = (
+                diag_d(sql, SqlDialect::MsSql),
+                diag_whole(sql, SqlDialect::MsSql),
+            );
+            assert!(
+                split.is_empty() && whole.is_empty(),
+                "{sql}: {split:?} / {whole:?}"
+            );
+        }
+        // What the structure holds is still checked, both ways.
+        for (sql, want) in [
+            (
+                "CREATE PROCEDURE dbo.p AS BEGIN SELECT FROM WHERE; END;",
+                "Syntax error",
+            ),
+            (
+                "IF EXISTS (SELECT 1 FROM nosuchtable) PRINT 1;",
+                "Table `nosuchtable` not found",
+            ),
+            (
+                "BEGIN TRY SELECT id FROM nosuchtable; END TRY BEGIN CATCH THROW; END CATCH",
+                "Table `nosuchtable` not found",
+            ),
+            ("IF @x = BEGIN PRINT 1; END", "Syntax error"),
+            (
+                "WHILE 1 = 1 BEGIN SELECT e.nope FROM employees e; BREAK; END",
+                "Column `nope` not found",
+            ),
+        ] {
+            for d in [
+                diag_d(sql, SqlDialect::MsSql),
+                diag_whole(sql, SqlDialect::MsSql),
+            ] {
+                assert!(
+                    d.iter().any(|x| x.message.starts_with(want)),
+                    "{sql}: {d:?}"
+                );
+            }
+        }
     }
 
     /// **What the T-SQL exemptions leave standing.** Withholding a routine's
@@ -14115,7 +14811,7 @@ mod tests {
         let units = |sql: &str| -> Vec<String> {
             statement_units(sql, 0, sql.len(), SqlDialect::MsSql)
                 .into_iter()
-                .map(|(lo, hi)| sql[lo..hi].trim().to_string())
+                .map(|(lo, hi, _)| sql[lo..hi].trim().to_string())
                 .collect()
         };
         for (sql, want) in [
@@ -14172,17 +14868,100 @@ mod tests {
             "SELECT CASE WHEN a = 1 THEN 1 ELSE 2 END FROM t",
             "DROP TABLE IF EXISTS t",
             "SELECT * FROM t INNER MERGE JOIN u ON t.id = u.id",
-            "IF @x = 1 SELECT 1 ELSE SELECT 2",
-            "BEGIN SELECT 1 SELECT 2 END",
-            "CREATE PROCEDURE p AS SELECT 1 SELECT 2",
         ] {
             assert_eq!(units(sql), [sql], "{sql}");
+        }
+        // Control-of-flow is structure (`#`), a condition its own unit (`?`),
+        // and a routine's header a statement of its own.
+        let kinds = |sql: &str| -> Vec<String> {
+            statement_units(sql, 0, sql.len(), SqlDialect::MsSql)
+                .into_iter()
+                .map(|(lo, hi, kind)| {
+                    let text = sql[lo..hi].trim();
+                    match kind {
+                        UnitKind::Statement => text.to_string(),
+                        UnitKind::Condition => format!("?{text}"),
+                        UnitKind::Structure => format!("#{text}"),
+                    }
+                })
+                .collect()
+        };
+        for (sql, want) in [
+            (
+                "IF @x = 1 SELECT 1 ELSE SELECT 2",
+                vec!["#IF", "?@x = 1", "SELECT 1", "#ELSE", "SELECT 2"],
+            ),
+            (
+                "BEGIN SELECT 1 SELECT 2 END",
+                vec!["#BEGIN", "SELECT 1", "SELECT 2", "#END"],
+            ),
+            (
+                "CREATE PROCEDURE p AS SELECT 1 SELECT 2",
+                vec!["CREATE PROCEDURE p AS", "SELECT 1", "SELECT 2"],
+            ),
+            (
+                "BEGIN TRY SELECT 1; END TRY BEGIN CATCH THROW; END CATCH",
+                vec![
+                    "#BEGIN TRY",
+                    "SELECT 1;",
+                    "#END TRY",
+                    "#BEGIN CATCH",
+                    "THROW;",
+                    "#END CATCH",
+                ],
+            ),
+            (
+                "WHILE (SELECT COUNT(*) FROM t) > 0 BEGIN BREAK END",
+                vec![
+                    "#WHILE",
+                    "?(SELECT COUNT(*) FROM t) > 0",
+                    "#BEGIN",
+                    "#BREAK",
+                    "#END",
+                ],
+            ),
+            (
+                "IF UPDATE(a) OR @x IS NULL SET @y = 1",
+                vec!["#IF", "?UPDATE(a) OR @x IS NULL", "SET @y = 1"],
+            ),
+            ("lbl: GOTO lbl", vec!["#lbl:", "#GOTO lbl"]),
+            // `IF EXISTS` continues only a `DROP`'s `TABLE IF EXISTS`.
+            (
+                "SELECT @a = 1 IF EXISTS (SELECT 1) PRINT 1",
+                vec!["SELECT @a = 1", "#IF", "?EXISTS (SELECT 1)", "PRINT 1"],
+            ),
+            (
+                "DROP TABLE t IF EXISTS (SELECT 1) PRINT 1",
+                vec!["DROP TABLE t", "#IF", "?EXISTS (SELECT 1)", "PRINT 1"],
+            ),
+            (
+                "DROP TABLE IF EXISTS t PRINT 1",
+                vec!["DROP TABLE IF EXISTS t", "PRINT 1"],
+            ),
+            // A decimal point is not a qualifier's dot.
+            ("IF @x < 0.0 SELECT 1", vec!["#IF", "?@x < 0.0", "SELECT 1"]),
+            (
+                "BULK INSERT t FROM 'f' PRINT 1",
+                vec!["BULK INSERT t FROM 'f'", "PRINT 1"],
+            ),
+            // `BEGIN TRAN` is a statement, `END CONVERSATION` too, and a
+            // `CASE`'s `END` and `ELSE` are the `CASE`'s.
+            (
+                "BEGIN TRAN SELECT CASE WHEN 1 = 1 THEN 1 ELSE 0 END END CONVERSATION @h",
+                vec![
+                    "BEGIN TRAN",
+                    "SELECT CASE WHEN 1 = 1 THEN 1 ELSE 0 END",
+                    "END CONVERSATION @h",
+                ],
+            ),
+        ] {
+            assert_eq!(kinds(sql), want, "{sql}");
         }
         // Every other engine's range is one statement: it needs the `;`.
         let sql = "SELECT 1 SELECT 2";
         assert_eq!(
             statement_units(sql, 0, sql.len(), SqlDialect::MySql),
-            [(0, sql.len())]
+            [(0, sql.len(), UnitKind::Statement)]
         );
     }
 

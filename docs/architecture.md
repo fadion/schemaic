@@ -916,18 +916,31 @@ existing prose was left alone.
     **T-SQL is where sqlparser 0.62's grammar runs out, and a SQL Server hand check found ordinary
     T-SQL squiggled red.** `parser_lacks_statement` withholds the parse error — only that; the
     typo, function-typo and alias checks still run over the statement — for what that grammar does
-    not carry: `RECONFIGURE`, `CREATE [UNIQUE] [NON]CLUSTERED INDEX`, and every
-    `CREATE`/`ALTER` of a procedure, function or trigger, since it fails on a scalar function's
-    `BEGIN … RETURN … END`, a procedure's bare `@x int` parameters, `WITH SCHEMABINDING` /
-    `CALLED ON NULL INPUT` and a trigger's `WITH EXECUTE AS` (each ran clean on SQL Server 2022,
-    per the function's doc). The server stays the authority for those, as for everything else;
-    the other three engines answer `false`. **A clause the grammar lacks inside an ordinary
-    statement is read past rather than given up at**: `grammar_gap_masks` finds T-SQL's query hint
-    `OPTION (…)` at the top level, `WITH ROLLUP`/`WITH CUBE` after a `GROUP BY` at the same depth,
-    and `GROUPING SETS (…)` (`MsSqlDialect` leaves `supports_group_by_expr` off, so that stopped at
-    `SETS`; all run on SQL Server 2022 and 2025), and `statement_diagnostics` parses the statement
-    with each overwritten — blanks, or a literal `0` where a `GROUP BY` item must remain — byte for
-    byte (`masked_text`), so every offset and line still lands where it did. The error used to be
+    not carry: `RECONFIGURE`, `CREATE [UNIQUE] [NON]CLUSTERED INDEX`, a routine's or trigger's
+    *header* (a scalar function's `RETURNS … AS`, a procedure's bare `@x int` parameters, `WITH
+    SCHEMABINDING` / `CALLED ON NULL INPUT`, a trigger's `WITH EXECUTE AS`; each ran clean on SQL
+    Server 2022), and the ordinary statements a body is made of that it lacks — measured by running
+    the diagnostics over every `sys.all_sql_modules` definition on SQL Server 2022: `SAVE TRAN`,
+    `BEGIN`/`COMMIT`/`ROLLBACK TRAN name`, `EXECUTE AS` and `REVERT`, `DBCC`, `CHECKPOINT`, `BULK
+    INSERT`, `BACKUP`/`RESTORE`, `WAITFOR`, `ENABLE`/`DISABLE TRIGGER`, a cursor's `FETCH`, a cursor
+    variable's `SET @c = CURSOR …`, Service Broker's statements, `CREATE`/`ALTER` of a sequence,
+    synonym, table type, queue and the like, `CREATE`/`UPDATE STATISTICS`, `INSERT … EXEC`, a
+    `DELETE t WHERE` with no `FROM`, and the T-SQL forms of `ALTER TABLE` (`ALTER COLUMN`, `ADD …
+    DEFAULT … FOR`, `[NO]CHECK`, `SWITCH`, …). The server stays the authority for those, as for
+    everything else; the other three engines answer `false`. **A clause the grammar lacks inside an
+    ordinary statement is read past rather than given up at**: `grammar_gap_masks` finds T-SQL's
+    query hint `OPTION (…)` at the top level, `WITH ROLLUP`/`WITH CUBE` after a `GROUP BY` at the
+    same depth, and `GROUPING SETS (…)` (`MsSqlDialect` leaves `supports_group_by_expr` off, so
+    that stopped at `SETS`; all run on SQL Server 2022 and 2025) — and, for the statements a body
+    holds, a compound assignment's operator (`SET @i += 1`), `NEXT VALUE FOR seq`, `EXEC @rc = p`
+    and an `EXEC`'s positional `OUTPUT`/`OUT`, a cursor's options and `FOR READ ONLY`,
+    `PARSE`/`TRY_PARSE`'s `AS type USING culture`, `TOP (n)` after `DELETE`/`UPDATE`/`INSERT`, a
+    table hint on a write's target, `DELETE FROM t FROM …`'s first `FROM`, `CREATE INDEX`'s `WITH
+    (…)` and filegroup, and a trigger's `UPDATE(col)` (filled as a call) — and `unit_diagnostics`
+    parses the statement with each overwritten — blanks, or a literal where an expression must
+    remain — byte for byte (`masked_text`), so every offset and line still lands where it did. A
+    clause is masked only where it really is one, so the same words anywhere else still err
+    (`t_sql_clauses_read_past_hide_nothing_beside_them`). The error used to be
     *withheld* when it landed on such a clause, and sqlparser stops at its first error, so a real
     one after it (`… WITH ROLLUP HAVING COUNT(*) >`) and every check that needs a parse went with
     it, while `FROM t WITH CUBE` — Msg 336 on the server — passed because only the next word was
@@ -939,17 +952,30 @@ existing prose was left alone.
     range without a `;` is the fragment still being typed, so its parse error was withheld and, a
     multi-statement blob never parsing, its table and column checks never ran: no error anywhere in
     such a script. `range_diagnostics` cuts each range again into `statement_units` and checks each
-    alone; only the last unit of the last range is the typing tail. The cuts (`tsql_statement_starts`)
-    are deliberately **not** `sql::tsql_statements`', which may cut wrongly because a fragment there
-    is one no guard answers for — here a wrong cut is a false syntax error (`INSERT INTO t (a)` cut
-    from its `SELECT`, `ALTER TABLE t` from its `DROP COLUMN`). So it cuts at a `;` and before a word
-    that can only begin a statement in its context (`TsqlStatement::cuts_before`: `SELECT` unless it
-    follows a set operator, `AS`, `FOR` or an `INSERT` still owed its rows; `SET` unless it is an
-    `UPDATE`'s first or follows `ON DELETE`; …), never inside a `CASE`, a `GRANT` or a
-    control-of-flow statement the parser reads whole — and a cut it misses costs nothing, because
-    `parse_statements` parses a unit without requiring `;` between statements, which is how the
-    server reads it (`a_t_sql_script_without_semicolons_is_checked_statement_by_statement`,
-    `t_sql_statement_units_cut_only_where_a_statement_begins`). The routine statements broke the alias
+    alone; only the last unit of the last range is the typing tail. The statement cuts
+    (`tsql_statement_end`) are deliberately **not** `sql::tsql_statements`', which may cut wrongly
+    because a fragment there is one no guard answers for — here a wrong cut is a false syntax error
+    (`INSERT INTO t (a)` cut from its `SELECT`, `ALTER TABLE t` from its `DROP COLUMN`). So it cuts
+    at a `;`, a label and before a word that can only begin a statement in its context
+    (`TsqlStatement::cuts_before`: `SELECT` unless it follows a set operator, `AS`, `FOR` or an
+    `INSERT` still owed its rows; `SET` unless it is an `UPDATE`'s first or follows `ON DELETE`;
+    `IF` unless it is a `DROP TABLE IF EXISTS`; …), never inside a `CASE` or a `GRANT` — and a cut it
+    misses costs nothing, because `parse_statements` parses a unit without requiring `;` between
+    statements, which is how the server reads it
+    (`a_t_sql_script_without_semicolons_is_checked_statement_by_statement`,
+    `t_sql_statement_units_cut_only_where_a_statement_begins`). **Control-of-flow is read, not
+    parsed** (`tsql_units`): sqlparser has no `TRY … CATCH`, label, `GOTO`, `BREAK` or `CONTINUE`,
+    and reads a `BEGIN … END` block or an `IF … ELSE` whole, so one construct it lacked anywhere
+    inside took the whole block down — and a `;` inside a block, where the editor's statement bounds
+    cut, left an unclosed `BEGIN`. Each keyword is a `UnitKind::Structure` unit, an `IF`'s or
+    `WHILE`'s condition (up to the statement it governs) a `UnitKind::Condition` parsed as an
+    expression, and the statements between are checked one by one, so the result is the same
+    whether a block reaches the checker as one range or several
+    (`t_sql_control_of_flow_holds_checked_statements` asserts both). A routine's header, up to its
+    body's `AS`, is a statement of its own, withheld as above, and **its body is checked like any
+    script** — it was one unit whose parse error was withheld wholesale, so a body was never
+    syntax-checked at all. The tokenizer reads a number as no token, so `@x < 0.0 SELECT` is not the
+    qualified name `@x . SELECT` that hid the next statement's first word. The routine statements broke the alias
     check a second way: a T-SQL header *ends* in a mandatory `AS` whose next word is the body's
     first statement, so `AS SET`, `AS BEGIN` and `AS RETURN` were reserved-alias errors. `routine_body_as` finds
     that `AS` — the first outside parentheses not preceded by `EXECUTE`/`EXEC` nor by a parameter
