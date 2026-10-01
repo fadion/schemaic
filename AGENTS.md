@@ -26,15 +26,19 @@ whether it is offered: `ddl::supports_or_replace_view`, `supports_view_rename`,
 `supports_column_reorder`, `rebuilds_tables`, `supports_change`, `alter_column_disturbs_checks`,
 `alter_column_disturbs_dependents`, `refreshes_star_dependents`, `bare_reference_is_own_namespace`,
 `ddl_is_transactional`, `users::revoke_cascades`, `supports_deny`,
-`table_grant_lifts_column_denies`, `sql::SqlDialect::read_only_is_a_rollback`,
-`dump::drops_up_front`,
+`table_grant_lifts_column_denies`, `table_revoke_clears_columns`, `blank_password_signs_in`, `drop_user_cuts_off_sessions`,
+`sql::SqlDialect::read_only_is_a_rollback`, `dump::drops_up_front`,
+`export::client_substitutes_variables`, `reads_dates_by_language`,
+`schema::unvalidated_check_waits_for_rows`, `writes_not_valid`,
 `stats::supports_table_stats` — alongside them the few that do decide whether a control is
 offered, because the clause behind it is one engine's alone:
 `ddl::supports_trigger_not_for_replication`, `supports_trigger_execute_as`,
-`supports_trigger_firing_rank`, `supports_fk_set_default`, `supports_fk_restrict` — and, for the
-*comparison* rather than any editor,
+`supports_trigger_firing_rank`, `supports_fk_set_default`, `supports_fk_restrict`,
+`users::accounts_have_hosts` — and, for the *comparison* rather than any editor,
 `ddl::ref_schema_is_database` and `view_definition_is_qualified`, which ask whether a field the
-differ reads names the object or the database it was read from. Ask a **capability**, never an
+differ reads names the object or the database it was read from, and
+`namespace_comes_with_every_database`, which keeps a schema the target already has out of the
+plan. Ask a **capability**, never an
 engine: a `dialect == Postgres` or `!= MySql` compiles cleanly while silently sorting a third
 engine onto whichever side it happens to fall — and a *constant* in place of a capability is the
 same failure with no comparison to grep for, which is why the predicates that do answer the same
