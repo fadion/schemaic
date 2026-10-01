@@ -13562,6 +13562,23 @@ existing prose was left alone.
   **`sys.objects.type` is `char(2)`**, so a procedure's `P` arrives padded as `P `, and until
   `routine_shape` trimmed it every stored procedure was read as a function
   (`a_routine_is_shaped_by_its_padded_object_type`).
+  **A schema load names no catalogue column the server has not got.** A static query naming one
+  fails whole at compile time (Msg 207, `CASE` or not), and `collect_schema` stops at the first
+  failure, so once the graph, temporal and sequence reads arrived every schema load on SQL Server
+  2016 or earlier failed — the tree, the dump, Copy DDL and the designer with it. `collect_schema`
+  now runs `CATALOGUE_PROBE` first, one `COL_LENGTH` per column, into `Catalogue`, and
+  `column_listing`, `index_listing`, `sequence_listing` and `table_kind_listing` are built from
+  its answer: `sys.columns.graph_type` and `sys.tables.is_node`/`is_edge` (2017),
+  `sys.tables.temporal_type` (2016), `is_memory_optimized` (2014) and
+  `sys.sequences.last_used_value` (2017), each a constant in its place where it is missing so the
+  reader's cell indices hold, and no table counted as a kind its server cannot have. Before 2017
+  `current_value` stands in for `last_used_value`; the two differ only on a sequence that has
+  handed out nothing, which then restores one step on — a gap, where reading nothing put every
+  used sequence back at its start. Asked by column rather than by `ProductMajorVersion`, since
+  Azure SQL Database reports 12 and has every one
+  (`a_listing_names_no_catalogue_column_the_server_has_not_got`,
+  `a_listing_without_a_column_keeps_its_cell_count`). No pre-2017 server is reachable here;
+  both forms of every listing were run against 2022 and 2025.
   **The driver is vendored and patched**, on the terms `vendor/floem/` is (*Floem 0.2 gotchas*):
   `vendor/tiberius/` is the published 0.13.0 through `[patch.crates-io]`, each change marked
   `schemaic patch (PATCHES.md)`, and `vendor/tiberius/PATCHES.md` is the record. Five patches:
@@ -13596,11 +13613,11 @@ existing prose was left alone.
   `tsql_definition` writes it, which the copy otherwise dropped and so took rows the original
   refused (`a_persisted_not_null_computed_column_keeps_its_not_null`) — a graph table `AS NODE`
   or `AS EDGE` and a temporal or memory-optimised one not at all (`TsqlTableKind`, read by
-  `TABLE_KIND_LISTING`; its `unrestatable` reason in a comment, the sequence arm's rule, since
+  `table_kind_listing`; its `unrestatable` reason in a comment, the sequence arm's rule, since
   read as a plain table a node carried its internal `graph_id_…`/`$node_id_…` columns and refused
   the original's rows, Msg 515, and a system-versioned table became two unrelated plain ones —
   `a_sql_server_graph_temporal_or_memory_optimised_table_is_not_scripted_as_a_plain_one`); the
-  internal columns are left out of `COLUMN_LISTING` by `graph_type`, the index keyed on nothing
+  internal columns are left out of `column_listing` by `graph_type`, the index keyed on nothing
   but graph ids is dropped and one naming another graph column is withheld as `lossy` — other indexes as separate
   statements, the table's and columns' comments after them through `ddl::tsql_add_comment` — the
   same `sp_addextendedproperty` the emitter writes (`create_ddl_sql_server_restates_the_comments`)

@@ -1256,12 +1256,86 @@ pub(crate) async fn fetch_table_list(db: &Db, database: &str) -> Result<DbSchema
     })
 }
 
+/// Which of the catalogue columns newer than SQL Server 2012 this server has
+/// — what [`CATALOGUE_PROBE`] answers, and what every listing that reads one
+/// is built from.
+///
+/// **A static query naming a column the server has not got fails whole**
+/// (Msg 207, at compile time, `CASE` or not), and `collect_schema` stops at
+/// the first such query: on a 2016 server every schema load failed, so the
+/// tree, the dump, Copy DDL and the designer with it. Asked by column rather
+/// than by `SERVERPROPERTY('ProductMajorVersion')`, because Azure SQL
+/// Database reports major version 12 and has every one of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Catalogue {
+    /// `sys.columns.graph_type` — SQL Server 2017.
+    graph_type: bool,
+    /// `sys.tables.is_node`/`is_edge` — SQL Server 2017.
+    graph_tables: bool,
+    /// `sys.tables.temporal_type` — SQL Server 2016.
+    temporal_type: bool,
+    /// `sys.tables.is_memory_optimized` — SQL Server 2014.
+    memory_optimized: bool,
+    /// `sys.sequences.last_used_value` — SQL Server 2017.
+    last_used_value: bool,
+}
+
+impl Catalogue {
+    /// What a current server has: every column.
+    #[cfg(test)]
+    const CURRENT: Catalogue = Catalogue {
+        graph_type: true,
+        graph_tables: true,
+        temporal_type: true,
+        memory_optimized: true,
+        last_used_value: true,
+    };
+
+    /// From [`CATALOGUE_PROBE`]'s row: each cell `1` where the column is
+    /// there.
+    fn from_row(r: &[Option<String>]) -> Catalogue {
+        let has = |i: usize| cell(r, i) == "1";
+        Catalogue {
+            graph_type: has(0),
+            graph_tables: has(1),
+            temporal_type: has(2),
+            memory_optimized: has(3),
+            last_used_value: has(4),
+        }
+    }
+}
+
+/// Whether each column [`Catalogue`] names is there, in its field order.
+/// `COL_LENGTH` answers `NULL` for a column a view has not got, on every
+/// version.
+const CATALOGUE_PROBE: &str = "SELECT \
+            CAST(CASE WHEN COL_LENGTH('sys.columns', 'graph_type') IS NULL THEN 0 ELSE 1 END AS int), \
+            CAST(CASE WHEN COL_LENGTH('sys.tables', 'is_node') IS NULL THEN 0 ELSE 1 END AS int), \
+            CAST(CASE WHEN COL_LENGTH('sys.tables', 'temporal_type') IS NULL THEN 0 ELSE 1 END AS int), \
+            CAST(CASE WHEN COL_LENGTH('sys.tables', 'is_memory_optimized') IS NULL THEN 0 ELSE 1 END AS int), \
+            CAST(CASE WHEN COL_LENGTH('sys.sequences', 'last_used_value') IS NULL THEN 0 ELSE 1 END AS int)";
+
 /// Every column of every user table and view: `(schema, table, column, type,
 /// max_length, precision, scale, user-defined type, nullable, identity,
 /// computed definition, persisted, default definition, collation (when not the
 /// database's), description, is rowversion, the type's schema, identity seed,
 /// identity increment, a typed `xml` column's schema collection's schema and
 /// name, and whether it is `DOCUMENT`)`.
+///
+/// A graph table's internal columns are left out by their `graph_type`
+/// ([`table_kind_listing`]); a server without the column has no graph tables.
+fn column_listing(cat: Catalogue) -> String {
+    format!(
+        "{COLUMN_LISTING}{} ORDER BY s.name, o.name, c.column_id",
+        if cat.graph_type {
+            " AND c.graph_type IS NULL"
+        } else {
+            ""
+        }
+    )
+}
+
+/// [`column_listing`] up to its filter on graph columns.
 const COLUMN_LISTING: &str = "SELECT s.name, o.name, c.name, ty.name, \
             c.max_length, c.precision, c.scale, CAST(ty.is_user_defined AS int), \
             CAST(c.is_nullable AS int), CAST(c.is_identity AS int), \
@@ -1288,23 +1362,38 @@ const COLUMN_LISTING: &str = "SELECT s.name, o.name, c.name, ty.name, \
      LEFT JOIN sys.extended_properties ep \
             ON ep.class = 1 AND ep.major_id = c.object_id AND ep.minor_id = c.column_id \
            AND ep.name = 'MS_Description' \
-     WHERE o.type IN ('U', 'V') AND o.is_ms_shipped = 0 AND c.graph_type IS NULL \
-     ORDER BY s.name, o.name, c.column_id";
+     WHERE o.type IN ('U', 'V') AND o.is_ms_shipped = 0";
 
 /// Every sequence, for a dump to create before the defaults that draw on it:
 /// `(schema, name, base type, precision, alias type's schema, alias type's
 /// name, start, increment, minimum, maximum, cycling, cached, cache size, last
 /// used)` — the bounds as text, a sequence being possibly `decimal(38,0)`.
-const SEQUENCE_LISTING: &str = "SELECT SCHEMA_NAME(s.schema_id), s.name, \
+///
+/// **Before 2017 there is no `last_used_value`, and `current_value` stands
+/// in.** The two differ only on a sequence that has handed out nothing,
+/// where `current_value` is its start: the copy's counter then moves on one
+/// step it need not have, a gap in the keys. Read as nothing instead, every
+/// used sequence came back at its start, and its next value was a key the
+/// rows already hold.
+fn sequence_listing(cat: Catalogue) -> String {
+    format!(
+        "SELECT SCHEMA_NAME(s.schema_id), s.name, \
             TYPE_NAME(s.system_type_id), CAST(s.precision AS int), \
             CASE WHEN s.user_type_id <> s.system_type_id THEN SCHEMA_NAME(t.schema_id) END, \
             CASE WHEN s.user_type_id <> s.system_type_id THEN t.name END, \
             CAST(s.start_value AS nvarchar(40)), CAST(s.increment AS nvarchar(40)), \
             CAST(s.minimum_value AS nvarchar(40)), CAST(s.maximum_value AS nvarchar(40)), \
             CAST(s.is_cycling AS int), CAST(s.is_cached AS int), CAST(s.cache_size AS int), \
-            CAST(s.last_used_value AS nvarchar(40)) \
+            CAST(s.{} AS nvarchar(40)) \
      FROM sys.sequences s JOIN sys.types t ON t.user_type_id = s.user_type_id \
-     ORDER BY 1, 2";
+     ORDER BY 1, 2",
+        if cat.last_used_value {
+            "last_used_value"
+        } else {
+            "current_value"
+        }
+    )
+}
 
 /// Every alias type (`CREATE TYPE … FROM`): `(schema, name, base type,
 /// max_length, precision, scale, nullable)`. A table type and a CLR type are
@@ -1334,20 +1423,56 @@ const SYNONYM_LISTING: &str = "SELECT SCHEMA_NAME(sn.schema_id), sn.name, \
 /// table, node, edge, temporal type, memory-optimised, has edge constraints)`.
 ///
 /// A graph table's internal columns (`graph_id_…`, `$node_id_…`, an edge's
-/// `$from_id_…`/`$to_id_…`) are left out of [`COLUMN_LISTING`] by their
+/// `$from_id_…`/`$to_id_…`) are left out of [`column_listing`] by their
 /// `graph_type`: they are the server's to add, `AS NODE`/`AS EDGE` restates
 /// them, and as ordinary columns they made a plain table that refused the
 /// original's rows (Msg 515). An edge constraint is an `EC` object, which a
 /// server before 2019 simply has none of.
-const TABLE_KIND_LISTING: &str = "SELECT s.name, t.name, CAST(t.is_node AS int), \
-            CAST(t.is_edge AS int), CAST(t.temporal_type AS int), \
-            CAST(t.is_memory_optimized AS int), \
+///
+/// Each kind a server has no column for is a `0` in its place, and no table
+/// is of it: a 2016 server has no graph tables, a 2012 one no temporal ones.
+fn table_kind_listing(cat: Catalogue) -> String {
+    // `(the cell, the test that a table is of the kind)`.
+    let kinds = [
+        (cat.graph_tables, "t.is_node", "t.is_node = 1"),
+        (cat.graph_tables, "t.is_edge", "t.is_edge = 1"),
+        (cat.temporal_type, "t.temporal_type", "t.temporal_type <> 0"),
+        (
+            cat.memory_optimized,
+            "t.is_memory_optimized",
+            "t.is_memory_optimized = 1",
+        ),
+    ];
+    let cells: Vec<String> = kinds
+        .iter()
+        .map(|&(has, col, _)| {
+            if has {
+                format!("CAST({col} AS int)")
+            } else {
+                "0".to_string()
+            }
+        })
+        .collect();
+    let any: Vec<&str> = kinds
+        .iter()
+        .filter(|(has, ..)| *has)
+        .map(|&(_, _, test)| test)
+        .collect();
+    format!(
+        "SELECT s.name, t.name, {}, \
             CAST(CASE WHEN EXISTS (SELECT 1 FROM sys.objects ec \
                                     WHERE ec.parent_object_id = t.object_id AND ec.type = 'EC') \
                  THEN 1 ELSE 0 END AS int) \
      FROM sys.tables t JOIN sys.schemas s ON s.schema_id = t.schema_id \
-     WHERE t.is_ms_shipped = 0 \
-       AND (t.is_node = 1 OR t.is_edge = 1 OR t.temporal_type <> 0 OR t.is_memory_optimized = 1)";
+     WHERE t.is_ms_shipped = 0 AND ({})",
+        cells.join(", "),
+        if any.is_empty() {
+            "1 = 0".to_string()
+        } else {
+            any.join(" OR ")
+        }
+    )
+}
 
 /// Every index's key columns, in key order: `(schema, table, index, unique,
 /// primary key, column, descending, filter, type, has included columns,
@@ -1359,6 +1484,18 @@ const TABLE_KIND_LISTING: &str = "SELECT s.name, t.name, CAST(t.is_node AS int),
 /// `key_ordinal` 0 and flagged as included — so it is read by its columns, in
 /// their order, or a key-only join drops it and the table's DDL left it out
 /// without the note every other index it cannot restate gets.
+fn index_listing(cat: Catalogue) -> String {
+    INDEX_LISTING.replace(
+        "{graph_type}",
+        if cat.graph_type {
+            "c.graph_type"
+        } else {
+            "NULL"
+        },
+    )
+}
+
+/// [`index_listing`] with `{graph_type}` where the column's graph type goes.
 const INDEX_LISTING: &str = "SELECT s.name, t.name, \
             CASE WHEN i.is_primary_key = 1 THEN 'PRIMARY' ELSE i.name END, \
             CAST(i.is_unique AS int), CAST(i.is_primary_key AS int), \
@@ -1369,7 +1506,7 @@ const INDEX_LISTING: &str = "SELECT s.name, t.name, \
                                       AND x.is_included_column = 1) \
                  THEN 1 ELSE 0 END AS int), \
             CASE WHEN i.is_primary_key = 1 OR i.is_unique_constraint = 1 THEN i.name END, \
-            c.graph_type \
+            {graph_type} \
      FROM sys.indexes i \
      JOIN sys.tables t ON t.object_id = i.object_id \
      JOIN sys.schemas s ON s.schema_id = t.schema_id \
@@ -1852,8 +1989,17 @@ async fn collect_schema(client: &mut MsClient) -> Result<DbSchema, DbError> {
     let int = |r: &[Option<String>], i: usize| -> i64 { cell(r, i).parse().unwrap_or(0) };
     let flag = |r: &[Option<String>], i: usize| cell(r, i) == "1";
 
+    // Which of the newer catalogue columns there are to read — see
+    // `Catalogue`.
+    let cat = Catalogue::from_row(
+        query_rows(client, CATALOGUE_PROBE)
+            .await?
+            .first()
+            .map(Vec::as_slice)
+            .unwrap_or_default(),
+    );
     let table_rows = query_rows(client, TABLE_LISTING).await?;
-    let mut idx_all = query_rows(client, INDEX_LISTING).await?;
+    let mut idx_all = query_rows(client, &index_listing(cat)).await?;
     // **A graph table's internal index is the server's, like its internal
     // columns**: one keyed on nothing but graph ids (`graph_type` 1, the
     // `GRAPH_UNIQUE_INDEX_…` that `AS NODE`/`AS EDGE` makes) goes; one that
@@ -1888,7 +2034,7 @@ async fn collect_schema(client: &mut MsClient) -> Result<DbSchema, DbError> {
         .map(|r| (cell(r, 0), cell(r, 1), cell(r, 5)))
         .collect();
 
-    let col_rows: Vec<(String, ColRow)> = query_rows(client, COLUMN_LISTING)
+    let col_rows: Vec<(String, ColRow)> = query_rows(client, &column_listing(cat))
         .await?
         .into_iter()
         .map(|r| {
@@ -2152,7 +2298,7 @@ async fn collect_schema(client: &mut MsClient) -> Result<DbSchema, DbError> {
         .filter_map(|r| Some(((cell(&r, 0), cell(&r, 1)), r.get(2).cloned().flatten()?)))
         .collect();
     let kinds: HashMap<(String, String), schemaic_core::schema::TsqlTableKind> =
-        query_rows(client, TABLE_KIND_LISTING)
+        query_rows(client, &table_kind_listing(cat))
             .await?
             .into_iter()
             .map(|r| {
@@ -2300,7 +2446,7 @@ async fn collect_schema(client: &mut MsClient) -> Result<DbSchema, DbError> {
                 },
             ));
         }
-        for r in query_rows(client, SEQUENCE_LISTING).await? {
+        for r in query_rows(client, &sequence_listing(cat)).await? {
             let base = cell(&r, 2);
             let data_type = match r.get(5).cloned().flatten() {
                 Some(alias) => format!(
@@ -4835,6 +4981,103 @@ mod write_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A server with none of the catalogue columns newer than 2012.
+    const OLDEST: Catalogue = Catalogue {
+        graph_type: false,
+        graph_tables: false,
+        temporal_type: false,
+        memory_optimized: false,
+        last_used_value: false,
+    };
+
+    /// Every listing a schema load runs, as built for `cat`.
+    fn listings(cat: Catalogue) -> Vec<String> {
+        vec![
+            column_listing(cat),
+            index_listing(cat),
+            sequence_listing(cat),
+            table_kind_listing(cat),
+        ]
+    }
+
+    /// **A schema load on a server older than a catalogue column never names
+    /// it.** A query naming one fails whole (Msg 207), and `collect_schema`
+    /// stopped at the first: on SQL Server 2016 every schema load failed.
+    /// Each column is asked of the probe on its own and left out where it is
+    /// missing, one at a time, so no listing leans on another's answer.
+    #[test]
+    fn a_listing_names_no_catalogue_column_the_server_has_not_got() {
+        let gated: [(&str, fn(&mut Catalogue)); 5] = [
+            ("graph_type", |c| c.graph_type = false),
+            ("is_node", |c| c.graph_tables = false),
+            ("temporal_type", |c| c.temporal_type = false),
+            ("is_memory_optimized", |c| c.memory_optimized = false),
+            ("last_used_value", |c| c.last_used_value = false),
+        ];
+        for (column, without) in gated {
+            let mut cat = Catalogue::CURRENT;
+            without(&mut cat);
+            for sql in listings(cat) {
+                assert!(!sql.contains(column), "{column} named without it: {sql}");
+            }
+            // And a current server is still asked for it.
+            assert!(
+                listings(Catalogue::CURRENT)
+                    .iter()
+                    .any(|sql| sql.contains(column)),
+                "{column} never read"
+            );
+        }
+        for column in ["is_edge", "graph_type"] {
+            for sql in listings(OLDEST) {
+                assert!(!sql.contains(column), "{column}: {sql}");
+            }
+        }
+    }
+
+    /// **The rows keep their shape whatever the server has**: a column it has
+    /// not got is a constant in its place, so the reader's cell indices hold.
+    #[test]
+    fn a_listing_without_a_column_keeps_its_cell_count() {
+        // Top-level commas of the outer `SELECT` list; none of these
+        // listings has a comma inside a string.
+        let cells = |sql: &str| {
+            let (mut depth, mut commas) = (0i32, 1usize);
+            for (i, b) in sql.bytes().enumerate() {
+                match b {
+                    b'(' => depth += 1,
+                    b')' => depth -= 1,
+                    b',' if depth == 0 => commas += 1,
+                    b' ' if depth == 0 && sql[i..].starts_with(" FROM ") => return commas,
+                    _ => {}
+                }
+            }
+            panic!("no FROM in {sql}")
+        };
+        for (old, new) in listings(OLDEST).iter().zip(listings(Catalogue::CURRENT)) {
+            assert_eq!(cells(old), cells(&new), "{old}\n{new}");
+        }
+    }
+
+    /// The probe's row read into its fields, in order — `1` there, anything
+    /// else not.
+    #[test]
+    fn the_catalogue_probe_reads_each_column_in_its_place() {
+        let row = |cells: [&str; 5]| -> Vec<Option<String>> {
+            cells.iter().map(|c| Some(c.to_string())).collect()
+        };
+        assert_eq!(
+            Catalogue::from_row(&row(["1"; 5])),
+            Catalogue::CURRENT,
+            "every column there"
+        );
+        assert_eq!(Catalogue::from_row(&row(["0"; 5])), OLDEST);
+        assert_eq!(Catalogue::from_row(&[]), OLDEST, "no row reads as none");
+        let one = Catalogue::from_row(&row(["0", "0", "1", "0", "0"]));
+        assert!(one.temporal_type && !one.graph_type && !one.memory_optimized);
+        assert_eq!(CATALOGUE_PROBE.matches("COL_LENGTH").count(), 5);
+    }
 
     /// **An Entra handle with a plan that verifies nothing is refused before a
     /// token is fetched** — the composition of `AuthMode::transport_refusal`
