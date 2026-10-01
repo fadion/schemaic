@@ -10638,7 +10638,7 @@ mod filter_exclusion_tests {
 
         let sql = build_query(
             base,
-            &eq_condition("a", Some("x"), true, SqlDialect::Sqlite),
+            &eq_condition("a", "TEXT", Some("x"), true, SqlDialect::Sqlite),
             &[],
             SqlDialect::Sqlite,
         )
@@ -10654,7 +10654,7 @@ mod filter_exclusion_tests {
         // that gesture means — the `=` arm must not grow the same term.
         let sql = build_query(
             base,
-            &eq_condition("a", Some("x"), false, SqlDialect::Sqlite),
+            &eq_condition("a", "TEXT", Some("x"), false, SqlDialect::Sqlite),
             &[],
             SqlDialect::Sqlite,
         )

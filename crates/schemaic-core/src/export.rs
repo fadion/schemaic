@@ -844,6 +844,102 @@ pub fn sql_literal(v: &Value, dialect: SqlDialect) -> String {
     }
 }
 
+/// [`sql_literal`] for a cell of a column typed `type_name`: a SQL Server
+/// `datetime` or `smalldatetime` in the form every login language reads
+/// alike ([`language_safe_datetime`]), anything else as `sql_literal` writes
+/// it.
+///
+/// **What a statement this app writes for someone else to run goes through
+/// this** — the SQL export, *Copy as SQL INSERT*, a dump's rows and the grid's
+/// *Filter by / Exclude this value*. The grid shows a `datetime` as
+/// `2026-01-02 09:00:00.000`, which those two types read by the session's
+/// `DATEFORMAT`: year-*day*-month under `british` and the German, French,
+/// Italian and Spanish defaults, so a pasted copy stored the 1st of February
+/// and said `1 row affected`, and a filter on the 2 January row showed the
+/// February ones (measured on 2022 and 2025).
+pub fn typed_literal(v: &Value, type_name: &str, dialect: SqlDialect) -> String {
+    match v {
+        Value::Str(s) if reads_dates_by_language(type_name, dialect) => {
+            match language_safe_datetime(s) {
+                Some(iso) => sql_literal(&Value::Str(iso), dialect),
+                None => sql_literal(v, dialect),
+            }
+        }
+        _ => sql_literal(v, dialect),
+    }
+}
+
+/// Does a column typed `type_name` read a date string by the session's
+/// language? SQL Server's `datetime` and `smalldatetime` do (`SET
+/// DATEFORMAT`, which `SET LANGUAGE` sets); its newer types read
+/// `yyyy-mm-dd` as ISO whatever the language, and no other engine has the
+/// setting.
+pub fn reads_dates_by_language(type_name: &str, dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MsSql => {
+            type_name.eq_ignore_ascii_case("datetime")
+                || type_name.eq_ignore_ascii_case("smalldatetime")
+        }
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+    }
+}
+
+/// `yyyy-mm-dd[ hh:mm[:ss[.fraction]]]` in the ISO 8601 `T` form —
+/// `yyyy-mm-ddThh:mm:ss[.fraction]` — or `None` for any other text.
+///
+/// **The form every login language reads alike.** A `datetime` or
+/// `smalldatetime` converts `2026-01-02 00:00:00.000` under the session's
+/// `DATEFORMAT`, which a day-first language (`british`, and the German,
+/// French, Italian and Spanish installers' default) makes year-*day*-month:
+/// deleting the 2 January row in the grid deleted 1 February, and the 1-row
+/// net passed it (measured on 2022). The `T` form is read as ISO under every
+/// setting, and so is a bare date turned into midnight; `smalldatetime` takes
+/// a fraction in it as well (measured). `date`, `datetime2` and
+/// `datetimeoffset` read `yyyy-mm-dd` as ISO already.
+pub fn language_safe_datetime(text: &str) -> Option<String> {
+    let b = text.as_bytes();
+    let digits =
+        |r: std::ops::Range<usize>| b.get(r).is_some_and(|s| s.iter().all(u8::is_ascii_digit));
+    if !(digits(0..4)
+        && b.get(4) == Some(&b'-')
+        && digits(5..7)
+        && b.get(7) == Some(&b'-')
+        && digits(8..10))
+    {
+        return None;
+    }
+    let date = &text[..10];
+    let rest = &text[10..];
+    if rest.is_empty() {
+        return Some(format!("{date}T00:00:00"));
+    }
+    let time = rest.strip_prefix(' ').or_else(|| rest.strip_prefix('T'))?;
+    let (clock, fraction) = match time.split_once('.') {
+        Some((c, f)) if !f.is_empty() && f.bytes().all(|d| d.is_ascii_digit()) => (c, Some(f)),
+        Some(_) => return None,
+        None => (time, None),
+    };
+    let parts: Vec<&str> = clock.split(':').collect();
+    let two = |p: &str, max: u32| {
+        (1..=2).contains(&p.len())
+            && p.bytes().all(|d| d.is_ascii_digit())
+            && p.parse::<u32>().is_ok_and(|n| n <= max)
+    };
+    let (h, m, s) = match parts.as_slice() {
+        [h, m] if two(h, 23) && two(m, 59) => (h, m, "0"),
+        [h, m, s] if two(h, 23) && two(m, 59) && two(s, 59) => (h, m, *s),
+        _ => return None,
+    };
+    if fraction.is_some() && parts.len() != 3 {
+        return None;
+    }
+    let pad = |p: &str| format!("{p:0>2}");
+    Some(match fraction {
+        Some(f) => format!("{date}T{}:{}:{}.{f}", pad(h), pad(m), pad(s)),
+        None => format!("{date}T{}:{}:{}", pad(h), pad(m), pad(s)),
+    })
+}
+
 /// A finite `f64` as a literal every engine reads back as the same double.
 ///
 /// **An exponent once the plain form grows long.** Rust prints an `f64` without
@@ -2931,7 +3027,7 @@ pub fn export_inserts_ending<W: Write>(
                             "NULL".to_string()
                         }),
                         None if withheld_binary(&mask, ci, &cell) => "NULL".to_string(),
-                        None => sql_literal(&value, dialect),
+                        None => typed_literal(&value, &c.rs.columns[ci].type_name, dialect),
                     }
                 });
                 let lit = lit.unwrap_or_else(|| "NULL".to_string());
@@ -3789,6 +3885,55 @@ mod tests {
         );
         assert_eq!(sql_literal(&Value::Int(-3), MsSql), "-3");
         assert_eq!(literal_mode_sql(MsSql), None);
+    }
+
+    /// **A SQL Server `datetime` is copied and exported in the form every
+    /// login language reads alike.** The grid's text, `2026-01-02
+    /// 09:00:00.000`, is year-*day*-month to a `datetime` or `smalldatetime`
+    /// under `british` and the German, French, Italian and Spanish defaults,
+    /// so *Copy as SQL INSERT* pasted there stored the 1st of February and
+    /// said `1 row affected`. The newer types read it as ISO already and keep
+    /// the grid's text, as every other engine does.
+    #[test]
+    fn a_sql_server_datetime_is_exported_in_the_form_every_language_reads() {
+        let rs_of = |at: &str| {
+            ResultSet::from_rows(
+                [
+                    ("at", "datetime"),
+                    ("sm", "smalldatetime"),
+                    ("d2", "datetime2"),
+                    ("s", "nvarchar"),
+                ]
+                .iter()
+                .map(|(n, t)| crate::model::Column {
+                    name: n.to_string(),
+                    type_name: t.to_string(),
+                    origin: None,
+                })
+                .collect(),
+                vec![vec![
+                    Value::Str(at.into()),
+                    Value::Str("2026-01-02 09:00:00".into()),
+                    Value::Str("2026-01-02 09:00:00.0000000".into()),
+                    Value::Str("2026-01-02 09:00:00.000".into()),
+                ]],
+            )
+        };
+        let rs = rs_of("2026-01-02 09:00:00.000");
+        let sql = export_inserts(&rs, &[0], None, MsSql);
+        assert!(
+            sql.contains(
+                "(N'2026-01-02T09:00:00.000', N'2026-01-02T09:00:00', \
+                 N'2026-01-02 09:00:00.0000000', N'2026-01-02 09:00:00.000')"
+            ),
+            "{sql}"
+        );
+        // Text that is not a date stays as it is — the server's to refuse.
+        let odd = export_inserts(&rs_of("not a date"), &[0], None, MsSql);
+        assert!(odd.contains("(N'not a date', "), "{odd}");
+        // No other engine's `datetime` reads a date by language.
+        let sql = export_inserts(&rs, &[0], None, MySql);
+        assert!(sql.contains("('2026-01-02 09:00:00.000', "), "{sql}");
     }
 
     /// **A character variant is converted under its own collation, and read

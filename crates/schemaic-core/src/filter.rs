@@ -250,8 +250,20 @@ pub fn rerun_of(
 ///
 /// Identifiers and string literals are quoted/escaped per dialect so the fragment
 /// re-parses cleanly (reserved-word columns, embedded quotes/backslashes).
-pub fn eq_condition(col: &str, value: Option<&str>, negate: bool, dialect: SqlDialect) -> String {
+///
+/// **`type_name` is the column's, because the literal depends on it**: a SQL
+/// Server `datetime` reads the cell's `2026-01-02 10:30:00.000` by the login's
+/// language, day-first under `british`, so filtering on the 2 January row
+/// showed the 1 February ones ([`crate::export::typed_literal`]).
+pub fn eq_condition(
+    col: &str,
+    type_name: &str,
+    value: Option<&str>,
+    negate: bool,
+    dialect: SqlDialect,
+) -> String {
     let ident = quote_ident(col, dialect);
+    let quote_value = |v: &str| quote_value(v, type_name, dialect);
     match value {
         None => {
             if negate {
@@ -261,12 +273,9 @@ pub fn eq_condition(col: &str, value: Option<&str>, negate: bool, dialect: SqlDi
             }
         }
         Some(v) if negate => {
-            format!(
-                "({ident} <> {} OR {ident} IS NULL)",
-                quote_value(v, dialect)
-            )
+            format!("({ident} <> {} OR {ident} IS NULL)", quote_value(v))
         }
-        Some(v) => format!("{ident} = {}", quote_value(v, dialect)),
+        Some(v) => format!("{ident} = {}", quote_value(v)),
     }
 }
 
@@ -349,11 +358,12 @@ pub(crate) fn quoted_ident_for_test(name: &str, dialect: SqlDialect) -> String {
 /// an escape character in string literals by default, unlike standard-conforming
 /// Postgres strings).
 ///
-/// **Delegates to [`crate::export::sql_literal`]**, which wrote the same
-/// escaping independently — and which is the one that knows SQL Server's
-/// literal wants an `N` prefix.
-fn quote_value(v: &str, dialect: SqlDialect) -> String {
-    crate::export::sql_literal(&crate::model::Value::Str(v.to_string()), dialect)
+/// **Delegates to [`crate::export::typed_literal`]**, over the one literal
+/// quoter, [`crate::export::sql_literal`], which wrote the same escaping
+/// independently — and which is the one that knows SQL Server's literal wants
+/// an `N` prefix.
+fn quote_value(v: &str, type_name: &str, dialect: SqlDialect) -> String {
+    crate::export::typed_literal(&crate::model::Value::Str(v.to_string()), type_name, dialect)
 }
 
 /// Does `name` have to be quoted to survive a round-trip through the server?
@@ -1317,7 +1327,7 @@ mod tests {
     #[test]
     fn eq_condition_basic() {
         assert_eq!(
-            eq_condition("country", Some("USA"), false, SqlDialect::MySql),
+            eq_condition("country", "VARCHAR", Some("USA"), false, SqlDialect::MySql),
             "`country` = 'USA'"
         );
         // **Exclude keeps the NULLs.** `NULL <> 'USA'` is NULL, not TRUE, so a
@@ -1325,19 +1335,58 @@ mod tests {
         // MariaDB 10.11 and PostgreSQL 16, and SQLite is the same. Parenthesised
         // because the caller `AND`s this onto whatever is already in the bar.
         assert_eq!(
-            eq_condition("country", Some("USA"), true, SqlDialect::MySql),
+            eq_condition("country", "VARCHAR", Some("USA"), true, SqlDialect::MySql),
             "(`country` <> 'USA' OR `country` IS NULL)"
+        );
+    }
+
+    /// **A SQL Server `datetime` is compared in the form every login language
+    /// reads alike.** The cell's text, `2026-01-02 10:30:00.000`, is
+    /// year-*day*-month to a `datetime` or `smalldatetime` under `british`,
+    /// so *Filter by this value* on the 2 January row showed the 1 February
+    /// rows and *Exclude* kept it (measured on 2022). `datetime2` reads the
+    /// grid's text as ISO, and keeps it.
+    #[test]
+    fn a_sql_server_datetime_filter_is_language_proof() {
+        let ms = SqlDialect::MsSql;
+        assert_eq!(
+            eq_condition("dt", "datetime", Some("2026-01-02 10:30:00.000"), false, ms),
+            "[dt] = N'2026-01-02T10:30:00.000'"
+        );
+        assert_eq!(
+            eq_condition("dt", "smalldatetime", Some("2026-01-02 10:30:00"), true, ms),
+            "([dt] <> N'2026-01-02T10:30:00' OR [dt] IS NULL)"
+        );
+        assert_eq!(
+            eq_condition(
+                "d2",
+                "datetime2",
+                Some("2026-01-02 10:30:00.0000000"),
+                false,
+                ms
+            ),
+            "[d2] = N'2026-01-02 10:30:00.0000000'"
+        );
+        assert_eq!(
+            eq_condition(
+                "dt",
+                "DATETIME",
+                Some("2026-01-02 10:30:00"),
+                false,
+                SqlDialect::MySql
+            ),
+            "`dt` = '2026-01-02 10:30:00'"
         );
     }
 
     #[test]
     fn eq_condition_null() {
         assert_eq!(
-            eq_condition("addr", None, false, SqlDialect::MySql),
+            eq_condition("addr", "VARCHAR", None, false, SqlDialect::MySql),
             "`addr` IS NULL"
         );
         assert_eq!(
-            eq_condition("addr", None, true, SqlDialect::MySql),
+            eq_condition("addr", "VARCHAR", None, true, SqlDialect::MySql),
             "`addr` IS NOT NULL"
         );
     }
@@ -1345,7 +1394,7 @@ mod tests {
     #[test]
     fn eq_condition_quotes_per_dialect() {
         assert_eq!(
-            eq_condition("x", Some("v"), false, SqlDialect::Postgres),
+            eq_condition("x", "text", Some("v"), false, SqlDialect::Postgres),
             "\"x\" = 'v'"
         );
     }
@@ -1353,7 +1402,7 @@ mod tests {
     #[test]
     fn eq_condition_escapes_embedded_quote() {
         assert_eq!(
-            eq_condition("c", Some("O'Brien"), false, SqlDialect::MySql),
+            eq_condition("c", "VARCHAR", Some("O'Brien"), false, SqlDialect::MySql),
             "`c` = 'O''Brien'"
         );
     }
@@ -1361,12 +1410,12 @@ mod tests {
     #[test]
     fn eq_condition_escapes_backslash_on_mysql_only() {
         assert_eq!(
-            eq_condition("c", Some("a\\b"), false, SqlDialect::MySql),
+            eq_condition("c", "VARCHAR", Some("a\\b"), false, SqlDialect::MySql),
             "`c` = 'a\\\\b'"
         );
         // Postgres standard strings treat backslash literally — don't double it.
         assert_eq!(
-            eq_condition("c", Some("a\\b"), false, SqlDialect::Postgres),
+            eq_condition("c", "text", Some("a\\b"), false, SqlDialect::Postgres),
             "\"c\" = 'a\\b'"
         );
     }
@@ -1375,7 +1424,13 @@ mod tests {
     fn eq_condition_roundtrips_through_build_query() {
         // A malicious-looking value stays a single string literal — the rewritten
         // SQL still parses to exactly one statement with one WHERE.
-        let cond = eq_condition("c", Some("x'); DROP TABLE t; --"), false, SqlDialect::MySql);
+        let cond = eq_condition(
+            "c",
+            "VARCHAR",
+            Some("x'); DROP TABLE t; --"),
+            false,
+            SqlDialect::MySql,
+        );
         let out = build_query("SELECT * FROM t", &cond, &[], SqlDialect::MySql)
             .unwrap()
             .unwrap();

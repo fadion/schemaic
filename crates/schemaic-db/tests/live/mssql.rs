@@ -5732,6 +5732,57 @@ async fn a_datetime_key_finds_its_row_under_a_day_first_login() {
     );
 }
 
+/// **A copied `INSERT` and a cell filter mean the grid's day under a
+/// day-first language.** Both wrote the cell's `2026-01-02 10:30:00.000`,
+/// which a `datetime` or `smalldatetime` reads as the 1st of February under
+/// `british`: the pasted copy stored February with `1 row affected`, and
+/// *Filter by this value* on the 2 January row showed the February one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_copied_insert_and_a_cell_filter_keep_their_day_under_a_day_first_language() {
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("dmycopy").await;
+    s.exec(
+        "CREATE TABLE dbo.d (id int PRIMARY KEY, at datetime NOT NULL, sm smalldatetime NULL); \
+         INSERT dbo.d VALUES (1, '20260102 10:30', '20260102 10:30'), \
+           (2, '20260201 10:30', '20260201 10:30'); \
+         CREATE TABLE dbo.copy (id int PRIMARY KEY, at datetime NOT NULL, sm smalldatetime NULL);",
+    )
+    .await;
+    let rs = s.exec("SELECT id, at, sm FROM dbo.d WHERE id = 1").await;
+    let sql = schemaic_core::export::export_inserts(&rs, &[0], Some(("", Some("dbo"), "copy")), MS);
+    s.exec(&format!("SET LANGUAGE british;\n{sql}")).await;
+    assert_eq!(
+        s.scalar(
+            "SELECT CONCAT(CONVERT(char(16), at, 126), '|', CONVERT(char(16), sm, 126)) \
+             FROM dbo.copy"
+        )
+        .await,
+        "2026-01-02T10:30|2026-01-02T10:30",
+        "{sql}"
+    );
+    for (ci, col) in [(1, "at"), (2, "sm")] {
+        let text = rs.cell(0, ci).unwrap().display().to_string();
+        let ty = &rs.columns[ci].type_name;
+        let ids = |negate: bool| {
+            let cond = schemaic_core::filter::eq_condition(col, ty, Some(&text), negate, MS);
+            format!(
+                "SET LANGUAGE british; \
+                 SELECT CONCAT('ids ', STRING_AGG(id, ',') WITHIN GROUP (ORDER BY id)) \
+                 FROM dbo.d WHERE {cond}"
+            )
+        };
+        assert_eq!(
+            s.scalar(&ids(false)).await,
+            "ids 1",
+            "{col}: {}",
+            ids(false)
+        );
+        assert_eq!(s.scalar(&ids(true)).await, "ids 2", "{col}: {}", ids(true));
+    }
+}
+
 /// **Accounts end to end, both halves.** A login and the user it brings are
 /// created in one plan and listed linked; the login signs in to the database
 /// through its user; grants at the schema and a role membership read back as

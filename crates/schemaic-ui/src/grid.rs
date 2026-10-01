@@ -952,7 +952,13 @@ impl GridState {
         let Some(col) = self.real_col(ci) else {
             return;
         };
-        let cond = eq_condition(&col, value, negate, self.dialect);
+        // The column's type decides the literal: a SQL Server `datetime`
+        // reads the cell's text by the login's language otherwise.
+        let type_name = self
+            .rs
+            .with_untracked(|rs| rs.columns.get(ci).map(|c| c.type_name.clone()))
+            .unwrap_or_default();
+        let cond = eq_condition(&col, &type_name, value, negate, self.dialect);
         self.grid_query.update(|gq| {
             if gq.filter.trim().is_empty() {
                 gq.filter = cond;

@@ -33,6 +33,7 @@ use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use schemaic_core::blob::{BlobRef, BlobValue, FETCH_CAP};
+use schemaic_core::export::language_safe_datetime;
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::model::{
     CellEdit, Column, ColumnFlags, ColumnOrigin, GridWrite, RefetchRow, RefetchTemplate,
@@ -2989,67 +2990,12 @@ fn hole(params: &mut Vec<ColumnData<'static>>, v: ColumnData<'static>) -> String
     format!("@P{}", params.len())
 }
 
-/// `yyyy-mm-dd[ hh:mm[:ss[.fraction]]]` in the ISO 8601 `T` form —
-/// `yyyy-mm-ddThh:mm:ss[.fraction]` — or `None` for any other text.
-///
-/// **The form every login language reads alike.** A `datetime` or
-/// `smalldatetime` converts `2026-01-02 00:00:00.000` under the session's
-/// `DATEFORMAT`, which a day-first language (`british`, and the German,
-/// French, Italian and Spanish installers' default) makes year-*day*-month:
-/// deleting the 2 January row in the grid deleted 1 February, and the 1-row
-/// net passed it (measured on 2022). The `T` form is read as ISO under every
-/// setting, and so is a bare date turned into midnight. `date`, `datetime2`
-/// and `datetimeoffset` read `yyyy-mm-dd` as ISO already.
-fn language_safe_datetime(text: &str) -> Option<String> {
-    let b = text.as_bytes();
-    let digits =
-        |r: std::ops::Range<usize>| b.get(r).is_some_and(|s| s.iter().all(u8::is_ascii_digit));
-    if !(digits(0..4)
-        && b.get(4) == Some(&b'-')
-        && digits(5..7)
-        && b.get(7) == Some(&b'-')
-        && digits(8..10))
-    {
-        return None;
-    }
-    let date = &text[..10];
-    let rest = &text[10..];
-    if rest.is_empty() {
-        return Some(format!("{date}T00:00:00"));
-    }
-    let time = rest.strip_prefix(' ').or_else(|| rest.strip_prefix('T'))?;
-    let (clock, fraction) = match time.split_once('.') {
-        Some((c, f)) if !f.is_empty() && f.bytes().all(|d| d.is_ascii_digit()) => (c, Some(f)),
-        Some(_) => return None,
-        None => (time, None),
-    };
-    let parts: Vec<&str> = clock.split(':').collect();
-    let two = |p: &str, max: u32| {
-        (1..=2).contains(&p.len())
-            && p.bytes().all(|d| d.is_ascii_digit())
-            && p.parse::<u32>().is_ok_and(|n| n <= max)
-    };
-    let (h, m, s) = match parts.as_slice() {
-        [h, m] if two(h, 23) && two(m, 59) => (h, m, "0"),
-        [h, m, s] if two(h, 23) && two(m, 59) && two(s, 59) => (h, m, *s),
-        _ => return None,
-    };
-    if fraction.is_some() && parts.len() != 3 {
-        return None;
-    }
-    let pad = |p: &str| format!("{p:0>2}");
-    Some(match fraction {
-        Some(f) => format!("{date}T{}:{}:{}.{f}", pad(h), pad(m), pad(s)),
-        None => format!("{date}T{}:{}:{}", pad(h), pad(m), pad(s)),
-    })
-}
-
 /// Text as `col` should receive it: a `datetime` or `smalldatetime` in the
-/// form every language reads alike ([`language_safe_datetime`]), anything
-/// else as it is.
+/// form every language reads alike ([`language_safe_datetime`], core's, which
+/// the export and the grid's filter write too), anything else as it is.
 fn column_text(facts: &[ColumnFacts], col: &str, text: &str) -> String {
     match fact(facts, col) {
-        Some(f) if matches!(f.base_type.as_str(), "datetime" | "smalldatetime") => {
+        Some(f) if schemaic_core::export::reads_dates_by_language(&f.base_type, MS) => {
             language_safe_datetime(text).unwrap_or_else(|| text.to_string())
         }
         _ => text.to_string(),

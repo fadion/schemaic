@@ -1773,7 +1773,9 @@ existing prose was left alone.
     everything green, and the read-more link had no copy at all (*Architecture invariants*, the write
     guard). An empty or whitespace base is `None` too, since `contains_write("")` is `false` and a
     bare "is it a write?" gate therefore says yes to nothing at all.
-    `eq_condition` is the right-click "Filter by / Exclude" fragment. `table_query` is what opening
+    `eq_condition` is the right-click "Filter by / Exclude" fragment, its literal written for the
+    column's type (`export::typed_literal`: a SQL Server `datetime` reads the cell's text by the
+    login's language otherwise). `table_query` is what opening
     a table from the tree generates: it orders by the PK on purpose — no engine promises row
     order for a capped page, and PG heap order shifts under an `UPDATE` — while leaving an ordinary
     name unquoted, since a quoted identifier blinds the mid-edit tokenizer behind completion. It
@@ -3426,7 +3428,9 @@ existing prose was left alone.
     (Msg 242). It is session state, so one line holds for every later `GO` batch on both restore
     paths; there is no restore half, since T-SQL cannot read the format back
     (`a_sql_server_dump_pins_its_date_format_before_any_row`; the live round trip restores under
-    `SET LANGUAGE british`). **The `@SCHEMAIC_OLD_SQL_MODE` wrapper is MySQL's
+    `SET LANGUAGE british`). The rows' own literals no longer lean on it — `export::typed_literal`
+    writes those two types in the `T` form — and the pin stays for whatever other date text the
+    file carries. **The `@SCHEMAIC_OLD_SQL_MODE` wrapper is MySQL's
     session-variable syntax**, so this leans on `literal_mode_sql` answering for MySQL alone and
     carries a `debug_assert` saying so: a second dialect needing a statement there has to grow an
     arm here, not have its statement wrapped in these two. Whether a PostgreSQL *dump* should pin
@@ -12797,8 +12801,13 @@ existing prose was left alone.
   (`british`, and the German, French, Italian and Spanish installers' default) makes
   year-*day*-month — deleting the 2 January row deleted 1 February and the 1-row net passed it,
   measured on 2022. So `column_text` rewrites such a column's text, key and staged value alike, into
-  the ISO `T` form (`language_safe_datetime`: `2026-01-02T00:00:00.000`, a bare date as midnight),
-  which every language reads the same; the column's type comes from the same `ColumnFacts` the
+  the ISO `T` form (`export::language_safe_datetime`: `2026-01-02T00:00:00.000`, a bare date as
+  midnight), which every language reads the same — **core's, because the same text reaches SQL by
+  three other roads**: `export::typed_literal`, behind every `INSERT` the export renderer writes
+  (the SQL export, *Copy as SQL INSERT*, a dump's rows) and the grid's *Filter by / Exclude this
+  value*, which wrote `N'2026-01-02 10:30:00.000'` and so pasted or filtered February for January
+  (`a_copied_insert_and_a_cell_filter_keep_their_day_under_a_day_first_language`); the predicate
+  all four ask is `export::reads_dates_by_language`. The column's type comes from the same `ColumnFacts` the
   guards read, so `refetch_on` and `blob_on` read them too, and the import rewrites each batch
   (`language_safe_batch`). `date`, `datetime2` and `datetimeoffset` read `yyyy-mm-dd` as ISO already
   and are left alone (`a_datetime_key_finds_its_row_under_a_day_first_login`, a `british` login, on
