@@ -1195,7 +1195,8 @@ pub(crate) async fn fetch_table_list(db: &Db, database: &str) -> Result<DbSchema
 /// max_length, precision, scale, user-defined type, nullable, identity,
 /// computed definition, persisted, default definition, collation (when not the
 /// database's), description, is rowversion, the type's schema, identity seed,
-/// identity increment)`.
+/// identity increment, a typed `xml` column's schema collection's schema and
+/// name, and whether it is `DOCUMENT`)`.
 const COLUMN_LISTING: &str = "SELECT s.name, o.name, c.name, ty.name, \
             c.max_length, c.precision, c.scale, CAST(ty.is_user_defined AS int), \
             CAST(c.is_nullable AS int), CAST(c.is_identity AS int), \
@@ -1206,8 +1207,11 @@ const COLUMN_LISTING: &str = "SELECT s.name, o.name, c.name, ty.name, \
             CAST(ep.value AS nvarchar(4000)), \
             CAST(CASE WHEN ty.name = 'timestamp' THEN 1 ELSE 0 END AS int), \
             SCHEMA_NAME(ty.schema_id), \
-            CAST(idc.seed_value AS nvarchar(40)), CAST(idc.increment_value AS nvarchar(40)) \
+            CAST(idc.seed_value AS nvarchar(40)), CAST(idc.increment_value AS nvarchar(40)), \
+            SCHEMA_NAME(xc.schema_id), xc.name, CAST(c.is_xml_document AS int) \
      FROM sys.columns c \
+     LEFT JOIN sys.xml_schema_collections xc \
+            ON xc.xml_collection_id = c.xml_collection_id AND c.xml_collection_id > 0 \
      JOIN sys.objects o ON o.object_id = c.object_id \
      JOIN sys.schemas s ON s.schema_id = o.schema_id \
      JOIN sys.types ty ON ty.user_type_id = c.user_type_id \
@@ -1221,6 +1225,45 @@ const COLUMN_LISTING: &str = "SELECT s.name, o.name, c.name, ty.name, \
            AND ep.name = 'MS_Description' \
      WHERE o.type IN ('U', 'V') AND o.is_ms_shipped = 0 AND c.graph_type IS NULL \
      ORDER BY s.name, o.name, c.column_id";
+
+/// Every sequence, for a dump to create before the defaults that draw on it:
+/// `(schema, name, base type, precision, alias type's schema, alias type's
+/// name, start, increment, minimum, maximum, cycling, cached, cache size, last
+/// used)` — the bounds as text, a sequence being possibly `decimal(38,0)`.
+const SEQUENCE_LISTING: &str = "SELECT SCHEMA_NAME(s.schema_id), s.name, \
+            TYPE_NAME(s.system_type_id), CAST(s.precision AS int), \
+            CASE WHEN s.user_type_id <> s.system_type_id THEN SCHEMA_NAME(t.schema_id) END, \
+            CASE WHEN s.user_type_id <> s.system_type_id THEN t.name END, \
+            CAST(s.start_value AS nvarchar(40)), CAST(s.increment AS nvarchar(40)), \
+            CAST(s.minimum_value AS nvarchar(40)), CAST(s.maximum_value AS nvarchar(40)), \
+            CAST(s.is_cycling AS int), CAST(s.is_cached AS int), CAST(s.cache_size AS int), \
+            CAST(s.last_used_value AS nvarchar(40)) \
+     FROM sys.sequences s JOIN sys.types t ON t.user_type_id = s.user_type_id \
+     ORDER BY 1, 2";
+
+/// Every alias type (`CREATE TYPE … FROM`): `(schema, name, base type,
+/// max_length, precision, scale, nullable)`. A table type and a CLR type are
+/// other kinds of object, and not these.
+const ALIAS_TYPE_LISTING: &str = "SELECT SCHEMA_NAME(t.schema_id), t.name, \
+            TYPE_NAME(t.system_type_id), t.max_length, t.precision, t.scale, \
+            CAST(t.is_nullable AS int) \
+     FROM sys.types t \
+     WHERE t.is_user_defined = 1 AND t.is_table_type = 0 AND t.is_assembly_type = 0 \
+     ORDER BY 1, 2";
+
+/// Every user XML schema collection, its schemas as the server prints them:
+/// `(schema, name, definition)`. The `sys` one is in every database.
+const XML_COLLECTION_LISTING: &str = "SELECT SCHEMA_NAME(x.schema_id), x.name, \
+            CAST(XML_SCHEMA_NAMESPACE(SCHEMA_NAME(x.schema_id), x.name) AS nvarchar(max)) \
+     FROM sys.xml_schema_collections x WHERE x.schema_id <> SCHEMA_ID('sys') \
+     ORDER BY 1, 2";
+
+/// Every synonym and its target, cut into its parts by the server: `(schema,
+/// name, server, database, schema, object)`.
+const SYNONYM_LISTING: &str = "SELECT SCHEMA_NAME(sn.schema_id), sn.name, \
+            PARSENAME(sn.base_object_name, 4), PARSENAME(sn.base_object_name, 3), \
+            PARSENAME(sn.base_object_name, 2), PARSENAME(sn.base_object_name, 1) \
+     FROM sys.synonyms sn ORDER BY 1, 2";
 
 /// The tables that are more than their columns — `TsqlTableKind`: `(schema,
 /// table, node, edge, temporal type, memory-optimised, has edge constraints)`.
@@ -1786,16 +1829,27 @@ async fn collect_schema(client: &mut MsClient) -> Result<DbSchema, DbError> {
         .map(|r| {
             let (ns, t, c) = (cell(&r, 0), cell(&r, 1), cell(&r, 2));
             let generated = r.get(10).cloned().flatten().map(|d| strip_outer_parens(&d));
-            let column = ColumnInfo {
-                primary_key: pk_set.contains(&(ns.clone(), t.clone(), c.clone())),
-                name: c,
-                type_name: mssql_type_name(
+            // A typed `xml` column names its schema collection — dropped, the
+            // copy took any XML at all, and the collection was never created.
+            let type_name = match r.get(20).cloned().flatten() {
+                Some(coll) => format!(
+                    "xml({}{}.{})",
+                    if flag(&r, 21) { "DOCUMENT " } else { "" },
+                    schemaic_core::export::ident_sql(&cell(&r, 19), MS),
+                    schemaic_core::export::ident_sql(&coll, MS)
+                ),
+                None => mssql_type_name(
                     &cell(&r, 3),
                     int(&r, 4),
                     int(&r, 5),
                     int(&r, 6),
                     flag(&r, 7).then(|| cell(&r, 16)).as_deref(),
                 ),
+            };
+            let column = ColumnInfo {
+                primary_key: pk_set.contains(&(ns.clone(), t.clone(), c.clone())),
+                name: c,
+                type_name,
                 nullable: flag(&r, 8),
                 // A computed column's value is its definition; a `rowversion`
                 // is the server's too, and like an identity no `INSERT`
@@ -2155,9 +2209,73 @@ async fn collect_schema(client: &mut MsClient) -> Result<DbSchema, DbError> {
         })
         .collect();
 
+    // The standalone objects a dump creates before the tables that name them.
+    let mut tsql_objects = Vec::new();
+    {
+        use schemaic_core::schema::{TsqlObject, TsqlObjectKind};
+        let obj = |r: &[Option<String>], kind| TsqlObject {
+            schema: Some(cell(r, 0)),
+            name: cell(r, 1),
+            kind,
+        };
+        for r in query_rows(client, XML_COLLECTION_LISTING).await? {
+            tsql_objects.push(obj(
+                &r,
+                TsqlObjectKind::XmlSchemaCollection {
+                    definition: cell(&r, 2),
+                },
+            ));
+        }
+        for r in query_rows(client, ALIAS_TYPE_LISTING).await? {
+            tsql_objects.push(obj(
+                &r,
+                TsqlObjectKind::AliasType {
+                    base: mssql_type_name(&cell(&r, 2), int(&r, 3), int(&r, 4), int(&r, 5), None),
+                    nullable: flag(&r, 6),
+                },
+            ));
+        }
+        for r in query_rows(client, SEQUENCE_LISTING).await? {
+            let base = cell(&r, 2);
+            let data_type = match r.get(5).cloned().flatten() {
+                Some(alias) => format!(
+                    "{}.{}",
+                    schemaic_core::export::ident_sql(&cell(&r, 4), MS),
+                    schemaic_core::export::ident_sql(&alias, MS)
+                ),
+                None if base == "decimal" || base == "numeric" => {
+                    format!("{base}({},0)", int(&r, 3))
+                }
+                None => base,
+            };
+            tsql_objects.push(obj(
+                &r,
+                TsqlObjectKind::Sequence {
+                    data_type,
+                    start: cell(&r, 6),
+                    increment: cell(&r, 7),
+                    min: cell(&r, 8),
+                    max: cell(&r, 9),
+                    cycle: flag(&r, 10),
+                    cache: flag(&r, 11).then(|| r.get(12).cloned().flatten()),
+                    last_used: r.get(13).cloned().flatten(),
+                },
+            ));
+        }
+        for r in query_rows(client, SYNONYM_LISTING).await? {
+            tsql_objects.push(obj(
+                &r,
+                TsqlObjectKind::Synonym {
+                    target: (2..6).filter_map(|i| r.get(i).cloned().flatten()).collect(),
+                },
+            ));
+        }
+    }
+
     Ok(DbSchema {
         tables,
         routines,
+        tsql_objects,
         flavour: schemaic_core::schema::ServerFlavour::Unknown,
         // Not needed, for PostgreSQL's reason: a foreign key's schema and a
         // view's names are part of the object, not the database's address.

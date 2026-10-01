@@ -5716,6 +5716,249 @@ pub struct DbSchema {
     /// reopening the one the tree already settled, and without shipping a
     /// thousand bodies over the wire to do it.
     pub extension_routines: Vec<String>,
+    /// **SQL Server's sequences, alias types, XML schema collections and
+    /// synonyms** — the objects a table, a view or a routine there can name
+    /// that a dump has to create first. Empty on every other engine.
+    ///
+    /// Not `sequences`/`domains`: those are PostgreSQL's, with PostgreSQL's
+    /// emitters, editor and compare behind them, and a SQL Server object put
+    /// there was scripted `CREATE DOMAIN … OWNED BY` and offered an editor that
+    /// can apply nothing. This list carries what the dump needs —
+    /// [`TsqlObject::create_sql`] and its drop — and no surface reads it
+    /// otherwise.
+    pub tsql_objects: Vec<TsqlObject>,
+}
+
+/// One of SQL Server's standalone objects a dump must create before what
+/// names it ([`DbSchema::tsql_objects`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TsqlObject {
+    pub schema: Option<String>,
+    pub name: String,
+    pub kind: TsqlObjectKind,
+}
+
+/// What a [`TsqlObject`] is, with what its `CREATE` restates. Bounds and
+/// counters are the catalogue's text: a sequence may be `decimal(38,0)`,
+/// past any `i64`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TsqlObjectKind {
+    /// `CREATE SEQUENCE`. Every clause is restated, since T-SQL's defaults
+    /// are not PostgreSQL's (an ascending sequence starts at the type's
+    /// minimum). `cache` is `None` for `NO CACHE`, `Some(None)` for the
+    /// server's default size. `last_used` is the counter's position, `None`
+    /// when it has handed out nothing.
+    Sequence {
+        data_type: String,
+        start: String,
+        increment: String,
+        min: String,
+        max: String,
+        cycle: bool,
+        cache: Option<Option<String>>,
+        last_used: Option<String>,
+    },
+    /// `CREATE TYPE … FROM <base> [NOT] NULL`.
+    AliasType { base: String, nullable: bool },
+    /// `CREATE XML SCHEMA COLLECTION … AS N'…'`, its schemas as the server
+    /// prints them (`XML_SCHEMA_NAMESPACE`).
+    XmlSchemaCollection { definition: String },
+    /// `CREATE SYNONYM … FOR …`: the target's parts, outermost first (server,
+    /// database, schema, object), as `PARSENAME` read them — quoted again
+    /// here, so no server text reaches the statement unquoted.
+    Synonym { target: Vec<String> },
+}
+
+impl TsqlObject {
+    fn qname(&self) -> String {
+        qualified_ident(
+            &self.name,
+            self.schema.as_deref(),
+            crate::intel::SqlDialect::MsSql,
+        )
+    }
+
+    /// What a person calls it — for a header line naming it.
+    pub fn kind_label(&self) -> &'static str {
+        match self.kind {
+            TsqlObjectKind::Sequence { .. } => "sequence",
+            TsqlObjectKind::AliasType { .. } => "alias type",
+            TsqlObjectKind::XmlSchemaCollection { .. } => "XML schema collection",
+            TsqlObjectKind::Synonym { .. } => "synonym",
+        }
+    }
+
+    /// The statement that creates it.
+    pub fn create_sql(&self) -> String {
+        let d = crate::intel::SqlDialect::MsSql;
+        let q = self.qname();
+        match &self.kind {
+            TsqlObjectKind::Sequence {
+                data_type,
+                start,
+                increment,
+                min,
+                max,
+                cycle,
+                cache,
+                ..
+            } => {
+                let cache = match cache {
+                    None => "NO CACHE".to_string(),
+                    Some(None) => "CACHE".to_string(),
+                    Some(Some(n)) => format!("CACHE {n}"),
+                };
+                format!(
+                    "CREATE SEQUENCE {q} AS {data_type}\n  START WITH {start}\n  \
+                     INCREMENT BY {increment}\n  MINVALUE {min}\n  MAXVALUE {max}\n  {}\n  {cache};",
+                    if *cycle { "CYCLE" } else { "NO CYCLE" }
+                )
+            }
+            TsqlObjectKind::AliasType { base, nullable } => format!(
+                "CREATE TYPE {q} FROM {base} {};",
+                if *nullable { "NULL" } else { "NOT NULL" }
+            ),
+            TsqlObjectKind::XmlSchemaCollection { definition } => format!(
+                "CREATE XML SCHEMA COLLECTION {q} AS {};",
+                ddl_string(definition, d)
+            ),
+            TsqlObjectKind::Synonym { target } => format!(
+                "CREATE SYNONYM {q} FOR {};",
+                target
+                    .iter()
+                    .map(|p| ddl_ident_in(p, d))
+                    .collect::<Vec<_>>()
+                    .join(".")
+            ),
+        }
+    }
+
+    /// [`Self::create_sql`], run only where no object of that name exists —
+    /// for one a file needs but does not own, which a restore onto the
+    /// database it came from finds already there. Through `EXEC`, since not
+    /// every `CREATE` here may sit under an `IF` in its batch. `then` runs
+    /// in the same `EXEC`, after the `CREATE` — a sequence's
+    /// [`Self::restart_sql`], which must move a counter on only when this
+    /// file made it.
+    pub fn create_if_absent_sql(&self, then: Option<&str>) -> String {
+        let d = crate::intel::SqlDialect::MsSql;
+        let q = ddl_string(&self.qname(), d);
+        let absent = match self.kind {
+            TsqlObjectKind::Sequence { .. } => format!("OBJECT_ID({q}, N'SO') IS NULL"),
+            TsqlObjectKind::Synonym { .. } => format!("OBJECT_ID({q}, N'SN') IS NULL"),
+            TsqlObjectKind::AliasType { .. } => format!("TYPE_ID({q}) IS NULL"),
+            TsqlObjectKind::XmlSchemaCollection { .. } => format!(
+                "NOT EXISTS (SELECT 1 FROM sys.xml_schema_collections WHERE name = {} \
+                 AND schema_id = SCHEMA_ID({}))",
+                ddl_string(&self.name, d),
+                ddl_string(self.schema.as_deref().unwrap_or(MSSQL_DEFAULT_SCHEMA), d),
+            ),
+        };
+        let body = match then {
+            Some(t) => format!("{}\n{t}", self.create_sql()),
+            None => self.create_sql(),
+        };
+        format!("IF {absent} EXEC({});", ddl_string(&body, d))
+    }
+
+    /// The statement that removes it if it is there — for a file that drops
+    /// what it recreates up front.
+    pub fn drop_sql(&self) -> String {
+        let q = self.qname();
+        match &self.kind {
+            TsqlObjectKind::Sequence { .. } => format!("DROP SEQUENCE IF EXISTS {q};"),
+            TsqlObjectKind::AliasType { .. } => format!("DROP TYPE IF EXISTS {q};"),
+            TsqlObjectKind::Synonym { .. } => format!("DROP SYNONYM IF EXISTS {q};"),
+            // No `IF EXISTS` for this one.
+            TsqlObjectKind::XmlSchemaCollection { .. } => {
+                let d = crate::intel::SqlDialect::MsSql;
+                format!(
+                    "IF EXISTS (SELECT 1 FROM sys.xml_schema_collections WHERE name = {} \
+                     AND schema_id = SCHEMA_ID({})) DROP XML SCHEMA COLLECTION {q};",
+                    ddl_string(&self.name, d),
+                    ddl_string(self.schema.as_deref().unwrap_or(MSSQL_DEFAULT_SCHEMA), d),
+                )
+            }
+        }
+    }
+
+    /// The statement that moves a sequence's counter on to where the source
+    /// had it — `None` for anything else and for a sequence that has handed
+    /// out nothing. It may run straight after the `CREATE`: a dump's rows
+    /// carry their own values, and draw nothing from the sequence.
+    ///
+    /// Without it a restored table holding keys 1..1000 drawn from the
+    /// sequence gets 1 again from its next `NEXT VALUE FOR` — the duplicate
+    /// key PostgreSQL's `setval` resync exists for (`dump::sequence_resync_sql`).
+    ///
+    /// **Through `sp_sequence_get_range`, not `ALTER SEQUENCE … RESTART
+    /// WITH`**: a restart rewrites the sequence's `start_value` (measured), so
+    /// the copy's definition would differ from the source's; taking the range
+    /// the source has used leaves the definition alone and the counter where
+    /// it was — exhausted again, if the source's was. Steps are counted along
+    /// the sequence, once round its cycle when it has wrapped. Only a count
+    /// past `bigint`'s range — a `decimal(38,0)` sequence far along —
+    /// falls back to the restart.
+    pub fn restart_sql(&self) -> Option<String> {
+        let TsqlObjectKind::Sequence {
+            start,
+            increment,
+            min,
+            max,
+            cycle,
+            last_used,
+            ..
+        } = &self.kind
+        else {
+            return None;
+        };
+        let n = |s: &str| s.trim().parse::<i128>().ok();
+        let (last, first, inc, lo, hi) = (
+            n(last_used.as_deref()?)?,
+            n(start)?,
+            n(increment)?,
+            n(min)?,
+            n(max)?,
+        );
+        if inc == 0 {
+            return None;
+        }
+        // Values from `a` to `b` inclusive, `b` reached from `a` by `step`.
+        let span = |a: i128, b: i128, step: i128| (b - a) / step + 1;
+        let steps = if inc > 0 {
+            if last >= first {
+                span(first, last, inc)
+            } else {
+                span(first, hi, inc) + span(lo, last, inc)
+            }
+        } else if last <= first {
+            span(first, last, inc)
+        } else {
+            span(first, lo, inc) + span(hi, last, inc)
+        };
+        let q = self.qname();
+        match i64::try_from(steps) {
+            // The first value is an output the procedure insists on. No `;`
+            // between the `DECLARE` and the `EXEC`: one statement, so no
+            // client cutting at semicolons parts the variable from its use.
+            Ok(k) if k > 0 => Some(format!(
+                "DECLARE @first sql_variant EXEC sys.sp_sequence_get_range \
+                 @sequence_name = {}, @range_size = {k}, @range_first_value = @first OUTPUT;",
+                ddl_string(&q, crate::intel::SqlDialect::MsSql)
+            )),
+            _ => {
+                let next = last.checked_add(inc)?;
+                let next = if (lo..=hi).contains(&next) {
+                    next
+                } else if *cycle {
+                    if inc > 0 { lo } else { hi }
+                } else {
+                    return None;
+                };
+                Some(format!("ALTER SEQUENCE {q} RESTART WITH {next};"))
+            }
+        }
+    }
 }
 
 /// Which MySQL-family server a schema was introspected from. See
@@ -9046,6 +9289,117 @@ mod tests {
             assert!(ddl.lines().all(|l| l.starts_with("--")), "{ddl}");
             assert!(ddl.contains(what), "{ddl}");
         }
+    }
+
+    /// SQL Server's standalone objects are written in T-SQL, every clause of a
+    /// sequence restated, and a synonym's target quoted here rather than taken
+    /// as the server's text.
+    #[test]
+    fn a_sql_server_object_is_created_dropped_and_restarted_in_t_sql() {
+        let obj = |name: &str, kind: TsqlObjectKind| TsqlObject {
+            schema: Some("Sequences".into()),
+            name: name.into(),
+            kind,
+        };
+        let seq = |last: Option<&str>, cycle: bool| {
+            obj(
+                "OrderID",
+                TsqlObjectKind::Sequence {
+                    data_type: "int".into(),
+                    start: "1".into(),
+                    increment: "1".into(),
+                    min: "-2147483648".into(),
+                    max: "100".into(),
+                    cycle,
+                    cache: Some(None),
+                    last_used: last.map(String::from),
+                },
+            )
+        };
+        assert_eq!(
+            seq(None, false).create_sql(),
+            "CREATE SEQUENCE [Sequences].[OrderID] AS int\n  START WITH 1\n  INCREMENT BY 1\n  \
+             MINVALUE -2147483648\n  MAXVALUE 100\n  NO CYCLE\n  CACHE;"
+        );
+        let range = |k: u32| {
+            format!(
+                "DECLARE @first sql_variant EXEC sys.sp_sequence_get_range \
+                 @sequence_name = N'[Sequences].[OrderID]', @range_size = {k}, \
+                 @range_first_value = @first OUTPUT;"
+            )
+        };
+        // Moved on by the values the source handed out, which leaves its
+        // `start_value` alone, as a `RESTART WITH` would not.
+        assert_eq!(seq(Some("41"), false).restart_sql(), Some(range(41)));
+        assert_eq!(seq(None, false).restart_sql(), None, "never used");
+        assert_eq!(
+            seq(Some("100"), false).restart_sql(),
+            Some(range(100)),
+            "exhausted, as the source's is"
+        );
+        assert_eq!(
+            seq(Some("-2147483648"), true).restart_sql(),
+            Some(range(101)),
+            "a cycling one that has wrapped is counted round"
+        );
+        // A count past `bigint` falls back to the restart.
+        let mut big = seq(Some("170141183460469231731687303715884105000"), false);
+        if let TsqlObjectKind::Sequence {
+            data_type,
+            min,
+            max,
+            ..
+        } = &mut big.kind
+        {
+            *data_type = "decimal(38,0)".into();
+            *min = "1".into();
+            *max = "170141183460469231731687303715884105727".into();
+        }
+        assert_eq!(
+            big.restart_sql().as_deref(),
+            Some(
+                "ALTER SEQUENCE [Sequences].[OrderID] RESTART WITH \
+                 170141183460469231731687303715884105001;"
+            )
+        );
+        assert_eq!(
+            seq(None, false).drop_sql(),
+            "DROP SEQUENCE IF EXISTS [Sequences].[OrderID];"
+        );
+        let alias = obj(
+            "Phone",
+            TsqlObjectKind::AliasType {
+                base: "nvarchar(20)".into(),
+                nullable: false,
+            },
+        );
+        assert_eq!(
+            alias.create_sql(),
+            "CREATE TYPE [Sequences].[Phone] FROM nvarchar(20) NOT NULL;"
+        );
+        let coll = obj(
+            "c'oll",
+            TsqlObjectKind::XmlSchemaCollection {
+                definition: "<xsd:schema a='1'/>".into(),
+            },
+        );
+        assert_eq!(
+            coll.create_sql(),
+            "CREATE XML SCHEMA COLLECTION [Sequences].[c'oll] AS N'<xsd:schema a=''1''/>';"
+        );
+        assert!(coll.drop_sql().starts_with(
+            "IF EXISTS (SELECT 1 FROM sys.xml_schema_collections WHERE name = N'c''oll'"
+        ));
+        let syn = obj(
+            "s",
+            TsqlObjectKind::Synonym {
+                target: vec!["other".into(), "dbo".into(), "t]x".into()],
+            },
+        );
+        assert_eq!(
+            syn.create_sql(),
+            "CREATE SYNONYM [Sequences].[s] FOR [other].[dbo].[t]]x];"
+        );
     }
 
     /// **A view's header is rebuilt under the name the catalogue gives it**,

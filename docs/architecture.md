@@ -3544,6 +3544,30 @@ existing prose was left alone.
     sequence carries its own namespace and its owner is in that namespace, which is what makes the
     pair available to compare. It is on by default because a file without it fails on the first
     column typed as one of the database's enums.
+    **SQL Server's standalone objects are `DbSchema::tsql_objects`, not PostgreSQL's lists** —
+    its sequences, alias types, XML schema collections and synonyms (`TsqlObject`, read by
+    `db::mssql`'s `SEQUENCE_LISTING`, `ALIAS_TYPE_LISTING`, `XML_COLLECTION_LISTING` and
+    `SYNONYM_LISTING`; a typed `xml` column's type names its collection, `xml([dbo].[coll])`).
+    None was read, so a table with a `NEXT VALUE FOR` default or an alias-typed column stopped the
+    restore at its `CREATE TABLE` (Msg 208/2715) and the header said nothing. They are not put in
+    `sequences`/`domains` because those have PostgreSQL's emitters, editor and compare behind them
+    — a SQL Server sequence there was scripted with `OWNED BY` and offered an editor that applies
+    nothing — and no surface but the dump reads this list. The dump writes them in the types
+    section in the order one can name another (collections, alias types, sequences, synonyms),
+    drops them after the routines where it drops up front, and moves each sequence's counter on to
+    the source's through `sp_sequence_get_range` beside its `CREATE`, since `ALTER SEQUENCE …
+    RESTART WITH` rewrites `start_value` (measured) and the rows carry their own values. **One
+    outside the export's namespaces that a chosen table names is carried too** — WideWorldImporters
+    keeps every key's sequence in a schema with no table in it, so the namespace rule alone left
+    them all out — but it is not the file's to own: its schema is made if missing, it is created
+    under `IF … IS NULL EXEC(…)` with its counter moved inside the same `EXEC`, so a replay that
+    finds it does not move it twice, and it is never dropped. Without `other_objects` such an
+    object is named by `outside_dependencies`, which reads a T-SQL column with its brackets taken
+    off (`a_sql_server_dump_carries_the_objects_its_tables_name`,
+    `a_sql_server_object_is_created_dropped_and_restarted_in_t_sql`; the live round trip carries a
+    sequence in a table-less schema behind one default and one in `dbo` behind another, an alias
+    type, a schema collection behind a typed `xml` column and a synonym a view reads through, and
+    compares each counter's next value on the copy and again after the replay).
     **What that namespace filter leaves out is now accounted for in the header** (`outside_dependencies`):
     the types and sequences the chosen tables' columns name that this file will not create, as
     display names, in the order they would have been emitted. Emitting only the chosen namespaces'

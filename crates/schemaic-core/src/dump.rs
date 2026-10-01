@@ -1118,6 +1118,7 @@ fn outside_dependencies(
     schema: &DbSchema,
     order: &[usize],
     namespaces: &[Option<String>],
+    carried: bool,
 ) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for kind in [ObjectKind::Enum, ObjectKind::Domain, ObjectKind::Sequence] {
@@ -1177,7 +1178,55 @@ fn outside_dependencies(
             }
         }
     }
+    // **SQL Server's, by the same rule** — the ones the file does not carry
+    // itself (`carried`: a dump with its other objects carries every one its
+    // tables name, wherever it lives).
+    for o in &schema.tsql_objects {
+        if carried || namespaces.contains(&o.schema) || !tsql_named(schema, order, namespaces, o) {
+            continue;
+        }
+        let name = match &o.schema {
+            Some(ns) => format!("{ns}.{}", o.name),
+            None => o.name.clone(),
+        };
+        if !out.contains(&name) {
+            out.push(name);
+        }
+    }
     out
+}
+
+/// Does a chosen table name SQL Server object `o` — as a column's type or in
+/// a default (`NEXT VALUE FOR`)?
+///
+/// A column names one bracketed — `[Sequences].[OrderID]`, `[dbo].[Phone]` —
+/// so the text is read with its brackets taken off, which leaves the dotted
+/// name [`outside_dependencies`]' walk matches; a bare name counts unless an
+/// object of that name lives in one of the export's own namespaces.
+fn tsql_named(
+    schema: &DbSchema,
+    order: &[usize],
+    namespaces: &[Option<String>],
+    o: &crate::schema::TsqlObject,
+) -> bool {
+    let local = schema
+        .tsql_objects
+        .iter()
+        .any(|l| l.name == o.name && namespaces.contains(&l.schema));
+    let qualified = o.schema.as_ref().map(|ns| format!("{ns}.{}", o.name));
+    let mentions = |text: &str| {
+        let text = text.replace(['[', ']'], "");
+        qualified
+            .as_deref()
+            .is_some_and(|q| names_identifier(&text, q))
+            || (!local && names_identifier(&text, &o.name))
+    };
+    order.iter().any(|&i| {
+        schema.tables[i]
+            .columns
+            .iter()
+            .any(|c| mentions(&c.type_name) || c.default.as_deref().is_some_and(mentions))
+    })
 }
 
 /// Does `text` name `word` as a whole identifier?
@@ -1432,7 +1481,33 @@ pub fn plan(
     let mut dangling_fks = 0usize;
     // Decided here, beside the other cross-selection census, for the same reason
     // it gives: the header is written before the objects are.
-    let outside_deps = outside_dependencies(schema, &order, &namespaces);
+    let outside_deps = outside_dependencies(schema, &order, &namespaces, opts.other_objects);
+    // **A SQL Server object a chosen table names is carried wherever it
+    // lives.** WideWorldImporters keeps every key's sequence in a schema of
+    // its own with no table in it, so the namespace rule above left them all
+    // out and the restore stopped at the first `NEXT VALUE FOR` (Msg 208).
+    // One outside the export's namespaces is not the file's to own, so it is
+    // created only where it is missing and never dropped.
+    let carried_outside: Vec<&crate::schema::TsqlObject> = if opts.other_objects {
+        schema
+            .tsql_objects
+            .iter()
+            .filter(|o| {
+                !namespaces.contains(&o.schema) && tsql_named(schema, &order, &namespaces, o)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    // The containers the file makes: its tables' namespaces, and those of the
+    // objects it carries from outside them.
+    let containers: Vec<Option<String>> = {
+        let mut ns = namespaces.clone();
+        ns.extend(carried_outside.iter().map(|o| o.schema.clone()));
+        ns.sort();
+        ns.dedup();
+        ns
+    };
     if opts.structure {
         for &i in &order {
             let t = &schema.tables[i];
@@ -1704,7 +1779,7 @@ pub fn plan(
     // has no `shop` is ERROR 1049 on line 1, and restoring onto a fresh server is
     // what a dump is mostly for.
     if opts.structure {
-        for sql in create_container_sql(dialect, database, &namespaces) {
+        for sql in create_container_sql(dialect, database, &containers) {
             text!(sql);
         }
     }
@@ -1827,7 +1902,52 @@ pub fn plan(
                 }
             }
         }
+        // **SQL Server's own standalone objects**, which a column's type, a
+        // default's `NEXT VALUE FOR`, a typed `xml` column or a view can name
+        // — none was read, and a table naming one stopped the restore at its
+        // `CREATE TABLE` (Msg 208). In the order one can name another: a
+        // collection or an alias type before a sequence typed with it, and a
+        // synonym last.
+        for rank in 0..4 {
+            for o in &schema.tsql_objects {
+                let at = match o.kind {
+                    crate::schema::TsqlObjectKind::XmlSchemaCollection { .. } => 0,
+                    crate::schema::TsqlObjectKind::AliasType { .. } => 1,
+                    crate::schema::TsqlObjectKind::Sequence { .. } => 2,
+                    crate::schema::TsqlObjectKind::Synonym { .. } => 3,
+                };
+                if at != rank {
+                    continue;
+                }
+                // Owned — in a namespace of the export — or only needed.
+                let owned = namespaces.contains(&o.schema);
+                if !owned && !carried_outside.iter().any(|c| std::ptr::eq(*c, o)) {
+                    continue;
+                }
+                // A sequence's counter goes on from where the source's was —
+                // on one this file made: the rows carry their own values, so
+                // this need not wait for them, and moving on one a replay
+                // found already there would move it twice.
+                let restart = opts.data.then(|| o.restart_sql()).flatten();
+                let sql = match (owned, &restart) {
+                    (true, Some(r)) => format!("{}\n{r}", o.create_sql()),
+                    (true, None) => o.create_sql(),
+                    (false, r) => o.create_if_absent_sql(r.as_deref()),
+                };
+                objects.push(Emitted {
+                    name: o.name.clone(),
+                    body: o.create_sql(),
+                    sql,
+                    drop: (up_front && owned).then(|| o.drop_sql()),
+                    function: false,
+                });
+            }
+        }
     }
+    // A domain over a domain is the same edge as a routine over a routine —
+    // `kinds` above orders Enum before Domain, and nothing ordered two Domains
+    // against each other. Ordered here, before the drops, as the routines are.
+    let objects = order_by_mention(objects, dialect);
 
     // **Ordered against each other, not just against the tables.** The
     // table→routine edge was the split above; the routine→routine edge had
@@ -1884,6 +2004,9 @@ pub fn plan(
             drops.push(format!("DROP {kw} IF EXISTS {};", qname(t)));
         }
         drops.extend(routines.iter().rev().filter_map(|r| r.drop.clone()));
+        // Then what the tables and routines were typed with or named — every
+        // one of them is gone by here.
+        drops.extend(objects.iter().rev().filter_map(|o| o.drop.clone()));
         text!("-- Dropped first, to be recreated below".to_string());
         for d in drops {
             text!(d);
@@ -1892,10 +2015,8 @@ pub fn plan(
 
     if !objects.is_empty() {
         text!("-- Types and sequences".to_string());
-        // A domain over a domain is the same edge as a routine over a
-        // routine — `kinds` above orders Enum before Domain, and nothing
-        // ordered two Domains against each other.
-        for o in order_by_mention(objects, dialect) {
+        // Already ordered against each other, above the drops.
+        for o in objects {
             text!(o.sql);
         }
     }
@@ -2051,6 +2172,8 @@ pub fn plan(
 
     // ── Key counters, once the rows they have to clear are in ────────────────
     if opts.data {
+        // SQL Server's sequences are objects of their own, and move on beside
+        // their `CREATE` (`TsqlObject::restart_sql`).
         let resync: Vec<String> = order
             .iter()
             .flat_map(|&i| sequence_resync_sql(&schema.tables[i], dialect))
@@ -4291,6 +4414,137 @@ mod tests {
         assert!(!file.contains("<<rows edge:"), "{file}");
         assert!(header.contains("dbo.edge"), "{header}");
         assert_eq!(p.tables, 3);
+    }
+
+    /// **A SQL Server dump creates the sequences, alias types, XML schema
+    /// collections and synonyms its tables lean on.** None was read, so a
+    /// table with a `NEXT VALUE FOR` default or an alias-typed column stopped
+    /// the restore at its `CREATE TABLE` (Msg 208), and the header said
+    /// nothing. They go in before the tables, are dropped after them where the
+    /// file drops up front, and a sequence's counter is put back after the
+    /// rows; one in a namespace the export does not cover is named instead.
+    #[test]
+    fn a_sql_server_dump_carries_the_objects_its_tables_name() {
+        use crate::schema::{TsqlObject, TsqlObjectKind};
+        let mut t = table("orders");
+        t.schema = Some("dbo".to_string());
+        t.columns[0].default = Some("NEXT VALUE FOR [dbo].[seq]".to_string());
+        t.columns.push(ColumnInfo {
+            name: "phone".to_string(),
+            type_name: "[dbo].[Phone]".to_string(),
+            ..Default::default()
+        });
+        t.columns.push(ColumnInfo {
+            name: "other".to_string(),
+            type_name: "int".to_string(),
+            default: Some("NEXT VALUE FOR [Sequences].[OrderID]".to_string()),
+            ..Default::default()
+        });
+        let mut s = schema_of(vec![t]);
+        let seq = |schema: &str, name: &str| TsqlObject {
+            schema: Some(schema.to_string()),
+            name: name.to_string(),
+            kind: TsqlObjectKind::Sequence {
+                data_type: "int".to_string(),
+                start: "1".to_string(),
+                increment: "1".to_string(),
+                min: "1".to_string(),
+                max: "1000".to_string(),
+                cycle: false,
+                cache: None,
+                last_used: Some("7".to_string()),
+            },
+        };
+        s.tsql_objects = vec![
+            seq("dbo", "seq"),
+            seq("Sequences", "OrderID"),
+            TsqlObject {
+                schema: Some("dbo".to_string()),
+                name: "Phone".to_string(),
+                kind: TsqlObjectKind::AliasType {
+                    base: "nvarchar(20)".to_string(),
+                    nullable: true,
+                },
+            },
+            TsqlObject {
+                schema: Some("dbo".to_string()),
+                name: "syn".to_string(),
+                kind: TsqlObjectKind::Synonym {
+                    target: vec!["dbo".to_string(), "orders".to_string()],
+                },
+            },
+        ];
+        let p = plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::MsSql,
+        );
+        let file = file_of(&p);
+        let create_table = pos(&file, "CREATE TABLE [dbo].[orders]");
+        assert!(
+            pos(&file, "CREATE SEQUENCE [dbo].[seq]") < create_table,
+            "{file}"
+        );
+        assert!(
+            pos(&file, "CREATE TYPE [dbo].[Phone]") < create_table,
+            "{file}"
+        );
+        assert!(
+            pos(&file, "CREATE SYNONYM [dbo].[syn]") < create_table,
+            "{file}"
+        );
+        // A sequence in a namespace with no table of the export's — as
+        // WideWorldImporters keeps every key's — is carried, its schema made,
+        // but only created where it is missing and never dropped: it is not
+        // the file's to own.
+        let schema_made = pos(&file, "IF SCHEMA_ID(N'Sequences') IS NULL");
+        let outside = pos(
+            &file,
+            "IF OBJECT_ID(N'[Sequences].[OrderID]', N'SO') IS NULL EXEC(N'CREATE SEQUENCE",
+        );
+        assert!(schema_made < outside && outside < create_table, "{file}");
+        assert!(
+            !file.contains("DROP SEQUENCE IF EXISTS [Sequences]"),
+            "{file}"
+        );
+        let drop_table = pos(&file, "DROP TABLE IF EXISTS [dbo].[orders];");
+        assert!(
+            drop_table < pos(&file, "DROP SEQUENCE IF EXISTS [dbo].[seq];"),
+            "{file}"
+        );
+        assert!(
+            drop_table < pos(&file, "DROP TYPE IF EXISTS [dbo].[Phone];"),
+            "{file}"
+        );
+        // Each counter goes on from where the source's was, beside its
+        // `CREATE` — inside the `EXEC` for the one only made where missing,
+        // so a replay that finds it there does not move it twice.
+        let moved = pos(&file, "@sequence_name = N'[dbo].[seq]', @range_size = 7,");
+        assert!(pos(&file, "CREATE SEQUENCE [dbo].[seq]") < moved, "{file}");
+        assert!(moved < create_table, "{file}");
+        let moved = pos(
+            &file,
+            "@sequence_name = N''[Sequences].[OrderID]'', @range_size = 7,",
+        );
+        assert!(outside < moved && moved < create_table, "{file}");
+        let header = text_of(&p);
+        assert!(!header.contains("outside this export"), "{header}");
+        // Without its other objects, the file says what it leaves out.
+        let p = plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions {
+                other_objects: false,
+                ..Default::default()
+            },
+            SqlDialect::MsSql,
+        );
+        let header = text_of(&p);
+        assert!(header.contains("Sequences.OrderID"), "{header}");
+        assert!(!header.contains("CREATE SEQUENCE"), "{header}");
     }
 
     /// **A SQL Server dump says how its dates are written, before any of them.**

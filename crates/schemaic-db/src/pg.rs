@@ -2278,6 +2278,8 @@ async fn collect_schema(client: &Client) -> Result<DbSchema, DbError> {
         // its own catalogue and no `CREATE EVENT` grammar — so this stays empty
         // and `ddl::supports_event_editing` is false here.
         events: Vec::new(),
+        // SQL Server's; PostgreSQL's own are the three lists above.
+        tsql_objects: Vec::new(),
         // A MySQL-family flavour is meaningless here, and `Unknown` is what
         // makes the emitter withhold MariaDB-specific behaviour rather than
         // assume it.

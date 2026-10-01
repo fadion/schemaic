@@ -798,6 +798,29 @@ async fn a_dump_restores_into_an_empty_database() {
            WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = dbo.versioned_history));",
     )
     .await;
+    // What a table leans on that is not a table: a sequence behind a default —
+    // one in a schema holding no table, as WideWorldImporters keeps all of its
+    // — an alias type, a typed `xml` column's schema collection, and a
+    // synonym a view reads through. None was read, so the restore stopped at
+    // the first CREATE TABLE naming one (Msg 208).
+    src.exec("CREATE SCHEMA Sequences").await;
+    src.exec(
+        "CREATE SEQUENCE Sequences.OrderID AS int START WITH 1000 INCREMENT BY 5 CACHE 10; \
+         CREATE SEQUENCE dbo.seq AS bigint START WITH 1 NO CACHE; \
+         CREATE TYPE dbo.Phone FROM nvarchar(20) NOT NULL; \
+         CREATE XML SCHEMA COLLECTION dbo.coll AS N'<xsd:schema xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\"><xsd:element name=\"a\" type=\"xsd:int\"/></xsd:schema>';",
+    )
+    .await;
+    src.exec(
+        "CREATE TABLE dbo.leaning (id bigint NOT NULL DEFAULT (NEXT VALUE FOR dbo.seq) PRIMARY KEY, \
+           code int NOT NULL DEFAULT (NEXT VALUE FOR Sequences.OrderID), phone dbo.Phone, \
+           doc xml(dbo.coll)); \
+         INSERT dbo.leaning (phone, doc) VALUES (N'555-0100', N'<a>1</a>'), (N'555-0101', NULL); \
+         CREATE SYNONYM dbo.syn_leaning FOR dbo.leaning;",
+    )
+    .await;
+    src.exec("CREATE VIEW dbo.v_leaning AS SELECT id FROM dbo.syn_leaning")
+        .await;
     // More rows than one `INSERT` carries, so the table's rows are several
     // statements — each closing its own `GO` batch.
     src.exec(
@@ -887,6 +910,21 @@ async fn a_dump_restores_into_an_empty_database() {
         UNION ALL SELECT CONCAT('f_double|', dbo.f_double(21)) \
         UNION ALL SELECT CONCAT('calc|', id, '|', dbl, '|', n) FROM dbo.calc \
         UNION ALL SELECT CONCAT('many|', COUNT(*), '|', SUM(id)) FROM dbo.many \
+        UNION ALL SELECT CONCAT('leaning|', id, '|', code, '|', phone, '|', \
+               CAST(doc AS nvarchar(max))) FROM dbo.leaning \
+        UNION ALL SELECT CONCAT('v_leaning|', COUNT(*)) FROM dbo.v_leaning \
+        UNION ALL SELECT CONCAT('sequence|', SCHEMA_NAME(schema_id), '.', name, '|', \
+               CAST(start_value AS nvarchar(40)), '|', CAST(increment AS nvarchar(40)), '|', \
+               is_cached, '|', cache_size, '|next ', \
+               CASE WHEN last_used_value IS NULL THEN CAST(current_value AS bigint) \
+                    ELSE CAST(last_used_value AS bigint) + CAST(increment AS bigint) END) \
+               FROM sys.sequences \
+        UNION ALL SELECT CONCAT('column|', c.name, '|', TYPE_NAME(c.user_type_id), '|', \
+               xc.name, '|', c.is_nullable) FROM sys.columns c \
+               LEFT JOIN sys.xml_schema_collections xc ON xc.xml_collection_id = c.xml_collection_id \
+                    AND c.xml_collection_id > 0 \
+               WHERE c.object_id = OBJECT_ID('dbo.leaning') \
+        UNION ALL SELECT CONCAT('synonym|', name, '|', base_object_name) FROM sys.synonyms \
         UNION ALL SELECT CONCAT('blobs|', id, '|', h.ToString(), '|', \
                CONVERT(varchar(max), CAST(h AS varbinary(max)), 1), '|', \
                CONVERT(varchar(max), CAST(g AS varbinary(max)), 1), '|', g.STSrid, '|', \
@@ -916,7 +954,20 @@ async fn a_dump_restores_into_an_empty_database() {
         UNION ALL SELECT CONCAT('v_double|', SUM(d)) FROM dbo.v_double \
       ) x";
     let (want, got) = (src.scalar(facts).await, dst.scalar(facts).await);
-    assert_eq!(got, want);
+    let differ = |want: &str, got: &str| {
+        let only = |a: &str, b: &str| -> Vec<String> {
+            a.lines()
+                .filter(|l| !b.lines().any(|m| m == *l))
+                .map(String::from)
+                .collect()
+        };
+        format!(
+            "the copy differs\n  only in the source: {:#?}\n  only in the copy: {:#?}",
+            only(want, got),
+            only(got, want)
+        )
+    };
+    assert!(got == want, "{}", differ(&want, &got));
     // The node is a node again with its rows; the edge is an edge, created
     // empty; the temporal table is not there to be mistaken for a copy.
     let graph = "SELECT CONCAT((SELECT COUNT(*) FROM sys.tables WHERE name = 'person' AND is_node = 1), \
@@ -958,6 +1009,15 @@ async fn a_dump_restores_into_an_empty_database() {
         "|char|0|0|4|Latin1_General_CS_AS|ab  ",
         "|uniqueidentifier|0|0|16||6F9619FF-8B86-D011-B42D-00C04FC964FF",
         "blobs|15|/15/|0xBE||||||10x0E||||||",
+        "leaning|1|1000|555-0100|<a>1</a>",
+        "leaning|2|1005|555-0101|",
+        "v_leaning|2",
+        // Each counter goes on from where the source's was.
+        "sequence|dbo.seq|1|1|0||next 3",
+        "sequence|Sequences.OrderID|1000|5|1|10|next 1010",
+        "column|phone|Phone||0",
+        "column|doc|xml|coll|1",
+        "synonym|syn_leaning|[dbo].[leaning]",
     ] {
         assert!(want.contains(fact), "{fact} in {want}");
     }
@@ -969,7 +1029,8 @@ async fn a_dump_restores_into_an_empty_database() {
         matches!(again, schemaic_core::script::ExecEnd::Done),
         "{again:?}\n{file}"
     );
-    assert_eq!(dst.scalar(facts).await, want);
+    let again = dst.scalar(facts).await;
+    assert!(again == want, "{}", differ(&want, &again));
     // The identity counts on past the highest key the file carried.
     dst.exec("INSERT dbo.customers (name) VALUES (N'next')")
         .await;
