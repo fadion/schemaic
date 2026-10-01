@@ -4327,8 +4327,8 @@ existing prose was left alone.
     default's value and not its name, and one put back as `DF__t__a__5EBF139D` is not the one
     scripts and a schema compare name; a `#` table because `run_ddl`'s one connection carries it
     across the batches. Beside them, what selects `*` from the table
-    (`tsql_collect_star_dependents`, below) — here and not later because the `DROP TABLE` takes the
-    table's dependency rows with it. (3) The keys **other tables** have on it (`TableInfo::referenced_by`, under
+    (`tsql_collect_star_dependents`, below) — here and not later because the first level is found
+    by the table's id, which the `DROP TABLE` ends. (3) The keys **other tables** have on it (`TableInfo::referenced_by`, under
     `schema.rs`) dropped, since each refuses the `DROP TABLE` (Msg 3726). (4) A bare shadow,
     `<table>_schemaic_rebuild`, of the draft's columns alone — no key, index, check or default,
     because a constraint's name is the schema's and the old table still holds each one. (5) The
@@ -4379,18 +4379,35 @@ existing prose was left alone.
     number but refuses to drop a column a view reads and cannot reorder one, and SQLite re-parses a
     view at every use. It is two statements around the move, each one batch with no `;` inside.
     `tsql_collect_star_dependents(table)`, run **before** the columns move, copies into the session
-    temp table `#schemaic_star_dependents` (`TSQL_STAR_DEPENDENTS`) everything whose `*` reads the
-    table, then whatever selects `*` from those, level by level to a cap of 32, out of
-    `sys.sql_dependencies` where `is_select_all = 1`. That catalogue is deprecated and is read
-    because it is the one that carries `is_select_all` — `sys.sql_expression_dependencies` does
-    not — and the flag is the point: a view that names its columns binds them by name and needs
-    nothing, and refreshing one that names a column the plan drops would fail the plan for no gain.
-    Were the catalogue removed, the statement fails and the plan rolls back whole, which is the
-    failure to want. `tsql_refresh_star_dependents()` then walks a cursor running
-    `EXEC sys.sp_refreshsqlmodule` on each kept object of type `V` or `IF`, nearest level first so a
-    view over a view re-expands against one already refreshed, and drops the temp table; a
-    procedure, a trigger or a multi-statement function expands its `*` at each compile and needs
-    nothing. **There is deliberately no `TRY … CATCH` around it**: a failed `sp_refreshsqlmodule`
+    temp table `#schemaic_star_dependents` (`TSQL_STAR_DEPENDENTS`) the table at level 0 and then,
+    level by level to a cap of 32, every view and inline function that references something the
+    level before found, and every synonym naming one, out of **`sys.sql_expression_dependencies`**
+    and `sys.synonyms` — by id, or by name where a reference is unresolved or spelt with this
+    database's name. It **used to read `sys.sql_dependencies` where `is_select_all = 1`**, the
+    deprecated catalogue chosen because it carries that flag, and it missed exactly the views that
+    needed it (R3-L5-01, S2-L5-01, measured on 2022 and 2025): that catalogue keeps a view's rows
+    only from its creation or last refresh, so a table SSMS's designer or any `SELECT … INTO`/`DROP
+    TABLE`/`sp_rename` migration had ever rebuilt left it **no row** for any view over the table, and
+    a view over a synonym has its row under the synonym, which the walk never visited — each left
+    bound by position, `UPDATE acct_v SET balance = 0` landing on `credit_limit`, with the plan
+    reporting success. The expression catalogue keeps a reference by name and resolves it afresh
+    (after the outside rebuild its `referenced_id` was the new table's), and it has no
+    `is_select_all`, so the collector is **fail-safe rather than exact**: of the views and inline
+    functions it keeps those whose text holds a `*` at all, or cannot be read. One that names its
+    columns and writes a `*` elsewhere is refreshed for nothing, which costs nothing unless it
+    names a column the plan drops — and then the plan fails whole, the direction to fail in. **A
+    view in another database is not looked for, and the preview's sentence says so**, naming
+    `sp_refreshview`: no catalogue in this database lists one, and entering every database from
+    inside the plan's transaction was built and measured on 2022 before it was dropped — the
+    transaction then holds a shared lock on each database it entered until it commits, so for a
+    rebuild's whole copy any `ALTER DATABASE`/`DROP DATABASE` on the server waits on the plan or,
+    `WITH ROLLBACK IMMEDIATE`, kills it (Msg 596 — the live tier's own scratch teardown did it on the
+    first run), and a database dropped between the listing and its turn dooms the transaction even
+    inside a `CATCH` (Msg 911, `XACT_STATE()` -1). `tsql_refresh_star_dependents()` then walks a
+    cursor running `EXEC sys.sp_refreshsqlmodule` on each kept object of type `V` or `IF`, nearest
+    level first so a view over a view re-expands against one already refreshed, and drops the temp
+    table; a synonym needs nothing, and a procedure, a trigger or a multi-statement function
+    expands its `*` at each compile. **There is deliberately no `TRY … CATCH` around it**: a failed `sp_refreshsqlmodule`
     rolls back the caller's whole transaction (measured), so swallowing the error would leave the
     rest of the plan running auto-committed. A dependent that no longer compiles against the new
     columns therefore fails the plan whole, and `ChangeSet::destructive()` says so beforehand in one
@@ -4405,9 +4422,11 @@ existing prose was left alone.
     refresh after the comments and **before** the table's own `sp_rename`, since a dependent names
     the table as it is and would not compile against a name that is gone. The unit pins are
     `a_sql_server_rebuild_refreshes_what_selects_star_from_the_table`,
-    `a_rebuilt_computed_column_refreshes_what_selects_star_from_the_table` and
-    `only_a_plan_that_moves_columns_refreshes_what_selects_star`; the live ones, each red before the
-    fix, are under `mssql.rs`.
+    `a_rebuilt_computed_column_refreshes_what_selects_star_from_the_table`,
+    `only_a_plan_that_moves_columns_refreshes_what_selects_star` and
+    `the_star_collector_finds_what_the_deprecated_catalogue_misses`; the live ones, each red before
+    the fix, are under `mssql.rs` — their fixture has a view over a synonym of the table, and the
+    rebuild's runs after an SSMS-shaped rebuild that leaves `sys.sql_dependencies` empty.
     **Which columns the copy skips is asked of the type, not of `identity_always`**
     (`tsql_server_filled`): a computed column and a `rowversion`/`timestamp`, whose values the
     server makes. The reader sets `identity_always` on an identity too, while the designer's toggle

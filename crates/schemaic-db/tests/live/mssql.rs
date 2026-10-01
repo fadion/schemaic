@@ -6704,9 +6704,9 @@ async fn a_rebuild_under_a_new_name_switches_off_an_identity_and_computes_a_colu
 }
 
 /// The views and the inline function over `dbo.<table>` that select `*` — a
-/// view, a view in another schema over that view, and an inline function —
-/// which SQL Server binds to the table's columns **by position** until they
-/// are refreshed.
+/// view, a view in another schema over that view, an inline function, and a
+/// view over a synonym of the table — which SQL Server binds to the table's
+/// columns **by position** until they are refreshed. Each is in [`STARS`].
 async fn star_dependents(s: &Scratch, table: &str) {
     for sql in [
         format!("CREATE VIEW dbo.{table}_v AS SELECT * FROM dbo.{table}"),
@@ -6715,15 +6715,34 @@ async fn star_dependents(s: &Scratch, table: &str) {
         format!(
             "CREATE FUNCTION dbo.{table}_f() RETURNS TABLE AS RETURN SELECT * FROM dbo.{table}"
         ),
+        format!("CREATE SYNONYM dbo.{table}_sy FOR dbo.{table}"),
+        format!("CREATE VIEW dbo.{table}_sv AS SELECT * FROM dbo.{table}_sy"),
     ] {
         s.exec(&sql).await;
     }
+}
+
+/// What [`star_dependents`] makes over `dbo.<table>`, as each is selected
+/// from: `{}` is the table's name.
+const STARS: [&str; 4] = ["dbo.{}_v", "rpt.{}_vv", "dbo.{}_f()", "dbo.{}_sv"];
+
+/// [`STARS`] over `table`.
+fn stars(table: &str) -> Vec<String> {
+    STARS.iter().map(|s| s.replace("{}", table)).collect()
 }
 
 /// **A rebuild refreshes what selects `*` from the table.** Moving
 /// `credit_limit` before `balance` left a `SELECT *` view bound to the old
 /// positions: it showed each column under the other's name, and an `UPDATE`
 /// of `balance` through it zeroed `credit_limit` (R3-L5-02).
+///
+/// **Found where the deprecated catalogue keeps no row** (R3-L5-01,
+/// S2-L5-01): the table is first rebuilt the way SSMS's designer does it
+/// (`SELECT … INTO`, `DROP TABLE`, `sp_rename`), which leaves
+/// `sys.sql_dependencies` empty for every view over it; and a view selects
+/// `*` through a synonym, whose row names the synonym. Each was left reading
+/// the old positions. (A view in another database is not refreshed, and the
+/// preview says so — `tsql_collect_star_dependents` has why.)
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rebuild_refreshes_the_views_that_select_star_from_it() {
     use schemaic_core::ddl::TableDraft;
@@ -6735,11 +6754,24 @@ async fn a_rebuild_refreshes_the_views_that_select_star_from_it() {
         .await;
     s.exec("INSERT dbo.acct VALUES (1, 1000, 50)").await;
     star_dependents(&s, "acct").await;
+    // Rebuilt outside Schemaic, in the same shape.
+    s.exec(
+        "SELECT * INTO dbo.acct_tmp FROM dbo.acct; DROP TABLE dbo.acct; \
+         EXEC sp_rename N'dbo.acct_tmp', N'acct'; \
+         ALTER TABLE dbo.acct ADD CONSTRAINT pk_acct PRIMARY KEY (id)",
+    )
+    .await;
+    assert_eq!(
+        s.scalar("SELECT COUNT(*) FROM sys.sql_dependencies WHERE referenced_major_id = OBJECT_ID(N'dbo.acct')")
+            .await,
+        "0",
+        "the deprecated catalogue has nothing to find them by"
+    );
     let t = read_table(&s, "acct").await;
     let mut d = TableDraft::from_table(&t);
     d.columns.swap(1, 2);
     apply_draft(&s, &t, &d).await;
-    for from in ["dbo.acct_v", "rpt.acct_vv", "dbo.acct_f()"] {
+    for from in stars("acct") {
         assert_eq!(
             s.scalar(&format!(
                 "SELECT CONCAT(balance, ':', credit_limit) FROM {from}"
@@ -6787,7 +6819,7 @@ async fn a_rebuilt_computed_column_refreshes_the_views_that_select_star() {
     let mut d = TableDraft::from_table(&t);
     d.columns[1].info.name = "a2".into();
     apply_draft(&s, &t, &d).await;
-    for from in ["dbo.t4_v", "rpt.t4_vv", "dbo.t4_f()"] {
+    for from in stars("t4") {
         assert_eq!(
             s.scalar(&format!(
                 "SELECT CONCAT(a2, ':', c, ':', x, ':', y) FROM {from}"
@@ -6807,7 +6839,8 @@ async fn a_rebuilt_computed_column_refreshes_the_views_that_select_star() {
 
 /// **A column dropped and another added in one plan refreshes what selects
 /// `*`**: the column count is unchanged, so a view bound by position read the
-/// new column's values under the dropped one's name, silently.
+/// new column's values under the dropped one's name, silently — a view over
+/// a synonym of the table included (S2-L5-01), which wrote `c` into `e`.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_dropped_column_refreshes_the_views_that_select_star() {
     use schemaic_core::ddl::{ColumnDraft, TableDraft};
@@ -6831,7 +6864,7 @@ async fn a_dropped_column_refreshes_the_views_that_select_star() {
             ..Default::default()
         }));
     apply_draft(&s, &t, &d).await;
-    for from in ["dbo.t_v", "rpt.t_vv", "dbo.t_f()"] {
+    for from in stars("t") {
         assert_eq!(
             s.scalar(&format!(
                 "SELECT STRING_AGG(c.name, ',') WITHIN GROUP (ORDER BY c.column_id) \

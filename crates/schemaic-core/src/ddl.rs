@@ -4434,10 +4434,12 @@ impl ChangeSet {
         // many of its changes move a column.
         if self.refreshes_star_dependents() {
             out.push(format!(
-                "Refreshes every view and inline function that selects * from {}: SQL Server \
-                 binds those to the table's columns by position, and would otherwise read and \
-                 write the wrong columns. The plan fails if one of them no longer compiles \
-                 against the new columns.",
+                "Refreshes every view and inline function in this database that selects * \
+                 from {0}, directly or through a synonym: SQL Server binds those to the \
+                 table's columns by position, and would otherwise read and write the wrong \
+                 columns. The plan fails if one of them no longer compiles against the new \
+                 columns. One in another database that selects * from {0} is not refreshed \
+                 and reads and writes the wrong columns until it is (sp_refreshview).",
                 self.table
             ));
         }
@@ -12248,49 +12250,88 @@ fn tsql_rebuild_keeps_name(current: &TableInfo, draft: &TableDraft) -> bool {
 }
 
 /// The first half of a SQL Server plan's refresh of what selects `*` from
-/// `table` (qualified and quoted): every view, inline function — or anything
-/// else — whose `*` reads it, and then whatever selects `*` from *those*, by
-/// level, into [`TSQL_STAR_DEPENDENTS`]. Run **before** the columns move,
-/// since a rebuild's `DROP TABLE` takes the table's dependency rows with it.
+/// `table` (qualified and quoted): every view and inline function in this
+/// database that may select `*` from it — directly or through a synonym —
+/// and then whatever may select `*` from *those*, by level, into
+/// [`TSQL_STAR_DEPENDENTS`] as `(object_id, sch, name, type, lvl)`, the table
+/// itself at level 0. Run **before** the columns move, while the table still
+/// has the id the first level is found by.
 ///
-/// `sys.sql_dependencies` rather than `sys.sql_expression_dependencies`
-/// because it is the catalogue that says `is_select_all`: a view that names
-/// its columns binds them by name and needs nothing, and refreshing one that
-/// names a column the plan drops would fail the plan for no gain. It is
-/// deprecated; were it removed, this statement fails and the plan rolls back
-/// whole, which is the failure to want.
+/// **Found through `sys.sql_expression_dependencies`, and fail-safe rather
+/// than exact.** It used to be `sys.sql_dependencies`, the deprecated
+/// catalogue that says `is_select_all` — and keeps a view's rows only from
+/// its creation or last refresh: a table dropped and re-created outside
+/// Schemaic (SSMS's designer, any `SELECT … INTO`/`DROP`/`sp_rename`
+/// migration) leaves it **no row** for any view over the table, and a view
+/// over a synonym has its row under the synonym, which the walk never visited
+/// (R3-L5-01, S2-L5-01). Each was left bound by position, and an `UPDATE`
+/// through it wrote the wrong column. The expression catalogue keeps a
+/// reference by name and resolves it afresh (measured on 2022 after an
+/// outside rebuild: `referenced_id` the new table's), so a candidate is any
+/// view or inline function that references a found object — by id, or by
+/// name where the reference is unresolved or spelt with this database's name
+/// — or a synonym whose `base_object_name` names one; and of the views and
+/// functions, those whose text holds a `*` at all, or cannot be read. One
+/// that names its columns and writes a `*` elsewhere is refreshed for
+/// nothing, which costs nothing unless it names a column the plan drops — and
+/// then the plan fails whole, the direction to fail in.
+///
+/// **Another database's views are not asked, on purpose** — the preview says
+/// so instead ([`ChangeSet::destructive`]). No catalogue here lists them, so
+/// finding one means entering every database inside the plan's transaction,
+/// and that was tried and measured on 2022: the transaction then holds a
+/// shared lock on every database it entered until it commits, so for the
+/// length of a rebuild's copy any `ALTER DATABASE` or `DROP DATABASE` on the
+/// server waits on the plan, or — `WITH ROLLBACK IMMEDIATE` — kills it
+/// (Msg 596, reproduced by the live tier's own teardown); and a database
+/// dropped between the listing and its turn dooms the transaction even
+/// caught (Msg 911, `XACT_STATE()` -1).
 fn tsql_collect_star_dependents(table: &str) -> String {
+    let d = TSQL_STAR_DEPENDENTS;
     format!(
         "DECLARE @t int = OBJECT_ID({}) \
-         SELECT DISTINCT d.object_id, 1 AS lvl INTO {TSQL_STAR_DEPENDENTS} \
-         FROM sys.sql_dependencies d WHERE d.referenced_major_id = @t AND d.is_select_all = 1 \
-         DECLARE @more int = @@ROWCOUNT DECLARE @lvl int = 1 \
-         WHILE @more > 0 AND @lvl < 32 BEGIN SET @lvl += 1 \
-         INSERT {TSQL_STAR_DEPENDENTS} (object_id, lvl) SELECT DISTINCT d.object_id, @lvl \
-         FROM sys.sql_dependencies d JOIN {TSQL_STAR_DEPENDENTS} p \
-         ON p.object_id = d.referenced_major_id AND p.lvl = @lvl - 1 WHERE d.is_select_all = 1 \
-         SET @more = @@ROWCOUNT END;",
+         CREATE TABLE {d} (object_id int NOT NULL, sch sysname COLLATE DATABASE_DEFAULT NOT NULL, \
+         name sysname COLLATE DATABASE_DEFAULT NOT NULL, type char(2) NOT NULL, lvl int NOT NULL) \
+         INSERT {d} VALUES (@t, OBJECT_SCHEMA_NAME(@t), OBJECT_NAME(@t), 'U', 0) \
+         DECLARE @lvl int = 0 WHILE @lvl < 32 BEGIN SET @lvl += 1 \
+         INSERT {d} (object_id, sch, name, type, lvl) \
+         SELECT DISTINCT o.object_id, SCHEMA_NAME(o.schema_id), o.name, o.type, @lvl \
+         FROM (SELECT d.referencing_id AS id FROM sys.sql_expression_dependencies d \
+         JOIN {d} p ON p.lvl = @lvl - 1 AND d.referenced_entity_name = p.name \
+         WHERE d.referenced_server_name IS NULL \
+         AND ISNULL(NULLIF(d.referenced_database_name, N''), DB_NAME()) = DB_NAME() \
+         AND (d.referenced_id = p.object_id OR (d.referenced_id IS NULL \
+         AND (ISNULL(d.referenced_schema_name, N'') = N'' OR d.referenced_schema_name = p.sch))) \
+         UNION SELECT y.object_id FROM sys.synonyms y \
+         JOIN {d} p ON p.lvl = @lvl - 1 AND PARSENAME(y.base_object_name, 1) = p.name \
+         WHERE PARSENAME(y.base_object_name, 4) IS NULL \
+         AND ISNULL(PARSENAME(y.base_object_name, 3), DB_NAME()) = DB_NAME() \
+         AND (PARSENAME(y.base_object_name, 2) IS NULL OR PARSENAME(y.base_object_name, 2) = p.sch)) f \
+         JOIN sys.objects o ON o.object_id = f.id \
+         WHERE (o.type = 'SN' OR (o.type IN ('V', 'IF') AND (OBJECT_DEFINITION(o.object_id) IS NULL \
+         OR CHARINDEX(N'*', OBJECT_DEFINITION(o.object_id)) > 0))) \
+         AND NOT EXISTS (SELECT 1 FROM {d} x WHERE x.lvl = @lvl AND x.object_id = o.object_id) \
+         IF @@ROWCOUNT = 0 BREAK END;",
         tsql_n(table)
     )
 }
 
 /// The second half: `sp_refreshsqlmodule` on each view and inline function
-/// [`tsql_collect_star_dependents`] kept, the ones nearest the table first so
-/// a view over a view re-expands against a refreshed one. A procedure, a
-/// trigger or a multi-statement function expands its `*` each time it is
-/// compiled and needs nothing.
+/// [`tsql_collect_star_dependents`] kept, the ones furthest down the levels
+/// last so a view over a view re-expands against a refreshed one. A synonym
+/// needs nothing, and a procedure, a trigger or a multi-statement function
+/// expands its `*` each time it is compiled.
 ///
 /// **No `TRY … CATCH` around it, on purpose**: a failed
 /// `sp_refreshsqlmodule` rolls back the caller's transaction (measured), so
 /// swallowing the error would leave the rest of the plan running
 /// auto-committed. A dependent that no longer compiles against the new
-/// columns fails the plan, whole.
+/// columns — or that this login may not alter — fails the plan, whole.
 fn tsql_refresh_star_dependents() -> String {
     format!(
         "DECLARE @m nvarchar(600) DECLARE schemaic_refresh CURSOR LOCAL FAST_FORWARD FOR \
-         SELECT QUOTENAME(OBJECT_SCHEMA_NAME(s.object_id)) + N'.' + QUOTENAME(OBJECT_NAME(s.object_id)) \
-         FROM {TSQL_STAR_DEPENDENTS} s JOIN sys.objects o ON o.object_id = s.object_id \
-         WHERE o.type IN ('V', 'IF') GROUP BY s.object_id ORDER BY MAX(s.lvl) \
+         SELECT QUOTENAME(sch) + N'.' + QUOTENAME(name) FROM {TSQL_STAR_DEPENDENTS} \
+         WHERE type IN ('V', 'IF') GROUP BY object_id, sch, name ORDER BY MAX(lvl) \
          OPEN schemaic_refresh FETCH NEXT FROM schemaic_refresh INTO @m \
          WHILE @@FETCH_STATUS = 0 BEGIN EXEC sys.sp_refreshsqlmodule @m \
          FETCH NEXT FROM schemaic_refresh INTO @m END \
@@ -12341,7 +12382,8 @@ fn tsql_server_filled(c: &ColumnInfo) -> bool {
 ///    model reads a default's value and not its name, and a default put back
 ///    under `DF__t__a__5EBF139D` is not the one scripts and a schema compare
 ///    name. Beside them, what selects `*` from it
-///    ([`tsql_collect_star_dependents`]), while the catalogue still says so.
+///    ([`tsql_collect_star_dependents`]), while the table still has the id
+///    they are found by.
 /// 3. The foreign keys **other tables** have on it ([`TableInfo::referenced_by`])
 ///    dropped — each refuses the `DROP TABLE` (Msg 3726).
 /// 4. The shadow, `<table>_schemaic_rebuild`, of the draft's columns alone: no
@@ -12576,8 +12618,8 @@ pub fn tsql_rebuild_sql(current: &TableInfo, draft: &TableDraft) -> Vec<String> 
          WHERE dc.parent_object_id = OBJECT_ID({});",
         tsql_n(&original)
     ));
-    // And what selects `*` from it, before the drop takes the rows that say so
-    // — unless the rebuild also renames the table
+    // And what selects `*` from it, while the table it is found by is still
+    // this one — unless the rebuild also renames the table
     // (`ChangeSet::refreshes_star_dependents` says why).
     let refresh = tsql_rebuild_keeps_name(current, draft);
     if refresh {
@@ -16934,8 +16976,9 @@ mod tests {
 
     /// **A rebuild refreshes what selects `*` from the table** (R3-L5-02): a
     /// non-schema-bound view keeps its `*` bound to the old positions, so its
-    /// dependents are kept before the `DROP TABLE` takes the dependency rows
-    /// with it, and refreshed once everything is back on the new table.
+    /// dependents are kept before the `DROP TABLE`, while the table has the id
+    /// they are found by, and refreshed once everything is back on the new
+    /// table.
     #[test]
     fn a_sql_server_rebuild_refreshes_what_selects_star_from_the_table() {
         let t = ms_rebuild_table();
@@ -16950,7 +16993,7 @@ mod tests {
                 .position(|s| s.contains(needle))
                 .unwrap_or_else(|| panic!("{needle} not in {stmts:#?}"))
         };
-        let collect = at("INTO #schemaic_star_dependents");
+        let collect = at("CREATE TABLE #schemaic_star_dependents");
         assert!(stmts[collect].starts_with("DECLARE @t int = OBJECT_ID(N'[dbo].[p]')"));
         assert!(at("THROW 50000") < collect);
         assert!(collect < at("DROP TABLE [dbo].[p]"), "{stmts:#?}");
@@ -17776,7 +17819,7 @@ mod tests {
                 .position(|s| s.contains(needle))
                 .unwrap_or_else(|| panic!("{needle} not in {stmts:#?}"))
         };
-        let collect = at("INTO #schemaic_star_dependents");
+        let collect = at("CREATE TABLE #schemaic_star_dependents");
         assert!(stmts[collect].starts_with("DECLARE @t int = OBJECT_ID(N'[dbo].[t]')"));
         assert!(collect < at("DROP COLUMN [x]"), "{stmts:#?}");
         let refresh = at("sp_refreshsqlmodule");
@@ -17796,6 +17839,42 @@ mod tests {
         );
     }
 
+    /// **The `SELECT *` collector does not lean on `sys.sql_dependencies`**
+    /// (R3-L5-01, S2-L5-01): that catalogue keeps no row for a view over a
+    /// table dropped and re-created outside Schemaic, files a view over a
+    /// synonym under the synonym, and knows nothing of another database — and
+    /// each such view was left bound by position. The collector asks the
+    /// expression catalogue, by id and by name, walks synonyms and keeps only
+    /// what may hold a `*`; a view in another database it does not ask for,
+    /// and the preview says so. One batch each.
+    #[test]
+    fn the_star_collector_finds_what_the_deprecated_catalogue_misses() {
+        let collect = tsql_collect_star_dependents("[dbo].[t]");
+        assert!(!collect.contains("sys.sql_dependencies"), "{collect}");
+        for needle in [
+            "sys.sql_expression_dependencies",
+            "d.referenced_id = p.object_id",
+            "d.referenced_id IS NULL",
+            "referenced_database_name",
+            "sys.synonyms",
+            "PARSENAME(y.base_object_name, 3)",
+            "CHARINDEX(N'*', OBJECT_DEFINITION(o.object_id))",
+        ] {
+            assert!(collect.contains(needle), "{needle} not in {collect}");
+        }
+        for s in [&collect, &tsql_refresh_star_dependents()] {
+            assert_eq!(s.matches(';').count(), 1, "one batch: {s}");
+        }
+        let t = ms_rebuild_table();
+        let mut d = TableDraft::from_table(&t);
+        d.columns.swap(1, 2);
+        let risk = diff(&t, &d, MsSql).destructive().join(" ");
+        assert!(
+            risk.contains("One in another database that selects * from p is not refreshed"),
+            "{risk}"
+        );
+    }
+
     /// **A dropped column shifts every column after it**, so its plan
     /// refreshes what selects `*` too; an added column alone only appends,
     /// and a rename or retype moves nothing, so theirs refresh nothing and
@@ -17809,7 +17888,7 @@ mod tests {
             let refresh = emitted.iter().any(|s| s.contains("sp_refreshsqlmodule"));
             let collect = emitted
                 .iter()
-                .any(|s| s.contains("INTO #schemaic_star_dependents"));
+                .any(|s| s.contains("CREATE TABLE #schemaic_star_dependents"));
             assert_eq!(refresh, collect, "{emitted:#?}");
             let said = cs.destructive().iter().any(|r| r.contains("selects *"));
             assert_eq!(refresh, said, "{:#?}", cs.destructive());
