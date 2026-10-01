@@ -4694,7 +4694,12 @@ existing prose was left alone.
     between a table counting down from 1000 and one counting up from 1 answered `Same`. It compares
     them now, `None` standing for the `(1,1)` the emitter writes for it, and T-SQL having no
     `ALTER COLUMN` for an identity the difference goes to the rebuild
-    (`an_identity_seed_or_increment_is_a_change`). Also `key_list_text`/`parse_key_list` (the designer's `bio(20), age DESC`
+    (`an_identity_seed_or_increment_is_a_change`). **`ForeignKeyInfo::not_enforced`/`not_validated`
+    were the sixth**, in `fks_equal`: the reader and the `AddForeignKey` arm learned SQL Server's
+    disabled and untrusted key while the equality did not, so Compare schemas called a `NOCHECK` key
+    equal to an enforced one and the migration carried nothing. It compares both now, `false` on
+    every other engine, and the SQL Server round-trip fixture carries a disabled key and a disabled,
+    untrusted check (`a_disabled_or_untrusted_key_differs_from_an_enforced_one`). Also `key_list_text`/`parse_key_list` (the designer's `bio(20), age DESC`
     field) and `common_types`. **That round trip is asserted twice here, and a quoted paren used to
     break it**: `unwrap_parens` counted parens over raw `char_indices` and `split_keys` counted raw
     bytes, so a close paren inside a string literal ended the group early. A PostgreSQL index keyed

@@ -8487,6 +8487,12 @@ fn fks_equal(a: &ForeignKeyInfo, b: &ForeignKeyInfo) -> bool {
         // engines that cannot report them, so this costs nothing there.
         && a.match_type == b.match_type
         && a.deferrable == b.deferrable
+        // **And so do SQL Server's disabled and untrusted states**, which the
+        // emitter restates (`WITH NOCHECK`, `NOCHECK CONSTRAINT`): left out,
+        // Compare called a disabled key equal to an enforced one and the
+        // migration carried nothing (R2-L6-01). `false` on every other engine.
+        && a.not_enforced == b.not_enforced
+        && a.not_validated == b.not_validated
 }
 
 /// What a routine's create or alter must be followed by, as statements of
@@ -15846,6 +15852,48 @@ mod tests {
         }
     }
 
+    /// **A disabled or untrusted SQL Server key is not the same key as an
+    /// enforced one** (R2-L6-01): `fks_equal` read neither flag, so Compare
+    /// schemas called a `NOCHECK` key on one side equal to an enforced one on
+    /// the other and the migration carried nothing — though the emitter
+    /// restates both states. Through the diff, as a compare reaches it, the
+    /// difference is the key dropped and re-added as the right side has it.
+    #[test]
+    fn a_disabled_or_untrusted_key_differs_from_an_enforced_one() {
+        let key = ForeignKeyInfo {
+            name: "fk_c".into(),
+            columns: vec!["c".into()],
+            ref_schema: Some("dbo".into()),
+            ref_table: "p".into(),
+            ref_columns: vec!["id".into()],
+            ..Default::default()
+        };
+        let disabled = ForeignKeyInfo {
+            not_enforced: true,
+            ..key.clone()
+        };
+        let untrusted = ForeignKeyInfo {
+            not_validated: true,
+            ..key.clone()
+        };
+        assert!(fks_equal(&key, &key.clone()));
+        assert!(!fks_equal(&key, &disabled));
+        assert!(!fks_equal(&key, &untrusted));
+        assert!(!fks_equal(&disabled, &untrusted));
+
+        let mut t = ms_table(vec![ms_col("id", "int"), ms_col("c", "int")], &["id"]);
+        t.foreign_keys = vec![key];
+        let mut d = TableDraft::from_table(&t);
+        d.foreign_keys[0].info.not_enforced = true;
+        let stmts = diff(&t, &d, MsSql).emit();
+        assert!(
+            stmts
+                .iter()
+                .any(|s| s.contains("NOCHECK CONSTRAINT [fk_c]")),
+            "{stmts:#?}"
+        );
+    }
+
     #[test]
     fn renaming_the_table_runs_last_and_under_the_old_name() {
         let t = users();
@@ -17892,11 +17940,13 @@ mod tests {
     /// - every rowstore index with `clustered: Some(kind == 1)` — here a
     ///   `NONCLUSTERED` named key beside a `CLUSTERED` descending index, which
     ///   is the pair a model without the field could not carry;
-    /// - a check, table and column descriptions (`MS_Description`);
+    /// - a check, a disabled and untrusted one beside it, table and column
+    ///   descriptions (`MS_Description`);
     /// - a foreign key with `ref_schema` always named and its actions as
     ///   `fk_action` spells them (`NO_ACTION` is `None`, `SET_NULL` is
-    ///   `SET NULL`), and on the table it references the inbound copy
-    ///   `link_inbound_foreign_keys` files under `referenced_by`.
+    ///   `SET NULL`), a disabled and untrusted one beside it, and on the table
+    ///   they reference the inbound copies `link_inbound_foreign_keys` files
+    ///   under `referenced_by`.
     #[test]
     fn a_sql_server_table_round_trips_through_its_draft() {
         let t = TableInfo {
@@ -17965,23 +18015,47 @@ mod tests {
                     ..Default::default()
                 },
             ],
-            foreign_keys: vec![crate::schema::ForeignKeyInfo {
-                name: "FK_orders_customer".into(),
-                columns: vec!["customer_id".into()],
-                ref_schema: Some("sales".into()),
-                ref_table: "customers".into(),
-                ref_columns: vec!["id".into()],
-                on_delete: Some("CASCADE".into()),
-                on_update: Some("SET NULL".into()),
-                ..Default::default()
-            }],
-            check_constraints: vec![crate::schema::CheckInfo {
-                name: "CK_qty".into(),
-                expression: "[qty]>=(0)".into(),
-                enforced: true,
-                validated: true,
-                ..Default::default()
-            }],
+            foreign_keys: vec![
+                crate::schema::ForeignKeyInfo {
+                    name: "FK_orders_customer".into(),
+                    columns: vec!["customer_id".into()],
+                    ref_schema: Some("sales".into()),
+                    ref_table: "customers".into(),
+                    ref_columns: vec!["id".into()],
+                    on_delete: Some("CASCADE".into()),
+                    on_update: Some("SET NULL".into()),
+                    ..Default::default()
+                },
+                // Disabled (`NOCHECK CONSTRAINT`), and so untrusted too, as
+                // the reader sets both off `sys.foreign_keys`.
+                crate::schema::ForeignKeyInfo {
+                    name: "FK_orders_placed_by".into(),
+                    columns: vec!["qty".into()],
+                    ref_schema: Some("sales".into()),
+                    ref_table: "customers".into(),
+                    ref_columns: vec!["id".into()],
+                    not_enforced: true,
+                    not_validated: true,
+                    ..Default::default()
+                },
+            ],
+            check_constraints: vec![
+                crate::schema::CheckInfo {
+                    name: "CK_qty".into(),
+                    expression: "[qty]>=(0)".into(),
+                    enforced: true,
+                    validated: true,
+                    ..Default::default()
+                },
+                // Added `WITH NOCHECK` (untrusted) and then disabled.
+                crate::schema::CheckInfo {
+                    name: "CK_code".into(),
+                    expression: "len([code])>(2)".into(),
+                    enforced: false,
+                    validated: false,
+                    ..Default::default()
+                },
+            ],
             ..Default::default()
         };
         let customers = TableInfo {
@@ -18009,8 +18083,8 @@ mod tests {
         let [t, customers] = tables;
         assert_eq!(
             customers.referenced_by.len(),
-            1,
-            "the fixture links its key"
+            2,
+            "the fixture links its keys"
         );
         for t in [&t, &customers] {
             let cs = diff(t, &TableDraft::from_table(t), MsSql);
