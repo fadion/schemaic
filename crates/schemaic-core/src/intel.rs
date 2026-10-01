@@ -4235,8 +4235,10 @@ pub fn clause_continuation(
 
 /// Parse the tables (and aliases) visible at `caret` using the byte-position
 /// lexer + paren-scope chain — the fallback used when the statement doesn't parse
-/// as a complete AST. Handles `db.table`, `AS alias`, implicit `table alias`, and
-/// comma FROM-lists; scopes to the caret's query or an enclosing one.
+/// as a complete AST. Reads each list with [`read_table_list`] — `db.table`,
+/// T-SQL's `db.schema.table`, `AS alias`, implicit `table alias`, and comma
+/// FROM-lists, past a derived table or a rowset function — and scopes to the
+/// caret's query or an enclosing one.
 fn lexer_scope(
     sql: &str,
     lo: usize,
@@ -4246,18 +4248,48 @@ fn lexer_scope(
 ) -> Vec<TableRef> {
     let toks = tokenize_range(sql, lo, hi, dialect);
     let chain = caret_scope_chain(&toks, caret);
-    let word = |k: &TkKind| -> Option<String> {
-        if let TkKind::Word(w) = k {
-            Some(w.clone())
-        } else {
-            None
-        }
-    };
     let mut out = Vec::new();
+    // Each item of a list read in paren scope `scope`, as a reference: the
+    // last part the table, the one before it its database or (T-SQL's
+    // `db.schema.t`) schema — as the parsed statement's scope has it.
+    let mut emit_in = |item: ListItem, scope: usize| {
+        let ListItem {
+            mut parts,
+            alias,
+            dangling,
+            ..
+        } = item;
+        // `db.` with no table after the dot — a qualifier still being typed.
+        // Registering `db` as a table shadowed database-qualified completion.
+        if dangling || !chain.contains(&scope) {
+            return;
+        }
+        let Some((name, _)) = parts.pop() else {
+            return;
+        };
+        let db = parts.pop().map(|p| p.0).filter(|d| !d.is_empty());
+        out.push(TableRef { name, alias, db });
+    };
     let mut next_id = 1usize;
     let mut open: Vec<usize> = Vec::new();
+    // Where a `FROM` list resumes past a parenthesised item, and the paren
+    // scope it was read in — see `ListStop::resume`. Innermost last.
+    let mut resume: Vec<(usize, usize)> = Vec::new();
     let mut i = 0;
     while i < toks.len() {
+        while resume.last().is_some_and(|r| r.0 < i) {
+            resume.pop();
+        }
+        if let Some(&(at, scope)) = resume.last()
+            && at == i
+        {
+            resume.pop();
+            let stop =
+                read_table_list_after_paren(&toks, i, dialect, &mut |item| emit_in(item, scope));
+            resume.extend(stop.resume.map(|r| (r, scope)));
+            i = stop.at;
+            continue;
+        }
         match &toks[i].kind {
             TkKind::LParen => {
                 open.push(next_id);
@@ -4272,71 +4304,19 @@ fn lexer_scope(
             }
             TkKind::Word(w) => {
                 let up = w.to_ascii_uppercase();
-                let is_from = up == "FROM";
                 if !matches!(up.as_str(), "FROM" | "JOIN" | "INTO" | "UPDATE") {
                     i += 1;
                     continue;
                 }
                 let scope = *open.last().unwrap_or(&0);
-                i += 1;
-                while let Some(mut name) = toks.get(i).and_then(|t| word(&t.kind)) {
-                    if is_reserved_word(&name, dialect) {
-                        break;
-                    }
-                    let mut db = None;
-                    i += 1;
-                    if matches!(toks.get(i).map(|t| &t.kind), Some(TkKind::Dot)) {
-                        match toks.get(i + 1).and_then(|t| word(&t.kind)) {
-                            Some(second) => {
-                                db = Some(name);
-                                name = second;
-                                i += 2;
-                            }
-                            // `name.` with no table after the dot — a `db.` qualifier
-                            // still being typed. Don't register `name` as a table (that
-                            // spurious entry shadowed database-qualified completion);
-                            // consume the dot and stop this FROM-list.
-                            None => {
-                                i += 1;
-                                break;
-                            }
-                        }
-                    }
-                    let mut alias = None;
-                    match toks.get(i).map(|t| &t.kind) {
-                        Some(TkKind::Word(a)) if a.eq_ignore_ascii_case("AS") => {
-                            if let Some(al) = toks.get(i + 1).and_then(|t| word(&t.kind)) {
-                                // A reserved keyword after AS isn't a valid alias
-                                // (needs backticks) — don't register it, matching the
-                                // implicit-alias arm below. Still consume both tokens.
-                                if !is_reserved_word(&al, dialect) {
-                                    alias = Some(al);
-                                }
-                                i += 2;
-                            }
-                        }
-                        // `is_implicit_alias`, not the reserved test alone — the
-                        // half-typed `FROM orders LEFT JOIN |` reaches *this*
-                        // scanner, which is how `join_targets` came to offer
-                        // `customers ON "LEFT".customer_id = customers.id`.
-                        Some(TkKind::Word(a))
-                            if !toks[i].after_semicolon
-                                && (toks[i].quoted || is_implicit_alias(a, dialect)) =>
-                        {
-                            alias = Some(a.clone());
-                            i += 1;
-                        }
-                        _ => {}
-                    }
-                    if chain.contains(&scope) {
-                        out.push(TableRef { name, alias, db });
-                    }
-                    if is_from && matches!(toks.get(i).map(|t| &t.kind), Some(TkKind::Comma)) {
-                        i += 1;
-                        continue;
-                    }
-                    break;
-                }
+                // `is_implicit_alias` (in `read_alias`), not the reserved test
+                // alone — the half-typed `FROM orders LEFT JOIN |` reaches
+                // *this* scanner, which is how `join_targets` came to offer
+                // `customers ON "LEFT".customer_id = customers.id`.
+                let stop =
+                    read_table_list(&toks, i + 1, &up, dialect, &mut |item| emit_in(item, scope));
+                resume.extend(stop.resume.map(|r| (r, scope)));
+                i = stop.at;
             }
             _ => {
                 i += 1;
@@ -5089,16 +5069,52 @@ fn table_refs_with_pos(
 fn located_table_refs(sql: &str, lo: usize, hi: usize, dialect: SqlDialect) -> Vec<LocatedRef> {
     let toks = tokenize_range(sql, lo, hi, dialect);
     let calls = enclosing_calls(&toks);
-    let word = |k: &TkKind| -> Option<String> {
-        if let TkKind::Word(w) = k {
-            Some(w.clone())
-        } else {
-            None
-        }
-    };
     let mut out = Vec::new();
+    let mut emit = |item: ListItem| {
+        let ListItem {
+            mut parts,
+            alias,
+            call,
+            ..
+        } = item;
+        // The last part is the table, positioned by its token's own span,
+        // not `at + name.len()`: `name` is the *unquoted* text, so
+        // recomputing underlines `"NoSuchTb` for a quoted identifier.
+        let (name, pos) = parts.pop().unwrap_or_default();
+        // A linked server's four-part name: nothing to judge it by. Nor a
+        // rowset function's call.
+        if parts.len() > 2 || call {
+            return;
+        }
+        let (db, database) = match parts.len() {
+            0 => (None, None),
+            1 => (parts.pop().map(|p| p.0), None),
+            _ => {
+                let schema = parts.pop().map(|p| p.0).filter(|s| !s.is_empty());
+                (schema, parts.pop().map(|p| p.0))
+            }
+        };
+        out.push(LocatedRef {
+            r: TableRef { name, alias, db },
+            pos,
+            database,
+        });
+    };
+    // Where a `FROM` list resumes past a parenthesised item whose inside the
+    // scan reads first — see `ListStop::resume`. Innermost last.
+    let mut resume: Vec<usize> = Vec::new();
     let mut i = 0;
     while i < toks.len() {
+        while resume.last().is_some_and(|&r| r < i) {
+            resume.pop();
+        }
+        if resume.last() == Some(&i) {
+            resume.pop();
+            let stop = read_table_list_after_paren(&toks, i, dialect, &mut emit);
+            resume.extend(stop.resume);
+            i = stop.at;
+            continue;
+        }
         let TkKind::Word(w) = &toks[i].kind else {
             i += 1;
             continue;
@@ -5138,75 +5154,259 @@ fn located_table_refs(sql: &str, lo: usize, hi: usize, dialect: SqlDialect) -> V
             i += 1;
             continue;
         }
-        i += 1;
-        while let Some(first) = toks.get(i).and_then(|t| word(&t.kind)) {
-            if is_reserved_word(&first, dialect) {
-                break;
-            }
-            let Some((mut parts, next)) = dotted_name(&toks, i) else {
-                break;
-            };
-            i = next;
-            // The last part is the table, positioned by its token's own span,
-            // not `at + name.len()`: `name` is the *unquoted* text, so
-            // recomputing underlines `"NoSuchTb` for a quoted identifier.
-            let (name, pos) = parts.pop().unwrap_or_default();
-            // A linked server's four-part name: nothing to judge it by. Nor a
-            // function after `FROM`/`JOIN` — `STRING_SPLIT(…)`, PostgreSQL's
-            // `generate_series(…)`, a user's table-valued function — since a
-            // table name is never followed by `(` there. (After `INTO` the
-            // `(` opens a column list, and the table is still judged.)
-            let call = matches!(up.as_str(), "FROM" | "JOIN")
-                && matches!(toks.get(i).map(|t| &t.kind), Some(TkKind::LParen));
-            let judged = parts.len() <= 2 && !call;
-            let (db, database) = match parts.len() {
-                0 => (None, None),
-                1 => (parts.pop().map(|p| p.0), None),
-                _ => {
-                    let schema = parts.pop().map(|p| p.0).filter(|s| !s.is_empty());
-                    (schema, parts.pop().map(|p| p.0))
-                }
-            };
-            let mut alias = None;
-            match toks.get(i).map(|t| &t.kind) {
-                Some(TkKind::Word(a)) if a.eq_ignore_ascii_case("AS") => {
-                    if let Some(al) = toks.get(i + 1).and_then(|t| word(&t.kind)) {
-                        // A reserved keyword after AS isn't a valid alias — don't
-                        // register it (matches the implicit arm + `lexer_scope`).
-                        if !is_reserved_word(&al, dialect) {
-                            alias = Some(al);
-                        }
-                        i += 2;
-                    }
-                }
-                // See `is_implicit_alias`: a join or clause keyword here ends the
-                // reference, and asking `is_reserved_word` alone put SQLite's
-                // `LEFT` in the alias slot. So does a `;` — the word after it
-                // begins the next statement.
-                Some(TkKind::Word(a))
-                    if !toks[i].after_semicolon
-                        && (toks[i].quoted || is_implicit_alias(a, dialect)) =>
-                {
-                    alias = Some(a.clone());
-                    i += 1;
-                }
-                _ => {}
-            }
-            if judged {
-                out.push(LocatedRef {
-                    r: TableRef { name, alias, db },
-                    pos,
-                    database,
-                });
-            }
-            if is_from && matches!(toks.get(i).map(|t| &t.kind), Some(TkKind::Comma)) {
-                i += 1;
-                continue;
-            }
-            break;
-        }
+        let stop = read_table_list(&toks, i + 1, &up, dialect, &mut emit);
+        i = stop.at;
+        resume.extend(stop.resume);
     }
     out
+}
+
+/// One item of a table list, as [`read_table_list`] reads it.
+struct ListItem {
+    /// The name's parts ([`dotted_name`]); the last is the table.
+    parts: Vec<(String, (usize, usize))>,
+    alias: Option<String>,
+    /// A rowset function's call after `FROM`/`JOIN` — `STRING_SPLIT(…)`,
+    /// PostgreSQL's `generate_series(…)`, a user's table-valued function —
+    /// named as a table is but not one. Its alias follows its `)`, where
+    /// [`read_table_list_after_paren`] reads it.
+    call: bool,
+    /// The name ended in a `.` with nothing after it: a qualifier still being
+    /// typed (`FROM company.dbo.`).
+    dangling: bool,
+}
+
+/// Where [`read_table_list`] stopped.
+struct ListStop {
+    /// The token the list ended at.
+    at: usize,
+    /// For a `FROM` list that met a parenthesised item — a derived table, or
+    /// a rowset function's arguments — the index just past its `)`: the list
+    /// goes on there, with the item's alias and then perhaps a comma, once the
+    /// caller has read what is inside (a derived table's own `FROM`, a
+    /// subquery in an argument). [`read_table_list_after_paren`] reads it.
+    resume: Option<usize>,
+}
+
+/// The table list after `keyword` (`FROM`, `JOIN`, `INTO` or `UPDATE`,
+/// upper-cased), from `toks[i]`: each item to `emit`, in order. The one
+/// reader [`located_table_refs`] and [`lexer_scope`] both walk a list with,
+/// so a list's shape is decided once.
+///
+/// **A list goes on past a parenthesised item.** A rowset function's call and
+/// a derived table left the reader on their `(`, where the comma test found
+/// none, so the rest of the list went unread: `FROM generate_series(1, 3) g,
+/// nosuch` never judged `nosuch`. The reader now stops at the `(` and says
+/// where the list resumes ([`ListStop::resume`]), and the caller reads the
+/// inside first — it has `FROM`s of its own — then the rest.
+///
+/// **A quoted word is a name, whatever word it is.** The list ends at a
+/// reserved word (`FROM WHERE …`), and that test once ran on the unquoted text
+/// alone, so `[order]`, `` `group` `` and `"user"` — quoting being the remedy
+/// for exactly those names — ended the list instead of being judged.
+///
+/// **A table hint is not a call** ([`table_hints`]): T-SQL's `FROM t (NOLOCK)`
+/// is a table and one hint, not `t`'s arguments, and `WITH (…)` after a name
+/// or an alias ends the item without ending the list.
+fn read_table_list(
+    toks: &[Token],
+    mut i: usize,
+    keyword: &str,
+    dialect: SqlDialect,
+    emit: &mut dyn FnMut(ListItem),
+) -> ListStop {
+    let is_from = keyword == "FROM";
+    // After `INTO` a `(` opens a column list, and after `UPDATE` none comes.
+    let parenthesised = matches!(keyword, "FROM" | "JOIN");
+    let at = |j: usize| toks.get(j).map(|t| &t.kind);
+    // Only a `FROM` list goes on after a comma, so only one resumes.
+    let resume_after = |open: usize| {
+        is_from
+            .then(|| matching_paren(toks, open))
+            .flatten()
+            .map(|close| close + 1)
+    };
+    loop {
+        if parenthesised && matches!(at(i), Some(TkKind::LParen)) {
+            return ListStop {
+                at: i,
+                resume: resume_after(i),
+            };
+        }
+        let Some(tok) = toks.get(i) else { break };
+        let TkKind::Word(first) = &tok.kind else {
+            break;
+        };
+        if !tok.quoted && is_reserved_word(first, dialect) {
+            break;
+        }
+        let Some((parts, next)) = dotted_name(toks, i) else {
+            break;
+        };
+        i = next;
+        if matches!(at(i), Some(TkKind::Dot)) {
+            emit(ListItem {
+                parts,
+                alias: None,
+                call: false,
+                dangling: true,
+            });
+            return ListStop {
+                at: i + 1,
+                resume: None,
+            };
+        }
+        if let Some(end) = table_hint_end(toks, i, dialect) {
+            i = end;
+        }
+        if parenthesised && matches!(at(i), Some(TkKind::LParen)) {
+            emit(ListItem {
+                parts,
+                alias: None,
+                call: true,
+                dangling: false,
+            });
+            return ListStop {
+                at: i,
+                resume: resume_after(i),
+            };
+        }
+        let alias = read_alias(toks, &mut i, dialect);
+        if let Some(end) = table_hint_end(toks, i, dialect) {
+            i = end;
+        }
+        emit(ListItem {
+            parts,
+            alias,
+            call: false,
+            dangling: false,
+        });
+        if is_from && matches!(at(i), Some(TkKind::Comma)) {
+            i += 1;
+            continue;
+        }
+        break;
+    }
+    ListStop {
+        at: i,
+        resume: None,
+    }
+}
+
+/// The rest of a `FROM` list after a parenthesised item, from `toks[i]` just
+/// past its `)` ([`ListStop::resume`]): the item's alias — with a column-alias
+/// list, `AS g(n)` — and, after a comma, the list's next items.
+fn read_table_list_after_paren(
+    toks: &[Token],
+    mut i: usize,
+    dialect: SqlDialect,
+    emit: &mut dyn FnMut(ListItem),
+) -> ListStop {
+    if read_alias(toks, &mut i, dialect).is_some()
+        && matches!(toks.get(i).map(|t| &t.kind), Some(TkKind::LParen))
+        && let Some(close) = matching_paren(toks, i)
+    {
+        i = close + 1;
+    }
+    if matches!(toks.get(i).map(|t| &t.kind), Some(TkKind::Comma)) {
+        return read_table_list(toks, i + 1, "FROM", dialect, emit);
+    }
+    ListStop {
+        at: i,
+        resume: None,
+    }
+}
+
+/// The alias at `toks[*i]`, if one is there, with `*i` moved past it.
+///
+/// See [`is_implicit_alias`]: a join or clause keyword here ends the
+/// reference, and asking `is_reserved_word` alone put SQLite's `LEFT` in the
+/// alias slot. So does a `;` — the word after it begins the next statement. A
+/// reserved word after `AS` is no valid alias and is not registered, but is
+/// consumed with the `AS`; quoted, it is one.
+fn read_alias(toks: &[Token], i: &mut usize, dialect: SqlDialect) -> Option<String> {
+    match toks.get(*i).map(|t| &t.kind) {
+        Some(TkKind::Word(a)) if !toks[*i].quoted && a.eq_ignore_ascii_case("AS") => {
+            let Some(Token {
+                kind: TkKind::Word(al),
+                quoted,
+                ..
+            }) = toks.get(*i + 1)
+            else {
+                return None;
+            };
+            *i += 2;
+            (*quoted || !is_reserved_word(al, dialect)).then(|| al.clone())
+        }
+        Some(TkKind::Word(a))
+            if !toks[*i].after_semicolon && (toks[*i].quoted || is_implicit_alias(a, dialect)) =>
+        {
+            *i += 1;
+            Some(a.clone())
+        }
+        _ => None,
+    }
+}
+
+/// The table hints `dialect` takes after a table name, upper-cased: `Some`
+/// for an engine whose `FROM t WITH (NOLOCK)` hints a table, holding the
+/// hints it also takes **alone, without `WITH`** — `FROM t (NOLOCK)`, the old
+/// form, still legal on SQL Server 2022 and 2025. Measured there: each hint
+/// below runs alone in parentheses, before or after an alias; two hints
+/// together, a bracketed `[NOLOCK]` or any other word is read as the
+/// arguments of a call (Msg 207, 215), and `HOLDLOCK` and `INDEX` need `WITH`
+/// (Msg 1018). `None` for an engine with no such hint, where `FROM t (…)` is
+/// a call.
+fn table_hints(dialect: SqlDialect) -> Option<&'static [&'static str]> {
+    match dialect {
+        SqlDialect::MsSql => Some(&[
+            "FORCESCAN",
+            "FORCESEEK",
+            "IGNORE_CONSTRAINTS",
+            "IGNORE_TRIGGERS",
+            "KEEPDEFAULTS",
+            "KEEPIDENTITY",
+            "NOEXPAND",
+            "NOLOCK",
+            "NOWAIT",
+            "PAGLOCK",
+            "READCOMMITTED",
+            "READCOMMITTEDLOCK",
+            "READPAST",
+            "READUNCOMMITTED",
+            "REPEATABLEREAD",
+            "ROWLOCK",
+            "SERIALIZABLE",
+            "SNAPSHOT",
+            "TABLOCK",
+            "TABLOCKX",
+            "UPDLOCK",
+            "XLOCK",
+        ]),
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => None,
+    }
+}
+
+/// The index just past a table hint at `toks[i]` — `WITH (…)`, or one of
+/// [`table_hints`]' words alone in parentheses — on an engine that has them.
+fn table_hint_end(toks: &[Token], i: usize, dialect: SqlDialect) -> Option<usize> {
+    let alone = table_hints(dialect)?;
+    let at = |j: usize| toks.get(j).map(|t| &t.kind);
+    match (at(i), at(i + 1)) {
+        (Some(TkKind::Word(w)), Some(TkKind::LParen))
+            if !toks[i].quoted && w.eq_ignore_ascii_case("WITH") =>
+        {
+            matching_paren(toks, i + 1).map(|close| close + 1)
+        }
+        (Some(TkKind::LParen), Some(TkKind::Word(w)))
+            if !toks[i + 1].quoted
+                && alone.contains(&w.to_ascii_uppercase().as_str())
+                && matches!(at(i + 2), Some(TkKind::RParen)) =>
+        {
+            Some(i + 3)
+        }
+        _ => None,
+    }
 }
 
 /// Is `word` a likely misspelled SQL keyword? Not a known word (keyword/function/
@@ -14740,9 +14940,10 @@ mod tests {
 
     /// **A function in `FROM` is not a table.** A rowset builtin —
     /// `generate_series`, `unnest` — read as a table name drew ``Table
-    /// `generate_series` not found``; a table name is never followed by `(`
-    /// there, on any engine here. An `INSERT`'s column list still is, and its
-    /// table is still checked.
+    /// `generate_series` not found``; a table name is followed by `(` there
+    /// only in T-SQL's old-style hint, `FROM t (NOLOCK)`
+    /// (`a_t_sql_table_hint_without_with_is_not_a_call`). An `INSERT`'s column
+    /// list still is, and its table is still checked.
     #[test]
     fn a_function_in_from_is_not_a_missing_table() {
         for sql in [
@@ -14850,6 +15051,69 @@ mod tests {
         );
     }
 
+    /// **Completion's scope reads a three-part name too.** Mid-edit the
+    /// statement does not parse, so the lexer's scope answers, and it took
+    /// one optional `.name`: `company.dbo.employees e` read as the table `dbo`
+    /// in `company`, the alias slot then met a `.`, and `e.` offered nothing.
+    /// It is the table, under its schema, with its alias — what the parsed
+    /// statement's scope holds.
+    #[test]
+    fn a_three_part_name_is_in_completions_scope_mid_edit() {
+        let ms = |sql: &str, caret: usize| {
+            statement_scope(sql, 0, sql.len(), caret, SqlDialect::MsSql).tables
+        };
+        let employees = |db: Option<&str>| TableRef {
+            name: "employees".to_string(),
+            alias: Some("e".to_string()),
+            db: db.map(str::to_string),
+        };
+        assert_eq!(
+            ms("SELECT e. FROM company.dbo.employees e", 9),
+            [employees(Some("dbo"))]
+        );
+        let sql = "SELECT e.id FROM company.dbo.employees e WHERE e.";
+        assert_eq!(ms(sql, sql.len()), [employees(Some("dbo"))]);
+        let sql = "SELECT e.id FROM company..employees e WHERE e.";
+        assert_eq!(ms(sql, sql.len()), [employees(None)]);
+        // The parsed statement agrees.
+        let sql = "SELECT e.id FROM company.dbo.employees e";
+        assert_eq!(ms(sql, sql.len()), [employees(Some("dbo"))]);
+        // A qualifier still being typed is no table.
+        let sql = "SELECT * FROM company.dbo.";
+        assert_eq!(ms(sql, sql.len()), []);
+    }
+
+    /// **A reserved word quoted is a name.** The reference scanner stopped at
+    /// a reserved word — meant for `FROM WHERE …` — without asking whether it
+    /// was quoted, and quoting is the documented remedy for a table called
+    /// `order` or `user`, so exactly those tables were never checked.
+    #[test]
+    fn a_quoted_reserved_table_name_is_checked() {
+        for (sql, dialect, table) in [
+            ("SELECT id FROM [order];", SqlDialect::MsSql, "order"),
+            ("SELECT id FROM `order`;", SqlDialect::MySql, "order"),
+            ("SELECT id FROM \"order\";", SqlDialect::Postgres, "order"),
+            ("SELECT id FROM \"user\";", SqlDialect::Postgres, "user"),
+            (
+                "SELECT e.id FROM employees e JOIN [select] s ON s.id = e.id;",
+                SqlDialect::MsSql,
+                "select",
+            ),
+        ] {
+            let d = diag_d(sql, dialect);
+            assert!(
+                d.iter()
+                    .any(|x| x.message == format!("Table `{table}` not found")),
+                "{sql} on {dialect:?}: {d:?}"
+            );
+        }
+        // Completion reads it as the table it names.
+        let sql = "SELECT o. FROM [order] o";
+        let s = statement_scope(sql, 0, sql.len(), 9, SqlDialect::MsSql);
+        assert_eq!(names(&s), ["order"]);
+        assert_eq!(s.tables[0].alias.as_deref(), Some("o"));
+    }
+
     /// The text under each of `sql`'s ``Table `…` not found`` diagnostics,
     /// in order.
     fn missing_tables(sql: &str, dialect: SqlDialect) -> Vec<String> {
@@ -14858,6 +15122,130 @@ mod tests {
             .filter(|x| x.message.starts_with("Table `"))
             .map(|x| sql[x.range.0..x.range.1].to_string())
             .collect()
+    }
+
+    /// **A FROM list goes on after a parenthesised item.** A rowset function's
+    /// call and a derived table left the scanner on their `(`, where the comma
+    /// test found none, so everything after them in the list went unread and
+    /// a missing table there drew nothing — though the same table after a
+    /// `JOIN` was reported. What is inside the parentheses is still read.
+    #[test]
+    fn a_from_list_is_read_past_a_function_or_a_derived_table() {
+        for (sql, dialect) in [
+            (
+                "SELECT * FROM unnest(ARRAY[1]) u, nosuch;",
+                SqlDialect::Postgres,
+            ),
+            (
+                "SELECT * FROM generate_series(1, 3) g, nosuch;",
+                SqlDialect::Postgres,
+            ),
+            (
+                "SELECT * FROM generate_series(1, 3) AS g(n), nosuch;",
+                SqlDialect::Postgres,
+            ),
+            (
+                "SELECT * FROM STRING_SPLIT(N'a', N',') s, nosuch;",
+                SqlDialect::MsSql,
+            ),
+            (
+                "SELECT * FROM (SELECT 1 AS a) s, nosuch;",
+                SqlDialect::MySql,
+            ),
+            (
+                "SELECT * FROM (SELECT 1 AS a) AS s, nosuch;",
+                SqlDialect::Postgres,
+            ),
+            (
+                "SELECT * FROM employees e, (SELECT 1 AS a) s, nosuch;",
+                SqlDialect::MySql,
+            ),
+            (
+                "SELECT * FROM (SELECT id FROM employees) s, nosuch;",
+                SqlDialect::MsSql,
+            ),
+        ] {
+            assert_eq!(missing_tables(sql, dialect), ["nosuch"], "{sql}");
+        }
+        // Inside the derived table, and after it, both.
+        assert_eq!(
+            missing_tables(
+                "SELECT * FROM (SELECT * FROM nosuch1) s, nosuch2;",
+                SqlDialect::MySql
+            ),
+            ["nosuch1", "nosuch2"]
+        );
+        // The function itself is still no table.
+        assert_eq!(
+            missing_tables(
+                "SELECT * FROM generate_series(1, 3) g, employees e;",
+                SqlDialect::Postgres
+            ),
+            Vec::<String>::new()
+        );
+        // And completion sees the table after it.
+        let sql = "SELECT e. FROM generate_series(1, 3) g, employees e";
+        let s = statement_scope(sql, 0, sql.len(), 9, SqlDialect::Postgres);
+        assert!(
+            s.tables
+                .iter()
+                .any(|t| t.name == "employees" && t.alias.as_deref() == Some("e")),
+            "{s:?}"
+        );
+    }
+
+    /// **T-SQL's old-style table hint is not a call.** `FROM t (NOLOCK)` —
+    /// one hint, alone, without `WITH` — runs on SQL Server 2022 and 2025, and
+    /// the scanner took the `(` after the name for a rowset function's, so the
+    /// name was never judged. What the server reads as a call stays one: two
+    /// hints, a bracketed word, any other word (each measured: Msg 207 or 215,
+    /// an argument list), and `HOLDLOCK`/`INDEX`, which need `WITH` (Msg
+    /// 1018). `WITH (…)` ends the item without ending the list.
+    #[test]
+    fn a_t_sql_table_hint_without_with_is_not_a_call() {
+        let ms = |sql: &str| missing_tables(sql, SqlDialect::MsSql);
+        assert_eq!(ms("SELECT * FROM nosuchtable (NOLOCK);"), ["nosuchtable"]);
+        assert_eq!(ms("SELECT * FROM nosuchtable (nolock) n;"), ["nosuchtable"]);
+        assert_eq!(
+            ms("SELECT * FROM nosuchtable n (READPAST);"),
+            ["nosuchtable"]
+        );
+        assert_eq!(
+            ms("SELECT * FROM employees e JOIN missing (NOLOCK) ON 1 = 1;"),
+            ["missing"]
+        );
+        assert_eq!(
+            ms("SELECT * FROM employees (NOLOCK) e, nosuch (UPDLOCK), nosuch2;"),
+            ["nosuch", "nosuch2"]
+        );
+        assert_eq!(
+            ms("SELECT * FROM employees WITH (NOLOCK), nosuch;"),
+            ["nosuch"]
+        );
+        for sql in [
+            "SELECT * FROM employees (NOLOCK);",
+            "SELECT * FROM employees (TABLOCKX) e WHERE e.id = 1;",
+            "SELECT * FROM employees e (NOLOCK) WHERE e.id = 1;",
+            "SELECT * FROM employees (NOLOCK) e JOIN departments (NOLOCK) d ON d.id = e.id;",
+        ] {
+            let d = diag_d(sql, SqlDialect::MsSql);
+            assert!(d.is_empty(), "{sql}: {d:?}");
+        }
+        // Calls, as the server reads them.
+        for sql in [
+            "SELECT * FROM nosuch (NOLOCK, READUNCOMMITTED);",
+            "SELECT * FROM nosuch ([NOLOCK]);",
+            "SELECT * FROM nosuch (FOO);",
+            "SELECT * FROM nosuch (HOLDLOCK);",
+            "SELECT * FROM dbo.nosuch (1);",
+        ] {
+            assert_eq!(ms(sql), Vec::<String>::new(), "{sql}");
+        }
+        // No other engine has the form.
+        assert_eq!(
+            missing_tables("SELECT * FROM nosuch (NOLOCK);", SqlDialect::Postgres),
+            Vec::<String>::new()
+        );
     }
 
     /// **A column named `move` is not a cursor.** `fetch_precedes` took a

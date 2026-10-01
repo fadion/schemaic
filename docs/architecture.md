@@ -858,11 +858,29 @@ existing prose was left alone.
     the `AS` form is the whole of it. It is answered off the token walk rather than the AST because
     `alias_checks` runs unconditionally, parse failure included — gating it on a parse would miss the
     real thing the diagnostic is for, since sqlparser *accepts* `AS or`.
-    **A function after `FROM`/`JOIN` is not a table** either: a table name is never followed by `(`
-    there on any engine here, and a rowset builtin read as one — T-SQL's `STRING_SPLIT`/`OPENJSON`/
-    `GENERATE_SERIES`, PostgreSQL's `generate_series`/`unnest` — was ``Table `…` not found``
-    (`a_function_in_from_is_not_a_missing_table`). After `INTO` the `(` opens a column list, and
-    that table is still judged.
+    **A function after `FROM`/`JOIN` is not a table** either: a rowset builtin read as one — T-SQL's
+    `STRING_SPLIT`/`OPENJSON`/`GENERATE_SERIES`, PostgreSQL's `generate_series`/`unnest` — was
+    ``Table `…` not found`` (`a_function_in_from_is_not_a_missing_table`). After `INTO` the `(`
+    opens a column list, and that table is still judged. A table name *is* followed by `(` in one
+    place: T-SQL's old-style hint, `FROM t (NOLOCK)` — one hint alone, without `WITH`, which 2022
+    and 2025 still run before or after an alias, and which read as a call left `FROM nosuch
+    (NOLOCK)` unjudged. `table_hints` is the per-dialect answer (`None` off SQL Server), holding
+    the hints measured to run alone; two together, a bracketed `[NOLOCK]` or any other word the
+    server takes for a call's arguments (Msg 207, 215), and `HOLDLOCK`/`INDEX` it refuses without
+    `WITH` (Msg 1018), so those stay calls; `WITH (…)` ends the item without ending the list
+    (`a_t_sql_table_hint_without_with_is_not_a_call`). **The list is one reader**,
+    `read_table_list`, shared by `located_table_refs` and completion's `lexer_scope`, whose two
+    copies had drifted: it reads every part of a name (`dotted_name`), so `lexer_scope` too sees
+    `company.dbo.employees e` as `employees` under `dbo` with its alias, where it saw the table `dbo`
+    and `e.` completed nothing (`a_three_part_name_is_in_completions_scope_mid_edit`); it ends at a
+    reserved word only **unquoted**, so `[order]`, `` `group` `` and `"user"` — quoting being the
+    remedy for exactly those names — are judged (`a_quoted_reserved_table_name_is_checked`); and
+    **a list goes on past a parenthesised item**: a derived table or a call stopped it on its `(`,
+    where the comma test found none, so `FROM generate_series(1, 3) g, nosuch` never judged
+    `nosuch`. The reader stops at the `(` and returns where the list resumes (`ListStop::resume`,
+    past the `)`); the caller reads the inside first — a derived table has `FROM`s of its own —
+    and `read_table_list_after_paren` the alias and the rest
+    (`a_from_list_is_read_past_a_function_or_a_derived_table`).
     **`INTO` names a table only after `INSERT`/`REPLACE`** (`insert_precedes`), because the word has
     three other meanings and none of them does: PostgreSQL's legacy `SELECT a INTO newtbl FROM t`
     names the table it is about to *create*, and MySQL's `SELECT a INTO @x` and
@@ -1020,7 +1038,9 @@ existing prose was left alone.
     schema-qualified (or, for `..`, bare) name, in another loaded one as that database's table of
     the same name whatever its schema (which can miss a wrong schema but never invent a missing
     table), and not at all in one never loaded. `colres` asks the same of the AST's parts, and a
-    linked server's four-part name is judged by nothing (`a_three_part_name_is_database_schema_table`).
+    linked server's four-part name is judged by nothing (`a_three_part_name_is_database_schema_table`;
+    the other-database arm, `a_three_part_name_in_another_loaded_database_is_judged_there`).
+    Completion's mid-edit scope reads the same parts through the same list reader (above).
     The error's remedy
     names the engine's quote (backticks, double quotes, brackets); it said "backticks" on every
     engine, advice neither PostgreSQL nor SQL Server accepts
