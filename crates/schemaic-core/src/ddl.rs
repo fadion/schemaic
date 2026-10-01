@@ -2616,11 +2616,18 @@ pub enum Change {
     },
     /// Create a trigger that doesn't exist yet.
     CreateTrigger(Box<TriggerDraft>),
-    /// Redefine an existing trigger — always a `DROP` followed by a `CREATE`,
-    /// because neither engine can alter one in place. One change, because it's
-    /// one edit, with the cost stated in [`Change::risks`].
+    /// Redefine an existing trigger — a `DROP` followed by a `CREATE`, or on
+    /// an engine that can alter one under its own name, a `CREATE OR ALTER`.
+    /// One change, because it's one edit, with the cost stated in
+    /// [`Change::risks`].
     ReplaceTrigger {
         draft: Box<TriggerDraft>,
+        /// **Altered in place** — [`trigger_alters_in_place`]'s answer,
+        /// carried on the change for the reason [`Change::ReplaceView`]
+        /// carries `recreate`: the statement, the risk sentence and the
+        /// change list's line have to answer the same question, and the
+        /// line, which has no dialect, said "Re-create" over an alter.
+        in_place: bool,
     },
     DropTrigger {
         name: String,
@@ -3283,7 +3290,11 @@ impl Change {
                 }
             ),
             Change::CreateTrigger(d) => format!("Create trigger {}", d.info.name),
-            Change::ReplaceTrigger { draft } => {
+            Change::ReplaceTrigger {
+                draft,
+                in_place: true,
+            } => format!("Redefine trigger {}", draft.info.name),
+            Change::ReplaceTrigger { draft, .. } => {
                 let server = draft.original.as_deref().unwrap_or(&draft.info.name);
                 if server != draft.info.name {
                     format!("Re-create trigger {server} as {}", draft.info.name)
@@ -3691,8 +3702,8 @@ impl Change {
             // **The sentence asks the plan's question** — `trigger_alters_in_place`
             // — because it described a drop over SQL Server's in-place alter,
             // which keeps the trigger's permissions and object id.
-            Change::ReplaceTrigger { draft } => {
-                let mut out = vec![if trigger_alters_in_place(draft, dialect) {
+            Change::ReplaceTrigger { draft, in_place } => {
+                let mut out = vec![if *in_place {
                     format!(
                         "Redefines trigger {} in place — it is not dropped, so its \
                          permissions stay — and what it does on each write changes \
@@ -5894,16 +5905,16 @@ impl ChangeSet {
         // nor re-enters the set — which is what keeps the ordering walk below
         // exact for it. A rename is still a drop and a create everywhere.
         // Which replace that is — the same name, byte for byte — is
-        // `trigger_alters_in_place`'s, the question the preview's sentence
-        // asks too.
-        let in_place = |draft: &TriggerDraft| trigger_alters_in_place(draft, d);
+        // `trigger_alters_in_place`'s, asked once when the change is built and
+        // carried on it (`ReplaceTrigger::in_place`), so the preview's
+        // sentence and its change-list line read the same answer.
         let mut dropped: Vec<&str> = Vec::new();
         let mut planned: Vec<&str> = Vec::new();
         for c in &self.changes {
             match c {
                 Change::CreateTrigger(draft) => planned.push(&draft.info.name),
-                Change::ReplaceTrigger { draft } if in_place(draft) => {}
-                Change::ReplaceTrigger { draft } => {
+                Change::ReplaceTrigger { in_place: true, .. } => {}
+                Change::ReplaceTrigger { draft, .. } => {
                     dropped.push(draft.original.as_deref().unwrap_or(&draft.info.name));
                     planned.push(&draft.info.name);
                 }
@@ -5933,10 +5944,11 @@ impl ChangeSet {
         for c in &self.changes {
             match c {
                 Change::CreateTrigger(draft) => push_create(&draft.info, false, &mut made),
-                Change::ReplaceTrigger { draft } if in_place(draft) => {
-                    push_create(&draft.info, true, &mut made)
-                }
-                Change::ReplaceTrigger { draft } => {
+                Change::ReplaceTrigger {
+                    draft,
+                    in_place: true,
+                } => push_create(&draft.info, true, &mut made),
+                Change::ReplaceTrigger { draft, .. } => {
                     // The drop addresses the name the server knows; the create
                     // builds the draft's, which is how a rename comes for free.
                     drops.push(drop(draft.original.as_deref().unwrap_or(&draft.info.name)));
@@ -10075,6 +10087,7 @@ pub fn supports_trigger_editing(dialect: SqlDialect) -> bool {
             dialect,
             &Change::ReplaceTrigger {
                 draft: Box::default(),
+                in_place: false,
             },
         )
         && supports_change(
@@ -14469,6 +14482,7 @@ pub fn diff_trigger(current: &TriggerInfo, draft: &TriggerDraft, dialect: SqlDia
     } else {
         vec![Change::ReplaceTrigger {
             draft: Box::new(draft.clone()),
+            in_place: trigger_alters_in_place(draft, dialect),
         }]
     };
     ChangeSet {
@@ -14517,6 +14531,7 @@ pub fn diff_triggers(
             Some(cur) if d.info == *cur => {}
             Some(_) => changes.push(Change::ReplaceTrigger {
                 draft: Box::new(d.clone()),
+                in_place: trigger_alters_in_place(d, dialect),
             }),
             // Either genuinely new, or naming a server trigger that has since
             // gone. Emitting a create either way lets the server be the one to
@@ -28668,17 +28683,24 @@ mod tsql_trigger_plan_tests {
         let cur = tr("tr");
         let mut d = set(vec![cur.clone()]);
         d.triggers[0].info.action = TriggerAction::Body("SET NOCOUNT OFF".into());
-        let risks = diff_triggers(std::slice::from_ref(&cur), &d, MsSql)
-            .destructive()
-            .join(" ");
+        let cs = diff_triggers(std::slice::from_ref(&cur), &d, MsSql);
+        let risks = cs.destructive().join(" ");
         assert!(!risks.contains("drops it first"), "{risks}");
         assert!(risks.contains("in place"), "{risks}");
+        // **And so does the change list's line above it** (S6.2-L1-06): it
+        // said "Re-create trigger tr" over the same alter.
+        assert_eq!(cs.changes[0].summary(), "Redefine trigger tr");
         let mut d = set(vec![cur.clone()]);
         d.triggers[0].info.name = "tr2".into();
-        let risks = diff_triggers(std::slice::from_ref(&cur), &d, MsSql)
-            .destructive()
-            .join(" ");
+        let cs = diff_triggers(std::slice::from_ref(&cur), &d, MsSql);
+        let risks = cs.destructive().join(" ");
         assert!(risks.contains("drops it first"), "{risks}");
+        assert_eq!(cs.changes[0].summary(), "Re-create trigger tr as tr2");
+        // Where no engine alters a trigger, every edit is a re-create.
+        let mut d = set(vec![cur.clone()]);
+        d.triggers[0].info.action = TriggerAction::Body("SET NOCOUNT OFF".into());
+        let cs = diff_triggers(std::slice::from_ref(&cur), &d, SqlDialect::MySql);
+        assert_eq!(cs.changes[0].summary(), "Re-create trigger tr");
     }
 
     /// A signed trigger's edit says it strips the signature, as a routine's

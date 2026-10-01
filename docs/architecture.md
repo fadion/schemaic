@@ -5578,7 +5578,11 @@ existing prose was left alone.
     (`a_sql_server_routine_recreates_sentences_match_its_plan`). The trigger arm's "drops it first"
     had the same fault over SQL Server's in-place alter; it asks `trigger_alters_in_place`, the
     predicate `trigger_statements` plans with, and says the trigger is redefined in place
-    (`a_trigger_altered_in_place_is_not_said_to_be_dropped`). `emit_mssql` now routes the shared `routine_statements`, whose drop arm
+    (`a_trigger_altered_in_place_is_not_said_to_be_dropped`). The change list's line above it
+    still said "Re-create trigger tr", because `Change::summary` has no dialect to ask with; the
+    answer is now asked once, when the change is built, and carried as
+    `ReplaceTrigger::in_place` — which the statement, the sentence and the line ("Redefine
+    trigger tr") all read, as `ReplaceView` carries `recreate`. `emit_mssql` now routes the shared `routine_statements`, whose drop arm
     replaced the inline `DropRoutine` one it had, and `tsql_supports` admits `CreateRoutine` and
     `ReplaceRoutine`, which is what switched `supports_routine_editing(MsSql)` on
     (`sql_server_offers_the_routine_editor`). `RoutineDraft::validate` has a SQL Server arm — every
