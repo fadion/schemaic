@@ -2580,6 +2580,15 @@ pub enum Change {
         /// and leave a read-only one, unrecoverably. Empty when `recreate` is
         /// false, and empty on the engines that replace a view in place.
         replay: Vec<String>,
+        /// **The indexes the view has on the server** — what SQL Server's
+        /// `ALTER VIEW`, and a re-create's `DROP VIEW`, take with it
+        /// ([`crate::schema::TsqlView::indexes`]). The draft's own are what
+        /// the plan builds after it. In the editor the two are one reading;
+        /// in a comparison the draft is the source's view and these the
+        /// target's, and the risk and the lossy refusal read the draft's
+        /// alone, so a target's index was dropped with nothing said. Empty
+        /// on the other engines.
+        server_indexes: Vec<IndexInfo>,
     },
     RenameView {
         to: String,
@@ -2900,6 +2909,7 @@ fn unreplayable_rename(c: &Change) -> Option<String> {
         draft,
         recreate: true,
         replay,
+        ..
     } = c
     else {
         return None;
@@ -3580,6 +3590,7 @@ impl Change {
                 draft,
                 recreate: true,
                 replay,
+                server_indexes,
             } => {
                 let why = match dialect {
                     SqlDialect::Sqlite => {
@@ -3614,7 +3625,7 @@ impl Change {
                         if replay.len() == 1 { "is" } else { "are" },
                     ));
                 }
-                out.extend(view_indexes_rebuilt(draft));
+                out.extend(view_indexes_rebuilt(draft, server_indexes));
                 out
             }
             // **An indexed view's alter drops its indexes too** — T-SQL's
@@ -3623,8 +3634,11 @@ impl Change {
             Change::ReplaceView {
                 draft,
                 recreate: false,
+                server_indexes,
                 ..
-            } => view_indexes_rebuilt(draft).into_iter().collect(),
+            } => view_indexes_rebuilt(draft, server_indexes)
+                .into_iter()
+                .collect(),
             // **Nothing is lost and the plan may simply fail** — which is worth
             // a sentence for the same reason `KeepLossyIndex` is: the preview is
             // where the plan says what it won't do for you. Every existing row
@@ -5701,6 +5715,7 @@ impl ChangeSet {
                     draft,
                     recreate,
                     replay,
+                    ..
                 } => {
                     // A replace addresses the view under the name the server
                     // knows; a re-create drops that one and builds the draft's,
@@ -6846,10 +6861,21 @@ pub(crate) fn view_index_statements(v: &ViewDraft, name: &str, d: SqlDialect) ->
 }
 
 /// The risk sentence for an indexed view's edit: the indexes the alter or the
-/// drop takes, which the plan builds again after it
-/// ([`view_index_statements`]). `None` for a view without any.
-fn view_indexes_rebuilt(v: &ViewDraft) -> Option<String> {
-    let names: Vec<&str> = v
+/// drop takes — `server`'s, the ones the view has
+/// ([`Change::ReplaceView::server_indexes`]) — and which of them the plan
+/// builds again after it ([`view_index_statements`], from the draft's).
+/// `None` for a view without any.
+///
+/// In the editor every one dropped is built again. In a comparison the draft
+/// is the other side's view, and an index only the target has is dropped and
+/// not built: the sentence says so, rather than reading the draft's set and
+/// saying nothing.
+fn view_indexes_rebuilt(v: &ViewDraft, server: &[IndexInfo]) -> Option<String> {
+    let dropped: Vec<&str> = server.iter().map(|ix| ix.name.as_str()).collect();
+    if dropped.is_empty() {
+        return None;
+    }
+    let built: Vec<&str> = v
         .options
         .tsql
         .indexes
@@ -6857,18 +6883,34 @@ fn view_indexes_rebuilt(v: &ViewDraft) -> Option<String> {
         .filter(|ix| !ix.lossy)
         .map(|ix| ix.name.as_str())
         .collect();
-    if names.is_empty() {
-        return None;
-    }
+    let (again, gone): (Vec<&str>, Vec<&str>) = dropped.iter().partition(|n| built.contains(n));
+    let it = |n: &[&str]| if n.len() == 1 { "it" } else { "them" };
+    let tail = if gone.is_empty() {
+        format!(
+            "and this plan builds {} again after it, in the same transaction. On a large view \
+             that takes as long as building {} did.",
+            it(&again),
+            it(&again)
+        )
+    } else if again.is_empty() {
+        format!(
+            "and this plan does not build {} again: the view it is made to match has no such \
+             index.",
+            it(&gone)
+        )
+    } else {
+        format!(
+            "and this plan builds {} again after it, in the same transaction, but not {}, which \
+             the view it is made to match does not have.",
+            again.join(", "),
+            gone.join(", ")
+        )
+    };
     Some(format!(
-        "Redefining view {} drops its index{} ({}) — SQL Server's ALTER VIEW always does — \
-         and this plan builds {} again after it, in the same transaction. On a large view \
-         that takes as long as building {} did.",
+        "Redefining view {} drops its index{} ({}) — SQL Server's ALTER VIEW always does — {tail}",
         v.original.as_deref().unwrap_or(&v.name),
-        if names.len() == 1 { "" } else { "es" },
-        names.join(", "),
-        if names.len() == 1 { "it" } else { "them" },
-        if names.len() == 1 { "it" } else { "them" },
+        if dropped.len() == 1 { "" } else { "es" },
+        dropped.join(", "),
     ))
 }
 
@@ -6881,19 +6923,29 @@ fn view_indexes_rebuilt(v: &ViewDraft) -> Option<String> {
 /// **And a view created from a reading** (the comparison's create) with such
 /// an index: the view would arrive without it, the plan saying nothing.
 fn lossy_view_index_refusal(c: &Change) -> Option<String> {
-    let (draft, created) = match c {
-        Change::ReplaceView { draft, .. } => (draft, false),
-        Change::CreateView(draft) => (draft, true),
+    // What the alter drops is the server's; what it builds, the draft's —
+    // one reading in the editor, two in a comparison, and a lossy one on
+    // either side is refused.
+    let (draft, server, created): (&ViewDraft, &[IndexInfo], bool) = match c {
+        Change::ReplaceView {
+            draft,
+            server_indexes,
+            ..
+        } => (draft, server_indexes, false),
+        Change::CreateView(draft) => (draft, &[], true),
         _ => return None,
     };
-    let lost: Vec<&str> = draft
+    let mut lost: Vec<&str> = draft
         .options
         .tsql
         .indexes
         .iter()
+        .chain(server)
         .filter(|ix| ix.lossy)
         .map(|ix| ix.name.as_str())
         .collect();
+    lost.sort_unstable();
+    lost.dedup();
     if lost.is_empty() {
         return None;
     }
@@ -9449,6 +9501,7 @@ pub fn supports_view_editing(dialect: SqlDialect) -> bool {
                 // the change the editor builds rather than a shape of it.
                 recreate: !supports_or_replace_view(dialect),
                 replay: Vec::new(),
+                server_indexes: Vec::new(),
             },
         )
 }
@@ -14298,6 +14351,13 @@ pub fn diff_view(current: &TableInfo, draft: &ViewDraft, dialect: SqlDialect) ->
             } else {
                 Vec::new()
             },
+            // `current`'s, not the draft's: in a comparison the draft is the
+            // other side's view.
+            server_indexes: current
+                .view_options
+                .as_ref()
+                .map(|o| o.tsql.indexes.clone())
+                .unwrap_or_default(),
         });
         // A re-create already builds the view under its new name; renaming
         // after it would address a name nothing answers to.
@@ -16729,6 +16789,7 @@ mod tests {
                 draft: Box::default(),
                 recreate: false,
                 replay: Vec::new(),
+                server_indexes: Vec::new(),
             },
             Change::CreateTable(Box::default()),
             Change::RenameTable { to: "u".into() },
@@ -18414,6 +18475,43 @@ mod tests {
         t.view_options.as_mut().unwrap().tsql.indexes[0].lossy = true;
         let refused = create_view(&ViewDraft::from_table(&t).unwrap(), MsSql).unsupported();
         assert!(refused.iter().any(|r| r.contains("a_nix")), "{refused:?}");
+    }
+
+    /// **An alter made to match another reading names the indexes it drops
+    /// — the server's, not the reading's** (S6.2-L1-05). In a comparison the
+    /// draft is the source's view, and the sentence and the lossy refusal
+    /// read its indexes while `ALTER VIEW` drops the target's: a target's
+    /// `cix` went with an empty risk list, and a lossy one with no refusal.
+    #[test]
+    fn a_view_alter_names_the_indexes_the_server_holds() {
+        let target = ms_indexed_view();
+        let mut source = ms_view();
+        source.view_definition = Some("SELECT id, d FROM dbo.t WHERE id > 0".into());
+        let cs = diff_view(&target, &ViewDraft::from_table(&source).unwrap(), MsSql);
+        let risks = cs.destructive().join(" ");
+        assert!(risks.contains("cix") && risks.contains("a_nix"), "{risks}");
+        assert!(risks.contains("not build"), "{risks}");
+        // The index set alone differing is still an alter, and still said.
+        let risks = diff_view(&target, &ViewDraft::from_table(&ms_view()).unwrap(), MsSql)
+            .destructive()
+            .join(" ");
+        assert!(risks.contains("cix"), "{risks}");
+        // A lossy index the server holds is refused, though the source has none.
+        let mut lossy = ms_indexed_view();
+        lossy.view_options.as_mut().unwrap().tsql.indexes[0].lossy = true;
+        let refused =
+            diff_view(&lossy, &ViewDraft::from_table(&source).unwrap(), MsSql).unsupported();
+        assert!(refused.iter().any(|r| r.contains("a_nix")), "{refused:?}");
+        // The other way round, nothing is dropped and nothing is said.
+        let cs = diff_view(&ms_view(), &ViewDraft::from_table(&target).unwrap(), MsSql);
+        assert!(cs.destructive().is_empty(), "{:?}", cs.destructive());
+        assert!(
+            cs.emit()
+                .iter()
+                .any(|s| s.starts_with("CREATE UNIQUE CLUSTERED INDEX [cix]")),
+            "{:?}",
+            cs.emit()
+        );
     }
 
     /// **A SQL Server table diffs to nothing against its own draft** — the

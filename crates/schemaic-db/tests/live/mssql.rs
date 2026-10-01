@@ -3410,6 +3410,44 @@ async fn a_comparison_creates_a_missing_view_with_its_settings_and_indexes() {
     assert!(left.is_empty(), "{left:?}");
 }
 
+/// **A comparison's view alter names the target's indexes it drops.** The
+/// risk read the source's view's indexes, so a target's `cix` — which
+/// `ALTER VIEW` drops — went with an empty risk list. Synced, the plan names
+/// it, the target's view matches the source's (unindexed), and a second
+/// comparison finds nothing to do.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_comparisons_view_alter_names_the_targets_indexes() {
+    if !enabled() {
+        return;
+    }
+    let target = Scratch::create("cmp_ix_target").await;
+    let source = Scratch::create("cmp_ix_source").await;
+    for s in [&target, &source] {
+        s.exec("CREATE TABLE dbo.t (id int NOT NULL PRIMARY KEY, d int NULL)")
+            .await;
+    }
+    target
+        .exec("CREATE VIEW dbo.vi WITH SCHEMABINDING AS SELECT id, d FROM dbo.t")
+        .await;
+    target
+        .exec("CREATE UNIQUE CLUSTERED INDEX cix ON dbo.vi (id)")
+        .await;
+    source
+        .exec("CREATE VIEW dbo.vi WITH SCHEMABINDING AS SELECT id, d FROM dbo.t WHERE id > 0")
+        .await;
+    let (plan, again) = sync_modules(&target, &source).await;
+    let risks = plan.destructive().join(" ");
+    assert!(risks.contains("cix"), "{risks}");
+    assert_eq!(
+        target
+            .scalar("SELECT COUNT(*) FROM sys.indexes WHERE object_id = OBJECT_ID('dbo.vi') AND index_id > 0")
+            .await,
+        "0"
+    );
+    let left: Vec<String> = again.differences().map(|e| e.key()).collect();
+    assert!(left.is_empty(), "{left:?}");
+}
+
 /// **A module's script restores it at the defaults through a session that
 /// has them off** — `sqlcmd`'s, whose `QUOTED_IDENTIFIER` is OFF unless given
 /// `-I`. The scripts stated a setting only when the module had it OFF, so

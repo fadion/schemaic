@@ -5119,7 +5119,15 @@ existing prose was left alone.
     in-place arm had no risk at all before. An `IndexInfo::lossy` one (included columns, a
     non-rowstore kind) cannot be built again whole, so `lossy_view_index_refusal`, in
     `unsupported()`, refuses the edit rather than bring the index back as less than it was
-    (`an_indexed_sql_server_views_edit_creates_its_indexes_again`). Its only re-create is a rename
+    (`an_indexed_sql_server_views_edit_creates_its_indexes_again`). **What is dropped is the
+    server's, what is built the draft's**: `ReplaceView::server_indexes` carries `diff_view`'s
+    `current` indexes, and the sentence names those, saying which the plan builds again and which
+    it does not; the refusal reads both sets. In the editor they are one reading; in a comparison
+    the draft is the source's view, and reading its indexes alone dropped a target's `cix` with an
+    empty risk list, a lossy one with no refusal
+    (`a_view_alter_names_the_indexes_the_server_holds`,
+    `an_alter_names_the_targets_indexes_it_drops`; live,
+    `a_comparisons_view_alter_names_the_targets_indexes`). Its only re-create is a rename
     (above). **`Change::CreateView` takes the same two steps** — the settings wrapper and
     `view_index_statements` — with the summary naming the indexes and the lossy refusal matching it
     too: the comparison creates a view only the source holds from the source's reading, which

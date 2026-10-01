@@ -5784,4 +5784,27 @@ mod tsql_module_tests {
         assert!(at("CREATE VIEW [dbo].[v]") < at("SET ANSI_NULLS ON;"));
         assert!(at("CREATE VIEW [dbo].[vi]") < at("CREATE UNIQUE CLUSTERED INDEX [cix]"));
     }
+
+    /// **An alter that drops the target's indexes says so** (S6.2-L1-05):
+    /// the risk read the source's indexes, and the target's `cix`, which
+    /// `ALTER VIEW` drops, went with nothing on the consent surface.
+    #[test]
+    fn an_alter_names_the_targets_indexes_it_drops() {
+        let target = tables(vec![ms_view(
+            "vi",
+            "SELECT id, d FROM dbo.t",
+            TsqlView {
+                indexes: vec![index("cix", "id", true)],
+                ..TsqlView::default()
+            },
+        )]);
+        let source = tables(vec![ms_view(
+            "vi",
+            "SELECT id, d FROM dbo.t WHERE id > 0",
+            TsqlView::default(),
+        )]);
+        let plan = SchemaComparison::of(&target, &source, MS).plan(|_| true);
+        let risks = plan.destructive().join(" ");
+        assert!(risks.contains("cix"), "{risks}");
+    }
 }
