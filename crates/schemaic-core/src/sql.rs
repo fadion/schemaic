@@ -2531,6 +2531,8 @@ pub(crate) fn tsql_statements(stmt: &str, dialect: SqlDialect) -> Vec<&str> {
     // `analyzed_statement` reads the prefixes other engines give them.
     let prefixed = matches!(word(0), Some("EXPLAIN" | "ANALYZE"));
     let mut cuts = Vec::new();
+    // The token the current statement begins at.
+    let mut head = 0usize;
     let mut cte = word(0) == Some("WITH");
     if !runs_to_end(0) && !prefixed {
         for (k, tok) in toks.iter().enumerate().skip(1) {
@@ -2551,11 +2553,17 @@ pub(crate) fn tsql_statements(stmt: &str, dialect: SqlDialect) -> Vec<&str> {
                 "MERGE" => next == Some("JOIN"),
                 // `DROP TABLE IF EXISTS t` is one statement.
                 "IF" => prev.is_some() && next == Some("EXISTS"),
-                // An `ALTER TABLE`'s partition clause, and its `DROP COLUMN`,
-                // `DROP CONSTRAINT` and `DROP PERIOD`, none of them a
-                // statement of their own.
                 "TRUNCATE" => next == Some("PARTITION"),
-                "DROP" => matches!(next, Some("PARTITION" | "COLUMN" | "CONSTRAINT" | "PERIOD")),
+                // An `ALTER`'s `DROP` clause — `DROP COLUMN`, `DROP CONSTRAINT`,
+                // `DROP PERIOD`, `ALTER ROLE r DROP MEMBER u`, and, `CONSTRAINT`
+                // being optional, `DROP pk_t` — is none of them a statement of
+                // its own; a `DROP` naming an object class begins one
+                // (`tsql_drop_names_a_class`), `DROP PARTITION SCHEME` among
+                // them, which a partition clause had hidden.
+                "DROP" => {
+                    word(head) == Some("ALTER")
+                        && !tsql_drop_names_a_class(next, word(k + 2), word(k + 3))
+                }
                 "CREATE" | "ALTER" | "DECLARE" | "WHILE" | "PRINT" | "EXEC" | "EXECUTE"
                 | "BEGIN" | "COMMIT" | "ROLLBACK" | "USE" | "RETURN" | "GRANT" | "REVOKE"
                 | "DENY" => false,
@@ -2569,6 +2577,7 @@ pub(crate) fn tsql_statements(stmt: &str, dialect: SqlDialect) -> Vec<&str> {
                 continue;
             }
             cuts.push(*at);
+            head = k;
             if runs_to_end(k) {
                 break;
             }
@@ -2586,6 +2595,78 @@ pub(crate) fn tsql_statements(stmt: &str, dialect: SqlDialect) -> Vec<&str> {
         out.push(stmt);
     }
     out
+}
+
+/// Do the words after a T-SQL `DROP` (upper-cased, `None` for anything but a
+/// word) name the **class of object** a `DROP` statement removes — `DROP
+/// TABLE`, `DROP PARTITION SCHEME`, `DROP COLUMN MASTER KEY` — rather than
+/// what an `ALTER`'s `DROP` clause removes (a column, a constraint named with
+/// or without `CONSTRAINT`, a period, a role's member)?
+///
+/// Every class T-SQL's `DROP` takes as its first word. A constraint named like
+/// one, unquoted (`DROP type`), reads as a statement — the direction that
+/// over-counts a destruction rather than hiding one.
+fn tsql_drop_names_a_class(next: Option<&str>, then: Option<&str>, third: Option<&str>) -> bool {
+    const CLASSES: &[&str] = &[
+        "AGGREGATE",
+        "APPLICATION",
+        "ASSEMBLY",
+        "ASYMMETRIC",
+        "AVAILABILITY",
+        "BROKER",
+        "CERTIFICATE",
+        "CONTRACT",
+        "COUNTER",
+        "CREDENTIAL",
+        "CRYPTOGRAPHIC",
+        "DATABASE",
+        "DEFAULT",
+        "ENDPOINT",
+        "EVENT",
+        "EXTERNAL",
+        "FULLTEXT",
+        "FUNCTION",
+        "INDEX",
+        "LOGIN",
+        "MASTER",
+        "MESSAGE",
+        "PROC",
+        "PROCEDURE",
+        "QUEUE",
+        "REMOTE",
+        "RESOURCE",
+        "ROLE",
+        "ROUTE",
+        "RULE",
+        "SCHEMA",
+        "SEARCH",
+        "SECURITY",
+        "SENSITIVITY",
+        "SEQUENCE",
+        "SERVER",
+        "SERVICE",
+        "SIGNATURE",
+        "STATISTICS",
+        "SYMMETRIC",
+        "SYNONYM",
+        "TABLE",
+        "TRIGGER",
+        "TYPE",
+        "USER",
+        "VIEW",
+        "WORKLOAD",
+        "XML",
+    ];
+    match next {
+        // `DROP COLUMN ENCRYPTION KEY` / `DROP COLUMN MASTER KEY`, where
+        // `DROP COLUMN c` is the clause.
+        Some("COLUMN") => matches!(then, Some("ENCRYPTION" | "MASTER")) && third == Some("KEY"),
+        // `DROP PARTITION SCHEME`/`FUNCTION`, where a partition clause —
+        // MySQL's spelling, which the guards read on every engine — is not.
+        Some("PARTITION") => matches!(then, Some("SCHEME" | "FUNCTION")),
+        Some(w) => CLASSES.contains(&w),
+        None => false,
+    }
 }
 
 /// How a statement failed for want of a database — see [`no_database_failure`].
@@ -8898,6 +8979,47 @@ line */",
             super::tsql_statements("ALTER TABLE t ADD c int\nDROP TABLE u", ms),
             vec!["ALTER TABLE t ADD c int", "DROP TABLE u"]
         );
+    }
+
+    /// **T-SQL's `CONSTRAINT` is optional in `ALTER TABLE … DROP`**, so the
+    /// clause is known by what follows it not being an object class:
+    /// `ALTER TABLE t DROP pk_t` (runs on 2022) was cut at `DROP` into an
+    /// `ALTER TABLE t` and a `DROP pk_t` the panel counted as a destruction of
+    /// its own — while `DROP PARTITION`, taken for a clause, hid a whole
+    /// `DROP PARTITION SCHEME`/`FUNCTION` statement after an unterminated one.
+    #[test]
+    fn a_drop_after_an_alter_is_a_clause_unless_it_names_an_object_class() {
+        let ms = SqlDialect::MsSql;
+        for one in [
+            "ALTER TABLE t DROP pk_t",
+            "ALTER TABLE t DROP pk_t, ck_t, COLUMN c",
+            "ALTER TABLE t DROP [pk_t]",
+            "ALTER TABLE t DROP CONSTRAINT IF EXISTS pk_t",
+            "ALTER ROLE r DROP MEMBER u",
+            "ALTER FULLTEXT INDEX ON t DROP (c)",
+        ] {
+            assert_eq!(super::tsql_statements(one, ms), vec![one]);
+        }
+        for (sql, parts) in [
+            (
+                "SELECT 1\nDROP PARTITION SCHEME ps",
+                vec!["SELECT 1", "DROP PARTITION SCHEME ps"],
+            ),
+            (
+                "ALTER TABLE t DROP pk_t\nDROP PARTITION FUNCTION pf",
+                vec!["ALTER TABLE t DROP pk_t", "DROP PARTITION FUNCTION pf"],
+            ),
+            (
+                "ALTER TABLE t DROP COLUMN c\nDROP INDEX ix ON t",
+                vec!["ALTER TABLE t DROP COLUMN c", "DROP INDEX ix ON t"],
+            ),
+            (
+                "UPDATE t SET a = 1 DROP pk_t",
+                vec!["UPDATE t SET a = 1", "DROP pk_t"],
+            ),
+        ] {
+            assert_eq!(super::tsql_statements(sql, ms), parts, "{sql}");
+        }
     }
 
     /// **Past the row cap a reader reads on unless the rest is surely rows.**

@@ -758,7 +758,13 @@ existing prose was left alone.
     What it must not do is cut where the word continues the statement before it — a set operator's
     second `SELECT`, `MERGE`'s `THEN UPDATE`/`DELETE`/`INSERT`, a cursor's `FOR UPDATE`, a foreign
     key's `ON DELETE CASCADE`, `INNER MERGE JOIN`, `DROP … IF EXISTS`, an `ALTER TABLE`'s
-    `TRUNCATE`/`DROP PARTITION` and `DROP COLUMN`/`CONSTRAINT`/`PERIOD` — or anywhere after the head of a procedure, function, trigger or
+    `TRUNCATE PARTITION` and an `ALTER`'s `DROP` clause. That last is known by what follows it
+    *not* being a class of object (`tsql_drop_names_a_class`), inside a statement headed `ALTER`,
+    because T-SQL's `CONSTRAINT` is optional: `ALTER TABLE t DROP pk_t` runs (measured on 2022) and
+    was cut into a `DROP pk_t` the panel counted as a destruction, and `ALTER ROLE r DROP MEMBER u`
+    with it; while `DROP PARTITION`, once listed as a clause, hid a whole `DROP PARTITION
+    SCHEME`/`FUNCTION` after an unterminated statement
+    (`a_drop_after_an_alter_is_a_clause_unless_it_names_an_object_class`) — or anywhere after the head of a procedure, function, trigger or
     view, which is one statement whatever it holds, or of a `GRANT`/`REVOKE`/`DENY`, whose privilege
     list is made of those words. A leading `WITH` keeps the statement its CTEs feed, and text headed
     `EXPLAIN`/`ANALYZE` — no T-SQL, but the prefixes `analyzed_statement` strips — stays whole. Every
