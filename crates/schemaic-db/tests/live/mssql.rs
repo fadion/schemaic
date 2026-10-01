@@ -6925,6 +6925,12 @@ async fn a_masked_or_sparse_column_is_not_altered_in_place() {
 /// refused naming what it would have re-created, and the column keeps its
 /// type. (A disabled, untrusted key is re-added as it was, so it is not
 /// refused — [`a_retype_under_a_disabled_or_untrusted_key_keeps_its_state`].)
+///
+/// **Every arm of the guard, run** (S2-L6-01): a check's `NOT FOR
+/// REPLICATION` and description, a key's description, a unique constraint's
+/// description and a partition scheme are here as well as the index shapes,
+/// since a catalogue predicate that looks right and misses fails open with
+/// every SQL-text needle still green — the shape S3.2-L5-03 was.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_retype_is_refused_where_a_dependent_carries_what_it_would_drop() {
     use schemaic_core::ddl::TableDraft;
@@ -6932,7 +6938,7 @@ async fn a_retype_is_refused_where_a_dependent_carries_what_it_would_drop() {
         return;
     }
     let s = Scratch::create("recreate_guard").await;
-    let cases: [(&str, &str, &str); 8] = [
+    let cases: [(&str, &str, &str); 13] = [
         (
             "t_dup",
             "CREATE UNIQUE INDEX ux ON dbo.t_dup (a) WITH (IGNORE_DUP_KEY = ON)",
@@ -6970,6 +6976,42 @@ async fn a_retype_is_refused_where_a_dependent_carries_what_it_would_drop() {
             "ALTER TABLE dbo.t_fk ADD CONSTRAINT fk_b FOREIGN KEY (b) \
              REFERENCES dbo.t_fk (a) NOT FOR REPLICATION",
             "foreign key fk_b",
+        ),
+        (
+            "t_fkdoc",
+            "ALTER TABLE dbo.t_fkdoc ADD CONSTRAINT fk_doc FOREIGN KEY (b) \
+             REFERENCES dbo.t_fkdoc (a); \
+             EXEC sp_addextendedproperty N'MS_Description', N'up', N'SCHEMA', N'dbo', \
+             N'TABLE', N't_fkdoc', N'CONSTRAINT', N'fk_doc'",
+            "foreign key fk_doc",
+        ),
+        (
+            "t_cknfr",
+            "ALTER TABLE dbo.t_cknfr ADD CONSTRAINT ck_nfr CHECK NOT FOR REPLICATION (b > 0)",
+            "check ck_nfr",
+        ),
+        (
+            "t_ckdoc",
+            "ALTER TABLE dbo.t_ckdoc ADD CONSTRAINT ck_doc CHECK (b > 0); \
+             EXEC sp_addextendedproperty N'MS_Description', N'positive', N'SCHEMA', N'dbo', \
+             N'TABLE', N't_ckdoc', N'CONSTRAINT', N'ck_doc'",
+            "check ck_doc",
+        ),
+        (
+            // A description on the unique *constraint*, which is class 1 on
+            // the constraint's id rather than class 7 on the index's.
+            "t_uqdoc",
+            "ALTER TABLE dbo.t_uqdoc ADD CONSTRAINT uq_doc UNIQUE (b); \
+             EXEC sp_addextendedproperty N'MS_Description', N'one each', N'SCHEMA', N'dbo', \
+             N'TABLE', N't_uqdoc', N'CONSTRAINT', N'uq_doc'",
+            "index uq_doc",
+        ),
+        (
+            "t_part",
+            "CREATE PARTITION FUNCTION pf_t_part (int) AS RANGE LEFT FOR VALUES (10); \
+             CREATE PARTITION SCHEME ps_t_part AS PARTITION pf_t_part ALL TO ([PRIMARY]); \
+             CREATE INDEX ix ON dbo.t_part (a) ON ps_t_part (a)",
+            "index ix",
         ),
         (
             "t_pk",
