@@ -918,6 +918,15 @@ existing prose was left alone.
     join's first items as a `FROM` list, leaving its `JOIN`s to the caller's walk. A
     `((SELECT …) UNION (…))` is asked again at its inner `(` and still ends a derived table; MySQL's
     `USE INDEX FOR JOIN (i)` opens no list (`a_parenthesised_join_registers_its_tables`).
+    **The walk over those lists is one too**, `walk_table_lists`, and `alias_checks` is its second
+    user and the reader's third: its implicit-alias half (`FROM orders or`) walked `FROM`/`JOIN` on
+    its own and had drifted the way `lexer_scope` had — it stopped at a derived table's or rowset
+    call's `(`, at a join's `ON` and at a quoted reserved table name, so a reserved alias after any
+    of them went unreported (`a_reserved_alias_is_flagged_wherever_the_from_list_goes`). It passes
+    `targets` false, keeping the check off `INSERT INTO`/`UPDATE`, whose `VALUES`/`SET`/`SELECT`
+    would false-trigger, and reads `ListItem::reserved_alias` (`reserved_in_alias_slot`), which the
+    reader fills only for a slot `read_alias` left alone — an `AS <reserved>` is the explicit
+    scan's, which still runs over every token.
     **`INTO` names a table only after `INSERT`/`REPLACE`** (`insert_precedes`), because the word has
     three other meanings and none of them does: PostgreSQL's legacy `SELECT a INTO newtbl FROM t`
     names the table it is about to *create*, and MySQL's `SELECT a INTO @x` and
@@ -937,8 +946,9 @@ existing prose was left alone.
     `SELECT * FROM orders LEFT JOIN customers ON |` registered `orders` under the alias `LEFT`,
     `ref_qualifier` preferred the alias, and both FK auto-join surfaces inserted
     `"LEFT".customer_id = customers.id` — `no such column: LEFT.customer_id`. A bare `JOIN` was
-    unaffected, which is why it read as working. `alias_checks` had the right order all along and is
-    the third caller; spelling it three times is what let two of them drift. A **quoted** word is
+    unaffected, which is why it read as working. `alias_checks` had the right order all along and was
+    the third caller; spelling it three times is what let two of them drift, and `read_alias` is now
+    the only one — `alias_checks` reaches the slot through the shared walk. A **quoted** word is
     always an alias, so the caller checks `Tk::quoted` before asking.
     **`is_table_ref_continuation` grew a `RETURNING` arm for the same reason**, one keyword further
     on: it ends the table reference of a data-modifying statement, and without it the alias check

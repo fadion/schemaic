@@ -5078,7 +5078,6 @@ fn table_refs_with_pos(
 /// can judge it.
 fn located_table_refs(sql: &str, lo: usize, hi: usize, dialect: SqlDialect) -> Vec<LocatedRef> {
     let toks = tokenize_range(sql, lo, hi, dialect);
-    let calls = enclosing_calls(&toks);
     let mut out = Vec::new();
     let mut emit = |item: ListItem| {
         let ListItem {
@@ -5110,6 +5109,27 @@ fn located_table_refs(sql: &str, lo: usize, hi: usize, dialect: SqlDialect) -> V
             database,
         });
     };
+    walk_table_lists(&toks, dialect, true, &mut emit);
+    out
+}
+
+/// Every table list in `toks`, each item to `emit` in order — the walk
+/// [`located_table_refs`] and [`alias_checks`] share, so where a list begins,
+/// what it skips and where it resumes is decided once. `FROM` and `JOIN`
+/// lists always; with `targets`, also the table a write names after `INSERT
+/// INTO` or `UPDATE`.
+///
+/// **`alias_checks` had a walk of its own**, and it had drifted the way
+/// [`lexer_scope`]'s once had: it stopped at a derived table's or a rowset
+/// call's `(`, at a join's `ON` and at a quoted reserved name, so a reserved
+/// word used as an alias after any of them went unreported.
+fn walk_table_lists(
+    toks: &[Token],
+    dialect: SqlDialect,
+    targets: bool,
+    emit: &mut dyn FnMut(ListItem),
+) {
+    let calls = enclosing_calls(toks);
     // Where a `FROM` list resumes past a parenthesised item whose inside the
     // scan reads first — see `ListStop::resume`. Innermost last.
     let mut resume: Vec<usize> = Vec::new();
@@ -5120,7 +5140,7 @@ fn located_table_refs(sql: &str, lo: usize, hi: usize, dialect: SqlDialect) -> V
         }
         if resume.last() == Some(&i) {
             resume.pop();
-            let stop = read_table_list_after_paren(&toks, i, dialect, &mut emit);
+            let stop = read_table_list_after_paren(toks, i, dialect, emit);
             resume.extend(stop.resume);
             i = stop.at;
             continue;
@@ -5131,7 +5151,12 @@ fn located_table_refs(sql: &str, lo: usize, hi: usize, dialect: SqlDialect) -> V
         };
         let up = w.to_ascii_uppercase();
         let is_from = up == "FROM";
-        if !matches!(up.as_str(), "FROM" | "JOIN" | "INTO" | "UPDATE") {
+        let lists = match up.as_str() {
+            "FROM" | "JOIN" => true,
+            "INTO" | "UPDATE" => targets,
+            _ => false,
+        };
+        if !lists {
             i += 1;
             continue;
         }
@@ -5139,12 +5164,12 @@ fn located_table_refs(sql: &str, lo: usize, hi: usize, dialect: SqlDialect) -> V
         // arguments — see `from_separates_call_arguments`. A subquery's `FROM`
         // is still a table list, which is why this asks the *call's name* and
         // not the paren depth.
-        if is_from && from_separates_call_arguments(&toks, &calls, i) {
+        if is_from && from_separates_call_arguments(toks, &calls, i) {
             i += 1;
             continue;
         }
         // A cursor loop's `FETCH NEXT FROM c` names a cursor.
-        if is_from && fetch_precedes(&toks, i, dialect) {
+        if is_from && fetch_precedes(toks, i, dialect) {
             i += 1;
             continue;
         }
@@ -5160,15 +5185,14 @@ fn located_table_refs(sql: &str, lo: usize, hi: usize, dialect: SqlDialect) -> V
         // Asked of the previous word rather than the statement's leading
         // keyword, so `INSERT IGNORE INTO t` and PostgreSQL's
         // `WITH … INSERT INTO t` both still register their table.
-        if up == "INTO" && !insert_precedes(&toks, i) {
+        if up == "INTO" && !insert_precedes(toks, i) {
             i += 1;
             continue;
         }
-        let stop = read_table_list(&toks, i + 1, &up, dialect, &mut emit);
+        let stop = read_table_list(toks, i + 1, &up, dialect, emit);
         i = stop.at;
         resume.extend(stop.resume);
     }
-    out
 }
 
 /// One item of a table list, as [`read_table_list`] reads it.
@@ -5184,6 +5208,10 @@ struct ListItem {
     /// The name ended in a `.` with nothing after it: a qualifier still being
     /// typed (`FROM company.dbo.`).
     dangling: bool,
+    /// A reserved word standing unquoted where the item's alias goes, with no
+    /// `AS` — `FROM orders or` — and where it starts: a syntax error unless
+    /// quoted, which [`alias_checks`] reports ([`reserved_in_alias_slot`]).
+    reserved_alias: Option<(usize, String)>,
 }
 
 /// Where [`read_table_list`] stopped.
@@ -5312,6 +5340,7 @@ fn read_table_list_items(
                 alias: None,
                 call: false,
                 dangling: true,
+                reserved_alias: None,
             });
             let stop = ListStop {
                 at: i + 1,
@@ -5328,6 +5357,7 @@ fn read_table_list_items(
                 alias: None,
                 call: true,
                 dangling: false,
+                reserved_alias: None,
             });
             let stop = ListStop {
                 at: i,
@@ -5335,7 +5365,14 @@ fn read_table_list_items(
             };
             return (stop, true);
         }
+        let slot = i;
         let alias = read_alias(toks, &mut i, dialect);
+        // Only a slot `read_alias` left alone: an `AS` it consumed, with the
+        // reserved word after it, is the explicit form `alias_checks` scans
+        // for itself.
+        let reserved_alias = (i == slot)
+            .then(|| reserved_in_alias_slot(toks, i, dialect))
+            .flatten();
         if let Some(end) = table_hint_end(toks, i, dialect) {
             i = end;
         }
@@ -5344,6 +5381,7 @@ fn read_table_list_items(
             alias,
             call: false,
             dangling: false,
+            reserved_alias,
         });
         read_an_item = true;
         if is_from && matches!(at(i), Some(TkKind::Comma)) {
@@ -5525,6 +5563,29 @@ fn read_alias(toks: &[Token], i: &mut usize, dialect: SqlDialect) -> Option<Stri
         }
         _ => None,
     }
+}
+
+/// The reserved word at `toks[i]`, in an item's alias slot that
+/// [`read_alias`] did not take, and where it starts — `FROM orders or`, which
+/// is a syntax error unless quoted. Not one that ends the reference
+/// ([`ends_table_ref`]: `WHERE`, `JOIN`, the next statement's head), nor the
+/// next statement's first word after a `;`, nor a query hint's `OPTION (…)`.
+fn reserved_in_alias_slot(
+    toks: &[Token],
+    i: usize,
+    dialect: SqlDialect,
+) -> Option<(usize, String)> {
+    let t = toks.get(i)?;
+    let TkKind::Word(a) = &t.kind else {
+        return None;
+    };
+    if t.quoted || t.after_semicolon || ends_table_ref(a, dialect) || !is_reserved_word(a, dialect)
+    {
+        return None;
+    }
+    let hint = a.eq_ignore_ascii_case("OPTION")
+        && matches!(toks.get(i + 1).map(|t| &t.kind), Some(TkKind::LParen));
+    (!hint).then(|| (t.at, a.clone()))
 }
 
 /// The table hints `dialect` takes after a table name, upper-cased: `Some`
@@ -8469,8 +8530,9 @@ fn ends_table_ref(word: &str, dialect: SqlDialect) -> bool {
 /// `no such column: LEFT.customer_id`. A bare `JOIN` was unaffected, which is
 /// why it read as working.
 ///
-/// `alias_checks` had the right order all along and is the third caller;
-/// spelling it three times is what let two of the three drift.
+/// `alias_checks` had the right order all along and was the third caller;
+/// spelling it three times is what let two of the three drift. It reaches the
+/// slot through [`walk_table_lists`] now, and [`read_alias`] is the one caller.
 ///
 /// A **quoted** word is always an alias — `FROM orders "LEFT" JOIN …` really
 /// does name it — so the caller checks `Tk::quoted` before asking.
@@ -9124,80 +9186,17 @@ fn alias_checks(sql: &str, lo: usize, hi: usize, dialect: SqlDialect, out: &mut 
             flag(out, w[1].at, b);
         }
     }
-    // Implicit `<table> <reserved>` in a FROM / JOIN ref position. Restricted to
-    // FROM/JOIN (where implicit aliases are idiomatic — not INSERT INTO / UPDATE,
-    // whose VALUES/SET/SELECT would false-trigger) and to keywords that aren't a
-    // legitimate table-ref continuation, so `WHERE`/`ORDER`/`ON`/`JOIN`/… are safe.
-    let word = |k: &TkKind| -> Option<String> {
-        if let TkKind::Word(w) = k {
-            Some(w.clone())
-        } else {
-            None
+    // Implicit `<table> <reserved>` in a FROM / JOIN ref position, read by the
+    // one table-list walk (`walk_table_lists`). Restricted to FROM/JOIN (where
+    // implicit aliases are idiomatic — not INSERT INTO / UPDATE, whose
+    // VALUES/SET/SELECT would false-trigger) and to keywords that aren't a
+    // legitimate table-ref continuation (`reserved_in_alias_slot`), so
+    // `WHERE`/`ORDER`/`ON`/`JOIN`/… are safe.
+    walk_table_lists(&toks, dialect, false, &mut |item| {
+        if let Some((at, kw)) = item.reserved_alias {
+            flag(out, at, &kw);
         }
-    };
-    let mut i = 0;
-    while i < toks.len() {
-        let Some(kw) = word(&toks[i].kind) else {
-            i += 1;
-            continue;
-        };
-        if !matches!(kw.to_ascii_uppercase().as_str(), "FROM" | "JOIN") {
-            i += 1;
-            continue;
-        }
-        let is_from = kw.eq_ignore_ascii_case("FROM");
-        // A cursor's name is not a table's — see `fetch_precedes`.
-        if is_from && fetch_precedes(&toks, i, dialect) {
-            i += 1;
-            continue;
-        }
-        i += 1;
-        while let Some(name) = toks.get(i).and_then(|t| word(&t.kind)) {
-            if is_reserved_word(&name, dialect) {
-                break; // a clause keyword, not a table name (`FROM WHERE …` etc.)
-            }
-            // The whole dotted name: `db.table`, `db.schema.table`, `db..table`.
-            i = dotted_name(&toks, i).map_or(i + 1, |(_, next)| next);
-            // A `;` after the name ended the statement: what follows is the
-            // next one's first word, not an alias.
-            if toks.get(i).is_some_and(|t| t.after_semicolon) {
-                break;
-            }
-            // The alias slot right after the table name.
-            match toks.get(i).map(|t| &t.kind) {
-                Some(TkKind::Word(a)) if a.eq_ignore_ascii_case("AS") => {
-                    // Handled by the `AS` scan above; consume `AS` + the next token.
-                    i += toks.get(i + 1).map_or(1, |_| 2);
-                }
-                // A quoted alias is always legal, reserved word or not — and a
-                // quoted name is never a clause keyword ending the ref.
-                Some(TkKind::Word(_)) if toks[i].quoted => i += 1,
-                // A clause/join keyword ends this ref — not an alias (check before
-                // `is_reserved_word`, since these are reserved too) — and so,
-                // where no `;` is needed, does the next statement's first word.
-                Some(TkKind::Word(a)) if ends_table_ref(a, dialect) => break,
-                // A query hint, `FROM t OPTION (RECOMPILE)`.
-                Some(TkKind::Word(a))
-                    if a.eq_ignore_ascii_case("OPTION")
-                        && matches!(toks.get(i + 1).map(|t| &t.kind), Some(TkKind::LParen)) =>
-                {
-                    break;
-                }
-                Some(TkKind::Word(a)) if is_reserved_word(a, dialect) => {
-                    flag(out, toks[i].at, a);
-                    break;
-                }
-                Some(TkKind::Word(_)) => i += 1, // a valid alias (identifier or non-reserved word)
-                _ => {}
-            }
-            // A comma continues the FROM list with another table reference.
-            if is_from && matches!(toks.get(i).map(|t| &t.kind), Some(TkKind::Comma)) {
-                i += 1;
-                continue;
-            }
-            break;
-        }
-    }
+    });
 }
 
 /// The tables a statement can read that **no catalogue holds**, by name —
@@ -15152,6 +15151,51 @@ mod tests {
         // explicit `AS or` (this was the reported gap).
         let sql = "SELECT * FROM employees or";
         assert!(has_reserved_alias(&diag(sql), sql, "or"));
+    }
+
+    /// **The implicit-alias check reads every list the table check reads.**
+    /// It walked `FROM` lists on its own, and stopped where that walk once did
+    /// — at a derived table's or a rowset call's `(`, at a join's `ON`, at a
+    /// quoted reserved table name — so `or` as an alias after any of them
+    /// drew nothing.
+    #[test]
+    fn a_reserved_alias_is_flagged_wherever_the_from_list_goes() {
+        for (sql, dialect) in [
+            (
+                "SELECT * FROM (SELECT 1 AS a) s, employees or",
+                SqlDialect::MySql,
+            ),
+            (
+                "SELECT * FROM generate_series(1, 3) g, employees or",
+                SqlDialect::Postgres,
+            ),
+            (
+                "SELECT * FROM employees e JOIN departments d ON d.id = e.dept_id, employees or",
+                SqlDialect::MySql,
+            ),
+            ("SELECT * FROM `order` or", SqlDialect::MySql),
+            (
+                "SELECT * FROM (employees or JOIN departments d ON d.id = 1)",
+                SqlDialect::MySql,
+            ),
+        ] {
+            assert!(
+                has_reserved_alias(&diag_d(sql, dialect), sql, "or"),
+                "{sql}: {:?}",
+                diag_d(sql, dialect)
+            );
+        }
+        // What ends a reference still ends it.
+        for sql in [
+            "SELECT * FROM employees e JOIN departments d ON d.id = e.dept_id, employees x WHERE 1 = 1",
+            "SELECT * FROM (SELECT 1 AS a) s, employees x ORDER BY 1",
+        ] {
+            let d = diag_d(sql, SqlDialect::MySql);
+            assert!(
+                !d.iter().any(|x| x.message.contains("reserved keyword")),
+                "{sql}: {d:?}"
+            );
+        }
     }
 
     #[test]
