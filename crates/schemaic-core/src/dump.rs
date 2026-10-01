@@ -434,10 +434,17 @@ pub fn render_rows<W: std::io::Write>(
 /// compatibility level, unlike `OPENJSON`, so the document is unpacked by the
 /// renderer rather than the server.
 ///
+/// **A column typed by an alias is judged by the alias's base**, looked up in
+/// `aliases` (`DbSchema::tsql_objects`): its `type_name` is the alias's own
+/// qualified name, `[dbo].[Hash]`, so an alias over `binary` was written as a
+/// withheld blob's `NULL` — which a `NOT NULL` alias refuses on restore
+/// (Msg 515) — and one over `sql_variant` came back an `nvarchar` variant.
+///
 /// Every other engine reads its columns as they are: a blob there stays
 /// withheld and noted, as the export's own rule has it.
 pub fn literal_select(
     c: &crate::schema::ColumnInfo,
+    aliases: &[crate::schema::TsqlObject],
     dialect: SqlDialect,
 ) -> Option<(String, crate::export::ServerLiteral)> {
     match dialect {
@@ -445,8 +452,22 @@ pub fn literal_select(
         SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => return None,
     }
     let col = ident_sql(&c.name, dialect);
-    let head = c
-        .type_name
+    let type_name = aliases
+        .iter()
+        .find_map(|o| match (&o.kind, o.schema.as_deref()) {
+            (crate::schema::TsqlObjectKind::AliasType { base, .. }, Some(schema))
+                if format!(
+                    "{}.{}",
+                    ident_sql(schema, dialect),
+                    ident_sql(&o.name, dialect)
+                ) == c.type_name =>
+            {
+                Some(base.as_str())
+            }
+            _ => None,
+        })
+        .unwrap_or(&c.type_name);
+    let head = type_name
         .split(|ch: char| ch == '(' || ch.is_whitespace())
         .next()
         .unwrap_or_default()
@@ -2423,7 +2444,7 @@ pub fn plan(
                 .iter()
                 .filter_map(|&name| {
                     let c = t.columns.iter().find(|c| c.name == name)?;
-                    Some((name, literal_select(c, dialect)?))
+                    Some((name, literal_select(c, &schema.tsql_objects, dialect)?))
                 })
                 .collect();
             steps.push(DumpStep::Rows {
@@ -4690,6 +4711,69 @@ mod tests {
             SqlDialect::MySql,
         );
         assert_eq!(select_of(&p, "t"), "SELECT `id`, `b` FROM `shop`.`t`");
+    }
+
+    /// **A column typed by an alias is read as its base type.** Its
+    /// `type_name` is the alias's own name, `[dbo].[Hash]`, so an alias over
+    /// `binary` went into the file as the `NULL` a withheld blob is — which a
+    /// `NOT NULL` alias refused on restore (Msg 515) — and one over
+    /// `sql_variant` came back an `nvarchar` variant.
+    #[test]
+    fn a_column_of_an_alias_type_is_read_as_its_base() {
+        use crate::export::ServerLiteral::{Hex, Variant};
+        use crate::schema::{TsqlObject, TsqlObjectKind};
+        let mut t = table("t");
+        t.schema = Some("dbo".to_string());
+        for (name, ty) in [
+            ("h", "[dbo].[Hash]"),
+            ("v", "[dbo].[Var]"),
+            ("p", "[dbo].[Phone]"),
+            ("o", "[other].[Hash]"),
+        ] {
+            t.columns.push(ColumnInfo {
+                name: name.to_string(),
+                type_name: ty.to_string(),
+                ..Default::default()
+            });
+        }
+        let mut s = schema_of(vec![t]);
+        let alias = |schema: &str, name: &str, base: &str| TsqlObject {
+            schema: Some(schema.to_string()),
+            name: name.to_string(),
+            kind: TsqlObjectKind::AliasType {
+                base: base.to_string(),
+                nullable: false,
+            },
+        };
+        s.tsql_objects = vec![
+            alias("dbo", "Hash", "binary(4)"),
+            alias("dbo", "Var", "sql_variant"),
+            alias("dbo", "Phone", "nvarchar(20)"),
+            alias("other", "Hash", "varbinary(max)"),
+        ];
+        let p = plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::MsSql,
+        );
+        let server = p
+            .steps
+            .iter()
+            .find_map(|s| match s {
+                DumpStep::Rows { server, .. } => Some(server.clone()),
+                _ => None,
+            })
+            .expect("a rows step");
+        assert_eq!(
+            server,
+            vec![
+                ("h".to_string(), Hex),
+                ("v".to_string(), Variant),
+                ("o".to_string(), Hex),
+            ]
+        );
     }
 
     /// **The server's text is checked before it is written as SQL.** Bytes

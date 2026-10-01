@@ -1197,6 +1197,47 @@ async fn a_dump_restores_character_variants_byte_for_byte() {
     assert_eq!(got, want, "\n{file}");
 }
 
+/// **A column typed by an alias over bytes or a variant restores as its
+/// base would.** The alias's name was all the dump saw, so a `NOT NULL`
+/// alias over `binary` was written `NULL` and the restore stopped (Msg 515),
+/// and a variant through an alias came back an `nvarchar` one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dump_restores_alias_typed_bytes_and_variants() {
+    use schemaic_core::dump::DumpOptions;
+    if !enabled() || azure_cannot("restores into a second database, which it has not got") {
+        return;
+    }
+    let src = Scratch::create("aliassrc").await;
+    src.exec(
+        "CREATE TYPE dbo.Hash FROM binary(4) NOT NULL; \
+         CREATE TYPE dbo.Blob FROM varbinary(max) NULL; \
+         CREATE TYPE dbo.Var FROM sql_variant NULL;",
+    )
+    .await;
+    src.exec(
+        "CREATE TABLE dbo.aliased (id int PRIMARY KEY, h dbo.Hash, b dbo.Blob, v dbo.Var); \
+         INSERT dbo.aliased VALUES (1, 0xDEADBEEF, 0x0102, CAST('2026-01-02' AS date)); \
+         INSERT dbo.aliased VALUES (2, 0x00000000, NULL, CAST(N'Ωμέγα' COLLATE Greek_CI_AS AS varchar(10)));",
+    )
+    .await;
+    let facts = "SELECT STRING_AGG(CAST(CONCAT(id, '|', CONVERT(varchar(20), h, 1), '|', \
+           CONVERT(varchar(20), b, 1), '|', \
+           CAST(SQL_VARIANT_PROPERTY(v, 'BaseType') AS sysname), '|', \
+           CAST(SQL_VARIANT_PROPERTY(v, 'Collation') AS sysname), '|', \
+           CONVERT(varchar(40), CAST(v AS varbinary(40)), 1)) AS nvarchar(max)), NCHAR(10)) \
+           WITHIN GROUP (ORDER BY id) FROM dbo.aliased";
+    let want = src.scalar(facts).await;
+    assert!(want.contains("1|0xDEADBEEF|0x0102|date|"), "{want}");
+    let file = Box::pin(dump_file(&src, DumpOptions::default())).await;
+    let dst = Scratch::create("aliasdst").await;
+    let end = Box::pin(restore_file(&dst, &file)).await;
+    assert!(
+        matches!(end, schemaic_core::script::ExecEnd::Done),
+        "{end:?}\n{file}"
+    );
+    assert_eq!(dst.scalar(facts).await, want, "\n{file}");
+}
+
 /// **A replay stops before it drops anything where a graph table is there.**
 /// The file cannot put one back as it is — an edge's rows are not in it, and
 /// a node's would come back under new node ids — and it dropped them: replayed

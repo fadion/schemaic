@@ -3272,7 +3272,11 @@ existing prose was left alone.
     with length, precision, scale and collation beside its value in an exact, language-proof text
     form (a variant's own text of a date is style 0, `Jan  2 2026  3:04AM`, which drops the
     seconds) — and names it in `DumpStep::Rows::server` with its `export::ServerLiteral` form. **A
-    character variant's value is the server's `FOR JSON` of it** (`{"x":"…"}`): `CAST(v AS
+    column typed by an alias is judged by the alias's base**, found in `DbSchema::tsql_objects`:
+    its `type_name` is the alias's qualified name (`[dbo].[Hash]`), so a `NOT NULL` alias over
+    `binary` was written as a withheld blob's `NULL` and stopped the restore (Msg 515), and a variant
+    through one came back `nvarchar` (`a_column_of_an_alias_type_is_read_as_its_base`, live
+    `a_dump_restores_alias_typed_bytes_and_variants`). **A character variant's value is the server's `FOR JSON` of it** (`{"x":"…"}`): `CAST(v AS
     nvarchar(max))` stops at 4,000 characters, the `max` not honoured from a variant, while a
     `varchar` one holds 8,000, so a 5,000-character value restored cut with `Done`; `CAST(v AS
     varchar(8000))` keeps the length but converts to the *database's* code page; `FOR XML` refuses a
