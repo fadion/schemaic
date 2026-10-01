@@ -1386,6 +1386,11 @@ mod tests {
             "CREATE DATABASE SCOPED CREDENTIAL c WITH IDENTITY = 'x', SECRET = 'hunter2'",
             "CREATE MASTER KEY ENCRYPTION BY PASSWORD = 'hunter2'",
             "EXEC sp_addlogin 'n', 'hunter2'",
+            // A batch kept whole from its `DECLARE` on: the password statement
+            // heads no range of its own.
+            "DECLARE @n int = 1; CREATE USER app WITH PASSWORD = 'hunter2';",
+            "SELECT * FROM OPENROWSET('MSOLEDBSQL', 'Server=h;UID=sa;PWD=hunter2;', 'SELECT 1')",
+            "EXEC sp_change_users_login 'Auto_Fix', 'appuser', NULL, 'hunter2'",
         ] {
             let mut v = Vec::new();
             let recorded = super::push(&mut v, entry(1, sql, 100), SqlDialect::MsSql);

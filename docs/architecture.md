@@ -6824,11 +6824,21 @@ existing prose was left alone.
     (`sql::carries_credential`, asked inside `push` so no caller can skip it): `IDENTIFIED`,
     `SET PASSWORD`, a `USER`/`ROLE` statement with `PASSWORD`, and T-SQL's own shapes — `CREATE`/
     `ALTER LOGIN … PASSWORD`, `BY PASSWORD` (a master key, certificate or symmetric key), a
-    `CREDENTIAL … SECRET`, and the routines that take a password as a bare argument
-    (`sql::SECRET_CALLS`: `sp_addlogin`, `sp_password`, `ENCRYPTBYPASSPHRASE`…). SQL Server
+    `CREDENTIAL … SECRET`, a `PASSWORD` or `…_PASSWORD` word under a `CHANGE`/`START`/`EXEC`
+    head (MySQL's `SOURCE_PASSWORD`, `START REPLICA … PASSWORD`, a procedure's `@password` /
+    `@subscriber_password`), and the routines that take a password as an argument
+    (`sql::SECRET_CALLS`: `sp_addlogin`, `sp_password`, `sp_change_users_login`, the replication
+    agents, `ENCRYPTBYPASSPHRASE`, and those whose argument is a connection string —
+    `OPENROWSET` but for `OPENROWSET(BULK …)`, `OPENDATASOURCE`, `sp_addlinkedserver`'s
+    `@provstr`, PostgreSQL's `dblink`/`dblink_connect`/`dblink_exec` — where the password sits
+    inside a literal the tokens never read). SQL Server
     arrived without the T-SQL words, so a typed `ALTER LOGIN … WITH PASSWORD` went to
     `history.json` and its `.bak` in the clear; the rule is deliberately not per dialect, since
-    none of the words means anything else as a statement's shape.
+    none of the words means anything else as a statement's shape. **It judges each T-SQL
+    statement where it begins** (`tsql_statements` over each range), not the range's head:
+    `scan_bounds` keeps a batch whole from a `DECLARE` on and never cuts inside `BEGIN … END`,
+    so `DECLARE …; CREATE USER … PASSWORD` and the provisioning script's `IF NOT EXISTS (…)
+    BEGIN CREATE LOGIN … END` headed no range with the password statement, and were recorded.
     An entry is written in **two passes** — `push` when the run
     launches, `finish` when it lands (duration, rows, `Outcome`) — because the two moments
     answer different questions: an entry has to exist while the query is still running (one the

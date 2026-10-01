@@ -4654,7 +4654,9 @@ pub fn limited_select(dialect: SqlDialect, projection: &str, rest: &str, limit: 
 /// trusts that has no reason to expect the same directory to hold the password
 /// they typed into a `CREATE USER`.
 ///
-/// Per statement, on whole tokens outside strings / quoted identifiers / comments
+/// Per statement — on SQL Server each statement [`tsql_statements`] finds in a
+/// range, since a range runs whole from a `DECLARE` and through a `BEGIN …
+/// END` — on whole tokens outside strings / quoted identifiers / comments
 /// (so `SELECT password FROM users` is *not* a credential statement — it names a
 /// column):
 ///
@@ -4669,9 +4671,15 @@ pub fn limited_select(dialect: SqlDialect, projection: &str, rest: &str, limit: 
 ///   symmetric key's;
 /// - a `CREATE`/`ALTER` naming a `CREDENTIAL` *and* a `SECRET` — T-SQL's
 ///   `CREATE DATABASE SCOPED CREDENTIAL … SECRET = '…'`;
+/// - a `CHANGE`/`START`/`EXEC`/`EXECUTE` holding `PASSWORD` or a word ending
+///   `_PASSWORD` — MySQL's `CHANGE REPLICATION SOURCE TO SOURCE_PASSWORD = …`
+///   and `START REPLICA … PASSWORD = …`, a T-SQL procedure's `@password` or
+///   `@subscriber_password`;
 /// - a call to one of [`SECRET_CALLS`], the system procedures and functions
-///   that take a password as a bare argument (`EXEC sp_addlogin 'n', 'pw'`),
-///   with no `PASSWORD` word for the rules above to find.
+///   that take a password as an argument (`EXEC sp_addlogin 'n', 'pw'`), or a
+///   connection string holding one (`OPENROWSET('…', 'Server=h;PWD=…', …)`,
+///   `dblink('… password=…', …)`), with no `PASSWORD` word for the rules above
+///   to find.
 ///
 /// Not per dialect: none of these words means anything else as a statement's
 /// shape on any engine, and a rule asked of one engine only is the one a new
@@ -4681,56 +4689,102 @@ pub fn limited_select(dialect: SqlDialect, projection: &str, rest: &str, limit: 
 /// Where it is imprecise it is imprecise toward omitting: a dropped history entry
 /// costs the user a scroll, a kept one writes their secret to disk.
 pub fn carries_credential(sql: &str, dialect: SqlDialect) -> bool {
-    for (lo, hi) in statement_ranges(sql, dialect) {
-        let (words, _) = word_tokens(&sql[lo..hi], dialect);
-        if words.iter().any(|w| w == "IDENTIFIED") {
-            return true;
-        }
-        if words.iter().any(|w| SECRET_CALLS.contains(&w.as_str())) {
-            return true;
-        }
-        if words.windows(2).any(|p| p[0] == "BY" && p[1] == "PASSWORD") {
-            return true;
-        }
-        let head = words.first().map(|s| s.as_str());
-        if matches!(head, Some("CREATE" | "ALTER"))
-            && words.iter().any(|w| w == "CREDENTIAL")
-            && words.iter().any(|w| w == "SECRET")
-        {
-            return true;
-        }
-        if !words.iter().any(|w| w == "PASSWORD") {
-            continue;
-        }
-        let names_a_principal = words.iter().any(|w| w == "USER" || w == "ROLE")
-            || words.get(1).is_some_and(|w| w == "LOGIN");
-        match words.first().map(|s| s.as_str()) {
-            Some("SET") => return true,
-            Some("CREATE" | "ALTER" | "DROP" | "GRANT" | "REVOKE") if names_a_principal => {
-                return true;
-            }
-            _ => {}
-        }
+    statement_ranges(sql, dialect).into_iter().any(|(lo, hi)| {
+        // **Each T-SQL statement where it begins**, not the range's head:
+        // `scan_bounds` keeps a batch whole from a `DECLARE` on and never cuts
+        // inside `BEGIN … END`, so `DECLARE …; CREATE LOGIN … PASSWORD` and
+        // `IF NOT EXISTS (…) BEGIN CREATE LOGIN … END` head no range with the
+        // statement that carries the password. The identity on every other
+        // engine.
+        tsql_statements(&sql[lo..hi], dialect)
+            .into_iter()
+            .any(|stmt| statement_carries_credential(stmt, dialect))
+    })
+}
+
+/// [`carries_credential`]'s rules, for one statement.
+fn statement_carries_credential(stmt: &str, dialect: SqlDialect) -> bool {
+    let (words, _) = word_tokens(stmt, dialect);
+    if words.iter().any(|w| w == "IDENTIFIED") {
+        return true;
     }
-    false
+    // A call to a routine that takes a password as an argument — except
+    // `OPENROWSET(BULK …)`, which reads a file and takes none.
+    if words.iter().enumerate().any(|(k, w)| {
+        SECRET_CALLS.contains(&w.as_str())
+            && !(w == "OPENROWSET" && words.get(k + 1).is_some_and(|n| n == "BULK"))
+    }) {
+        return true;
+    }
+    if words.windows(2).any(|p| p[0] == "BY" && p[1] == "PASSWORD") {
+        return true;
+    }
+    let head = words.first().map(|s| s.as_str());
+    if matches!(head, Some("CREATE" | "ALTER"))
+        && words.iter().any(|w| w == "CREDENTIAL")
+        && words.iter().any(|w| w == "SECRET")
+    {
+        return true;
+    }
+    // A password set by a word rather than a principal statement: MySQL's
+    // `CHANGE REPLICATION SOURCE TO SOURCE_PASSWORD = …`, `START REPLICA …
+    // PASSWORD = …`, and a T-SQL procedure's `@password`/`@…_password`
+    // parameter (`@` is not a word byte, so the token is the bare word).
+    let passwordish = |w: &String| w == "PASSWORD" || w.ends_with("_PASSWORD");
+    if matches!(head, Some("CHANGE" | "START" | "EXEC" | "EXECUTE"))
+        && words.iter().any(passwordish)
+    {
+        return true;
+    }
+    if !words.iter().any(|w| w == "PASSWORD") {
+        return false;
+    }
+    let names_a_principal = words.iter().any(|w| w == "USER" || w == "ROLE")
+        || words.get(1).is_some_and(|w| w == "LOGIN");
+    match head {
+        Some("SET") => true,
+        Some("CREATE" | "ALTER" | "DROP" | "GRANT" | "REVOKE") => names_a_principal,
+        _ => false,
+    }
 }
 
 /// The routines whose arguments include a password in the clear, with no
 /// `PASSWORD` keyword in the statement — SQL Server's system procedures for
-/// logins, linked-server logins and application roles, and its passphrase
-/// and password-hash functions. Upper case, as [`word_tokens`] gives words.
+/// logins, linked-server logins, orphaned users, application roles and
+/// replication agents, its passphrase and password-hash functions, the rowset
+/// functions and linked-server definition that take a connection string
+/// (`PWD=…` inside a literal), and PostgreSQL's `dblink` family, whose first
+/// argument is one. Upper case, as [`word_tokens`] gives words.
 const SECRET_CALLS: &[&str] = &[
     "SP_ADDLOGIN",
     "SP_PASSWORD",
     "SP_ADDLINKEDSRVLOGIN",
+    "SP_ADDLINKEDSERVER",
+    "SP_CHANGE_USERS_LOGIN",
     "SP_ADDAPPROLE",
     "SP_SETAPPROLE",
     "SP_APPROLEPASSWORD",
     "SP_CONTROL_DBMASTERKEY_PASSWORD",
+    "SP_ADDDISTRIBUTOR",
+    "SP_ADDDISTPUBLISHER",
+    "SP_CHANGEDISTRIBUTOR_PASSWORD",
+    "SP_ADDSUBSCRIPTION",
+    "SP_ADDPUSHSUBSCRIPTION_AGENT",
+    "SP_ADDPULLSUBSCRIPTION_AGENT",
+    "SP_ADDMERGEPUSHSUBSCRIPTION_AGENT",
+    "SP_ADDMERGEPULLSUBSCRIPTION_AGENT",
+    "SP_ADDLOGREADER_AGENT",
+    "SP_ADDPUBLICATION_SNAPSHOT",
     "ENCRYPTBYPASSPHRASE",
     "DECRYPTBYPASSPHRASE",
     "PWDENCRYPT",
     "PWDCOMPARE",
+    "OPENROWSET",
+    "OPENDATASOURCE",
+    "DBLINK",
+    "DBLINK_CONNECT",
+    "DBLINK_CONNECT_U",
+    "DBLINK_EXEC",
 ];
 
 #[cfg(test)]
@@ -6551,6 +6605,91 @@ mod tests {
         ] {
             assert!(!ms(s), "{s}");
         }
+    }
+
+    /// **A T-SQL credential statement is judged where it begins, not only at
+    /// its range's head.** `scan_bounds` keeps a batch whole from a `DECLARE`
+    /// on, and no `;` cuts inside `BEGIN … END`, so the password statement in
+    /// each of these was the head of no range — and the head-only rule wrote
+    /// it to `history.json`. The idempotent `IF NOT EXISTS … BEGIN CREATE
+    /// LOGIN …` is the shape every provisioning script has.
+    #[test]
+    fn carries_credential_finds_a_t_sql_password_statement_inside_a_batch() {
+        let ms = |s: &str| super::carries_credential(s, SqlDialect::MsSql);
+        for s in [
+            "DECLARE @n int = 1; CREATE USER app WITH PASSWORD = 'S3cret!x';",
+            "IF NOT EXISTS (SELECT 1 FROM sys.server_principals WHERE name = N'bob') \
+             BEGIN CREATE LOGIN bob WITH PASSWORD = 'S3cret!x'; END",
+            "BEGIN TRY CREATE USER app WITH PASSWORD = 'S3cret!x'; END TRY \
+             BEGIN CATCH THROW; END CATCH",
+            "DECLARE @n int = 1; ALTER LOGIN bob WITH PASSWORD = 'S3cret!x';",
+            "SET NOCOUNT ON\nCREATE LOGIN bob WITH PASSWORD = 'S3cret!x'",
+        ] {
+            assert!(ms(s), "{s}");
+        }
+        // Still only a statement that sets one: a batch reading a column of
+        // that name is recorded.
+        assert!(!ms(
+            "DECLARE @n int = 1; SELECT login, password FROM dbo.accounts;"
+        ));
+        assert!(!ms("IF 1 = 1 BEGIN SELECT password FROM dbo.accounts; END"));
+    }
+
+    /// **A password inside a connection-string argument, a replication
+    /// setting or a procedure's `@…password` parameter is a credential too.**
+    /// Each of these is a password typed into the statement, and none has the
+    /// `IDENTIFIED`/`BY PASSWORD`/principal shape the rules above look for —
+    /// the password sits in a string the tokens skip, under a word like
+    /// `SOURCE_PASSWORD`, or in a positional argument.
+    #[test]
+    fn carries_credential_knows_connection_strings_and_password_arguments() {
+        let ms = |s: &str| super::carries_credential(s, SqlDialect::MsSql);
+        for s in [
+            "SELECT * FROM OPENROWSET('MSOLEDBSQL', 'Server=h;UID=sa;PWD=S3cret!;', 'SELECT 1 AS x')",
+            "SELECT * FROM OPENROWSET('SQLNCLI', 'h'; 'sa'; 'S3cret!', 'SELECT 1')",
+            "SELECT * FROM OPENDATASOURCE('MSOLEDBSQL', 'Data Source=h;User ID=sa;Password=S3cret!').db.dbo.t",
+            "EXEC sp_addlinkedserver @server = N'L', @srvproduct = N'', \
+             @provider = N'MSOLEDBSQL', @provstr = N'Server=h;Uid=sa;Pwd=S3cret!'",
+            "EXEC sp_change_users_login 'Auto_Fix', 'appuser', NULL, 'S3cret!'",
+            "EXEC sp_change_users_login @Action = 'Auto_Fix', \
+             @UserNamePattern = 'appuser', @Password = 'S3cret!'",
+            "EXEC sp_adddistributor @distributor = 'srv', @password = 'S3cret!'",
+            "EXEC sp_addpushsubscription_agent @publication = 'p', \
+             @subscriber_password = 'S3cret!'",
+            "EXEC sp_addlogreader_agent @job_login = 'x', @job_password = 'S3cret!'",
+            "DECLARE @n int = 1; EXEC sp_adddistributor 'srv', 'S3cret!'",
+        ] {
+            assert!(ms(s), "{s}");
+        }
+        for s in [
+            "CHANGE REPLICATION SOURCE TO SOURCE_HOST = 'h', SOURCE_USER = 'r', \
+             SOURCE_PASSWORD = 'S3cret!'",
+            "CHANGE MASTER TO MASTER_HOST = 'h', MASTER_PASSWORD = 'S3cret!'",
+            "START REPLICA USER = 'r' PASSWORD = 'S3cret!'",
+            "START SLAVE USER = 'r' PASSWORD = 'S3cret!'",
+        ] {
+            assert!(carries_credential(s), "{s}");
+        }
+        for s in [
+            "SELECT * FROM dblink('host=h dbname=d user=u password=S3cret!', \
+             'SELECT 1') AS t(x int)",
+            "SELECT dblink_connect('c', 'host=h password=S3cret!')",
+            "SELECT dblink_connect_u('host=h password=S3cret!')",
+            "SELECT dblink_exec('host=h password=S3cret!', 'DELETE FROM t')",
+        ] {
+            assert!(super::carries_credential(s, PG), "{s}");
+        }
+        // Not every read of a remote source or a password-named column.
+        for s in [
+            "SELECT * FROM OPENROWSET(BULK 'C:\\data\\f.json', SINGLE_CLOB) AS j",
+            "EXEC sp_helplogins",
+            "SELECT user_password FROM dbo.accounts",
+            "UPDATE dbo.accounts SET last_password_change = GETDATE() WHERE id = 1",
+        ] {
+            assert!(!ms(s), "{s}");
+        }
+        assert!(!carries_credential("SELECT master_password FROM t"));
+        assert!(!carries_credential("START TRANSACTION"));
     }
 
     #[test]
