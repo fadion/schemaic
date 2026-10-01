@@ -3455,7 +3455,14 @@ existing prose was left alone.
     is, so where one holds a `$(` the dump's header says to restore with `sqlcmd -x` or *Run SQL
     file* — in a sentence holding no `$(` of its own
     (`a_definition_holding_a_sqlcmd_variable_is_named_in_the_header`); measured, the rows of such a
-    file restore byte-equal without `-x`, and the procedure body only with it.
+    file restore byte-equal without `-x`, and the procedure body only with it. **A name is rewritten
+    as well, brackets and all** — `CREATE TABLE dbo.[z$(HOME)t]` made `z/home/mssqlt`, exit 0 — and
+    cannot be cut without becoming another name. The dump's header already reads its table list for
+    the check (`a_data_only_file_whose_table_name_holds_a_sqlcmd_variable_says_so`); a file of
+    `INSERT`s with no header — the grid's SQL export, *Copy as SQL INSERT*, each file of a folder
+    export, and a dump's rows alike — gets a `-- NOTE:` before its first `INSERT` from
+    `export_inserts_ending` where its table or column list holds a `$(`
+    (`a_sql_server_script_whose_name_holds_a_sqlcmd_variable_says_how_to_run_it`).
     **Foreign keys are restated after the data.** `create_ddl` deliberately emits none: for Copy DDL
     an omitted key still leaves a script that runs, which is why the ordering effort there went to
     types and views instead (`create_ddl_script`'s own account of it). A dump can't take that trade —

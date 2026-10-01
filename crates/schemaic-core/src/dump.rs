@@ -3144,7 +3144,8 @@ pub fn plan(
     // variables and the environment, and only its `-x` flag stops it. The
     // rows' literals hold no `$(` (`export::script_literal` cuts each one),
     // but a module body, a default or a name is restated as the server has
-    // it — so where one holds a `$(`, the header says how to restore.
+    // it — so where one holds a `$(`, the header says how to restore. The rows'
+    // own `INSERT`s carry a note of their own (`export::export_inserts_ending`).
     if crate::export::client_substitutes_variables(dialect)
         && (header.contains("$(")
             || steps
@@ -3152,9 +3153,9 @@ pub fn plan(
                 .any(|s| matches!(s, DumpStep::Text(t) if t.contains("$("))))
     {
         header.push_str(
-            "\n--\n-- Some definitions below hold a `$` followed by `(`, which sqlcmd reads as a\n\
-             -- variable even inside a string: restore this file with `sqlcmd -x`, or with\n\
-             -- Run SQL file, to keep that text as it is.",
+            "\n--\n-- Some names or definitions below hold a `$` followed by `(`, which sqlcmd\n\
+             -- reads as a variable even inside a string: restore this file with `sqlcmd -x`,\n\
+             -- or with Run SQL file, to keep that text as it is.",
         );
     }
     steps.insert(0, DumpStep::Text(header));
@@ -5352,6 +5353,37 @@ mod tests {
         assert!(!h.contains("$("), "{h}");
         let h = header("CREATE VIEW [dbo].[v] AS SELECT N'$ (HOME)' AS x");
         assert!(!h.contains("sqlcmd"), "{h}");
+    }
+
+    /// **And so does a file whose rows name a `$(`** — `sqlcmd` rewrites a
+    /// bracketed name too (`[z$(HOME)t]` created `z/home/mssqlt`, measured on
+    /// 2022). A data-only file has no `CREATE TABLE` for the check above to
+    /// read; the header's own list of tables is what carries the name to it,
+    /// which this pins.
+    #[test]
+    fn a_data_only_file_whose_table_name_holds_a_sqlcmd_variable_says_so() {
+        let mut t = table("z$(HOME)t");
+        t.schema = Some("dbo".to_string());
+        let s = schema_of(vec![t]);
+        let p = plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions {
+                structure: false,
+                ..DumpOptions::default()
+            },
+            SqlDialect::MsSql,
+        );
+        assert!(
+            p.steps.iter().any(|s| matches!(s, DumpStep::Rows { .. })),
+            "{:?}",
+            p.steps
+        );
+        let DumpStep::Text(h) = &p.steps[0] else {
+            panic!("{:?}", p.steps[0])
+        };
+        assert!(h.contains("sqlcmd -x"), "{h}");
     }
 
     /// **A column typed by an alias is read as its base type.** Its

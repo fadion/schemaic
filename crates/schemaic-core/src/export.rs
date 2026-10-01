@@ -3006,6 +3006,21 @@ pub fn export_inserts_ending<W: Write>(
                     .map(|col| server.iter().find(|(n, _)| *n == col.name).map(|(_, f)| *f))
                     .collect();
             first = false;
+            // **A name is rewritten by `sqlcmd` as a literal is**, brackets and
+            // all (`z$(HOME)t` restored as `z/home/mssqlt`, measured), and it
+            // cannot be cut as `script_literal` cuts a value without becoming
+            // another name — so the script says how to run it. Before the first
+            // `INSERT`, so nothing is open.
+            if client_substitutes_variables(dialect)
+                && (table_sql.contains("$(") || cols.contains("$("))
+            {
+                writeln!(
+                    w,
+                    "-- NOTE: a name below holds a `$` followed by `(`, which sqlcmd reads as a \
+                     variable even inside brackets: run this file with `sqlcmd -x`, or with Run \
+                     SQL file, to keep the name as it is."
+                )?;
+            }
         }
         let dropped = dropped_binary_columns(c.rs, c.order);
         let mask = binary_mask(c.rs, &dropped);
@@ -4028,6 +4043,49 @@ mod tests {
                  AS sql_variant)"
             )
         );
+    }
+
+    /// **A name is not a literal, and `sqlcmd` rewrites it too.** Measured with
+    /// ODBC sqlcmd 18 on 2022: `CREATE TABLE dbo.[z$(HOME)t]` made a table
+    /// named `z/home/mssqlt`, and an `INSERT INTO [z$(Nope)t]` only warned that
+    /// the variable was undefined — exit code 0 both ways. A name cannot be cut
+    /// the way a literal is without becoming another name, so a SQL Server
+    /// script whose table or column name holds a `$(` says, before its first
+    /// `INSERT`, how to run it; the note itself holds no reference.
+    #[test]
+    fn a_sql_server_script_whose_name_holds_a_sqlcmd_variable_says_how_to_run_it() {
+        let rs = |col: &str| {
+            ResultSet::from_rows(
+                vec![crate::model::Column {
+                    name: col.to_string(),
+                    type_name: "int".to_string(),
+                    origin: None,
+                }],
+                vec![vec![Value::Int(1)]],
+            )
+        };
+        let note = "sqlcmd -x";
+        let table = export_inserts(
+            &rs("c"),
+            &[0],
+            Some(("db", Some("dbo"), "z$(HOME)t")),
+            MsSql,
+        );
+        assert!(table.contains(note), "{table}");
+        let (head, rest) = table.split_once("INSERT INTO").expect("an insert");
+        assert!(head.contains(note) && !head.contains("$("), "{table}");
+        assert!(
+            rest.contains("[z$(HOME)t]"),
+            "the name is kept as it is: {table}"
+        );
+        let column = export_inserts(&rs("c$(x)"), &[0], None, MsSql);
+        assert!(column.contains(note), "{column}");
+        // Nothing to say without a reference, or where the client reads the
+        // name as it is.
+        let plain = export_inserts(&rs("c"), &[0], Some(("db", Some("dbo"), "t$")), MsSql);
+        assert!(!plain.contains("NOTE"), "{plain}");
+        let pg = export_inserts(&rs("c$(x)"), &[0], None, Postgres);
+        assert!(!pg.contains("NOTE"), "{pg}");
     }
 
     /// **A character variant is converted under its own collation, and read
