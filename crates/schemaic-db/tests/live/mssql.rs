@@ -337,8 +337,8 @@ async fn a_ping_and_the_database_list_reach_the_server() {
 /// `SINGLE_USER` one, so the database an administrator had just put in
 /// maintenance vanished from their tree — while opening it by name worked.
 /// A login holding `CONNECT ANY DATABASE` (`sa` here) now sees both; the
-/// single-user one whether or not a session holds it, since expanding it says
-/// which.
+/// single-user one whether or not a session holds it, since reading it says
+/// which — and the load leaves that one unread until the user asks.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_database_in_maintenance_is_listed_for_a_login_that_may_open_it() {
     if !enabled() || azure_cannot("creates no databases of its own, so the maintenance listing") {
@@ -359,6 +359,7 @@ async fn a_database_in_maintenance_is_listed_for_a_login_that_may_open_it() {
     alter(&restricted.name, "RESTRICTED_USER").await;
     alter(&single.name, "SINGLE_USER").await;
     let names = base.fetch_databases().await;
+    let listed = base.list_databases().await;
     // Back to normal before anything can fail, so the drops are ordinary.
     alter(&restricted.name, "MULTI_USER").await;
     alter(&single.name, "MULTI_USER").await;
@@ -366,6 +367,29 @@ async fn a_database_in_maintenance_is_listed_for_a_login_that_may_open_it() {
     for scratch in [&restricted, &single] {
         assert!(names.contains(&scratch.name), "{}: {names:?}", scratch.name);
     }
+    // **Listed, but not read unasked.** The schema load connects into every
+    // database it reads, and a connection into a single-user one takes the
+    // slot the administrator just reserved: their `RESTORE` failed with Msg
+    // 924 behind it. The listing says which is which, and the load's own
+    // decision leaves the single-user one out, even as the active database.
+    let listed = listed.expect("a database list");
+    let flag = |name: &str| {
+        listed
+            .iter()
+            .find(|d| d.name == name)
+            .unwrap_or_else(|| panic!("{name}: {listed:?}"))
+            .single_user
+    };
+    assert!(flag(&single.name), "{listed:?}");
+    assert!(!flag(&restricted.name), "{listed:?}");
+    let none = std::collections::HashSet::new();
+    let reads = schemaic_core::schema::unasked_reads(&listed, Some(&single.name), &none, &none);
+    assert!(
+        reads.iter().all(|&i| listed[i].name != single.name),
+        "a load reads {}: {listed:?}",
+        single.name
+    );
+    assert!(reads.iter().any(|&i| listed[i].name == restricted.name));
 }
 
 /// Every value renders as the text SQL Server prints for it — the values at

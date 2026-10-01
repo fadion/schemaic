@@ -73,12 +73,12 @@ use schemaic_core::model::{
 use schemaic_core::monitor::{Snapshot, TickAction, diff_snapshots};
 
 /// Outcome of a background connect + schema-load task: `(tunnel port, tunnel
-/// handle, database names)` on success, or an error message.
+/// handle, databases listed)` on success, or an error message.
 type ConnectResult = Result<
     (
         Option<u16>,
         Option<schemaic_db::ssh::TunnelHandle>,
-        Vec<String>,
+        Vec<schemaic_core::schema::ListedDatabase>,
     ),
     String,
 >;
@@ -8139,7 +8139,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             let send = create_ext_action(cx, move |res: ConnectResult| {
                 let landing = load_landing(stamp, (active_conn.get_untracked(), gen_cb.get()));
                 match res {
-                    Ok((tunnel_port, new_handle, names)) => {
+                    Ok((tunnel_port, new_handle, listed)) => {
+                        let names: Vec<String> = listed.iter().map(|d| d.name.clone()).collect();
                         if let Some(handle) = new_handle {
                             // Dropping any prior handle here tears its listener down.
                             tunnels_cache.borrow_mut().insert(conn_send.id, handle);
@@ -8261,14 +8262,27 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                     .collect()
                             });
                             hidden_dbs.with_untracked(|h| {
-                                schemaic_core::schema::introspection_order(
-                                    &names,
+                                schemaic_core::schema::unasked_reads(
+                                    &listed,
                                     Some(conn_send.database.as_str()),
                                     &open,
                                     h,
                                 )
                             })
                         };
+                        // **What the load leaves unread says so** rather than
+                        // showing "Loading" for ever: a single-user database,
+                        // whose one connection a read would take, is read when
+                        // the user asks (`schema::unasked_reads`). A node that
+                        // already has rows, or a read in flight, keeps them.
+                        for (node, d) in nodes.iter().zip(&listed) {
+                            if d.single_user
+                                && !node.refreshing.get_untracked()
+                                && matches!(node.schema.get_untracked(), SchemaState::Loading)
+                            {
+                                node.schema.set(SchemaState::Unread);
+                            }
+                        }
                         for i in order {
                             (start_fetch_cb)(&nodes[i], db.clone());
                         }
@@ -8317,8 +8331,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     (None, None)
                 };
                 let db = Db::connect(&conn_task, tunnel_port);
-                match db.fetch_databases().await {
-                    Ok(names) => send(Ok((tunnel_port, new_handle, names))),
+                match db.list_databases().await {
+                    Ok(listed) => send(Ok((tunnel_port, new_handle, listed))),
                     Err(e) => send(Err(e.to_string())),
                 }
             });

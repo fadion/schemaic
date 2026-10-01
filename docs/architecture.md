@@ -8596,6 +8596,25 @@ existing prose was left alone.
     rule is `rearm_activity`'s, and the gate is that the signal has no other writer:
     `app_tests::emptying_the_schema_tree_lets_go_of_its_scope` asserts the closure still does all
     three and that nothing else writes `db_nodes` empty.
+    **`unasked_reads` is what a load actually enqueues, and `SchemaState::Unread` is what it leaves
+    behind.** It is `introspection_order` over the `ListedDatabase`s `Db::list_databases` returns,
+    with every `single_user` one dropped — not even the active database or an expanded one is
+    excepted. A read is a connection *into* the database and single-user mode admits one (SQL
+    Server's `SINGLE_USER`, the one engine that sets the flag; the listing is under `db::mssql`).
+    A load runs on app start, on Refresh, on a connection switch or edit and after every
+    server-scope DDL — the `ALTER DATABASE x SET SINGLE_USER WITH ROLLBACK IMMEDIATE` itself
+    included — so the load most likely to land between that `ALTER` and the administrator's
+    `RESTORE`, `DBCC CHECKDB` or `USE x` is the one the `ALTER` set off, and it took the slot (Msg
+    924/3101). An expanded node is no exception for the same reason: the reload after the `ALTER`
+    finds it expanded. `load_schema` sets a listed single-user node still at `Loading` with no read
+    in flight to `Unread`, rather than leaving it saying "Loading" for ever; one that already has
+    rows keeps them and is not re-read by the connection-wide reload — its own Refresh re-reads it.
+    `begin_refresh` answers `Unread` with `Some(Loading)`, as it does `Failed`, so the tree's *Read*
+    (`schema_tree.rs`'s `unread_row`) is the per-database `refresh_db` through the one
+    `start_fetch` like any other. The cost is that an unread database has no model, so completion
+    and `intel`'s catalogue know nothing of it until it is read.
+    `a_load_reads_no_single_user_database_unasked` pins the filter, the order of what is kept and
+    the `begin_refresh` arm.
   - `persist.rs` — the small on-disk state that survives a restart, and the one place that decides
     **how a config file is written and how it comes back**. `config_dir` is `%APPDATA%/schemaic` or
     `$XDG_CONFIG_HOME`/`~/.config`, and each candidate is filtered through **`usable_base`, because
@@ -13133,9 +13152,23 @@ existing prose was left alone.
   `CONNECT ANY DATABASE` sees both kinds**, the short-circuit coming first in the `CASE`. The
   listing once left every restricted and single-user database out for everyone, so the database
   an administrator had just put in maintenance vanished from their tree while opening it by name
-  worked; expanding a held one now says it is held
-  (`a_database_in_maintenance_is_listed_for_a_login_that_may_open_it`, live). The four system
-  databases (ids 1–4) are left out.
+  worked. **Listed is not read, though.** Both listings return `user_access` beside the name, and
+  `listed_database` turns its `1` into `ListedDatabase::single_user` — this is the one engine that
+  sets it — because the schema load connects *into* every database it reads (`fetch_schema`'s
+  `connect(db, Some(database))`), and single-user mode admits one connection. Once sysadmin's
+  listing included these, a load landing between an administrator's `ALTER DATABASE x SET
+  SINGLE_USER WITH ROLLBACK IMMEDIATE` and their `RESTORE … WITH REPLACE`, `DBCC CHECKDB(x,
+  REPAIR_…)` or `USE x` took the slot and failed the maintenance step (Msg 924/3101) — and a load
+  runs after every server-scope DDL, that `ALTER` included, so the one most likely to land there is
+  the app's own. Such a database is therefore listed and left `SchemaState::Unread`
+  (`schema::unasked_reads`, under `schema.rs`); expanding it offers a *Read*, which says it is held
+  if another session has it (`schema_tree.rs`'s `unread_row`). The filter still names
+  `user_access` only inside the `CASE` — a filter on it beside the `CASE` is how a restricted
+  database once vanished from every tree — and `the_listings_read_past_a_database_mid_create`
+  counts it there and requires both queries to select it;
+  `a_listing_row_says_whether_its_database_is_single_user` pins the reading, and the live
+  `a_database_in_maintenance_is_listed_for_a_login_that_may_open_it` (2022 and 2025) asserts the
+  flag and that `unasked_reads` leaves the single-user scratch out even as the active database. The four system databases (ids 1–4) are left out.
   **The listing can also wait on a database another session is creating or dropping**, and that is
   why it reads `sys.databases WITH (READPAST)` and asks nothing per database of a login holding
   `CONNECT ANY DATABASE` (`sysadmin` does). Its catalogue row is held under a lock that reading
@@ -13164,7 +13197,8 @@ existing prose was left alone.
   fit no fallback could finish, so the check is given all of what is left — the Entra sign-in
   above is answered by the filtered query or not at all. The cost of the fallback is a list that
   may name a database this login cannot enter, a restricted or held one included, which then says
-  so when it is expanded — the answer it had before the check existed. **Only a stall falls
+  so when it is expanded — a single-user one when its *Read* is pressed, since it is listed
+  `Unread` like any other — the answer it had before the check existed. **Only a stall falls
   back**: an error from the sign-in or the filtered query is returned as the answer, since a
   refused login would be refused again
   (`the_fallback_is_bounded_and_an_error_is_not_retried`, beside
@@ -19479,6 +19513,14 @@ existing prose was left alone.
     tree filters, highlights and re-expands off is unchanged, and a restored filter applies at once
     because `widgets::debounced` seeds its output from the source's current value — seeded empty,
     the tree would draw unfiltered for one debounce interval under a box that already said otherwise.
+    **An expanded `SchemaState::Unread` database renders `unread_row`** — "Single-user — not read"
+    and a *Read* link that calls `schema_actions.refresh_db`, which `begin_refresh` turns into
+    `Loading` and a fetch (why the load leaves such a database unread is under `schema.rs`'s
+    `unasked_reads`). **A press, not the expansion, and that is load-bearing**: the read is a
+    connection into a database that admits one, and the tree reopens with each node expanded as it
+    was, so reading on expansion would have the reload after `SET SINGLE_USER` take the slot on
+    nobody's say-so — the one thing the state exists to prevent. Like `failed_row` and `info_row` it
+    swallows a secondary click, a status row being a row.
     **The panel's title is the only place a long catalogue read can be reported.**
     `SchemaState::begin_refresh` deliberately leaves an already-loaded database's rows on screen
     through a refresh, and the per-database `Loading` row only ever appears for a *first* load — the
@@ -24990,7 +25032,8 @@ existing prose was left alone.
     app never needs a default database — the tree lists every one — so a saved connection often
     has none, and on MySQL 8.4 `schemaic query -c AEU "SELECT COUNT(*) FROM company"` failed with
     the server's bare `ERROR 1046 (3D000): No database selected` and nothing pointing at `-d`
-    (issue #2). It is `Db::fetch_databases` — the list the schema tree is built from, system
+    (issue #2). It is `Db::fetch_databases` — the names of the list the schema tree is built from
+    (`Db::list_databases`, less its single-user flag), system
     schemas left out, though not the ones the user hid there — rendered like `list` through
     `format::render_rows` as a one-column `database` result, so `--format` means what it does
     elsewhere. It takes the same `select_conn` and `connect` as the others, and a failed connection

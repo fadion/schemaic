@@ -420,7 +420,8 @@ struct SchemaKey(SchemaState);
 impl PartialEq for SchemaKey {
     fn eq(&self, other: &Self) -> bool {
         match (&self.0, &other.0) {
-            (SchemaState::Loading, SchemaState::Loading) => true,
+            (SchemaState::Loading, SchemaState::Loading)
+            | (SchemaState::Unread, SchemaState::Unread) => true,
             (SchemaState::Failed(a), SchemaState::Failed(b)) => a == b,
             (SchemaState::Loaded(a), SchemaState::Loaded(b)) => std::sync::Arc::ptr_eq(a, b),
             _ => false,
@@ -1974,6 +1975,11 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
                 })
                 .into_any(),
                 SchemaState::Failed(e) => failed_row(e, err_open, err_text).into_any(),
+                SchemaState::Unread => {
+                    let refresh = node_ctx.schema_actions.refresh_db.clone();
+                    let db = database.clone();
+                    unread_row(move || refresh(db.clone())).into_any()
+                }
                 SchemaState::Loaded(schema) => {
                     let db = database.clone();
                     let child_ctx = |indent_levels: u32| SchemaTreeCtx {
@@ -3319,6 +3325,35 @@ fn failed_row(
     // retry — offered `Create database` on a connection that has not connected.
     // Additive listeners, not a hit test: a hit test would be a second answer to
     // a question propagation already answers.
+    .on_secondary_click_stop(|_| {})
+    .style(|s| {
+        s.min_width(tree_row_min_w())
+            .padding_left(leaf_pad())
+            .padding_vert(theme::scaled(3.0))
+    })
+}
+
+/// The row under a database the load deliberately left unread
+/// (`SchemaState::Unread`, a single-user one): says why, and reads it on the
+/// user's word. **A press, not the expansion**: the read is a connection into
+/// a database that admits one, and the tree reopens with the node expanded as
+/// it was — the reload after `SET SINGLE_USER` would otherwise take the slot
+/// on nobody's say-so, which is the one thing the state exists to prevent.
+fn unread_row(read: impl Fn() + 'static) -> impl IntoView {
+    container(
+        h_stack((
+            text("Single-user — not read")
+                .style(|s| s.color(theme::text_muted()).font_size(theme::font_label())),
+            text("Read").on_click_stop(move |_| read()).style(|s| {
+                s.color(theme::accent())
+                    .font_size(theme::font_label())
+                    .margin_left(theme::scaled(8.0))
+                    .hover(|s| s.color(theme::accent_hover()))
+            }),
+        ))
+        .style(|s| s.flex_row().items_center()),
+    )
+    // See `failed_row`: a status row is a row.
     .on_secondary_click_stop(|_| {})
     .style(|s| {
         s.min_width(tree_row_min_w())

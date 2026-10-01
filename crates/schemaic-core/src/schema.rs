@@ -4727,6 +4727,56 @@ pub fn introspection_order(
     order
 }
 
+/// One database a server listed, with what decides whether a schema load
+/// reads it without being asked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListedDatabase {
+    /// The database's name, as the tree shows it.
+    pub name: String,
+    /// In single-user mode (SQL Server's `SINGLE_USER`): one connection at a
+    /// time may be in it, so a read takes the one slot. Never set by an
+    /// engine that has no such mode.
+    pub single_user: bool,
+}
+
+impl ListedDatabase {
+    /// A database with nothing that keeps a load out of it — every engine's
+    /// listing but SQL Server's.
+    pub fn open(name: impl Into<String>) -> Self {
+        ListedDatabase {
+            name: name.into(),
+            single_user: false,
+        }
+    }
+}
+
+/// The databases a schema load reads **without being asked** — indices into
+/// `listed`, in [`introspection_order`]'s order — the rest waiting as
+/// [`SchemaState::Unread`] until the user asks for one.
+///
+/// **A single-user database is never read unasked**, not even the active one
+/// or one already expanded. A read is a connection into it, and single-user
+/// mode admits one: an administrator runs `ALTER DATABASE x SET SINGLE_USER
+/// WITH ROLLBACK IMMEDIATE` and then their own `RESTORE`, `DBCC CHECKDB` or
+/// `USE x`, and a load landing between the two takes the slot — the
+/// maintenance step fails with Msg 924. A load runs on opening a connection,
+/// on Refresh, and after every server-scope DDL, the `ALTER DATABASE` itself
+/// included, so the one that would land there is the likeliest one of all.
+/// An expanded node is no exception for the same reason: the reload after the
+/// `ALTER` finds it expanded.
+pub fn unasked_reads(
+    listed: &[ListedDatabase],
+    active: Option<&str>,
+    expanded: &std::collections::HashSet<String>,
+    hidden: &std::collections::HashSet<String>,
+) -> Vec<usize> {
+    let names: Vec<String> = listed.iter().map(|d| d.name.clone()).collect();
+    introspection_order(&names, active, expanded, hidden)
+        .into_iter()
+        .filter(|&i| !listed[i].single_user)
+        .collect()
+}
+
 /// One standalone object, whichever kind it is.
 ///
 /// The tree renders a mixed list of these and the editor holds exactly one, so
@@ -6766,6 +6816,11 @@ pub enum SchemaState {
     Loading,
     Loaded(std::sync::Arc<DbSchema>),
     Failed(String),
+    /// Listed, and deliberately not read: a load does not read this database
+    /// unasked ([`unasked_reads`] — a single-user one, whose one connection
+    /// the read would take). Read when the user asks, by the node's own
+    /// Refresh.
+    Unread,
 }
 
 impl SchemaState {
@@ -6798,7 +6853,7 @@ impl SchemaState {
         match self {
             // Already showing rows, or already showing a load in progress.
             SchemaState::Loaded(_) | SchemaState::Loading => None,
-            SchemaState::Failed(_) => Some(SchemaState::Loading),
+            SchemaState::Failed(_) | SchemaState::Unread => Some(SchemaState::Loading),
         }
     }
 }
@@ -8872,6 +8927,37 @@ mod tests {
         // which is the same exception `schema::tab_target` makes.
         let hidden: std::collections::HashSet<String> = ["a".to_string()].into();
         assert_eq!(introspection_order(&names, Some("a"), &none, &hidden)[0], 0);
+    }
+
+    /// **A load never reads a single-user database unasked** — not the
+    /// active one, not one already expanded — because the read is a
+    /// connection into it, and single-user mode admits one: the
+    /// administrator's own `RESTORE` after `SET SINGLE_USER` failed with
+    /// Msg 924 when a load took the slot. The rest keep their order.
+    #[test]
+    fn a_load_reads_no_single_user_database_unasked() {
+        let listed = [
+            ListedDatabase::open("a"),
+            ListedDatabase {
+                name: "maint".into(),
+                single_user: true,
+            },
+            ListedDatabase::open("c"),
+        ];
+        let none = std::collections::HashSet::new();
+        assert_eq!(unasked_reads(&listed, None, &none, &none), [0, 2]);
+        let expanded: std::collections::HashSet<String> = ["maint".to_string()].into();
+        assert_eq!(
+            unasked_reads(&listed, Some("maint"), &expanded, &none),
+            [0, 2]
+        );
+        assert_eq!(unasked_reads(&listed, Some("c"), &none, &none), [2, 0]);
+        assert!(unasked_reads(&[], None, &none, &none).is_empty());
+        // And the node it leaves unread is read the moment it is asked for.
+        assert!(matches!(
+            SchemaState::Unread.begin_refresh(),
+            Some(SchemaState::Loading)
+        ));
     }
 
     /// **The two empty-filter answers are opposite, and both are right.**

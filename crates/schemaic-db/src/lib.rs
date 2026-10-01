@@ -1584,6 +1584,25 @@ impl Db {
         }
     }
 
+    /// [`Db::fetch_databases`] with what decides whether a schema load reads
+    /// each one unasked (`schema::unasked_reads`): SQL Server says which are in
+    /// single-user mode, a mode no other engine has, so theirs are the names
+    /// with nothing set. Bounded the same way.
+    pub async fn list_databases(
+        &self,
+    ) -> Result<Vec<schemaic_core::schema::ListedDatabase>, DbError> {
+        use schemaic_core::schema::ListedDatabase;
+        match self.engine {
+            Engine::MsSql => mssql::list_databases(self).await,
+            _ => Ok(self
+                .fetch_databases()
+                .await?
+                .into_iter()
+                .map(ListedDatabase::open)
+                .collect()),
+        }
+    }
+
     /// Introspect one database's schema (tables → columns + indexes) via
     /// `information_schema` (ARCHITECTURE §11). Everything is `CAST` to a known type
     /// so the protocol never surprises us with a width mismatch.

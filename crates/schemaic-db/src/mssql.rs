@@ -39,7 +39,7 @@ use schemaic_core::model::{
     ResultBuilder, ResultSet, Rollback, RowInsert, Value, WriteStep, binary_display,
     one_row_verdict, type_is_binary,
 };
-use schemaic_core::schema::{DbSchema, TableInfo};
+use schemaic_core::schema::{DbSchema, ListedDatabase, TableInfo};
 use tiberius::{ColumnData, ColumnType, QueryItem};
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
@@ -285,7 +285,8 @@ pub(crate) async fn ping(db: &Db, timeout: Duration) -> Result<(), DbError> {
 /// online database, restricted and single-user ones included: the listing used
 /// to leave both out for everyone, so the database an administrator had just
 /// put in maintenance vanished from their tree while opening it by name
-/// worked, and expanding a held single-user one says it is held. **The
+/// worked; a single-user one is listed unread, and its *Read* says it is held
+/// when another session holds it. **The
 /// catalogue is read `WITH (READPAST)`**, and the short-circuit comes first,
 /// both because a database another session is creating or
 /// dropping holds its catalogue row under a lock that reading `sys.databases`
@@ -296,7 +297,13 @@ pub(crate) async fn ping(db: &Db, timeout: Duration) -> Result<(), DbError> {
 /// only the rows under that lock — a database mid-create or mid-drop, which the
 /// next refresh shows as it lands. A plain login still asks `HAS_DBACCESS`,
 /// which still waits (to 7.8 s measured); [`listing_within`] is what bounds it.
-const DATABASE_LISTING: &str = "SELECT name FROM sys.databases WITH (READPAST) \
+///
+/// **`user_access` comes back with the name** — `1` is `SINGLE_USER` — because
+/// a listed single-user database must not be *read* unasked: the schema load
+/// connects into every database it is given, and a connection into a
+/// single-user one takes the slot the administrator just reserved
+/// (`schema::unasked_reads`).
+const DATABASE_LISTING: &str = "SELECT name, user_access FROM sys.databases WITH (READPAST) \
      WHERE database_id > 4 AND state = 0 \
        AND CASE WHEN HAS_PERMS_BY_NAME(NULL, NULL, 'CONNECT ANY DATABASE') = 1 THEN 1 \
                 WHEN user_access = 1 THEN 0 \
@@ -307,7 +314,7 @@ const DATABASE_LISTING: &str = "SELECT name FROM sys.databases WITH (READPAST) \
 /// that check stalls. A database this login cannot enter, a restricted or a
 /// held single-user one included, then says so when it is expanded, which is
 /// the answer it would have had before the check existed.
-const DATABASE_LISTING_UNFILTERED: &str = "SELECT name FROM sys.databases WITH (READPAST) \
+const DATABASE_LISTING_UNFILTERED: &str = "SELECT name, user_access FROM sys.databases WITH (READPAST) \
      WHERE database_id > 4 AND state = 0 \
      ORDER BY name";
 
@@ -345,9 +352,18 @@ fn access_check_share(connected: Duration, left: Duration) -> Duration {
 /// List the user databases, sorted by name. Bounded by
 /// [`crate::PING_TIMEOUT`], as on every engine.
 pub(crate) async fn fetch_databases(db: &Db) -> Result<Vec<String>, DbError> {
+    Ok(list_databases(db)
+        .await?
+        .into_iter()
+        .map(|d| d.name)
+        .collect())
+}
+
+/// [`fetch_databases`], each with whether it is in single-user mode.
+pub(crate) async fn list_databases(db: &Db) -> Result<Vec<ListedDatabase>, DbError> {
     let rows_of = |mut client: MsClient, sql: &'static str| async move {
         let rows = query_rows(&mut client, sql).await?;
-        Ok::<_, DbError>(rows.into_iter().map(|r| cell(&r, 0)).collect())
+        Ok::<_, DbError>(rows.iter().map(|r| listed_database(r)).collect())
     };
     listing_within(
         crate::PING_TIMEOUT,
@@ -361,28 +377,38 @@ pub(crate) async fn fetch_databases(db: &Db) -> Result<Vec<String>, DbError> {
     .await
 }
 
+/// One row of [`DATABASE_LISTING`] (or its unfiltered twin): the name, and
+/// `user_access` — `1` is `SINGLE_USER`.
+fn listed_database(row: &[Option<String>]) -> ListedDatabase {
+    ListedDatabase {
+        name: cell(row, 0),
+        single_user: cell(row, 1).trim() == "1",
+    }
+}
+
 /// Sign in with `connect`, then run `filtered` on that connection for
 /// [`access_check_share`] — at most [`ACCESS_CHECK_BUDGET`], less what the
 /// fallback's own sign-in will need; if it has not answered by then, run
-/// `unfiltered` in what is left of `budget`. The whole is bounded by `budget`, and **the
-/// share times the query alone** — a sign-in that takes 3–5 s (Microsoft
-/// Entra's, through the Azure CLI) was charged to it, so the filtered listing
+/// `unfiltered` in what is left of `budget`. The whole is bounded by
+/// `budget`, and **the share times the query alone** — a sign-in that takes
+/// 3–5 s (Microsoft Entra's, through the Azure CLI) was charged to it, so the
+/// filtered listing
 /// was abandoned mid-connect and the fallback connected from scratch in what
 /// was left, failing a listing the one 5 s bound before it answered. An
 /// **error** from either the connect or `filtered` is the answer and is
 /// returned as one — only a stall falls back, since a refused login would be
 /// refused again.
-async fn listing_within<C, F, FF, U, UF>(
+async fn listing_within<C, R, F, FF, U, UF>(
     budget: Duration,
     connect: impl std::future::Future<Output = Result<C, DbError>>,
     filtered: F,
     unfiltered: U,
-) -> Result<Vec<String>, DbError>
+) -> Result<R, DbError>
 where
     F: FnOnce(C) -> FF,
-    FF: std::future::Future<Output = Result<Vec<String>, DbError>>,
+    FF: std::future::Future<Output = Result<R, DbError>>,
     U: FnOnce() -> UF,
-    UF: std::future::Future<Output = Result<Vec<String>, DbError>>,
+    UF: std::future::Future<Output = Result<R, DbError>>,
 {
     let start = tokio::time::Instant::now();
     let timed_out = || DbError::Connect("timed out".to_string());
@@ -5032,7 +5058,7 @@ mod tests {
         // A sign-in that never finishes is bounded by the whole budget, and
         // one that is refused is the answer.
         let start = tokio::time::Instant::now();
-        let got = listing_within(
+        let got: Result<Vec<String>, _> = listing_within(
             crate::PING_TIMEOUT,
             signed_in_after(60_000),
             |()| async { panic!("the query ran") },
@@ -5041,7 +5067,7 @@ mod tests {
         .await;
         assert!(matches!(got, Err(DbError::Connect(_))), "{got:?}");
         assert!(start.elapsed() <= crate::PING_TIMEOUT);
-        let got = listing_within(
+        let got: Result<Vec<String>, _> = listing_within(
             crate::PING_TIMEOUT,
             async { Err::<(), _>(DbError::Connect("refused".into())) },
             |()| async { panic!("the query ran") },
@@ -5130,8 +5156,28 @@ mod tests {
             .expect("the single-user guard");
         assert!(short_circuit < single);
         assert!(single < DATABASE_LISTING.find("HAS_DBACCESS").unwrap());
-        assert_eq!(DATABASE_LISTING.matches("user_access").count(), 1);
-        assert!(!DATABASE_LISTING_UNFILTERED.contains("user_access"));
+        let filter_of = |q: &'static str| &q[q.find("WHERE").expect("a filter")..];
+        assert_eq!(
+            filter_of(DATABASE_LISTING).matches("user_access").count(),
+            1
+        );
+        assert!(!filter_of(DATABASE_LISTING_UNFILTERED).contains("user_access"));
+        // Both return it, so a load can leave a single-user database unread.
+        for q in [DATABASE_LISTING, DATABASE_LISTING_UNFILTERED] {
+            assert!(q.starts_with("SELECT name, user_access FROM"), "{q}");
+        }
+    }
+
+    /// A listing row's `user_access` of `1` is `SINGLE_USER`; `0`
+    /// (`MULTI_USER`) and `2` (`RESTRICTED_USER`) are read like any other.
+    #[test]
+    fn a_listing_row_says_whether_its_database_is_single_user() {
+        let row = |access: &str| vec![Some("d".to_string()), Some(access.to_string())];
+        assert!(listed_database(&row("1")).single_user);
+        assert!(!listed_database(&row("0")).single_user);
+        assert!(!listed_database(&row("2")).single_user);
+        assert!(!listed_database(&[Some("d".to_string()), None]).single_user);
+        assert_eq!(listed_database(&row("1")).name, "d");
     }
 
     /// A view's stored text reads into its body and the header `ALTER VIEW`
