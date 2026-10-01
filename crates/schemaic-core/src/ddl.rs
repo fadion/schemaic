@@ -33,7 +33,7 @@ use crate::schema::{
     CheckInfo, ColumnInfo, DomainInfo, EnumInfo, EventInfo, EventSchedule, ForeignKeyInfo,
     IndexInfo, RoutineInfo, RoutineKind, SequenceInfo, ServerFlavour, TableInfo, TriggerAction,
     TriggerEvent, TriggerInfo, TriggerLevel, TriggerTiming, ViewOptions, ddl_ident_in, ddl_string,
-    definer_sql, qualified_ident, sql_qualifier,
+    definer_sql, qualified_ident,
 };
 use crate::sql;
 
@@ -6833,19 +6833,23 @@ fn plural(n: usize) -> &'static str {
     if n == 1 { "" } else { "s" }
 }
 
-/// A table (or index) name, schema-qualified when the namespace isn't the one
-/// the server resolves to anyway.
+/// A table (or index) name in a statement that **runs**, schema-qualified
+/// whenever it has a schema — on every engine, PostgreSQL's `public`
+/// included.
+///
+/// `public` used to be left off, through
+/// [`sql_qualifier`](crate::schema::sql_qualifier), as SQL the user
+/// only reads leaves it off. But a bare name resolves through `search_path`,
+/// whose stock value is `"$user", public`: with a schema named after the
+/// login that holds a same-named table, `TRUNCATE TABLE "orders"` emptied
+/// `schemaic.orders` and left `public.orders` as it was, and a designer key
+/// to `customers` bound to `schemaic.customers` (S2-L5-02, measured on
+/// PostgreSQL 16). The write path already qualified `public` for the same
+/// reason (`db::pg::pg_qname`); executed DDL now does too. Elsewhere the
+/// schema is an ordinary name a bare one would resolve past, so it was
+/// already written.
 fn qualified(name: &str, schema: Option<&str>, dialect: SqlDialect) -> String {
-    // **Only PostgreSQL's `public` resolves unqualified.** `sql_qualifier` drops
-    // it whatever the engine; elsewhere the name is an ordinary one, and a
-    // statement naming the table alone resolves through the connection's
-    // default — so the emitter writes every schema it is given there.
-    let schema = match dialect {
-        SqlDialect::Postgres => sql_qualifier(schema),
-        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => {
-            schema.filter(|s| !s.is_empty())
-        }
-    };
+    let schema = schema.filter(|s| !s.is_empty());
     match schema {
         Some(s) => format!(
             "{}.{}",
@@ -6896,15 +6900,9 @@ fn fk_clause(fk: &ForeignKeyInfo, owner: Option<&str>, dialect: SqlDialect) -> S
                 .filter(|s| !s.is_empty())
                 .filter(|_| !bare_reference_is_own_namespace(dialect))
         });
-    // On MySQL the referenced schema is a *database*; on PostgreSQL a namespace,
-    // where `public` resolves unqualified.
-    let target = match dialect {
-        SqlDialect::Postgres => qualified(&fk.ref_table, ref_schema, dialect),
-        _ => match ref_schema {
-            Some(s) => format!("{}.{}", q(s), q(&fk.ref_table)),
-            None => q(&fk.ref_table),
-        },
-    };
+    // On MySQL the referenced schema is a *database*, elsewhere a namespace —
+    // written either way, PostgreSQL's `public` included (see [`qualified`]).
+    let target = qualified(&fk.ref_table, ref_schema, dialect);
     let mut out = format!(
         "CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {target} ({})",
         q(&fk.name),
@@ -15779,7 +15777,7 @@ mod tests {
         let sql = diff(&t, &draft, Postgres).editor_script();
         assert_eq!(
             sql,
-            "ALTER TABLE \"users\" RENAME COLUMN \"email\" TO \"login_email\";"
+            "ALTER TABLE \"public\".\"users\" RENAME COLUMN \"email\" TO \"login_email\";"
         );
     }
 
@@ -17563,9 +17561,11 @@ mod tests {
         assert!(ms.contains("REFERENCES [sales].[customers] ([id])"), "{ms}");
         let pg = add(Some("app"), Postgres);
         assert!(pg.contains("REFERENCES \"app\".\"customers\""), "{pg}");
-        // `public` resolves unqualified, and the emitter leaves it off.
+        // `public` is named too: a bare name resolves through `search_path`,
+        // and the stock `"$user", public` bound it to a `customers` in the
+        // login's own schema (S2-L5-02, measured on 16).
         let pg = add(Some("public"), Postgres);
-        assert!(pg.contains("REFERENCES \"customers\""), "{pg}");
+        assert!(pg.contains("REFERENCES \"public\".\"customers\""), "{pg}");
         let my = add(Some("shop"), MySql);
         assert!(my.contains("REFERENCES `customers`"), "{my}");
         // A namespace the key names is kept, whatever the table's.
@@ -18401,19 +18401,25 @@ mod tests {
         );
     }
 
-    /// **Only PostgreSQL's `public` resolves unqualified.** Elsewhere the name
-    /// is an ordinary one and is written — on SQL Server it cannot be created
-    /// at all (the `public` role holds the name, measured), but a table named
-    /// by a schema the emitter drops resolves through the login's default one.
+    /// **A schema named `public` is written in a statement that runs, on every
+    /// engine.** On SQL Server it is an ordinary name — it cannot be created at
+    /// all (the `public` role holds the name, measured), but a table named by a
+    /// schema the emitter drops resolves through the login's default one — and
+    /// on PostgreSQL a bare name resolves through `search_path`, not to
+    /// `public` (S2-L5-02).
     #[test]
     fn a_sql_server_schema_named_public_is_still_named() {
         assert_eq!(
             single("orders", Some("public"), MsSql, Change::TruncateTable).emit(),
             vec!["TRUNCATE TABLE [public].[orders];"]
         );
+        // **Nor PostgreSQL's, in a statement that runs** (S2-L5-02): a bare
+        // name resolves through `search_path`, whose stock first entry is
+        // `"$user"`, so a schema named after the login that holds an `orders`
+        // received the Truncate meant for `public.orders` (measured on 16).
         assert_eq!(
             single("orders", Some("public"), Postgres, Change::TruncateTable).emit(),
-            vec!["TRUNCATE TABLE \"orders\";"]
+            vec!["TRUNCATE TABLE \"public\".\"orders\";"]
         );
     }
 
@@ -22530,7 +22536,7 @@ mod tests {
             );
             assert_eq!(
                 drop_trigger(&pg_trigger(), Postgres).emit(),
-                vec!["DROP TRIGGER \"t_upd\" ON \"orders\";"]
+                vec!["DROP TRIGGER \"t_upd\" ON \"public\".\"orders\";"]
             );
         }
 
@@ -24029,7 +24035,7 @@ mod tests {
             draft.name = "large_city".into();
             let sql = diff_view(&v, &draft, Postgres).editor_script();
             assert!(
-                sql.contains(r#"ALTER VIEW "big_city" RENAME TO "large_city";"#),
+                sql.contains(r#"ALTER VIEW "public"."big_city" RENAME TO "large_city";"#),
                 "{sql}"
             );
         }
@@ -24043,8 +24049,11 @@ mod tests {
             draft.name = "large_city".into();
             draft.select = "SELECT city.id AS city_id FROM city".into();
             let sql = diff_view(&v, &draft, Postgres).editor_script();
-            assert!(sql.contains(r#"DROP VIEW "big_city";"#), "{sql}");
-            assert!(sql.contains(r#"CREATE VIEW "large_city""#), "{sql}");
+            assert!(sql.contains(r#"DROP VIEW "public"."big_city";"#), "{sql}");
+            assert!(
+                sql.contains(r#"CREATE VIEW "public"."large_city""#),
+                "{sql}"
+            );
             assert!(!sql.contains("RENAME"), "{sql}");
         }
 
@@ -24088,7 +24097,7 @@ mod tests {
             );
             assert_eq!(
                 cs.editor_script(),
-                r#"DROP MATERIALIZED VIEW "city_stats";"#
+                r#"DROP MATERIALIZED VIEW "public"."city_stats";"#
             );
         }
 
@@ -24139,7 +24148,7 @@ mod tests {
             );
             assert_eq!(
                 cs.editor_script(),
-                r#"REFRESH MATERIALIZED VIEW "city_stats";"#,
+                r#"REFRESH MATERIALIZED VIEW "public"."city_stats";"#,
                 "{}",
                 cs.editor_script()
             );
@@ -24762,7 +24771,7 @@ mod object_tests {
         assert_eq!(cs.len(), 1);
         assert_eq!(
             cs.emit(),
-            vec!["ALTER TYPE \"mood\" ADD VALUE 'elated' AFTER 'happy';"]
+            vec!["ALTER TYPE \"public\".\"mood\" ADD VALUE 'elated' AFTER 'happy';"]
         );
     }
 
@@ -24771,7 +24780,7 @@ mod object_tests {
         let cs = enum_cs(&mood(), |d| d.info.values.insert(1, "meh".into()));
         assert_eq!(
             cs.emit(),
-            vec!["ALTER TYPE \"mood\" ADD VALUE 'meh' AFTER 'sad';"]
+            vec!["ALTER TYPE \"public\".\"mood\" ADD VALUE 'meh' AFTER 'sad';"]
         );
     }
 
@@ -24782,7 +24791,7 @@ mod object_tests {
         let cs = enum_cs(&mood(), |d| d.info.values.insert(0, "awful".into()));
         assert_eq!(
             cs.emit(),
-            vec!["ALTER TYPE \"mood\" ADD VALUE 'awful' BEFORE 'sad';"]
+            vec!["ALTER TYPE \"public\".\"mood\" ADD VALUE 'awful' BEFORE 'sad';"]
         );
     }
 
@@ -24798,8 +24807,8 @@ mod object_tests {
         assert_eq!(
             cs.emit(),
             vec![
-                "ALTER TYPE \"mood\" ADD VALUE 'a' AFTER 'sad';",
-                "ALTER TYPE \"mood\" ADD VALUE 'b' AFTER 'a';",
+                "ALTER TYPE \"public\".\"mood\" ADD VALUE 'a' AFTER 'sad';",
+                "ALTER TYPE \"public\".\"mood\" ADD VALUE 'b' AFTER 'a';",
             ]
         );
     }
@@ -24810,7 +24819,7 @@ mod object_tests {
         let cs = enum_cs(&mood(), |d| d.info.values[1] = "fine".into());
         assert_eq!(
             cs.emit(),
-            vec!["ALTER TYPE \"mood\" RENAME VALUE 'ok' TO 'fine';"]
+            vec!["ALTER TYPE \"public\".\"mood\" RENAME VALUE 'ok' TO 'fine';"]
         );
     }
 
@@ -24839,8 +24848,8 @@ mod object_tests {
         assert_eq!(
             cs.emit(),
             vec![
-                "ALTER TYPE \"mood\" RENAME VALUE 'ok' TO 'fine';",
-                "ALTER TYPE \"mood\" ADD VALUE 'good' AFTER 'fine';",
+                "ALTER TYPE \"public\".\"mood\" RENAME VALUE 'ok' TO 'fine';",
+                "ALTER TYPE \"public\".\"mood\" ADD VALUE 'good' AFTER 'fine';",
             ]
         );
     }
@@ -24899,17 +24908,17 @@ mod object_tests {
         assert_eq!(
             diff_enum(&cur, &d, &deps, Postgres).emit(),
             vec![
-                "ALTER TYPE \"mood\" RENAME TO \"mood_schemaic_old\";",
+                "ALTER TYPE \"public\".\"mood\" RENAME TO \"mood_schemaic_old\";",
                 "CREATE TYPE \"mood\" AS ENUM ('ok', 'happy');\n\
                  COMMENT ON TYPE \"mood\" IS 'how it went';",
-                "ALTER TABLE \"people\" ALTER COLUMN \"m\" DROP DEFAULT;",
-                "ALTER TABLE \"people\" ALTER COLUMN \"m\" TYPE \"mood\" \
-                 USING \"m\"::text::\"mood\";",
-                "ALTER TABLE \"people\" ALTER COLUMN \"m\" SET DEFAULT 'ok'::mood;",
+                "ALTER TABLE \"public\".\"people\" ALTER COLUMN \"m\" DROP DEFAULT;",
+                "ALTER TABLE \"public\".\"people\" ALTER COLUMN \"m\" TYPE \"public\".\"mood\" \
+                 USING \"m\"::text::\"public\".\"mood\";",
+                "ALTER TABLE \"public\".\"people\" ALTER COLUMN \"m\" SET DEFAULT 'ok'::mood;",
                 // An array casts through `text[]`; there is no direct cast.
-                "ALTER TABLE \"people\" ALTER COLUMN \"tags\" TYPE \"mood\"[] \
-                 USING \"tags\"::text[]::\"mood\"[];",
-                "DROP TYPE \"mood_schemaic_old\";",
+                "ALTER TABLE \"public\".\"people\" ALTER COLUMN \"tags\" TYPE \"public\".\"mood\"[] \
+                 USING \"tags\"::text[]::\"public\".\"mood\"[];",
+                "DROP TYPE \"public\".\"mood_schemaic_old\";",
             ]
         );
     }
@@ -24951,10 +24960,13 @@ mod object_tests {
         let sql = cs.emit();
         assert_eq!(sql.len(), 2);
         assert!(
-            sql[0].starts_with("ALTER TYPE \"mood\" ADD VALUE"),
+            sql[0].starts_with("ALTER TYPE \"public\".\"mood\" ADD VALUE"),
             "{sql:?}"
         );
-        assert_eq!(sql[1], "ALTER TYPE \"mood\" RENAME TO \"feeling\";");
+        assert_eq!(
+            sql[1],
+            "ALTER TYPE \"public\".\"mood\" RENAME TO \"feeling\";"
+        );
     }
 
     #[test]
@@ -24972,7 +24984,10 @@ mod object_tests {
     #[test]
     fn clearing_a_comment_emits_null_rather_than_an_empty_string() {
         let cs = enum_cs(&mood(), |d| d.info.comment = None);
-        assert_eq!(cs.emit(), vec!["COMMENT ON TYPE \"mood\" IS NULL;"]);
+        assert_eq!(
+            cs.emit(),
+            vec!["COMMENT ON TYPE \"public\".\"mood\" IS NULL;"]
+        );
     }
 
     #[test]
@@ -25082,7 +25097,7 @@ mod object_tests {
         let cs = domain_cs(&email(), |d| d.info.base_type = "text".into());
         assert_eq!(cs.len(), 1);
         assert!(matches!(cs.changes[0], Change::RecreateDomain { .. }));
-        assert!(cs.emit()[0].starts_with("ALTER DOMAIN \"email\" RENAME TO"));
+        assert!(cs.emit()[0].starts_with("ALTER DOMAIN \"public\".\"email\" RENAME TO"));
         assert!(cs.emit().last().unwrap().starts_with("DROP DOMAIN"));
     }
 
@@ -25195,7 +25210,7 @@ mod object_tests {
             .emit()
             .join("\n");
         assert!(
-            sql.contains("USING \"m\"::text::\"mood\";"),
+            sql.contains("USING \"m\"::text::\"public\".\"mood\";"),
             "an enum needs the explicit cast: {sql}"
         );
     }
@@ -25214,11 +25229,11 @@ mod object_tests {
         assert_eq!(
             cs.emit(),
             vec![
-                "ALTER DOMAIN \"email\" DROP DEFAULT;",
-                "ALTER DOMAIN \"email\" DROP NOT NULL;",
+                "ALTER DOMAIN \"public\".\"email\" DROP DEFAULT;",
+                "ALTER DOMAIN \"public\".\"email\" DROP NOT NULL;",
                 // Drop before add, so the name can be reused within one plan.
-                "ALTER DOMAIN \"email\" DROP CONSTRAINT \"email_shaped\";",
-                "ALTER DOMAIN \"email\" ADD CONSTRAINT \"email_shaped\" \
+                "ALTER DOMAIN \"public\".\"email\" DROP CONSTRAINT \"email_shaped\";",
+                "ALTER DOMAIN \"public\".\"email\" ADD CONSTRAINT \"email_shaped\" \
                  CHECK ((VALUE)::text ~ '@example'::text);",
             ]
         );
@@ -25276,7 +25291,7 @@ mod object_tests {
         d.info.cycle = true;
         assert_eq!(
             diff_sequence(&s, &d, Postgres).emit(),
-            vec!["ALTER SEQUENCE \"counter\"\n  INCREMENT BY 5\n  CYCLE;"]
+            vec!["ALTER SEQUENCE \"public\".\"counter\"\n  INCREMENT BY 5\n  CYCLE;"]
         );
     }
 
@@ -25295,7 +25310,7 @@ mod object_tests {
         assert_eq!(cs.len(), 2, "{:?}", cs.changes);
         assert_eq!(
             cs.emit(),
-            vec!["ALTER SEQUENCE \"counter\"\n  START WITH 100\n  RESTART WITH 500;"]
+            vec!["ALTER SEQUENCE \"public\".\"counter\"\n  START WITH 100\n  RESTART WITH 500;"]
         );
         assert!(cs.destructive().iter().any(|r| r.contains("collides")));
     }
@@ -25309,7 +25324,7 @@ mod object_tests {
         d.restart = Some(500);
         assert_eq!(
             diff_sequence(&s, &d, Postgres).emit(),
-            vec!["ALTER SEQUENCE \"counter\" RESTART WITH 500;"]
+            vec!["ALTER SEQUENCE \"public\".\"counter\" RESTART WITH 500;"]
         );
     }
 
@@ -25368,7 +25383,7 @@ mod object_tests {
         d.info.owned_by = None;
         assert_eq!(
             diff_sequence(&s, &d, Postgres).emit(),
-            vec!["ALTER SEQUENCE \"counter\"\n  OWNED BY NONE;"]
+            vec!["ALTER SEQUENCE \"public\".\"counter\"\n  OWNED BY NONE;"]
         );
     }
 

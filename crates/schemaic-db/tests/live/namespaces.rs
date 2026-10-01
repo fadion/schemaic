@@ -621,6 +621,124 @@ pub async fn generated_ddl_lands_in_the_namespace_it_was_drafted_from(target: &'
     scratch.teardown().await;
 }
 
+/// **DDL for a `public` table names `public`** (S2-L5-02). The stock
+/// `search_path` is `"$user", public`, so with a schema named after the login
+/// that holds a same-named table, the bare `TRUNCATE TABLE "orders"` the
+/// emitter wrote for `public.orders` emptied the login's own `orders` and left
+/// `public.orders` as it was — and the confirm had counted the rows of the
+/// table that was not truncated — while a designer key to `customers` bound
+/// to the login's `customers`. Both tables of each pair exist, so a statement
+/// aimed at the wrong one succeeds: the untouched table is the assertion.
+///
+/// PostgreSQL alone: a MySQL namespace is a database the connection is
+/// scoped to, and SQL Server's emitter already wrote every schema.
+pub async fn public_ddl_does_not_land_in_the_logins_own_schema(target: &'static Target) {
+    use schemaic_core::ddl::{self, Change, ChangeSet, ForeignKeyDraft, TableDraft};
+    use schemaic_core::intel::SqlDialect;
+    use schemaic_core::schema::ForeignKeyInfo;
+
+    if target.engine.dialect() != SqlDialect::Postgres {
+        crate::endpoint::note_no_op(target, "resolves a bare name in no per-login schema");
+        return;
+    }
+    let scratch = Scratch::create(target, "ns_user_schema").await;
+    for sql in [
+        "CREATE SCHEMA AUTHORIZATION CURRENT_USER",
+        "CREATE TABLE public.customers (id integer PRIMARY KEY)",
+        "INSERT INTO public.customers VALUES (1), (2)",
+        "CREATE TABLE public.orders (id integer PRIMARY KEY, cust integer)",
+        "INSERT INTO public.orders VALUES (1, 1), (2, 2)",
+    ] {
+        scratch.exec(sql).await;
+    }
+    let user = scratch.exec("SELECT current_user::text").await;
+    let user = user
+        .cell(0, 0)
+        .map(|c| c.display().to_string())
+        .expect("the login's name");
+    let own = schemaic_core::export::ident_sql(&user, SqlDialect::Postgres);
+    for sql in [
+        format!("CREATE TABLE {own}.customers (id integer PRIMARY KEY)"),
+        format!("INSERT INTO {own}.customers VALUES (7)"),
+        format!("CREATE TABLE {own}.orders (id integer PRIMARY KEY, cust integer)"),
+        format!("INSERT INTO {own}.orders VALUES (9, 7)"),
+    ] {
+        scratch.exec(&sql).await;
+    }
+    let count = |table: String| {
+        let scratch = &scratch;
+        async move {
+            scratch
+                .exec(&format!("SELECT COUNT(*)::text FROM {table}"))
+                .await
+                .cell(0, 0)
+                .map(|c| c.display().to_string())
+                .expect("a count")
+        }
+    };
+    // The precondition: under this connection's `search_path` a bare name
+    // finds the login's own table, not `public`'s.
+    assert_eq!(
+        count("orders".into()).await,
+        "1",
+        "a bare orders is the login's own"
+    );
+
+    // A designer key on `public.orders` to `customers`, its namespace unnamed.
+    let current = table_info_in(&scratch, &scratch.namespace_ref(), "orders").await;
+    let mut draft = TableDraft::from_table(&current);
+    draft
+        .foreign_keys
+        .push(ForeignKeyDraft::new(ForeignKeyInfo {
+            name: "fk_orders_cust".into(),
+            columns: vec!["cust".into()],
+            ref_table: "customers".into(),
+            ref_columns: vec!["id".into()],
+            ..Default::default()
+        }));
+    scratch
+        .apply_plan(
+            &ddl::diff(&current, &draft, SqlDialect::Postgres),
+            "a key to customers",
+        )
+        .await;
+    let bound = scratch
+        .exec(
+            "SELECT n.nspname::text FROM pg_constraint c JOIN pg_class r ON r.oid = c.confrelid \
+             JOIN pg_namespace n ON n.oid = r.relnamespace WHERE c.conname = 'fk_orders_cust'",
+        )
+        .await;
+    assert_eq!(
+        bound.cell(0, 0).map(|c| c.display().to_string()).as_deref(),
+        Some("public"),
+        "the key binds to public.customers"
+    );
+
+    // The tree's Truncate on `public.orders`.
+    let truncate = ChangeSet {
+        table: "orders".into(),
+        schema: Some("public".into()),
+        dialect: SqlDialect::Postgres,
+        flavour: Default::default(),
+        changes: vec![Change::TruncateTable],
+    };
+    scratch
+        .apply_plan(&truncate, "truncate public.orders")
+        .await;
+    assert_eq!(
+        count("public.orders".into()).await,
+        "0",
+        "public.orders emptied"
+    );
+    assert_eq!(
+        count(format!("{own}.orders")).await,
+        "1",
+        "the login's own orders untouched"
+    );
+
+    scratch.teardown().await;
+}
+
 /// The `TableInfo` for `table` as `ns` reports it — the whole row the designer
 /// would draft from, not just its column names (cf. [`table_in`]).
 async fn table_info_in(

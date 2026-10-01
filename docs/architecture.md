@@ -3799,7 +3799,7 @@ existing prose was left alone.
     where a bare name resolves in the *login's* default schema and then `dbo`, never in the altered
     table's, and on PostgreSQL, where it resolves through `search_path`. `fk_clause(fk, owner,
     dialect)` takes `owner`, the namespace of the table the key stands on, and writes a `None` key
-    qualified with it wherever the answer is no (`qualified` still drops `public`) — `emit_mssql`,
+    qualified with it wherever the answer is no (`public` included, since S2-L5-02) — `emit_mssql`,
     `emit_mysql` and `emit_postgres` pass the change set's schema, `create_table_sql` the draft's,
     and the rebuild's inbound keys their own table's. The designer's foreign-key picker lists only
     the designed table's schema and writes only `ref_table`, so on SQL Server a key added to
@@ -13085,11 +13085,20 @@ existing prose was left alone.
   clear Nullable. So where `primary_key_implies_not_null` says no — SQL Server alone, an exhaustive
   `match` — `diff` reads the draft's key columns as `NOT NULL` and the plan alters them before
   `ADD PRIMARY KEY` (`a_nullable_column_keyed_on_sql_server_is_made_not_null_first`). And
-  `ddl::qualified` drops `public` only on PostgreSQL, where it is what an unqualified name resolves
-  to; it used `sql_qualifier`, which drops it on every engine. A schema called `public` cannot be
-  made on SQL Server (the `public` role holds the name, Msg 2714, measured), so this was latent
-  there, but the emitter is right by construction now
-  (`a_sql_server_schema_named_public_is_still_named`).
+  **`ddl::qualified` writes every schema it is given, on every engine — PostgreSQL's `public`
+  included.** It went through `sql_qualifier`, which drops `public` for SQL the user reads, first
+  on every engine and then on PostgreSQL alone, "where it is what an unqualified name resolves
+  to" — which it is not: a bare name resolves through `search_path`, whose stock value is
+  `"$user", public`, so with a schema named after the login that holds a same-named table (the
+  per-user layout PostgreSQL's own documentation recommends) `TRUNCATE TABLE "orders"` for
+  `public.orders` emptied the login's `orders` while the confirm counted `public`'s rows, and a
+  designer key to `customers` bound to the login's `customers` (S2-L5-02, measured on 16). The
+  write path already qualified `public` for that reason (`db::pg::pg_qname`), and nothing in
+  `schemaic-db` sets `search_path` on a connection. So the preview of a `public` table's plan now
+  reads `"public"."orders"`; `sql_qualifier` keeps the elision for SQL only shown, never run. A
+  schema called `public` cannot be made on SQL Server (the `public` role holds the name, Msg 2714,
+  measured) (`a_sql_server_schema_named_public_is_still_named`,
+  `public_ddl_does_not_land_in_the_logins_own_schema`).
   **`tsql_supports`' `AlterColumn` arm is an allowlist.** It copies `to`'s name, type,
   nullability, collation, default, key flag and comment onto `from` — the fields `tsql_alter_column`,
   the rename and the comment phase write — and admits the change only if that already equals `to` under `columns_equal`,

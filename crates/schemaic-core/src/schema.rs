@@ -1002,7 +1002,8 @@ pub fn default_namespace(dialect: crate::intel::SqlDialect) -> Option<&'static s
 /// statement the user sees stays clean and identical to the single-schema case.
 /// (The *write* path doesn't use this — `commit_writes`/`refetch_rows` qualify
 /// unconditionally, since that SQL is invisible and must not depend on
-/// `search_path` at all.)
+/// `search_path` at all — and neither does the DDL a plan runs,
+/// `ddl::qualified`: a stock `search_path` leads with `"$user"`.)
 /// **Case-sensitively** `public`, and only that. PostgreSQL identifiers are
 /// case-sensitive once quoted, so a schema literally named `"PUBLIC"` is a
 /// different schema from `public` — and folding it away made every statement
