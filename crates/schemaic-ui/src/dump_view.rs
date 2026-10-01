@@ -372,38 +372,24 @@ fn run_dump(ctx: &DumpCtx, target: DumpTarget) {
                     // file whose every blob is `NULL` is the failure this whole
                     // sentence exists to prevent. The table count is this path's
                     // own; the rest is the same sentence the grid's bar shows.
+                    // What the file is short of, and what a replay of it will
+                    // not replace, in the same sentence as the tally — see
+                    // `dump::done_note`.
                     DumpOutcome::Done {
                         tables,
                         tally,
                         missing,
                         refused,
-                    } => {
-                        // A ticked table the dump's own fresh introspection could
-                        // not find is the difference between a backup and a file
-                        // that looks like one, so it goes in the same sentence as
-                        // the tally rather than only into the file's header.
-                        let short = if missing.is_empty() {
-                            String::new()
-                        } else {
-                            format!(
-                                " {} ticked {} not found and {} not in the file: {}.",
-                                missing.len(),
-                                schemaic_core::text::plural(missing.len(), "table", "tables"),
-                                schemaic_core::text::plural(missing.len(), "is", "are"),
-                                missing.join(", "),
-                            )
-                        };
-                        // And what a replay of it will not replace, which is
-                        // the thing to know before trying one.
-                        d.done.set(Some(format!(
-                            "Wrote {} {}. {}{short}{}",
-                            tables,
-                            schemaic_core::text::plural(tables, "table", "tables"),
-                            schemaic_core::export::export_note(&tally, &name, true)
-                                .unwrap_or_default(),
-                            schemaic_core::dump::refused_note(&refused),
-                        )))
-                    }
+                        left_out,
+                        rows_left_out,
+                    } => d.done.set(Some(schemaic_core::dump::done_note(
+                        tables,
+                        schemaic_core::export::export_note(&tally, &name, true).as_deref(),
+                        &missing,
+                        &left_out,
+                        &rows_left_out,
+                        &refused,
+                    ))),
                     DumpOutcome::Cancelled { partial } => d
                         .error
                         .set(Some(schemaic_core::dump::cancel_note(&name, partial))),

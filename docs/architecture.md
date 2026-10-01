@@ -3416,7 +3416,18 @@ existing prose was left alone.
     header** — a system-versioned table, its history table, a memory-optimised table
     (`TsqlTableKind::unrestatable`): kept, its `DROP` destroyed what the file could not put back and
     its rows landed in nothing. Out of `order`, a key onto one is counted with the keys to tables
-    outside the export. A graph edge is restated, empty, and the header says why: an edge names
+    outside the export. **What cannot be created without it goes with it**
+    (`dependents_left_out`): every chosen view reading one, every routine in the export's
+    namespaces that binds to one at `CREATE` — schema-bound, natively compiled, or an inline
+    table-valued function (`binds_at_create`) — and every table whose expressions call such a
+    routine, each in turn counting as gone. One left in stopped the whole restore at its
+    `CREATE VIEW` (Msg 208, measured on 2022) and *One transaction* rolled everything back, where
+    without it the file restored one table short; a routine that only reads the table when it runs
+    stays. Names are matched with their qualifier read off the text (`names_object`), so a view
+    over `sales.emp` is not taken for one over `dbo.emp`. The lot is `DumpPlan::left_out`, named
+    in the header and, through `dump::done_note`, in the modal's report beside the missing tables
+    (`what_reads_a_table_left_out_of_the_file_is_left_out_with_it`; live,
+    `a_dump_leaves_out_what_reads_a_table_it_cannot_restate`). A graph edge is restated, empty, and the header says why: an edge names
     the nodes it joins by node id, and a restore gives every node a new one; a node's rows are
     carried (`a_table_the_file_cannot_restate_is_named_and_left_out`; the live round trip's node
     comes back a node with its rows, its edge an empty edge, and its temporal pair absent). For
@@ -3554,7 +3565,7 @@ existing prose was left alone.
     `-- Dropped first` section before any `CREATE` drops each key between the dumped tables that
     is there (`IF OBJECT_ID(…, N'F') IS NOT NULL ALTER TABLE … DROP CONSTRAINT`), then everything
     else in the exact mirror of the file's creation order — the trailing routines first, then each
-    view and table children-first with the functions `routine_slots` moved in ahead of it dropped
+    view and table children-first with the functions `creation_order` moved in ahead of it dropped
     straight after it (`DROP FUNCTION`/`DROP PROCEDURE IF EXISTS`) — and the per-table `DROP`
     beside each `CREATE` is not written. **The mirror is the only order that works**: a
     schema-bound function holds the table it reads and is held by the table whose column calls
@@ -3703,18 +3714,32 @@ existing prose was left alone.
     `CREATE` that carries it**, and that is the part a tidy would get wrong: a PostgreSQL function's
     `CREATE` wraps its body in `$$ … $$`, which is exactly what `intel::code_mask` marks as *not*
     code — so asking the emitted statement finds nothing, every time, and the walk would be a no-op
-    that looked like a fix. **`routine_slots` is the fourth, and the edge the other way.**
+    that looked like a fix. **`creation_order` is the fourth, and the edge the other way.**
     Routines go after the tables because a function reads them, but a table or view can call a
     function too, and SQL Server resolves one at `CREATE TABLE`/`CREATE VIEW` time (PostgreSQL does
     for a default and a view): a computed column, a check, a default or a view calling a function
     the file created later stopped the restore (Msg 4121). So a function named by a table's
     expressions (generated, default, check — not its `CREATE`, where a column named like a function
-    is no call) or a view's definition, and every function such a one calls, is written just ahead
-    of its first caller and after the last table or view it names itself; where both cannot hold,
-    the caller wins, being the statement that would fail. Every other routine stays in the trailing
-    section (`a_function_a_table_or_view_calls_is_created_before_it`, SQL Server and PostgreSQL; the
-    live round trip carries a table whose computed column, check and default call a function, and a
-    view that does). The standalone-objects section
+    is no call) or a view's definition, and every function such a one calls (`routine_slots` picks
+    them), is written just ahead of its first caller and after the last table or view it names
+    itself. **Tables, views and those functions are sorted as one graph**, not a function fitted
+    into a table order fixed without it: that order took the caller's side wherever the function's
+    two edges disagreed with it, so a view reaching another view only through an inline function
+    came out ahead of it, and a table whose check calls a function counting another table had its
+    rows refused before that table existed (Msg 208 both, on 2022 and 2025). Now the caller waits.
+    `order_tables`' answer is the tie-break — the first ready table or view in it goes next, its
+    own edges kept only as it already satisfies them, so a cycle it broke stays broken the same
+    way — and a function goes as soon as everything it names is there, so where no function is
+    called the file is byte-identical. Only a real cycle, a function reading a table whose own
+    column calls it, is broken, at the function, since deferred name resolution lets it stand
+    first. Every other routine stays in the trailing section
+    (`a_function_a_table_or_view_calls_is_created_before_it`, SQL Server and PostgreSQL;
+    `a_view_reached_through_a_function_comes_after_what_the_function_reads`,
+    `a_table_whose_check_calls_a_function_comes_after_what_the_function_reads`,
+    `the_one_sort_keeps_the_old_order_and_breaks_a_real_cycle_at_the_function`; the live round trip
+    carries a table whose computed column, check and default call a function, and a view that does,
+    and `a_dump_orders_tables_and_views_through_the_functions_they_call` both chains, restored and
+    replayed). The standalone-objects section
     covers only the namespaces the chosen tables live in — a dump of `sales` has no business
     recreating `archive`'s types — and skips `ObjectItem::is_internal`, since a `serial`'s own
     sequence is created by the column's definition and restating it fails the load on a name that
@@ -24135,8 +24160,12 @@ existing prose was left alone.
     structure-only dump streams nothing at all, so counting tables would promise a "12 of 12" that
     never arrives, while `DumpOutcome::Done`'s `tables` is `DumpPlan::tables`, what the file actually
     covers, and its `missing` is what the fresh introspection could not find at all. Its
-    `refused` is `DumpPlan::refused`, what a replay of the file will not replace, which the modal
-    words through `dump::refused_note`.
+    `refused` is `DumpPlan::refused`, what a replay of the file will not replace, its `left_out`
+    what the file leaves out though the export asked for it, and its `rows_left_out` the graph
+    edges created without their rows; the modal's sentence is `dump::done_note`, each part a
+    sentence of its own with one space between — the `format!` it replaced put a space after the
+    tally whatever followed, so a quiet dump read "Wrote 2 tables. " and a short one had two
+    spaces in it (`the_done_note_says_what_the_file_is_short_of_in_single_spaced_sentences`).
     **Beside it rides an `ExportTally`, not a row count.** `write` folds each table's tally into one
     through `ExportTally::absorb` — rows summed, and a withheld or blanked column named once however
     many tables it appears in, the rule `ExportTally::note` already follows within a single export —

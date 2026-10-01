@@ -1481,6 +1481,112 @@ async fn a_replay_leaves_a_sequence_where_it_stands() {
     );
 }
 
+/// **What reads a table the dump leaves out is left out with it.** A
+/// system-versioned table is not in the file, and a view over it stopped the
+/// restore into an empty database at its `CREATE VIEW` (Msg 208), the
+/// transaction rolling back everything — so the view, and the inline function
+/// bound to it, go too, named in the header; the rest restores.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dump_leaves_out_what_reads_a_table_it_cannot_restate() {
+    use schemaic_core::dump::DumpOptions;
+    if !enabled() || azure_cannot("restores into a second database, which it has not got") {
+        return;
+    }
+    let src = Scratch::create("dump_tempsrc").await;
+    src.exec(
+        "CREATE TABLE dbo.dept (id int PRIMARY KEY); INSERT dbo.dept VALUES (1), (2); \
+         CREATE TABLE dbo.emp (id int PRIMARY KEY, v int, \
+           vf datetime2 GENERATED ALWAYS AS ROW START HIDDEN NOT NULL, \
+           vt datetime2 GENERATED ALWAYS AS ROW END HIDDEN NOT NULL, \
+           PERIOD FOR SYSTEM_TIME (vf, vt)) \
+           WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = dbo.emp_history)); \
+         INSERT dbo.emp (id, v) VALUES (1, 10);",
+    )
+    .await;
+    src.exec("CREATE VIEW dbo.emp_v AS SELECT id, v FROM dbo.emp")
+        .await;
+    src.exec("CREATE VIEW dbo.dept_v AS SELECT id FROM dbo.dept")
+        .await;
+    src.exec("CREATE FUNCTION dbo.tvf_emp () RETURNS TABLE AS RETURN SELECT id FROM dbo.emp")
+        .await;
+    let file = Box::pin(dump_file(&src, DumpOptions::default())).await;
+    assert!(
+        file.contains("dbo.emp_v (a view reading dbo.emp, which is not in this file)")
+            && file.contains("dbo.tvf_emp (a function bound to dbo.emp"),
+        "{file}"
+    );
+    let dst = Scratch::create("dump_tempdst").await;
+    let end = Box::pin(restore_file(&dst, &file)).await;
+    assert!(
+        matches!(end, schemaic_core::script::ExecEnd::Done),
+        "{end:?}\n{file}"
+    );
+    assert_eq!(
+        dst.scalar(
+            "SELECT CONCAT((SELECT COUNT(*) FROM dbo.dept_v), '|', OBJECT_ID('dbo.emp'), '|', \
+             OBJECT_ID('dbo.emp_v'), '|', OBJECT_ID('dbo.tvf_emp'))"
+        )
+        .await,
+        "2|||"
+    );
+}
+
+/// **Tables, views and the functions they call are created in one order.**
+/// A view reaching another view only through an inline function, and a table
+/// whose check calls a function counting another table, were written
+/// caller-first — the names sort them so — and the restore into an empty
+/// database stopped at the function (Msg 208) and at the checked rows (Msg
+/// 208).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dump_orders_tables_and_views_through_the_functions_they_call() {
+    use schemaic_core::dump::DumpOptions;
+    if !enabled() || azure_cannot("restores into a second database, which it has not got") {
+        return;
+    }
+    let src = Scratch::create("dump_fnordsrc").await;
+    src.exec("CREATE TABLE dbo.t (id int PRIMARY KEY); INSERT dbo.t VALUES (1), (2), (3)")
+        .await;
+    src.exec("CREATE VIEW dbo.v_z AS SELECT id AS n FROM dbo.t")
+        .await;
+    src.exec("CREATE FUNCTION dbo.tvf_b () RETURNS TABLE AS RETURN SELECT n FROM dbo.v_z")
+        .await;
+    src.exec("CREATE VIEW dbo.v_a AS SELECT n FROM dbo.tvf_b()")
+        .await;
+    src.exec(
+        "CREATE TABLE dbo.z_customers (id int PRIMARY KEY); INSERT dbo.z_customers VALUES (7), (8)",
+    )
+    .await;
+    src.exec(
+        "CREATE FUNCTION dbo.f_known (@id int) RETURNS int AS \
+         BEGIN RETURN (SELECT COUNT(*) FROM dbo.z_customers WHERE id = @id); END",
+    )
+    .await;
+    src.exec(
+        "CREATE TABLE dbo.a_orders (id int PRIMARY KEY, customer_id int, \
+           CONSTRAINT ck_known CHECK (dbo.f_known(customer_id) = 1)); \
+         INSERT dbo.a_orders VALUES (1, 7), (2, 8);",
+    )
+    .await;
+    let file = Box::pin(dump_file(&src, DumpOptions::default())).await;
+    let dst = Scratch::create("dump_fnorddst").await;
+    for round in ["restore", "replay"] {
+        let end = Box::pin(restore_file(&dst, &file)).await;
+        assert!(
+            matches!(end, schemaic_core::script::ExecEnd::Done),
+            "{round}: {end:?}\n{file}"
+        );
+        assert_eq!(
+            dst.scalar(
+                "SELECT CONCAT((SELECT SUM(n) FROM dbo.v_a), '|', \
+                 (SELECT COUNT(*) FROM dbo.a_orders))"
+            )
+            .await,
+            "6|2",
+            "{round}"
+        );
+    }
+}
+
 /// Validation compiles without running: a missing table is reported by
 /// number, and a `DELETE` that checks clean deleted nothing.
 #[tokio::test(flavor = "multi_thread")]

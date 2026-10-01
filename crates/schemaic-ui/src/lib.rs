@@ -714,6 +714,12 @@ pub enum DumpOutcome {
         /// What a replay of the file will not replace — see
         /// [`DumpPlan::refused`](schemaic_core::dump::DumpPlan::refused).
         refused: Vec<String>,
+        /// What the file leaves out though the export asked for it — see
+        /// [`DumpPlan::left_out`](schemaic_core::dump::DumpPlan::left_out).
+        left_out: Vec<String>,
+        /// The tables it creates without their rows — see
+        /// [`DumpPlan::rows_left_out`](schemaic_core::dump::DumpPlan::rows_left_out).
+        rows_left_out: Vec<String>,
     },
     /// `partial` says whether a `.part` fragment is on disk and worth naming —
     /// the same field `Failed` carries, and for the same reason.

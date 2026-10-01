@@ -157,6 +157,23 @@ pub struct DumpPlan {
     /// ([`refuse_if_present_sql`]). Named in the header and, through
     /// [`refused_note`], in the modal.
     pub refused: Vec<String>,
+    /// What the file leaves out though the export asked for it, each with
+    /// why — a table no script from the model restates (`dbo.emp (a
+    /// system-versioned temporal table)`), and every view, routine or table
+    /// that could not be created without one (`dbo.emp_v (a view reading
+    /// dbo.emp, …)`).
+    ///
+    /// **Named in the modal as well as the header**, beside
+    /// [`DumpPlan::missing`] and for its reason: a file a table short of what
+    /// was ticked looks exactly like a complete one, and the green report
+    /// said "Wrote 2 tables." over it. Its dependents are left out with it
+    /// because one kept stopped the whole restore (Msg 208), which *One
+    /// transaction* then rolled back entirely.
+    pub left_out: Vec<String>,
+    /// The tables whose rows the file does not carry though it creates them
+    /// — a graph edge's (see [`plan`]'s header) — named in the modal for
+    /// [`DumpPlan::left_out`]'s reason.
+    pub rows_left_out: Vec<String>,
 }
 
 impl DumpPlan {
@@ -759,6 +776,71 @@ pub fn refused_note(refused: &[String]) -> String {
         crate::text::plural(n, "it is", "they are"),
         refused.join(", "),
     )
+}
+
+/// The modal's report on a finished dump: how many tables the file covers,
+/// then — each only when there is something to say — the export renderer's
+/// own caveat (`export_note`), the ticked tables the dump could not find,
+/// what it left out ([`DumpPlan::left_out`]), the tables whose rows it does
+/// not carry ([`DumpPlan::rows_left_out`]) and what a replay will not
+/// replace ([`refused_note`]).
+///
+/// **Each a sentence of its own, one space between them.** It was a
+/// `format!` in the view that put a space after the tally whatever followed
+/// it, so a dump with nothing to add read "Wrote 2 tables. " and one with a
+/// missing table "Wrote 2 tables.  1 ticked …".
+pub fn done_note(
+    tables: usize,
+    export_note: Option<&str>,
+    missing: &[String],
+    left_out: &[String],
+    rows_left_out: &[String],
+    refused: &[String],
+) -> String {
+    let mut parts = vec![format!(
+        "Wrote {tables} {}.",
+        crate::text::plural(tables, "table", "tables")
+    )];
+    parts.extend(
+        export_note
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .map(str::to_string),
+    );
+    // A ticked table the dump's own fresh introspection could not find is the
+    // difference between a backup and a file that looks like one, so it goes
+    // in the same sentence as the tally rather than only into the header.
+    if !missing.is_empty() {
+        let n = missing.len();
+        parts.push(format!(
+            "{n} ticked {} not found and {} not in the file: {}.",
+            crate::text::plural(n, "table", "tables"),
+            crate::text::plural(n, "is", "are"),
+            missing.join(", "),
+        ));
+    }
+    // So is one it found and could not write, and whatever went with it.
+    if !left_out.is_empty() {
+        let n = left_out.len();
+        parts.push(format!(
+            "{n} {} the export asked for {} not in the file: {}.",
+            crate::text::plural(n, "object", "objects"),
+            crate::text::plural(n, "is", "are"),
+            left_out.join(", "),
+        ));
+    }
+    if !rows_left_out.is_empty() {
+        let n = rows_left_out.len();
+        parts.push(format!(
+            "The rows of graph edge {} {} are not in the file; {} created empty.",
+            crate::text::plural(n, "table", "tables"),
+            rows_left_out.join(", "),
+            crate::text::plural(n, "it is", "they are"),
+        ));
+    }
+    let refused = refused_note(refused);
+    parts.extend(Some(refused.trim().to_string()).filter(|r| !r.is_empty()));
+    parts.join(" ")
 }
 
 /// The statements that make the file's own container before it is used —
@@ -1461,6 +1543,202 @@ fn table_hold(t: &TableInfo, any_edge: bool, dialect: SqlDialect) -> Option<Hold
     None
 }
 
+/// Does `text`, written in namespace `own`, name the object `name` in
+/// namespace `ns` — qualified (`s.n`, `[s].[n]`, `"s"."n"`), or bare where a
+/// bare name reaches it: in its own namespace, or the engine's default one?
+///
+/// Matched in code as a whole word ([`crate::intel::code_word_hits_in`]),
+/// with the qualifier in front of the hit read off rather than the name
+/// searched for twice, so `sales.emp` is not taken for `dbo.emp`.
+fn names_object(
+    text: &str,
+    code: &[bool],
+    dialect: SqlDialect,
+    own: Option<&str>,
+    ns: Option<&str>,
+    name: &str,
+) -> bool {
+    let b = text.as_bytes();
+    let same = |a: Option<&str>, z: Option<&str>| match (a, z) {
+        (Some(a), Some(z)) => a.eq_ignore_ascii_case(z),
+        (None, None) => true,
+        _ => false,
+    };
+    let opener = |c: u8| matches!(c, b'[' | b'"' | b'`');
+    let closer = |c: u8| matches!(c, b']' | b'"' | b'`');
+    crate::intel::code_word_hits_in(text, code, name)
+        .into_iter()
+        .any(|(i, _)| {
+            let mut j = i;
+            if j > 0 && opener(b[j - 1]) {
+                j -= 1;
+            }
+            if j == 0 || b[j - 1] != b'.' {
+                return same(own, ns) || same(ns, crate::schema::default_namespace(dialect));
+            }
+            // The qualifier: a quoted run up to its opener, or a word.
+            let stop = j - 1;
+            let (from, to) = if stop > 0 && closer(b[stop - 1]) {
+                let close = stop - 1;
+                let open = text[..close].rfind(['[', '"', '`']).unwrap_or(close);
+                (open + 1, close)
+            } else {
+                let mut k = stop;
+                while k > 0 && crate::sql::is_word_byte(b[k - 1]) {
+                    k -= 1;
+                }
+                (k, stop)
+            };
+            let qual = &text[from..to];
+            // `db..n` is the default namespace of database `db`.
+            if qual.is_empty() {
+                return same(ns, crate::schema::default_namespace(dialect));
+            }
+            ns.is_some_and(|ns| ns.eq_ignore_ascii_case(qual))
+        })
+}
+
+/// Does a routine bind to what it names when it is created, so that one
+/// naming an object the file leaves out stops the restore at its `CREATE`?
+/// A schema-bound or natively compiled module, and an inline table-valued
+/// function, do; any other routine resolves its names when it runs.
+fn binds_at_create(r: &crate::schema::RoutineInfo) -> bool {
+    use crate::schema::TsqlRoutineOption as O;
+    r.tsql
+        .options
+        .iter()
+        .any(|o| matches!(o, O::SchemaBinding | O::NativeCompilation))
+        || (r.kind == crate::schema::RoutineKind::Function
+            && r.returns.trim().eq_ignore_ascii_case("TABLE"))
+}
+
+/// What has to be left out of the file **with** the tables in `gone` (indices
+/// into `schema.tables`), which it does not create: every view in `order`
+/// reading one, every table in `order` whose expressions call a routine
+/// left out, and every routine in the export's namespaces that binds to one
+/// at `CREATE` ([`binds_at_create`]) — each in turn counting as gone, until
+/// nothing more is. Returns the tables and views (indices), the routines
+/// (`(namespace, name)`) and a label for each, saying why.
+///
+/// **One left in stops the whole restore.** A view over a temporal table
+/// the file leaves out failed at its `CREATE VIEW` (Msg 208), and *One
+/// transaction* rolled back everything before it — where without such a
+/// view the file restored, one table short and saying so.
+fn dependents_left_out(
+    schema: &DbSchema,
+    order: &[usize],
+    gone: &[usize],
+    dialect: SqlDialect,
+) -> (
+    std::collections::HashSet<usize>,
+    std::collections::HashSet<(Option<String>, String)>,
+    Vec<String>,
+) {
+    let mut out_tables = std::collections::HashSet::new();
+    let mut out_routines = std::collections::HashSet::new();
+    let mut labels = Vec::new();
+    if gone.is_empty() {
+        return (out_tables, out_routines, labels);
+    }
+    // `(namespace, name, a routine)` of everything gone so far.
+    let mut gone_objs: Vec<(Option<String>, String, bool)> = gone
+        .iter()
+        .map(|&i| {
+            let t = &schema.tables[i];
+            (t.schema.clone(), t.name.clone(), false)
+        })
+        .collect();
+    let namespaces: Vec<Option<&str>> = order
+        .iter()
+        .map(|&i| schema.tables[i].schema.as_deref())
+        .collect();
+    let callers = caller_texts(&schema.tables, order);
+    let caller_code: Vec<Vec<bool>> = callers
+        .iter()
+        .map(|t| crate::intel::code_mask(t, dialect))
+        .collect();
+    let routines: Vec<&crate::schema::RoutineInfo> = schema
+        .routines
+        .iter()
+        .map(|r| r.as_ref())
+        .filter(|r| namespaces.contains(&r.schema.as_deref()) && binds_at_create(r))
+        .collect();
+    let routine_code: Vec<Vec<bool>> = routines
+        .iter()
+        .map(|r| crate::intel::code_mask(&r.body, dialect))
+        .collect();
+    // The first gone object `text` names — only a routine, where `calls`:
+    // a table's expressions can call one, and a column there named like a
+    // table is not a mention of it.
+    let first_named = |text: &str,
+                       code: &[bool],
+                       own: Option<&str>,
+                       calls: bool,
+                       gone: &[(Option<String>, String, bool)]| {
+        gone.iter()
+            .filter(|(.., routine)| *routine || !calls)
+            .find(|(ns, name, _)| names_object(text, code, dialect, own, ns.as_deref(), name))
+            .map(|(ns, name, _)| display_name(ns.as_deref(), name))
+    };
+    loop {
+        let mut more = false;
+        for (k, &i) in order.iter().enumerate() {
+            let t = &schema.tables[i];
+            if out_tables.contains(&i) {
+                continue;
+            }
+            // A view reads a table, a view or a routine; a table's
+            // expressions call a routine, gone only once one is left out
+            // below.
+            let Some(g) = first_named(
+                &callers[k],
+                &caller_code[k],
+                t.schema.as_deref(),
+                !t.is_view,
+                &gone_objs,
+            ) else {
+                continue;
+            };
+            let what = if t.is_view {
+                format!("a view reading {g}")
+            } else {
+                format!("a table whose columns or checks call {g}")
+            };
+            labels.push(format!(
+                "{} ({what}, which is not in this file)",
+                display_name(t.schema.as_deref(), &t.name)
+            ));
+            out_tables.insert(i);
+            gone_objs.push((t.schema.clone(), t.name.clone(), false));
+            more = true;
+        }
+        for (r, code) in routines.iter().zip(&routine_code) {
+            let key = (r.schema.clone(), r.name.clone());
+            if out_routines.contains(&key) {
+                continue;
+            }
+            let Some(g) = first_named(&r.body, code, r.schema.as_deref(), false, &gone_objs) else {
+                continue;
+            };
+            labels.push(format!(
+                "{} (a {} bound to {g}, which is not in this file)",
+                display_name(r.schema.as_deref(), &r.name),
+                match r.kind {
+                    crate::schema::RoutineKind::Procedure => "procedure",
+                    _ => "function",
+                }
+            ));
+            gone_objs.push((key.0.clone(), key.1.clone(), true));
+            out_routines.insert(key);
+            more = true;
+        }
+        if !more {
+            break;
+        }
+    }
+    (out_tables, out_routines, labels)
+}
+
 /// The [`Hold`] on routine `r`, or `None` for one a replay may drop and put
 /// back.
 fn routine_hold(r: &crate::schema::RoutineInfo, dialect: SqlDialect) -> Option<Hold> {
@@ -1492,9 +1770,10 @@ fn routine_hold(r: &crate::schema::RoutineInfo, dialect: SqlDialect) -> Option<H
     })
 }
 
-/// Where each routine goes among the tables: `Some(k)` is "just before
-/// `order[k]`'s section" (`k == order.len()` after the last), `None` is the
-/// trailing routines section.
+/// The tables and views in creation order **together with the functions they
+/// call**, and where each routine goes among them: `Some(k)` is "just before
+/// the returned order's `k`th section" (`k == order.len()` after the last),
+/// `None` is the trailing routines section.
 ///
 /// **A function a table or view calls is created before it.** SQL Server
 /// resolves one at `CREATE TABLE`/`CREATE VIEW` time, so a computed column, a
@@ -1504,23 +1783,138 @@ fn routine_hold(r: &crate::schema::RoutineInfo, dialect: SqlDialect) -> Option<H
 /// view's definition name — and every function one of those calls, since it
 /// has to exist first — moves up, to just after the last table *it* names:
 /// the other half of the edge the trailing section exists for, a function
-/// reading a table that is not there yet (`check_function_bodies`). Where the
-/// two cannot both hold — a function reading a table whose own column calls
-/// it — the caller wins, since that is the statement that would fail.
+/// reading a table that is not there yet (`check_function_bodies`).
+///
+/// **One sort over all three, not a function fitted into a table order fixed
+/// without it.** The tables and views were ordered first, by their keys,
+/// their mentions of one another and name, and a function whose two edges
+/// could not both hold in that order took its caller's side — so a view
+/// reaching another view only through an inline function came out ahead of
+/// it and stopped the restore at the function (Msg 208), and a table whose
+/// check calls a function counting another table had its rows refused before
+/// that table existed. Here the caller waits instead. `order` is the order
+/// the tables and views had without any function, and it is the tie-break:
+/// whichever ready table or view comes first in it goes next, and a function
+/// goes as soon as everything it names is there — so where no function is
+/// called the file is exactly what it was. Only a real cycle — a function
+/// reading a table whose own column calls it — is broken, and at the
+/// function, since that is the statement deferred name resolution lets
+/// stand first.
 ///
 /// Every other routine stays where it was, after the data. `routines` is
 /// already in dependency order among itself ([`order_by_mention`]), and names
 /// are matched as whole words in code, as that walk matches them.
-fn routine_slots(
+fn creation_order(
     routines: &[Emitted],
     tables: &[TableInfo],
     order: &[usize],
+    home: Option<&str>,
     dialect: SqlDialect,
-) -> Vec<Option<usize>> {
-    // What each table's expressions and each view's definition say — the text
-    // a function has to exist for. Not the `CREATE`: a column named like a
-    // function is not a call.
-    let callers: Vec<String> = order
+) -> (Vec<usize>, Vec<Option<usize>>) {
+    let slots = routine_slots(routines, tables, order, dialect);
+    let moved: Vec<usize> = (0..routines.len())
+        .filter(|&r| slots[r].is_some())
+        .collect();
+    if moved.is_empty() {
+        return (order.to_vec(), slots);
+    }
+    let code = |t: &str| crate::intel::code_mask(t, dialect);
+    let names = |text: &str, mask: &[bool], word: &str| {
+        !crate::intel::code_word_hits_in(text, mask, word).is_empty()
+    };
+    // Nodes: `order`'s positions, then the moved functions.
+    let m = order.len();
+    let callers = caller_texts(tables, order);
+    let caller_code: Vec<Vec<bool>> = callers.iter().map(|t| code(t)).collect();
+    let mut waits: Vec<Vec<usize>> = vec![Vec::new(); m + moved.len()];
+    for (k, &i) in order.iter().enumerate() {
+        let t = &tables[i];
+        // What it waited for before — kept only as `order` already has it,
+        // so a cycle `order_tables` broke stays broken the same way.
+        let def = t.view_definition.as_deref().filter(|_| t.is_view);
+        let def_code = def.map(code);
+        for (p, &j) in order.iter().enumerate().take(k) {
+            let keyed = t
+                .foreign_keys
+                .iter()
+                .any(|fk| fk_targets(fk, t, &tables[j], home));
+            let read = def
+                .zip(def_code.as_deref())
+                .is_some_and(|(d, c)| names(d, c, &tables[j].name));
+            if j != i && (keyed || read) {
+                waits[k].push(p);
+            }
+        }
+        for (f, &r) in moved.iter().enumerate() {
+            if names(&callers[k], &caller_code[k], &routines[r].name) {
+                waits[k].push(m + f);
+            }
+        }
+    }
+    for (f, &r) in moved.iter().enumerate() {
+        let body_code = code(&routines[r].body);
+        for (k, &i) in order.iter().enumerate() {
+            if names(&routines[r].body, &body_code, &tables[i].name) {
+                waits[m + f].push(k);
+            }
+        }
+        // A function it calls that `routines` already puts first.
+        for (g, &q) in moved.iter().enumerate().take(f) {
+            if names(&routines[r].body, &body_code, &routines[q].name) {
+                waits[m + f].push(m + g);
+            }
+        }
+    }
+    let n = waits.len();
+    let mut done = vec![false; n];
+    let ready = |p: usize, done: &[bool]| !done[p] && waits[p].iter().all(|&d| done[d]);
+    let mut new_order: Vec<usize> = Vec::with_capacity(m);
+    let mut new_slots: Vec<Option<usize>> = vec![None; routines.len()];
+    for _ in 0..n {
+        // A ready function first — as early as it can go — then the first
+        // ready table or view in the old order.
+        let next = (m..n)
+            .find(|&p| ready(p, &done))
+            .or_else(|| (0..m).find(|&p| ready(p, &done)))
+            .or_else(|| {
+                // A cycle: broken at a function on it, or else where
+                // `order_tables` would have broken it.
+                (m..n)
+                    .find(|&p| !done[p] && on_cycle(p, &waits, &done))
+                    .or_else(|| (0..n).find(|&p| !done[p]))
+            });
+        let Some(p) = next else { break };
+        done[p] = true;
+        if p < m {
+            new_order.push(order[p]);
+        } else {
+            new_slots[moved[p - m]] = Some(new_order.len());
+        }
+    }
+    (new_order, new_slots)
+}
+
+/// Does `p` wait, through members not yet `done`, on itself?
+fn on_cycle(p: usize, waits: &[Vec<usize>], done: &[bool]) -> bool {
+    let mut seen = vec![false; waits.len()];
+    let mut stack: Vec<usize> = waits[p].clone();
+    while let Some(q) = stack.pop() {
+        if q == p {
+            return true;
+        }
+        if done[q] || std::mem::replace(&mut seen[q], true) {
+            continue;
+        }
+        stack.extend(&waits[q]);
+    }
+    false
+}
+
+/// What each table's expressions and each view's definition say, per
+/// position in `order` — the text a function has to exist for. Not the
+/// `CREATE`: a column named like a function is not a call.
+fn caller_texts(tables: &[TableInfo], order: &[usize]) -> Vec<String> {
+    order
         .iter()
         .map(|&i| {
             let t = &tables[i];
@@ -1541,7 +1935,20 @@ fn routine_slots(
             }
             text.join("\n")
         })
-        .collect();
+        .collect()
+}
+
+/// Which routines [`creation_order`] moves ahead of the tables, as the slot
+/// each would take in `order` as it stands — `None` for one that stays in
+/// the trailing section. A function moves when a table's expressions or a
+/// view's definition name it, or a moved function calls it.
+fn routine_slots(
+    routines: &[Emitted],
+    tables: &[TableInfo],
+    order: &[usize],
+    dialect: SqlDialect,
+) -> Vec<Option<usize>> {
+    let callers = caller_texts(tables, order);
     // Each text lexed once, then asked about every name — `order_by_mention`'s
     // rule, for its reason.
     let caller_code: Vec<Vec<bool>> = callers
@@ -1639,6 +2046,7 @@ pub fn plan(
     // nothing. Out of `order`, a key onto it is one more key to a table outside
     // the export, and is accounted for as one.
     let mut unrestated: Vec<String> = Vec::new();
+    let mut gone: Vec<usize> = Vec::new();
     let order: Vec<usize> = order
         .into_iter()
         .filter(|&i| {
@@ -1649,15 +2057,27 @@ pub fn plan(
                         "{} ({what})",
                         display_name(t.schema.as_deref(), &t.name)
                     ));
+                    gone.push(i);
                     false
                 }
                 _ => true,
             }
         })
         .collect();
+    // **And whatever cannot be created without them** — see
+    // `dependents_left_out`. The temporal table alone used to go, and a view
+    // over it stopped the whole restore.
+    let (dependent_tables, dependent_routines, dependents) =
+        dependents_left_out(schema, &order, &gone, dialect);
+    let order: Vec<usize> = order
+        .into_iter()
+        .filter(|i| !dependent_tables.contains(i))
+        .collect();
+    let left_out: Vec<String> = unrestated.iter().chain(&dependents).cloned().collect();
     if order.is_empty() {
         return DumpPlan {
             missing,
+            left_out,
             ..DumpPlan::default()
         };
     }
@@ -1903,6 +2323,22 @@ pub fn plan(
             crate::export::comment_text(&unrestated.join(", ")),
         ));
     }
+    // And what reads them, which could not be created without them.
+    if !dependents.is_empty() {
+        let n = dependents.len();
+        header.push_str(&format!(
+            "\n--\n-- {n} {} {} left out with {}: created without what {} {},\n\
+             -- {} would stop the restore. Script {} from the source server too: {}.",
+            crate::text::plural(n, "object", "objects"),
+            crate::text::plural(n, "is", "are"),
+            crate::text::plural(unrestated.len(), "it", "them"),
+            crate::text::plural(n, "it", "they"),
+            crate::text::plural(n, "reads", "read"),
+            crate::text::plural(n, "it", "they"),
+            crate::text::plural(n, "it", "them"),
+            crate::export::comment_text(&dependents.join(", ")),
+        ));
+    }
     // A graph edge's rows name the nodes they join by node id, and a restore
     // assigns every node a fresh one: carried, they would join the wrong nodes
     // or none. The edge itself is restated, empty.
@@ -2071,10 +2507,11 @@ pub fn plan(
         Hold::Keep => kept.push(name),
         Hold::Refuse { object, why } => refused.push((object, format!("{name} ({why})"))),
     };
-    // Per position in `order`: a table or view no `DROP` may name.
-    let held: Vec<bool> = order
+    // The tables and views no `DROP` may name, by index into `schema.tables`.
+    let held: std::collections::HashSet<usize> = order
         .iter()
-        .map(|&i| {
+        .copied()
+        .filter(|&i| {
             let t = &schema.tables[i];
             let h = (opts.structure && opts.drop_if_exists)
                 .then(|| table_hold(t, any_edge, dialect))
@@ -2132,6 +2569,12 @@ pub fn plan(
                         .as_ref()
                         .is_some_and(|w| owned_here.contains(&(s.schema.as_deref(), &w.table)))
                 {
+                    continue;
+                }
+                // One bound to what the file leaves out goes with it.
+                if o.routine().is_some_and(|r| {
+                    dependent_routines.contains(&(r.schema.clone(), r.name.clone()))
+                }) {
                     continue;
                 }
                 if namespaces.iter().any(|ns| ns.as_deref() == o.schema()) {
@@ -2245,13 +2688,13 @@ pub fn plan(
     // fact the split rests on — after the file's `DROP TABLE`s have run.
     // Ordered here, before the drops, so those can run in the reverse.
     let routines = order_by_mention(routines, dialect);
-    // A function a table or view calls goes just before it — see
-    // `routine_slots`; `None` stays in the trailing section. Decided before
-    // the drops, which mirror it.
-    let slots = if opts.structure {
-        routine_slots(&routines, &schema.tables, &order, dialect)
+    // A function a table or view calls goes just before it, and the tables
+    // and views wait for what it reads — see `creation_order`; `None` stays
+    // in the trailing section. Decided before the drops, which mirror it.
+    let (order, slots) = if opts.structure {
+        creation_order(&routines, &schema.tables, &order, home, dialect)
     } else {
-        vec![None; routines.len()]
+        (order, vec![None; routines.len()])
     };
 
     // ── What a replay must not replace, refused before anything is dropped ───
@@ -2338,7 +2781,7 @@ pub fn plan(
         drops.extend(routine_drops(Some(order.len())));
         for (k, &i) in order.iter().enumerate().rev() {
             let t = &schema.tables[i];
-            if t.shape() != TableShape::Sequence && !held[k] {
+            if t.shape() != TableShape::Sequence && !held.contains(&i) {
                 let kw = if t.is_view { "VIEW" } else { "TABLE" };
                 drops.push(format!("DROP {kw} IF EXISTS {};", qname(t)));
             }
@@ -2404,7 +2847,11 @@ pub fn plan(
             // which is the same reason `data_only_plans_no_create_and_no_drop`
             // gives one file down.
             // Nor one it cannot put back as it is — see `Hold`.
-            if opts.drop_if_exists && !up_front && t.shape() != TableShape::Sequence && !held[k] {
+            if opts.drop_if_exists
+                && !up_front
+                && t.shape() != TableShape::Sequence
+                && !held.contains(&i)
+            {
                 let kw = if t.is_view { "VIEW" } else { "TABLE" };
                 text!(format!(
                     "DROP {kw} IF EXISTS {}{};",
@@ -2628,6 +3075,8 @@ pub fn plan(
         cycles,
         missing,
         refused,
+        left_out,
+        rows_left_out: if opts.data { edges } else { Vec::new() },
     }
 }
 
@@ -6629,6 +7078,340 @@ mod tests {
         let func = pos(&file, "CREATE FUNCTION \"next_code\"");
         assert!(pos(&file, "CREATE TABLE \"a_src\"") < func, "{file}");
         assert!(func < pos(&file, "CREATE TABLE \"b_user\""), "{file}");
+    }
+
+    /// **What reads a table the file leaves out is left out with it, and
+    /// named.** A temporal table is not in the file; a view over it stopped
+    /// the restore at its `CREATE VIEW` (Msg 208, measured on 2022) and *One
+    /// transaction* rolled the whole file back — while the modal reported
+    /// "Wrote 2 tables." So the view goes, the view over the view, and the
+    /// inline function bound to it — each named in the header and on the
+    /// plan — and a function that only reads it when it runs stays.
+    #[test]
+    fn what_reads_a_table_left_out_of_the_file_is_left_out_with_it() {
+        let dbo = |mut t: TableInfo| {
+            t.schema = Some("dbo".to_string());
+            t
+        };
+        let mut emp = dbo(table("emp"));
+        emp.tsql_kind.temporal_type = 2;
+        let mut s = schema_of(vec![
+            emp,
+            dbo(table("dept")),
+            // `sales.emp` is another table; a view over it stays.
+            {
+                let mut t = table("emp");
+                t.schema = Some("sales".to_string());
+                t
+            },
+            tsql_view(
+                "emp_v",
+                "CREATE VIEW dbo.emp_v AS SELECT id FROM [dbo].[emp]",
+            ),
+            tsql_view(
+                "emp_vv",
+                "CREATE VIEW dbo.emp_vv AS SELECT id FROM dbo.emp_v",
+            ),
+            tsql_view(
+                "sales_v",
+                "CREATE VIEW dbo.sales_v AS SELECT id FROM sales.emp",
+            ),
+            tsql_view(
+                "dept_v",
+                "CREATE VIEW dbo.dept_v AS SELECT id FROM dbo.dept",
+            ),
+            tsql_view(
+                "v_tvf",
+                "CREATE VIEW dbo.v_tvf AS SELECT id FROM dbo.tvf_emp()",
+            ),
+        ]);
+        s.routines.push(tsql_function(
+            "tvf_emp",
+            "TABLE",
+            "RETURN SELECT id FROM emp",
+        ));
+        s.routines.push(tsql_function(
+            "f_count",
+            "int",
+            "BEGIN RETURN (SELECT COUNT(*) FROM dbo.emp); END",
+        ));
+        let p = plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::MsSql,
+        );
+        let file = file_of(&p);
+        for gone in ["emp_v]", "emp_vv]", "v_tvf]", "tvf_emp]"] {
+            assert!(
+                !file.contains(&format!("CREATE VIEW [dbo].[{gone}")),
+                "{file}"
+            );
+            assert!(
+                !file.contains(&format!("CREATE FUNCTION [dbo].[{gone}")),
+                "{file}"
+            );
+        }
+        for kept in [
+            "CREATE VIEW [dbo].[dept_v]",
+            "CREATE VIEW [dbo].[sales_v]",
+            "CREATE FUNCTION [dbo].[f_count]",
+            "CREATE TABLE [sales].[emp]",
+        ] {
+            assert!(file.contains(kept), "{kept}: {file}");
+        }
+        assert_eq!(
+            p.left_out,
+            vec![
+                "dbo.emp (a system-versioned temporal table)",
+                "dbo.emp_v (a view reading dbo.emp, which is not in this file)",
+                "dbo.emp_vv (a view reading dbo.emp_v, which is not in this file)",
+                "dbo.tvf_emp (a function bound to dbo.emp, which is not in this file)",
+                "dbo.v_tvf (a view reading dbo.tvf_emp, which is not in this file)",
+            ],
+        );
+        assert!(
+            file.contains("4 objects are left out with it")
+                && file.contains("dbo.emp_vv (a view reading dbo.emp_v"),
+            "{file}"
+        );
+        assert_eq!(p.tables, 4, "the tables and views the file holds");
+    }
+
+    /// **The modal names what the file left out, and one space separates its
+    /// sentences.** The report was "Wrote 2 tables." over a file a table
+    /// short, and its `format!` put a space after the tally whatever
+    /// followed, so a quiet dump read "Wrote 2 tables. " and one with a
+    /// missing table had two spaces in it.
+    #[test]
+    fn the_done_note_says_what_the_file_is_short_of_in_single_spaced_sentences() {
+        let none: [String; 0] = [];
+        assert_eq!(
+            done_note(2, None, &none, &none, &none, &none),
+            "Wrote 2 tables."
+        );
+        assert_eq!(
+            done_note(1, Some(""), &none, &none, &none, &none),
+            "Wrote 1 table."
+        );
+        let note = done_note(
+            2,
+            Some("Binary column [b] was exported as NULL."),
+            &["dbo.gone".to_string()],
+            &["dbo.emp (a system-versioned temporal table)".to_string()],
+            &["dbo.knows".to_string()],
+            &["dbo.p (signed, and no script can carry the signature)".to_string()],
+        );
+        assert!(!note.contains("  ") && !note.ends_with(' '), "{note}");
+        for part in [
+            "Wrote 2 tables. Binary column [b] was exported as NULL.",
+            "1 ticked table not found and is not in the file: dbo.gone.",
+            "1 object the export asked for is not in the file: dbo.emp (a system-versioned \
+             temporal table).",
+            "The rows of graph edge table dbo.knows are not in the file; it is created empty.",
+            "A replay onto a database that already holds this stops before it drops anything",
+        ] {
+            assert!(note.contains(part), "{part}: {note}");
+        }
+        let missing_only = done_note(3, None, &["a".to_string()], &none, &none, &none);
+        assert_eq!(
+            missing_only,
+            "Wrote 3 tables. 1 ticked table not found and is not in the file: a."
+        );
+    }
+
+    /// A SQL Server function in `dbo`, for the ordering tests below.
+    fn tsql_function(
+        name: &str,
+        returns: &str,
+        body: &str,
+    ) -> std::sync::Arc<crate::schema::RoutineInfo> {
+        std::sync::Arc::new(crate::schema::RoutineInfo {
+            name: name.to_string(),
+            schema: Some("dbo".to_string()),
+            kind: crate::schema::RoutineKind::Function,
+            language: "SQL".to_string(),
+            returns: returns.to_string(),
+            body: body.to_string(),
+            ..Default::default()
+        })
+    }
+
+    /// `view(name)` in `dbo`, its stored statement `create`.
+    fn tsql_view(name: &str, create: &str) -> TableInfo {
+        let mut v = view(name);
+        v.schema = Some("dbo".to_string());
+        v.create_sql = Some(create.to_string());
+        v
+    }
+
+    /// **Tables, views and the functions they call are ordered as one
+    /// graph.** The table and view order was fixed first, by foreign keys,
+    /// view-to-view mentions and name, and a called function was fitted in
+    /// afterwards — on its caller's side where the two could not both hold.
+    /// So a view reaching another view only through a function came out
+    /// ahead of it, and the inline function between them, which binds at
+    /// `CREATE`, stopped the restore (Msg 208, measured on 2022 and 2025).
+    /// The names sort the caller first, so only a walk over the function's
+    /// edges can produce this file.
+    #[test]
+    fn a_view_reached_through_a_function_comes_after_what_the_function_reads() {
+        let mut t = table("t");
+        t.schema = Some("dbo".to_string());
+        let mut s = schema_of(vec![
+            t,
+            tsql_view("v_a", "CREATE VIEW dbo.v_a AS SELECT n FROM dbo.tvf_b()"),
+            tsql_view("v_z", "CREATE VIEW dbo.v_z AS SELECT id AS n FROM dbo.t"),
+        ]);
+        s.routines.push(tsql_function(
+            "tvf_b",
+            "TABLE",
+            "RETURN SELECT n FROM dbo.v_z",
+        ));
+        let file = file_of(&plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::MsSql,
+        ));
+        let (v_z, tvf, v_a) = (
+            pos(&file, "CREATE VIEW [dbo].[v_z]"),
+            pos(&file, "CREATE FUNCTION [dbo].[tvf_b]"),
+            pos(&file, "CREATE VIEW [dbo].[v_a]"),
+        );
+        assert!(v_z < tvf && tvf < v_a, "{file}");
+        // And a replay drops them in the mirror of that order.
+        let drop =
+            |kw: &str, name: &str| pos(&file, &format!("DROP {kw} IF EXISTS [dbo].[{name}]"));
+        assert!(
+            drop("VIEW", "v_a") < drop("FUNCTION", "tvf_b")
+                && drop("FUNCTION", "tvf_b") < drop("VIEW", "v_z"),
+            "{file}"
+        );
+    }
+
+    /// **And a table waits for the table its check's function reads.** The
+    /// function itself may come first (deferred name resolution allows it),
+    /// but the check runs it against every restored row, so `a_orders`' rows
+    /// stopped the restore while `z_customers`, which the function counts,
+    /// was created after them (Msg 208).
+    #[test]
+    fn a_table_whose_check_calls_a_function_comes_after_what_the_function_reads() {
+        let mut customers = table("z_customers");
+        customers.schema = Some("dbo".to_string());
+        let mut orders = table("a_orders");
+        orders.schema = Some("dbo".to_string());
+        orders.check_constraints.push(crate::schema::CheckInfo {
+            name: "ck_known".to_string(),
+            expression: "[dbo].[f_known]([id])=(1)".to_string(),
+            ..Default::default()
+        });
+        let mut s = schema_of(vec![orders, customers]);
+        s.routines.push(tsql_function(
+            "f_known",
+            "int",
+            "BEGIN RETURN (SELECT COUNT(*) FROM dbo.z_customers WHERE id = @id); END",
+        ));
+        let file = file_of(&plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::MsSql,
+        ));
+        let (customers, f, orders) = (
+            pos(&file, "CREATE TABLE [dbo].[z_customers]"),
+            pos(&file, "CREATE FUNCTION [dbo].[f_known]"),
+            pos(&file, "CREATE TABLE [dbo].[a_orders]"),
+        );
+        assert!(customers < f && f < orders, "{file}");
+        assert!(pos(&file, "<<rows z_customers") < orders, "{file}");
+    }
+
+    /// **Where nothing calls a function, the order is the one it always
+    /// was** — every table first by its keys and name, every view after
+    /// them — so two dumps of an unchanged schema stay byte-identical. And a
+    /// function reading a table whose own column calls it is still the one
+    /// cycle there is: the caller wins, being the statement that would fail.
+    #[test]
+    fn the_one_sort_keeps_the_old_order_and_breaks_a_real_cycle_at_the_function() {
+        let dbo = |mut t: TableInfo| {
+            t.schema = Some("dbo".to_string());
+            t
+        };
+        let mut s = schema_of(vec![
+            dbo(refs(table("b_child"), "c_parent")),
+            dbo(table("c_parent")),
+            dbo(table("a_other")),
+            tsql_view("v_two", "CREATE VIEW dbo.v_two AS SELECT id FROM dbo.v_one"),
+            tsql_view(
+                "v_one",
+                "CREATE VIEW dbo.v_one AS SELECT id FROM dbo.a_other",
+            ),
+        ]);
+        // A function nothing calls, which reads every table: it stays in the
+        // trailing section and moves nothing.
+        s.routines.push(tsql_function(
+            "f_all",
+            "int",
+            "BEGIN RETURN (SELECT COUNT(*) FROM dbo.a_other, dbo.b_child, dbo.v_two); END",
+        ));
+        let plain = file_of(&plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::MsSql,
+        ));
+        let at: Vec<usize> = [
+            "TABLE [dbo].[a_other]",
+            "TABLE [dbo].[c_parent]",
+            "TABLE [dbo].[b_child]",
+            "VIEW [dbo].[v_one]",
+            "VIEW [dbo].[v_two]",
+            "-- Routines and events",
+            "FUNCTION [dbo].[f_all]",
+        ]
+        .iter()
+        .map(|n| match n.strip_prefix("-- ") {
+            Some(_) => pos(&plain, n),
+            None => pos(&plain, &format!("CREATE {n}")),
+        })
+        .collect();
+        assert!(at.windows(2).all(|w| w[0] < w[1]), "{plain}");
+
+        // `calc`'s column calls `f_count`, which reads `calc`.
+        let mut calc = dbo(table("calc"));
+        calc.columns.push(ColumnInfo {
+            name: "n".to_string(),
+            generated: Some("[dbo].[f_count]()".to_string()),
+            ..Default::default()
+        });
+        s.tables.push(calc);
+        s.routines.push(tsql_function(
+            "f_count",
+            "int",
+            "BEGIN RETURN (SELECT COUNT(*) FROM dbo.calc); END",
+        ));
+        let file = file_of(&plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::MsSql,
+        ));
+        assert!(
+            pos(&file, "CREATE FUNCTION [dbo].[f_count]") < pos(&file, "CREATE TABLE [dbo].[calc]"),
+            "{file}"
+        );
+        // The rest keeps its order around them.
+        let rest: Vec<usize> = ["a_other", "c_parent", "b_child"]
+            .iter()
+            .map(|n| pos(&file, &format!("CREATE TABLE [dbo].[{n}]")))
+            .collect();
+        assert!(rest.windows(2).all(|w| w[0] < w[1]), "{file}");
     }
 
     /// **And after the routines they call.**
