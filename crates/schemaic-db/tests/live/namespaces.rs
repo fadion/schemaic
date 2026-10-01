@@ -846,10 +846,11 @@ pub async fn public_objects_are_named_in_every_statement_that_runs(target: &'sta
         "public.mood rebuilt"
     );
     assert_eq!(
-        text(format!(
+        text(
             "SELECT count(*)::text FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace \
              WHERE t.typname = 'mood' AND n.nspname = current_user"
-        ))
+                .into()
+        )
         .await,
         "0",
         "no mood in the login's schema"
