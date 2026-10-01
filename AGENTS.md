@@ -24,11 +24,14 @@ does). What differs between the
 engines now lives in the *narrow* predicates that decide how an edit is performed rather than
 whether it is offered: `ddl::supports_or_replace_view`, `supports_view_rename`,
 `supports_column_reorder`, `rebuilds_tables`, `supports_change`, `alter_column_disturbs_checks`,
-`alter_column_disturbs_dependents`,
+`alter_column_disturbs_dependents`, `refreshes_star_dependents`, `bare_reference_is_own_namespace`,
+`ddl_is_transactional`, `users::revoke_cascades`, `sql::SqlDialect::read_only_is_a_rollback`,
+`dump::drops_up_front`,
 `stats::supports_table_stats` — alongside them the few that do decide whether a control is
 offered, because the clause behind it is one engine's alone:
 `ddl::supports_trigger_not_for_replication`, `supports_trigger_execute_as`,
-`supports_trigger_firing_rank` — and, for the *comparison* rather than any editor,
+`supports_trigger_firing_rank`, `supports_fk_set_default`, `supports_fk_restrict`,
+`users::supports_deny` — and, for the *comparison* rather than any editor,
 `ddl::ref_schema_is_database` and `view_definition_is_qualified`, which ask whether a field the
 differ reads names the object or the database it was read from. Ask a **capability**, never an
 engine: a `dialect == Postgres` or `!= MySql` compiles cleanly while silently sorting a third
@@ -110,9 +113,9 @@ substitute for the statement, and none of these is a style preference.
 - **Structure-aware SQL analysis goes through `core::intel`** (a real per-dialect AST), not a new
   hand-rolled scanner. The DB stays the semantic authority. Two stated exceptions: the read-only
   gate's PostgreSQL function scan, which has to fail closed where an AST visitor fails open; and
-  `ddl::tsql_trigger_parts` and `tsql_routine_parts`, a T-SQL trigger's and routine's header
-  walked over `sql::skip_noncode`, because sqlparser's T-SQL grammar does not carry their `WITH`
-  options and would re-print the body an edit has to keep verbatim.
+  `ddl::tsql_trigger_parts`, `tsql_routine_parts` and `tsql_view_parts`, a T-SQL trigger's,
+  routine's and view's header walked over `sql::skip_noncode`, because sqlparser's T-SQL grammar
+  does not carry their `WITH` options and would re-print the body an edit has to keep verbatim.
 - **One connection per operation** — every `Db` method connects, runs, disconnects. **Two**
   exceptions, both because their statements are not independent: a `TxMode::Manual` tab's pinned
   `Session`, and `Db::run_script`, which holds one connection for a whole `.sql` file (a dump's
