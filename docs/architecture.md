@@ -12699,7 +12699,8 @@ existing prose was left alone.
   own error to the acknowledgement (patch 5, below), which is how a Stop of a batch that had
   already failed was falling out of step; what is left is an attention refused, or not
   acknowledged within `CANCEL_TIMEOUT`. So after any `DbError::Cancelled` from those four
-  operations `Session::resync_after_stop` asks `answers_in_step` — a `SELECT CAST(<n> AS bigint)`
+  operations — `Session::lost_after_stop`, the one place they ask — `Session::resync_after_stop`
+  asks `answers_in_step` — a `SELECT CAST(<n> AS bigint)`
   of a number only that call could have sent, bounded by `CANCEL_TIMEOUT` — which costs one round
   trip per Stop. Out of step, **the pinned connection is replaced** — the one place a `Session`
   swaps its own connection: nothing more is sent on the old one, and dropping it closes the socket, so
@@ -12710,11 +12711,18 @@ existing prose was left alone.
   connection can be opened the backend becomes `Backend::Retired`, whose statements, writes and
   reads answer `retired_error` until the tab is switched to Auto and back — a Rollback is `Ok`,
   the server having rolled back already, and a Commit is refused as an aborted transaction
-  (`block_is_aborted` answers `true` for it). The live pin is
+  (`block_is_aborted` answers `true` for it) — and its `server_id` is none, since the old spid
+  may be another session's by then. The live pin is
   `a_stop_after_an_error_leaves_the_manual_session_in_step` (a `SELECT 1/0` and a `RAISERROR`, each
   before a `WAITFOR` that is stopped, then the next statement's own reply; 2022 and 2025), which
-  panicked before the driver fix. It covers the in-step branch only: an out-of-step connection,
-  and so the replacement, could not be produced live, and nothing tests it.
+  panicked before the driver fix. It covers the in-step branch only: an out-of-step connection
+  cannot be produced live. So what the replacement leaves is `replace_pinned`, synchronous and
+  split out of the resync for this, and the unit tests build a `Session` over `Backend::Retired`
+  directly, with no network: `a_retired_session_rolls_back_and_refuses_everything_else` (Rollback
+  `Ok`; `BEGIN`, Commit, a statement and a blob read refused, a statement as `ConnectionLost`),
+  `a_connection_replaced_after_a_stop_starts_over` (`in_tx`, scope and `server_id` reset) and
+  `only_a_stop_on_a_live_sql_server_connection_is_resynchronised`. Whether a fresh `connect`
+  succeeds is the one branch that stays untested.
   **`run_scope_sql` answers `false` for SQL Server without
   asking**, over a private `ScopeStep`, for `write_on`'s reason — an unreleasable savepoint name —
   so the pinned reads run unfenced, which costs nothing because a cancelled read does not abort a

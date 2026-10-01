@@ -769,7 +769,7 @@ impl Session {
             }
             Backend::Retired => Err(retired_error()),
         };
-        if matches!(result, Err(DbError::Cancelled)) && self.resync_after_stop(&mut guard).await {
+        if self.lost_after_stop(&mut guard, &result).await {
             return Outcome {
                 result,
                 stmt: StmtOutcome::ConnectionLost,
@@ -951,23 +951,61 @@ impl Session {
         if crate::mssql::answers_in_step(client).await {
             return false;
         }
-        *guard = match crate::mssql::connect(&self.db, self.database.as_deref()).await {
+        let fresh = match crate::mssql::connect(&self.db, self.database.as_deref()).await {
             Ok(mut fresh) => {
                 let spid = crate::mssql::spid(&mut fresh).await;
-                if let Ok(mut id) = self.server_id.lock() {
-                    *id = spid;
-                }
-                Backend::MsSql {
-                    client: Box::new(fresh),
-                }
+                Some((Box::new(fresh), spid))
             }
-            Err(_) => Backend::Retired,
+            Err(_) => None,
         };
+        self.replace_pinned(guard, fresh);
+        true
+    }
+
+    /// Put `fresh` in place of a pinned connection that fell out of step — or,
+    /// with none, [`Backend::Retired`] — and forget everything the old one
+    /// held: the server rolled its transaction back when it closed, the
+    /// replacement starts in the pinned database whatever a `USE` had moved
+    /// the old one to, and its server id is the new connection's, or none.
+    ///
+    /// Split from [`Session::resync_after_stop`] because the connection that
+    /// takes this path cannot be produced on demand — it takes an attention the
+    /// server does not acknowledge — so the state it leaves is tested here,
+    /// without one.
+    fn replace_pinned(
+        &self,
+        guard: &mut Backend,
+        fresh: Option<(Box<crate::mssql::MsClient>, Option<i64>)>,
+    ) {
+        let spid = match fresh {
+            Some((client, spid)) => {
+                *guard = Backend::MsSql { client };
+                spid
+            }
+            // A retired session is no connection on the server, and an old
+            // spid left here could be another session's by now.
+            None => {
+                *guard = Backend::Retired;
+                None
+            }
+        };
+        if let Ok(mut id) = self.server_id.lock() {
+            *id = spid;
+        }
         self.in_tx.store(false, Ordering::SeqCst);
         if let Ok(mut scope) = self.scope.lock() {
             *scope = self.database.clone();
         }
-        true
+    }
+
+    /// Did a Stop leave the pinned connection out of step, so that it was
+    /// replaced and the operation's outcome is
+    /// [`StmtOutcome::ConnectionLost`]? Asked of every operation on the
+    /// connection, in one place rather than four: only a cancelled result can
+    /// have left it so, and only SQL Server's connection is asked
+    /// ([`Session::resync_after_stop`]).
+    async fn lost_after_stop<T>(&self, guard: &mut Backend, result: &Result<T, DbError>) -> bool {
+        matches!(result, Err(DbError::Cancelled)) && self.resync_after_stop(guard).await
     }
 
     /// **SQL Server's answer to what an operation did to the transaction**,
@@ -1073,8 +1111,7 @@ impl Session {
                     &mut undone,
                 )
                 .await;
-                if matches!(r, Err(DbError::Cancelled)) && self.resync_after_stop(&mut guard).await
-                {
+                if self.lost_after_stop(&mut guard, &r).await {
                     return Outcome {
                         result: r,
                         stmt: StmtOutcome::ConnectionLost,
@@ -1159,7 +1196,7 @@ impl Session {
             Backend::MsSql { client } => crate::mssql::blob_on(client, r, &cancel).await,
             Backend::Retired => Err(retired_error()),
         };
-        if matches!(result, Err(DbError::Cancelled)) && self.resync_after_stop(&mut guard).await {
+        if self.lost_after_stop(&mut guard, &result).await {
             return Outcome {
                 result,
                 stmt: StmtOutcome::ConnectionLost,
@@ -1233,7 +1270,7 @@ impl Session {
             }
             Backend::Retired => Err(retired_error()),
         };
-        if matches!(result, Err(DbError::Cancelled)) && self.resync_after_stop(&mut guard).await {
+        if self.lost_after_stop(&mut guard, &result).await {
             return Outcome {
                 result,
                 stmt: StmtOutcome::ConnectionLost,
@@ -1542,5 +1579,103 @@ mod tests {
     #[test]
     fn the_unreachable_sqlite_arm_answers_with_the_forgiving_model() {
         assert_eq!(tx_engine_of(Engine::Sqlite), tx::TxEngine::MySql);
+    }
+
+    /// A SQL Server session whose pinned connection was closed after a Stop
+    /// the server did not acknowledge, with no new one to put in its place.
+    /// Built directly: the state takes an unacknowledged attention to reach,
+    /// which no server produces on demand, and needs no network once there.
+    fn retired_session() -> Session {
+        Session {
+            db: Db::from_parts(
+                Engine::MsSql,
+                "127.0.0.1".to_string(),
+                1,
+                "sa".to_string(),
+                String::new(),
+                String::new(),
+            ),
+            database: Some("app".to_string()),
+            scope: std::sync::Mutex::new(Some("moved_by_use".to_string())),
+            server_id: std::sync::Mutex::new(Some(57)),
+            inner: Mutex::new(Backend::Retired),
+            in_tx: AtomicBool::new(true),
+        }
+    }
+
+    /// **A retired session can roll back and nothing else** — its transaction
+    /// went with the connection, so a Rollback has nothing left to do, while a
+    /// Commit, a `BEGIN`, a statement and a read all refuse, and every refusal
+    /// is a lost connection to the pill rather than a statement's failure. A
+    /// Commit reported as a success here would be a commit over a connection
+    /// the server had already rolled back.
+    #[tokio::test]
+    async fn a_retired_session_rolls_back_and_refuses_everything_else() {
+        let s = retired_session();
+        s.rollback().await.expect("nothing left to roll back");
+        assert!(!s.in_tx.load(Ordering::SeqCst));
+
+        let err = s.ensure_tx().await.expect_err("no BEGIN on no connection");
+        assert!(err.to_string().contains("Switch the tab to Auto"), "{err}");
+
+        s.in_tx.store(true, Ordering::SeqCst);
+        let err = s.commit().await.expect_err("never a commit");
+        assert!(err.to_string().contains("Nothing was committed"), "{err}");
+        assert!(!s.in_tx.load(Ordering::SeqCst));
+        assert!(Session::block_is_aborted(&mut *s.inner.lock().await).await);
+
+        let out = s
+            .fetch_query("SELECT 1", 10, CancellationToken::new())
+            .await;
+        let err = out.result.expect_err("no statement runs");
+        assert!(err.to_string().contains("could not be opened"), "{err}");
+        assert_eq!(out.stmt, StmtOutcome::ConnectionLost);
+
+        let blob = BlobRef {
+            database: "app".to_string(),
+            schema: Some("dbo".to_string()),
+            table: "t".to_string(),
+            column: "b".to_string(),
+            key: Vec::new(),
+        };
+        let out = s.fetch_blob(&blob, CancellationToken::new()).await;
+        assert!(out.result.is_err());
+        assert!(
+            !Session::alive(&mut *s.inner.lock().await).await,
+            "the pill reads a retired connection as lost"
+        );
+    }
+
+    /// **What a replaced connection forgets.** The server rolled back what the
+    /// closed one held, the replacement starts in the pinned database however
+    /// far a `USE` had moved the old one, and the old server id is no longer
+    /// this tab's — none at all when nothing replaced it.
+    #[tokio::test]
+    async fn a_connection_replaced_after_a_stop_starts_over() {
+        let s = retired_session();
+        {
+            let mut guard = s.inner.lock().await;
+            s.replace_pinned(&mut guard, None);
+            assert!(matches!(*guard, Backend::Retired));
+        }
+        assert!(!s.in_tx.load(Ordering::SeqCst));
+        assert_eq!(s.scope.lock().unwrap().as_deref(), Some("app"));
+        assert_eq!(s.server_id(), None);
+    }
+
+    /// **Only a Stop, and only SQL Server's connection, is asked whether it
+    /// fell out of step** — every other outcome passes through untouched, so
+    /// a failed statement is never upgraded to a lost connection here.
+    #[tokio::test]
+    async fn only_a_stop_on_a_live_sql_server_connection_is_resynchronised() {
+        let s = retired_session();
+        let mut guard = s.inner.lock().await;
+        let cancelled: Result<(), DbError> = Err(DbError::Cancelled);
+        let failed: Result<(), DbError> = Err(DbError::Query("boom".to_string()));
+        assert!(!s.lost_after_stop(&mut guard, &Ok(())).await);
+        assert!(!s.lost_after_stop(&mut guard, &failed).await);
+        // A retired backend has no connection left to resynchronise.
+        assert!(!s.lost_after_stop(&mut guard, &cancelled).await);
+        assert!(s.in_tx.load(Ordering::SeqCst), "nothing was reset");
     }
 }
