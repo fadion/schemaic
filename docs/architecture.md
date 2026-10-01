@@ -4280,19 +4280,31 @@ existing prose was left alone.
     transaction, so a failure anywhere leaves the table as it was. (1) **A guard that stops the
     plan before it touches anything**, one `DECLARE @t … CASE WHEN … END IF @why IS NOT NULL THROW
     50000, @why, 1;` naming the first reason, wherever the table carries something the model does
-    not read and the `DROP TABLE` would take with it: permissions granted on it; a schema-bound
-    dependent; system versioning, memory optimisation, replication, change data capture or a lock
-    escalation setting; change tracking or a full-text index; partitioning, compression or a
-    filegroup other than the default; an extended property on the table or its columns other than
-    `MS_Description`; **any** extended property on what stands on the table — class 1 on an object
-    whose `parent_object_id` is the table (its key, default and check constraints, its triggers) or
-    class 7 on its indexes — a description included; an index option (fill factor, padding,
-    `IGNORE_DUP_KEY`, row or page locks) or a disabled index; a sparse, column-set,
-    `FILESTREAM`, `ROWGUIDCOL`, masked, encrypted, XML-schema-typed or hidden column; a foreign key
+    not read and the `DROP TABLE` would take with it: permissions granted on it; an owner of its
+    own (`ALTER AUTHORIZATION`, a non-NULL `principal_id` — the copy is the schema owner's); a
+    schema-bound dependent; system versioning, memory optimisation, replication, change data
+    capture or a lock escalation setting; a ledger; change tracking or a full-text index;
+    partitioning, compression or a filegroup other than the default; an extended property on the
+    table or its columns other than `MS_Description`; **any** extended property on what stands on
+    the table — class 1 on an object whose `parent_object_id` is the table (its key, default and
+    check constraints, its triggers) or class 7 on its indexes — a description included, and on a
+    key **another** table holds on it, which step 3 drops and step 7 adds back; an index option
+    (fill factor, padding, `IGNORE_DUP_KEY`, row or page locks) or a disabled index; a sparse,
+    column-set, `FILESTREAM`, `ROWGUIDCOL`, masked, encrypted, XML-schema-typed, hidden or
+    generated-always column; a rule or a default bound to a column (`sp_bindrule`,
+    `sp_bindefault` — the reader takes defaults from `sys.default_constraints` only); a sensitivity
+    classification; a foreign key
     on it or to it that is disabled, untrusted or `NOT FOR REPLICATION`, or a check or an identity
     that is; and a count of its indexes, own keys, inbound keys, checks or triggers that no longer
     matches the reading the draft was made from. The alternative to each is a plan that succeeds
-    and reports nothing lost. The schema-bound test leaves out objects whose parent is the table
+    and reports nothing lost — a ledger table came back an ordinary writable one, its original
+    kept as `MSSQL_DroppedLedgerTable_…`, and a bound rule's `INSERT … a = -5` was accepted, before
+    S2-L5-04 added those arms. **Two arms ask of a catalogue an older server lacks**:
+    `sys.tables.ledger_type` (2022) and `sys.sensitivity_classifications` (2019). Named in the
+    `CASE` they would fail its compile, and so every rebuild, there; `tsql_late_arm` runs each
+    behind a probe (`COL_LENGTH`, `OBJECT_ID`) through `sp_executesql`, ahead of the `CASE` so a
+    ledger table is named as one rather than by the generated-always columns every ledger table
+    has. The schema-bound test leaves out objects whose parent is the table
     itself, because a check or default constraint is an object of its own, schema-bound to the
     table it stands on — found live. **The arm about what stands on the table is the one that
     looked covered and was not** (S3.2-L5-03): the table's arm read class 1 on the table's own id
@@ -13729,11 +13741,15 @@ existing prose was left alone.
   failing plan rolled back whole to an existing table's edit landing as drafted, an edit keeping
   what it did not change, an identity toggle withheld over an index the rebuild cannot restate, a
   table rebuilt three ways and refused once by the rebuild's guard, then by each of its arms in
-  turn (`every_arm_of_the_rebuild_guard_refuses_its_table`, fifteen tables, under the rebuild in
+  turn (`every_arm_of_the_rebuild_guard_refuses_its_table`, twenty-one tables, under the rebuild in
   `ddl.rs` above), an in-place change refused by
   its own guard over a masked or sparse column and over a dependent a retype would re-create
-  without what it carries, eight cases (`a_masked_or_sparse_column_is_not_altered_in_place`,
-  `a_retype_is_refused_where_a_dependent_carries_what_it_would_drop`), the views and inline function
+  without what it carries, thirteen cases, and over a rebuilt computed column carrying a permission
+  (`a_masked_or_sparse_column_is_not_altered_in_place`,
+  `a_retype_is_refused_where_a_dependent_carries_what_it_would_drop`,
+  `a_rebuilt_computed_column_is_refused_where_it_carries_what_the_drop_takes`) while a retype under
+  a disabled or untrusted key applies and keeps both states
+  (`a_retype_under_a_disabled_or_untrusted_key_keeps_its_state`), the views and inline function
   that select `*` from a table refreshed after a rebuild, a rebuilt computed
   column and a dropped column (`a_rebuild_refreshes_the_views_that_select_star_from_it` and its two
   siblings), a clustered index and a nonclustered key

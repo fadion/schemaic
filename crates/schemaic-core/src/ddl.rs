@@ -3465,10 +3465,11 @@ impl Change {
                      keys, indexes, checks, defaults and triggers, its own and its columns' \
                      comments, and the foreign keys other tables have on it. It stops before \
                      it starts if the table has anything else Schemaic doesn't restate — \
-                     permissions, a schema-bound dependent, system versioning, replication, \
-                     compression, index options, a disabled index, a description on a key, \
-                     index, default, check or trigger. Statistics created by hand are not \
-                     carried over.",
+                     permissions, an owner of its own, a schema-bound dependent, system \
+                     versioning, a ledger, replication, compression, index options, a disabled \
+                     index, a bound rule or default, a sensitivity classification, a \
+                     description on a key, index, default, check or trigger. Statistics \
+                     created by hand are not carried over.",
                     r.current.name
                 ),
                 SqlDialect::Sqlite | SqlDialect::MySql | SqlDialect::Postgres => format!(
@@ -12320,18 +12321,21 @@ fn tsql_server_filled(c: &ColumnInfo) -> bool {
 ///
 /// 1. **A guard that stops the plan before it starts** when the table carries
 ///    anything the model does not, and so the rebuild would silently drop:
-///    permissions granted on it, a schema-bound dependent, system versioning,
-///    memory optimisation, replication or change tracking, a partition scheme
-///    or a filegroup other than the default, compression, an extended property
-///    other than its comments, any extended property on its keys, indexes,
-///    defaults, checks or triggers (a description included — the model reads
-///    only the table's and its columns'), an index option or a disabled index
-///    (a `CREATE INDEX` builds it), a column feature (sparse,
-///    `FILESTREAM`, `ROWGUIDCOL`, masking, encryption, an XML schema), a
-///    disabled, untrusted or `NOT FOR REPLICATION` key — and a count of its
-///    indexes, keys, checks and triggers that no longer matches the reading
-///    the draft was made from. The alternative to each is a plan that
-///    succeeds and reports nothing lost.
+///    permissions granted on it, an owner of its own, a schema-bound
+///    dependent, system versioning, a ledger, memory optimisation,
+///    replication or change tracking, a partition scheme or a filegroup other
+///    than the default, compression, an extended property other than its
+///    comments, any extended property on its keys, indexes, defaults, checks
+///    or triggers or on a key another table holds on it (a description
+///    included — the model reads only the table's and its columns'), an index
+///    option or a disabled index (a `CREATE INDEX` builds it), a column
+///    feature (sparse, hidden, generated always, `FILESTREAM`, `ROWGUIDCOL`,
+///    masking, encryption, an XML schema, a sensitivity classification, a
+///    bound rule or default), a disabled, untrusted or `NOT FOR REPLICATION`
+///    key — and a count of its indexes, keys, checks and triggers that no
+///    longer matches the reading the draft was made from. The alternative to
+///    each is a plan that succeeds and reports nothing lost. What an older
+///    server's catalogue lacks is asked behind a probe ([`tsql_late_arm`]).
 /// 2. The default constraints' names, kept in [`TSQL_REBUILD_DEFAULTS`]: the
 ///    model reads a default's value and not its name, and a default put back
 ///    under `DF__t__a__5EBF139D` is not the one scripts and a schema compare
@@ -12397,6 +12401,14 @@ pub fn tsql_rebuild_sql(current: &TableInfo, draft: &TableDraft) -> Vec<String> 
             "permissions are granted on it",
         ),
         (
+            // `ALTER AUTHORIZATION` to a principal other than the schema's
+            // owner: the new table is the schema owner's, which changes
+            // ownership chaining and that principal's implicit control.
+            "EXISTS (SELECT 1 FROM sys.objects WHERE object_id = @t AND principal_id IS NOT NULL)"
+                .into(),
+            "it has an owner of its own",
+        ),
+        (
             // Not its own: a check or default constraint is an object of its
             // own, schema-bound to the table it stands on.
             "EXISTS (SELECT 1 FROM sys.sql_expression_dependencies d WHERE d.referenced_id = @t \
@@ -12449,6 +12461,18 @@ pub fn tsql_rebuild_sql(current: &TableInfo, draft: &TableDraft) -> Vec<String> 
              comments included",
         ),
         (
+            // A key *another* table holds on it is that table's object, so the
+            // arm above, over what stands on this one, does not see it — but
+            // step 3 drops it and step 7 adds it back, and its properties go
+            // with the drop.
+            "EXISTS (SELECT 1 FROM sys.extended_properties e JOIN sys.foreign_keys f \
+             ON f.object_id = e.major_id WHERE e.class = 1 AND f.referenced_object_id = @t \
+             AND f.parent_object_id <> @t)"
+                .into(),
+            "a foreign key another table has on it carries extended properties, comments \
+             included",
+        ),
+        (
             "EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = @t AND index_id > 0 \
              AND (fill_factor NOT IN (0, 100) OR ignore_dup_key = 1 OR is_padded = 1 \
              OR allow_row_locks = 0 OR allow_page_locks = 0 OR is_disabled = 1))"
@@ -12459,10 +12483,21 @@ pub fn tsql_rebuild_sql(current: &TableInfo, draft: &TableDraft) -> Vec<String> 
         (
             "EXISTS (SELECT 1 FROM sys.columns WHERE object_id = @t AND (is_sparse = 1 \
              OR is_column_set = 1 OR is_filestream = 1 OR is_rowguidcol = 1 OR is_masked = 1 \
-             OR encryption_type IS NOT NULL OR xml_collection_id <> 0 OR is_hidden = 1))"
+             OR encryption_type IS NOT NULL OR xml_collection_id <> 0 OR is_hidden = 1 \
+             OR generated_always_type <> 0))"
                 .into(),
-            "a column is sparse, a column set, hidden, FILESTREAM, ROWGUIDCOL, masked, \
-             encrypted or typed by an XML schema",
+            "a column is sparse, a column set, hidden, generated always, FILESTREAM, \
+             ROWGUIDCOL, masked, encrypted or typed by an XML schema",
+        ),
+        (
+            // `sp_bindrule`/`sp_bindefault`: bound to the column, not a
+            // constraint, so the reader — which takes defaults from
+            // `sys.default_constraints` — never sees either.
+            "EXISTS (SELECT 1 FROM sys.columns WHERE object_id = @t AND (rule_object_id <> 0 \
+             OR (default_object_id <> 0 \
+             AND OBJECTPROPERTY(default_object_id, 'IsDefaultCnst') = 0)))"
+                .into(),
+            "a column has a rule or a default bound to it",
         ),
         (
             "EXISTS (SELECT 1 FROM sys.foreign_keys WHERE (parent_object_id = @t \
@@ -12493,13 +12528,33 @@ pub fn tsql_rebuild_sql(current: &TableInfo, draft: &TableDraft) -> Vec<String> 
             "its indexes, keys, checks or triggers changed since it was read - reopen it",
         ),
     ];
+    // And what only a newer server has, each behind its probe — asked first,
+    // so a ledger table is named as one rather than by the generated-always
+    // columns every ledger table has.
+    let late = [
+        tsql_late_arm(
+            "COL_LENGTH(N'sys.tables', N'ledger_type') IS NOT NULL",
+            "EXISTS (SELECT 1 FROM sys.tables WHERE object_id = @t AND ledger_type <> 0)",
+            // The copy is an ordinary table: no ledger, and the original
+            // kept as a dropped ledger table.
+            "it is a ledger table",
+        ),
+        tsql_late_arm(
+            "OBJECT_ID(N'sys.sensitivity_classifications') IS NOT NULL",
+            "EXISTS (SELECT 1 FROM sys.sensitivity_classifications WHERE class = 1 \
+             AND major_id = @t)",
+            "a column carries a sensitivity classification",
+        ),
+    ]
+    .concat();
     let cases = reasons
         .iter()
         .map(|(cond, why)| format!("WHEN {cond} THEN {}", tsql_n(why)))
         .collect::<Vec<_>>()
         .join(" ");
     out.push(format!(
-        "DECLARE @t int = OBJECT_ID({}) DECLARE @why nvarchar(400) = CASE {cases} END \
+        "DECLARE @t int = OBJECT_ID({}) DECLARE @why nvarchar(400) \
+         {late}SET @why = ISNULL(@why, CASE {cases} END) \
          IF @why IS NOT NULL THROW 50000, @why, 1;",
         tsql_n(&original),
     ));
@@ -12746,6 +12801,22 @@ pub fn tsql_rebuild_sql(current: &TableInfo, draft: &TableDraft) -> Vec<String> 
     }
     out.push(format!("DROP TABLE {TSQL_REBUILD_DEFAULTS};"));
     out
+}
+
+/// One arm of a T-SQL guard batch over a catalogue view or column **not
+/// every supported server has** — `sys.sensitivity_classifications` is
+/// 2019's, `sys.tables.ledger_type` 2022's. Named in the guard's own
+/// statement, it would fail that statement's compile on an older server, and
+/// so every plan the guard opens; behind `probe` and `sp_executesql` it is
+/// compiled only where it exists. It answers into the batch's `@why`, over
+/// the batch's `@t`, only where no earlier arm has.
+fn tsql_late_arm(probe: &str, cond: &str, why: &str) -> String {
+    let inner = format!("SET @w = CASE WHEN {cond} THEN {} END", tsql_n(why));
+    format!(
+        "IF @why IS NULL AND {probe} EXEC sys.sp_executesql {}, \
+         N'@t int, @w nvarchar(400) OUTPUT', @t, @why OUTPUT ",
+        tsql_n(&inner)
+    )
 }
 
 /// What a T-SQL rebuild ([`tsql_rebuild_sql`]) cannot put back from the
@@ -16785,6 +16856,37 @@ mod tests {
         let risk = cs.destructive().join(" ");
         assert!(risk.contains("its own and its columns' comments"), "{risk}");
         assert!(risk.contains("a disabled index"), "{risk}");
+    }
+
+    /// **The rebuild's guard covers the rest of what `DROP TABLE` takes**
+    /// (S2-L5-04): a ledger table came back an ordinary writable one, a
+    /// column-bound rule and a bound default went, the table's own owner fell
+    /// back to the schema's, a sensitivity classification went, and so did a
+    /// description on a key *another* table holds on it — each plan reporting
+    /// nothing lost. The two catalogues an older server lacks
+    /// (`sys.tables.ledger_type`, 2022; `sys.sensitivity_classifications`,
+    /// 2019) are asked behind a probe, so the guard still compiles there.
+    #[test]
+    fn the_rebuild_guard_refuses_the_rest_of_what_drop_table_takes() {
+        let t = ms_rebuild_table();
+        let mut d = TableDraft::from_table(&t);
+        d.columns.swap(1, 2);
+        let guard = &diff(&t, &d, MsSql).emit()[0];
+        assert_eq!(guard.matches(';').count(), 1, "one batch: {guard}");
+        assert!(guard.ends_with("IF @why IS NOT NULL THROW 50000, @why, 1;"));
+        for needle in [
+            "generated_always_type <> 0",
+            "rule_object_id <> 0",
+            "OBJECTPROPERTY(default_object_id, 'IsDefaultCnst') = 0",
+            "principal_id IS NOT NULL",
+            "f.referenced_object_id = @t",
+            "COL_LENGTH(N'sys.tables', N'ledger_type') IS NOT NULL",
+            "ledger_type <> 0",
+            "OBJECT_ID(N'sys.sensitivity_classifications') IS NOT NULL",
+            "sys.sensitivity_classifications WHERE class = 1 AND major_id = @t",
+        ] {
+            assert!(guard.contains(needle), "{needle} not in {guard}");
+        }
     }
 
     /// **A rebuild refreshes what selects `*` from the table** (R3-L5-02): a

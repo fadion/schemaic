@@ -7302,6 +7302,70 @@ async fn every_arm_of_the_rebuild_guard_refuses_its_table() {
             after: &[],
             says: "a foreign key on it or to it is disabled, untrusted or NOT FOR REPLICATION",
         },
+        // S2-L5-04: what `DROP TABLE` takes and the arms above did not ask.
+        Arm {
+            table: "g_owner",
+            setup: &[
+                "CREATE USER u_g_owner WITHOUT LOGIN",
+                "ALTER AUTHORIZATION ON dbo.g_owner TO u_g_owner",
+            ],
+            after: &[],
+            says: "it has an owner of its own",
+        },
+        Arm {
+            table: "g_rule",
+            setup: &[
+                "CREATE RULE dbo.r_g_pos AS @v > 0",
+                "EXEC sp_bindrule N'dbo.r_g_pos', N'dbo.g_rule.a'",
+            ],
+            after: &[],
+            says: "a column has a rule or a default bound to it",
+        },
+        Arm {
+            table: "g_bdef",
+            setup: &[
+                "CREATE DEFAULT dbo.d_g_zero AS 0",
+                "EXEC sp_bindefault N'dbo.d_g_zero', N'dbo.g_bdef.a'",
+            ],
+            after: &[],
+            says: "a column has a rule or a default bound to it",
+        },
+        Arm {
+            table: "g_label",
+            setup: &["ADD SENSITIVITY CLASSIFICATION TO dbo.g_label.a \
+                      WITH (LABEL = 'Confidential')"],
+            after: &[],
+            says: "a column carries a sensitivity classification",
+        },
+        Arm {
+            table: "g_inbound",
+            setup: &[
+                "CREATE TABLE dbo.g_inbound_c (id int PRIMARY KEY, \
+                 p int CONSTRAINT fk_g_inbound REFERENCES dbo.g_inbound (id))",
+                "EXEC sp_addextendedproperty N'MS_Description', N'its parent', \
+                 N'SCHEMA', N'dbo', N'TABLE', N'g_inbound_c', N'CONSTRAINT', N'fk_g_inbound'",
+            ],
+            after: &[],
+            says: "a foreign key another table has on it carries extended properties",
+        },
+        Arm {
+            // Made again as a ledger table, its ledger columns declared rather
+            // than hidden — the shape the column arm's `is_hidden` misses.
+            table: "g_ledger",
+            setup: &[
+                "DROP TABLE dbo.g_ledger",
+                "CREATE TABLE dbo.g_ledger (id int NOT NULL CONSTRAINT pk_g_ledger PRIMARY KEY, \
+                 a int NULL, b int NULL, \
+                 s bigint GENERATED ALWAYS AS TRANSACTION_ID START, \
+                 e bigint GENERATED ALWAYS AS TRANSACTION_ID END NULL, \
+                 ss bigint GENERATED ALWAYS AS SEQUENCE_NUMBER START, \
+                 se bigint GENERATED ALWAYS AS SEQUENCE_NUMBER END NULL) \
+                 WITH (SYSTEM_VERSIONING = ON, LEDGER = ON)",
+                "INSERT dbo.g_ledger (id, a, b) VALUES (1, 2, 3)",
+            ],
+            after: &[],
+            says: "it is a ledger table",
+        },
         Arm {
             table: "g_stale",
             setup: &[],
