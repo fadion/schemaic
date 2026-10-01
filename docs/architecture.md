@@ -7488,12 +7488,25 @@ existing prose was left alone.
     Npgsql write the same `Server=…;Database=…` grammar, and the canonical Connector/NET string
     imported as SQL Server on 1433 with the MySQL password, its `Port=3306` dropped. A keyword
     SqlClient lacks and those drivers have — `Port` above all (SqlClient writes `Server=h,1433`),
-    `Host`, `Username`, `SslMode`, `Search Path` — decides against; a SQL Server-only keyword
-    (`Initial Catalog`, `Data Source`, `User Id`, `Integrated Security`, `Encrypt`,
-    `TrustServerCertificate`…) or a server only its grammar writes (`tcp:`, `np:`, `lpc:`,
-    `(localdb)`, `.`, `,port`, `\instance`) decides for; neither is `UrlError::NotSqlServer`, which
-    repeats nothing, rather than a guess — `Server=h;Database=d;Uid=u;Pwd=p` is valid for both
-    (`a_connection_string_is_sql_servers_only_when_it_says_so`). **A repeated keyword keeps the value
+    `Host`, `Username`, `SslMode`, `Search Path` — decides against; a keyword neither of them
+    accepts (`Trusted_Connection`, `MultipleActiveResultSets`, `Authentication`,
+    `ApplicationIntent`, `Failover Partner`, `AttachDbFilename`), an `Encrypt` *value* only
+    SqlClient writes (`Strict`, `Mandatory`, `Optional`) or a server only its grammar writes
+    (`tcp:`, `np:`, `lpc:`, `(localdb)`, `.`, `,port`, `\instance`) decides for; neither is
+    `UrlError::NotSqlServer`, which repeats nothing, rather than a guess —
+    `Server=h;Database=d;Uid=u;Pwd=p` is valid for both
+    (`a_connection_string_is_sql_servers_only_when_it_says_so`). **The *for* list is what neither
+    driver documents, not what SqlClient's strings usually say**: `User Id`, `Data Source`,
+    `Initial Catalog`, `Integrated Security`, `Encrypt` and `TrustServerCertificate` were on it, and
+    each is a synonym Connector/NET or Npgsql accepts (`normalize_key` makes Npgsql's
+    `Trust Server Certificate` the same key), so
+    `Server=mysql.internal;Database=shop;User Id=app;Password=…` imported as a preselected SQL
+    Server row on 1433 with its password — or, with `Integrated Security=yes`, with the user's
+    Windows identity (`a_keyword_the_mysql_and_postgres_drivers_share_is_no_evidence`). The cost is
+    that a genuine SqlClient string written only in those shared keywords —
+    `Data Source=h;Initial Catalog=d;User Id=u;Password=p` — is refused too. That is the loud
+    direction, and the refusal's message names the answer: write the server as `tcp:host`.
+    **A repeated keyword keeps the value
     its driver would use** — the last in ADO.NET and OLE DB, SqlClient's documented rule for a base
     string with an override a config transform appended, and the first under an ODBC `Driver`,
     whose rule is the opposite — not the URL readers' first-wins, whose reason (the authority beats

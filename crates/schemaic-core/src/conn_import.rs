@@ -951,7 +951,8 @@ impl UrlError {
                 .to_string(),
             UrlError::NotSqlServer => "This connection string doesn't say it is SQL Server's — \
                  MySQL's and PostgreSQL's .NET drivers write the same keywords. Paste the \
-                 server's URL instead (mysql://, postgresql://, sqlserver://)."
+                 server's URL instead (mysql://, postgresql://, sqlserver://), or, for SQL \
+                 Server, write the server as tcp:host."
                 .to_string(),
         }
     }
@@ -1302,7 +1303,7 @@ fn parse_connection_string(s: &str) -> Result<(Connection, Vec<ImportNote>), Url
     }
     let server = server.trim();
     let lower = server.to_ascii_lowercase();
-    if driver.is_none() && !says_sql_server(&keys, &lower) {
+    if driver.is_none() && !says_sql_server(&keys, &lower, encrypt.as_deref()) {
         return Err(UrlError::NotSqlServer);
     }
     if lower.starts_with("np:") || lower.starts_with("(localdb)") {
@@ -1462,25 +1463,28 @@ fn names_sql_server_driver(v: &str) -> bool {
 ///   `Port` (SqlClient writes the port as `Server=h,1433`), `Host`,
 ///   `Username`, `SslMode`, `Search Path`. Any of them decides it, even
 ///   beside a keyword below;
-/// - **for** — a SQL Server-only keyword (`Initial Catalog`, `Data Source`,
-///   `User Id`, `Integrated Security`, `Trusted_Connection`, `Encrypt`,
-///   `TrustServerCertificate`, `MultipleActiveResultSets`, `Authentication`,
-///   `ApplicationIntent`, `Failover Partner`, `AttachDbFilename`), or a server
-///   only SQL Server's grammar writes: a `tcp:`/`np:`/`lpc:` prefix,
-///   `(localdb)`, `.`/`(local)`, a `,port` or a `\instance`.
+/// - **for** — a keyword neither of those drivers accepts
+///   (`Trusted_Connection`, `MultipleActiveResultSets`, `Authentication`,
+///   `ApplicationIntent`, `Failover Partner`, `AttachDbFilename`), an
+///   `Encrypt` value only SqlClient writes (`Strict`, `Mandatory`,
+///   `Optional`), or a server only SQL Server's grammar writes: a
+///   `tcp:`/`np:`/`lpc:` prefix, `(localdb)`, `.`/`(local)`, a `,port` or a
+///   `\instance`.
 ///
-/// Neither is not guessed: `Server=h;Database=d;Uid=u;Pwd=p` is a valid string
-/// for both SqlClient and Connector/NET.
-fn says_sql_server(keys: &[String], server: &str) -> bool {
+/// **Not `User Id`, `Data Source`, `Initial Catalog`, `Integrated Security`,
+/// `Encrypt` or `TrustServerCertificate`**, which were counted for and are
+/// each a synonym Connector/NET or Npgsql documents (`normalize_key` makes
+/// Npgsql's `Trust Server Certificate` the same key): a valid MySQL string
+/// using one imported as SQL Server on 1433 with its password, or with the
+/// user's Windows identity. `encrypt` is the string's normalised `Encrypt`.
+///
+/// With neither, nothing is guessed: `Server=h;Database=d;Uid=u;Pwd=p` is a valid string
+/// for both SqlClient and Connector/NET, and so is
+/// `Data Source=h;Initial Catalog=d;User Id=u;Password=p`.
+fn says_sql_server(keys: &[String], server: &str, encrypt: Option<&str>) -> bool {
     const AGAINST: &[&str] = &["port", "host", "username", "sslmode", "searchpath"];
     const FOR: &[&str] = &[
-        "initialcatalog",
-        "datasource",
-        "userid",
-        "integratedsecurity",
         "trustedconnection",
-        "encrypt",
-        "trustservercertificate",
         "multipleactiveresultsets",
         "authentication",
         "applicationintent",
@@ -1495,7 +1499,8 @@ fn says_sql_server(keys: &[String], server: &str) -> bool {
         .any(|p| server.starts_with(p))
         || matches!(server, "." | "(local)")
         || server.contains([',', '\\']);
-    shaped || keys.iter().any(|k| FOR.contains(&k.as_str()))
+    let sqlclient_encrypt = matches!(encrypt, Some("strict" | "mandatory" | "optional"));
+    shaped || sqlclient_encrypt || keys.iter().any(|k| FOR.contains(&k.as_str()))
 }
 
 /// Microsoft's `key=value;key=value`, where a value in braces is taken whole —
@@ -3483,7 +3488,7 @@ mod tests {
         let tls = |s: &str| url(s).tls.mode;
         let floor = blank(MSSQL).tls.mode;
         for verifies in [
-            "Server=db.corp;Database=d;User Id=u;Password=p",
+            "Server=tcp:db.corp;Database=d;User Id=u;Password=p",
             "jdbc:sqlserver://db.corp;databaseName=d",
             "sqlserver://db.corp:1433;database=d",
             "Driver={ODBC Driver 18 for SQL Server};Server=db.corp;Database=d",
@@ -3502,9 +3507,9 @@ mod tests {
             assert_eq!(tls(off), floor, "{off}");
         }
         // What the string does say still wins.
-        assert_eq!(tls("Server=db.corp;Encrypt=False"), SslMode::Disable);
+        assert_eq!(tls("Server=tcp:db.corp;Encrypt=False"), SslMode::Disable);
         assert_eq!(
-            tls("Server=db.corp;TrustServerCertificate=True"),
+            tls("Server=tcp:db.corp;TrustServerCertificate=True"),
             SslMode::Require
         );
         assert_eq!(
@@ -3661,7 +3666,7 @@ mod tests {
         assert_eq!(c.tls.mode, SslMode::Require);
         assert_eq!(c.name, suggest_name(&c));
         // The older keywords, and no port is 1433.
-        let c = url("Data Source=h;Initial Catalog=d;UID=u;PWD='it''s'");
+        let c = url("Data Source=tcp:h;Initial Catalog=d;UID=u;PWD='it''s'");
         assert_eq!((c.host.as_str(), c.port), ("h", 1433));
         assert_eq!((c.database.as_str(), c.user.as_str()), ("d", "u"));
         assert_eq!(c.password, "it's");
@@ -3671,7 +3676,7 @@ mod tests {
             assert_eq!(c.host, "localhost", "{local}");
         }
         // Keywords are case- and space-insensitive; TLS reads as JDBC's does.
-        let c = url("server = h ; ENCRYPT = false ; user id = u");
+        let c = url("server = tcp:h ; ENCRYPT = false ; user id = u");
         assert_eq!((c.host.as_str(), c.user.as_str()), ("h", "u"));
         assert_eq!(c.tls.mode, SslMode::Disable);
         let c = url("Server=h;Encrypt=Strict");
@@ -3709,12 +3714,12 @@ mod tests {
         assert!(scan.found[0].has(ImportNote::NamedInstance));
         let c = url("Server=db\\SQLEXPRESS,1500;Database=d");
         assert_eq!((c.host.as_str(), c.port), ("db", 1500));
-        let c = url("ConnectionStrings__Default=\"Server=h;Database=d;User Id=u\"");
+        let c = url("ConnectionStrings__Default=\"Server=tcp:h;Database=d;User Id=u\"");
         assert_eq!((c.host.as_str(), c.database.as_str()), ("h", "d"));
         // A Windows login becomes Windows sign-in where the build has it, and
         // keeps the note where it does not.
         for login in [
-            "Server=h;Database=d;Integrated Security=SSPI",
+            "Server=tcp:h;Database=d;Integrated Security=SSPI",
             "Server=h;Trusted_Connection=yes",
         ] {
             let scan = parse_url_scan(login);
@@ -3750,7 +3755,7 @@ mod tests {
             scan.found[0].connection.auth,
             crate::connection::AuthMode::Password
         );
-        let scan = parse_url_scan("Server=h;Integrated Security=false;User Id=u");
+        let scan = parse_url_scan("Server=tcp:h;Integrated Security=false;User Id=u");
         assert!(!scan.found[0].has(ImportNote::ExternalLogin));
         assert_eq!(
             scan.found[0].connection.auth,
@@ -3765,7 +3770,10 @@ mod tests {
                 "{unreachable}"
             );
         }
-        assert_eq!(parse_url("Database=d;User Id=u"), Err(UrlError::NoHost));
+        assert_eq!(
+            parse_url("Database=d;User Id=u;Trusted_Connection=no"),
+            Err(UrlError::NoHost)
+        );
     }
 
     /// **A JDBC URL's sign-in is read as an ADO.NET string's is** — one reading
@@ -3781,7 +3789,7 @@ mod tests {
         let one = |s: &str| parse_url_scan(s).found.remove(0);
         for windows in [
             "jdbc:sqlserver://h:1433;integratedSecurity=true",
-            "Server=h;Integrated Security=true",
+            "Server=tcp:h;Integrated Security=true",
         ] {
             let row = one(windows);
             assert_eq!(
@@ -3831,9 +3839,9 @@ mod tests {
     /// row connected somewhere, or as someone, the application did not.
     #[test]
     fn a_repeated_keyword_keeps_the_value_its_driver_uses() {
-        let c = url("Server=h;Password=first;Password=second;User Id=u");
+        let c = url("Server=tcp:h;Password=first;Password=second;User Id=u");
         assert_eq!(c.password, "second");
-        let c = url("Server=a;Database=one;User Id=u;Server=b;Database=two;User Id=v");
+        let c = url("Server=tcp:a;Database=one;User Id=u;Server=tcp:b;Database=two;User Id=v");
         assert_eq!(
             (c.host.as_str(), c.database.as_str(), c.user.as_str()),
             ("b", "two", "v")
@@ -3923,13 +3931,41 @@ mod tests {
             "Server=h,1433;Database=d",
             "Server=h\\SQLEXPRESS;Database=d",
             "Server=.;Database=d",
-            "Server=h;Initial Catalog=d",
-            "Data Source=h;Database=d",
-            "Server=h;Database=d;User Id=u;Password=p",
-            "Server=h;Integrated Security=true",
-            "Server=h;Database=d;TrustServerCertificate=true",
-            "Server=h;Database=d;Encrypt=true",
+            "Server=h;Trusted_Connection=yes",
+            "Server=h;Database=d;Encrypt=Strict",
             "Server=h;Database=d;MultipleActiveResultSets=true",
+        ] {
+            let c = parse_url(sql_server).unwrap_or_else(|e| panic!("{sql_server}: {e:?}"));
+            assert!(crate::connection::is_mssql(&c.db_type), "{sql_server}");
+        }
+    }
+
+    /// **A keyword Connector/NET or Npgsql also accepts is no evidence.**
+    /// `User Id`, `Data Source`, `Initial Catalog`, `Integrated Security`,
+    /// `Encrypt` and `TrustServerCertificate` were counted as SQL Server-only,
+    /// and each is a synonym one of those drivers documents — so a valid MySQL
+    /// or PostgreSQL string using one imported as a preselected SQL Server row
+    /// on 1433 with its password, or with the user's Windows identity. A value
+    /// only SqlClient writes still counts: `Encrypt=Strict`.
+    #[test]
+    fn a_keyword_the_mysql_and_postgres_drivers_share_is_no_evidence() {
+        for other in [
+            "Server=mysql.internal;Database=shop;User Id=app;Password=MyPw1;",
+            "Data Source=mysql.internal;Initial Catalog=shop;User Id=app;Password=MyPw2;",
+            "Server=pg.internal;Database=d;User Id=u;Password=PgPw3",
+            "Server=mysql.internal;Database=shop;Uid=app;Pwd=MyPw5;Encrypt=true",
+            "Server=mysql.internal;Database=shop;User=app;Password=MyPw6;Integrated Security=yes",
+            "Server=pg.internal;Database=d;User Id=u;Password=p;Trust Server Certificate=true",
+        ] {
+            let err = parse_url(other).expect_err(other);
+            assert_eq!(err, UrlError::NotSqlServer, "{other}");
+        }
+        for sql_server in [
+            "Server=h;Database=d;Encrypt=Strict",
+            "Server=h;Database=d;Encrypt=Mandatory;User Id=u",
+            "Server=h;Trusted_Connection=yes",
+            "Server=h;Authentication=Active Directory Default",
+            "Server=h;Database=d;ApplicationIntent=ReadOnly",
         ] {
             let c = parse_url(sql_server).unwrap_or_else(|e| panic!("{sql_server}: {e:?}"));
             assert!(crate::connection::is_mssql(&c.db_type), "{sql_server}");
@@ -5762,8 +5798,8 @@ mod tests {
             &[SourceFile {
                 source: ImportSource::Url,
                 path: String::new(),
-                text: "Server=h;Integrated Security=true\n\
-                       Server=h;Authentication=Active Directory Default\n"
+                text: "Server=tcp:h;Integrated Security=true\n\
+                       Server=tcp:h;Authentication=Active Directory Default\n"
                     .into(),
                 local: None,
             }],
@@ -5776,7 +5812,7 @@ mod tests {
             "{modes:?}"
         );
         // A saved Windows connection does not make the Entra import a repeat.
-        let mut saved = parse_url("Server=h;Integrated Security=true").unwrap();
+        let mut saved = parse_url("Server=tcp:h;Integrated Security=true").unwrap();
         saved.auth = crate::connection::AuthMode::Windows;
         let entra = parse_url("Server=h;Authentication=Active Directory Default").unwrap();
         assert_eq!(
@@ -5795,7 +5831,7 @@ mod tests {
             &[SourceFile {
                 source: ImportSource::Url,
                 path: String::new(),
-                text: "Server=h;Integrated Security=SSPI;User Id=u\n".into(),
+                text: "Server=tcp:h;Integrated Security=SSPI;User Id=u\n".into(),
                 local: None,
             }],
             &[],
