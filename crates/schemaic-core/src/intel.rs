@@ -4017,7 +4017,7 @@ fn scan_clauses(
                 "GROUP" => {
                     if toks
                         .get(i + 1)
-                        .and_then(&word_up)
+                        .and_then(word_up)
                         .as_deref()
                         .is_some_and(|w| w == "BY")
                     {
@@ -4032,7 +4032,7 @@ fn scan_clauses(
                 "ORDER" => {
                     if toks
                         .get(i + 1)
-                        .and_then(&word_up)
+                        .and_then(word_up)
                         .as_deref()
                         .is_some_and(|w| w == "BY")
                     {
