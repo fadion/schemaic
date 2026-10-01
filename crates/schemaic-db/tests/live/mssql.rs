@@ -3898,6 +3898,95 @@ async fn text_a_varchar_cannot_hold_is_refused_not_stored_as_question_marks() {
     );
 }
 
+/// **A double-byte code page is judged by the server, not by a browser's
+/// table.** `encoding_rs`'s Shift_JIS, GBK and Big5 are the WHATWG
+/// standard's, which encode `¥` as `\`, `−` as Shift_JIS's minus, GB18030's
+/// extra characters and the HKSCS ideographs — none of which Windows' 932,
+/// 936 and 950 hold: a `¥1200` written into a Japanese `varchar` was stored
+/// `\1200`, a Hong Kong name `?`, and the write reported success.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_double_byte_varchar_refuses_what_its_windows_code_page_lacks() {
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("dbcs_cp").await;
+    s.exec(
+        "CREATE TABLE dbo.imp (id int NOT NULL PRIMARY KEY, \
+         jp varchar(40) COLLATE Japanese_CI_AS NULL, \
+         tw varchar(40) COLLATE Chinese_Taiwan_Stroke_CI_AS NULL, \
+         cn varchar(40) COLLATE Chinese_PRC_CI_AS NULL); \
+         INSERT dbo.imp (id, jp) VALUES (100, 'seed')",
+    )
+    .await;
+    let set = |col: &str, v: &str| GridWrite {
+        updates: vec![row_edit(
+            &s,
+            "imp",
+            &[(col, txt(v))],
+            &[("id", Value::Int(100))],
+        )],
+        ..Default::default()
+    };
+    for (col, value, lost, cp) in [
+        ("jp", "¥1200", '¥', "932"),
+        ("jp", "a−b", '−', "932"),
+        ("tw", "陳晄", '晄', "950"),
+        ("cn", "\u{1E3F}", '\u{1E3F}', "936"),
+    ] {
+        let err = commit(&s, set(col, value)).await.expect_err(value);
+        assert!(matches!(err, DbError::Refused(_)), "{err:?}");
+        let msg = err.to_string();
+        assert!(msg.contains(lost) && msg.contains(cp), "{value}: {msg}");
+    }
+    assert_eq!(
+        s.scalar("SELECT jp FROM dbo.imp WHERE id = 100").await,
+        "seed"
+    );
+    // What the code pages do hold goes in, and comes back as it went.
+    commit(&s, set("jp", "日本語のテキスト"))
+        .await
+        .expect("932 holds it");
+    commit(&s, set("tw", "台灣")).await.expect("950 holds it");
+    assert_eq!(
+        s.scalar("SELECT jp FROM dbo.imp WHERE id = 100").await,
+        "日本語のテキスト"
+    );
+    assert_eq!(
+        s.scalar("SELECT tw FROM dbo.imp WHERE id = 100").await,
+        "台灣"
+    );
+    // An import is asked about in bulk, a question per batch rather than per
+    // value, and a refusal still names the file's row.
+    // Keyed past the seed row's 100.
+    let mut rows = (1..=1500).map(|i| {
+        Ok(vec![
+            Value::Int(1000 + i),
+            Value::Str(if i == 1400 {
+                "¥5".into()
+            } else {
+                format!("行{i}")
+            }),
+        ])
+    });
+    let err = import_into(&s, &["id", "jp"], &mut rows, CancellationToken::new())
+        .await
+        .expect_err("refused");
+    assert!(
+        err.to_string().contains("Row 1400") && err.to_string().contains('¥'),
+        "{err}"
+    );
+    assert_eq!(s.scalar("SELECT COUNT(*) FROM dbo.imp").await, "1");
+    let mut rows = (1..=1500).map(|i| Ok(vec![Value::Int(1000 + i), Value::Str(format!("行{i}"))]));
+    import_into(&s, &["id", "jp"], &mut rows, CancellationToken::new())
+        .await
+        .expect("932 holds every row");
+    assert_eq!(
+        s.scalar("SELECT COUNT(*) FROM dbo.imp WHERE jp = CONCAT(N'行', id - 1000)")
+            .await,
+        "1500"
+    );
+}
+
 /// **Stop mid-import rolls back and says so.**
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cancelled_import_rolls_back_and_says_so() {

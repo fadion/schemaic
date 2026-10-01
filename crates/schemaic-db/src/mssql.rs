@@ -3224,25 +3224,32 @@ enum Fit {
 ///
 /// `0` is a Unicode column and `65001` a UTF-8 collation, both of which hold
 /// everything; ASCII fits every code page SQL Server stores a `varchar` in.
-/// The rest are the Windows code pages `encoding_rs` implements, asked
-/// strictly: a character with no byte there is a loss, never the best-fit
-/// substitute the server would pick. The two IBM code pages behind the
-/// `SQL_Latin1_General_CP437`/`CP850` collations are not among them, and
-/// answer [`Fit::Unknown`].
+/// The rest are the single-byte Windows code pages `encoding_rs` implements,
+/// asked strictly: a character with no byte there is a loss, never the
+/// best-fit substitute the server would pick. Measured against the server's
+/// own conversion for every BMP character, none of those tables encodes a
+/// character the server then loses (2022).
+///
+/// **The double-byte ones are not answered here.** `encoding_rs`'s
+/// `SHIFT_JIS`, `GBK`, `EUC_KR` and `BIG5` are the WHATWG Encoding Standard's
+/// tables, written for browsers, not Windows' 932, 936, 949 and 950: they
+/// encode `¥` as `\`, `−` as Shift_JIS's minus, 99 characters GB18030 has and
+/// 936 has not, and 870 HKSCS ideographs — and SQL Server stored each as `\`
+/// or `?` and reported success (measured on 2022). So non-ASCII text for one
+/// of them is [`Fit::Unknown`], and the server is asked
+/// ([`server_code_page_refusal`]), as it is for the two IBM code pages behind
+/// the `SQL_Latin1_General_CP437`/`CP850` collations, which `encoding_rs`
+/// lacks.
 fn code_page_fit(code_page: u32, text: &str) -> Fit {
     use encoding_rs::{
-        BIG5, EUC_KR, GBK, SHIFT_JIS, WINDOWS_874, WINDOWS_1250, WINDOWS_1251, WINDOWS_1252,
-        WINDOWS_1253, WINDOWS_1254, WINDOWS_1255, WINDOWS_1256, WINDOWS_1257, WINDOWS_1258,
+        WINDOWS_874, WINDOWS_1250, WINDOWS_1251, WINDOWS_1252, WINDOWS_1253, WINDOWS_1254,
+        WINDOWS_1255, WINDOWS_1256, WINDOWS_1257, WINDOWS_1258,
     };
     if code_page == 0 || code_page == 65001 || text.is_ascii() {
         return Fit::Fits;
     }
     let enc = match code_page {
         874 => WINDOWS_874,
-        932 => SHIFT_JIS,
-        936 => GBK,
-        949 => EUC_KR,
-        950 => BIG5,
         1250 => WINDOWS_1250,
         1251 => WINDOWS_1251,
         1252 => WINDOWS_1252,
@@ -3268,7 +3275,8 @@ fn code_page_fit(code_page: u32, text: &str) -> Fit {
 #[derive(Debug, Default)]
 struct CodePageCheck<'a> {
     refusal: Option<String>,
-    ask_server: Vec<(&'a ColumnFacts, &'a str)>,
+    /// Each value with its column and, for an import, the file's row.
+    ask_server: Vec<(Option<u64>, &'a ColumnFacts, &'a str)>,
 }
 
 /// The sentence for a value `col` cannot hold. `row` names an import's row.
@@ -3285,7 +3293,8 @@ fn code_page_refusal(row: Option<u64>, f: &ColumnFacts, lost: Option<char>) -> S
         None => format!("A value for {} ({})", f.name, f.base_type),
     };
     format!(
-        "{head} holds {what}: SQL Server would store it as `?` rather than refuse it. \
+        "{head} holds {what}: SQL Server would store it as `?` or a look-alike rather \
+         than refuse it. \
          Store the column as nvarchar, or remove the character."
     )
 }
@@ -3309,7 +3318,7 @@ fn code_page_check<'a>(write: &'a GridWrite, facts: &'a [ColumnFacts]) -> CodePa
                 out.refusal = Some(code_page_refusal(None, f, Some(c)));
                 return out;
             }
-            Fit::Unknown => out.ask_server.push((f, t)),
+            Fit::Unknown => out.ask_server.push((None, f, t)),
         }
     }
     out
@@ -3328,14 +3337,14 @@ fn import_code_page_check<'a>(
         for (col, v) in columns.iter().zip(row) {
             let Value::Str(s) = v else { continue };
             let Some(f) = fact(facts, col) else { continue };
+            let row = first_row + i as u64 + 1;
             match code_page_fit(f.code_page, s) {
                 Fit::Fits => {}
                 Fit::Loses(c) => {
-                    let row = first_row + i as u64 + 1;
                     out.refusal = Some(code_page_refusal(Some(row), f, Some(c)));
                     return out;
                 }
-                Fit::Unknown => out.ask_server.push((f, s)),
+                Fit::Unknown => out.ask_server.push((Some(row), f, s)),
             }
         }
     }
@@ -3344,31 +3353,89 @@ fn import_code_page_check<'a>(
 
 /// Ask the server whether each of `values` survives its column's collation —
 /// for the code pages [`code_page_fit`] cannot read — and answer the refusal
-/// for the first that does not. A collation name is spliced into the text, so
-/// one that is not a plain word is not asked about, and the server decides.
+/// for the first that does not, naming the character the server loses. A
+/// collation name is spliced into the text, so one that is not a plain word
+/// is not asked about, and the server decides.
+///
+/// **One question per collation and thousand values, not per value**: every
+/// non-ASCII value bound for a double-byte `varchar` is asked about, and an
+/// import of Japanese text is all such values.
 async fn server_code_page_refusal(
     client: &mut MsClient,
-    values: &[(&ColumnFacts, &str)],
+    values: &[(Option<u64>, &ColumnFacts, &str)],
 ) -> Result<Option<String>, DbError> {
-    for (f, text) in values {
-        let Some(coll) = f
-            .collation
-            .as_deref()
-            .filter(|c| !c.is_empty() && c.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'))
-        else {
+    let plain =
+        |c: &&str| !c.is_empty() && c.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+    let mut collations: Vec<&str> = Vec::new();
+    for (_, f, _) in values {
+        if let Some(c) = f.collation.as_deref().filter(plain)
+            && !collations.contains(&c)
+        {
+            collations.push(c);
+        }
+    }
+    for coll in collations {
+        let asked: Vec<&(Option<u64>, &ColumnFacts, &str)> = values
+            .iter()
+            .filter(|(_, f, _)| f.collation.as_deref() == Some(coll))
+            .collect();
+        let texts: Vec<&str> = asked.iter().map(|(_, _, t)| *t).collect();
+        let Some(i) = first_lost(client, coll, &texts).await? else {
             continue;
         };
+        let (row, f, text) = *asked[i];
+        // The character, asked the same way: each distinct one in the value.
+        let mut chars: Vec<String> = Vec::new();
+        for c in text.chars().filter(|c| !c.is_ascii()) {
+            let c = c.to_string();
+            if !chars.contains(&c) && chars.len() < LOST_ASKED_AT_ONCE {
+                chars.push(c);
+            }
+        }
+        let refs: Vec<&str> = chars.iter().map(String::as_str).collect();
+        let lost = first_lost(client, coll, &refs)
+            .await?
+            .and_then(|j| refs[j].chars().next());
+        return Ok(Some(code_page_refusal(row, f, lost)));
+    }
+    Ok(None)
+}
+
+/// Values asked about in one statement: T-SQL takes at most 2,100
+/// parameters.
+const LOST_ASKED_AT_ONCE: usize = 1000;
+
+/// The index of the first of `texts` that does not come back from `coll`'s
+/// code page as it went in — SQL Server's own conversion, the one a write
+/// into a `varchar` of that collation makes — or `None` when all of them do.
+async fn first_lost(
+    client: &mut MsClient,
+    coll: &str,
+    texts: &[&str],
+) -> Result<Option<usize>, DbError> {
+    for (n, chunk) in texts.chunks(LOST_ASKED_AT_ONCE).enumerate() {
+        let rows = (1..=chunk.len())
+            .map(|i| format!("({i}, @P{i})"))
+            .collect::<Vec<_>>()
+            .join(", ");
         let sql = format!(
-            "SELECT CASE WHEN CAST(CAST(@P1 COLLATE {coll} AS varchar(max)) AS nvarchar(max)) \
-             COLLATE Latin1_General_BIN2 = @P1 COLLATE Latin1_General_BIN2 THEN 1 ELSE 0 END"
+            "SELECT TOP (1) v.i FROM (VALUES {rows}) v(i, t) \
+             WHERE CAST(CAST(v.t COLLATE {coll} AS varchar(max)) AS nvarchar(max)) \
+             COLLATE Latin1_General_BIN2 <> v.t COLLATE Latin1_General_BIN2 ORDER BY v.i"
         );
+        let params: Vec<&dyn tiberius::ToSql> =
+            chunk.iter().map(|t| t as &dyn tiberius::ToSql).collect();
         let stream = client
-            .query(sql.as_str(), &[text])
+            .query(sql.as_str(), &params)
             .await
             .map_err(|e| db_err(&e))?;
         let row = stream.into_row().await.map_err(|e| db_err(&e))?;
-        if row.as_ref().and_then(|r| cell_text(r, 0)).as_deref() == Some("0") {
-            return Ok(Some(code_page_refusal(None, f, None)));
+        if let Some(i) = row
+            .as_ref()
+            .and_then(|r| cell_text(r, 0))
+            .and_then(|s| s.parse::<usize>().ok())
+        {
+            return Ok(Some(n * LOST_ASKED_AT_ONCE + i - 1));
         }
     }
     Ok(None)
@@ -4628,14 +4695,29 @@ mod write_tests {
     /// a UTF-8 collation and a Unicode column hold everything, and the rest
     /// are asked of the code page itself — `Ω` is not in 1252 and is in 1253.
     /// The two IBM code pages `encoding_rs` lacks answer `Unknown`, which the
-    /// write settles by asking the server.
+    /// write settles by asking the server — and so do the four double-byte
+    /// ones, whose `encoding_rs` tables are the WHATWG standard's and not
+    /// Windows': `SHIFT_JIS` encodes `¥` as `\` and `−` as Shift_JIS's minus,
+    /// `GBK` and `BIG5` carry GB18030's and HKSCS's characters, and SQL
+    /// Server stores each of those as `\` or `?` (measured on 2022, 3, 99 and
+    /// 870 characters).
     #[test]
     fn a_code_page_says_which_characters_it_cannot_hold() {
         assert_eq!(code_page_fit(1252, "café"), Fit::Fits);
         assert_eq!(code_page_fit(1252, "Ωμέγα"), Fit::Loses('Ω'));
         assert_eq!(code_page_fit(1252, "ab日本"), Fit::Loses('日'));
         assert_eq!(code_page_fit(1253, "Ωμέγα"), Fit::Fits);
-        assert_eq!(code_page_fit(932, "日本"), Fit::Fits);
+        for (cp, text) in [
+            (932, "¥1200"),
+            (932, "a−b"),
+            (932, "日本"),
+            (936, "\u{1E3F}"),
+            (949, "한국"),
+            (950, "\u{6644}"),
+        ] {
+            assert_eq!(code_page_fit(cp, text), Fit::Unknown, "{cp} {text}");
+        }
+        assert_eq!(code_page_fit(932, "plain"), Fit::Fits);
         assert_eq!(code_page_fit(65001, "日本😀"), Fit::Fits);
         assert_eq!(code_page_fit(0, "日本"), Fit::Fits);
         assert_eq!(code_page_fit(850, "plain"), Fit::Fits);

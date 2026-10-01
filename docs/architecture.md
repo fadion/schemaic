@@ -12850,19 +12850,30 @@ existing prose was left alone.
   `Ωμέγα` into a Latin-1 `varchar` came back `Oµ??a`, measured — and reports success.
   `ColumnFacts::code_page` is `0` for every other column and `65001` under a UTF-8 collation, and
   `code_page_fit` answers locally with `encoding_rs` (a direct dependency now, already in the tree
-  through tiberius and calamine) for the Windows code pages — 874, 932, 936, 949, 950, 1250–1258 —
+  through tiberius and calamine) for the single-byte Windows code pages — 874 and 1250–1258 —
   **strictly**: a character with no byte there is `Fit::Loses`, never the best-fit substitute the
-  server would pick. ASCII, `0` and `65001` always fit. The IBM code pages behind the
-  `SQL_Latin1_General_CP437`/`CP850` collations are not in `encoding_rs` and answer `Fit::Unknown`,
-  which `server_code_page_refusal` settles by asking — a
-  `CAST(CAST(@P1 COLLATE <coll> AS varchar(max)) AS nvarchar(max))` compared with `@P1` under
-  `Latin1_General_BIN2`, one round trip per such value — splicing the collation name only when it
-  is a plain word and leaving any other to the server unasked. `code_page_check` runs beside
+  server would pick. ASCII, `0` and `65001` always fit. **The double-byte ones, 932, 936, 949 and
+  950, are not answered locally**: `encoding_rs`'s `SHIFT_JIS`, `GBK`, `EUC_KR` and `BIG5` are the
+  WHATWG Encoding Standard's tables, written for browsers, not Windows', and they encode `¥` as `\`
+  and `−` as Shift_JIS's minus, 99 characters GB18030 has and 936 has not, and 870 HKSCS
+  ideographs — every one of which SQL Server stored as `\` or `?` while the write reported success
+  (each BMP character measured against the server's own conversion on 2022; the single-byte tables
+  encode none the server then loses). So non-ASCII text for one of them is `Fit::Unknown`, as it is
+  for the IBM code pages behind the `SQL_Latin1_General_CP437`/`CP850` collations, which
+  `encoding_rs` lacks, and `server_code_page_refusal` settles it by asking: `first_lost` sends up
+  to a thousand values in one `VALUES` list per collation (T-SQL takes 2,100 parameters) and picks
+  the first whose `CAST(CAST(t COLLATE <coll> AS varchar(max)) AS nvarchar(max))` differs from it
+  under `Latin1_General_BIN2` — a question per batch, not per value, since an import of Japanese
+  text is all such values — then asks the same of that value's distinct characters, so the refusal
+  names the one lost and, for an import, the file's row. It splices the collation name only when it
+  is a plain word and leaves any other to the server unasked. `code_page_check` runs beside
   `blank_refusal` and names the column and the character
-  (`text_a_varchar_cannot_hold_is_refused_before_it_becomes_a_question_mark`; live,
-  `text_a_varchar_cannot_hold_is_refused_not_stored_as_question_marks`, on 2022 and 2025). The local
-  answer is `encoding_rs`'s tables rather than the server's, and the live test holds the two to each
-  other for 1252 alone. All of these are asked in `write_on` before its `SAVE`/`BEGIN`, so a refusal
+  (`text_a_varchar_cannot_hold_is_refused_before_it_becomes_a_question_mark`,
+  `a_code_page_says_which_characters_it_cannot_hold`; live,
+  `text_a_varchar_cannot_hold_is_refused_not_stored_as_question_marks` and
+  `a_double_byte_varchar_refuses_what_its_windows_code_page_lacks` — `¥`, `−`, an HKSCS and a
+  GB18030 character refused, Japanese and Big5 text kept byte for byte, an import refused at its
+  row — on 2022 and 2025). All of these are asked in `write_on` before its `SAVE`/`BEGIN`, so a refusal
   on the pinned session leaves `undone` at `None` (below). And an insert that gives
   an identity column a value needs `IDENTITY_INSERT` on — which, once on, refuses an insert that
   does *not* give one — so `sets_identity` has it switched on and off around that one statement,
