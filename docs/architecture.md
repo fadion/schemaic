@@ -1126,7 +1126,11 @@ existing prose was left alone.
     the name it prefixes (`sql::t_sql_name_prefix`) and runs a name on through the bytes its
     dialect continues one with (`sql::continues_name`); `#t` read as `t` was ``Table `t` not
     found``, and `@curdate` read as `curdate` a misspelled keyword (`typo_checks` scans the same
-    way and skips a prefixed name). `is_session_source` exempts a temporary table, a table
+    way and skips a prefixed name). **Nor does either typo check judge an ODBC escape's
+    function** (`names_an_odbc_function`): `{fn UCASE(x)}` names ODBC's vocabulary, which SQL
+    Server runs as written (`UCASE`, `LCASE`, `CURDATE`, `IFNULL`, `LOCATE`, `TIMESTAMPADD` measured
+    on 2022) and a driver translates elsewhere, and each was a misspelled keyword or function
+    (`an_odbc_escape_function_is_not_a_misspelling`). `is_session_source` exempts a temporary table, a table
     variable and `pseudo_tables` — T-SQL's `inserted`/`deleted`, which every trigger reads and the
     typo check also exempts — from the table check, which cannot judge absent what lives in the
     session; the per-dialect list is empty where trigger rows are `NEW`/`OLD` records. A T-SQL

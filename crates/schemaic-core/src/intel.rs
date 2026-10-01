@@ -10408,7 +10408,11 @@ fn typo_checks(
                 j += 1;
             }
             let qualified = s > 0 && b[s - 1] == b'.';
-            if prefix == 0 && !qualified && is_probable_typo(&sql[s..j], catalog, dialect) {
+            if prefix == 0
+                && !qualified
+                && !names_an_odbc_function(b, s)
+                && is_probable_typo(&sql[s..j], catalog, dialect)
+            {
                 out.push(Diagnostic {
                     range: (s, j),
                     severity: Severity::Warning,
@@ -10420,6 +10424,26 @@ fn typo_checks(
         }
         i += 1;
     }
+}
+
+/// Does the word at `b[s]` name an **ODBC escape's** scalar function — the
+/// `UCASE` of `{fn UCASE(x)}`? Its vocabulary is ODBC's (`UCASE`, `LCASE`,
+/// `CURDATE`, `IFNULL`, `LOCATE`, …), which SQL Server runs as written and a
+/// driver translates elsewhere, so neither typo check may judge it against the
+/// engine's own words. `{`, then `fn` in any case, with white space around it.
+fn names_an_odbc_function(b: &[u8], s: usize) -> bool {
+    let blank_before = |mut k: usize| {
+        while k > 0 && b[k - 1].is_ascii_whitespace() {
+            k -= 1;
+        }
+        k
+    };
+    let fn_end = blank_before(s);
+    if fn_end == s || fn_end < 2 || !b[fn_end - 2..fn_end].eq_ignore_ascii_case(b"fn") {
+        return false;
+    }
+    let brace = blank_before(fn_end - 2);
+    brace > 0 && b[brace - 1] == b'{'
 }
 
 /// Flag a word in **function-call position** (`word(`) that is a near-miss of a
@@ -10483,6 +10507,7 @@ fn function_typo_checks(
             if is_call
                 && !typed
                 && !qualified
+                && !names_an_odbc_function(b, s)
                 && !is_known_function(index, &lw)
                 && !is_sql_keyword(word)
                 && !STMT_KEYWORDS.iter().any(|k| k.eq_ignore_ascii_case(word))
@@ -15151,6 +15176,42 @@ mod tests {
         // explicit `AS or` (this was the reported gap).
         let sql = "SELECT * FROM employees or";
         assert!(has_reserved_alias(&diag(sql), sql, "or"));
+    }
+
+    /// **An ODBC escape's function is the escape's.** `{fn UCASE(x)}` names
+    /// one of ODBC's scalar functions, which SQL Server runs in T-SQL as
+    /// written (2022: `UCASE`, `LCASE`, `CURDATE`, `IFNULL`, `LOCATE`,
+    /// `TIMESTAMPADD` all measured) — and the typo checks, judging the name
+    /// against the engine's own vocabulary, called it a misspelled keyword or
+    /// function. Off SQL Server the escape is a driver's to translate, and
+    /// still no misspelling.
+    #[test]
+    fn an_odbc_escape_function_is_not_a_misspelling() {
+        let typos = |sql: &str, d: SqlDialect| {
+            diag_d(sql, d)
+                .into_iter()
+                .filter(|x| x.message.contains("looks like a misspelled"))
+                .map(|x| sql[x.range.0..x.range.1].to_string())
+                .collect::<Vec<_>>()
+        };
+        let sql = "SELECT {fn UCASE(name)}, {fn LCASE(name)}, {fn CURDATE()}, \
+                   { FN IFNULL(name, 'x') } FROM employees;";
+        for d in [
+            SqlDialect::MsSql,
+            SqlDialect::Postgres,
+            SqlDialect::Sqlite,
+            SqlDialect::MySql,
+        ] {
+            assert_eq!(typos(sql, d), Vec::<String>::new(), "{d:?}");
+        }
+        // The same names outside an escape are still judged.
+        assert_eq!(
+            typos(
+                "SELECT UCASE(name), IFNULL(name, 'x') FROM employees;",
+                SqlDialect::MsSql
+            ),
+            ["UCASE", "IFNULL"]
+        );
     }
 
     /// **The implicit-alias check reads every list the table check reads.**
