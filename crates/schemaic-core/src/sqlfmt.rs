@@ -206,6 +206,48 @@ fn composed_operator_len(b: &[u8], i: usize, dialect: SqlDialect) -> Option<usiz
     (end - i > 1).then_some(end - i)
 }
 
+/// How many bytes at `b[i]` are a **sigil** — a prefix that belongs to the
+/// name, number or quoted name after it, so the two are one token and
+/// `need_space` never separates them — or `0`.
+///
+/// Every engine's own parameter and variable spellings, measured as the space
+/// breaking them: T-SQL's `@x`/`@@x`/`#t`/`##t` ([`crate::sql::t_sql_name_prefix`]);
+/// a `$` before a word byte on all four — PostgreSQL's `$1`, SQLite's `$p`,
+/// MySQL's `$p` (a name there), T-SQL's money `$1.50` and `MERGE`'s
+/// `$action` — a dollar *quote* having been taken whole by `skip_noncode`
+/// before this is asked; SQLite's numbered `?1` and its `@p`; and MySQL's
+/// user variable `@x`, its system `@@x`, and `@` before a quoted name —
+/// `@'q v'`, and the host of an account, `'u'@'h'`, whose spaced form
+/// MySQL 8 and MariaDB 10.11 both refuse. PostgreSQL's `@` is an operator
+/// (`@ -5`) and is left to the operator arm. `:name` is the app's own
+/// placeholder, [`crate::params::opens_placeholder`]'s.
+///
+/// An exhaustive `match`, for the reason [`ops`] gives.
+fn sigil_len(b: &[u8], i: usize, dialect: SqlDialect) -> usize {
+    let tsql = crate::sql::t_sql_name_prefix(b, i, dialect);
+    if tsql > 0 {
+        return tsql;
+    }
+    let word_at = |k: usize| b.get(k).is_some_and(|&c| is_word_byte(c));
+    match b.get(i) {
+        Some(b'$') if word_at(i + 1) => 1,
+        Some(b'?') if b.get(i + 1).is_some_and(u8::is_ascii_digit) => match dialect {
+            SqlDialect::Sqlite => 1,
+            SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::MsSql => 0,
+        },
+        Some(b'@') => match dialect {
+            SqlDialect::MySql => {
+                let len = if b.get(i + 1) == Some(&b'@') { 2 } else { 1 };
+                let quoted = len == 1 && matches!(b.get(i + 1), Some(b'\'' | b'`'));
+                if word_at(i + len) || quoted { len } else { 0 }
+            }
+            SqlDialect::Sqlite => usize::from(word_at(i + 1)),
+            SqlDialect::Postgres | SqlDialect::MsSql => 0,
+        },
+        _ => 0,
+    }
+}
+
 fn tokenize(sql: &str, dialect: SqlDialect) -> Vec<(Kind, &str)> {
     let b = sql.as_bytes();
     let n = b.len();
@@ -306,7 +348,8 @@ fn tokenize(sql: &str, dialect: SqlDialect) -> Vec<(Kind, &str)> {
         // the operator arm below, `@`/`#` became a `Punct` and `need_space`
         // separated it from its name — `SELECT @ x` is Msg 137, `CREATE TABLE
         // # t` Msg 102 — so one Format Code broke nearly every T-SQL script.
-        let prefix = crate::sql::t_sql_name_prefix(b, i, dialect);
+        // The other engines' sigils are [`sigil_len`]'s.
+        let prefix = sigil_len(b, i, dialect);
         if is_word_byte(c) || prefix > 0 {
             let s = i;
             i += prefix.max(1);
@@ -1437,6 +1480,61 @@ mod tests {
         }
         assert_preserves(sql, d);
         assert_eq!(crate::params::names(&out, d), crate::params::names(sql, d));
+    }
+
+    /// **An engine's own parameter or variable is one token.** The formatter
+    /// knew `:name` and T-SQL's `@x`, and split every other sigil from its
+    /// name: PostgreSQL's `$1` came out `$ 1`, SQLite's `?1`, `$p` and `@p`
+    /// came out `? 1`, `$ p` and `@ p`, and MySQL's `@x`, `@@version` and the
+    /// account `'u'@'h'` came out `@ x`, `@ @ version` and `'u' @ 'h'` — each
+    /// a syntax error (MySQL 8 and MariaDB 10.11 measured) where the input
+    /// ran. MySQL's `$p` is a name too.
+    #[test]
+    fn a_native_parameter_or_variable_keeps_its_sigil() {
+        for (d, sql, kept) in [
+            (
+                SqlDialect::Postgres,
+                "select * from t where a = $1 and b = $2::int",
+                &["$1", "$2::int"][..],
+            ),
+            (
+                SqlDialect::Sqlite,
+                "select * from t where a = ?1 and b = $p and c = @q and d = :r and e = ?",
+                &["?1", "$p", "@q", ":r"],
+            ),
+            (
+                SqlDialect::MySql,
+                "set @x := 1; select @x, @@version, @@session.sql_mode, $p from t \
+                 where u = 'a'@'h' and v = @'q v'",
+                &[
+                    "@x",
+                    "@@version",
+                    "@@session.sql_mode",
+                    "$p",
+                    "@'h'",
+                    "@'q v'",
+                ],
+            ),
+            (
+                SqlDialect::MsSql,
+                "select $1.50, @x, @@ROWCOUNT, $action from #t",
+                &["$1.50", "@x", "@@ROWCOUNT", "$action", "#t"],
+            ),
+        ] {
+            let out = super::format_sql(sql, IND, d);
+            for k in kept {
+                assert!(out.contains(k), "{d:?}: {k} split: {out}");
+            }
+            for split in ["$ ", "@ ", "? 1"] {
+                assert!(!out.contains(split), "{d:?}: {split:?} in {out}");
+            }
+            assert_preserves(sql, d);
+        }
+        // PostgreSQL's `@` is an operator, and stays one.
+        assert_eq!(
+            token_texts("select @ -5, @x from t", SqlDialect::Postgres),
+            ["select", "@", "-", "5", ",", "@", "x", "from", "t"]
+        );
     }
 
     /// **A `$` inside a name is part of it on every engine.** MySQL's bare

@@ -10108,6 +10108,16 @@ existing prose was left alone.
     so a name that *holds* one of those bytes, `h#` or `f@x`, stays whole too
     (`a_t_sql_variable_or_temp_table_keeps_its_prefix`), and so does `a$b` on every engine
     (`a_dollar_inside_a_name_keeps_the_name_whole`).
+    **Every engine's own sigil is kept the same way** (`sigil_len`, of which the T-SQL prefix is
+    one arm). The other engines' were split from their names: PostgreSQL's `$1` came out `$ 1`,
+    SQLite's `?1`, `$p` and `@p` came out `? 1`, `$ p` and `@ p`, and MySQL's `@x`, `@@version` and
+    an account's host, `'u'@'h'`, came out `@ x`, `@ @ version` and `'u' @ 'h'` — each refused
+    where the input ran (MySQL 8 and MariaDB 10.11 measured; `'u' @'h'` and `u @h`, the spaced forms
+    the fix still writes, both run). So `$` before a word byte is a prefix on all four (a dollar
+    *quote* is `skip_noncode`'s and taken first; MySQL's `$p` is a name, T-SQL's `$1.50` money and
+    `$action` `MERGE`'s), `?` before a digit on SQLite, and `@`/`@@` on MySQL and SQLite, MySQL's
+    also before a quote, so `@'q v'` is one `Kind::Quoted`. PostgreSQL's `@` is an operator and is
+    left alone (`a_native_parameter_or_variable_keeps_its_sigil`).
   - `pairs.rs` — caret-driven, boundary-aware editor highlights + auto-close pairs (via
     `skip_noncode`): `auto_pair` (auto-close `()`/`''`/`""`/`` `` `` [MySQL] at code positions, wrap a
     selection, type-over a closer/quote already at the caret — respects string/comment regions and
