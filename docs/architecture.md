@@ -6414,7 +6414,14 @@ existing prose was left alone.
     Preview back under "leave this blank" with nothing on screen to blank. A reset keeps what was
     typed, its one row being the password, and so does an Entra draft, for the held-back sentence
     above (`a_password_the_kind_switch_hid_is_neither_emitted_nor_blocking`; the form's call site,
-    `the_preview_leaves_out_a_password_the_kind_switch_hid` under `account_editor.rs`).
+    `the_preview_leaves_out_a_password_the_kind_switch_hid` under `account_editor.rs`). **The Entra
+    toggle is the same hazard on the form's other hidden field**: drawn for a User alone, turned on
+    and then hidden by switching Kind to Role (or Login), it stayed on, and Preview was held back
+    under "Only a database user is made from Microsoft Entra." with no toggle on screen. So the
+    draft as shown carries `external` only where the toggle is drawn — a User, where
+    `supports_entra_users` — and the password rule reads that draft
+    (`an_entra_toggle_the_kind_switch_hid_is_neither_emitted_nor_blocking`). The blocker's
+    not-a-User sentence is now reached only by a caller that builds the draft directly.
     **What the form may make is `Principals::scope`, an `AccountScope` read with the list** — three
     `bool`s, every one `false` on every other engine, which is also an ordinary server's answer.
     `contained` is the first, because SQL Server takes a user's own password only in a contained

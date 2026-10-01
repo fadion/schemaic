@@ -2042,6 +2042,13 @@ pub fn account_form_blocker(
 /// A reset keeps what was typed: its one row is the password. So does a
 /// Microsoft Entra draft, whose blocker holds a hidden login or password back
 /// in a sentence of its own ([`account_form_blocker`]).
+///
+/// **The Entra toggle is hidden by the Kind switch too**, being drawn for a
+/// User alone where [`supports_entra_users`]: turned on and then hidden by
+/// switching to Role or Login, it stayed on, and Preview was held back under
+/// "Only a database user is made from Microsoft Entra." with no toggle on
+/// screen to turn off. Shown, it is off wherever it is not drawn — and the
+/// password rule above then reads that draft.
 pub fn account_form_as_shown(
     dialect: SqlDialect,
     draft: &AccountDraft,
@@ -2049,12 +2056,18 @@ pub fn account_form_as_shown(
     scope: AccountScope,
     resetting: bool,
 ) -> (AccountDraft, String) {
-    let hidden =
-        !resetting && !draft.external && !draft_takes_password(dialect, draft, scope.contained);
-    if !hidden {
-        return (draft.clone(), confirm.to_string());
-    }
     let mut shown = draft.clone();
+    if !resetting
+        && shown.external
+        && !(shown.kind == PrincipalKind::User && supports_entra_users(dialect, scope))
+    {
+        shown.external = false;
+    }
+    let hidden =
+        !resetting && !shown.external && !draft_takes_password(dialect, &shown, scope.contained);
+    if !hidden {
+        return (shown, confirm.to_string());
+    }
     shown.password.clear();
     (shown, String::new())
 }
@@ -5121,6 +5134,67 @@ mod mssql_tests {
                 }
             }
         }
+    }
+
+    /// **The Microsoft Entra toggle the Kind switch hid is not in the draft
+    /// either.** The toggle is drawn for a User alone; turned on and then
+    /// hidden by switching Kind to Role (or Login), it stayed on, and Preview
+    /// was held back under "Only a database user is made from Microsoft
+    /// Entra." with nothing on screen to turn off. Shown, the form is the role
+    /// it describes. Where the toggle is drawn it stands, and so does the
+    /// blocker for a login or password typed before it hid them.
+    #[test]
+    fn an_entra_toggle_the_kind_switch_hid_is_neither_emitted_nor_blocking() {
+        let entra = AccountScope {
+            entra_users: true,
+            ..AccountScope::default()
+        };
+        let user = AccountDraft {
+            name: "n".into(),
+            kind: PrincipalKind::User,
+            external: true,
+            ..Default::default()
+        };
+        for kind in [PrincipalKind::Role, PrincipalKind::Login] {
+            let switched = AccountDraft {
+                kind,
+                ..user.clone()
+            };
+            let (shown, confirm) = account_form_as_shown(MS, &switched, "", entra, false);
+            assert!(!shown.external, "{kind:?}");
+            if kind == PrincipalKind::Role {
+                assert_eq!(account_form_blocker(&shown, &confirm, false), None);
+                assert_eq!(
+                    account_draft_sql(&shown, MS).as_deref(),
+                    Some("CREATE ROLE [n]")
+                );
+            } else {
+                // A login is the login it shows: it still needs its password.
+                assert_eq!(
+                    account_form_blocker(&shown, &confirm, false),
+                    Some("A login needs a password.")
+                );
+            }
+        }
+        // Where it is drawn, it is what the user chose.
+        let (shown, _) = account_form_as_shown(MS, &user, "", entra, false);
+        assert!(shown.external);
+        assert_eq!(
+            account_draft_sql(&shown, MS).as_deref(),
+            Some("CREATE USER [n] FROM EXTERNAL PROVIDER")
+        );
+        let typed_login = AccountDraft {
+            login: "app".into(),
+            ..user.clone()
+        };
+        let (shown, confirm) = account_form_as_shown(MS, &typed_login, "", entra, false);
+        assert!(
+            account_form_blocker(&shown, &confirm, false).is_some_and(|w| w.contains("Entra")),
+            "the toggle's own blocker stands"
+        );
+        // A connection that cannot make one never draws it, whatever the kind.
+        let (shown, _) = account_form_as_shown(MS, &user, "", AccountScope::default(), false);
+        assert!(!shown.external);
     }
 
     /// **The password is the login's**, so a reset on a user row goes to the
