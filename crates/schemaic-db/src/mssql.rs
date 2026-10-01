@@ -3801,31 +3801,67 @@ async fn column_facts(
 
 // ── Accounts ─────────────────────────────────────────────────────────────────
 
-/// Every login — SQL (`S`), Windows (`U`) and Windows group (`G`) — with its
-/// server roles: `(name, type, disabled, default database, server roles)`.
-/// The `##…##` certificate logins are the server's plumbing and left out.
+/// Every login — SQL (`S`), Windows (`U`) and Windows group (`G`) — with the
+/// id its server roles are found by ([`SERVER_ROLE_MEMBERSHIPS`]): `(name,
+/// type, disabled, default database, principal id)`. The `##…##` certificate
+/// logins are the server's plumbing and left out.
+///
+/// **No `STRING_AGG`**: it is SQL Server 2017's, and the roles were gathered
+/// with it here, so on 2016 — which the schema load reads (`Catalogue`) —
+/// the account browser failed whole. The memberships are a query of their
+/// own, joined by [`roles_by_member`].
 const LOGIN_LISTING: &str = "SELECT sp.name, sp.type, CAST(sp.is_disabled AS int), \
-            sp.default_database_name, \
-            (SELECT STRING_AGG(r.name, ', ') WITHIN GROUP (ORDER BY r.name) \
-               FROM sys.server_role_members m \
-               JOIN sys.server_principals r ON r.principal_id = m.role_principal_id \
-              WHERE m.member_principal_id = sp.principal_id) \
+            sp.default_database_name, sp.principal_id \
      FROM sys.server_principals sp \
      WHERE sp.type IN ('S', 'U', 'G') AND sp.name NOT LIKE N'##%' \
      ORDER BY sp.name";
 
-/// The current database's users and roles, with each user's login and every
-/// principal's role memberships: `(name, type, login, authentication, default
-/// schema, fixed role, member of)`.
+/// Every server-role membership: `(member's principal id, role)`, in role
+/// order — the order the browser lists a login's roles in.
+const SERVER_ROLE_MEMBERSHIPS: &str = "SELECT m.member_principal_id, r.name \
+     FROM sys.server_role_members m \
+     JOIN sys.server_principals r ON r.principal_id = m.role_principal_id \
+     ORDER BY r.name";
+
+/// The current database's users and roles, with each user's login and the id
+/// its role memberships are found by ([`DATABASE_ROLE_MEMBERSHIPS`]): `(name,
+/// type, login, authentication, default schema, fixed role, principal id)`.
+/// No `STRING_AGG`, for [`LOGIN_LISTING`]'s reason.
 const USER_LISTING: &str = "SELECT dp.name, dp.type, SUSER_SNAME(dp.sid), \
             dp.authentication_type_desc, dp.default_schema_name, CAST(dp.is_fixed_role AS int), \
-            (SELECT STRING_AGG(r.name, ', ') WITHIN GROUP (ORDER BY r.name) \
-               FROM sys.database_role_members m \
-               JOIN sys.database_principals r ON r.principal_id = m.role_principal_id \
-              WHERE m.member_principal_id = dp.principal_id) \
+            dp.principal_id \
      FROM sys.database_principals dp \
      WHERE dp.type IN ('S', 'U', 'G', 'E', 'X', 'R') \
      ORDER BY dp.name";
+
+/// Every database-role membership in the current database: `(member's
+/// principal id, role)`, in role order.
+const DATABASE_ROLE_MEMBERSHIPS: &str = "SELECT m.member_principal_id, r.name \
+     FROM sys.database_role_members m \
+     JOIN sys.database_principals r ON r.principal_id = m.role_principal_id \
+     ORDER BY r.name";
+
+/// [`SERVER_ROLE_MEMBERSHIPS`]' or [`DATABASE_ROLE_MEMBERSHIPS`]' rows as each
+/// member's roles, joined `, ` in the rows' order — the text `STRING_AGG(…,
+/// ', ') WITHIN GROUP (ORDER BY r.name)` gave, keyed by the principal id the
+/// listing carries. A member with no role has no entry, as `STRING_AGG` over
+/// no rows was `NULL`.
+fn roles_by_member(rows: &[Vec<Option<String>>]) -> std::collections::HashMap<String, String> {
+    let mut out: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for r in rows {
+        let (member, role) = (cell(r, 0), cell(r, 1));
+        match out.get_mut(&member) {
+            Some(list) => {
+                list.push_str(", ");
+                list.push_str(&role);
+            }
+            None => {
+                out.insert(member, role);
+            }
+        }
+    }
+    out
+}
 
 /// [`USER_LISTING`] for Azure SQL Database, which refuses `SUSER_SNAME` a
 /// parameter (Msg 40507): the login is found by its SID instead. Not the one
@@ -3834,10 +3870,7 @@ const USER_LISTING: &str = "SELECT dp.name, dp.type, SUSER_SNAME(dp.sid), \
 const AZURE_USER_LISTING: &str = "SELECT dp.name, dp.type, \
             (SELECT sp.name FROM sys.server_principals sp WHERE sp.sid = dp.sid), \
             dp.authentication_type_desc, dp.default_schema_name, CAST(dp.is_fixed_role AS int), \
-            (SELECT STRING_AGG(r.name, ', ') WITHIN GROUP (ORDER BY r.name) \
-               FROM sys.database_role_members m \
-               JOIN sys.database_principals r ON r.principal_id = m.role_principal_id \
-              WHERE m.member_principal_id = dp.principal_id) \
+            dp.principal_id \
      FROM sys.database_principals dp \
      WHERE dp.type IN ('S', 'U', 'G', 'E', 'X', 'R') \
      ORDER BY dp.name";
@@ -3965,6 +3998,7 @@ pub(crate) async fn fetch_principals(
     let logins: Vec<MsLoginRow> = if logins_elsewhere {
         Vec::new()
     } else {
+        let roles = roles_by_member(&query_rows(&mut client, SERVER_ROLE_MEMBERSHIPS).await?);
         query_rows(&mut client, LOGIN_LISTING)
             .await?
             .iter()
@@ -3973,7 +4007,7 @@ pub(crate) async fn fetch_principals(
                 kind: cell(r, 1),
                 disabled: flag(r, 2),
                 default_database: r.get(3).cloned().flatten(),
-                server_roles: r.get(4).cloned().flatten(),
+                server_roles: roles.get(&cell(r, 4)).cloned(),
             })
             .collect()
     };
@@ -3983,19 +4017,22 @@ pub(crate) async fn fetch_principals(
         USER_LISTING
     };
     let users: Vec<MsUserRow> = match database {
-        Some(_) => query_rows(&mut client, user_listing)
-            .await?
-            .iter()
-            .map(|r| MsUserRow {
-                name: cell(r, 0),
-                kind: cell(r, 1),
-                login: r.get(2).cloned().flatten(),
-                authentication: r.get(3).cloned().flatten(),
-                default_schema: r.get(4).cloned().flatten(),
-                fixed_role: flag(r, 5),
-                member_of: r.get(6).cloned().flatten(),
-            })
-            .collect(),
+        Some(_) => {
+            let roles = roles_by_member(&query_rows(&mut client, DATABASE_ROLE_MEMBERSHIPS).await?);
+            query_rows(&mut client, user_listing)
+                .await?
+                .iter()
+                .map(|r| MsUserRow {
+                    name: cell(r, 0),
+                    kind: cell(r, 1),
+                    login: r.get(2).cloned().flatten(),
+                    authentication: r.get(3).cloned().flatten(),
+                    default_schema: r.get(4).cloned().flatten(),
+                    fixed_role: flag(r, 5),
+                    member_of: roles.get(&cell(r, 6)).cloned(),
+                })
+                .collect()
+        }
         None => Vec::new(),
     };
     let sees_all = query_rows(
@@ -5037,6 +5074,50 @@ mod write_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The account browser asks nothing newer than 2016**, which the schema
+    /// load reads: its role lists were gathered with `STRING_AGG`, SQL Server
+    /// 2017's, so on 2016 every listing of logins and users failed whole.
+    /// Pinned against this file's own source, since a query anywhere in it
+    /// reaches the same servers.
+    #[test]
+    fn no_query_here_aggregates_with_string_agg() {
+        // Up to the first test module — line by line, so a CRLF checkout
+        // reads the same.
+        let lines: Vec<&str> = include_str!("mssql.rs").lines().collect();
+        let end = lines
+            .windows(2)
+            .position(|w| w[0].trim_end() == "#[cfg(test)]" && w[1].starts_with("mod "))
+            .expect("the test module");
+        for (i, line) in lines[..end].iter().enumerate() {
+            let line = line.trim_start();
+            if line.starts_with("//") {
+                continue;
+            }
+            assert!(!line.contains("STRING_AGG"), "line {}: {line}", i + 1);
+        }
+    }
+
+    /// Each member's roles, `, `-joined in the rows' order — what
+    /// `STRING_AGG(r.name, ', ') WITHIN GROUP (ORDER BY r.name)` gave — and no
+    /// entry for a member with none, as `STRING_AGG` over no rows was `NULL`.
+    #[test]
+    fn roles_are_joined_per_member_in_row_order() {
+        let row = |m: &str, r: &str| vec![Some(m.to_string()), Some(r.to_string())];
+        let roles = roles_by_member(&[
+            row("5", "db_datareader"),
+            row("7", "db_datareader"),
+            row("5", "db_datawriter"),
+            row("5", "z, odd"),
+        ]);
+        assert_eq!(
+            roles.get("5").map(String::as_str),
+            Some("db_datareader, db_datawriter, z, odd")
+        );
+        assert_eq!(roles.get("7").map(String::as_str), Some("db_datareader"));
+        assert_eq!(roles.get("9"), None);
+        assert!(roles_by_member(&[]).is_empty());
+    }
 
     /// A server with none of the catalogue columns newer than 2012.
     const OLDEST: Catalogue = Catalogue {

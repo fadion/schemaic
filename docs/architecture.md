@@ -13827,7 +13827,13 @@ existing prose was left alone.
   Azure SQL Database reports 12 and has every one
   (`a_listing_names_no_catalogue_column_the_server_has_not_got`,
   `a_listing_without_a_column_keeps_its_cell_count`). No pre-2017 server is reachable here;
-  both forms of every listing were run against 2022 and 2025.
+  both forms of every listing were run against 2022 and 2025. **Nor does the account browser
+  call a function the server has not got**: the login and user listings gathered each
+  principal's roles with `STRING_AGG`, which is 2017's, so on 2016 the browser failed whole. The
+  memberships are now queries of their own (`SERVER_ROLE_MEMBERSHIPS`,
+  `DATABASE_ROLE_MEMBERSHIPS`), joined to the listing's `principal_id` by `roles_by_member` into
+  the same `, `-joined text, and `no_query_here_aggregates_with_string_agg` holds `mssql.rs`'s
+  queries to that.
   **The driver is vendored and patched**, on the terms `vendor/floem/` is (*Floem 0.2 gotchas*):
   `vendor/tiberius/` is the published 0.13.0 through `[patch.crates-io]`, each change marked
   `schemaic patch (PATCHES.md)`, and `vendor/tiberius/PATCHES.md` is the record. Five patches:
