@@ -8733,6 +8733,14 @@ existing prose was left alone.
     shows no text for (created `WITH ENCRYPTION`; the reader reads its NULL as `""`) is a comment
     naming `grp;n`, as an encrypted routine is: written as its empty text it was a bare `;` that
     said nothing, and the dump refuses to drop such a group on a replay (`dump::routine_hold`).
+    **The comparison leaves the members out of what it compares**: a member can be neither altered
+    nor dropped apart from its group, so a target missing `grp;2` was Differing over a no-op `CREATE
+    OR ALTER` of the head and Differing again after Apply. `compare::routine_entry` drafts the
+    source's routine with the target's members, flags an entry whose members differ `uncertain`,
+    and shows each side's members in its DDL pane; a group only the source holds is created whole,
+    `Change::CreateRoutine` going through `ddl::routine_create_statements` like the script
+    (`a_numbered_groups_members_are_shown_not_planned_and_created_with_it`; live,
+    `a_comparison_creates_a_numbered_group_whole`).
     `RoutineSource` is the MySQL body + session state, fetched lazily, and exists
     for exactly the reason `TriggerSource` does — `information_schema.ROUTINE_DEFINITION` resolves
     the body's escapes, and every edit on that engine begins with a `DROP` that commits on its own,

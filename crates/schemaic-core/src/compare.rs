@@ -2143,18 +2143,37 @@ fn routine_entry(
     // that "succeeded" creating nothing. `RoutineInfo::is_editable` asks the
     // same of these two, beside a C function that is plannable.
     let unread_source = r.is_some_and(|r| r.tsql.hidden || r.tsql.verbatim.is_some());
+    // **A SQL Server numbered group's other members are not compared**: a
+    // member can be neither altered nor dropped apart from its group, so no
+    // plan here resolves a difference in them, and comparing them reported a
+    // difference over a no-op `CREATE OR ALTER` of the head, again after
+    // every Apply. The source's draft takes the target's members; the panes
+    // show both sides' (`side_text`), and the entry is one this comparison
+    // cannot vouch for. A group only the source holds is created with them
+    // (`ddl::routine_create_statements`). Empty everywhere else.
+    let members_differ = matches!((l, r), (Some(l), Some(r)) if l.tsql.numbered != r.tsql.numbered);
     let changes = match (l, r) {
         _ if unread_source => empty_set(&any.name, any.schema.as_deref(), dialect),
-        (Some(l), Some(r)) => ddl::diff_routine(l, &RoutineDraft::from_info(r), dialect),
+        (Some(l), Some(r)) => {
+            let mut draft = RoutineDraft::from_info(r);
+            draft.info.tsql.numbered = l.tsql.numbered.clone();
+            ddl::diff_routine(l, &draft, dialect)
+        }
         (None, Some(r)) => ddl::create_routine(&RoutineDraft::from_info(r), dialect),
         (Some(l), None) => ddl::drop_routine(l, dialect),
         (None, None) => unreachable!("a pair holds at least one side"),
     };
     // `replace: false` — this text is read, never run, and a reader wants to
     // see the object as it stands rather than as a statement that would
-    // overwrite it.
-    let left_ddl = side_ddl(l, |f| f.create_sql(dialect, false));
-    let right_ddl = side_ddl(r, |f| f.create_sql(dialect, false));
+    // overwrite it. A numbered group's members after the head, as stored.
+    let side_text = |f: &RoutineInfo| {
+        std::iter::once(f.create_sql(dialect, false))
+            .chain(f.tsql.numbered.iter().map(|(_, t)| t.trim().to_string()))
+            .collect::<Vec<_>>()
+            .join("\nGO\n")
+    };
+    let left_ddl = side_ddl(l, side_text);
+    let right_ddl = side_ddl(r, side_text);
     CompareEntry {
         kind: match any.kind {
             RoutineKind::Function => CompareKind::Function,
@@ -2167,7 +2186,7 @@ fn routine_entry(
         status: unread_status(l.is_some(), unread_source, &left_ddl, &right_ddl)
             .unwrap_or_else(|| status_of(l.is_some(), r.is_some(), &changes)),
         changes,
-        uncertain: unread_source && l.is_some(),
+        uncertain: (unread_source && l.is_some()) || members_differ,
         left_ddl,
         right_ddl,
     }
@@ -6006,5 +6025,47 @@ mod tsql_module_tests {
             assert!(plan.emit().is_empty(), "{:?}", plan.emit());
             assert_eq!(plan.omitted.len(), 3, "{:?}", plan.omitted);
         }
+    }
+
+    fn group(members: &[(i32, &str)]) -> DbSchema {
+        let mut p = ms_procedure("SELECT 1", false);
+        p.name = "grp".into();
+        p.tsql.numbered = members.iter().map(|(n, t)| (*n, t.to_string())).collect();
+        DbSchema {
+            routines: vec![std::sync::Arc::new(p)],
+            ..Default::default()
+        }
+    }
+
+    /// **A numbered group's members are not a difference its plan cannot
+    /// resolve, and a group created is created whole** (S6.1-L1-03). The
+    /// members were compared but never planned: a target missing `grp;2`
+    /// was Differing over two identical `CREATE` panes, with a no-op `CREATE
+    /// OR ALTER` of the head as its plan and the same difference after it;
+    /// and a group only the source held was created without its members.
+    /// A member cannot be altered or dropped apart from its group, so the
+    /// members are left out of what is compared — the entry is flagged as
+    /// one the comparison cannot vouch for, and the panes show them.
+    #[test]
+    fn a_numbered_groups_members_are_shown_not_planned_and_created_with_it() {
+        let member = "CREATE PROCEDURE dbo.grp;2 AS SELECT 2";
+        let c = SchemaComparison::of(&group(&[]), &group(&[(2, member)]), MS);
+        let e = c.entries.iter().find(|e| e.name == "grp").expect("grp");
+        assert_eq!(e.status, ObjectStatus::Same, "{:?}", e.changes.emit());
+        assert!(e.uncertain);
+        assert!(e.right_ddl.contains("grp;2") && !e.left_ddl.contains("grp;2"));
+
+        let plan =
+            SchemaComparison::of(&DbSchema::default(), &group(&[(2, member)]), MS).plan(|_| true);
+        let sql = plan.emit();
+        let head = sql
+            .iter()
+            .position(|s| s.starts_with("CREATE PROCEDURE [dbo].[grp]"))
+            .unwrap_or_else(|| panic!("{sql:#?}"));
+        let at = sql
+            .iter()
+            .position(|s| s == member)
+            .unwrap_or_else(|| panic!("{sql:#?}"));
+        assert!(head < at, "{sql:#?}");
     }
 }

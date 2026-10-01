@@ -3615,6 +3615,55 @@ async fn a_comparison_discloses_the_modules_the_source_would_not_show() {
     }
 }
 
+/// **A comparison creates a numbered group whole, and does not count its
+/// members as a difference it cannot plan.** A group only the source held
+/// was created without `grp;2`; a target missing that member was Differing
+/// over a no-op alter of the head, again after every Apply. Synced, the
+/// target has the member, and a target whose group lacks one is not
+/// offered a plan for it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_comparison_creates_a_numbered_group_whole() {
+    use schemaic_core::compare::SchemaComparison;
+    if !enabled() || azure_cannot("Azure SQL Database has no numbered procedures") {
+        return;
+    }
+    let target = Scratch::create("cmp_grp_target").await;
+    let source = Scratch::create("cmp_grp_source").await;
+    // Something in `dbo` on each side: a target with nothing in it reads no
+    // `dbo`, and the plan would open by creating one.
+    for s in [&target, &source] {
+        s.exec("CREATE TABLE dbo.t (id int NOT NULL PRIMARY KEY)")
+            .await;
+    }
+    source
+        .exec("CREATE PROCEDURE dbo.grp AS SELECT 1 AS n")
+        .await;
+    source
+        .exec("CREATE PROCEDURE dbo.grp;2 AS SELECT 2 AS n")
+        .await;
+    let (_, again) = sync_modules(&target, &source).await;
+    assert_eq!(target.scalar("EXEC dbo.grp;2").await, "2");
+    let left: Vec<String> = again.differences().map(|e| e.key()).collect();
+    assert!(left.is_empty(), "{left:?}");
+
+    source
+        .exec("CREATE PROCEDURE dbo.grp;3 AS SELECT 3 AS n")
+        .await;
+    let read = |s: &Scratch| {
+        let db = s.db.clone();
+        let name = s.name.clone();
+        async move {
+            db.fetch_schema(&name, CancellationToken::new())
+                .await
+                .unwrap()
+        }
+    };
+    let c = SchemaComparison::of(&read(&target).await, &read(&source).await, MS);
+    let e = c.entries.iter().find(|e| e.name == "grp").expect("grp");
+    assert!(!e.status.is_difference() && e.uncertain, "{:?}", e.status);
+    assert!(e.right_ddl.contains("grp;3"), "{}", e.right_ddl);
+}
+
 /// **A comparison's view alter names the target's indexes it drops.** The
 /// risk read the source's view's indexes, so a target's `cix` — which
 /// `ALTER VIEW` drops — went with an empty risk list. Synced, the plan names

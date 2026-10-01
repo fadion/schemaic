@@ -5051,7 +5051,7 @@ impl ObjectItem {
             // stored and inside the group's settings — see
             // `ddl::routine_create_statements`; empty everywhere else.
             ObjectItem::Routine(r) => crate::ddl::client_script(
-                &crate::ddl::routine_create_statements(r, dialect),
+                &crate::ddl::routine_create_statements(r, dialect, true),
                 dialect,
             ),
             // Through `client_script` for the same reason a routine is: this

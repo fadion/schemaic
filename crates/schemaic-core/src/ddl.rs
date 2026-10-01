@@ -5998,7 +5998,8 @@ impl ChangeSet {
             match c {
                 Change::CreateRoutine(draft) => {
                     let f = &draft.info;
-                    out.extend(session_wrapped(None, f.create_sql(d, false), f, d));
+                    // A numbered group's members with it, inside its settings.
+                    out.extend(routine_create_statements(f, d, false));
                     out.extend(routine_follow_ups(f, None, d));
                 }
                 Change::ReplaceRoutine {
@@ -8909,12 +8910,19 @@ pub(crate) fn tsql_settings_scripted(
 /// Server **the other members of the numbered group it heads** after it,
 /// inside the same wrapper ([`tsql_settings_around`]), each as stored
 /// ([`crate::schema::TsqlRoutine::numbered`]; empty everywhere else). What
-/// recreates the whole routine: Copy DDL and the dump.
+/// recreates the whole routine: Copy DDL and the dump (`script`, which
+/// states both settings — [`tsql_settings_around`]), and a plan's
+/// `CreateRoutine` — a comparison's group only the source holds, which was
+/// created without its members.
 ///
 /// A member the server shows no text for (an encrypted one) is a comment
 /// that names it, as an encrypted routine is: written as its empty text, it
 /// was a bare `;` that said nothing.
-pub(crate) fn routine_create_statements(r: &RoutineInfo, d: SqlDialect) -> Vec<String> {
+pub(crate) fn routine_create_statements(
+    r: &RoutineInfo,
+    d: SqlDialect,
+    script: bool,
+) -> Vec<String> {
     let head = r.create_sql(d, false);
     match d {
         SqlDialect::MsSql => {
@@ -8935,7 +8943,7 @@ pub(crate) fn routine_create_statements(r: &RoutineInfo, d: SqlDialect) -> Vec<S
                 None,
                 std::iter::once(head).chain(members).collect(),
                 &r.tsql.module,
-                !r.tsql.hidden,
+                script && !r.tsql.hidden,
             )
         }
         SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => {
