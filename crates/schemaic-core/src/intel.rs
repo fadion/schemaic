@@ -3683,7 +3683,14 @@ fn tokenize_range(sql: &str, lo: usize, hi: usize, dialect: SqlDialect) -> Vec<T
             b',' => push(&mut out, &mut semi, i, i + 1, TkKind::Comma),
             b'(' => push(&mut out, &mut semi, i, i + 1, TkKind::LParen),
             b')' => push(&mut out, &mut semi, i, i + 1, TkKind::RParen),
-            b';' => semi = true,
+            // Not a procedure's group number, `EXEC p;2`.
+            b';' if !(numbered_procedures(dialect)
+                && i > lo
+                && (is_word_byte(b[i - 1]) || b[i - 1] == b']')
+                && b.get(i + 1).is_some_and(u8::is_ascii_digit)) =>
+            {
+                semi = true
+            }
             _ => {}
         }
         i += 1;
@@ -4391,6 +4398,9 @@ mod ast_scope {
                     collect_twj(twj, out);
                 }
             }
+            // A view's query, whose CTEs are its own: `CREATE VIEW v AS WITH
+            // a AS (…) SELECT … FROM a` said ``Table `a` not found``.
+            Statement::CreateView(view) => collect_query(&view.query, out),
             _ => {}
         }
     }
@@ -5452,7 +5462,7 @@ fn is_probable_typo(word: &str, catalog: &Catalog, dialect: SqlDialect) -> bool 
 /// Byte ranges come from the [`skip_noncode`] lexer, not AST spans (which are
 /// still maturing upstream), so squiggle placement is exact.
 pub fn diagnostics(sql: &str, catalog: &Catalog, dialect: SqlDialect) -> Vec<Diagnostic> {
-    let ranges = crate::sql::statement_ranges(sql, dialect);
+    let ranges = join_procedure_numbers(sql, crate::sql::statement_ranges(sql, dialect), dialect);
     let last = ranges.len().saturating_sub(1);
     let mut out: Vec<Diagnostic> = Vec::new();
     let mut flow = TsqlFlow::new();
@@ -5477,6 +5487,36 @@ pub fn diagnostics(sql: &str, catalog: &Catalog, dialect: SqlDialect) -> Vec<Dia
         flow.end_batch(range_is_terminated(sql, hi), &mut out);
     }
     dedup_diagnostics(out)
+}
+
+/// `ranges` with each range that a procedure's group number cut — `EXEC
+/// p;2 @a` is two ranges to [`crate::sql::statement_ranges`], whose `;` it is
+/// — joined back to the one before it, where [`numbered_procedures`].
+fn join_procedure_numbers(
+    sql: &str,
+    ranges: Vec<(usize, usize)>,
+    dialect: SqlDialect,
+) -> Vec<(usize, usize)> {
+    if !numbered_procedures(dialect) {
+        return ranges;
+    }
+    let b = sql.as_bytes();
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (lo, hi) in ranges {
+        match out.last_mut() {
+            Some(prev)
+                if prev.1 == lo
+                    && lo >= 2
+                    && b[lo - 1] == b';'
+                    && (is_word_byte(b[lo - 2]) || b[lo - 2] == b']')
+                    && b.get(lo).is_some_and(u8::is_ascii_digit) =>
+            {
+                prev.1 = hi;
+            }
+            _ => out.push((lo, hi)),
+        }
+    }
+    out
 }
 
 /// Does the range ending at byte `hi` end with its `;` — so that, the
@@ -6155,6 +6195,16 @@ fn tsql_condition_end(sql: &str, toks: &[Token], i: usize) -> usize {
 fn tsql_statement_end(sql: &str, toks: &[Token], i: usize) -> usize {
     let word = |j: usize| tsql_keyword(toks, j);
     let lparen = |j: usize| matches!(toks.get(j).map(|t| &t.kind), Some(TkKind::LParen));
+    // A view is one statement whatever it holds — and the only one in its
+    // batch — so its `AS WITH c AS (…) SELECT …` is never cut before the
+    // `SELECT` its CTEs feed.
+    if matches!(
+        head_words(&toks[i..], 4).as_slice(),
+        [c, v, ..] if (c == "CREATE" || c == "ALTER") && v == "VIEW"
+    ) || head_words(&toks[i..], 4) == ["CREATE", "OR", "ALTER", "VIEW"]
+    {
+        return toks.len();
+    }
     let mut st = TsqlStatement::begin(word(i));
     st.observe(word(i).as_deref());
     let mut depth = 0usize;
@@ -6342,7 +6392,8 @@ impl TsqlStatement {
             "DECLARE" | "PRINT" | "RAISERROR" | "THROW" | "RETURN" | "WAITFOR" | "USE"
             | "TRUNCATE" | "GOTO" | "BREAK" | "CONTINUE" | "OPEN" | "CLOSE" | "DEALLOCATE"
             | "KILL" | "CHECKPOINT" | "DBCC" | "BACKUP" | "RESTORE" | "RECONFIGURE" | "SAVE"
-            | "COMMIT" | "REVERT" | "BULK" | "BEGIN" | "WHILE" => true,
+            | "COMMIT" | "REVERT" | "BULK" | "BEGIN" | "WHILE" | "READTEXT" | "WRITETEXT"
+            | "UPDATETEXT" | "SETUSER" => true,
             _ => false,
         }
     }
@@ -6401,7 +6452,7 @@ fn unit_diagnostics(
     out: &mut Vec<Diagnostic>,
 ) {
     let toks = tokenize_range(sql, lo, hi, dialect);
-    let masks = grammar_gap_masks(sql, hi, &toks, dialect);
+    let masks = grammar_gap_masks(sql, lo, hi, &toks, dialect);
     // The text the parser and the checks read. Masked or not, it is as long as
     // the statement, so a position in it is a position in `sql` less `lo`.
     let masked = (!masks.is_empty()).then(|| masked_text(sql, lo, hi, &masks));
@@ -6564,21 +6615,42 @@ fn dotted_name_start(toks: &[Token], end: usize) -> Option<usize> {
 /// - `PARSE`/`TRY_PARSE`'s `AS type [USING culture]`, to the call's `)`;
 /// - `TOP (n)` right after `DELETE`/`UPDATE`/`INSERT`, a table hint on their
 ///   target (`INSERT INTO t WITH (ROWLOCK) …`), and the first `FROM` of
-///   `DELETE FROM t FROM t JOIN …`;
+///   `DELETE FROM t FROM t JOIN …` — a `WITH`'s CTEs before the verb or not;
 /// - `CREATE INDEX`'s `WITH (…)` options and its filegroup (`ON [PRIMARY]`);
 /// - a trigger's `UPDATE(col)`, which reads as an `UPDATE` statement and is
-///   filled as a call.
+///   filled as a call;
 ///
-/// `toks` are the statement's, which ends at byte `hi`.
-fn grammar_gap_masks(sql: &str, hi: usize, toks: &[Token], dialect: SqlDialect) -> Vec<Mask> {
+/// and what running the checker over every module in `master` and `msdb`
+/// found inside procedures that compile (S7.2-L1-03):
+/// - an index's kind in a table definition, `PRIMARY KEY CLUSTERED`, and a
+///   `CREATE TABLE`'s trailing comma (a table variable's is refused);
+/// - a join hint after its join type, `INNER HASH JOIN`;
+/// - `col.WRITE(…)` in an `UPDATE`'s `SET`, filled as an assignment, and
+///   `WHERE CURRENT OF c`, filled as a predicate;
+/// - `WITH XMLNAMESPACES (…)`, `OPENXML (…) WITH (…)`'s schema, and the
+///   internal `OpenRowset(TABLE x, …)` the server's own modules read;
+/// - `AS N'alias'`'s `N`, space-separated table hints' missing commas
+///   ([`table_hint_commas`]), `f(@a, DEFAULT)`'s argument, a collation after a
+///   qualified call;
+/// - spellings: `< =`, `0X00`, `FROM ::fn_x(…)`, ODBC's `{fn …}`, a
+///   procedure's group number `p;2`.
+///
+/// `toks` are the statement's, which runs from byte `lo` to `hi`.
+fn grammar_gap_masks(
+    sql: &str,
+    lo: usize,
+    hi: usize,
+    toks: &[Token],
+    dialect: SqlDialect,
+) -> Vec<Mask> {
     match dialect {
         SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => Vec::new(),
-        SqlDialect::MsSql => tsql_gap_masks(sql, hi, toks),
+        SqlDialect::MsSql => tsql_gap_masks(sql, lo, hi, toks),
     }
 }
 
 /// [`grammar_gap_masks`]' T-SQL arm.
-fn tsql_gap_masks(sql: &str, hi: usize, toks: &[Token]) -> Vec<Mask> {
+fn tsql_gap_masks(sql: &str, lo: usize, hi: usize, toks: &[Token]) -> Vec<Mask> {
     let b = sql.as_bytes();
     let word = |j: usize| tsql_keyword(toks, j);
     let lparen = |j: usize| matches!(toks.get(j).map(|t| &t.kind), Some(TkKind::LParen));
@@ -6596,6 +6668,29 @@ fn tsql_gap_masks(sql: &str, hi: usize, toks: &[Token]) -> Vec<Mask> {
     };
     let head = word(0);
     let mut out = Vec::new();
+    // `CREATE TABLE t (a int, b int, )`: SQL Server takes a trailing comma in
+    // a table's column list — a `CREATE TABLE`'s alone: a table variable's, a
+    // table type's and a `RETURNS @t TABLE`'s refuse one (Msg 102).
+    if head.as_deref() == Some("CREATE")
+        && word(1).as_deref() == Some("TABLE")
+        && let Some((_, next)) = dotted_name(toks, 2)
+        && lparen(next)
+        && let Some(close) = matching_paren(toks, next)
+        && matches!(toks[close - 1].kind, TkKind::Comma)
+    {
+        mask(&mut out, toks[close - 1].at, toks[close - 1].end, "");
+    }
+    // The verb the statement performs — its head, or the one a `WITH`'s
+    // CTEs feed — and the `FROM` right after a `DELETE [TOP (n)]`.
+    let verb = statement_verb(toks);
+    let verb_is = |w: &str| verb.is_some_and(|v| word(v).as_deref() == Some(w));
+    let delete_from = verb.filter(|_| verb_is("DELETE")).and_then(|v| {
+        let mut j = v + 1;
+        if word(j).as_deref() == Some("TOP") && lparen(j + 1) {
+            j = matching_paren(toks, j + 1)? + 1;
+        }
+        (word(j).as_deref() == Some("FROM")).then_some(j)
+    });
     // Per open parenthesis: has this depth's query reached its `GROUP BY`?
     let mut grouped: Vec<bool> = vec![false];
     // The call each open parenthesis belongs to, upper-cased.
@@ -6611,6 +6706,18 @@ fn tsql_gap_masks(sql: &str, hi: usize, toks: &[Token]) -> Vec<Mask> {
             TkKind::RParen if grouped.len() > 1 => {
                 grouped.pop();
                 calls.pop();
+            }
+            // `SET col.WRITE(expr, offset, length)`, an `UPDATE`'s partial
+            // write of a `max` value — read as the assignment it is.
+            TkKind::Word(w)
+                if !toks[i].quoted
+                    && w.eq_ignore_ascii_case("WRITE")
+                    && i > 0
+                    && matches!(toks[i - 1].kind, TkKind::Dot)
+                    && lparen(i + 1)
+                    && verb_is("UPDATE") =>
+            {
+                mask(&mut out, toks[i - 1].at, toks[i].end, "=ABS");
             }
             TkKind::Word(_) => match word(i).as_deref() {
                 Some("SELECT") => {
@@ -6629,6 +6736,145 @@ fn tsql_gap_masks(sql: &str, hi: usize, toks: &[Token]) -> Vec<Mask> {
                         i = close + 1;
                         continue;
                     }
+                }
+                // `WITH XMLNAMESPACES (N'urn:x' AS x)`: the clause whole, or
+                // up to the CTE its `,` leads to.
+                Some("WITH")
+                    if word(i + 1).as_deref() == Some("XMLNAMESPACES") && lparen(i + 2) =>
+                {
+                    if let Some(close) = matching_paren(toks, i + 2) {
+                        match toks.get(close + 1) {
+                            Some(
+                                t @ Token {
+                                    kind: TkKind::Comma,
+                                    ..
+                                },
+                            ) => mask(&mut out, toks[i + 1].at, t.end, ""),
+                            _ => mask(&mut out, toks[i].at, toks[close].end, ""),
+                        }
+                        i = close + 1;
+                        continue;
+                    }
+                }
+                // An index's kind in a table definition: `PRIMARY KEY
+                // CLUSTERED`, `UNIQUE NONCLUSTERED (c)` — not `CREATE UNIQUE
+                // CLUSTERED INDEX`, a statement of its own.
+                Some("CLUSTERED" | "NONCLUSTERED")
+                    if i > 2 && matches!(word(i - 1).as_deref(), Some("KEY" | "UNIQUE")) =>
+                {
+                    mask(&mut out, toks[i].at, toks[i].end, "");
+                }
+                // A column's own key given the columns it spans — `c datetime
+                // NULL CONSTRAINT pk PRIMARY KEY NONCLUSTERED (a, b)`, no comma
+                // before it — which the server reads as the table's.
+                Some("PRIMARY" | "UNIQUE") if !depth0 => {
+                    let mut k = if word(i).as_deref() == Some("PRIMARY") {
+                        i + 2
+                    } else {
+                        i + 1
+                    };
+                    if matches!(word(k).as_deref(), Some("CLUSTERED" | "NONCLUSTERED")) {
+                        k += 1;
+                    }
+                    let start = match i.checked_sub(2) {
+                        Some(s) if word(s).as_deref() == Some("CONSTRAINT") => s,
+                        _ => i,
+                    };
+                    let after_column = start > 0
+                        && !matches!(toks[start - 1].kind, TkKind::Comma | TkKind::LParen);
+                    if (word(i).as_deref() == Some("UNIQUE")
+                        || word(i + 1).as_deref() == Some("KEY"))
+                        && after_column
+                        && lparen(k)
+                        && let Some(close) = matching_paren(toks, k)
+                    {
+                        mask(&mut out, toks[k].at, toks[close].end, "");
+                    }
+                }
+                // A column's `FOREIGN KEY REFERENCES t`, and its `FOREIGN KEY
+                // (a) REFERENCES t (id)` with no comma before it: the grammar
+                // takes the `REFERENCES` alone.
+                Some("FOREIGN") if word(i + 1).as_deref() == Some("KEY") => {
+                    let start = match i.checked_sub(2) {
+                        Some(s) if word(s).as_deref() == Some("CONSTRAINT") => s,
+                        _ => i,
+                    };
+                    let after_column = !depth0
+                        && start > 0
+                        && !matches!(toks[start - 1].kind, TkKind::Comma | TkKind::LParen);
+                    if word(i + 2).as_deref() == Some("REFERENCES") {
+                        mask(&mut out, toks[i].at, toks[i + 1].end, "");
+                    } else if after_column
+                        && lparen(i + 2)
+                        && let Some(close) = matching_paren(toks, i + 2)
+                        && word(close + 1).as_deref() == Some("REFERENCES")
+                    {
+                        mask(&mut out, toks[i].at, toks[close].end, "");
+                    }
+                }
+                // A join hint, `INNER HASH JOIN`, `LEFT OUTER MERGE JOIN` —
+                // after the join's type, without which the server refuses it.
+                Some("LOOP" | "HASH" | "MERGE" | "REMOTE")
+                    if i > 0
+                        && word(i + 1).as_deref() == Some("JOIN")
+                        && matches!(
+                            word(i - 1).as_deref(),
+                            Some("INNER" | "OUTER" | "LEFT" | "RIGHT" | "FULL")
+                        ) =>
+                {
+                    mask(&mut out, toks[i].at, toks[i].end, "");
+                }
+                // `WHERE CURRENT OF [GLOBAL] c`: a cursor's current row.
+                Some("CURRENT")
+                    if i > 0
+                        && word(i - 1).as_deref() == Some("WHERE")
+                        && word(i + 1).as_deref() == Some("OF") =>
+                {
+                    let name = match word(i + 2).as_deref() {
+                        Some("GLOBAL") if toks.get(i + 3).is_some() => i + 3,
+                        _ => i + 2,
+                    };
+                    if let Some(t) = toks.get(name) {
+                        mask(&mut out, toks[i].at, t.end, "1=1");
+                        i = name + 1;
+                        continue;
+                    }
+                }
+                // `OPENXML (@h, N'/r') WITH (x int)`: the rowset's schema.
+                Some("OPENXML") if lparen(i + 1) => {
+                    if let Some(close) = matching_paren(toks, i + 1)
+                        && word(close + 1).as_deref() == Some("WITH")
+                        && lparen(close + 2)
+                        && let Some(schema) = matching_paren(toks, close + 2)
+                    {
+                        mask(&mut out, toks[close + 1].at, toks[schema].end, "");
+                    }
+                }
+                // `OpenRowset(TABLE ALUCOUNT, …)`: an internal rowset the
+                // server's own modules read, refused anywhere else (Msg 102)
+                // — so in nothing a user writes.
+                Some("OPENROWSET") if lparen(i + 1) && word(i + 2).as_deref() == Some("TABLE") => {
+                    mask(&mut out, toks[i + 2].at, toks[i + 2].end, "");
+                }
+                // `sys.f(x) COLLATE database_default`: after a qualified
+                // call the grammar takes no collation.
+                Some("COLLATE")
+                    if i > 0
+                        && matches!(toks[i - 1].kind, TkKind::RParen)
+                        && matches!(toks.get(i + 1).map(|t| &t.kind), Some(TkKind::Word(_))) =>
+                {
+                    mask(&mut out, toks[i].at, toks[i + 1].end, "");
+                }
+                // A function's argument left to its default, `f(@a, DEFAULT)`.
+                Some("DEFAULT")
+                    if i > 0
+                        && matches!(toks[i - 1].kind, TkKind::Comma | TkKind::LParen)
+                        && matches!(
+                            toks.get(i + 1).map(|t| &t.kind),
+                            Some(TkKind::Comma | TkKind::RParen)
+                        ) =>
+                {
+                    mask(&mut out, toks[i].at, toks[i].end, "NULL");
                 }
                 Some("WITH")
                     if grouped.last().copied().unwrap_or(false)
@@ -6732,10 +6978,25 @@ fn tsql_gap_masks(sql: &str, hi: usize, toks: &[Token]) -> Vec<Mask> {
                     i = j;
                     continue;
                 }
-                // `DELETE TOP (10) FROM t`, `UPDATE TOP (5) t SET …`.
+                // `AS N'alias'`: the grammar takes `AS 'alias'` and not its
+                // national-string spelling, so the `N` goes.
+                Some("AS")
+                    if matches!(b.get(after(i)), Some(b'N' | b'n'))
+                        && b.get(after(i) + 1) == Some(&b'\'')
+                        && !(i > 0
+                            && matches!(word(i - 1).as_deref(), Some("EXEC" | "EXECUTE"))) =>
+                {
+                    mask(&mut out, after(i), after(i) + 1, "");
+                }
+                // `DELETE TOP (10) FROM t`, `UPDATE TOP (5) t SET …` — right
+                // after the verb, a `WITH`'s CTEs before it or not.
                 Some("TOP")
-                    if i == 1
-                        && matches!(head.as_deref(), Some("DELETE" | "UPDATE" | "INSERT"))
+                    if i > 0
+                        && verb == Some(i - 1)
+                        && matches!(
+                            word(i - 1).as_deref(),
+                            Some("DELETE" | "UPDATE" | "INSERT")
+                        )
                         && lparen(i + 1) =>
                 {
                     if let Some(close) = matching_paren(toks, i + 1) {
@@ -6747,23 +7008,23 @@ fn tsql_gap_masks(sql: &str, hi: usize, toks: &[Token]) -> Vec<Mask> {
                 // `DELETE FROM t FROM t JOIN u …`: the first `FROM`, leaving
                 // the `DELETE t FROM …` the parser has.
                 Some("FROM")
-                    if i == 1
-                        && head.as_deref() == Some("DELETE")
-                        && top_level_word_after(toks, i + 1, "FROM") =>
+                    if delete_from == Some(i) && top_level_word_after(toks, i + 1, "FROM") =>
                 {
                     mask(&mut out, toks[i].at, toks[i].end, "");
                 }
                 // A table hint on a write's target: `INSERT INTO t WITH (…)`,
-                // `UPDATE t WITH (ROWLOCK) SET`, `MERGE t WITH (HOLDLOCK) …`.
+                // `UPDATE t WITH (ROWLOCK) SET`, `MERGE t WITH (HOLDLOCK) …`,
+                // `DELETE FROM t WITH (ROWLOCK) FROM …`.
                 Some("WITH")
                     if depth0
                         && lparen(i + 1)
                         && dotted_name_start(toks, i).is_some_and(|k| {
                             k > 0
-                                && matches!(
-                                    word(k - 1).as_deref(),
-                                    Some("INTO" | "UPDATE" | "DELETE" | "INSERT" | "MERGE")
-                                )
+                                && (delete_from == Some(k - 1)
+                                    || matches!(
+                                        word(k - 1).as_deref(),
+                                        Some("INTO" | "UPDATE" | "DELETE" | "INSERT" | "MERGE")
+                                    ))
                         }) =>
                 {
                     if let Some(close) = matching_paren(toks, i + 1) {
@@ -6783,6 +7044,14 @@ fn tsql_gap_masks(sql: &str, hi: usize, toks: &[Token]) -> Vec<Mask> {
                         mask(&mut out, toks[i].at, toks[close].end, "");
                         i = close + 1;
                         continue;
+                    }
+                }
+                // Any other `WITH (…)` that is a table-hint list: hints
+                // separated by spaces, `WITH (NOWAIT NOLOCK)`, which the
+                // server takes and the grammar does not, get their commas.
+                Some("WITH") if lparen(i + 1) => {
+                    if let Some(close) = matching_paren(toks, i + 1) {
+                        out.extend(table_hint_commas(sql, toks, i + 1, close));
                     }
                 }
                 Some("ON")
@@ -6811,24 +7080,190 @@ fn tsql_gap_masks(sql: &str, hi: usize, toks: &[Token]) -> Vec<Mask> {
     // end (`SET @s += N'…'` ends on a string, which is no token) — and only
     // where an assignment stands (`compound_assignment_at`): a `*=` in a
     // `WHERE` is the outer-join operator SQL Server removed, and refuses.
-    if let Some(first) = toks.first() {
+    //
+    // And, in the same pass, spellings the grammar lacks:
+    // - an operator with white space inside it, `< =`, `! =`, `< >`;
+    // - a binary literal's upper-case `0X`, filled with a number;
+    // - `FROM ::fn_x(…)`, the old call of a system table-valued function;
+    // - an ODBC escape, `{fn LENGTH(x)}`, `{d '…'}`: its braces and keyword;
+    // - a procedure's group number, `EXEC p;2` (`numbered_procedures`).
+    {
         let clauses = clause_of_each_token(toks);
-        let mut p = first.at;
-        while p < hi.min(b.len()) {
+        let end = hi.min(b.len());
+        let word_byte = |p: usize| p > 0 && (is_word_byte(b[p - 1]) || b[p - 1] == b']');
+        // Open ODBC escapes — they nest, `{fn F(x, {fn G(y)})}`.
+        let mut odbc = 0usize;
+        // From the unit's start: a condition can hold no token, `1 < = 2`.
+        let mut p = lo;
+        while p < end {
             if let Some(q) = crate::sql::skip_noncode(b, p, SqlDialect::MsSql) {
                 p = q;
                 continue;
             }
-            if matches!(b[p], b'+' | b'-' | b'*' | b'/' | b'%' | b'&' | b'|' | b'^')
-                && b.get(p + 1) == Some(&b'=')
-                && compound_assignment_at(toks, &clauses, p)
-            {
-                mask(&mut out, p, p + 1, "");
+            let next = |from: usize| (from..end).find(|&q| !b[q].is_ascii_whitespace());
+            match b[p] {
+                b'+' | b'-' | b'*' | b'/' | b'%' | b'&' | b'|' | b'^'
+                    if b.get(p + 1) == Some(&b'=') && compound_assignment_at(toks, &clauses, p) =>
+                {
+                    mask(&mut out, p, p + 1, "");
+                }
+                b'<' | b'>' | b'!' if b.get(p + 1).is_some_and(u8::is_ascii_whitespace) => {
+                    let fill = next(p + 1).and_then(|q| match (b[p], b[q]) {
+                        (b'<', b'=') => Some((q, "<=")),
+                        (b'<', b'>') => Some((q, "<>")),
+                        (b'>', b'=') => Some((q, ">=")),
+                        (b'!', b'=') => Some((q, "!=")),
+                        (b'!', b'<') => Some((q, "!<")),
+                        (b'!', b'>') => Some((q, "!>")),
+                        _ => None,
+                    });
+                    if let Some((q, fill)) = fill {
+                        mask(&mut out, p, q + 1, fill);
+                        p = q + 1;
+                        continue;
+                    }
+                }
+                b'0' if b.get(p + 1) == Some(&b'X') && !word_byte(p) => {
+                    let mut q = p + 2;
+                    while q < end && b[q].is_ascii_hexdigit() {
+                        q += 1;
+                    }
+                    mask(&mut out, p, q, "0");
+                    p = q;
+                    continue;
+                }
+                b':' if b.get(p + 1) == Some(&b':')
+                    && !word_byte(p)
+                    && b.get(p + 2).is_some_and(|&c| is_word_start(c)) =>
+                {
+                    mask(&mut out, p, p + 2, "");
+                    p += 2;
+                    continue;
+                }
+                b'{' => {
+                    let kw = next(p + 1).map_or(p + 1, |q| q);
+                    let mut q = kw;
+                    while q < end && b[q].is_ascii_alphabetic() {
+                        q += 1;
+                    }
+                    let escape = &b[kw..q];
+                    if ["fn", "d", "t", "ts"]
+                        .iter()
+                        .any(|e| escape.eq_ignore_ascii_case(e.as_bytes()))
+                    {
+                        mask(&mut out, p, q, "");
+                        odbc += 1;
+                        p = q;
+                        continue;
+                    }
+                }
+                b'}' if odbc > 0 => {
+                    mask(&mut out, p, p + 1, "");
+                    odbc -= 1;
+                }
+                b';' if numbered_procedures(SqlDialect::MsSql)
+                    && word_byte(p)
+                    && b.get(p + 1).is_some_and(u8::is_ascii_digit) =>
+                {
+                    let mut q = p + 1;
+                    while q < end && b[q].is_ascii_digit() {
+                        q += 1;
+                    }
+                    mask(&mut out, p, q, "");
+                    p = q;
+                    continue;
+                }
+                _ => {}
             }
             p += 1;
         }
     }
     out
+}
+
+/// Does `dialect` number a procedure within its group — `CREATE PROCEDURE
+/// p;2`, `EXEC p;2` — so that a `;` straight between a name and a number
+/// ends no statement? SQL Server's (deprecated, still compiled: `master`'s
+/// `sp_ddopen` calls its siblings that way). Elsewhere `x;2` is a statement
+/// ended and the next begun.
+fn numbered_procedures(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+        SqlDialect::MsSql => true,
+    }
+}
+
+/// The words a T-SQL table hint is made of — `WITH (NOLOCK, INDEX(ix))`.
+const TABLE_HINTS: &[&str] = &[
+    "NOLOCK",
+    "NOWAIT",
+    "HOLDLOCK",
+    "UPDLOCK",
+    "ROWLOCK",
+    "PAGLOCK",
+    "TABLOCK",
+    "TABLOCKX",
+    "XLOCK",
+    "READPAST",
+    "READUNCOMMITTED",
+    "READCOMMITTED",
+    "READCOMMITTEDLOCK",
+    "REPEATABLEREAD",
+    "SERIALIZABLE",
+    "SNAPSHOT",
+    "NOEXPAND",
+    "FORCESEEK",
+    "FORCESCAN",
+    "INDEX",
+    "KEEPIDENTITY",
+    "KEEPDEFAULTS",
+    "IGNORE_CONSTRAINTS",
+    "IGNORE_TRIGGERS",
+];
+
+/// The commas a table-hint list `toks[open..=close]` leaves out — SQL Server
+/// takes `WITH (NOWAIT NOLOCK)` for `WITH (NOWAIT, NOLOCK)` — as masks filling
+/// one into the space before each hint that follows another without one.
+/// Nothing unless every word in the list is a hint ([`TABLE_HINTS`]) or the
+/// index an `INDEX = ix` names, so a `WITH (…)` of any other kind is left as
+/// it is.
+fn table_hint_commas(sql: &str, toks: &[Token], open: usize, close: usize) -> Vec<Mask> {
+    let b = sql.as_bytes();
+    let mut depth = 0usize;
+    let mut gaps = Vec::new();
+    for k in open + 1..close {
+        match toks[k].kind {
+            TkKind::LParen => depth += 1,
+            TkKind::RParen => depth = depth.saturating_sub(1),
+            TkKind::Word(_) if depth == 0 => {
+                let names_index = tsql_keyword(toks, k - 1).as_deref() == Some("INDEX")
+                    && sql[toks[k - 1].end..toks[k].at].contains('=');
+                if names_index {
+                    continue;
+                }
+                if !tsql_keyword(toks, k).is_some_and(|w| TABLE_HINTS.contains(&w.as_str())) {
+                    return Vec::new();
+                }
+                if k > open + 1 && !matches!(toks[k - 1].kind, TkKind::Comma) {
+                    // The comma goes where the white space before the hint
+                    // begins: after an `INDEX = 1`'s number, too.
+                    let mut from = toks[k].at;
+                    while from > toks[k - 1].end && b[from - 1].is_ascii_whitespace() {
+                        from -= 1;
+                    }
+                    if from < toks[k].at {
+                        gaps.push(Mask {
+                            from,
+                            to: toks[k].at,
+                            fill: ",",
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    gaps
 }
 
 /// The index in `toks` of the verb a statement performs: its first word, or
@@ -7825,6 +8260,11 @@ fn unterminated_statement_heads(dialect: SqlDialect) -> &'static [&'static str] 
             "REVERT",
             "ENABLE",
             "DISABLE",
+            // Deprecated, and still in bodies the server compiles.
+            "READTEXT",
+            "WRITETEXT",
+            "UPDATETEXT",
+            "SETUSER",
         ],
     }
 }
@@ -8278,6 +8718,23 @@ fn parser_lacks_statement(sql: &str, toks: &[Token], dialect: SqlDialect) -> boo
                     | "EVENT",
                     ..,
                 ] => true,
+                ["CREATE" | "ALTER" | "DROP", kind, ..]
+                    if TSQL_KINDS_THE_GRAMMAR_LACKS.contains(kind) =>
+                {
+                    true
+                }
+                // T-SQL's users (`FOR LOGIN`, `WITH DEFAULT_SCHEMA`), its
+                // `ALTER DATABASE`, `ALTER AUTHORIZATION`, `ALTER INDEX …
+                // REBUILD`, `ALTER SCHEMA … TRANSFER`.
+                ["CREATE" | "ALTER", "USER", ..]
+                | ["ALTER", "DATABASE" | "AUTHORIZATION" | "INDEX", ..]
+                | ["DROP", "DATABASE", "AUDIT" | "SCOPED" | "ENCRYPTION", ..]
+                | ["READTEXT" | "WRITETEXT" | "UPDATETEXT" | "SETUSER", ..] => true,
+                ["ALTER", "SCHEMA", ..] => top("TRANSFER"),
+                ["GRANT" | "DENY" | "REVOKE", ..] => grant_beyond_the_grammar(sql, toks),
+                // A server's or a database's trigger, `DROP TRIGGER tr ON ALL
+                // SERVER`.
+                ["DROP", "TRIGGER", ..] => top("ON"),
                 ["INSERT", ..] => top("EXEC") || top("EXECUTE"),
                 // `DELETE t WHERE …`, `DELETE TOP (n) t WHERE …`.
                 ["DELETE", ..] => !top("FROM"),
@@ -8288,13 +8745,114 @@ fn parser_lacks_statement(sql: &str, toks: &[Token], dialect: SqlDialect) -> boo
                         .iter()
                         .any(|w| top(w))
                         || top_level_word_after(toks, 2, "ALTER")
-                        || (top("DEFAULT") && top("FOR"))
-                        || (top("WITH") && top("CHECK"))
+                        || (top("DEFAULT") && (top("FOR") || top("WITH")))
+                        || (top("CHECK") && !top("ADD"))
+                        // `ADD a int, b int`: one `ADD`, several columns.
+                        || (top("ADD") && top_level_comma(toks))
                 }
                 _ => is_routine_statement(toks),
             }
         }
     }
+}
+
+/// Kinds of object T-SQL creates, alters or drops that sqlparser's grammar
+/// has no statement for — `DROP SYNONYM`, `CREATE LOGIN`, `ALTER PARTITION
+/// FUNCTION`, `DROP EVENT NOTIFICATION`, … — each the word after the verb.
+/// The kinds sqlparser does carry (`TABLE`, `VIEW`, `INDEX`, `SCHEMA`, …) are
+/// not here, so a mistake in one of those still reports.
+const TSQL_KINDS_THE_GRAMMAR_LACKS: &[&str] = &[
+    "AGGREGATE",
+    "APPLICATION",
+    "ASSEMBLY",
+    "ASYMMETRIC",
+    "AVAILABILITY",
+    "BROKER",
+    "CERTIFICATE",
+    "COLUMN",
+    "COLUMNSTORE",
+    "CONTRACT",
+    "CREDENTIAL",
+    "CRYPTOGRAPHIC",
+    "DEFAULT",
+    "ENDPOINT",
+    "EVENT",
+    "EXTERNAL",
+    "FULLTEXT",
+    "LOGIN",
+    "MASTER",
+    "MESSAGE",
+    "PARTITION",
+    "PRIMARY",
+    "QUEUE",
+    "REMOTE",
+    "RESOURCE",
+    "ROUTE",
+    "RULE",
+    "SEARCH",
+    "SECURITY",
+    "SELECTIVE",
+    "SERVER",
+    "SERVICE",
+    "SPATIAL",
+    "STATISTICS",
+    "SYMMETRIC",
+    "SYNONYM",
+    "WORKLOAD",
+    "XML",
+];
+
+/// Is the T-SQL `GRANT`/`DENY`/`REVOKE` in `toks` one sqlparser's grammar
+/// does not carry — a securable named with its class (`ON OBJECT::t`,
+/// `ON SCHEMA::s`), or a permission only SQL Server has (`CONTROL`, `VIEW
+/// DEFINITION`, `IMPERSONATE`, `ALTER ANY …`, …)? `GRANT SELECT ON t TO u`
+/// it carries, and a mistake in one still reports.
+fn grant_beyond_the_grammar(sql: &str, toks: &[Token]) -> bool {
+    const TSQL_PERMISSIONS: &[&str] = &[
+        "ADMINISTER",
+        "ALTER",
+        "AUTHENTICATE",
+        "BACKUP",
+        "CHECKPOINT",
+        "CONNECT",
+        "CONTROL",
+        "CREATE",
+        "IMPERSONATE",
+        "KILL",
+        "RECEIVE",
+        "SEND",
+        "SHOWPLAN",
+        "SUBSCRIBE",
+        "TAKE",
+        "UNMASK",
+        "VIEW",
+    ];
+    let (Some(first), Some(last)) = (toks.first(), toks.last()) else {
+        return false;
+    };
+    sql.get(first.at..last.end)
+        .is_some_and(|s| s.contains("::"))
+        || (1..toks.len())
+            .map(|k| tsql_keyword(toks, k))
+            .take_while(|w| !matches!(w.as_deref(), Some("ON" | "TO" | "FROM")))
+            .any(|w| w.is_some_and(|w| TSQL_PERMISSIONS.contains(&w.as_str())))
+}
+
+/// Does a `,` stand at the top level of `toks` — outside every parenthesis?
+fn top_level_comma(toks: &[Token]) -> bool {
+    let mut depth = 0usize;
+    toks.iter().any(|t| match t.kind {
+        TkKind::LParen => {
+            depth += 1;
+            false
+        }
+        TkKind::RParen => {
+            depth = depth.saturating_sub(1);
+            false
+        }
+        TkKind::Comma => depth == 0,
+        _ => false,
+    })
 }
 
 /// Flag a reserved keyword used as an alias — explicit (`orders AS or`, `id AS key`)
@@ -8336,6 +8894,18 @@ fn alias_checks(sql: &str, lo: usize, hi: usize, dialect: SqlDialect, out: &mut 
         })
         .is_some_and(|w| w == "CREATE");
     let creates_type = head_words(&toks, 2) == ["CREATE", "TYPE"];
+    // A default's or a rule's first `AS` opens its definition: T-SQL's
+    // `CREATE DEFAULT d AS NULL`, PostgreSQL's `CREATE RULE r AS ON …`.
+    let definition_as = matches!(
+        head_words(&toks, 2).as_slice(),
+        [c, k] if c == "CREATE" && (k == "DEFAULT" || k == "RULE")
+    )
+    .then(|| {
+        toks.iter().position(|t| {
+            !t.quoted && matches!(&t.kind, TkKind::Word(w) if w.eq_ignore_ascii_case("AS"))
+        })
+    })
+    .flatten();
     // Explicit `AS <reserved>` — table OR column alias, anywhere.
     for (i, w) in toks.windows(2).enumerate() {
         let (TkKind::Word(a), TkKind::Word(b)) = (&w[0].kind, &w[1].kind) else {
@@ -8344,7 +8914,7 @@ fn alias_checks(sql: &str, lo: usize, hi: usize, dialect: SqlDialect, out: &mut 
         if !a.eq_ignore_ascii_case("AS") || !is_reserved_word(b, dialect) {
             continue;
         }
-        if body_as == Some(i) {
+        if body_as == Some(i) || definition_as == Some(i) {
             continue;
         }
         // `EXECUTE AS USER = 'x'` names whom to run as, not an alias.
@@ -15366,6 +15936,152 @@ mod tests {
         for s in crate::snippet::builtins(SqlDialect::MsSql) {
             let d = diag_d(&s.body, SqlDialect::MsSql);
             assert!(d.is_empty(), "{}: {d:?}", s.name);
+        }
+    }
+
+    /// **What SQL Server's own modules are made of draws no error**
+    /// (S7.2-L1-03). Checking a routine's body statement by statement turned
+    /// every T-SQL construct sqlparser's grammar lacks into a red error inside
+    /// procedures that compile: run over every definition in `master` and
+    /// `msdb` on SQL Server 2022, 80 modules drew 137 of them (89 drew 153 on
+    /// 2025), the engine's `%%` internals aside. Each construct measured
+    /// there is below, in a procedure body, and each of these procedures
+    /// compiles on 2022 and 2025.
+    #[test]
+    fn the_constructs_of_sql_servers_own_modules_draw_no_error() {
+        let body = |stmts: &str| format!("CREATE PROCEDURE dbo.p AS\nBEGIN\n{stmts}\nEND");
+        for stmts in [
+            // Index options in a table definition, and its trailing comma.
+            "CREATE TABLE #t (id int NOT NULL PRIMARY KEY CLUSTERED, b int UNIQUE NONCLUSTERED,\n\
+             c int, CONSTRAINT u1 UNIQUE NONCLUSTERED (c))",
+            "DECLARE @t TABLE (a int PRIMARY KEY CLUSTERED, b int UNIQUE NONCLUSTERED)",
+            "CREATE TABLE #tc (a int,\n b int,\n )",
+            // `ALTER TABLE`'s T-SQL forms.
+            "ALTER TABLE employees CHECK CONSTRAINT ALL",
+            "ALTER TABLE employees NOCHECK CONSTRAINT ALL",
+            "ALTER TABLE employees ADD bonus int NULL, joined datetime NULL",
+            "ALTER TABLE employees ADD bonus int NOT NULL DEFAULT 0 WITH VALUES",
+            // Statements of a kind the grammar has no `DROP`/`ALTER` for.
+            "ALTER DATABASE CURRENT SET MULTI_USER",
+            "DROP EVENT NOTIFICATION n ON SERVER",
+            "DROP SYMMETRIC KEY k",
+            "DROP CERTIFICATE c",
+            "DROP SYNONYM dbo.s",
+            "DROP TRIGGER tr ON ALL SERVER",
+            // Join hints.
+            "SELECT e.id FROM employees e LEFT OUTER MERGE JOIN departments d ON d.id = e.dept_id",
+            "SELECT e.id FROM employees e INNER HASH JOIN departments d ON d.id = e.dept_id",
+            "SELECT e.id FROM employees e INNER LOOP JOIN departments d ON d.id = e.dept_id",
+            // `.WRITE`, `WHERE CURRENT OF`.
+            "UPDATE employees SET name.WRITE(N'x', NULL, NULL) WHERE id = 1",
+            "UPDATE employees SET name .WRITE(N'x', NULL, 0), salary = 2",
+            "DECLARE c CURSOR FOR SELECT id FROM employees FOR UPDATE\n\
+             UPDATE employees SET salary = 2 WHERE CURRENT OF c\n\
+             DELETE FROM employees WHERE CURRENT OF GLOBAL c",
+            // A string alias, space-separated table hints.
+            "SELECT id AS N'job_id' FROM employees",
+            "SELECT COUNT(*) FROM employees WITH (NOWAIT NOLOCK READUNCOMMITTED)",
+            "SELECT name FROM employees WITH (UPDLOCK ROWLOCK INDEX = 1) WHERE id = 1",
+            "IF NOT EXISTS (SELECT * FROM employees WITH (HOLDLOCK TABLOCKX) WHERE id = 1) PRINT 1",
+            // `WITH XMLNAMESPACES`, a CTE feeding T-SQL's `DELETE … FROM`.
+            "WITH XMLNAMESPACES (N'urn:x' AS x) SELECT 1 AS a",
+            "WITH XMLNAMESPACES (N'urn:x' AS x), c AS (SELECT 1 AS a) SELECT a FROM c",
+            "WITH c AS (SELECT id FROM departments)\n\
+             DELETE FROM employees FROM c JOIN employees e ON e.id = c.id",
+            "DELETE FROM employees WITH (ROWLOCK) FROM employees JOIN departments d \
+             ON d.id = employees.dept_id",
+            // Spellings of an operator, a literal and a call.
+            "IF 1 < = 2 PRINT 1",
+            "SELECT 1 WHERE 1 ! = 2 AND 2 > = 1 AND 1 < > 2",
+            "SELECT 0X00, 0XFF",
+            "SELECT * FROM ::fn_listextendedproperty(NULL, NULL, NULL, NULL, NULL, NULL, NULL)",
+            "IF 1 <> {fn LENGTH('a')} PRINT 1",
+            "DECLARE @h int\nSELECT * FROM (SELECT * FROM OPENXML (@h, N'/r/a') WITH (x int)) q",
+            "DECLARE @s nvarchar(10)\n\
+             SELECT @s = sys.fn_varbintohexstr(0x01) COLLATE database_default + N'x'",
+            // A function's argument left to its default.
+            "DECLARE @r int\nSELECT @r = dbo.f2(N'x', DEFAULT)",
+            "DECLARE @r int\nEXEC @r = dbo.other;2 @a = 1",
+            // Deprecated statements a body still holds.
+            "SETUSER\nPRINT 1",
+            "DECLARE @p varbinary(16)\nREADTEXT docs.body @p 0 10\nPRINT 1",
+            // Key clauses the grammar spells otherwise.
+            "CREATE TABLE #k (a int NOT NULL, b int NOT NULL\n\
+             CONSTRAINT pk_k PRIMARY KEY NONCLUSTERED (a, b))",
+            "CREATE TABLE #f (a int NOT NULL PRIMARY KEY CLUSTERED FOREIGN KEY REFERENCES employees (id))",
+            "CREATE TABLE #g (a int NOT NULL, b int NOT NULL\n\
+             CONSTRAINT fk_g FOREIGN KEY (a) REFERENCES employees (id))",
+            "SELECT {fn LCASE({fn UCASE(N'x')})}",
+            // Permissions the grammar has no words for.
+            "GRANT SELECT ON OBJECT::dbo.employees TO public",
+            "GRANT CONTROL ON dbo.employees TO public",
+            "DENY VIEW DEFINITION TO public",
+        ] {
+            let sql = body(stmts);
+            let found: Vec<_> = diag_d(&sql, SqlDialect::MsSql)
+                .into_iter()
+                .filter(|x| x.severity == Severity::Error)
+                .collect();
+            assert!(found.is_empty(), "{sql}\n{found:?}");
+        }
+        // A rule's or default's `AS` is its definition's, not an alias; and
+        // a view is one statement, its CTEs never cut from the query they feed.
+        for sql in [
+            "CREATE DEFAULT dbo.d AS NULL",
+            "CREATE RULE dbo.r AS @v > 0",
+            "CREATE VIEW dbo.v AS\nWITH a (x) AS (SELECT 1),\nb (x) AS (SELECT 2)\n\
+             SELECT x FROM a UNION ALL SELECT x FROM b",
+            "CREATE VIEW dbo.v2 AS WITH XMLNAMESPACES (N'urn:x' AS x) SELECT 1 AS a",
+        ] {
+            let d = diag_d(sql, SqlDialect::MsSql);
+            assert!(d.is_empty(), "{sql}: {d:?}");
+        }
+    }
+
+    /// **What the read-past of SQL Server's own constructs leaves standing**:
+    /// each covers its construct alone, so an error beside one still reports.
+    #[test]
+    fn t_sql_module_constructs_read_past_hide_nothing_beside_them() {
+        for (sql, want) in [
+            (
+                "SELECT e.nope FROM employees e INNER HASH JOIN departments d ON d.id = e.dept_id;",
+                "Column `nope` not found",
+            ),
+            (
+                "SELECT COUNT(*) FROM nosuchtable WITH (NOWAIT NOLOCK);",
+                "Table `nosuchtable` not found",
+            ),
+            (
+                "UPDATE employees SET nope.WRITE(N'x', NULL, NULL) WHERE nosuchcol = 1 AND = 2;",
+                "Syntax error",
+            ),
+            (
+                "CREATE TABLE #t (a int PRIMARY KEY CLUSTERED, b int,, );",
+                "Syntax error",
+            ),
+            // Only a `CREATE TABLE`'s list takes a trailing comma: a table
+            // variable's and a table type's refuse one (Msg 102).
+            ("DECLARE @t TABLE (a int, );", "Syntax error"),
+            ("SELECT 1 WHERE 1 < = ;", "Syntax error"),
+            (
+                "WITH XMLNAMESPACES (N'urn:x' AS x) SELECT FROM;",
+                "Syntax error",
+            ),
+            (
+                "SELECT id AS N'a' FROM nosuchtable;",
+                "Table `nosuchtable` not found",
+            ),
+            // A bare join hint is refused (Msg 102): it needs its join type.
+            (
+                "SELECT e.id FROM employees e HASH JOIN departments d ON d.id = e.dept_id;",
+                "Syntax error",
+            ),
+        ] {
+            let d = diag_d(sql, SqlDialect::MsSql);
+            assert!(
+                d.iter().any(|x| x.message.starts_with(want)),
+                "{sql}: {d:?}"
+            );
         }
     }
 

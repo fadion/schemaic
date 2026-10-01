@@ -979,7 +979,17 @@ existing prose was left alone.
     variable's `SET @c = CURSOR …`, Service Broker's statements, `CREATE`/`ALTER` of a sequence,
     synonym, table type, queue and the like, `CREATE`/`UPDATE STATISTICS`, `INSERT … EXEC`, a
     `DELETE t WHERE` with no `FROM`, and the T-SQL forms of `ALTER TABLE` (`ALTER COLUMN`, `ADD …
-    DEFAULT … FOR`, `[NO]CHECK`, `SWITCH`, …). The server stays the authority for those, as for
+    DEFAULT … FOR`, `[NO]CHECK`, `SWITCH`, …). Checking bodies made the same corpus — `master`'s
+    `sys.all_sql_modules` and `msdb`'s `sys.sql_modules`, on 2022 and 2025 — red in 80 and 89
+    modules (`%%` internals aside) until the rest of what they hold was listed too:
+    `CREATE`/`ALTER`/`DROP` of the object kinds the grammar has no statement for
+    (`TSQL_KINDS_THE_GRAMMAR_LACKS`: `SYNONYM`, `LOGIN`, `CERTIFICATE`, `EVENT NOTIFICATION`,
+    `PARTITION …`), T-SQL's users, `ALTER DATABASE`/`AUTHORIZATION`/`INDEX`, `ALTER SCHEMA …
+    TRANSFER`, `DROP TRIGGER … ON ALL SERVER`, a `GRANT`/`DENY`/`REVOKE` on a class-qualified
+    securable or with a permission only SQL Server has (`grant_beyond_the_grammar`), `ALTER
+    TABLE`'s `CHECK CONSTRAINT`, `ADD a, b` and `DEFAULT … WITH VALUES`, and the deprecated
+    `READTEXT`/`WRITETEXT`/`UPDATETEXT`/`SETUSER`. The kinds the grammar carries are not listed, so
+    a mistake in a `DROP TABLE` still reports. The server stays the authority for those, as for
     everything else. MySQL and SQLite answer `false`; PostgreSQL withholds a `DO` block's alone,
     which its grammar lacks outright and whose body is a string to the lexer, so nothing inside it
     went unchecked before — a `DO;` with no body still errs (`a_postgres_do_block_draws_no_error`).
@@ -994,8 +1004,22 @@ existing prose was left alone.
     seq`, `EXEC @rc = p` and an `EXEC`'s positional `OUTPUT`/`OUT`, a cursor's options and `FOR
     READ ONLY`, `PARSE`/`TRY_PARSE`'s `AS type USING culture` to the call's own `)` (the first `)`
     was `decimal(10,2)`'s), `TOP (n)` after `DELETE`/`UPDATE`/`INSERT`, a
-    table hint on a write's target, `DELETE FROM t FROM …`'s first `FROM`, `CREATE INDEX`'s `WITH
-    (…)` and filegroup, and a trigger's `UPDATE(col)` (filled as a call) — and `unit_diagnostics`
+    table hint on a write's target, `DELETE FROM t FROM …`'s first `FROM` (behind a `WITH`'s CTEs
+    too), `CREATE INDEX`'s `WITH (…)` and filegroup, a trigger's `UPDATE(col)` (filled as a call),
+    and what the module corpus held: an index's kind in a table definition (`PRIMARY KEY
+    CLUSTERED`), a `CREATE TABLE`'s trailing comma (a table variable's and a table type's are
+    refused, and still err), a column's `FOREIGN KEY REFERENCES` and a column-level key given its
+    own column list with no comma before it, a join hint after its join type (a bare `HASH JOIN` is
+    refused), `col.WRITE(…)`, `WHERE CURRENT OF c`, `WITH XMLNAMESPACES`, `OPENXML`'s `WITH`
+    schema, `AS N'alias'`, space-separated table hints (`table_hint_commas`), `f(@a, DEFAULT)`, a
+    collation after a qualified call, `< =`, `0X00`, `FROM ::fn_x()`, ODBC's `{fn …}`, a
+    procedure's group number `p;2` (`numbered_procedures`, which also keeps that `;` from ending
+    the statement or the range) and the internal `OpenRowset(TABLE x)` the server's own modules
+    read and refuses anywhere else. With those, and a view read as one statement — its `AS WITH c
+    AS (…)` was cut from the `SELECT` its CTEs feed, and those CTEs are now its own to the table
+    check — the corpus draws no error on either version outside the `%%` internals
+    (`the_constructs_of_sql_servers_own_modules_draw_no_error`,
+    `t_sql_module_constructs_read_past_hide_nothing_beside_them`) — and `unit_diagnostics`
     parses the statement with each overwritten — blanks, or a literal where an expression must
     remain — byte for byte (`masked_text`), so every offset and line still lands where it did. A
     clause is masked only where it really is one, so the same words anywhere else still err
