@@ -9010,7 +9010,20 @@ existing prose was left alone.
     it — and an `IF`'s condition was dropped. Now the query comes first, the function's statement
     after it headed *in function db.dbo.f*, and the condition before its branch
     (`a_function_called_by_a_query_does_not_replace_the_querys_plan`,
-    `an_if_conditions_plan_is_shown_before_its_branch`, over the server's own documents). **A document
+    `an_if_conditions_plan_is_shown_before_its_branch`, over the server's own documents). **A
+    statement is whatever sits directly under `<Statements>`**, not a list of the names met so far:
+    the list was `StmtSimple`/`StmtCond`, and a cursor is a `<StmtCursor>` (its plan under
+    `<CursorPlan><Operation><QueryPlan>`), so its operators went to whatever statement was still
+    open — the query calling a function that opened one, drawn as the query's own at a thousand
+    times its cost; a procedure's `EXECUTE PROC` line, ahead of the procedure's first `SELECT`; or,
+    for a cursor declared in the batch, nowhere, which read as "no plan". And an operator, warning or
+    missing index joins a statement only **inside one of that statement's own `<QueryPlan>`s**, so a
+    plan the reader does not place is dropped rather than drawn into the plan around it. The four
+    shapes — a function's cursor, a procedure's, a batch's, and a procedure calling a procedure and
+    a function, whose headings pin that `</StoredProc>` closes the one it opened — are documents
+    captured whole from 2022 and 2025 under `core/testdata/showplan/`, and
+    `a_cursors_plan_is_read_as_its_own_statement` checks the live server still writes them so.
+    **A document
     that does not read as a plan is shown verbatim under the reason** rather than as an empty table
     that would claim there was no plan (`an_unreadable_showplan_is_shown_verbatim`). The heuristics
     are the other engines' in T-SQL's names — `Table Scan` and `Clustered Index Scan` are

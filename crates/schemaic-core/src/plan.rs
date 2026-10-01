@@ -465,11 +465,14 @@ fn unbracket_parts(s: &str) -> String {
     out
 }
 
-/// One statement being read: its index in the output, and the `<RelOp>`s
-/// open around the reader inside it (indexes into its `ops`).
+/// One statement being read: its index in the output, the `<RelOp>`s open
+/// around the reader inside it (indexes into its `ops`), and how many of its
+/// own `<QueryPlan>`s are open — an operator is the statement's only inside
+/// one of them.
 struct OpenStatement {
     at: usize,
     ops: Vec<usize>,
+    plans: usize,
 }
 
 /// What an element under `<Warnings>` means, in the words the table shows;
@@ -517,6 +520,17 @@ fn showplan_warning(
 /// in the output where it opens, so the query comes before the function it
 /// calls, and a statement inside a function or procedure is headed by whose
 /// it is.
+///
+/// **A statement is whatever sits directly under `<Statements>`**, not a list
+/// of the element names one has met. The list was `StmtSimple`/`StmtCond`, and
+/// a cursor is a `<StmtCursor>` — its plan under `<CursorPlan><Operation>` —
+/// so its operators went to whichever statement was still open: the query
+/// calling a function that opened it (drawn as the query's own, at a
+/// thousand times its cost), the `EXECUTE PROC` line of a procedure that did,
+/// or nothing at all for a cursor declared in the batch, which then read as
+/// "no plan". And an operator joins a statement only inside one of that
+/// statement's own `<QueryPlan>`s, so a plan this reader does not place is
+/// dropped rather than added to the plan of the statement around it.
 fn parse_showplan(doc: &str) -> Result<Vec<MsStatement>, String> {
     use quick_xml::XmlVersion;
     use quick_xml::events::{BytesStart, Event};
@@ -543,6 +557,8 @@ fn parse_showplan(doc: &str) -> Result<Vec<MsStatement>, String> {
     let mut stack: Vec<OpenStatement> = Vec::new();
     // The functions and procedures open around it, as a heading names them.
     let mut modules: Vec<String> = Vec::new();
+    // The elements open around it, outermost first.
+    let mut path: Vec<Vec<u8>> = Vec::new();
     // Element depth inside a `<Warnings>`: 0 outside one, 1 at its children.
     let mut in_warnings = 0usize;
     let mut missing: Option<MissingIndex> = None;
@@ -553,20 +569,27 @@ fn parse_showplan(doc: &str) -> Result<Vec<MsStatement>, String> {
             Event::Start(e) => (e, false),
             Event::Empty(e) => (e, true),
             Event::End(e) => {
+                path.pop();
+                if path.last().is_some_and(|p| p == b"Statements") {
+                    stack.pop();
+                }
                 match e.local_name().as_ref() {
                     b"RelOp" => {
                         if let Some(top) = stack.last_mut() {
                             top.ops.pop();
                         }
                     }
-                    b"StmtSimple" | b"StmtCond" => {
-                        stack.pop();
+                    b"QueryPlan" => {
+                        if let Some(top) = stack.last_mut() {
+                            top.plans = top.plans.saturating_sub(1);
+                        }
                     }
                     b"UDF" | b"StoredProc" => {
                         modules.pop();
                     }
                     b"MissingIndex" => {
-                        if let (Some(m), Some(top)) = (missing.as_mut(), stack.last()) {
+                        let top = stack.last().filter(|t| t.plans > 0);
+                        if let (Some(m), Some(top)) = (missing.as_mut(), top) {
                             out[top.at]
                                 .advice
                                 .push((PlanWarningKind::MissingIndex, m.message()));
@@ -593,8 +616,17 @@ fn parse_showplan(doc: &str) -> Result<Vec<MsStatement>, String> {
             }
             seen_root = true;
         }
-        // The innermost open statement, and the operator open innermost in it.
-        let top = stack.last().map(|t| (t.at, t.ops.last().copied()));
+        let statement = path.last().is_some_and(|p| p == b"Statements");
+        if !empty {
+            path.push(name.as_bytes().to_vec());
+        }
+        // The innermost open statement, and the operator open innermost in it
+        // — while one of the statement's own plans is open, as everything a
+        // plan reports about it (operators, warnings, advice) is.
+        let top = stack
+            .last()
+            .filter(|t| t.plans > 0)
+            .map(|t| (t.at, t.ops.last().copied()));
         if in_warnings == 1 {
             let warning = showplan_warning(name, &attr);
             if let Some((at, op)) = top {
@@ -606,7 +638,7 @@ fn parse_showplan(doc: &str) -> Result<Vec<MsStatement>, String> {
             }
         }
         match name {
-            "StmtSimple" | "StmtCond" => {
+            _ if statement => {
                 let mut kind = attr("StatementType").unwrap_or_default();
                 if let Some(module) = modules.last() {
                     kind.push_str(&format!(" in {module}"));
@@ -619,7 +651,13 @@ fn parse_showplan(doc: &str) -> Result<Vec<MsStatement>, String> {
                     stack.push(OpenStatement {
                         at: out.len() - 1,
                         ops: Vec::new(),
+                        plans: 0,
                     });
+                }
+            }
+            "QueryPlan" if !empty => {
+                if let Some(t) = stack.last_mut() {
+                    t.plans += 1;
                 }
             }
             "UDF" | "StoredProc" if !empty => {
@@ -635,7 +673,7 @@ fn parse_showplan(doc: &str) -> Result<Vec<MsStatement>, String> {
                 });
             }
             "RelOp" => {
-                if let Some(t) = stack.last_mut() {
+                if let Some(t) = stack.last_mut().filter(|t| t.plans > 0) {
                     let s = &mut out[t.at];
                     s.ops.push(MsOp {
                         depth: t.ops.len(),
@@ -1071,6 +1109,131 @@ mod tests {
             ]
         );
         assert_eq!(plan.rows[1][3], "0.0032906");
+    }
+
+    /// Estimated plans captured whole from SQL Server (`testdata/showplan`),
+    /// over a scratch database holding `dbo.t (id, v)` (3 rows) and
+    /// `dbo.big (id, v)` (2,000):
+    ///
+    /// - `function_cursor.xml` (2022): `SELECT id, dbo.fc(v) AS n FROM dbo.t`,
+    ///   `dbo.fc` a scalar function `WITH INLINE = OFF` that opens
+    ///   `DECLARE c CURSOR LOCAL FOR SELECT id FROM dbo.big WHERE v = @x`.
+    /// - `procedure_cursor.xml` (2022): `EXEC dbo.pc`, which runs `SELECT …
+    ///   WHERE id = 3`, then a cursor over `dbo.big`, then `SELECT … WHERE id
+    ///   = 2`.
+    /// - `batch_cursor.xml` (2022): `DECLARE c CURSOR FOR SELECT id FROM dbo.t
+    ///   WHERE v > 1; OPEN c; FETCH NEXT FROM c; CLOSE c; DEALLOCATE c;`.
+    /// - `nested_procedures.xml` (2025): `EXEC dbo.p1`, `p1` running `EXEC
+    ///   dbo.p2` and then `SELECT id, dbo.f(v) AS n FROM dbo.t`, `p2` a
+    ///   `SELECT` over `dbo.big` and `dbo.f` a scalar function.
+    ///
+    /// The two versions write these four shapes identically.
+    const SHOWPLAN_FUNCTION_CURSOR: &str = include_str!("../testdata/showplan/function_cursor.xml");
+    const SHOWPLAN_PROCEDURE_CURSOR: &str =
+        include_str!("../testdata/showplan/procedure_cursor.xml");
+    const SHOWPLAN_BATCH_CURSOR: &str = include_str!("../testdata/showplan/batch_cursor.xml");
+    const SHOWPLAN_NESTED_PROCEDURES: &str =
+        include_str!("../testdata/showplan/nested_procedures.xml");
+
+    fn plan_ops(plan: &QueryPlan) -> Vec<&str> {
+        plan.rows.iter().map(|r| r[0].as_str()).collect()
+    }
+
+    /// **A function's cursor is not the calling query's plan.** SQL Server
+    /// writes a cursor as `<StmtCursor>`, which the reader did not open as a
+    /// statement, so the cursor's operators — a worktable insert and a full
+    /// scan of `dbo.big`, at about 1,300 times the query's cost — were added
+    /// to the innermost statement still open: the query, whose own plan had
+    /// already closed. They are the function's, under their own heading.
+    #[test]
+    fn a_cursor_in_a_function_is_its_own_statement_not_the_querys() {
+        let plan = QueryPlan::from_result(&showplan_rs(&[SHOWPLAN_FUNCTION_CURSOR]));
+        assert_eq!(
+            plan_ops(&plan),
+            [
+                "Statement 1: SELECT",
+                "  Compute Scalar",
+                "    Clustered Index Scan",
+                "Statement 2: DECLARE CURSOR in function zz_plan_s71_ab11.dbo.fc",
+                "  Clustered Index Insert (Insert)",
+                "    Compute Scalar",
+                "      Clustered Index Scan",
+            ]
+        );
+        // The query's own cost and table; the cursor's scan is of `dbo.big`.
+        assert_eq!(plan.rows[1][3], "0.0032856");
+        assert_eq!(plan.rows[2][1].split(' ').next(), Some("dbo.t"));
+        assert_eq!(plan.rows[6][1].split(' ').next(), Some("dbo.big"));
+    }
+
+    /// **A procedure's cursor is the procedure's**: it was listed first, under
+    /// the `EXECUTE PROC` line that called it and with no "in procedure",
+    /// ahead of the procedure's own first `SELECT`.
+    #[test]
+    fn a_cursor_in_a_procedure_is_its_own_statement_in_order() {
+        let plan = QueryPlan::from_result(&showplan_rs(&[SHOWPLAN_PROCEDURE_CURSOR]));
+        assert_eq!(
+            plan_ops(&plan),
+            [
+                "Statement 1: SELECT in procedure dbo.pc",
+                "  Clustered Index Seek",
+                "Statement 2: DECLARE CURSOR in procedure dbo.pc",
+                "  Clustered Index Insert (Insert)",
+                "    Compute Scalar",
+                "      Clustered Index Scan",
+                "Statement 3: SELECT in procedure dbo.pc",
+                "  Clustered Index Seek",
+            ]
+        );
+    }
+
+    /// **A cursor typed in the editor has a plan**: its `DECLARE CURSOR` is
+    /// the batch's one planned statement, and the reader — with no statement
+    /// open to put its operators in — dropped them and said there was none.
+    #[test]
+    fn a_cursor_declared_in_the_batch_has_a_plan() {
+        let plan = QueryPlan::from_result(&showplan_rs(&[SHOWPLAN_BATCH_CURSOR]));
+        assert_eq!(
+            plan_ops(&plan),
+            [
+                "Clustered Index Insert (Insert)",
+                "  Compute Scalar",
+                "    Clustered Index Scan",
+            ]
+        );
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|w| w.row == 2 && w.kind == PlanWarningKind::FullScan),
+            "{:?}",
+            plan.warnings
+        );
+    }
+
+    /// **A procedure's statements are headed by whose they are, and a nested
+    /// call's heading ends with it**: `p2`'s `SELECT` is "in procedure
+    /// dbo.p2", and `p1`'s own `SELECT` after the call is `p1`'s again — not
+    /// `p2`'s, which it would be if `</StoredProc>` did not close the heading
+    /// it opened — with the function that `SELECT` calls after it.
+    #[test]
+    fn nested_procedures_are_each_headed_by_their_own_name() {
+        let plan = QueryPlan::from_result(&showplan_rs(&[SHOWPLAN_NESTED_PROCEDURES]));
+        assert_eq!(
+            plan_ops(&plan),
+            [
+                "Statement 1: SELECT in procedure dbo.p2",
+                "  Clustered Index Scan",
+                "Statement 2: SELECT in procedure dbo.p1",
+                "  Compute Scalar",
+                "    Clustered Index Scan",
+                "Statement 3: SELECT in function zz_plan_s71_ab11.dbo.f",
+                "  Compute Scalar",
+                "    Stream Aggregate (Aggregate)",
+                "      Clustered Index Scan",
+            ]
+        );
+        assert_eq!(plan.rows[1][1].split(' ').next(), Some("dbo.big"));
+        assert_eq!(plan.rows[4][1].split(' ').next(), Some("dbo.t"));
     }
 
     /// A document that is not a plan is shown as the server sent it, with the

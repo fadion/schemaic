@@ -590,6 +590,67 @@ async fn a_plan_is_read_from_the_servers_showplan_and_changes_nothing() {
     ));
 }
 
+/// A cursor's plan is the server's `<StmtCursor>`, and it is read as a
+/// statement of its own: one declared in the batch has a plan (it read as
+/// "no plan"), and one a procedure opens is that procedure's, after its first
+/// `SELECT` — not drawn under the `EXECUTE PROC` line that called it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cursors_plan_is_read_as_its_own_statement() {
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("plancur").await;
+    s.exec("CREATE TABLE dbo.t (id int PRIMARY KEY, v int); INSERT dbo.t VALUES (1, 1), (2, 2)")
+        .await;
+    s.exec(
+        "CREATE PROCEDURE dbo.pc AS BEGIN SELECT id FROM dbo.t WHERE id = 2; \
+         DECLARE @i int; DECLARE c CURSOR LOCAL FOR SELECT id FROM dbo.t WHERE v > 0; \
+         OPEN c; FETCH NEXT FROM c INTO @i; CLOSE c; DEALLOCATE c; END",
+    )
+    .await;
+    let explain = |sql: &'static str| {
+        let db = s.db.clone();
+        let name = s.name.clone();
+        async move {
+            db.explain(Some(&name), sql, false, false, CancellationToken::new())
+                .await
+                .map(|rs| schemaic_core::plan::QueryPlan::from_result(&rs))
+                .expect("an estimated plan")
+        }
+    };
+    let ops = |plan: &schemaic_core::plan::QueryPlan| {
+        plan.rows.iter().map(|r| r[0].clone()).collect::<Vec<_>>()
+    };
+
+    let plan = explain(
+        "DECLARE c CURSOR FOR SELECT id FROM dbo.t WHERE v > 1; OPEN c; \
+         FETCH NEXT FROM c; CLOSE c; DEALLOCATE c;",
+    )
+    .await;
+    assert!(
+        ops(&plan)
+            .iter()
+            .any(|o| o.contains("Clustered Index Scan")),
+        "{plan:?}"
+    );
+
+    let plan = explain("EXEC dbo.pc").await;
+    let ops = ops(&plan);
+    let heads: Vec<&str> = ops
+        .iter()
+        .filter(|o| o.starts_with("Statement"))
+        .map(|o| o.as_str())
+        .collect();
+    assert_eq!(
+        heads,
+        [
+            "Statement 1: SELECT in procedure dbo.pc",
+            "Statement 2: DECLARE CURSOR in procedure dbo.pc",
+        ],
+        "{plan:?}"
+    );
+}
+
 /// Take a dump of every table in `src` and render it as the app's writer
 /// does: text steps verbatim, each rows step streamed from `src` through the
 /// export renderer.
