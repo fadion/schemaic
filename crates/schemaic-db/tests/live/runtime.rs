@@ -1355,6 +1355,34 @@ pub async fn a_dump_with_compound_bodies_restores_through_run_file(target: &'sta
         "{}: the restored trigger's whole body",
         target.name
     );
+    // **The comment above each section is no part of what it restores.** SQL
+    // Server stores a module's whole batch, which is why its modules open
+    // batches of their own (`a_dumps_comments_stay_out_of_the_modules_it_restores`);
+    // MySQL keeps a routine's and a trigger's body alone, which this pins on
+    // its legs.
+    if target.trigger_body.is_some() {
+        let db =
+            schemaic_core::export::sql_literal(&Value::Str(dst.database.clone()), dst.dialect());
+        for sql in [
+            format!(
+                "SELECT ROUTINE_DEFINITION FROM information_schema.ROUTINES \
+                 WHERE ROUTINE_SCHEMA = {db} AND ROUTINE_NAME = 'p_twice'"
+            ),
+            format!(
+                "SELECT ACTION_STATEMENT FROM information_schema.TRIGGERS \
+                 WHERE TRIGGER_SCHEMA = {db} AND TRIGGER_NAME = 'tr_t'"
+            ),
+        ] {
+            let body = column(&dst, &sql).await;
+            assert_eq!(body.len(), 1, "{}: {sql}", target.name);
+            assert!(
+                !body[0].contains("--"),
+                "{}: a heading went into the body: {}",
+                target.name,
+                body[0]
+            );
+        }
+    }
 
     dst.teardown().await;
 }

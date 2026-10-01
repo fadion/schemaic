@@ -760,6 +760,48 @@ async fn restore_file(dst: &Scratch, file: &str) -> schemaic_core::script::ExecE
     end
 }
 
+/// [`restore_file`] the way `sqlcmd` restores: the file cut at its `GO` lines
+/// alone, and each batch — everything between two of them, comments included
+/// — sent whole on one connection.
+async fn restore_batches(dst: &Scratch, file: &str) -> schemaic_core::script::ExecEnd {
+    let mut batches: Vec<schemaic_core::script::Statement> = Vec::new();
+    let (mut batch, mut start) = (String::new(), 1u64);
+    for (n, l) in file.lines().enumerate() {
+        if l.trim().eq_ignore_ascii_case("GO") {
+            if !batch.trim().is_empty() {
+                batches.push(schemaic_core::script::Statement {
+                    sql: std::mem::take(&mut batch),
+                    line: start,
+                    offset: 0,
+                });
+            }
+            batch.clear();
+            start = n as u64 + 2;
+        } else {
+            batch.push_str(l);
+            batch.push('\n');
+        }
+    }
+    if !batch.trim().is_empty() {
+        batches.push(schemaic_core::script::Statement {
+            sql: batch,
+            line: start,
+            offset: 0,
+        });
+    }
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let feed = tokio::spawn(async move {
+        for s in batches {
+            if tx.send(s).await.is_err() {
+                break;
+            }
+        }
+    });
+    let (end, _) = Box::pin(dst.db.run_script(&dst.name, rx, CancellationToken::new())).await;
+    feed.await.unwrap();
+    end
+}
+
 /// **A dump restores into an empty database as the one it was taken from**:
 /// `core::dump`'s file, its rows rendered by the export renderer as the app's
 /// writer renders them, cut at its `GO` lines by the script splitter and run by
@@ -1269,6 +1311,53 @@ async fn a_dump_restores_alias_typed_bytes_and_variants() {
         "{end:?}\n{file}"
     );
     assert_eq!(dst.scalar(facts).await, want, "\n{file}");
+}
+
+/// **A dump's comments are no part of the modules it restores.** SQL Server
+/// stores a module's whole batch as its definition, and a comment-only step
+/// closes no batch, so a section heading (`-- Routines and events`,
+/// `-- Triggers`, a view's `-- dbo.v_c`) sits in whichever batch follows it.
+/// That is a module's `SET ANSI_NULLS` batch, never its `CREATE`
+/// (`ddl::tsql_settings_scripted`), so every restored definition opens with
+/// `CREATE`; this pins it against the real server, as the unit test
+/// `a_sql_server_dump_closes_every_batch_with_go` pins the file's shape.
+///
+/// **Restored as `sqlcmd` restores**, a batch at a time, every line between
+/// two `GO`s sent as it is ([`restore_batches`]): the app's own Run file cuts
+/// the batches into statements and drops a comment-only one, so it would
+/// never send a heading at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dumps_comments_stay_out_of_the_modules_it_restores() {
+    use schemaic_core::dump::DumpOptions;
+    if !enabled() || azure_cannot("restores into a second database, which it has not got") {
+        return;
+    }
+    let src = Scratch::create("cmtsrc").await;
+    src.exec("CREATE TABLE dbo.c (id int PRIMARY KEY)").await;
+    src.exec("CREATE TRIGGER dbo.tr_c ON dbo.c AFTER INSERT AS SET NOCOUNT ON;")
+        .await;
+    src.exec("CREATE VIEW dbo.v_c AS SELECT id FROM dbo.c")
+        .await;
+    src.exec("CREATE PROCEDURE dbo.p_c AS SELECT COUNT(*) FROM dbo.c;")
+        .await;
+    src.exec("CREATE FUNCTION dbo.f_c (@x int) RETURNS int AS BEGIN RETURN @x; END")
+        .await;
+    let file = Box::pin(dump_file(&src, DumpOptions::default())).await;
+    let dst = Scratch::create("cmtdst").await;
+    let end = Box::pin(restore_batches(&dst, &file)).await;
+    assert!(
+        matches!(end, schemaic_core::script::ExecEnd::Done),
+        "{end:?}\n{file}"
+    );
+    for name in ["dbo.tr_c", "dbo.v_c", "dbo.p_c", "dbo.f_c"] {
+        let def = dst
+            .scalar(&format!("SELECT OBJECT_DEFINITION(OBJECT_ID(N'{name}'))"))
+            .await;
+        assert!(
+            def.trim_start().starts_with("CREATE"),
+            "{name} restored as:\n{def}\n---\n{file}"
+        );
+    }
 }
 
 /// **A replay stops before it drops anything where a graph table is there.**

@@ -4973,6 +4973,15 @@ mod tests {
     /// lines; without them the first view after a table's rows was Msg 111.
     /// A comment needs none, and a script that already ends in one (the
     /// triggers' `client_script`) gets no second.
+    ///
+    /// **And a comment never shares a module's batch.** SQL Server stores a
+    /// module's whole batch as its definition, so a section heading
+    /// (`-- Routines and events`, `-- Triggers`, a view's `-- dbo.v`) left open
+    /// above a `CREATE` would be the first line of every restored module. It
+    /// is not, because every module is scripted under its own `SET ANSI_NULLS`
+    /// and `SET QUOTED_IDENTIFIER` batches (`ddl::tsql_settings_scripted`),
+    /// which is where the heading lands — pinned here so the wrapper cannot
+    /// move without the heading being given a batch of its own.
     #[test]
     fn a_sql_server_dump_closes_every_batch_with_go() {
         let mut t = mssql_orders();
@@ -5046,15 +5055,29 @@ mod tests {
                 ),
             }
         }
-        // The view opens its own batch: the last line before it that is not a
-        // comment is a `GO`.
-        let before_view = &file[..pos(&file, "CREATE VIEW")];
-        let last_code = before_view
-            .lines()
-            .rev()
-            .map(str::trim)
-            .find(|l| !l.is_empty() && !l.starts_with("--"));
-        assert_eq!(last_code, Some("GO"), "{file}");
+        // Every module opens its own batch, and nothing is in front of its
+        // `CREATE` there — not even a comment, which the server would store as
+        // the module's first line.
+        let mut modules = 0;
+        for batch in file.split("\nGO\n") {
+            let batch = batch.trim_start();
+            if [
+                "CREATE VIEW",
+                "CREATE FUNCTION",
+                "CREATE PROCEDURE",
+                "CREATE TRIGGER",
+            ]
+            .iter()
+            .any(|m| batch.contains(m))
+            {
+                modules += 1;
+                assert!(batch.starts_with("CREATE"), "a module's batch: {batch}");
+            }
+        }
+        assert_eq!(
+            modules, 4,
+            "the view, both routines and the trigger: {file}"
+        );
         // Each routine closes its batch once, with a bare `GO`.
         pos(&file, "CREATE FUNCTION [dbo].[f_double]");
         pos(&file, "CREATE PROCEDURE [dbo].[p_touch]");
