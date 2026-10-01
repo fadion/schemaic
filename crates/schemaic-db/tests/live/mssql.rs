@@ -2549,6 +2549,80 @@ async fn a_table_a_view_and_a_procedure_are_dropped() {
     );
 }
 
+/// **A namespace is created and dropped in the plan's transaction**, and
+/// `CREATE SCHEMA` — which T-SQL wants first in its batch — runs as the
+/// emitter writes it, ahead of a table in the same plan. A drop of one still
+/// holding that table is the server's refusal, not a cascade, and leaves both.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_namespace_is_created_with_its_table_and_dropped_only_when_empty() {
+    use schemaic_core::ddl::{self, Change};
+    use schemaic_core::schema::{ColumnInfo, TableInfo};
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("ddl_schema").await;
+    let table = TableInfo {
+        name: "orders".into(),
+        schema: Some("sales".into()),
+        columns: vec![ColumnInfo {
+            name: "id".into(),
+            type_name: "int".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let mut plan = ddl::single(
+        "orders",
+        Some("sales"),
+        MS,
+        Change::CreateTable(Box::new(ddl::TableDraft::from_table(&table))),
+    );
+    plan.changes.insert(
+        0,
+        Change::CreateSchema {
+            name: "sales".into(),
+            owner: None,
+        },
+    );
+    let stmts = plan.emit();
+    s.db.run_ddl(&s.name, &stmts, CancellationToken::new())
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{}", stmts.join("\n")));
+    let in_sales = "SELECT COUNT(*) FROM sys.tables WHERE SCHEMA_NAME(schema_id) = N'sales'";
+    assert_eq!(
+        s.scalar(in_sales).await,
+        "1",
+        "the table is in the new schema"
+    );
+
+    let drop = |name: &str| {
+        ddl::server_level(
+            name,
+            MS,
+            Change::DropSchema {
+                name: name.to_string(),
+            },
+        )
+        .emit()
+    };
+    let refused =
+        s.db.run_ddl(&s.name, &drop("sales"), CancellationToken::new())
+            .await;
+    assert!(refused.is_err(), "a schema holding a table was dropped");
+    assert_eq!(s.scalar(in_sales).await, "1", "nothing cascaded");
+
+    s.exec("DROP TABLE sales.orders").await;
+    let stmts = drop("sales");
+    s.db.run_ddl(&s.name, &stmts, CancellationToken::new())
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{}", stmts.join("\n")));
+    assert_eq!(
+        s.scalar("SELECT COUNT(*) FROM sys.schemas WHERE name = N'sales'")
+            .await,
+        "0"
+    );
+}
+
 /// **The editor's checker and the server agree on T-SQL's edges**
 /// (S7.2-L1-01 … L1-08). Each procedure body below is one the checker reads
 /// as clean — a `SET NOCOUNT ON` before a write, a `GRANT` before an `IF`, the

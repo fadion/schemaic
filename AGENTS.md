@@ -20,9 +20,9 @@ triggers and routines, manages logins and database users (on Azure SQL Database 
 users, its logins being `master`'s), and signs in with a SQL login, Windows (SSPI, in the Windows
 build) or Microsoft Entra through the Azure CLI, and rebuilds a table for the column changes
 T-SQL's `ALTER COLUMN` cannot make (`ddl::tsql_rebuild_sql`, as SQLite's twelve-step rebuild
-does). What it does not do yet is named, not implied by a label: creating or dropping a
-**database or schema** (`mssql::run_server_ddl` refuses, and `ddl::supports_change` answers no
-through `tsql_supports`), and **sequences, alias types, synonyms and XML schema collections** are
+does), and creates and drops schemas. What it does not do yet is named, not implied by a label:
+creating or dropping a **database** (`mssql::run_server_ddl` refuses, and `ddl::supports_change`
+answers no through `tsql_supports`), and **sequences, alias types, synonyms and XML schema collections** are
 read for the dump but have no tree entry, editor or comparison. What differs between the
 engines now lives in the *narrow* predicates that decide how an edit is performed rather than
 whether it is offered: `ddl::supports_or_replace_view`, `supports_view_rename`,

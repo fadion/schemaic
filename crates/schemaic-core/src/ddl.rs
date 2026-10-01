@@ -2802,8 +2802,9 @@ pub enum Change {
     DropDatabase {
         name: String,
     },
-    /// `CREATE SCHEMA` — a **namespace inside** the current database, which is
-    /// PostgreSQL's alone. Unlike the two above this runs in the database it is
+    /// `CREATE SCHEMA` — a **namespace inside** the current database, which
+    /// PostgreSQL and SQL Server have and MySQL does not (its `CREATE SCHEMA` is
+    /// `CREATE DATABASE`). Unlike the two above this runs in the database it is
     /// about, so it is not server-level; it is grouped with them because it is
     /// the same act one level down and the menus offer them together.
     CreateSchema {
@@ -4056,8 +4057,8 @@ impl Change {
             // is a *refusal*. The sentence says that, rather than borrowing the
             // database line's weight for something that cannot silently destroy.
             //
-            // **It names no engine**, though only PostgreSQL has namespaces
-            // today. `risks` takes a `dialect` precisely so a consequence can be
+            // **It names no engine**, and two have namespaces — PostgreSQL and
+            // SQL Server. `risks` takes a `dialect` precisely so a consequence can be
             // stated per engine, and a hardcoded "PostgreSQL refuses…" inside an
             // arm that ignores its `dialect` is the defect `view_drop_cost` was
             // extracted to fix — a sentence that becomes false for the second
@@ -4797,8 +4798,9 @@ impl ChangeSet {
             .iter()
             .filter(|c| supports_change(d, c))
             .collect();
-        let mut out = Vec::new();
-        // First, what would make any of it lose what the model does not read.
+        // The container first, before anything that lives in it.
+        let mut out = self.container_creates();
+        // Then what would make any of it lose what the model does not read.
         out.extend(tsql_in_place_guard(&q, &admitted));
         // Whole objects.
         for c in &admitted {
@@ -5072,6 +5074,8 @@ impl ChangeSet {
         // Logins, users, roles and their grants **last**, as on every engine:
         // a privilege is stated on something this plan may have just made.
         out.extend(self.account_statements());
+        // …and the container goes last of all, after everything that lived in it.
+        out.extend(self.container_drops());
         // Every admitted change is written by one of the phases above, bar
         // `KeepLossyIndex`, whose statement is none. Admitted and not written
         // would be a change the plan silently drops; the test that walks both
@@ -6464,7 +6468,7 @@ impl ChangeSet {
     /// one place where `table`/`schema` are deliberately unread — see
     /// [`server_level`], which is how such a set is built.
     ///
-    /// Called from the MySQL and PostgreSQL emitters on the same rule
+    /// Called from the MySQL, PostgreSQL and SQL Server emitters on the same rule
     /// [`ChangeSet::object_statements`] follows: from *both*, so a change set
     /// arriving at the wrong one emits SQL that server can reject rather than
     /// being silently dropped on the floor. SQLite has neither concept
@@ -9788,7 +9792,7 @@ pub fn supports_database_editing(dialect: SqlDialect) -> bool {
 
 /// Can `dialect` create and drop **namespaces inside** a database?
 ///
-/// PostgreSQL only. MySQL's `CREATE SCHEMA` is a synonym for `CREATE DATABASE`
+/// PostgreSQL and SQL Server. MySQL's `CREATE SCHEMA` is a synonym for `CREATE DATABASE`
 /// and means the level above this one; SQLite has no namespaces at all. The
 /// distinction from [`supports_database_editing`] is the whole point of having
 /// two predicates: on MySQL the first is true and this one is false, and a
@@ -9801,7 +9805,8 @@ pub fn supports_database_editing(dialect: SqlDialect) -> bool {
 /// all", which is the whole of `ddl.rs` rather than one statement in it. Reusing
 /// it would give a reader of `docs/architecture.md` the same name for the two
 /// opposite scopes, one of which that document records as gone. The menu entry
-/// is still labelled `Schema`, because that is what PostgreSQL calls it.
+/// is still labelled `Schema`, because that is what PostgreSQL and SQL Server
+/// call it.
 pub fn supports_namespace_editing(dialect: SqlDialect) -> bool {
     supports_change(
         dialect,
@@ -13690,20 +13695,20 @@ pub fn supports_change(dialect: SqlDialect, change: &Change) -> bool {
             SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => false,
         };
     }
-    // **A namespace inside a database is PostgreSQL's alone.** MySQL spells
-    // `CREATE SCHEMA` as a synonym for `CREATE DATABASE` — the same statement
-    // under another name, one level up from what this change means — so
-    // accepting it there would emit a plan that creates a *database* while the
-    // preview says "schema", which is the one thing a preview may not do.
-    // SQLite has neither the statement nor the concept. Exhaustive, so a fourth
+    // **A namespace inside a database is PostgreSQL's and SQL Server's.** MySQL
+    // spells `CREATE SCHEMA` as a synonym for `CREATE DATABASE` — the same
+    // statement under another name, one level up from what this change means —
+    // so accepting it there would emit a plan that creates a *database* while
+    // the preview says "schema", which is the one thing a preview may not do.
+    // SQLite has neither the statement nor the concept. Exhaustive, so a fifth
     // engine has to answer for itself.
     if matches!(
         change,
         Change::CreateSchema { .. } | Change::DropSchema { .. }
     ) {
         return match dialect {
-            SqlDialect::Postgres => true,
-            SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+            SqlDialect::Postgres | SqlDialect::MsSql => true,
+            SqlDialect::MySql | SqlDialect::Sqlite => false,
         };
     }
     // **A materialized view is PostgreSQL's alone, and so is the statement that
@@ -13910,9 +13915,16 @@ fn account_change_supported(dialect: SqlDialect, change: &Change) -> bool {
 /// raised, a rename being a re-create. A trigger is created, altered in place
 /// (`CREATE OR ALTER TRIGGER`, [`supports_trigger_alter_in_place`]) and
 /// dropped, and so is a routine (`CREATE OR ALTER PROCEDURE`/`FUNCTION`); a
-/// routine's `RenameRoutine` is never raised, a rename being a re-create.
+/// routine's `RenameRoutine` is never raised, a rename being a re-create. A
+/// namespace is created and dropped (`CREATE`/`DROP SCHEMA`) — a schema
+/// *inside* the database, as PostgreSQL's is and MySQL's is not.
 fn tsql_supports(change: &Change) -> bool {
     match change {
+        // A namespace: `container_creates`/`container_drops` write it, each its
+        // own statement and so its own batch, which `CREATE SCHEMA` must be.
+        // Never `CASCADE` (T-SQL has none), so one still holding anything is
+        // refused by the server, as on PostgreSQL.
+        Change::CreateSchema { .. } | Change::DropSchema { .. } => true,
         // Logins, users, roles and grants: the shared account answer.
         c if is_account_change(c) => account_change_supported(SqlDialect::MsSql, c),
         Change::CreateTrigger(_)
@@ -17299,6 +17311,13 @@ mod tests {
                 engine: None,
                 collation: None,
                 comment: Some("people".into()),
+            },
+            Change::CreateSchema {
+                name: "sales".into(),
+                owner: None,
+            },
+            Change::DropSchema {
+                name: "sales".into(),
             },
         ];
         for c in &yes {
@@ -33040,6 +33059,78 @@ mod database_tests {
         ] {
             assert!(!supports_change(Sqlite, &c), "SQLite accepted {c:?}");
         }
+    }
+
+    /// **SQL Server's `CREATE SCHEMA` is PostgreSQL's, not MySQL's** — a
+    /// namespace inside the database, never a synonym for the database itself
+    /// — so the namespace pair is offered there, and each is one statement:
+    /// T-SQL wants `CREATE SCHEMA` first in its batch, and every statement of
+    /// a plan is its own batch.
+    #[test]
+    fn sql_server_creates_and_drops_a_namespace() {
+        use crate::intel::SqlDialect::MsSql;
+        assert!(supports_namespace_editing(MsSql));
+        let create = server_level(
+            "sales",
+            MsSql,
+            Change::CreateSchema {
+                name: "sales".into(),
+                owner: None,
+            },
+        );
+        assert!(
+            create.unsupported().is_empty(),
+            "{:?}",
+            create.unsupported()
+        );
+        assert_eq!(create.emit(), vec!["CREATE SCHEMA [sales];".to_string()]);
+        let drop = server_level(
+            "sales",
+            MsSql,
+            Change::DropSchema {
+                name: "sales".into(),
+            },
+        );
+        assert!(drop.unsupported().is_empty(), "{:?}", drop.unsupported());
+        assert_eq!(drop.emit(), vec!["DROP SCHEMA [sales];".to_string()]);
+    }
+
+    /// A namespace a comparison has to create goes **ahead of** the table that
+    /// lives in it, in the one plan — the order `container_creates` keeps, on
+    /// the SQL Server emitter as on the others.
+    #[test]
+    fn sql_server_creates_the_namespace_before_the_table_in_it() {
+        use crate::intel::SqlDialect::MsSql;
+        let table = TableInfo {
+            name: "orders".into(),
+            schema: Some("sales".into()),
+            columns: vec![ColumnInfo {
+                name: "id".into(),
+                type_name: "int".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let set = ChangeSet {
+            table: "orders".into(),
+            schema: Some("sales".into()),
+            dialect: MsSql,
+            flavour: ServerFlavour::Unknown,
+            changes: vec![
+                Change::CreateSchema {
+                    name: "sales".into(),
+                    owner: None,
+                },
+                Change::CreateTable(Box::new(TableDraft::from_table(&table))),
+            ],
+        };
+        let sql = set.emit();
+        let schema = sql.iter().position(|s| s == "CREATE SCHEMA [sales];");
+        let create = sql.iter().position(|s| s.starts_with("CREATE TABLE"));
+        assert!(
+            matches!((schema, create), (Some(s), Some(c)) if s < c),
+            "{sql:?}"
+        );
     }
 
     /// The two option capabilities answer for **different** engines, which is

@@ -6293,15 +6293,14 @@ mod create_menu_tests {
         );
     }
 
-    /// **SQL Server is offered a table, a view, and its routines** — the
-    /// Creates whose statements it emits, the routines since `CREATE OR
-    /// ALTER PROCEDURE`/`FUNCTION` landed. Its containers wait on their own
-    /// `Create` arm, and are absent rather than dimmed.
+    /// **SQL Server is offered a table, a view, its routines and a schema** —
+    /// the Creates whose statements it emits. A database waits on its own
+    /// runner, and is absent rather than dimmed.
     #[test]
-    fn sql_server_is_offered_a_table_a_view_and_its_routines() {
+    fn sql_server_is_offered_what_it_emits() {
         assert_eq!(
             labels(SqlDialect::MsSql),
-            vec!["Table", "View", "Function", "Procedure"]
+            vec!["Table", "View", "Function", "Procedure", "Schema"]
         );
     }
 
@@ -6365,13 +6364,16 @@ mod create_menu_tests {
         );
     }
 
-    /// **PostgreSQL is the only engine offered both**, and the pair is what the
-    /// two capabilities are for: on MySQL a `Schema` entry would make a
-    /// database, and on SQLite neither exists at all — a database there is a
-    /// file, which is the connection form's business and not a DDL preview's.
+    /// **A namespace is offered where `CREATE SCHEMA` makes one** — PostgreSQL
+    /// and SQL Server — and the pair is what the two capabilities are for: on
+    /// MySQL a `Schema` entry would make a database, and on SQLite neither
+    /// exists at all — a database there is a file, which is the connection
+    /// form's business and not a DDL preview's.
     #[test]
-    fn only_postgres_is_offered_a_namespace() {
-        assert!(labels(SqlDialect::Postgres).contains(&"Schema"));
+    fn only_the_engines_with_namespaces_are_offered_one() {
+        for d in [SqlDialect::Postgres, SqlDialect::MsSql] {
+            assert!(labels(d).contains(&"Schema"), "{d:?}");
+        }
         for d in [SqlDialect::MySql, SqlDialect::Sqlite] {
             assert!(!labels(d).contains(&"Schema"), "{d:?}");
         }

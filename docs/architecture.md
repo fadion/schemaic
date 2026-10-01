@@ -12,9 +12,9 @@ scripts, writes the grid's edits back, imports a file into a table, designs tabl
 triggers and stored routines, drops a table, view or routine, holds a Manual tab's transaction,
 shows a query plan, dumps a database to a `.sql` file, and browses and administers its logins,
 database users and their grants. What it does not do yet is named rather than left to a label: it
-creates and drops no **database** and no **schema**, and its sequences, alias types, synonyms and
-XML schema collections are read for the dump alone, with no tree entry, editor or comparison — see
-`db::mssql`.
+creates and drops no **database** (a schema inside one it does), and its sequences, alias types,
+synonyms and XML schema collections are read for the dump alone, with no tree entry, editor or
+comparison — see `db::mssql`.
 
 This is the project's reference document: the crate/module map, the architecture invariants, the
 UI conventions, and the Floem hazards each subsystem is built on. `CLAUDE.md` at the repo root
@@ -4065,8 +4065,8 @@ existing prose was left alone.
     computed from a statement, so there is no `supports_change` to derive it from.
     `supports_database_editing` and `supports_namespace_editing` are the newest pair, for the
     **container** the rest of this module's objects live in: `CREATE`/`DROP DATABASE` on MySQL and
-    PostgreSQL, and PostgreSQL's `CREATE`/`DROP SCHEMA`. They are two predicates rather than one
-    because MySQL answers them *differently* — its `CREATE SCHEMA` is a synonym for
+    PostgreSQL, and PostgreSQL's and SQL Server's `CREATE`/`DROP SCHEMA`. They are two predicates
+    rather than one because MySQL answers them *differently* — its `CREATE SCHEMA` is a synonym for
     `CREATE DATABASE`, one level up from what the change means, so a single "supports containers"
     answer would have offered `Create schema` there and quietly made a database. SQLite answers no
     to both: a database there is a file, so a create is the connection form's business and a drop
@@ -4075,7 +4075,7 @@ existing prose was left alone.
     `supports_schema_editing`**: that name belonged to the predicate deleted two paragraphs up,
     which meant the whole of this module rather than one statement in it, and the same name for
     two opposite scopes is worse than a longer one. The menu entry is still labelled `Schema`,
-    because that is what PostgreSQL calls it.
+    because that is what PostgreSQL and SQL Server call it.
     The four changes they gate (`CreateDatabase`, `DropDatabase`, `CreateSchema`, `DropSchema`)
     are the only ones in the module that **do not address `ChangeSet::table`** — each carries its
     own name, `ddl::server_level` is the constructor that builds such a set, and
@@ -4094,6 +4094,17 @@ existing prose was left alone.
     the ordinary in-database path — which is what `DdlScope` and `Db::run_server_ddl` are for.
     `DROP SCHEMA` is never `CASCADE`, the same call `DropObject` makes: cascading drops every
     table in the namespace, so the server is left to refuse and name what is still in there.
+    **SQL Server takes the namespace pair through the same two functions**, at the same two ends of
+    `emit_mssql` as of `emit_mysql`/`emit_postgres` — `container_creates` ahead of even
+    `tsql_in_place_guard`, `container_drops` after `account_statements` — and needed nothing of
+    its own from them, because `CREATE SCHEMA [sales];` is one statement and so its own batch in
+    `mssql::run_ddl`, which T-SQL requires (`CREATE SCHEMA` must be first in its batch); it runs
+    inside the plan's transaction, which T-SQL allows. There is no `AUTHORIZATION`, since
+    `supports_owners` is false there and the form offers no owner, and T-SQL has no `CASCADE` to
+    leave out (`sql_server_creates_and_drops_a_namespace`,
+    `sql_server_creates_the_namespace_before_the_table_in_it`; live, on SQL Server 2022 and 2025,
+    `a_namespace_is_created_with_its_table_and_dropped_only_when_empty`, whose drop of a schema
+    still holding its table is refused and leaves both).
     **Seven account changes join them in not addressing `ChangeSet::table`** — `CreateAccount`,
     `SetAccountPassword`, `DropAccount`, `Grant`/`RevokePrivileges` and `Grant`/`RevokeRole`, the
     Users and privileges
@@ -6090,7 +6101,7 @@ existing prose was left alone.
     than by a dialect test — neither has a level between the database and the table, so every object's
     namespace there is `None` (`an_engine_with_no_namespaces_never_creates_one`). **Read off the
     entries, a target holding no objects reads no namespaces at all**, so comparing into an empty
-    SQL Server database planned "Create schema dbo" — a change SQL Server's plans refuse, which
+    SQL Server database planned "Create schema dbo" — a change SQL Server's plans then refused, which
     withheld the whole plan — and into an empty PostgreSQL one `CREATE SCHEMA "public"`, refused as
     already there along with the migration's transaction. A namespace every database comes with
     (`ddl::namespace_comes_with_every_database`: SQL Server's `dbo`, `guest`, `sys`,
@@ -6100,6 +6111,11 @@ existing prose was left alone.
     every database that still has it (`a_namespace_every_database_comes_with_is_not_planned`; live,
     `a_comparison_into_an_empty_database_does_not_create_dbo`). An *empty* namespace of the user's
     own on the target is still read as missing, and its `CREATE SCHEMA` refused as there.
+    **SQL Server's plans admit `CreateSchema` now** (under `ddl.rs`), so a comparison into a SQL
+    Server database that lacks a schema other than those four is planned like PostgreSQL's — the
+    `CREATE SCHEMA` ahead of the table in it — where `tsql_supports` refusing the prepended change
+    used to withhold the whole plan. That makes the filter above load-bearing there: without it,
+    `dbo` would no longer withhold the plan but reach the server as `CREATE SCHEMA [dbo];`.
     **`is_planned`, `selection_note` and `SchemaPlan::subject` are decisions, and they were in the
     view.** `is_planned(entry, selected)` — `selected.contains(&e.key()) && !e.needs_source() &&
     !e.unplannable()` — is the
@@ -12958,9 +12974,10 @@ existing prose was left alone.
   `DbError::Refused("… is not available for SQL Server yet.")`. **What it does not do yet is named
   here rather than left to a label**: the engine was called a preview until the rest was written,
   and the word had come to read as half-built, which it is not. A database's create and drop are
-  that refusal; a schema's are `CreateSchema` and `DropSchema`, which fall to `tsql_supports`'s
-  catch-all `false` (under `ddl.rs`), so a comparison into a database that lacks a schema other
-  than the four every database has (`ddl::namespace_comes_with_every_database`) is withheld whole;
+  that refusal, and `tsql_supports` refuses `CreateDatabase` and `DropDatabase` ahead of it. A
+  schema's are no longer on this list: `CreateSchema` and `DropSchema` fell to `tsql_supports`'s
+  catch-all `false`, which also withheld whole any comparison into a database lacking a schema
+  other than the four every database has, until `emit_mssql` wrote them (under `ddl.rs`);
   sequences, alias types, synonyms and XML schema collections are read into `TsqlObject` for the
   dump alone (under `dump.rs`), with no tree entry, editor or comparison; a named instance's port
   is not asked of SQL Server Browser and has to be given (`ImportNote::NamedInstance`, under
@@ -12973,7 +12990,8 @@ existing prose was left alone.
   `ddl::supports_change`, whose SQL Server answer comes before anything else and is
   `tsql_supports`: a table's own changes, new or existing, the table, view and routine drops, a
   view's `CreateView` and `ReplaceView`, a trigger's create, replace and drop, a routine's
-  `CreateRoutine` and `ReplaceRoutine`, and the seven account changes, through the same
+  `CreateRoutine` and `ReplaceRoutine`, a namespace's `CreateSchema` and `DropSchema`, and the
+  seven account changes, through the same
   `account_change_supported` every engine's answer goes through (under `ddl.rs`) — and nothing
   more. The four editor predicates compute
   from it, so it decides which editors open: `supports_table_design` probes a column retype, which
@@ -13015,10 +13033,14 @@ existing prose was left alone.
   table and a plain view **Triggers**, now that it writes `CREATE OR ALTER TRIGGER`, a view's
   `INSTEAD OF` being how one is written to at all; and the Create menu *Function* and *Procedure*,
   now that it writes `CREATE OR ALTER PROCEDURE`/`FUNCTION` — the entries `create_children` gates
-  on `supports_routine_editing`, so nothing in the menu changed but the test's expected list
+  on `supports_routine_editing`, so nothing in the menu changed but the test's expected list; and
+  last the Create menu *Schema* and a schema node's **Drop**, both gated on
+  `ddl::supports_namespace_editing`, now that it writes `CREATE`/`DROP SCHEMA` — the same: the
+  predicate computes from `supports_change`, so only the expected lists moved
   (`object_menu_tests::sql_server_offers_its_table_changes_and_a_views_drop`,
   `a_standalone_objects_drop_is_offered_only_where_its_statement_emits`,
-  `create_menu_tests::sql_server_is_offered_a_table_a_view_and_its_routines`). Unlike SQLite's gaps,
+  `create_menu_tests::sql_server_is_offered_what_it_emits`,
+  `only_the_engines_with_namespaces_are_offered_one`). Unlike SQLite's gaps,
   the capabilities that said no for want of code were **unfinished work**, not statements about the
   engine; the noes that *are* about it — the materialized view above, a read-only connection's
   Manual mode and *Cancel query* below — say so where they stand. `edit::supports_grid_writes`
@@ -19716,8 +19738,8 @@ existing prose was left alone.
     nothing back on a failed parse would silently swallow what somebody typed.
     `is_editable_object` is the entry point's gate: an identity column's counter is listed
     and alterable but not editable-as-an-object, the call a materialized view gets.
-  - `database_editor.rs` — the **container** form: a database, or one of PostgreSQL's
-    namespaces inside one, over `core::ddl`'s `DatabaseDraft`. The smallest of the schema
+  - `database_editor.rs` — the **container** form: a database, or one of PostgreSQL's or SQL
+    Server's namespaces inside one, over `core::ddl`'s `DatabaseDraft`. The smallest of the schema
     editors and the only one that **only ever creates** — there is no `current`, no diff and
     no change count, because a container is dropped from its own row's menu and neither engine
     offers a rename that is safe to perform (MySQL withdrew `RENAME DATABASE` in 5.1.23;
@@ -19760,7 +19782,8 @@ existing prose was left alone.
     The option fields are per-engine and **absent** rather than dimmed where the engine has
     none — asked as `ddl::supports_owners` / `supports_database_charset` rather than as
     `dialect ==` tests, which is what both were written as first. MySQL gets `Character set` /
-    `Collation`, PostgreSQL gets `Owner`, and PostgreSQL's `ENCODING` is deliberately not
+    `Collation`, PostgreSQL gets `Owner`, SQL Server's schema gets neither (a name and nothing
+    else, both predicates being false there), and PostgreSQL's `ENCODING` is deliberately not
     offered at all: the server refuses it unless the locale clauses and `TEMPLATE template0`
     agree, so a field for it would mostly produce *"new encoding is incompatible with the
     encoding of the template database"*.
@@ -27173,15 +27196,16 @@ Re-introducing the anti-patterns these guard against is a regression:
   Server is that fourth, and the derivation is what switched its editors off and then turned them
   back on one at a time: `supports_change` answers for it before any arm is consulted
   (`tsql_supports`), admitting a table's own changes, the table, view and routine drops, a view's
-  create and replace, a trigger's create, replace and drop, and a routine's create and replace —
-  and every editor predicate follows with no edit of its own. It held
+  create and replace, a trigger's create, replace and drop, a routine's create and replace, and a
+  namespace's create and drop — and every editor predicate follows with no edit of its own. It held
   when the first four came on (a new table and the three drops): no editor probes only them, so
   none opened. When `emit_mssql` learned `ALTER COLUMN`, the table designer opened on an existing
   table by that alone, while the other three stayed shut
   (`sql_server_admits_the_table_changes_it_can_write`); when it learned `CREATE OR ALTER VIEW`,
   the view editor opened the same way, and when it learned `CREATE OR ALTER TRIGGER` so did the
   trigger editor (`sql_server_offers_the_trigger_editor`), and with `CREATE OR ALTER
-  PROCEDURE`/`FUNCTION` the routine editor (`sql_server_offers_the_routine_editor`). A menu
+  PROCEDURE`/`FUNCTION` the routine editor (`sql_server_offers_the_routine_editor`), and with
+  `CREATE`/`DROP SCHEMA` `supports_namespace_editing` and so the namespace form. A menu
   entry with **no** predicate is the same failure with nothing to grep for — the designer's three
   entries were exactly that until `supports_table_design` existed. **Keep asking them, and keep them
   apart**:
