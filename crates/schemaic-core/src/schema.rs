@@ -1406,6 +1406,23 @@ pub struct TableInfo {
     /// edge, a system-versioned table or its history, memory-optimised — the
     /// default (a plain table) everywhere else. See [`TsqlTableKind`].
     pub tsql_kind: TsqlTableKind,
+    /// **SQL Server's defaults and rules bound to a column** with
+    /// `sp_bindefault`/`sp_bindrule` — standalone objects, not constraints, so
+    /// no `CREATE TABLE` restates them and [`TableInfo::create_ddl`] names them
+    /// instead. Here rather than on [`ColumnInfo`], whose equality is what the
+    /// differs compare: a binding no script can restate is no difference a
+    /// plan could act on. Empty on every other engine.
+    pub tsql_bindings: Vec<TsqlColumnBinding>,
+}
+
+/// A default or rule bound to one column ([`TableInfo::tsql_bindings`]), by
+/// the qualified names of the bound objects — [`TsqlTypeBinding`]'s sibling,
+/// one level down.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TsqlColumnBinding {
+    pub column: String,
+    pub default: Option<String>,
+    pub rule: Option<String>,
 }
 
 /// What a SQL Server table is besides its columns, where that changes the
@@ -5547,6 +5564,33 @@ impl TableInfo {
         if self.tsql_kind.edge_constraints {
             notes.push(format!(
                 "-- {cname}: its edge constraints (CONNECTION) are not read, and are left out."
+            ));
+        }
+        // A default or rule bound with `sp_bindefault`/`sp_bindrule` is an
+        // object of its own, not a constraint, and no `CREATE TABLE` restates
+        // the binding — so the copy's column took no default and checked
+        // nothing. Named, as an alias type's are in a dump's header.
+        for b in &self.tsql_bindings {
+            let bound: Vec<(String, &str)> = [
+                ("default", &b.default, "sp_bindefault"),
+                ("rule", &b.rule, "sp_bindrule"),
+            ]
+            .into_iter()
+            .filter_map(|(what, name, proc)| name.as_ref().map(|n| (format!("{what} {n}"), proc)))
+            .collect();
+            if bound.is_empty() {
+                continue;
+            }
+            let (names, procs): (Vec<String>, Vec<&str>) = bound.into_iter().unzip();
+            let one = names.len() == 1;
+            notes.push(format!(
+                "-- {}: {} {} bound to it ({}), which this script does not restate; bind {} \
+                 again after running it.",
+                crate::export::comment_text(&b.column),
+                crate::export::comment_text(&names.join(" and ")),
+                if one { "is" } else { "are" },
+                procs.join(", "),
+                if one { "it" } else { "them" },
             ));
         }
         for c in &self.columns {
@@ -9981,6 +10025,52 @@ mod tests {
                  it is left out."
             )
         );
+    }
+
+    /// **A default or rule bound to a column is named, since no `CREATE TABLE`
+    /// can carry it.** `sp_bindefault`/`sp_bindrule` bind a standalone
+    /// `CREATE DEFAULT`/`CREATE RULE` object to the column, not a
+    /// constraint, so the script restated the column with neither: a copy's
+    /// column took no default and checked nothing, and said so nowhere.
+    #[test]
+    fn create_ddl_sql_server_names_a_columns_bound_default_and_rule() {
+        let col = |name: &str| ColumnInfo {
+            name: name.into(),
+            type_name: "int".into(),
+            nullable: true,
+            ..Default::default()
+        };
+        let mut t = TableInfo {
+            schema: Some("dbo".into()),
+            name: "t".into(),
+            columns: vec![col("a"), col("b")],
+            ..Default::default()
+        };
+        let plain = t.create_ddl(crate::intel::SqlDialect::MsSql);
+        assert!(!plain.contains("sp_bind"), "{plain}");
+        t.tsql_bindings = vec![
+            TsqlColumnBinding {
+                column: "a".into(),
+                default: Some("dbo.zero".into()),
+                rule: Some("dbo.positive".into()),
+            },
+            TsqlColumnBinding {
+                column: "b".into(),
+                default: None,
+                rule: Some("dbo.positive".into()),
+            },
+        ];
+        let ddl = t.create_ddl(crate::intel::SqlDialect::MsSql);
+        let create = ddl.find("CREATE TABLE").expect("the table");
+        for note in [
+            "-- a: default dbo.zero and rule dbo.positive are bound to it (sp_bindefault, \
+             sp_bindrule), which this script does not restate; bind them again after running it.",
+            "-- b: rule dbo.positive is bound to it (sp_bindrule), which this script does not \
+             restate; bind it again after running it.",
+        ] {
+            let at = ddl.find(note).unwrap_or_else(|| panic!("{note}\n{ddl}"));
+            assert!(at < create, "{ddl}");
+        }
     }
 
     /// Where the header does not read, the stored text is all there is — it

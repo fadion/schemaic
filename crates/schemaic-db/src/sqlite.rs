@@ -2154,6 +2154,7 @@ pub(crate) async fn fetch_schema(db: &Db, cancel: CancellationToken) -> Result<D
                 referenced_by: Vec::new(),
                 // SQL Server's too.
                 tsql_kind: Default::default(),
+                tsql_bindings: Vec::new(),
             });
         }
         Ok(DbSchema {

@@ -3851,7 +3851,16 @@ existing prose was left alone.
     them — so the header names each alias type the file creates that has one, since the restored
     columns of it silently lost their default and their check
     (`an_alias_types_bound_default_and_rule_are_named_in_the_header`; live,
-    `a_dump_names_an_alias_types_bound_default_and_rule`).
+    `a_dump_names_an_alias_types_bound_default_and_rule`). **One bound to a column is named by the
+    table's own script**: `COLUMN_BINDING_LISTING` reads it into `TableInfo::tsql_bindings` —
+    there, not on `ColumnInfo`, whose equality the differs compare, and a binding no script can
+    restate is no difference a plan could act on — and `TableInfo::create_ddl` writes a `--`
+    note per column ahead of the `CREATE TABLE`, so Copy DDL and the dump both say it
+    (`create_ddl_sql_server_names_a_columns_bound_default_and_rule`; live,
+    `a_columns_bound_default_and_rule_are_named_in_its_script`). A binding the column has from its
+    alias type is left out: a column of a bound type carries the type's object in
+    `default_object_id` too (measured), and binding the type again rebinds it, which the header
+    already says.
     None was read, so a table with a `NEXT VALUE FOR` default or an alias-typed column stopped the
     restore at its `CREATE TABLE` (Msg 208/2715) and the header said nothing. They are not put in
     `sequences`/`domains` because those have PostgreSQL's emitters, editor and compare behind them

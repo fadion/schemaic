@@ -1776,6 +1776,63 @@ async fn a_dump_names_an_alias_types_bound_default_and_rule() {
     );
 }
 
+/// **A default or rule bound to a column is named in its script.** No
+/// `CREATE TABLE` carries a `sp_bindefault`/`sp_bindrule` binding, and the
+/// reader took defaults from `sys.default_constraints` alone, so Copy DDL and
+/// the dump restated the column with neither and said nothing. A binding the
+/// column has from its alias type is the type's, which the header names.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_columns_bound_default_and_rule_are_named_in_its_script() {
+    use schemaic_core::dump::DumpOptions;
+    if !enabled() || azure_cannot("restores into a second database, which it has not got") {
+        return;
+    }
+    let src = Scratch::create("col_bound").await;
+    src.exec("CREATE TYPE dbo.Qty FROM int NULL").await;
+    src.exec("CREATE DEFAULT dbo.df_zero AS 0").await;
+    src.exec("CREATE RULE dbo.rl_small AS @v < 100").await;
+    src.exec(
+        "EXEC sp_bindefault N'dbo.df_zero', N'dbo.Qty'; \
+         CREATE TABLE dbo.t (id int PRIMARY KEY, a int NULL, b int NULL, q dbo.Qty NULL); \
+         EXEC sp_bindefault N'dbo.df_zero', N'dbo.t.a'; \
+         EXEC sp_bindrule N'dbo.rl_small', N'dbo.t.a'; \
+         EXEC sp_bindrule N'dbo.rl_small', N'dbo.t.b';",
+    )
+    .await;
+    let t = read_table(&src, "t").await;
+    let bound: Vec<_> = t
+        .tsql_bindings
+        .iter()
+        .map(|b| (b.column.as_str(), b.default.as_deref(), b.rule.as_deref()))
+        .collect();
+    assert_eq!(
+        bound,
+        [
+            ("a", Some("dbo.df_zero"), Some("dbo.rl_small")),
+            ("b", None, Some("dbo.rl_small"))
+        ],
+        "q's default is its type's"
+    );
+    let ddl = t.create_ddl(MS);
+    for note in [
+        "-- a: default dbo.df_zero and rule dbo.rl_small are bound to it",
+        "-- b: rule dbo.rl_small is bound to it (sp_bindrule)",
+    ] {
+        assert!(ddl.contains(note), "{note}\n{ddl}");
+    }
+    assert!(!ddl.contains("-- q:"), "{ddl}");
+    // The dump carries the same notes, and they restore as the comments they
+    // are.
+    let file = Box::pin(dump_file(&src, DumpOptions::default())).await;
+    assert!(file.contains("-- a: default dbo.df_zero"), "{file}");
+    let dst = Scratch::create("col_bound_dst").await;
+    let end = Box::pin(restore_file(&dst, &file)).await;
+    assert!(
+        matches!(end, schemaic_core::script::ExecEnd::Done),
+        "{end:?}\n{file}"
+    );
+}
+
 /// **A synonym written `db..object` comes back as written.** `PARSENAME`'s
 /// missing schema part was dropped, so the copy's synonym read `[db].[t]` —
 /// schema `db` in the restoring database — and pointed at nothing (Msg 208).

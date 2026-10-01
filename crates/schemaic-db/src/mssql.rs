@@ -1416,6 +1416,32 @@ const ALIAS_TYPE_LISTING: &str = "SELECT SCHEMA_NAME(t.schema_id), t.name, \
      WHERE t.is_user_defined = 1 AND t.is_table_type = 0 AND t.is_assembly_type = 0 \
      ORDER BY 1, 2";
 
+/// Every table column with a default or rule **bound** to it
+/// (`sp_bindefault`/`sp_bindrule`): `(schema, table, column, bound default,
+/// bound rule)`, each the qualified name of the bound object. A default
+/// constraint also sits in `default_object_id`, and is read as the column's
+/// `DEFAULT` instead (`COLUMN_LISTING`), so only a standalone default counts.
+///
+/// **A binding the column has from its alias type is the type's**, and left
+/// out: a column created of a type with a bound default carries the type's
+/// object in `default_object_id` too, and binding the type again binds its
+/// columns with it — which the dump's header already says to do
+/// ([`ALIAS_TYPE_LISTING`]).
+const COLUMN_BINDING_LISTING: &str = "SELECT OBJECT_SCHEMA_NAME(c.object_id), \
+            OBJECT_NAME(c.object_id), c.name, \
+            CASE WHEN c.default_object_id NOT IN (0, ty.default_object_id) \
+                  AND OBJECTPROPERTY(c.default_object_id, 'IsDefaultCnst') = 0 THEN CONCAT( \
+                 OBJECT_SCHEMA_NAME(c.default_object_id), '.', OBJECT_NAME(c.default_object_id)) END, \
+            CASE WHEN c.rule_object_id NOT IN (0, ty.rule_object_id) THEN CONCAT( \
+                 OBJECT_SCHEMA_NAME(c.rule_object_id), '.', OBJECT_NAME(c.rule_object_id)) END \
+     FROM sys.columns c JOIN sys.objects o ON o.object_id = c.object_id \
+     JOIN sys.types ty ON ty.user_type_id = c.user_type_id \
+     WHERE o.type = 'U' AND o.is_ms_shipped = 0 \
+       AND (c.rule_object_id NOT IN (0, ty.rule_object_id) \
+        OR (c.default_object_id NOT IN (0, ty.default_object_id) \
+            AND OBJECTPROPERTY(c.default_object_id, 'IsDefaultCnst') = 0)) \
+     ORDER BY 1, 2, c.column_id";
+
 /// Every user XML schema collection, its schemas as the server prints them:
 /// `(schema, name, definition)`. The `sys` one is in every database.
 const XML_COLLECTION_LISTING: &str = "SELECT SCHEMA_NAME(x.schema_id), x.name, \
@@ -2339,12 +2365,25 @@ async fn collect_schema(client: &mut MsClient) -> Result<DbSchema, DbError> {
                 )
             })
             .collect();
+    let mut bindings: HashMap<(String, String), Vec<schemaic_core::schema::TsqlColumnBinding>> =
+        HashMap::new();
+    for r in query_rows(client, COLUMN_BINDING_LISTING).await? {
+        bindings
+            .entry((cell(&r, 0), cell(&r, 1)))
+            .or_default()
+            .push(schemaic_core::schema::TsqlColumnBinding {
+                column: cell(&r, 2),
+                default: r.get(3).cloned().flatten(),
+                rule: r.get(4).cloned().flatten(),
+            });
+    }
 
     for t in &mut tables {
         let ns = t.schema.clone().unwrap_or_default();
         let key = (ns.clone(), t.name.clone());
         t.comment = comments.get(&key).cloned();
         t.tsql_kind = kinds.get(&key).cloned().unwrap_or_default();
+        t.tsql_bindings = bindings.remove(&key).unwrap_or_default();
         t.check_constraints = checks_by.remove(&key).unwrap_or_default();
         t.triggers = triggers_by.remove(&key).unwrap_or_default();
         if t.is_view
