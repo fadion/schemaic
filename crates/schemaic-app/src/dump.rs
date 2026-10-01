@@ -241,6 +241,7 @@ pub(crate) async fn run(
             tables: dump.tables,
             tally: tally.unwrap_or_default(),
             missing: dump.missing,
+            refused: dump.refused,
         },
     }
 }

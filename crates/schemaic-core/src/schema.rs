@@ -4992,16 +4992,24 @@ impl ObjectItem {
             // server on one caller and are dropped on the other.
             //
             // A SQL Server numbered group's other members follow the head, as
-            // stored — see `TsqlRoutine::numbered`; empty everywhere else.
+            // stored — see `TsqlRoutine::numbered`; empty everywhere else. One
+            // the server shows no text for (an encrypted member) is a comment
+            // that names it, as an encrypted routine is: written as its empty
+            // text, it was a bare `;` that said nothing.
             ObjectItem::Routine(r) => {
                 let mut stmts =
                     crate::ddl::session_wrapped(None, r.create_sql(dialect, false), r, dialect);
-                stmts.extend(
-                    r.tsql
-                        .numbered
-                        .iter()
-                        .map(|(_, text)| text.trim().to_string()),
-                );
+                stmts.extend(r.tsql.numbered.iter().map(|(n, text)| {
+                    if text.trim().is_empty() {
+                        format!(
+                            "-- The definition of procedure {} was not available (it may be \
+                             encrypted, or not visible to this login).",
+                            crate::export::comment_text(&format!("{};{n}", r.name))
+                        )
+                    } else {
+                        text.trim().to_string()
+                    }
+                }));
                 crate::ddl::client_script(&stmts, dialect)
             }
             // Through `client_script` for the same reason a routine is: this

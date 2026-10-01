@@ -1118,8 +1118,15 @@ async fn a_dump_restores_into_an_empty_database() {
     }
     // Replayed onto a database that already holds all of it — the way a dump
     // is most often tested. It stopped at the first referenced table's `DROP`
-    // (Msg 3726), the child's key still standing.
-    let again = Box::pin(restore_file(&dst, &file)).await;
+    // (Msg 3726), the child's key still standing. All of it but the graph
+    // tables, which the file refuses to replace
+    // (`a_replay_refuses_to_replace_a_graph_table`): dropped ahead of it in the
+    // same run, not in an await of their own, for the poll frame's sake.
+    let again = Box::pin(restore_file(
+        &dst,
+        &format!("DROP TABLE dbo.knows;\nDROP TABLE dbo.person;\nGO\n\n{file}"),
+    ))
+    .await;
     assert!(
         matches!(again, schemaic_core::script::ExecEnd::Done),
         "{again:?}\n{file}"
@@ -1130,6 +1137,58 @@ async fn a_dump_restores_into_an_empty_database() {
     dst.exec("INSERT dbo.customers (name) VALUES (N'next')")
         .await;
     assert_eq!(dst.scalar("SELECT MAX(id) FROM dbo.customers").await, "4");
+}
+
+/// **A replay stops before it drops anything where a graph table is there.**
+/// The file cannot put one back as it is — an edge's rows are not in it, and
+/// a node's would come back under new node ids — and it dropped them: replayed
+/// onto the copy it had restored, every relationship was gone, with the run
+/// reporting success.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replay_refuses_to_replace_a_graph_table() {
+    use schemaic_core::dump::DumpOptions;
+    if !enabled() || azure_cannot("restores into a second database, which it has not got") {
+        return;
+    }
+    let src = Scratch::create("dump_graphsrc").await;
+    src.exec(
+        "CREATE TABLE dbo.plain (id int PRIMARY KEY); INSERT dbo.plain VALUES (1); \
+         CREATE TABLE dbo.person (id int PRIMARY KEY) AS NODE; \
+         INSERT dbo.person (id) VALUES (1), (2); \
+         CREATE TABLE dbo.knows (since int) AS EDGE;",
+    )
+    .await;
+    let file = Box::pin(dump_file(&src, DumpOptions::default())).await;
+    let dst = Scratch::create("dump_graphdst").await;
+    let end = Box::pin(restore_file(&dst, &file)).await;
+    assert!(
+        matches!(end, schemaic_core::script::ExecEnd::Done),
+        "{end:?}\n{file}"
+    );
+    dst.exec(
+        "INSERT dbo.knows ($from_id, $to_id, since) \
+         SELECT p1.$node_id, p2.$node_id, 2021 FROM dbo.person p1, dbo.person p2 \
+         WHERE p1.id = 2 AND p2.id = 1; \
+         INSERT dbo.plain VALUES (2);",
+    )
+    .await;
+    let end = Box::pin(restore_file(&dst, &file)).await;
+    assert!(
+        matches!(&end, schemaic_core::script::ExecEnd::Failed { message, .. }
+            if message.contains("this file cannot put dbo.")
+                && message.contains("before dropping anything")),
+        "{end:?}\n{file}"
+    );
+    // The edge, the nodes it joins and the plain table are as they were.
+    assert_eq!(
+        dst.scalar(
+            "SELECT CONCAT((SELECT COUNT(*) FROM dbo.knows k JOIN dbo.person a \
+             ON k.$from_id = a.$node_id JOIN dbo.person b ON k.$to_id = b.$node_id \
+             WHERE a.id = 2 AND b.id = 1), '|', (SELECT COUNT(*) FROM dbo.plain))"
+        )
+        .await,
+        "1|2"
+    );
 }
 
 /// **Without *One transaction*, a replay that fails at a `DROP` has dropped
@@ -1220,6 +1279,70 @@ async fn a_replay_drops_a_schema_bound_function_between_its_tables() {
             "{round}"
         );
     }
+}
+
+/// **A replay drops no module it cannot restate whole.** The server keeps no
+/// text for an encrypted procedure or an encrypted member of a numbered
+/// group, and no script carries a signature: replayed onto its source, the
+/// file dropped each and put back a comment, a bare `;` or an unsigned copy,
+/// and reported success. The encrypted procedure is now left as it is and
+/// the replay goes through; the group and the signed modules stop it before
+/// it drops anything.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replay_drops_no_module_it_cannot_restate_whole() {
+    use schemaic_core::dump::DumpOptions;
+    if !enabled() || azure_cannot("Azure SQL Database has no numbered procedures") {
+        return;
+    }
+    let s = Scratch::create("dump_modules").await;
+    s.exec("CREATE TABLE dbo.t (id int PRIMARY KEY); INSERT dbo.t VALUES (1)")
+        .await;
+    s.exec("CREATE PROCEDURE dbo.secret WITH ENCRYPTION AS SELECT 42 AS n")
+        .await;
+    s.exec("CREATE PROCEDURE dbo.ok AS SELECT 4 AS n").await;
+    let present = "SELECT CONCAT(OBJECT_ID('dbo.secret') / OBJECT_ID('dbo.secret'), \
+                   (SELECT COUNT(*) FROM sys.numbered_procedures), \
+                   (SELECT COUNT(*) FROM sys.crypt_properties WHERE class = 1), \
+                   (SELECT COUNT(*) FROM dbo.t))";
+    let file = Box::pin(dump_file(&s, DumpOptions::default())).await;
+    let end = Box::pin(restore_file(&s, &file)).await;
+    assert!(
+        matches!(end, schemaic_core::script::ExecEnd::Done),
+        "{end:?}\n{file}"
+    );
+    assert_eq!(s.scalar(present).await, "1001", "{file}");
+
+    let refused = |end: &schemaic_core::script::ExecEnd, what: &str| {
+        matches!(end, schemaic_core::script::ExecEnd::Failed { message, .. }
+            if message.contains(what) && message.contains("before dropping anything"))
+    };
+    s.exec("CREATE PROCEDURE dbo.grp AS SELECT 1 AS n").await;
+    s.exec("CREATE PROCEDURE dbo.grp;2 WITH ENCRYPTION AS SELECT 2 AS n")
+        .await;
+    let file = Box::pin(dump_file(&s, DumpOptions::default())).await;
+    assert!(file.contains("procedure grp;2 was not available"), "{file}");
+    let end = Box::pin(restore_file(&s, &file)).await;
+    assert!(refused(&end, "grp;2"), "{end:?}\n{file}");
+    assert_eq!(s.scalar(present).await, "1101", "{file}");
+    s.exec("DROP PROCEDURE dbo.grp").await;
+
+    s.exec("CREATE TRIGGER dbo.tr_signed ON dbo.t AFTER INSERT AS SET NOCOUNT ON")
+        .await;
+    s.exec(
+        "CREATE CERTIFICATE zz_dump_cert ENCRYPTION BY PASSWORD = 'Pa55word!!zz' \
+         WITH SUBJECT = 'schemaic test'",
+    )
+    .await;
+    for name in ["ok", "tr_signed"] {
+        s.exec(&format!(
+            "ADD SIGNATURE TO dbo.{name} BY CERTIFICATE zz_dump_cert WITH PASSWORD = 'Pa55word!!zz'"
+        ))
+        .await;
+    }
+    let file = Box::pin(dump_file(&s, DumpOptions::default())).await;
+    let end = Box::pin(restore_file(&s, &file)).await;
+    assert!(refused(&end, "signed"), "{end:?}\n{file}");
+    assert_eq!(s.scalar(present).await, "1021", "{file}");
 }
 
 /// **A replay rewinds no sequence.** One in an exported schema that no chosen

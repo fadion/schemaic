@@ -711,6 +711,9 @@ pub enum DumpOutcome {
         /// A backup one table short of what was asked for is exactly the case
         /// that must not read as a clean success.
         missing: Vec<String>,
+        /// What a replay of the file will not replace — see
+        /// [`DumpPlan::refused`](schemaic_core::dump::DumpPlan::refused).
+        refused: Vec<String>,
     },
     /// `partial` says whether a `.part` fragment is on disk and worth naming —
     /// the same field `Failed` carries, and for the same reason.

@@ -376,6 +376,7 @@ fn run_dump(ctx: &DumpCtx, target: DumpTarget) {
                         tables,
                         tally,
                         missing,
+                        refused,
                     } => {
                         // A ticked table the dump's own fresh introspection could
                         // not find is the difference between a backup and a file
@@ -392,12 +393,15 @@ fn run_dump(ctx: &DumpCtx, target: DumpTarget) {
                                 missing.join(", "),
                             )
                         };
+                        // And what a replay of it will not replace, which is
+                        // the thing to know before trying one.
                         d.done.set(Some(format!(
-                            "Wrote {} {}. {}{short}",
+                            "Wrote {} {}. {}{short}{}",
                             tables,
                             schemaic_core::text::plural(tables, "table", "tables"),
                             schemaic_core::export::export_note(&tally, &name, true)
                                 .unwrap_or_default(),
+                            schemaic_core::dump::refused_note(&refused),
                         )))
                     }
                     DumpOutcome::Cancelled { partial } => d

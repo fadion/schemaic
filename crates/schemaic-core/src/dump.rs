@@ -148,6 +148,12 @@ pub struct DumpPlan {
     /// looks exactly like a complete one. Only an *all* missing selection used to
     /// say anything, while the sibling vanished-preselect case was named.
     pub missing: Vec<String>,
+    /// What the file creates but cannot put back as it is, each with why —
+    /// `dbo.knows (a graph edge table: …)`. A replay never drops these; it
+    /// stops before dropping anything where one is there
+    /// ([`refuse_if_present_sql`]). Named in the header and, through
+    /// [`refused_note`], in the modal.
+    pub refused: Vec<String>,
 }
 
 impl DumpPlan {
@@ -631,6 +637,54 @@ pub fn drop_cascade(dialect: SqlDialect) -> &'static str {
 /// failure undoes it.
 pub fn drops_up_front(dialect: SqlDialect) -> bool {
     fk_guard_sql(dialect).is_none() && drop_cascade(dialect).is_empty()
+}
+
+/// The statement that stops a replay **before it drops anything** where
+/// `object` (an already-quoted, qualified name) is there — for something the
+/// file creates but cannot put back as it is, so must not drop — or `None`
+/// where the engine has no such statement.
+///
+/// A replay is the file run onto a database that already holds what it
+/// recreates. Something it cannot restate whole — a graph edge whose rows it
+/// does not carry, an encrypted or signed module — was dropped there with
+/// the rest and came back empty, as a comment, or unsigned, and the run
+/// reported success. Left out of the drops, its `CREATE` would stop the run
+/// further down instead, after other objects had been dropped, and with no
+/// word of why. So the file says why, first: `why` is the error the run stops
+/// with.
+///
+/// **SQL Server's**: `THROW` ends the batch with the message, and the
+/// restore stops there, inside the file's transaction where it has one.
+pub fn refuse_if_present_sql(dialect: SqlDialect, object: &str, why: &str) -> Option<String> {
+    match dialect {
+        SqlDialect::MsSql => Some(format!(
+            "IF OBJECT_ID({}) IS NOT NULL THROW 50000, {}, 1;",
+            crate::schema::ddl_string(object, dialect),
+            crate::schema::ddl_string(why, dialect),
+        )),
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => None,
+    }
+}
+
+/// What the modal adds to a finished dump's report about
+/// [`DumpPlan::refused`] — empty when there is nothing to say.
+///
+/// Said there as well as in the file's header because the modal is where the
+/// user decides what to do with the file, and a replay that will stop is the
+/// thing to know before trying one.
+pub fn refused_note(refused: &[String]) -> String {
+    if refused.is_empty() {
+        return String::new();
+    }
+    let n = refused.len();
+    format!(
+        " A replay onto a database that already holds {} stops before it drops anything: \
+         the file cannot put {} back as {}: {}.",
+        crate::text::plural(n, "this", "any of these"),
+        crate::text::plural(n, "it", "them"),
+        crate::text::plural(n, "it is", "they are"),
+        refused.join(", "),
+    )
 }
 
 /// The statements that make the file's own container before it is used —
@@ -1270,6 +1324,100 @@ struct Emitted {
     function: bool,
 }
 
+/// Why a replay must leave standing something the file creates.
+///
+/// **The file never drops what it cannot put back as it is.** A replay —
+/// the file run onto a database that already holds what it recreates — drops
+/// before it creates, and what the file restates only in part came back
+/// empty, as a comment, or unsigned, with the run reporting success.
+enum Hold {
+    /// The server shows no text for it, so the file's `CREATE` is a comment:
+    /// left as it is, and nothing collides with it.
+    Keep,
+    /// The file recreates it, but not as it is: a replay stops, before it
+    /// drops anything, where `object` (quoted and qualified) is there
+    /// ([`refuse_if_present_sql`]).
+    Refuse { object: String, why: String },
+}
+
+/// The [`Hold`] on table or view `t`, or `None` for one a replay may drop
+/// and put back. `any_edge` is whether the database has a graph edge table
+/// anywhere, in the export or not.
+fn table_hold(t: &TableInfo, any_edge: bool, dialect: SqlDialect) -> Option<Hold> {
+    let q = |name: &str, ns: Option<&str>| crate::schema::qualified_ident(name, ns, dialect);
+    let refuse = |why: String| {
+        Some(Hold::Refuse {
+            object: q(&t.name, t.schema.as_deref()),
+            why,
+        })
+    };
+    if t.is_view {
+        return t
+            .view_options
+            .as_ref()
+            .is_some_and(|o| o.tsql.hidden)
+            .then_some(Hold::Keep);
+    }
+    // An edge's rows name the nodes they join by node id, which a restore
+    // assigns afresh, so they are not in the file at all; a node's rows are,
+    // under new ids that no edge — in the file or not — points at.
+    if t.tsql_kind.edge {
+        return refuse("a graph edge table: its rows are not in this file".to_string());
+    }
+    if t.tsql_kind.node && any_edge {
+        return refuse(
+            "a graph node table: its rows would come back under new node ids, which no edge \
+             points at"
+                .to_string(),
+        );
+    }
+    // Dropping the table drops its triggers.
+    for tr in &t.triggers {
+        let why = if tr.tsql.hidden {
+            "is encrypted, so no script can recreate it"
+        } else if tr.tsql.module.signed {
+            "is signed, and no script can carry the signature"
+        } else {
+            continue;
+        };
+        // Asked of the table, as every refusal here is: it is the table the
+        // file would drop, and one left standing collides with its `CREATE`.
+        return refuse(format!("its trigger {} {why}", tr.name));
+    }
+    None
+}
+
+/// The [`Hold`] on routine `r`, or `None` for one a replay may drop and put
+/// back.
+fn routine_hold(r: &crate::schema::RoutineInfo, dialect: SqlDialect) -> Option<Hold> {
+    // The condition under which its `CREATE` is a comment.
+    if r.tsql.verbatim.is_none() && (r.tsql.hidden || r.body.trim().is_empty()) {
+        return Some(Hold::Keep);
+    }
+    let object = crate::schema::qualified_ident(&r.name, r.schema.as_deref(), dialect);
+    // `DROP PROCEDURE grp` drops every member of the group.
+    let unread: Vec<String> = r
+        .tsql
+        .numbered
+        .iter()
+        .filter(|(_, text)| text.trim().is_empty())
+        .map(|(n, _)| format!("{};{n}", r.name))
+        .collect();
+    if !unread.is_empty() {
+        return Some(Hold::Refuse {
+            object,
+            why: format!(
+                "a numbered procedure group, and the server shows no text for {}",
+                unread.join(", ")
+            ),
+        });
+    }
+    r.tsql.module.signed.then(|| Hold::Refuse {
+        object,
+        why: "signed, and no script can carry the signature".to_string(),
+    })
+}
+
 /// Where each routine goes among the tables: `Some(k)` is "just before
 /// `order[k]`'s section" (`k == order.len()` after the last), `None` is the
 /// trailing routines section.
@@ -1760,7 +1908,8 @@ pub fn plan(
             crate::text::plural(dangling_fks, "key has", "keys have"),
         ));
     }
-    text!(header);
+    // **Written last, at the head of the file**: what a replay leaves
+    // standing is known only once the routines are collected, below.
 
     // ── The literal guard, outside everything ────────────────────────────────
     //
@@ -1832,6 +1981,31 @@ pub fn plan(
     // has dropped only what was already put back.
     let up_front =
         opts.structure && opts.drop_if_exists && opts.wrap_transaction && drops_up_front(dialect);
+    // **What a replay must leave standing** — see `Hold`. A table or view is
+    // dropped wherever the file drops at all; a routine only up front.
+    let any_edge = schema.tables.iter().any(|t| t.tsql_kind.edge);
+    // `(object, label)` for each refusal, and the label of each kept one.
+    let mut refused: Vec<(String, String)> = Vec::new();
+    let mut kept: Vec<String> = Vec::new();
+    let mut hold = |h: Hold, name: String| match h {
+        Hold::Keep => kept.push(name),
+        Hold::Refuse { object, why } => refused.push((object, format!("{name} ({why})"))),
+    };
+    // Per position in `order`: a table or view no `DROP` may name.
+    let held: Vec<bool> = order
+        .iter()
+        .map(|&i| {
+            let t = &schema.tables[i];
+            let h = (opts.structure && opts.drop_if_exists)
+                .then(|| table_hold(t, any_edge, dialect))
+                .flatten();
+            let is_held = h.is_some();
+            if let Some(h) = h {
+                hold(h, display_name(t.schema.as_deref(), &t.name));
+            }
+            is_held
+        })
+        .collect();
     // **`other_objects` alone, not `structure && other_objects`.** The modal
     // draws it as a peer of Structure and Data, so ticking it by itself asks for
     // a file of the database's types, sequences and routines — a coherent thing
@@ -1888,13 +2062,18 @@ pub fn plan(
                     let sql = o.create_sql(dialect);
                     // A routine the file recreates is dropped with the tables:
                     // replayed onto its source, its `CREATE` otherwise stops
-                    // at a name that is already there.
-                    let drop = (up_front && o.routine().is_some()).then(|| {
-                        format!(
+                    // at a name that is already there. **Not one it cannot
+                    // restate whole** — see `routine_hold`.
+                    let drop = o.routine().filter(|_| up_front).and_then(|r| {
+                        if let Some(h) = routine_hold(r, dialect) {
+                            hold(h, display_name(r.schema.as_deref(), &r.name));
+                            return None;
+                        }
+                        Some(format!(
                             "DROP {} IF EXISTS {};",
                             kind.sql_keyword(),
                             crate::schema::qualified_ident(o.name(), o.schema(), dialect)
-                        )
+                        ))
                     });
                     let item = Emitted {
                         name: o.name().to_string(),
@@ -1994,6 +2173,36 @@ pub fn plan(
         vec![None; routines.len()]
     };
 
+    // ── What a replay must not replace, refused before anything is dropped ───
+    //
+    // Inside the transaction, ahead of every `DROP`: where one of these is
+    // there, the run stops with the reason before it has changed anything.
+    // Left out of the drops alone, its `CREATE` stopped the run further down
+    // instead, after everything ahead of it had been dropped, and said only
+    // that the name was taken.
+    let stops: Vec<String> = refused
+        .iter()
+        .filter_map(|(object, label)| {
+            refuse_if_present_sql(
+                dialect,
+                object,
+                &format!(
+                    "Schemaic: this file cannot put {label} back as it is, so it does not \
+                     replace it. The replay stopped here, before dropping anything."
+                ),
+            )
+        })
+        .collect();
+    if !stops.is_empty() {
+        text!(
+            "-- Not replaced: a replay stops here, before it drops anything, where one is there"
+                .to_string()
+        );
+        for s in stops {
+            text!(s);
+        }
+    }
+
     // ── What the file recreates, dropped before any of it is created ─────────
     //
     // Only where `drops_up_front` says so. The keys between the dumped tables
@@ -2048,7 +2257,7 @@ pub fn plan(
         drops.extend(routine_drops(Some(order.len())));
         for (k, &i) in order.iter().enumerate().rev() {
             let t = &schema.tables[i];
-            if t.shape() != TableShape::Sequence {
+            if t.shape() != TableShape::Sequence && !held[k] {
                 let kw = if t.is_view { "VIEW" } else { "TABLE" };
                 drops.push(format!("DROP {kw} IF EXISTS {};", qname(t)));
             }
@@ -2113,7 +2322,8 @@ pub fn plan(
             // dropping what the file cannot put back is destruction, not a dump,
             // which is the same reason `data_only_plans_no_create_and_no_drop`
             // gives one file down.
-            if opts.drop_if_exists && !up_front && t.shape() != TableShape::Sequence {
+            // Nor one it cannot put back as it is — see `Hold`.
+            if opts.drop_if_exists && !up_front && t.shape() != TableShape::Sequence && !held[k] {
                 let kw = if t.is_view { "VIEW" } else { "TABLE" };
                 text!(format!(
                     "DROP {kw} IF EXISTS {}{};",
@@ -2273,11 +2483,40 @@ pub fn plan(
         steps.push(DumpStep::Text(close.to_string()));
     }
 
+    // ── The header's last word: what a replay leaves standing ────────────────
+    let refused: Vec<String> = refused.into_iter().map(|(_, label)| label).collect();
+    if !refused.is_empty() {
+        let n = refused.len();
+        header.push_str(&format!(
+            "\n--\n-- A replay onto a database that already holds {} stops before it drops\n\
+             -- anything: this file cannot put {} back as {}, so it does not replace {}: {}.",
+            crate::text::plural(n, "this", "any of these"),
+            crate::text::plural(n, "it", "them"),
+            crate::text::plural(n, "it is", "they are"),
+            crate::text::plural(n, "it", "them"),
+            crate::export::comment_text(&refused.join(", ")),
+        ));
+    }
+    if !kept.is_empty() {
+        let n = kept.len();
+        header.push_str(&format!(
+            "\n--\n-- The server shows no text for {n} {} (encrypted, or not visible to this\n\
+             -- login), so {} left as {}: this file neither drops nor recreates {}: {}.",
+            crate::text::plural(n, "object", "objects"),
+            crate::text::plural(n, "it is", "they are"),
+            crate::text::plural(n, "it is", "they are"),
+            crate::text::plural(n, "it", "them"),
+            crate::export::comment_text(&kept.join(", ")),
+        ));
+    }
+    steps.insert(0, DumpStep::Text(header));
+
     DumpPlan {
         steps: close_batches(steps, dialect),
         tables: order.len(),
         cycles,
         missing,
+        refused,
     }
 }
 
@@ -4758,6 +4997,268 @@ mod tests {
             file.contains("@sequence_name = N''[dbo].[seq]'', @range_size = 2,"),
             "{file}"
         );
+    }
+
+    /// The statement that stops a replay where something the file cannot put
+    /// back is there: SQL Server's `THROW`, its name and message quoted as
+    /// literals; nothing on the engines with no such tables.
+    #[test]
+    fn a_replay_is_stopped_by_name_where_the_object_is_there() {
+        assert_eq!(
+            refuse_if_present_sql(SqlDialect::MsSql, "[dbo].[it's]", "no 'way'").as_deref(),
+            Some("IF OBJECT_ID(N'[dbo].[it''s]') IS NOT NULL THROW 50000, N'no ''way''', 1;")
+        );
+        for d in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite] {
+            assert_eq!(refuse_if_present_sql(d, "t", "why"), None, "{d:?}");
+        }
+        assert_eq!(refused_note(&[]), "");
+        let one = refused_note(&["dbo.knows (a graph edge table)".to_string()]);
+        assert!(
+            one.contains("already holds this stops before it drops anything")
+                && one.contains("put it back as it is: dbo.knows (a graph edge table)."),
+            "{one}"
+        );
+        let two = refused_note(&["a".to_string(), "b".to_string()]);
+        assert!(
+            two.contains("any of these") && two.ends_with("as they are: a, b."),
+            "{two}"
+        );
+    }
+
+    /// **A replay never drops a graph table.** An edge's rows are not in the
+    /// file, so replayed onto its source the edge was dropped and recreated
+    /// empty — every relationship gone — and every node came back under a new
+    /// node id, so an edge anywhere that pointed at one pointed at nothing;
+    /// the run reported success. Neither is dropped now, with or without the
+    /// transaction, and the file stops before it drops anything where one is
+    /// there. A node with no edge anywhere loses nothing by its new ids.
+    #[test]
+    fn a_replay_does_not_drop_a_graph_table_and_stops_where_one_is_there() {
+        let mk = |name: &str, node: bool, edge: bool| TableInfo {
+            schema: Some("dbo".to_string()),
+            tsql_kind: crate::schema::TsqlTableKind {
+                node,
+                edge,
+                ..Default::default()
+            },
+            ..table(name)
+        };
+        let s = schema_of(vec![
+            mk("person", true, false),
+            mk("knows", false, true),
+            mk("plain", false, false),
+        ]);
+        for wrap in [true, false] {
+            let opts = DumpOptions {
+                wrap_transaction: wrap,
+                ..Default::default()
+            };
+            let p = plan(&s, "shop", &all(&s), opts, SqlDialect::MsSql);
+            let file = file_of(&p);
+            assert!(
+                !file.contains("DROP TABLE IF EXISTS [dbo].[knows]"),
+                "{file}"
+            );
+            assert!(
+                !file.contains("DROP TABLE IF EXISTS [dbo].[person]"),
+                "{file}"
+            );
+            let first_drop = pos(&file, "DROP TABLE IF EXISTS [dbo].[plain];");
+            for obj in ["[dbo].[knows]", "[dbo].[person]"] {
+                let stop = pos(
+                    &file,
+                    &format!("IF OBJECT_ID(N'{obj}') IS NOT NULL THROW 50000,"),
+                );
+                assert!(stop < first_drop, "{file}");
+            }
+            // Still created, for a restore into an empty database.
+            assert!(file.contains(") AS EDGE;") && file.contains(") AS NODE;"));
+            assert_eq!(p.refused.len(), 2, "{:?}", p.refused);
+            assert!(
+                p.refused
+                    .iter()
+                    .any(|r| r.starts_with("dbo.knows (a graph edge table")),
+                "{:?}",
+                p.refused
+            );
+            assert!(text_of(&p).contains("already holds any of these stops before it drops"));
+        }
+        // A node with no edge anywhere is an ordinary table to a replay.
+        let lone = schema_of(vec![mk("person", true, false)]);
+        let p = plan(
+            &lone,
+            "shop",
+            &all(&lone),
+            DumpOptions::default(),
+            SqlDialect::MsSql,
+        );
+        assert!(file_of(&p).contains("DROP TABLE IF EXISTS [dbo].[person];"));
+        assert!(p.refused.is_empty() && !file_of(&p).contains("THROW"));
+        // A file that drops nothing refuses nothing.
+        let opts = DumpOptions {
+            drop_if_exists: false,
+            ..Default::default()
+        };
+        let p = plan(&s, "shop", &all(&s), opts, SqlDialect::MsSql);
+        assert!(p.refused.is_empty() && !file_of(&p).contains("THROW"));
+    }
+
+    /// **A replay drops no module it cannot restate whole.** The server keeps
+    /// no text for an encrypted procedure, or for an encrypted member of a
+    /// numbered group, so the file's "recreation" is a comment and a bare `;`
+    /// — and the replay dropped both and reported success; a signed module
+    /// comes back unsigned, every call that relied on the certificate failing
+    /// on permissions. An encrypted one is left as it is (its `CREATE` is a
+    /// comment, so nothing collides); the others stop the replay before it
+    /// drops anything; an unreadable member is a comment that names it.
+    #[test]
+    fn a_replay_leaves_an_encrypted_routine_alone_and_refuses_one_it_cannot_restate() {
+        let proc_ = |name: &str, body: &str| crate::schema::RoutineInfo {
+            name: name.to_string(),
+            schema: Some("dbo".to_string()),
+            kind: crate::schema::RoutineKind::Procedure,
+            body: body.to_string(),
+            ..Default::default()
+        };
+        let mut t = table("t");
+        t.schema = Some("dbo".to_string());
+        let mut s = schema_of(vec![t]);
+        let mut secret = proc_("secret", "");
+        secret.tsql.hidden = true;
+        let mut grp = proc_("grp", "SELECT 1");
+        grp.tsql.numbered = vec![
+            (2, String::new()),
+            (3, "CREATE PROCEDURE dbo.grp;3 AS SELECT 3".to_string()),
+        ];
+        let mut signed = proc_("signed", "SELECT 2");
+        signed.tsql.module.signed = true;
+        for r in [secret, grp, signed, proc_("ok", "SELECT 4")] {
+            s.routines.push(std::sync::Arc::new(r));
+        }
+        let p = plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::MsSql,
+        );
+        let file = file_of(&p);
+        for kept in ["secret", "grp", "signed"] {
+            assert!(
+                !file.contains(&format!("DROP PROCEDURE IF EXISTS [dbo].[{kept}]")),
+                "{kept}\n{file}"
+            );
+        }
+        let first_drop = pos(&file, "DROP PROCEDURE IF EXISTS [dbo].[ok];");
+        for refused in ["grp", "signed"] {
+            let stop = pos(
+                &file,
+                &format!("IF OBJECT_ID(N'[dbo].[{refused}]') IS NOT NULL THROW 50000,"),
+            );
+            assert!(stop < first_drop, "{file}");
+        }
+        assert!(
+            !file.contains("N'[dbo].[secret]') IS NOT NULL THROW"),
+            "{file}"
+        );
+        assert!(
+            file.contains("-- The definition of procedure grp;2 was not available"),
+            "{file}"
+        );
+        assert!(!file.contains("\n;\nGO"), "a bare member: {file}");
+        assert_eq!(p.refused.len(), 2, "{:?}", p.refused);
+        assert!(
+            p.refused.iter().any(|r| r.contains("grp;2")),
+            "{:?}",
+            p.refused
+        );
+        assert!(
+            p.refused.iter().any(|r| r.contains("signed")),
+            "{:?}",
+            p.refused
+        );
+        let header = text_of(&p);
+        assert!(
+            header.contains("left as it is") && header.contains("dbo.secret"),
+            "{header}"
+        );
+    }
+
+    /// **A replay drops no table carrying a trigger it cannot restate, and no
+    /// view the server shows no text for.** Dropping the table takes its
+    /// triggers with it: an encrypted one came back as a comment, a signed
+    /// one unsigned. An encrypted view's `CREATE` is a comment, so it is left
+    /// as it is.
+    #[test]
+    fn a_replay_refuses_to_drop_a_table_whose_trigger_it_cannot_restate() {
+        use crate::schema::{
+            TriggerAction, TriggerEvent, TriggerInfo, TriggerLevel, TriggerTiming,
+        };
+        let trigger = |name: &str, table: &str| TriggerInfo {
+            name: name.to_string(),
+            schema: Some("dbo".to_string()),
+            table: table.to_string(),
+            timing: TriggerTiming::After,
+            events: vec![TriggerEvent::Insert],
+            level: TriggerLevel::Statement,
+            action: TriggerAction::Body("SET NOCOUNT ON".to_string()),
+            ..Default::default()
+        };
+        let mk = |name: &str, tr: Option<TriggerInfo>| {
+            let mut t = table(name);
+            t.schema = Some("dbo".to_string());
+            t.triggers.extend(tr);
+            t
+        };
+        let mut hidden = trigger("tr_hidden", "t1");
+        hidden.tsql.hidden = true;
+        hidden.action = TriggerAction::Body(String::new());
+        let mut signed = trigger("tr_signed", "t2");
+        signed.tsql.module.signed = true;
+        let mut v = view("v_enc");
+        v.schema = Some("dbo".to_string());
+        v.view_definition = None;
+        let mut o = crate::schema::ViewOptions::default();
+        o.tsql.hidden = true;
+        v.view_options = Some(o);
+        let s = schema_of(vec![
+            mk("t1", Some(hidden)),
+            mk("t2", Some(signed)),
+            mk("t3", Some(trigger("tr_ok", "t3"))),
+            v,
+        ]);
+        let p = plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::MsSql,
+        );
+        let file = file_of(&p);
+        assert!(!file.contains("DROP TABLE IF EXISTS [dbo].[t1]"), "{file}");
+        assert!(!file.contains("DROP TABLE IF EXISTS [dbo].[t2]"), "{file}");
+        assert!(
+            !file.contains("DROP VIEW IF EXISTS [dbo].[v_enc]"),
+            "{file}"
+        );
+        let first_drop = pos(&file, "DROP TABLE IF EXISTS [dbo].[t3];");
+        // Asked of the table, which is what the file would drop.
+        for t in ["t1", "t2"] {
+            let stop = pos(
+                &file,
+                &format!("IF OBJECT_ID(N'[dbo].[{t}]') IS NOT NULL THROW 50000,"),
+            );
+            assert!(stop < first_drop, "{file}");
+        }
+        assert_eq!(p.refused.len(), 2, "{:?}", p.refused);
+        assert!(
+            p.refused
+                .iter()
+                .any(|r| r.starts_with("dbo.t2 (") && r.contains("tr_signed")),
+            "{:?}",
+            p.refused
+        );
+        assert!(text_of(&p).contains("dbo.v_enc"), "{}", text_of(&p));
     }
 
     /// **A SQL Server dump says how its dates are written, before any of them.**
