@@ -5986,6 +5986,18 @@ existing prose was left alone.
     for. **Measured on MariaDB 10.11.14**: a sequence reports `TABLE_TYPE = SEQUENCE` with eight
     counter columns, `DROP TABLE sq1` on one *succeeds*, and `CREATE TABLE sq2 (…)` over an existing
     sequence is ERROR 1050.
+    **An unreadable view is a real producer of that path now, as is a routine**: a SQL Server
+    *source* view or routine the server shows no text for (`WITH ENCRYPTION`) or whose header the
+    walk could not hold (`verbatim`) gets the empty set — the same two the editor refuses
+    (`ddl::view_not_editable_reason`, `RoutineInfo::is_editable` less its C-function case). Drafted
+    anyway, `ViewDraft::from_table` answers `Some` for every view, so the encrypted one became
+    `CREATE [OR ALTER] VIEW v AS ;`, the verbatim one nested its stored `CREATE` inside another, and
+    an encrypted procedure a comment-only plan that applied "successfully" creating nothing. A
+    two-sided pair of them does not read as `Same` off the empty set: `unread_status` compares the
+    two sides' texts (two encrypted modules are the same, flagged `uncertain`), and otherwise the
+    entry is a `Differing` one `unplannable` discloses. The target's being unreadable is not this
+    case — a readable source replaces it (`a_module_the_source_could_not_read_is_disclosed_not_planned`;
+    live, `a_comparison_discloses_the_modules_the_source_would_not_show`, 2022 and 2025).
     Triggers pair on the qualified table *and* the name, because MySQL scopes a trigger name to the
     schema and PostgreSQL to the table and the wider key is right under both; routines on kind,
     qualified name and `identity_arguments`, because PostgreSQL overloads on the arguments and a key
@@ -21406,8 +21418,9 @@ existing prose was left alone.
     or the footer's count, the Apply button
     and the statements actually built can disagree. The seed was a fourth one,
     `differences().filter(|e| !e.needs_source())`, which drops `unplannable()` — so the tree could
-    open with objects ticked that the footer refuses to count. Nothing diverged only because
-    `unplannable` has no reachable producer today, and it sat in a *third* crate, outside every test
+    open with objects ticked that the footer refuses to count. Nothing diverged then only because
+    `unplannable` had no reachable producer — it has since (a SQL Server source module the server
+    would not show, `compare::table_entry`/`routine_entry`) — and it sat in a *third* crate, outside every test
     that could have noticed. `the_compare_seed_does_not_respell_the_plannable_predicate` is a source
     gate rather than a unit test for exactly that reason — a fifth spelling compiles and passes
     every assertion in the workspace — and it fails on `needs_source` or `unplannable` appearing

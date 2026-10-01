@@ -3556,6 +3556,65 @@ async fn a_comparison_leaves_a_signature_out_of_the_difference() {
     assert!(left.is_empty(), "{left:?}");
 }
 
+/// **A comparison discloses a module the source would not show, rather than
+/// planning it.** An encrypted view was planned as `CREATE VIEW v AS ;` and
+/// an encrypted procedure as a comment that "succeeded" creating nothing.
+/// Whether the target lacks them or holds readable ones, each is now left
+/// out of the plan and named in its omitted list.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_comparison_discloses_the_modules_the_source_would_not_show() {
+    use schemaic_core::compare::SchemaComparison;
+    if !enabled() {
+        return;
+    }
+    let target = Scratch::create("cmp_enc_target").await;
+    let source = Scratch::create("cmp_enc_source").await;
+    for s in [&target, &source] {
+        s.exec("CREATE TABLE dbo.t (id int NOT NULL PRIMARY KEY)")
+            .await;
+    }
+    source
+        .exec("CREATE VIEW dbo.v_enc WITH ENCRYPTION AS SELECT id FROM dbo.t")
+        .await;
+    source
+        .exec("CREATE PROCEDURE dbo.p_enc WITH ENCRYPTION AS SELECT 1 AS n")
+        .await;
+    let read = |s: &Scratch| {
+        let db = s.db.clone();
+        let name = s.name.clone();
+        async move {
+            db.fetch_schema(&name, CancellationToken::new())
+                .await
+                .unwrap()
+        }
+    };
+    for round in ["absent", "readable"] {
+        let c = SchemaComparison::of(&read(&target).await, &read(&source).await, MS);
+        let plan = c.plan(|_| true);
+        let sql = plan.emit();
+        assert!(
+            !sql.iter()
+                .any(|s| s.contains("v_enc") || s.contains("p_enc")),
+            "{round}: {sql:#?}"
+        );
+        for name in ["v_enc", "p_enc"] {
+            assert!(
+                plan.omitted.iter().any(|o| o.contains(name)),
+                "{round}: {:?}",
+                plan.omitted
+            );
+        }
+        if round == "absent" {
+            target
+                .exec("CREATE VIEW dbo.v_enc AS SELECT id FROM dbo.t")
+                .await;
+            target
+                .exec("CREATE PROCEDURE dbo.p_enc AS SELECT 2 AS n")
+                .await;
+        }
+    }
+}
+
 /// **A comparison's view alter names the target's indexes it drops.** The
 /// risk read the source's view's indexes, so a target's `cix` — which
 /// `ALTER VIEW` drops — went with an empty risk list. Synced, the plan names

@@ -1969,14 +1969,16 @@ fn requalify(sql: &str, from: &str, to: Option<&str>, dialect: SqlDialect) -> St
 /// [`CompareEntry::unplannable`] is for; this function's doc used to claim the
 /// `Same` reading for both.
 ///
-/// **And no call site reaches it today.** [`table_entry`] guards each of its
-/// arms on `is_view`, and [`ViewDraft::from_table`] returns `None` only for a
-/// table that is *not* a view — so the two conditions cannot both hold. It is
-/// kept as the answer for a builder that one day can't draft an object it was
-/// handed, which is why `unplannable` exists on the reading side rather than an
-/// `unreachable!()` here: a set that says nothing is a safe value, and an entry
-/// that is a difference with nothing behind it is not something a plan should
-/// count either way.
+/// **What reaches it** is a sequence (`table_entry`'s first arm), and a
+/// SQL Server source view or routine whose definition was not read —
+/// encrypted, or a header the walk could not hold — which a draft would turn
+/// into a statement that is wrong rather than empty. A two-sided pair of
+/// those does not read as `Same` either: [`unread_status`] compares the two
+/// texts instead. [`ViewDraft::from_table`]'s own `None`, for a table that
+/// is not a view, `table_entry`'s `is_view` guards keep from arising. Hence
+/// `unplannable` on the reading side rather than an `unreachable!()` here: a
+/// set that says nothing is a safe value, and an entry that is a difference
+/// with nothing behind it is not something a plan should count either way.
 fn empty_set(name: &str, schema: Option<&str>, dialect: SqlDialect) -> ChangeSet {
     ChangeSet {
         table: name.to_string(),
@@ -2011,7 +2013,19 @@ fn table_entry(
     // `CompareEntry::unplannable` reads, so the object is disclosed through
     // `omission_note` exactly as an unreadable view is — which is also what the
     // right-hand DDL pane has been saying all along.
-    let changes = if shape == TableShape::Sequence {
+    // **A source view whose definition was not read has nothing to plan it
+    // with** — SQL Server's encrypted one (`TsqlView::hidden`) or one whose
+    // header the walk could not hold (`verbatim`), which the editor refuses
+    // for the same reason (`ddl::view_not_editable_reason`). Drafted anyway,
+    // the first became `CREATE VIEW v AS ;` and the second nested its stored
+    // `CREATE` inside another; an empty set is what `unplannable` reads, and
+    // the entry is disclosed through `omission_note`. Asked of the source
+    // only: a target that hides its text is still replaced by a readable one.
+    let unread_source = is_view
+        && r.and_then(|r| r.view_options.as_ref())
+            .and_then(ddl::view_not_editable_reason)
+            .is_some();
+    let changes = if shape == TableShape::Sequence || unread_source {
         empty_set(&any.name, any.schema.as_deref(), dialect)
     } else {
         match (l, r) {
@@ -2042,21 +2056,48 @@ fn table_entry(
     // An index the model only partly read compares equal whatever the server
     // holds, so a match over one is a match this cannot vouch for.
     let uncertain = match (l, r) {
-        (Some(l), Some(r)) => l.indexes.iter().chain(&r.indexes).any(|ix| ix.lossy),
+        (Some(l), Some(r)) => {
+            unread_source || l.indexes.iter().chain(&r.indexes).any(|ix| ix.lossy)
+        }
         _ => false,
     };
+    let left_ddl = side_ddl(l, |t| t.create_ddl(dialect));
+    let right_ddl = side_ddl(r, |t| t.create_ddl(dialect));
     CompareEntry {
         kind,
         schema: any.schema.clone(),
         name: any.name.clone(),
         table: None,
         signature: None,
-        status: status_of(l.is_some(), r.is_some(), &changes),
+        status: unread_status(l.is_some(), unread_source, &left_ddl, &right_ddl)
+            .unwrap_or_else(|| status_of(l.is_some(), r.is_some(), &changes)),
         changes,
         uncertain,
-        left_ddl: side_ddl(l, |t| t.create_ddl(dialect)),
-        right_ddl: side_ddl(r, |t| t.create_ddl(dialect)),
+        left_ddl,
+        right_ddl,
     }
+}
+
+/// The status of a pair whose **source** could not be read, which has no
+/// change set to ask: `None` where the source was read, or the target is
+/// absent (`status_of` already answers `OnlyRight`). Two sides are the same
+/// only when their texts are — two encrypted modules both say so — and
+/// otherwise a difference this comparison cannot plan, so that
+/// `unplannable` and `omission_note` disclose it instead of the empty set
+/// reading as `Same`.
+fn unread_status(
+    on_left: bool,
+    unread_source: bool,
+    left_ddl: &str,
+    right_ddl: &str,
+) -> Option<ObjectStatus> {
+    (unread_source && on_left).then(|| {
+        if left_ddl == right_ddl {
+            ObjectStatus::Same
+        } else {
+            ObjectStatus::Differing
+        }
+    })
 }
 
 /// One side's `CREATE` text, or empty when that side doesn't hold the object.
@@ -2096,12 +2137,24 @@ fn routine_entry(
     dialect: SqlDialect,
 ) -> CompareEntry {
     let any = l.or(r).expect("a pair holds at least one side");
+    // A SQL Server source routine with no text (encrypted) or a header the
+    // walk could not hold has nothing to plan it with — `table_entry`'s
+    // unread view, for the same reason: drafted, it was a comment-only plan
+    // that "succeeded" creating nothing. `RoutineInfo::is_editable` asks the
+    // same of these two, beside a C function that is plannable.
+    let unread_source = r.is_some_and(|r| r.tsql.hidden || r.tsql.verbatim.is_some());
     let changes = match (l, r) {
+        _ if unread_source => empty_set(&any.name, any.schema.as_deref(), dialect),
         (Some(l), Some(r)) => ddl::diff_routine(l, &RoutineDraft::from_info(r), dialect),
         (None, Some(r)) => ddl::create_routine(&RoutineDraft::from_info(r), dialect),
         (Some(l), None) => ddl::drop_routine(l, dialect),
         (None, None) => unreachable!("a pair holds at least one side"),
     };
+    // `replace: false` — this text is read, never run, and a reader wants to
+    // see the object as it stands rather than as a statement that would
+    // overwrite it.
+    let left_ddl = side_ddl(l, |f| f.create_sql(dialect, false));
+    let right_ddl = side_ddl(r, |f| f.create_sql(dialect, false));
     CompareEntry {
         kind: match any.kind {
             RoutineKind::Function => CompareKind::Function,
@@ -2111,14 +2164,12 @@ fn routine_entry(
         name: any.name.clone(),
         table: None,
         signature: Some(any.identity_arguments.clone()),
-        status: status_of(l.is_some(), r.is_some(), &changes),
+        status: unread_status(l.is_some(), unread_source, &left_ddl, &right_ddl)
+            .unwrap_or_else(|| status_of(l.is_some(), r.is_some(), &changes)),
         changes,
-        uncertain: false,
-        // `replace: false` — this text is read, never run, and a reader wants to
-        // see the object as it stands rather than as a statement that would
-        // overwrite it.
-        left_ddl: side_ddl(l, |f| f.create_sql(dialect, false)),
-        right_ddl: side_ddl(r, |f| f.create_sql(dialect, false)),
+        uncertain: unread_source && l.is_some(),
+        left_ddl,
+        right_ddl,
     }
 }
 
@@ -5890,5 +5941,70 @@ mod tsql_module_tests {
             .destructive()
             .join(" ");
         assert!(!risks.contains("signed"), "{risks}");
+    }
+
+    /// **A module the source shows no definition for is not planned, and the
+    /// plan says so** (S6.1-L1-05): an encrypted view was planned as `CREATE
+    /// [OR ALTER] VIEW v AS ;`, one whose header was not read nested its
+    /// stored `CREATE` inside another, and an encrypted procedure became a
+    /// comment that "succeeded" creating nothing — each a difference the
+    /// plan hid. Each is now `unplannable()`, emits nothing, and is named in
+    /// `omitted`, whether the target holds it or not.
+    #[test]
+    fn a_module_the_source_could_not_read_is_disclosed_not_planned() {
+        let hidden_view = ms_view(
+            "v",
+            "",
+            TsqlView {
+                hidden: true,
+                ..TsqlView::default()
+            },
+        );
+        let mut verbatim_view = ms_view(
+            "w",
+            "CREATE VIEW dbo.w WITH SOMETHING_NEW AS SELECT 1 AS x",
+            TsqlView {
+                verbatim: true,
+                ..TsqlView::default()
+            },
+        );
+        verbatim_view.create_sql = verbatim_view.view_definition.clone();
+        let mut hidden_proc = ms_procedure("", false);
+        hidden_proc.tsql.hidden = true;
+        let source = DbSchema {
+            tables: vec![hidden_view, verbatim_view],
+            routines: vec![std::sync::Arc::new(hidden_proc)],
+            ..Default::default()
+        };
+        let readable = |name: &str| TableInfo {
+            create_sql: Some(format!("CREATE VIEW dbo.{name} AS SELECT 1 AS x")),
+            ..ms_view(name, "SELECT 1 AS x", TsqlView::default())
+        };
+        let present = DbSchema {
+            tables: vec![readable("v"), readable("w")],
+            routines: vec![std::sync::Arc::new(ms_procedure("SELECT 1", false))],
+            ..Default::default()
+        };
+        for target in [DbSchema::default(), present] {
+            let c = SchemaComparison::of(&target, &source, MS);
+            for key in ["view:dbo.v", "view:dbo.w", "procedure:dbo.p()"] {
+                let e = c
+                    .entries
+                    .iter()
+                    .find(|e| e.key() == key)
+                    .unwrap_or_else(|| panic!("{key}"));
+                assert!(
+                    e.unplannable(),
+                    "{key}: {:?} {:?}\n{}\n{}",
+                    e.status,
+                    e.changes.emit(),
+                    e.left_ddl,
+                    e.right_ddl
+                );
+            }
+            let plan = c.plan(|_| true);
+            assert!(plan.emit().is_empty(), "{:?}", plan.emit());
+            assert_eq!(plan.omitted.len(), 3, "{:?}", plan.omitted);
+        }
     }
 }
