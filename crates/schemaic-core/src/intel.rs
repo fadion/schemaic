@@ -14781,6 +14781,47 @@ mod tests {
         );
     }
 
+    /// **A three-part name in another loaded database is judged against that
+    /// database**, not the active one: `hr.dbo.employees` is missing although
+    /// the active `company` has an `employees`, and `hr.dbo.staff` is there
+    /// although `company` has none. Its schema is not compared — the
+    /// catalogue keys a database's tables by name — which can only let a
+    /// mismatched schema pass, never report a table that exists.
+    #[test]
+    fn a_three_part_name_in_another_loaded_database_is_judged_there() {
+        let company = DbSchema {
+            tables: vec![tbl_in("dbo", "employees", &["id", "name"])],
+            ..Default::default()
+        };
+        let hr = DbSchema {
+            tables: vec![tbl_in("dbo", "staff", &["id", "grade"])],
+            ..Default::default()
+        };
+        let cat = Catalog::build(&[("company", &company), ("hr", &hr)], Some("company"));
+        let messages = |sql: &str| -> Vec<String> {
+            diagnostics(sql, &cat, SqlDialect::MsSql)
+                .into_iter()
+                .map(|x| x.message)
+                .collect()
+        };
+        for sql in [
+            "SELECT id FROM hr.dbo.staff;",
+            "SELECT s.grade FROM hr.dbo.staff s;",
+            "SELECT id FROM hr..staff;",
+            "SELECT id FROM hr.sales.staff;",
+        ] {
+            assert!(messages(sql).is_empty(), "{sql}: {:?}", messages(sql));
+        }
+        assert_eq!(
+            messages("SELECT id FROM hr.dbo.employees;"),
+            ["Table `employees` not found in `hr.dbo`"]
+        );
+        assert_eq!(
+            messages("SELECT id FROM hr.dbo.nosuch;"),
+            ["Table `nosuch` not found in `hr.dbo`"]
+        );
+    }
+
     /// **What the T-SQL name prefixes leave standing.** A `#`/`@` source and
     /// a trigger's `inserted`/`deleted` are exempt from the table check, and
     /// an `AS` after a variable declares a type — each exemption no wider than
