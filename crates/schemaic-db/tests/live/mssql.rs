@@ -1582,6 +1582,40 @@ async fn a_dump_leaves_a_ledger_table_out_and_names_it() {
     );
 }
 
+/// **A synonym written `db..object` comes back as written.** `PARSENAME`'s
+/// missing schema part was dropped, so the copy's synonym read `[db].[t]` —
+/// schema `db` in the restoring database — and pointed at nothing (Msg 208).
+/// Synonyms bind late, so the target database need not exist.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dump_keeps_a_synonyms_empty_schema_part() {
+    use schemaic_core::dump::DumpOptions;
+    if !enabled() || azure_cannot("restores into a second database, which it has not got") {
+        return;
+    }
+    let src = Scratch::create("dump_synsrc").await;
+    src.exec(
+        "CREATE TABLE dbo.t (id int PRIMARY KEY); \
+         CREATE SYNONYM dbo.syn_dd FOR zz_nowhere_db..t; \
+         CREATE SYNONYM dbo.syn_full FOR zz_nowhere_db.sales.t;",
+    )
+    .await;
+    // In the dumped schema, so the dump carries them.
+    let file = Box::pin(dump_file(&src, DumpOptions::default())).await;
+    let dst = Scratch::create("dump_syndst").await;
+    let end = Box::pin(restore_file(&dst, &file)).await;
+    assert!(
+        matches!(end, schemaic_core::script::ExecEnd::Done),
+        "{end:?}\n{file}"
+    );
+    let targets = "SELECT STRING_AGG(CONCAT(name, '=', base_object_name), ',') \
+                   WITHIN GROUP (ORDER BY name) FROM sys.synonyms";
+    assert_eq!(
+        dst.scalar(targets).await,
+        "syn_dd=[zz_nowhere_db]..[t],syn_full=[zz_nowhere_db].[sales].[t]",
+        "{file}"
+    );
+}
+
 /// **Tables, views and the functions they call are created in one order.**
 /// A view reaching another view only through an inline function, and a table
 /// whose check calls a function counting another table, were written

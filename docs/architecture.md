@@ -3763,6 +3763,11 @@ existing prose was left alone.
     its sequences, alias types, XML schema collections and synonyms (`TsqlObject`, read by
     `db::mssql`'s `SEQUENCE_LISTING`, `ALIAS_TYPE_LISTING`, `XML_COLLECTION_LISTING` and
     `SYNONYM_LISTING`; a typed `xml` column's type names its collection, `xml([dbo].[coll])`).
+    A synonym's target keeps `PARSENAME`'s parts in their places (`TsqlObject::synonym_target`):
+    `db..t` has no schema part, and dropping it wrote `[db].[t]`, schema `db` in the restoring
+    database, so the copy pointed at nothing or at the wrong object; an empty part between two
+    others is written empty (`a_synonyms_missing_middle_part_stays_in_its_place`; live,
+    `a_dump_keeps_a_synonyms_empty_schema_part`).
     None was read, so a table with a `NEXT VALUE FOR` default or an alias-typed column stopped the
     restore at its `CREATE TABLE` (Msg 208/2715) and the header said nothing. They are not put in
     `sequences`/`domains` because those have PostgreSQL's emitters, editor and compare behind them

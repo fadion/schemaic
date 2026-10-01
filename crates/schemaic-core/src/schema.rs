@@ -5887,7 +5887,10 @@ pub enum TsqlObjectKind {
     XmlSchemaCollection { definition: String },
     /// `CREATE SYNONYM … FOR …`: the target's parts, outermost first (server,
     /// database, schema, object), as `PARSENAME` read them — quoted again
-    /// here, so no server text reaches the statement unquoted.
+    /// here, so no server text reaches the statement unquoted. A part missing
+    /// between two others is empty, not dropped ([`TsqlObject::synonym_target`]):
+    /// `db..t` dropped to `[db].[t]` named schema `db` in the restoring
+    /// database.
     Synonym { target: Vec<String> },
 }
 
@@ -5898,6 +5901,18 @@ impl TsqlObject {
             self.schema.as_deref(),
             crate::intel::SqlDialect::MsSql,
         )
+    }
+
+    /// A synonym's [`TsqlObjectKind::Synonym::target`] from `PARSENAME`'s
+    /// four parts, outermost first: the missing outermost ones left off, and
+    /// one missing between two others kept, empty — `db..t` is `["db", "",
+    /// "t"]`.
+    pub fn synonym_target(parts: [Option<String>; 4]) -> Vec<String> {
+        parts
+            .into_iter()
+            .skip_while(Option::is_none)
+            .map(Option::unwrap_or_default)
+            .collect()
     }
 
     /// What a person calls it — for a header line naming it.
@@ -5944,11 +5959,16 @@ impl TsqlObject {
                 "CREATE XML SCHEMA COLLECTION {q} AS {};",
                 ddl_string(definition, d)
             ),
+            // An empty part stays empty, so `db..t` keeps its place.
             TsqlObjectKind::Synonym { target } => format!(
                 "CREATE SYNONYM {q} FOR {};",
                 target
                     .iter()
-                    .map(|p| ddl_ident_in(p, d))
+                    .map(|p| if p.is_empty() {
+                        String::new()
+                    } else {
+                        ddl_ident_in(p, d)
+                    })
                     .collect::<Vec<_>>()
                     .join(".")
             ),
@@ -9637,6 +9657,40 @@ mod tests {
             syn.create_sql(),
             "CREATE SYNONYM [Sequences].[s] FOR [other].[dbo].[t]]x];"
         );
+    }
+
+    /// **A synonym's target keeps its parts in their places.** `db..t` —
+    /// the default schema of database `db` — reads from `PARSENAME` as
+    /// database `db`, no schema, object `t`; the missing middle part was
+    /// dropped, so the copy pointed at `[db].[t]`, schema `db` in the
+    /// restoring database, which held nothing or the wrong object (Msg 208,
+    /// measured on 2022). An outermost part that is missing is simply not
+    /// there; one between two others is written empty.
+    #[test]
+    fn a_synonyms_missing_middle_part_stays_in_its_place() {
+        let parts = |p: [Option<&str>; 4]| -> Vec<String> {
+            TsqlObject::synonym_target(p.map(|s| s.map(str::to_string)))
+        };
+        let syn = |target: Vec<String>| TsqlObject {
+            schema: Some("dbo".into()),
+            name: "s".into(),
+            kind: TsqlObjectKind::Synonym { target },
+        };
+        let dd = parts([None, Some("db"), None, Some("t")]);
+        assert_eq!(dd, ["db", "", "t"]);
+        assert_eq!(
+            syn(dd).create_sql(),
+            "CREATE SYNONYM [dbo].[s] FOR [db]..[t];"
+        );
+        assert_eq!(
+            syn(parts([Some("srv"), None, None, Some("t")])).create_sql(),
+            "CREATE SYNONYM [dbo].[s] FOR [srv]...[t];"
+        );
+        assert_eq!(
+            syn(parts([None, None, Some("sales"), Some("t")])).create_sql(),
+            "CREATE SYNONYM [dbo].[s] FOR [sales].[t];"
+        );
+        assert_eq!(parts([None, None, None, Some("t")]), ["t"]);
     }
 
     /// **A view's header is rebuilt under the name the catalogue gives it**,

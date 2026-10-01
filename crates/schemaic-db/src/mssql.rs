@@ -2496,7 +2496,9 @@ async fn collect_schema(client: &mut MsClient) -> Result<DbSchema, DbError> {
             tsql_objects.push(obj(
                 &r,
                 TsqlObjectKind::Synonym {
-                    target: (2..6).filter_map(|i| r.get(i).cloned().flatten()).collect(),
+                    target: TsqlObject::synonym_target(std::array::from_fn(|i| {
+                        r.get(i + 2).cloned().flatten()
+                    })),
                 },
             ));
         }
