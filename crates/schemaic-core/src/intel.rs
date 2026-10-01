@@ -4293,7 +4293,7 @@ fn lexer_scope(
             resume.pop();
             let stop =
                 read_table_list_after_paren(&toks, i, dialect, &mut |item| emit_in(item, scope));
-            resume.extend(stop.resume.map(|r| (r, scope)));
+            resume.extend(stop.resume.into_iter().map(|r| (r, scope)));
             i = stop.at;
             continue;
         }
@@ -4322,7 +4322,7 @@ fn lexer_scope(
                 // `customers ON "LEFT".customer_id = customers.id`.
                 let stop =
                     read_table_list(&toks, i + 1, &up, dialect, &mut |item| emit_in(item, scope));
-                resume.extend(stop.resume.map(|r| (r, scope)));
+                resume.extend(stop.resume.into_iter().map(|r| (r, scope)));
                 i = stop.at;
             }
             _ => {
@@ -5190,12 +5190,19 @@ struct ListItem {
 struct ListStop {
     /// The token the list ended at.
     at: usize,
-    /// For a `FROM` list that met a parenthesised item — a derived table, or
-    /// a rowset function's arguments — the index just past its `)`: the list
-    /// goes on there, with the item's alias and then perhaps a comma, once the
-    /// caller has read what is inside (a derived table's own `FROM`, a
-    /// subquery in an argument). [`read_table_list_after_paren`] reads it.
-    resume: Option<usize>,
+    /// Where the list goes on once the caller has read what lies between —
+    /// the caller hands each to [`read_table_list_after_paren`] when its scan
+    /// reaches it, **innermost (lowest) last**. Three kinds:
+    ///
+    /// - For a `FROM` list that met a parenthesised item — a derived table, a
+    ///   rowset function's arguments, a parenthesised join — the index just
+    ///   past its `)`: the list goes on there, with the item's alias and then
+    ///   perhaps a comma, once the caller has read what is inside (a derived
+    ///   table's own `FROM`, a subquery in an argument, the join's `JOIN`s).
+    /// - Inside a parenthesised join, those of its first item.
+    /// - For a `JOIN`, the `,` after its `ON …`/`USING (…)` that goes on with
+    ///   the `FROM` list the join belongs to ([`join_tail_comma`]).
+    resume: Vec<usize>,
 }
 
 /// The table list after `keyword` (`FROM`, `JOIN`, `INTO` or `UPDATE`,
@@ -5218,13 +5225,54 @@ struct ListStop {
 /// **A table hint is not a call** ([`table_hints`]): T-SQL's `FROM t (NOLOCK)`
 /// is a table and one hint, not `t`'s arguments, and `WITH (…)` after a name
 /// or an alias ends the item without ending the list.
+///
+/// **A parenthesised join is a list of its own** ([`opens_parenthesised_join`]):
+/// `FROM (a JOIN b ON …)` was taken for a derived table, and `a` — after no
+/// `FROM` or `JOIN` of its own — was never read. Its first items are read
+/// here; its `JOIN`s the caller reaches as it walks the inside.
+///
+/// **A join goes on with its `FROM` list after a comma**: `FROM a JOIN b ON …,
+/// c` is two items, and the reader stopped at the `ON`, so `c` went unread.
+/// A `JOIN` list says where the comma is ([`join_tail_comma`]).
 fn read_table_list(
+    toks: &[Token],
+    i: usize,
+    keyword: &str,
+    dialect: SqlDialect,
+    emit: &mut dyn FnMut(ListItem),
+) -> ListStop {
+    // MySQL's index hint `USE INDEX FOR JOIN (i)` names an index, not a
+    // table: its `JOIN` opens no list.
+    let index_hint = keyword == "JOIN"
+        && i.checked_sub(2).and_then(|p| toks.get(p)).is_some_and(|t| {
+            !t.quoted && matches!(&t.kind, TkKind::Word(w) if w.eq_ignore_ascii_case("FOR"))
+        });
+    if index_hint {
+        return ListStop {
+            at: i,
+            resume: Vec::new(),
+        };
+    }
+    let (mut stop, read_an_item) = read_table_list_items(toks, i, keyword, dialect, emit);
+    // A `JOIN` that read nothing — T-SQL's `OPTION (HASH JOIN, LOOP JOIN)`,
+    // a half-typed `JOIN |` — has no `ON` whose comma could go on.
+    if keyword == "JOIN"
+        && read_an_item
+        && let Some(comma) = join_tail_comma(toks, stop.at, dialect)
+    {
+        stop.resume.insert(0, comma);
+    }
+    stop
+}
+
+/// [`read_table_list`]'s items, and whether it read one at all.
+fn read_table_list_items(
     toks: &[Token],
     mut i: usize,
     keyword: &str,
     dialect: SqlDialect,
     emit: &mut dyn FnMut(ListItem),
-) -> ListStop {
+) -> (ListStop, bool) {
     let is_from = keyword == "FROM";
     // After `INTO` a `(` opens a column list, and after `UPDATE` none comes.
     let parenthesised = matches!(keyword, "FROM" | "JOIN");
@@ -5236,12 +5284,16 @@ fn read_table_list(
             .flatten()
             .map(|close| close + 1)
     };
+    let mut read_an_item = false;
     loop {
         if parenthesised && matches!(at(i), Some(TkKind::LParen)) {
-            return ListStop {
-                at: i,
-                resume: resume_after(i),
-            };
+            let mut resume: Vec<usize> = resume_after(i).into_iter().collect();
+            if opens_parenthesised_join(toks, i) {
+                // Read as a `FROM` list: MySQL takes `(a, b) JOIN c` too.
+                let inner = read_table_list(toks, i + 1, "FROM", dialect, emit);
+                resume.extend(inner.resume);
+            }
+            return (ListStop { at: i, resume }, true);
         }
         let Some(tok) = toks.get(i) else { break };
         let TkKind::Word(first) = &tok.kind else {
@@ -5261,10 +5313,11 @@ fn read_table_list(
                 call: false,
                 dangling: true,
             });
-            return ListStop {
+            let stop = ListStop {
                 at: i + 1,
-                resume: None,
+                resume: Vec::new(),
             };
+            return (stop, true);
         }
         if let Some(end) = table_hint_end(toks, i, dialect) {
             i = end;
@@ -5276,10 +5329,11 @@ fn read_table_list(
                 call: true,
                 dangling: false,
             });
-            return ListStop {
+            let stop = ListStop {
                 at: i,
-                resume: resume_after(i),
+                resume: resume_after(i).into_iter().collect(),
             };
+            return (stop, true);
         }
         let alias = read_alias(toks, &mut i, dialect);
         if let Some(end) = table_hint_end(toks, i, dialect) {
@@ -5291,27 +5345,142 @@ fn read_table_list(
             call: false,
             dangling: false,
         });
+        read_an_item = true;
         if is_from && matches!(at(i), Some(TkKind::Comma)) {
             i += 1;
             continue;
         }
         break;
     }
-    ListStop {
+    let stop = ListStop {
         at: i,
-        resume: None,
+        resume: Vec::new(),
+    };
+    (stop, read_an_item)
+}
+
+/// Does the `(` at `toks[open]`, where a table list expects an item, open a
+/// **parenthesised join** — `FROM (a JOIN b ON …)`, `FROM ((a JOIN b) JOIN c)`
+/// — rather than a derived table? A name (quoted, or any word but a query's
+/// first) or a further `(` after it says so; `SELECT`, `WITH`, `VALUES` and
+/// PostgreSQL's `TABLE` begin a query. Asked of those four words rather than
+/// of [`is_reserved_word`], which on SQLite holds only what it refuses as an
+/// alias. A `(` followed by a `(` is read again by the same question, so a
+/// parenthesised query, `((SELECT …) UNION (…))`, still ends as a derived
+/// table.
+fn opens_parenthesised_join(toks: &[Token], open: usize) -> bool {
+    match toks.get(open + 1) {
+        Some(Token {
+            kind: TkKind::LParen,
+            ..
+        }) => true,
+        Some(Token {
+            kind: TkKind::Word(w),
+            quoted,
+            ..
+        }) => {
+            *quoted
+                || !["SELECT", "WITH", "VALUES", "TABLE"]
+                    .iter()
+                    .any(|q| w.eq_ignore_ascii_case(q))
+        }
+        _ => false,
     }
+}
+
+/// The `,` that goes on with a `FROM` list after a join ending at `toks[i]` —
+/// past its `ON …` or `USING (…)`, at the join's own paren depth — if one does.
+///
+/// **An `ON` condition holds no comma outside parentheses**, so the first one
+/// at that depth is the list's — unless a clause has begun first: `GROUP BY
+/// a, b`, `ORDER BY`, MySQL's `LIMIT 1, 2` and `ON DUPLICATE KEY UPDATE a = 1,
+/// b = 2`, an `UPDATE … JOIN … SET a = 1, b = 2`, `WINDOW w AS (…), w2 …`,
+/// `RETURNING a, b`, PostgreSQL's `FOR UPDATE OF a, b`, T-SQL's `OUTPUT`, the
+/// next statement where none needs a `;` ([`unterminated_statement_heads`]),
+/// or the next `JOIN`, whose own comma this asks about separately. A `)` that
+/// closes the paren the join is in ends the search too. Stopping early only
+/// misses a table; going on past a clause would judge a column as one.
+fn join_tail_comma(toks: &[Token], mut i: usize, dialect: SqlDialect) -> Option<usize> {
+    const CLAUSES: &[&str] = &[
+        "JOIN",
+        "WHERE",
+        "GROUP",
+        "ORDER",
+        "HAVING",
+        "LIMIT",
+        "OFFSET",
+        "FETCH",
+        "UNION",
+        "EXCEPT",
+        "INTERSECT",
+        "MINUS",
+        "WINDOW",
+        "QUALIFY",
+        "FOR",
+        "SET",
+        "RETURNING",
+        "OUTPUT",
+        "OPTION",
+        "INTO",
+        "UPDATE",
+        "VALUES",
+        "SELECT",
+        "FROM",
+        "WHEN",
+        "THEN",
+        "LOCK",
+        "PROCEDURE",
+        "DUPLICATE",
+        "CONFLICT",
+    ];
+    let mut depth = 0usize;
+    while let Some(t) = toks.get(i) {
+        if t.after_semicolon {
+            return None;
+        }
+        match &t.kind {
+            TkKind::LParen => depth += 1,
+            TkKind::RParen if depth == 0 => return None,
+            TkKind::RParen => depth -= 1,
+            TkKind::Comma if depth == 0 => return Some(i),
+            TkKind::Word(w)
+                if depth == 0
+                    && !t.quoted
+                    && (CLAUSES.iter().any(|c| w.eq_ignore_ascii_case(c))
+                        || unterminated_statement_heads(dialect)
+                            .iter()
+                            .any(|h| w.eq_ignore_ascii_case(h))) =>
+            {
+                return None;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 /// The rest of a `FROM` list after a parenthesised item, from `toks[i]` just
 /// past its `)` ([`ListStop::resume`]): the item's alias — with a column-alias
 /// list, `AS g(n)` — and, after a comma, the list's next items.
+///
+/// PostgreSQL's `WITH ORDINALITY` stands between a rowset function's `)` and
+/// its alias (`unnest(x) WITH ORDINALITY AS u(a, n)`); read as the end of the
+/// list, it hid every item after it.
 fn read_table_list_after_paren(
     toks: &[Token],
     mut i: usize,
     dialect: SqlDialect,
     emit: &mut dyn FnMut(ListItem),
 ) -> ListStop {
+    let bare = |j: usize, kw: &str| {
+        toks.get(j).is_some_and(|t| {
+            !t.quoted && matches!(&t.kind, TkKind::Word(w) if w.eq_ignore_ascii_case(kw))
+        })
+    };
+    if bare(i, "WITH") && bare(i + 1, "ORDINALITY") {
+        i += 2;
+    }
     if read_alias(toks, &mut i, dialect).is_some()
         && matches!(toks.get(i).map(|t| &t.kind), Some(TkKind::LParen))
         && let Some(close) = matching_paren(toks, i)
@@ -5323,7 +5492,7 @@ fn read_table_list_after_paren(
     }
     ListStop {
         at: i,
-        resume: None,
+        resume: Vec::new(),
     }
 }
 
@@ -16720,6 +16889,156 @@ mod tests {
             s.tables
                 .iter()
                 .any(|t| t.name == "employees" && t.alias.as_deref() == Some("e")),
+            "{s:?}"
+        );
+    }
+
+    /// **`WITH ORDINALITY` belongs to the function before it.** PostgreSQL's
+    /// `unnest(x) WITH ORDINALITY AS u(a, n)` puts two words between the
+    /// call's `)` and its alias, and the reader took `WITH` for the end of
+    /// the list — so the table after the comma was never judged.
+    #[test]
+    fn a_from_list_is_read_past_with_ordinality() {
+        for sql in [
+            "SELECT * FROM unnest(ARRAY[1, 2]) WITH ORDINALITY AS u(a, n), nosuch;",
+            "SELECT * FROM unnest(ARRAY[1, 2]) WITH ORDINALITY u, nosuch;",
+            "SELECT * FROM unnest(ARRAY[1, 2]) WITH ORDINALITY, nosuch;",
+        ] {
+            assert_eq!(
+                missing_tables(sql, SqlDialect::Postgres),
+                ["nosuch"],
+                "{sql}"
+            );
+        }
+        let sql = "SELECT e. FROM unnest(ARRAY[1]) WITH ORDINALITY AS u(a, n), employees e";
+        let s = statement_scope(sql, 0, sql.len(), 9, SqlDialect::Postgres);
+        assert!(
+            s.tables
+                .iter()
+                .any(|t| t.name == "employees" && t.alias.as_deref() == Some("e")),
+            "{s:?}"
+        );
+    }
+
+    /// **A comma after a join goes on with the `FROM` list.** `FROM a JOIN b
+    /// ON …, c` is one list of two items, the first a join; the reader ended
+    /// at the join's `ON`, so `c` was never judged — nor, after `USING (…)`
+    /// or a `CROSS JOIN`, the table after the comma.
+    #[test]
+    fn a_from_list_is_read_past_a_join() {
+        for (sql, dialect) in [
+            (
+                "SELECT * FROM employees e JOIN departments d ON d.id = e.dept_id, nosuch;",
+                SqlDialect::MySql,
+            ),
+            (
+                "SELECT * FROM employees e JOIN departments d ON d.id = coalesce(e.dept_id, 0), nosuch n WHERE 1 = 1;",
+                SqlDialect::Postgres,
+            ),
+            (
+                "SELECT * FROM employees e JOIN departments d USING (id), nosuch;",
+                SqlDialect::Postgres,
+            ),
+            (
+                "SELECT * FROM employees e CROSS JOIN departments d, nosuch;",
+                SqlDialect::MsSql,
+            ),
+            (
+                "SELECT * FROM employees e JOIN departments d ON d.id = e.dept_id \
+                 JOIN employees m ON m.id = e.id, nosuch;",
+                SqlDialect::Sqlite,
+            ),
+            (
+                "SELECT * FROM employees e JOIN (SELECT 1 AS id, 2 AS b) d ON d.id = e.id, nosuch;",
+                SqlDialect::MySql,
+            ),
+        ] {
+            assert_eq!(missing_tables(sql, dialect), ["nosuch"], "{sql}");
+        }
+        // A comma in a clause after the join is no table list's.
+        for (sql, dialect) in [
+            (
+                "SELECT e.id, d.id FROM employees e JOIN departments d ON d.id = e.dept_id \
+                 GROUP BY e.id, d.id ORDER BY e.id, d.id;",
+                SqlDialect::MySql,
+            ),
+            (
+                "UPDATE employees e JOIN departments d ON d.id = e.dept_id SET e.name = 'x', e.salary = 1;",
+                SqlDialect::MySql,
+            ),
+            (
+                "SELECT * FROM employees e JOIN departments d ON d.id = e.dept_id LIMIT 1, 2;",
+                SqlDialect::MySql,
+            ),
+            (
+                "SELECT * FROM employees e JOIN departments d ON d.id = e.dept_id \
+                 WINDOW w AS (ORDER BY e.id), w2 AS (ORDER BY d.id);",
+                SqlDialect::Postgres,
+            ),
+            (
+                "SELECT (SELECT 1 FROM employees e JOIN departments d ON d.id = e.dept_id), name \
+                 FROM employees;",
+                SqlDialect::MySql,
+            ),
+            (
+                "DELETE FROM employees USING employees JOIN departments d ON d.id = 1 \
+                 RETURNING id, name;",
+                SqlDialect::Postgres,
+            ),
+            (
+                "SELECT * FROM employees e JOIN departments d ON d.id = e.dept_id FOR UPDATE OF e, d;",
+                SqlDialect::Postgres,
+            ),
+        ] {
+            assert_eq!(missing_tables(sql, dialect), Vec::<String>::new(), "{sql}");
+        }
+    }
+
+    /// **A parenthesised join's tables are tables.** `FROM (a JOIN b ON …)`
+    /// left the reader on the `(`, which it took for a derived table's, so
+    /// `a` — named after no `FROM` or `JOIN` of its own — was never read.
+    #[test]
+    fn a_parenthesised_join_registers_its_tables() {
+        for (sql, dialect, missing) in [
+            (
+                "SELECT * FROM (nosuch1 a JOIN departments d ON d.id = a.id);",
+                SqlDialect::MySql,
+                vec!["nosuch1"],
+            ),
+            (
+                "SELECT * FROM ((nosuch1 a JOIN departments d ON d.id = a.id) \
+                 JOIN nosuch2 c ON c.id = a.id), nosuch3;",
+                SqlDialect::Postgres,
+                vec!["nosuch1", "nosuch2", "nosuch3"],
+            ),
+            (
+                "SELECT * FROM employees e JOIN (nosuch1 a JOIN departments d ON d.id = a.id) \
+                 ON a.id = e.id;",
+                SqlDialect::MsSql,
+                vec!["nosuch1"],
+            ),
+            // MySQL's index hint names an index in parentheses, not a join.
+            (
+                "SELECT * FROM employees e USE INDEX FOR JOIN (ix_dept) \
+                 JOIN departments d ON d.id = e.dept_id;",
+                SqlDialect::MySql,
+                vec![],
+            ),
+            // A derived table is still read as one.
+            (
+                "SELECT * FROM ((SELECT * FROM nosuch1) UNION (SELECT * FROM employees)) s, nosuch2;",
+                SqlDialect::Postgres,
+                vec!["nosuch1", "nosuch2"],
+            ),
+        ] {
+            assert_eq!(missing_tables(sql, dialect), missing, "{sql}");
+        }
+        let sql = "SELECT a. FROM (employees a JOIN departments d ON d.id = a.dept_id)";
+        let s = statement_scope(sql, 0, sql.len(), 9, SqlDialect::MySql);
+        assert!(
+            s.tables
+                .iter()
+                .any(|t| t.name == "employees" && t.alias.as_deref() == Some("a")),
             "{s:?}"
         );
     }

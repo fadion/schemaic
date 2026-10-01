@@ -900,7 +900,24 @@ existing prose was left alone.
     `nosuch`. The reader stops at the `(` and returns where the list resumes (`ListStop::resume`,
     past the `)`); the caller reads the inside first — a derived table has `FROM`s of its own —
     and `read_table_list_after_paren` the alias and the rest
-    (`a_from_list_is_read_past_a_function_or_a_derived_table`).
+    (`a_from_list_is_read_past_a_function_or_a_derived_table`). Three more shapes stopped it early,
+    each hiding a missing table after them. PostgreSQL's `WITH ORDINALITY` stands between a rowset
+    call's `)` and its alias, and read as the list's end (`a_from_list_is_read_past_with_ordinality`).
+    `FROM a JOIN b ON …, c` is one list of two items, and the reader ended at the `ON`:
+    `join_tail_comma` finds that comma at the join's own paren depth, and gives up at a `;`, at a
+    `)` closing the enclosing paren, or at the first clause word — `GROUP`, `SET`, `LIMIT`,
+    `WINDOW`, `RETURNING`, `FOR`, `DUPLICATE`, the next `JOIN`, a statement head that needs no `;`
+    — because stopping early only misses a table, while going on judges `GROUP BY a, b`'s columns
+    as tables (`a_from_list_is_read_past_a_join`). A `JOIN` that read no item — T-SQL's
+    `OPTION (HASH JOIN, LOOP JOIN)` — asks nothing. `ListStop::resume` is a `Vec`, innermost last,
+    holding that comma as well as the `)`s a list goes on past. And `FROM (a JOIN b ON …)` was taken
+    for a derived table, so `a`, after no `FROM` or `JOIN` of its own, was never read:
+    `opens_parenthesised_join` decides by the token after the `(` — a further `(`, or any name but
+    `SELECT`/`WITH`/`VALUES`/`TABLE`, asked of those four words rather than `is_reserved_word`
+    because `SQLITE_RESERVED` holds only what SQLite refuses as an alias — and the reader reads the
+    join's first items as a `FROM` list, leaving its `JOIN`s to the caller's walk. A
+    `((SELECT …) UNION (…))` is asked again at its inner `(` and still ends a derived table; MySQL's
+    `USE INDEX FOR JOIN (i)` opens no list (`a_parenthesised_join_registers_its_tables`).
     **`INTO` names a table only after `INSERT`/`REPLACE`** (`insert_precedes`), because the word has
     three other meanings and none of them does: PostgreSQL's legacy `SELECT a INTO newtbl FROM t`
     names the table it is about to *create*, and MySQL's `SELECT a INTO @x` and
