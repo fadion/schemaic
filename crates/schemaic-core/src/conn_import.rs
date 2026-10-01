@@ -485,16 +485,113 @@ fn split_mssql_userinfo(after: &str) -> (Option<&str>, &str) {
 
 /// `name` with anything that could be a password replaced by `…`.
 ///
-/// Two shapes, because those are the two a failed entry's fallback name can
-/// have: a URL's `scheme://user:secret@host` userinfo, and a
-/// `password=`/`pwd=`/`pass=` parameter in a query string or a DSN. Everything
-/// else — a DataGrip entry name, a file path, a driver name — passes through
-/// unchanged, which is most of what reaches here.
+/// Three shapes, because those are the ones a failed entry's fallback name can
+/// have: a URL's `scheme://user:secret@host` userinfo, a `password=`/`pwd=`/
+/// `pass=` parameter in its query, and a **keyword string** — ADO.NET's, ODBC's
+/// and OLE DB's `Server=…;Pwd=…`, which reaches the not-imported list whenever
+/// it is refused (`UrlError::NotSqlServer`, a transport, a bad port).
+/// Everything else — a DataGrip entry name, a file path, a driver name — passes
+/// through unchanged, which is most of what reaches here.
+///
+/// **A secret is hidden for as far as the importer would read it**, so each
+/// shape is read by the importer's own grammar rather than by a list of
+/// separators: a keyword string through [`mssql_props`], which
+/// [`parse_connection_string`] reads it with — `Pwd=My&Secret9` is one value,
+/// and so is `Password= "abc;Secret99"`, quote, `;` and all — and a SQL Server
+/// URL's `;` properties the same way, as [`parse_mssql_url`] reads them. A
+/// separator scan was the previous answer and kept being one character short:
+/// it ended a value at an `&`, which ends one only in a URL query, and looked
+/// for a quote only where the key shared a part with it, so a space after the
+/// `=` showed what followed the quoted password's first `;`.
 fn redacted(name: &str) -> String {
+    redact_text(name, REDACT_DEPTH, true)
+}
+
+/// How many keyword strings [`redact_text`] will look for inside one another —
+/// a `.env` line holding a quoted connection string holding a quoted value is
+/// three — before it reads what is left with [`redact_params`] alone. A bound,
+/// so that no input's nesting makes the redaction anything but linear.
+const REDACT_DEPTH: u8 = 3;
+
+/// [`redacted`] at a nesting `depth`. `outer` is whether this is the whole
+/// entry, where a text that merely *starts* `key=` — a Connector/NET string
+/// opening with `Uid=`, which the importer refuses as having no scheme — is
+/// still read as a keyword string, the reading that hides the most; a value
+/// inside one is read that way only when the importer would read it so.
+fn redact_text(text: &str, depth: u8, outer: bool) -> String {
+    if depth > 0
+        && let Some(list) = keyword_list(text, outer)
+    {
+        // `list` is a slice of `text`: the BOM, the blanks and a `.env`
+        // wrapper around it are kept as they were written.
+        let at = list.as_ptr() as usize - text.as_ptr() as usize;
+        let mut out = String::with_capacity(text.len());
+        out.push_str(&text[..at]);
+        out.push_str(&redact_keywords(list, true, depth - 1));
+        out.push_str(&text[at + list.len()..]);
+        return out;
+    }
+    redact_url(text)
+}
+
+/// The part of `text` that is a keyword string, as [`parse_url_any`] would
+/// find it — the whole of it, or what a `.env` assignment wraps — or, when
+/// `outer`, a text whose first `=` comes before anything a URL holds.
+fn keyword_list(text: &str, outer: bool) -> Option<&str> {
+    let t = strip_bom(text).trim();
+    if looks_like_connection_string(t) {
+        return Some(t);
+    }
+    let inner = strip_env_assignment(t);
+    if looks_like_connection_string(inner) {
+        return Some(inner);
+    }
+    let starts_keyed = t.find('=').is_some_and(|i| {
+        let key = &t[..i];
+        !key.trim().is_empty() && !key.contains([':', '/', '?', '@', '#'])
+    });
+    (outer && starts_keyed).then_some(t)
+}
+
+/// A keyword string with every password value — its whole extent as
+/// [`mssql_props`] reads it — replaced by `…`, and every other value read
+/// again by [`redact_text`], which finds a URL or a `.env`-quoted string
+/// inside it. Everything between the values is copied as written.
+fn redact_keywords(list: &str, quotes: bool, depth: u8) -> String {
+    let mut out = String::with_capacity(list.len());
+    let mut at = 0;
+    for prop in mssql_props(list, quotes) {
+        if prop.raw.is_empty() {
+            continue;
+        }
+        out.push_str(&list[at..prop.raw.start]);
+        if is_password_key(&prop.key) {
+            out.push('…');
+        } else {
+            out.push_str(&redact_text(&list[prop.raw.clone()], depth, false));
+        }
+        at = prop.raw.end;
+    }
+    out.push_str(&list[at..]);
+    out
+}
+
+/// Is this scheme — as [`redact_url`] finds it, `jdbc:` wrappers and any text
+/// before it included — one of SQL Server's?
+fn is_mssql_scheme(scheme: &str) -> bool {
+    let last = scheme.rsplit([':', ' ']).next().unwrap_or("");
+    engine_for_scheme(last) == Some(MSSQL)
+}
+
+/// The URL shape: the userinfo of the first `://` in `name`, then the rest
+/// through [`redact_params`] — and a SQL Server URL's `;` properties through
+/// [`redact_keywords`], since [`parse_mssql_url`] reads them as Microsoft's
+/// grammar, where a value runs to its `;`.
+fn redact_url(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     // The userinfo half. `://` then everything up to the last `@` before the
     // next `/`; a `:` inside it separates the login from the secret.
-    let rest = match name.split_once("://") {
+    let (rest, mssql) = match name.split_once("://") {
         Some((scheme, after)) => {
             out.push_str(scheme);
             out.push_str("://");
@@ -503,28 +600,71 @@ fn redacted(name: &str) -> String {
             // of a `/` in the password is the entry whose password is shown.
             // The ordinary delimiters on a SQL Server URL too: see
             // [`MSSQL_URL_DELIMS`] for why they hide at least as much.
-            match split_userinfo(after, URL_DELIMS) {
+            let tail = match split_userinfo(after, URL_DELIMS) {
                 (Some(userinfo), tail) => {
                     match userinfo.split_once(':') {
                         Some((user, _)) => {
                             out.push_str(user);
                             out.push_str(":…");
                         }
-                        None => out.push_str(userinfo),
+                        // No `:`, so no secret of its own — but the ordinary
+                        // delimiters can take a SQL Server URL's `;password=`
+                        // into a "userinfo" that Microsoft's grammar reads as
+                        // properties.
+                        None => out.push_str(&redact_params(userinfo)),
                     }
                     out.push('@');
                     tail
                 }
                 (None, tail) => tail,
-            }
+            };
+            (tail, is_mssql_scheme(scheme))
         }
-        None => name,
+        None => (name, false),
     };
-    // The parameter half, over whatever is left. Split on the characters a
-    // query string or a DSN separates parameters with, so one `password=` value
-    // cannot swallow the rest of the line. `split_inclusive` keeps each
-    // separator on the end of its own part, so the text is rebuilt exactly.
-    const SEPS: [char; 4] = ['&', '?', ';', ' '];
+    match rest.split_once(';') {
+        Some((head, props)) if mssql => {
+            out.push_str(&redact_params(head));
+            out.push(';');
+            out.push_str(&redact_keywords(props, false, 0));
+        }
+        _ => out.push_str(&redact_params(rest)),
+    }
+    out
+}
+
+/// The opening quote or brace `value` starts with (after its blanks) and the
+/// closer that ends it — `None` when it starts with neither.
+fn opening_quote(value: &str) -> Option<u8> {
+    match value.trim_start().bytes().next()? {
+        b'{' => Some(b'}'),
+        q @ (b'"' | b'\'') => Some(q),
+        _ => None,
+    }
+}
+
+/// The parameter half of [`redact_url`], over whatever the userinfo left, and
+/// the whole of any text no grammar above claimed — a skip reason, a value
+/// inside a keyword string.
+fn redact_params(rest: &str) -> String {
+    let mut out = String::with_capacity(rest.len());
+    // Split on the characters a query string or a DSN separates parameters
+    // with, so one `password=` value cannot swallow the rest of the line.
+    // `split_inclusive` keeps each separator on the end of its own part, so the
+    // text is rebuilt exactly. **`&` only once a `?` has opened a query**: it
+    // separates a URL's parameters and nothing else, and anywhere else it is a
+    // password character — `Pwd=My&Secret9` showed `&Secret9`.
+    let mut query = false;
+    let split_at = move |c: char| match c {
+        '?' => {
+            query = true;
+            true
+        }
+        '&' => query,
+        ';' | ' ' => true,
+        _ => false,
+    };
+    let mut seen_query = false;
     // **A key, its `=` and its value can land in three different parts**, because
     // ` ` is one of the separators. `Pwd = hunter2` — an ODBC-shaped connection
     // string, which the paste field reads — therefore never reached `split_once('=')` with the key and
@@ -548,7 +688,18 @@ fn redacted(name: &str) -> String {
     // one; splitting at the `;` inside showed the rest of the password. Holds
     // the closer being waited for.
     let mut in_quote: Option<u8> = None;
-    for part in rest.split_inclusive(SEPS) {
+    // A quoted or braced value that does not close in the part it starts in
+    // runs on through the parts after it — the closer being waited for.
+    let unclosed = |value: &str| {
+        let value = value.trim_start();
+        opening_quote(value).filter(|&closer| closing_quote(&value[1..], closer).is_none())
+    };
+    for part in rest.split_inclusive(split_at) {
+        // Whether an `&` ends this part is whether a `?` ended one before it —
+        // the splitter's own rule, tracked here because a part it is inside
+        // a quote for is skipped below.
+        let in_query = seen_query;
+        seen_query |= part.ends_with('?');
         if let Some(closer) = in_quote {
             if let Some(close) = closing_quote(part, closer) {
                 in_quote = None;
@@ -556,7 +707,8 @@ fn redacted(name: &str) -> String {
             }
             continue;
         }
-        let (body, sep) = match part.chars().next_back().filter(|c| SEPS.contains(c)) {
+        let ends_part = |c: &char| matches!(c, '?' | ';' | ' ') || (*c == '&' && in_query);
+        let (body, sep) = match part.chars().next_back().filter(ends_part) {
             Some(c) => (&part[..part.len() - c.len_utf8()], Some(c)),
             None => (part, None),
         };
@@ -578,21 +730,13 @@ fn redacted(name: &str) -> String {
                     out.push_str(key);
                     out.push_str("=…");
                     awaiting = false;
-                    let value = value.trim_start();
-                    let closer = match value.bytes().next() {
-                        Some(b'{') => Some(b'}'),
-                        Some(q @ (b'"' | b'\'')) => Some(q),
-                        _ => None,
-                    };
-                    if let Some(closer) = closer
-                        && closing_quote(&value[1..], closer).is_none()
-                    {
+                    if let Some(closer) = unclosed(value) {
                         // The separator is the secret's too; the part that
                         // closes the quote brings back what follows it.
                         in_quote = Some(closer);
                         continue;
                     }
-                    if closer.is_none() && value_runs_on {
+                    if opening_quote(value).is_none() && value_runs_on {
                         in_value = true;
                         continue;
                     }
@@ -601,10 +745,16 @@ fn redacted(name: &str) -> String {
                     awaiting = secret;
                 }
             }
+            // The value of a `Pwd` or `Pwd=` in the part before — quoted as
+            // often as not, since a space after the `=` is what put it here.
             None if awaiting && !body.trim().is_empty() => {
                 out.push('…');
                 awaiting = false;
-                if value_runs_on {
+                if let Some(closer) = unclosed(body) {
+                    in_quote = Some(closer);
+                    continue;
+                }
+                if opening_quote(body).is_none() && value_runs_on {
                     in_value = true;
                     continue;
                 }
@@ -1303,11 +1453,33 @@ fn says_sql_server(keys: &[String], server: &str) -> bool {
 /// quote standing for one; JDBC has no such quoting, so a JDBC password that
 /// merely starts with `"` is left alone.
 fn split_mssql_props(s: &str, quotes: bool) -> Vec<(String, String)> {
+    mssql_props(s, quotes)
+        .into_iter()
+        .map(|p| (p.key, p.value))
+        .collect()
+}
+
+/// One `key=value` of Microsoft's grammar, as [`mssql_props`] reads it.
+struct MssqlProp {
+    /// The key as written, trimmed.
+    key: String,
+    /// The value as the driver reads it: unquoted, a doubled closer one.
+    value: String,
+    /// Where the value is written in the text — from its first non-blank
+    /// character to the `;` that ends it, quotes and anything after the closer
+    /// included. What [`redacted`] hides of a password, so that it hides
+    /// exactly what this grammar reads as one.
+    raw: std::ops::Range<usize>,
+}
+
+/// [`split_mssql_props`] with where each value sits: the one grammar both the
+/// importer and the redaction of what it refuses read a keyword string with.
+fn mssql_props(s: &str, quotes: bool) -> Vec<MssqlProp> {
     let mut out = Vec::new();
-    let mut chars = s.chars().peekable();
+    let mut chars = s.char_indices().peekable();
     loop {
         let mut key = String::new();
-        for ch in chars.by_ref() {
+        for (_, ch) in chars.by_ref() {
             if ch == '=' || ch == ';' {
                 if ch == ';' {
                     key.clear();
@@ -1323,19 +1495,21 @@ fn split_mssql_props(s: &str, quotes: bool) -> Vec<(String, String)> {
         let mut value = String::new();
         // `Password = "x"`: the quote may follow a space, which the unquoted
         // branch would trim anyway.
-        while chars.peek().is_some_and(|c| *c == ' ' || *c == '\t') {
+        while chars.peek().is_some_and(|&(_, c)| c == ' ' || c == '\t') {
             chars.next();
         }
-        let closer = match chars.peek() {
+        let start = chars.peek().map_or(s.len(), |&(i, _)| i);
+        let mut end = s.len();
+        let closer = match chars.peek().map(|&(_, c)| c) {
             Some('{') => Some('}'),
-            Some(q @ ('"' | '\'')) if quotes => Some(*q),
+            Some(q @ ('"' | '\'')) if quotes => Some(q),
             _ => None,
         };
         if let Some(closer) = closer {
             chars.next();
-            while let Some(ch) = chars.next() {
+            while let Some((_, ch)) = chars.next() {
                 if ch == closer {
-                    if chars.peek() == Some(&closer) {
+                    if chars.peek().map(|&(_, c)| c) == Some(closer) {
                         chars.next();
                         value.push(closer);
                         continue;
@@ -1345,14 +1519,16 @@ fn split_mssql_props(s: &str, quotes: bool) -> Vec<(String, String)> {
                 value.push(ch);
             }
             // Past the closing brace to the separator.
-            for ch in chars.by_ref() {
+            for (i, ch) in chars.by_ref() {
                 if ch == ';' {
+                    end = i;
                     break;
                 }
             }
         } else {
-            for ch in chars.by_ref() {
+            for (i, ch) in chars.by_ref() {
                 if ch == ';' {
+                    end = i;
                     break;
                 }
                 value.push(ch);
@@ -1360,7 +1536,11 @@ fn split_mssql_props(s: &str, quotes: bool) -> Vec<(String, String)> {
             value = value.trim().to_string();
         }
         if !key.trim().is_empty() {
-            out.push((key.trim().to_string(), value));
+            out.push(MssqlProp {
+                key: key.trim().to_string(),
+                value,
+                raw: start..end,
+            });
         }
         if chars.peek().is_none() {
             break;
@@ -4069,6 +4249,122 @@ mod tests {
             redacted("mysql://h/d?password=a b&ssl-mode=REQUIRED"),
             "mysql://h/d?password=…&ssl-mode=REQUIRED"
         );
+    }
+
+    /// **A password is hidden for as far as the importer would read it**, which
+    /// is the grammar's question, not a separator list's: a keyword string's
+    /// value runs to its `;` — an `&` and a space included — and a quoted or
+    /// braced one to its closer, wherever the quote sits after the `=`. Each
+    /// row is refused, so its text is what the not-imported list shows, and it
+    /// stays there across later scans. `&` ending a value is a URL query's
+    /// rule alone, and a space before the quote put a quoted password's tail on
+    /// screen.
+    #[test]
+    fn a_password_is_hidden_for_as_far_as_its_grammar_runs() {
+        for (raw, leaks, kept) in [
+            // An `&` inside a keyword string's value: Connector/NET, LocalDB,
+            // an ODBC string naming MySQL's driver.
+            (
+                "Server=myhost;Port=3306;Database=shop;Uid=appuser;Pwd=My&Secret9;",
+                &["Secret9", "My&"][..],
+                &["Server=myhost", "Uid=appuser", "Pwd="][..],
+            ),
+            ("Password=ab&cd ef", &["cd", "ef", "ab"], &["Password="]),
+            (
+                "Server=(localdb)\\MSSQLLocalDB;User Id=u;Password=pa&ss word",
+                &["ss word", "pa&"],
+                &["User Id=u"],
+            ),
+            (
+                "Driver={MySQL ODBC 8.0 Driver};Server=h;Pwd=se&cret;Database=d",
+                &["cret", "se&"],
+                &["Database=d", "Driver={MySQL ODBC 8.0 Driver}"],
+            ),
+            (
+                "Uid=u;Pwd=My&Secret9;Server=h",
+                &["Secret9", "My&"],
+                &["Server=h"],
+            ),
+            // A quote or a brace after a space.
+            (
+                "Server=h,bad;User Id=u;Password= \"abc;Secret99\"",
+                &["Secret99", "abc"],
+                &["User Id=u"],
+            ),
+            ("Password = \"abc;Secret99\"", &["Secret99", "abc"], &[]),
+            ("Pwd= {abc;Secret99}", &["Secret99", "abc"], &[]),
+            ("Pwd = 'abc;Secret99'", &["Secret99", "abc"], &[]),
+            (
+                "Server=(localdb)\\MSSQLLocalDB;User Id=u;Password= \"my;Secret pass\"",
+                &["Secret", "pass", "my;"],
+                &["User Id=u"],
+            ),
+            (
+                "Driver={MySQL ODBC 8.0 Driver};Server=h;Pwd= {se;cret};Database=d",
+                &["cret", "se;"],
+                &["Database=d"],
+            ),
+            (
+                "Server=h,x;Password= \"a\"\"b;c\";User Id=u",
+                &["a\"", "b;c", "c\""],
+                &["User Id=u"],
+            ),
+            // The `.env` wrapper the importer strips before reading.
+            (
+                "ConnectionStrings__Default=\"Server=h,x;Pwd=My&Secret9\"",
+                &["Secret9", "My&"],
+                &["ConnectionStrings__Default", "Server=h,x"],
+            ),
+            (
+                "DB=Server=h;Port=3306;Pwd= \"a;Secret9\"",
+                &["Secret9"],
+                &["Server=h"],
+            ),
+            // A SQL Server URL's properties are Microsoft's grammar too, past a
+            // query that uses `&`.
+            (
+                "mssql://u@h:99999/d?encrypt=true&x=1;password=a&b c;user=u",
+                &["a&b", "b c"],
+                &["encrypt=true", ";user=u"],
+            ),
+            (
+                "jdbc:sqlserver://h:99999;password= {p;w};user=u",
+                &["p;w", "w}"],
+                &[";user=u"],
+            ),
+            // A libpq keyword string, whose values a space ends.
+            (
+                "host=h password=se&cret dbname=x",
+                &["cret", "se&"],
+                &["host=h"],
+            ),
+        ] {
+            let out = redacted(raw);
+            for leak in leaks {
+                assert!(!out.contains(leak), "{raw} -> {out} shows {leak}");
+            }
+            for keep in kept {
+                assert!(out.contains(keep), "{raw} -> {out} lost {keep}");
+            }
+        }
+        // And through `scan`, where the list is built.
+        let scan =
+            parse_url_scan("Server=myhost;Port=3306;Database=shop;Uid=appuser;Pwd=My&Secret9;");
+        let shown = format!(
+            "{} {}",
+            scan.skipped[0].name,
+            scan.skipped[0].reason.message()
+        );
+        assert!(!shown.contains("Secret9"), "{shown}");
+        // Everything that holds no secret comes back exactly as written.
+        for name in [
+            "Server=h;Database = shop;User = app",
+            "Driver={MySQL ODBC 8.0 Driver};Server=h;Database=d",
+            "ConnectionStrings__Default=\"Server=h;Database=d\"",
+            "a=b",
+        ] {
+            assert_eq!(redacted(name), name);
+        }
     }
 
     /// **The reason is rendered beside the name and was never redacted.**

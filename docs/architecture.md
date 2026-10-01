@@ -7513,12 +7513,34 @@ existing prose was left alone.
     failed with *Login failed for user ''* (`an_ado_net_connection_string_is_read_by_its_keywords`,
     `an_odbc_connection_string_is_read_when_its_driver_is_sql_server`,
     `an_ado_net_string_notes_what_it_cannot_carry_over`,
-    `a_jdbc_urls_sign_in_is_read_as_an_ado_net_strings_is`). **`redacted` knows the braces too**: a
-    password's value opened with `{` — or with ADO.NET's `"` or `'` — runs to the first matching
-    closer that is not doubled (`closing_quote`), `;` and spaces included, so a SQL Server string
+    `a_jdbc_urls_sign_in_is_read_as_an_ado_net_strings_is`). **`redacted` hides a password for as
+    far as the importer would read it, so it reads each shape with the importer's own grammar** —
+    a separator scan was the previous answer and kept being one character short of it. A keyword
+    string is found as `parse_url_any` would find it (`keyword_list`: `looks_like_connection_string`
+    on the text, or on what `strip_env_assignment` unwraps) or, for the whole entry only (`outer`),
+    as any text whose first `=` comes before a `:`, `/`, `?`, `@` or `#` — a Connector/NET string
+    opening `Uid=`, which the importer refuses as having no scheme. `redact_keywords` walks it with
+    `mssql_props`, the span-producing tokenizer `split_mssql_props` is now a map over, and so the
+    very grammar `parse_connection_string` reads with; each password value's whole written extent
+    (`MssqlProp::raw`, from its first non-blank character to its `;`, quotes and anything after the
+    closer included) becomes `…`. A value opened with `{` — or with ADO.NET's `"` or `'` — therefore
+    runs to the first closer that is not doubled, `;` and spaces included, so a SQL Server string
     that fails to parse shows none of `password={p;w=d}` or `Password="p;w=d"` in the not-imported
     list — split at each `;`, it showed `w=d}` (`a_braced_password_is_redacted_whole`,
-    `a_quoted_password_is_redacted_whole`).
+    `a_quoted_password_is_redacted_whole`). Every other value is read again by `redact_text`, so a
+    URL or a `.env`-quoted string inside one is still found, to a nesting of `REDACT_DEPTH` (three):
+    a bound, so that no input's nesting makes the redaction anything but linear. What is not a
+    keyword string goes to `redact_url` — its userinfo through `split_userinfo` (below), where one
+    with no `:` is now read by `redact_params` rather than kept, because the ordinary delimiters
+    can sweep a SQL Server URL's `;password=` into a "userinfo"; and on a SQL Server scheme
+    (`is_mssql_scheme`) the tail is cut at its first `;` and the properties go through
+    `redact_keywords` with quoting off, as `parse_mssql_url` reads them. The separator scan leaked
+    on exactly the strings this module refuses: it ended a value at every `&`, so the canonical
+    Connector/NET `Pwd=My&Secret9` showed `&Secret9`, and it looked for an opening quote only where
+    the key shared a part with it, so `Password= "abc;Secret99"` — a space after the `=` — showed
+    `…;Secret99"`. `a_password_is_hidden_for_as_far_as_its_grammar_runs` is seventeen refused
+    inputs, every one of which leaked on that code, and a verbatim round-trip of names that hold no
+    secret.
     **`split_userinfo` is where a URL comes apart, and the order is the whole point.** Everything
     past `://` is cut at the **last `@`** — an email address is an ordinary username — and only then
     is the remainder searched for a path, a `?` or a `#`. Both readers used to do it the other way
@@ -7545,15 +7567,21 @@ existing prose was left alone.
     redacts the name** — it is the render-facing accessor, and every variant carrying text carries
     text a *parser* chose out of the entry, so doing it at the one place both are rendered is what
     stops a fourth variant reopening it (`raw_message` is the unredacted form, and this module's own
-    tests are its only caller). The parameter half of `redacted` also spans separators now: ` ` is
+    tests are its only caller). The parameter half of `redacted` — `redact_params`, now only for
+    what no grammar claims: a skip reason's prose, a URL's path and query, the text inside a
+    keyword string's value — also spans separators: ` ` is
     one of them, so an ODBC-shaped `Pwd = hunter2` — which the paste field invites — put its key, its
     `=` and its value in three different parts and never reached `split_once('=')` with the pair
     together, while the unspaced `Password=hunter2` redacted correctly and hid that. **A redacted
-    bare value runs to the next `;` or `&`, spaces included** (`in_value`): ADO.NET and ODBC values
+    bare value runs to the next `;` — or `&`, once a `?` has opened a query — spaces included**
+    (`in_value`): ADO.NET and ODBC values
     are unquoted up to the `;`, so a space in a password is ordinary, and stopping at the first one
     put `Password=… horse battery` in the not-imported list — for every `Transport`, `BadPort` or
     unknown-driver refusal of such a string
-    (`a_password_holding_spaces_is_redacted_to_the_next_separator`).
+    (`a_password_holding_spaces_is_redacted_to_the_next_separator`). `&` separates a URL's
+    parameters and nothing else; anywhere else it is a password character. The arm that redacts a
+    value arriving in a part of its own — the space after the `=` is what puts it there — asks
+    `opening_quote` as the keyed arm does, since such a value is quoted as often as not.
     A driver this app has no engine for is `Skipped` **by name** rather than bent onto the nearest
     engine: a MySQL connection silently pointed at an Oracle server is a worse answer than an
     honest omission, and the modal says how many were left behind. DBeaver names its engine twice
