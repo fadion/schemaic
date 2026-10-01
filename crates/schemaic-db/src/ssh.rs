@@ -365,6 +365,23 @@ async fn authenticate_agent(
     agent_try(session, user, agent).await
 }
 
+/// Why the tunnel cannot carry a connection to `target_host`, or `None`.
+///
+/// One case: a SQL Server **named instance** (`server\INSTANCE`,
+/// [`schemaic_core::connection::sql_server_instance`]). Its port is SQL
+/// Server Browser's answer over UDP, and the tunnel forwards TCP alone — so
+/// the question cannot be asked through it, and dialled as a name
+/// `server\INSTANCE` resolves to nothing. Refused before the SSH sign-in,
+/// saying how to reach the instance instead.
+pub(crate) fn tunnel_target_refusal(target_host: &str) -> Option<String> {
+    let (server, instance) = schemaic_core::connection::sql_server_instance(target_host)?;
+    Some(format!(
+        "A named instance cannot be reached through an SSH tunnel: SQL Server Browser answers \
+         with its port over UDP, which the tunnel does not carry. Set the host to {server} \
+         without \\{instance} and the port to the one the instance listens on."
+    ))
+}
+
 /// Open an SSH tunnel to `target_host:target_port` and return a handle carrying
 /// the local port a MySQL connection should use. The tunnel forwards connections
 /// until the handle is dropped.
@@ -373,6 +390,9 @@ pub async fn open_tunnel(
     target_host: &str,
     target_port: u16,
 ) -> Result<TunnelHandle, DbError> {
+    if let Some(why) = tunnel_target_refusal(target_host) {
+        return Err(DbError::Connect(why));
+    }
     // Keepalives so a dropped SSH session is detected instead of the local port
     // being reused against a dead tunnel forever (review H9).
     let config = Arc::new(client::Config {
@@ -462,6 +482,26 @@ mod tests {
     use crate::DbError;
     use std::collections::HashMap;
     use std::time::Duration;
+
+    /// **A named instance is refused before the tunnel opens**, saying why —
+    /// its port is SQL Server Browser's answer over UDP — and how to reach it;
+    /// a plain host is the tunnel's to carry. Asked of `open_tunnel` itself,
+    /// so the refusal is the one every caller gets, and before any I/O.
+    #[tokio::test]
+    async fn a_named_instance_is_refused_through_a_tunnel() {
+        let why = super::tunnel_target_refusal("db.corp\\SQLEXPRESS").unwrap();
+        assert!(why.contains("UDP") && why.contains("db.corp"), "{why}");
+        assert!(super::tunnel_target_refusal("db.corp").is_none());
+        let ssh = schemaic_core::connection::SshTunnel {
+            host: "ssh.invalid".into(),
+            ..Default::default()
+        };
+        match super::open_tunnel(&ssh, "db.corp\\SQLEXPRESS", 1433).await {
+            Err(DbError::Connect(m)) => assert_eq!(m, why),
+            Err(e) => panic!("{e}"),
+            Ok(_) => panic!("a tunnel opened to a named instance"),
+        }
+    }
 
     /// A server that accepts the connection and never answers is refused once the
     /// bound passes, naming the phase and the host — not awaited forever.

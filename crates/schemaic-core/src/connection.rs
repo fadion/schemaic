@@ -1101,9 +1101,18 @@ impl Connection {
     /// connection's own name in a narrow list, and a full path is both too long
     /// for it and, on a work machine, often the one part of the row nobody wants
     /// to read out. [`Self::file_label`] is the full path, for places with room.
+    ///
+    /// A SQL Server named instance reads `server\INSTANCE` and no port, which
+    /// it does not use: SQL Server Browser answers with the port
+    /// ([`sql_server_instance`]).
     pub fn endpoint(&self) -> String {
         if is_sqlite(&self.db_type) {
             return file_name(&self.file).to_string();
+        }
+        if is_mssql(&self.db_type)
+            && let Some((server, instance)) = sql_server_instance(&self.host)
+        {
+            return format!("{server}\\{instance}");
         }
         format!("{}:{}", self.host, self.port)
     }
@@ -1876,6 +1885,65 @@ pub fn default_port(db_type: &str) -> u16 {
     }
 }
 
+/// A SQL Server host written `server\INSTANCE` — a **named instance** — as
+/// `(server, instance)`; `None` for a plain host.
+///
+/// The one reading of the spelling, for every place that has to take it
+/// apart: the connect, which asks SQL Server Browser (UDP 1434 on `server`)
+/// for the instance's port and so ignores the Port field; `sqlcmd`'s `-S`,
+/// which does the same lookup itself; and an SSH tunnel, which refuses one,
+/// since the Browser answers over UDP and the tunnel carries TCP. A host is
+/// otherwise a DNS name or an address, neither of which holds a `\`, so
+/// nothing else is read as an instance. Both halves must be there, and the
+/// instance must hold no second `\`.
+pub fn sql_server_instance(host: &str) -> Option<(&str, &str)> {
+    let (server, instance) = host.trim().split_once('\\')?;
+    let (server, instance) = (server.trim(), instance.trim());
+    (!server.is_empty() && !instance.is_empty() && !instance.contains('\\'))
+        .then_some((server, instance))
+}
+
+/// What the connection form says under Host and Port when the host names a
+/// SQL Server instance — that the Port field goes unused — or `None`.
+pub fn named_instance_port_note(db_type: &str, host: &str) -> Option<&'static str> {
+    (is_mssql(db_type) && sql_server_instance(host).is_some()).then_some(
+        "A named instance: SQL Server Browser gives its port, so Port is not used. To skip \
+         the Browser, set the host without the instance and the port it listens on.",
+    )
+}
+
+#[cfg(test)]
+mod instance_tests {
+    use super::{named_instance_port_note, sql_server_instance};
+
+    /// The note is SQL Server's, and only for a host naming an instance.
+    #[test]
+    fn the_port_note_shows_for_a_sql_server_named_instance_alone() {
+        assert!(named_instance_port_note("SQL Server", "db\\SQLEXPRESS").is_some());
+        assert!(named_instance_port_note("SQL Server", "db").is_none());
+        assert!(named_instance_port_note("MySQL", "db\\SQLEXPRESS").is_none());
+    }
+
+    #[test]
+    fn a_named_instance_is_split_into_server_and_instance() {
+        assert_eq!(
+            sql_server_instance("db.corp\\SQLEXPRESS"),
+            Some(("db.corp", "SQLEXPRESS"))
+        );
+        assert_eq!(
+            sql_server_instance("  10.0.0.5\\Reporting "),
+            Some(("10.0.0.5", "Reporting"))
+        );
+    }
+
+    #[test]
+    fn a_plain_host_or_a_half_spelling_is_no_instance() {
+        for host in ["db.corp", "", "\\SQLEXPRESS", "db\\", "db\\a\\b", "::1"] {
+            assert_eq!(sql_server_instance(host), None, "{host:?}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2096,6 +2164,20 @@ mod tests {
         assert_eq!(c.endpoint(), "db.example.com:3307");
         // A server connection has no file to label.
         assert_eq!(c.file_label(), "");
+    }
+
+    /// A SQL Server named instance shows no port: it does not use the one
+    /// saved, SQL Server Browser answering with it. Only on SQL Server — on
+    /// another engine a `\` is no instance, and the host shows as typed.
+    #[test]
+    fn a_named_instance_endpoint_has_no_port() {
+        let mut c = conn();
+        c.db_type = "SQL Server".to_string();
+        c.host = "db\\SQLEXPRESS".to_string();
+        c.port = 1433;
+        assert_eq!(c.endpoint(), "db\\SQLEXPRESS");
+        c.db_type = "MySQL".to_string();
+        assert_eq!(c.endpoint(), "db\\SQLEXPRESS:1433");
     }
 
     /// A SQLite connection has no host and no port, so `host:port` would read

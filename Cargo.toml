@@ -166,7 +166,13 @@ tokio-postgres-rustls = "0.14"
 # SQL and SQL Server 2022 can require. No `chrono`/`time`: values are rendered
 # to text by `db::mssql::cell_value` from the wire types, like the other engines' text
 # paths, so there is no conversion layer in between to lose precision.
-tiberius = { version = "0.13", default-features = false, features = ["tds80", "rustls"] }
+# `sql-browser-tokio` asks SQL Server Browser (UDP 1434) for a named instance's port
+# (`connection::sql_server_instance`); it brings no crate the tree lacks.
+tiberius = { version = "0.13", default-features = false, features = [
+    "tds80",
+    "rustls",
+    "sql-browser-tokio",
+] }
 # The code pages a SQL Server `varchar` column is stored in, so a write can tell
 # before it runs that a character would become `?` (`db::mssql::code_page_fit`).
 # Already in the tree through tiberius and calamine.

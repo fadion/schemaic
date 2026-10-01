@@ -6121,6 +6121,7 @@ dependencies = [
  "secrecy",
  "thiserror 2.0.20",
  "tiberius-macros",
+ "tokio",
  "tokio-rustls",
  "tokio-util",
  "tracing",

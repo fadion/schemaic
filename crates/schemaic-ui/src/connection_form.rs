@@ -1447,8 +1447,27 @@ fn server_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
     // would still claim the column's 20px below the picker.
     .style(move |s| crate::widgets::collapse_unless(s, reads_credentials()));
 
+    // Under Host and Port, a named instance's: Port goes unused, the Browser
+    // answering with it. Hidden, not empty, where there is nothing to say —
+    // an empty label still takes a line and the column's gap.
+    let port_note = move || {
+        schemaic_core::connection::named_instance_port_note(&draft.db_type.get(), &draft.host.get())
+    };
+    let instance_note =
+        label(move || port_note().unwrap_or_default().to_string()).style(move |s| {
+            let s = s
+                .width_full()
+                .font_size(theme::font_hint())
+                .color(theme::text_dim());
+            if port_note().is_none() { s.hide() } else { s }
+        });
+
     v_stack((
-        host_port_row("Host", draft.host, "Port", draft.port, ring.clone(), 60),
+        v_stack((
+            host_port_row("Host", draft.host, "Port", draft.port, ring.clone(), 60),
+            instance_note,
+        ))
+        .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full()),
         database_field,
         auth_picker,
         credentials,

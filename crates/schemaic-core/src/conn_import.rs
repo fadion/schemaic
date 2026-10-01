@@ -127,12 +127,6 @@ pub enum ImportNote {
     /// `same_endpoint` compares the invented number too, so the row can also
     /// collapse against an unrelated one.
     PortAssumed,
-    /// A SQL Server **named instance** (`host\SQLEXPRESS`) with no port. The
-    /// drivers ask SQL Server Browser on UDP 1434 which port it listens on;
-    /// Schemaic does not, so the row carries the default port — which reaches
-    /// the host's *default* instance, if it has one, not the named one — and
-    /// this says to set the instance's port.
-    NamedInstance,
     /// A SQL Server connection that signs in **a way Schemaic does not** — an
     /// Entra method other than `Active Directory Default` (`…Password`,
     /// `…Interactive`, `…Integrated`), or Windows sign-in in a build with no
@@ -154,7 +148,6 @@ impl ImportNote {
             ImportNote::UnexpandedPath => "Path contains an unexpanded macro",
             ImportNote::PasswordFromPgpass => "Password taken from your own .pgpass",
             ImportNote::PortAssumed => "The source named no port; this is the default",
-            ImportNote::NamedInstance => "A named instance: set the port it listens on",
             ImportNote::ExternalLogin => "Signs in a way Schemaic can't: set a SQL login",
         }
     }
@@ -1008,8 +1001,7 @@ pub fn parse_url(input: &str) -> Result<Connection, UrlError> {
     parse_url_noted(input).map(|(c, _)| c)
 }
 
-/// [`parse_url`], with the advisory notes the URL itself warrants — a SQL
-/// Server named instance with no port ([`ImportNote::NamedInstance`]), and a
+/// [`parse_url`], with the advisory notes the URL itself warrants — a
 /// connection string's sign-in Schemaic does not have
 /// ([`ImportNote::ExternalLogin`]).
 ///
@@ -1167,10 +1159,17 @@ fn parse_mssql_url(
             }
         }
     }
+    // `serverName=db\SQLEXPRESS` carries the instance in the property.
+    if let Some((h, i)) = host.clone().split_once('\\') {
+        host = h.to_string();
+        if instance.is_none() {
+            instance = Some(i.to_string()).filter(|i| !i.is_empty());
+        }
+    }
     if host.trim().is_empty() {
         return Err(UrlError::NoHost);
     }
-    c.host = host;
+    c.host = mssql_host(&host, instance.as_deref(), port);
     c.port = port.unwrap_or_else(|| default_port(MSSQL));
     // A named ODBC driver decides what silence means, as it does in a
     // connection string.
@@ -1179,13 +1178,21 @@ fn parse_mssql_url(
         None => verifies_by_default,
     };
     apply_mssql_tls(&mut c, encrypt.as_deref(), trust, verifies_by_default);
-    let mut notes = if instance.is_some() && port.is_none() {
-        vec![ImportNote::NamedInstance]
-    } else {
-        Vec::new()
-    };
+    let mut notes = Vec::new();
     sign_in.apply(&mut c, &mut notes);
     Ok((c, notes))
+}
+
+/// A SQL Server host as a connection keeps it: `server\INSTANCE` for a named
+/// instance the source gave no port for — the connect asks SQL Server Browser
+/// for the port, as the source's driver did
+/// ([`crate::connection::sql_server_instance`]) — and the bare server where it
+/// gave one, which is then the instance's own, reached directly.
+fn mssql_host(server: &str, instance: Option<&str>, port: Option<u16>) -> String {
+    match instance.map(str::trim).filter(|i| !i.is_empty()) {
+        Some(i) if port.is_none() => format!("{}\\{i}", server.trim()),
+        _ => server.trim().to_string(),
+    }
 }
 
 /// The Microsoft drivers' `encrypt` (normalised) and `trustServerCertificate`,
@@ -1354,16 +1361,17 @@ fn parse_connection_string(s: &str) -> Result<(Connection, Vec<ImportNote>), Url
         None => (server, None),
     };
     let (host, instance) = match hostpart.split_once('\\') {
-        Some((h, i)) => (h.trim(), !i.trim().is_empty()),
-        None => (hostpart, false),
+        Some((h, i)) => (h.trim(), Some(i)),
+        None => (hostpart, None),
     };
     if host.is_empty() {
         return Err(UrlError::NoHost);
     }
-    c.host = match host.to_ascii_lowercase().as_str() {
-        "." | "(local)" => "localhost".to_string(),
-        _ => host.to_string(),
+    let host = match host.to_ascii_lowercase().as_str() {
+        "." | "(local)" => "localhost",
+        _ => host,
     };
+    c.host = mssql_host(host, instance, port);
     c.port = port.unwrap_or_else(|| default_port(MSSQL));
     apply_mssql_tls(
         &mut c,
@@ -1372,9 +1380,6 @@ fn parse_connection_string(s: &str) -> Result<(Connection, Vec<ImportNote>), Url
         driver_verifies_by_default(driver.as_deref()),
     );
     let mut notes = Vec::new();
-    if instance && port.is_none() {
-        notes.push(ImportNote::NamedInstance);
-    }
     sign_in.apply(&mut c, &mut notes);
     c.name = suggest_name(&c);
     Ok((c, notes))
@@ -2029,7 +2034,7 @@ pub fn parse_dbeaver(json: &str) -> ImportScan {
         // Start from the JDBC URL when it parses — it is the one field that
         // carries the query parameters — then let the explicit fields win, since
         // DBeaver edits those and rewrites the URL from them.
-        let (mut c, mut notes) = match parse_url_noted(&url) {
+        let (mut c, notes) = match parse_url_noted(&url) {
             Ok((c, notes)) if same_engine(&c.db_type, engine) => (c, notes),
             _ => (blank(engine), Vec::new()),
         };
@@ -2049,14 +2054,13 @@ pub fn parse_dbeaver(json: &str) -> ImportScan {
             }
             dbeaver_handlers(&mut c, cfg);
             // DBeaver keeps a SQL Server named instance in the host field, as
-            // `host\SQLEXPRESS`; with no port of its own it gets the note.
+            // `host\SQLEXPRESS` — Schemaic's own spelling of one, kept where
+            // the entry has no port and reduced to the host where it has.
             if engine == MSSQL
                 && let Some((host, instance)) = c.host.clone().split_once('\\')
             {
-                c.host = host.to_string();
-                if !instance.is_empty() && str_at(cfg, "port").is_none() {
-                    notes.push(ImportNote::NamedInstance);
-                }
+                let port = str_at(cfg, "port").map(|_| c.port);
+                c.host = mssql_host(host, Some(instance), port);
             }
         }
         if !is_sqlite(engine) && c.host.trim().is_empty() {
@@ -3600,16 +3604,23 @@ mod tests {
         assert_eq!(c.database, "shop");
     }
 
-    /// **A named instance has no port of its own to import** — SQL Server
-    /// Browser answers it on 1434, which Schemaic does not ask — so one with
-    /// no port keeps the host and says what to do; one with a port needs no
-    /// Browser, and the port is kept.
+    /// **A named instance with no port is kept as one** — `db\SQLEXPRESS`,
+    /// whose port the connect asks SQL Server Browser for, as the source's
+    /// driver did — in each spelling JDBC has for it, and with no note, there
+    /// being nothing left to set. One with a port needs no Browser: the host
+    /// and the port are kept, and it is reached directly.
     #[test]
-    fn a_sql_server_named_instance_is_imported_with_a_note() {
-        let scan = parse_url_scan("jdbc:sqlserver://db\\SQLEXPRESS;databaseName=d");
-        let found = &scan.found[0];
-        assert_eq!(found.connection.host, "db");
-        assert!(found.has(ImportNote::NamedInstance), "{:?}", found.notes);
+    fn a_sql_server_named_instance_is_imported_as_one() {
+        for jdbc in [
+            "jdbc:sqlserver://db\\SQLEXPRESS;databaseName=d",
+            "jdbc:sqlserver://db;instanceName=SQLEXPRESS;databaseName=d",
+            "jdbc:sqlserver://;serverName=db\\SQLEXPRESS;databaseName=d",
+        ] {
+            let scan = parse_url_scan(jdbc);
+            let found = &scan.found[0];
+            assert_eq!(found.connection.host, "db\\SQLEXPRESS", "{jdbc}");
+            assert!(found.notes.is_empty(), "{jdbc}: {:?}", found.notes);
+        }
         let c = url("jdbc:sqlserver://db\\SQLEXPRESS:50123;databaseName=d");
         assert_eq!((c.host.as_str(), c.port), ("db", 50123));
         let c = url("jdbc:sqlserver://db;instanceName=SQLEXPRESS;portNumber=50124");
@@ -3740,14 +3751,16 @@ mod tests {
         }
     }
 
-    /// The named-instance note, the `.env` wrapper ASP.NET's environment
+    /// A named instance kept as one, the `.env` wrapper ASP.NET's environment
     /// variables use, and the transports Schemaic cannot reach — named pipes
     /// and LocalDB — refused by what they are rather than misread as a host.
     #[test]
     fn an_ado_net_string_notes_what_it_cannot_carry_over() {
         let scan = parse_url_scan("Server=db\\SQLEXPRESS;Database=d");
-        assert_eq!(scan.found[0].connection.host, "db");
-        assert!(scan.found[0].has(ImportNote::NamedInstance));
+        assert_eq!(scan.found[0].connection.host, "db\\SQLEXPRESS");
+        assert!(scan.found[0].notes.is_empty(), "{:?}", scan.found[0].notes);
+        let c = url("Server=.\\SQLEXPRESS;Database=d");
+        assert_eq!(c.host, "localhost\\SQLEXPRESS");
         let c = url("Server=db\\SQLEXPRESS,1500;Database=d");
         assert_eq!((c.host.as_str(), c.port), ("db", 1500));
         let c = url("ConnectionStrings__Default=\"Server=tcp:h;Database=d;User Id=u\"");
@@ -4803,7 +4816,7 @@ mod tests {
 
     /// DBeaver keeps a SQL Server's named instance in its own `host` field, and
     /// a generic data source may be jTDS: both come through as SQL Server, the
-    /// instance split off its host with the note that says to set the port.
+    /// instance kept on its host where the entry names no port.
     #[test]
     fn dbeaver_reads_a_named_instance_and_a_jtds_source() {
         let scan = parse_dbeaver(
@@ -4820,12 +4833,7 @@ mod tests {
             .iter()
             .find(|i| i.connection.name == "Express")
             .unwrap();
-        assert_eq!(express.connection.host, "laptop");
-        assert!(
-            express.has(ImportNote::NamedInstance),
-            "{:?}",
-            express.notes
-        );
+        assert_eq!(express.connection.host, "laptop\\SQLEXPRESS");
         let old = row(&scan, "Old");
         assert!(crate::connection::is_mssql(&old.db_type));
         assert_eq!(
@@ -4991,7 +4999,7 @@ mod tests {
     }
 
     /// DataGrip's SQL Server data sources — Microsoft's driver, and jTDS —
-    /// arrive through the same URL reader, named-instance note included.
+    /// arrive through the same URL reader, a named instance kept as one.
     #[test]
     fn datagrip_reads_its_sql_server_data_sources() {
         let scan = parse_datagrip(
@@ -5014,12 +5022,8 @@ mod tests {
         assert_eq!(books.connection.user, "app");
         assert_eq!(books.connection.tls.mode, SslMode::Require);
         let express = &scan.found[1];
-        assert_eq!(express.connection.host, "laptop");
-        assert!(
-            express.has(ImportNote::NamedInstance),
-            "{:?}",
-            express.notes
-        );
+        assert_eq!(express.connection.host, "laptop\\SQLEXPRESS");
+        assert!(express.notes.is_empty(), "{:?}", express.notes);
     }
 
     #[test]

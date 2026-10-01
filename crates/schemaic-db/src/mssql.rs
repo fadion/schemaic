@@ -74,8 +74,20 @@ async fn config(db: &Db, database: Option<&str>) -> Result<tiberius::Config, DbE
         return Err(DbError::Refused(why.to_string()));
     }
     let mut cfg = tiberius::Config::new();
-    cfg.host(&db.host);
-    cfg.port(db.port);
+    match schemaic_core::connection::sql_server_instance(&db.host) {
+        // **A named instance's port is SQL Server Browser's answer**, asked on
+        // UDP 1434 — so the saved port is not set, or the question goes to it
+        // and times out. The bare server is the host: DNS, the login packet
+        // and the certificate's name all want it without the instance.
+        Some((server, instance)) => {
+            cfg.host(server);
+            cfg.instance_name(instance);
+        }
+        None => {
+            cfg.host(&db.host);
+            cfg.port(db.port);
+        }
+    }
     if let Some(d) = database.or(db.database()) {
         cfg.database(d);
     }
@@ -175,15 +187,25 @@ async fn auth_method(db: &Db) -> Result<tiberius::AuthMethod, DbError> {
 /// over until it expired.
 pub(crate) async fn connect(db: &Db, database: Option<&str>) -> Result<MsClient, DbError> {
     let cfg = config(db, database).await?;
-    let result = match connect_with(cfg.clone()).await {
+    let named = schemaic_core::connection::sql_server_instance(&db.host);
+    let result = match connect_with(cfg.clone(), named.is_some()).await {
         Err(tiberius::error::Error::Routing { host, port }) => {
             let mut routed = cfg;
             routed.host(&host);
             routed.port(port);
-            connect_with(routed).await
+            connect_with(routed, false).await
         }
         other => other,
     };
+    // The Browser's silence — no service, UDP 1434 blocked, or no such
+    // instance, which it does not answer either — in words that say which
+    // three, and the way round it, rather than the driver's.
+    if let (Some((server, instance)), Err(tiberius::error::Error::Conversion(why))) =
+        (named, &result)
+        && why.to_ascii_lowercase().contains("browser")
+    {
+        return Err(DbError::Connect(browser_silent_text(server, instance)));
+    }
     if db.auth == schemaic_core::connection::AuthMode::AzureCli
         && matches!(&result, Err(tiberius::error::Error::Server(t)) if t.code() == 18456)
     {
@@ -207,10 +229,34 @@ pub(crate) async fn connect(db: &Db, database: Option<&str>) -> Result<MsClient,
     result.map_err(|e| connect_err(&e))
 }
 
-async fn connect_with(cfg: tiberius::Config) -> tiberius::Result<MsClient> {
-    let tcp = TcpStream::connect(cfg.get_addr()).await?;
-    tcp.set_nodelay(true)?;
+/// The socket, then the login. `named`: ask SQL Server Browser for the port
+/// first ([`config`] set the instance and no port).
+async fn connect_with(mut cfg: tiberius::Config, named: bool) -> tiberius::Result<MsClient> {
+    let tcp = if named {
+        let tcp = <TcpStream as tiberius::SqlBrowser>::connect_named(&cfg).await?;
+        // **The port the Browser named goes back into the configuration**:
+        // Windows sign-in names the service it signs in to by host and port
+        // (`MSSQLSvc/host:port`), which would otherwise be the Browser's 1434.
+        cfg.port(tcp.peer_addr()?.port());
+        tcp
+    } else {
+        let tcp = TcpStream::connect(cfg.get_addr()).await?;
+        tcp.set_nodelay(true)?;
+        tcp
+    };
     tiberius::Client::connect(cfg, tcp.compat_write()).await
+}
+
+/// What a connect to a named instance says when SQL Server Browser gave no
+/// port: the three reasons it stays silent, and the way to reach the instance
+/// without it.
+fn browser_silent_text(server: &str, instance: &str) -> String {
+    format!(
+        "SQL Server Browser on {server} gave no port for the instance {instance}: the Browser \
+         service is not running, UDP port 1434 is blocked on the way, or no instance there has \
+         that name. If the instance listens on a fixed port, set the host to {server} without \
+         \\{instance} and the port to that one."
+    )
 }
 
 /// A failed connect, in the server's words when it gave any — a wrong
@@ -5166,6 +5212,18 @@ mod write_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A named instance the Browser gave no port for is told the three
+    /// reasons and the way round them, naming the server and the instance.
+    #[test]
+    fn a_silent_browser_names_the_instance_and_the_way_round() {
+        let t = browser_silent_text("db.corp", "SQLEXPRESS");
+        assert!(t.contains("db.corp") && t.contains("SQLEXPRESS"), "{t}");
+        assert!(
+            t.contains("UDP port 1434") && t.contains("fixed port"),
+            "{t}"
+        );
+    }
 
     /// **The account browser asks nothing newer than 2016**, which the schema
     /// load reads: its role lists were gathered with `STRING_AGG`, SQL Server

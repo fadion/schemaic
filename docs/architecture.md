@@ -8025,17 +8025,25 @@ existing prose was left alone.
     against a self-signed server rather than silently against an attacker
     (`sql_server_tls_words_land_on_the_ladder`,
     `a_sql_server_string_silent_on_encryption_takes_its_drivers_default`).
-    **`ImportNote::NamedInstance` is `PortAssumed`'s
-    honesty for a named instance** (`host\SQLEXPRESS`) with no port: the drivers ask SQL Server
-    Browser on UDP 1434 which port it listens on and Schemaic does not, so the row carries 1433 —
-    which reaches the host's *default* instance if it has one, not the named one — and the note says
-    to set the port (`a_sql_server_named_instance_is_imported_with_a_note`). It is the first note a
-    URL can warrant by itself, which is why `parse_url` is now a wrapper over the private
+    **A named instance (`host\SQLEXPRESS`) is imported as one**, through `mssql_host`: kept as
+    `server\INSTANCE` where the source gave no port, so the connect asks SQL Server Browser for it
+    as the source's driver did (under `mssql.rs`), and reduced to the bare server where it gave one
+    — a port given is the instance's own, and the instance is reached directly at it, its name not
+    kept beside it. JDBC's three spellings — the authority's `db\SQLEXPRESS`, an `instanceName`
+    property, and `serverName=db\SQLEXPRESS`, which `parse_mssql_url` now splits too — arrive
+    alike and with no note (`a_sql_server_named_instance_is_imported_as_one`). **There used to be
+    one, `ImportNote::NamedInstance`**, `PortAssumed`'s honesty for an instance with no port:
+    Schemaic asked no Browser, so the row carried 1433 — which reaches the host's *default*
+    instance if it has one, not the named one — and the note said to set the port. With the lookup
+    in the connect nothing is left to set, and the note and its label are gone. It was the first
+    note a URL could warrant by itself, which is why `parse_url` is a wrapper over the private
     `parse_url_noted`, and `parse_url_scan`, the DataGrip reader and the DBeaver reader call the
-    noted form. DBeaver also keeps the instance in its own `host` field (`laptop\SQLEXPRESS`), so its
-    reader splits it off there and notes it when the entry names no port, and its generic-driver
-    fallback strips jTDS's `jtds:` as `parse_url` does
-    (`dbeaver_reads_a_named_instance_and_a_jtds_source`). **`parse_url_noted` refuses any parse
+    noted form; what a URL warrants now is a sign-in Schemaic does not have
+    (`ImportNote::ExternalLogin`, below). DBeaver also keeps the instance in its own `host` field
+    (`laptop\SQLEXPRESS`), so its reader splits it there through the same `mssql_host`, kept where
+    the entry names no port, and its generic-driver fallback strips jTDS's `jtds:` as `parse_url`
+    does (`dbeaver_reads_a_named_instance_and_a_jtds_source`); DataGrip's go through the URL
+    reader (`datagrip_reads_its_sql_server_data_sources`). **`parse_url_noted` refuses any parse
     whose host still holds an `@`**, whatever the grammar — `Server=sa:pw@host` in an ADO.NET string
     as much as a URL — with `UrlError::UserinfoInHost`, which carries nothing, since what it would
     repeat is most likely a password. It is asked once there rather than in each parser, because
@@ -8083,8 +8091,9 @@ existing prose was left alone.
     a query parameter) a flat keyword list does not have
     (`a_repeated_keyword_keeps_the_value_its_driver_uses`). It reads the transport too —
     `np:` named pipes and `(localdb)` are `UrlError::Transport`, since TCP is all Schemaic speaks,
-    while `lpc:`, `.` and `(local)` are this machine and become `localhost`. A named instance with
-    no port takes `NamedInstance` as the URL form does, and the TLS words go through
+    while `lpc:`, `.` and `(local)` are this machine and become `localhost` — `.\SQLEXPRESS` is
+    `localhost\SQLEXPRESS`. A named instance goes through `mssql_host` as the URL form's does
+    (`an_ado_net_string_notes_what_it_cannot_carry_over`), and the TLS words go through
     `apply_mssql_tls`, now the one reading both grammars share. `split_mssql_props` gained a
     `quotes` flag for ADO.NET's `"…"`/`'…'` (a doubled quote standing for one), off for JDBC, which
     has no such quoting — a JDBC password that merely starts with `"` is left alone. **A login
@@ -8261,6 +8270,18 @@ existing prose was left alone.
     would send a TDS handshake to a MySQL port. `read_only_caveat` is the sentence the form puts
     under the Read-only switch on SQL Server alone, since that engine's read-only is a rollback
     rather than a refusal (`db::mssql`).
+    **`sql_server_instance` is the one reading of a named instance** — a SQL Server host written
+    `server\INSTANCE`, split into its two halves, both non-empty and the instance holding no
+    second `\`; anything else is a plain host (`instance_tests`). A DNS name or an address holds no
+    `\`, so nothing else is read as one. Every place that takes a saved host apart asks it (the
+    importers split their sources' own grammars, then write this spelling back): the connect, which asks SQL Server Browser for the port and so leaves the Port field unused
+    (`db::mssql`); `launch::sqlcmd_args`, whose `sqlcmd` does the same lookup itself; and
+    `ssh::open_tunnel`, which refuses one. `named_instance_port_note` is the sentence the form puts
+    under Host and Port when the host names one, on SQL Server alone — *"A named instance: SQL
+    Server Browser gives its port, so Port is not used. To skip the Browser, set the host without
+    the instance and the port it listens on."* — and `endpoint()` follows it, showing
+    `server\INSTANCE` with no port, since the saved one is not what is dialled; on another engine
+    a `\` is no instance and the host shows as typed (`a_named_instance_endpoint_has_no_port`).
     `same_engine` is that pair asked of *two* labels — `MariaDB` and `MySQL` name one engine, as do
     `pg` and `PostgreSQL`, and as do `MySQL` and the empty label that predates the field — so the
     question is not a string comparison. It is what the connection form's Type picker tells its own
@@ -10694,7 +10715,14 @@ existing prose was left alone.
     `sqlcmd` parses (`host\instance`, `host,port`, a `tcp:`/`np:`/`lpc:`/`admin:` prefix), so it is
     forced onto TCP as `-Stcp:host,port` — an IPv6 literal bracketed — and a host holding `,`, `\`
     or `;`, or already carrying one of those prefixes, is refused rather than guessed at
-    (`a_host_sqlcmd_would_reparse_is_refused`). `-I` is always sent: the client's
+    (`a_host_sqlcmd_would_reparse_is_refused`). **A named instance is the one `\` let through**,
+    being `sqlcmd`'s own spelling: `server\INSTANCE` (`connection::sql_server_instance`) goes on as
+    `-Stcp:server\INSTANCE` with no port, since the saved one is not the instance's and ODBC
+    `sqlcmd` 18 asks SQL Server Browser itself — measured, an instance with no Browser behind it
+    answers *Error Locating Server/Instance Specified*, not a syntax error
+    (`a_named_instance_reaches_sqlcmd_without_a_port`). The rest of the refusal still holds around
+    it: a second `\`, a `,`, `;` or `:` in the instance, or a prefix on the server part. `-I` is
+    always sent: the client's
     `QUOTED_IDENTIFIER` default is off, where an index over a computed column is Msg 1934, and every
     Schemaic session has it on. TLS lands on the three things `sqlcmd` can say, each measured:
     `disable` → `-No`, unencrypted; `prefer` and `require` → `-Nm -C`, encrypted with the
@@ -13085,12 +13113,12 @@ existing prose was left alone.
   SQL Database — a created database there is a new billable one — so `master` taking the two
   statements on Azure is the code's word, not a measurement). Still on it:
   sequences, alias types, synonyms and XML schema collections are read into `TsqlObject` for the
-  dump alone (under `dump.rs`), with no tree entry, editor or comparison; a named instance's port
-  is not asked of SQL Server Browser and has to be given (`ImportNote::NamedInstance`, under
-  `conn_import.rs`); and a columnstore, XML or spatial index is read as `IndexInfo::lossy` rather
-  than authored, so a rebuild and a view edit refuse to touch it rather than drop it
-  (`tsql_rebuild_refusals`, `lossy_view_index_refusal`). An index with included columns was on
-  this list too, and is not now: they are read and restated (below). **The refusals are the backstop,
+  dump alone (under `dump.rs`), with no tree entry, editor or comparison; and a columnstore, XML
+  or spatial index is read as `IndexInfo::lossy` rather than authored, so a rebuild and a view
+  edit refuse to touch it rather than drop it (`tsql_rebuild_refusals`,
+  `lossy_view_index_refusal`). An index with included columns was on this list too, and is not
+  now: they are read and restated (below). So was a named instance's port, which had to be given
+  by hand and is now SQL Server Browser's answer (below). **The refusals are the backstop,
   not the gate**: the app is kept off them by
   capabilities, each an exhaustive `match` with `MsSql` on `false`, asked at the UI site that
   offers the thing — chief among them
@@ -13281,6 +13309,38 @@ existing prose was left alone.
   currently available*, rather than holding the login — so that code on an Azure host keeps the
   server's words and gains the same sentence (`azure_unavailable_text`). The bound is on the whole
   config, so the one routing redirect inherits it.
+  **A named instance is reached through SQL Server Browser**, as the Microsoft drivers reach one: a
+  host written `server\INSTANCE` (`connection::sql_server_instance`) is asked of the Browser on UDP
+  1434 for the instance's TCP port, through tiberius's `sql-browser-tokio` — upstream's own
+  feature, switched on in the workspace `Cargo.toml` rather than patched, and bringing no crate
+  the tree lacked. `config` sets `host(server)` and `instance_name(instance)` and **deliberately
+  no `port`**: tiberius sends the Browser's question to the configured port when there is one, so
+  setting the saved port would ask the wrong one and hear nothing. The host is the bare server
+  because DNS, the login packet and the certificate's name check all want it without the
+  instance. `connect_with(cfg, named)` opens the socket through
+  `<TcpStream as tiberius::SqlBrowser>::connect_named` and then **writes the port the Browser
+  named back into the configuration** (`cfg.port(tcp.peer_addr()?.port())`): Windows sign-in
+  names the service it signs in to as `MSSQLSvc/host:port`, built from the configuration's port,
+  which would otherwise be the Browser's 1434. That is reasoned from tiberius's source, not
+  measured — there is no Windows named instance to try it on — so a password sign-in working
+  without the line is no evidence it can go. A routed reconnect (Azure's gateway) passes
+  `named = false`, the redirect naming a host and a port of its own. **The Browser's silence is
+  told in words that say what it means** (`browser_silent_text`): tiberius gives up on it after a
+  second with an `Error::Conversion` mentioning the browser, and the Browser answers nothing
+  alike whether the service is not running, UDP 1434 is blocked on the way, or no instance there
+  has that name — so the text names all three, and the way round them: the bare host and the port
+  the instance listens on (`a_silent_browser_names_the_instance_and_the_way_round`). The match is
+  on the word `browser` in the driver's message, so a re-vendor that rewords it loses the
+  sentence and falls back to the driver's own. Live,
+  `a_named_instance_is_reached_through_sql_server_browser` puts a stand-in responder on UDP
+  `127.0.0.1:1434`, since no container runs the Browser, answering MS-SQLR's `SVR_RESP` with the
+  container's port; the saved port is 1, so a connect that used it would fail, and the instance
+  is `MSSQLSERVER`, the name a default instance accepts in the login's instance check. With the
+  stand-in silenced, the same connect has to name the Browser and the instance. It skips on Azure
+  SQL Database, which has no named instances, and on any host but `127.0.0.1`; the whole leg
+  passed on 2022 and 2025. The two paths that do not come through this connect answer the
+  spelling themselves: `sqlcmd` does its own Browser lookup (`core::launch::sqlcmd_args`), and an
+  SSH tunnel refuses one (`ssh.rs`).
   **`db/entra.rs` is the process half of the Entra sign-in**, the pure half and why it is shaped as
   it is being `core/entra.rs`. **It caches the token in memory**, because every `Db` operation
   opens its own connection (*One connection per operation*) and the CLI takes a second or two to
@@ -14134,6 +14194,14 @@ existing prose was left alone.
   crate's dev-dependencies enable `test-util`). The bound sits inside the function rather than at
   the three call sites — the app's connect, the form's Test button, `cli::run::connect` — so no
   caller has to remember it: while it was the caller's job, two of the three had none.
+  **`open_tunnel` refuses a SQL Server named instance before any I/O** (`tunnel_target_refusal`,
+  its first line): the instance's port is SQL Server Browser's answer over UDP, the tunnel
+  forwards TCP alone, and dialled as a name `server\INSTANCE` resolves to nothing — so the
+  question cannot be asked through it. The refusal says to set the bare host and the port the
+  instance listens on, and sits in `open_tunnel` rather than its callers for the bounds' reason:
+  every caller gets it (`a_named_instance_is_refused_through_a_tunnel`, which asks `open_tunnel`
+  itself). It asks `connection::sql_server_instance` alone, not the engine, so any host spelled
+  that way is refused — on another engine such a host names no server either.
   **PostgreSQL cannot connect without naming a database**, which is protocol rather than
   preference and stayed invisible while almost every server had a `postgres` one anybody could
   reach — so `connect_maintenance` guessed at that, the username and `template1` for server-level
@@ -18000,6 +18068,12 @@ existing prose was left alone.
     server must know that account as a Windows login."*), and Entra says *"Signs in as whoever is
     signed in to the Azure CLI (run `az login` first). The token is fetched when a connection needs
     one and never saved."*
+    **Under the Host/Port row, a SQL Server named instance says Port goes unused**
+    (`connection::named_instance_port_note`, read in `server_fields` from the draft's engine and
+    host): SQL Server Browser answers with the port, so a number left in the field is not what is
+    dialled, and the note says how to skip the Browser — the bare host and the instance's own port.
+    The label is **hidden**, not merely empty, when the note is `None`: an empty label still takes
+    a line and the column's gap.
   - `connection_import.rs` — the **Import Connections** modal, over `core::conn_import` and the
     app's `conn_sources`. Raised from the Manage Connections list ("Import from another client",
     below New connection and quieter than it: it is the first-run action, and the one nobody

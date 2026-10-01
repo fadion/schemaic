@@ -173,6 +173,74 @@ fn base_db() -> Db {
     )
 }
 
+/// **A named instance is reached through SQL Server Browser** — asked on UDP
+/// 1434 for the port, the saved one going unused. No container runs the
+/// Browser, so a stand-in answers on 127.0.0.1:1434 as the service does
+/// (MS-SQLR's `SVR_RESP`), naming the container's own port; the saved port is
+/// a wrong one, so a connect that used it fails. `MSSQLSERVER` is the name a
+/// default instance answers its login's instance check to. And the stand-in
+/// silenced, the connect says which three things the silence means.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_named_instance_is_reached_through_sql_server_browser() {
+    if !enabled() || azure_cannot("Azure SQL Database has no named instances") {
+        return;
+    }
+    let host = var("HOST", "127.0.0.1");
+    if host != "127.0.0.1" {
+        endpoint::note_leg_no_op("mssql", "a stand-in Browser answers on 127.0.0.1 alone");
+        return;
+    }
+    let port: u16 = var("PORT", "1433").parse().expect("a port");
+    let browser = std::sync::Arc::new(
+        tokio::net::UdpSocket::bind("127.0.0.1:1434")
+            .await
+            .expect("UDP 127.0.0.1:1434 is taken, so the stand-in Browser cannot answer"),
+    );
+    let answering = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    {
+        let (browser, answering) = (browser.clone(), answering.clone());
+        tokio::spawn(async move {
+            let data = format!("ServerName;H;InstanceName;MSSQLSERVER;IsClustered;No;tcp;{port};;");
+            let mut reply = vec![0x05];
+            reply.extend((data.len() as u16).to_le_bytes());
+            reply.extend(data.as_bytes());
+            let mut buf = [0u8; 512];
+            while let Ok((_, from)) = browser.recv_from(&mut buf).await {
+                if answering.load(std::sync::atomic::Ordering::SeqCst) {
+                    let _ = browser.send_to(&reply, from).await;
+                }
+            }
+        });
+    }
+    let named = Db::from_parts(
+        Engine::MsSql,
+        format!("{host}\\MSSQLSERVER"),
+        1,
+        var("USER", "sa"),
+        var("PASSWORD", "Schemaic_2026"),
+        String::new(),
+    );
+    let rs = named
+        .fetch_query(None, "SELECT 1", 1, CancellationToken::new())
+        .await
+        .unwrap_or_else(|e| panic!("the named instance was not reached: {e}"));
+    assert_eq!(
+        rs.cell(0, 0).map(|c| c.display().to_string()),
+        Some("1".into())
+    );
+
+    answering.store(false, std::sync::atomic::Ordering::SeqCst);
+    let silent = named
+        .fetch_query(None, "SELECT 1", 1, CancellationToken::new())
+        .await
+        .expect_err("a connect with no port from the Browser");
+    let why = silent.to_string();
+    assert!(
+        why.contains("SQL Server Browser") && why.contains("MSSQLSERVER"),
+        "{why}"
+    );
+}
+
 /// A scratch database for one test, dropped when it goes out of scope —
 /// including when the test panics, which is when a leftover is likeliest.
 struct Scratch {

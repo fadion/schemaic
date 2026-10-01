@@ -416,7 +416,11 @@ pub fn psql_cli_tls_env(tls: &crate::connection::Tls) -> Vec<(String, String)> {
 /// there is no connection-string re-read to refuse, which is the difference
 /// from [`psql_target`]. The host is the one value `sqlcmd` parses
 /// (`host\instance`, `host,port`, a `np:` or `lpc:` prefix), so it is forced
-/// onto TCP with `tcp:` and one that would re-shape the address is refused.
+/// onto TCP with `tcp:` and one that would re-shape the address is refused —
+/// bar a named instance, `server\INSTANCE`
+/// ([`crate::connection::sql_server_instance`]), which is passed on as
+/// `tcp:server\INSTANCE` with no port, `sqlcmd` asking SQL Server Browser for
+/// it as the app's own connect does.
 /// `-I` turns `QUOTED_IDENTIFIER` on, as every Schemaic session has it: the
 /// client's default is off, where an index on a computed column is Msg 1934.
 ///
@@ -447,7 +451,8 @@ pub fn sqlcmd_args(
     const ENTRA: &str = "sqlcmd cannot be handed the Azure CLI's sign-in token, so this \
         connection cannot open in it. Open it in a query tab instead.";
     const HOST: &str = "This connection's host contains a character sqlcmd reads as part of the \
-        address (',', '\\', ';' or a ':' prefix). Set the port in its own field, and open it again.";
+        address (',', ';', a second '\\' or a ':' prefix). Set the port in its own field, and open \
+        it again.";
     const CA: &str = "sqlcmd cannot verify against a CA file. Add the CA to the system's trust \
         store and clear the connection's CA field, or open the connection in a query tab.";
     const CLIENT_CERT: &str = "SQL Server does not sign in with a client certificate, so sqlcmd \
@@ -456,12 +461,20 @@ pub fn sqlcmd_args(
     if tls.uses_client_cert() {
         return Err(CLIENT_CERT);
     }
-    let host = host.trim();
+    // A named instance is `sqlcmd`'s own spelling too — `tcp:server\INSTANCE`,
+    // which it resolves through SQL Server Browser as the connect does — so it
+    // is passed on as one, with no port: the saved one is not the instance's.
+    let instance = crate::connection::sql_server_instance(host);
+    let host = instance.map_or(host.trim(), |(server, _)| server);
     let prefixed = ["tcp:", "np:", "lpc:", "admin:"].iter().any(|p| {
         host.get(..p.len())
             .is_some_and(|s| s.eq_ignore_ascii_case(p))
     });
-    if host.is_empty() || prefixed || host.contains([',', '\\', ';']) {
+    if host.is_empty()
+        || prefixed
+        || host.contains([',', '\\', ';'])
+        || instance.is_some_and(|(_, i)| i.contains([',', ';', ':']))
+    {
         return Err(HOST);
     }
     let host = if host.contains(':') && !host.starts_with('[') {
@@ -469,12 +482,16 @@ pub fn sqlcmd_args(
     } else {
         host.to_string()
     };
+    let address = match instance {
+        Some((_, instance)) => format!("-Stcp:{host}\\{instance}"),
+        None => format!("-Stcp:{host},{port}"),
+    };
     let sign_in = match auth {
         AuthMode::Password => format!("-U{user}"),
         AuthMode::Windows => "-E".to_string(),
         AuthMode::AzureCli => return Err(ENTRA),
     };
-    let mut args = vec![format!("-Stcp:{host},{port}"), sign_in];
+    let mut args = vec![address, sign_in];
     if let Some(db) = database.filter(|d| !d.is_empty()) {
         args.push(format!("-d{db}"));
     }
@@ -1220,9 +1237,28 @@ mod tests {
     /// — so what would re-shape it is refused rather than guessed at.
     #[test]
     fn a_host_sqlcmd_would_reparse_is_refused() {
-        for host in ["h,1500", "h\\SQLEXPRESS", "", "np:h", "h;x"] {
+        for host in [
+            "h,1500",
+            "h\\a\\b",
+            "h\\SQLEXPRESS,1500",
+            "np:h\\SQLEXPRESS",
+            "",
+            "np:h",
+            "h;x",
+        ] {
             assert!(sqlcmd(host, None, SslMode::Require).is_err(), "{host:?}");
         }
+    }
+
+    /// **A named instance is passed on as `sqlcmd` spells one** —
+    /// `tcp:server\INSTANCE`, no port — and `sqlcmd` asks SQL Server Browser
+    /// for the port, as the app's own connect does (measured: ODBC `sqlcmd`
+    /// 18 answers an instance with no Browser behind it *Error Locating
+    /// Server/Instance Specified*, not a syntax error).
+    #[test]
+    fn a_named_instance_reaches_sqlcmd_without_a_port() {
+        let a = sqlcmd("db.corp\\SQLEXPRESS", None, SslMode::Require).unwrap();
+        assert_eq!(a[0], "-Stcp:db.corp\\SQLEXPRESS");
     }
 
     /// Each rung lands on the flags that make `sqlcmd` behave as Schemaic's
