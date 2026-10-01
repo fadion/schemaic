@@ -1401,11 +1401,17 @@ fn sequence_listing(cat: Catalogue) -> String {
 }
 
 /// Every alias type (`CREATE TYPE … FROM`): `(schema, name, base type,
-/// max_length, precision, scale, nullable)`. A table type and a CLR type are
-/// other kinds of object, and not these.
+/// max_length, precision, scale, nullable, bound default, bound rule)`, the
+/// last two the qualified names of what `sp_bindefault`/`sp_bindrule` bound
+/// to it. A table type and a CLR type are other kinds of object, and not
+/// these.
 const ALIAS_TYPE_LISTING: &str = "SELECT SCHEMA_NAME(t.schema_id), t.name, \
             TYPE_NAME(t.system_type_id), t.max_length, t.precision, t.scale, \
-            CAST(t.is_nullable AS int) \
+            CAST(t.is_nullable AS int), \
+            CASE WHEN t.default_object_id <> 0 THEN CONCAT( \
+                 OBJECT_SCHEMA_NAME(t.default_object_id), '.', OBJECT_NAME(t.default_object_id)) END, \
+            CASE WHEN t.rule_object_id <> 0 THEN CONCAT( \
+                 OBJECT_SCHEMA_NAME(t.rule_object_id), '.', OBJECT_NAME(t.rule_object_id)) END \
      FROM sys.types t \
      WHERE t.is_user_defined = 1 AND t.is_table_type = 0 AND t.is_assembly_type = 0 \
      ORDER BY 1, 2";
@@ -2441,8 +2447,9 @@ async fn collect_schema(client: &mut MsClient) -> Result<DbSchema, DbError> {
 
     // The standalone objects a dump creates before the tables that name them.
     let mut tsql_objects = Vec::new();
+    let mut tsql_type_bindings = Vec::new();
     {
-        use schemaic_core::schema::{TsqlObject, TsqlObjectKind};
+        use schemaic_core::schema::{TsqlObject, TsqlObjectKind, TsqlTypeBinding};
         let obj = |r: &[Option<String>], kind| TsqlObject {
             schema: Some(cell(r, 0)),
             name: cell(r, 1),
@@ -2457,6 +2464,15 @@ async fn collect_schema(client: &mut MsClient) -> Result<DbSchema, DbError> {
             ));
         }
         for r in query_rows(client, ALIAS_TYPE_LISTING).await? {
+            let (default, rule) = (r.get(7).cloned().flatten(), r.get(8).cloned().flatten());
+            if default.is_some() || rule.is_some() {
+                tsql_type_bindings.push(TsqlTypeBinding {
+                    schema: Some(cell(&r, 0)),
+                    type_name: cell(&r, 1),
+                    default,
+                    rule,
+                });
+            }
             tsql_objects.push(obj(
                 &r,
                 TsqlObjectKind::AliasType {
@@ -2508,6 +2524,7 @@ async fn collect_schema(client: &mut MsClient) -> Result<DbSchema, DbError> {
         tables,
         routines,
         tsql_objects,
+        tsql_type_bindings,
         flavour: schemaic_core::schema::ServerFlavour::Unknown,
         // Not needed, for PostgreSQL's reason: a foreign key's schema and a
         // view's names are part of the object, not the database's address.

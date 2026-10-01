@@ -2462,6 +2462,50 @@ pub fn plan(
             crate::text::plural(dangling_fks, "key has", "keys have"),
         ));
     }
+    // **An alias type's bound default and rule are not in its `CREATE
+    // TYPE`** — `sp_bindefault`/`sp_bindrule`, deprecated, and restated
+    // nowhere — so the restored columns of that type silently lost their
+    // default and their check. Named for every alias type the file creates.
+    if opts.other_objects {
+        let unbound: Vec<String> = schema
+            .tsql_type_bindings
+            .iter()
+            .filter(|b| {
+                schema.tsql_objects.iter().any(|o| {
+                    o.schema == b.schema
+                        && o.name == b.type_name
+                        && matches!(o.kind, crate::schema::TsqlObjectKind::AliasType { .. })
+                        && (namespaces.contains(&o.schema)
+                            || carried_outside.iter().any(|c| std::ptr::eq(*c, o)))
+                })
+            })
+            .map(|b| {
+                let bound: Vec<String> = [("default", &b.default), ("rule", &b.rule)]
+                    .into_iter()
+                    .filter_map(|(what, name)| name.as_ref().map(|n| format!("{what} {n}")))
+                    .collect();
+                format!(
+                    "{} ({})",
+                    display_name(b.schema.as_deref(), &b.type_name),
+                    bound.join(", ")
+                )
+            })
+            .collect();
+        if !unbound.is_empty() {
+            let n = unbound.len();
+            header.push_str(&format!(
+                "\n--\n-- {n} alias {} here {} a bound default or rule, which its CREATE TYPE cannot\n\
+                 -- restate: the restored columns of {} lose {}. Bind {} again with\n\
+                 -- sp_bindefault/sp_bindrule after the restore: {}.",
+                crate::text::plural(n, "type", "types"),
+                crate::text::plural(n, "carries", "carry"),
+                crate::text::plural(n, "that type", "those types"),
+                crate::text::plural(n, "it", "them"),
+                crate::text::plural(n, "it", "them"),
+                crate::export::comment_text(&unbound.join(", ")),
+            ));
+        }
+    }
     // **Written last, at the head of the file**: what a replay leaves
     // standing is known only once the routines are collected, below.
 
@@ -5712,6 +5756,69 @@ mod tests {
             assert!(pos(&file, made) < procedure, "{made}: {file}");
         }
         assert!(!file.contains("[dbo].[other]"), "{file}");
+    }
+
+    /// **An alias type's bound default and rule are named, since its `CREATE
+    /// TYPE` cannot carry them.** `sp_bindefault`/`sp_bindrule` bindings are
+    /// restated nowhere, so a restored column of the type stored `NULL` where
+    /// the source stores 7 and took a negative value its rule refused
+    /// (measured on 2022), with nothing in the file saying so.
+    #[test]
+    fn an_alias_types_bound_default_and_rule_are_named_in_the_header() {
+        use crate::schema::{TsqlObject, TsqlObjectKind, TsqlTypeBinding};
+        let mut t = table("stock");
+        t.schema = Some("dbo".to_string());
+        t.columns[0].type_name = "[dbo].[Qty]".to_string();
+        let mut s = schema_of(vec![t]);
+        let alias = |name: &str| TsqlObject {
+            schema: Some("dbo".to_string()),
+            name: name.to_string(),
+            kind: TsqlObjectKind::AliasType {
+                base: "int".to_string(),
+                nullable: true,
+            },
+        };
+        s.tsql_objects = vec![alias("Qty"), alias("Plain")];
+        s.tsql_type_bindings = vec![
+            TsqlTypeBinding {
+                schema: Some("dbo".to_string()),
+                type_name: "Qty".to_string(),
+                default: Some("dbo.df_seven".to_string()),
+                rule: Some("dbo.rl_pos".to_string()),
+            },
+            // A type this file does not create says nothing.
+            TsqlTypeBinding {
+                schema: Some("archive".to_string()),
+                type_name: "Old".to_string(),
+                default: Some("archive.df".to_string()),
+                rule: None,
+            },
+        ];
+        let header = text_of(&plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::MsSql,
+        ));
+        assert!(
+            header.contains("1 alias type here carries a bound default or rule")
+                && header.contains("dbo.Qty (default dbo.df_seven, rule dbo.rl_pos)"),
+            "{header}"
+        );
+        assert!(!header.contains("archive.Old"), "{header}");
+        // Without its other objects the file creates no type at all.
+        let header = text_of(&plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions {
+                other_objects: false,
+                ..Default::default()
+            },
+            SqlDialect::MsSql,
+        ));
+        assert!(!header.contains("bound default"), "{header}");
     }
 
     /// **A replay drops no sequence, and nothing the chosen tables do not

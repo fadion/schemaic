@@ -5849,6 +5849,23 @@ pub struct DbSchema {
     /// [`TsqlObject::create_sql`] and its drop — and no surface reads it
     /// otherwise.
     pub tsql_objects: Vec<TsqlObject>,
+    /// **SQL Server's alias types that carry a bound default or rule**
+    /// (`sp_bindefault`/`sp_bindrule`, `sys.types.default_object_id`/
+    /// `rule_object_id`) — what a dump's `CREATE TYPE` does not restate, so
+    /// its header names them. Empty on every other engine.
+    pub tsql_type_bindings: Vec<TsqlTypeBinding>,
+}
+
+/// An alias type's bound default and rule, by their qualified names — the
+/// deprecated bindings a `CREATE TYPE … FROM` cannot carry
+/// ([`DbSchema::tsql_type_bindings`]). Restated nowhere: a restored column
+/// of the type loses its default and its check, so a dump says so.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TsqlTypeBinding {
+    pub schema: Option<String>,
+    pub type_name: String,
+    pub default: Option<String>,
+    pub rule: Option<String>,
 }
 
 /// One of SQL Server's standalone objects a dump must create before what

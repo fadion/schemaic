@@ -2280,6 +2280,7 @@ async fn collect_schema(client: &Client) -> Result<DbSchema, DbError> {
         events: Vec::new(),
         // SQL Server's; PostgreSQL's own are the three lists above.
         tsql_objects: Vec::new(),
+        tsql_type_bindings: Vec::new(),
         // A MySQL-family flavour is meaningless here, and `Unknown` is what
         // makes the emitter withhold MariaDB-specific behaviour rather than
         // assume it.

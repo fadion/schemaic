@@ -1617,6 +1617,34 @@ async fn a_dump_carries_a_type_only_its_routines_name() {
     );
 }
 
+/// **An alias type's bound default and rule are named in the dump.** No
+/// `CREATE TYPE` carries a `sp_bindefault`/`sp_bindrule` binding, so the
+/// restored column of the type stored `NULL` where the source stores 7 and
+/// took a negative value, with nothing in the file saying so.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dump_names_an_alias_types_bound_default_and_rule() {
+    use schemaic_core::dump::DumpOptions;
+    if !enabled() {
+        return;
+    }
+    let src = Scratch::create("dump_bound").await;
+    src.exec("CREATE TYPE dbo.Qty FROM int NULL").await;
+    src.exec("CREATE DEFAULT dbo.df_seven AS 7").await;
+    src.exec("CREATE RULE dbo.rl_pos AS @v >= 0").await;
+    src.exec(
+        "EXEC sp_bindefault N'dbo.df_seven', N'dbo.Qty'; \
+         EXEC sp_bindrule N'dbo.rl_pos', N'dbo.Qty'; \
+         CREATE TABLE dbo.stock (id int PRIMARY KEY, q dbo.Qty);",
+    )
+    .await;
+    let file = Box::pin(dump_file(&src, DumpOptions::default())).await;
+    assert!(
+        file.contains("1 alias type here carries a bound default or rule")
+            && file.contains("dbo.Qty (default dbo.df_seven, rule dbo.rl_pos)"),
+        "{file}"
+    );
+}
+
 /// **A synonym written `db..object` comes back as written.** `PARSENAME`'s
 /// missing schema part was dropped, so the copy's synonym read `[db].[t]` —
 /// schema `db` in the restoring database — and pointed at nothing (Msg 208).

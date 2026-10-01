@@ -3767,7 +3767,13 @@ existing prose was left alone.
     `db..t` has no schema part, and dropping it wrote `[db].[t]`, schema `db` in the restoring
     database, so the copy pointed at nothing or at the wrong object; an empty part between two
     others is written empty (`a_synonyms_missing_middle_part_stays_in_its_place`; live,
-    `a_dump_keeps_a_synonyms_empty_schema_part`).
+    `a_dump_keeps_a_synonyms_empty_schema_part`). An alias type's bound default and rule
+    (`sp_bindefault`/`sp_bindrule`, read by `ALIAS_TYPE_LISTING` into
+    `DbSchema::tsql_type_bindings`) are not restated — deprecated, and no `CREATE TYPE` carries
+    them — so the header names each alias type the file creates that has one, since the restored
+    columns of it silently lost their default and their check
+    (`an_alias_types_bound_default_and_rule_are_named_in_the_header`; live,
+    `a_dump_names_an_alias_types_bound_default_and_rule`).
     None was read, so a table with a `NEXT VALUE FOR` default or an alias-typed column stopped the
     restore at its `CREATE TABLE` (Msg 208/2715) and the header said nothing. They are not put in
     `sequences`/`domains` because those have PostgreSQL's emitters, editor and compare behind them
