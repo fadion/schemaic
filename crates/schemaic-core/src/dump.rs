@@ -5501,7 +5501,8 @@ mod tests {
         );
         let f_view = pos(&file, "CREATE FUNCTION [dbo].[f_view]");
         assert!(pos(&file, "CREATE TABLE [dbo].[base]") < f_view, "{file}");
-        assert!(f_view < pos(&file, "CREATE VIEW dbo.v"), "{file}");
+        // Rebuilt under the catalogue's name, not restated as stored.
+        assert!(f_view < pos(&file, "CREATE VIEW [dbo].[v]"), "{file}");
         assert!(
             pos(&file, "-- Routines and events") < pos(&file, "CREATE FUNCTION [dbo].[f_unused]"),
             "{file}"
