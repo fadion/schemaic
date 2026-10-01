@@ -5119,7 +5119,20 @@ existing prose was left alone.
     in-place arm had no risk at all before. An `IndexInfo::lossy` one (included columns, a
     non-rowstore kind) cannot be built again whole, so `lossy_view_index_refusal`, in
     `unsupported()`, refuses the edit rather than bring the index back as less than it was
-    (`an_indexed_sql_server_views_edit_creates_its_indexes_again`). **What is dropped is the
+    (`an_indexed_sql_server_views_edit_creates_its_indexes_again`). **That refusal covers only
+    what the model knows it missed**: `IndexInfo` has no fill factor, padding, lock options,
+    compression, filegroup, disabled state or description, and `lossy` is set for none of them, so
+    a `PAGE`-compressed or documented index came back without it while the sentence said it was
+    built again. `tsql_view_index_guard` now opens the plan — before the alter or the rename's drop
+    — with the table in-place guard's catalogue `THROW`, over the same predicate
+    (`tsql_index_carries`, shared with `tsql_in_place_guard`) for each index the plan drops and
+    builds again, and the sentence says such an index stops the plan. And `ALTER VIEW` drops the
+    view's hand-made statistics too, which nothing reads; the sentence names that loss as the
+    table rebuild's does (`an_indexed_views_edit_guards_what_its_indexes_cannot_restate`; live,
+    `an_indexed_views_edit_refuses_what_its_indexes_cannot_carry`, 2022 and 2025: the compressed
+    index's edit refused with nothing changed, the statistics gone after an edit that names them).
+    Copy DDL and the dump restate a view's indexes from the same model, as a table's script does,
+    and so without those options. **What is dropped is the
     server's, what is built the draft's**: `ReplaceView::server_indexes` carries `diff_view`'s
     `current` indexes, and the sentence names those, saying which the plan builds again and which
     it does not; the refusal reads both sets. In the editor they are one reading; in a comparison

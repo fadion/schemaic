@@ -5715,12 +5715,19 @@ impl ChangeSet {
                     draft,
                     recreate,
                     replay,
-                    ..
+                    server_indexes,
                 } => {
                     // A replace addresses the view under the name the server
                     // knows; a re-create drops that one and builds the draft's,
                     // which is how a rename comes along for free.
                     let server_name = draft.original.as_deref().unwrap_or(&draft.name);
+                    // Before anything runs: refused where an index it builds
+                    // again carries what the model does not read.
+                    out.extend(tsql_view_index_guard(
+                        &qualified(server_name, draft.schema.as_deref(), d),
+                        draft,
+                        server_indexes,
+                    ));
                     // A SQL Server view's creation-time settings around its
                     // create — `tsql_settings_wrapped`; nothing elsewhere.
                     let settings = &draft.options.tsql.module;
@@ -6875,33 +6882,38 @@ fn view_indexes_rebuilt(v: &ViewDraft, server: &[IndexInfo]) -> Option<String> {
     if dropped.is_empty() {
         return None;
     }
-    let built: Vec<&str> = v
-        .options
-        .tsql
-        .indexes
-        .iter()
-        .filter(|ix| !ix.lossy)
-        .map(|ix| ix.name.as_str())
-        .collect();
+    let built = view_indexes_built_again(v, server);
     let (again, gone): (Vec<&str>, Vec<&str>) = dropped.iter().partition(|n| built.contains(n));
     let it = |n: &[&str]| if n.len() == 1 { "it" } else { "them" };
+    // What the rebuild cannot carry, said where it is built again: the guard
+    // refuses an index that has any of it (`tsql_view_index_guard`).
+    let guarded = if again.is_empty() {
+        ""
+    } else {
+        " An index with a fill factor, compression, padding, lock options, a filegroup or a \
+         description stops the plan before anything changes — Schemaic can't build those again."
+    };
+    // `ALTER VIEW` takes the view's own statistics as well, and nothing here
+    // reads them (measured on SQL Server 2022: `CREATE STATISTICS` on an
+    // indexed view, gone after its alter) — the table rebuild's disclosure.
+    let stats = " Statistics created by hand on the view are not carried over.";
     let tail = if gone.is_empty() {
         format!(
             "and this plan builds {} again after it, in the same transaction. On a large view \
-             that takes as long as building {} did.",
+             that takes as long as building {} did.{guarded}{stats}",
             it(&again),
             it(&again)
         )
     } else if again.is_empty() {
         format!(
             "and this plan does not build {} again: the view it is made to match has no such \
-             index.",
+             index.{stats}",
             it(&gone)
         )
     } else {
         format!(
             "and this plan builds {} again after it, in the same transaction, but not {}, which \
-             the view it is made to match does not have.",
+             the view it is made to match does not have.{guarded}{stats}",
             again.join(", "),
             gone.join(", ")
         )
@@ -6911,6 +6923,84 @@ fn view_indexes_rebuilt(v: &ViewDraft, server: &[IndexInfo]) -> Option<String> {
         v.original.as_deref().unwrap_or(&v.name),
         if dropped.len() == 1 { "" } else { "es" },
         dropped.join(", "),
+    ))
+}
+
+/// What `CREATE INDEX` from the model does not state, for the index `which`
+/// picks out of `sys.indexes i` on the object `@t`: a fill factor, padding,
+/// `IGNORE_DUP_KEY`, row or page locks switched off, a disabled state,
+/// compression, a filegroup or partition scheme other than the default, or
+/// an extended property on it or its constraint. `IndexInfo` reads none of
+/// them. One predicate for the two guards that ask it — the table's in-place
+/// guard and an indexed view's ([`tsql_view_index_guard`]).
+fn tsql_index_carries(which: &str) -> String {
+    format!(
+        "EXISTS (SELECT 1 FROM sys.indexes i WHERE i.object_id = @t AND {which} \
+         AND (i.fill_factor NOT IN (0, 100) OR i.is_padded = 1 OR i.ignore_dup_key = 1 \
+         OR i.allow_row_locks = 0 OR i.allow_page_locks = 0 OR i.is_disabled = 1 \
+         OR EXISTS (SELECT 1 FROM sys.partitions p WHERE p.object_id = @t \
+         AND p.index_id = i.index_id AND p.data_compression <> 0) \
+         OR EXISTS (SELECT 1 FROM sys.data_spaces s WHERE s.data_space_id = i.data_space_id \
+         AND (s.type <> 'FG' OR s.is_default = 0)) \
+         OR EXISTS (SELECT 1 FROM sys.extended_properties e WHERE e.class = 7 \
+         AND e.major_id = @t AND e.minor_id = i.index_id) \
+         OR EXISTS (SELECT 1 FROM sys.key_constraints k JOIN sys.extended_properties e \
+         ON e.class = 1 AND e.major_id = k.object_id WHERE k.parent_object_id = @t \
+         AND k.unique_index_id = i.index_id)))"
+    )
+}
+
+/// The indexes a view edit drops **and builds again** — the server's, by
+/// name, that the draft also has and can restate. The rest are dropped for
+/// good (a comparison's target index the source lacks) or refused
+/// ([`lossy_view_index_refusal`]).
+fn view_indexes_built_again<'a>(v: &ViewDraft, server: &'a [IndexInfo]) -> Vec<&'a str> {
+    server
+        .iter()
+        .filter(|s| {
+            v.options
+                .tsql
+                .indexes
+                .iter()
+                .any(|ix| !ix.lossy && ix.name == s.name)
+        })
+        .map(|ix| ix.name.as_str())
+        .collect()
+}
+
+/// The guard ahead of an indexed view's alter or re-create, or `None` when
+/// it builds no index again: a `THROW` before anything runs where an index
+/// the plan drops and builds again carries what [`IndexInfo`] does not read
+/// ([`tsql_index_carries`]). Rebuilt from the model, such an index came back
+/// uncompressed, at the default fill factor and without its description,
+/// while the preview said it was built again (R2-L8-02) — the table's
+/// in-place guard refuses exactly that for a table's index, and never saw a
+/// view's. `qname` is the view as the server holds it.
+fn tsql_view_index_guard(qname: &str, v: &ViewDraft, server: &[IndexInfo]) -> Option<String> {
+    let again = view_indexes_built_again(v, server);
+    if again.is_empty() {
+        return None;
+    }
+    let cases = again
+        .iter()
+        .map(|ix| {
+            format!(
+                "WHEN {} THEN {}",
+                tsql_index_carries(&format!("i.name = {}", tsql_n(ix))),
+                tsql_n(&format!(
+                    "Redefining the view drops its index {ix}, whose fill factor, padding, \
+                     IGNORE_DUP_KEY, locks, compression, filegroup, disabled state or extended \
+                     properties Schemaic doesn't read, so it can't build it again as it was - \
+                     change the view in SQL"
+                ))
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    Some(format!(
+        "DECLARE @t int = OBJECT_ID({}) DECLARE @why nvarchar(2048) = CASE {cases} END \
+         IF @why IS NOT NULL THROW 50000, @why, 1;",
+        tsql_n(qname)
     ))
 }
 
@@ -7621,24 +7711,7 @@ fn tsql_in_place_guard(q: &str, changes: &[&Change]) -> Option<String> {
         })
         .collect();
 
-    // What `CREATE INDEX` from the model does not state, for the index `which`
-    // picks out of `sys.indexes i`.
-    let index_carries = |which: &str| {
-        format!(
-            "EXISTS (SELECT 1 FROM sys.indexes i WHERE i.object_id = @t AND {which} \
-             AND (i.fill_factor NOT IN (0, 100) OR i.is_padded = 1 OR i.ignore_dup_key = 1 \
-             OR i.allow_row_locks = 0 OR i.allow_page_locks = 0 OR i.is_disabled = 1 \
-             OR EXISTS (SELECT 1 FROM sys.partitions p WHERE p.object_id = @t \
-             AND p.index_id = i.index_id AND p.data_compression <> 0) \
-             OR EXISTS (SELECT 1 FROM sys.data_spaces s WHERE s.data_space_id = i.data_space_id \
-             AND (s.type <> 'FG' OR s.is_default = 0)) \
-             OR EXISTS (SELECT 1 FROM sys.extended_properties e WHERE e.class = 7 \
-             AND e.major_id = @t AND e.minor_id = i.index_id) \
-             OR EXISTS (SELECT 1 FROM sys.key_constraints k JOIN sys.extended_properties e \
-             ON e.class = 1 AND e.major_id = k.object_id WHERE k.parent_object_id = @t \
-             AND k.unique_index_id = i.index_id)))"
-        )
-    };
+    let index_carries = tsql_index_carries;
     let mut reasons: Vec<(String, String)> = Vec::new();
     for col in &restated {
         reasons.push((
@@ -18413,17 +18486,20 @@ mod tests {
         d.select = "SELECT id, d FROM dbo.t WHERE d > 0".into();
         let cs = diff_view(&t, &d, MsSql);
         assert!(cs.unsupported().is_empty(), "{:?}", cs.unsupported());
+        // After the guard `an_indexed_views_edit_guards_what_its_indexes_cannot_restate`
+        // pins.
         let sql = cs.emit();
-        assert_eq!(sql.len(), 3, "{sql:#?}");
+        assert_eq!(sql.len(), 4, "{sql:#?}");
+        assert!(sql[0].starts_with("DECLARE @t"), "{sql:#?}");
         assert!(
-            sql[0].starts_with("CREATE OR ALTER VIEW [dbo].[v]"),
+            sql[1].starts_with("CREATE OR ALTER VIEW [dbo].[v]"),
             "{sql:#?}"
         );
         assert_eq!(
-            sql[1],
+            sql[2],
             "CREATE UNIQUE CLUSTERED INDEX [cix] ON [dbo].[v] ([a]);"
         );
-        assert_eq!(sql[2], "CREATE INDEX [a_nix] ON [dbo].[v] ([b]);");
+        assert_eq!(sql[3], "CREATE INDEX [a_nix] ON [dbo].[v] ([b]);");
         let risks = cs.destructive().join(" ");
         assert!(risks.contains("cix") && risks.contains("a_nix"), "{risks}");
 
@@ -18431,9 +18507,9 @@ mod tests {
         let mut d = ViewDraft::from_table(&t).unwrap();
         d.name = "v2".into();
         let sql = diff_view(&t, &d, MsSql).emit();
-        assert_eq!(sql[0], "DROP VIEW [dbo].[v];");
+        assert_eq!(sql[1], "DROP VIEW [dbo].[v];");
         assert_eq!(
-            sql[2],
+            sql[3],
             "CREATE UNIQUE CLUSTERED INDEX [cix] ON [dbo].[v2] ([a]);"
         );
 
@@ -18512,6 +18588,57 @@ mod tests {
             "{:?}",
             cs.emit()
         );
+        // An index dropped and not built again needs no guard.
+        let sql = diff_view(&target, &ViewDraft::from_table(&source).unwrap(), MsSql).emit();
+        assert!(sql[0].starts_with("CREATE OR ALTER VIEW"), "{sql:#?}");
+    }
+
+    /// **What an indexed view's edit cannot build again is refused or
+    /// said.** The index comes back from `IndexInfo`, which carries no fill
+    /// factor, compression, padding, lock options, filegroup or description,
+    /// so an edit put the view back uncompressed and undocumented and called
+    /// it built again (R2-L8-02): a catalogue guard ahead of the alter now
+    /// refuses where an index carries one, as the table's in-place guard
+    /// does. And `ALTER VIEW` drops the view's hand-made statistics, which
+    /// nothing builds again and the sentence did not name (S6.2-L1-07).
+    #[test]
+    fn an_indexed_views_edit_guards_what_its_indexes_cannot_restate() {
+        let t = ms_indexed_view();
+        let mut d = ViewDraft::from_table(&t).unwrap();
+        d.select = "SELECT id, d FROM dbo.t WHERE d > 0".into();
+        let cs = diff_view(&t, &d, MsSql);
+        let sql = cs.emit();
+        let guard = &sql[0];
+        assert!(
+            guard.starts_with("DECLARE @t int = OBJECT_ID(N'[dbo].[v]')"),
+            "{sql:#?}"
+        );
+        for word in [
+            "N'cix'",
+            "N'a_nix'",
+            "fill_factor",
+            "data_compression",
+            "THROW 50000",
+        ] {
+            assert!(guard.contains(word), "{word}: {guard}");
+        }
+        assert!(sql[1].starts_with("CREATE OR ALTER VIEW"), "{sql:#?}");
+        let risks = cs.destructive().join(" ");
+        assert!(risks.contains("Statistics created by hand"), "{risks}");
+        assert!(risks.contains("fill factor"), "{risks}");
+        // A rename's drop is guarded the same way, under the old name.
+        let mut d = ViewDraft::from_table(&t).unwrap();
+        d.name = "v2".into();
+        let sql = diff_view(&t, &d, MsSql).emit();
+        assert!(sql[0].contains("OBJECT_ID(N'[dbo].[v]')"), "{sql:#?}");
+        assert_eq!(sql[1], "DROP VIEW [dbo].[v];");
+        // A view without indexes has neither.
+        let v = ms_view();
+        let mut d = ViewDraft::from_table(&v).unwrap();
+        d.select = "SELECT 1 AS a, 2 AS b".into();
+        let cs = diff_view(&v, &d, MsSql);
+        assert!(cs.emit()[0].starts_with("CREATE OR ALTER VIEW"));
+        assert!(cs.destructive().is_empty());
     }
 
     /// **A SQL Server table diffs to nothing against its own draft** — the

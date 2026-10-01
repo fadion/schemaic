@@ -3410,6 +3410,81 @@ async fn a_comparison_creates_a_missing_view_with_its_settings_and_indexes() {
     assert!(left.is_empty(), "{left:?}");
 }
 
+/// **An indexed view's edit refuses what its indexes cannot be built again
+/// with, and names the statistics it drops.** The indexes come back from a
+/// model with no fill factor, compression or description, so a `PAGE`
+/// compressed index came back uncompressed while the preview said it was
+/// built again: the plan's guard now refuses it, nothing changed. And
+/// `ALTER VIEW` takes a view's hand-made statistics, which nothing restates:
+/// the sentence says so, and the edit does take them.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_indexed_views_edit_refuses_what_its_indexes_cannot_carry() {
+    use schemaic_core::ddl::{ViewDraft, diff_view};
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("ddl_view_ix_guard").await;
+    s.exec(
+        "CREATE TABLE dbo.t (id int NOT NULL PRIMARY KEY, d int NULL); INSERT dbo.t VALUES (1, 2)",
+    )
+    .await;
+    for v in ["v_pg", "v_st"] {
+        s.exec(&format!(
+            "CREATE VIEW dbo.{v} WITH SCHEMABINDING AS SELECT id, d FROM dbo.t"
+        ))
+        .await;
+    }
+    s.exec("CREATE UNIQUE CLUSTERED INDEX cix ON dbo.v_pg (id) WITH (DATA_COMPRESSION = PAGE)")
+        .await;
+    s.exec("CREATE UNIQUE CLUSTERED INDEX cix ON dbo.v_st (id)")
+        .await;
+    s.exec("CREATE STATISTICS st_d ON dbo.v_st (d)").await;
+    let edit = |v: &schemaic_core::schema::TableInfo| {
+        let mut d = ViewDraft::from_table(v).unwrap();
+        d.select = "SELECT id, d FROM dbo.t WHERE id > 0".into();
+        diff_view(v, &d, MS)
+    };
+
+    let v = read_table(&s, "v_pg").await;
+    let stmts = edit(&v).emit();
+    let err =
+        s.db.run_ddl(&s.name, &stmts, CancellationToken::new())
+            .await
+            .expect_err("a compressed index is refused");
+    assert!(err.to_string().contains("cix"), "{err}");
+    assert_eq!(
+        s.scalar(
+            "SELECT p.data_compression_desc FROM sys.partitions p \
+             WHERE p.object_id = OBJECT_ID('dbo.v_pg') AND p.index_id = 1"
+        )
+        .await,
+        "PAGE",
+        "nothing changed"
+    );
+
+    let v = read_table(&s, "v_st").await;
+    let plan = edit(&v);
+    assert!(
+        plan.destructive()
+            .join(" ")
+            .contains("Statistics created by hand"),
+        "{:?}",
+        plan.destructive()
+    );
+    let stmts = plan.emit();
+    s.db.run_ddl(&s.name, &stmts, CancellationToken::new())
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{stmts:#?}"));
+    assert_eq!(
+        s.scalar(
+            "SELECT STRING_AGG(name, ',') FROM sys.stats WHERE object_id = OBJECT_ID('dbo.v_st')"
+        )
+        .await,
+        "cix",
+        "the index built again, the hand-made statistics gone as the sentence says"
+    );
+}
+
 /// **A comparison's view alter names the target's indexes it drops.** The
 /// risk read the source's view's indexes, so a target's `cix` — which
 /// `ALTER VIEW` drops — went with an empty risk list. Synced, the plan names
