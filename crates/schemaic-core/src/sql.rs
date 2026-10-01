@@ -1341,7 +1341,10 @@ fn scan_bounds(
             continue;
         }
         // Only at the start of a segment — `SELECT delimiter FROM t` is data.
-        if (seg..i).all(|k| b[k].is_ascii_whitespace())
+        // Comments may precede it, as the `mysql` client reads a script: our
+        // own dump opens its trigger section with a `-- Triggers` line right
+        // above the `DELIMITER $$`.
+        if only_comments_between(sql, seg, i, dialect)
             && let Some((end, token)) = delimiter_directive(sql, i, dialect)
         {
             // Mid-script, a directive running to the end of the buffer with no
@@ -1351,6 +1354,12 @@ fn scan_bounds(
             // Leave the whole thing for the next chunk.
             if !at_eof && b.get(end - 1) != Some(&b'\n') {
                 break;
+            }
+            // The comments ahead of it are a segment of their own, which
+            // `is_runnable_segment` drops as comment-only — left in front, they
+            // would hide the directive from it and send `DELIMITER` along.
+            if !(seg..i).all(|k| b[k].is_ascii_whitespace()) {
+                bounds.push(Bound { at: i, strip: 0 });
             }
             // The directive's own segment is dropped whole by
             // `is_runnable_segment`, so there is nothing to strip off it.
@@ -1469,6 +1478,27 @@ fn next_code_word(sql: &str, from: usize, dialect: SqlDialect, at_eof: bool) -> 
         return Lookahead::Pending;
     }
     Lookahead::Word(&sql[j..k])
+}
+
+/// Is `sql[from..to]` nothing but whitespace and comments — where a client
+/// directive may still open a statement?
+///
+/// Comments are found by [`skip_noncode`], the one lexer; a string or a quoted
+/// name is code, so `'x' DELIMITER $$` keeps the word as data.
+fn only_comments_between(sql: &str, from: usize, to: usize, dialect: SqlDialect) -> bool {
+    let b = sql.as_bytes();
+    let mut j = from;
+    while j < to {
+        if b[j].is_ascii_whitespace() {
+            j += 1;
+            continue;
+        }
+        match skip_noncode(b, j, dialect) {
+            Some(k) if matches!(b[j], b'-' | b'/' | b'#') && k <= to => j = k,
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// Trim ASCII whitespace off both ends of `sql[lo..hi]`.
@@ -5539,6 +5569,7 @@ mod tests {
     const SCRIPT: &str = "-- a comment holding a ; semicolon\n\
                           SELECT 'a;b' AS x;\n\
                           INSERT INTO t VALUES (1), (2);\n\
+                          -- Triggers\n\
                           DELIMITER $$\n\
                           CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW\n\
                           BEGIN\n\
@@ -5597,6 +5628,45 @@ mod tests {
                 .iter()
                 .any(|s| s.starts_with("CREATE TRIGGER") && s.ends_with("END$$")),
             "the trigger came out in pieces: {stmts:?}"
+        );
+    }
+
+    /// **A `DELIMITER` a comment line precedes is still a directive**, as the
+    /// `mysql` client reads it. Our own dump opens its trigger and routine
+    /// sections with a `-- Triggers` line directly above the first
+    /// `DELIMITER $$`, and the directive was taken only when nothing but
+    /// whitespace preceded it in the segment — so the comment, the directive
+    /// and the trigger's first statement went to the server as one, the body
+    /// was cut at its first `;`, and every MySQL dump holding a compound
+    /// trigger stopped there with its tables already replaced.
+    #[test]
+    fn a_delimiter_after_a_comment_line_is_still_honoured() {
+        let s = "SELECT 1;\n\n-- Triggers\n\nDELIMITER $$\n\n\
+                 CREATE TRIGGER t BEFORE INSERT ON o FOR EACH ROW\nBEGIN\n  \
+                 SET NEW.a = 1;\n  SET NEW.b = 2;\nEND$$\n\n\
+                 /* routines */ -- and more\n# and a hash one\nDELIMITER ;\n\nSELECT 2;";
+        let stmts = super::executable_statements(s, SqlDialect::MySql);
+        assert_eq!(
+            stmts,
+            vec![
+                "SELECT 1;".to_string(),
+                "CREATE TRIGGER t BEFORE INSERT ON o FOR EACH ROW\nBEGIN\n  \
+                 SET NEW.a = 1;\n  SET NEW.b = 2;\nEND"
+                    .to_string(),
+                "SELECT 2;".to_string(),
+            ]
+        );
+        // The script runner's splitter reads it the same at every block size.
+        for chunk in 1..=s.len() {
+            let got = chunked(s, SqlDialect::MySql, chunk);
+            assert_eq!(got.len(), 3, "at a {chunk}-byte block: {got:?}");
+            assert!(got[1].starts_with("CREATE TRIGGER") && got[1].ends_with("END$$"));
+        }
+        // A comment is not a statement head that makes `delimiter` code:
+        // the word inside a statement is still data.
+        assert_eq!(
+            super::executable_statements("SELECT /* c */ delimiter FROM t;", SqlDialect::MySql),
+            vec!["SELECT /* c */ delimiter FROM t;".to_string()]
         );
     }
 

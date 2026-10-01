@@ -1033,6 +1033,179 @@ async fn column(scratch: &Scratch, sql: &str) -> Vec<String> {
         .collect()
 }
 
+/// **A dump holding a compound trigger and a routine restores into an empty
+/// database through Run file** — `core::dump`'s plan, its rows rendered as the
+/// app's writer renders them, cut by the script splitter and run by
+/// `run_script` — and the restored trigger fires.
+///
+/// On MySQL the trailing sections open with a `-- Triggers` / `-- Routines and
+/// events` comment right above their `DELIMITER $$`, and the splitter took a
+/// directive only after whitespace: the comment, the directive and the body's
+/// first statement went to the server as one, and the restore stopped at
+/// ERROR 1064 with every table already replaced. PostgreSQL runs the same
+/// file shape (a trigger function in the routines section), which no
+/// `DELIMITER` touches, as the control.
+pub async fn a_dump_with_compound_bodies_restores_through_run_file(target: &'static Target) {
+    use schemaic_core::dump::{DumpOptions, DumpStep, plan, render_rows};
+    let src = Scratch::create(target, "dump_compound_src").await;
+    let t = src.qualified("t");
+    let audit = src.qualified("audit");
+    src.exec(&format!(
+        "CREATE TABLE {t} (id INTEGER NOT NULL PRIMARY KEY, s VARCHAR(20))"
+    ))
+    .await;
+    src.exec(&format!("CREATE TABLE {audit} (id INTEGER)"))
+        .await;
+    // A body on the trigger itself, or a function it calls — the leg says
+    // which shape its engine has (see `Target::trigger_body`).
+    if target.trigger_body.is_some() {
+        src.exec(&format!(
+            "CREATE TRIGGER tr_t AFTER INSERT ON {t} FOR EACH ROW BEGIN \
+               INSERT INTO {audit} VALUES (NEW.id); \
+               INSERT INTO {audit} VALUES (NEW.id + 100); END"
+        ))
+        .await;
+        src.exec("CREATE PROCEDURE p_twice() BEGIN SELECT 1; SELECT 2; END")
+            .await;
+    } else {
+        let f = src.qualified("tr_t_fn");
+        src.exec(&format!(
+            "CREATE FUNCTION {f}() RETURNS trigger LANGUAGE plpgsql AS $body$ BEGIN \
+               INSERT INTO {audit} VALUES (NEW.id); \
+               INSERT INTO {audit} VALUES (NEW.id + 100); RETURN NEW; END $body$"
+        ))
+        .await;
+        src.exec(&format!(
+            "CREATE TRIGGER tr_t AFTER INSERT ON {t} FOR EACH ROW EXECUTE FUNCTION {f}()"
+        ))
+        .await;
+    }
+    src.exec(&format!(
+        "INSERT INTO {t} (id, s) VALUES (1, 'a'), (2, 'b')"
+    ))
+    .await;
+
+    // The file, as the app's writer writes it.
+    let dialect = src.dialect();
+    let schema = src
+        .db
+        .fetch_schema(&src.database, CancellationToken::new())
+        .await
+        .expect("the schema");
+    let chosen: Vec<String> = schema
+        .tables
+        .iter()
+        .map(|t| schemaic_core::schema::display_name(t.schema.as_deref(), &t.name))
+        .collect();
+    let dump = plan(
+        &schema,
+        &src.database,
+        &chosen,
+        DumpOptions::default(),
+        dialect,
+    );
+    let mut file = String::new();
+    for step in dump.steps {
+        match step {
+            DumpStep::Text(sql) => {
+                file.push_str(&sql);
+                file.push_str("\n\n");
+            }
+            DumpStep::Rows {
+                database,
+                insert_database,
+                schema,
+                table,
+                select,
+                server,
+            } => {
+                let rs = src
+                    .db
+                    .fetch_query(Some(&database), &select, 10_000, CancellationToken::new())
+                    .await
+                    .expect("the rows");
+                let order: Vec<usize> = (0..rs.row_count()).collect();
+                let mut out = Vec::new();
+                render_rows(
+                    &mut out,
+                    &mut schemaic_core::export::OneChunk::new(&rs, &order),
+                    (&insert_database, schema.as_deref(), &table),
+                    &server,
+                    dialect,
+                )
+                .expect("the rows render");
+                file.push_str(&String::from_utf8(out).expect("UTF-8 rows"));
+                file.push('\n');
+            }
+        }
+    }
+    // What makes the MySQL leg the regression: a comment step right above a
+    // wrapped body.
+    if target.trigger_body.is_some() {
+        assert!(
+            file.contains("-- Triggers\n\nDELIMITER"),
+            "{}: the fixture no longer has the shape it guards: {file}",
+            target.name
+        );
+    }
+
+    // Emptied, then restored the way Run file does it: the splitter, then
+    // `run_script`. Into the database it came from, because a MySQL dump
+    // names it (`CREATE DATABASE IF NOT EXISTS …; USE …;`).
+    src.exec(&format!("DROP TABLE {t}")).await;
+    src.exec(&format!("DROP TABLE {audit}")).await;
+    if target.trigger_body.is_some() {
+        src.exec("DROP PROCEDURE p_twice").await;
+    } else {
+        src.exec(&format!("DROP FUNCTION {}()", src.qualified("tr_t_fn")))
+            .await;
+    }
+    let dst = src;
+    let mut splitter = schemaic_core::script::Splitter::new(dialect);
+    let mut stmts = splitter.push_str(&file);
+    stmts.extend(splitter.finish());
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let feed = tokio::spawn(async move {
+        for s in stmts {
+            if tx.send(s).await.is_err() {
+                break;
+            }
+        }
+    });
+    let (end, _) = dst
+        .db
+        .run_script(&dst.database, rx, CancellationToken::new())
+        .await;
+    feed.await.expect("the feeding task must not panic");
+    assert_eq!(
+        end,
+        ExecEnd::Done,
+        "{}: the dump did not restore:\n{file}",
+        target.name
+    );
+
+    let (dt, daudit) = (dst.qualified("t"), dst.qualified("audit"));
+    assert_eq!(
+        column(&dst, &format!("SELECT id FROM {dt} ORDER BY id")).await,
+        ["1", "2"],
+        "{}: the rows",
+        target.name
+    );
+    // The dump's own rows fire nothing — the trigger is created after them, so
+    // `audit` holds exactly its dumped rows — and the restored trigger fires on
+    // the next insert, both statements of it.
+    dst.exec(&format!("INSERT INTO {dt} (id, s) VALUES (3, 'c')"))
+        .await;
+    assert_eq!(
+        column(&dst, &format!("SELECT id FROM {daudit} ORDER BY id")).await,
+        ["1", "2", "3", "101", "102", "103"],
+        "{}: the restored trigger's whole body",
+        target.name
+    );
+
+    dst.teardown().await;
+}
+
 /// A typo in a Manual-mode tab reports **what the server said**, and the tab is
 /// still usable afterwards.
 ///

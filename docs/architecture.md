@@ -25631,7 +25631,15 @@ Re-introducing the anti-patterns these guard against is a regression:
   machine counts block openers (`BEGIN`, `CASE`) against `END`, so a `CASE … END` inside the body
   can't end it early — the same thing `sqlite3_complete()` does for SQLite's own shell. MySQL and
   PostgreSQL boundaries are deliberately untouched: MySQL's trigger bodies go behind `DELIMITER`.
-  **What Run Everything sends did change, on purpose**, and that is the other half of this
+  **That directive is taken at the start of a segment whose bytes so far are whitespace *and
+  comments*** (`only_comments_between`, over `skip_noncode`), as the `mysql` client reads a script,
+  and the comments ahead of it are cut off into a comment-only segment of their own, which
+  `is_runnable_segment` drops. It was whitespace alone, and the dump opens its trailing sections
+  with a `-- Routines and events` / `-- Triggers` line right above the first `DELIMITER $$`: the
+  comment, the directive and the body's first statement went to the server as one, so every MySQL
+  dump holding a routine or a compound trigger stopped at ERROR 1064 through Run file, its tables
+  already replaced. A string or a quoted name ahead of the word is code, so `SELECT delimiter`
+  stays data. **What Run Everything sends did change, on purpose**, and that is the other half of this
   invariant: a *range* keeps its terminator, because the editor selects and highlights with it, and
   a server must never see the client's `DELIMITER` token — `END$$` lexes as one identifier on MySQL
   and failed every dump carrying a trigger. So the three paths that **execute** go through

@@ -3622,6 +3622,86 @@ mod tests {
         }
     }
 
+    /// **A MySQL dump with a compound trigger and a routine splits back into
+    /// whole statements through the script runner's own splitter.** The
+    /// trailing sections open with a `-- Triggers` / `-- Routines and events`
+    /// comment step directly above their `DELIMITER $$`, and the splitter took a
+    /// directive only after whitespace — so the comment, the directive and the
+    /// body's first statement went to the server as one, and the restore
+    /// stopped there (ERROR 1064) with every table already replaced. The text
+    /// is rendered the way the app's writer does (`"{sql}\n\n"` per step).
+    #[test]
+    fn a_mysql_dump_with_compound_bodies_splits_back_into_whole_statements() {
+        let audit = table("audit");
+        let mut t = table("orders");
+        t.triggers.push(TriggerInfo {
+            name: "orders_ai".to_string(),
+            table: "orders".to_string(),
+            timing: TriggerTiming::After,
+            events: vec![TriggerEvent::Insert],
+            action: TriggerAction::Body(
+                "BEGIN INSERT INTO audit VALUES (NEW.id); INSERT INTO audit VALUES (NEW.id + 100); END"
+                    .to_string(),
+            ),
+            ..Default::default()
+        });
+        let mut s = schema_of(vec![t, audit]);
+        s.routines
+            .push(std::sync::Arc::new(crate::schema::RoutineInfo {
+                name: "p_twice".to_string(),
+                kind: crate::schema::RoutineKind::Procedure,
+                body: "BEGIN SELECT 1; SELECT 2; END".to_string(),
+                ..Default::default()
+            }));
+        let p = plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::MySql,
+        );
+        let mut text = String::new();
+        for step in &p.steps {
+            match step {
+                DumpStep::Text(t) => text.push_str(&format!("{t}\n\n")),
+                DumpStep::Rows { table, .. } => {
+                    text.push_str(&format!("INSERT INTO {table} VALUES (1);\n\n"))
+                }
+            }
+        }
+        assert!(text.contains("-- Triggers"), "{text}");
+        for block in [7usize, 64, 4096] {
+            let mut sp = crate::script::Splitter::new(SqlDialect::MySql);
+            let mut stmts = Vec::new();
+            for piece in text.as_bytes().chunks(block) {
+                stmts.extend(sp.push(piece));
+            }
+            stmts.extend(sp.finish());
+            for st in &stmts {
+                assert!(
+                    !st.sql
+                        .lines()
+                        .any(|l| l.trim_start().to_ascii_uppercase().starts_with("DELIMITER")),
+                    "a directive reached the server at a {block}-byte block: {:?}",
+                    st.sql
+                );
+            }
+            let whole = |needle: &str, tail: &str| {
+                stmts
+                    .iter()
+                    .any(|st| st.sql.contains(needle) && st.sql.contains(tail))
+            };
+            assert!(
+                whole("orders_ai", "NEW.id + 100); END"),
+                "the trigger came out in pieces at a {block}-byte block: {stmts:#?}"
+            );
+            assert!(
+                whole("p_twice", "SELECT 2; END"),
+                "the routine came out in pieces at a {block}-byte block: {stmts:#?}"
+            );
+        }
+    }
+
     // ── plan: the scaffolding, and the one composition that can be wrong ─────
 
     #[test]
