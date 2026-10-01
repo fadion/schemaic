@@ -84,8 +84,11 @@ enum Kind {
     LineComment,
     BlockComment,
     Punct,
-    /// A client directive that owns its whole line — SQL Server's `GO`.
+    /// A client directive that owns its whole line — SQL Server's `GO`,
+    /// MySQL's `DELIMITER`.
     Directive,
+    /// The statement terminator a MySQL `DELIMITER` set, in place of `;`.
+    Terminator,
 }
 
 use crate::sql::is_word_byte;
@@ -248,15 +251,56 @@ fn sigil_len(b: &[u8], i: usize, dialect: SqlDialect) -> usize {
     }
 }
 
+/// Does the next token begin a statement — is the last one before it, comments
+/// aside, the statement terminator in force (`delim`, or `;` when that is
+/// `None`), a directive, or nothing at all?
+fn at_statement_start(toks: &[(Kind, &str)], delim: Option<&str>) -> bool {
+    match toks
+        .iter()
+        .rev()
+        .find(|(k, _)| !matches!(k, Kind::LineComment | Kind::BlockComment))
+    {
+        None => true,
+        Some((Kind::Directive | Kind::Terminator, _)) => true,
+        Some((Kind::Punct, ";")) => delim.is_none(),
+        Some(_) => false,
+    }
+}
+
 fn tokenize(sql: &str, dialect: SqlDialect) -> Vec<(Kind, &str)> {
     let b = sql.as_bytes();
     let n = b.len();
-    let mut toks = Vec::new();
+    let mut toks: Vec<(Kind, &str)> = Vec::new();
+    // The terminator a MySQL `DELIMITER` set, while it is not `;`.
+    let mut delim: Option<String> = None;
     let mut i = 0;
     while i < n {
         let c = b[i];
         if c.is_ascii_whitespace() {
             i += 1;
+            continue;
+        }
+        // **A `DELIMITER` line is the client's, like `GO`**, and only where a
+        // statement begins — after the current terminator, a directive or
+        // nothing, comments aside — which is where `sql::statement_ranges`
+        // takes one. Read as SQL it came out `DELIMITER $ $`, joined to the
+        // statement after it. One verbatim line; `None` off MySQL.
+        if matches!(c, b'd' | b'D')
+            && at_statement_start(&toks, delim.as_deref())
+            && let Some((end, token)) = crate::sql::delimiter_directive(sql, i, dialect)
+        {
+            toks.push((Kind::Directive, sql[i..end].trim_end()));
+            delim = (token != ";").then_some(token);
+            i = end;
+            continue;
+        }
+        // The terminator it set ends a statement as `;` does, and is one
+        // token — `//` spaced to `/ /` is no terminator at all.
+        if let Some(d) = &delim
+            && b[i..].starts_with(d.as_bytes())
+        {
+            toks.push((Kind::Terminator, &sql[i..i + d.len()]));
+            i += d.len();
             continue;
         }
         // **A `GO` line is the client's batch separator, not SQL**, and is one
@@ -353,8 +397,14 @@ fn tokenize(sql: &str, dialect: SqlDialect) -> Vec<(Kind, &str)> {
         if is_word_byte(c) || prefix > 0 {
             let s = i;
             i += prefix.max(1);
-            // `continues_name`, so `h#` and `f@x` stay whole on T-SQL.
-            while i < n && crate::sql::continues_name(b[i], dialect) {
+            // `continues_name`, so `h#` and `f@x` stay whole on T-SQL — up to
+            // a `DELIMITER`'s terminator, which `END$$` ends in.
+            while i < n
+                && crate::sql::continues_name(b[i], dialect)
+                && !delim
+                    .as_ref()
+                    .is_some_and(|d| b[i..].starts_with(d.as_bytes()))
+            {
                 i += 1;
             }
             // **A literal's prefix is part of the literal**, so the two are one
@@ -745,6 +795,13 @@ impl<'a> Fmt<'a> {
                     self.blank = true;
                     self.break_to(0);
                 }
+                Kind::Terminator => {
+                    // Tight against the statement, as `;` is — unless it is
+                    // spelled in word bytes and would run into a word.
+                    let tight = !text.as_bytes().first().is_some_and(|&c| is_word_byte(c));
+                    self.emit(kind, text, tight);
+                    self.end_statement();
+                }
                 Kind::Word => {
                     let up = text.to_ascii_uppercase();
                     let in_expr = self.in_expr_paren();
@@ -824,13 +881,7 @@ impl<'a> Fmt<'a> {
                     }
                     ";" => {
                         self.emit(Kind::Punct, ";", true);
-                        self.base = 0;
-                        self.content = 0;
-                        self.parens.clear();
-                        self.suppress_and = false;
-                        self.prev = None;
-                        self.blank = true;
-                        self.break_to(0);
+                        self.end_statement();
                     }
                     "-" | "+" => {
                         let unary = match &self.prev {
@@ -851,6 +902,18 @@ impl<'a> Fmt<'a> {
             }
             k += 1;
         }
+    }
+
+    /// A statement's terminator was just written: the next one starts afresh
+    /// at the margin, after a blank line.
+    fn end_statement(&mut self) {
+        self.base = 0;
+        self.content = 0;
+        self.parens.clear();
+        self.suppress_and = false;
+        self.prev = None;
+        self.blank = true;
+        self.break_to(0);
     }
 
     fn is_join_break(&self, up: &str) -> bool {
@@ -1448,6 +1511,56 @@ mod tests {
         // Elsewhere `go` is only a word.
         let mysql = super::format_sql("SELECT 1\nGO\n", IND, SqlDialect::MySql);
         assert!(!mysql.lines().any(|l| l == "GO"), "{mysql}");
+    }
+
+    /// **A MySQL `DELIMITER` line is the client's, and passes through verbatim
+    /// on a line of its own.** Read as SQL, `DELIMITER $$` came out
+    /// `DELIMITER $ $` joined to the `CREATE` after it, `END$$` and the
+    /// `DELIMITER ;` line were run together, and `//` was split into `/ /` —
+    /// a script no client could split any more. The terminator it sets ends a
+    /// statement the way `;` does.
+    #[test]
+    fn a_mysql_delimiter_line_survives_formatting() {
+        let d = SqlDialect::MySql;
+        for (sql, lines) in [
+            (
+                "DELIMITER $$\nCREATE PROCEDURE p() BEGIN SELECT 1; END$$\nDELIMITER ;\nSELECT 2;\n",
+                &["DELIMITER $$", "DELIMITER ;"][..],
+            ),
+            (
+                "delimiter //\ncreate trigger tr before insert on t for each row \
+                 begin set new.a=1; end //\nDELIMITER ;\nselect 1;",
+                &["delimiter //", "DELIMITER ;"],
+            ),
+            (
+                "SELECT 1;\n-- routines\nDELIMITER ;;\nCREATE FUNCTION f() RETURNS INT RETURN 1;;\n\
+                 CREATE FUNCTION g() RETURNS INT RETURN 2;;\nDELIMITER ;\n",
+                &["DELIMITER ;;", "DELIMITER ;"],
+            ),
+        ] {
+            let out = super::format_sql(sql, IND, d);
+            for l in lines {
+                assert!(
+                    out.lines().any(|x| x == *l),
+                    "{l:?} not on its own line:\n{out}"
+                );
+            }
+            assert!(!out.contains("/ /") && !out.contains("$ $"), "{out}");
+            assert_eq!(
+                crate::sql::executable_statements(&out, d),
+                crate::sql::executable_statements(sql, d)
+                    .iter()
+                    .map(|s| super::format_sql(s, IND, d))
+                    .collect::<Vec<_>>(),
+                "{out}"
+            );
+            assert_eq!(super::format_sql(&out, IND, d), out, "not idempotent");
+        }
+        // Mid-statement, and on other engines, the word is only a word.
+        let out = super::format_sql("SELECT delimiter FROM t", IND, d);
+        assert!(out.contains("delimiter"), "{out}");
+        let pg = super::format_sql("DELIMITER $$\nSELECT 1;", IND, SqlDialect::Postgres);
+        assert!(!pg.lines().any(|l| l == "DELIMITER"), "{pg}");
     }
 
     /// **A T-SQL variable, system function or temporary table is one token.**

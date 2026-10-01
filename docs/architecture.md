@@ -10098,7 +10098,15 @@ existing prose was left alone.
     layout state as a `;` does, the next batch starting after a blank line. `go_directive` answers
     `None` on every other dialect, so there `go` is still a word
     (`a_sql_server_go_line_survives_formatting`, which asserts the formatted script splits into the
-    original's statements, each formatted).
+    original's statements, each formatted). **MySQL's `DELIMITER` line is the same kind of token**,
+    and was read as SQL: `DELIMITER $$` came out `DELIMITER $ $` joined to the `CREATE` after it,
+    `END$$` and the `DELIMITER ;` line ran together, and `//` split into `/ /` — a script no client
+    could split. `tokenize` asks `sql::delimiter_directive` (`pub(crate)` for this) only where a
+    statement begins (`at_statement_start`: after the terminator in force, a directive or nothing,
+    comments aside — where `statement_ranges` takes one), keeps the line verbatim, and while the
+    terminator it set is not `;` reads it as one `Kind::Terminator`, which a word stops at (`END$$`)
+    and `run` treats as `;` (`end_statement`), written tight unless spelled in word bytes
+    (`a_mysql_delimiter_line_survives_formatting`, by the same split-and-compare, and idempotent).
     **A T-SQL `@x`, `@@ROWCOUNT`, `#t` or `##g` is one `Kind::Word`.** `@` and `#` fell to the
     operator arm and `need_space` separated them from their name, so one Format Code broke nearly
     every T-SQL script: `SELECT @ x` is Msg 137, `SELECT @ @ VERSION` and `CREATE TABLE # t` are

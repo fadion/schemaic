@@ -840,8 +840,13 @@ pub fn find_code(hay: &str, needle: &str, dialect: SqlDialect) -> Option<usize> 
 /// semicolons, so `mysqldump` and every hand-written trigger script switch the
 /// terminator around them; a splitter that doesn't know the word cuts such a
 /// script into fragments that are each a syntax error. It is recognised only at
-/// the start of a statement, so `SELECT delimiter FROM t` is untouched.
-fn delimiter_directive(sql: &str, i: usize, dialect: SqlDialect) -> Option<(usize, String)> {
+/// the start of a statement, so `SELECT delimiter FROM t` is untouched — the
+/// caller's question, which the formatter asks too (`sqlfmt::tokenize`).
+pub(crate) fn delimiter_directive(
+    sql: &str,
+    i: usize,
+    dialect: SqlDialect,
+) -> Option<(usize, String)> {
     if !dialect.delimiter_directive() {
         return None;
     }
