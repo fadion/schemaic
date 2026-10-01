@@ -4173,10 +4173,10 @@ mod engine_comparison_gate {
     const ADMITTED: &[(&str, usize, &str)] = &[
         (
             "account_editor.rs",
-            2,
-            "Account-name grammar. MySQL identifies an account as `user@host` \
-             and the other two do not, so the host field and the \
-             Database/Schema label are shape, not capability.",
+            1,
+            "Account-name grammar: the Database/Schema label is shape, not \
+             capability. 2 → 1: the host field asks \
+             `users::accounts_have_hosts` where it asked `== MySql`.",
         ),
         // ── schemaic-core ───────────────────────────────────────────────────
         //
@@ -4206,12 +4206,12 @@ mod engine_comparison_gate {
         ),
         (
             "schemaic-core/ddl.rs",
-            16,
-            "Five of the sixteen are in the capability definitions the \
+            15,
+            "Five of the fifteen are in the capability definitions the \
              rest of the app asks — `requires_named_checks`, \
              `requires_rowid_key`, `strict_type_allowed`, and two in \
              `supports_change` — and a comparison is how they answer. The \
-             other eleven are DDL grammar \
+             other ten are DDL grammar \
              inside the emitters and validators (`create_view_sql`, \
              `create_table_sql`, `client_script`'s `DELIMITER`, \
              `repoint_check_column`, the drafts' `validate`), where the engines \
@@ -4232,7 +4232,9 @@ mod engine_comparison_gate {
              whose `else` had been validating SQL Server's triggers as MySQL's. \
              17 → 16, with SQL Server's table rebuild: `diff` asks \
              `rebuilds_tables` where it asked `== Sqlite`, which would have \
-             kept the rebuild SQLite's alone.",
+             kept the rebuild SQLite's alone. 16 → 15: a new account's \
+             `host is %` sentence asks `users::accounts_have_hosts` where it \
+             asked `== MySql`.",
         ),
         (
             "schemaic-core/filter.rs",

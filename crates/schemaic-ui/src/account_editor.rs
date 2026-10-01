@@ -711,7 +711,7 @@ fn account_form(
     // absent rather than dimmed, the same call every per-engine field in this
     // crate makes. Asked as a property of the account rather than of the engine:
     // a role has no host on either.
-    let hosts = target.dialect == SqlDialect::MySql;
+    let hosts = schemaic_core::users::accounts_have_hosts(target.dialect);
     if hosts && kind == PrincipalKind::User {
         rows.push(
             form_setting(

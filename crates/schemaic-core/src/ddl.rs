@@ -4193,9 +4193,10 @@ impl Change {
                         d.principal(dialect).display()
                     ));
                 }
-                // The host is MySQL's alone, and blank means `%` — the form's
-                // own placeholder says so, but only next to the empty box.
-                if dialect == SqlDialect::MySql
+                // The host is MySQL's alone (`users::accounts_have_hosts`), and
+                // blank means `%` — the form's own placeholder says so, but only
+                // next to the empty box.
+                if crate::users::accounts_have_hosts(dialect)
                     && matches!(d.host.trim(), "" | "%")
                     && d.password.is_empty()
                 {
@@ -32360,6 +32361,34 @@ mod database_tests {
             .summary(),
             "Create role readers"
         );
+    }
+
+    /// **The host sentence, the principal's host and the form's field are one
+    /// capability's answer** (`users::accounts_have_hosts`), asked on every
+    /// engine — the sentence spelled `dialect == MySql`, the shape a fourth
+    /// engine falls through. Where accounts have hosts a blank one is `%` and
+    /// said to be; elsewhere neither.
+    #[test]
+    fn a_blank_host_is_percent_and_said_to_be_only_where_accounts_have_hosts() {
+        use crate::users::{AccountDraft, accounts_have_hosts};
+        let draft = AccountDraft {
+            name: "app".into(),
+            ..Default::default()
+        };
+        for d in [MySql, Postgres, SqlDialect::MsSql, Sqlite] {
+            let hosts = accounts_have_hosts(d);
+            assert_eq!(
+                draft.principal(d).host.as_deref(),
+                hosts.then_some("%"),
+                "{d:?}"
+            );
+            let said = account("app", d, Change::CreateAccount(Box::new(draft.clone())))
+                .destructive()
+                .iter()
+                .any(|r| r.contains("host is %"));
+            assert_eq!(said, hosts, "{d:?}");
+        }
+        assert!(accounts_have_hosts(MySql));
     }
 
     /// **A blank password is the highest-consequence thing this module emits,

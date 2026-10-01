@@ -1930,12 +1930,14 @@ impl AccountDraft {
             // A role has no host on either engine's `CREATE ROLE`, and MySQL
             // fills one in itself; carrying `None` keeps `account_sql` from
             // writing an `@'%'` the statement must not have.
-            host: match (dialect, self.kind) {
-                (SqlDialect::MySql, PrincipalKind::User) => Some(if self.host.trim().is_empty() {
-                    "%".to_string()
-                } else {
-                    self.host.trim().to_string()
-                }),
+            host: match self.kind {
+                PrincipalKind::User if accounts_have_hosts(dialect) => {
+                    Some(if self.host.trim().is_empty() {
+                        "%".to_string()
+                    } else {
+                        self.host.trim().to_string()
+                    })
+                }
                 _ => None,
             },
             kind: self.kind,
@@ -2492,6 +2494,25 @@ pub fn drop_user_cuts_off_sessions(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MsSql => true,
         SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+    }
+}
+
+/// Is a user here **scoped to a host** — an account the `(user, host)` pair,
+/// as [`Principal::host`] describes, with a blank host meaning `%`?
+///
+/// MySQL's and MariaDB's are: `'app'@'%'` and `'app'@'localhost'` are two
+/// accounts, and a `CREATE USER` with no host is the one every machine on the
+/// network can sign in as. PostgreSQL's roles, SQL Server's logins and users
+/// and SQLite (no accounts at all) have no host part. What decides whether the
+/// form offers a host, whether a draft's principal carries one
+/// ([`AccountDraft::principal`]), and whether the preview says a blank one is
+/// `%` ([`crate::ddl::Change::risks`]) — asked rather than spelled as
+/// `dialect == MySql` at each, which sorts a fourth engine onto whichever side
+/// that comparison happens to put it.
+pub fn accounts_have_hosts(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MySql => true,
+        SqlDialect::Postgres | SqlDialect::MsSql | SqlDialect::Sqlite => false,
     }
 }
 

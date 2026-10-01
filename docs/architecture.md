@@ -4145,7 +4145,11 @@ existing prose was left alone.
     `WITHOUT LOGIN` user cannot sign in, an Entra user is Entra's, and the sentence's advice — set
     one "with ALTER USER afterwards" — is Msg 33234 outside a contained database (measured on 2022
     and 2025). It had sat on every SQL Server user, the companion user the New account form brings
-    by default included, so the engine's commonest plan previewed a false alarm.
+    by default included, so the engine's commonest plan previewed a false alarm. **The host sentence
+    is asked the same way** (`users::accounts_have_hosts`, MySQL's alone), and so are the draft's
+    principal (`AccountDraft::principal`, which writes `%` for a blank host) and the form's Host
+    field — the three had been `dialect == SqlDialect::MySql` each, the shape a fourth engine falls
+    through (`a_blank_host_is_percent_and_said_to_be_only_where_accounts_have_hosts`).
     **One grant carries a consequence too, where no grant carried one at all.** Every arm above
     describes what a plan takes away or rewrites; a `GrantPrivileges` whose level is
     `GrantLevel::Global` is the case where what it *gives* is the risk. `GRANT DROP ON *.*` reaches
