@@ -7002,6 +7002,84 @@ async fn a_retype_is_refused_where_a_dependent_carries_what_it_would_drop() {
     }
 }
 
+/// **A computed column rebuilt around a rename is refused where it carries
+/// what `DROP COLUMN` takes** (S2-L5-03): renaming `salary` drops and re-adds
+/// `annual AS (salary * 12)`, and a `DENY SELECT` on `annual` went with it —
+/// the plan succeeded and the denied user read the column. A column `GRANT`
+/// and an extended property other than its description go the same way (a
+/// sensitivity classification cannot stand on a computed column, Msg 16111).
+/// One table per case, each refused naming the column and left as it was;
+/// one carrying only its description, which the plan puts back, still
+/// renames.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rebuilt_computed_column_is_refused_where_it_carries_what_the_drop_takes() {
+    use schemaic_core::ddl::TableDraft;
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("computed_guard").await;
+    s.exec("CREATE USER u_reader WITHOUT LOGIN").await;
+    let cases: [(&str, &str); 4] = [
+        (
+            "c_deny",
+            "GRANT SELECT ON dbo.c_deny TO u_reader; \
+             DENY SELECT ON dbo.c_deny (annual) TO u_reader",
+        ),
+        (
+            "c_grant",
+            "GRANT SELECT ON dbo.c_grant (annual) TO u_reader",
+        ),
+        (
+            "c_prop",
+            "EXEC sp_addextendedproperty N'Owner', N'payroll', N'SCHEMA', N'dbo', \
+             N'TABLE', N'c_prop', N'COLUMN', N'annual'",
+        ),
+        (
+            "c_doc",
+            "EXEC sp_addextendedproperty N'MS_Description', N'yearly', N'SCHEMA', N'dbo', \
+             N'TABLE', N'c_doc', N'COLUMN', N'annual'",
+        ),
+    ];
+    for (table, setup) in cases {
+        s.exec(&format!(
+            "CREATE TABLE dbo.{table} (id int PRIMARY KEY, salary int, annual AS (salary * 12)); \
+             INSERT dbo.{table} (id, salary) VALUES (1, 1000)"
+        ))
+        .await;
+        s.exec(setup).await;
+        let t = read_table(&s, table).await;
+        let mut d = TableDraft::from_table(&t);
+        d.columns[1].info.name = "base_salary".into();
+        if table == "c_doc" {
+            apply_draft(&s, &t, &d).await;
+            assert_eq!(
+                read_table(&s, table).await.columns[2].comment.as_deref(),
+                Some("yearly")
+            );
+            continue;
+        }
+        let refused = refused_draft(&s, &t, &d).await;
+        assert!(
+            refused.contains("computed column annual would drop its permissions"),
+            "{table}: {refused}"
+        );
+        assert_eq!(
+            read_table(&s, table).await.columns[1].name,
+            "salary",
+            "{table} unchanged"
+        );
+    }
+    assert_eq!(
+        s.scalar(
+            "SELECT COUNT(*) FROM sys.database_permissions \
+             WHERE major_id = OBJECT_ID(N'dbo.c_deny') AND minor_id <> 0"
+        )
+        .await,
+        "1",
+        "the DENY stands"
+    );
+}
+
 /// **A retype under a disabled or untrusted foreign key applies, and the key
 /// comes back as it was** (R2-L8-06). The in-place plan re-adds such a key
 /// `WITH NOCHECK` and disables it again, yet the guard still refused it

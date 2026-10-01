@@ -4851,7 +4851,12 @@ existing prose was left alone.
     `ForeignKeyInfo::not_enforced`/`not_validated`), so neither is refused for those, where the key's
     arm went on saying the re-add "would enable and trust it" after it no longer did (R2-L8-06,
     `a_retype_under_a_disabled_or_untrusted_key_keeps_its_state`); and a rebuilt computed column
-    carrying an extended property other than the `MS_Description` the comment phase puts back.
+    carrying an extended property other than the `MS_Description` the comment phase puts back, or a
+    column permission — `DROP COLUMN` takes a `GRANT` or `DENY` on the column, so renaming `salary`
+    under `annual AS (salary * 12)` lifted a `DENY SELECT` on `annual` and the denied user read it
+    (S2-L5-03, `a_rebuilt_computed_column_is_refused_where_it_carries_what_the_drop_takes`). A
+    sensitivity classification is not on that list because a computed column cannot carry one
+    (Msg 16111, measured on 2022 and 2025); an in-place `ALTER COLUMN` keeps both.
     **It refuses rather than restates**, as the rebuild's guard does. It keys on the name, not on who raised the pair, so
     the designer's own edit of an index, foreign key or check that keeps its name is refused by the
     same arm — deliberately, the loss being the same

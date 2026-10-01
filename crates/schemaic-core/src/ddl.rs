@@ -7384,8 +7384,9 @@ fn tsql_alter_restates(from: &ColumnInfo, to: &ColumnInfo) -> bool {
 ///   REPLICATION` or carries an extended property. Their disabled and
 ///   untrusted states the re-add restates (`WITH NOCHECK`, `NOCHECK
 ///   CONSTRAINT`), so neither is refused for those.
-/// - A computed column rebuilt that carries an extended property other than
-///   its comment, which the re-add restates.
+/// - A computed column rebuilt that carries a column permission (a `GRANT`
+///   or `DENY` on it) or an extended property other than its comment, which
+///   the re-add restates: `DROP COLUMN` takes both (S2-L5-03).
 ///
 /// Refusing rather than restating, as the rebuild does: the alternative to
 /// each is a plan that succeeds and reports nothing lost.
@@ -7537,17 +7538,22 @@ fn tsql_in_place_guard(q: &str, changes: &[&Change]) -> Option<String> {
             ),
         ));
     }
+    // A computed column is dropped and added back, and `DROP COLUMN` takes
+    // what stands on the column itself: its extended properties and a column
+    // `GRANT`/`DENY` (S2-L5-03 — a `DENY SELECT` on it lifted silently). A
+    // sensitivity classification it cannot carry (Msg 16111, measured).
     for col in &computed {
+        let id = format!("COLUMNPROPERTY(@t, {}, 'ColumnId')", lit(col));
         reasons.push((
             format!(
                 "EXISTS (SELECT 1 FROM sys.extended_properties e WHERE e.class = 1 \
-                 AND e.major_id = @t AND e.minor_id = COLUMNPROPERTY(@t, {}, 'ColumnId') \
-                 AND e.name <> N'MS_Description')",
-                lit(col)
+                 AND e.major_id = @t AND e.minor_id = {id} AND e.name <> N'MS_Description') \
+                 OR EXISTS (SELECT 1 FROM sys.database_permissions WHERE class = 1 \
+                 AND major_id = @t AND minor_id = {id})"
             ),
             format!(
-                "Re-creating the computed column {col} would drop its extended properties other \
-                 than its comment, which Schemaic doesn't read - change it in SQL"
+                "Re-creating the computed column {col} would drop its permissions or extended \
+                 properties other than its comment, which Schemaic doesn't read - change it in SQL"
             ),
         ));
     }
@@ -17581,6 +17587,29 @@ mod tests {
         let mut d = TableDraft::from_table(&t);
         d.columns[1].info.default = Some("0".into());
         assert_eq!(ms_plan(&t, &d).len(), 1, "{:#?}", ms_plan(&t, &d));
+    }
+
+    /// **A computed column rebuilt is refused where it carries a column
+    /// permission** (S2-L5-03): `DROP COLUMN` takes a column `GRANT` or
+    /// `DENY`, and the model reads neither, so renaming the column it reads
+    /// silently lifted a `DENY SELECT` on it. The guard asks of the column by
+    /// its id, in the plan's one opening batch.
+    #[test]
+    fn a_rebuilt_computed_column_is_guarded_for_its_permissions() {
+        let t = ms_computed_table();
+        let mut d = TableDraft::from_table(&t);
+        d.columns[1].info.name = "s2".into();
+        let stmts = diff(&t, &d, MsSql).emit();
+        let guard = &stmts[0];
+        assert!(guard.ends_with("IF @why IS NOT NULL THROW 50000, @why, 1;"));
+        assert_eq!(guard.matches(';').count(), 1, "one batch: {guard}");
+        for needle in [
+            "sys.database_permissions WHERE class = 1 AND major_id = @t \
+             AND minor_id = COLUMNPROPERTY(@t, N'x', 'ColumnId')",
+            "computed column x would drop its permissions",
+        ] {
+            assert!(guard.contains(needle), "{needle} not in {guard}");
+        }
     }
 
     /// **A computed column rebuilt last refreshes what selects `*` from the
