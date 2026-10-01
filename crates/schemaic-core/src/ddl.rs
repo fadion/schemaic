@@ -7380,12 +7380,10 @@ fn tsql_alter_restates(from: &ColumnInfo, to: &ColumnInfo) -> bool {
 ///   other than the default, a disabled state, or an extended property on
 ///   it or its constraint: `CREATE INDEX` from [`IndexInfo`] states none of
 ///   them (S3.2-L5-02).
-/// - A foreign key dropped and added back that is disabled, untrusted or
-///   `NOT FOR REPLICATION`, or carries an extended property — it came back
-///   enforced and trusted.
-/// - A check dropped and added back that is `NOT FOR REPLICATION` or
-///   carries an extended property; its disabled and untrusted states the
-///   re-add already restates.
+/// - A foreign key or a check dropped and added back that is `NOT FOR
+///   REPLICATION` or carries an extended property. Their disabled and
+///   untrusted states the re-add restates (`WITH NOCHECK`, `NOCHECK
+///   CONSTRAINT`), so neither is refused for those.
 /// - A computed column rebuilt that carries an extended property other than
 ///   its comment, which the re-add restates.
 ///
@@ -7513,14 +7511,14 @@ fn tsql_in_place_guard(q: &str, changes: &[&Change]) -> Option<String> {
         reasons.push((
             format!(
                 "EXISTS (SELECT 1 FROM sys.foreign_keys f WHERE f.parent_object_id = @t \
-                 AND f.name = {} AND (f.is_disabled = 1 OR f.is_not_trusted = 1 \
-                 OR f.is_not_for_replication = 1 OR EXISTS (SELECT 1 FROM sys.extended_properties e \
+                 AND f.name = {} AND (f.is_not_for_replication = 1 \
+                 OR EXISTS (SELECT 1 FROM sys.extended_properties e \
                  WHERE e.class = 1 AND e.major_id = f.object_id)))",
                 lit(fk)
             ),
             format!(
-                "Re-creating the foreign key {fk} would enable and trust it, or drop its NOT FOR \
-                 REPLICATION or extended properties, which Schemaic doesn't read - change it in SQL"
+                "Re-creating the foreign key {fk} would drop its NOT FOR REPLICATION or extended \
+                 properties, which Schemaic doesn't read - change it in SQL"
             ),
         ));
     }
@@ -17262,10 +17260,15 @@ mod tests {
             "i.is_disabled = 1",
             "data_compression <> 0",
             "e.class = 7",
-            "is_not_trusted = 1",
-            "f.is_disabled = 1",
+            "f.is_not_for_replication = 1",
         ] {
             assert!(guard.contains(needle), "{needle} not in {guard}");
+        }
+        // **A disabled or untrusted key is not refused** (R2-L8-06): the re-add
+        // restates both states, as it does a check's, so refusing one said
+        // "would enable and trust it" of a plan that would not.
+        for needle in ["f.is_disabled", "f.is_not_trusted", "enable and trust"] {
+            assert!(!guard.contains(needle), "{needle} in {guard}");
         }
         // Only what the plan re-creates: `note` stands under nothing.
         assert!(!guard.contains("note"), "{guard}");

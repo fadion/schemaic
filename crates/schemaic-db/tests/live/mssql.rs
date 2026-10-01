@@ -6920,10 +6920,11 @@ async fn a_masked_or_sparse_column_is_not_altered_in_place() {
 /// **A dependent a retype takes off is not put back without what the model
 /// does not read** (S3.2-L5-02): an index came back without its
 /// `IGNORE_DUP_KEY`, fill factor, page locks, compression, disabled state or
-/// description, a key without its fill factor, and a disabled, untrusted
-/// foreign key came back enforced — each silently. One table per case; each
-/// plan is refused naming what it would have re-created, and the column keeps
-/// its type.
+/// description, a key without its fill factor, and a foreign key without its
+/// `NOT FOR REPLICATION` — each silently. One table per case; each plan is
+/// refused naming what it would have re-created, and the column keeps its
+/// type. (A disabled, untrusted key is re-added as it was, so it is not
+/// refused — [`a_retype_under_a_disabled_or_untrusted_key_keeps_its_state`].)
 #[tokio::test(flavor = "multi_thread")]
 async fn a_retype_is_refused_where_a_dependent_carries_what_it_would_drop() {
     use schemaic_core::ddl::TableDraft;
@@ -6966,8 +6967,8 @@ async fn a_retype_is_refused_where_a_dependent_carries_what_it_would_drop() {
         ),
         (
             "t_fk",
-            "ALTER TABLE dbo.t_fk WITH NOCHECK ADD CONSTRAINT fk_b FOREIGN KEY (b) \
-             REFERENCES dbo.t_fk (a); ALTER TABLE dbo.t_fk NOCHECK CONSTRAINT fk_b",
+            "ALTER TABLE dbo.t_fk ADD CONSTRAINT fk_b FOREIGN KEY (b) \
+             REFERENCES dbo.t_fk (a) NOT FOR REPLICATION",
             "foreign key fk_b",
         ),
         (
@@ -6997,6 +6998,55 @@ async fn a_retype_is_refused_where_a_dependent_carries_what_it_would_drop() {
             read_table(&s, table).await.columns[0].type_name,
             "int",
             "{table} unchanged"
+        );
+    }
+}
+
+/// **A retype under a disabled or untrusted foreign key applies, and the key
+/// comes back as it was** (R2-L8-06). The in-place plan re-adds such a key
+/// `WITH NOCHECK` and disables it again, yet the guard still refused it
+/// saying the re-add "would enable and trust it". Each table keeps a row its
+/// key does not hold, which a re-add that validated would refuse.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_retype_under_a_disabled_or_untrusted_key_keeps_its_state() {
+    use schemaic_core::ddl::TableDraft;
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("nocheck_retype").await;
+    for (table, disable, state) in [("t_off", true, "1:1"), ("t_untrusted", false, "0:1")] {
+        s.exec(&format!(
+            "CREATE TABLE dbo.{table} (a int NOT NULL CONSTRAINT pk_{table} PRIMARY KEY, \
+             b int NULL); INSERT dbo.{table} VALUES (1, 5); \
+             ALTER TABLE dbo.{table} WITH NOCHECK ADD CONSTRAINT fk_{table} FOREIGN KEY (b) \
+             REFERENCES dbo.{table} (a)"
+        ))
+        .await;
+        if disable {
+            s.exec(&format!(
+                "ALTER TABLE dbo.{table} NOCHECK CONSTRAINT fk_{table}"
+            ))
+            .await;
+        }
+        let t = read_table(&s, table).await;
+        let mut d = TableDraft::from_table(&t);
+        d.columns[0].info.type_name = "bigint".into();
+        d.columns[1].info.type_name = "bigint".into();
+        apply_draft(&s, &t, &d).await;
+        assert_eq!(read_table(&s, table).await.columns[1].type_name, "bigint");
+        assert_eq!(
+            s.scalar(&format!(
+                "SELECT CONCAT(CAST(is_disabled AS int), ':', CAST(is_not_trusted AS int)) \
+                 FROM sys.foreign_keys WHERE name = N'fk_{table}'"
+            ))
+            .await,
+            state,
+            "{table}: the key keeps its disabled and untrusted states"
+        );
+        assert_eq!(
+            s.scalar(&format!("SELECT CONCAT(a, ':', b) FROM dbo.{table}"))
+                .await,
+            "1:5"
         );
     }
 }

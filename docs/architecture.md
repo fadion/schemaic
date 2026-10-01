@@ -4845,10 +4845,12 @@ existing prose was left alone.
     under one name that carries a fill factor, padding, `IGNORE_DUP_KEY`, row or page locks off,
     compression, a filegroup or partition scheme other than the default, a disabled state, or an
     extended property on the index or on its key constraint; the primary key re-created (a
-    `Change::PrimaryKey` with both sides non-empty) carrying any of the same; a foreign key re-added
-    that is disabled, untrusted or `NOT FOR REPLICATION`, or carries an extended property; a check
-    re-added that is `NOT FOR REPLICATION` or carries one — its disabled and untrusted states the
-    re-add already restates (`WITH NOCHECK`, `NOCHECK CONSTRAINT`); and a rebuilt computed column
+    `Change::PrimaryKey` with both sides non-empty) carrying any of the same; a foreign key or a
+    check re-added that is `NOT FOR REPLICATION` or carries an extended property — their disabled and
+    untrusted states the re-add restates (`WITH NOCHECK`, `NOCHECK CONSTRAINT`; the key's since
+    `ForeignKeyInfo::not_enforced`/`not_validated`), so neither is refused for those, where the key's
+    arm went on saying the re-add "would enable and trust it" after it no longer did (R2-L8-06,
+    `a_retype_under_a_disabled_or_untrusted_key_keeps_its_state`); and a rebuilt computed column
     carrying an extended property other than the `MS_Description` the comment phase puts back.
     **It refuses rather than restates**, as the rebuild's guard does. It keys on the name, not on who raised the pair, so
     the designer's own edit of an index, foreign key or check that keeps its name is refused by the
