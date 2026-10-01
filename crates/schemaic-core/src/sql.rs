@@ -2400,13 +2400,38 @@ fn mssql_needs_database(sql: &str) -> bool {
 }
 
 /// Does this piece hold more than one T-SQL statement — so that what follows
-/// its first result, or its row cap, is statements the server will still run?
+/// its first result is statements the server will still run?
 ///
-/// [`tsql_statements`]' count, and so it errs toward *several*: a cut in the
-/// wrong place makes a reader drain a result it could have left, which costs
-/// time and never an outcome. `false` on every other engine.
+/// [`tsql_statements`]' count, and so it errs toward *several* — but only
+/// over the statements the text holds. A procedure call is one statement here
+/// and any number to the server, which is why a reader stopped at its row cap
+/// asks [`drains_past_row_cap`] instead. `false` on every other engine.
 pub fn holds_several_statements(sql: &str, dialect: SqlDialect) -> bool {
     tsql_statements(sql, dialect).len() > 1
+}
+
+/// Must a reader stopped at its row cap **read on to the end of the stream**
+/// rather than drop it?
+///
+/// Yes unless the rest is surely rows — unless the piece is one statement and
+/// a read ([`contains_write`] false). On SQL Server a dropped stream is a
+/// dropped connection mid-reply, and the server aborts what it was running:
+///
+/// * **a lone write's `OUTPUT` rows are the write still running.** An `UPDATE
+///   … OUTPUT` over 100,000 rows read to a cap of 10 was reported a success
+///   with a truncated grid, and afterwards no row had changed — the server
+///   rolled the statement back when the connection went (measured on 2022 and
+///   2025);
+/// * **a procedure call is one statement to the text** and any number to the
+///   server: past the cap, an error it raised after its first result was never
+///   read, and whether its later statements ran depended on timing.
+///
+/// `contains_write` counts `EXEC` and every head outside the read set, so both
+/// drain; a `SELECT`, even one calling a function — T-SQL forbids a function
+/// side effects — keeps its early stop. Wrong toward draining costs the time to read
+/// rows nobody sees, never an outcome.
+pub fn drains_past_row_cap(sql: &str, dialect: SqlDialect) -> bool {
+    holds_several_statements(sql, dialect) || contains_write(sql, dialect)
 }
 
 /// The statements one T-SQL range holds; any other dialect's range, whole.
@@ -8823,6 +8848,39 @@ line */",
             super::tsql_statements("ALTER TABLE t ADD c int\nDROP TABLE u", ms),
             vec!["ALTER TABLE t ADD c int", "DROP TABLE u"]
         );
+    }
+
+    /// **Past the row cap a reader reads on unless the rest is surely rows.**
+    /// A lone write's `OUTPUT` rows are the write still running: a read that
+    /// stopped at the cap and dropped its connection had SQL Server abort the
+    /// statement, and an `UPDATE … OUTPUT` over 300,000 rows was reported done
+    /// with none changed. A procedure call is one statement to the text and
+    /// any number to the server, so an error it raised after the cap was never
+    /// read. Only a read's remaining rows are its own.
+    #[test]
+    fn only_a_reads_rows_are_left_unread_past_the_cap() {
+        let ms = SqlDialect::MsSql;
+        for drain in [
+            "UPDATE dbo.big SET v = 1 OUTPUT inserted.n, inserted.pad",
+            "DELETE FROM dbo.big OUTPUT deleted.n WHERE n > 100000",
+            "INSERT INTO t OUTPUT inserted.id SELECT a FROM u",
+            "MERGE t USING s ON t.id = s.id WHEN MATCHED THEN UPDATE SET a = s.a OUTPUT $action;",
+            "EXEC dbo.report_then_purge",
+            "EXECUTE dbo.p @a = 1",
+            "dbo.p",
+            "SELECT 1 SELECT 2",
+            "SELECT * FROM t; DELETE FROM t",
+        ] {
+            assert!(super::drains_past_row_cap(drain, ms), "{drain}");
+        }
+        for read in [
+            "SELECT * FROM t",
+            "SELECT dbo.f(a) FROM t WHERE b = 1",
+            "WITH c AS (SELECT 1 AS a) SELECT * FROM c",
+            "SELECT a FROM t UNION ALL SELECT a FROM u",
+        ] {
+            assert!(!super::drains_past_row_cap(read, ms), "{read}");
+        }
     }
 
     /// And the error it answers with, when it ran in `master` and the table

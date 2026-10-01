@@ -3871,6 +3871,20 @@ async fn a_batch_scoped_script_runs_whole() {
     .await;
     assert_eq!(out.len(), 1, "{out:?}");
     assert!(out[0].is_ok(), "the error is caught: {out:?}");
+
+    // A label after a statement no `;` closed still holds its `GOTO` in the
+    // batch: cut there, `GOTO again` went alone (Msg 133) after the first
+    // `UPDATE` had committed.
+    let out = run_everything(
+        &s,
+        "UPDATE dbo.t SET a = a + 1 WHERE id = 1\nagain:\nUPDATE dbo.t SET a = a + 1 WHERE id = 2;\n\
+         IF (SELECT a FROM dbo.t WHERE id = 2) < 5 GOTO again;",
+        10,
+    )
+    .await;
+    assert_eq!(out.len(), 1, "{out:?}");
+    assert!(out[0].is_ok(), "{out:?}");
+    assert_eq!(s.scalar("SELECT SUM(a) FROM dbo.t").await, "7");
 }
 
 /// **A batch's error is the batch's outcome, whatever it returned first.**
@@ -3929,6 +3943,63 @@ async fn a_batch_reports_its_error_past_its_first_result() {
         .expect_err("the duplicate key");
     assert!(err.to_string().contains("may have run"), "{err}");
     assert_eq!(s.scalar("SELECT v FROM dbo.w").await, "9");
+}
+
+/// **Past the row cap, a lone write and a procedure call are read to their
+/// end.** The read stopped at the cap for any lone statement and dropped the
+/// connection, and the server aborted what it was still running: an `UPDATE
+/// … OUTPUT` larger than the network buffers was reported a success over a
+/// truncated grid with no row changed, and an error a procedure raised after
+/// its first result was never reported — on a Manual tab the driver's
+/// resynchronisation discarded it at the next request.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_or_a_procedure_past_the_row_cap_is_read_to_its_end() {
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("cap_drain").await;
+    s.exec(
+        "SELECT TOP (100000) ROW_NUMBER() OVER (ORDER BY (SELECT 1)) AS n, \
+         CAST(0 AS int) AS v, CAST(REPLICATE('x', 200) AS varchar(200)) AS pad INTO dbo.big \
+         FROM sys.all_columns a CROSS JOIN sys.all_columns b",
+    )
+    .await;
+    let capped = |sql: &'static str| {
+        s.db.fetch_query(Some(&s.name), sql, 10, CancellationToken::new())
+    };
+    let rs = capped("UPDATE dbo.big SET v = 1 OUTPUT inserted.n, inserted.pad")
+        .await
+        .expect("the update ran");
+    assert!(rs.truncated && rs.row_count() == 10, "{rs:?}");
+    assert_eq!(
+        s.scalar("SELECT COUNT(*) FROM dbo.big WHERE v = 1").await,
+        "100000",
+        "every row the grid did not show was updated too"
+    );
+    let rs = capped("DELETE FROM dbo.big OUTPUT deleted.n, deleted.pad WHERE n > 50000")
+        .await
+        .expect("the delete ran");
+    assert!(rs.truncated, "{rs:?}");
+    assert_eq!(s.scalar("SELECT COUNT(*) FROM dbo.big").await, "50000");
+
+    s.exec(
+        "CREATE PROCEDURE dbo.report_then_fail AS BEGIN \
+           SELECT n, pad FROM dbo.big; THROW 50001, 'the purge failed', 1; END",
+    )
+    .await;
+    let err = capped("EXEC dbo.report_then_fail")
+        .await
+        .expect_err("the procedure's error is the run's");
+    assert!(err.to_string().contains("the purge failed"), "{err}");
+    // And on a pinned session, whose next request would have flushed it.
+    let session = manual(&s).await;
+    let out = session
+        .fetch_query("EXEC dbo.report_then_fail", 10, CancellationToken::new())
+        .await;
+    let err = out.result.expect_err("reported on the pinned session too");
+    assert!(err.to_string().contains("the purge failed"), "{err}");
+    session.rollback().await.expect("rollback");
+    session.close().await;
 }
 
 /// The schema reads back as it was declared.

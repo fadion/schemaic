@@ -617,9 +617,11 @@ pub(crate) async fn drain(client: &mut MsClient, sql: &str) -> Result<(), DbErro
 /// announces itself with its own metadata, and the read goes on past it to
 /// the stream's end, its rows dropped — the driver raises a batch's error only
 /// there, and dropping the stream decided by timing whether the statements
-/// after it ran. Past the row cap the same, when the piece holds more than one
-/// statement ([`schemaic_core::sql::holds_several_statements`]); a lone
-/// statement's remaining rows are left unread.
+/// after it ran. Past the row cap the same, unless the piece is one read
+/// ([`schemaic_core::sql::drains_past_row_cap`]): a lone read's remaining rows
+/// are left unread, while a write's `OUTPUT` rows are the write still running
+/// — dropped, the connection went and the server rolled the write back — and a
+/// procedure's are its later statements.
 ///
 /// A cancel is TDS's own **attention**, on this connection: the driver's
 /// `cancel_query` aborts the running batch and waits for the server to
@@ -652,8 +654,12 @@ pub(crate) async fn run_statement(
     };
     let chunk_capacity = dest.chunk_capacity();
     // Statements after the first result's end are statements the server still
-    // runs, and whose error is the batch's: past the cap, read on for them.
+    // runs, and whose error is the batch's.
     let several = schemaic_core::sql::holds_several_statements(sql, MS);
+    // Past the cap, read on unless the rest is surely a read's own rows: a
+    // write's `OUTPUT` rows are the write still running, and a procedure's are
+    // its later statements — drop the stream there and the server aborts them.
+    let drain_at_cap = schemaic_core::sql::drains_past_row_cap(sql, MS);
 
     let mut grid: Option<ResultBuilder> = None;
     let mut truncated = false;
@@ -720,9 +726,10 @@ pub(crate) async fn run_statement(
                     };
                     if builder.row_count() >= row_cap {
                         truncated = true;
-                        // A lone statement's remaining rows are its own, and
-                        // left unread; a batch's later statements are not.
-                        if several {
+                        // A lone read's remaining rows are its own, and left
+                        // unread; a write's, a module's and a batch's later
+                        // statements are not.
+                        if drain_at_cap {
                             draining = true;
                             continue;
                         }

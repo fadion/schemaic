@@ -766,8 +766,11 @@ existing prose was left alone.
     (`every_sql_server_statement_in_a_range_is_judged_for_a_missing_where`, whose last assertion is
     that MySQL still reads the first shape as one statement). `holds_several_statements` is the
     same cut counted, for `db::mssql::run_statement`'s question of whether a result's end is the
-    piece's end; it errs toward *several*, since a cut in the wrong place drains a result that could
-    have been left — time, never an outcome.
+    piece's end; it errs toward *several*, but only over the statements the **text** holds, and a
+    procedure call is one statement there and any number to the server. So the row cap asks
+    `drains_past_row_cap` — several, or `contains_write` (which counts `EXEC` and every head outside
+    the read set) — and only a lone read keeps its early stop. A cut in the wrong place then drains
+    a result that could have been left: time, never an outcome.
     **`limited_select` is the one spelling of a generated row cap**, because T-SQL has no `LIMIT`
     and writes `TOP (n)` after `SELECT`: the generators had each written a trailing `LIMIT` into a
     `format!`, which is an engine assumption no census can find. `filter::table_query` and
@@ -12481,9 +12484,17 @@ existing prose was left alone.
   kept. tiberius raises a batch's error only when the stream ends, and `run_statement` used to
   stop at a second result set, and at the row cap, and drop the stream — so a failed batch was
   reported `Ok`, whether the statements after the stop ran depended on how much the first result
-  returned, and Run All went on past a piece that had failed. At the row cap it reads on only when
-  `sql::holds_several_statements` says the piece holds more than one statement, so a lone `SELECT`
-  still stops at the cap rather than draining a table. And a server error from such a piece
+  returned, and Run All went on past a piece that had failed. At the row cap it reads on unless
+  the piece is one read (`sql::drains_past_row_cap`), so a lone `SELECT` still stops at the cap
+  rather than draining a table. **The lone write was the case that stayed broken**: it used to read
+  on only for a piece holding several statements, on the premise that a lone statement's
+  remaining rows are its own — and a write's `OUTPUT` rows are the write still running. An `UPDATE
+  … OUTPUT` over 100,000 rows read to a cap of 10 was reported a success over a truncated grid with
+  **no row changed**, the dropped connection having made the server roll it back; and a procedure
+  that `THROW`s after a result larger than the cap was reported `Ok`, on a Manual tab too, where
+  `flush_stream` discarded the error at the next request (the write on 2022 and 2025, the
+  procedure on 2022; `a_write_or_a_procedure_past_the_row_cap_is_read_to_its_end`). And a server error from a piece
+  holding several statements
   carries `batch_error`'s sentence: SQL Server runs a batch on past a statement's error unless the
   error ends the batch, so a duplicate key followed by an `UPDATE` reports the duplicate while the
   `UPDATE` commits (measured on 2022; `a_batch_reports_its_error_past_its_first_result`). **`prepare_check` is the same DMF, and not `SET NOEXEC ON`**, which was the
@@ -12665,9 +12676,11 @@ existing prose was left alone.
   a connection out of step answering an earlier request — panicked the run task rather than
   answering `None`. `fetch_query`, `commit_writes`, `fetch_blob` and
   `refetch_rows` all end in it, except over a lost connection, and `tx_alive` — MySQL's probe —
-  is never asked on this engine. `fetch_query` runs `run_statement` on the pinned client, and a lone statement's result cut short at the
+  is never asked on this engine. `fetch_query` runs `run_statement` on the pinned client, and a lone read's result cut short at the
   row cap needs no draining for the next statement: tiberius resynchronises the stream at the start
-  of every request (`flush_stream`).
+  of every request (`flush_stream`). Anything else is drained by `run_statement` itself
+  (`sql::drains_past_row_cap`), since that resynchronisation discards unread whatever error the
+  rest of the stream carried.
   **A Stop is followed by a question: does the connection still answer its own requests?** An
   attention the server did not acknowledge leaves its reply on the wire, and every reply after it
   belongs to the request before — the next statement's grid showing the previous one's result, the

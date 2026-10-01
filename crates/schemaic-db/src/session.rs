@@ -757,11 +757,12 @@ impl Session {
             }
             // `run_statement` owns the token here as on PostgreSQL: every step
             // is raced against Stop and a Stop is the attention, on this
-            // connection. A lone statement's result cut short at the row cap
+            // connection. A lone read's result cut short at the row cap
             // needs no draining for the next statement — tiberius
             // resynchronises the stream at the start of every request
-            // (`flush_stream`) — and a piece holding several is read to its
-            // end by `run_statement` itself.
+            // (`flush_stream`) — and a piece that may do more than return
+            // rows (`sql::drains_past_row_cap`) is read to its end by
+            // `run_statement` itself, or its error would be flushed unread.
             Backend::MsSql { client } => {
                 let mut dest = crate::RowDest::Capped(row_cap);
                 crate::mssql::run_statement(client, sql, &mut dest, &cancel).await
