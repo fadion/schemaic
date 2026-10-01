@@ -5914,14 +5914,10 @@ async fn an_entra_sign_in_is_the_azure_clis_user() {
     let db = Db::connect(&conn, None);
     let login = signed_in_scalar(&db, &database, "SELECT SUSER_SNAME()").await;
     assert!(login.contains('@'), "{login} is not an Entra user");
-    let again = std::time::Instant::now();
+    // A second connection, on the cached token.
     assert_eq!(
         signed_in_scalar(&db, &database, "SELECT ORIGINAL_LOGIN()").await,
         login
-    );
-    eprintln!(
-        "live: mssql-azure signed in as {login}; a second connection took {:?}",
-        again.elapsed()
     );
     // A SQL login is refused on an Entra-only server, which is what makes the
     // assertion above one about the token rather than a password.
