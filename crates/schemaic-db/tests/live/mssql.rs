@@ -1531,6 +1531,57 @@ async fn a_dump_leaves_out_what_reads_a_table_it_cannot_restate() {
     );
 }
 
+/// **A ledger table is not dumped as a plain one.** An updatable ledger
+/// table came back with its ledger columns as ordinary ones, its history as
+/// a plain table and its ledger view as a plain view, and an append-only one
+/// accepted `DELETE` — tamper-evidence gone, with the restore reporting
+/// success. Each is left out and named; the rest restores.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dump_leaves_a_ledger_table_out_and_names_it() {
+    use schemaic_core::dump::DumpOptions;
+    if !enabled() || azure_cannot("restores into a second database, which it has not got") {
+        return;
+    }
+    let src = Scratch::create("dump_ledgersrc").await;
+    src.exec(
+        "CREATE TABLE dbo.plain (id int PRIMARY KEY); INSERT dbo.plain VALUES (1); \
+         CREATE TABLE dbo.led (id int PRIMARY KEY, v int) \
+           WITH (SYSTEM_VERSIONING = ON, LEDGER = ON); \
+         INSERT dbo.led VALUES (1, 10); UPDATE dbo.led SET v = 11; \
+         CREATE TABLE dbo.app_only (id int PRIMARY KEY) WITH (LEDGER = ON (APPEND_ONLY = ON)); \
+         INSERT dbo.app_only VALUES (1);",
+    )
+    .await;
+    let file = Box::pin(dump_file(&src, DumpOptions::default())).await;
+    for what in [
+        "dbo.led (an updatable ledger table)",
+        "dbo.app_only (an append-only ledger table)",
+        "(the history table of a ledger table)",
+        "dbo.led_Ledger (the ledger view of a ledger table)",
+        "dbo.app_only_Ledger (the ledger view of a ledger table)",
+    ] {
+        assert!(file.contains(what), "{what}\n{file}");
+    }
+    assert!(
+        !file.contains("ledger_start_transaction_id") && !file.contains("CREATE VIEW"),
+        "{file}"
+    );
+    let dst = Scratch::create("dump_ledgerdst").await;
+    let end = Box::pin(restore_file(&dst, &file)).await;
+    assert!(
+        matches!(end, schemaic_core::script::ExecEnd::Done),
+        "{end:?}\n{file}"
+    );
+    assert_eq!(
+        dst.scalar(
+            "SELECT CONCAT((SELECT COUNT(*) FROM dbo.plain), '|', \
+             (SELECT COUNT(*) FROM sys.objects WHERE is_ms_shipped = 0 AND type IN ('U', 'V')))"
+        )
+        .await,
+        "1|1"
+    );
+}
+
 /// **Tables, views and the functions they call are created in one order.**
 /// A view reaching another view only through an inline function, and a table
 /// whose check calls a function counting another table, were written

@@ -1278,6 +1278,8 @@ struct Catalogue {
     memory_optimized: bool,
     /// `sys.sequences.last_used_value` — SQL Server 2017.
     last_used_value: bool,
+    /// `sys.tables.ledger_type`/`ledger_view_id` — SQL Server 2022.
+    ledger: bool,
 }
 
 impl Catalogue {
@@ -1289,6 +1291,7 @@ impl Catalogue {
         temporal_type: true,
         memory_optimized: true,
         last_used_value: true,
+        ledger: true,
     };
 
     /// From [`CATALOGUE_PROBE`]'s row: each cell `1` where the column is
@@ -1301,6 +1304,7 @@ impl Catalogue {
             temporal_type: has(2),
             memory_optimized: has(3),
             last_used_value: has(4),
+            ledger: has(5),
         }
     }
 }
@@ -1313,7 +1317,8 @@ const CATALOGUE_PROBE: &str = "SELECT \
             CAST(CASE WHEN COL_LENGTH('sys.tables', 'is_node') IS NULL THEN 0 ELSE 1 END AS int), \
             CAST(CASE WHEN COL_LENGTH('sys.tables', 'temporal_type') IS NULL THEN 0 ELSE 1 END AS int), \
             CAST(CASE WHEN COL_LENGTH('sys.tables', 'is_memory_optimized') IS NULL THEN 0 ELSE 1 END AS int), \
-            CAST(CASE WHEN COL_LENGTH('sys.sequences', 'last_used_value') IS NULL THEN 0 ELSE 1 END AS int)";
+            CAST(CASE WHEN COL_LENGTH('sys.sequences', 'last_used_value') IS NULL THEN 0 ELSE 1 END AS int), \
+            CAST(CASE WHEN COL_LENGTH('sys.tables', 'ledger_type') IS NULL THEN 0 ELSE 1 END AS int)";
 
 /// Every column of every user table and view: `(schema, table, column, type,
 /// max_length, precision, scale, user-defined type, nullable, identity,
@@ -1420,7 +1425,9 @@ const SYNONYM_LISTING: &str = "SELECT SCHEMA_NAME(sn.schema_id), sn.name, \
      FROM sys.synonyms sn ORDER BY 1, 2";
 
 /// The tables that are more than their columns — `TsqlTableKind`: `(schema,
-/// table, node, edge, temporal type, memory-optimised, has edge constraints)`.
+/// table, node, edge, temporal type, memory-optimised, ledger type, has edge
+/// constraints, is a ledger view)` — and, on a server with ledgers, each
+/// ledger table's view in the same shape.
 ///
 /// A graph table's internal columns (`graph_id_…`, `$node_id_…`, an edge's
 /// `$from_id_…`/`$to_id_…`) are left out of [`column_listing`] by their
@@ -1442,6 +1449,7 @@ fn table_kind_listing(cat: Catalogue) -> String {
             "t.is_memory_optimized",
             "t.is_memory_optimized = 1",
         ),
+        (cat.ledger, "t.ledger_type", "t.ledger_type <> 0"),
     ];
     let cells: Vec<String> = kinds
         .iter()
@@ -1458,13 +1466,22 @@ fn table_kind_listing(cat: Catalogue) -> String {
         .filter(|(has, ..)| *has)
         .map(|&(_, _, test)| test)
         .collect();
+    // A ledger table's view, the one view of a kind: every cell but the
+    // last `0`, in the tables' shape.
+    let ledger_views = if cat.ledger {
+        " UNION ALL SELECT s.name, v.name, 0, 0, 0, 0, 0, 0, 1 \
+         FROM sys.tables t JOIN sys.views v ON v.object_id = t.ledger_view_id \
+         JOIN sys.schemas s ON s.schema_id = v.schema_id"
+    } else {
+        ""
+    };
     format!(
         "SELECT s.name, t.name, {}, \
             CAST(CASE WHEN EXISTS (SELECT 1 FROM sys.objects ec \
                                     WHERE ec.parent_object_id = t.object_id AND ec.type = 'EC') \
-                 THEN 1 ELSE 0 END AS int) \
+                 THEN 1 ELSE 0 END AS int), 0 \
      FROM sys.tables t JOIN sys.schemas s ON s.schema_id = t.schema_id \
-     WHERE t.is_ms_shipped = 0 AND ({})",
+     WHERE t.is_ms_shipped = 0 AND ({}){ledger_views}",
         cells.join(", "),
         if any.is_empty() {
             "1 = 0".to_string()
@@ -2309,7 +2326,9 @@ async fn collect_schema(client: &mut MsClient) -> Result<DbSchema, DbError> {
                         edge: flag(&r, 3),
                         temporal_type: u8::try_from(int(&r, 4)).unwrap_or(0),
                         memory_optimized: flag(&r, 5),
-                        edge_constraints: flag(&r, 6),
+                        ledger_type: u8::try_from(int(&r, 6)).unwrap_or(0),
+                        edge_constraints: flag(&r, 7),
+                        ledger_view: flag(&r, 8),
                     },
                 )
             })
@@ -4989,6 +5008,7 @@ mod tests {
         temporal_type: false,
         memory_optimized: false,
         last_used_value: false,
+        ledger: false,
     };
 
     /// Every listing a schema load runs, as built for `cat`.
@@ -5008,12 +5028,14 @@ mod tests {
     /// missing, one at a time, so no listing leans on another's answer.
     #[test]
     fn a_listing_names_no_catalogue_column_the_server_has_not_got() {
-        let gated: [(&str, fn(&mut Catalogue)); 5] = [
+        let gated: [(&str, fn(&mut Catalogue)); 7] = [
             ("graph_type", |c| c.graph_type = false),
             ("is_node", |c| c.graph_tables = false),
             ("temporal_type", |c| c.temporal_type = false),
             ("is_memory_optimized", |c| c.memory_optimized = false),
             ("last_used_value", |c| c.last_used_value = false),
+            ("ledger_type", |c| c.ledger = false),
+            ("ledger_view_id", |c| c.ledger = false),
         ];
         for (column, without) in gated {
             let mut cat = Catalogue::CURRENT;
@@ -5064,19 +5086,21 @@ mod tests {
     /// else not.
     #[test]
     fn the_catalogue_probe_reads_each_column_in_its_place() {
-        let row = |cells: [&str; 5]| -> Vec<Option<String>> {
+        let row = |cells: [&str; 6]| -> Vec<Option<String>> {
             cells.iter().map(|c| Some(c.to_string())).collect()
         };
         assert_eq!(
-            Catalogue::from_row(&row(["1"; 5])),
+            Catalogue::from_row(&row(["1"; 6])),
             Catalogue::CURRENT,
             "every column there"
         );
-        assert_eq!(Catalogue::from_row(&row(["0"; 5])), OLDEST);
+        assert_eq!(Catalogue::from_row(&row(["0"; 6])), OLDEST);
         assert_eq!(Catalogue::from_row(&[]), OLDEST, "no row reads as none");
-        let one = Catalogue::from_row(&row(["0", "0", "1", "0", "0"]));
+        let one = Catalogue::from_row(&row(["0", "0", "1", "0", "0", "0"]));
         assert!(one.temporal_type && !one.graph_type && !one.memory_optimized);
-        assert_eq!(CATALOGUE_PROBE.matches("COL_LENGTH").count(), 5);
+        let ledger = Catalogue::from_row(&row(["0", "0", "0", "0", "0", "1"]));
+        assert!(ledger.ledger && !ledger.last_used_value);
+        assert_eq!(CATALOGUE_PROBE.matches("COL_LENGTH").count(), 6);
     }
 
     /// **An Entra handle with a plan that verifies nothing is refused before a

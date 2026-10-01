@@ -1392,7 +1392,8 @@ pub struct TableInfo {
 
 /// What a SQL Server table is besides its columns, where that changes the
 /// `CREATE TABLE` that recreates it (`sys.tables`' `is_node`, `is_edge`,
-/// `temporal_type`, `is_memory_optimized`).
+/// `temporal_type`, `is_memory_optimized`, `ledger_type`), or a view that is
+/// a ledger table's (`ledger_view_id`).
 ///
 /// **Read so that no script builds a different table without saying so.**
 /// Unread, a graph node came out as a plain table carrying its internal
@@ -1417,11 +1418,24 @@ pub struct TsqlTableKind {
     pub temporal_type: u8,
     /// `MEMORY_OPTIMIZED = ON`.
     pub memory_optimized: bool,
+    /// `sys.tables.ledger_type`: 1 for a ledger table's history table, 2 for
+    /// an updatable ledger table, 3 for an append-only one, 0 otherwise.
+    pub ledger_type: u8,
+    /// The view a ledger table's `LEDGER_VIEW` is (`sys.tables.
+    /// ledger_view_id`) — the one view kind here.
+    pub ledger_view: bool,
 }
 
 impl TsqlTableKind {
     /// Why no `CREATE TABLE` from the model restates this table, or `None`
     /// when one does.
+    ///
+    /// **A ledger table, its history and its view among them.** Read as
+    /// plain, an updatable ledger table came back with its
+    /// `ledger_start_transaction_id` and the rest as ordinary columns, its
+    /// history as one more plain table and its ledger view as a plain view,
+    /// and the restore reported success over a copy whose rows could be
+    /// updated or deleted with no trace — tamper-evidence silently gone.
     pub fn unrestatable(&self) -> Option<&'static str> {
         if self.memory_optimized {
             Some("a memory-optimised table")
@@ -1429,6 +1443,14 @@ impl TsqlTableKind {
             Some("a system-versioned temporal table")
         } else if self.temporal_type == 1 {
             Some("the history table of a system-versioned table")
+        } else if self.ledger_type == 2 {
+            Some("an updatable ledger table")
+        } else if self.ledger_type == 3 {
+            Some("an append-only ledger table")
+        } else if self.ledger_type == 1 {
+            Some("the history table of a ledger table")
+        } else if self.ledger_view {
+            Some("the ledger view of a ledger table")
         } else {
             None
         }
@@ -5332,6 +5354,16 @@ impl TableInfo {
             None => q(&self.name),
         };
         let cname = crate::export::comment_text(&qname);
+        // **Not a plain table or view, and none is written in its place** —
+        // the sequence arm's rule in `create_ddl`: name the object, say what
+        // could not be restated, and leave the reader able to fix it.
+        if let Some(what) = self.tsql_kind.unrestatable() {
+            return format!(
+                "-- {cname} is {what}. Its period columns, history link and versioning, its\n\
+                 -- ledger, or its memory-optimised storage, are not in what Schemaic reads,\n\
+                 -- so this script cannot restate it. Script it from the source server."
+            );
+        }
         if self.is_view {
             let Some(sql) = self
                 .create_sql
@@ -5394,16 +5426,6 @@ impl TableInfo {
                 ));
             }
             return out;
-        }
-        // **Not a plain table, and none is written in its place** — the
-        // sequence arm's rule in `create_ddl`: name the object, say what could
-        // not be restated, and leave the reader able to fix it.
-        if let Some(what) = self.tsql_kind.unrestatable() {
-            return format!(
-                "-- {cname} is {what}. Its period columns, history link and versioning, or its\n\
-                 -- memory-optimised storage, are not in what Schemaic reads, so this script\n\
-                 -- cannot restate it. Script it from the source server."
-            );
         }
         let mut lines: Vec<String> = Vec::new();
         let mut notes: Vec<String> = Vec::new();
@@ -9457,12 +9479,53 @@ mod tests {
                 },
                 "a memory-optimised table",
             ),
+            // A ledger table, its history and its view are tamper-evidence a
+            // plain table and view would silently drop.
+            (
+                TsqlTableKind {
+                    ledger_type: 2,
+                    ..Default::default()
+                },
+                "an updatable ledger table",
+            ),
+            (
+                TsqlTableKind {
+                    ledger_type: 3,
+                    ..Default::default()
+                },
+                "an append-only ledger table",
+            ),
+            (
+                TsqlTableKind {
+                    ledger_type: 1,
+                    ..Default::default()
+                },
+                "the history table of a ledger table",
+            ),
         ] {
             let ddl = base("t", kind).create_ddl(d);
             assert!(!ddl.contains("CREATE TABLE"), "{ddl}");
             assert!(ddl.lines().all(|l| l.starts_with("--")), "{ddl}");
             assert!(ddl.contains(what), "{ddl}");
         }
+        let ledger_view = TableInfo {
+            is_view: true,
+            create_sql: Some("CREATE VIEW [dbo].[t_Ledger] AS SELECT 1 AS n".into()),
+            view_definition: Some("SELECT 1 AS n".into()),
+            ..base(
+                "t_Ledger",
+                TsqlTableKind {
+                    ledger_view: true,
+                    ..Default::default()
+                },
+            )
+        }
+        .create_ddl(d);
+        assert!(!ledger_view.contains("CREATE VIEW"), "{ledger_view}");
+        assert!(
+            ledger_view.contains("the ledger view of a ledger table"),
+            "{ledger_view}"
+        );
     }
 
     /// SQL Server's standalone objects are written in T-SQL, every clause of a

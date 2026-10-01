@@ -2051,8 +2051,9 @@ pub fn plan(
         .into_iter()
         .filter(|&i| {
             let t = &schema.tables[i];
+            // A view too: a ledger table's ledger view.
             match t.tsql_kind.unrestatable() {
-                Some(what) if !t.is_view => {
+                Some(what) => {
                     unrestated.push(format!(
                         "{} ({what})",
                         display_name(t.schema.as_deref(), &t.name)
@@ -7177,6 +7178,72 @@ mod tests {
             "{file}"
         );
         assert_eq!(p.tables, 4, "the tables and views the file holds");
+    }
+
+    /// **A ledger table, its history and its ledger view are left out and
+    /// named**, as a temporal table is: written plain, the copy took updates
+    /// and deletes with no trace and the restore reported success.
+    #[test]
+    fn a_ledger_table_its_history_and_its_view_are_left_out_and_named() {
+        let dbo = |mut t: TableInfo, ledger_type: u8| {
+            t.schema = Some("dbo".to_string());
+            t.tsql_kind.ledger_type = ledger_type;
+            t
+        };
+        let mut lv = tsql_view(
+            "led_Ledger",
+            "CREATE VIEW [dbo].[led_Ledger] AS SELECT 1 AS n",
+        );
+        lv.tsql_kind.ledger_view = true;
+        let s = schema_of(vec![
+            dbo(table("led"), 2),
+            dbo(table("app_only"), 3),
+            dbo(table("MSSQL_LedgerHistoryFor_1"), 1),
+            dbo(table("plain"), 0),
+            lv,
+        ]);
+        let p = plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::MsSql,
+        );
+        let file = file_of(&p);
+        assert!(file.contains("CREATE TABLE [dbo].[plain]"), "{file}");
+        for name in [
+            "led]",
+            "app_only]",
+            "MSSQL_LedgerHistoryFor_1]",
+            "led_Ledger]",
+        ] {
+            assert!(
+                !file.contains(&format!("CREATE TABLE [dbo].[{name}")),
+                "{file}"
+            );
+            assert!(
+                !file.contains(&format!("CREATE VIEW [dbo].[{name}")),
+                "{file}"
+            );
+            assert!(
+                !file.contains(&format!("<<rows {}", name.trim_end_matches(']'))),
+                "{file}"
+            );
+        }
+        for what in [
+            "dbo.led (an updatable ledger table)",
+            "dbo.app_only (an append-only ledger table)",
+            "dbo.MSSQL_LedgerHistoryFor_1 (the history table of a ledger table)",
+            "dbo.led_Ledger (the ledger view of a ledger table)",
+        ] {
+            assert!(
+                p.left_out.iter().any(|l| l == what),
+                "{what}: {:?}",
+                p.left_out
+            );
+            assert!(file.contains(what), "{what}: {file}");
+        }
+        assert_eq!(p.tables, 1);
     }
 
     /// **The modal names what the file left out, and one space separates its

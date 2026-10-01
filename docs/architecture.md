@@ -3413,9 +3413,14 @@ existing prose was left alone.
     carries the keys, and SQLite has no `ALTER TABLE … ADD CONSTRAINT` to restate them with. That
     question is asked of the *table*, never of the dialect — the data answers it directly.
     **A table no `CREATE` from the model restates is left out of the file and named in its
-    header** — a system-versioned table, its history table, a memory-optimised table
-    (`TsqlTableKind::unrestatable`): kept, its `DROP` destroyed what the file could not put back and
-    its rows landed in nothing. Out of `order`, a key onto one is counted with the keys to tables
+    header** — a system-versioned table, its history table, a memory-optimised table, and an
+    updatable or append-only ledger table with its history table and its ledger view
+    (`TsqlTableKind::unrestatable`, the view being the one of a kind): kept, its `DROP` destroyed
+    what the file could not put back and its rows landed in nothing, and a ledger table came back
+    as a plain one carrying its ledger columns as data, its history as one more table and its view
+    as a plain view, a copy that took updates and deletes with no trace while the restore reported
+    success (`a_ledger_table_its_history_and_its_view_are_left_out_and_named`; live,
+    `a_dump_leaves_a_ledger_table_out_and_names_it`). Out of `order`, a key onto one is counted with the keys to tables
     outside the export. **What cannot be created without it goes with it**
     (`dependents_left_out`): every chosen view reading one, every routine in the export's
     namespaces that binds to one at `CREATE` — schema-bound, natively compiled, or an inline
@@ -13594,8 +13599,9 @@ existing prose was left alone.
   now runs `CATALOGUE_PROBE` first, one `COL_LENGTH` per column, into `Catalogue`, and
   `column_listing`, `index_listing`, `sequence_listing` and `table_kind_listing` are built from
   its answer: `sys.columns.graph_type` and `sys.tables.is_node`/`is_edge` (2017),
-  `sys.tables.temporal_type` (2016), `is_memory_optimized` (2014) and
-  `sys.sequences.last_used_value` (2017), each a constant in its place where it is missing so the
+  `sys.tables.temporal_type` (2016), `is_memory_optimized` (2014), `sys.tables.ledger_type` and
+  `ledger_view_id` (2022) and `sys.sequences.last_used_value` (2017), each a constant in its place
+  where it is missing so the
   reader's cell indices hold, and no table counted as a kind its server cannot have. Before 2017
   `current_value` stands in for `last_used_value`; the two differ only on a sequence that has
   handed out nothing, which then restores one step on — a gap, where reading nothing put every
@@ -13637,7 +13643,8 @@ existing prose was left alone.
   `AS (…) PERSISTED` — with the `NOT NULL` a persisted one may carry, as the designer's
   `tsql_definition` writes it, which the copy otherwise dropped and so took rows the original
   refused (`a_persisted_not_null_computed_column_keeps_its_not_null`) — a graph table `AS NODE`
-  or `AS EDGE` and a temporal or memory-optimised one not at all (`TsqlTableKind`, read by
+  or `AS EDGE` and a temporal, memory-optimised or ledger one — or a ledger view, which the
+  same listing reads — not at all (`TsqlTableKind`, read by
   `table_kind_listing`; its `unrestatable` reason in a comment, the sequence arm's rule, since
   read as a plain table a node carried its internal `graph_id_…`/`$node_id_…` columns and refused
   the original's rows, Msg 515, and a system-versioned table became two unrelated plain ones —
