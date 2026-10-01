@@ -362,6 +362,10 @@ fn durability_sentence(probe: Option<&Probe>, name: &str, ran: usize) -> String 
         Durability::Applied => {
             format!("{name} opened no transaction, so every statement that ran is still applied.")
         }
+        Durability::AppliedBeforeTransaction => format!(
+            "Any statement that ran before {name} opened its own transaction is still applied; \
+             what ran inside the transaction was rolled back."
+        ),
         Durability::Unknown => format!(
             "Any statement that already ran is still applied unless {name} opened its own \
              transaction."

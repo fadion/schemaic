@@ -10293,7 +10293,14 @@ existing prose was left alone.
     that were committed (`a_t_sql_block_is_not_the_file_opening_a_transaction`). Nor does MariaDB's
     `BEGIN NOT ATOMIC … END`, a compound block whose statements each autocommit, on any dialect —
     no transaction `BEGIN` is followed by `NOT ATOMIC`
-    (`a_compound_block_is_not_the_file_opening_a_transaction`). It is bounded
+    (`a_compound_block_is_not_the_file_opening_a_transaction`). **The transaction covers the file
+    from its opener on, not from statement 1**: `INSERT …; BEGIN; …` failing inside it keeps the
+    first `INSERT`, which ran in autocommit, and `durability` said "nothing was applied" over it on
+    every engine. `Probe::writes_before_opening` records a data change before the opener —
+    `sql::contains_write` less a session-only `SET`/`USE`/`DECLARE`/`PRINT` (`changes_data`), so a
+    dump's `SET NAMES` preamble is still no write — and turns that answer into
+    `Durability::AppliedBeforeTransaction` (`a_write_before_the_files_transaction_is_still_applied`).
+    It is bounded
     by `PROBE_MAX_BYTES` — the same 8 MB as `SAMPLE_MAX_BYTES`, for the same reason: the user asked
     to *look* at a file — and by `PROBE_MAX_STATEMENTS`. Either bound sets `Probe::more`, and every
     count is then reported through `count_label` as a floor (`400+`), never rounded up to a total

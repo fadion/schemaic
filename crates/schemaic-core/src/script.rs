@@ -467,6 +467,27 @@ fn opens_transaction(sql: &str, kind: &str, dialect: SqlDialect) -> bool {
     }
 }
 
+/// Does a statement the probe met **before the file's transaction opened**
+/// change data, so that it stays applied whatever happens inside — see
+/// [`Probe::writes_before_opening`]? [`sql::contains_write`]'s answer, less
+/// what changes only the session: `USE`, a `DECLARE`, a `PRINT`, and a `SET`
+/// other than one that outlives it (`GLOBAL`, `PERSIST`, `PERSIST_ONLY`,
+/// `PASSWORD`, `DEFAULT ROLE`). Anything it cannot read is a write — the
+/// answer that keeps the report from saying "nothing was applied".
+fn changes_data(sql: &str, kind: &str, dialect: SqlDialect) -> bool {
+    let session_only = match kind {
+        "USE" | "DECLARE" | "PRINT" => true,
+        "SET" => !matches!(
+            sql::leading_words(sql, 2, dialect)
+                .get(1)
+                .map(String::as_str),
+            Some("GLOBAL" | "PERSIST" | "PERSIST_ONLY" | "PASSWORD" | "DEFAULT")
+        ),
+        _ => false,
+    };
+    !session_only && sql::contains_write(sql, dialect)
+}
+
 /// What the modal's red confirmation should say about a probe.
 ///
 /// **The gate was `p.destructive > 0` at the call site, and that is one state
@@ -548,6 +569,10 @@ pub enum Durability {
     /// The file opened no transaction of its own, and Schemaic adds none — so
     /// every statement that ran is applied and stays applied.
     Applied,
+    /// The file opened its own transaction **after** statements that changed
+    /// data: those ran in autocommit and stay applied, and whatever ran inside
+    /// the transaction was rolled back with it.
+    AppliedBeforeTransaction,
     /// The file was never probed, or the probe stopped before it could tell.
     /// Say so rather than guessing either way.
     Unknown,
@@ -570,10 +595,16 @@ pub fn durability(probe: Option<&Probe>, ran: usize) -> Durability {
     let Some(p) = probe else {
         return Durability::Unknown;
     };
-    // Inside the one transaction the file opened: statement `ran + 1` is at or
-    // before the `COMMIT` that closes it.
+    // Inside the one transaction the file opened — statement `ran + 1` is at or
+    // before the `COMMIT` that closes it — or before it opened. Either way,
+    // what ran before the opener ran in autocommit: if any of it changed data,
+    // that much is applied, and "nothing was" would be the claim that costs.
     if p.atomic_through.is_some_and(|through| ran < through) {
-        return Durability::RolledBack;
+        return if p.writes_before_opening {
+            Durability::AppliedBeforeTransaction
+        } else {
+            Durability::RolledBack
+        };
     }
     // The probe read the file whole and found no `BEGIN`, so there is none.
     if !p.own_transaction && !p.more {
@@ -653,7 +684,18 @@ pub struct Probe {
     /// run reached is not a question a count of statements can answer. A
     /// transaction the probe never saw close covers everything it read, and
     /// [`durability`] answers `Unknown` past that.
+    ///
+    /// **It starts at the opener, not at statement 1.** What ran before the
+    /// `BEGIN` ran in autocommit, so a file that writes and then opens its
+    /// transaction keeps that write whatever happens inside —
+    /// [`Probe::writes_before_opening`] says whether it has one.
     pub atomic_through: Option<usize>,
+    /// A statement **before the file's transaction opened** changes data —
+    /// anything [`crate::sql::contains_write`] calls a write except a
+    /// session-only `SET` or `USE` ([`changes_data`]). A dump's `SET NAMES`
+    /// and `SET FOREIGN_KEY_CHECKS` preamble changes none, and a failure
+    /// inside its transaction still leaves nothing applied.
+    pub writes_before_opening: bool,
     /// Statements that destroy something. Named in plain language before the
     /// run, the way generated DDL is.
     pub destructive: usize,
@@ -804,6 +846,7 @@ pub fn probe<R: std::io::Read>(r: R, dialect: SqlDialect) -> std::io::Result<Pro
     let mut opens = 0usize;
     let mut depth = 0usize;
     let mut closed_at: Option<usize> = None;
+    let mut writes_before_opening = false;
     let mut destructive = 0usize;
     let mut unqualified = 0usize;
     let mut statements = 0usize;
@@ -834,6 +877,8 @@ pub fn probe<R: std::io::Read>(r: R, dialect: SqlDialect) -> std::io::Result<Pro
                 if depth == 0 {
                     closed_at.get_or_insert(i + 1);
                 }
+            } else if opens == 0 && changes_data(one, &kind, dialect) {
+                writes_before_opening = true;
             }
             if is_destructive(one, &kind, dialect) {
                 destructive += 1;
@@ -858,6 +903,7 @@ pub fn probe<R: std::io::Read>(r: R, dialect: SqlDialect) -> std::io::Result<Pro
         // Exactly one, or the question a statement count can answer is not the
         // one being asked — see the field.
         atomic_through: (opens == 1).then(|| closed_at.unwrap_or(stmts.len())),
+        writes_before_opening,
         destructive,
         unqualified,
         bytes_read,
@@ -1908,6 +1954,60 @@ mod tests {
         // A failure at the trailing `SET`: the rows are committed, and the
         // report must not claim otherwise.
         assert_eq!(durability(Some(&p), 4), Durability::Unknown);
+    }
+
+    /// **What ran before the file's transaction opened is not inside it.**
+    /// `INSERT …; BEGIN; …; COMMIT;` failing inside the transaction leaves the
+    /// first `INSERT` committed — it ran in autocommit — and the report said
+    /// "nothing was applied" over it, on MySQL and every other engine alike.
+    /// A session-only preamble (`SET NAMES`, `SET FOREIGN_KEY_CHECKS`, `USE`)
+    /// changes no data, and the whole run still reads as rolled back.
+    #[test]
+    fn a_write_before_the_files_transaction_is_still_applied() {
+        for d in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite] {
+            let p = probe(
+                b"INSERT INTO a VALUES (1);\nBEGIN;\nINSERT INTO t VALUES (1);\n\
+                  INSERT INTO t VALUES (2);\nCOMMIT;"
+                    .as_slice(),
+                d,
+            )
+            .expect("a slice reads");
+            // Failing at the second `INSERT INTO t`, inside the transaction.
+            assert_eq!(
+                durability(Some(&p), 3),
+                Durability::AppliedBeforeTransaction,
+                "{d:?}"
+            );
+            // Failing before the transaction opened: what ran is applied.
+            assert_eq!(
+                durability(Some(&p), 1),
+                Durability::AppliedBeforeTransaction,
+                "{d:?}"
+            );
+        }
+        let p = probed_tsql(
+            "INSERT INTO a VALUES (1);\nBEGIN TRAN;\nINSERT INTO t VALUES (1);\nCOMMIT;",
+        );
+        assert_eq!(
+            durability(Some(&p), 2),
+            Durability::AppliedBeforeTransaction
+        );
+        // A preamble of session state is no write.
+        let p = probed(
+            "/*!40101 SET NAMES utf8mb4 */;\nUSE app;\nSET FOREIGN_KEY_CHECKS = 0;\n\
+             START TRANSACTION;\nINSERT INTO t VALUES (1);\nCOMMIT;",
+        );
+        assert_eq!(durability(Some(&p), 4), Durability::RolledBack);
+        let p = probed_tsql(
+            "SET NOCOUNT ON;\nDECLARE @n int = 1;\nBEGIN TRAN;\nINSERT INTO t VALUES (@n);\nCOMMIT;",
+        );
+        assert_eq!(durability(Some(&p), 1), Durability::RolledBack);
+        // …but a `SET` that outlives the session is one.
+        let p = probed("SET GLOBAL max_connections = 500;\nBEGIN;\nINSERT INTO t VALUES (1);");
+        assert_eq!(
+            durability(Some(&p), 2),
+            Durability::AppliedBeforeTransaction
+        );
     }
 
     /// **MariaDB's `BEGIN NOT ATOMIC … END` is a compound block, not a
