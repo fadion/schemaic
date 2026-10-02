@@ -13643,7 +13643,22 @@ existing prose was left alone.
   has that name — so the text names all three, and the way round them: the bare host and the port
   the instance listens on (`a_silent_browser_names_the_instance_and_the_way_round`). The match is
   on the word `browser` in the driver's message, so a re-vendor that rewords it loses the
-  sentence and falls back to the driver's own. Live,
+  sentence and falls back to the driver's own. **On Windows the silence arrives as a reset, not a
+  timeout**: with nothing listening on UDP 1434 the host answers the query with an ICMP
+  port-unreachable, which Windows hands the next `recv` as `WSAECONNRESET` (os error 10054) at
+  once, so tiberius surfaced `Error::Io { kind: ConnectionReset }` and the connection form showed
+  the driver's *An existing connection was forcibly closed by the remote host* in place of the
+  sentence (seen on `127.0.0.1\SQLEXPRESS`, by 7f728746's hand check). `connect_with` maps the
+  error of `connect_named` through `browser_silence`, which rewrites that reset into the timeout's
+  shape — a `Conversion` whose message names the browser — and `connect` asks `is_browser_silence`
+  of the result, where it had matched the `Conversion` inline. Reading a reset as the Browser is
+  sound only because of where the mapping sits: that step holds just the lookup and the TCP
+  connect to the port it answered, and a refused TCP connect is `ConnectionRefused`; the login
+  after it is outside the `map_err`, so a reset there keeps the driver's words. The word
+  `browser` in the rewritten message is what `is_browser_silence` reads, so it is load-bearing
+  for the same reason the driver's is (`a_reset_browser_query_is_the_browsers_silence`, which
+  composes the two functions rather than testing either alone, and was red before the mapping).
+  Live,
   `a_named_instance_is_reached_through_sql_server_browser` puts a stand-in responder on UDP
   `127.0.0.1:1434`, since no container runs the Browser, answering MS-SQLR's `SVR_RESP` with the
   container's port; the saved port is 1, so a connect that used it would fail, and the instance

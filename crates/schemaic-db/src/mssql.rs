@@ -200,9 +200,8 @@ pub(crate) async fn connect(db: &Db, database: Option<&str>) -> Result<MsClient,
     // The Browser's silence — no service, UDP 1434 blocked, or no such
     // instance, which it does not answer either — in words that say which
     // three, and the way round it, rather than the driver's.
-    if let (Some((server, instance)), Err(tiberius::error::Error::Conversion(why))) =
-        (named, &result)
-        && why.to_ascii_lowercase().contains("browser")
+    if let (Some((server, instance)), Err(e)) = (named, &result)
+        && is_browser_silence(e)
     {
         return Err(DbError::Connect(browser_silent_text(server, instance)));
     }
@@ -233,7 +232,9 @@ pub(crate) async fn connect(db: &Db, database: Option<&str>) -> Result<MsClient,
 /// first ([`config`] set the instance and no port).
 async fn connect_with(mut cfg: tiberius::Config, named: bool) -> tiberius::Result<MsClient> {
     let tcp = if named {
-        let tcp = <TcpStream as tiberius::SqlBrowser>::connect_named(&cfg).await?;
+        let tcp = <TcpStream as tiberius::SqlBrowser>::connect_named(&cfg)
+            .await
+            .map_err(browser_silence)?;
         // **The port the Browser named goes back into the configuration**:
         // Windows sign-in names the service it signs in to by host and port
         // (`MSSQLSvc/host:port`), which would otherwise be the Browser's 1434.
@@ -245,6 +246,31 @@ async fn connect_with(mut cfg: tiberius::Config, named: bool) -> tiberius::Resul
         tcp
     };
     tiberius::Client::connect(cfg, tcp.compat_write()).await
+}
+
+/// A named connect's error, with the Browser's silence on Windows made the
+/// shape [`is_browser_silence`] reads: nothing on UDP 1434 answers with an
+/// ICMP port-unreachable, which Windows hands the `recv` as a connection reset
+/// (os error 10054) where elsewhere it times out. Only the lookup and the TCP
+/// connect after it are in this step, and a refused TCP connect is
+/// `ConnectionRefused`, so a reset here is the Browser.
+fn browser_silence(e: tiberius::error::Error) -> tiberius::error::Error {
+    match e {
+        tiberius::error::Error::Io {
+            kind: tiberius::error::IoErrorKind::ConnectionReset,
+            message,
+        } => tiberius::error::Error::Conversion(
+            format!("SQL browser gave no answer: {message}").into(),
+        ),
+        other => other,
+    }
+}
+
+/// Did SQL Server Browser give no answer — the driver's timeout, which it
+/// writes as a `Conversion` naming the browser?
+fn is_browser_silence(e: &tiberius::error::Error) -> bool {
+    matches!(e, tiberius::error::Error::Conversion(why)
+        if why.to_ascii_lowercase().contains("browser"))
 }
 
 /// What a connect to a named instance says when SQL Server Browser gave no
@@ -5495,6 +5521,36 @@ mod tests {
             t.contains("UDP port 1434") && t.contains("fixed port"),
             "{t}"
         );
+    }
+
+    /// **A Browser that is not there is silence on Windows too.** Nothing on
+    /// UDP 1434 is answered by an ICMP port-unreachable, which Windows hands
+    /// the next `recv` as a connection reset (os error 10054) rather than
+    /// letting it time out — so the driver's "forcibly closed by the remote
+    /// host" reached the connection form in place of the Browser sentence
+    /// (seen on a local `127.0.0.1\SQLEXPRESS`). The reset is made the
+    /// timeout's shape, which is what `connect` recognises; a refused TCP
+    /// connect and the server's own errors are not.
+    #[test]
+    fn a_reset_browser_query_is_the_browsers_silence() {
+        use tiberius::error::{Error, IoErrorKind};
+        let io = |kind| Error::Io {
+            kind,
+            message: "An existing connection was forcibly closed by the remote host. (os error \
+                      10054)"
+                .into(),
+        };
+        let timeout = Error::Conversion("SQL browser timeout during resolving instance X".into());
+        assert!(is_browser_silence(&browser_silence(timeout)));
+        assert!(is_browser_silence(&browser_silence(io(
+            IoErrorKind::ConnectionReset
+        ))));
+        assert!(!is_browser_silence(&browser_silence(io(
+            IoErrorKind::ConnectionRefused
+        ))));
+        assert!(!is_browser_silence(&browser_silence(Error::Conversion(
+            "invalid utf-16".into()
+        ))));
     }
 
     /// **The account browser asks nothing newer than 2016**, which the schema
