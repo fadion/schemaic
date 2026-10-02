@@ -2092,6 +2092,23 @@ impl ObjectKind {
         }
     }
 
+    /// The heading a set of them is listed under — the schema tree's folder
+    /// and the schema comparison's group alike (`CompareKind::group_label`),
+    /// so one object is filed under one name wherever it is listed.
+    pub fn group_label(self) -> &'static str {
+        match self {
+            ObjectKind::Enum => "Types",
+            ObjectKind::Domain => "Domains",
+            ObjectKind::Sequence => "Sequences",
+            ObjectKind::Function => "Functions",
+            ObjectKind::Procedure => "Procedures",
+            ObjectKind::Event => "Events",
+            ObjectKind::Synonym => "Synonyms",
+            ObjectKind::AliasType => "Alias types",
+            ObjectKind::XmlSchemaCollection => "XML schema collections",
+        }
+    }
+
     /// The keyword that addresses it in `ALTER`/`DROP`/`COMMENT ON`.
     ///
     /// A domain **is** a type, and `ALTER TYPE` will rename one — but `ALTER

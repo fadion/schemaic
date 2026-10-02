@@ -277,21 +277,6 @@ fn object_groups(schema: &DbSchema, scope: TableScope) -> Vec<(ObjectKind, Vec<O
         .collect()
 }
 
-/// The folder's label. Plural, because it names a group.
-fn object_group_label(kind: ObjectKind) -> &'static str {
-    match kind {
-        ObjectKind::Enum => "Types",
-        ObjectKind::Domain => "Domains",
-        ObjectKind::Sequence => "Sequences",
-        ObjectKind::Function => "Functions",
-        ObjectKind::Procedure => "Procedures",
-        ObjectKind::Event => "Events",
-        ObjectKind::Synonym => "Synonyms",
-        ObjectKind::AliasType => "Alias types",
-        ObjectKind::XmlSchemaCollection => "XML schema collections",
-    }
-}
-
 /// The glyph for a standalone object's kind — shared with the Find-Anywhere
 /// palette, so a type looks the same wherever it is listed.
 pub(crate) fn object_icon(kind: ObjectKind) -> &'static str {
@@ -2365,7 +2350,7 @@ fn object_group_node(
     let open_menu: CtxOpener = {
         let (db, ns, objects) = (database.clone(), scope_ns.clone(), items.clone());
         Rc::new(move |at| {
-            let label = object_group_label(kind);
+            let label = kind.group_label();
             let ai_prompt = format!(
                 "In the `{db}` database, explain the {} it defines — what each one is \
                  for and where it is used.",
@@ -2423,8 +2408,9 @@ fn object_group_node(
                 .margin_right(icon_gap())
                 .flex_shrink(0.0_f32)
         }),
-        text(object_group_label(kind))
-            .style(|s| s.font_size(theme::font_body()).color(theme::text())),
+        // The folder's name — `ObjectKind::group_label`, the schema
+        // comparison's group heading too.
+        text(kind.group_label()).style(|s| s.font_size(theme::font_body()).color(theme::text())),
         capsule(count.to_string()),
     ))
     .on_double_click_stop(move |_| (toggle_row)(key_row.clone()))

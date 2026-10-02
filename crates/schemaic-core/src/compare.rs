@@ -118,6 +118,39 @@ impl CompareKind {
         }
     }
 
+    /// The standalone-object kind this is, when it is one — the schema tree
+    /// files these in folders; a table, a view and a trigger it does not.
+    pub fn object_kind(self) -> Option<ObjectKind> {
+        match self {
+            CompareKind::Enum => Some(ObjectKind::Enum),
+            CompareKind::Domain => Some(ObjectKind::Domain),
+            CompareKind::XmlSchemaCollection => Some(ObjectKind::XmlSchemaCollection),
+            CompareKind::AliasType => Some(ObjectKind::AliasType),
+            CompareKind::Sequence => Some(ObjectKind::Sequence),
+            CompareKind::Synonym => Some(ObjectKind::Synonym),
+            CompareKind::Function => Some(ObjectKind::Function),
+            CompareKind::Procedure => Some(ObjectKind::Procedure),
+            CompareKind::Event => Some(ObjectKind::Event),
+            CompareKind::Table | CompareKind::View | CompareKind::Trigger => None,
+        }
+    }
+
+    /// The heading the comparison lists this kind under — the schema tree's
+    /// folder name where the tree has one ([`ObjectKind::group_label`]), so a
+    /// synonym is under *Synonyms* in both, and the plural noun otherwise.
+    /// Not [`CompareKind::label`], which is also the prefix of
+    /// [`CompareEntry::key`] and the expand state's key.
+    pub fn group_label(self) -> &'static str {
+        match (self, self.object_kind()) {
+            (_, Some(ok)) => ok.group_label(),
+            (CompareKind::Table, None) => "Tables",
+            (CompareKind::View, None) => "Views",
+            (CompareKind::Trigger, None) => "Triggers",
+            // Every other kind is an object kind, answered above.
+            (_, None) => self.label(),
+        }
+    }
+
     /// The routine kind this is, when it is one.
     pub fn routine_kind(self) -> Option<RoutineKind> {
         match self {
@@ -2432,6 +2465,44 @@ fn tsql_entry(
 mod tests {
     use super::*;
     use crate::schema::{ColumnInfo, ForeignKeyInfo, SequenceOwner, TriggerAction, ViewOptions};
+
+    /// **A comparison's groups are named as the schema tree names them.**
+    /// The heading was the singular noun with a count — *"synonym (1)"*,
+    /// *"enums (2)"* — over objects the tree beside it files under
+    /// *Synonyms* and *Types*. Asked of `ObjectKind::group_label` wherever
+    /// the two kinds meet, so the names cannot drift apart.
+    #[test]
+    fn a_compare_group_is_named_as_the_tree_names_it() {
+        use CompareKind::*;
+        let all = [
+            Enum,
+            Domain,
+            XmlSchemaCollection,
+            AliasType,
+            Sequence,
+            Synonym,
+            Table,
+            View,
+            Function,
+            Procedure,
+            Trigger,
+            Event,
+        ];
+        for k in all {
+            if let Some(ok) = k.object_kind() {
+                assert_eq!(k.group_label(), ok.group_label(), "{k:?}");
+            }
+        }
+        assert_eq!(Synonym.group_label(), "Synonyms");
+        assert_eq!(Enum.group_label(), "Types");
+        assert_eq!(Table.group_label(), "Tables");
+        assert_eq!(View.group_label(), "Views");
+        assert_eq!(Trigger.group_label(), "Triggers");
+        // Every object kind the tree files is one the comparison can meet.
+        for ok in ObjectKind::ALL {
+            assert!(all.iter().any(|k| k.object_kind() == Some(ok)), "{ok:?}");
+        }
+    }
 
     fn col(name: &str, ty: &str) -> ColumnInfo {
         ColumnInfo {

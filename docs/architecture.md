@@ -22599,6 +22599,13 @@ existing prose was left alone.
     each heading's tally, the diff pane's two sides and the plan the footer previews are all reads of
     one `SchemaComparison`, and an opinion of its own here would be the second differ the DDL
     invariant exists to prevent.
+    **A kind's heading is named as the schema tree names it** — `CompareKind::group_label`, which
+    is `ddl::ObjectKind::group_label` (the tree's folder name, moved out of `schema_tree.rs` for
+    this) wherever the comparison's kind is an object kind, and *Tables*, *Views* and *Triggers*
+    otherwise — with the count after it, muted. It was the singular noun pluralised with the count
+    in brackets, *"synonym (1)"*, *"enums (2)"*, beside a tree filing the same objects under
+    *Synonyms* and *Types* (`a_compare_group_is_named_as_the_tree_names_it`). `CompareKind::label`
+    stays the expand state's key and `CompareEntry::key`'s prefix; only the heading changed.
     **The module names no `Ui` — it is off `whole_ui_gate`'s list, 8 to zero — and the split is
     `import_view.rs`'s.** The renderers take `OverlayUi`, being the eight `compare_*` signals and
     nothing else: `open_compare`, `reset`, `body_for`, `ready_body` and `filter_bar`. The four that

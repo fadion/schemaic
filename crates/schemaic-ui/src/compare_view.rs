@@ -820,19 +820,23 @@ fn row_view(row: CompareRow<'_>, o: crate::OverlayUi) -> AnyView {
     }
 }
 
-/// A kind's heading: a chevron, the plural noun, and what is under it.
+/// A kind's heading: a chevron, the group's name, and how many are under it.
+///
+/// **Named as the schema tree names it** (`CompareKind::group_label`):
+/// *Synonyms*, *Types*, *Tables* — it was the singular noun with the count
+/// in brackets, *"synonym (1)"*, beside a tree that files the same objects
+/// under *Synonyms*. The count follows the name, muted, as the tree's folder
+/// count does.
 fn group_row(
     kind: CompareKind,
     counts: schemaic_core::compare::CompareCounts,
     expanded: bool,
     o: crate::OverlayUi,
 ) -> impl IntoView {
-    let label = format!(
-        "{}{} ({})",
-        kind.label(),
-        schemaic_core::text::plural(counts.total(), "", "s"),
-        counts.total()
-    );
+    let label = kind.group_label();
+    let count = counts.total().to_string();
+    // The expand state's key, which is also `CompareEntry::key`'s prefix —
+    // `label()`, not the heading.
     let key = kind.label().to_string();
     h_stack((
         crate::icons::icon(
@@ -851,6 +855,7 @@ fn group_row(
         // Wingdings. Nothing else in this app sets a weight, and a heading is
         // already told apart by its colour and its chevron.
         text(label).style(|s| s.font_size(theme::font_label()).color(theme::text_dim())),
+        text(count).style(|s| s.font_size(theme::font_label()).color(theme::text_muted())),
     ))
     .on_click_stop(move |_| {
         o.compare_expanded.update(|set| {
