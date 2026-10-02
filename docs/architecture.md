@@ -21145,7 +21145,15 @@ existing prose was left alone.
     routines; and events on MySQL — so a SQLite tree grows none of them. They are
     scoped by `TableScope` for the reason
     it exists — *flat* means the database has no schema level, not that its objects have no
-    namespace. Two filter rules follow from the level above being evaluated first: a database
+    namespace. **Whether there is a level is `schema_groups(schema, dialect)`**: none when every
+    object sits in the engine's default namespace (`schema::default_namespace` — PostgreSQL's
+    `public`, SQL Server's `dbo`; MySQL has none at all), one row per namespace otherwise —
+    **including a lone namespace that is not the default**. That case was flattened like `public`,
+    as "no choice to present", which hid the namespace's name and left its Drop no row to hang
+    from: a SQL Server database whose only objects live in `sales` listed them straight under the
+    database (`a_single_non_default_namespace_gets_its_level`,
+    `the_nav_walk_shows_a_single_non_default_namespace`). The dialect is the active connection's
+    (`active_dialect`), the render's and the nav walk's alike. Two filter rules follow from the level above being evaluated first: a database
     and a namespace both survive a search that only one of their **objects** matches, or the
     match would be hidden by the row that contains it. `nav_rows` carries the folders and their
     leaves like everything else — it is the function that must stay bug-for-bug identical to

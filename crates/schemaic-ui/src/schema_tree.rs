@@ -452,12 +452,36 @@ struct FolderItems {
 /// The namespaces to render as their own tree level, or empty when the tables
 /// should be listed flat directly under the database.
 ///
-/// A schema level only earns its extra click when there's a choice to make: MySQL
-/// has no namespaces at all, and a PostgreSQL database with only `public` looks
-/// exactly as it did before multi-schema browsing existed.
-fn schema_groups(schema: &schemaic_core::schema::DbSchema) -> Vec<String> {
+/// A schema level earns its extra click when there's a choice to make, or when
+/// the one namespace isn't the one a reader assumes: MySQL has no namespaces at
+/// all, and a database whose objects all sit in the engine's default —
+/// PostgreSQL's `public`, SQL Server's `dbo` (`schema::default_namespace`) —
+/// looks exactly as it did before multi-schema browsing existed. **A lone
+/// namespace that is not the default is shown**: flattened, its name was
+/// nowhere in the tree and its Drop had no row to hang from.
+fn schema_groups(schema: &schemaic_core::schema::DbSchema, dialect: SqlDialect) -> Vec<String> {
     let names = schema.schemas();
-    if names.len() > 1 { names } else { Vec::new() }
+    let default = schemaic_core::schema::default_namespace(dialect);
+    match names.as_slice() {
+        [] => Vec::new(),
+        [only] if Some(only.as_str()) == default => Vec::new(),
+        _ => names,
+    }
+}
+
+/// The active connection's dialect — what [`schema_groups`] asks for the
+/// engine's default namespace, read where the walk has no render context.
+fn active_dialect(
+    connections: RwSignal<Vec<schemaic_core::connection::Connection>>,
+    active_conn: RwSignal<u64>,
+) -> SqlDialect {
+    connections
+        .with_untracked(|cs| {
+            cs.iter()
+                .find(|k| k.id == active_conn.get_untracked())
+                .map(|k| SqlDialect::from_db_type(&k.db_type))
+        })
+        .unwrap_or_default()
 }
 
 /// The source identity of a schema-tree table row.
@@ -592,6 +616,7 @@ fn visible_nav_rows(
     filter: RwSignal<String>,
     db_favorites: ReadSignal<Vec<FavoriteRule>>,
     active_conn: RwSignal<u64>,
+    dialect: SqlDialect,
 ) -> Vec<NavRow> {
     let mut dbs: Vec<NavDb> = db_nodes.with_untracked(|nodes| {
         nodes
@@ -611,7 +636,7 @@ fn visible_nav_rows(
     });
     expanded.with_untracked(|exp| {
         hidden_dbs.with_untracked(|hidden| {
-            filter.with_untracked(|filter| nav_rows(&dbs, exp, hidden, filter))
+            filter.with_untracked(|filter| nav_rows(&dbs, exp, hidden, filter, dialect))
         })
     })
 }
@@ -625,6 +650,7 @@ fn nav_rows(
     exp: &HashSet<String>,
     hidden: &HashSet<String>,
     filter: &str,
+    dialect: SqlDialect,
 ) -> Vec<NavRow> {
     let filt = filter.trim().to_lowercase();
     let filtering = !filt.is_empty();
@@ -655,9 +681,9 @@ fn nav_rows(
         let Some(schema) = schema else {
             continue;
         };
-        // Mirror the tree: with >1 PostgreSQL namespace, tables hang off a schema
-        // row; otherwise they hang off the database directly.
-        let groups = schema_groups(schema);
+        // Mirror the tree: with a schema level (`schema_groups`), tables hang
+        // off a schema row; otherwise they hang off the database directly.
+        let groups = schema_groups(schema, dialect);
         let push_tables = |rows: &mut Vec<NavRow>, parent: &String, scope: TableScope| {
             // A schema whose own name matches shows all its tables, like `db_hit`.
             let ns_hit = scope.name().is_some_and(|s| object_name_matches(s, &filt));
@@ -1171,13 +1197,7 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
         move |c| {
             // The active connection's dialect (drives engine-correct DDL). Rebuilt
             // with the tree on a connection switch (db_nodes changes).
-            let dialect = connections
-                .with_untracked(|cs| {
-                    cs.iter()
-                        .find(|k| k.id == active_conn.get_untracked())
-                        .map(|k| SqlDialect::from_db_type(&k.db_type))
-                })
-                .unwrap_or_default();
+            let dialect = active_dialect(connections, active_conn);
             db_node(
                 c,
                 SchemaTreeCtx {
@@ -1277,6 +1297,7 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
                         filter,
                         db_favorites,
                         active_conn,
+                        active_dialect(connections, active_conn),
                     )
                     .iter()
                     .any(|r| r.key == k)
@@ -1341,6 +1362,7 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
                             filter,
                             db_favorites,
                             active_conn,
+                            active_dialect(connections, active_conn),
                         )
                         .iter()
                         .any(|r| r.key == k)
@@ -1390,7 +1412,8 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
                         // keyboard action — the dead end the key rows are kept
                         // out of `nav_rows` to avoid. The key is rebuilt exactly
                         // as `push_objects` builds it, scopes included.
-                        let names = schema_groups(&schema);
+                        let names =
+                            schema_groups(&schema, active_dialect(connections, active_conn));
                         let scopes: Vec<TableScope> = if names.is_empty() {
                             vec![TableScope::Flat]
                         } else {
@@ -1433,6 +1456,7 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
                 filter,
                 db_favorites,
                 active_conn,
+                active_dialect(connections, active_conn),
             );
             if rows.is_empty() {
                 return EventPropagation::Stop;
@@ -2012,10 +2036,11 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
                         nav,
                         indent_levels,
                     };
-                    // More than one PostgreSQL namespace → group the tables under a
-                    // schema row each. A single-schema (or MySQL) database keeps the
-                    // flat list it has always had.
-                    let groups = schema_groups(&schema);
+                    // More than one namespace, or a lone one that isn't the
+                    // engine's default → group the tables under a schema row
+                    // each. A default-only (or MySQL) database keeps the flat
+                    // list it has always had.
+                    let groups = schema_groups(&schema, dialect);
                     if !groups.is_empty() {
                         let visible: Vec<String> = groups
                             .into_iter()
@@ -3451,7 +3476,7 @@ mod tests {
     /// The walk's output as `(key, parent)` pairs — the two fields navigation
     /// actually moves on.
     fn walk(dbs: &[NavDb], exp: &[&str], hidden: &[&str], filter: &str) -> Vec<(String, String)> {
-        nav_rows(dbs, &set(exp), &set(hidden), filter)
+        nav_rows(dbs, &set(exp), &set(hidden), filter, SqlDialect::Postgres)
             .into_iter()
             .map(|r| (r.key, r.parent.unwrap_or_default()))
             .collect()
@@ -3603,7 +3628,13 @@ mod tests {
     #[test]
     fn nav_walk_marks_expandability_the_way_the_tree_does() {
         let dbs = vec![db("shop", vec![tbl_cols(None, "users", &["id"])])];
-        let rows = nav_rows(&dbs, &set(&["db:shop", "tbl:shop:users"]), &set(&[]), "");
+        let rows = nav_rows(
+            &dbs,
+            &set(&["db:shop", "tbl:shop:users"]),
+            &set(&[]),
+            "",
+            SqlDialect::MySql,
+        );
         assert_eq!(
             rows.iter()
                 .map(|r| (r.expandable, r.expanded))
@@ -3622,7 +3653,7 @@ mod tests {
             tables: vec![tbl(None, "users"), tbl(None, "orders")],
             ..Default::default()
         };
-        assert!(schema_groups(&s).is_empty());
+        assert!(schema_groups(&s, SqlDialect::MySql).is_empty());
     }
 
     /// The flat branch is taken whenever a database has no *schema level* — which
@@ -3658,7 +3689,7 @@ mod tests {
             tables: vec![tbl(Some("public"), "album"), tbl(Some("public"), "artist")],
             ..Default::default()
         };
-        assert!(schema_groups(&s).is_empty());
+        assert!(schema_groups(&s, SqlDialect::Postgres).is_empty());
     }
 
     #[test]
@@ -3671,18 +3702,65 @@ mod tests {
             ],
             ..Default::default()
         };
-        assert_eq!(schema_groups(&s), vec!["public", "analytics", "sales"]);
+        assert_eq!(
+            schema_groups(&s, SqlDialect::Postgres),
+            vec!["public", "analytics", "sales"]
+        );
     }
 
+    /// **A single namespace that is not the engine's default is shown.** It
+    /// was flattened like `public` — "no choice to present" — which hid the
+    /// one thing the level is also for: the namespace's name and its Drop.
+    /// A SQL Server database whose only objects live in `sales` showed them
+    /// straight under the database, `sales` nowhere (seen on 2022).
     #[test]
-    fn a_single_non_public_namespace_also_stays_flat() {
-        // Everything lives in one schema that just isn't `public`: still no choice
-        // to present, so no level — the table rows carry the qualifier themselves.
-        let s = DbSchema {
-            tables: vec![tbl(Some("sales"), "orders")],
+    fn a_single_non_default_namespace_gets_its_level() {
+        let only = |ns: &str| DbSchema {
+            tables: vec![tbl(Some(ns), "orders")],
             ..Default::default()
         };
-        assert!(schema_groups(&s).is_empty());
+        assert_eq!(
+            schema_groups(&only("sales"), SqlDialect::MsSql),
+            vec!["sales"]
+        );
+        assert_eq!(
+            schema_groups(&only("sales"), SqlDialect::Postgres),
+            vec!["sales"]
+        );
+        // The default alone is still no choice at all.
+        assert!(schema_groups(&only("dbo"), SqlDialect::MsSql).is_empty());
+        assert!(schema_groups(&only("public"), SqlDialect::Postgres).is_empty());
+        // And each engine's default is its own: `public` on SQL Server is an
+        // ordinary schema someone made.
+        assert_eq!(
+            schema_groups(&only("public"), SqlDialect::MsSql),
+            vec!["public"]
+        );
+    }
+
+    /// The walk the arrow keys take mirrors it: the lone `sales` is a row, its
+    /// table under it rather than under the database.
+    #[test]
+    fn the_nav_walk_shows_a_single_non_default_namespace() {
+        let dbs = vec![NavDb {
+            database: "shop".into(),
+            name: "shop".into(),
+            schema: Some(std::sync::Arc::new(DbSchema {
+                tables: vec![tbl(Some("sales"), "orders")],
+                ..Default::default()
+            })),
+        }];
+        let keys: Vec<String> =
+            nav_rows(&dbs, &set(&["db:shop"]), &set(&[]), "", SqlDialect::MsSql)
+                .into_iter()
+                .map(|r| r.key)
+                .collect();
+        // The schema row, collapsed — not the table, which a flat walk put
+        // straight under the database (its key names `sales` too).
+        assert_eq!(
+            keys,
+            vec!["db:shop".to_string(), schema_key("shop", "sales")]
+        );
     }
 
     // ── node keys ─────────────────────────────────────────────────────────
