@@ -38,6 +38,9 @@ pub enum ObjectTag {
     Function,
     Procedure,
     Event,
+    Synonym,
+    AliasType,
+    XmlSchemaCollection,
     /// A kind this build doesn't know, preserved exactly as it was read.
     Unknown(String),
 }
@@ -52,6 +55,9 @@ impl ObjectTag {
             ObjectTag::Function => Some(crate::ddl::ObjectKind::Function),
             ObjectTag::Procedure => Some(crate::ddl::ObjectKind::Procedure),
             ObjectTag::Event => Some(crate::ddl::ObjectKind::Event),
+            ObjectTag::Synonym => Some(crate::ddl::ObjectKind::Synonym),
+            ObjectTag::AliasType => Some(crate::ddl::ObjectKind::AliasType),
+            ObjectTag::XmlSchemaCollection => Some(crate::ddl::ObjectKind::XmlSchemaCollection),
             ObjectTag::Unknown(_) => None,
         }
     }
@@ -65,6 +71,9 @@ impl ObjectTag {
             crate::ddl::ObjectKind::Function => ObjectTag::Function,
             crate::ddl::ObjectKind::Procedure => ObjectTag::Procedure,
             crate::ddl::ObjectKind::Event => ObjectTag::Event,
+            crate::ddl::ObjectKind::Synonym => ObjectTag::Synonym,
+            crate::ddl::ObjectKind::AliasType => ObjectTag::AliasType,
+            crate::ddl::ObjectKind::XmlSchemaCollection => ObjectTag::XmlSchemaCollection,
         }
     }
 
@@ -78,6 +87,9 @@ impl ObjectTag {
             ObjectTag::Function => "function",
             ObjectTag::Procedure => "procedure",
             ObjectTag::Event => "event",
+            ObjectTag::Synonym => "synonym",
+            ObjectTag::AliasType => "alias_type",
+            ObjectTag::XmlSchemaCollection => "xml_schema_collection",
             ObjectTag::Unknown(s) => s,
         }
     }
@@ -99,6 +111,9 @@ impl<'de> Deserialize<'de> for ObjectTag {
             "function" => ObjectTag::Function,
             "procedure" => ObjectTag::Procedure,
             "event" => ObjectTag::Event,
+            "synonym" => ObjectTag::Synonym,
+            "alias_type" => ObjectTag::AliasType,
+            "xml_schema_collection" => ObjectTag::XmlSchemaCollection,
             _ => ObjectTag::Unknown(s),
         })
     }

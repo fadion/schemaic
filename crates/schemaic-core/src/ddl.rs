@@ -1970,6 +1970,15 @@ pub enum ObjectKind {
     /// not a `COMMENT ON`, so `SetObjectComment` would emit a statement no
     /// engine has.
     Event,
+    /// A SQL Server synonym (`CREATE SYNONYM … FOR …`), browsed from
+    /// [`crate::schema::TsqlObject`] like the two below.
+    Synonym,
+    /// A SQL Server alias type (`CREATE TYPE … FROM <base>`). Not
+    /// [`ObjectKind::Domain`], which is PostgreSQL's — a domain carries checks
+    /// and a default and is altered in place, an alias type neither.
+    AliasType,
+    /// A SQL Server XML schema collection.
+    XmlSchemaCollection,
 }
 
 impl ObjectKind {
@@ -1980,10 +1989,13 @@ impl ObjectKind {
     /// spread across the tree's folder builder, its two filter predicates and
     /// Find-Anywhere — and a kind added to three of them is a kind the palette
     /// silently cannot find.
-    pub const ALL: [ObjectKind; 6] = [
+    pub const ALL: [ObjectKind; 9] = [
         ObjectKind::Enum,
         ObjectKind::Domain,
+        ObjectKind::AliasType,
+        ObjectKind::XmlSchemaCollection,
         ObjectKind::Sequence,
+        ObjectKind::Synonym,
         ObjectKind::Function,
         ObjectKind::Procedure,
         ObjectKind::Event,
@@ -1998,6 +2010,9 @@ impl ObjectKind {
             ObjectKind::Function => "function",
             ObjectKind::Procedure => "procedure",
             ObjectKind::Event => "event",
+            ObjectKind::Synonym => "synonym",
+            ObjectKind::AliasType => "alias type",
+            ObjectKind::XmlSchemaCollection => "XML schema collection",
         }
     }
 
@@ -2015,6 +2030,10 @@ impl ObjectKind {
             ObjectKind::Function => "FUNCTION",
             ObjectKind::Procedure => "PROCEDURE",
             ObjectKind::Event => "EVENT",
+            ObjectKind::Synonym => "SYNONYM",
+            // T-SQL's `DROP TYPE`, as for any user-defined type there.
+            ObjectKind::AliasType => "TYPE",
+            ObjectKind::XmlSchemaCollection => "XML SCHEMA COLLECTION",
         }
     }
 
@@ -2033,11 +2052,19 @@ impl ObjectKind {
     /// distinction every call site had to remember. Both go through their own
     /// changes instead ([`drop_event`], [`diff_event`]).
     ///
-    /// An exhaustive `match`, so a seventh kind has to answer rather than
+    /// An exhaustive `match`, so a new kind has to answer rather than
     /// inheriting whichever side it falls on.
+    ///
+    /// SQL Server's three answer yes, for `DropObject` — which `tsql_supports`
+    /// admits for them and a T-SQL sequence, and nothing else of the three.
     pub fn uses_shared_changes(self) -> bool {
         match self {
-            ObjectKind::Enum | ObjectKind::Domain | ObjectKind::Sequence => true,
+            ObjectKind::Enum
+            | ObjectKind::Domain
+            | ObjectKind::Sequence
+            | ObjectKind::Synonym
+            | ObjectKind::AliasType
+            | ObjectKind::XmlSchemaCollection => true,
             ObjectKind::Function | ObjectKind::Procedure | ObjectKind::Event => false,
         }
     }
@@ -2047,9 +2074,13 @@ impl ObjectKind {
         match self {
             ObjectKind::Function => Some(crate::schema::RoutineKind::Function),
             ObjectKind::Procedure => Some(crate::schema::RoutineKind::Procedure),
-            ObjectKind::Enum | ObjectKind::Domain | ObjectKind::Sequence | ObjectKind::Event => {
-                None
-            }
+            ObjectKind::Enum
+            | ObjectKind::Domain
+            | ObjectKind::Sequence
+            | ObjectKind::Event
+            | ObjectKind::Synonym
+            | ObjectKind::AliasType
+            | ObjectKind::XmlSchemaCollection => None,
         }
     }
 
@@ -2413,7 +2444,10 @@ impl ObjectDraft {
             crate::schema::ObjectItem::Sequence(s) => {
                 Some(ObjectDraft::Sequence(SequenceDraft::from_info(s)))
             }
-            crate::schema::ObjectItem::Routine(_) | crate::schema::ObjectItem::Event(_) => None,
+            // SQL Server's standalone objects have no draft here yet.
+            crate::schema::ObjectItem::Routine(_)
+            | crate::schema::ObjectItem::Event(_)
+            | crate::schema::ObjectItem::Tsql(_) => None,
         }
     }
 
@@ -2428,7 +2462,13 @@ impl ObjectDraft {
             ObjectKind::Enum => Some(ObjectDraft::Enum(EnumDraft::blank(name, schema))),
             ObjectKind::Domain => Some(ObjectDraft::Domain(DomainDraft::blank(name, schema))),
             ObjectKind::Sequence => Some(ObjectDraft::Sequence(SequenceDraft::blank(name, schema))),
-            ObjectKind::Function | ObjectKind::Procedure | ObjectKind::Event => None,
+            // SQL Server's have no draft yet: browsed, scripted and dropped.
+            ObjectKind::Function
+            | ObjectKind::Procedure
+            | ObjectKind::Event
+            | ObjectKind::Synonym
+            | ObjectKind::AliasType
+            | ObjectKind::XmlSchemaCollection => None,
         }
     }
 
@@ -4065,12 +4105,24 @@ impl Change {
             Change::SetDomainNotNull { to: true } => vec![
                 "The statement fails if any column of this domain already holds NULL.".to_string(),
             ],
+            // Per kind, as both engines with these objects answer (measured,
+            // PostgreSQL 16 and SQL Server 2022): a sequence a default draws
+            // from is refused by name — this said PostgreSQL's `nextval`
+            // default "stops working", where the server in fact refuses the
+            // drop — and so is a type or an XML schema collection a column
+            // uses; a synonym is refused by nothing, and what names it fails
+            // when next run.
             Change::DropObject { kind } => vec![match kind {
                 ObjectKind::Sequence => "Drops the sequence and the position it had \
-                     reached. A column defaulting to `nextval` on it stops working."
+                     reached. The server refuses while a column's default still draws \
+                     from it, so those defaults have to go first."
+                    .to_string(),
+                ObjectKind::Synonym => "Drops the synonym. Nothing refuses it: a view, \
+                     routine or query that names it fails from then on, when it next \
+                     runs."
                     .to_string(),
                 k => format!(
-                    "Drops the {}. PostgreSQL refuses while a column still uses it, \
+                    "Drops the {}. The server refuses while a column still uses it, \
                      so those columns have to change type first.",
                     k.label()
                 ),
@@ -4854,6 +4906,9 @@ impl ChangeSet {
                 Change::CreateTable(t) => out.extend(create_table_sql(t, d)),
                 Change::DropTable => out.push(format!("DROP TABLE {q};")),
                 Change::TruncateTable => out.push(format!("TRUNCATE TABLE {q};")),
+                Change::DropObject { kind } => {
+                    out.push(format!("DROP {} {q};", kind.sql_keyword()))
+                }
                 _ => {}
             }
         }
@@ -10477,6 +10532,29 @@ pub fn supports_event_editing(dialect: SqlDialect) -> bool {
         && supports_change(dialect, &Change::DropEvent(Box::default()))
 }
 
+/// Can `dialect` **create** a standalone object of `kind` from the object
+/// editor's blank form — what an object folder's *Create* entry asks.
+///
+/// Computed from the change the form would raise, so a folder SQL Server now
+/// shows — its Sequences, read into [`crate::schema::DbSchema::tsql_objects`]
+/// — is not offered PostgreSQL's sequence form, whose `CREATE SEQUENCE` its
+/// plans refuse. SQL Server's own three kinds have no form yet, and answer no.
+pub fn supports_object_creation(dialect: SqlDialect, kind: ObjectKind) -> bool {
+    let probe = match kind {
+        ObjectKind::Enum => Change::CreateEnum(Box::default()),
+        ObjectKind::Domain => Change::CreateDomain(Box::default()),
+        ObjectKind::Sequence => Change::CreateSequence(Box::default()),
+        ObjectKind::Function | ObjectKind::Procedure => {
+            return supports_routine_editing(dialect);
+        }
+        ObjectKind::Event => return supports_event_editing(dialect),
+        ObjectKind::Synonym | ObjectKind::AliasType | ObjectKind::XmlSchemaCollection => {
+            return false;
+        }
+    };
+    supports_change(dialect, &probe)
+}
+
 /// Can `dialect` redefine a routine **in place**, with `CREATE OR REPLACE`?
 ///
 /// PostgreSQL can. **MySQL cannot** — `CREATE OR REPLACE PROCEDURE` is not a
@@ -14048,6 +14126,17 @@ fn tsql_supports(change: &Change) -> bool {
         // `mssql::run_server_ddl`, attached to `master` and outside any
         // transaction — T-SQL refuses `CREATE DATABASE` inside one.
         Change::CreateDatabase(_) | Change::DropDatabase { .. } => true,
+        // A sequence, synonym, alias type or XML schema collection, dropped from
+        // its tree row — the shared arm, written `DROP <kind> <name>`; nothing
+        // else of the shared three, T-SQL having no `COMMENT ON` and renaming
+        // through `sp_rename`.
+        Change::DropObject { kind } => matches!(
+            kind,
+            ObjectKind::Sequence
+                | ObjectKind::Synonym
+                | ObjectKind::AliasType
+                | ObjectKind::XmlSchemaCollection
+        ),
         // Logins, users, roles and grants: the shared account answer.
         c if is_account_change(c) => account_change_supported(SqlDialect::MsSql, c),
         Change::CreateTrigger(_)
@@ -26739,10 +26828,16 @@ mod object_tests {
         assert!(cs.destructive()[0].contains("refuses while a column still uses it"));
     }
 
+    /// A sequence a default draws from is **refused**, not broken — measured on
+    /// PostgreSQL 16, `DROP SEQUENCE` answers "cannot drop sequence s because
+    /// other objects depend on it". The sentence said the `nextval` default
+    /// "stops working", a drop that cannot happen.
     #[test]
-    fn dropping_a_sequence_says_what_stops_working() {
+    fn dropping_a_sequence_says_the_server_refuses_while_a_default_uses_it() {
         let cs = drop_object(ObjectKind::Sequence, "counter", None, Postgres);
-        assert!(cs.destructive()[0].contains("nextval"));
+        let risk = &cs.destructive()[0];
+        assert!(risk.contains("refuses while a column's default"), "{risk}");
+        assert!(!risk.contains("stops working"), "{risk}");
     }
 
     // ── Which columns a rebuild has to touch ────────────────────────────────
@@ -33868,5 +33963,194 @@ mod database_tests {
             .validate()
             .is_empty()
         );
+    }
+}
+
+/// SQL Server's sequences, synonyms, alias types and XML schema collections,
+/// browsed as standalone objects and dropped from their rows.
+#[cfg(test)]
+mod tsql_object_tests {
+    use super::*;
+    use crate::intel::SqlDialect::{MsSql, Postgres};
+    use crate::schema::{DbSchema, ObjectItem, TsqlObject, TsqlObjectKind};
+
+    fn obj(name: &str, kind: TsqlObjectKind) -> TsqlObject {
+        TsqlObject {
+            schema: Some("sales".into()),
+            name: name.into(),
+            kind,
+        }
+    }
+
+    fn sequence() -> TsqlObject {
+        obj(
+            "order_no",
+            TsqlObjectKind::Sequence {
+                data_type: "bigint".into(),
+                start: "1".into(),
+                increment: "1".into(),
+                min: "1".into(),
+                max: "9223372036854775807".into(),
+                cycle: false,
+                cache: Some(None),
+                last_used: None,
+            },
+        )
+    }
+
+    fn schema() -> DbSchema {
+        DbSchema {
+            tsql_objects: vec![
+                sequence(),
+                obj(
+                    "customers",
+                    TsqlObjectKind::Synonym {
+                        target: vec!["crm".into(), "dbo".into(), "customer".into()],
+                    },
+                ),
+                obj(
+                    "code",
+                    TsqlObjectKind::AliasType {
+                        base: "nvarchar(10)".into(),
+                        nullable: false,
+                    },
+                ),
+                obj(
+                    "invoice",
+                    TsqlObjectKind::XmlSchemaCollection {
+                        definition: "<xsd:schema xmlns:xsd=\"x\"/>".into(),
+                    },
+                ),
+            ],
+            ..Default::default()
+        }
+    }
+
+    /// **Each is browsed as its kind**: a sequence beside PostgreSQL's, the
+    /// other three in folders of their own, found by name, and their
+    /// namespace listed though it holds no table.
+    #[test]
+    fn each_object_is_browsed_and_found_as_its_kind() {
+        let s = schema();
+        for (kind, name, detail) in [
+            (ObjectKind::Sequence, "order_no", "bigint"),
+            (ObjectKind::Synonym, "customers", "crm.dbo.customer"),
+            (ObjectKind::AliasType, "code", "nvarchar(10) NOT NULL"),
+            (ObjectKind::XmlSchemaCollection, "invoice", "1 schema"),
+        ] {
+            let all = s.objects_all(kind);
+            assert_eq!(all.len(), 1, "{kind:?}: {all:?}");
+            assert_eq!(all[0].name(), name);
+            assert_eq!(all[0].kind(), kind);
+            assert_eq!(all[0].detail(), detail);
+            assert!(
+                s.find_object(Some("sales"), kind, name).is_some(),
+                "{kind:?}"
+            );
+            assert!(s.any_object_matches(&name[..3]), "{kind:?}");
+        }
+        assert_eq!(s.schemas(), vec!["sales".to_string()]);
+        // Kinds never cross: a synonym is not found as a sequence.
+        assert!(
+            s.find_object(Some("sales"), ObjectKind::Sequence, "customers")
+                .is_none()
+        );
+    }
+
+    /// **A row's Drop is the object's own `DROP`**, admitted on SQL Server and
+    /// written in its grammar — `DROP TYPE` for an alias type, `DROP XML
+    /// SCHEMA COLLECTION` for a collection.
+    #[test]
+    fn each_object_drops_with_its_own_statement() {
+        for (item, sql) in [
+            (sequence(), "DROP SEQUENCE [sales].[order_no];"),
+            (
+                schema().tsql_objects[1].clone(),
+                "DROP SYNONYM [sales].[customers];",
+            ),
+            (
+                schema().tsql_objects[2].clone(),
+                "DROP TYPE [sales].[code];",
+            ),
+            (
+                schema().tsql_objects[3].clone(),
+                "DROP XML SCHEMA COLLECTION [sales].[invoice];",
+            ),
+        ] {
+            let plan = drop_item(&ObjectItem::Tsql(item), MsSql);
+            assert!(plan.unsupported().is_empty(), "{:?}", plan.unsupported());
+            assert_eq!(plan.emit(), vec![sql.to_string()]);
+        }
+    }
+
+    /// The drop's consequence is said as SQL Server answers it, measured on
+    /// 2022: a sequence a default draws from and a type or collection a column
+    /// uses are refused by name; a synonym is refused by nothing.
+    #[test]
+    fn a_drop_says_what_sql_server_does_with_what_uses_it() {
+        let risk = |kind| {
+            single("x", Some("dbo"), MsSql, Change::DropObject { kind }).changes[0]
+                .risks(MsSql)
+                .join(" ")
+        };
+        assert!(risk(ObjectKind::Sequence).contains("server refuses"));
+        assert!(!risk(ObjectKind::Sequence).contains("stops working"));
+        assert!(risk(ObjectKind::AliasType).contains("refuses while a column"));
+        assert!(risk(ObjectKind::Synonym).contains("Nothing refuses it"));
+        assert!(!risk(ObjectKind::AliasType).contains("PostgreSQL"));
+        // PostgreSQL refuses the sequence's drop too (measured on 16: "cannot
+        // drop sequence s because other objects depend on it"), so one
+        // sentence is true of both.
+        let pg = Change::DropObject {
+            kind: ObjectKind::Sequence,
+        }
+        .risks(Postgres)
+        .join(" ");
+        assert_eq!(pg, risk(ObjectKind::Sequence));
+    }
+
+    /// Nothing else of the shared three reaches SQL Server: a rename or a
+    /// comment of one of these is no statement T-SQL has in that shape.
+    #[test]
+    fn only_the_drop_of_the_shared_changes_is_admitted() {
+        for kind in [
+            ObjectKind::Sequence,
+            ObjectKind::Synonym,
+            ObjectKind::AliasType,
+            ObjectKind::XmlSchemaCollection,
+        ] {
+            assert!(supports_change(MsSql, &Change::DropObject { kind }));
+            assert!(!supports_change(
+                MsSql,
+                &Change::RenameObject {
+                    kind,
+                    to: "y".into()
+                }
+            ));
+        }
+        for kind in [ObjectKind::Enum, ObjectKind::Domain] {
+            assert!(!supports_change(MsSql, &Change::DropObject { kind }));
+        }
+    }
+
+    /// **A folder offers Create only where the form's plan would apply**:
+    /// SQL Server's Sequences folder is not handed PostgreSQL's form, and its
+    /// own three kinds have none yet; PostgreSQL keeps its three.
+    #[test]
+    fn a_folder_offers_create_where_the_engine_takes_the_form() {
+        for kind in [
+            ObjectKind::Enum,
+            ObjectKind::Domain,
+            ObjectKind::Sequence,
+            ObjectKind::Synonym,
+            ObjectKind::AliasType,
+            ObjectKind::XmlSchemaCollection,
+        ] {
+            assert!(!supports_object_creation(MsSql, kind), "{kind:?}");
+        }
+        for kind in [ObjectKind::Enum, ObjectKind::Domain, ObjectKind::Sequence] {
+            assert!(supports_object_creation(Postgres, kind), "{kind:?}");
+        }
+        assert!(supports_object_creation(MsSql, ObjectKind::Procedure));
     }
 }

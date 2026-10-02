@@ -1341,7 +1341,13 @@ fn outside_dependencies(
 ) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for kind in [ObjectKind::Enum, ObjectKind::Domain, ObjectKind::Sequence] {
-        let all = schema.objects_all(kind);
+        // PostgreSQL's: a SQL Server object an outside table names is
+        // `tsql_named`'s question, asked of the T-SQL pass.
+        let all: Vec<_> = schema
+            .objects_all(kind)
+            .into_iter()
+            .filter(|o| o.tsql().is_none())
+            .collect();
         // **The names of this kind the file will itself create.** An unqualified
         // mention resolves through the search path, and if this dump emits an
         // object of that name the mention is satisfied by it. Without this, a
@@ -2651,8 +2657,10 @@ pub fn plan(
             .collect();
         for kind in kinds {
             for o in schema.objects_all(kind) {
-                // `is_internal` is what keeps a `serial`'s own sequence out.
-                if o.is_internal() {
+                // `is_internal` is what keeps a `serial`'s own sequence out. A
+                // SQL Server object is the T-SQL pass's below, which orders
+                // them by what names what.
+                if o.is_internal() || o.tsql().is_some() {
                     continue;
                 }
                 if let crate::schema::ObjectItem::Sequence(s) = &o

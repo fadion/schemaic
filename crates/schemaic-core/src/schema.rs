@@ -5001,6 +5001,11 @@ pub enum ObjectItem {
     /// Behind an [`Arc`](std::sync::Arc) for the reason `Routine` is: it carries
     /// a body, and the keyboard walk rebuilds this list on every arrow key.
     Event(std::sync::Arc<EventInfo>),
+    /// One of SQL Server's sequences, synonyms, alias types and XML schema
+    /// collections ([`DbSchema::tsql_objects`]) — its own arm rather than
+    /// `Sequence`'s, whose model is PostgreSQL's `i64` counters and whose
+    /// emitters write PostgreSQL's grammar.
+    Tsql(TsqlObject),
 }
 
 impl ObjectItem {
@@ -5011,6 +5016,7 @@ impl ObjectItem {
             ObjectItem::Sequence(_) => crate::ddl::ObjectKind::Sequence,
             ObjectItem::Routine(r) => crate::ddl::ObjectKind::of_routine(r.kind),
             ObjectItem::Event(_) => crate::ddl::ObjectKind::Event,
+            ObjectItem::Tsql(t) => t.object_kind(),
         }
     }
 
@@ -5040,6 +5046,7 @@ impl ObjectItem {
             ObjectItem::Sequence(s) => &s.name,
             ObjectItem::Routine(r) => &r.name,
             ObjectItem::Event(e) => &e.name,
+            ObjectItem::Tsql(t) => &t.name,
         }
     }
 
@@ -5050,6 +5057,15 @@ impl ObjectItem {
             ObjectItem::Sequence(s) => s.schema.as_deref(),
             ObjectItem::Routine(r) => r.schema.as_deref(),
             ObjectItem::Event(e) => e.schema.as_deref(),
+            ObjectItem::Tsql(t) => t.schema.as_deref(),
+        }
+    }
+
+    /// The SQL Server object behind this item, when it is one.
+    pub fn tsql(&self) -> Option<&TsqlObject> {
+        match self {
+            ObjectItem::Tsql(t) => Some(t),
+            _ => None,
         }
     }
 
@@ -5129,6 +5145,7 @@ impl ObjectItem {
             // and, when it is switched off, that it is. See
             // [`EventInfo::detail`].
             ObjectItem::Event(e) => e.detail(),
+            ObjectItem::Tsql(t) => t.detail(),
         }
     }
 
@@ -5233,6 +5250,8 @@ impl ObjectItem {
                 &crate::ddl::event_session_wrapped(e.create_sql(dialect), e, dialect),
                 dialect,
             ),
+            // The dump's own builder: one statement, terminated.
+            ObjectItem::Tsql(t) => t.create_sql(),
         }
     }
 }
@@ -6033,8 +6052,9 @@ pub struct DbSchema {
     /// emitters, editor and compare behind them, and a SQL Server object put
     /// there was scripted `CREATE DOMAIN … OWNED BY` and offered an editor that
     /// can apply nothing. This list carries what the dump needs —
-    /// [`TsqlObject::create_sql`] and its drop — and no surface reads it
-    /// otherwise.
+    /// [`TsqlObject::create_sql`] and its drop — and the schema tree browses it
+    /// as [`ObjectItem::Tsql`], each object's row scripted and dropped through
+    /// SQL Server's own statements.
     pub tsql_objects: Vec<TsqlObject>,
     /// **SQL Server's alias types that carry a bound default or rule**
     /// (`sp_bindefault`/`sp_bindrule`, `sys.types.default_object_id`/
@@ -6117,6 +6137,45 @@ impl TsqlObject {
             .skip_while(Option::is_none)
             .map(Option::unwrap_or_default)
             .collect()
+    }
+
+    /// The kind it is browsed as — a sequence beside PostgreSQL's, the other
+    /// three their own.
+    pub fn object_kind(&self) -> crate::ddl::ObjectKind {
+        use crate::ddl::ObjectKind as K;
+        match self.kind {
+            TsqlObjectKind::Sequence { .. } => K::Sequence,
+            TsqlObjectKind::AliasType { .. } => K::AliasType,
+            TsqlObjectKind::XmlSchemaCollection { .. } => K::XmlSchemaCollection,
+            TsqlObjectKind::Synonym { .. } => K::Synonym,
+        }
+    }
+
+    /// The one-line summary the tree shows beside the name: a sequence's type,
+    /// an alias type's base, a synonym's target, an XML collection's
+    /// namespaces counted.
+    pub fn detail(&self) -> String {
+        match &self.kind {
+            TsqlObjectKind::Sequence { data_type, .. } => data_type.clone(),
+            TsqlObjectKind::AliasType { base, nullable } => {
+                if *nullable {
+                    base.clone()
+                } else {
+                    format!("{base} NOT NULL")
+                }
+            }
+            TsqlObjectKind::Synonym { target } => target.join("."),
+            TsqlObjectKind::XmlSchemaCollection { definition } => {
+                // Each schema in the collection is one `<xsd:schema …>`
+                // element, whatever prefix the server printed it with.
+                let n =
+                    definition.matches(":schema ").count() + definition.matches("<schema ").count();
+                match n {
+                    1 => "1 schema".to_string(),
+                    n => format!("{n} schemas"),
+                }
+            }
+        }
     }
 
     /// What a person calls it — for a header line naming it.
@@ -6488,10 +6547,17 @@ impl DbSchema {
                 .domains
                 .iter()
                 .any(|d| keep(d.schema.as_deref(), &d.name)),
-            K::Sequence => self
-                .sequences
-                .iter()
-                .any(|s| keep(s.schema.as_deref(), &s.name)),
+            K::Sequence => {
+                self.sequences
+                    .iter()
+                    .any(|s| keep(s.schema.as_deref(), &s.name))
+                    || self
+                        .tsql_of(kind)
+                        .any(|t| keep(t.schema.as_deref(), &t.name))
+            }
+            K::Synonym | K::AliasType | K::XmlSchemaCollection => self
+                .tsql_of(kind)
+                .any(|t| keep(t.schema.as_deref(), &t.name)),
             k @ (K::Function | K::Procedure) => self
                 .routines
                 .iter()
@@ -6537,6 +6603,18 @@ impl DbSchema {
                 .filter(|s| keep(s.schema.as_deref(), &s.name))
                 .cloned()
                 .map(ObjectItem::Sequence)
+                .chain(
+                    self.tsql_of(kind)
+                        .filter(|t| keep(t.schema.as_deref(), &t.name))
+                        .cloned()
+                        .map(ObjectItem::Tsql),
+                )
+                .collect(),
+            K::Synonym | K::AliasType | K::XmlSchemaCollection => self
+                .tsql_of(kind)
+                .filter(|t| keep(t.schema.as_deref(), &t.name))
+                .cloned()
+                .map(ObjectItem::Tsql)
                 .collect(),
             k @ (K::Function | K::Procedure) => self
                 .routines
@@ -6614,17 +6692,28 @@ impl DbSchema {
                 .find_domain(schema, name)
                 .cloned()
                 .map(ObjectItem::Domain),
-            crate::ddl::ObjectKind::Sequence => self
+            k @ crate::ddl::ObjectKind::Sequence => self
                 .find_sequence(schema, name)
                 .cloned()
-                .map(ObjectItem::Sequence),
+                .map(ObjectItem::Sequence)
+                .or_else(|| {
+                    self.find_tsql(schema, k, name)
+                        .cloned()
+                        .map(ObjectItem::Tsql)
+                }),
+            k @ (crate::ddl::ObjectKind::Synonym
+            | crate::ddl::ObjectKind::AliasType
+            | crate::ddl::ObjectKind::XmlSchemaCollection) => self
+                .find_tsql(schema, k, name)
+                .cloned()
+                .map(ObjectItem::Tsql),
             // Both routine kinds go through one lookup narrowed by kind, so a
             // procedure and a function of the same name resolve to the one that
             // was asked for. PostgreSQL's overloads share a name *and* a kind, so
             // this still answers with the first — a remembered palette hit names
             // only `(namespace, kind, name)`, which is all a search-history entry
             // can carry.
-            // Spelled out rather than caught by a `_`, so a sixth `ObjectKind`
+            // Spelled out rather than caught by a `_`, so a new `ObjectKind`
             // has to answer for itself instead of silently resolving to
             // nothing here and in the two lookups below.
             k @ (crate::ddl::ObjectKind::Function | crate::ddl::ObjectKind::Procedure) => k
@@ -6637,6 +6726,28 @@ impl DbSchema {
                 .cloned()
                 .map(ObjectItem::Event),
         }
+    }
+
+    /// SQL Server's standalone objects of one kind ([`DbSchema::tsql_objects`]).
+    fn tsql_of(&self, kind: crate::ddl::ObjectKind) -> impl Iterator<Item = &TsqlObject> {
+        self.tsql_objects
+            .iter()
+            .filter(move |t| t.object_kind() == kind)
+    }
+
+    /// One SQL Server standalone object of `kind`, on the namespace rule every
+    /// other `find_*` follows.
+    pub fn find_tsql(
+        &self,
+        schema: Option<&str>,
+        kind: crate::ddl::ObjectKind,
+        name: &str,
+    ) -> Option<&TsqlObject> {
+        let of_kind: Vec<&TsqlObject> = self.tsql_of(kind).collect();
+        find_by_ns(&of_kind, schema, name, |t| {
+            (t.schema.as_deref(), t.name.as_str())
+        })
+        .copied()
     }
 
     /// One scheduled event by name. The namespace argument is carried for the
@@ -6866,6 +6977,7 @@ impl DbSchema {
             .chain(self.domains.iter().filter_map(|d| d.schema.clone()))
             .chain(self.sequences.iter().filter_map(|s| s.schema.clone()))
             .chain(self.routines.iter().filter_map(|r| r.schema.clone()))
+            .chain(self.tsql_objects.iter().filter_map(|t| t.schema.clone()))
             .collect();
         out.sort_by(|a, b| {
             let key = |s: &str| (s != PG_DEFAULT_SCHEMA, s.to_string());

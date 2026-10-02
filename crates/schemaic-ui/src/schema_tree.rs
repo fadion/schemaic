@@ -286,6 +286,9 @@ fn object_group_label(kind: ObjectKind) -> &'static str {
         ObjectKind::Function => "Functions",
         ObjectKind::Procedure => "Procedures",
         ObjectKind::Event => "Events",
+        ObjectKind::Synonym => "Synonyms",
+        ObjectKind::AliasType => "Alias types",
+        ObjectKind::XmlSchemaCollection => "XML schema collections",
     }
 }
 
@@ -304,6 +307,11 @@ pub(crate) fn object_icon(kind: ObjectKind) -> &'static str {
         // A clock, because the only thing that distinguishes an event from a
         // procedure is that something runs it on a schedule.
         ObjectKind::Event => icons::CLOCK,
+        // A synonym is a second name for another object. Not `BOOKMARK`,
+        // which the palette's snippet rows wear.
+        ObjectKind::Synonym => icons::COPY,
+        ObjectKind::AliasType => icons::TYPE,
+        ObjectKind::XmlSchemaCollection => icons::BRACES,
     }
 }
 

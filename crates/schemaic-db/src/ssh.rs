@@ -383,7 +383,7 @@ pub(crate) fn tunnel_target_refusal(target_host: &str) -> Option<String> {
 }
 
 /// Open an SSH tunnel to `target_host:target_port` and return a handle carrying
-/// the local port a MySQL connection should use. The tunnel forwards connections
+/// the local port the engine's connection should use. The tunnel forwards connections
 /// until the handle is dropped.
 pub async fn open_tunnel(
     ssh: &SshTunnel,

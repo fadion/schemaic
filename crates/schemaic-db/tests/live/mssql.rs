@@ -2675,6 +2675,58 @@ async fn a_database_is_created_with_its_collation_and_dropped() {
     );
 }
 
+/// **A sequence, a synonym, an alias type and an XML schema collection are
+/// browsed as their kinds and dropped from their rows** — read from the
+/// catalogue into the tree's lists, and each row's Drop plan run as the
+/// preview runs it.
+#[tokio::test(flavor = "multi_thread")]
+async fn standalone_objects_are_browsed_and_dropped() {
+    use schemaic_core::ddl::{self, ObjectKind};
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("objects").await;
+    s.exec("CREATE SEQUENCE dbo.order_no AS bigint START WITH 10")
+        .await;
+    s.exec("CREATE TABLE dbo.customer (id int)").await;
+    s.exec("CREATE SYNONYM dbo.customers FOR dbo.customer")
+        .await;
+    s.exec("CREATE TYPE dbo.code FROM nvarchar(10) NOT NULL")
+        .await;
+    s.exec(
+        "CREATE XML SCHEMA COLLECTION dbo.invoice AS N'<xsd:schema \
+         xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\"><xsd:element name=\"a\" \
+         type=\"xsd:string\"/></xsd:schema>'",
+    )
+    .await;
+    let schema =
+        s.db.fetch_schema(&s.name, CancellationToken::new())
+            .await
+            .expect("the schema");
+    for (kind, name, detail) in [
+        (ObjectKind::Sequence, "order_no", "bigint"),
+        (ObjectKind::Synonym, "customers", "dbo.customer"),
+        (ObjectKind::AliasType, "code", "nvarchar(10) NOT NULL"),
+        (ObjectKind::XmlSchemaCollection, "invoice", "1 schema"),
+    ] {
+        let all = schema.objects_all(kind);
+        let item = all
+            .iter()
+            .find(|o| o.name() == name)
+            .unwrap_or_else(|| panic!("{kind:?} {name} not browsed: {all:?}"));
+        assert_eq!(item.detail(), detail, "{kind:?}");
+        let stmts = ddl::drop_item(item, MS).emit();
+        s.db.run_ddl(&s.name, &stmts, CancellationToken::new())
+            .await
+            .unwrap_or_else(|e| panic!("{e}\n{}", stmts.join("\n")));
+    }
+    let left =
+        s.db.fetch_schema(&s.name, CancellationToken::new())
+            .await
+            .expect("the schema");
+    assert!(left.tsql_objects.is_empty(), "{:?}", left.tsql_objects);
+}
+
 /// **A namespace is created and dropped in the plan's transaction**, and
 /// `CREATE SCHEMA` — which T-SQL wants first in its batch — runs as the
 /// emitter writes it, ahead of a table in the same plan. A drop of one still

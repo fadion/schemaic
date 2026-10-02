@@ -415,7 +415,7 @@ pub fn psql_cli_tls_env(tls: &crate::connection::Tls) -> Vec<(String, String)> {
 /// `x;Encrypt=no;Server=192.0.2.1` opens *that database* on *this server* —
 /// there is no connection-string re-read to refuse, which is the difference
 /// from [`psql_target`]. The host is the one value `sqlcmd` parses
-/// (`host\instance`, `host,port`, a `np:` or `lpc:` prefix), so it is forced
+/// (`host\instance`, `host,port`, a `tcp:`, `np:`, `lpc:` or `admin:` prefix), so it is forced
 /// onto TCP with `tcp:` and one that would re-shape the address is refused —
 /// bar a named instance, `server\INSTANCE`
 /// ([`crate::connection::sql_server_instance`]), which is passed on as

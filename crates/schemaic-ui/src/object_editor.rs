@@ -257,6 +257,11 @@ pub(crate) fn is_editable_object(item: &ObjectItem) -> bool {
     if let Some(r) = item.routine() {
         return r.is_editable();
     }
+    // SQL Server's sequences, synonyms, alias types and XML schema collections
+    // are browsed, scripted and dropped, and have no form here.
+    if item.tsql().is_some() {
+        return false;
+    }
     !item.is_internal()
 }
 

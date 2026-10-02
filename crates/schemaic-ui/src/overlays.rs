@@ -1903,7 +1903,9 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         entries.push(MenuEntry::action("Refresh", move || (rf)(db.clone())));
                     }
                     entries.push(MenuEntry::Separator);
-                    {
+                    // Absent, not dimmed, for a SQL Server object: there is no
+                    // form for one, which no state of the connection changes.
+                    if item.tsql().is_none() {
                         let ui = import_ui.clone();
                         let (db, obj) = (database.clone(), item.clone());
                         let read_only = conn_read_only(&connections, active_conn);
@@ -2112,8 +2114,17 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         let db = database.clone();
                         entries.push(MenuEntry::action("Refresh", move || (rf)(db.clone())));
                     }
-                    entries.push(MenuEntry::Separator);
-                    {
+                    // Absent where the engine has no form for the kind — SQL
+                    // Server's Sequences folder would otherwise open
+                    // PostgreSQL's sequence form, whose plan it refuses.
+                    let creates = schemaic_core::ddl::supports_object_creation(
+                        crate::table_designer::edit_ctx(import_ui.conn).dialect,
+                        kind,
+                    );
+                    if creates {
+                        entries.push(MenuEntry::Separator);
+                    }
+                    if creates {
                         let ui = import_ui.clone();
                         let (db, ns) = (database.clone(), schema.clone());
                         // Flat and kind-named, not a `Create` submenu: the folder
