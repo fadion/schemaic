@@ -1674,6 +1674,133 @@ fn file_name(path: &str) -> &str {
     }
 }
 
+/// Why an SSH connection's last load left no tunnel behind.
+///
+/// A load opens the tunnel and lists the databases through it, and keeps the
+/// tunnel only when both succeed — so a load that failed at *either* step leaves
+/// the connection with no tunnel, and every operation after it finds none.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LoadFailure {
+    /// The tunnel itself would not open — the SSH error (connect, host key,
+    /// key file, agent, authentication).
+    Tunnel(String),
+    /// The tunnel opened, but the server behind it failed the load, and the
+    /// tunnel was closed with it.
+    Server(String),
+}
+
+/// The last load failure of each SSH connection, by connection id — what an
+/// operation that finds no tunnel says instead of a bare "not established yet".
+///
+/// **That sentence alone hid every real failure.** A load that failed wrote its
+/// error to the log and nowhere else, so the Accounts view, a query and the
+/// terminal all answered "not established yet" for a tunnel that had in fact
+/// been refused — on a key, an agent, a host key or the server's own sign-in —
+/// and would never come up without a retry.
+#[derive(Debug, Default)]
+pub struct TunnelFailures(std::collections::HashMap<u64, LoadFailure>);
+
+impl TunnelFailures {
+    /// Record that this connection's load failed, replacing any earlier failure.
+    pub fn record(&mut self, conn_id: u64, failure: LoadFailure) {
+        self.0.insert(conn_id, failure);
+    }
+
+    /// Forget this connection's failure: a new load is under way, or one has
+    /// opened the tunnel.
+    pub fn clear(&mut self, conn_id: u64) {
+        self.0.remove(&conn_id);
+    }
+
+    /// What an operation on this connection says when it finds no tunnel.
+    pub fn refusal(&self, conn_id: u64) -> String {
+        const RETRY: &str = "Refresh the schema to try again.";
+        match self.0.get(&conn_id) {
+            None => "SSH tunnel is not established yet".to_string(),
+            Some(LoadFailure::Tunnel(why)) => format!(
+                "The SSH tunnel could not be opened: {}. {RETRY}",
+                why.trim_end_matches('.')
+            ),
+            Some(LoadFailure::Server(why)) => format!(
+                "Could not connect through the SSH tunnel: {}. {RETRY}",
+                why.trim_end_matches('.')
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tunnel_failure_tests {
+    use super::{LoadFailure, TunnelFailures};
+
+    const STILL_OPENING: &str = "SSH tunnel is not established yet";
+
+    #[test]
+    fn a_tunnel_still_opening_says_so() {
+        assert_eq!(TunnelFailures::default().refusal(7), STILL_OPENING);
+    }
+
+    #[test]
+    fn a_refused_tunnel_names_the_ssh_error_and_how_to_retry() {
+        let mut f = TunnelFailures::default();
+        f.record(7, LoadFailure::Tunnel("SSH authentication failed".into()));
+        let msg = f.refusal(7);
+        assert!(msg.contains("SSH authentication failed"), "{msg}");
+        assert!(msg.contains("could not be opened"), "{msg}");
+        assert!(msg.contains("Refresh the schema"), "{msg}");
+        assert!(!msg.contains("not established yet"), "{msg}");
+    }
+
+    /// The tunnel opened and the *server* refused — saying the tunnel failed
+    /// would send the user to fix SSH settings that work.
+    #[test]
+    fn a_server_failure_behind_the_tunnel_is_not_called_a_tunnel_failure() {
+        let mut f = TunnelFailures::default();
+        f.record(
+            7,
+            LoadFailure::Server("Access denied for user 'app'".into()),
+        );
+        let msg = f.refusal(7);
+        assert!(msg.contains("Access denied for user 'app'"), "{msg}");
+        assert!(msg.contains("through the SSH tunnel"), "{msg}");
+        assert!(!msg.contains("could not be opened"), "{msg}");
+        assert!(msg.contains("Refresh the schema"), "{msg}");
+    }
+
+    #[test]
+    fn a_reason_ending_in_a_full_stop_is_not_doubled() {
+        let mut f = TunnelFailures::default();
+        f.record(7, LoadFailure::Tunnel("no answer within 20s.".into()));
+        assert!(!f.refusal(7).contains(".."), "{}", f.refusal(7));
+    }
+
+    /// A retry under way is "still opening" again, not the last attempt's error.
+    #[test]
+    fn clearing_returns_to_still_opening() {
+        let mut f = TunnelFailures::default();
+        f.record(7, LoadFailure::Tunnel("SSH authentication failed".into()));
+        f.clear(7);
+        assert_eq!(f.refusal(7), STILL_OPENING);
+    }
+
+    #[test]
+    fn a_failure_belongs_to_its_own_connection() {
+        let mut f = TunnelFailures::default();
+        f.record(7, LoadFailure::Tunnel("SSH authentication failed".into()));
+        assert_eq!(f.refusal(8), STILL_OPENING);
+    }
+
+    #[test]
+    fn the_latest_failure_is_the_one_reported() {
+        let mut f = TunnelFailures::default();
+        f.record(7, LoadFailure::Tunnel("SSH authentication failed".into()));
+        f.record(7, LoadFailure::Server("Unknown database 'app'".into()));
+        let msg = f.refusal(7);
+        assert!(msg.contains("Unknown database 'app'"), "{msg}");
+        assert!(!msg.contains("authentication"), "{msg}");
+    }
+}
+
 #[cfg(test)]
 mod status_tests {
     use super::ConnStatus;

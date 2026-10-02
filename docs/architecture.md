@@ -246,7 +246,8 @@ existing prose was left alone.
     both go through the one `match`, so the fallback and an override cannot drift apart. It used to
     be `Failed(String)`, resolved *as* a `ModalError::statement` — a statement's failure by
     construction, which it was not: a run refused before anything was sent (`db_for`'s "connection
-    no longer exists", "SSH tunnel is not established yet", `session_for`'s refusals), a timeout, a
+    no longer exists", its no-tunnel refusal — "SSH tunnel is not established yet", or the last
+    load's failure, `connection::TunnelFailures::refusal` — `session_for`'s refusals), a timeout, a
     cancel or not-sent note, a failed `BEGIN` and a refused connection all land in the tab as its
     error, and every one of them was offered an AI fix and an explanation
     (`a_tab_refused_before_sending_offers_neither_action`). The run paths in `app/main.rs` now say
@@ -8575,7 +8576,29 @@ existing prose was left alone.
     `SshTunnel`/`SshAuth` cover the tunnel's own
     auth, including `Agent` (delegates to the running SSH agent, storing no secret at all).
     `ConnStatus::is_down` treats `Unknown` (not yet checked, or a tunnel still coming up) as
-    *non*-blocking — only a confirmed failure gates work. `SshAuth`/`Environment`/`AiData`
+    *non*-blocking — only a confirmed failure gates work.
+    **`LoadFailure` and `TunnelFailures` are what an SSH connection with no tunnel says, in place of
+    one sentence for every reason.** The app opens a tunnel to keep in one place, `load_schema`'s
+    background task, and keeps it only if `list_databases` through it succeeds as well — so a load
+    that failed at either step left the connection with no tunnel, and its error went to
+    `tracing::error!` and nowhere visible. Every later `db_for` and the terminal's `open_db_cli` then
+    answered "SSH tunnel is not established yet", for good, over a tunnel that had in fact been
+    refused, the sentence masking the one cause worth reading; it was reported from macOS, where the
+    tunnel evidently never opened. `LoadFailure` says which step failed — `Tunnel` (connect, host key,
+    key file, agent, authentication) or `Server` (the tunnel opened, the server behind it failed the
+    load, and the tunnel closed with it) — and is the error half of the app's `ConnectResult`, which
+    was a `String`. `TunnelFailures` holds each connection's last one, and `refusal` is the sentence:
+    the old one while nothing is recorded, otherwise the reason and *Refresh the schema to try
+    again* — the only retry there is, since nothing re-opens a tunnel on its own. `Server` is kept
+    apart because calling it a tunnel failure would send the user to fix SSH settings that work
+    (`a_server_failure_behind_the_tunnel_is_not_called_a_tunnel_failure`, in `tunnel_failure_tests`).
+    The app's bookkeeping is the half the type cannot pin: `load_schema` clears the entry when it is
+    about to open a fresh tunnel (no cached port) and when a load lands a new handle, so a retry under
+    way reads as still opening rather than as the last attempt's error; and it records a failure
+    whatever the landing — a load the user has moved on from still left *that* connection without a
+    tunnel — but only when none is cached, since a reload that failed on the server over a live
+    tunnel keeps it, and the operations that find it need no excuse. Manage Connections' Test is
+    still the other place the SSH error is shown in full. `SshAuth`/`Environment`/`AiData`
     deserialize through a `…Raw` shim with `#[serde(other)]`, so a value written by a newer build
     degrades to a default instead of failing all of `connections.json` — and for `AiData` that
     default is deliberately the *safe* level, since an unknown one written by a newer build means
@@ -18358,8 +18381,10 @@ existing prose was left alone.
     `ssh::refusal_message` — several sentences naming the host, both fingerprints, that the key *"has
     CHANGED since Schemaic first trusted it"*, and the out-of-band check to perform — stopped
     existing. `ssh::authenticate`'s own doc names this button as the surface for exactly those
-    errors, and the *real* connect path never had the gap (`Err(e) => send(Err(e.to_string()))`), so
-    only the diagnostic control lost the diagnosis: an unreadable trust store, a wrong SSH password
+    errors, and the *real* connect path kept the reason
+    (`Err(e) => send(Err(LoadFailure::Tunnel(e.to_string())))`) — if only as far as the log, until
+    `connection::TunnelFailures` — so only the diagnostic control lost the diagnosis outright: an
+    unreadable trust store, a wrong SSH password
     and an unreachable host were one identical red X with no text anywhere. `line` collapses the
     reason's whitespace, because the status is one row ending in `…` and a refusal runs to several
     lines; the whole of `TestState::failure()` is the line's tooltip (the anchored `.tooltip`,
@@ -23505,7 +23530,9 @@ existing prose was left alone.
   conditional on `db_for` succeeding**: clearing is always right, but refetching *now* is right only
   when the connection can be reached this instant, and after an edit it routinely cannot — `save_conn`
   has just dropped the tunnel and `load_schema` re-opens it asynchronously, so `db_for` answers "SSH
-  tunnel is not established yet" and refreshing anyway painted that across the panel as `Failed`, with
+  tunnel is not established yet" (the re-open having cleared any earlier load's failure from
+  `TunnelFailures`, so it is that sentence and not a stale reason) and refreshing anyway painted that
+  across the panel as `Failed`, with
   no tick to retire it when the interval is off. `Failed` is the right answer for a refresh the *user*
   asked for and the wrong one for a reset nobody asked for, where "no snapshot yet" is the truth; the
   delete path reaches the same guard through `db_for`'s "connection no longer exists". For the same

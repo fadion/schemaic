@@ -64,7 +64,7 @@ use floem::reactive::{
 };
 use floem::window::{Icon, WindowConfig};
 use schemaic_core::conn_import;
-use schemaic_core::connection::{ConnStatus, Connection};
+use schemaic_core::connection::{ConnStatus, Connection, LoadFailure};
 use schemaic_core::edit::analyze_edit;
 use schemaic_core::health;
 use schemaic_core::model::{
@@ -73,14 +73,14 @@ use schemaic_core::model::{
 use schemaic_core::monitor::{Snapshot, TickAction, diff_snapshots};
 
 /// Outcome of a background connect + schema-load task: `(tunnel port, tunnel
-/// handle, databases listed)` on success, or an error message.
+/// handle, databases listed)` on success, or which step failed and why.
 type ConnectResult = Result<
     (
         Option<u16>,
         Option<schemaic_db::ssh::TunnelHandle>,
         Vec<schemaic_core::schema::ListedDatabase>,
     ),
-    String,
+    schemaic_core::connection::LoadFailure,
 >;
 /// Self-rescheduling cursor-blink tick — holds an `Rc` to itself so it can re-arm.
 type BlinkTick = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
@@ -1950,6 +1950,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // (evict/replace) tears down its listener + local port (review H9).
     let tunnels: Rc<RefCell<HashMap<u64, schemaic_db::ssh::TunnelHandle>>> =
         Rc::new(RefCell::new(HashMap::new()));
+    // Why a connection's last load left it no tunnel — what `db_for` and the
+    // terminal say instead of "not established yet" once a load has failed.
+    // Written by `load_schema` alone, the one place a tunnel is opened to keep.
+    let tunnel_failures: Rc<RefCell<schemaic_core::connection::TunnelFailures>> =
+        Rc::new(RefCell::new(Default::default()));
     // The child scope the current `db_nodes` (and their `schema` signals) were
     // built in. A `load_schema` that switches connection swaps in a fresh scope
     // and disposes the old one, so a session's connection switches don't accrete
@@ -1966,12 +1971,14 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
 
     // Resolve a saved connection id to a `Db` handle (the app's connection
     // identity — no credential URL). For an SSH connection this needs the tunnel
-    // to be established; returns `None` until it is (the caller reports "not
-    // ready"). Because a tab carries its own `conn_id`, this keeps running each
-    // tab against the connection it was opened under, even after the active
-    // connection is switched (review H13).
+    // to be established; returns `Err` until it is — "not established yet" while
+    // the load is out, or the load's own failure once it has failed. Because a tab
+    // carries its own `conn_id`, this keeps running each tab against the
+    // connection it was opened under, even after the active connection is
+    // switched (review H13).
     let db_for: Rc<dyn Fn(u64) -> Result<Db, String>> = {
         let tunnels = tunnels.clone();
+        let tunnel_failures = tunnel_failures.clone();
         Rc::new(move |conn_id: u64| {
             let conn = connections
                 .with_untracked(|cs| cs.iter().find(|c| c.id == conn_id).cloned())
@@ -1979,7 +1986,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             let tunnel = if conn.uses_tunnel() {
                 match tunnels.borrow().get(&conn_id).map(|h| h.port()) {
                     Some(p) => Some(p),
-                    None => return Err("SSH tunnel is not established yet".to_string()),
+                    None => return Err(tunnel_failures.borrow().refusal(conn_id)),
                 }
             } else {
                 None
@@ -8094,6 +8101,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let load_schema: Rc<dyn Fn(Connection)> = {
         let handle = handle.clone();
         let tunnels = tunnels.clone();
+        let tunnel_failures = tunnel_failures.clone();
         let nodes_scope = nodes_scope.clone();
         let nodes_conn = nodes_conn.clone();
         let schema_gen = schema_gen.clone();
@@ -8130,7 +8138,15 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             let clear_schema_tree_cb = clear_schema_tree.clone();
             let start_fetch_cb = start_fetch.clone();
             let cached_port = tunnels.borrow().get(&conn.id).map(|h| h.port());
+            // A tunnel is about to be opened again, so until this load lands an
+            // operation that finds none is waiting on it, not on the last
+            // attempt's failure — that is the retry the failure tells the user
+            // to make.
+            if cached_port.is_none() {
+                tunnel_failures.borrow_mut().clear(conn.id);
+            }
             let tunnels_cache = tunnels.clone();
+            let failures_cb = tunnel_failures.clone();
             // `conn` (original) → the send callback; `conn_task` → the async task.
             let conn_send = conn.clone();
             // Result payload: the effective tunnel port (if SSH), a *newly opened*
@@ -8144,6 +8160,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         if let Some(handle) = new_handle {
                             // Dropping any prior handle here tears its listener down.
                             tunnels_cache.borrow_mut().insert(conn_send.id, handle);
+                            failures_cb.borrow_mut().clear(conn_send.id);
                         }
                         // Everything past this point writes state the tree, the
                         // database menu, the completion index and every open tab
@@ -8288,7 +8305,18 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         }
                     }
                     Err(e) => {
-                        tracing::error!("schema load failed: {e}");
+                        tracing::error!("schema load failed: {e:?}");
+                        // **Recorded whatever the landing**: a load the user has
+                        // moved on from still left *this* connection without a
+                        // tunnel, and its next operation is owed the reason. Only
+                        // when no tunnel is cached, though — a reload that failed
+                        // on the server over a live tunnel keeps that tunnel, and
+                        // the operations that find it need no excuse.
+                        if conn_send.uses_tunnel()
+                            && !tunnels_cache.borrow().contains_key(&conn_send.id)
+                        {
+                            failures_cb.borrow_mut().record(conn_send.id, e);
+                        }
                         // Same rule on this side: clearing the tree here would empty
                         // it for a connection that loaded perfectly well.
                         if landing == LoadLanding::Install {
@@ -8322,7 +8350,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         {
                             Ok(h) => (Some(h.port()), Some(h)),
                             Err(e) => {
-                                send(Err(e.to_string()));
+                                send(Err(LoadFailure::Tunnel(e.to_string())));
                                 return;
                             }
                         },
@@ -8333,7 +8361,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 let db = Db::connect(&conn_task, tunnel_port);
                 match db.list_databases().await {
                     Ok(listed) => send(Ok((tunnel_port, new_handle, listed))),
-                    Err(e) => send(Err(e.to_string())),
+                    // The tunnel this load opened, if any, closes here with it.
+                    Err(e) => send(Err(LoadFailure::Server(e.to_string()))),
                 }
             });
         })
@@ -11727,6 +11756,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let open_db_cli: Rc<dyn Fn(Option<String>)> = {
         let install_terminal = install_terminal.clone();
         let tunnels = tunnels.clone();
+        let tunnel_failures = tunnel_failures.clone();
         Rc::new(move |db: Option<String>| {
             // Guard the panel reveal: a redundant `set` rebuilds the panel
             // `dyn_container` (docs/architecture.md gotcha / review H11).
@@ -11789,9 +11819,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         ..conn
                     },
                     None => {
-                        let cfg = message_shell(
-                            "SSH tunnel is not established yet; try again in a moment.",
-                        );
+                        let cfg = message_shell(&tunnel_failures.borrow().refusal(conn.id));
                         // A message, not a session — nothing to badge. And a
                         // failure to spawn even *that* is logged now; this was
                         // the site that swallowed it.
