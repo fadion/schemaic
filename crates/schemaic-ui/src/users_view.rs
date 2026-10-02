@@ -1036,9 +1036,8 @@ fn actions_row(
     let risk_dialect = target.dialect;
     // The connection the browser was opened on, like the dialect beside it —
     // the preview must be built for the server this account lives on, not for
-    // whichever the switcher points at by the time the confirm is answered.
+    // whichever the switcher points at.
     let plan_conn_id = target.conn_id;
-    let confirm = overlay.confirm;
     // 14, after Reset password at 13 — the tab order follows the row, and Drop
     // stays last of the three because it is the destructive one.
     let drop = action_button("Drop", ActionKind::Danger, enabled, ring, 14, move || {
@@ -1058,46 +1057,28 @@ fn actions_row(
         }
         let database = drop_target.database.clone().unwrap_or_default();
         let who = drop_who.clone();
-        let change = schemaic_core::ddl::Change::DropAccount(Box::new(who.clone()));
-        confirm.set(Some(crate::Confirm {
-            title: format!("Drop {}", who.kind.label().to_lowercase()),
-            // The plain-language cost is the change's own (`Change::risks`), so
-            // this question and the preview's warning cannot drift into saying
-            // different things about the same act — and the preview still stands
-            // between the answer and the server.
-            // The target's dialect, like the highlighting and the capability
-            // half of `WriteGate` — the sentence is about the account on the
-            // server this browser was opened on, not about whichever connection
-            // the switcher points at.
-            message: crate::overlays::risk_prompt(&change, risk_dialect),
-            resolve: Rc::new(move |yes| {
-                // **And again here**, because this closure runs an arbitrary
-                // time after the button was pressed — the deferred half
-                // `accept_dialog_launch` exists for. The flag can flip while the
-                // red confirm stands.
-                let read_only = launch_read_only(conn.connections, plan_conn_id);
-                if yes && crate::widgets::accept_launch(false, read_only) {
-                    crate::ddl_preview::preview_account(
-                        ddl,
-                        crate::ddl_preview::PlanTarget {
-                            conn_id: plan_conn_id,
-                            database: database.clone(),
-                            dialect: risk_dialect,
-                            // Read, not a literal `false`. `PlanTarget`'s own
-                            // doc says the struct exists so no call site comes
-                            // to pass a constant beside a live `conn_id`, and
-                            // this was the site that did — which is why the
-                            // preview opened with Apply enabled and inert.
-                            read_only,
-                        },
-                        &who.display(),
-                        vec![schemaic_core::ddl::Change::DropAccount(Box::new(
-                            who.clone(),
-                        ))],
-                    );
-                }
-            }),
-        }));
+        // **Straight to the preview.** A confirm asked first with the change's
+        // own risk sentence (`Change::risks`), and the preview said it again
+        // over Apply — the same question twice. The preview's warning is that
+        // sentence, in the target's dialect: the account on the server this
+        // browser was opened on, not whichever the switcher points at.
+        crate::ddl_preview::preview_account(
+            ddl,
+            crate::ddl_preview::PlanTarget {
+                conn_id: plan_conn_id,
+                database,
+                dialect: risk_dialect,
+                // Read, not a literal `false`. `PlanTarget`'s own doc says the
+                // struct exists so no call site comes to pass a constant beside
+                // a live `conn_id`, and this was the site that did — which is
+                // why the preview opened with Apply enabled and inert.
+                read_only: launch_read_only(conn.connections, plan_conn_id),
+            },
+            &who.display(),
+            vec![schemaic_core::ddl::Change::DropAccount(Box::new(
+                who.clone(),
+            ))],
+        );
     });
 
     let why = match gate {

@@ -4640,8 +4640,8 @@ impl Change {
             // the operation, because "drops the database" is a sentence someone
             // who meant to drop a table would also read as fine.
             //
-            // No row count. Every other drop in here gets one from
-            // `stats::drop_prompt`, but a whole database's is the sum of a
+            // No row count. A table's drop gets one from `stats::drop_scale`,
+            // added to the preview's warning, but a whole database's is the sum of a
             // schema fetch this change has never made, and a figure that arrived
             // as `~0` on a stale tree would be worse than none.
             Change::DropDatabase { name } => vec![format!(

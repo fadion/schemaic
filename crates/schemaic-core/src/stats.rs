@@ -966,48 +966,49 @@ pub fn truncate_prompt(label: &str, rows: Option<RowCount>) -> String {
     }
 }
 
-/// What the `DROP` confirmation asks about `label`.
+/// The DDL preview's warning for the schema tree's Drop of a `shape`, from
+/// the dropped change's own `risks` — what a confirm asked before the
+/// preview, until it went for asking twice.
 ///
-/// A view is dropped by `DROP VIEW` and owns no rows, so it is never given a row
-/// figure — asking about "every row in it" would be asking about rows that
-/// belong to the tables under it.
-///
-/// **A [`TableShape`], not an `is_view` bool.** The boolean has two answers and
-/// the object has three: a MariaDB sequence is not a view, so it took the table
-/// sentence and the user was asked to confirm dropping "all N rows in it" about
-/// a counter. `TableShape` exists to make that a case somebody has to answer.
-pub fn drop_prompt(label: &str, rows: Option<RowCount>, shape: TableShape) -> String {
+/// A table's keeps its sentence and gains its row figure ([`drop_scale`]). A
+/// MariaDB **sequence** is dropped by `DROP TABLE` (no `Change` of its own),
+/// so its risks are the table's — *"every row in it"*, about a counter — and
+/// are replaced with its own; the confirm had been the one place that drop
+/// was worded as a sequence's. A view's are already its own.
+pub fn drop_warning(risks: Vec<String>, rows: Option<RowCount>, shape: TableShape) -> Vec<String> {
     match shape {
-        TableShape::View => {
-            return format!("Drop {label}? Anything built on it goes too. This can't be undone.");
-        }
-        // No rows to name, and nothing is built on it — a sequence is a counter.
-        TableShape::Sequence => return format!("Drop {label}? This can't be undone."),
-        TableShape::Table => {}
-    }
-    match rows.filter(|&r| worth_naming(r)) {
-        Some(r) => format!(
-            "Drop {label} and all {} rows in it? This can't be undone.",
-            r.label()
-        ),
-        None => format!("Drop {label} and every row in it? This can't be undone."),
+        TableShape::Table => risks.into_iter().chain(drop_scale(rows, shape)).collect(),
+        TableShape::Sequence => vec![
+            "Drops the sequence: the value it has reached is lost, and anything that still \
+             draws from it fails."
+                .to_string(),
+        ],
+        TableShape::View => risks,
     }
 }
 
-/// The title over [`drop_prompt`] — the same three answers, so the modal cannot
-/// say one thing in its heading and another in its body.
+/// How many rows a table's drop takes with it, as the sentence the DDL
+/// preview's warning adds under the drop's own (*"Drops the table and every
+/// row in it."*) — `None` where there is no figure worth naming.
 ///
-/// **Here rather than at the call site, because that is where it went wrong.**
-/// The body was routed through `drop_prompt` and the title three lines above it
-/// kept `if is_view { "Drop view" } else { "Drop table" }`, so a MariaDB
-/// sequence drew *"Drop table"* over *"Drop sq1? This can't be undone."* — the
-/// two halves of one modal disagreeing about what the object is. A view closure
-/// has no unit test to hold it; a pure pair does.
-pub fn drop_title(shape: TableShape) -> &'static str {
+/// It replaced a confirm asked *before* the preview, which said the same
+/// thing with the figure in it, so a drop asked twice; this is the one part
+/// of that question the preview did not already say.
+///
+/// **A [`TableShape`], not an `is_view` bool.** A view is dropped by `DROP
+/// VIEW` and owns no rows — its rows belong to the tables under it — and a
+/// MariaDB sequence is a counter: neither is ever given a figure. The boolean
+/// had two answers for the three, and a sequence took the table's sentence,
+/// the user being told about "all N rows in it" about a counter.
+fn drop_scale(rows: Option<RowCount>, shape: TableShape) -> Option<String> {
     match shape {
-        TableShape::View => "Drop view",
-        TableShape::Sequence => "Drop sequence",
-        TableShape::Table => "Drop table",
+        TableShape::View | TableShape::Sequence => None,
+        TableShape::Table => rows.filter(|&r| worth_naming(r)).map(|r| {
+            format!(
+                "By the schema tree's statistics, that is {} rows.",
+                r.label()
+            )
+        }),
     }
 }
 
@@ -2142,14 +2143,6 @@ mod tests {
             truncate_prompt("orders", Some(RowCount::Estimate(4_200_000))),
             "Delete all ~4.2m rows in orders? This can't be undone."
         );
-        assert_eq!(
-            drop_prompt(
-                "orders",
-                Some(RowCount::Estimate(4_200_000)),
-                TableShape::Table
-            ),
-            "Drop orders and all ~4.2m rows in it? This can't be undone."
-        );
         // An engine that counted is believed at any size above empty.
         assert_eq!(
             truncate_prompt("orders", Some(RowCount::Exact(12))),
@@ -2178,60 +2171,59 @@ mod tests {
         assert_eq!(truncate_prompt("orders", Some(RowCount::Exact(0))), vague);
     }
 
+    /// **A drop's warning is about the object's own shape.** A MariaDB
+    /// sequence is dropped by `DROP TABLE`, so the preview's warning was the
+    /// table's — *"Drops the table and every row in it."* — over a counter;
+    /// the confirm it replaced had been the one place worded for a sequence.
+    /// A table's keeps its sentence and gains the figure; a view's is its own.
     #[test]
-    fn a_view_is_never_given_a_row_figure() {
-        // It owns none: the rows belong to the tables under it, and `DROP VIEW`
-        // deletes no data at all.
-        let expected = "Drop v? Anything built on it goes too. This can't be undone.";
-        assert_eq!(drop_prompt("v", None, TableShape::View), expected);
+    fn a_drop_warning_speaks_of_the_shape_it_drops() {
+        let table = vec!["Drops the table and every row in it.".to_string()];
+        let big = Some(RowCount::Estimate(4_200_000));
         assert_eq!(
-            drop_prompt("v", Some(RowCount::Estimate(4_200_000)), TableShape::View),
-            expected
+            drop_warning(table.clone(), big, TableShape::Table),
+            vec![
+                "Drops the table and every row in it.".to_string(),
+                "By the schema tree's statistics, that is ~4.2m rows.".to_string(),
+            ]
         );
+        assert_eq!(drop_warning(table.clone(), None, TableShape::Table), table);
+        let seq = drop_warning(table.clone(), big, TableShape::Sequence);
+        assert_eq!(seq.len(), 1, "{seq:?}");
+        assert!(seq[0].contains("sequence"), "{seq:?}");
+        assert!(
+            !seq[0].contains("table") && !seq[0].contains("row"),
+            "{seq:?}"
+        );
+        let view = vec!["Drops the view.".to_string()];
+        assert_eq!(drop_warning(view.clone(), big, TableShape::View), view);
     }
 
-    /// **Nor is a sequence**, which the `is_view` boolean could not say. It is
-    /// not a view, so it took the *table* sentence — the user was asked to
-    /// confirm dropping "all N rows in it" about a counter, with a figure that
-    /// came from whatever the row-count probe made of it.
+    /// **The drop's scale, now said in the preview's warning** — the one thing
+    /// the confirm it replaces asked that the preview did not: under *"Drops
+    /// the table and every row in it."*, how many rows that is, on the same
+    /// rules `drop_prompt` kept — a figure worth naming, and never one for a
+    /// view or a sequence, which own no rows.
     #[test]
-    fn a_sequence_is_not_asked_about_as_a_table() {
-        let expected = "Drop sq1? This can't be undone.";
-        assert_eq!(drop_prompt("sq1", None, TableShape::Sequence), expected);
-        // Even handed a row figure: a sequence owns no rows whatever the probe
-        // reported, and repeating the number would be the bug with a sentence.
+    fn a_drop_names_its_scale_only_for_a_table_with_a_figure_worth_naming() {
+        let big = Some(RowCount::Estimate(4_200_000));
         assert_eq!(
-            drop_prompt(
-                "sq1",
-                Some(RowCount::Estimate(4_200_000)),
-                TableShape::Sequence
-            ),
-            expected
+            drop_scale(big, TableShape::Table).as_deref(),
+            Some("By the schema tree's statistics, that is ~4.2m rows.")
         );
-        // And it is not given the view's sentence either — nothing is built on
-        // a sequence the way a view is built on its tables.
-        assert_ne!(
-            drop_prompt("sq1", None, TableShape::Sequence),
-            drop_prompt("sq1", None, TableShape::View)
+        assert_eq!(
+            drop_scale(Some(RowCount::Exact(12)), TableShape::Table).as_deref(),
+            Some("By the schema tree's statistics, that is 12 rows.")
         );
-    }
-
-    /// **The title has to answer the same three, or the modal contradicts
-    /// itself.** The body was routed through `drop_prompt` and the title left on
-    /// `is_view`, so a sequence drew "Drop table" over "Drop sq1? This can't be
-    /// undone."
-    #[test]
-    fn the_drop_title_names_the_same_three_shapes_as_its_body() {
-        assert_eq!(drop_title(TableShape::Table), "Drop table");
-        assert_eq!(drop_title(TableShape::View), "Drop view");
-        assert_eq!(drop_title(TableShape::Sequence), "Drop sequence");
-        // The property, not the strings: three shapes, three titles.
-        let titles = [TableShape::Table, TableShape::View, TableShape::Sequence]
-            .map(drop_title)
-            .to_vec();
-        let mut uniq = titles.clone();
-        uniq.sort_unstable();
-        uniq.dedup();
-        assert_eq!(uniq.len(), titles.len(), "two shapes share a title");
+        for quiet in [
+            None,
+            Some(RowCount::Exact(0)),
+            Some(RowCount::Estimate(0)),
+            Some(RowCount::Estimate(CONFIRM_ROW_FLOOR - 1)),
+        ] {
+            assert_eq!(drop_scale(quiet, TableShape::Table), None, "{quiet:?}");
+        }
+        assert_eq!(drop_scale(big, TableShape::View), None);
+        assert_eq!(drop_scale(big, TableShape::Sequence), None);
     }
 }

@@ -7009,8 +7009,8 @@ existing prose was left alone.
     MySQL 8 a bare role name resolves to the `%` row it stored. That was three of the browser's four
     role actions broken on MariaDB. It is fixed in the fold and not in the builders because the
     *display* was wrong by the same value: `Some("")` renders through `display()` as `readers@`,
-    trailing `@`, in the list, the detail heading, the preview's subject and the Drop confirm's
-    title. `a_role_carries_no_host_because_no_statement_naming_one_accepts_it` pins it, and its
+    trailing `@`, in the list, the detail heading, the preview's subject and what was then the Drop
+    confirm's title. `a_role_carries_no_host_because_no_statement_naming_one_accepts_it` pins it, and its
     counterpart `a_user_keeps_the_host_that_makes_it_a_distinct_account` pins the half that must not
     move with it. `system` marks the accounts the server owns and maintains (the reserved
     `mysql.`/`mariadb.` prefixes, PostgreSQL's `pg_` predefined roles, **and the one exact name
@@ -8963,7 +8963,7 @@ existing prose was left alone.
     makes it a case somebody has to answer, and the consumers are the places that decide what an
     object *is*: `dump.rs`'s `DROP`-and-data arms and `ui/overlays.rs`'s menus, then
     `propose::resolve_target` (the one gate whose whole job is refusing a non-table),
-    `erd::build_graph`'s `drawable` filter, `stats::drop_prompt`, and `create_ddl_script`'s
+    `erd::build_graph`'s `drawable` filter, `stats::drop_warning`, and `create_ddl_script`'s
     partition below. `is_view` and `is_sequence` stay public because the three backends fill them
     directly and privatising them needs a constructor first; what they are not is the question a
     decision asks.
@@ -11692,7 +11692,7 @@ existing prose was left alone.
       was counting", never "drop this". `count_rows_sql` builds the exact-count statement here
       rather than three times in the db crate, through the one quoter (`export::ident_sql`).
       Filled by `Db::fetch_table_stats`; rendered by `ui/properties.rs`, the schema tree's
-      size column, the results toolbar and the destructive confirmations.
+      size column, the results toolbar, the Truncate confirmation and a table drop's preview.
       - **Where a figure may be printed, and in what words, is decided here too** — the surfaces
         that print one hold no rules of their own. `catalogue_key` says where a statement's
         `qualifier.table` sits in the catalogue, because the two engines that publish statistics
@@ -11726,24 +11726,31 @@ existing prose was left alone.
         matched 42 of 1,000: a claim that 958 rows were withheld, with no `(capped)` to hint a cap
         was ever involved. The noun follows the last figure named, which is
         the total when there is one: `1 of ~4.2m row` and `0 of 1 rows` are both wrong.
-        `truncate_prompt`/`drop_prompt` are the destructive confirmations'
-        wording, and they name a figure only above `CONFIRM_ROW_FLOOR` (1,000) when it is an
+        `truncate_prompt` is the Truncate confirmation's wording and `drop_scale` a table drop's
+        row figure, and both name a figure only above `CONFIRM_ROW_FLOOR` (1,000) when it is an
         *estimate*: the point of naming one is scale, and InnoDB's sampled `TABLE_ROWS` is at its
         least reliable exactly below that — it reports 0 for a table holding a handful of rows, so
         *"Delete all ~0 rows in orders?"* would answer a question the user didn't ask, wrongly. A
-        figure the engine actually counted is named at any size above empty; a **view** is never
-        given one, since the rows belong to the tables under it. **`drop_prompt` takes a
-        `TableShape` rather than an `is_view` bool**, and so has three sentences: the view one
-        (*"Anything built on it goes too"*), the table one that may name rows, and a third for a
-        sequence — *"Drop sq1? This can't be undone."*, with no rows to name and nothing built on
-        it, a sequence being a counter. The boolean has two answers and the object has three, so a
-        MariaDB sequence took the *table* sentence and the user was asked to confirm dropping "all N
-        rows in it" about a counter. **`drop_title(shape)` is the title's half of that pair**, and it
-        is here rather than at the call site because that is where it went wrong: `ui/overlays.rs`
-        routed the body through `drop_prompt` and left the title three lines above it as
-        `if is_view { "Drop view" } else { "Drop table" }`, so a sequence drew *"Drop table"* over
-        *"Drop sq1? This can't be undone."* — the two halves of one modal disagreeing about what the
-        object is. A view closure has no unit test to hold it; a pure pair does.
+        figure the engine actually counted is named at any size above empty.
+        **`drop_scale` is a sentence in the preview, not a question before it.** A Drop used to
+        raise a confirm first, worded by `drop_prompt` and titled by `drop_title`, and then
+        the DDL preview, whose Apply asked the same thing again under the same warning — every Drop
+        asked twice, and the user asked for the first to go. The one thing that confirm said and
+        the preview's *"Drops the table and every row in it."* did not was the figure, so that is
+        all that survived: *"By the schema tree's statistics, that is ~4.2m rows."*, added under
+        the preview's warning by **`drop_warning(risks, rows, shape)`**, which the tree's Drop
+        hands to `ddl_preview::preview_change_warning`. **It takes a `TableShape` rather than an
+        `is_view` bool**, and only a `Table` is ever given a figure: a **view** owns no rows (they
+        belong to the tables under it) and a MariaDB **sequence** is a counter. The boolean has two
+        answers and the object has three, so a sequence once took the *table* sentence and the user
+        was asked to confirm dropping "all N rows in it" about a counter
+        (`a_drop_names_its_scale_only_for_a_table_with_a_figure_worth_naming` pins all three).
+        **`drop_warning` also words a sequence's drop as one**: it is `Change::DropTable`
+        (`overlays::object_drop_change`, MariaDB's own `DROP TABLE` dropping a sequence), whose
+        risk is *"Drops the table and every row in it."*, and the deleted confirm had been the only
+        place that drop was worded for a sequence — so a sequence's warning is replaced with its own
+        sentence, the reached value lost (`a_drop_warning_speaks_of_the_shape_it_drops`). **Truncate
+        keeps its confirm-then-preview**: it is not a drop, and `truncate_prompt` is its question.
       - **`SchemaStats` carries a lookup index and its `tables` are private**, because the badge
         lookup is per *row* of the schema tree and one landing invalidates every badge in the
         database at once: `iter().find` cost 4.2 ms at 2,000 tables, 24.8 ms at 5,000 and 95.9 ms at
@@ -19496,12 +19503,15 @@ existing prose was left alone.
     **never offered for an account the server maintains** (`Principal::system`, the flag that
     already dims its row): dropping `mysql.sys` or `pg_monitor` breaks the server rather than the
     account, and no privilege screen should make that one click away — the pane says so in a line
-    instead. Drop goes through a `Confirm` whose body is the change's own `Change::risks` via
-    `overlays::risk_prompt`, so the question and the preview's warning cannot drift into saying
-    different things about one act, and then through the preview like everything else. **It also
-    guards its own launch, twice** — `widgets::accept_launch` at the click and again inside the
-    confirm's `resolve`, and the `read_only` that second call reads is what goes into
-    `ddl_preview::PlanTarget` instead of the `false` that was written there. The rule and the bug are
+    instead. Drop goes **straight to the preview** (`ddl_preview::preview_account`), whose warning
+    is the change's own `Change::risks` in the target's dialect. It used to raise a `Confirm` first
+    whose body was that same sentence (via `overlays::risk_prompt`), so the preview's Apply asked
+    the question a second time with the same words; the confirm is gone, and `risk_prompt` with it.
+    **It guards its own launch** — `widgets::accept_launch` at the click — and the live `read_only`
+    read there is what goes into `ddl_preview::PlanTarget` instead of the `false` that was written
+    there. The second ask that lived in the confirm's `resolve` went with the confirm: there is no
+    deferred step left for the flag to flip during, and the preview's Apply re-asks
+    `plan_read_only` for the plan's own connection when it is pressed. The rule and the bug are
     under *Architecture invariants*; what is worth knowing here is that the `enabled` this row dims
     itself with is a `bool` captured at build time, so it can never be the guard.
     **Reversing a listed `GRANT` into a `REVOKE` by parsing it was built, tested and then removed.**
@@ -19990,7 +20000,11 @@ existing prose was left alone.
     points:
     `table_designer::open_for_table`/`open_for_new`/`preview_draft_edit` (a shortcut whose
     edit has dependents — dropping a column takes its index and FK with it) and
-    `ddl_preview::preview_change` (a lone `Change`).
+    `ddl_preview::preview_change` (a lone `Change`). `preview_change_warning` is `preview_change`
+    with the plan's `destructive` list reworded by the caller, for facts it holds and the change set
+    does not: the schema tree's Drop passes `stats::drop_warning` — a table's row figure, a MariaDB
+    sequence's `DROP TABLE` worded as a sequence's — which is what the confirm it replaced had said
+    before the preview said everything else again.
     **`ddl_preview::close_peers` is the one editor-target list**, called by every editor's `open`
     before it sets its own and by `close_editors` after an Apply. Each of those `open`s used to
     keep its own copy and they had **drifted**: the table designer cleared the view editor and
@@ -20990,14 +21004,20 @@ existing prose was left alone.
     would predict. `menu_icon_tuck()` and `menu_edge_pad()` are functions for the same reason — an
     offset frozen between two growing boxes is not an offset but a drift, and at 160% a 154px panel
     tucked by a literal 30 landed its right edge ~18px inside the icon instead of flush past it.
-    **`risk_prompt(change, dialect)` is where a destructive confirm gets its body**, from the
-    change's own `Change::risks` rather than from a sentence typed at the call site, so the question
-    and the preview's warning cannot say different things about one act. It was
-    `container_drop_prompt` while the database and schema drops here were its only callers; it was
-    always generic over any `Change`, and the account drop `users_view` raises is what made the
-    narrower name wrong. An empty `risks()` — an arm a later edit emptied — falls back to a question
-    rather than to a modal with a blank body, which is an irreversible action asked with nothing in
-    it (`a_riskless_change_still_asks_something`).
+    **No Drop here asks before its preview.** The table/view/sequence Drop, a standalone object's,
+    the database's and the schema's each open the DDL preview directly — `preview_change_warning`,
+    `preview_of`/`open_preview` over `ddl::drop_item`, and `preview_container` twice — where every
+    one of them raised a `Confirm` first and the preview's Apply then asked the same question under
+    the same warning. The user asked for the first to go. The container and account drops' confirm
+    had its body from `risk_prompt(change, dialect)` — born `container_drop_prompt`, renamed when
+    `users_view`'s account drop became its third caller — which rendered `Change::risks` so the
+    confirm and the preview could not say different things about one act; with the confirm gone
+    the preview's risk block *is* `Change::risks`, there is no second rendering to keep in step,
+    and the function went with its last caller. The table drop's confirm had said two things the
+    preview did not — the row figure, and a MariaDB sequence named as a sequence rather than as the
+    table `DROP TABLE` treats it as — and both now ride into the preview's warning through
+    `stats::drop_warning`. **Truncate still asks first** (`stats::truncate_prompt`): it is
+    not a drop, and it keeps its confirm-then-preview.
     **`whole_ui_gate` 13 → 4, and six of the nine that came down were the small menus** — they read
     their bundles into locals at the top and never touch the root again, so `popup_menu_overlay`
     and `tx_prompt_overlay` take `OverlayUi`, `db_visibility_overlay` `SchemaUi`,
@@ -28259,7 +28279,10 @@ Re-introducing the anti-patterns these guard against is a regression:
   not the defect and is deliberately kept: it is what produces the per-kind refusal *before* the user
   is asked a question that would be refused anyway. `destructive_launch_gate`'s third test,
   `a_guarded_launch_behind_a_confirm_asks_again_in_the_resolve`, scans both view crates for a guard
-  call followed by a `confirm.set(Some(` and fails unless something asks again after it.
+  call followed by a `confirm.set(Some(` and fails unless something asks again after it. Its floor
+  — the scan must find at least that many such sites, or it is passing by matching nothing — is
+  **one** now, `kill_session`: it was two until the Users Drop stopped asking first and opened the
+  preview directly, whose Apply asks for itself.
   **The gate that forbids a *constant* in the guard's `read_only` slot was asserting over nothing.**
   `no_launch_hands_the_guard_a_constant` read `code.lines()` and split each line on the needle, so a
   call rustfmt had broken across lines yielded an empty second argument and passed. Of the fourteen
@@ -28319,12 +28342,14 @@ Re-introducing the anti-patterns these guard against is a regression:
   `open_for_reset` /
   `open_for_grant`. Its launch read an `enabled` `bool` captured when the account row was *built*, so
   the disabled button was the whole guard, which is verbatim what this rule forbids. It asks
-  `accept_launch` at the click **and again inside the `Confirm`'s `resolve`** — the deferred half
-  `accept_dialog_launch` exists for, since that closure runs an arbitrary time after the press and
-  the flag can flip while the red confirm stands — and the same live read then rides into
+  `accept_launch` at the click, and the same live read then rides into
   `ddl_preview::PlanTarget` in place of the literal `false` that site passed, `PlanTarget`'s own doc
   saying the struct exists so no call site comes to pass a constant beside a live `conn_id`. With
-  that constant there the preview opened with Apply enabled and inert.
+  that constant there the preview opened with Apply enabled and inert. It asked a second time
+  inside a `Confirm`'s `resolve` while a red confirm stood between the click and the preview — the
+  deferred half the paragraph above is about — and that ask went with the confirm, which was the
+  preview's own question asked first: the Drop opens the preview directly now, and the deferred
+  step left is the preview's Apply, which re-asks `plan_read_only` itself.
   **The other way to fail this rule is to have no gesture to guard**, which is where the folder
   export sat. The single-file export's consent is the save dialog's own "replace?";
   `select_directories()` has none, and the per-table names are `dump::file_plan`'s rather than the
@@ -28363,7 +28388,7 @@ Re-introducing the anti-patterns these guard against is a regression:
   sixteen, since a renamed field would otherwise pass it by finding none, and it holds its
   one exemption as *data* with the reason attached — `overlays.rs` stamps the flag into two
   `ddl_preview::PlanTarget`s, which capture the context a Drop-container menu fired in so the
-  confirmation cannot be answered against a connection the user switched to meanwhile; the refusal
+  preview's Apply cannot be answered against a connection the user switched to meanwhile; the refusal
   on that stamp is `preview_container`'s and there is no door there to guard.
   **That exemption is keyed on the struct literal, and it was keyed on the *file*.** `overlays.rs`
   is the launch point for every editor door in the app, so skipping the file skipped the doors with
@@ -31126,9 +31151,10 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   they stop at the read group, and `entries.push(export_submenu(…))` counted the same way for the
   same reason.
   The Table arm's `Truncate`/`Drop` name the **scale** of what they delete when a row figure is
-  already in `ConnNode::stats` (`stats::truncate_prompt`/`drop_prompt` decide the words and whether
-  a figure is worth naming). It is read, never fetched: the menu is built on the right-click, so a
-  round trip there would either block it or land after the modal is already up.
+  already in `ConnNode::stats` — Truncate in its confirm, Drop as an extra line under the preview's
+  warning, since it no longer asks first (`stats::truncate_prompt`/`drop_warning` decide the words and
+  whether a figure is worth naming). It is read, never fetched: the menu is built on the
+  right-click, so a round trip there would either block it or land after the modal is already up.
 - **Keyboard operation lives in `menu_key`.** The panel is a `focus_root`, so it took focus and
   answered Escape from the start — but nothing moved a cursor and no row was marked, so a menu
   opened with Enter from a ringed button could only be finished with the mouse and read as though

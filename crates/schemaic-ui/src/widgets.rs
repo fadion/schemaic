@@ -6457,10 +6457,12 @@ mod destructive_launch_gate {
                 );
             }
         }
-        // A floor: the two sites that do this must still be found, or the scan
-        // is passing by matching nothing.
+        // A floor: the site that does this — `kill_session` — must still be
+        // found, or the scan is passing by matching nothing. It was two until
+        // `users_view`'s Drop stopped asking first and went straight to the
+        // preview, which guards its own Apply.
         assert!(
-            checked >= 2,
+            checked >= 1,
             "only {checked} guard-then-confirm sites found — the shape moved, so \
              rewrite this gate rather than letting it pass on an empty scan"
         );

@@ -501,18 +501,35 @@ pub(crate) fn preview_change(
     schema: Option<&str>,
     change: schemaic_core::ddl::Change,
 ) {
+    preview_change_warning(conn, ddl, database, table, schema, change, |w| w);
+}
+
+/// [`preview_change`], with the change's warning reworded by `warning` for
+/// what the caller knows and the change set does not — the schema tree's
+/// Drop passes `stats::drop_warning`, which adds a table's row figure and
+/// words a MariaDB sequence's `DROP TABLE` as a sequence's. The drop opens
+/// the preview directly, so this is where the confirm it replaced had said
+/// those things.
+pub(crate) fn preview_change_warning(
+    conn: crate::ConnUi,
+    ddl: DdlUi,
+    database: &str,
+    table: &str,
+    schema: Option<&str>,
+    change: schemaic_core::ddl::Change,
+    warning: impl FnOnce(Vec<String>) -> Vec<String>,
+) {
     let ctx = crate::table_designer::edit_ctx(conn);
     let cs = schemaic_core::ddl::single(table, schema, ctx.dialect, change);
-    open_preview(
-        ddl,
-        preview_of(
-            ctx.conn_id,
-            database,
-            schemaic_core::schema::display_name(schema, table),
-            &cs,
-            ctx.read_only,
-        ),
+    let mut p = preview_of(
+        ctx.conn_id,
+        database,
+        schemaic_core::schema::display_name(schema, table),
+        &cs,
+        ctx.read_only,
     );
+    p.destructive = warning(std::mem::take(&mut p.destructive));
+    open_preview(ddl, p);
 }
 
 /// Send an **AI proposal** to the preview, or say why it can't go there.

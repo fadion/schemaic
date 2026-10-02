@@ -92,31 +92,6 @@ fn find_top() -> f64 {
     theme::scaled(80.0)
 }
 
-/// The question a destructive confirm asks, built from the change's own
-/// [`schemaic_core::ddl::Change::risks`] so the confirm and the DDL preview's
-/// warning block cannot drift into saying different things about the same act.
-///
-/// **The fallback is the point of the function.** `risks()` returning empty —
-/// an arm emptied by a later edit — would otherwise render a confirm titled
-/// `Drop database` with a *blank body*: an irreversible action asked with no
-/// question, and the exact shape of the bug
-/// `dropping_an_event_is_destructive_and_says_why` was written to catch one
-/// level down. The unit tests pin `risks()` in isolation; this is the seam
-/// between it and the modal, which is where CLAUDE.md says these bugs live.
-pub(crate) fn risk_prompt(
-    change: &schemaic_core::ddl::Change,
-    dialect: schemaic_core::intel::SqlDialect,
-) -> String {
-    let risks = change.risks(dialect);
-    if risks.is_empty() {
-        // Never reached while the arms are populated, and never a blank modal
-        // if they aren't. It names the change so the question is still about
-        // something even in the degenerate case.
-        return format!("{}. This cannot be undone.", change.summary());
-    }
-    risks.join(" ")
-}
-
 /// Is the active connection read-only? Every schema-editing menu entry asks,
 /// because a write it can't perform is shown dimmed rather than hidden — a
 /// missing item reads as "not supported", a dimmed one as "not here".
@@ -1816,18 +1791,15 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         crate::table_designer::edit_ctx(import_ui.conn).dialect,
                     ) {
                         let ui = import_ui.clone();
-                        let confirm = ui.overlay.confirm;
                         let db = menu.name.clone();
                         entries.push(
                             MenuEntry::action_colored("Drop", theme::error, move || {
-                                let (ui, db) = (ui.clone(), db.clone());
-                                // **Captured here, where the menu fired**, not
-                                // read back in `resolve` — the confirmation
-                                // dialog is a window the user can switch
-                                // connections in, and the plan would then be
-                                // built against whichever one they switched to.
-                                // The dialect this closure already reads for the
-                                // risk sentence comes from the same place.
+                                // **Straight to the preview.** A confirm asked
+                                // first with the change's own risk sentence, and
+                                // the preview then said it again over Apply —
+                                // the same question twice. The preview's warning
+                                // is that sentence (`Change::risks`), naming the
+                                // database and everything in it.
                                 let ctx = crate::table_designer::edit_ctx(ui.conn);
                                 let on = crate::ddl_preview::PlanTarget {
                                     conn_id: ctx.conn_id,
@@ -1838,36 +1810,12 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                     dialect: ctx.dialect,
                                     read_only: ctx.read_only,
                                 };
-                                confirm.set(Some(crate::Confirm {
-                                    title: format!(
-                                        "Drop {}",
-                                        crate::ContainerKind::Database.label()
-                                    ),
-                                    // The plain-language cost is the change's
-                                    // own (`Change::risks`), so this question
-                                    // and the preview's warning cannot drift
-                                    // into saying different things about the
-                                    // same act — and the preview still stands
-                                    // between the answer and the server.
-                                    message: risk_prompt(
-                                        &schemaic_core::ddl::Change::DropDatabase {
-                                            name: db.clone(),
-                                        },
-                                        ctx.dialect,
-                                    ),
-                                    resolve: Rc::new(move |yes| {
-                                        if yes {
-                                            crate::ddl_preview::preview_container(
-                                                ui.ddl,
-                                                on.clone(),
-                                                &db,
-                                                schemaic_core::ddl::Change::DropDatabase {
-                                                    name: db.clone(),
-                                                },
-                                            );
-                                        }
-                                    }),
-                                }));
+                                crate::ddl_preview::preview_container(
+                                    ui.ddl,
+                                    on,
+                                    &db,
+                                    schemaic_core::ddl::Change::DropDatabase { name: db.clone() },
+                                );
                             })
                             .disabled(conn_read_only(&connections, active_conn)),
                         );
@@ -1937,7 +1885,6 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         crate::table_designer::edit_ctx(import_ui.conn).dialect,
                     ) {
                         let ui = import_ui.clone();
-                        let confirm = ui.overlay.confirm;
                         let (db, obj) = (database.clone(), item.clone());
                         let label = menu.name.clone();
                         let read_only = conn_read_only(&connections, active_conn);
@@ -1948,33 +1895,24 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         let internal = obj.is_internal();
                         entries.push(
                             MenuEntry::action_colored("Drop", theme::error, move || {
-                                let (ui, db, obj) = (ui.clone(), db.clone(), obj.clone());
-                                let label = label.clone();
-                                confirm.set(Some(crate::Confirm {
-                                    title: format!("Drop {}", kind.label()),
-                                    message: format!("Drop {label}? This can't be undone."),
-                                    resolve: Rc::new(move |yes| {
-                                        if !yes {
-                                            return;
-                                        }
-                                        let ctx = crate::table_designer::edit_ctx(ui.conn);
-                                        // The routine, the event or the plain
-                                        // object — whichever the row holds, and
-                                        // the same set the gate above asked about
-                                        // (`ddl::drop_item`).
-                                        let cs = schemaic_core::ddl::drop_item(&obj, ctx.dialect);
-                                        crate::ddl_preview::open_preview(
-                                            ui.ddl,
-                                            crate::ddl_preview::preview_of(
-                                                ctx.conn_id,
-                                                &db,
-                                                label.clone(),
-                                                &cs,
-                                                ctx.read_only,
-                                            ),
-                                        );
-                                    }),
-                                }));
+                                // Straight to the preview, which names the drop
+                                // and its statement; a plain "Drop x? This can't
+                                // be undone." asked first made it ask twice.
+                                let ctx = crate::table_designer::edit_ctx(ui.conn);
+                                // The routine, the event or the plain object —
+                                // whichever the row holds, and the same set the
+                                // gate above asked about (`ddl::drop_item`).
+                                let cs = schemaic_core::ddl::drop_item(&obj, ctx.dialect);
+                                crate::ddl_preview::open_preview(
+                                    ui.ddl,
+                                    crate::ddl_preview::preview_of(
+                                        ctx.conn_id,
+                                        &db,
+                                        label.clone(),
+                                        &cs,
+                                        ctx.read_only,
+                                    ),
+                                );
                             })
                             .disabled(read_only || internal),
                         );
@@ -2048,19 +1986,16 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     // Last, like every other Drop. Unlike the database node's,
                     // this one cannot silently destroy: Schemaic never sends
                     // `CASCADE`, so a namespace that still holds anything is
-                    // refused by the server — which is what the risk sentence
-                    // this confirm borrows actually says.
+                    // refused by the server — which is what the preview's risk
+                    // sentence says. Straight to the preview, as the database's
+                    // Drop is, rather than asking first and then again.
                     if schemaic_core::ddl::supports_namespace_editing(
                         crate::table_designer::edit_ctx(import_ui.conn).dialect,
                     ) {
                         let ui = import_ui.clone();
-                        let confirm = ui.overlay.confirm;
                         let (db, ns) = (database.clone(), menu.name.clone());
                         entries.push(
                             MenuEntry::action_colored("Drop", theme::error, move || {
-                                let (ui, db, ns) = (ui.clone(), db.clone(), ns.clone());
-                                // Captured at menu-fire time, for the reason the
-                                // Drop-database entry above states.
                                 let ctx = crate::table_designer::edit_ctx(ui.conn);
                                 let on = crate::ddl_preview::PlanTarget {
                                     conn_id: ctx.conn_id,
@@ -2069,27 +2004,12 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                     dialect: ctx.dialect,
                                     read_only: ctx.read_only,
                                 };
-                                confirm.set(Some(crate::Confirm {
-                                    title: format!("Drop {}", crate::ContainerKind::Schema.label()),
-                                    message: risk_prompt(
-                                        &schemaic_core::ddl::Change::DropSchema {
-                                            name: ns.clone(),
-                                        },
-                                        ctx.dialect,
-                                    ),
-                                    resolve: Rc::new(move |yes| {
-                                        if yes {
-                                            crate::ddl_preview::preview_container(
-                                                ui.ddl,
-                                                on.clone(),
-                                                &ns,
-                                                schemaic_core::ddl::Change::DropSchema {
-                                                    name: ns.clone(),
-                                                },
-                                            );
-                                        }
-                                    }),
-                                }));
+                                crate::ddl_preview::preview_container(
+                                    ui.ddl,
+                                    on,
+                                    &ns,
+                                    schemaic_core::ddl::Change::DropSchema { name: ns.clone() },
+                                );
                             })
                             .disabled(conn_read_only(&connections, active_conn)),
                         );
@@ -2609,10 +2529,11 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                 .disabled(read_only),
                             );
                         }
-                        // Truncate and drop are the two that can't be taken back
-                        // and sit next to harmless entries, so they ask first and
-                        // *then* show the plan. Everything else relies on the
-                        // preview alone, which already names the consequence.
+                        // Truncate can't be taken back and sits next to harmless
+                        // entries, so it asks first and *then* shows the plan.
+                        // Drop used to as well, and asked twice for it; it now
+                        // relies on the preview alone, as everything else does,
+                        // whose warning names the consequence.
                         //
                         // Drop applies to a view; Truncate does not — a view owns
                         // no rows to delete — so only the second is conditional.
@@ -2667,63 +2588,37 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         }
                         if offers.drop {
                             let ui = import_ui.clone();
-                            let confirm = ui.overlay.confirm;
                             let (db, ns, tbl) = (database.clone(), schema.clone(), table.clone());
-                            let label = source.display();
                             entries.push(
                                 MenuEntry::action_colored("Drop", theme::error, move || {
-                                    let (ui, db, ns, tbl) =
-                                        (ui.clone(), db.clone(), ns.clone(), tbl.clone());
-                                    // A view is dropped by `DROP VIEW`; asking
-                                    // about "every row in it" would be asking
-                                    // about rows it doesn't own either — which is
-                                    // also why `drop_prompt` never gives one a
-                                    // row figure.
-                                    //
-                                    // **The title asks the shape too.** It was
-                                    // `if is_view { … } else { … }` three lines
-                                    // above the `shape` the body was already
-                                    // using, so a MariaDB sequence read
-                                    // "Drop table" over "Drop sq1? This can't be
-                                    // undone." — the two halves of one modal
-                                    // disagreeing about what the object is.
-                                    confirm.set(Some(crate::Confirm {
-                                        title: schemaic_core::stats::drop_title(shape).to_string(),
-                                        message: schemaic_core::stats::drop_prompt(
-                                            &label, rows, shape,
-                                        ),
-                                        resolve: Rc::new(move |yes| {
-                                            if yes {
-                                                crate::ddl_preview::preview_change(
-                                                    ui.conn,
-                                                    ui.ddl,
-                                                    &db,
-                                                    &tbl,
-                                                    ns.as_deref(),
-                                                    // **`DropTable` for a
-                                                    // sequence, deliberately.**
-                                                    // There is no
-                                                    // `Change::DropSequence`,
-                                                    // and MariaDB's own
-                                                    // `DROP TABLE sq1` drops a
-                                                    // sequence — measured on
-                                                    // 10.11.14: the object is
-                                                    // gone and the catalogue is
-                                                    // empty afterwards. So the
-                                                    // statement is right and it
-                                                    // was only ever the labels
-                                                    // that were wrong. Spelled
-                                                    // out per shape rather than
-                                                    // left on the boolean, so a
-                                                    // `DROP SEQUENCE` arm has a
-                                                    // place to land — in
-                                                    // `object_drop_change`, which
-                                                    // the gate asks about too.
-                                                    object_drop_change(shape, materialized),
-                                                );
-                                            }
-                                        }),
-                                    }));
+                                    // **Straight to the preview.** A confirm
+                                    // asked first, and then the preview asked
+                                    // again with Apply — the same question
+                                    // twice. What the confirm said that the
+                                    // preview's warning did not — a table's row
+                                    // figure, and a sequence named as one
+                                    // rather than as the table `DROP TABLE`
+                                    // takes it for — `drop_warning` says there.
+                                    crate::ddl_preview::preview_change_warning(
+                                        ui.conn,
+                                        ui.ddl,
+                                        &db,
+                                        &tbl,
+                                        ns.as_deref(),
+                                        // **`DropTable` for a sequence,
+                                        // deliberately.** There is no
+                                        // `Change::DropSequence`, and MariaDB's
+                                        // own `DROP TABLE sq1` drops a sequence
+                                        // — measured on 10.11.14: the object is
+                                        // gone and the catalogue is empty
+                                        // afterwards. Spelled out per shape
+                                        // rather than left on a boolean, so a
+                                        // `DROP SEQUENCE` arm has a place to
+                                        // land — in `object_drop_change`, which
+                                        // the gate asks about too.
+                                        object_drop_change(shape, materialized),
+                                        |w| schemaic_core::stats::drop_warning(w, rows, shape),
+                                    );
                                 })
                                 .disabled(read_only),
                             );
@@ -6273,7 +6168,7 @@ mod object_menu_tests {
 
 #[cfg(test)]
 mod create_menu_tests {
-    use super::{CreateKind, create_children, risk_prompt};
+    use super::{CreateKind, create_children};
     use schemaic_core::ddl::ObjectKind;
     use schemaic_core::intel::SqlDialect;
 
@@ -6406,53 +6301,6 @@ mod create_menu_tests {
         }
         assert!(labels(SqlDialect::MySql).contains(&"Database"));
         assert!(!labels(SqlDialect::Sqlite).contains(&"Database"));
-    }
-
-    /// **The seam, not the pure function.** `dropping_a_database_is_destructive_
-    /// and_names_it` over in `core::ddl` pins `risks()` in isolation and would
-    /// pass just as happily if the modal never showed it. This is what the
-    /// confirm actually renders: for both container drops it must name the
-    /// object and must not be blank, whatever `risks()` does.
-    #[test]
-    fn a_container_drop_confirm_is_never_a_blank_question() {
-        use schemaic_core::ddl::Change;
-        for (change, name) in [
-            (
-                Change::DropDatabase {
-                    name: "shop".into(),
-                },
-                "shop",
-            ),
-            (
-                Change::DropSchema {
-                    name: "sales".into(),
-                },
-                "sales",
-            ),
-        ] {
-            for d in [SqlDialect::MySql, SqlDialect::Postgres] {
-                let msg = risk_prompt(&change, d);
-                assert!(!msg.trim().is_empty(), "{change:?} on {d:?} asked nothing");
-                assert!(msg.contains(name), "{msg} does not name {name}");
-            }
-        }
-    }
-
-    /// And the fallback really is a sentence, so an emptied `risks()` arm
-    /// degrades to a question rather than to a modal with no body. Probed
-    /// through a change that has no risks of its own — the same code path a
-    /// future emptied arm would take.
-    #[test]
-    fn a_riskless_change_still_asks_something() {
-        let msg = risk_prompt(
-            &schemaic_core::ddl::Change::CreateSchema {
-                name: "sales".into(),
-                owner: None,
-            },
-            SqlDialect::Postgres,
-        );
-        assert!(msg.contains("sales"), "{msg}");
-        assert!(msg.contains("cannot be undone"), "{msg}");
     }
 
     /// The gate that matters if it drifts: every one of these opens an editor
