@@ -4306,6 +4306,56 @@ async fn a_comparison_into_an_empty_database_does_not_create_dbo() {
     assert_eq!(again.differences().count(), 0);
 }
 
+/// **A comparison carries SQL Server's standalone objects across**: an XML
+/// schema collection and an alias type a table's columns use, a sequence its
+/// default draws from, and a synonym naming it — created in the order their
+/// uses need, on a target that has none, while a target's own differing
+/// sequence is altered in place and an alias type the source lacks dropped.
+/// Synced, a second comparison finds nothing to do.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_comparison_carries_standalone_objects_in_their_order() {
+    if !enabled() {
+        return;
+    }
+    let target = Scratch::create("cmp_obj_target").await;
+    let source = Scratch::create("cmp_obj_source").await;
+    for sql in [
+        "CREATE XML SCHEMA COLLECTION dbo.invoice AS N'<xsd:schema \
+         xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\"><xsd:element name=\"a\" \
+         type=\"xsd:string\"/></xsd:schema>'",
+        "CREATE TYPE dbo.code FROM nvarchar(10) NOT NULL",
+        "CREATE SEQUENCE dbo.order_no AS bigint START WITH 1 INCREMENT BY 5",
+        "CREATE TABLE dbo.orders (id bigint NOT NULL DEFAULT (NEXT VALUE FOR dbo.order_no), \
+         c dbo.code, doc xml(dbo.invoice))",
+        "CREATE SYNONYM dbo.o FOR dbo.orders",
+        // Read through the synonym: a plan that made the view first was Msg 208.
+        "CREATE VIEW dbo.v_o AS SELECT id FROM dbo.o",
+    ] {
+        source.exec(sql).await;
+    }
+    target
+        .exec("CREATE SEQUENCE dbo.order_no AS bigint START WITH 1 INCREMENT BY 1")
+        .await;
+    target.exec("CREATE TYPE dbo.stale FROM int").await;
+    let (plan, again) = sync_modules(&target, &source).await;
+    let stmts = plan.emit();
+    assert!(
+        stmts
+            .iter()
+            .any(|s| s.contains("ALTER SEQUENCE [dbo].[order_no] INCREMENT BY 5")),
+        "{stmts:#?}"
+    );
+    assert_eq!(target.scalar("SELECT COUNT(*) FROM dbo.o").await, "0");
+    assert_eq!(
+        target
+            .scalar("SELECT COUNT(*) FROM sys.types WHERE name = 'stale'")
+            .await,
+        "0"
+    );
+    let left: Vec<String> = again.differences().map(|e| e.key()).collect();
+    assert!(left.is_empty(), "{left:?}");
+}
+
 /// **A comparison creates a missing view whole** — under the settings the
 /// source's was created with, and with its indexes. The plan was a bare
 /// `CREATE VIEW`, so a view written under `ANSI_NULLS OFF` arrived ON (its

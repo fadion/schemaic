@@ -59,12 +59,12 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use crate::ddl::{
     self, Change, ChangeSet, DomainDraft, EnumDraft, EventDraft, ObjectKind, RoutineDraft,
-    SequenceDraft, TableDraft, Target, TriggerDraft, ViewDraft,
+    SequenceDraft, TableDraft, Target, TriggerDraft, TsqlObjectDraft, ViewDraft,
 };
 use crate::intel::SqlDialect;
 use crate::schema::{
     DbSchema, DomainInfo, EnumInfo, EventInfo, RoutineInfo, RoutineKind, SequenceInfo, TableInfo,
-    TableShape, TriggerInfo, display_name,
+    TableShape, TriggerInfo, TsqlObject, display_name,
 };
 
 /// What kind of object a [`CompareEntry`] is about.
@@ -78,7 +78,18 @@ use crate::schema::{
 pub enum CompareKind {
     Enum,
     Domain,
+    /// SQL Server's. Before an alias type, whose `xml` base may be typed with
+    /// one, and before any table whose column is.
+    XmlSchemaCollection,
+    /// SQL Server's. Before a sequence typed with one, and any table.
+    AliasType,
     Sequence,
+    /// SQL Server's. **With the types, before any table or view** — measured
+    /// on 2022: `CREATE SYNONYM` takes a target that does not exist yet,
+    /// while a view selecting through a synonym not yet created is Msg 208,
+    /// so one created last broke a plan that also made a view over it. Its
+    /// drop is refused by nothing, wherever it falls.
+    Synonym,
     Table,
     View,
     Function,
@@ -94,6 +105,8 @@ impl CompareKind {
         match self {
             CompareKind::Enum => "enum",
             CompareKind::Domain => "domain",
+            CompareKind::XmlSchemaCollection => "XML schema collection",
+            CompareKind::AliasType => "alias type",
             CompareKind::Sequence => "sequence",
             CompareKind::Table => "table",
             CompareKind::View => "view",
@@ -101,6 +114,7 @@ impl CompareKind {
             CompareKind::Procedure => "procedure",
             CompareKind::Trigger => "trigger",
             CompareKind::Event => "event",
+            CompareKind::Synonym => "synonym",
         }
     }
 
@@ -131,7 +145,12 @@ impl CompareKind {
     fn is_type(self) -> bool {
         matches!(
             self,
-            CompareKind::Enum | CompareKind::Domain | CompareKind::Sequence
+            CompareKind::Enum
+                | CompareKind::Domain
+                | CompareKind::XmlSchemaCollection
+                | CompareKind::AliasType
+                | CompareKind::Sequence
+                | CompareKind::Synonym
         )
     }
 
@@ -714,6 +733,33 @@ impl SchemaComparison {
                 .map(|s| (seq_key(s), s)),
         ) {
             entries.push(sequence_entry(l, r, dialect));
+        }
+
+        // SQL Server's sequences, alias types, XML schema collections and
+        // synonyms, paired by kind and qualified name, and diffed by the object
+        // editor's own differ — one answer to what a change to one is.
+        for (ck, ok) in [
+            (
+                CompareKind::XmlSchemaCollection,
+                ObjectKind::XmlSchemaCollection,
+            ),
+            (CompareKind::AliasType, ObjectKind::AliasType),
+            (CompareKind::Sequence, ObjectKind::Sequence),
+            (CompareKind::Synonym, ObjectKind::Synonym),
+        ] {
+            fn of_kind(s: &DbSchema, ok: ObjectKind) -> Vec<(String, &TsqlObject)> {
+                s.tsql_objects
+                    .iter()
+                    .filter(|t| t.object_kind() == ok)
+                    .map(|t| (display_name(t.schema.as_deref(), &t.name), t))
+                    .collect()
+            }
+            for (l, r) in pair(
+                of_kind(left, ok).into_iter(),
+                of_kind(right, ok).into_iter(),
+            ) {
+                entries.push(tsql_entry(ck, ok, l, r));
+            }
         }
 
         // ── order ───────────────────────────────────────────────────────────
@@ -2349,6 +2395,39 @@ fn sequence_entry(
     }
 }
 
+/// One of SQL Server's standalone objects, compared: the object editor's
+/// differ between the two readings, its `CREATE` for one only the right has,
+/// its row's `DROP` for one only the left has. A sequence's position is not
+/// compared — two databases' counters differ by use, not by definition.
+fn tsql_entry(
+    kind: CompareKind,
+    object: ObjectKind,
+    l: Option<&TsqlObject>,
+    r: Option<&TsqlObject>,
+) -> CompareEntry {
+    let any = l.or(r).expect("a pair holds at least one side");
+    let changes = match (l, r) {
+        (Some(l), Some(r)) => ddl::diff_tsql_object(l, &TsqlObjectDraft::from_info(r)),
+        (None, Some(r)) => ddl::create_tsql_object(&TsqlObjectDraft::from_info(r)),
+        (Some(l), None) => {
+            ddl::drop_object(object, &l.name, l.schema.as_deref(), SqlDialect::MsSql)
+        }
+        (None, None) => unreachable!("a pair holds at least one side"),
+    };
+    CompareEntry {
+        kind,
+        schema: any.schema.clone(),
+        name: any.name.clone(),
+        table: None,
+        signature: None,
+        status: status_of(l.is_some(), r.is_some(), &changes),
+        changes,
+        uncertain: false,
+        left_ddl: side_ddl(l, |t| t.create_sql()),
+        right_ddl: side_ddl(r, |t| t.create_sql()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3724,6 +3803,170 @@ mod tests {
                 assert!(ph(kind, st) < ph(kind, Same), "{kind:?}/{st:?}");
             }
         }
+    }
+
+    fn tsql(name: &str, kind: crate::schema::TsqlObjectKind) -> TsqlObject {
+        TsqlObject {
+            schema: Some("dbo".into()),
+            name: name.into(),
+            kind,
+        }
+    }
+
+    fn tsql_sequence(increment: &str, last_used: Option<&str>) -> TsqlObject {
+        tsql(
+            "order_no",
+            crate::schema::TsqlObjectKind::Sequence {
+                data_type: "bigint".into(),
+                start: "1".into(),
+                increment: increment.into(),
+                min: "1".into(),
+                max: "9223372036854775807".into(),
+                cycle: false,
+                cache: Some(None),
+                last_used: last_used.map(str::to_string),
+            },
+        )
+    }
+
+    fn with_tsql(tables: Vec<TableInfo>, objects: Vec<TsqlObject>) -> DbSchema {
+        DbSchema {
+            tables,
+            tsql_objects: objects,
+            ..Default::default()
+        }
+    }
+
+    /// **SQL Server's standalone objects are compared, by kind and name**:
+    /// one only the right has is created, one only the left has dropped, one
+    /// that differs changed the way its editor would change it — and a
+    /// sequence whose counter alone differs is the same sequence, two
+    /// databases' positions differing by use.
+    #[test]
+    fn sql_servers_standalone_objects_are_compared() {
+        use crate::schema::TsqlObjectKind as T;
+        let alias = tsql(
+            "code",
+            T::AliasType {
+                base: "nvarchar(10)".into(),
+                nullable: false,
+            },
+        );
+        let syn = tsql(
+            "customers",
+            T::Synonym {
+                target: vec!["dbo".into(), "customer".into()],
+            },
+        );
+        let left = with_tsql(vec![], vec![tsql_sequence("1", Some("41")), alias]);
+        let right = with_tsql(vec![], vec![tsql_sequence("5", Some("7")), syn]);
+        let c = SchemaComparison::of(&left, &right, SqlDialect::MsSql);
+        let seq = find(&c, "sequence:dbo.order_no");
+        assert_eq!(seq.status, ObjectStatus::Differing);
+        assert_eq!(
+            seq.changes.emit(),
+            vec!["ALTER SEQUENCE [dbo].[order_no] INCREMENT BY 5;".to_string()]
+        );
+        assert_eq!(
+            find(&c, "alias type:dbo.code").status,
+            ObjectStatus::OnlyLeft
+        );
+        assert_eq!(
+            find(&c, "synonym:dbo.customers").status,
+            ObjectStatus::OnlyRight
+        );
+        let plan = c.plan(|_| true);
+        assert!(plan.unsupported().is_empty(), "{:?}", plan.unsupported());
+
+        let same = SchemaComparison::of(
+            &with_tsql(vec![], vec![tsql_sequence("1", Some("41"))]),
+            &with_tsql(vec![], vec![tsql_sequence("1", None)]),
+            SqlDialect::MsSql,
+        );
+        assert_eq!(
+            find(&same, "sequence:dbo.order_no").status,
+            ObjectStatus::Same
+        );
+    }
+
+    /// **The plan creates them in the order their uses need**: an XML schema
+    /// collection, then an alias type, then a sequence and a synonym, all
+    /// before the table whose columns may use them and the view that may read
+    /// through the synonym — a view over a synonym not yet created is Msg 208,
+    /// while a synonym takes a target that does not exist yet (both measured
+    /// on 2022). Dropped, they go after the tables, the synonym first.
+    #[test]
+    fn sql_servers_objects_are_planned_around_the_tables_that_use_them() {
+        use crate::schema::TsqlObjectKind as T;
+        let objects = vec![
+            tsql(
+                "customers",
+                T::Synonym {
+                    target: vec!["dbo".into(), "t".into()],
+                },
+            ),
+            tsql_sequence("1", None),
+            tsql(
+                "code",
+                T::AliasType {
+                    base: "nvarchar(10)".into(),
+                    nullable: true,
+                },
+            ),
+            tsql(
+                "invoice",
+                T::XmlSchemaCollection {
+                    definition: "<xsd:schema xmlns:xsd=\"x\"/>".into(),
+                },
+            ),
+        ];
+        let t = TableInfo {
+            schema: Some("dbo".into()),
+            ..table("t", &[("id", "int")])
+        };
+        let v = TableInfo {
+            schema: Some("dbo".into()),
+            is_view: true,
+            create_sql: Some("CREATE VIEW dbo.v AS SELECT id FROM dbo.customers".into()),
+            ..table("v", &[("id", "int")])
+        };
+        let full = with_tsql(vec![t, v], objects);
+        let empty = DbSchema::default();
+        let at = |stmts: &[String], needle: &str| {
+            stmts
+                .iter()
+                .position(|s| s.starts_with(needle))
+                .unwrap_or_else(|| panic!("no {needle} in {stmts:#?}"))
+        };
+        let create = SchemaComparison::of(&empty, &full, SqlDialect::MsSql)
+            .plan(|_| true)
+            .emit();
+        let order = [
+            "CREATE XML SCHEMA COLLECTION",
+            "CREATE TYPE",
+            "CREATE SEQUENCE",
+            "CREATE SYNONYM",
+            "CREATE TABLE",
+            "CREATE VIEW",
+        ];
+        for w in order.windows(2) {
+            assert!(at(&create, w[0]) < at(&create, w[1]), "{w:?}: {create:#?}");
+        }
+        let drop = SchemaComparison::of(&full, &empty, SqlDialect::MsSql)
+            .plan(|_| true)
+            .emit();
+        assert!(
+            at(&drop, "DROP TABLE") < at(&drop, "DROP SYNONYM"),
+            "{drop:#?}"
+        );
+        assert!(
+            at(&drop, "DROP SYNONYM") < at(&drop, "DROP TYPE"),
+            "{drop:#?}"
+        );
+        assert!(
+            at(&drop, "DROP TYPE") < at(&drop, "DROP XML SCHEMA COLLECTION"),
+            "{drop:#?}"
+        );
     }
 
     /// A foreign key onto `to`, on a column named `other`.

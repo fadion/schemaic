@@ -11,10 +11,11 @@ full one, as MySQL/MariaDB and PostgreSQL are**: it connects, reads, validates, 
 scripts, writes the grid's edits back, imports a file into a table, designs tables, edits views,
 triggers and stored routines, drops a table, view or routine, holds a Manual tab's transaction,
 shows a query plan, dumps a database to a `.sql` file, creates and drops a database or a schema
-inside one, and browses and administers its logins, database users and their grants. What it does
-not do yet is named rather than left to a label: its sequences, alias types, synonyms and XML
-schema collections are browsed in the schema tree, created and edited in the object editor and
-dropped from their rows, but have no comparison — see `db::mssql`.
+inside one, and browses and administers its logins, database users and their grants. Its
+sequences, alias types, synonyms and XML schema collections are browsed in the schema tree,
+created and edited in the object editor, dropped from their rows and compared. What it does not do
+yet is named rather than left to a label: a columnstore, XML or spatial index is read rather than
+authored — see `db::mssql`.
 
 This is the project's reference document: the crate/module map, the architecture invariants, the
 UI conventions, and the Floem hazards each subsystem is built on. `CLAUDE.md` at the repo root
@@ -5676,8 +5677,9 @@ existing prose was left alone.
     SQLite, a `TsqlObjectDraft` on SQL Server. The form and the plan follow the draft, so the wrong
     one would offer PostgreSQL's clauses and emit its grammar. A synonym, alias type or collection
     gets a `TsqlObjectDraft` whatever the dialect; the capability below is what keeps one from being
-    offered where its plan would be refused. The comparison is not written: nothing in `compare`
-    reads `tsql_objects` yet.
+    offered where its plan would be refused. The comparison asks this same differ of two readings
+    of one object, so a schema compare and the editor cannot disagree about what a change to one is
+    (`compare::tsql_entry`, under `compare.rs`).
     **`supports_object_creation(dialect, kind)` is what an object folder's Create entry and the
     database node's Create ▸ ask**, computed from the plan the blank form raises —
     `ObjectDraft::blank(kind, …, dialect)` through `change_set(None, …)`, every change in it asked
@@ -5958,9 +5960,9 @@ existing prose was left alone.
     view code, nothing here runs anything (98 unit tests).
     **The differ is the comparator.** An object is `ObjectStatus::Differing` precisely when
     `ddl::diff` — or `diff_view`/`diff_trigger`/`diff_routine`/`diff_event`/`diff_enum`/
-    `diff_domain`/`diff_sequence` — hands back a non-empty `ChangeSet` for it, and `status_of` reads
-    that set rather than comparing fields beside it. That is what keeps a tree's verdict and the
-    plan's contents one fact: a release that teaches `diff` about a column attribute teaches this
+    `diff_domain`/`diff_sequence`/`diff_tsql_object` — hands back a non-empty `ChangeSet` for it, and
+    `status_of` reads that set rather than comparing fields beside it. That is what keeps a tree's
+    verdict and the plan's contents one fact: a release that teaches `diff` about a column attribute teaches this
     module in the same commit, an object called *differing* can never plan nothing, and — the worse
     half — nothing can be called identical while a difference the differ can already see is left
     out of the migration. `the_status_is_the_differs_verdict_and_nothing_else` asserts
@@ -6389,6 +6391,44 @@ existing prose was left alone.
     own drop already performs. An enum's or a domain's dependents come off the **left** schema
     (`ddl::type_dependents`) — they are the columns the change has to re-cast, and they live where
     the DDL runs; asking the right side would list columns that aren't there.
+    **SQL Server's sequences, alias types, XML schema collections and synonyms are paired out of
+    `DbSchema::tsql_objects`**, kind by kind — a local `of_kind` keys each by `display_name`, as
+    every other kind is keyed — and each pair is one `tsql_entry`: `ddl::diff_tsql_object` between
+    the two readings (the right one through `TsqlObjectDraft::from_info`), `create_tsql_object` for
+    one only the right holds, `drop_object` for one only the left does. Those are the object
+    editor's own builders (under `ddl.rs`), so there is no second differ here, and a sequence whose
+    step differs comes out as the `ALTER SEQUENCE … INCREMENT BY 5` the form would have written;
+    `left_ddl`/`right_ddl` are `TsqlObject::create_sql`, the dump's own statement. A T-SQL sequence
+    pairs under `CompareKind::Sequence` beside PostgreSQL's — the two never meet, a T-SQL one being
+    in `tsql_objects` and never in `sequences` — and the other three are kinds of their own,
+    labelled `XML schema collection`, `alias type` and `synonym`. The label is the key's prefix, so
+    a key reads `alias type:dbo.code`, space and all, and the tree's headings pluralise it like any
+    other (`XML schema collections`). **Where they sit in `CompareKind` is their plan order.**
+    `XmlSchemaCollection` and `AliasType` come between `Domain` and `Sequence` — a collection before
+    an alias type whose `xml` base may be typed with one, an alias type before a sequence typed
+    with it — and `is_type` takes both, so they are created in the phase before the tables whose
+    columns name them and dropped in the phase after those tables are gone; dropped in reverse
+    ordinal, a sequence goes before an alias type and an alias type before a collection.
+    **`Synonym` is a type too**, after `Sequence` and before `Table`, as in the dump's types
+    section. It was written last, after `Event`, on the guess that a synonym needs what it names to
+    exist first, and that guess was wrong both ways (measured on 2022): `CREATE SYNONYM` takes a
+    target that does not exist yet, while a view reading through a synonym not yet created is
+    Msg 208 — so a plan making both a view and the synonym it reads failed at the view. Created with
+    the types, it precedes every table, view and routine; its drop is refused by nothing, a view
+    over it failing only when next run, so it goes with the types too, first of them
+    (`sql_servers_objects_are_planned_around_the_tables_that_use_them`, whose plan holds a view over
+    the synonym).
+    **A sequence's position is not compared.** `diff_tsql_object` never reads `last_used`, so two
+    sequences that differ only in how far their counters have run are `Same`: two databases'
+    counters differ by use, not by definition. The trade runs the other way too — a sequence the
+    comparison creates is `create_sql` alone and starts at its own `START WITH`, where the dump moves
+    a copy's counter on to the source's (`restart_sql`) only when it carries the rows as well
+    (`sql_servers_standalone_objects_are_compared`, whose counter-only difference is `Same`; live,
+    `a_comparison_carries_standalone_objects_in_their_order` on 2022 and 2025 — a source with a
+    collection, an alias type, a sequence at `INCREMENT BY 5`, a table drawing on all three, a
+    synonym for it and a view reading through the synonym, against a target holding its own sequence at `INCREMENT BY 1` and a stale alias
+    type: after the sync the sequence was altered in place, the stale type dropped, the synonym
+    worked, and a second comparison found nothing).
     **Three flags say what a comparison cannot vouch for, and all three are *emitting* limits rather
     than comparing ones** — the verdict is right, and it is the generated SQL that suffers.
     `CompareEntry::needs_source` is MySQL's: an eager `Db::fetch_schema` reads a trigger's, a
@@ -13249,16 +13289,17 @@ existing prose was left alone.
   there, ahead of `run_server_ddl`'s refusal, until that was written (both under `ddl.rs`; live,
   `a_database_is_created_with_its_collation_and_dropped` on 2022 and 2025, which skips on Azure
   SQL Database — a created database there is a new billable one — so `master` taking the two
-  statements on Azure is the code's word, not a measurement). Still on it:
-  sequences, alias types, synonyms and XML schema collections, read into `TsqlObject` for the dump
-  (under `dump.rs`), browsed in the tree and dropped from their rows (under `schema.rs` and
-  `ddl.rs`) and now created and edited in the object editor (`TsqlObjectDraft`, under `ddl.rs` and
-  `object_editor.rs`), have no comparison; and a columnstore, XML
+  statements on Azure is the code's word, not a measurement). Still on it: a columnstore, XML
   or spatial index is read as `IndexInfo::lossy` rather than authored, so a rebuild and a view
   edit refuse to touch it rather than drop it (`tsql_rebuild_refusals`,
   `lossy_view_index_refusal`). An index with included columns was on this list too, and is not
   now: they are read and restated (below). So was a named instance's port, which had to be given
-  by hand and is now SQL Server Browser's answer (below). **The refusals are the backstop,
+  by hand and is now SQL Server Browser's answer (below). So were sequences, alias types, synonyms
+  and XML schema collections, read into `TsqlObject` for the dump (under `dump.rs`), which are
+  now browsed in the tree and dropped from their rows (under `schema.rs` and `ddl.rs`), created
+  and edited in the object editor (`TsqlObjectDraft`, under `ddl.rs` and `object_editor.rs`) and
+  compared (under `compare.rs`; live, `a_comparison_carries_standalone_objects_in_their_order` on
+  2022 and 2025). **The refusals are the backstop,
   not the gate**: the app is kept off them by
   capabilities, each an exhaustive `match` with `MsSql` on `false`, asked at the UI site that
   offers the thing — chief among them
