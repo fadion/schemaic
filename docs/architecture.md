@@ -13,8 +13,8 @@ triggers and stored routines, drops a table, view or routine, holds a Manual tab
 shows a query plan, dumps a database to a `.sql` file, creates and drops a database or a schema
 inside one, and browses and administers its logins, database users and their grants. What it does
 not do yet is named rather than left to a label: its sequences, alias types, synonyms and XML
-schema collections are browsed in the schema tree and dropped from their rows, but have no editor
-or comparison — see `db::mssql`.
+schema collections are browsed in the schema tree, created and edited in the object editor and
+dropped from their rows, but have no comparison — see `db::mssql`.
 
 This is the project's reference document: the crate/module map, the architecture invariants, the
 UI conventions, and the Floem hazards each subsystem is built on. `CLAUDE.md` at the repo root
@@ -5027,7 +5027,7 @@ existing prose was left alone.
     `provides` being `None` with nothing waiting on it. *Supported*, because `unsupported()` and
     `emit()` are two halves of one decision and every other emitter that can meet a refused change
     filters at the site — `view_statements`, `routine_statements`, the container builders,
-    `event_statements`. The column clauses were the one family with no such filter, sound only while
+    `object_statements`, `event_statements`. The column clauses were the one family with no such filter, sound only while
     MySQL's `supports_change` had no `false` arm an `AlterColumn` could reach; once it did, the
     INCOMPLETE header read "would leave out: Change column g" with that exact `MODIFY COLUMN g`
     printed below it, and Copy and Open-in-editor are deliberately still live, so that sentence is
@@ -5451,9 +5451,18 @@ existing prose was left alone.
     model** — it's an action, not a state, so folding it in would make every re-opened editor
     dirty against a sequence nothing had changed — and `sequence_edits`/
     `sequence_alter_clauses` are kept in step so the sentence the user reads and the statement
-    that runs come from one comparison. All PostgreSQL-only; `object_statements` is still
-    called from both emitters so a MySQL connection handed such a set emits SQL the server can
-    reject rather than dropping it on the floor.
+    that runs come from one comparison. All PostgreSQL-only, and `supports_change` now says so
+    with an exhaustive arm of its own: the thirteen enum, domain and sequence changes are `true` on
+    PostgreSQL and `false` on the other three, where MySQL used to inherit the blanket yes. Nothing
+    reachable moved — MySQL never fills those lists — but the Create menu asks it (below, after the
+    drops), and that yes is why the menu had spelled its gate as an engine comparison.
+    `object_statements` is still called from both `emit_mysql` and `emit_postgres`, and **filters
+    on `supports_change`** as `container_creates` does: once MySQL answered no,
+    `a_refused_change_is_in_no_script_the_set_produces` caught it writing `CREATE TYPE … AS ENUM`
+    into the script beneath an INCOMPLETE header that named that change as withheld. It used to be
+    left unfiltered on purpose, so a MySQL set holding one emitted SQL the server could reject
+    rather than dropping it on the floor; with the refusal stated, the header names the change as
+    left out, so filtering it no longer drops it silently.
     **Triggers and stored routines** ride the same rails again:
     `TriggerSetDraft`/`TriggerDraft` → `diff_triggers` and `RoutineDraft` → `diff_routine`
     → `Change::{CreateTrigger, ReplaceTrigger, DropTrigger, CreateRoutine, ReplaceRoutine,
@@ -5591,16 +5600,19 @@ existing prose was left alone.
     `drop_event`, anything else to `drop_object` — and it was lifted out of the tree's menu handler
     so the row's **Drop** entry could be gated on the same set it opens
     (`overlays::object_drop_offered`) rather than on a second copy of the match.
-    **SQL Server's sequences, synonyms, alias types and XML schema collections take the shared arm,
-    for the drop alone.** A T-SQL sequence is `ObjectKind::Sequence`, the kind PostgreSQL's
-    browses as; the other three are kinds of their own — `AliasType` is not `Domain`, which is
-    PostgreSQL's and carries checks and a default and alters in place, where an alias type does
-    neither. All four answer yes to `uses_shared_changes`, and `tsql_supports` admits `DropObject`
-    for exactly those four and nothing else of the shared three: T-SQL renames through
-    `sp_rename` and has no `COMMENT ON`. `emit_mssql`'s whole-objects loop writes
+    **SQL Server's sequences, synonyms, alias types and XML schema collections take the shared arm
+    for the drop, and for a rename `sp_rename` can find.** A T-SQL sequence is
+    `ObjectKind::Sequence`, the kind PostgreSQL's browses as; the other three are kinds of their
+    own — `AliasType` is not `Domain`, which is PostgreSQL's and carries checks and a default and
+    alters in place, where an alias type does neither. All four answer yes to
+    `uses_shared_changes`, and `tsql_supports` admits `DropObject` for exactly those four,
+    `RenameObject` for three of them — not an XML schema collection, which `sp_rename` cannot find
+    to rename (Msg 15225, measured) — and never `SetObjectComment`, T-SQL having no `COMMENT ON`.
+    `emit_mssql`'s whole-objects loop writes
     `DROP {sql_keyword} {q};` — `DROP TYPE` for an alias type,
     `DROP XML SCHEMA COLLECTION [sales].[invoice];` for a collection
-    (`each_object_drops_with_its_own_statement`, `only_the_drop_of_the_shared_changes_is_admitted`;
+    (`each_object_drops_with_its_own_statement`,
+    `only_the_drop_and_a_findable_rename_of_the_shared_changes_are_admitted`;
     live, `standalone_objects_are_browsed_and_dropped` on 2022 and 2025, through `drop_item` and
     `run_ddl`). **The drop's risk sentence is per kind**, and true of both engines that have these
     objects, measured on PostgreSQL 16 and SQL Server 2022. A sequence a default still draws from
@@ -5612,22 +5624,78 @@ existing prose was left alone.
     and the sentence used to say *PostgreSQL* refuses, which was false the moment it covered SQL
     Server. A synonym is refused by nothing: a view through a dropped one fails only when it next
     runs (Msg 208/4413), so its sentence says that rather than promising a refusal that never comes
-    (`a_drop_says_what_sql_server_does_with_what_uses_it`). None of the four has a draft —
-    `ObjectDraft::blank` and `from_item` answer `None` — so the editor and the comparison are
-    still to be written.
-    **`supports_object_creation(dialect, kind)` is what an object folder's Create entry asks**,
-    computed from `supports_change` of the create the blank form would raise (`CreateEnum`,
-    `CreateDomain`, `CreateSequence`), with routines and events deferring to
-    `supports_routine_editing`/`supports_event_editing`. It exists because SQL Server now has a
-    Sequences folder, and the entry that folder carried would have opened PostgreSQL's sequence
-    form, whose `CREATE SEQUENCE` `tsql_supports` refuses. SQL Server's own three kinds answer
-    `false` on every engine, there being no form for them yet
-    (`a_folder_offers_create_where_the_engine_takes_the_form`). **It is only sound behind a folder
-    that exists**: MySQL's answer to those three creates is `supports_change`'s blanket yes, so the
-    predicate says yes to a MySQL sequence — harmless while nothing fills those folders there, and
-    why the database node's **Create ▸** (`overlays::create_children`) keeps its
-    `dialect == Postgres` for Type, Domain and Sequence rather than asking this: computed, it would
-    offer all three on MySQL.
+    (`a_drop_says_what_sql_server_does_with_what_uses_it`).
+    **Their editor's draft is `TsqlObjectDraft`** — `original`, the `TsqlObject` the dump reads and
+    writes, and a `restart` — its own type rather than `SequenceDraft`, whose counters are `i64`
+    and whose emitters are PostgreSQL's, where a T-SQL sequence may be `decimal(38,0)` and its
+    bounds are restated as the catalogue printed them. So the numbers stay **text**: `validate`
+    asks each to be a whole number of any length and compares them as `i128` where they parse —
+    the increment not 0, the minimum below the maximum, the start between them, a cache size above
+    0, a restart a whole number between the bounds (the server's Msg 11703 otherwise, measured on
+    2022) — and leaves to the server what only it can judge, a type name or
+    a target that exists. A synonym needs one to four target parts with the object named, an alias
+    type a base, a collection a definition. `blank` states every clause of a new sequence —
+    `bigint` from 1 by 1 up to `i64::MAX`, `NO CYCLE`, `CACHE` at the server's size — because
+    T-SQL's own default starts an ascending sequence at its type's minimum; an alias type starts as
+    a nullable `nvarchar(50)`, a collection as one empty `<xsd:schema>`, a synonym with no target.
+    `restart` is a request and not a field, as on PostgreSQL's draft: the counter's position is not
+    part of the definition. `create_tsql_object` is `Change::CreateTsqlObject`, written as
+    `TsqlObject::create_sql`, so a created object and a dumped one come from one builder.
+    **`diff_tsql_object` alters what T-SQL alters and replaces the rest.**
+    `Change::AlterTsqlSequence { from, to, restart }` is a sequence's increment, bounds, cycle and
+    cache as one `ALTER SEQUENCE` restating only the clauses that differ (`tsql_sequence_clauses`,
+    which the summary reads too), with `RESTART WITH` first, T-SQL's own order. A rename is the
+    shared `RenameObject`, written through `sp_rename` in `emit_mssql`'s rename loop beside
+    `RenameTable` — after the `ALTER`, which names the sequence as it was — with `N'USERDATATYPE'`
+    for an alias type, which is not an object to `sp_rename` until it is told so.
+    `Change::ReplaceTsqlObject { from, to }` — a plain `DROP` of `from`, then `to.create_sql()` —
+    is everything else: a sequence's type or start, a synonym's target, an alias type's base or
+    nullability, and any change at all to a collection, its name included. **A new start is a
+    replace, not a restart**: `ALTER SEQUENCE` has no `START WITH`, and `RESTART WITH` moves the
+    counter as well, which is why the form offers *Start* on a new sequence alone. The drop is
+    plain rather than the dump's `IF EXISTS` because the object came off the catalogue, and the
+    server's refusal over what uses it is the plan's answer. Measured on 2022: `sp_rename` renames
+    a sequence keeping its position, a synonym, and an alias type given `USERDATATYPE`, and all of
+    it works inside a transaction. **The risk sentences follow the act**: an `AlterTsqlSequence`
+    carrying a restart gets `RestartSequence`'s sentence; a sequence's replace says the position it
+    had reached is lost and it starts over, and that the server refuses the drop while a default
+    draws from it; an alias type's or a collection's, that it refuses while a column uses one; a
+    synonym's replace carries none (`an_unedited_object_is_no_change`,
+    `a_new_object_is_created_with_the_dumps_statement`,
+    `a_sequence_is_altered_in_place_and_retyped_by_replacing_it`,
+    `what_t_sql_cannot_alter_is_replaced_and_a_name_is_renamed`,
+    `a_draft_is_refused_for_what_the_form_can_know`; live,
+    `standalone_objects_are_created_and_edited_as_drafted` on 2022 and 2025 — a sequence, alias
+    type and collection created from their blank forms and read back as no change, a synonym
+    created with a target, a sequence moved to increment 5, restarted at 100 and renamed with
+    `NEXT VALUE FOR` then answering 100 and 105, a synonym re-pointed and renamed, an alias type
+    renamed through `sp_rename` and a collection renamed by replacement). `ObjectDraft::Tsql` wires
+    it into the editor: `from_item` answers it for `ObjectItem::Tsql`, and `kind`, `name`,
+    `validate` and `change_set` route to it. **`ObjectDraft::blank` takes the dialect now, because
+    a sequence's draft depends on it** — PostgreSQL's `SequenceDraft` on PostgreSQL, MySQL and
+    SQLite, a `TsqlObjectDraft` on SQL Server. The form and the plan follow the draft, so the wrong
+    one would offer PostgreSQL's clauses and emit its grammar. A synonym, alias type or collection
+    gets a `TsqlObjectDraft` whatever the dialect; the capability below is what keeps one from being
+    offered where its plan would be refused. The comparison is not written: nothing in `compare`
+    reads `tsql_objects` yet.
+    **`supports_object_creation(dialect, kind)` is what an object folder's Create entry and the
+    database node's Create ▸ ask**, computed from the plan the blank form raises —
+    `ObjectDraft::blank(kind, …, dialect)` through `change_set(None, …)`, every change in it asked
+    of `supports_change` — with routines and events deferring to
+    `supports_routine_editing`/`supports_event_editing`. It began because SQL Server's Sequences
+    folder would have opened PostgreSQL's sequence form, whose `CREATE SEQUENCE` `tsql_supports`
+    refuses. It answers Sequence, Synonym, Alias type and XML schema collection on SQL Server and
+    not Type or Domain; Type, Domain and Sequence on PostgreSQL; and nothing on MySQL or SQLite
+    (`a_folder_offers_create_where_the_engine_takes_the_form`; for the menu,
+    `create_menu_tests::mysql_offers_only_what_it_has` and `sql_server_is_offered_what_it_emits`).
+    **It used to be sound only behind a folder that exists**: MySQL inherited `supports_change`'s
+    blanket yes for PostgreSQL's three creates, so the predicate said yes to a MySQL sequence, and
+    `overlays::create_children` kept a `dialect == Postgres` for Type, Domain and Sequence rather
+    than ask it. With that family PostgreSQL's alone (above), the menu asks the predicate of all six
+    kinds and the literal is gone — `engine_comparison_gate`'s `overlays.rs` budget 2 → 1 — where
+    SQL Server's four would otherwise have wanted a second literal beside it. SQL Server's menu is
+    now Table, View, Sequence, Synonym, Alias type, XML schema collection, Function, Procedure,
+    Database, Schema; PostgreSQL's and MySQL's are unchanged.
     SQLite has no stored routines at all — a function there is registered by the host program,
     not stored in the database — so its arms are absent from `supports_change`,
     `supports_routine_editing` is false, and the tree grows no folder and the Create menu no entry.
@@ -9194,7 +9262,13 @@ existing prose was left alone.
     `tsql_of(kind)` and `find_tsql`, which takes the same `find_by_ns` rule as every other
     `find_*`; `schemas()` counts their namespaces, so a schema holding nothing but a synonym is
     still reachable in the tree. `ObjectItem::tsql()` is how a surface asks whether a row is one of
-    these — the object editor, the row's menu and both of the dump's object loops ask it.
+    these — both of the dump's object loops ask it; the object editor's gate and the row's Edit
+    entry asked it too while there was no form for one, and no longer do (under
+    `object_editor.rs`). `synonym_fields` and `synonym_target_of_fields` carry a synonym's target
+    to and from the editor's four fields — server, database, schema, object, the missing outermost
+    ones empty — and are one another's inverse, a missing middle part kept empty both ways as
+    `synonym_target` keeps it (`a_synonyms_target_round_trips_through_the_forms_four_fields`). Four
+    fields rather than one dotted name, so no dotted-name parser exists.
     `TsqlObject::detail` is the tree's summary beside the name: a sequence's type, an alias type's
     base with ` NOT NULL` where it is not nullable, a synonym's target parts joined with `.`, and a
     collection's schemas counted (`1 schema`, `n schemas`); `create_sql` is the dump's own
@@ -10991,9 +11065,9 @@ existing prose was left alone.
       or SQL Server's synonym, alias type or XML schema collection, persisted as `synonym`,
       `alias_type` and `xml_schema_collection` — rather than a table (its name rides in `table`, so
       every file written before objects were searchable still loads): a type and a table may share
-      a name in one namespace and are different places to go back to. Nothing writes the three SQL
-      Server tags yet: both `push` sites are the palette's, and it does not offer those objects
-      (under `object_editor.rs`). The tag is a **persisted** enum of its own rather than `ddl::ObjectKind` so a kind
+      a name in one namespace and are different places to go back to. The three SQL Server tags
+      went unwritten while the palette did not offer those objects — both `push` sites are its — and
+      are written now that it does (under `object_editor.rs`). The tag is a **persisted** enum of its own rather than `ddl::ObjectKind` so a kind
       written by a newer build degrades instead of failing the file and losing every connection's
       history, the rule `SshAuth`/`Environment` follow; it resolves to no live kind, so the row is
       dropped from the recents list exactly as an entry for a since-renamed table is. `Unknown`
@@ -13177,8 +13251,9 @@ existing prose was left alone.
   SQL Database — a created database there is a new billable one — so `master` taking the two
   statements on Azure is the code's word, not a measurement). Still on it:
   sequences, alias types, synonyms and XML schema collections, read into `TsqlObject` for the dump
-  (under `dump.rs`) and now browsed in the tree and dropped from their rows (under `schema.rs` and
-  `ddl.rs`), have no editor or comparison; and a columnstore, XML
+  (under `dump.rs`), browsed in the tree and dropped from their rows (under `schema.rs` and
+  `ddl.rs`) and now created and edited in the object editor (`TsqlObjectDraft`, under `ddl.rs` and
+  `object_editor.rs`), have no comparison; and a columnstore, XML
   or spatial index is read as `IndexInfo::lossy` rather than authored, so a rebuild and a view
   edit refuse to touch it rather than drop it (`tsql_rebuild_refusals`,
   `lossy_view_index_refusal`). An index with included columns was on this list too, and is not
@@ -13192,7 +13267,9 @@ existing prose was left alone.
   view's `CreateView` and `ReplaceView`, a trigger's create, replace and drop, a routine's
   `CreateRoutine` and `ReplaceRoutine`, a namespace's `CreateSchema` and `DropSchema`, a
   database's `CreateDatabase` and `DropDatabase`, the shared `DropObject` for a sequence, synonym,
-  alias type or XML schema collection, and the seven account changes, through the same
+  alias type or XML schema collection and `RenameObject` for the first three, the object editor's
+  `CreateTsqlObject`, `ReplaceTsqlObject` and `AlterTsqlSequence`, and the seven account changes,
+  through the same
   `account_change_supported` every engine's answer goes through (under `ddl.rs`) — and nothing
   more. The four editor predicates compute
   from it, so it decides which editors open: `supports_table_design` probes a column retype, which
@@ -13238,10 +13315,13 @@ existing prose was left alone.
   on `supports_routine_editing`, so nothing in the menu changed but the test's expected list; and
   the Create menu *Schema* and a schema node's **Drop**, both gated on
   `ddl::supports_namespace_editing`, now that it writes `CREATE`/`DROP SCHEMA` — the same: the
-  predicate computes from `supports_change`, so only the expected lists moved; and last the
+  predicate computes from `supports_change`, so only the expected lists moved; then the
   Create menu *Database*, the gear's and the blank space's *Create database* and a database
   node's **Drop**, all gated on `ddl::supports_database_editing`, now that `run_server_ddl` runs
-  `CREATE`/`DROP DATABASE` — the same again
+  `CREATE`/`DROP DATABASE` — the same again; and last the Create menu's *Sequence*, *Synonym*,
+  *Alias type* and *XML schema collection*, each of those folders' own Create entry and each such
+  row's **Edit**, now that `emit_mssql` writes the object editor's plans — the Creates gated on
+  `ddl::supports_object_creation`, which computes from the plan the blank form raises
   (`object_menu_tests::sql_server_offers_its_table_changes_and_a_views_drop`,
   `a_standalone_objects_drop_is_offered_only_where_its_statement_emits`,
   `create_menu_tests::sql_server_is_offered_what_it_emits`,
@@ -19978,16 +20058,21 @@ existing prose was left alone.
     It shares one tuple element with the trigger and routine overlays (Floem's 16-arity
     `ViewTuple` limit) and clears both of their targets on open, as they clear its.
   - `object_editor.rs` — the **enum / domain / sequence** modal, over `core::ddl`'s
-    `ObjectDraft`. Reached from a tree object's **Edit**, from a database or schema node's
-    **Create ▸ Type / Domain / Sequence** (PostgreSQL only — on MySQL those entries don't
-    exist, the same "hide what an engine can't express" call `trigger_editor`'s form makes;
-    `overlays::create_submenu` is the one builder both nodes' Create submenu comes from), and
-    from the folder that holds the objects themselves — `Types`/`Domains`/`Sequences` each offer a
-    flat, kind-named **Create sequence** / **Create type** / **Create domain** of their own, which
-    calls `open_for_new` directly rather than through `create_submenu`: the folder has already
-    said which kind, so the submenu's other two children would be entries belonging to the folders
-    either side of it.
-    One modal for three objects because the chrome, the footer, the change count and the
+    `ObjectDraft`, and SQL Server's **sequence / synonym / alias type / XML schema collection**
+    in the same modal. Reached from a tree object's **Edit**, from a database or schema node's
+    **Create ▸ Type / Domain / Sequence** on PostgreSQL and **Create ▸ Sequence / Synonym / Alias
+    type / XML schema collection** on SQL Server (each entry asks `ddl::supports_object_creation`,
+    so on MySQL none of them exists, the same "hide what an engine can't express" call
+    `trigger_editor`'s form makes; `overlays::create_submenu` is the one builder both nodes' Create
+    submenu comes from), and from the folder that holds the objects themselves — each object folder
+    offers a flat, kind-named **Create sequence** / **Create type** / **Create domain** and so on
+    of its own, which calls `open_for_new` directly rather than through `create_submenu`: the
+    folder has already said which kind, so the submenu's other children would be entries belonging
+    to the folders either side of it. `open_for_new` names a new object `new_domain`,
+    `new_sequence`, `new_synonym`, `new_xml_schema_collection` or `new_type` (an enum or an alias
+    type), and passes the connection's dialect to `ObjectDraft::blank`, which is what puts a SQL
+    Server sequence in SQL Server's form rather than PostgreSQL's.
+    One modal for all seven because the chrome, the footer, the change count and the
     ending at `ddl_preview` are identical and only the middle section differs. **A routine is
     not one of them**, and the split is made at the type level rather than by convention:
     `ObjectDraft::from_item`/`blank` return `None` for a routine **and for an event**, and this
@@ -20010,11 +20095,29 @@ existing prose was left alone.
     nothing back on a failed parse would silently swallow what somebody typed.
     `is_editable_object` is the entry point's gate: an identity column's counter is listed
     and alterable but not editable-as-an-object, the call a materialized view gets. **SQL Server's
-    sequences, synonyms, alias types and XML schema collections answer no** (`item.tsql()`): they
-    are browsed, scripted and dropped, and there is no form for one yet — `ObjectDraft::from_item`
-    answers `None` for them. Because the palette's gate delegates here, Find-Anywhere does not
-    offer them either, while the tree's filter finds them (the schema-search invariant, under
-    *Architecture invariants*).
+    sequences, synonyms, alias types and XML schema collections answered no** (`item.tsql()`)
+    while there was no form for one, and since the palette's gate delegates here, Find-Anywhere
+    withheld them while the tree's filter found them. They have a form now, the `item.tsql()`
+    exclusion is gone, and the palette offers them again — the divergence the schema-search
+    invariant records has ended (under *Architecture invariants*).
+    **`tsql_form` is SQL Server's four forms**, over `TsqlObjectDraft` through `tsql_field`,
+    `tsql_toggle` and `with_sequence`. **Numbers are text here, as the model holds them**: a
+    `decimal(38,0)` sequence's bounds pass any integer type the form could parse into, so nothing
+    goes through `object_errors`, as the PostgreSQL sequence form's `i64` fields do, and
+    `TsqlObjectDraft::validate` judges them. A sequence
+    has Name, *Stores* (its type, free text), Increment, Minimum, Maximum, a Cycle toggle, and a
+    Cache toggle beside a *Cache size* field whose empty value means the server's size — the
+    three states `None`, `Some(None)`, `Some(Some(n))` in two controls, **both written from one
+    pair of signals** rather than each from the draft: a toggle that rebuilt the cache from the
+    draft forgot the size its field still showed when turned off and on, and a size typed while
+    it was off went nowhere, so the preview wrote a bare `CACHE` under a field reading a number.
+    **Start appears on a new
+    sequence alone**: `ALTER SEQUENCE` has no `START WITH`, so on an existing one the field could
+    only ever mean dropping it, and a *Position* section's *Restart at* — labelled with the value
+    the counter last handed out — is what moves the counter instead. A synonym is four fields,
+    Server, Database, Schema and Object (`TsqlObject::synonym_fields`, under `schema.rs`); an alias
+    type a *Base type* and a Nullable toggle; a collection one multi-line, monospaced *Schemas*
+    field.
   - `database_editor.rs` — the **container** form: a database, or one of PostgreSQL's or SQL
     Server's namespaces inside one, over `core::ddl`'s `DatabaseDraft`. The smallest of the schema
     editors and the only one that **only ever creates** — there is no `current`, no diff and
@@ -20695,12 +20798,14 @@ existing prose was left alone.
     through the same `CtxOpener` its `on_secondary_click_stop` calls and hands that closure to
     `with_nav_scroll`, so the right-click and the keyboard cannot offer different menus for the
     row. **The Create entry asks `ddl::supports_object_creation`** and is absent where it answers
-    no: SQL Server's Sequences folder would otherwise open PostgreSQL's sequence form, whose plan
-    `tsql_supports` refuses, and its synonyms, alias types and XML schema collections have no form
-    at all (under `ddl.rs`, with why the database node's `Create ▸` does not ask the same
-    predicate). An object row's **Edit {kind}** is likewise **absent, not dimmed**, for a SQL
-    Server object (`item.tsql()`): there is no form behind it, which no state of the connection
-    changes. Its **Drop** stays, gated as every row's is on `object_drop_offered`.
+    no: SQL Server's Sequences folder would once have opened PostgreSQL's sequence form, whose plan
+    `tsql_supports` refuses, and it now opens SQL Server's because the predicate computes from the
+    blank form the connection's dialect picks — the same predicate the database node's `Create ▸`
+    asks now (under `ddl.rs`). An object row's **Edit {kind}** was **absent, not dimmed**, for a
+    SQL Server object (`item.tsql()`) while there was no form behind it; it is offered there now,
+    dimmed as on any other object row on a read-only connection or where `is_editable_object`
+    answers no. Its **Drop** stays, gated as every row's is on
+    `object_drop_offered`.
     - The **size column** (`size_badge`) puts each table's on-disk size at the right edge of the
       *panel*, from the same `core::stats` figures the properties modal shows. It answers the
       question that modal cannot — *which* of these is the big one — and is off by default behind
@@ -27528,7 +27633,11 @@ Re-introducing the anti-patterns these guard against is a regression:
   the INCOMPLETE header, refused Apply and still put the statement in the script the escape hatch
   hands over — which is the shape `container_creates`' own doc records a `DROP SCHEMA` reaching a
   MariaDB through. Neither was reachable through today's menus, and a filter that is applied
-  everywhere but one loop is not a filter. **What a per-object capability must not do is answer for an object it wasn't asked
+  everywhere but one loop is not a filter. `object_statements` was a third, unfiltered on purpose
+  while MySQL's answer for PostgreSQL's types was a blanket yes; when that answer became a no,
+  `a_refused_change_is_in_no_script_the_set_produces` caught a MySQL set writing `CREATE TYPE … AS
+  ENUM` under a header naming it withheld, and it filters now too (under `ddl.rs`). **What a
+  per-object capability must not do is answer for an object it wasn't asked
   about**: `field_entries` and `key_entries` take `is_view` because the tree renders a column row
   under a view exactly as under a table, and a constant `true` there offered Edit column and a red
   Drop for something that has neither — opening the *table* designer on a view, whose every edit all
@@ -28074,10 +28183,11 @@ Re-introducing the anti-patterns these guard against is a regression:
   search-history path. A `serial`'s sequence is an ordinary object and a legitimate result, so it
   can be remembered; migrating its column to an identity column makes that same sequence internal,
   and only the second gate stops the remembered row from opening an editor the server would refuse.
-  The same gate now withholds SQL Server's sequences, synonyms, alias types and XML schema
-  collections — `is_editable_object` answers no for `ObjectItem::tsql()`, there being no form for
-  one yet — so the tree's filter finds them and the palette does not, through the one delegation
-  rather than a second exclusion. Every path to `open_for_object` is gated (the tree's two, and this one) — don't add an ungated one.
+  The same gate withheld SQL Server's sequences, synonyms, alias types and XML schema collections
+  for as long as they had no form — `is_editable_object` answered no for `ObjectItem::tsql()` — so
+  the tree's filter found them and the palette did not, through the one delegation rather than a
+  second exclusion; and when the form landed, removing that one term ended the divergence on
+  both producers at once, the remembered row included. Every path to `open_for_object` is gated (the tree's two, and this one) — don't add an ungated one.
 - **A Find-Anywhere database is searched in three passes: table/view *names*, then objects, then
   columns** (`overlays::schema_hits`), and the object pass sits in the middle **deliberately**.
   Columns are the category that floods — one `user_id` foreign key across a hundred tables is a

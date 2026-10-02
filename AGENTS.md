@@ -22,7 +22,8 @@ build) or Microsoft Entra through the Azure CLI, and rebuilds a table for the co
 T-SQL's `ALTER COLUMN` cannot make (`ddl::tsql_rebuild_sql`, as SQLite's twelve-step rebuild
 does), and creates and drops databases and schemas. What it does not do yet is named, not
 implied by a label: **sequences, alias types, synonyms and XML schema collections** are browsed
-in the tree and dropped from their rows but have no editor or comparison. What differs between the
+in the tree, created and edited in the object editor and dropped from their rows, but have no
+comparison. What differs between the
 engines now lives in the *narrow* predicates that decide how an edit is performed rather than
 whether it is offered: `ddl::supports_or_replace_view`, `supports_view_rename`,
 `supports_column_reorder`, `rebuilds_tables`, `supports_change`, `alter_column_disturbs_checks`,

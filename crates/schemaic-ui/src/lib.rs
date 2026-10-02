@@ -4298,13 +4298,14 @@ mod engine_comparison_gate {
         ),
         (
             "overlays.rs",
-            2,
+            1,
             "**Not clean.** `dialect != MySql` decides whether a *view* is \
              offered a trigger, and `trigger_editor.rs` asks the same question \
              again in its own spelling to default the draft. That is defence \
              in depth today and divergence the moment one is edited — it wants \
              a `ddl::supports_view_triggers`, which does not exist yet. The \
-             Postgres-only menu entry beside it is ordinary shape.",
+             Postgres-only Create entries beside it were the second, and ask \
+             `ddl::supports_object_creation` now.",
         ),
         (
             "routine_editor.rs",

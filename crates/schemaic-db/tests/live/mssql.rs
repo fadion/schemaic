@@ -2727,6 +2727,107 @@ async fn standalone_objects_are_browsed_and_dropped() {
     assert!(left.tsql_objects.is_empty(), "{:?}", left.tsql_objects);
 }
 
+/// **The editor's plans run as written**: each kind created from its blank
+/// form and read back as drafted; a sequence altered in place with its
+/// counter restarted, then renamed; a synonym re-pointed and renamed, an alias
+/// type renamed through `sp_rename … USERDATATYPE`, and an XML schema
+/// collection renamed by being replaced — each read back equal to its draft,
+/// so a second open of the editor is no change.
+#[tokio::test(flavor = "multi_thread")]
+async fn standalone_objects_are_created_and_edited_as_drafted() {
+    use schemaic_core::ddl::{self, ObjectDraft, ObjectKind, TsqlObjectDraft};
+    use schemaic_core::schema::{ObjectItem, TsqlObjectKind};
+    if !enabled() {
+        return;
+    }
+    let scratch = Scratch::create("objects_edit").await;
+    let s = &scratch;
+    s.exec("CREATE TABLE dbo.customer (id int); CREATE TABLE dbo.client (id int)")
+        .await;
+    let run = |plan: ddl::ChangeSet| async move {
+        assert!(plan.unsupported().is_empty(), "{:?}", plan.unsupported());
+        let stmts = plan.emit();
+        s.db.run_ddl(&s.name, &stmts, CancellationToken::new())
+            .await
+            .unwrap_or_else(|e| panic!("{e}\n{}", stmts.join("\n")));
+    };
+    let read = |kind: ObjectKind, name: &'static str| async move {
+        let schema =
+            s.db.fetch_schema(&s.name, CancellationToken::new())
+                .await
+                .expect("the schema");
+        schema
+            .find_object(Some("dbo"), kind, name)
+            .unwrap_or_else(|| panic!("{kind:?} {name} not read back"))
+    };
+    let tsql = |item: &ObjectItem| item.tsql().cloned().expect("a SQL Server object");
+
+    // Created from the blank form, and read back as drafted.
+    for (kind, name) in [
+        (ObjectKind::Sequence, "order_no"),
+        (ObjectKind::AliasType, "code"),
+        (ObjectKind::XmlSchemaCollection, "invoice"),
+    ] {
+        let d = ObjectDraft::blank(kind, name, Some("dbo".into()), MS).expect("a form");
+        run(d.change_set(None, &[], MS)).await;
+        let back = read(kind, name).await;
+        let again = ObjectDraft::from_item(&back)
+            .unwrap()
+            .change_set(Some(&back), &[], MS);
+        assert!(again.changes.is_empty(), "{kind:?}: {:?}", again.changes);
+    }
+    let mut syn =
+        TsqlObjectDraft::blank(ObjectKind::Synonym, "customers", Some("dbo".into())).unwrap();
+    syn.info.kind = TsqlObjectKind::Synonym {
+        target: vec!["dbo".into(), "customer".into()],
+    };
+    run(ddl::create_tsql_object(&syn)).await;
+
+    // A sequence altered in place, its counter restarted, then renamed.
+    let seq = tsql(&read(ObjectKind::Sequence, "order_no").await);
+    let mut d = TsqlObjectDraft::from_info(&seq);
+    if let TsqlObjectKind::Sequence { increment, .. } = &mut d.info.kind {
+        *increment = "5".into();
+    }
+    d.restart = Some("100".into());
+    d.info.name = "order_number".into();
+    run(ddl::diff_tsql_object(&seq, &d)).await;
+    assert_eq!(
+        s.scalar("SELECT NEXT VALUE FOR dbo.order_number").await,
+        "100"
+    );
+    assert_eq!(
+        s.scalar("SELECT NEXT VALUE FOR dbo.order_number").await,
+        "105"
+    );
+
+    // A synonym re-pointed, then renamed; read back equal to the draft.
+    let cur = tsql(&read(ObjectKind::Synonym, "customers").await);
+    let mut d = TsqlObjectDraft::from_info(&cur);
+    d.info.kind = TsqlObjectKind::Synonym {
+        target: vec!["dbo".into(), "client".into()],
+    };
+    run(ddl::diff_tsql_object(&cur, &d)).await;
+    let cur = tsql(&read(ObjectKind::Synonym, "customers").await);
+    let mut d = TsqlObjectDraft::from_info(&cur);
+    d.info.name = "clients".into();
+    run(ddl::diff_tsql_object(&cur, &d)).await;
+    let back = tsql(&read(ObjectKind::Synonym, "clients").await);
+    assert_eq!(back.kind, d.info.kind);
+
+    // An alias type renamed in place, an XML schema collection by replacing it.
+    let cur = tsql(&read(ObjectKind::AliasType, "code").await);
+    let mut d = TsqlObjectDraft::from_info(&cur);
+    d.info.name = "sku".into();
+    run(ddl::diff_tsql_object(&cur, &d)).await;
+    read(ObjectKind::AliasType, "sku").await;
+    let cur = tsql(&read(ObjectKind::XmlSchemaCollection, "invoice").await);
+    let mut d = TsqlObjectDraft::from_info(&cur);
+    d.info.name = "bill".into();
+    run(ddl::diff_tsql_object(&cur, &d)).await;
+    read(ObjectKind::XmlSchemaCollection, "bill").await;
+}
+
 /// **A namespace is created and dropped in the plan's transaction**, and
 /// `CREATE SCHEMA` — which T-SQL wants first in its batch — runs as the
 /// emitter writes it, ahead of a table in the same plan. A drop of one still

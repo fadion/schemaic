@@ -606,21 +606,28 @@ pub(crate) fn create_children(
             disabled: read_only,
         });
     }
-    if dialect == schemaic_core::intel::SqlDialect::Postgres {
-        out.extend(
-            [
-                (ObjectKind::Enum, "Type"),
-                (ObjectKind::Domain, "Domain"),
-                (ObjectKind::Sequence, "Sequence"),
-            ]
-            .into_iter()
-            .map(|(kind, label)| CreateEntry {
-                label,
-                kind: CreateKind::Object(kind),
-                disabled: read_only,
-            }),
-        );
-    }
+    // The standalone objects, each asked of the plan its blank form raises
+    // (`ddl::supports_object_creation`) — PostgreSQL's types, domains and
+    // sequences, SQL Server's sequences, synonyms, alias types and XML schema
+    // collections. A capability, where this was a `dialect == Postgres`
+    // literal: SQL Server's kinds would have needed a second one beside it.
+    out.extend(
+        [
+            (ObjectKind::Enum, "Type"),
+            (ObjectKind::Domain, "Domain"),
+            (ObjectKind::Sequence, "Sequence"),
+            (ObjectKind::Synonym, "Synonym"),
+            (ObjectKind::AliasType, "Alias type"),
+            (ObjectKind::XmlSchemaCollection, "XML schema collection"),
+        ]
+        .into_iter()
+        .filter(|(kind, _)| schemaic_core::ddl::supports_object_creation(dialect, *kind))
+        .map(|(kind, label)| CreateEntry {
+            label,
+            kind: CreateKind::Object(kind),
+            disabled: read_only,
+        }),
+    );
     // Stored routines, on the three engines that have them. A **capability**, not
     // an engine test — SQLite has no `CREATE PROCEDURE` and no catalogue of one,
     // so the entries are absent there rather than dimmed, which is the same call
@@ -1903,15 +1910,13 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         entries.push(MenuEntry::action("Refresh", move || (rf)(db.clone())));
                     }
                     entries.push(MenuEntry::Separator);
-                    // Absent, not dimmed, for a SQL Server object: there is no
-                    // form for one, which no state of the connection changes.
-                    if item.tsql().is_none() {
+                    {
                         let ui = import_ui.clone();
                         let (db, obj) = (database.clone(), item.clone());
                         let read_only = conn_read_only(&connections, active_conn);
                         let editable = crate::object_editor::is_editable_object(&obj);
-                        // Named, not a bare "Edit": one tree holds types, domains
-                        // and sequences, and the menu is the only thing that says
+                        // Named, not a bare "Edit": one tree holds types, domains,
+                        // sequences, synonyms and more, and the menu is the only thing that says
                         // which of them the row under the cursor is.
                         entries.push(
                             MenuEntry::action(format!("Edit {}", kind.label()), move || {
@@ -6304,8 +6309,9 @@ mod create_menu_tests {
         );
     }
 
-    /// **SQL Server is offered a table, a view, its routines and both
-    /// containers** — the Creates whose statements it emits.
+    /// **SQL Server is offered a table, a view, its four standalone objects,
+    /// its routines and both containers** — the Creates whose statements it
+    /// emits — and not PostgreSQL's type or domain.
     #[test]
     fn sql_server_is_offered_what_it_emits() {
         assert_eq!(
@@ -6313,6 +6319,10 @@ mod create_menu_tests {
             vec![
                 "Table",
                 "View",
+                "Sequence",
+                "Synonym",
+                "Alias type",
+                "XML schema collection",
                 "Function",
                 "Procedure",
                 "Database",

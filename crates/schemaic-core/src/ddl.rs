@@ -2407,6 +2407,323 @@ impl SequenceDraft {
     }
 }
 
+// ── SQL Server's standalone objects ──────────────────────────────────────────
+
+/// The desired shape of one of SQL Server's sequences, synonyms, alias types
+/// and XML schema collections — the object editor's draft for them, over the
+/// [`crate::schema::TsqlObject`] the dump reads and writes, so a form's
+/// `CREATE` and a dump's are one builder's.
+///
+/// Its own type rather than [`SequenceDraft`]'s: that one's counters are
+/// `i64` and its emitters PostgreSQL's, where a T-SQL sequence may be
+/// `decimal(38,0)` and its bounds are restated as the catalogue printed them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TsqlObjectDraft {
+    /// The name on the server, or `None` for a new object.
+    pub original: Option<String>,
+    pub info: crate::schema::TsqlObject,
+    /// A sequence's `RESTART WITH`, when one is asked for — the counter's
+    /// position is not part of its definition, so it is a request, not a field.
+    pub restart: Option<String>,
+}
+
+impl TsqlObjectDraft {
+    /// The draft that describes `t` exactly — the round-trip gate's input.
+    pub fn from_info(t: &crate::schema::TsqlObject) -> TsqlObjectDraft {
+        TsqlObjectDraft {
+            original: Some(t.name.clone()),
+            info: t.clone(),
+            restart: None,
+        }
+    }
+
+    /// A new object of `kind`, or `None` for a kind that is not SQL Server's.
+    ///
+    /// A sequence starts as `bigint` from 1 up, cached at the server's size —
+    /// every clause stated, since T-SQL's own defaults start an ascending
+    /// sequence at its type's minimum. An alias type starts as a nullable
+    /// `nvarchar(50)`, an XML schema collection as one empty schema.
+    pub fn blank(
+        kind: ObjectKind,
+        name: impl Into<String>,
+        schema: Option<String>,
+    ) -> Option<TsqlObjectDraft> {
+        use crate::schema::TsqlObjectKind as T;
+        let kind = match kind {
+            ObjectKind::Sequence => T::Sequence {
+                data_type: "bigint".into(),
+                start: "1".into(),
+                increment: "1".into(),
+                min: "1".into(),
+                max: "9223372036854775807".into(),
+                cycle: false,
+                cache: Some(None),
+                last_used: None,
+            },
+            ObjectKind::Synonym => T::Synonym { target: Vec::new() },
+            ObjectKind::AliasType => T::AliasType {
+                base: "nvarchar(50)".into(),
+                nullable: true,
+            },
+            ObjectKind::XmlSchemaCollection => T::XmlSchemaCollection {
+                definition: "<xsd:schema xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\">\n\
+                             </xsd:schema>"
+                    .into(),
+            },
+            ObjectKind::Enum
+            | ObjectKind::Domain
+            | ObjectKind::Function
+            | ObjectKind::Procedure
+            | ObjectKind::Event => return None,
+        };
+        Some(TsqlObjectDraft {
+            original: None,
+            info: crate::schema::TsqlObject {
+                schema,
+                name: name.into(),
+                kind,
+            },
+            restart: None,
+        })
+    }
+
+    /// What stops this draft being applied, in the form's words.
+    ///
+    /// The numbers are asked as whole numbers of any size (a `decimal(38,0)`
+    /// sequence's bounds pass `i64`), compared where they parse; what only the
+    /// server can judge — a type name, a target that exists — is left to it.
+    pub fn validate(&self) -> Vec<String> {
+        use crate::schema::TsqlObjectKind as T;
+        let mut out = Vec::new();
+        if self.info.name.trim().is_empty() {
+            out.push("The name can't be empty.".to_string());
+        }
+        let whole = |s: &str| {
+            let s = s.trim();
+            let digits = s.strip_prefix('-').unwrap_or(s);
+            !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+        };
+        let n = |s: &str| s.trim().parse::<i128>().ok();
+        match &self.info.kind {
+            T::Sequence {
+                data_type,
+                start,
+                increment,
+                min,
+                max,
+                cache,
+                ..
+            } => {
+                if data_type.trim().is_empty() {
+                    out.push("A sequence needs a type.".to_string());
+                }
+                for (label, v) in [
+                    ("The start", start),
+                    ("The increment", increment),
+                    ("The minimum", min),
+                    ("The maximum", max),
+                ] {
+                    if !whole(v) {
+                        out.push(format!("{label} must be a whole number."));
+                    }
+                }
+                if n(increment) == Some(0) {
+                    out.push("The increment can't be 0.".to_string());
+                }
+                if let (Some(lo), Some(hi)) = (n(min), n(max)) {
+                    if lo >= hi {
+                        out.push("The minimum must be below the maximum.".to_string());
+                    } else if let Some(s) = n(start)
+                        && (s < lo || s > hi)
+                    {
+                        out.push(
+                            "The start must lie between the minimum and the maximum.".to_string(),
+                        );
+                    }
+                }
+                if let Some(Some(size)) = cache
+                    && !(whole(size) && n(size).is_some_and(|c| c > 0))
+                {
+                    out.push("The cache size must be a whole number above 0.".to_string());
+                }
+                if let Some(r) = &self.restart {
+                    if !whole(r) {
+                        out.push("The restart value must be a whole number.".to_string());
+                    } else if let (Some(r), Some(lo), Some(hi)) = (n(r), n(min), n(max))
+                        && (r < lo || r > hi)
+                    {
+                        out.push(
+                            "The restart value must lie between the minimum and the maximum."
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+            T::Synonym { target } => {
+                if target.is_empty()
+                    || target.len() > 4
+                    || target.last().is_none_or(|o| o.trim().is_empty())
+                {
+                    out.push("A synonym needs the object it stands for.".to_string());
+                }
+            }
+            T::AliasType { base, .. } => {
+                if base.trim().is_empty() {
+                    out.push("An alias type needs a base type.".to_string());
+                }
+            }
+            T::XmlSchemaCollection { definition } => {
+                if definition.trim().is_empty() {
+                    out.push("An XML schema collection needs at least one schema.".to_string());
+                }
+            }
+        }
+        out
+    }
+}
+
+/// The plan for a new SQL Server object: its `CREATE`, the dump's own.
+pub fn create_tsql_object(draft: &TsqlObjectDraft) -> ChangeSet {
+    object_set(
+        &draft.info.name,
+        draft.info.schema.as_deref(),
+        SqlDialect::MsSql,
+        Change::CreateTsqlObject(Box::new(draft.info.clone())),
+    )
+}
+
+/// Everything that turns `current` into `draft`, on SQL Server.
+///
+/// What T-SQL alters in place, it alters: a sequence's bounds, step, cycle
+/// and cache (`ALTER SEQUENCE`, the counter kept), and a name through
+/// `sp_rename` — which takes a sequence, a synonym and an alias type
+/// (measured, 2022) and keeps a sequence's position. What it cannot is a
+/// drop and a create ([`Change::ReplaceTsqlObject`]): a sequence's type, a
+/// synonym's target, an alias type's base or nullability, an XML schema
+/// collection's schemas or its name — `sp_rename` finds no collection to
+/// rename (Msg 15225), and a sequence's start: `ALTER SEQUENCE` has no
+/// `START WITH`, and its `RESTART WITH` moves the counter as well. A replace
+/// names the object as the draft does, so it carries a rename with it.
+pub fn diff_tsql_object(current: &crate::schema::TsqlObject, draft: &TsqlObjectDraft) -> ChangeSet {
+    use crate::schema::TsqlObjectKind as T;
+    let to = &draft.info;
+    let renamed = to.name != current.name;
+    let mut changes = Vec::new();
+    let replace = match (&current.kind, &to.kind) {
+        // `ALTER SEQUENCE` has no `START WITH` — its `RESTART WITH` moves the
+        // counter too — so a new start, like a new type, is a new sequence.
+        (
+            T::Sequence {
+                data_type: a,
+                start: s0,
+                ..
+            },
+            T::Sequence {
+                data_type: b,
+                start: s1,
+                ..
+            },
+        ) => a != b || s0.trim() != s1.trim(),
+        (T::Synonym { target: a }, T::Synonym { target: b }) => a != b,
+        (
+            T::AliasType {
+                base: a,
+                nullable: x,
+            },
+            T::AliasType {
+                base: b,
+                nullable: y,
+            },
+        ) => a != b || x != y,
+        (T::XmlSchemaCollection { definition: a }, T::XmlSchemaCollection { definition: b }) => {
+            a != b || renamed
+        }
+        // A kind mismatch cannot be built by the editor; replacing is the
+        // reading that states the draft whole.
+        _ => true,
+    };
+    if replace {
+        changes.push(Change::ReplaceTsqlObject {
+            from: Box::new(current.clone()),
+            to: Box::new(to.clone()),
+        });
+    } else {
+        if let (T::Sequence { .. }, T::Sequence { .. }) = (&current.kind, &to.kind)
+            && (!tsql_sequence_clauses(current, to).is_empty() || draft.restart.is_some())
+        {
+            changes.push(Change::AlterTsqlSequence {
+                from: Box::new(current.clone()),
+                to: Box::new(to.clone()),
+                restart: draft.restart.clone(),
+            });
+        }
+        if renamed {
+            changes.push(Change::RenameObject {
+                kind: to.object_kind(),
+                to: to.name.clone(),
+            });
+        }
+    }
+    ChangeSet {
+        table: current.name.clone(),
+        schema: current.schema.clone(),
+        dialect: SqlDialect::MsSql,
+        flavour: ServerFlavour::Unknown,
+        changes,
+    }
+}
+
+/// The `ALTER SEQUENCE` clauses that differ between two readings of one
+/// sequence, in T-SQL's order — none for an unchanged one.
+fn tsql_sequence_clauses(
+    from: &crate::schema::TsqlObject,
+    to: &crate::schema::TsqlObject,
+) -> Vec<String> {
+    use crate::schema::TsqlObjectKind as T;
+    let (
+        T::Sequence {
+            increment: i0,
+            min: lo0,
+            max: hi0,
+            cycle: c0,
+            cache: k0,
+            ..
+        },
+        T::Sequence {
+            increment: i1,
+            min: lo1,
+            max: hi1,
+            cycle: c1,
+            cache: k1,
+            ..
+        },
+    ) = (&from.kind, &to.kind)
+    else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    if i0.trim() != i1.trim() {
+        out.push(format!("INCREMENT BY {}", i1.trim()));
+    }
+    if lo0.trim() != lo1.trim() {
+        out.push(format!("MINVALUE {}", lo1.trim()));
+    }
+    if hi0.trim() != hi1.trim() {
+        out.push(format!("MAXVALUE {}", hi1.trim()));
+    }
+    if c0 != c1 {
+        out.push(if *c1 { "CYCLE" } else { "NO CYCLE" }.to_string());
+    }
+    if k0 != k1 {
+        out.push(match k1 {
+            None => "NO CACHE".to_string(),
+            Some(None) => "CACHE".to_string(),
+            Some(Some(n)) => format!("CACHE {}", n.trim()),
+        });
+    }
+    out
+}
+
 /// Whichever standalone object the editor is editing.
 ///
 /// The counterpart to [`crate::schema::ObjectItem`] on the draft side: one modal
@@ -2417,6 +2734,9 @@ pub enum ObjectDraft {
     Enum(EnumDraft),
     Domain(DomainDraft),
     Sequence(SequenceDraft),
+    /// SQL Server's sequences, synonyms, alias types and XML schema
+    /// collections.
+    Tsql(TsqlObjectDraft),
 }
 
 impl Default for ObjectDraft {
@@ -2444,31 +2764,41 @@ impl ObjectDraft {
             crate::schema::ObjectItem::Sequence(s) => {
                 Some(ObjectDraft::Sequence(SequenceDraft::from_info(s)))
             }
-            // SQL Server's standalone objects have no draft here yet.
-            crate::schema::ObjectItem::Routine(_)
-            | crate::schema::ObjectItem::Event(_)
-            | crate::schema::ObjectItem::Tsql(_) => None,
+            crate::schema::ObjectItem::Tsql(t) => {
+                Some(ObjectDraft::Tsql(TsqlObjectDraft::from_info(t)))
+            }
+            crate::schema::ObjectItem::Routine(_) | crate::schema::ObjectItem::Event(_) => None,
         }
     }
 
     /// A blank draft of one kind, or `None` for a routine or an event — see
     /// [`ObjectDraft::from_item`].
+    ///
+    /// **The dialect decides a sequence's draft**: PostgreSQL's
+    /// [`SequenceDraft`] everywhere but SQL Server, whose is a
+    /// [`TsqlObjectDraft`] — the form and the plan follow the draft, so the
+    /// wrong one would offer PostgreSQL's clauses and emit its grammar.
     pub fn blank(
         kind: ObjectKind,
         name: impl Into<String>,
         schema: Option<String>,
+        dialect: SqlDialect,
     ) -> Option<ObjectDraft> {
-        match kind {
-            ObjectKind::Enum => Some(ObjectDraft::Enum(EnumDraft::blank(name, schema))),
-            ObjectKind::Domain => Some(ObjectDraft::Domain(DomainDraft::blank(name, schema))),
-            ObjectKind::Sequence => Some(ObjectDraft::Sequence(SequenceDraft::blank(name, schema))),
-            // SQL Server's have no draft yet: browsed, scripted and dropped.
-            ObjectKind::Function
-            | ObjectKind::Procedure
-            | ObjectKind::Event
-            | ObjectKind::Synonym
-            | ObjectKind::AliasType
-            | ObjectKind::XmlSchemaCollection => None,
+        match (kind, dialect) {
+            (ObjectKind::Enum, _) => Some(ObjectDraft::Enum(EnumDraft::blank(name, schema))),
+            (ObjectKind::Domain, _) => Some(ObjectDraft::Domain(DomainDraft::blank(name, schema))),
+            (
+                ObjectKind::Sequence,
+                SqlDialect::Postgres | SqlDialect::MySql | SqlDialect::Sqlite,
+            ) => Some(ObjectDraft::Sequence(SequenceDraft::blank(name, schema))),
+            (
+                ObjectKind::Sequence
+                | ObjectKind::Synonym
+                | ObjectKind::AliasType
+                | ObjectKind::XmlSchemaCollection,
+                _,
+            ) => TsqlObjectDraft::blank(kind, name, schema).map(ObjectDraft::Tsql),
+            (ObjectKind::Function | ObjectKind::Procedure | ObjectKind::Event, _) => None,
         }
     }
 
@@ -2477,6 +2807,7 @@ impl ObjectDraft {
             ObjectDraft::Enum(_) => ObjectKind::Enum,
             ObjectDraft::Domain(_) => ObjectKind::Domain,
             ObjectDraft::Sequence(_) => ObjectKind::Sequence,
+            ObjectDraft::Tsql(d) => d.info.object_kind(),
         }
     }
 
@@ -2485,6 +2816,7 @@ impl ObjectDraft {
             ObjectDraft::Enum(d) => &d.info.name,
             ObjectDraft::Domain(d) => &d.info.name,
             ObjectDraft::Sequence(d) => &d.info.name,
+            ObjectDraft::Tsql(d) => &d.info.name,
         }
     }
 
@@ -2493,6 +2825,7 @@ impl ObjectDraft {
             ObjectDraft::Enum(d) => d.validate(),
             ObjectDraft::Domain(d) => d.validate(),
             ObjectDraft::Sequence(d) => d.validate(),
+            ObjectDraft::Tsql(d) => d.validate(),
         }
     }
 
@@ -2523,9 +2856,11 @@ impl ObjectDraft {
             (Some(ObjectItem::Sequence(c)), ObjectDraft::Sequence(d)) => {
                 diff_sequence(c, d, dialect)
             }
+            (Some(ObjectItem::Tsql(c)), ObjectDraft::Tsql(d)) => diff_tsql_object(c, d),
             (_, ObjectDraft::Enum(d)) => create_enum(d, dialect),
             (_, ObjectDraft::Domain(d)) => create_domain(d, dialect),
             (_, ObjectDraft::Sequence(d)) => create_sequence(d, dialect),
+            (_, ObjectDraft::Tsql(d)) => create_tsql_object(d),
         }
     }
 }
@@ -2861,12 +3196,33 @@ pub enum Change {
     RestartSequence {
         to: i64,
     },
-    /// `ALTER … RENAME TO` for any of the three standalone objects.
+    /// **SQL Server**: create one of its sequences, synonyms, alias types or
+    /// XML schema collections — the dump's own statement
+    /// ([`crate::schema::TsqlObject::create_sql`]).
+    CreateTsqlObject(Box<crate::schema::TsqlObject>),
+    /// **SQL Server**: drop the object and create it as `to` — what T-SQL
+    /// cannot alter in place ([`diff_tsql_object`]). A plain `DROP`, so the
+    /// server's refusal over a column that uses a type or a collection, or a
+    /// default that draws from a sequence, stops the plan.
+    ReplaceTsqlObject {
+        from: Box<crate::schema::TsqlObject>,
+        to: Box<crate::schema::TsqlObject>,
+    },
+    /// **SQL Server**: `ALTER SEQUENCE` — the clauses that differ, and a
+    /// `RESTART WITH` when asked; the counter is kept otherwise.
+    AlterTsqlSequence {
+        from: Box<crate::schema::TsqlObject>,
+        to: Box<crate::schema::TsqlObject>,
+        restart: Option<String>,
+    },
+    /// `ALTER … RENAME TO` for PostgreSQL's three standalone objects; `EXEC
+    /// sp_rename` for SQL Server's sequence, synonym and alias type.
     RenameObject {
         kind: ObjectKind,
         to: String,
     },
-    /// `DROP TYPE`/`DOMAIN`/`SEQUENCE`. Never `CASCADE`: cascading here drops the
+    /// `DROP TYPE`/`DOMAIN`/`SEQUENCE`, and SQL Server's `SYNONYM`/`XML SCHEMA
+    /// COLLECTION` ([`ObjectKind::sql_keyword`]). Never `CASCADE`: cascading here drops the
     /// *columns* built on the type, which is a far larger act than the one the
     /// user asked for. Let the server refuse and name what still depends on it.
     DropObject {
@@ -3569,6 +3925,26 @@ impl Change {
                 format!("Set the sequence's {}", sequence_edits(from, to).join(", "))
             }
             Change::RestartSequence { to } => format!("Restart the sequence at {to}"),
+            Change::CreateTsqlObject(t) => {
+                format!("Create {} {}", t.object_kind().label(), t.name)
+            }
+            Change::ReplaceTsqlObject { from, to } => format!(
+                "Drop the {} {} and create it again{}",
+                from.object_kind().label(),
+                from.name,
+                if from.name == to.name {
+                    String::new()
+                } else {
+                    format!(" as {}", to.name)
+                }
+            ),
+            Change::AlterTsqlSequence { from, to, restart } => {
+                let mut what = tsql_sequence_clauses(from, to);
+                if let Some(r) = restart {
+                    what.push(format!("RESTART WITH {}", r.trim()));
+                }
+                format!("Alter the sequence: {}", what.join(", "))
+            }
             Change::RenameObject { kind, to } => format!("Rename the {} to {to}", kind.label()),
             Change::DropObject { kind } => format!("Drop the {}", kind.label()),
             Change::SetObjectComment { kind, comment } => match comment {
@@ -4133,6 +4509,33 @@ impl Change {
                 "Restarts the counter at {to}. Values already handed out are not \
                  changed, so a key it reaches again collides."
             )],
+            Change::AlterTsqlSequence {
+                restart: Some(to), ..
+            } => vec![format!(
+                "Restarts the counter at {}. Values already handed out are not \
+                 changed, so a key it reaches again collides.",
+                to.trim()
+            )],
+            // A replace is the drop's consequence plus the create's: what the
+            // drop refuses over still stops it (measured, 2022), and a
+            // sequence created again starts over. A synonym holds nothing, and
+            // the two statements run in one transaction.
+            Change::ReplaceTsqlObject { from, .. } => match from.object_kind() {
+                ObjectKind::Synonym => Vec::new(),
+                ObjectKind::Sequence => vec![
+                    "Drops the sequence and creates it again: the position it had \
+                     reached is lost, and it starts over from its start value. The \
+                     server refuses the drop while a column's default still draws \
+                     from it."
+                        .to_string(),
+                ],
+                k => vec![format!(
+                    "Drops the {} and creates it again. The server refuses the drop \
+                     while a column still uses it, so those columns have to change \
+                     type first.",
+                    k.label()
+                )],
+            },
             // **The largest single act in this module, and the sentence says so
             // in the terms the user can check.** It names the database, because
             // this is the one plan where reading the wrong name and clicking
@@ -4909,6 +5312,27 @@ impl ChangeSet {
                 Change::DropObject { kind } => {
                     out.push(format!("DROP {} {q};", kind.sql_keyword()))
                 }
+                Change::CreateTsqlObject(t) => out.push(t.create_sql()),
+                // A plain `DROP`, not the dump's `IF EXISTS`: the object came
+                // off the catalogue, and the server's refusal over what uses
+                // it is the plan's answer.
+                Change::ReplaceTsqlObject { from, to } => {
+                    out.push(format!(
+                        "DROP {} {};",
+                        from.object_kind().sql_keyword(),
+                        from.qname()
+                    ));
+                    out.push(to.create_sql());
+                }
+                // `RESTART WITH` first, T-SQL's own order for the clauses.
+                Change::AlterTsqlSequence { from, to, restart } => {
+                    let clauses: Vec<String> = restart
+                        .iter()
+                        .map(|r| format!("RESTART WITH {}", r.trim()))
+                        .chain(tsql_sequence_clauses(from, to))
+                        .collect();
+                    out.push(format!("ALTER SEQUENCE {q} {};", clauses.join(" ")));
+                }
                 _ => {}
             }
         }
@@ -5168,8 +5592,17 @@ impl ChangeSet {
             out.push(tsql_refresh_star_dependents());
         }
         for c in &admitted {
-            if let Change::RenameTable { to } = c {
-                out.push(tsql_rename(&q, to, None));
+            match c {
+                Change::RenameTable { to } => out.push(tsql_rename(&q, to, None)),
+                // A standalone object's, after its `ALTER SEQUENCE` named it as
+                // it was. An alias type is not an object to `sp_rename`, which
+                // has to be told so.
+                Change::RenameObject { kind, to } => out.push(tsql_rename(
+                    &q,
+                    to,
+                    (*kind == ObjectKind::AliasType).then_some("USERDATATYPE"),
+                )),
+                _ => {}
             }
         }
         // Logins, users, roles and their grants **last**, as on every engine:
@@ -6404,13 +6837,14 @@ impl ChangeSet {
         out
     }
 
-    /// The statements for a standalone object — an enum, a domain or a sequence.
+    /// The statements for a PostgreSQL standalone object — an enum, a domain
+    /// or a sequence. (SQL Server's are `emit_mssql`'s own.)
     ///
     /// One builder for all three, on the same grounds as
     /// [`ChangeSet::view_statements`]: none of these can ever be a clause of an
     /// `ALTER TABLE`, so there is no coalescing to do and no engine split to make
-    /// — every one of them is PostgreSQL-only, which is why nothing here consults
-    /// the dialect beyond quoting.
+    /// — every one of them is PostgreSQL-only, so beyond quoting the dialect is
+    /// consulted once: to leave out what [`supports_change`] refuses.
     ///
     /// Order is dependency-first and then rename-last, the same shape the rest of
     /// the emitter uses: create before altering, alter under the name the server
@@ -6419,6 +6853,15 @@ impl ChangeSet {
         let d = self.dialect;
         let qname = self.qname();
         let mut out = Vec::new();
+        // **Filtered on `supports_change`**, as `container_creates` is: a
+        // change the INCOMPLETE header reports as withheld must not reach the
+        // script below it — a MySQL set holding PostgreSQL's `CREATE TYPE … AS
+        // ENUM` wrote it, under a header naming it refused.
+        let changes: Vec<&Change> = self
+            .changes
+            .iter()
+            .filter(|c| supports_change(d, c))
+            .collect();
         // A restart rides in the same `ALTER SEQUENCE` as the bound edits when
         // the plan has both. PostgreSQL cross-checks new bounds against the
         // sequence's **current** value unless the statement also restarts it —
@@ -6429,21 +6872,20 @@ impl ChangeSet {
         // — the *only* form of that edit the server can accept — could never be
         // applied. The two stay separate `Change`s so the preview still says
         // both things; only the statement is shared.
-        let folded_restart: Option<i64> = self
-            .changes
+        let folded_restart: Option<i64> = changes
             .iter()
             .any(|c| {
                 matches!(c, Change::AlterSequence { from, to }
                 if !sequence_alter_clauses(from, to, d).is_empty())
             })
             .then(|| {
-                self.changes.iter().find_map(|c| match c {
+                changes.iter().find_map(|c| match c {
                     Change::RestartSequence { to } => Some(*to),
                     _ => None,
                 })
             })
             .flatten();
-        for c in &self.changes {
+        for c in &changes {
             match c {
                 Change::CreateEnum(e) => out.push(e.create_sql(d)),
                 Change::CreateDomain(dom) => out.push(dom.create_sql(d)),
@@ -6525,14 +6967,14 @@ impl ChangeSet {
                 _ => {}
             }
         }
-        for c in &self.changes {
+        for c in &changes {
             if let Change::AddDomainCheck(ck) = c {
                 out.push(format!("ALTER DOMAIN {qname} ADD {};", ck.clause_sql(d)));
             }
         }
         // The comment addresses the object under the name the server still knows,
         // so it goes before the rename — as the view and function renames do.
-        for c in &self.changes {
+        for c in &changes {
             if let Change::SetObjectComment { kind, comment } = c {
                 out.push(format!(
                     "COMMENT ON {} {qname} IS {};",
@@ -6544,7 +6986,7 @@ impl ChangeSet {
                 ));
             }
         }
-        for c in &self.changes {
+        for c in &changes {
             match c {
                 Change::RenameObject { kind, to } => out.push(format!(
                     "ALTER {} {qname} RENAME TO {};",
@@ -10535,24 +10977,27 @@ pub fn supports_event_editing(dialect: SqlDialect) -> bool {
 /// Can `dialect` **create** a standalone object of `kind` from the object
 /// editor's blank form — what an object folder's *Create* entry asks.
 ///
-/// Computed from the change the form would raise, so a folder SQL Server now
-/// shows — its Sequences, read into [`crate::schema::DbSchema::tsql_objects`]
-/// — is not offered PostgreSQL's sequence form, whose `CREATE SEQUENCE` its
-/// plans refuse. SQL Server's own three kinds have no form yet, and answer no.
+/// **Computed from the plan the blank form would raise** — the draft
+/// [`ObjectDraft::blank`] picks for `dialect`, asked of [`supports_change`] —
+/// so a folder's entry and the form behind it cannot disagree: SQL Server's
+/// Sequences folder gets SQL Server's sequence form, never PostgreSQL's,
+/// whose `CREATE SEQUENCE` its plans refuse. A routine or an event has its
+/// own form and its own capability.
 pub fn supports_object_creation(dialect: SqlDialect, kind: ObjectKind) -> bool {
-    let probe = match kind {
-        ObjectKind::Enum => Change::CreateEnum(Box::default()),
-        ObjectKind::Domain => Change::CreateDomain(Box::default()),
-        ObjectKind::Sequence => Change::CreateSequence(Box::default()),
-        ObjectKind::Function | ObjectKind::Procedure => {
-            return supports_routine_editing(dialect);
-        }
+    match kind {
+        ObjectKind::Function | ObjectKind::Procedure => return supports_routine_editing(dialect),
         ObjectKind::Event => return supports_event_editing(dialect),
-        ObjectKind::Synonym | ObjectKind::AliasType | ObjectKind::XmlSchemaCollection => {
-            return false;
-        }
-    };
-    supports_change(dialect, &probe)
+        ObjectKind::Enum
+        | ObjectKind::Domain
+        | ObjectKind::Sequence
+        | ObjectKind::Synonym
+        | ObjectKind::AliasType
+        | ObjectKind::XmlSchemaCollection => {}
+    }
+    ObjectDraft::blank(kind, "probe", None, dialect).is_some_and(|d| {
+        let plan = d.change_set(None, &[], dialect);
+        !plan.changes.is_empty() && plan.changes.iter().all(|c| supports_change(dialect, c))
+    })
 }
 
 /// Can `dialect` redefine a routine **in place**, with `CREATE OR REPLACE`?
@@ -13907,6 +14352,49 @@ pub fn supports_change(dialect: SqlDialect, change: &Change) -> bool {
             SqlDialect::MySql | SqlDialect::Sqlite => false,
         };
     }
+    // **PostgreSQL's types, domains and sequences are PostgreSQL's.** Their
+    // changes carry its model and its grammar, and only its reader fills the
+    // lists they edit. Answered here, not left to the blanket "everything but
+    // SQLite" below, because the Create menu and a folder's entry ask this
+    // (`supports_object_creation`): MySQL inherited a yes for a `CREATE TYPE
+    // … AS ENUM` it has no word for, which is why that menu spelled its gate
+    // as an engine comparison instead. SQL Server returned through
+    // `tsql_supports` above. Exhaustive, so a fifth engine answers for itself.
+    if matches!(
+        change,
+        Change::CreateEnum(_)
+            | Change::AddEnumValue { .. }
+            | Change::RenameEnumValue { .. }
+            | Change::RecreateEnum { .. }
+            | Change::CreateDomain(_)
+            | Change::SetDomainDefault { .. }
+            | Change::SetDomainNotNull { .. }
+            | Change::AddDomainCheck(_)
+            | Change::DropDomainCheck { .. }
+            | Change::RecreateDomain { .. }
+            | Change::CreateSequence(_)
+            | Change::AlterSequence { .. }
+            | Change::RestartSequence { .. }
+    ) {
+        return match dialect {
+            SqlDialect::Postgres => true,
+            SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+        };
+    }
+    // **SQL Server's own objects are SQL Server's.** Their changes carry its
+    // model and are written in its grammar; no other emitter has an arm for
+    // them. Exhaustive, so a fifth engine has to say for itself.
+    if matches!(
+        change,
+        Change::CreateTsqlObject(_)
+            | Change::ReplaceTsqlObject { .. }
+            | Change::AlterTsqlSequence { .. }
+    ) {
+        return match dialect {
+            SqlDialect::MsSql => true,
+            SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+        };
+    }
     // **A materialized view is PostgreSQL's alone, and so is the statement that
     // rebuilds one.** MySQL and SQLite have no such object — not a missing
     // emitter arm, an object that cannot exist — so there is nothing for them to
@@ -14136,6 +14624,16 @@ fn tsql_supports(change: &Change) -> bool {
                 | ObjectKind::Synonym
                 | ObjectKind::AliasType
                 | ObjectKind::XmlSchemaCollection
+        ),
+        // Their editor's changes (`diff_tsql_object`), and a rename through
+        // `sp_rename` for the three it takes — not an XML schema collection,
+        // which it cannot find to rename (Msg 15225, measured).
+        Change::CreateTsqlObject(_)
+        | Change::ReplaceTsqlObject { .. }
+        | Change::AlterTsqlSequence { .. } => true,
+        Change::RenameObject { kind, .. } => matches!(
+            kind,
+            ObjectKind::Sequence | ObjectKind::Synonym | ObjectKind::AliasType
         ),
         // Logins, users, roles and grants: the shared account answer.
         c if is_account_change(c) => account_change_supported(SqlDialect::MsSql, c),
@@ -32351,6 +32849,9 @@ mod database_tests {
             | Change::CreateSequence(_)
             | Change::AlterSequence { .. }
             | Change::RestartSequence { .. }
+            | Change::CreateTsqlObject(_)
+            | Change::ReplaceTsqlObject { .. }
+            | Change::AlterTsqlSequence { .. }
             | Change::RenameObject { .. }
             | Change::DropObject { .. }
             | Change::SetObjectComment { .. }
@@ -34109,10 +34610,11 @@ mod tsql_object_tests {
         assert_eq!(pg, risk(ObjectKind::Sequence));
     }
 
-    /// Nothing else of the shared three reaches SQL Server: a rename or a
-    /// comment of one of these is no statement T-SQL has in that shape.
+    /// Of the shared three, SQL Server takes the drop of all four and the
+    /// rename of the three `sp_rename` finds — never an XML schema collection
+    /// (Msg 15225, measured) — and no comment, T-SQL having no `COMMENT ON`.
     #[test]
-    fn only_the_drop_of_the_shared_changes_is_admitted() {
+    fn only_the_drop_and_a_findable_rename_of_the_shared_changes_are_admitted() {
         for kind in [
             ObjectKind::Sequence,
             ObjectKind::Synonym,
@@ -34120,11 +34622,20 @@ mod tsql_object_tests {
             ObjectKind::XmlSchemaCollection,
         ] {
             assert!(supports_change(MsSql, &Change::DropObject { kind }));
+            let rename = Change::RenameObject {
+                kind,
+                to: "y".into(),
+            };
+            assert_eq!(
+                supports_change(MsSql, &rename),
+                kind != ObjectKind::XmlSchemaCollection,
+                "{kind:?}"
+            );
             assert!(!supports_change(
                 MsSql,
-                &Change::RenameObject {
+                &Change::SetObjectComment {
                     kind,
-                    to: "y".into()
+                    comment: None
                 }
             ));
         }
@@ -34133,23 +34644,245 @@ mod tsql_object_tests {
         }
     }
 
+    fn draft_of(t: &TsqlObject) -> TsqlObjectDraft {
+        TsqlObjectDraft::from_info(t)
+    }
+
+    /// **The round-trip gate**: each object, unedited, is no change.
+    #[test]
+    fn an_unedited_object_is_no_change() {
+        for t in schema().tsql_objects {
+            let plan = diff_tsql_object(&t, &draft_of(&t));
+            assert!(plan.changes.is_empty(), "{:?}", plan.changes);
+        }
+    }
+
+    /// A new object's plan is the dump's own `CREATE`.
+    #[test]
+    fn a_new_object_is_created_with_the_dumps_statement() {
+        for t in schema().tsql_objects {
+            let mut d = draft_of(&t);
+            d.original = None;
+            let plan = ObjectDraft::Tsql(d).change_set(None, &[], MsSql);
+            assert!(plan.unsupported().is_empty(), "{:?}", plan.unsupported());
+            assert_eq!(plan.emit(), vec![t.create_sql()]);
+        }
+    }
+
+    /// **A sequence is altered in place where T-SQL can**: the clauses that
+    /// differ, a restart asked for first, the counter kept, and a rename
+    /// through `sp_rename` after the `ALTER` that names it as it was. Its type
+    /// cannot be altered, so a new type is a drop and a create — said to lose
+    /// the position.
+    #[test]
+    fn a_sequence_is_altered_in_place_and_retyped_by_replacing_it() {
+        let t = sequence();
+        let mut d = draft_of(&t);
+        if let TsqlObjectKind::Sequence {
+            increment, cache, ..
+        } = &mut d.info.kind
+        {
+            *increment = "5".into();
+            *cache = Some(Some("20".into()));
+        }
+        d.restart = Some("100".into());
+        d.info.name = "order_number".into();
+        let plan = diff_tsql_object(&t, &d);
+        assert!(plan.unsupported().is_empty(), "{:?}", plan.unsupported());
+        assert_eq!(
+            plan.emit(),
+            vec![
+                "ALTER SEQUENCE [sales].[order_no] RESTART WITH 100 INCREMENT BY 5 CACHE 20;"
+                    .to_string(),
+                "EXEC sp_rename N'[sales].[order_no]', N'order_number';".to_string(),
+            ]
+        );
+        assert!(
+            plan.changes[0]
+                .risks(MsSql)
+                .join(" ")
+                .contains("Restarts the counter at 100"),
+            "{:?}",
+            plan.changes[0].risks(MsSql)
+        );
+
+        let mut d = draft_of(&t);
+        if let TsqlObjectKind::Sequence { data_type, .. } = &mut d.info.kind {
+            *data_type = "int".into();
+        }
+        let plan = diff_tsql_object(&t, &d);
+        let sql = plan.emit();
+        assert_eq!(sql[0], "DROP SEQUENCE [sales].[order_no];");
+        assert!(
+            sql[1].starts_with("CREATE SEQUENCE [sales].[order_no] AS int"),
+            "{sql:?}"
+        );
+        assert!(
+            plan.changes[0]
+                .risks(MsSql)
+                .join(" ")
+                .contains("position it had reached is lost")
+        );
+
+        // `ALTER SEQUENCE` has no `START WITH`, so a new start is a new
+        // sequence too — not a field the plan silently leaves out.
+        let mut d = draft_of(&t);
+        if let TsqlObjectKind::Sequence { start, .. } = &mut d.info.kind {
+            *start = "50".into();
+        }
+        let sql = diff_tsql_object(&t, &d).emit();
+        assert_eq!(sql[0], "DROP SEQUENCE [sales].[order_no];", "{sql:?}");
+        assert!(sql[1].contains("START WITH 50"), "{sql:?}");
+    }
+
+    /// A synonym's new target, an alias type's new base and any change to an
+    /// XML schema collection — its name included — are a drop and a create;
+    /// a synonym's or an alias type's new name alone is `sp_rename`'s, the
+    /// type's told it is one.
+    #[test]
+    fn what_t_sql_cannot_alter_is_replaced_and_a_name_is_renamed() {
+        let s = schema();
+        let (syn, alias, xml) = (&s.tsql_objects[1], &s.tsql_objects[2], &s.tsql_objects[3]);
+
+        let mut d = draft_of(syn);
+        d.info.kind = TsqlObjectKind::Synonym {
+            target: vec!["dbo".into(), "client".into()],
+        };
+        assert_eq!(
+            diff_tsql_object(syn, &d).emit(),
+            vec![
+                "DROP SYNONYM [sales].[customers];".to_string(),
+                "CREATE SYNONYM [sales].[customers] FOR [dbo].[client];".to_string(),
+            ]
+        );
+        let mut d = draft_of(syn);
+        d.info.name = "clients".into();
+        assert_eq!(
+            diff_tsql_object(syn, &d).emit(),
+            vec!["EXEC sp_rename N'[sales].[customers]', N'clients';".to_string()]
+        );
+
+        let mut d = draft_of(alias);
+        d.info.name = "sku".into();
+        assert_eq!(
+            diff_tsql_object(alias, &d).emit(),
+            vec!["EXEC sp_rename N'[sales].[code]', N'sku', N'USERDATATYPE';".to_string()]
+        );
+        let mut d = draft_of(alias);
+        d.info.kind = TsqlObjectKind::AliasType {
+            base: "nvarchar(20)".into(),
+            nullable: false,
+        };
+        let plan = diff_tsql_object(alias, &d);
+        assert_eq!(plan.emit()[0], "DROP TYPE [sales].[code];");
+        assert!(
+            plan.changes[0]
+                .risks(MsSql)
+                .join(" ")
+                .contains("refuses the drop")
+        );
+
+        let mut d = draft_of(xml);
+        d.info.name = "bill".into();
+        let plan = diff_tsql_object(xml, &d);
+        assert!(plan.unsupported().is_empty(), "{:?}", plan.unsupported());
+        assert_eq!(
+            plan.emit()[0],
+            "DROP XML SCHEMA COLLECTION [sales].[invoice];"
+        );
+        assert!(plan.emit()[1].starts_with("CREATE XML SCHEMA COLLECTION [sales].[bill]"));
+    }
+
+    /// What a client can judge is refused in the form's words; a type name
+    /// and a target that exists are the server's.
+    #[test]
+    fn a_draft_is_refused_for_what_the_form_can_know() {
+        let errs = |d: &TsqlObjectDraft| d.validate().join(" ");
+        let mut d = draft_of(&sequence());
+        if let TsqlObjectKind::Sequence {
+            increment,
+            min,
+            start,
+            ..
+        } = &mut d.info.kind
+        {
+            *increment = "0".into();
+            *min = "x".into();
+            *start = "-5".into();
+        }
+        let e = errs(&d);
+        assert!(
+            e.contains("increment can't be 0") && e.contains("minimum must be a whole"),
+            "{e}"
+        );
+        let mut d = draft_of(&sequence());
+        if let TsqlObjectKind::Sequence { start, .. } = &mut d.info.kind {
+            *start = "0".into();
+        }
+        assert!(errs(&d).contains("start must lie between"), "{}", errs(&d));
+        // A restart outside the bounds is refused before the server's Msg 11703
+        // ("must be between the minimum and maximum value", measured on 2022).
+        let mut d = draft_of(&sequence());
+        d.restart = Some("0".into());
+        assert!(
+            errs(&d).contains("restart value must lie between"),
+            "{}",
+            errs(&d)
+        );
+        d.restart = Some("7".into());
+        assert!(d.validate().is_empty(), "{:?}", d.validate());
+        // Past i64, as a decimal(38,0) sequence's bounds are.
+        let mut d = draft_of(&sequence());
+        if let TsqlObjectKind::Sequence { max, .. } = &mut d.info.kind {
+            *max = "99999999999999999999999999999999999999".into();
+        }
+        assert!(d.validate().is_empty(), "{:?}", d.validate());
+
+        let blank = |k| TsqlObjectDraft::blank(k, "x", Some("dbo".into())).unwrap();
+        assert!(errs(&blank(ObjectKind::Synonym)).contains("object it stands for"));
+        for k in [
+            ObjectKind::Sequence,
+            ObjectKind::AliasType,
+            ObjectKind::XmlSchemaCollection,
+        ] {
+            assert!(
+                blank(k).validate().is_empty(),
+                "{k:?}: {:?}",
+                blank(k).validate()
+            );
+        }
+        let mut d = blank(ObjectKind::Synonym);
+        d.info.kind = TsqlObjectKind::Synonym {
+            target: vec!["db".into(), String::new(), "t".into()],
+        };
+        assert!(d.validate().is_empty(), "{:?}", d.validate());
+    }
+
     /// **A folder offers Create only where the form's plan would apply**:
-    /// SQL Server's Sequences folder is not handed PostgreSQL's form, and its
-    /// own three kinds have none yet; PostgreSQL keeps its three.
+    /// SQL Server gets its own four kinds and not PostgreSQL's types or
+    /// domains; PostgreSQL keeps its three and gets none of SQL Server's.
     #[test]
     fn a_folder_offers_create_where_the_engine_takes_the_form() {
+        for kind in [ObjectKind::Enum, ObjectKind::Domain] {
+            assert!(!supports_object_creation(MsSql, kind), "{kind:?}");
+        }
         for kind in [
-            ObjectKind::Enum,
-            ObjectKind::Domain,
             ObjectKind::Sequence,
             ObjectKind::Synonym,
             ObjectKind::AliasType,
             ObjectKind::XmlSchemaCollection,
         ] {
-            assert!(!supports_object_creation(MsSql, kind), "{kind:?}");
+            assert!(supports_object_creation(MsSql, kind), "{kind:?}");
         }
         for kind in [ObjectKind::Enum, ObjectKind::Domain, ObjectKind::Sequence] {
             assert!(supports_object_creation(Postgres, kind), "{kind:?}");
+        }
+        for kind in [
+            ObjectKind::Synonym,
+            ObjectKind::AliasType,
+            ObjectKind::XmlSchemaCollection,
+        ] {
+            assert!(!supports_object_creation(Postgres, kind), "{kind:?}");
         }
         assert!(supports_object_creation(MsSql, ObjectKind::Procedure));
     }

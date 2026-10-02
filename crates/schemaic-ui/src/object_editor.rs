@@ -1,7 +1,8 @@
-//! The editor for PostgreSQL's standalone objects: an enum type, a domain, or a
-//! sequence.
+//! The editor for the standalone objects: PostgreSQL's enum type, domain and
+//! sequence, and SQL Server's sequence, synonym, alias type and XML schema
+//! collection.
 //!
-//! One modal for three objects, on the same grounds `trigger_editor` holds two:
+//! One modal for all of them, on the same grounds `trigger_editor` holds two:
 //! the chrome, the footer, the change count and the ending at
 //! [`ddl_preview`] are identical, and only the middle section
 //! differs — because the objects do. Nothing here is a designer tab, for the
@@ -20,10 +21,12 @@
 //!   — the introspection fixture has one — so a line-per-value box would split
 //!   such a label in two and then *rebuild the type around the split*, which
 //!   destroys data on apply rather than failing.
-//! * **A sequence's numbers are typed, and the draft holds `i64`.** A half-typed
-//!   `-` has nowhere to live in the model, so the parse failure goes to
-//!   `object_errors` beside the draft and blocks the preview from there. Writing
-//!   nothing back on a failed parse would silently ignore what somebody typed.
+//! * **A PostgreSQL sequence's numbers are typed, and the draft holds `i64`.** A
+//!   half-typed `-` has nowhere to live in the model, so the parse failure goes
+//!   to `object_errors` beside the draft and blocks the preview from there.
+//!   Writing nothing back on a failed parse would silently ignore what somebody
+//!   typed. A SQL Server sequence's are text in the draft, as the model holds
+//!   them, and its `validate` judges them ([`tsql_form`]).
 
 use std::rc::Rc;
 
@@ -32,8 +35,12 @@ use floem::keyboard::{Key, NamedKey};
 use floem::prelude::*;
 use floem::reactive::create_effect;
 
-use schemaic_core::ddl::{self, DomainDraft, EnumDraft, ObjectDraft, ObjectKind, SequenceDraft};
-use schemaic_core::schema::{CheckInfo, ObjectItem, SequenceInfo, SequenceOwner};
+use schemaic_core::ddl::{
+    self, DomainDraft, EnumDraft, ObjectDraft, ObjectKind, SequenceDraft, TsqlObjectDraft,
+};
+use schemaic_core::schema::{
+    CheckInfo, ObjectItem, SequenceInfo, SequenceOwner, TsqlObject, TsqlObjectKind,
+};
 
 use crate::table_designer::{edit_ctx, focusable_owned_dropdown, suggest_chevron};
 use crate::widgets::{
@@ -176,7 +183,8 @@ pub(crate) fn open_for_object(
     );
 }
 
-/// Open the editor on a blank draft — Create type / domain / sequence, or the
+/// Open the editor on a blank draft — Create type / domain / sequence / synonym /
+/// alias type / XML schema collection, the engine's own form, or the
 /// routine editor for the two kinds this modal doesn't hold.
 pub(crate) fn open_for_new(
     conn: ConnUi,
@@ -219,10 +227,14 @@ pub(crate) fn open_for_new(
     let name = match kind {
         ObjectKind::Domain => "new_domain",
         ObjectKind::Sequence => "new_sequence",
-        // `Enum`, and the two routine kinds the guard above has already taken.
+        ObjectKind::Synonym => "new_synonym",
+        ObjectKind::XmlSchemaCollection => "new_xml_schema_collection",
+        // `Enum` and `AliasType`, and the routine kinds and the event the
+        // guards above have already taken.
         _ => "new_type",
     };
-    let Some(draft) = ObjectDraft::blank(kind, name, schema.map(str::to_string)) else {
+    let Some(draft) = ObjectDraft::blank(kind, name, schema.map(str::to_string), ctx.dialect)
+    else {
         return;
     };
     open_editor(
@@ -256,11 +268,6 @@ pub(crate) fn open_for_new(
 pub(crate) fn is_editable_object(item: &ObjectItem) -> bool {
     if let Some(r) = item.routine() {
         return r.is_editable();
-    }
-    // SQL Server's sequences, synonyms, alias types and XML schema collections
-    // are browsed, scripted and dropped, and have no form here.
-    if item.tsql().is_some() {
-        return false;
     }
     !item.is_internal()
 }
@@ -1128,6 +1135,367 @@ fn sequence_form(
     .into_any()
 }
 
+// ── SQL Server's objects ─────────────────────────────────────────────────────
+
+/// A text field bound to one place in a SQL Server object's draft.
+fn tsql_field(
+    ui: DdlUi,
+    initial: String,
+    placeholder: &'static str,
+    ring: FocusRing,
+    tabindex: u32,
+    width: fn() -> f64,
+    apply: impl Fn(&mut TsqlObjectDraft, &str) + 'static,
+) -> AnyView {
+    bound_field(
+        ui,
+        initial,
+        FieldCfg {
+            placeholder,
+            focus: Some((ring, tabindex)),
+            ..Default::default()
+        },
+        move |d, v| {
+            if let ObjectDraft::Tsql(t) = d {
+                apply(t, v);
+            }
+        },
+    )
+    .style(move |s| s.width(width()))
+    .into_any()
+}
+
+/// A toggle bound to a SQL Server object's draft.
+fn tsql_toggle(
+    ui: DdlUi,
+    title: &'static str,
+    hint: &'static str,
+    initial: bool,
+    ring: FocusRing,
+    tabindex: u32,
+    apply: impl Fn(&mut TsqlObjectDraft, bool) + 'static,
+) -> AnyView {
+    bound_toggle(ui, title, hint, initial, ring, tabindex, move |d, v| {
+        if let ObjectDraft::Tsql(t) = d {
+            apply(t, v);
+        }
+    })
+}
+
+/// One of a sequence's fields, given the draft's sequence to write into.
+fn with_sequence(
+    t: &mut TsqlObjectDraft,
+    f: impl FnOnce(&mut String, &mut bool, &mut Option<Option<String>>, [&mut String; 4]),
+) {
+    if let TsqlObjectKind::Sequence {
+        data_type,
+        start,
+        increment,
+        min,
+        max,
+        cycle,
+        cache,
+        ..
+    } = &mut t.info.kind
+    {
+        f(data_type, cycle, cache, [start, increment, min, max]);
+    }
+}
+
+/// SQL Server's sequence, synonym, alias type and XML schema collection forms.
+///
+/// **Numbers are text here**, as the model holds them: a `decimal(38,0)`
+/// sequence's bounds pass any integer type the form could parse into, and
+/// [`TsqlObjectDraft::validate`] is what judges them. A sequence's **start**
+/// is a new one's alone: `ALTER SEQUENCE` has no `START WITH`, so on an
+/// existing sequence the field would only ever mean dropping it — *Restart at*
+/// is what moves its counter.
+fn tsql_form(ui: DdlUi, d: &TsqlObjectDraft, ring: FocusRing) -> AnyView {
+    let existing = d.original.is_some();
+    let kind = d.info.object_kind();
+    let name = form_setting(
+        "Name",
+        tsql_field(
+            ui,
+            d.info.name.clone(),
+            "name",
+            ring.clone(),
+            10,
+            field_w,
+            |t, v| t.info.name = v.trim().to_string(),
+        ),
+    );
+    let section = match kind {
+        ObjectKind::Sequence => "Sequence",
+        ObjectKind::Synonym => "Synonym",
+        ObjectKind::AliasType => "Alias type",
+        _ => "XML schema collection",
+    };
+    let mut rows: Vec<AnyView> = vec![form_section(section).into_any(), name.into_any()];
+    let num_col = |label: &'static str, field: AnyView| {
+        form_setting(label, field)
+            .style(|s| s.width(num_w()).flex_shrink(0.0_f32))
+            .into_any()
+    };
+    match &d.info.kind {
+        TsqlObjectKind::Sequence {
+            data_type,
+            start,
+            increment,
+            min,
+            max,
+            cycle,
+            cache,
+            last_used,
+        } => {
+            rows.push(
+                form_setting(
+                    "Stores",
+                    tsql_field(
+                        ui,
+                        data_type.clone(),
+                        "bigint",
+                        ring.clone(),
+                        20,
+                        field_w,
+                        |t, v| with_sequence(t, |ty, _, _, _| *ty = v.trim().to_string()),
+                    ),
+                )
+                .into_any(),
+            );
+            let num = |label, value: &String, tab, slot: usize| {
+                num_col(
+                    label,
+                    tsql_field(
+                        ui,
+                        value.clone(),
+                        "",
+                        ring.clone(),
+                        tab,
+                        num_w,
+                        move |t, v| {
+                            with_sequence(t, |_, _, _, fields| {
+                                *fields[slot] = v.trim().to_string();
+                            })
+                        },
+                    ),
+                )
+            };
+            let mut first = vec![num("Increment", increment, 30, 1)];
+            if !existing {
+                first.push(num("Start", start, 40, 0));
+            }
+            rows.push(
+                h_stack_from_iter(first)
+                    .style(|s| s.flex_row().gap(num_gap()).width_full())
+                    .into_any(),
+            );
+            rows.push(
+                h_stack((num("Minimum", min, 60, 2), num("Maximum", max, 70, 3)))
+                    .style(|s| s.flex_row().gap(num_gap()).width_full())
+                    .into_any(),
+            );
+            rows.push(tsql_toggle(
+                ui,
+                "Cycle",
+                "Wrap around to the other end of the range instead of failing when the sequence \
+                 runs out.",
+                *cycle,
+                ring.clone(),
+                80,
+                |t, v| with_sequence(t, |_, c, _, _| *c = v),
+            ));
+            // Three states in two controls: no cache, the server's size, or a
+            // size of one's own — `None`, `Some(None)`, `Some(Some(n))`. **Both
+            // write from the pair of signals, never from the draft alone**: a
+            // toggle that rebuilt the cache from the draft forgot the size the
+            // field still showed when turned off and on, and a size typed while
+            // it was off went nowhere — the preview then wrote a bare `CACHE`
+            // under a field reading a number.
+            let cache_on = floem::reactive::create_rw_signal(cache.is_some());
+            let cache_size =
+                floem::reactive::create_rw_signal(cache.clone().flatten().unwrap_or_default());
+            {
+                let draft = ui.object_draft;
+                create_effect(move |prev: Option<(bool, String)>| {
+                    let now = (cache_on.get(), cache_size.get());
+                    if prev.as_ref().is_some_and(|p| *p != now) {
+                        let (on, size) = now.clone();
+                        draft.update(|d| {
+                            if let ObjectDraft::Tsql(t) = d {
+                                with_sequence(t, |_, _, k, _| {
+                                    *k = on.then(|| {
+                                        Some(size.trim().to_string()).filter(|s| !s.is_empty())
+                                    });
+                                });
+                            }
+                        });
+                    }
+                    now
+                });
+            }
+            rows.push(
+                crate::settings::focusable_toggle_row(
+                    "Cache",
+                    "Hand out values from memory, faster, at the cost of a gap after a restart \
+                     of the server.",
+                    cache_on,
+                    ring.clone(),
+                    85,
+                )
+                .into_any(),
+            );
+            rows.push(
+                form_setting(
+                    "Cache size",
+                    edit_field(
+                        cache_size,
+                        FieldCfg {
+                            placeholder: "server default",
+                            focus: Some((ring.clone(), 90)),
+                            ..Default::default()
+                        },
+                    )
+                    .style(move |s| s.width(field_w())),
+                )
+                .into_any(),
+            );
+            if existing {
+                rows.push(
+                    form_section("Position")
+                        .style(|s| s.margin_top(theme::scaled(4.0)))
+                        .into_any(),
+                );
+                rows.push(
+                    form_setting_owned(
+                        match last_used {
+                            Some(v) => format!("Restart at — the counter last handed out {v}"),
+                            None => "Restart at — the counter has not been used".to_string(),
+                        },
+                        tsql_field(
+                            ui,
+                            d.restart.clone().unwrap_or_default(),
+                            "leave empty to keep the position",
+                            ring.clone(),
+                            100,
+                            field_w,
+                            |t, v| {
+                                t.restart = Some(v.trim().to_string()).filter(|s| !s.is_empty());
+                            },
+                        ),
+                    )
+                    .into_any(),
+                );
+            }
+        }
+        TsqlObjectKind::Synonym { target } => {
+            rows.push(form_section("Stands for").into_any());
+            let fields = TsqlObject::synonym_fields(target);
+            for (i, (label, placeholder)) in [
+                ("Server", "this server"),
+                ("Database", "this database"),
+                ("Schema", "the default schema"),
+                ("Object", "table, view or routine"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                rows.push(
+                    form_setting(
+                        label,
+                        tsql_field(
+                            ui,
+                            fields[i].clone(),
+                            placeholder,
+                            ring.clone(),
+                            20 + 10 * i as u32,
+                            field_w,
+                            move |t, v| {
+                                if let TsqlObjectKind::Synonym { target } = &mut t.info.kind {
+                                    let mut f = TsqlObject::synonym_fields(target);
+                                    f[i] = v.to_string();
+                                    *target = TsqlObject::synonym_target_of_fields(&f);
+                                }
+                            },
+                        ),
+                    )
+                    .into_any(),
+                );
+            }
+        }
+        TsqlObjectKind::AliasType { base, nullable } => {
+            rows.push(
+                form_setting(
+                    "Base type",
+                    tsql_field(
+                        ui,
+                        base.clone(),
+                        "nvarchar(50)",
+                        ring.clone(),
+                        20,
+                        field_w,
+                        |t, v| {
+                            if let TsqlObjectKind::AliasType { base, .. } = &mut t.info.kind {
+                                *base = v.trim().to_string();
+                            }
+                        },
+                    ),
+                )
+                .into_any(),
+            );
+            rows.push(tsql_toggle(
+                ui,
+                "Nullable",
+                "A column of this type accepts NULL unless the column says otherwise.",
+                *nullable,
+                ring.clone(),
+                30,
+                |t, v| {
+                    if let TsqlObjectKind::AliasType { nullable, .. } = &mut t.info.kind {
+                        *nullable = v;
+                    }
+                },
+            ));
+        }
+        TsqlObjectKind::XmlSchemaCollection { definition } => {
+            let max_rows = floem::reactive::create_rw_signal(14usize);
+            rows.push(
+                form_setting(
+                    "Schemas",
+                    bound_field(
+                        ui,
+                        definition.clone(),
+                        FieldCfg {
+                            multiline: true,
+                            no_wrap: true,
+                            mono: true,
+                            font_size: theme::font_body,
+                            max_rows: Some(max_rows),
+                            placeholder: "<xsd:schema …>",
+                            focus: Some((ring.clone(), 20)),
+                            tab_indents: true,
+                            ..Default::default()
+                        },
+                        |d, v| {
+                            if let ObjectDraft::Tsql(t) = d
+                                && let TsqlObjectKind::XmlSchemaCollection { definition } =
+                                    &mut t.info.kind
+                            {
+                                *definition = v.to_string();
+                            }
+                        },
+                    )
+                    .style(|s| s.width_full()),
+                )
+                .into_any(),
+            );
+        }
+    }
+    v_stack_from_iter(rows)
+        .style(|s| s.flex_col().gap(form_gap()).width_full())
+        .into_any()
+}
+
 // ── the modal ────────────────────────────────────────────────────────────────
 
 fn form(ui: DdlUi, overlay: OverlayUi, target: &ObjectTarget, ring: FocusRing) -> AnyView {
@@ -1142,6 +1510,7 @@ fn form(ui: DdlUi, overlay: OverlayUi, target: &ObjectTarget, ring: FocusRing) -
             target_sequence(target).and_then(|s| s.owned_by.clone()),
             ring,
         ),
+        ObjectDraft::Tsql(d) => tsql_form(ui, d, ring),
     };
     v_stack((body,))
         .style(|s| s.flex_col().gap(form_gap()).width_full())

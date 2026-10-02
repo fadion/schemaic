@@ -6119,7 +6119,7 @@ pub enum TsqlObjectKind {
 }
 
 impl TsqlObject {
-    fn qname(&self) -> String {
+    pub(crate) fn qname(&self) -> String {
         qualified_ident(
             &self.name,
             self.schema.as_deref(),
@@ -6176,6 +6176,29 @@ impl TsqlObject {
                 }
             }
         }
+    }
+
+    /// A synonym's target as the form's four fields hold it — server,
+    /// database, schema, object — the missing outermost ones empty: the
+    /// inverse of [`TsqlObject::synonym_target`] over non-empty fields.
+    pub fn synonym_fields(target: &[String]) -> [String; 4] {
+        let mut out: [String; 4] = Default::default();
+        let skip = 4usize.saturating_sub(target.len());
+        for (slot, part) in out.iter_mut().skip(skip).zip(target) {
+            *slot = part.clone();
+        }
+        out
+    }
+
+    /// A synonym's target from the form's four fields: an empty field is a
+    /// missing part, so leading empties are left off and one between two
+    /// named parts kept empty — `db..t`.
+    pub fn synonym_target_of_fields(fields: &[String; 4]) -> Vec<String> {
+        Self::synonym_target(
+            fields
+                .clone()
+                .map(|f| Some(f.trim().to_string()).filter(|f| !f.is_empty())),
+        )
     }
 
     /// What a person calls it — for a header line naming it.
@@ -10057,6 +10080,32 @@ mod tests {
     /// restoring database, which held nothing or the wrong object (Msg 208,
     /// measured on 2022). An outermost part that is missing is simply not
     /// there; one between two others is written empty.
+    /// The synonym form's four fields and a target are one another's
+    /// inverse, a missing middle part kept in its place both ways.
+    #[test]
+    fn a_synonyms_target_round_trips_through_the_forms_four_fields() {
+        let s = |v: &[&str]| v.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+        for target in [
+            s(&["t"]),
+            s(&["sales", "t"]),
+            s(&["db", "", "t"]),
+            s(&["srv", "db", "dbo", "t"]),
+        ] {
+            let fields = TsqlObject::synonym_fields(&target);
+            assert_eq!(TsqlObject::synonym_target_of_fields(&fields), target);
+        }
+        assert_eq!(
+            TsqlObject::synonym_fields(&s(&["dbo", "t"])),
+            [String::new(), String::new(), "dbo".into(), "t".into()]
+        );
+        // Trimmed, as a field is typed.
+        let fields = [String::new(), " db ".into(), String::new(), "t ".into()];
+        assert_eq!(
+            TsqlObject::synonym_target_of_fields(&fields),
+            s(&["db", "", "t"])
+        );
+    }
+
     #[test]
     fn a_synonyms_missing_middle_part_stays_in_its_place() {
         let parts = |p: [Option<&str>; 4]| -> Vec<String> {
