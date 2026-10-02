@@ -4139,7 +4139,11 @@ existing prose was left alone.
     `mssql::run_ddl`, which T-SQL requires (`CREATE SCHEMA` must be first in its batch); it runs
     inside the plan's transaction, which T-SQL allows. There is no `AUTHORIZATION`, since
     `supports_owners` is false there and the form offers no owner, and T-SQL has no `CASCADE` to
-    leave out (`sql_server_creates_and_drops_a_namespace`,
+    leave out — so the drop's warning (`Change::risks`) does not claim to withhold one there:
+    *"Schemaic never sends CASCADE"* is added only where `supports_drop_schema_cascade` answers
+    yes, PostgreSQL alone (`the_drop_schema_warning_names_cascade_only_where_it_exists`), the rest
+    of the sentence — the server refuses while the schema holds anything — being every engine's
+    (`sql_server_creates_and_drops_a_namespace`,
     `sql_server_creates_the_namespace_before_the_table_in_it`; live, on SQL Server 2022 and 2025,
     `a_namespace_is_created_with_its_table_and_dropped_only_when_empty`, whose drop of a schema
     still holding its table is refused and leaves both).

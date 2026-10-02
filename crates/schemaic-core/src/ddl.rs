@@ -4641,12 +4641,22 @@ impl Change {
             // extracted to fix — a sentence that becomes false for the second
             // engine to arrive, with no comparison left to grep for. What is
             // true of any engine with namespaces is that *the server* refuses,
-            // which is also the thing the reader needs to know.
-            Change::DropSchema { name } => vec![format!(
-                "Drops the schema {name}. The server refuses while it still holds \
-                 tables, views or routines, so this either takes an empty schema \
-                 or fails — Schemaic never sends CASCADE."
-            )],
+            // which is also the thing the reader needs to know. That Schemaic
+            // withholds `CASCADE` is said only where the engine has one to
+            // withhold (`supports_drop_schema_cascade`): T-SQL's `DROP SCHEMA`
+            // has no such clause.
+            Change::DropSchema { name } => {
+                let cascade = if supports_drop_schema_cascade(dialect) {
+                    " — Schemaic never sends CASCADE"
+                } else {
+                    ""
+                };
+                vec![format!(
+                    "Drops the schema {name}. The server refuses while it still holds \
+                     tables, views or routines, so this either takes an empty schema \
+                     or fails{cascade}."
+                )]
+            }
             // **An account drop destroys its privileges, not its data**, and the
             // sentence says which — because "drops the user" reads as reversible
             // to anyone who has just been told a `DROP DATABASE` is not, and the
@@ -9099,6 +9109,18 @@ pub fn supports_fk_restrict(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => true,
         SqlDialect::MsSql => false,
+    }
+}
+
+/// Does `dialect`'s `DROP SCHEMA` take a **`CASCADE`** — the clause
+/// [`Change::DropSchema`] never sends? PostgreSQL's does; T-SQL's has no
+/// such clause, and MySQL's `DROP SCHEMA` is `DROP DATABASE`. Only the
+/// warning reads it: saying a clause is withheld is reassurance only where
+/// the engine has one.
+pub fn supports_drop_schema_cascade(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::Postgres => true,
+        SqlDialect::MsSql | SqlDialect::MySql | SqlDialect::Sqlite => false,
     }
 }
 
@@ -34846,6 +34868,31 @@ mod database_tests {
         );
         assert!(drop.unsupported().is_empty(), "{:?}", drop.unsupported());
         assert_eq!(drop.emit(), vec!["DROP SCHEMA [sales];".to_string()]);
+    }
+
+    /// **The drop-schema warning mentions `CASCADE` only where the engine
+    /// has one to withhold.** It said "Schemaic never sends CASCADE" on SQL
+    /// Server too, whose `DROP SCHEMA` has no such clause — PostgreSQL's
+    /// wording on an engine where the reassurance means nothing. The
+    /// refusal it explains is every engine's, so that half stays.
+    #[test]
+    fn the_drop_schema_warning_names_cascade_only_where_it_exists() {
+        use crate::intel::SqlDialect::{MsSql, MySql, Postgres, Sqlite};
+        let drop = Change::DropSchema {
+            name: "sales".into(),
+        };
+        let pg = drop.risks(Postgres).join(" ");
+        assert!(pg.contains("never sends CASCADE"), "{pg}");
+        let ms = drop.risks(MsSql).join(" ");
+        assert!(!ms.contains("CASCADE"), "{ms}");
+        assert!(
+            ms.contains("The server refuses while it still holds"),
+            "{ms}"
+        );
+        assert!(supports_drop_schema_cascade(Postgres));
+        for d in [MsSql, MySql, Sqlite] {
+            assert!(!supports_drop_schema_cascade(d), "{d:?}");
+        }
     }
 
     /// **SQL Server creates and drops a database**, with a collation and no
