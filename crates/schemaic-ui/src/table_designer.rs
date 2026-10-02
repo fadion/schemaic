@@ -1732,6 +1732,51 @@ fn index_form(d: DdlUi, target: &DesignerTarget, ring: FocusRing) -> AnyView {
         crate::widgets::nothing()
     };
 
+    // SQL Server's storage choice — rowstore, columnstore, or the clustered
+    // columnstore that is the table's own storage — built only where the
+    // engine has one, for `pg_only`'s reason. The mapping is core's
+    // (`ddl::IndexStorage`), which also clears what the choice cannot carry.
+    let storage: AnyView = if ddl::supports_columnstore(dialect) {
+        let draft = d.draft;
+        let rev = d.rev;
+        let sig = floem::reactive::create_rw_signal(ddl::IndexStorage::of(&ix).label().to_string());
+        form_setting(
+            "Storage",
+            crate::table_designer::focusable_owned_dropdown(
+                move || sig.get(),
+                ddl::IndexStorage::ALL
+                    .iter()
+                    .map(|s| s.label().to_string())
+                    .collect(),
+                field_w,
+                ring.clone(),
+                27,
+                move |v: String| {
+                    if sig.get_untracked() == v {
+                        return;
+                    }
+                    sig.set(v.clone());
+                    if let Some(s) = ddl::IndexStorage::ALL.into_iter().find(|s| s.label() == v) {
+                        draft.update(|dr| {
+                            if let Some(x) = dr.indexes.get_mut(i) {
+                                s.apply(&mut x.info);
+                            }
+                        });
+                        // **A structural change, so the form is rebuilt**: `apply`
+                        // clears the unique flag, the include list and a clustered
+                        // one's columns, and the fields above were seeded once — left
+                        // standing, they showed what the draft no longer held, and
+                        // the next keystroke in one wrote it back.
+                        rev.update(|r| *r += 1);
+                    }
+                },
+            ),
+        )
+        .into_any()
+    } else {
+        crate::widgets::nothing()
+    };
+
     // Built only where the engine has `INCLUDE`, for `pg_only`'s reason.
     let include: AnyView = if ddl::supports_index_include(dialect) {
         form_setting(
@@ -1795,6 +1840,7 @@ fn index_form(d: DdlUi, target: &DesignerTarget, ring: FocusRing) -> AnyView {
             ),
         ),
         include,
+        storage,
         bound_toggle(
             d.draft,
             "Unique",

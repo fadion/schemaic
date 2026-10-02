@@ -14,8 +14,8 @@ shows a query plan, dumps a database to a `.sql` file, creates and drops a datab
 inside one, and browses and administers its logins, database users and their grants. Its
 sequences, alias types, synonyms and XML schema collections are browsed in the schema tree,
 created and edited in the object editor, dropped from their rows and compared. What it does not do
-yet is named rather than left to a label: a columnstore, XML or spatial index is read rather than
-authored — see `db::mssql`.
+yet is named rather than left to a label: an XML or spatial index, or an ordered columnstore one,
+is read rather than authored — see `db::mssql`.
 
 This is the project's reference document: the crate/module map, the architecture invariants, the
 UI conventions, and the Floem hazards each subsystem is built on. `CLAUDE.md` at the repo root
@@ -4005,7 +4005,9 @@ existing prose was left alone.
     `supports_index_include(dialect)` sits beside it, true on SQL Server and PostgreSQL and false on
     MySQL and SQLite, which have no `INCLUDE` clause: the index form builds its *Include* field only
     where it is true, and `IndexInfo::include_sql` writes nothing where it is false (below, and
-    under `schema.rs`).
+    under `schema.rs`). `supports_columnstore(dialect)` is SQL Server's alone: the index form builds
+    its *Storage* choice only there, and only `create_index_sql`'s T-SQL arm writes `COLUMNSTORE`
+    (below).
     **Three more answer for things outside the designer entirely.** `enforces_declared_byte_length`
     asks whether a column's *declared* type binds how many bytes a value in it may hold: MySQL's is a
     promise, enforced with `ERROR 1406: Data too long`; PostgreSQL's `bytea` declares no length to
@@ -4618,7 +4620,14 @@ existing prose was left alone.
     matches the reading the draft was made from. The alternative to each is a plan that succeeds
     and reports nothing lost — a ledger table came back an ordinary writable one, its original
     kept as `MSSQL_DroppedLedgerTable_…`, and a bound rule's `INSERT … a = -5` was accepted, before
-    S2-L5-04 added those arms. **Two arms ask of a catalogue an older server lacks**:
+    S2-L5-04 added those arms. **Two arms bar what a columnstore index is by nature**, since the
+    model states one now (`IndexInfo::method`, under `schema.rs`): its own `COLUMNSTORE`
+    compression, `data_compression` 3, so the arm refuses `NOT IN (0, 3)` — `COLUMNSTORE_ARCHIVE`
+    (4) is an option, and still refused — and row and page locks, which both columnstore kinds
+    report off (measured on 2022), so the index-option arm asks them only `AND type NOT IN (5, 6)`.
+    Asked as they had been, they refused a columnstore rebuild whose plan was otherwise right, which
+    the live `a_columnstore_index_is_read_rebuilt_and_authored` caught; `tsql_index_carries`, the
+    in-place guard's predicate (below), takes the same two bars. **Two arms ask of a catalogue an older server lacks**:
     `sys.tables.ledger_type` (2022) and `sys.sensitivity_classifications` (2019). Named in the
     `CASE` they would fail its compile, and so every rebuild, there; `tsql_late_arm` runs each
     behind a probe (`COL_LENGTH`, `OBJECT_ID`) through `sp_executesql`, ahead of the `CASE` so a
@@ -4785,7 +4794,9 @@ existing prose was left alone.
     the copy — found live. **What the reading already shows the rebuild cannot put back is
     `unsupported()`'s answer** — `tsql_rebuild_refusals`, SQL Server's arm of an exhaustive `match`
     on the dialect in the rebuild branch, where SQLite's is the list above: an index `lossy` there
-    (a columnstore, XML or spatial one; one with included columns was too, refusing five of
+    (an XML or spatial one, or an ordered columnstore; every columnstore was too, until
+    `IndexInfo::method` held one — `a_sql_server_rebuild_restates_a_columnstore_index` — and one
+    with included columns was, refusing five of
     WideWorldImporters' 48 tables, until `IndexInfo::include` held them and the rebuild restated
     them through `create_index_sql` —
     `a_sql_server_rebuild_restates_an_index_with_included_columns`) would come back without what
@@ -4993,6 +5004,26 @@ existing prose was left alone.
     `an_include_naming_no_column_is_refused`) and deliberately **not** a key column repeated in the
     list: SQL Server refuses that (Msg 1909) and PostgreSQL 16 accepts it, both measured, so it is
     the server's question, asked by the server.
+    **A columnstore index is written as one, and only on SQL Server** (`supports_columnstore`, an
+    exhaustive `match` with `MsSql` alone on `true`): `create_index_sql` writes `CREATE CLUSTERED
+    COLUMNSTORE INDEX ix ON t;` with no column list, or `CREATE NONCLUSTERED COLUMNSTORE INDEX ix ON
+    t (…)` with its `WHERE`, and never `UNIQUE` or `INCLUDE` — so the designer's `AddIndex`, the
+    T-SQL rebuild and `tsql_create_ddl` (under `schema.rs`) restate one the one way
+    (`a_columnstore_index_is_restated_as_one`, `a_sql_server_rebuild_restates_a_columnstore_index`).
+    `indexes_equal` compares `is_clustered_columnstore` as well as the method: a clustered
+    columnstore is the table's storage and a nonclustered one a copy beside it, the same method and
+    different indexes, so an edit between the two must not diff as nothing
+    (`a_clustered_columnstore_names_no_column_and_is_its_own_index`). `validate` lets a clustered
+    one name no column and refuses a columnstore index that is unique (*"…a columnstore index
+    stores columns, not keys"*) or includes columns, T-SQL taking neither on one
+    (`a_columnstore_index_is_refused_uniqueness_and_an_include_list`). `IndexStorage` — *Rowstore*,
+    *Columnstore*, *Clustered columnstore* — is the designer's choice mapped onto `method` and
+    `clustered`, so the form only shows it: `apply` clears what the choice cannot carry, the unique
+    flag and the include list and a clustered one's columns, rather than leaving `validate` to
+    refuse it, and back to rowstore clears both fields, the index taking T-SQL's default clustering
+    again (`the_storage_choice_maps_onto_the_index_and_back`). An **ordered** columnstore
+    (`ORDER (…)`, 2022 on) is still read `lossy`, the model not stating the order (under
+    `mssql.rs`).
     Ordering
     is dependency-first (FKs and indexes off before the columns under them; keys back on
     after), and **the column clauses inside that are ordered by their dependencies rather than
@@ -5236,7 +5267,7 @@ existing prose was left alone.
     SQL Server's early return — because only SQL Server's `diff` raises it and no other emitter
     writes it. **A dependent the draft already drops or adds is the
     draft's**, as with the check repair — and so is a computed column the draft itself alters or
-    drops; and a lossy index — a columnstore, say — is not
+    drops; and a lossy index — an XML or spatial one, say — is not
     touched, so the server refuses the retype naming it and the plan, one transaction, rolls back
     whole (`sql_server_takes_a_retyped_columns_dependents_off_and_back_on`,
     `sql_server_rebuilds_only_the_dependents_a_change_disturbs`,
@@ -5251,7 +5282,9 @@ existing prose was left alone.
     guard over exactly what this plan re-creates rather than the whole table, whose `THROW` names
     the object and ends *change it in SQL*: an index or unique constraint dropped and added back
     under one name that carries a fill factor, padding, `IGNORE_DUP_KEY`, row or page locks off,
-    compression, a filegroup or partition scheme other than the default, a disabled state, or an
+    compression — neither of the last two counted where it is what a columnstore index is by nature,
+    as in the rebuild's guard (above) — a filegroup or partition scheme other than the default, a
+    disabled state, or an
     extended property on the index or on its key constraint; the primary key re-created (a
     `Change::PrimaryKey` with both sides non-empty) carrying any of the same; a foreign key or a
     check re-added that is `NOT FOR REPLICATION` or carries an extended property — their disabled and
@@ -5368,8 +5401,9 @@ existing prose was left alone.
     names its nonclustered index `a_nix` so that name order is the wrong one. Both `ReplaceView`
     arms of the risks carry `view_indexes_rebuilt`, naming the indexes and saying they are built
     again in the same transaction, which on a large view takes as long as building them did; the
-    in-place arm had no risk at all before. An `IndexInfo::lossy` one (a columnstore, XML or
-    spatial index — one with included columns was too, and is built again with them now) cannot
+    in-place arm had no risk at all before. An `IndexInfo::lossy` one (an XML or spatial index, or
+    another kind the model does not state — a columnstore one and one with included columns were
+    too, and are modelled now) cannot
     be built again whole, so `lossy_view_index_refusal`, in
     `unsupported()`, refuses the edit rather than bring the index back as less than it was
     (`an_indexed_sql_server_views_edit_creates_its_indexes_again`). **That refusal covers only
@@ -8842,6 +8876,16 @@ existing prose was left alone.
     could only be withheld as `lossy`. `tsql_create_ddl` restates it as `PRIMARY KEY NONCLUSTERED`,
     `UNIQUE CLUSTERED` and `CREATE CLUSTERED INDEX`, writing only the side the default gets wrong
     (`create_ddl_sql_server_restates_clustering`).
+    **A SQL Server columnstore index is `IndexInfo::method` of `TSQL_COLUMNSTORE`** (`COLUMNSTORE`),
+    T-SQL's counterpart of PostgreSQL's access method, its own spelling rather than one of
+    PostgreSQL's names, with `clustered` saying which kind: `is_columnstore` asks the method,
+    `is_clustered_columnstore` adds `Some(true)`. A clustered one is the table's rows stored by
+    column and **names no columns** — the reader clears the list the catalogue gives it (under
+    `mssql.rs`) — and a nonclustered one names the columns it stores, in no key order; neither is
+    unique or has an `INCLUDE` list. Until it was modelled every columnstore index was `lossy`, so
+    it could not be edited, a T-SQL rebuild refused the table over it, and Copy DDL and the dump
+    left it out under a note. One with an `ORDER (…)` (2022 on) still is, the order being unread.
+    How it is written and refused is under `ddl.rs`.
     **`IndexInfo::include` is an index's included columns, in order** — `INCLUDE (…)`, carried in
     the index's leaf rows without being part of its key, on SQL Server and PostgreSQL (11 on), and
     empty on MySQL and SQLite, which have no such clause (`ddl::supports_index_include`). It is
@@ -8850,11 +8894,15 @@ existing prose was left alone.
     refused five of WideWorldImporters' 48 tables over it — nor written into a dump.
     `include_sql` is the one spelling, ` INCLUDE (…)` after the key list and before `WHERE`, or
     nothing where the list is empty or the engine has no clause; `ddl::create_index_sql` and
-    `create_ddl`'s two hand-rolled index emitters — PostgreSQL's model path and `tsql_create_ddl`
-    — all write it. `create_ddl_sql_server_writes_t_sql` restates a covering index with
-    `INCLUDE ([balance])` and leaves a columnstore `ix_cs` out under the note, which now reads
-    *"is a columnstore, XML or spatial index, or another kind this script cannot restate; it is left
-    out"* for a table and an indexed view alike — it began *"has included columns, or…"*. How the
+    `create_ddl`'s one hand-rolled index emitter, PostgreSQL's model path, both write it.
+    `tsql_create_ddl` was a second, and now writes each index it can restate through
+    `create_index_sql` (`pub(crate)` for it), so a script and a plan write one index one way, a
+    columnstore's form included. `create_ddl_sql_server_writes_t_sql` restates a covering index
+    with `INCLUDE ([balance])` and a nonclustered columnstore `ix_cs` as `CREATE NONCLUSTERED
+    COLUMNSTORE INDEX`, and leaves a lossy `ix_xml` out under the note, which now reads *"is an XML
+    or spatial index, or another kind this script cannot restate; it is left out"* for a table and
+    an indexed view alike — it began *"has included columns, or…"*, and named columnstore too until
+    that was modelled. How the
     designer's plan keeps the list through a rename, a removal and a retype is under `ddl.rs`.
     **`classify_column_type` reads all three engines' spellings now**, the type name being what the
     icon in the schema tree, the ER diagram's cards and tooltips, the completion popup and Find
@@ -13289,11 +13337,14 @@ existing prose was left alone.
   there, ahead of `run_server_ddl`'s refusal, until that was written (both under `ddl.rs`; live,
   `a_database_is_created_with_its_collation_and_dropped` on 2022 and 2025, which skips on Azure
   SQL Database — a created database there is a new billable one — so `master` taking the two
-  statements on Azure is the code's word, not a measurement). Still on it: a columnstore, XML
-  or spatial index is read as `IndexInfo::lossy` rather than authored, so a rebuild and a view
-  edit refuse to touch it rather than drop it (`tsql_rebuild_refusals`,
-  `lossy_view_index_refusal`). An index with included columns was on this list too, and is not
-  now: they are read and restated (below). So was a named instance's port, which had to be given
+  statements on Azure is the code's word, not a measurement). Still on it: an XML or spatial
+  index, and a columnstore one with an `ORDER (…)` (2022 on), is read as `IndexInfo::lossy`
+  rather than authored, so a rebuild and a view edit refuse to touch it rather than drop it
+  (`tsql_rebuild_refusals`, `lossy_view_index_refusal`) — and an XML or spatial one was not read
+  at all until the listing's join was fixed (below). A columnstore index was on this list, and is
+  not now: it is read, restated and authored from the designer (below). An index with included
+  columns was on it too, and is not now: they are read and restated (below). So was a named
+  instance's port, which had to be given
   by hand and is now SQL Server Browser's answer (below). So were sequences, alias types, synonyms
   and XML schema collections, read into `TsqlObject` for the dump (under `dump.rs`), which are
   now browsed in the tree and dropped from their rows (under `schema.rs` and `ddl.rs`), created
@@ -14053,9 +14104,10 @@ existing prose was left alone.
   reachable from a reading, the reader naming every key through `sys.indexes` and every check
   through `sys.check_constraints`. A `TableOptions` is admitted only as the comment alone — engine
   and collation are MySQL's table options.
-  **Introspection reads clustering rather than withholding it**: `IdxRow::clustered` is
-  `Some(sys.indexes.type == 1)` (`IndexInfo::clustered`, under `schema.rs`), and an index is
-  `lossy` only for a type past 2 — columnstore, XML, spatial — or for the graph-column marker
+  **Introspection reads clustering rather than withholding it**: `IdxRow::clustered` is `Some` of
+  whether `sys.indexes.type` is 1 or 5 — a clustered rowstore or a clustered columnstore
+  (`IndexInfo::clustered`, under `schema.rs`) — and an index is `lossy` only for an XML or
+  spatial one (types 3 and 4), an ordered columnstore (cell 12, below) or the graph-column marker
   (under the dump, below). Before the
   field a clustered index other than the key's was marked `lossy` too, and an edit to it withheld
   as a `KeepLossyIndex`, since recreating it plainly left the table a heap; the emitter writes
@@ -14067,13 +14119,32 @@ existing prose was left alone.
   where it was an `EXISTS` asking whether the index had any — which made the whole index `lossy`,
   so it could not be edited, restated by a rebuild or written into a dump — and `IdxRow::included`
   carries it to the fold (under `lib.rs`). The join admits a row with `key_ordinal > 0`, an
-  included one, or any row of a columnstore, and the `ORDER BY` puts `is_included_column` ahead
-  of `key_ordinal`, so the key comes first and the list keeps its own order. **The flag is forced
-  to 0 for types 5 and 6, and that is load-bearing**: a columnstore has no key columns, SQL Server
-  listing its columns with `key_ordinal` 0 *and* flagged as included, so taken at its word it
-  would fold into an index with an empty key; read as key rows, as before, it stays the `lossy`
-  index the refusals and the dump's note name. A partitioning column outside the key, neither
-  keyed nor included, is still left out. Every admitted change is
+  included one, or any row of an XML, spatial or columnstore index (types 3 to 6), and the
+  `ORDER BY` puts `is_included_column` ahead of `key_ordinal`, so the key comes first and the list
+  keeps its own order. **The flag is forced to 0 for types 3 to 6, and that is load-bearing**: a
+  columnstore has no key columns, SQL Server listing its columns with `key_ordinal` 0 *and*
+  flagged as included, so taken at its word it would fold into an index with an empty key. Read
+  as key rows, a nonclustered one's are the columns it stores, which `create_index_sql` lists.
+  **A columnstore index is read whole now** (`IndexInfo::method`, under `schema.rs`): types 5 and
+  6 are `method` `TSQL_COLUMNSTORE`, and after `assemble_schema` a clustered one's columns are
+  cleared, since the catalogue lists every column of the table under it and the fold took them
+  for its key. An **ordered** one (`ORDER (…)`, 2022 on) is still `lossy`, the order being unread:
+  cell 12 of `INDEX_LISTING`, its `{ordered}` placeholder, is an `EXISTS` on
+  `column_store_order_ordinal > 0`, or `0` where the catalogue has no such column (`Catalogue`,
+  below). `introspection_reads_the_schema_as_declared` expects a clustered columnstore read whole
+  and written as `COLUMNSTORE` in Copy DDL; `a_columnstore_index_is_read_rebuilt_and_authored` is
+  the rest, below. **XML and spatial indexes were not read at all.** One lists its one column with
+  `key_ordinal` 0 and `is_included_column` 0 (measured on 2022), and the join admitted only a
+  keyed row, an included one or a columnstore's, so it never reached the fold: Copy DDL and the
+  dump left it out with no note, a rebuild's refusal never named it — the rebuild's own
+  index-count arm would have stopped it at run time as changed since it was read — and a
+  comparison never saw it. The join now admits types 3 and 4 too, so they are read as the lossy
+  indexes they are, named by the rebuild's refusal and noted by Copy DDL. AdventureWorksLT's
+  `SalesLT.ProductModel.PXML_ProductModel_CatalogDescription` was invisible:
+  `a_real_schema_reads_and_every_table_round_trips` printed 0 notes over that sample before the fix
+  and 1 after. `VIEW_INDEX_LISTING` keeps its join, a view carrying no XML or spatial index. A
+  partitioning column outside the key, neither keyed nor included, is still left out. Every
+  admitted change is
   written by one of the phases bar `KeepLossyIndex`, whose statement is none; the catch-all arms
   write nothing, and that has the opposite hazard — an admitted change one swallowed would vanish
   from the plan in silence — so `sql_server_admits_the_table_changes_it_can_write` walks both
@@ -14088,8 +14159,14 @@ existing prose was left alone.
   and renames the table in one plan, then reads it back with the data kept, the new default filling
   a new row and the result round-tripping; `a_primary_key_is_replaced` widens a key by its read
   constraint name; `an_identity_toggle_is_withheld_over_an_index_the_rebuild_cannot_restate`
-  switches an identity on over a nonclustered columnstore index and gets the one refusal, naming it
-  (it planted an index with included columns until those were read);
+  switches an identity on over a primary XML index and gets the one refusal, naming it, and reads a
+  spatial index back `lossy` and noted in Copy DDL (it planted an index with included columns until
+  those were read, and a nonclustered columnstore until that was);
+  `a_columnstore_index_is_read_rebuilt_and_authored` reads a clustered columnstore and a filtered
+  nonclustered one back not lossy, rebuilds each table around its index by an identity toggle and
+  reads the index back equal with a diff of nothing, lands a nonclustered one made through
+  `IndexStorage::Columnstore`, and reads an ordered clustered one `lossy`, the rebuild refusing the
+  table over it;
   `a_rebuild_keeps_an_indexs_included_columns` reads `(a DESC) INCLUDE (c, b) WHERE a > 0` back as
   key `[a]` and list `[c, b]`, not lossy, rebuilds the table around it by an identity toggle,
   reads it back equal with a diff of nothing, then lands an edit of the list alone;
@@ -14272,7 +14349,9 @@ existing prose was left alone.
   `column_listing`, `index_listing`, `sequence_listing` and `table_kind_listing` are built from
   its answer: `sys.columns.graph_type` and `sys.tables.is_node`/`is_edge` (2017),
   `sys.tables.temporal_type` (2016), `is_memory_optimized` (2014), `sys.tables.ledger_type` and
-  `ledger_view_id` (2022) and `sys.sequences.last_used_value` (2017), each a constant in its place
+  `ledger_view_id` (2022), `sys.sequences.last_used_value` (2017) and
+  `sys.index_columns.column_store_order_ordinal` (2022, the probe's seventh cell, which
+  `index_listing`'s `{ordered}` asks), each a constant in its place
   where it is missing so the
   reader's cell indices hold, and no table counted as a kind its server cannot have. Before 2017
   `current_value` stands in for `last_used_value`; the two differ only on a sequence that has
@@ -14280,8 +14359,10 @@ existing prose was left alone.
   used sequence back at its start. Asked by column rather than by `ProductMajorVersion`, since
   Azure SQL Database reports 12 and has every one
   (`a_listing_names_no_catalogue_column_the_server_has_not_got`,
-  `a_listing_without_a_column_keeps_its_cell_count`). No pre-2017 server is reachable here;
-  both forms of every listing were run against 2022 and 2025. **Nor does the account browser
+  `a_listing_without_a_column_keeps_its_cell_count`,
+  `the_catalogue_probe_reads_each_column_in_its_place`). No pre-2017 server is reachable here;
+  both forms of every listing were run against 2022 and 2025 — bar `{ordered}`'s, added later,
+  whose fallback is the constant `0` and was not run there. **Nor does the account browser
   call a function the server has not got**: the login and user listings gathered each
   principal's roles with `STRING_AGG`, which is 2017's, so on 2016 the browser failed whole. The
   memberships are now queries of their own (`SERVER_ROLE_MEMBERSHIPS`,
@@ -14329,8 +14410,9 @@ existing prose was left alone.
   `a_sql_server_graph_temporal_or_memory_optimised_table_is_not_scripted_as_a_plain_one`); the
   internal columns are left out of `column_listing` by `graph_type`, the index keyed on nothing
   but graph ids is dropped and one naming another graph column is withheld as `lossy` — other indexes as separate
-  statements, their `INCLUDE` lists with them (`IndexInfo::include_sql`; a columnstore, XML or
-  spatial one is the lossy kind left out under a note, `create_ddl_sql_server_writes_t_sql`), the table's and columns' comments after them through `ddl::tsql_add_comment` — the
+  statements through `ddl::create_index_sql`, their `INCLUDE` lists and a columnstore's form with
+  them (`IndexInfo::include_sql`; an XML or spatial one is the lossy kind left out under a note,
+  `create_ddl_sql_server_writes_t_sql`), the table's and columns' comments after them through `ddl::tsql_add_comment` — the
   same `sp_addextendedproperty` the emitter writes (`create_ddl_sql_server_restates_the_comments`)
   — and what it cannot restate named in a comment; a view is its stored definition **with the
   header rebuilt under the catalogue's name**, as SQL Server's own scripter writes it, through
@@ -19544,7 +19626,11 @@ existing prose was left alone.
     MySQL's `bio(20)` prefix on every engine but PostgreSQL. The index form's *Include* field, after
     *Columns*, is built only where `ddl::supports_index_include` answers yes — SQL Server and
     PostgreSQL — and parses through `ddl::parse_name_list` into `IndexInfo::include`, so a list is
-    never typed where no emitter would write it. The foreign-key action dropdown lists
+    never typed where no emitter would write it. Its *Storage* dropdown, after *Include* (tab 27) —
+    *Rowstore*, *Columnstore*, *Clustered columnstore* — is built only where
+    `ddl::supports_columnstore` answers yes, SQL Server alone, and maps through `ddl::IndexStorage`,
+    whose `apply` also clears what a columnstore index cannot carry (under `ddl.rs`). The
+    foreign-key action dropdown lists
     `ddl::fk_actions` besides, which has no `RESTRICT` on SQL Server. The designer opens on an
     **existing** SQL Server table too, now that `supports_table_design` answers yes there
     (`emit_mssql`'s phases are under `mssql.rs`); the reorder arrows appear there too, and an

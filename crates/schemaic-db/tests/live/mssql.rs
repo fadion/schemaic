@@ -5936,8 +5936,11 @@ async fn a_clustered_index_and_a_nonclustered_key_keep_their_clustering() {
 }
 
 /// **An identity switched on is a rebuild — withheld where the rebuild would
-/// drop an index it does not read whole**, here a columnstore one, and the
-/// preview says which rather than applying a table without it.
+/// drop an index it does not read whole**, here an XML one, and the preview
+/// says which rather than applying a table without it. **Read at all, first**:
+/// an XML or spatial index's column is listed with `key_ordinal` 0 and not
+/// included, so the listing's join dropped it — the index was invisible, a
+/// dump and Copy DDL left it out with no note, and nothing named it here.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_identity_toggle_is_withheld_over_an_index_the_rebuild_cannot_restate() {
     use schemaic_core::ddl::TableDraft;
@@ -5945,17 +5948,28 @@ async fn an_identity_toggle_is_withheld_over_an_index_the_rebuild_cannot_restate
         return;
     }
     let s = Scratch::create("ddl_ident").await;
-    s.exec("CREATE TABLE dbo.t (id int NOT NULL, a int, b int)")
+    s.exec("CREATE TABLE dbo.t (id int NOT NULL, a int, x xml, CONSTRAINT pk_t PRIMARY KEY CLUSTERED (a))")
         .await;
-    s.exec("CREATE NONCLUSTERED COLUMNSTORE INDEX ix_cs ON dbo.t (a, b)")
+    s.exec("CREATE PRIMARY XML INDEX ix_x ON dbo.t (x)").await;
+    s.exec("CREATE TABLE dbo.g (id int NOT NULL PRIMARY KEY, g geometry)")
         .await;
+    s.exec("CREATE SPATIAL INDEX ix_g ON dbo.g (g) WITH (BOUNDING_BOX = (0, 0, 100, 100))")
+        .await;
+    let g = read_table(&s, "g").await;
+    let spatial = g.indexes.iter().find(|i| i.name == "ix_g");
+    assert!(spatial.is_some_and(|i| i.lossy), "{:?}", g.indexes);
+    assert!(
+        g.create_ddl(MS).contains("-- Index ix_g "),
+        "{}",
+        g.create_ddl(MS)
+    );
     let t = read_table(&s, "t").await;
     let mut d = TableDraft::from_table(&t);
     d.columns[0].info.auto_increment = true;
     let cs = schemaic_core::ddl::diff(&t, &d, MS);
     let refused = cs.unsupported();
     assert_eq!(refused.len(), 1, "{refused:?}");
-    assert!(refused[0].contains("ix_cs"), "{refused:?}");
+    assert!(refused[0].contains("ix_x"), "{refused:?}");
 }
 
 /// **An index's included columns are read apart from its key, and a rebuild
@@ -6017,6 +6031,93 @@ async fn a_rebuild_keeps_an_indexs_included_columns() {
     assert!(t4.columns.iter().all(|c| c.name != "b"), "{stmts:#?}");
     let ix4 = t4.indexes.iter().find(|i| i.name == "ix_a").expect("ix_a");
     assert!(ix4.include.is_empty(), "{stmts:#?}");
+}
+
+/// **A columnstore index is read, rebuilt and authored as one**: a clustered
+/// one with no column list and a filtered nonclustered one are read back
+/// unlossy, survive a rebuild around them equal to what they were, and one
+/// made from the designer's Storage choice lands; an **ordered** one (2022
+/// on), whose `ORDER` the model does not state, is still withheld.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_columnstore_index_is_read_rebuilt_and_authored() {
+    use schemaic_core::ddl::{IndexStorage, TableDraft};
+    use schemaic_core::schema::IndexColumn;
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("ddl_columnstore").await;
+    s.exec(
+        "CREATE TABLE dbo.c (id int NOT NULL, a int, b int, \
+         CONSTRAINT pk_c PRIMARY KEY NONCLUSTERED (id)); \
+         CREATE CLUSTERED COLUMNSTORE INDEX cci ON dbo.c; \
+         CREATE TABLE dbo.n (id int NOT NULL PRIMARY KEY, a int, b int); \
+         CREATE NONCLUSTERED COLUMNSTORE INDEX ncci ON dbo.n (a, b) WHERE a > 0; \
+         CREATE TABLE dbo.o (id int NOT NULL, a int); \
+         CREATE CLUSTERED COLUMNSTORE INDEX occi ON dbo.o ORDER (a);",
+    )
+    .await;
+    let ix = |t: &schemaic_core::schema::TableInfo, name: &str| {
+        t.indexes
+            .iter()
+            .find(|i| i.name == name)
+            .cloned()
+            .unwrap_or_else(|| panic!("no {name}: {:?}", t.indexes))
+    };
+
+    for (table, name) in [("c", "cci"), ("n", "ncci")] {
+        let t = read_table(&s, table).await;
+        let before = ix(&t, name);
+        assert!(before.is_columnstore() && !before.lossy, "{before:?}");
+        if name == "cci" {
+            assert!(before.is_clustered_columnstore() && before.columns.is_empty());
+        } else {
+            assert_eq!(before.column_names().collect::<Vec<_>>(), vec!["a", "b"]);
+            assert!(before.predicate.is_some());
+        }
+        // Rebuilt around it by an identity switched on.
+        let mut d = TableDraft::from_table(&t);
+        d.columns[0].info.auto_increment = true;
+        let stmts = apply_draft(&s, &t, &d).await;
+        let t2 = read_table(&s, table).await;
+        let after = ix(&t2, name);
+        assert_eq!(
+            (
+                after.is_clustered_columnstore(),
+                after.column_names().count(),
+                &after.predicate
+            ),
+            (
+                before.is_clustered_columnstore(),
+                before.column_names().count(),
+                &before.predicate
+            ),
+            "{stmts:#?}"
+        );
+        let again = schemaic_core::ddl::diff(&t2, &TableDraft::from_table(&t2), MS);
+        assert!(again.changes.is_empty(), "{:?}", again.changes);
+    }
+
+    // Authored from the designer's Storage choice.
+    let t = read_table(&s, "n").await;
+    let mut d = TableDraft::from_table(&t);
+    let mut new = schemaic_core::schema::IndexInfo {
+        name: "ncci2".into(),
+        columns: vec![IndexColumn::plain("id")],
+        ..Default::default()
+    };
+    IndexStorage::Columnstore.apply(&mut new);
+    d.indexes.retain(|i| i.info.name != "ncci");
+    d.indexes.push(schemaic_core::ddl::IndexDraft::new(new));
+    apply_draft(&s, &t, &d).await;
+    assert!(ix(&read_table(&s, "n").await, "ncci2").is_columnstore());
+
+    // Ordered: withheld, and a rebuild refuses the table over it.
+    let t = read_table(&s, "o").await;
+    assert!(ix(&t, "occi").lossy, "an ordered columnstore read as whole");
+    let mut d = TableDraft::from_table(&t);
+    d.columns[0].info.auto_increment = true;
+    let refused = schemaic_core::ddl::diff(&t, &d, MS).unsupported();
+    assert!(refused.iter().any(|r| r.contains("occi")), "{refused:?}");
 }
 
 /// **A key finds its row whatever its type** — as the grid read it back: a
@@ -6374,17 +6475,17 @@ async fn introspection_reads_the_schema_as_declared() {
         .expect("the procedure");
     assert_eq!(p.kind, schemaic_core::schema::RoutineKind::Procedure);
     assert_eq!(p.arguments, "@before date");
-    // A columnstore index has no key columns, and is still an index — one the
-    // table's DDL names rather than drops in silence.
+    // A columnstore index has no key columns, and is still an index — read
+    // whole now, and written into the table's DDL as one.
     let facts = t("dbo", "facts");
     let cci = facts
         .indexes
         .iter()
         .find(|i| i.name == "cci")
         .unwrap_or_else(|| panic!("the columnstore index: {:?}", facts.indexes));
-    assert!(cci.lossy);
+    assert!(!cci.lossy && cci.is_columnstore(), "{cci:?}");
     let ddl = facts.create_ddl(MS);
-    assert!(ddl.contains("-- Index cci "), "{ddl}");
+    assert!(ddl.contains("COLUMNSTORE INDEX [cci]"), "{ddl}");
     // And the list alone agrees with the whole.
     let list = s.db.fetch_table_list(&s.name).await.expect("the list");
     assert_eq!(list.tables.len(), schema.tables.len());

@@ -156,6 +156,12 @@ impl IndexColumn {
     }
 }
 
+/// SQL Server's **columnstore** index, as [`IndexInfo::method`] holds it — the
+/// one T-SQL index kind beyond the rowstore that the model states. Its own
+/// spelling rather than PostgreSQL's access-method names, and written only
+/// by SQL Server's emitters (`CREATE [NON]CLUSTERED COLUMNSTORE INDEX`).
+pub const TSQL_COLUMNSTORE: &str = "COLUMNSTORE";
+
 /// An index on a table (its ordered key columns).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct IndexInfo {
@@ -362,6 +368,21 @@ impl IndexInfo {
             unique,
             ..Default::default()
         }
+    }
+
+    /// Is this a SQL Server **columnstore** index — [`IndexInfo::method`]
+    /// [`TSQL_COLUMNSTORE`], clustered or not? A clustered one is the table's
+    /// rows, stored by column, and names no columns at all
+    /// ([`IndexInfo::is_clustered_columnstore`]); a nonclustered one names the
+    /// columns it stores, in no key order.
+    pub fn is_columnstore(&self) -> bool {
+        self.method.as_deref() == Some(TSQL_COLUMNSTORE)
+    }
+
+    /// A clustered columnstore index — `CREATE CLUSTERED COLUMNSTORE INDEX ix
+    /// ON t`, with no column list: it stores every column of the table.
+    pub fn is_clustered_columnstore(&self) -> bool {
+        self.is_columnstore() && self.clustered == Some(true)
     }
 
     /// ` INCLUDE ([a], [b])` — the clause after the key list, with its leading
@@ -5599,8 +5620,8 @@ impl TableInfo {
                     .join("\nGO\n");
             for ix in draft.options.tsql.indexes.iter().filter(|ix| ix.lossy) {
                 out.push_str(&format!(
-                    "\n-- Index {} is a columnstore, XML or spatial index, or another kind \
-                     this script cannot restate; it is left out.",
+                    "\n-- Index {} is an XML or spatial index, or another kind this script \
+                     cannot restate; it is left out.",
                     crate::export::comment_text(&ix.name)
                 ));
             }
@@ -5754,28 +5775,16 @@ impl TableInfo {
         {
             if ix.lossy {
                 out.push_str(&format!(
-                    "\n-- Index {} is a columnstore, XML or spatial index, or another kind \
-                     this script cannot restate; it is left out.",
+                    "\n-- Index {} is an XML or spatial index, or another kind this script \
+                     cannot restate; it is left out.",
                     crate::export::comment_text(&ix.name)
                 ));
                 continue;
             }
-            let uniq = if ix.unique { "UNIQUE " } else { "" };
-            let cl = if ix.clustered == Some(true) {
-                "CLUSTERED "
-            } else {
-                ""
-            };
-            let filter = match &ix.predicate {
-                Some(p) => format!(" WHERE {p}"),
-                None => String::new(),
-            };
-            out.push_str(&format!(
-                "\nCREATE {uniq}{cl}INDEX {} ON {qname} ({}){}{filter};",
-                q(&ix.name),
-                ix.key_sql(d),
-                ix.include_sql(d),
-            ));
+            // The designer's own emitter, so a script and a plan write one
+            // index one way — a columnstore's form included.
+            out.push('\n');
+            out.push_str(&crate::ddl::create_index_sql(ix, &qname, d));
         }
         let ns = self.schema.as_deref().unwrap_or(MSSQL_DEFAULT_SCHEMA);
         let comments = std::iter::once((None, &self.comment)).chain(
@@ -9635,13 +9644,16 @@ mod tests {
         let plain = IndexInfo::plain("ix_d", vec!["doubled"], false);
         let mut covering = IndexInfo::plain("ix_cover", vec!["id"], false);
         covering.include = vec!["balance".into()];
-        let mut columnstore = IndexInfo::plain("ix_cs", vec!["id"], false);
-        columnstore.lossy = true;
+        let mut columnstore = IndexInfo::plain("ix_cs", vec!["id", "balance"], false);
+        columnstore.method = Some(TSQL_COLUMNSTORE.into());
+        columnstore.clustered = Some(false);
+        let mut xml = IndexInfo::plain("ix_xml", vec!["id"], false);
+        xml.lossy = true;
         let t = TableInfo {
             schema: Some("dbo".into()),
             name: "t]x".into(),
             columns: vec![id, bal, doubled],
-            indexes: vec![pk, uq, plain, covering, columnstore],
+            indexes: vec![pk, uq, plain, covering, columnstore, xml],
             check_constraints: vec![CheckInfo {
                 name: "ck_b".into(),
                 expression: "[balance]>=(0)".into(),
@@ -9684,20 +9696,26 @@ mod tests {
             "{ddl}"
         );
         assert!(
-            ddl.contains("-- Index ix_cs is a columnstore, XML or spatial index"),
+            ddl.contains(
+                "\nCREATE NONCLUSTERED COLUMNSTORE INDEX [ix_cs] ON [dbo].[t]]x] ([id], [balance]);"
+            ),
             "{ddl}"
         );
-        assert!(!ddl.contains("CREATE INDEX [ix_cs]"), "{ddl}");
+        assert!(
+            ddl.contains("-- Index ix_xml is an XML or spatial index"),
+            "{ddl}"
+        );
+        assert!(!ddl.contains("CREATE INDEX [ix_xml]"), "{ddl}");
         assert!(ddl.starts_with("-- id: the identity's seed"), "{ddl}");
         assert!(
             !ddl.contains("AUTO_INCREMENT") && !ddl.contains('`'),
             "{ddl}"
         );
         // Every line that is not a comment is T-SQL the lexer ends where the
-        // server does: the table and its two indexes.
+        // server does: the table and its three indexes.
         assert_eq!(
             crate::sql::statement_ranges(&ddl, crate::intel::SqlDialect::MsSql).len(),
-            3
+            4
         );
     }
 
@@ -10217,8 +10235,8 @@ mod tests {
                  SELECT id, d FROM dbo.t;\nGO\n\
                  CREATE UNIQUE CLUSTERED INDEX [cix] ON [dbo].[v] ([id]);\nGO\n\
                  CREATE INDEX [nix] ON [dbo].[v] ([d]);\n\
-                 -- Index inc is a columnstore, XML or spatial index, or another kind this \
-                 script cannot restate; it is left out."
+                 -- Index inc is an XML or spatial index, or another kind this script \
+                 cannot restate; it is left out."
             )
         );
     }

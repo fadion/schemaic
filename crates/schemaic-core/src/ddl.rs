@@ -587,8 +587,26 @@ impl TableDraft {
             } else if !index_names.insert(ix.info.name.to_ascii_lowercase()) {
                 out.push(format!("Two indexes are both called {}.", ix.info.name));
             }
-            if ix.info.columns.is_empty() {
+            // A clustered columnstore index stores every column and names none.
+            if ix.info.columns.is_empty() && !ix.info.is_clustered_columnstore() {
                 out.push(format!("Index {} has no columns.", ix.info.name));
+            }
+            // A columnstore index stores columns, not keys: T-SQL takes
+            // neither `UNIQUE` nor `INCLUDE` on one.
+            if ix.info.is_columnstore() {
+                if ix.info.unique {
+                    out.push(format!(
+                        "Index {} can't be unique: a columnstore index stores columns, not keys.",
+                        ix.info.name
+                    ));
+                }
+                if !ix.info.include.is_empty() {
+                    out.push(format!(
+                        "Index {} can't include columns: a columnstore index lists every column \
+                         it stores.",
+                        ix.info.name
+                    ));
+                }
             }
             for c in &ix.info.columns {
                 // An expression key names no column by design, so there is
@@ -7652,15 +7670,20 @@ fn view_indexes_rebuilt(v: &ViewDraft, server: &[IndexInfo]) -> Option<String> {
 /// `IGNORE_DUP_KEY`, row or page locks switched off, a disabled state,
 /// compression, a filegroup or partition scheme other than the default, or
 /// an extended property on it or its constraint. `IndexInfo` reads none of
-/// them. One predicate for the two guards that ask it — the table's in-place
+/// them. **Bar what a columnstore index is by nature**: its own compression
+/// (`data_compression` 3, `COLUMNSTORE`) and its row and page locks, both
+/// off (measured, 2022) — the model states the index
+/// ([`IndexInfo::is_columnstore`]); `COLUMNSTORE_ARCHIVE` (4) is an option,
+/// and still refused. One predicate for the two guards that ask it — the table's in-place
 /// guard and an indexed view's ([`tsql_view_index_guard`]).
 fn tsql_index_carries(which: &str) -> String {
     format!(
         "EXISTS (SELECT 1 FROM sys.indexes i WHERE i.object_id = @t AND {which} \
          AND (i.fill_factor NOT IN (0, 100) OR i.is_padded = 1 OR i.ignore_dup_key = 1 \
-         OR i.allow_row_locks = 0 OR i.allow_page_locks = 0 OR i.is_disabled = 1 \
+         OR ((i.allow_row_locks = 0 OR i.allow_page_locks = 0) AND i.type NOT IN (5, 6)) \
+         OR i.is_disabled = 1 \
          OR EXISTS (SELECT 1 FROM sys.partitions p WHERE p.object_id = @t \
-         AND p.index_id = i.index_id AND p.data_compression <> 0) \
+         AND p.index_id = i.index_id AND p.data_compression NOT IN (0, 3)) \
          OR EXISTS (SELECT 1 FROM sys.data_spaces s WHERE s.data_space_id = i.data_space_id \
          AND (s.type <> 'FG' OR s.is_default = 0)) \
          OR EXISTS (SELECT 1 FROM sys.extended_properties e WHERE e.class = 7 \
@@ -7727,8 +7750,8 @@ fn tsql_view_index_guard(qname: &str, v: &ViewDraft, server: &[IndexInfo]) -> Op
 
 /// The refusal for a view edit **that would drop an index it cannot create
 /// again**, or `None` when the change is fine: an indexed view's index of a
-/// kind the model has no field for ([`IndexInfo::lossy`] — a columnstore, XML
-/// or spatial one; included columns are modelled) goes with the view's alter
+/// kind the model has no field for ([`IndexInfo::lossy`] — an XML or spatial
+/// one; included columns and a columnstore are modelled) goes with the view's alter
 /// and could only come back without what was never read.
 ///
 /// **And a view created from a reading** (the comparison's create) with such
@@ -7763,16 +7786,16 @@ fn lossy_view_index_refusal(c: &Change) -> Option<String> {
     let plural = if lost.len() == 1 { "" } else { "es" };
     Some(if created {
         format!(
-            "Creating view {} can't create its index{plural} {} — a columnstore, XML or spatial \
-             index, or another kind Schemaic can't restate. Create this view in SQL instead.",
+            "Creating view {} can't create its index{plural} {} — an XML or spatial index, or \
+             another kind Schemaic can't restate. Create this view in SQL instead.",
             draft.name,
             lost.join(", ")
         )
     } else {
         format!(
-            "Editing view {} drops its index{plural} {}, which Schemaic can't create again — a \
-             columnstore, XML or spatial index, or another kind Schemaic can't restate. Edit this \
-             view in SQL instead.",
+            "Editing view {} drops its index{plural} {}, which Schemaic can't create again — an \
+             XML or spatial index, or another kind Schemaic can't restate. Edit this view in SQL \
+             instead.",
             draft.original.as_deref().unwrap_or(&draft.name),
             lost.join(", ")
         )
@@ -7914,7 +7937,24 @@ fn fk_clause(fk: &ForeignKeyInfo, owner: Option<&str>, dialect: SqlDialect) -> S
     out
 }
 
-fn create_index_sql(ix: &IndexInfo, qtable: &str, dialect: SqlDialect) -> String {
+pub(crate) fn create_index_sql(ix: &IndexInfo, qtable: &str, dialect: SqlDialect) -> String {
+    // SQL Server's columnstore: never unique, clustered or not said outright,
+    // and a clustered one stores every column, so names none.
+    if supports_columnstore(dialect) && ix.is_columnstore() {
+        let (cluster, cols) = if ix.clustered == Some(true) {
+            ("CLUSTERED", String::new())
+        } else {
+            ("NONCLUSTERED", format!(" ({})", ix.key_sql(dialect)))
+        };
+        let filter = match &ix.predicate {
+            Some(p) => format!(" WHERE {p}"),
+            None => String::new(),
+        };
+        return format!(
+            "CREATE {cluster} COLUMNSTORE INDEX {} ON {qtable}{cols}{filter};",
+            ddl_ident_in(&ix.name, dialect)
+        );
+    }
     let uniq = if ix.unique { "UNIQUE " } else { "" };
     // T-SQL's default is `NONCLUSTERED`, so only the other is written.
     let cluster = match dialect {
@@ -8997,6 +9037,76 @@ pub fn supports_index_prefix(dialect: SqlDialect) -> bool {
     }
 }
 
+/// How a SQL Server index stores its rows — the designer's *Storage* choice,
+/// mapped onto [`IndexInfo::method`] and [`IndexInfo::clustered`] here so the
+/// form only shows it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IndexStorage {
+    Rowstore,
+    Columnstore,
+    ClusteredColumnstore,
+}
+
+impl IndexStorage {
+    pub const ALL: [IndexStorage; 3] = [
+        IndexStorage::Rowstore,
+        IndexStorage::Columnstore,
+        IndexStorage::ClusteredColumnstore,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            IndexStorage::Rowstore => "Rowstore",
+            IndexStorage::Columnstore => "Columnstore",
+            IndexStorage::ClusteredColumnstore => "Clustered columnstore",
+        }
+    }
+
+    pub fn of(ix: &IndexInfo) -> IndexStorage {
+        match (ix.is_columnstore(), ix.clustered == Some(true)) {
+            (false, _) => IndexStorage::Rowstore,
+            (true, false) => IndexStorage::Columnstore,
+            (true, true) => IndexStorage::ClusteredColumnstore,
+        }
+    }
+
+    /// Make `ix` store this way. A columnstore index is never unique and
+    /// lists no included columns, and a clustered one names no columns at
+    /// all, so what it cannot carry is cleared rather than left for
+    /// `validate` to refuse; back to rowstore, it takes T-SQL's default
+    /// clustering again.
+    pub fn apply(self, ix: &mut IndexInfo) {
+        match self {
+            IndexStorage::Rowstore => {
+                if ix.is_columnstore() {
+                    ix.method = None;
+                    ix.clustered = None;
+                }
+            }
+            IndexStorage::Columnstore | IndexStorage::ClusteredColumnstore => {
+                let clustered = self == IndexStorage::ClusteredColumnstore;
+                ix.method = Some(crate::schema::TSQL_COLUMNSTORE.to_string());
+                ix.clustered = Some(clustered);
+                ix.unique = false;
+                ix.include.clear();
+                if clustered {
+                    ix.columns.clear();
+                }
+            }
+        }
+    }
+}
+
+/// Does `dialect` have **columnstore** indexes ([`IndexInfo::is_columnstore`])
+/// — SQL Server's alone. The designer offers the storage choice only where it
+/// answers yes, and only its emitter writes `COLUMNSTORE`.
+pub fn supports_columnstore(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MsSql => true,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+    }
+}
+
 /// Can an index carry **included columns** (`INCLUDE (…)`, [`IndexInfo::include`])
 /// on `dialect`? SQL Server's and PostgreSQL's (11 on); MySQL and SQLite have
 /// no such clause, so the designer offers no field there and no emitter writes
@@ -9470,6 +9580,9 @@ fn indexes_equal(a: &IndexInfo, b: &IndexInfo) -> bool {
         && a.columns == b.columns
         && a.include == b.include
         && a.method == b.method
+        // A clustered columnstore index is the table's storage, a
+        // nonclustered one a copy beside it: the same method, other indexes.
+        && a.is_clustered_columnstore() == b.is_clustered_columnstore()
         && a.predicate == b.predicate
 }
 
@@ -12457,7 +12570,7 @@ fn tsql_var_widening(from: &str, to: &str) -> bool {
 ///
 /// **A dependent the plan already drops or re-adds is the draft's** and is
 /// left alone, as the check repair above leaves one. One the model cannot
-/// restate — a lossy index (a columnstore, XML or spatial one) — is not touched: the
+/// restate — a lossy index (an XML or spatial one) — is not touched: the
 /// server then refuses the change naming it, and the plan, one transaction,
 /// rolls back whole. One it reads but only in part — an index's options, a
 /// key's disabled state, a description — is taken off and put back only past
@@ -13839,8 +13952,12 @@ pub fn tsql_rebuild_sql(current: &TableInfo, draft: &TableDraft) -> Vec<String> 
              AND (s.type <> 'FG' OR s.is_default = 0)) \
              OR EXISTS (SELECT 1 FROM sys.tables t JOIN sys.data_spaces s \
              ON s.data_space_id = t.lob_data_space_id WHERE t.object_id = @t AND s.is_default = 0) \
-             OR EXISTS (SELECT 1 FROM sys.partitions WHERE object_id = @t AND data_compression <> 0)"
+             OR EXISTS (SELECT 1 FROM sys.partitions WHERE object_id = @t \
+             AND data_compression NOT IN (0, 3))"
                 .into(),
+            // Bar a columnstore index's own `COLUMNSTORE` compression (3),
+            // which is what the index is and what the model states; its
+            // `COLUMNSTORE_ARCHIVE` (4) is an option, and refused.
             "it is partitioned, compressed or stored off the default filegroup",
         ),
         (
@@ -13882,9 +13999,13 @@ pub fn tsql_rebuild_sql(current: &TableInfo, draft: &TableDraft) -> Vec<String> 
              included",
         ),
         (
+            // A columnstore index (types 5 and 6) takes neither row nor page
+            // locks by nature — both flags read 0 (measured, 2022) — so they
+            // are an option only on a rowstore one.
             "EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = @t AND index_id > 0 \
              AND (fill_factor NOT IN (0, 100) OR ignore_dup_key = 1 OR is_padded = 1 \
-             OR allow_row_locks = 0 OR allow_page_locks = 0 OR is_disabled = 1))"
+             OR ((allow_row_locks = 0 OR allow_page_locks = 0) AND type NOT IN (5, 6)) \
+             OR is_disabled = 1))"
                 .into(),
             "an index sets a fill factor, padding, IGNORE_DUP_KEY or row or page locks, \
              or is disabled",
@@ -14231,8 +14352,9 @@ fn tsql_late_arm(probe: &str, cond: &str, why: &str) -> String {
 /// What a T-SQL rebuild ([`tsql_rebuild_sql`]) cannot put back from the
 /// model, said before anything runs — the half of its refusals the reading
 /// already shows, where the guard it opens with is the half only the server
-/// can answer. An index Schemaic does not read whole (a columnstore, XML or
-/// spatial one — included columns it reads) would come back without what it
+/// can answer. An index Schemaic does not read whole (an XML or spatial one,
+/// or an ordered columnstore — included columns and a columnstore it reads)
+/// would come back without what it
 /// did not read; a trigger whose text is encrypted has none to put back; a signed one
 /// would come back unsigned (S2-L5-05); one kept verbatim names the table as
 /// it was, which a rename leaves behind.
@@ -14244,8 +14366,8 @@ fn tsql_rebuild_refusals(current: &TableInfo, draft: &TableDraft) -> Vec<String>
         .filter(|ix| ix.lossy && !ix.is_primary())
         .map(|ix| {
             format!(
-                "Rebuilding {t} would drop the index {}: it is a columnstore, XML or spatial \
-                 index, or another kind Schemaic doesn't read whole",
+                "Rebuilding {t} would drop the index {}: it is an XML or spatial index, or \
+                 another kind Schemaic doesn't read whole",
                 ix.name
             )
         })
@@ -18387,6 +18509,150 @@ mod tests {
         }
     }
 
+    fn columnstore(clustered: bool, cols: &[&str]) -> IndexInfo {
+        IndexInfo {
+            name: "ix_cs".into(),
+            columns: cols
+                .iter()
+                .map(|c| crate::schema::IndexColumn::plain(*c))
+                .collect(),
+            method: Some(crate::schema::TSQL_COLUMNSTORE.into()),
+            clustered: Some(clustered),
+            ..Default::default()
+        }
+    }
+
+    /// **A columnstore index is written as one** — clustered with no column
+    /// list, since it stores every column; nonclustered with the columns it
+    /// stores and its filter — and only by SQL Server's emitter.
+    #[test]
+    fn a_columnstore_index_is_restated_as_one() {
+        let add =
+            |ix: IndexInfo| single("p", Some("dbo"), MsSql, Change::AddIndex(Box::new(ix))).emit();
+        assert_eq!(
+            add(columnstore(true, &[])),
+            vec!["CREATE CLUSTERED COLUMNSTORE INDEX [ix_cs] ON [dbo].[p];"]
+        );
+        let filtered = IndexInfo {
+            predicate: Some("[qty] > 0".into()),
+            ..columnstore(false, &["qty", "code"])
+        };
+        assert_eq!(
+            add(filtered),
+            vec![
+                "CREATE NONCLUSTERED COLUMNSTORE INDEX [ix_cs] ON [dbo].[p] ([qty], [code]) \
+                 WHERE [qty] > 0;"
+            ]
+        );
+        assert!(supports_columnstore(MsSql));
+        for d in [Postgres, MySql, Sqlite] {
+            assert!(!supports_columnstore(d), "{d:?}");
+        }
+    }
+
+    /// A clustered columnstore index names no column and is not refused for
+    /// it; a rowstore one with none still is. Clustered and nonclustered are
+    /// two indexes, so moving between them is an index change.
+    #[test]
+    fn a_clustered_columnstore_names_no_column_and_is_its_own_index() {
+        let mut t = ms_rebuild_table();
+        t.indexes.push(columnstore(true, &[]));
+        let d = TableDraft::from_table(&t);
+        assert!(
+            !d.validate(MsSql).iter().any(|e| e.contains("ix_cs")),
+            "{:?}",
+            d.validate(MsSql)
+        );
+        let mut nc = TableDraft::from_table(&t);
+        let at = nc
+            .indexes
+            .iter()
+            .position(|i| i.info.name == "ix_cs")
+            .unwrap();
+        nc.indexes[at].info = columnstore(false, &["qty"]);
+        let stmts = diff(&t, &nc, MsSql).emit();
+        assert!(
+            stmts
+                .iter()
+                .any(|s| s.contains("CREATE NONCLUSTERED COLUMNSTORE INDEX [ix_cs]")),
+            "{stmts:?}"
+        );
+        let mut rowstore = TableDraft::from_table(&t);
+        rowstore.indexes[at].info = IndexInfo {
+            name: "ix_cs".into(),
+            ..Default::default()
+        };
+        assert!(
+            rowstore
+                .validate(MsSql)
+                .iter()
+                .any(|e| e.contains("ix_cs has no columns")),
+            "{:?}",
+            rowstore.validate(MsSql)
+        );
+    }
+
+    /// **The Storage choice round-trips, and clears what the new storage
+    /// cannot carry**: a columnstore index's uniqueness and include list, a
+    /// clustered one's columns; back to rowstore, T-SQL's default clustering.
+    #[test]
+    fn the_storage_choice_maps_onto_the_index_and_back() {
+        for s in IndexStorage::ALL {
+            let mut ix = IndexInfo {
+                unique: true,
+                include: vec!["code".into()],
+                ..covering(&[])
+            };
+            s.apply(&mut ix);
+            assert_eq!(IndexStorage::of(&ix), s, "{s:?}");
+            if s != IndexStorage::Rowstore {
+                assert!(!ix.unique && ix.include.is_empty(), "{s:?}: {ix:?}");
+            }
+            assert_eq!(
+                ix.columns.is_empty(),
+                s == IndexStorage::ClusteredColumnstore,
+                "{s:?}"
+            );
+        }
+        let mut ix = columnstore(true, &[]);
+        IndexStorage::Rowstore.apply(&mut ix);
+        assert_eq!((ix.method, ix.clustered), (None, None));
+    }
+
+    /// A columnstore index is neither unique nor has included columns — it
+    /// stores columns, not keys — so the draft refuses both before the server.
+    #[test]
+    fn a_columnstore_index_is_refused_uniqueness_and_an_include_list() {
+        let mut t = ms_rebuild_table();
+        t.indexes.push(IndexInfo {
+            unique: true,
+            include: vec!["id".into()],
+            ..columnstore(false, &["qty"])
+        });
+        let errs = TableDraft::from_table(&t).validate(MsSql).join(" ");
+        assert!(errs.contains("ix_cs can't be unique"), "{errs}");
+        assert!(errs.contains("ix_cs can't include"), "{errs}");
+    }
+
+    /// **A rebuild restates a columnstore index** rather than refusing the
+    /// table, as it did while one was read as lossy.
+    #[test]
+    fn a_sql_server_rebuild_restates_a_columnstore_index() {
+        let mut t = ms_rebuild_table();
+        t.indexes.push(columnstore(false, &["qty", "code"]));
+        let mut d = TableDraft::from_table(&t);
+        d.columns[0].info.auto_increment = false;
+        let plan = diff(&t, &d, MsSql);
+        assert!(plan.unsupported().is_empty(), "{:?}", plan.unsupported());
+        assert!(
+            plan.emit()
+                .iter()
+                .any(|s| s.contains("CREATE NONCLUSTERED COLUMNSTORE INDEX [ix_cs] ON [dbo].[p]")),
+            "{:?}",
+            plan.emit()
+        );
+    }
+
     /// **The included columns are part of what an index is**: changing only
     /// them is an index change, or the edit diffs as nothing and never lands.
     #[test]
@@ -18474,7 +18740,7 @@ mod tests {
 
     /// **A rebuild restates an index with included columns** rather than
     /// refusing the table, which is what it did while the model could not hold
-    /// one; a columnstore, XML or spatial index still stops it.
+    /// one; an XML or spatial index still stops it.
     #[test]
     fn a_sql_server_rebuild_restates_an_index_with_included_columns() {
         let mut t = ms_rebuild_table();
@@ -19072,7 +19338,8 @@ mod tests {
             "fill_factor NOT IN (0, 100)",
             "allow_page_locks = 0",
             "i.is_disabled = 1",
-            "data_compression <> 0",
+            // A columnstore index's own compression (3) is not refused.
+            "data_compression NOT IN (0, 3)",
             "e.class = 7",
             "f.is_not_for_replication = 1",
         ] {

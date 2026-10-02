@@ -1321,6 +1321,9 @@ struct Catalogue {
     last_used_value: bool,
     /// `sys.tables.ledger_type`/`ledger_view_id` — SQL Server 2022.
     ledger: bool,
+    /// `sys.index_columns.column_store_order_ordinal` — SQL Server 2022, the
+    /// first with an ordered columnstore index.
+    columnstore_order: bool,
 }
 
 impl Catalogue {
@@ -1333,6 +1336,7 @@ impl Catalogue {
         memory_optimized: true,
         last_used_value: true,
         ledger: true,
+        columnstore_order: true,
     };
 
     /// From [`CATALOGUE_PROBE`]'s row: each cell `1` where the column is
@@ -1346,6 +1350,7 @@ impl Catalogue {
             memory_optimized: has(3),
             last_used_value: has(4),
             ledger: has(5),
+            columnstore_order: has(6),
         }
     }
 }
@@ -1359,7 +1364,9 @@ const CATALOGUE_PROBE: &str = "SELECT \
             CAST(CASE WHEN COL_LENGTH('sys.tables', 'temporal_type') IS NULL THEN 0 ELSE 1 END AS int), \
             CAST(CASE WHEN COL_LENGTH('sys.tables', 'is_memory_optimized') IS NULL THEN 0 ELSE 1 END AS int), \
             CAST(CASE WHEN COL_LENGTH('sys.sequences', 'last_used_value') IS NULL THEN 0 ELSE 1 END AS int), \
-            CAST(CASE WHEN COL_LENGTH('sys.tables', 'ledger_type') IS NULL THEN 0 ELSE 1 END AS int)";
+            CAST(CASE WHEN COL_LENGTH('sys.tables', 'ledger_type') IS NULL THEN 0 ELSE 1 END AS int), \
+            CAST(CASE WHEN COL_LENGTH('sys.index_columns', 'column_store_order_ordinal') IS NULL \
+                 THEN 0 ELSE 1 END AS int)";
 
 /// Every column of every user table and view: `(schema, table, column, type,
 /// max_length, precision, scale, user-defined type, nullable, identity,
@@ -1566,42 +1573,62 @@ fn table_kind_listing(cat: Catalogue) -> String {
 
 /// Every index's key columns, in key order, then its included ones, in theirs:
 /// `(schema, table, index, unique, primary key, column, descending, filter,
-/// type, included, constraint, the column's graph type)`. The primary key's
+/// type, included, constraint, the column's graph type, whether a columnstore
+/// index is ordered)`. The primary key's
 /// index is renamed `PRIMARY`, as PostgreSQL's is, so `IndexInfo::is_primary`
 /// and the DDL treat it the one way; its real name is kept as the
 /// constraint's.
 ///
 /// **A columnstore index has no key columns** — its columns are listed with
 /// `key_ordinal` 0 and flagged as included — so it is read by its columns, in
-/// their order, as key rows (`included` 0), or a key-only join drops it and
-/// the table's DDL left it out without the note every other index it cannot
-/// restate gets. A partitioning column outside the key (`key_ordinal` 0, not
-/// included) is no column of the index's own, and is left out.
+/// their order, as key rows (`included` 0); a key-only join would drop it
+/// whole. A clustered one's are cleared again once folded, since it names
+/// none. **Nor has an XML or a spatial index** (types 3 and 4): its
+/// one column is listed with `key_ordinal` 0 and not included (measured,
+/// 2022), so the join dropped those whole — never read, so a dump and Copy
+/// DDL left them out with no note, and a rebuild's refusal never named them.
+/// They are read now, as the lossy indexes they are. A partitioning column
+/// outside the key (`key_ordinal` 0, not included) is no column of the
+/// index's own, and is left out.
 fn index_listing(cat: Catalogue) -> String {
-    INDEX_LISTING.replace(
-        "{graph_type}",
-        if cat.graph_type {
-            "c.graph_type"
-        } else {
-            "NULL"
-        },
-    )
+    INDEX_LISTING
+        .replace(
+            "{graph_type}",
+            if cat.graph_type {
+                "c.graph_type"
+            } else {
+                "NULL"
+            },
+        )
+        .replace(
+            "{ordered}",
+            if cat.columnstore_order {
+                "CAST(CASE WHEN EXISTS (SELECT 1 FROM sys.index_columns x \
+                 WHERE x.object_id = i.object_id AND x.index_id = i.index_id \
+                 AND x.column_store_order_ordinal > 0) THEN 1 ELSE 0 END AS int)"
+            } else {
+                "0"
+            },
+        )
 }
 
-/// [`index_listing`] with `{graph_type}` where the column's graph type goes.
+/// [`index_listing`] with `{graph_type}` where the column's graph type goes,
+/// and `{ordered}` where whether a columnstore index is **ordered** goes
+/// (`ORDER (…)`, 2022 on) — which the model does not state, so such an index
+/// stays withheld as lossy.
 const INDEX_LISTING: &str = "SELECT s.name, t.name, \
             CASE WHEN i.is_primary_key = 1 THEN 'PRIMARY' ELSE i.name END, \
             CAST(i.is_unique AS int), CAST(i.is_primary_key AS int), \
             c.name, CAST(ic.is_descending_key AS int), i.filter_definition, i.type, \
-            CAST(CASE WHEN i.type IN (5, 6) THEN 0 ELSE ic.is_included_column END AS int), \
+            CAST(CASE WHEN i.type IN (3, 4, 5, 6) THEN 0 ELSE ic.is_included_column END AS int), \
             CASE WHEN i.is_primary_key = 1 OR i.is_unique_constraint = 1 THEN i.name END, \
-            {graph_type} \
+            {graph_type}, {ordered} \
      FROM sys.indexes i \
      JOIN sys.tables t ON t.object_id = i.object_id \
      JOIN sys.schemas s ON s.schema_id = t.schema_id \
      JOIN sys.index_columns ic \
             ON ic.object_id = i.object_id AND ic.index_id = i.index_id \
-           AND (ic.key_ordinal > 0 OR ic.is_included_column = 1 OR i.type IN (5, 6)) \
+           AND (ic.key_ordinal > 0 OR ic.is_included_column = 1 OR i.type IN (3, 4, 5, 6)) \
      JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id \
      WHERE t.is_ms_shipped = 0 AND i.index_id > 0 AND i.is_hypothetical = 0 \
      ORDER BY s.name, t.name, i.name, ic.is_included_column, ic.key_ordinal, ic.index_column_id";
@@ -2179,14 +2206,17 @@ async fn collect_schema(client: &mut MsClient) -> Result<DbSchema, DbError> {
             column.descending = flag(r, 6);
             // Rowstore indexes — clustered and nonclustered, types 1 and 2 —
             // are what the model can say, included columns and all
-            // (`IndexInfo::include`); a columnstore, XML or spatial index is
-            // not. Clustering is `IndexInfo::clustered`: before it was
-            // modelled, a clustered index other than the key's had to be
-            // withheld, since recreating it plainly left the table a heap.
+            // (`IndexInfo::include`), and so is a columnstore one, types 5
+            // (clustered) and 6 (`IndexInfo::is_columnstore`) — unless it is
+            // ordered (column 12, 2022 on); an XML or spatial index is not.
+            // Clustering is `IndexInfo::clustered`: before it was modelled, a
+            // clustered index other than the key's had to be withheld, since
+            // recreating it plainly left the table a heap.
             let kind = int(r, 8);
+            let columnstore = matches!(kind, 5 | 6);
             // `lossy` in the graph column: an index over a graph table's
             // internal columns, marked above.
-            let lossy = kind > 2 || cell(r, 11) == "lossy";
+            let lossy = (kind > 2 && !columnstore) || flag(r, 12) || cell(r, 11) == "lossy";
             (
                 cell(r, 0),
                 IdxRow {
@@ -2194,11 +2224,12 @@ async fn collect_schema(client: &mut MsClient) -> Result<DbSchema, DbError> {
                     index: cell(r, 2),
                     unique: flag(r, 3),
                     column,
-                    method: None,
+                    method: columnstore
+                        .then(|| schemaic_core::schema::TSQL_COLUMNSTORE.to_string()),
                     predicate: r.get(7).cloned().flatten().map(|p| strip_outer_parens(&p)),
                     lossy,
                     create_sql: None,
-                    clustered: Some(kind == 1),
+                    clustered: Some(matches!(kind, 1 | 5)),
                     included: flag(r, 9),
                 },
             )
@@ -2289,6 +2320,13 @@ async fn collect_schema(client: &mut MsClient) -> Result<DbSchema, DbError> {
             &ns_views.remove(ns).unwrap_or_default(),
         );
         tables.extend(schema.tables);
+    }
+    // A clustered columnstore index stores every column and names none: the
+    // catalogue lists each column under it, which the fold read as its key.
+    for ix in tables.iter_mut().flat_map(|t| t.indexes.iter_mut()) {
+        if ix.is_clustered_columnstore() {
+            ix.columns.clear();
+        }
     }
 
     let checks = query_rows(client, CHECK_LISTING).await?;
@@ -5277,6 +5315,7 @@ mod tests {
         memory_optimized: false,
         last_used_value: false,
         ledger: false,
+        columnstore_order: false,
     };
 
     /// Every listing a schema load runs, as built for `cat`.
@@ -5297,7 +5336,7 @@ mod tests {
     #[test]
     fn a_listing_names_no_catalogue_column_the_server_has_not_got() {
         type Without = fn(&mut Catalogue);
-        let gated: [(&str, Without); 7] = [
+        let gated: [(&str, Without); 8] = [
             ("graph_type", |c| c.graph_type = false),
             ("is_node", |c| c.graph_tables = false),
             ("temporal_type", |c| c.temporal_type = false),
@@ -5305,6 +5344,9 @@ mod tests {
             ("last_used_value", |c| c.last_used_value = false),
             ("ledger_type", |c| c.ledger = false),
             ("ledger_view_id", |c| c.ledger = false),
+            ("column_store_order_ordinal", |c| {
+                c.columnstore_order = false
+            }),
         ];
         for (column, without) in gated {
             let mut cat = Catalogue::CURRENT;
@@ -5355,21 +5397,23 @@ mod tests {
     /// else not.
     #[test]
     fn the_catalogue_probe_reads_each_column_in_its_place() {
-        let row = |cells: [&str; 6]| -> Vec<Option<String>> {
+        let row = |cells: [&str; 7]| -> Vec<Option<String>> {
             cells.iter().map(|c| Some(c.to_string())).collect()
         };
         assert_eq!(
-            Catalogue::from_row(&row(["1"; 6])),
+            Catalogue::from_row(&row(["1"; 7])),
             Catalogue::CURRENT,
             "every column there"
         );
-        assert_eq!(Catalogue::from_row(&row(["0"; 6])), OLDEST);
+        assert_eq!(Catalogue::from_row(&row(["0"; 7])), OLDEST);
         assert_eq!(Catalogue::from_row(&[]), OLDEST, "no row reads as none");
-        let one = Catalogue::from_row(&row(["0", "0", "1", "0", "0", "0"]));
+        let one = Catalogue::from_row(&row(["0", "0", "1", "0", "0", "0", "0"]));
         assert!(one.temporal_type && !one.graph_type && !one.memory_optimized);
-        let ledger = Catalogue::from_row(&row(["0", "0", "0", "0", "0", "1"]));
-        assert!(ledger.ledger && !ledger.last_used_value);
-        assert_eq!(CATALOGUE_PROBE.matches("COL_LENGTH").count(), 6);
+        let ledger = Catalogue::from_row(&row(["0", "0", "0", "0", "0", "1", "0"]));
+        assert!(ledger.ledger && !ledger.last_used_value && !ledger.columnstore_order);
+        let ordered = Catalogue::from_row(&row(["0", "0", "0", "0", "0", "0", "1"]));
+        assert!(ordered.columnstore_order && !ordered.ledger);
+        assert_eq!(CATALOGUE_PROBE.matches("COL_LENGTH").count(), 7);
     }
 
     /// **An Entra handle with a plan that verifies nothing is refused before a
