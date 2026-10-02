@@ -1781,11 +1781,13 @@ fn index_form(d: DdlUi, target: &DesignerTarget, ring: FocusRing) -> AnyView {
         crate::widgets::nothing()
     };
 
-    // A secondary XML or a spatial index's clause after its column — `USING XML
-    // INDEX [primary] FOR PATH`, `USING GEOMETRY_GRID WITH (…)` — as SQL, like
-    // a filter's predicate. Built only for those kinds; the form is rebuilt
-    // when Storage changes, so it appears and goes with the choice.
-    let using: AnyView = if ddl::IndexStorage::of(&ix).takes_using() {
+    // A secondary XML, a selective XML or a spatial index's clause after its
+    // column — `USING XML INDEX [primary] FOR PATH`, `FOR (path = '…')`,
+    // `USING GEOMETRY_GRID WITH (…)` — as SQL, like a filter's predicate.
+    // Built only for those kinds; the form is rebuilt when Storage changes, so
+    // it appears and goes with the choice.
+    // Its example is its own kind's clause (`IndexStorage::using_example`).
+    let using: AnyView = if let Some(example) = ddl::IndexStorage::of(&ix).using_example() {
         form_setting(
             "Using",
             field_with_hint(
@@ -1793,7 +1795,7 @@ fn index_form(d: DdlUi, target: &DesignerTarget, ring: FocusRing) -> AnyView {
                     d.draft,
                     ix.using.clone().unwrap_or_default(),
                     list_field_w,
-                    "USING XML INDEX [primary] FOR PATH",
+                    example,
                     ring.clone(),
                     28,
                     move |d, v| {
@@ -1803,7 +1805,38 @@ fn index_form(d: DdlUi, target: &DesignerTarget, ring: FocusRing) -> AnyView {
                     },
                 ),
                 "The clause after the column: a secondary XML index's USING XML INDEX … FOR \
-                 PATH, VALUE or PROPERTY, or a spatial index's USING … WITH (…).",
+                 PATH, VALUE or PROPERTY (or FOR (path) on a selective one), a selective XML \
+                 index's [WITH XMLNAMESPACES (…)] FOR (name = '/path' [AS …], …), or a spatial \
+                 index's USING … WITH (…).",
+            ),
+        )
+        .into_any()
+    } else {
+        crate::widgets::nothing()
+    };
+
+    // A columnstore index's `ORDER`, as a column list like Include. Built only
+    // for a columnstore index where the engine orders one; the form is rebuilt
+    // when Storage changes, so it comes and goes with the choice.
+    let order: AnyView = if ix.is_columnstore() && ddl::supports_columnstore_order(dialect) {
+        form_setting(
+            "Order",
+            field_with_hint(
+                bound_field(
+                    d.draft,
+                    ix.order.join(", "),
+                    list_field_w,
+                    "",
+                    ring.clone(),
+                    29,
+                    move |d, v| {
+                        if let Some(x) = d.indexes.get_mut(i) {
+                            x.info.order = parse_name_list(v);
+                        }
+                    },
+                ),
+                "Comma-separated columns the segments are sorted by — SQL Server 2022 on, and \
+                 2025 on for a nonclustered index, which sorts only by columns it stores.",
             ),
         )
         .into_any()
@@ -1876,6 +1909,7 @@ fn index_form(d: DdlUi, target: &DesignerTarget, ring: FocusRing) -> AnyView {
         include,
         storage,
         using,
+        order,
         bound_toggle(
             d.draft,
             "Unique",

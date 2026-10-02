@@ -1350,6 +1350,10 @@ struct Catalogue {
     /// `sys.index_columns.column_store_order_ordinal` — SQL Server 2022, the
     /// first with an ordered columnstore index.
     columnstore_order: bool,
+    /// `sys.xml_indexes.path_id`, with `sys.selective_xml_index_paths` and
+    /// `…_namespaces` — SQL Server 2012 SP1, the first with a selective XML
+    /// index.
+    selective_xml: bool,
 }
 
 impl Catalogue {
@@ -1363,6 +1367,7 @@ impl Catalogue {
         last_used_value: true,
         ledger: true,
         columnstore_order: true,
+        selective_xml: true,
     };
 
     /// From [`CATALOGUE_PROBE`]'s row: each cell `1` where the column is
@@ -1377,6 +1382,7 @@ impl Catalogue {
             last_used_value: has(4),
             ledger: has(5),
             columnstore_order: has(6),
+            selective_xml: has(7),
         }
     }
 }
@@ -1392,7 +1398,8 @@ const CATALOGUE_PROBE: &str = "SELECT \
             CAST(CASE WHEN COL_LENGTH('sys.sequences', 'last_used_value') IS NULL THEN 0 ELSE 1 END AS int), \
             CAST(CASE WHEN COL_LENGTH('sys.tables', 'ledger_type') IS NULL THEN 0 ELSE 1 END AS int), \
             CAST(CASE WHEN COL_LENGTH('sys.index_columns', 'column_store_order_ordinal') IS NULL \
-                 THEN 0 ELSE 1 END AS int)";
+                 THEN 0 ELSE 1 END AS int), \
+            CAST(CASE WHEN COL_LENGTH('sys.xml_indexes', 'path_id') IS NULL THEN 0 ELSE 1 END AS int)";
 
 /// Every column of every user table and view: `(schema, table, column, type,
 /// max_length, precision, scale, user-defined type, nullable, identity,
@@ -1599,11 +1606,11 @@ fn table_kind_listing(cat: Catalogue) -> String {
 
 /// Every index's key columns, in key order, then its included ones, in theirs:
 /// `(schema, table, index, unique, primary key, column, descending, filter,
-/// type, included, constraint, the column's graph type, whether a columnstore
-/// index is ordered)`. The primary key's
+/// type, included, constraint, the column's graph type)`. The primary key's
 /// index is renamed `PRIMARY`, as PostgreSQL's is, so `IndexInfo::is_primary`
 /// and the DDL treat it the one way; its real name is kept as the
-/// constraint's.
+/// constraint's. A columnstore index's `ORDER` is its own listing
+/// ([`columnstore_order_listing`]).
 ///
 /// **A columnstore index has no key columns** — its columns are listed with
 /// `key_ordinal` 0 and flagged as included — so it is read by its columns, in
@@ -1613,42 +1620,29 @@ fn table_kind_listing(cat: Catalogue) -> String {
 /// one column is listed with `key_ordinal` 0 and not included (measured,
 /// 2022), so the join dropped those whole — never read, so a dump and Copy
 /// DDL left them out with no note, and a rebuild's refusal never named them.
-/// They are read now, as the lossy indexes they are. A partitioning column
+/// They are read now — lossy by their type here, and stated whole by the
+/// pass that reads their kind ([`xml_spatial_listing`]). A partitioning column
 /// outside the key (`key_ordinal` 0, not included) is no column of the
 /// index's own, and is left out.
 fn index_listing(cat: Catalogue) -> String {
-    INDEX_LISTING
-        .replace(
-            "{graph_type}",
-            if cat.graph_type {
-                "c.graph_type"
-            } else {
-                "NULL"
-            },
-        )
-        .replace(
-            "{ordered}",
-            if cat.columnstore_order {
-                "CAST(CASE WHEN EXISTS (SELECT 1 FROM sys.index_columns x \
-                 WHERE x.object_id = i.object_id AND x.index_id = i.index_id \
-                 AND x.column_store_order_ordinal > 0) THEN 1 ELSE 0 END AS int)"
-            } else {
-                "0"
-            },
-        )
+    INDEX_LISTING.replace(
+        "{graph_type}",
+        if cat.graph_type {
+            "c.graph_type"
+        } else {
+            "NULL"
+        },
+    )
 }
 
-/// [`index_listing`] with `{graph_type}` where the column's graph type goes,
-/// and `{ordered}` where whether a columnstore index is **ordered** goes
-/// (`ORDER (…)`, 2022 on) — which the model does not state, so such an index
-/// stays withheld as lossy.
+/// [`index_listing`] with `{graph_type}` where the column's graph type goes.
 const INDEX_LISTING: &str = "SELECT s.name, t.name, \
             CASE WHEN i.is_primary_key = 1 THEN 'PRIMARY' ELSE i.name END, \
             CAST(i.is_unique AS int), CAST(i.is_primary_key AS int), \
             c.name, CAST(ic.is_descending_key AS int), i.filter_definition, i.type, \
             CAST(CASE WHEN i.type IN (3, 4, 5, 6) THEN 0 ELSE ic.is_included_column END AS int), \
             CASE WHEN i.is_primary_key = 1 OR i.is_unique_constraint = 1 THEN i.name END, \
-            {graph_type}, {ordered} \
+            {graph_type} \
      FROM sys.indexes i \
      JOIN sys.tables t ON t.object_id = i.object_id \
      JOIN sys.schemas s ON s.schema_id = t.schema_id \
@@ -1659,17 +1653,177 @@ const INDEX_LISTING: &str = "SELECT s.name, t.name, \
      WHERE t.is_ms_shipped = 0 AND i.index_id > 0 AND i.is_hypothetical = 0 \
      ORDER BY s.name, t.name, i.name, ic.is_included_column, ic.key_ordinal, ic.index_column_id";
 
+/// Every columnstore index's `ORDER`, column by column in its order:
+/// `(schema, table, index, column)` — read into `IndexInfo::order`. `None` on
+/// a server older than 2022, which has no ordered columnstore.
+fn columnstore_order_listing(cat: Catalogue) -> Option<&'static str> {
+    cat.columnstore_order.then_some(
+        "SELECT s.name, t.name, i.name, c.name \
+         FROM sys.index_columns ic \
+         JOIN sys.indexes i ON i.object_id = ic.object_id AND i.index_id = ic.index_id \
+         JOIN sys.tables t ON t.object_id = i.object_id \
+         JOIN sys.schemas s ON s.schema_id = t.schema_id \
+         JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id \
+         WHERE t.is_ms_shipped = 0 AND i.type IN (5, 6) AND ic.column_store_order_ordinal > 0 \
+         ORDER BY s.name, t.name, i.name, ic.column_store_order_ordinal",
+    )
+}
+
+/// Every selective XML index's promoted paths, in their order: `(schema,
+/// table, index, path name, path, path type, XQuery type, XQuery type
+/// inferred, XQuery max length, max length inferred, node, SQL type, SQL type
+/// user-defined, max length, precision, scale, singleton)` — composed into
+/// its `FOR (…)` by [`tsql_selective_xml`]. `None` before 2012 SP1.
+fn selective_path_listing(cat: Catalogue) -> Option<&'static str> {
+    cat.selective_xml.then_some(
+        "SELECT s.name, t.name, i.name, p.name, p.path, p.path_type, \
+                p.xquery_type_description, CAST(p.is_xquery_type_inferred AS int), \
+                p.xquery_max_length, CAST(p.is_xquery_max_length_inferred AS int), \
+                CAST(p.is_node AS int), ty.name, CAST(ty.is_user_defined AS int), \
+                p.max_length, p.precision, p.scale, CAST(p.is_singleton AS int) \
+         FROM sys.selective_xml_index_paths p \
+         JOIN sys.indexes i ON i.object_id = p.object_id AND i.index_id = p.index_id \
+         JOIN sys.tables t ON t.object_id = i.object_id \
+         JOIN sys.schemas s ON s.schema_id = t.schema_id \
+         LEFT JOIN sys.types ty ON ty.user_type_id = p.user_type_id \
+         WHERE t.is_ms_shipped = 0 \
+         ORDER BY s.name, t.name, i.name, p.path_id",
+    )
+}
+
+/// Every selective XML index's namespaces: `(schema, table, index, is the
+/// default, uri, prefix)` — its `WITH XMLNAMESPACES (…)`. `None` before 2012
+/// SP1.
+fn selective_namespace_listing(cat: Catalogue) -> Option<&'static str> {
+    cat.selective_xml.then_some(
+        "SELECT s.name, t.name, i.name, CAST(n.is_default_uri AS int), n.uri, n.prefix \
+         FROM sys.selective_xml_index_namespaces n \
+         JOIN sys.indexes i ON i.object_id = n.object_id AND i.index_id = n.index_id \
+         JOIN sys.tables t ON t.object_id = i.object_id \
+         JOIN sys.schemas s ON s.schema_id = t.schema_id \
+         WHERE t.is_ms_shipped = 0 \
+         ORDER BY s.name, t.name, i.name, n.is_default_uri DESC, n.prefix",
+    )
+}
+
+/// A selective XML index's clause after its column — `[WITH XMLNAMESPACES
+/// (…)] FOR (…)` — from its rows of [`selective_path_listing`] and
+/// [`selective_namespace_listing`], or `None` for one this cannot restate
+/// whole.
+///
+/// **Each path says only what was written**: an XQuery type, a `MAXLENGTH`
+/// the server did not infer, `SINGLETON`, `node()`, or a SQL type — so a
+/// path the catalogue left untyped stays untyped, and one typed from an XML
+/// schema collection is left for the collection to type again. A shape T-SQL
+/// does not spell (`SINGLETON` or `MAXLENGTH` with no type, which the grammar
+/// refuses — `node()` takes `SINGLETON`, measured on 2022 and 2025; an alias
+/// type, which the server refuses; a path kind past the two) is `None`, never
+/// a guess. Names are quoted and every path, type and URI is a literal.
+fn tsql_selective_xml(
+    paths: &[&[Option<String>]],
+    namespaces: &[&[Option<String>]],
+) -> Option<String> {
+    let lit = |s: &str| schemaic_core::schema::ddl_string(s, MS);
+    let int = |r: &[Option<String>], i: usize| cell(r, i).trim().parse::<i64>().ok();
+    let flag = |r: &[Option<String>], i: usize| int(r, i) == Some(1);
+    if paths.is_empty() {
+        return None;
+    }
+    let mut promoted = Vec::with_capacity(paths.len());
+    for r in paths {
+        let name = r.get(3)?.as_deref()?;
+        let path = r.get(4)?.as_deref()?;
+        let singleton = flag(r, 16);
+        let mut item = format!("{} = {}", ident(name), lit(path));
+        match int(r, 5)? {
+            // XQUERY.
+            0 if flag(r, 10) => {
+                item.push_str(&format!(" AS XQUERY {}", lit("node()")));
+                if singleton {
+                    item.push_str(" SINGLETON");
+                }
+            }
+            0 => {
+                let typed = r.get(6).and_then(|v| v.as_deref()).filter(|_| !flag(r, 7));
+                let max = int(r, 8).filter(|n| *n > 0 && !flag(r, 9));
+                match typed {
+                    Some(ty) => {
+                        item.push_str(&format!(" AS XQUERY {}", lit(ty)));
+                        if let Some(n) = max {
+                            item.push_str(&format!(" MAXLENGTH({n})"));
+                        }
+                        if singleton {
+                            item.push_str(" SINGLETON");
+                        }
+                    }
+                    None if singleton || max.is_some() => return None,
+                    None => {}
+                }
+            }
+            // SQL.
+            1 => {
+                let ty = r.get(11)?.as_deref()?;
+                if flag(r, 12)
+                    || ty.is_empty()
+                    || !ty.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                {
+                    return None;
+                }
+                let ty = mssql_type_name(ty, int(r, 13)?, int(r, 14)?, int(r, 15)?, None);
+                item.push_str(&format!(" AS SQL {ty}"));
+                if singleton {
+                    item.push_str(" SINGLETON");
+                }
+            }
+            _ => return None,
+        }
+        promoted.push(item);
+    }
+    let mut spaces = Vec::with_capacity(namespaces.len());
+    for r in namespaces {
+        let uri = lit(r.get(4)?.as_deref()?);
+        if flag(r, 3) {
+            spaces.push(format!("DEFAULT {uri}"));
+        } else {
+            spaces.push(format!("{uri} AS {}", ident(r.get(5)?.as_deref()?)));
+        }
+    }
+    let with = if spaces.is_empty() {
+        String::new()
+    } else {
+        format!("WITH XMLNAMESPACES ({}) ", spaces.join(", "))
+    };
+    Some(format!("{with}FOR ({})", promoted.join(", ")))
+}
+
 /// Every table's XML and spatial index, with what its kind takes after the
 /// column list: `(schema, table, index, type, xml index type, the primary a
 /// secondary XML index uses, its FOR, tessellation scheme, bounding box
-/// xmin, ymin, xmax, ymax, grid levels 1–4, cells per object)` — read into
-/// `IndexInfo::method`/`using` by [`tsql_xml_or_spatial`].
+/// xmin, ymin, xmax, ymax, grid levels 1–4, cells per object, the selective
+/// index's path a secondary selective one is keyed on)` — read into
+/// `IndexInfo::method`/`using` by [`tsql_xml_or_spatial`]. The last is `NULL`
+/// on a server with no selective XML index.
+fn xml_spatial_listing(cat: Catalogue) -> String {
+    XML_SPATIAL_LISTING.replace(
+        "{selective_path}",
+        if cat.selective_xml {
+            "(SELECT sp.name FROM sys.selective_xml_index_paths sp \
+              WHERE sp.object_id = xi.object_id AND sp.index_id = xi.using_xml_index_id \
+              AND sp.path_id = xi.path_id)"
+        } else {
+            "NULL"
+        },
+    )
+}
+
+/// [`xml_spatial_listing`] with `{selective_path}` where a secondary
+/// selective XML index's path goes.
 const XML_SPATIAL_LISTING: &str = "SELECT s.name, t.name, i.name, i.type, \
             xi.xml_index_type, ux.name, xi.secondary_type_desc, \
             si.tessellation_scheme, st.bounding_box_xmin, st.bounding_box_ymin, \
             st.bounding_box_xmax, st.bounding_box_ymax, st.level_1_grid_desc, \
             st.level_2_grid_desc, st.level_3_grid_desc, st.level_4_grid_desc, \
-            st.cells_per_object \
+            st.cells_per_object, {selective_path} \
      FROM sys.indexes i \
      JOIN sys.tables t ON t.object_id = i.object_id \
      JOIN sys.schemas s ON s.schema_id = t.schema_id \
@@ -1685,15 +1839,20 @@ const XML_SPATIAL_LISTING: &str = "SELECT s.name, t.name, i.name, i.type, \
 /// [`IndexInfo::method`](schemaic_core::schema::IndexInfo::method) and
 /// [`IndexInfo::using`](schemaic_core::schema::IndexInfo::using)
 /// from its [`XML_SPATIAL_LISTING`] row, or `None` for one the model does not
-/// state — a selective XML index (`xml_index_type` 2 or 3, its own grammar),
-/// or a value outside what T-SQL spells.
+/// state — a value outside what T-SQL spells. A selective XML index
+/// (`xml_index_type` 2) takes `selective`, its clause as
+/// [`tsql_selective_xml`] composed it, and is `None` without one; a secondary
+/// selective one (3) is keyed on the path in the row's last cell.
 ///
 /// **Every option restated**, so the clause is the index as it stands rather
 /// than whatever the server's defaults are when it is made again; and each
 /// value checked for what it is — a name quoted, a `FOR` one of three words, a
 /// grid level one of three, a number a number — before it reaches T-SQL text.
-fn tsql_xml_or_spatial(r: &[Option<String>]) -> Option<(&'static str, Option<String>)> {
-    use schemaic_core::schema::{TSQL_PRIMARY_XML, TSQL_SPATIAL, TSQL_XML};
+fn tsql_xml_or_spatial(
+    r: &[Option<String>],
+    selective: Option<String>,
+) -> Option<(&'static str, Option<String>)> {
+    use schemaic_core::schema::{TSQL_PRIMARY_XML, TSQL_SELECTIVE_XML, TSQL_SPATIAL, TSQL_XML};
     let num = |i: usize| -> Option<String> {
         let v: f64 = r.get(i)?.as_deref()?.trim().parse().ok()?;
         v.is_finite().then(|| v.to_string())
@@ -1711,6 +1870,19 @@ fn tsql_xml_or_spatial(r: &[Option<String>]) -> Option<(&'static str, Option<Str
                         Some(format!("USING XML INDEX {} FOR {kind}", ident(primary))),
                     )
                 })
+            }
+            2 => selective.map(|using| (TSQL_SELECTIVE_XML, Some(using))),
+            3 => {
+                let parent = r.get(5)?.as_deref()?;
+                let path = r.get(17)?.as_deref()?;
+                Some((
+                    TSQL_XML,
+                    Some(format!(
+                        "USING XML INDEX {} FOR ({})",
+                        ident(parent),
+                        ident(path)
+                    )),
+                ))
             }
             _ => None,
         },
@@ -2341,10 +2513,10 @@ async fn collect_schema(client: &mut MsClient) -> Result<DbSchema, DbError> {
             // Rowstore indexes — clustered and nonclustered, types 1 and 2 —
             // are what the model can say, included columns and all
             // (`IndexInfo::include`), and so is a columnstore one, types 5
-            // (clustered) and 6 (`IndexInfo::is_columnstore`) — unless it is
-            // ordered (column 12, 2022 on). An XML or spatial index is marked
-            // lossy here by its type, and stated whole by the pass after the
-            // fold that reads its kind and options.
+            // (clustered) and 6 (`IndexInfo::is_columnstore`), its `ORDER`
+            // read by the pass after the fold. An XML or spatial index is
+            // marked lossy here by its type, and stated whole by the pass
+            // after the fold that reads its kind and options.
             // Clustering is `IndexInfo::clustered`: before it was modelled, a
             // clustered index other than the key's had to be withheld, since
             // recreating it plainly left the table a heap.
@@ -2352,7 +2524,7 @@ async fn collect_schema(client: &mut MsClient) -> Result<DbSchema, DbError> {
             let columnstore = matches!(kind, 5 | 6);
             // `lossy` in the graph column: an index over a graph table's
             // internal columns, marked above.
-            let lossy = (kind > 2 && !columnstore) || flag(r, 12) || cell(r, 11) == "lossy";
+            let lossy = (kind > 2 && !columnstore) || cell(r, 11) == "lossy";
             (
                 cell(r, 0),
                 IdxRow {
@@ -2464,11 +2636,57 @@ async fn collect_schema(client: &mut MsClient) -> Result<DbSchema, DbError> {
             ix.columns.clear();
         }
     }
+    // A columnstore index's `ORDER`, column by column (2022 on).
+    if let Some(sql) = columnstore_order_listing(cat) {
+        for r in query_rows(client, sql).await? {
+            let (ns, table, index) = (cell(&r, 0), cell(&r, 1), cell(&r, 2));
+            if let Some(ix) = tables
+                .iter_mut()
+                .filter(|t| t.schema.as_deref() == Some(ns.as_str()) && t.name == table)
+                .flat_map(|t| t.indexes.iter_mut())
+                .find(|ix| ix.name == index && ix.is_columnstore())
+            {
+                ix.order.push(cell(&r, 3));
+            }
+        }
+    }
+    // A selective XML index's paths and namespaces, by index, for the pass
+    // below to compose into its clause (`tsql_selective_xml`).
+    type IxKey = (String, String, String);
+    let by_index = |rows: Vec<Vec<Option<String>>>| {
+        let mut out: HashMap<IxKey, Vec<Vec<Option<String>>>> = HashMap::new();
+        for r in rows {
+            out.entry((cell(&r, 0), cell(&r, 1), cell(&r, 2)))
+                .or_default()
+                .push(r);
+        }
+        out
+    };
+    let selective_paths = match selective_path_listing(cat) {
+        Some(sql) => by_index(query_rows(client, sql).await?),
+        None => HashMap::new(),
+    };
+    let selective_namespaces = match selective_namespace_listing(cat) {
+        Some(sql) => by_index(query_rows(client, sql).await?),
+        None => HashMap::new(),
+    };
     // An XML or spatial index, read lossy above by its type, is stated whole
-    // where its kind and options are (`tsql_xml_or_spatial`); a selective XML
-    // index stays lossy.
-    for r in query_rows(client, XML_SPATIAL_LISTING).await? {
-        let Some((method, using)) = tsql_xml_or_spatial(&r) else {
+    // where its kind and options are (`tsql_xml_or_spatial`).
+    fn rows<'a>(
+        of: &'a HashMap<IxKey, Vec<Vec<Option<String>>>>,
+        key: &IxKey,
+    ) -> Vec<&'a [Option<String>]> {
+        of.get(key)
+            .map(|rs| rs.iter().map(Vec::as_slice).collect())
+            .unwrap_or_default()
+    }
+    for r in query_rows(client, &xml_spatial_listing(cat)).await? {
+        let key = (cell(&r, 0), cell(&r, 1), cell(&r, 2));
+        let selective = tsql_selective_xml(
+            &rows(&selective_paths, &key),
+            &rows(&selective_namespaces, &key),
+        );
+        let Some((method, using)) = tsql_xml_or_spatial(&r, selective) else {
             continue;
         };
         let (ns, table, index) = (cell(&r, 0), cell(&r, 1), cell(&r, 2));
@@ -5410,8 +5628,285 @@ mod tests {
         let mut r: Vec<Option<String>> =
             vec![Some("dbo".into()), Some("t".into()), Some("ix".into())];
         r.extend(cells.iter().map(|c| c.map(str::to_string)));
+        r.resize(18, None);
+        r
+    }
+
+    /// [`tsql_xml_or_spatial`] for a row that is not a selective XML index.
+    fn xs(r: &[Option<String>]) -> Option<(&'static str, Option<String>)> {
+        tsql_xml_or_spatial(r, None)
+    }
+
+    /// A [`selective_path_listing`] row, `(name, path, cells 5..)`.
+    fn sx_path(name: &str, path: &str, rest: &[Option<&str>]) -> Vec<Option<String>> {
+        let mut r: Vec<Option<String>> = ["dbo", "t", "sx", name, path]
+            .iter()
+            .map(|c| Some(c.to_string()))
+            .collect();
+        r.extend(rest.iter().map(|c| c.map(str::to_string)));
         r.resize(17, None);
         r
+    }
+
+    /// **A selective XML index is restated from the catalogue as it was
+    /// written** — the rows as SQL Server 2022 printed them for
+    /// `WITH XMLNAMESPACES ('urn:a' AS p, DEFAULT 'urn:d') FOR (path1 =
+    /// '/p:a/p:b', path2 = '/x/y' AS XQUERY 'xs:string' MAXLENGTH(40)
+    /// SINGLETON, path3 = '/x/z' AS XQUERY 'node()', path4 = '/x/w' AS SQL
+    /// nvarchar(30), path5 = '/x/v' AS SQL decimal(10,2) SINGLETON, path6 =
+    /// '/x/u' AS XQUERY 'xs:double', path7 = '/q' AS XQUERY 'xs:string')`:
+    /// an untyped path's `-1` length and an unbounded string's are no
+    /// `MAXLENGTH`, and nothing the server did not print is added.
+    #[test]
+    fn a_selective_xml_index_is_restated_as_written() {
+        let paths = [
+            sx_path(
+                "path1",
+                "/p:a/p:b",
+                &[Some("0"), None, Some("0"), Some("-1"), Some("0"), Some("0")],
+            ),
+            sx_path(
+                "path2",
+                "/x/y",
+                &[
+                    Some("0"),
+                    Some("xs:string"),
+                    Some("0"),
+                    Some("40"),
+                    Some("0"),
+                    Some("0"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("1"),
+                ],
+            ),
+            sx_path(
+                "path3",
+                "/x/z",
+                &[Some("0"), None, None, None, None, Some("1")],
+            ),
+            sx_path(
+                "path4",
+                "/x/w",
+                &[
+                    Some("1"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("0"),
+                    Some("nvarchar"),
+                    Some("0"),
+                    Some("60"),
+                    Some("0"),
+                    Some("0"),
+                    Some("0"),
+                ],
+            ),
+            sx_path(
+                "path5",
+                "/x/v",
+                &[
+                    Some("1"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("0"),
+                    Some("decimal"),
+                    Some("0"),
+                    Some("9"),
+                    Some("10"),
+                    Some("2"),
+                    Some("1"),
+                ],
+            ),
+            sx_path(
+                "path6",
+                "/x/u",
+                &[
+                    Some("0"),
+                    Some("xs:double"),
+                    Some("0"),
+                    None,
+                    None,
+                    Some("0"),
+                ],
+            ),
+            sx_path(
+                "path7",
+                "/q",
+                &[
+                    Some("0"),
+                    Some("xs:string"),
+                    Some("0"),
+                    Some("-1"),
+                    Some("0"),
+                    Some("0"),
+                ],
+            ),
+        ];
+        let ns = |default: &str, uri: &str, prefix: Option<&str>| -> Vec<Option<String>> {
+            let mut r: Vec<Option<String>> = ["dbo", "t", "sx", default, uri]
+                .iter()
+                .map(|c| Some(c.to_string()))
+                .collect();
+            r.push(prefix.map(str::to_string));
+            r
+        };
+        let spaces = [ns("1", "urn:d", None), ns("0", "urn:a", Some("p"))];
+        let p: Vec<&[Option<String>]> = paths.iter().map(Vec::as_slice).collect();
+        let n: Vec<&[Option<String>]> = spaces.iter().map(Vec::as_slice).collect();
+        assert_eq!(
+            tsql_selective_xml(&p, &n).as_deref(),
+            Some(
+                "WITH XMLNAMESPACES (DEFAULT N'urn:d', N'urn:a' AS [p]) FOR (\
+                 [path1] = N'/p:a/p:b', \
+                 [path2] = N'/x/y' AS XQUERY N'xs:string' MAXLENGTH(40) SINGLETON, \
+                 [path3] = N'/x/z' AS XQUERY N'node()', \
+                 [path4] = N'/x/w' AS SQL nvarchar(30), \
+                 [path5] = N'/x/v' AS SQL decimal(10,2) SINGLETON, \
+                 [path6] = N'/x/u' AS XQUERY N'xs:double', \
+                 [path7] = N'/q' AS XQUERY N'xs:string')"
+            )
+        );
+        // No namespaces: the clause is its paths alone.
+        assert_eq!(
+            tsql_selective_xml(&p[..1], &[]).as_deref(),
+            Some("FOR ([path1] = N'/p:a/p:b')")
+        );
+        // A quote in a path is doubled, not spliced.
+        let quoted = sx_path("q", "/a'b", &[Some("0")]);
+        assert_eq!(
+            tsql_selective_xml(&[quoted.as_slice()], &[]).as_deref(),
+            Some("FOR ([q] = N'/a''b')")
+        );
+        // `node()` takes `SINGLETON` (measured on 2022 and 2025), the row
+        // with no type and nothing inferred.
+        let node = sx_path(
+            "n",
+            "/n",
+            &[
+                Some("0"),
+                None,
+                None,
+                None,
+                None,
+                Some("1"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("1"),
+            ],
+        );
+        assert_eq!(
+            tsql_selective_xml(&[node.as_slice()], &[]).as_deref(),
+            Some("FOR ([n] = N'/n' AS XQUERY N'node()' SINGLETON)")
+        );
+    }
+
+    /// **What T-SQL does not spell is left lossy**, never restated as a
+    /// guess: `SINGLETON` with no type (a syntax error), a type the server
+    /// inferred from a schema collection with `SINGLETON` on it, an alias
+    /// type (refused, Msg 6375), a SQL type that is no type name, a path
+    /// kind past the two, and an index with no paths at all.
+    #[test]
+    fn a_selective_xml_index_the_model_cannot_state_is_lossy() {
+        let one = |r: Vec<Option<String>>| tsql_selective_xml(&[r.as_slice()], &[]);
+        let untyped_singleton = sx_path(
+            "a",
+            "/a",
+            &[
+                Some("0"),
+                None,
+                Some("0"),
+                Some("-1"),
+                Some("0"),
+                Some("0"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("1"),
+            ],
+        );
+        assert_eq!(one(untyped_singleton), None);
+        let inferred_singleton = sx_path(
+            "a",
+            "/a",
+            &[
+                Some("0"),
+                Some("xs:int"),
+                Some("1"),
+                None,
+                None,
+                Some("0"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("1"),
+            ],
+        );
+        assert_eq!(one(inferred_singleton), None);
+        let sql = |ty: &str, user_defined: &str| {
+            sx_path(
+                "a",
+                "/a",
+                &[
+                    Some("1"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("0"),
+                    Some(ty),
+                    Some(user_defined),
+                    Some("4"),
+                    Some("10"),
+                    Some("0"),
+                    Some("0"),
+                ],
+            )
+        };
+        assert_eq!(one(sql("short", "1")), None);
+        assert_eq!(one(sql("int) --", "0")), None);
+        assert_eq!(
+            one(sql("int", "0")).as_deref(),
+            Some("FOR ([a] = N'/a' AS SQL int)")
+        );
+        assert_eq!(one(sx_path("a", "/a", &[Some("7")])), None);
+        assert_eq!(tsql_selective_xml(&[], &[]), None);
+    }
+
+    /// **A selective XML index and the secondary keyed on one of its paths
+    /// are read as their kinds** — the selective one with the clause composed
+    /// for it and lossy without one, the secondary naming the selective index
+    /// and the path (`xml_index_type` 2 and 3, measured on 2022).
+    #[test]
+    fn a_selective_xml_index_and_its_secondary_are_read_as_their_kinds() {
+        use schemaic_core::schema::{TSQL_SELECTIVE_XML, TSQL_XML};
+        let selective = xs_row(&[Some("3"), Some("2")]);
+        assert_eq!(xs(&selective), None, "no paths read, nothing to restate");
+        assert_eq!(
+            tsql_xml_or_spatial(&selective, Some("FOR ([a] = N'/a')".into())),
+            Some((TSQL_SELECTIVE_XML, Some("FOR ([a] = N'/a')".into())))
+        );
+        let mut secondary = xs_row(&[Some("3"), Some("3"), Some("s x")]);
+        secondary[17] = Some("p]4".into());
+        assert_eq!(
+            xs(&secondary),
+            Some((TSQL_XML, Some("USING XML INDEX [s x] FOR ([p]]4])".into())))
+        );
+        secondary[17] = None;
+        assert_eq!(xs(&secondary), None, "a secondary with no path read");
     }
 
     /// **An XML or spatial index is read as the catalogue states it**, every
@@ -5422,11 +5917,11 @@ mod tests {
     fn an_xml_or_spatial_index_is_read_with_every_option() {
         use schemaic_core::schema::{TSQL_PRIMARY_XML, TSQL_SPATIAL, TSQL_XML};
         assert_eq!(
-            tsql_xml_or_spatial(&xs_row(&[Some("3"), Some("0")])),
+            xs(&xs_row(&[Some("3"), Some("0")])),
             Some((TSQL_PRIMARY_XML, None))
         );
         assert_eq!(
-            tsql_xml_or_spatial(&xs_row(&[Some("3"), Some("1"), Some("ix_x"), Some("PATH")])),
+            xs(&xs_row(&[Some("3"), Some("1"), Some("ix_x"), Some("PATH")])),
             Some((TSQL_XML, Some("USING XML INDEX [ix_x] FOR PATH".into())))
         );
         let grid = xs_row(&[
@@ -5446,7 +5941,7 @@ mod tests {
             Some("20"),
         ]);
         assert_eq!(
-            tsql_xml_or_spatial(&grid),
+            xs(&grid),
             Some((
                 TSQL_SPATIAL,
                 Some(
@@ -5474,14 +5969,14 @@ mod tests {
             Some("12"),
         ]);
         assert_eq!(
-            tsql_xml_or_spatial(&geography),
+            xs(&geography),
             Some((
                 TSQL_SPATIAL,
                 Some("USING GEOGRAPHY_AUTO_GRID WITH (CELLS_PER_OBJECT = 12)".into())
             ))
         );
-        // Selective XML, a FOR outside the three, a grid level or a scheme
-        // outside T-SQL's words: lossy, not spliced.
+        // Selective XML with no paths read, a FOR outside the three, a grid
+        // level or a scheme outside T-SQL's words: lossy, not spliced.
         for r in [
             xs_row(&[Some("3"), Some("2")]),
             xs_row(&[
@@ -5492,23 +5987,23 @@ mod tests {
             ]),
             xs_row(&[Some("4"), None, None, None, Some("GEOMETRY_GRID) --")]),
         ] {
-            assert_eq!(tsql_xml_or_spatial(&r), None, "{r:?}");
+            assert_eq!(xs(&r), None, "{r:?}");
         }
         let mut odd = grid.clone();
         odd[12] = Some("LOW, LEVEL_9 = X".into());
-        assert_eq!(tsql_xml_or_spatial(&odd), None);
+        assert_eq!(xs(&odd), None);
         // **A value there that does not parse leaves the index lossy**, not
         // restated without that option — which would be the server's default,
         // a different index, with the plan calling it the same.
         let mut nan = grid.clone();
         nan[8] = Some("1); DROP TABLE t; --".into());
-        assert_eq!(tsql_xml_or_spatial(&nan), None);
+        assert_eq!(xs(&nan), None);
         let mut half_box = grid.clone();
         half_box[10] = None;
-        assert_eq!(tsql_xml_or_spatial(&half_box), None);
+        assert_eq!(xs(&half_box), None);
         let mut cells = grid;
         cells[16] = Some("many".into());
-        assert_eq!(tsql_xml_or_spatial(&cells), None);
+        assert_eq!(xs(&cells), None);
     }
 
     /// A named instance the Browser gave no port for is told the three
@@ -5606,16 +6101,36 @@ mod tests {
         last_used_value: false,
         ledger: false,
         columnstore_order: false,
+        selective_xml: false,
     };
 
-    /// Every listing a schema load runs, as built for `cat`.
+    /// Every listing a schema load runs whatever the server, as built for
+    /// `cat`.
     fn listings(cat: Catalogue) -> Vec<String> {
         vec![
             column_listing(cat),
             index_listing(cat),
             sequence_listing(cat),
             table_kind_listing(cat),
+            xml_spatial_listing(cat),
         ]
+    }
+
+    /// [`listings`] and the ones a server runs only where it has what they
+    /// read.
+    fn every_listing(cat: Catalogue) -> Vec<String> {
+        let mut out = listings(cat);
+        out.extend(
+            [
+                columnstore_order_listing(cat),
+                selective_path_listing(cat),
+                selective_namespace_listing(cat),
+            ]
+            .into_iter()
+            .flatten()
+            .map(str::to_string),
+        );
+        out
     }
 
     /// **A schema load on a server older than a catalogue column never names
@@ -5626,9 +6141,11 @@ mod tests {
     #[test]
     fn a_listing_names_no_catalogue_column_the_server_has_not_got() {
         type Without = fn(&mut Catalogue);
-        let gated: [(&str, Without); 8] = [
+        let gated: [(&str, Without); 11] = [
             ("graph_type", |c| c.graph_type = false),
-            ("is_node", |c| c.graph_tables = false),
+            // `sys.tables`' — `sys.selective_xml_index_paths` has one too, on
+            // every server with a selective XML index.
+            ("t.is_node", |c| c.graph_tables = false),
             ("temporal_type", |c| c.temporal_type = false),
             ("is_memory_optimized", |c| c.memory_optimized = false),
             ("last_used_value", |c| c.last_used_value = false),
@@ -5637,23 +6154,28 @@ mod tests {
             ("column_store_order_ordinal", |c| {
                 c.columnstore_order = false
             }),
+            ("path_id", |c| c.selective_xml = false),
+            ("selective_xml_index_paths", |c| c.selective_xml = false),
+            ("selective_xml_index_namespaces", |c| {
+                c.selective_xml = false
+            }),
         ];
         for (column, without) in gated {
             let mut cat = Catalogue::CURRENT;
             without(&mut cat);
-            for sql in listings(cat) {
+            for sql in every_listing(cat) {
                 assert!(!sql.contains(column), "{column} named without it: {sql}");
             }
             // And a current server is still asked for it.
             assert!(
-                listings(Catalogue::CURRENT)
+                every_listing(Catalogue::CURRENT)
                     .iter()
                     .any(|sql| sql.contains(column)),
                 "{column} never read"
             );
         }
         for column in ["is_edge", "graph_type"] {
-            for sql in listings(OLDEST) {
+            for sql in every_listing(OLDEST) {
                 assert!(!sql.contains(column), "{column}: {sql}");
             }
         }
@@ -5687,23 +6209,25 @@ mod tests {
     /// else not.
     #[test]
     fn the_catalogue_probe_reads_each_column_in_its_place() {
-        let row = |cells: [&str; 7]| -> Vec<Option<String>> {
+        let row = |cells: [&str; 8]| -> Vec<Option<String>> {
             cells.iter().map(|c| Some(c.to_string())).collect()
         };
         assert_eq!(
-            Catalogue::from_row(&row(["1"; 7])),
+            Catalogue::from_row(&row(["1"; 8])),
             Catalogue::CURRENT,
             "every column there"
         );
-        assert_eq!(Catalogue::from_row(&row(["0"; 7])), OLDEST);
+        assert_eq!(Catalogue::from_row(&row(["0"; 8])), OLDEST);
         assert_eq!(Catalogue::from_row(&[]), OLDEST, "no row reads as none");
-        let one = Catalogue::from_row(&row(["0", "0", "1", "0", "0", "0", "0"]));
+        let one = Catalogue::from_row(&row(["0", "0", "1", "0", "0", "0", "0", "0"]));
         assert!(one.temporal_type && !one.graph_type && !one.memory_optimized);
-        let ledger = Catalogue::from_row(&row(["0", "0", "0", "0", "0", "1", "0"]));
+        let ledger = Catalogue::from_row(&row(["0", "0", "0", "0", "0", "1", "0", "0"]));
         assert!(ledger.ledger && !ledger.last_used_value && !ledger.columnstore_order);
-        let ordered = Catalogue::from_row(&row(["0", "0", "0", "0", "0", "0", "1"]));
-        assert!(ordered.columnstore_order && !ordered.ledger);
-        assert_eq!(CATALOGUE_PROBE.matches("COL_LENGTH").count(), 7);
+        let ordered = Catalogue::from_row(&row(["0", "0", "0", "0", "0", "0", "1", "0"]));
+        assert!(ordered.columnstore_order && !ordered.ledger && !ordered.selective_xml);
+        let selective = Catalogue::from_row(&row(["0", "0", "0", "0", "0", "0", "0", "1"]));
+        assert!(selective.selective_xml && !selective.columnstore_order);
+        assert_eq!(CATALOGUE_PROBE.matches("COL_LENGTH").count(), 8);
     }
 
     /// **An Entra handle with a plan that verifies nothing is refused before a

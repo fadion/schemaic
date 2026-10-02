@@ -5936,9 +5936,9 @@ async fn a_clustered_index_and_a_nonclustered_key_keep_their_clustering() {
 }
 
 /// **An identity switched on is a rebuild — withheld where the rebuild would
-/// drop an index it does not read whole**, here an ordered columnstore one
-/// (`ORDER`, 2022 on), and the preview says which rather than applying a
-/// table without it.
+/// drop an index it does not read whole**, here an edge table's index over
+/// its `$from_id`, a column the model leaves out, and the preview says which
+/// rather than applying a table without it.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_identity_toggle_is_withheld_over_an_index_the_rebuild_cannot_restate() {
     use schemaic_core::ddl::TableDraft;
@@ -5946,16 +5946,16 @@ async fn an_identity_toggle_is_withheld_over_an_index_the_rebuild_cannot_restate
         return;
     }
     let s = Scratch::create("ddl_ident").await;
-    s.exec("CREATE TABLE dbo.t (id int NOT NULL, a int)").await;
-    s.exec("CREATE CLUSTERED COLUMNSTORE INDEX occi ON dbo.t ORDER (a)")
+    s.exec("CREATE TABLE dbo.t (id int NOT NULL, a int) AS EDGE")
         .await;
+    s.exec("CREATE INDEX gx ON dbo.t ($from_id, a)").await;
     let t = read_table(&s, "t").await;
     let mut d = TableDraft::from_table(&t);
-    d.columns[0].info.auto_increment = true;
+    let id = d.columns.iter().position(|c| c.info.name == "id").unwrap();
+    d.columns[id].info.auto_increment = true;
     let cs = schemaic_core::ddl::diff(&t, &d, MS);
     let refused = cs.unsupported();
-    assert_eq!(refused.len(), 1, "{refused:?}");
-    assert!(refused[0].contains("occi"), "{refused:?}");
+    assert!(refused.iter().any(|r| r.contains("gx")), "{refused:?}");
 }
 
 /// **XML and spatial indexes are read whole and survive a rebuild**: a
@@ -6063,6 +6063,117 @@ async fn xml_and_spatial_indexes_are_read_whole_and_survive_a_rebuild() {
     }
 }
 
+/// **A selective XML index is read whole and survives a rebuild** — its
+/// namespaces and every kind of promoted path, untyped, XQuery-typed with a
+/// length and `SINGLETON`, `node()`, SQL-typed — with a secondary keyed on
+/// one of its paths and named to sort before it; restated by a rebuild,
+/// parent first, and read back equal. **Copy DDL** recreates the table from
+/// nothing with both, parent first whatever the names; and both are
+/// authored from the designer's Storage choice.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_selective_xml_index_is_read_whole_and_survives_a_rebuild() {
+    use schemaic_core::ddl::{IndexDraft, IndexStorage, TableDraft};
+    use schemaic_core::schema::{IndexColumn, IndexInfo, TSQL_SELECTIVE_XML, TSQL_XML};
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("ddl_selective_xml").await;
+    for sql in [
+        "CREATE TABLE dbo.t (id int NOT NULL, x xml, \
+         CONSTRAINT pk_t PRIMARY KEY CLUSTERED (id))",
+        "CREATE SELECTIVE XML INDEX z_sel ON dbo.t (x) \
+         WITH XMLNAMESPACES ('urn:a' AS p, DEFAULT 'urn:d') \
+         FOR (path1 = '/p:a/p:b', \
+              path2 = '/x/y' AS XQUERY 'xs:string' MAXLENGTH(40) SINGLETON, \
+              path3 = '/x/z' AS XQUERY 'node()', \
+              [path 4] = '/x/w' AS SQL nvarchar(30), \
+              path5 = '/x/v' AS SQL decimal(10,2) SINGLETON, \
+              path6 = '/x/u' AS XQUERY 'xs:double', \
+              path7 = '/x/n' AS XQUERY 'node()' SINGLETON)",
+        "CREATE XML INDEX a_sec ON dbo.t (x) USING XML INDEX z_sel FOR ([path 4])",
+    ] {
+        s.exec(sql).await;
+    }
+    let ix = |t: &schemaic_core::schema::TableInfo, name: &str| {
+        t.indexes
+            .iter()
+            .find(|i| i.name == name)
+            .cloned()
+            .unwrap_or_else(|| panic!("no {name}: {:?}", t.indexes))
+    };
+    let t = read_table(&s, "t").await;
+    let (sel, sec) = (ix(&t, "z_sel"), ix(&t, "a_sec"));
+    assert!(!sel.lossy && !sec.lossy, "{sel:?}\n{sec:?}");
+    assert_eq!(sel.method.as_deref(), Some(TSQL_SELECTIVE_XML));
+    assert_eq!(sec.method.as_deref(), Some(TSQL_XML));
+    assert_eq!(
+        sec.using.as_deref(),
+        Some("USING XML INDEX [z_sel] FOR ([path 4])")
+    );
+
+    // Rebuilt around them by an identity switched on.
+    let mut d = TableDraft::from_table(&t);
+    d.columns[0].info.auto_increment = true;
+    let stmts = apply_draft(&s, &t, &d).await;
+    let t2 = read_table(&s, "t").await;
+    for name in ["z_sel", "a_sec"] {
+        let (a, b) = (ix(&t, name), ix(&t2, name));
+        assert_eq!((&b.method, &b.using), (&a.method, &a.using), "{stmts:#?}");
+    }
+    let again = schemaic_core::ddl::diff(&t2, &TableDraft::from_table(&t2), MS);
+    assert!(again.changes.is_empty(), "{:?}", again.changes);
+
+    // Copy DDL, from nothing.
+    let ddl = t2.create_ddl(MS);
+    s.exec("DROP TABLE dbo.t").await;
+    s.exec(&ddl).await;
+    let t3 = read_table(&s, "t").await;
+    for name in ["z_sel", "a_sec"] {
+        let (a, b) = (ix(&t2, name), ix(&t3, name));
+        assert_eq!((&b.method, &b.using), (&a.method, &a.using), "{ddl}");
+    }
+
+    // Authored from the Storage choice, the secondary listed first.
+    s.exec(
+        "CREATE TABLE dbo.u (id int NOT NULL, x xml, \
+         CONSTRAINT pk_u PRIMARY KEY CLUSTERED (id))",
+    )
+    .await;
+    let u = read_table(&s, "u").await;
+    let made = |name: &str, kind: IndexStorage, using: &str| {
+        let mut ix = IndexInfo {
+            name: name.into(),
+            columns: vec![IndexColumn::plain("x")],
+            ..Default::default()
+        };
+        kind.apply(&mut ix);
+        ix.using = Some(using.to_string());
+        IndexDraft::new(ix)
+    };
+    let mut d = TableDraft::from_table(&u);
+    d.indexes.push(made(
+        "s2",
+        IndexStorage::SecondaryXml,
+        "USING XML INDEX [s1] FOR ([k])",
+    ));
+    d.indexes.push(made(
+        "s1",
+        IndexStorage::SelectiveXml,
+        "FOR ([k] = N'/a/k' AS SQL int, [n] = N'/a/n')",
+    ));
+    let stmts = apply_draft(&s, &u, &d).await;
+    let u2 = read_table(&s, "u").await;
+    assert_eq!(
+        ix(&u2, "s1").using.as_deref(),
+        Some("FOR ([k] = N'/a/k' AS SQL int, [n] = N'/a/n')"),
+        "{stmts:#?}"
+    );
+    assert_eq!(
+        ix(&u2, "s2").using.as_deref(),
+        Some("USING XML INDEX [s1] FOR ([k])")
+    );
+}
+
 /// **An index's included columns are read apart from its key, and a rebuild
 /// restates them** — the shape five of WideWorldImporters' tables have, which
 /// the rebuild refused while the model could not hold one. Read back, the
@@ -6128,7 +6239,9 @@ async fn a_rebuild_keeps_an_indexs_included_columns() {
 /// one with no column list and a filtered nonclustered one are read back
 /// unlossy, survive a rebuild around them equal to what they were, and one
 /// made from the designer's Storage choice lands; an **ordered** one (2022
-/// on), whose `ORDER` the model does not state, is still withheld.
+/// on) is read with its `ORDER`, survives a rebuild with it and is
+/// re-ordered from the draft, and a nonclustered one is authored ordered
+/// where the server has that (2025 on).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_columnstore_index_is_read_rebuilt_and_authored() {
     use schemaic_core::ddl::{IndexStorage, TableDraft};
@@ -6143,8 +6256,8 @@ async fn a_columnstore_index_is_read_rebuilt_and_authored() {
          CREATE CLUSTERED COLUMNSTORE INDEX cci ON dbo.c; \
          CREATE TABLE dbo.n (id int NOT NULL PRIMARY KEY, a int, b int); \
          CREATE NONCLUSTERED COLUMNSTORE INDEX ncci ON dbo.n (a, b) WHERE a > 0; \
-         CREATE TABLE dbo.o (id int NOT NULL, a int); \
-         CREATE CLUSTERED COLUMNSTORE INDEX occi ON dbo.o ORDER (a);",
+         CREATE TABLE dbo.o (id int NOT NULL, a int, b int); \
+         CREATE CLUSTERED COLUMNSTORE INDEX occi ON dbo.o ORDER (b, a);",
     )
     .await;
     let ix = |t: &schemaic_core::schema::TableInfo, name: &str| {
@@ -6202,13 +6315,62 @@ async fn a_columnstore_index_is_read_rebuilt_and_authored() {
     apply_draft(&s, &t, &d).await;
     assert!(ix(&read_table(&s, "n").await, "ncci2").is_columnstore());
 
-    // Ordered: withheld, and a rebuild refuses the table over it.
+    // **Ordered: read with its `ORDER`, in its order**, and rebuilt around
+    // with it.
     let t = read_table(&s, "o").await;
-    assert!(ix(&t, "occi").lossy, "an ordered columnstore read as whole");
+    let occi = ix(&t, "occi");
+    assert!(!occi.lossy && occi.is_clustered_columnstore(), "{occi:?}");
+    assert_eq!(occi.order, vec!["b".to_string(), "a".to_string()]);
     let mut d = TableDraft::from_table(&t);
     d.columns[0].info.auto_increment = true;
-    let refused = schemaic_core::ddl::diff(&t, &d, MS).unsupported();
-    assert!(refused.iter().any(|r| r.contains("occi")), "{refused:?}");
+    let stmts = apply_draft(&s, &t, &d).await;
+    assert!(
+        stmts.iter().any(|st| st.contains("ORDER ([b], [a])")),
+        "{stmts:#?}"
+    );
+    let t2 = read_table(&s, "o").await;
+    assert_eq!(ix(&t2, "occi").order, occi.order, "{stmts:#?}");
+    let again = schemaic_core::ddl::diff(&t2, &TableDraft::from_table(&t2), MS);
+    assert!(again.changes.is_empty(), "{:?}", again.changes);
+
+    // And re-ordered from the draft alone, as an index change.
+    let mut d = TableDraft::from_table(&t2);
+    let at = d
+        .indexes
+        .iter()
+        .position(|i| i.info.name == "occi")
+        .unwrap();
+    d.indexes[at].info.order = vec!["a".into()];
+    apply_draft(&s, &t2, &d).await;
+    assert_eq!(ix(&read_table(&s, "o").await, "occi").order, vec!["a"]);
+
+    // **A nonclustered one is ordered from 2025 on** — 2022 refuses its
+    // `ORDER` by name (Msg 35342), the server's answer to give.
+    let major: u32 = s
+        .scalar("SELECT CAST(SERVERPROPERTY('ProductMajorVersion') AS int)")
+        .await
+        .parse()
+        .expect("a major version");
+    let edition = s
+        .scalar("SELECT CAST(SERVERPROPERTY('EngineEdition') AS int)")
+        .await;
+    if major >= 17 || edition == "5" {
+        let t = read_table(&s, "n").await;
+        let mut d = TableDraft::from_table(&t);
+        let mut ordered = schemaic_core::schema::IndexInfo {
+            name: "oncci".into(),
+            columns: vec![IndexColumn::plain("a"), IndexColumn::plain("b")],
+            order: vec!["b".into()],
+            ..Default::default()
+        };
+        IndexStorage::Columnstore.apply(&mut ordered);
+        d.indexes.retain(|i| !i.info.is_columnstore());
+        d.indexes.push(schemaic_core::ddl::IndexDraft::new(ordered));
+        let stmts = apply_draft(&s, &t, &d).await;
+        let read = ix(&read_table(&s, "n").await, "oncci");
+        assert_eq!(read.order, vec!["b"], "{stmts:#?}");
+        assert!(!read.is_clustered_columnstore() && !read.lossy, "{read:?}");
+    }
 }
 
 /// **A key finds its row whatever its type** — as the grid read it back: a

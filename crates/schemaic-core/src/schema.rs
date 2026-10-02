@@ -176,6 +176,13 @@ pub const TSQL_XML: &str = "XML";
 /// <tessellation> WITH (…)`, the clause in [`IndexInfo::using`].
 pub const TSQL_SPATIAL: &str = "SPATIAL";
 
+/// SQL Server's selective XML index — `CREATE SELECTIVE XML INDEX ix ON t
+/// (xml_column) [WITH XMLNAMESPACES (…)] FOR (path = '…' [AS …], …)`, the
+/// clause from `WITH XMLNAMESPACES` (or `FOR`) on in [`IndexInfo::using`]. A
+/// secondary index built on one is a [`TSQL_XML`] index whose clause names
+/// one of its paths: `USING XML INDEX [sxi] FOR ([path])`.
+pub const TSQL_SELECTIVE_XML: &str = "SELECTIVE XML";
+
 /// An index on a table (its ordered key columns).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct IndexInfo {
@@ -284,6 +291,13 @@ pub struct IndexInfo {
     /// designer — never a server value spliced unquoted. `None` everywhere
     /// else.
     pub using: Option<String>,
+    /// SQL Server's **ordered columnstore** (`ORDER ([b], [a])`): the columns
+    /// a columnstore index sorts its segments by, in that order — 2022 on for
+    /// a clustered one, 2025 on for a nonclustered one, whose `ORDER` names
+    /// only columns it stores (Msg 1911). Empty for an unordered columnstore
+    /// and for every other index; a column list, not text, so a column the
+    /// designer renames or drops is followed here as it is in `include`.
+    pub order: Vec<String>,
 }
 
 /// What a [`TableInfo`] actually **is** — the three answers
@@ -408,13 +422,26 @@ impl IndexInfo {
         self.is_columnstore() && self.clustered == Some(true)
     }
 
-    /// A SQL Server XML index, primary ([`TSQL_PRIMARY_XML`]) or secondary
-    /// ([`TSQL_XML`]), or a spatial one ([`TSQL_SPATIAL`]) — over one column,
-    /// never unique, filtered or covering.
+    /// A SQL Server XML index, primary ([`TSQL_PRIMARY_XML`]), selective
+    /// ([`TSQL_SELECTIVE_XML`]) or secondary ([`TSQL_XML`]), or a spatial one
+    /// ([`TSQL_SPATIAL`]) — over one column, never unique, filtered or
+    /// covering.
     pub fn is_tsql_xml_or_spatial(&self) -> bool {
         matches!(
             self.method.as_deref(),
-            Some(TSQL_PRIMARY_XML | TSQL_XML | TSQL_SPATIAL)
+            Some(TSQL_PRIMARY_XML | TSQL_SELECTIVE_XML | TSQL_XML | TSQL_SPATIAL)
+        )
+    }
+
+    /// An XML index a secondary one can be **built on** — a primary
+    /// ([`TSQL_PRIMARY_XML`]) or a selective ([`TSQL_SELECTIVE_XML`]) one. It
+    /// is created before every secondary, which names it and is refused
+    /// until it exists, and dropped after them, since dropping it drops them
+    /// (Msg 3701 on the secondary's own `DROP` after it).
+    pub fn is_tsql_xml_parent(&self) -> bool {
+        matches!(
+            self.method.as_deref(),
+            Some(TSQL_PRIMARY_XML | TSQL_SELECTIVE_XML)
         )
     }
 
@@ -5800,15 +5827,19 @@ impl TableInfo {
             "CREATE TABLE {qname} (\n{}\n){graph};",
             lines.join(",\n")
         ));
-        for ix in self
+        // An XML index's parent before the secondaries built on it, which name
+        // it: the catalogue lists indexes by name, and `IXML_…` sorts before
+        // the `PXML_…` it is built on. A stable sort, so the rest keep theirs.
+        let mut own: Vec<&IndexInfo> = self
             .indexes
             .iter()
             .filter(|ix| !ix.is_primary() && !(ix.unique && ix.constraint.is_some()))
-        {
+            .collect();
+        own.sort_by_key(|ix| !ix.is_tsql_xml_parent());
+        for ix in own {
             if ix.lossy {
                 out.push_str(&format!(
-                    "\n-- Index {} is a selective XML index or an ordered columnstore, or \
-                     another kind this script cannot restate; it is left out.",
+                    "\n-- Index {} is of a kind this script cannot restate; it is left out.",
                     crate::export::comment_text(&ix.name)
                 ));
                 continue;
@@ -9763,6 +9794,52 @@ mod tests {
         assert!(DbSchema::default().synonyms("main").is_empty());
     }
 
+    /// **Copy DDL writes an XML index's parent before the secondaries built on
+    /// it**, whatever their names: the catalogue lists indexes by name, so
+    /// AdventureWorks' `IXML_…` secondaries came before their `PXML_…`
+    /// primary, and the script failed on the first of them — the primary it
+    /// names did not exist yet.
+    #[test]
+    fn create_ddl_writes_an_xml_parent_before_its_secondaries() {
+        let doc = col("doc", "xml", true, false);
+        let xml = |name: &str, method: &str, using: Option<&str>| IndexInfo {
+            method: Some(method.into()),
+            using: using.map(str::to_string),
+            ..IndexInfo::plain(name, vec!["doc"], false)
+        };
+        let t = TableInfo {
+            schema: Some("dbo".into()),
+            name: "t".into(),
+            columns: vec![col("id", "int", false, true), doc],
+            indexes: vec![
+                IndexInfo::plain("PRIMARY", vec!["id"], true),
+                xml("a_path", TSQL_XML, Some("USING XML INDEX [p_xml] FOR PATH")),
+                xml(
+                    "b_sel2",
+                    TSQL_XML,
+                    Some("USING XML INDEX [s_sel] FOR ([a])"),
+                ),
+                xml("p_xml", TSQL_PRIMARY_XML, None),
+                xml(
+                    "s_sel",
+                    TSQL_SELECTIVE_XML,
+                    Some("FOR ([a] = N'/a' AS SQL int)"),
+                ),
+            ],
+            ..Default::default()
+        };
+        let ddl = t.create_ddl(crate::intel::SqlDialect::MsSql);
+        let at = |n: &str| ddl.find(n).unwrap_or_else(|| panic!("no {n}: {ddl}"));
+        assert!(at("INDEX [p_xml]") < at("INDEX [a_path]"), "{ddl}");
+        assert!(at("INDEX [s_sel]") < at("INDEX [b_sel2]"), "{ddl}");
+        assert!(
+            ddl.contains(
+                "CREATE SELECTIVE XML INDEX [s_sel] ON [dbo].[t] ([doc]) FOR ([a] = N'/a' AS SQL int);"
+            ),
+            "{ddl}"
+        );
+    }
+
     /// SQL Server's table is written in its own shape — `IDENTITY`, named
     /// constraints, a computed column's `AS (…) PERSISTED`, indexes as their
     /// own statements — and says what it could not restate.
@@ -9840,7 +9917,7 @@ mod tests {
             "{ddl}"
         );
         assert!(
-            ddl.contains("-- Index ix_xml is a selective XML index or an ordered columnstore"),
+            ddl.contains("-- Index ix_xml is of a kind this script cannot restate"),
             "{ddl}"
         );
         assert!(!ddl.contains("CREATE INDEX [ix_xml]"), "{ddl}");
