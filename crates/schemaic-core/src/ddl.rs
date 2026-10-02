@@ -9275,6 +9275,37 @@ impl IndexStorage {
         )
     }
 
+    /// Can an index of this kind be **unique**? The designer builds its
+    /// *Unique* toggle only where it can, as [`IndexStorage::apply`] clears
+    /// the flag everywhere else.
+    pub fn takes_unique(self) -> bool {
+        self == IndexStorage::Rowstore
+    }
+
+    /// Does this kind **name its columns**? Every kind but the clustered
+    /// columnstore, which stores them all; the designer builds its
+    /// *Columns* field only where it does.
+    pub fn takes_columns(self) -> bool {
+        self != IndexStorage::ClusteredColumnstore
+    }
+
+    /// Can this kind carry **included columns** ([`IndexInfo::include`])?
+    /// A rowstore index alone — and only where the engine has `INCLUDE`
+    /// ([`supports_index_include`]), which the designer asks as well.
+    pub fn takes_include(self) -> bool {
+        self == IndexStorage::Rowstore
+    }
+
+    /// [`IndexStorage::of`] as `dialect`'s designer reads it: a kind the
+    /// engine does not offer is a rowstore index there. MySQL's `SPATIAL`
+    /// index carries the `method` SQL Server's does, and read as SQL
+    /// Server's kind it was given T-SQL's *Using* field.
+    pub fn of_in(ix: &IndexInfo, dialect: SqlDialect) -> IndexStorage {
+        Some(IndexStorage::of(ix))
+            .filter(|k| k.offered(dialect))
+            .unwrap_or(IndexStorage::Rowstore)
+    }
+
     pub fn of(ix: &IndexInfo) -> IndexStorage {
         IndexStorage::ALL
             .into_iter()
@@ -18850,6 +18881,53 @@ mod tests {
                 ..Default::default()
             }),
             "Add index ix_lower on (lower(email))"
+        );
+    }
+
+    /// **The designer shows a field exactly where its value survives the
+    /// kind.** It built *Unique*, *Columns* and *Include* for every kind, so a
+    /// columnstore, XML or spatial index offered a toggle and lists `apply`
+    /// had just cleared — and a clustered columnstore index, which names no
+    /// columns, a Columns field. Asked of what `apply` leaves rather than
+    /// listed beside it, so the two cannot drift.
+    #[test]
+    fn each_kind_takes_exactly_the_fields_its_apply_keeps() {
+        for s in IndexStorage::ALL {
+            let mut ix = IndexInfo {
+                include: vec!["code".into()],
+                ..IndexInfo::plain("ix", vec!["qty", "code"], true)
+            };
+            s.apply(&mut ix);
+            assert_eq!(s.takes_unique(), ix.unique, "{s:?}");
+            assert_eq!(s.takes_columns(), !ix.columns.is_empty(), "{s:?}");
+            assert_eq!(s.takes_include(), !ix.include.is_empty(), "{s:?}");
+        }
+        assert!(IndexStorage::Columnstore.takes_columns());
+        assert!(!IndexStorage::ClusteredColumnstore.takes_columns());
+        assert!(IndexStorage::Spatial.takes_columns());
+    }
+
+    /// **A kind is read as the engine has it.** MySQL's `SPATIAL` index
+    /// carries the `method` SQL Server's does, so `of` alone made it SQL
+    /// Server's Spatial kind on MySQL — given T-SQL's Using field, and
+    /// would now lose its Unique toggle to a kind MySQL hasn't got.
+    #[test]
+    fn a_kind_the_engine_lacks_reads_as_rowstore() {
+        let spatial = IndexInfo {
+            method: Some(crate::schema::TSQL_SPATIAL.into()),
+            ..IndexInfo::plain("ix_g", vec!["g"], false)
+        };
+        assert_eq!(IndexStorage::of_in(&spatial, MsSql), IndexStorage::Spatial);
+        assert_eq!(IndexStorage::of_in(&spatial, MySql), IndexStorage::Rowstore);
+        let gin = IndexInfo {
+            method: Some("gin".into()),
+            ..IndexInfo::plain("ix_j", vec!["j"], false)
+        };
+        assert_eq!(IndexStorage::of_in(&gin, Postgres), IndexStorage::Rowstore);
+        let cs = columnstore(true, &[]);
+        assert_eq!(
+            IndexStorage::of_in(&cs, MsSql),
+            IndexStorage::ClusteredColumnstore
         );
     }
 

@@ -19900,8 +19900,18 @@ existing prose was left alone.
     kinds it offers — each family asking its own capability, `ddl::supports_columnstore` or
     `ddl::supports_xml_and_spatial_indexes`, SQL Server alone for both today — and maps through
     `ddl::IndexStorage`, whose `apply` also clears what the chosen kind cannot carry (under
-    `ddl.rs`). A *Using* field (tab 28) follows it, built only when `IndexStorage::of` the index
-    has a `using_example()` — a selective XML, a secondary XML or a spatial index — and typed as SQL
+    `ddl.rs`). **The form reads the kind as the engine has it** — `IndexStorage::of_in(ix,
+    dialect)`, a kind the engine does not offer being *Rowstore* — because MySQL's `SPATIAL` index
+    carries the `method` SQL Server's does, and read through `of` alone it was given T-SQL's *Using*
+    field (`a_kind_the_engine_lacks_reads_as_rowstore`). **Unique, Columns and Include are built
+    only for a kind that keeps them** — `takes_unique` and `takes_include` for a rowstore index
+    alone, `takes_columns` for every kind but the clustered columnstore, which stores every column
+    — so a columnstore, XML or spatial index no longer offers a toggle and lists its Storage choice
+    has just emptied. Each is pinned to what `apply` leaves, not listed beside it
+    (`each_kind_takes_exactly_the_fields_its_apply_keeps`). The *Columns* hint follows the kind
+    too: the one column an XML or spatial index is over, the columns a nonclustered columnstore
+    stores. A *Using* field (tab 28) follows the Storage dropdown, built only when the kind has a
+    `using_example()` — a selective XML, a secondary XML or a spatial index — and typed as SQL
     into `IndexInfo::using`, like a filter's predicate, its hint naming each clause shape, a
     secondary selective index's `FOR (path)` among them. **The placeholder is that example, so it
     follows the kind**: a selective index's field showed a secondary one's `USING XML INDEX … FOR
@@ -19909,8 +19919,8 @@ existing prose was left alone.
     for a columnstore index where `ddl::supports_columnstore_order` answers yes, and parsed through
     `ddl::parse_name_list` into `IndexInfo::order` as *Include* is; its hint names the versions
     that take one and the nonclustered index's stored-columns limit, which `validate` refuses
-    before the server does. **Both appear and go with the choice because a Storage change bumps
-    the form's `rev` and rebuilds it**,
+    before the server does. **They all appear and go with the choice because a Storage change
+    bumps the form's `rev` and rebuilds it**,
     the same rebuild that keeps the fields above from showing what `apply` just cleared. The
     foreign-key action dropdown lists
     `ddl::fk_actions` besides, which has no `RESTRICT` on SQL Server. The designer opens on an

@@ -1675,7 +1675,22 @@ fn index_form(d: DdlUi, target: &DesignerTarget, ring: FocusRing) -> AnyView {
     };
     let dialect = target.dialect;
     let pg = dialect == SqlDialect::Postgres;
-    let key_hint: &'static str = if ddl::supports_index_prefix(dialect) {
+    // **Unique, Columns and Include are built only for a kind that keeps
+    // them** (`IndexStorage::takes_*`, which agree with what `apply` clears):
+    // a columnstore, XML or spatial index offered a toggle and lists the
+    // Storage choice had just emptied. The form is rebuilt when Storage
+    // changes, so they come and go with it. Read as this engine has it
+    // (`of_in`): MySQL's spatial index carries SQL Server's spatial `method`.
+    use ddl::IndexStorage as K;
+    let kind = K::of_in(&ix, dialect);
+    let key_hint: &'static str = if matches!(
+        kind,
+        K::PrimaryXml | K::SelectiveXml | K::SecondaryXml | K::Spatial
+    ) {
+        "The one xml, geometry or geography column it indexes."
+    } else if kind == K::Columnstore {
+        "Comma-separated columns it stores."
+    } else if ddl::supports_index_prefix(dialect) {
         "Comma-separated, in key order. bio(20) is a prefix length; add DESC to sort down."
     } else {
         "Comma-separated, in key order. Add DESC for a descending column."
@@ -1744,7 +1759,7 @@ fn index_form(d: DdlUi, target: &DesignerTarget, ring: FocusRing) -> AnyView {
     let storage: AnyView = if kinds.len() > 1 {
         let draft = d.draft;
         let rev = d.rev;
-        let sig = floem::reactive::create_rw_signal(ddl::IndexStorage::of(&ix).label().to_string());
+        let sig = floem::reactive::create_rw_signal(kind.label().to_string());
         form_setting(
             "Storage",
             crate::table_designer::focusable_owned_dropdown(
@@ -1787,7 +1802,7 @@ fn index_form(d: DdlUi, target: &DesignerTarget, ring: FocusRing) -> AnyView {
     // Built only for those kinds; the form is rebuilt when Storage changes, so
     // it appears and goes with the choice.
     // Its example is its own kind's clause (`IndexStorage::using_example`).
-    let using: AnyView = if let Some(example) = ddl::IndexStorage::of(&ix).using_example() {
+    let using: AnyView = if let Some(example) = kind.using_example() {
         form_setting(
             "Using",
             field_with_hint(
@@ -1844,8 +1859,9 @@ fn index_form(d: DdlUi, target: &DesignerTarget, ring: FocusRing) -> AnyView {
         crate::widgets::nothing()
     };
 
-    // Built only where the engine has `INCLUDE`, for `pg_only`'s reason.
-    let include: AnyView = if ddl::supports_index_include(dialect) {
+    // Built only where the engine has `INCLUDE`, for `pg_only`'s reason, and
+    // the kind keeps one.
+    let include: AnyView = if ddl::supports_index_include(dialect) && kind.takes_include() {
         form_setting(
             "Include",
             field_with_hint(
@@ -1870,23 +1886,7 @@ fn index_form(d: DdlUi, target: &DesignerTarget, ring: FocusRing) -> AnyView {
         crate::widgets::nothing()
     };
 
-    v_stack((
-        form_setting(
-            "Name",
-            bound_field(
-                d.draft,
-                ix.name.clone(),
-                field_w,
-                "index_name",
-                ring.clone(),
-                10,
-                move |d, v| {
-                    if let Some(x) = d.indexes.get_mut(i) {
-                        x.info.name = v.trim().to_string();
-                    }
-                },
-            ),
-        ),
+    let columns: AnyView = if kind.takes_columns() {
         form_setting(
             "Columns",
             field_with_hint(
@@ -1905,24 +1905,54 @@ fn index_form(d: DdlUi, target: &DesignerTarget, ring: FocusRing) -> AnyView {
                 ),
                 key_hint,
             ),
-        ),
-        include,
-        storage,
-        using,
-        order,
+        )
+        .into_any()
+    } else {
+        crate::widgets::nothing()
+    };
+
+    let unique: AnyView = if kind.takes_unique() {
         bound_toggle(
             d.draft,
             "Unique",
             "Refuse duplicate values across these columns.",
             ix.unique,
-            ring,
+            ring.clone(),
             30,
             move |d, v| {
                 if let Some(x) = d.indexes.get_mut(i) {
                     x.info.unique = v;
                 }
             },
+        )
+        .into_any()
+    } else {
+        crate::widgets::nothing()
+    };
+
+    v_stack((
+        form_setting(
+            "Name",
+            bound_field(
+                d.draft,
+                ix.name.clone(),
+                field_w,
+                "index_name",
+                ring,
+                10,
+                move |d, v| {
+                    if let Some(x) = d.indexes.get_mut(i) {
+                        x.info.name = v.trim().to_string();
+                    }
+                },
+            ),
         ),
+        columns,
+        include,
+        storage,
+        using,
+        order,
+        unique,
         pg_only,
     ))
     .style(|s| {
