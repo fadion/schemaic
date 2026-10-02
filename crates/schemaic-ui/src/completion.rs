@@ -366,6 +366,29 @@ mod index {
                         }
                     }
                 }
+                // A SQL Server synonym is offered as a table, with its target's
+                // columns where the target is this database's own table
+                // (`DbSchema::synonyms`), none otherwise.
+                for (syn, target) in schema.synonyms(&node.database) {
+                    by_db.push(syn.name.clone());
+                    let name_lower = syn.name.to_ascii_lowercase();
+                    let metas = target.and_then(|t| {
+                        columns_by_db
+                            .get(&(db_lower.clone(), t.name.to_ascii_lowercase()))
+                            .cloned()
+                    });
+                    if let Some(m) = &metas {
+                        columns_by_db.insert((db_lower.clone(), name_lower.clone()), m.clone());
+                    }
+                    if in_scope {
+                        tables.push((syn.name.clone(), node.database.clone()));
+                        if let Some(m) = metas {
+                            columns
+                                .entry(name_lower)
+                                .or_insert_with(|| m.iter().cloned().collect());
+                        }
+                    }
+                }
             }
         }
         SchemaIndex {
@@ -2105,6 +2128,51 @@ mod index_tests {
             ["id", "total", "vat"],
             "the shared `id` is not doubled"
         );
+    }
+
+    /// **A SQL Server synonym is offered as a table**, with its target's
+    /// columns where the target is this database's own table
+    /// (`DbSchema::synonyms`) and none otherwise — it was not offered at
+    /// all, being held apart from `tables`.
+    #[test]
+    fn a_synonym_is_offered_with_its_targets_columns() {
+        use schemaic_core::schema::{TsqlObject, TsqlObjectKind};
+        let syn = |name: &str, target: &[&str]| TsqlObject {
+            schema: Some("dbo".into()),
+            name: name.into(),
+            kind: TsqlObjectKind::Synonym {
+                target: target.iter().map(|s| s.to_string()).collect(),
+            },
+        };
+        let mut docs = tbl("docs", &["id", "c"], None);
+        docs.schema = Some("dbo".into());
+        let nodes = [LoadedNode {
+            database: "main".into(),
+            schema: Some(Arc::new(DbSchema {
+                tables: vec![docs],
+                tsql_objects: vec![
+                    syn("docs_syn", &["dbo", "docs"]),
+                    syn("far_syn", &["other", "dbo", "t"]),
+                ],
+                ..Default::default()
+            })),
+        }];
+        let ix = index::build(&nodes, &HashSet::new(), Some("main"));
+        for name in ["docs_syn", "far_syn"] {
+            assert!(
+                ix.tables.iter().any(|(t, _)| t == name),
+                "{name}: {:?}",
+                ix.tables
+            );
+            assert!(ix.tables_by_db["main"].iter().any(|t| t == name));
+        }
+        let names = |cols: &[ColMeta]| cols.iter().map(|c| c.name.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&ix.columns["docs_syn"]), ["id", "c"]);
+        assert_eq!(
+            names(&ix.columns_by_db[&("main".to_string(), "docs_syn".to_string())]),
+            ["id", "c"]
+        );
+        assert!(!ix.columns.contains_key("far_syn"));
     }
 
     /// The database list dedupes case-insensitively — two connections onto the

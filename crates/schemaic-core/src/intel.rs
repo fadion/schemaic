@@ -4564,9 +4564,18 @@ pub struct Catalog {
     loaded_dbs: HashSet<String>,
     /// The active database (lower), if any.
     active_db: Option<String>,
-    /// All known identifier names (lower) — dbs + tables + columns — used to keep
-    /// the keyword-typo check from flagging real schema names.
+    /// All known identifier names (lower) — databases, tables, columns,
+    /// namespaces, stored routines and SQL Server synonyms — used to keep the
+    /// keyword- and function-typo checks from flagging real schema names.
     known_idents: HashSet<String>,
+    /// Relations known by name whose columns are not: a SQL Server synonym
+    /// over anything but this database's own table ([`DbSchema::synonyms`]).
+    /// Keyed `(qualifier_lower, name_lower)` under its database and its
+    /// schema both, as `qualified` and `schema_qualified` are. A hit is
+    /// `Found` with no columns, which the column checks read as "can't judge".
+    opaque_qualified: HashSet<(String, String)>,
+    /// [`Catalog::opaque_qualified`]'s bare names, active-db scoped.
+    opaque_unqualified: HashSet<String>,
 }
 
 /// A memo over [`Catalog::build`], keyed on the **identity** of the schemas the
@@ -4703,6 +4712,8 @@ impl Catalog {
         let mut pks: HashMap<String, Vec<String>> = HashMap::new();
         let mut loaded_dbs = HashSet::new();
         let mut known_idents = HashSet::new();
+        let mut opaque_qualified = HashSet::new();
+        let mut opaque_unqualified = HashSet::new();
         let active_lower = active_db.map(|d| d.to_ascii_lowercase());
         for (db, schema) in loaded {
             let db_lower = db.to_ascii_lowercase();
@@ -4779,6 +4790,38 @@ impl Catalog {
                     }
                 }
             }
+            // **A SQL Server synonym is a relation too.** It is held apart
+            // from `tables` (`DbSchema::tsql_objects`), so a query through one
+            // was "Table not found". One over this database's own table
+            // carries its columns; any other is known by name alone.
+            for (syn, target) in schema.synonyms(db) {
+                let name_lower = syn.name.to_ascii_lowercase();
+                known_idents.insert(name_lower.clone());
+                let ns_lower = syn.schema.as_deref().map(str::to_ascii_lowercase);
+                match target {
+                    Some(t) => {
+                        let cols: Vec<String> = t.columns.iter().map(|c| c.name.clone()).collect();
+                        qualified.insert((db_lower.clone(), name_lower.clone()), cols.clone());
+                        if in_scope {
+                            if let Some(ns) = ns_lower {
+                                known_schemas.insert(ns.clone());
+                                schema_qualified.insert((ns, name_lower.clone()), cols.clone());
+                            }
+                            unqualified.entry(name_lower).or_insert(cols);
+                        }
+                    }
+                    None => {
+                        opaque_qualified.insert((db_lower.clone(), name_lower.clone()));
+                        if in_scope {
+                            if let Some(ns) = ns_lower {
+                                known_schemas.insert(ns.clone());
+                                opaque_qualified.insert((ns, name_lower.clone()));
+                            }
+                            opaque_unqualified.insert(name_lower);
+                        }
+                    }
+                }
+            }
         }
         Catalog {
             qualified,
@@ -4790,6 +4833,8 @@ impl Catalog {
             loaded_dbs,
             active_db: active_lower,
             known_idents,
+            opaque_qualified,
+            opaque_unqualified,
         }
     }
 
@@ -4816,7 +4861,10 @@ impl Catalog {
                 // PostgreSQL. Try both: whichever namespace the qualifier names
                 // decides, and a hit in either is a hit.
                 let key = (db_lower.clone(), table_lower);
-                if self.qualified.contains_key(&key) || self.schema_qualified.contains_key(&key) {
+                if self.qualified.contains_key(&key)
+                    || self.schema_qualified.contains_key(&key)
+                    || self.opaque_qualified.contains(&key)
+                {
                     return TableStatus::Found;
                 }
                 // Only a qualifier we've actually introspected can be judged
@@ -4831,7 +4879,10 @@ impl Catalog {
                 if !self.unqualified_db_loaded() {
                     return TableStatus::Unknown;
                 }
-                if self.unqualified.contains_key(&r.name.to_ascii_lowercase()) {
+                let name_lower = r.name.to_ascii_lowercase();
+                if self.unqualified.contains_key(&name_lower)
+                    || self.opaque_unqualified.contains(&name_lower)
+                {
                     TableStatus::Found
                 } else {
                     TableStatus::NotFound
@@ -16765,6 +16816,60 @@ mod tests {
                 "{dialect:?}: {d:?}"
             );
         }
+    }
+
+    /// **A SQL Server synonym is a relation the catalogue knows.** It lives in
+    /// `DbSchema::tsql_objects`, not `tables`, so `SELECT id FROM
+    /// dbo.docs_syn` was ``Table `docs_syn` not found in `dbo`` under a
+    /// synonym the schema tree listed one row away (seen in the app on 2022).
+    /// One over this database's own table carries that table's columns, so a
+    /// wrong column through it is still reported; one over anything else —
+    /// another database, a linked server, a routine — is known by name and
+    /// its columns are not judged.
+    #[test]
+    fn a_synonym_is_a_relation_with_its_targets_columns() {
+        use crate::schema::{TsqlObject, TsqlObjectKind};
+        let syn = |name: &str, target: &[&str]| TsqlObject {
+            schema: Some("dbo".into()),
+            name: name.into(),
+            kind: TsqlObjectKind::Synonym {
+                target: target.iter().map(|s| s.to_string()).collect(),
+            },
+        };
+        let schema = DbSchema {
+            tables: vec![tbl_in("dbo", "docs", &["id", "c"])],
+            tsql_objects: vec![
+                syn("docs_syn", &["dbo", "docs"]),
+                syn("far_syn", &["otherdb", "dbo", "t"]),
+            ],
+            ..Default::default()
+        };
+        let cat = Catalog::build(&[("gui_main", &schema)], Some("gui_main"));
+        let messages = |sql: &str| -> Vec<String> {
+            diagnostics(sql, &cat, SqlDialect::MsSql)
+                .into_iter()
+                .map(|x| x.message)
+                .collect()
+        };
+        for sql in [
+            "SELECT id, c FROM dbo.docs_syn;",
+            "SELECT id, c FROM docs_syn;",
+            "SELECT s.c FROM docs_syn s;",
+            "SELECT anything FROM dbo.far_syn;",
+            "SELECT f.anything FROM far_syn f;",
+            "SELECT id FROM gui_main.dbo.docs_syn;",
+        ] {
+            assert!(messages(sql).is_empty(), "{sql}: {:?}", messages(sql));
+        }
+        assert_eq!(
+            messages("SELECT s.nope FROM dbo.docs_syn s;"),
+            ["Column `nope` not found in `docs_syn`"]
+        );
+        // A name that is neither is still missing.
+        assert_eq!(
+            messages("SELECT id FROM dbo.no_syn;"),
+            ["Table `no_syn` not found in `dbo`"]
+        );
     }
 
     /// **A T-SQL three-part name is `database.schema.table`.** It was read as

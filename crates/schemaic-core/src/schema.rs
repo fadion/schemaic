@@ -6516,6 +6516,50 @@ impl DbSchema {
         self.tables.len()
     }
 
+    /// Each SQL Server synonym in this schema (read from `database`), with
+    /// the table or view it stands for **when that is one of this database's
+    /// own** — what the editor's catalogue and completion index know it by.
+    ///
+    /// The target is `[schema, object]`, or `[database, schema, object]`
+    /// naming this database. With no schema written (`[object]`, or
+    /// `db..object`) the server resolves it by the *caller's* default schema,
+    /// which nothing here knows, so it resolves only to the one table of that
+    /// name. Anything else — another database, a linked server, a routine, a
+    /// synonym of a synonym — is `None`: the synonym is a name whose columns
+    /// cannot be judged, since a guessed table would report columns it has
+    /// not got.
+    pub fn synonyms(&self, database: &str) -> Vec<(&TsqlObject, Option<&TableInfo>)> {
+        let named = |schema: &str, object: &str| -> Option<&TableInfo> {
+            let mut hits = self.tables.iter().filter(|t| {
+                t.name.eq_ignore_ascii_case(object)
+                    && (schema.is_empty()
+                        || t.schema
+                            .as_deref()
+                            .unwrap_or(MSSQL_DEFAULT_SCHEMA)
+                            .eq_ignore_ascii_case(schema))
+            });
+            let hit = hits.next()?;
+            hits.next().is_none().then_some(hit)
+        };
+        self.tsql_objects
+            .iter()
+            .filter_map(|o| match &o.kind {
+                TsqlObjectKind::Synonym { target } => {
+                    let table = match target.as_slice() {
+                        [object] => named("", object),
+                        [schema, object] => named(schema, object),
+                        [db, schema, object] if db.eq_ignore_ascii_case(database) => {
+                            named(schema, object)
+                        }
+                        _ => None,
+                    };
+                    Some((o, table))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The enum type with this `(namespace, name)` identity, on the same
     /// name-falls-back-to-`public` rule as [`DbSchema::find_table`].
     pub fn find_enum(&self, schema: Option<&str>, name: &str) -> Option<&EnumInfo> {
@@ -9655,6 +9699,68 @@ mod tests {
             ),
             "{ddl}"
         );
+    }
+
+    /// **A synonym stands for one of this database's tables only where the
+    /// target names it unambiguously** — `[schema, object]`, this database's
+    /// three-part name, or a bare name only one table has — and for nothing
+    /// otherwise: another database, a linked server, an object that is not a
+    /// table, or a bare name two schemas share.
+    #[test]
+    fn a_synonym_resolves_to_its_local_table_or_to_nothing() {
+        let syn = |name: &str, target: &[&str]| TsqlObject {
+            schema: Some("dbo".into()),
+            name: name.into(),
+            kind: TsqlObjectKind::Synonym {
+                target: target.iter().map(|s| s.to_string()).collect(),
+            },
+        };
+        let in_ns = |ns: &str, name: &str| TableInfo {
+            schema: Some(ns.into()),
+            name: name.into(),
+            ..Default::default()
+        };
+        let schema = DbSchema {
+            tables: vec![
+                in_ns("dbo", "docs"),
+                in_ns("sales", "orders"),
+                in_ns("dbo", "dup"),
+                in_ns("sales", "dup"),
+            ],
+            tsql_objects: vec![
+                syn("a", &["dbo", "docs"]),
+                syn("b", &["Main", "Sales", "ORDERS"]),
+                syn("c", &["orders"]),
+                syn("d", &["main", "", "docs"]),
+                syn("e", &["other", "dbo", "docs"]),
+                syn("f", &["srv", "main", "dbo", "docs"]),
+                syn("g", &["dbo", "some_proc"]),
+                syn("h", &["dup"]),
+                syn("i", &["sales", "docs"]),
+            ],
+            ..Default::default()
+        };
+        let got: Vec<(String, Option<String>)> = schema
+            .synonyms("main")
+            .into_iter()
+            .map(|(o, t)| (o.name.clone(), t.map(|t| t.name.clone())))
+            .collect();
+        let want: Vec<(String, Option<String>)> = [
+            ("a", Some("docs")),
+            ("b", Some("orders")),
+            ("c", Some("orders")),
+            ("d", Some("docs")),
+            ("e", None),
+            ("f", None),
+            ("g", None),
+            ("h", None),
+            ("i", None),
+        ]
+        .into_iter()
+        .map(|(n, t)| (n.to_string(), t.map(str::to_string)))
+        .collect();
+        assert_eq!(got, want);
+        assert!(DbSchema::default().synonyms("main").is_empty());
     }
 
     /// SQL Server's table is written in its own shape — `IDENTITY`, named

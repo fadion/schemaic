@@ -1169,6 +1169,18 @@ existing prose was left alone.
     names the engine's quote (backticks, double quotes, brackets); it said "backticks" on every
     engine, advice neither PostgreSQL nor SQL Server accepts
     (`a_reserved_alias_error_names_this_engines_quote`).
+    **A SQL Server synonym is a relation to the catalogue.** It lives in `DbSchema::tsql_objects`,
+    not `tables`, so `SELECT id FROM dbo.docs_syn` was ``Table `docs_syn` not found in `dbo``` under
+    a synonym the schema tree listed one row away (seen in the app on 2022). `Catalog::build` reads
+    `DbSchema::synonyms` (under `schema.rs`): one resolved to this database's own table or view goes
+    into `qualified`, `schema_qualified` and `unqualified` with the **target's** columns, so a wrong
+    column through it is still reported; one that is not — another database, a linked server, a
+    routine, an ambiguous bare target — goes into `opaque_qualified` (keyed under its database and
+    its schema both, as the other two maps are) or `opaque_unqualified`, which `table_status` answers
+    `Found` while `columns_of` stays `None`, and the column checks read that as can't-judge. That is
+    the three-part name's rule again: a relation whose columns are unknown may let a wrong column
+    through but must never report a real one missing
+    (`a_synonym_is_a_relation_with_its_targets_columns`, red before).
     **`NON_RESERVED_KEYWORDS` is legal keywords one edit from a curated one**, which the typo
     checker would otherwise flag. It is dialect-free, since each is legal on some engine here and
     which engine has which is `builtin_catalog`'s half of the question. The list was widened by
@@ -1250,8 +1262,8 @@ existing prose was left alone.
     `is_reserved_word` with the server's answer to `SELECT 1 AS <word>`.
     **The checker's exemption set is the other half of "a name this engine really has", and an
     extension's functions fell straight through it.** `function_typo_checks` passes anything in the
-    catalog's `known_idents` — databases, tables, columns, namespaces and the schema's stored
-    routines — and that set is built from what the tree lists. `pg::routine_filter`
+    catalog's `known_idents` — databases, tables, columns, namespaces, the schema's stored
+    routines and SQL Server's synonyms — and that set is built from what the tree lists. `pg::routine_filter`
     deliberately keeps an extension's functions *out* of the tree (PostGIS alone installs ~1,000
     `st_*` into `public`, and that decision stands), so an extension function was not merely absent
     from the tree: it was **squiggled as a misspelling under correct SQL**, which is the exact
@@ -9434,6 +9446,18 @@ existing prose was left alone.
     `TsqlObject::create_sql`, so a row's script and the dump's statement are one
     (`each_object_is_browsed_and_found_as_its_kind`; live,
     `standalone_objects_are_browsed_and_dropped`).
+    **`DbSchema::synonyms(database)` is what a synonym stands for, to the editor** — each synonym
+    with the local table or view behind it, which the catalogue and the completion index both read
+    (under `intel.rs` and `completion.rs`). A synonym lives in `tsql_objects`, not `tables`, so to
+    either it was no relation at all. The target resolves when it is `[schema, object]`,
+    `[database, schema, object]` naming the database the schema was read from, or a bare `[object]`
+    (or `db..object`) that **exactly one** table has — the server resolves an unqualified target
+    by the *caller's* default schema, which nothing here knows, so two candidates are no answer.
+    Anything else is `None`: another database, a linked server, a routine, a synonym of a synonym,
+    an ambiguous bare name. `None` is deliberate rather than a gap to fill with a best guess — a
+    guessed table would report columns the real target has not got, and the readers take `None`
+    as a name whose columns cannot be judged
+    (`a_synonym_resolves_to_its_local_table_or_to_nothing`).
     **`DbSchema::database` is the schema's own address, and deliberately not part of the schema.**
     It is *not* stamped onto the objects in it — `TableInfo::schema` is `None` on MySQL precisely
     because a database *is* its namespace there — and it rides on the struct because exactly one
@@ -21173,6 +21197,15 @@ existing prose was left alone.
     `entry.is_empty()` fast path exists to keep the ordinary case out of the quadratic merge and only
     the *second* table takes it; and the database list dedupes case-insensitively, so two connections
     onto one server spelling a database differently are one row in the popup.
+    **A SQL Server synonym is offered as a table** — it was not offered at all, being held in
+    `tsql_objects` apart from `tables`. `index::build` reads `DbSchema::synonyms` (under
+    `schema.rs`) and puts each into `tables_by_db`, and into `tables` where its database is in
+    scope; one resolved to this database's own table or view shares that table's `ColMeta`s in
+    `columns_by_db` and `columns`, and any other gets none rather than a guessed table's
+    (`a_synonym_is_offered_with_its_targets_columns`, red before). The
+    synonym loop runs **after** the tables loop on purpose: it takes the target's columns out of
+    `columns_by_db` by cloning the `Rc` the table just inserted, so moved ahead of it every synonym
+    would silently lose its columns.
   - `tabs.rs` — query-tab strip, and where a **`.sql`-backed tab** shows itself. The state behind
     that is four signals on `Tab`: `path`, `disk_sql` (the file's text as of the last open / save /
     reload — `None` means *unknown*, which reads as modified, the safe direction), `file_format`
