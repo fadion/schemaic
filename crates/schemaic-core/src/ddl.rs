@@ -3796,12 +3796,33 @@ impl Change {
                     to.join(", ")
                 ),
             },
-            Change::AddIndex(ix) => format!(
-                "Add {}index {} on ({})",
-                if ix.unique { "unique " } else { "" },
-                ix.name,
-                ix.column_names().collect::<Vec<_>>().join(", ")
-            ),
+            // Every list the statement carries, and its kind: a line that
+            // left one out read the same before and after an edit of it. A
+            // clustered columnstore index stores every column and names
+            // none, so it has no `on (…)` at all; an expression key is shown
+            // as its SQL, which is what `name` holds for one.
+            Change::AddIndex(ix) => {
+                let mut s = format!("Add {}", if ix.unique { "unique " } else { "" });
+                if let Some(kind) = IndexStorage::of(ix).summary_noun() {
+                    s.push_str(kind);
+                    s.push(' ');
+                }
+                s.push_str(&format!("index {}", ix.name));
+                let list = |names: Vec<&str>| names.join(", ");
+                if !ix.columns.is_empty() {
+                    let keys = ix.columns.iter().map(|c| c.name.as_str()).collect();
+                    s.push_str(&format!(" on ({})", list(keys)));
+                }
+                if !ix.include.is_empty() {
+                    let cols = ix.include.iter().map(String::as_str).collect();
+                    s.push_str(&format!(" including ({})", list(cols)));
+                }
+                if !ix.order.is_empty() {
+                    let cols = ix.order.iter().map(String::as_str).collect();
+                    s.push_str(&format!(" ordered by ({})", list(cols)));
+                }
+                s
+            }
             Change::DropIndex { name, .. } => format!("Drop index {name}"),
             Change::KeepLossyIndex { name } => {
                 format!("Leave index {name} unchanged — Schemaic can't read all of it")
@@ -9183,6 +9204,20 @@ impl IndexStorage {
             IndexStorage::SelectiveXml => "Selective XML",
             IndexStorage::SecondaryXml => "Secondary XML",
             IndexStorage::Spatial => "Spatial",
+        }
+    }
+
+    /// The words before *index* in the preview's line for one of this kind
+    /// (`Change::summary`) — `None` for a rowstore index, the plain kind.
+    pub fn summary_noun(self) -> Option<&'static str> {
+        match self {
+            IndexStorage::Rowstore => None,
+            IndexStorage::Columnstore => Some("columnstore"),
+            IndexStorage::ClusteredColumnstore => Some("clustered columnstore"),
+            IndexStorage::PrimaryXml => Some("primary XML"),
+            IndexStorage::SelectiveXml => Some("selective XML"),
+            IndexStorage::SecondaryXml => Some("secondary XML"),
+            IndexStorage::Spatial => Some("spatial"),
         }
     }
 
@@ -18753,6 +18788,69 @@ mod tests {
         for d in [MySql, Sqlite] {
             assert!(!supports_index_include(d), "{d:?}");
         }
+    }
+
+    /// **The preview's line for an added index says what the statement
+    /// does.** A clustered columnstore index names no columns, so it read
+    /// *"Add index ix_cs on ()"*; an expression key was skipped, so a
+    /// PostgreSQL expression index read the same; and included columns, a
+    /// columnstore's order and every non-rowstore kind went unmentioned, so
+    /// an edit of any of them previewed as a drop and an add of the same
+    /// line.
+    #[test]
+    fn an_added_index_is_summarised_with_its_kind_and_columns() {
+        let summary = |ix: IndexInfo| Change::AddIndex(Box::new(ix)).summary();
+        assert_eq!(
+            summary(IndexInfo::plain("ix_a", vec!["a", "b"], false)),
+            "Add index ix_a on (a, b)"
+        );
+        assert_eq!(
+            summary(IndexInfo::plain("uq_c", vec!["c"], true)),
+            "Add unique index uq_c on (c)"
+        );
+        assert_eq!(
+            summary(covering(&["code", "id"])),
+            "Add index ix_cover on (qty) including (code, id)"
+        );
+        assert_eq!(
+            summary(columnstore(true, &[])),
+            "Add clustered columnstore index ix_cs"
+        );
+        assert_eq!(
+            summary(IndexInfo {
+                order: vec!["qty".into()],
+                ..columnstore(false, &["qty", "code"])
+            }),
+            "Add columnstore index ix_cs on (qty, code) ordered by (qty)"
+        );
+        let xml = |method: &str| IndexInfo {
+            method: Some(method.into()),
+            ..IndexInfo::plain("ix_x", vec!["doc"], false)
+        };
+        assert_eq!(
+            summary(xml(crate::schema::TSQL_PRIMARY_XML)),
+            "Add primary XML index ix_x on (doc)"
+        );
+        assert_eq!(
+            summary(xml(crate::schema::TSQL_SELECTIVE_XML)),
+            "Add selective XML index ix_x on (doc)"
+        );
+        assert_eq!(
+            summary(xml(crate::schema::TSQL_XML)),
+            "Add secondary XML index ix_x on (doc)"
+        );
+        assert_eq!(
+            summary(xml(crate::schema::TSQL_SPATIAL)),
+            "Add spatial index ix_x on (doc)"
+        );
+        assert_eq!(
+            summary(IndexInfo {
+                name: "ix_lower".into(),
+                columns: vec![crate::schema::IndexColumn::expr("lower(email)")],
+                ..Default::default()
+            }),
+            "Add index ix_lower on (lower(email))"
+        );
     }
 
     fn columnstore(clustered: bool, cols: &[&str]) -> IndexInfo {
