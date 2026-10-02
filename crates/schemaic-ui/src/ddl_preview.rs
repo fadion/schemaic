@@ -1030,11 +1030,15 @@ pub(crate) fn ddl_preview_overlay(
                     // the app uses for text. Monospace, because this is the one
                     // place the user reads generated SQL closely — aligned
                     // columns are how a stray clause gets spotted before Apply.
+                    // **Wrapped**, though, for the same reason: unwrapped, a long
+                    // statement (a selective XML index's paths, a rebuild's
+                    // column list) ran past the box's edge, and an `edit_field`
+                    // has no wheel to scroll it sideways — the end of the line,
+                    // where a stray clause would be, could not be read at all.
                     edit_field(
                         d.sql,
                         FieldCfg {
                             multiline: true,
-                            no_wrap: true,
                             read_only: true,
                             mono: true,
                             font_size: theme::font_body,

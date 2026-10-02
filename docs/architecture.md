@@ -19865,6 +19865,10 @@ existing prose was left alone.
     It also owns two things the other editors reuse: `list_pane` — the list-plus-action-bar that
     is **one** Tab stop with Up/Down inside it (over `widgets::list_step`) — and
     `focusable_owned_dropdown`, the picker for a value that isn't `Copy`.
+    The preview's SQL box is a read-only monospace `edit_field` that **wraps**: it was `no_wrap`,
+    and an `edit_field` has no wheel to scroll sideways (only the editor pane wires Shift+wheel, see
+    the Floem gotchas), so the end of a long statement — a selective XML index's paths, a rebuild's
+    column list — ran past the box's edge and could not be read before Apply.
     `preview_proposal` is the AI's way in, beside `preview_change`'s: it seeds from `loaded_table`
     like every editor, applies the ops with `propose::apply`, diffs against
     `Target::new(dialect, db_flavour(…))` — the flavour matters, or the same change would preview
