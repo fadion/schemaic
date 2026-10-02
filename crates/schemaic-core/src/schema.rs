@@ -156,11 +156,25 @@ impl IndexColumn {
     }
 }
 
-/// SQL Server's **columnstore** index, as [`IndexInfo::method`] holds it — the
-/// one T-SQL index kind beyond the rowstore that the model states. Its own
-/// spelling rather than PostgreSQL's access-method names, and written only
-/// by SQL Server's emitters (`CREATE [NON]CLUSTERED COLUMNSTORE INDEX`).
+/// SQL Server's **columnstore** index, as [`IndexInfo::method`] holds it — one
+/// of the T-SQL index kinds beyond the rowstore the model states, with the XML
+/// and spatial ones below. Its own spelling rather than PostgreSQL's
+/// access-method names, and written only by SQL Server's emitters (`CREATE
+/// [NON]CLUSTERED COLUMNSTORE INDEX`).
 pub const TSQL_COLUMNSTORE: &str = "COLUMNSTORE";
+
+/// SQL Server's primary XML index, as [`IndexInfo::method`] holds it — `CREATE
+/// PRIMARY XML INDEX ix ON t (xml_column)`.
+pub const TSQL_PRIMARY_XML: &str = "PRIMARY XML";
+
+/// SQL Server's secondary XML index — `CREATE XML INDEX ix ON t (xml_column)
+/// USING XML INDEX primary FOR PATH|VALUE|PROPERTY`, the clause in
+/// [`IndexInfo::using`].
+pub const TSQL_XML: &str = "XML";
+
+/// SQL Server's spatial index — `CREATE SPATIAL INDEX ix ON t (column) USING
+/// <tessellation> WITH (…)`, the clause in [`IndexInfo::using`].
+pub const TSQL_SPATIAL: &str = "SPATIAL";
 
 /// An index on a table (its ordered key columns).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -261,6 +275,15 @@ pub struct IndexInfo {
     /// already is (Msg 1902). Without the field, a clustered index other than
     /// the key's could only be withheld as [`IndexInfo::lossy`].
     pub clustered: Option<bool>,
+    /// SQL Server's clause **after the column list** of an XML or spatial
+    /// index ([`IndexInfo::is_tsql_xml_or_spatial`]): a secondary XML index's
+    /// `USING XML INDEX [primary] FOR PATH`, a spatial one's `USING
+    /// GEOMETRY_GRID WITH (BOUNDING_BOX = (…), GRIDS = (…),
+    /// CELLS_PER_OBJECT = n)`. T-SQL text, composed by the reader from the
+    /// catalogue's numbers with every option restated, or typed in the
+    /// designer — never a server value spliced unquoted. `None` everywhere
+    /// else.
+    pub using: Option<String>,
 }
 
 /// What a [`TableInfo`] actually **is** — the three answers
@@ -383,6 +406,16 @@ impl IndexInfo {
     /// ON t`, with no column list: it stores every column of the table.
     pub fn is_clustered_columnstore(&self) -> bool {
         self.is_columnstore() && self.clustered == Some(true)
+    }
+
+    /// A SQL Server XML index, primary ([`TSQL_PRIMARY_XML`]) or secondary
+    /// ([`TSQL_XML`]), or a spatial one ([`TSQL_SPATIAL`]) — over one column,
+    /// never unique, filtered or covering.
+    pub fn is_tsql_xml_or_spatial(&self) -> bool {
+        matches!(
+            self.method.as_deref(),
+            Some(TSQL_PRIMARY_XML | TSQL_XML | TSQL_SPATIAL)
+        )
     }
 
     /// ` INCLUDE ([a], [b])` — the clause after the key list, with its leading
@@ -5620,8 +5653,7 @@ impl TableInfo {
                     .join("\nGO\n");
             for ix in draft.options.tsql.indexes.iter().filter(|ix| ix.lossy) {
                 out.push_str(&format!(
-                    "\n-- Index {} is an XML or spatial index, or another kind this script \
-                     cannot restate; it is left out.",
+                    "\n-- Index {} is of a kind this script cannot restate; it is left out.",
                     crate::export::comment_text(&ix.name)
                 ));
             }
@@ -5775,8 +5807,8 @@ impl TableInfo {
         {
             if ix.lossy {
                 out.push_str(&format!(
-                    "\n-- Index {} is an XML or spatial index, or another kind this script \
-                     cannot restate; it is left out.",
+                    "\n-- Index {} is a selective XML index or an ordered columnstore, or \
+                     another kind this script cannot restate; it is left out.",
                     crate::export::comment_text(&ix.name)
                 ));
                 continue;
@@ -9702,7 +9734,7 @@ mod tests {
             "{ddl}"
         );
         assert!(
-            ddl.contains("-- Index ix_xml is an XML or spatial index"),
+            ddl.contains("-- Index ix_xml is a selective XML index or an ordered columnstore"),
             "{ddl}"
         );
         assert!(!ddl.contains("CREATE INDEX [ix_xml]"), "{ddl}");
@@ -10235,8 +10267,7 @@ mod tests {
                  SELECT id, d FROM dbo.t;\nGO\n\
                  CREATE UNIQUE CLUSTERED INDEX [cix] ON [dbo].[v] ([id]);\nGO\n\
                  CREATE INDEX [nix] ON [dbo].[v] ([d]);\n\
-                 -- Index inc is an XML or spatial index, or another kind this script \
-                 cannot restate; it is left out."
+                 -- Index inc is of a kind this script cannot restate; it is left out."
             )
         );
     }

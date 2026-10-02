@@ -14,7 +14,7 @@ shows a query plan, dumps a database to a `.sql` file, creates and drops a datab
 inside one, and browses and administers its logins, database users and their grants. Its
 sequences, alias types, synonyms and XML schema collections are browsed in the schema tree,
 created and edited in the object editor, dropped from their rows and compared. What it does not do
-yet is named rather than left to a label: an XML or spatial index, or an ordered columnstore one,
+yet is named rather than left to a label: a selective XML index, or an ordered columnstore one,
 is read rather than authored — see `db::mssql`.
 
 This is the project's reference document: the crate/module map, the architecture invariants, the
@@ -4007,7 +4007,9 @@ existing prose was left alone.
     where it is true, and `IndexInfo::include_sql` writes nothing where it is false (below, and
     under `schema.rs`). `supports_columnstore(dialect)` is SQL Server's alone: the index form builds
     its *Storage* choice only there, and only `create_index_sql`'s T-SQL arm writes `COLUMNSTORE`
-    (below).
+    (below). `supports_xml_and_spatial_indexes(dialect)` is its sibling for the XML and spatial
+    kinds, also SQL Server's alone, and `IndexStorage::offered` asks each family its own predicate
+    rather than one standing in for both.
     **Three more answer for things outside the designer entirely.** `enforces_declared_byte_length`
     asks whether a column's *declared* type binds how many bytes a value in it may hold: MySQL's is a
     promise, enforced with `ERROR 1406: Data too long`; PostgreSQL's `bytea` declares no length to
@@ -4794,8 +4796,10 @@ existing prose was left alone.
     the copy — found live. **What the reading already shows the rebuild cannot put back is
     `unsupported()`'s answer** — `tsql_rebuild_refusals`, SQL Server's arm of an exhaustive `match`
     on the dialect in the rebuild branch, where SQLite's is the list above: an index `lossy` there
-    (an XML or spatial one, or an ordered columnstore; every columnstore was too, until
-    `IndexInfo::method` held one — `a_sql_server_rebuild_restates_a_columnstore_index` — and one
+    (a selective XML one, or an ordered columnstore; every XML and spatial index was too, until
+    `IndexInfo::method` and `using` held one — the live
+    `xml_and_spatial_indexes_are_read_whole_and_survive_a_rebuild` — every columnstore until
+    `method` held one — `a_sql_server_rebuild_restates_a_columnstore_index` — and one
     with included columns was, refusing five of
     WideWorldImporters' 48 tables, until `IndexInfo::include` held them and the rebuild restated
     them through `create_index_sql` —
@@ -5024,6 +5028,35 @@ existing prose was left alone.
     again (`the_storage_choice_maps_onto_the_index_and_back`). An **ordered** columnstore
     (`ORDER (…)`, 2022 on) is still read `lossy`, the model not stating the order (under
     `mssql.rs`).
+    **An XML or spatial index is written as one too, and also only on SQL Server**
+    (`supports_xml_and_spatial_indexes`, the same exhaustive shape): `create_index_sql` writes
+    `CREATE {method} INDEX ix ON t (col)` — `PRIMARY XML`, `XML` or `SPATIAL` — followed by
+    `IndexInfo::using` where there is one, a secondary XML index's `USING XML INDEX [primary] FOR
+    PATH` or a spatial one's tessellation and its options, so the designer, the rebuild and
+    `tsql_create_ddl` restate it the one way (`an_xml_or_spatial_index_is_restated_as_one`).
+    `indexes_equal` compares `using`, or an edit of the clause alone would diff as nothing.
+    `validate` refuses one that names other than exactly one column, or is unique, covering or
+    filtered, and a secondary XML index with no `using`, which is built on a primary one by name
+    (`an_xml_or_spatial_index_is_refused_what_it_cannot_take`). **The primary XML index is ordered
+    against its secondaries at both ends, each measured on 2022**, and the two halves sit in
+    different places on purpose. Added, it goes first: `emit_mssql`'s `AddIndex` phase writes a
+    primary XML index before the rest, since a secondary naming it is refused until it exists.
+    Dropped, it goes last: dropping a primary drops every secondary built on it, so a secondary's
+    own `DROP INDEX` after it found nothing and failed the plan with Msg 3701. That half is set at
+    the end of `diff`, which sorts a `DropIndex` of a primary XML index behind every other change,
+    because the drop carries a name and no kind and only `diff` has the reading that says which
+    the name is (`a_primary_xml_index_is_created_first_and_dropped_last`). The sort runs after
+    `repair_tsql_dependents`, so it orders the drops that repair adds as well — and it adds them for
+    an XML or spatial index on a column the plan's change disturbs now, which, no longer `lossy`,
+    is taken off and put back like any other. `IndexStorage` has three kinds for them, *Primary XML*, *Secondary XML*
+    and *Spatial*; `offered(dialect)` asks each family its own capability, `takes_using()` is true
+    for the secondary and the spatial kinds, and `of` reads all six off `method` (and `clustered`,
+    for the two columnstore kinds). `apply` clears `using`
+    whenever the kind changes — the clause is one kind's grammar and no other's — and for an XML or
+    spatial kind clears clustering, the unique flag, the include list and the predicate and keeps
+    the first column only; back to rowstore clears `clustered` only when the index was another kind.
+    A **selective** XML index (`xml_index_type` 2 or 3, a grammar of its own) is still read
+    `lossy` (under `mssql.rs`).
     Ordering
     is dependency-first (FKs and indexes off before the columns under them; keys back on
     after), and **the column clauses inside that are ordered by their dependencies rather than
@@ -5267,7 +5300,7 @@ existing prose was left alone.
     SQL Server's early return — because only SQL Server's `diff` raises it and no other emitter
     writes it. **A dependent the draft already drops or adds is the
     draft's**, as with the check repair — and so is a computed column the draft itself alters or
-    drops; and a lossy index — an XML or spatial one, say — is not
+    drops; and a lossy index — a selective XML one or an ordered columnstore, say — is not
     touched, so the server refuses the retype naming it and the plan, one transaction, rolls back
     whole (`sql_server_takes_a_retyped_columns_dependents_off_and_back_on`,
     `sql_server_rebuilds_only_the_dependents_a_change_disturbs`,
@@ -5401,9 +5434,9 @@ existing prose was left alone.
     names its nonclustered index `a_nix` so that name order is the wrong one. Both `ReplaceView`
     arms of the risks carry `view_indexes_rebuilt`, naming the indexes and saying they are built
     again in the same transaction, which on a large view takes as long as building them did; the
-    in-place arm had no risk at all before. An `IndexInfo::lossy` one (an XML or spatial index, or
-    another kind the model does not state — a columnstore one and one with included columns were
-    too, and are modelled now) cannot
+    in-place arm had no risk at all before. An `IndexInfo::lossy` one (a kind the model does not
+    state — a columnstore one and one with included columns were too, and are modelled now; a view
+    carries no XML or spatial index, so those never reached this arm) cannot
     be built again whole, so `lossy_view_index_refusal`, in
     `unsupported()`, refuses the edit rather than bring the index back as less than it was
     (`an_indexed_sql_server_views_edit_creates_its_indexes_again`). **That refusal covers only
@@ -8886,6 +8919,19 @@ existing prose was left alone.
     it could not be edited, a T-SQL rebuild refused the table over it, and Copy DDL and the dump
     left it out under a note. One with an `ORDER (…)` (2022 on) still is, the order being unread.
     How it is written and refused is under `ddl.rs`.
+    **SQL Server's XML and spatial indexes are `method` too** — `TSQL_PRIMARY_XML`
+    (`PRIMARY XML`), `TSQL_XML` (`XML`, a secondary one) and `TSQL_SPATIAL` (`SPATIAL`), each the
+    words `CREATE … INDEX` takes, which `is_tsql_xml_or_spatial` asks — with what the kind takes
+    after its one column in **`IndexInfo::using`**: a secondary XML index's `USING XML INDEX
+    [primary] FOR PATH|VALUE|PROPERTY`, a spatial one's `USING <scheme> WITH (BOUNDING_BOX = (…),
+    GRIDS = (…), CELLS_PER_OBJECT = n)`. It is T-SQL text rather than fields, and that is safe only
+    because of where it comes from: composed by the reader from the catalogue's numbers and words
+    with **every option restated**, so a restatement is the index as it stands rather than whatever
+    the defaults are when it is made again, each value checked before it reaches the text (under
+    `mssql.rs`) — or typed in the designer, as a filter's predicate is. `None` on every other
+    index and every other engine. Until they were modelled each was `lossy`, so a T-SQL rebuild
+    refused its table and Copy DDL and the dump left it out under a note; a **selective** XML index
+    still is.
     **`IndexInfo::include` is an index's included columns, in order** — `INCLUDE (…)`, carried in
     the index's leaf rows without being part of its key, on SQL Server and PostgreSQL (11 on), and
     empty on MySQL and SQLite, which have no such clause (`ddl::supports_index_include`). It is
@@ -8899,10 +8945,12 @@ existing prose was left alone.
     `create_index_sql` (`pub(crate)` for it), so a script and a plan write one index one way, a
     columnstore's form included. `create_ddl_sql_server_writes_t_sql` restates a covering index
     with `INCLUDE ([balance])` and a nonclustered columnstore `ix_cs` as `CREATE NONCLUSTERED
-    COLUMNSTORE INDEX`, and leaves a lossy `ix_xml` out under the note, which now reads *"is an XML
-    or spatial index, or another kind this script cannot restate; it is left out"* for a table and
-    an indexed view alike — it began *"has included columns, or…"*, and named columnstore too until
-    that was modelled. How the
+    COLUMNSTORE INDEX`, and leaves a lossy `ix_xml` out under the note, which for a table now
+    reads *"is a selective XML index or an ordered columnstore, or another kind this script cannot
+    restate; it is left out"* — what it fires for on SQL Server, beside an index naming a graph
+    column, an ordinary XML or spatial index being restated whole — and for an indexed view, which
+    can carry neither, *"is of a kind this script cannot restate"*. It began *"has included columns,
+    or…"*, and named columnstore, then XML and spatial, until each was modelled. How the
     designer's plan keeps the list through a rename, a removal and a retype is under `ddl.rs`.
     **`classify_column_type` reads all three engines' spellings now**, the type name being what the
     icon in the schema tree, the ER diagram's cards and tooltips, the completion popup and Find
@@ -13337,11 +13385,13 @@ existing prose was left alone.
   there, ahead of `run_server_ddl`'s refusal, until that was written (both under `ddl.rs`; live,
   `a_database_is_created_with_its_collation_and_dropped` on 2022 and 2025, which skips on Azure
   SQL Database — a created database there is a new billable one — so `master` taking the two
-  statements on Azure is the code's word, not a measurement). Still on it: an XML or spatial
+  statements on Azure is the code's word, not a measurement). Still on it: a selective XML
   index, and a columnstore one with an `ORDER (…)` (2022 on), is read as `IndexInfo::lossy`
   rather than authored, so a rebuild and a view edit refuse to touch it rather than drop it
-  (`tsql_rebuild_refusals`, `lossy_view_index_refusal`) — and an XML or spatial one was not read
-  at all until the listing's join was fixed (below). A columnstore index was on this list, and is
+  (`tsql_rebuild_refusals`, `lossy_view_index_refusal`). XML and spatial indexes were on this
+  list — first not read at all, until the listing's join was fixed, then read only as lossy — and
+  are not now: a primary or secondary XML index and a spatial one are read with every option,
+  restated and authored from the designer (below). A columnstore index was on this list, and is
   not now: it is read, restated and authored from the designer (below). An index with included
   columns was on it too, and is not now: they are read and restated (below). So was a named
   instance's port, which had to be given
@@ -13974,7 +14024,8 @@ existing prose was left alone.
   constraint backs, `DROP INDEX [i] ON t` otherwise); then dropped columns, each after its
   default's drop; **then** the column renames, `EXEC sp_rename N'[s].[t].[c]', N'new',
   N'COLUMN';`; then altered columns (`tsql_alter_column`), added columns, the keys, checks and
-  foreign keys, the indexes; then the comments, by the columns' new names and the table's
+  foreign keys, the indexes, a primary XML one ahead of the rest (under `ddl.rs`); then the
+  comments, by the columns' new names and the table's
   old one; then those `SELECT *` dependents refreshed, while the table still has the name they
   name; and the table's own `sp_rename` last, the new name bare
   because the procedure takes it literally and brackets would become part of it — so every
@@ -14106,9 +14157,10 @@ existing prose was left alone.
   and collation are MySQL's table options.
   **Introspection reads clustering rather than withholding it**: `IdxRow::clustered` is `Some` of
   whether `sys.indexes.type` is 1 or 5 — a clustered rowstore or a clustered columnstore
-  (`IndexInfo::clustered`, under `schema.rs`) — and an index is `lossy` only for an XML or
-  spatial one (types 3 and 4), an ordered columnstore (cell 12, below) or the graph-column marker
-  (under the dump, below). Before the
+  (`IndexInfo::clustered`, under `schema.rs`) — and an index is `lossy` only for a selective XML
+  one, an ordered columnstore (cell 12, below) or the graph-column marker (under the dump,
+  below); the fold still marks every XML and spatial one (types 3 and 4) `lossy`, and a second
+  pass clears it where the kind is stated whole (below). Before the
   field a clustered index other than the key's was marked `lossy` too, and an edit to it withheld
   as a `KeepLossyIndex`, since recreating it plainly left the table a heap; the emitter writes
   `CLUSTERED` and `NONCLUSTERED` where T-SQL's default is wrong now (under `ddl.rs`), and
@@ -14138,11 +14190,37 @@ existing prose was left alone.
   keyed row, an included one or a columnstore's, so it never reached the fold: Copy DDL and the
   dump left it out with no note, a rebuild's refusal never named it — the rebuild's own
   index-count arm would have stopped it at run time as changed since it was read — and a
-  comparison never saw it. The join now admits types 3 and 4 too, so they are read as the lossy
-  indexes they are, named by the rebuild's refusal and noted by Copy DDL. AdventureWorksLT's
+  comparison never saw it. The join now admits types 3 and 4 too, so they were read — at first
+  as lossy indexes, named by the rebuild's refusal and noted by Copy DDL. AdventureWorksLT's
   `SalesLT.ProductModel.PXML_ProductModel_CatalogDescription` was invisible:
   `a_real_schema_reads_and_every_table_round_trips` printed 0 notes over that sample before the fix
-  and 1 after. `VIEW_INDEX_LISTING` keeps its join, a view carrying no XML or spatial index. A
+  and 1 after — and 0 again once the index was read whole, which is the next step.
+  **An XML or spatial index is read whole now.** The fold still takes types 3 and 4 as `lossy`,
+  knowing only their type; after the clustered-columnstore pass a second listing,
+  `XML_SPATIAL_LISTING`, gives one row per such index, `LEFT JOIN`ed to `sys.xml_indexes` (the
+  `xml_index_type`, the using index's name through `using_xml_index_id`, `secondary_type_desc`),
+  `sys.spatial_indexes` (`tessellation_scheme`) and `sys.spatial_index_tessellations` (the
+  bounding box, the four grid levels, `cells_per_object`). The pure `tsql_xml_or_spatial` turns a
+  row into `method` and `using`, and the load patches the matching index — same schema, table and
+  name, exactly one column — with both and `lossy` `false`. A primary XML index (type 0) has no
+  clause; a secondary (1) is `USING XML INDEX [primary] FOR PATH|VALUE|PROPERTY`, the name through
+  the one quoter; a spatial one is `USING <scheme>` with a `WITH (…)` of whatever the catalogue
+  holds. **Every value is checked for what it is before it reaches T-SQL text**, because `using` is
+  text an emitter writes verbatim: the `FOR` one of three words, the scheme one of
+  `GEOMETRY_GRID`/`GEOMETRY_AUTO_GRID`/`GEOGRAPHY_GRID`/`GEOGRAPHY_AUTO_GRID`, a grid level one of
+  `LOW`/`MEDIUM`/`HIGH`, the bounding box written by Rust's `Display` only when all four parse as
+  finite `f64`s, `CELLS_PER_OBJECT` only when it parses as a `u32`. An unknown `FOR`, scheme or
+  grid word answers `None`, leaving the index `lossy` rather than splicing it — as does a
+  **selective** XML index (`xml_index_type` 2 or 3), whose grammar is its own and which the model
+  does not state. **So does an option read in part** — a value present that does not parse, a
+  bounding box or a grid missing a part: it was left out of the clause while the index still read
+  as whole, so a restatement took the server's default for it, a different index under the same
+  name; each option is now there whole or the index is `lossy`. **Every option is restated**, not just
+  the ones that differ from a default, so a restatement is the index as it stands rather than
+  whatever the server's defaults are when it is made again.
+  `an_xml_or_spatial_index_is_read_with_every_option` holds rows as 2022 printed them for the
+  indexes they were made from, and injection-shaped values refused. `VIEW_INDEX_LISTING` keeps its
+  join, a view carrying no XML or spatial index. A
   partitioning column outside the key, neither keyed nor included, is still left out. Every
   admitted change is
   written by one of the phases bar `KeepLossyIndex`, whose statement is none; the catch-all arms
@@ -14159,9 +14237,14 @@ existing prose was left alone.
   and renames the table in one plan, then reads it back with the data kept, the new default filling
   a new row and the result round-tripping; `a_primary_key_is_replaced` widens a key by its read
   constraint name; `an_identity_toggle_is_withheld_over_an_index_the_rebuild_cannot_restate`
-  switches an identity on over a primary XML index and gets the one refusal, naming it, and reads a
-  spatial index back `lossy` and noted in Copy DDL (it planted an index with included columns until
-  those were read, and a nonclustered columnstore until that was);
+  switches an identity on over an ordered clustered columnstore (`ORDER (a)`) and gets the one
+  refusal, naming it (it planted an index with included columns until those were read, a
+  nonclustered columnstore until that was, and a primary XML and a spatial index until those
+  were);
+  `xml_and_spatial_indexes_are_read_whole_and_survive_a_rebuild` reads a primary and a secondary
+  XML index, a `GEOMETRY_GRID` with every option, a `GEOMETRY_AUTO_GRID` and a geography index as
+  their kinds, not lossy, rebuilds the table around them by an identity toggle, and reads each
+  back with the same `method` and `using`, the table diffing to nothing;
   `a_columnstore_index_is_read_rebuilt_and_authored` reads a clustered columnstore and a filtered
   nonclustered one back not lossy, rebuilds each table around its index by an identity toggle and
   reads the index back equal with a diff of nothing, lands a nonclustered one made through
@@ -14410,9 +14493,10 @@ existing prose was left alone.
   `a_sql_server_graph_temporal_or_memory_optimised_table_is_not_scripted_as_a_plain_one`); the
   internal columns are left out of `column_listing` by `graph_type`, the index keyed on nothing
   but graph ids is dropped and one naming another graph column is withheld as `lossy` — other indexes as separate
-  statements through `ddl::create_index_sql`, their `INCLUDE` lists and a columnstore's form with
-  them (`IndexInfo::include_sql`; an XML or spatial one is the lossy kind left out under a note,
-  `create_ddl_sql_server_writes_t_sql`), the table's and columns' comments after them through `ddl::tsql_add_comment` — the
+  statements through `ddl::create_index_sql`, their `INCLUDE` lists, a columnstore's form and an
+  XML or spatial index's kind and `USING` clause with them (`IndexInfo::include_sql`,
+  `IndexInfo::using`; an ordered columnstore or a selective XML index is the lossy kind left out
+  under a note, `create_ddl_sql_server_writes_t_sql`), the table's and columns' comments after them through `ddl::tsql_add_comment` — the
   same `sp_addextendedproperty` the emitter writes (`create_ddl_sql_server_restates_the_comments`)
   — and what it cannot restate named in a comment; a view is its stored definition **with the
   header rebuilt under the catalogue's name**, as SQL Server's own scripter writes it, through
@@ -19627,9 +19711,16 @@ existing prose was left alone.
     *Columns*, is built only where `ddl::supports_index_include` answers yes — SQL Server and
     PostgreSQL — and parses through `ddl::parse_name_list` into `IndexInfo::include`, so a list is
     never typed where no emitter would write it. Its *Storage* dropdown, after *Include* (tab 27) —
-    *Rowstore*, *Columnstore*, *Clustered columnstore* — is built only where
-    `ddl::supports_columnstore` answers yes, SQL Server alone, and maps through `ddl::IndexStorage`,
-    whose `apply` also clears what a columnstore index cannot carry (under `ddl.rs`). The
+    *Rowstore*, *Columnstore*, *Clustered columnstore*, *Primary XML*, *Secondary XML*, *Spatial* —
+    is built only where `IndexStorage::offered` leaves more than *Rowstore*, and lists only the
+    kinds it offers — each family asking its own capability, `ddl::supports_columnstore` or
+    `ddl::supports_xml_and_spatial_indexes`, SQL Server alone for both today — and maps through
+    `ddl::IndexStorage`, whose `apply` also clears what the chosen kind cannot carry (under
+    `ddl.rs`). A *Using* field (tab 28) follows it, built only when `IndexStorage::of` the index
+    `takes_using()` — a secondary XML or a spatial index — and typed as SQL into
+    `IndexInfo::using`, like a filter's predicate, its hint naming both clause shapes. **It appears
+    and goes with the choice because a Storage change bumps the form's `rev` and rebuilds it**,
+    the same rebuild that keeps the fields above from showing what `apply` just cleared. The
     foreign-key action dropdown lists
     `ddl::fk_actions` besides, which has no `RESTRICT` on SQL Server. The designer opens on an
     **existing** SQL Server table too, now that `supports_table_design` answers yes there

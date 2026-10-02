@@ -1732,11 +1732,16 @@ fn index_form(d: DdlUi, target: &DesignerTarget, ring: FocusRing) -> AnyView {
         crate::widgets::nothing()
     };
 
-    // SQL Server's storage choice — rowstore, columnstore, or the clustered
-    // columnstore that is the table's own storage — built only where the
-    // engine has one, for `pg_only`'s reason. The mapping is core's
-    // (`ddl::IndexStorage`), which also clears what the choice cannot carry.
-    let storage: AnyView = if ddl::supports_columnstore(dialect) {
+    // SQL Server's index kinds — rowstore, columnstore, the clustered
+    // columnstore that is the table's own storage, XML and spatial — built only
+    // where the engine offers more than a rowstore, for `pg_only`'s reason, and
+    // each kind only where its capability says (`IndexStorage::offered`). The
+    // mapping is core's, which also clears what the choice cannot carry.
+    let kinds: Vec<ddl::IndexStorage> = ddl::IndexStorage::ALL
+        .into_iter()
+        .filter(|s| s.offered(dialect))
+        .collect();
+    let storage: AnyView = if kinds.len() > 1 {
         let draft = d.draft;
         let rev = d.rev;
         let sig = floem::reactive::create_rw_signal(ddl::IndexStorage::of(&ix).label().to_string());
@@ -1744,10 +1749,7 @@ fn index_form(d: DdlUi, target: &DesignerTarget, ring: FocusRing) -> AnyView {
             "Storage",
             crate::table_designer::focusable_owned_dropdown(
                 move || sig.get(),
-                ddl::IndexStorage::ALL
-                    .iter()
-                    .map(|s| s.label().to_string())
-                    .collect(),
+                kinds.iter().map(|s| s.label().to_string()).collect(),
                 field_w,
                 ring.clone(),
                 27,
@@ -1763,13 +1765,45 @@ fn index_form(d: DdlUi, target: &DesignerTarget, ring: FocusRing) -> AnyView {
                             }
                         });
                         // **A structural change, so the form is rebuilt**: `apply`
-                        // clears the unique flag, the include list and a clustered
-                        // one's columns, and the fields above were seeded once — left
-                        // standing, they showed what the draft no longer held, and
-                        // the next keystroke in one wrote it back.
+                        // clears what the new kind cannot carry — the unique flag,
+                        // the include list, the filter, the Using clause, columns
+                        // past the first or all of them — and the fields above were
+                        // seeded once: left standing, they showed what the draft no
+                        // longer held, and the next keystroke in one wrote it back.
+                        // The rebuild is also what brings the Using field in or out.
                         rev.update(|r| *r += 1);
                     }
                 },
+            ),
+        )
+        .into_any()
+    } else {
+        crate::widgets::nothing()
+    };
+
+    // A secondary XML or a spatial index's clause after its column — `USING XML
+    // INDEX [primary] FOR PATH`, `USING GEOMETRY_GRID WITH (…)` — as SQL, like
+    // a filter's predicate. Built only for those kinds; the form is rebuilt
+    // when Storage changes, so it appears and goes with the choice.
+    let using: AnyView = if ddl::IndexStorage::of(&ix).takes_using() {
+        form_setting(
+            "Using",
+            field_with_hint(
+                bound_field(
+                    d.draft,
+                    ix.using.clone().unwrap_or_default(),
+                    list_field_w,
+                    "USING XML INDEX [primary] FOR PATH",
+                    ring.clone(),
+                    28,
+                    move |d, v| {
+                        if let Some(x) = d.indexes.get_mut(i) {
+                            x.info.using = Some(v.trim().to_string()).filter(|s| !s.is_empty());
+                        }
+                    },
+                ),
+                "The clause after the column: a secondary XML index's USING XML INDEX … FOR \
+                 PATH, VALUE or PROPERTY, or a spatial index's USING … WITH (…).",
             ),
         )
         .into_any()
@@ -1841,6 +1875,7 @@ fn index_form(d: DdlUi, target: &DesignerTarget, ring: FocusRing) -> AnyView {
         ),
         include,
         storage,
+        using,
         bound_toggle(
             d.draft,
             "Unique",

@@ -5936,11 +5936,9 @@ async fn a_clustered_index_and_a_nonclustered_key_keep_their_clustering() {
 }
 
 /// **An identity switched on is a rebuild — withheld where the rebuild would
-/// drop an index it does not read whole**, here an XML one, and the preview
-/// says which rather than applying a table without it. **Read at all, first**:
-/// an XML or spatial index's column is listed with `key_ordinal` 0 and not
-/// included, so the listing's join dropped it — the index was invisible, a
-/// dump and Copy DDL left it out with no note, and nothing named it here.
+/// drop an index it does not read whole**, here an ordered columnstore one
+/// (`ORDER`, 2022 on), and the preview says which rather than applying a
+/// table without it.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_identity_toggle_is_withheld_over_an_index_the_rebuild_cannot_restate() {
     use schemaic_core::ddl::TableDraft;
@@ -5948,28 +5946,121 @@ async fn an_identity_toggle_is_withheld_over_an_index_the_rebuild_cannot_restate
         return;
     }
     let s = Scratch::create("ddl_ident").await;
-    s.exec("CREATE TABLE dbo.t (id int NOT NULL, a int, x xml, CONSTRAINT pk_t PRIMARY KEY CLUSTERED (a))")
+    s.exec("CREATE TABLE dbo.t (id int NOT NULL, a int)").await;
+    s.exec("CREATE CLUSTERED COLUMNSTORE INDEX occi ON dbo.t ORDER (a)")
         .await;
-    s.exec("CREATE PRIMARY XML INDEX ix_x ON dbo.t (x)").await;
-    s.exec("CREATE TABLE dbo.g (id int NOT NULL PRIMARY KEY, g geometry)")
-        .await;
-    s.exec("CREATE SPATIAL INDEX ix_g ON dbo.g (g) WITH (BOUNDING_BOX = (0, 0, 100, 100))")
-        .await;
-    let g = read_table(&s, "g").await;
-    let spatial = g.indexes.iter().find(|i| i.name == "ix_g");
-    assert!(spatial.is_some_and(|i| i.lossy), "{:?}", g.indexes);
-    assert!(
-        g.create_ddl(MS).contains("-- Index ix_g "),
-        "{}",
-        g.create_ddl(MS)
-    );
     let t = read_table(&s, "t").await;
     let mut d = TableDraft::from_table(&t);
     d.columns[0].info.auto_increment = true;
     let cs = schemaic_core::ddl::diff(&t, &d, MS);
     let refused = cs.unsupported();
     assert_eq!(refused.len(), 1, "{refused:?}");
-    assert!(refused[0].contains("ix_x"), "{refused:?}");
+    assert!(refused[0].contains("occi"), "{refused:?}");
+}
+
+/// **XML and spatial indexes are read whole and survive a rebuild**: a
+/// primary and a secondary XML index, a geometry grid with every option
+/// set, a geometry auto grid and a geography index are each read as their
+/// kind with their options, restated by a rebuild around them — the primary
+/// before the secondary built on it — and read back equal, so the table is
+/// its own draft again. **Read at all, first**: such an index's column is
+/// listed with `key_ordinal` 0 and not included, so the index listing's join
+/// dropped it — invisible to Copy DDL, the dump and a rebuild's refusal.
+#[tokio::test(flavor = "multi_thread")]
+async fn xml_and_spatial_indexes_are_read_whole_and_survive_a_rebuild() {
+    use schemaic_core::ddl::TableDraft;
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("ddl_xml_spatial").await;
+    for sql in [
+        "CREATE TABLE dbo.t (id int NOT NULL, x xml, g geometry, h geography, \
+         CONSTRAINT pk_t PRIMARY KEY CLUSTERED (id))",
+        "CREATE PRIMARY XML INDEX ix_x ON dbo.t (x)",
+        "CREATE XML INDEX ix_x2 ON dbo.t (x) USING XML INDEX ix_x FOR PATH",
+        "CREATE SPATIAL INDEX ix_g ON dbo.t (g) USING GEOMETRY_GRID WITH (BOUNDING_BOX = \
+         (0, -5.5, 100, 100), GRIDS = (LEVEL_1 = LOW, LEVEL_2 = MEDIUM, LEVEL_3 = HIGH, \
+         LEVEL_4 = MEDIUM), CELLS_PER_OBJECT = 20)",
+        "CREATE SPATIAL INDEX ix_ga ON dbo.t (g) USING GEOMETRY_AUTO_GRID WITH (BOUNDING_BOX = \
+         (0, 0, 10, 20))",
+        "CREATE SPATIAL INDEX ix_h ON dbo.t (h)",
+    ] {
+        s.exec(sql).await;
+    }
+    let t = read_table(&s, "t").await;
+    for name in ["ix_x", "ix_x2", "ix_g", "ix_ga", "ix_h"] {
+        let ix = t
+            .indexes
+            .iter()
+            .find(|i| i.name == name)
+            .unwrap_or_else(|| panic!("{name} not read: {:?}", t.indexes));
+        assert!(ix.is_tsql_xml_or_spatial() && !ix.lossy, "{name}: {ix:?}");
+    }
+    let mut d = TableDraft::from_table(&t);
+    d.columns[0].info.auto_increment = true;
+    let stmts = apply_draft(&s, &t, &d).await;
+    let t2 = read_table(&s, "t").await;
+    for name in ["ix_x", "ix_x2", "ix_g", "ix_ga", "ix_h"] {
+        let (a, b) = (
+            t.indexes.iter().find(|i| i.name == name).unwrap(),
+            t2.indexes.iter().find(|i| i.name == name),
+        );
+        assert_eq!(
+            b.map(|b| (&b.method, &b.using)),
+            Some((&a.method, &a.using)),
+            "{name}: {stmts:#?}"
+        );
+    }
+    let again = schemaic_core::ddl::diff(&t2, &TableDraft::from_table(&t2), MS);
+    assert!(again.changes.is_empty(), "{:?}", again.changes);
+
+    // **Authored from the designer's Storage choice** on a table with none:
+    // a spatial index with its clause typed, then a primary and a secondary
+    // XML index in one plan, listed secondary first — the plan puts the
+    // primary ahead.
+    use schemaic_core::ddl::{IndexDraft, IndexStorage};
+    use schemaic_core::schema::{IndexColumn, IndexInfo};
+    s.exec(
+        "CREATE TABLE dbo.u (id int NOT NULL, x xml, g geometry, \
+         CONSTRAINT pk_u PRIMARY KEY CLUSTERED (id))",
+    )
+    .await;
+    let u = read_table(&s, "u").await;
+    let made = |name: &str, col: &str, kind: IndexStorage, using: Option<&str>| {
+        let mut ix = IndexInfo {
+            name: name.into(),
+            columns: vec![IndexColumn::plain(col)],
+            ..Default::default()
+        };
+        kind.apply(&mut ix);
+        ix.using = using.map(str::to_string);
+        IndexDraft::new(ix)
+    };
+    let mut d = TableDraft::from_table(&u);
+    d.indexes.push(made(
+        "sp",
+        "g",
+        IndexStorage::Spatial,
+        Some("USING GEOMETRY_AUTO_GRID WITH (BOUNDING_BOX = (0, 0, 50, 50))"),
+    ));
+    d.indexes.push(made(
+        "sx",
+        "x",
+        IndexStorage::SecondaryXml,
+        Some("USING XML INDEX [px] FOR VALUE"),
+    ));
+    d.indexes
+        .push(made("px", "x", IndexStorage::PrimaryXml, None));
+    let stmts = apply_draft(&s, &u, &d).await;
+    let u2 = read_table(&s, "u").await;
+    for name in ["sp", "px", "sx"] {
+        assert!(
+            u2.indexes
+                .iter()
+                .any(|i| i.name == name && i.is_tsql_xml_or_spatial() && !i.lossy),
+            "{name}: {stmts:#?}"
+        );
+    }
 }
 
 /// **An index's included columns are read apart from its key, and a rebuild

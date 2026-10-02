@@ -1633,6 +1633,114 @@ const INDEX_LISTING: &str = "SELECT s.name, t.name, \
      WHERE t.is_ms_shipped = 0 AND i.index_id > 0 AND i.is_hypothetical = 0 \
      ORDER BY s.name, t.name, i.name, ic.is_included_column, ic.key_ordinal, ic.index_column_id";
 
+/// Every table's XML and spatial index, with what its kind takes after the
+/// column list: `(schema, table, index, type, xml index type, the primary a
+/// secondary XML index uses, its FOR, tessellation scheme, bounding box
+/// xmin, ymin, xmax, ymax, grid levels 1–4, cells per object)` — read into
+/// `IndexInfo::method`/`using` by [`tsql_xml_or_spatial`].
+const XML_SPATIAL_LISTING: &str = "SELECT s.name, t.name, i.name, i.type, \
+            xi.xml_index_type, ux.name, xi.secondary_type_desc, \
+            si.tessellation_scheme, st.bounding_box_xmin, st.bounding_box_ymin, \
+            st.bounding_box_xmax, st.bounding_box_ymax, st.level_1_grid_desc, \
+            st.level_2_grid_desc, st.level_3_grid_desc, st.level_4_grid_desc, \
+            st.cells_per_object \
+     FROM sys.indexes i \
+     JOIN sys.tables t ON t.object_id = i.object_id \
+     JOIN sys.schemas s ON s.schema_id = t.schema_id \
+     LEFT JOIN sys.xml_indexes xi ON xi.object_id = i.object_id AND xi.index_id = i.index_id \
+     LEFT JOIN sys.indexes ux ON ux.object_id = xi.object_id \
+           AND ux.index_id = xi.using_xml_index_id \
+     LEFT JOIN sys.spatial_indexes si ON si.object_id = i.object_id AND si.index_id = i.index_id \
+     LEFT JOIN sys.spatial_index_tessellations st \
+            ON st.object_id = i.object_id AND st.index_id = i.index_id \
+     WHERE t.is_ms_shipped = 0 AND i.type IN (3, 4)";
+
+/// An XML or spatial index's
+/// [`IndexInfo::method`](schemaic_core::schema::IndexInfo::method) and
+/// [`IndexInfo::using`](schemaic_core::schema::IndexInfo::using)
+/// from its [`XML_SPATIAL_LISTING`] row, or `None` for one the model does not
+/// state — a selective XML index (`xml_index_type` 2 or 3, its own grammar),
+/// or a value outside what T-SQL spells.
+///
+/// **Every option restated**, so the clause is the index as it stands rather
+/// than whatever the server's defaults are when it is made again; and each
+/// value checked for what it is — a name quoted, a `FOR` one of three words, a
+/// grid level one of three, a number a number — before it reaches T-SQL text.
+fn tsql_xml_or_spatial(r: &[Option<String>]) -> Option<(&'static str, Option<String>)> {
+    use schemaic_core::schema::{TSQL_PRIMARY_XML, TSQL_SPATIAL, TSQL_XML};
+    let num = |i: usize| -> Option<String> {
+        let v: f64 = r.get(i)?.as_deref()?.trim().parse().ok()?;
+        v.is_finite().then(|| v.to_string())
+    };
+    let int = |i: usize| cell(r, i).trim().parse::<i64>().unwrap_or(-1);
+    match int(3) {
+        3 => match int(4) {
+            0 => Some((TSQL_PRIMARY_XML, None)),
+            1 => {
+                let primary = r.get(5)?.as_deref()?;
+                let kind = r.get(6)?.as_deref()?.trim();
+                matches!(kind, "PATH" | "VALUE" | "PROPERTY").then(|| {
+                    (
+                        TSQL_XML,
+                        Some(format!("USING XML INDEX {} FOR {kind}", ident(primary))),
+                    )
+                })
+            }
+            _ => None,
+        },
+        4 => {
+            let scheme = r.get(7)?.as_deref()?.trim();
+            if !matches!(
+                scheme,
+                "GEOMETRY_GRID" | "GEOMETRY_AUTO_GRID" | "GEOGRAPHY_GRID" | "GEOGRAPHY_AUTO_GRID"
+            ) {
+                return None;
+            }
+            // **Each option is there whole or not at all** — a value present
+            // that does not parse, or a box or grid missing a part, is an
+            // index read in part, so `None`: restated without the option it
+            // would take the server's default, a different index.
+            let present = |i: usize| r.get(i).is_some_and(|v| v.is_some());
+            let mut with = Vec::new();
+            match (num(8), num(9), num(10), num(11)) {
+                (Some(a), Some(b), Some(c), Some(d)) => {
+                    with.push(format!("BOUNDING_BOX = ({a}, {b}, {c}, {d})"));
+                }
+                _ if (8..12).any(present) => return None,
+                _ => {}
+            }
+            let levels: Vec<&str> = (12..16)
+                .filter_map(|i| r.get(i).and_then(|v| v.as_deref()))
+                .map(str::trim)
+                .collect();
+            match levels.len() {
+                4 if levels
+                    .iter()
+                    .all(|l| matches!(*l, "LOW" | "MEDIUM" | "HIGH")) =>
+                {
+                    with.push(format!(
+                        "GRIDS = (LEVEL_1 = {}, LEVEL_2 = {}, LEVEL_3 = {}, LEVEL_4 = {})",
+                        levels[0], levels[1], levels[2], levels[3]
+                    ));
+                }
+                0 => {}
+                _ => return None,
+            }
+            if present(16) {
+                let n: u32 = cell(r, 16).trim().parse().ok()?;
+                with.push(format!("CELLS_PER_OBJECT = {n}"));
+            }
+            let using = if with.is_empty() {
+                format!("USING {scheme}")
+            } else {
+                format!("USING {scheme} WITH ({})", with.join(", "))
+            };
+            Some((TSQL_SPATIAL, Some(using)))
+        }
+        _ => None,
+    }
+}
+
 /// Every **indexed view's** indexes, in [`INDEX_LISTING`]'s shape — the
 /// unique clustered index that materialises the view and any nonclustered
 /// ones on it. Their own listing, over `sys.views`, so the table listing is
@@ -2208,7 +2316,9 @@ async fn collect_schema(client: &mut MsClient) -> Result<DbSchema, DbError> {
             // are what the model can say, included columns and all
             // (`IndexInfo::include`), and so is a columnstore one, types 5
             // (clustered) and 6 (`IndexInfo::is_columnstore`) — unless it is
-            // ordered (column 12, 2022 on); an XML or spatial index is not.
+            // ordered (column 12, 2022 on). An XML or spatial index is marked
+            // lossy here by its type, and stated whole by the pass after the
+            // fold that reads its kind and options.
             // Clustering is `IndexInfo::clustered`: before it was modelled, a
             // clustered index other than the key's had to be withheld, since
             // recreating it plainly left the table a heap.
@@ -2326,6 +2436,25 @@ async fn collect_schema(client: &mut MsClient) -> Result<DbSchema, DbError> {
     for ix in tables.iter_mut().flat_map(|t| t.indexes.iter_mut()) {
         if ix.is_clustered_columnstore() {
             ix.columns.clear();
+        }
+    }
+    // An XML or spatial index, read lossy above by its type, is stated whole
+    // where its kind and options are (`tsql_xml_or_spatial`); a selective XML
+    // index stays lossy.
+    for r in query_rows(client, XML_SPATIAL_LISTING).await? {
+        let Some((method, using)) = tsql_xml_or_spatial(&r) else {
+            continue;
+        };
+        let (ns, table, index) = (cell(&r, 0), cell(&r, 1), cell(&r, 2));
+        if let Some(ix) = tables
+            .iter_mut()
+            .filter(|t| t.schema.as_deref() == Some(ns.as_str()) && t.name == table)
+            .flat_map(|t| t.indexes.iter_mut())
+            .find(|ix| ix.name == index && ix.columns.len() == 1)
+        {
+            ix.method = Some(method.to_string());
+            ix.using = using;
+            ix.lossy = false;
         }
     }
 
@@ -5250,6 +5379,111 @@ mod write_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn xs_row(cells: &[Option<&str>]) -> Vec<Option<String>> {
+        let mut r: Vec<Option<String>> =
+            vec![Some("dbo".into()), Some("t".into()), Some("ix".into())];
+        r.extend(cells.iter().map(|c| c.map(str::to_string)));
+        r.resize(17, None);
+        r
+    }
+
+    /// **An XML or spatial index is read as the catalogue states it**, every
+    /// option restated — the rows as SQL Server 2022 printed them for the
+    /// indexes they were made from — and one the model does not state, or
+    /// with a value T-SQL does not spell, is left lossy.
+    #[test]
+    fn an_xml_or_spatial_index_is_read_with_every_option() {
+        use schemaic_core::schema::{TSQL_PRIMARY_XML, TSQL_SPATIAL, TSQL_XML};
+        assert_eq!(
+            tsql_xml_or_spatial(&xs_row(&[Some("3"), Some("0")])),
+            Some((TSQL_PRIMARY_XML, None))
+        );
+        assert_eq!(
+            tsql_xml_or_spatial(&xs_row(&[Some("3"), Some("1"), Some("ix_x"), Some("PATH")])),
+            Some((TSQL_XML, Some("USING XML INDEX [ix_x] FOR PATH".into())))
+        );
+        let grid = xs_row(&[
+            Some("4"),
+            None,
+            None,
+            None,
+            Some("GEOMETRY_GRID"),
+            Some("0.0"),
+            Some("-5.5"),
+            Some("100.0"),
+            Some("100.0"),
+            Some("LOW"),
+            Some("MEDIUM"),
+            Some("HIGH"),
+            Some("MEDIUM"),
+            Some("20"),
+        ]);
+        assert_eq!(
+            tsql_xml_or_spatial(&grid),
+            Some((
+                TSQL_SPATIAL,
+                Some(
+                    "USING GEOMETRY_GRID WITH (BOUNDING_BOX = (0, -5.5, 100, 100), GRIDS = \
+                     (LEVEL_1 = LOW, LEVEL_2 = MEDIUM, LEVEL_3 = HIGH, LEVEL_4 = MEDIUM), \
+                     CELLS_PER_OBJECT = 20)"
+                        .into()
+                )
+            ))
+        );
+        let geography = xs_row(&[
+            Some("4"),
+            None,
+            None,
+            None,
+            Some("GEOGRAPHY_AUTO_GRID"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("12"),
+        ]);
+        assert_eq!(
+            tsql_xml_or_spatial(&geography),
+            Some((
+                TSQL_SPATIAL,
+                Some("USING GEOGRAPHY_AUTO_GRID WITH (CELLS_PER_OBJECT = 12)".into())
+            ))
+        );
+        // Selective XML, a FOR outside the three, a grid level or a scheme
+        // outside T-SQL's words: lossy, not spliced.
+        for r in [
+            xs_row(&[Some("3"), Some("2")]),
+            xs_row(&[
+                Some("3"),
+                Some("1"),
+                Some("ix_x"),
+                Some("PATH; DROP TABLE t"),
+            ]),
+            xs_row(&[Some("4"), None, None, None, Some("GEOMETRY_GRID) --")]),
+        ] {
+            assert_eq!(tsql_xml_or_spatial(&r), None, "{r:?}");
+        }
+        let mut odd = grid.clone();
+        odd[12] = Some("LOW, LEVEL_9 = X".into());
+        assert_eq!(tsql_xml_or_spatial(&odd), None);
+        // **A value there that does not parse leaves the index lossy**, not
+        // restated without that option — which would be the server's default,
+        // a different index, with the plan calling it the same.
+        let mut nan = grid.clone();
+        nan[8] = Some("1); DROP TABLE t; --".into());
+        assert_eq!(tsql_xml_or_spatial(&nan), None);
+        let mut half_box = grid.clone();
+        half_box[10] = None;
+        assert_eq!(tsql_xml_or_spatial(&half_box), None);
+        let mut cells = grid;
+        cells[16] = Some("many".into());
+        assert_eq!(tsql_xml_or_spatial(&cells), None);
+    }
 
     /// A named instance the Browser gave no port for is told the three
     /// reasons and the way round them, naming the server and the instance.

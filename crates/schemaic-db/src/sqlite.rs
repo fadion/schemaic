@@ -3172,6 +3172,7 @@ fn table_indexes(conn: &SqliteConn, db: &str, table: &str) -> Result<Vec<IndexIn
             columns,
             // SQLite has no `INCLUDE`: a covering index is just more key.
             include: Vec::new(),
+            using: None,
             unique,
             foreign: false,
             method: None,

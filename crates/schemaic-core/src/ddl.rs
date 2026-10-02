@@ -591,6 +591,28 @@ impl TableDraft {
             if ix.info.columns.is_empty() && !ix.info.is_clustered_columnstore() {
                 out.push(format!("Index {} has no columns.", ix.info.name));
             }
+            // An XML or spatial index is over one column, with none of a
+            // rowstore index's options; a secondary XML one names its primary.
+            if ix.info.is_tsql_xml_or_spatial() {
+                let name = &ix.info.name;
+                if ix.info.columns.len() != 1 {
+                    out.push(format!("Index {name} must name exactly one column."));
+                }
+                if ix.info.unique || !ix.info.include.is_empty() || ix.info.predicate.is_some() {
+                    out.push(format!(
+                        "Index {name} can't be unique, include columns or be filtered: an XML \
+                         or spatial index takes none of those."
+                    ));
+                }
+                if ix.info.method.as_deref() == Some(crate::schema::TSQL_XML)
+                    && ix.info.using.as_deref().is_none_or(|u| u.trim().is_empty())
+                {
+                    out.push(format!(
+                        "Index {name} needs its USING XML INDEX … FOR … clause: a secondary XML \
+                         index is built on a primary one."
+                    ));
+                }
+            }
             // A columnstore index stores columns, not keys: T-SQL takes
             // neither `UNIQUE` nor `INCLUDE` on one.
             if ix.info.is_columnstore() {
@@ -5540,7 +5562,17 @@ impl ChangeSet {
                 _ => {}
             }
         }
-        for c in &admitted {
+        // A primary XML index before the rest: a secondary one is built on it,
+        // by name, and is refused until it exists.
+        let primary_xml = |c: &&&Change| {
+            matches!(c, Change::AddIndex(ix)
+                if ix.method.as_deref() == Some(crate::schema::TSQL_PRIMARY_XML))
+        };
+        for c in admitted
+            .iter()
+            .filter(primary_xml)
+            .chain(admitted.iter().filter(|c| !primary_xml(c)))
+        {
             match c {
                 // A unique constraint goes back as one, under its name, not as
                 // a unique index: `sys.key_constraints` is where tools and a
@@ -7750,8 +7782,8 @@ fn tsql_view_index_guard(qname: &str, v: &ViewDraft, server: &[IndexInfo]) -> Op
 
 /// The refusal for a view edit **that would drop an index it cannot create
 /// again**, or `None` when the change is fine: an indexed view's index of a
-/// kind the model has no field for ([`IndexInfo::lossy`] — an XML or spatial
-/// one; included columns and a columnstore are modelled) goes with the view's alter
+/// kind the model has no field for ([`IndexInfo::lossy`] — included columns, a
+/// columnstore, XML and spatial indexes are modelled) goes with the view's alter
 /// and could only come back without what was never read.
 ///
 /// **And a view created from a reading** (the comparison's create) with such
@@ -7786,16 +7818,15 @@ fn lossy_view_index_refusal(c: &Change) -> Option<String> {
     let plural = if lost.len() == 1 { "" } else { "es" };
     Some(if created {
         format!(
-            "Creating view {} can't create its index{plural} {} — an XML or spatial index, or \
-             another kind Schemaic can't restate. Create this view in SQL instead.",
+            "Creating view {} can't create its index{plural} {} — of a kind Schemaic can't \
+             restate. Create this view in SQL instead.",
             draft.name,
             lost.join(", ")
         )
     } else {
         format!(
-            "Editing view {} drops its index{plural} {}, which Schemaic can't create again — an \
-             XML or spatial index, or another kind Schemaic can't restate. Edit this view in SQL \
-             instead.",
+            "Editing view {} drops its index{plural} {}, which Schemaic can't create again — of \
+             a kind Schemaic can't restate. Edit this view in SQL instead.",
             draft.original.as_deref().unwrap_or(&draft.name),
             lost.join(", ")
         )
@@ -7938,6 +7969,24 @@ fn fk_clause(fk: &ForeignKeyInfo, owner: Option<&str>, dialect: SqlDialect) -> S
 }
 
 pub(crate) fn create_index_sql(ix: &IndexInfo, qtable: &str, dialect: SqlDialect) -> String {
+    // SQL Server's XML and spatial indexes: one column, then the clause the
+    // kind takes after it — a secondary XML index's `USING XML INDEX … FOR …`,
+    // a spatial one's tessellation and its options ([`IndexInfo::using`]).
+    if supports_xml_and_spatial_indexes(dialect) && ix.is_tsql_xml_or_spatial() {
+        let using = ix
+            .using
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+            .map(|u| format!(" {u}"))
+            .unwrap_or_default();
+        return format!(
+            "CREATE {} INDEX {} ON {qtable} ({}){using};",
+            ix.method.as_deref().unwrap_or_default(),
+            ddl_ident_in(&ix.name, dialect),
+            ix.key_sql(dialect)
+        );
+    }
     // SQL Server's columnstore: never unique, clustered or not said outright,
     // and a clustered one stores every column, so names none.
     if supports_columnstore(dialect) && ix.is_columnstore() {
@@ -9037,21 +9086,27 @@ pub fn supports_index_prefix(dialect: SqlDialect) -> bool {
     }
 }
 
-/// How a SQL Server index stores its rows — the designer's *Storage* choice,
-/// mapped onto [`IndexInfo::method`] and [`IndexInfo::clustered`] here so the
-/// form only shows it.
+/// What kind of index a SQL Server index is — the designer's *Storage*
+/// choice, mapped onto [`IndexInfo::method`], [`IndexInfo::clustered`] and
+/// [`IndexInfo::using`] here so the form only shows it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IndexStorage {
     Rowstore,
     Columnstore,
     ClusteredColumnstore,
+    PrimaryXml,
+    SecondaryXml,
+    Spatial,
 }
 
 impl IndexStorage {
-    pub const ALL: [IndexStorage; 3] = [
+    pub const ALL: [IndexStorage; 6] = [
         IndexStorage::Rowstore,
         IndexStorage::Columnstore,
         IndexStorage::ClusteredColumnstore,
+        IndexStorage::PrimaryXml,
+        IndexStorage::SecondaryXml,
+        IndexStorage::Spatial,
     ];
 
     pub fn label(self) -> &'static str {
@@ -9059,33 +9114,76 @@ impl IndexStorage {
             IndexStorage::Rowstore => "Rowstore",
             IndexStorage::Columnstore => "Columnstore",
             IndexStorage::ClusteredColumnstore => "Clustered columnstore",
+            IndexStorage::PrimaryXml => "Primary XML",
+            IndexStorage::SecondaryXml => "Secondary XML",
+            IndexStorage::Spatial => "Spatial",
         }
+    }
+
+    /// The `method` this kind is, or `None` for a rowstore index.
+    fn method(self) -> Option<&'static str> {
+        use crate::schema::{TSQL_COLUMNSTORE, TSQL_PRIMARY_XML, TSQL_SPATIAL, TSQL_XML};
+        match self {
+            IndexStorage::Rowstore => None,
+            IndexStorage::Columnstore | IndexStorage::ClusteredColumnstore => {
+                Some(TSQL_COLUMNSTORE)
+            }
+            IndexStorage::PrimaryXml => Some(TSQL_PRIMARY_XML),
+            IndexStorage::SecondaryXml => Some(TSQL_XML),
+            IndexStorage::Spatial => Some(TSQL_SPATIAL),
+        }
+    }
+
+    /// Is this kind offered on `dialect` — each family asked of its own
+    /// capability, a rowstore index everywhere.
+    pub fn offered(self, dialect: SqlDialect) -> bool {
+        match self {
+            IndexStorage::Rowstore => true,
+            IndexStorage::Columnstore | IndexStorage::ClusteredColumnstore => {
+                supports_columnstore(dialect)
+            }
+            IndexStorage::PrimaryXml | IndexStorage::SecondaryXml | IndexStorage::Spatial => {
+                supports_xml_and_spatial_indexes(dialect)
+            }
+        }
+    }
+
+    /// Does this kind take a clause after its column ([`IndexInfo::using`])?
+    pub fn takes_using(self) -> bool {
+        matches!(self, IndexStorage::SecondaryXml | IndexStorage::Spatial)
     }
 
     pub fn of(ix: &IndexInfo) -> IndexStorage {
-        match (ix.is_columnstore(), ix.clustered == Some(true)) {
-            (false, _) => IndexStorage::Rowstore,
-            (true, false) => IndexStorage::Columnstore,
-            (true, true) => IndexStorage::ClusteredColumnstore,
-        }
+        IndexStorage::ALL
+            .into_iter()
+            .filter(|s| *s != IndexStorage::Rowstore && s.method() == ix.method.as_deref())
+            .find(|s| {
+                !ix.is_columnstore()
+                    || (*s == IndexStorage::ClusteredColumnstore) == (ix.clustered == Some(true))
+            })
+            .unwrap_or(IndexStorage::Rowstore)
     }
 
-    /// Make `ix` store this way. A columnstore index is never unique and
-    /// lists no included columns, and a clustered one names no columns at
-    /// all, so what it cannot carry is cleared rather than left for
-    /// `validate` to refuse; back to rowstore, it takes T-SQL's default
-    /// clustering again.
+    /// Make `ix` this kind, clearing what the kind cannot carry rather than
+    /// leaving `validate` to refuse it: a columnstore index is never unique
+    /// and lists no included columns, a clustered one names no columns at
+    /// all; an XML or spatial index is over one column, unfiltered, and keeps
+    /// its clause only while it stays the kind the clause was written for.
+    /// Back to rowstore, it takes T-SQL's default clustering again.
     pub fn apply(self, ix: &mut IndexInfo) {
+        let was = IndexStorage::of(ix);
+        if was != self {
+            ix.using = None;
+        }
+        ix.method = self.method().map(str::to_string);
         match self {
             IndexStorage::Rowstore => {
-                if ix.is_columnstore() {
-                    ix.method = None;
+                if was != IndexStorage::Rowstore {
                     ix.clustered = None;
                 }
             }
             IndexStorage::Columnstore | IndexStorage::ClusteredColumnstore => {
                 let clustered = self == IndexStorage::ClusteredColumnstore;
-                ix.method = Some(crate::schema::TSQL_COLUMNSTORE.to_string());
                 ix.clustered = Some(clustered);
                 ix.unique = false;
                 ix.include.clear();
@@ -9093,7 +9191,24 @@ impl IndexStorage {
                     ix.columns.clear();
                 }
             }
+            IndexStorage::PrimaryXml | IndexStorage::SecondaryXml | IndexStorage::Spatial => {
+                ix.clustered = None;
+                ix.unique = false;
+                ix.include.clear();
+                ix.predicate = None;
+                ix.columns.truncate(1);
+            }
         }
+    }
+}
+
+/// Does `dialect` have **XML and spatial** indexes
+/// ([`IndexInfo::is_tsql_xml_or_spatial`]) — SQL Server's alone, written only
+/// by its emitter.
+pub fn supports_xml_and_spatial_indexes(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MsSql => true,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
     }
 }
 
@@ -9580,6 +9695,7 @@ fn indexes_equal(a: &IndexInfo, b: &IndexInfo) -> bool {
         && a.columns == b.columns
         && a.include == b.include
         && a.method == b.method
+        && a.using == b.using
         // A clustered columnstore index is the table's storage, a
         // nonclustered one a copy beside it: the same method, other indexes.
         && a.is_clustered_columnstore() == b.is_clustered_columnstore()
@@ -12570,7 +12686,7 @@ fn tsql_var_widening(from: &str, to: &str) -> bool {
 ///
 /// **A dependent the plan already drops or re-adds is the draft's** and is
 /// left alone, as the check repair above leaves one. One the model cannot
-/// restate — a lossy index (an XML or spatial one) — is not touched: the
+/// restate — a lossy index (a selective XML one, an ordered columnstore) — is not touched: the
 /// server then refuses the change naming it, and the plan, one transaction,
 /// rolls back whole. One it reads but only in part — an index's options, a
 /// key's disabled state, a description — is taken off and put back only past
@@ -14352,9 +14468,9 @@ fn tsql_late_arm(probe: &str, cond: &str, why: &str) -> String {
 /// What a T-SQL rebuild ([`tsql_rebuild_sql`]) cannot put back from the
 /// model, said before anything runs — the half of its refusals the reading
 /// already shows, where the guard it opens with is the half only the server
-/// can answer. An index Schemaic does not read whole (an XML or spatial one,
-/// or an ordered columnstore — included columns and a columnstore it reads)
-/// would come back without what it
+/// can answer. An index Schemaic does not read whole (a selective XML one or an
+/// ordered columnstore — included columns, a columnstore, XML and spatial
+/// indexes it reads) would come back without what it
 /// did not read; a trigger whose text is encrypted has none to put back; a signed one
 /// would come back unsigned (S2-L5-05); one kept verbatim names the table as
 /// it was, which a rename leaves behind.
@@ -14366,8 +14482,8 @@ fn tsql_rebuild_refusals(current: &TableInfo, draft: &TableDraft) -> Vec<String>
         .filter(|ix| ix.lossy && !ix.is_primary())
         .map(|ix| {
             format!(
-                "Rebuilding {t} would drop the index {}: it is an XML or spatial index, or \
-                 another kind Schemaic doesn't read whole",
+                "Rebuilding {t} would drop the index {}: it is a selective XML index or an \
+                 ordered columnstore, or another kind Schemaic doesn't read whole",
                 ix.name
             )
         })
@@ -15334,6 +15450,22 @@ pub fn diff(current: &TableInfo, draft: &TableDraft, target: impl Into<Target>) 
                 current: current.clone(),
                 draft: draft.clone(),
             })),
+        );
+    }
+
+    // **A primary XML index is dropped after the rest**: dropping one drops
+    // every secondary XML index built on it, so a secondary's own `DROP INDEX`
+    // after it found nothing to drop (Msg 3701, measured on 2022). The drop
+    // carries no kind, so the order is set here, where the reading is.
+    let primary_xml: HashSet<&str> = current
+        .indexes
+        .iter()
+        .filter(|ix| ix.method.as_deref() == Some(crate::schema::TSQL_PRIMARY_XML))
+        .map(|ix| ix.name.as_str())
+        .collect();
+    if !primary_xml.is_empty() {
+        changes.sort_by_key(
+            |c| matches!(c, Change::DropIndex { name, .. } if primary_xml.contains(name.as_str())),
         );
     }
 
@@ -18592,6 +18724,110 @@ mod tests {
         );
     }
 
+    fn xml_or_spatial(name: &str, method: &str, col: &str, using: Option<&str>) -> IndexInfo {
+        IndexInfo {
+            name: name.into(),
+            columns: vec![crate::schema::IndexColumn::plain(col)],
+            method: Some(method.into()),
+            using: using.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    /// **An XML or spatial index is written as one** — its kind's keyword, its
+    /// one column, and the clause after it as read: a secondary XML index's
+    /// primary and `FOR`, a spatial one's tessellation and options.
+    #[test]
+    fn an_xml_or_spatial_index_is_restated_as_one() {
+        use crate::schema::{TSQL_PRIMARY_XML, TSQL_SPATIAL, TSQL_XML};
+        let add = |ix| single("p", Some("dbo"), MsSql, Change::AddIndex(Box::new(ix))).emit();
+        assert_eq!(
+            add(xml_or_spatial("pxml", TSQL_PRIMARY_XML, "doc", None)),
+            vec!["CREATE PRIMARY XML INDEX [pxml] ON [dbo].[p] ([doc]);"]
+        );
+        assert_eq!(
+            add(xml_or_spatial(
+                "sxml",
+                TSQL_XML,
+                "doc",
+                Some("USING XML INDEX [pxml] FOR PATH")
+            )),
+            vec!["CREATE XML INDEX [sxml] ON [dbo].[p] ([doc]) USING XML INDEX [pxml] FOR PATH;"]
+        );
+        let using = "USING GEOMETRY_GRID WITH (BOUNDING_BOX = (0, 0, 100, 100), GRIDS = \
+                     (LEVEL_1 = LOW, LEVEL_2 = MEDIUM, LEVEL_3 = HIGH, LEVEL_4 = MEDIUM), \
+                     CELLS_PER_OBJECT = 20)";
+        assert_eq!(
+            add(xml_or_spatial("sp", TSQL_SPATIAL, "g", Some(using))),
+            vec![format!(
+                "CREATE SPATIAL INDEX [sp] ON [dbo].[p] ([g]) {using};"
+            )]
+        );
+        assert!(supports_xml_and_spatial_indexes(MsSql));
+        for d in [Postgres, MySql, Sqlite] {
+            assert!(!supports_xml_and_spatial_indexes(d), "{d:?}");
+        }
+    }
+
+    /// **A primary XML index goes on first and comes off last**: a secondary
+    /// is built on it by name, and dropping it drops every secondary — so a
+    /// secondary's own `DROP` after it was Msg 3701 (measured on 2022).
+    #[test]
+    fn a_primary_xml_index_is_created_first_and_dropped_last() {
+        use crate::schema::{TSQL_PRIMARY_XML, TSQL_XML};
+        let primary = xml_or_spatial("z_pxml", TSQL_PRIMARY_XML, "code", None);
+        let secondary = xml_or_spatial(
+            "a_sxml",
+            TSQL_XML,
+            "code",
+            Some("USING XML INDEX [z_pxml] FOR VALUE"),
+        );
+        let mut t = ms_rebuild_table();
+        t.indexes.push(primary.clone());
+        t.indexes.push(secondary.clone());
+        let mut d = TableDraft::from_table(&t);
+        d.indexes.retain(|i| !i.info.is_tsql_xml_or_spatial());
+        let drops = diff(&t, &d, MsSql).emit();
+        let at = |stmts: &[String], n: &str| {
+            stmts
+                .iter()
+                .position(|s| s.contains(n))
+                .unwrap_or_else(|| panic!("no {n} in {stmts:#?}"))
+        };
+        assert!(
+            at(&drops, "[a_sxml]") < at(&drops, "[z_pxml]"),
+            "{drops:#?}"
+        );
+
+        let mut bare = ms_rebuild_table();
+        bare.indexes.retain(|i| i.is_primary());
+        let mut d = TableDraft::from_table(&bare);
+        d.indexes.push(IndexDraft::new(secondary));
+        d.indexes.push(IndexDraft::new(primary));
+        let adds = diff(&bare, &d, MsSql).emit();
+        assert!(at(&adds, "[z_pxml]") < at(&adds, "[a_sxml]"), "{adds:#?}");
+    }
+
+    /// An XML or spatial index names one column and takes none of a rowstore
+    /// index's options; a secondary XML one must name its primary.
+    #[test]
+    fn an_xml_or_spatial_index_is_refused_what_it_cannot_take() {
+        use crate::schema::TSQL_XML;
+        let mut t = ms_rebuild_table();
+        t.indexes.push(IndexInfo {
+            unique: true,
+            columns: vec![
+                crate::schema::IndexColumn::plain("qty"),
+                crate::schema::IndexColumn::plain("code"),
+            ],
+            ..xml_or_spatial("sxml", TSQL_XML, "qty", None)
+        });
+        let errs = TableDraft::from_table(&t).validate(MsSql).join(" ");
+        for needle in ["exactly one column", "can't be unique", "USING XML INDEX"] {
+            assert!(errs.contains(needle), "{needle}: {errs}");
+        }
+    }
+
     /// **The Storage choice round-trips, and clears what the new storage
     /// cannot carry**: a columnstore index's uniqueness and include list, a
     /// clustered one's columns; back to rowstore, T-SQL's default clustering.
@@ -18617,6 +18853,27 @@ mod tests {
         let mut ix = columnstore(true, &[]);
         IndexStorage::Rowstore.apply(&mut ix);
         assert_eq!((ix.method, ix.clustered), (None, None));
+
+        // An XML or spatial kind keeps one column and no filter; its clause
+        // survives staying that kind, and is dropped on becoming another.
+        let mut ix = IndexInfo {
+            predicate: Some("qty > 0".into()),
+            columns: vec![
+                crate::schema::IndexColumn::plain("qty"),
+                crate::schema::IndexColumn::plain("code"),
+            ],
+            using: Some("USING GEOMETRY_AUTO_GRID".into()),
+            method: Some(crate::schema::TSQL_SPATIAL.into()),
+            ..covering(&[])
+        };
+        IndexStorage::Spatial.apply(&mut ix);
+        assert_eq!(ix.columns.len(), 1);
+        assert!(ix.predicate.is_none());
+        assert_eq!(ix.using.as_deref(), Some("USING GEOMETRY_AUTO_GRID"));
+        IndexStorage::SecondaryXml.apply(&mut ix);
+        assert!(ix.using.is_none());
+        assert!(IndexStorage::SecondaryXml.takes_using() && IndexStorage::Spatial.takes_using());
+        assert!(!IndexStorage::PrimaryXml.takes_using());
     }
 
     /// A columnstore index is neither unique nor has included columns — it
@@ -18740,7 +18997,7 @@ mod tests {
 
     /// **A rebuild restates an index with included columns** rather than
     /// refusing the table, which is what it did while the model could not hold
-    /// one; an XML or spatial index still stops it.
+    /// one; a selective XML index or an ordered columnstore still stops it.
     #[test]
     fn a_sql_server_rebuild_restates_an_index_with_included_columns() {
         let mut t = ms_rebuild_table();
