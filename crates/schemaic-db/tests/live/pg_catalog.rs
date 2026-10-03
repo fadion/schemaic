@@ -164,6 +164,35 @@ async fn an_empty_schema_is_listed_and_not_created_again() {
     source.teardown().await;
 }
 
+/// **A database is dropped from a connection that names it only when the run
+/// avoids it** (S1-L1-01): the schema tree's Drop carried no name to avoid,
+/// so the maintenance connection tried the connection's own database first —
+/// the one being dropped — and PostgreSQL refused to drop the currently open
+/// database. Told to avoid it, the run connects elsewhere and the drop lands.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_database_named_by_the_connection_is_dropped_when_avoided() {
+    if !POSTGRES.enabled() {
+        endpoint::note_skipped(&POSTGRES);
+        return;
+    }
+    let s = crate::scratch::Scratch::create(&POSTGRES, "drop_self").await;
+    let drop = vec![format!("DROP DATABASE \"{}\";", s.database)];
+    let refused =
+        s.db.run_server_ddl(None, &drop, CancellationToken::new())
+            .await
+            .expect_err("not avoided, the run is inside the database it drops");
+    assert!(refused.to_string().contains("currently open"), "{refused}");
+    s.db.run_server_ddl(Some(&s.database), &drop, CancellationToken::new())
+        .await
+        .unwrap_or_else(|e| panic!("avoided, the drop lands: {e}"));
+    // Back again, for the teardown's own drop.
+    let create = vec![format!("CREATE DATABASE \"{}\";", s.database)];
+    s.db.run_server_ddl(Some(&s.database), &create, CancellationToken::new())
+        .await
+        .unwrap();
+    s.teardown().await;
+}
+
 /// The server knows a name this catalog does not — a false positive waiting for
 /// whoever types it.
 #[tokio::test(flavor = "multi_thread")]

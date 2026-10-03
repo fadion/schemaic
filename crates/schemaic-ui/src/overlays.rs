@@ -289,6 +289,24 @@ pub(crate) struct ObjectEntries {
     pub drop: bool,
 }
 
+/// The target the schema tree's **Drop database** runs against: server-level,
+/// where `DdlScope::Server` wants the database the run must *avoid* — the one
+/// being dropped. It carried none, so on PostgreSQL the maintenance
+/// connection tried the connection's configured database first, which is
+/// the one being dropped, and the server refused to drop the currently open
+/// database (S1-L1-01).
+pub(crate) fn drop_database_target(
+    ctx: &crate::table_designer::EditCtx,
+    name: &str,
+) -> crate::ddl_preview::PlanTarget {
+    crate::ddl_preview::PlanTarget {
+        conn_id: ctx.conn_id,
+        database: name.to_string(),
+        dialect: ctx.dialect,
+        read_only: ctx.read_only,
+    }
+}
+
 /// The change a table-menu **Drop** makes of the object under the cursor —
 /// [`schemaic_core::stats::drop_change`], where why a sequence is a
 /// `DropTable` is said.
@@ -1793,15 +1811,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                 // is that sentence (`Change::risks`), naming the
                                 // database and everything in it.
                                 let ctx = crate::table_designer::edit_ctx(ui.conn);
-                                let on = crate::ddl_preview::PlanTarget {
-                                    conn_id: ctx.conn_id,
-                                    // Server-level: `DdlScope::Server` wants the
-                                    // database the run must *avoid*, and a
-                                    // dropped database is not one to run in.
-                                    database: String::new(),
-                                    dialect: ctx.dialect,
-                                    read_only: ctx.read_only,
-                                };
+                                let on = drop_database_target(&ctx, &db);
                                 crate::ddl_preview::preview_container(
                                     ui.ddl,
                                     on,
@@ -6152,6 +6162,24 @@ mod object_menu_tests {
         });
         assert!(super::object_drop_offered(&ty, Postgres));
         assert!(!super::object_drop_offered(&ty, MsSql));
+    }
+
+    /// **Drop database tells the run which database to avoid — the one it
+    /// drops** (S1-L1-01): it carried an empty name, so on PostgreSQL the
+    /// maintenance connection went to the connection's configured database
+    /// first — the very one being dropped — and the server refused to drop
+    /// the currently open database.
+    #[test]
+    fn drop_database_avoids_the_database_it_drops() {
+        let ctx = crate::table_designer::EditCtx {
+            conn_id: 7,
+            dialect: Postgres,
+            read_only: false,
+            exists: true,
+        };
+        let on = super::drop_database_target(&ctx, "shop");
+        assert_eq!(on.database, "shop");
+        assert_eq!((on.conn_id, on.dialect, on.read_only), (7, Postgres, false));
     }
 }
 

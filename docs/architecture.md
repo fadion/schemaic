@@ -13237,7 +13237,13 @@ existing prose was left alone.
   *configured* database is the first maintenance candidate and dropping it would otherwise pick,
   before anything else, the one connection that cannot perform the statement
   (`the_database_being_dropped_is_never_the_one_it_runs_on`, which covers the username guess too
-  — role and database sharing a name is the default PostgreSQL setup). SQLite's arm is an error
+  — role and database sharing a name is the default PostgreSQL setup). **The schema tree's Drop
+  has to hand it the target**, and for a while it did not: its `PlanTarget` carried an empty
+  `database`, the app turned that into `avoid = None`, and dropping the database a connection is
+  configured with ran from inside it — *cannot drop the currently open database* (S1-L1-01).
+  `overlays::drop_database_target` builds it with the dropped name now
+  (`drop_database_avoids_the_database_it_drops`; live, PostgreSQL 16,
+  `pg_catalog::a_database_named_by_the_connection_is_dropped_when_avoided`). SQLite's arm is an error
   with a sentence in it rather than a statement: a database there is a file, so creating one is
   the connection form's business and dropping one would be deleting the user's file off disk.
   SQL Server's arm attaches to **`master`**, never the target — which is being made, or must hold
