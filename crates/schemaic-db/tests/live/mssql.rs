@@ -2828,6 +2828,135 @@ async fn standalone_objects_are_created_and_edited_as_drafted() {
     read(ObjectKind::XmlSchemaCollection, "bill").await;
 }
 
+/// **A replace refuses what its `DROP` would take**: a GRANT or DENY on a
+/// sequence, synonym, alias type or XML schema collection, and an alias
+/// type's bound rule. Each went with the drop — four permission rows to
+/// none, a DENY lifted — and the plan said nothing. Here each is refused,
+/// the permissions survive, and the same edits of unguarded objects apply.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replace_refuses_over_permissions_and_a_bound_rule() {
+    use schemaic_core::ddl::{self, ObjectKind, TsqlObjectDraft};
+    use schemaic_core::schema::TsqlObjectKind;
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("objects_replace_guard").await;
+    let xsd = "<xsd:schema xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\" \
+               targetNamespace=\"urn:a\"><xsd:element name=\"a\" type=\"xsd:int\"/></xsd:schema>";
+    for suffix in ["", "_free", "_owned", "_prop"] {
+        s.exec(&format!(
+            "CREATE SEQUENCE dbo.sq{suffix} AS bigint START WITH 1; \
+             CREATE SYNONYM dbo.syn{suffix} FOR dbo.t; \
+             CREATE TYPE dbo.code{suffix} FROM nvarchar(10) NULL; \
+             CREATE XML SCHEMA COLLECTION dbo.xc{suffix} AS N'{xsd}';"
+        ))
+        .await;
+    }
+    s.exec("CREATE USER zz_reader WITHOUT LOGIN").await;
+    s.exec(
+        "GRANT UPDATE ON dbo.sq TO zz_reader; DENY SELECT ON dbo.syn TO zz_reader; \
+         GRANT REFERENCES ON TYPE::dbo.code TO zz_reader; \
+         GRANT EXECUTE ON XML SCHEMA COLLECTION::dbo.xc TO zz_reader;",
+    )
+    .await;
+    s.exec("CREATE TYPE dbo.pct FROM int NULL").await;
+    s.exec("CREATE RULE dbo.pct_rule AS @v BETWEEN 0 AND 100")
+        .await;
+    s.exec("EXEC sp_bindrule N'dbo.pct_rule', N'dbo.pct'").await;
+    s.exec("CREATE TYPE dbo.qty FROM int NULL").await;
+    s.exec("CREATE DEFAULT dbo.qty_default AS 0").await;
+    s.exec("EXEC sp_bindefault N'dbo.qty_default', N'dbo.qty'")
+        .await;
+    // Every arm in every catalogue class: a class asked wrong fails open.
+    s.exec(
+        "ALTER AUTHORIZATION ON OBJECT::dbo.sq_owned TO zz_reader; \
+         ALTER AUTHORIZATION ON OBJECT::dbo.syn_owned TO zz_reader; \
+         ALTER AUTHORIZATION ON TYPE::dbo.code_owned TO zz_reader; \
+         ALTER AUTHORIZATION ON XML SCHEMA COLLECTION::dbo.xc_owned TO zz_reader;",
+    )
+    .await;
+    for (level1, name) in [
+        ("SEQUENCE", "sq_prop"),
+        ("SYNONYM", "syn_prop"),
+        ("TYPE", "code_prop"),
+        ("XML SCHEMA COLLECTION", "xc_prop"),
+    ] {
+        s.exec(&format!(
+            "EXEC sp_addextendedproperty N'note', N'x', N'SCHEMA', N'dbo', N'{level1}', N'{name}'"
+        ))
+        .await;
+    }
+    let schema =
+        s.db.fetch_schema(&s.name, CancellationToken::new())
+            .await
+            .expect("the schema");
+    let replace = |kind: ObjectKind, name: &str| {
+        let cur = schema
+            .find_object(Some("dbo"), kind, name)
+            .and_then(|o| o.tsql().cloned())
+            .unwrap_or_else(|| panic!("{kind:?} {name}"));
+        let mut d = TsqlObjectDraft::from_info(&cur);
+        match &mut d.info.kind {
+            TsqlObjectKind::Sequence { start, .. } => *start = "5".into(),
+            TsqlObjectKind::Synonym { target } => *target = vec!["dbo".into(), "u".into()],
+            TsqlObjectKind::AliasType { base, .. } => *base = "nvarchar(20)".into(),
+            TsqlObjectKind::XmlSchemaCollection { definition } => {
+                *definition = definition.replace("urn:a", "urn:b")
+            }
+        }
+        ddl::diff_tsql_object(&cur, &d).emit()
+    };
+    let perms = "SELECT COUNT(*) FROM sys.database_permissions \
+                 WHERE grantee_principal_id = USER_ID(N'zz_reader') AND class <> 0";
+    assert_eq!(s.scalar(perms).await, "4");
+    for (kind, name, why) in [
+        (ObjectKind::Sequence, "sq", "permissions"),
+        (ObjectKind::Synonym, "syn", "permissions"),
+        (ObjectKind::AliasType, "code", "permissions"),
+        (ObjectKind::XmlSchemaCollection, "xc", "permissions"),
+        (ObjectKind::AliasType, "pct", "rule or default"),
+        (ObjectKind::AliasType, "qty", "rule or default"),
+        (ObjectKind::Sequence, "sq_owned", "owner"),
+        (ObjectKind::Synonym, "syn_owned", "owner"),
+        (ObjectKind::AliasType, "code_owned", "owner"),
+        (ObjectKind::XmlSchemaCollection, "xc_owned", "owner"),
+        (ObjectKind::Sequence, "sq_prop", "extended properties"),
+        (ObjectKind::Synonym, "syn_prop", "extended properties"),
+        (ObjectKind::AliasType, "code_prop", "extended properties"),
+        (
+            ObjectKind::XmlSchemaCollection,
+            "xc_prop",
+            "extended properties",
+        ),
+    ] {
+        let stmts = replace(kind, name);
+        let err =
+            s.db.run_ddl(&s.name, &stmts, CancellationToken::new())
+                .await
+                .expect_err(name)
+                .to_string();
+        assert!(err.contains(why), "{name}: {err}");
+    }
+    assert_eq!(s.scalar(perms).await, "4", "every permission survives");
+    assert_ne!(
+        s.scalar("SELECT rule_object_id FROM sys.types WHERE name = N'pct'")
+            .await,
+        "0"
+    );
+    // Nothing stands on the `_free` twins, so the guard lets each replace run.
+    for (kind, name) in [
+        (ObjectKind::Sequence, "sq_free"),
+        (ObjectKind::Synonym, "syn_free"),
+        (ObjectKind::AliasType, "code_free"),
+        (ObjectKind::XmlSchemaCollection, "xc_free"),
+    ] {
+        let stmts = replace(kind, name);
+        s.db.run_ddl(&s.name, &stmts, CancellationToken::new())
+            .await
+            .unwrap_or_else(|e| panic!("{name}: {e}\n{}", stmts.join("\n")));
+    }
+}
+
 /// **A namespace is created and dropped in the plan's transaction**, and
 /// `CREATE SCHEMA` — which T-SQL wants first in its batch — runs as the
 /// emitter writes it, ahead of a table in the same plan. A drop of one still

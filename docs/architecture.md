@@ -5787,20 +5787,40 @@ existing prose was left alone.
     plain rather than the dump's `IF EXISTS` because the object came off the catalogue, and the
     server's refusal over what uses it is the plan's answer. Measured on 2022: `sp_rename` renames
     a sequence keeping its position, a synonym, and an alias type given `USERDATATYPE`, and all of
-    it works inside a transaction. **The risk sentences follow the act**: an `AlterTsqlSequence`
+    it works inside a transaction. **What stands on the object rather than in it goes with the
+    drop**, and `create_sql` restates the definition alone: a GRANT, a DENY — a DENY dropped is a
+    DENY lifted — an owner set by `ALTER AUTHORIZATION`, extended properties, and an alias type's
+    `sp_bindrule`/`sp_bindefault`, none of which the model reads. Before R3-L5-01 a replace took
+    four permission rows to none and `rule_object_id` to 0, measured on 2022, while the plan said
+    nothing. So the arm opens with `tsql_replace_guard`, a
+    `DECLARE @id … CASE … THROW 50000` batch of the table rebuild's shape, which refuses over each
+    — refuse rather than restore, as the rebuild does over a table's permissions and owner, because
+    restoring grants would need a model of them this one does not have. Each kind asks its own
+    catalogue class — 1 for a sequence or synonym through `OBJECT_ID`, 6 for an alias type through
+    `TYPE_ID`, 10 for a collection through `sys.xml_schema_collections` — and a class asked wrong
+    fails open without a sound, as the rebuild guard's arm about what stands on the table did
+    (above). A comparison's replace is the same `Change`, so its Apply is refused with the same
+    reason. **The risk sentences follow the act**: an `AlterTsqlSequence`
     carrying a restart gets `RestartSequence`'s sentence; a sequence's replace says the position it
     had reached is lost and it starts over, and that the server refuses the drop while a default
     draws from it; an alias type's or a collection's, that it refuses while a column uses one; a
-    synonym's replace carries none (`an_unedited_object_is_no_change`,
+    synonym's, that nothing refuses its drop — and every replace a second sentence naming what the
+    guard refuses over. A synonym's replace used to carry none, so its Apply wore `Primary` over a
+    lifted DENY; it wears `Danger` now (`an_unedited_object_is_no_change`,
     `a_new_object_is_created_with_the_dumps_statement`,
     `a_sequence_is_altered_in_place_and_retyped_by_replacing_it`,
     `what_t_sql_cannot_alter_is_replaced_and_a_name_is_renamed`,
-    `a_draft_is_refused_for_what_the_form_can_know`; live,
+    `a_draft_is_refused_for_what_the_form_can_know`,
+    `a_replace_refuses_what_its_drop_would_take_and_says_so`; live,
     `standalone_objects_are_created_and_edited_as_drafted` on 2022 and 2025 — a sequence, alias
     type and collection created from their blank forms and read back as no change, a synonym
     created with a target, a sequence moved to increment 5, restarted at 100 and renamed with
     `NEXT VALUE FOR` then answering 100 and 105, a synonym re-pointed and renamed, an alias type
-    renamed through `sp_rename` and a collection renamed by replacement). `ObjectDraft::Tsql` wires
+    renamed through `sp_rename` and a collection renamed by replacement — and
+    `a_replace_refuses_over_permissions_and_a_bound_rule`, every arm on every kind — a GRANT or
+    DENY, an owner of its own, an extended property, and a bound rule and a bound default on an
+    alias type — each replace refused with every permission surviving and its unguarded twin
+    replaced, on 2022). `ObjectDraft::Tsql` wires
     it into the editor: `from_item` answers it for `ObjectItem::Tsql`, and `kind`, `name`,
     `validate` and `change_set` route to it. **`ObjectDraft::blank` takes the dialect now, because
     a sequence's draft depends on it** — PostgreSQL's `SequenceDraft` on PostgreSQL, MySQL and
@@ -6539,7 +6559,9 @@ existing prose was left alone.
     the two readings (the right one through `TsqlObjectDraft::from_info`), `create_tsql_object` for
     one only the right holds, `drop_object` for one only the left does. Those are the object
     editor's own builders (under `ddl.rs`), so there is no second differ here, and a sequence whose
-    step differs comes out as the `ALTER SEQUENCE … INCREMENT BY 5` the form would have written;
+    step differs comes out as the `ALTER SEQUENCE … INCREMENT BY 5` the form would have written,
+    and one that has to be re-created carries the editor's `tsql_replace_guard`, so a plan
+    replacing an object with permissions on it is refused at Apply with the reason;
     `left_ddl`/`right_ddl` are `TsqlObject::create_sql`, the dump's own statement. A T-SQL sequence
     pairs under `CompareKind::Sequence` beside PostgreSQL's — the two never meet, a T-SQL one being
     in `tsql_objects` and never in `sequences` — and the other three are kinds of their own,

@@ -4632,24 +4632,45 @@ impl Change {
             )],
             // A replace is the drop's consequence plus the create's: what the
             // drop refuses over still stops it (measured, 2022), and a
-            // sequence created again starts over. A synonym holds nothing, and
-            // the two statements run in one transaction.
-            Change::ReplaceTsqlObject { from, .. } => match from.object_kind() {
-                ObjectKind::Synonym => Vec::new(),
-                ObjectKind::Sequence => vec![
-                    "Drops the sequence and creates it again: the position it had \
-                     reached is lost, and it starts over from its start value. The \
-                     server refuses the drop while a column's default still draws \
-                     from it."
+            // sequence created again starts over. And what stands on the object
+            // rather than in it — permissions, an owner, extended properties, a
+            // bound rule — would go with the drop, so the plan refuses over
+            // them (`tsql_replace_guard`); said for every kind, the synonym's
+            // included, whose Apply wore Primary over a lifted DENY.
+            Change::ReplaceTsqlObject { from, .. } => {
+                let kept = match from.object_kind() {
+                    ObjectKind::AliasType => {
+                        "permissions on it, an owner of its own, extended properties or \
+                         a bound rule or default"
+                    }
+                    _ => "permissions on it, an owner of its own or extended properties",
+                };
+                let first = match from.object_kind() {
+                    ObjectKind::Synonym => {
+                        "Drops the synonym and creates it again. Nothing refuses the \
+                         drop: the two statements run in one transaction."
+                            .to_string()
+                    }
+                    ObjectKind::Sequence => "Drops the sequence and creates it again: \
+                         the position it had reached is lost, and it starts over from \
+                         its start value. The server refuses the drop while a column's \
+                         default still draws from it."
                         .to_string(),
-                ],
-                k => vec![format!(
-                    "Drops the {} and creates it again. The server refuses the drop \
-                     while a column still uses it, so those columns have to change \
-                     type first.",
-                    k.label()
-                )],
-            },
+                    k => format!(
+                        "Drops the {} and creates it again. The server refuses the drop \
+                         while a column still uses it, so those columns have to change \
+                         type first.",
+                        k.label()
+                    ),
+                };
+                vec![
+                    first,
+                    format!(
+                        "Refused while it has {kept}: the re-create would not restore \
+                         them."
+                    ),
+                ]
+            }
             // **The largest single act in this module, and the sentence says so
             // in the terms the user can check.** It names the database, because
             // this is the one plan where reading the wrong name and clicking
@@ -5439,8 +5460,10 @@ impl ChangeSet {
                 Change::CreateTsqlObject(t) => out.push(t.create_sql()),
                 // A plain `DROP`, not the dump's `IF EXISTS`: the object came
                 // off the catalogue, and the server's refusal over what uses
-                // it is the plan's answer.
+                // it is the plan's answer. The guard first, over what the drop
+                // takes that the create does not restate.
                 Change::ReplaceTsqlObject { from, to } => {
+                    out.push(tsql_replace_guard(from));
                     out.push(format!(
                         "DROP {} {};",
                         from.object_kind().sql_keyword(),
@@ -8312,6 +8335,87 @@ fn declares_sqlite_autoincrement(d: &TableDraft) -> bool {
 /// The one literal rule, `ddl_string`'s, under a name that says which grammar.
 fn tsql_n(s: &str) -> String {
     ddl_string(s, SqlDialect::MsSql)
+}
+
+/// The batch a [`Change::ReplaceTsqlObject`] runs ahead of its `DROP`,
+/// refusing (`THROW`) over what the drop takes and the `CREATE` does not put
+/// back: a GRANT or a DENY on the object — a DENY dropped is a DENY lifted —
+/// an owner of its own, extended properties, and an alias type's bound rule
+/// or default. The re-create restates the definition alone, and none of
+/// these is in the model (measured on 2022: four permission rows to none,
+/// `rule_object_id` to 0). The same refusal the table rebuild's guard makes
+/// over a table's permissions and owner.
+///
+/// Each kind in its own catalogue class: an object's (a sequence's, a
+/// synonym's) is 1, a type's 6, an XML schema collection's 10.
+fn tsql_replace_guard(from: &crate::schema::TsqlObject) -> String {
+    use crate::schema::TsqlObjectKind as T;
+    let q = tsql_n(&from.qname());
+    let schema = from
+        .schema
+        .as_deref()
+        .unwrap_or(crate::schema::MSSQL_DEFAULT_SCHEMA);
+    let (class, id, owner) = match &from.kind {
+        T::Sequence { .. } | T::Synonym { .. } => (
+            "1",
+            format!("OBJECT_ID({q})"),
+            "sys.objects WHERE object_id",
+        ),
+        T::AliasType { .. } => ("6", format!("TYPE_ID({q})"), "sys.types WHERE user_type_id"),
+        T::XmlSchemaCollection { .. } => (
+            "10",
+            format!(
+                "(SELECT xml_collection_id FROM sys.xml_schema_collections \
+                 WHERE schema_id = SCHEMA_ID({}) AND name = {})",
+                tsql_n(schema),
+                tsql_n(&from.name)
+            ),
+            "sys.xml_schema_collections WHERE xml_collection_id",
+        ),
+    };
+    let what = format!("the {} {}", from.kind_label(), from.qname());
+    let mut reasons = vec![
+        (
+            format!(
+                "EXISTS (SELECT 1 FROM sys.database_permissions WHERE class = {class} AND major_id = @id)"
+            ),
+            format!("Re-creating {what} would drop the permissions granted or denied on it"),
+        ),
+        (
+            format!("EXISTS (SELECT 1 FROM {owner} = @id AND principal_id IS NOT NULL)"),
+            format!("Re-creating {what} would drop the owner it has of its own"),
+        ),
+        (
+            format!(
+                "EXISTS (SELECT 1 FROM sys.extended_properties WHERE class = {class} AND major_id = @id)"
+            ),
+            format!("Re-creating {what} would drop its extended properties"),
+        ),
+    ];
+    if let T::AliasType { .. } = from.kind {
+        reasons.push((
+            "EXISTS (SELECT 1 FROM sys.types WHERE user_type_id = @id \
+             AND (rule_object_id <> 0 OR default_object_id <> 0))"
+                .into(),
+            format!("Re-creating {what} would unbind the rule or default bound to it"),
+        ));
+    }
+    let cases = reasons
+        .iter()
+        .map(|(cond, why)| {
+            format!(
+                "WHEN {cond} THEN {}",
+                tsql_n(&format!(
+                    "{why}, which Schemaic doesn't restore - change it in SQL"
+                ))
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "DECLARE @id int = {id} DECLARE @why nvarchar(2048) = CASE {cases} END \
+         IF @why IS NOT NULL THROW 50000, @why, 1;"
+    )
 }
 
 /// `EXEC sp_rename`: T-SQL's only rename of a table or a column. `object` is
@@ -35820,7 +35924,8 @@ mod tsql_object_tests {
             *data_type = "int".into();
         }
         let plan = diff_tsql_object(&t, &d);
-        let sql = plan.emit();
+        // After the replace's guard (`a_replace_refuses_what_its_drop_…`).
+        let sql = &plan.emit()[1..];
         assert_eq!(sql[0], "DROP SEQUENCE [sales].[order_no];");
         assert!(
             sql[1].starts_with("CREATE SEQUENCE [sales].[order_no] AS int"),
@@ -35840,8 +35945,8 @@ mod tsql_object_tests {
             *start = "50".into();
         }
         let sql = diff_tsql_object(&t, &d).emit();
-        assert_eq!(sql[0], "DROP SEQUENCE [sales].[order_no];", "{sql:?}");
-        assert!(sql[1].contains("START WITH 50"), "{sql:?}");
+        assert_eq!(sql[1], "DROP SEQUENCE [sales].[order_no];", "{sql:?}");
+        assert!(sql[2].contains("START WITH 50"), "{sql:?}");
     }
 
     /// A synonym's new target, an alias type's new base and any change to an
@@ -35858,7 +35963,7 @@ mod tsql_object_tests {
             target: vec!["dbo".into(), "client".into()],
         };
         assert_eq!(
-            diff_tsql_object(syn, &d).emit(),
+            diff_tsql_object(syn, &d).emit()[1..],
             vec![
                 "DROP SYNONYM [sales].[customers];".to_string(),
                 "CREATE SYNONYM [sales].[customers] FOR [dbo].[client];".to_string(),
@@ -35883,7 +35988,7 @@ mod tsql_object_tests {
             nullable: false,
         };
         let plan = diff_tsql_object(alias, &d);
-        assert_eq!(plan.emit()[0], "DROP TYPE [sales].[code];");
+        assert_eq!(plan.emit()[1], "DROP TYPE [sales].[code];");
         assert!(
             plan.changes[0]
                 .risks(MsSql)
@@ -35896,10 +36001,70 @@ mod tsql_object_tests {
         let plan = diff_tsql_object(xml, &d);
         assert!(plan.unsupported().is_empty(), "{:?}", plan.unsupported());
         assert_eq!(
-            plan.emit()[0],
+            plan.emit()[1],
             "DROP XML SCHEMA COLLECTION [sales].[invoice];"
         );
-        assert!(plan.emit()[1].starts_with("CREATE XML SCHEMA COLLECTION [sales].[bill]"));
+        assert!(plan.emit()[2].starts_with("CREATE XML SCHEMA COLLECTION [sales].[bill]"));
+    }
+
+    /// **A replace refuses what its `DROP` would take, and says so.** The
+    /// re-create restates the definition alone, so a GRANT on the object
+    /// went with the drop, a DENY was *lifted*, an alias type's bound rule
+    /// or default came unbound and extended properties vanished — measured
+    /// on 2022 (four permission rows to none) with an empty warning on the
+    /// synonym's. Each kind's plan now opens with a guard that refuses over
+    /// any of them, probing that kind's own class, and every kind's risk
+    /// line names them, so the synonym's Apply is Danger too.
+    #[test]
+    fn a_replace_refuses_what_its_drop_would_take_and_says_so() {
+        let s = schema();
+        let replaced = |t: &TsqlObject| {
+            let mut d = draft_of(t);
+            d.info.kind = match &t.kind {
+                TsqlObjectKind::Sequence { .. } => {
+                    let mut k = t.kind.clone();
+                    if let TsqlObjectKind::Sequence { data_type, .. } = &mut k {
+                        *data_type = "int".into();
+                    }
+                    k
+                }
+                TsqlObjectKind::Synonym { .. } => TsqlObjectKind::Synonym {
+                    target: vec!["dbo".into(), "client".into()],
+                },
+                TsqlObjectKind::AliasType { .. } => TsqlObjectKind::AliasType {
+                    base: "nvarchar(20)".into(),
+                    nullable: false,
+                },
+                TsqlObjectKind::XmlSchemaCollection { .. } => TsqlObjectKind::XmlSchemaCollection {
+                    definition: "<xsd:schema xmlns:xsd=\"y\"/>".into(),
+                },
+            };
+            diff_tsql_object(t, &d)
+        };
+        for (t, class) in s.tsql_objects.iter().zip(["1", "1", "6", "10"]) {
+            let plan = replaced(t);
+            let sql = plan.emit();
+            assert_eq!(sql.len(), 3, "{sql:#?}");
+            let guard = &sql[0];
+            assert!(guard.contains("THROW 50000"), "{guard}");
+            assert!(
+                guard.contains(&format!("sys.database_permissions WHERE class = {class} ")),
+                "{guard}"
+            );
+            assert!(
+                guard.contains(&format!("sys.extended_properties WHERE class = {class} ")),
+                "{guard}"
+            );
+            assert!(guard.contains("principal_id IS NOT NULL"), "{guard}");
+            assert_eq!(
+                guard.contains("rule_object_id"),
+                matches!(t.kind, TsqlObjectKind::AliasType { .. }),
+                "{guard}"
+            );
+            assert!(sql[1].starts_with("DROP "), "{sql:#?}");
+            let risks = plan.changes[0].risks(MsSql).join(" ");
+            assert!(risks.contains("permissions"), "{:?}: {risks}", t.kind);
+        }
     }
 
     /// What a client can judge is refused in the form's words; a type name
