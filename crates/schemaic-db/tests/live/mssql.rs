@@ -4811,6 +4811,62 @@ async fn xml_and_spatial_indexes_are_made_and_kept_whole() {
     assert_eq!(target.scalar(&indexes("s")).await, "sx,sx_q");
 }
 
+/// **A key re-created under XML and spatial indexes takes them off first**:
+/// retyping the clustered key's column, alone or with the XML indexes
+/// deleted in the same draft, was refused "because the table has an XML or
+/// spatial index" (Msg 3734) — the key's drop came before every index drop
+/// and the repair never took them off.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_key_under_xml_and_spatial_indexes_is_re_created() {
+    use schemaic_core::ddl::{self, TableDraft};
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("xml_under_key").await;
+    let ddl_of = |t: &str| {
+        format!(
+            "CREATE TABLE dbo.{t} (id int NOT NULL CONSTRAINT pk_{t} PRIMARY KEY CLUSTERED, \
+             doc xml, shape geometry); \
+             CREATE PRIMARY XML INDEX px_{t} ON dbo.{t} (doc); \
+             CREATE XML INDEX sx_{t} ON dbo.{t} (doc) USING XML INDEX px_{t} FOR PATH; \
+             CREATE SPATIAL INDEX sp_{t} ON dbo.{t} (shape) USING GEOMETRY_AUTO_GRID \
+             WITH (BOUNDING_BOX = (0, 0, 100, 100));"
+        )
+    };
+    s.exec(&ddl_of("kept")).await;
+    s.exec(&ddl_of("gone")).await;
+    let schema =
+        s.db.fetch_schema(&s.name, CancellationToken::new())
+            .await
+            .unwrap();
+    for (t, keep) in [("kept", true), ("gone", false)] {
+        let table = schema.find_table(Some("dbo"), t).unwrap();
+        let mut d = TableDraft::from_table(table);
+        d.columns
+            .iter_mut()
+            .find(|c| c.info.name == "id")
+            .unwrap()
+            .info
+            .type_name = "bigint".into();
+        if !keep {
+            d.indexes.retain(|i| !i.info.is_tsql_xml_or_spatial());
+        }
+        let stmts = ddl::diff(table, &d, MS).emit();
+        s.db.run_ddl(&s.name, &stmts, CancellationToken::new())
+            .await
+            .unwrap_or_else(|e| panic!("{t}: {e}\n{}", stmts.join("\n")));
+        let left = s
+            .scalar(&format!(
+                "SELECT CONCAT(TYPE_NAME(c.system_type_id), ':', \
+                 (SELECT COUNT(*) FROM sys.indexes i WHERE i.object_id = c.object_id \
+                 AND i.type IN (3, 4))) FROM sys.columns c \
+                 WHERE c.object_id = OBJECT_ID(N'dbo.{t}') AND c.name = N'id'"
+            ))
+            .await;
+        assert_eq!(left, if keep { "bigint:3" } else { "bigint:0" }, "{t}");
+    }
+}
+
 /// **A comparison discloses a module the source would not show, rather than
 /// planning it.** An encrypted view was planned as `CREATE VIEW v AS ;` and
 /// an encrypted procedure as a comment that "succeeded" creating nothing.

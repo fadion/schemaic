@@ -5526,6 +5526,25 @@ impl ChangeSet {
                 out.push(format!("ALTER TABLE {q} DROP CONSTRAINT {};", ident(name)));
             }
         }
+        // Indexes before the key: an XML or spatial index stands on the
+        // clustered primary key, and the server refuses the key's drop while
+        // one exists (Msg 3734, measured on 2022). Nothing else here has to
+        // wait for the key, and a nonclustered index dropped first is one the
+        // key's drop does not rebuild.
+        for c in &admitted {
+            match c {
+                Change::DropIndex {
+                    constraint: Some(k),
+                    ..
+                } => out.push(format!("ALTER TABLE {q} DROP CONSTRAINT {};", ident(k))),
+                Change::DropIndex {
+                    name,
+                    constraint: None,
+                    ..
+                } => out.push(format!("DROP INDEX {} ON {q};", ident(name))),
+                _ => {}
+            }
+        }
         for c in &admitted {
             match c {
                 Change::DropCheck { name } => {
@@ -5538,20 +5557,6 @@ impl ChangeSet {
                 } if !from.is_empty() => {
                     out.push(format!("ALTER TABLE {q} DROP CONSTRAINT {};", ident(k)));
                 }
-                _ => {}
-            }
-        }
-        for c in &admitted {
-            match c {
-                Change::DropIndex {
-                    constraint: Some(k),
-                    ..
-                } => out.push(format!("ALTER TABLE {q} DROP CONSTRAINT {};", ident(k))),
-                Change::DropIndex {
-                    name,
-                    constraint: None,
-                    ..
-                } => out.push(format!("DROP INDEX {} ON {q};", ident(name))),
                 _ => {}
             }
         }
@@ -15785,6 +15790,40 @@ pub fn diff(current: &TableInfo, draft: &TableDraft, target: impl Into<Target>) 
     if alter_column_disturbs_dependents(dialect) {
         repair_tsql_dependents(current, &renamed, &mut changes);
     }
+    // **An XML or spatial index stands on the clustered primary key**, and the
+    // server refuses the key's drop while one exists (Msg 3734, measured on
+    // 2022): a plan re-creating the key — its columns, its clustering, or a
+    // retype under it (`repair_tsql_dependents`) — takes every one the draft
+    // has not already dropped off first and puts it back after. Only SQL
+    // Server reads such an index. A lossy one is left, as the repair leaves
+    // one: the server then refuses the plan naming it.
+    let key_dropped = changes.iter().any(|c| {
+        matches!(c, Change::PrimaryKey { from, drop_constraint: Some(_), .. } if !from.is_empty())
+    });
+    if key_dropped {
+        let touched: HashSet<String> = changes
+            .iter()
+            .filter_map(|c| match c {
+                Change::DropIndex { name, .. } | Change::KeepLossyIndex { name } => {
+                    Some(name.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        let standing: Vec<&IndexInfo> = current
+            .indexes
+            .iter()
+            .filter(|ix| ix.is_tsql_xml_or_spatial() && !ix.lossy && !touched.contains(&ix.name))
+            .collect();
+        for ix in standing {
+            changes.push(Change::DropIndex {
+                name: ix.name.clone(),
+                constraint: None,
+                unique: false,
+            });
+            changes.push(Change::AddIndex(Box::new(rename_index(ix, &renamed))));
+        }
+    }
 
     // Table-level options. On PostgreSQL only the comment exists, and the draft
     // carries `None` for the other two on both sides, so nothing is emitted.
@@ -19768,6 +19807,90 @@ mod tests {
         assert!(at("[z_px]") < at("[a_sec]"), "{sql:#?}");
     }
 
+    /// **An XML or spatial index comes off before the clustered key it
+    /// stands on**, and goes back after it. SQL Server refuses to drop the
+    /// key while one exists (Msg 3734, measured on 2022): the plan dropped
+    /// the key ahead of every index drop — even of the XML indexes the same
+    /// plan removed — and a key re-created around a column retype never took
+    /// them off, so the edit could not be made at all.
+    #[test]
+    fn an_xml_index_comes_off_before_the_key_it_stands_on() {
+        use crate::schema::{TSQL_PRIMARY_XML, TSQL_SPATIAL, TSQL_XML};
+        let mut t = ms_rebuild_table();
+        t.indexes[0].clustered = Some(true);
+        t.indexes
+            .push(xml_or_spatial("px", TSQL_PRIMARY_XML, "code", None));
+        t.indexes.push(xml_or_spatial(
+            "sx",
+            TSQL_XML,
+            "code",
+            Some("USING XML INDEX [px] FOR PATH"),
+        ));
+        t.indexes.push(xml_or_spatial(
+            "sp",
+            TSQL_SPATIAL,
+            "qty",
+            Some("USING GEOMETRY_AUTO_GRID"),
+        ));
+        let retype = |d: &mut TableDraft| {
+            d.columns
+                .iter_mut()
+                .find(|c| c.info.name == "id")
+                .unwrap()
+                .info
+                .type_name = "bigint".into();
+        };
+        let at = |stmts: &[String], n: &str| {
+            stmts
+                .iter()
+                .position(|s| s.contains(n))
+                .unwrap_or_else(|| panic!("no {n} in {stmts:#?}"))
+        };
+
+        // The key re-created around a retype takes all three off and back.
+        let mut d = TableDraft::from_table(&t);
+        retype(&mut d);
+        let sql = diff(&t, &d, MsSql).emit();
+        let key_off = at(&sql, "DROP CONSTRAINT [pk_p]");
+        let key_on = at(&sql, "ADD CONSTRAINT [pk_p]");
+        for ix in ["[sx]", "[px]", "[sp]"] {
+            assert!(
+                at(&sql, &format!("DROP INDEX {ix}")) < key_off,
+                "{ix}: {sql:#?}"
+            );
+        }
+        assert!(
+            at(&sql, "DROP INDEX [sx]") < at(&sql, "DROP INDEX [px]"),
+            "{sql:#?}"
+        );
+        assert!(
+            key_on < at(&sql, "CREATE PRIMARY XML INDEX [px]"),
+            "{sql:#?}"
+        );
+        assert!(
+            at(&sql, "CREATE PRIMARY XML INDEX [px]") < at(&sql, "CREATE XML INDEX [sx]"),
+            "{sql:#?}"
+        );
+        assert!(key_on < at(&sql, "CREATE SPATIAL INDEX [sp]"), "{sql:#?}");
+
+        // Deleted in the same draft, they are dropped before the key too.
+        let mut d = TableDraft::from_table(&t);
+        retype(&mut d);
+        d.indexes.retain(|i| !i.info.is_tsql_xml_or_spatial());
+        let sql = diff(&t, &d, MsSql).emit();
+        let key_off = at(&sql, "DROP CONSTRAINT [pk_p]");
+        for ix in ["[sx]", "[px]", "[sp]"] {
+            assert!(
+                at(&sql, &format!("DROP INDEX {ix}")) < key_off,
+                "{ix}: {sql:#?}"
+            );
+        }
+        assert!(
+            !sql.iter().any(|s| s.contains("XML INDEX [px]")),
+            "{sql:#?}"
+        );
+    }
+
     /// **A rebuild restates a columnstore index** rather than refusing the
     /// table, as it did while one was read as lossy.
     #[test]
@@ -20263,9 +20386,11 @@ mod tests {
                 // A dropped column moves the ones after it.
                 tsql_collect_star_dependents(q),
                 format!("ALTER TABLE {q} DROP CONSTRAINT [fk_x];"),
-                format!("ALTER TABLE {q} DROP CONSTRAINT [pk_ok];"),
+                // Indexes before the key, which an XML or spatial index
+                // stands on (`an_xml_index_comes_off_before_the_key_it_…`).
                 format!("ALTER TABLE {q} DROP CONSTRAINT [uq_c];"),
                 format!("DROP INDEX [ix_old] ON {q};"),
+                format!("ALTER TABLE {q} DROP CONSTRAINT [pk_ok];"),
                 "DECLARE @df nvarchar(258) = (SELECT QUOTENAME(name) FROM sys.default_constraints \
                  WHERE parent_object_id = OBJECT_ID(N'[dbo].[o''k]') \
                  AND parent_column_id = COLUMNPROPERTY(OBJECT_ID(N'[dbo].[o''k]'), N'old', 'ColumnId')) \

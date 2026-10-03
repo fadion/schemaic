@@ -5109,7 +5109,17 @@ existing prose was left alone.
     alone, as they were, a selective index could be written after a secondary built on it. The
     sort runs after `repair_tsql_dependents`, so it orders the drops that repair adds as well — and it adds them for
     an XML or spatial index on a column the plan's change disturbs now, which, no longer `lossy`,
-    is taken off and put back like any other. **A secondary the draft keeps is put back when its
+    is taken off and put back like any other. **Every one is taken off and put back when the plan
+    re-creates the clustered key** — its columns, its clustering, or the repair around a retype of
+    a key column — since the server will not drop the key while one stands on it (Msg 3734,
+    measured on 2022) and the repair, asking only what a change disturbs, never took them off:
+    right after `repair_tsql_dependents`, `diff` drops and re-adds (through `rename_index`) every
+    current XML or spatial index the plan has not already dropped or withheld, the sort above
+    dropping a parent last and `emit_mssql` adding the key before the indexes and a parent before
+    its secondaries. A `lossy` one is left, as the repair leaves one, and the server then
+    refuses the plan naming it (`an_xml_index_comes_off_before_the_key_it_stands_on`; live,
+    `a_key_under_xml_and_spatial_indexes_is_re_created`, under `mssql.rs`, red with Msg 3734
+    before). **A secondary the draft keeps is put back when its
     parent is re-created**: dropping a primary or selective XML index drops every secondary built
     on it, silently (measured on 2022), and the plan re-created the parent alone — on a rename, an
     edit of its `using`, a comparison — so each secondary the draft still listed was lost with
@@ -14218,9 +14228,13 @@ existing prose was left alone.
   moves columns, what selects `*` from the table captured (`tsql_collect_star_dependents`, under
   `ddl.rs`); then the drops of what covers columns —
   foreign keys first of all, since one referencing the table's own key blocks the key's drop, then
-  checks and the primary key (`DROP CONSTRAINT` by name), then indexes (`DROP CONSTRAINT` for one a
-  constraint backs, `DROP INDEX [i] ON t` otherwise); then dropped columns, each after its
-  default's drop; **then** the column renames, `EXEC sp_rename N'[s].[t].[c]', N'new',
+  indexes (`DROP CONSTRAINT` for one a constraint backs, `DROP INDEX [i] ON t` otherwise), then
+  checks and the primary key (`DROP CONSTRAINT` by name). **Indexes before the key, not after**:
+  an XML or spatial index stands on the clustered key and the server refuses the key's drop while
+  one exists (Msg 3734, measured on 2022), so with the key's drop first even a plan that also
+  deleted its XML indexes failed (S3.2-L1-02). Nothing else in the phase waits for the key, and a
+  nonclustered index dropped first is one the key's drop does not rebuild. Then dropped columns,
+  each after its default's drop; **then** the column renames, `EXEC sp_rename N'[s].[t].[c]', N'new',
   N'COLUMN';`; then altered columns (`tsql_alter_column`), added columns, the keys, checks and
   foreign keys, the indexes, a primary XML one ahead of the rest (under `ddl.rs`); then the
   comments, by the columns' new names and the table's
