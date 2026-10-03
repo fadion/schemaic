@@ -445,6 +445,60 @@ impl IndexInfo {
         )
     }
 
+    /// The index a secondary XML index ([`TSQL_XML`]) is built on — the
+    /// name its `USING XML INDEX [parent] FOR …` clause gives, unquoted —
+    /// or `None` for any other index, or a clause that names none.
+    pub fn xml_parent(&self) -> Option<String> {
+        self.xml_parent_split().map(|(name, _)| name)
+    }
+
+    /// This secondary XML index's clause naming `parent` instead — for a
+    /// parent the same plan renames. `None` where [`IndexInfo::xml_parent`]
+    /// is.
+    pub fn using_xml_parent(&self, parent: &str) -> Option<String> {
+        let (_, rest) = self.xml_parent_split()?;
+        Some(format!(
+            "USING XML INDEX {} {}",
+            ddl_ident_in(parent, crate::intel::SqlDialect::MsSql),
+            rest.trim_start()
+        ))
+    }
+
+    /// The parent's name and what follows it in the clause.
+    fn xml_parent_split(&self) -> Option<(String, &str)> {
+        const HEAD: &str = "USING XML INDEX";
+        if self.method.as_deref() != Some(TSQL_XML) {
+            return None;
+        }
+        let u = self.using.as_deref()?.trim_start();
+        if !u.get(..HEAD.len())?.eq_ignore_ascii_case(HEAD) {
+            return None;
+        }
+        let rest = u[HEAD.len()..].trim_start();
+        match rest.strip_prefix('[') {
+            // A bracketed name, `]]` its escaped `]`.
+            Some(body) => {
+                let mut name = String::new();
+                let mut it = body.char_indices().peekable();
+                while let Some((i, c)) = it.next() {
+                    if c != ']' {
+                        name.push(c);
+                    } else if it.peek().is_some_and(|&(_, n)| n == ']') {
+                        it.next();
+                        name.push(']');
+                    } else {
+                        return Some((name, &body[i + 1..]));
+                    }
+                }
+                None
+            }
+            None => {
+                let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+                (end > 0).then(|| (rest[..end].to_string(), &rest[end..]))
+            }
+        }
+    }
+
     /// ` INCLUDE ([a], [b])` — the clause after the key list, with its leading
     /// space — or nothing when there are no included columns, or `dialect` has
     /// no such clause ([`crate::ddl::supports_index_include`]). The one
@@ -7463,6 +7517,53 @@ pub fn report_read_since(
         // Nothing in flight to date the notice from, so there is nothing to
         // announce however long the timer slept.
         None => false,
+    }
+}
+
+#[cfg(test)]
+mod xml_parent_tests {
+    use super::*;
+
+    fn secondary(using: &str) -> IndexInfo {
+        IndexInfo {
+            name: "s".into(),
+            method: Some(TSQL_XML.into()),
+            using: Some(using.into()),
+            ..Default::default()
+        }
+    }
+
+    /// The parent a secondary XML index names, bracketed with `]]` its
+    /// escape, or bare; re-pointed with the rest of its clause kept.
+    #[test]
+    fn a_secondary_names_its_parent_and_is_re_pointed() {
+        let s = secondary("USING XML INDEX [p]]x] FOR PATH");
+        assert_eq!(s.xml_parent().as_deref(), Some("p]x"));
+        assert_eq!(
+            s.using_xml_parent("q]y").as_deref(),
+            Some("USING XML INDEX [q]]y] FOR PATH")
+        );
+        let s = secondary("using xml index px FOR ([a])");
+        assert_eq!(s.xml_parent().as_deref(), Some("px"));
+        assert_eq!(
+            s.using_xml_parent("p2").as_deref(),
+            Some("USING XML INDEX [p2] FOR ([a])")
+        );
+    }
+
+    /// No parent where there is none to read: another kind, an unclosed
+    /// bracket, another clause.
+    #[test]
+    fn no_parent_is_read_where_none_is_named() {
+        let primary = IndexInfo {
+            method: Some(TSQL_PRIMARY_XML.into()),
+            using: Some("USING XML INDEX [p] FOR PATH".into()),
+            ..Default::default()
+        };
+        assert_eq!(primary.xml_parent(), None);
+        assert_eq!(secondary("USING XML INDEX [p FOR PATH").xml_parent(), None);
+        assert_eq!(secondary("FOR ([a] = N'/a')").xml_parent(), None);
+        assert_eq!(secondary("USING XML INDEX ").xml_parent(), None);
     }
 }
 

@@ -4702,6 +4702,115 @@ async fn a_synonym_naming_its_own_database_compares_the_same() {
     assert!(differing.is_empty(), "{differing:?}");
 }
 
+/// **XML and spatial indexes are made whole, and stay whole**: a table whose
+/// secondary XML index sorts before its parent is compared into an empty
+/// database (it was created first, Msg 6333), a spatial index's bounding box
+/// past `numeric(38)` replays (Msg 1007), a selective index's namespaces
+/// compare the same across a CI and a BIN2 database (it was re-created on
+/// every comparison), and renaming a primary XML index or giving a selective
+/// one a path keeps the secondaries built on them (the server dropped them
+/// with the parent, and nothing put them back).
+#[tokio::test(flavor = "multi_thread")]
+async fn xml_and_spatial_indexes_are_made_and_kept_whole() {
+    use schemaic_core::compare::SchemaComparison;
+    use schemaic_core::ddl::{self, TableDraft};
+    if !enabled() || azure_cannot("needs a second database") {
+        return;
+    }
+    let source = Scratch::create("xml_whole_source").await;
+    let target = Scratch::create("xml_whole_target").await;
+    base_db()
+        .fetch_query(
+            None,
+            &format!(
+                "ALTER DATABASE [{}] COLLATE Latin1_General_BIN2",
+                target.name
+            ),
+            1,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("a BIN2 target");
+    source
+        .exec(
+            "CREATE TABLE dbo.x (id int NOT NULL CONSTRAINT pk_x PRIMARY KEY CLUSTERED, \
+             doc xml, shape geometry); \
+             CREATE PRIMARY XML INDEX pxml ON dbo.x (doc); \
+             CREATE XML INDEX ixml_path ON dbo.x (doc) USING XML INDEX pxml FOR PATH; \
+             CREATE SPATIAL INDEX sp ON dbo.x (shape) USING GEOMETRY_GRID \
+             WITH (BOUNDING_BOX = (-1e39, 1.2345e-35, 1e39, 1.5e300));",
+        )
+        .await;
+    source
+        .exec(
+            "CREATE TABLE dbo.s (id int NOT NULL CONSTRAINT pk_s PRIMARY KEY CLUSTERED, doc xml); \
+             CREATE SELECTIVE XML INDEX sx ON dbo.s (doc) \
+             WITH XMLNAMESPACES ('urn:x' AS a, 'urn:y' AS B) FOR (q = '/a:r/B:s' AS SQL int); \
+             CREATE XML INDEX sx_q ON dbo.s (doc) USING XML INDEX sx FOR (q);",
+        )
+        .await;
+    let read = |s: &Scratch| {
+        let db = s.db.clone();
+        let name = s.name.clone();
+        async move {
+            db.fetch_schema(&name, CancellationToken::new())
+                .await
+                .unwrap()
+        }
+    };
+    let run = |s: &Scratch, stmts: Vec<String>| {
+        let db = s.db.clone();
+        let name = s.name.clone();
+        async move {
+            db.run_ddl(&name, &stmts, CancellationToken::new())
+                .await
+                .unwrap_or_else(|e| panic!("{e}\n{}", stmts.join("\n")));
+        }
+    };
+    let plan = SchemaComparison::of(&read(&target).await, &read(&source).await, MS)
+        .plan(|_| true)
+        .emit();
+    run(&target, plan).await;
+    let again = SchemaComparison::of(&read(&target).await, &read(&source).await, MS);
+    let differing: Vec<String> = again.differences().map(|e| e.key()).collect();
+    assert!(differing.is_empty(), "{differing:?}");
+
+    let indexes = |t: &str| {
+        format!(
+            "SELECT STRING_AGG(name, ',') WITHIN GROUP (ORDER BY name) FROM sys.indexes \
+             WHERE object_id = OBJECT_ID(N'dbo.{t}') AND type IN (3, 4)"
+        )
+    };
+    let schema = read(&target).await;
+    let x = schema.find_table(Some("dbo"), "x").unwrap();
+    let mut d = TableDraft::from_table(x);
+    d.indexes
+        .iter_mut()
+        .find(|i| i.info.name == "pxml")
+        .unwrap()
+        .info
+        .name = "pxml2".into();
+    run(&target, ddl::diff(x, &d, MS).emit()).await;
+    assert_eq!(target.scalar(&indexes("x")).await, "ixml_path,pxml2,sp");
+
+    let s = schema.find_table(Some("dbo"), "s").unwrap();
+    let mut d = TableDraft::from_table(s);
+    let sx = &mut d
+        .indexes
+        .iter_mut()
+        .find(|i| i.info.name == "sx")
+        .unwrap()
+        .info;
+    sx.using = sx.using.as_ref().map(|u| {
+        u.replace(
+            " AS SQL int)",
+            " AS SQL int, [r] = N'/a:r' AS XQUERY N'node()')",
+        )
+    });
+    run(&target, ddl::diff(s, &d, MS).emit()).await;
+    assert_eq!(target.scalar(&indexes("s")).await, "sx,sx_q");
+}
+
 /// **A comparison discloses a module the source would not show, rather than
 /// planning it.** An encrypted view was planned as `CREATE VIEW v AS ;` and
 /// an encrypted procedure as a comment that "succeeded" creating nothing.

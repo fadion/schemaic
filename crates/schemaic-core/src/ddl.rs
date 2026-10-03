@@ -620,6 +620,24 @@ impl TableDraft {
                     )),
                     _ => {}
                 }
+                // Its parent by its name or, renamed in this draft, by the one
+                // it had: the plan re-points it (`diff`). Gone, the server
+                // drops the secondary with it and refuses to make it again.
+                if let Some(parent) = ix.info.xml_parent() {
+                    let stands = self.indexes.iter().any(|p| {
+                        p.info.is_tsql_xml_parent()
+                            && (p.info.name.eq_ignore_ascii_case(&parent)
+                                || p.original
+                                    .as_deref()
+                                    .is_some_and(|o| o.eq_ignore_ascii_case(&parent)))
+                    });
+                    if !stands {
+                        out.push(format!(
+                            "Index {name} is built on {parent}, which isn't a primary or \
+                             selective XML index of this table: it goes when its parent does."
+                        ));
+                    }
+                }
             }
             // An `ORDER` is a columnstore index's alone, and a nonclustered
             // one sorts only by columns it stores (Msg 1911).
@@ -8988,7 +9006,13 @@ fn create_table_sql(d: &TableDraft, dialect: SqlDialect) -> Vec<String> {
     head.push(';');
     let mut out = vec![head];
     if separate_indexes {
-        for ix in &d.indexes {
+        // An XML index's parent before the secondaries that name it, as the
+        // plan's index phase and Copy DDL order them: a draft read off the
+        // catalogue lists `ixml_…` before the `pxml` it is built on (Msg
+        // 6333). A stable sort, so the rest keep the draft's order.
+        let mut indexes: Vec<&IndexDraft> = d.indexes.iter().collect();
+        indexes.sort_by_key(|ix| !ix.info.is_tsql_xml_parent());
+        for ix in indexes {
             // A SQLite constraint-backed index went into the table body above.
             if sqlite && is_sqlite_constraint_index(&ix.info) {
                 continue;
@@ -15400,6 +15424,83 @@ pub fn diff(current: &TableInfo, draft: &TableDraft, target: impl Into<Target>) 
             None => added_ix.push(d.info.clone()),
         }
     }
+    // **A secondary XML index goes with its parent**: dropping a primary or
+    // selective XML index drops every secondary built on it, silently
+    // (measured on 2022), so one the draft keeps is dropped and created
+    // again around the parent's re-create — the order below and in the emit
+    // puts it after the parent — naming a renamed parent by its new name.
+    // One that could not be restated (the reader leaves a secondary lossy
+    // only beside a lossy parent, whose edit is withheld already) withholds
+    // the parent's edit too, rather than re-making it from a partial reading.
+    let draft_name = |old: &str| {
+        draft
+            .indexes
+            .iter()
+            .find(|d| d.original.as_deref() == Some(old))
+            .map(|d| d.info.name.clone())
+    };
+    // The current secondaries the draft keeps, with the parent they name.
+    let kept_secondaries: Vec<(&IndexDraft, &IndexInfo, String)> = draft
+        .indexes
+        .iter()
+        .filter_map(|d| {
+            let cur = d
+                .original
+                .as_deref()
+                .and_then(|n| cur_indexes.iter().find(|ix| ix.name == n).copied())?;
+            Some((d, cur, cur.xml_parent()?))
+        })
+        .collect();
+    for (_, cur, parent) in &kept_secondaries {
+        if cur.lossy
+            && let Some(p) = dropped_ix
+                .iter()
+                .find(|ix| ix.is_tsql_xml_parent() && ix.name.eq_ignore_ascii_case(parent))
+                .map(|ix| ix.name.clone())
+        {
+            dropped_ix.retain(|ix| ix.name != p);
+            let new = draft_name(&p);
+            added_ix.retain(|ix| Some(&ix.name) != new.as_ref());
+            changes.push(Change::KeepLossyIndex {
+                name: cur.name.clone(),
+            });
+        }
+    }
+    let parents_out: Vec<String> = dropped_ix
+        .iter()
+        .filter(|ix| ix.is_tsql_xml_parent())
+        .map(|ix| ix.name.clone())
+        .collect();
+    if !parents_out.is_empty() {
+        for (d, cur, parent) in &kept_secondaries {
+            let Some(parent) = parents_out.iter().find(|p| p.eq_ignore_ascii_case(parent)) else {
+                continue;
+            };
+            let parent = parent.as_str();
+            let renamed_to = draft_name(parent).filter(|n| n != parent);
+            let repoint = |ix: &mut IndexInfo| {
+                if let Some(to) = &renamed_to
+                    && ix
+                        .xml_parent()
+                        .is_some_and(|p| p.eq_ignore_ascii_case(parent))
+                {
+                    ix.using = ix.using_xml_parent(to);
+                }
+            };
+            // Edited too, it is re-created already: only the name it gives
+            // its parent may need to follow.
+            if dropped_ix.iter().any(|x| x.name == cur.name) {
+                if let Some(added) = added_ix.iter_mut().find(|a| a.name == d.info.name) {
+                    repoint(added);
+                }
+            } else {
+                let mut again = d.info.clone();
+                repoint(&mut again);
+                dropped_ix.push(*cur);
+                added_ix.push(again);
+            }
+        }
+    }
     for ix in dropped_ix {
         changes.push(Change::DropIndex {
             name: ix.name.clone(),
@@ -19553,6 +19654,118 @@ mod tests {
         d.indexes.push(IndexDraft::new(parent));
         let adds = diff(&bare, &d, MsSql).emit();
         assert!(at(&adds, "[z_sx]") < at(&adds, "[a_sx2]"), "{adds:#?}");
+    }
+
+    /// **Re-creating an XML parent puts back the secondaries built on it**:
+    /// the server drops them with it, silently (measured on 2022), and the
+    /// plan re-created the parent alone — a renamed primary XML index, or a
+    /// selective one given another path, lost every secondary the draft
+    /// still listed. They are dropped before it and created after it, a
+    /// renamed parent's secondaries naming it by its new name.
+    #[test]
+    fn re_creating_an_xml_parent_puts_back_its_secondaries() {
+        use crate::schema::{TSQL_PRIMARY_XML, TSQL_SELECTIVE_XML, TSQL_XML};
+        let at = |stmts: &[String], n: &str| {
+            stmts
+                .iter()
+                .position(|s| s.contains(n))
+                .unwrap_or_else(|| panic!("no {n} in {stmts:#?}"))
+        };
+        let mut t = ms_rebuild_table();
+        t.indexes
+            .push(xml_or_spatial("px", TSQL_PRIMARY_XML, "code", None));
+        t.indexes.push(xml_or_spatial(
+            "sx_path",
+            TSQL_XML,
+            "code",
+            Some("USING XML INDEX [px] FOR PATH"),
+        ));
+        let mut d = TableDraft::from_table(&t);
+        d.indexes
+            .iter_mut()
+            .find(|i| i.info.name == "px")
+            .unwrap()
+            .info
+            .name = "px2".into();
+        assert!(d.validate(MsSql).is_empty(), "{:?}", d.validate(MsSql));
+        let sql = diff(&t, &d, MsSql).emit();
+        assert!(
+            at(&sql, "DROP INDEX [sx_path]") < at(&sql, "DROP INDEX [px]"),
+            "{sql:#?}"
+        );
+        assert!(
+            at(&sql, "CREATE PRIMARY XML INDEX [px2]") < at(&sql, "CREATE XML INDEX [sx_path]"),
+            "{sql:#?}"
+        );
+        assert!(
+            sql[at(&sql, "CREATE XML INDEX [sx_path]")]
+                .ends_with("USING XML INDEX [px2] FOR PATH;"),
+            "{sql:#?}"
+        );
+
+        let mut t = ms_rebuild_table();
+        t.indexes.push(xml_or_spatial(
+            "sx",
+            TSQL_SELECTIVE_XML,
+            "code",
+            Some("FOR ([a] = N'/a' AS SQL int)"),
+        ));
+        t.indexes.push(xml_or_spatial(
+            "sx_a",
+            TSQL_XML,
+            "code",
+            Some("USING XML INDEX [sx] FOR ([a])"),
+        ));
+        let mut d = TableDraft::from_table(&t);
+        d.indexes
+            .iter_mut()
+            .find(|i| i.info.name == "sx")
+            .unwrap()
+            .info
+            .using = Some("FOR ([a] = N'/a' AS SQL int, [b] = N'/b' AS SQL int)".into());
+        let sql = diff(&t, &d, MsSql).emit();
+        assert!(
+            at(&sql, "DROP INDEX [sx_a]") < at(&sql, "DROP INDEX [sx]"),
+            "{sql:#?}"
+        );
+        assert!(
+            at(&sql, "CREATE SELECTIVE XML INDEX [sx]") < at(&sql, "CREATE XML INDEX [sx_a]"),
+            "{sql:#?}"
+        );
+
+        // Kept while its parent goes, a secondary has nothing to stand on.
+        let mut d = TableDraft::from_table(&t);
+        d.indexes.retain(|i| i.info.name != "sx");
+        let errs = d.validate(MsSql).join(" ");
+        assert!(
+            errs.contains("sx_a") && errs.contains("built on sx"),
+            "{errs}"
+        );
+    }
+
+    /// **A new table's XML parent is created before its secondaries**, as
+    /// the plan's index phase and Copy DDL already order them: the catalogue
+    /// lists indexes by name, so a comparison into a database without the
+    /// table wrote `ixml_path` before `pxml` and was refused (Msg 6333).
+    #[test]
+    fn a_new_tables_xml_parent_is_created_before_its_secondaries() {
+        use crate::schema::{TSQL_PRIMARY_XML, TSQL_XML};
+        let mut t = ms_rebuild_table();
+        t.indexes.push(xml_or_spatial(
+            "a_sec",
+            TSQL_XML,
+            "code",
+            Some("USING XML INDEX [z_px] FOR PATH"),
+        ));
+        t.indexes
+            .push(xml_or_spatial("z_px", TSQL_PRIMARY_XML, "code", None));
+        let sql = create(&TableDraft::from_table(&t), MsSql).emit();
+        let at = |n: &str| {
+            sql.iter()
+                .position(|s| s.contains(n))
+                .unwrap_or_else(|| panic!("no {n} in {sql:#?}"))
+        };
+        assert!(at("[z_px]") < at("[a_sec]"), "{sql:#?}");
     }
 
     /// **A rebuild restates a columnstore index** rather than refusing the

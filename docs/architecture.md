@@ -5085,12 +5085,21 @@ existing prose was left alone.
     `validate` refuses one that names other than exactly one column, or is unique, covering or
     filtered, a secondary XML index with no `using`, which is built on a primary or selective one
     by name (`an_xml_or_spatial_index_is_refused_what_it_cannot_take`), and a selective one with
-    none, whose promoted paths are what it is (in `a_selective_xml_index_is_restated_as_one`).
+    none, whose promoted paths are what it is (in `a_selective_xml_index_is_restated_as_one`) — and
+    a secondary whose parent (`IndexInfo::xml_parent`) is no primary or selective XML index of the
+    draft, by its name or, for one the draft renames, by its `original`: *"Index … is built on …,
+    which isn't a primary or selective XML index of this table: it goes when its parent does"*,
+    since the server drops a secondary with its parent and will not build one on nothing (in
+    `re_creating_an_xml_parent_puts_back_its_secondaries`).
     **An XML index a secondary is built on — a primary one, measured on 2022, or a selective one
     (`IndexInfo::is_tsql_xml_parent`) — is ordered against its secondaries at both ends**, and the
     two halves sit in different places on purpose. Added, it goes first: `emit_mssql`'s `AddIndex` phase writes a
-    parent XML index before the rest, since a secondary naming it is refused until it exists.
-    Dropped, it goes last: dropping a primary drops every secondary built on it, so a secondary's
+    parent XML index before the rest, since a secondary naming it is refused until it exists, and
+    `create_table_sql` stable-sorts its separate indexes the same way, as `tsql_create_ddl` does
+    (under `schema.rs`). It was the one of the three that did not, so a plan that creates the table
+    — a comparison into a database without it, the designer's new table — wrote a catalogue-ordered
+    `ixml_…` before its `pxml` and failed with Msg 6333
+    (`a_new_tables_xml_parent_is_created_before_its_secondaries`). Dropped, it goes last: dropping a primary drops every secondary built on it, so a secondary's
     own `DROP INDEX` after it found nothing and failed the plan with Msg 3701. That half is set at
     the end of `diff`, which sorts a `DropIndex` of a parent XML index behind every other change,
     because the drop carries a name and no kind and only `diff` has the reading that says which
@@ -5100,7 +5109,20 @@ existing prose was left alone.
     alone, as they were, a selective index could be written after a secondary built on it. The
     sort runs after `repair_tsql_dependents`, so it orders the drops that repair adds as well — and it adds them for
     an XML or spatial index on a column the plan's change disturbs now, which, no longer `lossy`,
-    is taken off and put back like any other. `IndexStorage` has four kinds for them, *Primary XML*,
+    is taken off and put back like any other. **A secondary the draft keeps is put back when its
+    parent is re-created**: dropping a primary or selective XML index drops every secondary built
+    on it, silently (measured on 2022), and the plan re-created the parent alone — on a rename, an
+    edit of its `using`, a comparison — so each secondary the draft still listed was lost with
+    nothing said. `diff` now drops and re-adds every current secondary the draft keeps whose parent
+    is in `dropped_ix`, the sort above dropping it ahead of the parent and the `AddIndex` phase
+    creating it after, and where the draft renamed the parent re-points its clause at the new name
+    (`IndexInfo::using_xml_parent`); one the draft edits too is re-created already, and only its
+    clause follows (`re_creating_an_xml_parent_puts_back_its_secondaries`; live,
+    `xml_and_spatial_indexes_are_made_and_kept_whole`, under `mssql.rs`). A `lossy` secondary under
+    a dropped parent withholds the parent's edit instead — a `KeepLossyIndex` named for the
+    secondary — rather than re-make it from a partial reading. That arm is practically
+    unreachable, the reader leaving a secondary `lossy` only beside a `lossy` parent whose edit is
+    withheld already, and no test reaches it. `IndexStorage` has four kinds for them, *Primary XML*,
     *Selective XML*, *Secondary XML* and *Spatial* — a secondary selective index is a *Secondary
     XML* one whose clause names a path; `offered(dialect)` asks each family its own capability,
     `takes_using()` is true for the selective, secondary and spatial kinds, `using_example()` is
@@ -9048,7 +9070,9 @@ existing prose was left alone.
     and `TSQL_SPATIAL` (`SPATIAL`), each the words `CREATE … INDEX` takes, which
     `is_tsql_xml_or_spatial` asks; `is_tsql_xml_parent` asks for the two a secondary can be built
     on, primary and selective, which a plan and Copy DDL create first and drop last (under
-    `ddl.rs`) — with what the kind takes after its one column in **`IndexInfo::using`**: a
+    `ddl.rs`), and `xml_parent` the one a secondary's `USING XML INDEX` names — bracketed, `]]` its
+    escaped `]`, or bare — which `using_xml_parent` writes again naming another, for a parent the
+    plan renames (`xml_parent_tests`) — with what the kind takes after its one column in **`IndexInfo::using`**: a
     secondary XML index's `USING XML INDEX [primary] FOR PATH|VALUE|PROPERTY`, a selective one's
     `[WITH XMLNAMESPACES (…)] FOR (path = N'…' [AS …], …)`, a secondary selective one's `USING
     XML INDEX [sxi] FOR ([path])` — an ordinary `TSQL_XML` index whose clause names a path rather
@@ -14390,7 +14414,12 @@ existing prose was left alone.
   text an emitter writes verbatim: the `FOR` one of three words, the scheme one of
   `GEOMETRY_GRID`/`GEOMETRY_AUTO_GRID`/`GEOGRAPHY_GRID`/`GEOGRAPHY_AUTO_GRID`, a grid level one of
   `LOW`/`MEDIUM`/`HIGH`, the bounding box written by Rust's `Display` only when all four parse as
-  finite `f64`s, `CELLS_PER_OBJECT` only when it parses as a `u32`. An unknown `FOR`, scheme or
+  finite `f64`s, `CELLS_PER_OBJECT` only when it parses as a `u32`. **A bounding-box value past
+  `numeric(38)` is written with an exponent** (`{v:e}`, a float literal): a plain decimal whose
+  integer digits, less leading zeros, plus its scale come to more than 38 — `1e39` plainly, or
+  `1.2345e-35` — is refused (Msg 1007, measured on 2022), so such an index could be read but not
+  replayed. Within 38 the plain spelling stays, so an existing index restates as it always did
+  (in `an_xml_or_spatial_index_is_read_with_every_option`). An unknown `FOR`, scheme or
   grid word answers `None`, leaving the index `lossy` rather than splicing it. **So does an option read in part** — a value present that does not parse, a
   bounding box or a grid missing a part: it was left out of the clause while the index still read
   as whole, so a restatement took the server's default for it, a different index under the same
@@ -14406,7 +14435,12 @@ existing prose was left alone.
   (`sys.selective_xml_index_namespaces`), both `None` where `Catalogue::selective_xml` — the probe
   of `sys.xml_indexes.path_id`, SQL Server 2012 SP1 — says the server has none. The load groups
   their rows by index and the pure `tsql_selective_xml(paths, namespaces)` composes `[WITH
-  XMLNAMESPACES (…)] FOR (…)`, which `tsql_xml_or_spatial` takes for type 2. **Each path says
+  XMLNAMESPACES (…)] FOR (…)`, which `tsql_xml_or_spatial` takes for type 2. **The namespaces
+  are in the reader's order, not the collation's** — the default first, then the prefixes byte
+  for byte — because `selective_namespace_listing`'s `ORDER BY n.prefix` runs in the database's
+  collation: the same index read `[a], [B]` in a CI_AS database and `[B], [a]` in a BIN2 one, so
+  every comparison between the two re-created it (measured on 2022; in
+  `a_selective_xml_index_is_restated_as_written`). **Each path says
   only what was written**, because the catalogue fills in what it inferred and a restatement that
   wrote it back would be another index: the XQuery type unless the server inferred it, `MAXLENGTH`
   only when it is above 0 and not inferred — an untyped path and an unbounded `xs:string` both
@@ -14458,6 +14492,12 @@ existing prose was left alone.
   back with the same `method` and `using`, diffing to nothing; drops the table and runs its Copy
   DDL from nothing, reading both back again; and lands both from the designer's Storage choice,
   the secondary listed first;
+  `xml_and_spatial_indexes_are_made_and_kept_whole` compares two tables — one with a secondary
+  XML index that sorts before its parent and a spatial index whose bounding box is past
+  `numeric(38)`, one with a selective index declaring two prefixed namespaces and a secondary on
+  it — into an empty BIN2 database (Msg 6333 and Msg 1007 before), then compares again to
+  nothing; renames `pxml` to `pxml2` and gives the selective parent a path, and finds
+  `ixml_path` and `sx_q` still there after each;
   `a_columnstore_index_is_read_rebuilt_and_authored` reads a clustered columnstore and a filtered
   nonclustered one back not lossy, rebuilds each table around its index by an identity toggle and
   reads the index back equal with a diff of nothing, lands a nonclustered one made through

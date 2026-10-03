@@ -1779,15 +1779,28 @@ fn tsql_selective_xml(
         }
         promoted.push(item);
     }
-    let mut spaces = Vec::with_capacity(namespaces.len());
+    // In an order of the reader's own — the default first, then the prefixes
+    // byte for byte — not the query's `ORDER BY n.prefix`, which runs in the
+    // database's collation: the same index read `[a], [B]` in a CI database
+    // and `[B], [a]` in a BIN2 one, and compared as two (measured, 2022). The
+    // order the namespaces are declared in means nothing.
+    let mut sorted: Vec<(bool, &str, &str)> = Vec::with_capacity(namespaces.len());
     for r in namespaces {
-        let uri = lit(r.get(4)?.as_deref()?);
+        let uri = r.get(4)?.as_deref()?;
         if flag(r, 3) {
-            spaces.push(format!("DEFAULT {uri}"));
+            sorted.push((false, "", uri));
         } else {
-            spaces.push(format!("{uri} AS {}", ident(r.get(5)?.as_deref()?)));
+            sorted.push((true, r.get(5)?.as_deref()?, uri));
         }
     }
+    sorted.sort_by(|a, b| (a.0, a.1.as_bytes()).cmp(&(b.0, b.1.as_bytes())));
+    let spaces: Vec<String> = sorted
+        .into_iter()
+        .map(|(named, prefix, uri)| match named {
+            false => format!("DEFAULT {}", lit(uri)),
+            true => format!("{} AS {}", lit(uri), ident(prefix)),
+        })
+        .collect();
     let with = if spaces.is_empty() {
         String::new()
     } else {
@@ -1853,9 +1866,23 @@ fn tsql_xml_or_spatial(
     selective: Option<String>,
 ) -> Option<(&'static str, Option<String>)> {
     use schemaic_core::schema::{TSQL_PRIMARY_XML, TSQL_SELECTIVE_XML, TSQL_SPATIAL, TSQL_XML};
+    // Plain, as every value within `numeric(38)` has always been written; a
+    // literal past precision 38 is refused (Msg 1007, measured on 2022), so
+    // one is written with an exponent — a `float`, which T-SQL reads exactly.
     let num = |i: usize| -> Option<String> {
         let v: f64 = r.get(i)?.as_deref()?.trim().parse().ok()?;
-        v.is_finite().then(|| v.to_string())
+        if !v.is_finite() {
+            return None;
+        }
+        let plain = v.to_string();
+        let digits = plain.trim_start_matches('-');
+        let (int, frac) = digits.split_once('.').unwrap_or((digits, ""));
+        let precision = int.trim_start_matches('0').len() + frac.len();
+        Some(if precision > 38 {
+            format!("{v:e}")
+        } else {
+            plain
+        })
     };
     let int = |i: usize| cell(r, i).trim().parse::<i64>().unwrap_or(-1);
     match int(3) {
@@ -5779,6 +5806,29 @@ mod tests {
                  [path7] = N'/q' AS XQUERY N'xs:string')"
             )
         );
+        // **The namespaces' order is the reader's, not the collation's**:
+        // `ORDER BY n.prefix` runs in the database's collation, so a CI_AS
+        // database read `[a], [B]` and a BIN2 one `[B], [a]`, and every
+        // comparison between the two re-created the index. The default
+        // first, then the prefixes byte for byte, whatever order arrived.
+        let spaces = [
+            ns("0", "urn:x", Some("a")),
+            ns("0", "urn:y", Some("B")),
+            ns("1", "urn:d", None),
+        ];
+        let read = |rows: &[&Vec<Option<String>>]| {
+            let n: Vec<&[Option<String>]> = rows.iter().map(|r| r.as_slice()).collect();
+            tsql_selective_xml(&p[..1], &n)
+        };
+        let ci = read(&[&spaces[2], &spaces[0], &spaces[1]]);
+        let bin = read(&[&spaces[1], &spaces[0], &spaces[2]]);
+        assert_eq!(ci, bin);
+        assert!(
+            ci.as_deref().unwrap().starts_with(
+                "WITH XMLNAMESPACES (DEFAULT N'urn:d', N'urn:y' AS [B], N'urn:x' AS [a])"
+            ),
+            "{ci:?}"
+        );
         // No namespaces: the clause is its paths alone.
         assert_eq!(
             tsql_selective_xml(&p[..1], &[]).as_deref(),
@@ -5957,6 +6007,27 @@ mod tests {
                         .into()
                 )
             ))
+        );
+        // **A value past `numeric(38)` is written as a float**: plain, `1e39`
+        // is a 40-digit literal T-SQL refuses (Msg 1007, measured on 2022),
+        // as is `1.2345e-35`, scale 39. Within precision 38 a value keeps the
+        // plain spelling every index above was read with — `1e-30` among
+        // them, scale 30.
+        let mut wide = grid.clone();
+        for (i, v) in [
+            (8, "-1e39"),
+            (9, "1.2345e-35"),
+            (10, "1e-30"),
+            (11, "1.5e300"),
+        ] {
+            wide[i] = Some(v.into());
+        }
+        let clause = xs(&wide).and_then(|(_, u)| u).unwrap();
+        assert!(
+            clause.contains(
+                "BOUNDING_BOX = (-1e39, 1.2345e-35, 0.000000000000000000000000000001, 1.5e300)"
+            ),
+            "{clause}"
         );
         let geography = xs_row(&[
             Some("4"),
