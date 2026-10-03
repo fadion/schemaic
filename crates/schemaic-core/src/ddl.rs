@@ -17665,13 +17665,23 @@ mod tests {
                     ..Default::default()
                 },
             ],
-            indexes: vec![IndexInfo {
-                name: "PRIMARY".into(),
-                columns: vec![IndexColumn::plain("id")],
-                unique: true,
-                constraint: Some("orders_pkey".into()),
-                ..Default::default()
-            }],
+            indexes: vec![
+                IndexInfo {
+                    name: "PRIMARY".into(),
+                    columns: vec![IndexColumn::plain("id")],
+                    unique: true,
+                    constraint: Some("orders_pkey".into()),
+                    ..Default::default()
+                },
+                // A plain index's `INCLUDE`, which the reader now reads into
+                // `include` rather than leaving the index lossy (R2-L6-03).
+                IndexInfo {
+                    name: "orders_total_idx".into(),
+                    columns: vec![IndexColumn::plain("total")],
+                    include: vec!["id".into()],
+                    ..Default::default()
+                },
+            ],
             ..Default::default()
         };
         let cs = diff(&t, &TableDraft::from_table(&t), Postgres);
@@ -21078,6 +21088,36 @@ mod tests {
         d
     }
 
+    /// **An index that only includes a retyped column comes off with it**
+    /// (S3.1-L6-01): T-SQL refuses the `ALTER COLUMN` while an index includes
+    /// the column, as it does for a key column (Msg 5074), and the repair's
+    /// include arm — which nothing tested — is what takes it off and puts it
+    /// back.
+    #[test]
+    fn a_retyped_columns_covering_index_comes_off_and_back_on() {
+        let mut t = ms_rebuild_table();
+        t.indexes.push(covering(&["code"]));
+        let mut d = TableDraft::from_table(&t);
+        d.columns
+            .iter_mut()
+            .find(|c| c.info.name == "code")
+            .unwrap()
+            .info
+            .type_name = "nvarchar(5)".into();
+        let stmts = diff(&t, &d, MsSql).emit();
+        let at = |needle: &str| {
+            stmts
+                .iter()
+                .position(|s| s.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} not in {stmts:#?}"))
+        };
+        let alter = at("ALTER COLUMN [code]");
+        assert!(at("DROP INDEX [ix_cover]") < alter, "{stmts:#?}");
+        let back = at("CREATE INDEX [ix_cover]");
+        assert!(alter < back, "{stmts:#?}");
+        assert!(stmts[back].contains("INCLUDE ([code])"), "{stmts:#?}");
+    }
+
     /// **SQL Server refuses `ALTER COLUMN` on a column anything depends on**
     /// (Msg 5074 then 4922, measured on 2022 for every kind here), so a retype
     /// takes each dependent off and puts it back — the key, the index, the
@@ -22212,9 +22252,11 @@ mod tests {
     ///   `identity_always` and not `auto_increment`;
     /// - a normalised default (outer parentheses stripped), a persisted
     ///   computed column, a collation and an alias type;
-    /// - every rowstore index with `clustered: Some(kind == 1)` — here a
+    /// - every index with `clustered: Some(matches!(kind, 1 | 5))` — here a
     ///   `NONCLUSTERED` named key beside a `CLUSTERED` descending index, which
-    ///   is the pair a model without the field could not carry;
+    ///   is the pair a model without the field could not carry — and the
+    ///   kinds read whole since: a covering index, an ordered nonclustered
+    ///   columnstore, a primary and a secondary XML index and a spatial one;
     /// - a check, a disabled and untrusted one beside it, table and column
     ///   descriptions (`MS_Description`);
     /// - a foreign key with `ref_schema` always named and its actions as
@@ -22262,6 +22304,8 @@ mod tests {
                     ..ms_col("ver", "timestamp")
                 },
                 ms_col("customer_id", "int"),
+                ms_col("doc", "xml"),
+                ms_col("shape", "geometry"),
             ],
             indexes: vec![
                 crate::schema::IndexInfo {
@@ -22269,6 +22313,54 @@ mod tests {
                     columns: vec![IndexColumn::plain("id")],
                     unique: true,
                     constraint: Some("PK_orders".into()),
+                    clustered: Some(false),
+                    ..Default::default()
+                },
+                // This release's index fidelity (R2-L6-03), each as
+                // `collect_schema` sets it: a covering index, an ordered
+                // nonclustered columnstore, a primary XML index and a
+                // secondary built on it, and a spatial index — read whole,
+                // so restated, so a draft of them diffs to nothing.
+                crate::schema::IndexInfo {
+                    name: "IX_cover".into(),
+                    columns: vec![IndexColumn::plain("code")],
+                    include: vec!["qty".into()],
+                    clustered: Some(false),
+                    ..Default::default()
+                },
+                crate::schema::IndexInfo {
+                    name: "NCCI".into(),
+                    columns: vec![IndexColumn::plain("qty"), IndexColumn::plain("code")],
+                    method: Some(crate::schema::TSQL_COLUMNSTORE.into()),
+                    order: vec!["qty".into()],
+                    clustered: Some(false),
+                    ..Default::default()
+                },
+                crate::schema::IndexInfo {
+                    name: "PXML_doc".into(),
+                    columns: vec![IndexColumn::plain("doc")],
+                    method: Some(crate::schema::TSQL_PRIMARY_XML.into()),
+                    clustered: Some(false),
+                    ..Default::default()
+                },
+                crate::schema::IndexInfo {
+                    name: "IXML_doc_path".into(),
+                    columns: vec![IndexColumn::plain("doc")],
+                    method: Some(crate::schema::TSQL_XML.into()),
+                    using: Some("USING XML INDEX [PXML_doc] FOR PATH".into()),
+                    clustered: Some(false),
+                    ..Default::default()
+                },
+                crate::schema::IndexInfo {
+                    name: "SP_shape".into(),
+                    columns: vec![IndexColumn::plain("shape")],
+                    method: Some(crate::schema::TSQL_SPATIAL.into()),
+                    using: Some(
+                        "USING GEOMETRY_GRID WITH (BOUNDING_BOX = (0, 0, 10, 10), GRIDS = \
+                         (LEVEL_1 = MEDIUM, LEVEL_2 = MEDIUM, LEVEL_3 = MEDIUM, LEVEL_4 = \
+                         MEDIUM), CELLS_PER_OBJECT = 16)"
+                            .into(),
+                    ),
                     clustered: Some(false),
                     ..Default::default()
                 },

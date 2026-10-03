@@ -1836,6 +1836,19 @@ pub(crate) async fn fetch_schema(
     }
 }
 
+/// Primary-key columns = the key columns of the primary index
+/// (`indisprimary`, cell 5) — **not its `INCLUDE` list** (cell 13), whose rows
+/// the index listing's `LEFT JOIN` returns too — keyed by (schema, table,
+/// column) so two namespaces don't share a PK set. An included column read
+/// as a key column is one the grid's row-key selection would key on.
+fn primary_key_columns(idx_all: &[Vec<Option<String>>]) -> HashSet<(String, String, String)> {
+    idx_all
+        .iter()
+        .filter(|r| cell(r, 5) == "t" && !cell(r, 4).is_empty() && cell(r, 13) != "t")
+        .map(|r| (cell(r, 0), cell(r, 1), cell(r, 4)))
+        .collect()
+}
+
 /// The catalogue reads themselves, on a client the caller owns — split out so
 /// [`fetch_schema`] can race the whole sequence against a cancellation rather
 /// than checking a token between each of the dozen queries.
@@ -1919,14 +1932,7 @@ async fn collect_schema(client: &Client) -> Result<DbSchema, DbError> {
             )
         })
         .collect();
-    // Primary-key columns = the key columns of the primary index
-    // (`indisprimary`) — not its `INCLUDE` list — keyed by (schema, table,
-    // column) so two namespaces don't share a PK set.
-    let pk_set: HashSet<(String, String, String)> = idx_all
-        .iter()
-        .filter(|r| cell(r, 5) == "t" && !cell(r, 4).is_empty() && cell(r, 13) != "t")
-        .map(|r| (cell(r, 0), cell(r, 1), cell(r, 4)))
-        .collect();
+    let pk_set = primary_key_columns(&idx_all);
 
     // Columns for the whole schema, in ordinal order — from `pg_catalog`, not
     // `information_schema.columns`.
@@ -5521,6 +5527,30 @@ mod tests {
         // dependency on some other object with the same numeric oid would
         // otherwise hide a routine at random.
         assert!(f.contains("d.classid = 'pg_proc'::regclass"), "{f}");
+    }
+
+    /// **A primary key's `INCLUDE` columns are not key columns** (S3.1-L6-02):
+    /// the index listing returns a row for an included column too, with
+    /// `indisprimary` set, and only the included flag keeps it out — which
+    /// nothing tested. Reverted, `c` of `PRIMARY KEY (id) INCLUDE (c)` reads
+    /// `primary_key`, and the grid keys its writes on it.
+    #[test]
+    fn a_primary_keys_included_column_is_not_a_key_column() {
+        let row = |col: &str, primary: &str, included: &str| -> Vec<Option<String>> {
+            let mut r: Vec<Option<String>> = vec![None; 14];
+            r[0] = Some("public".into());
+            r[1] = Some("t".into());
+            r[4] = Some(col.into());
+            r[5] = Some(primary.into());
+            r[13] = Some(included.into());
+            r
+        };
+        let rows = vec![row("id", "t", "f"), row("c", "t", "t"), row("x", "f", "f")];
+        let key = |c: &str| ("public".to_string(), "t".to_string(), c.to_string());
+        let set = primary_key_columns(&rows);
+        assert!(set.contains(&key("id")));
+        assert!(!set.contains(&key("c")), "{set:?}");
+        assert!(!set.contains(&key("x")), "{set:?}");
     }
 
     #[test]

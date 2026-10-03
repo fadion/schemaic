@@ -5684,6 +5684,18 @@ mod tests {
             pos(&file, "CREATE SYNONYM [dbo].[syn]") < create_table,
             "{file}"
         );
+        // **Each once** (R2-L6-04): the generic objects pass and the outside-
+        // dependencies pass both skip SQL Server's objects, which the T-SQL
+        // pass writes; without either skip one was written a second time and
+        // the restore stopped at "There is already an object named …".
+        for create in [
+            "CREATE SEQUENCE [dbo].[seq]",
+            "CREATE SEQUENCE [Sequences].[OrderID]",
+            "CREATE TYPE [dbo].[Phone]",
+            "CREATE SYNONYM [dbo].[syn]",
+        ] {
+            assert_eq!(file.matches(create).count(), 1, "{create}: {file}");
+        }
         // A sequence in a namespace with no table of the export's — as
         // WideWorldImporters keeps every key's — is carried, its schema made,
         // but only created where it is missing and never dropped: it is not

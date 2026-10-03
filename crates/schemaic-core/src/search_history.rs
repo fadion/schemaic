@@ -448,6 +448,36 @@ mod tests {
         }
     }
 
+    /// **Every kind's tag is a pinned, persisted spelling that reads back as
+    /// itself** (R2-L6-05): the spellings are written by `as_str` and read by
+    /// a second hand-kept match, so a one-letter drift between the two — or a
+    /// rename — turned every remembered entry of that kind into `Unknown` on
+    /// the next load, silently, by design. The literal table makes a rename a
+    /// visible diff.
+    #[test]
+    fn every_kinds_tag_is_a_pinned_spelling_that_reads_back() {
+        use crate::ddl::ObjectKind as K;
+        let pinned = |k: K| match k {
+            K::Enum => "enum",
+            K::Domain => "domain",
+            K::Sequence => "sequence",
+            K::Function => "function",
+            K::Procedure => "procedure",
+            K::Event => "event",
+            K::Synonym => "synonym",
+            K::AliasType => "alias_type",
+            K::XmlSchemaCollection => "xml_schema_collection",
+        };
+        for kind in K::ALL {
+            let tag = ObjectTag::of(kind);
+            let json = serde_json::to_string(&tag).unwrap();
+            assert_eq!(json, format!("\"{}\"", pinned(kind)), "{kind:?}");
+            let back: ObjectTag = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, tag, "{kind:?}");
+            assert_eq!(back.kind(), Some(kind), "{kind:?}");
+        }
+    }
+
     #[test]
     fn push_caps_per_connection() {
         let mut v = Vec::new();
