@@ -519,6 +519,7 @@ pub(crate) fn key_entries(
                     name: String::new(),
                     constraint: constraint.map(str::to_string),
                     unique: false,
+                    remade: false,
                 },
             ),
     }
@@ -2806,6 +2807,8 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                             // duplicates are accepted from now
                                             // on — `Change::risks`' arm.
                                             unique: ix.unique,
+                                            // Dropped for good.
+                                            remade: false,
                                         },
                                     );
                                 })

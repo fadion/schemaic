@@ -5180,13 +5180,19 @@ existing prose was left alone.
     edit of its `using`, a comparison — so each secondary the draft still listed was lost with
     nothing said. `diff` now drops and re-adds every current secondary the draft keeps whose parent
     is in `dropped_ix`, the sort above dropping it ahead of the parent and the `AddIndex` phase
-    creating it after, and where the draft renamed the parent re-points its clause at the new name
-    (`IndexInfo::using_xml_parent`); one the draft edits too is re-created already, and only its
-    clause follows (`re_creating_an_xml_parent_puts_back_its_secondaries`; live,
-    `xml_and_spatial_indexes_are_made_and_kept_whole`, under `mssql.rs`). **A parent the draft only
-    renames is not re-created at all now** — it is an `sp_rename` (`Change::RenameIndex`, below),
-    and a secondary names its parent by id, so nothing under it moves; the pass and its re-pointing
-    matter only for a parent that is re-made, renamed or not (both halves in the same test). A
+    creating it after; one the draft edits too is re-created already. **One the draft renames is
+    re-made under its new name, not renamed**: its `sp_rename` ran after the parent's drop had
+    already taken it, and failed with Msg 15248 (IDX-01,
+    `a_renamed_secondary_is_not_touched_after_its_parent_goes`). **A parent the draft only
+    renames is not re-created at all** — it is an `sp_rename` (`Change::RenameIndex`, below),
+    and a secondary names its parent by id, so nothing under it moves. **Every secondary the plan
+    creates from the draft names its parent as the plan leaves it**
+    (`IndexInfo::using_xml_parent`): the draft's own parent of that name first, else the current one
+    the draft renamed — the two names `validate` accepts. The re-point once looked only at the
+    parents in `dropped_ix`, so a secondary edited or added beside a parent that was only renamed
+    named the old name, and the server refused it (Msg 6333, IDX-02,
+    `a_secondary_follows_a_parent_that_is_only_renamed`; both live, in
+    `index_renames_meeting_drops_and_each_other_apply`, under `mssql.rs`, red before). A
     `lossy` secondary under
     a dropped parent withholds the parent's edit instead — a `KeepLossyIndex` named for the
     secondary — rather than re-make it from a partial reading. That arm is practically
@@ -5513,7 +5519,13 @@ existing prose was left alone.
     re-points renamed columns, with the name and constraint set to the draft's — **even for a
     `lossy` index**, since a rename restates nothing. `emit_mssql` writes it straight after the
     index drops, because a dropped index frees its name first and an added one may take the old
-    name after: `EXEC sp_rename N'[s].[t].[old]', N'new', N'INDEX';`, or, for an index a constraint
+    name after, in the order `tsql_rename_steps` gives: a rename waits while another rename's index
+    still holds its new name, so a chain runs from its free end, and where every rename left waits
+    on another — a swap, any cycle — the first steps aside through a temporary
+    `schemaic_rename_N` that no rename holds or takes. In draft order, each of those renamed onto a
+    name still in use (Msg 15335, IDX-03, `index_renames_onto_freed_or_swapped_names_run`, which
+    runs every plan over the table's index names as the server would). Each step is
+    `EXEC sp_rename N'[s].[t].[old]', N'new', N'INDEX';`, or, for an index a constraint
     backs, `EXEC sp_rename N'[s].[constraint]', N'new', N'OBJECT';`, which renames the constraint
     and its index together. The preview reads *Rename index ix to ix2*, with no risk sentence. The
     other engines keep the drop and the create — none of their emitters writes the change, so
@@ -5524,26 +5536,33 @@ existing prose was left alone.
     (`a_renamed_sql_server_index_is_renamed_in_place`; live, `a_renamed_index_keeps_what_it_had`,
     under `mssql.rs` — a `FILLFACTOR = 80`, `PAGE`-compressed index, a unique constraint, a primary
     XML and a spatial index renamed together, each an `sp_rename` with its options kept, the
-    constraint named anew, a re-read diffing empty — red on 2022 with the change stashed). **An
-    index renamed *and* otherwise changed is renamed first and re-made under the new name**: a
-    `RenameIndex` plus a drop and an add of the new name (`drop_index_as_now`, its constraint
-    following), so the guard's name-pairing sees it, asking under the name it has when the guard
-    runs (`index_renamed_from`). `emit_mssql` runs the index drops in two halves around the
-    renames — those that free a name first, a rename's own target after it. As a drop of one name
-    and an add of another nothing paired them, and the index came back without what the model does
-    not read, unrefused. The passes that address a current index by name after the index pass —
-    the dependents repair around a retype, the key-bound XML/spatial pass and the parents-last sort
-    — use the name a rename gives it (`index_name_now`), and re-point a secondary whose parent is
-    renamed (same tests; live, a renamed-and-widened index with a fill factor refused, one with
-    none renamed and re-made).
+    constraint named anew, a re-read diffing empty — red on 2022 with the change stashed). **A
+    `RenameIndex` is only ever of an index the plan otherwise keeps, and every `DropIndex` names an
+    index as it is before the plan**: one renamed *and* otherwise changed — or only renamed but
+    taken off around a retype (`repair_tsql_dependents`), its clustered key or its XML parent
+    (`remake_index`) — is dropped under the name it has and created under the new one, and all the
+    drops run before any rename. The drop says itself that the index comes back (`DropIndex`'s
+    `remade`), and the guard asks of exactly those, by the name they have — so a renamed and widened
+    index is still asked what it carries. The first answer was the other way round: such an index
+    was renamed first and dropped under its new name, so the guard's name-pairing saw it, and the
+    emitter ran the drops in two halves around the renames, decided by name. That broke three ways —
+    a renamed secondary was renamed after its parent's drop had taken it (IDX-01), a deleted index
+    whose name a rename took was dropped after the rename onto it (IDX-03), and a deleted index and
+    one re-made under its name paired by name in the guard. The passes that address a current index
+    after the index pass — the dependents repair, the key-bound XML/spatial pass and the
+    parents-last sort — key on the name before the plan, and name what they put back as the plan
+    leaves it (`index_name_after`, over the draft's index renames the plan carries) (same tests;
+    live, a renamed-and-widened index with a fill factor refused, one with none re-made).
     `DropCheck` carries a risk sentence though it deletes no data — the table stops
     guaranteeing something and nothing else says so — but `ChangeSet::destructive`
     suppresses it when the same name is re-added in the same plan, since every check
     *edit* is a drop-and-add and "rows the constraint refused are accepted from now on"
-    is simply false about one. **Index and foreign-key names are on that same re-added
-    list now**, because `diff` recreates both the same way: without them, the two risk
-    sentences a dropped unique index and a dropped foreign key had been missing would
-    have put a false loss on every ordinary index or FK *edit*.
+    is simply false about one. **Foreign-key names are on that same re-added list now**, and an
+    index drop marked `remade` is passed over the same way, because `diff` recreates both: without
+    them, the two risk sentences a dropped unique index and a dropped foreign key had been missing
+    would have put a false loss on every ordinary index or FK *edit*. The index asks its own flag,
+    not the list, since one re-made under a new name has no add of its own name and a deleted one
+    may share its name with another renamed onto it (`a_re_added_constraint_is_not_a_loss`).
     `a_re_added_constraint_is_not_a_loss` pins that composition, which is the half
     neither predicate can be tested for alone. `enforced` is MySQL's `NOT ENFORCED` only: PG's
     `NOT VALID` exempts existing rows and so can't silently change what a write does.
@@ -14601,9 +14620,9 @@ existing prose was left alone.
   `ddl.rs`); then the drops of what covers columns —
   foreign keys first of all, since one referencing the table's own key blocks the key's drop, then
   indexes (`DROP CONSTRAINT` for one a constraint backs, `DROP INDEX [i] ON t` otherwise), then
-  the index renames (`Change::RenameIndex`'s `sp_rename`, under `ddl.rs`) — after the drops that
-  may free a name, before the adds that may take the old one — then the drop of an index renamed
-  and re-made, under its new name, then
+  the index renames (`Change::RenameIndex`'s `sp_rename`, under `ddl.rs`) — after every index
+  drop, each of which names the index as it was, so a rename onto a freed name finds it free, and
+  before the adds that may take the old one — then
   checks and the primary key (`DROP CONSTRAINT` by name). **Indexes before the key, not after**:
   an XML or spatial index stands on the clustered key and the server refuses the key's drop while
   one exists (Msg 3734, measured on 2022), so with the key's drop first even a plan that also

@@ -5125,6 +5125,171 @@ async fn a_renamed_index_keeps_what_it_had() {
     );
 }
 
+/// **Renames that meet a drop, or each other, run** (IDX-01–03): a
+/// secondary XML index renamed while the key under its parent is re-made,
+/// and one renamed beside a selective parent given another path, were
+/// renamed after the parent's drop had taken them (Msg 15248); a secondary
+/// edited or added beside a parent only renamed named the parent's old name
+/// (Msg 6333); and a rename onto a name the plan frees, a swap and a chain
+/// renamed onto a name still taken (Msg 15335). Each plan now applies, and
+/// what was renamed alone keeps its fill factor.
+#[tokio::test(flavor = "multi_thread")]
+async fn index_renames_meeting_drops_and_each_other_apply() {
+    use schemaic_core::ddl::{IndexDraft, TableDraft};
+    use schemaic_core::schema::{IndexInfo, TSQL_XML};
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("index_rename_order").await;
+    let rename = |d: &mut TableDraft, from: &str, to: &str| {
+        d.indexes
+            .iter_mut()
+            .find(|i| i.original.as_deref() == Some(from))
+            .unwrap_or_else(|| panic!("{from}"))
+            .info
+            .name = to.into();
+    };
+    fn ix<'a>(d: &'a mut TableDraft, name: &str) -> &'a mut IndexInfo {
+        &mut d
+            .indexes
+            .iter_mut()
+            .find(|i| i.info.name == name)
+            .unwrap_or_else(|| panic!("{name}"))
+            .info
+    }
+    // `name:parent` for each secondary XML index, `name:fill factor` for
+    // the rest — what the table has, in name order.
+    let shape = |t: &'static str| {
+        let s = &s;
+        async move {
+            s.scalar(&format!(
+                "SELECT STRING_AGG(CONCAT(i.name, ':', COALESCE(p.name, \
+                 CONVERT(nvarchar(10), i.fill_factor))), ',') WITHIN GROUP (ORDER BY i.name) \
+                 FROM sys.indexes i LEFT JOIN sys.xml_indexes x ON x.object_id = i.object_id \
+                 AND x.index_id = i.index_id LEFT JOIN sys.indexes p \
+                 ON p.object_id = i.object_id AND p.index_id = x.using_xml_index_id \
+                 WHERE i.object_id = OBJECT_ID(N'dbo.{t}') AND i.is_primary_key = 0 \
+                 AND i.type <> 0"
+            ))
+            .await
+        }
+    };
+
+    // A retype under the clustered key re-makes the XML parent; the
+    // secondary on it is renamed.
+    s.exec(
+        "CREATE TABLE dbo.k (id int NOT NULL CONSTRAINT pk_k PRIMARY KEY CLUSTERED, \
+         doc xml NULL); CREATE PRIMARY XML INDEX px ON dbo.k (doc); \
+         CREATE XML INDEX sx ON dbo.k (doc) USING XML INDEX px FOR PATH;",
+    )
+    .await;
+    let current = read_table(&s, "k").await;
+    let mut d = TableDraft::from_table(&current);
+    d.columns
+        .iter_mut()
+        .find(|c| c.info.name == "id")
+        .unwrap()
+        .info
+        .type_name = "bigint".into();
+    rename(&mut d, "sx", "sx2");
+    // Every plan is tried, and what the server refused said at the end.
+    let mut refused: Vec<String> = Vec::new();
+    match apply_draft_err_free(&s, &current, &d).await {
+        None => assert_eq!(shape("k").await, "px:0,sx2:px"),
+        Some(e) => refused.push(format!("k: {e}")),
+    }
+
+    // A selective parent given another path; its secondary renamed.
+    s.exec(
+        "CREATE TABLE dbo.sel (id int NOT NULL CONSTRAINT pk_sel PRIMARY KEY CLUSTERED, \
+         doc xml NULL); \
+         CREATE SELECTIVE XML INDEX sl ON dbo.sel (doc) FOR (a = '/a' AS SQL int); \
+         CREATE XML INDEX sx ON dbo.sel (doc) USING XML INDEX sl FOR (a);",
+    )
+    .await;
+    let current = read_table(&s, "sel").await;
+    let mut d = TableDraft::from_table(&current);
+    ix(&mut d, "sl").using = Some("FOR (a = '/a' AS SQL int, b = '/b' AS SQL int)".into());
+    rename(&mut d, "sx", "sx2");
+    match apply_draft_err_free(&s, &current, &d).await {
+        None => assert_eq!(shape("sel").await, "sl:0,sx2:sl"),
+        Some(e) => refused.push(format!("sel: {e}")),
+    }
+
+    // The parent only renamed; its secondary edited, another added naming
+    // the parent by the name it had.
+    s.exec(
+        "CREATE TABLE dbo.rp (id int NOT NULL CONSTRAINT pk_rp PRIMARY KEY CLUSTERED, \
+         doc xml NULL); CREATE PRIMARY XML INDEX px ON dbo.rp (doc); \
+         CREATE XML INDEX sx ON dbo.rp (doc) USING XML INDEX px FOR PATH;",
+    )
+    .await;
+    let current = read_table(&s, "rp").await;
+    let mut d = TableDraft::from_table(&current);
+    rename(&mut d, "px", "px2");
+    ix(&mut d, "sx").using = Some("USING XML INDEX [px] FOR VALUE".into());
+    let mut added = ix(&mut d, "sx").clone();
+    added.name = "sx_new".into();
+    added.using = Some("USING XML INDEX [px] FOR PROPERTY".into());
+    assert_eq!(added.method.as_deref(), Some(TSQL_XML));
+    d.indexes.push(IndexDraft::new(added));
+    match apply_draft_err_free(&s, &current, &d).await {
+        None => assert_eq!(shape("rp").await, "px2:0,sx:px2,sx_new:px2"),
+        Some(e) => refused.push(format!("rp: {e}")),
+    }
+
+    // A rename onto a name the plan frees, a swap, and a chain — each
+    // index renamed alone keeping its own fill factor.
+    s.exec(
+        "CREATE TABLE dbo.n (id int NOT NULL CONSTRAINT pk_n PRIMARY KEY, \
+         a int NULL, b int NULL, c int NULL); \
+         CREATE INDEX ix_a ON dbo.n (a) WITH (FILLFACTOR = 70); \
+         CREATE INDEX ix_b ON dbo.n (b) WITH (FILLFACTOR = 80); \
+         CREATE INDEX ix_c ON dbo.n (c) WITH (FILLFACTOR = 90);",
+    )
+    .await;
+    let current = read_table(&s, "n").await;
+    let mut d = TableDraft::from_table(&current);
+    d.indexes.retain(|i| i.info.name != "ix_b");
+    rename(&mut d, "ix_a", "ix_b");
+    match apply_draft_err_free(&s, &current, &d).await {
+        None => assert_eq!(shape("n").await, "ix_b:70,ix_c:90"),
+        Some(e) => refused.push(format!("onto a freed name: {e}")),
+    }
+
+    // A swap and a chain, on a table of their own so neither waits on the
+    // one above.
+    s.exec(
+        "CREATE TABLE dbo.w (id int NOT NULL CONSTRAINT pk_w PRIMARY KEY, \
+         b int NULL, c int NULL); \
+         CREATE INDEX ix_b ON dbo.w (b) WITH (FILLFACTOR = 70); \
+         CREATE INDEX ix_c ON dbo.w (c) WITH (FILLFACTOR = 90);",
+    )
+    .await;
+    let current = read_table(&s, "w").await;
+    let mut d = TableDraft::from_table(&current);
+    rename(&mut d, "ix_b", "ix_c");
+    rename(&mut d, "ix_c", "ix_b");
+    match apply_draft_err_free(&s, &current, &d).await {
+        None => assert_eq!(shape("w").await, "ix_b:90,ix_c:70"),
+        Some(e) => refused.push(format!("swap: {e}")),
+    }
+    let current = read_table(&s, "w").await;
+    let mut d = TableDraft::from_table(&current);
+    rename(&mut d, "ix_b", "ix_c");
+    rename(&mut d, "ix_c", "ix_d");
+    // Whether or not the swap applied, each index moves one name on.
+    let before = shape("w").await;
+    match apply_draft_err_free(&s, &current, &d).await {
+        None => assert_eq!(
+            shape("w").await,
+            before.replace("ix_c:", "ix_d:").replace("ix_b:", "ix_c:")
+        ),
+        Some(e) => refused.push(format!("chain: {e}")),
+    }
+    assert!(refused.is_empty(), "{refused:#?}");
+}
+
 /// **A sequence's restart is honoured where it is asked and ignored where it
 /// is not a definition**: a retype with *Restart at* filled starts there
 /// (it started at the old START, S4.1-L1-01); a minimum raised to the
