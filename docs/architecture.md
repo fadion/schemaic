@@ -6540,34 +6540,45 @@ existing prose was left alone.
     not refuse** (`a_mysql_body_is_kept_out_of_the_plan_and_disclosed_by_it`,
     `a_blocked_body_cannot_be_planned_however_the_predicate_answers`).
     **`SchemaComparison::new_namespaces` is the prerequisite a migration had no way to state.** A
-    namespace is not an object this comparison pairs — nothing introspects an empty one, and there is
-    nothing in it to diff — so a right-only PostgreSQL namespace meant `CREATE TABLE reporting.sales`
+    namespace is not an object this comparison pairs — there is nothing in it to diff — so a
+    right-only PostgreSQL namespace meant `CREATE TABLE reporting.sales`
     against a database with no `reporting` in it, which PostgreSQL refuses and with it the transaction
     the whole migration runs in, while `unsupported()` was empty and Apply was live. `plan()`
     prepends a `CREATE SCHEMA` for each one a set **in that plan** actually names, rather than for
     every one the comparison found: the comparison's list is about the two schemas, and a plan over
     one ticked table has no business creating a namespace for an object the user left out
     (`a_table_in_a_new_namespace_gets_its_create_schema_first`,
-    `an_unticked_objects_namespace_is_not_created`). It is read off the entries' own statuses,
-    `DbSchema` holding no list of namespaces, and is empty on MySQL and SQLite by construction rather
+    `an_unticked_objects_namespace_is_not_created`). The right side's namespaces are read off the
+    entries' own statuses; the left's are those **and** the target's `DbSchema::namespaces` (under
+    `schema.rs`), and the list is empty on MySQL and SQLite by construction rather
     than by a dialect test — neither has a level between the database and the table, so every object's
     namespace there is `None` (`an_engine_with_no_namespaces_never_creates_one`). **Read off the
-    entries, a target holding no objects reads no namespaces at all**, so comparing into an empty
-    SQL Server database planned "Create schema dbo" — a change SQL Server's plans then refused, which
-    withheld the whole plan — and into an empty PostgreSQL one `CREATE SCHEMA "public"`, refused as
+    entries alone, as it was, a target holding no objects read no namespaces at all**, so comparing
+    into an empty SQL Server database planned "Create schema dbo" — a change SQL Server's plans
+    then refused, which withheld the whole plan — and into an empty PostgreSQL one `CREATE SCHEMA "public"`, refused as
     already there along with the migration's transaction. A namespace every database comes with
     (`ddl::namespace_comes_with_every_database`: SQL Server's `dbo`, `guest`, `sys`,
-    `INFORMATION_SCHEMA`; PostgreSQL's `public`, `pg_catalog`, `information_schema`) is never one of
-    them. PostgreSQL's `public` can be dropped, and into a database where it has been the plan's
+    `INFORMATION_SCHEMA` and the nine `db_*` fixed-role schemas; PostgreSQL's `public`, `pg_catalog`,
+    `information_schema`) is never one of them. PostgreSQL's `public` can be dropped, and into a
+    database where it has been the plan's
     first `CREATE TABLE public.…` is refused and rolled back — the trade for a plan that applies into
     every database that still has it (`a_namespace_every_database_comes_with_is_not_planned`; live,
-    `a_comparison_into_an_empty_database_does_not_create_dbo`). An *empty* namespace of the user's
-    own on the target is still read as missing, and its `CREATE SCHEMA` refused as there.
+    `a_comparison_into_an_empty_database_does_not_create_dbo`). **An *empty* namespace of the
+    user's own on the target was read as missing too**, and its `CREATE SCHEMA` refused as there
+    (Msg 2714 on SQL Server) with the whole migration (S2-L1-02); the target's
+    `DbSchema::namespaces` is what answers that one (`a_namespace_the_target_already_has_is_not_planned`;
+    live, `an_empty_schema_is_listed_compared_into_and_dropped` and
+    `pg_catalog::an_empty_schema_is_listed_and_not_created_again`). It does not make the built-in
+    list redundant: the reader keeps the role schemas *off* `DbSchema::namespaces`, and they joined
+    the list in the same change, after a table in `db_datareader` compared into another database
+    planned `CREATE SCHEMA [db_datareader]` and met the same Msg 2714; a hand-built schema lists
+    nothing at all.
     **SQL Server's plans admit `CreateSchema` now** (under `ddl.rs`), so a comparison into a SQL
-    Server database that lacks a schema other than those four is planned like PostgreSQL's — the
+    Server database that lacks a schema other than those is planned like PostgreSQL's — the
     `CREATE SCHEMA` ahead of the table in it — where `tsql_supports` refusing the prepended change
-    used to withhold the whole plan. That makes the filter above load-bearing there: without it,
-    `dbo` would no longer withhold the plan but reach the server as `CREATE SCHEMA [dbo];`.
+    used to withhold the whole plan. That makes the filter above load-bearing there: without it, a
+    role schema would no longer withhold the plan but reach the server as
+    `CREATE SCHEMA [db_datareader];` — as `dbo` would have, before the reader listed it.
     **`is_planned`, `selection_note` and `SchemaPlan::subject` are decisions, and they were in the
     view.** `is_planned(entry, selected)` — `selected.contains(&e.key()) && !e.needs_source() &&
     !e.unplannable()` — is the
@@ -9703,6 +9714,25 @@ existing prose was left alone.
     round trip to change no answer. `None` also means "the reader did not record it", which is the honest
     answer for a hand-built schema, and a side with no address is compared exactly as it arrived
     rather than guessed at — see `compare.rs`'s `as_read_from`.
+    **`DbSchema::namespaces` is the reader's own list of namespaces, empty ones included**, and
+    `schemas()` is that list unioned with every object's namespace. `schemas()` used to be derived
+    from the objects alone, so a namespace holding nothing did not exist to anything that asked: on
+    SQL Server a schema made with Create ▸ Schema never appeared in the tree, its Drop was offered
+    only while the schema held something — exactly when T-SQL must refuse it (Msg 3729; there is no
+    `CASCADE`) — and a comparison planned `CREATE SCHEMA` for a namespace the target had but held
+    nothing in, refused with Msg 2714 and the whole migration rolled back with it (review findings
+    S2-L1-01 and S2-L1-02; under `compare.rs` and `schema_tree.rs`). SQL Server's list is
+    `db::mssql`'s `NAMESPACE_LISTING` over `sys.schemas` — `dbo` (`schema_id` 1) and the user's own
+    (5 to 16383), so not `guest` (2), `INFORMATION_SCHEMA` (3), `sys` (4) or the nine `db_*`
+    fixed-role schemas (16384–16393); PostgreSQL's is `db/pg.rs`'s `namespace_names` over
+    `pg_namespace`, on the same `user_schema_filter` every object read uses, so an extension-owned
+    schema is kept as it is everywhere else. MySQL and SQLite leave it empty, having no such level,
+    and **so does the first-paint partial schema** `fetch_table_list` returns on every engine — so
+    nothing may read an empty `schemas()` as "this database has no namespace level" (under
+    `table_designer.rs`). Pinned by `schemas_lists_a_listed_namespace_with_nothing_in_it`; live, by
+    `an_empty_schema_is_listed_compared_into_and_dropped` on SQL Server 2022 and
+    `pg_catalog::an_empty_schema_is_listed_and_not_created_again` on PostgreSQL 16, both watched fail
+    with the fix stashed.
     **`DbSchema::extension_routines` is the one field that carries names and nothing else**, and it
     exists because two readers of `routines` wanted opposite answers. PostgreSQL only — the other
     two engines have no such concept and leave it empty. The tree browses `routines`, which
@@ -20152,9 +20182,10 @@ existing prose was left alone.
     login mapped with `DEFAULT_SCHEMA = sales` is not the `dbo` the row stands for. **The dialect
     alone decides it now**, and `default_schema` takes `ConnUi` alone. It used to be refined by the
     loaded schema — `None` whenever `DbSchema::schemas()` came back empty, read as "this database
-    has no namespace level" — but that list is derived from the objects, so it is empty for *any*
-    database with none yet, while a SQL Server or PostgreSQL database always has its default
-    namespace. On an empty SQL Server database Create ▸ Table went out unqualified into the login's
+    has no namespace level" — but that list was then derived from the objects, so it was empty for
+    *any* database with none yet, while a SQL Server or PostgreSQL database always has its default
+    namespace. It carries the reader's own list now (`DbSchema::namespaces`, under `schema.rs`), but
+    the first-paint partial schema still carries none, so the inference stays wrong. On an empty SQL Server database Create ▸ Table went out unqualified into the login's
     default schema all the same (review finding S3.1-L1-03, measured with a user mapped
     `DEFAULT_SCHEMA = sales`) — the first table of a new database, the likeliest one to be created
     there — and a table comment in the same draft failed the plan instead, the comment naming
@@ -21350,14 +21381,21 @@ existing prose was left alone.
     routines; and events on MySQL — so a SQLite tree grows none of them. They are
     scoped by `TableScope` for the reason
     it exists — *flat* means the database has no schema level, not that its objects have no
-    namespace. **Whether there is a level is `schema_groups(schema, dialect)`**: none when every
-    object sits in the engine's default namespace (`schema::default_namespace` — PostgreSQL's
+    namespace. **Whether there is a level is `schema_groups(schema, dialect)`**: none when the only
+    namespace `schemas()` returns is the engine's default (`schema::default_namespace` — PostgreSQL's
     `public`, SQL Server's `dbo`; MySQL has none at all), one row per namespace otherwise —
     **including a lone namespace that is not the default**. That case was flattened like `public`,
     as "no choice to present", which hid the namespace's name and left its Drop no row to hang
     from: a SQL Server database whose only objects live in `sales` listed them straight under the
     database (`a_single_non_default_namespace_gets_its_level`,
-    `the_nav_walk_shows_a_single_non_default_namespace`). The dialect is the active connection's
+    `the_nav_walk_shows_a_single_non_default_namespace`). **An empty namespace counts too**, since
+    `schemas()` takes the reader's list as well as the objects' (`DbSchema::namespaces`, under
+    `schema.rs`): a schema just made with Create ▸ Schema, or emptied, is a node reading "0 tables"
+    with a "No tables" row and its context menu — Drop included, at the one moment T-SQL takes it
+    (Msg 3729 while anything is left inside). So `public` beside an empty `sales` now groups, while
+    a lone default still flattens. Nothing in `schema_groups` changed for it and no tree test pins
+    the empty case; `schemas_lists_a_listed_namespace_with_nothing_in_it` does, one level down, and
+    live `an_empty_schema_is_listed_compared_into_and_dropped` drops one. The dialect is the active connection's
     (`active_dialect`), the render's and the nav walk's alike. Two filter rules follow from the level above being evaluated first: a database
     and a namespace both survive a search that only one of their **objects** matches, or the
     match would be hidden by the row that contains it. `nav_rows` carries the folders and their

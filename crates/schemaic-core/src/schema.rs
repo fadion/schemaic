@@ -6146,6 +6146,19 @@ pub struct DbSchema {
     /// a hand-built schema. A side with no address is compared exactly as it
     /// arrived rather than guessed at.
     pub database: Option<String>,
+    /// **The namespaces the reader listed, empty ones included** — PostgreSQL's
+    /// user schemas from `pg_namespace`, SQL Server's from `sys.schemas` (`dbo`
+    /// and the user's own, not `guest`, `sys`, `INFORMATION_SCHEMA` or the
+    /// `db_*` role schemas). Empty on MySQL and SQLite, which have no such
+    /// level, and on a hand-built schema.
+    ///
+    /// [`DbSchema::schemas`] used to be derived from the objects alone, so a
+    /// namespace holding nothing was invisible: a schema made with Create ▸
+    /// Schema never appeared in the tree, its Drop was offered only while it
+    /// held something — when T-SQL must refuse it (Msg 3729) — and a
+    /// comparison planned `CREATE SCHEMA` for one the target already had,
+    /// which the server refused and the migration rolled back (S2-L1-01/02).
+    pub namespaces: Vec<String>,
     /// **Names of functions an extension owns — and nothing else about them.**
     /// PostgreSQL only; the other two engines have no such concept and leave it
     /// empty.
@@ -7163,11 +7176,13 @@ impl DbSchema {
     pub fn schemas(&self) -> Vec<String> {
         // Every kind of object contributes, not just tables: a namespace holding
         // only types or sequences is still a namespace, and leaving it out would
-        // make its contents unreachable in the tree.
+        // make its contents unreachable in the tree. And the ones the reader
+        // listed though they hold nothing (`namespaces`).
         let mut out: Vec<String> = self
-            .tables
+            .namespaces
             .iter()
-            .filter_map(|t| t.schema.clone())
+            .cloned()
+            .chain(self.tables.iter().filter_map(|t| t.schema.clone()))
             .chain(self.enums.iter().filter_map(|e| e.schema.clone()))
             .chain(self.domains.iter().filter_map(|d| d.schema.clone()))
             .chain(self.sequences.iter().filter_map(|s| s.schema.clone()))
@@ -11702,6 +11717,24 @@ mod tests {
         assert_eq!(s.create_ddl_script(Some("ghosts"), Postgres), "");
         assert_eq!(s.tables_in(Some("ghosts")).count(), 0);
         assert_eq!(s.tables_in(Some("sales")).count(), 1);
+    }
+
+    /// **A namespace the reader listed is one, objects or not** (S2-L1-01):
+    /// derived from objects alone, a schema made with Create ▸ Schema never
+    /// appeared, and a schema node's Drop was offered only while T-SQL had
+    /// to refuse it (Msg 3729, the schema not empty).
+    #[test]
+    fn schemas_lists_a_listed_namespace_with_nothing_in_it() {
+        let s = DbSchema {
+            tables: vec![TableInfo {
+                name: "orders".into(),
+                schema: Some("dbo".into()),
+                ..Default::default()
+            }],
+            namespaces: vec!["sales".into(), "dbo".into()],
+            ..Default::default()
+        };
+        assert_eq!(s.schemas(), vec!["dbo".to_string(), "sales".to_string()]);
     }
 
     #[test]

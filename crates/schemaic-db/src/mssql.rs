@@ -3040,18 +3040,32 @@ async fn collect_schema(client: &mut MsClient) -> Result<DbSchema, DbError> {
         }
     }
 
+    // The namespaces themselves, empty ones included — `dbo` and the user's
+    // own, not `guest` (2), `INFORMATION_SCHEMA` (3), `sys` (4) or the `db_*`
+    // role schemas (16384–16393). See `DbSchema::namespaces`.
+    let namespaces = query_rows(client, NAMESPACE_LISTING)
+        .await?
+        .iter()
+        .map(|r| cell(r, 0).to_string())
+        .filter(|n| !n.is_empty())
+        .collect();
     Ok(DbSchema {
         tables,
         routines,
         tsql_objects,
         tsql_type_bindings,
+        namespaces,
         flavour: schemaic_core::schema::ServerFlavour::Unknown,
-        // Not needed, for PostgreSQL's reason: a foreign key's schema and a
-        // view's names are part of the object, not the database's address.
+        // Stamped by `fetch_schema`, which has the name.
         database: None,
         ..Default::default()
     })
 }
+
+/// The database's namespaces: `dbo` and every user schema — see
+/// `DbSchema::namespaces`.
+const NAMESPACE_LISTING: &str = "SELECT name FROM sys.schemas \
+     WHERE schema_id = 1 OR (schema_id > 4 AND schema_id < 16384) ORDER BY name";
 
 // ── The entry points around a query ──────────────────────────────────────────
 

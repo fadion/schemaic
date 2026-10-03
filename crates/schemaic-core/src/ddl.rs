@@ -3486,8 +3486,10 @@ pub fn is_namespace_change(change: &Change) -> bool {
 ///
 /// What the schema comparison asks before planning a `CREATE SCHEMA`
 /// ([`crate::compare::SchemaComparison::new_namespaces`]), which it reads off
-/// the objects each side holds — so a target with no objects reads no
-/// namespaces at all. Comparing into an empty SQL Server database planned
+/// the objects each side holds and the target's listed namespaces — so a
+/// target with no objects, read from a hand-built or first-paint schema, reads
+/// no namespaces at all, and a full read lists no role schema
+/// (`DbSchema::namespaces`). Comparing into an empty SQL Server database planned
 /// "Create schema dbo", a change SQL Server's plans refuse, and so withheld the
 /// whole plan; into an empty PostgreSQL one, `CREATE SCHEMA "public"`, which the
 /// server refuses as already there, taking the migration's transaction with it.
@@ -3503,7 +3505,23 @@ pub fn is_namespace_change(change: &Change) -> bool {
 /// object there carries a namespace for this to be asked about.
 pub fn namespace_comes_with_every_database(name: &str, dialect: SqlDialect) -> bool {
     let builtin: &[&str] = match dialect {
-        SqlDialect::MsSql => &["dbo", "guest", "sys", "INFORMATION_SCHEMA"],
+        // And the nine fixed-role schemas (`schema_id` 16384–16393), which
+        // every database has too (S2-L1-02, Msg 2714 on a `db_owner` plan).
+        SqlDialect::MsSql => &[
+            "dbo",
+            "guest",
+            "sys",
+            "INFORMATION_SCHEMA",
+            "db_owner",
+            "db_accessadmin",
+            "db_securityadmin",
+            "db_ddladmin",
+            "db_backupoperator",
+            "db_datareader",
+            "db_datawriter",
+            "db_denydatareader",
+            "db_denydatawriter",
+        ],
         SqlDialect::Postgres => &["public", "pg_catalog", "information_schema"],
         SqlDialect::MySql | SqlDialect::Sqlite => &[],
     };

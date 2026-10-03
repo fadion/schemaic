@@ -2313,7 +2313,24 @@ async fn collect_schema(client: &Client) -> Result<DbSchema, DbError> {
         // `current_database()` round trip to change no answer.
         database: None,
         extension_routines: extension_routine_names(client).await?,
+        namespaces: namespace_names(client).await?,
     })
+}
+
+/// The database's schemas, empty ones included, on the filter every object
+/// read uses ([`user_schema_filter`]) — see `DbSchema::namespaces`: derived
+/// from objects alone, a schema holding nothing was invisible in the tree
+/// and missing to a comparison.
+async fn namespace_names(client: &Client) -> Result<Vec<String>, DbError> {
+    let sql = format!(
+        "SELECT n.nspname::text FROM pg_namespace n WHERE {} ORDER BY 1",
+        user_schema_filter("n.nspname")
+    );
+    Ok(query_all(client, &sql)
+        .await?
+        .into_iter()
+        .filter_map(|r| r.into_iter().next().flatten())
+        .collect())
 }
 
 /// Put each table's CHECK constraints and triggers on it — and, on a view, the

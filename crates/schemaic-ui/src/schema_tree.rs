@@ -443,7 +443,10 @@ struct FolderItems {
 /// PostgreSQL's `public`, SQL Server's `dbo` (`schema::default_namespace`) —
 /// looks exactly as it did before multi-schema browsing existed. **A lone
 /// namespace that is not the default is shown**: flattened, its name was
-/// nowhere in the tree and its Drop had no row to hang from.
+/// nowhere in the tree and its Drop had no row to hang from. **So is an empty
+/// one** the reader listed (`DbSchema::namespaces`): a schema just made with
+/// Create ▸ Schema, or emptied, is a node with a "No tables" row and its Drop
+/// — the one moment T-SQL takes that Drop.
 fn schema_groups(schema: &schemaic_core::schema::DbSchema, dialect: SqlDialect) -> Vec<String> {
     let names = schema.schemas();
     let default = schemaic_core::schema::default_namespace(dialect);

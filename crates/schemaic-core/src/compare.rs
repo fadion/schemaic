@@ -568,8 +568,8 @@ pub struct SchemaComparison {
     /// side has none of — the prerequisite a migration into them needs and had
     /// no way to state.
     ///
-    /// A namespace is not an object this comparison pairs (nothing introspects
-    /// an empty one, and there is nothing in it to diff), so `CREATE TABLE
+    /// A namespace is not an object this comparison pairs (there is nothing in
+    /// it to diff), so `CREATE TABLE
     /// reporting.sales` was emitted against a database with no `reporting` in
     /// it: PostgreSQL refuses that statement, and with it the transaction the
     /// whole migration runs in. [`SchemaComparison::plan`] turns the ones a plan
@@ -578,9 +578,10 @@ pub struct SchemaComparison {
     /// Empty on MySQL and SQLite by construction rather than by a dialect test:
     /// neither has a level between the database and the table, so every
     /// object's namespace there is `None`. Never one every database comes with
-    /// ([`ddl::namespace_comes_with_every_database`]) — SQL Server's `dbo`,
-    /// PostgreSQL's `public` — which a target holding no objects reads no sign
-    /// of, and which is there all the same.
+    /// ([`ddl::namespace_comes_with_every_database`]) — SQL Server's `dbo` and
+    /// role schemas, PostgreSQL's `public` — which a hand-built target may
+    /// show no sign of, and which is there all the same; nor one the target's
+    /// reader listed though it holds nothing ([`DbSchema::namespaces`]).
     pub new_namespaces: Vec<String>,
     /// Constraint and index names a table this comparison drops still holds and
     /// a table it creates needs — see [`occupied_names`], which is what a table
@@ -860,9 +861,11 @@ impl SchemaComparison {
 
         // ── namespaces ──────────────────────────────────────────────────────
         //
-        // Read off the entries rather than off `DbSchema`, which holds no list
-        // of them: an entry's status says which sides it is on, and a namespace
-        // matters here exactly when an object lives in it.
+        // Read off the entries — an entry's status says which sides it is on,
+        // and a namespace is to be created exactly when an object lives in it —
+        // and, for the target, off the namespaces its reader listed too
+        // (`DbSchema::namespaces`): one it has but holds nothing in read as
+        // missing, and its `CREATE SCHEMA` rolled the migration back (Msg 2714).
         let namespaces = |on: fn(ObjectStatus) -> bool| -> BTreeSet<String> {
             entries
                 .iter()
@@ -882,7 +885,8 @@ impl SchemaComparison {
                 ObjectStatus::OnlyRight | ObjectStatus::Differing | ObjectStatus::Same
             )
         };
-        let left_ns = namespaces(on_left);
+        let mut left_ns = namespaces(on_left);
+        left_ns.extend(left.namespaces.iter().cloned());
         // A namespace every database comes with is there whether or not an
         // object in it was read — an empty target reads none at all.
         let new_namespaces: Vec<String> = namespaces(on_right)
@@ -3684,6 +3688,39 @@ mod tests {
             );
             assert_eq!(c.new_namespaces, vec!["sales".to_string()], "{dialect:?}");
         }
+    }
+
+    /// **A namespace the target already has is not created, empty or not**
+    /// (S2-L1-02): read off the objects, an empty `sales` on the target was
+    /// missing, and `CREATE SCHEMA [sales]` met Msg 2714 and rolled the whole
+    /// migration back. So were SQL Server's nine `db_*` role schemas, which
+    /// every database has.
+    #[test]
+    fn a_namespace_the_target_already_has_is_not_planned() {
+        let in_ns = |ns: &str| TableInfo {
+            name: "t".to_string(),
+            schema: Some(ns.to_string()),
+            columns: vec![col("id", "int")],
+            ..Default::default()
+        };
+        for dialect in [SqlDialect::MsSql, SqlDialect::Postgres] {
+            let target = DbSchema {
+                namespaces: vec!["sales".into()],
+                ..schema_of(vec![])
+            };
+            let c = SchemaComparison::of(&target, &schema_of(vec![in_ns("sales")]), dialect);
+            assert!(
+                c.new_namespaces.is_empty(),
+                "{dialect:?}: {:?}",
+                c.new_namespaces
+            );
+        }
+        let c = SchemaComparison::of(
+            &schema_of(vec![]),
+            &schema_of(vec![in_ns("db_datareader")]),
+            SqlDialect::MsSql,
+        );
+        assert!(c.new_namespaces.is_empty(), "{:?}", c.new_namespaces);
     }
 
     // ── the two sentences about a count ──────────────────────────────────────

@@ -304,8 +304,9 @@ pub(crate) fn loaded_schema(
 /// **The dialect alone decides it now.** The loaded schema used to refine it —
 /// `None` whenever [`DbSchema::schemas`](schemaic_core::schema::DbSchema::schemas)
 /// came back empty, read as "this database has no namespace level" — but that
-/// list is derived from the objects, so it is empty for *any* database with
-/// none yet, and a database of either engine always has its default namespace.
+/// list was derived from the objects, so it was empty for *any* database with
+/// none yet (and still is on a partial, first-paint schema), and a database of
+/// either engine always has its default namespace.
 /// On an empty SQL Server database Create ▸ Table went out unqualified and
 /// landed in the login's default schema (S3.1-L1-03) — the first table of a
 /// new database, the likeliest one to create there.

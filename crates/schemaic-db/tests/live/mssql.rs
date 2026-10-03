@@ -5120,6 +5120,78 @@ async fn a_sequence_restart_is_honoured_and_not_compared() {
     assert!(differing.is_empty(), "{differing:?}");
 }
 
+/// **An empty schema is a namespace like any other** (S2-L1-01/02): read off
+/// the objects, a schema made with Create ▸ Schema never appeared, its Drop
+/// came only while the server had to refuse it, and a comparison into a
+/// database that already had it empty planned `CREATE SCHEMA` and rolled
+/// back (Msg 2714) — as it did for a table in `db_datareader`.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_empty_schema_is_listed_compared_into_and_dropped() {
+    use schemaic_core::compare::SchemaComparison;
+    use schemaic_core::ddl::{self, Change};
+    if !enabled() || azure_cannot("needs a second database") {
+        return;
+    }
+    let target = Scratch::create("ns_empty_target").await;
+    let source = Scratch::create("ns_empty_source").await;
+    target.exec("CREATE SCHEMA sales").await;
+    source.exec("CREATE SCHEMA sales").await;
+    source
+        .exec("CREATE TABLE sales.orders (id int NOT NULL PRIMARY KEY)")
+        .await;
+    source
+        .exec("CREATE TABLE db_datareader.r (id int NOT NULL PRIMARY KEY)")
+        .await;
+    let read = |s: &Scratch| {
+        let (db, name) = (s.db.clone(), s.name.clone());
+        async move {
+            db.fetch_schema(&name, CancellationToken::new())
+                .await
+                .unwrap()
+        }
+    };
+    let t = read(&target).await;
+    assert_eq!(t.schemas(), vec!["dbo".to_string(), "sales".to_string()]);
+    let plan = SchemaComparison::of(&t, &read(&source).await, MS).plan(|_| true);
+    let stmts = plan.emit();
+    assert!(
+        !stmts.iter().any(|s| s.contains("CREATE SCHEMA")),
+        "{stmts:#?}"
+    );
+    target
+        .db
+        .run_ddl(&target.name, &stmts, CancellationToken::new())
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{}", stmts.join("\n")));
+    assert_eq!(
+        target
+            .scalar("SELECT COUNT(*) FROM sys.tables WHERE name IN (N'orders', N'r')")
+            .await,
+        "2"
+    );
+
+    // Emptied again, it is still listed, and its Drop can succeed.
+    target
+        .exec("DROP TABLE sales.orders; DROP TABLE db_datareader.r")
+        .await;
+    assert!(read(&target).await.schemas().contains(&"sales".to_string()));
+    let drop = ddl::single(
+        "sales",
+        None,
+        MS,
+        Change::DropSchema {
+            name: "sales".into(),
+        },
+    )
+    .emit();
+    target
+        .db
+        .run_ddl(&target.name, &drop, CancellationToken::new())
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{}", drop.join("\n")));
+    assert_eq!(read(&target).await.schemas(), vec!["dbo".to_string()]);
+}
+
 /// **A comparison discloses a module the source would not show, rather than
 /// planning it.** An encrypted view was planned as `CREATE VIEW v AS ;` and
 /// an encrypted procedure as a comment that "succeeded" creating nothing.

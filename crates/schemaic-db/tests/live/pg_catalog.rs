@@ -116,6 +116,54 @@ const GRAMMAR_ONLY: &[&str] = &[
     "xmlserialize",
 ];
 
+/// **An empty schema is listed, and a comparison into it creates nothing**
+/// (S2-L1-01/02): read off the objects alone, a schema holding nothing was
+/// invisible in the tree, and a comparison planned `CREATE SCHEMA` for one
+/// the target already had, which PostgreSQL refuses as already there.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_empty_schema_is_listed_and_not_created_again() {
+    use schemaic_core::compare::SchemaComparison;
+    use schemaic_core::intel::SqlDialect;
+    if !POSTGRES.enabled() {
+        endpoint::note_skipped(&POSTGRES);
+        return;
+    }
+    let target = crate::scratch::Scratch::create(&POSTGRES, "ns_empty_t").await;
+    let source = crate::scratch::Scratch::create(&POSTGRES, "ns_empty_s").await;
+    target.exec("CREATE SCHEMA sales").await;
+    source.exec("CREATE SCHEMA sales").await;
+    source
+        .exec("CREATE TABLE sales.orders (id int PRIMARY KEY)")
+        .await;
+    let read = |s: &crate::scratch::Scratch| {
+        let (db, name) = (s.db.clone(), s.database.clone());
+        async move {
+            db.fetch_schema(&name, CancellationToken::new())
+                .await
+                .unwrap()
+        }
+    };
+    let t = read(&target).await;
+    assert!(
+        t.schemas().contains(&"sales".to_string()),
+        "{:?}",
+        t.schemas()
+    );
+    let plan = SchemaComparison::of(&t, &read(&source).await, SqlDialect::Postgres).plan(|_| true);
+    let stmts = plan.emit();
+    assert!(
+        !stmts.iter().any(|s| s.contains("CREATE SCHEMA")),
+        "{stmts:#?}"
+    );
+    target
+        .db
+        .run_ddl(&target.database, &stmts, CancellationToken::new())
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{}", stmts.join("\n")));
+    target.teardown().await;
+    source.teardown().await;
+}
+
 /// The server knows a name this catalog does not — a false positive waiting for
 /// whoever types it.
 #[tokio::test(flavor = "multi_thread")]

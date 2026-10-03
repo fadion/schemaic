@@ -137,9 +137,10 @@ pub(crate) fn open_for_new(
 /// at, because guessing means refusing what the server would have accepted. A
 /// name the app can *see* is taken is a different thing from one it cannot.
 ///
-/// A namespace holding no objects at all is invisible here, for the same reason
-/// it is invisible in the tree: `DbSchema::schemas` derives the list from the
-/// objects. The cost is one avoidable round trip, not a wrong statement.
+/// An empty namespace counts: `DbSchema::schemas` takes the reader's own
+/// list of them (`DbSchema::namespaces`) as well as the objects' — on a
+/// partial, first-paint schema it does not, and the cost there is one
+/// avoidable round trip, not a wrong statement.
 fn container_names(schema: SchemaUi, kind: ContainerKind, database: Option<&str>) -> Vec<String> {
     schema
         .db_nodes
