@@ -269,6 +269,48 @@ async fn a_named_instance_is_reached_through_sql_server_browser() {
     );
 }
 
+/// **A host is read as Microsoft's clients read it** (S5-L1-02): an inline
+/// `,port` wins over the Port field — `127.0.0.1\X,1433` asked SQL Server
+/// Browser for an instance named `X,1433` — and `tcp:` and `(local)` are the
+/// protocol and this machine, which reached DNS verbatim and failed. The
+/// saved port here is a wrong one, so each connect proves the inline port.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_host_is_read_as_microsofts_clients_read_it() {
+    if !enabled() || azure_cannot("the spellings are a local server's") {
+        return;
+    }
+    let host = var("HOST", "127.0.0.1");
+    if host != "127.0.0.1" {
+        endpoint::note_leg_no_op("mssql", "the spellings are written for 127.0.0.1");
+        return;
+    }
+    let port = var("PORT", "1433");
+    for spelling in [
+        format!("127.0.0.1,{port}"),
+        format!("127.0.0.1\\NOSUCH,{port}"),
+        format!("tcp:127.0.0.1,{port}"),
+        format!("(local),{port}"),
+    ] {
+        let db = Db::from_parts(
+            Engine::MsSql,
+            spelling.clone(),
+            1,
+            var("USER", "sa"),
+            var("PASSWORD", "Schemaic_2026"),
+            String::new(),
+        );
+        let rs = db
+            .fetch_query(None, "SELECT 1", 1, CancellationToken::new())
+            .await
+            .unwrap_or_else(|e| panic!("{spelling}: {e}"));
+        assert_eq!(
+            rs.cell(0, 0).map(|c| c.display().to_string()),
+            Some("1".into()),
+            "{spelling}"
+        );
+    }
+}
+
 /// A scratch database for one test, dropped when it goes out of scope —
 /// including when the test panics, which is when a leftover is likeliest.
 struct Scratch {

@@ -1114,7 +1114,24 @@ impl Connection {
         {
             return format!("{server}\\{instance}");
         }
-        format!("{}:{}", self.host, self.port)
+        let (host, port) = self.tcp_target();
+        format!("{host}:{port}")
+    }
+
+    /// Where this connection dials over TCP — the host and port the engine,
+    /// or an SSH tunnel to it, connects to. The fields as saved, except a SQL
+    /// Server host read as Microsoft's clients read it
+    /// ([`sql_server_address`]): `tcp:`, `(local)` and an inline `,port`
+    /// resolved. A named instance has no TCP target of its own (SQL Server
+    /// Browser answers its port), so its host is returned as saved, for the
+    /// tunnel to refuse in its own words.
+    pub fn tcp_target(&self) -> (&str, u16) {
+        if is_mssql(&self.db_type)
+            && let Some(target) = sql_server_address(&self.host).dialled(self.port)
+        {
+            return target;
+        }
+        (self.host.as_str(), self.port)
     }
 
     /// This connection as it should be **stored**: a file connection carries no
@@ -2024,10 +2041,81 @@ pub fn default_port(db_type: &str) -> u16 {
 /// nothing else is read as an instance. Both halves must be there, and the
 /// instance must hold no second `\`.
 pub fn sql_server_instance(host: &str) -> Option<(&str, &str)> {
-    let (server, instance) = host.trim().split_once('\\')?;
-    let (server, instance) = (server.trim(), instance.trim());
-    (!server.is_empty() && !instance.is_empty() && !instance.contains('\\'))
-        .then_some((server, instance))
+    let a = sql_server_address(host);
+    a.instance.map(|i| (a.server, i))
+}
+
+/// A SQL Server Host field read as Microsoft's clients read it — the one
+/// grammar every reader here takes it from ([`sql_server_instance`], the
+/// connect, `sqlcmd`, the endpoint label, the tunnel's target):
+///
+/// - a leading `tcp:` or `lpc:` is the protocol, not the host, and goes;
+/// - `.` and `(local)` are this machine — `localhost`;
+/// - `server\INSTANCE` is a named instance, its port SQL Server Browser's;
+/// - `server[\INSTANCE],port` is that port, **which wins**: the client dials
+///   it and asks no Browser, so no instance is left to ask about.
+///
+/// The same text was read three ways (S5-L1-02): the connect asked the
+/// Browser for an instance literally named `SQLEXPRESS,1500`, `sqlcmd`
+/// refused it, and the importer — the one reader already doing this —
+/// dialled `db:1500`. A part that is not one of these (a `,` with no port
+/// after it, a second `\`) is left in `server`, for DNS or the connect to
+/// refuse in their own words.
+pub fn sql_server_address(host: &str) -> SqlServerAddress<'_> {
+    let host = host.trim();
+    // `tcp:` and `lpc:` (shared memory, this machine), as the importer
+    // strips them; `np:` and `admin:` are left for their readers to refuse.
+    let host = host
+        .get(..4)
+        .filter(|p| p.eq_ignore_ascii_case("tcp:") || p.eq_ignore_ascii_case("lpc:"))
+        .map_or(host, |_| host[4..].trim());
+    let (rest, port) = match host.rsplit_once(',') {
+        Some((h, p)) => match p.trim().parse::<u16>() {
+            Ok(port) if port > 0 => (h.trim(), Some(port)),
+            _ => (host, None),
+        },
+        None => (host, None),
+    };
+    let (server, instance) = match rest.split_once('\\') {
+        Some((s, i)) if !s.trim().is_empty() && !i.trim().is_empty() && !i.contains('\\') => {
+            (s.trim(), Some(i.trim()))
+        }
+        _ => (rest, None),
+    };
+    let server = if server == "." || server.eq_ignore_ascii_case("(local)") {
+        "localhost"
+    } else {
+        server
+    };
+    SqlServerAddress {
+        server,
+        // A port given inline is dialled; there is no instance to resolve.
+        instance: instance.filter(|_| port.is_none()),
+        port,
+    }
+}
+
+/// [`sql_server_address`]'s reading of a SQL Server Host field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SqlServerAddress<'a> {
+    /// The machine: the host without its protocol, instance or port.
+    pub server: &'a str,
+    /// A named instance to ask SQL Server Browser about — `None` for a plain
+    /// host, and for one whose port is written inline.
+    pub instance: Option<&'a str>,
+    /// A port written inline (`server,port`), which wins over the Port field.
+    pub port: Option<u16>,
+}
+
+impl<'a> SqlServerAddress<'a> {
+    /// Where a connection to this address dials over TCP — the server and the
+    /// inline port, else `saved` — or `None` for a named instance, whose port
+    /// is SQL Server Browser's answer.
+    pub fn dialled(&self, saved: u16) -> Option<(&'a str, u16)> {
+        self.instance
+            .is_none()
+            .then(|| (self.server, self.port.unwrap_or(saved)))
+    }
 }
 
 /// What the connection form says under Host and Port when the host names a
@@ -2067,6 +2155,71 @@ mod instance_tests {
     fn a_plain_host_or_a_half_spelling_is_no_instance() {
         for host in ["db.corp", "", "\\SQLEXPRESS", "db\\", "db\\a\\b", "::1"] {
             assert_eq!(sql_server_instance(host), None, "{host:?}");
+        }
+    }
+
+    /// **One host, one reading, Microsoft's** (S5-L1-02): `db\SQLEXPRESS,1500`
+    /// asked the Browser for an instance named `SQLEXPRESS,1500` while the
+    /// importer dialled `db:1500`, and `(local)\X` and `tcp:db\X` reached
+    /// DNS verbatim. An inline port wins, `.` and `(local)` are this machine
+    /// and `tcp:` is the protocol.
+    #[test]
+    fn a_sql_server_host_is_read_as_microsofts_clients_read_it() {
+        use super::{SqlServerAddress, sql_server_address};
+        let read = |host| sql_server_address(host);
+        assert_eq!(sql_server_instance("db\\SQLEXPRESS,1500"), None);
+        assert_eq!(
+            read("db\\SQLEXPRESS,1500").dialled(1433),
+            Some(("db", 1500))
+        );
+        assert_eq!(read("db,1500").dialled(1433), Some(("db", 1500)));
+        assert_eq!(read("db").dialled(1433), Some(("db", 1433)));
+        assert_eq!(
+            sql_server_instance("(local)\\SQLEXPRESS"),
+            Some(("localhost", "SQLEXPRESS"))
+        );
+        assert_eq!(sql_server_instance(".\\X"), Some(("localhost", "X")));
+        assert_eq!(sql_server_instance("tcp:db\\X"), Some(("db", "X")));
+        assert_eq!(read("TCP:db,1500").dialled(1), Some(("db", 1500)));
+        assert_eq!(read("db\\X").dialled(1433), None);
+        // Not a port: left where DNS will say so.
+        assert_eq!(
+            read("db,x"),
+            SqlServerAddress {
+                server: "db,x",
+                instance: None,
+                port: None
+            }
+        );
+    }
+
+    /// **Typed and imported, the same text reaches the same place**: the
+    /// importer's `Server=` reading and the Host field's.
+    #[test]
+    fn a_typed_host_and_an_imported_one_agree() {
+        use super::sql_server_address;
+        for server in [
+            "db\\SQLEXPRESS,1500",
+            "db,1500",
+            "(local)\\SQLEXPRESS",
+            "tcp:db\\X",
+            "lpc:db",
+            ".",
+        ] {
+            let imported =
+                crate::conn_import::parse_url(&format!("Server={server};Database=d;User Id=u"))
+                    .unwrap_or_else(|e| panic!("{server}: {e:?}"));
+            let typed = sql_server_address(server);
+            let theirs = sql_server_address(&imported.host);
+            assert_eq!(
+                (typed.server, typed.instance, typed.dialled(imported.port)),
+                (
+                    theirs.server,
+                    theirs.instance,
+                    theirs.dialled(imported.port)
+                ),
+                "{server}"
+            );
         }
     }
 }

@@ -464,8 +464,15 @@ pub fn sqlcmd_args(
     // A named instance is `sqlcmd`'s own spelling too — `tcp:server\INSTANCE`,
     // which it resolves through SQL Server Browser as the connect does — so it
     // is passed on as one, with no port: the saved one is not the instance's.
-    let instance = crate::connection::sql_server_instance(host);
-    let host = instance.map_or(host.trim(), |(server, _)| server);
+    //
+    // Read as the connect reads it (`connection::sql_server_address`): a
+    // `tcp:` prefix, `(local)` and an inline `,port` resolved, so the text
+    // that connects in a query tab opens here too (S5-L1-02). What is left
+    // that sqlcmd would read as address syntax is still refused.
+    let address = crate::connection::sql_server_address(host);
+    let instance = address.instance;
+    let host = address.server;
+    let port = address.port.unwrap_or(port);
     let prefixed = ["tcp:", "np:", "lpc:", "admin:"].iter().any(|p| {
         host.get(..p.len())
             .is_some_and(|s| s.eq_ignore_ascii_case(p))
@@ -473,7 +480,7 @@ pub fn sqlcmd_args(
     if host.is_empty()
         || prefixed
         || host.contains([',', '\\', ';'])
-        || instance.is_some_and(|(_, i)| i.contains([',', ';', ':']))
+        || instance.is_some_and(|i| i.contains([',', ';', ':']))
     {
         return Err(HOST);
     }
@@ -483,7 +490,7 @@ pub fn sqlcmd_args(
         host.to_string()
     };
     let address = match instance {
-        Some((_, instance)) => format!("-Stcp:{host}\\{instance}"),
+        Some(instance) => format!("-Stcp:{host}\\{instance}"),
         None => format!("-Stcp:{host},{port}"),
     };
     let sign_in = match auth {
@@ -1237,16 +1244,21 @@ mod tests {
     /// — so what would re-shape it is refused rather than guessed at.
     #[test]
     fn a_host_sqlcmd_would_reparse_is_refused() {
-        for host in [
-            "h,1500",
-            "h\\a\\b",
-            "h\\SQLEXPRESS,1500",
-            "np:h\\SQLEXPRESS",
-            "",
-            "np:h",
-            "h;x",
-        ] {
+        for host in ["h\\a\\b", "np:h\\SQLEXPRESS", "", "np:h", "h;x", "h,x"] {
             assert!(sqlcmd(host, None, SslMode::Require).is_err(), "{host:?}");
+        }
+        // **Read as the connect reads it** (S5-L1-02): an inline port wins
+        // and `tcp:` / `(local)` resolve, so what connects in a query tab
+        // opens here — it was refused, and the connect asked the Browser for
+        // an instance named `SQLEXPRESS,1500`.
+        for (host, address) in [
+            ("h,1500", "-Stcp:h,1500"),
+            ("h\\SQLEXPRESS,1500", "-Stcp:h,1500"),
+            ("tcp:h\\SQLEXPRESS", "-Stcp:h\\SQLEXPRESS"),
+            ("(local)\\SQLEXPRESS", "-Stcp:localhost\\SQLEXPRESS"),
+        ] {
+            let a = sqlcmd(host, None, SslMode::Require).unwrap_or_else(|e| panic!("{host}: {e}"));
+            assert_eq!(a[0], address, "{host:?}");
         }
     }
 

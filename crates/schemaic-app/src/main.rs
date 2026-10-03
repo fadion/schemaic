@@ -8343,8 +8343,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         Some(p) => (Some(p), None),
                         None => match schemaic_db::ssh::open_tunnel(
                             &conn_task.ssh,
-                            &conn_task.host,
-                            conn_task.port,
+                            conn_task.tcp_target().0,
+                            conn_task.tcp_target().1,
                         )
                         .await
                         {
@@ -9715,7 +9715,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 // Keep the tunnel handle alive for the duration of the ping; it
                 // drops (freeing the listener/port) when this task ends.
                 let tunnel = if conn.uses_tunnel() {
-                    match schemaic_db::ssh::open_tunnel(&conn.ssh, &conn.host, conn.port).await {
+                    let (host, port) = conn.tcp_target();
+                    match schemaic_db::ssh::open_tunnel(&conn.ssh, host, port).await {
                         Ok(h) => Some(h),
                         Err(e) => {
                             send(Err(e.to_string()));

@@ -597,8 +597,11 @@ impl Db {
                 pass: conn.password.clone(),
                 file,
                 database,
+                // The name the tunnel dialled (`Connection::tcp_target`): a SQL
+                // Server host's `tcp:` prefix and inline `,port` are not part
+                // of the name its certificate carries.
                 tls: tls.map(|p| schemaic_core::connection::TlsPlan {
-                    hostname_override: Some(conn.host.clone()),
+                    hostname_override: Some(conn.tcp_target().0.to_string()),
                     ..p
                 }),
                 auth,
@@ -3432,6 +3435,35 @@ mod tests {
                 ),
             }
         }
+        // A SQL Server host's `tcp:` and inline port are not the
+        // certificate's name (`Connection::tcp_target`, S5-L1-02).
+        let ms = schemaic_core::connection::Connection {
+            id: 2,
+            name: "ms".to_string(),
+            db_type: "SQL Server".to_string(),
+            host: "tcp:remote.example,1500".to_string(),
+            port: 1433,
+            user: "u".to_string(),
+            password: "p".to_string(),
+            file: String::new(),
+            database: String::new(),
+            ssh: Default::default(),
+            tls: Tls {
+                mode: SslMode::VerifyFull,
+                ..Tls::default()
+            },
+            color: None,
+            prominent_color: false,
+            read_only: false,
+            cli_access: false,
+            environment: Default::default(),
+            ai_data: None,
+            folder: String::new(),
+            auth: Default::default(),
+        };
+        let tunneled = Db::connect(&ms, Some(55001));
+        let plan = tunneled.tls_plan().unwrap();
+        assert_eq!(plan.hostname_override.as_deref(), Some("remote.example"));
     }
 
     /// A SQLite connection's target is its file, and **a tunnel port must not

@@ -803,7 +803,7 @@ async fn connect(
     let tunnel = if conn.uses_tunnel() {
         let opened = tokio::time::timeout(
             timeout,
-            schemaic_db::ssh::open_tunnel(&conn.ssh, &conn.host, conn.port),
+            schemaic_db::ssh::open_tunnel(&conn.ssh, conn.tcp_target().0, conn.tcp_target().1),
         )
         .await;
         match opened {

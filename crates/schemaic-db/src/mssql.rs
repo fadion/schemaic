@@ -74,19 +74,24 @@ async fn config(db: &Db, database: Option<&str>) -> Result<tiberius::Config, DbE
         return Err(DbError::Refused(why.to_string()));
     }
     let mut cfg = tiberius::Config::new();
-    match schemaic_core::connection::sql_server_instance(&db.host) {
+    let address = schemaic_core::connection::sql_server_address(&db.host);
+    match (address.instance, address.dialled(db.port)) {
         // **A named instance's port is SQL Server Browser's answer**, asked on
         // UDP 1434 — so the saved port is not set, or the question goes to it
         // and times out. The bare server is the host: DNS, the login packet
         // and the certificate's name all want it without the instance.
-        Some((server, instance)) => {
-            cfg.host(server);
+        (Some(instance), _) => {
+            cfg.host(address.server);
             cfg.instance_name(instance);
         }
-        None => {
-            cfg.host(&db.host);
-            cfg.port(db.port);
+        // The server without a `tcp:` or `(local)` spelling, and a port
+        // written inline winning over the saved one, as Microsoft's clients
+        // read it (`sql_server_address`).
+        (None, Some((server, port))) => {
+            cfg.host(server);
+            cfg.port(port);
         }
+        (None, None) => unreachable!("an address with no instance is dialled"),
     }
     if let Some(d) = database.or(db.database()) {
         cfg.database(d);
@@ -118,7 +123,10 @@ const AZURE_HANDSHAKE: std::time::Duration = std::time::Duration::from_secs(60);
 /// Is `host` an Azure SQL Database server — `<name>.database.windows.net`,
 /// or a sovereign cloud's spelling of it?
 fn is_azure_sql(host: &str) -> bool {
-    let h = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    // The server as the connect reads it: `tcp:x.database.windows.net,1433`,
+    // the spelling Azure's own portal hands out, is Azure too.
+    let server = schemaic_core::connection::sql_server_address(host).server;
+    let h = server.trim().trim_end_matches('.').to_ascii_lowercase();
     [
         ".database.windows.net",
         ".database.chinacloudapi.cn",
@@ -6442,6 +6450,8 @@ mod tests {
             "SRV.Database.Windows.Net.",
             " srv.database.chinacloudapi.cn",
             "srv.database.usgovcloudapi.net",
+            // The portal's own spelling, read as the connect reads it.
+            "tcp:srv.database.windows.net,1433",
         ] {
             assert!(is_azure_sql(h), "{h}");
         }

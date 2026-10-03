@@ -8644,7 +8644,12 @@ existing prose was left alone.
     (`a_repeated_keyword_keeps_the_value_its_driver_uses`). It reads the transport too —
     `np:` named pipes and `(localdb)` are `UrlError::Transport`, since TCP is all Schemaic speaks,
     while `lpc:`, `.` and `(local)` are this machine and become `localhost` — `.\SQLEXPRESS` is
-    `localhost\SQLEXPRESS`. A named instance goes through `mssql_host` as the URL form's does
+    `localhost\SQLEXPRESS`. This reading is the importer's own, not
+    `connection::sql_server_address`, the Host field's reading of the same text, and the two are
+    pinned to agree
+    (`a_typed_host_and_an_imported_one_agree`, under `connection.rs`): a typed
+    `db\SQLEXPRESS,1500` once asked the Browser for an instance the imported one dialled at port
+    1500 (S5-L1-02). A named instance goes through `mssql_host` as the URL form's does
     (`an_ado_net_string_notes_what_it_cannot_carry_over`), and the TLS words go through
     `apply_mssql_tls`, now the one reading both grammars share. `split_mssql_props` gained a
     `quotes` flag for ADO.NET's `"…"`/`'…'` (a doubled quote standing for one), off for JDBC, which
@@ -8822,18 +8827,41 @@ existing prose was left alone.
     would send a TDS handshake to a MySQL port. `read_only_caveat` is the sentence the form puts
     under the Read-only switch on SQL Server alone, since that engine's read-only is a rollback
     rather than a refusal (`db::mssql`).
-    **`sql_server_instance` is the one reading of a named instance** — a SQL Server host written
-    `server\INSTANCE`, split into its two halves, both non-empty and the instance holding no
-    second `\`; anything else is a plain host (`instance_tests`). A DNS name or an address holds no
-    `\`, so nothing else is read as one. Every place that takes a saved host apart asks it (the
-    importers split their sources' own grammars, then write this spelling back): the connect, which asks SQL Server Browser for the port and so leaves the Port field unused
+    **`sql_server_address` is the one reading of a SQL Server Host field**, as Microsoft's clients
+    read it: a leading `tcp:` (any case) is the protocol and goes, `.` and `(local)` are
+    `localhost`, a trailing `,port` is the port — a non-zero `u16`, or the text stays in `server`
+    for DNS to refuse in its own words — and `server\INSTANCE` is a named instance, both halves
+    non-empty and the instance holding no second `\`. **An inline port wins**: the client dials it
+    and asks no Browser, so `instance` is `None` once a port is written. The same text used to be
+    read three ways (S5-L1-02): `db\SQLEXPRESS,1500`, the SSMS/ADO.NET spelling, had the connect
+    ask SQL Server Browser for an instance literally named `SQLEXPRESS,1500`, `sqlcmd` refuse it,
+    and the importer dial `db:1500`; and `(local)\X` and `tcp:db\X` reached DNS verbatim when typed
+    (os error 11001) while the importer mapped them
+    (`a_sql_server_host_is_read_as_microsofts_clients_read_it`). `sql_server_instance` is that
+    reading's named instance alone, and `SqlServerAddress::dialled(saved)` its TCP target — the
+    server and the inline port, else the saved one, and `None` for a named instance. A DNS name or
+    an address holds no `\`, so nothing else is read as an instance (`instance_tests`). Every place
+    that takes a saved host apart asks it: the connect, which asks SQL Server Browser for a named
+    instance's port and so leaves the Port field unused, and otherwise dials `dialled`
     (`db::mssql`); `launch::sqlcmd_args`, whose `sqlcmd` does the same lookup itself; and
-    `ssh::open_tunnel`, which refuses one. `named_instance_port_note` is the sentence the form puts
-    under Host and Port when the host names one, on SQL Server alone — *"A named instance: SQL
-    Server Browser gives its port, so Port is not used. To skip the Browser, set the host without
-    the instance and the port it listens on."* — and `endpoint()` follows it, showing
-    `server\INSTANCE` with no port, since the saved one is not what is dialled; on another engine
-    a `\` is no instance and the host shows as typed (`a_named_instance_endpoint_has_no_port`).
+    `Connection::tcp_target`, which is what an SSH tunnel is opened to and what `endpoint()` shows —
+    `dialled` on SQL Server, the fields as saved on any other engine, and **the host as saved for a
+    named instance**, which has no TCP target of its own, so that `ssh::open_tunnel` still sees the
+    `\` and refuses it. The importers keep their own parsers for their sources' grammars and write
+    this spelling back, and the two readings are pinned to agree rather than shared
+    (`a_typed_host_and_an_imported_one_agree`, over `db\SQLEXPRESS,1500`, `db,1500`,
+    `(local)\SQLEXPRESS`, `tcp:db\X`, `lpc:db` and `.`) — `lpc:` stripped as the importer strips
+    it. Two more readers take the server from it rather than the raw field: a tunnelled
+    connection's TLS name to verify (`Db::connect`'s `hostname_override`, from `tcp_target`), and
+    `mssql::is_azure_sql`, so the Azure portal's own `tcp:srv.database.windows.net,1433` gets the
+    Azure login bound (`a_tunnel_moves_the_address_and_keeps_the_name_to_verify`,
+    `an_azure_sql_host_is_told_by_its_name`).
+    `named_instance_port_note` is the sentence the form puts under Host and Port when the host
+    names one, on SQL Server alone — *"A named instance: SQL Server Browser gives its port, so Port
+    is not used. To skip the Browser, set the host without the instance and the port it listens
+    on."* — so it does not show for `db\X,1500`, whose port is used; and `endpoint()` follows it,
+    showing `server\INSTANCE` with no port, since the saved one is not what is dialled; on another
+    engine a `\` is no instance and the host shows as typed (`a_named_instance_endpoint_has_no_port`).
     `same_engine` is that pair asked of *two* labels — `MariaDB` and `MySQL` name one engine, as do
     `pg` and `PostgreSQL`, and as do `MySQL` and the empty label that predates the field — so the
     question is not a string comparison. It is what the connection form's Type picker tells its own
@@ -11400,15 +11428,21 @@ existing prose was left alone.
     refuse (`sqlcmd_takes_every_value_attached_to_its_flag`). Don't split a value off its flag to
     tidy the argv: the attachment is what makes the leading `-` inert. The **host** is the one value
     `sqlcmd` parses (`host\instance`, `host,port`, a `tcp:`/`np:`/`lpc:`/`admin:` prefix), so it is
-    forced onto TCP as `-Stcp:host,port` — an IPv6 literal bracketed — and a host holding `,`, `\`
-    or `;`, or already carrying one of those prefixes, is refused rather than guessed at
-    (`a_host_sqlcmd_would_reparse_is_refused`). **A named instance is the one `\` let through**,
-    being `sqlcmd`'s own spelling: `server\INSTANCE` (`connection::sql_server_instance`) goes on as
+    first read as the connect reads it (`connection::sql_server_address`) — `tcp:` dropped,
+    `(local)` as `localhost`, an inline port winning over the saved one — and then forced onto TCP
+    as `-Stcp:host,port`, an IPv6 literal bracketed: `h,1500` and `h\SQLEXPRESS,1500` both go on as
+    `-Stcp:h,1500`. Before that reading (S5-L1-02) any `,` was refused, so `db\SQLEXPRESS,1500`
+    met the HOST message here while the importer dialled `db:1500`. What is left that `sqlcmd`
+    would reparse is refused rather than guessed at — an `np:`/`lpc:`/`admin:` prefix, a `;`, a
+    second `\`, a `,` with no port after it (`a_host_sqlcmd_would_reparse_is_refused`). **A named
+    instance is the one `\` let through**, being `sqlcmd`'s own spelling: `server\INSTANCE` (`connection::sql_server_instance`) goes on as
     `-Stcp:server\INSTANCE` with no port, since the saved one is not the instance's and ODBC
     `sqlcmd` 18 asks SQL Server Browser itself — measured, an instance with no Browser behind it
     answers *Error Locating Server/Instance Specified*, not a syntax error
     (`a_named_instance_reaches_sqlcmd_without_a_port`). The rest of the refusal still holds around
-    it: a second `\`, a `,`, `;` or `:` in the instance, or a prefix on the server part. `-I` is
+    it: a second `\`, a `,`, `;` or `:` in the instance, or a prefix on the server part other than
+    the one `tcp:` the reading drops — so `tcp:h\X` goes on as `-Stcp:h\X` and `(local)\X` as
+    `-Stcp:localhost\X`. `-I` is
     always sent: the client's
     `QUOTED_IDENTIFIER` default is off, where an index over a computed column is Msg 1934, and every
     Schemaic session has it on. TLS lands on the three things `sqlcmd` can say, each measured:
@@ -14048,7 +14082,14 @@ existing prose was left alone.
   no `port`**: tiberius sends the Browser's question to the configured port when there is one, so
   setting the saved port would ask the wrong one and hear nothing. The host is the bare server
   because DNS, the login packet and the certificate's name check all want it without the
-  instance. `connect_with(cfg, named)` opens the socket through
+  instance. **`config` takes the host apart through `connection::sql_server_address`**, so with no
+  instance it sets the server and the `dialled` port — the inline one winning over the saved one,
+  `tcp:` and `(local)` resolved. Before that, `db\SQLEXPRESS,1500` asked the Browser for an
+  instance named `SQLEXPRESS,1500` and `(local)\X` reached DNS verbatim (S5-L1-02). Live,
+  `a_host_is_read_as_microsofts_clients_read_it` connects `127.0.0.1,1433`,
+  `127.0.0.1\NOSUCH,1433`, `tcp:127.0.0.1,1433` and `(local),1433` with a saved port of 1, so the
+  saved one cannot be what is dialled (passed on 2022, red with the change stashed: *No such host
+  is known*); it skips on Azure and on any host but `127.0.0.1`. `connect_with(cfg, named)` opens the socket through
   `<TcpStream as tiberius::SqlBrowser>::connect_named` and then **writes the port the Browser
   named back into the configuration** (`cfg.port(tcp.peer_addr()?.port())`): Windows sign-in
   names the service it signs in to as `MSSQLSvc/host:port`, built from the configuration's port,
@@ -15100,7 +15141,12 @@ existing prose was left alone.
   instance listens on, and sits in `open_tunnel` rather than its callers for the bounds' reason:
   every caller gets it (`a_named_instance_is_refused_through_a_tunnel`, which asks `open_tunnel`
   itself). It asks `connection::sql_server_instance` alone, not the engine, so any host spelled
-  that way is refused — on another engine such a host names no server either.
+  that way is refused — on another engine such a host names no server either. **Its three callers
+  pass `Connection::tcp_target()`**, not the raw fields, so a SQL Server host's `tcp:`, `(local)`
+  and inline `,port` are resolved before the tunnel dials — `db\SQLEXPRESS,1500` is tunnelled to
+  `db:1500` rather than refused (S5-L1-02). `tcp_target` hands a named instance's host over *as
+  saved*, and that is load-bearing: the bare server in its place would drop the `\` this refusal
+  reads, and the tunnel would dial whatever listens on the saved port instead.
   **PostgreSQL cannot connect without naming a database**, which is protocol rather than
   preference and stayed invisible while almost every server had a `postgres` one anybody could
   reach — so `connect_maintenance` guessed at that, the username and `template1` for server-level
