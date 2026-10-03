@@ -364,8 +364,12 @@ pub(crate) fn preview_of_plan(
 /// **Built against the connection the plan was raised on**, not against
 /// whichever the switcher points at now — the same rule [`preview_account`]
 /// states, and this is where it was missing. `database` comes off the target
-/// too: for a namespace it is the database the plan runs in, and for a database
-/// it is the empty string [`crate::DdlScope::Server`] wants.
+/// too: for a namespace it is the database the plan runs in. For a database it
+/// is what [`crate::DdlScope::Server`] must *avoid* connecting to — the empty
+/// string for a create, where nothing exists yet, and the database being
+/// dropped for a drop ([`crate::overlays::drop_database_target`]), since an
+/// empty one there let PostgreSQL's maintenance connection open the very
+/// database it was asked to drop (S1-L1-01).
 pub(crate) fn preview_container(
     ui: DdlUi,
     on: PlanTarget,

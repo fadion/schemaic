@@ -1540,8 +1540,9 @@ pub enum DdlScope {
 pub struct DdlRunRequest {
     pub conn_id: u64,
     /// The database the plan is about. Under [`DdlScope::Server`] this is the
-    /// database being created or dropped — the one the run must *not* connect
-    /// to — rather than the one it runs on.
+    /// one the run must *not* connect to, rather than the one it runs on: the
+    /// database being dropped for a drop, and the empty string for a create,
+    /// where there is nothing yet to avoid.
     pub database: String,
     pub scope: DdlScope,
     pub statements: Vec<String>,
