@@ -11913,10 +11913,21 @@ existing prose was left alone.
         was asked to confirm dropping "all N rows in it" about a counter
         (`a_drop_names_its_scale_only_for_a_table_with_a_figure_worth_naming` pins all three).
         **`drop_warning` also words a sequence's drop as one**: it is `Change::DropTable`
-        (`overlays::object_drop_change`, MariaDB's own `DROP TABLE` dropping a sequence), whose
-        risk is *"Drops the table and every row in it."*, and the deleted confirm had been the only
-        place that drop was worded for a sequence — so a sequence's warning is replaced with its own
-        sentence, the reached value lost (`a_drop_warning_speaks_of_the_shape_it_drops`). **Truncate
+        (`stats::drop_change`, which `overlays::object_drop_change` calls — MariaDB's own `DROP
+        TABLE` dropping a sequence), whose risk is *"Drops the table and every row in it."*, and the
+        deleted confirm had been the only place that drop was worded for a sequence — so a
+        sequence's warning is replaced with its own sentence, the reached value lost
+        (`a_drop_warning_speaks_of_the_shape_it_drops`). **So is its change line**: the preview
+        listed `DropTable`'s summary, *"Drop the table"*, over *"Drops the sequence"* until
+        `stats::drop_preview` reworded both halves together — `drop_summary` over the lines,
+        `drop_warning` over the risks — handed to `preview_change_warning` as one closure. The
+        property is pinned rather than the strings: for every shape on every engine that takes its
+        drop, the line's noun is the warning's (`a_drops_line_and_warning_name_the_same_object`,
+        R2-L6-02). And **every drop a Drop entry routes carries a warning** — the tree's three
+        shapes, each object kind's row drop, a numbered and a plain routine, an event, a database,
+        a schema and each account kind — since `Change::risks` ends in a catch-all `Vec::new()`
+        and the confirm with the non-blank fallback that once caught an emptied arm is gone
+        (`every_drop_a_drop_entry_routes_carries_a_warning`, R2-L6-01). **Truncate
         keeps its confirm-then-preview**: it is not a drop, and `truncate_prompt` is its question.
       - **`SchemaStats` carries a lookup index and its `tables` are private**, because the badge
         lookup is per *row* of the schema tree and one landing invalidates every badge in the
@@ -13729,7 +13740,7 @@ existing prose was left alone.
   saying every engine can create a table — so while it answered `false` to everything each opened a
   confirm and a DDL preview whose Apply could only end in `run_ddl`'s refusal. Each now asks
   `supports_change` of the statement it would really build, as Truncate already did:
-  `ObjectEntries::drop` asks it of `overlays::object_drop_change`, the one `Change` the menu action
+  `ObjectEntries::drop` asks it of `overlays::object_drop_change` (`stats::drop_change`), the one `Change` the menu action
   also sends; an object row asks `overlays::object_drop_offered`, over the set `ddl::drop_item`
   builds — the set the entry opens — and wants it non-empty as well as expressible; and
   `create_children`'s Table entry asks it of `Change::CreateTable`. **All three are offered on SQL
@@ -20191,9 +20202,10 @@ existing prose was left alone.
     `table_designer::open_for_table`/`open_for_new`/`preview_draft_edit` (a shortcut whose
     edit has dependents — dropping a column takes its index and FK with it) and
     `ddl_preview::preview_change` (a lone `Change`). `preview_change_warning` is `preview_change`
-    with the plan's `destructive` list reworded by the caller, for facts it holds and the change set
-    does not: the schema tree's Drop passes `stats::drop_warning` — a table's row figure, a MariaDB
-    sequence's `DROP TABLE` worded as a sequence's — which is what the confirm it replaced had said
+    with the plan's change lines and `destructive` list reworded by the caller, one closure over
+    both, for facts it holds and the change set does not: the schema tree's Drop passes
+    `stats::drop_preview` — a table's row figure, a MariaDB sequence's `DROP TABLE` worded as a
+    sequence's in its line and its warning alike — which is what the confirm it replaced had said
     before the preview said everything else again.
     **`ddl_preview::close_peers` is the one editor-target list**, called by every editor's `open`
     before it sets its own and by `close_editors` after an Apply. Each of those `open`s used to

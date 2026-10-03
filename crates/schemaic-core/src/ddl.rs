@@ -34532,6 +34532,104 @@ mod database_tests {
         .remove(0)
     }
 
+    /// **Every drop a Drop entry routes carries a warning** (R2-L6-01). A
+    /// Drop opens the preview directly, whose Apply is Danger only while
+    /// the warning is non-empty — and `Change::risks` ends in a catch-all
+    /// `Vec::new()`, so an arm emptied by a later edit (or a new variant
+    /// never given one) made an irreversible `DROP` one ordinary click. The
+    /// confirm whose non-blank fallback guarded it is gone. So: the schema
+    /// tree's table, view and sequence drops (`stats::drop_change`), every
+    /// object kind's row drop, a numbered and a plain routine, an event, a
+    /// database, a schema and every kind of account, on every engine that
+    /// takes it.
+    #[test]
+    fn every_drop_a_drop_entry_routes_carries_a_warning() {
+        use crate::schema::{EventInfo, RoutineInfo, TableShape};
+        use crate::users::PrincipalKind;
+        let mut sets: Vec<(String, SqlDialect, ChangeSet)> = Vec::new();
+        for d in [MySql, Postgres, Sqlite, SqlDialect::MsSql] {
+            let mut push = |label: String, cs: ChangeSet| sets.push((label, d, cs));
+            for shape in [TableShape::Table, TableShape::View, TableShape::Sequence] {
+                for materialized in [false, true] {
+                    let change = crate::stats::drop_change(shape, materialized);
+                    push(format!("{shape:?}"), single("x", Some("s"), d, change));
+                }
+            }
+            for kind in ObjectKind::ALL {
+                match kind {
+                    ObjectKind::Function | ObjectKind::Procedure => {
+                        for numbered in [vec![], vec![(2, "AS SELECT 2".to_string())]] {
+                            let mut r = RoutineInfo {
+                                name: "r".into(),
+                                schema: Some("s".into()),
+                                kind: kind.routine_kind().unwrap(),
+                                ..Default::default()
+                            };
+                            r.tsql.numbered = numbered;
+                            push(format!("{kind:?}"), drop_routine(&r, d));
+                        }
+                    }
+                    ObjectKind::Event => {
+                        let e = EventInfo {
+                            name: "e".into(),
+                            ..Default::default()
+                        };
+                        push("Event".into(), drop_event(&e, d));
+                    }
+                    k => push(format!("{k:?}"), drop_object(k, "o", Some("s"), d)),
+                }
+            }
+            push(
+                "DropDatabase".into(),
+                single(
+                    "x",
+                    None,
+                    d,
+                    Change::DropDatabase {
+                        name: "shop".into(),
+                    },
+                ),
+            );
+            push(
+                "DropSchema".into(),
+                single(
+                    "x",
+                    None,
+                    d,
+                    Change::DropSchema {
+                        name: "sales".into(),
+                    },
+                ),
+            );
+            for kind in [
+                PrincipalKind::User,
+                PrincipalKind::Role,
+                PrincipalKind::Login,
+            ] {
+                let who = crate::users::Principal {
+                    kind,
+                    ..an_account()
+                };
+                push(
+                    format!("{kind:?}"),
+                    accounts("app", d, vec![Change::DropAccount(Box::new(who))]),
+                );
+            }
+        }
+        let mut checked = 0;
+        for (label, d, cs) in sets {
+            for c in cs.changes.iter().filter(|c| supports_change(d, c)) {
+                checked += 1;
+                assert!(
+                    !c.risks(d).is_empty(),
+                    "{label} on {d:?}: {} has no warning",
+                    c.summary()
+                );
+            }
+        }
+        assert!(checked > 40, "only {checked} drops were checked");
+    }
+
     fn a_privilege_change(privs: &[&str]) -> Box<crate::users::PrivilegeChange> {
         Box::new(crate::users::PrivilegeChange {
             account: an_account(),

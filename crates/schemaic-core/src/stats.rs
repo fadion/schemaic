@@ -966,6 +966,50 @@ pub fn truncate_prompt(label: &str, rows: Option<RowCount>) -> String {
     }
 }
 
+/// The change the schema tree's **Drop** makes of a `shape`.
+///
+/// **`DropTable` for a sequence, deliberately.** There is no
+/// `Change::DropSequence`, and MariaDB's own `DROP TABLE sq1` drops a
+/// sequence — measured on 10.11.14: the object is gone and the catalogue is
+/// empty afterwards. Spelled out per shape rather than left on a boolean, so
+/// a `DROP SEQUENCE` arm has a place to land; the entry's gate and its action
+/// both ask this one.
+pub fn drop_change(shape: TableShape, materialized: bool) -> crate::ddl::Change {
+    use crate::ddl::Change;
+    match shape {
+        TableShape::View => Change::DropView { materialized },
+        TableShape::Sequence | TableShape::Table => Change::DropTable,
+    }
+}
+
+/// The preview's line for the schema tree's Drop of a `shape`, from the
+/// change's own `summary`: a sequence dropped by `DROP TABLE` read *"Drop the
+/// table"* over [`drop_warning`]'s *"Drops the sequence"* — the two halves of
+/// one modal disagreeing about what the object is (R2-L6-02). A table's and
+/// a view's are already their own.
+pub fn drop_summary(summary: String, shape: TableShape) -> String {
+    match shape {
+        TableShape::Sequence => "Drop the sequence".to_string(),
+        TableShape::Table | TableShape::View => summary,
+    }
+}
+
+/// The DDL preview's change lines and warning for the schema tree's Drop of
+/// a `shape`, from the change set's own — [`drop_summary`] over each line,
+/// [`drop_warning`] over the risks. One call, so the two halves of the modal
+/// are worded together.
+pub fn drop_preview(
+    lines: Vec<String>,
+    risks: Vec<String>,
+    rows: Option<RowCount>,
+    shape: TableShape,
+) -> (Vec<String>, Vec<String>) {
+    (
+        lines.into_iter().map(|l| drop_summary(l, shape)).collect(),
+        drop_warning(risks, rows, shape),
+    )
+}
+
 /// The DDL preview's warning for the schema tree's Drop of a `shape`, from
 /// the dropped change's own `risks` — what a confirm asked before the
 /// preview, until it went for asking twice.
@@ -2197,6 +2241,51 @@ mod tests {
         );
         let view = vec!["Drops the view.".to_string()];
         assert_eq!(drop_warning(view.clone(), big, TableShape::View), view);
+    }
+
+    /// **The preview's change line and its warning name the same object**
+    /// (R2-L6-02): a MariaDB sequence's Drop read "Drop the table" over
+    /// "Drops the sequence" — the deleted confirm's title test had guarded
+    /// exactly this. For every shape, on every engine that takes its drop,
+    /// the line's noun is the warning's.
+    #[test]
+    fn a_drops_line_and_warning_name_the_same_object() {
+        use crate::ddl::supports_change;
+        let noun = |s: &str, verb: &str| -> String {
+            s.strip_prefix(verb)
+                .unwrap_or_else(|| panic!("{s:?} starts with {verb:?}"))
+                .split(['.', ':', ','])
+                .next()
+                .unwrap()
+                .split(" and ")
+                .next()
+                .unwrap()
+                .trim()
+                .to_string()
+        };
+        for shape in [TableShape::Table, TableShape::View, TableShape::Sequence] {
+            for materialized in [false, true] {
+                let change = drop_change(shape, materialized);
+                for d in [
+                    SqlDialect::MySql,
+                    SqlDialect::Postgres,
+                    SqlDialect::Sqlite,
+                    SqlDialect::MsSql,
+                ] {
+                    if !supports_change(d, &change) {
+                        continue;
+                    }
+                    let (lines, warning) =
+                        drop_preview(vec![change.summary()], change.risks(d), None, shape);
+                    let line = &lines[0];
+                    assert_eq!(
+                        noun(line, "Drop the "),
+                        noun(&warning[0], "Drops the "),
+                        "{shape:?} on {d:?}: {line:?} over {warning:?}"
+                    );
+                }
+            }
+        }
     }
 
     /// **The drop's scale, now said in the preview's warning** — the one thing

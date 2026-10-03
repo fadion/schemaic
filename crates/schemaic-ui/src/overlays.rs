@@ -289,22 +289,14 @@ pub(crate) struct ObjectEntries {
     pub drop: bool,
 }
 
-/// The change a table-menu **Drop** makes of the object under the cursor.
-///
-/// **`DropTable` for a sequence, deliberately.** There is no
-/// `Change::DropSequence`, and MariaDB's own `DROP TABLE sq1` drops a sequence —
-/// measured on 10.11.14: the object is gone and the catalogue is empty
-/// afterwards. Spelled out per shape rather than left on a boolean, so a
-/// `DROP SEQUENCE` arm has a place to land.
+/// The change a table-menu **Drop** makes of the object under the cursor —
+/// [`schemaic_core::stats::drop_change`], where why a sequence is a
+/// `DropTable` is said.
 pub(crate) fn object_drop_change(
     shape: schemaic_core::schema::TableShape,
     materialized: bool,
 ) -> schemaic_core::ddl::Change {
-    use schemaic_core::schema::TableShape;
-    match shape {
-        TableShape::View => schemaic_core::ddl::Change::DropView { materialized },
-        TableShape::Sequence | TableShape::Table => schemaic_core::ddl::Change::DropTable,
-    }
+    schemaic_core::stats::drop_change(shape, materialized)
 }
 
 /// Whether a standalone object's row (a type, domain, sequence, routine or
@@ -2605,19 +2597,16 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                         &db,
                                         &tbl,
                                         ns.as_deref(),
-                                        // **`DropTable` for a sequence,
-                                        // deliberately.** There is no
-                                        // `Change::DropSequence`, and MariaDB's
-                                        // own `DROP TABLE sq1` drops a sequence
-                                        // — measured on 10.11.14: the object is
-                                        // gone and the catalogue is empty
-                                        // afterwards. Spelled out per shape
-                                        // rather than left on a boolean, so a
-                                        // `DROP SEQUENCE` arm has a place to
-                                        // land — in `object_drop_change`, which
-                                        // the gate asks about too.
+                                        // `DropTable` for a sequence — see
+                                        // `stats::drop_change`, which the gate
+                                        // asks about too; its line and its
+                                        // warning are worded as a sequence's.
                                         object_drop_change(shape, materialized),
-                                        |w| schemaic_core::stats::drop_warning(w, rows, shape),
+                                        |lines, w| {
+                                            schemaic_core::stats::drop_preview(
+                                                lines, w, rows, shape,
+                                            )
+                                        },
                                     );
                                 })
                                 .disabled(read_only),

@@ -432,9 +432,9 @@ pub(crate) fn preview_account(
 /// `edit_ctx` — so a *Create database* form filled in on MySQL and previewed
 /// after a switch to PostgreSQL was emitted at PostgreSQL's dialect, against
 /// PostgreSQL's `conn_id`, and Apply created the database on the wrong server.
-/// Nothing closes a DDL editor on a connection switch, and the two container
-/// menu entries reach the preview through a confirmation dialog, which is a
-/// second window for the switch to happen in.
+/// Nothing closes a DDL editor on a connection switch, and nothing closes the
+/// preview either: the menu entry opens it, it stands open, and Apply runs
+/// whenever it is pressed — after any number of switches.
 #[derive(Clone, Debug)]
 pub(crate) struct PlanTarget {
     pub conn_id: u64,
@@ -501,15 +501,16 @@ pub(crate) fn preview_change(
     schema: Option<&str>,
     change: schemaic_core::ddl::Change,
 ) {
-    preview_change_warning(conn, ddl, database, table, schema, change, |w| w);
+    preview_change_warning(conn, ddl, database, table, schema, change, |l, w| (l, w));
 }
 
-/// [`preview_change`], with the change's warning reworded by `warning` for
-/// what the caller knows and the change set does not — the schema tree's
-/// Drop passes `stats::drop_warning`, which adds a table's row figure and
-/// words a MariaDB sequence's `DROP TABLE` as a sequence's. The drop opens
-/// the preview directly, so this is where the confirm it replaced had said
-/// those things.
+/// [`preview_change`], with the change's lines and warning reworded by
+/// `reword` for what the caller knows and the change set does not — the
+/// schema tree's Drop passes `stats::drop_preview`, which adds a table's row
+/// figure and words a MariaDB sequence's `DROP TABLE` as a sequence's, its
+/// line as well as its warning (the line said "Drop the table" over "Drops
+/// the sequence"). The drop opens the preview directly, so this is where the
+/// confirm it replaced had said those things.
 pub(crate) fn preview_change_warning(
     conn: crate::ConnUi,
     ddl: DdlUi,
@@ -517,7 +518,7 @@ pub(crate) fn preview_change_warning(
     table: &str,
     schema: Option<&str>,
     change: schemaic_core::ddl::Change,
-    warning: impl FnOnce(Vec<String>) -> Vec<String>,
+    reword: impl FnOnce(Vec<String>, Vec<String>) -> (Vec<String>, Vec<String>),
 ) {
     let ctx = crate::table_designer::edit_ctx(conn);
     let cs = schemaic_core::ddl::single(table, schema, ctx.dialect, change);
@@ -528,7 +529,10 @@ pub(crate) fn preview_change_warning(
         &cs,
         ctx.read_only,
     );
-    p.destructive = warning(std::mem::take(&mut p.destructive));
+    (p.changes, p.destructive) = reword(
+        std::mem::take(&mut p.changes),
+        std::mem::take(&mut p.destructive),
+    );
     open_preview(ddl, p);
 }
 
