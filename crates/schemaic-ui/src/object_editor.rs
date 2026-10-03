@@ -1375,7 +1375,9 @@ fn tsql_form(ui: DdlUi, d: &TsqlObjectDraft, ring: FocusRing) -> AnyView {
                         tsql_field(
                             ui,
                             d.restart.clone().unwrap_or_default(),
-                            "leave empty to keep the position",
+                            // A new type re-creates the sequence, which
+                            // keeps no position: empty, it starts over.
+                            "empty keeps it, unless the type changes",
                             ring.clone(),
                             100,
                             field_w,

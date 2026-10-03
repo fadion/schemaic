@@ -2475,7 +2475,13 @@ fn sequence_entry(
 /// One of SQL Server's standalone objects, compared: the object editor's
 /// differ between the two readings, its `CREATE` for one only the right has,
 /// its row's `DROP` for one only the left has. A sequence's position is not
-/// compared — two databases' counters differ by use, not by definition.
+/// compared — two databases' counters differ by use, not by definition — and
+/// neither is its start: `ALTER SEQUENCE … RESTART WITH` rewrites
+/// `start_value` (measured on 2022), so a sequence merely restarted read as
+/// another definition, and the default-ticked plan re-created it at the
+/// source's start under keys already handed out (S4.2-L1-01). The right
+/// side takes the left's start before the editor's differ sees it, so one
+/// re-created for a real difference starts where the target's did.
 fn tsql_entry(
     kind: CompareKind,
     object: ObjectKind,
@@ -2484,7 +2490,17 @@ fn tsql_entry(
 ) -> CompareEntry {
     let any = l.or(r).expect("a pair holds at least one side");
     let changes = match (l, r) {
-        (Some(l), Some(r)) => ddl::diff_tsql_object(l, &TsqlObjectDraft::from_info(r)),
+        (Some(l), Some(r)) => {
+            let mut r = r.clone();
+            if let (
+                TsqlObjectKind::Sequence { start: kept, .. },
+                TsqlObjectKind::Sequence { start, .. },
+            ) = (&l.kind, &mut r.kind)
+            {
+                start.clone_from(kept);
+            }
+            ddl::diff_tsql_object(l, &TsqlObjectDraft::from_info(&r))
+        }
         (None, Some(r)) => ddl::create_tsql_object(&TsqlObjectDraft::from_info(r)),
         (Some(l), None) => {
             ddl::drop_object(object, &l.name, l.schema.as_deref(), SqlDialect::MsSql)
@@ -4001,6 +4017,47 @@ mod tests {
         assert_eq!(
             find(&same, "sequence:dbo.order_no").status,
             ObjectStatus::Same
+        );
+    }
+
+    /// **A sequence's start is not compared either** (S4.2-L1-01): `ALTER
+    /// SEQUENCE … RESTART WITH` rewrites `sys.sequences.start_value`
+    /// (measured on 2022), so a sequence merely restarted on one side came
+    /// out Differing, and the default-ticked plan dropped and re-created it
+    /// at the other's start — under keys the counter had already handed out.
+    #[test]
+    fn a_restarted_sequence_is_the_same_sequence() {
+        use crate::schema::TsqlObjectKind as T;
+        let restarted = {
+            let mut s = tsql_sequence("1", Some("5000"));
+            if let T::Sequence { start, .. } = &mut s.kind {
+                *start = "5000".into();
+            }
+            s
+        };
+        let c = SchemaComparison::of(
+            &with_tsql(vec![], vec![restarted.clone()]),
+            &with_tsql(vec![], vec![tsql_sequence("1", None)]),
+            SqlDialect::MsSql,
+        );
+        assert_eq!(find(&c, "sequence:dbo.order_no").status, ObjectStatus::Same);
+        // A new type is still a difference, re-created at the target's start
+        // rather than reset to the source's.
+        let mut retyped = tsql_sequence("1", None);
+        if let T::Sequence { data_type, .. } = &mut retyped.kind {
+            *data_type = "int".into();
+        }
+        let c = SchemaComparison::of(
+            &with_tsql(vec![], vec![restarted]),
+            &with_tsql(vec![], vec![retyped]),
+            SqlDialect::MsSql,
+        );
+        let e = find(&c, "sequence:dbo.order_no");
+        assert_eq!(e.status, ObjectStatus::Differing);
+        let sql = e.changes.emit().join("\n");
+        assert!(
+            sql.contains("AS int") && sql.contains("START WITH 5000"),
+            "{sql}"
         );
     }
 

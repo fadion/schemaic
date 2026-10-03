@@ -2641,15 +2641,29 @@ impl TsqlObjectDraft {
                 if n(increment) == Some(0) {
                     out.push("The increment can't be 0.".to_string());
                 }
+                // An existing sequence's start is where it restarts — `RESTART
+                // WITH` rewrites it, so a minimum raised to the restart is an
+                // edit the server takes (measured on 2022) — and the form
+                // shows no Start field for one, so the refusal names the
+                // control that fixes it (S4.1-L1-02). The restart is judged
+                // below.
+                let existing = self.original.is_some();
                 if let (Some(lo), Some(hi)) = (n(min), n(max)) {
                     if lo >= hi {
                         out.push("The minimum must be below the maximum.".to_string());
                     } else if let Some(s) = n(start)
                         && (s < lo || s > hi)
+                        && !(existing && self.restart.is_some())
                     {
-                        out.push(
-                            "The start must lie between the minimum and the maximum.".to_string(),
-                        );
+                        out.push(if existing {
+                            format!(
+                                "It started at {}, outside the new range: Restart at a value \
+                                 between the minimum and the maximum.",
+                                start.trim()
+                            )
+                        } else {
+                            "The start must lie between the minimum and the maximum.".to_string()
+                        });
                     }
                 }
                 if let Some(Some(size)) = cache
@@ -2683,11 +2697,11 @@ impl TsqlObjectDraft {
                     out.push("An alias type needs a base type.".to_string());
                 }
             }
-            T::XmlSchemaCollection { definition } => {
-                if definition.trim().is_empty() {
-                    out.push("An XML schema collection needs at least one schema.".to_string());
-                }
-            }
+            // No rule for an XML schema collection's text: the server is its
+            // judge, and takes an empty one — which is what the blank form's
+            // component-less schema reads back as, so refusing it made the
+            // collection the editor had just created uneditable (S4.1-L1-03).
+            T::XmlSchemaCollection { .. } => {}
         }
         out
     }
@@ -2754,9 +2768,16 @@ pub fn diff_tsql_object(current: &crate::schema::TsqlObject, draft: &TsqlObjectD
         _ => true,
     };
     if replace {
+        // A restart asked for is where the new sequence starts: re-created at
+        // the old START, the next value was one the tables already held, and
+        // the typed value appeared nowhere in the plan (S4.1-L1-01).
+        let mut to = to.clone();
+        if let (Some(r), T::Sequence { start, .. }) = (&draft.restart, &mut to.kind) {
+            *start = r.trim().to_string();
+        }
         changes.push(Change::ReplaceTsqlObject {
             from: Box::new(current.clone()),
-            to: Box::new(to.clone()),
+            to: Box::new(to),
         });
     } else {
         if let (T::Sequence { .. }, T::Sequence { .. }) = (&current.kind, &to.kind)
@@ -4668,7 +4689,7 @@ impl Change {
             // bound rule — would go with the drop, so the plan refuses over
             // them (`tsql_replace_guard`); said for every kind, the synonym's
             // included, whose Apply wore Primary over a lifted DENY.
-            Change::ReplaceTsqlObject { from, .. } => {
+            Change::ReplaceTsqlObject { from, to } => {
                 let kept = match from.object_kind() {
                     ObjectKind::AliasType => {
                         "permissions on it, an owner of its own, extended properties or \
@@ -4682,11 +4703,18 @@ impl Change {
                          drop: the two statements run in one transaction."
                             .to_string()
                     }
-                    ObjectKind::Sequence => "Drops the sequence and creates it again: \
-                         the position it had reached is lost, and it starts over from \
-                         its start value. The server refuses the drop while a column's \
-                         default still draws from it."
-                        .to_string(),
+                    // The start it is created at, a restart asked for included.
+                    ObjectKind::Sequence => format!(
+                        "Drops the sequence and creates it again: the position it had \
+                         reached is lost, and it starts over at {}. The server refuses \
+                         the drop while a column's default still draws from it.",
+                        match &to.kind {
+                            crate::schema::TsqlObjectKind::Sequence { start, .. } => {
+                                start.trim()
+                            }
+                            _ => "its start value",
+                        }
+                    ),
                     k => format!(
                         "Drops the {} and creates it again. The server refuses the drop \
                          while a column still uses it, so those columns have to change \
@@ -36762,6 +36790,129 @@ mod tsql_object_tests {
         }
     }
 
+    /// **A sequence re-created with *Restart at* filled starts there**
+    /// (S4.1-L1-01): a new type is a drop and a create, and the create used
+    /// the old START — the typed restart appeared nowhere and the next value
+    /// was one the tables already held.
+    #[test]
+    fn a_retyped_sequence_starts_where_it_was_asked_to_restart() {
+        let t = sequence();
+        let mut d = draft_of(&t);
+        if let TsqlObjectKind::Sequence { data_type, .. } = &mut d.info.kind {
+            *data_type = "int".into();
+        }
+        d.restart = Some(" 5001 ".into());
+        let plan = diff_tsql_object(&t, &d);
+        let sql = plan.emit();
+        assert!(sql[2].contains("START WITH 5001"), "{sql:#?}");
+        let risks = plan.changes[0].risks(MsSql).join(" ");
+        assert!(risks.contains("5001"), "{risks}");
+    }
+
+    /// **An existing sequence's start is where it restarts** (S4.1-L1-02):
+    /// `RESTART WITH` rewrites the start, so a minimum raised to the restart
+    /// is an edit the server takes (measured on 2022) — refused here over
+    /// the catalogue's old start, in a field the form does not show.
+    /// Without a restart the refusal names the control that fixes it.
+    #[test]
+    fn an_existing_sequences_start_is_judged_by_its_restart() {
+        let mut d = draft_of(&sequence());
+        if let TsqlObjectKind::Sequence { min, .. } = &mut d.info.kind {
+            *min = "100".into();
+        }
+        let errs = d.validate().join(" ");
+        assert!(errs.contains("Restart"), "{errs}");
+        assert!(!errs.contains("The start"), "{errs}");
+        d.restart = Some("100".into());
+        assert!(d.validate().is_empty(), "{:?}", d.validate());
+        // A new one has a Start field, and is told about it.
+        d.original = None;
+        d.restart = None;
+        assert!(d.validate().join(" ").contains("The start"));
+    }
+
+    /// **An XML schema collection with no schema in it is the server's to
+    /// judge** (S4.1-L1-03): created from the blank form, it reads back
+    /// empty, and the editor refused every edit of it, a rename included,
+    /// though the server takes `AS N''` (measured on 2022).
+    #[test]
+    fn an_empty_xml_schema_collection_can_be_edited() {
+        let t = TsqlObject {
+            schema: Some("dbo".into()),
+            name: "empty".into(),
+            kind: TsqlObjectKind::XmlSchemaCollection {
+                definition: String::new(),
+            },
+        };
+        let mut d = draft_of(&t);
+        d.info.name = "empty2".into();
+        assert!(d.validate().is_empty(), "{:?}", d.validate());
+    }
+
+    /// **Each `ALTER SEQUENCE` clause, from the three-state cache too**
+    /// (S4.1-L6-02): only `INCREMENT` and `CACHE n` were pinned, and the
+    /// cache's `None` / `Some(None)` arms swapped passed the suite.
+    #[test]
+    fn each_sequence_clause_is_altered_as_it_changed() {
+        let t = sequence();
+        let alter = |edit: &dyn Fn(&mut TsqlObjectKind)| {
+            let mut d = draft_of(&t);
+            edit(&mut d.info.kind);
+            diff_tsql_object(&t, &d).emit()
+        };
+        let set = |f: fn(&mut String, &mut String, &mut bool, &mut Option<Option<String>>)| {
+            move |k: &mut TsqlObjectKind| {
+                if let TsqlObjectKind::Sequence {
+                    min,
+                    max,
+                    cycle,
+                    cache,
+                    ..
+                } = k
+                {
+                    f(min, max, cycle, cache);
+                }
+            }
+        };
+        let q = "ALTER SEQUENCE [sales].[order_no]";
+        assert_eq!(
+            alter(&set(|min, max, _, _| {
+                *min = "0".into();
+                *max = "1000".into();
+            })),
+            vec![format!("{q} MINVALUE 0 MAXVALUE 1000;")]
+        );
+        assert_eq!(
+            alter(&set(|_, _, cycle, _| *cycle = true)),
+            vec![format!("{q} CYCLE;")]
+        );
+        assert_eq!(
+            alter(&set(|_, _, _, cache| *cache = None)),
+            vec![format!("{q} NO CACHE;")]
+        );
+        assert_eq!(
+            alter(&set(|_, _, _, cache| *cache = Some(Some("50".into())))),
+            vec![format!("{q} CACHE 50;")]
+        );
+        // From a size back to the server's own, and from cycling to not.
+        let mut sized = t.clone();
+        if let TsqlObjectKind::Sequence { cache, cycle, .. } = &mut sized.kind {
+            *cache = Some(Some("50".into()));
+            *cycle = true;
+        }
+        let mut d = draft_of(&sized);
+        if let TsqlObjectKind::Sequence { cache, cycle, .. } = &mut d.info.kind {
+            *cache = Some(None);
+            *cycle = false;
+        }
+        assert_eq!(
+            diff_tsql_object(&sized, &d).emit(),
+            vec![format!("{q} NO CYCLE CACHE;")]
+        );
+        // Unchanged, nothing.
+        assert!(alter(&|_| {}).is_empty());
+    }
+
     /// What a client can judge is refused in the form's words; a type name
     /// and a target that exists are the server's.
     #[test]
@@ -36788,6 +36939,14 @@ mod tsql_object_tests {
         if let TsqlObjectKind::Sequence { start, .. } = &mut d.info.kind {
             *start = "0".into();
         }
+        // An existing one is told to restart, a new one about its start
+        // (`an_existing_sequences_start_is_judged_by_its_restart`).
+        assert!(
+            errs(&d).contains("Restart at a value between"),
+            "{}",
+            errs(&d)
+        );
+        d.original = None;
         assert!(errs(&d).contains("start must lie between"), "{}", errs(&d));
         // A restart outside the bounds is refused before the server's Msg 11703
         // ("must be between the minimum and maximum value", measured on 2022).

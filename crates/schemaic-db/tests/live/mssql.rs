@@ -2762,7 +2762,11 @@ async fn standalone_objects_are_created_and_edited_as_drafted() {
     };
     let tsql = |item: &ObjectItem| item.tsql().cloned().expect("a SQL Server object");
 
-    // Created from the blank form, and read back as drafted.
+    // Created from the blank form, and read back as drafted — compared with
+    // the draft, not with a draft built from the read-back, which is equal
+    // to it by construction (S4.1-L6-01). The one normalisation: a blank XML
+    // schema collection's component-less schema is kept as nothing, and
+    // reads back empty — which the editor then takes (S4.1-L1-03).
     for (kind, name) in [
         (ObjectKind::Sequence, "order_no"),
         (ObjectKind::AliasType, "code"),
@@ -2771,10 +2775,20 @@ async fn standalone_objects_are_created_and_edited_as_drafted() {
         let d = ObjectDraft::blank(kind, name, Some("dbo".into()), MS).expect("a form");
         run(d.change_set(None, &[], MS)).await;
         let back = read(kind, name).await;
-        let again = ObjectDraft::from_item(&back)
-            .unwrap()
-            .change_set(Some(&back), &[], MS);
-        assert!(again.changes.is_empty(), "{kind:?}: {:?}", again.changes);
+        let ObjectDraft::Tsql(drafted) = &d else {
+            panic!("{kind:?} is SQL Server's own form")
+        };
+        let mut expected = drafted.info.clone();
+        if let TsqlObjectKind::XmlSchemaCollection { definition } = &mut expected.kind {
+            definition.clear();
+        }
+        assert_eq!(tsql(&back), expected, "{kind:?} read back as drafted");
+        let again = ObjectDraft::from_item(&back).unwrap();
+        assert!(
+            again.validate().is_empty(),
+            "{kind:?}: {:?}",
+            again.validate()
+        );
     }
     let mut syn =
         TsqlObjectDraft::blank(ObjectKind::Synonym, "customers", Some("dbo".into())).unwrap();
@@ -5023,6 +5037,87 @@ async fn a_renamed_index_keeps_what_it_had() {
         .await,
         "2"
     );
+}
+
+/// **A sequence's restart is honoured where it is asked and ignored where it
+/// is not a definition**: a retype with *Restart at* filled starts there
+/// (it started at the old START, S4.1-L1-01); a minimum raised to the
+/// restart is taken (the form refused it, S4.1-L1-02); and a sequence merely
+/// restarted on one side compares the same (`RESTART WITH` rewrites
+/// `start_value`, and the comparison re-created it, S4.2-L1-01).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sequence_restart_is_honoured_and_not_compared() {
+    use schemaic_core::compare::SchemaComparison;
+    use schemaic_core::ddl::{self, ObjectKind, TsqlObjectDraft};
+    use schemaic_core::schema::TsqlObjectKind;
+    if !enabled() || azure_cannot("needs a second database") {
+        return;
+    }
+    let scratch = Scratch::create("seq_restart").await;
+    let s = &scratch;
+    s.exec("CREATE SEQUENCE dbo.q AS bigint START WITH 1 MINVALUE 1")
+        .await;
+    s.exec("SELECT NEXT VALUE FOR dbo.q; SELECT NEXT VALUE FOR dbo.q")
+        .await;
+    let current = || async {
+        s.db.fetch_schema(&s.name, CancellationToken::new())
+            .await
+            .unwrap()
+            .find_object(Some("dbo"), ObjectKind::Sequence, "q")
+            .and_then(|o| o.tsql().cloned())
+            .unwrap()
+    };
+    let run = |plan: ddl::ChangeSet| async move {
+        let stmts = plan.emit();
+        s.db.run_ddl(&s.name, &stmts, CancellationToken::new())
+            .await
+            .unwrap_or_else(|e| panic!("{e}\n{}", stmts.join("\n")));
+    };
+
+    let cur = current().await;
+    let mut d = TsqlObjectDraft::from_info(&cur);
+    if let TsqlObjectKind::Sequence { data_type, max, .. } = &mut d.info.kind {
+        *data_type = "int".into();
+        *max = "2147483647".into();
+    }
+    d.restart = Some("500".into());
+    assert!(d.validate().is_empty(), "{:?}", d.validate());
+    run(ddl::diff_tsql_object(&cur, &d)).await;
+    assert_eq!(s.scalar("SELECT NEXT VALUE FOR dbo.q").await, "500");
+
+    let cur = current().await;
+    let mut d = TsqlObjectDraft::from_info(&cur);
+    if let TsqlObjectKind::Sequence { min, .. } = &mut d.info.kind {
+        *min = "600".into();
+    }
+    assert!(!d.validate().is_empty(), "a raised minimum needs a restart");
+    d.restart = Some("600".into());
+    assert!(d.validate().is_empty(), "{:?}", d.validate());
+    run(ddl::diff_tsql_object(&cur, &d)).await;
+    assert_eq!(s.scalar("SELECT NEXT VALUE FOR dbo.q").await, "600");
+
+    // Restarted on the target alone, it compares the same.
+    let other = Scratch::create("seq_restart_source").await;
+    for db in [s, &other] {
+        db.exec("CREATE SEQUENCE dbo.c AS bigint START WITH 1")
+            .await;
+    }
+    s.exec("ALTER SEQUENCE dbo.c RESTART WITH 5000").await;
+    let read = |x: &Scratch| {
+        let (db, name) = (x.db.clone(), x.name.clone());
+        async move {
+            db.fetch_schema(&name, CancellationToken::new())
+                .await
+                .unwrap()
+        }
+    };
+    let c = SchemaComparison::of(&read(s).await, &read(&other).await, MS);
+    let differing: Vec<String> = c
+        .differences()
+        .map(|e| e.key())
+        .filter(|k| k.contains("dbo.c"))
+        .collect();
+    assert!(differing.is_empty(), "{differing:?}");
 }
 
 /// **A comparison discloses a module the source would not show, rather than

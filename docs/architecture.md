@@ -5861,8 +5861,19 @@ existing prose was left alone.
     the increment not 0, the minimum below the maximum, the start between them, a cache size above
     0, a restart a whole number between the bounds (the server's Msg 11703 otherwise, measured on
     2022) — and leaves to the server what only it can judge, a type name or
-    a target that exists. A synonym needs one to four target parts with the object named, an alias
-    type a base, a collection a definition. `blank` states every clause of a new sequence —
+    a target that exists. **An existing sequence's start is judged by its restart**: `RESTART WITH`
+    rewrites `start_value`, so a minimum raised to the restart is an edit the server takes
+    (`ALTER SEQUENCE … RESTART WITH 100 MINVALUE 100` on 2022), and with a restart given the
+    catalogue start is not checked against the bounds at all. Without one the refusal names the
+    control the form shows — *It started at {start}, outside the new range: Restart at a value
+    between the minimum and the maximum* — where it used to ask for a *Start* the form hides on an existing
+    sequence; a new one keeps *The start must lie between the minimum and the maximum*
+    (`an_existing_sequences_start_is_judged_by_its_restart`). A synonym needs one to four target
+    parts with the object named, an alias type a base. **A collection's text has no rule**: the
+    server is its judge and takes `AS N''`, which is what the blank form's component-less
+    `<xsd:schema>` reads back as, so the old *needs at least one schema* refusal made the
+    collection the editor had just created uneditable, rename included
+    (`an_empty_xml_schema_collection_can_be_edited`). `blank` states every clause of a new sequence —
     `bigint` from 1 by 1 up to `i64::MAX`, `NO CYCLE`, `CACHE` at the server's size — because
     T-SQL's own default starts an ascending sequence at its type's minimum; an alias type starts as
     a nullable `nvarchar(50)`, a collection as one empty `<xsd:schema>`, a synonym with no target.
@@ -5880,7 +5891,11 @@ existing prose was left alone.
     is everything else: a sequence's type or start, a synonym's target, an alias type's base or
     nullability, and any change at all to a collection, its name included. **A new start is a
     replace, not a restart**: `ALTER SEQUENCE` has no `START WITH`, and `RESTART WITH` moves the
-    counter as well, which is why the form offers *Start* on a new sequence alone. The drop is
+    counter as well, which is why the form offers *Start* on a new sequence alone. **A restart
+    asked for is where the re-created sequence starts** — `to` takes it as its `START WITH`.
+    Before S4.1-L1-01 the typed value appeared nowhere in the plan and the new sequence began at
+    the old `START`, so its next value was one the tables already held
+    (`a_retyped_sequence_starts_where_it_was_asked_to_restart`). The drop is
     plain rather than the dump's `IF EXISTS` because the object came off the catalogue, and the
     server's refusal over what uses it is the plan's answer. Measured on 2022: `sp_rename` renames
     a sequence keeping its position, a synonym, and an alias type given `USERDATATYPE`, and all of
@@ -5899,25 +5914,33 @@ existing prose was left alone.
     (above). A comparison's replace is the same `Change`, so its Apply is refused with the same
     reason. **The risk sentences follow the act**: an `AlterTsqlSequence`
     carrying a restart gets `RestartSequence`'s sentence; a sequence's replace says the position it
-    had reached is lost and it starts over, and that the server refuses the drop while a default
-    draws from it; an alias type's or a collection's, that it refuses while a column uses one; a
-    synonym's, that nothing refuses its drop — and every replace a second sentence naming what the
+    had reached is lost and names the start it begins over at — `to`'s, so a restart asked for
+    included — and that the server refuses the drop while a default draws from it; an alias
+    type's or a collection's, that it refuses while a column uses one; a synonym's, that nothing refuses its drop — and every replace a second sentence naming what the
     guard refuses over. A synonym's replace used to carry none, so its Apply wore `Primary` over a
     lifted DENY; it wears `Danger` now (`an_unedited_object_is_no_change`,
     `a_new_object_is_created_with_the_dumps_statement`,
     `a_sequence_is_altered_in_place_and_retyped_by_replacing_it`,
+    `each_sequence_clause_is_altered_as_it_changed` — MINVALUE/MAXVALUE, CYCLE/NO CYCLE, NO CACHE,
+    CACHE n and a bare CACHE —
     `what_t_sql_cannot_alter_is_replaced_and_a_name_is_renamed`,
     `a_draft_is_refused_for_what_the_form_can_know`,
     `a_replace_refuses_what_its_drop_would_take_and_says_so`; live,
     `standalone_objects_are_created_and_edited_as_drafted` on 2022 and 2025 — a sequence, alias
-    type and collection created from their blank forms and read back as no change, a synonym
+    type and collection created from their blank forms, each read back equal to the draft itself
+    and its re-read draft valid, the one normalisation the blank collection's definition reading
+    back empty (it used to be compared with a draft built from the read-back, true by
+    construction), a synonym
     created with a target, a sequence moved to increment 5, restarted at 100 and renamed with
     `NEXT VALUE FOR` then answering 100 and 105, a synonym re-pointed and renamed, an alias type
-    renamed through `sp_rename` and a collection renamed by replacement — and
+    renamed through `sp_rename` and a collection renamed by replacement —
     `a_replace_refuses_over_permissions_and_a_bound_rule`, every arm on every kind — a GRANT or
     DENY, an owner of its own, an extended property, and a bound rule and a bound default on an
     alias type — each replace refused with every permission surviving and its unguarded twin
-    replaced, on 2022). `ObjectDraft::Tsql` wires
+    replaced, on 2022 — and `a_sequence_restart_is_honoured_and_not_compared` on 2022: retyped to
+    `int` with a restart of 500 it answers 500, its minimum raised to 600 is refused without a
+    restart and applies with one at 600, and a sequence restarted on one side compares the same).
+    `ObjectDraft::Tsql` wires
     it into the editor: `from_item` answers it for `ObjectItem::Tsql`, and `kind`, `name`,
     `validate` and `change_set` route to it. **`ObjectDraft::blank` takes the dialect now, because
     a sequence's draft depends on it** — PostgreSQL's `SequenceDraft` on PostgreSQL, MySQL and
@@ -6681,7 +6704,15 @@ existing prose was left alone.
     the synonym).
     **A sequence's position is not compared.** `diff_tsql_object` never reads `last_used`, so two
     sequences that differ only in how far their counters have run are `Same`: two databases'
-    counters differ by use, not by definition. The trade runs the other way too — a sequence the
+    counters differ by use, not by definition. **Nor is its start**, for the same reason one step
+    removed: `ALTER SEQUENCE … RESTART WITH` rewrites `sys.sequences.start_value` (measured on
+    2022), so a sequence merely restarted on one side came out Differing, and the default-ticked
+    plan dropped and re-created it at the source's start, under keys the target's counter had
+    already handed out. So `tsql_entry` gives the right side the left's `start` before the
+    editor's differ sees it — the same differ, not a second one — and a sequence re-created for a
+    real difference, a type, starts where the target's did
+    (`a_restarted_sequence_is_the_same_sequence`; live,
+    `a_sequence_restart_is_honoured_and_not_compared`). The trade runs the other way too — a sequence the
     comparison creates is `create_sql` alone and starts at its own `START WITH`, where the dump moves
     a copy's counter on to the source's (`restart_sql`) only when it carries the rows as well
     (`sql_servers_standalone_objects_are_compared`, whose counter-only difference is `Same`; live,
@@ -20710,7 +20741,10 @@ existing prose was left alone.
     **Start appears on a new
     sequence alone**: `ALTER SEQUENCE` has no `START WITH`, so on an existing one the field could
     only ever mean dropping it, and a *Position* section's *Restart at* — labelled with the value
-    the counter last handed out — is what moves the counter instead. A synonym is four fields,
+    the counter last handed out — is what moves the counter instead. It is also where a sequence
+    the plan has to re-create (a new type) starts, and the control `validate` names when a raised
+    minimum or lowered maximum leaves the old start outside the range (both under `ddl.rs`). A
+    synonym is four fields,
     Server, Database, Schema and Object (`TsqlObject::synonym_fields`, under `schema.rs`); an alias
     type a *Base type* and a Nullable toggle; a collection one multi-line, monospaced *Schemas*
     field.
