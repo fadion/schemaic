@@ -5684,10 +5684,14 @@ mod tests {
             pos(&file, "CREATE SYNONYM [dbo].[syn]") < create_table,
             "{file}"
         );
-        // **Each once** (R2-L6-04): the generic objects pass and the outside-
-        // dependencies pass both skip SQL Server's objects, which the T-SQL
-        // pass writes; without either skip one was written a second time and
-        // the restore stopped at "There is already an object named …".
+        // **Each once** (R2-L6-04): the generic objects pass skips SQL
+        // Server's objects, which the T-SQL pass writes; without that skip
+        // one was written a second time and the restore stopped at "There is
+        // already an object named …". This loop guards that skip only.
+        // `outside_dependencies` skips them too, but it writes no `CREATE`,
+        // so without its skip nothing here doubles — the file's header gains
+        // a stray "outside this export" note instead, which the `header`
+        // assertion further down is what catches.
         for create in [
             "CREATE SEQUENCE [dbo].[seq]",
             "CREATE SEQUENCE [Sequences].[OrderID]",
@@ -5729,6 +5733,8 @@ mod tests {
             "@sequence_name = N''[Sequences].[OrderID]'', @range_size = 7,",
         );
         assert!(outside < moved && moved < create_table, "{file}");
+        // The guard on `outside_dependencies`' T-SQL skip: without it, the
+        // header also named SQL Server's objects as outside this export.
         let header = text_of(&p);
         assert!(!header.contains("outside this export"), "{header}");
         // Without its other objects, the file says what it leaves out.
