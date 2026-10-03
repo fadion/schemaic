@@ -7836,6 +7836,13 @@ fn view_indexes_rebuilt(v: &ViewDraft, server: &[IndexInfo]) -> Option<String> {
 /// ([`IndexInfo::is_columnstore`]); `COLUMNSTORE_ARCHIVE` (4) is an option,
 /// and still refused. One predicate for the two guards that ask it — the table's in-place
 /// guard and an indexed view's ([`tsql_view_index_guard`]).
+///
+/// **An XML or spatial index keeps its rows in an internal table of its
+/// own** (`sys.internal_tables`, `parent_minor_id` the index), whose
+/// partitions carry its compression under another object id — so the
+/// table's partitions never showed a spatial index's `DATA_COMPRESSION`
+/// (R3-L5-03, measured on 2022). The newer servers' two options are
+/// [`tsql_index_carries_late`]'s.
 fn tsql_index_carries(which: &str) -> String {
     format!(
         "EXISTS (SELECT 1 FROM sys.indexes i WHERE i.object_id = @t AND {which} \
@@ -7844,6 +7851,9 @@ fn tsql_index_carries(which: &str) -> String {
          OR i.is_disabled = 1 \
          OR EXISTS (SELECT 1 FROM sys.partitions p WHERE p.object_id = @t \
          AND p.index_id = i.index_id AND p.data_compression NOT IN (0, 3)) \
+         OR EXISTS (SELECT 1 FROM sys.internal_tables it JOIN sys.partitions p \
+         ON p.object_id = it.object_id WHERE it.parent_object_id = @t \
+         AND it.parent_minor_id = i.index_id AND p.data_compression <> 0) \
          OR EXISTS (SELECT 1 FROM sys.data_spaces s WHERE s.data_space_id = i.data_space_id \
          AND (s.type <> 'FG' OR s.is_default = 0)) \
          OR EXISTS (SELECT 1 FROM sys.extended_properties e WHERE e.class = 7 \
@@ -7852,6 +7862,39 @@ fn tsql_index_carries(which: &str) -> String {
          ON e.class = 1 AND e.major_id = k.object_id WHERE k.parent_object_id = @t \
          AND k.unique_index_id = i.index_id)))"
     )
+}
+
+/// What [`tsql_index_carries`] cannot name in a statement every server
+/// compiles, as [`tsql_late_arm`]s answering `why`: a columnstore index's
+/// `COMPRESSION_DELAY` (`sys.indexes.compression_delay`, 2016) and an XML
+/// index's — or the XML columns' — `XML_COMPRESSION`
+/// (`sys.partitions.xml_compression`, 2022), on the index's own partitions
+/// or its internal table's. Neither is in `IndexInfo` (R3-L5-03).
+fn tsql_index_carries_late(which: &str, why: &str) -> String {
+    [
+        tsql_late_arm(
+            "COL_LENGTH(N'sys.indexes', N'compression_delay') IS NOT NULL",
+            &format!(
+                "EXISTS (SELECT 1 FROM sys.indexes i WHERE i.object_id = @t AND {which} \
+                 AND i.compression_delay > 0)"
+            ),
+            why,
+        ),
+        tsql_late_arm(
+            "COL_LENGTH(N'sys.partitions', N'xml_compression') IS NOT NULL",
+            &format!(
+                "EXISTS (SELECT 1 FROM sys.indexes i JOIN sys.partitions p \
+                 ON p.object_id = @t AND p.index_id = i.index_id \
+                 WHERE i.object_id = @t AND {which} AND p.xml_compression = 1) \
+                 OR EXISTS (SELECT 1 FROM sys.indexes i JOIN sys.internal_tables it \
+                 ON it.parent_object_id = @t AND it.parent_minor_id = i.index_id \
+                 JOIN sys.partitions p ON p.object_id = it.object_id \
+                 WHERE i.object_id = @t AND {which} AND p.xml_compression = 1)"
+            ),
+            why,
+        ),
+    ]
+    .concat()
 }
 
 /// The indexes a view edit drops **and builds again** — the server's, by
@@ -8746,6 +8789,9 @@ fn tsql_in_place_guard(q: &str, changes: &[&Change]) -> Option<String> {
 
     let index_carries = tsql_index_carries;
     let mut reasons: Vec<(String, String)> = Vec::new();
+    // What only a newer server's catalogue says about an index re-created,
+    // behind its probe ([`tsql_index_carries_late`]).
+    let mut late = String::new();
     for col in &restated {
         reasons.push((
             format!(
@@ -8760,23 +8806,21 @@ fn tsql_in_place_guard(q: &str, changes: &[&Change]) -> Option<String> {
         ));
     }
     if key {
-        reasons.push((
-            index_carries("i.is_primary_key = 1"),
-            "Re-creating the primary key would drop its fill factor, padding, locks, \
-             compression, filegroup, disabled state or extended properties, which Schemaic \
-             doesn't read - change it in SQL"
-                .to_string(),
-        ));
+        let why = "Re-creating the primary key would drop its fill factor, padding, locks, \
+                   compression, filegroup, disabled state or extended properties, which \
+                   Schemaic doesn't read - change it in SQL";
+        late.push_str(&tsql_index_carries_late("i.is_primary_key = 1", why));
+        reasons.push((index_carries("i.is_primary_key = 1"), why.to_string()));
     }
     for ix in &indexes {
-        reasons.push((
-            index_carries(&format!("i.name = {}", lit(ix))),
-            format!(
-                "Re-creating the index {ix} would drop its fill factor, padding, \
-                 IGNORE_DUP_KEY, locks, compression, filegroup, disabled state or extended \
-                 properties, which Schemaic doesn't read - change it in SQL"
-            ),
-        ));
+        let which = format!("i.name = {}", lit(ix));
+        let why = format!(
+            "Re-creating the index {ix} would drop its fill factor, padding, \
+             IGNORE_DUP_KEY, locks, compression, filegroup, disabled state or extended \
+             properties, which Schemaic doesn't read - change it in SQL"
+        );
+        late.push_str(&tsql_index_carries_late(&which, &why));
+        reasons.push((index_carries(&which), why));
     }
     for fk in &foreign_keys {
         reasons.push((
@@ -8836,7 +8880,8 @@ fn tsql_in_place_guard(q: &str, changes: &[&Change]) -> Option<String> {
         .collect::<Vec<_>>()
         .join(" ");
     Some(format!(
-        "DECLARE @t int = OBJECT_ID({}) DECLARE @why nvarchar(2048) = CASE {cases} END \
+        "DECLARE @t int = OBJECT_ID({}) DECLARE @why nvarchar(2048) \
+         {late}SET @why = ISNULL(@why, CASE {cases} END) \
          IF @why IS NOT NULL THROW 50000, @why, 1;",
         tsql_n(q)
     ))
@@ -14396,7 +14441,10 @@ pub fn tsql_rebuild_sql(current: &TableInfo, draft: &TableDraft) -> Vec<String> 
              OR EXISTS (SELECT 1 FROM sys.tables t JOIN sys.data_spaces s \
              ON s.data_space_id = t.lob_data_space_id WHERE t.object_id = @t AND s.is_default = 0) \
              OR EXISTS (SELECT 1 FROM sys.partitions WHERE object_id = @t \
-             AND data_compression NOT IN (0, 3))"
+             AND data_compression NOT IN (0, 3)) \
+             OR EXISTS (SELECT 1 FROM sys.internal_tables it JOIN sys.partitions p \
+             ON p.object_id = it.object_id WHERE it.parent_object_id = @t \
+             AND p.data_compression <> 0)"
                 .into(),
             // Bar a columnstore index's own `COLUMNSTORE` compression (3),
             // which is what the index is and what the model states; its
@@ -14517,6 +14565,21 @@ pub fn tsql_rebuild_sql(current: &TableInfo, draft: &TableDraft) -> Vec<String> 
             "EXISTS (SELECT 1 FROM sys.sensitivity_classifications WHERE class = 1 \
              AND major_id = @t)",
             "a column carries a sensitivity classification",
+        ),
+        // A columnstore index's delay and the XML columns' or an XML
+        // index's compression, none restated (R3-L5-03).
+        tsql_late_arm(
+            "COL_LENGTH(N'sys.indexes', N'compression_delay') IS NOT NULL",
+            "EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = @t AND compression_delay > 0)",
+            "an index has a compression delay",
+        ),
+        tsql_late_arm(
+            "COL_LENGTH(N'sys.partitions', N'xml_compression') IS NOT NULL",
+            "EXISTS (SELECT 1 FROM sys.partitions WHERE object_id = @t AND xml_compression = 1) \
+             OR EXISTS (SELECT 1 FROM sys.internal_tables it JOIN sys.partitions p \
+             ON p.object_id = it.object_id WHERE it.parent_object_id = @t \
+             AND p.xml_compression = 1)",
+            "it or an XML index on it is XML-compressed",
         ),
     ]
     .concat();
@@ -20112,6 +20175,14 @@ mod tests {
             "ledger_type <> 0",
             "OBJECT_ID(N'sys.sensitivity_classifications') IS NOT NULL",
             "sys.sensitivity_classifications WHERE class = 1 AND major_id = @t",
+            // An XML or spatial index's internal table, a columnstore
+            // index's COMPRESSION_DELAY (2016) and XML_COMPRESSION (2022),
+            // on the table or an index: none is restated (R3-L5-03).
+            "sys.internal_tables it",
+            "COL_LENGTH(N'sys.indexes', N'compression_delay') IS NOT NULL",
+            "compression_delay > 0",
+            "COL_LENGTH(N'sys.partitions', N'xml_compression') IS NOT NULL",
+            "xml_compression = 1",
         ] {
             assert!(guard.contains(needle), "{needle} not in {guard}");
         }
@@ -20601,6 +20672,14 @@ mod tests {
             "data_compression NOT IN (0, 3)",
             "e.class = 7",
             "f.is_not_for_replication = 1",
+            // An XML or spatial index's rows live in an internal table of
+            // their own, compressed apart from the table's (R3-L5-03).
+            "sys.internal_tables it",
+            // 2016's and 2022's columns, each behind its probe.
+            "COL_LENGTH(N'sys.indexes', N'compression_delay') IS NOT NULL",
+            "i.compression_delay > 0",
+            "COL_LENGTH(N'sys.partitions', N'xml_compression') IS NOT NULL",
+            "xml_compression = 1",
         ] {
             assert!(guard.contains(needle), "{needle} not in {guard}");
         }

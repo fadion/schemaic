@@ -4631,7 +4631,10 @@ existing prose was left alone.
     own (`ALTER AUTHORIZATION`, a non-NULL `principal_id` — the copy is the schema owner's); a
     schema-bound dependent; system versioning, memory optimisation, replication, change data
     capture or a lock escalation setting; a ledger; change tracking or a full-text index;
-    partitioning, compression or a filegroup other than the default; an extended property on the
+    partitioning, compression or a filegroup other than the default — an XML or spatial index's
+    compression included, which sits on the partitions of its internal table rather than the
+    table's; a columnstore index's `COMPRESSION_DELAY`, or `XML_COMPRESSION` on the table or on an
+    XML index on it; an extended property on the
     table or its columns other than `MS_Description`; **any** extended property on what stands on
     the table — class 1 on an object whose `parent_object_id` is the table (its key, default and
     check constraints, its triggers) or class 7 on its indexes — a description included, and on a
@@ -4653,13 +4656,21 @@ existing prose was left alone.
     report off (measured on 2022), so the index-option arm asks them only `AND type NOT IN (5, 6)`.
     Asked as they had been, they refused a columnstore rebuild whose plan was otherwise right, which
     the live `a_columnstore_index_is_read_rebuilt_and_authored` caught; `tsql_index_carries`, the
-    in-place guard's predicate (below), takes the same two bars. **Two arms ask of a catalogue an older server lacks**:
-    `sys.tables.ledger_type` (2022) and `sys.sensitivity_classifications` (2019). Named in the
-    `CASE` they would fail its compile, and so every rebuild, there; `tsql_late_arm` runs each
-    behind a probe (`COL_LENGTH`, `OBJECT_ID`) through `sp_executesql`, ahead of the `CASE` so a
-    ledger table is named as one rather than by the generated-always columns every ledger table
-    has. The schema-bound test leaves out objects whose parent is the table
-    itself, because a check or default constraint is an object of its own, schema-bound to the
+    in-place guard's predicate (below), takes the same two bars. **Four arms ask of a catalogue an
+    older server lacks**: `sys.tables.ledger_type` (2022), `sys.sensitivity_classifications`
+    (2019), `sys.indexes.compression_delay` (2016) and `sys.partitions.xml_compression` (2022).
+    Named in the `CASE` they would fail its compile, and so every rebuild, there; `tsql_late_arm`
+    runs each behind a probe (`COL_LENGTH`, `OBJECT_ID`) through `sp_executesql`, ahead of the
+    `CASE` so a ledger table is named as one rather than by the generated-always columns every
+    ledger table has. **An XML or spatial index keeps its rows in an internal table of its own**
+    (`sys.internal_tables`, `parent_object_id` the table, `parent_minor_id` the index), whose
+    partitions carry its `DATA_COMPRESSION` and `XML_COMPRESSION` under another object id — so an
+    arm reading `sys.partitions` for the table alone never saw a spatial index's `PAGE`
+    compression (measured on 2022), and the compression arm and the `xml_compression` arm each
+    ask the table's internal tables too (R3-L5-03). XML, spatial and columnstore indexes became
+    restatable in one release without the guard learning where their options live; the
+    table-level `XML_COMPRESSION` gap predated it. The schema-bound test leaves out objects whose
+    parent is the table itself, because a check or default constraint is an object of its own, schema-bound to the
     table it stands on — found live. **The arm about what stands on the table is the one that
     looked covered and was not** (S3.2-L5-03): the table's arm read class 1 on the table's own id
     alone, but a constraint's or a trigger's property sits on *its own* object id and an index's
@@ -4674,7 +4685,10 @@ existing prose was left alone.
     never run under a test, and an arm whose catalogue predicate is wrong fails open without a
     sound, which is what the one above did; its four cases for the widening — a description on the
     key, on an index and on a trigger, and the disabled index — were red, the plan applied, before
-    it, and it is green on 2022 and 2025. Full-text and
+    it, and it is green on 2022 and 2025. R3-L5-03's four — a `PAGE`-compressed spatial index, a
+    columnstore index with `COMPRESSION_DELAY = 30`, an `XML_COMPRESSION` primary XML index and a
+    table rebuilt with `XML_COMPRESSION = ON` — were red too, on 2022, with that fix stashed.
+    Full-text and
     memory-optimised tables are not in it: the containers have no full-text service and no
     memory-optimised filegroup. (2) The default constraints' names, captured into the session
     temp table `#schemaic_rebuild_defaults` (`TSQL_REBUILD_DEFAULTS`), since the model reads a
@@ -5425,7 +5439,17 @@ existing prose was left alone.
     under `annual AS (salary * 12)` lifted a `DENY SELECT` on `annual` and the denied user read it
     (S2-L5-03, `a_rebuilt_computed_column_is_refused_where_it_carries_what_the_drop_takes`). A
     sensitivity classification is not on that list because a computed column cannot carry one
-    (Msg 16111, measured on 2022 and 2025); an in-place `ALTER COLUMN` keeps both.
+    (Msg 16111, measured on 2022 and 2025); an in-place `ALTER COLUMN` keeps both. **An index's
+    options are asked where its kind keeps them** (R3-L5-03): an XML or spatial index's compression
+    on its internal table's partitions, inside `tsql_index_carries`, and a columnstore index's
+    `COMPRESSION_DELAY` and an `XML_COMPRESSION` through `tsql_index_carries_late` — two
+    `tsql_late_arm`s for the key and for each index re-created, behind the rebuild's probes, so the
+    batch now has the rebuild guard's shape, the late arms ahead of the `CASE` (`DECLARE @t …
+    DECLARE @why … {late}SET @why = ISNULL(@why, CASE … END)`). Before them a key retype brought a
+    `PAGE`-compressed spatial index and an `XML_COMPRESSION` primary XML index back without either,
+    and a column retype a columnstore index without its delay, each plan applying — the live
+    `an_index_re_created_in_place_is_refused_over_hidden_options` was red on 2022 with the fix
+    stashed, and now sees each refused as *Re-creating the index*.
     **It refuses rather than restates**, as the rebuild's guard does. It keys on the name, not on who raised the pair, so
     the designer's own edit of an index, foreign key or check that keeps its name is refused by the
     same arm — deliberately, the loss being the same
@@ -5541,7 +5565,9 @@ existing prose was left alone.
     built again. `tsql_view_index_guard` now opens the plan — before the alter or the rename's drop
     — with the table in-place guard's catalogue `THROW`, over the same predicate
     (`tsql_index_carries`, shared with `tsql_in_place_guard`) for each index the plan drops and
-    builds again, and the sentence says such an index stops the plan. And `ALTER VIEW` drops the
+    builds again, and the sentence says such an index stops the plan. It takes that predicate's
+    internal-table term with it, harmlessly, but not `tsql_index_carries_late`'s arms, since an
+    indexed view can hold no columnstore or XML index. And `ALTER VIEW` drops the
     view's hand-made statistics too, which nothing reads; the sentence names that loss as the
     table rebuild's does (`an_indexed_views_edit_guards_what_its_indexes_cannot_restate`; live,
     `an_indexed_views_edit_refuses_what_its_indexes_cannot_carry`, 2022 and 2025: the compressed

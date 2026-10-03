@@ -4867,6 +4867,58 @@ async fn a_key_under_xml_and_spatial_indexes_is_re_created() {
     }
 }
 
+/// **An index re-created in place is refused over the options its kind
+/// keeps out of sight** (R3-L5-03): a spatial index's compression lives on
+/// its internal table, an XML index's `XML_COMPRESSION` and a columnstore
+/// index's `COMPRESSION_DELAY` in newer servers' columns — the guard saw
+/// none, and the re-create brought each back without it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_index_re_created_in_place_is_refused_over_hidden_options() {
+    use schemaic_core::ddl::TableDraft;
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("hidden_index_options").await;
+    let retype = |t: &schemaic_core::schema::TableInfo, col: &str| {
+        let mut d = TableDraft::from_table(t);
+        d.columns
+            .iter_mut()
+            .find(|c| c.info.name == col)
+            .unwrap()
+            .info
+            .type_name = "bigint".into();
+        d
+    };
+    for (t, index, col) in [
+        (
+            "h_sp",
+            "CREATE SPATIAL INDEX sp ON dbo.h_sp (shape) USING GEOMETRY_GRID \
+             WITH (BOUNDING_BOX = (0, 0, 10, 10), DATA_COMPRESSION = PAGE)",
+            "id",
+        ),
+        (
+            "h_px",
+            "CREATE PRIMARY XML INDEX px ON dbo.h_px (doc) WITH (XML_COMPRESSION = ON)",
+            "id",
+        ),
+        (
+            "h_cs",
+            "CREATE NONCLUSTERED COLUMNSTORE INDEX cs ON dbo.h_cs (a) \
+             WITH (COMPRESSION_DELAY = 30)",
+            "a",
+        ),
+    ] {
+        s.exec(&format!(
+            "CREATE TABLE dbo.{t} (id int NOT NULL CONSTRAINT pk_{t} PRIMARY KEY CLUSTERED, \
+             a int NULL, doc xml NULL, shape geometry NULL); {index}"
+        ))
+        .await;
+        let current = read_table(&s, t).await;
+        let refused = refused_draft(&s, &current, &retype(&current, col)).await;
+        assert!(refused.contains("Re-creating the index"), "{t}: {refused}");
+    }
+}
+
 /// **A comparison discloses a module the source would not show, rather than
 /// planning it.** An encrypted view was planned as `CREATE VIEW v AS ;` and
 /// an encrypted procedure as a comment that "succeeded" creating nothing.
@@ -10230,6 +10282,45 @@ async fn every_arm_of_the_rebuild_guard_refuses_its_table() {
             setup: &["ALTER TABLE dbo.g_zip REBUILD WITH (DATA_COMPRESSION = ROW)"],
             after: &[],
             says: "it is partitioned, compressed or stored off the default filegroup",
+        },
+        // An XML or spatial index's rows are in an internal table whose
+        // partitions carry its compression (R3-L5-03).
+        Arm {
+            table: "g_spzip",
+            setup: &[
+                "ALTER TABLE dbo.g_spzip ADD shape geometry NULL",
+                "CREATE SPATIAL INDEX sp_g_spzip ON dbo.g_spzip (shape) USING GEOMETRY_GRID \
+                 WITH (BOUNDING_BOX = (0, 0, 10, 10), DATA_COMPRESSION = PAGE)",
+            ],
+            after: &[],
+            says: "it is partitioned, compressed or stored off the default filegroup",
+        },
+        Arm {
+            table: "g_delay",
+            setup: &[
+                "CREATE NONCLUSTERED COLUMNSTORE INDEX cs_g_delay ON dbo.g_delay (a) \
+                 WITH (COMPRESSION_DELAY = 30)",
+            ],
+            after: &[],
+            says: "an index has a compression delay",
+        },
+        Arm {
+            table: "g_xzip",
+            setup: &[
+                "ALTER TABLE dbo.g_xzip ADD doc xml NULL",
+                "CREATE PRIMARY XML INDEX px_g_xzip ON dbo.g_xzip (doc) WITH (XML_COMPRESSION = ON)",
+            ],
+            after: &[],
+            says: "it or an XML index on it is XML-compressed",
+        },
+        Arm {
+            table: "g_xtab",
+            setup: &[
+                "ALTER TABLE dbo.g_xtab ADD doc xml NULL",
+                "ALTER TABLE dbo.g_xtab REBUILD WITH (XML_COMPRESSION = ON)",
+            ],
+            after: &[],
+            says: "it or an XML index on it is XML-compressed",
         },
         Arm {
             table: "g_part",
