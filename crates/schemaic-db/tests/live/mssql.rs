@@ -5544,6 +5544,44 @@ async fn a_sequence_restart_is_honoured_and_not_compared() {
             "{q}"
         );
     }
+
+    // A narrower range the target's counter has already left is held back,
+    // not planned: the bare `ALTER … MAXVALUE 2000` over a counter at 5000 is
+    // Msg 11704, and anything the server would take hands numbers out again.
+    // Drawn up to 5000 rather than restarted there: `RESTART WITH` moves the
+    // sequence's `start_value` too, and a start the source's range cannot
+    // hold is a re-create (above), not the in-place alter this is about.
+    s.exec(
+        "CREATE SEQUENCE dbo.hi AS bigint START WITH 1; \
+         DECLARE @first sql_variant; \
+         EXEC sys.sp_sequence_get_range @sequence_name = N'dbo.hi', @range_size = 5000, \
+              @range_first_value = @first OUTPUT",
+    )
+    .await;
+    other
+        .exec("CREATE SEQUENCE dbo.hi AS bigint START WITH 1 MAXVALUE 2000")
+        .await;
+    let c = SchemaComparison::of(&read(s).await, &read(&other).await, MS);
+    let hi = c
+        .differences()
+        .find(|e| e.key() == "sequence:dbo.hi")
+        .expect("dbo.hi differs");
+    let refused = hi.changes.emit();
+    assert!(
+        s.db.run_ddl(&s.name, &refused, CancellationToken::new())
+            .await
+            .is_err(),
+        "the server takes {refused:?} after all; nothing need be held back"
+    );
+    assert!(hi.unplannable(), "{refused:?}");
+    let plan = c.plan(|e| e.key() == "sequence:dbo.hi");
+    assert!(plan.emit().is_empty(), "{:?}", plan.emit());
+    assert!(
+        c.standing_notes().iter().any(|n| n.contains("5000")),
+        "{:?}",
+        c.standing_notes()
+    );
+    assert_eq!(s.scalar("SELECT NEXT VALUE FOR dbo.hi").await, "5001");
 }
 
 /// **An empty schema is a namespace like any other** (S2-L1-01/02): read off

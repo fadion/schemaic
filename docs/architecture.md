@@ -6643,7 +6643,7 @@ existing prose was left alone.
     "Applied N statements to 1 object" over a three-difference comparison.
     `SchemaComparison::needs_source`, written to disclose exactly this, had **no production caller** —
     its only three call sites were its own asserts.
-    **That is one of the two reasons, and the second is not about reading.** `plan()` filters
+    **That is one of three reasons, and the second is not about reading.** `plan()` filters
     `e.needs_source() || e.unplannable()`, and `CompareEntry::unplannable` is a difference whose
     change set `emit()`s nothing — the same sentence one level down: the row was a difference, the
     footer counted it, the preview listed one change over an empty SQL box, and success read
@@ -6655,7 +6655,14 @@ existing prose was left alone.
     `AlterColumn` whatever the clause builder can express. So `omission_note` has three arms rather
     than two, and the third says "this comparison has no statement for the difference it found"
     instead of the read-failure sentence, which would send the reader to check a privilege that is
-    fine. `is_planned` carries the same term, so counting and building cannot answer differently.
+    fine. **The third is a set that emits and must not run.** `CompareEntry::held_back` is the
+    sentence saying why no plan may carry an entry's changes, set where the server would refuse the
+    statements and the only change it would take does damage the comparison may not choose for the
+    user; `unplannable` is true whenever it is set, and `omission_note` reads it ahead of its other
+    three arms, so the omitted line is that sentence. One producer sets it — `tsql_entry`, through
+    `held_back_sequence`, for a SQL Server sequence's range (below) — and every other entry is built
+    with `None`. `is_planned` carries the same term, so counting and building cannot answer
+    differently.
     It is a second list rather than more lines in
     `unsupported()` because the two ask different things of the reader: `unsupported` means this plan
     writes less than its own change list promises, so Apply is refused until the offending tick is
@@ -6893,9 +6900,28 @@ existing prose was left alone.
     (Msg 11704), and the migration rolled back. A start the source cannot hold is no restart to
     honour, so the source's own stands and the sequence is re-created there; a bound that does not
     parse answers the same way (`a_target_start_outside_the_sources_range_is_not_kept`; live, the
-    same test's last half). The counter is not asked: where the two starts already agree and the
-    target's counter has run past a lowered `MAXVALUE`, the `ALTER` carries no `RESTART WITH` and
-    is refused (Msg 11704), as it always was. **An alias type's bound rule or default is
+    same test's last half). **The counter is asked once, and only to hold the entry back.** Where
+    the two starts already agree and the target's counter (`last_used`) has left the source's new
+    range — run past a lowered `MAXVALUE`, or short of a raised `MINVALUE` — the change is an
+    `AlterTsqlSequence` with no `restart`, and that bare `ALTER` is refused (Msg 11704, measured on
+    2022) and the migration rolls back at it, as it always did. The server would take a `RESTART
+    WITH` a value inside the range, or a re-create, and either hands out again numbers the tables
+    may already hold — a choice about the user's data the comparison has no business making for
+    them. So `held_back_sequence` sets `CompareEntry::held_back` (above) and the entry stays out of
+    every plan, its sentence naming the counter and the range and telling the user to restart the
+    sequence on the target by hand, at a value no table holds, and compare again. That sentence is
+    the one instruction for a difference no plan carries, and a comparison whose only difference it
+    is plans nothing and never enables Preview, so the omitted list alone would never be read:
+    `SchemaComparison::standing_notes` puts each held-back entry's line ahead of `notes`, and that
+    is what the view's banner reads (CMP-03's banner, under `compare_view.rs`). A re-create — a new
+    type or start — begins a fresh counter and is not asked about; a counter never used is the
+    start, which `tsql_entry` already keeps only inside the range. **A target restarted past the
+    source's range is not this case**: `RESTART WITH` moves `start_value` too, so its start no
+    longer agrees and the source's stands — a re-create, as above. The live half draws its counter
+    to 5000 with `sp_sequence_get_range` instead, for exactly that reason, checks the bare `ALTER`
+    is refused, then that the entry is unplannable and named in `standing_notes`
+    (`a_range_the_targets_counter_has_left_is_held_back`; live, the end of
+    `a_sequence_restart_is_honoured_and_not_compared`). **An alias type's bound rule or default is
     not compared or carried** — the rule or default is an object of its own, and the comparison
     creates none — so it made the type bare and then called the two databases the same, a loss the
     dump names in its header (S4.2-L1-07). It is said instead: `SchemaComparison::notes` holds a
@@ -23143,7 +23169,12 @@ existing prose was left alone.
     reader only through a plan's omitted list, and once every object agreed no plan was built, so a
     second comparison after Apply read "These two schemas match" with Preview disabled and the note
     nowhere (CMP-03). The empty tree says `EmptyRows::AgreesExceptNoted` then, not
-    `EverythingAgrees` (under `compare.rs`).
+    `EverythingAgrees` (under `compare.rs`). The banner reads `SchemaComparison::standing_notes()`
+    rather than `notes`, which puts each **held-back** entry's omission line first
+    (`CompareEntry::held_back` — a SQL Server sequence range the target's counter has left): that
+    line is the instruction for the one difference no plan carries, and a comparison holding only
+    that difference plans nothing, so Preview is never enabled and the omitted list it would have
+    been read in is never shown.
     **The module names no `Ui` — it is off `whole_ui_gate`'s list, 8 to zero — and the split is
     `import_view.rs`'s.** The renderers take `OverlayUi`, being the eight `compare_*` signals and
     nothing else: `open_compare`, `reset`, `body_for`, `ready_body` and `filter_bar`. The four that
@@ -23251,7 +23282,11 @@ existing prose was left alone.
     it discloses without refusing — before that, the last surface ahead of Apply counted only what
     was included and reported "Applied N statements to 1 object" over a three-difference comparison.
     Lifting the block means re-reading each body through `Db::{trigger,routine,event}_source` first —
-    open work, not something to fake in the meantime.
+    open work, not something to fake in the meantime. **A held-back entry is drawn the same way** —
+    the row's `blocked` is `needs_source() || held_back.is_some()` — with the warning triangle where
+    its tick would be and "held back from the plan; the note above says why" as its hint, the
+    sentence itself standing in the banner (above). Unlike a MySQL body there is nothing to lift
+    here: the user restarts the sequence on the target and compares again.
     **Preview never applies.** `open_plan_preview` builds the `SchemaPlan`, reads the left
     connection's `read_only` off the connection list, names it through `SchemaPlan::subject_in` —
     the count and the database it lands in, both from the plan rather than hand-rolled here — and hands it to

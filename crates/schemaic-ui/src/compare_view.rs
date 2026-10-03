@@ -673,15 +673,19 @@ fn ready_body(c: Rc<SchemaComparison>, o: OverlayUi, ring: FocusRing) -> impl In
     // after Apply read "These two schemas match" over an alias type whose
     // bound rule it had left behind. One line each, under the same banner
     // the cycle takes, since both are facts about the two schemas rather
-    // than about the ticks.
-    let notes_note: AnyView = if c.notes.is_empty() {
+    // than about the ticks. A held-back entry's reason leads them
+    // (`standing_notes`): it is the instruction for the one difference no plan
+    // will carry, and a comparison holding only that difference has no
+    // preview to read it in either.
+    let standing = c.standing_notes();
+    let notes_note: AnyView = if standing.is_empty() {
         empty().into_any()
     } else {
         h_stack((
             crate::icons::icon(crate::icons::TRIANGLE_ALERT, 12.0)
                 .style(|s| s.color(theme::plan_warn())),
-            v_stack_from_iter(c.notes.iter().map(|n| {
-                text(n.clone()).style(|s| {
+            v_stack_from_iter(standing.into_iter().map(|n| {
+                text(n).style(|s| {
                     s.font_size(theme::font_hint())
                         .color(theme::text_dim())
                         .min_width(0.0)
@@ -927,7 +931,9 @@ fn lead_box(s: floem::style::Style) -> floem::style::Style {
 /// One object: its tick, its status, its name.
 fn object_row(e: &CompareEntry, o: crate::OverlayUi) -> impl IntoView {
     let key = e.key();
-    let blocked = e.needs_source();
+    // Nothing to tick where no plan may carry the change: a body that must be
+    // re-read, or a change held back (its reason is in the banner above).
+    let blocked = e.needs_source() || e.held_back.is_some();
     let ticked = {
         let key = key.clone();
         move || o.compare_selected.with(|s| s.contains(&key))
@@ -967,7 +973,9 @@ fn object_row(e: &CompareEntry, o: crate::OverlayUi) -> impl IntoView {
     };
 
     let status = e.status;
-    let hint = if blocked {
+    let hint = if e.held_back.is_some() {
+        Some("held back from the plan; the note above says why")
+    } else if blocked {
         Some("body must be re-read before this can be applied")
     } else if e.uncertain {
         Some("an index this model reads only in part — a match here isn't certain")

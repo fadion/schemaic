@@ -245,6 +245,12 @@ pub struct CompareEntry {
     /// stands, being the best the model can do; a tree that drew it the same as
     /// a fully-read match would be overclaiming.
     pub uncertain: bool,
+    /// Why no plan may carry `changes` although they emit — the one sentence
+    /// the omitted list and the row's hint show. Set where the server would
+    /// refuse the statements and the only change it would take does damage
+    /// the comparison may not choose for the user: a sequence range its
+    /// target's counter has already left ([`held_back_sequence`]).
+    pub held_back: Option<String>,
     /// The object's `CREATE` as the **left** side has it, and empty when only
     /// the right side does.
     ///
@@ -355,10 +361,10 @@ impl CompareEntry {
         self.status == ObjectStatus::Same && self.left_ddl != self.right_ddl
     }
 
-    /// A difference this comparison **has no statement for** — it is on one
-    /// side only, or the two sides differ, and the change set is empty.
+    /// A difference this comparison **has no statement for**, or one it has
+    /// statements for and must not run ([`CompareEntry::held_back`]).
     ///
-    /// One case reaches it today: a view whose model says it is not one, which
+    /// The first shape includes a view whose model says it is not one, which
     /// is what a view definition the connecting role cannot read looks like
     /// (`empty_set` builds the set for it). `status_of` reads the change set
     /// only on a *two*-sided pair, so a one-sided one keeps `OnlyLeft` /
@@ -397,13 +403,15 @@ impl CompareEntry {
     /// whole case, and `self.changes.is_empty()` was the spelling that got it
     /// wrong.
     pub fn unplannable(&self) -> bool {
-        self.status.is_difference() && self.changes.emit().is_empty()
+        self.status.is_difference() && (self.held_back.is_some() || self.changes.emit().is_empty())
     }
 
     /// The one-line disclosure for an entry a plan cannot carry — see
     /// [`SchemaPlan::omitted`].
     fn omission_note(&self) -> String {
-        let why = if self.needs_source() {
+        let why = if let Some(why) = &self.held_back {
+            why.as_str()
+        } else if self.needs_source() {
             "its body must be re-read from the server before it can be applied"
         } else if self.changes.is_empty() {
             "this comparison has no statement for it — its definition could not be read"
@@ -1104,6 +1112,24 @@ impl SchemaComparison {
         } else {
             EmptyRows::NoMatch
         }
+    }
+
+    /// What the comparison view says above its tree, whatever is ticked: each
+    /// held-back entry's reason ([`CompareEntry::held_back`]), then [`notes`].
+    ///
+    /// Both reach a plan's omitted list too, but that list is only read in the
+    /// preview, and a comparison whose one difference is held back plans
+    /// nothing, so Preview is never enabled. The reason, which is also the
+    /// instruction ("restart it on the target"), would have had nowhere to be
+    /// read.
+    ///
+    /// [`notes`]: SchemaComparison::notes
+    pub fn standing_notes(&self) -> Vec<String> {
+        self.differences()
+            .filter(|e| e.held_back.is_some())
+            .map(CompareEntry::omission_note)
+            .chain(self.notes.iter().cloned())
+            .collect()
     }
 
     /// The tree's rows, grouped by kind and filtered.
@@ -2660,6 +2686,7 @@ fn table_entry(
             .unwrap_or_else(|| status_of(l.is_some(), r.is_some(), &changes)),
         changes,
         uncertain,
+        held_back: None,
         left_ddl,
         right_ddl,
     }
@@ -2713,6 +2740,7 @@ fn trigger_entry(
         status: status_of(l.is_some(), r.is_some(), &changes),
         changes,
         uncertain: false,
+        held_back: None,
         left_ddl: side_ddl(l, |t| t.create_sql(dialect)),
         right_ddl: side_ddl(r, |t| t.create_sql(dialect)),
     }
@@ -2782,6 +2810,7 @@ fn routine_entry(
             .unwrap_or_else(|| status_of(l.is_some(), r.is_some(), &changes)),
         changes,
         uncertain: (unread_source && l.is_some()) || members_differ,
+        held_back: None,
         left_ddl,
         right_ddl,
     }
@@ -2804,6 +2833,7 @@ fn event_entry(l: Option<&EventInfo>, r: Option<&EventInfo>, dialect: SqlDialect
         status: status_of(l.is_some(), r.is_some(), &changes),
         changes,
         uncertain: false,
+        held_back: None,
         left_ddl: side_ddl(l, |e| e.create_sql(dialect)),
         right_ddl: side_ddl(r, |e| e.create_sql(dialect)),
     }
@@ -2839,6 +2869,7 @@ fn enum_entry(
         status: status_of(l.is_some(), r.is_some(), &changes),
         changes,
         uncertain: false,
+        held_back: None,
         left_ddl: side_ddl(l, |e| e.create_sql(dialect)),
         right_ddl: side_ddl(r, |e| e.create_sql(dialect)),
     }
@@ -2871,6 +2902,7 @@ fn domain_entry(
         status: status_of(l.is_some(), r.is_some(), &changes),
         changes,
         uncertain: false,
+        held_back: None,
         left_ddl: side_ddl(l, |d| d.create_sql(dialect)),
         right_ddl: side_ddl(r, |d| d.create_sql(dialect)),
     }
@@ -2899,6 +2931,7 @@ fn sequence_entry(
         status: status_of(l.is_some(), r.is_some(), &changes),
         changes,
         uncertain: false,
+        held_back: None,
         left_ddl: side_ddl(l, |s| s.create_sql(dialect)),
         right_ddl: side_ddl(r, |s| s.create_sql(dialect)),
     }
@@ -2969,11 +3002,52 @@ fn tsql_entry(
         table: None,
         signature: None,
         status: status_of(l.is_some(), r.is_some(), &changes),
+        held_back: held_back_sequence(&changes),
         changes,
         uncertain: false,
         left_ddl: side_ddl(l, |t| t.create_sql()),
         right_ddl: side_ddl(r, |t| t.create_sql()),
     }
+}
+
+/// Why a sequence's change must stay out of every plan: it alters the range in
+/// place, and the target's counter has already left the new one.
+///
+/// `ALTER SEQUENCE … MINVALUE`/`MAXVALUE` is refused while the counter lies
+/// outside the bounds it names (Msg 11704, measured on 2022), and the
+/// migration rolls back at that statement. The server would take it with a
+/// `RESTART WITH` a value inside them, or as a re-create, and either hands
+/// out again numbers the tables may already hold — a choice about the user's
+/// data this comparison has no business making for them. So the entry is held
+/// back with the sentence that says what to do. A re-create (a new type or
+/// start) starts a fresh counter and is not asked about here; a counter never
+/// used is the start, which `tsql_entry` keeps only inside the range.
+fn held_back_sequence(changes: &ChangeSet) -> Option<String> {
+    changes.changes.iter().find_map(|c| match c {
+        Change::AlterTsqlSequence {
+            from,
+            to,
+            restart: None,
+        } => match (&from.kind, &to.kind) {
+            (
+                TsqlObjectKind::Sequence {
+                    last_used: Some(at),
+                    ..
+                },
+                TsqlObjectKind::Sequence { min, max, .. },
+            ) if !within(at, min, max) => Some(format!(
+                "the target's counter has reached {}, outside the new range {} to {}, and the \
+                 server refuses to narrow a sequence past a value it has handed out. Restart it \
+                 on the target (ALTER SEQUENCE … RESTART WITH) at a value no table holds, then \
+                 compare again",
+                at.trim(),
+                min.trim(),
+                max.trim()
+            )),
+            _ => None,
+        },
+        _ => None,
+    })
 }
 
 /// Does a sequence value lie in `[min, max]`? The catalogue's text, read as
@@ -3696,6 +3770,7 @@ mod tests {
             status,
             changes: empty_set("secret_v", None, SqlDialect::MySql),
             uncertain: false,
+            held_back: None,
             left_ddl: String::new(),
             right_ddl: String::new(),
         };
@@ -3728,6 +3803,7 @@ mod tests {
                 status: ObjectStatus::OnlyRight,
                 changes: empty_set("secret_v", None, SqlDialect::MySql),
                 uncertain: false,
+                held_back: None,
                 left_ddl: String::new(),
                 right_ddl: String::new(),
             }],
@@ -3807,6 +3883,7 @@ mod tests {
             status: ObjectStatus::Differing,
             changes: set,
             uncertain: false,
+            held_back: None,
             left_ddl: String::new(),
             right_ddl: String::new(),
         };
@@ -5102,6 +5179,69 @@ mod tests {
             seq("bigint", "1", "1", "2000"),
         );
         assert_eq!(s, "ALTER SEQUENCE [dbo].[order_no] MAXVALUE 2000;");
+    }
+
+    /// **A range the target's counter has already left is held back, not
+    /// planned.** Starts that agree leave the sequence altered in place, and
+    /// `ALTER SEQUENCE … MAXVALUE 2000` over a counter that has handed out
+    /// 5000 is Msg 11704 — the migration rolled back at that statement. A
+    /// `RESTART` or a re-create would make the server take it, and would hand
+    /// out again values the tables already hold, so the comparison does
+    /// neither: the entry is left out of every plan, and its omission says
+    /// why and what to do. A counter inside the range, or one never used,
+    /// alters as before; a re-create starts a fresh counter and is not held.
+    #[test]
+    fn a_range_the_targets_counter_has_left_is_held_back() {
+        use crate::schema::TsqlObjectKind as T;
+        let seq = |min: &str, max: &str, last: Option<&str>| {
+            let mut s = tsql_sequence("1", last);
+            if let T::Sequence {
+                min: lo, max: hi, ..
+            } = &mut s.kind
+            {
+                *lo = min.into();
+                *hi = max.into();
+            }
+            s
+        };
+        let big = "9223372036854775807";
+        let compare = |target: TsqlObject, source: TsqlObject| {
+            SchemaComparison::of(
+                &with_tsql(vec![], vec![target]),
+                &with_tsql(vec![], vec![source]),
+                SqlDialect::MsSql,
+            )
+        };
+        let c = compare(seq("1", big, Some("5000")), seq("1", "2000", None));
+        let e = find(&c, "sequence:dbo.order_no");
+        assert_eq!(e.status, ObjectStatus::Differing);
+        assert!(e.unplannable(), "{:?}", e.changes.emit());
+        let plan = c.plan(|_| true);
+        assert!(plan.emit().is_empty(), "{:?}", plan.emit());
+        assert_eq!(plan.omitted.len(), 1, "{:?}", plan.omitted);
+        assert!(
+            plan.omitted[0].contains("5000") && plan.omitted[0].contains("RESTART"),
+            "{:?}",
+            plan.omitted
+        );
+        // And said where it can be read with nothing to plan: the omitted
+        // list belongs to a preview that a lone held-back entry never opens.
+        assert_eq!(c.standing_notes(), plan.omitted);
+        // Below a raised minimum, the same.
+        let c = compare(seq("1", big, Some("5")), seq("100", big, None));
+        assert!(find(&c, "sequence:dbo.order_no").unplannable());
+        // Inside the new range, or never used: altered as before.
+        let c = compare(seq("1", big, Some("1500")), seq("1", "2000", None));
+        assert!(!find(&c, "sequence:dbo.order_no").unplannable());
+        let c = compare(seq("1", big, None), seq("1", "2000", None));
+        assert!(!find(&c, "sequence:dbo.order_no").unplannable());
+        // A type change re-creates it, with a fresh counter: not held.
+        let mut source = seq("1", "2000", None);
+        if let T::Sequence { data_type, .. } = &mut source.kind {
+            *data_type = "int".into();
+        }
+        let c = compare(seq("1", big, Some("5000")), source);
+        assert!(!find(&c, "sequence:dbo.order_no").unplannable());
     }
 
     /// **A synonym naming its own database is re-addressed like a foreign
