@@ -4794,6 +4794,19 @@ impl Catalog {
             // from `tables` (`DbSchema::tsql_objects`), so a query through one
             // was "Table not found". One over this database's own table
             // carries its columns; any other is known by name alone.
+            //
+            // **Added to a same-named table's columns, never over them**
+            // (S4.2-L1-04): `(database, name)` and a bare name are shared with
+            // the tables of every schema, and a synonym `dbo.orders` replacing
+            // `sales.orders`' entry made a correct three-part reference to the
+            // table a "Column not found" — the merge same-named tables get.
+            let merge = |entry: &mut Vec<String>, cols: &[String]| {
+                for c in cols {
+                    if !entry.iter().any(|e| e.eq_ignore_ascii_case(c)) {
+                        entry.push(c.clone());
+                    }
+                }
+            };
             for (syn, target) in schema.synonyms(db) {
                 let name_lower = syn.name.to_ascii_lowercase();
                 known_idents.insert(name_lower.clone());
@@ -4801,13 +4814,18 @@ impl Catalog {
                 match target {
                     Some(t) => {
                         let cols: Vec<String> = t.columns.iter().map(|c| c.name.clone()).collect();
-                        qualified.insert((db_lower.clone(), name_lower.clone()), cols.clone());
+                        merge(
+                            qualified
+                                .entry((db_lower.clone(), name_lower.clone()))
+                                .or_default(),
+                            &cols,
+                        );
                         if in_scope {
                             if let Some(ns) = ns_lower {
                                 known_schemas.insert(ns.clone());
                                 schema_qualified.insert((ns, name_lower.clone()), cols.clone());
                             }
-                            unqualified.entry(name_lower).or_insert(cols);
+                            merge(unqualified.entry(name_lower).or_default(), &cols);
                         }
                     }
                     None => {
@@ -16870,6 +16888,48 @@ mod tests {
             messages("SELECT id FROM dbo.no_syn;"),
             ["Table `no_syn` not found in `dbo`"]
         );
+    }
+
+    /// **A synonym sharing a table's name adds to its columns, never replaces
+    /// them** (S4.2-L1-04): in `hist`, table `sales.orders (id, total)` and
+    /// synonym `dbo.orders` over `dbo.orders_archive (id, archived_at)` — the
+    /// synonym overwrote the table's `(hist, orders)` entry, so the correct
+    /// `SELECT total FROM hist.sales.orders` read "Column `total` not found".
+    /// Uncertainty never yields a false positive, as same-named tables merge.
+    #[test]
+    fn a_synonym_sharing_a_tables_name_adds_to_its_columns() {
+        use crate::schema::{TsqlObject, TsqlObjectKind};
+        let hist = DbSchema {
+            tables: vec![
+                tbl_in("sales", "orders", &["id", "total"]),
+                tbl_in("dbo", "orders_archive", &["id", "archived_at"]),
+            ],
+            tsql_objects: vec![TsqlObject {
+                schema: Some("dbo".into()),
+                name: "orders".into(),
+                kind: TsqlObjectKind::Synonym {
+                    target: vec!["dbo".into(), "orders_archive".into()],
+                },
+            }],
+            ..Default::default()
+        };
+        let app = DbSchema {
+            tables: vec![tbl_in("dbo", "t", &["id"])],
+            ..Default::default()
+        };
+        for active in ["app", "hist"] {
+            let cat = Catalog::build(&[("app", &app), ("hist", &hist)], Some(active));
+            for sql in [
+                "SELECT total FROM hist.sales.orders;",
+                "SELECT archived_at FROM hist.dbo.orders;",
+            ] {
+                let found = diagnostics(sql, &cat, SqlDialect::MsSql);
+                assert!(found.is_empty(), "{active}: {sql}: {found:?}");
+            }
+        }
+        let cat = Catalog::build(&[("app", &app), ("hist", &hist)], Some("hist"));
+        let found = diagnostics("SELECT archived_at FROM orders;", &cat, SqlDialect::MsSql);
+        assert!(found.is_empty(), "{found:?}");
     }
 
     /// **A T-SQL three-part name is `database.schema.table`.** It was read as

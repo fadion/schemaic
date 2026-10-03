@@ -1180,7 +1180,11 @@ existing prose was left alone.
     `Found` while `columns_of` stays `None`, and the column checks read that as can't-judge. That is
     the three-part name's rule again: a relation whose columns are unknown may let a wrong column
     through but must never report a real one missing
-    (`a_synonym_is_a_relation_with_its_targets_columns`, red before).
+    (`a_synonym_is_a_relation_with_its_targets_columns`, red before). By the same rule a resolved
+    synonym's columns are **merged** into a same-named table's `(database, name)` and bare-name
+    entries, never written over them — as same-named tables merge — since `dbo.orders` replacing
+    `sales.orders`' entry made the correct `SELECT total FROM hist.sales.orders` a "Column not
+    found" (`a_synonym_sharing_a_tables_name_adds_to_its_columns`, S4.2-L1-04, red before).
     **`NON_RESERVED_KEYWORDS` is legal keywords one edit from a curated one**, which the typo
     checker would otherwise flag. It is dialect-free, since each is legal on some engine here and
     which engine has which is `builtin_catalog`'s half of the question. The list was widened by
@@ -21711,12 +21715,15 @@ existing prose was left alone.
     **A SQL Server synonym is offered as a table** — it was not offered at all, being held in
     `tsql_objects` apart from `tables`. `index::build` reads `DbSchema::synonyms` (under
     `schema.rs`) and puts each into `tables_by_db`, and into `tables` where its database is in
-    scope; one resolved to this database's own table or view shares that table's `ColMeta`s in
+    scope; one resolved to this database's own table or view gets that table's `ColMeta`s in
     `columns_by_db` and `columns`, and any other gets none rather than a guessed table's
-    (`a_synonym_is_offered_with_its_targets_columns`, red before). The
-    synonym loop runs **after** the tables loop on purpose: it takes the target's columns out of
-    `columns_by_db` by cloning the `Rc` the table just inserted, so moved ahead of it every synonym
-    would silently lose its columns.
+    (`a_synonym_is_offered_with_its_targets_columns`, red before). **Built from the resolved table
+    itself** (`col_metas`, the tables loop's own rule), not looked up under the target's
+    `(database, name)`, which holds whichever same-named table was indexed last: a synonym over
+    `dbo.docs` beside a later `sales.docs` was offered `sales.docs`' columns, which diagnostics then
+    squiggled — and **merged** into a same-named table's entries rather than written over them,
+    as the diagnostics catalogue does (`a_synonym_is_offered_its_resolved_tables_columns`,
+    S4.2-L1-05, red before).
   - `tabs.rs` — query-tab strip, and where a **`.sql`-backed tab** shows itself. The state behind
     that is four signals on `Tab`: `path`, `disk_sql` (the file's text as of the last open / save /
     reload — `None` means *unknown*, which reads as modified, the safe direction), `file_format`

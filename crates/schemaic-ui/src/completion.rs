@@ -284,6 +284,33 @@ fn catalog_of(
 mod index {
     use super::*;
 
+    /// A table's columns as completion offers them — a synonym's built from
+    /// the table it resolves to, by the same rule.
+    fn col_metas(t: &schemaic_core::schema::TableInfo) -> Rc<Vec<ColMeta>> {
+        // Is this column covered by a foreign key (→ the FK tint)? A linear
+        // scan of the table's FK columns, which number a handful: building a
+        // lowercased `HashSet` cost an allocation per FK column *and* one per
+        // column looked up.
+        let is_fk = |name: &str| {
+            t.foreign_keys
+                .iter()
+                .flat_map(|fk| fk.columns.iter())
+                .any(|c| c.eq_ignore_ascii_case(name))
+        };
+        Rc::new(
+            t.columns
+                .iter()
+                .map(|c| ColMeta {
+                    name: c.name.clone(),
+                    type_name: c.type_name.clone(),
+                    nullable: c.nullable,
+                    primary_key: c.primary_key,
+                    foreign_key: is_fk(&c.name),
+                })
+                .collect(),
+        )
+    }
+
     /// Build the completion index. When `active_db` is `Some`, the *unqualified*
     /// suggestion pool (`tables`/`columns`) is scoped to that database, so a tab with
     /// a selected database isn't polluted by every other database's tables.
@@ -321,28 +348,7 @@ mod index {
                 let in_scope = active_db.is_none_or(|db| db.eq_ignore_ascii_case(&node.database));
                 for t in &schema.tables {
                     by_db.push(t.name.clone());
-                    // Is this column covered by a foreign key (→ the FK tint)? A
-                    // linear scan of the table's FK columns, which number a handful:
-                    // building a lowercased `HashSet` cost an allocation per FK
-                    // column *and* one per column looked up.
-                    let is_fk = |name: &str| {
-                        t.foreign_keys
-                            .iter()
-                            .flat_map(|fk| fk.columns.iter())
-                            .any(|c| c.eq_ignore_ascii_case(name))
-                    };
-                    let metas: Rc<Vec<ColMeta>> = Rc::new(
-                        t.columns
-                            .iter()
-                            .map(|c| ColMeta {
-                                name: c.name.clone(),
-                                type_name: c.type_name.clone(),
-                                nullable: c.nullable,
-                                primary_key: c.primary_key,
-                                foreign_key: is_fk(&c.name),
-                            })
-                            .collect(),
-                    );
+                    let metas = col_metas(t);
                     // Every database's columns are keyed by (db, table) for qualified
                     // (incl. cross-database) completion.
                     columns_by_db.insert(
@@ -369,23 +375,41 @@ mod index {
                 // A SQL Server synonym is offered as a table, with its target's
                 // columns where the target is this database's own table
                 // (`DbSchema::synonyms`), none otherwise.
+                //
+                // **The resolved table's own columns** (S4.2-L1-05), not the
+                // `(db, name)` entry's, which holds whichever same-named table
+                // was indexed last — `sales.docs` for a synonym over
+                // `dbo.docs`, offering columns diagnostics then squiggled. And
+                // merged into a same-named table's entries, never over them, as
+                // the diagnostics catalogue does.
+                let merge = |entry: &mut Vec<ColMeta>, metas: &[ColMeta]| {
+                    for m in metas {
+                        if !entry.iter().any(|e| e.name.eq_ignore_ascii_case(&m.name)) {
+                            entry.push(m.clone());
+                        }
+                    }
+                };
                 for (syn, target) in schema.synonyms(&node.database) {
                     by_db.push(syn.name.clone());
                     let name_lower = syn.name.to_ascii_lowercase();
-                    let metas = target.and_then(|t| {
-                        columns_by_db
-                            .get(&(db_lower.clone(), t.name.to_ascii_lowercase()))
-                            .cloned()
-                    });
+                    let metas = target.map(col_metas);
                     if let Some(m) = &metas {
-                        columns_by_db.insert((db_lower.clone(), name_lower.clone()), m.clone());
+                        let key = (db_lower.clone(), name_lower.clone());
+                        match columns_by_db.get(&key) {
+                            Some(have) => {
+                                let mut all: Vec<ColMeta> = have.iter().cloned().collect();
+                                merge(&mut all, m);
+                                columns_by_db.insert(key, Rc::new(all));
+                            }
+                            None => {
+                                columns_by_db.insert(key, m.clone());
+                            }
+                        }
                     }
                     if in_scope {
                         tables.push((syn.name.clone(), node.database.clone()));
                         if let Some(m) = metas {
-                            columns
-                                .entry(name_lower)
-                                .or_insert_with(|| m.iter().cloned().collect());
+                            merge(columns.entry(name_lower).or_default(), &m);
                         }
                     }
                 }
@@ -2173,6 +2197,40 @@ mod index_tests {
             ["id", "c"]
         );
         assert!(!ix.columns.contains_key("far_syn"));
+    }
+
+    /// **A synonym is offered the columns of the table it resolves to**
+    /// (S4.2-L1-05), not of whichever same-named table the index met last:
+    /// over `dbo.docs (x, y)` beside a later `sales.docs (a, b)`, `s` offered
+    /// `a, b`, which diagnostics then squiggled.
+    #[test]
+    fn a_synonym_is_offered_its_resolved_tables_columns() {
+        use schemaic_core::schema::{TsqlObject, TsqlObjectKind};
+        let mut dbo = tbl("docs", &["x", "y"], None);
+        dbo.schema = Some("dbo".into());
+        let mut sales = tbl("docs", &["a", "b"], None);
+        sales.schema = Some("sales".into());
+        let nodes = [LoadedNode {
+            database: "main".into(),
+            schema: Some(Arc::new(DbSchema {
+                tables: vec![dbo, sales],
+                tsql_objects: vec![TsqlObject {
+                    schema: Some("dbo".into()),
+                    name: "s".into(),
+                    kind: TsqlObjectKind::Synonym {
+                        target: vec!["dbo".into(), "docs".into()],
+                    },
+                }],
+                ..Default::default()
+            })),
+        }];
+        let ix = index::build(&nodes, &HashSet::new(), Some("main"));
+        let names = |cols: &[ColMeta]| cols.iter().map(|c| c.name.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&ix.columns["s"]), ["x", "y"]);
+        assert_eq!(
+            names(&ix.columns_by_db[&("main".to_string(), "s".to_string())]),
+            ["x", "y"]
+        );
     }
 
     /// The database list dedupes case-insensitively — two connections onto the
