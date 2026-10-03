@@ -6808,7 +6808,16 @@ existing prose was left alone.
     editor's differ sees it — the same differ, not a second one — and a sequence re-created for a
     real difference, a type, starts where the target's did
     (`a_restarted_sequence_is_the_same_sequence`; live,
-    `a_sequence_restart_is_honoured_and_not_compared`). **An alias type's bound rule or default is
+    `a_sequence_restart_is_honoured_and_not_compared`). **Only where the source's range holds
+    it** (`within`, over the catalogue's text as `i128`): a target at `START 1 MINVALUE 1` gave a
+    source at `START 1000 MINVALUE 1000` its 1, so a retype created `START WITH 1 … MINVALUE 1000`
+    (Msg 11703) and an unchanged type altered `MINVALUE 1000` under a counter still at 1
+    (Msg 11704), and the migration rolled back. A start the source cannot hold is no restart to
+    honour, so the source's own stands and the sequence is re-created there; a bound that does not
+    parse answers the same way (`a_target_start_outside_the_sources_range_is_not_kept`; live, the
+    same test's last half). The counter is not asked: where the two starts already agree and the
+    target's counter has run past a lowered `MAXVALUE`, the `ALTER` carries no `RESTART WITH` and
+    is refused (Msg 11704), as it always was. **An alias type's bound rule or default is
     not compared or carried** — the rule or default is an object of its own, and the comparison
     creates none — so it made the type bare and then called the two databases the same, a loss the
     dump names in its header (S4.2-L1-07). It is said instead: `SchemaComparison::binding_notes`

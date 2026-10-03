@@ -2692,6 +2692,15 @@ fn sequence_entry(
 /// side takes the left's start before the editor's differ sees it, so one
 /// re-created for a real difference starts where the target's did.
 ///
+/// **Only where the source's range holds it** ([`within`]). A target at
+/// `START 1 MINVALUE 1` against a source at `START 1000 MINVALUE 1000` gave
+/// the source the 1, so a type change created `START WITH 1 … MINVALUE
+/// 1000` (Msg 11703) and an unchanged type altered `MINVALUE 1000` under a
+/// counter still at 1 (Msg 11704), and the migration rolled back (both
+/// measured on 2022). A start the source's definition cannot hold is not a
+/// restart to honour; the source's own stands, and the sequence is
+/// re-created there.
+///
 /// **A synonym's target compares as the target database's names do**
 /// (`fold`): two synonyms naming `[dbo].[Orders]` and `[dbo].[orders]` on a
 /// case-insensitive database are the same synonym, and were replaced —
@@ -2710,8 +2719,10 @@ fn tsql_entry(
             match (&l.kind, &mut r.kind) {
                 (
                     TsqlObjectKind::Sequence { start: kept, .. },
-                    TsqlObjectKind::Sequence { start, .. },
-                ) => start.clone_from(kept),
+                    TsqlObjectKind::Sequence {
+                        start, min, max, ..
+                    },
+                ) if within(kept, min, max) => start.clone_from(kept),
                 (TsqlObjectKind::Synonym { target: kept }, TsqlObjectKind::Synonym { target })
                     if fold
                         && kept.len() == target.len()
@@ -2743,6 +2754,19 @@ fn tsql_entry(
         uncertain: false,
         left_ddl: side_ddl(l, |t| t.create_sql()),
         right_ddl: side_ddl(r, |t| t.create_sql()),
+    }
+}
+
+/// Does a sequence value lie in `[min, max]`? The catalogue's text, read as
+/// `i128` — a `decimal(38,0)` bound fits, being under 10^38. A value that
+/// does not parse answers no, so the source's own start stands: a
+/// re-created sequence is a plan the server takes, and one built around a
+/// start it cannot place is not.
+fn within(value: &str, min: &str, max: &str) -> bool {
+    let n = |s: &str| s.trim().parse::<i128>().ok();
+    match (n(value), n(min), n(max)) {
+        (Some(v), Some(lo), Some(hi)) => lo <= v && v <= hi,
+        _ => false,
     }
 }
 
@@ -4550,6 +4574,75 @@ mod tests {
             sql.contains("AS int") && sql.contains("START WITH 5000"),
             "{sql}"
         );
+    }
+
+    /// **The target's start is kept only where the source's range holds
+    /// it**: a source at `START 1000 MINVALUE 1000` against a target at
+    /// `START 1 MINVALUE 1` took the target's 1, so a type change created
+    /// `START WITH 1 … MINVALUE 1000` (Msg 11703) and an unchanged type
+    /// altered `MINVALUE 1000` under a counter at 1 (Msg 11704) — both
+    /// measured on 2022, and the whole migration rolled back. Out of range,
+    /// the source's own start stands, and the sequence is re-created there.
+    #[test]
+    fn a_target_start_outside_the_sources_range_is_not_kept() {
+        use crate::schema::TsqlObjectKind as T;
+        let seq = |ty: &str, start: &str, min: &str, max: &str| {
+            let mut s = tsql_sequence("1", None);
+            if let T::Sequence {
+                data_type,
+                start: st,
+                min: lo,
+                max: hi,
+                ..
+            } = &mut s.kind
+            {
+                *data_type = ty.into();
+                *st = start.into();
+                *lo = min.into();
+                *hi = max.into();
+            }
+            s
+        };
+        let big = "9223372036854775807";
+        let sql = |target: TsqlObject, source: TsqlObject| {
+            let c = SchemaComparison::of(
+                &with_tsql(vec![], vec![target]),
+                &with_tsql(vec![], vec![source]),
+                SqlDialect::MsSql,
+            );
+            let e = find(&c, "sequence:dbo.order_no");
+            assert_eq!(e.status, ObjectStatus::Differing);
+            e.changes.emit().join("\n")
+        };
+        // Below the source's minimum, with a type change and without one.
+        let s = sql(
+            seq("bigint", "1", "1", big),
+            seq("int", "1000", "1000", "2147483647"),
+        );
+        assert!(s.contains("START WITH 1000"), "{s}");
+        let s = sql(
+            seq("bigint", "1", "1", big),
+            seq("bigint", "1000", "1000", big),
+        );
+        assert!(
+            s.contains("CREATE SEQUENCE") && s.contains("START WITH 1000"),
+            "{s}"
+        );
+        // A target restarted past the source's maximum.
+        let s = sql(
+            seq("bigint", "5000", "1", big),
+            seq("bigint", "1", "1", "2000"),
+        );
+        assert!(
+            s.contains("CREATE SEQUENCE") && s.contains("START WITH 1\n"),
+            "{s}"
+        );
+        // Within it, the target's start still stands (S4.2-L1-01).
+        let s = sql(
+            seq("bigint", "500", "1", big),
+            seq("bigint", "1", "1", "2000"),
+        );
+        assert_eq!(s, "ALTER SEQUENCE [dbo].[order_no] MAXVALUE 2000;");
     }
 
     /// **A synonym naming its own database is re-addressed like a foreign

@@ -5188,6 +5188,34 @@ async fn a_sequence_restart_is_honoured_and_not_compared() {
         .filter(|k| k.contains("dbo.c"))
         .collect();
     assert!(differing.is_empty(), "{differing:?}");
+
+    // A target start the source's range cannot hold is not kept (Msg 11703
+    // on the retyped one, 11704 on the other), so the plan applies and both
+    // start where the source's do.
+    s.exec(
+        "CREATE SEQUENCE dbo.lo AS bigint START WITH 1 MINVALUE 1; \
+         CREATE SEQUENCE dbo.lo_int AS bigint START WITH 1 MINVALUE 1",
+    )
+    .await;
+    other
+        .exec(
+            "CREATE SEQUENCE dbo.lo AS bigint START WITH 1000 MINVALUE 1000; \
+             CREATE SEQUENCE dbo.lo_int AS int START WITH 1000 MINVALUE 1000",
+        )
+        .await;
+    let plan = SchemaComparison::of(&read(s).await, &read(&other).await, MS)
+        .plan(|e| e.key().starts_with("sequence:dbo.lo"));
+    let stmts = plan.emit();
+    s.db.run_ddl(&s.name, &stmts, CancellationToken::new())
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{}", stmts.join("\n")));
+    for q in ["dbo.lo", "dbo.lo_int"] {
+        assert_eq!(
+            s.scalar(&format!("SELECT NEXT VALUE FOR {q}")).await,
+            "1000",
+            "{q}"
+        );
+    }
 }
 
 /// **An empty schema is a namespace like any other** (S2-L1-01/02): read off
