@@ -5201,12 +5201,14 @@ existing prose was left alone.
     the first column only; back to rowstore clears `clustered` only when the index was another kind.
     A **selective** XML index was read `lossy` until `using` held its paths (under `mssql.rs`).
     **The preview's line for an added index names its kind and every list it carries** —
-    `Change::summary` writes *"Add [unique] [kind] index ix on (keys) including (…) ordered by
-    (…)"*, the kind from `IndexStorage::summary_noun` (none for rowstore), the `on (…)` left out
-    when there are no keys and an expression key shown as its SQL. It once wrote the key column
-    names alone, so a clustered columnstore index read *"Add index ix_cs on ()"*, as did a
-    PostgreSQL expression index, and an edit of an index's includes, order or kind previewed as a
-    drop and an add of the same line (`an_added_index_is_summarised_with_its_kind_and_columns`).
+    `Change::summary` writes *"Add [unique] [kind] index ix [using method] on (keys [desc])
+    including (…) ordered by (…) [where filter]"*, the kind from `IndexStorage::summary_noun` (none
+    for rowstore), a method that is no such kind — PostgreSQL's `gist`, `gin` — as `using`, the
+    `on (…)` left out when there are no keys and an expression key shown as its SQL. It once wrote
+    the key column names alone, so a clustered columnstore index read *"Add index ix_cs on ()"*, as
+    did a PostgreSQL expression index, and an edit of an index's includes, order or kind — and,
+    until S3.1-L1-04, its method, a key's direction or its filter — previewed as a drop and an add
+    of the same line (`an_added_index_is_summarised_with_its_kind_and_columns`).
     Ordering
     is dependency-first (FKs and indexes off before the columns under them; keys back on
     after), and **the column clauses inside that are ordered by their dependencies rather than

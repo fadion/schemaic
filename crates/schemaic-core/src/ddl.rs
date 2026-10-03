@@ -3949,10 +3949,29 @@ impl Change {
                     s.push(' ');
                 }
                 s.push_str(&format!("index {}", ix.name));
+                // A method that is not one of SQL Server's kinds (named above)
+                // is the access method itself — PostgreSQL's `gist`, `gin` —
+                // and a key's direction and a filter are the statement's too:
+                // each read the same before and after an edit (S3.1-L1-04).
+                if IndexStorage::of(ix).summary_noun().is_none()
+                    && let Some(m) = ix.method.as_deref().filter(|m| !m.is_empty())
+                {
+                    s.push_str(&format!(" using {m}"));
+                }
                 let list = |names: Vec<&str>| names.join(", ");
                 if !ix.columns.is_empty() {
-                    let keys = ix.columns.iter().map(|c| c.name.as_str()).collect();
-                    s.push_str(&format!(" on ({})", list(keys)));
+                    let keys: Vec<String> = ix
+                        .columns
+                        .iter()
+                        .map(|c| {
+                            if c.descending {
+                                format!("{} desc", c.name)
+                            } else {
+                                c.name.clone()
+                            }
+                        })
+                        .collect();
+                    s.push_str(&format!(" on ({})", keys.join(", ")));
                 }
                 if !ix.include.is_empty() {
                     let cols = ix.include.iter().map(String::as_str).collect();
@@ -3961,6 +3980,9 @@ impl Change {
                 if !ix.order.is_empty() {
                     let cols = ix.order.iter().map(String::as_str).collect();
                     s.push_str(&format!(" ordered by ({})", list(cols)));
+                }
+                if let Some(p) = ix.predicate.as_deref().filter(|p| !p.trim().is_empty()) {
+                    s.push_str(&format!(" where {}", p.trim()));
                 }
                 s
             }
@@ -19495,6 +19517,29 @@ mod tests {
         assert_eq!(
             summary(IndexInfo::plain("ix_a", vec!["a", "b"], false)),
             "Add index ix_a on (a, b)"
+        );
+        // A PostgreSQL method, a key's direction and a filter (S3.1-L1-04):
+        // each read the same before and after an edit of it.
+        assert_eq!(
+            summary(IndexInfo {
+                method: Some("gist".into()),
+                ..IndexInfo::plain("ix_g", vec!["a"], false)
+            }),
+            "Add index ix_g using gist on (a)"
+        );
+        assert_eq!(
+            summary(IndexInfo {
+                columns: vec![
+                    IndexColumn {
+                        descending: true,
+                        ..IndexColumn::plain("a")
+                    },
+                    IndexColumn::plain("b"),
+                ],
+                predicate: Some("a > 0".into()),
+                ..IndexInfo::plain("ix_f", Vec::<&str>::new(), false)
+            }),
+            "Add index ix_f on (a desc, b) where a > 0"
         );
         assert_eq!(
             summary(IndexInfo::plain("uq_c", vec!["c"], true)),
