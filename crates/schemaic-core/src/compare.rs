@@ -638,6 +638,9 @@ impl SchemaComparison {
         // diverges from MySQL's in ways that lose a column's own CHECK, and it
         // is the *left* server that will read the statements.
         let target = Target::new(dialect, left.flavour);
+        // The target's names decide whether two that differ in case are one
+        // (`pair`, `tsql_entry`): it is where the plan runs.
+        let fold = left.names_ignore_case;
         // The right side read as if it had come from the left side's database.
         // Two identical databases are identical here and not one object earlier;
         // see [`as_read_from`] for what rides on the difference. Every read below
@@ -675,6 +678,7 @@ impl SchemaComparison {
             )
         };
         for (l, r) in pair(
+            fold,
             left.tables.iter().map(|t| (table_key(t), t)),
             right.tables.iter().map(|t| (table_key(t), t)),
         ) {
@@ -690,6 +694,7 @@ impl SchemaComparison {
         let trigger_key =
             |t: &TriggerInfo| format!("{}.{}", display_name(t.schema.as_deref(), &t.table), t.name);
         for (l, r) in pair(
+            fold,
             left.tables
                 .iter()
                 .flat_map(|t| t.triggers.iter())
@@ -717,6 +722,7 @@ impl SchemaComparison {
             )
         };
         for (l, r) in pair(
+            fold,
             left.routines.iter().map(|r| (routine_key(r), r.as_ref())),
             right.routines.iter().map(|r| (routine_key(r), r.as_ref())),
         ) {
@@ -726,6 +732,7 @@ impl SchemaComparison {
         // ── events ──────────────────────────────────────────────────────────
         let event_key = |e: &EventInfo| display_name(e.schema.as_deref(), &e.name);
         for (l, r) in pair(
+            fold,
             left.events.iter().map(|e| (event_key(e), e.as_ref())),
             right.events.iter().map(|e| (event_key(e), e.as_ref())),
         ) {
@@ -735,6 +742,7 @@ impl SchemaComparison {
         // ── standalone types ────────────────────────────────────────────────
         let enum_key = |e: &EnumInfo| display_name(e.schema.as_deref(), &e.name);
         for (l, r) in pair(
+            fold,
             left.enums.iter().map(|e| (enum_key(e), e)),
             right.enums.iter().map(|e| (enum_key(e), e)),
         ) {
@@ -743,6 +751,7 @@ impl SchemaComparison {
 
         let domain_key = |d: &DomainInfo| display_name(d.schema.as_deref(), &d.name);
         for (l, r) in pair(
+            fold,
             left.domains.iter().map(|d| (domain_key(d), d)),
             right.domains.iter().map(|d| (domain_key(d), d)),
         ) {
@@ -756,6 +765,7 @@ impl SchemaComparison {
         let seq_key = |s: &SequenceInfo| display_name(s.schema.as_deref(), &s.name);
         let standalone = |s: &&SequenceInfo| s.owned_by.is_none();
         for (l, r) in pair(
+            fold,
             left.sequences
                 .iter()
                 .filter(standalone)
@@ -789,18 +799,45 @@ impl SchemaComparison {
                     .collect()
             }
             for (l, r) in pair(
+                fold,
                 of_kind(left, ok).into_iter(),
                 of_kind(right, ok).into_iter(),
             ) {
-                entries.push(tsql_entry(ck, ok, l, r));
+                entries.push(tsql_entry(ck, ok, l, r, fold));
             }
         }
 
         // ── order ───────────────────────────────────────────────────────────
         let (creates, c1) = fk_rank(&right.tables, dialect, false);
         let (drops, c2) = fk_rank(&left.tables, dialect, true);
+        // **A replaced type waits for the table drops that release it**
+        // (S4.2-L1-03): an alias type, XML schema collection or sequence that
+        // has to be dropped and created again ran in the type phase, ahead of
+        // the table drops in the same plan, and its `DROP` was refused while
+        // a table the plan was about to drop still used it (Msg 3732). Where no
+        // table on the right uses it, nothing needs it earlier, so it sits
+        // after the table drops (and the alters that move a column off it);
+        // where one does, that table's create needs it first, and it stays.
+        let late_replace = |e: &CompareEntry| {
+            e.kind.is_type()
+                && e.status == ObjectStatus::Differing
+                && e.changes
+                    .changes
+                    .iter()
+                    .any(|c| matches!(c, Change::ReplaceTsqlObject { .. }))
+                && !right.tables.iter().any(|t| {
+                    t.columns.iter().any(|c| {
+                        mentions(&c.type_name, &e.name)
+                            || c.default.as_deref().is_some_and(|d| mentions(d, &e.name))
+                    })
+                })
+        };
         entries.sort_by_cached_key(|e| {
-            let ph = phase(e.kind, e.status);
+            let ph = if late_replace(e) {
+                3
+            } else {
+                phase(e.kind, e.status)
+            };
             let name = display_name(e.schema.as_deref(), &e.name);
             // Tables and views carry a dependency rank; every other kind ties
             // at zero and falls through to the name.
@@ -858,6 +895,8 @@ impl SchemaComparison {
                 .unwrap_or(entries.len());
             entries.splice(at..at, moved);
         }
+        let mut clashes = clashes;
+        clashes.extend(free_names_across_kinds(&mut entries, left, fold));
 
         // ── namespaces ──────────────────────────────────────────────────────
         //
@@ -1506,16 +1545,24 @@ impl SchemaPlan {
 
 /// Pair two sides by key: every key either side holds, once, in key order so
 /// two runs of one comparison read the same.
+///
+/// **Keys fold case where the target's names do** (`fold`,
+/// [`DbSchema::names_ignore_case`]): on a case-insensitive SQL Server
+/// database `dbo.Orders` and `dbo.orders` are one object, and paired as a
+/// drop and a create of the same name the create came first and was refused
+/// (Msg 2714, S4.2-L1-02). Folded, they are one entry, and a renamed one.
 fn pair<'a, T>(
+    fold: bool,
     left: impl Iterator<Item = (String, &'a T)>,
     right: impl Iterator<Item = (String, &'a T)>,
 ) -> Vec<(Option<&'a T>, Option<&'a T>)> {
+    let key = |k: String| if fold { k.to_lowercase() } else { k };
     let mut by_key: BTreeMap<String, (Option<&'a T>, Option<&'a T>)> = BTreeMap::new();
     for (k, v) in left {
-        by_key.entry(k).or_default().0 = Some(v);
+        by_key.entry(key(k)).or_default().0 = Some(v);
     }
     for (k, v) in right {
-        by_key.entry(k).or_default().1 = Some(v);
+        by_key.entry(key(k)).or_default().1 = Some(v);
     }
     by_key.into_values().collect()
 }
@@ -1650,9 +1697,11 @@ fn occupied_names(
 /// A name a table being dropped still holds and a table being created needs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NameClash {
-    /// [`CompareEntry::key`] of the `OnlyLeft` table that still holds the name.
+    /// [`CompareEntry::key`] of the `OnlyLeft` table that still holds the name
+    /// — or, for a name shared across kinds ([`free_names_across_kinds`]), the
+    /// view, sequence or synonym.
     pub freed_by: String,
-    /// [`CompareEntry::key`] of the `OnlyRight` table that needs it.
+    /// [`CompareEntry::key`] of the `OnlyRight` object that needs it.
     pub claimed_by: String,
     /// The identifiers themselves, qualified the way the engine scopes them.
     ///
@@ -1687,6 +1736,9 @@ impl NameClash {
         let names = self.names.join(", ");
         let why = if self.resolved {
             "and this plan does not drop it"
+        } else if self.freed_by.starts_with("sequence:") {
+            // `free_names_across_kinds`' one other reason.
+            "and it cannot be dropped first because a column default draws from it"
         } else {
             "and it cannot be dropped first because another table references it"
         };
@@ -1812,6 +1864,96 @@ fn nothing_else_references(table: &str, schema: Option<&str>, left: &[TableInfo]
             && t.foreign_keys
                 .iter()
                 .any(|fk| display_name(fk.ref_schema.as_deref(), &fk.ref_table) == me)
+    })
+}
+
+/// **One name per schema across kinds**: a table, a view, a sequence and a
+/// synonym share it — SQL Server's `sys.objects`, PostgreSQL's `pg_class` —
+/// so a drop of one kind that frees a name a create of another kind takes
+/// has to run first. The phases put a synonym's or a sequence's create ahead
+/// of every table drop, and a table's create ahead of a synonym's drop: "move
+/// a table, leave a compatibility synonym" was Msg 2714 and the migration
+/// rolled back (S4.2-L1-02, every shape measured on 2022). Names compare as
+/// the target's do (`fold`).
+///
+/// Each such drop moves to just ahead of the create — never ahead of phase
+/// 0, the dependents that come off first, since a create sits past it —
+/// where nothing else on the left needs it gone later: a table nothing
+/// references ([`nothing_else_references`]), a sequence no column default
+/// draws from. Otherwise no order works and the clash is disclosed, as a
+/// table rename's is. `entries` is otherwise left in the order just computed.
+fn free_names_across_kinds(
+    entries: &mut Vec<CompareEntry>,
+    left: &DbSchema,
+    fold: bool,
+) -> Vec<NameClash> {
+    let shares = |k: CompareKind| {
+        matches!(
+            k,
+            CompareKind::Table | CompareKind::View | CompareKind::Sequence | CompareKind::Synonym
+        )
+    };
+    let name_of = |e: &CompareEntry| {
+        let n = display_name(e.schema.as_deref(), &e.name);
+        if fold { n.to_lowercase() } else { n }
+    };
+    let drops: Vec<String> = entries
+        .iter()
+        .filter(|e| e.status == ObjectStatus::OnlyLeft && shares(e.kind))
+        .map(CompareEntry::key)
+        .collect();
+    let mut out = Vec::new();
+    for drop_key in drops {
+        let Some(d) = entries.iter().position(|e| e.key() == drop_key) else {
+            continue;
+        };
+        let (kind, name) = (entries[d].kind, name_of(&entries[d]));
+        let Some(c) = entries[..d].iter().position(|e| {
+            e.status == ObjectStatus::OnlyRight
+                && shares(e.kind)
+                && e.kind != kind
+                && name_of(e) == name
+        }) else {
+            continue;
+        };
+        let dropped = &entries[d];
+        let free = match kind {
+            CompareKind::Table => {
+                nothing_else_references(&dropped.name, dropped.schema.as_deref(), &left.tables)
+            }
+            CompareKind::Sequence => !left.tables.iter().any(|t| {
+                t.columns.iter().any(|col| {
+                    col.default
+                        .as_deref()
+                        .is_some_and(|x| mentions(x, &dropped.name))
+                })
+            }),
+            _ => true,
+        };
+        // Recorded either way, as the table pull records its own: a moved drop
+        // settles the clash only while it is in the plan, and a plan that
+        // leaves it out has the create refused — said above Apply then.
+        out.push(NameClash {
+            freed_by: drop_key,
+            claimed_by: entries[c].key(),
+            names: vec![display_name(dropped.schema.as_deref(), &dropped.name)],
+            resolved: free,
+        });
+        if free {
+            let moved = entries.remove(d);
+            entries.insert(c, moved);
+        }
+    }
+    out
+}
+
+/// Does `text` name `name` as a whole word, case aside — a column default
+/// drawing from a sequence, a column typed by an alias type?
+fn mentions(text: &str, name: &str) -> bool {
+    let (text, name) = (text.to_lowercase(), name.to_lowercase());
+    let word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+    text.match_indices(&name).any(|(at, _)| {
+        !word(text[..at].chars().next_back()) && !word(text[at + name.len()..].chars().next())
     })
 }
 
@@ -2486,22 +2628,38 @@ fn sequence_entry(
 /// source's start under keys already handed out (S4.2-L1-01). The right
 /// side takes the left's start before the editor's differ sees it, so one
 /// re-created for a real difference starts where the target's did.
+///
+/// **A synonym's target compares as the target database's names do**
+/// (`fold`): two synonyms naming `[dbo].[Orders]` and `[dbo].[orders]` on a
+/// case-insensitive database are the same synonym, and were replaced —
+/// losing its grants — for the spelling alone (S4.2-L1-06).
 fn tsql_entry(
     kind: CompareKind,
     object: ObjectKind,
     l: Option<&TsqlObject>,
     r: Option<&TsqlObject>,
+    fold: bool,
 ) -> CompareEntry {
     let any = l.or(r).expect("a pair holds at least one side");
     let changes = match (l, r) {
         (Some(l), Some(r)) => {
             let mut r = r.clone();
-            if let (
-                TsqlObjectKind::Sequence { start: kept, .. },
-                TsqlObjectKind::Sequence { start, .. },
-            ) = (&l.kind, &mut r.kind)
-            {
-                start.clone_from(kept);
+            match (&l.kind, &mut r.kind) {
+                (
+                    TsqlObjectKind::Sequence { start: kept, .. },
+                    TsqlObjectKind::Sequence { start, .. },
+                ) => start.clone_from(kept),
+                (TsqlObjectKind::Synonym { target: kept }, TsqlObjectKind::Synonym { target })
+                    if fold
+                        && kept.len() == target.len()
+                        && kept
+                            .iter()
+                            .zip(target.iter())
+                            .all(|(a, b)| a.to_lowercase() == b.to_lowercase()) =>
+                {
+                    target.clone_from(kept)
+                }
+                _ => {}
             }
             ddl::diff_tsql_object(l, &TsqlObjectDraft::from_info(&r))
         }
@@ -4054,6 +4212,187 @@ mod tests {
         assert_eq!(
             find(&same, "sequence:dbo.order_no").status,
             ObjectStatus::Same
+        );
+    }
+
+    fn tsql_table(name: &str, cols: &[(&str, &str)]) -> TableInfo {
+        TableInfo {
+            schema: Some("dbo".into()),
+            ..table(name, cols)
+        }
+    }
+
+    fn synonym(name: &str, target: &[&str]) -> TsqlObject {
+        tsql(
+            name,
+            crate::schema::TsqlObjectKind::Synonym {
+                target: target.iter().map(|p| p.to_string()).collect(),
+            },
+        )
+    }
+
+    /// **A name another kind gives up is freed before it is taken**
+    /// (S4.2-L1-02): SQL Server's tables, views, synonyms and sequences share
+    /// one name per schema, and the phases put a synonym's or a sequence's
+    /// create ahead of every table drop — "move a table, leave a
+    /// compatibility synonym" was Msg 2714 and the migration rolled back.
+    /// Each shape measured live is ordered drop-first here.
+    #[test]
+    fn a_name_another_kind_gives_up_is_dropped_before_it_is_taken() {
+        let at = |stmts: &[String], needle: &str| {
+            stmts
+                .iter()
+                .position(|s| s.contains(needle))
+                .unwrap_or_else(|| panic!("no {needle} in {stmts:#?}"))
+        };
+        let plan = |l: DbSchema, r: DbSchema| {
+            SchemaComparison::of(&l, &r, SqlDialect::MsSql).plan(|_| true)
+        };
+        // Table → synonym.
+        let p = plan(
+            with_tsql(vec![tsql_table("orders", &[("id", "int")])], vec![]),
+            with_tsql(vec![], vec![synonym("orders", &["sales", "orders"])]),
+        );
+        assert!(p.clashes.is_empty(), "{:?}", p.clashes);
+        let s = p.emit();
+        assert!(at(&s, "DROP TABLE [dbo].[orders]") < at(&s, "CREATE SYNONYM [dbo].[orders]"));
+        // Left out of the plan, the drop no longer frees it — said above Apply.
+        let unticked = SchemaComparison::of(
+            &with_tsql(vec![tsql_table("orders", &[("id", "int")])], vec![]),
+            &with_tsql(vec![], vec![synonym("orders", &["sales", "orders"])]),
+            SqlDialect::MsSql,
+        )
+        .plan(|e| e.key() != "table:dbo.orders");
+        assert_eq!(unticked.clashes.len(), 1, "{:?}", unticked.clashes);
+        // Synonym → table.
+        let s = plan(
+            with_tsql(vec![], vec![synonym("orders", &["sales", "orders"])]),
+            with_tsql(vec![tsql_table("orders", &[("id", "int")])], vec![]),
+        )
+        .emit();
+        assert!(at(&s, "DROP SYNONYM [dbo].[orders]") < at(&s, "CREATE TABLE [dbo].[orders]"));
+        // Sequence → synonym.
+        let mut seq = tsql_sequence("1", None);
+        seq.name = "x".into();
+        let s = plan(
+            with_tsql(vec![], vec![seq]),
+            with_tsql(vec![], vec![synonym("x", &["dbo", "t"])]),
+        )
+        .emit();
+        assert!(at(&s, "DROP SEQUENCE [dbo].[x]") < at(&s, "CREATE SYNONYM [dbo].[x]"));
+        // Synonym (left) → view (right).
+        let view = TableInfo {
+            is_view: true,
+            create_sql: Some("CREATE VIEW dbo.v AS SELECT 1 AS id".into()),
+            ..tsql_table("v", &[("id", "int")])
+        };
+        let s = plan(
+            with_tsql(vec![], vec![synonym("v", &["dbo", "t"])]),
+            with_tsql(vec![view], vec![]),
+        )
+        .emit();
+        assert!(
+            at(&s, "DROP SYNONYM [dbo].[v]") < at(&s, "CREATE VIEW"),
+            "{s:#?}"
+        );
+    }
+
+    /// **A name that only changed case is one object where names ignore
+    /// case** (S4.2-L1-02, S4.2-L1-06): on a case-insensitive SQL Server
+    /// database `dbo.Orders` and `dbo.orders` are one name, so pairing them
+    /// as a drop and a create planned the create first (Msg 2714), and two
+    /// synonyms whose targets differed in case alone were replaced — losing
+    /// the synonym's grants. On a case-sensitive one both stay differences.
+    #[test]
+    fn a_case_only_difference_is_one_object_where_names_ignore_case() {
+        let ci = |objects: Vec<TsqlObject>| DbSchema {
+            names_ignore_case: true,
+            ..with_tsql(vec![], objects)
+        };
+        let c = SchemaComparison::of(
+            &ci(vec![synonym("Orders", &["dbo", "t"])]),
+            &ci(vec![synonym("orders", &["dbo", "t"])]),
+            SqlDialect::MsSql,
+        );
+        assert_eq!(
+            c.entries.len(),
+            1,
+            "{:?}",
+            c.entries.iter().map(|e| e.key()).collect::<Vec<_>>()
+        );
+        let s = c.plan(|_| true).emit();
+        assert_eq!(
+            s,
+            vec!["EXEC sp_rename N'[dbo].[Orders]', N'orders';".to_string()]
+        );
+
+        let c = SchemaComparison::of(
+            &ci(vec![synonym("c", &["dbo", "Orders"])]),
+            &ci(vec![synonym("c", &["DBO", "orders"])]),
+            SqlDialect::MsSql,
+        );
+        assert_eq!(find(&c, "synonym:dbo.c").status, ObjectStatus::Same);
+        let cs = |objects| with_tsql(vec![], objects);
+        let c = SchemaComparison::of(
+            &cs(vec![synonym("c", &["dbo", "Orders"])]),
+            &cs(vec![synonym("c", &["dbo", "orders"])]),
+            SqlDialect::MsSql,
+        );
+        assert_eq!(find(&c, "synonym:dbo.c").status, ObjectStatus::Differing);
+    }
+
+    /// **A replaced type is dropped once the tables that used it are gone**
+    /// (S4.2-L1-03): a replaced alias type, XML schema collection or
+    /// sequence ran in the type phase, ahead of the table drops in the same
+    /// plan that release it, and its `DROP` was refused (Msg 3732) though the
+    /// plan's next statements removed the only user. Where no table on the
+    /// right uses it, it waits for them.
+    #[test]
+    fn a_replaced_type_waits_for_the_table_drops_that_release_it() {
+        use crate::schema::TsqlObjectKind as T;
+        let code = |base: &str| {
+            tsql(
+                "code",
+                T::AliasType {
+                    base: base.into(),
+                    nullable: true,
+                },
+            )
+        };
+        let legacy = tsql_table("legacy", &[("c", "dbo.code")]);
+        let s = SchemaComparison::of(
+            &with_tsql(vec![legacy], vec![code("nvarchar(10)")]),
+            &with_tsql(vec![], vec![code("nvarchar(20)")]),
+            SqlDialect::MsSql,
+        )
+        .plan(|_| true)
+        .emit();
+        let at = |needle: &str| {
+            s.iter()
+                .position(|x| x.contains(needle))
+                .unwrap_or_else(|| panic!("no {needle} in {s:#?}"))
+        };
+        assert!(
+            at("DROP TABLE [dbo].[legacy]") < at("DROP TYPE [dbo].[code]"),
+            "{s:#?}"
+        );
+        // A table on the right that uses it still needs it first.
+        let user = tsql_table("users", &[("c", "dbo.code")]);
+        let s = SchemaComparison::of(
+            &with_tsql(vec![], vec![code("nvarchar(10)")]),
+            &with_tsql(vec![user], vec![code("nvarchar(20)")]),
+            SqlDialect::MsSql,
+        )
+        .plan(|_| true)
+        .emit();
+        let at = |needle: &str| {
+            s.iter()
+                .position(|x| x.contains(needle))
+                .unwrap_or_else(|| panic!("no {needle} in {s:#?}"))
+        };
+        assert!(
+            at("CREATE TYPE [dbo].[code]") < at("CREATE TABLE [dbo].[users]"),
+            "{s:#?}"
         );
     }
 

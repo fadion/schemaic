@@ -3049,12 +3049,20 @@ async fn collect_schema(client: &mut MsClient) -> Result<DbSchema, DbError> {
         .map(|r| cell(r, 0).to_string())
         .filter(|n| !n.is_empty())
         .collect();
+    // Whether its object names ignore case — the database collation's
+    // comparison style, bit 1 (`DbSchema::names_ignore_case`).
+    let names_ignore_case = query_rows(client, NAME_CASE_PROBE)
+        .await?
+        .first()
+        .and_then(|r| cell(r, 0).trim().parse::<i64>().ok())
+        .is_some_and(|style| style & 1 == 1);
     Ok(DbSchema {
         tables,
         routines,
         tsql_objects,
         tsql_type_bindings,
         namespaces,
+        names_ignore_case,
         flavour: schemaic_core::schema::ServerFlavour::Unknown,
         // Stamped by `fetch_schema`, which has the name.
         database: None,
@@ -3066,6 +3074,11 @@ async fn collect_schema(client: &mut MsClient) -> Result<DbSchema, DbError> {
 /// `DbSchema::namespaces`.
 const NAMESPACE_LISTING: &str = "SELECT name FROM sys.schemas \
      WHERE schema_id = 1 OR (schema_id > 4 AND schema_id < 16384) ORDER BY name";
+
+/// The database collation's comparison style, whose bit 1 is ignore-case —
+/// see `DbSchema::names_ignore_case`.
+const NAME_CASE_PROBE: &str = "SELECT CONVERT(int, COLLATIONPROPERTY(CONVERT(nvarchar(128), \
+     DATABASEPROPERTYEX(DB_NAME(), 'Collation')), 'ComparisonStyle'))";
 
 // ── The entry points around a query ──────────────────────────────────────────
 

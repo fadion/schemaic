@@ -6383,6 +6383,18 @@ existing prose was left alone.
     phase**, then tables dropped, then dependents created or altered, then types dropped — and `Same`
     sorts past every difference, so a hundred untouched tables cannot land between two statements
     that depend on each other (`untouched_objects_do_not_disturb_the_order_of_the_differences`).
+    **A replaced type is the one entry whose phase is not its (status, kind)'s.** An alias type,
+    XML schema collection or sequence the differ has to drop and create again
+    (`Change::ReplaceTsqlObject`) ran in phase 1, ahead of the table drops in the same plan, and its
+    `DROP` was refused (Msg 3732) while a table the plan was about to drop still used it — though
+    the plan's later statements removed the only user (S4.2-L1-03). The sort key's `late_replace`
+    gives such an entry phase 3 instead, behind the table drops and the phase-2 alters that may move
+    a column off it — `kind_rank` negating a drop's ordinal is what puts the drops first inside that
+    phase — **unless a table on the right uses it**, a column whose type or default `mentions` its
+    name (whole word, case aside), whose create needs it first; that one stays in phase 1, and a
+    false match only keeps the old order. The test is `is_type`, so a re-pointed synonym, also
+    replaced, takes phase 3 as well (`a_replaced_type_waits_for_the_table_drops_that_release_it`;
+    live, `a_comparison_orders_shared_names_and_folds_case` on 2022).
     **The creates and the alters share a phase because neither order between them is right.** Split,
     every `CREATE TABLE` ran ahead of every `ALTER`, so
     `CREATE TABLE child (… REFERENCES parent(code))` was emitted before the
@@ -6415,7 +6427,7 @@ existing prose was left alone.
     `a_new_view_is_created_before_the_trigger_that_names_it`, both failing before the ordinal went
     in; `a_dropped_enum_goes_after_the_domain_that_names_it` guards the negation, where alphabetical
     happened to coincide with the right answer).
-    **The order is no longer purely by phase, and the exception is a renamed table.** A rename is the
+    **The order is no longer purely by phase, and the first exception is a renamed table.** A rename is the
     single most ordinary difference a schema-compare tool is opened for, and it arrives as a drop
     plus a create: rename `orders` to `orders_old` on the left and the comparison yields `OnlyLeft
     table:orders_old` beside `OnlyRight table:orders`. Neither `RENAME TABLE` nor
@@ -6488,6 +6500,27 @@ existing prose was left alone.
     **create**: the claim side has to be in the plan for the warning to be about a statement that is
     in the script, and a comparison-level clash between two objects the user left out is not this
     plan's problem.
+    **The second exception is a name shared across kinds.** A table, a view, a sequence and a
+    synonym hold one name per schema between them — SQL Server's `sys.objects`, PostgreSQL's
+    `pg_class` — while the phases put a synonym's or a sequence's create ahead of every table drop,
+    and a table's create ahead of a synonym's drop: "move a table, leave a compatibility synonym" was
+    Msg 2714, and the migration rolled back with it (S4.2-L1-02). `free_names_across_kinds` runs
+    after the table pull: an `OnlyLeft` entry of one of those four kinds that sits *below* an
+    `OnlyRight` of another kind under the same name — compared as the keys are, folded where the
+    target's names ignore case — moves to just ahead of that create, not to the front of a phase,
+    and so never ahead of phase 0, the create being past it already. It moves only when the drop is
+    free to run that early: a table `nothing_else_references`, a sequence no column default on the
+    left `mentions` (whole word, case aside), a view or a synonym always. Anything else becomes a
+    `NameClash` with `resolved: false`, disclosed through the same `note` as a rename's — whose
+    reason clause, for a sequence, says a column default draws from it. **A drop this pass moves
+    is recorded too**, as a `resolved` clash like the table pull's, so the filter above discloses it
+    when the user unticks the drop and the create of the other kind would be refused. Every shape
+    was measured live on 2022 — table to synonym, synonym to table, sequence to
+    synonym, and a left synonym to a right view
+    (`a_name_another_kind_gives_up_is_dropped_before_it_is_taken`; live,
+    `a_comparison_orders_shared_names_and_folds_case`, which holds all four, a case-only synonym
+    rename, a case-only synonym target and a replaced alias type a dropped table used in one plan
+    that applies and a re-compare that finds nothing, watched fail with `compare.rs` stashed).
     A cycle is reported rather than resolved — no
     creation order satisfies one — and it is **two facts about two schemas, not one**.
     `SchemaComparison::cycles_create` is a tangle among the **right** schema's tables and
@@ -6684,6 +6717,15 @@ existing prose was left alone.
     own drop already performs. An enum's or a domain's dependents come off the **left** schema
     (`ddl::type_dependents`) — they are the columns the change has to re-cast, and they live where
     the DDL runs; asking the right side would list columns that aren't there.
+    **Keys fold case where the target's names do.** `pair` lowercases every key, of every kind, when
+    the **left** schema's `DbSchema::names_ignore_case` is set — the target's collation decides,
+    that being where the plan runs, and the right side's flag is not read. On a case-insensitive
+    SQL Server database `dbo.Orders` and `dbo.orders` are one object, and paired as an `OnlyLeft`
+    beside an `OnlyRight` the create sorted first and was refused for the name the drop below it
+    still held (Msg 2714, S4.2-L1-02). Folded, they are one `Differing` entry, and the editor's
+    differ makes the case-only rename a rename — `EXEC sp_rename N'[dbo].[Orders]', N'orders';` for
+    a synonym (`a_case_only_difference_is_one_object_where_names_ignore_case`). Only SQL Server's
+    reader ever sets the flag, so every other comparison pairs on exact keys, as all of them did.
     **SQL Server's sequences, alias types, XML schema collections and synonyms are paired out of
     `DbSchema::tsql_objects`**, kind by kind — a local `of_kind` keys each by `display_name`, as
     every other kind is keyed — and each pair is one `tsql_entry`: `ddl::diff_tsql_object` between
@@ -6732,6 +6774,14 @@ existing prose was left alone.
     synonym for it and a view reading through the synonym, against a target holding its own sequence at `INCREMENT BY 1` and a stale alias
     type: after the sync the sequence was altered in place, the stale type dropped, the synonym
     worked, and a second comparison found nothing).
+    **A synonym's target compares as the target's names do**, by the same flag `pair` folds on: two
+    synonyms naming `[dbo].[Orders]` and `[dbo].[orders]` on a case-insensitive database are one
+    synonym, and were replaced for the spelling alone — a replace `tsql_replace_guard` refuses at
+    Apply where the synonym carries permissions, and performs for nothing where it does not
+    (S4.2-L1-06). So `tsql_entry` gives the right side the left's target when the two match part
+    for part case aside, before the differ sees it, as it does a sequence's start; on a
+    case-sensitive database the two stay `Differing`
+    (`a_case_only_difference_is_one_object_where_names_ignore_case`).
     **Three flags say what a comparison cannot vouch for, and all three are *emitting* limits rather
     than comparing ones** — the verdict is right, and it is the generated SQL that suffers.
     `CompareEntry::needs_source` is MySQL's: an eager `Db::fetch_schema` reads a trigger's, a
@@ -9733,6 +9783,16 @@ existing prose was left alone.
     `an_empty_schema_is_listed_compared_into_and_dropped` on SQL Server 2022 and
     `pg_catalog::an_empty_schema_is_listed_and_not_created_again` on PostgreSQL 16, both watched fail
     with the fix stashed.
+    **`DbSchema::names_ignore_case` is whether two names differing only in case are one object
+    there**, and the comparison is its one reader (`pair` and `tsql_entry`, under `compare.rs`).
+    SQL Server's `collect_schema` asks the database's collation through `db::mssql`'s
+    `NAME_CASE_PROBE` — `COLLATIONPROPERTY(DATABASEPROPERTYEX(DB_NAME(), 'Collation'),
+    'ComparisonStyle')`, whose bit 1 is ignore-case: measured, `SQL_Latin1_General_CP1_CI_AS`
+    answers 196609 (bit set), `Latin1_General_CS_AS` 196608 and a `BIN2` collation 0. PostgreSQL's
+    reader sets it `false` explicitly; MySQL, SQLite and a hand-built schema take the default
+    `false`, which compares names exactly — what every comparison did before the field existed.
+    The probe is a `?` like the other catalogue reads in `collect_schema`, so a server refusing it
+    fails the schema load rather than falling back to exact names.
     **`DbSchema::extension_routines` is the one field that carries names and nothing else**, and it
     exists because two readers of `routines` wanted opposite answers. PostgreSQL only — the other
     two engines have no such concept and leave it empty. The tree browses `routines`, which

@@ -6159,6 +6159,18 @@ pub struct DbSchema {
     /// comparison planned `CREATE SCHEMA` for one the target already had,
     /// which the server refused and the migration rolled back (S2-L1-01/02).
     pub namespaces: Vec<String>,
+    /// **Do this database's object names ignore case?** SQL Server's reader
+    /// asks the database's collation (`COLLATIONPROPERTY(…, 'ComparisonStyle')`,
+    /// its ignore-case bit), since a `_CI_` database holds one object for
+    /// `dbo.Orders` and `dbo.orders`. `false` — compare names exactly — on the
+    /// other engines and on a hand-built schema, which is what every one of
+    /// them did before.
+    ///
+    /// The comparison folds case by it: two objects whose names differ only
+    /// in case are one renamed object there, not a drop and a create of the
+    /// same name (Msg 2714), and two synonyms whose targets differ only in
+    /// case are the same synonym (S4.2-L1-02, S4.2-L1-06).
+    pub names_ignore_case: bool,
     /// **Names of functions an extension owns — and nothing else about them.**
     /// PostgreSQL only; the other two engines have no such concept and leave it
     /// empty.

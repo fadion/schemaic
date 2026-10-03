@@ -2314,6 +2314,9 @@ async fn collect_schema(client: &Client) -> Result<DbSchema, DbError> {
         database: None,
         extension_routines: extension_routine_names(client).await?,
         namespaces: namespace_names(client).await?,
+        // A quoted identifier is case-sensitive here, and the reader keeps
+        // names as the catalogue stores them: compared exactly.
+        names_ignore_case: false,
     })
 }
 

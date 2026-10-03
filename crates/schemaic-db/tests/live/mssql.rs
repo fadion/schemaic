@@ -5192,6 +5192,72 @@ async fn an_empty_schema_is_listed_compared_into_and_dropped() {
     assert_eq!(read(&target).await.schemas(), vec!["dbo".to_string()]);
 }
 
+/// **A comparison orders what shares a name, and reads names as the
+/// database does** (S4.2-L1-02/03/06): a table replaced by a synonym of the
+/// same name, a synonym by a table, a sequence by a synonym, a synonym renamed
+/// in case alone, a synonym whose target differs only in case, and a replaced
+/// alias type a dropped table still used — every one of them was Msg 2714 or
+/// 3732 and a rolled-back migration, or a phantom replace. One plan applies,
+/// and a second comparison finds nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_comparison_orders_shared_names_and_folds_case() {
+    use schemaic_core::compare::SchemaComparison;
+    if !enabled() || azure_cannot("needs a second database") {
+        return;
+    }
+    let target = Scratch::create("cmp_names_target").await;
+    let source = Scratch::create("cmp_names_source").await;
+    for sql in [
+        "CREATE TABLE dbo.orders (id int NOT NULL PRIMARY KEY)",
+        "CREATE TABLE dbo.x (id int NOT NULL PRIMARY KEY)",
+        "CREATE SYNONYM dbo.s1 FOR dbo.x",
+        "CREATE SEQUENCE dbo.q AS int START WITH 1",
+        "CREATE SYNONYM dbo.Syn FOR dbo.x",
+        "CREATE SYNONYM dbo.c FOR dbo.X",
+        "CREATE TYPE dbo.code FROM nvarchar(10) NULL",
+        "CREATE TABLE dbo.legacy (c dbo.code NULL)",
+    ] {
+        target.exec(sql).await;
+    }
+    for sql in [
+        "CREATE SCHEMA sales",
+        "CREATE TABLE sales.orders (id int NOT NULL PRIMARY KEY)",
+        "CREATE SYNONYM dbo.orders FOR sales.orders",
+        "CREATE TABLE dbo.x (id int NOT NULL PRIMARY KEY)",
+        "CREATE TABLE dbo.s1 (id int NOT NULL PRIMARY KEY)",
+        "CREATE SYNONYM dbo.q FOR dbo.x",
+        "CREATE SYNONYM dbo.syn FOR dbo.x",
+        "CREATE SYNONYM dbo.c FOR [dbo].[x]",
+        "CREATE TYPE dbo.code FROM nvarchar(20) NULL",
+    ] {
+        source.exec(sql).await;
+    }
+    let read = |s: &Scratch| {
+        let (db, name) = (s.db.clone(), s.name.clone());
+        async move {
+            db.fetch_schema(&name, CancellationToken::new())
+                .await
+                .unwrap()
+        }
+    };
+    let t = read(&target).await;
+    assert!(t.names_ignore_case, "the default collation is CI");
+    let c = SchemaComparison::of(&t, &read(&source).await, MS);
+    let keys: Vec<String> = c.differences().map(|e| e.key()).collect();
+    assert!(!keys.iter().any(|k| k == "synonym:dbo.c"), "{keys:?}");
+    let plan = c.plan(|_| true);
+    assert!(plan.clashes.is_empty(), "{:?}", plan.clashes);
+    let stmts = plan.emit();
+    target
+        .db
+        .run_ddl(&target.name, &stmts, CancellationToken::new())
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{}", stmts.join("\n")));
+    let again = SchemaComparison::of(&read(&target).await, &read(&source).await, MS);
+    let left: Vec<String> = again.differences().map(|e| e.key()).collect();
+    assert!(left.is_empty(), "{left:?}");
+}
+
 /// **A comparison discloses a module the source would not show, rather than
 /// planning it.** An encrypted view was planned as `CREATE VIEW v AS ;` and
 /// an encrypted procedure as a comment that "succeeded" creating nothing.
