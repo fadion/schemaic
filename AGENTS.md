@@ -135,10 +135,12 @@ substitute for the statement, and none of these is a style preference.
 - **Themable colours reach reactive styles as `fn() -> Color`**, never a captured `Color`.
 - **Pure logic lives in `schemaic-core` with unit tests**; the UI/app keep thin wrappers.
 - **Generated DDL is never run silently, and never emitted from a second differ** — draft →
-  `ddl::diff` → `emit` → the preview modal → `Db::run_ddl`, or `Db::run_server_ddl` for a plan
-  about a **container** (`CREATE`/`DROP DATABASE`/`SCHEMA`), which needs a connection attached to
-  no database. Which runner a plan takes is read off the change set by `ddl_preview::preview_of`,
-  never chosen by the caller.
+  `ddl::diff` → `emit` → the preview modal → `Db::run_ddl`; `Db::run_server_ddl` for a plan that
+  creates or drops a **database** (`ddl::is_server_level`), on a connection attached to no
+  particular database (`master` on SQL Server) — a `CREATE`/`DROP SCHEMA` runs inside its database
+  on the ordinary path; and `Db::run_ddl_piecewise` for the plan SQL Server refuses inside a
+  transaction (`ChangeSet::runs_whole`). Which runner a plan takes is read off the change set by
+  `ddl_preview::preview_of`, never chosen by the caller.
 - **Write-back is transactional with a 1-row safety net**, and the report never claims more than
   the engine delivered (`GridWrite::plan`, `one_row_verdict`, `Rollback::note`).
 - **A destructive modal action guards its own launch**, in the same step that launches it

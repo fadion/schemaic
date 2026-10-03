@@ -256,10 +256,11 @@ pub struct IndexInfo {
     ///
     /// **On PostgreSQL it is what stops a structure dump rewriting an index
     /// nobody edited.** [`TableInfo::create_ddl`] emits from the model, and the
-    /// model has no field for an `INCLUDE` list, `NULLS NOT DISTINCT` or a
-    /// storage parameter — so a dump of `CREATE INDEX ix ON t (a, b) INCLUDE
-    /// (c, d)` restored an index that no longer covers, with no edit and no
-    /// warning. A lossy index there is emitted from this text instead.
+    /// model has no field for `NULLS NOT DISTINCT`, a storage parameter or a
+    /// **constraint's** `INCLUDE` list (a plain index's is
+    /// [`IndexInfo::include`]) — so a dump of an index carrying one restored an
+    /// index without it, with no edit and no warning. A lossy index there is
+    /// emitted from this text instead.
     ///
     /// **Only ever replayed for an index the plan leaves alone.** The text is a
     /// snapshot of the index as it was; an edited one has to come from the model,

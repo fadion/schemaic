@@ -11215,8 +11215,12 @@ pub fn supports_namespace_editing(dialect: SqlDialect) -> bool {
 /// the answer before there is a change to ask about.
 ///
 /// SQL Server's containers do have owners (`CREATE SCHEMA … AUTHORIZATION`,
-/// `ALTER AUTHORIZATION ON DATABASE::…`), and answers no here until its
-/// principals can be listed to fill the menu — see `users::supports_users`.
+/// `ALTER AUTHORIZATION ON DATABASE::…`), and it answers no here all the
+/// same: its `CREATE DATABASE` has no owner clause — ownership is a second
+/// statement, `ALTER AUTHORIZATION`, that the server-level plan does not
+/// write — so a yes would put `OWNER x` into a statement T-SQL refuses
+/// ([`DatabaseDraft::create_sql`]'s owner arm asks this). Its principals can be
+/// listed (`users::supports_users`); that was never the obstacle.
 pub fn supports_owners(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::Postgres => true,

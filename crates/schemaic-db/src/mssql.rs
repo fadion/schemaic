@@ -6,11 +6,11 @@
 //! run queries, batches and `.sql` scripts, non-executing validation
 //! (`prepare_check`), schema introspection, table statistics, server activity,
 //! query plans (`explain`), file import (`import_rows`), the grid's write-back
-//! (`commit_writes`, `refetch_rows`, `fetch_blob`) and the schema changes
-//! `ddl::supports_change` allows it (`run_ddl`). The one entry point not
-//! written is `run_server_ddl` — creating or dropping a database — which
-//! answers with a refusal naming SQL Server, so a caller that skips the
-//! capability gates is told so rather than handed another engine's SQL.
+//! (`commit_writes`, `refetch_rows`, `fetch_blob`), the schema changes
+//! `ddl::supports_change` allows it (`run_ddl`, `whole: false` for the plan
+//! T-SQL refuses inside a transaction), and creating or dropping a
+//! database (`run_server_ddl`, attached to `master` and outside any
+//! transaction, which `CREATE DATABASE` refuses).
 //!
 //! **Values come over TDS typed**, not as text: an `int` arrives as an `i32`,
 //! a `decimal` as a scaled integer, a `datetime2` as a day count and a count of
