@@ -5290,6 +5290,50 @@ async fn a_storage_switch_to_columnstore_applies() {
     }
 }
 
+/// **A comparison says it leaves an alias type's bound rule behind**
+/// (S4.2-L1-07): it created the type without it — the target then took a
+/// value the source refuses (Msg 513) — and a second comparison found
+/// nothing. Now every plan names the binding, after Apply as before.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_comparison_names_an_alias_types_binding_it_leaves_behind() {
+    use schemaic_core::compare::SchemaComparison;
+    if !enabled() || azure_cannot("needs a second database") {
+        return;
+    }
+    let target = Scratch::create("cmp_binding_target").await;
+    let source = Scratch::create("cmp_binding_source").await;
+    for sql in [
+        "CREATE RULE dbo.rl_pos AS @v > 0",
+        "CREATE TYPE dbo.qty FROM int NULL",
+        "EXEC sp_bindrule N'dbo.rl_pos', N'dbo.qty'",
+    ] {
+        source.exec(sql).await;
+    }
+    let read = |s: &Scratch| {
+        let (db, name) = (s.db.clone(), s.name.clone());
+        async move {
+            db.fetch_schema(&name, CancellationToken::new())
+                .await
+                .unwrap()
+        }
+    };
+    let plan = SchemaComparison::of(&read(&target).await, &read(&source).await, MS).plan(|_| true);
+    let note = plan.omitted.join(" ");
+    assert!(note.contains("qty") && note.contains("rl_pos"), "{note}");
+    let stmts = plan.emit();
+    target
+        .db
+        .run_ddl(&target.name, &stmts, CancellationToken::new())
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{}", stmts.join("\n")));
+    let again = SchemaComparison::of(&read(&target).await, &read(&source).await, MS).plan(|_| true);
+    assert!(
+        again.omitted.join(" ").contains("rl_pos"),
+        "{:?}",
+        again.omitted
+    );
+}
+
 /// **A comparison discloses a module the source would not show, rather than
 /// planning it.** An encrypted view was planned as `CREATE VIEW v AS ;` and
 /// an encrypted procedure as a comment that "succeeded" creating nothing.

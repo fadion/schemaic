@@ -593,6 +593,14 @@ pub struct SchemaComparison {
     /// [`SchemaPlan::destructive`], for [`SchemaPlan::cycles`]' reason — the
     /// statements are all there and one of them will be refused.
     pub name_clashes: Vec<NameClash>,
+    /// One line per SQL Server alias type whose **bound rule or default**
+    /// (`DbSchema::tsql_type_bindings`) the source has and the target lacks:
+    /// the comparison neither compares nor carries a binding — the rule or
+    /// default is an object of its own it does not create — so it made the
+    /// type without it and then called the two the same, a loss the dump
+    /// names in its header (S4.2-L1-07). Every plan's
+    /// [`SchemaPlan::omitted`] carries these.
+    pub binding_notes: Vec<String>,
 }
 
 /// Why a comparison's tree is empty — see [`SchemaComparison::empty_reason`].
@@ -934,6 +942,7 @@ impl SchemaComparison {
             .filter(|ns| !ddl::namespace_comes_with_every_database(ns, dialect))
             .collect();
 
+        let binding_notes = binding_notes(left, right, fold);
         SchemaComparison {
             entries,
             dialect,
@@ -941,6 +950,7 @@ impl SchemaComparison {
             cycles_drop: c2,
             new_namespaces,
             name_clashes: clashes,
+            binding_notes,
         }
     }
 
@@ -1150,6 +1160,7 @@ impl SchemaComparison {
             .differences()
             .filter(|e| e.needs_source() || e.unplannable())
             .map(CompareEntry::omission_note)
+            .chain(self.binding_notes.iter().cloned())
             .collect();
         // **A cycle breaks a plan that creates a table and one that drops
         // one, and they are not the same cycle.** A `CREATE` carries an inline
@@ -1942,6 +1953,58 @@ fn free_names_across_kinds(
         if free {
             let moved = entries.remove(d);
             entries.insert(c, moved);
+        }
+    }
+    out
+}
+
+/// The alias types whose bound rule or default the source has and the target
+/// lacks, one line each — see [`SchemaComparison::binding_notes`]. Matched by
+/// schema and type name as the target compares names (`fold`), and a binding
+/// by the rule's or default's name as the catalogue printed it.
+fn binding_notes(left: &DbSchema, right: &DbSchema, fold: bool) -> Vec<String> {
+    let same = |a: &str, b: &str| {
+        if fold {
+            a.to_lowercase() == b.to_lowercase()
+        } else {
+            a == b
+        }
+    };
+    let key = |b: &crate::schema::TsqlTypeBinding| {
+        (
+            b.schema
+                .clone()
+                .unwrap_or_else(|| crate::schema::MSSQL_DEFAULT_SCHEMA.to_string()),
+            b.type_name.clone(),
+        )
+    };
+    let mut out = Vec::new();
+    for b in &right.tsql_type_bindings {
+        let (schema, name) = key(b);
+        let had = left.tsql_type_bindings.iter().find(|l| {
+            let (s, n) = key(l);
+            same(&s, &schema) && same(&n, &name)
+        });
+        let missing = |theirs: &Option<String>, ours: Option<&Option<String>>| -> Option<String> {
+            theirs
+                .as_deref()
+                .filter(|t| !ours.and_then(|o| o.as_deref()).is_some_and(|o| same(o, t)))
+                .map(str::to_string)
+        };
+        let what: Vec<String> = [
+            missing(&b.rule, had.map(|h| &h.rule)).map(|r| format!("the rule {r}")),
+            missing(&b.default, had.map(|h| &h.default)).map(|d| format!("the default {d}")),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if !what.is_empty() {
+            out.push(format!(
+                "Alias type {}: {} bound to it on the source is not compared or carried — \
+                 bind it by hand (sp_bindrule / sp_bindefault).",
+                display_name(Some(&schema), &name),
+                what.join(" and ")
+            ));
         }
     }
     out
@@ -3430,6 +3493,7 @@ mod tests {
             cycles_drop: false,
             new_namespaces: Vec::new(),
             name_clashes: Vec::new(),
+            binding_notes: Vec::new(),
         };
         let plan = c.plan(|_| true);
         assert_eq!(plan.len(), 0, "nothing to apply");
@@ -3513,6 +3577,7 @@ mod tests {
             cycles_drop: false,
             new_namespaces: Vec::new(),
             name_clashes: Vec::new(),
+            binding_notes: Vec::new(),
         };
         let plan = c.plan(|_| true);
         assert_eq!(plan.len(), 0, "not an object the plan applies");
@@ -4393,6 +4458,56 @@ mod tests {
         assert!(
             at("CREATE TYPE [dbo].[code]") < at("CREATE TABLE [dbo].[users]"),
             "{s:#?}"
+        );
+    }
+
+    /// **A rule or default bound to an alias type is said, not silently
+    /// dropped** (S4.2-L1-07): the comparison created the type without it
+    /// and then called the two databases the same, while the dump names
+    /// exactly this loss. A binding the source has and the target lacks is
+    /// an omission line in every plan.
+    #[test]
+    fn an_alias_types_binding_the_target_lacks_is_disclosed() {
+        use crate::schema::{TsqlObjectKind as T, TsqlTypeBinding};
+        let qty = tsql(
+            "qty",
+            T::AliasType {
+                base: "int".into(),
+                nullable: true,
+            },
+        );
+        let bound = |rule: Option<&str>| DbSchema {
+            tsql_type_bindings: rule
+                .map(|r| TsqlTypeBinding {
+                    schema: Some("dbo".into()),
+                    type_name: "qty".into(),
+                    default: None,
+                    rule: Some(r.into()),
+                })
+                .into_iter()
+                .collect(),
+            ..with_tsql(vec![], vec![qty.clone()])
+        };
+        let c = SchemaComparison::of(
+            &DbSchema::default(),
+            &bound(Some("[dbo].[rl_pos]")),
+            SqlDialect::MsSql,
+        );
+        let omitted = c.plan(|_| true).omitted.join(" ");
+        assert!(
+            omitted.contains("qty") && omitted.contains("rl_pos"),
+            "{omitted}"
+        );
+        // The same binding on both sides says nothing.
+        let c = SchemaComparison::of(
+            &bound(Some("[dbo].[rl_pos]")),
+            &bound(Some("[dbo].[rl_pos]")),
+            SqlDialect::MsSql,
+        );
+        assert!(
+            c.plan(|_| true).omitted.is_empty(),
+            "{:?}",
+            c.plan(|_| true).omitted
         );
     }
 

@@ -6804,7 +6804,14 @@ existing prose was left alone.
     editor's differ sees it — the same differ, not a second one — and a sequence re-created for a
     real difference, a type, starts where the target's did
     (`a_restarted_sequence_is_the_same_sequence`; live,
-    `a_sequence_restart_is_honoured_and_not_compared`). The trade runs the other way too — a sequence the
+    `a_sequence_restart_is_honoured_and_not_compared`). **An alias type's bound rule or default is
+    not compared or carried** — the rule or default is an object of its own, and the comparison
+    creates none — so it made the type bare and then called the two databases the same, a loss the
+    dump names in its header (S4.2-L1-07). It is said instead: `SchemaComparison::binding_notes`
+    holds a line for each binding the source's `DbSchema::tsql_type_bindings` has and the target's
+    lacks, matched as the target's names compare, and every plan's `omitted` carries them
+    (`an_alias_types_binding_the_target_lacks_is_disclosed`; live,
+    `a_comparison_names_an_alias_types_binding_it_leaves_behind`, before and after Apply). The trade runs the other way too — a sequence the
     comparison creates is `create_sql` alone and starts at its own `START WITH`, where the dump moves
     a copy's counter on to the source's (`restart_sql`) only when it carries the rows as well
     (`sql_servers_standalone_objects_are_compared`, whose counter-only difference is `Same`; live,
