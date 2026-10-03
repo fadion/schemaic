@@ -200,10 +200,13 @@ pub(crate) async fn connect(db: &Db, database: Option<&str>) -> Result<MsClient,
     // The Browser's silence — no service, UDP 1434 blocked, or no such
     // instance, which it does not answer either — in words that say which
     // three, and the way round it, rather than the driver's.
-    if let (Some((server, instance)), Err(e)) = (named, &result)
-        && is_browser_silence(e)
-    {
-        return Err(DbError::Connect(browser_silent_text(server, instance)));
+    if let (Some((server, instance)), Err(e)) = (named, &result) {
+        if is_browser_silence(e) {
+            return Err(DbError::Connect(browser_silent_text(server, instance)));
+        }
+        if is_browser_without_tcp(e) {
+            return Err(DbError::Connect(browser_without_tcp_text(server, instance)));
+        }
     }
     if db.auth == schemaic_core::connection::AuthMode::AzureCli
         && matches!(&result, Err(tiberius::error::Error::Server(t)) if t.code() == 18456)
@@ -266,11 +269,34 @@ fn browser_silence(e: tiberius::error::Error) -> tiberius::error::Error {
     }
 }
 
-/// Did SQL Server Browser give no answer — the driver's timeout, which it
-/// writes as a `Conversion` naming the browser?
+/// Did SQL Server Browser give no answer — the driver's timeout (`SQL browser
+/// timeout …`), or the reset [`browser_silence`] writes in its shape (`SQL
+/// browser gave no answer …`)? Matched on those two shapes, not on any text
+/// naming the browser: the driver's "Could not resolve SQL browser instance"
+/// is an *answer* without a TCP port ([`is_browser_without_tcp`]), and read
+/// as silence it blamed a running Browser (S5-L1-01).
 fn is_browser_silence(e: &tiberius::error::Error) -> bool {
     matches!(e, tiberius::error::Error::Conversion(why)
-        if why.to_ascii_lowercase().contains("browser"))
+        if why.starts_with("SQL browser timeout") || why.starts_with("SQL browser gave no answer"))
+}
+
+/// Did SQL Server Browser answer for the instance but give no TCP port —
+/// the driver's reply-parse failure? A reply carries `tcp;<port>` only while
+/// the instance listens on TCP (MS-SQLR), so this is an instance with TCP/IP
+/// off, SQL Express's install default, or a malformed reply.
+fn is_browser_without_tcp(e: &tiberius::error::Error) -> bool {
+    matches!(e, tiberius::error::Error::Conversion(why)
+        if why.starts_with("Could not resolve SQL browser instance"))
+}
+
+/// What a connect to a named instance says when SQL Server Browser answered
+/// without a TCP port.
+fn browser_without_tcp_text(server: &str, instance: &str) -> String {
+    format!(
+        "SQL Server Browser on {server} answered for the instance {instance} but gave no TCP \
+         port: the instance does not listen on TCP. Enable TCP/IP for it in SQL Server \
+         Configuration Manager and restart it."
+    )
 }
 
 /// What a connect to a named instance says when SQL Server Browser gave no
@@ -6150,6 +6176,29 @@ mod tests {
         assert!(!is_browser_silence(&browser_silence(Error::Conversion(
             "invalid utf-16".into()
         ))));
+    }
+
+    /// **A Browser that answers with no TCP port is not silent** (S5-L1-01):
+    /// an instance with TCP/IP off — SQL Express's install default — is
+    /// answered for with `np;…` and no `tcp;`, which the driver reports as
+    /// "Could not resolve SQL browser instance X". That contains "browser",
+    /// so it was read as silence and told the user the Browser was not
+    /// running, UDP was blocked or the name wrong — all three false. It is
+    /// its own case now, naming TCP/IP.
+    #[test]
+    fn a_browser_answer_without_a_tcp_port_is_not_its_silence() {
+        use tiberius::error::Error;
+        let answered =
+            Error::Conversion("Could not resolve SQL browser instance SQLEXPRESS".into());
+        assert!(!is_browser_silence(&answered));
+        assert!(is_browser_without_tcp(&answered));
+        let timeout = Error::Conversion("SQL browser timeout during resolving instance X".into());
+        assert!(!is_browser_without_tcp(&timeout));
+        let text = browser_without_tcp_text("db", "SQLEXPRESS");
+        assert!(
+            text.contains("TCP/IP") && !text.contains("not running"),
+            "{text}"
+        );
     }
 
     /// **The account browser asks nothing newer than 2016**, which the schema

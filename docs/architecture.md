@@ -14061,8 +14061,16 @@ existing prose was left alone.
   alike whether the service is not running, UDP 1434 is blocked on the way, or no instance there
   has that name — so the text names all three, and the way round them: the bare host and the port
   the instance listens on (`a_silent_browser_names_the_instance_and_the_way_round`). The match is
-  on the word `browser` in the driver's message, so a re-vendor that rewords it loses the
-  sentence and falls back to the driver's own. **On Windows the silence arrives as a reset, not a
+  on the two shapes silence takes — the driver's `SQL browser timeout …` and the reset mapped
+  below to `SQL browser gave no answer …` — so a re-vendor that rewords the driver's loses the
+  sentence and falls back to the driver's own. **It once matched any message naming the
+  browser**, which took in the driver's *Could not resolve SQL browser instance* — not silence
+  but an **answer without a TCP port**: a reply carries `tcp;<port>` only while the instance
+  listens on TCP (MS-SQLR), so an instance with TCP/IP off, SQL Express's install default, was
+  reported as a Browser not running, UDP blocked or a wrong name, all three false (S5-L1-01). That
+  answer is `is_browser_without_tcp` now, told by `browser_without_tcp_text`: the Browser answered,
+  the instance does not listen on TCP, enable TCP/IP for it in SQL Server Configuration Manager
+  (`a_browser_answer_without_a_tcp_port_is_not_its_silence`). **On Windows the silence arrives as a reset, not a
   timeout**: with nothing listening on UDP 1434 the host answers the query with an ICMP
   port-unreachable, which Windows hands the next `recv` as `WSAECONNRESET` (os error 10054) at
   once, so tiberius surfaced `Error::Io { kind: ConnectionReset }` and the connection form showed
@@ -14082,7 +14090,9 @@ existing prose was left alone.
   `127.0.0.1:1434`, since no container runs the Browser, answering MS-SQLR's `SVR_RESP` with the
   container's port; the saved port is 1, so a connect that used it would fail, and the instance
   is `MSSQLSERVER`, the name a default instance accepts in the login's instance check. With the
-  stand-in silenced, the same connect has to name the Browser and the instance. It skips on Azure
+  stand-in silenced, the same connect has to name the Browser and the instance; answering with
+  named pipes alone, it has to name TCP/IP and not a silent Browser (red, on 2022, with the
+  classifier's old `contains("browser")` match). It skips on Azure
   SQL Database, which has no named instances, and on any host but `127.0.0.1`; the whole leg
   passed on 2022 and 2025. The two paths that do not come through this connect answer the
   spelling themselves: `sqlcmd` does its own Browser lookup (`core::launch::sqlcmd_args`), and an

@@ -196,18 +196,32 @@ async fn a_named_instance_is_reached_through_sql_server_browser() {
             .await
             .expect("UDP 127.0.0.1:1434 is taken, so the stand-in Browser cannot answer"),
     );
-    let answering = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    // 1: answers with the TCP port; 0: silent; 2: answers with named pipes
+    // alone, as for an instance with TCP/IP off (S5-L1-01).
+    let answering = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(1));
     {
         let (browser, answering) = (browser.clone(), answering.clone());
         tokio::spawn(async move {
-            let data = format!("ServerName;H;InstanceName;MSSQLSERVER;IsClustered;No;tcp;{port};;");
-            let mut reply = vec![0x05];
-            reply.extend((data.len() as u16).to_le_bytes());
-            reply.extend(data.as_bytes());
+            let reply_of = |data: String| {
+                let mut reply = vec![0x05];
+                reply.extend((data.len() as u16).to_le_bytes());
+                reply.extend(data.as_bytes());
+                reply
+            };
+            let tcp = reply_of(format!(
+                "ServerName;H;InstanceName;MSSQLSERVER;IsClustered;No;tcp;{port};;"
+            ));
+            let pipes = reply_of(
+                "ServerName;H;InstanceName;MSSQLSERVER;IsClustered;No;\
+                 np;\\\\H\\pipe\\sql\\query;;"
+                    .to_string(),
+            );
             let mut buf = [0u8; 512];
             while let Ok((_, from)) = browser.recv_from(&mut buf).await {
-                if answering.load(std::sync::atomic::Ordering::SeqCst) {
-                    let _ = browser.send_to(&reply, from).await;
+                match answering.load(std::sync::atomic::Ordering::SeqCst) {
+                    1 => drop(browser.send_to(&tcp, from).await),
+                    2 => drop(browser.send_to(&pipes, from).await),
+                    _ => {}
                 }
             }
         });
@@ -229,7 +243,7 @@ async fn a_named_instance_is_reached_through_sql_server_browser() {
         Some("1".into())
     );
 
-    answering.store(false, std::sync::atomic::Ordering::SeqCst);
+    answering.store(0, std::sync::atomic::Ordering::SeqCst);
     let silent = named
         .fetch_query(None, "SELECT 1", 1, CancellationToken::new())
         .await
@@ -237,6 +251,20 @@ async fn a_named_instance_is_reached_through_sql_server_browser() {
     let why = silent.to_string();
     assert!(
         why.contains("SQL Server Browser") && why.contains("MSSQLSERVER"),
+        "{why}"
+    );
+    assert!(why.contains("not running"), "{why}");
+
+    // Answered, but with named pipes alone: TCP/IP is named, not a silent
+    // Browser.
+    answering.store(2, std::sync::atomic::Ordering::SeqCst);
+    let why = named
+        .fetch_query(None, "SELECT 1", 1, CancellationToken::new())
+        .await
+        .expect_err("a connect with no TCP port in the Browser's answer")
+        .to_string();
+    assert!(
+        why.contains("TCP/IP") && !why.contains("not running"),
         "{why}"
     );
 }
