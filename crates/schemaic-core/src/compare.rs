@@ -551,6 +551,10 @@ pub struct SchemaComparison {
     pub entries: Vec<CompareEntry>,
     /// Both sides' engine.
     pub dialect: SqlDialect,
+    /// The **left** schema's [`DbSchema::names_ignore_case`] — how every name
+    /// in this comparison was matched, kept so a plan matches its namespaces
+    /// the same way.
+    pub names_ignore_case: bool,
     /// A foreign-key cycle among the **right** schema's tables: no creation
     /// order satisfies every reference, so one edge was broken.
     ///
@@ -582,6 +586,11 @@ pub struct SchemaComparison {
     /// role schemas, PostgreSQL's `public` — which a hand-built target may
     /// show no sign of, and which is there all the same; nor one the target's
     /// reader listed though it holds nothing ([`DbSchema::namespaces`]).
+    ///
+    /// Matched as the target's names compare ([`Names`]): a source's `sales`
+    /// is the target's `Sales` on a case-insensitive database, where its
+    /// `CREATE SCHEMA` was refused (Msg 2714, CMP-04), and two source
+    /// spellings of one new namespace are one entry here.
     pub new_namespaces: Vec<String>,
     /// Constraint and index names a table this comparison drops still holds and
     /// a table it creates needs — see [`occupied_names`], which is what a table
@@ -593,14 +602,23 @@ pub struct SchemaComparison {
     /// [`SchemaPlan::destructive`], for [`SchemaPlan::cycles`]' reason — the
     /// statements are all there and one of them will be refused.
     pub name_clashes: Vec<NameClash>,
-    /// One line per SQL Server alias type whose **bound rule or default**
-    /// (`DbSchema::tsql_type_bindings`) the source has and the target lacks:
-    /// the comparison neither compares nor carries a binding — the rule or
-    /// default is an object of its own it does not create — so it made the
-    /// type without it and then called the two the same, a loss the dump
-    /// names in its header (S4.2-L1-07). Every plan's
-    /// [`SchemaPlan::omitted`] carries these.
-    pub binding_notes: Vec<String>,
+    /// What this comparison saw and **cannot compare or carry, whatever is
+    /// ticked** — one line each, about the two schemas rather than about a
+    /// plan. Two kinds today:
+    ///
+    /// - A source object a case-insensitive target cannot hold beside
+    ///   another the source also has, its name differing only in case
+    ///   (`pair`, CMP-05): one of the two is compared, and this line names
+    ///   the other.
+    /// - A SQL Server alias type whose **bound rule or default**
+    ///   (`DbSchema::tsql_type_bindings`) the source has and the target
+    ///   lacks: the comparison neither compares nor carries a binding — the
+    ///   rule or default is an object of its own it does not create — so it
+    ///   made the type without it and then called the two the same, a loss
+    ///   the dump names in its header (S4.2-L1-07).
+    ///
+    /// Every plan's [`SchemaPlan::omitted`] carries these.
+    pub notes: Vec<String>,
 }
 
 /// Why a comparison's tree is empty — see [`SchemaComparison::empty_reason`].
@@ -646,9 +664,16 @@ impl SchemaComparison {
         // diverges from MySQL's in ways that lose a column's own CHECK, and it
         // is the *left* server that will read the statements.
         let target = Target::new(dialect, left.flavour);
-        // The target's names decide whether two that differ in case are one
-        // (`pair`, `tsql_entry`): it is where the plan runs.
-        let fold = left.names_ignore_case;
+        // The target's names decide whether two that differ in case are one,
+        // and every name lookup below asks them (`Names`): it is where the
+        // plan runs.
+        let names = Names {
+            ignore_case: left.names_ignore_case,
+        };
+        // What this comparison saw and cannot compare or carry, whatever is
+        // ticked — see `SchemaComparison::notes`.
+        let mut notes: Vec<String> = Vec::new();
+        let described = |kind: CompareKind, label: String| format!("{} {label}", kind.label());
         // The right side read as if it had come from the left side's database.
         // Two identical databases are identical here and not one object earlier;
         // see [`as_read_from`] for what rides on the difference. Every read below
@@ -685,10 +710,17 @@ impl SchemaComparison {
                 display_name(t.schema.as_deref(), &t.name)
             )
         };
+        let table_kind = |t: &TableInfo| match t.shape() {
+            TableShape::View => CompareKind::View,
+            TableShape::Sequence => CompareKind::Sequence,
+            TableShape::Table => CompareKind::Table,
+        };
         for (l, r) in pair(
-            fold,
+            names,
             left.tables.iter().map(|t| (table_key(t), t)),
             right.tables.iter().map(|t| (table_key(t), t)),
+            |t| described(table_kind(t), display_name(t.schema.as_deref(), &t.name)),
+            &mut notes,
         ) {
             entries.push(table_entry(l, r, target, dialect));
         }
@@ -702,7 +734,7 @@ impl SchemaComparison {
         let trigger_key =
             |t: &TriggerInfo| format!("{}.{}", display_name(t.schema.as_deref(), &t.table), t.name);
         for (l, r) in pair(
-            fold,
+            names,
             left.tables
                 .iter()
                 .flat_map(|t| t.triggers.iter())
@@ -712,6 +744,8 @@ impl SchemaComparison {
                 .iter()
                 .flat_map(|t| t.triggers.iter())
                 .map(|tr| (trigger_key(tr), tr)),
+            |t| described(CompareKind::Trigger, trigger_key(t)),
+            &mut notes,
         ) {
             entries.push(trigger_entry(l, r, dialect));
         }
@@ -729,10 +763,25 @@ impl SchemaComparison {
                 r.identity_arguments
             )
         };
+        let routine_kind = |r: &RoutineInfo| match r.kind {
+            RoutineKind::Function => CompareKind::Function,
+            RoutineKind::Procedure => CompareKind::Procedure,
+        };
         for (l, r) in pair(
-            fold,
+            names,
             left.routines.iter().map(|r| (routine_key(r), r.as_ref())),
             right.routines.iter().map(|r| (routine_key(r), r.as_ref())),
+            |r| {
+                described(
+                    routine_kind(r),
+                    format!(
+                        "{}({})",
+                        display_name(r.schema.as_deref(), &r.name),
+                        r.identity_arguments
+                    ),
+                )
+            },
+            &mut notes,
         ) {
             entries.push(routine_entry(l, r, dialect));
         }
@@ -740,9 +789,11 @@ impl SchemaComparison {
         // ── events ──────────────────────────────────────────────────────────
         let event_key = |e: &EventInfo| display_name(e.schema.as_deref(), &e.name);
         for (l, r) in pair(
-            fold,
+            names,
             left.events.iter().map(|e| (event_key(e), e.as_ref())),
             right.events.iter().map(|e| (event_key(e), e.as_ref())),
+            |e| described(CompareKind::Event, event_key(e)),
+            &mut notes,
         ) {
             entries.push(event_entry(l, r, dialect));
         }
@@ -750,18 +801,22 @@ impl SchemaComparison {
         // ── standalone types ────────────────────────────────────────────────
         let enum_key = |e: &EnumInfo| display_name(e.schema.as_deref(), &e.name);
         for (l, r) in pair(
-            fold,
+            names,
             left.enums.iter().map(|e| (enum_key(e), e)),
             right.enums.iter().map(|e| (enum_key(e), e)),
+            |e| described(CompareKind::Enum, enum_key(e)),
+            &mut notes,
         ) {
             entries.push(enum_entry(l, r, left, dialect));
         }
 
         let domain_key = |d: &DomainInfo| display_name(d.schema.as_deref(), &d.name);
         for (l, r) in pair(
-            fold,
+            names,
             left.domains.iter().map(|d| (domain_key(d), d)),
             right.domains.iter().map(|d| (domain_key(d), d)),
+            |d| described(CompareKind::Domain, domain_key(d)),
+            &mut notes,
         ) {
             entries.push(domain_entry(l, r, left, dialect));
         }
@@ -773,7 +828,7 @@ impl SchemaComparison {
         let seq_key = |s: &SequenceInfo| display_name(s.schema.as_deref(), &s.name);
         let standalone = |s: &&SequenceInfo| s.owned_by.is_none();
         for (l, r) in pair(
-            fold,
+            names,
             left.sequences
                 .iter()
                 .filter(standalone)
@@ -783,6 +838,8 @@ impl SchemaComparison {
                 .iter()
                 .filter(standalone)
                 .map(|s| (seq_key(s), s)),
+            |s| described(CompareKind::Sequence, seq_key(s)),
+            &mut notes,
         ) {
             entries.push(sequence_entry(l, r, dialect));
         }
@@ -807,17 +864,23 @@ impl SchemaComparison {
                     .collect()
             }
             for (l, r) in pair(
-                fold,
+                names,
                 of_kind(left, ok).into_iter(),
                 of_kind(right, ok).into_iter(),
+                |t| described(ck, display_name(t.schema.as_deref(), &t.name)),
+                &mut notes,
             ) {
-                entries.push(tsql_entry(ck, ok, l, r, fold));
+                entries.push(tsql_entry(ck, ok, l, r, names));
             }
         }
 
         // ── order ───────────────────────────────────────────────────────────
-        let (creates, c1) = fk_rank(&right.tables, dialect, false);
-        let (drops, c2) = fk_rank(&left.tables, dialect, true);
+        //
+        // Ranks are keyed, and looked up, as the target's names compare: an
+        // entry paired across a case-only rename is named as the target
+        // spells it, and the ranks come off the source (CMP-02).
+        let (creates, c1) = fk_rank(&right.tables, dialect, false, names);
+        let (drops, c2) = fk_rank(&left.tables, dialect, true, names);
         // **A replaced type waits for the table drops that release it**
         // (S4.2-L1-03): an alias type, XML schema collection or sequence that
         // has to be dropped and created again ran in the type phase, ahead of
@@ -846,7 +909,7 @@ impl SchemaComparison {
             } else {
                 phase(e.kind, e.status)
             };
-            let name = display_name(e.schema.as_deref(), &e.name);
+            let name = names.key(&display_name(e.schema.as_deref(), &e.name));
             // Tables and views carry a dependency rank; every other kind ties
             // at zero and falls through to the name.
             //
@@ -877,7 +940,7 @@ impl SchemaComparison {
         // statements — because MySQL and MariaDB do not scope a `CHECK`
         // constraint name the same way, and this is the question that turns on
         // it.
-        let clashes = clashes_between(&entries, left, right, dialect, left.flavour);
+        let clashes = clashes_between(&entries, left, right, dialect, left.flavour, names);
         // Pull each resolvable drop to the front of the table phase. `retain` +
         // `splice` rather than a re-sort: the order everything else is in was
         // just computed and is not up for revision.
@@ -904,7 +967,7 @@ impl SchemaComparison {
             entries.splice(at..at, moved);
         }
         let mut clashes = clashes;
-        clashes.extend(free_names_across_kinds(&mut entries, left, fold));
+        clashes.extend(free_names_across_kinds(&mut entries, left, names));
 
         // ── namespaces ──────────────────────────────────────────────────────
         //
@@ -932,25 +995,33 @@ impl SchemaComparison {
                 ObjectStatus::OnlyRight | ObjectStatus::Differing | ObjectStatus::Same
             )
         };
-        let mut left_ns = namespaces(on_left);
-        left_ns.extend(left.namespaces.iter().cloned());
+        // As the target's names compare, both sets (CMP-04): a source's
+        // `sales` is the target's `Sales` on a case-insensitive database, and
+        // two source spellings of one new namespace are one `CREATE SCHEMA`.
+        let mut left_ns: BTreeSet<String> =
+            namespaces(on_left).iter().map(|n| names.key(n)).collect();
+        left_ns.extend(left.namespaces.iter().map(|n| names.key(n)));
         // A namespace every database comes with is there whether or not an
         // object in it was read — an empty target reads none at all.
-        let new_namespaces: Vec<String> = namespaces(on_right)
-            .into_iter()
-            .filter(|ns| !left_ns.contains(ns))
-            .filter(|ns| !ddl::namespace_comes_with_every_database(ns, dialect))
-            .collect();
+        let mut new_namespaces: Vec<String> = Vec::new();
+        for ns in namespaces(on_right) {
+            if left_ns.insert(names.key(&ns))
+                && !ddl::namespace_comes_with_every_database(&ns, dialect)
+            {
+                new_namespaces.push(ns);
+            }
+        }
 
-        let binding_notes = binding_notes(left, right, fold);
+        notes.extend(binding_notes(left, right, names));
         SchemaComparison {
             entries,
             dialect,
+            names_ignore_case: names.ignore_case,
             cycles_create: c1,
             cycles_drop: c2,
             new_namespaces,
             name_clashes: clashes,
-            binding_notes,
+            notes,
         }
     }
 
@@ -1127,13 +1198,16 @@ impl SchemaComparison {
         // Only the ones a *set in this plan* actually names: the comparison's
         // list is about the two schemas, and a plan over one ticked table has no
         // business creating a namespace for an object the user left out.
+        let names = Names {
+            ignore_case: self.names_ignore_case,
+        };
         let mut sets: Vec<ChangeSet> = self
             .new_namespaces
             .iter()
             .filter(|ns| {
                 chosen
                     .iter()
-                    .any(|s| s.schema.as_deref() == Some(ns.as_str()))
+                    .any(|s| s.schema.as_deref().is_some_and(|s| names.same(s, ns)))
             })
             .map(|ns| {
                 ddl::single(
@@ -1160,7 +1234,7 @@ impl SchemaComparison {
             .differences()
             .filter(|e| e.needs_source() || e.unplannable())
             .map(CompareEntry::omission_note)
-            .chain(self.binding_notes.iter().cloned())
+            .chain(self.notes.iter().cloned())
             .collect();
         // **A cycle breaks a plan that creates a table and one that drops
         // one, and they are not the same cycle.** A `CREATE` carries an inline
@@ -1557,25 +1631,103 @@ impl SchemaPlan {
 /// Pair two sides by key: every key either side holds, once, in key order so
 /// two runs of one comparison read the same.
 ///
-/// **Keys fold case where the target's names do** (`fold`,
+/// **Keys fold case where the target's names do** ([`Names`],
 /// [`DbSchema::names_ignore_case`]): on a case-insensitive SQL Server
 /// database `dbo.Orders` and `dbo.orders` are one object, and paired as a
 /// drop and a create of the same name the create came first and was refused
 /// (Msg 2714, S4.2-L1-02). Folded, they are one entry, and a renamed one.
+///
+/// **Two objects one side holds that fold to one key are said, not
+/// collapsed** (CMP-05): a case-sensitive source holding `dbo.Orders` and
+/// `dbo.orders` is two tables a case-insensitive target cannot hold side by
+/// side, and the second used to overwrite the first, so one was never
+/// planned or named. The one compared is the one the other side spells
+/// exactly, or else the first read; the other gets a line in `notes`, named
+/// by `what` ([`SchemaComparison::notes`]). Two that share a key *exactly*
+/// — no fold in it — are one object read twice, and the later reading
+/// stands, as it always did.
 fn pair<'a, T>(
-    fold: bool,
+    names: Names,
     left: impl Iterator<Item = (String, &'a T)>,
     right: impl Iterator<Item = (String, &'a T)>,
+    what: impl Fn(&T) -> String,
+    notes: &mut Vec<String>,
 ) -> Vec<(Option<&'a T>, Option<&'a T>)> {
-    let key = |k: String| if fold { k.to_lowercase() } else { k };
-    let mut by_key: BTreeMap<String, (Option<&'a T>, Option<&'a T>)> = BTreeMap::new();
+    type Slot<'a, T> = Option<(String, &'a T)>;
+    let mut by_key: BTreeMap<String, (Slot<'a, T>, Slot<'a, T>)> = BTreeMap::new();
+    let mut set_aside = |side: &str, kept: &T, aside: &T| {
+        let kept = what(kept);
+        notes.push(format!(
+            "{} — the {side} also holds {kept}, and the target's names ignore case, so \
+             it can hold only one of the two; {kept} is the one compared",
+            what(aside),
+        ));
+    };
     for (k, v) in left {
-        by_key.entry(key(k)).or_default().0 = Some(v);
+        let slot = &mut by_key.entry(names.key(&k)).or_default().0;
+        match slot {
+            Some((had, kept)) if *had != k => set_aside("target", kept, v),
+            _ => *slot = Some((k, v)),
+        }
     }
     for (k, v) in right {
-        by_key.entry(key(k)).or_default().1 = Some(v);
+        let (l, slot) = by_key.entry(names.key(&k)).or_default();
+        match slot {
+            Some((had, kept)) if *had != k => {
+                let spelt_as_target = l.as_ref().is_some_and(|(lk, _)| *lk == k);
+                if spelt_as_target {
+                    set_aside("source", v, kept);
+                    *slot = Some((k, v));
+                } else {
+                    set_aside("source", kept, v);
+                }
+            }
+            _ => *slot = Some((k, v)),
+        }
     }
-    by_key.into_values().collect()
+    by_key
+        .into_values()
+        .map(|(l, r)| (l.map(|(_, v)| v), r.map(|(_, v)| v)))
+        .collect()
+}
+
+/// **How the target compares names — the one fold every name lookup in a
+/// comparison goes through** ([`DbSchema::names_ignore_case`]). The target's
+/// collation decides, that being where the plan runs.
+///
+/// One type rather than a `bool` each site lowercases by, because the sites
+/// did not all: `pair` folded while the dependency ranks, the clash census
+/// and the namespace check compared exactly, so an entry paired across a
+/// case-only rename — named as the target spells it — missed its rank and
+/// ran its new foreign key before the table it references (CMP-02), and a
+/// namespace the target held in another case was created again (CMP-04).
+#[derive(Clone, Copy, Debug)]
+struct Names {
+    ignore_case: bool,
+}
+
+impl Names {
+    /// The name as this target tells names apart.
+    fn key(self, name: &str) -> String {
+        if self.ignore_case {
+            name.to_lowercase()
+        } else {
+            name.to_string()
+        }
+    }
+
+    /// Are these one name here?
+    fn same(self, a: &str, b: &str) -> bool {
+        a == b || (self.ignore_case && a.to_lowercase() == b.to_lowercase())
+    }
+
+    /// The same, of two namespaces either of which may be absent.
+    fn same_ns(self, a: Option<&str>, b: Option<&str>) -> bool {
+        match (a, b) {
+            (Some(a), Some(b)) => self.same(a, b),
+            (a, b) => a == b,
+        }
+    }
 }
 
 /// The status a pair implies. **Read off the change set**, never beside it —
@@ -1796,18 +1948,34 @@ fn clashes_between(
     right: &DbSchema,
     dialect: SqlDialect,
     flavour: crate::schema::ServerFlavour,
+    names: Names,
 ) -> Vec<NameClash> {
     // The shape, not `!is_view` — a MariaDB sequence is not a view and is not a
     // table either, and pulling one into the clash census would make it a
     // drop/create candidate for a name it has no `CREATE TABLE` for.
+    //
+    // **As the target's names compare** (CMP-02): an entry paired across a
+    // case-only rename is named as the target spells it, so the source's
+    // table was not found, and what it acquired went unchecked. The exact
+    // spelling first, for a source holding two that fold together (`pair`).
     let table_of = |src: &[TableInfo], e: &CompareEntry| -> Option<TableInfo> {
-        src.iter()
-            .find(|t| {
-                t.shape() == TableShape::Table
-                    && t.name == e.name
-                    && t.schema.as_deref() == e.schema.as_deref()
+        let tables = || src.iter().filter(|t| t.shape() == TableShape::Table);
+        tables()
+            .find(|t| t.name == e.name && t.schema.as_deref() == e.schema.as_deref())
+            .or_else(|| {
+                tables().find(|t| {
+                    names.same(&t.name, &e.name)
+                        && names.same_ns(t.schema.as_deref(), e.schema.as_deref())
+                })
             })
             .cloned()
+    };
+    // A constraint name is an object name too, and folds the same way.
+    let occupied = |t: &TableInfo| -> BTreeMap<String, String> {
+        occupied_names(t, dialect, flavour)
+            .into_iter()
+            .map(|n| (names.key(&n), n))
+            .collect()
     };
     let is_table = |e: &&CompareEntry| e.kind == CompareKind::Table;
     let drops: Vec<(&CompareEntry, TableInfo)> = entries
@@ -1828,32 +1996,37 @@ fn clashes_between(
         let Some(made) = table_of(&right.tables, create) else {
             continue;
         };
-        let mut claimed = occupied_names(&made, dialect, flavour);
+        let mut claimed = occupied(&made);
         // A `Differing` table keeps the names it already had; only what it is
         // *acquiring* can clash with something else's.
         if create.status == ObjectStatus::Differing
             && let Some(was) = table_of(&left.tables, create)
         {
-            for had in occupied_names(&was, dialect, flavour) {
-                claimed.remove(&had);
+            for had in occupied(&was).keys() {
+                claimed.remove(had);
             }
         }
         if claimed.is_empty() {
             continue;
         }
         for (drop, held) in &drops {
-            let names: Vec<String> = occupied_names(held, dialect, flavour)
-                .intersection(&claimed)
-                .cloned()
+            let shared: Vec<String> = occupied(held)
+                .keys()
+                .filter_map(|k| claimed.get(k).cloned())
                 .collect();
-            if names.is_empty() {
+            if shared.is_empty() {
                 continue;
             }
             out.push(NameClash {
                 freed_by: drop.key(),
                 claimed_by: create.key(),
-                names,
-                resolved: nothing_else_references(&held.name, held.schema.as_deref(), &left.tables),
+                names: shared,
+                resolved: nothing_else_references(
+                    &held.name,
+                    held.schema.as_deref(),
+                    &left.tables,
+                    names,
+                ),
             });
         }
     }
@@ -1868,13 +2041,21 @@ fn clashes_between(
 /// the drop past them trades one refused statement for another. Where the
 /// answer is no, the clash is disclosed rather than reordered — the posture
 /// [`SchemaPlan::cycles`] already takes for a statement the server will refuse.
-fn nothing_else_references(table: &str, schema: Option<&str>, left: &[TableInfo]) -> bool {
-    let me = display_name(schema, table);
+///
+/// Names compare as the target's do (`names`): a key spelling the table in
+/// another case still references it there.
+fn nothing_else_references(
+    table: &str,
+    schema: Option<&str>,
+    left: &[TableInfo],
+    names: Names,
+) -> bool {
+    let me = names.key(&display_name(schema, table));
     !left.iter().any(|t| {
-        display_name(t.schema.as_deref(), &t.name) != me
+        names.key(&display_name(t.schema.as_deref(), &t.name)) != me
             && t.foreign_keys
                 .iter()
-                .any(|fk| display_name(fk.ref_schema.as_deref(), &fk.ref_table) == me)
+                .any(|fk| names.key(&display_name(fk.ref_schema.as_deref(), &fk.ref_table)) == me)
     })
 }
 
@@ -1885,7 +2066,7 @@ fn nothing_else_references(table: &str, schema: Option<&str>, left: &[TableInfo]
 /// of every table drop, and a table's create ahead of a synonym's drop: "move
 /// a table, leave a compatibility synonym" was Msg 2714 and the migration
 /// rolled back (S4.2-L1-02, every shape measured on 2022). Names compare as
-/// the target's do (`fold`).
+/// the target's do ([`Names`]).
 ///
 /// Each such drop moves to just ahead of the create — never ahead of phase
 /// 0, the dependents that come off first, since a create sits past it —
@@ -1896,7 +2077,7 @@ fn nothing_else_references(table: &str, schema: Option<&str>, left: &[TableInfo]
 fn free_names_across_kinds(
     entries: &mut Vec<CompareEntry>,
     left: &DbSchema,
-    fold: bool,
+    names: Names,
 ) -> Vec<NameClash> {
     let shares = |k: CompareKind| {
         matches!(
@@ -1904,10 +2085,7 @@ fn free_names_across_kinds(
             CompareKind::Table | CompareKind::View | CompareKind::Sequence | CompareKind::Synonym
         )
     };
-    let name_of = |e: &CompareEntry| {
-        let n = display_name(e.schema.as_deref(), &e.name);
-        if fold { n.to_lowercase() } else { n }
-    };
+    let name_of = |e: &CompareEntry| names.key(&display_name(e.schema.as_deref(), &e.name));
     let drops: Vec<String> = entries
         .iter()
         .filter(|e| e.status == ObjectStatus::OnlyLeft && shares(e.kind))
@@ -1929,9 +2107,12 @@ fn free_names_across_kinds(
         };
         let dropped = &entries[d];
         let free = match kind {
-            CompareKind::Table => {
-                nothing_else_references(&dropped.name, dropped.schema.as_deref(), &left.tables)
-            }
+            CompareKind::Table => nothing_else_references(
+                &dropped.name,
+                dropped.schema.as_deref(),
+                &left.tables,
+                names,
+            ),
             CompareKind::Sequence => !left.tables.iter().any(|t| {
                 t.columns.iter().any(|col| {
                     col.default
@@ -1959,17 +2140,11 @@ fn free_names_across_kinds(
 }
 
 /// The alias types whose bound rule or default the source has and the target
-/// lacks, one line each — see [`SchemaComparison::binding_notes`]. Matched by
-/// schema and type name as the target compares names (`fold`), and a binding
-/// by the rule's or default's name as the catalogue printed it.
-fn binding_notes(left: &DbSchema, right: &DbSchema, fold: bool) -> Vec<String> {
-    let same = |a: &str, b: &str| {
-        if fold {
-            a.to_lowercase() == b.to_lowercase()
-        } else {
-            a == b
-        }
-    };
+/// lacks, one line each — see [`SchemaComparison::notes`]. Matched by
+/// schema and type name as the target compares names ([`Names`]), and a
+/// binding by the rule's or default's name as the catalogue printed it.
+fn binding_notes(left: &DbSchema, right: &DbSchema, names: Names) -> Vec<String> {
+    let same = |a: &str, b: &str| names.same(a, b);
     let key = |b: &crate::schema::TsqlTypeBinding| {
         (
             b.schema
@@ -2038,9 +2213,10 @@ fn kind_rank(kind: CompareKind, status: ObjectStatus) -> i16 {
     }
 }
 
-/// Each table's **and view's** position in dependency order, by qualified name,
-/// plus whether a cycle had to be broken. `reverse` is for the drop phase: a
-/// referencing table has to go before the table it references.
+/// Each table's **and view's** position in dependency order, by qualified name
+/// as the target's names compare ([`Names`]), plus whether a cycle had to be
+/// broken. `reverse` is for the drop phase: a referencing table has to go
+/// before the table it references.
 ///
 /// [`crate::dump::order_tables`] is the sort — a second topological order over
 /// the same edges is a second answer to one question.
@@ -2054,6 +2230,7 @@ fn fk_rank(
     tables: &[TableInfo],
     dialect: SqlDialect,
     reverse: bool,
+    names: Names,
 ) -> (BTreeMap<String, usize>, bool) {
     let chosen: Vec<String> = tables
         .iter()
@@ -2069,7 +2246,7 @@ fn fk_rank(
         .into_iter()
         .enumerate()
         .map(|(pos, i)| {
-            let name = display_name(tables[i].schema.as_deref(), &tables[i].name);
+            let name = names.key(&display_name(tables[i].schema.as_deref(), &tables[i].name));
             (name, if reverse { n - pos } else { pos })
         })
         .collect();
@@ -2702,15 +2879,15 @@ fn sequence_entry(
 /// re-created there.
 ///
 /// **A synonym's target compares as the target database's names do**
-/// (`fold`): two synonyms naming `[dbo].[Orders]` and `[dbo].[orders]` on a
-/// case-insensitive database are the same synonym, and were replaced —
+/// ([`Names`]): two synonyms naming `[dbo].[Orders]` and `[dbo].[orders]` on
+/// a case-insensitive database are the same synonym, and were replaced —
 /// losing its grants — for the spelling alone (S4.2-L1-06).
 fn tsql_entry(
     kind: CompareKind,
     object: ObjectKind,
     l: Option<&TsqlObject>,
     r: Option<&TsqlObject>,
-    fold: bool,
+    names: Names,
 ) -> CompareEntry {
     let any = l.or(r).expect("a pair holds at least one side");
     let changes = match (l, r) {
@@ -2724,12 +2901,11 @@ fn tsql_entry(
                     },
                 ) if within(kept, min, max) => start.clone_from(kept),
                 (TsqlObjectKind::Synonym { target: kept }, TsqlObjectKind::Synonym { target })
-                    if fold
-                        && kept.len() == target.len()
+                    if kept.len() == target.len()
                         && kept
                             .iter()
                             .zip(target.iter())
-                            .all(|(a, b)| a.to_lowercase() == b.to_lowercase()) =>
+                            .all(|(a, b)| names.same(a, b)) =>
                 {
                     target.clone_from(kept)
                 }
@@ -3513,11 +3689,12 @@ mod tests {
                 right_ddl: String::new(),
             }],
             dialect: SqlDialect::MySql,
+            names_ignore_case: false,
             cycles_create: false,
             cycles_drop: false,
             new_namespaces: Vec::new(),
             name_clashes: Vec::new(),
-            binding_notes: Vec::new(),
+            notes: Vec::new(),
         };
         let plan = c.plan(|_| true);
         assert_eq!(plan.len(), 0, "nothing to apply");
@@ -3597,11 +3774,12 @@ mod tests {
         let c = SchemaComparison {
             entries: vec![entry],
             dialect: SqlDialect::Postgres,
+            names_ignore_case: false,
             cycles_create: false,
             cycles_drop: false,
             new_namespaces: Vec::new(),
             name_clashes: Vec::new(),
-            binding_notes: Vec::new(),
+            notes: Vec::new(),
         };
         let plan = c.plan(|_| true);
         assert_eq!(plan.len(), 0, "not an object the plan applies");
@@ -4428,6 +4606,180 @@ mod tests {
             SqlDialect::MsSql,
         );
         assert_eq!(find(&c, "synonym:dbo.c").status, ObjectStatus::Differing);
+    }
+
+    fn ci(tables: Vec<TableInfo>) -> DbSchema {
+        DbSchema {
+            names_ignore_case: true,
+            ..with_tsql(tables, vec![])
+        }
+    }
+
+    fn position(stmts: &[String], needle: &str) -> usize {
+        stmts
+            .iter()
+            .position(|s| s.contains(needle))
+            .unwrap_or_else(|| panic!("no {needle} in {stmts:#?}"))
+    }
+
+    /// **A table paired across a case-only rename keeps its dependency
+    /// rank** (CMP-02): the entry is named as the target spells it while the
+    /// ranks were keyed as the source does, so `dbo.Orders` paired with the
+    /// source's `dbo.orders` ranked 0 and its new foreign key ran before
+    /// `CREATE TABLE [dbo].[customers]` — refused, and the migration rolled
+    /// back. A view paired the same way lost its rank among the views.
+    #[test]
+    fn a_table_paired_across_a_case_rename_keeps_its_place_in_the_plan() {
+        let orders = |name: &str, fk: bool| TableInfo {
+            foreign_keys: if fk {
+                vec![ForeignKeyInfo {
+                    name: "fk_c".into(),
+                    columns: vec!["customer_id".into()],
+                    ref_schema: Some("dbo".into()),
+                    ref_table: "customers".into(),
+                    ref_columns: vec!["id".into()],
+                    ..Default::default()
+                }]
+            } else {
+                vec![]
+            },
+            ..tsql_table(name, &[("id", "int"), ("customer_id", "int")])
+        };
+        let s = SchemaComparison::of(
+            &ci(vec![orders("Orders", false)]),
+            &ci(vec![
+                orders("orders", true),
+                tsql_table("customers", &[("id", "int")]),
+            ]),
+            SqlDialect::MsSql,
+        )
+        .plan(|_| true)
+        .emit();
+        assert!(
+            position(&s, "CREATE TABLE [dbo].[customers]") < position(&s, "[fk_c]"),
+            "{s:#?}"
+        );
+
+        let view = |name: &str, body: &str| TableInfo {
+            schema: Some("dbo".into()),
+            ..view(name, body)
+        };
+        let s = SchemaComparison::of(
+            &ci(vec![view("V", "SELECT 1 AS id")]),
+            &ci(vec![
+                view("v", "SELECT id FROM dbo.a_new"),
+                view("a_new", "SELECT 1 AS id"),
+            ]),
+            SqlDialect::MsSql,
+        )
+        .plan(|_| true)
+        .emit();
+        assert!(
+            position(&s, "SELECT 1 AS id") < position(&s, "FROM dbo.a_new"),
+            "{s:#?}"
+        );
+    }
+
+    /// **And the clash census finds it** (CMP-02): `clashes_between` looked
+    /// the source's table up by the entry's — the target's — spelling, missed
+    /// it, and never asked what names a case-renamed table acquires, so a
+    /// constraint name a dropped table still held was refused at the `ALTER`.
+    #[test]
+    fn a_table_paired_across_a_case_rename_is_in_the_clash_census() {
+        use crate::schema::CheckInfo;
+        let checked = |name: &str, check: &str| TableInfo {
+            check_constraints: vec![CheckInfo {
+                name: check.into(),
+                expression: "id > 0".into(),
+                ..Default::default()
+            }],
+            ..tsql_table(name, &[("id", "int")])
+        };
+        let c = SchemaComparison::of(
+            &ci(vec![
+                tsql_table("Orders", &[("id", "int")]),
+                checked("archive", "ck_x"),
+            ]),
+            &ci(vec![checked("orders", "CK_X")]),
+            SqlDialect::MsSql,
+        );
+        let claims: Vec<(&str, &str)> = c
+            .name_clashes
+            .iter()
+            .map(|n| (n.freed_by.as_str(), n.claimed_by.as_str()))
+            .collect();
+        assert_eq!(claims, vec![("table:dbo.archive", "table:dbo.Orders")]);
+        let s = c.plan(|_| true).emit();
+        assert!(
+            position(&s, "DROP TABLE [dbo].[archive]") < position(&s, "[CK_X]"),
+            "{s:#?}"
+        );
+    }
+
+    /// **A namespace compares as the target's names do** (CMP-04): objects
+    /// were folded and namespaces were not, so a source's `sales.t` against
+    /// a target holding `Sales` planned `CREATE SCHEMA [sales]` (Msg 2714 on
+    /// a `CI` database) — and two source spellings of one new namespace
+    /// planned it twice.
+    #[test]
+    fn a_namespace_the_target_holds_in_another_case_is_not_planned() {
+        let in_ns = |ns: &str, name: &str| TableInfo {
+            schema: Some(ns.into()),
+            ..table(name, &[("id", "int")])
+        };
+        let target = DbSchema {
+            namespaces: vec!["Sales".into()],
+            ..ci(vec![])
+        };
+        let c = SchemaComparison::of(&target, &ci(vec![in_ns("sales", "t")]), SqlDialect::MsSql);
+        assert!(c.new_namespaces.is_empty(), "{:?}", c.new_namespaces);
+        let s = c.plan(|_| true).emit();
+        assert!(!s.iter().any(|x| x.contains("CREATE SCHEMA")), "{s:#?}");
+
+        let source = DbSchema {
+            names_ignore_case: false,
+            ..ci(vec![in_ns("Sales", "t"), in_ns("SALES", "u")])
+        };
+        let s = SchemaComparison::of(&ci(vec![]), &source, SqlDialect::MsSql)
+            .plan(|_| true)
+            .emit();
+        let schemas: Vec<&String> = s.iter().filter(|x| x.contains("CREATE SCHEMA")).collect();
+        assert_eq!(schemas.len(), 1, "{s:#?}");
+        assert!(position(&s, "CREATE SCHEMA") < position(&s, "CREATE TABLE"));
+    }
+
+    /// **Two source objects one case-insensitive target cannot tell apart are
+    /// said, not collapsed** (CMP-05): folded to one key, the second
+    /// overwrote the first, and one table was never planned or named. The
+    /// one the target already spells is the one compared.
+    #[test]
+    fn two_source_objects_differing_only_in_case_are_named_not_collapsed() {
+        let source = DbSchema {
+            names_ignore_case: false,
+            ..ci(vec![
+                tsql_table("Orders", &[("id", "int")]),
+                tsql_table("orders", &[("id", "int")]),
+            ])
+        };
+        let c = SchemaComparison::of(&ci(vec![]), &source, SqlDialect::MsSql);
+        assert_eq!(c.entries.len(), 1, "{:?}", keys(&c));
+        let omitted = c.plan(|_| true).omitted.join("\n");
+        assert!(
+            omitted.contains("dbo.Orders") && omitted.contains("dbo.orders"),
+            "{omitted}"
+        );
+        // The target's own spelling is the one compared.
+        let c = SchemaComparison::of(
+            &ci(vec![tsql_table("orders", &[("id", "int")])]),
+            &source,
+            SqlDialect::MsSql,
+        );
+        assert_eq!(find(&c, "table:dbo.orders").status, ObjectStatus::Same);
+        assert!(
+            c.notes.iter().any(|n| n.starts_with("table dbo.Orders")),
+            "{:?}",
+            c.notes
+        );
     }
 
     /// **A replaced type is dropped once the tables that used it are gone**

@@ -5356,6 +5356,84 @@ async fn a_comparison_orders_shared_names_and_folds_case() {
     assert!(left.is_empty(), "{left:?}");
 }
 
+/// **Every name a comparison looks up is matched as the target's are**
+/// (CMP-02/04/05), from a case-sensitive source into a case-insensitive
+/// target: `dbo.Orders` paired with the source's `dbo.orders` added its
+/// foreign key before the table it references existed; the source's
+/// `sales` planned `CREATE SCHEMA` beside the target's `Sales` (Msg 2714);
+/// and of the source's `dbo.Items` and `dbo.items` one vanished unsaid. The
+/// plan applies, the left-out table is named, and a second comparison finds
+/// nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_comparison_matches_every_name_as_the_target_does() {
+    use schemaic_core::compare::SchemaComparison;
+    if !enabled() || azure_cannot("needs a second database, of its own collation") {
+        return;
+    }
+    let target = Scratch::create("cmp_fold_target").await;
+    let source = Scratch::create("cmp_fold_source").await;
+    base_db()
+        .fetch_query(
+            None,
+            &format!(
+                "ALTER DATABASE [{}] COLLATE Latin1_General_CS_AS",
+                source.name
+            ),
+            1,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("could not make {} case-sensitive: {e}", source.name));
+    for sql in [
+        "CREATE TABLE dbo.Orders (id int NOT NULL CONSTRAINT pk_orders PRIMARY KEY, \
+         customer_id int NULL)",
+        "CREATE SCHEMA Sales",
+    ] {
+        target.exec(sql).await;
+    }
+    for sql in [
+        "CREATE TABLE dbo.customers (id int NOT NULL CONSTRAINT pk_customers PRIMARY KEY)",
+        "CREATE TABLE dbo.orders (id int NOT NULL CONSTRAINT pk_orders PRIMARY KEY, \
+         customer_id int NULL CONSTRAINT fk_c REFERENCES dbo.customers (id))",
+        "CREATE SCHEMA sales",
+        "CREATE TABLE sales.t (id int NULL)",
+        "CREATE TABLE dbo.Items (id int NULL)",
+        "CREATE TABLE dbo.items (id int NULL)",
+    ] {
+        source.exec(sql).await;
+    }
+    let read = |s: &Scratch| {
+        let (db, name) = (s.db.clone(), s.name.clone());
+        async move {
+            db.fetch_schema(&name, CancellationToken::new())
+                .await
+                .unwrap()
+        }
+    };
+    let src = read(&source).await;
+    assert!(!src.names_ignore_case, "the source is case-sensitive");
+    let c = SchemaComparison::of(&read(&target).await, &src, MS);
+    assert!(c.new_namespaces.is_empty(), "{:?}", c.new_namespaces);
+    let said = |c: &SchemaComparison| {
+        c.notes
+            .iter()
+            .any(|n| n.contains("dbo.Items") && n.contains("dbo.items"))
+    };
+    assert!(said(&c), "{:?}", c.notes);
+    let plan = c.plan(|_| true);
+    assert!(plan.clashes.is_empty(), "{:?}", plan.clashes);
+    let stmts = plan.emit();
+    target
+        .db
+        .run_ddl(&target.name, &stmts, CancellationToken::new())
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{}", stmts.join("\n")));
+    let again = SchemaComparison::of(&read(&target).await, &src, MS);
+    let left: Vec<String> = again.differences().map(|e| e.key()).collect();
+    assert!(left.is_empty(), "{left:?}");
+    assert!(said(&again), "{:?}", again.notes);
+}
+
 /// **A Storage switch leaves nothing the new kind refuses** (S3.1-L1-02): a
 /// filtered `(qty DESC)` index made Columnstore kept its direction (Msg
 /// 35302), and made Clustered columnstore its filter (Msg 102). Each plan

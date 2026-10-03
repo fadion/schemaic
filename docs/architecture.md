@@ -6769,6 +6769,30 @@ existing prose was left alone.
     differ makes the case-only rename a rename — `EXEC sp_rename N'[dbo].[Orders]', N'orders';` for
     a synonym (`a_case_only_difference_is_one_object_where_names_ignore_case`). Only SQL Server's
     reader ever sets the flag, so every other comparison pairs on exact keys, as all of them did.
+    **Every name lookup goes through the same fold**, a `Names` value built once from that flag —
+    `pair`'s keys, the dependency ranks `fk_rank` keys and the sort looks up, `clashes_between`'s
+    table lookup and the constraint names it intersects, `nothing_else_references`,
+    `free_names_across_kinds`, the namespace check, `binding_notes` and a synonym's target. They
+    were a `bool` each site lowercased by, and not every site did: a paired entry is named as the
+    *target* spells it while the ranks were keyed as the source does, so `dbo.Orders` paired with
+    the source's `dbo.orders` ranked 0 and ran its new foreign key ahead of `CREATE TABLE
+    [dbo].[customers]` (a view lost its rank the same way), and the clash census never found the
+    source's table to ask what names it acquired (CMP-02,
+    `a_table_paired_across_a_case_rename_keeps_its_place_in_the_plan`,
+    `a_table_paired_across_a_case_rename_is_in_the_clash_census`); and the namespace check compared
+    exactly, so a source's `sales` beside the target's `Sales` planned `CREATE SCHEMA` (Msg 2714),
+    and two source spellings of one new namespace planned it twice (CMP-04,
+    `a_namespace_the_target_holds_in_another_case_is_not_planned`). `SchemaComparison` keeps the
+    flag (`names_ignore_case`) so `plan` matches a new namespace to the sets naming it the same way.
+    **Two objects one side holds that fold to one key are said, not collapsed** (CMP-05): a
+    case-sensitive source's `dbo.Orders` and `dbo.orders` are two tables a case-insensitive target
+    cannot hold together, and the second overwrote the first in `pair`'s map, so one was never
+    planned or named. The one compared is the one the other side spells exactly, or else the first
+    read, and the other gets a line in `SchemaComparison::notes`
+    (`two_source_objects_differing_only_in_case_are_named_not_collapsed`). Live, all three from a
+    `Latin1_General_CS_AS` source into a `CI` target: `a_comparison_matches_every_name_as_the_target_does`.
+    A built-in namespace is still matched exactly (`ddl::namespace_comes_with_every_database`), so a
+    case-sensitive source's `DBO` into an empty target would plan `CREATE SCHEMA [DBO]`.
     **SQL Server's sequences, alias types, XML schema collections and synonyms are paired out of
     `DbSchema::tsql_objects`**, kind by kind — a local `of_kind` keys each by `display_name`, as
     every other kind is keyed — and each pair is one `tsql_entry`: `ddl::diff_tsql_object` between
@@ -6820,9 +6844,9 @@ existing prose was left alone.
     is refused (Msg 11704), as it always was. **An alias type's bound rule or default is
     not compared or carried** — the rule or default is an object of its own, and the comparison
     creates none — so it made the type bare and then called the two databases the same, a loss the
-    dump names in its header (S4.2-L1-07). It is said instead: `SchemaComparison::binding_notes`
-    holds a line for each binding the source's `DbSchema::tsql_type_bindings` has and the target's
-    lacks, matched as the target's names compare, and every plan's `omitted` carries them
+    dump names in its header (S4.2-L1-07). It is said instead: `SchemaComparison::notes` holds a
+    line for each binding the source's `DbSchema::tsql_type_bindings` has and the target's lacks
+    (`binding_notes`), matched as the target's names compare, and every plan's `omitted` carries them
     (`an_alias_types_binding_the_target_lacks_is_disclosed`; live,
     `a_comparison_names_an_alias_types_binding_it_leaves_behind`, before and after Apply). The trade runs the other way too — a sequence the
     comparison creates is `create_sql` alone and starts at its own `START WITH`, where the dump moves
@@ -9889,7 +9913,7 @@ existing prose was left alone.
     `pg_catalog::an_empty_schema_is_listed_and_not_created_again` on PostgreSQL 16, both watched fail
     with the fix stashed.
     **`DbSchema::names_ignore_case` is whether two names differing only in case are one object
-    there**, and the comparison is its one reader (`pair` and `tsql_entry`, under `compare.rs`).
+    there**, and the comparison is its one reader (its `Names` fold, under `compare.rs`).
     SQL Server's `collect_schema` asks the database's collation through `db::mssql`'s
     `NAME_CASE_PROBE` — `COLLATIONPROPERTY(DATABASEPROPERTYEX(DB_NAME(), 'Collation'),
     'ComparisonStyle')`, whose bit 1 is ignore-case: measured, `SQL_Latin1_General_CP1_CI_AS`
