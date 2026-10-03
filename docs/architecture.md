@@ -6843,8 +6843,10 @@ existing prose was left alone.
     read, and the other gets a line in `SchemaComparison::notes`
     (`two_source_objects_differing_only_in_case_are_named_not_collapsed`). Live, all three from a
     `Latin1_General_CS_AS` source into a `CI` target: `a_comparison_matches_every_name_as_the_target_does`.
-    A built-in namespace is still matched exactly (`ddl::namespace_comes_with_every_database`), so a
-    case-sensitive source's `DBO` into an empty target would plan `CREATE SCHEMA [DBO]`.
+    A built-in namespace is matched the same way: `ddl::namespace_comes_with_every_database` takes the
+    target's `names_ignore_case`, so a case-sensitive source's `DBO` is `dbo` on a `CI` target and is
+    not created, and on a case-sensitive one is a namespace of its own and is
+    (`a_built_in_namespace_in_another_case_is_not_planned_where_case_folds`).
     **SQL Server's sequences, alias types, XML schema collections and synonyms are paired out of
     `DbSchema::tsql_objects`**, kind by kind — a local `of_kind` keys each by `display_name`, as
     every other kind is keyed — and each pair is one `tsql_entry`: `ddl::diff_tsql_object` between

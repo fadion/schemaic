@@ -1021,7 +1021,7 @@ impl SchemaComparison {
         let mut new_namespaces: Vec<String> = Vec::new();
         for ns in namespaces(on_right) {
             if left_ns.insert(names.key(&ns))
-                && !ddl::namespace_comes_with_every_database(&ns, dialect)
+                && !ddl::namespace_comes_with_every_database(&ns, dialect, names.ignore_case)
             {
                 new_namespaces.push(ns);
             }
@@ -4765,6 +4765,32 @@ mod tests {
     /// a target holding `Sales` planned `CREATE SCHEMA [sales]` (Msg 2714 on
     /// a `CI` database) — and two source spellings of one new namespace
     /// planned it twice.
+    /// **So does a namespace every database comes with.** A case-sensitive
+    /// source can hold `DBO.t`; on a case-insensitive target that is `dbo`,
+    /// which the target has whatever it lists, so `CREATE SCHEMA [DBO]` is Msg
+    /// 2714 and the whole migration rolls back. On a case-sensitive target
+    /// `DBO` is a namespace of its own and is still created.
+    #[test]
+    fn a_built_in_namespace_in_another_case_is_not_planned_where_case_folds() {
+        let in_ns = |ns: &str, name: &str| TableInfo {
+            schema: Some(ns.into()),
+            ..table(name, &[("id", "int")])
+        };
+        let source = DbSchema {
+            names_ignore_case: false,
+            ..ci(vec![in_ns("DBO", "t")])
+        };
+        let c = SchemaComparison::of(&ci(vec![]), &source, SqlDialect::MsSql);
+        assert!(c.new_namespaces.is_empty(), "{:?}", c.new_namespaces);
+
+        let cs_target = DbSchema {
+            names_ignore_case: false,
+            ..ci(vec![])
+        };
+        let c = SchemaComparison::of(&cs_target, &source, SqlDialect::MsSql);
+        assert_eq!(c.new_namespaces, vec!["DBO".to_string()]);
+    }
+
     #[test]
     fn a_namespace_the_target_holds_in_another_case_is_not_planned() {
         let in_ns = |ns: &str, name: &str| TableInfo {

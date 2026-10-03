@@ -3576,7 +3576,16 @@ pub fn is_namespace_change(change: &Change) -> bool {
 /// — where planning it refused the plan into every database that still has
 /// it, which is nearly all of them. MySQL and SQLite have no such level, and no
 /// object there carries a namespace for this to be asked about.
-pub fn namespace_comes_with_every_database(name: &str, dialect: SqlDialect) -> bool {
+///
+/// `ignore_case` is the target's (`DbSchema::names_ignore_case`): on a
+/// case-insensitive SQL Server database a case-sensitive source's `DBO` *is*
+/// `dbo`, and `CREATE SCHEMA [DBO]` there is Msg 2714. On a case-sensitive one
+/// it is a namespace of its own.
+pub fn namespace_comes_with_every_database(
+    name: &str,
+    dialect: SqlDialect,
+    ignore_case: bool,
+) -> bool {
     let builtin: &[&str] = match dialect {
         // And the nine fixed-role schemas (`schema_id` 16384–16393), which
         // every database has too (S2-L1-02, Msg 2714 on a `db_owner` plan).
@@ -3598,7 +3607,9 @@ pub fn namespace_comes_with_every_database(name: &str, dialect: SqlDialect) -> b
         SqlDialect::Postgres => &["public", "pg_catalog", "information_schema"],
         SqlDialect::MySql | SqlDialect::Sqlite => &[],
     };
-    builtin.contains(&name)
+    builtin
+        .iter()
+        .any(|b| *b == name || (ignore_case && b.eq_ignore_ascii_case(name)))
 }
 
 /// Is `change` **server-level** — about a database as a whole rather than about
@@ -35347,8 +35358,14 @@ mod database_tests {
             (Postgres, "public"),
             (Postgres, "pg_catalog"),
         ] {
-            assert!(namespace_comes_with_every_database(ns, d), "{d:?} {ns}");
+            assert!(
+                namespace_comes_with_every_database(ns, d, false),
+                "{d:?} {ns}"
+            );
         }
+        // Another spelling of one is the same namespace only where case folds.
+        assert!(namespace_comes_with_every_database("DBO", MsSql, true));
+        assert!(!namespace_comes_with_every_database("DBO", MsSql, false));
         for (d, ns) in [
             (MsSql, "sales"),
             (MsSql, "public"),
@@ -35358,7 +35375,10 @@ mod database_tests {
             (MySql, "dbo"),
             (Sqlite, "main"),
         ] {
-            assert!(!namespace_comes_with_every_database(ns, d), "{d:?} {ns}");
+            assert!(
+                !namespace_comes_with_every_database(ns, d, true),
+                "{d:?} {ns}"
+            );
         }
     }
 
