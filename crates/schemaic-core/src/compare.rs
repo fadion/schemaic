@@ -625,13 +625,22 @@ pub struct SchemaComparison {
 ///
 /// Four arms and not three: "nothing matched" and "what matched, you asked not
 /// to see" are different answers, and giving the second the first's sentence
-/// tells the user their filter is wrong when it is the toggle beside it.
+/// tells the user their filter is wrong when it is the toggle beside it. And a
+/// fifth, because "every object agrees" is not "the schemas match" while a
+/// [`SchemaComparison::notes`] line stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EmptyRows {
     /// Neither side holds a single object.
     NothingToCompare,
     /// There is no filter, and every object either side holds agrees.
     EverythingAgrees,
+    /// There is no filter and every object agrees, but the comparison noted
+    /// something it could not compare or carry ([`SchemaComparison::notes`])
+    /// — an alias type's bound rule the target lacks, a source object the
+    /// target cannot hold. Claiming a match over it was CMP-03: the note
+    /// reached only a plan's omitted list, and with nothing to plan, no plan
+    /// was built.
+    AgreesExceptNoted,
     /// The filter matched no object's name at all.
     NoMatch,
     /// The filter matched, but only objects the two schemas agree on — and
@@ -645,6 +654,9 @@ impl EmptyRows {
         match self {
             EmptyRows::NothingToCompare => "Neither database holds anything to compare.",
             EmptyRows::EverythingAgrees => "These two schemas match, object for object.",
+            EmptyRows::AgreesExceptNoted => {
+                "Every object agrees, but not everything could be compared — see the notes above."
+            }
             EmptyRows::NoMatch => "Nothing matches that filter.",
             EmptyRows::OnlyIdenticalMatched => {
                 "Everything matching that filter is identical — turn on Include identical to see it."
@@ -1070,8 +1082,13 @@ impl SchemaComparison {
         let needle = filter.query.trim().to_lowercase();
         if needle.is_empty() {
             // No filter, and no rows: everything either side holds agrees, and
-            // agreement is hidden by default.
-            return EmptyRows::EverythingAgrees;
+            // agreement is hidden by default — unless a note says what was not
+            // compared, which "the schemas match" would contradict.
+            return if self.notes.is_empty() {
+                EmptyRows::EverythingAgrees
+            } else {
+                EmptyRows::AgreesExceptNoted
+            };
         }
         // The name filter alone, exactly as `rows` applies it — the `show_same`
         // half is what this arm is about, so it is deliberately not asked here.
@@ -4298,6 +4315,7 @@ mod tests {
         let all = [
             EmptyRows::NothingToCompare,
             EmptyRows::EverythingAgrees,
+            EmptyRows::AgreesExceptNoted,
             EmptyRows::NoMatch,
             EmptyRows::OnlyIdenticalMatched,
         ];
@@ -4885,6 +4903,43 @@ mod tests {
             "{:?}",
             c.plan(|_| true).omitted
         );
+    }
+
+    /// **A standing note keeps an all-`Same` comparison from claiming a
+    /// match** (CMP-03): once the type existed on both sides, every entry
+    /// was `Same`, the view read "These two schemas match, object for
+    /// object", Preview was disabled — and the binding note, carried only by
+    /// a plan's omitted list, appeared nowhere.
+    #[test]
+    fn a_standing_note_keeps_an_all_same_comparison_from_claiming_a_match() {
+        use crate::schema::{TsqlObjectKind as T, TsqlTypeBinding};
+        let qty = tsql(
+            "qty",
+            T::AliasType {
+                base: "int".into(),
+                nullable: true,
+            },
+        );
+        let target = with_tsql(vec![], vec![qty.clone()]);
+        let source = DbSchema {
+            tsql_type_bindings: vec![TsqlTypeBinding {
+                schema: Some("dbo".into()),
+                type_name: "qty".into(),
+                default: None,
+                rule: Some("[dbo].[rl_pos]".into()),
+            }],
+            ..with_tsql(vec![], vec![qty])
+        };
+        let c = SchemaComparison::of(&target, &source, SqlDialect::MsSql);
+        assert_eq!(c.differences().count(), 0);
+        assert_eq!(c.notes.len(), 1, "{:?}", c.notes);
+        let unfiltered = RowFilter {
+            query: "",
+            show_same: false,
+        };
+        assert!(c.rows(unfiltered, &HashSet::new()).is_empty());
+        assert_eq!(c.empty_reason(unfiltered), EmptyRows::AgreesExceptNoted);
+        assert!(!c.empty_reason(unfiltered).message().contains("match"));
     }
 
     /// **A sequence's start is not compared either** (S4.2-L1-01): `ALTER

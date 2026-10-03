@@ -6679,15 +6679,19 @@ existing prose was left alone.
     over `CompareEntry::label`, so typing a table's name also finds the triggers hanging off it, and
     `show_same` is off by default as a reading decision rather than a performance one: two hundred
     identical tables put the four that matter below the fold.
-    **Why there are *no* rows is its own four-armed answer.** `empty_reason(filter)` returns
-    `EmptyRows` — `NothingToCompare`, `EverythingAgrees`, `NoMatch`, `OnlyIdenticalMatched` — each
-    with its own `message()`, and it takes the same `RowFilter` so it and `rows` cannot disagree
-    about which emptiness this is. Four arms and not three: "nothing matched" and "what matched, you
+    **Why there are *no* rows is its own five-armed answer.** `empty_reason(filter)` returns
+    `EmptyRows` — `NothingToCompare`, `EverythingAgrees`, `AgreesExceptNoted`, `NoMatch`,
+    `OnlyIdenticalMatched` — each with its own `message()`, and it takes the same `RowFilter` so it
+    and `rows` cannot disagree about which emptiness this is. "Nothing matched" and "what matched, you
     asked not to see" are different answers, and giving the second the first's sentence tells the
     user their filter is wrong when it is the toggle beside it. It was three arms inline in a
     `dyn_container`'s child closure where nothing could reach them, and one of the three was exactly
     that mistake (`a_filter_that_matched_only_agreements_says_so_rather_than_blaming_itself`,
     `the_other_three_emptinesses_read_as_themselves`, `each_emptiness_says_something_different`).
+    And "every object agrees" is not "the schemas match" while a `SchemaComparison::notes` line
+    stands, so with no filter and a note the answer is `AgreesExceptNoted`, pointing at the notes
+    the view shows above the tree (CMP-03,
+    `a_standing_note_keeps_an_all_same_comparison_from_claiming_a_match`).
     **`label` carries a routine's signature** — `app.area(integer)` — because the compare tree is the
     first surface in this app to list two PostgreSQL overloads side by side, and without it they drew
     as two identical rows: the same text, the same heading over the diff pane, and a filter matching
@@ -6846,7 +6850,8 @@ existing prose was left alone.
     creates none — so it made the type bare and then called the two databases the same, a loss the
     dump names in its header (S4.2-L1-07). It is said instead: `SchemaComparison::notes` holds a
     line for each binding the source's `DbSchema::tsql_type_bindings` has and the target's lacks
-    (`binding_notes`), matched as the target's names compare, and every plan's `omitted` carries them
+    (`binding_notes`), matched as the target's names compare; the comparison view shows them above
+    the tree, where they stand after Apply too, and every plan's `omitted` carries them
     (`an_alias_types_binding_the_target_lacks_is_disclosed`; live,
     `a_comparison_names_an_alias_types_binding_it_leaves_behind`, before and after Apply). The trade runs the other way too — a sequence the
     comparison creates is `create_sql` alone and starts at its own `START WITH`, where the dump moves
@@ -23081,6 +23086,13 @@ existing prose was left alone.
     in brackets, *"synonym (1)"*, *"enums (2)"*, beside a tree filing the same objects under
     *Synonyms* and *Types* (`a_compare_group_is_named_as_the_tree_names_it`). `CompareKind::label`
     stays the expand state's key and `CompareEntry::key`'s prefix; only the heading changed.
+    **What the comparison noted is shown above the tree**, one line each, under the banner a
+    foreign-key cycle takes: `SchemaComparison::notes` — an alias type's bound rule or default the
+    target lacks, a source object a case-insensitive target cannot hold beside another — reached the
+    reader only through a plan's omitted list, and once every object agreed no plan was built, so a
+    second comparison after Apply read "These two schemas match" with Preview disabled and the note
+    nowhere (CMP-03). The empty tree says `EmptyRows::AgreesExceptNoted` then, not
+    `EverythingAgrees` (under `compare.rs`).
     **The module names no `Ui` — it is off `whole_ui_gate`'s list, 8 to zero — and the split is
     `import_view.rs`'s.** The renderers take `OverlayUi`, being the eight `compare_*` signals and
     nothing else: `open_compare`, `reset`, `body_for`, `ready_body` and `filter_bar`. The four that

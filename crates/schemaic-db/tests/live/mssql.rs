@@ -5469,10 +5469,11 @@ async fn a_storage_switch_to_columnstore_applies() {
 /// **A comparison says it leaves an alias type's bound rule behind**
 /// (S4.2-L1-07): it created the type without it — the target then took a
 /// value the source refuses (Msg 513) — and a second comparison found
-/// nothing. Now every plan names the binding, after Apply as before.
+/// nothing. Now every plan names the binding, and after Apply, when there
+/// is no plan to build, the comparison itself still does (CMP-03).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_comparison_names_an_alias_types_binding_it_leaves_behind() {
-    use schemaic_core::compare::SchemaComparison;
+    use schemaic_core::compare::{EmptyRows, RowFilter, SchemaComparison};
     if !enabled() || azure_cannot("needs a second database") {
         return;
     }
@@ -5502,11 +5503,22 @@ async fn a_comparison_names_an_alias_types_binding_it_leaves_behind() {
         .run_ddl(&target.name, &stmts, CancellationToken::new())
         .await
         .unwrap_or_else(|e| panic!("{e}\n{}", stmts.join("\n")));
-    let again = SchemaComparison::of(&read(&target).await, &read(&source).await, MS).plan(|_| true);
+    // The second comparison finds every object the same, so the view builds
+    // no plan: the note has to stand on the comparison itself, and the empty
+    // tree must not say the schemas match (CMP-03).
+    let again = SchemaComparison::of(&read(&target).await, &read(&source).await, MS);
+    assert_eq!(again.differences().count(), 0);
     assert!(
-        again.omitted.join(" ").contains("rl_pos"),
+        again.notes.join(" ").contains("rl_pos"),
         "{:?}",
-        again.omitted
+        again.notes
+    );
+    assert_eq!(
+        again.empty_reason(RowFilter {
+            query: "",
+            show_same: false
+        }),
+        EmptyRows::AgreesExceptNoted
     );
 }
 

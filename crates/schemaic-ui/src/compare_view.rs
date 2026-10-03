@@ -666,9 +666,49 @@ fn ready_body(c: Rc<SchemaComparison>, o: OverlayUi, ring: FocusRing) -> impl In
         empty().into_any()
     };
 
+    // **What the comparison noted and cannot compare or carry, said here and
+    // not only in a plan** (CMP-03). `SchemaComparison::notes` reached the
+    // reader through a plan's omitted list alone, and with every object the
+    // same no plan is built — Preview is disabled — so a second comparison
+    // after Apply read "These two schemas match" over an alias type whose
+    // bound rule it had left behind. One line each, under the same banner
+    // the cycle takes, since both are facts about the two schemas rather
+    // than about the ticks.
+    let notes_note: AnyView = if c.notes.is_empty() {
+        empty().into_any()
+    } else {
+        h_stack((
+            crate::icons::icon(crate::icons::TRIANGLE_ALERT, 12.0)
+                .style(|s| s.color(theme::plan_warn())),
+            v_stack_from_iter(c.notes.iter().map(|n| {
+                text(n.clone()).style(|s| {
+                    s.font_size(theme::font_hint())
+                        .color(theme::text_dim())
+                        .min_width(0.0)
+                })
+            }))
+            .style(|s| {
+                s.flex_col()
+                    .gap(theme::scaled(2.0))
+                    .min_width(0.0)
+                    .flex_shrink(1.0_f32)
+            }),
+        ))
+        .style(|s| {
+            s.items_start()
+                .width_full()
+                .gap(theme::scaled(6.0))
+                .padding_horiz(modal_pad_h())
+                .padding_vert(theme::scaled(6.0))
+                .background(theme::plan_warn_bg())
+        })
+        .into_any()
+    };
+
     v_stack((
         filter_bar(o, c.clone(), ring),
         cycle_note,
+        notes_note,
         h_stack((
             autohide(scroll(tree).style(|s| s.width_full())).style(|s| {
                 s.width(theme::scaled(400.0))
