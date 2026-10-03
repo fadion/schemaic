@@ -8028,23 +8028,34 @@ fn view_indexes_rebuilt(v: &ViewDraft, server: &[IndexInfo]) -> Option<String> {
 /// and still refused. One predicate for the two guards that ask it — the table's in-place
 /// guard and an indexed view's ([`tsql_view_index_guard`]).
 ///
-/// **An XML or spatial index keeps its rows in an internal table of its
-/// own** (`sys.internal_tables`, `parent_minor_id` the index), whose
-/// partitions carry its compression under another object id — so the
-/// table's partitions never showed a spatial index's `DATA_COMPRESSION`
-/// (R3-L5-03, measured on 2022). The newer servers' two options are
-/// [`tsql_index_carries_late`]'s.
-fn tsql_index_carries(which: &str) -> String {
+/// **An XML or spatial index keeps its rows in an internal table**
+/// ([`TSQL_INTERNAL_PARTITIONS`]), whose partitions carry its compression
+/// under another object id — so the table's partitions never showed a
+/// spatial index's `DATA_COMPRESSION` (R3-L5-03, measured on 2022). The
+/// newer servers' two options are [`tsql_index_carries_late`]'s.
+///
+/// **A table's clustered rowstore index is not asked its own partitions'
+/// compression** (`heap_keeps_compression`): that compression is the
+/// table's, which the heap its drop leaves keeps and its re-create takes
+/// again — a `PAGE` and `XML_COMPRESSION` clustered key and a `PAGE`
+/// clustered index, each dropped and created again from the model, came
+/// back compressed (measured on 2022, IDX-05). An indexed view's clustered
+/// index leaves no heap, so the view's guard asks it.
+fn tsql_index_carries(which: &str, heap_keeps_compression: bool) -> String {
+    let own = if heap_keeps_compression {
+        "AND i.type <> 1 "
+    } else {
+        ""
+    };
+    let internal = TSQL_INTERNAL_PARTITIONS;
     format!(
         "EXISTS (SELECT 1 FROM sys.indexes i WHERE i.object_id = @t AND {which} \
          AND (i.fill_factor NOT IN (0, 100) OR i.is_padded = 1 OR i.ignore_dup_key = 1 \
          OR ((i.allow_row_locks = 0 OR i.allow_page_locks = 0) AND i.type NOT IN (5, 6)) \
          OR i.is_disabled = 1 \
          OR EXISTS (SELECT 1 FROM sys.partitions p WHERE p.object_id = @t \
-         AND p.index_id = i.index_id AND p.data_compression NOT IN (0, 3)) \
-         OR EXISTS (SELECT 1 FROM sys.internal_tables it JOIN sys.partitions p \
-         ON p.object_id = it.object_id WHERE it.parent_object_id = @t \
-         AND it.parent_minor_id = i.index_id AND p.data_compression <> 0) \
+         AND p.index_id = i.index_id {own}AND p.data_compression NOT IN (0, 3)) \
+         OR EXISTS (SELECT 1 FROM {internal} AND p.data_compression <> 0) \
          OR EXISTS (SELECT 1 FROM sys.data_spaces s WHERE s.data_space_id = i.data_space_id \
          AND (s.type <> 'FG' OR s.is_default = 0)) \
          OR EXISTS (SELECT 1 FROM sys.extended_properties e WHERE e.class = 7 \
@@ -8055,13 +8066,36 @@ fn tsql_index_carries(which: &str) -> String {
     )
 }
 
+/// The partitions an XML or spatial index `i` of the table `@t` keeps in an
+/// internal table, as the `FROM … WHERE` of a probe over `p`.
+///
+/// **A primary or selective XML index or a spatial one has an internal
+/// table of its own** (`sys.internal_tables`, `parent_minor_id` the index);
+/// **a secondary XML index has none**: its rows are a nonclustered index
+/// on its parent's (`sys.xml_indexes.using_xml_index_id`). In either table
+/// the index's rows are the internal index of its own name — one name for
+/// both, which follows an `sp_rename` (measured on 2022). Asked by
+/// `parent_minor_id` alone, a secondary's compression was never seen, and
+/// the parent's probe took in every secondary's partitions as its own
+/// (IDX-04).
+const TSQL_INTERNAL_PARTITIONS: &str = "sys.internal_tables it JOIN sys.indexes ii \
+     ON ii.object_id = it.object_id AND ii.name = i.name \
+     JOIN sys.partitions p ON p.object_id = it.object_id AND p.index_id = ii.index_id \
+     WHERE it.parent_object_id = @t AND it.parent_minor_id = \
+     COALESCE((SELECT x.using_xml_index_id FROM sys.xml_indexes x WHERE x.object_id = @t \
+     AND x.index_id = i.index_id), i.index_id)";
+
 /// What [`tsql_index_carries`] cannot name in a statement every server
 /// compiles, as [`tsql_late_arm`]s answering `why`: a columnstore index's
 /// `COMPRESSION_DELAY` (`sys.indexes.compression_delay`, 2016) and an XML
 /// index's — or the XML columns' — `XML_COMPRESSION`
 /// (`sys.partitions.xml_compression`, 2022), on the index's own partitions
-/// or its internal table's. Neither is in `IndexInfo` (R3-L5-03).
+/// or its internal table's ([`TSQL_INTERNAL_PARTITIONS`]). Neither is in
+/// `IndexInfo` (R3-L5-03). For a table's index alone, so a clustered
+/// rowstore index is not asked its own partitions' compression, which the
+/// heap keeps ([`tsql_index_carries`]).
 fn tsql_index_carries_late(which: &str, why: &str) -> String {
+    let internal = TSQL_INTERNAL_PARTITIONS;
     [
         tsql_late_arm(
             "COL_LENGTH(N'sys.indexes', N'compression_delay') IS NOT NULL",
@@ -8076,11 +8110,9 @@ fn tsql_index_carries_late(which: &str, why: &str) -> String {
             &format!(
                 "EXISTS (SELECT 1 FROM sys.indexes i JOIN sys.partitions p \
                  ON p.object_id = @t AND p.index_id = i.index_id \
-                 WHERE i.object_id = @t AND {which} AND p.xml_compression = 1) \
-                 OR EXISTS (SELECT 1 FROM sys.indexes i JOIN sys.internal_tables it \
-                 ON it.parent_object_id = @t AND it.parent_minor_id = i.index_id \
-                 JOIN sys.partitions p ON p.object_id = it.object_id \
-                 WHERE i.object_id = @t AND {which} AND p.xml_compression = 1)"
+                 WHERE i.object_id = @t AND {which} AND i.type <> 1 AND p.xml_compression = 1) \
+                 OR EXISTS (SELECT 1 FROM sys.indexes i WHERE i.object_id = @t AND {which} \
+                 AND EXISTS (SELECT 1 FROM {internal} AND p.xml_compression = 1))"
             ),
             why,
         ),
@@ -8124,7 +8156,8 @@ fn tsql_view_index_guard(qname: &str, v: &ViewDraft, server: &[IndexInfo]) -> Op
         .map(|ix| {
             format!(
                 "WHEN {} THEN {}",
-                tsql_index_carries(&format!("i.name = {}", tsql_n(ix))),
+                // A view's clustered index leaves no heap behind.
+                tsql_index_carries(&format!("i.name = {}", tsql_n(ix)), false),
                 tsql_n(&format!(
                     "Redefining the view drops its index {ix}, whose fill factor, padding, \
                      IGNORE_DUP_KEY, locks, compression, filegroup, disabled state or extended \
@@ -8977,7 +9010,8 @@ fn tsql_in_place_guard(q: &str, changes: &[&Change]) -> Option<String> {
         })
         .collect();
 
-    let index_carries = tsql_index_carries;
+    // A table's clustered index leaves its compression with the heap.
+    let index_carries = |which: &str| tsql_index_carries(which, true);
     let mut reasons: Vec<(String, String)> = Vec::new();
     // What only a newer server's catalogue says about an index re-created,
     // behind its probe ([`tsql_index_carries_late`]).
@@ -20706,6 +20740,73 @@ mod tests {
             sql[at(&sql, "CREATE XML INDEX [sx2]")].ends_with("USING XML INDEX [sel] FOR ([a]);"),
             "{sql:#?}"
         );
+    }
+
+    /// **The in-place guard asks an index's compression where it lives, and
+    /// not where it survives** (IDX-04, IDX-05). A secondary XML index has
+    /// no internal table: its rows are an index of its parent's, named as
+    /// it is, so the guard — asking the internal table whose
+    /// `parent_minor_id` was the secondary's own id — found nothing and let
+    /// a compressed one be re-made without it, while the parent's probe took
+    /// in every secondary's partitions. And a clustered rowstore index's
+    /// compression is the table's, kept by the heap its drop leaves and
+    /// taken again by its re-create (measured on 2022), so a key change on
+    /// a compressed clustered key was refused over nothing it loses. Only
+    /// the server can say what the predicates select; the live test
+    /// `index_compression_is_asked_where_it_lives` runs them.
+    #[test]
+    fn the_guard_asks_compression_where_it_lives() {
+        use crate::schema::{TSQL_PRIMARY_XML, TSQL_XML};
+        let mut t = ms_rebuild_table();
+        t.indexes[0].clustered = Some(true);
+        t.indexes
+            .push(xml_or_spatial("px", TSQL_PRIMARY_XML, "code", None));
+        t.indexes.push(xml_or_spatial(
+            "sx",
+            TSQL_XML,
+            "code",
+            Some("USING XML INDEX [px] FOR PATH"),
+        ));
+        let mut d = TableDraft::from_table(&t);
+        d.indexes
+            .iter_mut()
+            .find(|i| i.info.name == "sx")
+            .unwrap()
+            .info
+            .using = Some("USING XML INDEX [px] FOR VALUE".into());
+        let guard = &diff(&t, &d, MsSql).emit()[0];
+        // The parent's internal table when the index has a parent, the
+        // internal index of the index's own name in it — in both the arm
+        // every server compiles and the late `XML_COMPRESSION` one.
+        for needle in [
+            "COALESCE((SELECT x.using_xml_index_id FROM sys.xml_indexes x",
+            "ii.name = i.name",
+            "COALESCE((SELECT x.using_xml_index_id FROM sys.xml_indexes x WHERE x.object_id = @t \
+             AND x.index_id = i.index_id), i.index_id) AND p.xml_compression = 1",
+        ] {
+            assert!(guard.contains(needle), "{needle} not in {guard}");
+        }
+        assert!(
+            !guard.contains("it.parent_minor_id = i.index_id"),
+            "{guard}"
+        );
+
+        // A table's clustered rowstore index is not asked its own
+        // partitions' compression; every other kind is.
+        let mut d = TableDraft::from_table(&t);
+        d.columns
+            .iter_mut()
+            .find(|c| c.info.name == "id")
+            .unwrap()
+            .info
+            .type_name = "bigint".into();
+        let guard = &diff(&t, &d, MsSql).emit()[0];
+        for needle in [
+            "AND i.type <> 1 AND p.data_compression NOT IN (0, 3)",
+            "AND i.type <> 1 AND p.xml_compression = 1",
+        ] {
+            assert!(guard.contains(needle), "{needle} not in {guard}");
+        }
     }
 
     /// **A secondary XML index re-made or added beside a parent that is only

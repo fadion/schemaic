@@ -5019,6 +5019,153 @@ async fn an_index_re_created_in_place_is_refused_over_hidden_options() {
     }
 }
 
+/// **An index's compression is asked where it lives, and not where it
+/// survives** (IDX-04, IDX-05). A secondary XML index keeps its rows in its
+/// parent's internal table, so a compressed one was re-made uncompressed
+/// past the guard, while its parent was refused over it even with the
+/// secondary deleted. A clustered index's compression is the table's: the
+/// heap its drop leaves keeps it and its re-create takes it again, so a key
+/// change on a compressed clustered key was refused over nothing it loses.
+/// A nonclustered key's own compression it does lose, and is still refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn index_compression_is_asked_where_it_lives() {
+    use schemaic_core::ddl::TableDraft;
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("index_compression").await;
+    let retype = |d: &mut TableDraft, col: &str| {
+        d.columns
+            .iter_mut()
+            .find(|c| c.info.name == col)
+            .unwrap()
+            .info
+            .type_name = "bigint".into();
+    };
+    // Every plan is tried, and what went the wrong way said at the end.
+    let mut wrong: Vec<String> = Vec::new();
+
+    // A compressed secondary, edited: refused over its own compression.
+    for t in ["x1", "x2"] {
+        s.exec(&format!(
+            "CREATE TABLE dbo.{t} (id int NOT NULL CONSTRAINT pk_{t} PRIMARY KEY CLUSTERED, \
+             doc xml NULL); CREATE PRIMARY XML INDEX px ON dbo.{t} (doc); \
+             CREATE XML INDEX sx ON dbo.{t} (doc) USING XML INDEX px FOR PATH \
+             WITH (XML_COMPRESSION = ON);"
+        ))
+        .await;
+    }
+    let current = read_table(&s, "x1").await;
+    let mut d = TableDraft::from_table(&current);
+    d.indexes
+        .iter_mut()
+        .find(|i| i.info.name == "sx")
+        .unwrap()
+        .info
+        .using = Some("USING XML INDEX [px] FOR VALUE".into());
+    match apply_draft_err_free(&s, &current, &d).await {
+        Some(e) if e.contains("Re-creating the index sx") => {}
+        other => wrong.push(format!("an edited compressed secondary: {other:?}")),
+    }
+    // The same under a selective parent, whose internal table is its own.
+    s.exec(
+        "CREATE TABLE dbo.x3 (id int NOT NULL CONSTRAINT pk_x3 PRIMARY KEY CLUSTERED, \
+         doc xml NULL); CREATE SELECTIVE XML INDEX sl ON dbo.x3 (doc) \
+         FOR (a = '/a' AS SQL int, b = '/b' AS SQL int); \
+         CREATE XML INDEX sx ON dbo.x3 (doc) USING XML INDEX sl FOR (a) \
+         WITH (XML_COMPRESSION = ON);",
+    )
+    .await;
+    let current = read_table(&s, "x3").await;
+    let mut d = TableDraft::from_table(&current);
+    d.indexes
+        .iter_mut()
+        .find(|i| i.info.name == "sx")
+        .unwrap()
+        .info
+        .using = Some("USING XML INDEX [sl] FOR (b)".into());
+    match apply_draft_err_free(&s, &current, &d).await {
+        Some(e) if e.contains("Re-creating the index sx") => {}
+        other => wrong.push(format!(
+            "an edited compressed selective secondary: {other:?}"
+        )),
+    }
+
+    // The same secondary deleted while the key under its parent is re-made:
+    // the parent carries nothing, and is re-made.
+    let current = read_table(&s, "x2").await;
+    let mut d = TableDraft::from_table(&current);
+    d.indexes.retain(|i| i.info.name != "sx");
+    retype(&mut d, "id");
+    match apply_draft_err_free(&s, &current, &d).await {
+        None => assert_eq!(
+            s.scalar(
+                "SELECT STRING_AGG(name, ',') FROM sys.indexes \
+                 WHERE object_id = OBJECT_ID(N'dbo.x2') AND type = 3"
+            )
+            .await,
+            "px"
+        ),
+        Some(e) => wrong.push(format!("a parent beside a deleted secondary: {e}")),
+    }
+
+    // A compressed clustered key, retyped under, and a compressed clustered
+    // index widened: each keeps its compression through the heap.
+    s.exec(
+        "CREATE TABLE dbo.c1 (id int NOT NULL, doc xml NULL, CONSTRAINT pk_c1 \
+         PRIMARY KEY CLUSTERED (id) WITH (DATA_COMPRESSION = PAGE, XML_COMPRESSION = ON)); \
+         CREATE TABLE dbo.c2 (id int NOT NULL CONSTRAINT pk_c2 PRIMARY KEY NONCLUSTERED, \
+         a int NULL, b int NULL); \
+         CREATE UNIQUE CLUSTERED INDEX cx ON dbo.c2 (a) WITH (DATA_COMPRESSION = PAGE);",
+    )
+    .await;
+    let compression = |t: &'static str| {
+        let s = &s;
+        async move {
+            s.scalar(&format!(
+                "SELECT CONCAT(data_compression_desc, ':', xml_compression) FROM sys.partitions \
+                 WHERE object_id = OBJECT_ID(N'dbo.{t}') AND index_id = 1"
+            ))
+            .await
+        }
+    };
+    let current = read_table(&s, "c1").await;
+    let mut d = TableDraft::from_table(&current);
+    retype(&mut d, "id");
+    match apply_draft_err_free(&s, &current, &d).await {
+        None => assert_eq!(compression("c1").await, "PAGE:1"),
+        Some(e) => wrong.push(format!("a compressed clustered key: {e}")),
+    }
+    let current = read_table(&s, "c2").await;
+    let mut d = TableDraft::from_table(&current);
+    d.indexes
+        .iter_mut()
+        .find(|i| i.info.name == "cx")
+        .unwrap()
+        .info
+        .columns
+        .push(schemaic_core::schema::IndexColumn::plain("b"));
+    match apply_draft_err_free(&s, &current, &d).await {
+        None => assert_eq!(compression("c2").await, "PAGE:0"),
+        Some(e) => wrong.push(format!("a compressed clustered index: {e}")),
+    }
+
+    // A compressed nonclustered key loses its own compression: refused.
+    s.exec(
+        "CREATE TABLE dbo.c3 (id int NOT NULL, a int NULL, \
+         CONSTRAINT pk_c3 PRIMARY KEY NONCLUSTERED (id) WITH (DATA_COMPRESSION = PAGE));",
+    )
+    .await;
+    let current = read_table(&s, "c3").await;
+    let mut d = TableDraft::from_table(&current);
+    retype(&mut d, "id");
+    match apply_draft_err_free(&s, &current, &d).await {
+        Some(e) if e.contains("Re-creating the primary key") => {}
+        other => wrong.push(format!("a compressed nonclustered key: {other:?}")),
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// **A renamed index keeps everything it had** (R3-L5-04): renamed in the
 /// designer, an index was dropped and created under the new name, past the
 /// guard, losing its fill factor and compression; a unique constraint went

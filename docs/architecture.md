@@ -4681,7 +4681,8 @@ existing prose was left alone.
     runs each behind a probe (`COL_LENGTH`, `OBJECT_ID`) through `sp_executesql`, ahead of the
     `CASE` so a ledger table is named as one rather than by the generated-always columns every
     ledger table has. **An XML or spatial index keeps its rows in an internal table of its own**
-    (`sys.internal_tables`, `parent_object_id` the table, `parent_minor_id` the index), whose
+    (`sys.internal_tables`, `parent_object_id` the table, `parent_minor_id` the index — a
+    secondary XML index's in its parent's, as an index of it), whose
     partitions carry its `DATA_COMPRESSION` and `XML_COMPRESSION` under another object id — so an
     arm reading `sys.partitions` for the table alone never saw a spatial index's `PAGE`
     compression (measured on 2022), and the compression arm and the `xml_compression` arm each
@@ -5502,7 +5503,22 @@ existing prose was left alone.
     `PAGE`-compressed spatial index and an `XML_COMPRESSION` primary XML index back without either,
     and a column retype a columnstore index without its delay, each plan applying — the live
     `an_index_re_created_in_place_is_refused_over_hidden_options` was red on 2022 with the fix
-    stashed, and now sees each refused as *Re-creating the index*.
+    stashed, and now sees each refused as *Re-creating the index*. **A secondary XML index has no
+    internal table of its own**: its rows are a nonclustered index on its parent's, and in either
+    table an index's rows are the internal index of its own name, a name that follows an
+    `sp_rename` (measured on 2022). So the internal-table term (`TSQL_INTERNAL_PARTITIONS`) finds
+    the table through `sys.xml_indexes.using_xml_index_id` where there is one, and the partitions
+    through the internal index named as the index is. Asked by `parent_minor_id` alone, a
+    compressed secondary was re-made uncompressed past the guard, while its parent was refused over
+    the secondary's partitions even with the secondary deleted (IDX-04). **A table's clustered
+    rowstore index is not asked its own partitions' compression**: that compression is the
+    table's, which the heap its drop leaves keeps and its re-create takes again — a `PAGE` and
+    `XML_COMPRESSION` clustered key retyped under, and a `PAGE` clustered index widened, came back
+    compressed (measured on 2022) — so every key change on a compressed clustered key was refused
+    over nothing it lost (IDX-05). A nonclustered key, or any other index, loses its own and is
+    still refused; the rebuild's guard, which drops the whole table, still asks every partition
+    (`the_guard_asks_compression_where_it_lives`; live, `index_compression_is_asked_where_it_lives`,
+    red on 2022 before both).
     **It refuses rather than restates**, as the rebuild's guard does. It keys on the name, not on who raised the pair, so
     the designer's own edit of an index, foreign key or check that keeps its name is refused by the
     same arm — deliberately, the loss being the same
@@ -5668,7 +5684,9 @@ existing prose was left alone.
     (`tsql_index_carries`, shared with `tsql_in_place_guard`) for each index the plan drops and
     builds again, and the sentence says such an index stops the plan. It takes that predicate's
     internal-table term with it, harmlessly, but not `tsql_index_carries_late`'s arms, since an
-    indexed view can hold no columnstore or XML index. And `ALTER VIEW` drops the
+    indexed view can hold no columnstore or XML index — and it asks the view's clustered index its
+    compression where the table's guard does not (`heap_keeps_compression`), since a view's
+    clustered index leaves no heap to keep it. And `ALTER VIEW` drops the
     view's hand-made statistics too, which nothing reads; the sentence names that loss as the
     table rebuild's does (`an_indexed_views_edit_guards_what_its_indexes_cannot_restate`; live,
     `an_indexed_views_edit_refuses_what_its_indexes_cannot_carry`, 2022 and 2025: the compressed
