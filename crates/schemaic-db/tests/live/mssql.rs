@@ -4784,6 +4784,22 @@ async fn a_synonym_naming_its_own_database_compares_the_same() {
     let c = SchemaComparison::of(&read(&target).await, &read(&source).await, MS);
     let differing: Vec<String> = c.differences().map(|e| e.key()).collect();
     assert!(differing.is_empty(), "{differing:?}");
+
+    // Written three-part on the target alone, and two-part on the source,
+    // it is the same synonym too (CMP-07) — in either direction.
+    source
+        .exec("DROP SYNONYM dbo.o; CREATE SYNONYM dbo.o FOR dbo.orders")
+        .await;
+    for (l, r) in [(&target, &source), (&source, &target)] {
+        let c = SchemaComparison::of(&read(l).await, &read(r).await, MS);
+        let differing: Vec<String> = c.differences().map(|e| e.key()).collect();
+        assert!(
+            differing.is_empty(),
+            "{} ← {}: {differing:?}",
+            l.name,
+            r.name
+        );
+    }
 }
 
 /// **XML and spatial indexes are made whole, and stay whole**: a table whose

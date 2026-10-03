@@ -858,7 +858,10 @@ impl SchemaComparison {
 
         // SQL Server's sequences, alias types, XML schema collections and
         // synonyms, paired by kind and qualified name, and diffed by the object
-        // editor's own differ — one answer to what a change to one is.
+        // editor's own differ — one answer to what a change to one is. `own`
+        // is the target's database, which a synonym's target may name on
+        // either side ([`same_synonym_target`]).
+        let own = left.database.as_deref().filter(|d| !d.is_empty());
         for (ck, ok) in [
             (
                 CompareKind::XmlSchemaCollection,
@@ -882,7 +885,7 @@ impl SchemaComparison {
                 |t| described(ck, display_name(t.schema.as_deref(), &t.name)),
                 &mut notes,
             ) {
-                entries.push(tsql_entry(ck, ok, l, r, names));
+                entries.push(tsql_entry(ck, ok, l, r, names, own));
             }
         }
 
@@ -2311,7 +2314,10 @@ fn fk_rank(
 /// instead of leaving the server to guess.
 ///
 /// The left side is never touched: it is the target, and it is already in its
-/// own terms.
+/// own terms. Its own terms can still spell one synonym target two ways —
+/// `[shop_dev].[dbo].[orders]` read from `shop_dev` and `[dbo].[orders]` are
+/// one table — and [`same_synonym_target`] reads both sides' that way for
+/// the comparison alone, rather than rewriting either side's text.
 ///
 /// [`ViewOptions::definer`](crate::schema::ViewOptions::definer) is cleared on
 /// both sides, and that is a different
@@ -2385,6 +2391,29 @@ fn synonym_database(target: &[String]) -> Option<&str> {
         [server, db, _, _] if server.is_empty() => Some(db),
         _ => None,
     }
+}
+
+/// Do two synonym targets name one object, **as the target database reads
+/// them**? Part for part as its names compare ([`Names`]), once each side's
+/// target naming `own` — the target's database, the one the plan runs in —
+/// is read as the bare two-part name that means "this database".
+///
+/// **Both sides, and for the comparison only** (CMP-07). [`as_read_from`]
+/// re-addresses the source's own-database target, and the target's was
+/// never touched: a target synonym SSMS wrote as `[shop_dev].[dbo].[orders]`
+/// against a source's `[dbo].[orders]` — the same table — compared
+/// Differing, and the plan dropped and re-created it, or the replace guard
+/// refused it over its grants. The answer only decides whether the two are
+/// the same; a real difference is still created with the source's target as
+/// written, so no `CREATE` text is rewritten here.
+fn same_synonym_target(a: &[String], b: &[String], own: Option<&str>, names: Names) -> bool {
+    let local = |t: &[String]| -> usize {
+        let names_own =
+            synonym_database(t).is_some_and(|d| own.is_some_and(|o| d.eq_ignore_ascii_case(o)));
+        if names_own { t.len() - 2 } else { 0 }
+    };
+    let (a, b) = (&a[local(a)..], &b[local(b)..]);
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| names.same(x, y))
 }
 
 /// Clear every `DEFINER`, on both sides, before the two are compared.
@@ -2905,6 +2934,7 @@ fn tsql_entry(
     l: Option<&TsqlObject>,
     r: Option<&TsqlObject>,
     names: Names,
+    own: Option<&str>,
 ) -> CompareEntry {
     let any = l.or(r).expect("a pair holds at least one side");
     let changes = match (l, r) {
@@ -2918,11 +2948,7 @@ fn tsql_entry(
                     },
                 ) if within(kept, min, max) => start.clone_from(kept),
                 (TsqlObjectKind::Synonym { target: kept }, TsqlObjectKind::Synonym { target })
-                    if kept.len() == target.len()
-                        && kept
-                            .iter()
-                            .zip(target.iter())
-                            .all(|(a, b)| names.same(a, b)) =>
+                    if same_synonym_target(kept, target, own, names) =>
                 {
                     target.clone_from(kept)
                 }
@@ -5119,6 +5145,60 @@ mod tests {
             &side("shop_prod", &["shop_prod", "dbo", "orders"]),
         );
         assert_eq!(to_bare, ObjectStatus::Same);
+    }
+
+    /// **Either side's own-database target compares as its two-part name**
+    /// (CMP-07): only the source's was re-addressed, so a target synonym
+    /// SSMS wrote as `[shop_dev].[dbo].[orders]` against a source's
+    /// `[dbo].[orders]` — the same table — compared Differing, and the plan
+    /// dropped and re-created it (or the replace guard refused it, over its
+    /// grants). The normalising is the comparison's alone: a real difference
+    /// is still created with the source's target as written.
+    #[test]
+    fn an_own_database_synonym_target_compares_the_same_on_either_side() {
+        use crate::schema::TsqlObjectKind as T;
+        let side = |db: &str, target: &[&str]| DbSchema {
+            database: Some(db.into()),
+            ..with_tsql(
+                vec![],
+                vec![tsql(
+                    "o",
+                    T::Synonym {
+                        target: target.iter().map(|p| p.to_string()).collect(),
+                    },
+                )],
+            )
+        };
+        let entry = |l: DbSchema, r: DbSchema| {
+            find(
+                &SchemaComparison::of(&l, &r, SqlDialect::MsSql),
+                "synonym:dbo.o",
+            )
+            .clone()
+        };
+        let e = entry(
+            side("shop_dev", &["shop_dev", "dbo", "orders"]),
+            side("shop_prod", &["dbo", "orders"]),
+        );
+        assert_eq!(e.status, ObjectStatus::Same);
+        let e = entry(
+            side("shop_dev", &["dbo", "orders"]),
+            side("shop_prod", &["shop_prod", "dbo", "orders"]),
+        );
+        assert_eq!(e.status, ObjectStatus::Same);
+        let e = entry(
+            side("shop_dev", &["", "SHOP_DEV", "dbo", "orders"]),
+            side("shop_prod", &["dbo", "orders"]),
+        );
+        assert_eq!(e.status, ObjectStatus::Same);
+        // A real difference is created as the source wrote it.
+        let e = entry(
+            side("shop_dev", &["shop_dev", "dbo", "orders"]),
+            side("shop_prod", &["dbo", "items"]),
+        );
+        assert_eq!(e.status, ObjectStatus::Differing);
+        let sql = e.changes.emit().join("\n");
+        assert!(sql.contains("FOR [dbo].[items];"), "{sql}");
     }
 
     /// **The plan creates them in the order their uses need**: an XML schema

@@ -6329,7 +6329,18 @@ existing prose was left alone.
     side that did not record where it came from
     (`the_foreign_key_pair_differs_only_in_where_it_was_read_from`). Where a schema was read from is
     `DbSchema::database`, which the model records nowhere else. The **left** side is never touched:
-    it is the target, and it is already in its own terms.
+    it is the target, and it is already in its own terms. **Those terms still spell a synonym's
+    target two ways**, three-part naming its own database or the bare two-part name, and only the
+    source's was re-addressed: a target synonym SSMS wrote as `[shop_dev].[dbo].[orders]` against
+    a source's `[dbo].[orders]` — one table — compared `Differing`, and the plan dropped and
+    re-created it, or the replace guard refused it over its grants (CMP-07). `tsql_entry` asks
+    `same_synonym_target`, which reads each side's target naming the target database as its last
+    two parts and then compares part for part as the target's names do; when they agree the source
+    takes the target's spelling before the differ sees it, as it does a case-only difference. The
+    reading is the comparison's alone — a real difference is still created with the source's target
+    as written (`an_own_database_synonym_target_compares_the_same_on_either_side`; live,
+    `a_synonym_naming_its_own_database_compares_the_same`, three-part on one side and two-part on
+    the other, both ways round).
     **A `DEFINER` is deliberately not compared at all**, on either side and on **every carrier that
     has one** (`without_definer`) — a view's `view_options`, a `TriggerInfo`, a `RoutineInfo` and an
     `EventInfo`, four separate fields the pass clears, because each is restated by its own emitter
@@ -6867,7 +6878,8 @@ existing prose was left alone.
     synonym, and were replaced for the spelling alone — a replace `tsql_replace_guard` refuses at
     Apply where the synonym carries permissions, and performs for nothing where it does not
     (S4.2-L1-06). So `tsql_entry` gives the right side the left's target when the two match part
-    for part case aside, before the differ sees it, as it does a sequence's start; on a
+    for part case aside (`same_synonym_target`, which also reads an own-database target as its
+    two-part name), before the differ sees it, as it does a sequence's start; on a
     case-sensitive database the two stay `Differing`
     (`a_case_only_difference_is_one_object_where_names_ignore_case`).
     **Three flags say what a comparison cannot vouch for, and all three are *emitting* limits rather
