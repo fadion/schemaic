@@ -4919,6 +4919,112 @@ async fn an_index_re_created_in_place_is_refused_over_hidden_options() {
     }
 }
 
+/// **A renamed index keeps everything it had** (R3-L5-04): renamed in the
+/// designer, an index was dropped and created under the new name, past the
+/// guard, losing its fill factor and compression; a unique constraint went
+/// back under its old name. Now each is `sp_rename`'s.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_renamed_index_keeps_what_it_had() {
+    use schemaic_core::ddl::{self, TableDraft};
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("index_rename").await;
+    s.exec(
+        "CREATE TABLE dbo.r (id int NOT NULL CONSTRAINT pk_r PRIMARY KEY CLUSTERED, \
+         a int NULL, b int NULL, doc xml NULL, shape geometry NULL, \
+         CONSTRAINT uq_r_b UNIQUE (b)); \
+         CREATE INDEX ix_a ON dbo.r (a) WITH (FILLFACTOR = 80, DATA_COMPRESSION = PAGE); \
+         CREATE PRIMARY XML INDEX px ON dbo.r (doc); \
+         CREATE SPATIAL INDEX sp ON dbo.r (shape) USING GEOMETRY_AUTO_GRID \
+         WITH (BOUNDING_BOX = (0, 0, 10, 10));",
+    )
+    .await;
+    let current = read_table(&s, "r").await;
+    let mut d = TableDraft::from_table(&current);
+    for (from, to) in [
+        ("ix_a", "ix_a2"),
+        ("uq_r_b", "uq_r_b2"),
+        ("px", "px2"),
+        ("sp", "sp2"),
+    ] {
+        d.indexes
+            .iter_mut()
+            .find(|i| i.info.name == from)
+            .unwrap()
+            .info
+            .name = to.into();
+    }
+    let stmts = ddl::diff(&current, &d, MS).emit();
+    assert!(
+        stmts.iter().all(|s| s.starts_with("EXEC sp_rename")),
+        "{stmts:#?}"
+    );
+    s.db.run_ddl(&s.name, &stmts, CancellationToken::new())
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{}", stmts.join("\n")));
+    assert_eq!(
+        s.scalar(
+            "SELECT CONCAT(i.fill_factor, ':', p.data_compression_desc) FROM sys.indexes i \
+             JOIN sys.partitions p ON p.object_id = i.object_id AND p.index_id = i.index_id \
+             WHERE i.object_id = OBJECT_ID(N'dbo.r') AND i.name = N'ix_a2'"
+        )
+        .await,
+        "80:PAGE"
+    );
+    assert_eq!(
+        s.scalar("SELECT name FROM sys.key_constraints WHERE type = 'UQ' AND parent_object_id = OBJECT_ID(N'dbo.r')")
+            .await,
+        "uq_r_b2"
+    );
+    let back = read_table(&s, "r").await;
+    let again = ddl::diff(&back, &TableDraft::from_table(&back), MS);
+    assert!(again.changes.is_empty(), "{:?}", again.changes);
+    let names: Vec<&str> = back.indexes.iter().map(|i| i.name.as_str()).collect();
+    for n in ["ix_a2", "uq_r_b2", "px2", "sp2"] {
+        assert!(names.contains(&n), "{n} in {names:?}");
+    }
+
+    // Renamed and changed: renamed, then re-made under the new name — so the
+    // guard asks what it carries under the old one, and refuses it over its
+    // fill factor; one carrying nothing is renamed and re-made.
+    let renamed_and_widened = |t: &schemaic_core::schema::TableInfo, from: &str, to: &str| {
+        let mut d = TableDraft::from_table(t);
+        let ix = &mut d
+            .indexes
+            .iter_mut()
+            .find(|i| i.info.name == from)
+            .unwrap()
+            .info;
+        ix.name = to.into();
+        ix.columns
+            .push(schemaic_core::schema::IndexColumn::plain("b"));
+        d
+    };
+    let refused = refused_draft(&s, &back, &renamed_and_widened(&back, "ix_a2", "ix_a3")).await;
+    assert!(refused.contains("fill factor"), "{refused}");
+    s.exec("CREATE INDEX ix_plain ON dbo.r (a)").await;
+    let back = read_table(&s, "r").await;
+    let stmts = ddl::diff(
+        &back,
+        &renamed_and_widened(&back, "ix_plain", "ix_wide"),
+        MS,
+    )
+    .emit();
+    s.db.run_ddl(&s.name, &stmts, CancellationToken::new())
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{}", stmts.join("\n")));
+    assert_eq!(
+        s.scalar(
+            "SELECT COUNT(*) FROM sys.index_columns ic JOIN sys.indexes i \
+             ON i.object_id = ic.object_id AND i.index_id = ic.index_id \
+             WHERE i.object_id = OBJECT_ID(N'dbo.r') AND i.name = N'ix_wide'"
+        )
+        .await,
+        "2"
+    );
+}
+
 /// **A comparison discloses a module the source would not show, rather than
 /// planning it.** An encrypted view was planned as `CREATE VIEW v AS ;` and
 /// an encrypted procedure as a comment that "succeeded" creating nothing.

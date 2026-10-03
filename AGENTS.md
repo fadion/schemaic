@@ -24,7 +24,7 @@ does), creates and drops databases and schemas, and browses, creates, edits, dro
 its **sequences, alias types, synonyms and XML schema collections**. What differs between the
 engines now lives in the *narrow* predicates that decide how an edit is performed rather than
 whether it is offered: `ddl::supports_or_replace_view`, `supports_view_rename`,
-`supports_column_reorder`, `rebuilds_tables`, `supports_change`, `alter_column_disturbs_checks`,
+`supports_column_reorder`, `rebuilds_tables`, `renames_indexes_in_place`, `supports_change`, `alter_column_disturbs_checks`,
 `alter_column_disturbs_dependents`, `refreshes_star_dependents`, `bare_reference_is_own_namespace`,
 `ddl_is_transactional`, `users::revoke_cascades`, `supports_deny`,
 `table_grant_lifts_column_denies`, `table_revoke_clears_columns`, `blank_password_signs_in`, `drop_user_cuts_off_sessions`,

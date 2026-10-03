@@ -5142,7 +5142,11 @@ existing prose was left alone.
     creating it after, and where the draft renamed the parent re-points its clause at the new name
     (`IndexInfo::using_xml_parent`); one the draft edits too is re-created already, and only its
     clause follows (`re_creating_an_xml_parent_puts_back_its_secondaries`; live,
-    `xml_and_spatial_indexes_are_made_and_kept_whole`, under `mssql.rs`). A `lossy` secondary under
+    `xml_and_spatial_indexes_are_made_and_kept_whole`, under `mssql.rs`). **A parent the draft only
+    renames is not re-created at all now** — it is an `sp_rename` (`Change::RenameIndex`, below),
+    and a secondary names its parent by id, so nothing under it moves; the pass and its re-pointing
+    matter only for a parent that is re-made, renamed or not (both halves in the same test). A
+    `lossy` secondary under
     a dropped parent withholds the parent's edit instead — a `KeepLossyIndex` named for the
     secondary — rather than re-make it from a partial reading. That arm is practically
     unreachable, the reader leaving a secondary `lossy` only beside a `lossy` parent whose edit is
@@ -5454,6 +5458,41 @@ existing prose was left alone.
     the designer's own edit of an index, foreign key or check that keeps its name is refused by the
     same arm — deliberately, the loss being the same
     (`re_creating_a_dependent_is_guarded_against_what_the_model_does_not_read`).
+    **Keyed on the name, it never saw a rename** (R3-L5-04): an index the designer only renamed was
+    a `DropIndex` of the old name and an `AddIndex` of the new, which the guard's `both(..)` never
+    pairs, so the gentler edit lost exactly what an in-place edit of the same index is refused over
+    — fill factor, compression, filegroup, `IGNORE_DUP_KEY`, locks, extended properties — and a
+    unique constraint renamed in the designer went back under its **old** name, since
+    `IndexInfo::constraint` kept the name it was read with and the re-add writes `ADD CONSTRAINT`
+    from it. A rename is now `Change::RenameIndex { from, to, constraint }`, asked of
+    `renames_indexes_in_place` — an exhaustive `match`, SQL Server alone on `true`. `diff` raises it
+    where the draft index differs from the current one only by name — compared after `rename_index`
+    re-points renamed columns, with the name and constraint set to the draft's — **even for a
+    `lossy` index**, since a rename restates nothing. `emit_mssql` writes it straight after the
+    index drops, because a dropped index frees its name first and an added one may take the old
+    name after: `EXEC sp_rename N'[s].[t].[old]', N'new', N'INDEX';`, or, for an index a constraint
+    backs, `EXEC sp_rename N'[s].[constraint]', N'new', N'OBJECT';`, which renames the constraint
+    and its index together. The preview reads *Rename index ix to ix2*, with no risk sentence. The
+    other engines keep the drop and the create — none of their emitters writes the change, so
+    `supports_change` answers it through the capability for them, and `tsql_supports` for SQL
+    Server. Separately, and on every engine, a constraint-backed index whose name changed while its
+    `constraint` still equals the old index name takes the new name as its constraint, so one
+    renamed **and** changed is re-added under the name the draft gave it
+    (`a_renamed_sql_server_index_is_renamed_in_place`; live, `a_renamed_index_keeps_what_it_had`,
+    under `mssql.rs` — a `FILLFACTOR = 80`, `PAGE`-compressed index, a unique constraint, a primary
+    XML and a spatial index renamed together, each an `sp_rename` with its options kept, the
+    constraint named anew, a re-read diffing empty — red on 2022 with the change stashed). **An
+    index renamed *and* otherwise changed is renamed first and re-made under the new name**: a
+    `RenameIndex` plus a drop and an add of the new name (`drop_index_as_now`, its constraint
+    following), so the guard's name-pairing sees it, asking under the name it has when the guard
+    runs (`index_renamed_from`). `emit_mssql` runs the index drops in two halves around the
+    renames — those that free a name first, a rename's own target after it. As a drop of one name
+    and an add of another nothing paired them, and the index came back without what the model does
+    not read, unrefused. The passes that address a current index by name after the index pass —
+    the dependents repair around a retype, the key-bound XML/spatial pass and the parents-last sort
+    — use the name a rename gives it (`index_name_now`), and re-point a secondary whose parent is
+    renamed (same tests; live, a renamed-and-widened index with a fill factor refused, one with
+    none renamed and re-made).
     `DropCheck` carries a risk sentence though it deletes no data — the table stops
     guaranteeing something and nothing else says so — but `ChangeSet::destructive`
     suppresses it when the same name is re-added in the same plan, since every check
@@ -14255,6 +14294,9 @@ existing prose was left alone.
   `ddl.rs`); then the drops of what covers columns —
   foreign keys first of all, since one referencing the table's own key blocks the key's drop, then
   indexes (`DROP CONSTRAINT` for one a constraint backs, `DROP INDEX [i] ON t` otherwise), then
+  the index renames (`Change::RenameIndex`'s `sp_rename`, under `ddl.rs`) — after the drops that
+  may free a name, before the adds that may take the old one — then the drop of an index renamed
+  and re-made, under its new name, then
   checks and the primary key (`DROP CONSTRAINT` by name). **Indexes before the key, not after**:
   an XML or spatial index stands on the clustered key and the server refuses the key's drop while
   one exists (Msg 3734, measured on 2022), so with the key's drop first even a plan that also
@@ -28208,6 +28250,7 @@ Re-introducing the anti-patterns these guard against is a regression:
   `supports_trigger_firing_rank`, plus
   `supports_column_reorder`, `rebuilds_tables`, `alter_column_disturbs_checks`,
   `alter_column_disturbs_dependents`, `refreshes_star_dependents`, `publishes_index_ddl`,
+  `renames_indexes_in_place`, true on SQL Server alone,
   `bare_reference_is_own_namespace` — which asks where a bare table name resolves, and so whether a
   foreign key with no namespace may be written without one — and
   `stats::supports_table_stats`; and, for the *comparison* rather than

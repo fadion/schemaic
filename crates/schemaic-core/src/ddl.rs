@@ -3068,6 +3068,18 @@ pub enum Change {
         /// does not depend on it.
         unique: bool,
     },
+    /// **SQL Server**: rename an index the draft changes nothing else about —
+    /// `sp_rename`, which keeps every option the model does not read (a fill
+    /// factor, compression, a filegroup, extended properties). As a drop and
+    /// a create it came back without them, past the in-place guard, which
+    /// pairs a drop with an add of the same name (R3-L5-04); and a unique
+    /// constraint went back under its old name. `constraint` is the one the
+    /// index backs, renamed with it ([`renames_indexes_in_place`]).
+    RenameIndex {
+        from: String,
+        to: String,
+        constraint: Option<String>,
+    },
     /// An edit to an index [`IndexInfo::lossy`] marks as only partly readable was
     /// **withheld**. Emits no SQL.
     ///
@@ -3859,6 +3871,7 @@ impl Change {
                 s
             }
             Change::DropIndex { name, .. } => format!("Drop index {name}"),
+            Change::RenameIndex { from, to, .. } => format!("Rename index {from} to {to}"),
             Change::KeepLossyIndex { name } => {
                 format!("Leave index {name} unchanged — Schemaic can't read all of it")
             }
@@ -5531,20 +5544,50 @@ impl ChangeSet {
         // one exists (Msg 3734, measured on 2022). Nothing else here has to
         // wait for the key, and a nonclustered index dropped first is one the
         // key's drop does not rebuild.
+        //
+        // An index renamed in place goes between two drops: after those that
+        // free a name it may take, before its own drop under the new name
+        // when it is re-made as well (`index_renamed_from`), and before an
+        // added one takes the old name. A constraint's index goes with the
+        // constraint, renamed as the object it is.
+        let renamed_to: Vec<&str> = admitted
+            .iter()
+            .filter_map(|c| match c {
+                Change::RenameIndex { to, .. } => Some(to.as_str()),
+                _ => None,
+            })
+            .collect();
+        let drop_index = |out: &mut Vec<String>, after_rename: bool| {
+            for c in &admitted {
+                if let Change::DropIndex {
+                    name, constraint, ..
+                } = c
+                    && renamed_to.contains(&name.as_str()) == after_rename
+                {
+                    out.push(match constraint {
+                        Some(k) => format!("ALTER TABLE {q} DROP CONSTRAINT {};", ident(k)),
+                        None => format!("DROP INDEX {} ON {q};", ident(name)),
+                    });
+                }
+            }
+        };
+        drop_index(&mut out, false);
         for c in &admitted {
-            match c {
-                Change::DropIndex {
-                    constraint: Some(k),
-                    ..
-                } => out.push(format!("ALTER TABLE {q} DROP CONSTRAINT {};", ident(k))),
-                Change::DropIndex {
-                    name,
-                    constraint: None,
-                    ..
-                } => out.push(format!("DROP INDEX {} ON {q};", ident(name))),
-                _ => {}
+            if let Change::RenameIndex {
+                from,
+                to,
+                constraint,
+            } = c
+            {
+                out.push(match constraint {
+                    Some(k) => {
+                        tsql_rename(&qualified(k, self.schema.as_deref(), d), to, Some("OBJECT"))
+                    }
+                    None => tsql_rename(&format!("{q}.{}", ident(from)), to, Some("INDEX")),
+                });
             }
         }
+        drop_index(&mut out, true);
         for c in &admitted {
             match c {
                 Change::DropCheck { name } => {
@@ -8813,7 +8856,8 @@ fn tsql_in_place_guard(q: &str, changes: &[&Change]) -> Option<String> {
         reasons.push((index_carries("i.is_primary_key = 1"), why.to_string()));
     }
     for ix in &indexes {
-        let which = format!("i.name = {}", lit(ix));
+        // Renamed first, it has its old name when the guard asks.
+        let which = format!("i.name = {}", lit(index_renamed_from(ix, changes)));
         let why = format!(
             "Re-creating the index {ix} would drop its fill factor, padding, \
              IGNORE_DUP_KEY, locks, compression, filegroup, disabled state or extended \
@@ -11123,6 +11167,23 @@ pub fn view_keeps_column_list(dialect: SqlDialect) -> bool {
     }
 }
 
+/// Does a renamed index — nothing else about it changed — go through
+/// [`Change::RenameIndex`] on `dialect` rather than a drop and a create?
+///
+/// SQL Server's `sp_rename … N'INDEX'` (or `N'OBJECT'` on the constraint an
+/// index backs, which takes the index with it) keeps every option the model
+/// does not read, where the re-create lost them past the in-place guard
+/// (R3-L5-04). The other engines keep their drop and create for now: none of
+/// their emitters writes the change.
+///
+/// An exhaustive `match`, for the reason [`supports_owners`] gives.
+pub fn renames_indexes_in_place(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MsSql => true,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+    }
+}
+
 /// Does `dialect` publish a whole `CREATE INDEX` statement per index, so an
 /// index the model only **partly** read can be emitted verbatim instead of
 /// reconstructed from the parts that were read?
@@ -13178,13 +13239,26 @@ fn repair_tsql_dependents(
                     clustered: ix.clustered,
                 });
             }
-        } else if !ix.lossy && !touched_ix.contains(&ix.name) {
-            repairs.push(Change::DropIndex {
-                name: ix.name.clone(),
-                constraint: ix.constraint.clone(),
-                unique: ix.unique,
-            });
-            repairs.push(Change::AddIndex(Box::new(rename_index(ix, renamed))));
+        } else if !ix.lossy && !touched_ix.contains(index_name_now(&ix.name, changes)) {
+            // One the draft only renames comes off and goes back under its
+            // new name, after the rename (`drop_index_as_now`).
+            let mut again = rename_index(ix, renamed);
+            let now = index_name_now(&ix.name, changes);
+            if now != ix.name {
+                again.constraint = again
+                    .constraint
+                    .filter(|k| *k != ix.name)
+                    .or_else(|| ix.constraint.as_ref().map(|_| now.to_string()));
+                again.name = now.to_string();
+            }
+            if let Some(parent) = ix.xml_parent()
+                && let now = index_name_now(&parent, changes)
+                && now != parent
+            {
+                again.using = again.using_xml_parent(now);
+            }
+            repairs.push(drop_index_as_now(ix, changes));
+            repairs.push(Change::AddIndex(Box::new(again)));
         }
     }
     for fk in &current.foreign_keys {
@@ -14952,6 +15026,12 @@ pub fn supports_change(dialect: SqlDialect, change: &Change) -> bool {
             SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
         };
     }
+    // An index renamed in place: `diff` writes one only where the engine
+    // does it ([`renames_indexes_in_place`]), and only SQL Server's emitter
+    // writes the statement.
+    if matches!(change, Change::RenameIndex { .. }) {
+        return renames_indexes_in_place(dialect);
+    }
     // **The one family that is narrower than "everything but SQLite".** A
     // scheduled event is MySQL's; PostgreSQL has no `CREATE EVENT` and SQLite no
     // scheduler, so this is asked before the blanket answer below rather than
@@ -15261,6 +15341,7 @@ fn tsql_supports(change: &Change) -> bool {
         Change::CreateTsqlObject(_)
         | Change::ReplaceTsqlObject { .. }
         | Change::AlterTsqlSequence { .. } => true,
+        Change::RenameIndex { .. } => renames_indexes_in_place(SqlDialect::MsSql),
         Change::RenameObject { kind, .. } => matches!(
             kind,
             ObjectKind::Sequence | ObjectKind::Synonym | ObjectKind::AliasType
@@ -15472,8 +15553,36 @@ pub fn diff(current: &TableInfo, draft: &TableDraft, target: impl Into<Target>) 
             .and_then(|n| cur_indexes.iter().find(|ix| ix.name == n).copied());
         // Compare against the current index rewritten in the draft's names, so a
         // renamed column doesn't read as a changed index.
+        // A constraint's index renamed keeps the constraint named as itself:
+        // the draft carries the name it was read with, and re-adding it
+        // under that put the rename back (a constraint and its index share
+        // their name on PostgreSQL and SQL Server alike).
+        let mut info = d.info.clone();
+        if let Some(ix) = current_ix
+            && ix.name != info.name
+            && info.constraint.as_deref() == Some(ix.name.as_str())
+        {
+            info.constraint = Some(info.name.clone());
+        }
+        let d = &IndexDraft { info, ..d.clone() };
+        // Only the name changed, where the engine renames an index in place:
+        // every option it has — the ones the model does not read with them —
+        // stays (`renames_indexes_in_place`).
+        let only_renamed = |ix: &IndexInfo| {
+            let mut was = rename_index(ix, &renamed);
+            was.name = d.info.name.clone();
+            was.constraint = d.info.constraint.clone();
+            ix.name != d.info.name && indexes_equal(&was, &d.info)
+        };
         match current_ix {
             Some(ix) if indexes_equal(&rename_index(ix, &renamed), &d.info) => {}
+            Some(ix) if renames_indexes_in_place(dialect) && only_renamed(ix) => {
+                changes.push(Change::RenameIndex {
+                    from: ix.name.clone(),
+                    to: d.info.name.clone(),
+                    constraint: ix.constraint.clone(),
+                });
+            }
             // An index we could only partly read: recreating it from this model
             // would silently destroy the parts introspection never saw (an
             // expression key column, an operator class, a NULLS ordering). The
@@ -15484,6 +15593,20 @@ pub fn diff(current: &TableInfo, draft: &TableDraft, target: impl Into<Target>) 
                 changes.push(Change::KeepLossyIndex {
                     name: ix.name.clone(),
                 });
+            }
+            // Renamed and changed, where the engine renames in place: renamed
+            // first, then re-made under the new name, so the in-place guard —
+            // which pairs a drop with an add by name — asks what the index
+            // carries under the name it had (`index_renamed_from`). As a drop
+            // of one name and an add of another, nothing paired them.
+            Some(ix) if renames_indexes_in_place(dialect) && ix.name != d.info.name => {
+                changes.push(Change::RenameIndex {
+                    from: ix.name.clone(),
+                    to: d.info.name.clone(),
+                    constraint: ix.constraint.clone(),
+                });
+                dropped_ix.push(ix);
+                added_ix.push(d.info.clone());
             }
             Some(ix) => {
                 dropped_ix.push(ix);
@@ -15529,6 +15652,7 @@ pub fn diff(current: &TableInfo, draft: &TableDraft, target: impl Into<Target>) 
             dropped_ix.retain(|ix| ix.name != p);
             let new = draft_name(&p);
             added_ix.retain(|ix| Some(&ix.name) != new.as_ref());
+            changes.retain(|c| !matches!(c, Change::RenameIndex { from, .. } if *from == p));
             changes.push(Change::KeepLossyIndex {
                 name: cur.name.clone(),
             });
@@ -15569,12 +15693,9 @@ pub fn diff(current: &TableInfo, draft: &TableDraft, target: impl Into<Target>) 
             }
         }
     }
+    // One renamed first is dropped under the name the rename gave it.
     for ix in dropped_ix {
-        changes.push(Change::DropIndex {
-            name: ix.name.clone(),
-            constraint: ix.constraint.clone(),
-            unique: ix.unique,
-        });
+        changes.push(drop_index_as_now(ix, &changes));
     }
     for ix in added_ix {
         changes.push(Change::AddIndex(Box::new(ix)));
@@ -15873,18 +15994,28 @@ pub fn diff(current: &TableInfo, draft: &TableDraft, target: impl Into<Target>) 
                 _ => None,
             })
             .collect();
+        // One the draft only renames is taken off under its new name, after
+        // the rename (`drop_index_as_now`), and put back under it.
         let standing: Vec<&IndexInfo> = current
             .indexes
             .iter()
-            .filter(|ix| ix.is_tsql_xml_or_spatial() && !ix.lossy && !touched.contains(&ix.name))
+            .filter(|ix| {
+                ix.is_tsql_xml_or_spatial()
+                    && !ix.lossy
+                    && !touched.contains(index_name_now(&ix.name, &changes))
+            })
             .collect();
         for ix in standing {
-            changes.push(Change::DropIndex {
-                name: ix.name.clone(),
-                constraint: None,
-                unique: false,
-            });
-            changes.push(Change::AddIndex(Box::new(rename_index(ix, &renamed))));
+            let mut again = rename_index(ix, &renamed);
+            again.name = index_name_now(&ix.name, &changes).to_string();
+            if let Some(parent) = ix.xml_parent()
+                && let now = index_name_now(&parent, &changes)
+                && now != parent
+            {
+                again.using = again.using_xml_parent(now);
+            }
+            changes.push(drop_index_as_now(ix, &changes));
+            changes.push(Change::AddIndex(Box::new(again)));
         }
     }
 
@@ -15961,11 +16092,12 @@ pub fn diff(current: &TableInfo, draft: &TableDraft, target: impl Into<Target>) 
     // `DROP INDEX` after it found nothing to drop (Msg 3701, measured on
     // 2022). The drop carries no kind, so the order is set here, where the
     // reading is.
-    let primary_xml: HashSet<&str> = current
+    // Under the name a rename gave it, where the plan renames it first.
+    let primary_xml: HashSet<String> = current
         .indexes
         .iter()
         .filter(|ix| ix.is_tsql_xml_parent())
-        .map(|ix| ix.name.as_str())
+        .map(|ix| index_name_now(&ix.name, &changes).to_string())
         .collect();
     if !primary_xml.is_empty() {
         changes.sort_by_key(
@@ -16212,6 +16344,47 @@ fn reorder_moves(changes: &mut [Change], moved: &[String]) {
     let lifted: Vec<Change> = order.iter().map(|&k| changes[slots[k]].clone()).collect();
     for (slot, c) in slots.iter().zip(lifted) {
         changes[*slot] = c;
+    }
+}
+
+/// The name the index `name` answers to once the plan's
+/// [`Change::RenameIndex`] has run — itself where nothing renames it.
+fn index_name_now<'a>(name: &'a str, changes: &'a [Change]) -> &'a str {
+    changes
+        .iter()
+        .find_map(|c| match c {
+            Change::RenameIndex { from, to, .. } if from == name => Some(to.as_str()),
+            _ => None,
+        })
+        .unwrap_or(name)
+}
+
+/// The name the index the plan knows as `name` had before its
+/// [`Change::RenameIndex`] — what the server calls it when a guard asks,
+/// ahead of every statement.
+fn index_renamed_from<'a>(name: &'a str, changes: &[&'a Change]) -> &'a str {
+    changes
+        .iter()
+        .find_map(|c| match c {
+            Change::RenameIndex { from, to, .. } if to == name => Some(from.as_str()),
+            _ => None,
+        })
+        .unwrap_or(name)
+}
+
+/// The drop of the current index `ix` as the plan addresses it: under the
+/// name a [`Change::RenameIndex`] in `changes` gave it — run before this
+/// drop (`emit_mssql`) — and its constraint, which shares the name, with it.
+fn drop_index_as_now(ix: &IndexInfo, changes: &[Change]) -> Change {
+    let name = index_name_now(&ix.name, changes);
+    let constraint = match ix.constraint.as_deref() {
+        Some(k) if k == ix.name && name != ix.name => Some(name.to_string()),
+        other => other.map(str::to_string),
+    };
+    Change::DropIndex {
+        name: name.to_string(),
+        constraint,
+        unique: ix.unique,
     }
 }
 
@@ -19790,19 +19963,11 @@ mod tests {
             .info
             .name = "px2".into();
         assert!(d.validate(MsSql).is_empty(), "{:?}", d.validate(MsSql));
-        let sql = diff(&t, &d, MsSql).emit();
-        assert!(
-            at(&sql, "DROP INDEX [sx_path]") < at(&sql, "DROP INDEX [px]"),
-            "{sql:#?}"
-        );
-        assert!(
-            at(&sql, "CREATE PRIMARY XML INDEX [px2]") < at(&sql, "CREATE XML INDEX [sx_path]"),
-            "{sql:#?}"
-        );
-        assert!(
-            sql[at(&sql, "CREATE XML INDEX [sx_path]")]
-                .ends_with("USING XML INDEX [px2] FOR PATH;"),
-            "{sql:#?}"
+        // Renamed alone, the parent is `sp_rename`'s, and the secondaries —
+        // which name it by id — stand (`a_renamed_sql_server_index_is_…`).
+        assert_eq!(
+            diff(&t, &d, MsSql).emit(),
+            vec!["EXEC sp_rename N'[dbo].[p].[px]', N'px2', N'INDEX';"]
         );
 
         let mut t = ms_rebuild_table();
@@ -19835,6 +20000,24 @@ mod tests {
             "{sql:#?}"
         );
 
+        // Renamed as well as re-made, the secondary names it by its new name.
+        d.indexes
+            .iter_mut()
+            .find(|i| i.info.name == "sx")
+            .unwrap()
+            .info
+            .name = "sx2".into();
+        assert!(d.validate(MsSql).is_empty(), "{:?}", d.validate(MsSql));
+        let sql = diff(&t, &d, MsSql).emit();
+        assert!(
+            at(&sql, "CREATE SELECTIVE XML INDEX [sx2]") < at(&sql, "CREATE XML INDEX [sx_a]"),
+            "{sql:#?}"
+        );
+        assert!(
+            sql[at(&sql, "CREATE XML INDEX [sx_a]")].ends_with("USING XML INDEX [sx2] FOR ([a]);"),
+            "{sql:#?}"
+        );
+
         // Kept while its parent goes, a secondary has nothing to stand on.
         let mut d = TableDraft::from_table(&t);
         d.indexes.retain(|i| i.info.name != "sx");
@@ -19842,6 +20025,100 @@ mod tests {
         assert!(
             errs.contains("sx_a") && errs.contains("built on sx"),
             "{errs}"
+        );
+    }
+
+    /// **A SQL Server index renamed and nothing else is `sp_rename`'s**,
+    /// which keeps every option the model does not read. As a drop and a
+    /// create it lost its fill factor, compression and filegroup past the
+    /// in-place guard, which pairs a drop with an add of the same name
+    /// (R3-L5-04); a unique constraint went back under its old name. A
+    /// constraint renamed together with a change is re-added under the new
+    /// name, and the other engines keep their drop and create.
+    #[test]
+    fn a_renamed_sql_server_index_is_renamed_in_place() {
+        let mut t = ms_rebuild_table();
+        t.indexes.push(IndexInfo {
+            name: "uq_qty".into(),
+            unique: true,
+            constraint: Some("uq_qty".into()),
+            columns: vec![crate::schema::IndexColumn::plain("qty")],
+            ..Default::default()
+        });
+        let renamed = |from: &str, to: &str| {
+            let mut d = TableDraft::from_table(&t);
+            d.indexes
+                .iter_mut()
+                .find(|i| i.info.name == from)
+                .unwrap()
+                .info
+                .name = to.into();
+            d
+        };
+        assert_eq!(
+            diff(&t, &renamed("ux_code", "ux_code2"), MsSql).emit(),
+            vec!["EXEC sp_rename N'[dbo].[p].[ux_code]', N'ux_code2', N'INDEX';"]
+        );
+        assert_eq!(
+            diff(&t, &renamed("uq_qty", "uq_q"), MsSql).emit(),
+            vec!["EXEC sp_rename N'[dbo].[uq_qty]', N'uq_q', N'OBJECT';"]
+        );
+
+        let mut d = renamed("uq_qty", "uq_q");
+        let uq = &mut d
+            .indexes
+            .iter_mut()
+            .find(|i| i.info.name == "uq_q")
+            .unwrap()
+            .info;
+        uq.columns.push(crate::schema::IndexColumn::plain("code"));
+        // Renamed and changed: renamed first, then re-made under the new
+        // name, so the guard — asked before anything runs — probes the name
+        // the index has then. As a drop of one name and an add of another,
+        // nothing paired them and its options went unasked.
+        let sql = diff(&t, &d, MsSql).emit();
+        let at = |sql: &[String], n: &str| {
+            sql.iter()
+                .position(|s| s.contains(n))
+                .unwrap_or_else(|| panic!("no {n} in {sql:#?}"))
+        };
+        assert!(sql[0].contains("i.name = N'uq_qty'"), "{sql:#?}");
+        assert!(
+            at(&sql, "sp_rename N'[dbo].[uq_qty]', N'uq_q'") < at(&sql, "DROP CONSTRAINT [uq_q]")
+        );
+        assert!(at(&sql, "DROP CONSTRAINT [uq_q]") < at(&sql, "ADD CONSTRAINT [uq_q] UNIQUE"));
+        assert!(
+            !sql.iter().any(|s| s.contains("DROP CONSTRAINT [uq_qty]")),
+            "{sql:#?}"
+        );
+
+        // Renamed alone while a retype under it re-makes it: off and back
+        // under the new name, after the rename.
+        let mut d = renamed("ux_code", "ux_code2");
+        d.columns
+            .iter_mut()
+            .find(|c| c.info.name == "code")
+            .unwrap()
+            .info
+            .type_name = "nvarchar(5)".into();
+        let sql = diff(&t, &d, MsSql).emit();
+        assert!(
+            at(&sql, "sp_rename N'[dbo].[p].[ux_code]'") < at(&sql, "DROP INDEX [ux_code2]"),
+            "{sql:#?}"
+        );
+        assert!(
+            at(&sql, "DROP INDEX [ux_code2]") < at(&sql, "CREATE UNIQUE INDEX [ux_code2]"),
+            "{sql:#?}"
+        );
+        assert!(sql[0].contains("i.name = N'ux_code'"), "{sql:#?}");
+
+        let pg = diff(&t, &renamed("ux_code", "ux_code2"), Postgres);
+        assert!(
+            !pg.changes
+                .iter()
+                .any(|c| matches!(c, Change::RenameIndex { .. })),
+            "{:?}",
+            pg.changes
         );
     }
 
@@ -34413,6 +34690,7 @@ mod database_tests {
             | Change::DropTable
             | Change::TruncateTable
             | Change::RenameTable { .. }
+            | Change::RenameIndex { .. }
             | Change::AddColumn { .. }
             | Change::DropColumn { .. }
             | Change::RebuildComputedColumn { .. }
