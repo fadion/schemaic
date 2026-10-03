@@ -4715,6 +4715,20 @@ impl Catalog {
         let mut opaque_qualified = HashSet::new();
         let mut opaque_unqualified = HashSet::new();
         let active_lower = active_db.map(|d| d.to_ascii_lowercase());
+        // **`(database, name)` and a bare name are shared by every schema's
+        // relations, so their columns are merged, never replaced.** Two
+        // same-named tables in different schemas (`sales.orders`,
+        // `dbo.orders`), or a table and a synonym, would otherwise leave
+        // whichever was indexed last, and a correct reference to the other a
+        // false "Column not found" (S4.2-L1-04, CMP-06). The union can only
+        // let a wrong column through, which is the side uncertainty takes.
+        let merge = |entry: &mut Vec<String>, cols: &[String]| {
+            for c in cols {
+                if !entry.iter().any(|e| e.eq_ignore_ascii_case(c)) {
+                    entry.push(c.clone());
+                }
+            }
+        };
         for (db, schema) in loaded {
             let db_lower = db.to_ascii_lowercase();
             loaded_dbs.insert(db_lower.clone());
@@ -4748,9 +4762,11 @@ impl Catalog {
                 for c in &cols {
                     known_idents.insert(c.to_ascii_lowercase());
                 }
-                qualified.insert(
-                    (db_lower.clone(), t.name.to_ascii_lowercase()),
-                    cols.clone(),
+                merge(
+                    qualified
+                        .entry((db_lower.clone(), t.name.to_ascii_lowercase()))
+                        .or_default(),
+                    &cols,
                 );
                 // PostgreSQL namespace, when the table carries one. Indexed only
                 // for the in-scope database: `schema.table` never crosses a
@@ -4763,12 +4779,10 @@ impl Catalog {
                     schema_qualified.insert((ns_lower, t.name.to_ascii_lowercase()), cols.clone());
                 }
                 if in_scope {
-                    let entry = unqualified.entry(t.name.to_ascii_lowercase()).or_default();
-                    for c in cols {
-                        if !entry.iter().any(|e| e.eq_ignore_ascii_case(&c)) {
-                            entry.push(c);
-                        }
-                    }
+                    merge(
+                        unqualified.entry(t.name.to_ascii_lowercase()).or_default(),
+                        &cols,
+                    );
                     let pk: Vec<String> = t
                         .columns
                         .iter()
@@ -4793,20 +4807,9 @@ impl Catalog {
             // **A SQL Server synonym is a relation too.** It is held apart
             // from `tables` (`DbSchema::tsql_objects`), so a query through one
             // was "Table not found". One over this database's own table
-            // carries its columns; any other is known by name alone.
-            //
-            // **Added to a same-named table's columns, never over them**
-            // (S4.2-L1-04): `(database, name)` and a bare name are shared with
-            // the tables of every schema, and a synonym `dbo.orders` replacing
-            // `sales.orders`' entry made a correct three-part reference to the
-            // table a "Column not found" — the merge same-named tables get.
-            let merge = |entry: &mut Vec<String>, cols: &[String]| {
-                for c in cols {
-                    if !entry.iter().any(|e| e.eq_ignore_ascii_case(c)) {
-                        entry.push(c.clone());
-                    }
-                }
-            };
+            // carries its columns; any other is known by name alone. Its
+            // columns are added to a same-named table's through `merge`,
+            // never over them (S4.2-L1-04).
             for (syn, target) in schema.synonyms(db) {
                 let name_lower = syn.name.to_ascii_lowercase();
                 known_idents.insert(name_lower.clone());
@@ -16930,6 +16933,38 @@ mod tests {
         let cat = Catalog::build(&[("app", &app), ("hist", &hist)], Some("hist"));
         let found = diagnostics("SELECT archived_at FROM orders;", &cat, SqlDialect::MsSql);
         assert!(found.is_empty(), "{found:?}");
+    }
+
+    /// **Two same-named tables in another database merge under `(database,
+    /// name)`** (CMP-06): in `hist`, `sales.orders (id, total)` and
+    /// `dbo.orders (id, archived_at)`, with `app` active. The tables loop
+    /// *replaced* that entry, so whichever was indexed last won and the
+    /// correct `SELECT total FROM hist.sales.orders` read "Column `total` not
+    /// found in `orders`" — the false positive the synonym arm's merge exists
+    /// to rule out. In scope the bare-name map already merged.
+    #[test]
+    fn same_named_tables_in_another_database_merge_their_columns() {
+        let hist = DbSchema {
+            tables: vec![
+                tbl_in("sales", "orders", &["id", "total"]),
+                tbl_in("dbo", "orders", &["id", "archived_at"]),
+            ],
+            ..Default::default()
+        };
+        let app = DbSchema {
+            tables: vec![tbl_in("dbo", "t", &["id"])],
+            ..Default::default()
+        };
+        for active in ["app", "hist"] {
+            let cat = Catalog::build(&[("app", &app), ("hist", &hist)], Some(active));
+            for sql in [
+                "SELECT total FROM hist.sales.orders;",
+                "SELECT archived_at FROM hist.dbo.orders;",
+            ] {
+                let found = diagnostics(sql, &cat, SqlDialect::MsSql);
+                assert!(found.is_empty(), "{active}: {sql}: {found:?}");
+            }
+        }
     }
 
     /// **A T-SQL three-part name is `database.schema.table`.** It was read as

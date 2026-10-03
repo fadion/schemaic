@@ -1182,9 +1182,13 @@ existing prose was left alone.
     through but must never report a real one missing
     (`a_synonym_is_a_relation_with_its_targets_columns`, red before). By the same rule a resolved
     synonym's columns are **merged** into a same-named table's `(database, name)` and bare-name
-    entries, never written over them — as same-named tables merge — since `dbo.orders` replacing
-    `sales.orders`' entry made the correct `SELECT total FROM hist.sales.orders` a "Column not
-    found" (`a_synonym_sharing_a_tables_name_adds_to_its_columns`, S4.2-L1-04, red before).
+    entries, never written over them, since `dbo.orders` replacing `sales.orders`' entry made the
+    correct `SELECT total FROM hist.sales.orders` a "Column not found"
+    (`a_synonym_sharing_a_tables_name_adds_to_its_columns`, S4.2-L1-04, red before). Same-named
+    **tables** take the same `merge`: the bare-name map always did, but `(database, name)` was
+    replaced, so `hist`'s `sales.orders` and `dbo.orders` kept whichever was indexed last and the
+    same three-part reference was the same false error with no synonym in sight
+    (`same_named_tables_in_another_database_merge_their_columns`, CMP-06, red before).
     **`NON_RESERVED_KEYWORDS` is legal keywords one edit from a curated one**, which the typo
     checker would otherwise flag. It is dialect-free, since each is legal on some engine here and
     which engine has which is `builtin_catalog`'s half of the question. The list was widened by
