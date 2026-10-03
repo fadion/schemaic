@@ -2391,7 +2391,13 @@ pub(crate) async fn fetch_schema(
         }
     };
     match outcome {
-        Some(r) => r,
+        // Where it was read from, as MySQL's reader records it: a synonym's
+        // target may name this database, and the comparison has to subtract
+        // it (`DbSchema::database`).
+        Some(r) => r.map(|mut schema| {
+            schema.database = Some(database.to_string());
+            schema
+        }),
         None => Err(cancel_now(&mut client).await),
     }
 }

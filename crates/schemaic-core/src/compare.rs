@@ -64,7 +64,7 @@ use crate::ddl::{
 use crate::intel::SqlDialect;
 use crate::schema::{
     DbSchema, DomainInfo, EnumInfo, EventInfo, RoutineInfo, RoutineKind, SequenceInfo, TableInfo,
-    TableShape, TriggerInfo, TsqlObject, display_name,
+    TableShape, TriggerInfo, TsqlObject, TsqlObjectKind, display_name,
 };
 
 /// What kind of object a [`CompareEntry`] is about.
@@ -1880,13 +1880,23 @@ fn fk_rank(
 /// - a view's [`TableInfo::view_definition`] is the server's rewritten body,
 ///   qualified throughout ([`ddl::view_definition_is_qualified`]).
 ///
+/// And on SQL Server a synonym's [`TsqlObjectKind::Synonym::target`] may carry
+/// one: SSMS's *New Synonym* dialog fills the database part in, so
+/// `[shop_dev].[dbo].[orders]` read from `shop_dev` is that database's own
+/// table — the reading [`DbSchema::synonyms`] takes of it. No predicate asks
+/// this one: the field is T-SQL's alone, and a target naming the database it
+/// was read from means the same thing on every engine that could fill it. A
+/// linked server's database of the same name is another server's, and is left
+/// as read ([`synonym_database`]).
+///
 /// Left alone, every table holding a key and every view came out `Differing`
 /// between two identical databases, and — the half that costs data — the plan
 /// runs against the **left** database while naming the **right** one:
 /// `ADD CONSTRAINT … REFERENCES <right>.parent` puts the left database's
 /// referential integrity in another database, and `CREATE OR REPLACE VIEW`
-/// re-points the left view at the right database's rows. Neither is named
-/// anywhere in the preview; `destructive()` is empty for both.
+/// re-points the left view at the right database's rows; a synonym's
+/// `DROP` + `CREATE` sends every read and write through the left one to the
+/// right database's table. None is named anywhere in the preview.
 ///
 /// **Re-addressed rather than stripped**, and the difference matters twice.
 /// Stripping loses the distinction the fix has to keep — MySQL allows a key into
@@ -1905,8 +1915,9 @@ fn fk_rank(
 /// judgement — see [`without_definer`].
 ///
 /// Borrows when there is nothing to re-address, which is every PostgreSQL and
-/// SQLite comparison, a pair whose two databases are named the same, and any
-/// side that did not record where it came from.
+/// SQLite comparison, a SQL Server one with no synonym naming its own database,
+/// a pair whose two databases are named the same, and any side that did not
+/// record where it came from.
 fn as_read_from<'a>(
     right: &'a DbSchema,
     left: &DbSchema,
@@ -1918,10 +1929,32 @@ fn as_read_from<'a>(
         ddl::ref_schema_is_database(dialect),
         ddl::view_definition_is_qualified(dialect),
     );
-    let Some(from) = from.filter(|f| Some(*f) != to && (fk || body)) else {
+    let names_from = |target: &[String]| {
+        synonym_database(target).is_some_and(|d| from.is_some_and(|f| d.eq_ignore_ascii_case(f)))
+    };
+    let synonyms = right.tsql_objects.iter().any(|o| match &o.kind {
+        TsqlObjectKind::Synonym { target } => names_from(target),
+        _ => false,
+    });
+    let Some(from) = from.filter(|f| Some(*f) != to && (fk || body || synonyms)) else {
         return Cow::Borrowed(right);
     };
     let mut out = right.clone();
+    for o in &mut out.tsql_objects {
+        if let TsqlObjectKind::Synonym { target } = &mut o.kind
+            && names_from(target)
+        {
+            let at = target.len() - 3;
+            match to {
+                Some(to) => target[at] = to.to_string(),
+                // The left side has no address to give it: the bare
+                // two-part name is the one that means "this database".
+                None => {
+                    target.drain(..=at);
+                }
+            }
+        }
+    }
     for t in &mut out.tables {
         if fk {
             for k in &mut t.foreign_keys {
@@ -1938,6 +1971,17 @@ fn as_read_from<'a>(
         }
     }
     Cow::Owned(out)
+}
+
+/// The database a synonym's target names on this server: `db` of
+/// `[db].[schema].[object]`, or of a four-part target whose server part is
+/// empty. `None` for a two-part target, and for a linked server's.
+fn synonym_database(target: &[String]) -> Option<&str> {
+    match target {
+        [db, _, _] => Some(db),
+        [server, db, _, _] if server.is_empty() => Some(db),
+        _ => None,
+    }
 }
 
 /// Clear every `DEFINER`, on both sides, before the two are compared.
@@ -3958,6 +4002,75 @@ mod tests {
             find(&same, "sequence:dbo.order_no").status,
             ObjectStatus::Same
         );
+    }
+
+    /// **A synonym naming its own database is re-addressed like a foreign
+    /// key's `ref_schema`**: `[shop_dev].[dbo].[orders]` read from `shop_dev`
+    /// and `[shop_prod].[dbo].[orders]` read from `shop_prod` each stand for
+    /// their own database's table, and are the same synonym. Left as read,
+    /// the plan repointed the left synonym at the right database, so every
+    /// read and write through it landed there. A target in a third database
+    /// is an address about the object and still compares as read.
+    #[test]
+    fn a_synonym_naming_its_own_database_is_compared_as_its_own() {
+        use crate::schema::TsqlObjectKind as T;
+        let syn = |target: &[&str]| {
+            tsql(
+                "o",
+                T::Synonym {
+                    target: target.iter().map(|p| p.to_string()).collect(),
+                },
+            )
+        };
+        let side = |db: &str, target: &[&str]| DbSchema {
+            database: Some(db.into()),
+            ..with_tsql(vec![], vec![syn(target)])
+        };
+        let status = |l: &DbSchema, r: &DbSchema| {
+            find(
+                &SchemaComparison::of(l, r, SqlDialect::MsSql),
+                "synonym:dbo.o",
+            )
+            .status
+        };
+        let own = status(
+            &side("shop_dev", &["shop_dev", "dbo", "orders"]),
+            &side("shop_prod", &["SHOP_PROD", "dbo", "orders"]),
+        );
+        assert_eq!(own, ObjectStatus::Same);
+        let third = status(
+            &side("shop_dev", &["archive", "dbo", "orders"]),
+            &side("shop_prod", &["archive", "dbo", "orders"]),
+        );
+        assert_eq!(third, ObjectStatus::Same);
+        let elsewhere = status(
+            &side("shop_dev", &["archive", "dbo", "orders"]),
+            &side("shop_prod", &["shop_prod", "dbo", "orders"]),
+        );
+        assert_eq!(elsewhere, ObjectStatus::Differing);
+        // A linked server's database of the same name is another server's.
+        let linked = status(
+            &side("shop_dev", &["srv", "shop_dev", "dbo", "orders"]),
+            &side("shop_prod", &["srv", "shop_prod", "dbo", "orders"]),
+        );
+        assert_eq!(linked, ObjectStatus::Differing);
+        // A four-part target with no server is this server's database.
+        let no_server = status(
+            &side("shop_dev", &["", "shop_dev", "dbo", "orders"]),
+            &side("shop_prod", &["", "shop_prod", "dbo", "orders"]),
+        );
+        assert_eq!(no_server, ObjectStatus::Same);
+        // A left side that recorded no address gets the bare two-part name,
+        // the one that means "this database".
+        let anonymous = DbSchema {
+            database: None,
+            ..side("x", &["dbo", "orders"])
+        };
+        let to_bare = status(
+            &anonymous,
+            &side("shop_prod", &["shop_prod", "dbo", "orders"]),
+        );
+        assert_eq!(to_bare, ObjectStatus::Same);
     }
 
     /// **The plan creates them in the order their uses need**: an XML schema

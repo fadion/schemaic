@@ -6084,7 +6084,9 @@ pub struct DbSchema {
     /// view's rewritten [`TableInfo::view_definition`] both come back qualified
     /// with the reading database. Two structurally identical databases then
     /// differ in every object holding either, and the migration re-points the
-    /// left database's key — and its view's body — at the *right* one.
+    /// left database's key — and its view's body — at the *right* one. SQL
+    /// Server's reader records it too, for a synonym whose target names the
+    /// database it lives in ([`TsqlObjectKind::Synonym`]).
     ///
     /// `None` means the reader did not record it, which is the honest answer for
     /// a hand-built schema. A side with no address is compared exactly as it

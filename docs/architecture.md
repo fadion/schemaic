@@ -6119,6 +6119,11 @@ existing prose was left alone.
     **right** one: `ADD CONSTRAINT … REFERENCES <right>.parent` puts the left database's referential
     integrity in another database, and `CREATE OR REPLACE VIEW` re-points the left view at the right
     database's rows. Neither is named anywhere in the preview, and `destructive()` is empty for both.
+    SQL Server has a third such field: a synonym's `TsqlObjectKind::Synonym::target`, which SSMS's
+    *New Synonym* dialog fills in three-part, so `[shop_dev].[dbo].[orders]` read from `shop_dev` is
+    that database's own table — the reading `DbSchema::synonyms` takes of it — yet it compared
+    `Differing` against `[shop_prod].[dbo].[orders]`, and the plan's `DROP` + `CREATE` sent every
+    read and write through the left synonym to the right database's table.
     `as_read_from` is the pass that closes it, and it **re-addresses rather than strips**: MySQL
     allows a key into another database, so one of those genuinely *is* a difference, and `ddl`'s
     foreign-key rule that an absent namespace matches an explicit one would have made a
@@ -6129,9 +6134,16 @@ existing prose was left alone.
     of it and a `.` behind it, so `` `t`.`shop` `` stays the column it is
     (`a_column_named_after_the_database_is_left_alone`). Which of the two fields to re-address is
     asked of two capability predicates rather than of the engine (`ddl::ref_schema_is_database`,
-    `ddl::view_definition_is_qualified`), and the whole pass borrows rather than clones when there is
-    nothing to do — every PostgreSQL and SQLite comparison, a pair whose two databases are named the
-    same, and any side that did not record where it came from
+    `ddl::view_definition_is_qualified`). The synonym asks none, the field being T-SQL's alone by
+    type: a target whose database part names the right side's database, case-insensitively, becomes
+    the left side's database — or, where the left recorded none, the bare two-part name that means
+    "this database". `synonym_database` reads that part off a three-part target, or a four-part one
+    whose server part is empty; a linked server's database of the same name is another server's and
+    is left as read (`a_synonym_naming_its_own_database_is_compared_as_its_own`; live,
+    `a_synonym_naming_its_own_database_compares_the_same`). The whole pass borrows rather than
+    clones when there is nothing to do — every PostgreSQL and SQLite comparison, a SQL Server one
+    with no synonym naming its own database, a pair whose two databases are named the same, and any
+    side that did not record where it came from
     (`the_foreign_key_pair_differs_only_in_where_it_was_read_from`). Where a schema was read from is
     `DbSchema::database`, which the model records nowhere else. The **left** side is never touched:
     it is the target, and it is already in its own terms.
@@ -9530,7 +9542,10 @@ existing prose was left alone.
     reader has to subtract an object's own address before comparing it against another database's,
     and the model records that address nowhere else. MySQL's `collect_schema` stamps it with the
     database it was handed, that being the engine where a foreign key's `ref_schema` and a view's
-    rewritten `view_definition` both come back qualified with the reading database; PostgreSQL's
+    rewritten `view_definition` both come back qualified with the reading database. SQL Server's
+    `fetch_schema` stamps it too, on success, for a synonym's target that may name the reading
+    database — before it did, that engine's schema never said where it came from, and the
+    comparison's re-addressing of a synonym would have been inert. PostgreSQL's
     `collect_schema` leaves it `None` on purpose — and says so in a comment on the literal, since
     nothing that engine reports carries an address, so filling it would cost a `current_database()`
     round trip to change no answer. `None` also means "the reader did not record it", which is the honest

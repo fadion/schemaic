@@ -4540,6 +4540,39 @@ async fn a_comparison_leaves_a_signature_out_of_the_difference() {
     assert!(left.is_empty(), "{left:?}");
 }
 
+/// **A synonym naming its own database is its own database's in a
+/// comparison.** Created the way SSMS's dialog writes it — database part
+/// filled in — each side's `dbo.o` stands for that side's `orders`. The
+/// comparison called them Differing and planned to repoint the target's
+/// synonym at the source database.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_synonym_naming_its_own_database_compares_the_same() {
+    use schemaic_core::compare::SchemaComparison;
+    if !enabled() || azure_cannot("needs a second database") {
+        return;
+    }
+    let target = Scratch::create("cmp_syn_target").await;
+    let source = Scratch::create("cmp_syn_source").await;
+    for s in [&target, &source] {
+        s.exec("CREATE TABLE dbo.orders (id int NOT NULL PRIMARY KEY)")
+            .await;
+        s.exec(&format!("CREATE SYNONYM dbo.o FOR [{}].dbo.orders", s.name))
+            .await;
+    }
+    let read = |s: &Scratch| {
+        let db = s.db.clone();
+        let name = s.name.clone();
+        async move {
+            db.fetch_schema(&name, CancellationToken::new())
+                .await
+                .unwrap()
+        }
+    };
+    let c = SchemaComparison::of(&read(&target).await, &read(&source).await, MS);
+    let differing: Vec<String> = c.differences().map(|e| e.key()).collect();
+    assert!(differing.is_empty(), "{differing:?}");
+}
+
 /// **A comparison discloses a module the source would not show, rather than
 /// planning it.** An encrypted view was planned as `CREATE VIEW v AS ;` and
 /// an encrypted procedure as a comment that "succeeded" creating nothing.
