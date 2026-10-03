@@ -7,7 +7,8 @@
 //! dead host shouldn't be hammered, a background window shouldn't be opening
 //! connections at all, an SSH-tunnelled link is more expensive to probe than a
 //! local socket — so it lives here, decided by [`tick`] over a [`TickCtx`]
-//! snapshot and covered by unit tests.
+//! snapshot and covered by unit tests. What each piece of news — a check, a
+//! schema load, an edit of the settings — does to the verdict is [`fold`].
 //!
 //! The app owns the parts that can't be pure: reading the snapshot, calling
 //! `Db::ping`, and re-arming the timer with [`Tick::next`].
@@ -150,6 +151,87 @@ pub fn backoff(base: Duration, failures: u32, max: Duration) -> Duration {
 /// Fold a ping result into the consecutive-failure count: any success clears it.
 pub fn record(failures: u32, ok: bool) -> u32 {
     if ok { 0 } else { failures.saturating_add(1) }
+}
+
+/// What the app knows about the active connection's reachability: the verdict
+/// the header shows ("Disconnected · Retry" when it is down) and the
+/// consecutive-failure count [`tick`] backs off on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Health {
+    /// The verdict.
+    pub status: ConnStatus,
+    /// Consecutive failed checks behind it (see [`record`]).
+    pub failures: u32,
+}
+
+/// Something that has just told the app about the active connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Evidence {
+    /// A health check landed, and the app's landing guard let it write: `true`
+    /// if the server answered.
+    Checked(bool),
+    /// The schema load listed the connection's databases: a sign-in with the
+    /// connection's settings as they now stand, and a query after it, have just
+    /// succeeded.
+    Listed,
+    /// The connection's settings were saved.
+    Edited,
+}
+
+impl Evidence {
+    /// Is every health check already in flight stale once this has happened?
+    ///
+    /// Only an **edit**. A check out at the time pings with the settings as they
+    /// were — the wrong password the user has just corrected — and its failure,
+    /// landing after the save, would put the header straight back.
+    ///
+    /// **Not a load**, which is the other half and is just as deliberate. A
+    /// check started after the load did is newer evidence than the load, so a
+    /// failure it brings back must still land: retiring it would let a
+    /// successful listing mask the server going away a moment later.
+    pub fn retires_checks_in_flight(self) -> bool {
+        matches!(self, Evidence::Edited)
+    }
+}
+
+/// Fold one piece of [`Evidence`] into what the app knows.
+///
+/// The case this exists for: a connection showing "Disconnected" because its
+/// saved password was wrong, the user fixes it and saves, and the schema tree
+/// fills in while the header goes on saying "Disconnected · Retry" — for as
+/// long as the poll's backoff, grown on every failed check, took to come round.
+/// Two facts were missing, and both are folded here:
+///
+/// - **A listing is a check that passed.** It signed in and ran a query against
+///   this connection with its current settings, which is everything `ping`
+///   proves, so it clears the verdict and the backoff behind it.
+/// - **An edit forgets the old settings' backoff**, which says nothing about the
+///   new ones, and the app re-checks at once rather than at the next tick. The
+///   verdict itself stands until that check (or the load's listing) answers:
+///   clearing it made a colour-only save of a connection that really is down
+///   hide "Disconnected" for as long as the check took, then show it again. The
+///   checks already in flight are what the edit makes stale, and the app retires
+///   those ([`Evidence::retires_checks_in_flight`]).
+///
+/// A load that *failed* is deliberately not evidence: a listing can fail on a
+/// privilege the ping does not need, and the tree already says so in its own
+/// words.
+pub fn fold(h: Health, e: Evidence) -> Health {
+    match e {
+        Evidence::Checked(ok) => Health {
+            status: if ok {
+                ConnStatus::Connected
+            } else {
+                ConnStatus::Disconnected
+            },
+            failures: record(h.failures, ok),
+        },
+        Evidence::Listed => fold(h, Evidence::Checked(true)),
+        Evidence::Edited => Health {
+            status: h.status,
+            failures: 0,
+        },
+    }
 }
 
 #[cfg(test)]
@@ -363,5 +445,99 @@ mod tests {
     #[test]
     fn record_saturates() {
         assert_eq!(record(u32::MAX, false), u32::MAX);
+    }
+
+    fn down(failures: u32) -> Health {
+        Health {
+            status: ConnStatus::Disconnected,
+            failures,
+        }
+    }
+
+    #[test]
+    fn a_check_folds_its_verdict_and_counts_toward_the_backoff() {
+        assert_eq!(
+            fold(down(2), Evidence::Checked(false)),
+            Health {
+                status: ConnStatus::Disconnected,
+                failures: 3
+            }
+        );
+        assert_eq!(
+            fold(down(2), Evidence::Checked(true)),
+            Health {
+                status: ConnStatus::Connected,
+                failures: 0
+            }
+        );
+    }
+
+    /// The reported bug: the password is fixed, the tree fills in, and the
+    /// header still says "Disconnected · Retry" until a backed-off poll comes
+    /// round. Listing the databases *is* a successful check.
+    #[test]
+    fn a_listed_load_clears_a_failed_verdict_and_its_backoff() {
+        assert_eq!(
+            fold(down(4), Evidence::Listed),
+            Health {
+                status: ConnStatus::Connected,
+                failures: 0
+            }
+        );
+    }
+
+    #[test]
+    fn a_listed_load_of_an_unchecked_connection_says_connected() {
+        assert_eq!(
+            fold(Health::default(), Evidence::Listed).status,
+            ConnStatus::Connected
+        );
+    }
+
+    /// An edit forgets the old settings' backoff but leaves the verdict to the
+    /// check the save runs at once. Clearing it instead made a colour-only save
+    /// of a connection that really is down hide "Disconnected" for as long as
+    /// that check took, then show it again.
+    #[test]
+    fn an_edit_keeps_a_failed_verdict_and_forgets_its_backoff() {
+        assert_eq!(fold(down(4), Evidence::Edited), down(0));
+    }
+
+    #[test]
+    fn an_edit_keeps_a_passing_verdict_too() {
+        let up = Health {
+            status: ConnStatus::Connected,
+            failures: 0,
+        };
+        assert_eq!(fold(up, Evidence::Edited), up);
+    }
+
+    /// A check out at the time of a save pinged with the old settings; its
+    /// failure must not land on top of the new ones.
+    #[test]
+    fn an_edit_retires_every_check_in_flight() {
+        assert!(Evidence::Edited.retires_checks_in_flight());
+    }
+
+    /// The reverse must not happen: a check started after a load is newer
+    /// evidence, and a failure it brings back must still be able to land.
+    #[test]
+    fn a_load_or_a_check_retires_nothing() {
+        assert!(!Evidence::Listed.retires_checks_in_flight());
+        assert!(!Evidence::Checked(true).retires_checks_in_flight());
+        assert!(!Evidence::Checked(false).retires_checks_in_flight());
+    }
+
+    /// A failure after a listing is the newer news, and wins.
+    #[test]
+    fn a_failed_check_after_a_listing_still_says_disconnected() {
+        let after = fold(fold(down(1), Evidence::Listed), Evidence::Checked(false));
+        assert_eq!(
+            after,
+            Health {
+                status: ConnStatus::Disconnected,
+                failures: 1
+            }
+        );
     }
 }

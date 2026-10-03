@@ -21,13 +21,14 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Live reachability of the active connection, from the last health check.
+/// Live reachability of the active connection, from the last health check (or
+/// schema load) — see [`crate::health::fold`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum ConnStatus {
     /// Not yet checked (or check in flight before any result).
     #[default]
     Unknown,
-    /// A recent health check succeeded.
+    /// A recent health check succeeded, or a schema load listed the databases.
     Connected,
     /// A recent health check failed (unreachable / auth / tunnel down).
     Disconnected,

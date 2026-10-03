@@ -8081,6 +8081,24 @@ existing prose was left alone.
     whether to proceed. A **different** connection still refuses, which is the case that matters:
     running an action gated on a server the user has left, or reporting the old one unreachable in a
     modal over the new one.
+    **A check is not the only news about reachability, and `health::fold` takes all three**:
+    `Evidence::Checked` (a check the guard let write), `Listed` (the schema load listed the
+    databases — a sign-in and a query with the settings as they stand, everything a ping proves —
+    so `Connected` and the backoff cleared) and `Edited` (a save of the active connection's
+    settings — failures to zero, the verdict left for the check the save runs at once to answer;
+    clearing it to `Unknown` made a colour-only save of a connection that really is down hide
+    "Disconnected" until that check came back). Every write of the verdict
+    goes through `main.rs`'s `note_health`, which composes `fold` with the generation in
+    `note_evidence`. Only a check used to write, so a connection "Disconnected" on a wrong password
+    had its tree fill in after the corrected one was saved while the header went on saying
+    "Disconnected · Retry" until the poll, backed off by every failure that password earned, came
+    round; `save_conn` now also re-checks at once. **An edit retires every check in flight
+    (`Evidence::retires_checks_in_flight`) and a listing retires none**, and the asymmetry is the
+    point: a ping out at the time of the save carries the old password, and since a save moves no
+    connection id only a generation bump stops its failure landing over the new settings; a check
+    started *after* a load is newer news than the load, so a failure it brings back must still
+    land rather than be masked by the listing. Only a load that passes `load_landing` speaks, and a
+    *failed* load is no evidence — a listing can fail on a privilege a ping does not need.
   - `core/window_chrome.rs` — which half of the window frame the app draws itself, now that it
     launches with `WindowConfig::show_titlebar(false)`. `Chrome::current()` answers per `Host`
     (Windows/Linux/macOS): `draws_own_controls`, `own_control_count`, `draws_own_resize_border`,

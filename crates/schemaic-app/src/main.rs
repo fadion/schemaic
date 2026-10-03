@@ -1421,6 +1421,25 @@ fn check_outcome(started: (u64, u64), current: (u64, u64), ok: bool) -> CheckOut
     }
 }
 
+/// Fold one piece of reachability evidence into the health signals' values:
+/// the verdict and failure count `health::fold` decides, and the check
+/// generation [`check_landing`] stamps against.
+///
+/// **The generation is the half the core fold cannot carry**, and the half an
+/// edit needs most. A check already in flight when the user saves a corrected
+/// password is pinging with the wrong one; its stamp still matches the
+/// generation, since a save moves no connection id, so its failure lands after
+/// the save and puts "Disconnected · Retry" straight back over a connection the
+/// tree beside it has just loaded. Bumping here is what makes it superseded.
+fn note_evidence(h: health::Health, generation: u64, e: health::Evidence) -> (health::Health, u64) {
+    let generation = if e.retires_checks_in_flight() {
+        generation + 1
+    } else {
+        generation
+    };
+    (health::fold(h, e), generation)
+}
+
 /// What one database of a landed connection load becomes: an existing node kept,
 /// or a fresh node at this id. Both carry the node id, because the schema tree's
 /// `dyn_stack` is keyed on it.
@@ -2409,12 +2428,14 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let error_modal_text: RwSignal<Option<ModalError>> = RwSignal::new(None);
     let conn_status = RwSignal::new(ConnStatus::Unknown);
     // Consecutive failed health checks of the active connection, folded by every
-    // check (polled or manual). Drives the health poll's backoff so a server
-    // that's been down for a while isn't probed every 10s; reset on switch.
+    // check (polled or manual) and cleared by a successful schema load. Drives
+    // the health poll's backoff so a server that's been down for a while isn't
+    // probed every 10s; reset on switch and on a save of its settings.
     let health_failures = RwSignal::new(0u32);
-    // Bumped by every health check that actually pings, so a check that lands
-    // after a newer one (or after a connection switch) can tell and drop its
-    // result — see `check_landing`.
+    // Bumped by every health check that actually pings, and by a save of the
+    // connection's settings, so a check that lands after a newer one (or after a
+    // connection switch, or after an edit) can tell and drop its result — see
+    // `check_landing` and `note_evidence`.
     let health_gen = RwSignal::new(0u64);
     // OS window focus, set from the workspace root. Starts `true`: the window is
     // focused on launch and winit only reports the *changes*.
@@ -7632,6 +7653,26 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // answers. The continuation is what makes the "connection is down" block
     // recoverable: a blocked action re-checks and proceeds if the server is
     // back, so a stale `Disconnected` can't strand the user.
+    //
+    // **Every write of the verdict goes through `note_health`**, because three
+    // things tell the app about reachability, not one: a check that landed, a
+    // schema load that listed the databases (a sign-in and a query, which is all
+    // a ping proves), and a save of the connection's settings (which makes the
+    // old verdict a verdict about other settings). Only the first used to write,
+    // so a corrected password filled the tree in while the header went on saying
+    // "Disconnected · Retry" until a backed-off poll came round. The decision is
+    // `note_evidence`; this only reads and writes the three signals. Captures
+    // nothing but signals, so it is `Copy`.
+    let note_health = move |e: health::Evidence| {
+        let h = health::Health {
+            status: conn_status.get_untracked(),
+            failures: health_failures.get_untracked(),
+        };
+        let (h, generation) = note_evidence(h, health_gen.get_untracked(), e);
+        conn_status.set(h.status);
+        health_failures.set(h.failures);
+        health_gen.set(generation);
+    };
     let check_conn_then: Rc<dyn Fn(Option<CheckDoneFn>)> = {
         let handle = handle.clone();
         let tunnels = tunnels.clone();
@@ -7682,15 +7723,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 // test can see it.
                 let outcome = check_outcome(stamp, now, ok);
                 if outcome.write_status {
-                    conn_status.set(if ok {
-                        ConnStatus::Connected
-                    } else {
-                        ConnStatus::Disconnected
-                    });
                     // Every check counts toward the backoff, not just the polled
                     // ones — a user hammering Retry against a dead host shouldn't
                     // reset the timer's patience either.
-                    health_failures.set(health::record(health_failures.get_untracked(), ok));
+                    note_health(health::Evidence::Checked(ok));
                 }
                 if let Some(f) = &done {
                     f(outcome.answer);
@@ -8169,6 +8205,13 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         if landing != LoadLanding::Install {
                             return;
                         }
+                        // **The listing is a check that passed** — a sign-in with
+                        // the settings as they now stand, and a query after it.
+                        // After the landing guard, so only the load the user is
+                        // still waiting on speaks for the active connection; it
+                        // retires no check, so one started since that finds the
+                        // server gone still lands its failure.
+                        note_health(health::Evidence::Listed);
                         // A reload of the connection already on screen reuses the
                         // node of every database that is still there — its
                         // `schema` signal comes through untouched, so the rows
@@ -10026,6 +10069,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // Save the form (create or update); reload schema if the active conn changed.
     let save_conn: Rc<dyn Fn()> = {
         let load_schema = load_schema.clone();
+        let check_conn = check_conn.clone();
         let tunnels = tunnels.clone();
         let reset_activity = reset_activity.clone();
         let drop_session = drop_session.clone();
@@ -10163,7 +10207,20 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 // above: a rename moves no server but the snapshot is cheap, and
                 // `reset_activity` skips its own refetch when nothing is
                 // reachable.
+                //
+                // **And the header's verdict, the third thing taken against the
+                // old settings.** A save used to leave it alone, so "Disconnected
+                // · Retry" from a wrong password stood beside a tree the corrected
+                // one had just filled, until the poll — backed off by every
+                // failure that password earned — came round. The edit forgets
+                // that backoff and retires any ping still out with the old
+                // settings (`note_evidence`), and the check runs now rather than
+                // at the next tick; the verdict stands until it (or the load's
+                // listing) answers. Unconditional for the reason above: an edit the predicates
+                // call harmless can still be the password, which neither compares.
+                note_health(health::Evidence::Edited);
                 load_schema(conn);
+                check_conn();
                 (reset_activity)();
             }
         })
@@ -14884,6 +14941,52 @@ mod app_tests {
         // old failure on top, and the banner is back until a poll that has just
         // been told to back off.
         assert!(!check_landing((7, 3), (7, 4)));
+    }
+
+    /// The reported bug, end to end: a connection is "Disconnected" on a wrong
+    /// password, a poll's ping (with that password) is in flight, and the user
+    /// saves the corrected one. The save forgets the backoff, the load's listing
+    /// clears "Disconnected", and the old ping's failure, landing last, must not
+    /// put it back.
+    #[test]
+    fn a_save_retires_the_old_ping_so_it_cannot_restore_the_verdict() {
+        use super::{check_outcome, note_evidence};
+        use schemaic_core::connection::ConnStatus;
+        use schemaic_core::health::{Evidence, Health};
+        let down = Health {
+            status: ConnStatus::Disconnected,
+            failures: 3,
+        };
+        // The poll's ping, stamped before the save.
+        let stale_ping = (7, 3);
+        let (h, generation) = note_evidence(down, 3, Evidence::Edited);
+        assert_eq!(h.failures, 0, "the save forgets the old settings' backoff");
+        let (h, generation) = note_evidence(h, generation, Evidence::Listed);
+        assert_eq!(h.status, ConnStatus::Connected, "the listing proves it");
+        // The wrong password's ping lands last.
+        let late = check_outcome(stale_ping, (7, generation), false);
+        assert!(
+            !late.write_status,
+            "a ping from before the edit may not repaint the header"
+        );
+        assert_eq!(h.status, ConnStatus::Connected);
+    }
+
+    /// The reverse: a listing does not retire a check, so a failure found by a
+    /// check started after the load still lands. A stale success must not mask
+    /// a real failure.
+    #[test]
+    fn a_listing_leaves_a_newer_check_free_to_report_a_failure() {
+        use super::{check_outcome, note_evidence};
+        use schemaic_core::connection::ConnStatus;
+        use schemaic_core::health::{Evidence, Health};
+        let newer_ping = (7, 5);
+        let (h, generation) = note_evidence(Health::default(), 5, Evidence::Listed);
+        assert_eq!(h.status, ConnStatus::Connected);
+        let landed = check_outcome(newer_ping, (7, generation), false);
+        assert!(landed.write_status, "the newer failure still writes");
+        let (h, _) = note_evidence(h, generation, Evidence::Checked(false));
+        assert_eq!(h.status, ConnStatus::Disconnected);
     }
 
     /// A superseded check must still **answer** the action that asked for it,
