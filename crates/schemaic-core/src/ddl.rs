@@ -683,6 +683,38 @@ impl TableDraft {
                         ix.info.name
                     ));
                 }
+                // Msg 35302 and Msg 102, measured on 2022 (S3.1-L1-02).
+                if ix.info.columns.iter().any(|c| c.descending) {
+                    out.push(format!(
+                        "Index {} can't sort its columns: a columnstore column has no direction.",
+                        ix.info.name
+                    ));
+                }
+                if ix.info.is_clustered_columnstore() && ix.info.predicate.is_some() {
+                    out.push(format!(
+                        "Index {} can't be filtered: a clustered columnstore index stores every \
+                         row.",
+                        ix.info.name
+                    ));
+                }
+            } else if !ix.info.include.is_empty()
+                && !ix.info.is_tsql_xml_or_spatial()
+                && !index_takes_include(&ix.info, dialect)
+            {
+                // What `index_takes_include` keeps the designer's field off,
+                // for a draft built any other way (S3.1-L1-01/03).
+                out.push(if ix.info.clustered == Some(true) {
+                    format!(
+                        "Index {} can't include columns: a clustered index holds every column \
+                         already.",
+                        ix.info.name
+                    )
+                } else {
+                    format!(
+                        "Index {} can't include columns: a unique constraint has no INCLUDE here.",
+                        ix.info.name
+                    )
+                });
             }
             for c in &ix.info.columns {
                 // An expression key names no column by design, so there is
@@ -704,6 +736,29 @@ impl TableDraft {
                     ix.info.name
                 ));
             }
+        }
+        // **One clustered structure per table**: the key, where it clusters by
+        // default or by choice, and every index that clusters — a clustered
+        // columnstore included. A second is Msg 35372 / 1902 (S3.1-L1-03).
+        let key_clusters = !self.primary_key.is_empty()
+            && key_clusters_by_default(dialect)
+            && self.primary_key_clustered != Some(false);
+        let clustered: Vec<&str> = self
+            .indexes
+            .iter()
+            .filter(|i| !i.info.is_primary() && i.info.clustered == Some(true))
+            .map(|i| i.info.name.as_str())
+            .collect();
+        if usize::from(key_clusters) + clustered.len() > 1 {
+            let mut what: Vec<String> = clustered.iter().map(|n| format!("index {n}")).collect();
+            if key_clusters {
+                what.insert(0, "the primary key".to_string());
+            }
+            out.push(format!(
+                "A table holds only one clustered index, and {} each cluster it - make all but \
+                 one nonclustered.",
+                what.join(" and ")
+            ));
         }
         // Foreign keys were the last section without a uniqueness arm, though
         // both siblings have one — so `ADD CONSTRAINT` with a name already in
@@ -9603,9 +9658,10 @@ impl IndexStorage {
     }
 
     /// Make `ix` this kind, clearing what the kind cannot carry rather than
-    /// leaving `validate` to refuse it: a columnstore index is never unique
-    /// and lists no included columns, a clustered one names no columns at
-    /// all; an XML or spatial index is over one column, unfiltered, and keeps
+    /// leaving `validate` to refuse it: a columnstore index is never unique,
+    /// lists no included columns and sorts no key column, a clustered one
+    /// names no columns at all and is never filtered; an XML or spatial index
+    /// is over one column, unfiltered, and keeps
     /// its clause only while it stays the kind the clause was written for.
     /// Back to rowstore, it takes T-SQL's default clustering again. Only a
     /// columnstore index keeps an `ORDER`.
@@ -9632,8 +9688,16 @@ impl IndexStorage {
                 ix.clustered = Some(clustered);
                 ix.unique = false;
                 ix.include.clear();
+                // A columnstore column has no direction (Msg 35302), and a
+                // clustered one takes no filter (Msg 102) — a filter the
+                // designer shows on PostgreSQL alone, so left here it could
+                // not be cleared (S3.1-L1-02).
+                for c in &mut ix.columns {
+                    c.descending = false;
+                }
                 if clustered {
                     ix.columns.clear();
+                    ix.predicate = None;
                 }
             }
             IndexStorage::PrimaryXml
@@ -9692,6 +9756,46 @@ pub fn supports_index_include(dialect: SqlDialect) -> bool {
         SqlDialect::MsSql | SqlDialect::Postgres => true,
         SqlDialect::MySql | SqlDialect::Sqlite => false,
     }
+}
+
+/// Can a **unique constraint** carry included columns on `dialect`?
+/// PostgreSQL's `UNIQUE (…) INCLUDE (…)` can; T-SQL has no `INCLUDE` on a
+/// constraint (Msg 102, measured on 2022), and its re-add dropped a typed
+/// list while the preview said "including" (S3.1-L1-01). MySQL and SQLite
+/// have no `INCLUDE` at all ([`supports_index_include`]).
+///
+/// An exhaustive `match`, for the reason [`supports_owners`] gives.
+pub fn constraint_takes_include(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::Postgres => true,
+        SqlDialect::MsSql | SqlDialect::MySql | SqlDialect::Sqlite => false,
+    }
+}
+
+/// Does a primary key cluster its table **by default** on `dialect` — so a
+/// key with no stated clustering counts as the table's clustered structure?
+/// T-SQL's `PRIMARY KEY` is `CLUSTERED` unless told otherwise; the other
+/// engines have no such choice to make.
+///
+/// An exhaustive `match`, for the reason [`supports_owners`] gives.
+pub fn key_clusters_by_default(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MsSql => true,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+    }
+}
+
+/// Can `ix` carry **included columns** on `dialect` — the designer's
+/// *Include* field and `validate` asking one question: an engine with
+/// `INCLUDE`, a kind that takes it ([`IndexStorage::takes_include`]), not a
+/// unique constraint where the constraint has none
+/// ([`constraint_takes_include`]), and not a clustered index, whose leaf is
+/// every column already (Msg 10601, S3.1-L1-03).
+pub fn index_takes_include(ix: &IndexInfo, dialect: SqlDialect) -> bool {
+    supports_index_include(dialect)
+        && IndexStorage::of_in(ix, dialect).takes_include()
+        && !(ix.unique && ix.constraint.is_some() && !constraint_takes_include(dialect))
+        && ix.clustered != Some(true)
 }
 
 /// Can a table and its columns carry a comment the emitter writes on `dialect`?
@@ -19521,6 +19625,9 @@ mod tests {
     #[test]
     fn a_clustered_columnstore_names_no_column_and_is_its_own_index() {
         let mut t = ms_rebuild_table();
+        // The key nonclustered, as it has to be beside a clustered
+        // columnstore (Msg 35372, `sql_server_index_shapes_it_refuses_…`).
+        t.indexes[0].clustered = Some(false);
         t.indexes.push(columnstore(true, &[]));
         let d = TableDraft::from_table(&t);
         assert!(
@@ -19659,6 +19766,105 @@ mod tests {
         for needle in ["exactly one column", "can't be unique", "USING XML INDEX"] {
             assert!(errs.contains(needle), "{needle}: {errs}");
         }
+    }
+
+    /// **A columnstore index keeps no filter where it can't, and no key
+    /// direction** (S3.1-L1-02): switched from a filtered `(a DESC)` rowstore
+    /// index, a clustered columnstore kept the filter (Msg 102, and the
+    /// filter field is PostgreSQL's alone, so it could not be cleared) and a
+    /// columnstore the direction (Msg 35302). `apply` clears both, and
+    /// `validate` refuses a draft built any other way.
+    #[test]
+    fn a_columnstore_index_keeps_no_filter_or_direction() {
+        let filtered_desc = || IndexInfo {
+            name: "ix".into(),
+            columns: vec![crate::schema::IndexColumn {
+                descending: true,
+                ..crate::schema::IndexColumn::plain("qty")
+            }],
+            predicate: Some("[qty]>(0)".into()),
+            ..Default::default()
+        };
+        let mut cci = filtered_desc();
+        IndexStorage::ClusteredColumnstore.apply(&mut cci);
+        assert_eq!(cci.predicate, None);
+        let mut ncci = filtered_desc();
+        IndexStorage::Columnstore.apply(&mut ncci);
+        assert!(ncci.columns.iter().all(|c| !c.descending), "{ncci:?}");
+
+        let errs = |ix: IndexInfo| {
+            let mut t = ms_rebuild_table();
+            t.indexes.push(ix);
+            TableDraft::from_table(&t).validate(MsSql).join(" ")
+        };
+        let mut bad = filtered_desc();
+        bad.method = Some(crate::schema::TSQL_COLUMNSTORE.into());
+        bad.clustered = Some(false);
+        assert!(
+            errs(bad.clone()).contains("no direction"),
+            "{}",
+            errs(bad.clone())
+        );
+        bad.clustered = Some(true);
+        bad.columns.clear();
+        assert!(errs(bad.clone()).contains("filtered"), "{}", errs(bad));
+    }
+
+    /// **The designer offers no index shape SQL Server always refuses**
+    /// (S3.1-L1-01, S3.1-L1-03): included columns on a unique constraint —
+    /// T-SQL has no `INCLUDE` there, and the re-add dropped the list while the
+    /// preview said "including" — or on a clustered rowstore index (Msg
+    /// 10601), and a second clustered structure beside a clustered key (Msg
+    /// 35372).
+    #[test]
+    fn sql_server_index_shapes_it_refuses_are_refused_first() {
+        let errs = |extra: IndexInfo, key_clustered: Option<bool>| {
+            let mut t = ms_rebuild_table();
+            t.indexes.push(extra);
+            let mut d = TableDraft::from_table(&t);
+            d.primary_key_clustered = key_clustered;
+            d.validate(MsSql).join(" ")
+        };
+        let uq = IndexInfo {
+            name: "uq_qty".into(),
+            unique: true,
+            constraint: Some("uq_qty".into()),
+            ..covering(&["code"])
+        };
+        assert!(index_takes_include(&covering(&[]), MsSql));
+        assert!(!index_takes_include(&uq, MsSql));
+        assert!(
+            errs(uq.clone(), None).contains("unique constraint"),
+            "{}",
+            errs(uq, None)
+        );
+
+        let cx = IndexInfo {
+            clustered: Some(true),
+            ..covering(&["code"])
+        };
+        assert!(!index_takes_include(&cx, MsSql));
+        let e = errs(cx.clone(), Some(false));
+        assert!(e.contains("clustered index"), "{e}");
+
+        let mut cci = IndexInfo {
+            name: "cci".into(),
+            ..Default::default()
+        };
+        IndexStorage::ClusteredColumnstore.apply(&mut cci);
+        let e = errs(cci.clone(), None);
+        assert!(e.contains("one clustered"), "{e}");
+        // With the key nonclustered, the columnstore may cluster the table.
+        assert!(!errs(cci, Some(false)).contains("one clustered"));
+        // PostgreSQL's constraint takes `INCLUDE`, and has no clustering.
+        assert!(index_takes_include(
+            &IndexInfo {
+                unique: true,
+                constraint: Some("uq".into()),
+                ..covering(&["code"])
+            },
+            Postgres
+        ));
     }
 
     /// **The Storage choice round-trips, and clears what the new storage

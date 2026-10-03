@@ -5258,6 +5258,38 @@ async fn a_comparison_orders_shared_names_and_folds_case() {
     assert!(left.is_empty(), "{left:?}");
 }
 
+/// **A Storage switch leaves nothing the new kind refuses** (S3.1-L1-02): a
+/// filtered `(qty DESC)` index made Columnstore kept its direction (Msg
+/// 35302), and made Clustered columnstore its filter (Msg 102). Each plan
+/// now applies.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_storage_switch_to_columnstore_applies() {
+    use schemaic_core::ddl::{self, IndexStorage, TableDraft};
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("storage_switch").await;
+    for (t, storage) in [
+        ("sw_ncci", IndexStorage::Columnstore),
+        ("sw_cci", IndexStorage::ClusteredColumnstore),
+    ] {
+        s.exec(&format!(
+            "CREATE TABLE dbo.{t} (id int NOT NULL CONSTRAINT pk_{t} PRIMARY KEY NONCLUSTERED, \
+             qty int NULL); CREATE INDEX ix ON dbo.{t} (qty DESC) WHERE qty > 0"
+        ))
+        .await;
+        let current = read_table(&s, t).await;
+        let mut d = TableDraft::from_table(&current);
+        let ix = d.indexes.iter_mut().find(|i| i.info.name == "ix").unwrap();
+        storage.apply(&mut ix.info);
+        assert!(d.validate(MS).is_empty(), "{t}: {:?}", d.validate(MS));
+        let stmts = ddl::diff(&current, &d, MS).emit();
+        s.db.run_ddl(&s.name, &stmts, CancellationToken::new())
+            .await
+            .unwrap_or_else(|e| panic!("{t}: {e}\n{}", stmts.join("\n")));
+    }
+}
+
 /// **A comparison discloses a module the source would not show, rather than
 /// planning it.** An encrypted view was planned as `CREATE VIEW v AS ;` and
 /// an encrypted procedure as a comment that "succeeded" creating nothing.

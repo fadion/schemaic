@@ -4018,7 +4018,17 @@ existing prose was left alone.
     `supports_index_include(dialect)` sits beside it, true on SQL Server and PostgreSQL and false on
     MySQL and SQLite, which have no `INCLUDE` clause: the index form builds its *Include* field only
     where it is true, and `IndexInfo::include_sql` writes nothing where it is false (below, and
-    under `schema.rs`). `supports_columnstore(dialect)` is SQL Server's alone: the index form builds
+    under `schema.rs`). It is necessary, not sufficient: the field asks `index_takes_include(ix,
+    dialect)`, which adds a kind that keeps a list (`IndexStorage::takes_include`) and refuses two
+    shapes SQL Server rejects — a unique *constraint* where `constraint_takes_include` says no, and
+    a clustered index, whose leaf is every column already (Msg 10601). `constraint_takes_include`
+    is PostgreSQL's alone, whose `UNIQUE (…) INCLUDE (…)` exists; T-SQL has no `INCLUDE` on a
+    constraint (Msg 102), and `emit_mssql`'s constraint re-add dropped a typed list while the
+    preview said *"including"*. `key_clusters_by_default(dialect)`, SQL Server's alone, asks whether
+    a key with no stated clustering is the table's clustered structure — T-SQL's `PRIMARY KEY` is
+    `CLUSTERED` unless told otherwise — and `validate` asks it to count those structures (below).
+    Both are exhaustive `match`es.
+    `supports_columnstore(dialect)` is SQL Server's alone: the index form builds
     its *Storage* choice only there, and only `create_index_sql`'s T-SQL arm writes `COLUMNSTORE`
     (below). `supports_xml_and_spatial_indexes(dialect)` is its sibling for the XML and spatial
     kinds, also SQL Server's alone, and `IndexStorage::offered` asks each family its own predicate
@@ -5034,6 +5044,16 @@ existing prose was left alone.
     (`sql_server_recreates_a_clustered_index_clustered`,
     `sql_server_keeps_a_nonclustered_primary_key_nonclustered`). `None` — every other engine, and a
     key or index the designer is making — takes the default; the designer has no control for it.
+    **`validate` counts the table's clustered structures**, since a table holds only one: the key, where
+    it is non-empty, `key_clusters_by_default` answers yes and `primary_key_clustered` is not
+    `Some(false)`, plus every other index whose `clustered` is `Some(true)`, a clustered columnstore
+    among them. More than one is refused — *"A table holds only one clustered index, and the
+    primary key and index X each cluster it - make all but one nonclustered."* — ahead of the
+    server's Msg 35372 or 1902 (`sql_server_index_shapes_it_refuses_are_refused_first`). With no
+    control for the key's clustering, a clustered columnstore on a table whose key clusters by
+    default is now refused up front rather than at the server; a key read as `NONCLUSTERED` passes,
+    `from_table` carrying it (`a_clustered_columnstore_names_no_column_and_is_its_own_index` makes
+    its key nonclustered for exactly this reason, its old fixture being a table SQL Server refuses).
     **An index's included columns are `IndexInfo::include`, and `create_index_sql` writes them**
     after the key list and before `WHERE`, through `include_sql` — so the designer's `AddIndex`, an
     indexed view's indexes, the T-SQL rebuild and SQLite's replay all go through it, the last
@@ -5048,7 +5068,11 @@ existing prose was left alone.
     `validate` refuses a list naming no column (*"Index X includes c, which isn't a column."*,
     `an_include_naming_no_column_is_refused`) and deliberately **not** a key column repeated in the
     list: SQL Server refuses that (Msg 1909) and PostgreSQL 16 accepts it, both measured, so it is
-    the server's question, asked by the server.
+    the server's question, asked by the server. It does refuse a list where `index_takes_include`
+    answers no, for a draft built other than through the form — *"…a clustered index holds every
+    column already."* or *"…a unique constraint has no INCLUDE here."*
+    (`sql_server_index_shapes_it_refuses_are_refused_first`); a columnstore index has its own
+    refusal (below), and an XML or spatial one is left to its kind's.
     **A columnstore index is written as one, and only on SQL Server** (`supports_columnstore`, an
     exhaustive `match` with `MsSql` alone on `true`): `create_index_sql` writes `CREATE CLUSTERED
     COLUMNSTORE INDEX ix ON t;` with no column list, or `CREATE NONCLUSTERED COLUMNSTORE INDEX ix ON
@@ -5061,12 +5085,21 @@ existing prose was left alone.
     (`a_clustered_columnstore_names_no_column_and_is_its_own_index`). `validate` lets a clustered
     one name no column and refuses a columnstore index that is unique (*"…a columnstore index
     stores columns, not keys"*) or includes columns, T-SQL taking neither on one
-    (`a_columnstore_index_is_refused_uniqueness_and_an_include_list`). `IndexStorage` — *Rowstore*,
+    (`a_columnstore_index_is_refused_uniqueness_and_an_include_list`), and one that sorts a column
+    `DESC` (*"…a columnstore column has no direction."*, Msg 35302) or, clustered, is filtered
+    (*"…a clustered columnstore index stores every row."*, Msg 102 on `CREATE CLUSTERED
+    COLUMNSTORE INDEX … WHERE`), both measured on 2022. `IndexStorage` — *Rowstore*,
     *Columnstore*, *Clustered columnstore* — is the designer's choice mapped onto `method` and
     `clustered`, so the form only shows it: `apply` clears what the choice cannot carry, the unique
-    flag and the include list and a clustered one's columns, rather than leaving `validate` to
-    refuse it, and back to rowstore clears both fields, the index taking T-SQL's default clustering
-    again (`the_storage_choice_maps_onto_the_index_and_back`). **An ordered columnstore is written
+    flag, the include list and every column's direction, and a clustered one's columns and filter,
+    rather than leaving `validate` to refuse it, and back to rowstore clears both fields, the index
+    taking T-SQL's default clustering again (`the_storage_choice_maps_onto_the_index_and_back`).
+    **The direction and the filter were the two it missed** (S3.1-L1-02): a filtered `(qty DESC)`
+    index switched to *Columnstore* kept its direction, and to *Clustered columnstore* its filter —
+    and the filter field is PostgreSQL's alone, so on SQL Server that filter could not even be
+    cleared from the form
+    (`a_columnstore_index_keeps_no_filter_or_direction`; live,
+    `a_storage_switch_to_columnstore_applies`). **An ordered columnstore is written
     with its `ORDER`** (`IndexInfo::order`, under `schema.rs`): ` ORDER ([b], [a])` after a
     clustered one's table or a nonclustered one's column list and before its `WHERE`, the grammar's
     place, measured on 2022 and 2025, and only where `supports_columnstore_order` answers yes
@@ -14718,6 +14751,10 @@ existing prose was left alone.
   `IndexStorage::Columnstore`, reads an ordered clustered one (`ORDER (b, a)`) with its order,
   rebuilds around it with `ORDER ([b], [a])` and re-orders it from the draft alone, and on 2025
   (or Azure SQL Database) authors an ordered nonclustered one, which 2022 refuses by name;
+  `a_storage_switch_to_columnstore_applies` switches a filtered `(qty DESC)` index to
+  *Columnstore* and to *Clustered columnstore* beside a nonclustered key through
+  `IndexStorage::apply` alone, and applies both plans — the first was Msg 35302 before `apply`
+  cleared the direction;
   `a_rebuild_keeps_an_indexs_included_columns` reads `(a DESC) INCLUDE (c, b) WHERE a > 0` back as
   key `[a]` and list `[c, b]`, not lossy, rebuilds the table around it by an identity toggle,
   reads it back equal with a diff of nothing, then lands an edit of the list alone;
@@ -20196,9 +20233,11 @@ existing prose was left alone.
     dropped, until the emitter wrote them and the predicate turned them back on; the identity toggle asks `ddl::identity_wording`, having said *Auto-increment
     (AUTO_INCREMENT)* there; the index key hint asks `ddl::supports_index_prefix`, having named
     MySQL's `bio(20)` prefix on every engine but PostgreSQL. The index form's *Include* field, after
-    *Columns*, is built only where `ddl::supports_index_include` answers yes — SQL Server and
-    PostgreSQL — and parses through `ddl::parse_name_list` into `IndexInfo::include`, so a list is
-    never typed where no emitter would write it. Its *Storage* dropdown, after *Include* (tab 27) —
+    *Columns*, is built only where `ddl::index_takes_include` answers yes — an engine with `INCLUDE`
+    (`supports_index_include`, SQL Server and PostgreSQL), a kind that keeps a list, and neither a
+    SQL Server unique constraint nor a clustered index, on either of which the server refuses one
+    (under `ddl.rs`) — and parses through `ddl::parse_name_list` into `IndexInfo::include`, so a list is
+    never typed where no emitter would write it, or where the server would refuse it. Its *Storage* dropdown, after *Include* (tab 27) —
     *Rowstore*, *Columnstore*, *Clustered columnstore*, *Primary XML*, *Selective XML*, *Secondary
     XML*, *Spatial* —
     is built only where `IndexStorage::offered` leaves more than *Rowstore*, and lists only the

@@ -1860,9 +1860,11 @@ fn index_form(d: DdlUi, target: &DesignerTarget, ring: FocusRing) -> AnyView {
         crate::widgets::nothing()
     };
 
-    // Built only where the engine has `INCLUDE`, for `pg_only`'s reason, and
-    // the kind keeps one.
-    let include: AnyView = if ddl::supports_index_include(dialect) && kind.takes_include() {
+    // Built only where the engine has `INCLUDE`, for `pg_only`'s reason, the
+    // kind keeps one, and the index can: not a SQL Server unique constraint
+    // (no `INCLUDE` there, and the re-add dropped the list) nor a clustered
+    // index (Msg 10601) — `ddl::index_takes_include`, which `validate` asks.
+    let include: AnyView = if ddl::index_takes_include(&ix, dialect) {
         form_setting(
             "Include",
             field_with_hint(
