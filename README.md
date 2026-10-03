@@ -5,294 +5,139 @@ written in Rust, with an editable results grid, visual schema editing, and
 schema-aware intelligence, built to feel instant.
 
 <p align="center">
-  <img src="assets/screenshot.png" alt="Schemaic — SQL editor and results grid" width="820">
+  <img src="assets/screenshot.png" alt="Schemaic's SQL editor and results grid" width="820">
 </p>
 
 ## Why
 
-- **Fast** — GPU-rendered UI ([Floem](https://github.com/lapce/floem)); scrolls
-  200k-row result sets smoothly and searches them without lag.
-- **Lightweight** — a single native binary. No runtime to install, no embedded
+- **Fast.** A GPU-rendered UI ([Floem](https://github.com/lapce/floem)) that
+  scrolls and searches 200k-row result sets without lag.
+- **Lightweight.** A single native binary. No runtime to install, no embedded
   browser.
-- **Native** — real desktop app on Windows, Linux and macOS.
-- **Guard-rails** — writes go through a missing-`WHERE` check, grid edits commit
-  in a transaction that rolls back unless exactly one row changed, and generated
-  `ALTER` / `DROP` is always shown as SQL — with what it destroys named in plain
-  language — before it runs.
-- **Local** — no account, no telemetry, no cloud service. Schemaic itself has no
-  API key and talks to no model provider. Credentials go to the OS keyring —
-  never a URL, never a command line — falling back to the config file only on a
-  machine with no keyring at all. Turn the assistant on and your prompts go out
-  through your own agent CLI, under that CLI's own account and its own terms;
-  what *else* that CLI sends is its business and not Schemaic's, and it is not
-  nothing — three of the four keep built-in tools that can read the machine
-  they run on, and one of those was measured reading files without being asked.
-  The AI panel tells you which restrictions are actually in force for the CLI
-  you picked, in a sentence, before you send anything.
-- **Every engine, properly** — MySQL/MariaDB, PostgreSQL and SQLite are separate
-  dialects all the way down: quoting, DDL, completion and diagnostics follow what
-  you're actually connected to, not a shared lowest common denominator. Where an
-  engine can't do something, the app doesn't offer it rather than failing at it —
-  and where it can do it differently, the app does the work: editing a SQLite
-  table means the twelve-step rebuild SQLite's own docs prescribe, generated,
-  checked and run in one transaction that either lands or rolls back.
+- **Native.** A real desktop app on Windows, Linux and macOS.
+- **Guard-rails.** Writes go through a missing-`WHERE` check, grid edits roll
+  back unless exactly one row changed, and generated `ALTER` and `DROP` is shown
+  as SQL, with what it destroys named in plain language, before it runs.
+- **Local.** No account, no telemetry, no API key. Credentials live in the OS
+  keyring. The AI assistant runs through your own agent CLI, under that CLI's
+  account and terms, and the panel tells you which restrictions are actually in
+  force for it before you send anything.
+- **Every engine, properly.** Quoting, DDL, completion and diagnostics follow the
+  dialect you're connected to. What an engine can't do isn't offered, and what it
+  does differently is handled for you, like SQLite's twelve-step table rebuild.
 
 ## Features
 
-- **SQL editor** — syntax highlighting, schema-aware autocomplete, structure-aware
-  diagnostics (unknown tables/columns, syntax errors, typo hints) from a real
-  per-dialect parser, one-key formatting, auto-closing pairs, and bracket matching.
-- **Snippets and parameters** — a snippet library scoped the way you actually
-  work (this connection, this engine, or everywhere), expanded by abbreviation
-  from the completion popup, with a per-engine starter pack you can duplicate but
-  not break. Write `:name` in a statement and a bar appears to fill it in — the
-  values are substituted before the run, so the missing-`WHERE` check reads the
-  SQL that will really execute rather than the template.
-- **Results grid** — inline editing that writes back to the database
-  (transactional, with a per-row safety net); add / duplicate / delete rows;
-  server-side filter and sort straight from the column headers; per-column freeze;
-  a whole-row JSON view/edit panel; per-column display formatters; paste a block
-  from a spreadsheet straight onto the selection (staged as ordinary edits, so
-  you still commit or discard it); range selection that totals what you've
-  highlighted; and export to CSV / JSON / SQL / Markdown / HTML / Excel —
-  streaming the whole table when you ask for it, not just the rows that happened
-  to be fetched. Results worth keeping can be pinned to a strip that stays on
-  screen while you go on querying.
-- **Binary columns** — a blob cell isn't dragged into the result set with
-  everything else: open one and its bytes are fetched on their own, shown as an
-  image preview (PNG, JPEG, GIF, BMP, WebP, ICO) or a hex dump, and a file can be
-  staged back into the cell as bytes, committed like any other edit. A value too
-  large to fetch whole is said to be truncated and then refuses to be saved to a
-  file, rather than handing you a partial blob that looks complete.
-- **Statement timeout** — optional, off by default: cancel a statement that runs
-  longer than you meant it to, per statement rather than per script, using the
-  same server-side cancellation the Cancel button does.
-- **Transactions** — a per-tab manual mode that pins one connection and waits for
-  an explicit commit or rollback, with a status pill saying what is open and how
-  many statements are in it. MySQL/MariaDB, PostgreSQL and SQL Server; on SQLite
-  the control isn't shown, because SQLite has no manual mode to offer.
-- **Schema editing** — a visual table designer (columns, indexes, foreign keys,
-  CHECK constraints) plus editors for views and triggers, for stored functions
-  and procedures on MySQL/MariaDB, PostgreSQL and SQL Server, for PostgreSQL types, domains
-  and sequences, and for MySQL's scheduled events. Databases and schemas
-  can be created and dropped, and a PostgreSQL materialized view refreshed, from
-  the tree's own menus. Every change is shown as the SQL it will run,
-  with anything destructive spelled out in plain language, before it runs. Tables,
-  views and triggers on every engine — including SQLite, where a column change is
-  a table rebuild and the app generates, verifies and runs the whole script for
-  you, and SQL Server, where the same is done for the column changes its
-  `ALTER COLUMN` cannot make.
-- **Compare schemas** — pair two databases object by object (tables, views,
-  triggers, routines, events, enums, domains, sequences), tick the differences you
-  want, and get one migration through the same preview and Apply as every other
-  change. Same dialect only — a MySQL-to-PostgreSQL migration generated from a
-  diff would be wrong, so the app refuses it instead of emitting it. Anything it
-  can't express is named in an "omitted" block above the plan rather than quietly
-  dropped.
-- **Export a database** — structure and data from a whole database, one schema, or
-  a single table. As SQL it's one replayable file, with foreign keys restated
-  after the rows; in any of the other five formats it's one file per table in a
-  folder. The header says what it left out and why — keys pointing outside the
-  selection, a dependency cycle, and the identity columns that mean restored rows
-  are renumbered rather than carrying their old ids.
-- **Users and privileges** — browse a server's accounts and roles, read one
-  account's privileges as the actual `GRANT` statements, and create, drop, grant
-  or revoke through the ordinary DDL preview. MySQL/MariaDB, PostgreSQL and SQL
-  Server (its logins and each database's users); server-owned accounts are shown
-  read-only, and where a privilege could be held
-  indirectly — through a role, ownership, or superuser — the pane says the list is
-  direct grants only instead of implying it is the whole picture.
-- **Server activity** — the connection's live sessions, with a lock-wait banner,
-  and *Kill session* / *Cancel query* on any of them. MySQL/MariaDB, PostgreSQL
-  and SQL Server (*Kill session* only: SQL Server cannot cancel another session's
-  statement without ending the session). Where the engine can't say what is
-  blocking what, it still shows who is waiting and admits it can't name the blocker.
-- **Live Monitor** — watch a table and see inserts, updates and deletes as they
-  land, down to which column changed; pause, clear or export the change log.
-- **Import** — load CSV / TSV / JSON (array or JSON Lines) / Excel `.xlsx` into a
-  table, with column mapping and a full validation pass that reports every
-  problem, with its line number, before a single row is written.
-- **Navigate** — schema browser with favourites, table sizes and a properties panel
-  that marks an estimate as an estimate rather than dressing it up as a count (the
-  two server engines; SQLite keeps no such statistics), query history, `EXPLAIN`
-  query plans, and a global "find anywhere" for schema objects. The ER diagram
-  covers a whole database or one table's neighbourhood, finds tables and columns
-  with Ctrl+F (Cmd+F on macOS), and exports as an image or as diagram source.
-- **`.sql` files** — open a script into a tab and save it back, or run a whole
-  file against a database. A script is treated as a write without reading it
-  first, so it can't slip past the guard that stands in front of everything else.
-- **Connect** — MySQL / MariaDB / PostgreSQL, direct or over SSH tunnels, with
-  TLS from *prefer* through *verify-full* (client certificates included, verified
-  against the OS trust store rather than a root set compiled in years ago), and
-  SQLite by picking a file (no server, so no host, credentials or tunnel to fill
-  in). **SQL Server and Azure SQL**: signing in with a SQL login,
-  Windows authentication (in the Windows build) or Microsoft Entra through the
-  Azure CLI; querying, scripts with `GO`, browsing the schema, editing rows in the
-  grid, importing files, Manual-mode transactions, query plans, `.sql` dumps,
-  exports and server activity; creating and editing tables in the designer, and
-  editing views, triggers, procedures and functions; logins and database users;
-  a `sqlcmd` session; and the AI panel's read access. Per-connection
-  colours, environment badges, and a read-only guard-rail on all of them — on SQL
-  Server, which has no read-only session, a read runs in a transaction that is
-  rolled back, and a login that can only read is the full guarantee. Coming from another client, you can import the servers you already
-  have — a pasted URL or DSN, DBeaver, DataGrip, `~/.my.cnf`, `~/.pgpass`,
-  `~/.pg_service.conf` — as a proposal you review row by row. Where a source keeps
-  its passwords encrypted or in the OS credential store, you're told so rather
-  than left with a connection that silently won't open.
-- **Terminal** — an embedded shell, and a one-click `mysql` / `mariadb` / `psql` /
-  `sqlite3` / `sqlcmd` session against the active connection — through the SSH tunnel when
-  there is one, with the password passed by environment rather than on the command
-  line, and for SQLite starting in the database file's own directory so `.output`
-  and `.read` land where you'd expect.
-- **AI assistant** — an agent-CLI session wired into the app rather than bolted
-  beside it, driving **your own** installed CLI — Claude Code, Codex,
-  Antigravity, OpenCode, GitHub Copilot or Cursor — picked in Settings → AI with
-  the model id and reasoning effort, and never started on a binary Schemaic
-  could not confirm it can restrict. (Cursor is held by a permissions file
-  Schemaic writes rather than a sandbox, and the panel says so.) Fix a failed
-  query from its error, rewrite the statement under
-  the caret and accept or reject the diff (Ctrl+K, Cmd+K on macOS), explain or
-  optimise it, ask about an `EXPLAIN` plan, summarise a column or a value, or
-  generate realistic rows for a table from the shape of the data already in it.
-  A built-in MCP server lets it read your schema and query the database, so
-  answers are about your data rather than a generic guess — and it proposes a
-  table change as a patch that lands in the same preview any hand edit does,
-  never as SQL run behind your back. How much it may see is set **per
-  connection**: schema only, on request, or full.
-- **Themeable** — dark / light UI themes, multiple editor colour schemes, and an
-  interface scale (80% / 100% / 130% / 160%) for the app's own text and rows.
+- **SQL editor.** Highlighting, schema-aware completion, diagnostics from a real
+  per-dialect parser, formatting, snippets, and `:name` parameters you fill in
+  before the run. Open, save and run `.sql` files.
+- **Results grid.** Edit cells and write them back, add, duplicate and delete
+  rows, filter and sort on the server, freeze columns, and paste a block from a
+  spreadsheet. Binary cells preview as images or hex. Export to CSV, JSON, SQL,
+  Markdown, HTML or Excel.
+- **Transactions.** A per-tab manual mode with explicit commit and rollback, and
+  an optional statement timeout.
+- **Schema editing.** A visual table designer, editors for views, triggers,
+  routines, sequences and types, and create and drop for databases and schemas.
+  Every change is previewed as SQL first.
+- **Compare schemas.** Diff two databases on the same engine and apply the
+  differences you tick as one migration.
+- **Import and export.** Load CSV, TSV, JSON or Excel into a table, with every
+  problem reported before a row is written. Dump a database, schema or table to
+  one `.sql` file or a file per table.
+- **Users and activity.** Accounts, roles and grants; live sessions with lock
+  waits, *Kill session* and *Cancel query*; and a Live Monitor that streams a
+  table's inserts, updates and deletes.
+- **Navigate.** A schema browser with favourites and table sizes, query history,
+  `EXPLAIN` plans, find-anywhere, and an ER diagram.
+- **Connect.** Direct, over SSH, or with TLS. SQL Server signs in with a SQL
+  login, Windows or Microsoft Entra. Bring your connections over from a URL,
+  DBeaver, DataGrip, `~/.my.cnf` or `~/.pgpass`. Per-connection colours,
+  environment badges and a read-only mode.
+- **Terminal.** An embedded shell, and a one-click `mysql`, `psql`, `sqlite3` or
+  `sqlcmd` session on the active connection.
+- **AI assistant.** Drives your own Claude Code, Codex, Antigravity, OpenCode,
+  GitHub Copilot or Cursor. Fix a failed query, rewrite the statement under the
+  caret (Ctrl+K), explain or optimise it, or generate realistic rows. It reads
+  your schema through a built-in [MCP server](#mcp-server), proposes table
+  changes through the same preview as a hand edit, and sees only as much data
+  as you allow per connection.
+- **Themes.** Dark and light themes, editor colour schemes, and an interface
+  scale up to 160%.
 
 ### Accessibility
 
-Schemaic is **keyboard-operable but not screen-reader accessible**, and the
-second half is not a plan we haven't got to — it is a limit of what the app is
-built on. Every modal has a focus ring and a Tab order, every destructive action
-**in a modal, in the schema tree or in the results grid** can be reached and
-confirmed from the keyboard, the header's **?** opens a reference of every
-shortcut, and **Settings → Appearance → Interface scale** enlarges the whole
-interface (not just one font) up to 160%. The one place that qualifier is doing
-work is the Server Activity panel: its rows have no keyboard cursor and their
-context menu has no `Shift+F10` opener, so *Kill session* and *Cancel query* are
-reachable by right-click only. The lock-wait banner's own **Kill** button is
-keyboard-reachable.
-But Floem 0.2 exposes no accessibility tree at all — there is no AccessKit
-integration in the toolkit, so there is nothing for Narrator, VoiceOver or Orca
-to read, and no amount of markup in this repository can add one. If you need a
-screen reader, this is not yet a tool you can use, and we would rather say so
-than let you find out after the download.
+Schemaic is **keyboard-operable but not screen-reader accessible**. Every modal
+has a focus ring and a Tab order, destructive actions in modals, the schema tree
+and the results grid can be reached and confirmed from the keyboard, the
+header's **?** lists every shortcut, and **Settings → Appearance → Interface
+scale** enlarges the whole interface up to 160%. The exception is the Server
+Activity panel, where a row's *Kill session* and *Cancel query* need a
+right-click (the lock-wait banner's **Kill** button is keyboard-reachable).
 
-### Command line
+Floem 0.2 exposes no accessibility tree, so Narrator, VoiceOver and Orca have
+nothing to read. If you rely on a screen reader, Schemaic can't serve you yet.
 
-Schemaic can run a query without its window, against a connection you have
-already saved:
+## Command line
 
-```
+The `schemaic` command runs statements against your saved connections without
+opening the window. It never takes a credential: the connection comes from your
+saved list and its password from the OS keyring, so a script or an AI agent can
+be handed a connection name instead of a password.
+
+```sh
 schemaic list
-schemaic databases --connection=prod
-schemaic ping --connection=prod
-schemaic tables --connection=prod --database=shop
-schemaic describe orders --connection=prod --database=shop
-schemaic query "SELECT * FROM orders LIMIT 5" --connection=prod --database=shop --format=json
-schemaic exec "UPDATE orders SET state = 'sent' WHERE id = 7" --connection=prod
+schemaic tables -c prod -d shop
+schemaic query "SELECT * FROM orders LIMIT 5" -c prod -d shop --format=json
+schemaic exec "UPDATE orders SET state = 'sent' WHERE id = 7" -c prod
 ```
 
-**Nothing here takes a credential.** The connection comes from Schemaic's own
-saved list and its password from the OS keyring, which is the point: you can
-hand a script — or an AI agent — a connection name without handing it a
-password, including for a database whose credentials you only ever typed into
-Schemaic.
+- `query` only reads, on a session the server holds read-only, and returns 200
+  rows unless you raise `--limit`.
+- `exec` writes. It refuses on a read-only connection, and a statement the guard
+  flags, such as a `DELETE` with no `WHERE`, needs `--yes`.
+- Output is a table, JSON, JSON Lines, CSV or vertical records. Rows go to
+  stdout and everything else to stderr.
 
-A connection is reachable this way only once you turn on **CLI access** for it
-in its connection settings. That is off for every connection, including ones you
-saved before this existed, because the command line runs with nobody watching.
-`schemaic list` says how many it left out, and `schemaic list --all` shows them.
+A connection is reachable only once you turn on **CLI access** in its settings;
+it is off by default. Where there is no keyring, such as over SSH or in a
+container, `--password-stdin` takes the password instead. `schemaic --help`
+covers the other commands, the formats and the exit codes.
 
-A statement runs in the connection's default database, or the one `-d`/`--database`
-names. Schemaic itself never needs a default — it lists every database — so a saved
-connection often has none; `schemaic databases` lists the names `-d` takes, and a
-statement that failed for want of one says so. `SCHEMAIC_CONNECTION` and
-`SCHEMAIC_DATABASE` stand in for `-c` and `-d`, so a shell — or an agent's — can be
-pointed at one connection and database once; a flag given as well wins. `schemaic
-ping` logs in and runs `SELECT 1`, printing the round trip, or exits `4` with
-the server's reason. `schemaic tables` lists a database's tables and views, and
-`schemaic describe <table>` its columns — type, nullable, default, key — under the
-same column names on every engine, PostgreSQL and SQLite included, which have no
-`DESCRIBE` of their own. `schemaic
-version` prints the version.
+To put `schemaic` on your `PATH`, use **Settings → General → Command line →
+Install**. The Linux `.deb` and `.rpm` do this for you.
 
-`query` runs reads and nothing else — not a flag away from a write, a different
-subcommand, on a session the server itself holds read-only. It returns 200 rows
-unless you raise `--limit`, and says so when it stopped short — on stderr, or in
-the table's footer; with `--fail-on-cap` it also exits `6`, for a script that
-reads only stdout. `exec` is the one
-that writes: it refuses outright on a connection marked read-only, and it
-refuses something the guard flags — such as a `DELETE` with no `WHERE` — until
-you pass `--yes`, which answers that question and cannot unlock a read-only
-connection. Output is `table`, `json`, `jsonl`, `csv` or `vertical` (one
-`name: value` record per row, like the `mysql` client's `\G`), and `--no-header`
-leaves the column names — and the table's footer — out of `table` and `csv`, so
-the output is the rows alone; rows go to stdout and
-everything else to stderr, so a pipe gets only data. It exits `0` on success,
-`2` on a usage error, `3` when a guard refused (nothing was sent), `4` when the
-server or the connection failed, `5` when a write timed out after it was
-sent — it may have been applied, so check before running it again — and `6`
-when `--fail-on-cap` was given and the rows were cut short. `schemaic --help`
-lists the formats and the exit codes too.
+## MCP server
 
-Where there is no keyring to read — an SSH session, a container — pipe the
-password in with `--password-stdin` instead. A statement that itself carries a
-password (`ALTER ROLE … PASSWORD …`) belongs on stdin too: pass `-` as the SQL
-and pipe it in, so it stays out of the process list and your shell's history.
-`-f`/`--file <path>` reads the statement from a file instead — still one
-statement, not a script.
-
-`schemaic mcp --connection=prod` serves one connection to any AI agent that
-speaks [MCP](https://modelcontextprotocol.io) — an editor's assistant, a desktop
-app — over stdin and stdout. It is the same server the AI panel runs, and it is
-for the agent to launch, not for you to type:
+`schemaic mcp` serves one saved connection to any AI agent that speaks
+[MCP](https://modelcontextprotocol.io), such as an editor's assistant or a
+desktop app. It is the same server Schemaic's own AI panel uses, and it is meant
+for the agent to launch:
 
 ```json
 { "mcpServers": { "prod": { "command": "schemaic", "args": ["mcp", "--connection=prod"] } } }
 ```
 
-The agent gets `list_schema` and `describe_table`, and `run_query` (read-only,
-200 rows) only if the connection's **AI data access** is *Let it read data*. At
-the default, *Only what I attach*, the agent reads no rows, since an outside
-agent has no way to be handed any. The same **CLI access** switch gates it, and
-it prints on stderr — which clients keep as the server's log — what it is serving
-and why a tool is missing. `-d` sets the database the tools default to (on
-SQLite there is only ever `main`). There is
-no `--password-stdin` here, because stdin belongs to the agent.
-
-On Linux the `.deb` and `.rpm` put `schemaic` on your `PATH` already. Elsewhere,
-**Settings → General → Command line → Install** does it: on Windows it adds the
-app's folder, where `schemaic.com` sits beside `schemaic.exe`, to your user
-`PATH` — which is what lets typing `schemaic` reach the command line while
-shortcuts still open the app — and on macOS or with an AppImage it links
-`~/.local/bin/schemaic` to the app. **Remove** undoes it, and on Windows
-uninstalling does too.
+The agent gets `list_schema` and `describe_table`, plus `run_query` (read-only,
+200 rows) when the connection's **AI data access** is *Let it read data*. Like
+the command line, it needs **CLI access** turned on for the connection.
 
 ## Install
 
-Prebuilt binaries for every release are on the
-[Releases page](https://github.com/fadion/schemaic/releases/latest). Schemaic
-runs on **Windows and Linux (x86_64)** and **macOS (Apple Silicon)**. There is
-no Intel Mac build.
+Binaries for every release are on the
+[Releases page](https://github.com/fadion/schemaic/releases/latest), for
+**Windows and Linux (x86_64)** and **macOS (Apple Silicon)**. The self-updating
+builds check GitHub for a new release in the background; set
+`SCHEMAIC_NO_UPDATE_CHECK=1` to turn that off.
 
 ### Windows
 
-Download **`Schemaic-win-x64-Setup.exe`** and run it. It installs per-user into
-`%LocalAppData%`, so there is no admin prompt, and it updates itself: the app
-checks for new releases in the background and offers a **Restart to update**
-button in the header when one is staged.
+Download and run **`Schemaic-win-x64-Setup.exe`**. It installs per-user, with no
+admin prompt, and updates itself. The installer isn't code-signed, so SmartScreen
+warns the first time: click *More info*, then *Run anyway*.
 
-The installer is not code-signed, so SmartScreen shows an "unknown publisher"
-warning the first time — *More info* then *Run anyway*. That is a deliberate
-choice rather than an oversight; a self-signed certificate chains to no trusted
-root and would change nothing.
-
-Prefer no installer? `schemaic-vX.Y.Z-windows-x86_64.zip` is the same build as a
-portable folder. It does not auto-update.
+`schemaic-vX.Y.Z-windows-x86_64.zip` is a portable build that doesn't update
+itself.
 
 ### macOS
 
@@ -300,24 +145,13 @@ portable folder. It does not auto-update.
 curl -fsSL https://raw.githubusercontent.com/fadion/schemaic/main/install.sh | bash
 ```
 
-Installs the `.pkg` into `/Applications`. The app updates itself from then on.
+This installs Schemaic into `/Applications`, and it updates itself from then on.
 
-**Prefer to download it by hand?** Take **`Schemaic-osx-arm64.dmg`** and drag
-Schemaic into `/Applications` — the familiar route, and the app still updates
-itself afterwards; `Schemaic-osx-arm64-Setup.pkg` is the same app with an
-installer in front of it. Either way macOS will refuse to open it the first
-time — the app is not signed with an Apple Developer ID, which is a
-paid, ongoing thing and not yet warranted. To get past it: open the app once
-and let it be blocked, then **System Settings → Privacy & Security**, scroll
-to the message naming Schemaic, and click **Open Anyway**.
-
-Right-click → Open, which you will find in older advice, no longer works for
-unsigned apps on macOS Sequoia and later. The command-line equivalent is
+To install by hand, take **`Schemaic-osx-arm64.dmg`** (or the `.pkg`) and drag
+Schemaic into `/Applications`. The app isn't signed with an Apple Developer ID,
+so macOS blocks the first launch: open it once, then click **Open Anyway** in
+**System Settings → Privacy & Security**, or run
 `xattr -dr com.apple.quarantine /Applications/Schemaic.app`.
-
-The script above avoids all of that, and not by weakening anything: the
-quarantine flag is set by whatever downloads the file, and `curl` doesn't set
-it.
 
 ### Linux
 
@@ -325,28 +159,17 @@ it.
 curl -fsSL https://raw.githubusercontent.com/fadion/schemaic/main/install.sh | bash
 ```
 
-The script picks the route that fits the system — the **apt repository** on
-Debian and Ubuntu, the **dnf/zypper repository** on Fedora, RHEL and openSUSE,
-the self-updating AppImage everywhere else — and tells you at the end how that
-install updates itself. Override the choice with
-`SCHEMAIC_PKG_FAMILY=debian|rpm|appimage`, or set `SCHEMAIC_NO_REPO=1` to take a
-single downloaded package and add nothing to your source lists. Read it first if
-you would rather not pipe a script into a shell; it is [install.sh](install.sh)
-in this repository. It asks for `sudo` three times and says so each time: to
-write the signing key and the source list under `/usr/share/keyrings` and
-`/etc/apt/sources.list.d` (or `/etc/yum.repos.d`), to `rpm --import` the key on
-an RPM system, and for the package-manager step itself. The uninstall lines it
-prints at the end name every file it put there.
+On Debian and Ubuntu this adds the signed apt repository, on Fedora, RHEL and
+openSUSE the dnf/zypper repository, and elsewhere it installs the self-updating
+AppImage. Packaged installs update with the rest of your system. Read
+[install.sh](install.sh) first if you prefer; it asks for `sudo` and prints the
+uninstall steps at the end. `SCHEMAIC_PKG_FAMILY=debian|rpm|appimage` overrides
+its choice, and `SCHEMAIC_NO_REPO=1` installs a single package without adding a
+repository.
 
-**Everything on this list updates itself now**, by one of two mechanisms: the
-AppImage checks GitHub in the background and offers a restart, and a packaged
-install is carried forward by the package manager along with the rest of your
-system.
+#### Adding the repository by hand
 
-#### The package repositories
-
-Signed, hosted at <https://fadion.github.io/schemaic>, and holding the five most
-recent releases. To add them by hand — Debian, Ubuntu and derivatives:
+Debian, Ubuntu and derivatives:
 
 ```sh
 curl -fsSL https://fadion.github.io/schemaic/schemaic-archive-keyring.gpg \
@@ -356,7 +179,7 @@ curl -fsSL https://fadion.github.io/schemaic/schemaic.sources \
 sudo apt-get update && sudo apt-get install schemaic
 ```
 
-Fedora, RHEL, CentOS (and openSUSE, with `zypper` in place of `dnf`):
+Fedora, RHEL and CentOS (on openSUSE, `zypper` in place of `dnf`):
 
 ```sh
 sudo curl -fsSL https://fadion.github.io/schemaic/schemaic.repo \
@@ -364,79 +187,37 @@ sudo curl -fsSL https://fadion.github.io/schemaic/schemaic.repo \
 sudo dnf install schemaic
 ```
 
-The first `dnf install` reports `repomd.xml GPG signature verification error:
-Signing key not found` and then offers to import the key — twice, once for the
-repository index and once for the packages. That is what a machine which has
-never seen the key is supposed to do, not a failure, and it shows the
-fingerprint below each time so you can check before answering. The script above
-never shows it, because it imports the key before adding the repository.
-
-Upgrades then arrive with `apt-get upgrade` or `dnf upgrade`. Nothing upgrades
-on its own unless you have already set that up — Debian and Ubuntu users can add
-`"Schemaic:stable";` to `Unattended-Upgrade::Allowed-Origins` to include
-Schemaic in it.
-
-Both repositories are signed, and every `.rpm` in them is signed too. That key
-says a package came from this repository and arrived unaltered; it is not a
-code-signing certificate and vouches for no identity beyond that. Its
-fingerprint is:
+The first `dnf install` asks twice to import the signing key. Check that it
+matches this fingerprint before you accept:
 
 ```
 ABDBDC3958F3FAFC734273796566ECED7795DC1A
 ```
 
-That is printed here as well as on the site on purpose: a fingerprint you can
-only check against the same server the key came from is not a check at all,
-and this repository's history is a channel that server does not control.
+#### Release files
 
-#### Or by hand, from a release
-
-From the [latest release](https://github.com/fadion/schemaic/releases/latest):
-
-| Artifact | Install | Updates |
+| File | Install | Updates itself |
 | --- | --- | --- |
-| `Schemaic-linux-x64.AppImage` | `chmod +x` and run | **Yes**, in-app |
+| `Schemaic-linux-x64.AppImage` | `chmod +x` and run | Yes |
 | `schemaic_X.Y.Z_amd64.deb` | `sudo apt-get install ./schemaic_*.deb` | No |
 | `schemaic-X.Y.Z-1.x86_64.rpm` | `sudo dnf install --nogpgcheck ./schemaic-*.rpm` | No |
 | `schemaic-vX.Y.Z-linux-x86_64.tar.gz` | Extract anywhere | No |
 
-None of these update themselves. A `.deb` or `.rpm` installs to `/usr/bin`,
-which the in-app updater correctly refuses to touch — with the repository added
-that is the package manager's job, and without it there is nothing behind the
-install to update from. The packages *on the Releases page* are unsigned, which
-is why the `.rpm` line waives the check; the copies in the repository are
-signed.
-
-The binary needs a GPU stack and the usual desktop libraries at runtime
-(`libxkbcommon`, Wayland or X11, Vulkan or EGL). The `.deb` and `.rpm` declare
-them; the AppImage and the tarball assume a working desktop session.
+The `.deb` and `.rpm` on the Releases page are unsigned; the repository copies
+are signed. The app needs `libxkbcommon`, Wayland or X11, and Vulkan or EGL at
+runtime, which the packages declare.
 
 ## Build & run
 
-Requires a recent Rust toolchain (edition 2024). On any platform:
+Requires a recent Rust toolchain (edition 2024) and a C compiler, since SQLite is
+compiled in from source: the MSVC tools on Windows, `xcode-select --install` on
+macOS, `gcc` on Linux. No database client libraries are needed.
 
 ```sh
 cargo run -p schemaic-app
 ```
 
-No database client libraries to install for any of the engines — SQLite is
-compiled in from source, so building needs a working C compiler (the MSVC tools on
-Windows, `build-essential` / `gcc` on Linux, the Xcode command line tools on
-macOS) alongside the GUI libraries below.
-
-### On Windows
-
-Nothing else to install.
-
-### On macOS
-
-`xcode-select --install`, if you haven't already. Everything the renderer needs
-ships with the OS.
-
-### On Linux
-
-The renderer needs a few GUI system libraries first — the package names differ by
-distribution, the set doesn't.
+On Linux the renderer also needs a few GUI libraries.
 
 Debian / Ubuntu:
 
@@ -458,5 +239,5 @@ sudo pacman -S --needed libxkbcommon wayland libxcb libx11 pkgconf
 
 ## Licence
 
-MIT — see [LICENSE](LICENSE). Third-party notices are in
+MIT, see [LICENSE](LICENSE). Third-party notices are in
 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
