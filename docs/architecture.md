@@ -1908,7 +1908,14 @@ existing prose was left alone.
     `FOREIGN` or `REFERENCES`: a constraint's `NOT` is PostgreSQL's `NOT VALID` or
     `NOT DEFERRABLE`, and the first cut, without that rule, offered `NULL` there
     (`not_after_a_constraint_predicts_nothing`). Its cost is a column with an inline `REFERENCES`,
-    whose `NOT NULL` gets no ghost. `CREATE UNIQUE` and `CREATE OR` are asked as capabilities the
+    whose `NOT NULL` gets no ghost. A table constraint `CONSTRAINT` does not name carries none of
+    those words, so the item's opening word is read too — the word after the comma or the `(`
+    that opens the list, or after an `ALTER … TABLE`'s `ADD` — and `PRIMARY`, `UNIQUE`, `EXCLUDE`, `KEY` or `INDEX` there makes it
+    a constraint, whose `NOT` is `NOT DEFERRABLE`: without it `UNIQUE (a, b) NOT `,
+    `PRIMARY KEY (a) NOT `, an `EXCLUDE … NOT ` and `ADD PRIMARY KEY (a) NOT ` were all offered
+    `NULL`. A column's own `a int UNIQUE NOT `, whose kind comes after its name, still is
+    (`not_after_a_table_constraint_predicts_nothing`).
+    `CREATE UNIQUE` and `CREATE OR` are asked as capabilities the
     same exhaustive way: `unique_index_names_its_kind` makes `INDEX` a guess on T-SQL alone
     (`CREATE UNIQUE CLUSTERED INDEX`), and `create_or_spelling` answers `REPLACE` on MySQL and
     PostgreSQL, `ALTER` on SQL Server and nothing on SQLite, which has neither form
@@ -1957,7 +1964,11 @@ existing prose was left alone.
     `ORDER BY` among the arguments, which only an aggregate or a window takes, so a user-defined
     aggregate written any of those ways needs no list — and only then by `GROUP_AGGREGATES`, on the
     bare upper-cased name, for the plain `sum(x)` with no shape to tell it by
-    (`group_by_knows_an_aggregate_by_its_shape_and_its_name`). A star, a projection with no key
+    (`group_by_knows_an_aggregate_by_its_shape_and_its_name`). A name the list misses is grouped
+    by: without `JSONB_OBJECT_AGG`, PostgreSQL 16's `JSON[B]_OBJECT_AGG_STRICT`/`_UNIQUE`/
+    `_UNIQUE_STRICT` and SQLite's `JSONB_GROUP_ARRAY`/`JSONB_GROUP_OBJECT`, a
+    `jsonb_object_agg(…)` landed in the grouping list, which PostgreSQL refuses
+    (`group_by_leaves_out_every_json_aggregate`). A star, a projection with no key
     left or a prefix that does not parse (a half-written `FROM`) predicts nothing.
     **A join is predicted only where the schema leaves one join to make.** After an empty `JOIN `
     the ghost is a row of the kind the popup's table list leads with — `join_targets_for`, asked of
@@ -2040,7 +2051,11 @@ existing prose was left alone.
     index and falls back to the `primary_key` flags in column order only where there is none. A
     foreign key's referenced columns follow the key's order — MySQL wants them in the referenced
     index's — so `PRIMARY KEY (b, a)` must give `b, a`, and table order gave `a, b`
-    (`references_names_a_composite_key_in_its_declared_order`). It predicts nothing when no key is
+    (`references_names_a_composite_key_in_its_declared_order`). The key must also be as wide as the
+    foreign key it completes — `referencing_width` counts the names in a `FOREIGN KEY (a, b)`
+    written straight before the `REFERENCES`, else 1, a column's own — since a one-column
+    `a int REFERENCES lines (` was offered `order_id, line_no)`, a count the server refuses
+    (`references_names_a_key_only_as_wide_as_the_foreign_key`). It predicts nothing when no key is
     declared; when the reference names another loaded database's table, whose key `Catalog::pks`
     (active-database scoped) does not hold; or when two tables in scope share the name with
     different keys — `sales.orders` and `dbo.orders`, no key counting as a different one. `pks` is
@@ -2070,13 +2085,18 @@ existing prose was left alone.
     **An operand's partner waits for the operand to be finished.** `operand_partner` answers where
     what has just been written is a construct's operand and the next word is fixed, each in the
     case its keyword was typed: `BETWEEN x ` → `AND` (`between_and`, once `x` is finished at
-    `BETWEEN`'s own depth and no `AND`/`OR` follows it); `CAST(x ` — `TRY_CAST`, `SAFE_CAST` — →
+    `BETWEEN`'s own depth and no `AND`/`OR` follows it — and, in a window frame, a
+    `ROWS`/`RANGE`/`GROUPS BETWEEN`, only once the bound ends on `PRECEDING`, `FOLLOWING` or
+    `ROW`, since `ROWS BETWEEN UNBOUNDED `, `1 ` and `CURRENT ` are finished operands and were
+    each offered `AND`); `CAST(x ` — `TRY_CAST`, `SAFE_CAST` — →
     `AS` when the innermost open paren is the call's, with one finished operand and no top-level
     `AS` or comma, and `EXTRACT(field ` → `FROM` on exactly one word (`call_keyword`);
     `SELECT * `, `SELECT DISTINCT|ALL * ` and `SELECT t.* ` → `FROM` (`star_from`) — a star takes
     no alias, so nothing else can come, where `SELECT a ` may be followed by its alias and
     predicts nothing; a CTE's name, right after `WITH`, `WITH RECURSIVE` or a depth-0 comma → `AS`
-    (`cte_as`), until a depth-0 `SELECT`/`INSERT`/`UPDATE`/`DELETE`/`MERGE`/`VALUES` shows the
+    (`cte_as`; not T-SQL's `WITH XMLNAMESPACES `, which declares namespaces rather than a CTE and
+    was offered `AS` — `with_xmlnamespaces_predicts_no_as`), until a depth-0
+    `SELECT`/`INSERT`/`UPDATE`/`DELETE`/`MERGE`/`VALUES` shows the
     query proper has begun — `AS ` and not `AS (`, because the user's own `(` auto-pairs and an
     inserted one would not; `DELETE FROM t ` (`t`, `q.t` or `db.q.t`, nothing more) → `WHERE`
     (`delete_where`), offered as a safety as much as a prediction; and `GRANT`/`DENY … ON obj ` →
@@ -2086,7 +2106,17 @@ existing prose was left alone.
     *Finished* is `operand_finished`: something written, its parens closed (`depth_after`), and
     the last thing neither an operator character nor a word that wants another operand
     (`OPERAND_PENDING` — `AND`, `OR`, `NOT`, `IS`, `IN`, `LIKE`, `AS`, …), so `BETWEEN 1 + `,
-    `BETWEEN f(1 ` and `CAST(f(total ` predict nothing (`an_unfinished_operand_predicts_nothing`;
+    `BETWEEN f(1 ` and `CAST(f(total ` predict nothing (`an_unfinished_operand_predicts_nothing`).
+    The list once knew too few infix words: `CAST(created AT TIME ZONE ` and MySQL's
+    `CAST(total DIV ` were offered `AS`, PostgreSQL's `BETWEEN SYMMETRIC ` `AND`. It now holds
+    `SYMMETRIC`/`ASYMMETRIC`, `AT`, `ZONE`, `DIV`, `MOD`, `XOR`, `REGEXP`, `RLIKE` and `INTERVAL`,
+    with `AT TIME` pending as a pair; and an `INTERVAL` followed by a number is pending too, since
+    MySQL's `BETWEEN now() - INTERVAL 1 ` still wants its unit. **A pending word counts only if
+    the text ends on it**, not merely the tokens: numbers and strings are not tokens, so
+    `BETWEEN SYMMETRIC 1` ends on `SYMMETRIC` among the tokens and on `1` in the text, and is
+    finished — the same reading that keeps `INTERVAL '1 day'` finished while `INTERVAL 1`, whose
+    text ends in a digit after that last token, is not (`between_waits_for_a_whole_bound`,
+    `an_operand_waits_for_its_infix_words_and_its_unit`;
     `a_finished_operand_predicts_the_word_its_construct_takes`, `a_star_projection_predicts_from`,
     `a_common_table_expressions_name_predicts_as`, `a_delete_target_predicts_where`,
     `a_privilege_object_predicts_its_grantee_word`). The UI asks it

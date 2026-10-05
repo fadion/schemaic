@@ -13166,23 +13166,70 @@ fn depth_after(toks: &[Token]) -> Option<usize> {
 
 /// Words after which an expression is still waiting for its next operand.
 const OPERAND_PENDING: &[&str] = &[
-    "AND", "OR", "NOT", "IS", "IN", "LIKE", "ILIKE", "AS", "COLLATE", "BETWEEN", "CASE", "WHEN",
-    "THEN", "ELSE", "DISTINCT", "ESCAPE", "ANY", "ALL", "SOME", "EXISTS",
+    "AND",
+    "OR",
+    "NOT",
+    "IS",
+    "IN",
+    "LIKE",
+    "ILIKE",
+    "AS",
+    "COLLATE",
+    "BETWEEN",
+    "CASE",
+    "WHEN",
+    "THEN",
+    "ELSE",
+    "DISTINCT",
+    "ESCAPE",
+    "ANY",
+    "ALL",
+    "SOME",
+    "EXISTS",
+    "SYMMETRIC",
+    "ASYMMETRIC",
+    "AT",
+    "ZONE",
+    "DIV",
+    "MOD",
+    "XOR",
+    "REGEXP",
+    "RLIKE",
+    "INTERVAL",
 ];
 
 /// Is `text` (the source from a construct's keyword to the caret, `toks` its
 /// tokens) one finished operand? Something is written, its parens are closed,
-/// and it does not end on an operator or on a word that wants another operand.
+/// and it does not end on an operator or on a word that wants another operand
+/// ([`OPERAND_PENDING`]; `AT TIME`, and MySQL's `INTERVAL 1` still wanting its
+/// unit). The word must be what the text *ends* on: a number or a string after
+/// it is a token nobody kept, so `BETWEEN SYMMETRIC 1` ends on `SYMMETRIC`
+/// among the tokens and on `1` in the text.
 fn operand_finished(text: &str, toks: &[Token]) -> bool {
     let text = text.trim();
     let Some(last) = text.chars().next_back() else {
         return false;
     };
     let ends_on_operator = "+-*/%|&^=<>,(!~:".contains(last);
-    let pending = toks
-        .last()
-        .and_then(bare_upper)
-        .is_some_and(|w| OPERAND_PENDING.contains(&w.as_str()));
+    let ends_on = |w: &str| {
+        let cut = text.len().saturating_sub(w.len());
+        text.is_char_boundary(cut)
+            && text[cut..].eq_ignore_ascii_case(w)
+            && !text[..cut].ends_with(|c: char| c.is_ascii() && crate::sql::is_word_byte(c as u8))
+    };
+    let word_back = |n: usize| {
+        toks.len()
+            .checked_sub(n + 1)
+            .and_then(|i| bare_upper(&toks[i]))
+    };
+    let (prev, final_word) = (word_back(1), word_back(0));
+    let pending = final_word
+        .as_deref()
+        .is_some_and(|w| OPERAND_PENDING.contains(&w) && ends_on(w))
+        || prev.as_deref() == Some("AT")
+            && final_word.as_deref() == Some("TIME")
+            && ends_on("TIME")
+        || final_word.as_deref() == Some("INTERVAL") && last.is_ascii_digit();
     !ends_on_operator && !pending && depth_after(toks) == Some(0)
 }
 
@@ -13202,7 +13249,9 @@ fn operand_partner(sql: &str, caret: usize, toks: &[Token]) -> Option<String> {
 }
 
 /// `… BETWEEN x ` → `AND `, once `x` is a finished operand at the `BETWEEN`'s
-/// own depth and no `AND` has been written.
+/// own depth and no `AND` has been written. In a window frame (`ROWS`/`RANGE`/
+/// `GROUPS BETWEEN`) the bound is finished only with its `PRECEDING`,
+/// `FOLLOWING` or `ROW`.
 fn between_and(sql: &str, caret: usize, toks: &[Token]) -> Option<String> {
     let i = toks
         .iter()
@@ -13214,7 +13263,17 @@ fn between_and(sql: &str, caret: usize, toks: &[Token]) -> Option<String> {
     let TkKind::Word(kw) = &toks[i].kind else {
         return None;
     };
-    (!has_and && operand_finished(sql.get(toks[i].end..caret)?, after))
+    // A window frame's bound is whole only once it says which way it runs.
+    let frame = i
+        .checked_sub(1)
+        .and_then(|p| bare_upper(&toks[p]))
+        .is_some_and(|w| matches!(w.as_str(), "ROWS" | "RANGE" | "GROUPS"));
+    let bound_whole = !frame
+        || after
+            .last()
+            .and_then(bare_upper)
+            .is_some_and(|w| matches!(w.as_str(), "PRECEDING" | "FOLLOWING" | "ROW"));
+    (!has_and && bound_whole && operand_finished(sql.get(toks[i].end..caret)?, after))
         .then(|| in_typed_case("AND ", kw))
 }
 
@@ -13311,7 +13370,14 @@ fn cte_as(toks: &[Token]) -> Option<String> {
     let [.., prev, name] = toks else {
         return None;
     };
-    if !matches!(name.kind, TkKind::Word(_)) || bare_upper(name).as_deref() == Some("RECURSIVE") {
+    // `RECURSIVE` comes before a name, and T-SQL's `WITH XMLNAMESPACES (`
+    // declares namespaces, not a CTE.
+    if !matches!(name.kind, TkKind::Word(_))
+        || matches!(
+            bare_upper(name).as_deref(),
+            Some("RECURSIVE" | "XMLNAMESPACES")
+        )
+    {
         return None;
     }
     let mut depth = 0usize;
@@ -13496,7 +13562,13 @@ fn declares_a_column(toks: &[Token]) -> bool {
     let mut item = 0;
     for (i, t) in body.iter().enumerate() {
         match t.kind {
-            TkKind::LParen => depth += 1,
+            // The paren that opens the list starts its first item.
+            TkKind::LParen => {
+                depth += 1;
+                if depth == want {
+                    item = i + 1;
+                }
+            }
             TkKind::RParen => depth -= 1,
             TkKind::Comma if depth == want => item = i + 1,
             _ => {}
@@ -13506,7 +13578,24 @@ fn declares_a_column(toks: &[Token]) -> bool {
     let condition_or_constraint = body[item..].iter().any(|t| {
         matches!(&t.kind, TkKind::Word(w) if NOT_A_COLUMN.contains(&w.to_ascii_uppercase().as_str()))
     });
-    is_table && depth == want && !condition_or_constraint
+    // A table constraint unnamed by `CONSTRAINT` opens with its kind: the
+    // item's first word, or the one after an `ALTER TABLE`'s `ADD`. Its `NOT`
+    // is `NOT DEFERRABLE`; a column's own `UNIQUE NOT` comes after its name.
+    let item_words = &body[item..];
+    let opener = match item_words
+        .iter()
+        .position(|t| bare_upper(t).as_deref() == Some("ADD"))
+    {
+        Some(add) => item_words.get(add + 1),
+        None => item_words.first(),
+    };
+    let table_constraint = opener.and_then(bare_upper).is_some_and(|w| {
+        matches!(
+            w.as_str(),
+            "PRIMARY" | "UNIQUE" | "EXCLUDE" | "KEY" | "INDEX"
+        )
+    });
+    is_table && depth == want && !condition_or_constraint && !table_constraint
 }
 
 /// Whether `CREATE UNIQUE` may name the index's clustering before `INDEX`
@@ -13945,6 +14034,11 @@ fn paren_contents(
         && let Some(target) = written_table(&body[r + 1..])
     {
         let key = catalog.key_columns_of(&catalog.resolve_located(&target)?)?;
+        // As wide as the foreign key: a `lines (order_id, line_no)` key
+        // offered to a one-column key is a count the server refuses.
+        if key.len() != referencing_width(&body[..r]) {
+            return None;
+        }
         return column_list(&key, dialect, closed);
     }
     match bare_upper(kw)?.as_str() {
@@ -13974,6 +14068,35 @@ fn paren_contents(
         }
         _ => None,
     }
+}
+
+/// How many columns the foreign key whose `REFERENCES` `before` runs up to
+/// declares: the names in a `FOREIGN KEY (a, b)` written straight before it,
+/// else one — a column's own `REFERENCES`.
+fn referencing_width(before: &[Token]) -> usize {
+    let listed = || {
+        let [.., rp] = before else { return None };
+        if !matches!(rp.kind, TkKind::RParen) {
+            return None;
+        }
+        let lp = before
+            .iter()
+            .rposition(|t| matches!(t.kind, TkKind::LParen))?;
+        let head = |back: usize| lp.checked_sub(back).and_then(|i| bare_upper(&before[i]));
+        let inner = &before[lp + 1..before.len() - 1];
+        (head(2).as_deref() == Some("FOREIGN")
+            && head(1).as_deref() == Some("KEY")
+            && inner
+                .iter()
+                .all(|t| matches!(t.kind, TkKind::Word(_) | TkKind::Comma)))
+        .then(|| {
+            inner
+                .iter()
+                .filter(|t| matches!(t.kind, TkKind::Word(_)))
+                .count()
+        })
+    };
+    listed().unwrap_or(1)
 }
 
 /// `INSERT … ON CONFLICT (` → the target's primary key, when the `INSERT`
@@ -14030,8 +14153,17 @@ const GROUP_AGGREGATES: &[&str] = &[
     "JSON_ARRAYAGG",
     "JSON_OBJECTAGG",
     "JSON_OBJECT_AGG",
+    "JSON_OBJECT_AGG_STRICT",
+    "JSON_OBJECT_AGG_UNIQUE",
+    "JSON_OBJECT_AGG_UNIQUE_STRICT",
+    "JSONB_OBJECT_AGG",
+    "JSONB_OBJECT_AGG_STRICT",
+    "JSONB_OBJECT_AGG_UNIQUE",
+    "JSONB_OBJECT_AGG_UNIQUE_STRICT",
     "JSON_GROUP_ARRAY",
     "JSON_GROUP_OBJECT",
+    "JSONB_GROUP_ARRAY",
+    "JSONB_GROUP_OBJECT",
     "BIT_AND",
     "BIT_OR",
     "BIT_XOR",
@@ -15698,6 +15830,139 @@ mod predict_tests {
             at_bar("SELECT * FROM orders o JOIN customers c | WHERE c.id = 1").as_deref(),
             Some("ON o.customer_id = c.id")
         );
+    }
+
+    /// `BETWEEN`'s `AND` waits for a finished bound: PostgreSQL's
+    /// `SYMMETRIC`/`ASYMMETRIC` are not one, and a window frame's bound is
+    /// whole only with its `PRECEDING`, `FOLLOWING` or `ROW`.
+    #[test]
+    fn between_waits_for_a_whole_bound() {
+        let pg = |sql: &str| at_end(sql, SqlDialect::Postgres);
+        assert_eq!(pg("SELECT * FROM t WHERE a BETWEEN SYMMETRIC "), None);
+        assert_eq!(pg("SELECT * FROM t WHERE a BETWEEN ASYMMETRIC "), None);
+        let frame = "SELECT sum(x) OVER (ORDER BY id ROWS BETWEEN ";
+        for bound in ["UNBOUNDED ", "1 ", "CURRENT "] {
+            assert_eq!(pg(&format!("{frame}{bound}")), None, "{bound}");
+        }
+        for bound in ["UNBOUNDED PRECEDING ", "1 FOLLOWING ", "CURRENT ROW "] {
+            assert_eq!(
+                pg(&format!("{frame}{bound}")).as_deref(),
+                Some("AND "),
+                "{bound}"
+            );
+        }
+        assert_eq!(
+            pg("SELECT * FROM t WHERE a BETWEEN SYMMETRIC 1 ").as_deref(),
+            Some("AND ")
+        );
+    }
+
+    /// An operand is unfinished after an infix word the list did not know —
+    /// `AT TIME ZONE`, MySQL's `DIV`/`MOD`/`XOR`/`REGEXP` — and after a MySQL
+    /// `INTERVAL n`, which still wants its unit.
+    #[test]
+    fn an_operand_waits_for_its_infix_words_and_its_unit() {
+        let pg = |sql: &str| at_end(sql, SqlDialect::Postgres);
+        assert_eq!(pg("SELECT CAST(created AT TIME ZONE "), None);
+        assert_eq!(pg("SELECT CAST(created AT "), None);
+        for op in ["DIV", "MOD", "XOR", "REGEXP"] {
+            assert_eq!(my(&format!("SELECT CAST(total {op} ")), None, "{op}");
+        }
+        assert_eq!(
+            my("SELECT * FROM t WHERE d BETWEEN now() - INTERVAL 1 "),
+            None
+        );
+        assert_eq!(
+            my("SELECT * FROM t WHERE d BETWEEN now() - INTERVAL 1 DAY ").as_deref(),
+            Some("AND ")
+        );
+    }
+
+    /// A one-column foreign key gets no composite key, and a composite one no
+    /// single column: the counts must agree.
+    #[test]
+    fn references_names_a_key_only_as_wide_as_the_foreign_key() {
+        let mut lines = tbl("lines", &["order_id", "line_no", "sku"]);
+        lines.columns[0].primary_key = true;
+        lines.columns[1].primary_key = true;
+        let schema = DbSchema {
+            tables: vec![lines],
+            ..Default::default()
+        };
+        let at = |sql: &str| in_schema(&schema, sql, SqlDialect::MySql);
+        assert_eq!(at("CREATE TABLE t (a int REFERENCES lines ("), None);
+        assert_eq!(
+            at("CREATE TABLE t (a int, FOREIGN KEY (a) REFERENCES lines ("),
+            None
+        );
+        assert_eq!(
+            at("CREATE TABLE t (a int, b int, FOREIGN KEY (a, b) REFERENCES lines (").as_deref(),
+            Some("order_id, line_no)")
+        );
+        let k = |sql: &str| keyed_at(sql, SqlDialect::MySql);
+        assert_eq!(
+            k("CREATE TABLE t (a int, b int, FOREIGN KEY (a, b) REFERENCES customers ("),
+            None
+        );
+    }
+
+    /// A table constraint's `NOT` is PostgreSQL's `NOT DEFERRABLE`, in a
+    /// `CREATE TABLE` list or after an `ALTER TABLE … ADD`; a column's own
+    /// `UNIQUE NOT` is still `NULL`.
+    #[test]
+    fn not_after_a_table_constraint_predicts_nothing() {
+        let pg = |sql: &str| at_end(sql, SqlDialect::Postgres);
+        for sql in [
+            "CREATE TABLE t (a int, b int, UNIQUE (a, b) NOT ",
+            "CREATE TABLE t (a int, PRIMARY KEY (a) NOT ",
+            "CREATE TABLE t (a int, EXCLUDE USING gist (a WITH =) NOT ",
+            "CREATE TABLE t (PRIMARY KEY (a) NOT ",
+            "ALTER TABLE t ADD PRIMARY KEY (a) NOT ",
+            "ALTER TABLE t ADD UNIQUE (a) NOT ",
+        ] {
+            assert_eq!(pg(sql), None, "{sql}");
+        }
+        assert_eq!(
+            pg("CREATE TABLE t (a int UNIQUE NOT ").as_deref(),
+            Some("NULL")
+        );
+        assert_eq!(
+            pg("ALTER TABLE t ADD COLUMN a int NOT ").as_deref(),
+            Some("NULL")
+        );
+    }
+
+    /// The JSON aggregates the list missed are aggregates too, and a GROUP BY
+    /// list leaves them out.
+    #[test]
+    fn group_by_leaves_out_every_json_aggregate() {
+        let pg = |sql: &str| at_end(sql, SqlDialect::Postgres);
+        for agg in [
+            "jsonb_object_agg(id, total)",
+            "json_object_agg_strict(id, total)",
+            "jsonb_object_agg_unique(id, total)",
+            "jsonb_object_agg_unique_strict(id, total)",
+        ] {
+            assert_eq!(
+                pg(&format!("SELECT customer_id, {agg} FROM orders GROUP BY ")).as_deref(),
+                Some("customer_id"),
+                "{agg}"
+            );
+        }
+        assert_eq!(
+            at_end(
+                "SELECT customer_id, jsonb_group_array(id) FROM orders GROUP BY ",
+                SqlDialect::Sqlite
+            )
+            .as_deref(),
+            Some("customer_id")
+        );
+    }
+
+    /// T-SQL's `WITH XMLNAMESPACES (` names no CTE.
+    #[test]
+    fn with_xmlnamespaces_predicts_no_as() {
+        assert_eq!(at_end("WITH XMLNAMESPACES ", SqlDialect::MsSql), None);
     }
 }
 
