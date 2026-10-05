@@ -11925,13 +11925,18 @@ existing prose was left alone.
     unrunnable statement, not a cosmetic one.** A phantom row means `prepare_run` answers
     `Err(Missing)`, which stops the run *before* the guard and so offers no "Run anyway" — there is
     no way through the app at all. Three shapes say "subscript": a word byte immediately before
-    (`arr[1:2]`), a `]` immediately before (`m[1][2:3]`), and an **open** `[` —
-    `subscript_open_before`, for PostgreSQL's open-ended lower bound `arr[:hi]`, which all three
-    existing slice tests had missed by writing a lower bound. The first two look at the byte
-    *immediately* before rather than the last non-space one, since `SELECT :a` has its `T` a space
-    away and skipping the space would swallow every placeholder in the language. The `[` rule does
-    look past whitespace, and then has to ask **what the bracket hangs off**, which is the whole of
-    that function: `ARRAY[…]` is a *constructor*, not a subscript, and a rule reading every `[` as a
+    (`arr[1:2]`), a `]` immediately before (`m[1][2:3]`), and being **the first `:` inside an open
+    `[`** — `slices_a_subscript`, for PostgreSQL's open-ended lower bound `arr[:hi]`, which all
+    three existing slice tests had missed by writing a lower bound, and for a bound with a space
+    before the colon, `arr[lo :hi]`, which the first rule cannot see past. The first two look at the
+    byte *immediately* before rather than the last non-space one, since `SELECT :a` has its `T` a
+    space away and skipping the space would swallow every placeholder in the language. The `[` rule
+    reads back to the open bracket (over closed brackets and parens, and a `::` cast, to the start of
+    the line or statement — an unbounded walk per `:` was quadratic in a long script); only the
+    *first* colon in it is the slice's, so `arr[1 : :n]` keeps its `:n`
+    (`a_spaced_slice_colon_is_not_a_placeholder`). It then has to ask **what the bracket hangs
+    off**, which is the whole of `hangs_off_subscriptable`: `ARRAY[…]` is a *constructor*, not a
+    subscript, and a rule reading every `[` as a
     slice reported `SELECT ARRAY[:a, :b]` as carrying only `:b` — the bar offered one row and
     `substitute` left `:a` in the statement verbatim. `arr[` and `ARRAY[` are the same two bytes;
     only what precedes them tells them apart, which `word_before` answers. Subscriptable hosts now
@@ -11945,9 +11950,16 @@ existing prose was left alone.
     **All of that is one predicate, `opens_placeholder`, and it is `pub(crate)` because a second
     module was re-spelling half of it.** `sqlfmt`'s `:name` token arm asked only "is the next byte an
     identifier byte", so `a[lo:hi]` lexed as one token and `need_space` wrote it back as `lo :hi` —
-    which this module's full rule *does* read as a placeholder, so Format Code created a query
-    parameter by moving a space and the run then stopped at `Err(Missing)`. One definition, two
-    callers: whatever the slice rule grows next, the formatter grows it too.
+    which this module's rule then read as a placeholder (it no longer does, the spaced slice being
+    one of the shapes above), so Format Code created a query parameter by moving a space and the
+    run then stopped at `Err(Missing)`. One definition, two callers: whatever the slice rule grows
+    next, the formatter grows it too.
+    **A sqlcmd command line is skipped whole** on an engine whose scripts carry them
+    (`has_sqlcmd_commands`, an exhaustive match: SQL Server alone): a `:` first on its line naming
+    one of sqlcmd's commands — `:setvar Region West`, `:r .\seed.sql`, `:on error exit` — is the
+    script talking to sqlcmd, and the bar asked for parameters `setvar`, `r` and `on`
+    (`a_sqlcmd_command_line_is_not_a_parameter`). Not first on its line, or not a command, a `:name`
+    is a placeholder as anywhere else.
     `prepare_run` is the pair the run action calls — substitute, then `sql::run_verdict` on the
     result — so the ordering is structural rather than a rule a caller has to remember, and
     `strip_param_diagnostics` drops the reports `neutralize`'s own rewrite caused. Pure +

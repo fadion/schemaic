@@ -29,9 +29,12 @@
 //!   start where [`crate::sql::is_word_start`] says one can.
 //! - **`arr[lo:hi]`** — a PostgreSQL array slice. Excluded by requiring the byte
 //!   *before* the `:` not to be part of a word (or a `]`), which a placeholder's
-//!   never is and a slice bound's always is — plus the open-ended `arr[:hi]`,
-//!   which has neither and is settled by [`subscript_open_before`]. `ARRAY[:a]`
-//!   is a constructor rather than a subscript, and `:a` there is a parameter.
+//!   never is and a slice bound's always is — plus the open-ended `arr[:hi]`
+//!   and the spaced `arr[lo :hi]`, which have neither and are settled by
+//!   [`slices_a_subscript`]. `ARRAY[:a]` is a constructor rather than a
+//!   subscript, and `:a` there is a parameter.
+//! - **`:setvar`, `:r`** — sqlcmd command lines in a SQL Server script,
+//!   skipped whole (`sqlcmd_line_end`).
 //!
 //! Everything inside a string, comment, dollar-quoted body or quoted identifier
 //! is skipped by [`crate::sql::skip_noncode`], per the one-boundary-lexer rule —
@@ -229,6 +232,11 @@ pub fn scan(sql: &str, dialect: SqlDialect) -> Vec<ParamRef> {
             i += 2;
             continue;
         }
+        // A sqlcmd command line (`:setvar`, `:r`), skipped whole.
+        if let Some(end) = sqlcmd_line_end(b, i, dialect) {
+            i = end;
+            continue;
+        }
         if !opens_placeholder(b, i) {
             i += 1;
             continue;
@@ -245,6 +253,62 @@ pub fn scan(sql: &str, dialect: SqlDialect) -> Vec<ParamRef> {
         i = j;
     }
     out
+}
+
+/// Where a sqlcmd command line ends, when the `:` at `i` starts one: first on
+/// its line, on an engine whose scripts carry them ([`has_sqlcmd_commands`]),
+/// and naming one of sqlcmd's commands. `:setvar Region West` is the script
+/// setting a variable, not a parameter `setvar` for the bar to ask about, and
+/// `:r .\seed.sql` named one `r`.
+fn sqlcmd_line_end(b: &[u8], i: usize, dialect: SqlDialect) -> Option<usize> {
+    const COMMANDS: &[&[u8]] = &[
+        b"setvar",
+        b"r",
+        b"connect",
+        b"on",
+        b"out",
+        b"error",
+        b"exit",
+        b"quit",
+        b"listvar",
+        b"reset",
+        b"ed",
+        b"perftrace",
+        b"serverlist",
+        b"help",
+        b"xml",
+    ];
+    if !has_sqlcmd_commands(dialect) {
+        return None;
+    }
+    let line_start = b[..i]
+        .iter()
+        .rposition(|&c| c == b'\n')
+        .map_or(0, |p| p + 1);
+    if !b[line_start..i].iter().all(|c| c.is_ascii_whitespace()) {
+        return None;
+    }
+    let word_end = (i + 1..b.len())
+        .find(|&j| !is_word_byte(b[j]))
+        .unwrap_or(b.len());
+    let word = &b[i + 1..word_end];
+    if !COMMANDS.iter().any(|c| word.eq_ignore_ascii_case(c)) {
+        return None;
+    }
+    Some(
+        (word_end..b.len())
+            .find(|&j| b[j] == b'\n')
+            .unwrap_or(b.len()),
+    )
+}
+
+/// Does this engine's tooling put sqlcmd commands in a script? SQL Server's
+/// (`sqlcmd`, SSMS's SQLCMD mode); no other engine reads a line-leading `:`.
+fn has_sqlcmd_commands(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MsSql => true,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+    }
 }
 
 /// Does a placeholder open at `b[i]` — is this `:` the start of `:name`?
@@ -270,9 +334,9 @@ pub fn scan(sql: &str, dialect: SqlDialect) -> Vec<ParamRef> {
 ///
 /// The first two must look at the byte *immediately* before, not the last
 /// non-space one — `SELECT :a` has `T` a space away, and skipping the space
-/// would swallow every placeholder in the language. The `[` rule looks past
-/// whitespace, and has to ask what the `[` hangs off — see
-/// [`subscript_open_before`]. Where `[` quotes an identifier (SQLite)
+/// would swallow every placeholder in the language. The `[` rule reads back to
+/// the open bracket, and has to ask what the `[` hangs off — see
+/// [`slices_a_subscript`]. Where `[` quotes an identifier (SQLite)
 /// `skip_noncode` has already consumed it, and a `::` cast is consumed whole by
 /// the caller before it gets here.
 pub(crate) fn opens_placeholder(b: &[u8], i: usize) -> bool {
@@ -280,30 +344,57 @@ pub(crate) fn opens_placeholder(b: &[u8], i: usize) -> bool {
         return false;
     }
     let attached =
-        i > 0 && (is_word_byte(b[i - 1]) || b[i - 1] == b']') || subscript_open_before(b, i);
+        i > 0 && (is_word_byte(b[i - 1]) || b[i - 1] == b']') || slices_a_subscript(b, i);
     !attached && b.get(i + 1).copied().is_some_and(is_word_start)
 }
 
-/// Is the `:` at `i` opening a **subscript's** slice bound — `arr[:hi]`?
+/// Is the `:` at `i` a **subscript's** slice colon — `arr[:hi]`, and with a
+/// space before it, `arr[lo :hi]`?
 ///
-/// It is, when the last non-whitespace byte before it is a `[` **and** that `[`
-/// hangs off something subscriptable: an identifier, or the `]` of an earlier
-/// subscript.
+/// It is, when it is the first `:` (a `::` cast aside) inside an open `[` that
+/// hangs off something subscriptable ([`hangs_off_subscriptable`]). The first
+/// only: in `arr[1 : :n]` the second is a placeholder for the upper bound. Read
+/// back over raw bytes to the start of the line or statement — a slice is not
+/// written across lines, and an unbounded walk per `:` was quadratic in a long
+/// script. `arr[lo :hi]` used to grow a parameter row named `hi` and hold the
+/// run with no "Run anyway", as `arr[:hi]` once did: the space put the bound's
+/// own word out of reach of the "word byte immediately before" rule.
+fn slices_a_subscript(b: &[u8], i: usize) -> bool {
+    // Brackets and parens closed between the colon and the bracket it is in.
+    let mut depth = 0usize;
+    let mut k = i;
+    while k > 0 {
+        k -= 1;
+        match b[k] {
+            b'\n' | b';' => return false,
+            b']' | b')' => depth += 1,
+            b'(' if depth == 0 => return false,
+            b'[' if depth == 0 => return hangs_off_subscriptable(b, k),
+            b'(' | b'[' => depth -= 1,
+            b':' if depth == 0 => {
+                let cast = (k > 0 && b[k - 1] == b':') || b.get(k + 1) == Some(&b':');
+                if !cast {
+                    // This subscript's slice colon came first.
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Does the `[` at `open` subscript something — an identifier, or the `]` of
+/// an earlier subscript — rather than build an array?
 ///
-/// The second half is the whole of the function. `ARRAY[…]` is a *constructor*,
+/// That is the whole question. `ARRAY[…]` is a *constructor*,
 /// not a subscript, and a placeholder inside one is an ordinary parameter — so
 /// a rule that read every `[` as a slice reported `SELECT ARRAY[:a, :b]` as
 /// carrying only `:b`. The bar then offered one row, `substitute` left `:a` in
 /// the statement verbatim, and the server got SQL with an unbound name in it
 /// and no row for the user to fill in. `arr[` and `ARRAY[` are the same two
 /// bytes here; only what precedes them tells them apart.
-fn subscript_open_before(b: &[u8], i: usize) -> bool {
-    let Some(open) = b[..i].iter().rposition(|c| !c.is_ascii_whitespace()) else {
-        return false;
-    };
-    if b[open] != b'[' {
-        return false;
-    }
+fn hangs_off_subscriptable(b: &[u8], open: usize) -> bool {
     // What the bracket hangs off.
     let Some(host) = b[..open].iter().rposition(|c| !c.is_ascii_whitespace()) else {
         // A `[` with nothing before it subscripts nothing.
@@ -589,6 +680,33 @@ mod tests {
     }
 
     // ── scan ────────────────────────────────────────────────────────────────
+
+    /// A sqlcmd command line is the script talking to sqlcmd, not a parameter
+    /// — on SQL Server, first on its line, and naming a command.
+    #[test]
+    fn a_sqlcmd_command_line_is_not_a_parameter() {
+        let ms = SqlDialect::MsSql;
+        let sql = ":setvar Region West\n:r .\\seed.sql\n  :on error exit\nSELECT * FROM t WHERE r = :region";
+        assert_eq!(found(sql, ms), ["region"]);
+        // Not first on its line, not a command, or not SQL Server: a placeholder.
+        assert_eq!(found("SELECT :setvar", ms), ["setvar"]);
+        assert_eq!(found(":id\n", ms), ["id"]);
+        assert_eq!(found(":setvar x 1", MY), ["setvar"]);
+    }
+
+    /// A slice's colon with spaces round it is still the subscript's, and the
+    /// placeholder after it in `arr[1 : :n]` is still a placeholder.
+    #[test]
+    fn a_spaced_slice_colon_is_not_a_placeholder() {
+        assert!(found("SELECT arr[lo :hi] FROM t", PG).is_empty());
+        assert!(found("SELECT arr[ :hi] FROM t", PG).is_empty());
+        assert!(found("SELECT (a)[lo :hi], m[1][2 :x] FROM t", PG).is_empty());
+        assert!(found("SELECT arr[f(x) :hi] FROM t", PG).is_empty());
+        assert_eq!(found("SELECT arr[1 : :n] FROM t", PG), ["n"]);
+        assert_eq!(found("SELECT arr[x::int : :n] FROM t", PG), ["n"]);
+        assert_eq!(found("SELECT ARRAY[:a, :b], f(:c)", PG), ["a", "b", "c"]);
+        assert_eq!(found("SELECT a[1], :p FROM t", PG), ["p"]);
+    }
 
     #[test]
     fn finds_a_named_placeholder() {
