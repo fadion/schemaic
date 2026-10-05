@@ -1814,13 +1814,40 @@ existing prose was left alone.
     anything else — an operand, a list item, `BETWEEN 1 | 5`, `INSERT INTO t (| id)` — the text
     after the caret is part of what is being written, and a prediction would split it; so
     `ORDER | id` still predicts nothing (`a_prediction_goes_in_front_of_the_next_clause_on_the_line`,
-    red first; `nothing_is_predicted_mid_line_or_for_a_word_already_there`). There the prediction
-    may not hold the following clause's word *anywhere*, not only first — `JOIN | ON o.x = c.y`
-    would otherwise gain `customers ON …` and a second `ON`
-    (`mid_line_predicts_nothing_that_would_collide_with_what_follows`) — and its trailing
+    red first; `nothing_is_predicted_mid_line_or_for_a_word_already_there`). There its trailing
     whitespace is trimmed, since the space already after the caret stands in for it (`BY`, not
     `BY `). The auto-paired `)` counts only at a line's end (`closed` is read only there), so a
     caret against one mid-line, as in `INSERT INTO t (|) VALUES (1)`, gets no ghost.
+    **A line's end is not the statement's: whatever follows the caret, on this line or the ones
+    below, is what the ghost is written in front of**, and one rule holds it in both places. The
+    first word after the caret up to the statement's end (`statement_range`, so its `;`) must open a
+    clause or a statement — `opens_a_clause_or_statement`, `CLAUSE_OPENERS` or `STATEMENT_OPENERS`,
+    the second because with no `;` before it the editor reads the next statement as part of this
+    one, so `ORDER |\n\nSELECT 1` still gets `BY `. The prediction may not hold that word
+    *anywhere*, not only first — `JOIN | ON o.x = c.y` would otherwise gain `customers ON …` and a
+    second `ON` (`mid_line_predicts_nothing_that_would_collide_with_what_follows`). And
+    `may_precede(guess, next)` must let it go there: a guess holding `WHERE` only before a clause
+    that may follow a condition (`AFTER_WHERE` — `GROUP`, `ORDER`, `HAVING`, `LIMIT`, `OFFSET`,
+    `FETCH`, `WINDOW`, the set operations, `RETURNING`), one holding `ON` only before those or
+    `AFTER_ON` (`WHERE`, the join words, MySQL's `UPDATE … JOIN … SET`), one holding `FROM` never
+    before `INTO`, and anything before a statement opener. Two holes made this one rule. At a
+    line's end only the next word was compared, and only with the guess's first, so the line break
+    hid the rest of the statement: `JOIN |\n  ON o.customer_id = c.id` predicted `customers ON …`
+    and a second `ON`, `JOIN |\n  customers c ON …` another table, `GROUP BY |\n  total` a second
+    list, `INSERT INTO customers (|\n  name)` a list clashing with the one written,
+    `LEFT |\n  OUTER JOIN` a `JOIN`, `ON |\n  c.id = o.customer_id` a duplicate condition and
+    `IF |\n  EXISTS` a `NOT EXISTS` (`a_prediction_reads_what_the_statement_says_on_the_lines_below`,
+    red first). Mid-line, the check kept the next clause's word out of the guess but not the guess
+    out from in front of a clause it may not precede: `JOIN | USING (id)` got an `ON`,
+    PostgreSQL's `DELETE FROM t | USING …` a `WHERE` before the `USING`, T-SQL's
+    `DELETE FROM t | FROM …` one before the second `FROM`, and `SELECT * | INTO #t FROM t` a `FROM`
+    (`a_prediction_goes_only_before_a_clause_it_may_precede`, red first). The one exception is a
+    caret in a closed paren — `closed`, the auto-paired `)` — whose contents end at the `)`
+    whatever follows it, so `INSERT INTO customers (|)\nVALUES (1, 'a')` still gets its columns.
+    The cost is a statement that goes on below with anything else: editing the top of an
+    unterminated statement whose next line is an operand or a list item gets no ghost, and nor does
+    a statement left without its `;` above one whose first word `STATEMENT_OPENERS` does not list
+    (`PRAGMA`, `COPY`, T-SQL's `PRINT`).
     Each keyword guard is a place the bare
     rule was wrong: `INSERT`/`DELETE` count only as a statement's first word, since both also sit
     in a trigger header and a key's `ON DELETE`; `GROUP` takes `BY` only where it groups a

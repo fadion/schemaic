@@ -12584,7 +12584,12 @@ fn is_real_statement(stmt: &sqlparser::ast::Statement) -> bool {
 /// clause ([`starts_a_clause`]), straight after whitespace or a `(`,
 /// and in code — a caret a string, comment or quoted name runs up to predicts
 /// nothing. And never the word the statement already has next, so editing
-/// `ORDER |` above an existing `BY` offers no second one.
+/// `ORDER |` above an existing `BY` offers no second one. **What the statement
+/// says after the caret, on the lines below too, is what the prediction is
+/// written in front of**: the next word must open a clause or a statement
+/// ([`opens_a_clause_or_statement`]), the prediction may not hold it, and it
+/// must be a clause that may come first ([`may_precede`]) — unless the caret
+/// is in a closed paren, whose contents end at its `)`.
 pub fn predict(sql: &str, caret: usize, catalog: &Catalog, dialect: SqlDialect) -> Option<String> {
     if caret > sql.len() || !sql.is_char_boundary(caret) {
         return None;
@@ -12636,15 +12641,23 @@ pub fn predict(sql: &str, caret: usize, catalog: &Catalog, dialect: SqlDialect) 
     {
         return None;
     }
+    // **Whatever the statement says after the caret, the prediction goes in
+    // front of it** — on this line or the ones below, since a statement goes
+    // on past a line's end (`JOIN |⏎ ON …` must not gain a second `ON`, `GROUP
+    // BY |⏎ total` a second list). So the next word must open a clause or a
+    // statement, the prediction may not hold it, and it must be a clause that
+    // may come before it ([`may_precede`]). Not inside a closed paren, whose
+    // contents end at the `)` whatever follows it.
+    if let Some(next) = &next_word
+        && (mid_line || !closed)
+        && (!opens_a_clause_or_statement(next)
+            || guessed.any(|w| w.eq_ignore_ascii_case(next))
+            || !may_precede(&guess, next))
+    {
+        return None;
+    }
     if mid_line {
-        // In front of a clause, the prediction may not hold that clause's own
-        // word (`JOIN | ON …` must not gain a second `ON`), and the space
-        // already after the caret stands in for its trailing one.
-        if let Some(next) = &next_word
-            && guessed.any(|w| w.eq_ignore_ascii_case(next))
-        {
-            return None;
-        }
+        // The space already after the caret stands in for its trailing one.
         let trimmed = guess.trim_end();
         return (!trimmed.is_empty()).then(|| trimmed.to_string());
     }
@@ -12700,6 +12713,72 @@ fn starts_a_clause(line_rest: &str) -> bool {
     CLAUSE_OPENERS
         .iter()
         .any(|kw| rest[..end].eq_ignore_ascii_case(kw))
+}
+
+/// The words that begin a statement — what follows a prediction when the
+/// statement it ends has no `;` before the next one, which the editor then
+/// reads as one statement.
+const STATEMENT_OPENERS: &[&str] = &[
+    "SELECT", "INSERT", "UPDATE", "DELETE", "WITH", "CREATE", "ALTER", "DROP", "TRUNCATE", "MERGE",
+    "REPLACE", "GRANT", "REVOKE", "DENY", "SHOW", "EXPLAIN", "DESCRIBE", "USE", "BEGIN", "COMMIT",
+    "ROLLBACK", "DECLARE", "EXEC", "EXECUTE", "CALL", "GO",
+];
+
+/// Is `word`, the next word after a prediction, one a prediction may go in
+/// front of — a clause's ([`CLAUSE_OPENERS`]) or a statement's
+/// ([`STATEMENT_OPENERS`])? Anything else is the rest of what is being
+/// written: an operand, a list item, a table already named.
+fn opens_a_clause_or_statement(word: &str) -> bool {
+    CLAUSE_OPENERS
+        .iter()
+        .chain(STATEMENT_OPENERS)
+        .any(|kw| word.eq_ignore_ascii_case(kw))
+}
+
+/// The clauses that may follow a condition — what a prediction ending in a
+/// `WHERE` may be written in front of.
+const AFTER_WHERE: &[&str] = &[
+    "GROUP",
+    "ORDER",
+    "HAVING",
+    "LIMIT",
+    "OFFSET",
+    "FETCH",
+    "WINDOW",
+    "UNION",
+    "INTERSECT",
+    "EXCEPT",
+    "RETURNING",
+];
+
+/// The clauses that may follow a join's `ON` condition: what a `WHERE` may,
+/// the `WHERE` itself, another join, and MySQL's `UPDATE … JOIN … SET`.
+const AFTER_ON: &[&str] = &[
+    "WHERE", "JOIN", "LEFT", "RIGHT", "INNER", "FULL", "CROSS", "NATURAL", "SET",
+];
+
+/// May a prediction holding `guess`'s words go in front of `next`, the word
+/// that opens what follows it? Not an `ON` before a `USING` (one join, two
+/// conditions), not a `WHERE` before the `USING` or second `FROM` a `DELETE`
+/// joins through, nor before a join; not a `FROM` before the `INTO` a T-SQL
+/// or PostgreSQL `SELECT … INTO` puts ahead of it. A statement's first word
+/// may follow anything: the next statement.
+fn may_precede(guess: &str, next: &str) -> bool {
+    if STATEMENT_OPENERS
+        .iter()
+        .any(|kw| next.eq_ignore_ascii_case(kw))
+    {
+        return true;
+    }
+    let holds = |kw: &str| {
+        guess
+            .split(|c: char| c.is_ascii() && !crate::sql::is_word_byte(c as u8))
+            .any(|w| w.eq_ignore_ascii_case(kw))
+    };
+    let next_in = |list: &[&str]| list.iter().any(|kw| next.eq_ignore_ascii_case(kw));
+    !(holds("WHERE") && !next_in(AFTER_WHERE)
+        || holds("ON") && !next_in(AFTER_WHERE) && !next_in(AFTER_ON)
+        || holds("FROM") && next.eq_ignore_ascii_case("INTO"))
 }
 
 /// The inline prediction remembered rather than reasoned: the rest of the
@@ -15407,6 +15486,84 @@ mod predict_tests {
             );
         }
         assert_eq!(at_end("SELECT * FROM a OUTER ", SqlDialect::MsSql), None);
+    }
+
+    /// The prediction at the `|` in `sql`, which is removed first, on
+    /// `dialect`.
+    fn bar_in(sql: &str, dialect: SqlDialect) -> Option<String> {
+        let caret = sql.find('|').expect("a caret");
+        let text = sql.replacen('|', "", 1);
+        let schema = shop();
+        let cat = Catalog::build(&[("shop", &schema)], Some("shop"));
+        predict(&text, caret, &cat, dialect)
+    }
+
+    /// At the end of a line the statement may go on below, and whatever it
+    /// says there is what the prediction would be written in front of: a
+    /// second `ON`, a column already listed, the operand of the word just
+    /// typed. Only before the next clause — or the next statement — is it
+    /// offered.
+    #[test]
+    fn a_prediction_reads_what_the_statement_says_on_the_lines_below() {
+        for sql in [
+            "SELECT * FROM orders o JOIN |\n  ON o.customer_id = c.id",
+            "SELECT * FROM orders o JOIN |\n  customers c ON o.customer_id = c.id",
+            "SELECT customer_id, total FROM orders GROUP BY |\n  total",
+            "INSERT INTO customers (|\n  name) VALUES ('a')",
+            "SELECT * FROM orders o LEFT |\n  OUTER JOIN customers c ON c.id = o.customer_id",
+            "SELECT * FROM orders o JOIN customers c ON |\n  c.id = o.customer_id",
+            "CREATE TABLE IF |\n  EXISTS t (id int)",
+        ] {
+            assert_eq!(at_bar(sql), None, "{sql}");
+        }
+        assert_eq!(
+            at_bar("SELECT customer_id, count(*) FROM orders GROUP BY |\nORDER BY 2").as_deref(),
+            Some("customer_id")
+        );
+        assert_eq!(
+            at_bar("SELECT id FROM orders ORDER |\n\nSELECT 1").as_deref(),
+            Some("BY ")
+        );
+        assert_eq!(
+            at_bar("INSERT INTO customers (|)\nVALUES (1, 'a')").as_deref(),
+            Some("id, name")
+        );
+    }
+
+    /// In front of a clause, the prediction must be a clause that may come
+    /// before it: no `ON` before a `USING`, no `WHERE` before the `USING` or
+    /// second `FROM` a `DELETE` joins through, no `FROM` before an `INTO`.
+    #[test]
+    fn a_prediction_goes_only_before_a_clause_it_may_precede() {
+        assert_eq!(at_bar("SELECT * FROM orders o JOIN | USING (id)"), None);
+        assert_eq!(
+            at_bar("SELECT * FROM orders o JOIN customers c | USING (customer_id)"),
+            None
+        );
+        assert_eq!(
+            at_bar("SELECT * FROM orders o JOIN customers c |\nUSING (customer_id)"),
+            None
+        );
+        let pg = |sql: &str| bar_in(sql, SqlDialect::Postgres);
+        let ms = |sql: &str| bar_in(sql, SqlDialect::MsSql);
+        assert_eq!(
+            pg("DELETE FROM orders | USING customers c WHERE c.id = 1"),
+            None
+        );
+        assert_eq!(
+            ms("DELETE FROM orders | FROM orders o JOIN customers c ON c.id = o.customer_id"),
+            None
+        );
+        assert_eq!(ms("SELECT * | INTO #t FROM orders"), None);
+        assert_eq!(pg("SELECT * |\nINTO TEMP t FROM orders"), None);
+        assert_eq!(
+            pg("DELETE FROM orders | RETURNING id").as_deref(),
+            Some("WHERE")
+        );
+        assert_eq!(
+            at_bar("SELECT * FROM orders o JOIN customers c | WHERE c.id = 1").as_deref(),
+            Some("ON o.customer_id = c.id")
+        );
     }
 }
 
