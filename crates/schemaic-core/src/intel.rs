@@ -10708,6 +10708,18 @@ fn typo_checks(
     out: &mut Vec<Diagnostic>,
 ) {
     let b = sql.as_bytes();
+    // A name the statement declares with `AS` is the user's, wherever it is
+    // used: `COUNT(*) AS likes … ORDER BY likes` was "`likes` looks like a
+    // misspelled keyword" twice over.
+    let toks = tokenize_range(sql, lo, hi, dialect);
+    let aliases: Vec<&str> = toks
+        .windows(2)
+        .filter(|w| bare_upper(&w[0]).as_deref() == Some("AS"))
+        .filter_map(|w| match &w[1].kind {
+            TkKind::Word(name) => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
     let mut i = lo;
     while i < hi {
         if let Some(j) = skip_noncode(b, i, dialect) {
@@ -10728,6 +10740,7 @@ fn typo_checks(
             if prefix == 0
                 && !qualified
                 && !names_an_odbc_function(b, s)
+                && !aliases.iter().any(|a| a.eq_ignore_ascii_case(&sql[s..j]))
                 && is_probable_typo(&sql[s..j], catalog, dialect)
             {
                 out.push(Diagnostic {
@@ -19640,6 +19653,27 @@ mod tests {
         // And a genuine typo is still caught, or the exemptions have
         // swallowed the whole check.
         assert_eq!(flagged("SELCT * FROM employees"), vec!["SELCT"]);
+    }
+
+    /// A name the statement declares with `AS` is not a keyword typo, where it
+    /// is declared or where it is used; the same word undeclared still is.
+    #[test]
+    fn an_alias_declared_with_as_is_not_a_keyword_typo() {
+        let (schema, db) = sample_catalog();
+        let cat = Catalog::build(&[(db, &schema)], Some(db));
+        let flagged = |sql: &str| -> Vec<String> {
+            diagnostics(sql, &cat, SqlDialect::MySql)
+                .into_iter()
+                .filter(|d| d.message.contains("misspelled keyword"))
+                .map(|d| sql[d.range.0..d.range.1].to_string())
+                .collect()
+        };
+        assert!(
+            flagged("SELECT COUNT(*) AS likes FROM employees ORDER BY likes").is_empty(),
+            "{:?}",
+            flagged("SELECT COUNT(*) AS likes FROM employees ORDER BY likes")
+        );
+        assert_eq!(flagged("SELECT * FROM employees likes"), ["likes"]);
     }
 
     /// **The set no longer belongs to one statement, so every statement in the

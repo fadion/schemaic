@@ -1229,7 +1229,11 @@ existing prose was left alone.
     function** (`names_an_odbc_function`): `{fn UCASE(x)}` names ODBC's vocabulary, which SQL
     Server runs as written (`UCASE`, `LCASE`, `CURDATE`, `IFNULL`, `LOCATE`, `TIMESTAMPADD` measured
     on 2022) and a driver translates elsewhere, and each was a misspelled keyword or function
-    (`an_odbc_escape_function_is_not_a_misspelling`). `is_session_source` exempts a temporary table, a table
+    (`an_odbc_escape_function_is_not_a_misspelling`). **Nor does `typo_checks` judge a name the
+    statement declares with `AS`**, where it is declared or anywhere it is used: `COUNT(*) AS likes
+    … ORDER BY likes` was two misspelled `LIKE`s. The names are read off the statement's tokens
+    first; an implicit alias (`FROM t likes`) is still checked, since there `likes` may as well be a
+    mistyped `LIKE` (`an_alias_declared_with_as_is_not_a_keyword_typo`). `is_session_source` exempts a temporary table, a table
     variable and `pseudo_tables` — T-SQL's `inserted`/`deleted`, which every trigger reads and the
     typo check also exempts — from the table check, which cannot judge absent what lives in the
     session; the per-dialect list is empty where trigger rows are `NEW`/`OLD` records. A T-SQL
