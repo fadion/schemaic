@@ -123,16 +123,19 @@ fn scrollbar_geo(lines: usize, line_h: f64, viewport_h: f64) -> Option<(f64, f64
 ///
 /// Only a plain Tab, only with the completion list closed — an open list owns
 /// Tab, and a forced list (Ctrl+Space) is never shown beside a ghost — and only
-/// while the caret is still where the prediction was made. Anything else falls
-/// through to the indent it always was.
+/// while the caret is still where the prediction was made. `caret` is
+/// [`lone_caret`]'s: with several carets or a selection there is none, and Tab
+/// indents. Anything else falls through to the indent it always was.
+///
+/// [`lone_caret`]: crate::completion::lone_caret
 fn ghost_takes_tab(
     ghost_at: Option<usize>,
-    caret: usize,
+    caret: Option<usize>,
     list_open: bool,
     shift: bool,
     primary: bool,
 ) -> bool {
-    ghost_at == Some(caret) && !list_open && !shift && !primary
+    ghost_at.is_some() && ghost_at == caret && !list_open && !shift && !primary
 }
 
 /// Does this →, with the primary modifier held, take one word of the inline
@@ -146,12 +149,12 @@ fn ghost_takes_tab(
 /// [`intel::prediction_word_end`]: schemaic_core::intel::prediction_word_end
 fn ghost_takes_word(
     ghost_at: Option<usize>,
-    caret: usize,
+    caret: Option<usize>,
     list_open: bool,
     shift: bool,
     primary: bool,
 ) -> bool {
-    ghost_at == Some(caret) && !list_open && !shift && primary
+    ghost_at.is_some() && ghost_at == caret && !list_open && !shift && primary
 }
 
 /// Apply an edit the user did **not** type, without popping the completion list.
@@ -2588,7 +2591,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 let ghost = comp.ghost.get_untracked();
                 if !ghost_takes_tab(
                     ghost.as_ref().map(|g| g.offset),
-                    caret,
+                    crate::completion::lone_caret(&e.cursor.get_untracked()),
                     comp.open.get_untracked(),
                     mods.shift(),
                     primary_held(mods),
@@ -2629,7 +2632,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 let ghost = comp.ghost.get_untracked();
                 if !ghost_takes_word(
                     ghost.as_ref().map(|g| g.offset),
-                    caret,
+                    crate::completion::lone_caret(&e.cursor.get_untracked()),
                     comp.open.get_untracked(),
                     mods.shift(),
                     primary_held(mods),
@@ -2645,8 +2648,13 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     e.cursor.update(|c| c.set_offset(at, false, false));
                     if !rest.is_empty() {
                         let doc_len = e.doc().text().len();
-                        let kept =
-                            crate::completion::ghost_at(e, at, rest.to_string(), Some(doc_len));
+                        let kept = crate::completion::ghost_at(
+                            e,
+                            at,
+                            rest.to_string(),
+                            Some(doc_len),
+                            g.remembered,
+                        );
                         inline_diff::set_ghost(comp.ghost, e, Some(kept));
                     }
                 }
@@ -3283,18 +3291,36 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     // **A ghost lives only at the caret it was made for.** A click, an arrow or
     // a selection moves the caret off it, and the prediction was about that one
     // spot — so it goes, and Tab goes back to indenting. An edit moves the caret
-    // too; the recompute that edit schedules asks again for the new spot.
+    // too; the recompute that edit schedules asks again for the new spot. A
+    // second caret counts as a move: `lone_caret` answers for one alone.
     {
         let ed_ghost = ed.clone();
         create_effect(move |_| {
             let cur = ed_ghost.cursor.get();
             let stale = comp.ghost.with_untracked(|g| {
                 g.as_ref()
-                    .is_some_and(|g| cur.get_selection() != Some((g.offset, g.offset)))
+                    .is_some_and(|g| crate::completion::lone_caret(&cur) != Some(g.offset))
             });
             if stale {
                 inline_diff::set_ghost(comp.ghost, &ed_ghost, None);
             }
+        });
+    }
+
+    // **Nor does it outlive what it was made under.** Inline predictions
+    // switched off, or the tab moved to another connection, database or engine:
+    // a ghost made before stayed drawn, and Tab still took it, until the next
+    // edit asked again.
+    {
+        let ed_ghost = ed.clone();
+        create_effect(move |_| {
+            let _ = (
+                predictions.get(),
+                active_conn.get(),
+                active_db.get(),
+                dialect.get(),
+            );
+            inline_diff::set_ghost(comp.ghost, &ed_ghost, None);
         });
     }
 
@@ -6317,39 +6343,50 @@ mod ghost_key_tests {
     /// Ctrl+→ (Cmd+→ on macOS) takes one word of the prediction at its caret.
     #[test]
     fn primary_right_at_the_predictions_caret_takes_a_word() {
-        assert!(ghost_takes_word(Some(12), 12, false, false, true));
+        assert!(ghost_takes_word(Some(12), Some(12), false, false, true));
     }
 
     /// A plain → moves the caret; Shift selects; an open list, a missing or a
     /// stale prediction leaves the key to what it always did.
     #[test]
     fn a_word_is_taken_only_by_primary_right_at_a_live_prediction() {
-        assert!(!ghost_takes_word(Some(12), 12, false, false, false));
-        assert!(!ghost_takes_word(Some(12), 12, false, true, true));
-        assert!(!ghost_takes_word(Some(12), 12, true, false, true));
-        assert!(!ghost_takes_word(None, 12, false, false, true));
-        assert!(!ghost_takes_word(Some(12), 13, false, false, true));
+        assert!(!ghost_takes_word(Some(12), Some(12), false, false, false));
+        assert!(!ghost_takes_word(Some(12), Some(12), false, true, true));
+        assert!(!ghost_takes_word(Some(12), Some(12), true, false, true));
+        assert!(!ghost_takes_word(None, Some(12), false, false, true));
+        assert!(!ghost_takes_word(Some(12), Some(13), false, false, true));
     }
 
     #[test]
     fn a_plain_tab_at_the_predictions_caret_takes_it() {
-        assert!(ghost_takes_tab(Some(12), 12, false, false, false));
+        assert!(ghost_takes_tab(Some(12), Some(12), false, false, false));
     }
 
     /// An open list owns Tab; Shift+Tab outdents; Ctrl+Tab cycles tabs.
     #[test]
     fn tab_belongs_elsewhere_while_the_list_is_open_or_a_modifier_is_held() {
-        assert!(!ghost_takes_tab(Some(12), 12, true, false, false));
-        assert!(!ghost_takes_tab(Some(12), 12, false, true, false));
-        assert!(!ghost_takes_tab(Some(12), 12, false, false, true));
+        assert!(!ghost_takes_tab(Some(12), Some(12), true, false, false));
+        assert!(!ghost_takes_tab(Some(12), Some(12), false, true, false));
+        assert!(!ghost_takes_tab(Some(12), Some(12), false, false, true));
     }
 
     /// No ghost, or one made at a caret that has since moved, leaves Tab to
     /// indent.
     #[test]
     fn a_missing_or_stale_prediction_leaves_tab_to_indent() {
-        assert!(!ghost_takes_tab(None, 12, false, false, false));
-        assert!(!ghost_takes_tab(Some(12), 13, false, false, false));
+        assert!(!ghost_takes_tab(None, Some(12), false, false, false));
+        assert!(!ghost_takes_tab(Some(12), Some(13), false, false, false));
+    }
+
+    /// With several carets or a selection there is no lone caret
+    /// (`completion::lone_caret`), and neither key takes the ghost: Tab
+    /// indents the selection, Ctrl+→ moves every caret.
+    #[test]
+    fn no_lone_caret_leaves_both_keys_to_what_they_always_did() {
+        assert!(!ghost_takes_tab(Some(12), None, false, false, false));
+        assert!(!ghost_takes_word(Some(12), None, false, false, true));
+        assert!(!ghost_takes_tab(None, None, false, false, false));
+        assert!(!ghost_takes_word(None, None, false, false, true));
     }
 }
 

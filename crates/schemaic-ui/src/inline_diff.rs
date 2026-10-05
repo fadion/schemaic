@@ -213,6 +213,11 @@ pub struct EditorGhost {
     /// where the words already taken may predict nothing — while the document
     /// is still that length (`completion::keeps_ghost`).
     pub kept: Option<usize>,
+    /// Remembered from a statement run before (`intel::predict_from_history`)
+    /// rather than reasoned (`intel::predict`). A remembered ghost does not
+    /// take the empty word's place: the list that opens there still opens,
+    /// and the ghost gives way to it (`completion::ghost_displaces_the_list`).
+    pub remembered: bool,
 }
 
 /// How strongly the prediction is drawn: the editor's foreground at this
@@ -643,6 +648,18 @@ mod tests {
         }
     }
 
+    /// The ghost keeps the line's phantom columns non-decreasing wherever it
+    /// lands: before a phantom further right, after one at or before its own
+    /// column.
+    #[test]
+    fn the_ghost_slots_in_after_every_phantom_at_or_before_its_column() {
+        assert_eq!(phantom_slot([], 3), 0);
+        assert_eq!(phantom_slot([0, 5], 3), 1);
+        assert_eq!(phantom_slot([3], 3), 1);
+        assert_eq!(phantom_slot([5], 3), 0);
+        assert_eq!(phantom_slot([0, 3, 3, 9], 3), 3);
+    }
+
     /// **`before_col_of` must be floem's own arithmetic, not a plausible
     /// version of it.**
     ///
@@ -660,18 +677,6 @@ mod tests {
     /// phantoms at the *same* column — which is what the block's own parts are,
     /// and the case that lets `Block::len` stand in for the list — and columns
     /// before, inside, at both edges of, and past every span.
-    /// The ghost keeps the line's phantom columns non-decreasing wherever it
-    /// lands: before a phantom further right, after one at or before its own
-    /// column.
-    #[test]
-    fn the_ghost_slots_in_after_every_phantom_at_or_before_its_column() {
-        assert_eq!(phantom_slot([], 3), 0);
-        assert_eq!(phantom_slot([0, 5], 3), 1);
-        assert_eq!(phantom_slot([3], 3), 1);
-        assert_eq!(phantom_slot([5], 3), 0);
-        assert_eq!(phantom_slot([0, 3, 3, 9], 3), 3);
-    }
-
     #[test]
     fn before_col_of_agrees_with_floems_own_translation() {
         use floem::views::editor::phantom_text::{PhantomText, PhantomTextKind, PhantomTextLine};

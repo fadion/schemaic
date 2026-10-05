@@ -692,32 +692,90 @@ pub(crate) struct CompletionCtx<'a> {
 /// The ghost to show at `offset`, or `None` — [`intel::predict`] over the
 /// *offer* catalog, the one the popup's foreign-key join reads, so a hidden
 /// database is no more predicted from than it is offered; failing that,
-/// [`intel::predict_from_history`] over this connection's runs, newest first,
-/// leaving out the ones that failed — a statement the server refused is not
-/// one to offer again.
+/// [`intel::predict_from_history`] over the runs [`recallable`] here, newest
+/// first. Which of the two, and whether it can be shown at all, is
+/// [`pick_prediction`]'s.
 fn prediction_at(
     ed: &Editor,
     text: &str,
     offset: usize,
     ctx: &CompletionCtx<'_>,
 ) -> Option<crate::inline_diff::EditorGhost> {
-    use schemaic_core::history::Outcome;
     if !ctx.predictions {
         return None;
     }
     let catalog = ctx
         .hidden_dbs
         .with_untracked(|h| build_offer_catalog(ctx.db_nodes, h, ctx.active_db));
-    let guess = intel::predict(text, offset, &catalog, ctx.dialect).or_else(|| {
-        ctx.history.with_untracked(|entries| {
-            let past = entries
-                .iter()
-                .filter(|e| e.conn_id == ctx.conn_id && e.outcome != Outcome::Failed)
-                .map(|e| e.sql.as_str());
-            intel::predict_from_history(text, offset, ctx.dialect, past)
-        })
-    })?;
-    Some(ghost_at(ed, offset, guess, None))
+    let (guess, remembered) =
+        pick_prediction(intel::predict(text, offset, &catalog, ctx.dialect), || {
+            ctx.history.with_untracked(|entries| {
+                let past = entries
+                    .iter()
+                    .filter(|e| recallable(e, ctx.conn_id, ctx.active_db))
+                    .map(|e| e.sql.as_str());
+                intel::predict_from_history(text, offset, ctx.dialect, past)
+            })
+        })?;
+    Some(ghost_at(ed, offset, guess, None, remembered))
+}
+
+/// Which prediction to show: the one [`intel::predict`] reasons, else the one
+/// history remembers (answered `true`) — and neither when it holds a line
+/// break. `InlineDiffDoc::ghost_on` cannot draw one, but Tab still inserted it
+/// and Escape spent a press on it: an offer nobody could see.
+fn pick_prediction(
+    reasoned: Option<String>,
+    remembered: impl FnOnce() -> Option<String>,
+) -> Option<(String, bool)> {
+    let (guess, from_history) = match reasoned {
+        Some(g) => (g, false),
+        None => (remembered()?, true),
+    };
+    (!guess.contains('\n')).then_some((guess, from_history))
+}
+
+/// Is `e` a run to remember in this tab? Its connection's; not one that
+/// failed — a statement the server refused is not one to offer again — and
+/// run against the database the tab is in, where both say which.
+fn recallable(
+    e: &schemaic_core::history::HistoryEntry,
+    conn_id: u64,
+    active_db: Option<&str>,
+) -> bool {
+    let same_db = match (e.database.as_deref(), active_db) {
+        (Some(ran), Some(here)) => ran.eq_ignore_ascii_case(here),
+        _ => true,
+    };
+    e.conn_id == conn_id && e.outcome != schemaic_core::history::Outcome::Failed && same_db
+}
+
+/// Does `ghost` take the place of the list at an empty word (`prefix`)?
+///
+/// A reasoned one does: the list opens there only on its own guesses — after
+/// `WHERE`/`ON`/`BY`, the FK join row — and the ghost is the same kind of
+/// guess, made with more certainty. A remembered one does not: it is one past
+/// statement, and taking the empty word's place made the table list after
+/// `FROM ` and the columns after `WHERE ` stop opening once any such statement
+/// had run. That list opens, and the remembered ghost gives way to it.
+fn ghost_displaces_the_list(ghost: Option<&crate::inline_diff::EditorGhost>, prefix: &str) -> bool {
+    prefix.is_empty() && ghost.is_some_and(|g| !g.remembered)
+}
+
+/// The caret a ghost may sit at: the cursor's offset when it is one caret with
+/// nothing selected. Not with several carets — the ghost was drawn at one,
+/// and taking it there collapsed the rest — nor with a selection, which Tab
+/// indents and the ghost would have replaced.
+pub(crate) fn lone_caret(cursor: &floem::views::editor::core::cursor::Cursor) -> Option<usize> {
+    use floem::views::editor::core::cursor::CursorMode;
+    match &cursor.mode {
+        CursorMode::Normal(offset) => Some(*offset),
+        CursorMode::Insert(sel) => match sel.regions() {
+            [only] if only.is_caret() => Some(only.end),
+            _ => None,
+        },
+        CursorMode::Visual { .. } => None,
+    }
 }
 
 /// Is `g` the rest of a prediction to keep as it stands, at `caret` in a
@@ -742,6 +800,7 @@ pub(crate) fn ghost_at(
     offset: usize,
     text: String,
     kept: Option<usize>,
+    remembered: bool,
 ) -> crate::inline_diff::EditorGhost {
     let rope = ed.doc().text();
     let line = rope.line_of_offset(offset);
@@ -751,6 +810,7 @@ pub(crate) fn ghost_at(
         col: offset - rope.offset_of_line(line),
         text,
         kept,
+        remembered,
     }
 }
 
@@ -796,15 +856,23 @@ pub(crate) fn recompute_completions(
     // asks for the list, so a forced recompute shows no ghost beside it. The
     // rest of a prediction taken word by word is kept while the caret is where
     // the last word left it: asked afresh there, it would often be nothing.
-    let ghost = if force {
+    // And only at a lone caret ([`lone_caret`]).
+    let ghost = if force || lone_caret(&ed.cursor.get_untracked()) != Some(offset) {
         None
     } else {
         comp.ghost
             .with_untracked(|g| g.clone().filter(|g| keeps_ghost(g, offset, text.len())))
             .or_else(|| prediction_at(ed, &text, offset, &ctx))
     };
-    let has_ghost = ghost.is_some();
-    crate::inline_diff::set_ghost(comp.ghost, ed, ghost);
+    let remembered = ghost.as_ref().is_some_and(|g| g.remembered);
+    let displaces = |prefix: &str| ghost_displaces_the_list(ghost.as_ref(), prefix);
+    // A remembered ghost gives way to a list that opens at its caret.
+    let give_way = |opening: bool| {
+        if opening && remembered {
+            crate::inline_diff::set_ghost(comp.ghost, ed, None);
+        }
+    };
+    crate::inline_diff::set_ghost(comp.ghost, ed, ghost.clone());
     if comp.suppress.get_untracked() {
         comp.suppress.set(false);
         if !force && !after_dot {
@@ -822,12 +890,11 @@ pub(crate) fn recompute_completions(
     }
     let word_lo = word_start(&text, offset);
     let prefix = text.get(word_lo..offset).unwrap_or("").to_string();
-    // **A prediction takes the empty word's place.** With nothing typed yet the
-    // popup opens only on its own guesses — after WHERE/ON/BY, the FK join row —
-    // and a ghost there is the same kind of guess, made with more certainty and
-    // drawn where it would go. Two offers at one caret would leave Tab meaning
-    // whichever happened to be open; Ctrl+Space (`force`) still brings the list.
-    if prefix.is_empty() && has_ghost {
+    // **A reasoned prediction takes the empty word's place** — see
+    // `ghost_displaces_the_list`. Two offers at one caret would leave Tab meaning
+    // whichever happened to be open; Ctrl+Space (`force`) still brings the list,
+    // and a remembered ghost gives way to one instead (`give_way`).
+    if displaces(&prefix) {
         comp.open.set(false);
         set_items(comp, Vec::new());
         return;
@@ -869,6 +936,7 @@ pub(crate) fn recompute_completions(
                 }],
             );
             comp.sel.set(0);
+            give_way(true);
             comp.open.set(true);
             return;
         }
@@ -948,6 +1016,7 @@ pub(crate) fn recompute_completions(
     let open = !items.is_empty();
     set_items(comp, items);
     comp.sel.set(0);
+    give_way(open);
     comp.open.set(open);
 }
 
@@ -1455,6 +1524,7 @@ mod kept_ghost_tests {
             col: offset,
             text: "ON o.id = c.id".to_string(),
             kept,
+            remembered: false,
         }
     }
 
@@ -1472,6 +1542,115 @@ mod kept_ghost_tests {
         assert!(!keeps_ghost(&ghost(20, Some(40)), 20, 39));
         assert!(!keeps_ghost(&ghost(20, Some(40)), 21, 40));
         assert!(!keeps_ghost(&ghost(20, None), 20, 40));
+    }
+}
+
+#[cfg(test)]
+mod ghost_choice_tests {
+    use super::{ghost_displaces_the_list, lone_caret, pick_prediction, recallable};
+    use crate::inline_diff::EditorGhost;
+    use floem::views::editor::core::cursor::{Cursor, CursorMode};
+    use floem::views::editor::core::selection::{SelRegion, Selection};
+    use schemaic_core::history::{HistoryEntry, Outcome};
+
+    fn cursor(sel: Selection) -> Cursor {
+        Cursor::new(CursorMode::Insert(sel), None, None)
+    }
+
+    /// One caret with nothing selected is where a ghost may sit; several
+    /// carets, or a selection, have no one caret for it.
+    #[test]
+    fn a_ghost_sits_only_at_a_lone_caret() {
+        assert_eq!(lone_caret(&cursor(Selection::caret(5))), Some(5));
+        let mut two = Selection::caret(2);
+        two.add_region(SelRegion::caret(9));
+        assert_eq!(lone_caret(&cursor(two)), None);
+        assert_eq!(lone_caret(&cursor(Selection::region(2, 5))), None);
+    }
+
+    /// The reasoned prediction first, else the remembered one, flagged — and
+    /// neither when it holds a line break, which the ghost cannot draw.
+    #[test]
+    fn a_prediction_is_shown_only_if_it_can_be_drawn() {
+        assert_eq!(
+            pick_prediction(Some("BY ".into()), || Some("x".into())),
+            Some(("BY ".to_string(), false))
+        );
+        assert_eq!(
+            pick_prediction(None, || Some("WHERE id = 1".into())),
+            Some(("WHERE id = 1".to_string(), true))
+        );
+        assert_eq!(pick_prediction(Some("a, '\n'".into()), || None), None);
+        assert_eq!(pick_prediction(None, || Some("a\nb".into())), None);
+    }
+
+    fn run(conn_id: u64, database: Option<&str>, outcome: Outcome) -> HistoryEntry {
+        HistoryEntry {
+            conn_id,
+            database: database.map(str::to_string),
+            sql: "SELECT 1".to_string(),
+            ts: 0,
+            tab_name: None,
+            run_id: 1,
+            duration_ms: None,
+            rows: None,
+            rows_capped: false,
+            outcome,
+        }
+    }
+
+    /// A run is remembered on its own connection, when it did not fail, and
+    /// in the database it ran against — where both the run and the tab say.
+    #[test]
+    fn a_run_is_remembered_only_where_it_ran() {
+        assert!(recallable(
+            &run(1, Some("shop"), Outcome::Ok),
+            1,
+            Some("shop")
+        ));
+        assert!(recallable(
+            &run(1, Some("Shop"), Outcome::Unknown),
+            1,
+            Some("shop")
+        ));
+        assert!(recallable(&run(1, None, Outcome::Ok), 1, Some("shop")));
+        assert!(recallable(&run(1, Some("shop"), Outcome::Ok), 1, None));
+        assert!(!recallable(
+            &run(1, Some("archive"), Outcome::Ok),
+            1,
+            Some("shop")
+        ));
+        assert!(!recallable(
+            &run(2, Some("shop"), Outcome::Ok),
+            1,
+            Some("shop")
+        ));
+        assert!(!recallable(
+            &run(1, Some("shop"), Outcome::Failed),
+            1,
+            Some("shop")
+        ));
+    }
+
+    fn ghost(remembered: bool) -> EditorGhost {
+        EditorGhost {
+            offset: 14,
+            line: 0,
+            col: 14,
+            text: "orders WHERE id = 1".to_string(),
+            kept: None,
+            remembered,
+        }
+    }
+
+    /// A reasoned ghost takes an empty word's place; a remembered one leaves
+    /// the list that opens there to open; nothing displaces a typed word.
+    #[test]
+    fn only_a_reasoned_ghost_displaces_the_list() {
+        assert!(ghost_displaces_the_list(Some(&ghost(false)), ""));
+        assert!(!ghost_displaces_the_list(Some(&ghost(true)), ""));
+        assert!(!ghost_displaces_the_list(Some(&ghost(false)), "or"));
+        assert!(!ghost_displaces_the_list(None, ""));
     }
 }
 

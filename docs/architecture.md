@@ -22437,20 +22437,40 @@ existing prose was left alone.
     squiggled — and **merged** into a same-named table's entries rather than written over them,
     as the diagnostics catalogue does (`a_synonym_is_offered_its_resolved_tables_columns`,
     S4.2-L1-05, red before).
-    **The inline prediction is asked before the popup, and outranks it on an empty word.**
+    **The inline prediction is asked before the popup, and a reasoned one outranks it on an empty
+    word.**
     `recompute_completions` asks `prediction_at` — `intel::predict` over the *offer* catalogue
     (`build_offer_catalog`), the one the FK join row reads, so a hidden database is no more predicted
     from than offered — and publishes the answer through `inline_diff::set_ghost` **before either
     one-shot can return**. `suppress` is set by an accept, and the next prediction is wanted
     straight after one: Tab on a `BY ` ghost leaves `GROUP BY `, whose grouping columns are the next
     thing to offer, so a ghost asked after the one-shot would break that chain at its second link.
-    **Where `predict` has nothing, `prediction_at` asks `intel::predict_from_history`** over this
-    connection's runs (`HistoryEntry::conn_id == ctx.conn_id`), newest first, leaving out
-    `Outcome::Failed` ones — a statement the server refused is not one to offer again; an `Unknown`
-    run, cancelled or still going, is offered. The log arrives as `CompletionCtx::history`
+    **Where `predict` has nothing, `prediction_at` asks `intel::predict_from_history`** over the
+    runs `recallable` keeps, newest first: this connection's (`HistoryEntry::conn_id ==
+    ctx.conn_id`), leaving out `Outcome::Failed` ones — a statement the server refused is not one
+    to offer again; an `Unknown` run, cancelled or still going, is offered — and, where both the
+    run's `HistoryEntry::database` and the tab's active database are known, only a run in that
+    database, compared case-insensitively. The connection alone let a statement run in one
+    database be offered in another; where either side is unknown the run is kept
+    (`a_run_is_remembered_only_where_it_ran`, red against a stub of the old filter). The log
+    arrives as `CompletionCtx::history`
     (`ui.history.entries`, every connection's, through `QueryPaneParams::history`), so a statement
     `history::push` declined to record for carrying a credential is never offered either.
+    **Which of the two answers, and whether it is shown at all, is `pick_prediction`'s** — the
+    reasoned one, else the remembered one, flagged as such — and **neither when it holds a line
+    break**. `InlineDiffDoc::ghost_on` never drew one, but it was published all the same, so Tab
+    still inserted it, Escape was spent on it and the popup was held shut for it: an offer nobody
+    could see, which a `GROUP BY` list whose expression holds a string literal with a real newline
+    produced (`a_prediction_is_shown_only_if_it_can_be_drawn`, red before).
     A forced recompute (Ctrl+Space) asks for the list, so it shows no ghost beside it.
+    **Nor is a ghost asked anywhere but a lone caret** — `lone_caret`, the cursor's offset only
+    when it is one caret with nothing selected: Normal mode's offset, Insert mode's one caret
+    region, never Visual. A ghost used to be asked at `cursor.offset()`, which with several carets
+    is the last-inserted region's, and taking it there collapsed the rest; and an edit that left a
+    selection — Tab indenting a block — got a ghost at the selection's end, which the next Tab,
+    meant to indent again, inserted, dropping the selection (`a_ghost_sits_only_at_a_lone_caret`,
+    red before). `lone_caret` is also what both keys and the clearing effect read (under
+    `editor_pane.rs`), so the three cannot disagree about which caret a ghost belongs to.
     **The rest of a prediction taken a word at a time is kept, not asked for again**: a ghost
     `keeps_ghost` accepts is published as it stands, ahead of `prediction_at`, because
     asked at the new caret the words already taken often predict nothing — after
@@ -22461,12 +22481,25 @@ existing prose was left alone.
     `a_kept_rest_is_dropped_once_the_text_or_the_caret_changes` was red against the offset-only
     rule). A forced recompute still shows none, and
     any caret move still clears it (under `editor_pane.rs`). `ghost_at` is the one place an
-    `EditorGhost` is built, with its line and column, for `prediction_at` and that key alike.
-    With the word at the caret empty and a ghost showing, the popup does not open: that is the slot `auto_show`
-    (columns after `WHERE`/`ON`/`BY`) and the FK join row used to take, and two offers at one caret
-    would leave Tab meaning whichever happened to be open. The table list `auto_show` opens after
-    `JOIN ` yields the same way, so where the whole join is predicted it waits for a typed letter.
-    Ctrl+Space still brings the list, join row included. `CompletionCtx::predictions` is the switch, from the `editor_predictions` setting, for both kinds of ghost.
+    `EditorGhost` is built, with its line and column, for `prediction_at` and that key alike; the
+    rest Ctrl+→ keeps carries on the `remembered` flag of the ghost it was cut from.
+    **Only a reasoned ghost takes the empty word's place** (`ghost_displaces_the_list`). With the
+    word at the caret empty and an `intel::predict` ghost showing, the popup does not open: that is
+    a slot the list opens on its own guesses — `auto_show`'s columns after
+    `WHERE`/`ON`/`BY`/`SET`/`HAVING`/`SELECT` and tables after `FROM`/`JOIN`/`INTO`, and the FK
+    join row — and two offers at one caret would leave Tab meaning whichever happened to be open.
+    So where the whole join is predicted, the table list after `JOIN ` waits for a typed letter.
+    **A remembered ghost does not displace the list**: it is one past statement, and letting it
+    take the slot made the table list after `FROM ` and the columns after `WHERE ` stop opening by
+    themselves once any `SELECT * FROM x …` had run. Where the list then opens — the FK join row or
+    the ranked list — the remembered ghost gives way instead (`give_way` clears it in the same
+    recompute), so the caret still carries one offer, not two
+    (`only_a_reasoned_ghost_displaces_the_list`, red against a stub of the old rule; where
+    `give_way` fires needs a live `Editor` and is not unit-tested). Ctrl+Space still brings the list,
+    join row included. `CompletionCtx::predictions` carries the `editor_predictions` setting into
+    the *asking*, for both kinds of ghost, and is read only there — it is not the switch on its
+    own: a ghost already drawn when the setting goes off is cleared by an effect under
+    `editor_pane.rs`, where before it stayed and Tab still took it until the next edit.
   - `tabs.rs` — query-tab strip, and where a **`.sql`-backed tab** shows itself. The state behind
     that is four signals on `Tab`: `path`, `disk_sql` (the file's text as of the last open / save /
     reload — `None` means *unknown*, which reads as modified, the safe direction), `file_format`
@@ -22970,9 +23003,14 @@ existing prose was left alone.
     held every occurrence: the screen read as though the replace had happened.
     **Tab takes the inline prediction ahead of the soft-tab indent, on `ghost_takes_tab`'s terms**
     (`ghost_key_tests`): a plain Tab — no Shift, no primary modifier — with the list closed, since an
-    open list owns Tab, and the caret still at the offset the ghost was made for. Anything else falls
-    through to the indent. The insert goes through `edit_untyped`, so the Ctrl+K freeze holds and
-    `suppress` keeps the popup from reopening over the inserted words, and the caret is put after
+    open list owns Tab, and `completion::lone_caret` still answering the offset the ghost was made
+    for (`ghost_at.is_some() && ghost_at == caret`, the caret being `lone_caret`'s `Option`).
+    Anything else falls through to the indent. With several carets or a selection there is no lone
+    caret, so Tab indents and Ctrl+→ moves every caret
+    (`no_lone_caret_leaves_both_keys_to_what_they_always_did`): both keys used to compare
+    `cursor.offset()`, the last-inserted region, so a ghost was inserted at one caret of several
+    and `set_offset` collapsed the rest. The insert goes through `edit_untyped`, so the Ctrl+K
+    freeze holds and `suppress` keeps the popup from reopening over the inserted words, and the caret is put after
     them; a refused insert still spends the key. **Ctrl+→ (Cmd+→ on macOS) takes one word of it**,
     on `ghost_takes_word`'s terms — Tab's, but with `primary_held` rather than without it, so
     Shift+primary+→ still selects by word and a plain → still moves
@@ -22982,11 +23020,22 @@ existing prose was left alone.
     as a `kept` ghost at the new caret, stamped with the document's length after the insert, and is
     **published last**, after every caret change the insert makes — so the effect that clears a
     ghost whose offset is not the caret never sees it at a stale one. Escape turns a ghost down as it
-    does the list and signature help, consuming the key only when one of the three was showing.
+    does the list and signature help, consuming the key only when one of the three was up — and a
+    ghost that is up is one `InlineDiffDoc::ghost_on` will draw outside a Ctrl+K preview, now that
+    `completion::pick_prediction` refuses a prediction holding a line break before it is
+    published; until then Escape could be spent on a ghost nobody could see.
     **A ghost lives only at the caret it was made for**: an effect on `ed.cursor` clears it the
-    moment the caret leaves that offset or a selection appears, so after a click elsewhere Tab
-    indents again; an edit moves the caret too, and the recompute it schedules asks again for the
-    new spot — or keeps the `kept` rest Ctrl+→ left there (under `completion.rs`).
+    moment `lone_caret` stops answering its offset — the caret leaves it, a selection appears or a
+    second caret is added — so after a click elsewhere Tab indents again; an edit moves the caret
+    too, and the recompute it schedules asks again for the new spot — or keeps the `kept` rest
+    Ctrl+→ left there (under `completion.rs`). It used to read `get_selection()`, which sees only
+    the first region, and so could not judge a cursor of several.
+    **Nor does a ghost outlive what it was made under**: a second effect, tracking `predictions`,
+    `active_conn`, `active_db` and `dialect`, clears it whenever one of them changes. The setting
+    was read untracked, and only when a ghost was asked for, so switching *Inline predictions* off
+    — or the tab moving to another connection, database or engine — left the ghost drawn, and Tab
+    still took it, until the next edit asked again. Like the cursor effect it lives in the view and
+    has no unit test.
     `QueryPaneParams::predictions` carries the setting in, and `QueryPaneParams::history` the run
     log a ghost remembers from (under `completion.rs`).
   - `inline_diff.rs` — the Ctrl+K suggestion rendered **in the editor's own line flow**: the lines
@@ -23080,7 +23129,10 @@ existing prose was left alone.
     `col`, so the per-line question floem asks on every relayout is a comparison rather than a walk
     of the rope; and `kept`, which on the rest of a prediction Ctrl+→ has taken words of holds the
     document's length once it did, so the next recompute keeps it rather than predicting afresh
-    while the caret and that length both stand (`keeps_ghost`, under `completion.rs`). It lives in a
+    while the caret and that length both stand (`keeps_ghost`, under `completion.rs`); and
+    `remembered`, set on a ghost `intel::predict_from_history` made rather than `intel::predict`,
+    which does not take the empty word's place from the list and gives way where it opens
+    (`ghost_displaces_the_list`, under `completion.rs`). It lives in a
     `GhostSignal` that `InlineDiffDoc::new` takes beside the preview.
     `phantom_text` draws it at the caret's column as a `PhantomTextKind::Completion` with
     `affinity: Some(CursorAffinity::Backward)` — floem's own rule for completion phantoms, which
@@ -23088,7 +23140,10 @@ existing prose was left alone.
     `GHOST_ALPHA` (0.45). **Not `theme::placeholder()`**: that was checked in the running app and
     was drawn but all but invisible on the current-line band. It is not drawn while a Ctrl+K view
     is up in either state, nor when its text holds a `\n` — and `has_multiline_phantom` does not
-    consult the ghost, so that refusal is what keeps its answer true. `set_ghost` is `set_preview`'s
+    consult the ghost, so that refusal is what keeps its answer true. Refusing to *draw* one was
+    not refusing to *offer* it: such a ghost was still published, so Tab inserted it and Escape was
+    spent on it, and `completion::pick_prediction` now drops it before it reaches the signal. The
+    refusal here stays, as the one `has_multiline_phantom` rests on. `set_ghost` is `set_preview`'s
     twin, `cache_rev` bump and early return included, and the early return matters at least as
     much here: `completion::recompute_completions` calls it on every recompute, so without the
     comparison an unchanged ghost would discard every cached line layout per keystroke. **The ghost
