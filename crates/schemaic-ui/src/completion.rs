@@ -741,7 +741,7 @@ fn recall(text: &str, offset: usize, ctx: &CompletionCtx<'_>) -> Option<String> 
         .with_untracked(|entries| {
             entries
                 .iter()
-                .filter(|e| recallable(e, ctx.conn_id, ctx.active_db))
+                .filter(|e| recallable(e, ctx.dialect, ctx.conn_id, ctx.active_db))
                 .find_map(|e| r.from(&e.sql))
         })
         .or_else(|| {
@@ -756,7 +756,7 @@ fn recall(text: &str, offset: usize, ctx: &CompletionCtx<'_>) -> Option<String> 
                 tabs.iter().find_map(|t| {
                     let conn = t.conn_id.try_get_untracked()?;
                     let db = t.database.try_get_untracked()?;
-                    if !same_place(conn, db.as_deref(), ctx.conn_id, ctx.active_db) {
+                    if !same_place(ctx.dialect, conn, db.as_deref(), ctx.conn_id, ctx.active_db) {
                         return None;
                     }
                     t.query.try_with_untracked(|q| q.and_then(|q| r.from(q)))
@@ -785,18 +785,32 @@ fn pick_prediction(
 /// run against the database the tab is in, where both say which.
 fn recallable(
     e: &schemaic_core::history::HistoryEntry,
+    dialect: SqlDialect,
     conn_id: u64,
     active_db: Option<&str>,
 ) -> bool {
     e.outcome != schemaic_core::history::Outcome::Failed
-        && same_place(e.conn_id, e.database.as_deref(), conn_id, active_db)
+        && same_place(
+            dialect,
+            e.conn_id,
+            e.database.as_deref(),
+            conn_id,
+            active_db,
+        )
 }
 
 /// Was a text written in this tab's place — its connection, and its database
-/// where both say which (compared ignoring ASCII case)?
-fn same_place(conn_id: u64, database: Option<&str>, here_conn: u64, here_db: Option<&str>) -> bool {
+/// where both say which, compared by the engine's case rule
+/// ([`schemaic_core::history::same_database`])?
+fn same_place(
+    dialect: SqlDialect,
+    conn_id: u64,
+    database: Option<&str>,
+    here_conn: u64,
+    here_db: Option<&str>,
+) -> bool {
     let same_db = match (database, here_db) {
-        (Some(there), Some(here)) => there.eq_ignore_ascii_case(here),
+        (Some(there), Some(here)) => schemaic_core::history::same_database(dialect, there, here),
         _ => true,
     };
     conn_id == here_conn && same_db
@@ -1693,11 +1707,16 @@ mod ghost_choice_tests {
     /// database where both say which.
     #[test]
     fn an_open_tab_is_remembered_from_only_in_the_same_place() {
-        assert!(same_place(1, Some("shop"), 1, Some("Shop")));
-        assert!(same_place(1, None, 1, Some("shop")));
-        assert!(same_place(1, Some("shop"), 1, None));
-        assert!(!same_place(2, Some("shop"), 1, Some("shop")));
-        assert!(!same_place(1, Some("archive"), 1, Some("shop")));
+        let ms = SqlDialect::MsSql;
+        assert!(same_place(ms, 1, Some("shop"), 1, Some("Shop")));
+        assert!(same_place(ms, 1, None, 1, Some("shop")));
+        assert!(same_place(ms, 1, Some("shop"), 1, None));
+        assert!(!same_place(ms, 2, Some("shop"), 1, Some("shop")));
+        assert!(!same_place(ms, 1, Some("archive"), 1, Some("shop")));
+        // PostgreSQL keeps `Shop` and `shop` as two databases.
+        let pg = SqlDialect::Postgres;
+        assert!(!same_place(pg, 1, Some("shop"), 1, Some("Shop")));
+        assert!(same_place(pg, 1, Some("shop"), 1, Some("shop")));
     }
 
     fn snippet(source: Source, scope: Scope) -> Snippet {
@@ -1804,30 +1823,31 @@ mod ghost_choice_tests {
     /// in the database it ran against — where both the run and the tab say.
     #[test]
     fn a_run_is_remembered_only_where_it_ran() {
-        assert!(recallable(
-            &run(1, Some("shop"), Outcome::Ok),
-            1,
-            Some("shop")
-        ));
-        assert!(recallable(
+        let ms = SqlDialect::MsSql;
+        let here = |e: &HistoryEntry, conn_id, db| recallable(e, ms, conn_id, db);
+        assert!(here(&run(1, Some("shop"), Outcome::Ok), 1, Some("shop")));
+        assert!(here(
             &run(1, Some("Shop"), Outcome::Unknown),
             1,
             Some("shop")
         ));
-        assert!(recallable(&run(1, None, Outcome::Ok), 1, Some("shop")));
-        assert!(recallable(&run(1, Some("shop"), Outcome::Ok), 1, None));
-        assert!(!recallable(
+        assert!(here(&run(1, None, Outcome::Ok), 1, Some("shop")));
+        assert!(here(&run(1, Some("shop"), Outcome::Ok), 1, None));
+        assert!(!here(
             &run(1, Some("archive"), Outcome::Ok),
             1,
             Some("shop")
         ));
-        assert!(!recallable(
-            &run(2, Some("shop"), Outcome::Ok),
+        assert!(!here(&run(2, Some("shop"), Outcome::Ok), 1, Some("shop")));
+        assert!(!here(
+            &run(1, Some("shop"), Outcome::Failed),
             1,
             Some("shop")
         ));
+        // By the engine's case rule: another database on PostgreSQL.
         assert!(!recallable(
-            &run(1, Some("shop"), Outcome::Failed),
+            &run(1, Some("Shop"), Outcome::Ok),
+            SqlDialect::Postgres,
             1,
             Some("shop")
         ));

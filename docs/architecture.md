@@ -8786,6 +8786,17 @@ existing prose was left alone.
     the comparison rather than into a `String` first — `max_height` and
     `clip()` bound *paint*, not layout, so a multi-MB `INSERT` was laid out whole on every rebuild
     of the panel, but clamping what is drawn must not become a decision about what is findable.
+    `same_database(dialect, a, b)` answers whether two database names one connection reported name
+    the same database, by the engine's own rule (`database_names_ignore_case`, an exhaustive match):
+    exact on PostgreSQL, which keeps `Sales` and `sales` apart, and on MySQL, which does so on a
+    case-sensitive file system and elsewhere lower-cases every name it lists, so the spellings
+    agree anyway; ASCII-case-insensitive on SQL Server and on SQLite's attached-schema names. It is
+    what the editor's remembered predictions ask before offering a run or an open tab from one
+    database in another (`same_place`, under `completion.rs`), where folding case on every engine
+    offered PostgreSQL's `Sales` statements in `sales`
+    (`database_names_compare_by_the_engines_case_rule`). The SQL Server arm is the *default*
+    collation's answer; nothing consults the server's own, so on one installed case-sensitive
+    the rule errs towards offering.
   - `health.rs` — connection health-poll policy: `tick(HealthCfg, TickCtx) -> Tick` decides
     ping-or-skip + the delay until the next tick (exponential `backoff` on consecutive failures,
     longer interval for SSH-tunnelled connections, skip while the window is unfocused / a query is
@@ -22770,16 +22781,20 @@ existing prose was left alone.
     (`HistoryEntry::conn_id == ctx.conn_id`), leaving out `Outcome::Failed` ones — a statement the
     server refused is not one to offer again; an `Unknown` run, cancelled or still going, is
     offered — and, where both the run's `HistoryEntry::database` and the tab's active database are
-    known, only a run in that database, compared case-insensitively. The connection alone let a
-    statement run in one database be offered in another; where either side is unknown the run is
-    kept. That rule is `same_place`, which the open tabs below go through too
+    known, only a run in that database, compared by the engine's own case rule
+    (`history::same_database`, under `history.rs`). The connection alone let a statement run in
+    one database be offered in another; where either side is unknown the run is kept. That rule is
+    `same_place`, which the open tabs below go through too
     (`a_run_is_remembered_only_where_it_ran`, red against a stub of the old filter, and asking it
-    through `same_place` since). The log arrives as `CompletionCtx::history`
-    (`ui.history.entries`, every connection's, through `QueryPaneParams::history`). **A statement
-    carrying a credential is offered from none of the three sources**, and not because
-    `history::push` declined to record it: this passage once said so, while the snippets and tabs
-    below — which `push` never sees — were read as typed and ghosted a password. The gate is
-    `Recall::from`'s own, asked of any text (under `intel.rs`).
+    through `same_place` since). Both take the dialect for it: they used to compare with
+    `eq_ignore_ascii_case` on every engine, which on PostgreSQL — where `Sales` and `sales` are two
+    databases — offered one's statements in the other
+    (`an_open_tab_is_remembered_from_only_in_the_same_place`). The log arrives as
+    `CompletionCtx::history` (`ui.history.entries`, every connection's, through
+    `QueryPaneParams::history`). **A statement carrying a credential is offered from none of the
+    three sources**, and not because `history::push` declined to record it: this passage once said
+    so, while the snippets and tabs below — which `push` never sees — were read as typed and
+    ghosted a password. The gate is `Recall::from`'s own, asked of any text (under `intel.rs`).
     **Then the user's own snippets that apply here** (`snippet_recallable`, over
     `CompletionCtx::snippets`): `Source::User` alone — a built-in is a template nobody wrote, not a
     statement anyone ran — and only where `snippet::applies`, so one scoped to another connection

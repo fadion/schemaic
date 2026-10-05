@@ -472,6 +472,31 @@ pub fn remove(entries: &mut Vec<HistoryEntry>, conn_id: u64, sql: &str) -> bool 
     entries.len() != before
 }
 
+/// Do two database names one connection reported name the same database, by
+/// the engine's own rule for telling them apart?
+///
+/// PostgreSQL keeps `Sales` and `sales` as two databases, and so does MySQL on
+/// a case-sensitive file system (and where it is not, it lower-cases every name
+/// it lists, so the spellings agree anyway): exact. SQL Server's default
+/// collation and SQLite's attached-schema names ignore case: `Sales` is
+/// `sales`. Recall asks it before offering a line run in one database to a tab
+/// in another — folding case on PostgreSQL offered `Sales`' statements in `sales`.
+pub fn same_database(dialect: SqlDialect, a: &str, b: &str) -> bool {
+    if database_names_ignore_case(dialect) {
+        a.eq_ignore_ascii_case(b)
+    } else {
+        a == b
+    }
+}
+
+/// Does this engine treat database names alike that differ only in case?
+fn database_names_ignore_case(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MsSql | SqlDialect::Sqlite => true,
+        SqlDialect::Postgres | SqlDialect::MySql => false,
+    }
+}
+
 /// How many entries [`clear_conn`] would delete for `conn_id`.
 ///
 /// This exists so the confirmation modal's count and the deletion itself can't
@@ -666,6 +691,20 @@ mod tests {
             rows: None,
             rows_capped: false,
             outcome: Outcome::Unknown,
+        }
+    }
+
+    /// PostgreSQL and MySQL keep two databases apart by case; SQL Server and
+    /// SQLite read them as one.
+    #[test]
+    fn database_names_compare_by_the_engines_case_rule() {
+        assert!(!same_database(SqlDialect::Postgres, "Sales", "sales"));
+        assert!(!same_database(SqlDialect::MySql, "Sales", "sales"));
+        assert!(same_database(SqlDialect::MsSql, "Sales", "sales"));
+        assert!(same_database(SqlDialect::Sqlite, "Main", "main"));
+        for dialect in SqlDialect::ALL {
+            assert!(same_database(dialect, "sales", "sales"), "{dialect:?}");
+            assert!(!same_database(dialect, "sales", "orders"), "{dialect:?}");
         }
     }
 
