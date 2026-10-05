@@ -202,6 +202,36 @@ pub fn move_line(text: &str, sel_start: usize, sel_end: usize, up: bool) -> Opti
     })
 }
 
+/// Ctrl+D's duplicate: the line(s) spanned by `[sel_start, sel_end]` copied onto
+/// fresh lines below them. Returns `(at, insert, sel)` — insert `insert` at
+/// `at` (the end of the last spanned line, before its newline) and reapply
+/// `sel`, the same selection or caret on the copy.
+///
+/// The copy is `\n` + the lines rather than the lines + `\n`, so the newline-less
+/// last line duplicates onto a line of its own. Floem's `DuplicateLineDown`
+/// slices `line_start..next_line_start`, which on that line holds no `\n`, and
+/// the copy landed on the same line — `SELECT 1SELECT 1`. A selection ending
+/// exactly at a line's start does not pull that line in, as in [`move_line`].
+pub fn duplicate_lines(
+    text: &str,
+    sel_start: usize,
+    sel_end: usize,
+) -> (usize, String, (usize, usize)) {
+    let len = text.len();
+    let lo = sel_start.min(sel_end).min(len);
+    let hi = sel_start.max(sel_end).min(len);
+    let starts = line_start_offsets(text);
+    let first = line_index_of(&starts, lo);
+    let mut last = line_index_of(&starts, hi);
+    if last > first && hi == starts[last] {
+        last -= 1;
+    }
+    let ls = starts[first];
+    let le = starts.get(last + 1).map_or(len, |&next| next - 1);
+    let shift = le - ls + 1;
+    (le, format!("\n{}", &text[ls..le]), (lo + shift, hi + shift))
+}
+
 /// Byte offsets of every (non-overlapping) ASCII-case-insensitive occurrence of
 /// `needle` in `hay`. Offsets index into `hay` directly (the search is byte-wise
 /// and boundary-checked, so no `to_lowercase` reallocation shifts them). Empty
@@ -1241,6 +1271,44 @@ mod tests {
         let out = soft_tab_outdent(&indented, ind.sel.0, ind.sel.1, 4);
         assert_eq!(out.text, "x");
         assert_eq!(out.sel, (0, 0));
+    }
+
+    // --- duplicate_lines ---------------------------------------------------
+
+    /// Apply a [`duplicate_lines`] result: the new text, and the text the
+    /// returned selection covers in it.
+    fn duplicated(text: &str, a: usize, b: usize) -> (String, String) {
+        let (at, insert, (lo, hi)) = duplicate_lines(text, a, b);
+        let mut out = text.to_string();
+        out.insert_str(at, &insert);
+        let sel = out[lo..hi].to_string();
+        (out, sel)
+    }
+
+    /// The newline-less last line duplicates onto a line of its own, with a
+    /// selection or a caret, and the selection follows onto the copy.
+    #[test]
+    fn duplicating_the_last_line_makes_a_new_line() {
+        let text = "SELECT 1;\nSELECT 2";
+        // `SELECT` selected on the last line.
+        assert_eq!(
+            duplicated(text, 10, 16),
+            (
+                "SELECT 1;\nSELECT 2\nSELECT 2".to_string(),
+                "SELECT".to_string()
+            )
+        );
+        // A caret keeps its column on the copy.
+        let (at, insert, sel) = duplicate_lines(text, 13, 13);
+        assert_eq!((at, insert.as_str(), sel), (18, "\nSELECT 2", (22, 22)));
+        // A selection over both lines copies both, below the second.
+        assert_eq!(
+            duplicated(text, 2, 12).0,
+            "SELECT 1;\nSELECT 2\nSELECT 1;\nSELECT 2"
+        );
+        // One ending at a line's start leaves that line out.
+        assert_eq!(duplicated(text, 0, 10).0, "SELECT 1;\nSELECT 1;\nSELECT 2");
+        assert_eq!(duplicated("", 0, 0).0, "\n");
     }
 
     // --- move_line ---------------------------------------------------------

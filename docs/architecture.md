@@ -11733,6 +11733,9 @@ existing prose was left alone.
       both.
   - `text_ops.rs` — Ctrl+/ `toggle_line_comment` + `find_matches`/`replace_all`/
     `contains_ignore_ascii_case` (find bars). Pure, ASCII-case-insensitive, byte-offset-preserving.
+    `duplicate_lines` is Ctrl+D's: the spanned lines copied as `\n` + lines at the end of the last
+    one, so the newline-less last line gets a line of its own, with the selection or caret moved
+    onto the copy (`duplicating_the_last_line_makes_a_new_line`).
     **`contains_collapsed_ignore_ascii_case` is the same search against a haystack read *as if* its
     whitespace runs were collapsed, without building the collapsed string** — exactly
     `split_whitespace().collect::<Vec<_>>().join(" ")`, which is what it replaces. The two search
@@ -31851,7 +31854,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   **The answer to the second half is a funnel: `editor_pane::edit_untyped`.** Every programmatic
   edit in that pane goes through it, it asks `read_only` itself and it **refuses** — it answers
   `bool` rather than looking and proceeding. That one check replaced nine missing ones: the preview
-  holds the keyboard while it is up, so Ctrl+/, Alt+Up, Tab, Ctrl+D on a bare caret, Ctrl+Alt+L, the
+  holds the keyboard while it is up, so Ctrl+/, Alt+Up, Tab, Ctrl+D (caret or selection — both go
+  through `text_ops::duplicate_lines` now, floem's `DuplicateLineDown` having put the newline-less
+  last line's copy on the same line), Ctrl+Alt+L, the
   paired Backspace, the find bar's Replace and the snippet library all reached the document through
   it, each moving every byte after the caret while `cmdk.start`/`end` stayed put — so Accept spliced
   the approved suggestion into the middle of a different token. `edit_untyped_frozen` is the one

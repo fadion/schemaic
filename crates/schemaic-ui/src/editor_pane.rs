@@ -2960,46 +2960,32 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 return CommandExecuted::Yes;
             }
             if c.eq_ignore_ascii_case("d") {
+                // The spanned line(s) — the caret's, or a selection's — copied
+                // onto fresh lines below, by `text_ops::duplicate_lines` rather
+                // than floem's `DuplicateLineDown`, which on the newline-less
+                // last line put the copy on the same line.
                 editor_sig.with_untracked(|e| {
-                    let has_sel = e
-                        .cursor
-                        .get_untracked()
-                        .get_selection()
-                        .is_some_and(|(a, b)| a != b);
-                    if has_sel {
-                        // Selection: duplicate the spanned line(s) (Floem default).
-                        e.doc().run_command(
-                            e,
-                            &Command::Edit(EditCommand::DuplicateLineDown),
-                            Some(1),
-                            mods,
-                        );
-                    } else {
-                        // Bare caret: copy the whole current line onto a fresh line
-                        // below. Done manually because Floem's DuplicateLineDown
-                        // slices `line_start..next_line_start`, so on a line with no
-                        // trailing newline (the last line) the copy has no `\n` and
-                        // lands on the *same* line. Prepending `\n` guarantees a new
-                        // line below regardless.
-                        let doc = e.doc();
-                        let full = doc.text().to_string();
-                        let off = e.cursor.get_untracked().offset();
-                        let ls = full[..off].rfind('\n').map(|i| i + 1).unwrap_or(0);
-                        let le = full[off..]
-                            .find('\n')
-                            .map(|i| off + i)
-                            .unwrap_or(full.len());
-                        let insert = format!("\n{}", &full[ls..le]);
-                        edit_untyped(
-                            e,
-                            comp,
-                            Selection::region(le, le),
-                            &insert,
-                            EditType::InsertChars,
-                        );
-                        // Keep the caret at the same column on the duplicated line.
-                        let new_caret = le + 1 + (off - ls);
-                        e.cursor.update(|c| c.set_offset(new_caret, false, false));
+                    let cur = e.cursor.get_untracked();
+                    let off = cur.offset();
+                    let (a, b) = cur.get_selection().unwrap_or((off, off));
+                    let full = e.doc().text().to_string();
+                    let (at, insert, (lo, hi)) =
+                        schemaic_core::text_ops::duplicate_lines(&full, a, b);
+                    if edit_untyped(
+                        e,
+                        comp,
+                        Selection::region(at, at),
+                        &insert,
+                        EditType::InsertChars,
+                    ) {
+                        // The same selection or caret, on the copy.
+                        e.cursor.update(|c| {
+                            if lo == hi {
+                                c.set_offset(lo, false, false);
+                            } else {
+                                c.set_insert(Selection::region(lo, hi));
+                            }
+                        });
                     }
                 });
                 return CommandExecuted::Yes;
