@@ -12562,7 +12562,7 @@ fn is_real_statement(stmt: &sqlparser::ast::Statement) -> bool {
 /// verbatim when the user presses Tab — or `None` when nothing is certain
 /// enough to offer.
 ///
-/// **Deterministic, and only where the answer is close to certain.** Nine
+/// **Deterministic, and only where the answer is close to certain.** Ten
 /// producers, asked in this order, each answering only its own shape:
 ///
 /// - an empty `JOIN … ON` → the foreign-key condition, where one key decides
@@ -12570,6 +12570,9 @@ fn is_real_statement(stmt: &sqlparser::ast::Statement) -> bool {
 /// - `INSERT INTO t (` → `t`'s columns and the closing paren;
 /// - `REFERENCES t (`, `ON CONFLICT (`, `USING (` → the key the schema says
 ///   goes there ([`paren_contents`]);
+/// - `ON DUPLICATE KEY UPDATE `, `ON CONFLICT (k) DO UPDATE SET ` → each
+///   column the `INSERT` writes, set from the row it tried to insert
+///   ([`upsert_assignments`]);
 /// - `GROUP BY ` → the projection's non-aggregated expressions, read off the
 ///   parsed statement in front of it;
 /// - an empty `JOIN ` → the one table a foreign key reaches, with its `ON`
@@ -12627,6 +12630,7 @@ pub fn predict(sql: &str, caret: usize, catalog: &Catalog, dialect: SqlDialect) 
     let guess = on_condition_guess(sql, (lo, hi, caret), catalog, dialect)
         .or_else(|| insert_columns(&toks, catalog, dialect, closed))
         .or_else(|| paren_contents(sql, (lo, hi, caret), &toks, catalog, dialect, closed))
+        .or_else(|| upsert_assignments(&toks, catalog, dialect))
         .or_else(|| group_by_items(sql, lo, &toks, dialect))
         .or_else(|| join_target_guess(sql, (lo, hi, caret), &toks, catalog, dialect))
         .or_else(|| join_on_guess(sql, (lo, hi, caret), &toks, catalog, dialect))
@@ -14426,6 +14430,102 @@ fn conflict_key(
         }
     }
     column_list(&key, dialect, closed)
+}
+
+/// [`predict`]'s upsert producer: the update list of an `INSERT` that updates
+/// on a clash — every column the `INSERT` writes (its column list, else the
+/// table's [`Catalog::insert_columns_of`]) set from the row it tried to
+/// insert, less the ones that identify the row.
+///
+/// - MySQL's `ON DUPLICATE KEY UPDATE ` → `a = VALUES(a), …`, less the
+///   primary key ([`Catalog::key_columns_of`], where known) — or `a =
+///   new.a` when MySQL 8's row alias (`VALUES (…) AS new`) is written.
+///   `VALUES()` is MariaDB's only spelling and still MySQL 8's, deprecated.
+/// - PostgreSQL's and SQLite's `ON CONFLICT (k) DO UPDATE SET ` → `a =
+///   EXCLUDED.a, …`, less the conflict target (the key, where it is named
+///   by constraint).
+///
+/// `None` when nothing is left to set, or the table is not known as one table
+/// (whose key could then not be told apart), column list or no.
+fn upsert_assignments(toks: &[Token], catalog: &Catalog, dialect: SqlDialect) -> Option<String> {
+    let word = |t: &Token| bare_upper(t);
+    let n = toks.len();
+    let is = |i: usize, kw: &str| toks.get(i).and_then(word).as_deref() == Some(kw);
+    let mysql = n >= 4
+        && is(n - 4, "ON")
+        && is(n - 3, "DUPLICATE")
+        && is(n - 2, "KEY")
+        && is(n - 1, "UPDATE");
+    let conflict = n >= 3 && is(n - 3, "DO") && is(n - 2, "UPDATE") && is(n - 1, "SET");
+    if !(mysql || conflict) {
+        return None;
+    }
+    let TkKind::Word(kw) = &toks[n - 1].kind else {
+        return None;
+    };
+    let (target, after) = insert_target(toks, dialect)?;
+    let r = catalog.resolve_located(&target)?;
+    let words_in_parens = |from: usize| -> Vec<String> {
+        toks[from + 1..]
+            .iter()
+            .take_while(|t| !matches!(t.kind, TkKind::RParen))
+            .filter_map(|t| match &t.kind {
+                TkKind::Word(w) => Some(w.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    // Asked even with a column list: a table the catalogue does not know, or
+    // a name two tables share, has no key it can subtract.
+    let table_columns = catalog.insert_columns_of(&r)?;
+    let written: Vec<String> = if matches!(toks.get(after).map(|t| &t.kind), Some(TkKind::LParen)) {
+        words_in_parens(after)
+    } else {
+        table_columns.into_iter().cloned().collect()
+    };
+    // What identifies the row: a conflict target's own list, else the key.
+    let conflict_list = toks
+        .iter()
+        .position(|t| word(t).as_deref() == Some("CONFLICT"))
+        .filter(|&c| matches!(toks.get(c + 1).map(|t| &t.kind), Some(TkKind::LParen)))
+        .map(|c| words_in_parens(c + 1));
+    let identifying: Vec<String> = match conflict_list {
+        Some(list) if conflict => list,
+        _ => catalog
+            .key_columns_of(&r)
+            .map(|k| k.into_iter().cloned().collect())
+            .unwrap_or_default(),
+    };
+    let set: Vec<&String> = written
+        .iter()
+        .filter(|c| !identifying.iter().any(|k| k.eq_ignore_ascii_case(c)))
+        .collect();
+    if set.is_empty() {
+        return None;
+    }
+    // MySQL 8's `VALUES (…) AS new` names the row it would have inserted.
+    let row_alias = mysql
+        .then(|| n.checked_sub(6))
+        .flatten()
+        .filter(|&i| is(i, "AS"))
+        .and_then(|i| match &toks[i + 1].kind {
+            TkKind::Word(a) => Some(a.clone()),
+            _ => None,
+        });
+    let source = |col: &str| match (&row_alias, conflict) {
+        (Some(alias), _) => format!("{alias}.{col}"),
+        (None, true) => format!("{}.{col}", in_typed_case("EXCLUDED", kw)),
+        (None, false) => format!("{}({col})", in_typed_case("VALUES", kw)),
+    };
+    Some(
+        set.iter()
+            .map(|c| {
+                let col = crate::export::ident_if_needed(c, dialect);
+                format!("{col} = {}", source(&col))
+            })
+            .collect::<Vec<_>>()
+            .join(", "),
+    )
 }
 
 /// The aggregates a `GROUP BY` prediction leaves out of the grouping list —
@@ -16417,6 +16517,80 @@ mod predict_tests {
                 "SELECT * FROM orders ORDER BY id FETCH FIRST 5 ",
                 SqlDialect::Sqlite
             ),
+            None
+        );
+    }
+
+    /// An upsert's update list is the columns the `INSERT` writes, less its
+    /// key: MySQL's `ON DUPLICATE KEY UPDATE` sets each from `VALUES(…)` —
+    /// or from MySQL 8's row alias, where one is written — and PostgreSQL's
+    /// and SQLite's `ON CONFLICT (…) DO UPDATE SET` from `EXCLUDED`, less the
+    /// conflict target.
+    #[test]
+    fn an_upsert_predicts_its_assignments() {
+        let my = |sql: &str| keyed_at(sql, SqlDialect::MySql);
+        let pg = |sql: &str| keyed_at(sql, SqlDialect::Postgres);
+        assert_eq!(
+            my("INSERT INTO customers (id, name) VALUES (1, 'a') ON DUPLICATE KEY UPDATE ")
+                .as_deref(),
+            Some("name = VALUES(name)")
+        );
+        assert_eq!(
+            my("INSERT INTO customers VALUES (1, 'a') ON DUPLICATE KEY UPDATE ").as_deref(),
+            Some("name = VALUES(name)")
+        );
+        assert_eq!(
+            my("INSERT INTO customers (id, name) VALUES (1, 'a') AS new ON DUPLICATE KEY UPDATE ")
+                .as_deref(),
+            Some("name = new.name")
+        );
+        assert_eq!(
+            my("insert into orders (id, customer_id, total) values (1, 2, 3) on duplicate key update ")
+                .as_deref(),
+            Some("customer_id = values(customer_id), total = values(total)")
+        );
+        assert_eq!(
+            pg("INSERT INTO customers (id, name) VALUES (1, 'a') ON CONFLICT (id) DO UPDATE SET ")
+                .as_deref(),
+            Some("name = EXCLUDED.name")
+        );
+        assert_eq!(
+            keyed_at(
+                "insert into customers (id, name) values (1, 'a') on conflict (id) do update set ",
+                SqlDialect::Sqlite
+            )
+            .as_deref(),
+            Some("name = excluded.name")
+        );
+    }
+
+    /// Nothing left to set, an assignment already begun, or a table the
+    /// catalogue does not know: no list.
+    #[test]
+    fn an_upsert_predicts_no_assignment_it_cannot_list() {
+        let my = |sql: &str| keyed_at(sql, SqlDialect::MySql);
+        let pg = |sql: &str| keyed_at(sql, SqlDialect::Postgres);
+        assert_eq!(
+            my("INSERT INTO customers (id) VALUES (1) ON DUPLICATE KEY UPDATE "),
+            None
+        );
+        assert_eq!(
+            pg(
+                "INSERT INTO customers (id, name) VALUES (1, 'a') ON CONFLICT (id) DO UPDATE SET name = "
+            ),
+            None
+        );
+        assert_eq!(
+            my("INSERT INTO nowhere VALUES (1) ON DUPLICATE KEY UPDATE "),
+            None
+        );
+        // Unknown, its key is unknown too, and would be assigned with the rest.
+        assert_eq!(
+            my("INSERT INTO nowhere (id, a) VALUES (1, 2) ON DUPLICATE KEY UPDATE "),
+            None
+        );
+        assert_eq!(
+            pg("INSERT INTO customers (id, name) VALUES (1, 'a') ON CONFLICT (id) DO NOTHING "),
             None
         );
     }

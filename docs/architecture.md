@@ -1771,13 +1771,14 @@ existing prose was left alone.
     `noise_in_the_middle_is_not_stitched_around` pins, and it is the reason the guard exists. The
     cost is deliberate: a valid statement this parser cannot handle is refused rather than shown.
     **`predict` is the editor's inline ghost — deterministic, not AI, and offered only where the
-    answer is close to certain.** It returns the text Tab would insert at the caret, from nine
+    answer is close to certain.** It returns the text Tab would insert at the caret, from ten
     producers asked in order, each answering only its own shape: an empty `JOIN … ON` gets the
     foreign-key predicate (`on_condition_guess`, below); `INSERT`/`REPLACE … INTO t (` (its target read as the
     engine writes it, below) gets the columns an `INSERT` writes, from `Catalog::insert_columns_of`, quoted through
     `export::ident_if_needed` like every fragment above, plus a `)` unless one already follows
     (`column_list`); a `(` whose contents the schema fixes — `REFERENCES t (`, `ON CONFLICT (`,
-    `USING (` — gets them (`paren_contents`, below);
+    `USING (` — gets them (`paren_contents`, below); `ON DUPLICATE KEY UPDATE ` and
+    `ON CONFLICT (k) DO UPDATE SET ` get the update list (`upsert_assignments`, below);
     `GROUP BY ` gets the grouping list; an empty `JOIN ` gets the whole join, `table ON condition`
     (`join_target_guess`); `JOIN t alias ` gets `ON` and the condition (`join_on_guess`); a
     keyword whose partner the grammar fixes gets the partner (`ORDER`/`GROUP`/`PARTITION` → `BY`,
@@ -2090,6 +2091,31 @@ existing prose was left alone.
     (`references_predicts_the_referenced_tables_key`,
     `on_conflict_predicts_the_key_the_insert_writes`,
     `using_predicts_a_key_named_alike_on_both_sides`).
+    **An upsert's update list is every column the `INSERT` writes, set from the row it tried to
+    insert, less what identifies the row.** `upsert_assignments`, asked right after
+    `paren_contents`, answers only with the update word last — MySQL/MariaDB's
+    `… ON DUPLICATE KEY UPDATE ` (the word `keyword_partner` offers after a hand-typed
+    `ON DUPLICATE KEY`) and PostgreSQL/SQLite's `… ON CONFLICT (k) DO UPDATE SET ` — and reads the
+    columns off the `INSERT`'s column list, else the table's `Catalog::insert_columns_of`, each
+    quoted through `export::ident_if_needed`. MySQL's arm writes `a = VALUES(a), b = VALUES(b)`, or
+    `a = new.a` where MySQL 8's row alias (`VALUES (…) AS new ON DUPLICATE KEY UPDATE`) is written.
+    `VALUES()` is the default because it is MariaDB's only spelling and MySQL 8 still accepts it,
+    though deprecated; the alias is MySQL 8's alone. The conflict arm writes `a = EXCLUDED.a`. Both
+    write `VALUES`/`EXCLUDED` in the case `UPDATE`/`SET` was typed (`in_typed_case`). What
+    identifies the row is the conflict target's own list where there is one, else — MySQL, or a
+    target named `ON CONSTRAINT` — the primary key through `Catalog::key_columns_of`. **That key is
+    subtracted only where known**: with none declared, or a name `pk_shared` refuses, nothing is,
+    so a key in the column list is assigned like any other column. Nor does MySQL's arm leave out
+    a unique key other than the primary one, which also fires `ON DUPLICATE KEY` — the catalogue
+    does not record those (`conflict_key`'s limit, above). It predicts nothing when nothing is left
+    to set (an `INSERT` of the key alone); when the update word is not last — an assignment
+    already begun, a `DO NOTHING`; or when `insert_columns_of` cannot name the table's columns —
+    a table it does not know, or a name two tables share with different columns (`is_union`) —
+    **column list or no**: such a table's key could not be told apart, and an `INSERT INTO
+    nowhere (id, a)` got `id = VALUES(id)` with the rest until the catalogue was asked on that path
+    too. The shapes are
+    matched on the text, not the dialect (`an_upsert_predicts_its_assignments`, red before;
+    `an_upsert_predicts_no_assignment_it_cannot_list`, the refusals).
     **An operand's partner waits for the operand to be finished.** `operand_partner` answers where
     what has just been written is a construct's operand and the next word is fixed, each in the
     case its keyword was typed: `BETWEEN x ` → `AND` (`between_and`, once `x` is finished at
