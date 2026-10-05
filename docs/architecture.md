@@ -1776,7 +1776,8 @@ existing prose was left alone.
     caret's line is whitespace and `)` — the editor auto-pairs a `(`, so `INSERT INTO t (|)` has a
     closer nobody wrote — and at most the statement's own closing `;`, which going back into a
     finished statement always leaves after the caret (`ORDER |;`), though a second statement after
-    it on the line still refuses (`a_statements_own_semicolon_after_the_caret_still_predicts`); the
+    it on the line still refuses (`a_statements_own_semicolon_after_the_caret_still_predicts`), or
+    is the next clause, apart from the caret (below); the
     character before the caret is whitespace or `(`; and the word it would offer is not the one the
     statement already has next (editing `ORDER |` above an existing `BY` offers no second one).
     That word is compared whole: a non-ASCII character never ends it, where casting each `char` to
@@ -1791,7 +1792,22 @@ existing prose was left alone.
     It also refuses a caret in a string, comment or quoted name, and
     that is `caret_touches_noncode` walking only the text *before* the caret through `skip_noncode`,
     so an unterminated quote or a line comment running up to the caret counts as the caret being
-    inside one — the one boundary lexer, not a new scanner. Each keyword guard is a place the bare
+    inside one — the one boundary lexer, not a new scanner.
+    **Mid-line, a ghost goes only in front of the next clause.** `starts_a_clause` wants whitespace
+    straight after the caret, then a whole word from `CLAUSE_OPENERS` (`FROM`, `WHERE`, `ORDER`,
+    `LIMIT`, the join words, `ON`, `USING`, `SET`, `VALUES`, `INTO`, …): `ORDER | LIMIT 10` is two
+    clauses apart and `BY` belongs between them. Glued to the caret (`ORDER |LIMIT`) or before
+    anything else — an operand, a list item, `BETWEEN 1 | 5`, `INSERT INTO t (| id)` — the text
+    after the caret is part of what is being written, and a prediction would split it; so
+    `ORDER | id` still predicts nothing (`a_prediction_goes_in_front_of_the_next_clause_on_the_line`,
+    red first; `nothing_is_predicted_mid_line_or_for_a_word_already_there`). There the prediction
+    may not hold the following clause's word *anywhere*, not only first — `JOIN | ON o.x = c.y`
+    would otherwise gain `customers ON …` and a second `ON`
+    (`mid_line_predicts_nothing_that_would_collide_with_what_follows`) — and its trailing
+    whitespace is trimmed, since the space already after the caret stands in for it (`BY`, not
+    `BY `). The auto-paired `)` counts only at a line's end (`closed` is read only there), so a
+    caret against one mid-line, as in `INSERT INTO t (|) VALUES (1)`, gets no ghost.
+    Each keyword guard is a place the bare
     rule was wrong: `INSERT`/`DELETE` count only as a statement's first word, since both also sit
     in a trigger header and a key's `ON DELETE`; `WITHIN GROUP (` takes no `BY`; a join word
     predicts `JOIN` only where a join can go, since `LEFT`/`RIGHT` are string functions too —

@@ -12454,7 +12454,8 @@ fn is_real_statement(stmt: &sqlparser::ast::Statement) -> bool {
 ///
 /// **Where a ghost can be drawn, and nowhere else**: at the end of a line
 /// (nothing after the caret but whitespace, the `)` bracket pairing put there
-/// and the statement's own closing `;`), straight after whitespace or a `(`,
+/// and the statement's own closing `;`) or mid-line in front of the next
+/// clause ([`starts_a_clause`]), straight after whitespace or a `(`,
 /// and in code — a caret a string, comment or quoted name runs up to predicts
 /// nothing. And never the word the statement already has next, so editing
 /// `ORDER |` above an existing `BY` offers no second one.
@@ -12466,13 +12467,17 @@ pub fn predict(sql: &str, caret: usize, catalog: &Catalog, dialect: SqlDialect) 
     // editor pairs a `(` as it is typed, so the caret inside a fresh `(…)` has
     // a `)` after it that nobody wrote and that the ghost simply sits before.
     // And the statement's own `;` at the very end, which going back into a
-    // finished statement always leaves after the caret.
-    let rest = sql[caret..].split('\n').next().unwrap_or("").trim();
+    // finished statement always leaves after the caret. Or, mid-line, the
+    // next clause, apart from the caret ([`starts_a_clause`]).
+    let line_rest = sql[caret..].split('\n').next().unwrap_or("");
+    let rest = line_rest.trim();
     let rest = rest.strip_suffix(';').unwrap_or(rest).trim_end();
-    if !rest.chars().all(|c| c == ')') {
+    let at_end = rest.chars().all(|c| c == ')');
+    let mid_line = !at_end && starts_a_clause(line_rest);
+    if !at_end && !mid_line {
         return None;
     }
-    let closed = rest.starts_with(')');
+    let closed = at_end && rest.starts_with(')');
     let before = sql[..caret].chars().next_back()?;
     if !(before.is_whitespace() || before == '(') {
         return None;
@@ -12498,15 +12503,77 @@ pub fn predict(sql: &str, caret: usize, catalog: &Catalog, dialect: SqlDialect) 
         });
     // A character outside ASCII is a word character (`is_word_byte` answers so
     // for every byte of one), so it is never where the first word ends.
-    let first_guessed = guess
-        .split(|c: char| c.is_ascii() && !crate::sql::is_word_byte(c as u8))
-        .next();
-    if let (Some(next), Some(first)) = (next_word, first_guessed)
+    let mut guessed = guess.split(|c: char| c.is_ascii() && !crate::sql::is_word_byte(c as u8));
+    let first_guessed = guessed.clone().next();
+    if let (Some(next), Some(first)) = (&next_word, first_guessed)
         && next.eq_ignore_ascii_case(first)
     {
         return None;
     }
+    if mid_line {
+        // In front of a clause, the prediction may not hold that clause's own
+        // word (`JOIN | ON …` must not gain a second `ON`), and the space
+        // already after the caret stands in for its trailing one.
+        if let Some(next) = &next_word
+            && guessed.any(|w| w.eq_ignore_ascii_case(next))
+        {
+            return None;
+        }
+        let trimmed = guess.trim_end();
+        return (!trimmed.is_empty()).then(|| trimmed.to_string());
+    }
     Some(guess)
+}
+
+/// The words that open a clause — what a prediction may be put in front of
+/// mid-line.
+const CLAUSE_OPENERS: &[&str] = &[
+    "FROM",
+    "WHERE",
+    "GROUP",
+    "ORDER",
+    "HAVING",
+    "LIMIT",
+    "OFFSET",
+    "FETCH",
+    "WINDOW",
+    "UNION",
+    "INTERSECT",
+    "EXCEPT",
+    "RETURNING",
+    "JOIN",
+    "LEFT",
+    "RIGHT",
+    "INNER",
+    "FULL",
+    "CROSS",
+    "NATURAL",
+    "ON",
+    "USING",
+    "SET",
+    "VALUES",
+    "INTO",
+];
+
+/// Does the rest of the caret's line, `line_rest`, start a clause of its own —
+/// whitespace, then a word that opens one ([`CLAUSE_OPENERS`]), whole?
+///
+/// That is where a prediction can go mid-line: `ORDER | LIMIT 10` is two
+/// clauses apart, and `BY` belongs between them. Glued to the caret
+/// (`ORDER |LIMIT`) or before anything else — an operand, a list item — the
+/// text after the caret is part of what is being written, and a prediction
+/// would split it.
+fn starts_a_clause(line_rest: &str) -> bool {
+    if !line_rest.starts_with(|c: char| c.is_whitespace()) {
+        return false;
+    }
+    let rest = line_rest.trim_start();
+    let end = rest
+        .find(|c: char| c.is_ascii() && !crate::sql::is_word_byte(c as u8))
+        .unwrap_or(rest.len());
+    CLAUSE_OPENERS
+        .iter()
+        .any(|kw| rest[..end].eq_ignore_ascii_case(kw))
 }
 
 /// Where the first word of a prediction `text` ends — the byte length Ctrl+→
@@ -13763,6 +13830,37 @@ mod predict_tests {
             at_bar("SELECT id FROM orders ORDER |  \nLIMIT 1").as_deref(),
             Some("BY ")
         );
+    }
+
+    /// Mid-line, before the next clause: what follows starts a clause of its
+    /// own, so the prediction goes in front of it — without the trailing space
+    /// the space already there supplies.
+    #[test]
+    fn a_prediction_goes_in_front_of_the_next_clause_on_the_line() {
+        assert_eq!(
+            at_bar("SELECT id FROM orders ORDER | LIMIT 10").as_deref(),
+            Some("BY")
+        );
+        assert_eq!(
+            at_bar("SELECT * FROM orders o JOIN | WHERE o.id = 1").as_deref(),
+            Some("customers ON o.customer_id = customers.id")
+        );
+        assert_eq!(
+            at_bar("SELECT customer_id, count(*) FROM orders GROUP BY | ORDER BY 2;").as_deref(),
+            Some("customer_id")
+        );
+    }
+
+    /// Only before a clause, apart from it, and never repeating it: glued to the
+    /// next word, before an operand, or holding the very word that follows, the
+    /// prediction would write a statement nobody meant.
+    #[test]
+    fn mid_line_predicts_nothing_that_would_collide_with_what_follows() {
+        assert_eq!(at_bar("SELECT id FROM orders ORDER |LIMIT 10"), None);
+        assert_eq!(at_bar("SELECT * FROM orders o JOIN | ON o.x = c.y"), None);
+        assert_eq!(at_bar("DELETE FROM orders | WHERE id = 1"), None);
+        assert_eq!(at_bar("SELECT * FROM t WHERE a BETWEEN 1 | 5"), None);
+        assert_eq!(at_bar("INSERT INTO customers (| id)"), None);
     }
 
     #[test]
