@@ -12562,7 +12562,7 @@ fn is_real_statement(stmt: &sqlparser::ast::Statement) -> bool {
 /// verbatim when the user presses Tab — or `None` when nothing is certain
 /// enough to offer.
 ///
-/// **Deterministic, and only where the answer is close to certain.** Eight
+/// **Deterministic, and only where the answer is close to certain.** Nine
 /// producers, asked in this order, each answering only its own shape:
 ///
 /// - an empty `JOIN … ON` → the foreign-key condition, where one key decides
@@ -12579,7 +12579,10 @@ fn is_real_statement(stmt: &sqlparser::ast::Statement) -> bool {
 ///   `JOIN`, a statement-opening `INSERT` → `INTO`…), in the case it was typed;
 /// - a construct whose operand was just written (`BETWEEN x` → `AND`, `CAST(x`
 ///   → `AS`, `SELECT *` → `FROM`, `DELETE FROM t` → `WHERE`…,
-///   [`operand_partner`]).
+///   [`operand_partner`]);
+/// - a construct's word it cannot do without (`ROW_NUMBER()` → `OVER`,
+///   `FOREIGN KEY (a)` → `REFERENCES`, T-SQL's `OFFSET 10` → `ROWS`…,
+///   [`clause_partner`]).
 ///
 /// **Where a ghost can be drawn, and nowhere else**: at the end of a line
 /// (nothing after the caret but whitespace, the `)` bracket pairing put there
@@ -12628,7 +12631,8 @@ pub fn predict(sql: &str, caret: usize, catalog: &Catalog, dialect: SqlDialect) 
         .or_else(|| join_target_guess(sql, (lo, hi, caret), &toks, catalog, dialect))
         .or_else(|| join_on_guess(sql, (lo, hi, caret), &toks, catalog, dialect))
         .or_else(|| keyword_partner(sql, lo, &toks, dialect))
-        .or_else(|| operand_partner(sql, caret, &toks))?;
+        .or_else(|| operand_partner(sql, caret, &toks))
+        .or_else(|| clause_partner(sql, lo, caret, &toks, dialect))?;
     let next_word = tokenize_range(sql, caret, hi.max(caret), dialect)
         .into_iter()
         .find_map(|t| match t.kind {
@@ -13080,6 +13084,8 @@ fn keyword_partner(sql: &str, lo: usize, toks: &[Token], dialect: SqlDialect) ->
         }
         "DUPLICATE" if prev_is("ON") => "KEY UPDATE ",
         "KEY" if prev_is("DUPLICATE") && prev2.as_deref() == Some("ON") => "UPDATE ",
+        // An ordered-set aggregate's `WITHIN GROUP`, the word's only use.
+        "WITHIN" => "GROUP ",
         "UPDATE" if prev_is("DO") => "SET ",
         "UNIQUE" if second_after("CREATE") && !unique_index_names_its_kind(dialect) => "INDEX ",
         "OR" if second_after("CREATE") => create_or_spelling(dialect)?,
@@ -13100,6 +13106,13 @@ fn groups_rows(sql: &str, lo: usize, at: usize, prev: Option<&str>, dialect: Sql
     ) {
         return false;
     }
+    in_a_query(sql, lo, at, dialect)
+}
+
+/// Does the query `at` sits in — its own, from [`local_scope_start`] — have a
+/// `SELECT` at its depth? What a query's clause word (`GROUP`, `OFFSET`,
+/// `FETCH`) wants before it is read as one.
+fn in_a_query(sql: &str, lo: usize, at: usize, dialect: SqlDialect) -> bool {
     let start = local_scope_start(sql, lo, at, dialect);
     let mut depth = 0usize;
     tokenize_range(sql, start, at, dialect)
@@ -13283,6 +13296,138 @@ fn when_then(sql: &str, caret: usize, toks: &[Token]) -> Option<String> {
         return None;
     };
     operand_finished(sql.get(toks[i].end..caret)?, after).then(|| in_typed_case("THEN ", kw))
+}
+
+/// The functions that are window functions and nothing else — whose call
+/// cannot stand without its `OVER`.
+const WINDOW_ONLY: &[&str] = &[
+    "ROW_NUMBER",
+    "RANK",
+    "DENSE_RANK",
+    "PERCENT_RANK",
+    "CUME_DIST",
+    "NTILE",
+    "LAG",
+    "LEAD",
+    "FIRST_VALUE",
+    "LAST_VALUE",
+    "NTH_VALUE",
+];
+
+/// [`predict`]'s construct producer: a word a written construct cannot do
+/// without. A window function's call its `OVER`; an ordered-set aggregate's
+/// its `WITHIN GROUP` ([`takes_within_group`]), and `WITHIN GROUP (` its
+/// `ORDER BY`; a table-level `FOREIGN KEY (…)` its `REFERENCES`; and a row
+/// count its `ROWS` — T-SQL's `OFFSET n` ([`offset_takes_rows`]) and a `FETCH
+/// NEXT|FIRST n` ([`fetch_rows_tail`]), in a query. Each answers in the case
+/// its word was typed.
+fn clause_partner(
+    sql: &str,
+    lo: usize,
+    caret: usize,
+    toks: &[Token],
+    dialect: SqlDialect,
+) -> Option<String> {
+    let last = toks.last()?;
+    if let [.., within, group, lp] = toks
+        && bare_upper(within).as_deref() == Some("WITHIN")
+        && bare_upper(group).as_deref() == Some("GROUP")
+        && matches!(lp.kind, TkKind::LParen)
+        && let TkKind::Word(w) = &within.kind
+    {
+        return Some(in_typed_case("ORDER BY ", w));
+    }
+    if matches!(last.kind, TkKind::RParen) {
+        // The `(` this `)` closes, and the word in front of it.
+        let mut depth = 0usize;
+        let open = toks.iter().rposition(|t| match t.kind {
+            TkKind::RParen => {
+                depth += 1;
+                false
+            }
+            TkKind::LParen => {
+                depth -= 1;
+                depth == 0
+            }
+            _ => false,
+        })?;
+        let callee = toks.get(open.checked_sub(1)?)?;
+        let TkKind::Word(name) = &callee.kind else {
+            return None;
+        };
+        if callee.quoted {
+            return None;
+        }
+        let before = open.checked_sub(2).and_then(|i| bare_upper(&toks[i]));
+        let upper = name.to_ascii_uppercase();
+        // A routine being declared under the name is not a call.
+        let declared = matches!(
+            before.as_deref(),
+            Some("FUNCTION" | "PROCEDURE" | "AGGREGATE" | "ROUTINE")
+        );
+        let partner = match upper.as_str() {
+            _ if declared => return None,
+            w if WINDOW_ONLY.contains(&w) => "OVER ",
+            w if takes_within_group(w, dialect) => "WITHIN GROUP ",
+            "KEY" if before.as_deref() == Some("FOREIGN") => "REFERENCES ",
+            _ => return None,
+        };
+        return Some(in_typed_case(partner, name));
+    }
+    // A count is no token, so the text says one was written after the word.
+    let counted = sql
+        .get(lo..caret)?
+        .trim_end()
+        .ends_with(|c: char| c.is_ascii_digit());
+    let TkKind::Word(w) = &last.kind else {
+        return None;
+    };
+    if !counted || last.quoted || !in_a_query(sql, lo, last.at, dialect) {
+        return None;
+    }
+    let prev = toks.len().checked_sub(2).and_then(|i| bare_upper(&toks[i]));
+    let partner = match w.to_ascii_uppercase().as_str() {
+        "OFFSET" if offset_takes_rows(dialect) => "ROWS ",
+        "NEXT" | "FIRST" if prev.as_deref() == Some("FETCH") => fetch_rows_tail(dialect)?,
+        _ => return None,
+    };
+    Some(in_typed_case(partner, w))
+}
+
+/// Whether `function` (upper-case) is an ordered-set aggregate on this engine
+/// — called with its arguments and then `WITHIN GROUP (ORDER BY …)`, which it
+/// cannot do without. SQLite's `percentile_cont(Y, P)` is an ordinary
+/// aggregate; MariaDB's (the MySQL dialect's) takes the clause, and
+/// `mode()` is PostgreSQL's alone.
+fn takes_within_group(function: &str, dialect: SqlDialect) -> bool {
+    let percentile = matches!(function, "PERCENTILE_CONT" | "PERCENTILE_DISC");
+    match dialect {
+        SqlDialect::Postgres => percentile || function == "MODE",
+        SqlDialect::MsSql | SqlDialect::MySql => percentile,
+        SqlDialect::Sqlite => false,
+    }
+}
+
+/// Whether `OFFSET n` must be followed by `ROWS` on this engine. T-SQL's
+/// alone: PostgreSQL makes the word optional, and MySQL and SQLite write a
+/// bare `OFFSET n` after their `LIMIT`.
+fn offset_takes_rows(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MsSql => true,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+    }
+}
+
+/// What a `FETCH NEXT|FIRST n` takes next on this engine: T-SQL's `ROWS
+/// ONLY`, which has no other ending; `ROWS` where `ONLY` and `WITH TIES` are
+/// both possible (PostgreSQL, MariaDB); nothing on SQLite, which has no
+/// `FETCH` clause.
+fn fetch_rows_tail(dialect: SqlDialect) -> Option<&'static str> {
+    match dialect {
+        SqlDialect::MsSql => Some("ROWS ONLY"),
+        SqlDialect::Postgres | SqlDialect::MySql => Some("ROWS "),
+        SqlDialect::Sqlite => None,
+    }
 }
 
 /// `CREATE [UNIQUE] [CLUSTERED…] INDEX [CONCURRENTLY] [IF NOT EXISTS] name `
@@ -16190,6 +16335,90 @@ mod predict_tests {
         );
         assert_eq!(pg("ALTER TABLE IF NOT "), None);
         assert_eq!(pg("DROP TABLE IF NOT "), None);
+    }
+
+    /// Words a written construct cannot do without: a window function's
+    /// `OVER`, an ordered-set aggregate's `WITHIN GROUP` and its `ORDER BY`, a
+    /// table-level foreign key's `REFERENCES`, and the `ROWS` T-SQL's `OFFSET`
+    /// and every engine's `FETCH` count takes.
+    #[test]
+    fn a_construct_predicts_the_words_it_cannot_do_without() {
+        let pg = |sql: &str| at_end(sql, SqlDialect::Postgres);
+        let ms = |sql: &str| at_end(sql, SqlDialect::MsSql);
+        assert_eq!(my("SELECT id, ROW_NUMBER() ").as_deref(), Some("OVER "));
+        assert_eq!(my("SELECT ntile(4) ").as_deref(), Some("over "));
+        assert_eq!(pg("SELECT lag(total, 1) ").as_deref(), Some("over "));
+        assert_eq!(
+            pg("SELECT percentile_cont(0.5) ").as_deref(),
+            Some("within group ")
+        );
+        assert_eq!(pg("SELECT mode() ").as_deref(), Some("within group "));
+        assert_eq!(
+            ms("SELECT PERCENTILE_DISC(0.5) ").as_deref(),
+            Some("WITHIN GROUP ")
+        );
+        assert_eq!(
+            pg("SELECT percentile_cont(0.5) WITHIN ").as_deref(),
+            Some("GROUP ")
+        );
+        assert_eq!(
+            bar_in(
+                "SELECT percentile_cont(0.5) WITHIN GROUP (|)",
+                SqlDialect::Postgres
+            )
+            .as_deref(),
+            Some("ORDER BY ")
+        );
+        assert_eq!(
+            my("CREATE TABLE t (a int, b int, FOREIGN KEY (a, b) ").as_deref(),
+            Some("REFERENCES ")
+        );
+        assert_eq!(
+            pg("ALTER TABLE t ADD CONSTRAINT fk FOREIGN KEY (a) ").as_deref(),
+            Some("REFERENCES ")
+        );
+        assert_eq!(
+            ms("SELECT * FROM orders ORDER BY id OFFSET 10 ").as_deref(),
+            Some("ROWS ")
+        );
+        assert_eq!(
+            ms("SELECT * FROM orders ORDER BY id OFFSET 10 ROWS FETCH NEXT 5 ").as_deref(),
+            Some("ROWS ONLY")
+        );
+        assert_eq!(
+            pg("SELECT * FROM orders ORDER BY id FETCH FIRST 5 ").as_deref(),
+            Some("ROWS ")
+        );
+    }
+
+    /// Where those words are a choice or another construct's, nothing: a
+    /// function that is no window function, SQLite's two-argument
+    /// `percentile_cont`, an `OFFSET` that takes no `ROWS`, a cursor's `FETCH
+    /// NEXT FROM`, an unfinished call.
+    #[test]
+    fn the_constructs_words_are_offered_only_where_they_are_required() {
+        let pg = |sql: &str| at_end(sql, SqlDialect::Postgres);
+        let ms = |sql: &str| at_end(sql, SqlDialect::MsSql);
+        assert_eq!(my("SELECT count(id) "), None);
+        assert_eq!(my("SELECT ROW_NUMBER( "), None);
+        assert_eq!(
+            at_end("SELECT percentile_cont(total, 0.5) ", SqlDialect::Sqlite),
+            None
+        );
+        assert_eq!(pg("SELECT * FROM orders ORDER BY id OFFSET 10 "), None);
+        assert_eq!(my("SELECT * FROM orders LIMIT 5 OFFSET 10 "), None);
+        assert_eq!(ms("FETCH NEXT "), None);
+        assert_eq!(ms("SELECT * FROM orders ORDER BY id OFFSET "), None);
+        assert_eq!(my("CREATE TABLE t (a int, FOREIGN KEY (a "), None);
+        assert_eq!(pg("CREATE FUNCTION rank() "), None);
+        assert_eq!(pg("SELECT \"row_number\"() "), None);
+        assert_eq!(
+            at_end(
+                "SELECT * FROM orders ORDER BY id FETCH FIRST 5 ",
+                SqlDialect::Sqlite
+            ),
+            None
+        );
     }
 }
 

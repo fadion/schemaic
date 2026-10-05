@@ -1771,7 +1771,7 @@ existing prose was left alone.
     `noise_in_the_middle_is_not_stitched_around` pins, and it is the reason the guard exists. The
     cost is deliberate: a valid statement this parser cannot handle is refused rather than shown.
     **`predict` is the editor's inline ghost — deterministic, not AI, and offered only where the
-    answer is close to certain.** It returns the text Tab would insert at the caret, from eight
+    answer is close to certain.** It returns the text Tab would insert at the caret, from nine
     producers asked in order, each answering only its own shape: an empty `JOIN … ON` gets the
     foreign-key predicate (`on_condition_guess`, below); `INSERT`/`REPLACE … INTO t (` (its target read as the
     engine writes it, below) gets the columns an `INSERT` writes, from `Catalog::insert_columns_of`, quoted through
@@ -1786,8 +1786,9 @@ existing prose was left alone.
     `IS [NOT] DISTINCT` → `FROM`, `ON DUPLICATE` → `KEY UPDATE` and a hand-typed
     `ON DUPLICATE KEY` → `UPDATE` — `keyword_partner` is the list),
     in lower case when the keyword was typed all-lower — `in_typed_case`, which writes both join
-    producers' `ON` in the case `JOIN` was typed; and, asked last, an operand just written gets the
-    word its construct fixes next (`operand_partner`, below). It answers nothing unless the rest of the
+    producers' `ON` in the case `JOIN` was typed; an operand just written gets the
+    word its construct fixes next (`operand_partner`, below); and, asked last, a written construct
+    gets the word it cannot do without (`clause_partner`, below). It answers nothing unless the rest of the
     caret's line is whitespace and `)` — the editor auto-pairs a `(`, so `INSERT INTO t (|)` has a
     closer nobody wrote — and at most the statement's own closing `;`, which going back into a
     finished statement always leaves after the caret (`ORDER |;`), though a second statement after
@@ -2145,7 +2146,36 @@ existing prose was left alone.
     `an_operand_waits_for_its_infix_words_and_its_unit`;
     `a_finished_operand_predicts_the_word_its_construct_takes`, `a_star_projection_predicts_from`,
     `a_common_table_expressions_name_predicts_as`, `a_delete_target_predicts_where`,
-    `a_privilege_object_predicts_its_grantee_word`). The UI asks it
+    `a_privilege_object_predicts_its_grantee_word`).
+    **A construct's own word is offered where the construct cannot stand without it.**
+    `clause_partner`, asked last, reads a closed call and a written count. A window-only
+    function's call (`WINDOW_ONLY` — `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `PERCENT_RANK`,
+    `CUME_DIST`, `NTILE`, `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`, `NTH_VALUE`) → `OVER` —
+    `OVER ` and not `OVER (`, for the reason `cte_as` answers `AS `: the user's own `(` auto-pairs
+    and an inserted one would not. An ordered-set aggregate's → `WITHIN GROUP` where
+    `takes_within_group` says the engine has one: `PERCENTILE_CONT`/`PERCENTILE_DISC` on
+    PostgreSQL, SQL Server and the MySQL dialect (MariaDB's), and PostgreSQL's `mode()` besides;
+    never on SQLite, whose `percentile_cont(Y, P)` is an ordinary aggregate. A typed `WITHIN` gets
+    `GROUP` from `keyword_partner` — the word's only use — and `WITHIN GROUP (` gets `ORDER BY`
+    here. A table-level `FOREIGN KEY (a, b)` → `REFERENCES`. And a count in a query — `in_a_query`,
+    factored out of `groups_rows`, wanting a `SELECT` at depth 0 in the word's own query — gets the
+    `ROWS` its engine requires: T-SQL's `OFFSET n` → `ROWS` (`offset_takes_rows`, T-SQL alone —
+    PostgreSQL makes the word optional, and MySQL and SQLite write a bare `OFFSET n` after their
+    `LIMIT`), and `FETCH NEXT|FIRST n` → `fetch_rows_tail`'s answer: `ROWS ONLY` on T-SQL, its only
+    ending; `ROWS ` on PostgreSQL and the MySQL dialect (MariaDB's), where `ONLY` and `WITH TIES`
+    both follow and which one is the user's choice; nothing on SQLite, which has no `FETCH` clause.
+    A count is no token, so the text must end in a digit after the word — which is what keeps a
+    cursor's `FETCH NEXT FROM` out. `takes_within_group`, `offset_takes_rows` and
+    `fetch_rows_tail` are asked as capabilities through an exhaustive match, as `has_apply_joins`
+    and `has_full_joins` are, so a new engine has to answer them. A name a routine is being
+    declared under (`FUNCTION`, `PROCEDURE`, `AGGREGATE` or `ROUTINE` before it) is no call and gets
+    nothing, nor does a quoted name; each answer is in the case its word was typed
+    (`a_construct_predicts_the_words_it_cannot_do_without`, red first on
+    `SELECT id, ROW_NUMBER() `; `the_constructs_words_are_offered_only_where_they_are_required`,
+    the guards — a function that is no window function, SQLite's two-argument `percentile_cont`,
+    an `OFFSET` that takes no `ROWS`, a cursor's `FETCH NEXT`, an unfinished call or key list —
+    which passed before, as guards do). Neither pins the declared-routine or quoted-name guard.
+    The UI asks `predict`
     over the offer catalogue (under `completion.rs`) and only while the `editor_predictions`
     setting is on — Settings → Editor → *Inline predictions*, on by default. `predict_tests` covers
     each producer and gate, `an_auto_paired_closer_after_the_caret_still_predicts` the `)` one.
