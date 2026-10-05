@@ -88,6 +88,10 @@ pub(crate) struct Completion {
     ///
     /// [`inline_diff::set_ghost`]: crate::inline_diff::set_ghost
     pub(crate) ghost: crate::inline_diff::GhostSignal,
+    /// The word at the caret already spells a candidate in full
+    /// (`rank::Ranked::completes_a_word`), so Enter is a newline, not an
+    /// accept of whatever longer word heads the list.
+    pub(crate) word_complete: RwSignal<bool>,
 }
 
 /// The ranking vocabulary, which lives in `core::rank` — see that module for why
@@ -547,6 +551,8 @@ fn natural_width(items: &[Suggestion]) -> f64 {
 fn set_items(comp: Completion, items: Vec<Suggestion>) {
     comp.width.set(natural_width(&items));
     comp.items.set(items);
+    // Said of the list this replaces; the one caller that knows sets it after.
+    comp.word_complete.set(false);
 }
 
 /// A column row's mid annotation: its owning table, plus the in-scope alias when it
@@ -983,6 +989,14 @@ pub(crate) fn recompute_completions(
     }
 
     let (lo, hi) = statement_range(&text, offset, dialect);
+    // **Not inside a value or a remark**, not even on Ctrl+Space: `name = 'jo`
+    // offered columns, and Tab spliced one into the literal. A quoted name
+    // is still a name, and completes.
+    if intel::caret_in_literal_or_comment(&text, lo, offset, dialect) {
+        comp.open.set(false);
+        set_items(comp, Vec::new());
+        return;
+    }
     // Context is lexer-based (correct mid-edit); scope prefers the real AST
     // (robust CTE/alias/derived-table resolution), falling back to the lexer.
     let ctx = intel::clause_context(&text, lo, word_lo, dialect);
@@ -1066,7 +1080,7 @@ pub(crate) fn recompute_completions(
     // you tend to reference the same columns/tables again.
     let used = rank::statement_identifiers(&text, lo, hi, (word_lo, offset));
 
-    let items = rank::rank(
+    let ranked = rank::rank_full(
         &schema,
         &rank::RankInput {
             ctx: &ctx,
@@ -1095,8 +1109,10 @@ pub(crate) fn recompute_completions(
     );
 
     set_anchor(ed, comp, offset);
+    let items = ranked.items;
     let open = !items.is_empty();
     set_items(comp, items);
+    comp.word_complete.set(ranked.completes_a_word);
     comp.sel.set(0);
     give_way(open);
     comp.open.set(open);

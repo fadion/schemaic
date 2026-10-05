@@ -882,6 +882,33 @@ existing prose was left alone.
     `JOIN … ON` auto-fill), `db_error_diagnostic` (positions a live DB error within the statement),
     `parses` (Tier-2 gate), and `select_output_names` (a projection's column names *in order*, or
     `None` when the statement alone can't say — what `ddl::pg_replaceable` reads).
+    **`clause_context` takes the last clause keyword within the caret's paren**, not across the
+    statement: each `(` opens a scope whose keywords end at its `)`, and a closed one gives the
+    outer clause back. Read across the statement, the last keyword answered wherever it stood,
+    outside the caret's paren or inside a call — `INSERT INTO orders (cu` was `INTO`'s table slot,
+    `EXTRACT(YEAR FROM cr` and `TRIM(BOTH ' ' FROM na` the slot of the `FROM` inside the call,
+    `REFERENCES t (` that of the `ALTER`/`CREATE TABLE` around it, and `VALUES (` got the mixed
+    list — so a column list or an expression was offered tables, the diagnostics'
+    `FROM`-inside-a-call mistake (below) in the surface that inserts the word. A paren whose first
+    word is `SELECT`, `WITH`, `VALUES` or `TABLE` is a subquery and has clauses of its own; any
+    other is `Column`, but for two shapes: `Table` where it has just opened after `FROM`/`JOIN`
+    with no word in it yet — it may hold a table or a `SELECT` — or where its own last keyword is
+    `JOIN`, a parenthesised join; and `Other` for `TABLE t (`, whose column definitions name
+    nothing that exists yet (`a_paren_scopes_the_clause_context`). Two keywords name a column
+    without a clause of their own: MySQL's `ON DUPLICATE KEY UPDATE` is read as `SET`, and inside
+    an `ALTER TABLE` the word after `DROP`/`ALTER`/`RENAME`/`MODIFY`/`CHANGE COLUMN`, or a bare
+    `MODIFY`/`CHANGE`, is `Column`, where the `TABLE` before it had left a table slot
+    (`an_upsert_or_altered_column_is_a_column_context`).
+    **`caret_in_literal_or_comment` is the completion popup's gate, and it is not
+    `caret_touches_noncode`** (under `predict`, below), which differs on both counts that matter
+    to a list: a quoted name is a name, and completes — `"Ord`, `` `ord ``, `[Order De` are what
+    opening a table from the tree writes — so only `NonCode::Literal` and `Comment` answer `true`,
+    through `skip_noncode` and `sql::noncode_kind`. And it asks of `sql[lo..caret]` **with one `x`
+    appended**, which closes no quote and no comment, so only a span still running past it was open
+    at the caret: without it the two cases the popup meets most look alike, a `'jo` being typed at
+    the buffer's end and a `'jo'` just closed both ending where the text does
+    (`the_caret_in_a_literal_or_comment_is_told_apart_from_a_quoted_name`). The popup's half is
+    under `completion.rs`.
     **`error_fix_range` decides what an AI fix is allowed to rewrite**, and it is a range question
     rather than a prompt one: a fix replaces text in the editor, so hand the model the buffer and
     every statement the user did not ask about comes back rewritten — which is what the error bar
@@ -12538,7 +12565,17 @@ existing prose was left alone.
       in what order. `rank(&SchemaIndex, &RankInput)` collects candidates into context tiers (dedup
       by text, first/lowest tier wins, and a candidate equal to the typed prefix is dropped), scores
       each by `fuzzy_score` plus `recency_bonus`, and sorts by tier, then score, then length,
-      capped at `MAX_ROWS`. **`RankInput::dialect` decides which builtin catalog the function tier is
+      capped at `MAX_ROWS`. **`rank_full` is `rank` plus the one fact the rows cannot carry**:
+      `Ranked::completes_a_word`, whether the word typed already spells a candidate in full. The
+      exact match is left out of the rows, and that was also what hid it — after `FROM` the list
+      held `FROM_BASE64()` and `FROM_DAYS()`, and Enter, meant as a newline, accepted the first (the
+      key is under `editor_pane.rs`). So the exact match is still put into `seen` before it is
+      turned away, and the flag is `seen.contains` of the lower-cased prefix, never `true` for an
+      empty one; `rank` is `rank_full(..).items`, so no other caller moved
+      (`a_word_typed_in_full_is_reported_though_not_listed`). **The order inside
+      `!seen.insert(tl) || exact` is load-bearing**: written `exact || !seen.insert(tl)`, which
+      reads the same, the short circuit skips the insert for exactly the candidate the flag is
+      about, and it is never set. **`RankInput::dialect` decides which builtin catalog the function tier is
       drawn from, and it is not a nicety**: the `ClauseCtx::Column` arm used to walk
       `intel::FUNCTIONS` whatever the engine, so a PostgreSQL tab was offered `IFNULL` and
       `GROUP_CONCAT` — names that engine does not have — and never `btrim`, which it does, while a
@@ -22627,6 +22664,17 @@ existing prose was left alone.
     `snippet::by_abbrev` so the narrowest scope wins by the same rule everywhere; the row shows the
     abbrev and inserts the **body**, through the same `Suggestion::insert` override an FK-JOIN row
     uses.
+    **No list opens inside a string literal or a comment, not even on Ctrl+Space**:
+    `recompute_completions` asks `intel::caret_in_literal_or_comment` of the caret's statement
+    before it reads the clause, ahead of the FK join row and the ranked list alike, and closes the
+    popup where it answers. `WHERE name = 'jo` offered columns, and Tab spliced one into the
+    literal. A quoted name is not a value, so `"Ord` still completes (why the gate is not
+    `caret_touches_noncode` is under `intel.rs`). It gates the list only: the ghost is published
+    above it, and `predict` and `recall` refuse such a caret on their own terms.
+    **`Completion::word_complete` carries `rank::Ranked::completes_a_word` to the key handler**
+    (under `editor_pane.rs`). `set_items` resets it to `false` — every path that fills the list goes
+    through there, so the FK join row or an emptied list never inherits the last ranked list's
+    answer — and the ranked path sets it straight after.
     **`recompute_completions` fills `RankInput::flavour`, and it needed no new signal to do it**:
     the flavour is stamped on the loaded `DbSchema`, and this function already destructures
     `active_db` and `db_nodes`. It asks through `table_designer::db_flavour`, which was narrowed to
@@ -23287,6 +23335,15 @@ existing prose was left alone.
     an ordinary replacement whose replacement does not contain the needle that list is **empty**, so
     the bar reported no matches, `n/total` collapsed and Enter did nothing, over a document that still
     held every occurrence: the screen read as though the replace had happened.
+    **Enter is a newline once the word is typed in full.** With the list open, ↑/↓ move the
+    selection and Enter or Tab accept `items[sel]` — except Enter with `comp.word_complete` set and
+    the selection still on row 0, which closes the list and lets the key through to the editor.
+    The exact match is never a row (under `core/rank.rs`), so after `FROM` the list held
+    `FROM_BASE64()` and `FROM_DAYS()`, and Enter, meant to end the line, accepted the first. An
+    arrow onto a row first still accepts that row, and Tab still accepts row 0. The handler reads
+    only where the selection is, not whether it moved, so ↓ then ↑ back onto row 0 is a newline
+    too. The flag is under test (`a_word_typed_in_full_is_reported_though_not_listed`); the key
+    decision lives in the view and is not.
     **Tab takes the inline prediction ahead of the soft-tab indent, on `ghost_takes_tab`'s terms**
     (`ghost_key_tests`): a plain Tab — no Shift, no primary modifier — with the list closed, since an
     open list owns Tab, and `completion::lone_caret` still answering the offset the ghost was made

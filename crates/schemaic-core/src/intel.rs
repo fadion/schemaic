@@ -3790,14 +3790,77 @@ pub fn clause_context(sql: &str, lo: usize, word_lo: usize, dialect: SqlDialect)
     {
         return ClauseCtx::Qualified(name.clone());
     }
-    // The last clause keyword strictly before the caret's word decides the rest.
+    // The last clause keyword strictly before the caret's word decides the rest
+    // — **within the caret's paren**: each `(` opens a scope whose keywords
+    // end at its `)`, so `INTO t (` is not `INTO`'s table slot, and the `FROM`
+    // of `EXTRACT(YEAR FROM x)` names no table.
     let mut last_kw: Option<String> = None;
-    for t in &toks {
-        if let TkKind::Word(w) = &t.kind {
-            let up = w.to_ascii_uppercase();
-            if CLAUSE_KEYWORDS.contains(&up.as_str()) {
-                last_kw = Some(up);
+    // Per open paren: the keyword outside it, and where it opened.
+    let mut outer: Vec<(Option<String>, usize)> = Vec::new();
+    let word_up = |t: &Token| match &t.kind {
+        TkKind::Word(w) => Some(w.to_ascii_uppercase()),
+        _ => None,
+    };
+    for (i, t) in toks.iter().enumerate() {
+        match &t.kind {
+            TkKind::LParen => outer.push((last_kw.take(), i)),
+            TkKind::RParen => {
+                if let Some((kw, _)) = outer.pop() {
+                    last_kw = kw;
+                }
             }
+            TkKind::Word(w) => {
+                let up = w.to_ascii_uppercase();
+                if CLAUSE_KEYWORDS.contains(&up.as_str()) {
+                    // MySQL's `ON DUPLICATE KEY UPDATE` assigns columns.
+                    let upsert = up == "UPDATE"
+                        && i >= 2
+                        && word_up(&toks[i - 1]).as_deref() == Some("KEY")
+                        && word_up(&toks[i - 2]).as_deref() == Some("DUPLICATE");
+                    last_kw = Some(if upsert { "SET".to_string() } else { up });
+                }
+            }
+            _ => {}
+        }
+    }
+    let words: Vec<String> = toks.iter().filter_map(word_up).collect();
+    if let Some((outer_kw, open)) = outer.last() {
+        let open = *open;
+        let first = toks[open + 1..].iter().find_map(word_up);
+        let subquery = first
+            .as_deref()
+            .is_some_and(|w| matches!(w, "SELECT" | "WITH" | "VALUES" | "TABLE"));
+        if !subquery {
+            // A paren just opened after FROM/JOIN may hold a table or a
+            // SELECT, and one holding a join is a table slot after its JOIN.
+            let table_slot = matches!(outer_kw.as_deref(), Some("FROM" | "JOIN"));
+            if (first.is_none() && table_slot) || last_kw.as_deref() == Some("JOIN") {
+                return ClauseCtx::Table;
+            }
+            // `TABLE t (`: column definitions, whose names and types are new.
+            let defines = outer_kw.as_deref() == Some("TABLE")
+                && open >= 2
+                && word_up(&toks[open - 2]).as_deref() == Some("TABLE");
+            return if defines {
+                ClauseCtx::Other
+            } else {
+                ClauseCtx::Column
+            };
+        }
+    }
+    // The column an `ALTER TABLE` drops, alters, renames, modifies or changes.
+    if last_kw.as_deref() == Some("TABLE") && words.first().is_some_and(|w| w == "ALTER") {
+        let n = words.len();
+        let last = words.last().map(String::as_str);
+        let before = n.checked_sub(2).map(|j| words[j].as_str());
+        let names_column = matches!(last, Some("MODIFY" | "CHANGE"))
+            || last == Some("COLUMN")
+                && matches!(
+                    before,
+                    Some("DROP" | "ALTER" | "RENAME" | "MODIFY" | "CHANGE")
+                );
+        if names_column {
+            return ClauseCtx::Column;
         }
     }
     match last_kw.as_deref() {
@@ -13026,6 +13089,44 @@ fn caret_touches_noncode(sql: &str, lo: usize, caret: usize, dialect: SqlDialect
     false
 }
 
+/// Is `caret` inside a string literal or a comment — not a quoted name —
+/// reading `sql` from `lo`? The completion popup's question: a value or a
+/// remark takes no column, while a quoted name is completed like a bare one.
+///
+/// **Asked of the text before the caret with one byte added**, an `x`, which
+/// closes no quote and no comment: a span that still runs past it was open at
+/// the caret. Without it the two cases the popup meets most look alike — the
+/// `'jo` being typed at the end of the buffer and a `'jo'` just closed both end
+/// where the text does. Through [`skip_noncode`] and
+/// [`crate::sql::noncode_kind`], the one boundary lexer.
+pub fn caret_in_literal_or_comment(
+    sql: &str,
+    lo: usize,
+    caret: usize,
+    dialect: SqlDialect,
+) -> bool {
+    let (lo, caret) = (lo.min(caret), caret.min(sql.len()));
+    let mut probe = String::with_capacity(caret - lo + 1);
+    probe.push_str(&sql[lo..caret]);
+    probe.push('x');
+    let b = probe.as_bytes();
+    let end = b.len() - 1;
+    let mut i = 0;
+    while i < end {
+        match skip_noncode(b, i, dialect) {
+            Some(j) if j > end => {
+                return matches!(
+                    crate::sql::noncode_kind(b, i, dialect),
+                    Some(crate::sql::NonCode::Literal | crate::sql::NonCode::Comment)
+                );
+            }
+            Some(j) => i = j.max(i + 1),
+            None => i += 1,
+        }
+    }
+    false
+}
+
 /// Whether `CROSS` and `OUTER` may be followed by `APPLY` on this engine, which
 /// makes `JOIN` after them a guess rather than a certainty. T-SQL's alone.
 fn has_apply_joins(dialect: SqlDialect) -> bool {
@@ -17838,6 +17939,114 @@ mod tests {
             ctx_at("SELECT e. FROM employees e", 9),
             ClauseCtx::Qualified("e".to_string())
         );
+    }
+
+    fn ctx(sql: &str) -> ClauseCtx {
+        ctx_at(sql, sql.len())
+    }
+
+    /// **A paren is a scope of its own.** The last clause keyword *anywhere*
+    /// before the caret decided, so a column list after `INTO t (` offered
+    /// tables, and so did the `FROM` inside `EXTRACT(YEAR FROM …)`, which
+    /// names a field's source, not a table's.
+    #[test]
+    fn a_paren_scopes_the_clause_context() {
+        // A column list, or an expression, inside a paren: columns.
+        for sql in [
+            "INSERT INTO orders (cu",
+            "INSERT INTO orders (id, cu",
+            "SELECT EXTRACT(YEAR FROM cr",
+            "SELECT TRIM(BOTH ' ' FROM na",
+            "SELECT SUBSTRING(name FROM 2 FOR 3), COUNT(",
+            "ALTER TABLE o ADD FOREIGN KEY (c) REFERENCES customers (",
+            "SELECT * FROM t WHERE id IN (",
+            "INSERT INTO t VALUES (",
+        ] {
+            assert_eq!(ctx(sql), ClauseCtx::Column, "{sql:?}");
+        }
+        // A subquery is a statement again, with its own clauses.
+        assert_eq!(
+            ctx("SELECT * FROM t WHERE id IN (SELECT x FROM "),
+            ClauseCtx::Table
+        );
+        assert_eq!(
+            ctx("SELECT * FROM t WHERE id IN (SELECT "),
+            ClauseCtx::Column
+        );
+        assert_eq!(ctx("SELECT * FROM (SELECT 1) d JOIN "), ClauseCtx::Table);
+        // A paren just opened after FROM may hold a table or a SELECT; so may a
+        // parenthesised join.
+        assert_eq!(ctx("SELECT * FROM ("), ClauseCtx::Table);
+        assert_eq!(ctx("SELECT * FROM (a JOIN "), ClauseCtx::Table);
+        // A table's column definitions are neither.
+        assert_eq!(ctx("CREATE TABLE t (id in"), ClauseCtx::Other);
+        assert_eq!(ctx("CREATE TABLE t ("), ClauseCtx::Other);
+        // Closed parens give the outer clause back.
+        assert_eq!(ctx("INSERT INTO t (a) SELECT x FROM "), ClauseCtx::Table);
+        assert_eq!(ctx("SELECT COUNT(*) FROM "), ClauseCtx::Table);
+    }
+
+    /// The keywords that name a column without a clause of their own:
+    /// MySQL's upsert assignments, and the column an `ALTER TABLE` drops,
+    /// alters, renames or changes.
+    #[test]
+    fn an_upsert_or_altered_column_is_a_column_context() {
+        assert_eq!(
+            ctx("INSERT INTO t (a) VALUES (1) ON DUPLICATE KEY UPDATE "),
+            ClauseCtx::Column
+        );
+        for sql in [
+            "ALTER TABLE t DROP COLUMN ",
+            "ALTER TABLE t ALTER COLUMN ",
+            "ALTER TABLE t RENAME COLUMN ",
+            "ALTER TABLE t MODIFY ",
+            "ALTER TABLE t CHANGE COLUMN ",
+        ] {
+            assert_eq!(ctx(sql), ClauseCtx::Column, "{sql:?}");
+        }
+        assert_eq!(ctx("UPDATE "), ClauseCtx::Table);
+        assert_eq!(ctx("ALTER TABLE "), ClauseCtx::Table);
+    }
+
+    fn in_value(sql: &str, d: SqlDialect) -> bool {
+        caret_in_literal_or_comment(sql, 0, sql.len(), d)
+    }
+
+    /// **A value or a remark is no place for the list**: in `name = 'jo` the
+    /// popup offered columns, and Tab spliced one into the literal. A quoted
+    /// *name* is still completed — opening a table from the tree writes them.
+    #[test]
+    fn the_caret_in_a_literal_or_comment_is_told_apart_from_a_quoted_name() {
+        for d in SqlDialect::ALL {
+            assert!(in_value("SELECT * FROM t WHERE name = 'jo", d), "{d:?}");
+            assert!(in_value("SELECT 1 -- note", d), "{d:?}");
+            assert!(in_value("SELECT 1 /* note", d), "{d:?}");
+            assert!(
+                caret_in_literal_or_comment("SELECT 'abc' FROM t", 0, 10, d),
+                "{d:?}"
+            );
+            // Closed before the caret, or never opened: code.
+            assert!(!in_value("SELECT 'abc'", d), "{d:?}");
+            assert!(!in_value("SELECT 1 /* note */", d), "{d:?}");
+            assert!(!in_value("SELECT na", d), "{d:?}");
+            assert!(!in_value("SELECT 'it''s' ", d), "{d:?}");
+        }
+        assert!(in_value("SELECT 1 # note", SqlDialect::MySql));
+        assert!(in_value("SELECT $$ body", SqlDialect::Postgres));
+        // A quoted name is a name.
+        assert!(!in_value("SELECT * FROM \"Ord", SqlDialect::Postgres));
+        assert!(!in_value("SELECT * FROM `ord", SqlDialect::MySql));
+        assert!(!in_value("SELECT * FROM [Order De", SqlDialect::MsSql));
+        // Where `"` quotes a string, it is one.
+        assert!(in_value("SELECT \"jo", SqlDialect::MySql));
+        // Only the text from `lo`: an earlier statement's quote is closed.
+        let sql = "SELECT 'a'; SELECT na";
+        assert!(!caret_in_literal_or_comment(
+            sql,
+            12,
+            sql.len(),
+            SqlDialect::MySql
+        ));
     }
 
     // ── clause_continuation (expected-token model) ────────────────────────────

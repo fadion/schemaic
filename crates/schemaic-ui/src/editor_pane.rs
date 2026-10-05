@@ -2299,6 +2299,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         sig: RwSignal::new(None),
         sig_point: RwSignal::new(Point::ZERO),
         ghost: RwSignal::new(None),
+        word_complete: RwSignal::new(false),
     };
     let cmdk = CmdK {
         open: RwSignal::new(false),
@@ -2578,7 +2579,15 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     && matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::Enter), _));
                 let accept_tab = !mods.shift()
                     && matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::Tab), _));
-                if accept_enter || accept_tab {
+                // **A word typed in full ends at Enter**: after `FROM` the list
+                // holds `FROM_BASE64()`, and Enter meant as a newline took it.
+                // An arrow onto a row first still accepts that row.
+                if accept_enter
+                    && comp.word_complete.get_untracked()
+                    && comp.sel.get_untracked() == 0
+                {
+                    comp.open.set(false);
+                } else if accept_enter || accept_tab {
                     editor_sig.with_untracked(|e| accept_completion(e, comp));
                     return CommandExecuted::Yes;
                 }

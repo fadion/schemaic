@@ -220,6 +220,27 @@ pub struct RankInput<'a> {
 /// fuzzy match plus a recency bonus, and sorts by tier, then score, then a shorter
 /// candidate. Non-matches drop out. At most [`MAX_ROWS`].
 pub fn rank(schema: &SchemaIndex, input: &RankInput<'_>) -> Vec<Suggestion> {
+    rank_full(schema, input).items
+}
+
+/// What [`rank_full`] answers.
+pub struct Ranked {
+    /// The rows, as [`rank`] returns them.
+    pub items: Vec<Suggestion>,
+    /// The word typed already spells a candidate in full.
+    pub completes_a_word: bool,
+}
+
+/// [`rank`], and whether the word typed already spells a candidate in full.
+pub fn rank_full(schema: &SchemaIndex, input: &RankInput<'_>) -> Ranked {
+    let (items, completes_a_word) = rank_rows(schema, input);
+    Ranked {
+        items,
+        completes_a_word,
+    }
+}
+
+fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, bool) {
     let (ctx, cont, scope, prefix, active_db) = (
         input.ctx,
         input.cont,
@@ -268,7 +289,9 @@ pub fn rank(schema: &SchemaIndex, input: &RankInput<'_>) -> Vec<Suggestion> {
             return;
         }
         let tl = text.to_ascii_lowercase();
-        if tl == pl || !seen.insert(tl) {
+        // The exact match is left out but still marked seen — `completes_a_word`.
+        let exact = tl == pl;
+        if !seen.insert(tl) || exact {
             return;
         }
         cands.push(Cand {
@@ -327,7 +350,8 @@ pub fn rank(schema: &SchemaIndex, input: &RankInput<'_>) -> Vec<Suggestion> {
             return;
         }
         let tl = c.name.to_ascii_lowercase();
-        if tl == pl || !seen.insert(tl) {
+        let exact = tl == pl;
+        if !seen.insert(tl) || exact {
             return;
         }
         let key = if c.primary_key {
@@ -357,7 +381,8 @@ pub fn rank(schema: &SchemaIndex, input: &RankInput<'_>) -> Vec<Suggestion> {
         for r in scope {
             let qtext = r.alias.as_deref().unwrap_or(&r.name);
             let tl = qtext.to_ascii_lowercase();
-            if tl == pl || !seen.insert(tl) {
+            let exact = tl == pl;
+            if !seen.insert(tl) || exact {
                 continue;
             }
             let detail = match (&r.alias, &r.db) {
@@ -481,7 +506,8 @@ pub fn rank(schema: &SchemaIndex, input: &RankInput<'_>) -> Vec<Suggestion> {
             let mut fk_added = false;
             for jt in input.join_targets {
                 let tl = jt.table.to_ascii_lowercase();
-                if tl == pl || !seen.insert(tl) {
+                let exact = tl == pl;
+                if !seen.insert(tl) || exact {
                     continue;
                 }
                 fk_added = true;
@@ -626,6 +652,9 @@ pub fn rank(schema: &SchemaIndex, input: &RankInput<'_>) -> Vec<Suggestion> {
         });
     }
 
+    // Every candidate that spelled the word typed was marked seen on its way out.
+    let completes_a_word = !pl.is_empty() && seen.contains(&pl);
+
     // Score by fuzzy match (+ recency bonus); sort by tier (context priority), then
     // score, then a shorter candidate. Non-matches drop out.
     let mut scored: Vec<(u8, i32, Cand)> = cands
@@ -640,7 +669,7 @@ pub fn rank(schema: &SchemaIndex, input: &RankInput<'_>) -> Vec<Suggestion> {
             .then(b.1.cmp(&a.1))
             .then(a.2.text.len().cmp(&b.2.text.len()))
     });
-    scored
+    let items = scored
         .into_iter()
         .take(MAX_ROWS)
         .map(|(_, _, c)| Suggestion {
@@ -654,7 +683,8 @@ pub fn rank(schema: &SchemaIndex, input: &RankInput<'_>) -> Vec<Suggestion> {
             insert: c.insert,
             replace: c.replace,
         })
-        .collect()
+        .collect();
+    (items, completes_a_word)
 }
 
 /// Would this candidate survive scoring at all? The same question
@@ -941,6 +971,51 @@ mod tests {
     /// Does the ranked list offer this name, however either side spells its case?
     fn offers(rows: &[String], name: &str) -> bool {
         rows.iter().any(|r| r.eq_ignore_ascii_case(name))
+    }
+
+    /// Does the word typed already spell a candidate in full?
+    fn completes(schema: &SchemaIndex, ctx: ClauseCtx, scope: &[TableRef], prefix: &str) -> bool {
+        let cont = Continuation::default();
+        let used = HashSet::new();
+        rank_full(
+            schema,
+            &RankInput {
+                ctx: &ctx,
+                cont: &cont,
+                scope,
+                prefix,
+                snippets: &[],
+                join_targets: &[],
+                star: None,
+                used: &used,
+                active_db: Some("shop"),
+                dialect: SqlDialect::MySql,
+                flavour: ServerFlavour::Unknown,
+            },
+        )
+        .completes_a_word
+    }
+
+    /// **A word typed in full is reported, though it is not listed.** The
+    /// exact match is left out of the rows, so after `FROM` the list held
+    /// `FROM_BASE64()` and `FROM_DAYS()` — and Enter, meant as a newline,
+    /// accepted the first of them. The editor asks this to let Enter through.
+    #[test]
+    fn a_word_typed_in_full_is_reported_though_not_listed() {
+        let s = shop();
+        let scope = [tref("orders", None)];
+        assert!(completes(&s, ClauseCtx::Column, &scope, "from"));
+        assert!(completes(&s, ClauseCtx::Column, &scope, "FROM"));
+        assert!(!offers(
+            &ranked(&s, ClauseCtx::Column, &scope, "from"),
+            "from"
+        ));
+        assert!(completes(&s, ClauseCtx::Table, &[], "orders"));
+        assert!(completes(&s, ClauseCtx::Column, &scope, "total"));
+        // A part of a word, or nothing typed, completes nothing.
+        assert!(!completes(&s, ClauseCtx::Column, &scope, "fro"));
+        assert!(!completes(&s, ClauseCtx::Table, &[], "ord"));
+        assert!(!completes(&s, ClauseCtx::Column, &scope, ""));
     }
 
     /// The builtins offered are the engine's own, not whichever catalog is
