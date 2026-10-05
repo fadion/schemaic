@@ -834,8 +834,16 @@ existing prose was left alone.
     the per-scope resolver `colres` — qualified *and* unqualified, across subqueries/derived-tables/CTEs
     with correlation — reserved-keyword-alias errors, syntax errors on completed statements save
     those sqlparser has no grammar for (`parser_lacks_statement` and `grammar_gap_masks`,
-    below), and keyword-typo
-    warnings). **AST for classification, `skip_noncode` for byte positions by default** —
+    below), keyword-typo warnings, and two warnings raised per `SELECT` scope as `colres` walks it,
+    a derived table's own included (`diag_only_full_group_by_inside_subquery`): the
+    `only_full_group_by` check (`group_by_check`) on a projected bare column neither grouped nor
+    aggregated — judged only over a single, fully known base table and a grouping list of bare
+    columns, skipping wildcards and a table whose name another in scope shares with a different key
+    (`Catalog::pk_shared`, under `predict` below), and exempting a query grouped by the table's
+    whole primary key, MySQL's own functional-dependency exemption (`pk_of`) — and
+    `cartesian_check` on a `JOIN`/`INNER JOIN`/`STRAIGHT_JOIN` with no `ON`/`USING`, which runs as a
+    cross join; an explicit `CROSS JOIN` and a comma-join are meant, and left alone).
+    **AST for classification, `skip_noncode` for byte positions by default** —
     except `colres`, which uses sqlparser 0.62's now-accurate per-identifier *spans* (verified) so the
     same column name in an inner vs outer scope is placed independently. **A base table exposes more than
     its introspected columns**, so both column checks add `SqlDialect::implicit_columns` — SQLite's
