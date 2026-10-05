@@ -2252,7 +2252,11 @@ existing prose was left alone.
     text with `\r\n` made `\n`, and a stored run of several statements is cut by
     `sql::statement_ranges` so that each is offered, each read from its first byte of code
     (`skip_leading_noncode`): the range `statement_ranges` gives includes a comment heading the
-    statement, so a run saved as `-- weekly report⏎SELECT …` never matched at all.
+    statement, so a run saved as `-- weekly report⏎SELECT …` never matched at all. **The statement
+    typed is read the same way** (in `Recall::at`), and was not until a comment heading it —
+    `-- weekly⏎SELECT * FROM orders ` — turned recall off, the stored statement being read past its
+    comment while the typed one kept it; the comment's words no longer count toward the two the
+    gate wants either (`a_comment_heading_the_typed_statement_is_skipped`).
     It answers one line, its trailing `;` dropped:
     a statement written over several continues line by line as Enter starts each, so a ghost never
     needs a newline — which it could not carry, since `inline_diff` draws none that holds a `\n`.
@@ -2261,7 +2265,18 @@ existing prose was left alone.
     nothing. The line was once cut at the first `\n` wherever it sat, so a past
     `SELECT * FROM orders /* multi⏎line */ WHERE id = 1` offered `/* multi`, and Tab left that
     comment open over the rest of the buffer — a multi-line string likewise. A line comment ends
-    its own line and is offered whole.
+    its own line, and is offered whole **only where nothing follows the caret on it**
+    (`Recall::followed`): where the statement's `;` or the `)`s bracket pairing made sit there, a
+    trailing `--` (or MySQL's `#`) is cut off (`before_line_comment`), since Tab would comment out
+    the `;` after the caret and merge the next statement into this one — and inside a paired
+    `(…)` the line could not end in its `)` at all. A line that is nothing but the comment then
+    offers nothing (`a_remembered_line_comment_never_swallows_what_follows_the_caret`).
+    **A statement `sql::carries_credential` flags is never offered, from any text** — asked in
+    `Recall::from` itself, not left to the source. `history::push` keeps such a statement out of
+    the history, but a tab or a snippet holds whatever was typed into it, so a tab holding
+    `CREATE USER bob IDENTIFIED BY 'S3cret'` ghosted the password after `CREATE USER bob `; the
+    statement beside it in the same text is still offered
+    (`a_statement_carrying_a_credential_is_never_remembered`).
     **It runs on every keystroke, so what it reads is bounded.** Each space at a statement's end
     used to re-lex every stored run of the connection — up to `history::MAX_PER_CONN` (50), each
     stored whole — and a review measured 432 ms a keystroke, in a release build, after a Run All of
@@ -22636,8 +22651,11 @@ existing prose was left alone.
     kept. That rule is `same_place`, which the open tabs below go through too
     (`a_run_is_remembered_only_where_it_ran`, red against a stub of the old filter, and asking it
     through `same_place` since). The log arrives as `CompletionCtx::history`
-    (`ui.history.entries`, every connection's, through `QueryPaneParams::history`), so a statement
-    `history::push` declined to record for carrying a credential is never offered either.
+    (`ui.history.entries`, every connection's, through `QueryPaneParams::history`). **A statement
+    carrying a credential is offered from none of the three sources**, and not because
+    `history::push` declined to record it: this passage once said so, while the snippets and tabs
+    below — which `push` never sees — were read as typed and ghosted a password. The gate is
+    `Recall::from`'s own, asked of any text (under `intel.rs`).
     **Then the user's own snippets that apply here** (`snippet_recallable`, over
     `CompletionCtx::snippets`): `Source::User` alone — a built-in is a template nobody wrote, not a
     statement anyone ran — and only where `snippet::applies`, so one scoped to another connection

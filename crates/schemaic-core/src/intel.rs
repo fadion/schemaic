@@ -12805,11 +12805,16 @@ fn may_precede(guess: &str, next: &str) -> bool {
 /// after whitespace or a `(`, and in code. The match is exact — `select` does
 /// not continue `SELECT` — over text with its line endings made `\n`, and a
 /// stored run of several statements offers each of them, read from its first
-/// word of code (a comment heading a run is skipped). What it answers is one
+/// word of code (a comment heading a run is skipped, and so is one heading the
+/// statement typed). What it answers is one
 /// line: a statement written over several continues line by line as Enter
 /// starts each, so a ghost never needs a newline — and a line whose end falls
 /// inside a comment or string ([`first_code_line`]) is not offered, since Tab
-/// would leave it open over the rest of the buffer.
+/// would leave it open over the rest of the buffer. A line comment ending the
+/// line is left off where anything follows the caret on its line, which it
+/// would swallow. **A statement that [`crate::sql::carries_credential`] is
+/// never offered**, from any text: the history keeps those out, a tab or a
+/// snippet does not.
 ///
 /// Inside the `(…)` bracket pairing made, the remembered line must close
 /// there as well, and is offered without the `)`s already after the caret.
@@ -12838,6 +12843,9 @@ pub struct Recall {
     /// The `)`s bracket pairing left after the caret, which the remembered
     /// line must end with and is offered without.
     closers: String,
+    /// Something follows the caret on its line — the `;`, those `)`s — which
+    /// a remembered line comment would swallow.
+    followed: bool,
     dialect: SqlDialect,
 }
 
@@ -12862,11 +12870,16 @@ impl Recall {
         if !after.chars().all(|c| c == ')') {
             return None;
         }
-        let typed = sql[lo..caret].trim_start().replace("\r\n", "\n");
+        // From its first word of code, as a stored statement is read: a comment
+        // heading it would otherwise have to be in the stored text too, and its
+        // words would count toward the two the gate wants.
+        let typed = skip_leading_noncode(&sql[lo..caret], dialect).replace("\r\n", "\n");
         typed.split_whitespace().nth(1)?;
+        let line_rest = sql[caret..].split('\n').next().unwrap_or("");
         Some(Recall {
             typed,
             closers: ")".repeat(after.len()),
+            followed: !line_rest.trim().is_empty(),
             dialect,
         })
     }
@@ -12895,7 +12908,15 @@ impl Recall {
             .find_map(|(a, b)| {
                 let stmt = skip_leading_noncode(&text[a..b], self.dialect);
                 let more = stmt.strip_prefix(self.typed.as_str())?;
-                let line = first_code_line(more, self.dialect)?.trim_end();
+                // `history::push` keeps these out of the history; a tab or a
+                // snippet holds whatever was typed into it.
+                if crate::sql::carries_credential(stmt, self.dialect) {
+                    return None;
+                }
+                let mut line = first_code_line(more, self.dialect)?.trim_end();
+                if self.followed {
+                    line = before_line_comment(line, self.dialect).trim_end();
+                }
                 let line = line.strip_suffix(';').unwrap_or(line).trim_end();
                 let line = line.strip_suffix(self.closers.as_str())?.trim_end();
                 (!line.is_empty()).then(|| line.to_string())
@@ -12917,6 +12938,27 @@ fn skip_leading_noncode(stmt: &str, dialect: SqlDialect) -> &str {
         rest = rest[end..].trim_start();
     }
     rest
+}
+
+/// `line` in front of the line comment that ends it, or all of it when none
+/// does — the code a remembered line offers where something follows the caret.
+fn before_line_comment(line: &str, dialect: SqlDialect) -> &str {
+    let b = line.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        match skip_noncode(b, i, dialect) {
+            Some(_)
+                if crate::sql::noncode_kind(b, i, dialect)
+                    == Some(crate::sql::NonCode::Comment)
+                    && !line[i..].starts_with("/*") =>
+            {
+                return &line[..i];
+            }
+            Some(end) => i = end.max(i + 1),
+            None => i += 1,
+        }
+    }
+    line
 }
 
 /// `text` up to its first line end in code — `None` when a comment or a
@@ -14853,6 +14895,97 @@ mod history_prediction_tests {
             .as_deref(),
             Some("-- recent")
         );
+    }
+
+    /// **A line comment is offered only where nothing follows the caret on
+    /// its line.** In front of the statement's own `;`, or the `)` bracket
+    /// pairing put there, Tab would write the comment over them: the `;` gone,
+    /// the next statement merged into this one. There the comment is left off
+    /// and the code before it offered.
+    #[test]
+    fn a_remembered_line_comment_never_swallows_what_follows_the_caret() {
+        let past = ["SELECT * FROM orders WHERE id = 1 -- last week"];
+        assert_eq!(
+            hist("SELECT * FROM orders |;", &past).as_deref(),
+            Some("WHERE id = 1")
+        );
+        assert_eq!(
+            hist(
+                "SELECT * FROM orders |;",
+                &["SELECT * FROM orders WHERE id = 1 # mine"]
+            )
+            .as_deref(),
+            Some("WHERE id = 1")
+        );
+        assert_eq!(
+            hist(
+                "SELECT * FROM orders WHERE id IN (|)",
+                &["SELECT * FROM orders WHERE id IN (1, 2) -- open ones"]
+            )
+            .as_deref(),
+            Some("1, 2")
+        );
+        // A line that is nothing but the comment has nothing left to offer.
+        assert_eq!(
+            hist(
+                "SELECT * FROM orders |;",
+                &["SELECT * FROM orders -- x\nWHERE id = 1"]
+            ),
+            None
+        );
+        // At the end of its line the comment is still offered whole.
+        assert_eq!(
+            hist("SELECT * FROM orders ", &past).as_deref(),
+            Some("WHERE id = 1 -- last week")
+        );
+    }
+
+    /// **A credential is never offered**, whichever text holds it.
+    /// `history::push` keeps such a statement out of the history, but recall
+    /// also reads open tabs and saved snippets, which hold whatever was typed.
+    #[test]
+    fn a_statement_carrying_a_credential_is_never_remembered() {
+        assert_eq!(
+            hist(
+                "CREATE USER bob ",
+                &["CREATE USER bob IDENTIFIED BY 'S3cret'"]
+            ),
+            None
+        );
+        assert_eq!(
+            predict_from_history(
+                "ALTER LOGIN sa ",
+                15,
+                SqlDialect::MsSql,
+                ["ALTER LOGIN sa WITH PASSWORD = 'S3cret'"]
+            ),
+            None
+        );
+        // The statement beside it in the same text still is.
+        assert_eq!(
+            hist(
+                "SELECT * FROM users ",
+                &["CREATE USER bob IDENTIFIED BY 'S3cret'; SELECT * FROM users LIMIT 5"]
+            )
+            .as_deref(),
+            Some("LIMIT 5")
+        );
+    }
+
+    /// A comment heading the statement being typed is skipped, as one heading
+    /// a remembered run is — and its words are not the two the gate wants.
+    #[test]
+    fn a_comment_heading_the_typed_statement_is_skipped() {
+        let past = ["SELECT * FROM orders WHERE id = 1"];
+        assert_eq!(
+            hist("-- weekly\nSELECT * FROM orders ", &past).as_deref(),
+            Some("WHERE id = 1")
+        );
+        assert_eq!(
+            hist("/* v2 */ SELECT * FROM orders ", &past).as_deref(),
+            Some("WHERE id = 1")
+        );
+        assert_eq!(hist("-- two words\nSELECT ", &past), None);
     }
 
     /// A run whose text opens with a comment — a heading above the query —
