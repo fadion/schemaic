@@ -902,6 +902,16 @@ existing prose was left alone.
     an `ALTER TABLE` the word after `DROP`/`ALTER`/`RENAME`/`MODIFY`/`CHANGE COLUMN`, or a bare
     `MODIFY`/`CHANGE`, is `Column`, where the `TABLE` before it had left a table slot
     (`an_upsert_or_altered_column_is_a_column_context`).
+    **`signature_help` asks what the word before the `(` names before it asks the catalogue** —
+    the column list above, met again in the signature bar: `INSERT INTO log (` opened `LOG(x)`'s
+    help over a list of columns nobody was calling. `names_an_object` reads back over an `a.b`
+    qualification to the word before the name and answers yes after `INTO`, `INSERT` (T-SQL's
+    `INTO` is optional), `TABLE`, `REFERENCES`, `VIEW`, `INDEX`, `KEY`, `FUNCTION`, `PROCEDURE`,
+    `TYPE` or `WITH` (a CTE's column list), and after `ON` only in a statement that begins `CREATE`
+    with `INDEX` among its next three words — elsewhere `ON` opens a condition, which may call one.
+    So `JOIN b ON LOG(` and `VALUES (LOG(` still open it
+    (`signature_help_does_not_open_on_a_table_named_like_a_function`). `FROM` and `JOIN` are not
+    on the list, so a rowset function after one — PostgreSQL's `generate_series(` — still does.
     **`caret_in_literal_or_comment` is the completion popup's gate, and it is not
     `caret_touches_noncode`** (under `predict`, below), which differs on both counts that matter
     to a list: a quoted name is a name, and completes — `"Ord`, `` `ord ``, `[Order De` are what

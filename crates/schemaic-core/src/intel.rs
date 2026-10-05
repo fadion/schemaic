@@ -11581,6 +11581,9 @@ pub fn signature_help(
     let TkKind::Word(name) = &toks[paren_idx - 1].kind else {
         return None;
     };
+    if names_an_object(&toks, paren_idx - 1) {
+        return None;
+    }
     // **This engine's catalog, asked as the capability** — the third surface to
     // do so, after the typo checker and `rank`. It named `FUNCTIONS` outright
     // for a release while `builtin_catalog`'s own doc said there were two
@@ -11597,6 +11600,41 @@ pub fn signature_help(
         active_arg: comma_count,
         active_range: active_param_range(func.signature, comma_count),
     })
+}
+
+/// Does the word at `toks[at]`, with a `(` after it, name a table or an object
+/// being defined rather than call a function? `INSERT INTO log (`, `CREATE
+/// TABLE log (`, `REFERENCES log (`, `CREATE INDEX i ON log (`, a CTE's `WITH
+/// log (` and `CREATE FUNCTION log(` all open a column or parameter list, and
+/// signature help for `LOG(x)` there described a call nobody was making. A
+/// qualified name (`dbo.log`) is read back to its first part.
+fn names_an_object(toks: &[Token], at: usize) -> bool {
+    let mut first = at;
+    while first >= 2
+        && matches!(toks[first - 1].kind, TkKind::Dot)
+        && matches!(toks[first - 2].kind, TkKind::Word(_))
+    {
+        first -= 2;
+    }
+    let Some(prev) = first
+        .checked_sub(1)
+        .and_then(|i| toks.get(i))
+        .and_then(bare_upper)
+    else {
+        return false;
+    };
+    let head = |i: usize| toks.get(i).and_then(bare_upper);
+    match prev.as_str() {
+        // T-SQL's `INSERT log (…)`, whose `INTO` is optional.
+        "INTO" | "INSERT" | "TABLE" | "REFERENCES" | "VIEW" | "INDEX" | "KEY" | "FUNCTION"
+        | "PROCEDURE" | "TYPE" | "WITH" => true,
+        // An index's table; elsewhere `ON` opens a condition that may call one.
+        "ON" => {
+            head(0).as_deref() == Some("CREATE")
+                && (1..4).any(|i| head(i).as_deref() == Some("INDEX"))
+        }
+        _ => false,
+    }
 }
 
 /// The byte range within `signature` of the `active_arg`-th parameter (top-level,
@@ -24121,6 +24159,34 @@ mod tests {
 
     fn sig_on(sql: &str, dialect: SqlDialect) -> Option<SignatureHelp> {
         signature_help(sql, 0, sql.len(), sql.len(), dialect)
+    }
+
+    /// A function's name used as a table's or a defined object's opens a
+    /// column or parameter list, not a call: no help for `LOG(x)` there.
+    #[test]
+    fn signature_help_does_not_open_on_a_table_named_like_a_function() {
+        for sql in [
+            "INSERT INTO log (",
+            "INSERT INTO app.log (id, ",
+            "CREATE TABLE log (",
+            "ALTER TABLE t ADD FOREIGN KEY (a) REFERENCES log (",
+            "CREATE INDEX ix ON log (",
+            "WITH log (",
+            "CREATE FUNCTION log(",
+        ] {
+            assert!(sig(sql).is_none(), "{sql:?}");
+        }
+        assert!(sig_on("INSERT log (", SqlDialect::MsSql).is_none());
+        // A call is still one, in a join condition and as a table function.
+        assert_eq!(sig("SELECT LOG(").unwrap().name, "LOG");
+        assert_eq!(sig("SELECT * FROM a JOIN b ON LOG(").unwrap().name, "LOG");
+        assert_eq!(sig("INSERT INTO t (a) VALUES (LOG(").unwrap().name, "LOG");
+        assert_eq!(
+            sig_on("SELECT * FROM generate_series(", SqlDialect::Postgres)
+                .unwrap()
+                .name,
+            "generate_series"
+        );
     }
 
     /// **The third surface asks the same capability as the other two.**
