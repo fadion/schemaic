@@ -38,6 +38,7 @@ use floem::views::editor::Editor;
 use floem::views::editor::EditorStyle;
 use floem::views::editor::command::{Command, CommandExecuted};
 use floem::views::editor::core::buffer::rope_text::RopeText;
+use floem::views::editor::core::cursor::CursorAffinity;
 use floem::views::editor::core::editor::EditType;
 use floem::views::editor::core::selection::Selection;
 use floem::views::editor::core::xi_rope::Rope;
@@ -190,6 +191,55 @@ fn before_col_of(spans: &[(usize, usize)], col: usize) -> usize {
     last
 }
 
+/// The SQL editor's inline **prediction**, as drawn: `text` shown dim after the
+/// caret, inserted there by Tab (`core::intel::predict` decides it, the editor
+/// pane accepts it).
+///
+/// Carried with its `line` and `col` as well as its `offset`, so the per-line
+/// phantom question floem asks on every relayout is a comparison rather than an
+/// offset-to-line walk of the rope.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct EditorGhost {
+    /// The caret offset the prediction was made at — it shows only while the
+    /// caret is still there.
+    pub offset: usize,
+    pub line: usize,
+    /// Byte column of `offset` within `line`.
+    pub col: usize,
+    pub text: String,
+}
+
+/// How strongly the prediction is drawn: the editor's foreground at this
+/// alpha. Dim enough to read as not-yet-yours, strong enough to read at all.
+const GHOST_ALPHA: f32 = 0.45;
+
+/// The editor's one ghost slot — see [`EditorGhost`].
+pub type GhostSignal = RwSignal<Option<EditorGhost>>;
+
+/// Publish `next` as the editor's ghost (`None` clears it), with the
+/// `cache_rev` bump [`set_preview`] explains: a ghost is phantom text too, and
+/// a bare `set` would draw it a keystroke late.
+pub fn set_ghost(ghost: GhostSignal, ed: &Editor, next: Option<EditorGhost>) {
+    if ghost.with_untracked(|cur| cur == &next) {
+        return;
+    }
+    ghost.set(next);
+    ed.doc().cache_rev().update(|rev| *rev += 1);
+}
+
+/// Where a phantom at `col` goes in a line's phantom list: after every phantom
+/// at or before its column.
+///
+/// `PhantomTextLine::combine_with_text` accumulates a running shift and is only
+/// right while the columns never decrease, so the ghost cannot simply be pushed
+/// onto the wrapped document's own phantoms: an IME preedit sits at the same
+/// caret column (the ghost follows what is being composed), and the empty
+/// document's placeholder sits at column 0. (A Ctrl+K block never shares the
+/// line — [`InlineDiffDoc::ghost_on`] draws no ghost while a preview is up.)
+fn phantom_slot(cols: impl IntoIterator<Item = usize>, col: usize) -> usize {
+    cols.into_iter().take_while(|&c| c <= col).count()
+}
+
 /// Build the phantom rows hanging off `line`, or `None` if no hunk anchors there.
 ///
 /// Each added line contributes a `\n` (which is what makes Floem lay it out as
@@ -318,16 +368,39 @@ pub fn split_rows(
 pub struct InlineDiffDoc {
     inner: Rc<dyn Document>,
     preview: InlinePreview,
+    /// The inline prediction, a second phantom this wrapper draws — at the
+    /// caret's column rather than off a hunk, and never while a Ctrl+K preview
+    /// is up, which owns the editor's phantom space while it is.
+    ghost: GhostSignal,
     dialect: SqlDialect,
 }
 
 impl InlineDiffDoc {
-    pub fn new(inner: Rc<dyn Document>, preview: InlinePreview, dialect: SqlDialect) -> Self {
+    pub fn new(
+        inner: Rc<dyn Document>,
+        preview: InlinePreview,
+        ghost: GhostSignal,
+        dialect: SqlDialect,
+    ) -> Self {
         Self {
             inner,
             preview,
+            ghost,
             dialect,
         }
+    }
+
+    /// The ghost to draw on `line`, as `(col, text)` — none while a Ctrl+K
+    /// preview is showing, and none whose text would need a second row.
+    fn ghost_on(&self, line: usize) -> Option<(usize, String)> {
+        if self.preview.with_untracked(|p| p.is_some()) {
+            return None;
+        }
+        self.ghost.with_untracked(|g| {
+            g.as_ref()
+                .filter(|g| g.line == line && !g.text.contains('\n'))
+                .map(|g| (g.col, g.text.clone()))
+        })
     }
 }
 
@@ -422,6 +495,11 @@ impl DocumentPhantom for InlineDiffDoc {
         if let Some(b) = block.filter(|b| !b.before) {
             spans.push((self.inner.rope_text().line_content(line).len(), b.len));
         }
+        // Where `phantom_text` puts it, so the two agree about every column.
+        if let Some((at, text)) = self.ghost_on(line) {
+            let slot = phantom_slot(spans.iter().map(|s| s.0), at);
+            spans.insert(slot, (at, text.len()));
+        }
         before_col_of(&spans, col)
     }
 
@@ -429,6 +507,30 @@ impl DocumentPhantom for InlineDiffDoc {
         // Start from the real document's own phantoms (placeholder, IME preedit)
         // so wrapping never costs the editor either of them.
         let mut out = self.inner.phantom_text(edid, styling, line);
+        // The prediction: dim, at the caret, and `Backward` — floem's own rule
+        // for completion phantoms, which keeps the caret *before* the text it
+        // has not been given yet (`PhantomText::affinity`).
+        if let Some((col, text)) = self.ghost_on(line) {
+            let slot = phantom_slot(out.text.iter().map(|p| p.col), col);
+            out.text.insert(
+                slot,
+                PhantomText {
+                    kind: PhantomTextKind::Completion,
+                    col,
+                    affinity: Some(CursorAffinity::Backward),
+                    text,
+                    font_size: None,
+                    // The editor theme's own foreground, faded — not the field
+                    // placeholder colour, which was drawn but all but invisible
+                    // on the current-line band. Read per relayout, and an
+                    // editor-theme switch relays out every line.
+                    fg: Some(crate::theme::editor_theme().fg.multiply_alpha(GHOST_ALPHA)),
+                    bg: None,
+                    under_line: None,
+                },
+            );
+            return out;
+        }
         // `with_untracked`, not `get_untracked`: the latter clones the whole
         // `InlinePlan` — every hunk and every added line's `String` — and this
         // runs per line, per relayout.
@@ -552,6 +654,18 @@ mod tests {
     /// phantoms at the *same* column — which is what the block's own parts are,
     /// and the case that lets `Block::len` stand in for the list — and columns
     /// before, inside, at both edges of, and past every span.
+    /// The ghost keeps the line's phantom columns non-decreasing wherever it
+    /// lands: before a phantom further right, after one at or before its own
+    /// column.
+    #[test]
+    fn the_ghost_slots_in_after_every_phantom_at_or_before_its_column() {
+        assert_eq!(phantom_slot([], 3), 0);
+        assert_eq!(phantom_slot([0, 5], 3), 1);
+        assert_eq!(phantom_slot([3], 3), 1);
+        assert_eq!(phantom_slot([5], 3), 0);
+        assert_eq!(phantom_slot([0, 3, 3, 9], 3), 3);
+    }
+
     #[test]
     fn before_col_of_agrees_with_floems_own_translation() {
         use floem::views::editor::phantom_text::{PhantomText, PhantomTextKind, PhantomTextLine};

@@ -341,6 +341,10 @@ pub struct UiState {
     /// squiggles. Adds a debounced DB round-trip per edit pause. Default: off.
     #[serde(default)]
     pub live_validate: bool,
+    /// Show the SQL editor's inline predictions — the dim text after the caret
+    /// that Tab takes (`intel::predict`). Default: on.
+    #[serde(default = "default_true")]
+    pub editor_predictions: bool,
     /// Cancel a running statement after this many seconds. **`0` means no
     /// timeout**, which is the default and the behaviour every release before
     /// this one had — a runaway `SELECT` ran until somebody noticed.
@@ -441,6 +445,7 @@ impl Default for UiState {
             word_wrap: false,
             restore_tabs: true,
             live_validate: false,
+            editor_predictions: true,
             statement_timeout_secs: 0,
             // Nothing unrecognised until a file says otherwise.
             extra: serde_json::Map::new(),
@@ -1798,6 +1803,23 @@ mod tests {
             !keys.iter().any(|k| k.as_str() == "extra"),
             "the carrier is written out even when empty: {keys:?}"
         );
+    }
+
+    /// The editor's inline predictions are on unless switched off — for a new
+    /// install and for a file written before the setting existed alike — and a
+    /// switched-off setting stays off.
+    #[test]
+    fn editor_predictions_default_on_and_keep_an_off() {
+        assert!(UiState::default().editor_predictions);
+        let old: UiState = serde_json::from_str("{}").expect("parses");
+        assert!(old.editor_predictions);
+        let off = UiState {
+            editor_predictions: false,
+            ..UiState::default()
+        };
+        let back: UiState = serde_json::from_str(&serde_json::to_string(&off).expect("serialises"))
+            .expect("parses");
+        assert!(!back.editor_predictions);
     }
 
     /// **`#[serde(flatten)]` changes the deserializer's shape for the whole

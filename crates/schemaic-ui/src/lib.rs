@@ -6068,6 +6068,8 @@ pub struct LayoutUi {
     /// Validate the statement under the cursor against the live DB (non-executing
     /// PREPARE) as you type. Drives the editor's Tier-2 diagnostics.
     pub live_validate: RwSignal<bool>,
+    /// Show the SQL editor's inline predictions (`intel::predict`). Persisted.
+    pub editor_predictions: RwSignal<bool>,
     /// Whether the OS window currently has focus. Session-only (never persisted);
     /// set from the workspace root's window-focus events. The app's connection
     /// health poll reads it so a backgrounded Schemaic stops opening connections
@@ -8743,6 +8745,7 @@ fn center(ui: Ui) -> impl IntoView {
         .unwrap_or_default()
     });
     let live_validate = ui.layout.live_validate;
+    let predictions = ui.layout.editor_predictions;
     let validate_stmt = ui.tab_actions.validate_stmt.clone();
     let run = ui.tab_actions.run.clone();
     let run_all = ui.tab_actions.run_all.clone();
@@ -9008,6 +9011,7 @@ fn center(ui: Ui) -> impl IntoView {
                     menus: all_menus,
                     read_only,
                     live_validate,
+                    predictions,
                     validate_stmt: validate_stmt.clone(),
                     popup_menu: popup,
                     popup_anchor,

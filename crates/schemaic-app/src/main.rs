@@ -2264,6 +2264,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let statement_timeout = RwSignal::new(ui_state.statement_timeout_secs);
     let confirm_writes = RwSignal::new(ui_state.confirm_writes);
     let live_validate = RwSignal::new(ui_state.live_validate);
+    let editor_predictions = RwSignal::new(ui_state.editor_predictions);
     let restore_tabs = RwSignal::new(ui_state.restore_tabs);
     schemaic_ui::theme::set_editor_font(editor_font.get_untracked());
     schemaic_ui::theme::set_editor_tab_width(tab_width.get_untracked());
@@ -7403,6 +7404,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     word_wrap: word_wrap.get_untracked(),
                     restore_tabs: restore_tabs.get_untracked(),
                     live_validate: live_validate.get_untracked(),
+                    editor_predictions: editor_predictions.get_untracked(),
                     show_table_sizes: table_sizes.get_untracked(),
                     schema_filter: schema_filter.get_untracked(),
                     // Carried straight back out — see `UiState::extra`. This
@@ -7495,6 +7497,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             confirm_writes.get();
             restore_tabs.get();
             live_validate.get();
+            editor_predictions.get();
             save_ui(persist::Saving::Replacing);
         });
     }
@@ -12595,6 +12598,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             confirm_writes,
             restore_tabs,
             live_validate,
+            editor_predictions,
             window_focused,
         },
         // A divider drag is never a deletion, so the UI's own handle is the

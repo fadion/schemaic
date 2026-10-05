@@ -82,6 +82,12 @@ pub(crate) struct Completion {
     /// sits just *above* the caret so it doesn't collide with the suggestion list).
     /// Editor-*content* coordinates, like `point`.
     pub(crate) sig_point: RwSignal<Point>,
+    /// The inline prediction at the caret (`intel::predict`), drawn by
+    /// `InlineDiffDoc` and taken by Tab. Set with [`inline_diff::set_ghost`] —
+    /// never a bare `set`, for that function's `cache_rev` reason.
+    ///
+    /// [`inline_diff::set_ghost`]: crate::inline_diff::set_ghost
+    pub(crate) ghost: crate::inline_diff::GhostSignal,
 }
 
 /// The ranking vocabulary, which lives in `core::rank` — see that module for why
@@ -676,6 +682,34 @@ pub(crate) struct CompletionCtx<'a> {
     pub(crate) dialect: SqlDialect,
     pub(crate) snippets: Memo<Vec<snippet::Snippet>>,
     pub(crate) conn_id: u64,
+    /// The editor's inline predictions are on (Settings → Editor).
+    pub(crate) predictions: bool,
+}
+
+/// The ghost to show at `offset`, or `None` — [`intel::predict`] over the
+/// *offer* catalog, the one the popup's foreign-key join reads, so a hidden
+/// database is no more predicted from than it is offered.
+fn prediction_at(
+    ed: &Editor,
+    text: &str,
+    offset: usize,
+    ctx: &CompletionCtx<'_>,
+) -> Option<crate::inline_diff::EditorGhost> {
+    if !ctx.predictions {
+        return None;
+    }
+    let catalog = ctx
+        .hidden_dbs
+        .with_untracked(|h| build_offer_catalog(ctx.db_nodes, h, ctx.active_db));
+    let guess = intel::predict(text, offset, &catalog, ctx.dialect)?;
+    let rope = ed.doc().text();
+    let line = rope.line_of_offset(offset);
+    Some(crate::inline_diff::EditorGhost {
+        offset,
+        line,
+        col: offset - rope.offset_of_line(line),
+        text: guess,
+    })
 }
 
 pub(crate) fn recompute_completions(
@@ -691,6 +725,7 @@ pub(crate) fn recompute_completions(
         dialect,
         snippets,
         conn_id,
+        predictions: _,
     } = ctx;
     let offset = ed.cursor.get_untracked().offset();
     let text = ed.doc().text().to_string();
@@ -710,6 +745,19 @@ pub(crate) fn recompute_completions(
     // of a keypress mean what it should: not typing.
     let typed = comp.typed.get_untracked();
     comp.typed.set(false);
+    // **The ghost is asked before either one-shot can return**, because it is
+    // not the popup and neither rule is about it: `suppress` is set by an
+    // accept, and the ghost is wanted straight after one — Tab on `BY ` leaves
+    // `GROUP BY ` and the grouping columns are the next thing to offer — and
+    // an edit no key typed still ends somewhere a ghost can be right. Ctrl+Space
+    // asks for the list, so a forced recompute shows no ghost beside it.
+    let ghost = if force {
+        None
+    } else {
+        prediction_at(ed, &text, offset, &ctx)
+    };
+    let has_ghost = ghost.is_some();
+    crate::inline_diff::set_ghost(comp.ghost, ed, ghost);
     if comp.suppress.get_untracked() {
         comp.suppress.set(false);
         if !force && !after_dot {
@@ -727,6 +775,16 @@ pub(crate) fn recompute_completions(
     }
     let word_lo = word_start(&text, offset);
     let prefix = text.get(word_lo..offset).unwrap_or("").to_string();
+    // **A prediction takes the empty word's place.** With nothing typed yet the
+    // popup opens only on its own guesses — after WHERE/ON/BY, the FK join row —
+    // and a ghost there is the same kind of guess, made with more certainty and
+    // drawn where it would go. Two offers at one caret would leave Tab meaning
+    // whichever happened to be open; Ctrl+Space (`force`) still brings the list.
+    if prefix.is_empty() && has_ghost {
+        comp.open.set(false);
+        set_items(comp, Vec::new());
+        return;
+    }
 
     let (lo, hi) = statement_range(&text, offset, dialect);
     // Context is lexer-based (correct mid-edit); scope prefers the real AST

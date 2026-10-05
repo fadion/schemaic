@@ -1734,6 +1734,7 @@ pub(crate) fn theme_settings_overlay(
     let statement_timeout = layout.statement_timeout;
     let confirm_writes = layout.confirm_writes;
     let live_validate = layout.live_validate;
+    let editor_predictions = layout.editor_predictions;
     let restore_tabs = layout.restore_tabs;
     let open_config_dir = open_config_dir.clone();
 
@@ -1784,8 +1785,21 @@ pub(crate) fn theme_settings_overlay(
                 100,
             );
             let font_section = v_stack((settings_group_label("Font size"), font_dd)).style(ctrl);
-            let editor_group = v_stack((settings_section_header("Editor"), font_section))
-                .style(|s| s.flex_col().gap(theme::scaled(16.0)));
+            let predictions_row = focusable_toggle_row(
+                "Inline predictions",
+                "Show the likely next words after the caret — the partner of a keyword, a \
+                 join's foreign key, the columns to group by or insert — and take them with \
+                 Tab.",
+                editor_predictions,
+                ring.clone(),
+                110,
+            );
+            let editor_group = v_stack((
+                settings_section_header("Editor"),
+                font_section,
+                predictions_row,
+            ))
+            .style(|s| s.flex_col().gap(theme::scaled(16.0)));
 
             // Query group.
             let row_dd =

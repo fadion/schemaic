@@ -12321,6 +12321,514 @@ fn is_real_statement(stmt: &sqlparser::ast::Statement) -> bool {
     }
 }
 
+// ── Inline predictions ───────────────────────────────────────────────────────
+
+/// The text the SQL editor's inline ghost offers at `caret` — inserted there
+/// verbatim when the user presses Tab — or `None` when nothing is certain
+/// enough to offer.
+///
+/// **Deterministic, and only where the answer is close to certain.** Four
+/// producers, asked in this order, each answering only its own shape:
+///
+/// - an empty `JOIN … ON` → the foreign-key condition ([`join_condition`]);
+/// - `INSERT INTO t (` → `t`'s columns and the closing paren;
+/// - `GROUP BY ` → the projection's non-aggregated expressions, read off the
+///   parsed statement in front of it;
+/// - a keyword whose partner the grammar fixes (`ORDER` → `BY`, `LEFT` →
+///   `JOIN`, a statement-opening `INSERT` → `INTO`…), in the case it was typed.
+///
+/// **Where a ghost can be drawn, and nowhere else**: at the end of a line
+/// (nothing after the caret but whitespace and the `)` bracket pairing put
+/// there), straight after whitespace or a `(`, and in code — a caret a string, comment or quoted name runs up to
+/// predicts nothing. And never the word the statement already has next, so
+/// editing `ORDER |` above an existing `BY` offers no second one.
+pub fn predict(sql: &str, caret: usize, catalog: &Catalog, dialect: SqlDialect) -> Option<String> {
+    if caret > sql.len() || !sql.is_char_boundary(caret) {
+        return None;
+    }
+    // What follows on the line may be whitespace and closing parens only: the
+    // editor pairs a `(` as it is typed, so the caret inside a fresh `(…)` has
+    // a `)` after it that nobody wrote and that the ghost simply sits before.
+    let rest = sql[caret..].split('\n').next().unwrap_or("").trim();
+    if !rest.chars().all(|c| c == ')') {
+        return None;
+    }
+    let closed = rest.starts_with(')');
+    let before = sql[..caret].chars().next_back()?;
+    if !(before.is_whitespace() || before == '(') {
+        return None;
+    }
+    let (lo, hi) = crate::sql::statement_range(sql, caret, dialect);
+    if lo > caret || caret_touches_noncode(sql, lo, caret, dialect) {
+        return None;
+    }
+    let toks = tokenize_range(sql, lo, caret, dialect);
+    let guess = join_condition(sql, lo, hi, caret, catalog, dialect)
+        .or_else(|| insert_columns(&toks, catalog, dialect, closed))
+        .or_else(|| group_by_items(sql, lo, &toks, dialect))
+        .or_else(|| keyword_partner(&toks, dialect))?;
+    let next_word = tokenize_range(sql, caret, hi.max(caret), dialect)
+        .into_iter()
+        .find_map(|t| match t.kind {
+            TkKind::Word(w) => Some(w),
+            _ => None,
+        });
+    let first_guessed = guess
+        .split(|c: char| !crate::sql::is_word_byte(c as u8))
+        .next();
+    if let (Some(next), Some(first)) = (next_word, first_guessed)
+        && next.eq_ignore_ascii_case(first)
+    {
+        return None;
+    }
+    Some(guess)
+}
+
+/// Does a string, comment or quoted name run up to (or past) `caret`, reading
+/// only the text before it? — through [`skip_noncode`], the one boundary lexer.
+///
+/// Before the caret only, so an unterminated quote or a line comment counts as
+/// reaching it: that is the caret *inside* one, where a ghost would be typing
+/// into a value or a remark.
+fn caret_touches_noncode(sql: &str, lo: usize, caret: usize, dialect: SqlDialect) -> bool {
+    let b = &sql.as_bytes()[..caret];
+    let mut i = lo;
+    while i < caret {
+        match skip_noncode(b, i, dialect) {
+            Some(j) if j >= caret => return true,
+            Some(j) => i = j,
+            None => i += 1,
+        }
+    }
+    false
+}
+
+/// Whether `CROSS` and `OUTER` may be followed by `APPLY` on this engine, which
+/// makes `JOIN` after them a guess rather than a certainty. T-SQL's alone.
+fn has_apply_joins(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MsSql => true,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+    }
+}
+
+/// [`predict`]'s keyword producer: the last token is a keyword whose next word
+/// the grammar fixes.
+///
+/// Each guard is a place the bare rule was wrong: `INSERT`/`DELETE` also sit
+/// inside a trigger header and a key's `ON DELETE`, so only a statement's first
+/// word counts; `WITHIN GROUP (` takes no `BY`; and the join words wait for a
+/// `FROM`, since `LEFT`/`RIGHT` are string functions too.
+fn keyword_partner(toks: &[Token], dialect: SqlDialect) -> Option<String> {
+    let last = toks.last()?;
+    let TkKind::Word(w) = &last.kind else {
+        return None;
+    };
+    if last.quoted {
+        return None;
+    }
+    let word_at = |i: usize| match toks.get(i).map(|t| &t.kind) {
+        Some(TkKind::Word(w)) => Some(w.to_ascii_uppercase()),
+        _ => None,
+    };
+    let first = toks.len() == 1;
+    let prev = toks.len().checked_sub(2).and_then(word_at);
+    let after_from = toks
+        .iter()
+        .any(|t| !t.quoted && matches!(&t.kind, TkKind::Word(w) if w.eq_ignore_ascii_case("FROM")));
+    let partner = match w.to_ascii_uppercase().as_str() {
+        "GROUP" if prev.as_deref() == Some("WITHIN") => return None,
+        "ORDER" | "GROUP" | "PARTITION" => "BY ",
+        "LEFT" | "RIGHT" | "INNER" | "FULL" if after_from => "JOIN ",
+        "CROSS" | "OUTER" if after_from && !has_apply_joins(dialect) => "JOIN ",
+        "PRIMARY" | "FOREIGN" => "KEY",
+        "INSERT" if first => "INTO ",
+        "DELETE" if first => "FROM ",
+        _ => return None,
+    };
+    // The case the keyword was typed in: all lower answers in lower, anything
+    // else — `ORDER`, `Order` — in the conventional upper.
+    Some(if w.bytes().any(|b| b.is_ascii_uppercase()) {
+        partner.to_string()
+    } else {
+        partner.to_ascii_lowercase()
+    })
+}
+
+/// [`predict`]'s `INSERT INTO t (` producer: `t`'s columns, in table order,
+/// quoted where they need it, and the closing paren.
+///
+/// Only right after the `(` that opens the column list — `INSERT … VALUES (`
+/// is a row, not a column list, and is left alone — and only for a table the
+/// catalog knows the columns of. `closed`: a `)` already follows the caret (the
+/// editor's bracket pairing), so the list is offered without one of its own.
+fn insert_columns(
+    toks: &[Token],
+    catalog: &Catalog,
+    dialect: SqlDialect,
+    closed: bool,
+) -> Option<String> {
+    fn word(t: &Token) -> Option<&str> {
+        match &t.kind {
+            TkKind::Word(w) => Some(w.as_str()),
+            _ => None,
+        }
+    }
+    let head = word(toks.first()?)?;
+    if !(head.eq_ignore_ascii_case("INSERT") || head.eq_ignore_ascii_case("REPLACE")) {
+        return None;
+    }
+    if !matches!(toks.last()?.kind, TkKind::LParen) {
+        return None;
+    }
+    let into = toks
+        .iter()
+        .position(|t| !t.quoted && word(t).is_some_and(|w| w.eq_ignore_ascii_case("INTO")))?;
+    // `name` or `db.name`, and nothing else, between `INTO` and the `(`.
+    let name = &toks[into + 1..toks.len() - 1];
+    let (db, table) = match name {
+        [t] => (None, word(t)?),
+        [d, dot, t] if matches!(dot.kind, TkKind::Dot) => (Some(word(d)?), word(t)?),
+        _ => return None,
+    };
+    let r = TableRef {
+        name: table.to_string(),
+        alias: None,
+        db: db.map(str::to_string),
+    };
+    let cols = catalog.columns_of(&r)?;
+    if cols.is_empty() {
+        return None;
+    }
+    let list: Vec<String> = cols
+        .iter()
+        .map(|c| crate::export::ident_if_needed(c, dialect))
+        .collect();
+    let close = if closed { "" } else { ")" };
+    Some(format!("{}{close}", list.join(", ")))
+}
+
+/// The aggregates a `GROUP BY` prediction leaves out of the grouping list —
+/// upper-case, the bare function name.
+const GROUP_AGGREGATES: &[&str] = &[
+    "COUNT",
+    "SUM",
+    "AVG",
+    "MIN",
+    "MAX",
+    "GROUP_CONCAT",
+    "STRING_AGG",
+    "ARRAY_AGG",
+    "JSON_AGG",
+    "JSONB_AGG",
+    "JSON_ARRAYAGG",
+    "JSON_OBJECTAGG",
+    "JSON_OBJECT_AGG",
+    "JSON_GROUP_ARRAY",
+    "JSON_GROUP_OBJECT",
+    "BIT_AND",
+    "BIT_OR",
+    "BIT_XOR",
+    "BOOL_AND",
+    "BOOL_OR",
+    "EVERY",
+    "STDDEV",
+    "STDDEV_POP",
+    "STDDEV_SAMP",
+    "STDEV",
+    "STDEVP",
+    "VARIANCE",
+    "VAR_POP",
+    "VAR_SAMP",
+    "VAR",
+    "VARP",
+    "LISTAGG",
+    "TOTAL",
+    "COUNT_BIG",
+    "CHECKSUM_AGG",
+    "APPROX_COUNT_DISTINCT",
+];
+
+/// [`predict`]'s `GROUP BY ` producer: what the projection groups by — every
+/// item that is neither an aggregate nor a window — written as it was in the
+/// `SELECT`.
+///
+/// **Read off the parse, not the text.** The statement up to `GROUP` is a
+/// whole query on its own (`SELECT … FROM … WHERE …`), so it is parsed as one
+/// and its projection read from the AST — the rule `core::intel` exists to
+/// hold, and the reason an alias (`x AS c`) gives back `x`, not `c`. A
+/// statement that does not parse there (a `GROUP BY` inside a subquery, half
+/// a `FROM`) predicts nothing. So does a projection that cannot be listed: a
+/// star, or aggregates alone.
+fn group_by_items(sql: &str, lo: usize, toks: &[Token], dialect: SqlDialect) -> Option<String> {
+    use sqlparser::ast::{Expr, SelectItem, SetExpr, Statement, visit_expressions};
+    use std::ops::ControlFlow;
+
+    let [.., group, by] = toks else {
+        return None;
+    };
+    let is = |t: &Token, kw: &str| {
+        !t.quoted && matches!(&t.kind, TkKind::Word(w) if w.eq_ignore_ascii_case(kw))
+    };
+    if !(is(group, "GROUP") && is(by, "BY")) {
+        return None;
+    }
+    let prefix = sql.get(lo..group.at)?;
+    let mut stmts = sqlparser::parser::Parser::parse_sql(&*dialect.parser(), prefix).ok()?;
+    let [Statement::Query(q)] = stmts.as_mut_slice() else {
+        return None;
+    };
+    let SetExpr::Select(sel) = q.body.as_ref() else {
+        return None;
+    };
+    // An aggregate or a window anywhere in the item takes it out of the list.
+    let aggregated = |e: &Expr| {
+        visit_expressions(e, |x| match x {
+            Expr::Function(f) => {
+                let name = f.name.to_string();
+                let bare = name
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or(&name)
+                    .to_ascii_uppercase();
+                if f.over.is_some() || GROUP_AGGREGATES.contains(&bare.as_str()) {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            }
+            _ => ControlFlow::Continue(()),
+        })
+        .is_break()
+    };
+    let mut keys = Vec::new();
+    for item in &sel.projection {
+        let e = match item {
+            SelectItem::UnnamedExpr(e) => e,
+            SelectItem::ExprWithAlias { expr, .. } => expr,
+            _ => return None,
+        };
+        if !aggregated(e) {
+            keys.push(e.to_string());
+        }
+    }
+    (!keys.is_empty()).then(|| keys.join(", "))
+}
+
+#[cfg(test)]
+mod predict_tests {
+    use super::*;
+    use crate::schema::{ColumnInfo, ForeignKeyInfo, TableInfo};
+
+    fn tbl(name: &str, cols: &[&str]) -> TableInfo {
+        TableInfo {
+            name: name.to_string(),
+            columns: cols
+                .iter()
+                .map(|c| ColumnInfo {
+                    name: c.to_string(),
+                    type_name: "int".to_string(),
+                    nullable: true,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn shop() -> DbSchema {
+        let mut orders = tbl("orders", &["id", "customer_id", "total"]);
+        orders.foreign_keys = vec![ForeignKeyInfo {
+            columns: vec!["customer_id".to_string()],
+            ref_table: "customers".to_string(),
+            ref_columns: vec!["id".to_string()],
+            ..Default::default()
+        }];
+        DbSchema {
+            tables: vec![orders, tbl("customers", &["id", "name"])],
+            ..Default::default()
+        }
+    }
+
+    /// The prediction at the end of `sql`.
+    fn at_end(sql: &str, dialect: SqlDialect) -> Option<String> {
+        let schema = shop();
+        let cat = Catalog::build(&[("shop", &schema)], Some("shop"));
+        predict(sql, sql.len(), &cat, dialect)
+    }
+
+    fn my(sql: &str) -> Option<String> {
+        at_end(sql, SqlDialect::MySql)
+    }
+
+    /// The prediction at the `|` in `sql`, which is removed first.
+    fn at_bar(sql: &str) -> Option<String> {
+        let caret = sql.find('|').expect("a caret");
+        let text = sql.replacen('|', "", 1);
+        let schema = shop();
+        let cat = Catalog::build(&[("shop", &schema)], Some("shop"));
+        predict(&text, caret, &cat, SqlDialect::MySql)
+    }
+
+    #[test]
+    fn a_keyword_whose_partner_is_certain_predicts_it() {
+        for (sql, want) in [
+            ("SELECT id FROM orders ORDER ", "BY "),
+            ("SELECT id FROM orders GROUP ", "BY "),
+            ("SELECT id, row_number() OVER (PARTITION ", "BY "),
+            ("SELECT * FROM orders o LEFT ", "JOIN "),
+            ("SELECT * FROM orders o INNER ", "JOIN "),
+            ("SELECT * FROM orders o RIGHT ", "JOIN "),
+            ("SELECT * FROM orders o FULL ", "JOIN "),
+            ("SELECT * FROM orders o CROSS ", "JOIN "),
+            ("SELECT * FROM orders o LEFT OUTER ", "JOIN "),
+            ("CREATE TABLE t (id int PRIMARY ", "KEY"),
+            ("CREATE TABLE t (c int, FOREIGN ", "KEY"),
+            ("INSERT ", "INTO "),
+            ("DELETE ", "FROM "),
+        ] {
+            assert_eq!(my(sql).as_deref(), Some(want), "{sql}");
+        }
+    }
+
+    /// The prediction is written in the case the keyword was typed in.
+    #[test]
+    fn a_keyword_typed_in_lower_case_is_answered_in_lower_case() {
+        assert_eq!(my("select id from orders order ").as_deref(), Some("by "));
+        assert_eq!(my("insert ").as_deref(), Some("into "));
+        assert_eq!(my("Select * From orders Left ").as_deref(), Some("JOIN "));
+    }
+
+    /// `INSERT` and `DELETE` begin many things that are not their statements:
+    /// a trigger's `BEFORE INSERT ON`, a key's `ON DELETE CASCADE`.
+    #[test]
+    fn insert_and_delete_predict_only_at_the_start_of_a_statement() {
+        assert_eq!(my("CREATE TRIGGER t BEFORE INSERT "), None);
+        assert_eq!(
+            my("ALTER TABLE t ADD FOREIGN KEY (a) REFERENCES b (id) ON DELETE "),
+            None
+        );
+        assert_eq!(my("SELECT 1;\nINSERT ").as_deref(), Some("INTO "));
+        assert_eq!(my("SELECT 1;\ndelete ").as_deref(), Some("from "));
+    }
+
+    /// T-SQL's `CROSS APPLY` and `OUTER APPLY` make the partner a guess there.
+    #[test]
+    fn cross_and_outer_are_not_certain_on_sql_server() {
+        assert_eq!(at_end("SELECT * FROM a CROSS ", SqlDialect::MsSql), None);
+        assert_eq!(at_end("SELECT * FROM a OUTER ", SqlDialect::MsSql), None);
+        assert_eq!(
+            at_end("SELECT * FROM a LEFT ", SqlDialect::MsSql).as_deref(),
+            Some("JOIN ")
+        );
+    }
+
+    #[test]
+    fn nothing_is_predicted_before_the_keyword_is_finished() {
+        assert_eq!(my("SELECT id FROM orders ORDER"), None);
+        assert_eq!(my("SELECT id FROM orders ORD"), None);
+        assert_eq!(my(""), None);
+        assert_eq!(my("   "), None);
+    }
+
+    /// Text that is not code predicts nothing: a string, a comment, a quoted
+    /// name that happens to spell a keyword.
+    #[test]
+    fn a_keyword_in_a_string_comment_or_quoted_name_predicts_nothing() {
+        assert_eq!(my("SELECT 'order "), None);
+        assert_eq!(my("SELECT 1 -- order "), None);
+        assert_eq!(my("SELECT 1 /* group "), None);
+        assert_eq!(my("SELECT `order` "), None);
+        assert_eq!(at_end("SELECT \"order\" ", SqlDialect::Postgres), None);
+    }
+
+    /// A ghost is drawn after the caret, so it is offered only where nothing
+    /// follows on the line — and never for a word the statement already has.
+    #[test]
+    fn nothing_is_predicted_mid_line_or_for_a_word_already_there() {
+        assert_eq!(at_bar("SELECT id FROM orders ORDER | id"), None);
+        assert_eq!(at_bar("SELECT id FROM orders ORDER |\nBY id"), None);
+        assert_eq!(
+            at_bar("SELECT id FROM orders ORDER |  \nLIMIT 1").as_deref(),
+            Some("BY ")
+        );
+    }
+
+    #[test]
+    fn an_empty_join_condition_predicts_the_foreign_key() {
+        assert_eq!(
+            my("SELECT * FROM orders o JOIN customers c ON ").as_deref(),
+            Some("o.customer_id = c.id")
+        );
+        assert_eq!(
+            my("SELECT * FROM orders o JOIN customers c ON o.id = 1 AND "),
+            None
+        );
+    }
+
+    #[test]
+    fn group_by_predicts_the_projected_columns_that_are_not_aggregated() {
+        assert_eq!(
+            my("SELECT customer_id, total, count(*) FROM orders GROUP BY ").as_deref(),
+            Some("customer_id, total")
+        );
+        assert_eq!(
+            my("select o.customer_id as c, sum(total) from orders o group by ").as_deref(),
+            Some("o.customer_id")
+        );
+        assert_eq!(
+            my("SELECT customer_id, count(*) FROM orders WHERE total > 1 GROUP BY ").as_deref(),
+            Some("customer_id")
+        );
+    }
+
+    /// Only when the list is knowable: a star cannot be listed, a projection
+    /// of aggregates alone groups by nothing, and a window function is not a
+    /// grouping key.
+    #[test]
+    fn group_by_predicts_nothing_it_cannot_list() {
+        assert_eq!(my("SELECT *, count(*) FROM orders GROUP BY "), None);
+        assert_eq!(
+            my("SELECT count(*), max(total) FROM orders GROUP BY "),
+            None
+        );
+        assert_eq!(
+            my("SELECT id, row_number() OVER (ORDER BY id) FROM orders GROUP BY ").as_deref(),
+            Some("id")
+        );
+        assert_eq!(my("SELECT customer_id FROM orders GROUP BY total, "), None);
+    }
+
+    #[test]
+    fn an_insert_column_list_predicts_the_tables_columns() {
+        assert_eq!(my("INSERT INTO customers (").as_deref(), Some("id, name)"));
+        assert_eq!(
+            my("insert into shop.customers (").as_deref(),
+            Some("id, name)")
+        );
+        assert_eq!(my("INSERT INTO nowhere ("), None);
+        assert_eq!(my("INSERT INTO customers (id"), None);
+        assert_eq!(my("INSERT INTO customers VALUES ("), None);
+    }
+
+    /// **The editor pairs brackets as they are typed**, so the `(` that opens
+    /// the column list arrives with its `)` already after the caret. A closer
+    /// there is not "something on the line" to the ghost, and the list it
+    /// predicts leaves out the `)` that is already written.
+    #[test]
+    fn an_auto_paired_closer_after_the_caret_still_predicts() {
+        assert_eq!(
+            at_bar("INSERT INTO customers (|)").as_deref(),
+            Some("id, name")
+        );
+        assert_eq!(
+            at_bar("SELECT * FROM (SELECT id FROM orders ORDER |)").as_deref(),
+            Some("BY ")
+        );
+        assert_eq!(at_bar("INSERT INTO customers (|) VALUES"), None);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

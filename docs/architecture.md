@@ -1756,6 +1756,36 @@ existing prose was left alone.
     `SELECT a`, which parses perfectly and means something else entirely. That is what
     `noise_in_the_middle_is_not_stitched_around` pins, and it is the reason the guard exists. The
     cost is deliberate: a valid statement this parser cannot handle is refused rather than shown.
+    **`predict` is the editor's inline ghost — deterministic, not AI, and offered only where the
+    answer is close to certain.** It returns the text Tab would insert at the caret, from four
+    producers asked in order, each answering only its own shape: an empty `JOIN … ON` gets
+    `join_condition`'s foreign-key predicate; `INSERT`/`REPLACE … INTO t (` (or `db.t (`) gets the
+    table's columns from `Catalog::columns_of`, quoted through `export::ident_if_needed` like every
+    fragment above, plus a `)` unless one already follows; `GROUP BY ` gets the grouping list; and a
+    keyword whose partner the grammar fixes gets the partner (`ORDER`/`GROUP`/`PARTITION` → `BY`,
+    `PRIMARY`/`FOREIGN` → `KEY`, `INSERT` → `INTO`, `DELETE` → `FROM`, the join words → `JOIN`),
+    in lower case when the keyword was typed all-lower. It answers nothing unless the rest of the
+    caret's line is whitespace and `)` — the editor auto-pairs a `(`, so `INSERT INTO t (|)` has a
+    closer nobody wrote — the character before the caret is whitespace or `(`, and the word it
+    would offer is not the one the statement already has next (editing `ORDER |` above an existing
+    `BY` offers no second one). It also refuses a caret in a string, comment or quoted name, and
+    that is `caret_touches_noncode` walking only the text *before* the caret through `skip_noncode`,
+    so an unterminated quote or a line comment running up to the caret counts as the caret being
+    inside one — the one boundary lexer, not a new scanner. Each keyword guard is a place the bare
+    rule was wrong: `INSERT`/`DELETE` count only as a statement's first word, since both also sit
+    in a trigger header and a key's `ON DELETE`; `WITHIN GROUP (` takes no `BY`; every join word
+    waits for a `FROM`, since `LEFT`/`RIGHT` are string functions too; and `CROSS`/`OUTER` predict
+    nothing where `has_apply_joins` says an `APPLY` may follow — T-SQL alone, asked as a
+    capability through an exhaustive match, so a new engine has to answer it.
+    **The grouping list is read off the parse, not the text** — the rule this module exists to
+    hold. The statement up to `GROUP` is a whole query on its own, so it is parsed with sqlparser
+    and every projection item holding neither an aggregate (`GROUP_AGGREGATES`, on the bare
+    upper-cased function name) nor a window is listed through the AST's `Display`, which is why
+    `x AS c` gives back `x`, not `c`. A star, an all-aggregate projection or a prefix that does not
+    parse (a `GROUP BY` inside a subquery, a half-written `FROM`) predicts nothing. The UI asks it
+    over the offer catalogue (under `completion.rs`) and only while the `editor_predictions`
+    setting is on — Settings → Editor → *Inline predictions*, on by default. `predict_tests` covers
+    each producer and gate, `an_auto_paired_closer_after_the_caret_still_predicts` the `)` one.
   - `pg_builtins.rs` — the **PostgreSQL builtin catalog**, the third entry in
     `intel::builtin_catalog` and the one that could not be written by hand, and the reason the typo
     checker is on for this engine at all. `PG_FUNCTIONS` is 2,706 entries and the split is the point:
@@ -22068,6 +22098,18 @@ existing prose was left alone.
     squiggled — and **merged** into a same-named table's entries rather than written over them,
     as the diagnostics catalogue does (`a_synonym_is_offered_its_resolved_tables_columns`,
     S4.2-L1-05, red before).
+    **The inline prediction is asked before the popup, and outranks it on an empty word.**
+    `recompute_completions` asks `prediction_at` — `intel::predict` over the *offer* catalogue
+    (`build_offer_catalog`), the one the FK join row reads, so a hidden database is no more predicted
+    from than offered — and publishes the answer through `inline_diff::set_ghost` **before either
+    one-shot can return**. `suppress` is set by an accept, and the next prediction is wanted
+    straight after one: Tab on a `BY ` ghost leaves `GROUP BY `, whose grouping columns are the next
+    thing to offer, so a ghost asked after the one-shot would break that chain at its second link.
+    A forced recompute (Ctrl+Space) asks for the list, so it shows no ghost beside it. With the word
+    at the caret empty and a ghost showing, the popup does not open: that is the slot `auto_show`
+    (columns after `WHERE`/`ON`/`BY`) and the FK join row used to take, and two offers at one caret
+    would leave Tab meaning whichever happened to be open. Ctrl+Space still brings the list, join
+    row included. `CompletionCtx::predictions` is the switch, from the `editor_predictions` setting.
   - `tabs.rs` — query-tab strip, and where a **`.sql`-backed tab** shows itself. The state behind
     that is four signals on `Tab`: `path`, `disk_sql` (the file's text as of the last open / save /
     reload — `None` means *unknown*, which reads as modified, the safe direction), `file_format`
@@ -22569,6 +22611,17 @@ existing prose was left alone.
     an ordinary replacement whose replacement does not contain the needle that list is **empty**, so
     the bar reported no matches, `n/total` collapsed and Enter did nothing, over a document that still
     held every occurrence: the screen read as though the replace had happened.
+    **Tab takes the inline prediction ahead of the soft-tab indent, on `ghost_takes_tab`'s terms**
+    (`ghost_key_tests`): a plain Tab — no Shift, no primary modifier — with the list closed, since an
+    open list owns Tab, and the caret still at the offset the ghost was made for. Anything else falls
+    through to the indent. The insert goes through `edit_untyped`, so the Ctrl+K freeze holds and
+    `suppress` keeps the popup from reopening over the inserted words, and the caret is put after
+    them; a refused insert still spends the key. Escape turns a ghost down as it does the list and
+    signature help, consuming the key only when one of the three was showing. **A ghost lives only
+    at the caret it was made for**: an effect on `ed.cursor` clears it the moment the caret leaves
+    that offset or a selection appears, so after a click elsewhere Tab indents again; an edit moves
+    the caret too, and the recompute it schedules asks again for the new spot.
+    `QueryPaneParams::predictions` carries the setting in.
   - `inline_diff.rs` — the Ctrl+K suggestion rendered **in the editor's own line flow**: the lines
     it replaces stay where they are, faded, and the lines it proposes appear directly below them,
     pushing the rest of the document down. They are Floem *phantom text* (the facility inlay hints
@@ -22655,6 +22708,26 @@ existing prose was left alone.
     block at column 0, a block at end of line, both at once, several phantoms at the *same* column
     — which is what a block's own parts are, and the case that lets `Block::len` stand in for the
     list — and columns before, inside, at both edges of, and past every span.
+    **The editor's inline prediction is a second phantom on the same wrapper.** `EditorGhost`
+    carries the caret `offset` it was made at and the `text`, plus that offset's `line` and byte
+    `col`, so the per-line question floem asks on every relayout is a comparison rather than a walk
+    of the rope; it lives in a `GhostSignal` that `InlineDiffDoc::new` takes beside the preview.
+    `phantom_text` draws it at the caret's column as a `PhantomTextKind::Completion` with
+    `affinity: Some(CursorAffinity::Backward)` — floem's own rule for completion phantoms, which
+    keeps the caret *before* text it has not been given yet — in `editor_theme().fg` at
+    `GHOST_ALPHA` (0.45). **Not `theme::placeholder()`**: that was checked in the running app and
+    was drawn but all but invisible on the current-line band. It is not drawn while a Ctrl+K view
+    is up in either state, nor when its text holds a `\n` — and `has_multiline_phantom` does not
+    consult the ghost, so that refusal is what keeps its answer true. `set_ghost` is `set_preview`'s
+    twin, `cache_rev` bump and early return included, and the early return matters at least as
+    much here: `completion::recompute_completions` calls it on every recompute, so without the
+    comparison an unchanged ghost would discard every cached line layout per keystroke. **The ghost
+    is inserted, never pushed**, because of the column-order rule (the Floem gotcha on phantom
+    text): the wrapped document's own IME preedit sits at the same caret column, so `phantom_slot`
+    puts it after every phantom at or before its column
+    (`the_ghost_slots_in_after_every_phantom_at_or_before_its_column`), and `before_phantom_col`
+    inserts the ghost's span at the same slot so the caret's column translation and the drawn text
+    agree.
   - `erd_view.rs` — the **ER-diagram** canvas over `core::erd`. Edges are drawn by a custom paint
     view (`EdgeCanvas`), *not* a Floem `svg` — `svg` doesn't repaint reliably on reactive change
     here and blanked the edges on drag/hover. Zoom is **semantic, not a paint transform**: cards and
@@ -30804,15 +30877,17 @@ Re-introducing the anti-patterns these guard against is a regression:
   to go through that count. `PhantomTextLine.text` is walked **in stored order**, accumulating a
   column shift as it goes (`combine_with_text`), and floem never re-sorts it: the columns must be
   non-decreasing, so a block rendering *before* the line (column 0) has to lead the list and an
-  end-of-line block has to trail it. Per-token colour therefore works by pushing one `PhantomText`
+  end-of-line block has to trail it, and a phantom at a mid-line column — the inline prediction at
+  the caret — has to be inserted at its place (`inline_diff::phantom_slot`). Per-token colour therefore works by pushing one `PhantomText`
   per token — each carries a single `fg`, and the order you give them is the order they render in.
   **An added line that is empty has to render as a single space**: `relevant_layouts()` filters out
   layouts with no glyphs, so a genuinely empty row collapses and the block comes out one row shorter
   than it claims. And **writing the signal a phantom is built from changes nothing on screen by
   itself** — phantom text is baked into the line's cached `TextLayout` and that cache is keyed on
   `cache_rev`, so the write has to bump it or the rows appear a frame late, or not until the next
-  keystroke happens to invalidate the line. `inline_diff::set_preview` is the one place that pair is
-  spelled out, and the only way the preview should be set.
+  keystroke happens to invalidate the line. `inline_diff::set_preview` and its twin `set_ghost` are
+  the two places that pair is spelled out, and the only ways the Ctrl+K preview and the inline
+  prediction should be set.
 - **Wrap the editor's document *last*: `TextEditor`'s document-callback builders silently do
   nothing on a wrapped doc.** `update`, `placeholder` and `pre_command` each resolve the document
   with `downcast_rc::<TextDocument>()` and are written `if let Some(doc) = self.text_doc() { … }`
@@ -31634,7 +31709,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   keystroke was: type `sel`, dismiss the list, right-click → Paste, and the popup opened on the
   pasted text because the flag was still standing from the `l`. `Completion::suppress` is the other
   half and a different thing: a one-shot that closes an open list after an edit the app itself made
-  (`edit_untyped`, accept).
+  (`edit_untyped`, accept). The inline prediction is asked *before* both and answers to neither —
+  it is not the popup, and `suppress` is spent by the very accept the next ghost has to follow
+  (under `completion.rs`).
 - **`Editor::points_of_offset` returns *content* coords, not viewport-relative** (`.y` is `vline_y`,
   the absolute document y; the gutter view subtracts `viewport.y0` itself). Overlays pinned in
   `editor_area` must subtract `ed.viewport.get()` `x0`/`y0` to follow scroll — see `span_box_at`

@@ -119,6 +119,22 @@ fn scrollbar_geo(lines: usize, line_h: f64, viewport_h: f64) -> Option<(f64, f64
     Some((viewport_h, thumb_h, (content_h - viewport_h).max(1.0)))
 }
 
+/// Does this Tab take the inline prediction?
+///
+/// Only a plain Tab, only with the completion list closed — an open list owns
+/// Tab, and a forced list (Ctrl+Space) is never shown beside a ghost — and only
+/// while the caret is still where the prediction was made. Anything else falls
+/// through to the indent it always was.
+fn ghost_takes_tab(
+    ghost_at: Option<usize>,
+    caret: usize,
+    list_open: bool,
+    shift: bool,
+    primary: bool,
+) -> bool {
+    ghost_at == Some(caret) && !list_open && !shift && !primary
+}
+
 /// Apply an edit the user did **not** type, without popping the completion list.
 ///
 /// Every document change re-runs the completion recompute a tick later, and that
@@ -2149,6 +2165,8 @@ pub(crate) struct QueryPaneParams {
     /// Whether to validate the statement under the cursor against the live DB as
     /// you type (Tier-2 diagnostics). Persisted setting.
     pub live_validate: RwSignal<bool>,
+    /// Show inline predictions after the caret, taken by Tab. Persisted setting.
+    pub predictions: RwSignal<bool>,
     /// Requests a debounced DB validation of the statement under the cursor.
     pub validate_stmt: ValidateFn,
     pub popup_menu: RwSignal<Option<Vec<MenuEntry>>>,
@@ -2208,6 +2226,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         menus,
         read_only,
         live_validate,
+        predictions,
         validate_stmt,
         popup_menu,
         popup_anchor,
@@ -2229,6 +2248,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         typed: RwSignal::new(false),
         sig: RwSignal::new(None),
         sig_point: RwSignal::new(Point::ZERO),
+        ghost: RwSignal::new(None),
     };
     let cmdk = CmdK {
         open: RwSignal::new(false),
@@ -2478,9 +2498,15 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         if matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::Escape), _)) {
             let had_sig = comp.sig.get_untracked().is_some();
             let had_list = comp.open.get_untracked();
+            // The ghost too: it is an offer like the list, and Escape is how an
+            // offer is turned down.
+            let had_ghost = comp.ghost.with_untracked(|g| g.is_some());
             comp.sig.set(None);
             comp.open.set(false);
-            if had_sig || had_list {
+            if had_ghost {
+                editor_sig.with_untracked(|e| inline_diff::set_ghost(comp.ghost, e, None));
+            }
+            if had_sig || had_list || had_ghost {
                 return CommandExecuted::Yes;
             }
         }
@@ -2525,6 +2551,43 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 )
             ) {
                 comp.open.set(false);
+            }
+        }
+        // Tab takes the inline prediction, ahead of the indent below — see
+        // `ghost_takes_tab` for when it may. Through `edit_untyped`, so the
+        // Ctrl+K freeze holds and the popup does not reopen over the inserted
+        // words; the recompute that edit schedules asks for the *next*
+        // prediction before that one-shot, which is what chains `GROUP ` →
+        // `BY ` → the grouping columns.
+        if matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::Tab), _)) {
+            let taken = editor_sig.with_untracked(|e| {
+                let caret = e.cursor.get_untracked().offset();
+                let ghost = comp.ghost.get_untracked();
+                if !ghost_takes_tab(
+                    ghost.as_ref().map(|g| g.offset),
+                    caret,
+                    comp.open.get_untracked(),
+                    mods.shift(),
+                    primary_held(mods),
+                ) {
+                    return false;
+                }
+                let Some(g) = ghost else { return false };
+                inline_diff::set_ghost(comp.ghost, e, None);
+                if edit_untyped(
+                    e,
+                    comp,
+                    Selection::caret(caret),
+                    &g.text,
+                    EditType::Completion,
+                ) {
+                    e.cursor
+                        .update(|c| c.set_offset(caret + g.text.len(), false, false));
+                }
+                true
+            });
+            if taken {
+                return CommandExecuted::Yes;
             }
         }
         // Soft-tab indent: floem's built-in InsertTab uses the buffer's own fixed
@@ -2610,6 +2673,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                             dialect: dialect.get_untracked(),
                             snippets,
                             conn_id: active_conn.get_untracked(),
+                            predictions: predictions.get_untracked(),
                         },
                         comp,
                         true,
@@ -3148,6 +3212,24 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 .filter(|(a, b)| a != b),
         );
     });
+
+    // **A ghost lives only at the caret it was made for.** A click, an arrow or
+    // a selection moves the caret off it, and the prediction was about that one
+    // spot — so it goes, and Tab goes back to indenting. An edit moves the caret
+    // too; the recompute that edit schedules asks again for the new spot.
+    {
+        let ed_ghost = ed.clone();
+        create_effect(move |_| {
+            let cur = ed_ghost.cursor.get();
+            let stale = comp.ghost.with_untracked(|g| {
+                g.as_ref()
+                    .is_some_and(|g| cur.get_selection() != Some((g.offset, g.offset)))
+            });
+            if stale {
+                inline_diff::set_ghost(comp.ghost, &ed_ghost, None);
+            }
+        });
+    }
 
     // Bracket matching: recompute the matched-paren offsets on every caret move
     // (tracks `ed.cursor`) and edit (tracks `query`). Pure/boundary-aware via
@@ -3855,6 +3937,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                             dialect: dialect.get_untracked(),
                             snippets,
                             conn_id: active_conn.get_untracked(),
+                            predictions: predictions.get_untracked(),
                         },
                         comp,
                         false,
@@ -3959,6 +4042,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         .use_doc(Rc::new(inline_diff::InlineDiffDoc::new(
             inner_doc,
             cmdk.preview,
+            comp.ghost,
             dialect.get_untracked(),
         )) as Rc<dyn floem::views::editor::text::Document>)
         .style(|s| {
@@ -6155,6 +6239,32 @@ mod cmdk_preview_gate {
             );
         }
         assert_eq!(checked, 1, "this gate is stale — it found {checked}");
+    }
+}
+
+#[cfg(test)]
+mod ghost_key_tests {
+    use super::ghost_takes_tab;
+
+    #[test]
+    fn a_plain_tab_at_the_predictions_caret_takes_it() {
+        assert!(ghost_takes_tab(Some(12), 12, false, false, false));
+    }
+
+    /// An open list owns Tab; Shift+Tab outdents; Ctrl+Tab cycles tabs.
+    #[test]
+    fn tab_belongs_elsewhere_while_the_list_is_open_or_a_modifier_is_held() {
+        assert!(!ghost_takes_tab(Some(12), 12, true, false, false));
+        assert!(!ghost_takes_tab(Some(12), 12, false, true, false));
+        assert!(!ghost_takes_tab(Some(12), 12, false, false, true));
+    }
+
+    /// No ghost, or one made at a caret that has since moved, leaves Tab to
+    /// indent.
+    #[test]
+    fn a_missing_or_stale_prediction_leaves_tab_to_indent() {
+        assert!(!ghost_takes_tab(None, 12, false, false, false));
+        assert!(!ghost_takes_tab(Some(12), 13, false, false, false));
     }
 }
 
