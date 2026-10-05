@@ -31,7 +31,7 @@ use floem::reactive::create_effect;
 
 use schemaic_core::ddl::{self, DatabaseDraft};
 
-use crate::table_designer::{edit_ctx, suggest_chevron};
+use crate::table_designer::{edit_ctx, suggest_field};
 use crate::widgets::{
     ACTION_TAB, ActionKind, FocusRing, action_button, action_gap, focus_root_with_ring, form_gap,
     form_section, form_setting, modal_footer_split, modal_h, modal_pad_h, modal_title_owned,
@@ -246,7 +246,8 @@ fn bound_field(
 
 /// An optional field, written back as `None` when it is emptied — which is what
 /// makes "let the server choose" reachable again after something was typed —
-/// with a [`suggest_chevron`] beside it offering `options`.
+/// with a chevron beside it offering `options`, and the field's inline ghost
+/// offering the same list — both [`suggest_field`]'s.
 ///
 /// **Free text plus a shortcut, not a picker**, which is the standing the
 /// designer's column-type field has and the reason that control is shared rather
@@ -281,27 +282,19 @@ fn optional_field(
         }
         v
     });
-    h_stack((
-        edit_field(
-            sig,
-            FieldCfg {
-                placeholder,
-                focus: Some((ring.clone(), tabindex)),
-                ..Default::default()
-            },
-        )
-        .style(move |s| s.width(field_w())),
-        suggest_chevron(
-            overlay,
-            sig,
-            options,
-            empty_note,
-            ring.clone(),
-            tabindex + 1,
-        ),
-    ))
-    .style(|s| s.flex_row().items_center().gap(theme::scaled(2.0)))
-    .into_any()
+    suggest_field(
+        overlay,
+        sig,
+        FieldCfg {
+            placeholder,
+            ..Default::default()
+        },
+        field_w,
+        options,
+        empty_note,
+        ring.clone(),
+        tabindex,
+    )
 }
 
 fn form(

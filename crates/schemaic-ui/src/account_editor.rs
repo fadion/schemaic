@@ -54,7 +54,7 @@ use schemaic_core::users::{
     self, AccountDraft, GrantDraft, GrantLevelKind, GrantSubject, Principal, PrincipalKind,
 };
 
-use crate::table_designer::suggest_chevron;
+use crate::table_designer::suggest_field;
 use crate::widgets::{
     ACTION_TAB, ActionKind, FocusRing, action_button, action_gap, autohide, focus_root_with_ring,
     form_gap, form_section, form_setting, form_setting_owned, modal_footer_split, modal_h,
@@ -504,27 +504,19 @@ fn suggested_field<D: Clone + 'static>(
         }
         v
     });
-    h_stack((
-        edit_field(
-            sig,
-            FieldCfg {
-                placeholder,
-                focus: Some((ring.clone(), tabindex)),
-                ..Default::default()
-            },
-        )
-        .style(move |s| s.width(field_w())),
-        suggest_chevron(
-            overlay,
-            sig,
-            options,
-            empty_note,
-            ring.clone(),
-            tabindex + 1,
-        ),
-    ))
-    .style(|s| s.flex_row().items_center().gap(theme::scaled(2.0)))
-    .into_any()
+    suggest_field(
+        overlay,
+        sig,
+        FieldCfg {
+            placeholder,
+            ..Default::default()
+        },
+        field_w,
+        options,
+        empty_note,
+        ring.clone(),
+        tabindex,
+    )
 }
 
 // ── what makes a form rebuild ────────────────────────────────────────────────

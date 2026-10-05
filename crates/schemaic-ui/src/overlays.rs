@@ -4588,28 +4588,16 @@ fn build_items(
 /// The dim tail of `complete` beyond what the user has typed — the inline ghost
 /// showing where Tab would land — or `None` when there is nothing to show.
 ///
-/// **Every slice here is taken at a real char boundary of `complete`, and that
-/// is the whole point.** The previous version tested the prefix on the two
-/// strings *lowercased* and then sliced the **original-cased** `complete` at the
-/// typed query's byte length. `char::to_lowercase` is not length-preserving —
-/// `İ` (U+0130) is 2 bytes and lowercases to `i` + U+0307, 3 bytes — so that
-/// index need not be a boundary in `complete`, and `&str` indexing panics. A
-/// table named `İzmir` plus the single typed letter `i` crashed the app.
-///
-/// So walk `complete`'s own boundaries and take the first whose lowercased head
-/// covers the query. Case-insensitive, like the hit test it has to agree with.
+/// [`schemaic_core::text::completion_tail`] is the rule, char boundaries and
+/// all; it is shared with [`crate::FieldCfg::suggest`]'s ghost, which is the
+/// same picture in a form field. The one thing the palette adds is the empty
+/// query: its box shows the selected row's whole name before anything is typed,
+/// which a form field deliberately does not.
 fn ghost_suffix(complete: &str, query: &str) -> Option<String> {
-    let q = query.to_lowercase();
-    if q.is_empty() {
+    if query.is_empty() {
         return (!complete.is_empty()).then(|| complete.to_string());
     }
-    complete
-        .char_indices()
-        .map(|(i, c)| i + c.len_utf8())
-        .find(|&i| complete[..i].to_lowercase().starts_with(&q))
-        // A completion equal to what's typed has no tail worth painting.
-        .filter(|&i| i < complete.len())
-        .map(|i| complete[i..].to_string())
+    schemaic_core::text::completion_tail(complete, query).map(str::to_string)
 }
 
 pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {

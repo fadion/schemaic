@@ -12175,6 +12175,18 @@ existing prose was left alone.
       by the grid's stats line and the properties surface so `200k` means one thing — and bound by a
       round-trip property: every string it emits must parse back through `model::goto_row_index`.
       Not the namesake in `transcript.rs`, which buckets token counts differently on purpose.
+      `completion_tail(complete, typed)` is the **inline ghost's** rule — the tail of `complete`
+      past a case-insensitive prefix `typed` — and it walks `complete`'s own char boundaries rather
+      than slicing at the lowercased length, because lowercasing is not length-preserving: the Find
+      palette's first ghost sliced that way, and a table named `İzmir` plus a typed `i` landed inside
+      a character and crashed the app. An empty `typed` answers `None` on purpose — a whole value
+      painted into an empty box reads as one the box already holds — so the palette's
+      `ghost_suffix`, which does show the selected row's name in an empty box, keeps that arm on its
+      own side and delegates the rest. `field_suggestion(typed, options)` is the form field's half
+      (`FieldCfg::suggest`, under `lib.rs`): the first option, in the caller's order, with a tail to
+      paint, and `None` once `typed` already *is* an option in any case — typing `int` with `int` and
+      `integer` both listed is a whole answer, and a ghost offering `eger` there would turn the Tab
+      that moves on into the Tab that changes the value.
     - `stats.rs` — table statistics: `TableStats`/`IndexStats`/`SchemaStats`, `format_bytes`
       (1024-based, IEC units), `format_age`, and the honesty types. Every figure is an `Option`
       because the three engines publish different facts — `supports_table_stats` is `false` for
@@ -18268,7 +18280,10 @@ existing prose was left alone.
     change a selection is clicking every row, which is not a thing a keyboard can do —
     `section_title`/`centered_msg`/`toggle_icon` (whose `enabled` is **not optional**: every panel
     toggle in the footer needs it, so the ungated shims that passed `|| true` were only hiding the
-    fact — see *The footer's panel toggles* below), `tip_when`, `measure_text_px`,
+    fact — see *The footer's panel toggles* below), `tip_when`, `measure_text_px` (and
+    `measure_field_text_px`, text as an `edit_field` draws it — in `MONO_FAMILY` when the field is
+    `mono` — which is what places a suggestion ghost after the typed text: the column-type field is
+    mono, and a body-face measurement lands the tail inside its own text),
     `jump_to_bottom_button`. Also `dedup_key` — the one-line `create_memo` wrapper a
     `dyn_container` key goes through so a write that doesn't change *this* node's answer doesn't
     rebuild it. It is here rather than in either caller because two of them have the same shape, a
@@ -20432,9 +20447,16 @@ existing prose was left alone.
     back through effects, so a draft-keyed form would tear down the field being typed into
     (it's keyed on `(tab, selected, rev)`, where `rev` is bumped on structural edits because
     removing the selected row leaves `selected` unchanged over a different item).
-    It also owns two things the other editors reuse: `list_pane` — the list-plus-action-bar that
-    is **one** Tab stop with Up/Down inside it (over `widgets::list_step`) — and
-    `focusable_owned_dropdown`, the picker for a value that isn't `Copy`.
+    It also owns three things the other editors reuse: `list_pane` — the list-plus-action-bar that
+    is **one** Tab stop with Up/Down inside it (over `widgets::list_step`) —
+    `focusable_owned_dropdown`, the picker for a value that isn't `Copy`, and `suggest_field`, the
+    **one** builder of a free-text field with a `suggest_chevron` beside it. One options closure
+    feeds both the menu and the field's inline ghost (`FieldCfg::suggest`, under `lib.rs`), so the
+    ghost cannot offer what the menu does not hold; the field takes `tabindex` and the chevron
+    `tabindex + 1`. The pair was hand-assembled in four modules before the ghost came, and a field
+    built on its own copy would have gained the menu and not the ghost — the column Type and MySQL
+    Engine (`bound_field_with_menu`), the database editor's `optional_field`, the grant form's
+    `suggested_field` and the domain's base Type all go through it now.
     The preview's SQL box is a read-only monospace `edit_field` that **wraps**: it was `no_wrap`,
     and an `edit_field` has no wheel to scroll sideways (only the editor pane wires Shift+wheel, see
     the Floem gotchas), so the end of a long statement — a selective XML index's paths, a rebuild's
@@ -21177,8 +21199,9 @@ existing prose was left alone.
     offered at all: the server refuses it unless the locale clauses and `TEMPLATE template0`
     agree, so a field for it would mostly produce *"new encoding is incompatible with the
     encoding of the template database"*.
-    All three are **free text with a `suggest_chevron` beside them**, the designer's
-    column-type pattern, because every value they take is per-server and per-version — a
+    All three are **free text with a `suggest_chevron` beside them** — built by
+    `table_designer::suggest_field`, so each also ghosts the first listed value the typed text
+    begins and takes it on Tab — the designer's column-type pattern, because every value they take is per-server and per-version — a
     collation only MariaDB has, a role created five minutes ago. The MySQL lists are the
     constants `ddl::MYSQL_CHARSETS`/`MYSQL_COLLATIONS`, and the Collation row is offered
     `ddl::database_collations(dialect)`, which is the latter on MySQL and `MSSQL_COLLATIONS` on SQL
@@ -21189,7 +21212,8 @@ existing prose was left alone.
     'pg\_%'` whose escape only survives while `standard_conforming_strings` is on), fetched on
     open like the trigger editor's functions — which is why `suggest_chevron` takes its options
     as a **closure read at press time**: the reply lands after the form is built, and rebuilding
-    the row to deliver it would tear down a field the user may be typing in. That closure is also
+    the row to deliver it would tear down a field the user may be typing in. The ghost reads the
+    same closure on every keystroke, untracked, for the same reason. That closure is also
     why the chevron now **refuses to open on an empty list**: `popup_menu_overlay` builds a panel
     for any `Some`, and an empty entry vec still draws — height collapsing to the padding and
     border, width clamping to the 170px floor — so a press before the fetch landed painted an
@@ -21280,7 +21304,7 @@ existing prose was left alone.
     added**: another `ui: &Ui` would have raised this file's `whole_ui_gate` budget, and the
     ratchet's only legal direction is down, so `suggested_field` and the
     `table_designer::suggest_chevron` it
-    wraps both narrowed from `&Ui` to `crate::OverlayUi` — the two `Copy` signals (`popup_menu`,
+    wraps (through `suggest_field` now) both narrowed from `&Ui` to `crate::OverlayUi` — the two `Copy` signals (`popup_menu`,
     `popup_anchor`) are the whole of the chevron's interest in the bundle — across four call sites,
     which is what takes `table_designer.rs`'s entry 33 → 32 in a change about accounts. That entry
     went to **29** next: `clamp_selection` and `swap_selected` narrowed to `DdlUi` — every signal
@@ -24062,6 +24086,23 @@ existing prose was left alone.
     because the field's own re-mask arrives through the same `update` hook and reporting it back
     would loop the pair of effects that produced it — a flag suffices because `on_update` runs
     synchronously inside `edit_single`.
+    **`FieldCfg::suggest` is the inline ghost a free-text field with a menu wears.** While the field
+    is focused, the caret sits at the end with nothing selected and the field is neither read-only
+    nor frozen, the first listed value the typed text begins (`text::field_suggestion`) paints its
+    tail in the placeholder colour, and Tab takes it. One closure, `ghost_of`, is asked by both the
+    painter and the Tab handler, so the key can only take what is on screen. The tail is an absolute
+    overlay in the placeholder's stack, moved right by the typed text's width
+    (`widgets::measure_field_text_px`, in the field's own face) and back by the editor viewport's
+    `x0`, so a value longer than the box still has its tail at the caret rather than at the
+    unscrolled end. The list is read **untracked**, on every keystroke: the database editor's Owner
+    roles arrive from a fetch after the form is built and the next keystroke sees them, while a
+    tracked read would subscribe the field to whatever signals the closure touches. Accept sets the
+    field to the option **in the list's spelling**, not the typed head plus the tail — a collation
+    or a role is the server's spelling — and then puts the caret at the end explicitly, keeping
+    focus. **That caret move is load-bearing**: the signal→doc reconcile maps the old caret through
+    the common prefix, which leaves it mid-text whenever the typed head already matched the
+    option's case. Every caller reaches it through `table_designer::suggest_field`; Tab's precedence
+    is under *Floem 0.2 gotchas*.
     The shared types living in the crate root is what stalls further splitting: the
     root depends on the leaves (`mod`) and the leaves depend on the root (types), so a view builder
     can't move out until the types do.
@@ -31403,6 +31444,16 @@ Re-introducing the anti-patterns these guard against is a regression:
   the PG function body and the view editor's `SELECT`. Deliberately not on prose (the AI settings'
   custom instructions) or on the DDL preview's read-only script box, where there is no indent to
   type and Tab moving on is simply better.
+- **A field offering suggestions takes Tab only while its ghost is showing.** `lib.rs`'s
+  `tab_action` is `edit_field`'s whole Tab precedence as one decision — `on_tab`, then a showing
+  `FieldCfg::suggest` ghost (`TabAction::Accept`), then `tab_indents`, then the ring, then floem's
+  `InsertTab` — and the ghost arm is gated on a ghost being *on screen*, not on the field having a
+  list: with none showing, Tab means what it meant before the field had suggestions. Accepting
+  keeps the keyboard in the field, so a second Tab moves on; `text::field_suggestion` answers
+  `None` once the text already is an option, which is what stops an exact `int` being "completed"
+  to `integer` by the key meant to leave. **Shift+Tab never accepts** — a completion is a forward
+  motion — and walks back past the ghost. `field_key_tests` pins the order
+  (`a_showing_ghost_is_accepted_before_the_ring_steps`, `shift_tab_never_accepts_a_completion`).
 - **A popup that takes the keyboard can only be closed from the *window root*.** The corollary of
   the directed dispatch above, and it is not obvious: a modal's Escape handler runs because its
   `focus_root` is the *focused view*, not because it is an ancestor — there is no bubbling in

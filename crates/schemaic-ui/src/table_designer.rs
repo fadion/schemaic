@@ -714,7 +714,10 @@ fn field_view(
 /// `empty_note` is what the menu says when [`suggest_chevron`]'s `options`
 /// answer nothing — see the "nothing to suggest" arm for why the menu is not
 /// simply withheld.
-pub(crate) fn suggest_chevron<F: Fn() -> Vec<String> + 'static>(
+///
+/// Private to this module, and called only by [`suggest_field`]: a chevron
+/// placed by hand beside a field would offer the menu without the ghost.
+fn suggest_chevron<F: Fn() -> Vec<String> + 'static>(
     overlay: crate::OverlayUi,
     sig: RwSignal<String>,
     options: F,
@@ -816,7 +819,58 @@ pub(crate) fn suggest_chevron<F: Fn() -> Vec<String> + 'static>(
     button
 }
 
-/// [`bound_field`] plus a [`suggest_chevron`] writing into it.
+/// A free-text field with a [`suggest_chevron`] beside it — **the one builder
+/// of that pair**, which every field offering a menu of values goes through.
+///
+/// One list feeds both halves: the chevron's menu, and the field's inline ghost
+/// ([`FieldCfg::suggest`]), which offers the first of the same values the typed
+/// text begins and takes it on Tab. Sharing it is the point: a ghost proposing
+/// something the menu doesn't hold would be a second, unexplained list. The pair
+/// was hand-assembled in four modules before the ghost came, and a field built
+/// on its own copy would have gained the menu and not the ghost.
+///
+/// `cfg` carries what differs between the fields (placeholder, `mono`); the ring
+/// position and the suggestions are set here, the field at `tabindex` and the
+/// chevron at `tabindex + 1`, so Tab walks the box you type in and then the list
+/// of things you could have typed.
+#[allow(clippy::too_many_arguments)] // a UI builder; grouping into a struct adds no clarity
+pub(crate) fn suggest_field<F: Fn() -> Vec<String> + 'static>(
+    overlay: OverlayUi,
+    sig: RwSignal<String>,
+    cfg: FieldCfg,
+    width: fn() -> f64,
+    options: F,
+    empty_note: &'static str,
+    ring: FocusRing,
+    tabindex: u32,
+) -> AnyView {
+    let options: Rc<dyn Fn() -> Vec<String>> = Rc::new(options);
+    let menu = options.clone();
+    h_stack((
+        edit_field(
+            sig,
+            FieldCfg {
+                suggest: Some(options),
+                focus: Some((ring.clone(), tabindex)),
+                ..cfg
+            },
+        )
+        // Called inside the closure, as `field_view` explains.
+        .style(move |s| s.width(width())),
+        suggest_chevron(
+            overlay,
+            sig,
+            move || (menu)(),
+            empty_note,
+            ring,
+            tabindex + 1,
+        ),
+    ))
+    .style(|s| s.flex_row().items_center().gap(theme::scaled(2.0)))
+    .into_any()
+}
+
+/// [`bound_field`] as a [`suggest_field`].
 #[allow(clippy::too_many_arguments)] // a UI builder; grouping into a struct adds no clarity
 fn bound_field_with_menu(
     draft: RwSignal<TableDraft>,
@@ -831,19 +885,20 @@ fn bound_field_with_menu(
     apply: impl Fn(&mut TableDraft, &str) + 'static,
 ) -> AnyView {
     let sig = bound_signal(draft, initial, apply);
-    h_stack((
-        field_view(sig, width, placeholder, mono, ring.clone(), tabindex),
-        suggest_chevron(
-            overlay,
-            sig,
-            move || options.clone(),
-            "No suggestions",
-            ring,
-            tabindex + 1,
-        ),
-    ))
-    .style(|s| s.flex_row().items_center().gap(theme::scaled(2.0)))
-    .into_any()
+    suggest_field(
+        overlay,
+        sig,
+        FieldCfg {
+            placeholder,
+            mono,
+            ..Default::default()
+        },
+        width,
+        move || options.clone(),
+        "No suggestions",
+        ring,
+        tabindex,
+    )
 }
 
 /// A `<select>`-style picker over owned values (the settings one needs `Copy`,

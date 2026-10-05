@@ -115,9 +115,131 @@ pub fn hides_detail(msg: &str, fits_chars: usize) -> bool {
     msg.trim_end().contains('\n') || msg.chars().count() > fits_chars
 }
 
+/// The part of `complete` beyond what has been `typed`, when `typed` is a
+/// case-insensitive prefix of it — the dim tail an inline ghost paints after the
+/// caret — or `None` when it is not a prefix, or nothing is left to paint.
+///
+/// **Every slice is taken at a real char boundary of `complete`.** Lowercasing is
+/// not length-preserving — `İ` (U+0130) is two bytes and lowercases to `i` plus
+/// U+0307, three — so slicing the original-cased `complete` at the length of the
+/// lowercased `typed` can land inside a character, and `&str` indexing panics on
+/// that. The Find palette's first ghost did exactly this, and a table named
+/// `İzmir` plus the typed letter `i` crashed the app. So the walk is over
+/// `complete`'s own boundaries, taking the first whose lowercased head covers
+/// what was typed.
+///
+/// An empty `typed` answers `None`, deliberately: a ghost is a completion of
+/// something, and a whole value painted into an empty box reads as a value the
+/// box already holds. The palette, which does show its first row's whole name in
+/// an empty box, asks for that on its side.
+pub fn completion_tail<'a>(complete: &'a str, typed: &str) -> Option<&'a str> {
+    let q = typed.to_lowercase();
+    if q.is_empty() {
+        return None;
+    }
+    complete
+        .char_indices()
+        .map(|(i, c)| i + c.len_utf8())
+        .find(|&i| complete[..i].to_lowercase().starts_with(&q))
+        .filter(|&i| i < complete.len())
+        .map(|i| &complete[i..])
+}
+
+/// The option an inline ghost offers for a free-text field holding `typed`: the
+/// first of `options`, in their order, that `typed` is a case-insensitive prefix
+/// of and that has something left to add ([`completion_tail`]).
+///
+/// **`None` once `typed` already *is* an option**, whatever its case. Typing
+/// `int` in a type box whose list holds both `int` and `integer` has produced a
+/// whole answer; a ghost offering `eger` there would turn the one key that moves
+/// on — Tab — into the key that changes the value.
+///
+/// The order is the caller's: these lists are curated with the common answer
+/// first, and the first match is the one the ghost shows.
+pub fn field_suggestion<'a>(typed: &str, options: &'a [String]) -> Option<&'a str> {
+    let q = typed.to_lowercase();
+    if options.iter().any(|o| o.to_lowercase() == q) {
+        return None;
+    }
+    options
+        .iter()
+        .find(|o| completion_tail(o, typed).is_some())
+        .map(String::as_str)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn opts(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_completion_tail_is_what_is_left_after_a_case_insensitive_prefix() {
+        assert_eq!(completion_tail("varchar(255)", "var"), Some("char(255)"));
+        // The tail keeps the completion's own casing, whatever was typed.
+        assert_eq!(completion_tail("varchar(255)", "VAR"), Some("char(255)"));
+        assert_eq!(
+            completion_tail("utf8mb4_0900_ai_ci", "utf8MB4_"),
+            Some("0900_ai_ci")
+        );
+    }
+
+    #[test]
+    fn a_completion_tail_is_none_when_nothing_is_left_or_it_is_no_prefix() {
+        assert_eq!(completion_tail("text", "text"), None);
+        assert_eq!(completion_tail("text", "TEXT"), None);
+        assert_eq!(completion_tail("text", "tex t"), None);
+        assert_eq!(completion_tail("text", "texts"), None);
+        assert_eq!(completion_tail("text", "x"), None);
+        assert_eq!(completion_tail("", "a"), None);
+    }
+
+    /// A ghost completes something; an empty box has nothing to complete.
+    #[test]
+    fn an_empty_typed_value_has_no_completion_tail() {
+        assert_eq!(completion_tail("integer", ""), None);
+        assert_eq!(completion_tail("", ""), None);
+    }
+
+    /// The crash the palette's ghost shipped with: `İ` lowercases to three
+    /// bytes from two, so a slice at the typed length is not a boundary.
+    #[test]
+    fn a_completion_tail_is_cut_at_a_char_boundary_when_case_changes_length() {
+        assert_eq!(completion_tail("İzmir", "i"), Some("zmir"));
+        assert_eq!(completion_tail("İzmir", "İz"), Some("mir"));
+        assert_eq!(completion_tail("çağrı", "ÇA"), Some("ğrı"));
+    }
+
+    #[test]
+    fn a_field_suggestion_is_the_first_option_the_typed_text_begins() {
+        let types = opts(&["integer", "bigint", "int", "varchar(255)", "varbinary(255)"]);
+        assert_eq!(field_suggestion("var", &types), Some("varchar(255)"));
+        assert_eq!(field_suggestion("VARB", &types), Some("varbinary(255)"));
+        assert_eq!(field_suggestion("i", &types), Some("integer"));
+        assert_eq!(field_suggestion("big", &types), Some("bigint"));
+    }
+
+    /// Typing a whole option is an answer, not the start of a longer one.
+    #[test]
+    fn a_field_suggestion_is_none_once_the_typed_text_is_an_option() {
+        let types = opts(&["integer", "int"]);
+        assert_eq!(field_suggestion("int", &types), None);
+        assert_eq!(field_suggestion("INT", &types), None);
+        assert_eq!(field_suggestion("integer", &types), None);
+        // Short of a whole option, the longer one is still offered.
+        assert_eq!(field_suggestion("inte", &types), Some("integer"));
+    }
+
+    #[test]
+    fn a_field_suggestion_is_none_for_an_empty_value_list_or_no_match() {
+        let types = opts(&["integer", "text"]);
+        assert_eq!(field_suggestion("", &types), None);
+        assert_eq!(field_suggestion("x", &types), None);
+        assert_eq!(field_suggestion("te", &[]), None);
+        assert_eq!(field_suggestion("text(", &types), None);
+    }
 
     #[test]
     fn a_leading_bom_comes_off_and_nothing_else_does() {

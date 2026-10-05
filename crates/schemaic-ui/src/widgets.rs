@@ -4591,7 +4591,8 @@ pub(crate) fn open_picker(
 /// answers with nothing, and is indistinguishable from one that is broken, which
 /// is how it was reported the first time.
 ///
-/// [`crate::table_designer::suggest_chevron`] already had this arm and carried
+/// `table_designer::suggest_chevron` (behind
+/// [`crate::table_designer::suggest_field`]) already had this arm and carried
 /// its own note; its sibling `focusable_owned_dropdown` — the wrapper behind
 /// every dropdown in the designer, the object editor, the trigger editor, the
 /// view editor, the event editor and the routine editor — did not. It is
@@ -4878,6 +4879,13 @@ pub(crate) fn measure_text_px_bold_at(text: &str, size: f32) -> f64 {
 
 fn measure_text_px_weighted(text: &str, size: f32, bold: bool) -> f64 {
     measure_text_px_styled(text, size, bold, false)
+}
+
+/// The width of `text` as an `edit_field` draws it: at `size`, in the app's
+/// monospace face when the field is `mono` and the body face otherwise. What
+/// places a field's suggestion ghost after the typed text.
+pub(crate) fn measure_field_text_px(text: &str, size: f32, mono: bool) -> f64 {
+    measure_text_px_styled(text, size, false, mono)
 }
 
 /// [`measure_text_px_at`]'s other axis: the line box a label of this size

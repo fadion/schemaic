@@ -10647,6 +10647,20 @@ pub(crate) struct FieldCfg {
     /// Tab (e.g. accept the command-palette ghost completion). When set, the key
     /// is consumed here instead of inserting a tab / moving focus.
     pub on_tab: Option<Rc<dyn Fn()>>,
+    /// **Values to complete what is typed with, inline.** While the field has
+    /// focus, the caret is at the end and nothing is selected, the first of these
+    /// the typed text begins ([`schemaic_core::text::field_suggestion`]) paints
+    /// its remaining tail after the caret in the placeholder colour — a ghost —
+    /// and Tab takes it: the field becomes that value, **in the list's
+    /// spelling**, with the caret at its end and the keyboard still here. With no
+    /// ghost showing, Tab does what it did before ([`tab_action`]).
+    ///
+    /// For the fields that pair free text with a `suggest_chevron` menu, which
+    /// pass the menu's own list (`table_designer::suggest_field`), so the ghost
+    /// can only offer what the menu would. Read on every keystroke, untracked
+    /// inside it — the closure may read a signal that arrives late (the database
+    /// editor's server roles), and the next keystroke sees it.
+    pub suggest: Option<Rc<dyn Fn() -> Vec<String>>>,
     /// Place the field in a modal's Tab order at this index.
     ///
     /// The ring has to reach *inside* the editor's key handler: floem registers
@@ -10736,6 +10750,7 @@ impl Default for FieldCfg {
             on_ctrl_arrow_down: None,
             uncommitted: None,
             on_tab: None,
+            suggest: None,
             focus: None,
             tab_indents: false,
             caret_end: None,
@@ -10811,29 +10826,43 @@ fn common_suffix_len(a: &str, b: &str, floor: usize) -> usize {
 pub(crate) enum TabAction {
     /// Run [`FieldCfg::on_tab`] (the command palette's ghost completion).
     Callback,
+    /// Take the [`FieldCfg::suggest`] ghost showing in the field.
+    Accept,
     /// Move to the next control in [`FieldCfg::focus`]'s ring.
     StepRing,
     /// Leave the key to floem, whose editor maps it to `InsertTab`.
     Insert,
 }
 
-/// [`edit_field`]'s three-way Tab precedence, as one decision rather than three
+/// [`edit_field`]'s Tab precedence, as one decision rather than a run of
 /// sequential `if`s.
 ///
 /// `on_tab` first, because it is an explicit override for this specific key;
-/// then [`FieldCfg::tab_indents`], which is the field saying Tab is typing here;
+/// then a [`FieldCfg::suggest`] ghost, **only while one is showing** (`ghost`)
+/// — the field's ghost is an offer on screen, and with none there Tab means
+/// what it meant before the field had suggestions, which is the ring; then
+/// [`FieldCfg::tab_indents`], which is the field saying Tab is typing here;
 /// then the ring. A field with none of them lets floem insert a tab, which is
 /// also what a `tab_indents` field does — the difference between those two is
 /// only reachable through the ring, so the enum keeps them distinct rather than
 /// collapsing to a bool.
 ///
-/// **Shift+Tab never runs `on_tab`.** Accepting a completion is a forward
-/// motion, and its one caller (the palette) has no ring, so a shifted Tab there
-/// falls through to `Insert` — which is what the code did before this was
-/// written down, and what the doc on `on_tab` says.
-pub(crate) fn tab_action(on_tab: bool, tab_indents: bool, in_ring: bool, shift: bool) -> TabAction {
+/// **Shift+Tab never runs `on_tab` and never accepts a ghost.** Accepting a
+/// completion is a forward motion. `on_tab`'s one caller (the palette) has no
+/// ring, so a shifted Tab there falls through to `Insert` — which is what the
+/// code did before this was written down, and what the doc on `on_tab` says —
+/// and a suggesting field's walks back past the ghost.
+pub(crate) fn tab_action(
+    on_tab: bool,
+    ghost: bool,
+    tab_indents: bool,
+    in_ring: bool,
+    shift: bool,
+) -> TabAction {
     if on_tab && !shift {
         TabAction::Callback
+    } else if ghost && !shift {
+        TabAction::Accept
     } else if in_ring && !tab_indents {
         TabAction::StepRing
     } else {
@@ -10912,6 +10941,7 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
         on_ctrl_arrow_down,
         uncommitted,
         on_tab,
+        suggest,
         focus,
         tab_indents,
         caret_end,
@@ -10957,6 +10987,30 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
     // Visual (wrapped) line count → drives the box height (clamped to `cap`).
     let rows = RwSignal::new(1usize);
 
+    // The value a `suggest` ghost offers, or `None` when none is showing — one
+    // function, asked by both the overlay that paints the ghost and the Tab
+    // that takes it, so the key can only take what is on screen. The list is
+    // read untracked: the overlay re-asks on every keystroke anyway, and a
+    // tracked read would subscribe the field to whatever signals the closure
+    // touches.
+    let ghost_of = {
+        let suggest = suggest.clone();
+        move |typed: &str, caret_at_end: bool, has_focus: bool| -> Option<String> {
+            let options = suggest.as_ref()?;
+            let stopped = read_only || frozen.is_some_and(|f| f.get_untracked());
+            if !has_focus || !caret_at_end || stopped {
+                return None;
+            }
+            let list = untrack(|| options());
+            schemaic_core::text::field_suggestion(typed, &list).map(str::to_string)
+        }
+    };
+    // "The caret sits at the end of `typed` with nothing selected" — the one
+    // place a tail painted after the text is where typing would continue.
+    let caret_at_end = |c: &floem::views::editor::core::cursor::Cursor, typed: &str| {
+        c.get_selection() == Some((typed.len(), typed.len()))
+    };
+
     let submit = on_submit.clone();
     let escape = on_escape.clone();
     let arrow_up = on_arrow_up.clone();
@@ -10965,6 +11019,7 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
     let ctrl_down = on_ctrl_arrow_down.clone();
     let tab = on_tab.clone();
     let key_focus = focus.clone();
+    let key_ghost = ghost_of.clone();
     let editor = text_editor_keys(text_sig.get_untracked(), move |editor_sig, kp, mods| {
         // A masked field has no undo. Its document holds `*`s, so the history
         // floem would replay is a history of masks: an undo re-inserts mask
@@ -11054,8 +11109,15 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
             return CommandExecuted::Yes;
         }
         if matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::Tab), _)) {
+            let ghost = {
+                let typed = text_sig.get_untracked();
+                let at_end = editor_sig
+                    .with_untracked(|e| e.cursor.with_untracked(|c| caret_at_end(c, &typed)));
+                (key_ghost)(&typed, at_end, focused.get_untracked())
+            };
             match tab_action(
                 tab.is_some(),
+                ghost.is_some(),
                 tab_indents,
                 key_focus.is_some(),
                 mods.shift(),
@@ -11063,6 +11125,22 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
                 TabAction::Callback => {
                     if let Some(cb) = &tab {
                         (cb)();
+                    }
+                    return CommandExecuted::Yes;
+                }
+                // The list's spelling, not the typed head plus a tail: the
+                // value a collation or a role takes is the server's. The set
+                // reconciles the document synchronously, so the caret is put at
+                // the end of the text that is now there — the reconcile alone
+                // would keep it where it was whenever the typed head matched
+                // the value's own case.
+                TabAction::Accept => {
+                    if let Some(value) = ghost {
+                        text_sig.set(value);
+                        editor_sig.with_untracked(|e| {
+                            let len = e.doc().text().to_string().len();
+                            e.cursor.update(|c| c.set_offset(len, false, false));
+                        });
                     }
                     return CommandExecuted::Yes;
                 }
@@ -11665,6 +11743,46 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
     // placeholder text (which sits on top) fails to focus the field.
     .pointer_events(|| false);
 
+    // The `suggest` ghost: the offered value's tail, painted where the next typed
+    // character would go. Positioned like the placeholder above, then moved
+    // right by the typed text's width **in the face the editor draws it in** —
+    // a mono field measured in Plex Sans lands the tail inside its own text —
+    // and back by the editor's horizontal scroll, so a value longer than the box
+    // still has its tail at the caret rather than at the unscrolled end.
+    let ghost_ed = ed.clone();
+    let ghost_tail = move || -> Option<String> {
+        let typed = text_sig.get();
+        let at_end = ghost_ed.cursor.with(|c| caret_at_end(c, &typed));
+        let value = ghost_of(&typed, at_end, focused.get())?;
+        schemaic_core::text::completion_tail(&value, &typed).map(str::to_string)
+    };
+    let ghost_pos_ed = ed.clone();
+    let ghost = dyn_container(ghost_tail, move |tail| match tail {
+        Some(tail) => text(tail)
+            .style(move |s| {
+                s.font_size(font_size())
+                    .font_family(if mono { MONO_FAMILY } else { "IBM Plex Sans" }.to_string())
+                    .color(placeholder_color())
+                    .width_full()
+                    .min_width(0.0)
+                    .text_ellipsis()
+            })
+            .into_any(),
+        None => empty().into_any(),
+    })
+    .style(move |s| {
+        let typed_w = text_sig.with(|t| widgets::measure_field_text_px(t, font_size(), mono));
+        let scrolled = ghost_pos_ed.viewport.with(|v| v.x0);
+        // `has_side`, where the placeholder above passes `has_trailing`: the
+        // clearable × shows exactly while the field holds text, which is when
+        // the placeholder is hidden and the only time a ghost can show.
+        s.absolute()
+            .inset_left(chat_pad_h() + typed_w - scrolled)
+            .inset_right(placeholder_right_inset(has_side))
+            .inset_top(ph_top())
+    })
+    .pointer_events(|| false);
+
     // Trailing × that empties the value. In-flow beside the editor (which
     // flex-grows) — NOT an absolute overlay — so the editor's width is bounded
     // and its text can never scroll underneath the ×.
@@ -11741,7 +11859,7 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
     // recorded at registration rather than the editor's signal, which by cleanup
     // time may already be disposed.
     let ring_cleanup = focus.map(|(ring, _)| ring);
-    stack((inner, placeholder))
+    stack((inner, placeholder, ghost))
         .on_cleanup(move || {
             // Hand the keyboard back if this field held it — floem clears the
             // focus of a removed view *silently*, so a field that unmounts while
@@ -14170,11 +14288,18 @@ mod field_key_tests {
     #[test]
     fn an_explicit_tab_handler_wins() {
         assert_eq!(
-            tab_action(true, false, true, false),
+            tab_action(true, false, false, true, false),
             TabAction::Callback,
             "even with a ring"
         );
-        assert_eq!(tab_action(true, true, true, false), TabAction::Callback);
+        assert_eq!(
+            tab_action(true, false, true, true, false),
+            TabAction::Callback
+        );
+        assert_eq!(
+            tab_action(true, true, false, true, false),
+            TabAction::Callback
+        );
     }
 
     /// Accepting a completion is a forward motion, so a shifted Tab isn't one.
@@ -14182,14 +14307,46 @@ mod field_key_tests {
     /// to floem.
     #[test]
     fn shift_tab_never_accepts_a_completion() {
-        assert_eq!(tab_action(true, false, false, true), TabAction::Insert);
-        assert_eq!(tab_action(true, false, true, true), TabAction::StepRing);
+        assert_eq!(
+            tab_action(true, false, false, false, true),
+            TabAction::Insert
+        );
+        assert_eq!(
+            tab_action(true, false, false, true, true),
+            TabAction::StepRing
+        );
+        // Nor a field's ghost: Shift+Tab walks back past it.
+        assert_eq!(
+            tab_action(false, true, false, true, true),
+            TabAction::StepRing
+        );
+    }
+
+    /// A showing ghost is what Tab takes — and the field keeps the keyboard, so
+    /// the accepted value can still be typed on. The next Tab, with no ghost
+    /// left, steps the ring as before.
+    #[test]
+    fn a_showing_ghost_is_accepted_before_the_ring_steps() {
+        assert_eq!(
+            tab_action(false, true, false, true, false),
+            TabAction::Accept
+        );
+        assert_eq!(
+            tab_action(false, false, false, true, false),
+            TabAction::StepRing
+        );
     }
 
     #[test]
     fn a_ringed_field_steps_in_both_directions() {
-        assert_eq!(tab_action(false, false, true, false), TabAction::StepRing);
-        assert_eq!(tab_action(false, false, true, true), TabAction::StepRing);
+        assert_eq!(
+            tab_action(false, false, false, true, false),
+            TabAction::StepRing
+        );
+        assert_eq!(
+            tab_action(false, false, false, true, true),
+            TabAction::StepRing
+        );
     }
 
     /// A field holding code types the indent — Escape is the way out, and the
@@ -14197,14 +14354,26 @@ mod field_key_tests {
     /// too, deliberately: half a step-away would be stranger than none.
     #[test]
     fn a_code_field_types_the_indent_instead_of_leaving() {
-        assert_eq!(tab_action(false, true, true, false), TabAction::Insert);
-        assert_eq!(tab_action(false, true, true, true), TabAction::Insert);
+        assert_eq!(
+            tab_action(false, false, true, true, false),
+            TabAction::Insert
+        );
+        assert_eq!(
+            tab_action(false, false, true, true, true),
+            TabAction::Insert
+        );
     }
 
     #[test]
     fn a_plain_field_outside_any_ring_inserts() {
-        assert_eq!(tab_action(false, false, false, false), TabAction::Insert);
-        assert_eq!(tab_action(false, true, false, false), TabAction::Insert);
+        assert_eq!(
+            tab_action(false, false, false, false, false),
+            TabAction::Insert
+        );
+        assert_eq!(
+            tab_action(false, false, true, false, false),
+            TabAction::Insert
+        );
     }
 
     /// `is_modifier_key` decides whether a keypress **commits** recalled text.

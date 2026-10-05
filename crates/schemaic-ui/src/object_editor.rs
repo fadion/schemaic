@@ -42,7 +42,7 @@ use schemaic_core::schema::{
     CheckInfo, ObjectItem, SequenceInfo, SequenceOwner, TsqlObject, TsqlObjectKind,
 };
 
-use crate::table_designer::{edit_ctx, focusable_owned_dropdown, suggest_chevron};
+use crate::table_designer::{edit_ctx, focusable_owned_dropdown, suggest_field};
 use crate::widgets::{
     ACTION_TAB, ActionKind, FocusRing, action_button, action_gap, focus_root_with_ring, form_gap,
     form_section, form_setting, form_setting_owned, modal_footer_split, modal_h, modal_pad_h,
@@ -735,31 +735,24 @@ fn domain_form(
             // a domain can be built on a type no fixed list holds (another
             // domain, an array, an extension's), so the box is the answer and the
             // menu is only a shortcut into it.
-            h_stack((
-                edit_field(
-                    sig,
-                    FieldCfg {
-                        placeholder: "text",
-                        focus: Some((ring.clone(), 20)),
-                        ..Default::default()
-                    },
-                )
-                .style(move |s| s.width(field_w())),
-                suggest_chevron(
-                    overlay,
-                    sig,
-                    move || {
-                        ddl::common_types(dialect)
-                            .iter()
-                            .map(|t| t.to_string())
-                            .collect()
-                    },
-                    "This engine suggests no base types",
-                    ring.clone(),
-                    21,
-                ),
-            ))
-            .style(|s| s.flex_row().items_center().gap(theme::scaled(2.0))),
+            suggest_field(
+                overlay,
+                sig,
+                FieldCfg {
+                    placeholder: "text",
+                    ..Default::default()
+                },
+                field_w,
+                move || {
+                    ddl::common_types(dialect)
+                        .iter()
+                        .map(|t| t.to_string())
+                        .collect()
+                },
+                "This engine suggests no base types",
+                ring.clone(),
+                20,
+            ),
         )
     };
     let default = form_setting(
