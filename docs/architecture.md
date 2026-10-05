@@ -1793,11 +1793,23 @@ existing prose was left alone.
     (`an_insert_column_list_leaves_out_what_the_server_assigns`,
     `an_insert_into_a_key_only_table_still_names_the_key`).
     **The grouping list is read off the parse, not the text** — the rule this module exists to
-    hold. The statement up to `GROUP` is a whole query on its own, so it is parsed with sqlparser
-    and every projection item holding neither an aggregate (`GROUP_AGGREGATES`, on the bare
-    upper-cased function name) nor a window is listed through the AST's `Display`, which is why
-    `x AS c` gives back `x`, not `c`. A star, an all-aggregate projection or a prefix that does not
-    parse (a `GROUP BY` inside a subquery, a half-written `FROM`) predicts nothing. The UI asks it
+    hold. The query up to `GROUP` is a whole query on its own, so it is parsed with sqlparser and
+    its grouping keys listed through the AST's `Display`, which is why `x AS c` gives back `x`, not
+    `c`. *Which* query is the one the `GROUP BY` belongs to: the text after the innermost `(` still
+    open before `GROUP` (`local_scope_start` — a derived table, a CTE body), else the statement;
+    within that, the `SELECT` an `INSERT` or a `CREATE VIEW` is built from, and a set operation's
+    last arm, the one being typed (`group_by_reads_the_query_it_belongs_to`). It used to parse the
+    whole statement, so a `GROUP BY` inside a subquery predicted nothing at all. **An item is a key
+    only if it reads a column** and holds no aggregate, window or subquery: a constant or a
+    column-less expression groups nothing, and the engines refuse it — PostgreSQL a non-integer
+    constant (`GROUP BY 'x'`), SQL Server any expression without a column, and a subquery there too
+    (`group_by_leaves_out_constants_and_subqueries`). `aggregates_rows` knows an aggregate by its
+    shape before its name — `OVER`, `FILTER (…)`, `WITHIN GROUP (…)`, a `DISTINCT` argument or an
+    `ORDER BY` among the arguments, which only an aggregate or a window takes, so a user-defined
+    aggregate written any of those ways needs no list — and only then by `GROUP_AGGREGATES`, on the
+    bare upper-cased name, for the plain `sum(x)` with no shape to tell it by
+    (`group_by_knows_an_aggregate_by_its_shape_and_its_name`). A star, a projection with no key
+    left or a prefix that does not parse (a half-written `FROM`) predicts nothing. The UI asks it
     over the offer catalogue (under `completion.rs`) and only while the `editor_predictions`
     setting is on — Settings → Editor → *Inline predictions*, on by default. `predict_tests` covers
     each producer and gate, `an_auto_paired_closer_after_the_caret_still_predicts` the `)` one.

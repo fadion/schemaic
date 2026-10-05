@@ -12602,19 +12602,82 @@ const GROUP_AGGREGATES: &[&str] = &[
     "COUNT_BIG",
     "CHECKSUM_AGG",
     "APPROX_COUNT_DISTINCT",
+    "APPROX_PERCENTILE_CONT",
+    "APPROX_PERCENTILE_DISC",
+    "ANY_VALUE",
+    "STD",
+    "MEDIAN",
+    "PERCENTILE_CONT",
+    "PERCENTILE_DISC",
+    "MODE",
+    "CORR",
+    "COVAR_POP",
+    "COVAR_SAMP",
+    "REGR_AVGX",
+    "REGR_AVGY",
+    "REGR_COUNT",
+    "REGR_INTERCEPT",
+    "REGR_R2",
+    "REGR_SLOPE",
+    "REGR_SXX",
+    "REGR_SXY",
+    "REGR_SYY",
+    "XMLAGG",
+    "RANGE_AGG",
+    "RANGE_INTERSECT_AGG",
+    "GROUPING",
+    "GROUPING_ID",
 ];
 
-/// [`predict`]'s `GROUP BY ` producer: what the projection groups by — every
-/// item that is neither an aggregate nor a window — written as it was in the
-/// `SELECT`.
+/// Is this call an aggregate or a window — something a `GROUP BY` list leaves
+/// out?
 ///
-/// **Read off the parse, not the text.** The statement up to `GROUP` is a
-/// whole query on its own (`SELECT … FROM … WHERE …`), so it is parsed as one
-/// and its projection read from the AST — the rule `core::intel` exists to
-/// hold, and the reason an alias (`x AS c`) gives back `x`, not `c`. A
-/// statement that does not parse there (a `GROUP BY` inside a subquery, half
-/// a `FROM`) predicts nothing. So does a projection that cannot be listed: a
-/// star, or aggregates alone.
+/// By its **shape** first: only an aggregate takes `FILTER (…)`, `WITHIN GROUP
+/// (…)`, a `DISTINCT` argument or an `ORDER BY` among its arguments, and only a
+/// window takes `OVER`, so a user-defined aggregate written any of those ways is
+/// known without its name. Then by [`GROUP_AGGREGATES`], on the bare upper-cased
+/// name, for the plain `sum(x)` that has no shape to tell it by.
+fn aggregates_rows(f: &sqlparser::ast::Function) -> bool {
+    use sqlparser::ast::{DuplicateTreatment, FunctionArgumentClause, FunctionArguments};
+    if f.over.is_some() || f.filter.is_some() || !f.within_group.is_empty() {
+        return true;
+    }
+    if let FunctionArguments::List(l) = &f.args
+        && (matches!(l.duplicate_treatment, Some(DuplicateTreatment::Distinct))
+            || l.clauses
+                .iter()
+                .any(|c| matches!(c, FunctionArgumentClause::OrderBy(_))))
+    {
+        return true;
+    }
+    let name = f.name.to_string();
+    let bare = name
+        .rsplit('.')
+        .next()
+        .unwrap_or(&name)
+        .to_ascii_uppercase();
+    GROUP_AGGREGATES.contains(&bare.as_str())
+}
+
+/// [`predict`]'s `GROUP BY ` producer: what the projection groups by — every
+/// item that reads a column and is neither an aggregate nor a window — written
+/// as it was in the `SELECT`.
+///
+/// **Read off the parse, not the text.** The query up to `GROUP` is a whole
+/// query on its own (`SELECT … FROM … WHERE …`), so it is parsed as one and its
+/// projection read from the AST — the rule `core::intel` exists to hold, and
+/// the reason an alias (`x AS c`) gives back `x`, not `c`. *Which* query is the
+/// one the `GROUP BY` belongs to: the text after the innermost `(` still open
+/// before it (a derived table, a CTE body — [`local_scope_start`]), else the
+/// statement; within that, the `SELECT` an `INSERT` or a view is built from, and
+/// a set operation's last arm. A prefix that does not parse (half a `FROM`)
+/// predicts nothing. So does a projection that cannot be listed: a star, or
+/// nothing groupable left.
+///
+/// **An item that reads no column is left out**, along with one holding a
+/// subquery: it groups nothing, and the engines refuse it — PostgreSQL a
+/// non-integer constant (`GROUP BY 'x'`), SQL Server any expression without a
+/// column, and a subquery there too.
 fn group_by_items(sql: &str, lo: usize, toks: &[Token], dialect: SqlDialect) -> Option<String> {
     use sqlparser::ast::{Expr, SelectItem, SetExpr, Statement, visit_expressions};
     use std::ops::ControlFlow;
@@ -12628,33 +12691,38 @@ fn group_by_items(sql: &str, lo: usize, toks: &[Token], dialect: SqlDialect) -> 
     if !(is(group, "GROUP") && is(by, "BY")) {
         return None;
     }
-    let prefix = sql.get(lo..group.at)?;
-    let mut stmts = sqlparser::parser::Parser::parse_sql(&*dialect.parser(), prefix).ok()?;
-    let [Statement::Query(q)] = stmts.as_mut_slice() else {
+    let start = local_scope_start(sql, lo, group.at, dialect);
+    let prefix = sql.get(start..group.at)?;
+    let stmts = sqlparser::parser::Parser::parse_sql(&*dialect.parser(), prefix).ok()?;
+    let q = match stmts.as_slice() {
+        [Statement::Query(q)] => q,
+        [Statement::Insert(i)] => i.source.as_ref()?,
+        [Statement::CreateView(v)] => &v.query,
+        _ => return None,
+    };
+    let mut body = q.body.as_ref();
+    while let SetExpr::SetOperation { right, .. } = body {
+        body = right;
+    }
+    let SetExpr::Select(sel) = body else {
         return None;
     };
-    let SetExpr::Select(sel) = q.body.as_ref() else {
-        return None;
-    };
-    // An aggregate or a window anywhere in the item takes it out of the list.
-    let aggregated = |e: &Expr| {
-        visit_expressions(e, |x| match x {
-            Expr::Function(f) => {
-                let name = f.name.to_string();
-                let bare = name
-                    .rsplit('.')
-                    .next()
-                    .unwrap_or(&name)
-                    .to_ascii_uppercase();
-                if f.over.is_some() || GROUP_AGGREGATES.contains(&bare.as_str()) {
-                    ControlFlow::Break(())
-                } else {
-                    ControlFlow::Continue(())
-                }
+    // A grouping key reads a column and holds no aggregate, window or subquery.
+    let is_key = |e: &Expr| {
+        let mut reads_column = false;
+        let refused = visit_expressions(e, |x| match x {
+            Expr::Function(f) if aggregates_rows(f) => ControlFlow::Break(()),
+            Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => {
+                ControlFlow::Break(())
+            }
+            Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
+                reads_column = true;
+                ControlFlow::Continue(())
             }
             _ => ControlFlow::Continue(()),
         })
-        .is_break()
+        .is_break();
+        !refused && reads_column
     };
     let mut keys = Vec::new();
     for item in &sel.projection {
@@ -12663,7 +12731,7 @@ fn group_by_items(sql: &str, lo: usize, toks: &[Token], dialect: SqlDialect) -> 
             SelectItem::ExprWithAlias { expr, .. } => expr,
             _ => return None,
         };
-        if !aggregated(e) {
+        if is_key(e) {
             keys.push(e.to_string());
         }
     }
@@ -12856,6 +12924,89 @@ mod predict_tests {
             Some("id")
         );
         assert_eq!(my("SELECT customer_id FROM orders GROUP BY total, "), None);
+    }
+
+    /// An item that reads no column of the row groups nothing, and grouping by
+    /// one is refused: PostgreSQL rejects `GROUP BY 'x'` as a non-integer
+    /// constant, SQL Server any expression without a column, and a subquery as
+    /// well.
+    #[test]
+    fn group_by_leaves_out_constants_and_subqueries() {
+        assert_eq!(
+            my("SELECT 'all' AS k, customer_id, count(*) FROM orders GROUP BY ").as_deref(),
+            Some("customer_id")
+        );
+        assert_eq!(
+            my("SELECT now(), -1, customer_id, count(*) FROM orders GROUP BY ").as_deref(),
+            Some("customer_id")
+        );
+        assert_eq!(
+            my(
+                "SELECT customer_id, (SELECT max(id) FROM customers) AS m, count(*) \
+                FROM orders GROUP BY "
+            )
+            .as_deref(),
+            Some("customer_id")
+        );
+        assert_eq!(my("SELECT 1, count(*) FROM orders GROUP BY "), None);
+    }
+
+    /// An aggregate is known by its shape as well as its name: only an
+    /// aggregate takes `FILTER`, `WITHIN GROUP`, a `DISTINCT` argument or an
+    /// `ORDER BY` among its arguments — which is what catches a user-defined
+    /// one — and the names the list missed.
+    #[test]
+    fn group_by_knows_an_aggregate_by_its_shape_and_its_name() {
+        for (item, dialect) in [
+            (
+                "my_sum(total) FILTER (WHERE total > 1)",
+                SqlDialect::Postgres,
+            ),
+            (
+                "percentile_cont(0.5) WITHIN GROUP (ORDER BY total)",
+                SqlDialect::Postgres,
+            ),
+            ("my_agg(DISTINCT total)", SqlDialect::Postgres),
+            ("my_agg(total ORDER BY id)", SqlDialect::Postgres),
+            ("any_value(total)", SqlDialect::MySql),
+            ("std(total)", SqlDialect::MySql),
+            ("mode() WITHIN GROUP (ORDER BY total)", SqlDialect::Postgres),
+            ("corr(total, id)", SqlDialect::Postgres),
+            ("grouping(customer_id)", SqlDialect::Postgres),
+        ] {
+            let sql = format!("SELECT customer_id, {item} FROM orders GROUP BY ");
+            assert_eq!(
+                at_end(&sql, dialect).as_deref(),
+                Some("customer_id"),
+                "{item}"
+            );
+        }
+    }
+
+    /// The `GROUP BY` of a query that is not the whole statement: a derived
+    /// table (its `)` auto-paired after the caret), the `SELECT` feeding an
+    /// `INSERT` or a view, and a set operation's last arm.
+    #[test]
+    fn group_by_reads_the_query_it_belongs_to() {
+        assert_eq!(
+            at_bar("SELECT * FROM (SELECT customer_id, count(*) FROM orders GROUP BY |)")
+                .as_deref(),
+            Some("customer_id")
+        );
+        assert_eq!(
+            my("INSERT INTO t SELECT customer_id, count(*) FROM orders GROUP BY ").as_deref(),
+            Some("customer_id")
+        );
+        assert_eq!(
+            my("CREATE VIEW v AS SELECT customer_id, count(*) FROM orders GROUP BY ").as_deref(),
+            Some("customer_id")
+        );
+        assert_eq!(
+            my("SELECT id, 1 FROM customers UNION ALL \
+                SELECT customer_id, count(*) FROM orders GROUP BY ")
+            .as_deref(),
+            Some("customer_id")
+        );
     }
 
     #[test]
