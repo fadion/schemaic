@@ -750,7 +750,10 @@ existing prose was left alone.
     whether the choice fell back past that statement's terminator, and `statement_range` is its
     first half. Falling back is right for Ctrl+Enter and wrong for anything that writes at the
     caret, which is why `intel::predict` and `Recall::at` ask for the second half and refuse there
-    (`the_caret_is_past_a_statement_only_after_its_terminator`; see `intel.rs`).
+    (`the_caret_is_past_a_statement_only_after_its_terminator`; see `intel.rs`). Completion asks
+    `writing_range`, the same pair as an empty range at the caret when it has fallen back, so
+    Ctrl+Space below `DELETE FROM t;` offers what starts a statement rather than the `DELETE`'s
+    `WHERE` (`the_writing_range_is_empty_past_a_terminator`).
     **`unsafe_reason` asks first about what destroys stored rows, and about nothing else.** It is
     the warning behind `first_unsafe`, which `run_verdict` turns into `Confirm` whatever
     `confirm_writes` says: `every_row_reason` (below), or `drop_reason`, a statement that destroys

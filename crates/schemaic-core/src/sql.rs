@@ -1630,6 +1630,22 @@ pub fn statement_range(sql: &str, offset: usize, dialect: SqlDialect) -> (usize,
     statement_range_ended(sql, offset, dialect).0
 }
 
+/// The statement the caret is **writing**: [`statement_range`]'s, or an empty
+/// range at the caret when it is past that statement's end
+/// ([`statement_range_ended`]). What completion reads its context from:
+/// Ctrl+Space on the blank line below `DELETE FROM t;` read the `DELETE` and
+/// offered its `WHERE` and `t`'s columns, where the caret was starting a new
+/// statement.
+pub fn writing_range(sql: &str, offset: usize, dialect: SqlDialect) -> (usize, usize) {
+    let ((lo, hi), ended) = statement_range_ended(sql, offset, dialect);
+    if ended {
+        let at = offset.min(sql.len());
+        (at, at)
+    } else {
+        (lo, hi)
+    }
+}
+
 /// [`statement_range`], and whether the caret is **past that statement's
 /// end** — after the terminator that closes it, as on the blank line below a
 /// `DELETE FROM t;` or after a space following its `;`.
@@ -5117,6 +5133,26 @@ mod holds_code_tests {
         }
         assert!(!holds_code("# note\n", SqlDialect::MySql));
         assert!(holds_code("# note\n", SqlDialect::Postgres));
+    }
+
+    /// Past a statement's terminator the caret is writing a new, empty one;
+    /// inside or at the end of one, it is writing that one.
+    #[test]
+    fn the_writing_range_is_empty_past_a_terminator() {
+        use super::writing_range;
+        let my = SqlDialect::MySql;
+        let sql = "DELETE FROM t;\n";
+        assert_eq!(writing_range(sql, sql.len(), my), (sql.len(), sql.len()));
+        let sql = "DELETE FROM t; ";
+        assert_eq!(writing_range(sql, sql.len(), my), (sql.len(), sql.len()));
+        for sql in ["DELETE FROM t WHERE ", "SELECT 1;\nSEL", "SELECT 1"] {
+            assert_eq!(
+                writing_range(sql, sql.len(), my),
+                super::statement_range(sql, sql.len(), my),
+                "{sql:?}"
+            );
+        }
+        assert_eq!(writing_range("SELECT 1;\nSEL", 13, my).0, 10);
     }
 }
 

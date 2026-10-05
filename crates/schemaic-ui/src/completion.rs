@@ -1002,7 +1002,10 @@ pub(crate) fn recompute_completions(
         return;
     }
 
-    let (lo, hi) = statement_range(&text, offset, dialect);
+    // The statement being *written*: past a `;` the caret starts a new one, and
+    // Ctrl+Space on the blank line below `DELETE FROM t;` offered the `DELETE`'s
+    // `WHERE` and columns.
+    let (lo, hi) = schemaic_core::sql::writing_range(&text, offset, dialect);
     // **Not inside a value or a remark**, not even on Ctrl+Space: `name = 'jo`
     // offered columns, and Tab spliced one into the literal. A quoted name
     // is still a name, and completes.
