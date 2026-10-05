@@ -94,7 +94,7 @@ pub(crate) const SHORTCUTS: &[ShortcutGroup] = &[
             ("Ctrl+/", "Toggle line comment"),
             ("Ctrl+D", "Duplicate line / selection"),
             ("Ctrl+X", "Delete line"),
-            ("Ctrl+Alt+L", "Format SQL"),
+            ("Ctrl+Alt+L", "Format code"),
             ("Alt+↑ / Alt+↓", "Move line up / down"),
             ("Tab / Shift+Tab", "Indent / outdent"),
             ("Tab / Ctrl+→", "Take the inline prediction / its next word"),
@@ -218,7 +218,7 @@ pub(crate) enum MenuKey {
     GridPaste,
     /// The grid gutter menu's *Delete* / *Undo delete* over the selected rows.
     GridDeleteRows,
-    /// The editor menu's *Format*.
+    /// The editor menu's *Format code*.
     EditorFormat,
 }
 
@@ -229,13 +229,19 @@ impl MenuKey {
             MenuKey::GridCopy => ("Results grid", "Ctrl+C", "Copy"),
             MenuKey::GridPaste => ("Results grid", "Ctrl+V", "Paste as staged edits"),
             MenuKey::GridDeleteRows => ("Results grid", "Del", "Mark row for deletion"),
-            MenuKey::EditorFormat => ("Editor", "Ctrl+Alt+L", "Format SQL"),
+            MenuKey::EditorFormat => ("Editor", "Ctrl+Alt+L", "Format code"),
         }
     }
 
     /// The keys as this platform reads them, for the menu's keycap.
     pub(crate) fn keys(self) -> Cow<'static, str> {
         keys_label(self.row().1)
+    }
+
+    /// What the `SHORTCUTS` row calls the action — the menu entry's own label
+    /// where the menu takes it from here, so the two say the same thing.
+    pub(crate) fn label(self) -> &'static str {
+        self.row().2
     }
 }
 
@@ -707,6 +713,25 @@ mod tests {
             );
             assert_eq!(key.keys(), keys_label(keys));
         }
+    }
+
+    /// The format action is called the same on the shortcut sheet, the editor
+    /// menu (which takes [`MenuKey::label`]) and the palette (whose command
+    /// name is matched here), in each surface's own case. It was "Format SQL",
+    /// "Format" and "Format Code" — three names for one key.
+    #[test]
+    fn the_format_action_has_one_name_on_every_surface() {
+        let label = MenuKey::EditorFormat.label();
+        let (group, keys, _) = MenuKey::EditorFormat.row();
+        let palette = COMMAND_KEYS
+            .iter()
+            .find(|(_, g, k)| *g == group && *k == keys)
+            .map(|(name, _, _)| *name)
+            .expect("the palette names the format command");
+        assert!(
+            label.eq_ignore_ascii_case(palette),
+            "{label:?} / {palette:?}"
+        );
     }
 
     /// Every [`MenuKey`], spelled so that a new variant fails to compile here

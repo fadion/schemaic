@@ -3337,7 +3337,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     let ed_bar_poke = ed.clone(); // auto-hide: poke the bars on scroll/resize
     let ed_wheel = ed.clone(); // shift+wheel → horizontal scroll
     let ed_find = ed.clone(); // Ctrl+F find: select + centre a match
-    let ed_fmt = ed.clone(); // right-click "Format SQL"
+    let ed_fmt = ed.clone(); // right-click "Format code"
     let ed_cursor = ed.clone(); // mirror caret offset out for the status bar
     let ed_goto = ed.clone(); // Ctrl+G go-to-line: move caret + centre
     let ed_jump = ed.clone(); // status-bar warning count: jump to first warning
@@ -3496,7 +3496,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
 
     // Reformat on request from outside the pane (the palette's "Format Code"),
     // then clear it — same shape as the jump above, and deliberately the *same*
-    // `format_editor` Ctrl+Alt+L and the right-click "Format SQL" use, so the
+    // `format_editor` Ctrl+Alt+L and the right-click "Format code" use, so the
     // three can't disagree about what formatting means. The palette used to set
     // `query` itself, which the mounted editor never reads back (see
     // `Tab::format_req`), so the command silently did nothing.
@@ -3871,7 +3871,9 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                         highlight_pick(&sql, lo, hi, dialect.get_untracked(), highlight);
                     }
                 }),
-                MenuEntry::action("Format", move || {
+                // Named by its shortcut row, as the palette's "Format Code" is
+                // (`the_format_action_has_one_name_on_every_surface`).
+                MenuEntry::action(crate::shortcuts::MenuKey::EditorFormat.label(), move || {
                     format_editor(&ed_format, comp, dialect.get_untracked())
                 })
                 .shortcut(crate::shortcuts::MenuKey::EditorFormat),

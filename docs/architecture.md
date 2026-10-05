@@ -32834,7 +32834,10 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   does not re-select.
   The cell menu's single-row *Delete row* wears none, and neither does the editor's *Ask AI*, which
   acts on the right-clicked statement where Ctrl+K takes the caret or selection; the editor's
-  *Format* wears Ctrl+Alt+L, being the same `format_editor` call. The builder is a no-op on
+  *Format code* wears Ctrl+Alt+L, being the same `format_editor` call — and takes its label from
+  the row too (`MenuKey::label`), so it is called what the shortcut sheet and the palette's
+  *Format Code* call it (`the_format_action_has_one_name_on_every_surface`; it was "Format", "Format
+  SQL" and "Format Code"). The builder is a no-op on
   `Sub`/`Separator` — a submenu row's trailing slot is its chevron
   (`a_shortcut_lands_on_an_action_and_nowhere_else`). `menu_row` draws the keycap after the same
   flex spacer (floor `MENU_SUB_SPACER`) a chevron uses; it is one line and shorter than the label,
