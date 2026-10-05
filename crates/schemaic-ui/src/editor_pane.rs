@@ -2696,25 +2696,29 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 return CommandExecuted::Yes;
             }
         }
-        // Soft-tab indent: floem's built-in InsertTab uses the buffer's own fixed
-        // indent width (4) and ignores our configured tab width, so when soft tabs
-        // are on we compute and apply the spaces ourselves (via the tested pure
-        // `soft_tab_indent`). Hard tabs fall through to the default (a literal
-        // `\t`, whose display width already follows SqlStyling::tab_width).
+        // Tab indent, soft or hard, computed here: floem's built-in InsertTab uses
+        // the buffer's own fixed indent width (4) and ignores our configured tab
+        // width, and it **replaces a selection** with one `\t` — three selected
+        // lines became a single tab when hard tabs fell through to it. Both are
+        // the tested pure `soft_tab_indent` / `hard_tab_indent`.
         if !primary_held(mods)
             && !mods.shift()
             && !comp.open.get_untracked()
             && matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::Tab), _))
-            && theme::editor_soft_tabs()
         {
             let tw = theme::editor_tab_width();
+            let soft = theme::editor_soft_tabs();
             editor_sig.with_untracked(|e| {
                 let full = e.doc().text().to_string();
                 let (a, b) = e.cursor.get_untracked().get_selection().unwrap_or_else(|| {
                     let o = e.cursor.get_untracked().offset();
                     (o, o)
                 });
-                let ed = soft_tab_indent(&full, a, b, tw);
+                let ed = if soft {
+                    soft_tab_indent(&full, a, b, tw)
+                } else {
+                    schemaic_core::text_ops::hard_tab_indent(&full, a, b)
+                };
                 edit_untyped(
                     e,
                     comp,
@@ -2727,14 +2731,14 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             });
             return CommandExecuted::Yes;
         }
-        // Soft-tab outdent (Shift+Tab): the inverse of the above. Same reason —
-        // floem's built-in outdent uses the buffer's fixed indent width — so we
-        // remove one level (a leading tab, or up to `tw` spaces) per line ourselves.
+        // Outdent (Shift+Tab): the inverse of the above. Same reason — floem's
+        // built-in outdent uses the buffer's fixed indent width — so we remove one
+        // level (a leading tab, or up to `tw` spaces) per line ourselves, which
+        // is one level whichever kind of indent the line has.
         if !primary_held(mods)
             && mods.shift()
             && !comp.open.get_untracked()
             && matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::Tab), _))
-            && theme::editor_soft_tabs()
         {
             let tw = theme::editor_tab_width();
             editor_sig.with_untracked(|e| {
@@ -2950,7 +2954,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             }
             if c.eq_ignore_ascii_case("x") {
                 // Selection-aware: with a selection, fall through to the default
-                // handler's Ctrl+X = cut; on a bare caret, delete the line.
+                // handler's Ctrl+X = cut; on bare carets, cut their lines.
                 let has_sel = editor_sig.with_untracked(|e| {
                     e.cursor
                         .get_untracked()
@@ -2958,13 +2962,30 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                         .is_some_and(|(a, b)| a != b)
                 });
                 if !has_sel {
+                    // Every caret's line onto the clipboard, and only those
+                    // lines (`text_ops::cut_lines`): floem's `DeleteLine` never
+                    // copied, and across several carets deleted every line
+                    // from the first to the last.
                     editor_sig.with_untracked(|e| {
-                        e.doc().run_command(
+                        let full = e.doc().text().to_string();
+                        let cursor = e.cursor.get_untracked();
+                        let carets: Vec<usize> = match &cursor.mode {
+                            floem::views::editor::core::cursor::CursorMode::Insert(sel) => {
+                                sel.regions().iter().map(|r| r.end).collect()
+                            }
+                            _ => vec![cursor.offset()],
+                        };
+                        let cut = schemaic_core::text_ops::cut_lines(&full, &carets);
+                        if edit_untyped(
                             e,
-                            &Command::Edit(EditCommand::DeleteLine),
-                            Some(1),
-                            mods,
-                        );
+                            comp,
+                            Selection::region(0, full.len()),
+                            &cut.text,
+                            EditType::Delete,
+                        ) {
+                            let _ = floem::Clipboard::set_contents(cut.clipboard);
+                            e.cursor.update(|c| c.set_offset(cut.caret, false, false));
+                        }
                     });
                     return CommandExecuted::Yes;
                 }
@@ -3991,9 +4012,11 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             zoom,
             cmdk.preview,
         ))
-        // `smart_tab` makes Tab insert spaces to the next tab stop; without it
-        // Tab inserts a literal '\t' while OutdentLine assumes space indentation,
-        // so Shift+Tab removes ALL indentation instead of one level.
+        // `smart_tab` makes floem's own Tab insert spaces to the next tab stop.
+        // Tab and Shift+Tab are the key handler's (`soft_tab_indent` /
+        // `hard_tab_indent` / `soft_tab_outdent`); this matters only where they
+        // still reach floem — Shift+Tab with the suggestion list open, whose
+        // `OutdentLine` assumes space indentation.
         // `wrap_method` follows the word-wrap setting (default off = scroll long
         // SQL lines horizontally; on = wrap to the viewport width).
         .editor_style(move |s| {

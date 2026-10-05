@@ -422,7 +422,8 @@ pub fn line_col_of_offset(text: &str, offset: usize) -> (usize, usize) {
 }
 
 /// A single text replacement plus the selection to apply afterward — the result
-/// of a soft-tab indent ([`soft_tab_indent`]).
+/// of a Tab or Shift+Tab ([`soft_tab_indent`], [`hard_tab_indent`],
+/// [`soft_tab_outdent`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndentEdit {
     /// Byte range in the original text to replace.
@@ -465,17 +466,44 @@ pub fn soft_tab_indent(full: &str, sel_a: usize, sel_b: usize, tw: usize) -> Ind
         };
     }
 
-    // Selection: re-indent each spanned line. A selection ending exactly at a line
-    // start shouldn't include that (otherwise-untouched) line.
+    indent_lines(full, lo, hi, &" ".repeat(tw))
+}
+
+/// [`soft_tab_indent`] with **hard tabs**: a bare caret inserts one `\t`, a
+/// selection indents each spanned line by one, as the soft-tab one does.
+///
+/// Floem's `InsertTab`, which hard tabs used to fall through to, replaces a
+/// selection with a single `\t` — Tab over three selected lines left one tab
+/// character where they had been.
+pub fn hard_tab_indent(full: &str, sel_a: usize, sel_b: usize) -> IndentEdit {
+    let len = full.len();
+    let lo = sel_a.min(sel_b).min(len);
+    let hi = sel_a.max(sel_b).min(len);
+    if lo == hi {
+        return IndentEdit {
+            start: lo,
+            end: lo,
+            text: "\t".to_string(),
+            sel: (lo + 1, lo + 1),
+        };
+    }
+    indent_lines(full, lo, hi, "\t")
+}
+
+/// Indent every line `[lo, hi)` spans by `pad` at its first non-blank column
+/// (blank lines untouched), and re-select the block. A selection ending exactly
+/// at a line start doesn't pull that line in.
+fn indent_lines(full: &str, lo: usize, hi: usize, pad: &str) -> IndentEdit {
+    let len = full.len();
+    let line_start = |off: usize| full[..off].rfind('\n').map(|i| i + 1).unwrap_or(0);
     let mut eff_hi = hi;
     if eff_hi > lo && full.as_bytes()[eff_hi - 1] == b'\n' {
         eff_hi -= 1;
     }
     let region_start = line_start(lo);
     let region_end = full[eff_hi..].find('\n').map(|i| eff_hi + i).unwrap_or(len);
-    let pad = " ".repeat(tw);
     let block = &full[region_start..region_end];
-    let mut out = String::with_capacity(block.len() + tw * 4);
+    let mut out = String::with_capacity(block.len() + pad.len() * 4);
     let mut added = 0usize;
     for (i, line) in block.split('\n').enumerate() {
         if i > 0 {
@@ -486,15 +514,83 @@ pub fn soft_tab_indent(full: &str, sel_a: usize, sel_b: usize, tw: usize) -> Ind
         }
         let fnb = line.len() - line.trim_start().len(); // leading-whitespace bytes
         out.push_str(&line[..fnb]);
-        out.push_str(&pad);
+        out.push_str(pad);
         out.push_str(&line[fnb..]);
-        added += tw;
+        added += pad.len();
     }
     IndentEdit {
         start: region_start,
         end: region_end,
         text: out,
         sel: (region_start, region_end + added),
+    }
+}
+
+/// What Ctrl+X on bare carets does — see [`cut_lines`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LineCut {
+    /// The lines cut, each with its line end, in document order.
+    pub clipboard: String,
+    /// The whole document after the cut.
+    pub text: String,
+    /// Where the caret goes: the start of the line that followed the first cut
+    /// — or, when that cut was the last line, of the line before it.
+    pub caret: usize,
+}
+
+/// Ctrl+X with no selection: cut the line under each caret in `carets`, line
+/// end and all, onto the clipboard — and only those lines.
+///
+/// It was floem's `DeleteLine`, which **never copies**, so the paste after it
+/// brought back whatever the clipboard held before; and with several carets
+/// it deleted from the first to the last, every line between included. A last
+/// line without a line end of its own takes the one before it, so no blank
+/// line is left behind, and goes onto the clipboard with a `\n` so a paste puts
+/// it back as a line.
+pub fn cut_lines(full: &str, carets: &[usize]) -> LineCut {
+    let len = full.len();
+    let line_start = |off: usize| full[..off].rfind('\n').map_or(0, |i| i + 1);
+    let line_end = |off: usize| full[off..].find('\n').map_or(len, |i| off + i + 1);
+    let mut lines: Vec<(usize, usize)> = carets
+        .iter()
+        .map(|&c| {
+            let ls = line_start(c.min(len));
+            (ls, line_end(ls))
+        })
+        .collect();
+    lines.sort_unstable();
+    lines.dedup();
+    let mut clipboard = String::new();
+    for &(a, b) in &lines {
+        clipboard.push_str(&full[a..b]);
+        if !full[a..b].ends_with('\n') {
+            clipboard.push('\n');
+        }
+    }
+    // What goes: each line, the last one's preceding line end in its place.
+    let mut text = String::with_capacity(len);
+    let mut at = 0;
+    let mut first_cut = None;
+    for &(a, b) in &lines {
+        let a = if b == len && !full[a..b].ends_with('\n') && a > 0 {
+            a - 1
+        } else {
+            a
+        };
+        let a = a.max(at);
+        text.push_str(&full[at..a]);
+        first_cut.get_or_insert(text.len());
+        at = b;
+    }
+    text.push_str(&full[at..]);
+    // The start of the line the first cut is on — the line after it, or the
+    // one before when the last line took the line end before it.
+    let cut = first_cut.unwrap_or(0).min(text.len());
+    let caret = text[..cut].rfind('\n').map_or(0, |i| i + 1);
+    LineCut {
+        clipboard,
+        text,
+        caret,
     }
 }
 
@@ -508,9 +604,9 @@ fn outdent_strip_len(line: &str, tw: usize) -> usize {
     }
 }
 
-/// Compute pressing Shift+Tab with **soft tabs** in `full` — the inverse of
-/// [`soft_tab_indent`]. Removes one indent level (a leading tab, or up to `tw`
-/// leading spaces) from each affected line:
+/// Compute pressing Shift+Tab in `full`, soft tabs or hard — the inverse of
+/// [`soft_tab_indent`] and [`hard_tab_indent`]. Removes one indent level (a
+/// leading tab, or up to `tw` leading spaces) from each affected line:
 /// - A bare caret outdents the caret's line and shifts the caret left by however
 ///   much was removed before it.
 /// - A selection outdents every spanned line and re-selects the block. A selection
@@ -937,6 +1033,67 @@ mod tests {
             let off = offset_of_line(src, line).unwrap();
             assert_eq!(line_col_of_offset(src, off), (line, 1));
         }
+    }
+
+    /// **Tab over a selection indents it with hard tabs too.** The editor
+    /// handled soft tabs itself and left hard ones to floem's `InsertTab`,
+    /// which replaces the selection with one `\t` — three selected lines
+    /// became a single tab character.
+    #[test]
+    fn hard_tab_indents_a_selection_rather_than_replacing_it() {
+        let full = "select a\nfrom t\nwhere x = 1";
+        let e = hard_tab_indent(full, 0, full.len());
+        assert_eq!((e.start, e.end), (0, full.len()));
+        assert_eq!(e.text, "\tselect a\n\tfrom t\n\twhere x = 1");
+        assert_eq!(e.sel, (0, e.text.len()));
+        // A selection inside one line indents that line.
+        let e = hard_tab_indent("  select a", 4, 8);
+        assert_eq!(e.text, "  \tselect a");
+        // Blank lines stay blank; a selection ending at a line start leaves it.
+        let e = hard_tab_indent("a\n\nb\nc", 0, 5);
+        assert_eq!(e.text, "\ta\n\n\tb");
+        // A bare caret inserts one tab there.
+        let e = hard_tab_indent("ab", 1, 1);
+        assert_eq!(
+            (e.start, e.end, e.text.as_str(), e.sel),
+            (1, 1, "\t", (2, 2))
+        );
+    }
+
+    /// **Ctrl+X on a bare caret cuts the caret's line — every caret's, and
+    /// only theirs.** It ran floem's `DeleteLine`, which never copies, so the
+    /// Ctrl+V after it pasted whatever was on the clipboard before; and with a
+    /// caret on line 1 and another on line 50 it deleted lines 1 through 50.
+    #[test]
+    fn cutting_lines_takes_each_carets_line_onto_the_clipboard() {
+        let full = "one\ntwo\nthree\nfour";
+        let c = cut_lines(full, &[1]);
+        assert_eq!(c.clipboard, "one\n");
+        assert_eq!(c.text, "two\nthree\nfour");
+        assert_eq!(c.caret, 0);
+        // Two carets: their two lines, nothing between.
+        let c = cut_lines(full, &[1, 10]);
+        assert_eq!(c.clipboard, "one\nthree\n");
+        assert_eq!(c.text, "two\nfour");
+        // Two carets on one line cut it once.
+        let c = cut_lines(full, &[4, 6]);
+        assert_eq!(c.clipboard, "two\n");
+        assert_eq!(c.text, "one\nthree\nfour");
+        assert_eq!(c.caret, 4);
+        // The last line, with no newline of its own, takes the one before it.
+        let c = cut_lines(full, &[full.len()]);
+        assert_eq!(c.clipboard, "four\n");
+        assert_eq!(c.text, "one\ntwo\nthree");
+        assert_eq!(c.caret, "one\ntwo\n".len());
+        // The only line.
+        let c = cut_lines("solo", &[2]);
+        assert_eq!(
+            (c.clipboard.as_str(), c.text.as_str(), c.caret),
+            ("solo\n", "", 0)
+        );
+        // CRLF lines are cut whole.
+        let c = cut_lines("a\r\nb\r\n", &[0]);
+        assert_eq!((c.clipboard.as_str(), c.text.as_str()), ("a\r\n", "b\r\n"));
     }
 
     #[test]

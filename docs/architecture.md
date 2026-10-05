@@ -11694,6 +11694,24 @@ existing prose was left alone.
     comes from the mounted editor while the text comes from the tab's own signal, so the two can
     disagree by a keystroke — an empty, reversed, out-of-range or mid-character range yields `None`
     ("no selection"), never a panic.
+    **Tab and Shift+Tab are computed here, for hard tabs as well as soft.** `soft_tab_indent` and
+    `hard_tab_indent` share `indent_lines` — each spanned line indented at its first non-blank
+    column, blank lines left alone, a selection ending at a line start leaving that line — and
+    differ only in the pad and in what a bare caret gets (spaces to the next stop, or one `\t`).
+    Hard tabs used to fall through to floem's `InsertTab`, which **replaces a selection** with one
+    `\t`: Tab over three selected lines left a single tab character where they had been
+    (`hard_tab_indents_a_selection_rather_than_replacing_it`). `soft_tab_outdent` already removed
+    one level of either kind — a leading tab, or up to the tab width in spaces — so `editor_pane`
+    now asks it whatever the setting, and a plain Shift+Tab with the suggestion list closed no
+    longer reaches floem's `OutdentLine` and its fixed `Spaces(4)` unit. **`cut_lines` is Ctrl+X on
+    bare carets**: each caret's line, line end included, onto the clipboard once and in document
+    order, a last line with no line end of its own taking the one before it and going onto the
+    clipboard with a `\n`. It replaces floem's `DeleteLine`, which never copies — Ctrl+X then
+    Ctrl+V pasted whatever the clipboard held before — and which, with carets on lines 1 and 50,
+    deleted every line from 1 to 50 (`cutting_lines_takes_each_carets_line_onto_the_clipboard`).
+    The pane applies it as one whole-buffer edit through `edit_untyped` and writes the clipboard
+    only when that edit went through, so a cut the Ctrl+K freeze refuses leaves the clipboard as it
+    was.
   - `sqlfmt.rs` — `format_sql` (Ctrl+Alt+L pretty-printer): re-flows whitespace/indent/line-breaks
     "block" style, **preserving keyword case**; built on `skip_noncode` so comments/strings/backtick
     idents pass through untouched; indent follows editor tab-width/soft-tabs.
@@ -19730,7 +19748,7 @@ existing prose was left alone.
     radius provable rather than argued: `primary_from(c, m, false) == c`, so off macOS the whole
     change cannot behave differently, and on macOS it acts on keys that previously did nothing.
     **The negative checks are the ones to be careful with.** `!primary_held(mods)` is how the editor
-    pane asks *is this plain typing* — the soft-tab indent, the auto-pair block and the `ctrl`
+    pane asks *is this plain typing* — the Tab indent, the auto-pair block and the `ctrl`
     argument it hands `completion::types_a_character` — so one left as `!mods.control()` would let a
     Cmd chord both fire a shortcut and insert a character. Two surfaces stay hand-spelled on
     purpose: the terminal's `encode_key` and its Ctrl+Shift+C/V, and the grid's two
@@ -23344,7 +23362,7 @@ existing prose was left alone.
     only where the selection is, not whether it moved, so ↓ then ↑ back onto row 0 is a newline
     too. The flag is under test (`a_word_typed_in_full_is_reported_though_not_listed`); the key
     decision lives in the view and is not.
-    **Tab takes the inline prediction ahead of the soft-tab indent, on `ghost_takes_tab`'s terms**
+    **Tab takes the inline prediction ahead of the indent, on `ghost_takes_tab`'s terms**
     (`ghost_key_tests`): a plain Tab — no Shift, no primary modifier — with the list closed, since an
     open list owns Tab, and `completion::lone_caret` still answering the offset the ghost was made
     for (`ghost_at.is_some() && ghost_at == caret`, the caret being `lone_caret`'s `Option`).
@@ -32466,7 +32484,7 @@ Re-introducing the anti-patterns these guard against is a regression:
 - **`text_editor_keys` inserts a typed char *unconditionally* — your handler's `CommandExecuted`
   return is ignored for plain character keys.** Floem's `editor_content` KeyDown listener discards the
   handler's result and then, if `mods` (minus SHIFT/ALTGR) is empty, calls `receive_char(c)` for any
-  `Key::Character`. So the existing custom edits (soft-tab, Ctrl+/, Ctrl+D…) only work because they're
+  `Key::Character`. So the existing custom edits (Tab indent, Ctrl+/, Ctrl+D…) only work because they're
   on keys that *don't* trigger that path (Tab is `Named`; Ctrl-combos keep a modifier). To fully take
   over a **plain character** (auto-close pairs), suppress the built-in insert by setting the editor's
   own `ed.read_only` true for the rest of the dispatch and restoring it on the next tick via
@@ -32476,7 +32494,7 @@ Re-introducing the anti-patterns these guard against is a regression:
 - **Only *typing* may open the suggestion popup** (`completion::popup_may_open`), and what counts as
   typing is decided in the key handler (`completion::types_a_character`) because it cannot be
   decided anywhere else. Every document change schedules a recompute a tick later, and the recompute
-  sees only the document — where a typed `x` and Ctrl+X are indistinguishable. So Ctrl+X (delete
+  sees only the document — where a typed `x` and Ctrl+X are indistinguishable. So Ctrl+X (cut
   line) and Ctrl+Z opened a list wherever the caret happened to land, and Enter opened the
   `auto_show` list on the new blank line: three basic edits that never asked for a suggestion.
   `Ctrl`/`Alt` mean command, never text — the same test the auto-pair block applies, with the same
