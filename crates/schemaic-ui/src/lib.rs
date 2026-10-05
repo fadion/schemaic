@@ -9012,6 +9012,7 @@ fn center(ui: Ui) -> impl IntoView {
                     read_only,
                     live_validate,
                     predictions,
+                    history: ui.history.entries,
                     validate_stmt: validate_stmt.clone(),
                     popup_menu: popup,
                     popup_anchor,

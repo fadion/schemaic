@@ -1949,6 +1949,23 @@ existing prose was left alone.
     over the offer catalogue (under `completion.rs`) and only while the `editor_predictions`
     setting is on — Settings → Editor → *Inline predictions*, on by default. `predict_tests` covers
     each producer and gate, `an_auto_paired_closer_after_the_caret_still_predicts` the `)` one.
+    **`predict_from_history` is the ghost remembered rather than reasoned**, asked only when
+    `predict` has nothing and under the same *Inline predictions* switch, with none of its own: the
+    rest of the caret's line from the first statement in `past` (newest first) that begins with the
+    statement typed so far, its leading whitespace trimmed. Its gate is stricter than `predict`'s.
+    At least two words must be typed — one word starts every run, so matching it is a guess, not a
+    memory; nothing may follow the caret in the statement, not even the next clause on another line,
+    since a statement being edited in the middle is not the one run before; and the caret wants
+    whitespace or `(` before it and code under it (`caret_touches_noncode`, as above). The match is
+    an exact prefix, case and inner spacing included — `select` does not continue `SELECT` — over
+    text with `\r\n` made `\n`, and a stored run of several statements is cut by
+    `sql::statement_ranges` so that each is offered. It answers one line, its trailing `;` dropped:
+    a statement written over several continues line by line as Enter starts each, so a ghost never
+    needs a newline — which it could not carry, since `inline_diff` draws none that holds a `\n`
+    (`history_prediction_tests::a_statement_run_before_predicts_the_rest_of_its_line` and
+    `the_newest_statement_that_fits_is_the_one_predicted`, red against a stub first;
+    `history_predicts_nothing_it_cannot_continue` the gate). Which runs it is given is the UI's
+    choice (under `completion.rs`).
   - `pg_builtins.rs` — the **PostgreSQL builtin catalog**, the third entry in
     `intel::builtin_catalog` and the one that could not be written by hand, and the reason the typo
     checker is on for this engine at all. `PG_FUNCTIONS` is 2,706 entries and the split is the point:
@@ -22273,6 +22290,12 @@ existing prose was left alone.
     one-shot can return**. `suppress` is set by an accept, and the next prediction is wanted
     straight after one: Tab on a `BY ` ghost leaves `GROUP BY `, whose grouping columns are the next
     thing to offer, so a ghost asked after the one-shot would break that chain at its second link.
+    **Where `predict` has nothing, `prediction_at` asks `intel::predict_from_history`** over this
+    connection's runs (`HistoryEntry::conn_id == ctx.conn_id`), newest first, leaving out
+    `Outcome::Failed` ones — a statement the server refused is not one to offer again; an `Unknown`
+    run, cancelled or still going, is offered. The log arrives as `CompletionCtx::history`
+    (`ui.history.entries`, every connection's, through `QueryPaneParams::history`), so a statement
+    `history::push` declined to record for carrying a credential is never offered either.
     A forced recompute (Ctrl+Space) asks for the list, so it shows no ghost beside it.
     **The rest of a prediction taken a word at a time is kept, not asked for again**: a ghost
     `keeps_ghost` accepts is published as it stands, ahead of `prediction_at`, because
@@ -22289,7 +22312,7 @@ existing prose was left alone.
     (columns after `WHERE`/`ON`/`BY`) and the FK join row used to take, and two offers at one caret
     would leave Tab meaning whichever happened to be open. The table list `auto_show` opens after
     `JOIN ` yields the same way, so where the whole join is predicted it waits for a typed letter.
-    Ctrl+Space still brings the list, join row included. `CompletionCtx::predictions` is the switch, from the `editor_predictions` setting.
+    Ctrl+Space still brings the list, join row included. `CompletionCtx::predictions` is the switch, from the `editor_predictions` setting, for both kinds of ghost.
   - `tabs.rs` — query-tab strip, and where a **`.sql`-backed tab** shows itself. The state behind
     that is four signals on `Tab`: `path`, `disk_sql` (the file's text as of the last open / save /
     reload — `None` means *unknown*, which reads as modified, the safe direction), `file_format`
@@ -22810,7 +22833,8 @@ existing prose was left alone.
     moment the caret leaves that offset or a selection appears, so after a click elsewhere Tab
     indents again; an edit moves the caret too, and the recompute it schedules asks again for the
     new spot — or keeps the `kept` rest Ctrl+→ left there (under `completion.rs`).
-    `QueryPaneParams::predictions` carries the setting in.
+    `QueryPaneParams::predictions` carries the setting in, and `QueryPaneParams::history` the run
+    log a ghost remembers from (under `completion.rs`).
   - `inline_diff.rs` — the Ctrl+K suggestion rendered **in the editor's own line flow**: the lines
     it replaces stay where they are, faded, and the lines it proposes appear directly below them,
     pushing the rest of the document down. They are Floem *phantom text* (the facility inlay hints

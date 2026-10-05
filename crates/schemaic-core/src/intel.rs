@@ -12576,6 +12576,58 @@ fn starts_a_clause(line_rest: &str) -> bool {
         .any(|kw| rest[..end].eq_ignore_ascii_case(kw))
 }
 
+/// The inline prediction remembered rather than reasoned: the rest of the
+/// caret's line from a statement run before — the first in `past` (newest
+/// first) that begins with the statement typed so far.
+///
+/// **Asked only when [`predict`] has nothing**, and held to a stricter gate:
+/// at least two words typed (one word is the start of every run, so matching
+/// it is a guess, not a memory), nothing after the caret in the statement (a
+/// statement being edited in the middle is not the one run before), the caret
+/// after whitespace or a `(`, and in code. The match is exact — `select` does
+/// not continue `SELECT` — over text with its line endings made `\n`, and a
+/// stored run of several statements offers each of them. What it answers is
+/// one line: a statement written over several continues line by line as Enter
+/// starts each, so a ghost never needs a newline.
+pub fn predict_from_history<'a>(
+    sql: &str,
+    caret: usize,
+    dialect: SqlDialect,
+    past: impl IntoIterator<Item = &'a str>,
+) -> Option<String> {
+    if caret > sql.len() || !sql.is_char_boundary(caret) {
+        return None;
+    }
+    let before = sql[..caret].chars().next_back()?;
+    if !(before.is_whitespace() || before == '(') {
+        return None;
+    }
+    let (lo, hi) = crate::sql::statement_range(sql, caret, dialect);
+    if lo > caret || caret_touches_noncode(sql, lo, caret, dialect) {
+        return None;
+    }
+    let after = sql.get(caret..hi.max(caret))?.trim();
+    if !(after.is_empty() || after == ";") {
+        return None;
+    }
+    let typed = sql[lo..caret].trim_start().replace("\r\n", "\n");
+    typed.split_whitespace().nth(1)?;
+    for text in past {
+        let text = text.replace("\r\n", "\n");
+        for (a, b) in crate::sql::statement_ranges(&text, dialect) {
+            let Some(more) = text[a..b].trim_start().strip_prefix(typed.as_str()) else {
+                continue;
+            };
+            let line = more.split('\n').next().unwrap_or("").trim_end();
+            let line = line.strip_suffix(';').unwrap_or(line).trim_end();
+            if !line.is_empty() {
+                return Some(line.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Where the first word of a prediction `text` ends — the byte length Ctrl+→
 /// takes of it, leaving the rest drawn.
 ///
@@ -13652,6 +13704,86 @@ fn group_by_items(sql: &str, lo: usize, toks: &[Token], dialect: SqlDialect) -> 
         }
     }
     (!keys.is_empty()).then(|| keys.join(", "))
+}
+
+#[cfg(test)]
+mod history_prediction_tests {
+    use super::*;
+
+    /// The history prediction at the `|` in `sql` (or its end), over `past`,
+    /// newest first.
+    fn hist(sql: &str, past: &[&str]) -> Option<String> {
+        let (text, caret) = match sql.find('|') {
+            Some(at) => (sql.replacen('|', "", 1), at),
+            None => (sql.to_string(), sql.len()),
+        };
+        predict_from_history(&text, caret, SqlDialect::MySql, past.iter().copied())
+    }
+
+    /// A statement typed so far that begins one run before gets the rest of
+    /// that statement's line — its next line once Enter starts one.
+    #[test]
+    fn a_statement_run_before_predicts_the_rest_of_its_line() {
+        assert_eq!(
+            hist(
+                "SELECT * FROM orders ",
+                &["SELECT * FROM orders WHERE status = 'open' ORDER BY id;"]
+            )
+            .as_deref(),
+            Some("WHERE status = 'open' ORDER BY id")
+        );
+        let past = ["SELECT id\nFROM orders\nWHERE total > 100\nORDER BY id"];
+        assert_eq!(hist("SELECT id\nFROM ", &past).as_deref(), Some("orders"));
+        assert_eq!(
+            hist("SELECT id\nFROM orders\n", &past).as_deref(),
+            Some("WHERE total > 100")
+        );
+        assert_eq!(hist("SELECT id\r\nFROM ", &past).as_deref(), Some("orders"));
+    }
+
+    /// The newest run that fits wins, and a run of several statements offers
+    /// each of them.
+    #[test]
+    fn the_newest_statement_that_fits_is_the_one_predicted() {
+        let past = [
+            "SELECT * FROM orders WHERE a = 1",
+            "SELECT * FROM orders WHERE b = 2",
+        ];
+        assert_eq!(
+            hist("SELECT * FROM orders ", &past).as_deref(),
+            Some("WHERE a = 1")
+        );
+        assert_eq!(
+            hist(
+                "SELECT * FROM orders ",
+                &["SELECT 1; SELECT * FROM orders LIMIT 5"]
+            )
+            .as_deref(),
+            Some("LIMIT 5")
+        );
+    }
+
+    /// A single word matches every run that starts with it, which is a guess,
+    /// not a memory; and a statement with more after the caret, a caret in a
+    /// string or inside a word, or nothing more to offer predicts nothing.
+    #[test]
+    fn history_predicts_nothing_it_cannot_continue() {
+        let past = ["SELECT * FROM orders WHERE x = 1"];
+        assert_eq!(hist("SELECT ", &past), None);
+        assert_eq!(hist("SELECT * FROM customers ", &past), None);
+        assert_eq!(hist("SELECT * FROM orders WHERE x = 1 ", &past), None);
+        assert_eq!(hist("SELECT * FROM orders |\nWHERE x = 2", &past), None);
+        assert_eq!(hist("SELECT * FROM orders | x", &past), None);
+        assert_eq!(hist("SELECT * FROM ord", &past), None);
+        assert_eq!(
+            hist(
+                "SELECT * FROM orders WHERE x = 'a ",
+                &["SELECT * FROM orders WHERE x = 'a b'"]
+            ),
+            None
+        );
+        assert_eq!(hist("SELECT * FROM orders ", &[]), None);
+    }
 }
 
 #[cfg(test)]

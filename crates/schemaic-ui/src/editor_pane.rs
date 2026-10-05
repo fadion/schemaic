@@ -2186,6 +2186,9 @@ pub(crate) struct QueryPaneParams {
     pub live_validate: RwSignal<bool>,
     /// Show inline predictions after the caret, taken by Tab. Persisted setting.
     pub predictions: RwSignal<bool>,
+    /// The run history, every connection's — what an inline prediction
+    /// remembers when `intel::predict` has nothing (`completion::prediction_at`).
+    pub history: RwSignal<Vec<schemaic_core::history::HistoryEntry>>,
     /// Requests a debounced DB validation of the statement under the cursor.
     pub validate_stmt: ValidateFn,
     pub popup_menu: RwSignal<Option<Vec<MenuEntry>>>,
@@ -2246,6 +2249,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         read_only,
         live_validate,
         predictions,
+        history,
         validate_stmt,
         popup_menu,
         popup_anchor,
@@ -2736,6 +2740,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                             snippets,
                             conn_id: active_conn.get_untracked(),
                             predictions: predictions.get_untracked(),
+                            history,
                         },
                         comp,
                         true,
@@ -4000,6 +4005,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                             snippets,
                             conn_id: active_conn.get_untracked(),
                             predictions: predictions.get_untracked(),
+                            history,
                         },
                         comp,
                         false,

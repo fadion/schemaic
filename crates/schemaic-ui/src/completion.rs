@@ -684,24 +684,39 @@ pub(crate) struct CompletionCtx<'a> {
     pub(crate) conn_id: u64,
     /// The editor's inline predictions are on (Settings → Editor).
     pub(crate) predictions: bool,
+    /// The run history, every connection's; [`prediction_at`] reads this
+    /// connection's.
+    pub(crate) history: RwSignal<Vec<schemaic_core::history::HistoryEntry>>,
 }
 
 /// The ghost to show at `offset`, or `None` — [`intel::predict`] over the
 /// *offer* catalog, the one the popup's foreign-key join reads, so a hidden
-/// database is no more predicted from than it is offered.
+/// database is no more predicted from than it is offered; failing that,
+/// [`intel::predict_from_history`] over this connection's runs, newest first,
+/// leaving out the ones that failed — a statement the server refused is not
+/// one to offer again.
 fn prediction_at(
     ed: &Editor,
     text: &str,
     offset: usize,
     ctx: &CompletionCtx<'_>,
 ) -> Option<crate::inline_diff::EditorGhost> {
+    use schemaic_core::history::Outcome;
     if !ctx.predictions {
         return None;
     }
     let catalog = ctx
         .hidden_dbs
         .with_untracked(|h| build_offer_catalog(ctx.db_nodes, h, ctx.active_db));
-    let guess = intel::predict(text, offset, &catalog, ctx.dialect)?;
+    let guess = intel::predict(text, offset, &catalog, ctx.dialect).or_else(|| {
+        ctx.history.with_untracked(|entries| {
+            let past = entries
+                .iter()
+                .filter(|e| e.conn_id == ctx.conn_id && e.outcome != Outcome::Failed)
+                .map(|e| e.sql.as_str());
+            intel::predict_from_history(text, offset, ctx.dialect, past)
+        })
+    })?;
     Some(ghost_at(ed, offset, guess, None))
 }
 
@@ -753,6 +768,7 @@ pub(crate) fn recompute_completions(
         snippets,
         conn_id,
         predictions: _,
+        history: _,
     } = ctx;
     let offset = ed.cursor.get_untracked().offset();
     let text = ed.doc().text().to_string();
