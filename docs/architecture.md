@@ -1073,7 +1073,9 @@ existing prose was left alone.
     alias is the whole row** (`names_whole_rows`): `row_to_json(u)`, `SELECT u FROM users u` —
     `resolve` accepts one naming a visible source once no column of that name has claimed it,
     where it used to report ``Column `u` not found``
-    (`a_whole_row_reference_is_not_an_unknown_column_on_postgres`). **Three more identifiers
+    (`a_whole_row_reference_is_not_an_unknown_column_on_postgres`). A derived table's column
+    list renames its columns as a CTE's does (`cte_cols`): `(SELECT id …) AS d(x)` exposes `x`
+    and not `id` (`a_derived_tables_column_list_names_its_columns`). **Three more identifiers
     the parser hands over are not columns**, all measured as red ``Column `…` not found``: a
     datepart function's first argument (`DATEADD(day, …)`, and MySQL's `TIMESTAMPDIFF(SECOND,
     …)` — `datepart_functions`, per dialect; the call's span goes into `not_columns` before the

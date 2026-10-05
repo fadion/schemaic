@@ -10634,9 +10634,20 @@ mod colres {
                     .as_ref()
                     .map(|a| vec![a.name.value.to_ascii_lowercase()])
                     .unwrap_or_default();
+                // `AS d(x, y)` renames the columns, as a CTE's list does: the
+                // body's own names are no longer visible through `d`.
+                let cols = match alias.as_ref().filter(|a| !a.columns.is_empty()) {
+                    Some(a) => Cols::Known(
+                        a.columns
+                            .iter()
+                            .map(|c| c.name.value.to_ascii_lowercase())
+                            .collect(),
+                    ),
+                    None => output_cols(subquery),
+                };
                 sources.push(Src {
                     quals,
-                    cols: output_cols(subquery),
+                    cols,
                     table: None,
                     shadowed: None,
                     defines: Some(to_range(stmt, lo, subquery.span())),
@@ -19294,6 +19305,19 @@ mod tests {
         ] {
             assert!(col_errors(sql).is_empty(), "false positive: {sql}");
         }
+    }
+
+    /// A derived table's column list names its columns: `d.x` resolves, and
+    /// the body's own name behind it does not.
+    #[test]
+    fn a_derived_tables_column_list_names_its_columns() {
+        let pg = SqlDialect::Postgres;
+        assert!(col_errors_d("SELECT d.x FROM (SELECT id FROM employees) AS d(x)", pg).is_empty());
+        assert!(col_errors_d("SELECT x FROM (SELECT 1) AS d(x)", pg).is_empty());
+        assert_eq!(
+            col_errors_d("SELECT d.id FROM (SELECT id FROM employees) AS d(x)", pg).len(),
+            1
+        );
     }
 
     /// On PostgreSQL a bare table name or alias is the whole row; elsewhere it
