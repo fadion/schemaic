@@ -12717,6 +12717,10 @@ existing prose was left alone.
       (`a_keyword_is_offered_only_on_an_engine_that_takes_it`). What each engine lacks is
       `intel`'s `keywords_not_taken`, an exhaustive `match`, so a fifth engine has to answer
       rather than inherit MySQL's empty list.
+      **`ClauseCtx::Database` is `USE |`**, which `intel::clause_context` answers for a statement
+      whose only word so far is `USE` (`use_names_a_database`): its arm offers every database but
+      the tab's own, with no prefix needed, and nothing else — the mixed list it fell into before
+      offered tables and columns where only a database can go (`use_offers_the_other_databases`).
       **`add` asks `worth_offering` before it builds anything, which is `add_col`'s shape adopted
       for `add_col`'s reason.** A PostgreSQL tab offers 863 builtins where a MySQL 8 one offers 341
       (`FUNCTIONS`' 463 less `MARIADB_ONLY`, which contains every `DEPRECATED_ALIASES` name), and

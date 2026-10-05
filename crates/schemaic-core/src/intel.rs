@@ -3799,6 +3799,8 @@ pub enum ClauseCtx {
     Table,
     /// Right after `qualifier.` → that table's columns (or that db's tables).
     Qualified(String),
+    /// After a statement-opening `USE` → databases.
+    Database,
     /// Anything else → the full mixed list (keywords + tables + columns).
     Other,
 }
@@ -3908,6 +3910,10 @@ pub fn clause_context(sql: &str, lo: usize, word_lo: usize, dialect: SqlDialect)
         if names_column {
             return ClauseCtx::Column;
         }
+    }
+    // `USE |` names a database, and nothing else does.
+    if words.len() == 1 && words[0] == "USE" {
+        return ClauseCtx::Database;
     }
     match last_kw.as_deref() {
         None => {
@@ -18145,6 +18151,17 @@ mod tests {
 
     fn ctx(sql: &str) -> ClauseCtx {
         ctx_at(sql, sql.len())
+    }
+
+    /// The word after a statement-opening `USE` is a database; past it, or
+    /// anywhere `USE` is not the statement's first word, it is not.
+    #[test]
+    fn use_names_a_database() {
+        assert_eq!(ctx("USE "), ClauseCtx::Database);
+        assert_eq!(ctx("USE sa"), ClauseCtx::Database);
+        assert_eq!(ctx("use "), ClauseCtx::Database);
+        assert_ne!(ctx("USE shop "), ClauseCtx::Database);
+        assert_ne!(ctx("SELECT * FROM t USE "), ClauseCtx::Database);
     }
 
     /// **A paren is a scope of its own.** The last clause keyword *anywhere*

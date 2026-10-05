@@ -508,6 +508,15 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
                 }
             }
         }
+        // `USE |`: every database but the one the tab is already in, with no
+        // prefix needed — there is nothing else the word can be.
+        ClauseCtx::Database => {
+            for db in &schema.databases {
+                if active_db.is_none_or(|a| !a.eq_ignore_ascii_case(db)) {
+                    add(&mut cands, &mut seen, db, SuggestKind::Database, "", 0);
+                }
+            }
+        }
         ClauseCtx::Table => {
             // FK-aware JOIN targets first (top tier): a table connected by a foreign
             // key to something in scope, inserting `table ON <predicate>` in one go.
@@ -1020,6 +1029,16 @@ mod tests {
         }
         assert_eq!(row(SqlDialect::MySql, "coal", "coalesce").insert, None);
         assert_eq!(row(SqlDialect::Postgres, "coal", "coalesce").insert, None);
+    }
+
+    /// After `USE` the databases are offered, with no prefix needed and not
+    /// the one the tab is in; nothing else is.
+    #[test]
+    fn use_offers_the_other_databases() {
+        let s = shop();
+        assert_eq!(ranked(&s, ClauseCtx::Database, &[], ""), ["archive"]);
+        assert_eq!(ranked(&s, ClauseCtx::Database, &[], "arc"), ["archive"]);
+        assert!(ranked(&s, ClauseCtx::Database, &[], "ord").is_empty());
     }
 
     /// A keyword the engine has no use for is not offered: no `LIMIT` on SQL
