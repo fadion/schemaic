@@ -193,6 +193,12 @@ fn ghost_takes_word(
 /// rule every future programmatic edit has to be told about. **Typed** edits —
 /// auto-pair insertion, the paired backspace — deliberately do not come through
 /// here: there the popup *should* follow the caret.
+///
+/// **The answer is `#[must_use]`**: `false` is a refused edit, and a caller
+/// that moved the caret anyway — Tab, Shift+Tab, Ctrl+/, Alt+↑↓ and the
+/// snippet library all did — put a selection over text that never changed
+/// under the Ctrl+K freeze.
+#[must_use = "a refused edit must not move the caret: act on the answer"]
 fn edit_untyped(ed: &Editor, comp: Completion, sel: Selection, text: &str, ty: EditType) -> bool {
     // **`read_only` does not gate this path, so the funnel has to.** In floem
     // 0.2 the flag is read at exactly two entry points —
@@ -2797,15 +2803,16 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 } else {
                     schemaic_core::text_ops::hard_tab_indent(&full, a, b)
                 };
-                edit_untyped(
+                if edit_untyped(
                     e,
                     comp,
                     Selection::region(ed.start, ed.end),
                     &ed.text,
                     EditType::InsertChars,
-                );
-                e.cursor
-                    .update(|c| c.set_insert(Selection::region(ed.sel.0, ed.sel.1)));
+                ) {
+                    e.cursor
+                        .update(|c| c.set_insert(Selection::region(ed.sel.0, ed.sel.1)));
+                }
             });
             return CommandExecuted::Yes;
         }
@@ -2832,14 +2839,15 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 // Skip the edit when nothing changes (no undo churn), but still
                 // consume the key so it never falls through to floem's fixed-width
                 // outdent.
-                if ed.text != full[ed.start..ed.end] {
-                    edit_untyped(
+                if ed.text != full[ed.start..ed.end]
+                    && edit_untyped(
                         e,
                         comp,
                         Selection::region(ed.start, ed.end),
                         &ed.text,
                         EditType::InsertChars,
-                    );
+                    )
+                {
                     e.cursor
                         .update(|c| c.set_insert(Selection::region(ed.sel.0, ed.sel.1)));
                 }
@@ -2976,15 +2984,16 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     let (a, b) = cur.get_selection().unwrap_or((off, off));
                     let edit =
                         toggle_line_comment(&full, a.min(b), a.max(b), dialect.get_untracked());
-                    edit_untyped(
+                    if edit_untyped(
                         e,
                         comp,
                         Selection::region(0, full.len()),
                         &edit.text,
                         EditType::ToggleComment,
-                    );
-                    e.cursor
-                        .update(|cc| cc.set_insert(Selection::region(edit.sel.0, edit.sel.1)));
+                    ) {
+                        e.cursor
+                            .update(|cc| cc.set_insert(Selection::region(edit.sel.0, edit.sel.1)));
+                    }
                 });
                 return CommandExecuted::Yes;
             }
@@ -3188,14 +3197,15 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 let cur = e.cursor.get_untracked();
                 let off = cur.offset();
                 let (a, b) = cur.get_selection().unwrap_or((off, off));
-                if let Some(edit) = move_line(&full, a.min(b), a.max(b), up) {
-                    edit_untyped(
+                if let Some(edit) = move_line(&full, a.min(b), a.max(b), up)
+                    && edit_untyped(
                         e,
                         comp,
                         Selection::region(0, full.len()),
                         &edit.text,
                         EditType::MoveLine,
-                    );
+                    )
+                {
                     e.cursor
                         .update(|c| c.set_insert(Selection::region(edit.sel.0, edit.sel.1)));
                 }
@@ -3548,18 +3558,19 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     (off, off)
                 });
             let (lo, hi) = (a.min(b), a.max(b));
-            edit_untyped(
+            // Caret after the inserted text, so typing continues where the
+            // snippet left off rather than in front of it.
+            if edit_untyped(
                 &ed_ins,
                 comp,
                 Selection::region(lo, hi),
                 &body,
                 EditType::Other,
-            );
-            // Caret after the inserted text, so typing continues where the
-            // snippet left off rather than in front of it.
-            ed_ins
-                .cursor
-                .update(|cc| cc.set_offset(lo + body.len(), false, false));
+            ) {
+                ed_ins
+                    .cursor
+                    .update(|cc| cc.set_offset(lo + body.len(), false, false));
+            }
         });
     }
 

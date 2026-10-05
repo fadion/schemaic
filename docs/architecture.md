@@ -31883,7 +31883,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   features reach for is not a lock; if a third one arrives, this is the paragraph it has to read.
   **The answer to the second half is a funnel: `editor_pane::edit_untyped`.** Every programmatic
   edit in that pane goes through it, it asks `read_only` itself and it **refuses** — it answers
-  `bool` rather than looking and proceeding. That one check replaced nine missing ones: the preview
+  `bool` rather than looking and proceeding, and the `bool` is `#[must_use]`: Tab, Shift+Tab,
+  Ctrl+/, Alt+↑↓ and the snippet library each set the caret after a refused edit, selecting text
+  that had not changed, until the compiler was made to ask. That one check replaced nine missing ones: the preview
   holds the keyboard while it is up, so Ctrl+/, Alt+Up, Tab, Ctrl+D (caret or selection — both go
   through `text_ops::duplicate_lines` now, floem's `DuplicateLineDown` having put the newline-less
   last line's copy on the same line), Ctrl+Alt+L, the
