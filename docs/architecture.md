@@ -30907,7 +30907,10 @@ Re-introducing the anti-patterns these guard against is a regression:
   `ThemeState` stores `ui_kind`/`editor_kind` beside the built themes at all: a built `UiTheme` has
   no identity to compare against. The choices are persisted (`ui_theme`/`editor_theme`/`ui_scale` in
   `UiState`) and seeded via `theme::init` before the view builds. Editor tokens re-highlight on switch because
-  `SqlStyling::id()` returns `theme::editor_generation()`.
+  `SqlStyling::id()` folds in `theme::editor_generation()` (`layout_cache_key`, with the UI
+  generation, the font size and — read tracked off the tab's dialect memo — the engine, so a tab
+  moved to another kind of engine re-lexes its lines; the styling used to hold the dialect it was
+  built with).
   - **Live-switch caveat**: a colour read *inside* a reactive `.style` closure updates instantly; one
     captured *by value* freezes at build time. Prefer `fn() -> Color` for anything themable (see
     `FieldCfg::background`).

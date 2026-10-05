@@ -4056,7 +4056,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         // on a wrapper installed later in this chain.
         .styling(sql_highlight::SqlStyling::new(
             inner_doc.clone(),
-            dialect.get_untracked(),
+            dialect,
             zoom,
             cmdk.preview,
         ))

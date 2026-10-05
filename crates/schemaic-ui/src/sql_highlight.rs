@@ -18,7 +18,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use floem::peniko::Color;
-use floem::reactive::{RwSignal, SignalGet, SignalWith};
+use floem::reactive::{Memo, RwSignal, SignalGet, SignalWith};
 use floem::text::{Attrs, AttrsList, FamilyOwned};
 use floem::views::editor::EditorStyle;
 use floem::views::editor::core::buffer::rope_text::RopeText;
@@ -56,9 +56,13 @@ pub struct SqlStyling {
     doc: Rc<dyn Document>,
     family: Vec<FamilyOwned>,
     /// The connection's SQL dialect — so `#`-operators / `$tag$` bodies aren't
-    /// coloured as comments on a PostgreSQL connection. Fixed at construction
-    /// (the editor is rebuilt when the tab's connection changes).
-    dialect: SqlDialect,
+    /// coloured as comments on a PostgreSQL connection. **Followed, not fixed
+    /// at construction**: the editor is not rebuilt when its tab moves to an
+    /// engine of another kind, and a styling holding the old value went on
+    /// colouring a SQL Server tab's `#temp` as a MySQL comment. `id()` reads it,
+    /// so a change re-lays the lines out, and the block-comment cache is keyed
+    /// on it.
+    dialect: Memo<SqlDialect>,
     /// This tab's temporary font-size override (px) for Ctrl+scroll zoom; `None`
     /// follows the user's configured size. Per-tab, so zooming one editor doesn't
     /// touch others.
@@ -82,13 +86,17 @@ pub struct SqlStyling {
     /// `mysqldump` header comment cost ~11 ms of extra scanning per keypress.
     /// One forward pass answers it for every line at once, so the cost is paid
     /// once per edit instead of ~45 times.
-    block_lines: RefCell<Option<(u64, Vec<bool>)>>,
+    block_lines: RefCell<Option<(BlockKey, Vec<bool>)>>,
 }
+
+/// What [`SqlStyling`]'s block-comment flags were computed for: the document
+/// revision and the dialect.
+type BlockKey = (u64, SqlDialect);
 
 impl SqlStyling {
     pub fn new(
         doc: Rc<dyn Document>,
-        dialect: SqlDialect,
+        dialect: Memo<SqlDialect>,
         zoom: RwSignal<Option<f32>>,
         preview: crate::inline_diff::InlinePreview,
     ) -> Self {
@@ -123,11 +131,14 @@ impl SqlStyling {
         if line == 0 {
             return false;
         }
-        let rev = self.doc.cache_rev().get_untracked();
+        let key = (
+            self.doc.cache_rev().get_untracked(),
+            self.dialect.get_untracked(),
+        );
         let mut cache = self.block_lines.borrow_mut();
-        if cache.as_ref().map(|(r, _)| *r) != Some(rev) {
+        if cache.as_ref().map(|(k, _)| *k) != Some(key) {
             let text = self.doc.text().to_string();
-            *cache = Some((rev, block_comment_lines(&text, self.dialect)));
+            *cache = Some((key, block_comment_lines(&text, key.1)));
         }
         cache
             .as_ref()
@@ -139,7 +150,7 @@ impl SqlStyling {
 /// `TextLayoutLine`s live under, so anything baked into a layout that this key
 /// does not move with **cannot repaint**.
 ///
-/// Three inputs, and every one of them is something baked in:
+/// Four inputs, and every one of them is something baked in:
 ///
 /// - `editor_gen` — the token colours, which come from `editor()`, and the tab
 ///   width. Bumped by `set_editor` and the font/tab setters.
@@ -151,6 +162,9 @@ impl SqlStyling {
 ///   same bands — ordinary style closures, calling the same two accessors —
 ///   took the new one.
 /// - `px` — the effective font size, so a per-tab zoom re-lays out.
+/// - `dialect` — which spans are comments, strings and names, so a tab moved to
+///   another engine re-lexes its lines. It is not monotonic, but it has its own
+///   bits, so it cannot collide with the other terms.
 ///
 /// The generations are **summed** rather than XOR'd: both are monotonic
 /// counters, so their sum climbs on every bump of either and never returns to
@@ -158,8 +172,14 @@ impl SqlStyling {
 /// both 1, two states one bump apart sharing a key. (The sum is not injective
 /// over `(editor, ui)` pairs, and does not need to be: in one process the pair
 /// only ever moves forward.)
-fn layout_cache_key(editor_gen: u64, ui_gen: u64, px: f32) -> u64 {
-    (editor_gen.wrapping_add(ui_gen) << 8) | (px.round() as u64 & 0xFF)
+fn layout_cache_key(editor_gen: u64, ui_gen: u64, px: f32, dialect: SqlDialect) -> u64 {
+    let engine = match dialect {
+        SqlDialect::MySql => 0,
+        SqlDialect::Postgres => 1,
+        SqlDialect::Sqlite => 2,
+        SqlDialect::MsSql => 3,
+    };
+    (editor_gen.wrapping_add(ui_gen) << 11) | (engine << 8) | (px.round() as u64 & 0xFF)
 }
 
 impl Styling for SqlStyling {
@@ -184,6 +204,7 @@ impl Styling for SqlStyling {
             crate::theme::editor_generation(),
             crate::theme::ui_generation(),
             self.effective_px(),
+            self.dialect.get(),
         )
     }
 
@@ -258,7 +279,8 @@ impl Styling for SqlStyling {
         }
         // Does this line begin inside a `/* … */` opened on an earlier line?
         let start_in_block = self.starts_in_block(line);
-        for (start, end, tok) in lex_line(&content, self.dialect, start_in_block) {
+        let dialect = self.dialect.get_untracked();
+        for (start, end, tok) in lex_line(&content, dialect, start_in_block) {
             attrs.add_span(shift + start..shift + end, default.color(tint(tok.color())));
         }
     }
@@ -887,19 +909,28 @@ mod tests {
     /// behind the code in the old palette.
     #[test]
     fn the_layout_cache_key_moves_on_either_theme_axis() {
-        let base = layout_cache_key(3, 7, 14.0);
-        assert_ne!(base, layout_cache_key(4, 7, 14.0), "the editor axis");
-        assert_ne!(base, layout_cache_key(3, 8, 14.0), "the interface axis");
-        assert_ne!(base, layout_cache_key(3, 7, 15.0), "the font size");
+        let my = SqlDialect::MySql;
+        let base = layout_cache_key(3, 7, 14.0, my);
+        assert_ne!(base, layout_cache_key(4, 7, 14.0, my), "the editor axis");
+        assert_ne!(base, layout_cache_key(3, 8, 14.0, my), "the interface axis");
+        assert_ne!(base, layout_cache_key(3, 7, 15.0, my), "the font size");
+        // A tab moved to another engine re-lexes: every dialect its own key.
+        let keys: Vec<u64> = SqlDialect::ALL
+            .iter()
+            .map(|&d| layout_cache_key(3, 7, 14.0, d))
+            .collect();
+        for (i, k) in keys.iter().enumerate() {
+            assert!(!keys[..i].contains(k), "two dialects share a key");
+        }
 
         // The property that matters is that the key never *returns* to a value
         // it has already had, since floem's cache is keyed on it: both counters
         // only climb, so the sum climbs with them. An XOR would not — `2^3 == 1`
         // and `0^1 == 1`, two different states one bump apart sharing a key.
-        let mut prev = layout_cache_key(0, 0, 14.0);
+        let mut prev = layout_cache_key(0, 0, 14.0, my);
         let mut seen = vec![prev];
         for (e, u) in [(1, 0), (1, 1), (2, 1), (2, 4), (9, 4)] {
-            let k = layout_cache_key(e, u, 14.0);
+            let k = layout_cache_key(e, u, 14.0, my);
             assert!(k > prev, "the key went backwards at ({e}, {u})");
             assert!(!seen.contains(&k), "the key repeated at ({e}, {u})");
             seen.push(k);
@@ -919,6 +950,7 @@ mod tests {
                 crate::theme::editor_generation(),
                 crate::theme::ui_generation(),
                 14.0,
+                SqlDialect::MySql,
             )
         };
         let before = key();
@@ -945,6 +977,8 @@ mod tests {
             "layout_cache_key(",
             "editor_generation()",
             "ui_generation()",
+            // Tracked, so a tab moved to another engine re-lexes its lines.
+            "self.dialect.get()",
         ] {
             assert!(
                 f.contains(term),
