@@ -218,11 +218,22 @@ pub struct EditorGhost {
     /// stand (`completion::keeps_ghost`). A kept ghost holds the caret against
     /// the list, being the offer the user is following.
     pub kept: bool,
-    /// Remembered from a statement run before (`intel::predict_from_history`)
-    /// rather than reasoned (`intel::predict`). A remembered ghost does not
+    /// Remembered from a statement written before — a run in the history, an
+    /// open tab, one of the user's snippets (`intel::predict_from_history`,
+    /// asked by `completion::prediction_at` in that order) — rather than
+    /// reasoned (`intel::predict`). A remembered ghost does not
     /// take the empty word's place: the list that opens there still opens,
     /// and the ghost gives way to it (`completion::ghost_displaces_the_list`).
     pub remembered: bool,
+}
+
+/// The ghost as it is on screen — `None` while a Ctrl+K preview is up, which
+/// draws no ghost, and for one holding a line break, which a phantom cannot
+/// show. **The keys that take a ghost ask this, not the slot**: Tab took one
+/// hidden behind a preview, inserting words nobody could see and spending the
+/// key the preview was waiting on.
+pub fn shown_ghost(ghost: Option<&EditorGhost>, preview_up: bool) -> Option<&EditorGhost> {
+    ghost.filter(|g| !preview_up && !g.text.contains('\n'))
 }
 
 /// How strongly the prediction is drawn: the editor's foreground at this
@@ -409,12 +420,10 @@ impl InlineDiffDoc {
     /// The ghost to draw on `line`, as `(col, text)` — none while a Ctrl+K
     /// preview is showing, and none whose text would need a second row.
     fn ghost_on(&self, line: usize) -> Option<(usize, String)> {
-        if self.preview.with_untracked(|p| p.is_some()) {
-            return None;
-        }
+        let preview_up = self.preview.with_untracked(|p| p.is_some());
         self.ghost.with_untracked(|g| {
-            g.as_ref()
-                .filter(|g| g.line == line && !g.text.contains('\n'))
+            shown_ghost(g.as_ref(), preview_up)
+                .filter(|g| g.line == line)
                 .map(|g| (g.col, g.text.clone()))
         })
     }
@@ -633,6 +642,29 @@ impl Document for InlineDiffDoc {
 mod tests {
     use super::*;
     use schemaic_core::diff::{InlineHunk, InlinePlan};
+
+    fn ghost(text: &str) -> EditorGhost {
+        EditorGhost {
+            offset: 7,
+            line: 0,
+            col: 7,
+            text: text.to_string(),
+            doc_len: 7,
+            kept: false,
+            remembered: false,
+        }
+    }
+
+    /// A ghost is on screen — and so takeable — only with no Ctrl+K preview
+    /// up and no line break in it.
+    #[test]
+    fn a_ghost_behind_a_preview_or_holding_a_line_break_is_not_shown() {
+        let by = ghost("BY ");
+        assert_eq!(shown_ghost(Some(&by), false), Some(&by));
+        assert_eq!(shown_ghost(Some(&by), true), None);
+        assert_eq!(shown_ghost(Some(&ghost("a\nb")), false), None);
+        assert_eq!(shown_ghost(None, false), None);
+    }
 
     fn plan(hunks: Vec<InlineHunk>) -> InlineView {
         let added = hunks.iter().map(|h| h.add.len()).sum();

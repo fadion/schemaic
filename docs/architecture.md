@@ -22826,7 +22826,9 @@ existing prose was left alone.
     break**. `InlineDiffDoc::ghost_on` never drew one, but it was published all the same, so Tab
     still inserted it, Escape was spent on it and the popup was held shut for it: an offer nobody
     could see, which a `GROUP BY` list whose expression holds a string literal with a real newline
-    produced (`a_prediction_is_shown_only_if_it_can_be_drawn`, red before).
+    produced (`a_prediction_is_shown_only_if_it_can_be_drawn`, red before). A ghost published
+    before a Ctrl+K preview opened is the other one nobody can see, and that is the keys' to
+    refuse: they ask `inline_diff::shown_ghost` rather than the slot (under `editor_pane.rs`).
     A forced recompute (Ctrl+Space) asks for the list, so it shows no ghost beside it.
     **Nor is a ghost asked anywhere but a lone caret** — `lone_caret`, the cursor's offset only
     when it is one caret with nothing selected: Normal mode's offset, Insert mode's one caret
@@ -23419,6 +23421,15 @@ existing prose was left alone.
     ghost that is up is one `InlineDiffDoc::ghost_on` will draw outside a Ctrl+K preview, now that
     `completion::pick_prediction` refuses a prediction holding a line break before it is
     published; until then Escape could be spent on a ghost nobody could see.
+    **All three keys ask `inline_diff::shown_ghost`, not the slot** — the ghost as it is on screen,
+    none while a Ctrl+K preview is up and none holding a line break, the one predicate
+    `InlineDiffDoc::ghost_on` draws by too. Tab used to read the slot, and so took a ghost hidden
+    behind a preview, inserting words nobody could see and spending the key the preview was
+    waiting on. Escape still clears a hidden ghost, but consumes the key only for one that was
+    shown, so the preview's own Escape is left to answer. The key handler wants the preview
+    untracked, and `cmdk_preview_gate::a_preview_read_sits_in_a_tracking_scope` refuses an
+    untracked read of `cmdk.preview` by name, so the handler asks `preview_up`, a memo over it,
+    untracked instead; the gate now counts two reads, the verdict footer's and that memo's.
     **A ghost lives only at the caret it was made for**: an effect on `ed.cursor` clears it the
     moment `lone_caret` stops answering its offset — the caret leaves it, a selection appears or a
     second caret is added — so after a click elsewhere Tab indents again; an edit moves the caret
@@ -23435,12 +23446,22 @@ existing prose was left alone.
     It used to read `get_selection()`, which sees only the first region, and so could not judge a
     cursor of several.
     **Nor does a ghost outlive what it was made under**: a second effect, tracking `predictions`,
-    `remembered_predictions`, `active_conn`, `active_db` and `dialect`, clears it whenever one of
-    them changes. The setting
+    `remembered_predictions`, `active_conn`, `active_db`, `dialect` and the schema, clears it
+    whenever one of them changes. The setting
     was read untracked, and only when a ghost was asked for, so switching *Inline predictions* off
     — or the tab moving to another connection, database or engine — left the ghost drawn, and Tab
     still took it, until the next edit asked again; *Predictions from past statements* is tracked
-    there for the same reason. Like the cursor effect it lives in the view and has no unit test.
+    there for the same reason, and the schema because a ghost read from it — a join guessed through
+    a key since dropped — is stale once it refreshes. **The schema is `db_nodes` *and* every node's
+    inner `schema` signal**: a per-database Refresh, and the re-introspection after DDL, write the
+    inner signal and leave the list alone, so tracking the list alone would miss both. Nor does a
+    ghost outlive the editor's focus: the `editor_view_focus_lost` effect clears it, since a ghost
+    is an offer to the keyboard, an unfocused editor has none, and drawn there it read as text in
+    the buffer; the next edit after focus returns asks again. It clears on every blur, outside the
+    `blur_dismisses_completion` test that spares a press on the popup (the Floem gotcha on views
+    that must survive their own click) — which is safe only because no view is keyed on the ghost:
+    every read of `comp.ghost` is untracked, and `set_ghost` reaches the screen through `cache_rev`
+    alone. Like the cursor effect both live in the view and have no unit test.
     `QueryPaneParams::predictions` and `remembered_predictions` carry the two settings in,
     `QueryPaneParams::history` the run log and `QueryPaneParams::tabs` the open tabs a ghost
     remembers from (under `completion.rs`); `tabs` is threaded from `lib.rs`'s editor-area
@@ -23549,7 +23570,11 @@ existing prose was left alone.
     `GHOST_ALPHA` (0.45). **Not `theme::placeholder()`**: that was checked in the running app and
     was drawn but all but invisible on the current-line band. It is not drawn while a Ctrl+K view
     is up in either state, nor when its text holds a `\n` — and `has_multiline_phantom` does not
-    consult the ghost, so that refusal is what keeps its answer true. Refusing to *draw* one was
+    consult the ghost, so that refusal is what keeps its answer true. **The refusal is
+    `shown_ghost(ghost, preview_up)`, and the keys ask it too**: `ghost_on` draws by it, and the
+    editor's Tab, Ctrl+→ and Escape take or spend a ghost only where it answers, so what a key
+    acts on is what is on screen (`a_ghost_behind_a_preview_or_holding_a_line_break_is_not_shown`).
+    It was `ghost_on`'s alone, and Tab read the slot, taking a ghost hidden behind a preview. Refusing to *draw* one was
     not refusing to *offer* it: such a ghost was still published, so Tab inserted it and Escape was
     spent on it, and `completion::pick_prediction` now drops it before it reaches the signal. The
     refusal here stays, as the one `has_multiline_phantom` rests on. `set_ghost` is `set_preview`'s

@@ -2311,6 +2311,10 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         preview: RwSignal::new(None),
         verdict: RwSignal::new(None),
     };
+    // Whether a Ctrl+K preview is up, for the keys that take a ghost
+    // (`inline_diff::shown_ghost`): read in a memo so the preview is tracked
+    // where it is read (`cmdk_preview_gate`), and the key handler asks the memo.
+    let preview_up = create_memo(move |_| cmdk.preview.with(|p| p.is_some()));
     // Editor-area height, tracked so the completion popup knows whether its list
     // fits below the caret, and so the Ctrl+K bars can tell when they would fall
     // off the bottom of the pane. Declared up here because the editor's own key
@@ -2550,14 +2554,19 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             let had_sig = comp.sig.get_untracked().is_some();
             let had_list = comp.open.get_untracked();
             // The ghost too: it is an offer like the list, and Escape is how an
-            // offer is turned down.
+            // offer is turned down. Only one on screen spends the key: a ghost
+            // hidden behind a Ctrl+K preview goes, and the preview's Escape is
+            // left to answer.
             let had_ghost = comp.ghost.with_untracked(|g| g.is_some());
+            let showed_ghost = comp.ghost.with_untracked(|g| {
+                inline_diff::shown_ghost(g.as_ref(), preview_up.get_untracked()).is_some()
+            });
             comp.sig.set(None);
             comp.open.set(false);
             if had_ghost {
                 editor_sig.with_untracked(|e| inline_diff::set_ghost(comp.ghost, e, None));
             }
-            if had_sig || had_list || had_ghost {
+            if had_sig || had_list || showed_ghost {
                 return CommandExecuted::Yes;
             }
         }
@@ -2621,7 +2630,9 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         if matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::Tab), _)) {
             let taken = editor_sig.with_untracked(|e| {
                 let caret = e.cursor.get_untracked().offset();
-                let ghost = comp.ghost.get_untracked();
+                let ghost = comp.ghost.with_untracked(|g| {
+                    inline_diff::shown_ghost(g.as_ref(), preview_up.get_untracked()).cloned()
+                });
                 if !ghost_takes_tab(
                     ghost.as_ref().map(|g| g.offset),
                     crate::completion::lone_caret(&e.cursor.get_untracked()),
@@ -2662,7 +2673,9 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         ) {
             let taken = editor_sig.with_untracked(|e| {
                 let caret = e.cursor.get_untracked().offset();
-                let ghost = comp.ghost.get_untracked();
+                let ghost = comp.ghost.with_untracked(|g| {
+                    inline_diff::shown_ghost(g.as_ref(), preview_up.get_untracked()).cloned()
+                });
                 if !ghost_takes_word(
                     ghost.as_ref().map(|g| g.offset),
                     crate::completion::lone_caret(&e.cursor.get_untracked()),
@@ -3381,13 +3394,17 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     }
 
     // **Nor does it outlive what it was made under.** Inline predictions — or
-    // the remembered ones — switched off, or the tab moved to another
-    // connection, database or engine:
+    // the remembered ones — switched off, the tab moved to another
+    // connection, database or engine, or the schema it read refreshed (a join
+    // guessed through a key since dropped):
     // a ghost made before stayed drawn, and Tab still took it, until the next
     // edit asked again.
     {
         let ed_ghost = ed.clone();
         create_effect(move |_| {
+            // Each database's own model too: a per-database Refresh, and the
+            // re-introspection after DDL, write that and not the list.
+            db_nodes.with(|ns| ns.iter().for_each(|n| n.schema.track()));
             let _ = (
                 predictions.get(),
                 remembered_predictions.get(),
@@ -3954,6 +3971,10 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         create_effect(move |_| {
             ed_blur.editor_view_focus_lost.track();
             editor_focused.set(false);
+            // A ghost is an offer to the keyboard, and an unfocused editor has
+            // none: drawn there it read as text in the buffer. The next edit
+            // after focus returns asks again.
+            inline_diff::set_ghost(comp.ghost, &ed_blur, None);
             // Clicking away from the editor (schema panel, terminal, another tab)
             // dismisses a stray completion popup + signature help too — but a
             // press on the *popup* is not clicking away, and this ran for that
@@ -6411,7 +6432,8 @@ mod cmdk_preview_gate {
                  builder is not a tracking scope in floem 0.2"
             );
         }
-        assert_eq!(checked, 1, "this gate is stale — it found {checked}");
+        // The verdict footer's, and the `preview_up` memo the ghost keys ask.
+        assert_eq!(checked, 2, "this gate is stale — it found {checked}");
     }
 }
 
