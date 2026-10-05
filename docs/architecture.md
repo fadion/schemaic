@@ -1823,16 +1823,48 @@ existing prose was left alone.
     caret against one mid-line, as in `INSERT INTO t (|) VALUES (1)`, gets no ghost.
     Each keyword guard is a place the bare
     rule was wrong: `INSERT`/`DELETE` count only as a statement's first word, since both also sit
-    in a trigger header and a key's `ON DELETE`; `WITHIN GROUP (` takes no `BY`; a join word
+    in a trigger header and a key's `ON DELETE`; `GROUP` takes `BY` only where it groups a
+    query's rows (`groups_rows`) — its own query, from `local_scope_start`, has a `SELECT` at its
+    depth, and the word before it is none of `WITHIN`, `TO`, `FROM`, `CREATE`, `ALTER`, `DROP`,
+    `RESOURCE` or `AVAILABILITY` — where the bare rule offered `BY` after PostgreSQL's
+    `CREATE GROUP` and `GRANT … TO GROUP`, MySQL's `CREATE RESOURCE GROUP` and T-SQL's
+    `ALTER AVAILABILITY GROUP`; `WITHIN GROUP (`, once a guard of its own, is one of those words.
+    `PARTITION` takes it only where a partitioning is declared (`declares_a_partitioning`):
+    straight after a window's own paren (`OVER (PARTITION`, `WINDOW w AS (PARTITION`), or after a
+    `)` that returns a `CREATE … TABLE` to depth 0, the one closing its column list. It used to
+    answer everywhere — MySQL's `FROM t PARTITION (p0)` and
+    `ALTER TABLE … ADD`/`DROP`/`TRUNCATE PARTITION`, PostgreSQL's `PARTITION OF` and
+    `ATTACH PARTITION`, T-SQL's `CREATE PARTITION FUNCTION`, a column named `partition`. The
+    narrower rule's cost is a partitioning declared
+    anywhere else: MySQL's `ALTER TABLE t PARTITION BY`, and a `CREATE TABLE` with table options
+    between its `)` and the `PARTITION`, get no ghost
+    (`partition_and_group_predict_by_only_where_they_partition_or_group`). `PRIMARY`/`FOREIGN`
+    take `KEY` except after `CREATE`, `ALTER`, `DROP`, `IMPORT` or `ON`, where the word names an
+    object — PostgreSQL's `CREATE FOREIGN TABLE`, `IMPORT FOREIGN SCHEMA` and
+    `ON FOREIGN DATA WRAPPER`, T-SQL's `CREATE PRIMARY XML INDEX`
+    (`primary_and_foreign_predict_key_only_in_a_definition`). A join word
     predicts `JOIN` only where a join can go, since `LEFT`/`RIGHT` are string functions too —
     `in_join_position` reads the word's own query from `local_scope_start` through `scan_clauses`
     and wants a `FROM`, join, `ON` or `USING` clause, or an `UPDATE`'s table list where
     `update_takes_joins` says one may (MySQL's multi-table `UPDATE a INNER JOIN …` alone; the
     others join in an `UPDATE … FROM`, which reads as a `FROM`), where waiting for any earlier `FROM` in the statement
     predicted `JOIN` after `WHERE LEFT ` and `ORDER BY LEFT `, and in a subquery's projection off
-    the outer query's `FROM` (`join_words_predict_only_where_a_join_can_go`); and `CROSS`/`OUTER`
-    predict nothing where `has_apply_joins` says an `APPLY` may follow — T-SQL alone, asked as a
-    capability through an exhaustive match, so a new engine has to answer it. `REPLACE`/`MERGE`
+    the outer query's `FROM` (`join_words_predict_only_where_a_join_can_go`). Inside an `ON` it
+    also wants the condition so far to be a finished operand (`operand_finished`, below): the
+    clause alone said yes to `ON LEFT ` and `ON c.name = RIGHT `, predicting `JOIN` where the user
+    is writing the `LEFT()`/`RIGHT()` functions, while `ON o.customer_id = c.id LEFT ` still gets
+    it (`a_join_word_in_an_unfinished_condition_predicts_nothing`). `FULL` predicts it only where
+    `has_full_joins` says the engine has the join — not MySQL or MariaDB, which read
+    `FROM a FULL JOIN b` as `FULL` being `a`'s alias
+    (`full_predicts_join_only_where_the_engine_has_one`). `CROSS` predicts nothing where
+    `has_apply_joins` says an `APPLY` may follow — T-SQL alone. `OUTER` predicts `JOIN` only straight
+    after `LEFT`, `RIGHT` or (where `has_full_joins` says so) `FULL`: there no `APPLY` can follow,
+    and a bare `OUTER JOIN` is no join on any engine. The `APPLY` guard used to refuse every `OUTER`
+    on SQL Server, `LEFT OUTER ` included, while a bare `OUTER ` was offered `JOIN` everywhere else
+    and MySQL's `FULL OUTER ` slipped past `has_full_joins`
+    (`an_outer_join_predicts_join_on_sql_server_too`,
+    `full_predicts_join_only_where_the_engine_has_one`). Both are asked as a capability through an
+    exhaustive match, so a new engine has to answer them. `REPLACE`/`MERGE`
     (→ `INTO`) and `TRUNCATE` (→ `TABLE`) count only first, as `INSERT` does (`SELECT REPLACE `
     predicts nothing). Some of those words are optional on some engines (`INTO` after `INSERT` on
     MySQL and SQL Server, `TABLE` after `TRUNCATE` everywhere but T-SQL); the partner is then the

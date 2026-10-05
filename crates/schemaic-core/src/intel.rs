@@ -12817,12 +12817,23 @@ fn has_apply_joins(dialect: SqlDialect) -> bool {
 /// Read through [`scan_clauses`] from [`local_scope_start`], so a subquery's
 /// `FROM` is its own and the outer query's is not: a `FROM` *anywhere* earlier
 /// in the statement made `WHERE LEFT ` and `ORDER BY LEFT ` predict `JOIN`.
+/// In an `ON` only once the condition is a finished operand
+/// ([`operand_finished`]): before that, `ON LEFT ` is the function.
 fn in_join_position(sql: &str, lo: usize, at: usize, dialect: SqlDialect) -> bool {
     let start = local_scope_start(sql, lo, at, dialect);
     let toks = tokenize_range(sql, start, at, dialect);
     let (_, clause, ..) = scan_clauses(sql, &toks, at, dialect);
     match clause {
-        Clause::From | Clause::Join | Clause::JoinMod | Clause::On | Clause::Using => true,
+        Clause::From | Clause::Join | Clause::JoinMod | Clause::Using => true,
+        // Inside a condition `LEFT`/`RIGHT` are the string functions until
+        // the condition is whole: `ON LEFT(`, `ON c.name = RIGHT(`.
+        Clause::On => toks
+            .iter()
+            .rposition(|t| bare_upper(t).as_deref() == Some("ON"))
+            .is_some_and(|on| {
+                sql.get(toks[on].end..at)
+                    .is_some_and(|cond| operand_finished(cond, &toks[on + 1..]))
+            }),
         Clause::Update => update_takes_joins(dialect),
         _ => false,
     }
@@ -12854,9 +12865,13 @@ fn insert_into_is_optional(dialect: SqlDialect) -> bool {
 ///
 /// Each guard is a place the bare rule was wrong: `INSERT`/`DELETE` (and
 /// `REPLACE`/`MERGE`/`TRUNCATE`) also sit inside a trigger header and a key's
-/// `ON DELETE`, so only a statement's first word counts; `WITHIN GROUP (` takes
-/// no `BY`; the join words count only where a join can go
-/// ([`in_join_position`]), since `LEFT`/`RIGHT` are string functions too; `IF`
+/// `ON DELETE`, so only a statement's first word counts; `GROUP` takes `BY`
+/// only in a query ([`groups_rows`]) and `PARTITION` only where a partitioning
+/// is declared ([`declares_a_partitioning`]); `PRIMARY`/`FOREIGN` take `KEY`
+/// only where they do not name an object (`CREATE FOREIGN TABLE`); the join
+/// words count only where a join can go ([`in_join_position`]), since
+/// `LEFT`/`RIGHT` are string functions too, and `FULL` only where the engine
+/// has the join ([`has_full_joins`]); `IF`
 /// answers only after an object word ([`if_partner`]); and `NOT` only in a
 /// column's definition ([`declares_a_column`]).
 fn keyword_partner(sql: &str, lo: usize, toks: &[Token], dialect: SqlDialect) -> Option<String> {
@@ -12879,11 +12894,33 @@ fn keyword_partner(sql: &str, lo: usize, toks: &[Token], dialect: SqlDialect) ->
     let second_after = |kw: &str| toks.len() == 2 && prev_is(kw);
     let joins = || in_join_position(sql, lo, last.at, dialect);
     let partner = match w.to_ascii_uppercase().as_str() {
-        "GROUP" if prev_is("WITHIN") => return None,
-        "ORDER" | "GROUP" | "PARTITION" => "BY ",
-        "LEFT" | "RIGHT" | "INNER" | "FULL" if joins() => "JOIN ",
-        "CROSS" | "OUTER" if !has_apply_joins(dialect) && joins() => "JOIN ",
-        "PRIMARY" | "FOREIGN" => "KEY",
+        "ORDER" => "BY ",
+        "GROUP" if groups_rows(sql, lo, last.at, prev.as_deref(), dialect) => "BY ",
+        "PARTITION" if declares_a_partitioning(toks) => "BY ",
+        "LEFT" | "RIGHT" | "INNER" if joins() => "JOIN ",
+        "FULL" if has_full_joins(dialect) && joins() => "JOIN ",
+        // `OUTER` is a join's only after its side — `LEFT OUTER` can only be
+        // a join, `APPLY` or not — and a bare `OUTER JOIN` is none at all.
+        "OUTER"
+            if (prev_is("LEFT")
+                || prev_is("RIGHT")
+                || (prev_is("FULL") && has_full_joins(dialect)))
+                && joins() =>
+        {
+            "JOIN "
+        }
+        "CROSS" if !has_apply_joins(dialect) && joins() => "JOIN ",
+        // Not where the word names an object: PostgreSQL's `CREATE FOREIGN
+        // TABLE`, `IMPORT FOREIGN SCHEMA`, `ON FOREIGN DATA WRAPPER`; T-SQL's
+        // `CREATE PRIMARY XML INDEX`.
+        "PRIMARY" | "FOREIGN"
+            if !matches!(
+                prev.as_deref(),
+                Some("CREATE" | "ALTER" | "DROP" | "IMPORT" | "ON")
+            ) =>
+        {
+            "KEY"
+        }
         "INSERT" if first => "INTO ",
         "DELETE" if first => "FROM ",
         "REPLACE" | "MERGE" if first => "INTO ",
@@ -12901,6 +12938,65 @@ fn keyword_partner(sql: &str, lo: usize, toks: &[Token], dialect: SqlDialect) ->
         _ => return None,
     };
     Some(in_typed_case(partner, w))
+}
+
+/// Does a `GROUP` at `at` group a query's rows — rather than name a role
+/// group (`CREATE GROUP`, `GRANT … TO GROUP`), MySQL's `RESOURCE GROUP`,
+/// T-SQL's `AVAILABILITY GROUP` or an aggregate's `WITHIN GROUP`? Its own
+/// query ([`local_scope_start`]) has a `SELECT` at its depth, and the word
+/// before it is not one of those.
+fn groups_rows(sql: &str, lo: usize, at: usize, prev: Option<&str>, dialect: SqlDialect) -> bool {
+    if matches!(
+        prev,
+        Some("WITHIN" | "TO" | "FROM" | "CREATE" | "ALTER" | "DROP" | "RESOURCE" | "AVAILABILITY")
+    ) {
+        return false;
+    }
+    let start = local_scope_start(sql, lo, at, dialect);
+    let mut depth = 0usize;
+    tokenize_range(sql, start, at, dialect)
+        .iter()
+        .any(|t| match t.kind {
+            TkKind::LParen => {
+                depth += 1;
+                false
+            }
+            TkKind::RParen => {
+                depth = depth.saturating_sub(1);
+                false
+            }
+            _ => depth == 0 && bare_upper(t).as_deref() == Some("SELECT"),
+        })
+}
+
+/// Does a `PARTITION` ending `toks` open a partitioning — a window's
+/// (`OVER (PARTITION`, `WINDOW w AS (PARTITION`) or a table's, straight after
+/// a `CREATE TABLE`'s column list? Elsewhere it is MySQL's `FROM t PARTITION
+/// (p0)` and `ADD PARTITION`, PostgreSQL's `PARTITION OF` and `ATTACH
+/// PARTITION`, T-SQL's `CREATE PARTITION FUNCTION`, or a column's name.
+fn declares_a_partitioning(toks: &[Token]) -> bool {
+    let [.., before, prev, _] = toks else {
+        return false;
+    };
+    match prev.kind {
+        TkKind::LParen => matches!(bare_upper(before).as_deref(), Some("OVER" | "AS")),
+        TkKind::RParen => {
+            let head = |i: usize| toks.get(i).and_then(bare_upper);
+            head(0).as_deref() == Some("CREATE")
+                && (1..4).any(|i| head(i).as_deref() == Some("TABLE"))
+                && depth_after(&toks[..toks.len() - 1]) == Some(0)
+        }
+        _ => false,
+    }
+}
+
+/// Whether this engine has `FULL [OUTER] JOIN`. MySQL and MariaDB do not:
+/// `FROM a FULL JOIN b` reads `FULL` as `a`'s alias there.
+fn has_full_joins(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MySql => false,
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => true,
+    }
 }
 
 /// An unquoted word token, upper-cased — what a keyword test reads.
@@ -14133,7 +14229,6 @@ mod predict_tests {
             ("SELECT * FROM orders o LEFT ", "JOIN "),
             ("SELECT * FROM orders o INNER ", "JOIN "),
             ("SELECT * FROM orders o RIGHT ", "JOIN "),
-            ("SELECT * FROM orders o FULL ", "JOIN "),
             ("SELECT * FROM orders o CROSS ", "JOIN "),
             ("SELECT * FROM orders o LEFT OUTER ", "JOIN "),
             ("CREATE TABLE t (id int PRIMARY ", "KEY"),
@@ -15201,6 +15296,117 @@ mod predict_tests {
             in_schema(&twins, "INSERT INTO orders (", SqlDialect::Postgres).as_deref(),
             Some("id, customer_id)")
         );
+    }
+
+    /// `PARTITION` is `BY` only where a partitioning is declared — a window's
+    /// own paren, or after a `CREATE TABLE`'s column list — and `GROUP` only
+    /// in a query; both words name other things elsewhere.
+    #[test]
+    fn partition_and_group_predict_by_only_where_they_partition_or_group() {
+        let pg = |sql: &str| at_end(sql, SqlDialect::Postgres);
+        assert_eq!(
+            pg("SELECT row_number() OVER (PARTITION ").as_deref(),
+            Some("BY ")
+        );
+        assert_eq!(
+            pg("SELECT 1 FROM t WINDOW w AS (PARTITION ").as_deref(),
+            Some("BY ")
+        );
+        assert_eq!(
+            pg("CREATE TABLE m (id int, at date) PARTITION ").as_deref(),
+            Some("BY ")
+        );
+        assert_eq!(pg("CREATE TABLE m_2024 PARTITION "), None);
+        assert_eq!(pg("ALTER TABLE m ATTACH PARTITION "), None);
+        assert_eq!(pg("SELECT topic, partition "), None);
+        assert_eq!(pg("SELECT (partition "), None);
+        assert_eq!(my("SELECT * FROM orders PARTITION "), None);
+        assert_eq!(my("ALTER TABLE orders DROP PARTITION "), None);
+        assert_eq!(at_end("CREATE PARTITION ", SqlDialect::MsSql), None);
+
+        assert_eq!(
+            pg("SELECT a, count(*) FROM t GROUP ").as_deref(),
+            Some("BY ")
+        );
+        assert_eq!(
+            pg("CREATE VIEW v AS SELECT a FROM t GROUP ").as_deref(),
+            Some("BY ")
+        );
+        assert_eq!(pg("CREATE GROUP "), None);
+        assert_eq!(pg("GRANT SELECT ON t TO GROUP "), None);
+        assert_eq!(my("CREATE RESOURCE GROUP "), None);
+        assert_eq!(at_end("ALTER AVAILABILITY GROUP ", SqlDialect::MsSql), None);
+    }
+
+    /// `PRIMARY` and `FOREIGN` are `KEY` in a table's definition, not where
+    /// they name an object: PostgreSQL's foreign tables, schemas and data
+    /// wrappers, SQL Server's primary XML index.
+    #[test]
+    fn primary_and_foreign_predict_key_only_in_a_definition() {
+        let pg = |sql: &str| at_end(sql, SqlDialect::Postgres);
+        assert_eq!(pg("CREATE FOREIGN "), None);
+        assert_eq!(pg("DROP FOREIGN "), None);
+        assert_eq!(pg("ALTER FOREIGN "), None);
+        assert_eq!(pg("IMPORT FOREIGN "), None);
+        assert_eq!(pg("GRANT USAGE ON FOREIGN "), None);
+        assert_eq!(at_end("CREATE PRIMARY ", SqlDialect::MsSql), None);
+        assert_eq!(pg("ALTER TABLE t ADD FOREIGN ").as_deref(), Some("KEY"));
+        assert_eq!(
+            pg("ALTER TABLE t ADD CONSTRAINT pk PRIMARY ").as_deref(),
+            Some("KEY")
+        );
+    }
+
+    /// MySQL has no `FULL JOIN`: `FROM a FULL JOIN b` reads `FULL` as `a`'s
+    /// alias there, so the word predicts nothing.
+    #[test]
+    fn full_predicts_join_only_where_the_engine_has_one() {
+        assert_eq!(my("SELECT * FROM orders o FULL "), None);
+        assert_eq!(my("SELECT * FROM orders o FULL OUTER "), None);
+        // A bare `OUTER JOIN` is no join on any engine: `OUTER` needs its side.
+        for dialect in SqlDialect::ALL {
+            assert_eq!(
+                at_end("SELECT * FROM orders o OUTER ", dialect),
+                None,
+                "{dialect:?}"
+            );
+        }
+        for dialect in [SqlDialect::Postgres, SqlDialect::MsSql, SqlDialect::Sqlite] {
+            assert_eq!(
+                at_end("SELECT * FROM orders o FULL ", dialect).as_deref(),
+                Some("JOIN "),
+                "{dialect:?}"
+            );
+        }
+    }
+
+    /// Inside a join's condition `LEFT` and `RIGHT` are the string functions
+    /// until the condition is whole; then the next join may begin.
+    #[test]
+    fn a_join_word_in_an_unfinished_condition_predicts_nothing() {
+        assert_eq!(my("SELECT * FROM orders o JOIN customers c ON LEFT "), None);
+        assert_eq!(
+            my("SELECT * FROM orders o JOIN customers c ON c.name = RIGHT "),
+            None
+        );
+        assert_eq!(
+            my("SELECT * FROM orders o JOIN customers c ON o.customer_id = c.id LEFT ").as_deref(),
+            Some("JOIN ")
+        );
+    }
+
+    /// On SQL Server `OUTER` alone may be `OUTER APPLY`, but not after `LEFT`,
+    /// `RIGHT` or `FULL`, where it can only be followed by `JOIN`.
+    #[test]
+    fn an_outer_join_predicts_join_on_sql_server_too() {
+        for side in ["LEFT", "RIGHT", "FULL"] {
+            assert_eq!(
+                at_end(&format!("SELECT * FROM a {side} OUTER "), SqlDialect::MsSql).as_deref(),
+                Some("JOIN "),
+                "{side}"
+            );
+        }
+        assert_eq!(at_end("SELECT * FROM a OUTER ", SqlDialect::MsSql), None);
     }
 }
 
