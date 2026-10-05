@@ -721,6 +721,10 @@ struct Fmt<'a> {
     /// Where clause bodies / commas / `AND`/`OR` break to (usually `base + 1`).
     content: usize,
     parens: Vec<Paren>,
+    /// How many `[` are open — an array constructor's or a subscript's. Their
+    /// commas are an element list's, never a clause list's, and the brackets
+    /// and a slice's `:` sit tight: `ARRAY[1,2]` came out `array [ 1,⏎  2 ]`.
+    brackets: usize,
     prev: Option<(Kind, String)>,
     /// Inside `BETWEEN … AND …`: the next `AND` stays inline.
     suppress_and: bool,
@@ -751,6 +755,7 @@ impl<'a> Fmt<'a> {
             base: 0,
             content: 0,
             parens: Vec::new(),
+            brackets: 0,
             prev: None,
             suppress_and: false,
             tight_next: false,
@@ -838,11 +843,20 @@ impl<'a> Fmt<'a> {
         // prev forces no following space. `::` is a cast, and a cast binds to
         // what it casts the way `.` binds to what it qualifies: `id :: text` is
         // legal PostgreSQL and reads like a mistake.
-        if *pk == Kind::Punct && (pt == "(" || pt == "." || pt == "::") {
+        if *pk == Kind::Punct && (pt == "(" || pt == "." || pt == "::" || pt == "[") {
             return false;
         }
         // cur forces no preceding space
-        if cur_kind == Kind::Punct && matches!(cur, ")" | "," | ";" | "." | "::") {
+        if cur_kind == Kind::Punct && matches!(cur, ")" | "," | ";" | "." | "::" | "]") {
+            return false;
+        }
+        // A subscript or an array constructor's `[` binds to what it follows
+        // (`arr[1]`, `ARRAY[1]`, `m[1][2]`), and a slice's `:` to both bounds.
+        if cur_kind == Kind::Punct && cur == "[" {
+            return !(matches!(pk, Kind::Word | Kind::Quoted)
+                || (*pk == Kind::Punct && (pt == "]" || pt == ")")));
+        }
+        if self.brackets > 0 && ((cur_kind == Kind::Punct && cur == ":") || pt == ":") {
             return false;
         }
         if cur_kind == Kind::Punct && cur == "(" {
@@ -1012,10 +1026,11 @@ impl<'a> Fmt<'a> {
                         self.emit(Kind::Punct, ",", true);
                         // Break top-level list commas and subquery SELECT-list
                         // commas; keep function-argument / IN-list commas inline.
-                        let breakable = match self.parens.last() {
-                            None => true,
-                            Some(p) => p.subquery,
-                        };
+                        let breakable = self.brackets == 0
+                            && match self.parens.last() {
+                                None => true,
+                                Some(p) => p.subquery,
+                            };
                         if breakable {
                             self.break_to(self.content);
                         }
@@ -1036,6 +1051,14 @@ impl<'a> Fmt<'a> {
                             self.tight_next = true;
                         }
                     }
+                    "[" => {
+                        self.emit(Kind::Punct, text, false);
+                        self.brackets += 1;
+                    }
+                    "]" => {
+                        self.emit(Kind::Punct, text, false);
+                        self.brackets = self.brackets.saturating_sub(1);
+                    }
                     _ => {
                         self.emit(Kind::Punct, text, false);
                     }
@@ -1051,6 +1074,7 @@ impl<'a> Fmt<'a> {
         self.base = 0;
         self.content = 0;
         self.parens.clear();
+        self.brackets = 0;
         self.suppress_and = false;
         self.prev = None;
         self.blank = true;
@@ -1095,6 +1119,25 @@ mod tests {
     }
 
     const IND: &str = "  ";
+
+    /// An array constructor's or a subscript's brackets sit tight, a slice's
+    /// `:` binds both bounds, and a comma inside them is an element list's —
+    /// never a select list's line break. `ARRAY[1,2]` came out
+    /// `array [ 1,⏎  2 ]`.
+    #[test]
+    fn brackets_are_neither_spaced_nor_broken() {
+        let pg = |s: &str| super::format_sql(s, IND, SqlDialect::Postgres);
+        let got = pg("select array[1,2], a[ 1 ], m[1][2:3] from t");
+        assert_eq!(
+            got,
+            "select\n  array[1, 2],\n  a[1],\n  m[1][2:3]\nfrom\n  t"
+        );
+        assert_eq!(pg(&got), got, "a second format changes nothing");
+        assert_eq!(
+            pg("select 1 from t where x = any(array[1,2]) and y = 1"),
+            "select\n  1\nfrom\n  t\nwhere\n  x = any (array[1, 2])\n  and y = 1"
+        );
+    }
 
     /// **A trailing newline is part of the file, and Format Code now reaches
     /// files.** Trimming it made a reformat also produce

@@ -11880,6 +11880,11 @@ existing prose was left alone.
     **What the input had between two tokens** is read where the layout depends on it: the token
     stream does not carry it, so `Fmt` holds `src` and `between` slices the gap out of it, every
     token being a slice of `src`.
+    **A `[` is an array constructor's or a subscript's, and `Fmt::brackets` counts the open ones**:
+    a comma inside them is an element list's and never breaks a clause list, the brackets sit tight
+    against what they follow and what they hold, and a slice's `:` binds both bounds — `ARRAY[1,2]`
+    came out `array [ 1,⏎  2 ]` (`brackets_are_neither_spaced_nor_broken`). A bracket-quoted name is
+    a `Quoted` token on the engines that have one, so this never sees it.
     **Some words are laid out by what is around them rather than what they spell.** A word straight
     after `.` is a plain name, never a clause head, a join or an `AND`/`OR` break: MySQL reads a
     keyword as a name only when nothing separates it from the `.`, so `select t.order, p.left` came
