@@ -2320,8 +2320,12 @@ existing prose was left alone.
     `IN (1, 2)` offers `1, 2`, while one that runs on past the paren (`IN (1, 2) ORDER BY id`)
     offers nothing, since all of it would land inside the `)`. That spot used to be refused outright
     (`after == ")"`), though `predict` answers there. The match is
-    an exact prefix, case and inner spacing included — `select` does not continue `SELECT` — over
-    text with `\r\n` made `\n`, and a stored run of several statements is cut by
+    SQL's, not the bytes' (`strip_prefix_loose`): keywords and bare names in any case, and a
+    white-space run matching one of any width or kind — `select *⏎from orders ` continues a past
+    `SELECT * FROM   orders WHERE …` — but a string, quoted name or comment exactly as written,
+    since `'Open'` is not `'open'`; a run ending the typed text takes all of the stored one, so the
+    offer starts at a word (`recall_ignores_case_and_spacing_but_not_inside_quotes`; it was an
+    exact prefix until then). It reads text with `\r\n` made `\n`, and a stored run of several statements is cut by
     `sql::statement_ranges` so that each is offered, each read from its first byte of code
     (`skip_leading_noncode`): the range `statement_ranges` gives includes a comment heading the
     statement, so a run saved as `-- weekly report⏎SELECT …` never matched at all. **The statement
@@ -2353,8 +2357,9 @@ existing prose was left alone.
     used to re-lex every stored run of the connection — up to `history::MAX_PER_CONN` (50), each
     stored whole — and a review measured 432 ms a keystroke, in a release build, after a Run All of
     a mysqldump. Now a text longer than `RECALL_MAX_BYTES` (256 KiB) is skipped; one that does not
-    hold the typed text's first line — which a `\r\n` text holds verbatim too — is passed over by a
-    substring search; and only one that does is given its `\r\n` copy (where it holds a `\r`) and
+    hold the typed text — searched as loosely as it is matched, by
+    `text_ops::contains_collapsed_ignore_ascii_case` over `Recall::needle`, the typed text with its
+    white space collapsed — is passed over; and only one that does is given its `\r\n` copy (where it holds a `\r`) and
     lexed by `statement_ranges`. **The cap was 16 KiB until open tabs were read too**: a scratch
     tab is routinely longer than that, and at that cap would not have been read at all. The
     substring search is what keeps a keystroke cheap — most texts do not hold the typed line — and

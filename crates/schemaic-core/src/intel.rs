@@ -12974,8 +12974,10 @@ fn may_precede(guess: &str, next: &str) -> bool {
 /// at least two words typed (one word is the start of every run, so matching
 /// it is a guess, not a memory), nothing after the caret in the statement (a
 /// statement being edited in the middle is not the one run before), the caret
-/// after whitespace or a `(`, and in code. The match is exact — `select` does
-/// not continue `SELECT` — over text with its line endings made `\n`, and a
+/// after whitespace or a `(`, and in code. The match is SQL's, not the bytes'
+/// ([`strip_prefix_loose`]) — `select *⏎from` continues `SELECT * FROM`, while
+/// a string or quoted name must match as written — over text with its line
+/// endings made `\n`, and a
 /// stored run of several statements offers each of them, read from its first
 /// word of code (a comment heading a run is skipped, and so is one heading the
 /// statement typed). What it answers is one
@@ -13012,6 +13014,9 @@ pub fn predict_from_history<'a>(
 pub struct Recall {
     /// The statement typed so far, its line endings made `\n`.
     typed: String,
+    /// `typed` with its white-space runs collapsed to one space — what the
+    /// cheap search over a whole text looks for before anything is lexed.
+    needle: String,
     /// The `)`s bracket pairing left after the caret, which the remembered
     /// line must end with and is offered without.
     closers: String,
@@ -13048,8 +13053,10 @@ impl Recall {
         let typed = skip_leading_noncode(&sql[lo..caret], dialect).replace("\r\n", "\n");
         typed.split_whitespace().nth(1)?;
         let line_rest = sql[caret..].split('\n').next().unwrap_or("");
+        let needle = typed.split_whitespace().collect::<Vec<_>>().join(" ");
         Some(Recall {
             typed,
+            needle,
             closers: ")".repeat(after.len()),
             followed: !line_rest.trim().is_empty(),
             dialect,
@@ -13060,11 +13067,12 @@ impl Recall {
     /// begins with the one typed — `None` if none does, or `text` is too long
     /// to read on a keystroke.
     pub fn from(&self, text: &str) -> Option<String> {
-        // What a `\r\n` text holds verbatim too: the typed text up to its
-        // first line end. A substring search for it first: most texts do not
-        // hold it at all, and passing them over costs a scan, not a lex.
-        let first_typed_line = self.typed.split('\n').next().unwrap_or("");
-        if text.len() > RECALL_MAX_BYTES || !text.contains(first_typed_line) {
+        // A search for the typed text first, as loose as the match below — any
+        // case, any white space: most texts do not hold it at all, and passing
+        // them over costs a scan, not a lex.
+        if text.len() > RECALL_MAX_BYTES
+            || !crate::text_ops::contains_collapsed_ignore_ascii_case(text, &self.needle)
+        {
             return None;
         }
         let text = if text.contains('\r') {
@@ -13072,14 +13080,11 @@ impl Recall {
         } else {
             std::borrow::Cow::Borrowed(text)
         };
-        if !text.contains(self.typed.as_str()) {
-            return None;
-        }
         crate::sql::statement_ranges(&text, self.dialect)
             .into_iter()
             .find_map(|(a, b)| {
                 let stmt = skip_leading_noncode(&text[a..b], self.dialect);
-                let more = stmt.strip_prefix(self.typed.as_str())?;
+                let more = strip_prefix_loose(stmt, &self.typed, self.dialect)?;
                 // `history::push` keeps these out of the history; a tab or a
                 // snippet holds whatever was typed into it.
                 if crate::sql::carries_credential(stmt, self.dialect) {
@@ -13101,6 +13106,46 @@ impl Recall {
 /// than rescanned on every keystroke. Below it a text is still lexed only once
 /// a substring search has found the typed line in it.
 const RECALL_MAX_BYTES: usize = 256 * 1024;
+
+/// `stmt` past `typed`, when `stmt` begins with it **as SQL reads it**: a
+/// keyword or a bare name in any case, white space of any width or kind —
+/// `select *⏎from` begins `SELECT * FROM` — but a string, a quoted name or a
+/// comment exactly as written, since `'Bob'` is not `'bob'`. A white-space run
+/// ending `typed` takes all of the one in `stmt`, so what is left starts at
+/// its next word. Spans are read off `typed` through [`skip_noncode`].
+fn strip_prefix_loose<'a>(stmt: &'a str, typed: &str, dialect: SqlDialect) -> Option<&'a str> {
+    let (s, t) = (stmt.as_bytes(), typed.as_bytes());
+    let (mut i, mut j) = (0, 0);
+    while j < t.len() {
+        if t[j].is_ascii_whitespace() {
+            if !s.get(i)?.is_ascii_whitespace() {
+                return None;
+            }
+            while j < t.len() && t[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            while i < s.len() && s[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            continue;
+        }
+        if let Some(end) = skip_noncode(t, j, dialect) {
+            let span = &t[j..end];
+            if s.get(i..i + span.len())? != span {
+                return None;
+            }
+            i += span.len();
+            j = end;
+            continue;
+        }
+        if !s.get(i)?.eq_ignore_ascii_case(&t[j]) {
+            return None;
+        }
+        i += 1;
+        j += 1;
+    }
+    stmt.get(i..)
+}
 
 /// `stmt` from its first byte of code: whitespace and comments in front of it
 /// skipped, through [`skip_noncode`].
@@ -15039,6 +15084,33 @@ mod history_prediction_tests {
             None => (sql.to_string(), sql.len()),
         };
         predict_from_history(&text, caret, SqlDialect::MySql, past.iter().copied())
+    }
+
+    /// Recall reads the typed statement as SQL does: keywords and bare names
+    /// in any case, white space of any width or kind — but a string or a
+    /// quoted name exactly as written.
+    #[test]
+    fn recall_ignores_case_and_spacing_but_not_inside_quotes() {
+        let past = ["SELECT * FROM   orders WHERE status = 'Open' ORDER BY id"];
+        assert_eq!(
+            hist("select * from orders ", &past).as_deref(),
+            Some("WHERE status = 'Open' ORDER BY id")
+        );
+        assert_eq!(
+            hist("SELECT *\n  FROM orders ", &past).as_deref(),
+            Some("WHERE status = 'Open' ORDER BY id")
+        );
+        assert_eq!(
+            hist("select * from orders where status = 'Open' ", &past).as_deref(),
+            Some("ORDER BY id")
+        );
+        assert_eq!(
+            hist("SELECT * FROM orders WHERE status = 'open' ", &past),
+            None,
+            "a string's case is its value"
+        );
+        // White space where the remembered text has none is another statement.
+        assert_eq!(hist("SELECT * FROM ord ers ", &past), None);
     }
 
     /// A statement typed so far that begins one run before gets the rest of
