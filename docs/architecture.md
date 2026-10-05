@@ -940,7 +940,9 @@ existing prose was left alone.
     statement holding it; an error naming nothing findable keeps the whole buffer, because guessing
     a statement would be a rewrite of the wrong one. **The token has to be unique in the buffer**,
     and that is the one place this parts company with the squiggle's lookup: `locate_db_error`
-    answers with the *first* case-insensitive hit, which is right when it is handed one statement
+    answers with the *first* hit — in code and on word boundaries (`code_word_hits`), so a named
+    `id` no longer lands inside `valid`, nor a `salery` inside the comment above the real one
+    (`db_error_locates_the_named_token_in_code_and_whole`) — which is right when it is handed one statement
     and wrong when it is handed a script — `near 'FROM t2'` names a word every statement has, so the
     fix scoped to the first one, a working statement that Accept would then overwrite while the
     broken one stayed broken. A token that appears twice identifies nothing, so `repeats_ci` sends

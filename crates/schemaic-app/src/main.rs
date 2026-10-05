@@ -3200,6 +3200,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     create_ext_action(cx, move |diags: Vec<schemaic_core::intel::Diagnostic>| {
                         on_done(diags)
                     });
+                let dialect = dialect_of(&db);
                 handle.spawn(async move {
                     let stmt = sql.get(lo..hi).unwrap_or("").to_string();
                     let diags = match db.prepare_check(database.as_deref(), &stmt).await {
@@ -3209,6 +3210,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             lo,
                             hi,
                             &e.to_string(),
+                            dialect,
                         )],
                     };
                     send(diags);

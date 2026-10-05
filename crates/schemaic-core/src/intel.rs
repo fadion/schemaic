@@ -12358,32 +12358,6 @@ pub fn select_output_names(sql: &str, dialect: SqlDialect) -> Option<Vec<String>
     Some(out)
 }
 
-/// Case-insensitive search for `needle` in `hay`, returning its byte range.
-fn find_ci(hay: &str, needle: &str) -> Option<(usize, usize)> {
-    if needle.is_empty() {
-        return None;
-    }
-    let h = hay.as_bytes();
-    let n = needle.as_bytes();
-    // Not just tidiness: `saturating_sub` bottoms out at 0, so a needle longer
-    // than the haystack still visited `i = 0` and sliced past the end — a panic
-    // reachable from any caller that hands over a tail shorter than the token.
-    if n.len() > h.len() {
-        return None;
-    }
-    (0..=h.len() - n.len()).find_map(|i| {
-        if h[i..i + n.len()]
-            .iter()
-            .zip(n)
-            .all(|(a, b)| a.eq_ignore_ascii_case(b))
-        {
-            Some((i, i + n.len()))
-        } else {
-            None
-        }
-    })
-}
-
 /// Generic phrases MySQL/MariaDB puts in quotes that aren't object names.
 fn is_error_phrase(s: &str) -> bool {
     matches!(
@@ -12400,7 +12374,13 @@ fn is_error_phrase(s: &str) -> bool {
 /// Locate the offending token of a DB error `message` within the statement text
 /// `stmt`: the `near '<tok>'` clause of a syntax error, or the first quoted object
 /// name of a name error (`Unknown column 'x'`, `Table 'db.t' doesn't exist`).
-fn locate_db_error(stmt: &str, message: &str) -> Option<(usize, usize)> {
+///
+/// **The first hit in code, on word boundaries** ([`code_word_hits`]), not the
+/// first substring: `Unknown column 'id'` squiggled the `id` inside `valid`,
+/// and a token named in a comment or a string above the real one took the
+/// squiggle from it.
+fn locate_db_error(stmt: &str, message: &str, dialect: SqlDialect) -> Option<(usize, usize)> {
+    let find = |tok: &str| code_word_hits(stmt, tok, dialect).first().copied();
     // Syntax error: MySQL's `… near 'FRM employees' at line 1`, PostgreSQL's
     // `syntax error at or near "FRM"` → first word of the quoted run.
     const NEAR: &str = "near ";
@@ -12411,7 +12391,7 @@ fn locate_db_error(stmt: &str, message: &str) -> Option<(usize, usize)> {
                 let tok = rest[..end].split_whitespace().next().unwrap_or("");
                 let tok = tok.trim_matches('`');
                 if !tok.is_empty()
-                    && let Some(r) = find_ci(stmt, tok)
+                    && let Some(r) = find(tok)
                 {
                     return r.into();
                 }
@@ -12442,7 +12422,7 @@ fn locate_db_error(stmt: &str, message: &str) -> Option<(usize, usize)> {
                 .next()
                 .unwrap_or(content)
                 .trim_matches('`');
-            if let Some(r) = find_ci(stmt, seg) {
+            if let Some(r) = find(seg) {
                 return Some(r);
             }
         } else {
@@ -12473,9 +12453,15 @@ fn clean_db_message(message: &str) -> String {
 /// the offending token — a `near '<tok>'` clause or a quoted object name — which we
 /// locate to place the squiggle; failing that, the statement's leading token is
 /// underlined (never the whole statement, which reads as noise).
-pub fn db_error_diagnostic(sql: &str, lo: usize, hi: usize, message: &str) -> Diagnostic {
+pub fn db_error_diagnostic(
+    sql: &str,
+    lo: usize,
+    hi: usize,
+    message: &str,
+    dialect: SqlDialect,
+) -> Diagnostic {
     let stmt = sql.get(lo..hi).unwrap_or("");
-    let range = match locate_db_error(stmt, message) {
+    let range = match locate_db_error(stmt, message, dialect) {
         Some((s, e)) => (lo + s, lo + e),
         // Fall back to the statement's first token, not the whole statement.
         None => {
@@ -12506,7 +12492,7 @@ pub fn db_error_diagnostic(sql: &str, lo: usize, hi: usize, message: &str) -> Di
 ///
 /// **The named token has to identify exactly one place in the buffer**, and that
 /// is the whole difference between this and the squiggle's lookup.
-/// `locate_db_error` answers with the *first* case-insensitive hit, which is
+/// `locate_db_error` answers with the *first* hit in code, which is
 /// right when it is handed one statement and wrong when it is handed a script:
 /// `near 'FROM t2'` names a word every statement has, so the fix scoped to the
 /// first one — a working statement that Accept would then overwrite, leaving the
@@ -12529,7 +12515,7 @@ pub fn error_fix_range(sql: &str, message: &str, dialect: SqlDialect) -> (usize,
     if crate::sql::statement_ranges(sql, dialect).len() < 2 {
         return whole;
     }
-    let Some((s, e)) = locate_db_error(sql, message) else {
+    let Some((s, e)) = locate_db_error(sql, message, dialect) else {
         return whole;
     };
     match code_word_hits(sql, &sql[s..e], dialect).as_slice() {
@@ -24525,6 +24511,27 @@ mod tests {
 
     // ── DB-validated diagnostics ──────────────────────────────────────────────
 
+    /// MySQL's, for the tests written before the dialect parameter.
+    fn db_error_diagnostic(sql: &str, lo: usize, hi: usize, message: &str) -> Diagnostic {
+        super::db_error_diagnostic(sql, lo, hi, message, SqlDialect::MySql)
+    }
+
+    /// The token the server names is found in code and on word boundaries:
+    /// not inside a longer name, not in a comment or a string before it.
+    #[test]
+    fn db_error_locates_the_named_token_in_code_and_whole() {
+        let sql = "SELECT valid, id FROM t";
+        let d = db_error_diagnostic(sql, 0, sql.len(), "Unknown column 'id' in 'field list'");
+        assert_eq!(d.range, (14, 16), "the `id`, not the one inside `valid`");
+        let sql = "SELECT /* salery */ 'salery', salery FROM t";
+        let d = db_error_diagnostic(sql, 0, sql.len(), "Unknown column 'salery' in 'field list'");
+        assert_eq!(&sql[d.range.0..d.range.1], "salery");
+        assert_eq!(
+            d.range.0, 30,
+            "the code one, after the comment and the string"
+        );
+    }
+
     #[test]
     fn db_error_locates_syntax_near_token() {
         let sql = "SELECT * FRM employees";
@@ -24555,16 +24562,19 @@ mod tests {
         // to the leading-token fallback and landed on `SELECT`, in the feature
         // whose whole job is putting the error where the mistake is. The three
         // message shapes below are the ones the server really emits.
+        let pg = |sql: &str, msg: &str| {
+            super::db_error_diagnostic(sql, 0, sql.len(), msg, SqlDialect::Postgres)
+        };
         let sql = r#"SELECT id, nosuchcol FROM "Orders""#;
-        let d = db_error_diagnostic(sql, 0, sql.len(), r#"column "nosuchcol" does not exist"#);
+        let d = pg(sql, r#"column "nosuchcol" does not exist"#);
         assert_eq!(&sql[d.range.0..d.range.1], "nosuchcol");
 
         let sql = r#"SELECT 1 FROM "Ordrs""#;
-        let d = db_error_diagnostic(sql, 0, sql.len(), r#"relation "Ordrs" does not exist"#);
+        let d = pg(sql, r#"relation "Ordrs" does not exist"#);
         assert_eq!(&sql[d.range.0..d.range.1], "Ordrs");
 
         let sql = "SELECT 1 FRM t";
-        let d = db_error_diagnostic(sql, 0, sql.len(), r#"syntax error at or near "FRM""#);
+        let d = pg(sql, r#"syntax error at or near "FRM""#);
         assert_eq!(&sql[d.range.0..d.range.1], "FRM");
     }
 
@@ -24718,10 +24728,13 @@ mod tests {
     }
 
     #[test]
-    fn find_ci_answers_none_when_the_needle_is_longer_than_the_haystack() {
-        assert_eq!(find_ci("ab", "abc"), None);
-        assert_eq!(find_ci("", "a"), None);
-        assert_eq!(find_ci("abc", "abc"), Some((0, 3)));
+    fn code_word_hits_answers_none_when_the_needle_is_longer_than_the_haystack() {
+        // The class `find_ci` once panicked on — a needle longer than the tail
+        // it was handed — for the search `locate_db_error` now uses.
+        let my = SqlDialect::MySql;
+        assert!(code_word_hits("ab", "abc", my).is_empty());
+        assert!(code_word_hits("", "a", my).is_empty());
+        assert_eq!(code_word_hits("abc", "abc", my), [(0, 3)]);
     }
 
     #[test]
