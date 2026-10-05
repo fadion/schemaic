@@ -1069,7 +1069,11 @@ existing prose was left alone.
     (`Scope::alias_blind`): `WHERE` everywhere but SQLite, which resolves one there
     (`select_alias_in_where`), and `HAVING` on PostgreSQL and SQL Server, which do not
     (`select_alias_in_having`); the resolver used to know only `WHERE`, for every engine
-    (`a_select_list_alias_is_judged_by_the_engines_scope`). **Three more identifiers
+    (`a_select_list_alias_is_judged_by_the_engines_scope`). **On PostgreSQL a bare table name or
+    alias is the whole row** (`names_whole_rows`): `row_to_json(u)`, `SELECT u FROM users u` —
+    `resolve` accepts one naming a visible source once no column of that name has claimed it,
+    where it used to report ``Column `u` not found``
+    (`a_whole_row_reference_is_not_an_unknown_column_on_postgres`). **Three more identifiers
     the parser hands over are not columns**, all measured as red ``Column `…` not found``: a
     datepart function's first argument (`DATEADD(day, …)`, and MySQL's `TIMESTAMPDIFF(SECOND,
     …)` — `datepart_functions`, per dialect; the call's span goes into `not_columns` before the

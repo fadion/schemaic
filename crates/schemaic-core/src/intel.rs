@@ -3080,6 +3080,17 @@ fn bare_called_builtins(dialect: SqlDialect) -> &'static [&'static str] {
     }
 }
 
+/// Does a bare table name or alias stand for the whole row on this engine?
+/// PostgreSQL's composite-value reference — `row_to_json(u)`, `count(u)`,
+/// `SELECT u FROM users u` — which the column resolver flagged as an unknown
+/// column `u`. The other three have no such reference.
+fn names_whole_rows(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::Postgres => true,
+        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+    }
+}
+
 /// Is a select-list alias in scope in this engine's `WHERE`? SQLite resolves
 /// one there — `SELECT price * 2 AS p FROM t WHERE p > 10` runs — where
 /// MySQL, PostgreSQL and SQL Server answer that the column does not exist.
@@ -9868,8 +9879,9 @@ mod colres {
             not_columns: Vec::new(),
         };
         let _ = ast.visit(&mut c);
+        let whole_row = super::names_whole_rows(dialect);
         for r in &c.refs {
-            if let Some(d) = resolve(r, &c.scopes) {
+            if let Some(d) = resolve(r, &c.scopes, whole_row) {
                 out.push(d);
             }
         }
@@ -10161,7 +10173,8 @@ mod colres {
 
     /// Resolve one column ref against the scopes containing its position (innermost
     /// first). Returns a diagnostic only when the column definitively doesn't exist.
-    fn resolve(r: &Ref, scopes: &[Scope]) -> Option<Diagnostic> {
+    /// `whole_row` is [`super::names_whole_rows`]' answer for the engine.
+    fn resolve(r: &Ref, scopes: &[Scope], whole_row: bool) -> Option<Diagnostic> {
         // Scopes whose range contains this ref, smallest (innermost) first.
         let mut chain: Vec<&Scope> = scopes
             .iter()
@@ -10250,6 +10263,17 @@ mod colres {
                     }
                     if has_open {
                         return None; // an unenumerable source might provide it
+                    }
+                    // A bare table name or alias is the whole row on PostgreSQL —
+                    // `row_to_json(u)`, `SELECT u FROM users u` — once no column
+                    // of that name has claimed it.
+                    if whole_row
+                        && s.sources
+                            .iter()
+                            .filter(visible)
+                            .any(|src| src.quals.iter().any(|x| x == &r.col))
+                    {
+                        return None;
                     }
                     // A projection alias resolves an unqualified ref — except in a
                     // clause where this engine has none in scope yet (`alias_blind`):
@@ -19270,6 +19294,30 @@ mod tests {
         ] {
             assert!(col_errors(sql).is_empty(), "false positive: {sql}");
         }
+    }
+
+    /// On PostgreSQL a bare table name or alias is the whole row; elsewhere it
+    /// is still an unknown column, and a real column of that name still wins.
+    #[test]
+    fn a_whole_row_reference_is_not_an_unknown_column_on_postgres() {
+        let pg = SqlDialect::Postgres;
+        for sql in [
+            "SELECT row_to_json(e) FROM employees e",
+            "SELECT row_to_json(employees) FROM employees",
+            "SELECT e FROM employees e",
+        ] {
+            assert!(
+                col_errors_d(sql, pg).is_empty(),
+                "{sql}: {:?}",
+                col_errors_d(sql, pg)
+            );
+        }
+        assert_eq!(
+            col_errors_d("SELECT e FROM employees e", SqlDialect::MySql).len(),
+            1
+        );
+        // Not a source in scope: still unknown.
+        assert_eq!(col_errors_d("SELECT x FROM employees e", pg).len(), 1);
     }
 
     /// Where a select-list alias is in scope is the engine's: SQLite takes one
