@@ -94,8 +94,10 @@ pub struct Suggestion {
     /// Key membership — tints a column's glyph gold/purple like the schema tree.
     pub key: KeyKind,
     /// Text spliced on accept when it differs from `text` — e.g. an FK JOIN target
-    /// displays `orders` but inserts `orders ON o.customer_id = orders.id`. `None`
-    /// inserts `text` verbatim.
+    /// displays `orders` but inserts `orders ON o.customer_id = orders.id` — or
+    /// a function row's name alone, for a builtin the engine calls without
+    /// parentheses (`CURRENT_TIMESTAMP`), where a function would get `()`. `None`
+    /// inserts `text` verbatim (a function: `text()`).
     pub insert: Option<String>,
     /// Absolute byte range to replace on accept, overriding the default word range —
     /// used by `SELECT *` expansion to swap the `*` (or `t.*`) for the column list.
@@ -483,6 +485,12 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
         }
         None
     };
+    // The shared keyword lists, less the words this engine has no use for.
+    let keywords = |list: &'static [&'static str]| {
+        list.iter()
+            .copied()
+            .filter(|k| crate::intel::keyword_offered(k, input.dialect))
+    };
 
     match ctx {
         ClauseCtx::Qualified(q) => {
@@ -587,6 +595,7 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
             // filter's answer, held in `intel`'s `CatalogIndex` beside the
             // typo checker's own rearrangement of the same data.
             for fun in crate::intel::offered_builtins(input.dialect, input.flavour).unwrap_or(&[]) {
+                let before = cands.len();
                 add(
                     &mut cands,
                     &mut seen,
@@ -595,16 +604,24 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
                     fun.signature,
                     2,
                 );
+                // A builtin the engine calls bare goes in bare, not as the
+                // `name()` a function row inserts.
+                if cands.len() > before
+                    && crate::intel::called_bare(fun.name, input.dialect)
+                    && let Some(c) = cands.last_mut()
+                {
+                    c.insert = Some(fun.name.to_string());
+                }
             }
-            for &k in SQL_KEYWORDS {
+            for k in keywords(SQL_KEYWORDS) {
                 add(&mut cands, &mut seen, k, SuggestKind::Keyword, "", 3);
             }
         }
         ClauseCtx::Start => {
-            for &k in STMT_KEYWORDS {
+            for k in keywords(STMT_KEYWORDS) {
                 add(&mut cands, &mut seen, k, SuggestKind::Keyword, "", 0);
             }
-            for &k in SQL_KEYWORDS {
+            for k in keywords(SQL_KEYWORDS) {
                 add(&mut cands, &mut seen, k, SuggestKind::Keyword, "", 1);
             }
         }
@@ -618,7 +635,7 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
             for (name, db) in &schema.tables {
                 add(&mut cands, &mut seen, name, SuggestKind::Table, db, 1);
             }
-            for &k in SQL_KEYWORDS {
+            for k in keywords(SQL_KEYWORDS) {
                 add(&mut cands, &mut seen, k, SuggestKind::Keyword, "", 2);
             }
         }
@@ -966,6 +983,64 @@ mod tests {
         .into_iter()
         .map(|s| s.text)
         .collect()
+    }
+
+    /// A builtin the engine calls bare is offered with its bare name to insert,
+    /// so accepting it writes no `()`; an ordinary function is left to get them.
+    #[test]
+    fn a_builtin_called_bare_inserts_without_parentheses() {
+        let s = shop();
+        let row = |dialect: SqlDialect, prefix: &str, name: &str| {
+            let cont = Continuation::default();
+            let used = HashSet::new();
+            rank(
+                &s,
+                &RankInput {
+                    ctx: &ClauseCtx::Column,
+                    cont: &cont,
+                    scope: &[tref("orders", None)],
+                    prefix,
+                    snippets: &[],
+                    join_targets: &[],
+                    star: None,
+                    used: &used,
+                    active_db: Some("shop"),
+                    dialect,
+                    flavour: ServerFlavour::Unknown,
+                },
+            )
+            .into_iter()
+            .find(|r| r.text.eq_ignore_ascii_case(name))
+            .unwrap_or_else(|| panic!("{name} offered on {dialect:?}"))
+        };
+        for dialect in SqlDialect::ALL {
+            let r = row(dialect, "current_ti", "current_timestamp");
+            assert_eq!(r.kind, SuggestKind::Function, "{dialect:?}");
+            assert_eq!(r.insert.as_deref(), Some(r.text.as_str()), "{dialect:?}");
+        }
+        assert_eq!(row(SqlDialect::MySql, "coal", "coalesce").insert, None);
+        assert_eq!(row(SqlDialect::Postgres, "coal", "coalesce").insert, None);
+    }
+
+    /// A keyword the engine has no use for is not offered: no `LIMIT` on SQL
+    /// Server, no `AUTO_INCREMENT` off MySQL, no `DESCRIBE` statement off it.
+    #[test]
+    fn a_keyword_is_offered_only_on_an_engine_that_takes_it() {
+        let s = shop();
+        let scope = [tref("orders", None)];
+        let col = |d, p| ranked_on(&s, d, ClauseCtx::Column, &scope, p);
+        assert!(offers(&col(SqlDialect::MySql, "lim"), "LIMIT"));
+        assert!(offers(&col(SqlDialect::Postgres, "lim"), "LIMIT"));
+        assert!(!offers(&col(SqlDialect::MsSql, "lim"), "LIMIT"));
+        assert!(offers(&col(SqlDialect::MySql, "auto_"), "AUTO_INCREMENT"));
+        for d in [SqlDialect::Postgres, SqlDialect::Sqlite, SqlDialect::MsSql] {
+            assert!(!offers(&col(d, "auto_"), "AUTO_INCREMENT"), "{d:?}");
+        }
+        let start = |d, p| ranked_on(&s, d, ClauseCtx::Start, &[], p);
+        assert!(offers(&start(SqlDialect::MySql, "desc"), "DESCRIBE"));
+        assert!(!offers(&start(SqlDialect::Postgres, "desc"), "DESCRIBE"));
+        assert!(offers(&start(SqlDialect::MsSql, "us"), "USE"));
+        assert!(!offers(&start(SqlDialect::Sqlite, "trun"), "TRUNCATE"));
     }
 
     /// Does the ranked list offer this name, however either side spells its case?

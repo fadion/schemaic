@@ -3024,6 +3024,13 @@ fn niladic_builtins(dialect: SqlDialect) -> &'static HashSet<String> {
     })
 }
 
+/// Is `name` a builtin `dialect` calls without parentheses ([`niladic_builtins`])?
+/// What completion inserts bare: `CURRENT_TIMESTAMP()` is a syntax error on
+/// PostgreSQL, SQL Server and SQLite, and the standard spelling on MySQL too.
+pub(crate) fn called_bare(name: &str, dialect: SqlDialect) -> bool {
+    niladic_builtins(dialect).contains(&name.to_ascii_lowercase())
+}
+
 /// The builtins `dialect` calls bare that its catalogue does **not** spell
 /// bare, so [`niladic_builtins`]' catalogue rule cannot find them. MySQL's
 /// catalogue writes `CURRENT_USER()` and `UTC_TIMESTAMP()`, which the engine
@@ -3450,6 +3457,45 @@ pub const STMT_KEYWORDS: &[&str] = &[
     "SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER", "TRUNCATE", "WITH", "SHOW",
     "EXPLAIN", "DESCRIBE", "USE", "REPLACE", "CALL",
 ];
+
+/// Does completion offer `kw`, a word of [`SQL_KEYWORDS`] or
+/// [`STMT_KEYWORDS`], on this engine? Both lists are shared, and a word the
+/// engine has no use for is a row that writes an error: `LIMIT` on SQL Server,
+/// `AUTO_INCREMENT` anywhere but MySQL.
+pub fn keyword_offered(kw: &str, dialect: SqlDialect) -> bool {
+    !keywords_not_taken(dialect)
+        .iter()
+        .any(|k| k.eq_ignore_ascii_case(kw))
+}
+
+/// The completion keywords this engine does not take. SQLite spells its key
+/// `AUTOINCREMENT` and has no `TRUNCATE`, `SHOW` or `CALL`; PostgreSQL has no
+/// `REPLACE` statement, `DESCRIBE` or `USE` (a database is a connection there);
+/// SQL Server pages with `TOP`/`OFFSET … FETCH`, keys with `IDENTITY`, runs a
+/// procedure with `EXEC`, and has no `SHOW`, `DESCRIBE`, `EXPLAIN` or `REPLACE`.
+fn keywords_not_taken(dialect: SqlDialect) -> &'static [&'static str] {
+    match dialect {
+        SqlDialect::MySql => &[],
+        SqlDialect::Postgres => &["AUTO_INCREMENT", "DESCRIBE", "USE", "REPLACE"],
+        SqlDialect::Sqlite => &[
+            "AUTO_INCREMENT",
+            "DESCRIBE",
+            "USE",
+            "SHOW",
+            "CALL",
+            "TRUNCATE",
+        ],
+        SqlDialect::MsSql => &[
+            "LIMIT",
+            "AUTO_INCREMENT",
+            "DESCRIBE",
+            "SHOW",
+            "CALL",
+            "EXPLAIN",
+            "REPLACE",
+        ],
+    }
+}
 
 /// Clause keywords that determine the completion context (see [`clause_context`]).
 const CLAUSE_KEYWORDS: &[&str] = &[

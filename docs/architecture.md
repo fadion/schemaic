@@ -878,7 +878,10 @@ existing prose was left alone.
     for it up to four times, so the UI goes through `CatalogCache` — a memo keyed on the **`Arc<DbSchema>`
     identity** of the schemas it was built from rather than a hand-bumped generation, so a re-introspection
     misses by construction and there is no write site to remember. Hosts the shared `SQL_KEYWORDS`/`FUNCTIONS`/
-    `STMT_KEYWORDS` (the UI's completion + editor build on these). Also `join_condition` (FK-aware
+    `STMT_KEYWORDS` (the UI's completion + editor build on these); shared across engines, so
+    completion offers a keyword only where `keyword_offered` says the engine takes it — the words
+    each lacks are `keywords_not_taken`, an exhaustive `match` (under `rank.rs`). Also
+    `join_condition` (FK-aware
     `JOIN … ON` auto-fill), `db_error_diagnostic` (positions a live DB error within the statement),
     `parses` (Tier-2 gate), and `select_output_names` (a projection's column names *in order*, or
     `None` when the statement alone can't say — what `ddl::pg_replaceable` reads).
@@ -1054,7 +1057,8 @@ existing prose was left alone.
     writes `CURRENT_USER()`, or on PostgreSQL, whose generated one has no bare form, so `SELECT
     CURRENT_USER` and `current_schema` stayed red — every name on the list was run bare on MariaDB,
     MySQL 8 and PostgreSQL 16, and a quoted one is a column again,
-    `a_bare_called_builtin_is_not_a_column_on_mysql_or_postgres`).
+    `a_bare_called_builtin_is_not_a_column_on_mysql_or_postgres`). The same set decides what
+    completion inserts: `called_bare` is its `pub(crate)` question for `rank` (under `rank.rs`).
     `sql_server_measures_against_its_own_catalog` had filtered its statements to the
     misspelled-function message and so passed over ``Column `day` not found`` on the one it named;
     it asserts no diagnostic at all now (`a_datepart_variable_or_niladic_builtin_is_not_a_column`). `INTO` (MySQL's trailing
@@ -12655,6 +12659,23 @@ existing prose was left alone.
       everything, which is what this did before the split and is the deliberate choice
       `intel::is_offered_builtin` argues for. No new signal carries it: the caller reads it off the
       loaded `DbSchema` for the tab's active database, where `collect_schema` stamped it.
+      **A builtin the engine calls bare is inserted bare.** `accept_completion` writes a function
+      row as `name()` with the caret between the parentheses, so `CURRENT_TIMESTAMP` went in as
+      `CURRENT_TIMESTAMP()` — a syntax error on PostgreSQL, SQL Server and SQLite. The `Column` arm
+      sets such a row's `Suggestion::insert` to the name alone wherever `intel::called_bare` — the
+      `niladic_builtins` set the column resolver already exempts — says the engine calls it so,
+      and an `insert` is spliced verbatim; the row stays a `Function` for its glyph and colour
+      (`a_builtin_called_bare_inserts_without_parentheses`, every engine, with `coalesce` still
+      `None` beside it). **The `cands.len() > before` guard is load-bearing**: `add` returns
+      without pushing for a name the prefix filter, the dedup or the exact match turns away, and
+      without the guard `cands.last_mut()` would stamp the name onto whatever was pushed last.
+      **The keyword lists are filtered per engine** in every arm that offers them, through a local
+      `keywords` closure over `intel::keyword_offered`: `SQL_KEYWORDS` and `STMT_KEYWORDS` are
+      shared, and a word the engine has no use for is a row that writes an error — `LIMIT` on SQL
+      Server, `AUTO_INCREMENT` anywhere but MySQL, `DESCRIBE` off it
+      (`a_keyword_is_offered_only_on_an_engine_that_takes_it`). What each engine lacks is
+      `intel`'s `keywords_not_taken`, an exhaustive `match`, so a fifth engine has to answer
+      rather than inherit MySQL's empty list.
       **`add` asks `worth_offering` before it builds anything, which is `add_col`'s shape adopted
       for `add_col`'s reason.** A PostgreSQL tab offers 863 builtins where a MySQL 8 one offers 341
       (`FUNCTIONS`' 463 less `MARIADB_ONLY`, which contains every `DEPRECATED_ALIASES` name), and
@@ -22710,7 +22731,8 @@ existing prose was left alone.
     one is not the guess a ranked keyword is. One row per distinct spelling, each resolved through
     `snippet::by_abbrev` so the narrowest scope wins by the same rule everywhere; the row shows the
     abbrev and inserts the **body**, through the same `Suggestion::insert` override an FK-JOIN row
-    uses.
+    uses — as does a builtin the engine calls bare (`CURRENT_TIMESTAMP`, under `rank.rs`), which
+    is why `accept_completion` appends `()` to a function row only when it carries no `insert`.
     **No list opens inside a string literal or a comment, not even on Ctrl+Space**:
     `recompute_completions` asks `intel::caret_in_literal_or_comment` of the caret's statement
     before it reads the clause, ahead of the FK join row and the ranked list alike, and closes the
