@@ -345,6 +345,12 @@ pub struct UiState {
     /// that Tab takes (`intel::predict`). Default: on.
     #[serde(default = "default_true")]
     pub editor_predictions: bool,
+    /// Let those predictions also be remembered — the rest of a line from a
+    /// statement run before, written in an open tab or saved as a snippet
+    /// (`intel::Recall`) — rather than only reasoned. Off keeps past
+    /// statements off the screen, a screen share's among them. Default: on.
+    #[serde(default = "default_true")]
+    pub editor_remembered_predictions: bool,
     /// Cancel a running statement after this many seconds. **`0` means no
     /// timeout**, which is the default and the behaviour every release before
     /// this one had — a runaway `SELECT` ran until somebody noticed.
@@ -446,6 +452,7 @@ impl Default for UiState {
             restore_tabs: true,
             live_validate: false,
             editor_predictions: true,
+            editor_remembered_predictions: true,
             statement_timeout_secs: 0,
             // Nothing unrecognised until a file says otherwise.
             extra: serde_json::Map::new(),
@@ -1820,6 +1827,24 @@ mod tests {
         let back: UiState = serde_json::from_str(&serde_json::to_string(&off).expect("serialises"))
             .expect("parses");
         assert!(!back.editor_predictions);
+    }
+
+    /// Remembered predictions are on unless switched off, for a new install
+    /// and a file written before the setting existed alike, and an off stays
+    /// off — independently of the predictions switch itself.
+    #[test]
+    fn remembered_predictions_default_on_and_keep_an_off() {
+        assert!(UiState::default().editor_remembered_predictions);
+        let old: UiState = serde_json::from_str("{}").expect("parses");
+        assert!(old.editor_remembered_predictions);
+        let off = UiState {
+            editor_remembered_predictions: false,
+            ..UiState::default()
+        };
+        let back: UiState = serde_json::from_str(&serde_json::to_string(&off).expect("serialises"))
+            .expect("parses");
+        assert!(!back.editor_remembered_predictions);
+        assert!(back.editor_predictions);
     }
 
     /// **`#[serde(flatten)]` changes the deserializer's shape for the whole

@@ -12810,72 +12810,101 @@ fn may_precede(guess: &str, next: &str) -> bool {
 /// would leave it open over the rest of the buffer.
 ///
 /// Inside the `(…)` bracket pairing made, the remembered line must close
-/// there as well, and is offered without the `)`s already after the caret. A
-/// run longer than [`RECALL_MAX_BYTES`] is not read: this runs on every
-/// keystroke, and a dump run whole made each one rescan it.
+/// there as well, and is offered without the `)`s already after the caret.
+///
+/// **`past` is any text worth remembering from** — runs, open tabs, saved
+/// queries — in the order the caller trusts them. This runs on every
+/// keystroke, so a text longer than [`RECALL_MAX_BYTES`] is not read (a dump
+/// run whole made each one rescan it), and one that does not hold the typed
+/// line is passed over by a substring search before anything is lexed.
 pub fn predict_from_history<'a>(
     sql: &str,
     caret: usize,
     dialect: SqlDialect,
     past: impl IntoIterator<Item = &'a str>,
 ) -> Option<String> {
-    if caret > sql.len() || !sql.is_char_boundary(caret) {
-        return None;
+    let recall = Recall::at(sql, caret, dialect)?;
+    past.into_iter().find_map(|text| recall.from(text))
+}
+
+/// [`predict_from_history`] in two steps, for a caller whose texts are not all
+/// at hand at once — each behind its own signal, say: [`Recall::at`] runs the
+/// caret's gate once, and [`Recall::from`] asks it of one text at a time.
+pub struct Recall {
+    /// The statement typed so far, its line endings made `\n`.
+    typed: String,
+    /// The `)`s bracket pairing left after the caret, which the remembered
+    /// line must end with and is offered without.
+    closers: String,
+    dialect: SqlDialect,
+}
+
+impl Recall {
+    /// The statement typed up to `caret`, when the gate
+    /// [`predict_from_history`] describes lets it be remembered from.
+    pub fn at(sql: &str, caret: usize, dialect: SqlDialect) -> Option<Recall> {
+        if caret > sql.len() || !sql.is_char_boundary(caret) {
+            return None;
+        }
+        let before = sql[..caret].chars().next_back()?;
+        if !(before.is_whitespace() || before == '(') {
+            return None;
+        }
+        let (lo, hi) = crate::sql::statement_range(sql, caret, dialect);
+        if lo > caret || caret_touches_noncode(sql, lo, caret, dialect) {
+            return None;
+        }
+        let after = sql.get(caret..hi.max(caret))?.trim();
+        let after = after.strip_suffix(';').unwrap_or(after).trim_end();
+        if !after.chars().all(|c| c == ')') {
+            return None;
+        }
+        let typed = sql[lo..caret].trim_start().replace("\r\n", "\n");
+        typed.split_whitespace().nth(1)?;
+        Some(Recall {
+            typed,
+            closers: ")".repeat(after.len()),
+            dialect,
+        })
     }
-    let before = sql[..caret].chars().next_back()?;
-    if !(before.is_whitespace() || before == '(') {
-        return None;
-    }
-    let (lo, hi) = crate::sql::statement_range(sql, caret, dialect);
-    if lo > caret || caret_touches_noncode(sql, lo, caret, dialect) {
-        return None;
-    }
-    let after = sql.get(caret..hi.max(caret))?.trim();
-    let after = after.strip_suffix(';').unwrap_or(after).trim_end();
-    if !after.chars().all(|c| c == ')') {
-        return None;
-    }
-    let closers = ")".repeat(after.len());
-    let typed = sql[lo..caret].trim_start().replace("\r\n", "\n");
-    typed.split_whitespace().nth(1)?;
-    for text in past {
-        if text.len() > RECALL_MAX_BYTES {
-            continue;
+
+    /// The rest of the caret's line from the first statement in `text` that
+    /// begins with the one typed — `None` if none does, or `text` is too long
+    /// to read on a keystroke.
+    pub fn from(&self, text: &str) -> Option<String> {
+        // What a `\r\n` text holds verbatim too: the typed text up to its
+        // first line end. A substring search for it first: most texts do not
+        // hold it at all, and passing them over costs a scan, not a lex.
+        let first_typed_line = self.typed.split('\n').next().unwrap_or("");
+        if text.len() > RECALL_MAX_BYTES || !text.contains(first_typed_line) {
+            return None;
         }
         let text = if text.contains('\r') {
             std::borrow::Cow::Owned(text.replace("\r\n", "\n"))
         } else {
             std::borrow::Cow::Borrowed(text)
         };
-        if !text.contains(typed.as_str()) {
-            continue;
+        if !text.contains(self.typed.as_str()) {
+            return None;
         }
-        for (a, b) in crate::sql::statement_ranges(&text, dialect) {
-            let stmt = skip_leading_noncode(&text[a..b], dialect);
-            let Some(more) = stmt.strip_prefix(typed.as_str()) else {
-                continue;
-            };
-            let Some(line) = first_code_line(more, dialect) else {
-                continue;
-            };
-            let line = line.trim_end();
-            let line = line.strip_suffix(';').unwrap_or(line).trim_end();
-            let Some(line) = line.strip_suffix(closers.as_str()) else {
-                continue;
-            };
-            let line = line.trim_end();
-            if !line.is_empty() {
-                return Some(line.to_string());
-            }
-        }
+        crate::sql::statement_ranges(&text, self.dialect)
+            .into_iter()
+            .find_map(|(a, b)| {
+                let stmt = skip_leading_noncode(&text[a..b], self.dialect);
+                let more = stmt.strip_prefix(self.typed.as_str())?;
+                let line = first_code_line(more, self.dialect)?.trim_end();
+                let line = line.strip_suffix(';').unwrap_or(line).trim_end();
+                let line = line.strip_suffix(self.closers.as_str())?.trim_end();
+                (!line.is_empty()).then(|| line.to_string())
+            })
     }
-    None
 }
 
-/// The longest stored run [`predict_from_history`] reads. Ample for a
-/// statement anyone types; a dump or a seed script run whole is left alone
-/// rather than rescanned on every keystroke.
-const RECALL_MAX_BYTES: usize = 16 * 1024;
+/// The longest text [`predict_from_history`] reads. Ample for a scratch tab of
+/// many statements; a dump or a seed script run whole is left alone rather
+/// than rescanned on every keystroke. Below it a text is still lexed only once
+/// a substring search has found the typed line in it.
+const RECALL_MAX_BYTES: usize = 256 * 1024;
 
 /// `stmt` from its first byte of code: whitespace and comments in front of it
 /// skipped, through [`skip_noncode`].
@@ -14849,6 +14878,21 @@ mod history_prediction_tests {
                 &["SELECT * FROM orders WHERE id IN (1, 2) ORDER BY id"]
             ),
             None
+        );
+    }
+
+    /// A scratch buffer of many statements — an open tab, a long script — is
+    /// read for the one that fits, however far down it sits.
+    #[test]
+    fn a_statement_deep_in_a_long_text_is_remembered() {
+        let long = format!(
+            "{}SELECT * FROM orders WHERE id = 7;\n",
+            "SELECT 1;\n".repeat(4_000)
+        );
+        assert!(long.len() > 32 * 1024);
+        assert_eq!(
+            hist("SELECT * FROM orders ", &[long.as_str()]).as_deref(),
+            Some("WHERE id = 7")
         );
     }
 

@@ -2189,9 +2189,14 @@ pub(crate) struct QueryPaneParams {
     pub live_validate: RwSignal<bool>,
     /// Show inline predictions after the caret, taken by Tab. Persisted setting.
     pub predictions: RwSignal<bool>,
+    /// Let the predictions be remembered too, not only reasoned. Persisted
+    /// setting.
+    pub remembered_predictions: RwSignal<bool>,
     /// The run history, every connection's — what an inline prediction
     /// remembers when `intel::predict` has nothing (`completion::prediction_at`).
     pub history: RwSignal<Vec<schemaic_core::history::HistoryEntry>>,
+    /// Every open tab, whose statements a prediction remembers from too.
+    pub tabs: RwSignal<Vec<crate::Tab>>,
     /// Requests a debounced DB validation of the statement under the cursor.
     pub validate_stmt: ValidateFn,
     pub popup_menu: RwSignal<Option<Vec<MenuEntry>>>,
@@ -2252,7 +2257,9 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         read_only,
         live_validate,
         predictions,
+        remembered_predictions,
         history,
+        tabs,
         validate_stmt,
         popup_menu,
         popup_anchor,
@@ -2747,7 +2754,9 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                             snippets,
                             conn_id: active_conn.get_untracked(),
                             predictions: predictions.get_untracked(),
+                            remembered: remembered_predictions.get_untracked(),
                             history,
+                            tabs,
                         },
                         comp,
                         true,
@@ -3323,8 +3332,9 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         });
     }
 
-    // **Nor does it outlive what it was made under.** Inline predictions
-    // switched off, or the tab moved to another connection, database or engine:
+    // **Nor does it outlive what it was made under.** Inline predictions — or
+    // the remembered ones — switched off, or the tab moved to another
+    // connection, database or engine:
     // a ghost made before stayed drawn, and Tab still took it, until the next
     // edit asked again.
     {
@@ -3332,6 +3342,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         create_effect(move |_| {
             let _ = (
                 predictions.get(),
+                remembered_predictions.get(),
                 active_conn.get(),
                 active_db.get(),
                 dialect.get(),
@@ -4047,7 +4058,9 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                             snippets,
                             conn_id: active_conn.get_untracked(),
                             predictions: predictions.get_untracked(),
+                            remembered: remembered_predictions.get_untracked(),
                             history,
+                            tabs,
                         },
                         comp,
                         false,

@@ -1735,6 +1735,7 @@ pub(crate) fn theme_settings_overlay(
     let confirm_writes = layout.confirm_writes;
     let live_validate = layout.live_validate;
     let editor_predictions = layout.editor_predictions;
+    let editor_remembered_predictions = layout.editor_remembered_predictions;
     let restore_tabs = layout.restore_tabs;
     let open_config_dir = open_config_dir.clone();
 
@@ -1794,10 +1795,20 @@ pub(crate) fn theme_settings_overlay(
                 ring.clone(),
                 110,
             );
+            let remembered_row = focusable_toggle_row(
+                "Predictions from past statements",
+                "Also offer the rest of a line from a statement you ran, wrote in another \
+                 tab or saved as a snippet. Switch off to keep past statements off the \
+                 screen.",
+                editor_remembered_predictions,
+                ring.clone(),
+                120,
+            );
             let editor_group = v_stack((
                 settings_section_header("Editor"),
                 font_section,
                 predictions_row,
+                remembered_row,
             ))
             .style(|s| s.flex_col().gap(theme::scaled(16.0)));
 

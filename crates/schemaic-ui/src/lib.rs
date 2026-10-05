@@ -6070,6 +6070,9 @@ pub struct LayoutUi {
     pub live_validate: RwSignal<bool>,
     /// Show the SQL editor's inline predictions (`intel::predict`). Persisted.
     pub editor_predictions: RwSignal<bool>,
+    /// Let them be remembered too — from past runs, open tabs and snippets
+    /// (`intel::Recall`) — beside the predictions switch. Persisted.
+    pub editor_remembered_predictions: RwSignal<bool>,
     /// Whether the OS window currently has focus. Session-only (never persisted);
     /// set from the workspace root's window-focus events. The app's connection
     /// health poll reads it so a backgrounded Schemaic stops opening connections
@@ -8746,6 +8749,7 @@ fn center(ui: Ui) -> impl IntoView {
     });
     let live_validate = ui.layout.live_validate;
     let predictions = ui.layout.editor_predictions;
+    let remembered_predictions = ui.layout.editor_remembered_predictions;
     let validate_stmt = ui.tab_actions.validate_stmt.clone();
     let run = ui.tab_actions.run.clone();
     let run_all = ui.tab_actions.run_all.clone();
@@ -9012,7 +9016,9 @@ fn center(ui: Ui) -> impl IntoView {
                     read_only,
                     live_validate,
                     predictions,
+                    remembered_predictions,
                     history: ui.history.entries,
+                    tabs,
                     validate_stmt: validate_stmt.clone(),
                     popup_menu: popup,
                     popup_anchor,

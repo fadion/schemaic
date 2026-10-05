@@ -2206,9 +2206,15 @@ existing prose was left alone.
     setting is on — Settings → Editor → *Inline predictions*, on by default. `predict_tests` covers
     each producer and gate, `an_auto_paired_closer_after_the_caret_still_predicts` the `)` one.
     **`predict_from_history` is the ghost remembered rather than reasoned**, asked only when
-    `predict` has nothing and under the same *Inline predictions* switch, with none of its own: the
-    rest of the caret's line from the first statement in `past` (newest first) that begins with the
-    statement typed so far, its leading whitespace trimmed. Its gate is stricter than `predict`'s.
+    `predict` has nothing, under the same *Inline predictions* switch and a second of its own,
+    *Predictions from past statements* (under `completion.rs`): the rest of the caret's line from
+    the first statement in `past` that begins with the statement typed so far, its leading
+    whitespace trimmed. `past` is any text worth remembering from, in the order the caller trusts
+    it — the UI gives it runs, then snippets, then open tabs. **It is two steps under one name**:
+    `Recall::at(sql, caret, dialect)` runs the caret's gate once, and `Recall::from(text)` asks it
+    of one text; `predict_from_history` is `at` then `find_map(from)`. The split is for a caller
+    whose texts are not at hand at once — each open tab's sits behind its own signal — so the gate
+    runs once a keystroke rather than once a tab. Its gate is stricter than `predict`'s.
     At least two words must be typed — one word starts every run, so matching it is a guess, not a
     memory; nothing may follow the caret in the statement but the `)`s bracket pairing made and a
     `;`, not even the next clause on another line, since a statement being edited in the middle is
@@ -2235,18 +2241,24 @@ existing prose was left alone.
     **It runs on every keystroke, so what it reads is bounded.** Each space at a statement's end
     used to re-lex every stored run of the connection — up to `history::MAX_PER_CONN` (50), each
     stored whole — and a review measured 432 ms a keystroke, in a release build, after a Run All of
-    a mysqldump. Now a run longer than `RECALL_MAX_BYTES` (16 KiB) is skipped, the `\r\n` copy is
-    made only of a text that holds a `\r`, and a run that does not contain the typed text anywhere
-    is passed over before `statement_ranges` lexes it. The cap is on the stored run, not on any one
-    statement in it: a short query run as part of a long script is not remembered — that is the
-    trade (`history_prediction_tests::a_statement_run_before_predicts_the_rest_of_its_line` and
+    a mysqldump. Now a text longer than `RECALL_MAX_BYTES` (256 KiB) is skipped; one that does not
+    hold the typed text's first line — which a `\r\n` text holds verbatim too — is passed over by a
+    substring search; and only one that does is given its `\r\n` copy (where it holds a `\r`) and
+    lexed by `statement_ranges`. **The cap was 16 KiB until open tabs were read too**: a scratch
+    tab is routinely longer than that, and at that cap would not have been read at all. The
+    substring search is what keeps a keystroke cheap — most texts do not hold the typed line — and
+    the cap is left to keep a dump or seed script run whole from being lexed whenever one does. The
+    cap is on the whole text, not on any one statement in it: a short query run as part of a script
+    over 256 KiB is not remembered — that is the trade
+    (`history_prediction_tests::a_statement_run_before_predicts_the_rest_of_its_line` and
     `the_newest_statement_that_fits_is_the_one_predicted`, red against a stub first;
     `history_predicts_nothing_it_cannot_continue` the gate;
     `a_remembered_line_never_ends_inside_a_comment_or_string`,
     `a_run_that_opens_with_a_comment_is_still_remembered`,
     `a_remembered_line_fills_an_auto_paired_paren` and
     `a_run_too_long_to_scan_per_keystroke_is_not_remembered`, each red against the body before
-    them). Which runs it is given is the UI's choice (under `completion.rs`).
+    them; `a_statement_deep_in_a_long_text_is_remembered`, red at the 16 KiB cap). Which texts it
+    is given, and in what order, is the UI's choice (under `completion.rs`).
   - `pg_builtins.rs` — the **PostgreSQL builtin catalog**, the third entry in
     `intel::builtin_catalog` and the one that could not be written by hand, and the reason the typo
     checker is on for this engine at all. `PG_FUNCTIONS` is 2,706 entries and the split is the point:
@@ -22572,17 +22584,41 @@ existing prose was left alone.
     one-shot can return**. `suppress` is set by an accept, and the next prediction is wanted
     straight after one: Tab on a `BY ` ghost leaves `GROUP BY `, whose grouping columns are the next
     thing to offer, so a ghost asked after the one-shot would break that chain at its second link.
-    **Where `predict` has nothing, `prediction_at` asks `intel::predict_from_history`** over the
-    runs `recallable` keeps, newest first: this connection's (`HistoryEntry::conn_id ==
-    ctx.conn_id`), leaving out `Outcome::Failed` ones — a statement the server refused is not one
-    to offer again; an `Unknown` run, cancelled or still going, is offered — and, where both the
-    run's `HistoryEntry::database` and the tab's active database are known, only a run in that
-    database, compared case-insensitively. The connection alone let a statement run in one
-    database be offered in another; where either side is unknown the run is kept
-    (`a_run_is_remembered_only_where_it_ran`, red against a stub of the old filter). The log
-    arrives as `CompletionCtx::history`
+    **Where `predict` has nothing, `prediction_at` asks `recall`**, which runs `intel::Recall::at`
+    once and asks `Recall::from` of three sources in the order they are trusted, the first to answer
+    winning. **First the runs `recallable` keeps, newest first**: this connection's
+    (`HistoryEntry::conn_id == ctx.conn_id`), leaving out `Outcome::Failed` ones — a statement the
+    server refused is not one to offer again; an `Unknown` run, cancelled or still going, is
+    offered — and, where both the run's `HistoryEntry::database` and the tab's active database are
+    known, only a run in that database, compared case-insensitively. The connection alone let a
+    statement run in one database be offered in another; where either side is unknown the run is
+    kept. That rule is `same_place`, which the open tabs below go through too
+    (`a_run_is_remembered_only_where_it_ran`, red against a stub of the old filter, and asking it
+    through `same_place` since). The log arrives as `CompletionCtx::history`
     (`ui.history.entries`, every connection's, through `QueryPaneParams::history`), so a statement
     `history::push` declined to record for carrying a credential is never offered either.
+    **Then the user's own snippets that apply here** (`snippet_recallable`, over
+    `CompletionCtx::snippets`): `Source::User` alone — a built-in is a template nobody wrote, not a
+    statement anyone ran — and only where `snippet::applies`, so one scoped to another connection
+    or engine is not offered
+    (`a_snippet_is_remembered_from_only_if_it_is_the_users_and_applies_here`). These are the saved
+    queries; the source was first asked for as "saved favourites", but `favorites.json` holds
+    favourite *databases* (`favorite::FavoriteRule`), not queries. **Last the open tabs in the same
+    place** (`CompletionCtx::tabs`, the tab's `conn_id` and `database` through `same_place`;
+    `an_open_tab_is_remembered_from_only_in_the_same_place`) — statements written but not run, the
+    tab being typed in among them: its current statement offers nothing, being what was typed, and
+    each of its others may. **Each tab's text is read inside its own signal**
+    (`try_with_untracked`, its `conn_id` and `database` through `try_get_untracked`), not cloned
+    out, since this runs on a keystroke over every open tab; and the `try_` is what lets a tab
+    disposed under it answer nothing rather than read a dead signal. The three predicates are under
+    test; where `recall` is called and its reading of the tab signals live in the view and are not.
+    **Remembering has its own switch**, Settings → Editor → *Predictions from past statements*
+    (`UiState::editor_remembered_predictions`, `default_true`, so on for a new install and a file
+    from before it alike, and independent of *Inline predictions* —
+    `remembered_predictions_default_on_and_keep_an_off`), carried as
+    `LayoutUi::editor_remembered_predictions`, `QueryPaneParams::remembered_predictions` and
+    `CompletionCtx::remembered`; `recall` answers nothing when it is off. Off keeps past statements
+    off the screen — a screen share's among them — while the reasoned ghost stays.
     **Which of the two answers, and whether it is shown at all, is `pick_prediction`'s** — the
     reasoned one, else the remembered one, flagged as such — and **neither when it holds a line
     break**. `InlineDiffDoc::ghost_on` never drew one, but it was published all the same, so Tab
@@ -22643,8 +22679,9 @@ existing prose was left alone.
     them and an open list owns Tab (`a_kept_ghost_displaces_the_list_at_any_word`, red against the
     old rule). The displacement returns before either list is built, so a kept remembered ghost
     never reaches `give_way` either. Ctrl+Space still brings the list, join row included. `CompletionCtx::predictions` carries the `editor_predictions` setting into
-    the *asking*, for both kinds of ghost, and is read only there — it is not the switch on its
-    own: a ghost already drawn when the setting goes off is cleared by an effect under
+    the *asking*, for both kinds of ghost, and `CompletionCtx::remembered` the
+    `editor_remembered_predictions` one, for the remembered kind; each is read only there — neither
+    is the switch on its own: a ghost already drawn when either setting goes off is cleared by an effect under
     `editor_pane.rs`, where before it stayed and Tab still took it until the next edit.
   - `tabs.rs` — query-tab strip, and where a **`.sql`-backed tab** shows itself. The state behind
     that is four signals on `Tab`: `path`, `disk_sql` (the file's text as of the last open / save /
@@ -23186,13 +23223,16 @@ existing prose was left alone.
     It used to read `get_selection()`, which sees only the first region, and so could not judge a
     cursor of several.
     **Nor does a ghost outlive what it was made under**: a second effect, tracking `predictions`,
-    `active_conn`, `active_db` and `dialect`, clears it whenever one of them changes. The setting
+    `remembered_predictions`, `active_conn`, `active_db` and `dialect`, clears it whenever one of
+    them changes. The setting
     was read untracked, and only when a ghost was asked for, so switching *Inline predictions* off
     — or the tab moving to another connection, database or engine — left the ghost drawn, and Tab
-    still took it, until the next edit asked again. Like the cursor effect it lives in the view and
-    has no unit test.
-    `QueryPaneParams::predictions` carries the setting in, and `QueryPaneParams::history` the run
-    log a ghost remembers from (under `completion.rs`).
+    still took it, until the next edit asked again; *Predictions from past statements* is tracked
+    there for the same reason. Like the cursor effect it lives in the view and has no unit test.
+    `QueryPaneParams::predictions` and `remembered_predictions` carry the two settings in,
+    `QueryPaneParams::history` the run log and `QueryPaneParams::tabs` the open tabs a ghost
+    remembers from (under `completion.rs`); `tabs` is threaded from `lib.rs`'s editor-area
+    `dyn_container`, where it is in scope.
   - `inline_diff.rs` — the Ctrl+K suggestion rendered **in the editor's own line flow**: the lines
     it replaces stay where they are, faded, and the lines it proposes appear directly below them,
     pushing the rest of the document down. They are Floem *phantom text* (the facility inlay hints

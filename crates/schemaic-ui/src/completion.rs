@@ -684,17 +684,20 @@ pub(crate) struct CompletionCtx<'a> {
     pub(crate) conn_id: u64,
     /// The editor's inline predictions are on (Settings → Editor).
     pub(crate) predictions: bool,
+    /// And may be remembered, not only reasoned (Settings → Editor).
+    pub(crate) remembered: bool,
     /// The run history, every connection's; [`prediction_at`] reads this
     /// connection's.
     pub(crate) history: RwSignal<Vec<schemaic_core::history::HistoryEntry>>,
+    /// Every open tab; [`prediction_at`] reads this connection's.
+    pub(crate) tabs: RwSignal<Vec<crate::Tab>>,
 }
 
 /// The ghost to show at `offset`, or `None` — [`intel::predict`] over the
 /// *offer* catalog, the one the popup's foreign-key join reads, so a hidden
-/// database is no more predicted from than it is offered; failing that,
-/// [`intel::predict_from_history`] over the runs [`recallable`] here, newest
-/// first. Which of the two, and whether it can be shown at all, is
-/// [`pick_prediction`]'s.
+/// database is no more predicted from than it is offered; failing that, the
+/// one [`recall`] remembers from past runs, snippets and open tabs. Which of
+/// the two, and whether it can be shown at all, is [`pick_prediction`]'s.
 fn prediction_at(
     ed: &Editor,
     text: &str,
@@ -709,15 +712,51 @@ fn prediction_at(
         .with_untracked(|h| build_offer_catalog(ctx.db_nodes, h, ctx.active_db));
     let (guess, remembered) =
         pick_prediction(intel::predict(text, offset, &catalog, ctx.dialect), || {
-            ctx.history.with_untracked(|entries| {
-                let past = entries
-                    .iter()
-                    .filter(|e| recallable(e, ctx.conn_id, ctx.active_db))
-                    .map(|e| e.sql.as_str());
-                intel::predict_from_history(text, offset, ctx.dialect, past)
-            })
+            recall(text, offset, ctx)
         })?;
     Some(ghost_at(ed, offset, guess, false, remembered))
+}
+
+/// The remembered prediction at `offset` — [`intel::Recall`], its gate run
+/// once, asked of each text in the order it is trusted: this connection's
+/// runs, newest first ([`recallable`]); then the user's own snippets that
+/// apply here ([`snippet_recallable`]); then the open tabs in the same place
+/// ([`same_place`]) — statements written but not run, the tab being typed in
+/// among them. `None` with remembered predictions switched off.
+///
+/// Each tab's text is read inside its own signal rather than cloned out: this
+/// runs on a keystroke, and a tab disposed under it answers nothing.
+fn recall(text: &str, offset: usize, ctx: &CompletionCtx<'_>) -> Option<String> {
+    if !ctx.remembered {
+        return None;
+    }
+    let r = intel::Recall::at(text, offset, ctx.dialect)?;
+    ctx.history
+        .with_untracked(|entries| {
+            entries
+                .iter()
+                .filter(|e| recallable(e, ctx.conn_id, ctx.active_db))
+                .find_map(|e| r.from(&e.sql))
+        })
+        .or_else(|| {
+            ctx.snippets.with_untracked(|all| {
+                all.iter()
+                    .filter(|s| snippet_recallable(s, ctx.dialect, ctx.conn_id))
+                    .find_map(|s| r.from(&s.body))
+            })
+        })
+        .or_else(|| {
+            ctx.tabs.with_untracked(|tabs| {
+                tabs.iter().find_map(|t| {
+                    let conn = t.conn_id.try_get_untracked()?;
+                    let db = t.database.try_get_untracked()?;
+                    if !same_place(conn, db.as_deref(), ctx.conn_id, ctx.active_db) {
+                        return None;
+                    }
+                    t.query.try_with_untracked(|q| q.and_then(|q| r.from(q)))
+                })
+            })
+        })
 }
 
 /// Which prediction to show: the one [`intel::predict`] reasons, else the one
@@ -743,11 +782,25 @@ fn recallable(
     conn_id: u64,
     active_db: Option<&str>,
 ) -> bool {
-    let same_db = match (e.database.as_deref(), active_db) {
-        (Some(ran), Some(here)) => ran.eq_ignore_ascii_case(here),
+    e.outcome != schemaic_core::history::Outcome::Failed
+        && same_place(e.conn_id, e.database.as_deref(), conn_id, active_db)
+}
+
+/// Was a text written in this tab's place — its connection, and its database
+/// where both say which (compared ignoring ASCII case)?
+fn same_place(conn_id: u64, database: Option<&str>, here_conn: u64, here_db: Option<&str>) -> bool {
+    let same_db = match (database, here_db) {
+        (Some(there), Some(here)) => there.eq_ignore_ascii_case(here),
         _ => true,
     };
-    e.conn_id == conn_id && e.outcome != schemaic_core::history::Outcome::Failed && same_db
+    conn_id == here_conn && same_db
+}
+
+/// Is `s` a snippet to remember from here? The user's own — a built-in is a
+/// template, not a statement anyone wrote — and one that applies on this
+/// connection ([`snippet::applies`]).
+fn snippet_recallable(s: &snippet::Snippet, dialect: SqlDialect, conn_id: u64) -> bool {
+    s.source == snippet::Source::User && snippet::applies(s, dialect, conn_id)
 }
 
 /// Does `ghost` take the place of the list at the word being typed (`prefix`)?
@@ -855,7 +908,9 @@ pub(crate) fn recompute_completions(
         snippets,
         conn_id,
         predictions: _,
+        remembered: _,
         history: _,
+        tabs: _,
     } = ctx;
     let offset = ed.cursor.get_untracked().offset();
     let text = ed.doc().text().to_string();
@@ -1611,7 +1666,73 @@ mod kept_ghost_tests {
 
 #[cfg(test)]
 mod ghost_choice_tests {
-    use super::{ghost_displaces_the_list, lone_caret, pick_prediction, recallable};
+    use super::{
+        ghost_displaces_the_list, lone_caret, pick_prediction, recallable, same_place,
+        snippet_recallable,
+    };
+    use schemaic_core::intel::SqlDialect;
+    use schemaic_core::snippet::{Scope, Snippet, Source};
+
+    /// A text belongs here when it was written on this connection, in this
+    /// database where both say which.
+    #[test]
+    fn an_open_tab_is_remembered_from_only_in_the_same_place() {
+        assert!(same_place(1, Some("shop"), 1, Some("Shop")));
+        assert!(same_place(1, None, 1, Some("shop")));
+        assert!(same_place(1, Some("shop"), 1, None));
+        assert!(!same_place(2, Some("shop"), 1, Some("shop")));
+        assert!(!same_place(1, Some("archive"), 1, Some("shop")));
+    }
+
+    fn snippet(source: Source, scope: Scope) -> Snippet {
+        Snippet {
+            id: 1,
+            name: "recent orders".to_string(),
+            abbrev: None,
+            body: "SELECT * FROM orders WHERE id = :id".to_string(),
+            scope,
+            source,
+            last_used: None,
+        }
+    }
+
+    /// The user's own snippets that apply here are remembered from; a
+    /// built-in is a template nobody wrote, and a snippet scoped to another
+    /// connection or engine is not offered here at all.
+    #[test]
+    fn a_snippet_is_remembered_from_only_if_it_is_the_users_and_applies_here() {
+        let pg = SqlDialect::Postgres;
+        assert!(snippet_recallable(
+            &snippet(Source::User, Scope::Global),
+            pg,
+            1
+        ));
+        assert!(snippet_recallable(
+            &snippet(Source::User, Scope::Conn(1)),
+            pg,
+            1
+        ));
+        assert!(snippet_recallable(
+            &snippet(Source::User, Scope::Dialect(pg)),
+            pg,
+            1
+        ));
+        assert!(!snippet_recallable(
+            &snippet(Source::Builtin, Scope::Global),
+            pg,
+            1
+        ));
+        assert!(!snippet_recallable(
+            &snippet(Source::User, Scope::Conn(2)),
+            pg,
+            1
+        ));
+        assert!(!snippet_recallable(
+            &snippet(Source::User, Scope::Dialect(SqlDialect::MySql)),
+            pg,
+            1
+        ));
+    }
     use crate::inline_diff::EditorGhost;
     use floem::views::editor::core::cursor::{Cursor, CursorMode};
     use floem::views::editor::core::selection::{SelRegion, Selection};
