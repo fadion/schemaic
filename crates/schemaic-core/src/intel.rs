@@ -13069,12 +13069,17 @@ fn keyword_partner(sql: &str, lo: usize, toks: &[Token], dialect: SqlDialect) ->
         "REPLACE" | "MERGE" if first => "INTO ",
         "TRUNCATE" if first => "TABLE ",
         "IF" => if_partner(toks)?,
-        "NOT" if prev_is("IF") && if_partner(&toks[..toks.len() - 1]).is_some() => "EXISTS ",
-        "NOT" if declares_a_column(toks) => "NULL",
+        // Only where `IF` itself would have answered `NOT EXISTS`: a dropping
+        // or altering verb's `IF NOT` is no form at all.
+        "NOT" if prev_is("IF") && if_partner(&toks[..toks.len() - 1]) == Some("NOT EXISTS ") => {
+            "EXISTS "
+        }
+        "NOT" if !prev_is("IF") && declares_a_column(toks) => "NULL",
         "DISTINCT" if prev_is("IS") || (prev_is("NOT") && prev2.as_deref() == Some("IS")) => {
             "FROM "
         }
         "DUPLICATE" if prev_is("ON") => "KEY UPDATE ",
+        "KEY" if prev_is("DUPLICATE") && prev2.as_deref() == Some("ON") => "UPDATE ",
         "UPDATE" if prev_is("DO") => "SET ",
         "UNIQUE" if second_after("CREATE") && !unique_index_names_its_kind(dialect) => "INDEX ",
         "OR" if second_after("CREATE") => create_or_spelling(dialect)?,
@@ -13196,6 +13201,9 @@ const OPERAND_PENDING: &[&str] = &[
     "REGEXP",
     "RLIKE",
     "INTERVAL",
+    // `ORDER BY`, and T-SQL's `WHEN NOT MATCHED BY` still wanting its
+    // `TARGET` or `SOURCE`.
+    "BY",
 ];
 
 /// Is `text` (the source from a construct's keyword to the caret, `toks` its
@@ -13237,8 +13245,9 @@ fn operand_finished(text: &str, toks: &[Token]) -> bool {
 /// written takes a fixed next word — `BETWEEN x` its `AND`, `CAST(x` its `AS`,
 /// `EXTRACT(field` its `FROM`, `SELECT *` (which no alias can follow) its
 /// `FROM`, a CTE's name its `AS`, `DELETE FROM t` its `WHERE` (as much a safety
-/// as a prediction), and a privilege's object its `TO` or `FROM`. Each answers
-/// in the case its keyword was typed.
+/// as a prediction), a privilege's object its `TO` or `FROM`, a `WHEN`'s
+/// condition its `THEN`, and a named `CREATE INDEX` its `ON`. Each answers in
+/// the case its keyword was typed.
 fn operand_partner(sql: &str, caret: usize, toks: &[Token]) -> Option<String> {
     between_and(sql, caret, toks)
         .or_else(|| call_keyword(sql, caret, toks))
@@ -13246,6 +13255,73 @@ fn operand_partner(sql: &str, caret: usize, toks: &[Token]) -> Option<String> {
         .or_else(|| cte_as(toks))
         .or_else(|| delete_where(toks))
         .or_else(|| grantee_word(sql, caret, toks))
+        .or_else(|| when_then(sql, caret, toks))
+        .or_else(|| index_on(toks))
+}
+
+/// `WHEN cond ` → `THEN `: a `CASE`'s branch, a `MERGE`'s `WHEN [NOT]
+/// MATCHED` — once the condition is a finished operand and no `THEN` has been
+/// written. Not in a `CREATE … TRIGGER`, whose `WHEN (…)` is followed by the
+/// trigger's body.
+fn when_then(sql: &str, caret: usize, toks: &[Token]) -> Option<String> {
+    let head = |i: usize| toks.get(i).and_then(bare_upper);
+    if head(0).as_deref() == Some("CREATE") && (1..5).any(|i| head(i).as_deref() == Some("TRIGGER"))
+    {
+        return None;
+    }
+    let i = toks
+        .iter()
+        .rposition(|t| bare_upper(t).as_deref() == Some("WHEN"))?;
+    let after = &toks[i + 1..];
+    if after
+        .iter()
+        .any(|t| bare_upper(t).as_deref() == Some("THEN"))
+    {
+        return None;
+    }
+    let TkKind::Word(kw) = &toks[i].kind else {
+        return None;
+    };
+    operand_finished(sql.get(toks[i].end..caret)?, after).then(|| in_typed_case("THEN ", kw))
+}
+
+/// `CREATE [UNIQUE] [CLUSTERED…] INDEX [CONCURRENTLY] [IF NOT EXISTS] name `
+/// → `ON `: a named index's table comes next. An unnamed one (`CREATE INDEX
+/// `) may still be given its name, so predicts nothing.
+fn index_on(toks: &[Token]) -> Option<String> {
+    let word = |i: usize| toks.get(i).and_then(bare_upper);
+    if word(0).as_deref() != Some("CREATE") {
+        return None;
+    }
+    let mut i = 1;
+    while matches!(
+        word(i).as_deref(),
+        Some("UNIQUE" | "CLUSTERED" | "NONCLUSTERED" | "FULLTEXT" | "SPATIAL")
+    ) {
+        i += 1;
+    }
+    if word(i).as_deref() != Some("INDEX") {
+        return None;
+    }
+    let TkKind::Word(kw) = &toks[i].kind else {
+        return None;
+    };
+    i += 1;
+    if word(i).as_deref() == Some("CONCURRENTLY") {
+        i += 1;
+    }
+    if word(i).as_deref() == Some("IF") {
+        if !(word(i + 1).as_deref() == Some("NOT") && word(i + 2).as_deref() == Some("EXISTS")) {
+            return None;
+        }
+        i += 3;
+    }
+    let name = written_table(toks.get(i..)?)?;
+    let reserved = matches!(
+        name.r.name.to_ascii_uppercase().as_str(),
+        "ON" | "USING" | "IF" | "CONCURRENTLY"
+    );
+    (!reserved).then(|| in_typed_case("ON ", kw))
 }
 
 /// `… BETWEEN x ` → `AND `, once `x` is a finished operand at the `BETWEEN`'s
@@ -13328,7 +13404,7 @@ fn call_keyword(sql: &str, caret: usize, toks: &[Token]) -> Option<String> {
     }
 }
 
-/// `SELECT * ` (or `SELECT DISTINCT *`, `SELECT t.*`) → `FROM `: a star takes
+/// `SELECT * ` (or `SELECT DISTINCT *`, `SELECT TOP 10 *`, `SELECT t.*`) → `FROM `: a star takes
 /// no alias, so nothing else can come next. Any other projection might be
 /// followed by its alias, and predicts nothing.
 fn star_from(sql: &str, caret: usize, toks: &[Token]) -> Option<String> {
@@ -13346,7 +13422,42 @@ fn star_from(sql: &str, caret: usize, toks: &[Token]) -> Option<String> {
         from = q.end;
         tail = rest;
     }
+    // T-SQL's `TOP n` / `TOP (n)`, then `PERCENT` and `WITH TIES`. A number is
+    // no token, so a bare `TOP 10` leaves its `10` in the text to skip.
+    let mut bare_count = false;
+    if let [top, rest @ ..] = tail
+        && bare_upper(top).as_deref() == Some("TOP")
+    {
+        from = top.end;
+        tail = rest;
+        if let [lp, rest @ ..] = tail
+            && matches!(lp.kind, TkKind::LParen)
+        {
+            let close = rest.iter().position(|t| matches!(t.kind, TkKind::RParen))?;
+            from = rest[close].end;
+            tail = &rest[close + 1..];
+        } else {
+            bare_count = true;
+        }
+        while let [w, rest @ ..] = tail
+            && matches!(bare_upper(w).as_deref(), Some("PERCENT" | "WITH" | "TIES"))
+        {
+            from = w.end;
+            tail = rest;
+            bare_count = false;
+        }
+    }
     let star = sql.get(from..caret)?.trim();
+    let star = if bare_count {
+        let rest = star.trim_start_matches(|c: char| c.is_ascii_digit());
+        // The count itself, and whitespace after it, before the star.
+        if rest.len() == star.len() || !rest.starts_with(char::is_whitespace) {
+            return None;
+        }
+        rest.trim_start()
+    } else {
+        star
+    };
     let shaped = match tail {
         [] => star == "*",
         [w, dot] if matches!(w.kind, TkKind::Word(_)) && matches!(dot.kind, TkKind::Dot) => {
@@ -13404,9 +13515,41 @@ fn cte_as(toks: &[Token]) -> Option<String> {
 }
 
 /// `DELETE FROM t ` → `WHERE `: the table, and nothing else, after `DELETE
-/// FROM`.
+/// FROM` — the statement's own `DELETE`, its first word or the one after a
+/// `WITH`'s list, and past T-SQL's `TOP (n) [PERCENT]`.
 fn delete_where(toks: &[Token]) -> Option<String> {
-    let [del, from, name @ ..] = toks else {
+    let start = if toks.first().and_then(bare_upper).as_deref() == Some("WITH") {
+        let mut depth = 0usize;
+        toks.iter().position(|t| match t.kind {
+            TkKind::LParen => {
+                depth += 1;
+                false
+            }
+            TkKind::RParen => {
+                depth = depth.saturating_sub(1);
+                false
+            }
+            _ => depth == 0 && bare_upper(t).as_deref() == Some("DELETE"),
+        })?
+    } else {
+        0
+    };
+    let [del, rest @ ..] = &toks[start..] else {
+        return None;
+    };
+    let rest = match rest {
+        [top, lp, rest @ ..]
+            if bare_upper(top).as_deref() == Some("TOP") && matches!(lp.kind, TkKind::LParen) =>
+        {
+            let close = rest.iter().position(|t| matches!(t.kind, TkKind::RParen))?;
+            match &rest[close + 1..] {
+                [pct, rest @ ..] if bare_upper(pct).as_deref() == Some("PERCENT") => rest,
+                rest => rest,
+            }
+        }
+        rest => rest,
+    };
+    let [from, name @ ..] = rest else {
         return None;
     };
     if bare_upper(del).as_deref() != Some("DELETE") || bare_upper(from).as_deref() != Some("FROM") {
@@ -13481,10 +13624,13 @@ fn grantee_word(sql: &str, caret: usize, toks: &[Token]) -> Option<String> {
         return None;
     }
     let object = sql.get(toks[on].end..caret)?.trim();
+    // A name, or a routine's closed signature (`FUNCTION f(int)`); never
+    // inside a paren still open.
     let named = object
         .chars()
         .next_back()
-        .is_some_and(|c| !c.is_ascii() || c.is_ascii_alphanumeric() || "_*\"`]".contains(c));
+        .is_some_and(|c| !c.is_ascii() || c.is_ascii_alphanumeric() || "_*\"`])".contains(c))
+        && depth_after(after) == Some(0);
     named.then(|| in_typed_case(partner, verb))
 }
 
@@ -13514,7 +13660,7 @@ const DDL_OBJECT_WORDS: &[&str] = &[
 ];
 
 /// What follows an `IF` that ends `toks`: `EXISTS` when the verb it belongs to
-/// drops, `NOT EXISTS` when it creates or adds — and nothing unless an object
+/// drops or alters, `NOT EXISTS` when it creates or adds — and nothing unless an object
 /// word stands right before it, since `IF` is also a T-SQL statement, a
 /// procedure body's branch and MySQL's `IF()`.
 fn if_partner(toks: &[Token]) -> Option<&'static str> {
@@ -13531,7 +13677,7 @@ fn if_partner(toks: &[Token]) -> Option<&'static str> {
         return None;
     }
     toks.iter().rev().find_map(|t| match upper(t)?.as_str() {
-        "DROP" => Some("EXISTS "),
+        "DROP" | "ALTER" => Some("EXISTS "),
         "CREATE" | "ADD" => Some("NOT EXISTS "),
         _ => None,
     })
@@ -14252,7 +14398,8 @@ fn aggregates_rows(f: &sqlparser::ast::Function) -> bool {
 /// the reason an alias (`x AS c`) gives back `x`, not `c`. *Which* query is the
 /// one the `GROUP BY` belongs to: the text after the innermost `(` still open
 /// before it (a derived table, a CTE body — [`local_scope_start`]), else the
-/// statement; within that, the `SELECT` an `INSERT` or a view is built from, and
+/// statement; within that, the `SELECT` an `INSERT`, a view or a `CREATE TABLE
+/// … AS` is built from, and
 /// a set operation's last arm. A prefix that does not parse (half a `FROM`)
 /// predicts nothing. So does a projection that cannot be listed: a star, or
 /// nothing groupable left.
@@ -14281,6 +14428,7 @@ fn group_by_items(sql: &str, lo: usize, toks: &[Token], dialect: SqlDialect) -> 
         [Statement::Query(q)] => q,
         [Statement::Insert(i)] => i.source.as_ref()?,
         [Statement::CreateView(v)] => &v.query,
+        [Statement::CreateTable(t)] => t.query.as_ref()?,
         _ => return None,
     };
     let mut body = q.body.as_ref();
@@ -15963,6 +16111,85 @@ mod predict_tests {
     #[test]
     fn with_xmlnamespaces_predicts_no_as() {
         assert_eq!(at_end("WITH XMLNAMESPACES ", SqlDialect::MsSql), None);
+    }
+
+    /// Answers as certain as the ones already offered, which the producers'
+    /// shapes left out: `ALTER … IF`, a hand-typed `ON DUPLICATE KEY`, a named
+    /// `CREATE INDEX`, a `WHEN`'s condition, a `DELETE` behind a `WITH` or a
+    /// `TOP`, a `TOP n *`, a routine's signature in a `GRANT`, and a `GROUP
+    /// BY` in a `CREATE TABLE … AS SELECT`.
+    #[test]
+    fn the_words_as_certain_as_the_others_are_predicted_too() {
+        let pg = |sql: &str| at_end(sql, SqlDialect::Postgres);
+        let ms = |sql: &str| at_end(sql, SqlDialect::MsSql);
+        assert_eq!(pg("ALTER TABLE IF ").as_deref(), Some("EXISTS "));
+        assert_eq!(
+            my("INSERT INTO t (a) VALUES (1) ON DUPLICATE KEY ").as_deref(),
+            Some("UPDATE ")
+        );
+        assert_eq!(my("CREATE INDEX ix_total ").as_deref(), Some("ON "));
+        assert_eq!(
+            pg("CREATE UNIQUE INDEX IF NOT EXISTS ix_total ").as_deref(),
+            Some("ON ")
+        );
+        assert_eq!(
+            ms("CREATE UNIQUE CLUSTERED INDEX ix_total ").as_deref(),
+            Some("ON ")
+        );
+        assert_eq!(my("SELECT CASE WHEN total > 1 ").as_deref(), Some("THEN "));
+        assert_eq!(
+            my("SELECT CASE status WHEN 'open' ").as_deref(),
+            Some("THEN ")
+        );
+        assert_eq!(
+            ms("MERGE INTO t USING s ON t.id = s.id WHEN MATCHED ").as_deref(),
+            Some("THEN ")
+        );
+        assert_eq!(
+            my("WITH x AS (SELECT 1) DELETE FROM orders ").as_deref(),
+            Some("WHERE ")
+        );
+        assert_eq!(
+            ms("DELETE TOP (10) FROM orders ").as_deref(),
+            Some("WHERE ")
+        );
+        assert_eq!(ms("SELECT TOP 10 * ").as_deref(), Some("FROM "));
+        assert_eq!(ms("SELECT DISTINCT TOP (10) * ").as_deref(), Some("FROM "));
+        assert_eq!(
+            pg("GRANT EXECUTE ON FUNCTION f(int) ").as_deref(),
+            Some("TO ")
+        );
+        assert_eq!(
+            my("CREATE TABLE x AS SELECT customer_id, count(*) FROM orders GROUP BY ").as_deref(),
+            Some("customer_id")
+        );
+    }
+
+    /// Where those words are not certain, they are not offered: a trigger's
+    /// `WHEN (…)` is followed by its body, an unfinished condition by more of
+    /// it, an unnamed `CREATE INDEX` by its name, and a `GRANT` whose object
+    /// is still an open paren by the rest of it.
+    #[test]
+    fn the_new_answers_hold_their_guards() {
+        let pg = |sql: &str| at_end(sql, SqlDialect::Postgres);
+        assert_eq!(
+            pg("CREATE TRIGGER t BEFORE UPDATE ON orders FOR EACH ROW WHEN (NEW.total > 1) "),
+            None
+        );
+        assert_eq!(my("SELECT CASE WHEN total > "), None);
+        assert_eq!(my("SELECT CASE WHEN total > 1 THEN 'a' WHEN "), None);
+        assert_eq!(my("CREATE INDEX "), None);
+        assert_eq!(pg("GRANT EXECUTE ON FUNCTION f(int "), None);
+        assert_eq!(at_end("SELECT TOP 10 ", SqlDialect::MsSql), None);
+        assert_eq!(
+            at_end(
+                "MERGE INTO t USING s ON t.id = s.id WHEN NOT MATCHED BY ",
+                SqlDialect::MsSql
+            ),
+            None
+        );
+        assert_eq!(pg("ALTER TABLE IF NOT "), None);
+        assert_eq!(pg("DROP TABLE IF NOT "), None);
     }
 }
 

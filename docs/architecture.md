@@ -1783,7 +1783,8 @@ existing prose was left alone.
     keyword whose partner the grammar fixes gets the partner (`ORDER`/`GROUP`/`PARTITION` → `BY`,
     `PRIMARY`/`FOREIGN` → `KEY`, `INSERT` → `INTO`, `DELETE` → `FROM`, the join words → `JOIN`,
     `IF` → `[NOT] EXISTS`, a column's `NOT` → `NULL`, and a handful of pairs such as
-    `IS [NOT] DISTINCT` → `FROM` and `ON DUPLICATE` → `KEY UPDATE` — `keyword_partner` is the list),
+    `IS [NOT] DISTINCT` → `FROM`, `ON DUPLICATE` → `KEY UPDATE` and a hand-typed
+    `ON DUPLICATE KEY` → `UPDATE` — `keyword_partner` is the list),
     in lower case when the keyword was typed all-lower — `in_typed_case`, which writes both join
     producers' `ON` in the case `JOIN` was typed; and, asked last, an operand just written gets the
     word its construct fixes next (`operand_partner`, below). It answers nothing unless the rest of the
@@ -1897,9 +1898,14 @@ existing prose was left alone.
     MySQL and SQL Server, `TABLE` after `TRUNCATE` everywhere but T-SQL); the partner is then the
     conventional spelling every engine that has the statement accepts, not a guess. `IF` is also a T-SQL statement, a procedure body's branch and MySQL's
     `IF()`, so `if_partner` answers only with an object word (`DDL_OBJECT_WORDS` — `TABLE`,
-    `VIEW`, `COLUMN`, …) right before it, and the nearest verb behind that decides: `DROP` →
-    `EXISTS`, `CREATE`/`ADD` → `NOT EXISTS`; `IF NOT` gets `EXISTS` only after an `IF` that
+    `VIEW`, `COLUMN`, …) right before it, and the nearest verb behind that decides: `DROP`/`ALTER`
+    → `EXISTS`, `CREATE`/`ADD` → `NOT EXISTS`; `IF NOT` gets `EXISTS` only after an `IF` that
     qualified (`if_predicts_exists_by_the_verb_it_belongs_to`, `if_elsewhere_predicts_nothing`).
+    `ALTER` came late: the look-back knew only `DROP`, `CREATE` and `ADD`, so PostgreSQL's and
+    MariaDB's `ALTER TABLE IF ` got no `EXISTS`. *Nearest* is what keeps it safe to add — an
+    `ALTER`'s `ADD COLUMN IF ` and `DROP COLUMN IF ` still find their own verb first, and get
+    `NOT EXISTS` and `EXISTS` (`the_words_as_certain_as_the_others_are_predicted_too`, red first
+    on that `ALTER TABLE IF `).
     `NOT` negates anything in a condition, so it gets `NULL` only where `declares_a_column` finds
     a column being defined — a `CREATE … TABLE`'s column list (one paren deep) or an
     `ALTER … TABLE`'s clause (none) — and so never inside a `CHECK (` or a
@@ -1953,7 +1959,8 @@ existing prose was left alone.
     its grouping keys listed through the AST's `Display`, which is why `x AS c` gives back `x`, not
     `c`. *Which* query is the one the `GROUP BY` belongs to: the text after the innermost `(` still
     open before `GROUP` (`local_scope_start` — a derived table, a CTE body), else the statement;
-    within that, the `SELECT` an `INSERT` or a `CREATE VIEW` is built from, and a set operation's
+    within that, the `SELECT` an `INSERT`, a `CREATE VIEW` or a `CREATE TABLE … AS` is built
+    from, and a set operation's
     last arm, the one being typed (`group_by_reads_the_query_it_belongs_to`). It used to parse the
     whole statement, so a `GROUP BY` inside a subquery predicted nothing at all. **An item is a key
     only if it reads a column** and holds no aggregate, window or subquery: a constant or a
@@ -2093,16 +2100,35 @@ existing prose was left alone.
     `AS` or comma, and `EXTRACT(field ` → `FROM` on exactly one word (`call_keyword`);
     `SELECT * `, `SELECT DISTINCT|ALL * ` and `SELECT t.* ` → `FROM` (`star_from`) — a star takes
     no alias, so nothing else can come, where `SELECT a ` may be followed by its alias and
-    predicts nothing; a CTE's name, right after `WITH`, `WITH RECURSIVE` or a depth-0 comma → `AS`
+    predicts nothing; T-SQL's `TOP n`, `TOP (n)`, `PERCENT` and `WITH TIES` may stand between the
+    `SELECT` (or its `DISTINCT`) and the star, and a bare count is no token, so its digits are
+    skipped in the text — `SELECT TOP 10 `, the star not yet written, still predicts nothing;
+    a CTE's name, right after `WITH`, `WITH RECURSIVE` or a depth-0 comma → `AS`
     (`cte_as`; not T-SQL's `WITH XMLNAMESPACES `, which declares namespaces rather than a CTE and
     was offered `AS` — `with_xmlnamespaces_predicts_no_as`), until a depth-0
     `SELECT`/`INSERT`/`UPDATE`/`DELETE`/`MERGE`/`VALUES` shows the
     query proper has begun — `AS ` and not `AS (`, because the user's own `(` auto-pairs and an
     inserted one would not; `DELETE FROM t ` (`t`, `q.t` or `db.q.t`, nothing more) → `WHERE`
-    (`delete_where`), offered as a safety as much as a prediction; and `GRANT`/`DENY … ON obj ` →
-    `TO`, `REVOKE … ON obj ` → `FROM` (`grantee_word`), once the text after `ON` ends in a name
-    character, `*` or a closing quote, not while only the object's kind is written
-    (`PRIVILEGE_OBJECT_KINDS` — `TABLE`, `SCHEMA`, `ALL`, `IN`, …) and not once `TO`/`FROM` is.
+    (`delete_where`), offered as a safety as much as a prediction — after the statement's own
+    `DELETE`, its first word or the first at depth 0 behind a `WITH` list, and past T-SQL's
+    `TOP (n) [PERCENT]`, so `WITH x AS (…) DELETE FROM t ` and `DELETE TOP (10) FROM t ` get it
+    too; a `WHEN`'s condition → `THEN` (`when_then`), once it is a finished operand and no `THEN`
+    has followed the last `WHEN` — `CASE WHEN total > 1 `, a simple `CASE status WHEN 'open' `, a
+    `MERGE`'s `WHEN [NOT] MATCHED ` — but never in a `CREATE … TRIGGER`, whose `WHEN (…)` is
+    followed by the trigger's body rather than a `THEN`; that guard reads the statement's first
+    words, so a `CASE` inside a trigger's body gets no `THEN` either; a named index → `ON`
+    (`index_on`), after `CREATE [UNIQUE|CLUSTERED|NONCLUSTERED|FULLTEXT|SPATIAL] INDEX
+    [CONCURRENTLY] [IF NOT EXISTS] name `, the name read as `written_table` reads a table's and
+    none of `ON`, `USING`, `IF` or `CONCURRENTLY`, while an unnamed `CREATE INDEX ` predicts
+    nothing, since its name may still come (these two arms, and the `TOP`, `WITH … DELETE` and
+    routine-signature shapes, are `the_words_as_certain_as_the_others_are_predicted_too`); and
+    `GRANT`/`DENY … ON obj ` → `TO`, `REVOKE … ON obj ` → `FROM` (`grantee_word`), once the
+    text after `ON` ends in a name character, `*`, a closing quote or the `)` closing a routine's
+    signature (`GRANT EXECUTE ON FUNCTION f(int) `), with every paren it opened closed
+    (`depth_after`), not while only the object's kind is written (`PRIVILEGE_OBJECT_KINDS` —
+    `TABLE`, `SCHEMA`, `ALL`, `IN`, …) and not once `TO`/`FROM` is. The paren check is
+    load-bearing: the last character alone offered `TO` inside `FUNCTION f(int `, a signature
+    still being written (`the_new_answers_hold_their_guards`, red first).
     *Finished* is `operand_finished`: something written, its parens closed (`depth_after`), and
     the last thing neither an operator character nor a word that wants another operand
     (`OPERAND_PENDING` — `AND`, `OR`, `NOT`, `IS`, `IN`, `LIKE`, `AS`, …), so `BETWEEN 1 + `,
