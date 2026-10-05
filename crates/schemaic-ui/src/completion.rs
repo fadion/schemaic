@@ -702,14 +702,41 @@ fn prediction_at(
         .hidden_dbs
         .with_untracked(|h| build_offer_catalog(ctx.db_nodes, h, ctx.active_db));
     let guess = intel::predict(text, offset, &catalog, ctx.dialect)?;
+    Some(ghost_at(ed, offset, guess, None))
+}
+
+/// Is `g` the rest of a prediction to keep as it stands, at `caret` in a
+/// document of `doc_len` bytes?
+///
+/// Only one Ctrl+→ left ([`EditorGhost::kept`]), at the caret it left, while
+/// the document is the length it left it: an edit that moves no caret — a
+/// forward Delete there — changes what follows the caret, and the rest is
+/// asked for afresh.
+///
+/// [`EditorGhost::kept`]: crate::inline_diff::EditorGhost::kept
+fn keeps_ghost(g: &crate::inline_diff::EditorGhost, caret: usize, doc_len: usize) -> bool {
+    g.kept == Some(doc_len) && g.offset == caret
+}
+
+/// A ghost of `text` at `offset`, with the line and column [`EditorGhost`]
+/// carries.
+///
+/// [`EditorGhost`]: crate::inline_diff::EditorGhost
+pub(crate) fn ghost_at(
+    ed: &Editor,
+    offset: usize,
+    text: String,
+    kept: Option<usize>,
+) -> crate::inline_diff::EditorGhost {
     let rope = ed.doc().text();
     let line = rope.line_of_offset(offset);
-    Some(crate::inline_diff::EditorGhost {
+    crate::inline_diff::EditorGhost {
         offset,
         line,
         col: offset - rope.offset_of_line(line),
-        text: guess,
-    })
+        text,
+        kept,
+    }
 }
 
 pub(crate) fn recompute_completions(
@@ -750,11 +777,15 @@ pub(crate) fn recompute_completions(
     // accept, and the ghost is wanted straight after one — Tab on `BY ` leaves
     // `GROUP BY ` and the grouping columns are the next thing to offer — and
     // an edit no key typed still ends somewhere a ghost can be right. Ctrl+Space
-    // asks for the list, so a forced recompute shows no ghost beside it.
+    // asks for the list, so a forced recompute shows no ghost beside it. The
+    // rest of a prediction taken word by word is kept while the caret is where
+    // the last word left it: asked afresh there, it would often be nothing.
     let ghost = if force {
         None
     } else {
-        prediction_at(ed, &text, offset, &ctx)
+        comp.ghost
+            .with_untracked(|g| g.clone().filter(|g| keeps_ghost(g, offset, text.len())))
+            .or_else(|| prediction_at(ed, &text, offset, &ctx))
     };
     let has_ghost = ghost.is_some();
     crate::inline_diff::set_ghost(comp.ghost, ed, ghost);
@@ -1394,6 +1425,38 @@ pub(crate) fn signature_popup(comp: Completion, viewport: RwSignal<Rect>) -> imp
     // sets is an overlay that has something to hover, and this has nothing. See
     // `editor_pane`'s squiggles for the other side of that.
     .pointer_events(|| false)
+}
+
+#[cfg(test)]
+mod kept_ghost_tests {
+    use super::keeps_ghost;
+    use crate::inline_diff::EditorGhost;
+
+    fn ghost(offset: usize, kept: Option<usize>) -> EditorGhost {
+        EditorGhost {
+            offset,
+            line: 0,
+            col: offset,
+            text: "ON o.id = c.id".to_string(),
+            kept,
+        }
+    }
+
+    /// The recompute a Ctrl+→ schedules keeps the rest it left.
+    #[test]
+    fn the_rest_of_a_word_taken_is_kept_where_it_was_left() {
+        assert!(keeps_ghost(&ghost(20, Some(40)), 20, 40));
+    }
+
+    /// A forward Delete at the caret moves nothing but changes what follows,
+    /// and a caret moved elsewhere, or a prediction no Ctrl+→ left, is asked
+    /// for afresh.
+    #[test]
+    fn a_kept_rest_is_dropped_once_the_text_or_the_caret_changes() {
+        assert!(!keeps_ghost(&ghost(20, Some(40)), 20, 39));
+        assert!(!keeps_ghost(&ghost(20, Some(40)), 21, 40));
+        assert!(!keeps_ghost(&ghost(20, None), 20, 40));
+    }
 }
 
 #[cfg(test)]

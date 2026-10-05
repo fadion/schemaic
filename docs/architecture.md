@@ -1781,7 +1781,13 @@ existing prose was left alone.
     statement already has next (editing `ORDER |` above an existing `BY` offers no second one).
     That word is compared whole: a non-ASCII character never ends it, where casting each `char` to
     a byte for `is_word_byte` cut `名前` at its first character and offered it again
-    (`a_non_ascii_word_already_next_is_not_offered_again`).
+    (`a_non_ascii_word_already_next_is_not_offered_again`). The same reading of a word decides how
+    Ctrl+→ takes a ghost one word at a time: `prediction_word_end` is the byte length one press
+    takes — any punctuation leading in, whitespace, the word's own characters and the whitespace
+    after them — so `id, name)` goes `id` | `, name` | `)` and `customers ON o.customer_id` goes
+    `customers ` | `ON ` | `o` | `.customer_id`. A non-ASCII character is a word character there
+    too, as `is_word_byte` has it, and the answer is never 0 for a non-empty text, so every press
+    takes something (`a_prediction_is_taken_a_word_at_a_time`; the key is under `editor_pane.rs`).
     It also refuses a caret in a string, comment or quoted name, and
     that is `caret_touches_noncode` walking only the text *before* the caret through `skip_noncode`,
     so an unterminated quote or a line comment running up to the caret counts as the caret being
@@ -22251,8 +22257,19 @@ existing prose was left alone.
     one-shot can return**. `suppress` is set by an accept, and the next prediction is wanted
     straight after one: Tab on a `BY ` ghost leaves `GROUP BY `, whose grouping columns are the next
     thing to offer, so a ghost asked after the one-shot would break that chain at its second link.
-    A forced recompute (Ctrl+Space) asks for the list, so it shows no ghost beside it. With the word
-    at the caret empty and a ghost showing, the popup does not open: that is the slot `auto_show`
+    A forced recompute (Ctrl+Space) asks for the list, so it shows no ghost beside it.
+    **The rest of a prediction taken a word at a time is kept, not asked for again**: a ghost
+    `keeps_ghost` accepts is published as it stands, ahead of `prediction_at`, because
+    asked at the new caret the words already taken often predict nothing — after
+    `JOIN customers ` there is no alias, so no `ON` ghost. **It asks for the caret *and* the
+    document's length** Ctrl+→ left (`kept == Some(doc_len) && offset == caret`): the offset alone
+    let a stale rest survive an edit that moves no caret — a forward Delete at the caret changes
+    what follows it — where now that edit asks afresh (`kept_ghost_tests`;
+    `a_kept_rest_is_dropped_once_the_text_or_the_caret_changes` was red against the offset-only
+    rule). A forced recompute still shows none, and
+    any caret move still clears it (under `editor_pane.rs`). `ghost_at` is the one place an
+    `EditorGhost` is built, with its line and column, for `prediction_at` and that key alike.
+    With the word at the caret empty and a ghost showing, the popup does not open: that is the slot `auto_show`
     (columns after `WHERE`/`ON`/`BY`) and the FK join row used to take, and two offers at one caret
     would leave Tab meaning whichever happened to be open. The table list `auto_show` opens after
     `JOIN ` yields the same way, so where the whole join is predicted it waits for a typed letter.
@@ -22763,11 +22780,20 @@ existing prose was left alone.
     open list owns Tab, and the caret still at the offset the ghost was made for. Anything else falls
     through to the indent. The insert goes through `edit_untyped`, so the Ctrl+K freeze holds and
     `suppress` keeps the popup from reopening over the inserted words, and the caret is put after
-    them; a refused insert still spends the key. Escape turns a ghost down as it does the list and
-    signature help, consuming the key only when one of the three was showing. **A ghost lives only
-    at the caret it was made for**: an effect on `ed.cursor` clears it the moment the caret leaves
-    that offset or a selection appears, so after a click elsewhere Tab indents again; an edit moves
-    the caret too, and the recompute it schedules asks again for the new spot.
+    them; a refused insert still spends the key. **Ctrl+→ (Cmd+→ on macOS) takes one word of it**,
+    on `ghost_takes_word`'s terms — Tab's, but with `primary_held` rather than without it, so
+    Shift+primary+→ still selects by word and a plain → still moves
+    (`primary_right_at_the_predictions_caret_takes_a_word`,
+    `a_word_is_taken_only_by_primary_right_at_a_live_prediction`). The word is
+    `intel::prediction_word_end`'s, inserted through `edit_untyped` as Tab's is; the rest goes back
+    as a `kept` ghost at the new caret, stamped with the document's length after the insert, and is
+    **published last**, after every caret change the insert makes — so the effect that clears a
+    ghost whose offset is not the caret never sees it at a stale one. Escape turns a ghost down as it
+    does the list and signature help, consuming the key only when one of the three was showing.
+    **A ghost lives only at the caret it was made for**: an effect on `ed.cursor` clears it the
+    moment the caret leaves that offset or a selection appears, so after a click elsewhere Tab
+    indents again; an edit moves the caret too, and the recompute it schedules asks again for the
+    new spot — or keeps the `kept` rest Ctrl+→ left there (under `completion.rs`).
     `QueryPaneParams::predictions` carries the setting in.
   - `inline_diff.rs` — the Ctrl+K suggestion rendered **in the editor's own line flow**: the lines
     it replaces stay where they are, faded, and the lines it proposes appear directly below them,
@@ -22858,7 +22884,10 @@ existing prose was left alone.
     **The editor's inline prediction is a second phantom on the same wrapper.** `EditorGhost`
     carries the caret `offset` it was made at and the `text`, plus that offset's `line` and byte
     `col`, so the per-line question floem asks on every relayout is a comparison rather than a walk
-    of the rope; it lives in a `GhostSignal` that `InlineDiffDoc::new` takes beside the preview.
+    of the rope; and `kept`, which on the rest of a prediction Ctrl+→ has taken words of holds the
+    document's length once it did, so the next recompute keeps it rather than predicting afresh
+    while the caret and that length both stand (`keeps_ghost`, under `completion.rs`). It lives in a
+    `GhostSignal` that `InlineDiffDoc::new` takes beside the preview.
     `phantom_text` draws it at the caret's column as a `PhantomTextKind::Completion` with
     `affinity: Some(CursorAffinity::Backward)` — floem's own rule for completion phantoms, which
     keeps the caret *before* text it has not been given yet — in `editor_theme().fg` at

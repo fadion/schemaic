@@ -207,6 +207,12 @@ pub struct EditorGhost {
     /// Byte column of `offset` within `line`.
     pub col: usize,
     pub text: String,
+    /// The rest of a prediction whose first words were taken one at a time
+    /// (Ctrl+→), with the document's length once they were: the next
+    /// recompute keeps it as it is rather than predicting afresh at the caret,
+    /// where the words already taken may predict nothing — while the document
+    /// is still that length (`completion::keeps_ghost`).
+    pub kept: Option<usize>,
 }
 
 /// How strongly the prediction is drawn: the editor's foreground at this

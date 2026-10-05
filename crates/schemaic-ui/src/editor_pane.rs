@@ -135,6 +135,25 @@ fn ghost_takes_tab(
     ghost_at == Some(caret) && !list_open && !shift && !primary
 }
 
+/// Does this →, with the primary modifier held, take one word of the inline
+/// prediction ([`intel::prediction_word_end`])?
+///
+/// Ctrl+→ on Windows and Linux, Cmd+→ on macOS — the editors' "accept next
+/// word" — under the same conditions as [`ghost_takes_tab`]: the list closed
+/// and the caret still where the prediction was made. Shift+primary+→ still
+/// selects by word.
+///
+/// [`intel::prediction_word_end`]: schemaic_core::intel::prediction_word_end
+fn ghost_takes_word(
+    ghost_at: Option<usize>,
+    caret: usize,
+    list_open: bool,
+    shift: bool,
+    primary: bool,
+) -> bool {
+    ghost_at == Some(caret) && !list_open && !shift && primary
+}
+
 /// Apply an edit the user did **not** type, without popping the completion list.
 ///
 /// Every document change re-runs the completion recompute a tick later, and that
@@ -2583,6 +2602,49 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 ) {
                     e.cursor
                         .update(|c| c.set_offset(caret + g.text.len(), false, false));
+                }
+                true
+            });
+            if taken {
+                return CommandExecuted::Yes;
+            }
+        }
+        // Ctrl+→ (Cmd+→) takes the prediction one word at a time — see
+        // `ghost_takes_word`. The rest is put back as a `kept` ghost at the new
+        // caret, stamped with the document's length after the insert, and
+        // published last — after every caret change the insert makes, so the
+        // effect that clears a ghost off its caret never sees it at a stale one.
+        // The recompute the edit schedules keeps it (`keeps_ghost`) rather than
+        // predicting afresh where the words just taken may predict nothing.
+        if matches!(
+            kp.key,
+            KeyInput::Keyboard(Key::Named(NamedKey::ArrowRight), _)
+        ) {
+            let taken = editor_sig.with_untracked(|e| {
+                let caret = e.cursor.get_untracked().offset();
+                let ghost = comp.ghost.get_untracked();
+                if !ghost_takes_word(
+                    ghost.as_ref().map(|g| g.offset),
+                    caret,
+                    comp.open.get_untracked(),
+                    mods.shift(),
+                    primary_held(mods),
+                ) {
+                    return false;
+                }
+                let Some(g) = ghost else { return false };
+                let end = schemaic_core::intel::prediction_word_end(&g.text);
+                let (word, rest) = g.text.split_at(end);
+                inline_diff::set_ghost(comp.ghost, e, None);
+                if edit_untyped(e, comp, Selection::caret(caret), word, EditType::Completion) {
+                    let at = caret + word.len();
+                    e.cursor.update(|c| c.set_offset(at, false, false));
+                    if !rest.is_empty() {
+                        let doc_len = e.doc().text().len();
+                        let kept =
+                            crate::completion::ghost_at(e, at, rest.to_string(), Some(doc_len));
+                        inline_diff::set_ghost(comp.ghost, e, Some(kept));
+                    }
                 }
                 true
             });
@@ -6244,7 +6306,24 @@ mod cmdk_preview_gate {
 
 #[cfg(test)]
 mod ghost_key_tests {
-    use super::ghost_takes_tab;
+    use super::{ghost_takes_tab, ghost_takes_word};
+
+    /// Ctrl+→ (Cmd+→ on macOS) takes one word of the prediction at its caret.
+    #[test]
+    fn primary_right_at_the_predictions_caret_takes_a_word() {
+        assert!(ghost_takes_word(Some(12), 12, false, false, true));
+    }
+
+    /// A plain → moves the caret; Shift selects; an open list, a missing or a
+    /// stale prediction leaves the key to what it always did.
+    #[test]
+    fn a_word_is_taken_only_by_primary_right_at_a_live_prediction() {
+        assert!(!ghost_takes_word(Some(12), 12, false, false, false));
+        assert!(!ghost_takes_word(Some(12), 12, false, true, true));
+        assert!(!ghost_takes_word(Some(12), 12, true, false, true));
+        assert!(!ghost_takes_word(None, 12, false, false, true));
+        assert!(!ghost_takes_word(Some(12), 13, false, false, true));
+    }
 
     #[test]
     fn a_plain_tab_at_the_predictions_caret_takes_it() {

@@ -12509,6 +12509,34 @@ pub fn predict(sql: &str, caret: usize, catalog: &Catalog, dialect: SqlDialect) 
     Some(guess)
 }
 
+/// Where the first word of a prediction `text` ends — the byte length Ctrl+→
+/// takes of it, leaving the rest drawn.
+///
+/// A word is any punctuation leading into it, then whitespace, the word's own
+/// characters, and the whitespace after it: `id, name)` goes `id`, `, name`,
+/// `)`, and `customers ON o.customer_id` goes `customers `, `ON `, `o`,
+/// `.customer_id`. A character outside ASCII is a word character, as
+/// [`is_word_byte`] has it. Never `0` for a non-empty `text`, so each press
+/// takes something.
+pub fn prediction_word_end(text: &str) -> usize {
+    let word = |c: char| !c.is_ascii() || c.is_ascii_alphanumeric() || c == '_' || c == '$';
+    let punct = |c: char| !word(c) && !c.is_whitespace();
+    let space = |c: char| c.is_whitespace();
+    let classes: [&dyn Fn(char) -> bool; 4] = [&punct, &space, &word, &space];
+    let mut end = 0;
+    let mut chars = text.char_indices().peekable();
+    for class in classes {
+        while let Some(&(i, c)) = chars.peek() {
+            if !class(c) {
+                break;
+            }
+            end = i + c.len_utf8();
+            chars.next();
+        }
+    }
+    end
+}
+
 /// Does a string, comment or quoted name run up to (or past) `caret`, reading
 /// only the text before it? — through [`skip_noncode`], the one boundary lexer.
 ///
@@ -13563,6 +13591,41 @@ fn group_by_items(sql: &str, lo: usize, toks: &[Token], dialect: SqlDialect) -> 
 mod predict_tests {
     use super::*;
     use crate::schema::{ColumnInfo, ForeignKeyInfo, TableInfo};
+
+    /// `text` cut the way repeated Ctrl+→ takes it.
+    fn words(text: &str) -> Vec<&str> {
+        let mut out = Vec::new();
+        let mut rest = text;
+        while !rest.is_empty() {
+            let end = prediction_word_end(rest);
+            assert!(end > 0, "a press took nothing of {rest:?}");
+            out.push(&rest[..end]);
+            rest = &rest[end..];
+        }
+        out
+    }
+
+    /// Each press takes a word with the punctuation leading into it and the
+    /// space after it, so the caret lands where the next word starts.
+    #[test]
+    fn a_prediction_is_taken_a_word_at_a_time() {
+        assert_eq!(words("BY "), ["BY "]);
+        assert_eq!(words("NOT EXISTS "), ["NOT ", "EXISTS "]);
+        assert_eq!(words("id, name)"), ["id", ", name", ")"]);
+        assert_eq!(
+            words("customers ON o.customer_id = customers.id"),
+            [
+                "customers ",
+                "ON ",
+                "o",
+                ".customer_id ",
+                "= customers",
+                ".id"
+            ]
+        );
+        assert_eq!(words("名前, 番号"), ["名前", ", 番号"]);
+        assert_eq!(prediction_word_end(""), 0);
+    }
 
     fn tbl(name: &str, cols: &[&str]) -> TableInfo {
         TableInfo {
