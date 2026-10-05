@@ -1816,6 +1816,10 @@ existing prose was left alone.
     The live DB stays the semantic authority: **Tier-2 live validation**
     PREPAREs the statement under the cursor (`Db::prepare_check`, non-executing) behind the
     `live_validate` setting (off by default), merging dialect-exact errors into the editor squiggles.
+    Those squiggles are one server's verdict, so moving the tab to another connection, database or
+    engine clears them and bumps the validation generation, dropping a round-trip still in flight
+    to the old one (an effect in `editor_pane`, beside the one that clears them when validation is
+    switched off; no unit test).
     **`sql_reply` is a gate on what a model may put in the editor, not a cleanup.** Ctrl+K's output
     goes straight into the user's buffer, and while the model is told to answer with bare SQL the
     *tool* it runs in can still put a line of its own on stdout: a `claude -p` run returned an MCP

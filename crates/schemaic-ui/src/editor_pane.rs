@@ -2462,6 +2462,20 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             db_diag.set(Vec::new());
         }
     });
+    // So does moving the tab to another connection, database or engine: the
+    // squiggle was that server's verdict on the statement, and it stood over
+    // text the new one had never been asked about. The generation bump drops a
+    // round-trip still in flight to the old one.
+    {
+        let vgen = val_gen.clone();
+        create_effect(move |_| {
+            let _ = (active_conn.get(), active_db.get(), dialect.get());
+            vgen.set(vgen.get().wrapping_add(1));
+            if !db_diag.with_untracked(Vec::is_empty) {
+                db_diag.set(Vec::new());
+            }
+        });
+    }
 
     // The editor key handler needs its own clone (it's a `move` closure).
     // `run` is already the guarded run action — see `TabsActions::run`.
