@@ -3080,6 +3080,27 @@ fn bare_called_builtins(dialect: SqlDialect) -> &'static [&'static str] {
     }
 }
 
+/// Is a select-list alias in scope in this engine's `WHERE`? SQLite resolves
+/// one there — `SELECT price * 2 AS p FROM t WHERE p > 10` runs — where
+/// MySQL, PostgreSQL and SQL Server answer that the column does not exist.
+fn select_alias_in_where(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::Sqlite => true,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::MsSql => false,
+    }
+}
+
+/// Is a select-list alias in scope in this engine's `HAVING`? MySQL and SQLite
+/// resolve one; PostgreSQL (`column "c" does not exist`) and SQL Server (Msg
+/// 207, `Invalid column name`) read `HAVING` before the select list names
+/// anything.
+fn select_alias_in_having(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MySql | SqlDialect::Sqlite => true,
+        SqlDialect::Postgres | SqlDialect::MsSql => false,
+    }
+}
+
 /// The functions whose **first argument is a datepart keyword** — `DATEADD(day,
 /// 1, d)`, `DATEDIFF(month, a, b)` — which the parser carries as an identifier
 /// and the column resolver took for a column: a red ``Column `day` not
@@ -9795,11 +9816,12 @@ mod colres {
         range: (usize, usize),
         sources: Vec<Src>,
         proj_aliases: HashSet<String>,
-        /// Byte range of this scope's `WHERE` clause, if any. A projection alias may
-        /// be referenced in GROUP BY / HAVING / ORDER BY but **not** in WHERE (MySQL /
-        /// Postgres both reject it), so an alias-only match inside this range is an
-        /// error, not a resolution.
-        where_range: Option<(usize, usize)>,
+        /// Byte ranges of this scope's clauses where a projection alias is **not**
+        /// in scope on this engine ([`super::select_alias_in_where`],
+        /// [`super::select_alias_in_having`]), so an alias-only match inside one is
+        /// an error, not a resolution: `WHERE` everywhere but SQLite, `HAVING` on
+        /// PostgreSQL and SQL Server.
+        alias_blind: Vec<(usize, usize)>,
         /// Columns coalesced by a `USING(...)` join — an unqualified reference to
         /// one is unambiguous even when several sources expose it.
         coalesced: HashSet<String>,
@@ -9836,6 +9858,8 @@ mod colres {
             implicit: dialect.implicit_columns(),
             niladic: super::niladic_builtins(dialect),
             dateparts: super::datepart_functions(dialect),
+            alias_in_where: super::select_alias_in_where(dialect),
+            alias_in_having: super::select_alias_in_having(dialect),
             ctes: HashMap::new(),
             cte_frames: Vec::new(),
             scopes: Vec::new(),
@@ -9879,6 +9903,10 @@ mod colres {
         /// The engine's datepart-taking functions
         /// ([`super::datepart_functions`]), whose first argument is a keyword.
         dateparts: &'static [&'static str],
+        /// Whether a projection alias is in scope in `WHERE` and in `HAVING` on
+        /// this engine — see [`Scope::alias_blind`].
+        alias_in_where: bool,
+        alias_in_having: bool,
         /// Populated as queries are visited. See [`Ctes`].
         ctes: Ctes,
         /// What each enclosing query put into [`Collector::ctes`], and what it
@@ -9979,7 +10007,7 @@ mod colres {
                                 defines: None,
                             }],
                             proj_aliases: HashSet::new(),
-                            where_range: None,
+                            alias_blind: Vec::new(),
                             coalesced: HashSet::new(),
                             natural: false,
                         });
@@ -10095,15 +10123,23 @@ mod colres {
                 &mut self.gb,
             );
             cartesian_check(sel, self.stmt, self.lo, &mut self.gb);
-            let where_range = sel
-                .selection
-                .as_ref()
-                .map(|e| to_range(self.stmt, self.lo, e.span()));
+            let clause = |e: &Option<Expr>, visible: bool| {
+                e.as_ref()
+                    .filter(|_| !visible)
+                    .map(|e| to_range(self.stmt, self.lo, e.span()))
+            };
+            let alias_blind = [
+                clause(&sel.selection, self.alias_in_where),
+                clause(&sel.having, self.alias_in_having),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
             self.scopes.push(Scope {
                 range,
                 sources,
                 proj_aliases,
-                where_range,
+                alias_blind,
                 coalesced,
                 natural,
             });
@@ -10215,14 +10251,14 @@ mod colres {
                     if has_open {
                         return None; // an unenumerable source might provide it
                     }
-                    // A projection alias resolves an unqualified ref — except in the
-                    // WHERE clause, where an alias isn't in scope yet (only GROUP BY /
-                    // HAVING / ORDER BY may use it). An alias-only match inside WHERE
-                    // falls through to the not-found flag, matching MySQL / Postgres.
+                    // A projection alias resolves an unqualified ref — except in a
+                    // clause where this engine has none in scope yet (`alias_blind`):
+                    // an alias-only match there falls through to the not-found flag.
                     if s.proj_aliases.contains(&r.col)
                         && !s
-                            .where_range
-                            .is_some_and(|w| w.0 <= r.range.0 && r.range.1 <= w.1)
+                            .alias_blind
+                            .iter()
+                            .any(|w| w.0 <= r.range.0 && r.range.1 <= w.1)
                     {
                         return None;
                     }
@@ -19233,6 +19269,32 @@ mod tests {
             "SELECT salary AS s FROM employees WHERE salary > 100",
         ] {
             assert!(col_errors(sql).is_empty(), "false positive: {sql}");
+        }
+    }
+
+    /// Where a select-list alias is in scope is the engine's: SQLite takes one
+    /// in `WHERE`, and PostgreSQL and SQL Server take none in `HAVING`.
+    #[test]
+    fn a_select_list_alias_is_judged_by_the_engines_scope() {
+        let in_where = "SELECT salary AS s FROM employees WHERE s > 100";
+        assert!(col_errors_d(in_where, SqlDialect::Sqlite).is_empty());
+        for d in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::MsSql] {
+            assert_eq!(col_errors_d(in_where, d).len(), 1, "{d:?}");
+        }
+        let in_having =
+            "SELECT dept_id AS d, COUNT(*) AS c FROM employees GROUP BY dept_id HAVING c > 1";
+        for d in [SqlDialect::MySql, SqlDialect::Sqlite] {
+            assert!(col_errors_d(in_having, d).is_empty(), "{d:?}");
+        }
+        for d in [SqlDialect::Postgres, SqlDialect::MsSql] {
+            let e = col_errors_d(in_having, d);
+            assert_eq!(e.len(), 1, "{d:?}: {e:?}");
+            assert!(e[0].contains("`c`"), "{e:?}");
+        }
+        // ORDER BY takes one everywhere.
+        for d in SqlDialect::ALL {
+            let order = "SELECT salary AS s FROM employees ORDER BY s";
+            assert!(col_errors_d(order, d).is_empty(), "{d:?}");
         }
     }
 

@@ -1064,7 +1064,12 @@ existing prose was left alone.
     takes `WITH` as one. The hint's inside needed a second fix in `colres`: sqlparser carries a
     hint as an `Expr`, so the visitor resolved `NOLOCK` as a column (``Column `nolock` not
     found``); `Collector::not_columns` records each `TableFactor::Table`'s `with_hints` ranges in
-    `pre_visit_table_factor`, and an expression inside one is skipped. **Three more identifiers
+    `pre_visit_table_factor`, and an expression inside one is skipped. **A select-list alias
+    resolves an unqualified name except in the clauses the engine reads before it**
+    (`Scope::alias_blind`): `WHERE` everywhere but SQLite, which resolves one there
+    (`select_alias_in_where`), and `HAVING` on PostgreSQL and SQL Server, which do not
+    (`select_alias_in_having`); the resolver used to know only `WHERE`, for every engine
+    (`a_select_list_alias_is_judged_by_the_engines_scope`). **Three more identifiers
     the parser hands over are not columns**, all measured as red ``Column `…` not found``: a
     datepart function's first argument (`DATEADD(day, …)`, and MySQL's `TIMESTAMPDIFF(SECOND,
     …)` — `datepart_functions`, per dialect; the call's span goes into `not_columns` before the
