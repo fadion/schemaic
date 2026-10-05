@@ -2083,18 +2083,43 @@ existing prose was left alone.
     rest of the caret's line from the first statement in `past` (newest first) that begins with the
     statement typed so far, its leading whitespace trimmed. Its gate is stricter than `predict`'s.
     At least two words must be typed — one word starts every run, so matching it is a guess, not a
-    memory; nothing may follow the caret in the statement, not even the next clause on another line,
-    since a statement being edited in the middle is not the one run before; and the caret wants
-    whitespace or `(` before it and code under it (`caret_touches_noncode`, as above). The match is
+    memory; nothing may follow the caret in the statement but the `)`s bracket pairing made and a
+    `;`, not even the next clause on another line, since a statement being edited in the middle is
+    not the one run before; and the caret wants whitespace or `(` before it and code under it
+    (`caret_touches_noncode`, as above). **Inside an auto-paired `(…)`** the remembered line must
+    end in as many `)` as follow the caret, and is offered without them: `IN (|)` over a past
+    `IN (1, 2)` offers `1, 2`, while one that runs on past the paren (`IN (1, 2) ORDER BY id`)
+    offers nothing, since all of it would land inside the `)`. That spot used to be refused outright
+    (`after == ")"`), though `predict` answers there. The match is
     an exact prefix, case and inner spacing included — `select` does not continue `SELECT` — over
     text with `\r\n` made `\n`, and a stored run of several statements is cut by
-    `sql::statement_ranges` so that each is offered. It answers one line, its trailing `;` dropped:
+    `sql::statement_ranges` so that each is offered, each read from its first byte of code
+    (`skip_leading_noncode`): the range `statement_ranges` gives includes a comment heading the
+    statement, so a run saved as `-- weekly report⏎SELECT …` never matched at all.
+    It answers one line, its trailing `;` dropped:
     a statement written over several continues line by line as Enter starts each, so a ghost never
-    needs a newline — which it could not carry, since `inline_diff` draws none that holds a `\n`
-    (`history_prediction_tests::a_statement_run_before_predicts_the_rest_of_its_line` and
+    needs a newline — which it could not carry, since `inline_diff` draws none that holds a `\n`.
+    **That line ends at the first line end *in code*** (`first_code_line`, walking the text through
+    `skip_noncode`), and a run whose block comment or string crosses a line end before it offers
+    nothing. The line was once cut at the first `\n` wherever it sat, so a past
+    `SELECT * FROM orders /* multi⏎line */ WHERE id = 1` offered `/* multi`, and Tab left that
+    comment open over the rest of the buffer — a multi-line string likewise. A line comment ends
+    its own line and is offered whole.
+    **It runs on every keystroke, so what it reads is bounded.** Each space at a statement's end
+    used to re-lex every stored run of the connection — up to `history::MAX_PER_CONN` (50), each
+    stored whole — and a review measured 432 ms a keystroke, in a release build, after a Run All of
+    a mysqldump. Now a run longer than `RECALL_MAX_BYTES` (16 KiB) is skipped, the `\r\n` copy is
+    made only of a text that holds a `\r`, and a run that does not contain the typed text anywhere
+    is passed over before `statement_ranges` lexes it. The cap is on the stored run, not on any one
+    statement in it: a short query run as part of a long script is not remembered — that is the
+    trade (`history_prediction_tests::a_statement_run_before_predicts_the_rest_of_its_line` and
     `the_newest_statement_that_fits_is_the_one_predicted`, red against a stub first;
-    `history_predicts_nothing_it_cannot_continue` the gate). Which runs it is given is the UI's
-    choice (under `completion.rs`).
+    `history_predicts_nothing_it_cannot_continue` the gate;
+    `a_remembered_line_never_ends_inside_a_comment_or_string`,
+    `a_run_that_opens_with_a_comment_is_still_remembered`,
+    `a_remembered_line_fills_an_auto_paired_paren` and
+    `a_run_too_long_to_scan_per_keystroke_is_not_remembered`, each red against the body before
+    them). Which runs it is given is the UI's choice (under `completion.rs`).
   - `pg_builtins.rs` — the **PostgreSQL builtin catalog**, the third entry in
     `intel::builtin_catalog` and the one that could not be written by hand, and the reason the typo
     checker is on for this engine at all. `PG_FUNCTIONS` is 2,706 entries and the split is the point:

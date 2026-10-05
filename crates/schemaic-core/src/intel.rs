@@ -12791,9 +12791,17 @@ fn may_precede(guess: &str, next: &str) -> bool {
 /// statement being edited in the middle is not the one run before), the caret
 /// after whitespace or a `(`, and in code. The match is exact — `select` does
 /// not continue `SELECT` — over text with its line endings made `\n`, and a
-/// stored run of several statements offers each of them. What it answers is
-/// one line: a statement written over several continues line by line as Enter
-/// starts each, so a ghost never needs a newline.
+/// stored run of several statements offers each of them, read from its first
+/// word of code (a comment heading a run is skipped). What it answers is one
+/// line: a statement written over several continues line by line as Enter
+/// starts each, so a ghost never needs a newline — and a line whose end falls
+/// inside a comment or string ([`first_code_line`]) is not offered, since Tab
+/// would leave it open over the rest of the buffer.
+///
+/// Inside the `(…)` bracket pairing made, the remembered line must close
+/// there as well, and is offered without the `)`s already after the caret. A
+/// run longer than [`RECALL_MAX_BYTES`] is not read: this runs on every
+/// keystroke, and a dump run whole made each one rescan it.
 pub fn predict_from_history<'a>(
     sql: &str,
     caret: usize,
@@ -12812,25 +12820,78 @@ pub fn predict_from_history<'a>(
         return None;
     }
     let after = sql.get(caret..hi.max(caret))?.trim();
-    if !(after.is_empty() || after == ";") {
+    let after = after.strip_suffix(';').unwrap_or(after).trim_end();
+    if !after.chars().all(|c| c == ')') {
         return None;
     }
+    let closers = ")".repeat(after.len());
     let typed = sql[lo..caret].trim_start().replace("\r\n", "\n");
     typed.split_whitespace().nth(1)?;
     for text in past {
-        let text = text.replace("\r\n", "\n");
+        if text.len() > RECALL_MAX_BYTES {
+            continue;
+        }
+        let text = if text.contains('\r') {
+            std::borrow::Cow::Owned(text.replace("\r\n", "\n"))
+        } else {
+            std::borrow::Cow::Borrowed(text)
+        };
+        if !text.contains(typed.as_str()) {
+            continue;
+        }
         for (a, b) in crate::sql::statement_ranges(&text, dialect) {
-            let Some(more) = text[a..b].trim_start().strip_prefix(typed.as_str()) else {
+            let stmt = skip_leading_noncode(&text[a..b], dialect);
+            let Some(more) = stmt.strip_prefix(typed.as_str()) else {
                 continue;
             };
-            let line = more.split('\n').next().unwrap_or("").trim_end();
+            let Some(line) = first_code_line(more, dialect) else {
+                continue;
+            };
+            let line = line.trim_end();
             let line = line.strip_suffix(';').unwrap_or(line).trim_end();
+            let Some(line) = line.strip_suffix(closers.as_str()) else {
+                continue;
+            };
+            let line = line.trim_end();
             if !line.is_empty() {
                 return Some(line.to_string());
             }
         }
     }
     None
+}
+
+/// The longest stored run [`predict_from_history`] reads. Ample for a
+/// statement anyone types; a dump or a seed script run whole is left alone
+/// rather than rescanned on every keystroke.
+const RECALL_MAX_BYTES: usize = 16 * 1024;
+
+/// `stmt` from its first byte of code: whitespace and comments in front of it
+/// skipped, through [`skip_noncode`].
+fn skip_leading_noncode(stmt: &str, dialect: SqlDialect) -> &str {
+    let mut rest = stmt.trim_start();
+    while let Some(end) = skip_noncode(rest.as_bytes(), 0, dialect) {
+        rest = rest[end..].trim_start();
+    }
+    rest
+}
+
+/// `text` up to its first line end in code — `None` when a comment or a
+/// string runs across one before that, so the line would end inside it.
+fn first_code_line(text: &str, dialect: SqlDialect) -> Option<&str> {
+    let b = text.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\n' {
+            return Some(&text[..i]);
+        }
+        match skip_noncode(b, i, dialect) {
+            Some(end) if text[i..end].contains('\n') => return None,
+            Some(end) => i = end,
+            None => i += 1,
+        }
+    }
+    Some(text)
 }
 
 /// Where the first word of a prediction `text` ends — the byte length Ctrl+→
@@ -14202,6 +14263,76 @@ mod history_prediction_tests {
             None
         );
         assert_eq!(hist("SELECT * FROM orders ", &[]), None);
+    }
+
+    /// The line offered ends at a line end in code: a comment or a string
+    /// that runs across one would be cut open, and Tab would leave a `/*` or
+    /// a `'` unclosed over the rest of the buffer. A line comment ends its
+    /// own line, and is offered whole.
+    #[test]
+    fn a_remembered_line_never_ends_inside_a_comment_or_string() {
+        assert_eq!(
+            hist(
+                "SELECT * FROM orders ",
+                &["SELECT * FROM orders /* multi\nline */ WHERE id = 1"]
+            ),
+            None
+        );
+        assert_eq!(
+            hist(
+                "SELECT * FROM orders ",
+                &["SELECT * FROM orders WHERE note = 'a\nb'"]
+            ),
+            None
+        );
+        assert_eq!(
+            hist(
+                "SELECT * FROM orders ",
+                &["SELECT * FROM orders -- recent\nWHERE id = 1"]
+            )
+            .as_deref(),
+            Some("-- recent")
+        );
+    }
+
+    /// A run whose text opens with a comment — a heading above the query —
+    /// is remembered from its first word of code.
+    #[test]
+    fn a_run_that_opens_with_a_comment_is_still_remembered() {
+        let past = ["-- weekly report\n/* v2 */ SELECT * FROM orders WHERE total > 1"];
+        assert_eq!(
+            hist("SELECT * FROM orders ", &past).as_deref(),
+            Some("WHERE total > 1")
+        );
+    }
+
+    /// Inside the `(…)` bracket pairing made, the remembered line is offered
+    /// when it closes there too, without the `)` already after the caret.
+    #[test]
+    fn a_remembered_line_fills_an_auto_paired_paren() {
+        let typed = "SELECT * FROM orders WHERE id IN (|)";
+        assert_eq!(
+            hist(typed, &["SELECT * FROM orders WHERE id IN (1, 2)"]).as_deref(),
+            Some("1, 2")
+        );
+        assert_eq!(
+            hist(
+                typed,
+                &["SELECT * FROM orders WHERE id IN (1, 2) ORDER BY id"]
+            ),
+            None
+        );
+    }
+
+    /// A run too long to scan on every keystroke — a dump run whole — is not
+    /// read at all.
+    #[test]
+    fn a_run_too_long_to_scan_per_keystroke_is_not_remembered() {
+        let huge = format!(
+            "SELECT * FROM orders WHERE id = 1;\n{}",
+            "INSERT INTO t VALUES (1);\n".repeat(RECALL_MAX_BYTES / 20)
+        );
+        assert_eq!(hist("SELECT * FROM orders ", &[huge.as_str()]), None);
     }
 }
 
