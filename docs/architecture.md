@@ -11682,6 +11682,18 @@ existing prose was left alone.
     the document, because silently reformatting every line the user did not select is the worse of
     the two surprises. Both ends are asked through `pairs::region_at`, so the two halves of "is this
     code" stay one answer.
+    **What a Format writes over that range is `format_range`'s, not `format_sql`'s**, because
+    `format_sql` trims both ends and a selection's outer whitespace belongs to the document around
+    it: `select a from ` selected out of `select a from t` — where a Ctrl+Shift+→ selection ends,
+    after the space — came back ending in `from`, and the splice fused it with `t` into `fromt`. The
+    range's own leading and trailing whitespace is put back unless the range is the whole document,
+    which stays `format_sql`'s, trailing-newline rule and all
+    (`formatting_a_range_keeps_the_whitespace_around_it`). `caret_after_format` is where the caret
+    goes afterwards — a Format of the whole document used to leave it at the end — and it counts the
+    non-whitespace bytes before the caret and finds as many in the result, a caret in whitespace
+    landing straight after the token before it (`the_caret_keeps_its_place_through_a_format`). That
+    leans on this module's contract that only whitespace moves: a layout that ever changed a token's
+    text would put the caret somewhere else.
     **`tokenize` takes a numeric literal in one arm, ahead of the word arm, because two of a
     number's three parts are spelled in bytes that arm calls punctuation.** `1.5e-3` lexed as
     `["1", ".", "5e", "-", "3"]`; `need_space` suppresses the space around a `.`, but nothing said
@@ -11690,8 +11702,11 @@ existing prose was left alone.
     buffer. `1.5e` is not a number on any of the three engines: SQLite lexes it `TK_ILLEGAL`,
     PostgreSQL answers *trailing junk after numeric literal*, MySQL reads `1.5` and an identifier
     `e`. The arm takes only the shape all three lexers share and no more of it — a `.` only ahead of
-    a digit, and a sign only ahead of a digit *and* behind the `e` the word scan already swallowed —
-    so `select a-1` keeps its binary minus and `select 1 e` keeps its two tokens.
+    a digit or of an exponent, and a sign only ahead of a digit *and* behind the `e` the word scan
+    already swallowed — so `select a-1` keeps its binary minus and `select 1 e` keeps its two tokens.
+    The exponent half came later: `1.e-5` is a number on all four engines, and asking only for a
+    digit after the `.` wrote it back as `1.e - 5`
+    (`a_number_with_a_bare_point_before_its_exponent_is_one_token`).
     **Two more ways it broke a token's *text*, against its own contract that only whitespace and
     layout change.** It was a fourth caller of `skip_comment` and took the security gates' answer, so
     a `/*! … */` body became ordinary tokens and the closing `*/` fell out as two one-byte puncts
@@ -11714,7 +11729,15 @@ existing prose was left alone.
     layout state as a `;` does, the next batch starting after a blank line. `go_directive` answers
     `None` on every other dialect, so there `go` is still a word
     (`a_sql_server_go_line_survives_formatting`, which asserts the formatted script splits into the
-    original's statements, each formatted). **MySQL's `DELIMITER` line is the same kind of token**,
+    original's statements, each formatted). **The converse holds there too: a *name* `go` is never
+    left alone at the start of a line**, since on SQL Server that line is the directive.
+    `select a, go⏎from t` came out with `go` on a line of its own, splitting the script into two
+    broken batches, and a second Format read it as one, so formatting was not idempotent. On a
+    `batch_separator` dialect (`go_separates`) `run` cancels the break pending before a word `go`
+    that does not follow a `.`, keeping it on the line before; where a line comment forced that
+    break, `go` starts the line and `glue_next` pulls the token after it onto the same one
+    (`a_name_spelled_go_never_becomes_a_batch_separator`, which also formats its output again).
+    **MySQL's `DELIMITER` line is the same kind of token**,
     and was read as SQL: `DELIMITER $$` came out `DELIMITER $ $` joined to the `CREATE` after it,
     `END$$` and the `DELIMITER ;` line ran together, and `//` split into `/ /` — a script no client
     could split. `tokenize` asks `sql::delimiter_directive` (`pub(crate)` for this) only where a
@@ -11737,11 +11760,28 @@ existing prose was left alone.
     SQLite's `?1`, `$p` and `@p` came out `? 1`, `$ p` and `@ p`, and MySQL's `@x`, `@@version` and
     an account's host, `'u'@'h'`, came out `@ x`, `@ @ version` and `'u' @ 'h'` — each refused
     where the input ran (MySQL 8 and MariaDB 10.11 measured; `'u' @'h'` and `u @h`, the spaced forms
-    the fix still writes, both run). So `$` before a word byte is a prefix on all four (a dollar
-    *quote* is `skip_noncode`'s and taken first; MySQL's `$p` is a name, T-SQL's `$1.50` money and
-    `$action` `MERGE`'s), `?` before a digit on SQLite, and `@`/`@@` on MySQL and SQLite, MySQL's
-    also before a quote, so `@'q v'` is one `Kind::Quoted`. PostgreSQL's `@` is an operator and is
-    left alone (`a_native_parameter_or_variable_keeps_its_sigil`).
+    the fix still writes, both run — measured again on 2026-10-05, after an audit took them for
+    refused: the space *after* the `@` is the one MySQL 8 refuses). So `$` before a word byte is a
+    prefix on all four (a dollar *quote* is `skip_noncode`'s and taken first; MySQL's `$p` is a
+    name, T-SQL's `$1.50` money and `$action` `MERGE`'s), `?` before a digit on SQLite, and
+    `@`/`@@` on MySQL and SQLite, MySQL's also before a quote, so `@'q v'` is one `Kind::Quoted`.
+    PostgreSQL's `@` is an operator and is left alone
+    (`a_native_parameter_or_variable_keeps_its_sigil`).
+    **What the input had between two tokens** is read where the layout depends on it: the token
+    stream does not carry it, so `Fmt` holds `src` and `between` slices the gap out of it, every
+    token being a slice of `src`.
+    **Some words are laid out by what is around them rather than what they spell.** A word straight
+    after `.` is a plain name, never a clause head, a join or an `AND`/`OR` break: MySQL reads a
+    keyword as a name only when nothing separates it from the `.`, so `select t.order, p.left` came
+    out `t.⏎order` — `ORDER` the keyword again (`a_word_after_a_dot_is_laid_out_as_a_name`).
+    `LEFT`, `RIGHT`, `REPLACE` and `INSERT` with a `(` straight after them are calls, a plain word
+    with a tight `(` (`is_called_keyword`); laid out as the clause or join they also spell, these
+    everyday string functions broke the select list. None of those clauses is ever followed by `(`
+    (`a_keyword_called_as_a_function_stays_a_call`). And a `'…'` literal that
+    followed another across a newline in the input breaks to a new line again, through `between`:
+    on PostgreSQL `'foo'⏎'bar'` is one literal only because of the newline, and joined onto one line
+    it is a syntax error. Literals written on one line stay on one
+    (`string_literals_continued_across_a_line_stay_on_two_lines`).
   - `pairs.rs` — caret-driven, boundary-aware editor highlights + auto-close pairs (via
     `skip_noncode`): `auto_pair` (auto-close `()`/`''`/`""`/`` `` `` [MySQL] at code positions, wrap a
     selection, type-over a closer/quote already at the caret — respects string/comment regions and
@@ -32486,6 +32526,11 @@ Re-introducing the anti-patterns these guard against is a regression:
   invisible in review, because the line that "applies" the format looks exactly like the line that
   would work if the sync went both ways. It also meant two formatters, so the palette could drift
   from Ctrl+Alt+L; `format_req` reaches the same `editor_pane::format_editor`.
+  That function writes `sqlfmt::format_range`'s text, not `format_sql`'s — the `sqlfmt.rs` entry
+  has the `fromt` splice that cost — and returns without touching the caret when `edit_untyped`
+  refuses, where under the Ctrl+K preview's freeze it used to move the caret anyway. A formatted
+  selection stays selected, over its new extent; a formatted document keeps the caret among the
+  same tokens through `sqlfmt::caret_after_format`, where it used to jump to the end.
 
 ## Popup menus (`menu_panel`)
 

@@ -67,7 +67,7 @@ pub fn formattable_range(
 /// still whitespace to re-flow.
 pub fn format_sql(sql: &str, indent_unit: &str, dialect: SqlDialect) -> String {
     let toks = tokenize(sql, dialect);
-    let mut f = Fmt::new(indent_unit);
+    let mut f = Fmt::new(indent_unit, sql, dialect);
     f.run(&toks);
     let out = f.out.trim_end();
     if sql.ends_with('\n') {
@@ -75,6 +75,62 @@ pub fn format_sql(sql: &str, indent_unit: &str, dialect: SqlDialect) -> String {
     } else {
         out.to_string()
     }
+}
+
+/// The text Format Code writes over `full[lo..hi]` — [`format_sql`]'s, with
+/// the range's own leading and trailing whitespace put back unless the range
+/// is the whole document.
+///
+/// **That whitespace belongs to the document around the range.** `format_sql`
+/// trims both ends, which is right for a whole buffer and wrong for a
+/// selection: selecting `select a from ` out of `select a from t` — a
+/// Ctrl+Shift+→ selection ends after the space — wrote back a fragment ending
+/// in `from`, and the splice fused it with `t` into `fromt`.
+pub fn format_range(
+    full: &str,
+    lo: usize,
+    hi: usize,
+    indent_unit: &str,
+    dialect: SqlDialect,
+) -> String {
+    if lo == 0 && hi == full.len() {
+        return format_sql(full, indent_unit, dialect);
+    }
+    let frag = &full[lo..hi];
+    let body = frag.trim();
+    if body.is_empty() {
+        return frag.to_string();
+    }
+    let lead = &frag[..frag.len() - frag.trim_start().len()];
+    let trail = &frag[frag.trim_end().len()..];
+    format!("{lead}{}{trail}", format_sql(body, indent_unit, dialect))
+}
+
+/// Where a caret at `old_caret` in `old` belongs in `new`, the text
+/// [`format_sql`] made of it: after as many non-whitespace bytes as preceded
+/// it.
+///
+/// Formatting keeps every token's text and moves only the whitespace between
+/// tokens, so that count finds the same character on the other side. A caret
+/// in whitespace lands straight after the token before it.
+pub fn caret_after_format(old: &str, old_caret: usize, new: &str) -> usize {
+    let want = old.as_bytes()[..old_caret.min(old.len())]
+        .iter()
+        .filter(|c| !c.is_ascii_whitespace())
+        .count();
+    if want == 0 {
+        return 0;
+    }
+    let mut seen = 0;
+    for (i, c) in new.bytes().enumerate() {
+        if !c.is_ascii_whitespace() {
+            seen += 1;
+            if seen == want {
+                return i + 1;
+            }
+        }
+    }
+    new.len()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -370,7 +426,20 @@ fn tokenize(sql: &str, dialect: SqlDialect) -> Vec<(Kind, &str)> {
             while i < n && is_word_byte(b[i]) {
                 i += 1;
             }
-            if i < n && b[i] == b'.' && b.get(i + 1).is_some_and(u8::is_ascii_digit) {
+            // `.` ahead of a digit, or of the exponent a bare point may have
+            // (`1.e-5` is a number on all four).
+            let exponent_at = |k: usize| {
+                matches!(b.get(k), Some(b'e' | b'E'))
+                    && match b.get(k + 1) {
+                        Some(b'+' | b'-') => b.get(k + 2).is_some_and(u8::is_ascii_digit),
+                        Some(c) => c.is_ascii_digit(),
+                        None => false,
+                    }
+            };
+            if i < n
+                && b[i] == b'.'
+                && (b.get(i + 1).is_some_and(u8::is_ascii_digit) || exponent_at(i + 1))
+            {
                 i += 1;
                 while i < n && is_word_byte(b[i]) {
                     i += 1;
@@ -593,6 +662,16 @@ fn is_keyword(w: &str) -> bool {
         )
 }
 
+/// Is `w` a clause keyword that is also a function, so a `(` straight after it
+/// makes it a call — `LEFT(s, 3)`, `RIGHT(…)`, `REPLACE(…)` and MySQL's
+/// `INSERT(…)` — rather than the clause it also spells? None of those clauses
+/// is ever followed by `(` (`LEFT JOIN`, `REPLACE INTO`, `INSERT INTO`).
+fn is_called_keyword(w: &str) -> bool {
+    ["LEFT", "RIGHT", "REPLACE", "INSERT"]
+        .iter()
+        .any(|k| w.eq_ignore_ascii_case(k))
+}
+
 // Punctuation after which a `+`/`-` is unary (so the following number stays
 // tight: `= -1`, `(-1`), not a binary operator.
 fn unary_context(prev_punct: &str) -> bool {
@@ -647,11 +726,22 @@ struct Fmt<'a> {
     suppress_and: bool,
     /// Previous token was a unary sign → the next token is tight against it.
     tight_next: bool,
+    /// The text the tokens were cut from, for what lay between two of them.
+    src: &'a str,
+    /// A `GO` on a line of its own is a batch separator here
+    /// ([`SqlDialect::batch_separator`]), so a name spelled `go` must not be
+    /// left on one.
+    go_separates: bool,
+    /// A `go` name had to start its line: the next token stays on it.
+    glue_next: bool,
 }
 
 impl<'a> Fmt<'a> {
-    fn new(unit: &'a str) -> Self {
+    fn new(unit: &'a str, src: &'a str, dialect: SqlDialect) -> Self {
         Fmt {
+            src,
+            go_separates: dialect.batch_separator(),
+            glue_next: false,
             unit,
             out: String::new(),
             pending: None,
@@ -673,7 +763,20 @@ impl<'a> Fmt<'a> {
         self.pending = Some(level);
     }
 
+    /// The input between tokens `a` and `b`, both slices of `src` with `a`
+    /// first — whitespace only, since every other byte is some token's.
+    fn between(&self, a: &str, b: &str) -> &'a str {
+        let base = self.src.as_ptr() as usize;
+        let a_end = a.as_ptr() as usize - base + a.len();
+        let b_start = b.as_ptr() as usize - base;
+        self.src.get(a_end..b_start).unwrap_or("")
+    }
+
     fn emit(&mut self, kind: Kind, text: &str, tight_left: bool) {
+        if std::mem::take(&mut self.glue_next) {
+            self.pending = None;
+            self.blank = false;
+        }
         if let Some(level) = self.pending.take() {
             if !self.out.is_empty() {
                 self.out.push('\n');
@@ -743,8 +846,9 @@ impl<'a> Fmt<'a> {
             return false;
         }
         if cur_kind == Kind::Punct && cur == "(" {
-            // Function call `name(` / `)(` → tight; `KEYWORD (` → spaced.
-            if *pk == Kind::Word && !is_keyword(pt) {
+            // Function call `name(` / `)(` → tight; `KEYWORD (` → spaced —
+            // save a keyword that is also a function, whose `(` is a call's.
+            if *pk == Kind::Word && (!is_keyword(pt) || is_called_keyword(pt)) {
                 return false;
             }
             if *pk == Kind::Punct && pt == ")" {
@@ -770,6 +874,9 @@ impl<'a> Fmt<'a> {
         let mut k = 0;
         while k < toks.len() {
             let (kind, text) = toks[k];
+            // What the input had between this token and the one before it.
+            let prev_tok = k.checked_sub(1).map(|j| toks[j]);
+            let gap = prev_tok.map_or("", |(_, p)| self.between(p, text));
             match kind {
                 Kind::LineComment => {
                     self.emit(kind, text, false);
@@ -777,7 +884,19 @@ impl<'a> Fmt<'a> {
                     // new line at the current structural indent.
                     self.break_to(self.line_indent);
                 }
-                Kind::BlockComment | Kind::Quoted => {
+                Kind::BlockComment => {
+                    self.emit(kind, text, false);
+                }
+                Kind::Quoted => {
+                    // **A string continued on the next line stays there.**
+                    // PostgreSQL joins `'foo'⏎'bar'` into one literal only
+                    // because of the newline; on one line it is a syntax error.
+                    let continued = gap.contains('\n')
+                        && text.ends_with('\'')
+                        && prev_tok.is_some_and(|(pk, p)| pk == Kind::Quoted && p.ends_with('\''));
+                    if continued {
+                        self.break_to(self.line_indent);
+                    }
                     self.emit(kind, text, false);
                 }
                 Kind::Directive => {
@@ -805,7 +924,29 @@ impl<'a> Fmt<'a> {
                 Kind::Word => {
                     let up = text.to_ascii_uppercase();
                     let in_expr = self.in_expr_paren();
-                    if !in_expr && HEADS.contains(&up.as_str()) {
+                    // **A word after `.` is a name**: MySQL reads `t.order` as
+                    // a column only with nothing between the two, and laid out
+                    // as a clause it became `t.⏎order` — `ORDER` again.
+                    let after_dot = matches!(&self.prev, Some((Kind::Punct, p)) if p == ".");
+                    let called = is_called_keyword(&up)
+                        && matches!(toks.get(k + 1), Some((Kind::Punct, "(")));
+                    if self.go_separates && up == "GO" && !after_dot && self.pending.is_some() {
+                        // **Never alone on a line where `GO` separates
+                        // batches**, which a name `go` would be once its
+                        // neighbours broke around it. Kept on the line before
+                        // — or, where a line comment ends that one, with the
+                        // token after it on its own.
+                        if matches!(prev_tok, Some((Kind::LineComment, _))) {
+                            self.emit(Kind::Word, text, false);
+                            self.glue_next = true;
+                        } else {
+                            self.pending = None;
+                            self.blank = false;
+                            self.emit(Kind::Word, text, false);
+                        }
+                    } else if after_dot || called {
+                        self.emit(Kind::Word, text, false);
+                    } else if !in_expr && HEADS.contains(&up.as_str()) {
                         self.break_to(self.base);
                         self.emit(Kind::Word, text, false);
                         // Attach any followers on the same line.
@@ -1670,5 +1811,149 @@ mod tests {
             assert!(!out.contains(" $ "), "{d:?}: {out}");
             assert_preserves(sql, d);
         }
+    }
+
+    /// **A word after `.` is a name, never a clause.** `t.order` came out
+    /// `t.⏎order`, and MySQL reads a keyword as a name only straight after the
+    /// `.`: with a newline between them `order` is `ORDER` again, and the
+    /// statement a syntax error.
+    #[test]
+    fn a_word_after_a_dot_is_laid_out_as_a_name() {
+        let sql = "select t.order, p.left, t.set, x.values, y.and from t where t.from = 1";
+        for d in SqlDialect::ALL {
+            let out = super::format_sql(sql, IND, d);
+            for kept in [
+                "t.order",
+                "p.left",
+                "t.set",
+                "x.values",
+                "y.and",
+                "t.from = 1",
+            ] {
+                assert!(out.contains(kept), "{d:?}: {kept} split: {out}");
+            }
+            assert_preserves(sql, d);
+        }
+    }
+
+    /// **A clause keyword that is also a function is a call when `(` follows
+    /// it**: `LEFT(`, `RIGHT(`, `REPLACE(` and MySQL's `INSERT(` are everyday
+    /// string functions, and laid out as clauses they broke the select list.
+    #[test]
+    fn a_keyword_called_as_a_function_stays_a_call() {
+        assert_eq!(
+            format_sql(
+                "select left(name,3), replace(a,'x','y'), right(b, 2), insert(s, 1, 2, 'x') from t",
+                IND
+            ),
+            "select\n  left(name, 3),\n  replace(a, 'x', 'y'),\n  right(b, 2),\n  \
+             insert(s, 1, 2, 'x')\nfrom\n  t"
+        );
+        // The clauses they also spell are untouched.
+        assert_eq!(
+            format_sql("select * from a left join b on a.id = b.id", IND),
+            "select\n  *\nfrom\n  a\n  left join b on a.id = b.id"
+        );
+        assert_eq!(
+            format_sql("replace into t (a) values (1)", IND),
+            "replace into\n  t(a)\nvalues\n  (1)"
+        );
+    }
+
+    /// **`1.e-5` is one number**: a `.` with no digit after it but an exponent
+    /// is still the literal's, so the sign is not spaced as a binary minus.
+    #[test]
+    fn a_number_with_a_bare_point_before_its_exponent_is_one_token() {
+        for d in SqlDialect::ALL {
+            let sql = "select 1.e-5, 1.E+5, 2.e3 from t";
+            let out = super::format_sql(sql, IND, d);
+            for kept in ["1.e-5", "1.E+5", "2.e3"] {
+                assert!(out.contains(kept), "{d:?}: {kept} split: {out}");
+            }
+            assert_preserves(sql, d);
+        }
+    }
+
+    /// **A name `go` never lands alone on a line where `GO` is a directive.**
+    /// There it is the batch separator, so the formatted script split in two
+    /// broken batches — and a second Format Code read it as one.
+    #[test]
+    fn a_name_spelled_go_never_becomes_a_batch_separator() {
+        for sql in [
+            "select a, go\nfrom t",
+            "select a, go, b from t",
+            "select go from t",
+            "select a, -- c\n go from t",
+        ] {
+            let out = super::format_sql(sql, IND, SqlDialect::MsSql);
+            for line in out.lines() {
+                let line = line.trim_start();
+                assert!(
+                    crate::sql::go_directive(line, 0, SqlDialect::MsSql).is_none(),
+                    "{sql:?} → {out:?}"
+                );
+            }
+            assert_eq!(
+                super::format_sql(&out, IND, SqlDialect::MsSql),
+                out,
+                "{sql:?}"
+            );
+            assert_preserves(sql, SqlDialect::MsSql);
+        }
+    }
+
+    /// **Adjacent string literals keep the newline between them.** On
+    /// PostgreSQL `'foo'⏎'bar'` is one string, `'foobar'`, *only* because of
+    /// the newline; joined onto one line it is a syntax error. Literals written
+    /// on one line stay on one.
+    #[test]
+    fn string_literals_continued_across_a_line_stay_on_two_lines() {
+        let out = super::format_sql("select 'foo'\n'bar' from t", IND, SqlDialect::Postgres);
+        assert!(!out.contains("'foo' 'bar'"), "{out}");
+        assert!(out.contains("'foo'\n"), "{out}");
+        assert_eq!(super::format_sql(&out, IND, SqlDialect::Postgres), out);
+        let out = super::format_sql("select 'a' 'b' from t", IND, SqlDialect::MySql);
+        assert!(out.contains("'a' 'b'"), "{out}");
+    }
+
+    /// **A selection's outer whitespace is the document's, not the
+    /// fragment's.** Formatting `select a from ` out of `select a from t`
+    /// trimmed the trailing space, and the splice fused `from` with `t`.
+    #[test]
+    fn formatting_a_range_keeps_the_whitespace_around_it() {
+        let full = "select a from t";
+        let out = format_range(full, 0, 14, IND, SqlDialect::MySql);
+        assert!(out.ends_with(' '), "{out:?}");
+        let full = "select a from t where x=1";
+        let out = format_range(full, 15, full.len(), IND, SqlDialect::MySql);
+        assert!(out.starts_with(' '), "{out:?}");
+        assert_eq!(
+            format_range("a  \n ", 1, 5, IND, SqlDialect::MySql),
+            "  \n "
+        );
+        // The whole document is `format_sql`'s, trailing newline rule and all.
+        let full = "  select a from t\n\n";
+        assert_eq!(
+            format_range(full, 0, full.len(), IND, SqlDialect::MySql),
+            super::format_sql(full, IND, SqlDialect::MySql)
+        );
+    }
+
+    /// The caret keeps its place among the tokens: formatting moves only the
+    /// whitespace between them, so the count of non-blank bytes before it
+    /// finds the same spot in the result.
+    #[test]
+    fn the_caret_keeps_its_place_through_a_format() {
+        let old = "select a, b from t where x = 1";
+        let new = format_sql(old, IND);
+        let caret = old.find("rom").unwrap();
+        let at = caret_after_format(old, caret, &new);
+        assert_eq!(&new[at..at + 3], "rom");
+        assert_eq!(caret_after_format(old, 0, &new), 0);
+        assert_eq!(caret_after_format(old, old.len(), &new), new.len());
+        // In the whitespace after a token, it lands right after the token.
+        let caret = old.find(" from").unwrap();
+        let at = caret_after_format(old, caret, &new);
+        assert!(new[..at].ends_with('b'), "{:?}", &new[..at]);
     }
 }

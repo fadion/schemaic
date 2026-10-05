@@ -220,7 +220,9 @@ fn edit_untyped_frozen(ed: &Editor, comp: Completion, sel: Selection, text: &str
 /// "Format SQL"). Formats the current selection if there is one, else the whole
 /// document; indentation follows the editor's tab-width / soft-tabs settings and
 /// keyword case is preserved. Applied as one `edit_single` (a single undo step);
-/// a no-op when the text is already formatted.
+/// a no-op when the text is already formatted. A formatted selection stays
+/// selected; after the whole document, the caret keeps its place among the
+/// tokens; and a refused edit (the Ctrl+K preview's freeze) moves nothing.
 fn format_editor(ed: &Editor, comp: Completion, dialect: SqlDialect) {
     let doc = ed.doc();
     let full = doc.text().to_string();
@@ -238,19 +240,34 @@ fn format_editor(ed: &Editor, comp: Completion, dialect: SqlDialect) {
     } else {
         "\t".to_string()
     };
-    let formatted = schemaic_core::sqlfmt::format_sql(&full[start..end], &unit, dialect);
+    // `format_range`, not `format_sql`: a selection's outer whitespace is the
+    // document's, and trimmed it fused the fragment with its neighbours.
+    let formatted = schemaic_core::sqlfmt::format_range(&full, start, end, &unit, dialect);
     if formatted == full[start..end] {
         return;
     }
-    edit_untyped(
+    let caret = ed.cursor.get_untracked().offset();
+    let selected = a != b;
+    // A refused edit (the Ctrl+K preview's freeze) leaves the caret too.
+    if !edit_untyped(
         ed,
         comp,
         Selection::region(start, end),
         &formatted,
         EditType::Other,
-    );
-    let caret = start + formatted.len();
-    ed.cursor.update(|cc| cc.set_offset(caret, false, false));
+    ) {
+        return;
+    }
+    if selected {
+        // The selection, formatted: still selected.
+        let hi = start + formatted.len();
+        ed.cursor
+            .update(|cc| cc.set_insert(Selection::region(start, hi)));
+    } else {
+        // The whole document: the caret keeps its place among the tokens.
+        let at = schemaic_core::sqlfmt::caret_after_format(&full, caret, &formatted);
+        ed.cursor.update(|cc| cc.set_offset(at, false, false));
+    }
 }
 
 // The inline-AI suggestion is rendered *in the editor's line flow* by

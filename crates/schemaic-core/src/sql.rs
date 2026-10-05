@@ -135,7 +135,8 @@ impl SqlDialect {
     /// [`go_directive`] and [`BodyScan`].
     ///
     /// `pub(crate)` for `ddl::join_scripts`, which writes a `GO` between the
-    /// objects of a script. (`sqlfmt` asks [`go_directive`] instead.)
+    /// objects of a script, and for `sqlfmt`, which keeps a name `go` off a
+    /// line of its own (and asks [`go_directive`] for the directive itself).
     pub(crate) fn batch_separator(self) -> bool {
         matches!(self, SqlDialect::MsSql)
     }
