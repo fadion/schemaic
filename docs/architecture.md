@@ -407,7 +407,9 @@ existing prose was left alone.
     block nor before an `ELSE` — so the scope's start through the caret's statement runs, and the
     statements below it do not. The editor's statement for completion and the AI actions stays the
     whole piece, where the variable is declared. Ctrl+Enter opens the menu with that range outlined
-    whenever it has neighbours **or holds several statements** (`editor_pane::run_menu_wanted`), so a
+    whenever it has neighbours — code outside it, by `sql::holds_code`, so a comment beside a lone
+    statement is none and Ctrl+Enter just runs it (`statement_has_neighbours`) —
+    **or holds several statements** (`editor_pane::run_menu_wanted`), so a
     write above the caret is shown before it runs
     (`run_at_the_caret_stops_at_the_carets_statement_in_a_batch_scope`,
     `ctrl_enter_outlines_a_batch_scoped_piece_before_running_it`). The missing-`WHERE` guards lose nothing by the larger

@@ -158,6 +158,26 @@ impl SqlDialect {
     }
 }
 
+/// Does `text` hold anything but whitespace, punctuation and comments — a
+/// letter or digit outside a comment? What the editor asks of the text either
+/// side of a statement to decide whether it has a neighbour: a `-- note` above
+/// a lone `SELECT` is not another statement, and counting it opened the run
+/// menu over the only thing there was to run.
+pub fn holds_code(text: &str, dialect: SqlDialect) -> bool {
+    let b = text.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if let Some(j) = skip_comment(b, i, dialect) {
+            i = j.max(i + 1);
+        } else if b[i].is_ascii_alphanumeric() || b[i] >= 0x80 {
+            return true;
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
 /// If `b[i..]` starts a comment, return the index just past it. Handles `--`
 /// (whitespace after it required per [`SqlDialect::dash_comment_needs_space`]),
 /// `#` line comments (per [`SqlDialect::hash_line_comment`]), and `/* … */` block
@@ -5077,6 +5097,28 @@ const SECRET_CALLS: &[&str] = &[
     "DBLINK_CONNECT_U",
     "DBLINK_EXEC",
 ];
+
+#[cfg(test)]
+mod holds_code_tests {
+    use super::holds_code;
+    use crate::intel::SqlDialect;
+
+    /// Comments, whitespace and punctuation are not code, in each engine's
+    /// comment syntax; a word or a number is.
+    #[test]
+    fn only_a_word_outside_a_comment_is_code() {
+        for d in SqlDialect::ALL {
+            assert!(!holds_code("", d), "{d:?}");
+            assert!(!holds_code("  ;\n\n", d), "{d:?}");
+            assert!(!holds_code("-- fetch the users\n", d), "{d:?}");
+            assert!(!holds_code("/* note */ ;", d), "{d:?}");
+            assert!(holds_code("SELECT 2", d), "{d:?}");
+            assert!(holds_code("-- a\nSELECT 2", d), "{d:?}");
+        }
+        assert!(!holds_code("# note\n", SqlDialect::MySql));
+        assert!(holds_code("# note\n", SqlDialect::Postgres));
+    }
+}
 
 #[cfg(test)]
 mod ident_at_tests {

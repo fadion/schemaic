@@ -1990,8 +1990,8 @@ fn span_box(content_x: f64, ed: &Editor, lo: usize, hi: usize) -> Option<(f64, f
 // SVG markup — so it calls `underline_seg_at` from inside a memo instead. See
 // `syntax_view`.)
 
-/// Is `[lo, hi]` **one of several** statements — i.e. is there any alphanumeric
-/// content outside it?
+/// Is `[lo, hi]` **one of several** statements — i.e. is there any code outside
+/// it ([`schemaic_core::sql::holds_code`])?
 ///
 /// The question two features share: the picked-statement highlight (a lone
 /// query needs none, per the spec) and the Ctrl+Enter run menu (a lone query
@@ -2001,16 +2001,25 @@ fn span_box(content_x: f64, ed: &Editor, lo: usize, hi: usize) -> Option<(f64, f
 /// statement the editor has not outlined, or outlines one it then runs without
 /// asking.
 ///
-/// Alphanumeric rather than "non-whitespace" on purpose: a trailing `;`, a
-/// comment's punctuation and stray blank lines are not another statement.
-fn statement_has_neighbours(sql: &str, lo: usize, hi: usize) -> bool {
-    sql[..lo].chars().any(|c| c.is_alphanumeric()) || sql[hi..].chars().any(|c| c.is_alphanumeric())
+/// Letters outside comments rather than "non-whitespace" on purpose: a trailing
+/// `;`, stray blank lines and a comment — `-- fetch the users` above a lone
+/// `SELECT` — are not another statement. A comment used to count, and opened
+/// the run menu over the only statement there was.
+fn statement_has_neighbours(sql: &str, lo: usize, hi: usize, dialect: SqlDialect) -> bool {
+    use schemaic_core::sql::holds_code;
+    holds_code(&sql[..lo], dialect) || holds_code(&sql[hi..], dialect)
 }
 
 /// Set the picked-statement highlight to `[lo, hi]` — but only when it's ONE OF
 /// SEVERAL statements (a lone query needs no highlight, per the spec).
-fn highlight_pick(sql: &str, lo: usize, hi: usize, highlight: RwSignal<Option<(usize, usize)>>) {
-    highlight.set(statement_has_neighbours(sql, lo, hi).then_some((lo, hi)));
+fn highlight_pick(
+    sql: &str,
+    lo: usize,
+    hi: usize,
+    dialect: SqlDialect,
+    highlight: RwSignal<Option<(usize, usize)>>,
+) {
+    highlight.set(statement_has_neighbours(sql, lo, hi, dialect).then_some((lo, hi)));
 }
 
 /// Does Ctrl+Enter on `[lo, hi]` — [`schemaic_core::sql::run_current_range`]'s
@@ -2023,7 +2032,7 @@ fn highlight_pick(sql: &str, lo: usize, hi: usize, highlight: RwSignal<Option<(u
 /// with nothing outlined. The menu and the outline answer this one question,
 /// as [`statement_has_neighbours`]' doc says they must.
 fn run_menu_wanted(sql: &str, lo: usize, hi: usize, dialect: SqlDialect) -> bool {
-    statement_has_neighbours(sql, lo, hi)
+    statement_has_neighbours(sql, lo, hi, dialect)
         || schemaic_core::sql::holds_several_statements(&sql[lo..hi], dialect)
 }
 
@@ -3627,7 +3636,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             crate::reveal_ai_panel(right_panel);
             (ai_send)(p);
             if let Some((lo, hi)) = range {
-                highlight_pick(&sql, lo, hi, highlight);
+                highlight_pick(&sql, lo, hi, dialect.get_untracked(), highlight);
             }
         })
     };
@@ -3748,7 +3757,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                         if let Some(stmt) = sql.get(lo..hi).filter(|s| !s.is_empty()) {
                             reveal_ai_panel(right_panel);
                             (ai_explain)(format!("Explain this SQL query:\n```sql\n{stmt}\n```"));
-                            highlight_pick(&sql, lo, hi, highlight);
+                            highlight_pick(&sql, lo, hi, dialect.get_untracked(), highlight);
                         }
                     },
                 ),
@@ -3830,7 +3839,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                         let stmt = params::substitute(stmt, &tab_params.get_untracked(), dia)
                             .unwrap_or_else(|_| stmt.to_string());
                         (show_plan)(stmt);
-                        highlight_pick(&sql, lo, hi, highlight);
+                        highlight_pick(&sql, lo, hi, dialect.get_untracked(), highlight);
                     }
                 }),
                 MenuEntry::action("Format", move || {
@@ -7134,24 +7143,35 @@ mod geometry_tests {
     #[test]
     fn a_lone_statement_has_no_neighbours_however_it_is_punctuated() {
         // The whole buffer is the statement.
+        let my = SqlDialect::MySql;
         let sql = "SELECT 1";
-        assert!(!statement_has_neighbours(sql, 0, sql.len()));
+        assert!(!statement_has_neighbours(sql, 0, sql.len(), my));
         // Whitespace, a terminator and blank lines are not another statement —
-        // which is why the test is alphanumeric and not "non-whitespace".
+        // which is why the test is for code and not "non-whitespace".
         let sql = "\n\n  SELECT 1;  \n\n";
         let (lo, hi) = (4, 12);
         assert_eq!(&sql[lo..hi], "SELECT 1");
-        assert!(!statement_has_neighbours(sql, lo, hi));
+        assert!(!statement_has_neighbours(sql, lo, hi, my));
 
         // A real neighbour, on either side.
         let sql = "SELECT 1; SELECT 2";
-        assert!(statement_has_neighbours(sql, 0, 9), "one follows");
-        assert!(statement_has_neighbours(sql, 10, sql.len()), "one precedes");
+        assert!(statement_has_neighbours(sql, 0, 9, my), "one follows");
+        assert!(
+            statement_has_neighbours(sql, 10, sql.len(), my),
+            "one precedes"
+        );
 
-        // A *comment* beside it is alphanumeric, so it counts as a neighbour —
-        // recorded because it is a real consequence of the rule and not an
-        // accident: the editor outlines the statement, and the menu opens.
-        assert!(statement_has_neighbours("-- note\nSELECT 1", 8, 16));
+        // A *comment* beside it is not another statement either: Ctrl+Enter
+        // on a commented lone `SELECT` just runs it, with nothing outlined.
+        assert!(!statement_has_neighbours("-- note\nSELECT 1", 8, 16, my));
+        assert!(!statement_has_neighbours("SELECT 1 /* done */", 0, 8, my));
+        assert!(!run_menu_wanted("-- note\nSELECT 1", 8, 16, my));
+        assert!(statement_has_neighbours(
+            "-- note\nSELECT 1;\nSELECT 2",
+            8,
+            16,
+            my
+        ));
     }
 
     /// **Ctrl+Enter shows what it is about to run whenever that is more than
