@@ -2647,12 +2647,11 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     let at = caret + word.len();
                     e.cursor.update(|c| c.set_offset(at, false, false));
                     if !rest.is_empty() {
-                        let doc_len = e.doc().text().len();
                         let kept = crate::completion::ghost_at(
                             e,
                             at,
                             rest.to_string(),
-                            Some(doc_len),
+                            true,
                             g.remembered,
                         );
                         inline_diff::set_ghost(comp.ghost, e, Some(kept));
@@ -3293,17 +3292,34 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     // spot — so it goes, and Tab goes back to indenting. An edit moves the caret
     // too; the recompute that edit schedules asks again for the new spot. A
     // second caret counts as a move: `lone_caret` answers for one alone.
+    //
+    // **Except a move that typed the ghost's own next letters**
+    // (`completion::typed_through`): the rest is shifted to the new caret as a
+    // kept ghost, so it stays while what is typed is what it says, and the
+    // recompute keeps it rather than predicting afresh mid-word.
     {
         let ed_ghost = ed.clone();
         create_effect(move |_| {
             let cur = ed_ghost.cursor.get();
-            let stale = comp.ghost.with_untracked(|g| {
-                g.as_ref()
-                    .is_some_and(|g| crate::completion::lone_caret(&cur) != Some(g.offset))
-            });
-            if stale {
-                inline_diff::set_ghost(comp.ghost, &ed_ghost, None);
+            let Some(g) = comp.ghost.get_untracked() else {
+                return;
+            };
+            let caret = crate::completion::lone_caret(&cur);
+            if caret == Some(g.offset) {
+                return;
             }
+            let rope = ed_ghost.doc().text();
+            let shifted = caret
+                .filter(|&c| c > g.offset && c <= rope.len())
+                .and_then(|c| {
+                    let typed = rope.slice_to_cow(g.offset..c);
+                    crate::completion::typed_through(&g, c, rope.len(), &typed)
+                        .map(|rest| (c, rest.to_string()))
+                })
+                .map(|(c, rest)| {
+                    crate::completion::ghost_at(&ed_ghost, c, rest, true, g.remembered)
+                });
+            inline_diff::set_ghost(comp.ghost, &ed_ghost, shifted);
         });
     }
 

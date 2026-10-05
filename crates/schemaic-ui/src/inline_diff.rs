@@ -207,12 +207,17 @@ pub struct EditorGhost {
     /// Byte column of `offset` within `line`.
     pub col: usize,
     pub text: String,
-    /// The rest of a prediction whose first words were taken one at a time
-    /// (Ctrl+→), with the document's length once they were: the next
-    /// recompute keeps it as it is rather than predicting afresh at the caret,
-    /// where the words already taken may predict nothing — while the document
-    /// is still that length (`completion::keeps_ghost`).
-    pub kept: Option<usize>,
+    /// The document's length when the ghost was published — what tells an
+    /// edit that only typed into it (`completion::typed_through`) from one
+    /// that changed what it was predicted for.
+    pub doc_len: usize,
+    /// The rest of a prediction whose first part was taken (Ctrl+→) or typed
+    /// (`completion::typed_through`): the next recompute keeps it as it is
+    /// rather than predicting afresh at the caret, where what was taken may
+    /// predict nothing — while the caret and [`EditorGhost::doc_len`] still
+    /// stand (`completion::keeps_ghost`). A kept ghost holds the caret against
+    /// the list, being the offer the user is following.
+    pub kept: bool,
     /// Remembered from a statement run before (`intel::predict_from_history`)
     /// rather than reasoned (`intel::predict`). A remembered ghost does not
     /// take the empty word's place: the list that opens there still opens,

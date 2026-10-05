@@ -22572,18 +22572,32 @@ existing prose was left alone.
     meant to indent again, inserted, dropping the selection (`a_ghost_sits_only_at_a_lone_caret`,
     red before). `lone_caret` is also what both keys and the clearing effect read (under
     `editor_pane.rs`), so the three cannot disagree about which caret a ghost belongs to.
-    **The rest of a prediction taken a word at a time is kept, not asked for again**: a ghost
-    `keeps_ghost` accepts is published as it stands, ahead of `prediction_at`, because
-    asked at the new caret the words already taken often predict nothing — after
-    `JOIN customers ` there is no alias, so no `ON` ghost. **It asks for the caret *and* the
-    document's length** Ctrl+→ left (`kept == Some(doc_len) && offset == caret`): the offset alone
-    let a stale rest survive an edit that moves no caret — a forward Delete at the caret changes
-    what follows it — where now that edit asks afresh (`kept_ghost_tests`;
+    **The rest of a prediction taken a word at a time, or typed into, is kept, not asked for
+    again**: a ghost `keeps_ghost` accepts is published as it stands, ahead of `prediction_at`,
+    because asked at the new caret the words already taken often predict nothing — after
+    `JOIN customers ` there is no alias, so no `ON` ghost — and mid-word nothing is asked at all,
+    `intel::predict` and `predict_from_history` both refusing a caret without whitespace or `(`
+    before it. **It asks for the caret *and* the document's length** the rest was published at
+    (`kept && doc_len == len && offset == caret`): the offset alone let a stale rest survive an
+    edit that moves no caret — a forward Delete at the caret changes what follows it — where now
+    that edit asks afresh (`kept_ghost_tests`;
     `a_kept_rest_is_dropped_once_the_text_or_the_caret_changes` was red against the offset-only
-    rule). A forced recompute still shows none, and
-    any caret move still clears it (under `editor_pane.rs`). `ghost_at` is the one place an
-    `EditorGhost` is built, with its line and column, for `prediction_at` and that key alike; the
-    rest Ctrl+→ keeps carries on the `remembered` flag of the ghost it was cut from.
+    rule). A forced recompute still shows none, and any caret move still clears it — unless the
+    move typed the ghost's own next letters (under `editor_pane.rs`). `ghost_at` is the one place
+    an `EditorGhost` is built, with its line and column and the rope's length as `doc_len`, for
+    `prediction_at`, that key and the clearing effect alike; a kept rest carries on the
+    `remembered` flag of the ghost it was cut from.
+    **Typing into a ghost leaves the rest of it** (`typed_through`) — the fish shell's and the code
+    editors' rule. A ghost used to vanish at the first letter, the caret no longer being at its
+    offset and neither predictor answering mid-word, and came back only after the next space.
+    `typed_through(g, caret, doc_len, typed)` answers the rest only when the edit was exactly the
+    ghost's next characters typed at it: the caret ahead of `g.offset` by k > 0 bytes, the document
+    grown by exactly k since the ghost was published, the text between equal to `g.text[..k]`, and
+    something left over. **The comparison is exact, case included** — Tab would write the ghost's
+    own text, so a `b` typed at a `BY ` ghost is not a step towards it — and a k that splits one of
+    the ghost's characters answers `None`, as does a caret that moved without the document growing
+    by as much (`typing_into_a_ghost_leaves_the_rest_of_it`, red against a stub returning `None`;
+    `anything_but_the_ghosts_own_letters_drops_it`).
     **Only a reasoned ghost takes the empty word's place** (`ghost_displaces_the_list`). With the
     word at the caret empty and an `intel::predict` ghost showing, the popup does not open: that is
     a slot the list opens on its own guesses — `auto_show`'s columns after
@@ -22596,8 +22610,13 @@ existing prose was left alone.
     the ranked list — the remembered ghost gives way instead (`give_way` clears it in the same
     recompute), so the caret still carries one offer, not two
     (`only_a_reasoned_ghost_displaces_the_list`, red against a stub of the old rule; where
-    `give_way` fires needs a live `Editor` and is not unit-tested). Ctrl+Space still brings the list,
-    join row included. `CompletionCtx::predictions` carries the `editor_predictions` setting into
+    `give_way` fires needs a live `Editor` and is not unit-tested).
+    **A kept ghost displaces the list at any word**, remembered or not: it is the offer being
+    followed, and typing into it is exactly what opens the list — `typed` is set and the word at
+    the caret is the letters just typed — so under the empty-word rule alone the list opened on
+    them and an open list owns Tab (`a_kept_ghost_displaces_the_list_at_any_word`, red against the
+    old rule). The displacement returns before either list is built, so a kept remembered ghost
+    never reaches `give_way` either. Ctrl+Space still brings the list, join row included. `CompletionCtx::predictions` carries the `editor_predictions` setting into
     the *asking*, for both kinds of ghost, and is read only there — it is not the switch on its
     own: a ghost already drawn when the setting goes off is cleared by an effect under
     `editor_pane.rs`, where before it stayed and Tab still took it until the next edit.
@@ -23129,8 +23148,17 @@ existing prose was left alone.
     moment `lone_caret` stops answering its offset — the caret leaves it, a selection appears or a
     second caret is added — so after a click elsewhere Tab indents again; an edit moves the caret
     too, and the recompute it schedules asks again for the new spot — or keeps the `kept` rest
-    Ctrl+→ left there (under `completion.rs`). It used to read `get_selection()`, which sees only
-    the first region, and so could not judge a cursor of several.
+    Ctrl+→ left there (under `completion.rs`). **Except a move that typed the ghost's own next
+    letters**: before clearing, the effect reads the rope between the ghost's offset and the new
+    caret and asks `completion::typed_through`, and where that answers it publishes the rest at
+    the new caret through `ghost_at` as a `kept` ghost, `remembered` carried on — which the
+    recompute the keystroke schedules then keeps (`keeps_ghost`) instead of asking mid-word, where
+    neither predictor answers. It fires on the cursor change and reads the document untracked, so
+    it counts on the rope already holding the typed text when the caret moves; were floem to move
+    the caret first, the length check in `typed_through` fails and the ghost is cleared — the
+    behaviour before, so that order fails safe rather than keeping a rest for the wrong text.
+    It used to read `get_selection()`, which sees only the first region, and so could not judge a
+    cursor of several.
     **Nor does a ghost outlive what it was made under**: a second effect, tracking `predictions`,
     `active_conn`, `active_db` and `dialect`, clears it whenever one of them changes. The setting
     was read untracked, and only when a ghost was asked for, so switching *Inline predictions* off
@@ -23228,10 +23256,12 @@ existing prose was left alone.
     **The editor's inline prediction is a second phantom on the same wrapper.** `EditorGhost`
     carries the caret `offset` it was made at and the `text`, plus that offset's `line` and byte
     `col`, so the per-line question floem asks on every relayout is a comparison rather than a walk
-    of the rope; and `kept`, which on the rest of a prediction Ctrl+→ has taken words of holds the
-    document's length once it did, so the next recompute keeps it rather than predicting afresh
-    while the caret and that length both stand (`keeps_ghost`, under `completion.rs`); and
-    `remembered`, set on a ghost `intel::predict_from_history` made rather than `intel::predict`,
+    of the rope; `doc_len`, the document's length when it was published, which is what tells an
+    edit that only typed into it from one that changed what it was predicted for (`typed_through`,
+    under `completion.rs`); and `kept`, set on the rest of a prediction whose first part Ctrl+→
+    took or the user typed, so the next recompute keeps it rather than predicting afresh while the
+    caret and that length both stand (`keeps_ghost`), and it holds the caret against the list at
+    any word (`ghost_displaces_the_list`, both under `completion.rs`); and `remembered`, set on a ghost `intel::predict_from_history` made rather than `intel::predict`,
     which does not take the empty word's place from the list and gives way where it opens
     (`ghost_displaces_the_list`, under `completion.rs`). It lives in a
     `GhostSignal` that `InlineDiffDoc::new` takes beside the preview.

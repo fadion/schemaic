@@ -717,7 +717,7 @@ fn prediction_at(
                 intel::predict_from_history(text, offset, ctx.dialect, past)
             })
         })?;
-    Some(ghost_at(ed, offset, guess, None, remembered))
+    Some(ghost_at(ed, offset, guess, false, remembered))
 }
 
 /// Which prediction to show: the one [`intel::predict`] reasons, else the one
@@ -750,16 +750,42 @@ fn recallable(
     e.conn_id == conn_id && e.outcome != schemaic_core::history::Outcome::Failed && same_db
 }
 
-/// Does `ghost` take the place of the list at an empty word (`prefix`)?
+/// Does `ghost` take the place of the list at the word being typed (`prefix`)?
 ///
-/// A reasoned one does: the list opens there only on its own guesses — after
-/// `WHERE`/`ON`/`BY`, the FK join row — and the ghost is the same kind of
-/// guess, made with more certainty. A remembered one does not: it is one past
-/// statement, and taking the empty word's place made the table list after
-/// `FROM ` and the columns after `WHERE ` stop opening once any such statement
-/// had run. That list opens, and the remembered ghost gives way to it.
+/// A reasoned one does at an empty word: the list opens there only on its own
+/// guesses — after `WHERE`/`ON`/`BY`, the FK join row — and the ghost is the
+/// same kind of guess, made with more certainty. A remembered one does not: it
+/// is one past statement, and taking the empty word's place made the table
+/// list after `FROM ` and the columns after `WHERE ` stop opening once any
+/// such statement had run. That list opens, and the remembered ghost gives way
+/// to it. A kept ghost does at any word, remembered or not: its first part was
+/// just taken or typed, so it is the offer the user is following, and a list
+/// opening on the letters typed into it would take Tab from it.
 fn ghost_displaces_the_list(ghost: Option<&crate::inline_diff::EditorGhost>, prefix: &str) -> bool {
-    prefix.is_empty() && ghost.is_some_and(|g| !g.remembered)
+    ghost.is_some_and(|g| g.kept || (prefix.is_empty() && !g.remembered))
+}
+
+/// The rest of `g` once the user has typed its first characters: `typed` is
+/// the document's text from the ghost's offset to the `caret`, now `doc_len`
+/// bytes long. `None` unless that edit was exactly those characters typed at
+/// the ghost — the caret ahead of it by as many bytes as the document grew,
+/// and the text there the ghost's own — or the ghost is used up.
+///
+/// The fish shell's and the code editors' rule: a suggestion stays while what
+/// is typed is what it says, rather than vanishing at the first letter and
+/// coming back after the next space.
+pub(crate) fn typed_through<'g>(
+    g: &'g crate::inline_diff::EditorGhost,
+    caret: usize,
+    doc_len: usize,
+    typed: &str,
+) -> Option<&'g str> {
+    let k = caret.checked_sub(g.offset).filter(|&k| k > 0)?;
+    if doc_len != g.doc_len + k || g.text.get(..k)? != typed {
+        return None;
+    }
+    let rest = &g.text[k..];
+    (!rest.is_empty()).then_some(rest)
 }
 
 /// The caret a ghost may sit at: the cursor's offset when it is one caret with
@@ -781,25 +807,25 @@ pub(crate) fn lone_caret(cursor: &floem::views::editor::core::cursor::Cursor) ->
 /// Is `g` the rest of a prediction to keep as it stands, at `caret` in a
 /// document of `doc_len` bytes?
 ///
-/// Only one Ctrl+→ left ([`EditorGhost::kept`]), at the caret it left, while
-/// the document is the length it left it: an edit that moves no caret — a
-/// forward Delete there — changes what follows the caret, and the rest is
-/// asked for afresh.
+/// Only one a Ctrl+→ or a typed letter left ([`EditorGhost::kept`]), at the
+/// caret it left, while the document is the length it left it: an edit that
+/// moves no caret — a forward Delete there — changes what follows the caret,
+/// and the rest is asked for afresh.
 ///
 /// [`EditorGhost::kept`]: crate::inline_diff::EditorGhost::kept
 fn keeps_ghost(g: &crate::inline_diff::EditorGhost, caret: usize, doc_len: usize) -> bool {
-    g.kept == Some(doc_len) && g.offset == caret
+    g.kept && g.doc_len == doc_len && g.offset == caret
 }
 
 /// A ghost of `text` at `offset`, with the line and column [`EditorGhost`]
-/// carries.
+/// carries and the document's length now.
 ///
 /// [`EditorGhost`]: crate::inline_diff::EditorGhost
 pub(crate) fn ghost_at(
     ed: &Editor,
     offset: usize,
     text: String,
-    kept: Option<usize>,
+    kept: bool,
     remembered: bool,
 ) -> crate::inline_diff::EditorGhost {
     let rope = ed.doc().text();
@@ -809,6 +835,7 @@ pub(crate) fn ghost_at(
         line,
         col: offset - rope.offset_of_line(line),
         text,
+        doc_len: rope.len(),
         kept,
         remembered,
     }
@@ -1514,18 +1541,55 @@ pub(crate) fn signature_popup(comp: Completion, viewport: RwSignal<Rect>) -> imp
 
 #[cfg(test)]
 mod kept_ghost_tests {
-    use super::keeps_ghost;
+    use super::{keeps_ghost, typed_through};
     use crate::inline_diff::EditorGhost;
 
+    /// A ghost at `offset`, kept at document length `kept` when that is given.
     fn ghost(offset: usize, kept: Option<usize>) -> EditorGhost {
         EditorGhost {
             offset,
             line: 0,
             col: offset,
             text: "ON o.id = c.id".to_string(),
-            kept,
+            doc_len: kept.unwrap_or(40),
+            kept: kept.is_some(),
             remembered: false,
         }
+    }
+
+    /// A fresh ghost of `text` at offset 20 in a 40-byte document.
+    fn fresh(text: &str) -> EditorGhost {
+        EditorGhost {
+            text: text.to_string(),
+            kept: false,
+            ..ghost(20, None)
+        }
+    }
+
+    /// Typing the ghost's next letters leaves the rest of it — however many
+    /// were typed at once, and a character outside ASCII whole.
+    #[test]
+    fn typing_into_a_ghost_leaves_the_rest_of_it() {
+        assert_eq!(typed_through(&fresh("BY "), 21, 41, "B"), Some("Y "));
+        assert_eq!(typed_through(&fresh("BY "), 22, 42, "BY"), Some(" "));
+        assert_eq!(
+            typed_through(&fresh("名前, x"), 23, 43, "名"),
+            Some("前, x")
+        );
+    }
+
+    /// A letter the ghost does not say (case counts: Tab would write the
+    /// ghost's own), a caret that moved without typing, a ghost typed to its
+    /// end, or a caret behind it leave nothing to keep.
+    #[test]
+    fn anything_but_the_ghosts_own_letters_drops_it() {
+        assert_eq!(typed_through(&fresh("BY "), 21, 41, "b"), None);
+        assert_eq!(typed_through(&fresh("BY "), 21, 41, "X"), None);
+        assert_eq!(typed_through(&fresh("BY "), 21, 40, "B"), None);
+        assert_eq!(typed_through(&fresh("BY "), 23, 43, "BY "), None);
+        assert_eq!(typed_through(&fresh("BY "), 20, 40, ""), None);
+        assert_eq!(typed_through(&fresh("BY "), 19, 39, ""), None);
+        assert_eq!(typed_through(&fresh("名前"), 21, 41, "\u{FFFD}"), None);
     }
 
     /// The recompute a Ctrl+→ schedules keeps the rest it left.
@@ -1638,8 +1702,24 @@ mod ghost_choice_tests {
             line: 0,
             col: 14,
             text: "orders WHERE id = 1".to_string(),
-            kept: None,
+            doc_len: 14,
+            kept: false,
             remembered,
+        }
+    }
+
+    /// A kept ghost — one being typed into or taken word by word — holds the
+    /// caret against the list at any word, remembered or not: a list opening
+    /// on the letters typed into it would take Tab from it.
+    #[test]
+    fn a_kept_ghost_displaces_the_list_at_any_word() {
+        for remembered in [false, true] {
+            let kept = EditorGhost {
+                kept: true,
+                ..ghost(remembered)
+            };
+            assert!(ghost_displaces_the_list(Some(&kept), "o"), "{remembered}");
+            assert!(ghost_displaces_the_list(Some(&kept), ""), "{remembered}");
         }
     }
 
