@@ -11875,7 +11875,10 @@ existing prose was left alone.
   - `pairs.rs` — caret-driven, boundary-aware editor highlights + auto-close pairs (via
     `skip_noncode`): `auto_pair` (auto-close `()`/`''`/`""`/`` `` `` [MySQL] at code positions, wrap a
     selection, type-over a closer/quote already at the caret — respects string/comment regions and
-    word-adjacency guards), `backspace_pair` (delete both halves of an empty pair), `match_paren` (the
+    word-adjacency guards), `backspace_pair` (delete both halves of an empty pair — one the lexer
+    agrees is one: a quote pair only where its first half opens a string or quoted name of exactly
+    those two bytes, a paren pair only in code, so `'it'|'s'` and `'f(|)'` lose one character,
+    `backspace_takes_only_an_empty_pair_the_lexer_agrees_is_one`), `match_paren` (the
     paren adjacent to the caret + its partner, ignoring parens in strings/comments),
     `identifier_occurrences` (every whole-word, ASCII-case-insensitive occurrence of the identifier
     under the caret — excludes keywords/numbers/strings, needs ≥2 to fire), and `region_at`

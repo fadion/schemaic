@@ -281,17 +281,48 @@ pub fn auto_pair(
 /// If the caret sits between an empty auto-inserted pair (`(|)`, `'|'`, `` `|` ``,
 /// `"|"`), return the byte range `[caret-1, caret+1]` so a Backspace deletes both
 /// halves. `None` otherwise (normal Backspace).
+///
+/// **Asked of the lexer, not just the two bytes.** A quote pair is an empty
+/// pair only when its first half opens a string (or quoted name) that is
+/// exactly those two bytes; a paren pair only when it is code. Between the
+/// halves of an escaped quote — `'it'|'s'` — the two bytes look the same, and
+/// Backspace took both, leaving `'its'`; inside a string `'f(|)'` it took a
+/// paren pair nobody had typed as one.
 pub fn backspace_pair(text: &str, caret: usize, dialect: SqlDialect) -> Option<(usize, usize)> {
     let b = text.as_bytes();
     if caret == 0 || caret >= b.len() {
         return None;
     }
-    let empty_pair = match (b[caret - 1], b[caret]) {
-        (b'(', b')') | (b'\'', b'\'') | (b'"', b'"') => true,
-        (b'`', b'`') => dialect.backtick_ident(),
-        _ => false,
+    let (quote, paren) = match (b[caret - 1], b[caret]) {
+        (b'(', b')') => (false, true),
+        (b'\'', b'\'') | (b'"', b'"') => (true, false),
+        (b'`', b'`') => (dialect.backtick_ident(), false),
+        _ => (false, false),
     };
+    let span = || noncode_span_at(b, caret - 1, dialect);
+    let empty_pair =
+        (quote && span() == Some((caret - 1, caret + 1))) || (paren && span().is_none());
     empty_pair.then_some((caret - 1, caret + 1))
+}
+
+/// The string, comment or quoted name holding byte `pos`, as `[start, end)` —
+/// read from the start through [`skip_noncode`], since only the text before a
+/// quote says whether it opens a string or closes one.
+fn noncode_span_at(b: &[u8], pos: usize, dialect: SqlDialect) -> Option<(usize, usize)> {
+    let mut i = 0;
+    while i <= pos {
+        match skip_noncode(b, i, dialect) {
+            Some(j) => {
+                let j = j.max(i + 1);
+                if pos < j {
+                    return Some((i, j));
+                }
+                i = j;
+            }
+            None => i += 1,
+        }
+    }
+    None
 }
 
 /// If the caret is adjacent to a parenthesis that isn't inside a string/comment,
@@ -667,6 +698,24 @@ mod tests {
         assert_eq!(backspace_pair("(x)", 1, MySql), None); // not empty
         // backtick pair not recognised under Postgres
         assert_eq!(backspace_pair("``", 1, Postgres), None);
+    }
+
+    /// Between an escaped quote's halves, or at a paren pair inside a string,
+    /// Backspace deletes one character; an empty pair after other code is
+    /// still taken whole.
+    #[test]
+    fn backspace_takes_only_an_empty_pair_the_lexer_agrees_is_one() {
+        for d in [MySql, Postgres, Sqlite] {
+            assert_eq!(backspace_pair("SELECT 'it''s'", 11, d), None, "{d:?}");
+            assert_eq!(backspace_pair("SELECT 'f()'", 10, d), None, "{d:?}");
+            assert_eq!(
+                backspace_pair("WHERE a = '' AND b = ''", 22, d),
+                Some((21, 23)),
+                "{d:?}"
+            );
+            assert_eq!(backspace_pair("SELECT f()", 9, d), Some((8, 10)), "{d:?}");
+        }
+        assert_eq!(backspace_pair("SELECT \"a\"\"b\"", 10, Postgres), None);
     }
 
     // --- match_paren -------------------------------------------------------
