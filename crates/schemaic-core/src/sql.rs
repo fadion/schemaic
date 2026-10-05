@@ -3039,6 +3039,29 @@ fn is_denied(word: &str, dialect: SqlDialect) -> bool {
     DENY_ANY_ENGINE.contains(&word) || deny_keywords_for(dialect).contains(&word)
 }
 
+/// Is `word`, as an unquoted name followed by an argument list, the builtin
+/// function of that name on `dialect` rather than the write it spells
+/// elsewhere? Issue #5: `SELECT REPLACE(name, 'a', 'b') FROM t` was refused
+/// as a write, on every engine, because `REPLACE` was denied wherever it stood.
+///
+/// **No statement these words begin is followed by a `(`** — `REPLACE [INTO]
+/// t`, `INSERT [INTO] t`, `TRUNCATE [TABLE] t` — so the statement spellings
+/// stay refused, including SQLite's `WITH … REPLACE INTO`, which a read head
+/// begins. What the builtin cannot be told from by its text is a user function
+/// of the same name, and that is the read-only session's to refuse
+/// (`Db::fetch_query_enforced`), as for any other function that writes.
+///
+/// Per dialect, because the builtins are: `INSERT(str, pos, len, new)` and
+/// `TRUNCATE(x, d)` are MySQL's alone, and `insert(` on any other engine
+/// stays refused.
+fn is_builtin_call(word: &str, dialect: SqlDialect) -> bool {
+    let builtins: &[&str] = match dialect {
+        SqlDialect::MySql => &["REPLACE", "INSERT", "TRUNCATE"],
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => &["REPLACE"],
+    };
+    builtins.contains(&word)
+}
+
 /// The functions a read-only query may call on `dialect`, or `None` where the
 /// engine's calls are answered by its deny list instead.
 ///
@@ -4382,6 +4405,19 @@ fn next_code_byte(b: &[u8], mut i: usize, dialect: SqlDialect) -> Option<u8> {
 /// content. The bool is set once a top-level `;` is followed by more real
 /// content (i.e. the input is multiple statements).
 fn word_tokens(sql: &str, dialect: SqlDialect) -> (Vec<String>, bool) {
+    let (words, multi) = called_word_tokens(sql, dialect);
+    (words.into_iter().map(|(w, _)| w).collect(), multi)
+}
+
+/// [`word_tokens`], with each word marked by whether it is an **unquoted** name
+/// an argument list follows — the one thing that tells `REPLACE(…)`, the
+/// function, from `REPLACE INTO`, the statement ([`is_builtin_call`]).
+///
+/// A quoted name before a `(` is a call too, but it is marked `false`: whether a
+/// quoted spelling reaches the builtin or a user function of that name differs
+/// by engine, the mark exists only to let a builtin through, and refusing what
+/// nobody needs to spell that way is the safe direction.
+fn called_word_tokens(sql: &str, dialect: SqlDialect) -> (Vec<(String, bool)>, bool) {
     let b = sql.as_bytes();
     let n = b.len();
     let mut i = 0;
@@ -4389,13 +4425,19 @@ fn word_tokens(sql: &str, dialect: SqlDialect) -> (Vec<String>, bool) {
     let mut word: Vec<u8> = Vec::new();
     let mut ended = false;
     let mut multi = false;
+    // `i` is the first byte past the word whenever this runs, so the gap
+    // `next_code_byte` steps over is the one between the name and its `(`.
     macro_rules! flush {
         () => {
             if !word.is_empty() {
                 if ended {
                     multi = true;
                 }
-                words.push(String::from_utf8_lossy(&std::mem::take(&mut word)).into_owned());
+                let called = next_code_byte(b, i, dialect) == Some(b'(');
+                words.push((
+                    String::from_utf8_lossy(&std::mem::take(&mut word)).into_owned(),
+                    called,
+                ));
             }
         };
     }
@@ -4426,7 +4468,7 @@ fn word_tokens(sql: &str, dialect: SqlDialect) -> (Vec<String>, bool) {
                 && next_code_byte(b, j, dialect) == Some(b'(')
                 && let (Some(name), _) = ident_at(sql, i, dialect)
             {
-                words.push(name.to_ascii_uppercase());
+                words.push((name.to_ascii_uppercase(), false));
             }
             i = j;
             continue;
@@ -4530,7 +4572,8 @@ pub struct ReadRefusal {
 /// only when nothing else in the statement is refused.
 pub fn read_only_refusal(sql: &str, dialect: SqlDialect) -> Result<(), ReadRefusal> {
     let refuse = |reason: String, writes: bool| Err(ReadRefusal { reason, writes });
-    let (words, multi) = word_tokens(sql, dialect);
+    let (marked, multi) = called_word_tokens(sql, dialect);
+    let (words, called): (Vec<String>, Vec<bool>) = marked.into_iter().unzip();
     if multi {
         return refuse("only a single statement is allowed".to_string(), false);
     }
@@ -4546,6 +4589,7 @@ pub fn read_only_refusal(sql: &str, dialect: SqlDialect) -> Result<(), ReadRefus
     }
     let denied: Vec<usize> = (0..words.len())
         .filter(|&k| is_denied(&words[k], dialect))
+        .filter(|&k| !(called[k] && is_builtin_call(&words[k], dialect)))
         .collect();
     if let Some(&k) = denied
         .iter()
@@ -4744,7 +4788,8 @@ const WRITE_KEYWORDS: &[&str] = &[
 /// user marked read-only is the correct direction.
 pub fn contains_write(sql: &str, dialect: SqlDialect) -> bool {
     for (lo, hi) in statement_ranges(sql, dialect) {
-        let (words, _) = word_tokens(&sql[lo..hi], dialect);
+        let (marked, _) = called_word_tokens(&sql[lo..hi], dialect);
+        let (words, called): (Vec<String>, Vec<bool>) = marked.into_iter().unzip();
         match words.first().map(|s| s.as_str()) {
             None => continue, // empty / comment-only statement
             Some(head) => {
@@ -4761,7 +4806,9 @@ pub fn contains_write(sql: &str, dialect: SqlDialect) -> bool {
                 ) {
                     return true;
                 }
-                if words.iter().any(|w| WRITE_KEYWORDS.contains(&w.as_str())) {
+                if words.iter().zip(&called).any(|(w, &c)| {
+                    WRITE_KEYWORDS.contains(&w.as_str()) && !(c && is_builtin_call(w, dialect))
+                }) {
                     return true;
                 }
                 if words
@@ -7283,6 +7330,55 @@ mod tests {
         // The backtick is not standard, so this one is deliberately not in the
         // sweep — see `the_gate_reads_this_engines_identifier_quoting`.
         assert!(read_only_reason("SELECT `update` FROM t").is_ok());
+    }
+
+    /// **A write keyword followed by an argument list is the builtin of that
+    /// name** — issue #5. `REPLACE` was denied wherever it stood, so `SELECT
+    /// REPLACE(name, 'a', 'b') FROM t` was refused as a write on every engine,
+    /// and refused again by the editor on a read-only connection; MySQL's
+    /// `INSERT(str, …)` and `TRUNCATE(x, d)` the same. No statement those words
+    /// begin is followed by a `(`, so the statement spellings stay refused.
+    #[test]
+    fn a_write_keyword_called_as_a_function_is_the_builtin() {
+        for d in EVERY_DIALECT {
+            for sql in [
+                "SELECT REPLACE(name, 'a', 'b') FROM t",
+                "select replace (name, 'a', 'b') from t",
+                "SELECT REPLACE/* gap */(name, 'a', 'b') FROM t",
+                "WITH c AS (SELECT REPLACE(name, 'a', 'b') AS n FROM t) SELECT n FROM c",
+            ] {
+                assert_eq!(super::read_only_reason(sql, d), Ok(()), "{d:?}: {sql}");
+                assert!(!super::contains_write(sql, d), "{d:?}: {sql}");
+            }
+        }
+        for sql in [
+            "SELECT INSERT('Quadratic', 3, 4, 'What')",
+            "SELECT TRUNCATE(1.223, 1)",
+        ] {
+            assert_eq!(read_only_reason(sql), Ok(()), "{sql}");
+            assert!(!contains_write(sql), "{sql}");
+        }
+    }
+
+    /// The other half of the rule: only the call is the builtin. A `REPLACE`
+    /// not followed by `(` is still the statement — SQLite takes one after a
+    /// `WITH`, which is a read head — and `INSERT(` is a builtin on MySQL alone.
+    #[test]
+    fn a_write_keyword_not_called_is_still_refused() {
+        let sqlite = SqlDialect::Sqlite;
+        for sql in [
+            "WITH c AS (SELECT 1 AS a) REPLACE INTO t SELECT a FROM c",
+            "WITH c AS (SELECT 1 AS a) INSERT OR REPLACE INTO t SELECT a FROM c",
+        ] {
+            assert!(super::read_only_reason(sql, sqlite).is_err(), "{sql}");
+            assert!(super::contains_write(sql, sqlite), "{sql}");
+        }
+        assert!(read_only_reason("SELECT 1 FROM t WHERE replace = 1").is_err());
+        for d in [SqlDialect::Postgres, SqlDialect::Sqlite, SqlDialect::MsSql] {
+            let sql = "SELECT insert(a) FROM t";
+            assert!(super::read_only_reason(sql, d).is_err(), "{d:?}");
+            assert!(super::contains_write(sql, d), "{d:?}");
+        }
     }
 
     /// **A locking read is refused as a lock, not as a write.** `SELECT … FOR

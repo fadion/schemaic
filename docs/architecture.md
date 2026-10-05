@@ -540,6 +540,25 @@ existing prose was left alone.
     string or a quoted identifier — code rather than a gap — stops the scan. The repair is inside
     `word_tokens`, so `contains_write`'s read-only gate, which had the identical door, closed with
     it.
+    **A write keyword followed by an argument list is the builtin of that name** (`is_builtin_call`,
+    GitHub issue #5). `REPLACE` is denied for MySQL's `REPLACE INTO`, and was matched wherever it
+    stood, so `SELECT REPLACE(name, 'a', 'b') FROM t` was refused as a write on every engine — by this
+    gate, and through `WRITE_KEYWORDS` by `contains_write` on a read-only connection's editor — and
+    MySQL's `INSERT(str, pos, len, new)` and `TRUNCATE(x, d)` with it. `called_word_tokens`, which
+    `word_tokens` now wraps, marks each word with whether it is an **unquoted** name a `(` follows,
+    the gap asked through `next_code_byte` as above; both scans skip a word that is called and is a
+    builtin on that dialect — `REPLACE` on every engine, `INSERT` and `TRUNCATE` on MySQL/MariaDB
+    alone, so `insert(a)` stays refused elsewhere. It rests on one fact of the grammar: no statement
+    those words begin is followed by a `(`, so `REPLACE INTO`, `INSERT OR REPLACE` and SQLite's
+    `WITH … REPLACE INTO`, which a read head begins, stay refused
+    (`a_write_keyword_called_as_a_function_is_the_builtin`,
+    `a_write_keyword_not_called_is_still_refused`). A quoted name before a `(` is marked *not*
+    called, on purpose: whether a quoted spelling reaches the builtin or a user function differs by
+    engine, the mark exists only to let a builtin through, and refusing what nobody needs to spell
+    that way is the safe direction. What the text cannot tell from the builtin is an owner's
+    function of the same name, and that is `Enforce::ReadOnly`'s to refuse, as for any function that
+    writes. PostgreSQL's and SQL Server's call allowlists already listed `replace`, so they needed
+    no change.
     **A read-only session does not refuse a write that is not transactional, so on PostgreSQL the
     text gate has to judge functions.** Replication slots and origins, statistics resets, WAL
     switches, restore points, backup markers, `pg_promote` and WAL-replay pause never call
@@ -663,9 +682,10 @@ existing prose was left alone.
     retired entry is refused now, bare and quoted, because that list was the record of what had been
     found to act. A name the allowlist lacks costs a refusal, never a write.
     **The known over-blocks are all in the safe direction**: a table alias with a column list but no
-    `AS` after an unquoted table name (`FROM t x(a, b)`; after a quoted one it passes), a composite
-    field read through parentheses (`(x).key`), and `replace(…)` — which predates the allowlist and
-    is listed on it, because `REPLACE` is in `DENY_ANY_ENGINE` for MySQL's `REPLACE INTO`. **What the
+    `AS` after an unquoted table name (`FROM t x(a, b)`; after a quoted one it passes), and a
+    composite field read through parentheses (`(x).key`). `replace(…)` was a third — listed on the
+    allowlist and refused anyway by `DENY_ANY_ENGINE`'s `REPLACE` — until a called builtin stopped
+    being a denied word (`is_builtin_call`, above). **What the
     text cannot see rests on `Enforce::ReadOnly`**: a view's body, a trigger, an operator's function,
     the whole-row `alias.f` form, which reaches only a function taking a row or `any` — in
     `pg_catalog` all formatters (`row_to_json`, `to_json`, `pg_typeof`, measured through `pg_proc`)
