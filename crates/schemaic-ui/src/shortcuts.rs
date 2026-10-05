@@ -91,6 +91,7 @@ pub(crate) const SHORTCUTS: &[ShortcutGroup] = &[
             // Ctrl+H — this modal is its only affordance.
             ("Ctrl+H", "Find and replace"),
             ("Ctrl+G", "Go to line"),
+            ("Ctrl+Shift+\\", "Jump to the matching bracket"),
             ("Ctrl+/", "Toggle line comment"),
             ("Ctrl+D", "Duplicate line / selection"),
             ("Ctrl+X", "Delete line"),

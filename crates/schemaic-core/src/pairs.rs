@@ -325,6 +325,15 @@ fn noncode_span_at(b: &[u8], pos: usize, dialect: SqlDialect) -> Option<(usize, 
     None
 }
 
+/// Where Ctrl+Shift+\ puts the caret: on the same side of the matching paren
+/// as it was of the one beside it — before `(` goes before its `)`, after `)`
+/// goes after its `(` — so a second press comes back. `None` with no code paren
+/// beside the caret, or none matching ([`match_paren`]).
+pub fn bracket_jump(text: &str, caret: usize, dialect: SqlDialect) -> Option<usize> {
+    let (here, partner) = match_paren(text, caret, dialect)?;
+    Some(if here == caret { partner } else { partner + 1 })
+}
+
 /// If the caret is adjacent to a parenthesis that isn't inside a string/comment,
 /// return `(here, partner)` — the byte offset of that paren and of its match.
 /// Prefers the paren to the *right* of the caret, else the one to the *left*.
@@ -716,6 +725,23 @@ mod tests {
             assert_eq!(backspace_pair("SELECT f()", 9, d), Some((8, 10)), "{d:?}");
         }
         assert_eq!(backspace_pair("SELECT \"a\"\"b\"", 10, Postgres), None);
+    }
+
+    // --- bracket_jump ------------------------------------------------------
+
+    /// The caret lands on the same side of the partner as it was of the paren
+    /// beside it, so a second press returns; no code paren, no jump.
+    #[test]
+    fn a_bracket_jump_lands_beside_the_partner_and_comes_back() {
+        let sql = "SELECT f(a, (b)) FROM t";
+        // Before the outer `(` (8) → before its `)` (15) → back.
+        assert_eq!(bracket_jump(sql, 8, MySql), Some(15));
+        assert_eq!(bracket_jump(sql, 15, MySql), Some(8));
+        // After the outer `)` (16) → after its `(` (9) → back after the `)`.
+        assert_eq!(bracket_jump(sql, 16, MySql), Some(9));
+        assert_eq!(bracket_jump(sql, 9, MySql), Some(16));
+        assert_eq!(bracket_jump(sql, 3, MySql), None);
+        assert_eq!(bracket_jump("SELECT '(' x", 7, MySql), None);
     }
 
     // --- match_paren -------------------------------------------------------

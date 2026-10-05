@@ -2966,6 +2966,24 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 return CommandExecuted::Yes;
             }
         }
+        // Ctrl+Shift+\ — jump to the matching bracket (VS Code's key), matched
+        // physically: Shift turns the `\` into `|` on a US layout.
+        if primary_held(mods) && mods.shift() && !mods.alt() {
+            use floem::keyboard::{KeyCode, PhysicalKey};
+            if matches!(
+                kp.key,
+                KeyInput::Keyboard(_, PhysicalKey::Code(KeyCode::Backslash))
+            ) {
+                editor_sig.with_untracked(|e| {
+                    let caret = e.cursor.get_untracked().offset();
+                    let text = e.doc().text().to_string();
+                    if let Some(to) = pairs::bracket_jump(&text, caret, dialect.get_untracked()) {
+                        e.cursor.update(|c| c.set_offset(to, false, false));
+                    }
+                });
+                return CommandExecuted::Yes;
+            }
+        }
         // Editor line operations (DataGrip-ish): Ctrl+/ toggle line comment,
         // Ctrl+D duplicate line/selection, Ctrl+X delete line. `--` is the SQL
         // comment token; Floem's built-in ToggleLineComment hardcodes an empty
