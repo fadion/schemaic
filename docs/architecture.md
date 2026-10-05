@@ -19223,6 +19223,23 @@ existing prose was left alone.
     on (see **No floem `Dropdown`** below). `themed_toggle` is the un-ringed builder beneath, and
     is **private** on purpose: a control nobody can Tab to is one left out of the modal's keyboard
     order by accident.
+    **Its one caller outside the ring is a switch nobody can flip either.**
+    `focusable_toggle_row_when(title, hint, sig, enabled, ring, tabindex)` is the row for a setting
+    that refines another and does nothing without it — today only Editor's *Predictions from past
+    statements*, under *Inline predictions* (`completion::prediction_at` returns before `recall` is
+    asked when predictions are off). While `enabled` is false the row is **greyed out**: its title
+    dims to `theme::text_dim`, and its switch is `themed_toggle(sig, true)`, *inert* —
+    floem-`disabled`, which drops its pointer events and, through floem's `AppState::can_focus`,
+    keeps floem's own Tab walk off it as well; an `on_toggle` that ignores the flip besides; no hover
+    change; and its own colours at `INERT_TOGGLE_ALPHA` (0.4, through `multiply_alpha`, floem 0.2
+    having no `opacity` — see *Floem 0.2 gotchas*), so its value still reads, faintly. It is **out
+    of the ring** while greyed, the way a disabled `widgets::in_ring_button` is, and back in when
+    `enabled` returns. A ring control registers when it is built, so that takes a rebuild: the
+    switch sits in a `dyn_container` on `enabled`, as Install and Remove do below. **The value is
+    kept either way** — greying says whether the switch can do anything, not what it holds. So the
+    privacy rule stands, read as a rule about *live* switches: there is still none you can flip and
+    cannot Tab to. `focusable_toggle_row` and the greyed row share `toggle_row_layout`. Which branch
+    is built is one `enabled.get()` in the view, and nothing tests it.
     **Off `whole_ui_gate`'s list, 4 to zero, and it is `connection_import.rs`'s sweep a second
     time** — the module was narrow already and only had to say so, each of its four modals (the
     three settings ones and Shortcuts) owning one domain and reading nothing else:
@@ -22618,7 +22635,11 @@ existing prose was left alone.
     `remembered_predictions_default_on_and_keep_an_off`), carried as
     `LayoutUi::editor_remembered_predictions`, `QueryPaneParams::remembered_predictions` and
     `CompletionCtx::remembered`; `recall` answers nothing when it is off. Off keeps past statements
-    off the screen — a screen share's among them — while the reasoned ghost stays.
+    off the screen — a screen share's among them — while the reasoned ghost stays. Its *value* is
+    independent; its *switch* is not: with *Inline predictions* off, `prediction_at` returns before
+    `recall` is asked, so the row is greyed out and leaves the Tab ring until predictions are back
+    on, keeping whatever it held (`settings::focusable_toggle_row_when`, under `settings.rs`; a view
+    decision, untested).
     **Which of the two answers, and whether it is shown at all, is `pick_prediction`'s** — the
     reasoned one, else the remembered one, flagged as such — and **neither when it holds a line
     break**. `InlineDiffDoc::ghost_on` never drew one, but it was published all the same, so Tab

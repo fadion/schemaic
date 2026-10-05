@@ -202,16 +202,64 @@ fn shell_dropdown(
 /// — whose switch is in a modal's Tab order and can be flipped with Space (or
 /// Enter, which floem's own switch answers; see [`focusable_toggle`]).
 ///
-/// There is no un-focusable variant, and [`themed_toggle`] is private so there
-/// can't be: a switch nobody can Tab to is a control left out of the modal's
-/// keyboard order by accident, and the two modals that had one — Query plan and
-/// Live monitor — now carry rings of their own.
+/// There is no un-focusable *live* variant, and [`themed_toggle`] is private so
+/// there can't be: a switch nobody can Tab to is a control left out of the
+/// modal's keyboard order by accident, and the two modals that had one — Query
+/// plan and Live monitor — now carry rings of their own. The one switch outside
+/// the ring is [`focusable_toggle_row_when`]'s greyed one, which nobody can flip
+/// either.
 pub(crate) fn focusable_toggle_row(
     title: &'static str,
     hint: &'static str,
     sig: RwSignal<bool>,
     ring: crate::widgets::FocusRing,
     tabindex: u32,
+) -> impl IntoView {
+    toggle_row_layout(
+        title,
+        hint,
+        theme::text,
+        focusable_toggle(sig, ring, tabindex),
+    )
+}
+
+/// A [`focusable_toggle_row`] that only means something while `enabled` holds
+/// — a setting that refines another, like *Predictions from past statements*
+/// under *Inline predictions*. While it does not, the row is **greyed out**:
+/// its title dims, and its switch, still showing its value faintly, is inert
+/// to the pointer and **out of the Tab order**, the way a disabled
+/// [`crate::widgets::in_ring_button`] is. The switch is rebuilt on `enabled`,
+/// as Settings' Install and Remove buttons are, so the ring gains and loses
+/// it with the state. Its value is kept either way.
+pub(crate) fn focusable_toggle_row_when(
+    title: &'static str,
+    hint: &'static str,
+    sig: RwSignal<bool>,
+    enabled: RwSignal<bool>,
+    ring: crate::widgets::FocusRing,
+    tabindex: u32,
+) -> impl IntoView {
+    let switch = dyn_container(
+        move || enabled.get(),
+        move |on| match on {
+            true => focusable_toggle(sig, ring.clone(), tabindex).into_any(),
+            false => themed_toggle(sig, true).into_any(),
+        },
+    );
+    let title_color = move || match enabled.get() {
+        true => theme::text(),
+        false => theme::text_dim(),
+    };
+    toggle_row_layout(title, hint, title_color, switch)
+}
+
+/// The layout every toggle row shares: title and hint on the left, `switch`
+/// on the right.
+fn toggle_row_layout(
+    title: &'static str,
+    hint: &'static str,
+    title_color: impl Fn() -> floem::peniko::Color + 'static,
+    switch: impl IntoView + 'static,
 ) -> impl IntoView {
     h_stack((
         // `flex_grow(1) + min_width(0)`: take the space left of the switch and be
@@ -220,7 +268,7 @@ pub(crate) fn focusable_toggle_row(
         // The switch's primary label, so `theme::text()` rather than a caption's
         // colour: it is the thing being toggled, not a caption above it.
         v_stack((
-            text(title).style(|s| s.color(theme::text()).font_size(theme::font_label())),
+            text(title).style(move |s| s.color(title_color()).font_size(theme::font_label())),
             form_hint(hint),
         ))
         .style(|s| {
@@ -229,7 +277,7 @@ pub(crate) fn focusable_toggle_row(
                 .flex_grow(1.0_f32)
                 .min_width(0.0)
         }),
-        focusable_toggle(sig, ring, tabindex),
+        switch,
     ))
     .style(|s| s.items_center().width_full().gap(theme::scaled(10.0)))
 }
@@ -386,16 +434,26 @@ fn scale_picker(
     })
 }
 
+/// How strongly an inert switch is drawn: its colours at this alpha, so its
+/// value still reads, faintly, under a row that is greyed out.
+const INERT_TOGGLE_ALPHA: f32 = 0.4;
+
 // A dark-theme switch. Track + handle colours are driven by on/off state; the
 // track brightens on hover, and the press (active) state is neutralised to match
-// hover so there's no distracting flash on click.
-fn themed_toggle(sig: RwSignal<bool>) -> impl IntoView {
+// hover so there's no distracting flash on click. `inert`: drawn faded, with no
+// hover, and disabled — a click flips nothing (`focusable_toggle_row_when`).
+fn themed_toggle(sig: RwSignal<bool>, inert: bool) -> impl IntoView {
     use floem::peniko::Brush;
     use floem::style::Foreground;
     use floem::unit::PxPct;
     use floem::views::{ToggleButtonCircleRad, ToggleButtonInset};
     floem::views::toggle_button(move || sig.get())
-        .on_toggle(move |v| sig.set(v))
+        .on_toggle(move |v| {
+            if !inert {
+                sig.set(v)
+            }
+        })
+        .disabled(move || inert)
         .style(move |s| {
             let (bg, bg_hover, handle) = if sig.get() {
                 (
@@ -409,6 +467,14 @@ fn themed_toggle(sig: RwSignal<bool>) -> impl IntoView {
                     theme::toggle_off_hover(),
                     theme::toggle_handle_off(),
                 )
+            };
+            let (bg, bg_hover, handle) = match inert {
+                false => (bg, bg_hover, handle),
+                true => (
+                    bg.multiply_alpha(INERT_TOGGLE_ALPHA),
+                    bg.multiply_alpha(INERT_TOGGLE_ALPHA),
+                    handle.multiply_alpha(INERT_TOGGLE_ALPHA),
+                ),
             };
             // The track's radius is half its height — the same arithmetic as the
             // colour swatches in `connection_form`, and wrong in the same way when
@@ -526,7 +592,7 @@ pub(crate) fn focusable_toggle(
     ring: crate::widgets::FocusRing,
     tabindex: u32,
 ) -> impl IntoView {
-    crate::widgets::in_focus_ring(themed_toggle(sig), ring, tabindex).on_event(
+    crate::widgets::in_focus_ring(themed_toggle(sig, false), ring, tabindex).on_event(
         floem::event::EventListener::KeyDown,
         move |e| {
             let floem::event::Event::KeyDown(ke) = e else {
@@ -1795,12 +1861,15 @@ pub(crate) fn theme_settings_overlay(
                 ring.clone(),
                 110,
             );
-            let remembered_row = focusable_toggle_row(
+            // Greyed out while inline predictions are off: it refines them, and
+            // means nothing without them.
+            let remembered_row = focusable_toggle_row_when(
                 "Predictions from past statements",
                 "Also offer the rest of a line from a statement you ran, wrote in another \
                  tab or saved as a snippet. Switch off to keep past statements off the \
                  screen.",
                 editor_remembered_predictions,
+                editor_predictions,
                 ring.clone(),
                 120,
             );
