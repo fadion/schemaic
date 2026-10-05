@@ -1759,25 +1759,43 @@ existing prose was left alone.
     **`predict` is the editor's inline ghost — deterministic, not AI, and offered only where the
     answer is close to certain.** It returns the text Tab would insert at the caret, from four
     producers asked in order, each answering only its own shape: an empty `JOIN … ON` gets
-    `join_condition`'s foreign-key predicate; `INSERT`/`REPLACE … INTO t (` (or `db.t (`) gets the
-    columns an `INSERT` writes, from `Catalog::insert_columns_of`, quoted through
+    `join_condition`'s foreign-key predicate; `INSERT`/`REPLACE … INTO t (` (its target read as the
+    engine writes it, below) gets the columns an `INSERT` writes, from `Catalog::insert_columns_of`, quoted through
     `export::ident_if_needed` like every fragment above, plus a `)` unless one already follows;
     `GROUP BY ` gets the grouping list; and a
     keyword whose partner the grammar fixes gets the partner (`ORDER`/`GROUP`/`PARTITION` → `BY`,
     `PRIMARY`/`FOREIGN` → `KEY`, `INSERT` → `INTO`, `DELETE` → `FROM`, the join words → `JOIN`),
     in lower case when the keyword was typed all-lower. It answers nothing unless the rest of the
     caret's line is whitespace and `)` — the editor auto-pairs a `(`, so `INSERT INTO t (|)` has a
-    closer nobody wrote — the character before the caret is whitespace or `(`, and the word it
-    would offer is not the one the statement already has next (editing `ORDER |` above an existing
-    `BY` offers no second one). It also refuses a caret in a string, comment or quoted name, and
+    closer nobody wrote — and at most the statement's own closing `;`, which going back into a
+    finished statement always leaves after the caret (`ORDER |;`), though a second statement after
+    it on the line still refuses (`a_statements_own_semicolon_after_the_caret_still_predicts`); the
+    character before the caret is whitespace or `(`; and the word it would offer is not the one the
+    statement already has next (editing `ORDER |` above an existing `BY` offers no second one).
+    That word is compared whole: a non-ASCII character never ends it, where casting each `char` to
+    a byte for `is_word_byte` cut `名前` at its first character and offered it again
+    (`a_non_ascii_word_already_next_is_not_offered_again`).
+    It also refuses a caret in a string, comment or quoted name, and
     that is `caret_touches_noncode` walking only the text *before* the caret through `skip_noncode`,
     so an unterminated quote or a line comment running up to the caret counts as the caret being
     inside one — the one boundary lexer, not a new scanner. Each keyword guard is a place the bare
     rule was wrong: `INSERT`/`DELETE` count only as a statement's first word, since both also sit
-    in a trigger header and a key's `ON DELETE`; `WITHIN GROUP (` takes no `BY`; every join word
-    waits for a `FROM`, since `LEFT`/`RIGHT` are string functions too; and `CROSS`/`OUTER` predict
-    nothing where `has_apply_joins` says an `APPLY` may follow — T-SQL alone, asked as a
-    capability through an exhaustive match, so a new engine has to answer it.
+    in a trigger header and a key's `ON DELETE`; `WITHIN GROUP (` takes no `BY`; a join word
+    predicts `JOIN` only where a join can go, since `LEFT`/`RIGHT` are string functions too —
+    `in_join_position` reads the word's own query from `local_scope_start` through `scan_clauses`
+    and wants a `FROM`, join, `ON` or `USING` clause, or an `UPDATE`'s table list where
+    `update_takes_joins` says one may (MySQL's multi-table `UPDATE a INNER JOIN …` alone; the
+    others join in an `UPDATE … FROM`, which reads as a `FROM`), where waiting for any earlier `FROM` in the statement
+    predicted `JOIN` after `WHERE LEFT ` and `ORDER BY LEFT `, and in a subquery's projection off
+    the outer query's `FROM` (`join_words_predict_only_where_a_join_can_go`); and `CROSS`/`OUTER`
+    predict nothing where `has_apply_joins` says an `APPLY` may follow — T-SQL alone, asked as a
+    capability through an exhaustive match, so a new engine has to answer it. The `INSERT` target
+    is read as each engine writes it: `t` and `q.t`, and T-SQL's `db.schema.t` and `db..t`, resolved
+    through `Catalog::resolve_located` as the checker's three-part names are; and with no `INTO` at
+    all (`INSERT t (`) where `insert_into_is_optional` says the grammar allows it — MySQL and SQL
+    Server, PostgreSQL and SQLite requiring the word — asked the same way. It used to want `INTO`
+    and at most one qualifier, so a ghost the engine's own spelling should have had never came
+    (`an_insert_target_is_read_as_the_engine_writes_it`).
     **The column list is `skeleton::skeleton_columns`'s, not the table's.** Listing every column
     named the key the server numbers — a statement SQL Server refuses outright without
     `IDENTITY_INSERT` — and any computed column, which every engine refuses; and a ghost that

@@ -12387,10 +12387,11 @@ fn is_real_statement(stmt: &sqlparser::ast::Statement) -> bool {
 ///   `JOIN`, a statement-opening `INSERT` → `INTO`…), in the case it was typed.
 ///
 /// **Where a ghost can be drawn, and nowhere else**: at the end of a line
-/// (nothing after the caret but whitespace and the `)` bracket pairing put
-/// there), straight after whitespace or a `(`, and in code — a caret a string, comment or quoted name runs up to
-/// predicts nothing. And never the word the statement already has next, so
-/// editing `ORDER |` above an existing `BY` offers no second one.
+/// (nothing after the caret but whitespace, the `)` bracket pairing put there
+/// and the statement's own closing `;`), straight after whitespace or a `(`,
+/// and in code — a caret a string, comment or quoted name runs up to predicts
+/// nothing. And never the word the statement already has next, so editing
+/// `ORDER |` above an existing `BY` offers no second one.
 pub fn predict(sql: &str, caret: usize, catalog: &Catalog, dialect: SqlDialect) -> Option<String> {
     if caret > sql.len() || !sql.is_char_boundary(caret) {
         return None;
@@ -12398,7 +12399,10 @@ pub fn predict(sql: &str, caret: usize, catalog: &Catalog, dialect: SqlDialect) 
     // What follows on the line may be whitespace and closing parens only: the
     // editor pairs a `(` as it is typed, so the caret inside a fresh `(…)` has
     // a `)` after it that nobody wrote and that the ghost simply sits before.
+    // And the statement's own `;` at the very end, which going back into a
+    // finished statement always leaves after the caret.
     let rest = sql[caret..].split('\n').next().unwrap_or("").trim();
+    let rest = rest.strip_suffix(';').unwrap_or(rest).trim_end();
     if !rest.chars().all(|c| c == ')') {
         return None;
     }
@@ -12415,15 +12419,17 @@ pub fn predict(sql: &str, caret: usize, catalog: &Catalog, dialect: SqlDialect) 
     let guess = join_condition(sql, lo, hi, caret, catalog, dialect)
         .or_else(|| insert_columns(&toks, catalog, dialect, closed))
         .or_else(|| group_by_items(sql, lo, &toks, dialect))
-        .or_else(|| keyword_partner(&toks, dialect))?;
+        .or_else(|| keyword_partner(sql, lo, &toks, dialect))?;
     let next_word = tokenize_range(sql, caret, hi.max(caret), dialect)
         .into_iter()
         .find_map(|t| match t.kind {
             TkKind::Word(w) => Some(w),
             _ => None,
         });
+    // A character outside ASCII is a word character (`is_word_byte` answers so
+    // for every byte of one), so it is never where the first word ends.
     let first_guessed = guess
-        .split(|c: char| !crate::sql::is_word_byte(c as u8))
+        .split(|c: char| c.is_ascii() && !crate::sql::is_word_byte(c as u8))
         .next();
     if let (Some(next), Some(first)) = (next_word, first_guessed)
         && next.eq_ignore_ascii_case(first)
@@ -12461,14 +12467,52 @@ fn has_apply_joins(dialect: SqlDialect) -> bool {
     }
 }
 
+/// Does a word at `at` sit where a join can go — in its own query's `FROM`
+/// clause (after a table, a join, its `ON`/`USING` or another join word), or
+/// an `UPDATE`'s table list where [`update_takes_joins`] says one may?
+///
+/// Read through [`scan_clauses`] from [`local_scope_start`], so a subquery's
+/// `FROM` is its own and the outer query's is not: a `FROM` *anywhere* earlier
+/// in the statement made `WHERE LEFT ` and `ORDER BY LEFT ` predict `JOIN`.
+fn in_join_position(sql: &str, lo: usize, at: usize, dialect: SqlDialect) -> bool {
+    let start = local_scope_start(sql, lo, at, dialect);
+    let toks = tokenize_range(sql, start, at, dialect);
+    let (_, clause, ..) = scan_clauses(sql, &toks, at, dialect);
+    match clause {
+        Clause::From | Clause::Join | Clause::JoinMod | Clause::On | Clause::Using => true,
+        Clause::Update => update_takes_joins(dialect),
+        _ => false,
+    }
+}
+
+/// Whether an `UPDATE`'s own table list may hold joins (`UPDATE a INNER JOIN b
+/// ON … SET …`) on this engine. MySQL's multi-table form alone: the others join
+/// in an `UPDATE … FROM`, which [`in_join_position`] reads as a `FROM`.
+fn update_takes_joins(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MySql => true,
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+    }
+}
+
+/// Whether an `INSERT` may name its table without `INTO` (`INSERT t (…)`) on
+/// this engine. PostgreSQL and SQLite require the word.
+fn insert_into_is_optional(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MySql | SqlDialect::MsSql => true,
+        SqlDialect::Postgres | SqlDialect::Sqlite => false,
+    }
+}
+
 /// [`predict`]'s keyword producer: the last token is a keyword whose next word
 /// the grammar fixes.
 ///
 /// Each guard is a place the bare rule was wrong: `INSERT`/`DELETE` also sit
 /// inside a trigger header and a key's `ON DELETE`, so only a statement's first
-/// word counts; `WITHIN GROUP (` takes no `BY`; and the join words wait for a
-/// `FROM`, since `LEFT`/`RIGHT` are string functions too.
-fn keyword_partner(toks: &[Token], dialect: SqlDialect) -> Option<String> {
+/// word counts; `WITHIN GROUP (` takes no `BY`; and the join words count only
+/// where a join can go ([`in_join_position`]), since `LEFT`/`RIGHT` are string
+/// functions too.
+fn keyword_partner(sql: &str, lo: usize, toks: &[Token], dialect: SqlDialect) -> Option<String> {
     let last = toks.last()?;
     let TkKind::Word(w) = &last.kind else {
         return None;
@@ -12482,14 +12526,12 @@ fn keyword_partner(toks: &[Token], dialect: SqlDialect) -> Option<String> {
     };
     let first = toks.len() == 1;
     let prev = toks.len().checked_sub(2).and_then(word_at);
-    let after_from = toks
-        .iter()
-        .any(|t| !t.quoted && matches!(&t.kind, TkKind::Word(w) if w.eq_ignore_ascii_case("FROM")));
+    let joins = || in_join_position(sql, lo, last.at, dialect);
     let partner = match w.to_ascii_uppercase().as_str() {
         "GROUP" if prev.as_deref() == Some("WITHIN") => return None,
         "ORDER" | "GROUP" | "PARTITION" => "BY ",
-        "LEFT" | "RIGHT" | "INNER" | "FULL" if after_from => "JOIN ",
-        "CROSS" | "OUTER" if after_from && !has_apply_joins(dialect) => "JOIN ",
+        "LEFT" | "RIGHT" | "INNER" | "FULL" if joins() => "JOIN ",
+        "CROSS" | "OUTER" if !has_apply_joins(dialect) && joins() => "JOIN ",
         "PRIMARY" | "FOREIGN" => "KEY",
         "INSERT" if first => "INTO ",
         "DELETE" if first => "FROM ",
@@ -12536,21 +12578,36 @@ fn insert_columns(
     if !matches!(toks.last()?.kind, TkKind::LParen) {
         return None;
     }
-    let into = toks
+    // The name starts after `INTO` — or, where the engine lets it be left out,
+    // straight after `INSERT` (`INSERT t (`).
+    let name_from = match toks
         .iter()
-        .position(|t| !t.quoted && word(t).is_some_and(|w| w.eq_ignore_ascii_case("INTO")))?;
-    // `name` or `db.name`, and nothing else, between `INTO` and the `(`.
-    let name = &toks[into + 1..toks.len() - 1];
-    let (db, table) = match name {
-        [t] => (None, word(t)?),
-        [d, dot, t] if matches!(dot.kind, TkKind::Dot) => (Some(word(d)?), word(t)?),
+        .position(|t| !t.quoted && word(t).is_some_and(|w| w.eq_ignore_ascii_case("INTO")))
+    {
+        Some(into) => into + 1,
+        None if insert_into_is_optional(dialect) => 1,
+        None => return None,
+    };
+    // `name`, `db.name`, `db.schema.name` or `db..name`, and nothing else,
+    // between there and the `(`.
+    let dot = |t: &Token| matches!(t.kind, TkKind::Dot);
+    let (database, qualifier, table) = match &toks[name_from..toks.len() - 1] {
+        [t] => (None, None, word(t)?),
+        [q, d, t] if dot(d) => (None, Some(word(q)?), word(t)?),
+        [db, d1, q, d2, t] if dot(d1) && dot(d2) => (Some(word(db)?), Some(word(q)?), word(t)?),
+        [db, d1, d2, t] if dot(d1) && dot(d2) => (Some(word(db)?), None, word(t)?),
         _ => return None,
     };
-    let r = TableRef {
-        name: table.to_string(),
-        alias: None,
-        db: db.map(str::to_string),
+    let located = LocatedRef {
+        r: TableRef {
+            name: table.to_string(),
+            alias: None,
+            db: qualifier.map(str::to_string),
+        },
+        pos: (0, 0),
+        database: database.map(str::to_string),
     };
+    let r = catalog.resolve_located(&located)?;
     let cols = catalog.insert_columns_of(&r)?;
     if cols.is_empty() {
         return None;
@@ -13076,6 +13133,96 @@ mod predict_tests {
             Some("BY ")
         );
         assert_eq!(at_bar("INSERT INTO customers (|) VALUES"), None);
+    }
+
+    /// Going back into a finished statement puts its `;` after the caret, and
+    /// that ends the statement rather than continuing the line: the ghost sits
+    /// before it. Another statement after the `;` is still something on the line.
+    #[test]
+    fn a_statements_own_semicolon_after_the_caret_still_predicts() {
+        assert_eq!(
+            at_bar("SELECT id FROM orders ORDER |;").as_deref(),
+            Some("BY ")
+        );
+        assert_eq!(
+            at_bar("INSERT INTO customers (|);").as_deref(),
+            Some("id, name")
+        );
+        assert_eq!(at_bar("SELECT id FROM orders ORDER |; SELECT 1"), None);
+    }
+
+    /// `LEFT`/`RIGHT` are string functions as well as join words, and a `FROM`
+    /// earlier in the statement does not make every later one a join: only a
+    /// word in the `FROM` clause — or a MySQL multi-table `UPDATE`'s table list
+    /// — of its own query is.
+    #[test]
+    fn join_words_predict_only_where_a_join_can_go() {
+        assert_eq!(my("SELECT * FROM orders WHERE LEFT "), None);
+        assert_eq!(my("SELECT * FROM orders o ORDER BY LEFT "), None);
+        assert_eq!(my("SELECT * FROM orders WHERE id IN (SELECT RIGHT "), None);
+        assert_eq!(
+            my("SELECT * FROM orders o JOIN customers c ON o.customer_id = c.id LEFT ").as_deref(),
+            Some("JOIN ")
+        );
+        assert_eq!(
+            my("SELECT * FROM orders WHERE id IN (SELECT id FROM customers c LEFT ").as_deref(),
+            Some("JOIN ")
+        );
+        assert_eq!(my("UPDATE orders o INNER ").as_deref(), Some("JOIN "));
+        // The others join in an `UPDATE`'s `FROM`, never its table list.
+        for dialect in [SqlDialect::Postgres, SqlDialect::Sqlite, SqlDialect::MsSql] {
+            assert_eq!(
+                at_end("UPDATE orders o INNER ", dialect),
+                None,
+                "{dialect:?}"
+            );
+        }
+    }
+
+    /// The target of an `INSERT` as each engine may write it: without `INTO`
+    /// where the grammar makes it optional (MySQL, SQL Server) and with all
+    /// three parts on SQL Server.
+    #[test]
+    fn an_insert_target_is_read_as_the_engine_writes_it() {
+        assert_eq!(my("INSERT customers (").as_deref(), Some("id, name)"));
+        assert_eq!(
+            at_end("INSERT customers (", SqlDialect::MsSql).as_deref(),
+            Some("id, name)")
+        );
+        assert_eq!(at_end("INSERT customers (", SqlDialect::Postgres), None);
+        assert_eq!(at_end("INSERT customers (", SqlDialect::Sqlite), None);
+        let mut schema = shop();
+        for t in &mut schema.tables {
+            t.schema = Some("dbo".to_string());
+        }
+        assert_eq!(
+            in_schema(
+                &schema,
+                "INSERT INTO shop.dbo.customers (",
+                SqlDialect::MsSql
+            )
+            .as_deref(),
+            Some("id, name)")
+        );
+        assert_eq!(
+            in_schema(&schema, "INSERT INTO shop..customers (", SqlDialect::MsSql).as_deref(),
+            Some("id, name)")
+        );
+    }
+
+    /// The word already next is compared whole, whatever script it is written
+    /// in — a non-ASCII name used to be cut at its first character.
+    #[test]
+    fn a_non_ascii_word_already_next_is_not_offered_again() {
+        let schema = DbSchema {
+            tables: vec![tbl("t", &["名前"])],
+            ..Default::default()
+        };
+        let sql = "SELECT 名前, count(*) FROM t GROUP BY |\n名前";
+        let caret = sql.find('|').unwrap();
+        let text = sql.replacen('|', "", 1);
+        let cat = Catalog::build(&[("shop", &schema)], Some("shop"));
+        assert_eq!(predict(&text, caret, &cat, SqlDialect::MySql), None);
     }
 }
 
