@@ -1757,15 +1757,17 @@ existing prose was left alone.
     `noise_in_the_middle_is_not_stitched_around` pins, and it is the reason the guard exists. The
     cost is deliberate: a valid statement this parser cannot handle is refused rather than shown.
     **`predict` is the editor's inline ghost — deterministic, not AI, and offered only where the
-    answer is close to certain.** It returns the text Tab would insert at the caret, from four
+    answer is close to certain.** It returns the text Tab would insert at the caret, from six
     producers asked in order, each answering only its own shape: an empty `JOIN … ON` gets
     `join_condition`'s foreign-key predicate; `INSERT`/`REPLACE … INTO t (` (its target read as the
     engine writes it, below) gets the columns an `INSERT` writes, from `Catalog::insert_columns_of`, quoted through
     `export::ident_if_needed` like every fragment above, plus a `)` unless one already follows;
-    `GROUP BY ` gets the grouping list; and a
+    `GROUP BY ` gets the grouping list; an empty `JOIN ` gets the whole join, `table ON condition`
+    (`join_target_guess`); `JOIN t alias ` gets `ON` and the condition (`join_on_guess`); and a
     keyword whose partner the grammar fixes gets the partner (`ORDER`/`GROUP`/`PARTITION` → `BY`,
     `PRIMARY`/`FOREIGN` → `KEY`, `INSERT` → `INTO`, `DELETE` → `FROM`, the join words → `JOIN`),
-    in lower case when the keyword was typed all-lower. It answers nothing unless the rest of the
+    in lower case when the keyword was typed all-lower — `in_typed_case`, which writes both join
+    producers' `ON` in the case `JOIN` was typed. It answers nothing unless the rest of the
     caret's line is whitespace and `)` — the editor auto-pairs a `(`, so `INSERT INTO t (|)` has a
     closer nobody wrote — and at most the statement's own closing `;`, which going back into a
     finished statement always leaves after the caret (`ORDER |;`), though a second statement after
@@ -1827,7 +1829,24 @@ existing prose was left alone.
     aggregate written any of those ways needs no list — and only then by `GROUP_AGGREGATES`, on the
     bare upper-cased name, for the plain `sum(x)` with no shape to tell it by
     (`group_by_knows_an_aggregate_by_its_shape_and_its_name`). A star, a projection with no key
-    left or a prefix that does not parse (a half-written `FROM`) predicts nothing. The UI asks it
+    left or a prefix that does not parse (a half-written `FROM`) predicts nothing.
+    **A join is predicted only where the schema leaves one join to make.** After an empty `JOIN `
+    the ghost is `join_targets`' own row — the one the popup's table list leads with — and only
+    when that list holds a single table which `fk_edge_count` (the keys between two tables, in
+    either direction) finds joined to the tables in scope by a single key: `FROM orders o JOIN `
+    gets `customers ON o.customer_id = customers.id`, and from the other side
+    `FROM customers c JOIN ` gets `orders ON orders.customer_id = c.id`. Two reachable tables, two
+    keys to one table or nothing left to reach make which join is meant a choice, and the table
+    list is the place to make it; a table's key to itself counts twice, since which side is the
+    parent is that same choice. `join_on_guess` holds a table already written — `t`, `q.t` or
+    `db.q.t` — to the same bar, offering `fk_predicate`'s condition only when exactly one other
+    table in scope is joined to it, by one key. **Only with an alias** (`JOIN t c ` or `JOIN t AS c `): after a bare `JOIN t `
+    the next word may well be the alias, and an unquoted reserved word in its place
+    (`JOIN t WHERE `, by `is_reserved_word`) is not one
+    (`an_empty_join_predicts_the_one_table_a_foreign_key_reaches`,
+    `an_empty_join_predicts_nothing_when_the_table_is_not_certain`,
+    `a_joined_table_and_its_alias_predict_the_on_condition`,
+    `a_joined_table_predicts_no_condition_it_cannot_be_sure_of`). The UI asks it
     over the offer catalogue (under `completion.rs`) and only while the `editor_predictions`
     setting is on — Settings → Editor → *Inline predictions*, on by default. `predict_tests` covers
     each producer and gate, `an_auto_paired_closer_after_the_caret_still_predicts` the `)` one.
@@ -22158,8 +22177,9 @@ existing prose was left alone.
     A forced recompute (Ctrl+Space) asks for the list, so it shows no ghost beside it. With the word
     at the caret empty and a ghost showing, the popup does not open: that is the slot `auto_show`
     (columns after `WHERE`/`ON`/`BY`) and the FK join row used to take, and two offers at one caret
-    would leave Tab meaning whichever happened to be open. Ctrl+Space still brings the list, join
-    row included. `CompletionCtx::predictions` is the switch, from the `editor_predictions` setting.
+    would leave Tab meaning whichever happened to be open. The table list `auto_show` opens after
+    `JOIN ` yields the same way, so where the whole join is predicted it waits for a typed letter.
+    Ctrl+Space still brings the list, join row included. `CompletionCtx::predictions` is the switch, from the `editor_predictions` setting.
   - `tabs.rs` — query-tab strip, and where a **`.sql`-backed tab** shows itself. The state behind
     that is four signals on `Tab`: `path`, `disk_sql` (the file's text as of the last open / save /
     reload — `None` means *unknown*, which reads as modified, the safe direction), `file_format`

@@ -12376,13 +12376,16 @@ fn is_real_statement(stmt: &sqlparser::ast::Statement) -> bool {
 /// verbatim when the user presses Tab — or `None` when nothing is certain
 /// enough to offer.
 ///
-/// **Deterministic, and only where the answer is close to certain.** Four
+/// **Deterministic, and only where the answer is close to certain.** Six
 /// producers, asked in this order, each answering only its own shape:
 ///
 /// - an empty `JOIN … ON` → the foreign-key condition ([`join_condition`]);
 /// - `INSERT INTO t (` → `t`'s columns and the closing paren;
 /// - `GROUP BY ` → the projection's non-aggregated expressions, read off the
 ///   parsed statement in front of it;
+/// - an empty `JOIN ` → the one table a foreign key reaches, with its `ON`
+///   ([`join_target_guess`]);
+/// - `JOIN t alias ` → `ON` and the foreign-key condition ([`join_on_guess`]);
 /// - a keyword whose partner the grammar fixes (`ORDER` → `BY`, `LEFT` →
 ///   `JOIN`, a statement-opening `INSERT` → `INTO`…), in the case it was typed.
 ///
@@ -12419,6 +12422,8 @@ pub fn predict(sql: &str, caret: usize, catalog: &Catalog, dialect: SqlDialect) 
     let guess = join_condition(sql, lo, hi, caret, catalog, dialect)
         .or_else(|| insert_columns(&toks, catalog, dialect, closed))
         .or_else(|| group_by_items(sql, lo, &toks, dialect))
+        .or_else(|| join_target_guess(sql, (lo, hi, caret), &toks, catalog, dialect))
+        .or_else(|| join_on_guess(sql, (lo, hi, caret), &toks, catalog, dialect))
         .or_else(|| keyword_partner(sql, lo, &toks, dialect))?;
     let next_word = tokenize_range(sql, caret, hi.max(caret), dialect)
         .into_iter()
@@ -12537,13 +12542,134 @@ fn keyword_partner(sql: &str, lo: usize, toks: &[Token], dialect: SqlDialect) ->
         "DELETE" if first => "FROM ",
         _ => return None,
     };
-    // The case the keyword was typed in: all lower answers in lower, anything
-    // else — `ORDER`, `Order` — in the conventional upper.
-    Some(if w.bytes().any(|b| b.is_ascii_uppercase()) {
-        partner.to_string()
+    Some(in_typed_case(partner, w))
+}
+
+/// `keyword` (written upper-case) in the case `typed` was: all lower answers in
+/// lower, anything else — `ORDER`, `Order` — in the conventional upper.
+fn in_typed_case(keyword: &str, typed: &str) -> String {
+    if typed.bytes().any(|b| b.is_ascii_uppercase()) {
+        keyword.to_string()
     } else {
-        partner.to_ascii_lowercase()
+        keyword.to_ascii_lowercase()
+    }
+}
+
+/// How many foreign keys join tables `a` and `b`, in either direction. Two
+/// make the condition a choice rather than a fact — and so does a table's key
+/// to itself, which counts twice, since which side is the parent is the choice.
+fn fk_edge_count(catalog: &Catalog, a: &str, b: &str) -> usize {
+    let one_way = |from: &str, to: &str| {
+        catalog.fks_of(from).map_or(0, |edges| {
+            edges
+                .iter()
+                .filter(|e| e.ref_table.eq_ignore_ascii_case(to))
+                .count()
+        })
+    };
+    one_way(a, b) + one_way(b, a)
+}
+
+/// [`predict`]'s empty-`JOIN ` producer: the whole join — table, `ON` and the
+/// foreign-key condition — when [`join_targets`] finds exactly one table a key
+/// reaches from the tables in scope, by exactly one key.
+///
+/// Any more and which join is meant is a choice, and the popup's table list
+/// (which still opens on a typed letter, or Ctrl+Space) is the place to make it.
+fn join_target_guess(
+    sql: &str,
+    (lo, hi, caret): (usize, usize, usize),
+    toks: &[Token],
+    catalog: &Catalog,
+    dialect: SqlDialect,
+) -> Option<String> {
+    let last = toks.last()?;
+    let TkKind::Word(join) = &last.kind else {
+        return None;
+    };
+    if last.quoted || !join.eq_ignore_ascii_case("JOIN") {
+        return None;
+    }
+    let targets = join_targets(sql, lo, hi, caret, catalog, dialect);
+    let [target] = targets.as_slice() else {
+        return None;
+    };
+    let scope = statement_scope(sql, lo, hi, caret, dialect).tables;
+    let keys: usize = scope
+        .iter()
+        .map(|s| fk_edge_count(catalog, &target.table, &s.name))
+        .sum();
+    (keys == 1).then(|| {
+        format!(
+            "{} {} {}",
+            target.table_sql,
+            in_typed_case("ON", join),
+            target.predicate
+        )
     })
+}
+
+/// [`predict`]'s joined-table producer: after `JOIN t alias ` (or `JOIN t AS
+/// alias `), `ON` and the foreign-key condition — the next word is `ON`, and the
+/// key says what follows it.
+///
+/// **Only with an alias**: after a bare `JOIN t ` the next word may well be the
+/// alias, and a reserved word in the alias's place (`JOIN t WHERE `) is not
+/// one. And only when exactly one other table in scope is joined to `t` by
+/// exactly one key ([`fk_edge_count`]).
+fn join_on_guess(
+    sql: &str,
+    (lo, hi, caret): (usize, usize, usize),
+    toks: &[Token],
+    catalog: &Catalog,
+    dialect: SqlDialect,
+) -> Option<String> {
+    fn word(t: &Token) -> Option<&str> {
+        match &t.kind {
+            TkKind::Word(w) => Some(w.as_str()),
+            _ => None,
+        }
+    }
+    let is_kw =
+        |t: &Token, kw: &str| !t.quoted && word(t).is_some_and(|w| w.eq_ignore_ascii_case(kw));
+    let join_idx = toks.iter().rposition(|t| is_kw(t, "JOIN"))?;
+    let join = word(&toks[join_idx])?;
+    let (name, alias) = match &toks[join_idx + 1..] {
+        [name @ .., as_kw, alias] if is_kw(as_kw, "AS") => (name, alias),
+        [name @ .., alias] => (name, alias),
+        [] => return None,
+    };
+    let alias_text = word(alias)?;
+    if !alias.quoted && is_reserved_word(alias_text, dialect) {
+        return None;
+    }
+    // `t`, `q.t` or `db.q.t`, and nothing else, between `JOIN` and the alias.
+    let dot = |t: &Token| matches!(t.kind, TkKind::Dot);
+    let table = match name {
+        [t] => word(t)?,
+        [_, d, t] if dot(d) => word(t)?,
+        [_, d1, _, d2, t] if dot(d1) && dot(d2) => word(t)?,
+        _ => return None,
+    };
+    let scope = statement_scope(sql, lo, hi, caret, dialect).tables;
+    let same = |r: &TableRef| {
+        r.name.eq_ignore_ascii_case(table)
+            && r.alias
+                .as_deref()
+                .is_some_and(|a| a.eq_ignore_ascii_case(alias_text))
+    };
+    let joined = scope.iter().find(|r| same(r))?;
+    let mut condition = None;
+    for other in scope.iter().filter(|r| !same(r)) {
+        match fk_edge_count(catalog, &joined.name, &other.name) {
+            0 => continue,
+            1 if condition.is_none() => {
+                condition = Some(fk_predicate(catalog, joined, other, dialect)?);
+            }
+            _ => return None,
+        }
+    }
+    Some(format!("{} {}", in_typed_case("ON", join), condition?))
 }
 
 /// [`predict`]'s `INSERT INTO t (` producer: `t`'s columns, in table order,
@@ -12946,6 +13072,121 @@ mod predict_tests {
         );
         assert_eq!(
             my("SELECT * FROM orders o JOIN customers c ON o.id = 1 AND "),
+            None
+        );
+    }
+
+    /// `shop` plus a second way out of `orders` — to `products` — and two keys
+    /// from `orders` to the one `addresses` table.
+    fn branching() -> DbSchema {
+        let mut schema = shop();
+        let orders = &mut schema.tables[0];
+        orders.columns.push(ColumnInfo {
+            name: "product_id".to_string(),
+            ..Default::default()
+        });
+        orders.foreign_keys.push(ForeignKeyInfo {
+            columns: vec!["product_id".to_string()],
+            ref_table: "products".to_string(),
+            ref_columns: vec!["id".to_string()],
+            ..Default::default()
+        });
+        let mut shipments = tbl("shipments", &["id", "bill_to", "ship_to"]);
+        for col in ["bill_to", "ship_to"] {
+            shipments.foreign_keys.push(ForeignKeyInfo {
+                columns: vec![col.to_string()],
+                ref_table: "addresses".to_string(),
+                ref_columns: vec!["id".to_string()],
+                ..Default::default()
+            });
+        }
+        schema.tables.push(tbl("products", &["id"]));
+        schema.tables.push(tbl("addresses", &["id"]));
+        schema.tables.push(shipments);
+        schema
+    }
+
+    /// An empty `JOIN ` whose only foreign-key way out of the tables already
+    /// joined reaches one table, by one key, predicts that whole join — in
+    /// either direction of the key, in the case `JOIN` was typed in.
+    #[test]
+    fn an_empty_join_predicts_the_one_table_a_foreign_key_reaches() {
+        assert_eq!(
+            my("SELECT * FROM orders o JOIN ").as_deref(),
+            Some("customers ON o.customer_id = customers.id")
+        );
+        assert_eq!(
+            my("select * from orders o left join ").as_deref(),
+            Some("customers on o.customer_id = customers.id")
+        );
+        assert_eq!(
+            my("SELECT * FROM customers c JOIN ").as_deref(),
+            Some("orders ON orders.customer_id = c.id")
+        );
+    }
+
+    /// Two tables reachable, two keys to one table, or none left to reach:
+    /// which join is meant is not certain, and the table list is the offer.
+    #[test]
+    fn an_empty_join_predicts_nothing_when_the_table_is_not_certain() {
+        let schema = branching();
+        let at = |sql: &str| in_schema(&schema, sql, SqlDialect::MySql);
+        assert_eq!(at("SELECT * FROM orders o JOIN "), None);
+        assert_eq!(at("SELECT * FROM shipments s JOIN "), None);
+        assert_eq!(
+            my("SELECT * FROM orders o JOIN customers c ON o.customer_id = c.id JOIN "),
+            None
+        );
+        assert_eq!(my("SELECT * FROM orders o JOIN cu"), None);
+    }
+
+    /// A joined table with its alias is followed by its condition: the next
+    /// word is `ON`, and the foreign key says what it joins on.
+    #[test]
+    fn a_joined_table_and_its_alias_predict_the_on_condition() {
+        assert_eq!(
+            my("SELECT * FROM orders o JOIN customers c ").as_deref(),
+            Some("ON o.customer_id = c.id")
+        );
+        assert_eq!(
+            my("SELECT * FROM orders o JOIN customers AS c ").as_deref(),
+            Some("ON o.customer_id = c.id")
+        );
+        assert_eq!(
+            my("select * from orders o left join customers c ").as_deref(),
+            Some("on o.customer_id = c.id")
+        );
+        assert_eq!(
+            my("SELECT * FROM orders o JOIN shop.customers c ").as_deref(),
+            Some("ON o.customer_id = c.id")
+        );
+    }
+
+    /// Without an alias the next word may be one; a reserved word is not one;
+    /// and a pair with no key, or two keys, has no certain condition.
+    #[test]
+    fn a_joined_table_predicts_no_condition_it_cannot_be_sure_of() {
+        let schema = branching();
+        assert_eq!(my("SELECT * FROM orders o JOIN customers "), None);
+        assert_eq!(my("SELECT * FROM orders o JOIN customers c WHERE "), None);
+        assert_eq!(
+            in_schema(
+                &schema,
+                "SELECT * FROM orders o JOIN addresses a ",
+                SqlDialect::MySql
+            ),
+            None
+        );
+        assert_eq!(
+            in_schema(
+                &schema,
+                "SELECT * FROM shipments s JOIN addresses a ",
+                SqlDialect::MySql
+            ),
+            None
+        );
+        assert_eq!(
+            my("SELECT * FROM orders o JOIN customers c ON o.customer_id = c.id "),
             None
         );
     }
