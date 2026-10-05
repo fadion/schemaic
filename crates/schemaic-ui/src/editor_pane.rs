@@ -2500,6 +2500,8 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     // The editor key handler needs its own clone (it's a `move` closure).
     // `run` is already the guarded run action — see `TabsActions::run`.
     let guarded_run_key = run.clone();
+    // And `run_all`, for Ctrl+Enter over a selection of several statements.
+    let guarded_run_all_key = run_all.clone();
 
     // Only one menu open at a time: opening any one closes the others. (Their
     // dismiss catchers cover different regions, so a click in one doesn't reach
@@ -3135,6 +3137,19 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             editor_sig.with_untracked(|e| {
                 let offset = e.cursor.get_untracked().offset();
                 let dia = dialect.get_untracked();
+                // **A selection runs as written** — its statements, through the
+                // same guarded actions (`sql::selection_statements`). No menu:
+                // selecting already said what to run.
+                let sel = e.cursor.get_untracked().get_selection();
+                if let Some(mut stmts) = schemaic_core::sql::selection_statements(&sql, sel, dia) {
+                    comp.open.set(false);
+                    if stmts.len() == 1 {
+                        (guarded_run_key)(stmts.remove(0));
+                    } else {
+                        (guarded_run_all_key)(stmts);
+                    }
+                    return;
+                }
                 // **What Run Current would run**, not the editor's statement:
                 // inside a T-SQL batch scope that is the scope's start through
                 // the caret's statement (`sql::run_current_range`).

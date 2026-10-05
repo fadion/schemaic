@@ -412,7 +412,11 @@ existing prose was left alone.
     **or holds several statements** (`editor_pane::run_menu_wanted`), so a
     write above the caret is shown before it runs
     (`run_at_the_caret_stops_at_the_carets_statement_in_a_batch_scope`,
-    `ctrl_enter_outlines_a_batch_scoped_piece_before_running_it`). The missing-`WHERE` guards lose nothing by the larger
+    `ctrl_enter_outlines_a_batch_scoped_piece_before_running_it`). **None of that applies to a
+    selection**: Ctrl+Enter over selected code runs exactly it, split into its statements
+    (`sql::selection_statements`, over `executable_statements`) and handed to the guarded `run` —
+    or `run_all` for several — with no menu, a fragment of a statement included
+    (`a_selection_runs_as_its_statements`). The missing-`WHERE` guards lose nothing by the larger
     piece, since `tsql_statements` (below) cuts at statement words and not at `;` — and the `.sql`
     panel's probe, which read a piece by its head and so missed everything after a `DECLARE`, now
     counts through it too (`core::script`). **`nested_block_comments` was a divergence the table did not have**:

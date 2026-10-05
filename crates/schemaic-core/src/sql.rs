@@ -1630,6 +1630,26 @@ pub fn statement_range(sql: &str, offset: usize, dialect: SqlDialect) -> (usize,
     statement_range_ended(sql, offset, dialect).0
 }
 
+/// What Ctrl+Enter runs when text is selected: the selection's statements,
+/// split as Run Everything splits ([`executable_statements`]) — or `None` when
+/// nothing is selected, or nothing in it is code ([`holds_code`]), and the
+/// statement at the caret runs as before. The selection is run as written, a
+/// fragment of a statement included: selecting is how one asks for exactly
+/// that text.
+pub fn selection_statements(
+    sql: &str,
+    sel: Option<(usize, usize)>,
+    dialect: SqlDialect,
+) -> Option<Vec<String>> {
+    let (a, b) = sel?;
+    let text = sql.get(a.min(b)..a.max(b))?;
+    if !holds_code(text, dialect) {
+        return None;
+    }
+    let stmts = executable_statements(text, dialect);
+    (!stmts.is_empty()).then_some(stmts)
+}
+
 /// The statement the caret is **writing**: [`statement_range`]'s, or an empty
 /// range at the caret when it is past that statement's end
 /// ([`statement_range_ended`]). What completion reads its context from:
@@ -5133,6 +5153,35 @@ mod holds_code_tests {
         }
         assert!(!holds_code("# note\n", SqlDialect::MySql));
         assert!(holds_code("# note\n", SqlDialect::Postgres));
+    }
+
+    /// A selection runs as its own statements; no selection, or one holding
+    /// no code, leaves Ctrl+Enter to the statement at the caret.
+    #[test]
+    fn a_selection_runs_as_its_statements() {
+        use super::selection_statements;
+        let my = SqlDialect::MySql;
+        let sql = "SELECT 1;\nSELECT 2;\nDELETE FROM t;";
+        assert_eq!(
+            selection_statements(sql, Some((0, 19)), my),
+            Some(vec!["SELECT 1;".to_string(), "SELECT 2;".to_string()])
+        );
+        // Backwards (dragged upwards) is the same selection.
+        assert_eq!(
+            selection_statements(sql, Some((19, 0)), my),
+            selection_statements(sql, Some((0, 19)), my)
+        );
+        // A fragment runs as written.
+        assert_eq!(
+            selection_statements("SELECT a FROM t WHERE x = 1", Some((0, 15)), my),
+            Some(vec!["SELECT a FROM t".to_string()])
+        );
+        assert_eq!(selection_statements(sql, None, my), None);
+        assert_eq!(selection_statements(sql, Some((9, 9)), my), None);
+        assert_eq!(
+            selection_statements("-- note\nSELECT 1", Some((0, 7)), my),
+            None
+        );
     }
 
     /// Past a statement's terminator the caret is writing a new, empty one;
