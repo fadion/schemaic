@@ -4582,6 +4582,12 @@ pub struct Catalog {
     /// reference) exactly as the column maps are, for
     /// [`Catalog::insert_columns_of`].
     insert_skips: HashSet<(String, String, String)>,
+    /// Table names (lower) two in-scope tables share with **different** keys —
+    /// `sales.orders` and `dbo.orders`. [`Catalog::pks`] is keyed by the bare
+    /// name, so it holds whichever was indexed last; a question that names the
+    /// key ([`Catalog::key_columns_of`]) answers nothing for these rather than
+    /// the other table's.
+    pk_shared: HashSet<String>,
 }
 
 /// A memo over [`Catalog::build`], keyed on the **identity** of the schemas the
@@ -4721,6 +4727,8 @@ impl Catalog {
         let mut opaque_qualified = HashSet::new();
         let mut opaque_unqualified = HashSet::new();
         let mut insert_skips = HashSet::new();
+        let mut pk_shared = HashSet::new();
+        let mut keys_seen: HashMap<String, Vec<String>> = HashMap::new();
         let active_lower = active_db.map(|d| d.to_ascii_lowercase());
         // **`(database, name)` and a bare name are shared by every schema's
         // relations, so their columns are merged, never replaced.** Two
@@ -4810,14 +4818,29 @@ impl Catalog {
                         unqualified.entry(t.name.to_ascii_lowercase()).or_default(),
                         &cols,
                     );
-                    let pk: Vec<String> = t
-                        .columns
-                        .iter()
-                        .filter(|c| c.primary_key)
-                        .map(|c| c.name.to_ascii_lowercase())
-                        .collect();
+                    // In the order the key was declared, where the primary
+                    // index records it: a foreign key's referenced columns
+                    // follow that order, not the table's.
+                    let pk: Vec<String> = match t.indexes.iter().find(|ix| ix.is_primary()) {
+                        Some(ix) => ix.column_names().map(str::to_ascii_lowercase).collect(),
+                        None => t
+                            .columns
+                            .iter()
+                            .filter(|c| c.primary_key)
+                            .map(|c| c.name.to_ascii_lowercase())
+                            .collect(),
+                    };
+                    // Every in-scope table's key, an empty one included: a
+                    // keyless table sharing a name with a keyed one is two
+                    // different keys under one name as much as two keys are.
+                    let name_lower = t.name.to_ascii_lowercase();
+                    if let Some(other) = keys_seen.insert(name_lower.clone(), pk.clone())
+                        && other != pk
+                    {
+                        pk_shared.insert(name_lower.clone());
+                    }
                     if !pk.is_empty() {
-                        pks.insert(t.name.to_ascii_lowercase(), pk);
+                        pks.insert(name_lower, pk);
                     }
                     if !t.foreign_keys.is_empty() {
                         fks.entry(t.name.to_ascii_lowercase()).or_default().extend(
@@ -4884,6 +4907,7 @@ impl Catalog {
             opaque_qualified,
             opaque_unqualified,
             insert_skips,
+            pk_shared,
         }
     }
 
@@ -10828,6 +10852,40 @@ impl Catalog {
     fn all_fks(&self) -> impl Iterator<Item = (&String, &Vec<FkEdge>)> {
         self.fks.iter()
     }
+
+    /// The first foreign key joining tables `a` and `b`, in either direction —
+    /// the one, where [`fk_edge_count`] says there is exactly one.
+    fn fk_edge_between(&self, a: &str, b: &str) -> Option<&FkEdge> {
+        let one_way = |from: &str, to: &str| {
+            self.fks_of(from)?
+                .iter()
+                .find(|e| e.ref_table.eq_ignore_ascii_case(to))
+        };
+        one_way(a, b).or_else(|| one_way(b, a))
+    }
+
+    /// The primary-key columns of a resolved reference, in the table's case and
+    /// the key's declared order — `None` when none is declared, when the
+    /// reference names another loaded database's table, whose keys this
+    /// catalogue does not hold ([`Catalog::pks`] is active-db scoped), or when
+    /// two tables of that name have different keys ([`Catalog::pk_shared`]).
+    fn key_columns_of(&self, r: &TableRef) -> Option<Vec<&String>> {
+        if let Some(q) = &r.db {
+            let q = q.to_ascii_lowercase();
+            if self.loaded_dbs.contains(&q) && self.active_db.as_deref() != Some(q.as_str()) {
+                return None;
+            }
+        }
+        let name = r.name.to_ascii_lowercase();
+        if self.pk_shared.contains(&name) {
+            return None;
+        }
+        let cols = self.columns_of(r)?;
+        self.pk_of(&name)?
+            .iter()
+            .map(|k| cols.iter().find(|c| c.eq_ignore_ascii_case(k)))
+            .collect()
+    }
 }
 
 /// The qualifier to write for a table reference in a predicate: its alias if it
@@ -12376,11 +12434,13 @@ fn is_real_statement(stmt: &sqlparser::ast::Statement) -> bool {
 /// verbatim when the user presses Tab — or `None` when nothing is certain
 /// enough to offer.
 ///
-/// **Deterministic, and only where the answer is close to certain.** Seven
+/// **Deterministic, and only where the answer is close to certain.** Eight
 /// producers, asked in this order, each answering only its own shape:
 ///
 /// - an empty `JOIN … ON` → the foreign-key condition ([`join_condition`]);
 /// - `INSERT INTO t (` → `t`'s columns and the closing paren;
+/// - `REFERENCES t (`, `ON CONFLICT (`, `USING (` → the key the schema says
+///   goes there ([`paren_contents`]);
 /// - `GROUP BY ` → the projection's non-aggregated expressions, read off the
 ///   parsed statement in front of it;
 /// - an empty `JOIN ` → the one table a foreign key reaches, with its `ON`
@@ -12424,6 +12484,7 @@ pub fn predict(sql: &str, caret: usize, catalog: &Catalog, dialect: SqlDialect) 
     let toks = tokenize_range(sql, lo, caret, dialect);
     let guess = join_condition(sql, lo, hi, caret, catalog, dialect)
         .or_else(|| insert_columns(&toks, catalog, dialect, closed))
+        .or_else(|| paren_contents(sql, (lo, hi, caret), &toks, catalog, dialect, closed))
         .or_else(|| group_by_items(sql, lo, &toks, dialect))
         .or_else(|| join_target_guess(sql, (lo, hi, caret), &toks, catalog, dialect))
         .or_else(|| join_on_guess(sql, (lo, hi, caret), &toks, catalog, dialect))
@@ -13035,52 +13096,19 @@ fn join_on_guess(
     catalog: &Catalog,
     dialect: SqlDialect,
 ) -> Option<String> {
-    fn word(t: &Token) -> Option<&str> {
-        match &t.kind {
-            TkKind::Word(w) => Some(w.as_str()),
-            _ => None,
-        }
-    }
-    let is_kw =
-        |t: &Token, kw: &str| !t.quoted && word(t).is_some_and(|w| w.eq_ignore_ascii_case(kw));
-    let join_idx = toks.iter().rposition(|t| is_kw(t, "JOIN"))?;
-    let join = word(&toks[join_idx])?;
-    let (name, alias) = match &toks[join_idx + 1..] {
-        [name @ .., as_kw, alias] if is_kw(as_kw, "AS") => (name, alias),
-        [name @ .., alias] => (name, alias),
-        [] => return None,
-    };
-    let alias_text = word(alias)?;
-    if !alias.quoted && is_reserved_word(alias_text, dialect) {
+    let join_idx = toks
+        .iter()
+        .rposition(|t| bare_upper(t).as_deref() == Some("JOIN"))?;
+    let TkKind::Word(join) = &toks[join_idx].kind else {
         return None;
-    }
-    // `t`, `q.t` or `db.q.t`, and nothing else, between `JOIN` and the alias.
-    let dot = |t: &Token| matches!(t.kind, TkKind::Dot);
-    let table = match name {
-        [t] => word(t)?,
-        [_, d, t] if dot(d) => word(t)?,
-        [_, d1, _, d2, t] if dot(d1) && dot(d2) => word(t)?,
-        _ => return None,
     };
+    let written = joined_table(&toks[join_idx + 1..], dialect)?;
+    written.1.as_ref()?;
     let scope = statement_scope(sql, lo, hi, caret, dialect).tables;
-    let same = |r: &TableRef| {
-        r.name.eq_ignore_ascii_case(table)
-            && r.alias
-                .as_deref()
-                .is_some_and(|a| a.eq_ignore_ascii_case(alias_text))
-    };
-    let joined = scope.iter().find(|r| same(r))?;
-    let mut condition = None;
-    for other in scope.iter().filter(|r| !same(r)) {
-        match fk_edge_count(catalog, &joined.name, &other.name) {
-            0 => continue,
-            1 if condition.is_none() => {
-                condition = Some(fk_predicate(catalog, joined, other, dialect)?);
-            }
-            _ => return None,
-        }
-    }
-    Some(format!("{} {}", in_typed_case("ON", join), condition?))
+    let joined = find_joined(&scope, &written)?;
+    let other = sole_fk_partner(catalog, &scope, joined)?;
+    let condition = fk_predicate(catalog, joined, other, dialect)?;
+    Some(format!("{} {condition}", in_typed_case("ON", join)))
 }
 
 /// [`predict`]'s `INSERT INTO t (` producer: `t`'s columns, in table order,
@@ -13102,40 +13130,47 @@ fn insert_columns(
     dialect: SqlDialect,
     closed: bool,
 ) -> Option<String> {
+    // The `(` straight after the target's name, and nothing else.
+    let (target, after) = insert_target(toks, dialect)?;
+    if after + 1 != toks.len() || !matches!(toks[after].kind, TkKind::LParen) {
+        return None;
+    }
+    let r = catalog.resolve_located(&target)?;
+    column_list(&catalog.insert_columns_of(&r)?, dialect, closed)
+}
+
+/// `cols` as a predicted column list: quoted where they need it, and the
+/// closing paren unless one already follows. `None` for no columns.
+fn column_list<S: AsRef<str>>(cols: &[S], dialect: SqlDialect, closed: bool) -> Option<String> {
+    if cols.is_empty() {
+        return None;
+    }
+    let list: Vec<String> = cols
+        .iter()
+        .map(|c| crate::export::ident_if_needed(c.as_ref(), dialect))
+        .collect();
+    let close = if closed { "" } else { ")" };
+    Some(format!("{}{close}", list.join(", ")))
+}
+
+/// A table name written as `name` tokens — `t`, `q.t`, `db.q.t` or `db..t`,
+/// and nothing else — as the reference [`Catalog::resolve_located`] takes.
+fn written_table(name: &[Token]) -> Option<LocatedRef> {
     fn word(t: &Token) -> Option<&str> {
         match &t.kind {
             TkKind::Word(w) => Some(w.as_str()),
             _ => None,
         }
     }
-    let head = word(toks.first()?)?;
-    if !(head.eq_ignore_ascii_case("INSERT") || head.eq_ignore_ascii_case("REPLACE")) {
-        return None;
-    }
-    if !matches!(toks.last()?.kind, TkKind::LParen) {
-        return None;
-    }
-    // The name starts after `INTO` — or, where the engine lets it be left out,
-    // straight after `INSERT` (`INSERT t (`).
-    let name_from = match toks
-        .iter()
-        .position(|t| !t.quoted && word(t).is_some_and(|w| w.eq_ignore_ascii_case("INTO")))
-    {
-        Some(into) => into + 1,
-        None if insert_into_is_optional(dialect) => 1,
-        None => return None,
-    };
-    // `name`, `db.name`, `db.schema.name` or `db..name`, and nothing else,
-    // between there and the `(`.
     let dot = |t: &Token| matches!(t.kind, TkKind::Dot);
-    let (database, qualifier, table) = match &toks[name_from..toks.len() - 1] {
+    let (database, qualifier, table) = match name {
         [t] => (None, None, word(t)?),
         [q, d, t] if dot(d) => (None, Some(word(q)?), word(t)?),
         [db, d1, q, d2, t] if dot(d1) && dot(d2) => (Some(word(db)?), Some(word(q)?), word(t)?),
         [db, d1, d2, t] if dot(d1) && dot(d2) => (Some(word(db)?), None, word(t)?),
         _ => return None,
     };
-    let located = LocatedRef {
+    Some(LocatedRef {
         r: TableRef {
             name: table.to_string(),
             alias: None,
@@ -13143,18 +13178,210 @@ fn insert_columns(
         },
         pos: (0, 0),
         database: database.map(str::to_string),
-    };
-    let r = catalog.resolve_located(&located)?;
-    let cols = catalog.insert_columns_of(&r)?;
-    if cols.is_empty() {
+    })
+}
+
+/// The table an `INSERT`/`REPLACE` in `toks` writes, and the index of the
+/// token after its name.
+///
+/// The name starts after `INTO` — or, where [`insert_into_is_optional`] lets
+/// it be left out, straight after `INSERT` (`INSERT t (`) — and runs while
+/// words and dots alternate.
+fn insert_target(toks: &[Token], dialect: SqlDialect) -> Option<(LocatedRef, usize)> {
+    let head = bare_upper(toks.first()?)?;
+    if head != "INSERT" && head != "REPLACE" {
         return None;
     }
-    let list: Vec<String> = cols
+    let name_from = match toks
         .iter()
-        .map(|c| crate::export::ident_if_needed(c, dialect))
-        .collect();
-    let close = if closed { "" } else { ")" };
-    Some(format!("{}{close}", list.join(", ")))
+        .position(|t| bare_upper(t).as_deref() == Some("INTO"))
+    {
+        Some(into) => into + 1,
+        None if insert_into_is_optional(dialect) => 1,
+        None => return None,
+    };
+    let is_word = |j: usize| {
+        toks.get(j)
+            .is_some_and(|t| matches!(t.kind, TkKind::Word(_)))
+    };
+    let is_dot = |j: usize| toks.get(j).is_some_and(|t| matches!(t.kind, TkKind::Dot));
+    if !is_word(name_from) {
+        return None;
+    }
+    let mut end = name_from + 1;
+    while is_dot(end) {
+        end += 1;
+        if is_dot(end) {
+            end += 1;
+        }
+        if !is_word(end) {
+            return None;
+        }
+        end += 1;
+    }
+    Some((written_table(&toks[name_from..end])?, end))
+}
+
+/// The table a `JOIN` introduces, read from the tokens after it: its name
+/// (any form [`written_table`] reads) and its alias when one is written
+/// (`t c`, `t AS c`).
+/// `None` when they are anything more — a condition begun, a subquery — or
+/// when an unquoted reserved word stands where the alias would (`t WHERE`).
+fn joined_table(after: &[Token], dialect: SqlDialect) -> Option<(String, Option<String>)> {
+    if let Some(name) = written_table(after) {
+        return Some((name.r.name, None));
+    }
+    let (name, alias) = match after {
+        [name @ .., as_kw, alias] if bare_upper(as_kw).as_deref() == Some("AS") => (name, alias),
+        [name @ .., alias] => (name, alias),
+        [] => return None,
+    };
+    let TkKind::Word(alias_text) = &alias.kind else {
+        return None;
+    };
+    if !alias.quoted && is_reserved_word(alias_text, dialect) {
+        return None;
+    }
+    Some((written_table(name)?.r.name, Some(alias_text.clone())))
+}
+
+/// The one other table in `scope` a foreign key joins `joined` to, by exactly
+/// one key ([`fk_edge_count`]) — `None` if there are none, or more than one
+/// table or key to choose between.
+fn sole_fk_partner<'a>(
+    catalog: &Catalog,
+    scope: &'a [TableRef],
+    joined: &TableRef,
+) -> Option<&'a TableRef> {
+    let mut partner = None;
+    for other in scope
+        .iter()
+        .filter(|r| !std::ptr::eq(*r, joined) && !same_ref(r, joined))
+    {
+        match fk_edge_count(catalog, &joined.name, &other.name) {
+            0 => continue,
+            1 if partner.is_none() => partner = Some(other),
+            _ => return None,
+        }
+    }
+    partner
+}
+
+/// The same table reference: name and alias alike, ignoring case.
+fn same_ref(a: &TableRef, b: &TableRef) -> bool {
+    a.name.eq_ignore_ascii_case(&b.name)
+        && match (&a.alias, &b.alias) {
+            (Some(x), Some(y)) => x.eq_ignore_ascii_case(y),
+            (None, None) => true,
+            _ => false,
+        }
+}
+
+/// The table [`joined_table`] names, found in `scope` (which carries what the
+/// catalog keys it by).
+fn find_joined<'a>(
+    scope: &'a [TableRef],
+    (table, alias): &(String, Option<String>),
+) -> Option<&'a TableRef> {
+    scope.iter().find(|r| {
+        same_ref(
+            r,
+            &TableRef {
+                name: table.clone(),
+                alias: alias.clone(),
+                db: None,
+            },
+        )
+    })
+}
+
+/// [`predict`]'s schema-read paren producer: what a `(` holds when the schema
+/// says so — `REFERENCES t (` the referenced key, `ON CONFLICT (` the key the
+/// `INSERT` writes, `USING (` the columns a join's one key pairs.
+fn paren_contents(
+    sql: &str,
+    (lo, hi, caret): (usize, usize, usize),
+    toks: &[Token],
+    catalog: &Catalog,
+    dialect: SqlDialect,
+    closed: bool,
+) -> Option<String> {
+    let [.., kw, lp] = toks else {
+        return None;
+    };
+    if !matches!(lp.kind, TkKind::LParen) {
+        return None;
+    }
+    let body = &toks[..toks.len() - 1];
+    if let Some(r) = body
+        .iter()
+        .rposition(|t| bare_upper(t).as_deref() == Some("REFERENCES"))
+        && let Some(target) = written_table(&body[r + 1..])
+    {
+        let key = catalog.key_columns_of(&catalog.resolve_located(&target)?)?;
+        return column_list(&key, dialect, closed);
+    }
+    match bare_upper(kw)?.as_str() {
+        "CONFLICT" => conflict_key(toks, catalog, dialect, closed),
+        "USING" => {
+            let join = body
+                .iter()
+                .rposition(|t| bare_upper(t).as_deref() == Some("JOIN"))?;
+            let written = joined_table(&body[join + 1..body.len() - 1], dialect)?;
+            let scope = statement_scope(sql, lo, hi, caret, dialect).tables;
+            let joined = find_joined(&scope, &written)?;
+            let other = sole_fk_partner(catalog, &scope, joined)?;
+            let edge = catalog.fk_edge_between(&joined.name, &other.name)?;
+            let alike = edge.columns.len() == edge.ref_columns.len()
+                && edge
+                    .columns
+                    .iter()
+                    .zip(&edge.ref_columns)
+                    .all(|(a, b)| a.eq_ignore_ascii_case(b));
+            alike
+                .then(|| column_list(&edge.columns, dialect, closed))
+                .flatten()
+        }
+        _ => None,
+    }
+}
+
+/// `INSERT … ON CONFLICT (` → the target's primary key, when the `INSERT`
+/// writes every column of it. One that leaves the key to the server — a
+/// column list without it — conflicts on some other unique column, which the
+/// catalog does not record, so nothing is predicted.
+fn conflict_key(
+    toks: &[Token],
+    catalog: &Catalog,
+    dialect: SqlDialect,
+    closed: bool,
+) -> Option<String> {
+    let [.., on, _, _] = toks else {
+        return None;
+    };
+    if bare_upper(on).as_deref() != Some("ON") {
+        return None;
+    }
+    let (target, after) = insert_target(toks, dialect)?;
+    let key = catalog.key_columns_of(&catalog.resolve_located(&target)?)?;
+    // The column list, if one follows the name: its words at depth one.
+    if matches!(toks[after].kind, TkKind::LParen) && after + 1 < toks.len() - 1 {
+        let mut listed = Vec::new();
+        for t in &toks[after + 1..] {
+            match &t.kind {
+                TkKind::RParen => break,
+                TkKind::Word(w) => listed.push(w.as_str()),
+                _ => {}
+            }
+        }
+        if !key
+            .iter()
+            .all(|k| listed.iter().any(|l| l.eq_ignore_ascii_case(k)))
+        {
+            return None;
+        }
+    }
+    column_list(&key, dialect, closed)
 }
 
 /// The aggregates a `GROUP BY` prediction leaves out of the grouping list —
@@ -14122,6 +14349,161 @@ mod predict_tests {
         assert_eq!(pg("GRANT SELECT ON ALL TABLES IN SCHEMA "), None);
         assert_eq!(my("GRANT SELECT ON orders TO "), None);
         assert_eq!(my("GRANT SELECT ON "), None);
+    }
+
+    /// `shop` with its keys declared, plus `invoices.customer_id →
+    /// clients.customer_id` — a key named alike on both sides.
+    fn keyed() -> DbSchema {
+        let mut schema = shop();
+        for t in &mut schema.tables {
+            t.columns[0].primary_key = true;
+        }
+        let mut clients = tbl("clients", &["customer_id", "name"]);
+        clients.columns[0].primary_key = true;
+        let mut invoices = tbl("invoices", &["id", "customer_id"]);
+        invoices.foreign_keys = vec![ForeignKeyInfo {
+            columns: vec!["customer_id".to_string()],
+            ref_table: "clients".to_string(),
+            ref_columns: vec!["customer_id".to_string()],
+            ..Default::default()
+        }];
+        schema.tables.push(clients);
+        schema.tables.push(invoices);
+        schema
+    }
+
+    /// The prediction at the `|` in `sql` over [`keyed`].
+    fn keyed_at(sql: &str, dialect: SqlDialect) -> Option<String> {
+        let (text, caret) = match sql.find('|') {
+            Some(at) => (sql.replacen('|', "", 1), at),
+            None => (sql.to_string(), sql.len()),
+        };
+        let schema = keyed();
+        let cat = Catalog::build(&[("shop", &schema)], Some("shop"));
+        predict(&text, caret, &cat, dialect)
+    }
+
+    /// A foreign key's `REFERENCES t (` names `t`'s primary key.
+    #[test]
+    fn references_predicts_the_referenced_tables_key() {
+        let k = |sql: &str| keyed_at(sql, SqlDialect::MySql);
+        assert_eq!(
+            k("CREATE TABLE t (c int REFERENCES customers (").as_deref(),
+            Some("id)")
+        );
+        assert_eq!(
+            k("ALTER TABLE t ADD FOREIGN KEY (c) REFERENCES shop.customers (|)").as_deref(),
+            Some("id")
+        );
+        assert_eq!(k("CREATE TABLE t (c int REFERENCES nowhere ("), None);
+        // No key declared, nothing to name.
+        assert_eq!(my("CREATE TABLE t (c int REFERENCES customers ("), None);
+    }
+
+    /// A composite key is named in the order it was declared — MySQL wants the
+    /// referenced columns in its index's order — not the table's.
+    #[test]
+    fn references_names_a_composite_key_in_its_declared_order() {
+        let mut lines = tbl("lines", &["order_id", "line_no", "sku"]);
+        lines.columns[0].primary_key = true;
+        lines.columns[1].primary_key = true;
+        lines.indexes = vec![crate::schema::IndexInfo {
+            name: "PRIMARY".to_string(),
+            columns: ["line_no", "order_id"]
+                .iter()
+                .map(|c| crate::schema::IndexColumn {
+                    name: c.to_string(),
+                    ..Default::default()
+                })
+                .collect(),
+            unique: true,
+            ..Default::default()
+        }];
+        let schema = DbSchema {
+            tables: vec![lines],
+            ..Default::default()
+        };
+        assert_eq!(
+            in_schema(
+                &schema,
+                "CREATE TABLE t (a int, b int, FOREIGN KEY (a, b) REFERENCES lines (",
+                SqlDialect::MySql
+            )
+            .as_deref(),
+            Some("line_no, order_id)")
+        );
+    }
+
+    /// Two same-named tables in two namespaces of one database have two keys,
+    /// and which one a reference means is not this catalogue's to say.
+    #[test]
+    fn references_to_a_name_two_tables_share_predicts_nothing() {
+        let mut sales = tbl("orders", &["id", "code"]);
+        sales.schema = Some("sales".to_string());
+        sales.columns[0].primary_key = true;
+        let mut dbo = tbl("orders", &["id", "code"]);
+        dbo.schema = Some("dbo".to_string());
+        dbo.columns[1].primary_key = true;
+        let schema = DbSchema {
+            tables: vec![sales, dbo],
+            ..Default::default()
+        };
+        assert_eq!(
+            in_schema(
+                &schema,
+                "CREATE TABLE t (c int REFERENCES dbo.orders (",
+                SqlDialect::MsSql
+            ),
+            None
+        );
+        // No key is a different key too: the keyless one must not get the other's.
+        let mut keyless = schema.clone();
+        keyless.tables[0].columns[0].primary_key = false;
+        assert_eq!(
+            in_schema(
+                &keyless,
+                "CREATE TABLE t (c int REFERENCES sales.orders (",
+                SqlDialect::MsSql
+            ),
+            None
+        );
+    }
+
+    /// `ON CONFLICT (` names the target's key — when the `INSERT` writes it.
+    /// One that leaves the key to the server conflicts on something else.
+    #[test]
+    fn on_conflict_predicts_the_key_the_insert_writes() {
+        let k = |sql: &str| keyed_at(sql, SqlDialect::Postgres);
+        assert_eq!(
+            k("INSERT INTO customers (id, name) VALUES (1, 'a') ON CONFLICT (").as_deref(),
+            Some("id)")
+        );
+        assert_eq!(
+            k("INSERT INTO customers VALUES (1, 'a') ON CONFLICT (|)").as_deref(),
+            Some("id")
+        );
+        assert_eq!(
+            k("INSERT INTO customers (name) VALUES ('a') ON CONFLICT ("),
+            None
+        );
+        assert_eq!(k("INSERT INTO nowhere VALUES (1) ON CONFLICT ("), None);
+    }
+
+    /// `USING (` names the columns a join's one key pairs — when they are
+    /// named alike on both sides, which is what `USING` requires.
+    #[test]
+    fn using_predicts_a_key_named_alike_on_both_sides() {
+        let k = |sql: &str| keyed_at(sql, SqlDialect::MySql);
+        assert_eq!(
+            k("SELECT * FROM invoices i JOIN clients c USING (").as_deref(),
+            Some("customer_id)")
+        );
+        assert_eq!(
+            k("SELECT * FROM invoices JOIN clients USING (|)").as_deref(),
+            Some("customer_id")
+        );
+        assert_eq!(k("SELECT * FROM orders o JOIN customers c USING ("), None);
+        assert_eq!(k("SELECT * FROM orders o JOIN invoices i USING ("), None);
     }
 }
 

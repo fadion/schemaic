@@ -1757,11 +1757,13 @@ existing prose was left alone.
     `noise_in_the_middle_is_not_stitched_around` pins, and it is the reason the guard exists. The
     cost is deliberate: a valid statement this parser cannot handle is refused rather than shown.
     **`predict` is the editor's inline ghost — deterministic, not AI, and offered only where the
-    answer is close to certain.** It returns the text Tab would insert at the caret, from seven
+    answer is close to certain.** It returns the text Tab would insert at the caret, from eight
     producers asked in order, each answering only its own shape: an empty `JOIN … ON` gets
     `join_condition`'s foreign-key predicate; `INSERT`/`REPLACE … INTO t (` (its target read as the
     engine writes it, below) gets the columns an `INSERT` writes, from `Catalog::insert_columns_of`, quoted through
-    `export::ident_if_needed` like every fragment above, plus a `)` unless one already follows;
+    `export::ident_if_needed` like every fragment above, plus a `)` unless one already follows
+    (`column_list`); a `(` whose contents the schema fixes — `REFERENCES t (`, `ON CONFLICT (`,
+    `USING (` — gets them (`paren_contents`, below);
     `GROUP BY ` gets the grouping list; an empty `JOIN ` gets the whole join, `table ON condition`
     (`join_target_guess`); `JOIN t alias ` gets `ON` and the condition (`join_on_guess`); a
     keyword whose partner the grammar fixes gets the partner (`ORDER`/`GROUP`/`PARTITION` → `BY`,
@@ -1863,14 +1865,42 @@ existing prose was left alone.
     keys to one table or nothing left to reach make which join is meant a choice, and the table
     list is the place to make it; a table's key to itself counts twice, since which side is the
     parent is that same choice. `join_on_guess` holds a table already written — `t`, `q.t` or
-    `db.q.t` — to the same bar, offering `fk_predicate`'s condition only when exactly one other
-    table in scope is joined to it, by one key. **Only with an alias** (`JOIN t c ` or `JOIN t AS c `): after a bare `JOIN t `
+    `db.q.t`, read by `joined_table` — to the same bar, offering `fk_predicate`'s condition only
+    when exactly one other table in scope is joined to it, by one key (`sole_fk_partner`, which
+    `USING (` asks too). **Only with an alias** (`JOIN t c ` or `JOIN t AS c `): after a bare `JOIN t `
     the next word may well be the alias, and an unquoted reserved word in its place
     (`JOIN t WHERE `, by `is_reserved_word`) is not one
     (`an_empty_join_predicts_the_one_table_a_foreign_key_reaches`,
     `an_empty_join_predicts_nothing_when_the_table_is_not_certain`,
     `a_joined_table_and_its_alias_predict_the_on_condition`,
     `a_joined_table_predicts_no_condition_it_cannot_be_sure_of`).
+    **A `(` is filled from the schema only where the schema names one answer.** `paren_contents`,
+    asked right after `insert_columns`, answers three openers through the same `column_list`.
+    `REFERENCES t (` gets `t`'s primary key from `Catalog::key_columns_of` — its columns in the
+    table's case but in the key's **declared** order, which `Catalog::build` reads off the primary
+    index and falls back to the `primary_key` flags in column order only where there is none. A
+    foreign key's referenced columns follow the key's order — MySQL wants them in the referenced
+    index's — so `PRIMARY KEY (b, a)` must give `b, a`, and table order gave `a, b`
+    (`references_names_a_composite_key_in_its_declared_order`). It predicts nothing when no key is
+    declared; when the reference names another loaded database's table, whose key `Catalog::pks`
+    (active-database scoped) does not hold; or when two tables in scope share the name with
+    different keys — `sales.orders` and `dbo.orders`, no key counting as a different one. `pks` is
+    keyed by the bare name and keeps whichever was indexed last, so the reference to the other one
+    got that one's key; `Catalog::pk_shared` records such names, comparing every in-scope table's
+    key (an empty one included), and `key_columns_of` refuses them
+    (`references_to_a_name_two_tables_share_predicts_nothing`). `INSERT … ON CONFLICT (` gets the
+    target's key through the same `key_columns_of` (`conflict_key`, the target read by the same
+    `insert_target` as the column list), but only when the `INSERT` writes every key
+    column — all of them in its column list, or no list at all, which writes every column. One
+    that leaves the key to the server conflicts on some other unique column, which the catalogue
+    does not record, so naming the key there would be a guess. `JOIN t [alias] USING (` reads the
+    joined table through `joined_table` and `sole_fk_partner` as `join_on_guess` does — an alias
+    is optional, since `USING` already stands where one would — and gets the columns of that one
+    key (`Catalog::fk_edge_between`) only when they are named alike on both sides, which is what
+    `USING` requires: `orders.customer_id → customers.id` predicts nothing
+    (`references_predicts_the_referenced_tables_key`,
+    `on_conflict_predicts_the_key_the_insert_writes`,
+    `using_predicts_a_key_named_alike_on_both_sides`).
     **An operand's partner waits for the operand to be finished.** `operand_partner` answers where
     what has just been written is a construct's operand and the next word is fixed, each in the
     case its keyword was typed: `BETWEEN x ` → `AND` (`between_and`, once `x` is finished at
