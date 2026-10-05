@@ -11022,9 +11022,9 @@ pub fn join_condition(
     catalog: &Catalog,
     dialect: SqlDialect,
 ) -> Option<String> {
-    let (joined, scope) = empty_on_join(sql, lo, hi, caret, dialect)?;
-    // Pair it with each other in-scope table; first FK match wins.
-    for other in &scope {
+    let joined = empty_on_join(sql, lo, hi, caret, dialect)?;
+    // Pair it with each other table of its query; first FK match wins.
+    for other in &query_scope(sql, lo, hi, caret, dialect) {
         if other.name.eq_ignore_ascii_case(&joined.name) && other.alias == joined.alias {
             continue;
         }
@@ -11036,7 +11036,7 @@ pub fn join_condition(
 }
 
 /// The table a *fresh* `JOIN … ON` introduced — the caret right after `ON`,
-/// nothing typed yet — and the statement's scope, which holds it.
+/// nothing typed yet — when the statement's scope holds it.
 ///
 /// Only the first `ON` after its `JOIN` is the join's condition: a second is
 /// MySQL's `ON DUPLICATE KEY`, PostgreSQL's `ON CONFLICT ON`, or a mistake.
@@ -11047,7 +11047,7 @@ fn empty_on_join(
     hi: usize,
     caret: usize,
     dialect: SqlDialect,
-) -> Option<(TableRef, Vec<TableRef>)> {
+) -> Option<TableRef> {
     let toks = tokenize_range(sql, lo, hi, dialect);
     // The last clause keyword strictly before the caret must be `ON`.
     let mut last_kw_idx = None;
@@ -11114,8 +11114,8 @@ fn empty_on_join(
     // the `ON` is the *inner* one, so there is no paren in between and the
     // proposal was an alias that exists only inside the subquery.
     // `statement_scope` tracks paren scoping (an empty `ON` never parses, so
-    // this is `lexer_scope`'s answer), and it is the same set `join_targets`
-    // has always used.
+    // this is `lexer_scope`'s answer). Which of those tables the joined one is
+    // paired with is the callers' `query_scope`, which reads its query alone.
     let scope = statement_scope(sql, lo, hi, caret, dialect).tables;
     let in_scope = |r: &TableRef| {
         scope
@@ -11125,7 +11125,7 @@ fn empty_on_join(
     if !in_scope(&joined) {
         return None;
     }
-    Some((joined, scope))
+    Some(joined)
 }
 
 /// `CROSS` or `NATURAL` when either leads the `JOIN` that `before` runs up to
@@ -11212,6 +11212,10 @@ pub fn join_targets(
     let Some(join_idx) = join_idx else {
         return Vec::new();
     };
+    // Every row writes an `ON`, so none for a join that takes none.
+    if !join_takes_a_condition(&toks[..join_idx], dialect) {
+        return Vec::new();
+    }
     // No complete table already typed between `JOIN` and the partial prefix.
     for t in &toks[join_idx + 1..] {
         if t.at >= word_lo {
@@ -11221,8 +11225,7 @@ pub fn join_targets(
             return Vec::new();
         }
     }
-    let scope = statement_scope(sql, lo, hi, caret, dialect).tables;
-    join_targets_for(&scope, catalog, dialect)
+    join_targets_for(&query_scope(sql, lo, hi, caret, dialect), catalog, dialect)
 }
 
 /// The FK-connected join candidates for a set of in-scope tables (both edge
@@ -13647,7 +13650,7 @@ fn on_condition_guess(
     catalog: &Catalog,
     dialect: SqlDialect,
 ) -> Option<String> {
-    let (joined, _) = empty_on_join(sql, lo, hi, caret, dialect)?;
+    let joined = empty_on_join(sql, lo, hi, caret, dialect)?;
     let scope = query_scope(sql, lo, hi, caret, dialect);
     let joined = scope.iter().find(|s| same_ref(s, &joined))?;
     let other = sole_fk_partner(catalog, &scope, joined)?;
@@ -22466,7 +22469,7 @@ mod tests {
     /// reaches `lexer_scope` because a half-typed `JOIN` does not parse.
     #[test]
     fn a_join_modifier_is_not_the_left_table_alias() {
-        for dialect in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite] {
+        for dialect in SqlDialect::ALL {
             for modifier in [
                 "LEFT",
                 "INNER",
@@ -22492,6 +22495,11 @@ mod tests {
                 );
                 let sql = format!("SELECT * FROM orders {modifier} JOIN ");
                 let ts = jt_on(&sql, dialect);
+                // Each row writes an `ON`, so none where the join takes none.
+                if !takes_on {
+                    assert!(ts.is_empty(), "{modifier} on {dialect:?} offers {ts:?}");
+                    continue;
+                }
                 let cust = ts
                     .iter()
                     .find(|t| t.table == "customers")
@@ -22525,6 +22533,27 @@ mod tests {
                 "{dialect:?}"
             );
         }
+    }
+
+    /// **The popup's FK join rows pair the tables of the join's own query.**
+    /// An `INSERT`'s target sits in the statement beside the `SELECT` feeding
+    /// it, and was paired as if the query could see it: `line_items.order_id
+    /// = o.id` for an `ON` the `SELECT` writes, and `orders ON
+    /// line_items.order_id = orders.id` for its `JOIN`.
+    #[test]
+    fn the_popups_join_rows_read_the_joins_own_query() {
+        let insert =
+            "INSERT INTO line_items (order_id) SELECT o.id FROM customers c JOIN orders o ON ";
+        assert_eq!(
+            join_at_on(insert, insert.len(), SqlDialect::MySql).as_deref(),
+            Some("o.customer_id = c.id")
+        );
+        let ts = jt("INSERT INTO line_items (order_id) SELECT c.id FROM customers c JOIN ");
+        let orders = ts
+            .iter()
+            .find(|t| t.table == "orders")
+            .expect("orders is offered");
+        assert_eq!(orders.predicate, "orders.customer_id = c.id");
     }
 
     #[test]

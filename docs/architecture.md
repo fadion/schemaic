@@ -1982,7 +1982,8 @@ existing prose was left alone.
     the ghost offered `s.bill_to = a.id` with a `ship_to` key beside it, `m.manager_id = e.id` for
     a self-join, where which side is the parent is exactly the choice, and a partner from outside
     the query (`an_empty_on_predicts_only_the_condition_one_key_decides`). The popup's own rows,
-    `join_condition` and `join_targets`, still take the first key and read `statement_scope`.
+    `join_condition` and `join_targets`, still take the first key — the popup is a list to choose
+    from, where the ghost is one offer and is held to one key.
     **A name two tables share pairs nothing.** The foreign keys are held by bare name (`fks`), as
     `pks` is, so beside `sales.orders` and its key to `customers`, `FROM dbo.orders o JOIN ` was
     offered `customers ON o.customer_id = customers.id` — through a column `dbo.orders` does not
@@ -1996,7 +1997,8 @@ existing prose was left alone.
     under the one name: the condition then reads a column the table has, though not necessarily
     a key it declared. `Catalog::pk_shared`, below, is the same refusal for a primary key.
     **The tables these producers pair are the caret's own query's** — `on_condition_guess`,
-    `join_target_guess`, `join_on_guess` and the `USING (` arm all read `query_scope`, where
+    `join_target_guess`, `join_on_guess` and the `USING (` arm all read `query_scope`, as do the
+    popup's `join_condition` and `join_targets`, where
     `statement_scope` reads the whole statement: from `local_scope_start`, at the last `SELECT` at
     that depth (a set operation's last arm, the query after an `INSERT … `). The whole statement
     held an `INSERT`'s target beside the `SELECT` feeding it, and an `UPDATE`'s beside a subquery
@@ -2004,7 +2006,14 @@ existing prose was left alone.
     c.id` in a query that cannot see `invoices`. It also drops a bare name a CTE stands in for,
     whose columns and keys are not the catalogue table's; the names come from `cte_names`, a token
     scan of the `WITH` list, because an empty `ON` never parses and `statement_scope`'s lexer
-    fallback reports no CTEs (`a_join_is_predicted_from_its_own_querys_tables`).
+    fallback reports no CTEs (`a_join_is_predicted_from_its_own_querys_tables`). The popup rows
+    kept the whole statement after the ghost had moved off it, and paired the `INSERT`'s target as if the query
+    could see it: `INSERT INTO line_items (order_id) SELECT o.id FROM customers c JOIN orders o ON `
+    was offered `line_items.order_id = o.id`, and `… FROM customers c JOIN ` was offered
+    `orders ON line_items.order_id = orders.id` (`the_popups_join_rows_read_the_joins_own_query`,
+    red before). `empty_on_join` still asks `statement_scope` whether the joined table is in scope
+    at all — the check that keeps a table inside a joined subquery from being taken for the join's
+    own — but returns only that table; which tables it is paired with is the caller's `query_scope`.
     **Only a join that takes a condition is given one.** `empty_on_join` — split out of
     `join_condition` and shared by both surfaces, so the popup row refuses too — answers only the
     first `ON` after its `JOIN`, a second being MySQL's `ON DUPLICATE KEY` or PostgreSQL's
@@ -2012,12 +2021,18 @@ existing prose was left alone.
     `NATURAL`, and after `CROSS` only where `cross_join_takes_on` says the engine accepts the `ON`
     — MySQL reads `CROSS JOIN t ON …` as an inner join and SQLite's join operator takes a
     constraint whatever it is; PostgreSQL and SQL Server refuse it — asked as a capability through
-    an exhaustive match, as `has_apply_joins` is. The producers that would *add* an `ON` —
+    an exhaustive match, as `has_apply_joins` is. `join_targets` asks `join_takes_a_condition` too,
+    of the `JOIN` its table slot follows: every row it offers writes `table ON …`, and after
+    `NATURAL JOIN ` it offered `customers ON …`, which every engine refuses. The producers that
+    would *add* an `ON` —
     `join_target_guess`, `join_on_guess` and `USING (` — refuse after either word on every engine
     (`cross_or_natural`): a `CROSS JOIN` is written without a condition and a `NATURAL` one writes
-    its own, so the ghost would add what the user's choice of join left out
+    its own, so the ghost would add what the user's choice of join left out. The popup's table
+    rows are held only to what the engine accepts, so after `CROSS JOIN ` on MySQL or SQLite they
+    still offer an `ON` where the ghost offers none
     (`a_cross_or_natural_join_predicts_no_condition`; `a_join_modifier_is_not_the_left_table_alias`
-    holds the popup row to `join_takes_a_condition`).
+    holds both popup surfaces to `join_takes_a_condition`, the table rows red before — on MySQL,
+    PostgreSQL and SQLite; its loop leaves SQL Server out, though it shares PostgreSQL's arm).
     **A `(` is filled from the schema only where the schema names one answer.** `paren_contents`,
     asked right after `insert_columns`, answers three openers through the same `column_list`.
     `REFERENCES t (` gets `t`'s primary key from `Catalog::key_columns_of` — its columns in the
