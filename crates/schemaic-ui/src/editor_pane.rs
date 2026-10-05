@@ -2812,12 +2812,15 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         // Outdent (Shift+Tab): the inverse of the above. Same reason — floem's
         // built-in outdent uses the buffer's fixed indent width — so we remove one
         // level (a leading tab, or up to `tw` spaces) per line ourselves, which
-        // is one level whichever kind of indent the line has.
+        // is one level whichever kind of indent the line has. **With the list
+        // open too**: Tab accepts there and Shift+Tab never did, so it fell to
+        // floem's `OutdentLine` — four spaces, whatever the tab settings, and
+        // nothing at all off a hard tab. The list closes, as for any caret move.
         if !primary_held(mods)
             && mods.shift()
-            && !comp.open.get_untracked()
             && matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::Tab), _))
         {
+            comp.open.set(false);
             let tw = theme::editor_tab_width();
             editor_sig.with_untracked(|e| {
                 let full = e.doc().text().to_string();
@@ -4088,9 +4091,8 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         ))
         // `smart_tab` makes floem's own Tab insert spaces to the next tab stop.
         // Tab and Shift+Tab are the key handler's (`soft_tab_indent` /
-        // `hard_tab_indent` / `soft_tab_outdent`); this matters only where they
-        // still reach floem — Shift+Tab with the suggestion list open, whose
-        // `OutdentLine` assumes space indentation.
+        // `hard_tab_indent` / `soft_tab_outdent`), with the suggestion list
+        // open or not, so this matters only where floem's own Tab still runs.
         // `wrap_method` follows the word-wrap setting (default off = scroll long
         // SQL lines horizontally; on = wrap to the viewport width).
         .editor_style(move |s| {

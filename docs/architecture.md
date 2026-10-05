@@ -11766,8 +11766,9 @@ existing prose was left alone.
     `\t`: Tab over three selected lines left a single tab character where they had been
     (`hard_tab_indents_a_selection_rather_than_replacing_it`). `soft_tab_outdent` already removed
     one level of either kind — a leading tab, or up to the tab width in spaces — so `editor_pane`
-    now asks it whatever the setting, and a plain Shift+Tab with the suggestion list closed no
-    longer reaches floem's `OutdentLine` and its fixed `Spaces(4)` unit. **`cut_lines` is Ctrl+X on
+    now asks it whatever the setting, and a plain Shift+Tab no longer reaches floem's
+    `OutdentLine` and its fixed `Spaces(4)` unit — with the suggestion list open too, which it
+    closes (it did reach it there, Tab accepting a row and Shift+Tab falling through). **`cut_lines` is Ctrl+X on
     bare carets**: each caret's line, line end included, onto the clipboard once and in document
     order, a last line with no line end of its own taking the one before it and going onto the
     clipboard with a `\n`. It replaces floem's `DeleteLine`, which never copies — Ctrl+X then
