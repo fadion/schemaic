@@ -1766,8 +1766,8 @@ existing prose was left alone.
     cost is deliberate: a valid statement this parser cannot handle is refused rather than shown.
     **`predict` is the editor's inline ghost — deterministic, not AI, and offered only where the
     answer is close to certain.** It returns the text Tab would insert at the caret, from eight
-    producers asked in order, each answering only its own shape: an empty `JOIN … ON` gets
-    `join_condition`'s foreign-key predicate; `INSERT`/`REPLACE … INTO t (` (its target read as the
+    producers asked in order, each answering only its own shape: an empty `JOIN … ON` gets the
+    foreign-key predicate (`on_condition_guess`, below); `INSERT`/`REPLACE … INTO t (` (its target read as the
     engine writes it, below) gets the columns an `INSERT` writes, from `Catalog::insert_columns_of`, quoted through
     `export::ident_if_needed` like every fragment above, plus a `)` unless one already follows
     (`column_list`); a `(` whose contents the schema fixes — `REFERENCES t (`, `ON CONFLICT (`,
@@ -1887,8 +1887,8 @@ existing prose was left alone.
     (`group_by_knows_an_aggregate_by_its_shape_and_its_name`). A star, a projection with no key
     left or a prefix that does not parse (a half-written `FROM`) predicts nothing.
     **A join is predicted only where the schema leaves one join to make.** After an empty `JOIN `
-    the ghost is `join_targets`' own row — the one the popup's table list leads with — and only
-    when that list holds a single table which `fk_edge_count` (the keys between two tables, in
+    the ghost is a row of the kind the popup's table list leads with — `join_targets_for`, asked of
+    the query's own tables (`query_scope`, below) — and only when that list holds a single table which `fk_edge_count` (the keys between two tables, in
     either direction) finds joined to the tables in scope by a single key: `FROM orders o JOIN `
     gets `customers ON o.customer_id = customers.id`, and from the other side
     `FROM customers c JOIN ` gets `orders ON orders.customer_id = c.id`. Two reachable tables, two
@@ -1903,7 +1903,36 @@ existing prose was left alone.
     (`an_empty_join_predicts_the_one_table_a_foreign_key_reaches`,
     `an_empty_join_predicts_nothing_when_the_table_is_not_certain`,
     `a_joined_table_and_its_alias_predict_the_on_condition`,
-    `a_joined_table_predicts_no_condition_it_cannot_be_sure_of`).
+    `a_joined_table_predicts_no_condition_it_cannot_be_sure_of`). **An empty `ON` is held to the
+    same bar** by `on_condition_guess`: the joined table and `sole_fk_partner`'s one table. It used
+    to be `join_condition`, the popup's row, which takes the first key `fk_predicate` finds — so
+    the ghost offered `s.bill_to = a.id` with a `ship_to` key beside it, `m.manager_id = e.id` for
+    a self-join, where which side is the parent is exactly the choice, and a partner from outside
+    the query (`an_empty_on_predicts_only_the_condition_one_key_decides`). The popup's own rows,
+    `join_condition` and `join_targets`, still take the first key and read `statement_scope`.
+    **The tables these producers pair are the caret's own query's** — `on_condition_guess`,
+    `join_target_guess`, `join_on_guess` and the `USING (` arm all read `query_scope`, where
+    `statement_scope` reads the whole statement: from `local_scope_start`, at the last `SELECT` at
+    that depth (a set operation's last arm, the query after an `INSERT … `). The whole statement
+    held an `INSERT`'s target beside the `SELECT` feeding it, and an `UPDATE`'s beside a subquery
+    in its `SET`, so a key from the joined table to that target produced `invoices.customer_id =
+    c.id` in a query that cannot see `invoices`. It also drops a bare name a CTE stands in for,
+    whose columns and keys are not the catalogue table's; the names come from `cte_names`, a token
+    scan of the `WITH` list, because an empty `ON` never parses and `statement_scope`'s lexer
+    fallback reports no CTEs (`a_join_is_predicted_from_its_own_querys_tables`).
+    **Only a join that takes a condition is given one.** `empty_on_join` — split out of
+    `join_condition` and shared by both surfaces, so the popup row refuses too — answers only the
+    first `ON` after its `JOIN`, a second being MySQL's `ON DUPLICATE KEY` or PostgreSQL's
+    `ON CONFLICT ON`, and only where `join_takes_a_condition` says the join takes one: never after
+    `NATURAL`, and after `CROSS` only where `cross_join_takes_on` says the engine accepts the `ON`
+    — MySQL reads `CROSS JOIN t ON …` as an inner join and SQLite's join operator takes a
+    constraint whatever it is; PostgreSQL and SQL Server refuse it — asked as a capability through
+    an exhaustive match, as `has_apply_joins` is. The producers that would *add* an `ON` —
+    `join_target_guess`, `join_on_guess` and `USING (` — refuse after either word on every engine
+    (`cross_or_natural`): a `CROSS JOIN` is written without a condition and a `NATURAL` one writes
+    its own, so the ghost would add what the user's choice of join left out
+    (`a_cross_or_natural_join_predicts_no_condition`; `a_join_modifier_is_not_the_left_table_alias`
+    holds the popup row to `join_takes_a_condition`).
     **A `(` is filled from the schema only where the schema names one answer.** `paren_contents`,
     asked right after `insert_columns`, answers three openers through the same `column_list`.
     `REFERENCES t (` gets `t`'s primary key from `Catalog::key_columns_of` — its columns in the

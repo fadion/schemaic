@@ -10969,6 +10969,32 @@ pub fn join_condition(
     catalog: &Catalog,
     dialect: SqlDialect,
 ) -> Option<String> {
+    let (joined, scope) = empty_on_join(sql, lo, hi, caret, dialect)?;
+    // Pair it with each other in-scope table; first FK match wins.
+    for other in &scope {
+        if other.name.eq_ignore_ascii_case(&joined.name) && other.alias == joined.alias {
+            continue;
+        }
+        if let Some(pred) = fk_predicate(catalog, &joined, other, dialect) {
+            return Some(pred);
+        }
+    }
+    None
+}
+
+/// The table a *fresh* `JOIN … ON` introduced — the caret right after `ON`,
+/// nothing typed yet — and the statement's scope, which holds it.
+///
+/// Only the first `ON` after its `JOIN` is the join's condition: a second is
+/// MySQL's `ON DUPLICATE KEY`, PostgreSQL's `ON CONFLICT ON`, or a mistake.
+/// And only a join that takes one ([`join_takes_a_condition`]).
+fn empty_on_join(
+    sql: &str,
+    lo: usize,
+    hi: usize,
+    caret: usize,
+    dialect: SqlDialect,
+) -> Option<(TableRef, Vec<TableRef>)> {
     let toks = tokenize_range(sql, lo, hi, dialect);
     // The last clause keyword strictly before the caret must be `ON`.
     let mut last_kw_idx = None;
@@ -11003,6 +11029,13 @@ pub fn join_condition(
     let join_idx = toks[..on_idx]
         .iter()
         .rposition(|t| matches!(&t.kind, TkKind::Word(w) if w.eq_ignore_ascii_case("JOIN")))?;
+    if toks[join_idx + 1..on_idx]
+        .iter()
+        .any(|t| bare_upper(t).as_deref() == Some("ON"))
+        || !join_takes_a_condition(&toks[..join_idx], dialect)
+    {
+        return None;
+    }
     let join_at = toks[join_idx].at;
     let refs = table_refs_with_pos(sql, lo, hi, dialect);
     let joined = refs
@@ -11039,16 +11072,45 @@ pub fn join_condition(
     if !in_scope(&joined) {
         return None;
     }
-    // Pair it with each other in-scope table; first FK match wins.
-    for other in &scope {
-        if other.name.eq_ignore_ascii_case(&joined.name) && other.alias == joined.alias {
-            continue;
-        }
-        if let Some(pred) = fk_predicate(catalog, &joined, other, dialect) {
-            return Some(pred);
-        }
+    Some((joined, scope))
+}
+
+/// `CROSS` or `NATURAL` when either leads the `JOIN` that `before` runs up to
+/// (`NATURAL [LEFT|RIGHT|FULL|INNER] [OUTER] JOIN`) — a join that is not
+/// written with a condition, or writes its own.
+fn cross_or_natural(before: &[Token]) -> Option<&'static str> {
+    let lead = before.iter().rev().find(|t| {
+        !matches!(
+            bare_upper(t).as_deref(),
+            Some("LEFT" | "RIGHT" | "FULL" | "INNER" | "OUTER")
+        )
+    });
+    match lead.and_then(bare_upper).as_deref() {
+        Some("CROSS") => Some("CROSS"),
+        Some("NATURAL") => Some("NATURAL"),
+        _ => None,
     }
-    None
+}
+
+/// Does the `JOIN` that `before` runs up to accept an `ON` on this engine?
+/// Never a `NATURAL` one, and a `CROSS` one only where
+/// [`cross_join_takes_on`] says so.
+fn join_takes_a_condition(before: &[Token], dialect: SqlDialect) -> bool {
+    match cross_or_natural(before) {
+        Some("NATURAL") => false,
+        Some(_) => cross_join_takes_on(dialect),
+        None => true,
+    }
+}
+
+/// Whether `CROSS JOIN t ON …` is accepted on this engine. MySQL reads
+/// `CROSS JOIN` as `INNER JOIN`, and SQLite's join operator takes a constraint
+/// whatever it is; PostgreSQL and SQL Server refuse the `ON`.
+fn cross_join_takes_on(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MySql | SqlDialect::Sqlite => true,
+        SqlDialect::Postgres | SqlDialect::MsSql => false,
+    }
 }
 
 /// A foreign-key-connected table to offer at a `JOIN` slot: the table to insert and
@@ -12447,7 +12509,8 @@ fn is_real_statement(stmt: &sqlparser::ast::Statement) -> bool {
 /// **Deterministic, and only where the answer is close to certain.** Eight
 /// producers, asked in this order, each answering only its own shape:
 ///
-/// - an empty `JOIN … ON` → the foreign-key condition ([`join_condition`]);
+/// - an empty `JOIN … ON` → the foreign-key condition, where one key decides
+///   it ([`on_condition_guess`]);
 /// - `INSERT INTO t (` → `t`'s columns and the closing paren;
 /// - `REFERENCES t (`, `ON CONFLICT (`, `USING (` → the key the schema says
 ///   goes there ([`paren_contents`]);
@@ -12497,7 +12560,7 @@ pub fn predict(sql: &str, caret: usize, catalog: &Catalog, dialect: SqlDialect) 
         return None;
     }
     let toks = tokenize_range(sql, lo, caret, dialect);
-    let guess = join_condition(sql, lo, hi, caret, catalog, dialect)
+    let guess = on_condition_guess(sql, (lo, hi, caret), catalog, dialect)
         .or_else(|| insert_columns(&toks, catalog, dialect, closed))
         .or_else(|| paren_contents(sql, (lo, hi, caret), &toks, catalog, dialect, closed))
         .or_else(|| group_by_items(sql, lo, &toks, dialect))
@@ -13199,12 +13262,105 @@ fn fk_edge_count(catalog: &Catalog, a: &str, b: &str) -> usize {
     one_way(a, b) + one_way(b, a)
 }
 
+/// The tables of the query the caret is in — what the predictions that pair
+/// tables by a key read, where [`statement_scope`] reads the whole statement.
+///
+/// The whole statement held an `INSERT`'s target beside the `SELECT` feeding
+/// it, and an `UPDATE`'s beside a subquery in its `SET`, so a key from the
+/// joined table to that target offered `invoices.customer_id = c.id` in a
+/// query that cannot see `invoices`. So from the query's own start: inside the
+/// innermost open paren ([`local_scope_start`]), at the last `SELECT` at that
+/// depth (a set operation's last arm, the query after an `INSERT … `). And
+/// less any bare name a CTE stands in for ([`cte_names`]), whose columns and
+/// keys are not the catalogue's table's.
+fn query_scope(
+    sql: &str,
+    lo: usize,
+    hi: usize,
+    caret: usize,
+    dialect: SqlDialect,
+) -> Vec<TableRef> {
+    let start = local_scope_start(sql, lo, caret, dialect);
+    let mut depth = 0usize;
+    let mut from = start;
+    for t in &tokenize_range(sql, start, caret, dialect) {
+        match t.kind {
+            TkKind::LParen => depth += 1,
+            TkKind::RParen => depth = depth.saturating_sub(1),
+            _ if depth == 0 && bare_upper(t).as_deref() == Some("SELECT") => from = t.at,
+            _ => {}
+        }
+    }
+    let ctes = cte_names(&tokenize_range(sql, lo, caret, dialect));
+    statement_scope(sql, from, hi, caret, dialect)
+        .tables
+        .into_iter()
+        .filter(|t| t.db.is_some() || !ctes.iter().any(|c| c.eq_ignore_ascii_case(&t.name)))
+        .collect()
+}
+
+/// The names a statement's `WITH` gives its CTEs, read off its tokens: the
+/// word after `WITH` (or `WITH RECURSIVE`) and after each comma at depth 0,
+/// until the query proper begins.
+fn cte_names(toks: &[Token]) -> Vec<String> {
+    let mut out = Vec::new();
+    if toks.first().and_then(bare_upper).as_deref() != Some("WITH") {
+        return out;
+    }
+    let mut depth = 0usize;
+    let mut want_name = true;
+    for t in &toks[1..] {
+        match &t.kind {
+            TkKind::LParen => depth += 1,
+            TkKind::RParen => depth = depth.saturating_sub(1),
+            TkKind::Comma if depth == 0 => want_name = true,
+            TkKind::Word(w) if depth == 0 => match bare_upper(t).as_deref() {
+                Some("SELECT" | "INSERT" | "UPDATE" | "DELETE" | "MERGE" | "VALUES") => break,
+                Some("RECURSIVE") => {}
+                _ if want_name => {
+                    out.push(w.clone());
+                    want_name = false;
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    out
+}
+
+/// [`predict`]'s empty-`ON` producer: [`join_condition`]'s foreign-key
+/// condition, held to the bar the other join producers are — the joined table
+/// paired with the one other table of its own query ([`query_scope`]) a key
+/// joins it to, by exactly one key ([`sole_fk_partner`]).
+///
+/// [`join_condition`] is the popup's row, and takes the first key it finds.
+/// As a ghost that was `s.bill_to = a.id` with a `ship_to` beside it, a
+/// self-join's condition the wrong way round, and a partner the query could not
+/// see.
+fn on_condition_guess(
+    sql: &str,
+    (lo, hi, caret): (usize, usize, usize),
+    catalog: &Catalog,
+    dialect: SqlDialect,
+) -> Option<String> {
+    let (joined, _) = empty_on_join(sql, lo, hi, caret, dialect)?;
+    let scope = query_scope(sql, lo, hi, caret, dialect);
+    let joined = scope.iter().find(|s| same_ref(s, &joined))?;
+    let other = sole_fk_partner(catalog, &scope, joined)?;
+    fk_predicate(catalog, joined, other, dialect)
+}
+
 /// [`predict`]'s empty-`JOIN ` producer: the whole join — table, `ON` and the
-/// foreign-key condition — when [`join_targets`] finds exactly one table a key
-/// reaches from the tables in scope, by exactly one key.
+/// foreign-key condition — when [`join_targets_for`], the popup's table rows,
+/// finds exactly one table a key reaches from the query's tables, by exactly
+/// one key.
 ///
 /// Any more and which join is meant is a choice, and the popup's table list
 /// (which still opens on a typed letter, or Ctrl+Space) is the place to make it.
+/// The tables are the query's own ([`query_scope`]), and never after `CROSS`
+/// or `NATURAL` ([`cross_or_natural`]), a join written without an `ON` — the
+/// ghost would add the one the user's choice of join left out.
 fn join_target_guess(
     sql: &str,
     (lo, hi, caret): (usize, usize, usize),
@@ -13216,14 +13372,17 @@ fn join_target_guess(
     let TkKind::Word(join) = &last.kind else {
         return None;
     };
-    if last.quoted || !join.eq_ignore_ascii_case("JOIN") {
+    if last.quoted
+        || !join.eq_ignore_ascii_case("JOIN")
+        || cross_or_natural(&toks[..toks.len() - 1]).is_some()
+    {
         return None;
     }
-    let targets = join_targets(sql, lo, hi, caret, catalog, dialect);
+    let scope = query_scope(sql, lo, hi, caret, dialect);
+    let targets = join_targets_for(&scope, catalog, dialect);
     let [target] = targets.as_slice() else {
         return None;
     };
-    let scope = statement_scope(sql, lo, hi, caret, dialect).tables;
     let keys: usize = scope
         .iter()
         .map(|s| fk_edge_count(catalog, &target.table, &s.name))
@@ -13244,8 +13403,9 @@ fn join_target_guess(
 ///
 /// **Only with an alias**: after a bare `JOIN t ` the next word may well be the
 /// alias, and a reserved word in the alias's place (`JOIN t WHERE `) is not
-/// one. And only when exactly one other table in scope is joined to `t` by
-/// exactly one key ([`fk_edge_count`]).
+/// one. And only when exactly one other table of its query ([`query_scope`])
+/// is joined to `t` by exactly one key ([`fk_edge_count`]), and not after
+/// `CROSS` or `NATURAL` ([`cross_or_natural`]).
 fn join_on_guess(
     sql: &str,
     (lo, hi, caret): (usize, usize, usize),
@@ -13259,9 +13419,12 @@ fn join_on_guess(
     let TkKind::Word(join) = &toks[join_idx].kind else {
         return None;
     };
+    if cross_or_natural(&toks[..join_idx]).is_some() {
+        return None;
+    }
     let written = joined_table(&toks[join_idx + 1..], dialect)?;
     written.1.as_ref()?;
-    let scope = statement_scope(sql, lo, hi, caret, dialect).tables;
+    let scope = query_scope(sql, lo, hi, caret, dialect);
     let joined = find_joined(&scope, &written)?;
     let other = sole_fk_partner(catalog, &scope, joined)?;
     let condition = fk_predicate(catalog, joined, other, dialect)?;
@@ -13457,7 +13620,7 @@ fn find_joined<'a>(
 /// `INSERT` writes, `USING (` the columns a join's one key pairs.
 fn paren_contents(
     sql: &str,
-    (lo, hi, caret): (usize, usize, usize),
+    (lo, hi, _): (usize, usize, usize),
     toks: &[Token],
     catalog: &Catalog,
     dialect: SqlDialect,
@@ -13484,8 +13647,12 @@ fn paren_contents(
             let join = body
                 .iter()
                 .rposition(|t| bare_upper(t).as_deref() == Some("JOIN"))?;
+            if cross_or_natural(&body[..join]).is_some() {
+                return None;
+            }
             let written = joined_table(&body[join + 1..body.len() - 1], dialect)?;
-            let scope = statement_scope(sql, lo, hi, caret, dialect).tables;
+            // From before `USING (`, whose paren is not a query's.
+            let scope = query_scope(sql, lo, hi, lp.at, dialect);
             let joined = find_joined(&scope, &written)?;
             let other = sole_fk_partner(catalog, &scope, joined)?;
             let edge = catalog.fk_edge_between(&joined.name, &other.name)?;
@@ -14807,6 +14974,117 @@ mod predict_tests {
         );
         assert_eq!(k("SELECT * FROM orders o JOIN customers c USING ("), None);
         assert_eq!(k("SELECT * FROM orders o JOIN invoices i USING ("), None);
+    }
+
+    /// `shop` plus `invoices.customer_id → customers.id` — a second table a key
+    /// joins `customers` to — and `employees.manager_id → employees.id`, a
+    /// table's key to itself.
+    fn joined_up() -> DbSchema {
+        let mut schema = shop();
+        let mut invoices = tbl("invoices", &["id", "customer_id"]);
+        invoices.foreign_keys = vec![ForeignKeyInfo {
+            columns: vec!["customer_id".to_string()],
+            ref_table: "customers".to_string(),
+            ref_columns: vec!["id".to_string()],
+            ..Default::default()
+        }];
+        let mut employees = tbl("employees", &["id", "manager_id"]);
+        employees.foreign_keys = vec![ForeignKeyInfo {
+            columns: vec!["manager_id".to_string()],
+            ref_table: "employees".to_string(),
+            ref_columns: vec!["id".to_string()],
+            ..Default::default()
+        }];
+        schema.tables.push(invoices);
+        schema.tables.push(employees);
+        schema
+    }
+
+    /// An empty `ON` is held to the bar the other join producers are: one
+    /// table in scope a key joins the new one to, by one key. Two keys, a key
+    /// to itself, or a second table it could pair with make it a choice.
+    #[test]
+    fn an_empty_on_predicts_only_the_condition_one_key_decides() {
+        let branching = branching();
+        assert_eq!(
+            in_schema(
+                &branching,
+                "SELECT * FROM shipments s JOIN addresses a ON ",
+                SqlDialect::MySql
+            ),
+            None
+        );
+        let schema = joined_up();
+        let at = |sql: &str| in_schema(&schema, sql, SqlDialect::MySql);
+        assert_eq!(at("SELECT * FROM employees e JOIN employees m ON "), None);
+        assert_eq!(
+            at("SELECT * FROM orders o JOIN invoices i ON i.id = o.id JOIN customers c ON "),
+            None
+        );
+        assert_eq!(
+            at("SELECT * FROM orders o JOIN customers c ON ").as_deref(),
+            Some("o.customer_id = c.id")
+        );
+    }
+
+    /// The tables a join pairs are its own query's: not an `INSERT`'s target
+    /// around its `SELECT`, not an `UPDATE`'s around a subquery, not a real
+    /// table a CTE's name stands in for — and only the first `ON` after a
+    /// `JOIN` is its condition.
+    #[test]
+    fn a_join_is_predicted_from_its_own_querys_tables() {
+        let schema = joined_up();
+        let at = |sql: &str| in_schema(&schema, sql, SqlDialect::MySql);
+        assert_eq!(
+            at("INSERT INTO invoices (id, customer_id) SELECT o.id, c.id FROM orders o JOIN customers c ON ")
+                .as_deref(),
+            Some("o.customer_id = c.id")
+        );
+        assert_eq!(
+            at("UPDATE invoices SET customer_id = (SELECT c.id FROM orders o JOIN customers c ON ")
+                .as_deref(),
+            Some("o.customer_id = c.id")
+        );
+        assert_eq!(
+            at("INSERT INTO invoices (id) SELECT p.id FROM products p JOIN customers c "),
+            None
+        );
+        let cte = "WITH orders AS (SELECT id FROM customers) SELECT * FROM orders o JOIN ";
+        assert_eq!(my(cte), None);
+        assert_eq!(my(&format!("{cte}customers c ")), None);
+        assert_eq!(my(&format!("{cte}customers c ON ")), None);
+        assert_eq!(
+            my("SELECT * FROM orders o JOIN customers c ON o.customer_id = c.id ON "),
+            None
+        );
+    }
+
+    /// A `CROSS JOIN` is written without a condition and a `NATURAL` one
+    /// writes its own, so no ghost adds an `ON` to either. A typed `ON` after
+    /// `CROSS JOIN` is filled only where the engine accepts it — MySQL and
+    /// SQLite read it as an inner join.
+    #[test]
+    fn a_cross_or_natural_join_predicts_no_condition() {
+        for dialect in SqlDialect::ALL {
+            for sql in [
+                "SELECT * FROM orders o CROSS JOIN ",
+                "SELECT * FROM orders o CROSS JOIN customers c ",
+                "SELECT * FROM orders o NATURAL JOIN ",
+                "SELECT * FROM orders o NATURAL JOIN customers c ",
+                "SELECT * FROM orders o NATURAL JOIN customers c ON ",
+                "SELECT * FROM orders o NATURAL LEFT OUTER JOIN customers c ",
+            ] {
+                assert_eq!(at_end(sql, dialect), None, "{dialect:?}: {sql}");
+            }
+        }
+        let typed_on = "SELECT * FROM orders o CROSS JOIN customers c ON ";
+        assert_eq!(at_end(typed_on, SqlDialect::Postgres), None);
+        assert_eq!(at_end(typed_on, SqlDialect::MsSql), None);
+        assert_eq!(my(typed_on).as_deref(), Some("o.customer_id = c.id"));
+        assert_eq!(
+            my("SELECT * FROM orders o LEFT OUTER JOIN customers c ").as_deref(),
+            Some("ON o.customer_id = c.id")
+        );
     }
 }
 
@@ -21589,9 +21867,17 @@ mod tests {
                 "LEFT OUTER",
             ] {
                 let sql = format!("SELECT * FROM orders {modifier} JOIN customers ON ");
+                // Where the engine takes no `ON` after the join, none is
+                // offered (`join_takes_a_condition`); everywhere else the
+                // condition names `orders`, not an alias `LEFT`.
+                let takes_on = match modifier {
+                    "NATURAL" => false,
+                    "CROSS" => cross_join_takes_on(dialect),
+                    _ => true,
+                };
                 assert_eq!(
                     join_at_on(&sql, sql.len(), dialect).as_deref(),
-                    Some("orders.customer_id = customers.id"),
+                    takes_on.then_some("orders.customer_id = customers.id"),
                     "{modifier} on {dialect:?}"
                 );
                 let sql = format!("SELECT * FROM orders {modifier} JOIN ");
