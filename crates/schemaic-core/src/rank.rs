@@ -296,8 +296,16 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
         if !seen.insert(tl) || exact {
             return;
         }
+        // A keyword goes in the case the word is being typed in: `sel` takes
+        // `select`, `Sel` and `SEL` the conventional `SELECT` — as the inline
+        // predictions answer. With nothing typed there is no case to follow.
+        let text = if kind == SuggestKind::Keyword && !prefix.is_empty() {
+            crate::intel::in_typed_case(text, prefix)
+        } else {
+            text.to_string()
+        };
         cands.push(Cand {
-            text: text.to_string(),
+            text,
             kind,
             detail: detail.to_string(),
             table: String::new(),
@@ -1029,6 +1037,20 @@ mod tests {
         }
         assert_eq!(row(SqlDialect::MySql, "coal", "coalesce").insert, None);
         assert_eq!(row(SqlDialect::Postgres, "coal", "coalesce").insert, None);
+    }
+
+    /// A keyword row is in the case the word is typed in; a name keeps its own.
+    #[test]
+    fn a_keyword_is_offered_in_the_typed_case() {
+        let s = shop();
+        let start = |p| ranked(&s, ClauseCtx::Start, &[], p);
+        assert!(start("sel").contains(&"select".to_string()));
+        assert!(start("SEL").contains(&"SELECT".to_string()));
+        assert!(start("Sel").contains(&"SELECT".to_string()));
+        assert!(start("").contains(&"SELECT".to_string()));
+        let scope = [tref("orders", None)];
+        let col = ranked(&s, ClauseCtx::Column, &scope, "TOT");
+        assert!(col.contains(&"total".to_string()), "{col:?}");
     }
 
     /// After `USE` the databases are offered, with no prefix needed and not

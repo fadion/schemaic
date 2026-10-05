@@ -14226,8 +14226,9 @@ fn create_or_spelling(dialect: SqlDialect) -> Option<&'static str> {
 }
 
 /// `keyword` (written upper-case) in the case `typed` was: all lower answers in
-/// lower, anything else — `ORDER`, `Order` — in the conventional upper.
-fn in_typed_case(keyword: &str, typed: &str) -> String {
+/// lower, anything else — `ORDER`, `Order` — in the conventional upper. The
+/// inline predictions answer in it, and so do completion's keyword rows.
+pub(crate) fn in_typed_case(keyword: &str, typed: &str) -> String {
     if typed.bytes().any(|b| b.is_ascii_uppercase()) {
         keyword.to_string()
     } else {

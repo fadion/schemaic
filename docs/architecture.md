@@ -12717,6 +12717,10 @@ existing prose was left alone.
       (`a_keyword_is_offered_only_on_an_engine_that_takes_it`). What each engine lacks is
       `intel`'s `keywords_not_taken`, an exhaustive `match`, so a fifth engine has to answer
       rather than inherit MySQL's empty list.
+      **A keyword row is in the typed case**: `add` writes it through `intel::in_typed_case`, the
+      inline predictions' rule — all lower typed, lower offered; anything else, and nothing typed,
+      the conventional upper — so `sel` accepts `select` (`a_keyword_is_offered_in_the_typed_case`).
+      A name keeps its own spelling whatever the prefix.
       **`ClauseCtx::Database` is `USE |`**, which `intel::clause_context` answers for a statement
       whose only word so far is `USE` (`use_names_a_database`): its arm offers every database but
       the tab's own, with no prefix needed, and nothing else — the mixed list it fell into before
