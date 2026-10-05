@@ -4576,6 +4576,12 @@ pub struct Catalog {
     opaque_qualified: HashSet<(String, String)>,
     /// [`Catalog::opaque_qualified`]'s bare names, active-db scoped.
     opaque_unqualified: HashSet<String>,
+    /// `(qualifier_lower, table_lower, column_lower)` for each column an
+    /// `INSERT` leaves out — the ones [`crate::skeleton::skeleton_columns`]
+    /// does not name. Keyed under the database, the namespace and `""` (a bare
+    /// reference) exactly as the column maps are, for
+    /// [`Catalog::insert_columns_of`].
+    insert_skips: HashSet<(String, String, String)>,
 }
 
 /// A memo over [`Catalog::build`], keyed on the **identity** of the schemas the
@@ -4714,6 +4720,7 @@ impl Catalog {
         let mut known_idents = HashSet::new();
         let mut opaque_qualified = HashSet::new();
         let mut opaque_unqualified = HashSet::new();
+        let mut insert_skips = HashSet::new();
         let active_lower = active_db.map(|d| d.to_ascii_lowercase());
         // **`(database, name)` and a bare name are shared by every schema's
         // relations, so their columns are merged, never replaced.** Two
@@ -4761,6 +4768,26 @@ impl Catalog {
                 known_idents.insert(t.name.to_ascii_lowercase());
                 for c in &cols {
                     known_idents.insert(c.to_ascii_lowercase());
+                }
+                let named = crate::skeleton::skeleton_columns(t);
+                let table_lower = t.name.to_ascii_lowercase();
+                // Most tables name every column; only the rest pay the scan.
+                let all_named = named.len() == t.columns.len();
+                for c in t.columns.iter().filter(|_| !all_named) {
+                    if named.iter().any(|n| std::ptr::eq(*n, c)) {
+                        continue;
+                    }
+                    let col_lower = c.name.to_ascii_lowercase();
+                    let mut skip = |qualifier: String| {
+                        insert_skips.insert((qualifier, table_lower.clone(), col_lower.clone()));
+                    };
+                    skip(db_lower.clone());
+                    if in_scope {
+                        skip(String::new());
+                        if let Some(ns) = &t.schema {
+                            skip(ns.to_ascii_lowercase());
+                        }
+                    }
                 }
                 merge(
                     qualified
@@ -4856,7 +4883,29 @@ impl Catalog {
             known_idents,
             opaque_qualified,
             opaque_unqualified,
+            insert_skips,
         }
+    }
+
+    /// The columns an `INSERT` into `r` names, in table order: [`columns_of`]
+    /// less the server-assigned ones [`Catalog::insert_skips`] records.
+    ///
+    /// [`columns_of`]: Catalog::columns_of
+    fn insert_columns_of(&self, r: &TableRef) -> Option<Vec<&String>> {
+        let qualifier = r.db.as_deref().unwrap_or("").to_ascii_lowercase();
+        let table = r.name.to_ascii_lowercase();
+        let cols = self.columns_of(r)?;
+        Some(
+            cols.iter()
+                .filter(|c| {
+                    !self.insert_skips.contains(&(
+                        qualifier.clone(),
+                        table.clone(),
+                        c.to_ascii_lowercase(),
+                    ))
+                })
+                .collect(),
+        )
     }
 
     /// The primary-key columns (lower) of an active-db table, if known and non-empty.
@@ -12458,6 +12507,12 @@ fn keyword_partner(toks: &[Token], dialect: SqlDialect) -> Option<String> {
 /// [`predict`]'s `INSERT INTO t (` producer: `t`'s columns, in table order,
 /// quoted where they need it, and the closing paren.
 ///
+/// The columns a hand-written `INSERT` names, not every column: a key the
+/// server numbers and a computed column are left out, by the rule `skeleton`
+/// drafts an `INSERT` with ([`Catalog::insert_columns_of`]). Naming them was a
+/// statement SQL Server refuses outright for an identity, and every engine for
+/// a computed column.
+///
 /// Only right after the `(` that opens the column list — `INSERT … VALUES (`
 /// is a row, not a column list, and is left alone — and only for a table the
 /// catalog knows the columns of. `closed`: a `)` already follows the caret (the
@@ -12496,7 +12551,7 @@ fn insert_columns(
         alias: None,
         db: db.map(str::to_string),
     };
-    let cols = catalog.columns_of(&r)?;
+    let cols = catalog.insert_columns_of(&r)?;
     if cols.is_empty() {
         return None;
     }
@@ -12652,8 +12707,12 @@ mod predict_tests {
 
     /// The prediction at the end of `sql`.
     fn at_end(sql: &str, dialect: SqlDialect) -> Option<String> {
-        let schema = shop();
-        let cat = Catalog::build(&[("shop", &schema)], Some("shop"));
+        in_schema(&shop(), sql, dialect)
+    }
+
+    /// The prediction at the end of `sql`, over `schema` (database `shop`).
+    fn in_schema(schema: &DbSchema, sql: &str, dialect: SqlDialect) -> Option<String> {
+        let cat = Catalog::build(&[("shop", schema)], Some("shop"));
         predict(sql, sql.len(), &cat, dialect)
     }
 
@@ -12809,6 +12868,46 @@ mod predict_tests {
         assert_eq!(my("INSERT INTO nowhere ("), None);
         assert_eq!(my("INSERT INTO customers (id"), None);
         assert_eq!(my("INSERT INTO customers VALUES ("), None);
+    }
+
+    /// The list is the one a hand-written `INSERT` names: a key the server
+    /// numbers is left to it, and a computed column — which refuses any value —
+    /// is never named. SQL Server refuses an identity column outright without
+    /// `IDENTITY_INSERT`, so naming it there was a statement that could not run.
+    #[test]
+    fn an_insert_column_list_leaves_out_what_the_server_assigns() {
+        let mut events = tbl("events", &["id", "body", "twice", "seq"]);
+        events.columns[0].auto_increment = true;
+        events.columns[0].primary_key = true;
+        events.columns[2].generated = Some("id * 2".to_string());
+        events.columns[3].identity_always = true;
+        let schema = DbSchema {
+            tables: vec![events],
+            ..Default::default()
+        };
+        for dialect in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::MsSql] {
+            assert_eq!(
+                in_schema(&schema, "INSERT INTO events (", dialect).as_deref(),
+                Some("body)"),
+                "{dialect:?}"
+            );
+        }
+    }
+
+    /// A table that is nothing but a numbered key still gets that key — the
+    /// rule `skeleton` drafts an `INSERT` by — rather than no prediction.
+    #[test]
+    fn an_insert_into_a_key_only_table_still_names_the_key() {
+        let mut ids = tbl("ids", &["id"]);
+        ids.columns[0].auto_increment = true;
+        let schema = DbSchema {
+            tables: vec![ids],
+            ..Default::default()
+        };
+        assert_eq!(
+            in_schema(&schema, "INSERT INTO ids (", SqlDialect::MySql).as_deref(),
+            Some("id)")
+        );
     }
 
     /// **The editor pairs brackets as they are typed**, so the `(` that opens

@@ -1760,8 +1760,9 @@ existing prose was left alone.
     answer is close to certain.** It returns the text Tab would insert at the caret, from four
     producers asked in order, each answering only its own shape: an empty `JOIN … ON` gets
     `join_condition`'s foreign-key predicate; `INSERT`/`REPLACE … INTO t (` (or `db.t (`) gets the
-    table's columns from `Catalog::columns_of`, quoted through `export::ident_if_needed` like every
-    fragment above, plus a `)` unless one already follows; `GROUP BY ` gets the grouping list; and a
+    columns an `INSERT` writes, from `Catalog::insert_columns_of`, quoted through
+    `export::ident_if_needed` like every fragment above, plus a `)` unless one already follows;
+    `GROUP BY ` gets the grouping list; and a
     keyword whose partner the grammar fixes gets the partner (`ORDER`/`GROUP`/`PARTITION` → `BY`,
     `PRIMARY`/`FOREIGN` → `KEY`, `INSERT` → `INTO`, `DELETE` → `FROM`, the join words → `JOIN`),
     in lower case when the keyword was typed all-lower. It answers nothing unless the rest of the
@@ -1777,6 +1778,20 @@ existing prose was left alone.
     waits for a `FROM`, since `LEFT`/`RIGHT` are string functions too; and `CROSS`/`OUTER` predict
     nothing where `has_apply_joins` says an `APPLY` may follow — T-SQL alone, asked as a
     capability through an exhaustive match, so a new engine has to answer it.
+    **The column list is `skeleton::skeleton_columns`'s, not the table's.** Listing every column
+    named the key the server numbers — a statement SQL Server refuses outright without
+    `IDENTITY_INSERT` — and any computed column, which every engine refuses; and a ghost that
+    disagreed with the Generate menu's `INSERT` draft about what an `INSERT` writes would be two
+    answers to one question. `Catalog` stores only column names, so `Catalog::build` asks
+    `skeleton_columns` of each table and records the columns it leaves out in `insert_skips`, keyed
+    under the database, `""` for a bare in-scope reference and the PG/T-SQL namespace — the same
+    three keyings as the column maps, so like them two same-named tables under one key share their
+    skips (an identity `id` on `sales.orders` drops `id` from a bare `orders (` meant for
+    `dbo.orders` too: a column left out, which typing restores, never one wrongly named) — and
+    `insert_columns_of` is `columns_of` less those. The
+    skeleton's fallback comes with it, so a table that is only a numbered key still names that key
+    (`an_insert_column_list_leaves_out_what_the_server_assigns`,
+    `an_insert_into_a_key_only_table_still_names_the_key`).
     **The grouping list is read off the parse, not the text** — the rule this module exists to
     hold. The statement up to `GROUP` is a whole query on its own, so it is parsed with sqlparser
     and every projection item holding neither an aggregate (`GROUP_AGGREGATES`, on the bare
@@ -2017,8 +2032,13 @@ existing prose was left alone.
     against every row. Which columns are named is one step stricter than
     `ColumnInfo::is_server_assigned` (the rule real write paths obey, "the server rejects a value")
     and drops `AUTO_INCREMENT` keys too, which accept one but which nobody hand-writes; when that
-    leaves nothing at all, every column comes back, since a statement naming no columns is not a
-    draft of anything. The `CREATE` in that menu is not from here — it is `DbSchema`'s own
+    leaves nothing, the columns the server at least *accepts* a value for come back (the
+    numbered-key-only table), and only failing that every column, since a statement naming no
+    columns is not a draft of anything. The middle stage is the load-bearing one: collapsing
+    straight to every column named the `is_server_assigned` ones, which the server refuses however
+    the draft is filled in (`the_fallback_never_names_a_column_the_server_refuses`). `skeleton_columns` is
+    `pub(crate)` because the editor's `INSERT INTO t (` ghost (`intel::predict`) names the same
+    columns, so the two never disagree about what an `INSERT` writes. The `CREATE` in that menu is not from here — it is `DbSchema`'s own
     `create_ddl_script`, which emits real DDL. **Whatever generates it, the tab it opens in is bound
     to the database the statement is *for*** — `TabActions::open_query` takes it as a parameter, and
     every schema-menu entry, plus the DDL preview's "Open in editor", passes the node's own. Falling

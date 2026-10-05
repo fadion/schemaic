@@ -142,7 +142,11 @@ fn worth_writing(c: &ColumnInfo) -> bool {
 /// *generates* a value when you omit one is a different thing from a column
 /// that refuses one, which is exactly the distinction [`worth_writing`] draws
 /// and this fallback used to throw away.
-fn skeleton_columns(t: &TableInfo) -> Vec<&ColumnInfo> {
+///
+/// The editor's inline `INSERT INTO t (` prediction names the same columns
+/// (`intel::Catalog::build` records the rest), so a ghost and a draft never
+/// disagree about what an `INSERT` writes.
+pub(crate) fn skeleton_columns(t: &TableInfo) -> Vec<&ColumnInfo> {
     let worth: Vec<&ColumnInfo> = t.columns.iter().filter(|c| worth_writing(c)).collect();
     if !worth.is_empty() {
         return worth;
