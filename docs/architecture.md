@@ -1910,7 +1910,14 @@ existing prose was left alone.
     keyed by the bare name and keeps whichever was indexed last, so the reference to the other one
     got that one's key; `Catalog::pk_shared` records such names, comparing every in-scope table's
     key (an empty one included), and `key_columns_of` refuses them
-    (`references_to_a_name_two_tables_share_predicts_nothing`). `INSERT … ON CONFLICT (` gets the
+    (`references_to_a_name_two_tables_share_predicts_nothing`). **So does the diagnostics pass's
+    `only_full_group_by` check** (`group_by_check`), whose functional-dependency exemption — the
+    grouping set holds the table's whole primary key — read that key through `pk_of`, keyed the
+    same way: beside `ops.employees` (key `dept_id`), `SELECT dept_id, name FROM hr.employees GROUP
+    BY id`, grouped by its own key, was flagged twice against the other table's. The check is
+    conservative by design, skipping what it cannot judge, and which key is this source's is exactly
+    that, so a shared name skips the source outright — the cost is a true warning missed on such a
+    table (`diag_only_full_group_by_skips_a_name_two_tables_share`). `INSERT … ON CONFLICT (` gets the
     target's key through the same `key_columns_of` (`conflict_key`, the target read by the same
     `insert_target` as the column list), but only when the `INSERT` writes every key
     column — all of them in its column list, or no list at all, which writes every column. One

@@ -10166,7 +10166,10 @@ mod colres {
     /// fires only for a *single, fully-known base table* (multi-source / derived /
     /// unloaded FROMs are skipped), skips non-column grouping expressions and
     /// wildcards, and exempts the whole query when the grouping set contains the
-    /// table's full primary key (functional dependency, MySQL's own exemption).
+    /// table's full primary key (functional dependency, MySQL's own exemption) —
+    /// skipping a table whose name another in-scope table shares with a
+    /// different key ([`Catalog::pk_shared`]), since which key is its own is
+    /// unknown.
     fn group_by_check(
         sel: &Select,
         sources: &[Src],
@@ -10201,8 +10204,15 @@ mod colres {
             return;
         };
         let Some(table) = &src.table else { return };
+        let table_lower = table.to_ascii_lowercase();
+        // Two same-named tables with different keys: `pk_of` answers by bare
+        // name, so it may be the other table's key, and judging by it flagged
+        // queries grouped by their own. Which key is this source's is unknown.
+        if catalog.pk_shared.contains(&table_lower) {
+            return;
+        }
         // Grouping by the full primary key functionally determines every column.
-        if let Some(pk) = catalog.pk_of(&table.to_ascii_lowercase())
+        if let Some(pk) = catalog.pk_of(&table_lower)
             && pk.iter().all(|k| grouped.contains(k))
         {
             return;
@@ -16896,6 +16906,36 @@ mod tests {
                 .iter()
                 .any(|d| d.message.contains("GROUP BY"))
         );
+    }
+
+    /// Two same-named tables in two namespaces have two keys, and the catalogue
+    /// keys a table's by its bare name: asked of one, it can answer the other's.
+    /// Grouping by `hr.employees`' own key was then flagged against
+    /// `ops.employees`' — a false warning on a correct query — so a shared name
+    /// is a source this check cannot judge.
+    #[test]
+    fn diag_only_full_group_by_skips_a_name_two_tables_share() {
+        let mut hr = tbl("employees", &["id", "name", "dept_id"]);
+        hr.schema = Some("hr".to_string());
+        hr.columns[0].primary_key = true;
+        let mut ops = tbl("employees", &["id", "name", "dept_id"]);
+        ops.schema = Some("ops".to_string());
+        ops.columns[2].primary_key = true;
+        let schema = DbSchema {
+            tables: vec![hr, ops],
+            ..Default::default()
+        };
+        let cat = Catalog::build(&[("company", &schema)], Some("company"));
+        let warnings: Vec<String> = diagnostics(
+            "SELECT dept_id, name FROM hr.employees GROUP BY id",
+            &cat,
+            SqlDialect::Postgres,
+        )
+        .into_iter()
+        .filter(|d| d.message.contains("GROUP BY"))
+        .map(|d| d.message)
+        .collect();
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 
     #[test]
