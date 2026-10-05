@@ -749,7 +749,12 @@ pub fn fuzzy_score(cand: &str, query: &str) -> Option<i32> {
             if first.is_none() {
                 first = Some(ci);
             }
-            let boundary = ci == 0 || c[ci - 1] == b'_';
+            // A word starts at the name's start, after `_`, and at a camelCase
+            // hump — an upper-case letter after a lower-case one, so `oi`
+            // finds `OrderItem`'s two words as it finds `order_item`'s.
+            let boundary = ci == 0
+                || c[ci - 1] == b'_'
+                || (c[ci].is_ascii_uppercase() && c[ci - 1].is_ascii_lowercase());
             score += if boundary { 18 } else { 4 };
             if let Some(p) = prev {
                 if ci == p + 1 {
@@ -1037,6 +1042,28 @@ mod tests {
         }
         assert_eq!(row(SqlDialect::MySql, "coal", "coalesce").insert, None);
         assert_eq!(row(SqlDialect::Postgres, "coal", "coalesce").insert, None);
+    }
+
+    /// A camelCase hump is a word boundary, as `_` is: `oi` scores `OrderItem`
+    /// (its `I` starts a word) above `Orderingx` (its `i` is mid-word), and
+    /// `oi` scores `order_item` the same as `OrderItem`.
+    #[test]
+    fn a_camel_case_hump_scores_as_a_word_boundary() {
+        let s = |c| fuzzy_score(c, "oi").unwrap();
+        assert!(
+            s("OrderItem") > s("Orderingx"),
+            "{} / {}",
+            s("OrderItem"),
+            s("Orderingx")
+        );
+        assert!(s("orderItem") > s("orderingx"));
+        // Both find two words; `OrderItem` is a byte shorter and its gap one less.
+        assert_eq!(s("OrderItem"), s("order_item") + 2);
+        // An all-caps run is not a run of humps.
+        assert_eq!(
+            fuzzy_score("ORDERINGX", "oi"),
+            fuzzy_score("orderingx", "oi")
+        );
     }
 
     /// A keyword row is in the case the word is typed in; a name keeps its own.

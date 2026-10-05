@@ -12657,7 +12657,9 @@ existing prose was left alone.
       in what order. `rank(&SchemaIndex, &RankInput)` collects candidates into context tiers (dedup
       by text, first/lowest tier wins, and a candidate equal to the typed prefix is dropped), scores
       each by `fuzzy_score` plus `recency_bonus`, and sorts by tier, then score, then length,
-      capped at `MAX_ROWS`. **`rank_full` is `rank` plus the one fact the rows cannot carry**:
+      capped at `MAX_ROWS`. `fuzzy_score` is a subsequence match that rewards a hit at a word's
+      start — the name's, after `_`, or at a camelCase hump, so `oi` finds `OrderItem`'s words as
+      it finds `order_item`'s (`a_camel_case_hump_scores_as_a_word_boundary`). **`rank_full` is `rank` plus the one fact the rows cannot carry**:
       `Ranked::completes_a_word`, whether the word typed already spells a candidate in full. The
       exact match is left out of the rows, and that was also what hid it — after `FROM` the list
       held `FROM_BASE64()` and `FROM_DAYS()`, and Enter, meant as a newline, accepted the first (the
