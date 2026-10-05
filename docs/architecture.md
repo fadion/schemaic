@@ -1217,6 +1217,12 @@ existing prose was left alone.
     replaced, so `hist`'s `sales.orders` and `dbo.orders` kept whichever was indexed last and the
     same three-part reference was the same false error with no synonym in sight
     (`same_named_tables_in_another_database_merge_their_columns`, CMP-06, red before).
+    **The union is the right side for a diagnostic to err on and the wrong one for a prediction**,
+    which would write it out as one table's columns or keys. So `merge` also answers whether the
+    list it was handed differed from what the entry already held, and `Catalog::unioned` records
+    each entry that did — keyed `(qualifier, table)`, `""` for the bare map, as `insert_skips` is.
+    Two relations with the same columns are not a union of anything. `Catalog::is_union` asks it
+    of a reference, and what the predictions do with the answer is under `predict` below.
     **`NON_RESERVED_KEYWORDS` is legal keywords one edit from a curated one**, which the typo
     checker would otherwise flag. It is dialect-free, since each is legal on some engine here and
     which engine has which is `builtin_catalog`'s half of the question. The list was widened by
@@ -1862,9 +1868,17 @@ existing prose was left alone.
     `skeleton_columns` of each table and records the columns it leaves out in `insert_skips`, keyed
     under the database, `""` for a bare in-scope reference and the PG/T-SQL namespace — the same
     three keyings as the column maps, so like them two same-named tables under one key share their
-    skips (an identity `id` on `sales.orders` drops `id` from a bare `orders (` meant for
-    `dbo.orders` too: a column left out, which typing restores, never one wrongly named) — and
-    `insert_columns_of` is `columns_of` less those. The
+    skips (where the two have the same columns, an identity `id` on `sales.orders` drops `id` from a
+    bare `orders (` meant for `dbo.orders` too: a column left out, which typing restores, never one
+    wrongly named) — and `insert_columns_of` is `columns_of` less those. **Where their columns
+    differ it answers nothing at all** (`Catalog::is_union`, under the synonym paragraph above):
+    the bare map holds both tables' columns, so PostgreSQL's `INSERT INTO orders (` predicted
+    `id, customer_id, code)`, a list neither table has. `is_union` reads the entry the reference
+    resolves to — the `(database, name)` one when its qualifier is a database holding the table,
+    the bare one for a bare name — and never a namespace-qualified reference, which reads that one
+    table's own `schema_qualified` entry; so `INSERT INTO sales.orders (` still predicts
+    `id, customer_id)` (`a_name_two_tables_share_predicts_nothing_from_their_union`, red before on
+    exactly that `INSERT`). The
     skeleton's fallback comes with it, so a table that is only a numbered key still names that key
     (`an_insert_column_list_leaves_out_what_the_server_assigns`,
     `an_insert_into_a_key_only_table_still_names_the_key`).
@@ -1910,6 +1924,18 @@ existing prose was left alone.
     a self-join, where which side is the parent is exactly the choice, and a partner from outside
     the query (`an_empty_on_predicts_only_the_condition_one_key_decides`). The popup's own rows,
     `join_condition` and `join_targets`, still take the first key and read `statement_scope`.
+    **A name two tables share pairs nothing.** The foreign keys are held by bare name (`fks`), as
+    `pks` is, so beside `sales.orders` and its key to `customers`, `FROM dbo.orders o JOIN ` was
+    offered `customers ON o.customer_id = customers.id` — through a column `dbo.orders` does not
+    have. `fk_edge_count` answers 2, the count that makes a join a choice, when either name
+    `is_union` (under the synonym paragraph above), so every producer that pairs tables by a key
+    refuses: `on_condition_guess`, `join_target_guess`, `join_on_guess`, and `USING (` through
+    `sole_fk_partner` (`a_name_two_tables_share_predicts_nothing_from_their_union`). It is asked of
+    the bare name, so a namespace does not lift it as it does for an `INSERT`'s column list —
+    `FROM sales.orders o JOIN ` predicts nothing too, since bare-keyed edges cannot say which
+    `orders` declared them. And two same-shaped tables are not a union, so their keys still pool
+    under the one name: the condition then reads a column the table has, though not necessarily
+    a key it declared. `Catalog::pk_shared`, below, is the same refusal for a primary key.
     **The tables these producers pair are the caret's own query's** — `on_condition_guess`,
     `join_target_guess`, `join_on_guess` and the `USING (` arm all read `query_scope`, where
     `statement_scope` reads the whole statement: from `local_scope_start`, at the last `SELECT` at

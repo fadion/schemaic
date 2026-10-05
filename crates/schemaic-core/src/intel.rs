@@ -4588,6 +4588,13 @@ pub struct Catalog {
     /// key ([`Catalog::key_columns_of`]) answers nothing for these rather than
     /// the other table's.
     pk_shared: HashSet<String>,
+    /// The column-map entries `(qualifier_lower, table_lower)` — `""` for the
+    /// bare map, as [`Catalog::insert_skips`] keys them — that hold the union
+    /// of two differently-columned relations sharing a name. The union is the
+    /// right side for a diagnostic to err on and the wrong one for a
+    /// prediction, which would write it out as one table's columns or keys
+    /// ([`Catalog::is_union`]).
+    unioned: HashSet<(String, String)>,
 }
 
 /// A memo over [`Catalog::build`], keyed on the **identity** of the schemas the
@@ -4728,6 +4735,7 @@ impl Catalog {
         let mut opaque_unqualified = HashSet::new();
         let mut insert_skips = HashSet::new();
         let mut pk_shared = HashSet::new();
+        let mut unioned = HashSet::new();
         let mut keys_seen: HashMap<String, Vec<String>> = HashMap::new();
         let active_lower = active_db.map(|d| d.to_ascii_lowercase());
         // **`(database, name)` and a bare name are shared by every schema's
@@ -4737,12 +4745,21 @@ impl Catalog {
         // whichever was indexed last, and a correct reference to the other a
         // false "Column not found" (S4.2-L1-04, CMP-06). The union can only
         // let a wrong column through, which is the side uncertainty takes.
-        let merge = |entry: &mut Vec<String>, cols: &[String]| {
+        // Answers whether `cols` differed from what the entry already held —
+        // whether the entry is now a union (`Catalog::unioned`).
+        let merge = |entry: &mut Vec<String>, cols: &[String]| -> bool {
+            let differs = !entry.is_empty()
+                && !(entry.len() == cols.len()
+                    && entry
+                        .iter()
+                        .zip(cols)
+                        .all(|(e, c)| e.eq_ignore_ascii_case(c)));
             for c in cols {
                 if !entry.iter().any(|e| e.eq_ignore_ascii_case(c)) {
                     entry.push(c.clone());
                 }
             }
+            differs
         };
         for (db, schema) in loaded {
             let db_lower = db.to_ascii_lowercase();
@@ -4797,12 +4814,14 @@ impl Catalog {
                         }
                     }
                 }
-                merge(
+                if merge(
                     qualified
                         .entry((db_lower.clone(), t.name.to_ascii_lowercase()))
                         .or_default(),
                     &cols,
-                );
+                ) {
+                    unioned.insert((db_lower.clone(), table_lower.clone()));
+                }
                 // PostgreSQL namespace, when the table carries one. Indexed only
                 // for the in-scope database: `schema.table` never crosses a
                 // database in PG, so an out-of-scope db's namespaces would just
@@ -4814,10 +4833,12 @@ impl Catalog {
                     schema_qualified.insert((ns_lower, t.name.to_ascii_lowercase()), cols.clone());
                 }
                 if in_scope {
-                    merge(
+                    if merge(
                         unqualified.entry(t.name.to_ascii_lowercase()).or_default(),
                         &cols,
-                    );
+                    ) {
+                        unioned.insert((String::new(), table_lower.clone()));
+                    }
                     // In the order the key was declared, where the primary
                     // index records it: a foreign key's referenced columns
                     // follow that order, not the table's.
@@ -4867,18 +4888,22 @@ impl Catalog {
                 match target {
                     Some(t) => {
                         let cols: Vec<String> = t.columns.iter().map(|c| c.name.clone()).collect();
-                        merge(
+                        if merge(
                             qualified
                                 .entry((db_lower.clone(), name_lower.clone()))
                                 .or_default(),
                             &cols,
-                        );
+                        ) {
+                            unioned.insert((db_lower.clone(), name_lower.clone()));
+                        }
                         if in_scope {
                             if let Some(ns) = ns_lower {
                                 known_schemas.insert(ns.clone());
                                 schema_qualified.insert((ns, name_lower.clone()), cols.clone());
                             }
-                            merge(unqualified.entry(name_lower).or_default(), &cols);
+                            if merge(unqualified.entry(name_lower.clone()).or_default(), &cols) {
+                                unioned.insert((String::new(), name_lower));
+                            }
                         }
                     }
                     None => {
@@ -4908,14 +4933,42 @@ impl Catalog {
             opaque_unqualified,
             insert_skips,
             pk_shared,
+            unioned,
         }
     }
 
+    /// Do `r`'s columns, as [`columns_of`] answers them, belong to two
+    /// differently-columned relations sharing its name ([`Catalog::unioned`])?
+    /// A namespace-qualified reference that resolves there reads that one
+    /// table's own entry, which never is.
+    ///
+    /// [`columns_of`]: Catalog::columns_of
+    fn is_union(&self, r: &TableRef) -> bool {
+        let table = r.name.to_ascii_lowercase();
+        let key = match &r.db {
+            Some(q)
+                if self
+                    .qualified
+                    .contains_key(&(q.to_ascii_lowercase(), table.clone())) =>
+            {
+                (q.to_ascii_lowercase(), table)
+            }
+            Some(_) => return false,
+            None => (String::new(), table),
+        };
+        self.unioned.contains(&key)
+    }
+
     /// The columns an `INSERT` into `r` names, in table order: [`columns_of`]
-    /// less the server-assigned ones [`Catalog::insert_skips`] records.
+    /// less the server-assigned ones [`Catalog::insert_skips`] records. `None`
+    /// for a name two tables share ([`Catalog::is_union`]), whose columns are
+    /// neither table's.
     ///
     /// [`columns_of`]: Catalog::columns_of
     fn insert_columns_of(&self, r: &TableRef) -> Option<Vec<&String>> {
+        if self.is_union(r) {
+            return None;
+        }
         let qualifier = r.db.as_deref().unwrap_or("").to_ascii_lowercase();
         let table = r.name.to_ascii_lowercase();
         let cols = self.columns_of(r)?;
@@ -13250,7 +13303,21 @@ fn in_typed_case(keyword: &str, typed: &str) -> String {
 /// How many foreign keys join tables `a` and `b`, in either direction. Two
 /// make the condition a choice rather than a fact — and so does a table's key
 /// to itself, which counts twice, since which side is the parent is the choice.
+///
+/// A name two tables share ([`Catalog::is_union`]) answers two as well: the
+/// keys are held by bare name, so `dbo.orders` would be joined on
+/// `sales.orders`' key, through a column it does not have.
 fn fk_edge_count(catalog: &Catalog, a: &str, b: &str) -> usize {
+    let shared = |name: &str| {
+        catalog.is_union(&TableRef {
+            name: name.to_string(),
+            alias: None,
+            db: None,
+        })
+    };
+    if shared(a) || shared(b) {
+        return 2;
+    }
     let one_way = |from: &str, to: &str| {
         catalog.fks_of(from).map_or(0, |edges| {
             edges
@@ -15084,6 +15151,55 @@ mod predict_tests {
         assert_eq!(
             my("SELECT * FROM orders o LEFT OUTER JOIN customers c ").as_deref(),
             Some("ON o.customer_id = c.id")
+        );
+    }
+
+    /// `sales.orders`, keyed to `customers`, and `dbo.orders`, a different
+    /// table of the same name with neither the column nor the key.
+    fn two_orders() -> DbSchema {
+        let mut sales = tbl("orders", &["id", "customer_id"]);
+        sales.schema = Some("sales".to_string());
+        sales.foreign_keys = vec![ForeignKeyInfo {
+            columns: vec!["customer_id".to_string()],
+            ref_table: "customers".to_string(),
+            ref_columns: vec!["id".to_string()],
+            ..Default::default()
+        }];
+        let mut dbo = tbl("orders", &["id", "code"]);
+        dbo.schema = Some("dbo".to_string());
+        let mut customers = tbl("customers", &["id", "name"]);
+        customers.schema = Some("sales".to_string());
+        DbSchema {
+            tables: vec![sales, dbo, customers],
+            ..Default::default()
+        }
+    }
+
+    /// A name two tables share is held as the union of their columns and
+    /// their keys together, which is neither table: nothing is predicted from
+    /// it. Named by its namespace, a table is one table again.
+    #[test]
+    fn a_name_two_tables_share_predicts_nothing_from_their_union() {
+        let schema = two_orders();
+        let pg = |sql: &str| in_schema(&schema, sql, SqlDialect::Postgres);
+        assert_eq!(pg("INSERT INTO orders ("), None);
+        assert_eq!(
+            pg("INSERT INTO sales.orders (").as_deref(),
+            Some("id, customer_id)")
+        );
+        assert_eq!(
+            in_schema(&schema, "INSERT INTO shop..orders (", SqlDialect::MsSql),
+            None
+        );
+        assert_eq!(pg("SELECT * FROM dbo.orders o JOIN "), None);
+        assert_eq!(pg("SELECT * FROM dbo.orders o JOIN customers c "), None);
+        assert_eq!(pg("SELECT * FROM dbo.orders o JOIN customers c ON "), None);
+        // Two tables that are the same shape are not a union of anything.
+        let mut twins = two_orders();
+        twins.tables[1].columns = twins.tables[0].columns.clone();
+        assert_eq!(
+            in_schema(&twins, "INSERT INTO orders (", SqlDialect::Postgres).as_deref(),
+            Some("id, customer_id)")
         );
     }
 }
