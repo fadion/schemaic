@@ -26,7 +26,7 @@ use floem::views::editor::id::EditorId;
 use floem::views::editor::layout::{LineExtraStyle, TextLayoutLine};
 use floem::views::editor::text::{Document, Styling};
 use schemaic_core::intel::SqlDialect;
-use schemaic_core::sql::{NonCode, is_word_byte, is_word_start};
+use schemaic_core::sql::{NonCode, continues_name, is_word_byte, is_word_start, t_sql_name_prefix};
 
 #[derive(Clone, Copy)]
 enum Tok {
@@ -452,13 +452,21 @@ fn lex_line(line: &str, dialect: SqlDialect, start_in_block: bool) -> Vec<(usize
             i = end;
             continue;
         }
-        // number literal
+        // number literal, whole: `0x1F`, `1.5E-3`
         if c.is_ascii_digit() {
+            let j = number_end(b, i);
+            out.push((i, j, Tok::Number));
+            i = j;
+            continue;
+        }
+        // A variable — T-SQL's and MySQL's `@x`, `@@version` — or a T-SQL
+        // temporary table (`#t`, `##t`) is a name, so `@select` and `#order`
+        // keep the default colour.
+        if c == b'@' || t_sql_name_prefix(b, i, dialect) > 0 {
             let mut j = i + 1;
-            while j < n && (b[j].is_ascii_digit() || b[j] == b'.') {
+            while j < n && (matches!(b[j], b'@' | b'#') || is_word_byte(b[j])) {
                 j += 1;
             }
-            out.push((i, j, Tok::Number));
             i = j;
             continue;
         }
@@ -474,12 +482,23 @@ fn lex_line(line: &str, dialect: SqlDialect, start_in_block: bool) -> Vec<(usize
         // happened to follow the non-ASCII byte (`naïve_from`'s tail is not
         // one), which is why nobody saw it. `is_keyword` folds ASCII only, so a
         // whole non-ASCII word now correctly matches nothing.
+        //
+        // A name runs on through the engine's own continuation bytes (`a$from`
+        // is one name), and a word after a `.` is a member (`t.order`): neither
+        // is a keyword however it is spelled. One letter glued to a `'` is a
+        // literal's prefix (`N'…'`, `E'…'`, `X'…'`, `B'…'`), coloured with it.
         if is_word_start(c) {
             let mut j = i + 1;
-            while j < n && is_word_byte(b[j]) {
+            while j < n && (is_word_byte(b[j]) || continues_name(b[j], dialect)) {
                 j += 1;
             }
-            if is_keyword(&line[i..j]) {
+            let member = i > 0 && b[i - 1] == b'.';
+            if j == i + 1
+                && matches!(c.to_ascii_uppercase(), b'N' | b'E' | b'X' | b'B')
+                && b.get(j) == Some(&b'\'')
+            {
+                out.push((i, j, Tok::Str));
+            } else if !member && is_keyword(&line[i..j]) {
                 out.push((i, j, Tok::Keyword));
             }
             i = j;
@@ -490,6 +509,37 @@ fn lex_line(line: &str, dialect: SqlDialect, start_in_block: bool) -> Vec<(usize
     }
 
     out
+}
+
+/// Where the number starting at `b[i]` (a digit) ends: a hex literal `0x1F`,
+/// or digits with an optional fraction and exponent (`1.5E-3`) — an `e` is the
+/// exponent's only with a digit after it, so `1end` stops at `1`.
+fn number_end(b: &[u8], i: usize) -> usize {
+    let n = b.len();
+    let digits = |mut j: usize, ok: fn(&u8) -> bool| {
+        while j < n && ok(&b[j]) {
+            j += 1;
+        }
+        j
+    };
+    if b[i] == b'0' && matches!(b.get(i + 1), Some(b'x' | b'X')) {
+        let j = digits(i + 2, u8::is_ascii_hexdigit);
+        if j > i + 2 {
+            return j;
+        }
+    }
+    let mut j = digits(i, u8::is_ascii_digit);
+    if b.get(j) == Some(&b'.') {
+        j = digits(j + 1, u8::is_ascii_digit);
+    }
+    if matches!(b.get(j), Some(b'e' | b'E')) {
+        let sign = usize::from(matches!(b.get(j + 1), Some(b'+' | b'-')));
+        let k = digits(j + 1 + sign, u8::is_ascii_digit);
+        if k > j + 1 + sign {
+            j = k;
+        }
+    }
+    j
 }
 
 fn is_keyword(w: &str) -> bool {
@@ -622,6 +672,49 @@ mod tests {
             })
             .map(|(s, e, _)| line[s..e].to_string())
             .collect()
+    }
+
+    /// A keyword spelling that is a member, a variable or part of a longer
+    /// name is a name: `t.order`, `@select`, `@@version`, `a$from`.
+    #[test]
+    fn a_keyword_spelling_after_a_dot_an_at_or_in_a_dollar_name_is_not_coloured() {
+        use SqlDialect::{MsSql, MySql, Postgres};
+        assert_eq!(
+            spans_of("SELECT t.order FROM t", MySql, "keyword"),
+            ["SELECT", "FROM"]
+        );
+        assert_eq!(
+            spans_of("SELECT @select, @@version", MsSql, "keyword"),
+            ["SELECT"]
+        );
+        assert_eq!(spans_of("SET @from = 1", MySql, "keyword"), ["SET"]);
+        assert_eq!(
+            spans_of("SELECT * FROM #order", MsSql, "keyword"),
+            ["SELECT", "FROM"]
+        );
+        assert_eq!(
+            spans_of("SELECT a$from FROM t", Postgres, "keyword"),
+            ["SELECT", "FROM"]
+        );
+    }
+
+    /// A number is coloured whole — exponent, hex — and a literal's prefix
+    /// with its string.
+    #[test]
+    fn whole_numbers_and_literal_prefixes_are_coloured() {
+        use SqlDialect::{MsSql, MySql, Postgres};
+        assert_eq!(
+            spans_of("SELECT 1e10, 1.5E-3, 0x1F, 42", MySql, "number"),
+            ["1e10", "1.5E-3", "0x1F", "42"]
+        );
+        assert_eq!(spans_of("SELECT N'é'", MsSql, "string"), ["N", "'é'"]);
+        assert_eq!(
+            spans_of("SELECT E'\\n'", Postgres, "string"),
+            ["E", "'\\n'"]
+        );
+        assert_eq!(spans_of("SELECT X'0A'", MySql, "string"), ["X", "'0A'"]);
+        // A name ending in such a letter is not a prefix.
+        assert_eq!(spans_of("SELECT colN 'x'", MySql, "string"), ["'x'"]);
     }
 
     /// **A non-code span is coloured by what it is on *this* engine.**

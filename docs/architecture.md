@@ -24483,7 +24483,13 @@ existing prose was left alone.
     ASCII rule of its own: this was invariant 11's first site outside `core/sql.rs`, and it painted
     `select` as a keyword *inside* the legal column name `éselect`, spans that reach the Ctrl+K diff
     through `highlight_spans` too. `is_keyword` folds ASCII only, so a whole non-ASCII word now
-    correctly matches nothing.
+    correctly matches nothing. A word runs on through `sql::continues_name` (`a$from` is one name),
+    a word straight after a `.` is a member, and a variable (`@x`, `@@version`) or a T-SQL temporary
+    table (`sql::t_sql_name_prefix`: `#t`, `##t`) is a name — none is a keyword however it is spelled
+    (`a_keyword_spelling_after_a_dot_an_at_or_in_a_dollar_name_is_not_coloured`). A number is
+    coloured whole by `number_end` — `0x1F`, `1.5E-3`, an `e` counting only with a digit after it —
+    and a one-letter literal prefix glued to its `'` (`N`, `E`, `X`, `B`) takes the string's colour
+    (`whole_numbers_and_literal_prefixes_are_coloured`).
     `preview_bg`/`preview_fg` are the surface and base text of a **syntax-coloured preview**, and
     they are named here rather than spelled at each site so the cross-axis gate in `contrast.rs`
     measures the surface the previews actually paint — the account browser's `GRANT` block is the
