@@ -28,9 +28,11 @@ schema-aware intelligence, built to feel instant.
 
 ## Features
 
-- **SQL editor.** Highlighting, schema-aware completion, diagnostics from a real
-  per-dialect parser, formatting, snippets, and `:name` parameters you fill in
-  before the run. Open, save and run `.sql` files.
+- **SQL editor.** Highlighting, schema-aware completion, inline predictions of
+  the next words (a keyword's partner, a join's foreign-key condition, the
+  columns to group by, the rest of a line you ran before) that Tab accepts,
+  diagnostics from a real per-dialect parser, formatting, snippets, and `:name`
+  parameters you fill in before the run. Open, save and run `.sql` files.
 - **Results grid.** Edit cells and write them back, add, duplicate and delete
   rows, filter and sort on the server, freeze columns, and paste a block from a
   spreadsheet. Binary cells preview as images or hex. Export to CSV, JSON, SQL,
