@@ -111,6 +111,17 @@ fn default_editor_h() -> f64 {
 fn default_ai_harness() -> String {
     "claude".to_string()
 }
+
+/// The [`UiState::ai_harness`] key that means **no agent at all** — the
+/// assistant switched off. Not a `Harness::key`, and must never become one:
+/// `schemaic_ai::harness::Agent` reads it as the off state.
+pub const AI_DISABLED_KEY: &str = "disabled";
+
+/// The agent a **new install** starts with: none. See
+/// [`UiState::ai_harness`] for why this is not [`default_ai_harness`].
+fn first_run_ai_harness() -> String {
+    AI_DISABLED_KEY.to_string()
+}
 fn default_ai_model() -> String {
     "haiku".to_string()
 }
@@ -212,17 +223,20 @@ pub struct UiState {
     /// Query-editor height (px); the results grid takes the rest.
     #[serde(default = "default_editor_h")]
     pub editor_h: f64,
-    /// AI Assistant — which agent CLI drives the panel: `claude` / `codex` /
-    /// `antigravity`.
+    /// AI Assistant — which agent CLI drives the panel: a `Harness::key`, or
+    /// [`AI_DISABLED_KEY`] for none, written by Settings → AI's *Agent CLI*
+    /// dropdown and read by `schemaic_ai::harness::Agent::from_key`.
     ///
-    /// `gemini` was a fourth and is gone; a settings file still naming it takes
-    /// the unrecognised-value path below rather than a migration of its own.
+    /// `gemini` was once a harness and is gone; a settings file still naming it
+    /// takes the unrecognised-value path below rather than a migration of its
+    /// own.
     ///
-    /// One of `claude` / `codex` / `antigravity` / `opencode`
-    /// (`Harness::key`), written by Settings → AI.
-    ///
-    /// Defaults to `claude`, which is what every settings file written before
-    /// this field existed meant — the app drove that CLI and nothing else.
+    /// **Two defaults, and the difference is the point.** A file *without* the
+    /// key defaults to `claude`, which is what every settings file written
+    /// before this field existed meant — the app drove that CLI and nothing
+    /// else, and an upgrade must not switch off a panel somebody is using. *No
+    /// file at all* — a new install — is [`UiState::default`], which starts the
+    /// assistant **off**: nothing reaches an agent until the user picks one.
     ///
     /// An unrecognised value is **not** silently replaced with the default —
     /// and that promise used to be false one save later, which is the more
@@ -408,7 +422,7 @@ impl Default for UiState {
             schema_w: default_schema_w(),
             right_w: default_right_w(),
             editor_h: default_editor_h(),
-            ai_harness: default_ai_harness(),
+            ai_harness: first_run_ai_harness(),
             ai_cli_path: String::new(),
             ai_model: default_ai_model(),
             ai_effort: default_ai_effort(),
@@ -1711,11 +1725,11 @@ pub fn clear_connections_backup() {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConnectionsFile, FileStore, Load, RECOVERIES, Recovered, RightPanelState, Saving, UiState,
-        ai_harness_to_persist, classify, legacy_ai_run_queries_in, migrate_legacy_once,
-        missing_notice, private_dir_in, read_bytes, read_unrecovered, recover, recovery_notice,
-        remove_secret_siblings, sibling, statement_timeout, statement_timeout_label,
-        take_recoveries, usable_base, write_bytes, write_secret_store,
+        AI_DISABLED_KEY, ConnectionsFile, FileStore, Load, RECOVERIES, Recovered, RightPanelState,
+        Saving, UiState, ai_harness_to_persist, classify, legacy_ai_run_queries_in,
+        migrate_legacy_once, missing_notice, private_dir_in, read_bytes, read_unrecovered, recover,
+        recovery_notice, remove_secret_siblings, sibling, statement_timeout,
+        statement_timeout_label, take_recoveries, usable_base, write_bytes, write_secret_store,
     };
     use std::cell::RefCell;
     use std::collections::HashMap;
@@ -2091,6 +2105,36 @@ mod tests {
         assert_eq!(state.ai_harness, "claude");
         // …and the settings that lived beside it are untouched.
         assert_eq!(state.ai_model, "opus");
+    }
+
+    /// **A first run starts with the assistant off**, and only a first run.
+    /// No `ui_state.json` at all is a new install, which gets nothing sent
+    /// anywhere until the user picks an agent; a file without the key is an old
+    /// one, which ran Claude and keeps running it (the test above). The two
+    /// defaults are different functions for exactly that reason.
+    #[test]
+    fn a_first_run_starts_with_the_assistant_disabled() {
+        assert_eq!(UiState::default().ai_harness, AI_DISABLED_KEY);
+        let state: UiState = serde_json::from_str("{}").expect("parses");
+        assert_eq!(
+            state.ai_harness, "claude",
+            "an existing file keeps its agent"
+        );
+    }
+
+    /// Off is a choice the file records, and records verbatim.
+    #[test]
+    fn a_disabled_assistant_round_trips() {
+        let raw = format!(r#"{{"ai_harness": "{AI_DISABLED_KEY}"}}"#);
+        let state: UiState = serde_json::from_str(&raw).expect("parses");
+        let back: UiState =
+            serde_json::from_str(&serde_json::to_string(&state).expect("serializes"))
+                .expect("re-parses");
+        assert_eq!(back.ai_harness, AI_DISABLED_KEY);
+        assert_eq!(
+            ai_harness_to_persist(None, AI_DISABLED_KEY),
+            AI_DISABLED_KEY
+        );
     }
 
     /// The value round-trips verbatim. Nothing here maps it onto a known set:

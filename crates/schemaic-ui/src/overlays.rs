@@ -1557,6 +1557,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
     let refresh_db = ui.schema_actions.refresh_db.clone();
     let collapse_db = ui.schema_actions.collapse_db.clone();
     let ai_send = ui.ai_actions.send.clone();
+    let ai_enabled = ui.ai.enabled;
     let right_panel = ui.layout.right_panel;
     // `Stored` handles: every `update` below saves by construction.
     let db_colors = ui.db_colors;
@@ -2819,21 +2820,26 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     }
                 }
             }
-            entries.push(MenuEntry::Separator);
-            let ai = ai_send.clone();
-            let prompt = menu.ai_prompt.clone();
-            entries.push(MenuEntry::action_icon(
-                "AI explain",
-                (icons::SPARKLES, theme::key_foreign),
-                // Reveal, then send — as the palette's Ask AI and the grid's AI
-                // Summary already did. Without it, with the right column showing
-                // the Terminal or History (or closed), this sent the prompt into a
-                // panel the user couldn't see and read as doing nothing at all.
-                move || {
-                    crate::reveal_ai_panel(right_panel);
-                    (ai)(prompt.clone());
-                },
-            ));
+            // The fixed tail of every menu — **unless the assistant is off**,
+            // when it and its separator are absent, so the menu ends where the
+            // object's own actions do.
+            if ai_enabled.get_untracked() {
+                entries.push(MenuEntry::Separator);
+                let ai = ai_send.clone();
+                let prompt = menu.ai_prompt.clone();
+                entries.push(MenuEntry::action_icon(
+                    "AI explain",
+                    (icons::SPARKLES, theme::key_foreign),
+                    // Reveal, then send — as the palette's Ask AI and the grid's AI
+                    // Summary already did. Without it, with the right column showing
+                    // the Terminal or History (or closed), this sent the prompt into a
+                    // panel the user couldn't see and read as doing nothing at all.
+                    move || {
+                        crate::reveal_ai_panel(right_panel);
+                        (ai)(prompt.clone());
+                    },
+                ));
+            }
 
             entries
         }
@@ -3672,6 +3678,7 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
     let hist_open = ui.history_actions.open.clone();
     let hist_clear = ui.history_actions.clear.clone();
     let ai_send = ui.ai_actions.send.clone();
+    let ai_enabled = ui.ai.enabled;
     let term_input = ui.term_actions.input.clone();
 
     // The active tab (Copy) — for query-scoped commands.
@@ -3688,7 +3695,7 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
         }))
     };
 
-    vec![
+    let mut cmds = vec![
         Command {
             name: "toggle panel",
             label: "Toggle Panel",
@@ -4203,7 +4210,14 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
                 },
             },
         },
-    ]
+    ];
+    // **No "Ask AI" while the assistant is off** — omitted, as the Activity
+    // panel is on an engine without sessions. The registry is built per open,
+    // so turning the assistant on brings it back at the next.
+    if !ai_enabled.get_untracked() {
+        cmds.retain(|c| c.name != "ask ai");
+    }
+    cmds
 }
 
 /// Move the active tab by `step` (±1), wrapping around the strip order.
@@ -5316,6 +5330,7 @@ pub(crate) fn error_modal_overlay(ui: Ui) -> impl IntoView {
     // fix: the panel is the workspace's, not the editor pane's, so this overlay
     // can reach it the same way the schema tree's own AI explain does.
     let ai_send = ui.ai_actions.send.clone();
+    let ai_enabled = ui.ai.enabled;
     let right_panel = ui.layout.right_panel;
     let connections = ui.conn.connections;
 
@@ -5355,6 +5370,13 @@ pub(crate) fn error_modal_overlay(ui: Ui) -> impl IntoView {
                 explain: explain_error,
                 fix: fixable_error,
             } = offers.clone();
+            // Neither action while the assistant is off — the error is still
+            // shown in full, which is what the modal is for.
+            let (explain_error, fixable_error) = if ai_enabled.get_untracked() {
+                (explain_error, fixable_error)
+            } else {
+                (None, None)
+            };
             let msg = shown.unwrap_or_else(|| "No error.".to_string());
             let has_actions = explain_error.is_some() || fixable_error.is_some();
 

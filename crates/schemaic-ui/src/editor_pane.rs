@@ -2108,6 +2108,10 @@ pub(crate) struct QueryPaneParams {
     pub inline_ai: RwSignal<InlineAiState>,
     pub inline_ai_run: Rc<dyn Fn(InlineAiRequest)>,
     pub inline_ai_cancel: Rc<dyn Fn()>,
+    /// The assistant is on ([`crate::AiUi::enabled`]). Off, the pane offers no
+    /// AI action — the menu's AI entries and the error bar's are absent, and
+    /// Ctrl+K opens nothing.
+    pub ai_enabled: RwSignal<bool>,
     pub error_modal_open: RwSignal<bool>,
     pub schema_visible: RwSignal<bool>,
     pub right_panel: RwSignal<RightPanel>,
@@ -2188,6 +2192,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         inline_ai,
         inline_ai_run,
         inline_ai_cancel,
+        ai_enabled,
         error_modal_open,
         schema_visible,
         right_panel,
@@ -2620,6 +2625,13 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             && let KeyInput::Keyboard(Key::Character(c), _) = &kp.key
             && c.as_str().eq_ignore_ascii_case("k")
         {
+            // **Nothing, while the assistant is off** — and the key is still
+            // consumed, so it does not fall through to an editor binding that a
+            // user who never turned AI on would then meet instead. The app's
+            // inline action refuses too; this is that refusal's courtesy.
+            if !ai_enabled.get_untracked() {
+                return CommandExecuted::Yes;
+            }
             editor_sig.with_untracked(|e| {
                 let cur = e.cursor.get_untracked();
                 let offset = cur.offset();
@@ -3412,9 +3424,13 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 db_diag.with_untracked(|d| diags.extend_from_slice(d));
                 ((lo, hi), intel::problems_in_range(&diags, lo, hi))
             };
+            // **No AI entry while the assistant is off** — absent rather than
+            // dimmed, as "Plan" is below on an engine without one: off is the
+            // user's answer, and a menu offering four dead sparkles keeps asking.
+            let ai_on = ai_enabled.get_untracked();
             let fix_entry = {
                 let fix_with_ai = fix_with_ai.clone();
-                let has_problems = !statement_problems().1.is_empty();
+                let has_problems = ai_on && !statement_problems().1.is_empty();
                 has_problems.then(|| {
                     MenuEntry::action_icon(
                         "AI fix",
@@ -3428,7 +3444,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             };
             // The three AI actions carry the sparkle (matching AI Summary in the
             // grid); Plan + Format sit below the separator as plain actions.
-            let mut entries = vec![
+            let ai_entries = vec![
                 MenuEntry::action_icon(
                     "Ask AI",
                     (icons::SPARKLES, theme::key_foreign),
@@ -3528,6 +3544,9 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     },
                 ),
                 MenuEntry::Separator,
+            ];
+            let mut entries = if ai_on { ai_entries } else { Vec::new() };
+            entries.extend([
                 MenuEntry::action("Plan", move || {
                     let sql = query.get_untracked();
                     let dia = dialect.get_untracked();
@@ -3551,7 +3570,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     format_editor(&ed_format, comp, dialect.get_untracked())
                 })
                 .shortcut(crate::shortcuts::MenuKey::EditorFormat),
-            ];
+            ]);
             // First when it's there: over a squiggle it is the most specific
             // thing this menu can offer, and the one the user came for.
             if let Some(fix) = fix_entry {
@@ -4373,8 +4392,14 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     // hold all three with the message still readable. It is the
                     // one of the three that has a second home — the *View* modal
                     // offers the same explanation — so it is the one that can go.
+                    // Both AI actions are absent while the assistant is off, which
+                    // leaves *View* — the message is still worth reading.
                     dyn_container(
-                        move || can_explain && error_bar_fits_explain(error_bar_w.get()),
+                        move || {
+                            ai_enabled.get()
+                                && can_explain
+                                && error_bar_fits_explain(error_bar_w.get())
+                        },
                         {
                             let explain_error = explain_error.clone();
                             move |fits: bool| {
@@ -4400,7 +4425,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                             }
                         },
                     ),
-                    dyn_container(move || can_fix, {
+                    dyn_container(move || ai_enabled.get() && can_fix, {
                         let ai_fix = ai_fix.clone();
                         move |can_fix: bool| {
                             if !can_fix {

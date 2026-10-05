@@ -129,7 +129,7 @@ type GuardCloseFn = GuardTxFn;
 /// initial load, the connection-wide Refresh and the per-database Refresh all
 /// take, so what the tree shows while a fetch is out is decided once.
 type FetchSchemaFn = Rc<dyn Fn(&ConnNode, Db)>;
-use schemaic_ai::harness::Harness;
+use schemaic_ai::harness::{Agent, Harness};
 use schemaic_core::filter::{BrowseKey, Order, table_query};
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::launch;
@@ -2158,9 +2158,14 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let editor_collapsed: RwSignal<bool> = RwSignal::new(false);
     // AI Assistant settings (gear → modal), restored from disk.
     let ai_settings_open = RwSignal::new(false);
-    // Which agent CLI drives the panel. An unrecognised persisted key falls back
-    // to Claude *and says so* — `Harness::from_key` refuses to guess precisely so
-    // this decision is made where there is a UI to report it.
+    // Which agent CLI drives the panel, or none. An unrecognised persisted key
+    // falls back to **off** *and says so* — `Agent::from_key` refuses to guess
+    // precisely so this decision is made where there is a UI to report it.
+    //
+    // **Off, not Claude.** It used to be Claude, which spawned a CLI the settings
+    // file did not name for a user who had picked something else; off sends
+    // nothing anywhere, the panel says the assistant is off, and the dropdown is
+    // one click from whichever agent the user meant.
     //
     // **The key the file names, kept.** The field's doc promises the
     // unrecognised value is not silently replaced with the default — and it was,
@@ -2169,24 +2174,32 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // next thing that touched the settings. A build that later grows that
     // harness would then have nothing to restore. Held here and written back
     // until the user picks something themselves.
-    let ai_harness_unknown: RwSignal<Option<String>> =
-        RwSignal::new(match Harness::from_key(&ui_state.ai_harness) {
-            Some(_) => None,
-            None => {
-                // Said out loud rather than swallowed. The substitution is
-                // otherwise invisible: the panel would drive Claude while
-                // `ui_state.json` names something else, and the only symptom is
-                // an assistant behaving unlike the CLI the user believes they
-                // picked.
-                tracing::warn!(
-                    harness = %ui_state.ai_harness,
-                    "unknown AI harness in ui_state.json; falling back to Claude Code"
-                );
-                Some(ui_state.ai_harness.clone())
-            }
-        });
-    let ai_harness =
-        RwSignal::new(Harness::from_key(&ui_state.ai_harness).unwrap_or(Harness::Claude));
+    let loaded_agent = Agent::from_key(&ui_state.ai_harness);
+    let ai_harness_unknown: RwSignal<Option<String>> = RwSignal::new(match loaded_agent {
+        Some(_) => None,
+        None => {
+            // Said out loud rather than swallowed: the panel reads "off" while
+            // `ui_state.json` names something, and the log is where that
+            // something can be found.
+            tracing::warn!(
+                harness = %ui_state.ai_harness,
+                "unknown AI harness in ui_state.json; the assistant starts off"
+            );
+            Some(ui_state.ai_harness.clone())
+        }
+    });
+    // **Two signals for one setting**: whether the assistant is on, and the
+    // harness it drives when it is. Off keeps a harness so everything that takes
+    // one — the settings sections, `harness_fields`, the switch effect below —
+    // goes on taking a `Harness`, and `Agent` is composed only where the choice is
+    // shown or persisted. Claude is the harness an off assistant holds, which is
+    // only what the dropdown lands on when the user turns it back on by picking.
+    let ai_enabled = RwSignal::new(loaded_agent.is_some_and(|a| a != Agent::Disabled));
+    let ai_harness = RwSignal::new(
+        loaded_agent
+            .and_then(Agent::harness)
+            .unwrap_or(Harness::Claude),
+    );
     let ai_cli_path = RwSignal::new(match ai_harness_unknown.get_untracked() {
         Some(_) => String::new(),
         None => ui_state.ai_cli_path.clone(),
@@ -2278,6 +2291,12 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     create_effect(move |_| {
         let h = ai_harness.get();
         let path = ai_cli_path.get();
+        // **Not while the assistant is off.** This runs at every launch, and the
+        // probe spawns the CLI: off has to mean no agent process at all, not
+        // only no question sent. Tracked, so turning it on warms the cache then.
+        if !ai_enabled.get() {
+            return;
+        }
         // **The settings notice reads the cache and never fills it**, so this
         // has to tell it when an answer lands, or a harness switch leaves the
         // grade blank until something else re-renders the modal. A cold key is
@@ -2302,6 +2321,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // the process that needed it — so any are removed at startup, off-thread
     // because it shells out. See `antigravity::sweep` for the one case this
     // cannot distinguish (a second running Schemaic).
+    //
+    // **Whether or not the assistant is on.** These withdraw what an earlier
+    // session granted and never ask a model anything; an assistant switched off
+    // after a crash is exactly the case whose leftovers should not stand.
     {
         let agy = detect_bin(Harness::Antigravity);
         std::thread::spawn(move || {
@@ -2392,6 +2415,18 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         ai_model.set(plan.model.unwrap_or_default());
         if plan.effort != ai_effort.get_untracked() {
             ai_effort.set(plan.effort);
+        }
+        now
+    });
+    // **Turning the assistant on or off is a pick too**, and the effect above
+    // cannot see it when the harness stays put. An unknown key loads as off
+    // holding Claude, so picking *Claude Code* changes `ai_enabled` and not
+    // `ai_harness` — and with the unknown key still held, the save wrote it back
+    // and the next launch started off again.
+    create_effect(move |prev: Option<bool>| {
+        let now = ai_enabled.get();
+        if prev.is_some_and(|p| p != now) {
+            ai_harness_unknown.set(None);
         }
         now
     });
@@ -7347,7 +7382,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     // should start naming what is actually running.
                     ai_harness: persist::ai_harness_to_persist(
                         ai_harness_unknown.get_untracked().as_deref(),
-                        ai_harness.get_untracked().key(),
+                        Agent::of(ai_enabled.get_untracked(), ai_harness.get_untracked()).key(),
                     ),
                     ai_cli_path: ai_cli_path.get_untracked(),
                     ai_model: ai_model.get_untracked(),
@@ -10694,7 +10729,12 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         let db_for = db_for.clone();
         Rc::new(move |msg: String| {
             let msg = msg.trim().to_string();
-            if msg.is_empty() || ai_busy.get_untracked() {
+            // **Off is refused here, at the action**, not only by the controls
+            // that lead to it being hidden — the same shape as the write guard:
+            // every surface that sends goes through this (regenerate, a grid
+            // summary, the plan modal's Ask AI), and a control missed by the
+            // hiding must still send nothing. The panel already says why.
+            if msg.is_empty() || ai_busy.get_untracked() || !ai_enabled.get_untracked() {
                 return;
             }
             let active_id = active_conn.get_untracked();
@@ -11092,10 +11132,42 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // `output()` future → the child is killed (no orphaned request).
     let inline_ai_task: Rc<RefCell<Option<tokio::task::JoinHandle<()>>>> =
         Rc::new(RefCell::new(None));
+    // **Switching the assistant off ends what it is doing**, the moment it is
+    // picked rather than when the settings close: the live session is dropped,
+    // which kills its CLI (as `ai_apply`'s respawn does), and an in-flight
+    // inline generation is aborted, which kills its child (`kill_on_drop`). The
+    // gear is live mid-turn, so a turn can be streaming as this runs; it is
+    // settled the way `ai_apply` settles one.
+    {
+        let ai_session = ai_session.clone();
+        let task_slot = inline_ai_task.clone();
+        create_effect(move |_| {
+            if ai_enabled.get() {
+                return;
+            }
+            ai_session.borrow_mut().take();
+            if let Some(task) = task_slot.borrow_mut().take() {
+                task.abort();
+            }
+            if matches!(inline_ai.get_untracked(), InlineAiState::Busy) {
+                inline_ai.set(InlineAiState::Idle);
+            }
+            ai_stopping.set(false);
+            if ai_busy.get_untracked() {
+                mark_stopped(ai_messages);
+                ai_busy.set(false);
+            }
+        });
+    }
     let inline_ai_run: Rc<dyn Fn(InlineAiRequest)> = {
         let handle = handle.clone();
         let task_slot = inline_ai_task.clone();
         Rc::new(move |req: InlineAiRequest| {
+            // Refused at the action, as `ai_send` is — see there.
+            if !ai_enabled.get_untracked() {
+                inline_ai.set(InlineAiState::Failed(schemaic_ui::AI_OFF_NOTE.to_string()));
+                return;
+            }
             inline_ai.set(InlineAiState::Busy);
             // The active tab's database gets full column detail; others only when
             // a table is named in the buffer/intent. Scoped to the active
@@ -11216,6 +11288,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         Rc::new(
             move |req: schemaic_ui::AiFillRequest, done: schemaic_ui::AiFillDoneFn| {
                 use schemaic_ui::AiFillResult;
+                // Refused at the action, as `ai_send` is — see there.
+                if !ai_enabled.get_untracked() {
+                    (done)(AiFillResult::Failed(schemaic_ui::AI_OFF_NOTE.to_string()));
+                    return;
+                }
                 let db = match db_for(req.conn_id) {
                     Ok(db) => db,
                     Err(e) => {
@@ -11315,6 +11392,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         Rc::new(
             move |req: schemaic_ui::AiSeedRequest, done: schemaic_ui::AiSeedDoneFn| {
                 use schemaic_ui::AiSeedResult;
+                // Refused at the action, as `ai_send` is — see there.
+                if !ai_enabled.get_untracked() {
+                    (done)(AiSeedResult::Failed(schemaic_ui::AI_OFF_NOTE.to_string()));
+                    return;
+                }
                 let db = match db_for(req.conn_id) {
                     Ok(db) => db,
                     Err(e) => {
@@ -12371,6 +12453,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             busy: ai_busy,
             settings_open: ai_settings_open,
             harness: ai_harness,
+            enabled: ai_enabled,
             cli_path: ai_cli_path,
             model: ai_model,
             effort: ai_effort,

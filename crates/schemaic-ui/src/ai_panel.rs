@@ -348,6 +348,7 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
         }
     });
 
+    let enabled_for_empty = ui.ai.enabled;
     let convo = dyn_container(
         move || msg_count.get() == 0,
         move |is_empty| {
@@ -365,19 +366,34 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
                 // an installation that was not the one in question. The settings
                 // modal was fixed for this exact reason; the panel was left
                 // behind.
+                //
+                // **Off says so first**, and says how back: the gear in this
+                // panel's title row is the one way into the settings.
+                let enabled = enabled_for_empty;
                 return dyn_container(
-                    move || (available.get(), panel_harness.get()),
-                    move |(ok, h)| {
-                        let msg = match ok {
-                            true => "Ask about your SQL…".to_string(),
-                            false => format!("{} not connected.", h.label()),
+                    move || (enabled.get(), available.get(), panel_harness.get()),
+                    move |(on, ok, h)| {
+                        let msg = match (on, ok) {
+                            (false, _) => crate::AI_OFF_NOTE.to_string(),
+                            (true, true) => "Ask about your SQL…".to_string(),
+                            (true, false) => format!("{} not connected.", h.label()),
                         };
+                        // **Pinned to `panel_w`, as the bubble list is**, and for
+                        // its reason: the scroll hands its child unbounded width,
+                        // so a label sized itself to its one line and ran off the
+                        // panel's edge — "The AI assistant is off…" is the first
+                        // of these long enough to. A definite width is what lets
+                        // it wrap; the right padding mirrors the left so the
+                        // wrapped lines stop short of the edge. Taffy's widths are
+                        // border-box, so both paddings come out of `panel_w`.
                         text(msg)
-                            .style(|s| {
+                            .style(move |s| {
                                 s.font_size(theme::scaled_font(14.0))
                                     .color(theme::text_muted())
+                                    .width(panel_w.get())
                                     .padding_top(theme::scaled(10.0))
                                     .padding_left(theme::scaled(12.0))
+                                    .padding_right(theme::scaled(12.0))
                             })
                             .into_any()
                     },
@@ -633,16 +649,20 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
     // field mid-sentence, so the box lost focus and re-measured its own height
     // from an unlaid-out editor. A memo only notifies when the pair really
     // changes. (Note it must stay a *pair* memo: two memos would be two keys.)
-    let input_state =
-        floem::reactive::create_memo(move |_| (available.get(), conn_status.get().is_down()));
+    // (One memo over all three now, for the same reason it was a pair.)
+    let enabled = ui.ai.enabled;
+    let input_state = floem::reactive::create_memo(move |_| {
+        input_state_of(enabled.get(), available.get(), conn_status.get().is_down())
+    });
     let input_row = dyn_container(
         move || input_state.get(),
-        move |(claude_ok, db_down)| match (claude_ok, db_down) {
-            (true, false) => {
+        move |state| match state {
+            InputState::Live => {
                 ai_input_row(input, messages, busy, send.clone(), cancel.clone()).into_any()
             }
-            (_, true) => ai_input_disabled("Not connected to the database").into_any(),
-            (false, _) => ai_input_disabled("Message…").into_any(),
+            InputState::Off => ai_input_disabled("The AI assistant is off").into_any(),
+            InputState::DbDown => ai_input_disabled("Not connected to the database").into_any(),
+            InputState::Unreachable => ai_input_disabled("Message…").into_any(),
         },
     )
     .style(|s| s.flex_shrink(0.0_f32));
@@ -1049,6 +1069,57 @@ fn attachment_chip(
                 .padding_bottom(theme::scaled(4.0))
         })
     })
+}
+
+/// What the panel's message box is — see [`input_state_of`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InputState {
+    /// A live box: the assistant is on, its CLI is there and so is the database.
+    Live,
+    /// The assistant is switched off (`AiUi::enabled`).
+    Off,
+    /// The database is down — recoverable from the header's Retry.
+    DbDown,
+    /// The selected CLI cannot be found.
+    Unreachable,
+}
+
+/// Which message box the panel shows.
+///
+/// **Off wins over everything.** With the assistant switched off, "not
+/// connected to the database" or a missing CLI is not why the box is dead, and
+/// a message naming either would send the user to fix something that is not
+/// the reason. The other two keep their order: a down database is the
+/// recoverable one and the header's Retry answers it.
+fn input_state_of(enabled: bool, reachable: bool, db_down: bool) -> InputState {
+    match (enabled, reachable, db_down) {
+        (false, _, _) => InputState::Off,
+        (true, _, true) => InputState::DbDown,
+        (true, false, false) => InputState::Unreachable,
+        (true, true, false) => InputState::Live,
+    }
+}
+
+#[cfg(test)]
+mod input_state_tests {
+    use super::{InputState, input_state_of};
+
+    #[test]
+    fn an_assistant_switched_off_says_so_whatever_else_is_wrong() {
+        for reachable in [true, false] {
+            for db_down in [true, false] {
+                assert_eq!(input_state_of(false, reachable, db_down), InputState::Off);
+            }
+        }
+    }
+
+    #[test]
+    fn an_assistant_that_is_on_keeps_the_existing_order() {
+        assert_eq!(input_state_of(true, true, false), InputState::Live);
+        assert_eq!(input_state_of(true, true, true), InputState::DbDown);
+        assert_eq!(input_state_of(true, false, true), InputState::DbDown);
+        assert_eq!(input_state_of(true, false, false), InputState::Unreachable);
+    }
 }
 
 // The disabled message box shown when the selected CLI isn't connected — matches the real

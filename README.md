@@ -19,9 +19,9 @@ schema-aware intelligence, built to feel instant.
   back unless exactly one row changed, and generated `ALTER` and `DROP` is shown
   as SQL, with what it destroys named in plain language, before it runs.
 - **Local.** No account, no telemetry, no API key. Credentials live in the OS
-  keyring. The AI assistant runs through your own agent CLI, under that CLI's
-  account and terms, and the panel tells you which restrictions are actually in
-  force for it before you send anything.
+  keyring. The AI assistant is off until you pick an agent CLI, and then runs
+  through that CLI, under its account and terms; the panel tells you which
+  restrictions are actually in force for it before you send anything.
 - **Every engine, properly.** Quoting, DDL, completion and diagnostics follow the
   dialect you're connected to. What an engine can't do isn't offered, and what it
   does differently is handled for you, like SQLite's twelve-step table rebuild.

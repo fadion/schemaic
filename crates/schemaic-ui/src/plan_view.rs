@@ -38,6 +38,9 @@ pub(crate) fn plan_overlay(
     layout: LayoutUi,
     tab_actions: Rc<TabsActions>,
     ai_actions: Rc<AiActions>,
+    // `AiUi::enabled`: off, the footer has no "Ask AI" — the plan is still the
+    // modal's whole point.
+    ai_enabled: RwSignal<bool>,
 ) -> impl IntoView {
     let plan_open = o.plan_open;
     let plan_state = o.plan_state;
@@ -121,15 +124,20 @@ pub(crate) fn plan_overlay(
             let toolbar = h_stack((
                 analyze_control,
                 empty().style(|s| s.flex_grow(1.0_f32)),
-                ask_ai_button(
-                    plan_state,
-                    plan_sql,
-                    ai_send.clone(),
-                    right_panel,
-                    close.clone(),
-                    plan_dialect(),
-                    ring.clone(),
-                ),
+                if ai_enabled.get_untracked() {
+                    ask_ai_button(
+                        plan_state,
+                        plan_sql,
+                        ai_send.clone(),
+                        right_panel,
+                        close.clone(),
+                        plan_dialect(),
+                        ring.clone(),
+                    )
+                    .into_any()
+                } else {
+                    empty().into_any()
+                },
             ))
             .style(|s| {
                 s.items_center()

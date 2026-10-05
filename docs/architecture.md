@@ -10376,6 +10376,18 @@ existing prose was left alone.
     (`the_schema_filter_round_trips_and_defaults_to_none`). It changes per keystroke, so it is saved
     on a debounce and again at quit rather than by the effects the other fields share (*app/main.rs*,
     beside the `WindowClosed` flush).
+    **`ai_harness` has two defaults, and the difference between them is the point.** A file *without*
+    the key takes the serde default, `default_ai_harness` — `"claude"`, which is what every file
+    written before multiple harnesses meant, since that was the one CLI the app drove; an upgrade must
+    not switch off a panel somebody is using
+    (`a_ui_state_from_before_multiple_harnesses_loads_as_claude`). `UiState::default()` takes
+    `first_run_ai_harness` — `AI_DISABLED_KEY`, the assistant off — so a new install sends nothing to
+    any agent until the user picks one (`a_first_run_starts_with_the_assistant_disabled`;
+    `a_disabled_assistant_round_trips` holds the key through serde and `ai_harness_to_persist`). Off
+    is therefore also what anything else that lands on `UiState::default()` gets: no config
+    directory, or — per the paragraph below — a `ui_state.json` that is corrupt with no `.bak` that
+    parses. Pointing the serde default at `first_run_ai_harness` as a tidy-up would switch
+    every upgraded install's assistant off.
     **An absent primary is not a first run**, and treating it as one was silent data loss.
     `recover(primary, staged, backup)` returns the value *and* a `Recovered` — `Primary`,
     `FirstRun`, `Corrupt(err)` or `Restored(sibling)` — and an absent primary walks `.tmp` then
@@ -16494,6 +16506,10 @@ existing prose was left alone.
   carried on `AiSettings::harness`, resolved and interrogated by `app/agent_cli.rs`, and spawned by
   `app/ai.rs` — Claude and Antigravity as one persistent child per conversation, Codex, OpenCode,
   GitHub Copilot and Cursor as one process per turn.
+  **The dropdown's first entry is none of them**: *Disabled*, `harness::Agent::Disabled`, persisted
+  as `persist::AI_DISABLED_KEY` in the same field. A new install starts there and an upgrade does
+  not (`persist.rs`), and what off withholds is an invariant — *An assistant that is off sends
+  nothing and starts no agent process*.
   **A fifth, `gemini`, was modelled here and refused, and it has now been deleted rather than left
   as a menu entry that says no.** Google withdrew OAuth for personal accounts, so `gemini` needs an
   API key to authenticate at all, and the CLI's own sign-in points at Antigravity as its successor —
@@ -16502,9 +16518,9 @@ existing prose was left alone.
   the `stream.rs` dialect and every test of them are gone. It is written down because this is the
   kind of decision that gets re-litigated by whoever next wonders why Google's CLI is not in the
   picker. **The migration needed no code**, which is the whole point of the shape `from_key` already
-  had: it returns `None` for a key this build does not know, and `main.rs` warns and falls back to
-  Claude rather than coercing, so a `ui_state.json` still saying `"gemini"` takes the path that was
-  built for exactly this (`gemini_is_gone_and_its_persisted_key_resolves_to_nothing`).
+  had: it returns `None` for a key this build does not know, and `main.rs` warns and starts the
+  assistant off rather than coercing, so a `ui_state.json` still saying `"gemini"` takes the path
+  that was built for exactly this (`gemini_is_gone_and_its_persisted_key_resolves_to_nothing`).
   `Constraint::notice` reaches the user in three places and no fourth: under the settings modal's
   *Agent CLI* dropdown, where it describes the grade the selected binary would run at before a
   session is started, in what `spawn_refusal` prints when the session is refused outright, and — since
@@ -16515,7 +16531,7 @@ existing prose was left alone.
   counterpart of `turn_args`, and Claude's arm of it is `inline_args`, which was the whole of this
   path for as long as all three features spawned `claude` regardless of the selection. Why they did,
   and the bug that made that the safe answer at the time, is under `app/agent_cli.rs`. A
-  harness key `main.rs` does not recognise is `tracing::warn!`ed and falls back to Claude.
+  harness key `main.rs` does not recognise is `tracing::warn!`ed and starts the assistant off.
   **Getting the tools to each harness is six different mechanisms, and only Claude's is per
   invocation.** Claude gets a `--mcp-config` file in a directory of Schemaic's own (`ai::mcp_dir()`,
   and it was the temp dir until the credentials in it were moved somewhere only this user can
@@ -16757,7 +16773,10 @@ existing prose was left alone.
   on the UI thread. It is therefore called from an **effect on `harness_bin(h, &ai_cli_path)`**
   rather than once at startup, so changing the override re-warms the key that will actually be
   used — and the effect reads the **harness** signal as well, since that is the other half of the
-  key and a second way to warm an entry nobody reads.
+  key and a second way to warm an entry nobody reads. **It returns early while the assistant is
+  off**, because the probe *is* a spawn of the CLI and runs at every launch: off has to mean no agent
+  process at all, not only no question sent. It reads `ai_enabled` tracked, so turning the assistant
+  on is what warms the cache.
   **One key now covers every AI entry point, and it took two goes to get there.** Ctrl+K, AI Fill and
   AI Seed used to probe `(Claude, <claude bin>)` whatever was selected, which is a different key from
   `(selected harness, its bin)` whenever the selection is not Claude — so with Codex, Antigravity or
@@ -16831,20 +16850,41 @@ existing prose was left alone.
     this build no longer knows has to be *reported* and a silent substitution is invisible by
     construction. **The reporting is now somebody's job rather than an intention**: `persist` keeps
     the raw string (see `UiState::ai_harness`) and `main.rs` is where the `None` is answered — a
-    `tracing::warn!` naming the value, then Claude. The key round-trips **verbatim**, never mapped
-    onto the known set at the persistence layer, which is precisely what leaves the app something to
+    `tracing::warn!` naming the value, then the assistant **off**. It used to be Claude, which spawned
+    a CLI the file did not name for a user who had picked something else; off sends nothing anywhere,
+    the panel says so, and the dropdown is one pick from whichever agent was meant. The key
+    round-trips **verbatim**, never mapped onto the known set at the persistence layer, which is precisely what leaves the app something to
     report (`an_unknown_harness_survives_the_round_trip_rather_than_being_corrected`); and a
     settings file written before the field existed carries no key at all and loads as Claude,
     because Claude was the only harness there was
-    (`a_ui_state_from_before_multiple_harnesses_loads_as_claude`).
+    (`a_ui_state_from_before_multiple_harnesses_loads_as_claude`) — while a new install, which has
+    no file at all, starts off (`persist.rs`'s entry has both defaults).
+    **`Agent` is the setting; `Harness` is what it drives.** `enum Agent { Disabled, Cli(Harness) }`
+    sits beside `Harness` rather than adding an off variant to it, because every `match` over
+    `Harness` — the argv, the stream decoder, the constraint grade — answers a question only a CLI
+    has, and an off arm in each would be a dozen places to answer "nothing" and one place to forget
+    to. `Agent::ALL` is the dropdown's order, *Disabled* first and then `Harness::ALL`; `key` is
+    `Harness::key` or `persist::AI_DISABLED_KEY`, which must never become a harness key
+    (`the_disabled_key_is_no_harness_key`); and `from_key` returns `None` for an unknown key for
+    `Harness::from_key`'s reason. The app holds the choice as **two signals**, `ai_enabled` and the
+    `ai_harness` it already had — off still holds a harness (Claude, when it loaded off), so
+    everything that takes a `Harness` goes on taking one — and **`Agent::of(enabled, harness)` is
+    the one place they are composed**, by the dropdown and by the save alike, so the two cannot
+    disagree about what "off, with Codex held" means: it means off
+    (`an_off_assistant_is_disabled_whatever_harness_it_holds`).
     **Serde kept the key and the app then overwrote it, so the promise held for exactly one
     session.** The save site wrote `ai_harness.get().key()` — the *fallback's* key — so the name
     the user's file carried was replaced by the next thing that touched the settings, and a build
     that later grew that harness had nothing to restore. The rule is
     `persist::ai_harness_to_persist(unknown, running)`: `main.rs` holds the raw key in
     `ai_harness_unknown` and writes it back
-    until the user picks a harness themselves, at which point the harness-switch effect clears it
-    and the file starts naming what runs. **The same load also clears `ai_model` and
+    until the user picks, at which point it is cleared and the file starts naming what runs — by the
+    harness-switch effect when the pick changes the harness, and by a second effect on
+    `ai_enabled` when it only turns the assistant on or off. **That second effect is not
+    redundant**: an unknown key loads off *holding Claude*, so picking *Claude Code* changes
+    `ai_enabled` and not `ai_harness`, and with only the first effect the save went on writing the
+    unknown key back and the next launch started off again. Picking *Disabled* while already off
+    changes neither, so the key is still kept. **The same load also clears `ai_model` and
     `ai_cli_path`**, which were chosen for a CLI this build does not have: the switch effect clears
     those on a *switch* and a restore is not one, so an unknown harness paired with
     `opencode/claude-sonnet-5` started a Claude session with that model id and died on an unknown
@@ -18727,12 +18767,23 @@ existing prose was left alone.
     **Both buttons stay enabled while either runs**, and the guard against a click on either is
     `main.rs`'s, beside the launch — the labels only say so.
     **The AI modal is where the harness is chosen, and half its controls follow that choice.** The
-    *Agent CLI* dropdown is `focusable_dropdown(harness, Harness::ALL, Harness::label, …)` over the
-    workspace's **one** `Harness` — `schemaic-ui` depends on `schemaic-ai` for it, deliberately, and
+    *Agent CLI* dropdown is `focusable_dropdown(agent, Agent::ALL, Agent::label, …)` over the
+    workspace's **one** `Agent` — `schemaic-ui` depends on `schemaic-ai` for it, deliberately, and
     the Cargo.toml comment carries the reason: a UI-side mirror converted at the app boundary is two
-    definitions free to drift, which is precisely what `AiModel::from_cli` was. `Harness` is `Copy`
-    and `label` is a plain `fn(Harness) -> &'static str`, so it meets the widget's bounds with no
-    wrapper.
+    definitions free to drift, which is precisely what `AiModel::from_cli` was. `Agent` is `Copy`
+    and `label` is a plain `fn(Agent) -> &'static str`, so it meets the widget's bounds with no
+    wrapper. `agent` is a modal-local `RwSignal<Agent>` seeded from `Agent::of(enabled, harness)`
+    and written back on a pick: *Disabled* sets `AiUi::enabled` false and keeps the harness, so
+    turning the assistant back on by picking the same CLI costs nothing; a CLI sets the harness
+    **only if it differs** — the app's switch effect files the old harness's path and model on every
+    set it sees — and then sets `enabled`.
+    **Off builds nothing below the choice.** A muted hint under the dropdown says what off means, and
+    every control after it is made by a `build_rest` closure inside a `dyn_container` keyed on
+    `enabled`, whose off arm is `widgets::nothing()` — torn down rather than hidden, because a hidden
+    field stays in the ring (the `.hide()` entry under *Floem 0.2 gotchas*), and Tab would walk an off
+    modal through a CLI path, a model and the rest of a form nobody can see. Each control binds
+    straight to an `AiUi` signal, so the rebuild on turning it on loses nothing. The grade notice's
+    memo answers `None` while off: there is no CLI to grade, and the app does not probe one.
     **The grade notice under it is hidden, not merely empty, when there is nothing to say.**
     `Constraint::notice` is `None` on `Sealed`, and a `dyn_container` rendering `empty()` is still a
     flex child, so it collected the group's 6px gap on *both* sides — which meant Claude Code, the
@@ -21577,6 +21628,17 @@ existing prose was left alone.
     proposed a change that couldn't be read"*, and the AI settings' gutter toggle describes *"the
     assistant's replies"*, because that renderer and that setting are about replies rather than
     about any one vendor's.
+    **Off is said before anything else is.** With `AiUi::enabled` false the empty conversation reads
+    `AI_OFF_NOTE` (*"The AI assistant is off. Pick an Agent CLI in AI settings to turn it on."*)
+    rather than *"`<Harness>` not connected."*, and the message box is the pure
+    `input_state_of(enabled, reachable, db_down)` → `InputState::{Live, Off, DbDown, Unreachable}`,
+    in which **off wins over everything**: with the assistant switched off, a down database or a
+    missing CLI is not why the box is dead, and naming either sends the user to fix something that
+    is not the reason (`an_assistant_switched_off_says_so_whatever_else_is_wrong`; the other three
+    keep their old order). It is one memo over all three inputs, for the reason the pair memo it
+    replaced was one: two memos would be two keys. **The gear stays live** — it is the only way into
+    the settings, and so the only way back on — and the panel toggle and Ctrl+Shift+A stay too, so
+    the panel is there to say that it is off.
   - `overlays.rs` — absolutely-positioned popups: connection/active-db/schema menus, schema context
     menu, generic grid popup, the date picker's calendar (`date_pick_overlay`, whose panel is
     `cell_editors::calendar_panel` — up here because the field it drops from sits inside a scrolling
@@ -24670,7 +24732,14 @@ existing prose was left alone.
   is unreachable, because answering through a session built for the previous level is this control
   failing open. The grid
   asks `ai_data_of` (`GridState::conn_at_load` — the connection the rows were *loaded* under, not
-  the tab's live one) and checks it at each action as well as when building the menu.
+  the tab's live one) through `grid::ai_offered`, which is `GridState::ai_enabled` **and**
+  `ai_data_of(gs).may_attach()` — the one question every AI entry there asks, so none can check the
+  connection's consent and forget the switch, or the reverse — and checks it at each action as well
+  as when building the menu. `ai_data_of` itself is unchanged, so its source gate still pins it to
+  `conn_at_load`. The toolbar's sparkle is where the two halves part: a schema-only connection keeps
+  its explanatory disabled entry, a choice about *this* connection worth saying so, while an
+  assistant that is off has no sparkle built at all — off is the user saying no AI anywhere, and a
+  sparkle opening onto a refusal would keep asking.
   **A session may only start on a binary the probe established can be restricted, and that gate is
   the first thing `start_ai_session` does** — ahead of the MCP config being written and ahead of the
   oversize check. `ai::spawn_refusal` is the rule: a `Constraint` that is not runnable is refused
@@ -28015,6 +28084,30 @@ Re-introducing the anti-patterns these guard against is a regression:
   reason the denylist could not do it on its own is written down. The other five harnesses close it
   by their own mechanism rather than by that flag, on the session path through `harness::turn_args`
   and on the one-shot path through `harness::inline_argv`, and how far each gets is `Constraint`.
+- **An assistant that is off sends nothing and starts no agent process — refused at the action, not
+  only hidden.** Off (`AiUi::enabled` false: *Disabled* in the *Agent CLI* dropdown, a new install's
+  default, and what an unrecognised persisted key loads as) is checked by the four app actions every
+  AI path goes through. `ai_send` returns before anything else, and with it go regenerate, the grid's
+  AI summary, the plan modal's and the palette's Ask AI and the schema tree's AI explain;
+  `inline_ai_run` (Ctrl+K) answers `InlineAiState::Failed(AI_OFF_NOTE)`; `ai_fill` and `ai_seed`
+  answer `Failed` with the same note. The entry points are **absent, not greyed**, which was the
+  user's call — the editor's right-click Ask AI/Explain/Optimise/AI fix and their separator, the
+  error bar's and the error modal's Explain and AI fix, the schema tree's *AI explain*, the
+  palette's *Ask AI*, the plan modal's button, the grid's sparkle and every `grid::ai_offered`
+  entry; Ctrl+K is consumed and opens nothing, so it cannot fall through to an editor binding. But
+  **hiding is the courtesy, not the guard**, for the write guard's reason: a control the hiding
+  missed, or a menu built a moment before the switch, must still send nothing. **Switching off ends
+  what is running**, at the pick rather than when the modal closes: an effect on `ai_enabled` going
+  false drops the live session, which kills its CLI, aborts an in-flight inline task, whose child is
+  `kill_on_drop`, resets a Busy inline state, and settles a streaming turn with `mark_stopped`, since
+  the gear is live mid-turn. **"No process" includes the probe**: `warm_probe_cache`'s effect
+  returns early while off, because the probe is a spawn and it runs at every launch (`agent_cli.rs`).
+  **The Antigravity, OpenCode, Copilot and Cursor sweeps run regardless**, and that is not a leak in
+  the rule: they withdraw what an earlier session granted — an `agy` registration and its standing
+  tool rules, Schemaic's own per-instance homes, what Cursor kept in `~/.cursor` — and ask no model
+  anything, and an assistant switched off after a crash is exactly the case whose leftovers should
+  not stand. What this does **not** have is a test that reaches the guards: all four are closures in
+  `main.rs`, and the pinned halves are the pure ones, `Agent::of` and `ai_panel::input_state_of`.
 - **One SQL boundary lexer.** Any code scanning SQL for string / `-- ` / `#` / `/* */` / backtick /
   `$tag$` boundaries MUST build on `schemaic_core::sql::skip_noncode` (statement split, WHERE guard, AI
   read-only gate, `intel`'s tokenizer, `sql_highlight`, `sqlfmt`, and `users::redact_secrets`, where
@@ -31211,7 +31304,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   conditionally**: import's CSV and Excel settings, the designer's MySQL-only engine/collation and
   `ON UPDATE` and PostgreSQL-only index method/predicate, the view editor's MySQL options, PG
   recreate toggle and SQLite-only column list, the trigger form's `Fires`/`When` and SQLite-only
-  `Of columns`.
+  `Of columns`. The AI settings modal applies it to a setting rather than an engine: with the
+  assistant off, nothing below the *Agent CLI* choice is built (`settings.rs`).
   Nothing is lost by rebuilding — each of those binds
   straight to a draft or a persisted signal — and a control an engine can't express shouldn't be
   reachable at all, which is the same call `trigger_editor`'s per-engine form already made.

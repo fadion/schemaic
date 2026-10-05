@@ -310,6 +310,85 @@ impl Harness {
     }
 }
 
+/// The *Agent CLI* setting: the assistant switched off, or one harness driving
+/// it.
+///
+/// **Beside [`Harness`], not a variant of it.** A `Harness` is a CLI that can be
+/// spawned, and every `match` over it — the argv, the stream decoder, the
+/// constraint grade — answers a question only a CLI has. An off arm in each of
+/// those would be a dozen places to answer "nothing" and one place to forget
+/// to. So off lives here, and everything downstream of the choice keeps taking
+/// the `Harness` it already takes.
+///
+/// Persisted in `UiState::ai_harness` with the harness keys, as
+/// [`schemaic_core::persist::AI_DISABLED_KEY`]. A new install starts here; see
+/// that field for why an old settings file does not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Agent {
+    /// No agent: nothing is spawned, probed or sent, and the app offers no AI
+    /// action until one is picked.
+    Disabled,
+    /// This harness drives the assistant.
+    Cli(Harness),
+}
+
+impl Agent {
+    /// Every choice, in the order the settings dropdown offers them: off first,
+    /// then [`Harness::ALL`].
+    pub const ALL: [Agent; 7] = [
+        Agent::Disabled,
+        Agent::Cli(Harness::Claude),
+        Agent::Cli(Harness::Codex),
+        Agent::Cli(Harness::Antigravity),
+        Agent::Cli(Harness::OpenCode),
+        Agent::Cli(Harness::Copilot),
+        Agent::Cli(Harness::Cursor),
+    ];
+
+    /// The persisted key — [`Harness::key`], or the off key.
+    pub fn key(self) -> &'static str {
+        match self {
+            Agent::Disabled => schemaic_core::persist::AI_DISABLED_KEY,
+            Agent::Cli(h) => h.key(),
+        }
+    }
+
+    /// The dropdown's text.
+    pub fn label(self) -> &'static str {
+        match self {
+            Agent::Disabled => "Disabled",
+            Agent::Cli(h) => h.label(),
+        }
+    }
+
+    /// The choice an app holding **two** signals — whether the assistant is on,
+    /// and the harness it drives when it is — is showing or should persist.
+    /// The one place the two are composed, so the dropdown and the file cannot
+    /// disagree about what "off with Codex held" means: it means off.
+    pub fn of(enabled: bool, harness: Harness) -> Agent {
+        if enabled {
+            Agent::Cli(harness)
+        } else {
+            Agent::Disabled
+        }
+    }
+
+    /// The harness this choice drives, `None` when the assistant is off.
+    pub fn harness(self) -> Option<Harness> {
+        match self {
+            Agent::Disabled => None,
+            Agent::Cli(h) => Some(h),
+        }
+    }
+
+    /// Parse a persisted key. `None` for one this build does not know, for the
+    /// reason [`Harness::from_key`] gives: the caller decides, where it can say
+    /// so.
+    pub fn from_key(s: &str) -> Option<Agent> {
+        Agent::ALL.into_iter().find(|a| a.key() == s)
+    }
+}
+
 /// How well a harness's built-in tools are shut off for this session.
 ///
 /// Ordered worst-to-best deliberately: a caller comparing grades gets the
@@ -2364,6 +2443,64 @@ fn parse_settings(current: &str) -> Option<serde_json::Map<String, serde_json::V
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Off is the dropdown's first entry, then the harnesses in their order.
+    #[test]
+    fn the_agent_list_is_off_and_then_every_harness() {
+        assert_eq!(Agent::ALL[0], Agent::Disabled);
+        let rest: Vec<Agent> = Agent::ALL[1..].to_vec();
+        let harnesses: Vec<Agent> = Harness::ALL.into_iter().map(Agent::Cli).collect();
+        assert_eq!(rest, harnesses);
+        assert_eq!(Agent::Disabled.label(), "Disabled");
+        assert_eq!(Agent::Cli(Harness::Codex).label(), "Codex");
+    }
+
+    /// The off key is persisted beside the harness keys in the same field, so
+    /// it must be none of them — or a settings file saying "off" would run a CLI.
+    #[test]
+    fn the_disabled_key_is_no_harness_key() {
+        for h in Harness::ALL {
+            assert_ne!(h.key(), schemaic_core::persist::AI_DISABLED_KEY);
+        }
+        assert_eq!(
+            Agent::Disabled.key(),
+            schemaic_core::persist::AI_DISABLED_KEY
+        );
+        assert_eq!(Agent::Disabled.harness(), None);
+    }
+
+    /// Off wins whatever harness is held; on names the one held.
+    #[test]
+    fn an_off_assistant_is_disabled_whatever_harness_it_holds() {
+        for h in Harness::ALL {
+            assert_eq!(Agent::of(false, h), Agent::Disabled);
+            assert_eq!(Agent::of(true, h), Agent::Cli(h));
+            assert_eq!(
+                Agent::of(false, h).key(),
+                schemaic_core::persist::AI_DISABLED_KEY
+            );
+        }
+    }
+
+    #[test]
+    fn every_agent_round_trips_through_its_key() {
+        for a in Agent::ALL {
+            assert_eq!(Agent::from_key(a.key()), Some(a), "{a:?}");
+        }
+        assert_eq!(
+            Agent::from_key("claude").and_then(Agent::harness),
+            Some(Harness::Claude)
+        );
+    }
+
+    /// An unknown key is still the caller's to answer, as `Harness::from_key`'s
+    /// is — not quietly read as off, and not as a CLI.
+    #[test]
+    fn an_unknown_agent_key_is_none() {
+        assert_eq!(Agent::from_key("gemini"), None);
+        assert_eq!(Agent::from_key(""), None);
+        assert_eq!(Agent::from_key("Disabled"), None);
+    }
 
     fn spec() -> TurnSpec {
         TurnSpec {

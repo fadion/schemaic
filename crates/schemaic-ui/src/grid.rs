@@ -402,6 +402,8 @@ struct GridState {
     /// Held as the signal rather than resolved once at build, so locking a
     /// connection down takes effect on the grid already on screen.
     connections: RwSignal<Vec<Connection>>,
+    /// The assistant is on (`AiUi::enabled`) — the other half of [`ai_offered`].
+    ai_enabled: RwSignal<bool>,
     /// This tab's SQL dialect (from its connection's engine) — used to build
     /// engine-correct SQL for grid actions like Follow-FK.
     dialect: SqlDialect,
@@ -746,6 +748,7 @@ impl GridState {
             formats: RwSignal::new(formats),
             conn_id: gctx.conn_id,
             connections: gctx.connections,
+            ai_enabled: gctx.ai_enabled,
             dialect,
             kept: gctx.panel_frozen,
             panel_sql: gctx.panel_sql,
@@ -2576,6 +2579,20 @@ fn ai_data_of(gs: GridState) -> AiData {
         .unwrap_or_default()
 }
 
+/// May this grid offer an AI action on its rows — the assistant is **on**, and
+/// **this result's** connection lets rows reach it ([`ai_data_of`])?
+///
+/// The one question every AI entry here asks, so none can check the
+/// connection's consent and forget the switch (or the reverse). Separate from
+/// `ai_data_of` rather than folded into it: that function answers what the
+/// *connection* allows, and a source gate pins it to `conn_at_load`. The toolbar's
+/// sparkle is the one place the two halves part: a connection that says no
+/// still shows its explanatory entry, while an assistant that is off shows no
+/// sparkle at all.
+fn ai_offered(gs: GridState) -> bool {
+    gs.ai_enabled.get_untracked() && ai_data_of(gs).may_attach()
+}
+
 /// What the *current selection* would send, as the phrase the attach entry reads
 /// — `core::model::attach_scope_label` over the selected rectangle, with the row
 /// count capped at what an attachment actually carries.
@@ -2630,7 +2647,7 @@ fn attach_to_chat(gs: GridState, whole: bool) {
     // Checked here as well as on the menu entries. The entries are the UI; this
     // is the rule — a keyboard path, a future caller or a menu built a moment
     // before the connection was locked down all arrive here.
-    if !ai_data_of(gs).may_attach() {
+    if !ai_offered(gs) {
         return;
     }
     let rs = gs.rs.get_untracked();
@@ -3584,6 +3601,8 @@ pub(crate) struct GridCtx {
     /// the table's top edge (the "prominent colour" setting).
     pub(crate) connections: RwSignal<Vec<Connection>>,
     pub(crate) active_conn: RwSignal<u64>,
+    /// [`crate::AiUi::enabled`]: off, the grid offers no AI action at all.
+    pub(crate) ai_enabled: RwSignal<bool>,
     /// Ui-level popup-menu signal (header/cell right-click menus).
     pub(crate) popup: RwSignal<Option<Vec<MenuEntry>>>,
     /// Popup anchor signal (icon-anchored toolbar dropdowns vs cursor menus).
@@ -6051,7 +6070,7 @@ fn ai_fill_value(gs: GridState) {
     // app callback that would otherwise fetch it. This entry used to justify
     // itself with "and a sample of the column", which understated the payload:
     // the app fetched twenty whole rows of every column.
-    if gs.ai_busy.get_untracked() || !ai_data_of(gs).may_attach() {
+    if gs.ai_busy.get_untracked() || !ai_offered(gs) {
         return;
     }
     let Some((disp, ci)) = gs.active.get_untracked() else {
@@ -6188,7 +6207,7 @@ fn ai_insert_row(gs: GridState) {
 fn ai_seed_rows(gs: GridState, count: usize) {
     // Seeding samples the table to imitate it, so it sends rows like the rest —
     // one gate, checked at the action rather than only at the menu.
-    if gs.ai_busy.get_untracked() || count == 0 || !ai_data_of(gs).may_attach() {
+    if gs.ai_busy.get_untracked() || count == 0 || !ai_offered(gs) {
         return;
     }
     let model = gs.edit_model.get_untracked();
@@ -6310,7 +6329,7 @@ fn open_seed_popover(gs: GridState) {
     // and then silently does nothing (because `ai_seed_rows` refuses) is worse
     // than one that never opens. Reachable if the level is tightened while the
     // menu is up.
-    if gs.ai_busy.get_untracked() || !ai_data_of(gs).may_attach() {
+    if gs.ai_busy.get_untracked() || !ai_offered(gs) {
         return;
     }
     gs.seed_buf.set("10".to_string());
@@ -8975,8 +8994,12 @@ fn grid_toolbar(
     // *menu items* carry the purple sparkle, matching "AI summary" / "Ask AI". The
     // menu anchors below the icon via the shared `ui.popup_menu` channel. Actions
     // are stubbed pending the one-shot AI pipeline.
+    // **No sparkle at all while the assistant is off**, which is not the
+    // schema-only connection's answer below: that one is a choice about *this*
+    // connection, worth an entry that says so; off is the user saying no AI
+    // anywhere, and a sparkle opening onto a refusal would keep asking.
     let ai_menu = dyn_container(
-        move || gs.edit_model.get().insert_target().is_some(),
+        move || gs.ai_enabled.get() && gs.edit_model.get().insert_target().is_some(),
         move |show| {
             if !show {
                 return empty().into_any();
@@ -9603,7 +9626,7 @@ fn gutter_menu(gs: GridState, pos: usize, pending: Option<usize>) -> Vec<MenuEnt
             delete
         });
     }
-    if ai_data_of(gs).may_attach() {
+    if ai_offered(gs) {
         entries.push(MenuEntry::Separator);
         entries.push(MenuEntry::action_icon(
             format!("Attach {} to chat", selection_scope_label(gs)),
@@ -10007,7 +10030,7 @@ fn header_cell(
             // The column summary's prompt carries a sample of the values, so it
             // is a data path like the cell one and is absent on a schema-only
             // connection. (Copy is not: the clipboard is the user's own machine.)
-            if ai_data_of(gs).may_attach() {
+            if ai_offered(gs) {
                 entries.push(MenuEntry::Separator);
                 entries.push(MenuEntry::action_icon(
                     "AI summary",
@@ -10018,7 +10041,7 @@ fn header_cell(
                         // menu can outlive the level that permitted it — the
                         // connection's data access is changed from a settings
                         // panel that does not close an open menu.
-                        if !ai_data_of(gs).may_attach() {
+                        if !ai_offered(gs) {
                             return;
                         }
                         if let Some(s) = &sum {
@@ -10973,8 +10996,9 @@ fn data_cell(
             // cell, its row and a sample of its column — so both are absent
             // entirely on a connection set to schema-only. Absent rather than
             // disabled: a greyed "AI summary" invites a hunt for the reason,
-            // while the connection form is where the answer lives.
-            if ai_data_of(gs).may_attach() {
+            // while the connection form is where the answer lives. Absent too
+            // while the assistant is off (`ai_offered`).
+            if ai_offered(gs) {
                 // Set off from the row actions above it — asking about a value is a
                 // different kind of act from editing or deleting one.
                 entries.push(MenuEntry::Separator);
@@ -10987,7 +11011,7 @@ fn data_cell(
                         // menu can outlive the level that permitted it — the
                         // connection's data access is changed from a settings
                         // panel that does not close an open menu.
-                        if !ai_data_of(gs).may_attach() {
+                        if !ai_offered(gs) {
                             return;
                         }
                         if let Some(s) = &sum {

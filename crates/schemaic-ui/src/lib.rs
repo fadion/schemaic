@@ -3860,6 +3860,13 @@ pub enum InlineAiState {
     Failed(String),
 }
 
+/// What every AI surface says while the assistant is off (`AiUi::enabled`) —
+/// the panel's empty state, and the refusal an AI action gives if it is
+/// reached anyway. One string, so the panel and a refusal name the same way
+/// back.
+pub const AI_OFF_NOTE: &str =
+    "The AI assistant is off. Pick an Agent CLI in AI settings to turn it on.";
+
 /// One inline-AI request from the editor's Ctrl+K prompt.
 pub struct InlineAiRequest {
     /// The user's natural-language intent.
@@ -3940,6 +3947,17 @@ pub struct AiUi {
     /// (`ai::needs_respawn`), so it is a settings-modal control rather than
     /// something the panel switches mid-conversation.
     pub harness: RwSignal<Harness>,
+    /// **Whether the assistant is on at all** — `false` is the *Agent CLI*
+    /// dropdown's *Disabled*, and what a new install starts with. While it is
+    /// off no AI action is offered anywhere: the menu entries, buttons and the
+    /// Ctrl+K bar are absent rather than greyed, and the panel says so
+    /// ([`AI_OFF_NOTE`]) with its gear still the way back in. [`Self::harness`]
+    /// is still held, and is what turning it on lands on until the user picks.
+    ///
+    /// Hiding is the courtesy, not the guard: the app's send, inline, fill and
+    /// seed actions each refuse while this is off, so a control the hiding
+    /// missed still sends nothing.
+    pub enabled: RwSignal<bool>,
     /// Override path to the selected harness's CLI (empty = auto-detect, via
     /// [`AiActions::detect_path`]).
     ///
@@ -8974,6 +8992,7 @@ fn center(ui: Ui) -> impl IntoView {
                     inline_ai,
                     inline_ai_run: inline_ai_run.clone(),
                     inline_ai_cancel: inline_ai_cancel.clone(),
+                    ai_enabled: ui.ai.enabled,
                     error_modal_open,
                     schema_visible,
                     right_panel,
@@ -9038,6 +9057,7 @@ fn center(ui: Ui) -> impl IntoView {
                     stats_gen,
                     connections,
                     active_conn,
+                    ai_enabled: ui.ai.enabled,
                     popup,
                     popup_anchor,
                     popup_width,

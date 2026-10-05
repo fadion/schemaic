@@ -239,6 +239,7 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
             ui.layout,
             ui.tab_actions.clone(),
             ui.ai_actions.clone(),
+            ui.ai.enabled,
         ),
         // Monitor + ER-diagram modals share one tuple element (the workspace stack
         // is at Floem's 16-arity `ViewTuple` limit). The wrapper must fill the
