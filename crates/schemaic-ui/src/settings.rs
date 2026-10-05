@@ -1855,8 +1855,9 @@ pub(crate) fn theme_settings_overlay(
             let predictions_row = focusable_toggle_row(
                 "Inline predictions",
                 "Show the likely next words after the caret — the partner of a keyword, a \
-                 join's foreign key, the columns to group by or insert. Tab takes them whole, \
-                 Ctrl+→ (⌘→ on macOS) a word at a time, and Escape turns them down.",
+                 join's foreign key, the columns to group by or insert. Tab, or → at the end of \
+                 a line, takes them whole, Ctrl+→ (⌘→ on macOS) a word at a time, and Escape \
+                 turns them down.",
                 editor_predictions,
                 ring.clone(),
                 110,

@@ -23476,7 +23476,11 @@ existing prose was left alone.
     on `ghost_takes_word`'s terms — Tab's, but with `primary_held` rather than without it, so
     Shift+primary+→ still selects by word and a plain → still moves
     (`primary_right_at_the_predictions_caret_takes_a_word`,
-    `a_word_is_taken_only_by_primary_right_at_a_live_prediction`). The word is
+    `a_word_is_taken_only_by_primary_right_at_a_live_prediction`) — **except at the end of its
+    line**, where a bare → has nowhere to move the caret and takes the whole ghost, as the shells'
+    autosuggestions do (`ghost_takes_right`,
+    `a_bare_right_at_the_line_end_takes_the_whole_prediction`); mid-line it moves, and the ghost
+    left behind goes. The word is
     `intel::prediction_word_end`'s in the editor's dialect (so a quoted name goes whole, under
     `intel.rs`), inserted through `edit_untyped` as Tab's is; the rest goes back
     as a `kept` ghost at the new caret, stamped with the document's length after the insert, and is

@@ -97,7 +97,10 @@ pub(crate) const SHORTCUTS: &[ShortcutGroup] = &[
             ("Ctrl+Alt+L", "Format code"),
             ("Alt+↑ / Alt+↓", "Move line up / down"),
             ("Tab / Shift+Tab", "Indent / outdent"),
-            ("Tab / Ctrl+→", "Take the inline prediction / its next word"),
+            (
+                "Tab / Ctrl+→",
+                "Take the inline prediction (→ too, at a line's end) / its next word",
+            ),
         ],
     ),
     (

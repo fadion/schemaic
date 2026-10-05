@@ -138,6 +138,20 @@ fn ghost_takes_tab(
     ghost_at.is_some() && ghost_at == caret && !list_open && !shift && !primary
 }
 
+/// Does this bare → take the whole inline prediction? Where the caret has
+/// nowhere to move — the end of its line — as the shells' autosuggestions
+/// take one; anywhere else → moves the caret as it always did (and the ghost,
+/// left behind, goes). The other conditions are [`ghost_takes_tab`]'s.
+fn ghost_takes_right(
+    ghost_at: Option<usize>,
+    caret: Option<usize>,
+    list_open: bool,
+    mods: Modifiers,
+    at_line_end: bool,
+) -> bool {
+    ghost_at.is_some() && ghost_at == caret && !list_open && mods.is_empty() && at_line_end
+}
+
 /// Does this ↑/↓ move the completion list's selection? Only bare: with Shift
 /// it selects lines, with Alt it moves one, with Ctrl it scrolls — and the list
 /// took all three, so Shift+↓ walked the rows instead of extending the
@@ -2714,18 +2728,30 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 let ghost = comp.ghost.with_untracked(|g| {
                     inline_diff::shown_ghost(g.as_ref(), preview_up.get_untracked()).cloned()
                 });
-                if !ghost_takes_word(
-                    ghost.as_ref().map(|g| g.offset),
-                    crate::completion::lone_caret(&e.cursor.get_untracked()),
-                    comp.open.get_untracked(),
-                    mods.shift(),
-                    primary_held(mods),
-                ) {
+                let ghost_at = ghost.as_ref().map(|g| g.offset);
+                let lone = crate::completion::lone_caret(&e.cursor.get_untracked());
+                let list_open = comp.open.get_untracked();
+                let by_word =
+                    ghost_takes_word(ghost_at, lone, list_open, mods.shift(), primary_held(mods));
+                // A bare → at the end of the line takes all of it, as the
+                // shells' autosuggestions do: there is nowhere for the caret to go.
+                let at_line_end = {
+                    let rope = e.doc().text();
+                    let next = rope.offset_of_line(rope.line_of_offset(caret) + 1);
+                    rope.slice_to_cow(caret..next.max(caret))
+                        .trim_end_matches(['\r', '\n'])
+                        .is_empty()
+                };
+                let whole = ghost_takes_right(ghost_at, lone, list_open, mods, at_line_end);
+                if !by_word && !whole {
                     return false;
                 }
                 let Some(g) = ghost else { return false };
-                let end =
-                    schemaic_core::intel::prediction_word_end(&g.text, dialect.get_untracked());
+                let end = if whole {
+                    g.text.len()
+                } else {
+                    schemaic_core::intel::prediction_word_end(&g.text, dialect.get_untracked())
+                };
                 let (word, rest) = g.text.split_at(end);
                 inline_diff::set_ghost(comp.ghost, e, None);
                 if edit_untyped(e, comp, Selection::caret(caret), word, EditType::Completion) {
@@ -6465,8 +6491,28 @@ mod cmdk_preview_gate {
 
 #[cfg(test)]
 mod ghost_key_tests {
-    use super::{ghost_takes_tab, ghost_takes_word, list_takes_arrow};
+    use super::{ghost_takes_right, ghost_takes_tab, ghost_takes_word, list_takes_arrow};
     use floem::keyboard::Modifiers;
+
+    /// A bare → at the end of the line takes the whole prediction; mid-line,
+    /// modified, with the list open or off the ghost's caret it moves the caret.
+    #[test]
+    fn a_bare_right_at_the_line_end_takes_the_whole_prediction() {
+        let none = Modifiers::empty();
+        assert!(ghost_takes_right(Some(12), Some(12), false, none, true));
+        assert!(!ghost_takes_right(Some(12), Some(12), false, none, false));
+        assert!(!ghost_takes_right(
+            Some(12),
+            Some(12),
+            false,
+            Modifiers::SHIFT,
+            true
+        ));
+        assert!(!ghost_takes_right(Some(12), Some(12), true, none, true));
+        assert!(!ghost_takes_right(Some(12), Some(13), false, none, true));
+        assert!(!ghost_takes_right(None, Some(12), false, none, true));
+        assert!(!ghost_takes_right(Some(12), None, false, none, true));
+    }
 
     /// Only a bare ↑/↓ walks the completion list; with any modifier the key
     /// does its own work.
