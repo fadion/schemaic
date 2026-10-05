@@ -17778,7 +17778,10 @@ existing prose was left alone.
     Claude-only inline rule existed to prevent, arriving by a different door the moment all four
     harnesses could run a one-shot. The stderr → stdout → status order is unchanged, and it is that
     order because the CLI writes some fatal errors (an expired OAuth session among them) to stdout
-    with an empty stderr, so surfacing stderr alone yields a blank.
+    with an empty stderr, so surfacing stderr alone yields a blank. On Claude Code 2.1.289 a
+    `stream-json` session's expired login does not reach this order at all: it arrives as JSON in a
+    turn that ends cleanly, and is read out of that turn's `result` (`claude_error_text`, under
+    `stream.rs`).
     With the Gemini adapter deleted, `claude`, `codex`, `agy` and `opencode` were the four, and every
     argv here is for a binary somebody has run — and with the Antigravity resume measured above,
     nothing on any of those four is now carried on its help page alone. `copilot` is the fifth, and
@@ -17802,8 +17805,9 @@ existing prose was left alone.
     **Decoding needs state, which is why it is a `StreamParser` and not a function — and there are
     two pieces of it.** The first is prose.
     Claude and Antigravity stream *deltas* — each line carries only the text new since the last one,
-    so a stateless `line -> events` map is exact, and `parse_stream_line` is kept and delegated to
-    rather than generalised. Antigravity's half of that is measured rather than assumed: a captured
+    so a stateless `line -> events` map is exact, and `parse_stream_value` is kept and delegated to
+    rather than generalised — Claude's arm, `push_claude`, adds only the failed turn's reason
+    beside it (see `claude_error_text` below). Antigravity's half of that is measured rather than assumed: a captured
     answer split **mid-word** across two `text_delta`s (`"orders\nwidge"`, then `"ts\n"`), which is
     what a partial chunk looks like and a cumulative restatement never does
     (`real_antigravity_deltas_are_partial_chunks_and_append`). Codex *documents* re-sending a
@@ -17928,9 +17932,9 @@ existing prose was left alone.
     (`a_builtin_reader_is_shown_and_the_catalogue_lookup_is_not`).
     **All of that state is cleared at a turn boundary, and it only began mattering when a stream
     could hold more than one Antigravity turn.** `StreamParser::push` looks at the events it has just
-    produced and, if any of them is a `TurnDone`, resets `seen_tools`, the `Coalescer` and the
-    `OpenCodeTurn`. The ids `seen_tools` holds are whatever the dialect gives a call, and they are
-    unique only *within* a turn — Antigravity numbers its steps from zero on each one. That was
+    produced and, if any of them is a `TurnDone`, resets `seen_tools`, the `Coalescer`, the
+    `OpenCodeTurn` and `claude_spoke`. The ids `seen_tools` holds are whatever the dialect gives a call,
+    and they are unique only *within* a turn — Antigravity numbers its steps from zero on each one. That was
     invisible while every multi-turn stream was Claude's, whose ids are unique for the life of the
     process: on a persistent Antigravity the second turn's first tool call carries `step_index` 0
     again, the set already holds it, and the chip announcing it is dropped — a tool call running with
@@ -18149,6 +18153,32 @@ existing prose was left alone.
     the prompt or a count within it is unknown (`a_cursor_turn_counts_its_cached_input`). A provider
     refusal is Copilot's case again: stderr only, with no `result`, so it reaches the panel through
     the same not-`ended` arm.
+    **A Claude turn that fails before the model is called says why only in its `result`, and that
+    is read now.** Reproduced with an expired login on Claude Code 2.1.289: the CLI writes a
+    synthetic whole `assistant` message (`"model":"<synthetic>"`, `"error":"authentication_failed"`)
+    holding *"Failed to authenticate: OAuth session expired and could not be refreshed"*, then a
+    `result` with `"is_error":true` repeating it in `result` — and streams no `stream_event` delta
+    at all. `parse_stream_value` takes Claude's prose from the deltas only and reads the whole
+    message for its tool calls, so the reason was in neither place it looked, and the panel drew an
+    **empty** reply under `40ms · ↑0 ↓0`, reported as "Claude doesn't respond". The app's fallbacks
+    could not catch it either: both lines are JSON, so `LineKind::Plain` keeps nothing, and the turn
+    ended cleanly through `TurnDone`, so the stdout-closed arm, which hands stderr and that prose to
+    `cli_failure_message`, was never reached. `push_claude` now asks `claude_error_text` — a `result`
+    whose `is_error` is true, its `result` trimmed and non-empty — and inserts that as a `TextDelta`
+    **ahead of** the `TurnDone`, so it lands in the turn it explains and is painted in the error
+    colour. **It keys on `is_error`, not `subtype`**: the captured failure says
+    `"subtype":"success"`. The `result` is read rather than the synthetic message because it is the
+    one every failure has. A *successful* `result` is never echoed, because its `result` repeats the
+    answer already streamed (`a_successful_result_does_not_repeat_the_streamed_answer`).
+    `claude_spoke` records that the turn has already streamed text, so a reason arriving after a
+    partial answer is set apart by a blank line rather than run on into its last word
+    (`an_error_after_streamed_text_is_set_apart_from_it`); it is per turn and cleared with the rest
+    at the boundary, or a clean first turn would make the second turn's error look like a
+    continuation (`the_second_turns_error_is_not_set_apart_from_the_first_turns_answer`).
+    `AUTH_FAIL` is the capture, cut to the fields the parser reads, and
+    `an_error_result_that_streamed_nothing_says_why` drives it; an error `result` that names nothing
+    adds nothing (`an_error_result_without_text_adds_none`). Checked live in a sandboxed app, where
+    the panel now shows the authentication message.
     **`push` strips a leading U+FEFF before anything else, because `trim` does not.** A byte-order
     mark is not `White_Space`, so a BOM on the first line — what a Windows console redirect or a shim
     that re-encodes a pipe prepends — made `from_str` fail and the line was filed as prose. On the

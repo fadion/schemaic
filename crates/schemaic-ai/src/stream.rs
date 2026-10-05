@@ -197,14 +197,42 @@ pub struct StreamParser {
     /// What the last line was, so the caller need not parse it again to find
     /// out. See [`StreamParser::last_line`].
     last_line: LineKind,
+    /// Claude only: this turn has streamed text, so an error result's reason
+    /// is set apart from it rather than run on into it. See
+    /// [`claude_error_text`].
+    claude_spoke: bool,
+}
+
+/// The reason a Claude `result` gives for a turn that **failed**, when it gives
+/// one — `None` for a success, whose `result` repeats the answer already
+/// streamed, and for an error that names nothing.
+///
+/// **The only place some failures are said at all.** The CLI writes an error
+/// it hits before calling the model as a synthetic whole `assistant` message
+/// and an error `result`, and streams no delta — measured for an expired login
+/// on Claude Code 2.1.289, and keyed on `is_error` rather than `subtype`, which
+/// that capture reports as `"success"`. `parse_stream_value` takes prose from
+/// the deltas only and the whole message for its tool calls, so the reason was
+/// in neither place it read: the panel drew an empty reply under `40ms · ↑0
+/// ↓0`, which is how an expired Claude Code login was reported. The `result`
+/// is taken rather than the message because it is the one every failure has.
+fn claude_error_text(v: &serde_json::Value) -> Option<&str> {
+    let failed = v.get("type").and_then(|t| t.as_str()) == Some("result")
+        && v.get("is_error").and_then(|e| e.as_bool()) == Some(true);
+    failed
+        .then(|| v.get("result").and_then(|r| r.as_str()))
+        .flatten()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
 }
 
 /// What one line of a CLI's stdout turned out to be.
 ///
 /// The distinction that matters is [`LineKind::Plain`]: a non-blank line that is
-/// not JSON is a diagnostic the CLI printed as prose — an expired OAuth session,
-/// a missing model — and it is the only explanation the user will get, so it is
-/// kept and shown when the turn ends badly.
+/// not JSON is a diagnostic the CLI printed as prose — a missing model, say —
+/// and it is the only explanation the user will get, so it is kept and shown
+/// when the turn ends badly. (An expired login was once one of these; Claude
+/// Code 2.1.289 writes it as JSON instead, and [`claude_error_text`] reads it.)
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum LineKind {
     /// Nothing was pushed yet, or the line was blank.
@@ -418,6 +446,7 @@ impl StreamParser {
             seen_tools: std::collections::HashSet::new(),
             oc: OpenCodeTurn::default(),
             last_line: LineKind::Blank,
+            claude_spoke: false,
         }
     }
 
@@ -542,7 +571,7 @@ impl StreamParser {
         };
         self.last_line = LineKind::Json;
         let out = match self.harness {
-            Harness::Claude => crate::parse_stream_value(&v),
+            Harness::Claude => self.push_claude(&v),
             Harness::Codex => self.push_codex(&v),
             Harness::Antigravity => self.push_antigravity(&v),
             Harness::OpenCode => self.push_opencode(&v),
@@ -566,6 +595,30 @@ impl StreamParser {
             self.seen_tools.clear();
             self.text = Coalescer::default();
             self.oc = OpenCodeTurn::default();
+            self.claude_spoke = false;
+        }
+        out
+    }
+
+    /// Claude's `stream-json`: [`crate::parse_stream_value`], plus the reason a
+    /// failed turn gives ([`claude_error_text`]), placed ahead of the
+    /// `TurnDone` so it lands in the turn it explains.
+    fn push_claude(&mut self, v: &serde_json::Value) -> Vec<StreamEvent> {
+        let mut out = crate::parse_stream_value(v);
+        if out.iter().any(|e| matches!(e, StreamEvent::TextDelta(_))) {
+            self.claude_spoke = true;
+        }
+        if let Some(why) = claude_error_text(v) {
+            let text = if self.claude_spoke {
+                format!("\n\n{why}")
+            } else {
+                why.to_string()
+            };
+            let at = out
+                .iter()
+                .position(|e| matches!(e, StreamEvent::TurnDone { .. }))
+                .unwrap_or(out.len());
+            out.insert(at, StreamEvent::TextDelta(text));
         }
         out
     }
@@ -2906,6 +2959,108 @@ mod tests {
             ],
         );
         assert_eq!(text_of(&out), "hello");
+    }
+}
+
+#[cfg(test)]
+mod claude_error_tests {
+    use super::*;
+
+    fn drive(lines: &[&str]) -> Vec<StreamEvent> {
+        let mut p = StreamParser::new(Harness::Claude);
+        lines.iter().flat_map(|l| p.push(l)).collect()
+    }
+
+    fn text_of(evs: &[StreamEvent]) -> String {
+        evs.iter()
+            .filter_map(|e| match e {
+                StreamEvent::TextDelta(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Captured from Claude Code 2.1.289 with an expired login, cut to the
+    /// fields the parser reads. The CLI never calls the model: it writes a
+    /// synthetic `assistant` message holding the reason, then an error
+    /// `result` repeating it — and streams no text at all.
+    const AUTH_FAIL: [&str; 2] = [
+        r#"{"type":"assistant","message":{"model":"<synthetic>","role":"assistant","stop_reason":"stop_sequence","type":"message","usage":{"input_tokens":0,"output_tokens":0},"content":[{"type":"text","text":"Failed to authenticate: OAuth session expired and could not be refreshed"}]},"error":"authentication_failed","is_api_error_message":false}"#,
+        r#"{"duration_api_ms":0,"stop_reason":"stop_sequence","usage":{"input_tokens":0,"output_tokens":0},"is_error":true,"num_turns":1,"subtype":"success","result":"Failed to authenticate: OAuth session expired and could not be refreshed","type":"result","duration_ms":63}"#,
+    ];
+
+    /// **The reported bug**: the panel showed an empty reply under `40ms · ↑0
+    /// ↓0`, because the reason was in neither place the parser read — not a
+    /// streamed delta, and not a tool call in the whole message.
+    #[test]
+    fn an_error_result_that_streamed_nothing_says_why() {
+        let evs = drive(&AUTH_FAIL);
+        assert_eq!(
+            text_of(&evs),
+            "Failed to authenticate: OAuth session expired and could not be refreshed"
+        );
+        assert!(
+            matches!(
+                evs.last(),
+                Some(StreamEvent::TurnDone { is_error: true, .. })
+            ),
+            "{evs:?}"
+        );
+    }
+
+    /// A successful `result` repeats the whole answer in its `result` field;
+    /// echoing it would print every reply twice.
+    #[test]
+    fn a_successful_result_does_not_repeat_the_streamed_answer() {
+        let evs = drive(&[
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello there"}}}"#,
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"Hello there","duration_ms":2984,"usage":{"input_tokens":2,"output_tokens":10}}"#,
+        ]);
+        assert_eq!(text_of(&evs), "Hello there");
+    }
+
+    /// An error after a partial answer is set apart from it rather than run
+    /// on into its last word.
+    #[test]
+    fn an_error_after_streamed_text_is_set_apart_from_it() {
+        let evs = drive(&[
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Partial"}}}"#,
+            r#"{"type":"result","subtype":"error_during_execution","is_error":true,"result":"API Error: overloaded","duration_ms":900}"#,
+        ]);
+        assert_eq!(text_of(&evs), "Partial\n\nAPI Error: overloaded");
+    }
+
+    /// The flag is per turn: a clean first turn does not make the second
+    /// turn's error look like a continuation of it.
+    #[test]
+    fn the_second_turns_error_is_not_set_apart_from_the_first_turns_answer() {
+        let mut p = StreamParser::new(Harness::Claude);
+        for l in [
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"First"}}}"#,
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"First","duration_ms":10}"#,
+        ] {
+            p.push(l);
+        }
+        let evs: Vec<StreamEvent> = AUTH_FAIL.iter().flat_map(|l| p.push(l)).collect();
+        assert_eq!(
+            text_of(&evs),
+            "Failed to authenticate: OAuth session expired and could not be refreshed"
+        );
+    }
+
+    /// An error result with nothing to say adds nothing. That turn still
+    /// renders empty: the app's stderr and plain-stdout fallbacks run only when
+    /// stdout closes, and a `result` ends the turn before that.
+    #[test]
+    fn an_error_result_without_text_adds_none() {
+        let evs = drive(&[
+            r#"{"type":"result","subtype":"error_during_execution","is_error":true,"duration_ms":0}"#,
+        ]);
+        assert_eq!(text_of(&evs), "");
+        let evs = drive(&[
+            r#"{"type":"result","subtype":"error_during_execution","is_error":true,"result":"  ","duration_ms":0}"#,
+        ]);
+        assert_eq!(text_of(&evs), "");
     }
 }
 
