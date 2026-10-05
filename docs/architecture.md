@@ -22778,6 +22778,10 @@ existing prose was left alone.
     abbrev and inserts the **body**, through the same `Suggestion::insert` override an FK-JOIN row
     uses — as does a builtin the engine calls bare (`CURRENT_TIMESTAMP`, under `rank.rs`), which
     is why `accept_completion` appends `()` to a function row only when it carries no `insert`.
+    **An accept replaces the whole word the caret is in**, from `word_start` to `word_end` — the
+    part after the caret too, and the `(` test reads past it — so accepting `customer_id` at
+    `cust|_id` no longer writes `customer_id_id`
+    (`an_accept_replaces_the_whole_word_the_caret_is_in`).
     **No list opens inside a string literal or a comment, not even on Ctrl+Space**:
     `recompute_completions` asks `intel::caret_in_literal_or_comment` of the caret's statement
     before it reads the clause, ahead of the FK join row and the ranked list alike, and closes the

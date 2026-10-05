@@ -129,6 +129,18 @@ fn word_start(text: &str, offset: usize) -> usize {
     start
 }
 
+/// Byte offset where the identifier the caret is in ends — [`word_start`]'s
+/// mirror. An accept replaces the word from its start to here, not to the
+/// caret: accepting `customer_id` at `cust|_id` wrote `customer_id_id`.
+fn word_end(text: &str, offset: usize) -> usize {
+    let bytes = text.as_bytes();
+    let mut end = offset.min(text.len());
+    while end < bytes.len() && is_word_byte(bytes[end]) {
+        end += 1;
+    }
+    end
+}
+
 thread_local! {
     /// One memoised catalog per UI thread — see [`intel::CatalogCache`]. A single
     /// keystroke reaches `build_catalog` up to four times (column completion, JOIN
@@ -1141,6 +1153,7 @@ pub(crate) fn accept_completion(ed: &Editor, comp: Completion) {
     let doc = ed.doc();
     let text = doc.text().to_string();
     let start = word_start(&text, offset);
+    let end = word_end(&text, offset);
     let idx = comp.sel.get_untracked();
     if let Some((word, kind, over, replace)) = comp.items.with_untracked(|v| {
         v.get(idx)
@@ -1158,12 +1171,13 @@ pub(crate) fn accept_completion(ed: &Editor, comp: Completion) {
             completion_insertion(
                 &word,
                 kind == SuggestKind::Function,
-                call_parens_follow(&text[offset..]),
+                call_parens_follow(&text[end..]),
             )
         };
-        // Most completions replace the word being typed; a `replace` override (star
-        // expansion) swaps a specific range instead (the `*` / `t.*`).
-        let (from, to) = replace.unwrap_or((start, offset));
+        // Most completions replace the word being typed — the whole of it, the
+        // part after the caret too; a `replace` override (star expansion) swaps
+        // a specific range instead (the `*` / `t.*`).
+        let (from, to) = replace.unwrap_or((start, end));
         doc.edit_single(Selection::region(from, to), &insert, EditType::Completion);
         // `edit_single` doesn't move the caret, so place it explicitly.
         ed.cursor
@@ -1899,7 +1913,7 @@ mod tests {
     use super::{
         KeyKind, SuggestGlyph, SuggestKind, Suggestion, call_parens_follow, completion_insertion,
         natural_width, popup_may_open, popup_placement, popup_w, popup_x, row_width,
-        types_a_character,
+        types_a_character, word_end, word_start,
     };
     // These moved to `core::rank` with the policy that reads them; the tests stay
     // here because what they pin is this pane's behaviour, and the popup is here.
@@ -2087,6 +2101,28 @@ mod tests {
         // Keywords/functions never get the boost, even if present.
         let kw: HashSet<String> = ["select".to_string()].into_iter().collect();
         assert_eq!(recency_bonus("SELECT", SuggestKind::Keyword, &kw), 0);
+    }
+
+    /// An accept replaces the whole word the caret is in, the part after it
+    /// too — `cust|_id` is all of `cust_id` — and a caret at a word's end or
+    /// on a blank replaces only what is before it.
+    #[test]
+    fn an_accept_replaces_the_whole_word_the_caret_is_in() {
+        let text = "SELECT cust_id FROM t";
+        let at = 11; // cust|_id
+        assert_eq!(&text[..at], "SELECT cust");
+        assert_eq!(
+            (word_start(text, at), word_end(text, at)),
+            (7, 14),
+            "the whole of `cust_id`"
+        );
+        assert_eq!(word_end(text, 14), 14, "at the word's end");
+        assert_eq!(
+            word_end(text, 6),
+            6,
+            "on the space before a word, nothing after"
+        );
+        assert_eq!(word_end("SELECT cou", 10), 10, "at the end of the text");
     }
 
     #[test]
