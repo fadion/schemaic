@@ -1757,19 +1757,20 @@ existing prose was left alone.
     `noise_in_the_middle_is_not_stitched_around` pins, and it is the reason the guard exists. The
     cost is deliberate: a valid statement this parser cannot handle is refused rather than shown.
     **`predict` is the editor's inline ghost — deterministic, not AI, and offered only where the
-    answer is close to certain.** It returns the text Tab would insert at the caret, from six
+    answer is close to certain.** It returns the text Tab would insert at the caret, from seven
     producers asked in order, each answering only its own shape: an empty `JOIN … ON` gets
     `join_condition`'s foreign-key predicate; `INSERT`/`REPLACE … INTO t (` (its target read as the
     engine writes it, below) gets the columns an `INSERT` writes, from `Catalog::insert_columns_of`, quoted through
     `export::ident_if_needed` like every fragment above, plus a `)` unless one already follows;
     `GROUP BY ` gets the grouping list; an empty `JOIN ` gets the whole join, `table ON condition`
-    (`join_target_guess`); `JOIN t alias ` gets `ON` and the condition (`join_on_guess`); and a
+    (`join_target_guess`); `JOIN t alias ` gets `ON` and the condition (`join_on_guess`); a
     keyword whose partner the grammar fixes gets the partner (`ORDER`/`GROUP`/`PARTITION` → `BY`,
     `PRIMARY`/`FOREIGN` → `KEY`, `INSERT` → `INTO`, `DELETE` → `FROM`, the join words → `JOIN`,
     `IF` → `[NOT] EXISTS`, a column's `NOT` → `NULL`, and a handful of pairs such as
     `IS [NOT] DISTINCT` → `FROM` and `ON DUPLICATE` → `KEY UPDATE` — `keyword_partner` is the list),
     in lower case when the keyword was typed all-lower — `in_typed_case`, which writes both join
-    producers' `ON` in the case `JOIN` was typed. It answers nothing unless the rest of the
+    producers' `ON` in the case `JOIN` was typed; and, asked last, an operand just written gets the
+    word its construct fixes next (`operand_partner`, below). It answers nothing unless the rest of the
     caret's line is whitespace and `)` — the editor auto-pairs a `(`, so `INSERT INTO t (|)` has a
     closer nobody wrote — and at most the statement's own closing `;`, which going back into a
     finished statement always leaves after the caret (`ORDER |;`), though a second statement after
@@ -1869,7 +1870,30 @@ existing prose was left alone.
     (`an_empty_join_predicts_the_one_table_a_foreign_key_reaches`,
     `an_empty_join_predicts_nothing_when_the_table_is_not_certain`,
     `a_joined_table_and_its_alias_predict_the_on_condition`,
-    `a_joined_table_predicts_no_condition_it_cannot_be_sure_of`). The UI asks it
+    `a_joined_table_predicts_no_condition_it_cannot_be_sure_of`).
+    **An operand's partner waits for the operand to be finished.** `operand_partner` answers where
+    what has just been written is a construct's operand and the next word is fixed, each in the
+    case its keyword was typed: `BETWEEN x ` → `AND` (`between_and`, once `x` is finished at
+    `BETWEEN`'s own depth and no `AND`/`OR` follows it); `CAST(x ` — `TRY_CAST`, `SAFE_CAST` — →
+    `AS` when the innermost open paren is the call's, with one finished operand and no top-level
+    `AS` or comma, and `EXTRACT(field ` → `FROM` on exactly one word (`call_keyword`);
+    `SELECT * `, `SELECT DISTINCT|ALL * ` and `SELECT t.* ` → `FROM` (`star_from`) — a star takes
+    no alias, so nothing else can come, where `SELECT a ` may be followed by its alias and
+    predicts nothing; a CTE's name, right after `WITH`, `WITH RECURSIVE` or a depth-0 comma → `AS`
+    (`cte_as`), until a depth-0 `SELECT`/`INSERT`/`UPDATE`/`DELETE`/`MERGE`/`VALUES` shows the
+    query proper has begun — `AS ` and not `AS (`, because the user's own `(` auto-pairs and an
+    inserted one would not; `DELETE FROM t ` (`t`, `q.t` or `db.q.t`, nothing more) → `WHERE`
+    (`delete_where`), offered as a safety as much as a prediction; and `GRANT`/`DENY … ON obj ` →
+    `TO`, `REVOKE … ON obj ` → `FROM` (`grantee_word`), once the text after `ON` ends in a name
+    character, `*` or a closing quote, not while only the object's kind is written
+    (`PRIVILEGE_OBJECT_KINDS` — `TABLE`, `SCHEMA`, `ALL`, `IN`, …) and not once `TO`/`FROM` is.
+    *Finished* is `operand_finished`: something written, its parens closed (`depth_after`), and
+    the last thing neither an operator character nor a word that wants another operand
+    (`OPERAND_PENDING` — `AND`, `OR`, `NOT`, `IS`, `IN`, `LIKE`, `AS`, …), so `BETWEEN 1 + `,
+    `BETWEEN f(1 ` and `CAST(f(total ` predict nothing (`an_unfinished_operand_predicts_nothing`;
+    `a_finished_operand_predicts_the_word_its_construct_takes`, `a_star_projection_predicts_from`,
+    `a_common_table_expressions_name_predicts_as`, `a_delete_target_predicts_where`,
+    `a_privilege_object_predicts_its_grantee_word`). The UI asks it
     over the offer catalogue (under `completion.rs`) and only while the `editor_predictions`
     setting is on — Settings → Editor → *Inline predictions*, on by default. `predict_tests` covers
     each producer and gate, `an_auto_paired_closer_after_the_caret_still_predicts` the `)` one.

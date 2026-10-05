@@ -12376,7 +12376,7 @@ fn is_real_statement(stmt: &sqlparser::ast::Statement) -> bool {
 /// verbatim when the user presses Tab — or `None` when nothing is certain
 /// enough to offer.
 ///
-/// **Deterministic, and only where the answer is close to certain.** Six
+/// **Deterministic, and only where the answer is close to certain.** Seven
 /// producers, asked in this order, each answering only its own shape:
 ///
 /// - an empty `JOIN … ON` → the foreign-key condition ([`join_condition`]);
@@ -12387,7 +12387,10 @@ fn is_real_statement(stmt: &sqlparser::ast::Statement) -> bool {
 ///   ([`join_target_guess`]);
 /// - `JOIN t alias ` → `ON` and the foreign-key condition ([`join_on_guess`]);
 /// - a keyword whose partner the grammar fixes (`ORDER` → `BY`, `LEFT` →
-///   `JOIN`, a statement-opening `INSERT` → `INTO`…), in the case it was typed.
+///   `JOIN`, a statement-opening `INSERT` → `INTO`…), in the case it was typed;
+/// - a construct whose operand was just written (`BETWEEN x` → `AND`, `CAST(x`
+///   → `AS`, `SELECT *` → `FROM`, `DELETE FROM t` → `WHERE`…,
+///   [`operand_partner`]).
 ///
 /// **Where a ghost can be drawn, and nowhere else**: at the end of a line
 /// (nothing after the caret but whitespace, the `)` bracket pairing put there
@@ -12424,7 +12427,8 @@ pub fn predict(sql: &str, caret: usize, catalog: &Catalog, dialect: SqlDialect) 
         .or_else(|| group_by_items(sql, lo, &toks, dialect))
         .or_else(|| join_target_guess(sql, (lo, hi, caret), &toks, catalog, dialect))
         .or_else(|| join_on_guess(sql, (lo, hi, caret), &toks, catalog, dialect))
-        .or_else(|| keyword_partner(sql, lo, &toks, dialect))?;
+        .or_else(|| keyword_partner(sql, lo, &toks, dialect))
+        .or_else(|| operand_partner(sql, caret, &toks))?;
     let next_word = tokenize_range(sql, caret, hi.max(caret), dialect)
         .into_iter()
         .find_map(|t| match t.kind {
@@ -12563,6 +12567,286 @@ fn keyword_partner(sql: &str, lo: usize, toks: &[Token], dialect: SqlDialect) ->
         _ => return None,
     };
     Some(in_typed_case(partner, w))
+}
+
+/// An unquoted word token, upper-cased — what a keyword test reads.
+fn bare_upper(t: &Token) -> Option<String> {
+    match &t.kind {
+        TkKind::Word(w) if !t.quoted => Some(w.to_ascii_uppercase()),
+        _ => None,
+    }
+}
+
+/// The paren depth at the end of `toks`, or `None` if it closes a paren it
+/// did not open — the construct it was asked about has already ended.
+fn depth_after(toks: &[Token]) -> Option<usize> {
+    let mut depth = 0usize;
+    for t in toks {
+        match t.kind {
+            TkKind::LParen => depth += 1,
+            TkKind::RParen => depth = depth.checked_sub(1)?,
+            _ => {}
+        }
+    }
+    Some(depth)
+}
+
+/// Words after which an expression is still waiting for its next operand.
+const OPERAND_PENDING: &[&str] = &[
+    "AND", "OR", "NOT", "IS", "IN", "LIKE", "ILIKE", "AS", "COLLATE", "BETWEEN", "CASE", "WHEN",
+    "THEN", "ELSE", "DISTINCT", "ESCAPE", "ANY", "ALL", "SOME", "EXISTS",
+];
+
+/// Is `text` (the source from a construct's keyword to the caret, `toks` its
+/// tokens) one finished operand? Something is written, its parens are closed,
+/// and it does not end on an operator or on a word that wants another operand.
+fn operand_finished(text: &str, toks: &[Token]) -> bool {
+    let text = text.trim();
+    let Some(last) = text.chars().next_back() else {
+        return false;
+    };
+    let ends_on_operator = "+-*/%|&^=<>,(!~:".contains(last);
+    let pending = toks
+        .last()
+        .and_then(bare_upper)
+        .is_some_and(|w| OPERAND_PENDING.contains(&w.as_str()));
+    !ends_on_operator && !pending && depth_after(toks) == Some(0)
+}
+
+/// [`predict`]'s operand producer: a construct whose operand has just been
+/// written takes a fixed next word — `BETWEEN x` its `AND`, `CAST(x` its `AS`,
+/// `EXTRACT(field` its `FROM`, `SELECT *` (which no alias can follow) its
+/// `FROM`, a CTE's name its `AS`, `DELETE FROM t` its `WHERE` (as much a safety
+/// as a prediction), and a privilege's object its `TO` or `FROM`. Each answers
+/// in the case its keyword was typed.
+fn operand_partner(sql: &str, caret: usize, toks: &[Token]) -> Option<String> {
+    between_and(sql, caret, toks)
+        .or_else(|| call_keyword(sql, caret, toks))
+        .or_else(|| star_from(sql, caret, toks))
+        .or_else(|| cte_as(toks))
+        .or_else(|| delete_where(toks))
+        .or_else(|| grantee_word(sql, caret, toks))
+}
+
+/// `… BETWEEN x ` → `AND `, once `x` is a finished operand at the `BETWEEN`'s
+/// own depth and no `AND` has been written.
+fn between_and(sql: &str, caret: usize, toks: &[Token]) -> Option<String> {
+    let i = toks
+        .iter()
+        .rposition(|t| bare_upper(t).as_deref() == Some("BETWEEN"))?;
+    let after = &toks[i + 1..];
+    let has_and = after
+        .iter()
+        .any(|t| matches!(bare_upper(t).as_deref(), Some("AND" | "OR")));
+    let TkKind::Word(kw) = &toks[i].kind else {
+        return None;
+    };
+    (!has_and && operand_finished(sql.get(toks[i].end..caret)?, after))
+        .then(|| in_typed_case("AND ", kw))
+}
+
+/// `CAST(x ` → `AS ` and `EXTRACT(field ` → `FROM `: the innermost open paren
+/// is the call's, and its one operand is written.
+fn call_keyword(sql: &str, caret: usize, toks: &[Token]) -> Option<String> {
+    let mut open = Vec::new();
+    for (i, t) in toks.iter().enumerate() {
+        match t.kind {
+            TkKind::LParen => open.push(i),
+            TkKind::RParen => {
+                open.pop();
+            }
+            _ => {}
+        }
+    }
+    let p = *open.last()?;
+    let call = toks.get(p.checked_sub(1)?)?;
+    let TkKind::Word(name) = &call.kind else {
+        return None;
+    };
+    let inner = &toks[p + 1..];
+    let text = sql.get(toks[p].end..caret)?;
+    let top_level_word = |kw: &str| {
+        let mut depth = 0usize;
+        inner.iter().any(|t| match t.kind {
+            TkKind::LParen => {
+                depth += 1;
+                false
+            }
+            TkKind::RParen => {
+                depth = depth.saturating_sub(1);
+                false
+            }
+            TkKind::Comma => depth == 0,
+            _ => depth == 0 && bare_upper(t).as_deref() == Some(kw),
+        })
+    };
+    match bare_upper(call)?.as_str() {
+        "CAST" | "TRY_CAST" | "SAFE_CAST"
+            if !top_level_word("AS") && operand_finished(text, inner) =>
+        {
+            Some(in_typed_case("AS ", name))
+        }
+        "EXTRACT"
+            if matches!(inner, [t] if matches!(t.kind, TkKind::Word(_)))
+                && text.trim() == sql.get(inner[0].at..inner[0].end)? =>
+        {
+            Some(in_typed_case("FROM ", name))
+        }
+        _ => None,
+    }
+}
+
+/// `SELECT * ` (or `SELECT DISTINCT *`, `SELECT t.*`) → `FROM `: a star takes
+/// no alias, so nothing else can come next. Any other projection might be
+/// followed by its alias, and predicts nothing.
+fn star_from(sql: &str, caret: usize, toks: &[Token]) -> Option<String> {
+    let i = toks
+        .iter()
+        .rposition(|t| bare_upper(t).as_deref() == Some("SELECT"))?;
+    let TkKind::Word(kw) = &toks[i].kind else {
+        return None;
+    };
+    let mut tail = &toks[i + 1..];
+    let mut from = toks[i].end;
+    if let [q, rest @ ..] = tail
+        && matches!(bare_upper(q).as_deref(), Some("DISTINCT" | "ALL"))
+    {
+        from = q.end;
+        tail = rest;
+    }
+    let star = sql.get(from..caret)?.trim();
+    let shaped = match tail {
+        [] => star == "*",
+        [w, dot] if matches!(w.kind, TkKind::Word(_)) && matches!(dot.kind, TkKind::Dot) => {
+            star.strip_suffix('*') == sql.get(w.at..dot.end)
+        }
+        _ => false,
+    };
+    shaped.then(|| in_typed_case("FROM ", kw))
+}
+
+/// `WITH name ` → `AS `: a CTE's name — the first, the one after `RECURSIVE`,
+/// or one after the comma that starts the next — before the query proper.
+fn cte_as(toks: &[Token]) -> Option<String> {
+    let first = toks.first()?;
+    if bare_upper(first).as_deref() != Some("WITH") {
+        return None;
+    }
+    let TkKind::Word(with) = &first.kind else {
+        return None;
+    };
+    let [.., prev, name] = toks else {
+        return None;
+    };
+    if !matches!(name.kind, TkKind::Word(_)) || bare_upper(name).as_deref() == Some("RECURSIVE") {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut began = false;
+    for t in toks {
+        match t.kind {
+            TkKind::LParen => depth += 1,
+            TkKind::RParen => depth = depth.saturating_sub(1),
+            _ if depth == 0 => {
+                began |= matches!(
+                    bare_upper(t).as_deref(),
+                    Some("SELECT" | "INSERT" | "UPDATE" | "DELETE" | "MERGE" | "VALUES")
+                );
+            }
+            _ => {}
+        }
+    }
+    let after_name_slot = match bare_upper(prev).as_deref() {
+        Some("WITH") => true,
+        Some("RECURSIVE") => toks.len() == 3,
+        _ => matches!(prev.kind, TkKind::Comma) && depth == 0,
+    };
+    (after_name_slot && !began).then(|| in_typed_case("AS ", with))
+}
+
+/// `DELETE FROM t ` → `WHERE `: the table, and nothing else, after `DELETE
+/// FROM`.
+fn delete_where(toks: &[Token]) -> Option<String> {
+    let [del, from, name @ ..] = toks else {
+        return None;
+    };
+    if bare_upper(del).as_deref() != Some("DELETE") || bare_upper(from).as_deref() != Some("FROM") {
+        return None;
+    }
+    let word = |t: &Token| matches!(t.kind, TkKind::Word(_));
+    let dot = |t: &Token| matches!(t.kind, TkKind::Dot);
+    let named = match name {
+        [t] => word(t),
+        [a, d, t] => word(a) && dot(d) && word(t),
+        [a, d1, b, d2, t] => word(a) && dot(d1) && word(b) && dot(d2) && word(t),
+        _ => false,
+    };
+    let TkKind::Word(kw) = &del.kind else {
+        return None;
+    };
+    named.then(|| in_typed_case("WHERE ", kw))
+}
+
+/// The words a privilege's `ON` clause names an object's *kind* with — after
+/// one, the object itself is still to come.
+const PRIVILEGE_OBJECT_KINDS: &[&str] = &[
+    "TABLE",
+    "TABLES",
+    "VIEW",
+    "SCHEMA",
+    "DATABASE",
+    "FUNCTION",
+    "FUNCTIONS",
+    "PROCEDURE",
+    "PROCEDURES",
+    "ROUTINE",
+    "ROUTINES",
+    "SEQUENCE",
+    "SEQUENCES",
+    "TYPE",
+    "DOMAIN",
+    "LANGUAGE",
+    "TABLESPACE",
+    "OBJECT",
+    "ALL",
+    "IN",
+    "FOREIGN",
+    "SERVER",
+    "LARGE",
+];
+
+/// `GRANT … ON obj ` / `DENY … ON obj ` → `TO `, `REVOKE … ON obj ` → `FROM `:
+/// once the object is named, and before its grantee word is written.
+fn grantee_word(sql: &str, caret: usize, toks: &[Token]) -> Option<String> {
+    let head = toks.first()?;
+    let TkKind::Word(verb) = &head.kind else {
+        return None;
+    };
+    let partner = match bare_upper(head)?.as_str() {
+        "GRANT" | "DENY" => "TO ",
+        "REVOKE" => "FROM ",
+        _ => return None,
+    };
+    let on = toks
+        .iter()
+        .position(|t| bare_upper(t).as_deref() == Some("ON"))?;
+    let after = &toks[on + 1..];
+    if after
+        .iter()
+        .any(|t| matches!(bare_upper(t).as_deref(), Some("TO" | "FROM")))
+        || after
+            .last()
+            .and_then(bare_upper)
+            .is_some_and(|w| PRIVILEGE_OBJECT_KINDS.contains(&w.as_str()))
+    {
+        return None;
+    }
+    let object = sql.get(toks[on].end..caret)?.trim();
+    let named = object
+        .chars()
+        .next_back()
+        .is_some_and(|c| !c.is_ascii() || c.is_ascii_alphanumeric() || "_*\"`]".contains(c));
+    named.then(|| in_typed_case(partner, verb))
 }
 
 /// The words that name the kind of object a DDL statement is about — the
@@ -13723,6 +14007,121 @@ mod predict_tests {
             pg("CREATE TABLE t (a int REFERENCES u (id), b int NOT ").as_deref(),
             Some("NULL")
         );
+    }
+
+    /// A construct whose operand has just been written takes a fixed next word:
+    /// `BETWEEN x` its `AND`, `CAST(x` its `AS`, `EXTRACT(field` its `FROM`.
+    #[test]
+    fn a_finished_operand_predicts_the_word_its_construct_takes() {
+        let pg = |sql: &str| at_end(sql, SqlDialect::Postgres);
+        assert_eq!(
+            my("SELECT * FROM orders WHERE total BETWEEN 1 ").as_deref(),
+            Some("AND ")
+        );
+        assert_eq!(
+            my("SELECT * FROM orders WHERE total NOT BETWEEN o.x + 1 ").as_deref(),
+            Some("AND ")
+        );
+        assert_eq!(
+            my("SELECT * FROM orders WHERE created BETWEEN '2024-01-01' ").as_deref(),
+            Some("AND ")
+        );
+        assert_eq!(
+            my("select * from orders where total between 1 ").as_deref(),
+            Some("and ")
+        );
+        assert_eq!(my("SELECT CAST(total ").as_deref(), Some("AS "));
+        assert_eq!(my("SELECT CAST(o.total * 2 ").as_deref(), Some("AS "));
+        assert_eq!(
+            at_end("SELECT TRY_CAST(total ", SqlDialect::MsSql).as_deref(),
+            Some("AS ")
+        );
+        assert_eq!(pg("SELECT EXTRACT(year ").as_deref(), Some("FROM "));
+    }
+
+    /// An operand still being written — or a construct already given its
+    /// word — predicts nothing.
+    #[test]
+    fn an_unfinished_operand_predicts_nothing() {
+        assert_eq!(my("SELECT * FROM orders WHERE total BETWEEN "), None);
+        assert_eq!(my("SELECT * FROM orders WHERE total BETWEEN 1 + "), None);
+        assert_eq!(
+            my("SELECT * FROM orders WHERE total BETWEEN 1 AND 5 "),
+            None
+        );
+        assert_eq!(my("SELECT * FROM orders WHERE total BETWEEN f(1 "), None);
+        assert_eq!(my("SELECT CAST(total AS "), None);
+        assert_eq!(my("SELECT CAST(f(total "), None);
+        assert_eq!(my("SELECT CAST(total, "), None);
+        assert_eq!(
+            at_end("SELECT EXTRACT(year FROM ", SqlDialect::Postgres),
+            None
+        );
+    }
+
+    /// `SELECT *` can take no alias, so `FROM` follows it; a projection that
+    /// can (`SELECT a `) predicts nothing.
+    #[test]
+    fn a_star_projection_predicts_from() {
+        assert_eq!(my("SELECT * ").as_deref(), Some("FROM "));
+        assert_eq!(my("SELECT DISTINCT * ").as_deref(), Some("FROM "));
+        assert_eq!(my("SELECT o.* ").as_deref(), Some("FROM "));
+        assert_eq!(my("select * ").as_deref(), Some("from "));
+        assert_eq!(
+            my("SELECT * FROM orders WHERE id IN (SELECT * ").as_deref(),
+            Some("FROM ")
+        );
+        assert_eq!(my("SELECT a "), None);
+        assert_eq!(my("SELECT count(*) "), None);
+        assert_eq!(my("SELECT *, "), None);
+        assert_eq!(my("SELECT a, * "), None);
+    }
+
+    /// A CTE's name takes `AS` — the first, after `RECURSIVE`, or after the
+    /// comma that starts the next one — but not once the query proper begins.
+    #[test]
+    fn a_common_table_expressions_name_predicts_as() {
+        assert_eq!(my("WITH totals ").as_deref(), Some("AS "));
+        assert_eq!(my("WITH RECURSIVE tree ").as_deref(), Some("AS "));
+        assert_eq!(my("with a as (select 1), b ").as_deref(), Some("as "));
+        assert_eq!(my("WITH RECURSIVE "), None);
+        assert_eq!(my("WITH a AS (SELECT 1) SELECT x, y "), None);
+        assert_eq!(my("SELECT * FROM t WITH "), None);
+    }
+
+    /// `DELETE FROM t ` is followed by its `WHERE` — offered as the safety it
+    /// is as much as a prediction.
+    #[test]
+    fn a_delete_target_predicts_where() {
+        assert_eq!(my("DELETE FROM orders ").as_deref(), Some("WHERE "));
+        assert_eq!(my("delete from shop.orders ").as_deref(), Some("where "));
+        assert_eq!(
+            at_end("DELETE FROM shop.dbo.orders ", SqlDialect::MsSql).as_deref(),
+            Some("WHERE ")
+        );
+        assert_eq!(my("DELETE FROM "), None);
+        assert_eq!(my("DELETE FROM orders WHERE id = 1 "), None);
+    }
+
+    /// The object of a `GRANT`/`DENY` takes `TO`, of a `REVOKE` `FROM` — once
+    /// it is named, not while only its kind is.
+    #[test]
+    fn a_privilege_object_predicts_its_grantee_word() {
+        let pg = |sql: &str| at_end(sql, SqlDialect::Postgres);
+        assert_eq!(my("GRANT SELECT ON shop.orders ").as_deref(), Some("TO "));
+        assert_eq!(my("REVOKE SELECT ON shop.* ").as_deref(), Some("FROM "));
+        assert_eq!(
+            at_end("DENY SELECT ON orders ", SqlDialect::MsSql).as_deref(),
+            Some("TO ")
+        );
+        assert_eq!(
+            pg("GRANT SELECT ON ALL TABLES IN SCHEMA public ").as_deref(),
+            Some("TO ")
+        );
+        assert_eq!(pg("GRANT SELECT ON TABLE "), None);
+        assert_eq!(pg("GRANT SELECT ON ALL TABLES IN SCHEMA "), None);
+        assert_eq!(my("GRANT SELECT ON orders TO "), None);
+        assert_eq!(my("GRANT SELECT ON "), None);
     }
 }
 
