@@ -12510,13 +12510,17 @@ fn insert_into_is_optional(dialect: SqlDialect) -> bool {
 }
 
 /// [`predict`]'s keyword producer: the last token is a keyword whose next word
-/// the grammar fixes.
+/// the grammar fixes — or, where an engine lets that word be left out
+/// (`INSERT INTO`, `TRUNCATE TABLE`, `MERGE INTO`), the conventional spelling
+/// every engine accepts.
 ///
-/// Each guard is a place the bare rule was wrong: `INSERT`/`DELETE` also sit
-/// inside a trigger header and a key's `ON DELETE`, so only a statement's first
-/// word counts; `WITHIN GROUP (` takes no `BY`; and the join words count only
-/// where a join can go ([`in_join_position`]), since `LEFT`/`RIGHT` are string
-/// functions too.
+/// Each guard is a place the bare rule was wrong: `INSERT`/`DELETE` (and
+/// `REPLACE`/`MERGE`/`TRUNCATE`) also sit inside a trigger header and a key's
+/// `ON DELETE`, so only a statement's first word counts; `WITHIN GROUP (` takes
+/// no `BY`; the join words count only where a join can go
+/// ([`in_join_position`]), since `LEFT`/`RIGHT` are string functions too; `IF`
+/// answers only after an object word ([`if_partner`]); and `NOT` only in a
+/// column's definition ([`declares_a_column`]).
 fn keyword_partner(sql: &str, lo: usize, toks: &[Token], dialect: SqlDialect) -> Option<String> {
     let last = toks.last()?;
     let TkKind::Word(w) = &last.kind else {
@@ -12531,18 +12535,141 @@ fn keyword_partner(sql: &str, lo: usize, toks: &[Token], dialect: SqlDialect) ->
     };
     let first = toks.len() == 1;
     let prev = toks.len().checked_sub(2).and_then(word_at);
+    let prev2 = toks.len().checked_sub(3).and_then(word_at);
+    let prev_is = |kw: &str| prev.as_deref() == Some(kw);
+    // The statement's second word follows its first: `CREATE OR`, `CREATE UNIQUE`.
+    let second_after = |kw: &str| toks.len() == 2 && prev_is(kw);
     let joins = || in_join_position(sql, lo, last.at, dialect);
     let partner = match w.to_ascii_uppercase().as_str() {
-        "GROUP" if prev.as_deref() == Some("WITHIN") => return None,
+        "GROUP" if prev_is("WITHIN") => return None,
         "ORDER" | "GROUP" | "PARTITION" => "BY ",
         "LEFT" | "RIGHT" | "INNER" | "FULL" if joins() => "JOIN ",
         "CROSS" | "OUTER" if !has_apply_joins(dialect) && joins() => "JOIN ",
         "PRIMARY" | "FOREIGN" => "KEY",
         "INSERT" if first => "INTO ",
         "DELETE" if first => "FROM ",
+        "REPLACE" | "MERGE" if first => "INTO ",
+        "TRUNCATE" if first => "TABLE ",
+        "IF" => if_partner(toks)?,
+        "NOT" if prev_is("IF") && if_partner(&toks[..toks.len() - 1]).is_some() => "EXISTS ",
+        "NOT" if declares_a_column(toks) => "NULL",
+        "DISTINCT" if prev_is("IS") || (prev_is("NOT") && prev2.as_deref() == Some("IS")) => {
+            "FROM "
+        }
+        "DUPLICATE" if prev_is("ON") => "KEY UPDATE ",
+        "UPDATE" if prev_is("DO") => "SET ",
+        "UNIQUE" if second_after("CREATE") && !unique_index_names_its_kind(dialect) => "INDEX ",
+        "OR" if second_after("CREATE") => create_or_spelling(dialect)?,
         _ => return None,
     };
     Some(in_typed_case(partner, w))
+}
+
+/// The words that name the kind of object a DDL statement is about — the
+/// ones `IF [NOT] EXISTS` follows.
+const DDL_OBJECT_WORDS: &[&str] = &[
+    "TABLE",
+    "VIEW",
+    "INDEX",
+    "SCHEMA",
+    "DATABASE",
+    "SEQUENCE",
+    "TRIGGER",
+    "FUNCTION",
+    "PROCEDURE",
+    "COLUMN",
+    "TYPE",
+    "EXTENSION",
+    "ROLE",
+    "USER",
+    "EVENT",
+    "CONSTRAINT",
+    "DOMAIN",
+    "SERVER",
+    "TABLESPACE",
+    "SYNONYM",
+];
+
+/// What follows an `IF` that ends `toks`: `EXISTS` when the verb it belongs to
+/// drops, `NOT EXISTS` when it creates or adds — and nothing unless an object
+/// word stands right before it, since `IF` is also a T-SQL statement, a
+/// procedure body's branch and MySQL's `IF()`.
+fn if_partner(toks: &[Token]) -> Option<&'static str> {
+    let upper = |t: &Token| match &t.kind {
+        TkKind::Word(w) if !t.quoted => Some(w.to_ascii_uppercase()),
+        _ => None,
+    };
+    let [.., object, if_kw] = toks else {
+        return None;
+    };
+    if upper(if_kw).as_deref() != Some("IF")
+        || !upper(object).is_some_and(|o| DDL_OBJECT_WORDS.contains(&o.as_str()))
+    {
+        return None;
+    }
+    toks.iter().rev().find_map(|t| match upper(t)?.as_str() {
+        "DROP" => Some("EXISTS "),
+        "CREATE" | "ADD" => Some("NOT EXISTS "),
+        _ => None,
+    })
+}
+
+/// Does a `NOT` ending `toks` sit in a column's definition — where it can
+/// only be `NOT NULL`? Inside a `CREATE TABLE`'s column list (one paren deep)
+/// or an `ALTER TABLE`'s clause (none), and so never in a `CHECK (…)`, an
+/// `AS SELECT … WHERE` or anywhere else a condition is written. Nor in an item
+/// that declares a constraint, whose `NOT` is PostgreSQL's `NOT VALID` or
+/// `NOT DEFERRABLE`.
+fn declares_a_column(toks: &[Token]) -> bool {
+    let upper = |i: usize| match toks.get(i).map(|t| &t.kind) {
+        Some(TkKind::Word(w)) => Some(w.to_ascii_uppercase()),
+        _ => None,
+    };
+    // `TABLE` among the first words: `CREATE [TEMPORARY|UNLOGGED|…] TABLE`.
+    let is_table = (1..4).any(|i| upper(i).as_deref() == Some("TABLE"));
+    let want = match upper(0).as_deref() {
+        Some("CREATE") => 1,
+        Some("ALTER") => 0,
+        _ => return false,
+    };
+    // Walk to the `NOT`, noting where the item it is in began: after the last
+    // comma at the depth the items are listed at.
+    let body = &toks[..toks.len() - 1];
+    let mut depth = 0i32;
+    let mut item = 0;
+    for (i, t) in body.iter().enumerate() {
+        match t.kind {
+            TkKind::LParen => depth += 1,
+            TkKind::RParen => depth -= 1,
+            TkKind::Comma if depth == want => item = i + 1,
+            _ => {}
+        }
+    }
+    const NOT_A_COLUMN: &[&str] = &["WHERE", "CONSTRAINT", "CHECK", "FOREIGN", "REFERENCES"];
+    let condition_or_constraint = body[item..].iter().any(|t| {
+        matches!(&t.kind, TkKind::Word(w) if NOT_A_COLUMN.contains(&w.to_ascii_uppercase().as_str()))
+    });
+    is_table && depth == want && !condition_or_constraint
+}
+
+/// Whether `CREATE UNIQUE` may name the index's clustering before `INDEX`
+/// (`CREATE UNIQUE CLUSTERED INDEX`) on this engine — which makes `INDEX` a
+/// guess there. T-SQL's alone.
+fn unique_index_names_its_kind(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MsSql => true,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+    }
+}
+
+/// The word `CREATE OR` takes on this engine: `REPLACE`, T-SQL's `ALTER`, or
+/// none at all on SQLite, which has neither form.
+fn create_or_spelling(dialect: SqlDialect) -> Option<&'static str> {
+    match dialect {
+        SqlDialect::MySql | SqlDialect::Postgres => Some("REPLACE "),
+        SqlDialect::MsSql => Some("ALTER "),
+        SqlDialect::Sqlite => None,
+    }
 }
 
 /// `keyword` (written upper-case) in the case `typed` was: all lower answers in
@@ -13464,6 +13591,138 @@ mod predict_tests {
         let text = sql.replacen('|', "", 1);
         let cat = Catalog::build(&[("shop", &schema)], Some("shop"));
         assert_eq!(predict(&text, caret, &cat, SqlDialect::MySql), None);
+    }
+
+    /// `IF` after an object word takes `EXISTS` when the verb it belongs to
+    /// drops, and `NOT EXISTS` when it creates or adds.
+    #[test]
+    fn if_predicts_exists_by_the_verb_it_belongs_to() {
+        let pg = |sql: &str| at_end(sql, SqlDialect::Postgres);
+        assert_eq!(my("DROP TABLE IF ").as_deref(), Some("EXISTS "));
+        assert_eq!(my("DROP TEMPORARY TABLE IF ").as_deref(), Some("EXISTS "));
+        assert_eq!(my("CREATE TABLE IF ").as_deref(), Some("NOT EXISTS "));
+        assert_eq!(my("CREATE TABLE IF NOT ").as_deref(), Some("EXISTS "));
+        assert_eq!(my("drop view if ").as_deref(), Some("exists "));
+        assert_eq!(
+            pg("ALTER TABLE t DROP COLUMN IF ").as_deref(),
+            Some("EXISTS ")
+        );
+        assert_eq!(
+            pg("ALTER TABLE t ADD COLUMN IF ").as_deref(),
+            Some("NOT EXISTS ")
+        );
+    }
+
+    /// `IF` is also a statement and a function: neither follows an object word.
+    #[test]
+    fn if_elsewhere_predicts_nothing() {
+        assert_eq!(at_end("IF ", SqlDialect::MsSql), None);
+        assert_eq!(at_end("IF NOT ", SqlDialect::MsSql), None);
+        assert_eq!(my("CREATE PROCEDURE p() BEGIN IF "), None);
+        assert_eq!(my("SELECT IF "), None);
+    }
+
+    #[test]
+    fn more_keywords_whose_partner_is_fixed_predict_it() {
+        let pg = |sql: &str| at_end(sql, SqlDialect::Postgres);
+        assert_eq!(
+            pg("SELECT * FROM t WHERE a IS DISTINCT ").as_deref(),
+            Some("FROM ")
+        );
+        assert_eq!(
+            pg("SELECT * FROM t WHERE a IS NOT DISTINCT ").as_deref(),
+            Some("FROM ")
+        );
+        assert_eq!(
+            my("INSERT INTO t (a) VALUES (1) ON DUPLICATE ").as_deref(),
+            Some("KEY UPDATE ")
+        );
+        assert_eq!(
+            pg("INSERT INTO t (a) VALUES (1) ON CONFLICT (a) DO UPDATE ").as_deref(),
+            Some("SET ")
+        );
+        assert_eq!(my("CREATE UNIQUE ").as_deref(), Some("INDEX "));
+        assert_eq!(my("REPLACE ").as_deref(), Some("INTO "));
+        assert_eq!(
+            at_end("MERGE ", SqlDialect::MsSql).as_deref(),
+            Some("INTO ")
+        );
+        assert_eq!(my("TRUNCATE ").as_deref(), Some("TABLE "));
+        assert_eq!(my("SELECT REPLACE "), None);
+    }
+
+    /// `CREATE OR` is spelt `REPLACE` where it exists and `ALTER` on SQL
+    /// Server; SQLite has neither, and SQL Server's `CREATE UNIQUE` may name
+    /// its clustering before `INDEX`.
+    #[test]
+    fn create_modifiers_are_answered_per_engine() {
+        assert_eq!(my("CREATE OR ").as_deref(), Some("REPLACE "));
+        assert_eq!(
+            at_end("create or ", SqlDialect::Postgres).as_deref(),
+            Some("replace ")
+        );
+        assert_eq!(
+            at_end("CREATE OR ", SqlDialect::MsSql).as_deref(),
+            Some("ALTER ")
+        );
+        assert_eq!(at_end("CREATE OR ", SqlDialect::Sqlite), None);
+        assert_eq!(at_end("CREATE UNIQUE ", SqlDialect::MsSql), None);
+    }
+
+    /// `NOT` in a column's definition is `NOT NULL`.
+    #[test]
+    fn not_predicts_null_in_a_column_definition() {
+        assert_eq!(my("CREATE TABLE t (id int NOT ").as_deref(), Some("NULL"));
+        assert_eq!(
+            my("CREATE TABLE t (id int, name varchar(20) NOT ").as_deref(),
+            Some("NULL")
+        );
+        assert_eq!(
+            my("ALTER TABLE t ADD COLUMN c int NOT ").as_deref(),
+            Some("NULL")
+        );
+        assert_eq!(
+            my("ALTER TABLE t MODIFY c int NOT ").as_deref(),
+            Some("NULL")
+        );
+        assert_eq!(
+            at_end(
+                "ALTER TABLE t ALTER COLUMN c SET NOT ",
+                SqlDialect::Postgres
+            )
+            .as_deref(),
+            Some("NULL")
+        );
+    }
+
+    /// A `NOT` in a condition — a query's, a `CHECK`'s — negates anything.
+    #[test]
+    fn not_in_a_condition_predicts_nothing() {
+        assert_eq!(my("SELECT * FROM t WHERE NOT "), None);
+        assert_eq!(my("CREATE TABLE t (c int CHECK (NOT "), None);
+        assert_eq!(my("CREATE TABLE t (c int, CHECK (c > 0 AND NOT "), None);
+        assert_eq!(my("CREATE TABLE t AS SELECT * FROM u WHERE NOT "), None);
+        assert_eq!(my("ALTER TABLE t ADD CONSTRAINT k CHECK (NOT "), None);
+    }
+
+    /// A constraint's `NOT` is PostgreSQL's `NOT VALID` or `NOT DEFERRABLE`,
+    /// never `NOT NULL` — in the item it is written in, not the next column.
+    #[test]
+    fn not_after_a_constraint_predicts_nothing() {
+        let pg = |sql: &str| at_end(sql, SqlDialect::Postgres);
+        assert_eq!(
+            pg("ALTER TABLE t ADD CONSTRAINT k CHECK (a > 0) NOT "),
+            None
+        );
+        assert_eq!(
+            pg("ALTER TABLE t ADD FOREIGN KEY (a) REFERENCES u (id) NOT "),
+            None
+        );
+        assert_eq!(pg("CREATE TABLE t (a int REFERENCES u (id) NOT "), None);
+        assert_eq!(
+            pg("CREATE TABLE t (a int REFERENCES u (id), b int NOT ").as_deref(),
+            Some("NULL")
+        );
     }
 }
 

@@ -1765,7 +1765,9 @@ existing prose was left alone.
     `GROUP BY ` gets the grouping list; an empty `JOIN ` gets the whole join, `table ON condition`
     (`join_target_guess`); `JOIN t alias ` gets `ON` and the condition (`join_on_guess`); and a
     keyword whose partner the grammar fixes gets the partner (`ORDER`/`GROUP`/`PARTITION` → `BY`,
-    `PRIMARY`/`FOREIGN` → `KEY`, `INSERT` → `INTO`, `DELETE` → `FROM`, the join words → `JOIN`),
+    `PRIMARY`/`FOREIGN` → `KEY`, `INSERT` → `INTO`, `DELETE` → `FROM`, the join words → `JOIN`,
+    `IF` → `[NOT] EXISTS`, a column's `NOT` → `NULL`, and a handful of pairs such as
+    `IS [NOT] DISTINCT` → `FROM` and `ON DUPLICATE` → `KEY UPDATE` — `keyword_partner` is the list),
     in lower case when the keyword was typed all-lower — `in_typed_case`, which writes both join
     producers' `ON` in the case `JOIN` was typed. It answers nothing unless the rest of the
     caret's line is whitespace and `)` — the editor auto-pairs a `(`, so `INSERT INTO t (|)` has a
@@ -1791,7 +1793,28 @@ existing prose was left alone.
     predicted `JOIN` after `WHERE LEFT ` and `ORDER BY LEFT `, and in a subquery's projection off
     the outer query's `FROM` (`join_words_predict_only_where_a_join_can_go`); and `CROSS`/`OUTER`
     predict nothing where `has_apply_joins` says an `APPLY` may follow — T-SQL alone, asked as a
-    capability through an exhaustive match, so a new engine has to answer it. The `INSERT` target
+    capability through an exhaustive match, so a new engine has to answer it. `REPLACE`/`MERGE`
+    (→ `INTO`) and `TRUNCATE` (→ `TABLE`) count only first, as `INSERT` does (`SELECT REPLACE `
+    predicts nothing). Some of those words are optional on some engines (`INTO` after `INSERT` on
+    MySQL and SQL Server, `TABLE` after `TRUNCATE` everywhere but T-SQL); the partner is then the
+    conventional spelling every engine that has the statement accepts, not a guess. `IF` is also a T-SQL statement, a procedure body's branch and MySQL's
+    `IF()`, so `if_partner` answers only with an object word (`DDL_OBJECT_WORDS` — `TABLE`,
+    `VIEW`, `COLUMN`, …) right before it, and the nearest verb behind that decides: `DROP` →
+    `EXISTS`, `CREATE`/`ADD` → `NOT EXISTS`; `IF NOT` gets `EXISTS` only after an `IF` that
+    qualified (`if_predicts_exists_by_the_verb_it_belongs_to`, `if_elsewhere_predicts_nothing`).
+    `NOT` negates anything in a condition, so it gets `NULL` only where `declares_a_column` finds
+    a column being defined — a `CREATE … TABLE`'s column list (one paren deep) or an
+    `ALTER … TABLE`'s clause (none) — and so never inside a `CHECK (` or a
+    `CREATE TABLE … AS SELECT … WHERE` (`not_in_a_condition_predicts_nothing`). The item it sits
+    in, since the last comma at that depth, must also hold none of `WHERE`, `CONSTRAINT`, `CHECK`,
+    `FOREIGN` or `REFERENCES`: a constraint's `NOT` is PostgreSQL's `NOT VALID` or
+    `NOT DEFERRABLE`, and the first cut, without that rule, offered `NULL` there
+    (`not_after_a_constraint_predicts_nothing`). Its cost is a column with an inline `REFERENCES`,
+    whose `NOT NULL` gets no ghost. `CREATE UNIQUE` and `CREATE OR` are asked as capabilities the
+    same exhaustive way: `unique_index_names_its_kind` makes `INDEX` a guess on T-SQL alone
+    (`CREATE UNIQUE CLUSTERED INDEX`), and `create_or_spelling` answers `REPLACE` on MySQL and
+    PostgreSQL, `ALTER` on SQL Server and nothing on SQLite, which has neither form
+    (`create_modifiers_are_answered_per_engine`). The `INSERT` target
     is read as each engine writes it: `t` and `q.t`, and T-SQL's `db.schema.t` and `db..t`, resolved
     through `Catalog::resolve_located` as the checker's three-part names are; and with no `INTO` at
     all (`INSERT t (`) where `insert_into_is_optional` says the grammar allows it — MySQL and SQL
