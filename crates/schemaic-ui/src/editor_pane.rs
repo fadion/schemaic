@@ -16,7 +16,7 @@
 use std::rc::Rc;
 
 use floem::event::{Event, EventListener, EventPropagation};
-use floem::keyboard::{Key, NamedKey};
+use floem::keyboard::{Key, Modifiers, NamedKey};
 use floem::kurbo::{Point, Rect, Vec2};
 use floem::prelude::*;
 use floem::reactive::{Memo, create_effect, create_memo};
@@ -136,6 +136,14 @@ fn ghost_takes_tab(
     primary: bool,
 ) -> bool {
     ghost_at.is_some() && ghost_at == caret && !list_open && !shift && !primary
+}
+
+/// Does this ↑/↓ move the completion list's selection? Only bare: with Shift
+/// it selects lines, with Alt it moves one, with Ctrl it scrolls — and the list
+/// took all three, so Shift+↓ walked the rows instead of extending the
+/// selection. A modified arrow closes the list and does its own work.
+fn list_takes_arrow(mods: Modifiers) -> bool {
+    mods.is_empty()
 }
 
 /// Does this →, with the primary modifier held, take one word of the inline
@@ -2582,14 +2590,18 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         if comp.open.get_untracked() {
             let len = comp.items.with_untracked(|v| v.len());
             if len > 0 {
-                if matches!(
-                    kp.key,
-                    KeyInput::Keyboard(Key::Named(NamedKey::ArrowDown), _)
-                ) {
+                if list_takes_arrow(mods)
+                    && matches!(
+                        kp.key,
+                        KeyInput::Keyboard(Key::Named(NamedKey::ArrowDown), _)
+                    )
+                {
                     comp.sel.update(|i| *i = (*i + 1) % len);
                     return CommandExecuted::Yes;
                 }
-                if matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::ArrowUp), _)) {
+                if list_takes_arrow(mods)
+                    && matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::ArrowUp), _))
+                {
                     comp.sel.update(|i| *i = (*i + len - 1) % len);
                     return CommandExecuted::Yes;
                 }
@@ -2613,12 +2625,15 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             // A caret-moving key (not list-nav/accept above) leaves the popup
             // anchored to a stale position → close it, but let the caret still
             // move (fall through to the default handler). Typing recomputes it.
+            // A modified ↑/↓ — Shift selecting, Alt moving the line — is one.
             if matches!(
                 kp.key,
                 KeyInput::Keyboard(
                     Key::Named(
                         NamedKey::ArrowLeft
                             | NamedKey::ArrowRight
+                            | NamedKey::ArrowUp
+                            | NamedKey::ArrowDown
                             | NamedKey::Home
                             | NamedKey::End
                             | NamedKey::PageUp
@@ -6448,7 +6463,23 @@ mod cmdk_preview_gate {
 
 #[cfg(test)]
 mod ghost_key_tests {
-    use super::{ghost_takes_tab, ghost_takes_word};
+    use super::{ghost_takes_tab, ghost_takes_word, list_takes_arrow};
+    use floem::keyboard::Modifiers;
+
+    /// Only a bare ↑/↓ walks the completion list; with any modifier the key
+    /// does its own work.
+    #[test]
+    fn only_a_bare_arrow_walks_the_completion_list() {
+        assert!(list_takes_arrow(Modifiers::empty()));
+        for m in [
+            Modifiers::SHIFT,
+            Modifiers::ALT,
+            Modifiers::CONTROL,
+            Modifiers::META,
+        ] {
+            assert!(!list_takes_arrow(m), "{m:?}");
+        }
+    }
 
     /// Ctrl+→ (Cmd+→ on macOS) takes one word of the prediction at its caret.
     #[test]

@@ -23437,8 +23437,10 @@ existing prose was left alone.
     an ordinary replacement whose replacement does not contain the needle that list is **empty**, so
     the bar reported no matches, `n/total` collapsed and Enter did nothing, over a document that still
     held every occurrence: the screen read as though the replace had happened.
-    **Enter is a newline once the word is typed in full.** With the list open, ↑/↓ move the
-    selection and Enter or Tab accept `items[sel]` — except Enter with `comp.word_complete` set and
+    **Enter is a newline once the word is typed in full.** With the list open, a bare ↑/↓ moves the
+    selection (`list_takes_arrow`: with Shift, Alt or Ctrl the arrow closes the list and does its
+    own work — Shift+↓ used to walk the rows instead of extending the selection) and Enter or Tab
+    accept `items[sel]` — except Enter with `comp.word_complete` set and
     the selection still on row 0, which closes the list and lets the key through to the editor.
     The exact match is never a row (under `core/rank.rs`), so after `FROM` the list held
     `FROM_BASE64()` and `FROM_DAYS()`, and Enter, meant to end the line, accepted the first. An
