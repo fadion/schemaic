@@ -1850,6 +1850,13 @@ existing prose was left alone.
     `customers ` | `ON ` | `o` | `.customer_id`. A non-ASCII character is a word character there
     too, as `is_word_byte` has it, and the answer is never 0 for a non-empty text, so every press
     takes something (`a_prediction_is_taken_a_word_at_a_time`; the key is under `editor_pane.rs`).
+    It takes the editor's `SqlDialect`, for two reasons. A quoted name or a string is one word,
+    read through `skip_noncode` in that dialect — `"order details".id` goes `"order details"` |
+    `.id`, `[order details] ON ` goes `[order details] ` | `ON ` — since a press that stopped
+    inside the quotes would leave the buffer holding half a name, and every keystroke after it
+    inside an open quote. And a word's characters include `sql::continues_name`'s, so `$`
+    everywhere and T-SQL's `@`/`#` keep a name whole: `@total + 1` goes `@total ` | `+ 1`
+    (`a_press_takes_a_quoted_name_whole`).
     It also refuses a caret in a string, comment or quoted name, and
     that is `caret_touches_noncode` walking only the text *before* the caret through `skip_noncode`,
     so an unterminated quote or a line comment running up to the caret counts as the caret being
@@ -1870,7 +1877,12 @@ existing prose was left alone.
     red first; `nothing_is_predicted_mid_line_or_for_a_word_already_there`). There its trailing
     whitespace is trimmed, since the space already after the caret stands in for it (`BY`, not
     `BY `). The auto-paired `)` counts only at a line's end (`closed` is read only there), so a
-    caret against one mid-line, as in `INSERT INTO t (|) VALUES (1)`, gets no ghost.
+    caret against one mid-line, as in `INSERT INTO t (|) VALUES (1)`, gets no ghost. **Nor does
+    one go in a line's leading indentation**: with nothing but whitespace before the caret on its
+    line and the line's code after it — `JOIN\n  |  WHERE …`, `ORDER\n| LIMIT 10` — the caret is
+    re-indenting that clause, not writing in front of it, and a ghost would split the clause off
+    its indent. A blank indented line, where the statement goes on, still predicts
+    (`nothing_is_predicted_in_a_lines_leading_indentation`).
     **A line's end is not the statement's: whatever follows the caret, on this line or the ones
     below, is what the ghost is written in front of**, and one rule holds it in both places. The
     first word after the caret up to the statement's end (`statement_range`, so its `;`) must open a
@@ -1921,8 +1933,14 @@ existing prose was left alone.
     (`partition_and_group_predict_by_only_where_they_partition_or_group`). `PRIMARY`/`FOREIGN`
     take `KEY` except after `CREATE`, `ALTER`, `DROP`, `IMPORT` or `ON`, where the word names an
     object — PostgreSQL's `CREATE FOREIGN TABLE`, `IMPORT FOREIGN SCHEMA` and
-    `ON FOREIGN DATA WRAPPER`, T-SQL's `CREATE PRIMARY XML INDEX`
-    (`primary_and_foreign_predict_key_only_in_a_definition`). A join word
+    `ON FOREIGN DATA WRAPPER`, T-SQL's `CREATE PRIMARY XML INDEX` — and anywhere in a statement
+    where it can only name one: `CREATE SERVER s FOREIGN DATA WRAPPER` (PostgreSQL and MySQL) and
+    `ALTER EXTENSION e ADD FOREIGN TABLE`. Those are read off the statement's first two words, not
+    the word before, which a `CREATE SERVER`'s `TYPE 'x' VERSION '1'` can stand between
+    (`primary_and_foreign_predict_key_only_in_a_definition`). `ORDER` takes `BY` except in a
+    `CREATE … COLUMNSTORE INDEX` — `COLUMNSTORE` as the statement's second or third word, so
+    `CLUSTERED`/`NONCLUSTERED` may come between — whose T-SQL ordered form takes `ORDER (col)`
+    with no `BY` (`a_columnstore_index_order_predicts_no_by`). A join word
     predicts `JOIN` only where a join can go, since `LEFT`/`RIGHT` are string functions too —
     `in_join_position` reads the word's own query from `local_scope_start` through `scan_clauses`
     and wants a `FROM`, join, `ON` or `USING` clause, or an `UPDATE`'s table list where
@@ -23377,7 +23395,8 @@ existing prose was left alone.
     Shift+primary+→ still selects by word and a plain → still moves
     (`primary_right_at_the_predictions_caret_takes_a_word`,
     `a_word_is_taken_only_by_primary_right_at_a_live_prediction`). The word is
-    `intel::prediction_word_end`'s, inserted through `edit_untyped` as Tab's is; the rest goes back
+    `intel::prediction_word_end`'s in the editor's dialect (so a quoted name goes whole, under
+    `intel.rs`), inserted through `edit_untyped` as Tab's is; the rest goes back
     as a `kept` ghost at the new caret, stamped with the document's length after the insert, and is
     **published last**, after every caret change the insert makes — so the effect that clears a
     ghost whose offset is not the caret never sees it at a stale one. Escape turns a ghost down as it

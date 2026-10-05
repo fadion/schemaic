@@ -12653,8 +12653,8 @@ fn is_real_statement(stmt: &sqlparser::ast::Statement) -> bool {
 /// **Where a ghost can be drawn, and nowhere else**: at the end of a line
 /// (nothing after the caret but whitespace, the `)` bracket pairing put there
 /// and the statement's own closing `;`) or mid-line in front of the next
-/// clause ([`starts_a_clause`]), straight after whitespace or a `(`,
-/// and in code — a caret a string, comment or quoted name runs up to predicts
+/// clause ([`starts_a_clause`]) but not from the line's leading indentation,
+/// straight after whitespace or a `(`, and in code — a caret a string, comment or quoted name runs up to predicts
 /// nothing. And never the word the statement already has next, so editing
 /// `ORDER |` above an existing `BY` offers no second one. **What the statement
 /// says after the caret, on the lines below too, is what the prediction is
@@ -12678,6 +12678,12 @@ pub fn predict(sql: &str, caret: usize, catalog: &Catalog, dialect: SqlDialect) 
     let at_end = rest.chars().all(|c| c == ')');
     let mid_line = !at_end && starts_a_clause(line_rest);
     if !at_end && !mid_line {
+        return None;
+    }
+    // Nor in a line's leading indentation with the line's code after it: that
+    // caret is re-indenting the clause, and a ghost would split it off its indent.
+    let line_start = sql[..caret].rfind('\n').map_or(0, |i| i + 1);
+    if mid_line && sql[line_start..caret].trim().is_empty() {
         return None;
     }
     let closed = at_end && rest.starts_with(')');
@@ -13051,23 +13057,43 @@ fn first_code_line(text: &str, dialect: SqlDialect) -> Option<&str> {
 /// `.customer_id`. A character outside ASCII is a word character, as
 /// [`is_word_byte`] has it. Never `0` for a non-empty `text`, so each press
 /// takes something.
-pub fn prediction_word_end(text: &str) -> usize {
-    let word = |c: char| !c.is_ascii() || c.is_ascii_alphanumeric() || c == '_' || c == '$';
-    let punct = |c: char| !word(c) && !c.is_whitespace();
-    let space = |c: char| c.is_whitespace();
-    let classes: [&dyn Fn(char) -> bool; 4] = [&punct, &space, &word, &space];
-    let mut end = 0;
-    let mut chars = text.char_indices().peekable();
-    for class in classes {
-        while let Some(&(i, c)) = chars.peek() {
-            if !class(c) {
-                break;
-            }
-            end = i + c.len_utf8();
-            chars.next();
+///
+/// A quoted name or a string is one word, read through [`skip_noncode`] in
+/// `dialect`: `"order details".id` goes `"order details"`, `.id` — a press
+/// that stopped inside the quotes would leave the buffer holding half a name
+/// and every keystroke after it inside a quote.
+pub fn prediction_word_end(text: &str, dialect: SqlDialect) -> usize {
+    let b = text.as_bytes();
+    let space = |c: u8| c.is_ascii_whitespace();
+    let word = |c: u8| is_word_byte(c) || crate::sql::continues_name(c, dialect);
+    let quoted = |i: usize| skip_noncode(b, i, dialect).filter(|&end| end > i);
+    let mut i = 0;
+    // Punctuation leading into the word — up to a quote, which starts it.
+    while i < b.len() && !space(b[i]) && !word(b[i]) && quoted(i).is_none() {
+        i += 1;
+    }
+    while i < b.len() && space(b[i]) {
+        i += 1;
+    }
+    // The word itself: its own characters and any quoted span joined to them.
+    while i < b.len() {
+        if let Some(end) = quoted(i) {
+            i = end;
+        } else if word(b[i]) {
+            i += 1;
+        } else {
+            break;
         }
     }
-    end
+    while i < b.len() && space(b[i]) {
+        i += 1;
+    }
+    // Every class boundary above falls on an ASCII byte or the span's end, so
+    // `i` is a char boundary; the guard keeps a malformed span from splitting one.
+    while !text.is_char_boundary(i) {
+        i += 1;
+    }
+    i
 }
 
 /// Does a string, comment or quoted name run up to (or past) `caret`, reading
@@ -13219,8 +13245,11 @@ fn keyword_partner(sql: &str, lo: usize, toks: &[Token], dialect: SqlDialect) ->
     // The statement's second word follows its first: `CREATE OR`, `CREATE UNIQUE`.
     let second_after = |kw: &str| toks.len() == 2 && prev_is(kw);
     let joins = || in_join_position(sql, lo, last.at, dialect);
+    let head = |i: usize| toks.get(i).and_then(bare_upper);
+    let head_has = |kw: &str, within: usize| (1..within).any(|i| head(i).as_deref() == Some(kw));
     let partner = match w.to_ascii_uppercase().as_str() {
-        "ORDER" => "BY ",
+        // T-SQL's ordered columnstore index takes `ORDER (col)`, no `BY`.
+        "ORDER" if !(head(0).as_deref() == Some("CREATE") && head_has("COLUMNSTORE", 3)) => "BY ",
         "GROUP" if groups_rows(sql, lo, last.at, prev.as_deref(), dialect) => "BY ",
         "PARTITION" if declares_a_partitioning(toks) => "BY ",
         "LEFT" | "RIGHT" | "INNER" if joins() => "JOIN ",
@@ -13238,11 +13267,16 @@ fn keyword_partner(sql: &str, lo: usize, toks: &[Token], dialect: SqlDialect) ->
         "CROSS" if !has_apply_joins(dialect) && joins() => "JOIN ",
         // Not where the word names an object: PostgreSQL's `CREATE FOREIGN
         // TABLE`, `IMPORT FOREIGN SCHEMA`, `ON FOREIGN DATA WRAPPER`; T-SQL's
-        // `CREATE PRIMARY XML INDEX`.
+        // `CREATE PRIMARY XML INDEX`. Nor in a statement where it can only
+        // name one: `CREATE SERVER s FOREIGN DATA WRAPPER` (PostgreSQL and
+        // MySQL) and `ALTER EXTENSION e ADD FOREIGN TABLE`.
         "PRIMARY" | "FOREIGN"
             if !matches!(
                 prev.as_deref(),
                 Some("CREATE" | "ALTER" | "DROP" | "IMPORT" | "ON")
+            ) && !matches!(
+                (head(0).as_deref(), head(1).as_deref()),
+                (Some("CREATE"), Some("SERVER")) | (Some("ALTER"), Some("EXTENSION"))
             ) =>
         {
             "KEY"
@@ -15152,10 +15186,14 @@ mod predict_tests {
 
     /// `text` cut the way repeated Ctrl+→ takes it.
     fn words(text: &str) -> Vec<&str> {
+        words_in(text, SqlDialect::MySql)
+    }
+
+    fn words_in(text: &str, dialect: SqlDialect) -> Vec<&str> {
         let mut out = Vec::new();
         let mut rest = text;
         while !rest.is_empty() {
-            let end = prediction_word_end(rest);
+            let end = prediction_word_end(rest, dialect);
             assert!(end > 0, "a press took nothing of {rest:?}");
             out.push(&rest[..end]);
             rest = &rest[end..];
@@ -15182,7 +15220,33 @@ mod predict_tests {
             ]
         );
         assert_eq!(words("名前, 番号"), ["名前", ", 番号"]);
-        assert_eq!(prediction_word_end(""), 0);
+        assert_eq!(prediction_word_end("", SqlDialect::MySql), 0);
+    }
+
+    /// A quoted name is one word in each engine's quoting, so a press never
+    /// leaves the buffer inside an open quote.
+    #[test]
+    fn a_press_takes_a_quoted_name_whole() {
+        assert_eq!(
+            words_in("\"order details\".id ", SqlDialect::Postgres),
+            ["\"order details\"", ".id "]
+        );
+        assert_eq!(
+            words_in("[order details] ON ", SqlDialect::MsSql),
+            ["[order details] ", "ON "]
+        );
+        assert_eq!(
+            words_in("`order details`, x", SqlDialect::MySql),
+            ["`order details`", ", x"]
+        );
+        assert_eq!(
+            words_in("= 'a b' AND ", SqlDialect::MySql),
+            ["= 'a b' ", "AND "]
+        );
+        assert_eq!(
+            words_in("@total + 1", SqlDialect::MsSql),
+            ["@total ", "+ 1"]
+        );
     }
 
     fn tbl(name: &str, cols: &[&str]) -> TableInfo {
@@ -15369,6 +15433,23 @@ mod predict_tests {
         assert_eq!(
             at_bar("SELECT customer_id, count(*) FROM orders GROUP BY | ORDER BY 2;").as_deref(),
             Some("customer_id")
+        );
+    }
+
+    /// A caret in a line's leading indentation, the line's code after it, is
+    /// someone re-indenting, not writing: a ghost there would split the indent
+    /// from the clause it belongs to. A blank line, where the statement goes
+    /// on, still predicts.
+    #[test]
+    fn nothing_is_predicted_in_a_lines_leading_indentation() {
+        assert_eq!(
+            at_bar("SELECT * FROM orders o JOIN\n  |  WHERE o.id = 1"),
+            None
+        );
+        assert_eq!(at_bar("SELECT id FROM orders ORDER\n| LIMIT 10"), None);
+        assert_eq!(
+            at_bar("SELECT id FROM orders ORDER\n    |").as_deref(),
+            Some("BY ")
         );
     }
 
@@ -16404,6 +16485,30 @@ mod predict_tests {
         assert_eq!(
             pg("ALTER TABLE t ADD CONSTRAINT pk PRIMARY ").as_deref(),
             Some("KEY")
+        );
+        // A statement whose `FOREIGN` can only name a wrapper or a table.
+        assert_eq!(pg("CREATE SERVER films FOREIGN "), None);
+        assert_eq!(
+            pg("CREATE SERVER films TYPE 'x' VERSION '1' FOREIGN "),
+            None
+        );
+        assert_eq!(my("CREATE SERVER s FOREIGN "), None);
+        assert_eq!(pg("ALTER EXTENSION hstore ADD FOREIGN "), None);
+    }
+
+    /// An ordered columnstore index takes `ORDER (col)`; any other `ORDER`
+    /// still takes `BY`.
+    #[test]
+    fn a_columnstore_index_order_predicts_no_by() {
+        let ms = |sql: &str| at_end(sql, SqlDialect::MsSql);
+        assert_eq!(
+            ms("CREATE CLUSTERED COLUMNSTORE INDEX cci ON t ORDER "),
+            None
+        );
+        assert_eq!(ms("CREATE COLUMNSTORE INDEX cci ON t ORDER "), None);
+        assert_eq!(
+            ms("CREATE VIEW v AS SELECT TOP 5 * FROM t ORDER ").as_deref(),
+            Some("BY ")
         );
     }
 

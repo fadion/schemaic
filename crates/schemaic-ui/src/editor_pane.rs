@@ -2673,7 +2673,8 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     return false;
                 }
                 let Some(g) = ghost else { return false };
-                let end = schemaic_core::intel::prediction_word_end(&g.text);
+                let end =
+                    schemaic_core::intel::prediction_word_end(&g.text, dialect.get_untracked());
                 let (word, rest) = g.text.split_at(end);
                 inline_diff::set_ghost(comp.ghost, e, None);
                 if edit_untyped(e, comp, Selection::caret(caret), word, EditType::Completion) {
