@@ -732,6 +732,23 @@ existing prose was left alone.
     5.0 / 20.5 / 80.7 ms at 1 / 4 / 16 MiB — an arrow key's worth of UI-thread work to locate a
     statement whose actual work, `intel::signature_help` on the isolated statement, is 8 µs. `None`
     keeps the full walk, which is what every other caller wants.
+    **Which segment the caret means is `caret_segment`'s, the one choice `statement_range` and
+    `run_current_bounds` share** — so Run at the caret's outline and what `executable_at` sends
+    are chosen there too. It is the segment the caret falls in, save in two places where it means
+    the statement before: a blank segment, as after the final `;`; and the rest of the line a `;`
+    ends — only spaces, tabs or a `\r` between that bound and the caret, and nothing but whitespace
+    or a comment after the caret on its line. A segment starts straight after its `;`, so with
+    `SELECT 1;⏎SELECT 2;` and the caret at the end of the first line — the end of the line just
+    typed, where Ctrl+Enter is pressed most — Run Current ran `SELECT 2`, the statement below it.
+    Code after the caret on that line still means the next statement (`SELECT 1;| SELECT 2;`),
+    since the caret's own statement then starts there
+    (`a_caret_at_a_lines_closing_semicolon_is_in_that_statement`, over every dialect and through
+    `statement_range`, `run_current_range` and `executable_at` alike). **What the statement is and
+    whether the caret is in it are two questions**: `statement_range_ended` is the range plus
+    whether the choice fell back past that statement's terminator, and `statement_range` is its
+    first half. Falling back is right for Ctrl+Enter and wrong for anything that writes at the
+    caret, which is why `intel::predict` and `Recall::at` ask for the second half and refuse there
+    (`the_caret_is_past_a_statement_only_after_its_terminator`; see `intel.rs`).
     **`unsafe_reason` asks first about what destroys stored rows, and about nothing else.** It is
     the warning behind `first_unsafe`, which `run_verdict` turns into `Confirm` whatever
     `confirm_writes` says: `every_row_reason` (below), or `drop_reason`, a statement that destroys
@@ -1809,7 +1826,13 @@ existing prose was left alone.
     It also refuses a caret in a string, comment or quoted name, and
     that is `caret_touches_noncode` walking only the text *before* the caret through `skip_noncode`,
     so an unterminated quote or a line comment running up to the caret counts as the caret being
-    inside one — the one boundary lexer, not a new scanner.
+    inside one — the one boundary lexer, not a new scanner. **Nor does it answer past the
+    statement's end** — after the `;` that closes it, on the rest of that line or the blank lines
+    below — which `sql::statement_range_ended` reports, since `statement_range` there answers the
+    statement *before* the caret: a caret on the line after `DELETE FROM t;`, or after a space
+    following its `;`, read `DELETE FROM t` and ghosted `WHERE `, which Tab wrote after the `;`
+    (`a_caret_past_a_finished_statement_predicts_nothing`). Back in front of that `;`
+    (`DELETE FROM t |;`) it still predicts.
     **Mid-line, a ghost goes only in front of the next clause.** `starts_a_clause` wants whitespace
     straight after the caret, then a whole word from `CLAUSE_OPENERS` (`FROM`, `WHERE`, `ORDER`,
     `LIMIT`, the join words, `ON`, `USING`, `SET`, `VALUES`, `INTO`, …): `ORDER | LIMIT 10` is two
@@ -2219,7 +2242,8 @@ existing prose was left alone.
     memory; nothing may follow the caret in the statement but the `)`s bracket pairing made and a
     `;`, not even the next clause on another line, since a statement being edited in the middle is
     not the one run before; and the caret wants whitespace or `(` before it and code under it
-    (`caret_touches_noncode`, as above). **Inside an auto-paired `(…)`** the remembered line must
+    (`caret_touches_noncode`, as above), and the statement not already ended behind it
+    (`sql::statement_range_ended`, which `predict` refuses on too). **Inside an auto-paired `(…)`** the remembered line must
     end in as many `)` as follow the caret, and is offered without them: `IN (|)` over a past
     `IN (1, 2)` offers `1, 2`, while one that runs on past the paren (`IN (1, 2) ORDER BY id`)
     offers nothing, since all of it would land inside the `)`. That spot used to be refused outright

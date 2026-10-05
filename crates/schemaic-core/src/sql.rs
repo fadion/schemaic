@@ -1582,16 +1582,9 @@ fn run_current_bounds(sql: &str, offset: usize, dialect: SqlDialect) -> (usize, 
         at: sql.len(),
         strip: 0,
     });
-    let mut k = 0;
-    for (w, b) in bounds.iter().enumerate().take(bounds.len() - 1) {
-        if b.at <= offset {
-            k = w;
-        }
-    }
-    // The same fallback `statement_range` makes: a caret sitting after the
-    // final `;` is in a blank segment and means the statement before it.
-    let (lo, hi) = trim_range(sql, bounds[k].at, bounds[k + 1].at);
-    let k = if lo == hi && k > 0 { k - 1 } else { k };
+    // The same choice `statement_range` makes, from the same function.
+    let ats: Vec<usize> = bounds.iter().map(|b| b.at).collect();
+    let k = caret_segment(sql, &ats, offset, dialect);
     let (lo, hi) = (bounds[k].at, bounds[k + 1]);
     // The first `;` past the caret that only the batch scope held ends it.
     match soft.iter().find(|&&s| s > offset && s > lo && s < hi.at) {
@@ -1613,6 +1606,23 @@ fn run_current_bounds(sql: &str, offset: usize, dialect: SqlDialect) -> (usize, 
 /// so the answer is unchanged; only the boundaries *after* the caret's
 /// statement go unvisited, and nothing here ever read them.
 pub fn statement_range(sql: &str, offset: usize, dialect: SqlDialect) -> (usize, usize) {
+    statement_range_ended(sql, offset, dialect).0
+}
+
+/// [`statement_range`], and whether the caret is **past that statement's
+/// end** — after the terminator that closes it, as on the blank line below a
+/// `DELETE FROM t;` or after a space following its `;`.
+///
+/// What the statement *is* and whether the caret is *in* it are two
+/// questions. The range answers the statement before the caret there, which is
+/// right for Ctrl+Enter and wrong for anything that writes at the caret: the
+/// inline ghost read `DELETE FROM t` and offered `WHERE` on the line after its
+/// `;`.
+pub fn statement_range_ended(
+    sql: &str,
+    offset: usize,
+    dialect: SqlDialect,
+) -> ((usize, usize), bool) {
     let offset = offset.min(sql.len());
     let mut delim: Vec<u8> = vec![b';'];
     let mut bounds: Vec<usize> = scan_bounds(sql, dialect, &mut delim, true, Some(offset))
@@ -1625,18 +1635,50 @@ pub fn statement_range(sql: &str, offset: usize, dialect: SqlDialect) -> (usize,
     if bounds.last().is_none_or(|&last| last <= offset) {
         bounds.push(sql.len());
     }
+    let k = caret_segment(sql, &bounds, offset, dialect);
+    // Past it exactly when the choice fell back to the segment before the
+    // caret's own — whose end bound is then a real one, not the closing
+    // document end the caret may sit at.
+    (
+        trim_range(sql, bounds[k], bounds[k + 1]),
+        k + 2 < bounds.len() && offset >= bounds[k + 1],
+    )
+}
+
+/// Which segment of `bounds` (ascending, closed by the document's end) the
+/// caret at `offset` means — the one choice [`statement_range`] and
+/// [`run_current_range`] share.
+///
+/// The segment the caret falls in, except in two places where it means the
+/// statement before:
+///
+/// - **a blank segment**, as after the final `;`;
+/// - **the rest of the line a `;` ends** — only spaces between the bound and
+///   the caret, and no code after the caret on its line. A segment starts right
+///   after its `;`, so the caret at the end of `SELECT 1;⏎SELECT 2;`'s first
+///   line used to be in the second statement, and Ctrl+Enter there — the end of
+///   the line just typed — ran the statement below it.
+fn caret_segment(sql: &str, bounds: &[usize], offset: usize, dialect: SqlDialect) -> usize {
     let mut k = 0;
     for (w, &b) in bounds.iter().enumerate().take(bounds.len() - 1) {
         if b <= offset {
             k = w;
         }
     }
-    let (lo, hi) = trim_range(sql, bounds[k], bounds[k + 1]);
-    if lo == hi && k > 0 {
-        // Blank segment (e.g. caret after the final `;`) → previous statement.
-        return trim_range(sql, bounds[k - 1], bounds[k]);
+    if k == 0 {
+        return k;
     }
-    (lo, hi)
+    let (lo, hi) = trim_range(sql, bounds[k], bounds[k + 1]);
+    if lo == hi {
+        return k - 1;
+    }
+    let (plo, phi) = trim_range(sql, bounds[k - 1], bounds[k]);
+    let gap = &sql.as_bytes()[bounds[k]..offset];
+    let eol = sql[offset..].find('\n').map_or(sql.len(), |p| offset + p);
+    let ends_the_line = plo < phi
+        && gap.iter().all(|&c| c == b' ' || c == b'\t' || c == b'\r')
+        && !segment_has_code(sql, offset, eol, dialect);
+    if ends_the_line { k - 1 } else { k }
 }
 
 /// The trimmed byte range **Run at the caret runs** — the one the editor
@@ -8650,6 +8692,68 @@ line */",
         assert_eq!(&"SELECT 1"[lo..hi], "SELECT 1");
     }
 
+    /// **A caret right after a `;` is in the statement that `;` ends**, not the
+    /// next one — the commonest spot for Ctrl+Enter, the end of the line just
+    /// typed. Whitespace or a comment between the two on that line changes
+    /// nothing; code after the caret on the same line does, since that is where
+    /// the caret's statement then starts.
+    #[test]
+    fn a_caret_at_a_lines_closing_semicolon_is_in_that_statement() {
+        let ends_line_one = [
+            ("SELECT 1;\nSELECT 2;", 9),
+            ("SELECT 1;   \nSELECT 2;", 12),
+            ("SELECT 1;   \nSELECT 2;", 10),
+            ("SELECT 1; -- note\nSELECT 2;", 9),
+            ("SELECT 1;\r\nSELECT 2;", 9),
+        ];
+        for (sql, caret) in ends_line_one {
+            for d in SqlDialect::ALL {
+                let (lo, hi) = super::statement_range(sql, caret, d);
+                assert_eq!(&sql[lo..hi], "SELECT 1;", "{d:?} {sql:?} at {caret}");
+                let (lo, hi) = super::run_current_range(sql, caret, d);
+                assert_eq!(&sql[lo..hi], "SELECT 1;", "{d:?} {sql:?} at {caret}");
+                assert_eq!(
+                    super::executable_at(sql, caret, d),
+                    super::executable_at(sql, 3, d),
+                    "{d:?} {sql:?} at {caret}"
+                );
+            }
+        }
+        // Code after the caret on its line, or the caret on the next line: the
+        // next statement.
+        for (sql, caret) in [
+            ("SELECT 1; SELECT 2;", 9),
+            ("SELECT 1;SELECT 2;", 9),
+            ("SELECT 1;\nSELECT 2;", 10),
+        ] {
+            let (lo, hi) = statement_range(sql, caret);
+            assert_eq!(&sql[lo..hi], "SELECT 2;", "{sql:?} at {caret}");
+        }
+    }
+
+    /// `statement_range_ended` says the caret is past its statement exactly
+    /// where the range fell back to the statement before the caret.
+    #[test]
+    fn the_caret_is_past_a_statement_only_after_its_terminator() {
+        let ended =
+            |sql: &str, caret: usize| super::statement_range_ended(sql, caret, SqlDialect::MySql).1;
+        // Past: after the `;`, on its line or the blank lines below.
+        assert!(ended("DELETE FROM t;", 14));
+        assert!(ended("DELETE FROM t; ", 15));
+        assert!(ended("DELETE FROM t;\n", 15));
+        assert!(ended("SELECT 1;\n\n", 10));
+        assert!(ended("SELECT 1;\nSELECT 2;", 9));
+        let proc = "DELIMITER //\nCREATE PROCEDURE p() BEGIN SELECT 1; END//\n";
+        assert!(ended(proc, proc.len()));
+        assert!(!ended(proc, proc.len() - 3));
+        // In it: anywhere up to its terminator, or with no terminator at all.
+        assert!(!ended("DELETE FROM t;", 13));
+        assert!(!ended("DELETE FROM t ", 14));
+        assert!(!ended("DELETE FROM t", 13));
+        assert!(!ended("SELECT 1;\nSELECT 2;", 10));
+        assert!(!ended("", 0));
+    }
+
     /// **Stopping at the caret's statement must not change the answer.**
     ///
     /// `statement_range` now cuts the boundary walk short instead of scanning
@@ -8672,17 +8776,8 @@ line */",
         fn full_scan(sql: &str, offset: usize, dialect: SqlDialect) -> (usize, usize) {
             let offset = offset.min(sql.len());
             let bounds = statement_bounds(sql, dialect);
-            let mut k = 0;
-            for (w, &b) in bounds.iter().enumerate().take(bounds.len() - 1) {
-                if b <= offset {
-                    k = w;
-                }
-            }
-            let (lo, hi) = trim_range(sql, bounds[k], bounds[k + 1]);
-            if lo == hi && k > 0 {
-                return trim_range(sql, bounds[k - 1], bounds[k]);
-            }
-            (lo, hi)
+            let k = caret_segment(sql, &bounds, offset, dialect);
+            trim_range(sql, bounds[k], bounds[k + 1])
         }
 
         let corpora = [

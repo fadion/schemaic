@@ -12622,8 +12622,10 @@ pub fn predict(sql: &str, caret: usize, catalog: &Catalog, dialect: SqlDialect) 
     if !(before.is_whitespace() || before == '(') {
         return None;
     }
-    let (lo, hi) = crate::sql::statement_range(sql, caret, dialect);
-    if lo > caret || caret_touches_noncode(sql, lo, caret, dialect) {
+    // Past a finished statement there is nothing to continue: the range is the
+    // statement *before* the caret, and its next word would land after its `;`.
+    let ((lo, hi), ended) = crate::sql::statement_range_ended(sql, caret, dialect);
+    if ended || lo > caret || caret_touches_noncode(sql, lo, caret, dialect) {
         return None;
     }
     let toks = tokenize_range(sql, lo, caret, dialect);
@@ -12850,8 +12852,9 @@ impl Recall {
         if !(before.is_whitespace() || before == '(') {
             return None;
         }
-        let (lo, hi) = crate::sql::statement_range(sql, caret, dialect);
-        if lo > caret || caret_touches_noncode(sql, lo, caret, dialect) {
+        // Past a finished statement, as `predict` refuses it.
+        let ((lo, hi), ended) = crate::sql::statement_range_ended(sql, caret, dialect);
+        if ended || lo > caret || caret_touches_noncode(sql, lo, caret, dialect) {
             return None;
         }
         let after = sql.get(caret..hi.max(caret))?.trim();
@@ -15051,6 +15054,37 @@ mod predict_tests {
         assert_eq!(
             at_end("SELECT * FROM a LEFT ", SqlDialect::MsSql).as_deref(),
             Some("JOIN ")
+        );
+    }
+
+    /// **A caret past a finished statement predicts nothing.** `statement_range`
+    /// answers the statement before a blank segment, so a caret after
+    /// `DELETE FROM t;` read `DELETE FROM t` and offered its `WHERE` — which Tab
+    /// then wrote after the `;`, as a statement of its own.
+    #[test]
+    fn a_caret_past_a_finished_statement_predicts_nothing() {
+        for d in SqlDialect::ALL {
+            assert_eq!(at_end("DELETE FROM t;\n", d), None, "{d:?}");
+            assert_eq!(at_end("DELETE FROM t; ", d), None, "{d:?}");
+            assert_eq!(at_end("SELECT * FROM orders;\n\n", d), None, "{d:?}");
+            assert_eq!(at_end("SELECT *;\n", d), None, "{d:?}");
+            // The statement itself still does, and so does the next one.
+            assert_eq!(
+                at_end("DELETE FROM t ", d).as_deref(),
+                Some("WHERE "),
+                "{d:?}"
+            );
+            assert_eq!(
+                at_end("SELECT 1;\nDELETE FROM t ", d).as_deref(),
+                Some("WHERE ")
+            );
+        }
+        // Back inside a finished statement, in front of its own `;`, still does.
+        let sql = "DELETE FROM t ;";
+        let cat = Catalog::build(&[("shop", &shop())], Some("shop"));
+        assert_eq!(
+            predict(sql, sql.len() - 1, &cat, SqlDialect::MySql).as_deref(),
+            Some("WHERE ")
         );
     }
 
