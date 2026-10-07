@@ -923,20 +923,28 @@ fn opens_block(before: &str, in_code: impl Fn(usize) -> bool) -> bool {
     }
 }
 
-/// Typing `ch` at a bare caret (`sel_a == sel_b`) when it completes `END` as
-/// the only word on its line: the edit that puts the line at the indent of
-/// the line whose `BEGIN` or `CASE` it closes ([`crate::pairs::match_block`]),
-/// `ch` included. `None` — the character types as usual — when it does not
-/// complete such an `END`, there is more on the line, nothing matches, or the
-/// line is already at that indent.
-pub fn dedent_typed_end(
+/// Typing `ch` at a bare caret (`sel_a == sel_b`) when it completes a block
+/// word as the only word on its line: the edit that moves the line where the
+/// block puts it, `ch` included —
+///
+/// - `END`: to the indent of the line whose `BEGIN` or `CASE` it closes
+///   ([`crate::pairs::match_block`]);
+/// - `WHEN`, `ELSE`: one `unit` under the line of the `CASE` they are in
+///   ([`crate::pairs::enclosing_block`]); an `ELSE` in any other block is not
+///   a `CASE`'s and is left alone.
+///
+/// `None` — the character types as usual — when it completes no such word,
+/// there is more on the line, there is no block, or the line is already where
+/// it belongs.
+pub fn dedent_typed_word(
     full: &str,
     sel_a: usize,
     sel_b: usize,
     ch: char,
+    unit: &str,
     dialect: SqlDialect,
 ) -> Option<IndentEdit> {
-    if sel_a != sel_b || !ch.eq_ignore_ascii_case(&'d') {
+    if sel_a != sel_b {
         return None;
     }
     let caret = floor_char(full, sel_a);
@@ -947,17 +955,31 @@ pub fn dedent_typed_end(
     }
     let before = &full[ls..caret];
     let word = before.trim_start_matches([' ', '\t']);
-    if !word.eq_ignore_ascii_case("EN") {
-        return None;
-    }
+    let completes = |w: &str| {
+        word.len() + 1 == w.len()
+            && w[..word.len()].eq_ignore_ascii_case(word)
+            && ch.eq_ignore_ascii_case(&(w.as_bytes()[word.len()] as char))
+    };
     // Asked of the text as it will be, with `ch` typed.
     let typed = format!("{}{ch}{}", &full[..caret], &full[caret..]);
-    let end_at = caret - word.len();
-    let (_, (opener, _)) = crate::pairs::match_block(&typed, end_at, dialect)?;
-    let ols = typed[..opener].rfind('\n').map_or(0, |i| i + 1);
-    let line = &typed[ols..];
-    let indent = &line[..line.len() - line.trim_start_matches([' ', '\t']).len()];
-    if indent == &before[..before.len() - word.len()] {
+    let word_at = caret - word.len();
+    let indent_of = |at: usize| {
+        let line = &typed[typed[..at].rfind('\n').map_or(0, |i| i + 1)..];
+        line[..line.len() - line.trim_start_matches([' ', '\t']).len()].to_string()
+    };
+    let indent = if completes("END") {
+        let (_, (opener, _)) = crate::pairs::match_block(&typed, word_at, dialect)?;
+        indent_of(opener)
+    } else if completes("WHEN") || completes("ELSE") {
+        let (case, _, is_case) = crate::pairs::enclosing_block(&typed, word_at, dialect)?;
+        if !is_case {
+            return None;
+        }
+        format!("{}{unit}", indent_of(case))
+    } else {
+        return None;
+    };
+    if indent == before[..before.len() - word.len()] {
         return None;
     }
     let text = format!("{indent}{word}{ch}");
@@ -1911,7 +1933,7 @@ mod tests {
         let typed = |src: &str, ch: char, d| {
             let at = src.find('|').unwrap();
             let clean = src.replacen('|', "", 1);
-            dedent_typed_end(&clean, at, at, ch, d).map(|e| {
+            dedent_typed_word(&clean, at, at, ch, "  ", d).map(|e| {
                 let mut out = format!("{}{}{}", &clean[..e.start], e.text, &clean[e.end..]);
                 out.insert(e.sel.0, '|');
                 out
@@ -1936,6 +1958,42 @@ mod tests {
         assert_eq!(typed("-- BEGIN\n  EN|", 'D', MsSql), None);
         assert_eq!(typed("BEGIN\n  x;\n  EN| -- c", 'D', MsSql), None);
         assert_eq!(typed("BEGIN\n  x;\n  EN|", 'X', MsSql), None);
+    }
+
+    /// `WHEN` and `ELSE` typed as a line's only word inside a `CASE` go one
+    /// unit under the `CASE`'s line — the layout Format gives them — and an
+    /// `ELSE` in any other block is left where it is.
+    #[test]
+    fn typing_a_case_branch_indents_it_under_its_case() {
+        use SqlDialect::{MsSql, MySql};
+        let typed = |src: &str, ch: char, d| {
+            let at = src.find('|').unwrap();
+            let clean = src.replacen('|', "", 1);
+            dedent_typed_word(&clean, at, at, ch, "  ", d).map(|e| {
+                let mut out = format!("{}{}{}", &clean[..e.start], e.text, &clean[e.end..]);
+                out.insert(e.sel.0, '|');
+                out
+            })
+        };
+        assert_eq!(
+            typed("SELECT CASE\nWHE|", 'N', MySql).as_deref(),
+            Some("SELECT CASE\n  WHEN|")
+        );
+        assert_eq!(
+            typed("  case\n    when a then 1\n          els|", 'e', MySql).as_deref(),
+            Some("  case\n    when a then 1\n    else|")
+        );
+        assert_eq!(
+            typed("SELECT CASE\n  WHE|", 'N', MySql),
+            None,
+            "already there"
+        );
+        assert_eq!(
+            typed("BEGIN\n  IF x = 1\n    SET a = 1\n      ELS|", 'E', MsSql),
+            None,
+            "an IF's ELSE"
+        );
+        assert_eq!(typed("SELECT a\nWHE|", 'N', MySql), None, "no CASE");
     }
 
     /// Not a block: the word is part of a name, in a comment or string, or a

@@ -3413,16 +3413,16 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             });
             return CommandExecuted::Yes;
         }
-        // Typing the `D` of a line's lone `END` puts the line at the indent of
-        // the `BEGIN`/`CASE` it closes (`text_ops::dedent_typed_end`). Same
-        // shape as the auto-pair below — the edit made here, floem's own
+        // Typing the last letter of a line's lone `END`, `WHEN` or `ELSE` puts
+        // the line where its block puts it (`text_ops::dedent_typed_word`).
+        // Same shape as the auto-pair below — the edit made here, floem's own
         // insert suppressed through `read_only`, a freeze left alone — and the
-        // edit is `InsertChars`, so it undoes with the word it finished.
+        // edit is `InsertChars`, so it undoes with the typing it finished.
         if !primary_held(mods)
             && !mods.alt()
             && let KeyInput::Keyboard(Key::Character(cs), _) = &kp.key
             && let Some(ch) = single_char(cs)
-            && ch.eq_ignore_ascii_case(&'d')
+            && matches!(ch.to_ascii_lowercase(), 'd' | 'n' | 'e')
         {
             let dia = dialect.get_untracked();
             let acted = editor_sig.with_untracked(|e| {
@@ -3436,7 +3436,9 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 let cur = e.cursor.get_untracked();
                 let off = cur.offset();
                 let (a, b) = cur.get_selection().unwrap_or((off, off));
-                let Some(edit) = schemaic_core::text_ops::dedent_typed_end(&full, a, b, ch, dia)
+                let unit = indent_unit();
+                let Some(edit) =
+                    schemaic_core::text_ops::dedent_typed_word(&full, a, b, ch, &unit, dia)
                 else {
                     return false;
                 };

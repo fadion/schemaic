@@ -441,6 +441,67 @@ pub fn match_block(
     if !block_word {
         return None;
     }
+    let words = block_words(text, dialect);
+    let here = words.iter().position(|w| w.lo <= caret && caret <= w.hi)?;
+    if words[here].role == BlockRole::Other {
+        return None;
+    }
+    let range = |w: usize| (words[w].lo, words[w].hi);
+    let mut stack: Vec<usize> = Vec::new();
+    for (w, word) in words.iter().enumerate() {
+        match word.role {
+            BlockRole::Open => stack.push(w),
+            BlockRole::Close => match stack.pop() {
+                Some(open) if open == here => return Some((range(here), range(w))),
+                Some(open) if w == here => return Some((range(here), range(open))),
+                None if w == here => return None,
+                _ => {}
+            },
+            BlockRole::Other => {}
+        }
+    }
+    None
+}
+
+/// The innermost `BEGIN` or `CASE` still open at `at` — its word range, and
+/// whether it is a `CASE` — by [`match_block`]'s rules for what opens and
+/// closes a block. `None` outside any.
+pub fn enclosing_block(text: &str, at: usize, dialect: SqlDialect) -> Option<(usize, usize, bool)> {
+    let words = block_words(text, dialect);
+    let mut stack: Vec<usize> = Vec::new();
+    for (w, word) in words.iter().enumerate().take_while(|(_, w)| w.hi <= at) {
+        match word.role {
+            BlockRole::Open => stack.push(w),
+            BlockRole::Close => {
+                stack.pop();
+            }
+            BlockRole::Other => {}
+        }
+    }
+    let w = &words[*stack.last()?];
+    Some((w.lo, w.hi, w.up == "CASE"))
+}
+
+/// What a word does to the block structure [`match_block`] reads.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BlockRole {
+    Open,
+    Close,
+    Other,
+}
+
+/// One word of code, as [`block_words`] reads it.
+struct BlockWord {
+    lo: usize,
+    hi: usize,
+    up: String,
+    role: BlockRole,
+}
+
+/// Every word of `text` in code, in order, with what it does to the block
+/// structure — the rules [`match_block`]'s doc sets out.
+fn block_words(text: &str, dialect: SqlDialect) -> Vec<BlockWord> {
+    let b = text.as_bytes();
     // Every word in code, in order: its range, upper-cased, and whether a
     // `.` makes it a member (`t.end`).
     let mut words: Vec<(usize, usize, String, bool)> = Vec::new();
@@ -509,27 +570,20 @@ pub fn match_block(
                 Some("IF" | "LOOP" | "WHILE" | "REPEAT" | "FOR")
             )
     };
-    let here = words
-        .iter()
-        .position(|(lo, hi, ..)| *lo <= caret && caret <= *hi)?;
-    if !opens(here) && !closes(here) {
-        return None;
-    }
-    let range = |w: usize| (words[w].0, words[w].1);
-    let mut stack: Vec<usize> = Vec::new();
-    for w in 0..words.len() {
-        if opens(w) {
-            stack.push(w);
-        } else if closes(w) {
-            match stack.pop() {
-                Some(open) if open == here => return Some((range(here), range(w))),
-                Some(open) if w == here => return Some((range(here), range(open))),
-                None if w == here => return None,
-                _ => {}
-            }
-        }
-    }
-    None
+    (0..words.len())
+        .map(|w| BlockWord {
+            lo: words[w].0,
+            hi: words[w].1,
+            up: words[w].2.clone(),
+            role: if opens(w) {
+                BlockRole::Open
+            } else if closes(w) {
+                BlockRole::Close
+            } else {
+                BlockRole::Other
+            },
+        })
+        .collect()
 }
 
 /// All byte ranges of the identifier under the caret, for "highlight all

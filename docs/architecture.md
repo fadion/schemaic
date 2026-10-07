@@ -11931,10 +11931,14 @@ existing prose was left alone.
     `BEGIN;` end in another word or a `;`, so a transaction opens nothing
     (`enter_after_a_block_opening_word_goes_one_unit_deeper`,
     `enter_after_a_word_that_opens_no_block_adds_nothing`). **And the level closes as `END` is
-    typed**: `dedent_typed_end` answers the `D` that makes a line's only word `END` — nothing after
-    it on the line — with the edit that moves the line to the indent of the line whose `BEGIN` or
-    `CASE` it closes, asked of the text as it will be through `pairs::match_block`; `None` leaves the
-    character to floem (`typing_an_end_dedents_it_to_its_opener`). The pane applies it as the
+    typed**: `dedent_typed_word` answers the letter that makes a line's only word `END` — nothing
+    after it on the line — with the edit that moves the line to the indent of the line whose `BEGIN`
+    or `CASE` it closes, asked of the text as it will be through `pairs::match_block`; and the one
+    that makes it `WHEN` or `ELSE` inside a `CASE` with the edit that puts it one unit under the
+    `CASE`'s line (`pairs::enclosing_block`, which shares `match_block`'s `block_words`) — the
+    layout Format gives a `CASE`; an `IF`'s `ELSE` in a `BEGIN` is left alone. `None` leaves the
+    character to floem (`typing_an_end_dedents_it_to_its_opener`,
+    `typing_a_case_branch_indents_it_under_its_case`). The pane applies it as the
     auto-pair does — floem's own insert suppressed through `read_only`, a Ctrl+K freeze left alone
     — and as `InsertChars`, so it undoes with the typing it finished, never alone. The pane takes
     Enter with no
@@ -12157,7 +12161,8 @@ existing prose was left alone.
     the three — `a_block_word_matches_its_end`,
     `a_word_that_opens_or_closes_no_block_matches_nothing`,
     `a_block_jump_lands_on_the_same_side_and_comes_back`. Inside a PostgreSQL `$$` body the
-    lexer sees a literal, so nothing there pairs),
+    lexer sees a literal, so nothing there pairs; `enclosing_block`, the innermost block still open
+    at an offset, reads the same `block_words`),
     `identifier_occurrences` (every whole-word, ASCII-case-insensitive occurrence of the identifier
     under the caret — excludes keywords/numbers/strings, needs ≥2 to fire), and `region_at`
     (`Code`/`Str`/`Comment` classification). Pure + unit-tested; dialect-aware, and its two "is a
