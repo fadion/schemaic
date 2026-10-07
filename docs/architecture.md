@@ -12945,6 +12945,22 @@ existing prose was left alone.
       PostgreSQL, SQLite and SQL Server take any type name, so theirs are `ddl::common_types`'
       base names, upper-cased for `in_typed_case`
       (`each_engine_is_offered_its_own_cast_targets`).
+      **The statement's own names arrive as `RankInput::local`** (`LocalNames`), read by the
+      caller only where they are offered: `intel::ctes_at` at a table slot, whose CTEs lead the
+      `Table` arm (tier 0, detail `CTE`, ahead of the FK targets so one shadowing a table claims its
+      row), and `intel::output_aliases_at` at a column slot, whose aliases lead the `Column` arm
+      (tier 0, the alias glyph). Each is an `intel::LocalName` and **inserts as the statement
+      spelled it** (`written`), never through `accepted_insert`'s quoting: PostgreSQL's unquoted
+      `AS Total` names `total`, and quoting it by the engine's rule would name something else
+      (`the_statements_own_ctes_and_aliases_are_offered`). `output_aliases_at` answers only in the
+      caret's own query's `ORDER BY`, or its `HAVING` where `having_sees_output_aliases` —
+      measured: MariaDB 10.11.14 and SQLite 3.45.1 resolve `HAVING x` against the select list,
+      PostgreSQL 16.15 and SQL Server 2022 refuse it, and all four take an `ORDER BY` alias. It
+      parses the query up to the keyword from `local_scope_start`, as `group_by_items` does, so a
+      subquery's aliases stay its own and a window's `OVER (ORDER BY` reads nothing; after a set
+      operation an `ORDER BY` takes the first arm's names and a `HAVING` its own arm's
+      (`order_by_and_having_see_the_select_lists_aliases`). `ctes_at` is `cte_names`' walk
+      (`cte_name_tokens`) with each name's spelling kept.
       **`add` asks `worth_offering` before it builds anything, which is `add_col`'s shape adopted
       for `add_col`'s reason.** A PostgreSQL tab offers 863 builtins where a MySQL 8 one offers 341
       (`FUNCTIONS`' 463 less `MARIADB_ONLY`, which contains every `DEPRECATED_ALIASES` name), and

@@ -164,6 +164,17 @@ struct Cand {
     replace: Option<(usize, usize)>,
 }
 
+/// The names a statement declares itself, which the schema cannot know.
+#[derive(Clone, Debug, Default)]
+pub struct LocalNames {
+    /// The CTEs declared before the caret ([`crate::intel::ctes_at`]),
+    /// offered where a table goes.
+    pub ctes: Vec<crate::intel::LocalName>,
+    /// The select-list aliases the caret's clause may name
+    /// ([`crate::intel::output_aliases_at`]), offered where a column goes.
+    pub output_aliases: Vec<crate::intel::LocalName>,
+}
+
 /// Everything ranking needs that is not the schema.
 ///
 /// A struct rather than nine arguments, and the fields are exactly the caller's
@@ -214,6 +225,8 @@ pub struct RankInput<'a> {
     /// PostgreSQL or SQLite tab, or one whose schema has not loaded yet —
     /// offers everything, which is what this did before the split existed.
     pub flavour: crate::schema::ServerFlavour,
+    /// The statement's own CTEs and select-list aliases.
+    pub local: &'a LocalNames,
 }
 
 /// Rank the candidates a caret position offers.
@@ -316,6 +329,24 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
             insert: None,
             replace: None,
         });
+    };
+    // A name the statement declares itself: inserted as the statement spelled
+    // it, never re-quoted by the engine's rules (see `intel::LocalName`).
+    let add_local = |cands: &mut Vec<Cand>,
+                     seen: &mut HashSet<String>,
+                     n: &crate::intel::LocalName,
+                     kind: SuggestKind,
+                     detail: &str,
+                     glyph: SuggestGlyph,
+                     tier: u8| {
+        let before = cands.len();
+        add(cands, seen, &n.name, kind, detail, tier);
+        if cands.len() > before
+            && let Some(c) = cands.last_mut()
+        {
+            c.glyph = glyph;
+            c.insert = Some(n.written.clone());
+        }
     };
     // The detail string for a column typed against its own metadata: the type,
     // suffixed with a dim `· NULL` for nullable columns (NOT NULL stays clean).
@@ -532,6 +563,19 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
             }
         }
         ClauseCtx::Table => {
+            // The statement's own CTEs, ahead of everything: one shadows a table
+            // of the same name, and claims its row.
+            for cte in &input.local.ctes {
+                add_local(
+                    &mut cands,
+                    &mut seen,
+                    cte,
+                    SuggestKind::Table,
+                    "CTE",
+                    SuggestGlyph::Table,
+                    0,
+                );
+            }
             // FK-aware JOIN targets first (top tier): a table connected by a foreign
             // key to something in scope, inserting `table ON <predicate>` in one go.
             let mut fk_added = false;
@@ -588,6 +632,20 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
             }
         }
         ClauseCtx::Column => {
+            // The select list's aliases, where the clause may name them (the
+            // caller asks `intel::output_aliases_at`): an `ORDER BY` names its
+            // output more often than its input.
+            for alias in &input.local.output_aliases {
+                add_local(
+                    &mut cands,
+                    &mut seen,
+                    alias,
+                    SuggestKind::Column,
+                    "alias",
+                    SuggestGlyph::Alias,
+                    0,
+                );
+            }
             if scope.is_empty() {
                 // No FROM yet: offer every column, annotated by its owning table so
                 // the broader list stays navigable.
@@ -1054,6 +1112,7 @@ mod tests {
                 active_db: Some("shop"),
                 dialect,
                 flavour,
+                local: &LocalNames::default(),
             },
         )
         .into_iter()
@@ -1083,6 +1142,7 @@ mod tests {
                     active_db: Some("shop"),
                     dialect,
                     flavour: ServerFlavour::Unknown,
+                    local: &LocalNames::default(),
                 },
             )
             .into_iter()
@@ -1240,6 +1300,75 @@ mod tests {
         assert!(!offers(&rows, "PARTITION"), "{rows:?}");
     }
 
+    /// The statement's own names: its CTEs where a table goes, its select
+    /// list's aliases where the reader says a column may name them — each
+    /// inserted as the statement spelled it.
+    #[test]
+    fn the_statements_own_ctes_and_aliases_are_offered() {
+        let s = shop();
+        let local = |name: &str, written: &str| crate::intel::LocalName {
+            name: name.to_string(),
+            written: written.to_string(),
+        };
+        let names = LocalNames {
+            ctes: vec![local("recent", "recent"), local("Big", "\"Big\"")],
+            output_aliases: vec![local("Total", "Total")],
+        };
+        let rows = |ctx: ClauseCtx, scope: &[TableRef], prefix: &str| {
+            let cont = Continuation::default();
+            let used = HashSet::new();
+            rank(
+                &s,
+                &RankInput {
+                    ctx: &ctx,
+                    cont: &cont,
+                    scope,
+                    prefix,
+                    snippets: &[],
+                    join_targets: &[],
+                    star: None,
+                    used: &used,
+                    active_db: Some("shop"),
+                    dialect: SqlDialect::Postgres,
+                    flavour: ServerFlavour::Unknown,
+                    local: &names,
+                },
+            )
+        };
+        let tables = rows(ClauseCtx::Table, &[], "");
+        let cte = tables
+            .iter()
+            .find(|r| r.text == "Big")
+            .expect("CTE offered");
+        assert_eq!(cte.detail, "CTE");
+        assert_eq!(cte.insert.as_deref(), Some("\"Big\""));
+        assert!(tables.iter().any(|r| r.text == "recent"));
+        assert!(
+            tables.iter().any(|r| r.text == "orders"),
+            "the schema's too"
+        );
+        let scope = [tref("orders", None)];
+        let cols = rows(ClauseCtx::Column, &scope, "tot");
+        let alias = cols
+            .iter()
+            .find(|r| r.text == "Total")
+            .expect("alias offered");
+        assert_eq!(alias.glyph, SuggestGlyph::Alias);
+        // As written: unquoted on PostgreSQL it is `total`, so no quotes go in.
+        assert_eq!(alias.insert.as_deref(), Some("Total"));
+        assert_eq!(
+            accepted_insert(alias, SqlDialect::Postgres, false).as_deref(),
+            Some("Total")
+        );
+        // A CTE is no column, and an alias no table.
+        assert!(cols.iter().all(|r| r.text != "recent"));
+        assert!(
+            rows(ClauseCtx::Table, &[], "tot")
+                .iter()
+                .all(|r| r.text != "Total")
+        );
+    }
+
     /// A cast's target offers the engine's cast types alone — no columns, no
     /// functions — in the case they are typed, as a keyword is.
     #[test]
@@ -1311,6 +1440,7 @@ mod tests {
                     active_db: Some("shop"),
                     dialect,
                     flavour: ServerFlavour::Unknown,
+                    local: &LocalNames::default(),
                 },
             )
             .into_iter()
@@ -1374,6 +1504,7 @@ mod tests {
                 active_db: Some("shop"),
                 dialect: SqlDialect::MySql,
                 flavour: ServerFlavour::Unknown,
+                local: &LocalNames::default(),
             },
         )
         .completes_a_word
@@ -1571,6 +1702,7 @@ mod tests {
                 active_db: Some("shop"),
                 dialect: SqlDialect::MySql,
                 flavour: ServerFlavour::Unknown,
+                local: &LocalNames::default(),
             },
         )
         .into_iter()
@@ -1610,6 +1742,7 @@ mod tests {
                     active_db: Some("shop"),
                     dialect: SqlDialect::MySql,
                     flavour: ServerFlavour::Unknown,
+                    local: &LocalNames::default(),
                 },
             )
             .into_iter()
@@ -1670,6 +1803,7 @@ mod tests {
                     active_db: Some("shop"),
                     dialect: SqlDialect::MySql,
                     flavour: ServerFlavour::Unknown,
+                    local: &LocalNames::default(),
                 },
             )
         };
@@ -1736,6 +1870,7 @@ mod tests {
                 active_db: Some("shop"),
                 dialect: SqlDialect::MySql,
                 flavour: ServerFlavour::Unknown,
+                local: &LocalNames::default(),
             },
         );
         let email = out.iter().find(|s| s.text == "email").expect("offered");
@@ -1774,6 +1909,7 @@ mod tests {
                     active_db: Some("shop"),
                     dialect: SqlDialect::MySql,
                     flavour: ServerFlavour::Unknown,
+                    local: &LocalNames::default(),
                 },
             )
         };
@@ -1817,6 +1953,7 @@ mod tests {
                 active_db: Some("shop"),
                 dialect: SqlDialect::MySql,
                 flavour: ServerFlavour::Unknown,
+                local: &LocalNames::default(),
             },
         )
         .into_iter()
@@ -1861,6 +1998,7 @@ mod tests {
                 active_db: Some("shop"),
                 dialect: SqlDialect::MySql,
                 flavour: ServerFlavour::Unknown,
+                local: &LocalNames::default(),
             },
         );
         let first = out.first().expect("something is offered");
@@ -1926,6 +2064,7 @@ mod tests {
                 active_db: Some("shop"),
                 dialect: SqlDialect::MySql,
                 flavour: ServerFlavour::Unknown,
+                local: &LocalNames::default(),
             },
         );
         let first = out.first().expect("something is offered");

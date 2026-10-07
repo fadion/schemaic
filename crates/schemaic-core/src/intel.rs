@@ -14757,6 +14757,17 @@ fn query_scope(
 /// word after `WITH` (or `WITH RECURSIVE`) and after each comma at depth 0,
 /// until the query proper begins.
 fn cte_names(toks: &[Token]) -> Vec<String> {
+    cte_name_tokens(toks)
+        .into_iter()
+        .filter_map(|t| match &t.kind {
+            TkKind::Word(w) => Some(w.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// [`cte_names`]' walk, answering the name tokens themselves.
+fn cte_name_tokens(toks: &[Token]) -> Vec<&Token> {
     let mut out = Vec::new();
     if toks.first().and_then(bare_upper).as_deref() != Some("WITH") {
         return out;
@@ -14768,11 +14779,11 @@ fn cte_names(toks: &[Token]) -> Vec<String> {
             TkKind::LParen => depth += 1,
             TkKind::RParen => depth = depth.saturating_sub(1),
             TkKind::Comma if depth == 0 => want_name = true,
-            TkKind::Word(w) if depth == 0 => match bare_upper(t).as_deref() {
+            TkKind::Word(_) if depth == 0 => match bare_upper(t).as_deref() {
                 Some("SELECT" | "INSERT" | "UPDATE" | "DELETE" | "MERGE" | "VALUES") => break,
                 Some("RECURSIVE") => {}
                 _ if want_name => {
-                    out.push(w.clone());
+                    out.push(t);
                     want_name = false;
                 }
                 _ => {}
@@ -14781,6 +14792,156 @@ fn cte_names(toks: &[Token]) -> Vec<String> {
         }
     }
     out
+}
+
+/// A name the statement declares itself, which no catalogue holds: a CTE, a
+/// select-list alias. `name` is what it is called; `written` is how the
+/// statement spelled it, quotes and all, which is what completion inserts —
+/// re-quoting by the engine's rules would be wrong where the statement's own
+/// spelling decided the name (PostgreSQL's unquoted `AS Total` is `total`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalName {
+    pub name: String,
+    pub written: String,
+}
+
+/// The CTEs the statement opening at `lo` has declared before `caret` —
+/// [`cte_names`]' reading, with each name's spelling.
+pub fn ctes_at(sql: &str, lo: usize, caret: usize, dialect: SqlDialect) -> Vec<LocalName> {
+    let toks = tokenize_range(sql, lo, caret, dialect);
+    cte_name_tokens(&toks)
+        .into_iter()
+        .filter_map(|t| match &t.kind {
+            TkKind::Word(w) => Some(LocalName {
+                name: w.clone(),
+                written: sql.get(t.at..t.end)?.to_string(),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The select-list aliases a name typed at `word_lo` may use: those of the
+/// caret's own query when the caret is in its `ORDER BY`, or in its `HAVING`
+/// where the engine lets that see them ([`having_sees_output_aliases`]).
+/// Empty anywhere else.
+///
+/// **Read off the parse, as [`group_by_items`] reads a projection**: the query
+/// up to the `ORDER`/`HAVING` is a whole query, parsed from the innermost open
+/// paren ([`local_scope_start`]), so a subquery's aliases stay its own and a
+/// window's `OVER (ORDER BY` is no query's `ORDER BY`. An `ORDER BY` after a
+/// set operation names the first arm's columns; a `HAVING` is its own arm's.
+pub fn output_aliases_at(
+    sql: &str,
+    lo: usize,
+    word_lo: usize,
+    dialect: SqlDialect,
+) -> Vec<LocalName> {
+    use sqlparser::ast::{SelectItem, SetExpr, Statement};
+    // The clauses that end one another at a query's own depth; `AND`, `BY`,
+    // `ON` and the rest continue the clause they are in.
+    const CLAUSES: &[&str] = &[
+        "SELECT",
+        "FROM",
+        "WHERE",
+        "GROUP",
+        "HAVING",
+        "ORDER",
+        "LIMIT",
+        "OFFSET",
+        "FETCH",
+        "WINDOW",
+        "QUALIFY",
+        "UNION",
+        "INTERSECT",
+        "EXCEPT",
+    ];
+    let toks = tokenize_range(sql, lo, word_lo, dialect);
+    let mut last: Option<usize> = None;
+    let mut outer: Vec<Option<usize>> = Vec::new();
+    for (i, t) in toks.iter().enumerate() {
+        match t.kind {
+            TkKind::LParen => outer.push(last.take()),
+            TkKind::RParen => {
+                if let Some(kw) = outer.pop() {
+                    last = kw;
+                }
+            }
+            _ if bare_upper(t).is_some_and(|w| CLAUSES.contains(&w.as_str())) => last = Some(i),
+            _ => {}
+        }
+    }
+    let Some(k) = last else {
+        return Vec::new();
+    };
+    let kw = bare_upper(&toks[k]);
+    let ordering = kw.as_deref() == Some("ORDER")
+        && toks.get(k + 1).and_then(bare_upper).as_deref() == Some("BY");
+    let having = kw.as_deref() == Some("HAVING") && having_sees_output_aliases(dialect);
+    if !ordering && !having {
+        return Vec::new();
+    }
+    let at = toks[k].at;
+    let start = local_scope_start(sql, lo, at, dialect);
+    let Some(Ok(stmts)) = sql
+        .get(start..at)
+        .map(|q| sqlparser::parser::Parser::parse_sql(&*dialect.parser(), q))
+    else {
+        return Vec::new();
+    };
+    let query = match stmts.as_slice() {
+        [Statement::Query(q)] => Some(q.as_ref()),
+        [Statement::Insert(i)] => i.source.as_deref(),
+        [Statement::CreateView(v)] => Some(v.query.as_ref()),
+        [Statement::CreateTable(t)] => t.query.as_deref(),
+        _ => None,
+    };
+    let Some(query) = query else {
+        return Vec::new();
+    };
+    // An ORDER BY after a set operation names the first arm's columns; a
+    // HAVING is its own, the last arm's.
+    let mut body = query.body.as_ref();
+    loop {
+        body = match body {
+            SetExpr::SetOperation { left, right, .. } => {
+                if ordering {
+                    left
+                } else {
+                    right
+                }
+            }
+            SetExpr::Query(q) => q.body.as_ref(),
+            _ => break,
+        };
+    }
+    let SetExpr::Select(sel) = body else {
+        return Vec::new();
+    };
+    let mut out: Vec<LocalName> = Vec::new();
+    for item in &sel.projection {
+        if let SelectItem::ExprWithAlias { alias, .. } = item
+            && !out.iter().any(|n| n.name == alias.value)
+        {
+            out.push(LocalName {
+                name: alias.value.clone(),
+                written: alias.to_string(),
+            });
+        }
+    }
+    out
+}
+
+/// Does a `HAVING` see the select list's aliases? Measured with
+/// `SELECT a AS x, count(*) … GROUP BY a HAVING x > 0`: MariaDB 10.11.14 and
+/// SQLite 3.45.1 answer it; PostgreSQL 16.15 answers *column "x" does not
+/// exist* and SQL Server 2022 *Invalid column name 'x'*. An `ORDER BY` sees
+/// them on all four.
+fn having_sees_output_aliases(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MySql | SqlDialect::Sqlite => true,
+        SqlDialect::Postgres | SqlDialect::MsSql => false,
+    }
 }
 
 /// [`predict`]'s empty-`ON` producer: [`join_condition`]'s foreign-key
@@ -18668,6 +18829,118 @@ mod tests {
         assert!(has(SqlDialect::MsSql, Unknown, "NVARCHAR"));
     }
 
+    /// The `(name, written)` pairs of a local-name reader's answer.
+    fn pairs(names: Vec<LocalName>) -> Vec<(String, String)> {
+        names.into_iter().map(|n| (n.name, n.written)).collect()
+    }
+
+    fn aliases(sql: &str, d: SqlDialect) -> Vec<String> {
+        output_aliases_at(sql, 0, word_start(sql, sql.len()), d)
+            .into_iter()
+            .map(|n| n.name)
+            .collect()
+    }
+
+    /// An `ORDER BY` may name the select list's aliases on every engine, and
+    /// a `HAVING` where the engine lets it; nothing else may.
+    #[test]
+    fn order_by_and_having_see_the_select_lists_aliases() {
+        for d in SqlDialect::ALL {
+            let sql = "SELECT a AS x, b y, c FROM t ORDER BY ";
+            assert_eq!(aliases(sql, d), ["x", "y"], "{d:?}");
+            assert_eq!(
+                aliases("SELECT a AS x FROM t ORDER BY x, t", d),
+                ["x"],
+                "{d:?}"
+            );
+            assert!(
+                aliases("SELECT a AS x FROM t WHERE ", d).is_empty(),
+                "{d:?}"
+            );
+            assert!(
+                aliases("SELECT a AS x FROM t GROUP BY ", d).is_empty(),
+                "{d:?}"
+            );
+            // A window's ORDER BY belongs to no query.
+            assert!(
+                aliases("SELECT a AS x, row_number() OVER (ORDER BY ", d).is_empty(),
+                "{d:?}"
+            );
+            // A subquery's aliases are its own.
+            assert_eq!(
+                aliases("SELECT * FROM (SELECT a AS i FROM t ORDER BY ", d),
+                ["i"],
+                "{d:?}"
+            );
+            assert_eq!(
+                aliases("SELECT a AS o FROM (SELECT b AS i FROM u) d ORDER BY ", d),
+                ["o"],
+                "{d:?}"
+            );
+            // After a set operation, the first arm names the columns.
+            assert_eq!(
+                aliases(
+                    "SELECT a AS x FROM t UNION SELECT b AS z FROM u ORDER BY ",
+                    d
+                ),
+                ["x"],
+                "{d:?}"
+            );
+        }
+        let having = "SELECT a AS x, count(*) AS n FROM t GROUP BY a HAVING ";
+        // The completion asks only at a column slot, so both clauses must be one.
+        for sql in [
+            having,
+            "SELECT a AS x FROM t ORDER BY ",
+            "SELECT a AS x FROM t ORDER BY a, ",
+        ] {
+            let at = word_start(sql, sql.len());
+            assert_eq!(
+                clause_context(sql, 0, at, SqlDialect::MySql),
+                ClauseCtx::Column,
+                "{sql}"
+            );
+        }
+        // And the CTEs only at a table slot, which `FROM` after a WITH is.
+        let with = "WITH r AS (SELECT 1) SELECT * FROM ";
+        assert_eq!(
+            clause_context(with, 0, with.len(), SqlDialect::MySql),
+            ClauseCtx::Table
+        );
+        assert_eq!(aliases(having, SqlDialect::MySql), ["x", "n"]);
+        assert_eq!(aliases(having, SqlDialect::Sqlite), ["x", "n"]);
+        assert!(aliases(having, SqlDialect::Postgres).is_empty());
+        assert!(aliases(having, SqlDialect::MsSql).is_empty());
+        // Past an AND the HAVING is still the clause.
+        let and = "SELECT a AS x FROM t GROUP BY a HAVING x > 1 AND ";
+        assert_eq!(aliases(and, SqlDialect::MySql), ["x"]);
+        // As written, quotes and all.
+        let sql = "SELECT a AS \"Total\" FROM t ORDER BY ";
+        assert_eq!(
+            pairs(output_aliases_at(sql, 0, sql.len(), SqlDialect::Postgres)),
+            [("Total".to_string(), "\"Total\"".to_string())]
+        );
+    }
+
+    /// The CTEs a statement has declared before the caret, as spelled.
+    #[test]
+    fn the_ctes_declared_so_far_are_read_with_their_spelling() {
+        let sql = "WITH a AS (SELECT 1), \"B\" AS (SELECT 2) SELECT * FROM ";
+        assert_eq!(
+            pairs(ctes_at(sql, 0, sql.len(), SqlDialect::Postgres)),
+            [
+                ("a".to_string(), "a".to_string()),
+                ("B".to_string(), "\"B\"".to_string())
+            ]
+        );
+        let rec = "WITH RECURSIVE r AS (SELECT 1 UNION ALL SELECT n FROM ";
+        assert_eq!(
+            pairs(ctes_at(rec, 0, rec.len(), SqlDialect::MySql)).len(),
+            1
+        );
+        assert!(ctes_at("SELECT * FROM ", 0, 14, SqlDialect::MySql).is_empty());
+    }
+
     #[test]
     fn context_start_then_table_then_column() {
         assert_eq!(ctx_at("SEL", 3), ClauseCtx::Start);
@@ -20767,6 +21040,7 @@ mod tests {
                     active_db: None,
                     dialect: SqlDialect::MySql,
                     flavour,
+                    local: &crate::rank::LocalNames::default(),
                 },
             )
             .into_iter()

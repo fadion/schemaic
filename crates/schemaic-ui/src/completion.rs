@@ -1108,6 +1108,21 @@ pub(crate) fn recompute_completions(
     // Identifiers already written in this statement rank a little higher (recency):
     // you tend to reference the same columns/tables again.
     let used = rank::statement_identifiers(&text, lo, hi, (word_lo, offset));
+    // The statement's own names, read only where they are offered: its CTEs
+    // at a table slot, its select list's aliases where a column goes (the
+    // reader answers nothing outside an `ORDER BY` or `HAVING`).
+    let local = rank::LocalNames {
+        ctes: if matches!(ctx, ClauseCtx::Table) {
+            intel::ctes_at(&text, lo, word_lo, dialect)
+        } else {
+            Vec::new()
+        },
+        output_aliases: if matches!(ctx, ClauseCtx::Column) {
+            intel::output_aliases_at(&text, lo, word_lo, dialect)
+        } else {
+            Vec::new()
+        },
+    };
 
     let ranked = rank::rank_full(
         &schema,
@@ -1134,6 +1149,7 @@ pub(crate) fn recompute_completions(
             flavour: active_db
                 .map(|db| crate::table_designer::db_flavour(db_nodes, db))
                 .unwrap_or_default(),
+            local: &local,
         },
     );
 
