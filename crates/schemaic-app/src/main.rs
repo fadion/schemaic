@@ -2262,6 +2262,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let soft_tabs = RwSignal::new(ui_state.soft_tabs);
     let word_wrap = RwSignal::new(ui_state.word_wrap);
     let rainbow_brackets = RwSignal::new(ui_state.editor_rainbow_brackets);
+    let show_whitespace = RwSignal::new(ui_state.editor_show_whitespace);
+    let indent_guides = RwSignal::new(ui_state.editor_indent_guides);
     let row_limit = RwSignal::new(ui_state.row_limit);
     let statement_timeout = RwSignal::new(ui_state.statement_timeout_secs);
     let confirm_writes = RwSignal::new(ui_state.confirm_writes);
@@ -2279,6 +2281,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     create_effect(move |_| schemaic_ui::theme::set_editor_word_wrap(word_wrap.get()));
     schemaic_ui::theme::set_editor_rainbow_brackets(rainbow_brackets.get_untracked());
     create_effect(move |_| schemaic_ui::theme::set_editor_rainbow_brackets(rainbow_brackets.get()));
+    schemaic_ui::theme::set_editor_show_whitespace(show_whitespace.get_untracked());
+    create_effect(move |_| schemaic_ui::theme::set_editor_show_whitespace(show_whitespace.get()));
+    schemaic_ui::theme::set_editor_indent_guides(indent_guides.get_untracked());
+    create_effect(move |_| schemaic_ui::theme::set_editor_indent_guides(indent_guides.get()));
     // Bumped when a background probe fills the cache, so the settings modal's
     // constraint notice — which reads the cache and must never fill it, being on
     // the UI thread — knows to look again.
@@ -7413,6 +7419,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     soft_tabs: soft_tabs.get_untracked(),
                     word_wrap: word_wrap.get_untracked(),
                     editor_rainbow_brackets: rainbow_brackets.get_untracked(),
+                    editor_show_whitespace: show_whitespace.get_untracked(),
+                    editor_indent_guides: indent_guides.get_untracked(),
                     restore_tabs: restore_tabs.get_untracked(),
                     live_validate: live_validate.get_untracked(),
                     editor_predictions: editor_predictions.get_untracked(),
@@ -7505,6 +7513,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             soft_tabs.get();
             word_wrap.get();
             rainbow_brackets.get();
+            show_whitespace.get();
+            indent_guides.get();
             row_limit.get();
             statement_timeout.get();
             confirm_writes.get();
@@ -12609,6 +12619,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             soft_tabs,
             word_wrap,
             rainbow_brackets,
+            show_whitespace,
+            indent_guides,
             row_limit,
             statement_timeout,
             confirm_writes,

@@ -33,7 +33,7 @@ use floem::views::editor::core::selection::Selection;
 use floem::views::editor::gutter::GutterClass;
 use floem::views::editor::keypress::default_key_handler;
 use floem::views::editor::keypress::key::KeyInput;
-use floem::views::editor::text::WrapMethod;
+use floem::views::editor::text::{RenderWhitespace, WrapMethod};
 use floem::views::scroll::{Handle, Thickness};
 use schemaic_core::connection::ConnStatus;
 
@@ -4505,6 +4505,8 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             let soft = theme::editor_soft_tabs();
             let tw = theme::editor_tab_width();
             let wrap = theme::editor_word_wrap();
+            let whitespace = theme::editor_show_whitespace();
+            let guides = theme::editor_indent_guides();
             // Caret paints transparent while the editor is unfocused — Floem always
             // paints (and blinks) the caret regardless of focus, so hiding it any
             // other way is fought by its internal blink reset (see the focus block
@@ -4521,6 +4523,14 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 .gutter_accent_color(t.fg)
                 .indent_guide_color(t.selection)
                 .visible_whitespace(t.selection)
+                // Settings → Editor: whitespace as marks, and a guide per
+                // indent level, both drawn by floem in the colours above.
+                .render_white_space(if whitespace {
+                    RenderWhitespace::All
+                } else {
+                    RenderWhitespace::None
+                })
+                .indent_guide(guides)
                 // Soft tabs → insert spaces to the next stop; hard tabs → literal
                 // `\t`. This `indent_style` only spaces the indent guides: the
                 // unit floem's own edit commands indent by is the buffer's, a

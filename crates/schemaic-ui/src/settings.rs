@@ -1803,6 +1803,8 @@ pub(crate) fn theme_settings_overlay(
     let editor_predictions = layout.editor_predictions;
     let editor_remembered_predictions = layout.editor_remembered_predictions;
     let rainbow_brackets = layout.rainbow_brackets;
+    let show_whitespace = layout.show_whitespace;
+    let indent_guides = layout.indent_guides;
     let restore_tabs = layout.restore_tabs;
     let open_config_dir = open_config_dir.clone();
 
@@ -1883,12 +1885,28 @@ pub(crate) fn theme_settings_overlay(
                 ring.clone(),
                 130,
             );
+            let whitespace_row = focusable_toggle_row(
+                "Show whitespace",
+                "Draw spaces and tabs as faint marks, so a tab can be told from spaces.",
+                show_whitespace,
+                ring.clone(),
+                140,
+            );
+            let guides_row = focusable_toggle_row(
+                "Indent guides",
+                "Draw a faint vertical line at each indent level.",
+                indent_guides,
+                ring.clone(),
+                150,
+            );
             let editor_group = v_stack((
                 settings_section_header("Editor"),
                 font_section,
                 predictions_row,
                 remembered_row,
                 rainbow_row,
+                whitespace_row,
+                guides_row,
             ))
             .style(|s| s.flex_col().gap(theme::scaled(16.0)));
 

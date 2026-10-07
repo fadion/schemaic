@@ -336,6 +336,12 @@ pub struct UiState {
     /// Colour the editor's brackets by their nesting. Default: off.
     #[serde(default)]
     pub editor_rainbow_brackets: bool,
+    /// Draw spaces and tabs as visible marks in the editor. Default: off.
+    #[serde(default)]
+    pub editor_show_whitespace: bool,
+    /// Draw a guide at each indent level in the editor. Default: off.
+    #[serde(default)]
+    pub editor_indent_guides: bool,
     /// Reopen the previous session's query tabs on startup. Default: on.
     #[serde(default = "default_true")]
     pub restore_tabs: bool,
@@ -453,6 +459,8 @@ impl Default for UiState {
             soft_tabs: true,
             word_wrap: false,
             editor_rainbow_brackets: false,
+            editor_show_whitespace: false,
+            editor_indent_guides: false,
             restore_tabs: true,
             live_validate: false,
             editor_predictions: true,
@@ -1870,6 +1878,30 @@ mod tests {
         let back: UiState =
             serde_json::from_str(&serde_json::to_string(&on).expect("serialises")).expect("parses");
         assert!(back.editor_rainbow_brackets);
+    }
+
+    /// Visible whitespace and indent guides are off for a new install and a
+    /// file written before either setting existed, and each keeps an on of its
+    /// own.
+    #[test]
+    fn whitespace_and_indent_guides_default_off_and_keep_an_on() {
+        let old: UiState = serde_json::from_str("{}").expect("parses");
+        for s in [UiState::default(), old] {
+            assert!(!s.editor_show_whitespace && !s.editor_indent_guides);
+        }
+        let round = |s: UiState| -> UiState {
+            serde_json::from_str(&serde_json::to_string(&s).expect("serialises")).expect("parses")
+        };
+        let ws = round(UiState {
+            editor_show_whitespace: true,
+            ..UiState::default()
+        });
+        assert!(ws.editor_show_whitespace && !ws.editor_indent_guides);
+        let guides = round(UiState {
+            editor_indent_guides: true,
+            ..UiState::default()
+        });
+        assert!(guides.editor_indent_guides && !guides.editor_show_whitespace);
     }
 
     /// **`#[serde(flatten)]` changes the deserializer's shape for the whole

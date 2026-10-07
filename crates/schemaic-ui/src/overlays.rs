@@ -3669,6 +3669,8 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
     let soft_tabs = ui.layout.soft_tabs;
     let tab_width = ui.layout.tab_width;
     let word_wrap = ui.layout.word_wrap;
+    let show_whitespace = ui.layout.show_whitespace;
+    let indent_guides = ui.layout.indent_guides;
     let ui_theme = ui.layout.ui_theme;
     let editor_theme = ui.layout.editor_theme;
     let connections = ui.conn.connections;
@@ -4215,6 +4217,21 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
             label: "Toggle Word Wrap",
             hint: "",
             arg: instant(Rc::new(move || word_wrap.update(|w| *w = !*w)), &close),
+        },
+        Command {
+            name: "toggle whitespace",
+            label: "Toggle Whitespace",
+            hint: "show spaces and tabs",
+            arg: instant(
+                Rc::new(move || show_whitespace.update(|w| *w = !*w)),
+                &close,
+            ),
+        },
+        Command {
+            name: "toggle indent guides",
+            label: "Toggle Indent Guides",
+            hint: "",
+            arg: instant(Rc::new(move || indent_guides.update(|g| *g = !*g)), &close),
         },
         Command {
             name: "switch connection",

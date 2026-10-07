@@ -952,6 +952,9 @@ struct ThemeState {
     editor_word_wrap: RwSignal<bool>,
     // Whether the editor colours brackets by their nesting.
     editor_rainbow_brackets: RwSignal<bool>,
+    // Whether the editor draws whitespace marks, and indent guides.
+    editor_show_whitespace: RwSignal<bool>,
+    editor_indent_guides: RwSignal<bool>,
     // How large the app's own chrome is drawn (`UiScale`). Read by every scaled
     // design token, so a change re-runs each style closure that uses one.
     ui_scale: RwSignal<UiScale>,
@@ -988,6 +991,8 @@ fn with_state<R>(f: impl FnOnce(&ThemeState) -> R) -> R {
                 editor_soft_tabs: scope.create_rw_signal(true),
                 editor_word_wrap: scope.create_rw_signal(false),
                 editor_rainbow_brackets: scope.create_rw_signal(false),
+                editor_show_whitespace: scope.create_rw_signal(false),
+                editor_indent_guides: scope.create_rw_signal(false),
                 ui_scale: scope.create_rw_signal(UiScale::Normal),
                 ui_kind: scope.create_rw_signal(None),
                 editor_kind: scope.create_rw_signal(None),
@@ -1231,6 +1236,32 @@ pub fn editor_rainbow_brackets() -> bool {
 pub fn set_editor_rainbow_brackets(on: bool) {
     with_state(|st| {
         st.editor_rainbow_brackets.set(on);
+        st.editor_gen.update(|g| *g += 1);
+    });
+}
+
+/// Whether the editor draws spaces and tabs as marks. Read by `editor_style`.
+pub fn editor_show_whitespace() -> bool {
+    with_state(|st| st.editor_show_whitespace.get())
+}
+
+/// Set visible whitespace; bumps the generation so the editor re-lays out.
+pub fn set_editor_show_whitespace(on: bool) {
+    with_state(|st| {
+        st.editor_show_whitespace.set(on);
+        st.editor_gen.update(|g| *g += 1);
+    });
+}
+
+/// Whether the editor draws a guide at each indent level. Read by `editor_style`.
+pub fn editor_indent_guides() -> bool {
+    with_state(|st| st.editor_indent_guides.get())
+}
+
+/// Set indent guides; bumps the generation so the editor re-lays out.
+pub fn set_editor_indent_guides(on: bool) {
+    with_state(|st| {
+        st.editor_indent_guides.set(on);
         st.editor_gen.update(|g| *g += 1);
     });
 }

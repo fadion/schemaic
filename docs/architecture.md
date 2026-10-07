@@ -25017,6 +25017,15 @@ existing prose was left alone.
     *Recessive* as well. Not covered: the lexer still treats a string continued from an earlier line
     per line, as it always has, so a bracket inside that continuation is coloured as code — the depth
     each later line starts at is unaffected, the cached count having skipped the string whole.
+    **Visible whitespace and indent guides** (Settings → Editor, both off by default —
+    `UiState::editor_show_whitespace`/`editor_indent_guides`, pinned by
+    `whitespace_and_indent_guides_default_off_and_keep_an_on`; `theme::editor_show_whitespace`/
+    `editor_indent_guides`, whose setters bump `editor_gen` as `set_editor_rainbow_brackets` does)
+    are floem's own, not ours: `editor_pane`'s `editor_style` closure passes
+    `render_white_space(RenderWhitespace::All | None)` and `indent_guide(bool)`, and they draw in the
+    `visible_whitespace`/`indent_guide_color` the closure already set — the editor theme's
+    `selection`. There is no rendering code of ours behind either. The palette's *Toggle Whitespace*
+    and *Toggle Indent Guides* sit beside *Toggle Word Wrap*.
     `preview_bg`/`preview_fg` are the surface and base text of a **syntax-coloured preview**, and
     they are named here rather than spelled at each site so the cross-axis gate in `contrast.rs`
     measures the surface the previews actually paint — the account browser's `GRANT` block is the
@@ -32391,7 +32400,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   funnel's own pair carries. Against the unfixed tree it reports nine offenders.
 - **The editor has two indent units, and floem's edit commands read the one we cannot set.** The
   `indent_style` `editor_pane` hands `editor_style` from the tab settings is the *style's*, which
-  floem reads only to space the indent guides. `InsertTab` (with `smart_tab`), `OutdentLine` and
+  floem reads only to space the indent guides (drawn only while Settings → Editor → *Indent
+  guides* is on). `InsertTab` (with `smart_tab`), `OutdentLine` and
   `InsertNewLine`'s `auto_indent` take `Buffer::indent_unit` from `floem-editor-core`, which is
   `IndentStyle::DEFAULT_INDENT` — `Spaces(4)` — and has no setter: `Buffer::detect_indent`, the
   only way to move it, prefers whatever the text already holds, and nothing here calls it. So

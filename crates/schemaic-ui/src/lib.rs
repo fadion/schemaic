@@ -6060,6 +6060,12 @@ pub struct LayoutUi {
     /// Colour the editor's brackets by nesting; drives
     /// `theme::set_editor_rainbow_brackets`. Persisted.
     pub rainbow_brackets: RwSignal<bool>,
+    /// Draw whitespace as marks in the editor; drives
+    /// `theme::set_editor_show_whitespace`. Persisted.
+    pub show_whitespace: RwSignal<bool>,
+    /// Draw indent guides in the editor; drives `theme::set_editor_indent_guides`.
+    /// Persisted.
+    pub indent_guides: RwSignal<bool>,
     /// Max rows fetched per query (results-grid cap).
     pub row_limit: RwSignal<usize>,
     /// Cancel a running statement after this many seconds; **`0` is off**, and
