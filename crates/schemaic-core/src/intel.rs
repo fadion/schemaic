@@ -6192,8 +6192,12 @@ fn range_diagnostics(
     let terminated = range_is_terminated(sql, hi);
     let units = units_of(sql, lo, hi, dialect);
     let n = units.len();
+    // A T-SQL routine's body is cut into units of its own, and runs to the
+    // range's end once a header has opened it.
+    let mut in_body = false;
     for (k, u) in units.iter().enumerate() {
         let is_typing_tail = is_last && k + 1 == n && !terminated;
+        in_body |= u.header;
         if u.kind != UnitKind::Structure {
             unit_diagnostics(
                 sql,
@@ -6201,6 +6205,7 @@ fn range_diagnostics(
                 u.hi,
                 u.kind,
                 is_typing_tail,
+                in_body,
                 catalog,
                 dialect,
                 out,
@@ -7073,7 +7078,9 @@ impl TsqlStatement {
 /// `IF`/`WHILE` condition parsed as an expression: its syntax error (withheld
 /// on the fragment still being typed, `is_typing_tail`, and on a statement the
 /// parser has no grammar for — [`parser_lacks_statement`]); on a clean parse
-/// the table and column checks; and, unconditionally, the reserved-alias check.
+/// the table and column checks and the lints, which are told whether the unit
+/// is inside a T-SQL routine's body (`in_body`); and, unconditionally, the
+/// reserved-alias check.
 ///
 /// **A clause the parser lacks is read past, not given up at.** Where
 /// [`grammar_gap_masks`] finds one — T-SQL's `OPTION (…)`, `WITH ROLLUP`,
@@ -7089,6 +7096,7 @@ fn unit_diagnostics(
     hi: usize,
     kind: UnitKind,
     is_typing_tail: bool,
+    in_body: bool,
     catalog: &Catalog,
     dialect: SqlDialect,
     out: &mut Vec<Diagnostic>,
@@ -7111,6 +7119,14 @@ fn unit_diagnostics(
     match parsed {
         Ok(asts) => {
             table_existence_checks(text, tlo, thi, catalog, dialect, &asts, &mut found);
+            lints::check(
+                &text[tlo..thi],
+                &sql[lo..hi],
+                tlo,
+                &asts,
+                in_body,
+                &mut found,
+            );
             match asts.as_slice() {
                 // A single SELECT/query → per-scope column resolution (aware of
                 // subqueries / derived tables / CTEs; qualified + unqualified).
@@ -10813,11 +10829,151 @@ mod colres {
 
     /// A sqlparser span (line/col, relative to `stmt`) → absolute byte range in the
     /// buffer. Spans are 1-based, end-exclusive; `offset_of_line_col` clamps.
-    fn to_range(stmt: &str, lo: usize, s: Span) -> (usize, usize) {
+    pub(super) fn to_range(stmt: &str, lo: usize, s: Span) -> (usize, usize) {
         (
             lo + offset_of_line_col(stmt, s.start.line, s.start.column),
             lo + offset_of_line_col(stmt, s.end.line, s.end.column),
         )
+    }
+}
+
+/// Warnings about a statement that parses and almost certainly does not do
+/// what was meant, placed by the AST's spans ([`colres::to_range`]). Run on
+/// every clean parse of a unit (`unit_diagnostics`), the typing tail included,
+/// as the table checks are: each is true of the text as it stands.
+mod lints {
+    use std::ops::ControlFlow;
+
+    use sqlparser::ast::{
+        BinaryOperator, Expr, FromTable, Spanned, Statement, TableWithJoins, UpdateTableFromKind,
+        Value, visit_expressions,
+    };
+
+    use super::colres::to_range;
+    use super::{Diagnostic, Severity};
+
+    /// Every lint over `asts`, parsed from `stmt`, which starts at `lo`;
+    /// `in_body` when they are statements of a T-SQL routine's body. `raw` is
+    /// `stmt` before `grammar_gap_masks` blanked what the parser lacks — the
+    /// same length, so an offset into one is an offset into the other.
+    pub(super) fn check(
+        stmt: &str,
+        raw: &str,
+        lo: usize,
+        asts: &[Statement],
+        in_body: bool,
+        out: &mut Vec<Diagnostic>,
+    ) {
+        for ast in asts {
+            if !in_body {
+                unfiltered_write(stmt, raw, lo, ast, out);
+            }
+            null_comparisons(stmt, lo, ast, out);
+        }
+    }
+
+    /// An `UPDATE` or `DELETE` with no `WHERE`, squiggled on its verb. The
+    /// run guard asks before running one (`sql::every_row_reason`); this says
+    /// so while it is written.
+    ///
+    /// **Narrower than the guard, on purpose.** A write that joins — T-SQL's
+    /// `UPDATE … FROM t JOIN u ON …`, MySQL's `UPDATE a JOIN b ON …`, a
+    /// multi-table `DELETE t FROM t JOIN u ON …` — is filtered by its join,
+    /// and is the ordinary way to write one; the guard still asks before it
+    /// runs. A `FROM` or `USING` that only *lists* tables is a cross join, so
+    /// PostgreSQL's `UPDATE t … FROM u` with no `WHERE` is still flagged. Nor
+    /// is a statement checked in a routine's body (`check`'s `in_body`), where
+    /// `DELETE FROM staging` is usually the point of the routine. Top-level
+    /// statements only, for the same reason. And a bounded write — T-SQL's
+    /// `TOP (n)`, MySQL's `LIMIT n` — is the batched delete it looks like.
+    /// `TOP` is not in sqlparser's grammar for a write and reaches it
+    /// blanked, so it is read from `raw`, straight after the verb.
+    fn unfiltered_write(
+        stmt: &str,
+        raw: &str,
+        lo: usize,
+        ast: &Statement,
+        out: &mut Vec<Diagnostic>,
+    ) {
+        let joins = |t: &[TableWithJoins]| t.iter().any(|t| !t.joins.is_empty());
+        let (token, message) = match ast {
+            Statement::Update(u)
+                if u.selection.is_none()
+                    && u.limit.is_none()
+                    && !joins(std::slice::from_ref(&u.table))
+                    && !u.from.as_ref().is_some_and(|f| match f {
+                        UpdateTableFromKind::BeforeSet(t) | UpdateTableFromKind::AfterSet(t) => {
+                            joins(t)
+                        }
+                    }) =>
+            {
+                (
+                    &u.update_token,
+                    "UPDATE without WHERE changes every row in the table",
+                )
+            }
+            Statement::Delete(d)
+                if d.selection.is_none()
+                    && d.limit.is_none()
+                    && !d.using.as_deref().is_some_and(joins)
+                    && !joins(match &d.from {
+                        FromTable::WithFromKeyword(t) | FromTable::WithoutKeyword(t) => t,
+                    }) =>
+            {
+                (
+                    &d.delete_token,
+                    "DELETE without WHERE removes every row in the table",
+                )
+            }
+            _ => return,
+        };
+        let range = to_range(stmt, lo, token.0.span);
+        let after = raw
+            .get(range.1 - lo..)
+            .unwrap_or("")
+            .trim_start()
+            .as_bytes();
+        let top = after.len() > 3
+            && after[..3].eq_ignore_ascii_case(b"TOP")
+            && !crate::sql::is_word_byte(after[3]);
+        if top {
+            return;
+        }
+        out.push(Diagnostic {
+            range,
+            severity: Severity::Warning,
+            message: message.to_string(),
+        });
+    }
+
+    /// `x = NULL`, `x <> NULL`, `x != NULL`: under the standard's (and every
+    /// engine's default) null semantics the answer is unknown for every row,
+    /// so a filter on one keeps nothing. An assignment is not a comparison
+    /// and never reaches here (`SET a = NULL` is an `Assignment`), and a
+    /// variable on the left is left alone, since T-SQL's `SELECT @v = NULL`
+    /// is one parsed as a comparison.
+    fn null_comparisons(stmt: &str, lo: usize, ast: &Statement, out: &mut Vec<Diagnostic>) {
+        let is_null = |e: &Expr| matches!(e, Expr::Value(v) if v.value == Value::Null);
+        let is_variable = |e: &Expr| matches!(e, Expr::Identifier(id) if id.value.starts_with('@'));
+        let _ = visit_expressions(ast, |e| {
+            if let Expr::BinaryOp { left, op, right } = e
+                && matches!(op, BinaryOperator::Eq | BinaryOperator::NotEq)
+                && (is_null(left) || is_null(right))
+                && !is_variable(left)
+            {
+                let fix = if *op == BinaryOperator::Eq {
+                    "IS NULL"
+                } else {
+                    "IS NOT NULL"
+                };
+                out.push(Diagnostic {
+                    range: to_range(stmt, lo, e.span()),
+                    severity: Severity::Warning,
+                    message: format!("A comparison with NULL is never true — use {fix}"),
+                });
+            }
+            ControlFlow::<()>::Continue(())
+        });
     }
 }
 
@@ -19678,6 +19834,105 @@ mod tests {
         }
     }
 
+    // ── lints ────────────────────────────────────────────────────────────────
+
+    /// The warnings whose message carries `needle`, as the squiggled text.
+    fn lint_hits(sql: &str, dialect: SqlDialect, needle: &str) -> Vec<String> {
+        diag_d(sql, dialect)
+            .into_iter()
+            .filter(|d| d.severity == Severity::Warning && d.message.contains(needle))
+            .map(|d| sql[d.range.0..d.range.1].to_string())
+            .collect()
+    }
+
+    /// An `UPDATE` or `DELETE` with no `WHERE` changes every row — the run
+    /// guard asks before running one, and the editor says so as it is
+    /// written, on the verb.
+    #[test]
+    fn an_update_or_delete_without_where_is_flagged_on_its_verb() {
+        for d in SqlDialect::ALL {
+            let hits = |sql| lint_hits(sql, d, "every row");
+            assert_eq!(hits("DELETE FROM employees;"), ["DELETE"], "{d:?}");
+            assert_eq!(
+                hits("update employees set name = 'x';"),
+                ["update"],
+                "{d:?}"
+            );
+            assert!(
+                hits("DELETE FROM employees WHERE id = 1;").is_empty(),
+                "{d:?}"
+            );
+            assert!(
+                hits("UPDATE employees SET name = 'x' WHERE id = 1;").is_empty(),
+                "{d:?}"
+            );
+            assert!(hits("SELECT * FROM employees;").is_empty(), "{d:?}");
+        }
+        // Each statement on its own: the scoped one does not lend the other
+        // its WHERE.
+        let sql = "DELETE FROM employees WHERE id = 1;\nDELETE FROM departments;";
+        let hits = lint_hits(sql, SqlDialect::MySql, "every row");
+        assert_eq!(hits, ["DELETE"]);
+        let at = diag(sql)
+            .into_iter()
+            .find(|d| d.message.contains("every row"))
+            .unwrap();
+        assert_eq!(at.range.0, sql.rfind("DELETE").unwrap());
+        // A write that joins is filtered by its join.
+        let ms = |sql| lint_hits(sql, SqlDialect::MsSql, "every row");
+        assert!(
+            ms("UPDATE e SET name = d.name FROM employees e \
+                JOIN departments d ON d.id = e.dept_id;")
+            .is_empty()
+        );
+        assert!(ms("DELETE e FROM employees e JOIN departments d ON d.id = e.dept_id;").is_empty());
+        let my = |sql| lint_hits(sql, SqlDialect::MySql, "every row");
+        assert!(
+            my("UPDATE employees e JOIN departments d ON d.id = e.dept_id SET e.name = d.name;")
+                .is_empty()
+        );
+        // A FROM or USING that only lists a table is a cross join: every row.
+        let pg = |sql| lint_hits(sql, SqlDialect::Postgres, "every row");
+        assert_eq!(
+            pg("UPDATE employees SET name = d.name FROM departments d;"),
+            ["UPDATE"]
+        );
+        assert_eq!(pg("DELETE FROM employees USING departments;"), ["DELETE"]);
+        // A routine's body is the routine's business.
+        assert!(ms("CREATE PROCEDURE dbo.p AS BEGIN DELETE FROM employees; END;").is_empty());
+        // A bounded write is a batch: TOP, LIMIT.
+        assert!(ms("DELETE TOP (10) FROM employees;").is_empty());
+        assert!(ms("UPDATE TOP (5) employees SET name = N'x';").is_empty());
+        assert!(my("DELETE FROM employees LIMIT 100;").is_empty());
+        // A table called `top_x` is no TOP.
+        assert_eq!(ms("UPDATE topx SET a = 1;"), ["UPDATE"]);
+    }
+
+    /// `= NULL` and `<> NULL` are never true; `IS NULL` is what was meant.
+    /// An assignment is not a comparison — `SET a = NULL` — and neither is
+    /// T-SQL's `SELECT @v = NULL`.
+    #[test]
+    fn a_comparison_with_null_is_flagged() {
+        let my = |sql| lint_hits(sql, SqlDialect::MySql, "IS ");
+        assert_eq!(
+            my("SELECT * FROM employees WHERE name = NULL;"),
+            ["name = NULL"]
+        );
+        assert_eq!(
+            my("SELECT * FROM employees WHERE NULL <> name OR id != NULL;"),
+            ["NULL <> name", "id != NULL"]
+        );
+        assert!(my("SELECT * FROM employees WHERE name IS NULL;").is_empty());
+        assert!(my("SELECT * FROM employees WHERE name <=> NULL;").is_empty());
+        assert!(my("UPDATE employees SET name = NULL WHERE id = 1;").is_empty());
+        let ms = |sql| lint_hits(sql, SqlDialect::MsSql, "IS ");
+        assert!(ms("DECLARE @v INT; SELECT @v = NULL;").is_empty());
+        assert_eq!(
+            ms("SELECT * FROM employees WHERE name = NULL;"),
+            ["name = NULL"]
+        );
+    }
+
     #[test]
     fn diag_column_per_scope_subquery() {
         // Unknown in the OUTER scope is flagged; the inner subquery resolves against
@@ -21765,10 +22020,11 @@ mod tests {
             "SET @s += N'x';",
             "SELECT @s += 1;",
             "SELECT @a = 1, @b -= 2;",
-            "UPDATE employees SET salary += 1, name = N'x';",
+            // Each write has a WHERE, so the every-row lint stays out of it.
+            "UPDATE employees SET salary += 1, name = N'x' WHERE id = 1;",
             "UPDATE employees SET name = N'x', salary *= 2 WHERE id = 1;",
-            "UPDATE e SET e.salary /= 2 FROM employees e;",
-            "UPDATE employees SET salary = (SELECT 1), dept_id |= 4;",
+            "UPDATE e SET e.salary /= 2 FROM employees e WHERE e.id = 1;",
+            "UPDATE employees SET salary = (SELECT 1), dept_id |= 4 WHERE id = 1;",
             "MERGE employees AS t USING departments AS s ON t.id = s.id \
              WHEN MATCHED THEN UPDATE SET t.salary += 1;",
             "SELECT * FROM employees OPTION (RECOMPILE);",
@@ -22824,7 +23080,8 @@ mod tests {
             "CREATE TRIGGER dbo.tr ON employees AFTER UPDATE AS SET NOCOUNT ON \
              UPDATE e SET name = i.name FROM employees e JOIN inserted i ON i.id = e.id",
             "SET XACT_ABORT ON\nUPDATE TOP (5) employees SET name = N'x'\nSELECT 1",
-            "SET ANSI_NULLS ON\nUPDATE employees WITH (ROWLOCK) SET name = N'x'\nSELECT 1",
+            // A WHERE, or the every-row lint would draw the squiggle.
+            "SET ANSI_NULLS ON\nUPDATE employees WITH (ROWLOCK) SET name = N'x' WHERE id = 1\nSELECT 1",
             "SET NOCOUNT ON\nDELETE TOP (10) FROM employees\nSELECT 1",
             "SET NOCOUNT ON\nDELETE FROM employees FROM employees e \
              JOIN departments d ON d.id = e.dept_id\nSELECT 1",

@@ -875,8 +875,22 @@ existing prose was left alone.
     whole primary key, MySQL's own functional-dependency exemption (`pk_of`) — and
     `cartesian_check` on a `JOIN`/`INNER JOIN`/`STRAIGHT_JOIN` with no `ON`/`USING`, which runs as a
     cross join; an explicit `CROSS JOIN` and a comma-join are meant, and left alone).
+    **The `lints` module** adds warnings on every clean parse of a unit, whatever the statement:
+    an `UPDATE`/`DELETE` with no `WHERE`, squiggled on its verb (`update_token`/`delete_token`), and
+    `= NULL`/`<> NULL`/`!= NULL`, squiggled on the comparison, naming `IS [NOT] NULL`
+    (`an_update_or_delete_without_where_is_flagged_on_its_verb`,
+    `a_comparison_with_null_is_flagged`). The first is **narrower than the run guard's
+    `sql::every_row_reason` on purpose**, since a squiggle is drawn on every keystroke's worth of
+    text and a confirm only on Run: a write that *joins* (`UPDATE … FROM t JOIN u ON …`, MySQL's
+    `UPDATE a JOIN b`, `DELETE t FROM t JOIN u ON …`) is filtered by its join, and a bounded one
+    (`TOP (n)`, which reaches it blanked by `grammar_gap_masks` and is read from the unmasked text
+    after the verb, or `LIMIT n`) is a batch — while a `FROM`/`USING` that only lists a table is a
+    cross join and still flagged. Nor does it run inside a T-SQL routine's body (`range_diagnostics`'
+    `in_body`, from `Unit::header`), where `DELETE FROM staging` is the point of the routine. The
+    `NULL` check skips a variable on the left, since T-SQL's `SELECT @v = NULL` is an assignment that
+    parses as a comparison; `SET a = NULL` is an `Assignment` and never reaches it.
     **AST for classification, `skip_noncode` for byte positions by default** —
-    except `colres`, which uses sqlparser 0.62's now-accurate per-identifier *spans* (verified) so the
+    except `colres` and `lints`, which use sqlparser 0.62's now-accurate per-identifier *spans* (verified) so the
     same column name in an inner vs outer scope is placed independently. **A base table exposes more than
     its introspected columns**, so both column checks add `SqlDialect::implicit_columns` — SQLite's
     `rowid`/`_rowid_`/`oid`, PostgreSQL's `ctid`/`tableoid`/`xmin`/`xmax`/`cmin`/`cmax`, none on MySQL — to
