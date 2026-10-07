@@ -11791,6 +11791,25 @@ existing prose was left alone.
     first join, and a selection is re-mapped over the joined text
     (`join_lines_joins_every_spanned_line_and_keeps_the_selection`). The pane takes it in
     `toggle_case`'s arm, so on one caret or selection only and through `edit_untyped`.
+    `toggle_block_comment` is Ctrl+Shift+/, DataGrip's key as well. It **unwraps first**: a walk over
+    `sql::skip_noncode` looks for the block comment that strictly contains a bare caret, or is
+    exactly a bare caret's line text — so a caret at either end of a line that is only a comment
+    still unwraps it — or contains the whole selection, outer blanks aside; the `/*` and `*/` go,
+    with one space inside each if there is one. Only a span of at least four bytes that opens `/*`
+    and ends `*/` counts, so an unclosed comment is never unwrapped, nor a MySQL executable
+    `/*!…*/`, which the lexer returns as code. Otherwise it **wraps** the selection, or a bare
+    caret's line, as `/* … */` with the outer blanks left outside — refused when that range is
+    empty, when either end is not in code (`pairs::region_at`: a range starting or ending in a
+    string would put the comment in the data), or when the wrapped text does not lex back as one
+    comment ending at its own `*/`. That last check is how an inner `*/` is refused on MySQL and
+    SQLite, where it ends the comment early and leaves the rest as code, and allowed where comments
+    nest (PostgreSQL, SQL Server) — without asking the dialect a second time. A selection stays over
+    the comment or the unwrapped text, so a second press undoes the first; a bare caret keeps its
+    place in the text (`block_comment_wraps_a_selection_and_unwraps_it_again`,
+    `block_comment_on_a_bare_caret_takes_the_line_or_its_comment`,
+    `block_comment_is_refused_where_the_wrap_would_not_be_one_comment`). The pane takes it in the
+    same arm, matched on the physical `KeyCode::Slash` because Shift makes the character `?` on a
+    US layout.
     **`contains_collapsed_ignore_ascii_case` is the same search against a haystack read *as if* its
     whitespace runs were collapsed, without building the collapsed string** — exactly
     `split_whitespace().collect::<Vec<_>>().join(" ")`, which is what it replaces. The two search

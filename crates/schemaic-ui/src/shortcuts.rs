@@ -93,6 +93,7 @@ pub(crate) const SHORTCUTS: &[ShortcutGroup] = &[
             ("Ctrl+G", "Go to line"),
             ("Ctrl+Shift+\\", "Jump to the matching bracket"),
             ("Ctrl+/", "Toggle line comment"),
+            ("Ctrl+Shift+/", "Toggle block comment"),
             ("Ctrl+Shift+U", "Toggle case"),
             ("Ctrl+Shift+J", "Join lines"),
             ("Ctrl+D", "Duplicate line / selection"),

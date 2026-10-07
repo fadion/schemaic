@@ -1,6 +1,6 @@
 //! Pure editor text operations (no UI): the query editor's line and selection
 //! edits (Ctrl+/, Ctrl+D, Ctrl+X, Alt+↑↓, Tab/Shift+Tab, Enter, Ctrl+Shift+U,
-//! Ctrl+Shift+J), the search helpers the find surfaces share, and line/column
+//! Ctrl+Shift+J, Ctrl+Shift+/), the search helpers the find surfaces share, and line/column
 //! arithmetic. Each edit is computed with the selection the caret should occupy
 //! afterwards, which the pane applies as one edit through `edit_untyped` (so
 //! it's one undo step).
@@ -370,6 +370,112 @@ fn floor_char(full: &str, i: usize) -> usize {
     i
 }
 
+/// Ctrl+Shift+/: wrap the selection — or, on a bare caret, its line's text —
+/// in `/* … */`, or unwrap the block comment it already sits in.
+///
+/// - **Unwrap** when the caret is inside a block comment, or at either end of
+///   a line that is only one, or the selection (its outer blanks aside) lies
+///   within one: the `/*` and `*/` go, with one
+///   space inside each if there is one.
+/// - **Wrap** otherwise, the selection's outer blanks left outside. The result
+///   is lexed before it is offered: it has to be one comment ending at its own
+///   `*/`. An inner `*/` ends a comment early on MySQL and SQLite — wrapping
+///   would leave the rest as code — and is fine where comments nest; a range
+///   starting or ending inside a string would put the comment in the data.
+///   Either is `None`, as is a range with nothing in it.
+///
+/// A selection stays over the wrapped comment or the unwrapped text, so a
+/// second press undoes the first; a bare caret keeps its place in the text.
+pub fn toggle_block_comment(
+    full: &str,
+    sel_a: usize,
+    sel_b: usize,
+    dialect: SqlDialect,
+) -> Option<IndentEdit> {
+    let b = full.as_bytes();
+    let len = full.len();
+    let lo = floor_char(full, sel_a.min(sel_b));
+    let hi = floor_char(full, sel_a.max(sel_b));
+    let bare = lo == hi;
+    // What would be wrapped: the selection, or the caret's line, unpadded.
+    let (from, to) = if bare {
+        let ls = full[..lo].rfind('\n').map_or(0, |i| i + 1);
+        let le = full[lo..].find('\n').map_or(len, |i| lo + i);
+        (ls, le)
+    } else {
+        (lo, hi)
+    };
+    let s = &full[from..to];
+    let rlo = from + (s.len() - s.trim_start().len());
+    let rhi = rlo + s.trim().len();
+
+    // Unwrap: the block comment the caret, or the whole selection, sits in.
+    let limit = if bare { lo } else { rlo };
+    let mut i = 0;
+    while i < len && i <= limit {
+        let Some(j) = skip_noncode(b, i, dialect) else {
+            i += 1;
+            continue;
+        };
+        let j = j.max(i + 1);
+        let block = j - i >= 4 && full[i..j].starts_with("/*") && full[..j].ends_with("*/");
+        // A bare caret also unwraps a line that is only the comment, from
+        // either end of it.
+        let inside = if bare {
+            (i < lo && lo < j) || (i == rlo && j == rhi)
+        } else {
+            rlo < rhi && i <= rlo && rhi <= j
+        };
+        if block && inside {
+            let inner = &full[i + 2..j - 2];
+            let lead = usize::from(inner.starts_with(' '));
+            let inner = &inner[lead..];
+            let text = inner.strip_suffix(' ').unwrap_or(inner).to_string();
+            let sel = if bare {
+                let at = i + (lo.saturating_sub(i + 2 + lead)).min(text.len());
+                (at, at)
+            } else {
+                (i, i + text.len())
+            };
+            return Some(IndentEdit {
+                start: i,
+                end: j,
+                text,
+                sel,
+            });
+        }
+        i = j;
+    }
+
+    // Wrap — only what lexes back as one comment, ending at its own `*/`,
+    // and only a range whose ends are both in code.
+    if rlo == rhi
+        || region_at(full, rlo, dialect) != Region::Code
+        || region_at(full, rhi, dialect) != Region::Code
+    {
+        return None;
+    }
+    let text = format!("/* {} */", &full[rlo..rhi]);
+    if skip_noncode(text.as_bytes(), 0, dialect) != Some(text.len()) {
+        return None;
+    }
+    let sel = if !bare {
+        (rlo, rlo + text.len())
+    } else if lo < rlo {
+        (lo, lo)
+    } else if lo <= rhi {
+        (lo + 3, lo + 3)
+    } else {
+        (lo + 6, lo + 6)
+    };
+    Some(IndentEdit {
+        start: rlo,
+        end: rhi,
+        text,
+        sel,
+    })
+}
+
 /// Ctrl+D's duplicate: the line(s) spanned by `[sel_start, sel_end]` copied onto
 /// fresh lines below them. Returns `(at, insert, sel)` — insert `insert` at
 /// `at` (the end of the last spanned line, before its newline) and reapply
@@ -640,9 +746,10 @@ pub fn line_col_of_offset(text: &str, offset: usize) -> (usize, usize) {
 }
 
 /// A single text replacement plus the selection to apply afterward — the result
-/// of a Tab, Shift+Tab, Enter, Ctrl+Shift+U or Ctrl+Shift+J
+/// of a Tab, Shift+Tab, Enter, Ctrl+Shift+U, Ctrl+Shift+J or Ctrl+Shift+/
 /// ([`soft_tab_indent`], [`hard_tab_indent`], [`soft_tab_outdent`],
-/// [`newline_indent`], [`toggle_case`], [`join_lines`]).
+/// [`newline_indent`], [`toggle_case`], [`join_lines`],
+/// [`toggle_block_comment`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndentEdit {
     /// Byte range in the original text to replace.
@@ -1554,6 +1661,69 @@ mod tests {
             join("{a,\nb -- x\nc,\nd}", MySql).unwrap(),
             "{a, b -- x\nc, d}"
         );
+    }
+
+    /// Toggle a block comment at the `|` (or over `{`…`}`) in `src`, rendered
+    /// as [`join`] renders.
+    fn block(src: &str, dialect: SqlDialect) -> Option<String> {
+        let (sel, clean) = match (src.find('{'), src.find('}')) {
+            (Some(lo), Some(hi)) => ((lo, hi - 1), src.replacen(['{', '}'], "", 2)),
+            _ => {
+                let at = src.find('|').expect("a caret");
+                ((at, at), src.replacen('|', "", 1))
+            }
+        };
+        toggle_block_comment(&clean, sel.0, sel.1, dialect).map(|e| applied(&clean, &e))
+    }
+
+    #[test]
+    fn block_comment_wraps_a_selection_and_unwraps_it_again() {
+        use SqlDialect::MySql;
+        let wrapped = block("SELECT {a, b} FROM t", MySql).unwrap();
+        assert_eq!(wrapped, "SELECT {/* a, b */} FROM t");
+        assert_eq!(block(&wrapped, MySql).unwrap(), "SELECT {a, b} FROM t");
+        // Outer blanks stay outside the comment.
+        assert_eq!(
+            block("SELECT{ a }FROM", MySql).unwrap(),
+            "SELECT {/* a */} FROM"
+        );
+        // A selection inside a comment unwraps the whole of it.
+        assert_eq!(block("x /*a {b} c*/ y", MySql).unwrap(), "x {a b c} y");
+    }
+
+    #[test]
+    fn block_comment_on_a_bare_caret_takes_the_line_or_its_comment() {
+        use SqlDialect::MySql;
+        assert_eq!(
+            block("  SEL|ECT 1\nx", MySql).unwrap(),
+            "  /* SEL|ECT 1 */\nx"
+        );
+        assert_eq!(
+            block("SELECT /* n|ote */ 1", MySql).unwrap(),
+            "SELECT n|ote 1"
+        );
+        assert_eq!(
+            block("  |/* SELECT 1 */\nx", MySql).unwrap(),
+            "  |SELECT 1\nx"
+        );
+        assert_eq!(block("/* a */|", MySql).unwrap(), "a|");
+        assert_eq!(block("a\n  |  \nb", MySql), None, "a blank line");
+    }
+
+    #[test]
+    fn block_comment_is_refused_where_the_wrap_would_not_be_one_comment() {
+        use SqlDialect::{MySql, Postgres};
+        // An inner `*/` ends the comment early on MySQL; PostgreSQL nests.
+        assert_eq!(block("{a /* b */ c}", MySql), None);
+        assert_eq!(
+            block("{a /* b */ c}", Postgres).unwrap(),
+            "{/* a /* b */ c */}"
+        );
+        // A range that starts or ends inside a string.
+        assert_eq!(block("SELECT 'a{bc' x}", MySql), None);
+        assert_eq!(block("SELECT {x 'ab}c'", MySql), None);
+        // An executable comment is code, not a comment to unwrap.
+        assert_eq!(block("SELECT /*!50000 1| */", MySql), None);
     }
 
     /// Press Enter at the `|` (or over `{`…`}`) in `src` and render the result

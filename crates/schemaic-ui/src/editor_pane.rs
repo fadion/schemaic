@@ -46,8 +46,8 @@ use schemaic_core::prompt::{self, FixOrigin};
 use schemaic_core::sql::statement_range;
 use schemaic_core::text_ops::{
     find_matches, find_seed, first_hit_from, join_lines, matches_at, move_line, newline_indent,
-    offset_of_line, replace_all, soft_tab_indent, soft_tab_outdent, toggle_case,
-    toggle_line_comment,
+    offset_of_line, replace_all, soft_tab_indent, soft_tab_outdent, toggle_block_comment,
+    toggle_case, toggle_line_comment,
 };
 
 use crate::completion::{
@@ -3031,25 +3031,34 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         // Ctrl+Shift+U — toggle the case of the selection, or of the word at
         // the caret: `text_ops::toggle_case`. Ctrl+Shift+J — join the caret's
         // line with the next, or the selected lines: `text_ops::join_lines`.
-        // Both DataGrip's keys.
-        if primary_held(mods)
-            && mods.shift()
-            && !mods.alt()
-            && let KeyInput::Keyboard(Key::Character(c), _) = &kp.key
-            && (c.as_str().eq_ignore_ascii_case("u") || c.as_str().eq_ignore_ascii_case("j"))
-        {
-            let join = c.as_str().eq_ignore_ascii_case("j");
+        // Ctrl+Shift+/ — wrap in or unwrap a block comment:
+        // `text_ops::toggle_block_comment`, matched physically since Shift
+        // turns the `/` into `?` on a US layout. All three DataGrip's keys.
+        let selection_op = if primary_held(mods) && mods.shift() && !mods.alt() {
+            use floem::keyboard::{KeyCode, PhysicalKey};
+            match &kp.key {
+                KeyInput::Keyboard(_, PhysicalKey::Code(KeyCode::Slash)) => Some('/'),
+                KeyInput::Keyboard(Key::Character(c), _) if c.eq_ignore_ascii_case("u") => {
+                    Some('u')
+                }
+                KeyInput::Keyboard(Key::Character(c), _) if c.eq_ignore_ascii_case("j") => {
+                    Some('j')
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some(op) = selection_op {
             let dia = dialect.get_untracked();
             editor_sig.with_untracked(|e| {
                 let cur = e.cursor.get_untracked();
                 let off = cur.offset();
                 let (a, b) = cur.get_selection().unwrap_or((off, off));
-                let Some(ed) = query.with_untracked(|t| {
-                    if join {
-                        join_lines(t, a, b, dia)
-                    } else {
-                        toggle_case(t, a, b)
-                    }
+                let Some(ed) = query.with_untracked(|t| match op {
+                    'j' => join_lines(t, a, b, dia),
+                    '/' => toggle_block_comment(t, a, b, dia),
+                    _ => toggle_case(t, a, b),
                 }) else {
                     return;
                 };
