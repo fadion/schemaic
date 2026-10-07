@@ -13046,7 +13046,9 @@ existing prose was left alone.
       database, PostgreSQL's `schema.t` and nothing from another database, which its connection
       cannot reach (`the_widened_list_offers_every_table_fully_qualified`,
       `a_table_is_named_from_the_sessions_database`). The row shows the reference with its quotes
-      off and is matched by it. In the UI `Completion::wide` is set by a Ctrl+Space over an open
+      off and is matched by it. **A view's row wears the view glyph** (`SuggestGlyph::View`, the
+      schema tree's `TABLE_CELLS_MERGE`), from `SchemaIndex::views`, at a table slot and after its
+      database's qualifier (`a_view_is_told_from_a_table`). In the UI `Completion::wide` is set by a Ctrl+Space over an open
       list, kept while it stays open, and cleared when a list next opens by typing.
       **Straight after a sigil the list is the document's own names and nothing else**:
       `ClauseCtx::Variable` after one `@` where the engine has `@` variables (`has_at_variables`:

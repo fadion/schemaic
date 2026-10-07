@@ -118,6 +118,8 @@ fn glyph_icon(glyph: SuggestGlyph, kind: SuggestKind) -> &'static str {
         SuggestGlyph::ForeignKey => icons::KEY_SQUARE,
         SuggestGlyph::Alias => icons::TAG,
         SuggestGlyph::Table => icons::TABLE,
+        // The schema tree's view glyph, so the two read alike.
+        SuggestGlyph::View => icons::TABLE_CELLS_MERGE,
     }
 }
 
@@ -363,6 +365,7 @@ mod index {
         let mut tables_by_schema: HashMap<String, Vec<String>> = HashMap::new();
         // Every contributing database's tables, for the widened list.
         let mut all_tables: Vec<rank::IndexedTable> = Vec::new();
+        let mut views: HashSet<(String, String)> = HashSet::new();
         for node in nodes {
             if !db_contributes(hidden, &node.database, active_db) {
                 continue;
@@ -385,6 +388,9 @@ mod index {
                         schema: t.schema.clone(),
                         name: t.name.clone(),
                     });
+                    if t.is_view {
+                        views.insert((db_lower.clone(), t.name.to_ascii_lowercase()));
+                    }
                     let metas = col_metas(t);
                     if in_scope && let Some(ns) = &t.schema {
                         let ns = ns.to_ascii_lowercase();
@@ -469,6 +475,7 @@ mod index {
             columns_by_schema,
             tables_by_schema,
             all_tables,
+            views,
         }
     }
 }

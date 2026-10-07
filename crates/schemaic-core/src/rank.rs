@@ -74,6 +74,8 @@ pub enum SuggestGlyph {
     Alias,
     /// A table, whatever the row's kind says.
     Table,
+    /// A view, which the schema tree tells from a table by its glyph too.
+    View,
 }
 
 /// One ranked autocomplete row: the text inserted, its kind, a dim detail (a
@@ -154,6 +156,9 @@ pub struct SchemaIndex {
     /// what the widened list ([`RankInput::wide`]) names, each through
     /// [`crate::filter::table_name_from`].
     pub all_tables: Vec<IndexedTable>,
+    /// `(database, name)` (both lowercase) of every view, so a table row can
+    /// say it is one.
+    pub views: HashSet<(String, String)>,
 }
 
 /// One table as [`SchemaIndex::all_tables`] holds it.
@@ -364,6 +369,17 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
             insert: None,
             replace: None,
         });
+    };
+    // A table row just added (past `before`) that names a view wears the
+    // view's glyph, as the schema tree's node does.
+    let mark_view = |cands: &mut Vec<Cand>, before: usize, db: &str, name: &str| {
+        let key = (db.to_ascii_lowercase(), name.to_ascii_lowercase());
+        if cands.len() > before
+            && schema.views.contains(&key)
+            && let Some(c) = cands.last_mut()
+        {
+            c.glyph = SuggestGlyph::View;
+        }
     };
     // A name the statement declares itself: inserted as the statement spelled
     // it, never re-quoted by the engine's rules (see `intel::LocalName`).
@@ -628,7 +644,9 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
                 .or_else(|| schema.tables_by_schema.get(&q.to_ascii_lowercase()))
             {
                 for t in tbls {
+                    let before = cands.len();
                     add(&mut cands, &mut seen, t, SuggestKind::Table, q, 0);
+                    mark_view(&mut cands, before, q, t);
                 }
             }
         }
@@ -685,6 +703,7 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
                 table_tier
             };
             for (name, db) in &schema.tables {
+                let before = cands.len();
                 add(
                     &mut cands,
                     &mut seen,
@@ -693,6 +712,7 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
                     db,
                     plain_tier,
                 );
+                mark_view(&mut cands, before, db, name);
             }
             // Databases are offered only once a prefix is typed (so an empty
             // FROM/JOIN list stays tables-only) and never the active one — cross-db
@@ -1473,6 +1493,53 @@ mod tests {
         assert_eq!(rows(ClauseCtx::Variable, "t"), ["tag", "total"]);
         assert_eq!(rows(ClauseCtx::TempTable, ""), ["work"]);
         assert!(rows(ClauseCtx::Variable, "to").iter().all(|r| r != "TOP"));
+    }
+
+    /// A view's row wears the view glyph, at a table slot and after its
+    /// database's qualifier; a table's the table one.
+    #[test]
+    fn a_view_is_told_from_a_table() {
+        let mut s = shop();
+        s.tables
+            .push(("open_orders".to_string(), "shop".to_string()));
+        s.tables_by_db
+            .get_mut("shop")
+            .unwrap()
+            .push("open_orders".to_string());
+        s.views
+            .insert(("shop".to_string(), "open_orders".to_string()));
+        let glyph = |ctx: ClauseCtx, name: &str| {
+            let cont = Continuation::default();
+            let used = HashSet::new();
+            rank(
+                &s,
+                &RankInput {
+                    ctx: &ctx,
+                    cont: &cont,
+                    scope: &[],
+                    prefix: "o",
+                    snippets: &[],
+                    join_targets: &[],
+                    star: None,
+                    used: &used,
+                    active_db: Some("shop"),
+                    dialect: SqlDialect::MySql,
+                    flavour: ServerFlavour::Unknown,
+                    local: &LocalNames::default(),
+                    wide: false,
+                },
+            )
+            .into_iter()
+            .find(|r| r.text == name)
+            .map(|r| r.glyph)
+        };
+        assert_eq!(
+            glyph(ClauseCtx::Table, "open_orders"),
+            Some(SuggestGlyph::View)
+        );
+        assert_eq!(glyph(ClauseCtx::Table, "orders"), Some(SuggestGlyph::Kind));
+        let q = ClauseCtx::Qualified("shop".to_string());
+        assert_eq!(glyph(q, "open_orders"), Some(SuggestGlyph::View));
     }
 
     /// **The widened list** names every database's and schema's tables at a
