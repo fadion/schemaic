@@ -2806,12 +2806,15 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 } else {
                     schemaic_core::text_ops::hard_tab_indent(&full, a, b)
                 };
+                // `Indent`, not `InsertChars`: floem merges consecutive edits of
+                // those two kinds into one undo step, and a Tab merged with the
+                // typing around it was undone along with it.
                 if edit_untyped(
                     e,
                     comp,
                     Selection::region(ed.start, ed.end),
                     &ed.text,
-                    EditType::InsertChars,
+                    EditType::Indent,
                 ) {
                     e.cursor
                         .update(|c| c.set_insert(Selection::region(ed.sel.0, ed.sel.1)));
@@ -2891,7 +2894,9 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                         comp,
                         Selection::region(ed.start, ed.end),
                         &ed.text,
-                        EditType::InsertChars,
+                        // `Outdent`, as Tab's is `Indent`: never merged
+                        // with the typing around it into one undo step.
+                        EditType::Outdent,
                     )
                 {
                     e.cursor
@@ -3130,7 +3135,8 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                         comp,
                         Selection::region(at, at),
                         &insert,
-                        EditType::InsertChars,
+                        // Its own undo step — `InsertChars` merges with typing.
+                        EditType::Other,
                     ) {
                         // The same selection or caret, on the copy.
                         e.cursor.update(|c| {
@@ -3173,7 +3179,9 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                             comp,
                             Selection::region(0, full.len()),
                             &cut.text,
-                            EditType::Delete,
+                            // `Cut`: a `Delete` merges with the Backspaces
+                            // around it into one undo step.
+                            EditType::Cut,
                         ) {
                             let _ = floem::Clipboard::set_contents(cut.clipboard);
                             e.cursor.update(|c| c.set_offset(cut.caret, false, false));

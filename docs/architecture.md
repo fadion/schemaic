@@ -32076,6 +32076,25 @@ Re-introducing the anti-patterns these guard against is a regression:
   turning `TextDocument::auto_indent` on is not how to make Enter indent — it would indent by four
   spaces under any setting — and every indenting key is computed in `core::text_ops` and applied
   through `edit_untyped` instead: Tab, Shift+Tab and Enter (under `text_ops.rs`).
+- **The `EditType` a programmatic edit passes is a decision about undo, not a label.** Floem
+  groups undo steps by it: `EditType::breaks_undo_group` (`floem-editor-core` 0.2, `editor.rs`)
+  keeps an edit in the previous group only when both are `InsertChars` or both are `Delete` —
+  the kinds floem's own typing and Backspace use — and starts a new group for every other kind.
+  `InsertChars` reads as the natural type for an insertion, and that is how Tab, Shift+Tab and
+  Ctrl+D came to pass it to `edit_untyped`, and Ctrl+X on bare carets `Delete`: each merged with
+  the typing or the Backspaces around it, and one Ctrl+Z took both away. They now pass `Indent`,
+  `Outdent`, `Other` and `Cut`. The pane's other programmatic edits already carried a kind that
+  never merges — `InsertNewline` for Enter, `ToggleComment`, `MoveLine`, `Completion`, `Paste`
+  for the Ctrl+K accept, `Other` for the Ctrl+Shift+J/U and Ctrl+Shift+/ arms, the format, the find
+  bar's Replace and Replace All and the snippet library. **Two keep a merging kind on purpose**,
+  both through a raw `doc.edit_single` rather than the funnel: the auto-pair insert is
+  `InsertChars` because it *is* a typed character, and the empty-pair Backspace is `Delete`
+  because it is a Backspace. What it costs: two Tabs in a row are two undo steps, since a
+  non-merging kind does not merge with itself either. What it does not cover: every keystroke is
+  `InsertChars`, so a run of typing is still one undo step however long — nothing breaks it at
+  word boundaries. No test can fail on any of this, the choice being made at view call sites and
+  the merge being floem's; the comments at the Tab, Shift+Tab, Ctrl+D and Ctrl+X sites are what a tidy-up
+  back to `InsertChars` has to read.
 - **Shift+wheel → horizontal scroll in the editor.** The editor owns its scroll internally, so
   `shift_hscroll` can't reach it. Register a `PointerWheel` listener on the internal scroll view —
   reached via `ed.editor_view_id.get_untracked().and_then(|c| c.parent())` (the content view's parent
