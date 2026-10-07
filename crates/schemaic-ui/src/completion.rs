@@ -1572,13 +1572,44 @@ pub(crate) fn completion_popup(
             // The height cap comes from the same placement the outer style uses, so a
             // list squeezed against the top or bottom of the pane shortens instead of
             // overhanging it.
+            // **The selected function's summary, under the list** — one line,
+            // ellipsized, for the row the keyboard is on rather than beside
+            // every row, which would make the popup as wide as the longest
+            // description. It counts as a row in the placement, and its height
+            // comes off the scroll's, so a flipped popup still clears the caret.
+            let summary = move || selected_summary(comp, dialect.get());
+            let footer = label(move || summary().unwrap_or_default().to_string()).style(move |s| {
+                s.width_full()
+                    .min_width(0.0)
+                    .text_ellipsis()
+                    .font_size(completion_annot_size())
+                    .color(theme::text_muted())
+                    .padding_horiz(completion_row_pad())
+                    .padding_vert(theme::scaled(5.0))
+                    .border_top(1.0)
+                    .border_color(theme::completion_border())
+                    .apply_if(summary().is_none(), |s| s.hide())
+            });
             container(
-                autohide(scroll(list).scroll_to_view(move || row_ids.get(comp.sel.get()).copied()))
+                v_stack((
+                    autohide(
+                        scroll(list).scroll_to_view(move || row_ids.get(comp.sel.get()).copied()),
+                    )
                     .style(move |s| {
                         let (line_top, line_bot, _) = anchor();
-                        let place = popup_placement(line_top, line_bot, rows_n, area_h.get());
-                        s.width_full().max_height(place.max_h)
+                        let shown = summary().is_some();
+                        let place = popup_placement(
+                            line_top,
+                            line_bot,
+                            rows_n + usize::from(shown),
+                            area_h.get(),
+                        );
+                        let footer_h = if shown { completion_row_h() } else { 0.0 };
+                        s.width_full().max_height((place.max_h - footer_h).max(0.0))
                     }),
+                    footer,
+                ))
+                .style(|s| s.flex_col().width_full()),
             )
             .style(|s| {
                 s.width_full()
@@ -1613,7 +1644,9 @@ pub(crate) fn completion_popup(
         let s = s.z_index(1000);
         if comp.open.get() {
             let (line_top, line_bot, caret_x) = anchor();
-            let rows = comp.items.with(Vec::len);
+            // The summary footer is one row more — see the list's own style.
+            let footer = usize::from(selected_summary(comp, dialect.get()).is_some());
+            let rows = comp.items.with(Vec::len) + footer;
             let place = popup_placement(line_top, line_bot, rows, area_h.get());
             // An explicit width, not `min_width`/`max_width`: the left edge has to be
             // computed against the width to slide the box back inside the pane, and a
@@ -1626,6 +1659,18 @@ pub(crate) fn completion_popup(
         } else {
             s
         }
+    })
+}
+
+/// The selected row's one-line summary, when it is a function the engine's
+/// catalogue describes ([`intel::builtin_summary`]) — the popup's footer.
+/// Tracked: it follows `comp.sel` as the keyboard walks the list.
+fn selected_summary(comp: Completion, dialect: SqlDialect) -> Option<&'static str> {
+    let sel = comp.sel.get();
+    comp.items.with(|v| {
+        v.get(sel)
+            .filter(|s| s.kind == rank::SuggestKind::Function)
+            .and_then(|s| intel::builtin_summary(dialect, &s.text))
     })
 }
 

@@ -1417,6 +1417,12 @@ existing prose was left alone.
     and "shows the wrong engine's" are one defect with two faces. `rank` reaches the map through
     `offered_builtins` now rather than calling `builtin_catalog` itself, which leaves the map with
     no caller outside this module and is the same "one place to forget an engine" one hop on.
+    `builtin_summary(dialect, name)` is the fourth asker and keeps that shape: the completion
+    popup's footer (under `completion.rs`) wants the selected function's one-line `summary`, and
+    it reads it out of `builtin_catalog(dialect)` — the catalogue signature help reads, matched in
+    any case — so a name the engine lacks answers `None` rather than another engine's description
+    (`a_builtins_summary_is_found_by_name_in_its_engines_catalogue`, which asks `DATE_FORMAT` of
+    PostgreSQL for exactly that).
     **`is_offered_builtin` is where those two surfaces part company again**, because trusting a name
     and offering it are not the same question: `builtin_catalog` is what the checker **trusts**,
     whole, and `is_offered_builtin(dialect, flavour, name)` is what `rank`'s `ClauseCtx::Column` arm
@@ -23467,6 +23473,19 @@ existing prose was left alone.
     `editor_remembered_predictions` one, for the remembered kind; each is read only there — neither
     is the switch on its own: a ghost already drawn when either setting goes off is cleared by an effect under
     `editor_pane.rs`, where before it stayed and Tab still took it until the next edit.
+    **The selected function's summary is a footer under the list, not a column beside each row** —
+    a column would widen the popup to the longest description in it. `selected_summary` reads
+    `comp.sel` and `comp.items` tracked, so the footer follows the keyboard, and answers only for a
+    `SuggestKind::Function` row, through `intel::builtin_summary`: the catalogue signature help
+    reads, so the footer never describes a function the engine has not got. One line, ellipsized,
+    muted, at `completion_annot_size`, under a top border, and hidden when there is nothing to say.
+    `natural_width` does not count it — it ellipsizes to the width the rows chose. **It is one more
+    row to the placement, in both places that ask**: the scroll's own `popup_placement` call and
+    the outer positioning style's, with `completion_row_h()` taken off the scroll's `max_height`.
+    That is what keeps a popup flipped above the caret clear of the caret line — the flip is placed
+    by the predicted height (under *Floem 0.2 gotchas*), so a footer counted in one call and not
+    the other is a box taller than the space it was placed in. No test covers the footer; it is a
+    view.
   - `tabs.rs` — query-tab strip, and where a **`.sql`-backed tab** shows itself. The state behind
     that is four signals on `Tab`: `path`, `disk_sql` (the file's text as of the last open / save /
     reload — `None` means *unknown*, which reads as modified, the safe direction), `file_format`
@@ -29889,10 +29908,11 @@ Re-introducing the anti-patterns these guard against is a regression:
   (`Option<&'static [SqlFunction]>`) rather than sitting beside a bool, and the
   `builtin_functions_are_authoritative` that did sit beside it was deleted — "is this app's list
   authoritative here" and "which list" are one question, and answering it twice is two arms to keep
-  in step instead of one. The typo checker, `rank::rank` (through `intel::offered_builtins`) and
-  `signature_help` all ask it now, which is that argument at the other end: three surfaces, one map,
-  so a fourth engine is forgotten in one place rather than three — and it was three, for as long as
-  the popup and then the signature bar named `FUNCTIONS` themselves. **The cache in front of it is
+  in step instead of one. The typo checker, `rank::rank` (through `intel::offered_builtins`),
+  `signature_help` and `builtin_summary` all ask it now, which is that argument at the other end:
+  four surfaces, one map, so a fourth engine is forgotten in one place rather than four — and it
+  was forgotten in three, for as long as the popup and then the signature bar named `FUNCTIONS`
+  themselves. **The cache in front of it is
   the same shape for the same reason**: `intel::catalog_index` is four `OnceLock`s, one per
   `SqlDialect` arm, rather than one map keyed by the dialect, so a fifth engine is a compiler error
   there too rather than a cache nothing ever fills.
@@ -33348,7 +33368,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   cut every row's annotations off mid-word (worst with the AI panel hidden, where the editor's right
   edge *is* the window's). Both predict rather than measure, because a style closure gets neither a
   laid-out height nor width: the height from `COMPLETION_ROW_H × rows`, pinned when flipped so an
-  under-estimate costs a scrolled pixel rather than an overlap; the width from
+  under-estimate costs a scrolled pixel rather than an overlap — the selected function's summary
+  footer counts as one of those rows, and comes off the scroll's own cap (under `completion.rs`);
+  the width from
   `completion::natural_width`, which sums the row chrome (the `COMPLETION_*_W` consts, which
   `completion_popup` builds its rows from so the two can't drift) with `widgets::measure_text_px_at`
   over the row text. That measurement runs in `completion::set_items` — once per recompute, not per

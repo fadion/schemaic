@@ -12590,6 +12590,17 @@ pub fn signature_help(
     })
 }
 
+/// The one-line summary `dialect`'s catalogue gives the builtin `name`, in any
+/// case — what the completion list shows for a selected function row, from
+/// the same catalogue [`signature_help`] reads. `None` for a name the engine
+/// does not have.
+pub fn builtin_summary(dialect: SqlDialect, name: &str) -> Option<&'static str> {
+    builtin_catalog(dialect)?
+        .iter()
+        .find(|f| f.name.eq_ignore_ascii_case(name))
+        .map(|f| f.summary)
+}
+
 /// Does the word at `toks[at]`, with a `(` after it, name a table or an object
 /// being defined rather than call a function? `INSERT INTO log (`, `CREATE
 /// TABLE log (`, `REFERENCES log (`, `CREATE INDEX i ON log (`, a CTE's `WITH
@@ -20649,6 +20660,18 @@ mod tests {
             &"SELECT e.salery FROM employees e"[d[0].range.0..d[0].range.1],
             "salery"
         );
+    }
+
+    /// A builtin's one-line summary, by name in any case, from the engine's
+    /// own catalogue — what the completion list shows under a function row.
+    #[test]
+    fn a_builtins_summary_is_found_by_name_in_its_engines_catalogue() {
+        let s = builtin_summary(SqlDialect::MySql, "date_format").expect("MySQL has it");
+        assert!(!s.is_empty());
+        assert_eq!(builtin_summary(SqlDialect::MySql, "DATE_FORMAT"), Some(s));
+        assert!(builtin_summary(SqlDialect::Postgres, "btrim").is_some());
+        assert_eq!(builtin_summary(SqlDialect::Postgres, "date_format"), None);
+        assert_eq!(builtin_summary(SqlDialect::MySql, "no_such_fn"), None);
     }
 
     /// The nearest name to a misspelling, by the typo checker's distance: one
