@@ -894,8 +894,21 @@ existing prose was left alone.
     `NULL` check skips a variable on the left, since T-SQL's `SELECT @v = NULL` is an assignment that
     parses as a comparison; `SET a = NULL` is an `Assignment` and never reaches it. One lint is an
     **error**, being refused by every engine: an `INSERT` naming its columns with a `VALUES` row of
-    another length, squiggled on the row's own parens (`Parens`' tokens); with no column list the
-    count is the table's, which it does not ask (`an_insert_row_of_the_wrong_length_is_an_error`).
+    another length, squiggled on the row's own parens (`Parens`' tokens)
+    (`an_insert_row_of_the_wrong_length_is_an_error`). **With no column list the count is the
+    table's**, so `lints::check` takes the `Catalog` and the dialect, and `bare_insert_row_lengths`
+    measures each row against the table — `` `t` has N columns but this row has M values ``. The
+    engines do not agree on that count. A row longer than the table is refused everywhere; a
+    shorter one PostgreSQL fills with the remaining columns' defaults, and the others differ over
+    the columns the server assigns — MySQL wants every column, `AUTO_INCREMENT` and generated ones
+    included, SQL Server leaves out an identity or computed one, SQLite a generated one. So a row
+    is short, on every engine but PostgreSQL, only when it is short of the columns *no* engine
+    leaves out (`Catalog::insert_columns_of`): exact for a table with no server-assigned column,
+    and silent where the engines disagree — a MySQL row that leaves out its `AUTO_INCREMENT` key
+    is refused there and passes here (`a_bare_insert_row_is_measured_against_the_table`,
+    `a_bare_insert_may_leave_out_what_the_server_assigns`). A table the catalogue does not know, a
+    name two tables share (`Catalog::is_union`) and a three-part name, which may be another
+    database's, are not measured.
     **AST for classification, `skip_noncode` for byte positions by default** —
     except `colres` and `lints`, which use sqlparser 0.62's now-accurate per-identifier *spans* (verified) so the
     same column name in an inner vs outer scope is placed independently. **A base table exposes more than
@@ -1087,9 +1100,11 @@ existing prose was left alone.
     call's `(`, at a join's `ON` and at a quoted reserved table name, so a reserved alias after any
     of them went unreported (`a_reserved_alias_is_flagged_wherever_the_from_list_goes`). It passes
     `targets` false, keeping the check off `INSERT INTO`/`UPDATE`, whose `VALUES`/`SET`/`SELECT`
-    would false-trigger, and reads `ListItem::reserved_alias` (`reserved_in_alias_slot`), which the
-    reader fills only for a slot `read_alias` left alone — an `AS <reserved>` is the explicit
-    scan's, which still runs over every token.
+    would false-trigger, and reads `ListItem::reserved_alias`, which the reader fills for a slot
+    `read_alias` left alone (`reserved_in_alias_slot`) and for an unquoted implicit alias it *took*
+    that some server of the dialect reserves (`reserved_anywhere`) — `alias_checks` then asks the
+    server's own flavour whether it is an error (under the reserved lists below). An `AS
+    <reserved>` is the explicit scan's, which still runs over every token.
     **`INTO` names a table only after `INSERT`/`REPLACE`** (`insert_precedes`), because the word has
     three other meanings and none of them does: PostgreSQL's legacy `SELECT a INTO newtbl FROM t`
     names the table it is about to *create*, and MySQL's `SELECT a INTO @x` and
@@ -1102,7 +1117,8 @@ existing prose was left alone.
     **`is_implicit_alias` is "is this bare word an alias" written once instead of three times, and
     the order of its two tests is the bug it fixes.** `ends_table_ref` first, because
     a join or clause keyword *ends* a table reference rather than naming it, and only then
-    `is_reserved_word`. Only SQLite showed it: `MYSQL_RESERVED` and `PG_RESERVED` both carry
+    whether the word is reserved — `reserved_on_every_server`, as `read_alias`'s `AS` arm asks too
+    (under the reserved lists below). Only SQLite showed it: `MYSQL_RESERVED` and `PG_RESERVED` both carry
     `LEFT`/`INNER`/`CROSS`/`NATURAL`/`RIGHT` (MySQL has no `FULL` join to reserve), so on those engines the reserved test alone
     happened to reject them, while `SQLITE_RESERVED` holds only what SQLite refuses *as an alias* and
     that engine accepts all seven as identifiers. So
@@ -1897,12 +1913,22 @@ existing prose was left alone.
     which `Catalog` now carries (`Catalog::flavour`, from the active database's `DbSchema`), and
     with none known holds to what both reserve — the warning's side
     (`mariadb_reserves_its_own_words`, `the_alias_check_follows_the_servers_flavour`). Its implicit
-    `orders offset` form is read by the table-list walk on the dialect's list, so a MariaDB-only
-    word there goes unflagged rather than wrongly read. The **quoter** cannot know the server, so
-    `must_quote_ident` takes both, and every version (`reserved_anywhere`): a MariaDB column named
+    `orders offset` form is read by the table-list walk, which has no flavour: the walk decides
+    where a table reference ends by what **every** server of the dialect reserves
+    (`reserved_on_every_server` — `is_reserved_word_on` with `ServerFlavour::Unknown`), and hands
+    `alias_checks` any implicit alias it took that *some* server reserves, for the flavour to
+    judge. So MariaDB's `orders current_role` and `orders offset` are flagged there, and MySQL 8's
+    `orders rank` on MySQL 8 alone (`a_word_mariadb_adds_is_flagged_as_an_implicit_alias_there`).
+    The walk used to read MySQL's list, which left a MariaDB-only word unflagged — and broke the
+    scope the other way: `FROM employees rank` registered no alias, so on MariaDB, which frees
+    `rank`, mid-edit `rank.` completed nothing and `rank.id` was an unknown qualifier
+    (`a_word_mariadb_frees_is_an_alias_in_scope`). The trade is MySQL 8, where `rank` is now read
+    as the alias it refuses — the squiggle on it is the alias check's. The **quoter** cannot know
+    the server, so `must_quote_ident` takes both, and every version (`reserved_anywhere`): a MariaDB column named
     `offset` had gone into generated SQL bare (`a_word_either_mysql_family_server_reserves_is_quoted`,
     `a_word_one_server_version_reserves_is_quoted`). The other
-    `is_reserved_word` sites — the scope's alias resolution among them — still read MySQL's list.
+    `is_reserved_word` sites — `reserved_in_alias_slot` and `joined_table` among them — still read
+    MySQL's list.
     Neither list is a transcription of anybody's documentation any more: `db::sqlite`'s
     `the_reserved_lists_match_what_sqlite_itself_refuses` walks the engine's own keyword table
     (`sqlite3_keyword_count`/`sqlite3_keyword_name`) and compiles every keyword on a real in-memory

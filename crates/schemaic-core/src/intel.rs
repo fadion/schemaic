@@ -6062,12 +6062,22 @@ fn read_table_list_items(
         }
         let slot = i;
         let alias = read_alias(toks, &mut i, dialect);
-        // Only a slot `read_alias` left alone: an `AS` it consumed, with the
-        // reserved word after it, is the explicit form `alias_checks` scans
-        // for itself.
-        let reserved_alias = (i == slot)
-            .then(|| reserved_in_alias_slot(toks, i, dialect))
-            .flatten();
+        // A slot `read_alias` left alone, or an implicit alias it took that
+        // some server reserves — MySQL 8's `rank`, MariaDB's `offset` — for
+        // `alias_checks` to judge by the server's flavour. An `AS` it
+        // consumed, with the reserved word after it, is the explicit form
+        // `alias_checks` scans for itself.
+        let reserved_alias = if i == slot {
+            reserved_in_alias_slot(toks, i, dialect)
+        } else {
+            let t = &toks[slot];
+            match &t.kind {
+                TkKind::Word(a) if i == slot + 1 && !t.quoted && reserved_anywhere(a, dialect) => {
+                    Some((t.at, a.clone()))
+                }
+                _ => None,
+            }
+        };
         if let Some(end) = table_hint_end(toks, i, dialect) {
             i = end;
         }
@@ -6236,6 +6246,10 @@ fn read_table_list_after_paren(
 /// alias slot. So does a `;` — the word after it begins the next statement. A
 /// reserved word after `AS` is no valid alias and is not registered, but is
 /// consumed with the `AS`; quoted, it is one.
+///
+/// **Reserved means reserved by every server of the dialect**
+/// ([`reserved_on_every_server`]): the scope has no flavour, and `FROM t
+/// rank` names the alias `rank` on MariaDB however MySQL 8 reads it.
 fn read_alias(toks: &[Token], i: &mut usize, dialect: SqlDialect) -> Option<String> {
     match toks.get(*i).map(|t| &t.kind) {
         Some(TkKind::Word(a)) if !toks[*i].quoted && a.eq_ignore_ascii_case("AS") => {
@@ -6248,7 +6262,7 @@ fn read_alias(toks: &[Token], i: &mut usize, dialect: SqlDialect) -> Option<Stri
                 return None;
             };
             *i += 2;
-            (*quoted || !is_reserved_word(al, dialect)).then(|| al.clone())
+            (*quoted || !reserved_on_every_server(al, dialect)).then(|| al.clone())
         }
         Some(TkKind::Word(a))
             if !toks[*i].after_semicolon && (toks[*i].quoted || is_implicit_alias(a, dialect)) =>
@@ -7409,6 +7423,8 @@ fn unit_diagnostics(
                 tlo,
                 &asts,
                 in_body,
+                catalog,
+                dialect,
                 &mut found,
             );
             match asts.as_slice() {
@@ -9369,8 +9385,19 @@ fn ends_table_ref(word: &str, dialect: SqlDialect) -> bool {
 ///
 /// A **quoted** word is always an alias — `FROM orders "LEFT" JOIN …` really
 /// does name it — so the caller checks `Tk::quoted` before asking.
+///
+/// The reserved test is [`reserved_on_every_server`], as [`read_alias`]'s is.
 fn is_implicit_alias(word: &str, dialect: SqlDialect) -> bool {
-    !ends_table_ref(word, dialect) && !is_reserved_word(word, dialect)
+    !ends_table_ref(word, dialect) && !reserved_on_every_server(word, dialect)
+}
+
+/// Is `word` reserved on **every** server `dialect` reaches — MySQL 8 and
+/// MariaDB both, for a MySQL-family tab ([`is_reserved_word_on`] with the
+/// flavour not known)? The scope readers' test: a word one server takes as an
+/// alias is read as one, and [`alias_checks`] asks the server's own flavour
+/// whether it is an error.
+fn reserved_on_every_server(word: &str, dialect: SqlDialect) -> bool {
+    is_reserved_word_on(word, dialect, crate::schema::ServerFlavour::Unknown)
 }
 
 /// Does a cursor `FETCH` (or PostgreSQL's `MOVE`) introduce the `FROM` at
@@ -10035,10 +10062,11 @@ fn alias_checks(
     // legitimate table-ref continuation (`reserved_in_alias_slot`), so
     // `WHERE`/`ORDER`/`ON`/`JOIN`/… are safe.
     //
-    // The walk reads the slot by the dialect's list, which is what decides
-    // where a table reference ends; whether the word is an error is the
-    // server's question. So a MariaDB-only reserved word there (`orders
-    // offset`) is read as an alias and goes unflagged — missed, not wrong.
+    // The walk reads the slot by what every server of the dialect reserves,
+    // which is what decides where a table reference ends, and hands over any
+    // word some server reserves; whether it is an error is the server's
+    // question, asked here of its flavour. So MariaDB's `orders offset` is
+    // flagged there, and MySQL 8's `orders rank` on MySQL 8 alone.
     walk_table_lists(&toks, dialect, false, &mut |item| {
         if let Some((at, kw)) = item.reserved_alias
             && reserved(&kw)
@@ -11285,23 +11313,26 @@ mod lints {
     use std::ops::ControlFlow;
 
     use sqlparser::ast::{
-        BinaryOperator, Expr, FromTable, SetExpr, Spanned, Statement, TableWithJoins,
+        BinaryOperator, Expr, FromTable, SetExpr, Spanned, Statement, TableObject, TableWithJoins,
         UpdateTableFromKind, Value, visit_expressions,
     };
 
     use super::colres::to_range;
-    use super::{Diagnostic, Severity};
+    use super::{Catalog, Diagnostic, Severity, SqlDialect, TableRef};
 
     /// Every lint over `asts`, parsed from `stmt`, which starts at `lo`;
     /// `in_body` when they are statements of a T-SQL routine's body. `raw` is
     /// `stmt` before `grammar_gap_masks` blanked what the parser lacks — the
     /// same length, so an offset into one is an offset into the other.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn check(
         stmt: &str,
         raw: &str,
         lo: usize,
         asts: &[Statement],
         in_body: bool,
+        catalog: &Catalog,
+        dialect: SqlDialect,
         out: &mut Vec<Diagnostic>,
     ) {
         for ast in asts {
@@ -11309,14 +11340,31 @@ mod lints {
                 unfiltered_write(stmt, raw, lo, ast, out);
             }
             null_comparisons(stmt, lo, ast, out);
-            insert_row_lengths(stmt, lo, ast, out);
+            insert_row_lengths(stmt, lo, ast, catalog, dialect, out);
         }
     }
 
     /// An `INSERT` naming its columns, with a `VALUES` row of another length:
     /// refused by every engine, so an error, squiggled on the row's parens.
-    /// With no column list the count is the table's, which is not asked here.
-    fn insert_row_lengths(stmt: &str, lo: usize, ast: &Statement, out: &mut Vec<Diagnostic>) {
+    ///
+    /// **With no column list the count is the table's**, and the engines do
+    /// not agree on it. A row longer than the table is refused everywhere. A
+    /// shorter one PostgreSQL fills with the remaining columns' defaults, and
+    /// what the others want depends on the columns the server assigns: MySQL
+    /// wants every column, SQL Server leaves out an identity or computed one,
+    /// SQLite a generated one. So a row is short only when it is short of the
+    /// columns no engine leaves out ([`Catalog::insert_columns_of`]), which is
+    /// exact for a table with no such column and silent where they disagree.
+    /// A table the catalog does not know, or a name two tables share, is not
+    /// measured; nor is a three-part name, which may be another database's.
+    fn insert_row_lengths(
+        stmt: &str,
+        lo: usize,
+        ast: &Statement,
+        catalog: &Catalog,
+        dialect: SqlDialect,
+        out: &mut Vec<Diagnostic>,
+    ) {
         let Statement::Insert(ins) = ast else {
             return;
         };
@@ -11328,6 +11376,7 @@ mod lints {
             return;
         };
         if n == 0 {
+            bare_insert_row_lengths(stmt, lo, ins, values, catalog, dialect, out);
             return;
         }
         for row in &values.rows {
@@ -11342,6 +11391,67 @@ mod lints {
                 message: format!(
                     "INSERT names {n} {} but this row has {m} {}",
                     crate::text::plural(n, "column", "columns"),
+                    crate::text::plural(m, "value", "values"),
+                ),
+            });
+        }
+    }
+
+    /// Does `dialect` take a bare `INSERT`'s row **shorter than the table**,
+    /// filling the columns after it with their defaults? PostgreSQL does —
+    /// the row names the table's first columns. The others refuse it.
+    pub(super) fn short_row_takes_defaults(dialect: SqlDialect) -> bool {
+        match dialect {
+            SqlDialect::Postgres => true,
+            SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+        }
+    }
+
+    /// [`insert_row_lengths`] for an `INSERT` with no column list.
+    fn bare_insert_row_lengths(
+        stmt: &str,
+        lo: usize,
+        ins: &sqlparser::ast::Insert,
+        values: &sqlparser::ast::Values,
+        catalog: &Catalog,
+        dialect: SqlDialect,
+        out: &mut Vec<Diagnostic>,
+    ) {
+        let TableObject::TableName(name) = &ins.table else {
+            return;
+        };
+        let r = match super::object_name_parts(name).as_slice() {
+            [t] => TableRef {
+                name: t.clone(),
+                alias: None,
+                db: None,
+            },
+            [q, t] => TableRef {
+                name: t.clone(),
+                alias: None,
+                db: Some(q.clone()),
+            },
+            _ => return,
+        };
+        let (Some(all), Some(needed)) = (catalog.columns_of(&r), catalog.insert_columns_of(&r))
+        else {
+            return;
+        };
+        let (all, needed) = (all.len(), needed.len());
+        for row in &values.rows {
+            let m = row.content.len();
+            let short = m < needed && !short_row_takes_defaults(dialect);
+            if m == 0 || !(m > all || short) {
+                continue;
+            }
+            let span = row.opening_token.0.span.union(&row.closing_token.0.span);
+            out.push(Diagnostic {
+                range: to_range(stmt, lo, span),
+                severity: Severity::Error,
+                message: format!(
+                    "`{}` has {all} {} but this row has {m} {}",
+                    r.name,
+                    crate::text::plural(all, "column", "columns"),
                     crate::text::plural(m, "value", "values"),
                 ),
             });
@@ -21237,12 +21347,94 @@ mod tests {
                     .all(|x| !x.message.contains("INSERT names")),
                 "{d:?}"
             );
-            // No column list: the table's own count is not this check's.
+            // No column list: the table's own count is the next test's.
             let bare = "INSERT INTO employees VALUES (1);";
             assert!(
                 diag_d(bare, d)
                     .iter()
                     .all(|x| !x.message.contains("INSERT names")),
+                "{d:?}"
+            );
+        }
+    }
+
+    /// The `VALUES` rows' lengths for an `INSERT` with no column list, as the
+    /// squiggled text of each error.
+    fn bare_insert_errors(sql: &str, dialect: SqlDialect) -> Vec<String> {
+        diag_d(sql, dialect)
+            .into_iter()
+            .filter(|x| x.severity == Severity::Error && x.message.contains("this row has"))
+            .map(|x| sql[x.range.0..x.range.1].to_string())
+            .collect()
+    }
+
+    /// With no column list a row supplies every column, so a row longer than
+    /// the table is refused everywhere, and a shorter one everywhere but
+    /// PostgreSQL, which fills the rest with their defaults.
+    #[test]
+    fn a_bare_insert_row_is_measured_against_the_table() {
+        for d in SqlDialect::ALL {
+            let long = "INSERT INTO departments VALUES (1, 'a', 3);";
+            assert_eq!(bare_insert_errors(long, d), ["(1, 'a', 3)"], "{d:?}");
+            let fits = "INSERT INTO departments VALUES (1, 'a');";
+            assert!(bare_insert_errors(fits, d).is_empty(), "{d:?}");
+            let short = "INSERT INTO departments VALUES (1), (2, 'b');";
+            let want: &[&str] = if lints::short_row_takes_defaults(d) {
+                &[]
+            } else {
+                &["(1)"]
+            };
+            assert_eq!(
+                lints::short_row_takes_defaults(d),
+                d == SqlDialect::Postgres,
+                "{d:?}"
+            );
+            assert_eq!(bare_insert_errors(short, d), want, "{d:?}");
+            // A table the catalog does not know is not measured.
+            assert!(bare_insert_errors("INSERT INTO nosuch VALUES (1);", d).is_empty());
+        }
+        let msg = diag_d(
+            "INSERT INTO departments VALUES (1, 'a', 3);",
+            SqlDialect::MySql,
+        )
+        .into_iter()
+        .find(|x| x.message.contains("this row has"))
+        .map(|x| x.message);
+        assert_eq!(
+            msg.as_deref(),
+            Some("`departments` has 2 columns but this row has 3 values")
+        );
+    }
+
+    /// A column the server fills in itself — an `AUTO_INCREMENT` key, an
+    /// identity, a generated column — is left out of a bare `INSERT`'s row on
+    /// some engines and not others (SQL Server and SQLite's generated columns
+    /// against MySQL), so a row is only short when it is short of the columns
+    /// every engine wants.
+    #[test]
+    fn a_bare_insert_may_leave_out_what_the_server_assigns() {
+        let mut t = tbl("events", &["id", "name", "at"]);
+        t.columns[0].auto_increment = true;
+        let schema = DbSchema {
+            tables: vec![t],
+            ..Default::default()
+        };
+        let cat = Catalog::build(&[("company", &schema)], Some("company"));
+        let errs = |sql: &str, d| -> Vec<String> {
+            diagnostics(sql, &cat, d)
+                .into_iter()
+                .filter(|x| x.severity == Severity::Error && x.message.contains("this row has"))
+                .map(|x| sql[x.range.0..x.range.1].to_string())
+                .collect()
+        };
+        for d in [SqlDialect::MySql, SqlDialect::MsSql, SqlDialect::Sqlite] {
+            assert!(
+                errs("INSERT INTO events VALUES ('a', now());", d).is_empty(),
+                "{d:?}"
+            );
+            assert_eq!(
+                errs("INSERT INTO events VALUES ('a');", d),
+                ["('a')"],
                 "{d:?}"
             );
         }
@@ -22087,6 +22279,53 @@ mod tests {
         for w in MARIADB_ADDS {
             assert!(!MYSQL_RESERVED.contains(w), "{w}");
         }
+    }
+
+    /// **The scope reads a MariaDB alias as one.** `FROM employees rank` is a
+    /// table aliased `rank` on MariaDB, and the scope readers asked MySQL's
+    /// list, so `rank.` completed nothing there and `rank.id` was an unknown
+    /// qualifier. A word only one of the two servers reserves is read as the
+    /// alias it is on the other; whether it is an error is `alias_checks`'
+    /// question, asked of the server's flavour.
+    #[test]
+    fn a_word_mariadb_frees_is_an_alias_in_scope() {
+        // Mid-edit, where the parser fails and the lexer reads the scope.
+        let sql = "SELECT rank. FROM employees rank";
+        let scope = statement_scope(sql, 0, sql.len(), 12, SqlDialect::MySql);
+        assert_eq!(scope.tables[0].alias.as_deref(), Some("rank"));
+        let maria = |sql: &str| {
+            let (mut schema, db) = sample_catalog();
+            schema.flavour = crate::schema::ServerFlavour::MariaDb;
+            let cat = Catalog::build(&[(db, &schema)], Some(db));
+            diagnostics(sql, &cat, SqlDialect::MySql)
+        };
+        let ok = "SELECT rank.name FROM employees rank";
+        assert!(maria(ok).is_empty(), "{:?}", maria(ok));
+        // MySQL 8 refuses it, and still says so.
+        assert!(
+            diag(ok)
+                .iter()
+                .any(|d| d.message.contains("`rank` is a reserved")),
+            "{:?}",
+            diag(ok)
+        );
+    }
+
+    /// A word **MariaDB alone** reserves, as an implicit table alias: refused
+    /// there and flagged there, an alias on MySQL 8. The walk used to read it
+    /// as an alias on both and flag it on neither.
+    #[test]
+    fn a_word_mariadb_adds_is_flagged_as_an_implicit_alias_there() {
+        let sql = "SELECT * FROM employees current_role";
+        let (mut schema, db) = sample_catalog();
+        schema.flavour = crate::schema::ServerFlavour::MariaDb;
+        let cat = Catalog::build(&[(db, &schema)], Some(db));
+        let flagged = |ds: Vec<Diagnostic>| {
+            ds.iter()
+                .any(|d| d.message.contains("`current_role` is a reserved"))
+        };
+        assert!(flagged(diagnostics(sql, &cat, SqlDialect::MySql)));
+        assert!(!flagged(diag(sql)), "{:?}", diag(sql));
     }
 
     /// **MySQL's list is 8.4's.** Measured on 8.4.11 in all three alias
