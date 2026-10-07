@@ -1716,6 +1716,114 @@ pub(crate) fn signature_popup(comp: Completion, viewport: RwSignal<Rect>) -> imp
 }
 
 #[cfg(test)]
+mod recall_order_tests {
+    use super::{CompletionCtx, recall};
+    use floem::reactive::{RwSignal, Scope, SignalUpdate};
+    use schemaic_core::history::{HistoryEntry, Outcome};
+    use schemaic_core::intel::SqlDialect;
+    use schemaic_core::snippet::{self, Snippet, Source};
+    use std::collections::HashSet;
+
+    const TYPED: &str = "SELECT * FROM orders ";
+
+    fn run(conn_id: u64, sql: &str) -> HistoryEntry {
+        HistoryEntry {
+            conn_id,
+            database: None,
+            sql: sql.to_string(),
+            ts: 0,
+            tab_name: None,
+            run_id: 1,
+            duration_ms: None,
+            rows: None,
+            rows_capped: false,
+            outcome: Outcome::Ok,
+        }
+    }
+
+    fn user_snippet(body: &str) -> Snippet {
+        Snippet {
+            id: 1,
+            name: "s".to_string(),
+            abbrev: None,
+            body: body.to_string(),
+            scope: snippet::Scope::Global,
+            source: Source::User,
+            last_used: None,
+        }
+    }
+
+    /// `recall` on connection 1 over these runs, snippets and open tabs (each
+    /// tab a `(conn_id, text)`), the typed statement's own tab among them.
+    fn recalled(
+        runs: Vec<HistoryEntry>,
+        snippets: &[&str],
+        tabs: &[(u64, &str)],
+    ) -> Option<String> {
+        let cx = Scope::new();
+        let snippets: Vec<Snippet> = snippets.iter().map(|b| user_snippet(b)).collect();
+        let mut open = vec![crate::Tab::new(cx, 1, TYPED, 1, None)];
+        for (i, (conn, text)) in tabs.iter().enumerate() {
+            open.push(crate::Tab::new(cx, i + 2, text, *conn, None));
+        }
+        let ctx = CompletionCtx {
+            db_nodes: RwSignal::new(Vec::new()),
+            hidden_dbs: cx.create_memo(|_| HashSet::new()),
+            active_db: None,
+            dialect: SqlDialect::MySql,
+            snippets: cx.create_memo(move |_| snippets.clone()),
+            conn_id: 1,
+            predictions: true,
+            remembered: true,
+            history: RwSignal::new(runs),
+            tabs: RwSignal::new(open),
+        };
+        let got = recall(TYPED, TYPED.len(), &ctx);
+        ctx.tabs.update(|t| t.clear());
+        cx.dispose();
+        got
+    }
+
+    /// **This connection's runs, then the user's snippets, then the open tabs
+    /// on the same connection** — the first to continue the typed statement
+    /// wins, and a source that does not apply here is passed over rather than
+    /// ending the search.
+    #[test]
+    fn runs_come_before_snippets_and_snippets_before_tabs() {
+        let snippets = ["SELECT * FROM orders WHERE id = 2"];
+        let tabs = [(1, "SELECT * FROM orders WHERE id = 3")];
+        assert_eq!(
+            recalled(
+                vec![run(1, "SELECT * FROM orders WHERE id = 1")],
+                &snippets,
+                &tabs
+            )
+            .as_deref(),
+            Some("WHERE id = 1")
+        );
+        assert_eq!(
+            recalled(
+                vec![run(2, "SELECT * FROM orders WHERE id = 1")],
+                &snippets,
+                &tabs
+            )
+            .as_deref(),
+            Some("WHERE id = 2"),
+            "another connection's run is no run here"
+        );
+        assert_eq!(
+            recalled(Vec::new(), &[], &tabs).as_deref(),
+            Some("WHERE id = 3")
+        );
+        assert_eq!(
+            recalled(Vec::new(), &[], &[(2, "SELECT * FROM orders WHERE id = 3")]),
+            None,
+            "another connection's tab"
+        );
+    }
+}
+
+#[cfg(test)]
 mod kept_ghost_tests {
     use super::{keeps_ghost, typed_through};
     use crate::inline_diff::EditorGhost;

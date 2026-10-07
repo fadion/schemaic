@@ -23265,7 +23265,8 @@ existing prose was left alone.
     thing to offer, so a ghost asked after the one-shot would break that chain at its second link.
     **Where `predict` has nothing, `prediction_at` asks `recall`**, which runs `intel::Recall::at`
     once and asks `Recall::from` of three sources in the order they are trusted, the first to answer
-    winning. **First the runs `recallable` keeps, newest first**: this connection's
+    winning — an order `runs_come_before_snippets_and_snippets_before_tabs` pins through the real
+    `recall` (red with runs and snippets swapped). **First the runs `recallable` keeps, newest first**: this connection's
     (`HistoryEntry::conn_id == ctx.conn_id`), leaving out `Outcome::Failed` ones — a statement the
     server refused is not one to offer again; an `Unknown` run, cancelled or still going, is
     offered — and, where both the run's `HistoryEntry::database` and the tab's active database are
