@@ -10734,9 +10734,10 @@ mod colres {
 
     /// Warn on an inner `JOIN`/`INNER JOIN`/`STRAIGHT_JOIN` with no `ON`/`USING`
     /// condition — MySQL treats it as a cross join (every row combined), almost
-    /// always an accident. An explicit `CROSS JOIN` (a distinct operator) and a
-    /// comma-join (a separate `TableWithJoins`, no join node) are intentional and
-    /// left alone. Squiggles the joined relation.
+    /// always an accident. An explicit `CROSS JOIN` (a distinct operator) is
+    /// intentional and left alone, and so is a comma-join (a separate
+    /// `TableWithJoins`, no join node) with a `WHERE`; one with no `WHERE` at all
+    /// to a plain table is warned of the same way. Squiggles the joined relation.
     fn cartesian_check(sel: &Select, stmt: &str, lo: usize, out: &mut Vec<Diagnostic>) {
         fn walk(twj: &TableWithJoins, stmt: &str, lo: usize, out: &mut Vec<Diagnostic>) {
             walk_factor(&twj.relation, stmt, lo, out);
@@ -10763,6 +10764,23 @@ mod colres {
         }
         for twj in &sel.from {
             walk(twj, stmt, lo, out);
+        }
+        // A comma join with no WHERE at all: every row with every row. One
+        // with a WHERE is the old-style join it looks like, and a comma to a
+        // table function (`, unnest(t.a)`, `, JSON_TABLE(…)`) is correlated,
+        // so only a plain table after the first is flagged.
+        if sel.selection.is_none() {
+            for twj in sel.from.iter().skip(1) {
+                if let TableFactor::Table { args: None, .. } = &twj.relation {
+                    out.push(Diagnostic {
+                        range: to_range(stmt, lo, twj.relation.span()),
+                        severity: Severity::Warning,
+                        message: "Comma join with no WHERE — this is a cross join; add a \
+                                  WHERE, or use CROSS JOIN if that's intended"
+                            .to_string(),
+                    });
+                }
+            }
         }
     }
 
@@ -11153,8 +11171,8 @@ mod lints {
     use std::ops::ControlFlow;
 
     use sqlparser::ast::{
-        BinaryOperator, Expr, FromTable, Spanned, Statement, TableWithJoins, UpdateTableFromKind,
-        Value, visit_expressions,
+        BinaryOperator, Expr, FromTable, SetExpr, Spanned, Statement, TableWithJoins,
+        UpdateTableFromKind, Value, visit_expressions,
     };
 
     use super::colres::to_range;
@@ -11177,6 +11195,42 @@ mod lints {
                 unfiltered_write(stmt, raw, lo, ast, out);
             }
             null_comparisons(stmt, lo, ast, out);
+            insert_row_lengths(stmt, lo, ast, out);
+        }
+    }
+
+    /// An `INSERT` naming its columns, with a `VALUES` row of another length:
+    /// refused by every engine, so an error, squiggled on the row's parens.
+    /// With no column list the count is the table's, which is not asked here.
+    fn insert_row_lengths(stmt: &str, lo: usize, ast: &Statement, out: &mut Vec<Diagnostic>) {
+        let Statement::Insert(ins) = ast else {
+            return;
+        };
+        let n = ins.columns.len();
+        let Some(src) = &ins.source else {
+            return;
+        };
+        let SetExpr::Values(values) = src.body.as_ref() else {
+            return;
+        };
+        if n == 0 {
+            return;
+        }
+        for row in &values.rows {
+            let m = row.content.len();
+            if m == n || m == 0 {
+                continue;
+            }
+            let span = row.opening_token.0.span.union(&row.closing_token.0.span);
+            out.push(Diagnostic {
+                range: to_range(stmt, lo, span),
+                severity: Severity::Error,
+                message: format!(
+                    "INSERT names {n} {} but this row has {m} {}",
+                    crate::text::plural(n, "column", "columns"),
+                    crate::text::plural(m, "value", "values"),
+                ),
+            });
         }
     }
 
@@ -20552,7 +20606,9 @@ mod tests {
             "SELECT * FROM employees e CROSS JOIN departments d", // explicit → intended
             "SELECT * FROM employees e JOIN departments d ON e.dept_id = d.id",
             "SELECT * FROM employees e JOIN departments d USING (id)",
-            "SELECT * FROM employees, departments", // comma-join → not flagged
+            // A comma join with a WHERE is the old-style join; without one it
+            // is flagged (`a_comma_join_without_a_where_is_flagged`).
+            "SELECT * FROM employees, departments WHERE employees.dept_id = departments.id",
             "SELECT * FROM employees",
         ] {
             assert!(cross_warnings(sql).is_empty(), "false positive: {sql}");
@@ -20631,6 +20687,56 @@ mod tests {
         assert!(my("DELETE FROM employees LIMIT 100;").is_empty());
         // A table called `top_x` is no TOP.
         assert_eq!(ms("UPDATE topx SET a = 1;"), ["UPDATE"]);
+    }
+
+    /// An `INSERT` whose column list and a `VALUES` row differ in length is
+    /// refused by every engine: an error, on the row.
+    #[test]
+    fn an_insert_row_of_the_wrong_length_is_an_error() {
+        for d in SqlDialect::ALL {
+            let sql = "INSERT INTO employees (id, name) VALUES (1, 'a'), (2);";
+            let errs: Vec<String> = diag_d(sql, d)
+                .into_iter()
+                .filter(|x| x.severity == Severity::Error && x.message.contains("INSERT names"))
+                .map(|x| sql[x.range.0..x.range.1].to_string())
+                .collect();
+            assert_eq!(errs, ["(2)"], "{d:?}");
+            let ok = "INSERT INTO employees (id, name) VALUES (1, 'a'), (2, 'b');";
+            assert!(
+                diag_d(ok, d)
+                    .iter()
+                    .all(|x| !x.message.contains("INSERT names")),
+                "{d:?}"
+            );
+            // No column list: the table's own count is not this check's.
+            let bare = "INSERT INTO employees VALUES (1);";
+            assert!(
+                diag_d(bare, d)
+                    .iter()
+                    .all(|x| !x.message.contains("INSERT names")),
+                "{d:?}"
+            );
+        }
+    }
+
+    /// A comma join with no `WHERE` at all combines every row with every row.
+    /// One with a `WHERE` is the old-style join it looks like.
+    #[test]
+    fn a_comma_join_without_a_where_is_flagged() {
+        let hits = |sql| lint_hits(sql, SqlDialect::MySql, "cross join");
+        assert_eq!(
+            hits("SELECT * FROM employees, departments;"),
+            ["departments"]
+        );
+        assert_eq!(
+            hits("SELECT * FROM employees e, departments d;"),
+            ["departments d"]
+        );
+        assert!(
+            hits("SELECT * FROM employees e, departments d WHERE d.id = e.dept_id;").is_empty()
+        );
+        assert!(hits("SELECT * FROM employees;").is_empty());
+        assert!(hits("SELECT * FROM employees CROSS JOIN departments;").is_empty());
     }
 
     /// `= NULL` and `<> NULL` are never true; `IS NULL` is what was meant.
@@ -21732,7 +21838,7 @@ mod tests {
             "SELECT e.name, d.name FROM employees e JOIN departments d ON e.dept_id = d.id;",
             "SELECT * FROM employees e LEFT JOIN departments d ON e.dept_id = d.id;",
             "SELECT * FROM employees e INNER JOIN departments d ON e.dept_id = d.id;",
-            "SELECT * FROM employees, departments;",
+            "SELECT * FROM employees, departments WHERE employees.dept_id = departments.id;",
             "SELECT * FROM employees e, departments d WHERE e.dept_id = d.id;",
             // Subqueries / derived / CTE / set ops.
             "SELECT * FROM (SELECT id FROM employees) AS sub;",

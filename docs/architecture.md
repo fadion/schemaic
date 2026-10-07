@@ -874,7 +874,11 @@ existing prose was left alone.
     (`Catalog::pk_shared`, under `predict` below), and exempting a query grouped by the table's
     whole primary key, MySQL's own functional-dependency exemption (`pk_of`) — and
     `cartesian_check` on a `JOIN`/`INNER JOIN`/`STRAIGHT_JOIN` with no `ON`/`USING`, which runs as a
-    cross join; an explicit `CROSS JOIN` and a comma-join are meant, and left alone).
+    cross join; an explicit `CROSS JOIN` is meant, and left alone, and so is a comma-join with a
+    `WHERE` — one with no `WHERE` at all to a plain table (not a table function such as `,
+    unnest(t.a)`, which is correlated) is warned of too (`a_comma_join_without_a_where_is_flagged`).
+    The valid-SQL corpora held the bare comma join clean when it was left alone; their entry now has
+    a `WHERE`).
     **The `lints` module** adds warnings on every clean parse of a unit, whatever the statement:
     an `UPDATE`/`DELETE` with no `WHERE`, squiggled on its verb (`update_token`/`delete_token`), and
     `= NULL`/`<> NULL`/`!= NULL`, squiggled on the comparison, naming `IS [NOT] NULL`
@@ -888,7 +892,10 @@ existing prose was left alone.
     cross join and still flagged. Nor does it run inside a T-SQL routine's body (`range_diagnostics`'
     `in_body`, from `Unit::header`), where `DELETE FROM staging` is the point of the routine. The
     `NULL` check skips a variable on the left, since T-SQL's `SELECT @v = NULL` is an assignment that
-    parses as a comparison; `SET a = NULL` is an `Assignment` and never reaches it.
+    parses as a comparison; `SET a = NULL` is an `Assignment` and never reaches it. One lint is an
+    **error**, being refused by every engine: an `INSERT` naming its columns with a `VALUES` row of
+    another length, squiggled on the row's own parens (`Parens`' tokens); with no column list the
+    count is the table's, which it does not ask (`an_insert_row_of_the_wrong_length_is_an_error`).
     **AST for classification, `skip_noncode` for byte positions by default** —
     except `colres` and `lints`, which use sqlparser 0.62's now-accurate per-identifier *spans* (verified) so the
     same column name in an inner vs outer scope is placed independently. **A base table exposes more than
