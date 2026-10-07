@@ -456,7 +456,7 @@ pub fn toggle_block_comment(
         return None;
     }
     let text = format!("/* {} */", &full[rlo..rhi]);
-    if skip_noncode(text.as_bytes(), 0, dialect) != Some(text.len()) {
+    if !crate::sql::is_one_comment(&text, dialect) {
         return None;
     }
     let sel = if !bare {
@@ -1719,6 +1719,8 @@ mod tests {
             block("{a /* b */ c}", Postgres).unwrap(),
             "{/* a /* b */ c */}"
         );
+        // …and there an unclosed comment the range ends on stays open inside.
+        assert_eq!(block("{a /* b}", Postgres), None);
         // A range that starts or ends inside a string.
         assert_eq!(block("SELECT 'a{bc' x}", MySql), None);
         assert_eq!(block("SELECT {x 'ab}c'", MySql), None);

@@ -600,6 +600,18 @@ pub fn skip_noncode(b: &[u8], i: usize, dialect: SqlDialect) -> Option<usize> {
     }
 }
 
+/// Does `text` lex as exactly one comment, closed at its own last byte?
+///
+/// The question an editor asks before it writes `/* … */` around something.
+/// [`skip_noncode`] alone cannot answer it: an **unclosed** comment runs to the
+/// end of the input too, so `/* a /* b */` — one comment on MySQL, an open one
+/// where comments nest — returned the same length either way. Lexing with a
+/// byte after the text tells the two apart.
+pub(crate) fn is_one_comment(text: &str, dialect: SqlDialect) -> bool {
+    let probe = format!("{text}\nx");
+    skip_comment(probe.as_bytes(), 0, dialect) == Some(text.len())
+}
+
 /// The identifier at or after `at`, **unquoted**, and the offset just past it —
 /// or `(None, offset)` when there isn't one.
 ///
@@ -7387,6 +7399,19 @@ mod tests {
         ] {
             assert_eq!(unsafe_reason(sql), None, "{sql}");
         }
+    }
+
+    /// An unclosed comment runs to the end of the input just as one closed at
+    /// its last byte does; only the first is one comment.
+    #[test]
+    fn one_comment_is_closed_at_its_own_end() {
+        use SqlDialect::{MySql, Postgres};
+        assert!(is_one_comment("/* a /* b */", MySql));
+        assert!(!is_one_comment("/* a /* b */", Postgres), "still open");
+        assert!(is_one_comment("/* a /* b */ */", Postgres));
+        assert!(!is_one_comment("/* a */ b */", MySql), "closed early");
+        assert!(!is_one_comment("/* a", MySql));
+        assert!(!is_one_comment("x", MySql));
     }
 
     /// **PostgreSQL's block comments nest, and the one lexer has to know.**

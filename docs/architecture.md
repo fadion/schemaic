@@ -436,6 +436,12 @@ existing prose was left alone.
     engine now fills in the table rather than hoping a `!=` falls the right way. `comment_open` is
     the classification half, exposed because `pairs::region_at` has to tell a comment span from a
     string span after the lexer has found one and was answering it with its own byte test.
+    `is_one_comment` asks whether a text lexes as exactly one comment closed at its own last byte —
+    the question an editor asks before writing `/* … */` round something. `skip_noncode` alone
+    cannot answer it, since an **unclosed** comment runs to the end of the input too: `/* a /* b */`
+    is one comment on MySQL and still open where comments nest, and came back the same length both
+    ways. So it lexes the text with `\nx` after it and asks for the text's own length
+    (`one_comment_is_closed_at_its_own_end`).
     **`noncode_kind` → `NonCode::{Comment, Literal, Identifier}` is the whole of that
     classification, and it is here for the same privacy wall.** A caller that has to *colour* or
     label a span rather than skip it needs the same per-dialect predicates the scanner uses, and the
@@ -11800,10 +11806,13 @@ existing prose was left alone.
     `/*!…*/`, which the lexer returns as code. Otherwise it **wraps** the selection, or a bare
     caret's line, as `/* … */` with the outer blanks left outside — refused when that range is
     empty, when either end is not in code (`pairs::region_at`: a range starting or ending in a
-    string would put the comment in the data), or when the wrapped text does not lex back as one
-    comment ending at its own `*/`. That last check is how an inner `*/` is refused on MySQL and
-    SQLite, where it ends the comment early and leaves the rest as code, and allowed where comments
-    nest (PostgreSQL, SQL Server) — without asking the dialect a second time. A selection stays over
+    string would put the comment in the data), or when the wrapped text is not one comment closed
+    at its own `*/` (`sql::is_one_comment`). That last check is how an inner `*/` is refused on MySQL
+    and SQLite, where it ends the comment early and leaves the rest as code, and allowed where
+    comments nest (PostgreSQL, SQL Server) — without asking the dialect a second time. It used to be
+    `skip_noncode` reaching the wrap's last byte, which an **unclosed** comment does as well: on
+    PostgreSQL, `a /* b` selected at the end of the document — whose end `region_at` reads as code —
+    wrapped to `/* a /* b */`, a comment still open. A selection stays over
     the comment or the unwrapped text, so a second press undoes the first; a bare caret keeps its
     place in the text (`block_comment_wraps_a_selection_and_unwraps_it_again`,
     `block_comment_on_a_bare_caret_takes_the_line_or_its_comment`,
