@@ -447,6 +447,12 @@ fn lex_line(line: &str, dialect: SqlDialect, start_in_block: bool) -> Vec<(usize
                 return out;
             }
         }
+    } else if let Some((lo, hi)) = schemaic_core::sql::line_directive_span(line, dialect) {
+        // A client directive — `GO`, `DELIMITER` — in the keyword colour with
+        // its argument, as SSMS and DataGrip colour it; a `GO` line's comment
+        // is lexed below as any other.
+        out.push((lo, hi, Tok::Keyword));
+        i = hi;
     }
 
     while i < n {
@@ -694,6 +700,27 @@ mod tests {
             })
             .map(|(s, e, _)| line[s..e].to_string())
             .collect()
+    }
+
+    /// A client directive line is coloured as a keyword, its argument with it
+    /// — `GO 5`, `DELIMITER $$` — on the engine that has it; a `GO` line's
+    /// comment keeps the comment colour, and a line inside a block comment
+    /// is comment whatever it says.
+    #[test]
+    fn a_directive_line_is_coloured_as_a_keyword() {
+        use SqlDialect::{MsSql, MySql, Postgres};
+        assert_eq!(spans_of("GO", MsSql, "keyword"), ["GO"]);
+        assert_eq!(spans_of("  go 5 -- next", MsSql, "keyword"), ["go 5"]);
+        assert_eq!(spans_of("  go 5 -- next", MsSql, "comment"), ["-- next"]);
+        assert_eq!(spans_of("DELIMITER $$", MySql, "keyword"), ["DELIMITER $$"]);
+        assert_eq!(spans_of("DELIMITER ;", MySql, "keyword"), ["DELIMITER ;"]);
+        assert!(spans_of("GO", MySql, "keyword").is_empty());
+        assert!(spans_of("DELIMITER $$", Postgres, "keyword").is_empty());
+        let in_block = lex_line("GO", MsSql, true);
+        assert!(
+            in_block.iter().all(|&(_, _, t)| matches!(t, Tok::Comment)),
+            "a GO inside a block comment"
+        );
     }
 
     /// A keyword spelling that is a member, a variable or part of a longer

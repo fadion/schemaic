@@ -965,6 +965,32 @@ pub(crate) fn go_directive(sql: &str, i: usize, dialect: SqlDialect) -> Option<u
     }
 }
 
+/// The directive's own text on `line` — `GO` and its count, `DELIMITER` and
+/// its token — when the line is a client directive on this engine
+/// ([`go_directive`], [`delimiter_directive`]), for the editor to colour it.
+///
+/// **Asked of the line alone**, as `sqlfmt::single_line` asks it: whether a
+/// statement begins there is not, so a mid-statement line opening with a column
+/// named `delimiter` and another word is coloured as one. The splitter asks
+/// both, and decides what runs; this decides only a colour. A `GO` line's
+/// trailing `--` comment is left out, for the comment colour.
+pub fn line_directive_span(line: &str, dialect: SqlDialect) -> Option<(usize, usize)> {
+    let b = line.as_bytes();
+    let p = b.iter().position(|&c| c != b' ' && c != b'\t')?;
+    if go_directive(line, p, dialect).is_some() {
+        // `GO`, and the repeat count when there is one.
+        let mut j = p + 2;
+        while b.get(j).is_some_and(|&c| c == b' ' || c == b'\t') {
+            j += 1;
+        }
+        let digits = b[j..].iter().take_while(|c| c.is_ascii_digit()).count();
+        return Some((p, if digits > 0 { j + digits } else { p + 2 }));
+    }
+    // The rest of a `DELIMITER` line is the directive's, whatever it holds.
+    let (end, _) = delimiter_directive(line, p, dialect)?;
+    Some((p, p + line[p..end].trim_end().len()))
+}
+
 /// Is `i` the first non-blank byte of its line?
 pub(crate) fn at_line_start(b: &[u8], i: usize) -> bool {
     b[..i]
@@ -5874,6 +5900,33 @@ mod tests {
             super::executable_statements(sql, SqlDialect::Postgres).len(),
             1
         );
+    }
+
+    /// The directive's own text on a line — word and argument, not a
+    /// trailing comment or blanks — on the engine that has it, and nothing
+    /// for a line that only begins with the word.
+    #[test]
+    fn a_directive_line_spans_its_word_and_argument() {
+        use SqlDialect::{MsSql, MySql, Postgres, Sqlite};
+        fn span(line: &str, d: SqlDialect) -> Option<&str> {
+            super::line_directive_span(line, d).map(|(a, b)| &line[a..b])
+        }
+        assert_eq!(span("GO", MsSql), Some("GO"));
+        assert_eq!(span("  go 5 -- next", MsSql), Some("go 5"));
+        assert_eq!(span("GO\r\n", MsSql), Some("GO"));
+        assert_eq!(span("GO;", MsSql), None);
+        assert_eq!(span("GOTO done", MsSql), None);
+        assert_eq!(span("SELECT 1 GO", MsSql), None);
+        assert_eq!(span("DELIMITER $$", MySql), Some("DELIMITER $$"));
+        assert_eq!(span("  delimiter //  \n", MySql), Some("delimiter //"));
+        assert_eq!(span("DELIMITER", MySql), None);
+        // Each engine its own.
+        assert_eq!(span("GO", MySql), None);
+        assert_eq!(span("DELIMITER $$", MsSql), None);
+        for d in [Postgres, Sqlite] {
+            assert_eq!(span("GO", d), None);
+            assert_eq!(span("DELIMITER $$", d), None);
+        }
     }
 
     /// **A routine body holds its own `;`s and runs to the end of the batch.**

@@ -24714,7 +24714,12 @@ existing prose was left alone.
     (`a_keyword_spelling_after_a_dot_an_at_or_in_a_dollar_name_is_not_coloured`). A number is
     coloured whole by `number_end` — `0x1F`, `1.5E-3`, an `e` counting only with a digit after it —
     and a one-letter literal prefix glued to its `'` (`N`, `E`, `X`, `B`) takes the string's colour
-    (`whole_numbers_and_literal_prefixes_are_coloured`).
+    (`whole_numbers_and_literal_prefixes_are_coloured`). A client directive line — `GO 5`,
+    `DELIMITER $$` — takes the keyword colour, argument and all, from `sql::line_directive_span`,
+    which asks `go_directive`/`delimiter_directive` of the line alone: whether a statement begins
+    there is the splitter's question, and here only a colour rides on it, so a mid-statement line
+    opening `delimiter x` is coloured as one. A line that starts inside a block comment is never
+    asked (`a_directive_line_is_coloured_as_a_keyword`).
     `preview_bg`/`preview_fg` are the surface and base text of a **syntax-coloured preview**, and
     they are named here rather than spelled at each site so the cross-axis gate in `contrast.rs`
     measures the surface the previews actually paint — the account browser's `GRANT` block is the
