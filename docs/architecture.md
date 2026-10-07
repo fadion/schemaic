@@ -12064,6 +12064,15 @@ existing prose was left alone.
     `a, -- first` came out over `b` and read as `b`'s note. `need_space` sets a line comment off
     from the code before it first thing, since after a `;` `end_statement` has cleared `prev` and
     `1;-- done` came out tight (`a_trailing_comment_stays_with_the_code_it_followed`).
+    **A `CASE` is laid out** (`cases`, one `CaseFrame` per open `CASE`): each `WHEN` and the
+    `ELSE` one level under the line the `CASE` opened on, `END` back at that line's level, so
+    nested ones nest. A frame belongs to the paren depth it opened at, so only its own
+    `WHEN`/`ELSE`/`END` are its; one opened inside a function's parens stays inline; and a routine's
+    `END CASE` closes a frame rather than opening one (`a_case_lays_out_its_branches`). `WITH
+    RECURSIVE` keeps its word on the head's line (`head_followers`), `WINDOW` is a clause head, and
+    MySQL's `LIMIT offset, count` keeps its comma inline — `limit_depth` holds the paren depth the
+    `LIMIT` opened at, so a comma after a subquery's `LIMIT` breaks as the list's again
+    (`recursive_window_and_limit_lay_out_as_clauses`).
     **A T-SQL `@x`, `@@ROWCOUNT`, `#t` or `##g` is one `Kind::Word`.** `@` and `#` fell to the
     operator arm and `need_space` separated them from their name, so one Format Code broke nearly
     every T-SQL script: `SELECT @ x` is Msg 137, `SELECT @ @ VERSION` and `CREATE TABLE # t` are

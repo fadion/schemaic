@@ -746,6 +746,7 @@ const HEADS: &[&str] = &[
     "WITH",
     "GROUP",
     "ORDER",
+    "WINDOW",
 ];
 
 // Words that may follow a head on the same line (e.g. `GROUP BY`, `SELECT
@@ -757,6 +758,7 @@ fn head_followers(up: &str) -> &'static [&'static str] {
         "UNION" => &["ALL", "DISTINCT"],
         "INSERT" | "REPLACE" => &["INTO"],
         "DELETE" => &["FROM"],
+        "WITH" => &["RECURSIVE"],
         _ => &[],
     }
 }
@@ -907,6 +909,21 @@ struct Fmt<'a> {
     go_separates: bool,
     /// A `go` name had to start its line: the next token stays on it.
     glue_next: bool,
+    /// The paren depth of the `LIMIT` clause being laid out, if one is: its
+    /// comma is MySQL's `LIMIT offset, count`, not a list's. A depth, so the
+    /// comma after a subquery's `LIMIT` closes back into an ordinary list.
+    limit_depth: Option<usize>,
+    /// The `CASE`s open, innermost last.
+    cases: Vec<CaseFrame>,
+}
+
+/// One open `CASE`: the indent of the line it opened on, the paren depth it
+/// opened at (its `WHEN`/`ELSE`/`END` are the ones at that depth), and whether
+/// it is laid out — not inside a function's parens, where it stays inline.
+struct CaseFrame {
+    indent: usize,
+    depth: usize,
+    laid_out: bool,
 }
 
 impl<'a> Fmt<'a> {
@@ -928,7 +945,14 @@ impl<'a> Fmt<'a> {
             prev: None,
             suppress_and: false,
             tight_next: false,
+            limit_depth: None,
+            cases: Vec::new(),
         }
+    }
+
+    /// The innermost open `CASE`, if it opened at the current paren depth.
+    fn case_here(&self) -> Option<&CaseFrame> {
+        self.cases.last().filter(|f| f.depth == self.parens.len())
     }
 
     fn break_to(&mut self, level: usize) {
@@ -1141,7 +1165,28 @@ impl<'a> Fmt<'a> {
                         }
                     } else if after_dot || called {
                         self.emit(Kind::Word, text, false);
+                    } else if up == "CASE" && self.prev_word_upper().as_deref() != Some("END") {
+                        // Opens a frame; `END CASE`'s word closes one instead.
+                        self.emit(Kind::Word, text, false);
+                        self.cases.push(CaseFrame {
+                            indent: self.line_indent,
+                            depth: self.parens.len(),
+                            laid_out: !in_expr,
+                        });
+                    } else if (up == "WHEN" || up == "ELSE")
+                        && let Some(f) = self.case_here().filter(|f| f.laid_out)
+                    {
+                        self.break_to(f.indent + 1);
+                        self.emit(Kind::Word, text, false);
+                    } else if up == "END" && self.case_here().is_some() {
+                        if let Some(f) = self.cases.pop()
+                            && f.laid_out
+                        {
+                            self.break_to(f.indent);
+                        }
+                        self.emit(Kind::Word, text, false);
                     } else if !in_expr && HEADS.contains(&up.as_str()) {
+                        self.limit_depth = (up == "LIMIT").then_some(self.parens.len());
                         self.break_to(self.base);
                         self.emit(Kind::Word, text, false);
                         // Attach any followers on the same line.
@@ -1208,6 +1253,7 @@ impl<'a> Fmt<'a> {
                         // Break top-level list commas and subquery SELECT-list
                         // commas; keep function-argument / IN-list commas inline.
                         let breakable = self.brackets == 0
+                            && self.limit_depth != Some(self.parens.len())
                             && match self.parens.last() {
                                 None => true,
                                 Some(p) => p.subquery,
@@ -1257,6 +1303,7 @@ impl<'a> Fmt<'a> {
         self.parens.clear();
         self.brackets = 0;
         self.suppress_and = false;
+        self.cases.clear();
         self.prev = None;
         self.blank = true;
         self.break_to(0);
@@ -1541,6 +1588,71 @@ mod tests {
             "select\n  a,\n  -- about b\n  b\nfrom\n  t"
         );
         for sql in ["select a, -- first\n  b from t", own] {
+            let once = format_sql(sql, IND);
+            assert_eq!(format_sql(&once, IND), once, "idempotent: {sql}");
+        }
+    }
+
+    /// A `CASE` is laid out: each `WHEN` and the `ELSE` one level under the
+    /// line it opens on, `END` back at that line's level. Inside a function's
+    /// parens it stays on its line, and nested ones nest.
+    #[test]
+    fn a_case_lays_out_its_branches() {
+        assert_eq!(
+            format_sql(
+                "select case when a = 1 then 'one' when a = 2 then 'two' else 'many' end as label, b from t",
+                IND
+            ),
+            "select\n  case\n    when a = 1 then 'one'\n    when a = 2 then 'two'\n    else 'many'\n  end as label,\n  b\nfrom\n  t"
+        );
+        assert_eq!(
+            format_sql("select coalesce(case when a then 1 end, 0) from t", IND),
+            "select\n  coalesce(case when a then 1 end, 0)\nfrom\n  t"
+        );
+        assert_eq!(
+            format_sql(
+                "select case when a then case when b then 1 else 2 end end from t",
+                IND
+            ),
+            "select\n  case\n    when a then case\n      when b then 1\n      else 2\n    end\n  end\nfrom\n  t"
+        );
+        // A routine's `END CASE` closes with its own word.
+        let routine = format_sql("case x when 1 then set y = 1; end case;", IND);
+        assert!(routine.contains("end case;"), "{routine}");
+        for sql in [
+            "select case when a = 1 then 'one' else 'many' end as label, b from t",
+            "select case when a then case when b then 1 else 2 end end from t",
+        ] {
+            let once = format_sql(sql, IND);
+            assert_eq!(format_sql(&once, IND), once, "idempotent: {sql}");
+        }
+    }
+
+    /// `WITH RECURSIVE` is one head, `WINDOW` is a clause of its own, and
+    /// MySQL's `LIMIT offset, count` is one clause's two numbers, not a list.
+    #[test]
+    fn recursive_window_and_limit_lay_out_as_clauses() {
+        let got = format_sql("with recursive r as (select 1) select * from r", IND);
+        // The head's layout, as a plain `WITH` gets: `with⏎  r as (`.
+        assert!(got.starts_with("with recursive\n  r as (\n"), "{got}");
+        assert_eq!(
+            format_sql("select a from t window w as (partition by b)", IND),
+            "select\n  a\nfrom\n  t\nwindow\n  w as (partition by b)"
+        );
+        assert_eq!(
+            format_sql("select a from t limit 10, 20", IND),
+            "select\n  a\nfrom\n  t\nlimit\n  10, 20"
+        );
+        // A select list after the LIMIT's statement still breaks.
+        assert_eq!(
+            format_sql("select a from t limit 1, 2; select b, c from u", IND),
+            "select\n  a\nfrom\n  t\nlimit\n  1, 2;\n\nselect\n  b,\n  c\nfrom\n  u"
+        );
+        for sql in [
+            "with recursive r as (select 1) select * from r",
+            "select a from t window w as (partition by b)",
+            "select a from t limit 10, 20",
+        ] {
             let once = format_sql(sql, IND);
             assert_eq!(format_sql(&once, IND), once, "idempotent: {sql}");
         }
