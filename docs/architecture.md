@@ -1864,6 +1864,20 @@ existing prose was left alone.
     split, `export::ident_if_needed` and `filter::needs_quoting` were asking the **alias** set, so
     `filter::table_query` over a table `if` keyed on a `cast` column generated
     `SELECT * FROM if ORDER BY cast ASC LIMIT 10` and SQLite answered `near "ASC": syntax error`.
+    **The MySQL family is two servers here, and the two questions take them differently.**
+    `MYSQL_RESERVED` is MySQL 8's; MariaDB, measured word by word against its own
+    `information_schema.KEYWORDS` in all three alias positions on 10.11.14 and 11.8.9, takes the
+    thirty-one words of `MARIADB_FREES` as aliases (the window functions, `LATERAL`, `ROW`,
+    `SYSTEM`, …) and refuses the fifteen of `MARIADB_ADDS` (`OFFSET`, `RETURNING`,
+    `CURRENT_ROLE`, …). The **alias check** asks `is_reserved_word_on` with the server's flavour,
+    which `Catalog` now carries (`Catalog::flavour`, from the active database's `DbSchema`), and
+    with none known holds to what both reserve — the warning's side
+    (`mariadb_reserves_its_own_words`, `the_alias_check_follows_the_servers_flavour`). Its implicit
+    `orders offset` form is read by the table-list walk on the dialect's list, so a MariaDB-only
+    word there goes unflagged rather than wrongly read. The **quoter** cannot know the server, so
+    `must_quote_ident` takes both (`reserved_anywhere`): a MariaDB column named `offset` had gone
+    into generated SQL bare (`a_word_either_mysql_family_server_reserves_is_quoted`). The other
+    `is_reserved_word` sites — the scope's alias resolution among them — still read MySQL's list.
     Neither list is a transcription of anybody's documentation any more: `db::sqlite`'s
     `the_reserved_lists_match_what_sqlite_itself_refuses` walks the engine's own keyword table
     (`sqlite3_keyword_count`/`sqlite3_keyword_name`) and compiles every keyword on a real in-memory

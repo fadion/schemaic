@@ -4976,6 +4976,10 @@ pub struct Catalog {
     /// prediction, which would write it out as one table's columns or keys
     /// ([`Catalog::is_union`]).
     unioned: HashSet<(String, String)>,
+    /// Which MySQL-family server the schemas were read from — the active
+    /// database's, else the first loaded one's that says. The alias
+    /// diagnostic asks it ([`is_reserved_word_on`]); `Unknown` elsewhere.
+    flavour: crate::schema::ServerFlavour,
 }
 
 /// A memo over [`Catalog::build`], keyed on the **identity** of the schemas the
@@ -5119,6 +5123,16 @@ impl Catalog {
         let mut unioned = HashSet::new();
         let mut keys_seen: HashMap<String, Vec<String>> = HashMap::new();
         let active_lower = active_db.map(|d| d.to_ascii_lowercase());
+        // The active database's server, else the first loaded one that says:
+        // one connection's databases share their server.
+        let known = |s: &&DbSchema| s.flavour != crate::schema::ServerFlavour::Unknown;
+        let flavour = loaded
+            .iter()
+            .find(|(db, _)| active_db.is_some_and(|a| a.eq_ignore_ascii_case(db)))
+            .map(|(_, s)| *s)
+            .filter(known)
+            .or_else(|| loaded.iter().map(|(_, s)| *s).find(known))
+            .map_or_else(Default::default, |s| s.flavour);
         // **`(database, name)` and a bare name are shared by every schema's
         // relations, so their columns are merged, never replaced.** Two
         // same-named tables in different schemas (`sales.orders`,
@@ -5315,7 +5329,14 @@ impl Catalog {
             insert_skips,
             pk_shared,
             unioned,
+            flavour,
         }
+    }
+
+    /// Which MySQL-family server the catalogue was read from — see
+    /// [`Catalog::flavour`](Catalog#structfield.flavour).
+    pub fn flavour(&self) -> crate::schema::ServerFlavour {
+        self.flavour
     }
 
     /// Do `r`'s columns, as [`columns_of`] answers them, belong to two
@@ -7332,7 +7353,7 @@ fn unit_diagnostics(
     // Reserved-keyword aliases (`orders AS or`, `orders or`) run unconditionally:
     // sqlparser is laxer than MySQL here (it *accepts* `AS or`), so gating on a
     // parse failure would miss the very case we want to flag.
-    alias_checks(sql, lo, hi, dialect, out);
+    alias_checks(sql, lo, hi, dialect, catalog.flavour(), out);
 }
 
 /// One stretch of a statement the parser has no grammar for — `from..to` in
@@ -8465,6 +8486,68 @@ const MYSQL_RESERVED: &[&str] = &[
     "ZEROFILL",
 ];
 
+/// Words [`MYSQL_RESERVED`] holds that **MariaDB takes as an alias**: measured
+/// by `SELECT 1 AS w`, `FROM (…) AS w` and `FROM (…) w`, each accepted, on
+/// MariaDB 10.11.14 and 11.8.9 alike. `WINDOW` is not among them: MariaDB
+/// takes it as a column alias and refuses it as a table's.
+const MARIADB_FREES: &[&str] = &[
+    "CUBE",
+    "CUME_DIST",
+    "DATABASE",
+    "DENSE_RANK",
+    "EMPTY",
+    "FIRST_VALUE",
+    "FUNCTION",
+    "GENERATED",
+    "GET",
+    "GROUPING",
+    "GROUPS",
+    "IO_AFTER_GTIDS",
+    "IO_BEFORE_GTIDS",
+    "JSON_TABLE",
+    "LAG",
+    "LAST_VALUE",
+    "LATERAL",
+    "LEAD",
+    "MASTER_BIND",
+    "NTH_VALUE",
+    "NTILE",
+    "OF",
+    "OPTIMIZER_COSTS",
+    "OPTION",
+    "PERCENT_RANK",
+    "RANK",
+    "ROW",
+    "SCHEMA",
+    "STORED",
+    "SYSTEM",
+    "VIRTUAL",
+];
+
+/// Words **MariaDB reserves** that [`MYSQL_RESERVED`] does not: refused in all
+/// three alias positions on MariaDB 10.11.14 and 11.8.9, found by trying every
+/// word of its `information_schema.KEYWORDS`. 11.8 also refuses `VECTOR`,
+/// `SQL_AFTER_GTIDS` and `SQL_BEFORE_GTIDS`, which 10.11 takes; they are left
+/// out, since the version is not known here and a false squiggle is the worse
+/// mistake.
+const MARIADB_ADDS: &[&str] = &[
+    "CURRENT_ROLE",
+    "DELETE_DOMAIN_ID",
+    "DO_DOMAIN_IDS",
+    "IGNORE_DOMAIN_IDS",
+    "MASTER_DEMOTE_TO_REPLICA",
+    "MASTER_DEMOTE_TO_SLAVE",
+    "OFFSET",
+    "PAGE_CHECKSUM",
+    "PARSE_VCOL_EXPR",
+    "PORTION",
+    "REF_SYSTEM_ID",
+    "RETURNING",
+    "STATS_AUTO_RECALC",
+    "STATS_PERSISTENT",
+    "STATS_SAMPLE_PAGES",
+];
+
 /// PostgreSQL **reserved** words — those that can't be a bare (unquoted)
 /// identifier/alias without double-quoting. The union of Postgres 16's "reserved"
 /// and "reserved (can be function or type name)" categories (Appendix C): both are
@@ -8852,6 +8935,47 @@ pub fn is_reserved_word(word: &str, dialect: SqlDialect) -> bool {
     reserved_words(dialect).contains(&up.as_str())
 }
 
+/// [`is_reserved_word`] on a known server: a MySQL-family `dialect` is MySQL 8
+/// or MariaDB by `flavour` ([`MARIADB_FREES`], [`MARIADB_ADDS`]), and one not
+/// yet asked is held to the words **both** reserve — this backs a warning,
+/// where a word wrongly listed squiggles working SQL. Other engines have no
+/// flavour and answer as [`is_reserved_word`] does.
+pub fn is_reserved_word_on(
+    word: &str,
+    dialect: SqlDialect,
+    flavour: crate::schema::ServerFlavour,
+) -> bool {
+    use crate::schema::ServerFlavour;
+    let up = word.to_ascii_uppercase();
+    let mysql = || MYSQL_RESERVED.contains(&up.as_str());
+    let freed = || MARIADB_FREES.contains(&up.as_str());
+    match dialect {
+        SqlDialect::MySql => match flavour {
+            ServerFlavour::MySql => mysql(),
+            ServerFlavour::MariaDb => (mysql() && !freed()) || MARIADB_ADDS.contains(&up.as_str()),
+            ServerFlavour::Unknown => mysql() && !freed(),
+        },
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => {
+            is_reserved_word(word, dialect)
+        }
+    }
+}
+
+/// Does either MySQL-family server reserve `word`? The quoter's question
+/// ([`must_quote_ident`]), which cannot know the server and must be safe on
+/// both: [`MYSQL_RESERVED`] and [`MARIADB_ADDS`]. Elsewhere the dialect's list.
+fn reserved_anywhere(word: &str, dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MySql => {
+            is_reserved_word(word, dialect)
+                || MARIADB_ADDS.contains(&word.to_ascii_uppercase().as_str())
+        }
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => {
+            is_reserved_word(word, dialect)
+        }
+    }
+}
+
 /// The reserved list [`is_reserved_word`] consults, as a slice.
 ///
 /// Named so [`static_words`] can fold the same vocabulary into the typo
@@ -8955,7 +9079,7 @@ fn alias_ok_but_unquotable(dialect: SqlDialect) -> &'static [&'static str] {
 /// `the_reserved_lists_match_what_sqlite_itself_refuses`, which walks the engine's
 /// own keyword table rather than a transcription of its documentation.
 pub fn must_quote_ident(word: &str, dialect: SqlDialect) -> bool {
-    if is_reserved_word(word, dialect) {
+    if reserved_anywhere(word, dialect) {
         return true;
     }
     let up = word.to_ascii_uppercase();
@@ -9686,9 +9810,18 @@ fn top_level_comma(toks: &[Token]) -> bool {
 /// or implicit (`orders or`) — a syntax error unless backtick-quoted. Runs
 /// unconditionally: sqlparser is laxer than MySQL here (it *accepts* `AS or`), so
 /// gating on a parse failure would miss it. Only genuinely-reserved words are flagged
-/// ([`is_reserved_word`]) and only where an alias is actually expected, so well-formed
-/// SQL isn't squiggled.
-fn alias_checks(sql: &str, lo: usize, hi: usize, dialect: SqlDialect, out: &mut Vec<Diagnostic>) {
+/// — on the server the catalogue was read from ([`is_reserved_word_on`], so MariaDB's
+/// `AS rank` is left alone and its `AS offset` is not) — and only where an alias is
+/// actually expected, so well-formed SQL isn't squiggled.
+fn alias_checks(
+    sql: &str,
+    lo: usize,
+    hi: usize,
+    dialect: SqlDialect,
+    flavour: crate::schema::ServerFlavour,
+    out: &mut Vec<Diagnostic>,
+) {
+    let reserved = |w: &str| is_reserved_word_on(w, dialect, flavour);
     let toks = tokenize_range(sql, lo, hi, dialect);
     // The remedy names this engine's quote: backticks were SQL Server's and
     // PostgreSQL's advice too, and neither accepts them.
@@ -9738,7 +9871,7 @@ fn alias_checks(sql: &str, lo: usize, hi: usize, dialect: SqlDialect, out: &mut 
         let (TkKind::Word(a), TkKind::Word(b)) = (&w[0].kind, &w[1].kind) else {
             continue;
         };
-        if !a.eq_ignore_ascii_case("AS") || !is_reserved_word(b, dialect) {
+        if !a.eq_ignore_ascii_case("AS") || !reserved(b) {
             continue;
         }
         if body_as == Some(i) || definition_as == Some(i) {
@@ -9787,8 +9920,15 @@ fn alias_checks(sql: &str, lo: usize, hi: usize, dialect: SqlDialect, out: &mut 
     // VALUES/SET/SELECT would false-trigger) and to keywords that aren't a
     // legitimate table-ref continuation (`reserved_in_alias_slot`), so
     // `WHERE`/`ORDER`/`ON`/`JOIN`/… are safe.
+    //
+    // The walk reads the slot by the dialect's list, which is what decides
+    // where a table reference ends; whether the word is an error is the
+    // server's question. So a MariaDB-only reserved word there (`orders
+    // offset`) is read as an alias and goes unflagged — missed, not wrong.
     walk_table_lists(&toks, dialect, false, &mut |item| {
-        if let Some((at, kw)) = item.reserved_alias {
+        if let Some((at, kw)) = item.reserved_alias
+            && reserved(&kw)
+        {
             flag(out, at, &kw);
         }
     });
@@ -19432,6 +19572,11 @@ mod tests {
                     tbl("employees", &["id", "name", "salary", "dept_id"]),
                     tbl("departments", &["id", "name"]),
                 ],
+                // A MySQL 8 server, which is what the MySQL-dialect tests
+                // mean; the flavour is no question on the other engines. Left
+                // `Unknown`, the alias check holds to what MariaDB reserves
+                // too (`is_reserved_word_on`).
+                flavour: crate::schema::ServerFlavour::MySql,
                 ..Default::default()
             },
             "company",
@@ -21274,6 +21419,79 @@ mod tests {
         ));
     }
 
+    /// **MariaDB reserves its own set.** Measured by `SELECT 1 AS w` (and as a
+    /// table alias, with and without `AS`) on MariaDB 10.11.14 and 11.8.9:
+    /// the window functions, `LATERAL`, `ROW`, `SYSTEM` and the rest of
+    /// `MARIADB_FREES` are aliases there, and `OFFSET`, `RETURNING`,
+    /// `CURRENT_ROLE` and the rest of `MARIADB_ADDS` are refused. A server
+    /// not yet asked is held to what both reserve.
+    #[test]
+    fn mariadb_reserves_its_own_words() {
+        use crate::schema::ServerFlavour::{MariaDb, MySql as My, Unknown};
+        let on = |w, f| is_reserved_word_on(w, SqlDialect::MySql, f);
+        assert!(on("rank", My) && !on("rank", MariaDb) && !on("rank", Unknown));
+        assert!(on("lateral", My) && !on("lateral", MariaDb));
+        assert!(on("offset", MariaDb) && !on("offset", My) && !on("offset", Unknown));
+        assert!(on("returning", MariaDb) && !on("returning", My));
+        // `WINDOW` is a column alias on MariaDB but not a table alias: kept.
+        assert!(on("window", MariaDb));
+        for f in [My, MariaDb, Unknown] {
+            assert!(on("select", f) && on("unsigned", f), "{f:?}");
+        }
+        // The flavour is a MySQL-family question only.
+        assert!(is_reserved_word_on(
+            "lateral",
+            SqlDialect::Postgres,
+            Unknown
+        ));
+        // The deltas are deltas.
+        for w in MARIADB_FREES {
+            assert!(MYSQL_RESERVED.contains(w), "{w}");
+        }
+        for w in MARIADB_ADDS {
+            assert!(!MYSQL_RESERVED.contains(w), "{w}");
+        }
+    }
+
+    /// A quoter does not know which server it writes for, so a name either
+    /// reserves is quoted: a MariaDB column named `offset` went into generated
+    /// SQL bare and did not parse there.
+    #[test]
+    fn a_word_either_mysql_family_server_reserves_is_quoted() {
+        assert!(must_quote_ident("offset", SqlDialect::MySql));
+        assert_eq!(
+            crate::export::ident_if_needed("offset", SqlDialect::MySql),
+            "`offset`"
+        );
+        assert_eq!(
+            crate::export::ident_if_needed("rank", SqlDialect::MySql),
+            "`rank`"
+        );
+        assert!(!must_quote_ident("rank", SqlDialect::Postgres));
+    }
+
+    /// The alias diagnostic asks the server the catalogue was read from.
+    #[test]
+    fn the_alias_check_follows_the_servers_flavour() {
+        let on = |sql: &str, f| {
+            let (mut schema, db) = sample_catalog();
+            schema.flavour = f;
+            let cat = Catalog::build(&[(db, &schema)], Some(db));
+            diagnostics(sql, &cat, SqlDialect::MySql)
+        };
+        use crate::schema::ServerFlavour::{MariaDb, MySql as My};
+        let rank = "SELECT id AS rank FROM employees";
+        assert!(has_reserved_alias(&on(rank, My), rank, "rank"));
+        assert!(!has_reserved_alias(&on(rank, MariaDb), rank, "rank"));
+        let offset = "SELECT id AS offset FROM employees";
+        assert!(has_reserved_alias(&on(offset, MariaDb), offset, "offset"));
+        assert!(!has_reserved_alias(&on(offset, My), offset, "offset"));
+        // Implicit table aliases too.
+        let t = "SELECT 1 FROM employees rank";
+        assert!(!has_reserved_alias(&on(t, MariaDb), t, "rank"));
+        assert!(has_reserved_alias(&on(t, My), t, "rank"));
+    }
+
     #[test]
     fn reserved_word_lookup_per_dialect() {
         assert!(is_reserved_word("unsigned", SqlDialect::MySql));
@@ -21660,7 +21878,9 @@ mod tests {
             "SELECT * FROM employees AS or;",
             "SELECT * FROM employees or;",
             "SELECT id AS select FROM employees;",
-            "SELECT id AS rank FROM employees;",
+            // Reserved by both MySQL-family servers: with no schema loaded the
+            // server is not known, and MariaDB takes `rank` as an alias.
+            "SELECT id AS range FROM employees;",
             "SELECT * FROM employees AS and;",
             "SELECT * FROM employees e JOIN departments or ON 1 = 1;",
             "SELECT FROM WHERE;",
@@ -22840,7 +23060,14 @@ mod tests {
         // and its syntax error on the same word would hide the alias error.
         let sql = "DELETE FROM employees FROM employees e JOIN departments d ON d.id = e.dept_id;";
         let mut out = Vec::new();
-        alias_checks(sql, 0, sql.len(), SqlDialect::MsSql, &mut out);
+        alias_checks(
+            sql,
+            0,
+            sql.len(),
+            SqlDialect::MsSql,
+            crate::schema::ServerFlavour::Unknown,
+            &mut out,
+        );
         assert!(out.is_empty(), "{out:?}");
         // A reserved alias right before the `;` is still one.
         assert_eq!(
