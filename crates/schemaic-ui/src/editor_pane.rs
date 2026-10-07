@@ -295,6 +295,18 @@ fn format_editor(ed: &Editor, comp: Completion, dialect: SqlDialect) {
     }
 }
 
+/// What a format request from outside the pane asks of it ([`Tab::format_req`](crate::Tab::format_req)):
+/// the palette's three commands, each the editor menu's entry of that name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FormatReq {
+    /// *Format Code* — the selection, else the document (`format_editor`).
+    Code,
+    /// *Format Statement* — the statement at the caret.
+    Statement,
+    /// *Make Single Line* — the selection, else the statement at the caret.
+    SingleLine,
+}
+
 /// One level of Format's indentation, from the editor's tab-width and
 /// soft-tabs settings.
 fn indent_unit() -> String {
@@ -2186,10 +2198,11 @@ pub(crate) struct QueryPaneParams {
     /// When set, jump the caret to this byte offset (move + centre + focus), then
     /// clear it. Driven by the status-bar warning count.
     pub jump_offset: RwSignal<Option<usize>>,
-    /// When set, reformat this tab and clear it — the palette's "Format Code".
-    /// See [`Tab::format_req`](crate::Tab::format_req) for why it comes through
-    /// the pane instead of being written straight into `query`.
-    pub format_req: RwSignal<bool>,
+    /// When set, reformat this tab as asked and clear it — the palette's
+    /// "Format Code", "Format Statement" and "Make Single Line". See
+    /// [`Tab::format_req`](crate::Tab::format_req) for why it comes through the
+    /// pane instead of being written straight into `query`.
+    pub format_req: RwSignal<Option<FormatReq>>,
     /// When set, insert this text at the caret and clear it — the snippet
     /// library. See [`Tab::insert_req`](crate::Tab::insert_req).
     pub insert_req: RwSignal<Option<String>>,
@@ -3708,12 +3721,38 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     // three can't disagree about what formatting means. The palette used to set
     // `query` itself, which the mounted editor never reads back (see
     // `Tab::format_req`), so the command silently did nothing.
+    //
+    // The palette's statement and single-line commands are the editor menu's
+    // entries at the caret, by the same `sqlfmt` answers and `rewrite_range`.
     create_effect(move |_| {
-        if !format_req.get() {
+        let Some(req) = format_req.get() else {
             return;
+        };
+        let dia = dialect.get_untracked();
+        let cursor = ed_fmt_req.cursor.get_untracked();
+        let caret = cursor.offset();
+        let edit = || {
+            let sql = ed_fmt_req.doc().text().to_string();
+            match req {
+                FormatReq::Code => None,
+                FormatReq::Statement => {
+                    schemaic_core::sqlfmt::format_statement(&sql, caret, &indent_unit(), dia)
+                }
+                FormatReq::SingleLine => {
+                    let sel = cursor.get_selection().unwrap_or((caret, caret));
+                    schemaic_core::sqlfmt::single_line_in_place(&sql, sel, caret, dia)
+                }
+            }
+        };
+        match req {
+            FormatReq::Code => format_editor(&ed_fmt_req, comp, dia),
+            FormatReq::Statement | FormatReq::SingleLine => {
+                if let Some(e) = edit() {
+                    rewrite_range(&ed_fmt_req, comp, e);
+                }
+            }
         }
-        format_editor(&ed_fmt_req, comp, dialect.get_untracked());
-        format_req.set(false);
+        format_req.set(None);
     });
 
     // Insert text at the caret on request (the snippet library), then clear —

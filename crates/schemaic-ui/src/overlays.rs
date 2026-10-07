@@ -3888,7 +3888,37 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
             arg: instant(
                 Rc::new(move || {
                     if let Some(t) = active_tab() {
-                        t.format_req.set(true);
+                        t.format_req.set(Some(crate::editor_pane::FormatReq::Code));
+                    }
+                }),
+                &close,
+            ),
+        },
+        // The editor menu's in-place entries, at the caret — through the
+        // same request, so the palette cannot drift from the menu.
+        Command {
+            name: "format statement",
+            label: "Format Statement",
+            hint: "the statement at the caret",
+            arg: instant(
+                Rc::new(move || {
+                    if let Some(t) = active_tab() {
+                        t.format_req
+                            .set(Some(crate::editor_pane::FormatReq::Statement));
+                    }
+                }),
+                &close,
+            ),
+        },
+        Command {
+            name: "make single line",
+            label: "Make Single Line",
+            hint: "the selection or statement, on one line",
+            arg: instant(
+                Rc::new(move || {
+                    if let Some(t) = active_tab() {
+                        t.format_req
+                            .set(Some(crate::editor_pane::FormatReq::SingleLine));
                     }
                 }),
                 &close,

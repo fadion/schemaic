@@ -2010,8 +2010,10 @@ pub struct Tab {
     /// signal, and the formatted text was never shown — the next keystroke
     /// overwrote it back from the doc. Routing it here also means one formatter
     /// (`format_editor`), so the palette can't drift from Ctrl+Alt+L, and the
-    /// result lands as one undoable edit instead of a pane remount.
-    pub format_req: RwSignal<bool>,
+    /// result lands as one undoable edit instead of a pane remount. Which of
+    /// the three formats is asked ([`editor_pane::FormatReq`]): Format Code,
+    /// Format Statement, Make Single Line.
+    pub format_req: RwSignal<Option<editor_pane::FormatReq>>,
     /// A run error to fix with the AI, which the editor pane does and then
     /// clears — the same request-and-clear shape as [`Tab::format_req`], and for
     /// a stricter version of the same reason.
@@ -2553,7 +2555,7 @@ impl Tab {
             params: cx.create_rw_signal(Vec::new()),
             goto_open: cx.create_rw_signal(false),
             jump_offset: cx.create_rw_signal(None),
-            format_req: cx.create_rw_signal(false),
+            format_req: cx.create_rw_signal(None),
             fix_req: cx.create_rw_signal(None),
             diagnostics: cx.create_rw_signal(Vec::new()),
             highlight_col: cx.create_rw_signal(None),

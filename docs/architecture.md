@@ -23454,8 +23454,10 @@ existing prose was left alone.
     code*, writes `sqlfmt::format_statement` over the statement under the click, and is offered only
     **without a selection** — with one, *Format code* already formats just that — and only when the
     statement is not formatted yet. A selection stays selected over the rewritten range; a bare
-    caret keeps its place among the tokens (`sqlfmt::caret_after_replace`). Neither has a shortcut
-    or a palette command yet.
+    caret keeps its place among the tokens (`sqlfmt::caret_after_replace`). Neither has a shortcut;
+    each has a palette command (*Format Statement*, *Make Single Line*), which acts at the caret
+    through `Tab::format_req` — an `Option<FormatReq>` naming which of the three formats is asked —
+    and the same `sqlfmt` answer and `rewrite_range`.
     **The Ctrl+K suggestion is not drawn here** — it is phantom rows in the editor's own line flow
     (`inline_diff`, below), and what `cmdk_popup` still draws is the two ends of the block: the
     question bar (sparkle, a `multiline` `edit_field` capped at three rows, then a send affordance or
@@ -33136,7 +33138,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   `t.query`, which nothing read back, so the command silently did nothing at all — and the bug was
   invisible in review, because the line that "applies" the format looks exactly like the line that
   would work if the sync went both ways. It also meant two formatters, so the palette could drift
-  from Ctrl+Alt+L; `format_req` reaches the same `editor_pane::format_editor`.
+  from Ctrl+Alt+L; `format_req` (`Some(FormatReq::Code)`) reaches the same
+  `editor_pane::format_editor`.
   That function writes `sqlfmt::format_range`'s text, not `format_sql`'s — the `sqlfmt.rs` entry
   has the `fromt` splice that cost — and returns without touching the caret when `edit_untyped`
   refuses, where under the Ctrl+K preview's freeze it used to move the caret anyway. A formatted
