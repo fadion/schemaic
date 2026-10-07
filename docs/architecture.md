@@ -12109,13 +12109,29 @@ existing prose was left alone.
     (`Fmt::verb`, the statement's first word), and only with a name after it, since a procedure
     parameter's `@x int OUTPUT` takes no parens and a column may be called `output`
     (`top_keeps_its_space_and_output_is_a_clause`). **A `BEGIN … END` body is indented**
-    (`Fmt::blocks`): `end_statement` returns a body's `;` to the body's level, not the margin, and
-    with no blank line between its statements; `END` steps back to its `BEGIN`'s; T-SQL's `TRY`/
-    `CATCH` stay with their word (`emit_block_follower`); a `BEGIN` takes a line of its own unless
-    it ends a header (`AS BEGIN`, `THEN BEGIN`). A transaction's `BEGIN` — `TRAN`, `TRANSACTION`,
-    `WORK`, `DISTRIBUTED`, or a bare `BEGIN;` — opens nothing (`opens_body`), an `END IF`/`LOOP`/
-    `WHILE`/`REPEAT`/`FOR` closes no body, and a `GO` ends whatever its batch left open
-    (`a_begin_end_body_is_indented`).
+    (`Fmt::blocks`, a stack of the word that opened each open body): `end_statement` returns a
+    body's `;` to the body's level, not the margin, and with no blank line between its statements;
+    `END` steps back to its `BEGIN`'s; T-SQL's `TRY`/`CATCH` stay with their word
+    (`emit_block_follower`); a `BEGIN` takes a line of its own unless it ends a header (`AS BEGIN`,
+    `THEN BEGIN`) or follows a label (`lbl: begin`). A transaction's `BEGIN` — `TRAN`,
+    `TRANSACTION`, `WORK`, `DISTRIBUTED`, or a bare `BEGIN;` — opens nothing (`opens_body`), and a
+    `GO` ends whatever its batch left open (`a_begin_end_body_is_indented`). **On MySQL a compound
+    statement is a body too**, where `pairs::names_its_block_ends` says so — the same predicate
+    the editor's block matching asks. `IF`, `WHILE` and MariaDB's `FOR` at a statement start
+    (`at_statement_start`: nothing yet, or a label's `:`) write their header on the line, its
+    content one deeper so an `AND` in the condition breaks one level in, and `Fmt::awaiting` holds
+    the word that ends it — `THEN`, `DO` — which opens the body (`open_block`); `LOOP` and
+    `REPEAT` open theirs at once. An `ELSEIF`/`ELSE` goes back to its `IF`'s level and reopens;
+    `UNTIL` goes back to its `REPEAT`'s, and the `END REPEAT` after it stays on its line
+    (`until i > 5 end repeat;`). Which `END` closes which body is `closes_block`: a bare `END`
+    (or `END TRY`/`CATCH`) a `BEGIN`, an `END IF`/`LOOP`/`WHILE`/`FOR` its own kind, `END REPEAT`
+    the `UNTIL`, and an `END CASE` nothing — before, an `END CASE` whose `CASE` frame a `;` had
+    already cleared popped the enclosing `BEGIN`. `IF (…)` is the statement only when `THEN`
+    follows the parens (`if_statement`), so `IF(a, 1, 2)` stays a call, and the statement's
+    `IF (a > 1) THEN` keeps its space. A label's colon is written tight before
+    `BEGIN`/`LOOP`/`WHILE`/`REPEAT`/`FOR` on every engine — it came out `l : loop`. Where
+    `names_its_block_ends` is `false` an `END IF` and its kin still close no body: T-SQL's `IF`
+    has no `END IF` and opens nothing (`a_compound_statement_body_is_indented`).
     **A T-SQL `@x`, `@@ROWCOUNT`, `#t` or `##g` is one `Kind::Word`.** `@` and `#` fell to the
     operator arm and `need_space` separated them from their name, so one Format Code broke nearly
     every T-SQL script: `SELECT @ x` is Msg 137, `SELECT @ @ VERSION` and `CREATE TABLE # t` are

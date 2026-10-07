@@ -931,10 +931,18 @@ struct Fmt<'a> {
     verb: Option<String>,
     /// `OUTPUT` can be a write's clause here ([`has_output_clause`]).
     output_clause: bool,
-    /// How many `BEGIN … END` bodies are open. A statement inside one starts
-    /// that many levels in, and its `;` returns there rather than to the
-    /// margin.
-    blocks: usize,
+    /// The bodies open, innermost last, each by the word that opened it:
+    /// `BEGIN`, or where an `END` names what it closes
+    /// ([`crate::pairs::names_its_block_ends`]) `IF`, `LOOP`, `WHILE`, `FOR`,
+    /// `REPEAT` — `UNTIL` once a `REPEAT` reaches its condition. A statement
+    /// inside one starts that many levels in, and its `;` returns there
+    /// rather than to the margin.
+    blocks: Vec<&'static str>,
+    /// An `IF`/`ELSEIF`, `WHILE` or `FOR` header being written: the word that
+    /// ends it and opens the body (`THEN`, `DO`), and the block it opens.
+    awaiting: Option<(&'static str, &'static str)>,
+    /// Compound statements are bodies here ([`crate::pairs::names_its_block_ends`]).
+    named_ends: bool,
 }
 
 /// One open `CASE`: the indent of the line it opened on, the paren depth it
@@ -969,8 +977,76 @@ impl<'a> Fmt<'a> {
             cases: Vec::new(),
             verb: None,
             output_clause: has_output_clause(dialect),
-            blocks: 0,
+            blocks: Vec::new(),
+            awaiting: None,
+            named_ends: crate::pairs::names_its_block_ends(dialect),
         }
+    }
+
+    /// Open a body of `kind` after the word just written: what follows starts
+    /// a statement one level in.
+    fn open_block(&mut self, kind: &'static str) {
+        self.blocks.push(kind);
+        self.base = self.blocks.len();
+        self.content = self.base;
+        self.prev = None;
+        self.break_to(self.base);
+    }
+
+    /// Is the next token one where a statement starts — after a `;`, a body's
+    /// opening word, or a label's `:`?
+    fn at_statement_start(&self) -> bool {
+        match &self.prev {
+            None => true,
+            Some((Kind::Punct, p)) => p == ":",
+            Some(_) => false,
+        }
+    }
+
+    /// Does the `END` at `toks[k]` close the innermost body? A bare `END` (or
+    /// T-SQL's `END TRY`/`CATCH`) closes a `BEGIN`; an `END IF` and its kin
+    /// the statement they name; an `END CASE` a `CASE` statement, which is no
+    /// body here.
+    fn closes_block(&self, toks: &[(Kind, &str)], k: usize) -> bool {
+        let Some(&top) = self.blocks.last() else {
+            return false;
+        };
+        let named = match toks.get(k + 1) {
+            Some((Kind::Word, w)) => ["IF", "LOOP", "WHILE", "REPEAT", "FOR", "CASE"]
+                .into_iter()
+                .find(|t| w.eq_ignore_ascii_case(t)),
+            _ => None,
+        };
+        match named {
+            None => top == "BEGIN",
+            Some("REPEAT") => top == "UNTIL",
+            Some(n) => top == n,
+        }
+    }
+
+    /// Is the `IF` at `toks[k]` a statement's? `IF (…)` is when `THEN`
+    /// follows the parens, and otherwise the `IF()` function.
+    fn if_statement(toks: &[(Kind, &str)], k: usize) -> bool {
+        let mut rest = toks[k + 1..]
+            .iter()
+            .filter(|(kind, _)| !matches!(kind, Kind::LineComment | Kind::BlockComment));
+        if !matches!(rest.next(), Some((Kind::Punct, "("))) {
+            return true;
+        }
+        let mut depth = 1usize;
+        for (kind, t) in rest.by_ref() {
+            match (kind, *t) {
+                (Kind::Punct, "(") => depth += 1,
+                (Kind::Punct, ")") => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        matches!(rest.next(), Some((Kind::Word, w)) if w.eq_ignore_ascii_case("THEN"))
     }
 
     /// After a `BEGIN`/`END` at `toks[k]`: T-SQL's `TRY`/`CATCH` stays with
@@ -1109,6 +1185,16 @@ impl<'a> Fmt<'a> {
         if self.brackets > 0 && ((cur_kind == Kind::Punct && cur == ":") || pt == ":") {
             return false;
         }
+        // A compound statement's `IF (a > b) THEN` is no `IF()` call.
+        if cur_kind == Kind::Punct
+            && cur == "("
+            && self.awaiting.is_some()
+            && ["IF", "ELSEIF", "WHILE"]
+                .iter()
+                .any(|w| pt.eq_ignore_ascii_case(w))
+        {
+            return true;
+        }
         if cur_kind == Kind::Punct && cur == "(" {
             // Function call `name(` / `)(` → tight; `KEYWORD (` → spaced —
             // save a keyword that is also a function, whose `(` is a call's.
@@ -1178,7 +1264,8 @@ impl<'a> Fmt<'a> {
                     self.break_to(0);
                     self.emit(kind, text, false);
                     // A batch's end closes whatever body it left open.
-                    self.blocks = 0;
+                    self.blocks.clear();
+                    self.awaiting = None;
                     self.base = 0;
                     self.content = 0;
                     self.parens.clear();
@@ -1229,7 +1316,65 @@ impl<'a> Fmt<'a> {
                             self.blank = false;
                             self.emit(Kind::Word, text, false);
                         }
-                    } else if after_dot || called {
+                    } else if after_dot {
+                        self.emit(Kind::Word, text, false);
+                    } else if let Some((ends, kind)) = self.awaiting
+                        && up == ends
+                        && !in_expr
+                        && self.case_here().is_none()
+                    {
+                        // `THEN`/`DO` ends the header: the body opens.
+                        self.emit(Kind::Word, text, false);
+                        self.awaiting = None;
+                        self.open_block(kind);
+                    } else if self.named_ends && !in_expr && self.at_statement_start() && {
+                        let opener = matches!(up.as_str(), "LOOP" | "REPEAT" | "WHILE" | "FOR");
+                        opener || (up == "IF" && Self::if_statement(toks, k))
+                    } {
+                        // A compound statement: `LOOP` and `REPEAT` open their
+                        // body at once, the others after their header.
+                        self.emit(Kind::Word, text, false);
+                        match up.as_str() {
+                            "LOOP" => self.open_block("LOOP"),
+                            "REPEAT" => self.open_block("REPEAT"),
+                            _ => {
+                                self.awaiting = Some(match up.as_str() {
+                                    "IF" => ("THEN", "IF"),
+                                    "WHILE" => ("DO", "WHILE"),
+                                    _ => ("DO", "FOR"),
+                                });
+                                self.content = self.base + 1;
+                            }
+                        }
+                    } else if !in_expr
+                        && self.case_here().is_none()
+                        && self.blocks.last() == Some(&"IF")
+                        && (up == "ELSEIF" || up == "ELSE")
+                    {
+                        // An `IF`'s next branch, at the `IF`'s level.
+                        self.blocks.pop();
+                        let level = self.blocks.len();
+                        self.base = level;
+                        self.content = level;
+                        self.break_to(level);
+                        self.emit(Kind::Word, text, false);
+                        if up == "ELSE" {
+                            self.open_block("IF");
+                        } else {
+                            self.awaiting = Some(("THEN", "IF"));
+                            self.content = level + 1;
+                        }
+                    } else if up == "UNTIL" && !in_expr && self.blocks.last() == Some(&"REPEAT") {
+                        // A `REPEAT`'s condition, at its level; the `END
+                        // REPEAT` after it stays on its line.
+                        self.blocks.pop();
+                        self.blocks.push("UNTIL");
+                        let level = self.blocks.len() - 1;
+                        self.base = level;
+                        self.content = level + 1;
+                        self.break_to(level);
+                        self.emit(Kind::Word, text, false);
+                    } else if called {
                         self.emit(Kind::Word, text, false);
                     } else if up == "CASE" && self.prev_word_upper().as_deref() != Some("END") {
                         // Opens a frame; `END CASE`'s word closes one instead.
@@ -1254,33 +1399,27 @@ impl<'a> Fmt<'a> {
                     } else if up == "BEGIN" && !in_expr && Self::opens_body(toks, k) {
                         // A body: on its own line unless it ends a header
                         // (`AS BEGIN`, `THEN BEGIN`), with T-SQL's TRY/CATCH.
+                        // A label's `l: BEGIN` keeps its line too.
                         let ends_header = matches!(
                             self.prev_word_upper().as_deref(),
                             Some("AS" | "THEN" | "ELSE" | "DO")
-                        );
+                        ) || matches!(&self.prev, Some((Kind::Punct, p)) if p == ":");
                         if !ends_header {
                             self.break_to(self.base);
                         }
                         self.emit(Kind::Word, text, false);
                         k += self.emit_block_follower(toks, k);
-                        self.blocks += 1;
-                        self.base = self.blocks;
-                        self.content = self.blocks;
-                        self.break_to(self.base);
-                    } else if up == "END"
-                        && !in_expr
-                        && self.blocks > 0
-                        && !matches!(
-                            toks.get(k + 1),
-                            Some((Kind::Word, w)) if ["IF", "LOOP", "WHILE", "REPEAT", "FOR"]
-                                .iter()
-                                .any(|t| w.eq_ignore_ascii_case(t))
-                        )
-                    {
-                        self.blocks -= 1;
-                        self.base = self.blocks;
-                        self.content = self.blocks;
-                        self.break_to(self.base);
+                        self.open_block("BEGIN");
+                    } else if up == "END" && !in_expr && self.closes_block(toks, k) {
+                        // Back to the opener's level — on the `UNTIL`'s line
+                        // for an `END REPEAT`.
+                        let until = self.blocks.pop() == Some("UNTIL");
+                        let level = self.blocks.len();
+                        self.base = level;
+                        self.content = level;
+                        if !until {
+                            self.break_to(level);
+                        }
                         self.emit(Kind::Word, text, false);
                         k += self.emit_block_follower(toks, k);
                     } else if !in_expr && (HEADS.contains(&up.as_str()) || output_head) {
@@ -1376,6 +1515,16 @@ impl<'a> Fmt<'a> {
                             self.tight_next = true;
                         }
                     }
+                    // A label's colon sits against its name: `l: LOOP`.
+                    ":" if self.brackets == 0
+                        && matches!(&self.prev, Some((Kind::Word, _)))
+                        && matches!(toks.get(k + 1), Some((Kind::Word, w))
+                            if ["BEGIN", "LOOP", "WHILE", "REPEAT", "FOR"]
+                                .iter()
+                                .any(|t| w.eq_ignore_ascii_case(t))) =>
+                    {
+                        self.emit(Kind::Punct, text, true);
+                    }
                     "[" => {
                         self.emit(Kind::Punct, text, false);
                         self.brackets += 1;
@@ -1398,15 +1547,17 @@ impl<'a> Fmt<'a> {
     fn end_statement(&mut self) {
         // Back to the open body's level, not the margin — and no blank line
         // between a body's statements.
-        self.base = self.blocks;
-        self.content = self.blocks;
+        let level = self.blocks.len();
+        self.base = level;
+        self.content = level;
         self.parens.clear();
         self.brackets = 0;
         self.suppress_and = false;
         self.cases.clear();
+        self.awaiting = None;
         self.prev = None;
-        self.blank = self.blocks == 0;
-        self.break_to(self.blocks);
+        self.blank = level == 0;
+        self.break_to(level);
     }
 
     fn is_join_break(&self, up: &str) -> bool {
@@ -1753,6 +1904,37 @@ mod tests {
         ] {
             assert_eq!(ms(&ms(s)), ms(s), "idempotent: {s}");
         }
+    }
+
+    /// MySQL's compound statements indent their bodies as `BEGIN` does: an
+    /// `IF`'s branches under `THEN`, `ELSEIF` and `ELSE`, a `WHILE`'s under
+    /// `DO`, a labelled `LOOP`'s and a `REPEAT`'s — whose `UNTIL` ends it on
+    /// its `END REPEAT`'s line — with each `END` back at its opener's level.
+    #[test]
+    fn a_compound_statement_body_is_indented() {
+        let my = |s: &str| super::format_sql(s, IND, SqlDialect::MySql);
+        let routine = "create procedure p() begin declare i int default 0; \
+             if i > 1 then set i = 2; elseif i = 0 then select 1; else select a from t; end if; \
+             while i < 3 do set i = i + 1; end while; \
+             l: loop leave l; end loop l; \
+             repeat set i = i + 1; until i > 5 end repeat; end";
+        assert_eq!(
+            my(routine),
+            "create procedure p()\nbegin\n  declare i int default 0;\n  if i > 1 then\n    set\n      i = 2;\n  elseif i = 0 then\n    select\n      1;\n  else\n    select\n      a\n    from\n      t;\n  end if;\n  while i < 3 do\n    set\n      i = i + 1;\n  end while;\n  l: loop\n    leave l;\n  end loop l;\n  repeat\n    set\n      i = i + 1;\n  until i > 5 end repeat;\nend"
+        );
+        assert_eq!(my(&my(routine)), my(routine), "idempotent");
+        // `IF (…) THEN` is the statement; `IF(…)` a function, and an
+        // `END CASE` closes no `BEGIN`.
+        assert_eq!(
+            my("if (a > 1) then select 1; end if;"),
+            "if (a > 1) then\n  select\n    1;\nend if;"
+        );
+        assert_eq!(my("select if(a, 1, 2)"), "select\n  if(a, 1, 2)");
+        let case = my("begin case x when 1 then select 1; end case; select 2; end");
+        assert!(case.ends_with("\n  select\n    2;\nend"), "{case}");
+        // T-SQL's IF has no END IF and opens nothing.
+        let ms = super::format_sql("if @a = 1 select 1; select 2;", IND, SqlDialect::MsSql);
+        assert!(ms.contains("\n\nselect\n  2;"), "{ms}");
     }
 
     /// T-SQL's `TOP (n)` keeps its space, and a write's `OUTPUT` clause takes

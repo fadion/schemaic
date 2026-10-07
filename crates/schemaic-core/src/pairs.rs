@@ -511,7 +511,7 @@ struct BlockWord {
 /// dollar-quoted body, which is a string here; T-SQL's `IF` and `WHILE` take
 /// one statement or a `BEGIN … END` and have no `END` of their own; SQLite
 /// has no compound statements.
-fn names_its_block_ends(dialect: SqlDialect) -> bool {
+pub(crate) fn names_its_block_ends(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MySql => true,
         SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => false,
