@@ -758,13 +758,17 @@ fn prediction_at(
     if !ctx.predictions {
         return None;
     }
-    let catalog = ctx
-        .hidden_dbs
-        .with_untracked(|h| build_offer_catalog(ctx.db_nodes, h, ctx.active_db));
-    let (guess, remembered) =
-        pick_prediction(intel::predict(text, offset, &catalog, ctx.dialect), || {
-            recall(text, offset, ctx)
-        })?;
+    // The catalog only where a ghost could go: building it is the costly half
+    // of a keystroke's prediction, and most carets are mid-word.
+    let reasoned = intel::may_predict_at(text, offset, ctx.dialect)
+        .then(|| {
+            let catalog = ctx
+                .hidden_dbs
+                .with_untracked(|h| build_offer_catalog(ctx.db_nodes, h, ctx.active_db));
+            intel::predict(text, offset, &catalog, ctx.dialect)
+        })
+        .flatten();
+    let (guess, remembered) = pick_prediction(reasoned, || recall(text, offset, ctx))?;
     Some(ghost_at(ed, offset, guess, false, remembered))
 }
 

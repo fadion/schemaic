@@ -13521,6 +13521,48 @@ fn is_real_statement(stmt: &sqlparser::ast::Statement) -> bool {
 /// must be a clause that may come first ([`may_precede`]) — unless the caret
 /// is in a closed paren, whose contents end at its `)`.
 pub fn predict(sql: &str, caret: usize, catalog: &Catalog, dialect: SqlDialect) -> Option<String> {
+    let PredictGate {
+        lo,
+        hi,
+        mid_line,
+        closed,
+    } = predict_gate(sql, caret, dialect)?;
+    let toks = tokenize_range(sql, lo, caret, dialect);
+    let guess = on_condition_guess(sql, (lo, hi, caret), catalog, dialect)
+        .or_else(|| insert_columns(&toks, catalog, dialect, closed))
+        .or_else(|| paren_contents(sql, (lo, hi, caret), &toks, catalog, dialect, closed))
+        .or_else(|| upsert_assignments(&toks, catalog, dialect))
+        .or_else(|| group_by_items(sql, lo, &toks, dialect))
+        .or_else(|| join_target_guess(sql, (lo, hi, caret), &toks, catalog, dialect))
+        .or_else(|| join_on_guess(sql, (lo, hi, caret), &toks, catalog, dialect))
+        .or_else(|| keyword_partner(sql, lo, &toks, dialect))
+        .or_else(|| operand_partner(sql, caret, &toks))
+        .or_else(|| clause_partner(sql, lo, caret, &toks, dialect))?;
+    finish_prediction(sql, caret, guess, (hi, mid_line, closed), dialect)
+}
+
+/// Could [`predict`] offer anything at `caret` — is the caret where a ghost
+/// can be drawn ([`predict`]'s doc sets out where), in code, in an unfinished
+/// statement? Its gate alone, which reads the caret's line and statement and
+/// no schema: an editor asks it before building the catalog `predict` takes,
+/// which is the costly half of a keystroke's prediction. `false` means
+/// `predict` answers `None` whatever the catalog.
+pub fn may_predict_at(sql: &str, caret: usize, dialect: SqlDialect) -> bool {
+    predict_gate(sql, caret, dialect).is_some()
+}
+
+/// What [`predict`]'s gate found: the caret's statement `lo..hi`, whether the
+/// ghost goes mid-line in front of the next clause, and whether the caret is
+/// inside a closed paren.
+struct PredictGate {
+    lo: usize,
+    hi: usize,
+    mid_line: bool,
+    closed: bool,
+}
+
+/// [`may_predict_at`]'s answer, with what it read for [`predict`] to use.
+fn predict_gate(sql: &str, caret: usize, dialect: SqlDialect) -> Option<PredictGate> {
     if caret > sql.len() || !sql.is_char_boundary(caret) {
         return None;
     }
@@ -13555,17 +13597,23 @@ pub fn predict(sql: &str, caret: usize, catalog: &Catalog, dialect: SqlDialect) 
     if ended || lo > caret || caret_touches_noncode(sql, lo, caret, dialect) {
         return None;
     }
-    let toks = tokenize_range(sql, lo, caret, dialect);
-    let guess = on_condition_guess(sql, (lo, hi, caret), catalog, dialect)
-        .or_else(|| insert_columns(&toks, catalog, dialect, closed))
-        .or_else(|| paren_contents(sql, (lo, hi, caret), &toks, catalog, dialect, closed))
-        .or_else(|| upsert_assignments(&toks, catalog, dialect))
-        .or_else(|| group_by_items(sql, lo, &toks, dialect))
-        .or_else(|| join_target_guess(sql, (lo, hi, caret), &toks, catalog, dialect))
-        .or_else(|| join_on_guess(sql, (lo, hi, caret), &toks, catalog, dialect))
-        .or_else(|| keyword_partner(sql, lo, &toks, dialect))
-        .or_else(|| operand_partner(sql, caret, &toks))
-        .or_else(|| clause_partner(sql, lo, caret, &toks, dialect))?;
+    Some(PredictGate {
+        lo,
+        hi,
+        mid_line,
+        closed,
+    })
+}
+
+/// A producer's `guess` at `caret`, held to what the statement says after the
+/// caret — or `None` where it would repeat or split it ([`predict`]'s doc).
+fn finish_prediction(
+    sql: &str,
+    caret: usize,
+    guess: String,
+    (hi, mid_line, closed): (usize, bool, bool),
+    dialect: SqlDialect,
+) -> Option<String> {
     let next_word = tokenize_range(sql, caret, hi.max(caret), dialect)
         .into_iter()
         .find_map(|t| match t.kind {
@@ -16532,6 +16580,46 @@ mod predict_tests {
             return Err(format!("{ghost:?} changed the statements of {doc:?}"));
         }
         Ok(())
+    }
+
+    /// The gate an editor asks before building a catalog: `false` where no
+    /// ghost can be drawn — mid-word, in a string or comment, past a finished
+    /// statement, before an operand on the line — and `true` wherever
+    /// [`predict`] does answer.
+    #[test]
+    fn the_gate_refuses_only_where_nothing_could_be_predicted() {
+        let my = SqlDialect::MySql;
+        let gate = |sql: &str| {
+            let caret = sql.find('|').unwrap();
+            may_predict_at(&sql.replacen('|', "", 1), caret, my)
+        };
+        for sql in [
+            "SELECT * FROM ord|",
+            "SELECT 'ORDER |",
+            "SELECT 1 -- ORDER |",
+            "SELECT 1; |",
+            "SELECT * FROM t WHERE a = | 1",
+        ] {
+            assert!(!gate(sql), "{sql}");
+        }
+        for sql in [
+            "SELECT * FROM orders ORDER |",
+            "SELECT * FROM orders ORDER | LIMIT 1;",
+            "INSERT INTO orders (|)",
+        ] {
+            assert!(gate(sql), "{sql}");
+        }
+        let cat = Catalog::build(&[("shop", &keyed())], Some("shop"));
+        for sql in [
+            "SELECT * FROM orders o JOIN customers c ON |",
+            "SELECT customer_id, COUNT(*) FROM orders GROUP BY |",
+            "SELECT * FROM invoices JOIN |",
+        ] {
+            let caret = sql.find('|').unwrap();
+            let text = sql.replacen('|', "", 1);
+            assert!(predict(&text, caret, &cat, my).is_some(), "{sql}");
+            assert!(may_predict_at(&text, caret, my), "{sql}");
+        }
     }
 
     /// The check refuses what it is there to catch: an open quote, a line

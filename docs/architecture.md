@@ -2401,7 +2401,18 @@ existing prose was left alone.
     which passed before, as guards do). Neither pins the declared-routine or quoted-name guard.
     The UI asks `predict`
     over the offer catalogue (under `completion.rs`) and only while the `editor_predictions`
-    setting is on — Settings → Editor → *Inline predictions*, on by default. `predict_tests` covers
+    setting is on — Settings → Editor → *Inline predictions*, on by default. **The gate is a
+    function of its own, `may_predict_at`**: every check above that reads only the caret's line and
+    statement — the rest of the line, the leading indent, the character before, the ended
+    statement, noncode — and no schema, so a caller can ask it before building the `Catalog`
+    `predict` takes, and `false` means `predict` is `None` whatever the catalogue. `predict` runs
+    the same gate (`predict_gate`), then its producers, then `finish_prediction`, which holds the
+    guess to what follows the caret — the next-word and `may_precede` checks, which need the guess
+    and so cannot be in the gate. Keep the split that way: a check moved from the gate into a
+    producer still predicts correctly but leaves `may_predict_at` passing where nothing could be
+    offered, and one moved the other way that needs the catalogue cannot be asked without it
+    (`the_gate_refuses_only_where_nothing_could_be_predicted`, which also asks that the gate pass
+    wherever `predict` answers). `predict_tests` covers
     each producer and gate, `an_auto_paired_closer_after_the_caret_still_predicts` the `)` one.
     **`predict_from_history` is the ghost remembered rather than reasoned**, asked only when
     `predict` has nothing, under the same *Inline predictions* switch and a second of its own,
@@ -23263,6 +23274,10 @@ existing prose was left alone.
     one-shot can return**. `suppress` is set by an accept, and the next prediction is wanted
     straight after one: Tab on a `BY ` ghost leaves `GROUP BY `, whose grouping columns are the next
     thing to offer, so a ghost asked after the one-shot would break that chain at its second link.
+    **The offer catalogue is built only where `intel::may_predict_at` passes** (under `intel.rs`):
+    building it is the costly half of a keystroke's prediction, and most carets — mid-word, in a
+    string — are ones `predict` would refuse before reading it. The gate decides the reasoned ghost
+    alone; `recall` is asked whenever that is `None`, the gate's refusal included, and runs its own.
     **Where `predict` has nothing, `prediction_at` asks `recall`**, which runs `intel::Recall::at`
     once and asks `Recall::from` of three sources in the order they are trusted, the first to answer
     winning — an order `runs_come_before_snippets_and_snippets_before_tabs` pins through the real
