@@ -12268,7 +12268,12 @@ existing prose was left alone.
     sent" that both paths ask. Confirmed against MariaDB: `CREATE TRIGGER … END$$` is a 1064,
     `… END` creates the trigger.
     `Splitter` is the whole of it: `push` takes the next block's **bytes** and returns the
-    `Statement`s it completed, `finish` yields what is left (a script's final statement need not
+    `Statement`s it completed. **A UTF-16 BOM, either byte order, makes it a UTF-16 read**, as a
+    tab opening the same file reads it (`sqlfile::decode`): decided on the file's first two bytes,
+    held back until both have arrived (and decoded as themselves by `finish` for a one-byte file),
+    with an odd byte or a surrogate pair's first half cut by a block waiting in the carry as a cut
+    UTF-8 sequence does. Read as UTF-8 it was a NUL between every character, and the probe could not
+    see a `DROP` (`a_utf16_script_splits_as_its_utf8_twin`). `finish` yields what is left (a script's final statement need not
     carry a terminator, and a runner that dropped it would replay a dump one statement short,
     silently). `finish` rescans the tail **as the end of the input**
     (`sql::statement_bounds_closing`) and may yield more than one: mid-file a `GO` line with no

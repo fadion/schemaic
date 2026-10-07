@@ -93,6 +93,12 @@ pub struct Splitter {
     /// Nothing has been decoded yet, so the next non-empty text may open with a
     /// BOM. See [`split`](Self::split).
     at_start: bool,
+    /// The file's first two bytes have been read, so whether it is UTF-16 is
+    /// known. See [`push`](Self::push).
+    sniffed: bool,
+    /// The file is UTF-16 in this byte order, told by its BOM — as
+    /// [`crate::sqlfile::decode`] reads one opened in a tab.
+    utf16: Option<crate::sqlfile::Utf16>,
 }
 
 impl Splitter {
@@ -107,6 +113,8 @@ impl Splitter {
             raw: 0,
             line: 1,
             at_start: true,
+            sniffed: false,
+            utf16: None,
         }
     }
 
@@ -123,6 +131,12 @@ impl Splitter {
     /// A sequence that is genuinely invalid rather than merely incomplete
     /// becomes `U+FFFD`, which is [`crate::sqlfile::decode`]'s choice for the
     /// same problem: a mis-encoded byte should cost one character, not the file.
+    ///
+    /// **A UTF-16 BOM makes it a UTF-16 read**, either byte order, decided on
+    /// the file's first two bytes (held back until two have arrived) — the
+    /// encoding a tab opening the same file reads ([`crate::sqlfile::decode`]).
+    /// An odd byte, or a surrogate pair's first half, cut by a block boundary
+    /// waits in the carry as a cut UTF-8 sequence does.
     pub fn push(&mut self, bytes: &[u8]) -> Vec<Statement> {
         // The common case — no character was cut — must not copy the block.
         let joined: Vec<u8>;
@@ -135,6 +149,27 @@ impl Splitter {
                 .collect();
             &joined
         };
+        if !self.sniffed {
+            if rest.len() < 2 {
+                self.carry.extend_from_slice(rest);
+                self.raw += bytes.len() as u64;
+                return Vec::new();
+            }
+            self.sniffed = true;
+            self.utf16 = match rest {
+                [0xFF, 0xFE, ..] => Some(crate::sqlfile::Utf16::Le),
+                [0xFE, 0xFF, ..] => Some(crate::sqlfile::Utf16::Be),
+                _ => None,
+            };
+            if self.utf16.is_some() {
+                rest = &rest[2..];
+            }
+        }
+        if let Some(order) = self.utf16 {
+            let text = self.decode_utf16(rest, order);
+            self.raw += bytes.len() as u64;
+            return self.split(&text);
+        }
         let mut text = String::new();
         loop {
             match std::str::from_utf8(rest) {
@@ -166,6 +201,29 @@ impl Splitter {
         // a latin-1 file report more progress than it had — "5.2 MB of 4.9 MB".
         self.raw += bytes.len() as u64;
         self.split(&text)
+    }
+
+    /// The UTF-16 half of [`push`](Self::push): `data` (the carry already in
+    /// front) decoded, with a trailing odd byte or lone first half of a
+    /// surrogate pair held back for the next block. A surrogate that is no
+    /// pair's becomes `U+FFFD`, as an invalid UTF-8 byte does.
+    fn decode_utf16(&mut self, data: &[u8], order: crate::sqlfile::Utf16) -> String {
+        let (pairs, _odd) = data.as_chunks::<2>();
+        let units: Vec<u16> = pairs
+            .iter()
+            .map(|&p| match order {
+                crate::sqlfile::Utf16::Le => u16::from_le_bytes(p),
+                crate::sqlfile::Utf16::Be => u16::from_be_bytes(p),
+            })
+            .collect();
+        let mut n = units.len();
+        if units.last().is_some_and(|u| (0xD800..0xDC00).contains(u)) {
+            n -= 1;
+        }
+        self.carry.extend_from_slice(&data[2 * n..]);
+        char::decode_utf16(units[..n].iter().copied())
+            .map(|r| r.unwrap_or('\u{FFFD}'))
+            .collect()
     }
 
     /// [`push`](Self::push) for text that is already decoded.
@@ -259,6 +317,16 @@ impl Splitter {
     /// that ends mid-character is truncated, and losing the last character is a
     /// better report than losing the last statement.
     pub fn finish(&mut self) -> Vec<Statement> {
+        if !self.sniffed && !self.carry.is_empty() {
+            // A one-byte file, held back to see whether it opened a BOM: it
+            // is that byte's text, not a cut character.
+            let held = std::mem::take(&mut self.carry);
+            self.sniffed = true;
+            let text = String::from_utf8_lossy(&held).into_owned();
+            let mut out = self.split(&text);
+            out.extend(self.finish());
+            return out;
+        }
         if !self.carry.is_empty() {
             self.carry.clear();
             self.buf.push('\u{FFFD}');
@@ -1015,6 +1083,49 @@ mod tests {
 
     fn stamp(len: u64, modified_ms: Option<u128>) -> FileStamp {
         FileStamp { len, modified_ms }
+    }
+
+    /// The statements a splitter finds in `bytes`, fed `block` bytes at a
+    /// time.
+    fn split_in_blocks(bytes: &[u8], block: usize, d: SqlDialect) -> Vec<String> {
+        let mut s = Splitter::new(d);
+        let mut out: Vec<String> = Vec::new();
+        for chunk in bytes.chunks(block) {
+            out.extend(s.push(chunk).into_iter().map(|st| st.sql));
+        }
+        out.extend(s.finish().into_iter().map(|st| st.sql));
+        out
+    }
+
+    /// **A UTF-16 script runs as the text it is.** Read as UTF-8 it was a NUL
+    /// between every character — while opening the same file in a tab already
+    /// read it right. By its BOM, either byte order, fed in blocks that cut a
+    /// character, and a surrogate pair, in half: the same statements as the
+    /// UTF-8 file, and the probe's kinds with them.
+    #[test]
+    fn a_utf16_script_splits_as_its_utf8_twin() {
+        let text = "INSERT INTO t VALUES ('é');\nDROP TABLE x;\nSELECT '😀';\n";
+        let want = split_in_blocks(text.as_bytes(), 4096, SqlDialect::MySql);
+        assert_eq!(want.len(), 3);
+        for le in [true, false] {
+            let bytes: Vec<u8> = std::iter::once(0xFEFFu16)
+                .chain(text.encode_utf16())
+                .flat_map(|u| if le { u.to_le_bytes() } else { u.to_be_bytes() })
+                .collect();
+            for block in [1, 3, 5, 4096] {
+                assert_eq!(
+                    split_in_blocks(&bytes, block, SqlDialect::MySql),
+                    want,
+                    "le={le} block={block}"
+                );
+            }
+            // A one-byte first block is held to see whether it opens a BOM,
+            // and a one-byte file is still its own text.
+            assert_eq!(split_in_blocks(b"x", 1, SqlDialect::MySql), ["x"]);
+            let p = probe(&bytes[..], SqlDialect::MySql).unwrap();
+            assert_eq!(p.statements, 3, "le={le}");
+            assert!(p.destructive > 0, "the DROP is seen: le={le}");
+        }
     }
 
     /// **A different length is a different file**, whatever the clock says.
