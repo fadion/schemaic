@@ -5,6 +5,7 @@
 
 use crate::intel::SqlDialect;
 use crate::pairs::{Region, region_at};
+use crate::sql::is_word_byte;
 
 /// SQL line-comment token.
 const TOKEN: &str = "--";
@@ -200,6 +201,52 @@ pub fn move_line(text: &str, sel_start: usize, sel_end: usize, up: bool) -> Opti
     Some(LineEdit {
         text: lines.join("\n"),
         sel: (new_lo, new_hi),
+    })
+}
+
+/// Ctrl+Shift+U: upper-case the selection — or, on a bare caret, the word it
+/// touches ([`is_word_byte`]) — unless it has no lower-case letter, in which
+/// case lower-case it — so presses alternate between the two cases, though
+/// mixed case does not come back (`Name` → `NAME` → `name`). A selection stays
+/// selected over its new extent (a character can change length: `ß` → `SS`);
+/// a bare caret stays where it was. `None` when there is nothing to change.
+pub fn toggle_case(full: &str, sel_a: usize, sel_b: usize) -> Option<IndentEdit> {
+    let b = full.as_bytes();
+    let lo = sel_a.min(sel_b).min(full.len());
+    let hi = sel_a.max(sel_b).min(full.len());
+    let (start, end) = if lo == hi {
+        let mut s = lo;
+        while s > 0 && is_word_byte(b[s - 1]) {
+            s -= 1;
+        }
+        let mut e = lo;
+        while e < b.len() && is_word_byte(b[e]) {
+            e += 1;
+        }
+        (s, e)
+    } else {
+        (lo, hi)
+    };
+    let old = full.get(start..end)?;
+    let text = if old.chars().any(char::is_lowercase) {
+        old.to_uppercase()
+    } else {
+        old.to_lowercase()
+    };
+    if text == old {
+        return None;
+    }
+    let sel = if lo == hi {
+        let at = lo.min(start + text.len());
+        (at, at)
+    } else {
+        (start, start + text.len())
+    };
+    Some(IndentEdit {
+        start,
+        end,
+        text,
+        sel,
     })
 }
 
@@ -473,8 +520,9 @@ pub fn line_col_of_offset(text: &str, offset: usize) -> (usize, usize) {
 }
 
 /// A single text replacement plus the selection to apply afterward — the result
-/// of a Tab, Shift+Tab or Enter ([`soft_tab_indent`], [`hard_tab_indent`],
-/// [`soft_tab_outdent`], [`newline_indent`]).
+/// of a Tab, Shift+Tab, Enter or Ctrl+Shift+U ([`soft_tab_indent`],
+/// [`hard_tab_indent`], [`soft_tab_outdent`], [`newline_indent`],
+/// [`toggle_case`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndentEdit {
     /// Byte range in the original text to replace.
@@ -1297,6 +1345,48 @@ mod tests {
     fn soft_tab_clamps_zero_width() {
         let e = soft_tab_indent("a", 0, 0, 0);
         assert_eq!(e.text, " "); // tw clamped to 1
+    }
+
+    /// Apply `e` to `src` and render its selection as `{…}` (a caret as `|`).
+    fn applied(src: &str, e: &IndentEdit) -> String {
+        let mut out = format!("{}{}{}", &src[..e.start], e.text, &src[e.end..]);
+        if e.sel.0 == e.sel.1 {
+            out.insert(e.sel.0, '|');
+        } else {
+            out.insert(e.sel.1, '}');
+            out.insert(e.sel.0, '{');
+        }
+        out
+    }
+
+    #[test]
+    fn toggle_case_upper_cases_then_lower_cases_a_selection() {
+        let src = "select Name from t";
+        let up = toggle_case(src, 0, 11).unwrap();
+        assert_eq!(applied(src, &up), "{SELECT NAME} from t");
+        let again = format!("{}{}", up.text, &src[11..]);
+        let down = toggle_case(&again, 11, 0).unwrap();
+        assert_eq!(applied(&again, &down), "{select name} from t");
+        // A length change keeps the whole result selected.
+        let e = toggle_case("straße", 0, 7).unwrap();
+        assert_eq!(applied("straße", &e), "{STRASSE}");
+    }
+
+    #[test]
+    fn toggle_case_on_a_bare_caret_takes_its_word() {
+        let src = "SELECT user_id FROM t";
+        let e = toggle_case(src, 10, 10).unwrap();
+        assert_eq!(applied(src, &e), "SELECT USE|R_ID FROM t");
+        // At a word's end, that word.
+        let e = toggle_case(src, 6, 6).unwrap();
+        assert_eq!(applied(src, &e), "select| user_id FROM t");
+    }
+
+    #[test]
+    fn toggle_case_with_nothing_to_change_is_none() {
+        assert_eq!(toggle_case("a  b", 2, 2), None, "no word at the caret");
+        assert_eq!(toggle_case("12 + 3", 0, 6), None, "no letters");
+        assert_eq!(toggle_case("", 0, 0), None);
     }
 
     /// Press Enter at the `|` (or over `{`…`}`) in `src` and render the result

@@ -46,7 +46,7 @@ use schemaic_core::prompt::{self, FixOrigin};
 use schemaic_core::sql::statement_range;
 use schemaic_core::text_ops::{
     find_matches, find_seed, first_hit_from, matches_at, move_line, newline_indent, offset_of_line,
-    replace_all, soft_tab_indent, soft_tab_outdent, toggle_line_comment,
+    replace_all, soft_tab_indent, soft_tab_outdent, toggle_case, toggle_line_comment,
 };
 
 use crate::completion::{
@@ -3026,6 +3026,39 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 });
                 return CommandExecuted::Yes;
             }
+        }
+        // Ctrl+Shift+U — toggle the case of the selection, or of the word at
+        // the caret (DataGrip's key): `text_ops::toggle_case`.
+        if primary_held(mods)
+            && mods.shift()
+            && !mods.alt()
+            && let KeyInput::Keyboard(Key::Character(c), _) = &kp.key
+            && c.as_str().eq_ignore_ascii_case("u")
+        {
+            editor_sig.with_untracked(|e| {
+                let cur = e.cursor.get_untracked();
+                let off = cur.offset();
+                let (a, b) = cur.get_selection().unwrap_or((off, off));
+                let Some(ed) = query.with_untracked(|t| toggle_case(t, a, b)) else {
+                    return;
+                };
+                if edit_untyped(
+                    e,
+                    comp,
+                    Selection::region(ed.start, ed.end),
+                    &ed.text,
+                    EditType::Other,
+                ) {
+                    e.cursor.update(|c| {
+                        if ed.sel.0 == ed.sel.1 {
+                            c.set_offset(ed.sel.0, false, false);
+                        } else {
+                            c.set_insert(Selection::region(ed.sel.0, ed.sel.1));
+                        }
+                    });
+                }
+            });
+            return CommandExecuted::Yes;
         }
         // Editor line operations (DataGrip-ish): Ctrl+/ toggle line comment,
         // Ctrl+D duplicate line/selection, Ctrl+X delete line. `--` is the SQL

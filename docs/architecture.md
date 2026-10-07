@@ -11767,6 +11767,15 @@ existing prose was left alone.
     `duplicate_lines` is Ctrl+D's: the spanned lines copied as `\n` + lines at the end of the last
     one, so the newline-less last line gets a line of its own, with the selection or caret moved
     onto the copy (`duplicating_the_last_line_makes_a_new_line`).
+    `toggle_case` is Ctrl+Shift+U, DataGrip's key: the selection, or on a bare caret the word it
+    touches — `sql::is_word_byte`'s words, so `user_id` is one and so is a non-ASCII name —
+    upper-cased unless it holds no lower-case letter, and then lower-cased. It toggles between the
+    two cases rather than undoing: `Name` goes to `NAME` and then `name`, `ß` to `SS` and then `ss`
+    — the length change being why a selection is re-selected over its *new* extent, while a bare
+    caret stays put. Nothing to change (no word at the caret, no letters) is `None`, so the pane
+    makes no edit and no undo step (`toggle_case_upper_cases_then_lower_cases_a_selection`,
+    `toggle_case_with_nothing_to_change_is_none`). The pane applies it to one caret or selection
+    only, through `edit_untyped`.
     **`contains_collapsed_ignore_ascii_case` is the same search against a haystack read *as if* its
     whitespace runs were collapsed, without building the collapsed string** — exactly
     `split_whitespace().collect::<Vec<_>>().join(" ")`, which is what it replaces. The two search
