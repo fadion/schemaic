@@ -180,6 +180,202 @@ fn ghost_takes_word(
     ghost_at.is_some() && ghost_at == caret && !list_open && !shift && primary
 }
 
+/// The keys [`editor_key_plan`] tells apart; anything else is `Other`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EdKey {
+    Escape,
+    Tab,
+    Enter,
+    Up,
+    Down,
+    Right,
+    /// ←, Home, End, Page Up, Page Down: a caret move that is not ↑, ↓ or →.
+    Move,
+    Other,
+}
+
+impl EdKey {
+    fn of(key: &KeyInput) -> EdKey {
+        match key {
+            KeyInput::Keyboard(Key::Named(n), _) => match n {
+                NamedKey::Escape => EdKey::Escape,
+                NamedKey::Tab => EdKey::Tab,
+                NamedKey::Enter => EdKey::Enter,
+                NamedKey::ArrowUp => EdKey::Up,
+                NamedKey::ArrowDown => EdKey::Down,
+                NamedKey::ArrowRight => EdKey::Right,
+                NamedKey::ArrowLeft
+                | NamedKey::Home
+                | NamedKey::End
+                | NamedKey::PageUp
+                | NamedKey::PageDown => EdKey::Move,
+                _ => EdKey::Other,
+            },
+            _ => EdKey::Other,
+        }
+    }
+}
+
+/// What the editor's key handler reads to decide a key, past the tab
+/// navigation and the Ctrl+K verdict ahead of it.
+#[derive(Clone, Copy, Debug, Default)]
+struct KeyCtx {
+    key: Option<EdKey>,
+    mods: Modifiers,
+    find_open: bool,
+    goto_open: bool,
+    /// Signature help is showing.
+    sig_up: bool,
+    list_open: bool,
+    /// The open list has rows.
+    list_rows: bool,
+    /// The word before the caret is complete ([`completion`]'s `word_complete`).
+    ///
+    /// [`completion`]: crate::completion
+    word_complete: bool,
+    /// The list's first row is the selected one.
+    first_row: bool,
+    /// Where the shown ghost is ([`inline_diff::shown_ghost`]) — none behind
+    /// a Ctrl+K preview.
+    ghost_at: Option<usize>,
+    /// [`lone_caret`](crate::completion::lone_caret).
+    caret: Option<usize>,
+    /// The caret has nothing after it on its line.
+    at_line_end: bool,
+}
+
+/// The one action a key takes, once [`KeyPlan`]'s clearing is done.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeyAction {
+    CloseFind,
+    CloseGoto,
+    /// Escape that turned down something on screen: spent.
+    Dismissed,
+    ListNext,
+    ListPrev,
+    Accept,
+    /// Tab: the whole ghost.
+    TakeGhost,
+    /// Ctrl+→: the ghost's next word.
+    TakeGhostWord,
+    /// A bare → at the line's end: the whole ghost.
+    TakeGhostWhole,
+    Indent,
+    /// Enter, with the line's indent carried — when the caret is one region.
+    NewlineIndent,
+    Outdent,
+    /// None of these: on to the handler's later keys, then floem's.
+    Pass,
+}
+
+/// How a key is answered: what is cleared first, then the one action.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct KeyPlan {
+    /// Escape: signature help, the list and any ghost go — consumed only when
+    /// one was on screen ([`KeyAction::Dismissed`]).
+    dismiss: bool,
+    /// The list closes and the key goes on: a caret move, Enter after a
+    /// word typed in full, Shift+Tab.
+    close_list: bool,
+    action: KeyAction,
+}
+
+/// **The editor's key order**, as one decision: Escape closes the find bar,
+/// then Go-to-line, then turns down signature help, the list and the ghost;
+/// an open list takes ↑/↓, Enter and Tab; Tab takes a ghost ahead of the
+/// indent ([`ghost_takes_tab`]), Ctrl+→ its next word ([`ghost_takes_word`])
+/// and a bare → at the line's end the rest of it ([`ghost_takes_right`]);
+/// then Tab indents, Enter carries the indent and Shift+Tab outdents.
+///
+/// It lived as a run of `if`s in the view, each reading signals another had
+/// just set, so the order — which is the behaviour — had no test. Clearing
+/// that falls through is modelled here: after Escape dismisses nothing on
+/// screen, or a caret move closes the list, the later keys see it closed.
+fn editor_key_plan(c: KeyCtx) -> KeyPlan {
+    let Some(key) = c.key else {
+        return KeyPlan {
+            dismiss: false,
+            close_list: false,
+            action: KeyAction::Pass,
+        };
+    };
+    let mut plan = KeyPlan {
+        dismiss: false,
+        close_list: false,
+        action: KeyAction::Pass,
+    };
+    let done = |mut plan: KeyPlan, action| {
+        plan.action = action;
+        plan
+    };
+    let (shift, primary) = (c.mods.shift(), primary_held(c.mods));
+    let mut list_open = c.list_open;
+    let mut ghost_at = c.ghost_at;
+    if key == EdKey::Escape {
+        if c.find_open {
+            return done(plan, KeyAction::CloseFind);
+        }
+        if c.goto_open {
+            return done(plan, KeyAction::CloseGoto);
+        }
+        plan.dismiss = true;
+        if c.sig_up || c.list_open || c.ghost_at.is_some() {
+            return done(plan, KeyAction::Dismissed);
+        }
+        list_open = false;
+        ghost_at = None;
+    }
+    if list_open {
+        if c.list_rows {
+            if list_takes_arrow(c.mods) && key == EdKey::Down {
+                return done(plan, KeyAction::ListNext);
+            }
+            if list_takes_arrow(c.mods) && key == EdKey::Up {
+                return done(plan, KeyAction::ListPrev);
+            }
+            let accept_enter = !primary && key == EdKey::Enter;
+            let accept_tab = !shift && key == EdKey::Tab;
+            // **A word typed in full ends at Enter**: after `FROM` the list
+            // holds `FROM_BASE64()`, and Enter meant as a newline took it. An
+            // arrow onto a row first still accepts that row.
+            if accept_enter && c.word_complete && c.first_row {
+                plan.close_list = true;
+                list_open = false;
+            } else if accept_enter || accept_tab {
+                return done(plan, KeyAction::Accept);
+            }
+        }
+        // A caret move leaves the list anchored to a stale position: it
+        // closes, and the caret still moves. A modified ↑/↓ is one.
+        if matches!(key, EdKey::Up | EdKey::Down | EdKey::Right | EdKey::Move) {
+            plan.close_list = true;
+            list_open = false;
+        }
+    }
+    if key == EdKey::Tab && ghost_takes_tab(ghost_at, c.caret, list_open, shift, primary) {
+        return done(plan, KeyAction::TakeGhost);
+    }
+    if key == EdKey::Right {
+        if ghost_takes_word(ghost_at, c.caret, list_open, shift, primary) {
+            return done(plan, KeyAction::TakeGhostWord);
+        }
+        if ghost_takes_right(ghost_at, c.caret, list_open, c.mods, c.at_line_end) {
+            return done(plan, KeyAction::TakeGhostWhole);
+        }
+    }
+    if key == EdKey::Tab && !primary && !shift && !list_open {
+        return done(plan, KeyAction::Indent);
+    }
+    if key == EdKey::Enter && !primary && !c.mods.alt() {
+        return done(plan, KeyAction::NewlineIndent);
+    }
+    if key == EdKey::Tab && !primary && shift {
+        plan.close_list = true;
+        return done(plan, KeyAction::Outdent);
+    }
+    plan
+}
+
 /// Apply an edit the user did **not** type, without popping the completion list.
 ///
 /// Every document change re-runs the completion recompute a tick later, and that
@@ -2643,104 +2839,84 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 }
             }
         }
-        // Esc closes the find bar even when focus is back in the editor (its input's
-        // own on_escape covers the focused-input case) — so Esc closes it "anywhere".
-        if find_open.get_untracked()
-            && matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::Escape), _))
-        {
-            find_open.set(false);
-            find_query.set(String::new());
-            find_replace.set(String::new());
-            return CommandExecuted::Yes;
-        }
-        // Same for the Go-to-line popup — Esc closes it from anywhere in the editor.
-        if goto_open.get_untracked()
-            && matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::Escape), _))
-        {
-            goto_open.set(false);
-            goto_query.set(String::new());
-            return CommandExecuted::Yes;
-        }
-        // Escape dismisses the suggestion list and/or signature help, whichever is
-        // showing (consuming the key only when it actually dismissed something).
-        if matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::Escape), _)) {
-            let had_sig = comp.sig.get_untracked().is_some();
-            let had_list = comp.open.get_untracked();
-            // The ghost too: it is an offer like the list, and Escape is how an
-            // offer is turned down. Only one on screen spends the key: a ghost
-            // hidden behind a Ctrl+K preview goes, and the preview's Escape is
-            // left to answer.
-            let had_ghost = comp.ghost.with_untracked(|g| g.is_some());
-            let showed_ghost = comp.ghost.with_untracked(|g| {
-                inline_diff::shown_ghost(g.as_ref(), preview_up.get_untracked()).is_some()
-            });
+        // Find, Go-to-line, the list, the ghost and the indent keys, in the
+        // order `editor_key_plan` decides and tests; what follows carries the
+        // plan out. The ghost is the *shown* one: behind a Ctrl+K preview a
+        // ghost is cleared by Escape but does not spend it — the preview's
+        // Escape is left to answer.
+        let key = EdKey::of(&kp.key);
+        let ghost_at = comp.ghost.with_untracked(|g| {
+            inline_diff::shown_ghost(g.as_ref(), preview_up.get_untracked()).map(|g| g.offset)
+        });
+        let plan = editor_sig.with_untracked(|e| {
+            let cursor = e.cursor.get_untracked();
+            // A bare → at the end of the line takes all of the ghost, as the
+            // shells' autosuggestions do: there is nowhere for the caret to go.
+            let at_line_end = key == EdKey::Right && ghost_at.is_some() && {
+                let caret = cursor.offset();
+                let rope = e.doc().text();
+                let next = rope.offset_of_line(rope.line_of_offset(caret) + 1);
+                rope.slice_to_cow(caret..next.max(caret))
+                    .trim_end_matches(['\r', '\n'])
+                    .is_empty()
+            };
+            editor_key_plan(KeyCtx {
+                key: Some(key),
+                mods,
+                find_open: find_open.get_untracked(),
+                goto_open: goto_open.get_untracked(),
+                sig_up: comp.sig.with_untracked(|s| s.is_some()),
+                list_open: comp.open.get_untracked(),
+                list_rows: comp.items.with_untracked(|v| !v.is_empty()),
+                word_complete: comp.word_complete.get_untracked(),
+                first_row: comp.sel.get_untracked() == 0,
+                ghost_at,
+                caret: crate::completion::lone_caret(&cursor),
+                at_line_end,
+            })
+        });
+        if plan.dismiss {
             comp.sig.set(None);
             comp.open.set(false);
-            if had_ghost {
+            if comp.ghost.with_untracked(|g| g.is_some()) {
                 editor_sig.with_untracked(|e| inline_diff::set_ghost(comp.ghost, e, None));
             }
-            if had_sig || had_list || showed_ghost {
+        }
+        if plan.close_list {
+            comp.open.set(false);
+        }
+        match plan.action {
+            // Esc closes the find bar even when focus is back in the editor (its
+            // input's own on_escape covers the focused-input case) — so Esc
+            // closes it "anywhere". Go-to-line the same.
+            KeyAction::CloseFind => {
+                find_open.set(false);
+                find_query.set(String::new());
+                find_replace.set(String::new());
                 return CommandExecuted::Yes;
             }
-        }
-        if comp.open.get_untracked() {
-            let len = comp.items.with_untracked(|v| v.len());
-            if len > 0 {
-                if list_takes_arrow(mods)
-                    && matches!(
-                        kp.key,
-                        KeyInput::Keyboard(Key::Named(NamedKey::ArrowDown), _)
-                    )
-                {
-                    comp.sel.update(|i| *i = (*i + 1) % len);
-                    return CommandExecuted::Yes;
-                }
-                if list_takes_arrow(mods)
-                    && matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::ArrowUp), _))
-                {
-                    comp.sel.update(|i| *i = (*i + len - 1) % len);
-                    return CommandExecuted::Yes;
-                }
-                let accept_enter = !primary_held(mods)
-                    && matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::Enter), _));
-                let accept_tab = !mods.shift()
-                    && matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::Tab), _));
-                // **A word typed in full ends at Enter**: after `FROM` the list
-                // holds `FROM_BASE64()`, and Enter meant as a newline took it.
-                // An arrow onto a row first still accepts that row.
-                if accept_enter
-                    && comp.word_complete.get_untracked()
-                    && comp.sel.get_untracked() == 0
-                {
-                    comp.open.set(false);
-                } else if accept_enter || accept_tab {
-                    let d = dialect.get_untracked();
-                    editor_sig.with_untracked(|e| accept_completion(e, comp, d));
-                    return CommandExecuted::Yes;
-                }
+            KeyAction::CloseGoto => {
+                goto_open.set(false);
+                goto_query.set(String::new());
+                return CommandExecuted::Yes;
             }
-            // A caret-moving key (not list-nav/accept above) leaves the popup
-            // anchored to a stale position → close it, but let the caret still
-            // move (fall through to the default handler). Typing recomputes it.
-            // A modified ↑/↓ — Shift selecting, Alt moving the line — is one.
-            if matches!(
-                kp.key,
-                KeyInput::Keyboard(
-                    Key::Named(
-                        NamedKey::ArrowLeft
-                            | NamedKey::ArrowRight
-                            | NamedKey::ArrowUp
-                            | NamedKey::ArrowDown
-                            | NamedKey::Home
-                            | NamedKey::End
-                            | NamedKey::PageUp
-                            | NamedKey::PageDown
-                    ),
-                    _,
-                )
-            ) {
-                comp.open.set(false);
+            KeyAction::Dismissed => return CommandExecuted::Yes,
+            KeyAction::ListNext | KeyAction::ListPrev => {
+                let len = comp.items.with_untracked(|v| v.len()).max(1);
+                let step = if plan.action == KeyAction::ListNext {
+                    1
+                } else {
+                    len - 1
+                };
+                comp.sel.update(|i| *i = (*i + step) % len);
+                return CommandExecuted::Yes;
             }
+            KeyAction::Accept => {
+                let d = dialect.get_untracked();
+                editor_sig.with_untracked(|e| accept_completion(e, comp, d));
+                return CommandExecuted::Yes;
+            }
+            _ => {}
         }
         // Tab takes the inline prediction, ahead of the indent below — see
         // `ghost_takes_tab` for when it may. Through `edit_untyped`, so the
@@ -2748,21 +2924,12 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         // words; the recompute that edit schedules asks for the *next*
         // prediction before that one-shot, which is what chains `GROUP ` →
         // `BY ` → the grouping columns.
-        if matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::Tab), _)) {
+        if plan.action == KeyAction::TakeGhost {
             let taken = editor_sig.with_untracked(|e| {
                 let caret = e.cursor.get_untracked().offset();
                 let ghost = comp.ghost.with_untracked(|g| {
                     inline_diff::shown_ghost(g.as_ref(), preview_up.get_untracked()).cloned()
                 });
-                if !ghost_takes_tab(
-                    ghost.as_ref().map(|g| g.offset),
-                    crate::completion::lone_caret(&e.cursor.get_untracked()),
-                    comp.open.get_untracked(),
-                    mods.shift(),
-                    primary_held(mods),
-                ) {
-                    return false;
-                }
                 let Some(g) = ghost else { return false };
                 inline_diff::set_ghost(comp.ghost, e, None);
                 if edit_untyped(
@@ -2789,32 +2956,15 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         // The recompute the edit schedules keeps it (`keeps_ghost`) rather than
         // predicting afresh where the words just taken may predict nothing.
         if matches!(
-            kp.key,
-            KeyInput::Keyboard(Key::Named(NamedKey::ArrowRight), _)
+            plan.action,
+            KeyAction::TakeGhostWord | KeyAction::TakeGhostWhole
         ) {
+            let whole = plan.action == KeyAction::TakeGhostWhole;
             let taken = editor_sig.with_untracked(|e| {
                 let caret = e.cursor.get_untracked().offset();
                 let ghost = comp.ghost.with_untracked(|g| {
                     inline_diff::shown_ghost(g.as_ref(), preview_up.get_untracked()).cloned()
                 });
-                let ghost_at = ghost.as_ref().map(|g| g.offset);
-                let lone = crate::completion::lone_caret(&e.cursor.get_untracked());
-                let list_open = comp.open.get_untracked();
-                let by_word =
-                    ghost_takes_word(ghost_at, lone, list_open, mods.shift(), primary_held(mods));
-                // A bare → at the end of the line takes all of it, as the
-                // shells' autosuggestions do: there is nowhere for the caret to go.
-                let at_line_end = {
-                    let rope = e.doc().text();
-                    let next = rope.offset_of_line(rope.line_of_offset(caret) + 1);
-                    rope.slice_to_cow(caret..next.max(caret))
-                        .trim_end_matches(['\r', '\n'])
-                        .is_empty()
-                };
-                let whole = ghost_takes_right(ghost_at, lone, list_open, mods, at_line_end);
-                if !by_word && !whole {
-                    return false;
-                }
                 let Some(g) = ghost else { return false };
                 let end = if whole {
                     g.text.len()
@@ -2848,11 +2998,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         // width, and it **replaces a selection** with one `\t` — three selected
         // lines became a single tab when hard tabs fell through to it. Both are
         // the tested pure `soft_tab_indent` / `hard_tab_indent`.
-        if !primary_held(mods)
-            && !mods.shift()
-            && !comp.open.get_untracked()
-            && matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::Tab), _))
-        {
+        if plan.action == KeyAction::Indent {
             let tw = theme::editor_tab_width();
             let soft = theme::editor_soft_tabs();
             editor_sig.with_untracked(|e| {
@@ -2887,10 +3033,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         // the buffer's own unit, not the tab settings'. `text_ops::newline_indent`
         // keeps the indent and goes one level deeper after an open bracket.
         // Several carets still take floem's, which handles each of them.
-        if !primary_held(mods)
-            && !mods.alt()
-            && matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::Enter), _))
-        {
+        if plan.action == KeyAction::NewlineIndent {
             let unit = if theme::editor_soft_tabs() {
                 " ".repeat(theme::editor_tab_width())
             } else {
@@ -2932,11 +3075,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         // open too**: Tab accepts there and Shift+Tab never did, so it fell to
         // floem's `OutdentLine` — four spaces, whatever the tab settings, and
         // nothing at all off a hard tab. The list closes, as for any caret move.
-        if !primary_held(mods)
-            && mods.shift()
-            && matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::Tab), _))
-        {
-            comp.open.set(false);
+        if plan.action == KeyAction::Outdent {
             let tw = theme::editor_tab_width();
             editor_sig.with_untracked(|e| {
                 let full = e.doc().text().to_string();
@@ -6944,8 +7083,216 @@ mod format_chord_tests {
 
 #[cfg(test)]
 mod ghost_key_tests {
-    use super::{ghost_takes_right, ghost_takes_tab, ghost_takes_word, list_takes_arrow};
+    use super::{
+        EdKey, KeyAction, KeyCtx, KeyPlan, editor_key_plan, ghost_takes_right, ghost_takes_tab,
+        ghost_takes_word, list_takes_arrow,
+    };
     use floem::keyboard::Modifiers;
+
+    fn ctx(key: EdKey) -> KeyCtx {
+        KeyCtx {
+            key: Some(key),
+            caret: Some(12),
+            ..KeyCtx::default()
+        }
+    }
+
+    fn act(c: KeyCtx) -> KeyAction {
+        editor_key_plan(c).action
+    }
+
+    /// Escape answers the innermost thing first: the find bar, then
+    /// Go-to-line, then what is offered — and spends the key only when an
+    /// offer was on screen.
+    #[test]
+    fn escape_closes_find_then_goto_then_dismisses() {
+        let esc = KeyCtx {
+            find_open: true,
+            goto_open: true,
+            list_open: true,
+            ..ctx(EdKey::Escape)
+        };
+        assert_eq!(act(esc), KeyAction::CloseFind);
+        assert_eq!(
+            act(KeyCtx {
+                find_open: false,
+                ..esc
+            }),
+            KeyAction::CloseGoto
+        );
+        let plan = editor_key_plan(KeyCtx {
+            find_open: false,
+            goto_open: false,
+            ..esc
+        });
+        assert_eq!(
+            plan,
+            KeyPlan {
+                dismiss: true,
+                close_list: false,
+                action: KeyAction::Dismissed
+            }
+        );
+        for on_screen in [
+            KeyCtx {
+                sig_up: true,
+                ..ctx(EdKey::Escape)
+            },
+            KeyCtx {
+                ghost_at: Some(12),
+                ..ctx(EdKey::Escape)
+            },
+        ] {
+            assert_eq!(act(on_screen), KeyAction::Dismissed);
+        }
+        // Nothing on screen: it still clears (a ghost hidden behind a
+        // Ctrl+K preview goes), and the key goes on.
+        let idle = editor_key_plan(ctx(EdKey::Escape));
+        assert!(idle.dismiss);
+        assert_eq!(idle.action, KeyAction::Pass);
+    }
+
+    /// An open list with rows owns bare ↑/↓, Enter and Tab; a modified arrow
+    /// or any other caret move closes it and moves the caret.
+    #[test]
+    fn an_open_list_owns_its_keys_and_a_caret_move_closes_it() {
+        let list = |key| KeyCtx {
+            list_open: true,
+            list_rows: true,
+            ..ctx(key)
+        };
+        assert_eq!(act(list(EdKey::Down)), KeyAction::ListNext);
+        assert_eq!(act(list(EdKey::Up)), KeyAction::ListPrev);
+        assert_eq!(act(list(EdKey::Enter)), KeyAction::Accept);
+        assert_eq!(act(list(EdKey::Tab)), KeyAction::Accept);
+        let shift_down = editor_key_plan(KeyCtx {
+            mods: Modifiers::SHIFT,
+            ..list(EdKey::Down)
+        });
+        assert!(shift_down.close_list);
+        assert_eq!(shift_down.action, KeyAction::Pass);
+        for key in [EdKey::Move, EdKey::Right] {
+            let p = editor_key_plan(list(key));
+            assert!(p.close_list && p.action == KeyAction::Pass, "{key:?}");
+        }
+        // Ctrl+Enter is the run, not an accept.
+        assert_ne!(
+            act(KeyCtx {
+                mods: Modifiers::CONTROL,
+                ..list(EdKey::Enter)
+            }),
+            KeyAction::Accept
+        );
+        // Shift+Tab outdents and closes the list, as any caret move does.
+        let p = editor_key_plan(KeyCtx {
+            mods: Modifiers::SHIFT,
+            ..list(EdKey::Tab)
+        });
+        assert!(p.close_list);
+        assert_eq!(p.action, KeyAction::Outdent);
+    }
+
+    /// **Enter after a word typed in full is a newline**, not the first row:
+    /// the list closes and Enter carries the indent. An arrow onto a row
+    /// first still accepts it.
+    #[test]
+    fn enter_after_a_full_word_is_a_newline_unless_a_row_was_chosen() {
+        let full = KeyCtx {
+            list_open: true,
+            list_rows: true,
+            word_complete: true,
+            first_row: true,
+            ..ctx(EdKey::Enter)
+        };
+        let p = editor_key_plan(full);
+        assert!(p.close_list);
+        assert_eq!(p.action, KeyAction::NewlineIndent);
+        assert_eq!(
+            act(KeyCtx {
+                first_row: false,
+                ..full
+            }),
+            KeyAction::Accept
+        );
+        assert_eq!(
+            act(KeyCtx {
+                word_complete: false,
+                ..full
+            }),
+            KeyAction::Accept
+        );
+    }
+
+    /// Tab takes a ghost ahead of the indent; Ctrl+→ its next word, a bare →
+    /// at the line's end all of it; without one, Tab indents and → moves.
+    #[test]
+    fn a_ghost_takes_tab_and_right_ahead_of_the_indent() {
+        let ghost = |key| KeyCtx {
+            ghost_at: Some(12),
+            ..ctx(key)
+        };
+        assert_eq!(act(ghost(EdKey::Tab)), KeyAction::TakeGhost);
+        assert_eq!(act(ctx(EdKey::Tab)), KeyAction::Indent);
+        assert_eq!(
+            act(KeyCtx {
+                mods: Modifiers::CONTROL,
+                ..ghost(EdKey::Right)
+            }),
+            KeyAction::TakeGhostWord
+        );
+        assert_eq!(
+            act(KeyCtx {
+                at_line_end: true,
+                ..ghost(EdKey::Right)
+            }),
+            KeyAction::TakeGhostWhole
+        );
+        assert_eq!(act(ghost(EdKey::Right)), KeyAction::Pass, "mid-line");
+        // Off the ghost's caret, Tab indents as it always did.
+        assert_eq!(
+            act(KeyCtx {
+                caret: Some(13),
+                ..ghost(EdKey::Tab)
+            }),
+            KeyAction::Indent
+        );
+    }
+
+    /// An open list with no rows takes neither Tab nor the indent: the key
+    /// goes on to floem's own.
+    #[test]
+    fn tab_over_an_empty_open_list_is_passed_on() {
+        let p = editor_key_plan(KeyCtx {
+            list_open: true,
+            ..ctx(EdKey::Tab)
+        });
+        assert_eq!(p.action, KeyAction::Pass);
+    }
+
+    /// Enter carries the indent unless Ctrl (the run) or Alt is held;
+    /// Shift+Tab outdents; anything else is passed on.
+    #[test]
+    fn enter_indents_and_shift_tab_outdents() {
+        assert_eq!(act(ctx(EdKey::Enter)), KeyAction::NewlineIndent);
+        for m in [Modifiers::CONTROL, Modifiers::ALT] {
+            assert_eq!(
+                act(KeyCtx {
+                    mods: m,
+                    ..ctx(EdKey::Enter)
+                }),
+                KeyAction::Pass,
+                "{m:?}"
+            );
+        }
+        assert_eq!(
+            act(KeyCtx {
+                mods: Modifiers::SHIFT,
+                ..ctx(EdKey::Tab)
+            }),
+            KeyAction::Outdent
+        );
+        assert_eq!(act(ctx(EdKey::Other)), KeyAction::Pass);
+    }
 
     /// A bare → at the end of the line takes the whole prediction; mid-line,
     /// modified, with the list open or off the ghost's caret it moves the caret.

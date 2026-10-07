@@ -23995,6 +23995,30 @@ existing prose was left alone.
     an ordinary replacement whose replacement does not contain the needle that list is **empty**, so
     the bar reported no matches, `n/total` collapsed and Enter did nothing, over a document that still
     held every occurrence: the screen read as though the replace had happened.
+    **The editor's key order is one decision, `editor_key_plan`, and the view only carries it out.**
+    It used to be a run of `if`s in `text_editor_keys`, each reading signals another had just set,
+    so the order — which *is* the behaviour — had no test. The tab navigation (Ctrl+P/T/W/Tab/1–9)
+    and the Ctrl+K verdict stay ahead of it in the closure, unchanged, and Ctrl+Space onwards after
+    it. The handler builds a `KeyCtx` — the key as an `EdKey` (←, Home, End, PgUp and PgDn are one
+    `Move`), the modifiers, which bars and offers are up, the *shown* ghost's offset
+    (`inline_diff::shown_ghost`, below), `lone_caret`, and whether the caret ends its line, which it
+    works out only for a → with a ghost showing — applies the returned `KeyPlan`'s `dismiss` and
+    `close_list`, then performs its one `KeyAction`. Escape closes the find bar, then Go-to-line,
+    then turns down signature help, the list and the ghost; an open list with rows takes a bare ↑/↓,
+    Enter and Tab, and any other ↑, ↓, → or `Move` closes it and goes on; then Tab takes a ghost and
+    → a word or the whole of it, ahead of Tab's indent, Enter's carried indent and Shift+Tab's
+    outdent, which closes the list as a caret move does. **The clearing that falls through is
+    modelled inside the function, not left to the signals**: after an Escape that turned down
+    nothing on screen, after a caret move that closed the list, and after Enter closed it on a word
+    typed in full, the later checks see the list (and, for Escape, the ghost) gone — which the view
+    got for free by setting a signal and reading it back, and a plan that only named the action
+    would not. An open list with *no* rows takes nothing and stays open, so Tab over it is passed on
+    to floem rather than indenting (`tab_over_an_empty_open_list_is_passed_on`). The order is pinned
+    in `ghost_key_tests` (`escape_closes_find_then_goto_then_dismisses`,
+    `an_open_list_owns_its_keys_and_a_caret_move_closes_it`,
+    `a_ghost_takes_tab_and_right_ahead_of_the_indent`, `enter_indents_and_shift_tab_outdents`); what
+    stays in the view is the edit each action makes, and Enter's own fall-through to floem when the
+    caret is not one region.
     **Enter is a newline once the word is typed in full.** With the list open, a bare ↑/↓ moves the
     selection (`list_takes_arrow`: with Shift, Alt or Ctrl the arrow closes the list and does its
     own work — Shift+↓ used to walk the rows instead of extending the selection) and Enter or Tab
@@ -24005,8 +24029,9 @@ existing prose was left alone.
     `FROM_BASE64()` and `FROM_DAYS()`, and Enter, meant to end the line, accepted the first. An
     arrow onto a row first still accepts that row, and Tab still accepts row 0. The handler reads
     only where the selection is, not whether it moved, so ↓ then ↑ back onto row 0 is a newline
-    too. The flag is under test (`a_word_typed_in_full_is_reported_though_not_listed`); the key
-    decision lives in the view and is not.
+    too. The flag is under test (`a_word_typed_in_full_is_reported_though_not_listed`), and so,
+    since `editor_key_plan`, is the key decision
+    (`enter_after_a_full_word_is_a_newline_unless_a_row_was_chosen`).
     **Tab takes the inline prediction ahead of the indent, on `ghost_takes_tab`'s terms**
     (`ghost_key_tests`): a plain Tab — no Shift, no primary modifier — with the list closed, since an
     open list owns Tab, and `completion::lone_caret` still answering the offset the ghost was made
