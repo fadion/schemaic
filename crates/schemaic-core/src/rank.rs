@@ -553,7 +553,7 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
     if !qualified
         && !matches!(
             ctx,
-            ClauseCtx::Type | ClauseCtx::Variable | ClauseCtx::TempTable
+            ClauseCtx::Type | ClauseCtx::ColumnType | ClauseCtx::Variable | ClauseCtx::TempTable
         )
     {
         for kw in &cont.keywords {
@@ -816,6 +816,13 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
         }
         // Straight after a sigil: the document's own names, and nothing the
         // schema could put there.
+        // A column definition's type: the engine's column types, as a cast's
+        // target offers its cast types.
+        ClauseCtx::ColumnType => {
+            for t in crate::intel::column_types(input.dialect) {
+                add(&mut cands, &mut seen, &t, SuggestKind::Keyword, "type", 0);
+            }
+        }
         ClauseCtx::Variable => {
             for v in &input.local.variables {
                 let glyph = SuggestGlyph::Kind;
@@ -1760,6 +1767,18 @@ mod tests {
             offers(&all, "nvarchar") && !offers(&all, "total"),
             "{all:?}"
         );
+    }
+
+    /// A column definition's type offers the engine's column types — MySQL's
+    /// `INT`, which its `CAST` refuses — and nothing else.
+    #[test]
+    fn a_column_definition_offers_column_types() {
+        let s = shop();
+        let ty = |d, p| ranked_on(&s, d, ClauseCtx::ColumnType, &[], p);
+        let my = ty(SqlDialect::MySql, "in");
+        assert_eq!(my.first().map(String::as_str), Some("int"), "{my:?}");
+        assert!(!offers(&ty(SqlDialect::MySql, "to"), "total"), "no columns");
+        assert!(offers(&ty(SqlDialect::MsSql, "nvar"), "NVARCHAR"));
     }
 
     /// A name that bare would be something else — a reserved word, a space,

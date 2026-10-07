@@ -3647,17 +3647,23 @@ pub fn cast_target_types(
                 .map(|t| t.to_string())
                 .collect()
         }
-        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => {
-            let mut out: Vec<String> = Vec::new();
-            for t in crate::ddl::common_types(dialect) {
-                let base = t.split('(').next().unwrap_or(t).trim().to_ascii_uppercase();
-                if !out.contains(&base) {
-                    out.push(base);
-                }
-            }
-            out
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => column_types(dialect),
+    }
+}
+
+/// The type names completion offers for a column definition
+/// ([`ClauseCtx::ColumnType`]): [`crate::ddl::common_types`]' base names, the
+/// size left off, written upper-case for [`in_typed_case`]. On MySQL these
+/// are its column types, not [`cast_target_types`]' narrower `CAST` list.
+pub fn column_types(dialect: SqlDialect) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for t in crate::ddl::common_types(dialect) {
+        let base = t.split('(').next().unwrap_or(t).trim().to_ascii_uppercase();
+        if !out.contains(&base) {
+            out.push(base);
         }
     }
+    out
 }
 
 /// Clause keywords that determine the completion context (see [`clause_context`]).
@@ -3965,6 +3971,9 @@ pub enum ClauseCtx {
     /// A cast's target type — `CAST(x AS |`, `TRY_CAST(x AS |`,
     /// PostgreSQL's `x::|` → [`cast_target_types`].
     Type,
+    /// A column definition's type — after the name in `CREATE TABLE t (`, or
+    /// `ALTER TABLE … ADD`/`MODIFY` → [`column_types`].
+    ColumnType,
     /// A value with no columns in reach — a `VALUES` tuple, a `DECLARE`'s
     /// default, the value a statement-opening `SET` gives a variable →
     /// functions and keywords, no columns.
@@ -3992,6 +4001,14 @@ fn cast_target_at(sql: &str, toks: &[Token], word_lo: usize, dialect: SqlDialect
         return true;
     }
     let is_word = |t: &Token, any: &[&str]| matches!(&t.kind, TkKind::Word(w) if !t.quoted && any.iter().any(|k| w.eq_ignore_ascii_case(k)));
+    // T-SQL's `CONVERT(type, …)`: the word straight after the paren.
+    if convert_takes_type_first(dialect)
+        && let [.., f, p] = toks
+        && matches!(p.kind, TkKind::LParen)
+        && is_word(f, &["CONVERT", "TRY_CONVERT"])
+    {
+        return true;
+    }
     if !toks.last().is_some_and(|t| is_word(t, &["AS"])) {
         return false;
     }
@@ -4049,6 +4066,36 @@ fn past_assignment(
         i += 1;
     }
     false
+}
+
+/// Does an item of a table's definition that begins with `word` (upper-case)
+/// define something other than a column — a constraint or an index?
+fn defines_no_column(word: &str) -> bool {
+    matches!(
+        word,
+        "CONSTRAINT"
+            | "PRIMARY"
+            | "FOREIGN"
+            | "UNIQUE"
+            | "CHECK"
+            | "KEY"
+            | "INDEX"
+            | "FULLTEXT"
+            | "SPATIAL"
+            | "EXCLUDE"
+            | "LIKE"
+            | "PERIOD"
+    )
+}
+
+/// Does T-SQL's `CONVERT(type, expr)` order hold here — the type first?
+/// MySQL's `CONVERT(expr, type)` puts it second, and PostgreSQL's and
+/// SQLite's have none.
+fn convert_takes_type_first(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MsSql => true,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+    }
 }
 
 /// Does the engine spell a cast `x::type`? PostgreSQL's alone.
@@ -4162,6 +4209,26 @@ pub fn clause_context(sql: &str, lo: usize, word_lo: usize, dialect: SqlDialect)
             let defines = outer_kw.as_deref() == Some("TABLE")
                 && open >= 2
                 && word_up(&toks[open - 2]).as_deref() == Some("TABLE");
+            // A definition whose only word so far is a column's name: its
+            // type comes next. A constraint's keyword is no name.
+            if defines {
+                let mut depth = 0usize;
+                let mut item = open + 1;
+                for (i, t) in toks.iter().enumerate().skip(open + 1) {
+                    match t.kind {
+                        TkKind::LParen => depth += 1,
+                        TkKind::RParen => depth = depth.saturating_sub(1),
+                        TkKind::Comma if depth == 0 => item = i + 1,
+                        _ => {}
+                    }
+                }
+                if let [name] = &toks[item..]
+                    && matches!(name.kind, TkKind::Word(_))
+                    && !word_up(name).is_some_and(|w| defines_no_column(&w) && !name.quoted)
+                {
+                    return ClauseCtx::ColumnType;
+                }
+            }
             return if defines {
                 ClauseCtx::Other
             } else {
@@ -4193,6 +4260,16 @@ pub fn clause_context(sql: &str, lo: usize, word_lo: usize, dialect: SqlDialect)
                 );
         if names_column {
             return ClauseCtx::Column;
+        }
+        // The type of a column being added or redefined: `ADD [COLUMN] name`,
+        // MySQL's `MODIFY [COLUMN] name`, PostgreSQL's `ALTER COLUMN c TYPE`.
+        let at = |k: usize| n.checked_sub(k).map(|j| words[j].as_str());
+        let named_after =
+            |verb: &str| at(2) == Some(verb) || (at(3) == Some(verb) && at(2) == Some("COLUMN"));
+        let adds = (named_after("ADD") || named_after("MODIFY"))
+            && last.is_some_and(|w| !defines_no_column(w) && w != "COLUMN");
+        if adds || (last == Some("TYPE") && at(3) == Some("COLUMN")) {
+            return ClauseCtx::ColumnType;
         }
     }
     // `USE |` names a database, and nothing else does.
@@ -19239,6 +19316,74 @@ mod tests {
         assert_ne!(on("SELECT a::", SqlDialect::MySql), ClauseCtx::Type);
     }
 
+    /// A column definition's type: after the name in `CREATE TABLE t (`, after
+    /// `ADD`/`MODIFY [COLUMN] name`, after PostgreSQL's `ALTER COLUMN c TYPE`.
+    /// And T-SQL's `CONVERT(`, whose first argument is the type.
+    #[test]
+    fn a_column_definitions_type_is_a_type_slot() {
+        let on = |sql: &str, d| clause_context(sql, 0, word_start(sql, sql.len()), d);
+        for d in SqlDialect::ALL {
+            assert_eq!(on("CREATE TABLE t (id ", d), ClauseCtx::ColumnType, "{d:?}");
+            assert_eq!(
+                on("CREATE TABLE t (id int, name va", d),
+                ClauseCtx::ColumnType,
+                "{d:?}"
+            );
+            assert_eq!(
+                on("ALTER TABLE t ADD note ", d),
+                ClauseCtx::ColumnType,
+                "{d:?}"
+            );
+            assert_eq!(
+                on("ALTER TABLE t ADD COLUMN note ", d),
+                ClauseCtx::ColumnType,
+                "{d:?}"
+            );
+            // The name's own slot, a constraint, and past the type, are not.
+            assert_ne!(on("CREATE TABLE t (", d), ClauseCtx::ColumnType, "{d:?}");
+            assert_ne!(
+                on("CREATE TABLE t (id int ", d),
+                ClauseCtx::ColumnType,
+                "{d:?}"
+            );
+            assert_ne!(
+                on("CREATE TABLE t (id int, PRIMARY ", d),
+                ClauseCtx::ColumnType,
+                "{d:?}"
+            );
+            assert_ne!(
+                on("ALTER TABLE t ADD CONSTRAINT ", d),
+                ClauseCtx::ColumnType,
+                "{d:?}"
+            );
+            assert_ne!(
+                on("CREATE TABLE t (n numeric(10, ", d),
+                ClauseCtx::ColumnType,
+                "{d:?}"
+            );
+        }
+        assert_eq!(
+            on("ALTER TABLE t MODIFY note ", SqlDialect::MySql),
+            ClauseCtx::ColumnType
+        );
+        assert_eq!(
+            on(
+                "ALTER TABLE t ALTER COLUMN note TYPE ",
+                SqlDialect::Postgres
+            ),
+            ClauseCtx::ColumnType
+        );
+        assert_eq!(on("SELECT CONVERT(", SqlDialect::MsSql), ClauseCtx::Type);
+        assert_eq!(
+            on("SELECT TRY_CONVERT(dec", SqlDialect::MsSql),
+            ClauseCtx::Type
+        );
+        assert_ne!(on("SELECT CONVERT(", SqlDialect::MySql), ClauseCtx::Type);
+        // Column types are the engine's, not MySQL's CAST list.
+        assert!(column_types(SqlDialect::MySql).contains(&"INT".to_string()));
+        assert!(column_types(SqlDialect::MsSql).contains(&"NVARCHAR".to_string()));
+    }
+
     /// Each engine's cast targets: MySQL's and MariaDB's own lists, each
     /// measured, and the column types' base names elsewhere.
     #[test]
@@ -19451,8 +19596,9 @@ mod tests {
         // parenthesised join.
         assert_eq!(ctx("SELECT * FROM ("), ClauseCtx::Table);
         assert_eq!(ctx("SELECT * FROM (a JOIN "), ClauseCtx::Table);
-        // A table's column definitions are neither.
-        assert_eq!(ctx("CREATE TABLE t (id in"), ClauseCtx::Other);
+        // A table's column definitions are neither: a new name, then its type
+        // (`a_column_definitions_type_is_a_type_slot`).
+        assert_eq!(ctx("CREATE TABLE t (id in"), ClauseCtx::ColumnType);
         assert_eq!(ctx("CREATE TABLE t ("), ClauseCtx::Other);
         // Closed parens give the outer clause back.
         assert_eq!(ctx("INSERT INTO t (a) SELECT x FROM "), ClauseCtx::Table);

@@ -952,8 +952,14 @@ existing prose was left alone.
     before any of that (`cast_target_at`): the word straight after an `AS` whose innermost open
     paren is a `CAST(`/`TRY_CAST(` — an `AS` anywhere else is an alias's — or after `::` where the
     engine casts with it (`casts_with_double_colon`, PostgreSQL), read off the bytes since the
-    tokenizer keeps no operators (`a_cast_target_is_a_type_slot`). A column definition's type
-    and T-SQL's `CONVERT(type, …)` are not type slots yet. **A value no column reaches is
+    tokenizer keeps no operators (`a_cast_target_is_a_type_slot`) — and straight after T-SQL's
+    `CONVERT(`/`TRY_CONVERT(`, whose first argument is the type (`convert_takes_type_first`; MySQL's
+    `CONVERT` takes it second). **A column definition's type is `ColumnType`**: in a `CREATE TABLE
+    t (` paren, an item whose only word so far is a name (`defines_no_column` keeps
+    `PRIMARY`/`CONSTRAINT`/`KEY`/… out); after `ALTER TABLE … ADD`/`MODIFY [COLUMN] name`; after
+    PostgreSQL's `ALTER COLUMN c TYPE` (`a_column_definitions_type_is_a_type_slot`). It offers
+    `column_types` — `ddl::common_types`' base names — because MySQL's column types are not its
+    `CAST` list: `INT` is a column type its `CAST` refuses. **A value no column reaches is
     `Value`**: a `VALUES` tuple (the paren whose outer keyword is `VALUES`; a subquery inside it
     is a statement again), and the value a statement-opening `DECLARE` (no clause since) or `SET`
     (no clause but itself) gives a variable once `past_assignment` finds an `=` in code or a
