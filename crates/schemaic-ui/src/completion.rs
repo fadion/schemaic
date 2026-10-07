@@ -1147,17 +1147,23 @@ pub(crate) fn recompute_completions(
     comp.open.set(open);
 }
 
-/// Replace the word at the caret with the selected suggestion.
-pub(crate) fn accept_completion(ed: &Editor, comp: Completion) {
+/// Replace the word at the caret with the selected suggestion — a name quoted
+/// where bare it would be something else, unless the caret is inside a quote
+/// already (`rank::accepted_insert`).
+pub(crate) fn accept_completion(ed: &Editor, comp: Completion, dialect: SqlDialect) {
     let offset = ed.cursor.get_untracked().offset();
     let doc = ed.doc();
     let text = doc.text().to_string();
     let start = word_start(&text, offset);
     let end = word_end(&text, offset);
     let idx = comp.sel.get_untracked();
+    let (lo, _) = schemaic_core::sql::writing_range(&text, offset, dialect);
+    let in_quoted_name = intel::caret_in_quoted_name(&text, lo, start, dialect);
     if let Some((word, kind, over, replace)) = comp.items.with_untracked(|v| {
-        v.get(idx)
-            .map(|s| (s.text.clone(), s.kind, s.insert.clone(), s.replace))
+        v.get(idx).map(|s| {
+            let over = rank::accepted_insert(s, dialect, in_quoted_name);
+            (s.text.clone(), s.kind, over, s.replace)
+        })
     }) {
         comp.suppress.set(true);
         let (insert, caret) = if let Some(over) = over {
@@ -1305,6 +1311,7 @@ pub(crate) fn completion_popup(
     area_h: RwSignal<f64>,
     area_w: RwSignal<f64>,
     viewport: RwSignal<Rect>,
+    dialect: Memo<SqlDialect>,
 ) -> impl IntoView {
     // The anchor is in content coords, so the viewport origin comes off here — in a
     // reactive read, which is what keeps the popup pinned to the caret while the
@@ -1433,7 +1440,7 @@ pub(crate) fn completion_popup(
                         let editor = editor.clone();
                         move |_| {
                             comp.sel.set(i);
-                            accept_completion(&editor, comp);
+                            accept_completion(&editor, comp, dialect.get_untracked());
                             let ed = editor.clone();
                             floem::action::exec_after(std::time::Duration::ZERO, move |_| {
                                 if let Some(Some(vid)) = ed.editor_view_id.try_get_untracked() {

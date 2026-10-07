@@ -2683,7 +2683,8 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 {
                     comp.open.set(false);
                 } else if accept_enter || accept_tab {
-                    editor_sig.with_untracked(|e| accept_completion(e, comp));
+                    let d = dialect.get_untracked();
+                    editor_sig.with_untracked(|e| accept_completion(e, comp, d));
                     return CommandExecuted::Yes;
                 }
             }
@@ -6445,7 +6446,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         bracket_match_view,
         occurrences_view,
         run_overlay,
-        completion_popup(comp, ed_comp, area_h, area_w, ed_vp),
+        completion_popup(comp, ed_comp, area_h, area_w, ed_vp, dialect),
         // The two paint-only hints share one slot — the stack is at its 16 — at
         // the signature hint's layer. Floem 0.2's `z_index` is the renderer's
         // paint layer, set when a view paints and inherited by its descendants

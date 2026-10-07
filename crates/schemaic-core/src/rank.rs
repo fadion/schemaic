@@ -732,6 +732,32 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
     (items, completes_a_word)
 }
 
+/// What accepting `s` splices over the word being typed, when that is not
+/// `s.text` as it reads: the row's own `insert` (an FK join target, a
+/// snippet's body, the star expansion), or — for a table, column or database
+/// row — its name through [`crate::export::ident_if_needed`], where bare it
+/// would be something else (`` `order` ``, `` `Unit Price` ``, PostgreSQL's
+/// `"OrderDate"`). The row still shows, and was matched by, the bare name.
+///
+/// **Inside a quoted name the name goes in bare** (`in_quoted_name`):
+/// completion runs there on purpose, and the quote before the word is the
+/// user's — a quoted insert would double it.
+pub fn accepted_insert(
+    s: &Suggestion,
+    dialect: crate::intel::SqlDialect,
+    in_quoted_name: bool,
+) -> Option<String> {
+    if s.insert.is_some() {
+        return s.insert.clone();
+    }
+    match s.kind {
+        SuggestKind::Table | SuggestKind::Column | SuggestKind::Database if !in_quoted_name => {
+            Some(crate::export::ident_if_needed(&s.text, dialect)).filter(|q| *q != s.text)
+        }
+        _ => None,
+    }
+}
+
 /// Does `cand` begin with a non-empty `prefix`, ignoring ASCII case?
 fn begins_with(cand: &str, prefix: &str) -> bool {
     !prefix.is_empty()
@@ -1204,6 +1230,81 @@ mod tests {
         // still sits under the builtins — past the last row on PostgreSQL.
         let rows = col("");
         assert!(!offers(&rows, "PARTITION"), "{rows:?}");
+    }
+
+    /// A name that bare would be something else — a reserved word, a space,
+    /// a capital letter on PostgreSQL — inserts quoted, through the one
+    /// quoter, while the row still shows and matches the bare name. One that
+    /// needs nothing inserts as it reads, and so does any name typed inside a
+    /// quote already.
+    #[test]
+    fn a_name_that_needs_quoting_inserts_quoted() {
+        let col = |n: &str| ColMeta {
+            name: n.to_string(),
+            type_name: "int".to_string(),
+            nullable: false,
+            primary_key: false,
+            foreign_key: false,
+        };
+        let cols = vec![col("Unit Price"), col("OrderDate"), col("qty")];
+        let mut columns = HashMap::new();
+        columns.insert("order".to_string(), cols.clone());
+        let mut columns_by_db = HashMap::new();
+        columns_by_db.insert(("shop".to_string(), "order".to_string()), Rc::new(cols));
+        let s = SchemaIndex {
+            databases: vec!["shop".to_string()],
+            tables: vec![("order".to_string(), "shop".to_string())],
+            columns,
+            columns_by_db,
+            tables_by_db: HashMap::new(),
+        };
+        let row = |dialect, ctx: ClauseCtx, scope: &[TableRef], prefix: &str, name: &str| {
+            let cont = Continuation::default();
+            let used = HashSet::new();
+            rank(
+                &s,
+                &RankInput {
+                    ctx: &ctx,
+                    cont: &cont,
+                    scope,
+                    prefix,
+                    snippets: &[],
+                    join_targets: &[],
+                    star: None,
+                    used: &used,
+                    active_db: Some("shop"),
+                    dialect,
+                    flavour: ServerFlavour::Unknown,
+                },
+            )
+            .into_iter()
+            .find(|r| r.text == name)
+            .unwrap_or_else(|| panic!("{name} offered"))
+        };
+        let (my, pg) = (SqlDialect::MySql, SqlDialect::Postgres);
+        let ins = |d, s: &Suggestion| accepted_insert(s, d, false);
+        let table = row(my, ClauseCtx::Table, &[], "ord", "order");
+        assert_eq!(ins(my, &table).as_deref(), Some("`order`"));
+        // Inside `` `ord `` the quote is the user's.
+        assert_eq!(accepted_insert(&table, my, true), None);
+        let scope = [tref("order", None)];
+        let spaced = row(my, ClauseCtx::Column, &scope, "unit", "Unit Price");
+        assert_eq!(ins(my, &spaced).as_deref(), Some("`Unit Price`"));
+        let cased = |d| ins(d, &row(d, ClauseCtx::Column, &scope, "orderd", "OrderDate"));
+        assert_eq!(cased(my), None);
+        assert_eq!(cased(pg).as_deref(), Some("\"OrderDate\""));
+        assert_eq!(
+            ins(pg, &row(pg, ClauseCtx::Column, &scope, "q", "qty")),
+            None
+        );
+        // A keyword or a function is never quoted; a row's own insert wins.
+        let kw = row(my, ClauseCtx::Start, &[], "sel", "select");
+        assert_eq!(ins(my, &kw), None);
+        let own = Suggestion {
+            insert: Some("orders ON o.id = orders.id".to_string()),
+            ..table.clone()
+        };
+        assert_eq!(ins(my, &own), own.insert);
     }
 
     /// The engine's own keywords complete a row; they do not make a word an

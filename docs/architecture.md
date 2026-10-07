@@ -12841,7 +12841,16 @@ existing prose was left alone.
       each by `fuzzy_score` plus `recency_bonus`, and sorts by tier, then score, then length,
       capped at `MAX_ROWS`. `fuzzy_score` is a subsequence match that rewards a hit at a word's
       start — the name's, after `_`, or at a camelCase hump, so `oi` finds `OrderItem`'s words as
-      it finds `order_item`'s (`a_camel_case_hump_scores_as_a_word_boundary`). **`rank_full` is `rank` plus the one fact the rows cannot carry**:
+      it finds `order_item`'s (`a_camel_case_hump_scores_as_a_word_boundary`). **A table, column
+      or database row inserts its name through `export::ident_if_needed`** where that differs from
+      the bare name — `` `order` ``, `` `Unit Price` ``, PostgreSQL's `"OrderDate"` — while the row
+      shows, and was matched by, the bare one. That is `accepted_insert`'s answer, asked at accept
+      for the one row taken rather than while ranking, and never over a row's own `insert` (an FK
+      join target's `table_sql` is quoted already). **Inside a quoted name the name goes in bare**:
+      completion runs there on purpose (`intel::caret_in_literal_or_comment` lets a quoted name
+      through), and the quote before the word is the user's, so the UI asks
+      `intel::caret_in_quoted_name` — the same probe, answering the other kind of span — and passes
+      it in (`a_name_that_needs_quoting_inserts_quoted`). **`rank_full` is `rank` plus the one fact the rows cannot carry**:
       `Ranked::completes_a_word`, whether the word typed already spells a candidate in full. The
       exact match is left out of the rows, and that was also what hid it — after `FROM` the list
       held `FROM_BASE64()` and `FROM_DAYS()`, and Enter, meant as a newline, accepted the first (the

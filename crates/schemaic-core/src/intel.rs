@@ -13574,6 +13574,31 @@ pub fn caret_in_literal_or_comment(
     caret: usize,
     dialect: SqlDialect,
 ) -> bool {
+    matches!(
+        caret_noncode(sql, lo, caret, dialect),
+        Some(crate::sql::NonCode::Literal | crate::sql::NonCode::Comment)
+    )
+}
+
+/// Is `caret` inside a quoted name — `` `ord ``, `"Ord`, `[Order De` —
+/// reading `sql` from `lo`? Accepting a completion there inserts the name
+/// bare (`rank::accepted_insert`), since the quote before it is the user's.
+pub fn caret_in_quoted_name(sql: &str, lo: usize, caret: usize, dialect: SqlDialect) -> bool {
+    matches!(
+        caret_noncode(sql, lo, caret, dialect),
+        Some(crate::sql::NonCode::Identifier)
+    )
+}
+
+/// What the non-code span open at `caret` is, reading `sql` from `lo` —
+/// `None` in code. The probe both [`caret_in_literal_or_comment`] and
+/// [`caret_in_quoted_name`] describe.
+fn caret_noncode(
+    sql: &str,
+    lo: usize,
+    caret: usize,
+    dialect: SqlDialect,
+) -> Option<crate::sql::NonCode> {
     let (lo, caret) = (lo.min(caret), caret.min(sql.len()));
     let mut probe = String::with_capacity(caret - lo + 1);
     probe.push_str(&sql[lo..caret]);
@@ -13583,17 +13608,12 @@ pub fn caret_in_literal_or_comment(
     let mut i = 0;
     while i < end {
         match skip_noncode(b, i, dialect) {
-            Some(j) if j > end => {
-                return matches!(
-                    crate::sql::noncode_kind(b, i, dialect),
-                    Some(crate::sql::NonCode::Literal | crate::sql::NonCode::Comment)
-                );
-            }
+            Some(j) if j > end => return crate::sql::noncode_kind(b, i, dialect),
             Some(j) => i = j.max(i + 1),
             None => i += 1,
         }
     }
-    false
+    None
 }
 
 /// Whether `CROSS` and `OUTER` may be followed by `APPLY` on this engine, which
@@ -18634,6 +18654,24 @@ mod tests {
             sql.len(),
             SqlDialect::MySql
         ));
+    }
+
+    /// The other half: the caret inside a quoted name, where an accepted
+    /// completion goes in bare because the quote is the user's.
+    #[test]
+    fn the_caret_in_a_quoted_name_is_told_apart_from_code_and_values() {
+        let quoted = |sql: &str, d| caret_in_quoted_name(sql, 0, sql.len(), d);
+        assert!(quoted("SELECT * FROM \"Ord", SqlDialect::Postgres));
+        assert!(quoted("SELECT * FROM `ord", SqlDialect::MySql));
+        assert!(quoted("SELECT * FROM [Order De", SqlDialect::MsSql));
+        for d in SqlDialect::ALL {
+            assert!(!quoted("SELECT * FROM ord", d), "{d:?}");
+            assert!(!quoted("SELECT 'ord", d), "{d:?}");
+            assert!(!quoted("SELECT 1 -- ord", d), "{d:?}");
+        }
+        assert!(!quoted("SELECT * FROM `ord` ", SqlDialect::MySql), "closed");
+        // Where `"` quotes a string, it is a value, not a name.
+        assert!(!quoted("SELECT \"jo", SqlDialect::MySql));
     }
 
     // ── clause_continuation (expected-token model) ────────────────────────────
