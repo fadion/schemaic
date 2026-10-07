@@ -11945,7 +11945,9 @@ existing prose was left alone.
     `enter_after_a_word_that_opens_no_block_adds_nothing`). **And the level closes as `END` is
     typed**: `dedent_typed_word` answers the letter that makes a line's only word `END` — nothing
     after it on the line — with the edit that moves the line to the indent of the line whose `BEGIN`
-    or `CASE` it closes, asked of the text as it will be through `pairs::match_block`; and the one
+    or `CASE` it closes (on MySQL also the `IF`/`LOOP`/`WHILE`/`REPEAT`/`FOR` its `END IF` and kin
+    close, rather than the `BEGIN` around them), asked of the text as it will be through
+    `pairs::match_block`; and the one
     that makes it `WHEN` or `ELSE` inside a `CASE` with the edit that puts it one unit under the
     `CASE`'s line (`pairs::enclosing_block`, which shares `match_block`'s `block_words`) — the
     layout Format gives a `CASE`; an `IF`'s `ELSE` in a `BEGIN` is left alone. `None` leaves the
@@ -12174,14 +12176,30 @@ existing prose was left alone.
     and SQLite, `skip_noncode` skips it and it pairs nothing), `match_block` and `block_jump` (the
     same two questions asked of words: `BEGIN`/`CASE` and its `END`, as word ranges, the pane
     asking them when no bracket answers. A transaction's `BEGIN` — `BEGIN TRAN`, `TRANSACTION`,
-    `WORK`, `BEGIN;` — opens nothing, an `END IF`/`LOOP`/`WHILE`/`REPEAT`/`FOR` closes a block it
-    does not track and is passed over, `END CASE` is an `END`, and `t.end` is a name. It runs on
-    every caret move, so it asks the caret's own word first and scans only when that is one of
-    the three — `a_block_word_matches_its_end`,
+    `WORK`, `BEGIN;` — opens nothing, `END CASE` is an `END`, and `t.end` is a name. **On MySQL a
+    compound statement is a block too**: `IF`, `[label:] LOOP`, `WHILE`, `REPEAT` and MariaDB's
+    `FOR` open one, and the `END` of its `END IF`/`END LOOP`/… closes it, matched on the one stack
+    innermost first — so the jump, the partner highlight and a typed `END`'s dedent all reach
+    them. **An opener counts only where a statement starts**: the text's first word, after a `;`
+    or a label's `:`, or after `BEGIN`/`THEN`/`ELSE`/`DO`/`LOOP`/`REPEAT` — `block_words` records
+    that per word from the last code token, a comment not counting and a string counting. That is
+    what keeps out the `IF()` and `REPEAT()` functions, `IF [NOT] EXISTS`, `FOR UPDATE` and a
+    trigger's `FOR EACH ROW`; and an `IF (` is the statement only when the word after its matching
+    `)` is `THEN`, since `CASE WHEN a THEN IF(b,1,2) END` starts the `IF` exactly where a statement
+    would (`a_compound_statement_matches_its_named_end`,
+    `a_word_that_is_no_compound_statement_opens_nothing`). Whether an engine does this is
+    `names_its_block_ends`, an exhaustive match that answers `true` for MySQL alone: PostgreSQL's
+    `END IF` lives in a dollar-quoted body, a literal to the lexer; T-SQL's `IF`/`WHILE` take one
+    statement or a `BEGIN … END` and have no `END` of their own; SQLite has no compound
+    statements. Where it is `false` an `END IF`/`LOOP`/`WHILE`/`REPEAT`/`FOR` closes a block this
+    does not track and is passed over, as it was everywhere before. It runs on every caret move,
+    so it asks the caret's own word first and scans only when that is one of the eight block
+    words — `a_block_word_matches_its_end`,
     `a_word_that_opens_or_closes_no_block_matches_nothing`,
     `a_block_jump_lands_on_the_same_side_and_comes_back`. Inside a PostgreSQL `$$` body the
     lexer sees a literal, so nothing there pairs; `enclosing_block`, the innermost block still open
-    at an offset, reads the same `block_words`),
+    at an offset — an open compound statement included
+    (`an_open_compound_statement_encloses_what_follows`) — reads the same `block_words`),
     `identifier_occurrences` (every whole-word, ASCII-case-insensitive occurrence of the identifier
     under the caret — excludes keywords/numbers/strings, needs ≥2 to fire), and `region_at`
     (`Code`/`Str`/`Comment` classification). Pure + unit-tested; dialect-aware, and its two "is a

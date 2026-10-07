@@ -410,11 +410,15 @@ pub fn block_jump(text: &str, caret: usize, dialect: SqlDialect) -> Option<usize
 
 /// The block the caret's word opens or closes: `BEGIN` or `CASE` and its
 /// `END`, as `(here, partner)` word ranges, when the caret is on or just after
-/// one of those words in code. The bracket pair's question asked of words —
-/// see [`match_paren`].
+/// one of those words in code — and, where an `END` names what it closes
+/// ([`names_its_block_ends`]), a compound statement's `IF`, `LOOP`, `WHILE`,
+/// `REPEAT` or `FOR` at the start of a statement, with the `END` of its
+/// `END IF` and the rest. The bracket pair's question asked of words — see
+/// [`match_paren`].
 ///
 /// What is not a block is passed over: a transaction's `BEGIN` (`BEGIN TRAN`,
-/// `TRANSACTION`, `WORK`, or a `BEGIN;`), and an `END IF`/`LOOP`/`WHILE`/
+/// `TRANSACTION`, `WORK`, or a `BEGIN;`); the `IF()` function, told from an
+/// `IF (…) THEN` by the `THEN`; and elsewhere an `END IF`/`LOOP`/`WHILE`/
 /// `REPEAT`/`FOR`, which closes a block this does not track. `END CASE` and
 /// T-SQL's `END TRY`/`END CATCH` are `END`s. A word after `.` is a name.
 pub fn match_block(
@@ -435,9 +439,11 @@ pub fn match_block(
     while hi < b.len() && crate::sql::is_word_byte(b[hi]) {
         hi += 1;
     }
-    let block_word = ["BEGIN", "CASE", "END"]
-        .iter()
-        .any(|k| text[lo..hi].eq_ignore_ascii_case(k));
+    let block_word = [
+        "BEGIN", "CASE", "END", "IF", "LOOP", "WHILE", "REPEAT", "FOR",
+    ]
+    .iter()
+    .any(|k| text[lo..hi].eq_ignore_ascii_case(k));
     if !block_word {
         return None;
     }
@@ -463,8 +469,9 @@ pub fn match_block(
     None
 }
 
-/// The innermost `BEGIN` or `CASE` still open at `at` — its word range, and
-/// whether it is a `CASE` — by [`match_block`]'s rules for what opens and
+/// The innermost block still open at `at` — a `BEGIN`, a `CASE`, or where
+/// [`names_its_block_ends`] a compound statement's opener — its word range,
+/// and whether it is a `CASE`, by [`match_block`]'s rules for what opens and
 /// closes a block. `None` outside any.
 pub fn enclosing_block(text: &str, at: usize, dialect: SqlDialect) -> Option<(usize, usize, bool)> {
     let words = block_words(text, dialect);
@@ -498,16 +505,37 @@ struct BlockWord {
     role: BlockRole,
 }
 
+/// Whether `dialect`'s compound statements — `IF`, `LOOP`, `WHILE`, `REPEAT`,
+/// `FOR` — close with an `END` that names them, in code the editor scans.
+/// MySQL's routine bodies are plain code. PostgreSQL's `END IF` lives in a
+/// dollar-quoted body, which is a string here; T-SQL's `IF` and `WHILE` take
+/// one statement or a `BEGIN … END` and have no `END` of their own; SQLite
+/// has no compound statements.
+fn names_its_block_ends(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MySql => true,
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+    }
+}
+
 /// Every word of `text` in code, in order, with what it does to the block
 /// structure — the rules [`match_block`]'s doc sets out.
 fn block_words(text: &str, dialect: SqlDialect) -> Vec<BlockWord> {
     let b = text.as_bytes();
-    // Every word in code, in order: its range, upper-cased, and whether a
-    // `.` makes it a member (`t.end`).
-    let mut words: Vec<(usize, usize, String, bool)> = Vec::new();
+    // Every word in code, in order: its range, upper-cased, whether a `.`
+    // makes it a member (`t.end`), and whether it starts a statement.
+    let mut words: Vec<(usize, usize, String, bool, bool)> = Vec::new();
+    // What the last token of code was: nothing yet, a word, or this byte.
+    let mut last: Option<Option<u8>> = None;
     let mut i = 0;
     while i < b.len() {
         if let Some(j) = skip_noncode(b, i, dialect) {
+            if !matches!(
+                crate::sql::noncode_kind(b, i, dialect),
+                Some(crate::sql::NonCode::Comment)
+            ) {
+                last = Some(Some(b'\''));
+            }
             i = j.max(i + 1);
             continue;
         }
@@ -517,9 +545,25 @@ fn block_words(text: &str, dialect: SqlDialect) -> Vec<BlockWord> {
                 j += 1;
             }
             let member = i > 0 && b[i - 1] == b'.';
-            words.push((i, j, text[i..j].to_ascii_uppercase(), member));
+            // At the start of a statement: the text's first, after a `;` or
+            // a label's `:`, or after a word a statement list follows.
+            let starts = match last {
+                None | Some(Some(b';' | b':')) => true,
+                Some(None) => words.last().is_some_and(|w| {
+                    matches!(
+                        w.2.as_str(),
+                        "BEGIN" | "THEN" | "ELSE" | "DO" | "LOOP" | "REPEAT"
+                    )
+                }),
+                Some(Some(_)) => false,
+            };
+            words.push((i, j, text[i..j].to_ascii_uppercase(), member, starts));
+            last = Some(None);
             i = j;
             continue;
+        }
+        if !b[i].is_ascii_whitespace() {
+            last = Some(Some(b[i]));
         }
         i += 1;
     }
@@ -543,12 +587,50 @@ fn block_words(text: &str, dialect: SqlDialect) -> Vec<BlockWord> {
         None
     };
     let word_after = |w: usize| words.get(w + 1).map(|n| n.2.as_str());
+    // Past the `)` that closes the `(` at `at`, if one does.
+    let past_parens = |at: usize| {
+        let mut depth = 0usize;
+        let mut k = at;
+        while k < b.len() {
+            if let Some(j) = skip_noncode(b, k, dialect) {
+                k = j.max(k + 1);
+                continue;
+            }
+            match b[k] {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(k + 1);
+                    }
+                }
+                _ => {}
+            }
+            k += 1;
+        }
+        None
+    };
+    let named_ends = names_its_block_ends(dialect);
     let opens = |w: usize| {
-        let (_, hi, up, member) = &words[w];
+        let (_, hi, up, member, starts) = &words[w];
         if *member {
             return false;
         }
         match up.as_str() {
+            // A compound statement, where its END names it. `IF (` is the
+            // statement when THEN follows the parens, else `IF()`.
+            "IF" if named_ends && *starts => match next_code(*hi) {
+                Some(k) if b[k] == b'(' => past_parens(k).is_some_and(|after| {
+                    words
+                        .iter()
+                        .find(|n| n.0 >= after)
+                        .is_some_and(|n| n.2 == "THEN")
+                }),
+                _ => true,
+            },
+            "LOOP" | "WHILE" | "REPEAT" | "FOR" => {
+                named_ends && *starts && next_code(*hi).is_none_or(|k| b[k] != b'(')
+            }
             // `END CASE` closes; it does not open another.
             "CASE" => w == 0 || words[w - 1].2 != "END" || words[w - 1].3,
             "BEGIN" => {
@@ -562,13 +644,16 @@ fn block_words(text: &str, dialect: SqlDialect) -> Vec<BlockWord> {
             _ => false,
         }
     };
+    // An `END IF` and its kin close the statement it names where that is
+    // tracked, and elsewhere a block this does not track.
     let closes = |w: usize| {
         words[w].2 == "END"
             && !words[w].3
-            && !matches!(
-                word_after(w),
-                Some("IF" | "LOOP" | "WHILE" | "REPEAT" | "FOR")
-            )
+            && (named_ends
+                || !matches!(
+                    word_after(w),
+                    Some("IF" | "LOOP" | "WHILE" | "REPEAT" | "FOR")
+                ))
     };
     (0..words.len())
         .map(|w| BlockWord {
@@ -1003,7 +1088,7 @@ mod tests {
         use SqlDialect::{MsSql, MySql};
         assert_eq!(blocks("BEGIN TRAN; COMMIT", 0, MsSql), None);
         assert_eq!(blocks("BEGIN; SELECT 1; COMMIT;", 0, MySql), None);
-        // `END IF` closes an `IF` this does not track, so `BEGIN`'s END is the last.
+        // `END IF` closes its own `IF`, so `BEGIN`'s END is the last.
         let sql = "BEGIN IF x THEN SET y = 1; END IF; END";
         assert_eq!(blocks(sql, 0, MySql).map(|b| b.3), sql.rfind("END"));
         assert_eq!(blocks("SELECT t.end FROM t", 10, MySql), None);
@@ -1011,6 +1096,65 @@ mod tests {
         assert_eq!(blocks("-- begin\nSELECT 1", 4, MySql), None);
         assert_eq!(blocks("SELECT 1", 3, MySql), None);
         assert_eq!(blocks("BEGIN SELECT 1", 0, MsSql), None, "unclosed");
+    }
+
+    /// MySQL's compound statements pair with their named `END`: `IF … END
+    /// IF`, `[label:] LOOP … END LOOP`, `WHILE … END WHILE`, `REPEAT … END
+    /// REPEAT` and MariaDB's `FOR … END FOR`, nested in each other and in a
+    /// `BEGIN`. The partner is the `END`.
+    #[test]
+    fn a_compound_statement_matches_its_named_end() {
+        use SqlDialect::MySql;
+        let sql = "BEGIN IF x THEN SET y = 1; END IF; END";
+        let end_if = sql.find("END IF").unwrap();
+        assert_eq!(blocks(sql, 6, MySql), Some(("IF", "END", 6, end_if)));
+        assert_eq!(blocks(sql, end_if, MySql), Some(("END", "IF", end_if, 6)));
+        for (sql, word) in [
+            ("l: LOOP SET i = i + 1; END LOOP l", "LOOP"),
+            ("WHILE i < 3 DO SET i = i + 1; END WHILE", "WHILE"),
+            ("REPEAT SET i = i + 1; UNTIL i > 3 END REPEAT", "REPEAT"),
+            ("FOR i IN 1..3 DO SELECT i; END FOR", "FOR"),
+            ("IF (a > b) THEN SELECT 1; END IF", "IF"),
+            ("WHILE a DO IF b THEN SELECT 1; END IF; END WHILE", "WHILE"),
+        ] {
+            let at = sql.find(word).unwrap();
+            assert_eq!(
+                blocks(sql, at, MySql).map(|b| b.3),
+                sql.rfind("END"),
+                "{sql}"
+            );
+        }
+    }
+
+    /// No compound statement: the `IF()` and `REPEAT()` functions, `IF [NOT]
+    /// EXISTS`, `FOR UPDATE`, a trigger's `FOR EACH ROW` — and on SQL Server an
+    /// `IF`, which has no `END` of its own.
+    #[test]
+    fn a_word_that_is_no_compound_statement_opens_nothing() {
+        use SqlDialect::{MsSql, MySql};
+        let sql = "BEGIN SELECT IF(a, 1, 2), REPEAT('x', 3); DROP TABLE IF EXISTS t; \
+                   CREATE TABLE IF NOT EXISTS u (a INT); SELECT * FROM t FOR UPDATE; END";
+        assert_eq!(blocks(sql, 0, MySql).map(|b| b.3), sql.rfind("END"));
+        let case = "SELECT CASE WHEN a THEN IF(b, 1, 2) END";
+        assert_eq!(blocks(case, 7, MySql).map(|b| b.3), case.rfind("END"));
+        let trig = "CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW BEGIN SET NEW.a = 1; END";
+        let begin = trig.find("BEGIN").unwrap();
+        assert_eq!(blocks(trig, begin, MySql).map(|b| b.3), trig.rfind("END"));
+        let tsql = "IF @a = 1 BEGIN SELECT 1; END";
+        assert_eq!(blocks(tsql, 0, MsSql), None);
+        let begin = tsql.find("BEGIN").unwrap();
+        assert_eq!(blocks(tsql, begin, MsSql).map(|b| b.3), tsql.rfind("END"));
+    }
+
+    /// The block an `END` typed inside an `IF` closes is the `IF`.
+    #[test]
+    fn an_open_compound_statement_encloses_what_follows() {
+        let sql = "BEGIN\n  IF x THEN\n    SET y = 1;\n    ";
+        let at_if = sql.find("IF").unwrap();
+        assert_eq!(
+            enclosing_block(sql, sql.len(), SqlDialect::MySql),
+            Some((at_if, at_if + 2, false))
+        );
     }
 
     #[test]
