@@ -325,6 +325,39 @@ fn noncode_span_at(b: &[u8], pos: usize, dialect: SqlDialect) -> Option<(usize, 
     None
 }
 
+/// How many brackets — `(` and `[`, in code — are open at the start of each
+/// line of `text`, one entry per line: the depth a per-line highlighter needs
+/// to colour a line's brackets by nesting (rainbow brackets). A stray close
+/// opens nothing below zero. Brackets in a string or comment are not counted,
+/// and nor is a SQL Server or SQLite `[name]`, which is a quoted name.
+pub fn bracket_depth_at_lines(text: &str, dialect: SqlDialect) -> Vec<usize> {
+    let b = text.as_bytes();
+    let mut out = vec![0];
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < b.len() {
+        if let Some(j) = skip_noncode(b, i, dialect) {
+            // A string or comment over several lines: each line it starts is
+            // at the depth outside it.
+            let j = j.max(i + 1).min(b.len());
+            out.extend(std::iter::repeat_n(
+                depth,
+                b[i..j].iter().filter(|&&c| c == b'\n').count(),
+            ));
+            i = j;
+            continue;
+        }
+        match b[i] {
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth = depth.saturating_sub(1),
+            b'\n' => out.push(depth),
+            _ => {}
+        }
+        i += 1;
+    }
+    out
+}
+
 /// Where Ctrl+Shift+\ puts the caret: on the same side of the matching paren
 /// as it was of the one beside it — before `(` goes before its `)`, after `)`
 /// goes after its `(` — so a second press comes back. `None` with no code paren
@@ -757,6 +790,26 @@ pub fn identifier_occurrences(
 mod tests {
     use super::*;
     use SqlDialect::{MsSql, MySql, Postgres, Sqlite};
+
+    /// The depth at each line's start counts the code brackets above it,
+    /// through strings and comments that span lines, never below zero; and a
+    /// `[name]` is a name where it is one.
+    #[test]
+    fn bracket_depth_is_counted_at_each_line_start() {
+        assert_eq!(bracket_depth_at_lines("", MySql), [0]);
+        assert_eq!(
+            bracket_depth_at_lines("SELECT f(a,\n  g(b,\n    c))\nFROM t", MySql),
+            [0, 1, 2, 0]
+        );
+        assert_eq!(
+            bracket_depth_at_lines("SELECT ('(\n', /* ( \n */ 1\n)", MySql),
+            [0, 1, 1, 1]
+        );
+        assert_eq!(bracket_depth_at_lines(")\n(\nx", MySql), [0, 0, 1]);
+        assert_eq!(bracket_depth_at_lines("SELECT a[1\n]", Postgres), [0, 1]);
+        assert_eq!(bracket_depth_at_lines("SELECT [a\nb]", MsSql), [0, 0]);
+        assert_eq!(bracket_depth_at_lines("SELECT [a\nb]", Sqlite), [0, 0]);
+    }
 
     // --- region_at ---------------------------------------------------------
 

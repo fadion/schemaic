@@ -1802,6 +1802,7 @@ pub(crate) fn theme_settings_overlay(
     let live_validate = layout.live_validate;
     let editor_predictions = layout.editor_predictions;
     let editor_remembered_predictions = layout.editor_remembered_predictions;
+    let rainbow_brackets = layout.rainbow_brackets;
     let restore_tabs = layout.restore_tabs;
     let open_config_dir = open_config_dir.clone();
 
@@ -1874,11 +1875,20 @@ pub(crate) fn theme_settings_overlay(
                 ring.clone(),
                 120,
             );
+            let rainbow_row = focusable_toggle_row(
+                "Rainbow brackets",
+                "Colour each pair of brackets by how deeply it is nested, so a closing \
+                 bracket can be matched to its opening one at a glance.",
+                rainbow_brackets,
+                ring.clone(),
+                130,
+            );
             let editor_group = v_stack((
                 settings_section_header("Editor"),
                 font_section,
                 predictions_row,
                 remembered_row,
+                rainbow_row,
             ))
             .style(|s| s.flex_col().gap(theme::scaled(16.0)));
 

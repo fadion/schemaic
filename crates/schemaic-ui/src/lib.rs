@@ -6057,6 +6057,9 @@ pub struct LayoutUi {
     pub soft_tabs: RwSignal<bool>,
     /// Editor word wrap; drives `theme::set_editor_word_wrap`.
     pub word_wrap: RwSignal<bool>,
+    /// Colour the editor's brackets by nesting; drives
+    /// `theme::set_editor_rainbow_brackets`. Persisted.
+    pub rainbow_brackets: RwSignal<bool>,
     /// Max rows fetched per query (results-grid cap).
     pub row_limit: RwSignal<usize>,
     /// Cancel a running statement after this many seconds; **`0` is off**, and

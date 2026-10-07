@@ -4,7 +4,7 @@
 //! hook: for each visible line we lex the text and add colored spans. The
 //! tokenizer is a lightweight per-line SQL lexer (keywords / strings / numbers
 //! / comments). It's deliberately behind this one function — a tree-sitter
-//! grammar could replace `lex_line` later without touching the editor wiring.
+//! grammar could replace `lex_line_with` later without touching the editor wiring.
 //!
 //! Multi-line `/* … */` block comments are the one thing a per-line lexer can't
 //! see, so `block_comment_lines` makes one forward pass over the document and
@@ -36,6 +36,8 @@ enum Tok {
     Comment,
     /// A variable (`@x`, `@@version`) or a `:name` placeholder.
     Variable,
+    /// A code bracket at this nesting depth, with rainbow brackets on.
+    Bracket(usize),
 }
 
 impl Tok {
@@ -49,6 +51,9 @@ impl Tok {
             Tok::Number => t.number,
             Tok::Comment => t.comment,
             Tok::Variable => t.variable,
+            // Three of the palette's own colours, in turn — the gold, orchid,
+            // blue round most editors give nested brackets.
+            Tok::Bracket(depth) => [t.type_, t.keyword, t.function][depth % 3],
         }
     }
 }
@@ -90,6 +95,10 @@ pub struct SqlStyling {
     /// One forward pass answers it for every line at once, so the cost is paid
     /// once per edit instead of ~45 times.
     block_lines: RefCell<Option<(BlockKey, Vec<bool>)>>,
+    /// Per-line bracket depth at the line's start, for rainbow brackets, with
+    /// the revision it was computed for — one pass per edit, as
+    /// `block_lines` is, and only while rainbow brackets are on.
+    bracket_lines: RefCell<Option<(BlockKey, Vec<usize>)>>,
 }
 
 /// What [`SqlStyling`]'s block-comment flags were computed for: the document
@@ -109,6 +118,7 @@ impl SqlStyling {
             zoom,
             preview,
             block_lines: RefCell::new(None),
+            bracket_lines: RefCell::new(None),
             // Explicit IBM Plex Mono (the bundled face) rather than the generic
             // `Monospace` — keeps the editor and the Ctrl+K diff on the exact
             // same family, not just both relying on the generic override.
@@ -146,6 +156,28 @@ impl SqlStyling {
         cache
             .as_ref()
             .is_some_and(|(_, flags)| flags.get(line).copied().unwrap_or(false))
+    }
+
+    /// How many brackets are open where `line` begins
+    /// (`pairs::bracket_depth_at_lines`), cached per revision as
+    /// [`starts_in_block`](Self::starts_in_block) is.
+    fn depth_at(&self, line: usize) -> usize {
+        let key = (
+            self.doc.cache_rev().get_untracked(),
+            self.dialect.get_untracked(),
+        );
+        let mut cache = self.bracket_lines.borrow_mut();
+        if cache.as_ref().map(|(k, _)| *k) != Some(key) {
+            let text = self.doc.text().to_string();
+            *cache = Some((
+                key,
+                schemaic_core::pairs::bracket_depth_at_lines(&text, key.1),
+            ));
+        }
+        cache
+            .as_ref()
+            .and_then(|(_, depths)| depths.get(line).copied())
+            .unwrap_or(0)
     }
 }
 
@@ -269,7 +301,7 @@ impl Styling for SqlStyling {
             None => c,
         };
         let faded = fade.is_some();
-        // Fade the whole line first — `lex_line` only colours the tokens it knows,
+        // Fade the whole line first — `lex_line_with` only colours the tokens it knows,
         // and an identifier left on the default colour would stay at full strength
         // in the middle of a faded row.
         if faded {
@@ -283,7 +315,8 @@ impl Styling for SqlStyling {
         // Does this line begin inside a `/* … */` opened on an earlier line?
         let start_in_block = self.starts_in_block(line);
         let dialect = self.dialect.get_untracked();
-        for (start, end, tok) in lex_line(&content, dialect, start_in_block) {
+        let brackets = crate::theme::editor_rainbow_brackets().then(|| self.depth_at(line));
+        for (start, end, tok) in lex_line_with(&content, dialect, start_in_block, brackets) {
             attrs.add_span(shift + start..shift + end, default.color(tint(tok.color())));
         }
     }
@@ -382,7 +415,7 @@ fn block_comment_lines(text: &str, dialect: SqlDialect) -> Vec<bool> {
     // A line starts inside a comment when its start offset falls *strictly*
     // inside a region: equal to the region's end means the `*/` closed it on the
     // previous line, and equal to its start means this line opens the comment
-    // itself (which `lex_line` handles on its own).
+    // itself (which `lex_line_with` handles on its own).
     let mut flags = vec![false];
     if regions.is_empty() {
         flags.resize(1 + b.iter().filter(|&&c| c == b'\n').count(), false);
@@ -410,7 +443,8 @@ fn block_comment_lines(text: &str, dialect: SqlDialect) -> Vec<bool> {
 pub fn highlight_spans(line: &str, dialect: SqlDialect) -> Vec<(usize, usize, Color)> {
     // Standalone line (Ctrl+K diff) — no document context, so no cross-line block
     // state; a multi-line comment there stays coloured per-line.
-    lex_line(line, dialect, false)
+    let brackets = crate::theme::editor_rainbow_brackets().then_some(0);
+    lex_line_with(line, dialect, false, brackets)
         .into_iter()
         .map(|(s, e, tok)| (s, e, tok.color()))
         .collect()
@@ -430,7 +464,17 @@ pub fn highlight_spans(line: &str, dialect: SqlDialect) -> Vec<(usize, usize, Co
 /// closing `*/` (or the whole line, if it doesn't close here) is coloured as a
 /// comment before normal lexing resumes. (A string spanning lines is still handled
 /// per-line — the rarer case the TODO didn't call for.)
-fn lex_line(line: &str, dialect: SqlDialect, start_in_block: bool) -> Vec<(usize, usize, Tok)> {
+///
+/// `brackets` is the depth the line starts at (`pairs::bracket_depth_at_lines`)
+/// with rainbow brackets on: each code bracket is then coloured by its nesting.
+/// `None` leaves brackets alone.
+fn lex_line_with(
+    line: &str,
+    dialect: SqlDialect,
+    start_in_block: bool,
+    brackets: Option<usize>,
+) -> Vec<(usize, usize, Tok)> {
+    let mut depth = brackets;
     let b = line.as_bytes();
     let n = b.len();
     let mut out = Vec::new();
@@ -565,6 +609,21 @@ fn lex_line(line: &str, dialect: SqlDialect, start_in_block: bool) -> Vec<(usize
             }
             i = j;
             continue;
+        }
+
+        // A code bracket, by its nesting: an opener at the depth it opens, a
+        // closer at its opener's.
+        if let Some(d) = depth.as_mut()
+            && matches!(c, b'(' | b'[' | b')' | b']')
+        {
+            let at = if matches!(c, b'(' | b'[') {
+                *d += 1;
+                *d - 1
+            } else {
+                *d = d.saturating_sub(1);
+                *d
+            };
+            out.push((i, i + 1, Tok::Bracket(at)));
         }
 
         i += 1;
@@ -712,6 +771,11 @@ fn is_keyword(w: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// [`lex_line_with`] with rainbow brackets off.
+    fn lex_line(line: &str, dialect: SqlDialect, start_in_block: bool) -> Vec<(usize, usize, Tok)> {
+        lex_line_with(line, dialect, start_in_block, None)
+    }
+
     /// The text of every span of one kind, on one dialect.
     ///
     /// **Every other test in this block is `SqlDialect::MySql`**, which is why
@@ -819,6 +883,38 @@ mod tests {
             .map(|&(s, e, _)| &"WHERE id = :id */ AND a = :b"[s..e])
             .collect();
         assert_eq!(vars, [":b"], "past a block comment's end only");
+    }
+
+    /// With rainbow brackets on, a code bracket is coloured by its nesting —
+    /// an opener by the depth it opens at, a closer by its opener's — starting
+    /// from the depth the line begins at; one in a string, comment or quoted
+    /// name is not a bracket. Off, no bracket is coloured.
+    #[test]
+    fn rainbow_brackets_are_coloured_by_depth() {
+        let depths = |line: &str, start: usize, d: SqlDialect| -> Vec<(String, usize)> {
+            lex_line_with(line, d, false, Some(start))
+                .into_iter()
+                .filter_map(|(s, e, t)| match t {
+                    Tok::Bracket(n) => Some((line[s..e].to_string(), n)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let pair = |s: &str, n: usize| (s.to_string(), n);
+        assert_eq!(
+            depths("f(a, g(b), '(') [x]", 0, SqlDialect::MsSql),
+            [pair("(", 0), pair("(", 1), pair(")", 1), pair(")", 0)]
+        );
+        assert_eq!(
+            depths("  c))", 2, SqlDialect::MySql),
+            [pair(")", 1), pair(")", 0)]
+        );
+        assert_eq!(depths(")", 0, SqlDialect::MySql), [pair(")", 0)]);
+        assert!(
+            lex_line_with("f(a)", SqlDialect::MySql, false, None)
+                .iter()
+                .all(|(_, _, t)| !matches!(t, Tok::Bracket(_)))
+        );
     }
 
     /// A number is coloured whole — exponent, hex — and a literal's prefix

@@ -12228,8 +12228,17 @@ existing prose was left alone.
     at an offset — an open compound statement included
     (`an_open_compound_statement_encloses_what_follows`) — reads the same `block_words`),
     `identifier_occurrences` (every whole-word, ASCII-case-insensitive occurrence of the identifier
-    under the caret — excludes keywords/numbers/strings, needs ≥2 to fire), and `region_at`
-    (`Code`/`Str`/`Comment` classification). Pure + unit-tested; dialect-aware, and its two "is a
+    under the caret — excludes keywords/numbers/strings, needs ≥2 to fire), `region_at`
+    (`Code`/`Str`/`Comment` classification), and `bracket_depth_at_lines` (how many code `(`/`[`
+    are open where each line starts, one entry per line — the depth the editor's rainbow brackets
+    start a line's lexing at, under `sql_highlight.rs`. A string or comment over several lines is
+    skipped whole by `skip_noncode`, so each line it starts is at the depth outside it; a stray close
+    never takes the depth below zero; and a SQL Server/SQLite `[name]` is a quoted name and counts
+    nothing — `bracket_depth_is_counted_at_each_line_start`. **It keeps one depth for both kinds**,
+    where `match_paren` pairs each only with its own, so on mismatched input such as `(a])` the
+    colours and the pair highlight can disagree; the depth only ever chooses a colour. It walks the
+    whole document, but once per edit from `SqlStyling`'s cache, not on the per-caret path below).
+    Pure + unit-tested; dialect-aware, and its two "is a
     backtick an identifier quote here" sites ask `SqlDialect::backtick_ident` (`pub(crate)` for
     them) rather than re-spelling `!= Postgres`, which is the capability rule one module over.
     **Three of those walk the document, and all three are on the editor's *undebounced*
@@ -24046,7 +24055,7 @@ existing prose was left alone.
     returns `None` for `Working` through `InlineView::plan()`.
     The colour is `sql_highlight`'s half of the same signal. `apply_attr_styles` fades a line the
     view says it fades — alpha on the token colours **plus a whole-line span**, or an identifier
-    `lex_line` doesn't colour would stay at full strength in the middle of a faded row — and shifts
+    `lex_line_with` doesn't colour would stay at full strength in the middle of a faded row — and shifts
     the line's spans by `Block::prefix_len()` for the one `before` case; Floem calls that hook
     with the line's *pre-phantom* columns and adds the phantom spans afterwards, so an end-of-line
     block (every block but that one) needs no adjustment at all. `apply_layout_styles` early-returns
@@ -24963,7 +24972,7 @@ existing prose was left alone.
     NaN for a NaN input (and panics on a NaN bound) and `serde_json` will hand over a NaN for a bare
     `nan` token.
     `sql_highlight.rs` decides nothing about *where* a token is — both halves of that are
-    `core::sql`'s, and both used to be re-derived here. `lex_line` asks `skip_noncode` for the span
+    `core::sql`'s, and both used to be re-derived here. `lex_line_with` asks `skip_noncode` for the span
     and `noncode_kind` for what the span **is**, instead of classifying it by its opening byte with
     no dialect (which greyed out every PostgreSQL dollar-quoted body as a comment — see `core/sql.rs`
     for the whole of that), and its word scan asks `sql::is_word_start`/`is_word_byte` rather than an
@@ -24989,6 +24998,25 @@ existing prose was left alone.
     there is the splitter's question, and here only a colour rides on it, so a mid-statement line
     opening `delimiter x` is coloured as one. A line that starts inside a block comment is never
     asked (`a_directive_line_is_coloured_as_a_keyword`).
+    **Rainbow brackets** (Settings → Editor, off by default — `UiState::editor_rainbow_brackets`,
+    `theme::editor_rainbow_brackets`) are the one colour that depends on lines other than its own.
+    `lex_line_with` takes the depth its line starts at, or `None` while the setting is off, which
+    leaves brackets uncoloured exactly as before; with a depth, each code `(`/`[`/`)`/`]` is a
+    `Tok::Bracket(depth)` — an opener the depth it opens at, a closer its opener's — painted in turn
+    from the editor theme's own `type_`, `keyword` and `function` (`[..][depth % 3]`) rather than a
+    palette of its own (`rainbow_brackets_are_coloured_by_depth`). The starting depths are
+    `pairs::bracket_depth_at_lines`, cached in `SqlStyling::bracket_lines` per document revision and
+    dialect (`depth_at`) beside `block_lines`, the starts-inside-a-block-comment flags, and for the
+    same reason: the styling hook runs per visible line on every relayout, and re-walking the
+    document before each line is the Θ(visible × document) cost `block_lines` was added to remove.
+    It is computed only while the setting is on. `set_editor_rainbow_brackets` bumps `editor_gen`,
+    which `SqlStyling::id()` folds into the layout cache key, so a flip re-colours lines already laid
+    out. `highlight_spans` has no document, so each standalone line of the Ctrl+K diff or a preview
+    starts at depth 0 and a bracket opened on an earlier line is unknown there; and since that puts
+    `type_` and `function` on previews, `contrast.rs`'s cross-axis preview test now holds both to
+    *Recessive* as well. Not covered: the lexer still treats a string continued from an earlier line
+    per line, as it always has, so a bracket inside that continuation is coloured as code — the depth
+    each later line starts at is unaffected, the cached count having skipped the string whole.
     `preview_bg`/`preview_fg` are the surface and base text of a **syntax-coloured preview**, and
     they are named here rather than spelled at each site so the cross-axis gate in `contrast.rs`
     measures the surface the previews actually paint — the account browser's `GRANT` block is the

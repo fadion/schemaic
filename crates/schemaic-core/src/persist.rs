@@ -333,6 +333,9 @@ pub struct UiState {
     /// Wrap long editor lines to the viewport width. Default: off (scroll).
     #[serde(default)]
     pub word_wrap: bool,
+    /// Colour the editor's brackets by their nesting. Default: off.
+    #[serde(default)]
+    pub editor_rainbow_brackets: bool,
     /// Reopen the previous session's query tabs on startup. Default: on.
     #[serde(default = "default_true")]
     pub restore_tabs: bool,
@@ -449,6 +452,7 @@ impl Default for UiState {
             tab_width: default_tab_width(),
             soft_tabs: true,
             word_wrap: false,
+            editor_rainbow_brackets: false,
             restore_tabs: true,
             live_validate: false,
             editor_predictions: true,
@@ -1850,6 +1854,22 @@ mod tests {
             .expect("parses");
         assert!(!back.editor_remembered_predictions);
         assert!(back.editor_predictions);
+    }
+
+    /// Rainbow brackets are off for a new install and a file written before
+    /// the setting existed, and an on stays on.
+    #[test]
+    fn rainbow_brackets_default_off_and_keep_an_on() {
+        assert!(!UiState::default().editor_rainbow_brackets);
+        let old: UiState = serde_json::from_str("{}").expect("parses");
+        assert!(!old.editor_rainbow_brackets);
+        let on = UiState {
+            editor_rainbow_brackets: true,
+            ..UiState::default()
+        };
+        let back: UiState =
+            serde_json::from_str(&serde_json::to_string(&on).expect("serialises")).expect("parses");
+        assert!(back.editor_rainbow_brackets);
     }
 
     /// **`#[serde(flatten)]` changes the deserializer's shape for the whole

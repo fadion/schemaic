@@ -950,6 +950,8 @@ struct ThemeState {
     editor_soft_tabs: RwSignal<bool>,
     // Whether long editor lines wrap to the viewport width vs scroll horizontally.
     editor_word_wrap: RwSignal<bool>,
+    // Whether the editor colours brackets by their nesting.
+    editor_rainbow_brackets: RwSignal<bool>,
     // How large the app's own chrome is drawn (`UiScale`). Read by every scaled
     // design token, so a change re-runs each style closure that uses one.
     ui_scale: RwSignal<UiScale>,
@@ -985,6 +987,7 @@ fn with_state<R>(f: impl FnOnce(&ThemeState) -> R) -> R {
                 editor_tab_width: scope.create_rw_signal(4usize),
                 editor_soft_tabs: scope.create_rw_signal(true),
                 editor_word_wrap: scope.create_rw_signal(false),
+                editor_rainbow_brackets: scope.create_rw_signal(false),
                 ui_scale: scope.create_rw_signal(UiScale::Normal),
                 ui_kind: scope.create_rw_signal(None),
                 editor_kind: scope.create_rw_signal(None),
@@ -1215,6 +1218,19 @@ pub fn editor_word_wrap() -> bool {
 pub fn set_editor_word_wrap(wrap: bool) {
     with_state(|st| {
         st.editor_word_wrap.set(wrap);
+        st.editor_gen.update(|g| *g += 1);
+    });
+}
+
+/// Whether the editor colours brackets by their nesting. Read by `SqlStyling`.
+pub fn editor_rainbow_brackets() -> bool {
+    with_state(|st| st.editor_rainbow_brackets.get())
+}
+
+/// Set rainbow brackets; bumps the generation so the editor re-colours.
+pub fn set_editor_rainbow_brackets(on: bool) {
+    with_state(|st| {
+        st.editor_rainbow_brackets.set(on);
         st.editor_gen.update(|g| *g += 1);
     });
 }
