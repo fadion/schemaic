@@ -895,7 +895,18 @@ existing prose was left alone.
     misses by construction and there is no write site to remember. Hosts the shared `SQL_KEYWORDS`/`FUNCTIONS`/
     `STMT_KEYWORDS` (the UI's completion + editor build on these); shared across engines, so
     completion offers a keyword only where `keyword_offered` says the engine takes it — the words
-    each lacks are `keywords_not_taken`, an exhaustive `match` (under `rank.rs`). Also
+    each lacks are `keywords_not_taken`, an exhaustive `match` (under `rank.rs`). **Past those
+    forty, `engine_keywords(dialect, flavour)` is what each engine has of its own** — the window
+    clauses and `INTERSECT`/`EXCEPT` on all four, then `TOP`, `APPLY` and `OUTPUT` on SQL Server,
+    `MERGE` there and on PostgreSQL, `RETURNING` on PostgreSQL, SQLite and MariaDB, and `LATERAL`
+    on PostgreSQL and MySQL. A MySQL-family server not yet asked (`ServerFlavour::Unknown`) is
+    offered both, as `offered_builtins` offers every builtin then: a row too many is a word the
+    server refuses, never a write. **It is deliberately not
+    folded into `SQL_KEYWORDS`**, because that list also answers `is_sql_keyword` — whether a word
+    can be a table's implicit alias — and `FROM t top` is `t` aliased `top`; a word added for the
+    popup would have stopped that resolving (`an_engine_keyword_is_still_an_alias`).
+    `static_words`, the typo checker's exemption set, chains both flavours' answer, lower-cased, so
+    nothing completion offers on an engine is squiggled there as a misspelling. Also
     `join_condition` (FK-aware
     `JOIN … ON` auto-fill), `db_error_diagnostic` (positions a live DB error within the statement),
     `parses` (Tier-2 gate), and `select_output_names` (a projection's column names *in order*, or
@@ -12854,7 +12865,17 @@ existing prose was left alone.
       Server, `AUTO_INCREMENT` anywhere but MySQL, `DESCRIBE` off it
       (`a_keyword_is_offered_only_on_an_engine_that_takes_it`). What each engine lacks is
       `intel`'s `keywords_not_taken`, an exhaustive `match`, so a fifth engine has to answer
-      rather than inherit MySQL's empty list.
+      rather than inherit MySQL's empty list. **Each engine's own keywords follow the shared
+      ones**: a `clause_keywords` closure chains `intel::engine_keywords(dialect, flavour)` onto
+      the filtered `SQL_KEYWORDS` at all three sites that offer it, in the same tier — 3 in
+      `Column`, 2 in `Other`, and 1 at `Start`, so `MERGE` begins a statement on PostgreSQL and
+      SQL Server (`each_engine_is_offered_its_own_keywords`). **A keyword can be crowded out of
+      PostgreSQL's column context entirely, and nothing here prevents it**: the sort is by tier
+      first, a builtin's tier (2) outranks every keyword's (3), and `parti` is a fuzzy match for
+      enough of the 863 offered builtins to fill `MAX_ROWS` before `PARTITION` is reached — which
+      is why that test leaves PostgreSQL out of its `PARTITION` assertion. It is a ranking
+      question rather than this list's, and older than it: the shared forty are exposed the same
+      way.
       **A keyword row is in the typed case**: `add` writes it through `intel::in_typed_case`, the
       inline predictions' rule — all lower typed, lower offered; anything else, and nothing typed,
       the conventional upper — so `sel` accepts `select` (`a_keyword_is_offered_in_the_typed_case`).

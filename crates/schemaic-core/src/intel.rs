@@ -3474,6 +3474,15 @@ fn static_words(dialect: SqlDialect) -> &'static std::collections::HashSet<Strin
             // `OUTPUT inserted.id` — one edit from `INSERT`.
             .chain(pseudo_tables(dialect).iter())
             .map(|k| k.to_ascii_lowercase())
+            // What completion offers is never a misspelling — either flavour's.
+            .chain(
+                engine_keywords(dialect, crate::schema::ServerFlavour::MariaDb)
+                    .chain(engine_keywords(
+                        dialect,
+                        crate::schema::ServerFlavour::MySql,
+                    ))
+                    .map(str::to_ascii_lowercase),
+            )
             .chain(
                 builtin_catalog(dialect)
                     .unwrap_or(&[])
@@ -3527,6 +3536,63 @@ fn keywords_not_taken(dialect: SqlDialect) -> &'static [&'static str] {
             "REPLACE",
         ],
     }
+}
+
+/// The keywords completion offers on this engine past the shared
+/// [`SQL_KEYWORDS`]: window clauses and set operators everywhere, then each
+/// engine's own — `TOP`, `APPLY` and `OUTPUT` on SQL Server, `RETURNING` where
+/// the engine has it (MariaDB, not MySQL), `LATERAL` on MySQL and PostgreSQL,
+/// `MERGE` on PostgreSQL and SQL Server. A MySQL-family server not yet asked
+/// is offered both of the family's — as `offered_builtins` offers everything
+/// then: a row too many is a word the server refuses, never a write.
+///
+/// **Kept out of `SQL_KEYWORDS`**, which also answers [`is_sql_keyword`] —
+/// whether a word can be a table's implicit alias. `FROM t top` is `t` aliased
+/// `top` on MySQL, and a completion list is no reason to stop it resolving.
+pub fn engine_keywords(
+    dialect: SqlDialect,
+    flavour: crate::schema::ServerFlavour,
+) -> impl Iterator<Item = &'static str> {
+    const SHARED: &[&str] = &[
+        "OVER",
+        "PARTITION",
+        "WINDOW",
+        "ROWS",
+        "RANGE",
+        "PRECEDING",
+        "FOLLOWING",
+        "UNBOUNDED",
+        "INTERSECT",
+        "EXCEPT",
+    ];
+    let own: &'static [&'static str] = match dialect {
+        SqlDialect::MySql => match flavour {
+            crate::schema::ServerFlavour::MariaDb => &["RECURSIVE", "DUPLICATE", "RETURNING"],
+            crate::schema::ServerFlavour::MySql => &["RECURSIVE", "DUPLICATE", "LATERAL"],
+            crate::schema::ServerFlavour::Unknown => {
+                &["RECURSIVE", "DUPLICATE", "LATERAL", "RETURNING"]
+            }
+        },
+        SqlDialect::Postgres => &[
+            "RECURSIVE",
+            "LATERAL",
+            "RETURNING",
+            "FILTER",
+            "ILIKE",
+            "CONFLICT",
+            "NOTHING",
+            "MERGE",
+            "MATCHED",
+            "FETCH",
+            "NEXT",
+            "ONLY",
+        ],
+        SqlDialect::Sqlite => &["RECURSIVE", "RETURNING", "FILTER", "CONFLICT", "NOTHING"],
+        SqlDialect::MsSql => &[
+            "TOP", "APPLY", "OUTPUT", "MERGE", "MATCHED", "FETCH", "NEXT", "ONLY",
+        ],
+    };
+    SHARED.iter().chain(own).copied()
 }
 
 /// Clause keywords that determine the completion context (see [`clause_context`]).

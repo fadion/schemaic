@@ -499,6 +499,11 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
             .copied()
             .filter(|k| crate::intel::keyword_offered(k, input.dialect))
     };
+    // …and this engine's own past them (`intel::engine_keywords`), in the same
+    // tier wherever the shared ones are offered.
+    let clause_keywords = || {
+        keywords(SQL_KEYWORDS).chain(crate::intel::engine_keywords(input.dialect, input.flavour))
+    };
 
     match ctx {
         ClauseCtx::Qualified(q) => {
@@ -630,7 +635,7 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
                     c.insert = Some(fun.name.to_string());
                 }
             }
-            for k in keywords(SQL_KEYWORDS) {
+            for k in clause_keywords() {
                 add(&mut cands, &mut seen, k, SuggestKind::Keyword, "", 3);
             }
         }
@@ -638,7 +643,7 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
             for k in keywords(STMT_KEYWORDS) {
                 add(&mut cands, &mut seen, k, SuggestKind::Keyword, "", 0);
             }
-            for k in keywords(SQL_KEYWORDS) {
+            for k in clause_keywords() {
                 add(&mut cands, &mut seen, k, SuggestKind::Keyword, "", 1);
             }
         }
@@ -652,7 +657,7 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
             for (name, db) in &schema.tables {
                 add(&mut cands, &mut seen, name, SuggestKind::Table, db, 1);
             }
-            for k in keywords(SQL_KEYWORDS) {
+            for k in clause_keywords() {
                 add(&mut cands, &mut seen, k, SuggestKind::Keyword, "", 2);
             }
         }
@@ -1109,6 +1114,63 @@ mod tests {
         assert!(!offers(&start(SqlDialect::Postgres, "desc"), "DESCRIBE"));
         assert!(offers(&start(SqlDialect::MsSql, "us"), "USE"));
         assert!(!offers(&start(SqlDialect::Sqlite, "trun"), "TRUNCATE"));
+    }
+
+    /// Past the forty shared words, each engine's own: window clauses and set
+    /// operators everywhere, `TOP` and `APPLY` on SQL Server alone, `RETURNING`
+    /// where the engine has it — MariaDB, not MySQL — and `LATERAL` where
+    /// MySQL and PostgreSQL take it.
+    #[test]
+    fn each_engine_is_offered_its_own_keywords() {
+        let s = shop();
+        let scope = [tref("orders", None)];
+        let col = |d, f, p| ranked_on_flavour(&s, d, f, ClauseCtx::Column, &scope, p);
+        let (my, maria, any) = (
+            ServerFlavour::MySql,
+            ServerFlavour::MariaDb,
+            ServerFlavour::Unknown,
+        );
+        for d in [
+            SqlDialect::MySql,
+            SqlDialect::Postgres,
+            SqlDialect::Sqlite,
+            SqlDialect::MsSql,
+        ] {
+            assert!(offers(&col(d, any, "ove"), "OVER"), "{d:?}");
+            assert!(offers(&col(d, any, "inters"), "INTERSECT"), "{d:?}");
+        }
+        // Not PostgreSQL: there `parti` fuzzy-matches enough builtins to fill
+        // the list, and a builtin's tier ranks above every keyword's — a
+        // ranking question, not this list's.
+        for d in [SqlDialect::MySql, SqlDialect::Sqlite, SqlDialect::MsSql] {
+            assert!(offers(&col(d, any, "parti"), "PARTITION"), "{d:?}");
+        }
+        assert!(offers(&col(SqlDialect::MsSql, any, "to"), "TOP"));
+        assert!(offers(&col(SqlDialect::MsSql, any, "app"), "APPLY"));
+        assert!(!offers(&col(SqlDialect::MySql, my, "app"), "APPLY"));
+        assert!(!offers(&col(SqlDialect::Postgres, any, "to"), "TOP"));
+        assert!(offers(&col(SqlDialect::Postgres, any, "retu"), "RETURNING"));
+        assert!(offers(&col(SqlDialect::Sqlite, any, "retu"), "RETURNING"));
+        assert!(offers(&col(SqlDialect::MySql, maria, "retu"), "RETURNING"));
+        assert!(!offers(&col(SqlDialect::MySql, my, "retu"), "RETURNING"));
+        // Not yet asked: both, as the builtins offer everything then.
+        assert!(offers(&col(SqlDialect::MySql, any, "retu"), "RETURNING"));
+        assert!(offers(&col(SqlDialect::MySql, any, "late"), "LATERAL"));
+        assert!(offers(&col(SqlDialect::MySql, my, "late"), "LATERAL"));
+        assert!(!offers(&col(SqlDialect::MySql, maria, "late"), "LATERAL"));
+        assert!(!offers(&col(SqlDialect::MsSql, any, "late"), "LATERAL"));
+        // `MERGE` begins a statement where the engine has one.
+        let start = |d, p| ranked_on(&s, d, ClauseCtx::Start, &[], p);
+        assert!(offers(&start(SqlDialect::MsSql, "mer"), "MERGE"));
+        assert!(!offers(&start(SqlDialect::Sqlite, "mer"), "MERGE"));
+    }
+
+    /// The engine's own keywords complete a row; they do not make a word an
+    /// unaliasable keyword — `FROM t top` is still `t` aliased `top`.
+    #[test]
+    fn an_engine_keyword_is_still_an_alias() {
+        assert!(!crate::intel::is_sql_keyword("top"));
+        assert!(!crate::intel::is_sql_keyword("over"));
     }
 
     /// Does the ranked list offer this name, however either side spells its case?
