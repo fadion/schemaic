@@ -805,6 +805,9 @@ pub fn soft_tab_indent(full: &str, sel_a: usize, sel_b: usize, tw: usize) -> Ind
 ///   the matching closer follows the caret (`(|)`), the closer moves to a line
 ///   of its own at the old indent, the caret on the deeper line between them.
 ///   A bracket in a string or comment opens nothing.
+/// - **After a block-opening word** — `BEGIN`, `CASE`, `THEN`, `ELSE`,
+///   `LOOP`, `DO`, `REPEAT` ([`opens_block`]) — the same, with an `END`
+///   following the caret in the closer's place.
 /// - At the end of a line whose next line is deeper, it takes that line's
 ///   indent — the way floem's own Enter answered, kept so a list being
 ///   extended stays in step.
@@ -864,6 +867,19 @@ pub fn newline_indent(
         let caret = inner.len();
         return edit(inner, caret);
     }
+    // A block-opening word ends the line: one level deeper, and its `END`, if
+    // it follows the caret, to a line of its own — the bracket's answer.
+    if opens_block(before, |at| in_code(ls + at)) {
+        let inner = format!("\n{base}{unit}");
+        let caret = inner.len();
+        let end_follows = rest.get(..3).is_some_and(|w| w.eq_ignore_ascii_case("END"))
+            && rest.as_bytes().get(3).is_none_or(|&c| !is_word_byte(c));
+        return if end_follows {
+            edit(format!("{inner}\n{base}"), caret)
+        } else {
+            edit(inner, caret)
+        };
+    }
     // At a line's end, a deeper next line lends its indent (floem's answer).
     if rest.is_empty() && line_end < len {
         let next = indent_of(line_end + 1);
@@ -874,6 +890,37 @@ pub fn newline_indent(
     let text = format!("\n{base}");
     let caret = text.len();
     edit(text, caret)
+}
+
+/// Does `before` — a line up to the caret, trailing blanks off — end with a
+/// word that opens a block: `BEGIN` (T-SQL's `BEGIN TRY`/`BEGIN CATCH` too),
+/// `CASE`, `THEN`, `ELSE`, `LOOP`, `DO`, `REPEAT`? A bare word in code
+/// (`in_code`, asked of an offset into `before`), not a member (`t.begin`),
+/// a variable or a quoted name. `BEGIN TRAN` is a transaction, and its last
+/// word is not one of these.
+fn opens_block(before: &str, in_code: impl Fn(usize) -> bool) -> bool {
+    let last_word = |s: &str| {
+        let at = s
+            .bytes()
+            .rposition(|c| !is_word_byte(c))
+            .map_or(0, |i| i + 1);
+        (at < s.len()).then_some(at)
+    };
+    let Some(at) = last_word(before) else {
+        return false;
+    };
+    if at > 0 && matches!(before.as_bytes()[at - 1], b'.' | b'@' | b'$' | b'#') || !in_code(at) {
+        return false;
+    }
+    let word = before[at..].to_ascii_uppercase();
+    match word.as_str() {
+        "BEGIN" | "CASE" | "THEN" | "ELSE" | "LOOP" | "DO" | "REPEAT" => true,
+        "TRY" | "CATCH" => {
+            let prev = before[..at].trim_end_matches([' ', '\t']);
+            last_word(prev).is_some_and(|p| prev[p..].eq_ignore_ascii_case("BEGIN"))
+        }
+        _ => false,
+    }
 }
 
 /// [`soft_tab_indent`] with **hard tabs**: a bare caret inserts one `\t`, a
@@ -1774,6 +1821,52 @@ mod tests {
         assert_eq!(enter("f(|  )", "\t", MySql), "f(\n\t|\n  )");
         // A closer of the other kind is not the pair's.
         assert_eq!(enter("f(|]", "  ", MySql), "f(\n  |]");
+    }
+
+    /// A word that opens a block opens a level, as a bracket does: `BEGIN`
+    /// (and T-SQL's `BEGIN TRY`/`BEGIN CATCH`), `CASE`, `THEN`, `ELSE`,
+    /// `LOOP`, `DO`, `REPEAT`. With its `END` straight after the caret the
+    /// `END` goes to a line of its own at the old indent.
+    #[test]
+    fn enter_after_a_block_opening_word_goes_one_unit_deeper() {
+        use SqlDialect::{MsSql, MySql, Postgres};
+        assert_eq!(enter("  BEGIN|", "  ", MsSql), "  BEGIN\n    |");
+        assert_eq!(enter("begin  |", "\t", MySql), "begin  \n\t|");
+        assert_eq!(enter("BEGIN TRY|", "  ", MsSql), "BEGIN TRY\n  |");
+        assert_eq!(enter("  BEGIN CATCH|", "  ", MsSql), "  BEGIN CATCH\n    |");
+        assert_eq!(enter("SELECT CASE|", "  ", MySql), "SELECT CASE\n  |");
+        assert_eq!(
+            enter("  IF x > 1 THEN|", "  ", MySql),
+            "  IF x > 1 THEN\n    |"
+        );
+        assert_eq!(enter("  ELSE|", "  ", Postgres), "  ELSE\n    |");
+        assert_eq!(enter("LOOP|", "  ", Postgres), "LOOP\n  |");
+        assert_eq!(enter("WHILE i < 3 DO|", "  ", MySql), "WHILE i < 3 DO\n  |");
+        assert_eq!(enter("REPEAT|", "  ", MySql), "REPEAT\n  |");
+        // Its END after the caret takes a line of its own.
+        assert_eq!(enter("  BEGIN|END", "  ", MsSql), "  BEGIN\n    |\n  END");
+        // The blanks before it stay with it, as they do before a bracket.
+        assert_eq!(enter("CASE| END", "  ", MySql), "CASE\n  |\n END");
+        // What follows the word is the block's body, and goes in with it.
+        assert_eq!(enter("BEGIN| x", "  ", MsSql), "BEGIN\n  | x");
+        assert_eq!(
+            enter("BEGIN TRY|END TRY", "  ", MsSql),
+            "BEGIN TRY\n  |\nEND TRY"
+        );
+    }
+
+    /// Not a block: the word is part of a name, in a comment or string, or a
+    /// transaction (`BEGIN TRAN`, `BEGIN;`).
+    #[test]
+    fn enter_after_a_word_that_opens_no_block_adds_nothing() {
+        use SqlDialect::{MsSql, MySql};
+        assert_eq!(enter("SELECT t.begin|", "  ", MySql), "SELECT t.begin\n|");
+        assert_eq!(enter("SELECT my_case|", "  ", MySql), "SELECT my_case\n|");
+        assert_eq!(enter("  -- BEGIN|", "  ", MySql), "  -- BEGIN\n  |");
+        assert_eq!(enter("SELECT 'then|", "  ", MySql), "SELECT 'then\n|");
+        assert_eq!(enter("BEGIN TRAN|", "  ", MsSql), "BEGIN TRAN\n|");
+        assert_eq!(enter("BEGIN;|", "  ", MySql), "BEGIN;\n|");
+        assert_eq!(enter("SELECT `case`|", "  ", MySql), "SELECT `case`\n|");
     }
 
     #[test]

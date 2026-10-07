@@ -11896,7 +11896,14 @@ existing prose was left alone.
     indent. At a line's end a deeper next line still lends its indent, floem's rule kept, and a CRLF
     line's `\r` counts as its end. **The bracket is asked about at the byte *before* it**: one byte
     later, `pairs::region_at` reads a `(` ending a `--` comment as code, at the comment's end
-    (`enter_after_a_bracket_in_a_string_or_comment_adds_nothing`). The pane takes Enter with no
+    (`enter_after_a_bracket_in_a_string_or_comment_adds_nothing`). **A block-opening word is a
+    bracket too** (`opens_block`): a line ending, before the caret, in `BEGIN` (T-SQL's `BEGIN
+    TRY`/`BEGIN CATCH` too), `CASE`, `THEN`, `ELSE`, `LOOP`, `DO` or `REPEAT` gets the deeper
+    line, and an `END` straight after the caret the closer's own line. The word must be bare and in
+    code — not `t.begin`, `@case`, a quoted `` `case` `` or one in a comment — and `BEGIN TRAN`/
+    `BEGIN;` end in another word or a `;`, so a transaction opens nothing
+    (`enter_after_a_block_opening_word_goes_one_unit_deeper`,
+    `enter_after_a_word_that_opens_no_block_adds_nothing`). The pane takes Enter with no
     primary modifier or Alt, after the completion and Ctrl+K arms — so a word typed in full now
     reaches it — and leaves several carets to floem's Enter, which handles each one.
     **`cut_lines` is Ctrl+X on
