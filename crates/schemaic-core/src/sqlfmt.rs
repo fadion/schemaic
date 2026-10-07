@@ -1096,8 +1096,8 @@ impl<'a> Fmt<'a> {
 
     /// Does the `END` at `toks[k]` close the innermost body? A bare `END` (or
     /// T-SQL's `END TRY`/`CATCH`) closes a `BEGIN`; an `END IF` and its kin
-    /// the statement they name; an `END CASE` a `CASE` statement, which is no
-    /// body here.
+    /// the statement they name; an `END CASE` a `CASE` statement — from inside
+    /// its last branch's body, or from a `CASE` with none.
     fn closes_block(&self, toks: &[(Kind, &str)], k: usize) -> bool {
         let Some(&top) = self.blocks.last() else {
             return false;
@@ -1111,6 +1111,8 @@ impl<'a> Fmt<'a> {
         match named {
             None => top == "BEGIN",
             Some("REPEAT") => top == "UNTIL",
+            // From inside its last branch's body, or a `CASE` with none.
+            Some("CASE") => top == "WHEN" || top == "CASE",
             Some(n) => top == n,
         }
     }
@@ -1465,6 +1467,37 @@ impl<'a> Fmt<'a> {
                         self.content = level + 1;
                         self.break_to(level);
                         self.emit(Kind::Word, text, false);
+                    } else if self.named_ends
+                        && !in_expr
+                        && up == "CASE"
+                        && self.at_statement_start()
+                    {
+                        // A `CASE` statement: its operand stays on the line,
+                        // and its branches open bodies as an `IF`'s do.
+                        self.emit(Kind::Word, text, false);
+                        self.blocks.push("CASE");
+                        self.content = self.blocks.len();
+                    } else if !in_expr
+                        && self.case_here().is_none()
+                        && matches!(self.blocks.last(), Some(&("CASE" | "WHEN")))
+                        && (up == "WHEN" || up == "ELSE")
+                    {
+                        // A `CASE` statement's next branch, one level in from
+                        // the `CASE`; its statements one further.
+                        if self.blocks.last() == Some(&"WHEN") {
+                            self.blocks.pop();
+                        }
+                        let level = self.blocks.len();
+                        self.base = level;
+                        self.content = level;
+                        self.break_to(level);
+                        self.emit(Kind::Word, text, false);
+                        if up == "ELSE" {
+                            self.open_block("WHEN");
+                        } else {
+                            self.awaiting = Some(("THEN", "WHEN"));
+                            self.content = level + 1;
+                        }
                     } else if called {
                         self.emit(Kind::Word, text, false);
                     } else if up == "CASE" && self.prev_word_upper().as_deref() != Some("END") {
@@ -1504,7 +1537,12 @@ impl<'a> Fmt<'a> {
                     } else if up == "END" && !in_expr && self.closes_block(toks, k) {
                         // Back to the opener's level — on the `UNTIL`'s line
                         // for an `END REPEAT`.
-                        let until = self.blocks.pop() == Some("UNTIL");
+                        let popped = self.blocks.pop();
+                        // An `END CASE` closes its last branch and the `CASE`.
+                        if popped == Some("WHEN") {
+                            self.blocks.pop();
+                        }
+                        let until = popped == Some("UNTIL");
                         let level = self.blocks.len();
                         self.base = level;
                         self.content = level;
@@ -2102,6 +2140,31 @@ mod tests {
         // T-SQL's IF has no END IF and opens nothing.
         let ms = super::format_sql("if @a = 1 select 1; select 2;", IND, SqlDialect::MsSql);
         assert!(ms.contains("\n\nselect\n  2;"), "{ms}");
+    }
+
+    /// A MySQL `CASE` **statement** lays its branches out as `IF` does: each
+    /// `WHEN … THEN` and the `ELSE` one level in, their statements one more,
+    /// and `END CASE` back at the `CASE`. The `;` ending a branch's statement
+    /// used to clear the frame, and every branch came out flat.
+    #[test]
+    fn a_case_statement_lays_out_its_branches() {
+        let my = |s: &str| super::format_sql(s, IND, SqlDialect::MySql);
+        let routine = "begin case x when 1 then set y = 1; when 2 then select 2; \
+             else set y = 3; end case; select 4; end";
+        assert_eq!(
+            my(routine),
+            "begin\n  case x\n    when 1 then\n      set\n        y = 1;\n    when 2 then\n      \
+             select\n        2;\n    else\n      set\n        y = 3;\n  end case;\n  select\n    \
+             4;\nend"
+        );
+        assert_eq!(my(&my(routine)), my(routine), "idempotent");
+        // A searched CASE, and a CASE expression inside a branch, are as before.
+        let searched = my("case when a > 1 then select case when b then 1 else 2 end; end case;");
+        assert_eq!(
+            searched,
+            "case\n  when a > 1 then\n    select\n      case\n        when b then 1\n        else 2\n      \
+             end;\nend case;"
+        );
     }
 
     /// T-SQL's `TOP (n)` keeps its space, and a write's `OUTPUT` clause takes

@@ -12240,7 +12240,8 @@ existing prose was left alone.
     `ELSE` one level under the line the `CASE` opened on, `END` back at that line's level, so
     nested ones nest. A frame belongs to the paren depth it opened at, so only its own
     `WHEN`/`ELSE`/`END` are its; one opened inside a function's parens stays inline; and a routine's
-    `END CASE` closes a frame rather than opening one (`a_case_lays_out_its_branches`). `WITH
+    `END CASE` closes a frame rather than opening one — on MySQL, where the statement is a body
+    instead (below), it closes that (`a_case_lays_out_its_branches`). `WITH
     RECURSIVE` keeps its word on the head's line (`head_followers`), `WINDOW` is a clause head, and
     MySQL's `LIMIT offset, count` keeps its comma inline — `limit_depth` holds the paren depth the
     `LIMIT` opened at, so a comma after a subquery's `LIMIT` breaks as the list's again
@@ -12264,10 +12265,21 @@ existing prose was left alone.
     the word that ends it — `THEN`, `DO` — which opens the body (`open_block`); `LOOP` and
     `REPEAT` open theirs at once. An `ELSEIF`/`ELSE` goes back to its `IF`'s level and reopens;
     `UNTIL` goes back to its `REPEAT`'s, and the `END REPEAT` after it stays on its line
-    (`until i > 5 end repeat;`). Which `END` closes which body is `closes_block`: a bare `END`
-    (or `END TRY`/`CATCH`) a `BEGIN`, an `END IF`/`LOOP`/`WHILE`/`FOR` its own kind, `END REPEAT`
-    the `UNTIL`, and an `END CASE` nothing — before, an `END CASE` whose `CASE` frame a `;` had
-    already cleared popped the enclosing `BEGIN`. `IF (…)` is the statement only when `THEN`
+    (`until i > 5 end repeat;`). **A `CASE` statement is laid out as an `IF` is**, not through
+    `cases`: a `CASE` at a statement start, outside an expression, pushes `"CASE"` onto `blocks`
+    without breaking the line, so its operand stays on it (`case x`). A `WHEN` or `ELSE` with no
+    expression `CASE` open here (`case_here`) while `blocks` ends in `"CASE"` or `"WHEN"` pops the
+    previous branch's `"WHEN"` and is written one level in from the `CASE`; a `WHEN` awaits its
+    `THEN`, which opens a `"WHEN"` body, and an `ELSE` opens one at once — so each branch's
+    statements sit one level further in. Through a `CaseFrame` the branches came out flat at the
+    enclosing body's level, since the `;` ending a branch's first statement cleared the frame. A
+    `CASE` *expression* — anywhere else, a branch's own statements included — still takes the
+    `cases` path (`a_case_statement_lays_out_its_branches`, a searched `CASE` holding a `CASE`
+    expression among its shapes, and idempotent). Which `END` closes which body is
+    `closes_block`: a bare `END` (or `END TRY`/`CATCH`) a `BEGIN`, an `END IF`/`LOOP`/`WHILE`/`FOR`
+    its own kind, `END REPEAT` the `UNTIL`, and an `END CASE` a top of `"WHEN"` (its last branch)
+    or `"CASE"` (none) — popping the `"WHEN"` and then the `"CASE"` beneath it, back at the
+    `CASE`'s level. `IF (…)` is the statement only when `THEN`
     follows the parens (`if_statement`), so `IF(a, 1, 2)` stays a call, and the statement's
     `IF (a > 1) THEN` keeps its space. A label's colon is written tight before
     `BEGIN`/`LOOP`/`WHILE`/`REPEAT`/`FOR` on every engine — it came out `l : loop`. Where
