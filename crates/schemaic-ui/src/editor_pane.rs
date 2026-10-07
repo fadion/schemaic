@@ -463,7 +463,14 @@ fn format_editor(ed: &Editor, comp: Completion, dialect: SqlDialect) {
     let unit = indent_unit();
     // `format_range`, not `format_sql`: a selection's outer whitespace is the
     // document's, and trimmed it fused the fragment with its neighbours.
-    let formatted = schemaic_core::sqlfmt::format_range(&full, start, end, &unit, dialect);
+    let formatted = schemaic_core::sqlfmt::format_range(
+        &full,
+        start,
+        end,
+        &unit,
+        dialect,
+        theme::format_keyword_case(),
+    );
     if formatted == full[start..end] {
         return;
     }
@@ -3949,9 +3956,13 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             let sql = ed_fmt_req.doc().text().to_string();
             match req {
                 FormatReq::Code => None,
-                FormatReq::Statement => {
-                    schemaic_core::sqlfmt::format_statement(&sql, caret, &indent_unit(), dia)
-                }
+                FormatReq::Statement => schemaic_core::sqlfmt::format_statement(
+                    &sql,
+                    caret,
+                    &indent_unit(),
+                    dia,
+                    theme::format_keyword_case(),
+                ),
                 FormatReq::SingleLine => {
                     let sel = cursor.get_selection().unwrap_or((caret, caret));
                     schemaic_core::sqlfmt::single_line_in_place(&sql, sel, caret, dia)
@@ -4410,6 +4421,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                         menu_offset.get_untracked(),
                         &indent_unit(),
                         dialect.get_untracked(),
+                        theme::format_keyword_case(),
                     )
                 })
             };

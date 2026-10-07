@@ -1803,6 +1803,7 @@ pub(crate) fn theme_settings_overlay(
     let editor_predictions = layout.editor_predictions;
     let editor_remembered_predictions = layout.editor_remembered_predictions;
     let rainbow_brackets = layout.rainbow_brackets;
+    let keyword_case = layout.keyword_case;
     let show_whitespace = layout.show_whitespace;
     let indent_guides = layout.indent_guides;
     let restore_tabs = layout.restore_tabs;
@@ -1899,6 +1900,22 @@ pub(crate) fn theme_settings_overlay(
                 ring.clone(),
                 150,
             );
+            let case_dd = focusable_dropdown(
+                keyword_case,
+                schemaic_core::sqlfmt::KeywordCase::ALL,
+                schemaic_core::sqlfmt::KeywordCase::label,
+                ring.clone(),
+                160,
+            );
+            let case_section = v_stack((
+                settings_group_label("Keyword case when formatting"),
+                case_dd,
+                form_hint(
+                    "How Format Code writes keywords such as SELECT and FROM. Names, \
+                     strings and comments keep their case.",
+                ),
+            ))
+            .style(ctrl);
             let editor_group = v_stack((
                 settings_section_header("Editor"),
                 font_section,
@@ -1907,6 +1924,7 @@ pub(crate) fn theme_settings_overlay(
                 rainbow_row,
                 whitespace_row,
                 guides_row,
+                case_section,
             ))
             .style(|s| s.flex_col().gap(theme::scaled(16.0)));
 

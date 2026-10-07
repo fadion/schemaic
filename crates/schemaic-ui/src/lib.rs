@@ -6060,6 +6060,9 @@ pub struct LayoutUi {
     /// Colour the editor's brackets by nesting; drives
     /// `theme::set_editor_rainbow_brackets`. Persisted.
     pub rainbow_brackets: RwSignal<bool>,
+    /// How Format Code cases keywords; drives
+    /// `theme::set_format_keyword_case`. Persisted.
+    pub keyword_case: RwSignal<schemaic_core::sqlfmt::KeywordCase>,
     /// Draw whitespace as marks in the editor; drives
     /// `theme::set_editor_show_whitespace`. Persisted.
     pub show_whitespace: RwSignal<bool>,

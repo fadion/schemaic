@@ -952,6 +952,8 @@ struct ThemeState {
     editor_word_wrap: RwSignal<bool>,
     // Whether the editor colours brackets by their nesting.
     editor_rainbow_brackets: RwSignal<bool>,
+    // How Format Code cases keywords.
+    format_keyword_case: RwSignal<schemaic_core::sqlfmt::KeywordCase>,
     // Whether the editor draws whitespace marks, and indent guides.
     editor_show_whitespace: RwSignal<bool>,
     editor_indent_guides: RwSignal<bool>,
@@ -991,6 +993,8 @@ fn with_state<R>(f: impl FnOnce(&ThemeState) -> R) -> R {
                 editor_soft_tabs: scope.create_rw_signal(true),
                 editor_word_wrap: scope.create_rw_signal(false),
                 editor_rainbow_brackets: scope.create_rw_signal(false),
+                format_keyword_case: scope
+                    .create_rw_signal(schemaic_core::sqlfmt::KeywordCase::Keep),
                 editor_show_whitespace: scope.create_rw_signal(false),
                 editor_indent_guides: scope.create_rw_signal(false),
                 ui_scale: scope.create_rw_signal(UiScale::Normal),
@@ -1238,6 +1242,16 @@ pub fn set_editor_rainbow_brackets(on: bool) {
         st.editor_rainbow_brackets.set(on);
         st.editor_gen.update(|g| *g += 1);
     });
+}
+
+/// How Format Code cases keywords. Read when it runs, so nothing repaints.
+pub fn format_keyword_case() -> schemaic_core::sqlfmt::KeywordCase {
+    with_state(|st| st.format_keyword_case.get_untracked())
+}
+
+/// Set how Format Code cases keywords.
+pub fn set_format_keyword_case(case: schemaic_core::sqlfmt::KeywordCase) {
+    with_state(|st| st.format_keyword_case.set(case));
 }
 
 /// Whether the editor draws spaces and tabs as marks. Read by `editor_style`.

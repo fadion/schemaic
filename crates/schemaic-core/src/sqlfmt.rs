@@ -1,6 +1,7 @@
 //! Pure SQL pretty-printer: re-flow whitespace, indentation, and line breaks
-//! **without changing any token's text** — keyword case is preserved exactly as
-//! typed. Built on the same boundary lexer as the rest of [`crate::sql`]
+//! **without changing any token's text** — except keyword case when the
+//! user's setting asks [`apply_keyword_case`] for upper or lower case; the
+//! default keeps it exactly as typed. Built on the same boundary lexer as the rest of [`crate::sql`]
 //! (`skip_noncode`), so string literals, `--` / `#` line comments, `/* … */`
 //! block comments, and backtick identifiers all tokenize on the same boundaries
 //! and are emitted verbatim (a `;` or keyword hidden inside one never affects
@@ -77,6 +78,90 @@ pub fn format_sql(sql: &str, indent_unit: &str, dialect: SqlDialect) -> String {
     }
 }
 
+/// How Format Code cases keywords — Settings → Editor. `Keep`, the default,
+/// is the formatter as it always was: no token's text changes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KeywordCase {
+    #[default]
+    Keep,
+    Upper,
+    Lower,
+}
+
+impl KeywordCase {
+    /// Every choice, in the order Settings lists them.
+    pub const ALL: [KeywordCase; 3] = [KeywordCase::Keep, KeywordCase::Upper, KeywordCase::Lower];
+
+    /// The setting's label.
+    pub fn label(self) -> &'static str {
+        match self {
+            KeywordCase::Keep => "As typed",
+            KeywordCase::Upper => "Upper case",
+            KeywordCase::Lower => "Lower case",
+        }
+    }
+}
+
+/// Read leniently: a word this version does not know is `Keep`, so a setting
+/// a later version wrote never fails the settings file it sits in.
+impl<'de> serde::Deserialize<'de> for KeywordCase {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let word = String::deserialize(d)?;
+        Ok(match word.as_str() {
+            "upper" => KeywordCase::Upper,
+            "lower" => KeywordCase::Lower,
+            _ => KeywordCase::Keep,
+        })
+    }
+}
+
+/// `sql` with its keywords in `case` — applied over Format Code's output.
+///
+/// **A keyword is a word every server of the dialect reserves**
+/// ([`crate::intel::is_reserved_word_on`] with the flavour not known), which
+/// can never be an unquoted name, **or one this formatter lays out as a
+/// keyword** ([`is_keyword`]: clause heads, joins, `BY`, `AND`…), which it
+/// already reads as one wherever it stands — PostgreSQL reserves neither `BY`
+/// nor `INSERT`, and `ORDER by` is what the reserved list alone wrote. No
+/// wider: a general keyword list would recase names, and an unquoted table
+/// called `status` is case-sensitive on a MySQL server on Linux. For the same
+/// reason a word beside a `.` is left alone: MySQL takes a reserved word as a
+/// qualified name (`shop.order`). Strings, comments and quoted names are
+/// tokens of their own and never words. ASCII case only, so every byte stays
+/// where it was and a caret mapped over the formatted text still lands.
+pub fn apply_keyword_case(sql: &str, dialect: SqlDialect, case: KeywordCase) -> String {
+    if case == KeywordCase::Keep {
+        return sql.to_string();
+    }
+    let toks = tokenize(sql, dialect);
+    let base = sql.as_ptr() as usize;
+    let mut out = sql.to_string();
+    let dot = |t: Option<&(Kind, &str)>| matches!(t, Some((Kind::Punct, ".")));
+    for (i, (kind, text)) in toks.iter().enumerate() {
+        if *kind != Kind::Word
+            || dot(i.checked_sub(1).and_then(|p| toks.get(p)))
+            || dot(toks.get(i + 1))
+            || !(is_keyword(text)
+                || crate::intel::is_reserved_word_on(
+                    text,
+                    dialect,
+                    crate::schema::ServerFlavour::Unknown,
+                ))
+        {
+            continue;
+        }
+        let at = text.as_ptr() as usize - base;
+        let recased = match case {
+            KeywordCase::Upper => text.to_ascii_uppercase(),
+            KeywordCase::Lower => text.to_ascii_lowercase(),
+            KeywordCase::Keep => continue,
+        };
+        out.replace_range(at..at + text.len(), &recased);
+    }
+    out
+}
+
 /// The text Format Code writes over `full[lo..hi]` — [`format_sql`]'s, with
 /// the range's own leading and trailing whitespace put back unless the range
 /// is the whole document.
@@ -92,9 +177,11 @@ pub fn format_range(
     hi: usize,
     indent_unit: &str,
     dialect: SqlDialect,
+    case: KeywordCase,
 ) -> String {
+    let cased = |s: String| apply_keyword_case(&s, dialect, case);
     if lo == 0 && hi == full.len() {
-        return format_sql(full, indent_unit, dialect);
+        return cased(format_sql(full, indent_unit, dialect));
     }
     let frag = &full[lo..hi];
     let body = frag.trim();
@@ -103,7 +190,10 @@ pub fn format_range(
     }
     let lead = &frag[..frag.len() - frag.trim_start().len()];
     let trail = &frag[frag.trim_end().len()..];
-    format!("{lead}{}{trail}", format_sql(body, indent_unit, dialect))
+    format!(
+        "{lead}{}{trail}",
+        cased(format_sql(body, indent_unit, dialect))
+    )
 }
 
 /// `sql` on one line, for the editor's *Copy as single line*: every run of
@@ -248,12 +338,13 @@ pub fn format_statement(
     offset: usize,
     indent_unit: &str,
     dialect: SqlDialect,
+    case: KeywordCase,
 ) -> Option<(usize, usize, String)> {
     let (lo, hi) = crate::sql::statement_range(full, offset, dialect);
     if full.get(lo..hi)?.trim().is_empty() {
         return None;
     }
-    let text = format_range(full, lo, hi, indent_unit, dialect);
+    let text = format_range(full, lo, hi, indent_unit, dialect, case);
     (text != full[lo..hi]).then_some((lo, hi, text))
 }
 
@@ -1591,6 +1682,81 @@ impl<'a> Fmt<'a> {
 mod tests {
     use super::*;
 
+    /// Upper or lower case for keywords — the words every server of the
+    /// dialect reserves, and the formatter's own layout keywords — and nothing
+    /// else: identifiers, strings, comments and quoted names keep their case.
+    /// Keep leaves the text alone.
+    #[test]
+    fn keyword_case_recases_keywords_and_nothing_else() {
+        use KeywordCase::*;
+        let pg = SqlDialect::Postgres;
+        let sql = "select Name, 'select' from Users -- from\nwhere x is not null order by \"from\"";
+        assert_eq!(
+            apply_keyword_case(sql, pg, Upper),
+            "SELECT Name, 'select' FROM Users -- from\nWHERE x IS NOT NULL ORDER BY \"from\""
+        );
+        assert_eq!(
+            apply_keyword_case("SELECT a FROM t WHERE b IS NULL", pg, Lower),
+            "select a from t where b is null"
+        );
+        assert_eq!(apply_keyword_case(sql, pg, Keep), sql);
+        // A word beside a `.` is a name — MySQL takes a reserved word there,
+        // and a table's name may be case-sensitive.
+        assert_eq!(
+            apply_keyword_case("select t.order from shop.order", SqlDialect::MySql, Upper),
+            "SELECT t.order FROM shop.order"
+        );
+        // MariaDB frees `rank`, so it is no keyword to recase on a MySQL tab.
+        assert_eq!(
+            apply_keyword_case("select rank from t", SqlDialect::MySql, Upper),
+            "SELECT rank FROM t"
+        );
+        // PostgreSQL reserves neither `INSERT` nor `BY`; the formatter's own
+        // keywords are cased all the same.
+        assert_eq!(
+            apply_keyword_case("insert into t values (1)", pg, Upper),
+            "INSERT INTO t VALUES (1)"
+        );
+    }
+
+    /// The setting is saved as a lower-case word, and an unknown or missing
+    /// one reads as Keep — the formatter's behaviour before it existed.
+    #[test]
+    fn keyword_case_persists_as_a_word() {
+        assert_eq!(KeywordCase::default(), KeywordCase::Keep);
+        assert_eq!(
+            serde_json::to_string(&KeywordCase::Upper).unwrap(),
+            "\"upper\""
+        );
+        let back: KeywordCase = serde_json::from_str("\"lower\"").unwrap();
+        assert_eq!(back, KeywordCase::Lower);
+        // A word a later version writes must not fail the whole settings file.
+        let later: KeywordCase = serde_json::from_str("\"title\"").unwrap();
+        assert_eq!(later, KeywordCase::Keep);
+    }
+
+    /// Format Code and *Format statement* write the case, and a statement
+    /// laid out already but cased otherwise is still theirs to rewrite.
+    #[test]
+    fn formatting_writes_the_keyword_case() {
+        let pg = SqlDialect::Postgres;
+        let format_sql = super::format_sql;
+        let laid_out = format_sql("SELECT a FROM t", "  ", pg);
+        assert_eq!(
+            format_statement(&laid_out, 0, "  ", pg, KeywordCase::Keep),
+            None
+        );
+        assert_eq!(
+            format_statement(&laid_out, 0, "  ", pg, KeywordCase::Lower),
+            Some((0, laid_out.len(), format_sql("select a from t", "  ", pg)))
+        );
+        let full = "x; select a from t;";
+        assert_eq!(
+            format_range(full, 3, full.len(), "  ", pg, KeywordCase::Upper),
+            format_sql("SELECT a FROM t;", "  ", pg)
+        );
+    }
+
     // These tests predate the dialect parameter and assert MySQL formatting; a thin
     // MySQL-defaulting wrapper (shadowing the glob import) keeps them unchanged.
     fn format_sql(sql: &str, indent_unit: &str) -> String {
@@ -1736,7 +1902,8 @@ mod tests {
     fn format_statement_formats_only_the_statement_at_the_caret() {
         use SqlDialect::MySql;
         let doc = "select a,b from t;\nselect c,d from u where x=1;\nselect e,f from v;\n";
-        let edit = format_statement(doc, 25, IND, MySql).unwrap();
+        let keep = KeywordCase::Keep;
+        let edit = format_statement(doc, 25, IND, MySql, keep).unwrap();
         assert_eq!(&doc[edit.0..edit.1], "select c,d from u where x=1;");
         assert_eq!(edit.2, format_sql("select c,d from u where x=1;", IND));
         let out = splice(doc, edit);
@@ -1744,9 +1911,9 @@ mod tests {
         assert!(out.ends_with("\nselect e,f from v;\n"), "{out}");
         // Formatted already, or no statement at all: nothing to write.
         let formatted = format_sql("select c from u", IND);
-        assert_eq!(format_statement(&formatted, 2, IND, MySql), None);
-        assert_eq!(format_statement("  \n ", 1, IND, MySql), None);
-        assert_eq!(format_statement("", 0, IND, MySql), None);
+        assert_eq!(format_statement(&formatted, 2, IND, MySql, keep), None);
+        assert_eq!(format_statement("  \n ", 1, IND, MySql, keep), None);
+        assert_eq!(format_statement("", 0, IND, MySql, keep), None);
     }
 
     /// A caret before the rewritten range stays, one after it moves by the
@@ -2819,20 +2986,21 @@ mod tests {
     /// trimmed the trailing space, and the splice fused `from` with `t`.
     #[test]
     fn formatting_a_range_keeps_the_whitespace_around_it() {
+        let keep = KeywordCase::Keep;
         let full = "select a from t";
-        let out = format_range(full, 0, 14, IND, SqlDialect::MySql);
+        let out = format_range(full, 0, 14, IND, SqlDialect::MySql, keep);
         assert!(out.ends_with(' '), "{out:?}");
         let full = "select a from t where x=1";
-        let out = format_range(full, 15, full.len(), IND, SqlDialect::MySql);
+        let out = format_range(full, 15, full.len(), IND, SqlDialect::MySql, keep);
         assert!(out.starts_with(' '), "{out:?}");
         assert_eq!(
-            format_range("a  \n ", 1, 5, IND, SqlDialect::MySql),
+            format_range("a  \n ", 1, 5, IND, SqlDialect::MySql, keep),
             "  \n "
         );
         // The whole document is `format_sql`'s, trailing newline rule and all.
         let full = "  select a from t\n\n";
         assert_eq!(
-            format_range(full, 0, full.len(), IND, SqlDialect::MySql),
+            format_range(full, 0, full.len(), IND, SqlDialect::MySql, keep),
             super::format_sql(full, IND, SqlDialect::MySql)
         );
     }

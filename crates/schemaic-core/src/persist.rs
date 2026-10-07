@@ -336,6 +336,9 @@ pub struct UiState {
     /// Colour the editor's brackets by their nesting. Default: off.
     #[serde(default)]
     pub editor_rainbow_brackets: bool,
+    /// How Format Code cases keywords. Default: as typed.
+    #[serde(default)]
+    pub format_keyword_case: crate::sqlfmt::KeywordCase,
     /// Draw spaces and tabs as visible marks in the editor. Default: off.
     #[serde(default)]
     pub editor_show_whitespace: bool,
@@ -459,6 +462,7 @@ impl Default for UiState {
             soft_tabs: true,
             word_wrap: false,
             editor_rainbow_brackets: false,
+            format_keyword_case: crate::sqlfmt::KeywordCase::Keep,
             editor_show_whitespace: false,
             editor_indent_guides: false,
             restore_tabs: true,
@@ -1862,6 +1866,24 @@ mod tests {
             .expect("parses");
         assert!(!back.editor_remembered_predictions);
         assert!(back.editor_predictions);
+    }
+
+    /// Format Code keeps keywords as typed for a new install and a file
+    /// written before the setting existed, and a choice stays chosen.
+    #[test]
+    fn format_keyword_case_defaults_to_as_typed_and_keeps_a_choice() {
+        use crate::sqlfmt::KeywordCase;
+        assert_eq!(UiState::default().format_keyword_case, KeywordCase::Keep);
+        let old: UiState = serde_json::from_str("{}").expect("parses");
+        assert_eq!(old.format_keyword_case, KeywordCase::Keep);
+        let upper = UiState {
+            format_keyword_case: KeywordCase::Upper,
+            ..UiState::default()
+        };
+        let back: UiState =
+            serde_json::from_str(&serde_json::to_string(&upper).expect("serialises"))
+                .expect("parses");
+        assert_eq!(back.format_keyword_case, KeywordCase::Upper);
     }
 
     /// Rainbow brackets are off for a new install and a file written before

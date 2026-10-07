@@ -12072,8 +12072,28 @@ existing prose was left alone.
     only when that edit went through, so a cut the Ctrl+K freeze refuses leaves the clipboard as it
     was.
   - `sqlfmt.rs` — `format_sql` (Ctrl+Alt+L pretty-printer): re-flows whitespace/indent/line-breaks
-    "block" style, **preserving keyword case**; built on `skip_noncode` so comments/strings/backtick
-    idents pass through untouched; indent follows editor tab-width/soft-tabs.
+    "block" style, **preserving keyword case** itself; built on `skip_noncode` so comments/strings/
+    backtick idents pass through untouched; indent follows editor tab-width/soft-tabs.
+    **Keyword case is a setting now, and `format_sql` still does not know it** — the recasing is
+    `apply_keyword_case(sql, dialect, KeywordCase)`, applied over `format_sql`'s output by
+    `format_range` (and so by `format_statement`), the two functions a Format writes through.
+    `KeywordCase` is `Keep` (the default, labelled *As typed*: no token's text changes, the
+    formatter as it always was), `Upper` or `Lower`. **A keyword is deliberately narrow**: an
+    unquoted `Kind::Word` that every server of the dialect reserves (`intel::is_reserved_word_on`
+    with `ServerFlavour::Unknown`, so on a MySQL tab MariaDB's freeing of `rank` keeps it a name),
+    **or** one of this module's own layout keywords (`is_keyword` — clause heads, joins, `BY`, `AND`
+    …), which the formatter already reads as a keyword wherever it stands. The second half is there
+    because PostgreSQL reserves neither `BY` nor `INSERT`, and the reserved list alone wrote
+    `ORDER by`. It goes no wider than that on purpose: a general keyword list would recase names,
+    and an unquoted MySQL table called `status` is case-sensitive on a Linux server. For the same
+    reason a word beside a `.` is left alone — MySQL takes a reserved word as a qualified name
+    (`shop.order`). Strings, comments and quoted names are tokens of their own and never words
+    (`keyword_case_recases_keywords_and_nothing_else`, both halves). The recasing is **ASCII only**, so every byte stays where it was — that is what keeps
+    `caret_after_format` right over a recased result. `KeywordCase` serialises as a lower-case word
+    and **deserialises leniently** through a hand-written impl: a word this version does not know
+    reads as `Keep`, so a value a later version writes never fails the `ui_state.json` it sits in
+    (`keyword_case_persists_as_a_word`). Deriving `Deserialize` as a tidy-up would make it fail the
+    whole file. A value that is not a string at all still fails the parse.
     **`formattable_range` is what decides how much of the document a Format may touch**, and it is
     here rather than at the call site because `format_sql` lexes what it is handed **from byte 0**
     and takes that for a real token boundary. True of a whole document and of a selection whose ends
@@ -12097,7 +12117,8 @@ existing prose was left alone.
     non-whitespace bytes before the caret and finds as many in the result, a caret in whitespace
     landing straight after the token before it (`the_caret_keeps_its_place_through_a_format`). That
     leans on this module's contract that only whitespace moves: a layout that ever changed a token's
-    text would put the caret somewhere else.
+    text would put the caret somewhere else. Keyword case is the one sanctioned change to a token's
+    text, and it survives that only because it is ASCII and leaves every token's length alone.
     **`single_line` is the editor's *Copy as single line*, and it is not `format_sql` with the
     breaks left out, because a line break is not always layout.** A whitespace run in code becomes
     one space and a block comment's runs collapse too, but a `--` or `#` comment ends at its line
@@ -12130,6 +12151,9 @@ existing prose was left alone.
     **`format_statement`** is *Format statement*'s answer in the same shape: the
     `sql::statement_range` at the caret through `format_range`, or `None` for blank text or a
     statement formatted already (`format_statement_formats_only_the_statement_at_the_caret`).
+    "Formatted already" includes the keyword case: both take a `KeywordCase`, so a statement laid
+    out already but cased otherwise is still `Some` — and still offered by the editor's menu
+    (`formatting_writes_the_keyword_case`).
     **`caret_after_replace`** places a bare caret after either rewrite — unmoved before the range,
     shifted by the length change after it, `caret_after_format` within it — and is approximate inside
     a single-line rewrite, where a `--` comment gains the `/*` and `*/` it becomes and a caret past it
@@ -23694,7 +23718,7 @@ existing prose was left alone.
     is absent where that is already one line; *Format statement*, placed straight after *Format
     code*, writes `sqlfmt::format_statement` over the statement under the click, and is offered only
     **without a selection** — with one, *Format code* already formats just that — and only when the
-    statement is not formatted yet. A selection stays selected over the rewritten range; a bare
+    statement is not formatted yet, keyword case included. A selection stays selected over the rewritten range; a bare
     caret keeps its place among the tokens (`sqlfmt::caret_after_replace`). Each has a palette
     command (*Format Statement*, *Make Single Line*) and a key (Ctrl+Alt+Shift+L, Ctrl+Alt+J), which
     act at the caret through `Tab::format_req` — an `Option<FormatReq>` naming which of the three
@@ -25194,7 +25218,14 @@ existing prose was left alone.
     `visible_whitespace`/`indent_guide_color` the closure already set — the editor theme's
     `selection`. There is no rendering code of ours behind either. The palette's *Toggle Whitespace*
     and *Toggle Indent Guides* sit beside *Toggle Word Wrap*.
-    `preview_bg`/`preview_fg` are the surface and base text of a **syntax-coloured preview**, and
+    **Keyword case when formatting** (Settings → Editor, a `focusable_dropdown` after *Indent
+    guides*, *As typed* by default — `UiState::format_keyword_case`, pinned by
+    `format_keyword_case_defaults_to_as_typed_and_keeps_a_choice`; `LayoutUi::keyword_case`) is the
+    one editor setting here that paints nothing. `theme::format_keyword_case` reads it **untracked**
+    and its setter bumps no `editor_gen`, because nothing is drawn from it: Format Code
+    (`format_editor`'s `format_range`) and both *Format statement* sites — the key/palette request
+    and the right-click menu — ask for it at the moment they run. What it does to the text is the
+    `core/sqlfmt.rs` entry's. the surface and base text of a **syntax-coloured preview**, and
     they are named here rather than spelled at each site so the cross-axis gate in `contrast.rs`
     measures the surface the previews actually paint — the account browser's `GRANT` block is the
     latest caller, and its move off `code_bg` is exactly that distinction and nothing else:
