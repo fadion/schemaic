@@ -1191,10 +1191,12 @@ pub fn comment_text(raw: &str) -> String {
 
 /// The same, but only when leaving the name bare would name something else.
 ///
-/// A bare identifier is safe exactly when it is a plain lower-case ASCII word and
-/// not reserved: PostgreSQL folds an unquoted name to lower case, so anything with
-/// an upper-case letter, a space, punctuation or a non-ASCII byte has to be quoted
-/// there, and a reserved word has to be quoted on either engine.
+/// A bare identifier is safe exactly when it is a plain ASCII word and not
+/// reserved: a space, punctuation or a non-ASCII byte has to be quoted, and a
+/// reserved word has to be quoted on every engine. **An upper-case letter only
+/// where the engine folds a bare name** ([`SqlDialect::folds_unquoted_names`]):
+/// PostgreSQL reads `ArtistId` as `artistid`, while the other three keep or
+/// match the name as written.
 ///
 /// This is the rule for SQL Schemaic *generates for the user to read* — the
 /// completion layer's auto-join and star expansion, and `filter::table_query`'s
@@ -1203,10 +1205,14 @@ pub fn comment_text(raw: &str) -> String {
 /// For SQL that is only executed, [`ident_sql`] and its unconditional quoting is
 /// the right choice and stays what the write paths use.
 pub fn ident_if_needed(name: &str, dialect: SqlDialect) -> String {
+    let folds = dialect.folds_unquoted_names();
     let plain = !name.is_empty()
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        && name.bytes().all(|b| {
+            b.is_ascii_lowercase()
+                || (b.is_ascii_uppercase() && !folds)
+                || b.is_ascii_digit()
+                || b == b'_'
+        })
         && !name.as_bytes()[0].is_ascii_digit()
         // The identifier question, not the alias one: `CAST`/`IF`/`RAISE` are
         // valid SQLite aliases but cannot be a bare column or table name.

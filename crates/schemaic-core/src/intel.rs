@@ -129,6 +129,22 @@ impl SqlDialect {
         }
     }
 
+    /// Does the engine **fold an unquoted name's case**, so that a name with a
+    /// capital letter in it has to be quoted to be reached?
+    ///
+    /// PostgreSQL folds a bare name to lower case: `ArtistId` is `artistid`,
+    /// a different table from the `"ArtistId"` a tool created. MySQL keeps a
+    /// bare name's case, and SQLite and SQL Server match it whatever its case
+    /// (SQL Server by its collation, which quoting does not change), so on
+    /// those a capital letter is no reason to quote — and quoting for it put
+    /// brackets round every PascalCase name the editor inserted.
+    pub fn folds_unquoted_names(self) -> bool {
+        match self {
+            SqlDialect::Postgres => true,
+            SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+        }
+    }
+
     /// Is `name` one of [`SqlDialect::implicit_columns`]? Case-insensitive, as
     /// column names are on every engine Schemaic speaks to.
     pub fn is_implicit_column(self, name: &str) -> bool {
@@ -25429,8 +25445,7 @@ mod tests {
             assert_eq!(q("orders", d), "orders", "{d:?}");
             assert_eq!(q("customer_id", d), "customer_id", "{d:?}");
             assert_eq!(q("t2", d), "t2", "{d:?}");
-            // Anything PostgreSQL would fold, or that isn't a plain word.
-            assert_ne!(q("ArtistId", d), "ArtistId", "{d:?}");
+            // Anything that isn't a plain word.
             assert_ne!(q("Order Details", d), "Order Details", "{d:?}");
             assert_ne!(q("naïve", d), "naïve", "{d:?}");
             assert_ne!(q("2fast", d), "2fast", "{d:?}");
@@ -25439,9 +25454,23 @@ mod tests {
             assert_ne!(q("select", d), "select", "{d:?}");
             assert_ne!(q("order", d), "order", "{d:?}");
         }
-        // Each engine's own quote character, with the embedded one doubled.
-        assert_eq!(q("ArtistId", SqlDialect::MySql), "`ArtistId`");
+        // A capital letter only where the engine folds a bare name: PostgreSQL
+        // reads `ArtistId` as `artistid`; the other three keep it, or match it
+        // whatever its case, so quoting there only puts brackets round every
+        // PascalCase name the editor inserts.
         assert_eq!(q("ArtistId", SqlDialect::Postgres), "\"ArtistId\"");
+        assert_eq!(q("ArtistId", SqlDialect::MySql), "ArtistId");
+        assert_eq!(q("ArtistId", SqlDialect::Sqlite), "ArtistId");
+        assert_eq!(q("ArtistId", SqlDialect::MsSql), "ArtistId");
+        assert_eq!(
+            q("ORDER", SqlDialect::MsSql),
+            "[ORDER]",
+            "reserved in any case"
+        );
+        assert_eq!(q("Order Details", SqlDialect::MsSql), "[Order Details]");
+        // Each engine's own quote character, with the embedded one doubled.
+        assert_eq!(q("Artist Id", SqlDialect::MySql), "`Artist Id`");
+        assert_eq!(q("Artist Id", SqlDialect::Postgres), "\"Artist Id\"");
         assert_eq!(q("we`ird", SqlDialect::MySql), "`we``ird`");
         assert_eq!(q("we\"ird", SqlDialect::Postgres), "\"we\"\"ird\"");
     }

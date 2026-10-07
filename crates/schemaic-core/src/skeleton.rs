@@ -543,18 +543,24 @@ mod tests {
     /// `ident_if_needed`'s *quote byte* is per dialect, and only `delete` was
     /// ever exercised outside MySQL — so the `INSERT`/`UPDATE` column quoting
     /// was pinned on one engine of three. The placeholder is not quoted on any
-    /// of them: it is a token, not an identifier.
+    /// of them: it is a token, not an identifier. A reserved word is quoted
+    /// everywhere; a capital letter only on PostgreSQL, which folds it.
     #[test]
     fn every_generator_quotes_per_dialect() {
         let mut t = actor();
-        t.columns = vec![col("id", true, false), col("FirstName", false, false)];
+        t.columns = vec![
+            col("id", true, false),
+            col("FirstName", false, false),
+            col("order", false, false),
+        ];
         let pg = insert_skeleton(SqlDialect::Postgres, "shop", &t);
-        assert!(pg.contains("(id, \"FirstName\")"), "{pg}");
+        assert!(pg.contains("(id, \"FirstName\", \"order\")"), "{pg}");
         assert!(pg.contains(":FirstName"), "{pg}");
         let lite = update_skeleton(SqlDialect::Sqlite, "main", &t);
-        assert!(lite.contains("\"FirstName\" = :FirstName"), "{lite}");
+        assert!(lite.contains("FirstName = :FirstName"), "{lite}");
+        assert!(lite.contains("\"order\" = :order"), "{lite}");
         let my = insert_skeleton(SqlDialect::MySql, "sakila", &t);
-        assert!(my.contains("(id, `FirstName`)"), "{my}");
+        assert!(my.contains("(id, FirstName, `order`)"), "{my}");
     }
 
     /// `GENERATED ALWAYS AS IDENTITY` is the other half of `is_server_assigned`,

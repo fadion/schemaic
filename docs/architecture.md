@@ -1828,11 +1828,15 @@ existing prose was left alone.
     relaxation of the duplicate rule fails there rather than in a SQLite integration test.
     **Every SQL fragment this module generates** (`join_condition`, `join_targets`, `expand_star`)
     is quoted through `export::ident_if_needed`, which quotes only what a bare name would get wrong
-    — anything that isn't a plain lower-case word that can stand unquoted as an *identifier*
+    — anything that isn't a plain ASCII word that can stand unquoted as an *identifier*
     (`must_quote_ident`, below). PostgreSQL folds an unquoted
     `ArtistId` to `artistid`, so unquoted output couldn't run on any mixed-case schema, while
     unconditional quoting would backtick every ordinary MySQL name in text the user is about to
-    edit. `JoinTarget` therefore carries the **bare** name for the popup to display and prefix-match
+    edit. **A capital letter is a reason to quote only where the engine folds**
+    (`SqlDialect::folds_unquoted_names`, PostgreSQL alone): MySQL keeps a bare name's case and
+    SQLite and SQL Server match it whatever its case, so quoting for case there bracketed every
+    PascalCase SQL Server name the editor generated
+    (`ident_if_needed_quotes_exactly_what_a_bare_name_would_get_wrong`). `JoinTarget` therefore carries the **bare** name for the popup to display and prefix-match
     and `table_sql` for what is actually inserted.
     **A reserved word is two questions, and they carry opposite costs.** `is_reserved_word` (over
     `MYSQL_RESERVED` / `PG_RESERVED` / `SQLITE_RESERVED`) asks whether a word can be a bare
