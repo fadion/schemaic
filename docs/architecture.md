@@ -946,7 +946,14 @@ existing prose was left alone.
     paren is a `CAST(`/`TRY_CAST(` — an `AS` anywhere else is an alias's — or after `::` where the
     engine casts with it (`casts_with_double_colon`, PostgreSQL), read off the bytes since the
     tokenizer keeps no operators (`a_cast_target_is_a_type_slot`). A column definition's type
-    and T-SQL's `CONVERT(type, …)` are not type slots yet.
+    and T-SQL's `CONVERT(type, …)` are not type slots yet. **A value no column reaches is
+    `Value`**: a `VALUES` tuple (the paren whose outer keyword is `VALUES`; a subquery inside it
+    is a statement again), and the value a statement-opening `DECLARE` (no clause since) or `SET`
+    (no clause but itself) gives a variable once `past_assignment` finds an `=` in code or a
+    `DEFAULT` in the list's current item. `rank` offers it the builtins first and keywords, and no
+    columns — a statement-opening `SET @x =` had offered every column in the database above the
+    functions (`a_value_with_no_columns_in_reach_is_a_value_slot`,
+    `a_value_slot_offers_functions_and_no_columns`). `UPDATE … SET a =` stays `Column`.
     **`signature_help` asks what the word before the `(` names before it asks the catalogue** —
     the column list above, met again in the signature bar: `INSERT INTO log (` opened `LOG(x)`'s
     help over a list of columns nobody was calling. `names_an_object` reads back over an `a.b`

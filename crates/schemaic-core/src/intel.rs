@@ -3965,6 +3965,10 @@ pub enum ClauseCtx {
     /// A cast's target type — `CAST(x AS |`, `TRY_CAST(x AS |`,
     /// PostgreSQL's `x::|` → [`cast_target_types`].
     Type,
+    /// A value with no columns in reach — a `VALUES` tuple, a `DECLARE`'s
+    /// default, the value a statement-opening `SET` gives a variable →
+    /// functions and keywords, no columns.
+    Value,
     /// After a statement-opening `USE` → databases.
     Database,
     /// Anything else → the full mixed list (keywords + tables + columns).
@@ -3997,6 +4001,48 @@ fn cast_target_at(sql: &str, toks: &[Token], word_lo: usize, dialect: SqlDialect
     }
     open.last()
         .is_some_and(|&p| p > 0 && is_word(&toks[p - 1], &["CAST", "TRY_CAST"]))
+}
+
+/// Has the current item of a `DECLARE`/`SET` list reached its value — is
+/// there an `=` in code, or a `DEFAULT`, between the last comma at the list's
+/// own depth and the word at `word_lo`? `toks` are `sql[lo..word_lo]`'s.
+fn past_assignment(
+    sql: &str,
+    lo: usize,
+    word_lo: usize,
+    toks: &[Token],
+    dialect: SqlDialect,
+) -> bool {
+    let mut depth = 0usize;
+    let mut item = 0usize;
+    for (i, t) in toks.iter().enumerate() {
+        match t.kind {
+            TkKind::LParen => depth += 1,
+            TkKind::RParen => depth = depth.saturating_sub(1),
+            TkKind::Comma if depth == 0 => item = i + 1,
+            _ => {}
+        }
+    }
+    if toks[item..]
+        .iter()
+        .any(|t| bare_upper(t).as_deref() == Some("DEFAULT"))
+    {
+        return true;
+    }
+    let from = toks.get(item).map_or(lo, |t| t.at).max(lo);
+    let b = sql.as_bytes();
+    let mut i = from;
+    while i < word_lo {
+        if let Some(j) = skip_noncode(b, i, dialect) {
+            i = j.max(i + 1);
+            continue;
+        }
+        if b[i] == b'=' {
+            return true;
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Does the engine spell a cast `x::type`? PostgreSQL's alone.
@@ -4090,6 +4136,10 @@ pub fn clause_context(sql: &str, lo: usize, word_lo: usize, dialect: SqlDialect)
             if (first.is_none() && table_slot) || last_kw.as_deref() == Some("JOIN") {
                 return ClauseCtx::Table;
             }
+            // A `VALUES` tuple reads no table's columns.
+            if outer_kw.as_deref() == Some("VALUES") {
+                return ClauseCtx::Value;
+            }
             // `TABLE t (`: column definitions, whose names and types are new.
             let defines = outer_kw.as_deref() == Some("TABLE")
                 && open >= 2
@@ -4100,6 +4150,17 @@ pub fn clause_context(sql: &str, lo: usize, word_lo: usize, dialect: SqlDialect)
                 ClauseCtx::Column
             };
         }
+    }
+    // A variable's value: past the `=` (`DEFAULT`, `:=`) of a statement-opening
+    // `DECLARE` that no clause has followed, or of a statement-opening `SET`
+    // whose only clause is itself. A subquery's `WHERE` ends either.
+    let assigns = match words.first().map(String::as_str) {
+        Some("DECLARE") => last_kw.is_none(),
+        Some("SET") => last_kw.as_deref() == Some("SET"),
+        _ => false,
+    };
+    if assigns && past_assignment(sql, lo, word_lo, &toks, dialect) {
+        return ClauseCtx::Value;
     }
     // The column an `ALTER TABLE` drops, alters, renames, modifies or changes.
     if last_kw.as_deref() == Some("TABLE") && words.first().is_some_and(|w| w == "ALTER") {
@@ -18771,6 +18832,47 @@ mod tests {
         clause_context(sql, 0, word_lo, SqlDialect::MySql)
     }
 
+    /// A value with no columns in reach: a `VALUES` tuple, a `DECLARE`'s
+    /// default, the value a statement-opening `SET` gives a variable. An
+    /// `UPDATE`'s `SET`, and a subquery inside any of them, still reach
+    /// columns.
+    #[test]
+    fn a_value_with_no_columns_in_reach_is_a_value_slot() {
+        let on = |sql: &str, d| clause_context(sql, 0, word_start(sql, sql.len()), d);
+        let (my, ms) = (SqlDialect::MySql, SqlDialect::MsSql);
+        for d in SqlDialect::ALL {
+            assert_eq!(on("INSERT INTO t VALUES (", d), ClauseCtx::Value, "{d:?}");
+            assert_eq!(
+                on("INSERT INTO t (a, b) VALUES (1, cu", d),
+                ClauseCtx::Value,
+                "{d:?}"
+            );
+            assert_eq!(on("UPDATE t SET a = ", d), ClauseCtx::Column, "{d:?}");
+        }
+        assert_eq!(
+            on("INSERT INTO t VALUES (1, now(), co", my),
+            ClauseCtx::Value
+        );
+        assert_eq!(on("DECLARE @x INT = ge", ms), ClauseCtx::Value);
+        assert_eq!(on("DECLARE @a INT = 1, @b INT = ge", ms), ClauseCtx::Value);
+        assert_eq!(on("DECLARE x INT DEFAULT no", my), ClauseCtx::Value);
+        assert_eq!(on("SET @x = ge", ms), ClauseCtx::Value);
+        assert_eq!(on("SET @x = no", my), ClauseCtx::Value);
+        // Before the `=` is the variable and its type, not a value.
+        assert_ne!(on("DECLARE @x ", ms), ClauseCtx::Value);
+        assert_ne!(on("SET @x", ms), ClauseCtx::Value);
+        // A subquery has columns again.
+        assert_eq!(
+            on("SET @x = (SELECT a FROM t WHERE ", ms),
+            ClauseCtx::Column
+        );
+        assert_eq!(
+            on("DECLARE c CURSOR FOR SELECT a FROM t WHERE ", ms),
+            ClauseCtx::Column
+        );
+        assert_eq!(on("INSERT INTO t VALUES ((SELECT ", my), ClauseCtx::Column);
+    }
+
     /// A cast's target is a type: after `AS` inside `CAST(`/`TRY_CAST(`, and
     /// after PostgreSQL's `::`. An `AS` anywhere else names an alias.
     #[test]
@@ -18989,10 +19091,12 @@ mod tests {
             "SELECT SUBSTRING(name FROM 2 FOR 3), COUNT(",
             "ALTER TABLE o ADD FOREIGN KEY (c) REFERENCES customers (",
             "SELECT * FROM t WHERE id IN (",
-            "INSERT INTO t VALUES (",
         ] {
             assert_eq!(ctx(sql), ClauseCtx::Column, "{sql:?}");
         }
+        // A `VALUES` tuple is a paren too, but one no column reaches
+        // (`a_value_with_no_columns_in_reach_is_a_value_slot`).
+        assert_eq!(ctx("INSERT INTO t VALUES ("), ClauseCtx::Value);
         // A subquery is a statement again, with its own clauses.
         assert_eq!(
             ctx("SELECT * FROM t WHERE id IN (SELECT x FROM "),

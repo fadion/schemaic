@@ -536,6 +536,35 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
     let clause_keywords = || {
         keywords(SQL_KEYWORDS).chain(crate::intel::engine_keywords(input.dialect, input.flavour))
     };
+    // The engine's builtins, in `tier`.
+    //
+    // **The offered subset, precomputed once per dialect.**
+    // `is_offered_builtin` is a binary search on PostgreSQL, and asking it per
+    // candidate meant 2,706 of them per keystroke to arrive at the same 863
+    // names every time. `offered_builtins` is that filter's answer, held in
+    // `intel`'s `CatalogIndex` beside the typo checker's own rearrangement of
+    // the same data.
+    let add_builtins = |cands: &mut Vec<Cand>, seen: &mut HashSet<String>, tier: u8| {
+        for fun in crate::intel::offered_builtins(input.dialect, input.flavour).unwrap_or(&[]) {
+            let before = cands.len();
+            add(
+                cands,
+                seen,
+                fun.name,
+                SuggestKind::Function,
+                fun.signature,
+                tier,
+            );
+            // A builtin the engine calls bare goes in bare, not as the
+            // `name()` a function row inserts.
+            if cands.len() > before
+                && crate::intel::called_bare(fun.name, input.dialect)
+                && let Some(c) = cands.last_mut()
+            {
+                c.insert = Some(fun.name.to_string());
+            }
+        }
+    };
 
     match ctx {
         ClauseCtx::Qualified(q) => {
@@ -669,31 +698,7 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
                     }
                 }
             }
-            // **The offered subset, precomputed once per dialect.**
-            // `is_offered_builtin` is a binary search on PostgreSQL, and asking
-            // it per candidate meant 2,706 of them per keystroke to arrive at
-            // the same 863 names every time. `offered_builtins` is that
-            // filter's answer, held in `intel`'s `CatalogIndex` beside the
-            // typo checker's own rearrangement of the same data.
-            for fun in crate::intel::offered_builtins(input.dialect, input.flavour).unwrap_or(&[]) {
-                let before = cands.len();
-                add(
-                    &mut cands,
-                    &mut seen,
-                    fun.name,
-                    SuggestKind::Function,
-                    fun.signature,
-                    2,
-                );
-                // A builtin the engine calls bare goes in bare, not as the
-                // `name()` a function row inserts.
-                if cands.len() > before
-                    && crate::intel::called_bare(fun.name, input.dialect)
-                    && let Some(c) = cands.last_mut()
-                {
-                    c.insert = Some(fun.name.to_string());
-                }
-            }
+            add_builtins(&mut cands, &mut seen, 2);
             // A keyword the typed word begins competes with the builtins on
             // score, where its prefix bonus lifts it past every builtin that
             // only fuzzy-matches: under them, PostgreSQL's `parti` filled the
@@ -701,6 +706,14 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
             // match stays under them all.
             for k in clause_keywords() {
                 let tier = if begins_with(k, prefix) { 2 } else { 3 };
+                add(&mut cands, &mut seen, k, SuggestKind::Keyword, "", tier);
+            }
+        }
+        // A value with no columns in reach: functions first, then keywords.
+        ClauseCtx::Value => {
+            add_builtins(&mut cands, &mut seen, 0);
+            for k in clause_keywords() {
+                let tier = if begins_with(k, prefix) { 0 } else { 1 };
                 add(&mut cands, &mut seen, k, SuggestKind::Keyword, "", tier);
             }
         }
@@ -1298,6 +1311,26 @@ mod tests {
         // still sits under the builtins — past the last row on PostgreSQL.
         let rows = col("");
         assert!(!offers(&rows, "PARTITION"), "{rows:?}");
+    }
+
+    /// A value slot offers functions first and no columns — not even the
+    /// tables in scope, which a `VALUES` tuple or a variable's value cannot
+    /// read. A builtin called bare still goes in bare.
+    #[test]
+    fn a_value_slot_offers_functions_and_no_columns() {
+        let s = shop();
+        let scope = [tref("orders", None)];
+        let v = |d, p| ranked_on(&s, d, ClauseCtx::Value, &scope, p);
+        let rows = v(SqlDialect::MySql, "no");
+        assert_eq!(rows.first().map(String::as_str), Some("NOW"), "{rows:?}");
+        let rows = v(SqlDialect::MySql, "to");
+        assert!(!offers(&rows, "total"), "no columns: {rows:?}");
+        assert!(!offers(&v(SqlDialect::MySql, ""), "id"));
+        assert!(offers(&v(SqlDialect::MsSql, "getd"), "GETDATE"));
+        assert!(
+            offers(&v(SqlDialect::Postgres, "nul"), "NULL"),
+            "keywords too"
+        );
     }
 
     /// The statement's own names: its CTEs where a table goes, its select
