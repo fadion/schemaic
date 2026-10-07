@@ -24115,7 +24115,18 @@ existing prose was left alone.
     `affinity: Some(CursorAffinity::Backward)` — floem's own rule for completion phantoms, which
     keeps the caret *before* text it has not been given yet — in `editor_theme().fg` at
     `GHOST_ALPHA` (0.45). **Not `theme::placeholder()`**: that was checked in the running app and
-    was drawn but all but invisible on the current-line band. It is not drawn while a Ctrl+K view
+    was drawn but all but invisible on the current-line band. **After it comes a hint**, a second
+    `PhantomText` at the same column, same kind and affinity, fainter still (`GHOST_HINT_ALPHA`,
+    0.28 — it is about the prediction, not part of it): `ghost_hint(remembered, rest_of_line)`
+    answers `"  Tab"`, or `"  Tab · remembered"` for a `predict_from_history` ghost. Until then a
+    remembered ghost looked exactly like a reasoned one, and the hint is now the only visible
+    difference. It says *remembered* rather than *from history* because `recall` draws on snippets
+    and open tabs as well as runs. **It is drawn only at the end of its line** — `None` when
+    anything but whitespace follows the caret — since a mid-line ghost goes in front of the next
+    clause and a hint would sit between the two
+    (`a_hint_follows_a_prediction_only_at_the_end_of_its_line`). **It is display only**: Tab, →
+    and Ctrl+→ take `EditorGhost.text` and never the hint, and `EditorGhost` does not carry it —
+    `ghost_on` derives it per relayout from `remembered` and the line. It is not drawn while a Ctrl+K view
     is up in either state, nor when its text holds a `\n` — and `has_multiline_phantom` does not
     consult the ghost, so that refusal is what keeps its answer true. **The refusal is
     `shown_ghost(ghost, preview_up)`, and the keys ask it too**: `ghost_on` draws by it, and the
@@ -24133,7 +24144,10 @@ existing prose was left alone.
     puts it after every phantom at or before its column
     (`the_ghost_slots_in_after_every_phantom_at_or_before_its_column`), and `before_phantom_col`
     inserts the ghost's span at the same slot so the caret's column translation and the drawn text
-    agree.
+    agree. That span is the ghost and its hint as **one span of their combined length**: a run of
+    phantoms at one column shifts a position exactly as one phantom of their length does — the
+    property that lets `Block::len` stand in for a block's parts — so leaving the hint out of it
+    would put every caret column after the ghost out by the hint's length.
   - `erd_view.rs` — the **ER-diagram** canvas over `core::erd`. Edges are drawn by a custom paint
     view (`EdgeCanvas`), *not* a Floem `svg` — `svg` doesn't repaint reliably on reactive change
     here and blanked the edges on drag/hover. Zoom is **semantic, not a paint transform**: cards and
