@@ -1,11 +1,13 @@
-//! Pure editor text operations (no UI). Currently: SQL line-comment toggling for
-//! the editor's Ctrl+/. The function computes the full edited buffer plus the
-//! selection the caret should occupy, which the UI applies in a single
-//! `edit_single` (so it's one undo step).
+//! Pure editor text operations (no UI): the query editor's line and selection
+//! edits (Ctrl+/, Ctrl+D, Ctrl+X, Alt+↑↓, Tab/Shift+Tab, Enter, Ctrl+Shift+U,
+//! Ctrl+Shift+J), the search helpers the find surfaces share, and line/column
+//! arithmetic. Each edit is computed with the selection the caret should occupy
+//! afterwards, which the pane applies as one edit through `edit_untyped` (so
+//! it's one undo step).
 
 use crate::intel::SqlDialect;
 use crate::pairs::{Region, region_at};
-use crate::sql::is_word_byte;
+use crate::sql::{is_word_byte, skip_noncode};
 
 /// SQL line-comment token.
 const TOKEN: &str = "--";
@@ -248,6 +250,124 @@ pub fn toggle_case(full: &str, sel_a: usize, sel_b: usize) -> Option<IndentEdit>
         text,
         sel,
     })
+}
+
+/// Ctrl+Shift+J: join the caret's line with the next — or every line the
+/// selection spans — each line break and the blanks around it becoming one
+/// space. No space where one would only pad a bracket or a separator (after
+/// `(`/`[`, before `)`/`]`/`,`/`;`) or where either side is empty.
+///
+/// **Only a break in code joins.** One inside a string is the string's data,
+/// and one ending a `--`/`#` comment is what ends the comment — joined, the
+/// next line's code would be commented out; both stay where they are. A
+/// selection ending at a line's start does not pull that line in. The caret
+/// lands at the first join; a selection is kept over the joined text. `None`
+/// when no break joins.
+pub fn join_lines(
+    full: &str,
+    sel_a: usize,
+    sel_b: usize,
+    dialect: SqlDialect,
+) -> Option<IndentEdit> {
+    let b = full.as_bytes();
+    let len = full.len();
+    let lo = floor_char(full, sel_a.min(sel_b));
+    let hi = floor_char(full, sel_a.max(sel_b));
+    let last = if hi > lo && b[hi - 1] == b'\n' {
+        hi - 1
+    } else {
+        hi
+    };
+    let first_ls = full[..lo].rfind('\n').map_or(0, |i| i + 1);
+    let last_le = full[last..].find('\n').map_or(len, |i| last + i);
+    let mut breaks: Vec<usize> = (first_ls..last_le).filter(|&i| b[i] == b'\n').collect();
+    if breaks.is_empty() {
+        if last_le == len {
+            return None;
+        }
+        breaks.push(last_le);
+    }
+
+    // Which breaks the lexer says are not code: inside a span, or the end of
+    // a line comment (its span stops at the `\n`, `\r` included).
+    let mut kept = vec![false; breaks.len()];
+    let (mut i, mut k) = (0, 0);
+    let scan_end = breaks[breaks.len() - 1];
+    while i <= scan_end && k < breaks.len() {
+        let Some(j) = skip_noncode(b, i, dialect) else {
+            i += 1;
+            continue;
+        };
+        let j = j.max(i + 1);
+        while k < breaks.len() && breaks[k] < i {
+            k += 1;
+        }
+        while k < breaks.len() && breaks[k] < j {
+            kept[k] = true;
+            k += 1;
+        }
+        if matches!(b[i], b'-' | b'#') && k < breaks.len() && breaks[k] == j {
+            kept[k] = true;
+            k += 1;
+        }
+        i = j;
+    }
+
+    let blank = |c: u8| c == b' ' || c == b'\t';
+    let mut out = String::new();
+    let mut span: Option<(usize, usize)> = None; // (start, end) replaced
+    for (&nl, _) in breaks.iter().zip(&kept).filter(|(_, kept)| !**kept) {
+        let floor = span.map_or(0, |(_, e)| e);
+        let mut s = nl;
+        while s > floor && (blank(b[s - 1]) || b[s - 1] == b'\r') {
+            s -= 1;
+        }
+        let mut e = nl + 1;
+        while e < len && blank(b[e]) {
+            e += 1;
+        }
+        let start = span.map_or(s, |(st, _)| st);
+        out.push_str(&full[span.map_or(s, |(_, pe)| pe)..s]);
+        let left = out.chars().last().or_else(|| full[..start].chars().last());
+        let right = full[e..].chars().next();
+        let tight = matches!(left, None | Some('\n' | '(' | '['))
+            || matches!(right, None | Some('\n' | '\r' | ')' | ']' | ',' | ';'));
+        if !tight {
+            out.push(' ');
+        }
+        span = Some((start, e));
+    }
+    let (start, end) = span?;
+    let map = |off: usize| {
+        if off <= start {
+            off
+        } else if off >= end {
+            off - (end - start) + out.len()
+        } else {
+            start + out.len()
+        }
+    };
+    let sel = if lo == hi {
+        (start, start)
+    } else {
+        (map(lo), map(hi))
+    };
+    Some(IndentEdit {
+        start,
+        end,
+        text: out,
+        sel,
+    })
+}
+
+/// `i`, clamped to `full`'s length and taken back to the start of the
+/// character it falls inside.
+fn floor_char(full: &str, i: usize) -> usize {
+    let mut i = i.min(full.len());
+    while !full.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
 }
 
 /// Ctrl+D's duplicate: the line(s) spanned by `[sel_start, sel_end]` copied onto
@@ -520,9 +640,9 @@ pub fn line_col_of_offset(text: &str, offset: usize) -> (usize, usize) {
 }
 
 /// A single text replacement plus the selection to apply afterward — the result
-/// of a Tab, Shift+Tab, Enter or Ctrl+Shift+U ([`soft_tab_indent`],
-/// [`hard_tab_indent`], [`soft_tab_outdent`], [`newline_indent`],
-/// [`toggle_case`]).
+/// of a Tab, Shift+Tab, Enter, Ctrl+Shift+U or Ctrl+Shift+J
+/// ([`soft_tab_indent`], [`hard_tab_indent`], [`soft_tab_outdent`],
+/// [`newline_indent`], [`toggle_case`], [`join_lines`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndentEdit {
     /// Byte range in the original text to replace.
@@ -597,15 +717,8 @@ pub fn newline_indent(
     dialect: SqlDialect,
 ) -> IndentEdit {
     let len = full.len();
-    let floor = |mut i: usize| {
-        i = i.min(len);
-        while !full.is_char_boundary(i) {
-            i -= 1;
-        }
-        i
-    };
-    let lo = floor(sel_a.min(sel_b));
-    let hi = floor(sel_a.max(sel_b));
+    let lo = floor_char(full, sel_a.min(sel_b));
+    let hi = floor_char(full, sel_a.max(sel_b));
     let is_blank = |c: char| c == ' ' || c == '\t';
     let ls = full[..lo].rfind('\n').map_or(0, |i| i + 1);
     let indent_of = |from: usize| {
@@ -1387,6 +1500,60 @@ mod tests {
         assert_eq!(toggle_case("a  b", 2, 2), None, "no word at the caret");
         assert_eq!(toggle_case("12 + 3", 0, 6), None, "no letters");
         assert_eq!(toggle_case("", 0, 0), None);
+    }
+
+    /// Join at the `|` (or over `{`…`}`) in `src` and render the result with
+    /// the selection as `{…}` (a caret as `|`); `None` when nothing joins.
+    fn join(src: &str, dialect: SqlDialect) -> Option<String> {
+        let (sel, clean) = match (src.find('{'), src.find('}')) {
+            (Some(lo), Some(hi)) => ((lo, hi - 1), src.replacen(['{', '}'], "", 2)),
+            _ => {
+                let at = src.find('|').expect("a caret");
+                ((at, at), src.replacen('|', "", 1))
+            }
+        };
+        join_lines(&clean, sel.0, sel.1, dialect).map(|e| applied(&clean, &e))
+    }
+
+    #[test]
+    fn join_lines_joins_the_caret_line_with_the_next() {
+        use SqlDialect::MySql;
+        assert_eq!(
+            join("SELECT a,|\n    b\nFROM t", MySql).unwrap(),
+            "SELECT a,| b\nFROM t"
+        );
+        assert_eq!(join("|a  \r\n\tb", MySql).unwrap(), "a| b");
+        // An empty side takes no space.
+        assert_eq!(join("a|\n\nb", MySql).unwrap(), "a|\nb");
+        assert_eq!(join("a\nb|", MySql), None, "the last line has no next");
+    }
+
+    #[test]
+    fn join_lines_joins_every_spanned_line_and_keeps_the_selection() {
+        use SqlDialect::MySql;
+        assert_eq!(join("{a\n  b\n  c}\nd", MySql).unwrap(), "{a b c}\nd");
+        // A blank line between two joined lines leaves one space, not none:
+        // the left side is what has been joined so far.
+        assert_eq!(join("{a\n\nb}", MySql).unwrap(), "{a b}");
+        // A selection ending at a line start does not pull that line in.
+        assert_eq!(join("{a\n  b\n}c", MySql).unwrap(), "{a b\n}c");
+        // No padding inside brackets or before a separator.
+        assert_eq!(join("{IN (\n  1\n  , 2\n)}", MySql).unwrap(), "{IN (1, 2)}");
+    }
+
+    #[test]
+    fn join_lines_leaves_a_break_in_a_string_or_ending_a_line_comment() {
+        use SqlDialect::{MySql, Postgres};
+        assert_eq!(join("SELECT 'x|\ny'", MySql), None);
+        assert_eq!(join("a -- note|\nb", MySql), None);
+        assert_eq!(join("a # note|\nb", MySql), None);
+        // `#` is no comment on PostgreSQL, so that break joins.
+        assert_eq!(join("a # b|\nc", Postgres).unwrap(), "a # b| c");
+        // The joinable breaks around a kept one still join.
+        assert_eq!(
+            join("{a,\nb -- x\nc,\nd}", MySql).unwrap(),
+            "{a, b -- x\nc, d}"
+        );
     }
 
     /// Press Enter at the `|` (or over `{`…`}`) in `src` and render the result

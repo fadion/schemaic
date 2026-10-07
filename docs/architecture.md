@@ -11776,6 +11776,21 @@ existing prose was left alone.
     makes no edit and no undo step (`toggle_case_upper_cases_then_lower_cases_a_selection`,
     `toggle_case_with_nothing_to_change_is_none`). The pane applies it to one caret or selection
     only, through `edit_untyped`.
+    `join_lines` is Ctrl+Shift+J, DataGrip's key again: the caret's line joined with the next, or
+    every line a selection spans — one ending at a line's start leaving that line out, as Tab's
+    does. Each break and the blanks around it (spaces, tabs and a CRLF's `\r` before; spaces and
+    tabs after) become one space, or none after `(`/`[`, before `)`/`]`/`,`/`;`, or where a side
+    is empty; the left side is read from the output built so far, so a blank line between two
+    joined lines still leaves one space rather than none. **Only a break in code joins**, which is
+    why it walks `sql::skip_noncode` — the one boundary lexer, in the tab's dialect: a break inside
+    a span is a string's or a block comment's own text, and one exactly at the end of a span
+    opening `-`/`#` is what ends a line comment, whose span stops at the `\n` — joined, the next
+    line's code would be commented out. Those stay verbatim while the breaks around them still
+    join; with none left to join it is `None`, so no edit and no undo step
+    (`join_lines_leaves_a_break_in_a_string_or_ending_a_line_comment`). The caret lands at the
+    first join, and a selection is re-mapped over the joined text
+    (`join_lines_joins_every_spanned_line_and_keeps_the_selection`). The pane takes it in
+    `toggle_case`'s arm, so on one caret or selection only and through `edit_untyped`.
     **`contains_collapsed_ignore_ascii_case` is the same search against a haystack read *as if* its
     whitespace runs were collapsed, without building the collapsed string** — exactly
     `split_whitespace().collect::<Vec<_>>().join(" ")`, which is what it replaces. The two search

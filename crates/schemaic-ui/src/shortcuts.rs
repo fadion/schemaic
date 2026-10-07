@@ -94,6 +94,7 @@ pub(crate) const SHORTCUTS: &[ShortcutGroup] = &[
             ("Ctrl+Shift+\\", "Jump to the matching bracket"),
             ("Ctrl+/", "Toggle line comment"),
             ("Ctrl+Shift+U", "Toggle case"),
+            ("Ctrl+Shift+J", "Join lines"),
             ("Ctrl+D", "Duplicate line / selection"),
             ("Ctrl+X", "Cut line / selection"),
             ("Ctrl+Alt+L", "Format code"),
@@ -665,8 +666,8 @@ mod tests {
         // The failure this spelling avoids: `Ctrl+Enter` must not make every
         // Ctrl+E binding look documented, nor `Del` vouch for Ctrl+D.
         assert!(
-            !documented('j'),
-            "nothing binds or documents J — if this ever passes, the match is too loose"
+            !documented('q'),
+            "nothing binds or documents Q — if this ever passes, the match is too loose"
         );
         assert!(
             !documented('n'),
