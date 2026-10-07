@@ -307,6 +307,21 @@ pub enum FormatReq {
     SingleLine,
 }
 
+/// The format request a Ctrl+Alt chord asks for, by its *physical* key: L
+/// formats the code (DataGrip's key), Shift+L the statement at the caret, and
+/// J makes it single line — Ctrl+Shift+J's join, taken to the whole statement.
+/// Physical because Windows delivers Ctrl+Alt as AltGr, so the logical
+/// character need not be the letter.
+fn format_chord(shift: bool, key: floem::keyboard::KeyCode) -> Option<FormatReq> {
+    use floem::keyboard::KeyCode;
+    match (shift, key) {
+        (false, KeyCode::KeyL) => Some(FormatReq::Code),
+        (true, KeyCode::KeyL) => Some(FormatReq::Statement),
+        (false, KeyCode::KeyJ) => Some(FormatReq::SingleLine),
+        _ => None,
+    }
+}
+
 /// One level of Format's indentation, from the editor's tab-width and
 /// soft-tabs settings.
 fn indent_unit() -> String {
@@ -3050,16 +3065,16 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             cmdk.open.set(true);
             return CommandExecuted::Yes;
         }
-        // Ctrl+Alt+L — reformat SQL (DataGrip's shortcut). Match the *physical* L
-        // key, not the produced character: on Windows Ctrl+Alt is delivered as
-        // AltGr, so the logical `Key::Character` may not be "l".
+        // Ctrl+Alt+L — reformat SQL (DataGrip's shortcut); Ctrl+Alt+Shift+L the
+        // statement at the caret, Ctrl+Alt+J make it single line
+        // (`format_chord`). Through `format_req`, the palette's and the menu's
+        // path, so the three cannot disagree about what each one does.
         if primary_held(mods) && mods.alt() {
-            use floem::keyboard::{KeyCode, PhysicalKey};
-            if matches!(
-                kp.key,
-                KeyInput::Keyboard(_, PhysicalKey::Code(KeyCode::KeyL))
-            ) {
-                editor_sig.with_untracked(|e| format_editor(e, comp, dialect.get_untracked()));
+            use floem::keyboard::PhysicalKey;
+            if let KeyInput::Keyboard(_, PhysicalKey::Code(code)) = &kp.key
+                && let Some(req) = format_chord(mods.shift(), *code)
+            {
+                format_req.set(Some(req));
                 return CommandExecuted::Yes;
             }
         }
@@ -6884,6 +6899,36 @@ mod cmdk_preview_gate {
         }
         // The verdict footer's, and the `preview_up` memo the ghost keys ask.
         assert_eq!(checked, 2, "this gate is stale — it found {checked}");
+    }
+}
+
+#[cfg(test)]
+mod format_chord_tests {
+    use super::{FormatReq, format_chord};
+    use floem::keyboard::KeyCode;
+
+    /// Ctrl+Alt+L formats the code, Shift added narrows it to the statement,
+    /// and Ctrl+Alt+J makes the statement single line.
+    #[test]
+    fn each_format_chord_asks_for_its_own_request() {
+        assert_eq!(format_chord(false, KeyCode::KeyL), Some(FormatReq::Code));
+        assert_eq!(
+            format_chord(true, KeyCode::KeyL),
+            Some(FormatReq::Statement)
+        );
+        assert_eq!(
+            format_chord(false, KeyCode::KeyJ),
+            Some(FormatReq::SingleLine)
+        );
+    }
+
+    /// Shift+J is no chord here, and nor is any other letter: the key types as
+    /// it would have.
+    #[test]
+    fn other_chords_ask_for_nothing() {
+        assert_eq!(format_chord(true, KeyCode::KeyJ), None);
+        assert_eq!(format_chord(false, KeyCode::KeyK), None);
+        assert_eq!(format_chord(true, KeyCode::Slash), None);
     }
 }
 

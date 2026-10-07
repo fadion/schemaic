@@ -23495,10 +23495,12 @@ existing prose was left alone.
     code*, writes `sqlfmt::format_statement` over the statement under the click, and is offered only
     **without a selection** — with one, *Format code* already formats just that — and only when the
     statement is not formatted yet. A selection stays selected over the rewritten range; a bare
-    caret keeps its place among the tokens (`sqlfmt::caret_after_replace`). Neither has a shortcut;
-    each has a palette command (*Format Statement*, *Make Single Line*), which acts at the caret
-    through `Tab::format_req` — an `Option<FormatReq>` naming which of the three formats is asked —
-    and the same `sqlfmt` answer and `rewrite_range`.
+    caret keeps its place among the tokens (`sqlfmt::caret_after_replace`). Each has a palette
+    command (*Format Statement*, *Make Single Line*) and a key (Ctrl+Alt+Shift+L, Ctrl+Alt+J), which
+    act at the caret through `Tab::format_req` — an `Option<FormatReq>` naming which of the three
+    formats is asked — and the same `sqlfmt` answer and `rewrite_range`. **The menu entries wear no
+    keycap on purpose**: they act on the statement under the click, the key on the one at the caret,
+    so a keycap would claim the key does what the click does.
     **The Ctrl+K suggestion is not drawn here** — it is phantom rows in the editor's own line flow
     (`inline_diff`, below), and what `cmdk_popup` still draws is the two ends of the block: the
     question bar (sparkle, a `multiline` `edit_field` capped at three rows, then a send affordance or
@@ -33180,7 +33182,12 @@ Re-introducing the anti-patterns these guard against is a regression:
   invisible in review, because the line that "applies" the format looks exactly like the line that
   would work if the sync went both ways. It also meant two formatters, so the palette could drift
   from Ctrl+Alt+L; `format_req` (`Some(FormatReq::Code)`) reaches the same
-  `editor_pane::format_editor`.
+  `editor_pane::format_editor`. The keys now come the same way: the key handler asks
+  `editor_pane::format_chord` (Ctrl+Alt+L, Ctrl+Alt+Shift+L, Ctrl+Alt+J, matched by *physical* key
+  because Windows delivers Ctrl+Alt as AltGr) and sets `format_req` rather than formatting itself.
+  When it called `format_editor` directly, its Ctrl+Alt+L arm did not exclude Shift, so
+  Ctrl+Alt+Shift+L — now *Format statement* — formatted the whole document
+  (`each_format_chord_asks_for_its_own_request`, `other_chords_ask_for_nothing`).
   That function writes `sqlfmt::format_range`'s text, not `format_sql`'s — the `sqlfmt.rs` entry
   has the `fromt` splice that cost — and returns without touching the caret when `edit_untyped`
   refuses, where under the Ctrl+K preview's freeze it used to move the caret anyway. A formatted
@@ -33289,7 +33296,8 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   shows Del too, and Del then acts on that row as the entry does; the test is for an opener that
   does not re-select.
   The cell menu's single-row *Delete row* wears none, and neither does the editor's *Ask AI*, which
-  acts on the right-clicked statement where Ctrl+K takes the caret or selection; the editor's
+  acts on the right-clicked statement where Ctrl+K takes the caret or selection — nor, for the same
+  reason, *Format statement* and *Make single line*, whose keys act at the caret; the editor's
   *Format code* wears Ctrl+Alt+L, being the same `format_editor` call — and takes its label from
   the row too (`MenuKey::label`), so it is called what the shortcut sheet and the palette's
   *Format Code* call it (`the_format_action_has_one_name_on_every_surface`; it was "Format", "Format

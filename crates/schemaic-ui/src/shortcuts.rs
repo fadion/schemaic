@@ -99,6 +99,8 @@ pub(crate) const SHORTCUTS: &[ShortcutGroup] = &[
             ("Ctrl+D", "Duplicate line / selection"),
             ("Ctrl+X", "Cut line / selection"),
             ("Ctrl+Alt+L", "Format code"),
+            ("Ctrl+Alt+Shift+L", "Format statement"),
+            ("Ctrl+Alt+J", "Make single line"),
             ("Alt+↑ / Alt+↓", "Move line up / down"),
             ("Tab / Shift+Tab", "Indent / outdent"),
             (
@@ -191,6 +193,8 @@ pub(crate) const COMMAND_KEYS: &[(&str, &str, &str)] = &[
     ("next tab", "Global", "Ctrl+Tab"),
     ("previous tab", "Global", "Ctrl+Shift+Tab"),
     ("format code", "Editor", "Ctrl+Alt+L"),
+    ("format statement", "Editor", "Ctrl+Alt+Shift+L"),
+    ("make single line", "Editor", "Ctrl+Alt+J"),
     ("go to line", "Editor", "Ctrl+G"),
 ];
 
