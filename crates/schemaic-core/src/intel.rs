@@ -16498,6 +16498,136 @@ mod predict_tests {
         predict(&text, caret, &cat, SqlDialect::MySql)
     }
 
+    /// `ghost` taken at `caret` in `text` leaves the buffer as SQL with what
+    /// it had: every string, comment or quoted name the ghost opens closes
+    /// inside it — a line comment does not run into what follows on its line
+    /// — and the document holds the same statements, its `;`s kept.
+    fn assert_composes(text: &str, caret: usize, ghost: &str, d: SqlDialect) {
+        if let Err(e) = composes(text, caret, ghost, d) {
+            panic!("{e}");
+        }
+    }
+
+    /// [`assert_composes`]'s question, answered rather than asserted.
+    fn composes(text: &str, caret: usize, ghost: &str, d: SqlDialect) -> Result<(), String> {
+        let doc = format!("{}{ghost}{}", &text[..caret], &text[caret..]);
+        let end = caret + ghost.len();
+        let b = doc.as_bytes();
+        let mut i = caret;
+        while i < end {
+            match skip_noncode(b, i, d) {
+                Some(j) if j > end => {
+                    return Err(format!(
+                        "{ghost:?} leaves {:?} open in {doc:?}",
+                        &doc[i..end]
+                    ));
+                }
+                Some(j) => i = j.max(i + 1),
+                None => i += 1,
+            }
+        }
+        if crate::sql::statement_ranges(&doc, d).len()
+            != crate::sql::statement_ranges(text, d).len()
+        {
+            return Err(format!("{ghost:?} changed the statements of {doc:?}"));
+        }
+        Ok(())
+    }
+
+    /// The check refuses what it is there to catch: an open quote, a line
+    /// comment run into the code after it on its line, a `;` that splits the
+    /// statement — and passes a ghost that closes what it opens.
+    #[test]
+    fn a_ghost_that_leaves_the_sql_broken_does_not_compose() {
+        let d = SqlDialect::MySql;
+        let text = "SELECT * FROM t WHERE  LIMIT 1;";
+        let caret = text.find("  LIMIT").unwrap() + 1;
+        assert!(composes(text, caret, "a = 'x", d).is_err());
+        assert!(composes(text, caret, "a = 1 -- one", d).is_err());
+        assert!(composes(text, caret, "a = 1; SELECT 2", d).is_err());
+        assert!(composes(text, caret, "a = 'x;y' /* c */", d).is_ok());
+    }
+
+    /// **Each producer's ghost, spliced into the SQL it was asked of,
+    /// composes** ([`assert_composes`]) — a reasoned one from every producer
+    /// [`predict`] asks, with names that need quoting, and remembered ones
+    /// holding strings and comments. Each case must predict something, so the
+    /// corpus cannot go quietly vacuous.
+    #[test]
+    fn every_ghost_composes_with_the_sql_around_it() {
+        let mut detail = tbl("order details", &["id", "order id"]);
+        detail.foreign_keys = vec![ForeignKeyInfo {
+            columns: vec!["order id".to_string()],
+            ref_table: "orders".to_string(),
+            ref_columns: vec!["id".to_string()],
+            ..Default::default()
+        }];
+        detail.columns[0].primary_key = true;
+        let mut schema = keyed();
+        schema.tables.push(detail);
+        let cat = Catalog::build(&[("shop", &schema)], Some("shop"));
+        use SqlDialect::{MsSql, MySql, Postgres};
+        let reasoned = [
+            (MySql, "SELECT * FROM orders o JOIN customers c ON |"),
+            (MySql, "INSERT INTO orders (|)"),
+            (
+                MySql,
+                "CREATE TABLE t (a INT, FOREIGN KEY (a) REFERENCES customers (|))",
+            ),
+            (
+                MySql,
+                "INSERT INTO orders (id, total) VALUES (1, 2) ON DUPLICATE KEY UPDATE |",
+            ),
+            (MySql, "SELECT customer_id, COUNT(*) FROM orders GROUP BY |"),
+            (MySql, "SELECT * FROM invoices JOIN |"),
+            (MySql, "SELECT * FROM orders o JOIN customers c |"),
+            (MySql, "SELECT * FROM orders ORDER |;"),
+            (
+                MySql,
+                "SELECT * FROM orders ORDER | LIMIT 10;\nSELECT 'a;b';",
+            ),
+            (MySql, "SELECT * FROM orders WHERE total BETWEEN 1 |"),
+            (MySql, "SELECT ROW_NUMBER() |"),
+            (MySql, "SELECT * FROM `order details` d JOIN |"),
+            (
+                Postgres,
+                "SELECT * FROM \"order details\" d JOIN orders o |",
+            ),
+            (MsSql, "SELECT * FROM [order details] d JOIN |"),
+        ];
+        let mut silent = Vec::new();
+        for (d, sql) in reasoned {
+            let caret = sql.find('|').unwrap();
+            let text = sql.replacen('|', "", 1);
+            match predict(&text, caret, &cat, d) {
+                Some(ghost) => assert_composes(&text, caret, &ghost, d),
+                None => silent.push(sql),
+            }
+        }
+        assert!(silent.is_empty(), "no prediction for {silent:#?}");
+        let remembered = [
+            (
+                "SELECT * FROM t WHERE |",
+                "SELECT * FROM t WHERE a = 'x;y' /* note */ AND b = 1;",
+            ),
+            (
+                "SELECT * FROM t |",
+                "SELECT * FROM t WHERE a = '--' -- the dashes\nORDER BY a",
+            ),
+            (
+                "SELECT * FROM t WHERE a IN (|)",
+                "SELECT * FROM t WHERE a IN (')', 2)",
+            ),
+        ];
+        for (sql, past) in remembered {
+            let caret = sql.find('|').unwrap();
+            let text = sql.replacen('|', "", 1);
+            let ghost = predict_from_history(&text, caret, MySql, [past])
+                .unwrap_or_else(|| panic!("nothing recalled for {sql:?}"));
+            assert_composes(&text, caret, &ghost, MySql);
+        }
+    }
+
     #[test]
     fn a_keyword_whose_partner_is_certain_predicts_it() {
         for (sql, want) in [
