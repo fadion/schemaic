@@ -12051,6 +12051,13 @@ existing prose was left alone.
     terminator it set is not `;` reads it as one `Kind::Terminator`, which a word stops at (`END$$`)
     and `run` treats as `;` (`end_statement`), written tight unless spelled in word bytes
     (`a_mysql_delimiter_line_survives_formatting`, by the same split-and-compare, and idempotent).
+    **Idempotence is held as a property over the widest corpus the crate has**: `intel`'s
+    `valid_corpus`, formatted on all four engines, must format to itself a second time and keep
+    every non-blank character in order (`the_corpus_formats_idempotently_on_every_engine`, under
+    `intel`'s tests for where the corpus lives). The token-preservation test runs its shared shapes
+    on all four engines too, and SQL Server's own besides — bracketed names with `]]`, `N'…'`,
+    `@x`/`@@x`/`#t`/`##t`, compound assignment, `TOP (n)`, `OUTPUT`, `APPLY`, `type::Method`,
+    `!<`/`!>` — each idempotent. Both were green on arrival: they guard, they did not find.
     **A T-SQL `@x`, `@@ROWCOUNT`, `#t` or `##g` is one `Kind::Word`.** `@` and `#` fell to the
     operator arm and `need_space` separated them from their name, so one Format Code broke nearly
     every T-SQL script: `SELECT @ x` is Msg 137, `SELECT @ @ VERSION` and `CREATE TABLE # t` are

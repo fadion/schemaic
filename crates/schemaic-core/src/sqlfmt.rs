@@ -1883,9 +1883,33 @@ mod tests {
             // trailing-sign back-off the run rule would make it one.
             "select a from t where x=-1",
         ];
+        // On every engine, SQL Server and SQLite included: the shared shapes
+        // lex alike on all four.
         for sql in shared {
-            assert_preserves(sql, SqlDialect::MySql);
-            assert_preserves(sql, SqlDialect::Postgres);
+            for d in SqlDialect::ALL {
+                assert_preserves(sql, d);
+            }
+        }
+        // SQL Server's own: bracketed names (a `]]` inside one), `N'…'`,
+        // variables and temporary tables, compound assignment, `TOP (n)`,
+        // `OUTPUT`, `APPLY`, and `::` calling a static method of a type.
+        for sql in [
+            "select [order id], [a]]b] from [dbo].[t]",
+            "select N'unicode' as [x] from t where name = N'é'",
+            "declare @n int = 1; set @n += 2; select @n, @@rowcount",
+            "select top (5) * from #work join ##shared s on s.id = #work.id",
+            "update t set n -= 1, m *= 2 output inserted.id where id = @id",
+            "select a.x from a cross apply (select top 1 b.y from b where b.a = a.id) c",
+            "select geography::Point(47.6, -122.3, 4326).STAsText()",
+            "select x from t where y <> 1 and z !< 2 and w !> 3",
+        ] {
+            assert_preserves(sql, SqlDialect::MsSql);
+            let once = super::format_sql(sql, IND, SqlDialect::MsSql);
+            assert_eq!(
+                super::format_sql(&once, IND, SqlDialect::MsSql),
+                once,
+                "not idempotent: {sql}"
+            );
         }
         // Dialect-only shapes, each meaningless or differently-lexed elsewhere.
         assert_preserves(

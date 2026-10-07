@@ -21878,6 +21878,31 @@ mod tests {
         ]
     }
 
+    /// **Format Code is idempotent over the whole corpus, on every engine**:
+    /// a second Format changes nothing, and neither changes what the
+    /// statement says — the same non-blank characters, in order. Asserted
+    /// here because this is the widest body of SQL the crate holds; the
+    /// formatter's own tests pin layout, one shape at a time.
+    #[test]
+    fn the_corpus_formats_idempotently_on_every_engine() {
+        let mut failures = Vec::new();
+        let ink = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+        for d in SqlDialect::ALL {
+            for sql in valid_corpus() {
+                let once = crate::sqlfmt::format_sql(sql, "  ", d);
+                let twice = crate::sqlfmt::format_sql(&once, "  ", d);
+                if twice != once {
+                    failures.push(format!(
+                        "[{d:?}] not idempotent: {sql}\n{once}\n--\n{twice}"
+                    ));
+                } else if ink(&once) != ink(sql) {
+                    failures.push(format!("[{d:?}] changed the text: {sql}\n{once}"));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+    }
+
     #[test]
     fn corpus_valid_queries_produce_no_diagnostics() {
         let valid = valid_corpus();
