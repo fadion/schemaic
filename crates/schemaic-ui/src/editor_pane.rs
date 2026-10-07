@@ -3503,7 +3503,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     let ed_bar_poke = ed.clone(); // auto-hide: poke the bars on scroll/resize
     let ed_wheel = ed.clone(); // shift+wheel → horizontal scroll
     let ed_find = ed.clone(); // Ctrl+F find: select + centre a match
-    let ed_fmt = ed.clone(); // right-click "Format code"
+    let ed_fmt = ed.clone(); // right-click "Format code" / "Copy as single line"
     let ed_cursor = ed.clone(); // mirror caret offset out for the status bar
     let ed_goto = ed.clone(); // Ctrl+G go-to-line: move caret + centre
     let ed_jump = ed.clone(); // status-bar warning count: jump to first warning
@@ -3873,6 +3873,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             let run_optimize = inline_ai_run.clone();
             let show_plan = open_plan.clone();
             let ed_format = ed_fmt.clone();
+            let ed_one_line = ed_fmt.clone();
             let make_view = create_view.clone();
             // "AI fix" — offered only over a statement the editor has something
             // to say about, which is what the user is pointing at when they
@@ -3916,7 +3917,8 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 })
             };
             // The three AI actions carry the sparkle (matching AI Summary in the
-            // grid); Plan + Format sit below the separator as plain actions.
+            // grid); Plan, Format and Copy as single line sit below the
+            // separator as plain actions.
             let ai_entries = vec![
                 MenuEntry::action_icon(
                     "Ask AI",
@@ -4046,6 +4048,28 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 })
                 .shortcut(crate::shortcuts::MenuKey::EditorFormat),
             ]);
+            // "Copy as single line": the selection, or the statement under the
+            // click, on one line (`sqlfmt::single_line_copy`). Absent when it
+            // has none to give — a `GO` line, a selection starting in a string —
+            // and, like every entry here, re-derived when it runs.
+            let one_line = move || {
+                let off = menu_offset.get_untracked();
+                let sel = ed_one_line
+                    .cursor
+                    .get_untracked()
+                    .get_selection()
+                    .unwrap_or((off, off));
+                query.with_untracked(|sql| {
+                    schemaic_core::sqlfmt::single_line_copy(sql, sel, off, dialect.get_untracked())
+                })
+            };
+            if one_line().is_some() {
+                entries.push(MenuEntry::action("Copy as single line", move || {
+                    if let Some(text) = one_line() {
+                        let _ = floem::Clipboard::set_contents(text);
+                    }
+                }));
+            }
             // First when it's there: over a squiggle it is the most specific
             // thing this menu can offer, and the one the user came for.
             if let Some(fix) = fix_entry {

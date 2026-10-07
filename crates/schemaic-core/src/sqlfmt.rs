@@ -106,6 +106,109 @@ pub fn format_range(
     format!("{lead}{}{trail}", format_sql(body, indent_unit, dialect))
 }
 
+/// `sql` on one line, for the editor's *Copy as single line*: every run of
+/// whitespace in code becomes one space, a block comment's runs too, and a
+/// `--`/`#` comment becomes `/* … */` — it would otherwise swallow everything
+/// after it. Strings, quoted names and dollar-quoted bodies are copied as
+/// they are, line breaks and all: those are data, and a statement that
+/// changed them would not be the one it was copied from.
+///
+/// `None` when the text cannot be one line and mean the same: a `GO` or
+/// `DELIMITER` line, which a client only reads standing on its own line, or a
+/// line comment whose text would not lex back as one block comment (a `*/` in
+/// it, or a `/*` where comments nest).
+pub fn single_line(sql: &str, dialect: SqlDialect) -> Option<String> {
+    let b = sql.as_bytes();
+    let collapse = |s: &str| s.split_ascii_whitespace().collect::<Vec<_>>().join(" ");
+    let mut out = String::with_capacity(sql.len());
+    let mut space = false;
+    let mut line_start = true;
+    // A MySQL executable comment (`/*!…*/`, `/*M!…*/`) is code to the lexer,
+    // so a line comment inside one is lexed as one — and rewritten, its `*/`
+    // would close the executable comment. Where one has opened, a line comment
+    // refuses the copy (conservatively: even after it has closed).
+    let mut executable = false;
+    let mut i = 0;
+    while i < b.len() {
+        if b[i].is_ascii_whitespace() {
+            line_start |= b[i] == b'\n';
+            space = !out.is_empty();
+            i += 1;
+            continue;
+        }
+        if std::mem::take(&mut line_start)
+            && (crate::sql::delimiter_directive(sql, i, dialect).is_some()
+                || crate::sql::go_directive(sql, i, dialect).is_some())
+        {
+            return None;
+        }
+        let (piece, next) = match skip_noncode(b, i, dialect) {
+            Some(j) => {
+                let j = j.max(i + 1);
+                let span = &sql[i..j];
+                // The lexer hands back an executable comment's marker alone —
+                // on MySQL; elsewhere `/*!` opens a whole comment, `*/` and all.
+                executable |=
+                    (span.starts_with("/*!") || span.starts_with("/*M!")) && !span.ends_with("*/");
+                let line_body = span.strip_prefix("--").or_else(|| span.strip_prefix('#'));
+                let piece = match line_body {
+                    Some(body) => {
+                        let body = collapse(body);
+                        if body.is_empty() {
+                            i = j;
+                            continue;
+                        }
+                        if executable {
+                            return None;
+                        }
+                        let block = format!("/* {body} */");
+                        if !crate::sql::is_one_comment(&block, dialect) {
+                            return None;
+                        }
+                        block
+                    }
+                    None if span.starts_with("/*") => collapse(span),
+                    None => span.to_string(),
+                };
+                (piece, j)
+            }
+            None => {
+                let ch = sql[i..].chars().next()?;
+                (ch.to_string(), i + ch.len_utf8())
+            }
+        };
+        if std::mem::take(&mut space) {
+            out.push(' ');
+        }
+        out.push_str(&piece);
+        i = next;
+    }
+    Some(out)
+}
+
+/// What *Copy as single line* copies, [`single_line`] already applied: the
+/// selection `sel` when there is one — refused, like Format Code's, when an
+/// end is not in code ([`formattable_range`]), since the fragment would be
+/// lexed from a boundary that isn't one — or else the statement at `offset`,
+/// the right-click's. `None` leaves the menu entry out.
+pub fn single_line_copy(
+    full: &str,
+    sel: (usize, usize),
+    offset: usize,
+    dialect: SqlDialect,
+) -> Option<String> {
+    let (lo, hi) = if sel.0 != sel.1 {
+        formattable_range(full, sel.0, sel.1, dialect)?
+    } else {
+        crate::sql::statement_range(full, offset, dialect)
+    };
+    let text = full.get(lo..hi)?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    single_line(text, dialect)
+}
+
 /// Where a caret at `old_caret` in `old` belongs in `new`, the text
 /// [`format_sql`] made of it: after as many non-whitespace bytes as preceded
 /// it.
@@ -1119,6 +1222,92 @@ mod tests {
     }
 
     const IND: &str = "  ";
+
+    #[test]
+    fn single_line_collapses_whitespace_in_code_and_comments() {
+        use SqlDialect::MySql;
+        let sql = "  SELECT a,\n\t  b\r\nFROM t /* two\n   lines */\nWHERE x = 1;\n";
+        assert_eq!(
+            single_line(sql, MySql).unwrap(),
+            "SELECT a, b FROM t /* two lines */ WHERE x = 1;"
+        );
+        assert_eq!(single_line("", MySql).unwrap(), "");
+    }
+
+    #[test]
+    fn single_line_turns_a_line_comment_into_a_block_comment() {
+        use SqlDialect::{MySql, Postgres};
+        assert_eq!(
+            single_line("SELECT a -- the key\n  , b # note\nFROM t", MySql).unwrap(),
+            "SELECT a /* the key */ , b /* note */ FROM t"
+        );
+        // An empty comment just goes.
+        assert_eq!(single_line("a --\nb", MySql).unwrap(), "a b");
+        // `#` is no comment on PostgreSQL.
+        assert_eq!(single_line("a #- b\nc", Postgres).unwrap(), "a #- b c");
+    }
+
+    #[test]
+    fn single_line_keeps_a_strings_line_breaks() {
+        use SqlDialect::{MySql, Postgres};
+        assert_eq!(
+            single_line("INSERT INTO t\nVALUES ('a\n  b')", MySql).unwrap(),
+            "INSERT INTO t VALUES ('a\n  b')"
+        );
+        let body = "$$\nBEGIN\n  -- keep\nEND\n$$";
+        assert_eq!(
+            single_line(&format!("CREATE FUNCTION f() AS\n{body}"), Postgres).unwrap(),
+            format!("CREATE FUNCTION f() AS {body}")
+        );
+    }
+
+    #[test]
+    fn single_line_refuses_what_one_line_would_change() {
+        use SqlDialect::{MsSql, MySql, Postgres};
+        assert_eq!(single_line("SELECT 1\nGO\nSELECT 2", MsSql), None);
+        assert_eq!(single_line("DELIMITER //\nSELECT 1//", MySql), None);
+        assert_eq!(single_line("a -- x */ y\nb", MySql), None);
+        // Where comments nest, a `/*` in the text would leave one open.
+        assert_eq!(single_line("a -- x /* y\nb", Postgres), None);
+        assert_eq!(
+            single_line("a -- x /* y\nb", MySql).unwrap(),
+            "a /* x /* y */ b"
+        );
+        // Inside a MySQL executable comment the `*/` of the rewritten comment
+        // would close the executable one; outside one, a line comment is fine.
+        assert_eq!(single_line("/*!50001 SELECT 1 -- n\n */", MySql), None);
+        assert_eq!(single_line("/*!50001 SELECT 1 */ -- n\nx", MySql), None);
+        assert_eq!(
+            single_line("SELECT 1 -- n\n", MySql).unwrap(),
+            "SELECT 1 /* n */"
+        );
+        // Off MySQL `/*!` opens an ordinary comment, closed where it ends.
+        assert_eq!(
+            single_line("/*! a */ SELECT 1 -- n\n", Postgres).unwrap(),
+            "/*! a */ SELECT 1 /* n */"
+        );
+        // `GO` is only a directive on SQL Server.
+        assert_eq!(single_line("SELECT 1\nGO", MySql).unwrap(), "SELECT 1 GO");
+    }
+
+    #[test]
+    fn single_line_copy_takes_the_selection_or_the_statement_at_the_click() {
+        use SqlDialect::MySql;
+        let doc = "SELECT 1;\nSELECT a,\n  b FROM t;\n";
+        // A bare caret: the statement it is in, without its padding.
+        assert_eq!(
+            single_line_copy(doc, (12, 12), 12, MySql).unwrap(),
+            "SELECT a, b FROM t;"
+        );
+        // A selection: exactly that, wherever the click was.
+        assert_eq!(
+            single_line_copy(doc, (10, 23), 2, MySql).unwrap(),
+            "SELECT a, b"
+        );
+        // A selection starting inside a string is no fragment to lex.
+        assert_eq!(single_line_copy("SELECT 'a\nb' x", (9, 14), 0, MySql), None);
+        assert_eq!(single_line_copy("  \n  ", (1, 1), 1, MySql), None);
+    }
 
     /// An array constructor's or a subscript's brackets sit tight, a slice's
     /// `:` binds both bounds, and a comma inside them is an element list's —

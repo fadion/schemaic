@@ -11894,6 +11894,32 @@ existing prose was left alone.
     landing straight after the token before it (`the_caret_keeps_its_place_through_a_format`). That
     leans on this module's contract that only whitespace moves: a layout that ever changed a token's
     text would put the caret somewhere else.
+    **`single_line` is the editor's *Copy as single line*, and it is not `format_sql` with the
+    breaks left out, because a line break is not always layout.** A whitespace run in code becomes
+    one space and a block comment's runs collapse too, but a `--` or `#` comment ends at its line
+    and would swallow the rest of the statement, so it is rewritten as `/* … */` (an empty one is
+    dropped) — and the whole copy is refused, `None`, unless `sql::is_one_comment` reads the result
+    back as one comment closed at its own end: a `*/` in the text would close it early, and where
+    comments nest a `/*` would leave it open. A MySQL executable comment is the one that check
+    cannot see: `skip_noncode` hands back its marker (`/*!`, `/*!nnnnn`, `/*M!…`) as a span of its
+    own and lexes the body as code, so a `--` inside `/*!50001 … */` was rewritten `/* n */`, whose
+    `*/` closed the executable comment early (`/*!50001 SELECT 1 /* n */ */`). Once a marker has
+    been seen, a non-empty line comment refuses the copy — even after the executable comment has
+    closed, since the walk does not track its end.
+    Strings, quoted names and dollar-quoted bodies are
+    copied **verbatim, line breaks included** — they are data, and a copy that changed them would
+    not be the statement it was copied from — so a PL/pgSQL body keeps its lines and its `--`
+    comments. A `GO` or `DELIMITER` line refuses it too (`sql::go_directive`/`delimiter_directive`,
+    asked at the first non-blank code byte of each line), since a client reads either only standing
+    on a line of its own. That is deliberately conservative: unlike `tokenize`, it does not ask
+    whether a statement begins there, so a line that merely opens with a word `delimiter`
+    mid-statement refuses as well (`single_line_refuses_what_one_line_would_change`).
+    `single_line_copy` picks what is copied — the selection when there is one, else
+    `sql::statement_range` at the right-click, trimmed, an empty answer being `None` — and puts the
+    selection through `formattable_range` for that function's reason: `single_line` lexes from byte
+    0 as well, and a fragment opening inside a string takes its closing quote for an opening one
+    (`single_line_copy_takes_the_selection_or_the_statement_at_the_click`). Only the copy is
+    written; an in-place minify is not.
     **`tokenize` takes a numeric literal in one arm, ahead of the word arm, because two of a
     number's three parts are spelled in bytes that arm calls punctuation.** `1.5e-3` lexed as
     `["1", ".", "5e", "-", "3"]`; `need_space` suppresses the space around a `.`, but nothing said
@@ -23226,6 +23252,14 @@ existing prose was left alone.
     holds the hover box to the wave, and
     `the_tip_stays_inside_the_pane_margins_wherever_the_squiggle_is` sweeps pane widths and squiggle
     positions for either edge ever reaching past a margin.
+    **The right-click menu's *Copy as single line*** puts `sqlfmt::single_line_copy`'s answer on the
+    clipboard — the selection, or with none the statement under the right-click, on one line (the
+    `sqlfmt.rs` entry has what that keeps and what it refuses). It is **absent rather than dimmed**
+    when that answers `None`, as *Create view* is, and re-derived when clicked, like every other
+    action in the menu. The selection it reads is the one floem's `right_click` leaves: a click
+    inside the selection keeps it and a click outside collapses it to the caret the click placed,
+    so what is copied is the statement under the pointer unless the pointer was on the selection.
+    It has no shortcut.
     **The Ctrl+K suggestion is not drawn here** — it is phantom rows in the editor's own line flow
     (`inline_diff`, below), and what `cmdk_popup` still draws is the two ends of the block: the
     question bar (sparkle, a `multiline` `edit_field` capped at three rows, then a send affordance or
