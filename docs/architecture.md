@@ -1103,7 +1103,7 @@ existing prose was left alone.
     the order of its two tests is the bug it fixes.** `ends_table_ref` first, because
     a join or clause keyword *ends* a table reference rather than naming it, and only then
     `is_reserved_word`. Only SQLite showed it: `MYSQL_RESERVED` and `PG_RESERVED` both carry
-    `LEFT`/`INNER`/`CROSS`/`FULL`/`NATURAL`/`RIGHT`, so on those engines the reserved test alone
+    `LEFT`/`INNER`/`CROSS`/`NATURAL`/`RIGHT` (MySQL has no `FULL` join to reserve), so on those engines the reserved test alone
     happened to reject them, while `SQLITE_RESERVED` holds only what SQLite refuses *as an alias* and
     that engine accepts all seven as identifiers. So
     `SELECT * FROM orders LEFT JOIN customers ON |` registered `orders` under the alias `LEFT`,
@@ -1878,18 +1878,30 @@ existing prose was left alone.
     `filter::table_query` over a table `if` keyed on a `cast` column generated
     `SELECT * FROM if ORDER BY cast ASC LIMIT 10` and SQLite answered `near "ASC": syntax error`.
     **The MySQL family is two servers here, and the two questions take them differently.**
-    `MYSQL_RESERVED` is MySQL 8's; MariaDB, measured word by word against its own
+    `MYSQL_RESERVED` is MySQL 8.4's, matching 8.4.11's `information_schema.KEYWORDS` where
+    `RESERVED = 1` word for word (`mysql_reserves_what_8_4_reserves`) — it was 8.0's, which still
+    held `MASTER_BIND` and `MASTER_SSL_VERIFY_SERVER_CERT` (8.4 takes both as aliases) and lacked
+    `QUALIFY` and `TABLESAMPLE` (8.4 refuses both). The cost is on 8.0, past its end of life: an
+    `AS qualify` it accepts is now warned about. MariaDB, measured word by word against its own
     `information_schema.KEYWORDS` in all three alias positions on 10.11.14 and 11.8.9, takes the
-    thirty-one words of `MARIADB_FREES` as aliases (the window functions, `LATERAL`, `ROW`,
-    `SYSTEM`, …) and refuses the fifteen of `MARIADB_ADDS` (`OFFSET`, `RETURNING`,
-    `CURRENT_ROLE`, …). The **alias check** asks `is_reserved_word_on` with the server's flavour,
+    thirty-two words of `MARIADB_FREES` as aliases (the window functions, `LATERAL`, `ROW`,
+    `QUALIFY`, …) and refuses the fifteen of `MARIADB_ADDS` (`OFFSET`, `RETURNING`,
+    `CURRENT_ROLE`, …). A word only **one version** reserves sits in a third list,
+    `RESERVED_BY_SOME_VERSION` — 8.0's two above; `MASTER_SSL_VERIFY_SERVER_CERT` again, which
+    10.11 refuses and 11.8 takes; and `VECTOR`, `SQL_AFTER_GTIDS` and `SQL_BEFORE_GTIDS`, which
+    11.8 refuses and 10.11 takes. The server's version is not known, so the warning never reads
+    it — a false squiggle is the worse mistake there — and only the quoter does. Before it
+    existed the 11.8 words were left out of both, so a column named `vector` went into generated
+    SQL bare and would not parse on 11.8. The **alias check** asks `is_reserved_word_on` with the
+    server's flavour,
     which `Catalog` now carries (`Catalog::flavour`, from the active database's `DbSchema`), and
     with none known holds to what both reserve — the warning's side
     (`mariadb_reserves_its_own_words`, `the_alias_check_follows_the_servers_flavour`). Its implicit
     `orders offset` form is read by the table-list walk on the dialect's list, so a MariaDB-only
     word there goes unflagged rather than wrongly read. The **quoter** cannot know the server, so
-    `must_quote_ident` takes both (`reserved_anywhere`): a MariaDB column named `offset` had gone
-    into generated SQL bare (`a_word_either_mysql_family_server_reserves_is_quoted`). The other
+    `must_quote_ident` takes both, and every version (`reserved_anywhere`): a MariaDB column named
+    `offset` had gone into generated SQL bare (`a_word_either_mysql_family_server_reserves_is_quoted`,
+    `a_word_one_server_version_reserves_is_quoted`). The other
     `is_reserved_word` sites — the scope's alias resolution among them — still read MySQL's list.
     Neither list is a transcription of anybody's documentation any more: `db::sqlite`'s
     `the_reserved_lists_match_what_sqlite_itself_refuses` walks the engine's own keyword table

@@ -8313,8 +8313,9 @@ fn is_query_body_keyword(word: &str) -> bool {
 /// for [`is_reserved_word`] (the alias check + scope's alias resolution); it's a
 /// superset of the small [`SQL_KEYWORDS`] completion set and deliberately excludes
 /// non-reserved keywords (`OFFSET`, `VIEW`, `TRUNCATE`, …), which *are* legal aliases.
-/// Sourced from MySQL 8.0's "Keywords and Reserved Words" (the `(R)` entries), plus
-/// `INTERSECT`. The Postgres counterpart is [`PG_RESERVED`]; [`is_reserved_word`]
+/// It is MySQL 8.4's `information_schema.KEYWORDS` where `RESERVED = 1`, matched
+/// word for word on 8.4.11; 8.0's two that 8.4 frees are in
+/// [`RESERVED_BY_SOME_VERSION`]. The Postgres counterpart is [`PG_RESERVED`]; [`is_reserved_word`]
 /// selects between them by [`SqlDialect`].
 const MYSQL_RESERVED: &[&str] = &[
     "ACCESSIBLE",
@@ -8458,8 +8459,6 @@ const MYSQL_RESERVED: &[&str] = &[
     "LONGTEXT",
     "LOOP",
     "LOW_PRIORITY",
-    "MASTER_BIND",
-    "MASTER_SSL_VERIFY_SERVER_CERT",
     "MATCH",
     "MAXVALUE",
     "MEDIUMBLOB",
@@ -8495,6 +8494,7 @@ const MYSQL_RESERVED: &[&str] = &[
     "PRIMARY",
     "PROCEDURE",
     "PURGE",
+    "QUALIFY",
     "RANGE",
     "RANK",
     "READ",
@@ -8543,6 +8543,7 @@ const MYSQL_RESERVED: &[&str] = &[
     "STRAIGHT_JOIN",
     "SYSTEM",
     "TABLE",
+    "TABLESAMPLE",
     "TERMINATED",
     "THEN",
     "TINYBLOB",
@@ -8604,27 +8605,27 @@ const MARIADB_FREES: &[&str] = &[
     "LAST_VALUE",
     "LATERAL",
     "LEAD",
-    "MASTER_BIND",
     "NTH_VALUE",
     "NTILE",
     "OF",
     "OPTIMIZER_COSTS",
     "OPTION",
     "PERCENT_RANK",
+    "QUALIFY",
     "RANK",
     "ROW",
     "SCHEMA",
     "STORED",
     "SYSTEM",
+    "TABLESAMPLE",
     "VIRTUAL",
 ];
 
 /// Words **MariaDB reserves** that [`MYSQL_RESERVED`] does not: refused in all
 /// three alias positions on MariaDB 10.11.14 and 11.8.9, found by trying every
-/// word of its `information_schema.KEYWORDS`. 11.8 also refuses `VECTOR`,
-/// `SQL_AFTER_GTIDS` and `SQL_BEFORE_GTIDS`, which 10.11 takes; they are left
-/// out, since the version is not known here and a false squiggle is the worse
-/// mistake.
+/// word of its `information_schema.KEYWORDS`. A word only one of the two
+/// versions refuses is left out, since the version is not known here and a
+/// false squiggle is the worse mistake; it is in [`RESERVED_BY_SOME_VERSION`].
 const MARIADB_ADDS: &[&str] = &[
     "CURRENT_ROLE",
     "DELETE_DOMAIN_ID",
@@ -8641,6 +8642,21 @@ const MARIADB_ADDS: &[&str] = &[
     "STATS_AUTO_RECALC",
     "STATS_PERSISTENT",
     "STATS_SAMPLE_PAGES",
+];
+
+/// Words **one version** of a MySQL-family server reserves and another takes
+/// as an alias: MySQL 8.0's reserved list holds `MASTER_BIND` and
+/// `MASTER_SSL_VERIFY_SERVER_CERT`, which 8.4.11 takes. Measured in all three
+/// alias positions: MariaDB 10.11.14 refuses `MASTER_SSL_VERIFY_SERVER_CERT` and 11.8.9 takes
+/// it; 11.8.9 refuses `VECTOR`, `SQL_AFTER_GTIDS` and `SQL_BEFORE_GTIDS`,
+/// which 10.11.14 takes. The server's version is not known here, so these
+/// draw no warning, and only the quoter ([`reserved_anywhere`]) reads them.
+const RESERVED_BY_SOME_VERSION: &[&str] = &[
+    "MASTER_BIND",
+    "MASTER_SSL_VERIFY_SERVER_CERT",
+    "SQL_AFTER_GTIDS",
+    "SQL_BEFORE_GTIDS",
+    "VECTOR",
 ];
 
 /// PostgreSQL **reserved** words — those that can't be a bare (unquoted)
@@ -9058,12 +9074,15 @@ pub fn is_reserved_word_on(
 
 /// Does either MySQL-family server reserve `word`? The quoter's question
 /// ([`must_quote_ident`]), which cannot know the server and must be safe on
-/// both: [`MYSQL_RESERVED`] and [`MARIADB_ADDS`]. Elsewhere the dialect's list.
+/// both, and on every version of each: [`MYSQL_RESERVED`], [`MARIADB_ADDS`]
+/// and [`RESERVED_BY_SOME_VERSION`]. Elsewhere the dialect's list.
 fn reserved_anywhere(word: &str, dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MySql => {
+            let up = word.to_ascii_uppercase();
             is_reserved_word(word, dialect)
-                || MARIADB_ADDS.contains(&word.to_ascii_uppercase().as_str())
+                || MARIADB_ADDS.contains(&up.as_str())
+                || RESERVED_BY_SOME_VERSION.contains(&up.as_str())
         }
         SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => {
             is_reserved_word(word, dialect)
@@ -21850,6 +21869,44 @@ mod tests {
         for w in MARIADB_ADDS {
             assert!(!MYSQL_RESERVED.contains(w), "{w}");
         }
+    }
+
+    /// **MySQL's list is 8.4's.** Measured on 8.4.11 in all three alias
+    /// positions: `QUALIFY` and `TABLESAMPLE` are refused, `MASTER_BIND` and
+    /// `MASTER_SSL_VERIFY_SERVER_CERT` — 8.0's — are taken. MariaDB 10.11.14
+    /// and 11.8.9 take `QUALIFY` and `TABLESAMPLE`.
+    #[test]
+    fn mysql_reserves_what_8_4_reserves() {
+        use crate::schema::ServerFlavour::{MariaDb, MySql as My, Unknown};
+        let on = |w, f| is_reserved_word_on(w, SqlDialect::MySql, f);
+        for w in ["qualify", "tablesample"] {
+            assert!(on(w, My), "{w}");
+            assert!(!on(w, MariaDb) && !on(w, Unknown), "{w}");
+        }
+        for w in ["master_bind", "master_ssl_verify_server_cert"] {
+            for f in [My, MariaDb, Unknown] {
+                assert!(!on(w, f), "{w} {f:?}");
+            }
+        }
+    }
+
+    /// A word only some version of a MySQL-family server reserves draws no
+    /// warning, but the quoter, which knows no version, quotes it: MySQL 8.0
+    /// reserves `MASTER_BIND`, MariaDB 10.11 `MASTER_SSL_VERIFY_SERVER_CERT`,
+    /// MariaDB 11.8 `VECTOR` and the GTID pair.
+    #[test]
+    fn a_word_one_server_version_reserves_is_quoted() {
+        for w in [
+            "master_bind",
+            "master_ssl_verify_server_cert",
+            "vector",
+            "sql_after_gtids",
+            "sql_before_gtids",
+            "qualify",
+        ] {
+            assert!(must_quote_ident(w, SqlDialect::MySql), "{w}");
+        }
+        assert!(!must_quote_ident("vector", SqlDialect::Postgres));
     }
 
     /// A quoter does not know which server it writes for, so a name either
