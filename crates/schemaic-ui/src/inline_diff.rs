@@ -49,8 +49,6 @@ use floem::views::editor::text::{Document, DocumentPhantom, PreeditData};
 use schemaic_core::diff::InlinePlan;
 use schemaic_core::intel::SqlDialect;
 
-use crate::sql_highlight::highlight_spans;
-
 /// What the editor is currently showing about a Ctrl+K request, or `None` when
 /// it is showing nothing.
 ///
@@ -305,6 +303,9 @@ pub fn segments(view: &InlineView, line: usize, dialect: SqlDialect) -> Option<S
         .iter()
         .find(|h| h.anchor == line && !h.add.is_empty())?;
     let mut parts: Vec<(String, Option<Color>)> = Vec::new();
+    // The hunk's rows lexed as one text, so a comment or string the
+    // suggestion opens on one row is coloured as one on the next.
+    let spans = crate::sql_highlight::highlight_lines(&hunk.add, dialect);
     for (i, added) in hunk.add.iter().enumerate() {
         // A `before` block ends each row with the newline; an after-block starts
         // each row with one. Either way there is exactly one `\n` per added row,
@@ -316,7 +317,7 @@ pub fn segments(view: &InlineView, line: usize, dialect: SqlDialect) -> Option<S
             parts.push((" ".to_string(), None));
         } else {
             let mut at = 0;
-            for (s, e, color) in highlight_spans(added, dialect) {
+            for &(s, e, color) in spans.get(i).into_iter().flatten() {
                 if s > at {
                     parts.push((added[at..s].to_string(), None));
                 }

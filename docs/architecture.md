@@ -25209,8 +25209,8 @@ existing prose was left alone.
     then wears the editor theme's `variable` colour — it used only to be kept from being a keyword —
     while the temporary table keeps the default, as a bare table name does. So does a `:name`
     placeholder, which is found by `core::params::scan` — the parameters bar's own rule, not a
-    second scanner — run over the line from where code starts (past a continued block comment's
-    `*/`, or a directive). That rule is what leaves a PostgreSQL `::` cast, MySQL's `:=`, an array
+    second scanner — run over the line from where code starts (past the close of a region carried
+    in from the line above, or a directive). That rule is what leaves a PostgreSQL `::` cast, MySQL's `:=`, an array
     slice and a `:x` in a string or comment uncoloured, and a placeholder spelled like a keyword
     (`:limit`) is a placeholder, not a keyword (`variables_and_placeholders_are_coloured`). A number is
     coloured whole by `number_end` — `0x1F`, `1.5E-3`, an `e` counting only with a digit after it —
@@ -25219,8 +25219,27 @@ existing prose was left alone.
     `DELIMITER $$` — takes the keyword colour, argument and all, from `sql::line_directive_span`,
     which asks `go_directive`/`delimiter_directive` of the line alone: whether a statement begins
     there is the splitter's question, and here only a colour rides on it, so a mid-statement line
-    opening `delimiter x` is coloured as one. A line that starts inside a block comment is never
-    asked (`a_directive_line_is_coloured_as_a_keyword`).
+    opening `delimiter x` is coloured as one. A line that starts inside a region carried from above
+    is never asked (`a_directive_line_is_coloured_as_a_keyword`).
+    **Every non-code region carries across lines, not only `/* */`.** The styling hook lexes one
+    line at a time, so what a line starts inside has to be handed to it: `carried_lines` makes one
+    forward pass over the document's `skip_noncode` regions — string, dollar-quoted body, quoted
+    name, comment — and gives each line that begins strictly inside one a `LineCarry`, the region's
+    `noncode_kind` and the byte column just past its close on that line (`None` when it runs on).
+    `lex_line_with` colours that lead as the kind — a literal the string colour, a comment the
+    comment colour, a quoted name the default, as one opened on its own line is — returns there if
+    the region runs past the line, and otherwise lexes the rest as code. This pass used to carry
+    block comments alone (`block_comment_lines`, now a `#[cfg(test)]` narrowing of it kept for the
+    tests that pin that case), so a multi-line string's second line was lexed as code and a
+    PostgreSQL function's `$$` body as keywords. Where a comment closes is the dialect's, since
+    `skip_noncode` decides it: `/* a /* b */⏎c */` carries into its second line on PostgreSQL,
+    where comments nest, and not on MySQL (`every_noncode_region_carries_across_lines`).
+    `highlight_spans` still lexes one line with no carry — it has no document — so a string or
+    comment spanning a preview's lines is coloured line by line there. The Ctrl+K diff's added
+    rows go through `highlight_lines` instead, which lexes a hunk's rows as one text and carries
+    what one row opens into the next (`a_run_of_lines_carries_its_regions`); the document around
+    the hunk is still not read, so a hunk that starts inside a string the lines above opened is
+    coloured as code.
     **Rainbow brackets** (Settings → Editor, off by default — `UiState::editor_rainbow_brackets`,
     `theme::editor_rainbow_brackets`) are the one colour that depends on lines other than its own.
     `lex_line_with` takes the depth its line starts at, or `None` while the setting is off, which
@@ -25229,7 +25248,7 @@ existing prose was left alone.
     from the editor theme's own `type_`, `keyword` and `function` (`[..][depth % 3]`) rather than a
     palette of its own (`rainbow_brackets_are_coloured_by_depth`). The starting depths are
     `pairs::bracket_depth_at_lines`, cached in `SqlStyling::bracket_lines` per document revision and
-    dialect (`depth_at`) beside `block_lines`, the starts-inside-a-block-comment flags, and for the
+    dialect (`depth_at`) beside `block_lines`, the carried regions above, and for the
     same reason: the styling hook runs per visible line on every relayout, and re-walking the
     document before each line is the Θ(visible × document) cost `block_lines` was added to remove.
     It is computed only while the setting is on. `set_editor_rainbow_brackets` bumps `editor_gen`,
@@ -25237,9 +25256,10 @@ existing prose was left alone.
     out. `highlight_spans` has no document, so each standalone line of the Ctrl+K diff or a preview
     starts at depth 0 and a bracket opened on an earlier line is unknown there; and since that puts
     `type_` and `function` on previews, `contrast.rs`'s cross-axis preview test now holds both to
-    *Recessive* as well. Not covered: the lexer still treats a string continued from an earlier line
-    per line, as it always has, so a bracket inside that continuation is coloured as code — the depth
-    each later line starts at is unaffected, the cached count having skipped the string whole.
+    *Recessive* as well. In the editor a bracket inside a string continued from an earlier line is
+    part of the carried lead and goes uncoloured; it was coloured as code while only block comments
+    carried, though the depth each later line starts at never moved, the cached count having
+    skipped the string whole.
     **Visible whitespace and indent guides** (Settings → Editor, both off by default —
     `UiState::editor_show_whitespace`/`editor_indent_guides`, pinned by
     `whitespace_and_indent_guides_default_off_and_keep_an_on`; `theme::editor_show_whitespace`/
@@ -25259,9 +25279,8 @@ existing prose was left alone.
     `core/sqlfmt.rs` entry's.
     **`FieldSql` carries the same colouring into an `edit_field`** — the DDL preview's SQL box and
     the view, trigger and routine bodies, each of which sets `FieldCfg::sql` (under `lib.rs`). It
-    is the same `lex_line_with` with the same cross-line block-comment state: the per-revision
-    `block_lines` cache is `starts_in_block_cached` now, which `SqlStyling::starts_in_block` calls
-    too, so the forward pass that removed the Θ(visible × document) re-lex is one piece of code
+    is the same `lex_line_with` with the same cross-line state: the per-revision `CarryCache` is
+    filled by `carry_at_cached`, which `SqlStyling::carry_at` calls too, so the forward pass that removed the Θ(visible × document) re-lex is one piece of code
     rather than two copies of it. It leaves out what only the tab editor has — the zoom, the inline
     diff and rainbow brackets (`lex_line_with` is handed `None` for the depth) — and its dialect is a
     plain `SqlDialect` fixed when the field is built, where `SqlStyling`'s is a memo.

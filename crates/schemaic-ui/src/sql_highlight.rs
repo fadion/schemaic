@@ -6,12 +6,12 @@
 //! / comments). It's deliberately behind this one function — a tree-sitter
 //! grammar could replace `lex_line_with` later without touching the editor wiring.
 //!
-//! Multi-line `/* … */` block comments are the one thing a per-line lexer can't
-//! see, so `block_comment_lines` makes one forward pass over the document and
-//! records, for every line, whether it *starts* inside an open block comment;
-//! `SqlStyling` caches that per document revision, and a line that does gets its
-//! lead coloured as a comment. A *string* spanning lines is still coloured
-//! per-line (the rarer case); a full tree-sitter grammar would generalize both.
+//! What a per-line lexer can't see is a region opened on an earlier line — a
+//! `/* … */` comment, a multi-line string, a dollar-quoted body — so
+//! `carried_lines` makes one forward pass over the document and records, for
+//! every line, the region it *starts* inside and where on the line it closes;
+//! `SqlStyling` caches that per document revision, and a line that starts in
+//! one gets its lead coloured as that region.
 
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -84,8 +84,8 @@ pub struct SqlStyling {
     /// by counting the phantom rows the document emitted, so a second source of
     /// truth would paint bands over the wrong lines.
     preview: crate::inline_diff::InlinePreview,
-    /// Per-line "starts inside a block comment" flags, with the document
-    /// revision they were computed for.
+    /// Per-line "starts inside a non-code region" answers ([`LineCarry`]),
+    /// with the document revision they were computed for.
     ///
     /// [`apply_attr_styles`](Styling::apply_attr_styles) is called per *visible
     /// line*, and it used to answer this by copying and re-lexing the whole
@@ -94,49 +94,52 @@ pub struct SqlStyling {
     /// `mysqldump` header comment cost ~11 ms of extra scanning per keypress.
     /// One forward pass answers it for every line at once, so the cost is paid
     /// once per edit instead of ~45 times.
-    block_lines: RefCell<Option<(BlockKey, Vec<bool>)>>,
+    block_lines: CarryCache,
     /// Per-line bracket depth at the line's start, for rainbow brackets, with
     /// the revision it was computed for — one pass per edit, as
     /// `block_lines` is, and only while rainbow brackets are on.
     bracket_lines: RefCell<Option<(BlockKey, Vec<usize>)>>,
 }
 
-/// What [`SqlStyling`]'s block-comment flags were computed for: the document
+/// What a [`CarryCache`]'s answers were computed for: the document
 /// revision and the dialect.
 type BlockKey = (u64, SqlDialect);
 
-/// Does `line` of `doc` begin inside a `/* … */` opened above it? One forward
-/// pass ([`block_comment_lines`]) per document revision and dialect, kept in
-/// `cache` — what [`SqlStyling`] and [`FieldSql`] both ask.
-fn starts_in_block_cached(
+/// [`carried_lines`]' answer for a document, with what it was computed for.
+type CarryCache = RefCell<Option<(BlockKey, Vec<Option<LineCarry>>)>>;
+
+/// The non-code region `line` of `doc` begins inside, opened above it. One
+/// forward pass ([`carried_lines`]) per document revision and dialect, kept
+/// in `cache` — what [`SqlStyling`] and [`FieldSql`] both ask.
+fn carry_at_cached(
     doc: &dyn Document,
     dialect: SqlDialect,
-    cache: &RefCell<Option<(BlockKey, Vec<bool>)>>,
+    cache: &CarryCache,
     line: usize,
-) -> bool {
+) -> Option<LineCarry> {
     if line == 0 {
-        return false;
+        return None;
     }
     let key = (doc.cache_rev().get_untracked(), dialect);
     let mut cache = cache.borrow_mut();
     if cache.as_ref().map(|(k, _)| *k) != Some(key) {
         let text = doc.text().to_string();
-        *cache = Some((key, block_comment_lines(&text, key.1)));
+        *cache = Some((key, carried_lines(&text, key.1)));
     }
     cache
         .as_ref()
-        .is_some_and(|(_, flags)| flags.get(line).copied().unwrap_or(false))
+        .and_then(|(_, carries)| carries.get(line).copied().flatten())
 }
 
 /// The SQL editor's colouring for an `edit_field` that holds SQL — the DDL
 /// preview and the view, trigger and routine bodies — through the same lexer
-/// and the same cross-line block-comment state, without the tab editor's zoom,
+/// and the same cross-line state ([`carried_lines`]), without the tab editor's zoom,
 /// inline diff or rainbow brackets. Its field sits on the preview surface
 /// (`theme::preview_bg`), which is the one the editor palette is measured on.
 pub(crate) struct FieldSql {
     doc: Rc<dyn Document>,
     dialect: SqlDialect,
-    block_lines: RefCell<Option<(BlockKey, Vec<bool>)>>,
+    block_lines: CarryCache,
 }
 
 impl FieldSql {
@@ -161,9 +164,8 @@ impl FieldSql {
             return;
         }
         let content = rope.line_content(line);
-        let start_in_block =
-            starts_in_block_cached(&*self.doc, self.dialect, &self.block_lines, line);
-        for (start, end, tok) in lex_line_with(&content, self.dialect, start_in_block, None) {
+        let carry = carry_at_cached(&*self.doc, self.dialect, &self.block_lines, line);
+        for (start, end, tok) in lex_line_with(&content, self.dialect, carry, None) {
             attrs.add_span(start..end, default.color(tok.color()));
         }
     }
@@ -199,13 +201,13 @@ impl SqlStyling {
             .unwrap_or_else(crate::theme::editor_font_size)
     }
 
-    /// Does `line` begin inside a `/* … */` opened earlier?
+    /// The non-code region `line` begins inside, opened earlier.
     ///
-    /// Recomputes the whole document's flags when it has changed since the last
-    /// call (`cache_rev` is bumped by every edit), and answers from the cache
-    /// otherwise — so a relayout's ~45 line callbacks share one pass.
-    fn starts_in_block(&self, line: usize) -> bool {
-        starts_in_block_cached(
+    /// Recomputes the whole document's answers when it has changed since the
+    /// last call (`cache_rev` is bumped by every edit), and answers from the
+    /// cache otherwise — so a relayout's ~45 line callbacks share one pass.
+    fn carry_at(&self, line: usize) -> Option<LineCarry> {
+        carry_at_cached(
             &*self.doc,
             self.dialect.get_untracked(),
             &self.block_lines,
@@ -215,7 +217,7 @@ impl SqlStyling {
 
     /// How many brackets are open where `line` begins
     /// (`pairs::bracket_depth_at_lines`), cached per revision as
-    /// [`starts_in_block`](Self::starts_in_block) is.
+    /// [`carry_at`](Self::carry_at) is.
     fn depth_at(&self, line: usize) -> usize {
         let key = (
             self.doc.cache_rev().get_untracked(),
@@ -367,11 +369,11 @@ impl Styling for SqlStyling {
                 default.color(tint(crate::theme::editor_theme().fg)),
             );
         }
-        // Does this line begin inside a `/* … */` opened on an earlier line?
-        let start_in_block = self.starts_in_block(line);
+        // Does this line begin inside a string or comment opened above it?
+        let carry = self.carry_at(line);
         let dialect = self.dialect.get_untracked();
         let brackets = crate::theme::editor_rainbow_brackets().then(|| self.depth_at(line));
-        for (start, end, tok) in lex_line_with(&content, dialect, start_in_block, brackets) {
+        for (start, end, tok) in lex_line_with(&content, dialect, carry, brackets) {
             attrs.add_span(shift + start..shift + end, default.color(tint(tok.color())));
         }
     }
@@ -439,56 +441,85 @@ impl Styling for SqlStyling {
 }
 
 /// For every line of `text`, whether it **starts inside** a `/* … */` block
-/// comment opened on an earlier line — so its lead must be coloured as a comment.
-///
-/// One forward pass for the whole document, rather than re-lexing the prefix per
-/// line: the editor asks this ~45 times per relayout and a relayout happens on
-/// every keystroke, so the per-line form was Θ(visible × document).
-///
-/// Built on the shared `schemaic_core::sql::skip_noncode` primitive, so
-/// strings / line-comments / dollar-quotes are skipped (a `/*` inside a string
-/// never opens a comment) and the block boundary agrees with the rest of the SQL
-/// tooling. `flags[0]` is always false — line 0 has nothing before it.
+/// comment opened on an earlier line: `carried_lines` narrowed to comments,
+/// for the tests that pin that case.
+#[cfg(test)]
 fn block_comment_lines(text: &str, dialect: SqlDialect) -> Vec<bool> {
+    carried_lines(text, dialect)
+        .into_iter()
+        .map(|c| c.is_some_and(|c| c.kind == Some(NonCode::Comment)))
+        .collect()
+}
+
+/// A non-code region a line **starts inside** — a string, a dollar-quoted
+/// body, a quoted name or a comment opened on an earlier line: what it is, and
+/// the byte column on this line just past its close (`None` when it runs on
+/// past the line).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LineCarry {
+    pub(crate) kind: Option<NonCode>,
+    pub(crate) end: Option<usize>,
+}
+
+/// For every line of `text`, the non-code region it starts inside, if any
+/// ([`LineCarry`]) — every kind `skip_noncode` knows, not `/* … */` alone,
+/// which was all this once carried. A per-line lexer cannot see a string that
+/// opened above it, so a multi-line string's second line read as code and a
+/// PostgreSQL function's `$$` body as keywords; nested comments close where
+/// the dialect says they do. `[0]` is always `None` — line 0 has nothing
+/// before it.
+///
+/// One forward pass for the whole document, rather than re-lexing the prefix
+/// per line: the editor asks this ~45 times per relayout and a relayout
+/// happens on every keystroke, so the per-line form was Θ(visible × document).
+/// Built on the shared `schemaic_core::sql::skip_noncode` primitive, so every
+/// boundary agrees with the rest of the SQL tooling.
+fn carried_lines(text: &str, dialect: SqlDialect) -> Vec<Option<LineCarry>> {
     let b = text.as_bytes();
     let n = b.len();
-    // Where the block comments are. `skip_noncode` returns the end of whatever
-    // non-code region starts at `i`; an unterminated block runs to EOF.
-    let mut regions: Vec<(usize, usize)> = Vec::new();
+    // Every non-code region that spans a line break; an unterminated one runs
+    // to EOF.
+    let mut regions: Vec<(usize, usize, Option<NonCode>)> = Vec::new();
     let mut i = 0;
     while i < n {
         match schemaic_core::sql::skip_noncode(b, i, dialect) {
             Some(end) => {
-                if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
-                    regions.push((i, end.min(n)));
+                let end = end.min(n);
+                if b[i..end].contains(&b'\n') {
+                    regions.push((i, end, schemaic_core::sql::noncode_kind(b, i, dialect)));
                 }
                 i = end.max(i + 1);
             }
             None => i += 1,
         }
     }
-    // A line starts inside a comment when its start offset falls *strictly*
-    // inside a region: equal to the region's end means the `*/` closed it on the
-    // previous line, and equal to its start means this line opens the comment
-    // itself (which `lex_line_with` handles on its own).
-    let mut flags = vec![false];
-    if regions.is_empty() {
-        flags.resize(1 + b.iter().filter(|&&c| c == b'\n').count(), false);
-        return flags;
-    }
+    let mut carries = vec![None];
     let mut r = 0;
-    for (p, _) in b.iter().enumerate().filter(|&(_, &c)| c == b'\n') {
+    let breaks: Vec<usize> = b
+        .iter()
+        .enumerate()
+        .filter(|&(_, &c)| c == b'\n')
+        .map(|(p, _)| p)
+        .collect();
+    for (k, &p) in breaks.iter().enumerate() {
         let start = p + 1;
+        let line_end = breaks.get(k + 1).copied().unwrap_or(n);
         while r < regions.len() && regions[r].1 <= start {
             r += 1;
         }
-        flags.push(
+        // *Strictly* inside: at its end the region closed on the line above,
+        // and at its start this line opens it (which `lex_line_with` handles).
+        carries.push(
             regions
                 .get(r)
-                .is_some_and(|&(lo, hi)| lo < start && start < hi),
+                .filter(|&&(lo, hi, _)| lo < start && start < hi)
+                .map(|&(_, hi, kind)| LineCarry {
+                    kind,
+                    end: (hi <= line_end).then(|| hi - start),
+                }),
         );
     }
-    flags
+    carries
 }
 
 /// Public: color spans for a standalone SQL line (byte ranges + color), for
@@ -499,9 +530,35 @@ pub fn highlight_spans(line: &str, dialect: SqlDialect) -> Vec<(usize, usize, Co
     // Standalone line (Ctrl+K diff) — no document context, so no cross-line block
     // state; a multi-line comment there stays coloured per-line.
     let brackets = crate::theme::editor_rainbow_brackets().then_some(0);
-    lex_line_with(line, dialect, false, brackets)
+    lex_line_with(line, dialect, None, brackets)
         .into_iter()
         .map(|(s, e, tok)| (s, e, tok.color()))
+        .collect()
+}
+
+/// [`highlight_spans`] for a run of lines read as one text — the Ctrl+K
+/// diff's added rows — so a string or comment one line opens is carried into
+/// the next ([`carried_lines`]). One `Vec` of spans per line, in order.
+pub fn highlight_lines<S: AsRef<str>>(
+    lines: &[S],
+    dialect: SqlDialect,
+) -> Vec<Vec<(usize, usize, Color)>> {
+    let text = lines
+        .iter()
+        .map(AsRef::as_ref)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let carries = carried_lines(&text, dialect);
+    let brackets = crate::theme::editor_rainbow_brackets().then_some(0);
+    lines
+        .iter()
+        .zip(carries)
+        .map(|(line, carry)| {
+            lex_line_with(line.as_ref(), dialect, carry, brackets)
+                .into_iter()
+                .map(|(s, e, tok)| (s, e, tok.color()))
+                .collect()
+        })
         .collect()
 }
 
@@ -514,11 +571,10 @@ pub fn highlight_spans(line: &str, dialect: SqlDialect) -> Vec<(usize, usize, Co
 /// end. Backtick identifiers keep the default color; comments and strings get
 /// their theme color.
 ///
-/// `start_in_block` = this line begins inside a `/* … */` block comment opened on
-/// an earlier line (see [`block_comment_lines`]): its leading text up to the
-/// closing `*/` (or the whole line, if it doesn't close here) is coloured as a
-/// comment before normal lexing resumes. (A string spanning lines is still handled
-/// per-line — the rarer case the TODO didn't call for.)
+/// `carry` = the non-code region this line begins inside, opened on an earlier
+/// line ([`carried_lines`]): its leading text up to the region's close (or the
+/// whole line, if it doesn't close here) takes that region's colour before
+/// normal lexing resumes.
 ///
 /// `brackets` is the depth the line starts at (`pairs::bracket_depth_at_lines`)
 /// with rainbow brackets on: each code bracket is then coloured by its nesting.
@@ -526,7 +582,7 @@ pub fn highlight_spans(line: &str, dialect: SqlDialect) -> Vec<(usize, usize, Co
 fn lex_line_with(
     line: &str,
     dialect: SqlDialect,
-    start_in_block: bool,
+    carry: Option<LineCarry>,
     brackets: Option<usize>,
 ) -> Vec<(usize, usize, Tok)> {
     let mut depth = brackets;
@@ -535,20 +591,25 @@ fn lex_line_with(
     let mut out = Vec::new();
     let mut i = 0;
 
-    // Continuation of a block comment from a previous line: colour to the `*/`.
-    if start_in_block {
-        match line.find("*/") {
-            Some(p) => {
-                out.push((0, p + 2, Tok::Comment));
-                i = p + 2;
-            }
-            None => {
-                if n > 0 {
-                    out.push((0, n, Tok::Comment));
-                }
-                return out;
-            }
+    // The rest of a region opened on an earlier line: coloured as its kind to
+    // its close, or the whole line when it runs on. A quoted name keeps the
+    // default colour, as one opened on this line does.
+    if let Some(c) = carry {
+        let end = c.end.unwrap_or(n).min(n);
+        let tok = match c.kind {
+            Some(NonCode::Literal) => Some(Tok::Str),
+            Some(NonCode::Comment) => Some(Tok::Comment),
+            Some(NonCode::Identifier) | None => None,
+        };
+        if let Some(tok) = tok
+            && end > 0
+        {
+            out.push((0, end, tok));
         }
+        if c.end.is_none() {
+            return out;
+        }
+        i = end;
     } else if let Some((lo, hi)) = schemaic_core::sql::line_directive_span(line, dialect) {
         // A client directive — `GO`, `DELIMITER` — in the keyword colour with
         // its argument, as SSMS and DataGrip colour it; a `GO` line's comment
@@ -826,9 +887,79 @@ fn is_keyword(w: &str) -> bool {
 mod tests {
     use super::*;
 
-    /// [`lex_line_with`] with rainbow brackets off.
+    /// [`lex_line_with`] with rainbow brackets off; `start_in_block` is a
+    /// `/* … */` carried in from above, ending at the line's first `*/`.
     fn lex_line(line: &str, dialect: SqlDialect, start_in_block: bool) -> Vec<(usize, usize, Tok)> {
-        lex_line_with(line, dialect, start_in_block, None)
+        let carry = start_in_block.then(|| LineCarry {
+            kind: Some(NonCode::Comment),
+            end: line.find("*/").map(|p| p + 2),
+        });
+        lex_line_with(line, dialect, carry, None)
+    }
+
+    /// Each line of `text` lexed with what [`carried_lines`] carries into
+    /// it, as `(line, the span's text, its kind)` for strings and comments.
+    fn doc_spans(text: &str, dialect: SqlDialect) -> Vec<(usize, String, &'static str)> {
+        let carries = carried_lines(text, dialect);
+        let mut out = Vec::new();
+        for (n, line) in text.split('\n').enumerate() {
+            for (s, e, t) in lex_line_with(line, dialect, carries[n], None) {
+                let kind = match t {
+                    Tok::Str => "string",
+                    Tok::Comment => "comment",
+                    Tok::Keyword => "keyword",
+                    _ => continue,
+                };
+                out.push((n, line[s..e].to_string(), kind));
+            }
+        }
+        out
+    }
+
+    /// **A run of lines is lexed as one text**, for the Ctrl+K diff's added
+    /// rows: a comment one row opens colours the next, which `highlight_spans`
+    /// lexing each row alone could not.
+    #[test]
+    fn a_run_of_lines_carries_its_regions() {
+        let lines = ["select 1 /* first", "still a comment */ from t"];
+        let spans = highlight_lines(&lines, SqlDialect::MySql);
+        let comment = crate::theme::editor_theme().comment;
+        assert_eq!(spans.len(), 2);
+        assert!(
+            spans[1]
+                .iter()
+                .any(|&(s, e, c)| (s, e) == (0, 18) && c == comment),
+            "{:?}",
+            spans[1]
+        );
+        assert_eq!(highlight_lines(&[] as &[&str], SqlDialect::MySql).len(), 0);
+    }
+
+    /// **A string, a dollar-quoted body and a nested comment carry across
+    /// lines** as a `/* … */` always did: the lines inside them take their
+    /// colour, and what follows the close on its line is code again. They
+    /// were lexed per line, so a multi-line string's second line read as
+    /// code and a function body's `begin` as a keyword.
+    #[test]
+    fn every_noncode_region_carries_across_lines() {
+        use SqlDialect::*;
+        let s = doc_spans("select 'a\nfrom b' from t", MySql);
+        assert!(s.contains(&(1, "from b'".to_string(), "string")), "{s:?}");
+        assert!(s.contains(&(1, "from".to_string(), "keyword")), "{s:?}");
+        assert!(!s.contains(&(1, "from b".to_string(), "keyword")), "{s:?}");
+        let pg = doc_spans("do $$\nbegin\nend $$; select 1", Postgres);
+        assert!(pg.contains(&(1, "begin".to_string(), "string")), "{pg:?}");
+        assert!(pg.contains(&(2, "end $$".to_string(), "string")), "{pg:?}");
+        assert!(pg.contains(&(2, "select".to_string(), "keyword")), "{pg:?}");
+        // PostgreSQL's comments nest; MySQL's do not.
+        let nested = "/* a /* b */\nc */ select 1";
+        let pg = doc_spans(nested, Postgres);
+        assert!(pg.contains(&(1, "c */".to_string(), "comment")), "{pg:?}");
+        let my = doc_spans(nested, MySql);
+        assert!(
+            !my.iter().any(|(n, _, k)| *n == 1 && *k == "comment"),
+            "{my:?}"
+        );
     }
 
     /// The text of every span of one kind, on one dialect.
@@ -947,7 +1078,7 @@ mod tests {
     #[test]
     fn rainbow_brackets_are_coloured_by_depth() {
         let depths = |line: &str, start: usize, d: SqlDialect| -> Vec<(String, usize)> {
-            lex_line_with(line, d, false, Some(start))
+            lex_line_with(line, d, None, Some(start))
                 .into_iter()
                 .filter_map(|(s, e, t)| match t {
                     Tok::Bracket(n) => Some((line[s..e].to_string(), n)),
@@ -966,7 +1097,7 @@ mod tests {
         );
         assert_eq!(depths(")", 0, SqlDialect::MySql), [pair(")", 0)]);
         assert!(
-            lex_line_with("f(a)", SqlDialect::MySql, false, None)
+            lex_line_with("f(a)", SqlDialect::MySql, None, None)
                 .iter()
                 .all(|(_, _, t)| !matches!(t, Tok::Bracket(_)))
         );
