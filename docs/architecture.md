@@ -12135,7 +12135,16 @@ existing prose was left alone.
     innermost has no partner; a stray close anywhere else is passed over rather than popped, so it
     cannot take the pair from the close of the right kind — `(a])` still pairs `(` with `)`,
     `match_paren_pairs_square_brackets_by_kind`. Where `[name]` is a quoted identifier, SQL Server
-    and SQLite, `skip_noncode` skips it and it pairs nothing),
+    and SQLite, `skip_noncode` skips it and it pairs nothing), `match_block` and `block_jump` (the
+    same two questions asked of words: `BEGIN`/`CASE` and its `END`, as word ranges, the pane
+    asking them when no bracket answers. A transaction's `BEGIN` — `BEGIN TRAN`, `TRANSACTION`,
+    `WORK`, `BEGIN;` — opens nothing, an `END IF`/`LOOP`/`WHILE`/`REPEAT`/`FOR` closes a block it
+    does not track and is passed over, `END CASE` is an `END`, and `t.end` is a name. It runs on
+    every caret move, so it asks the caret's own word first and scans only when that is one of
+    the three — `a_block_word_matches_its_end`,
+    `a_word_that_opens_or_closes_no_block_matches_nothing`,
+    `a_block_jump_lands_on_the_same_side_and_comes_back`. Inside a PostgreSQL `$$` body the
+    lexer sees a literal, so nothing there pairs),
     `identifier_occurrences` (every whole-word, ASCII-case-insensitive occurrence of the identifier
     under the caret — excludes keywords/numbers/strings, needs ≥2 to fire), and `region_at`
     (`Code`/`Str`/`Comment` classification). Pure + unit-tested; dialect-aware, and its two "is a

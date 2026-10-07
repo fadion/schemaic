@@ -2448,10 +2448,12 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     // the Ctrl+Enter key handler can set it.
     let highlight: RwSignal<Option<(usize, usize)>> = RwSignal::new(None);
 
-    // Bracket matching: the byte offsets of the paren adjacent to the caret and
-    // its partner (or None). Recomputed from caret + text below; drawn as two
+    // Bracket matching: the byte ranges of the paren adjacent to the caret and
+    // its partner — or of the `BEGIN`/`CASE`/`END` the caret is on and its
+    // partner — or None. Recomputed from caret + text below; drawn as two
     // faint boxes by `bracket_match_view`.
-    let bracket_match: RwSignal<Option<(usize, usize)>> = RwSignal::new(None);
+    #[allow(clippy::type_complexity)] // two ranges, named where they are drawn
+    let bracket_match: RwSignal<Option<((usize, usize), (usize, usize))>> = RwSignal::new(None);
 
     // Highlight-all-occurrences: byte ranges of every occurrence of the identifier
     // under the caret (empty when the caret isn't on a repeated identifier).
@@ -3061,7 +3063,8 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 return CommandExecuted::Yes;
             }
         }
-        // Ctrl+Shift+\ — jump to the matching bracket (VS Code's key), matched
+        // Ctrl+Shift+\ — jump to the matching bracket (VS Code's key), or the
+        // `BEGIN`/`CASE`/`END` partner of the word under the caret, matched
         // physically: Shift turns the `\` into `|` on a US layout.
         if primary_held(mods) && mods.shift() && !mods.alt() {
             use floem::keyboard::{KeyCode, PhysicalKey};
@@ -3072,7 +3075,10 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 editor_sig.with_untracked(|e| {
                     let caret = e.cursor.get_untracked().offset();
                     let text = e.doc().text().to_string();
-                    if let Some(to) = pairs::bracket_jump(&text, caret, dialect.get_untracked()) {
+                    let dia = dialect.get_untracked();
+                    let to = pairs::bracket_jump(&text, caret, dia)
+                        .or_else(|| pairs::block_jump(&text, caret, dia));
+                    if let Some(to) = to {
                         e.cursor.update(|c| c.set_offset(to, false, false));
                     }
                 });
@@ -3678,10 +3684,17 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     // (tracks `ed.cursor`) and edit (tracks `query`). Pure/boundary-aware via
     // `core::pairs::match_paren`, so parens and square brackets inside
     // strings/comments are ignored.
+    //
+    // A bracket beside the caret answers first; else a block word under it
+    // (`pairs::match_block`), which asks its own word before scanning.
     create_effect(move |_| {
         let caret = ed_bm.cursor.get().offset();
         let sql = query.get();
-        bracket_match.set(pairs::match_paren(&sql, caret, dialect.get_untracked()));
+        let dia = dialect.get_untracked();
+        let found = pairs::match_paren(&sql, caret, dia)
+            .map(|(p, q)| ((p, p + 1), (q, q + 1)))
+            .or_else(|| pairs::match_block(&sql, caret, dia));
+        bracket_match.set(found);
     });
 
     // Highlight all occurrences of the identifier under the caret. Same triggers
@@ -5557,7 +5570,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             move || bracket_match.get(),
             move |m| match m {
                 None => empty().into_any(),
-                Some((p, q)) => {
+                Some(((p, p_end), (q, q_end))) => {
                     // Once per rebuild, not once per style-closure run: the
                     // two boxes' closures re-run on every scroll frame and
                     // `content_x_of` counts every newline in the document.
@@ -5565,7 +5578,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     let cx = content_x_of(&query.get_untracked());
                     let (edp, edq) = (ed.clone(), ed.clone());
                     v_stack((
-                        empty().style(move |s| match span_box(cx, &edp, p, p + 1) {
+                        empty().style(move |s| match span_box(cx, &edp, p, p_end) {
                             // Scrolled out of view: draw nothing rather than a
                             // box at the editor's origin.
                             None => s.hide(),
@@ -5579,7 +5592,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                                 .border_radius(2.0)
                                 .border_color(theme::bracket_match().multiply_alpha(0.5)),
                         }),
-                        empty().style(move |s| match span_box(cx, &edq, q, q + 1) {
+                        empty().style(move |s| match span_box(cx, &edq, q, q_end) {
                             None => s.hide(),
                             Some((x, y, w, h)) => s
                                 .absolute()

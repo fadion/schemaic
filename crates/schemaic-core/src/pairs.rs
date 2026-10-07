@@ -399,6 +399,139 @@ pub fn match_paren(text: &str, caret: usize, dialect: SqlDialect) -> Option<(usi
     None
 }
 
+/// Where Ctrl+Shift+\ puts the caret over a block word ([`match_block`]): on
+/// the same side of the partner as it was of its own word — its end to the
+/// partner's end, anywhere else to the partner's start — so a second press
+/// comes back, as [`bracket_jump`] does for a paren.
+pub fn block_jump(text: &str, caret: usize, dialect: SqlDialect) -> Option<usize> {
+    let ((_, here_hi), (lo, hi)) = match_block(text, caret, dialect)?;
+    Some(if caret == here_hi { hi } else { lo })
+}
+
+/// The block the caret's word opens or closes: `BEGIN` or `CASE` and its
+/// `END`, as `(here, partner)` word ranges, when the caret is on or just after
+/// one of those words in code. The bracket pair's question asked of words —
+/// see [`match_paren`].
+///
+/// What is not a block is passed over: a transaction's `BEGIN` (`BEGIN TRAN`,
+/// `TRANSACTION`, `WORK`, or a `BEGIN;`), and an `END IF`/`LOOP`/`WHILE`/
+/// `REPEAT`/`FOR`, which closes a block this does not track. `END CASE` and
+/// T-SQL's `END TRY`/`END CATCH` are `END`s. A word after `.` is a name.
+pub fn match_block(
+    text: &str,
+    caret: usize,
+    dialect: SqlDialect,
+) -> Option<((usize, usize), (usize, usize))> {
+    let b = text.as_bytes();
+    // **Asked of the caret's word before anything is scanned**: this runs on
+    // every caret move, undebounced, as `match_paren` does — and the caret is
+    // almost never on one of these three words.
+    let caret = caret.min(b.len());
+    let mut lo = caret;
+    while lo > 0 && crate::sql::is_word_byte(b[lo - 1]) {
+        lo -= 1;
+    }
+    let mut hi = caret;
+    while hi < b.len() && crate::sql::is_word_byte(b[hi]) {
+        hi += 1;
+    }
+    let block_word = ["BEGIN", "CASE", "END"]
+        .iter()
+        .any(|k| text[lo..hi].eq_ignore_ascii_case(k));
+    if !block_word {
+        return None;
+    }
+    // Every word in code, in order: its range, upper-cased, and whether a
+    // `.` makes it a member (`t.end`).
+    let mut words: Vec<(usize, usize, String, bool)> = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if let Some(j) = skip_noncode(b, i, dialect) {
+            i = j.max(i + 1);
+            continue;
+        }
+        if crate::sql::is_word_start(b[i]) {
+            let mut j = i + 1;
+            while j < b.len() && crate::sql::is_word_byte(b[j]) {
+                j += 1;
+            }
+            let member = i > 0 && b[i - 1] == b'.';
+            words.push((i, j, text[i..j].to_ascii_uppercase(), member));
+            i = j;
+            continue;
+        }
+        i += 1;
+    }
+    // The first code byte after `at` that is not blank.
+    let next_code = |at: usize| {
+        let mut k = at;
+        while k < b.len() {
+            if b[k].is_ascii_whitespace() {
+                k += 1;
+            } else if let Some(j) = skip_noncode(b, k, dialect).filter(|_| {
+                matches!(
+                    crate::sql::noncode_kind(b, k, dialect),
+                    Some(crate::sql::NonCode::Comment)
+                )
+            }) {
+                k = j;
+            } else {
+                return Some(k);
+            }
+        }
+        None
+    };
+    let word_after = |w: usize| words.get(w + 1).map(|n| n.2.as_str());
+    let opens = |w: usize| {
+        let (_, hi, up, member) = &words[w];
+        if *member {
+            return false;
+        }
+        match up.as_str() {
+            // `END CASE` closes; it does not open another.
+            "CASE" => w == 0 || words[w - 1].2 != "END" || words[w - 1].3,
+            "BEGIN" => {
+                let transaction = matches!(
+                    word_after(w),
+                    Some("TRAN" | "TRANSACTION" | "WORK" | "DISTRIBUTED")
+                );
+                let bare = next_code(*hi).is_none_or(|k| b[k] == b';');
+                !transaction && !bare
+            }
+            _ => false,
+        }
+    };
+    let closes = |w: usize| {
+        words[w].2 == "END"
+            && !words[w].3
+            && !matches!(
+                word_after(w),
+                Some("IF" | "LOOP" | "WHILE" | "REPEAT" | "FOR")
+            )
+    };
+    let here = words
+        .iter()
+        .position(|(lo, hi, ..)| *lo <= caret && caret <= *hi)?;
+    if !opens(here) && !closes(here) {
+        return None;
+    }
+    let range = |w: usize| (words[w].0, words[w].1);
+    let mut stack: Vec<usize> = Vec::new();
+    for w in 0..words.len() {
+        if opens(w) {
+            stack.push(w);
+        } else if closes(w) {
+            match stack.pop() {
+                Some(open) if open == here => return Some((range(here), range(w))),
+                Some(open) if w == here => return Some((range(here), range(open))),
+                None if w == here => return None,
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
 /// All byte ranges of the identifier under the caret, for "highlight all
 /// occurrences of the identifier under the caret." Returns empty unless the caret
 /// sits on an identifier in *code* (not a string/comment), the identifier is
@@ -760,6 +893,71 @@ mod tests {
     }
 
     // --- match_paren -------------------------------------------------------
+
+    /// The text of a range pair, for readable assertions.
+    fn blocks(sql: &str, caret: usize, d: SqlDialect) -> Option<(&str, &str, usize, usize)> {
+        match_block(sql, caret, d).map(|((a, b), (c, e))| (&sql[a..b], &sql[c..e], a, c))
+    }
+
+    /// `BEGIN` and `CASE` pair with their `END`, nested blocks with their own,
+    /// from the caret on or beside either word.
+    #[test]
+    fn a_block_word_matches_its_end() {
+        use SqlDialect::{MsSql, MySql};
+        let sql = "BEGIN SELECT CASE WHEN a THEN 1 END; END";
+        let outer_end = sql.rfind("END").unwrap();
+        assert_eq!(blocks(sql, 0, MsSql), Some(("BEGIN", "END", 0, outer_end)));
+        assert_eq!(blocks(sql, 3, MsSql), Some(("BEGIN", "END", 0, outer_end)));
+        assert_eq!(blocks(sql, 5, MsSql), Some(("BEGIN", "END", 0, outer_end)));
+        assert_eq!(
+            blocks(sql, sql.len(), MsSql),
+            Some(("END", "BEGIN", outer_end, 0))
+        );
+        let case = sql.find("CASE").unwrap();
+        let inner = sql.find("END;").unwrap();
+        assert_eq!(blocks(sql, case, MsSql), Some(("CASE", "END", case, inner)));
+        assert_eq!(
+            blocks(sql, inner + 1, MsSql),
+            Some(("END", "CASE", inner, case))
+        );
+        // Lower case, and `END CASE` / `BEGIN TRY … END TRY` too.
+        let try_ = "begin try select 1; end try";
+        assert_eq!(blocks(try_, 0, MsSql).map(|b| b.1), Some("end"));
+        let routine = "CASE x WHEN 1 THEN SET y = 1; END CASE";
+        assert_eq!(blocks(routine, 0, MySql).map(|b| b.3), routine.find("END"));
+    }
+
+    /// Ctrl+Shift+\ over a block word lands on its partner on the same side —
+    /// a word's start to its partner's start, its end to its partner's end —
+    /// so a second press comes back.
+    #[test]
+    fn a_block_jump_lands_on_the_same_side_and_comes_back() {
+        let d = SqlDialect::MsSql;
+        let sql = "BEGIN SELECT 1; END";
+        let end = sql.rfind("END").unwrap();
+        assert_eq!(block_jump(sql, 0, d), Some(end));
+        assert_eq!(block_jump(sql, end, d), Some(0));
+        assert_eq!(block_jump(sql, 5, d), Some(sql.len()));
+        assert_eq!(block_jump(sql, sql.len(), d), Some(5));
+        assert_eq!(block_jump("SELECT 1", 0, d), None);
+    }
+
+    /// No block: a transaction's `BEGIN`, an `END IF`'s `END`, a column named
+    /// `end`, the word in a string or comment, and a caret on nothing.
+    #[test]
+    fn a_word_that_opens_or_closes_no_block_matches_nothing() {
+        use SqlDialect::{MsSql, MySql};
+        assert_eq!(blocks("BEGIN TRAN; COMMIT", 0, MsSql), None);
+        assert_eq!(blocks("BEGIN; SELECT 1; COMMIT;", 0, MySql), None);
+        // `END IF` closes an `IF` this does not track, so `BEGIN`'s END is the last.
+        let sql = "BEGIN IF x THEN SET y = 1; END IF; END";
+        assert_eq!(blocks(sql, 0, MySql).map(|b| b.3), sql.rfind("END"));
+        assert_eq!(blocks("SELECT t.end FROM t", 10, MySql), None);
+        assert_eq!(blocks("SELECT 'begin' x", 9, MySql), None);
+        assert_eq!(blocks("-- begin\nSELECT 1", 4, MySql), None);
+        assert_eq!(blocks("SELECT 1", 3, MySql), None);
+        assert_eq!(blocks("BEGIN SELECT 1", 0, MsSql), None, "unclosed");
+    }
 
     #[test]
     fn match_paren_prefers_right_then_left() {
