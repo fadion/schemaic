@@ -197,16 +197,82 @@ pub fn single_line_copy(
     offset: usize,
     dialect: SqlDialect,
 ) -> Option<String> {
+    single_line_target(full, sel, offset, dialect)
+        .and_then(|(lo, hi)| single_line(&full[lo..hi], dialect))
+}
+
+/// The text *Copy as single line* and *Make single line* take: the selection
+/// `sel` when there is one, refused when an end is not in code, else the
+/// statement at `offset` — trimmed of its outer whitespace either way, which
+/// belongs to the lines around it. `None` when that leaves nothing.
+fn single_line_target(
+    full: &str,
+    sel: (usize, usize),
+    offset: usize,
+    dialect: SqlDialect,
+) -> Option<(usize, usize)> {
     let (lo, hi) = if sel.0 != sel.1 {
         formattable_range(full, sel.0, sel.1, dialect)?
     } else {
         crate::sql::statement_range(full, offset, dialect)
     };
-    let text = full.get(lo..hi)?.trim();
-    if text.is_empty() {
+    let text = full.get(lo..hi)?;
+    let body = text.trim();
+    if body.is_empty() {
         return None;
     }
-    single_line(text, dialect)
+    let lo = lo + (text.len() - text.trim_start().len());
+    Some((lo, lo + body.len()))
+}
+
+/// What *Make single line* writes: [`single_line_copy`]'s text, and the range
+/// `(lo, hi)` of `full` it replaces. `None` when there is nothing to take, when
+/// [`single_line`] refuses it, or when it is one line already — the edit would
+/// change nothing, so the menu leaves the entry out.
+pub fn single_line_in_place(
+    full: &str,
+    sel: (usize, usize),
+    offset: usize,
+    dialect: SqlDialect,
+) -> Option<(usize, usize, String)> {
+    let (lo, hi) = single_line_target(full, sel, offset, dialect)?;
+    let text = single_line(&full[lo..hi], dialect)?;
+    (text != full[lo..hi]).then_some((lo, hi, text))
+}
+
+/// What *Format statement* writes: the statement at `offset`, formatted with
+/// `indent_unit`, and the range `(lo, hi)` of `full` it replaces. `None` when
+/// there is no statement there or it is formatted already.
+pub fn format_statement(
+    full: &str,
+    offset: usize,
+    indent_unit: &str,
+    dialect: SqlDialect,
+) -> Option<(usize, usize, String)> {
+    let (lo, hi) = crate::sql::statement_range(full, offset, dialect);
+    if full.get(lo..hi)?.trim().is_empty() {
+        return None;
+    }
+    let text = format_range(full, lo, hi, indent_unit, dialect);
+    (text != full[lo..hi]).then_some((lo, hi, text))
+}
+
+/// Where a caret at `caret` in `old` belongs once `old[lo..hi]` is replaced by
+/// `new`, a re-flow of it: unmoved before the range, shifted by the change in
+/// length after it, and inside it after as many non-whitespace bytes of the
+/// range as preceded it ([`caret_after_format`]).
+///
+/// Inside a [`single_line`] rewrite that count is approximate — a `--` comment
+/// gains the `/*` and `*/` it becomes — so a caret past such a comment lands a
+/// few bytes early, and never outside the new text.
+pub fn caret_after_replace(old: &str, lo: usize, hi: usize, caret: usize, new: &str) -> usize {
+    if caret <= lo {
+        caret
+    } else if caret >= hi {
+        caret - (hi - lo) + new.len()
+    } else {
+        lo + caret_after_format(&old[lo..hi], caret - lo, new)
+    }
 }
 
 /// Where a caret at `old_caret` in `old` belongs in `new`, the text
@@ -1307,6 +1373,87 @@ mod tests {
         // A selection starting inside a string is no fragment to lex.
         assert_eq!(single_line_copy("SELECT 'a\nb' x", (9, 14), 0, MySql), None);
         assert_eq!(single_line_copy("  \n  ", (1, 1), 1, MySql), None);
+    }
+
+    /// Splice an edit's answer back into its document.
+    fn splice(doc: &str, (lo, hi, text): (usize, usize, String)) -> String {
+        format!("{}{text}{}", &doc[..lo], &doc[hi..])
+    }
+
+    /// *Make single line* rewrites the statement at the caret, or the
+    /// selection, in place — and nothing around it: the line breaks either
+    /// side of it are the neighbours'.
+    #[test]
+    fn single_line_in_place_rewrites_only_the_statement_or_selection() {
+        use SqlDialect::MySql;
+        let doc = "SELECT 1;\nSELECT a,\n  b -- n\nFROM t;\nSELECT 3;\n";
+        let edit = single_line_in_place(doc, (12, 12), 12, MySql).unwrap();
+        assert_eq!(&doc[edit.0..edit.1], "SELECT a,\n  b -- n\nFROM t;");
+        assert_eq!(
+            splice(doc, edit),
+            "SELECT 1;\nSELECT a, b /* n */ FROM t;\nSELECT 3;\n"
+        );
+        // A selection: exactly that, its outer whitespace left where it was.
+        let edit = single_line_in_place(doc, (17, 28), 0, MySql).unwrap();
+        assert_eq!(&doc[edit.0..edit.1], "a,\n  b -- n");
+        assert_eq!(edit.2, "a, b /* n */");
+    }
+
+    /// Nothing to do is no entry: a statement already on one line, blank
+    /// text, a selection starting in a string, and what [`single_line`]
+    /// refuses.
+    #[test]
+    fn single_line_in_place_declines_what_it_would_not_change() {
+        use SqlDialect::{MsSql, MySql};
+        assert_eq!(
+            single_line_in_place("SELECT 1;\nSELECT 2;", (3, 3), 3, MySql),
+            None
+        );
+        assert_eq!(single_line_in_place("  \n  ", (1, 1), 1, MySql), None);
+        assert_eq!(
+            single_line_in_place("SELECT 'a\nb' x", (9, 14), 0, MySql),
+            None
+        );
+        assert_eq!(
+            single_line_in_place("SELECT\n1\nGO\nSELECT 2", (0, 18), 0, MsSql),
+            None
+        );
+    }
+
+    /// *Format statement* re-flows the statement at the caret and leaves the
+    /// others as they were, unformatted or not.
+    #[test]
+    fn format_statement_formats_only_the_statement_at_the_caret() {
+        use SqlDialect::MySql;
+        let doc = "select a,b from t;\nselect c,d from u where x=1;\nselect e,f from v;\n";
+        let edit = format_statement(doc, 25, IND, MySql).unwrap();
+        assert_eq!(&doc[edit.0..edit.1], "select c,d from u where x=1;");
+        assert_eq!(edit.2, format_sql("select c,d from u where x=1;", IND));
+        let out = splice(doc, edit);
+        assert!(out.starts_with("select a,b from t;\n"), "{out}");
+        assert!(out.ends_with("\nselect e,f from v;\n"), "{out}");
+        // Formatted already, or no statement at all: nothing to write.
+        let formatted = format_sql("select c from u", IND);
+        assert_eq!(format_statement(&formatted, 2, IND, MySql), None);
+        assert_eq!(format_statement("  \n ", 1, IND, MySql), None);
+        assert_eq!(format_statement("", 0, IND, MySql), None);
+    }
+
+    /// A caret before the rewritten range stays, one after it moves by the
+    /// change in length, and one inside keeps its place among the tokens.
+    #[test]
+    fn caret_after_replace_keeps_its_place_on_every_side_of_the_range() {
+        let old = "x;\nselect a,\n  b;\ny";
+        let (lo, hi) = (3, 17);
+        assert_eq!(&old[lo..hi], "select a,\n  b;");
+        let new = "select a, b;";
+        assert_eq!(caret_after_replace(old, lo, hi, 1, new), 1);
+        // On `y`: two bytes of whitespace were taken out before it.
+        assert_eq!(caret_after_replace(old, lo, hi, 18, new), 16);
+        assert_eq!(&"x;\nselect a, b;\ny"[16..], "y");
+        // Just after `b`: still just after it.
+        let at = caret_after_replace(old, lo, hi, 16, new);
+        assert_eq!(&format!("x;\n{new}\ny")[..at], "x;\nselect a, b");
     }
 
     /// An array constructor's or a subscript's brackets sit tight, a slice's

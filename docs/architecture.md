@@ -11929,8 +11929,18 @@ existing prose was left alone.
     `sql::statement_range` at the right-click, trimmed, an empty answer being `None` — and puts the
     selection through `formattable_range` for that function's reason: `single_line` lexes from byte
     0 as well, and a fragment opening inside a string takes its closing quote for an opening one
-    (`single_line_copy_takes_the_selection_or_the_statement_at_the_click`). Only the copy is
-    written; an in-place minify is not.
+    (`single_line_copy_takes_the_selection_or_the_statement_at_the_click`). That choice is
+    `single_line_target`'s, which **`single_line_in_place`** shares: the same text with the range
+    it replaces, for *Make single line*, and `None` as well when the text is one line already, since
+    that edit would change nothing. The range is the trimmed one, so the line breaks either side of
+    the statement stay its neighbours' (`single_line_in_place_rewrites_only_the_statement_or_selection`).
+    **`format_statement`** is *Format statement*'s answer in the same shape: the
+    `sql::statement_range` at the caret through `format_range`, or `None` for blank text or a
+    statement formatted already (`format_statement_formats_only_the_statement_at_the_caret`).
+    **`caret_after_replace`** places a bare caret after either rewrite — unmoved before the range,
+    shifted by the length change after it, `caret_after_format` within it — and is approximate inside
+    a single-line rewrite, where a `--` comment gains the `/*` and `*/` it becomes and a caret past it
+    lands a few bytes early.
     **`tokenize` takes a numeric literal in one arm, ahead of the word arm, because two of a
     number's three parts are spelled in bytes that arm calls punctuation.** `1.5e-3` lexed as
     `["1", ".", "5e", "-", "3"]`; `need_space` suppresses the space around a `.`, but nothing said
@@ -23282,7 +23292,15 @@ existing prose was left alone.
     action in the menu. The selection it reads is the one floem's `right_click` leaves: a click
     inside the selection keeps it and a click outside collapses it to the caret the click placed,
     so what is copied is the statement under the pointer unless the pointer was on the selection.
-    It has no shortcut.
+    It has no shortcut. **Two in-place entries follow the same rules** and write through
+    `rewrite_range`, one `edit_untyped` (a single undo step, refused under the Ctrl+K freeze):
+    *Make single line* writes `sqlfmt::single_line_in_place` over the same text the copy takes, and
+    is absent where that is already one line; *Format statement*, placed straight after *Format
+    code*, writes `sqlfmt::format_statement` over the statement under the click, and is offered only
+    **without a selection** — with one, *Format code* already formats just that — and only when the
+    statement is not formatted yet. A selection stays selected over the rewritten range; a bare
+    caret keeps its place among the tokens (`sqlfmt::caret_after_replace`). Neither has a shortcut
+    or a palette command yet.
     **The Ctrl+K suggestion is not drawn here** — it is phantom rows in the editor's own line flow
     (`inline_diff`, below), and what `cmdk_popup` still draws is the two ends of the block: the
     question bar (sparkle, a `multiline` `edit_field` capped at three rows, then a send affordance or

@@ -264,11 +264,7 @@ fn format_editor(ed: &Editor, comp: Completion, dialect: SqlDialect) {
     let Some((start, end)) = schemaic_core::sqlfmt::formattable_range(&full, a, b, dialect) else {
         return;
     };
-    let unit = if theme::editor_soft_tabs() {
-        " ".repeat(theme::editor_tab_width())
-    } else {
-        "\t".to_string()
-    };
+    let unit = indent_unit();
     // `format_range`, not `format_sql`: a selection's outer whitespace is the
     // document's, and trimmed it fused the fragment with its neighbours.
     let formatted = schemaic_core::sqlfmt::format_range(&full, start, end, &unit, dialect);
@@ -295,6 +291,38 @@ fn format_editor(ed: &Editor, comp: Completion, dialect: SqlDialect) {
     } else {
         // The whole document: the caret keeps its place among the tokens.
         let at = schemaic_core::sqlfmt::caret_after_format(&full, caret, &formatted);
+        ed.cursor.update(|cc| cc.set_offset(at, false, false));
+    }
+}
+
+/// One level of Format's indentation, from the editor's tab-width and
+/// soft-tabs settings.
+fn indent_unit() -> String {
+    if theme::editor_soft_tabs() {
+        " ".repeat(theme::editor_tab_width())
+    } else {
+        "\t".to_string()
+    }
+}
+
+/// Write `text` over `lo..hi` of `ed`'s document — a re-flow of that range
+/// that *Format statement* or *Make single line* computed — as one undo step.
+/// A selection is replaced by the rewritten range, selected; a bare caret keeps
+/// its place among the tokens (`sqlfmt::caret_after_replace`). A refused edit
+/// (the Ctrl+K preview's freeze) moves nothing.
+fn rewrite_range(ed: &Editor, comp: Completion, (lo, hi, text): (usize, usize, String)) {
+    let full = ed.doc().text().to_string();
+    let cursor = ed.cursor.get_untracked();
+    let selected = cursor.get_selection().is_some_and(|(a, b)| a != b);
+    let caret = cursor.offset();
+    if !edit_untyped(ed, comp, Selection::region(lo, hi), &text, EditType::Other) {
+        return;
+    }
+    if selected {
+        ed.cursor
+            .update(|cc| cc.set_insert(Selection::region(lo, lo + text.len())));
+    } else {
+        let at = schemaic_core::sqlfmt::caret_after_replace(&full, lo, hi, caret, &text);
         ed.cursor.update(|cc| cc.set_offset(at, false, false));
     }
 }
@@ -3882,6 +3910,8 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             let show_plan = open_plan.clone();
             let ed_format = ed_fmt.clone();
             let ed_one_line = ed_fmt.clone();
+            let ed_one_line_edit = ed_fmt.clone();
+            let ed_stmt_format = ed_fmt.clone();
             let make_view = create_view.clone();
             // "AI fix" — offered only over a statement the editor has something
             // to say about, which is what the user is pointing at when they
@@ -3925,8 +3955,8 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 })
             };
             // The three AI actions carry the sparkle (matching AI Summary in the
-            // grid); Plan, Format and Copy as single line sit below the
-            // separator as plain actions.
+            // grid); Plan, the two Formats and the two single-line entries sit
+            // below the separator as plain actions.
             let ai_entries = vec![
                 MenuEntry::action_icon(
                     "Ask AI",
@@ -4077,6 +4107,71 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                         let _ = floem::Clipboard::set_contents(text);
                     }
                 }));
+            }
+            // "Make single line": the same text, written over what it was
+            // taken from (`sqlfmt::single_line_in_place`). Absent when that
+            // would change nothing — already one line — as well as where the
+            // copy is.
+            let one_line_edit = move || {
+                let off = menu_offset.get_untracked();
+                let sel = ed_one_line_edit
+                    .cursor
+                    .get_untracked()
+                    .get_selection()
+                    .unwrap_or((off, off));
+                query.with_untracked(|sql| {
+                    schemaic_core::sqlfmt::single_line_in_place(
+                        sql,
+                        sel,
+                        off,
+                        dialect.get_untracked(),
+                    )
+                })
+            };
+            if one_line_edit().is_some() {
+                let ed = ed_one_line_edit.clone();
+                entries.push(MenuEntry::action("Make single line", move || {
+                    if let Some(edit) = one_line_edit() {
+                        rewrite_range(&ed, comp, edit);
+                    }
+                }));
+            }
+            // "Format statement": the statement under the click alone, where
+            // "Format code" with no selection takes the whole document. Only
+            // without a selection — with one, "Format code" already formats
+            // just that — and only when the statement is not formatted yet.
+            let has_selection = ed_stmt_format
+                .cursor
+                .get_untracked()
+                .get_selection()
+                .is_some_and(|(a, b)| a != b);
+            let stmt_format = move || {
+                query.with_untracked(|sql| {
+                    schemaic_core::sqlfmt::format_statement(
+                        sql,
+                        menu_offset.get_untracked(),
+                        &indent_unit(),
+                        dialect.get_untracked(),
+                    )
+                })
+            };
+            if !has_selection && stmt_format().is_some() {
+                let ed = ed_stmt_format.clone();
+                let at = entries
+                    .iter()
+                    .position(|e| {
+                        matches!(e, MenuEntry::Action { label, .. }
+                            if label == crate::shortcuts::MenuKey::EditorFormat.label())
+                    })
+                    .map_or(entries.len(), |i| i + 1);
+                entries.insert(
+                    at,
+                    MenuEntry::action("Format statement", move || {
+                        if let Some(edit) = stmt_format() {
+                            rewrite_range(&ed, comp, edit);
+                        }
+                    }),
+                );
             }
             // First when it's there: over a squiggle it is the most specific
             // thing this menu can offer, and the one the user came for.
