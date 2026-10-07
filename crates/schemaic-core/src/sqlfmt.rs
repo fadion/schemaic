@@ -1005,6 +1005,11 @@ impl<'a> Fmt<'a> {
     }
 
     fn need_space(&self, cur_kind: Kind, cur: &str) -> bool {
+        // A line comment kept on a line of code is set off from it — asked
+        // first, since after a `;` the statement has ended and `prev` with it.
+        if cur_kind == Kind::LineComment {
+            return true;
+        }
         let Some((pk, pt)) = &self.prev else {
             return false;
         };
@@ -1062,10 +1067,17 @@ impl<'a> Fmt<'a> {
             let gap = prev_tok.map_or("", |(_, p)| self.between(p, text));
             match kind {
                 Kind::LineComment => {
+                    // A comment that trailed its line's code stays on that
+                    // line: the break the code before it asked for — a list
+                    // comma's, a clause head's — is taken after it instead.
+                    // Moved down past the break, `a, -- first` read as the
+                    // next item's.
+                    let trailing = prev_tok.is_some() && !gap.contains('\n');
+                    let deferred = if trailing { self.pending.take() } else { None };
                     self.emit(kind, text, false);
                     // A line comment runs to EOL; whatever follows must be on a
                     // new line at the current structural indent.
-                    self.break_to(self.line_indent);
+                    self.break_to(deferred.unwrap_or(self.line_indent));
                 }
                 Kind::BlockComment => {
                     self.emit(kind, text, false);
@@ -1501,6 +1513,36 @@ mod tests {
                 // And never more than one, whatever the input collected.
                 assert!(!got.ends_with("\n\n"), "{input:?} → {got:?}");
             }
+        }
+    }
+
+    /// **A comment that trailed its line's code stays on that line.** After a
+    /// list comma it moved down onto the next item's line — `a, -- first`
+    /// came out over `b`, reading as `b`'s. A comment on a line of its own
+    /// keeps one.
+    #[test]
+    fn a_trailing_comment_stays_with_the_code_it_followed() {
+        assert_eq!(
+            format_sql("select a, -- first\n  b from t", IND),
+            "select\n  a, -- first\n  b\nfrom\n  t"
+        );
+        assert_eq!(
+            format_sql("select -- columns\n a from t", IND),
+            "select -- columns\n  a\nfrom\n  t"
+        );
+        // After a `;`, on the statement it ended — not atop the next one.
+        assert_eq!(
+            format_sql("select 1; -- done\nselect 2", IND),
+            "select\n  1; -- done\n\nselect\n  2"
+        );
+        let own = "select a,\n  -- about b\n  b from t";
+        assert_eq!(
+            format_sql(own, IND),
+            "select\n  a,\n  -- about b\n  b\nfrom\n  t"
+        );
+        for sql in ["select a, -- first\n  b from t", own] {
+            let once = format_sql(sql, IND);
+            assert_eq!(format_sql(&once, IND), once, "idempotent: {sql}");
         }
     }
 

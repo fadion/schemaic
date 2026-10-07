@@ -12058,6 +12058,12 @@ existing prose was left alone.
     on all four engines too, and SQL Server's own besides — bracketed names with `]]`, `N'…'`,
     `@x`/`@@x`/`#t`/`##t`, compound assignment, `TOP (n)`, `OUTPUT`, `APPLY`, `type::Method`,
     `!<`/`!>` — each idempotent. Both were green on arrival: they guard, they did not find.
+    **A line comment that trailed its line's code stays on that line**: with no newline before it in
+    the input, the break the code before it asked for — a list comma's, a clause head's, a `;`'s —
+    is taken after it instead (`deferred` in `run`'s `LineComment` arm). Moved down past the break,
+    `a, -- first` came out over `b` and read as `b`'s note. `need_space` sets a line comment off
+    from the code before it first thing, since after a `;` `end_statement` has cleared `prev` and
+    `1;-- done` came out tight (`a_trailing_comment_stays_with_the_code_it_followed`).
     **A T-SQL `@x`, `@@ROWCOUNT`, `#t` or `##g` is one `Kind::Word`.** `@` and `#` fell to the
     operator arm and `need_space` separated them from their name, so one Format Code broke nearly
     every T-SQL script: `SELECT @ x` is Msg 137, `SELECT @ @ VERSION` and `CREATE TABLE # t` are
