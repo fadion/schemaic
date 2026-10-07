@@ -931,6 +931,10 @@ struct Fmt<'a> {
     verb: Option<String>,
     /// `OUTPUT` can be a write's clause here ([`has_output_clause`]).
     output_clause: bool,
+    /// How many `BEGIN … END` bodies are open. A statement inside one starts
+    /// that many levels in, and its `;` returns there rather than to the
+    /// margin.
+    blocks: usize,
 }
 
 /// One open `CASE`: the indent of the line it opened on, the paren depth it
@@ -965,6 +969,36 @@ impl<'a> Fmt<'a> {
             cases: Vec::new(),
             verb: None,
             output_clause: has_output_clause(dialect),
+            blocks: 0,
+        }
+    }
+
+    /// After a `BEGIN`/`END` at `toks[k]`: T-SQL's `TRY`/`CATCH` stays with
+    /// it. How many tokens it took.
+    fn emit_block_follower(&mut self, toks: &[(Kind, &str)], k: usize) -> usize {
+        match toks.get(k + 1) {
+            Some((Kind::Word, w))
+                if w.eq_ignore_ascii_case("TRY") || w.eq_ignore_ascii_case("CATCH") =>
+            {
+                self.emit(Kind::Word, w, false);
+                1
+            }
+            _ => 0,
+        }
+    }
+
+    /// Does the `BEGIN` at `toks[k]` open a body? Not a transaction's:
+    /// `BEGIN TRAN`, `TRANSACTION`, `WORK`, `DISTRIBUTED`, or a bare `BEGIN;`.
+    fn opens_body(toks: &[(Kind, &str)], k: usize) -> bool {
+        let next = toks[k + 1..]
+            .iter()
+            .find(|(kind, _)| !matches!(kind, Kind::LineComment | Kind::BlockComment));
+        match next {
+            None | Some((Kind::Terminator, _)) | Some((Kind::Punct, ";")) => false,
+            Some((Kind::Word, w)) => !["TRAN", "TRANSACTION", "WORK", "DISTRIBUTED"]
+                .iter()
+                .any(|t| w.eq_ignore_ascii_case(t)),
+            Some(_) => true,
         }
     }
 
@@ -1143,6 +1177,8 @@ impl<'a> Fmt<'a> {
                     self.blank = false;
                     self.break_to(0);
                     self.emit(kind, text, false);
+                    // A batch's end closes whatever body it left open.
+                    self.blocks = 0;
                     self.base = 0;
                     self.content = 0;
                     self.parens.clear();
@@ -1215,6 +1251,38 @@ impl<'a> Fmt<'a> {
                             self.break_to(f.indent);
                         }
                         self.emit(Kind::Word, text, false);
+                    } else if up == "BEGIN" && !in_expr && Self::opens_body(toks, k) {
+                        // A body: on its own line unless it ends a header
+                        // (`AS BEGIN`, `THEN BEGIN`), with T-SQL's TRY/CATCH.
+                        let ends_header = matches!(
+                            self.prev_word_upper().as_deref(),
+                            Some("AS" | "THEN" | "ELSE" | "DO")
+                        );
+                        if !ends_header {
+                            self.break_to(self.base);
+                        }
+                        self.emit(Kind::Word, text, false);
+                        k += self.emit_block_follower(toks, k);
+                        self.blocks += 1;
+                        self.base = self.blocks;
+                        self.content = self.blocks;
+                        self.break_to(self.base);
+                    } else if up == "END"
+                        && !in_expr
+                        && self.blocks > 0
+                        && !matches!(
+                            toks.get(k + 1),
+                            Some((Kind::Word, w)) if ["IF", "LOOP", "WHILE", "REPEAT", "FOR"]
+                                .iter()
+                                .any(|t| w.eq_ignore_ascii_case(t))
+                        )
+                    {
+                        self.blocks -= 1;
+                        self.base = self.blocks;
+                        self.content = self.blocks;
+                        self.break_to(self.base);
+                        self.emit(Kind::Word, text, false);
+                        k += self.emit_block_follower(toks, k);
                     } else if !in_expr && (HEADS.contains(&up.as_str()) || output_head) {
                         self.limit_depth = (up == "LIMIT").then_some(self.parens.len());
                         self.break_to(self.base);
@@ -1328,15 +1396,17 @@ impl<'a> Fmt<'a> {
     /// A statement's terminator was just written: the next one starts afresh
     /// at the margin, after a blank line.
     fn end_statement(&mut self) {
-        self.base = 0;
-        self.content = 0;
+        // Back to the open body's level, not the margin — and no blank line
+        // between a body's statements.
+        self.base = self.blocks;
+        self.content = self.blocks;
         self.parens.clear();
         self.brackets = 0;
         self.suppress_and = false;
         self.cases.clear();
         self.prev = None;
-        self.blank = true;
-        self.break_to(0);
+        self.blank = self.blocks == 0;
+        self.break_to(self.blocks);
     }
 
     fn is_join_break(&self, up: &str) -> bool {
@@ -1655,6 +1725,33 @@ mod tests {
         ] {
             let once = format_sql(sql, IND);
             assert_eq!(format_sql(&once, IND), once, "idempotent: {sql}");
+        }
+    }
+
+    /// A `BEGIN … END` body is indented, its statements one level in with no
+    /// blank line between them, and `END` back at its `BEGIN`'s level; T-SQL's
+    /// `BEGIN TRY` / `END CATCH` keep their word; a transaction's `BEGIN`
+    /// opens nothing.
+    #[test]
+    fn a_begin_end_body_is_indented() {
+        let ms = |s: &str| super::format_sql(s, IND, SqlDialect::MsSql);
+        assert_eq!(
+            ms("create procedure p as begin select 1; select a from t; end;"),
+            "create procedure p as begin\n  select\n    1;\n  select\n    a\n  from\n    t;\nend;"
+        );
+        assert_eq!(
+            ms("begin try select 1; end try begin catch select 2; end catch"),
+            "begin try\n  select\n    1;\nend try\nbegin catch\n  select\n    2;\nend catch"
+        );
+        let tx = ms("begin transaction; select 1; commit;");
+        assert!(tx.contains("\nselect\n  1;"), "{tx}");
+        let my = super::format_sql("begin; select 1; commit;", IND, SqlDialect::MySql);
+        assert!(my.contains("\nselect\n  1;"), "{my}");
+        for s in [
+            "create procedure p as begin select 1; select a from t; end;",
+            "begin try select 1; end try begin catch select 2; end catch",
+        ] {
+            assert_eq!(ms(&ms(s)), ms(s), "idempotent: {s}");
         }
     }
 

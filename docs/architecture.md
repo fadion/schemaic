@@ -12094,7 +12094,14 @@ existing prose was left alone.
     — only where `has_output_clause` (SQL Server), only in an `INSERT`/`UPDATE`/`DELETE`/`MERGE`
     (`Fmt::verb`, the statement's first word), and only with a name after it, since a procedure
     parameter's `@x int OUTPUT` takes no parens and a column may be called `output`
-    (`top_keeps_its_space_and_output_is_a_clause`).
+    (`top_keeps_its_space_and_output_is_a_clause`). **A `BEGIN … END` body is indented**
+    (`Fmt::blocks`): `end_statement` returns a body's `;` to the body's level, not the margin, and
+    with no blank line between its statements; `END` steps back to its `BEGIN`'s; T-SQL's `TRY`/
+    `CATCH` stay with their word (`emit_block_follower`); a `BEGIN` takes a line of its own unless
+    it ends a header (`AS BEGIN`, `THEN BEGIN`). A transaction's `BEGIN` — `TRAN`, `TRANSACTION`,
+    `WORK`, `DISTRIBUTED`, or a bare `BEGIN;` — opens nothing (`opens_body`), an `END IF`/`LOOP`/
+    `WHILE`/`REPEAT`/`FOR` closes no body, and a `GO` ends whatever its batch left open
+    (`a_begin_end_body_is_indented`).
     **A T-SQL `@x`, `@@ROWCOUNT`, `#t` or `##g` is one `Kind::Word`.** `@` and `#` fell to the
     operator arm and `need_space` separated them from their name, so one Format Code broke nearly
     every T-SQL script: `SELECT @ x` is Msg 137, `SELECT @ @ VERSION` and `CREATE TABLE # t` are
