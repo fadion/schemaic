@@ -460,8 +460,9 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
     // functions, and — after a complete table ref — schema table names), so the
     // legal next keyword the grammar predicts wins ties. Added before the
     // per-context candidates so they claim tier 0 (dedup keeps the first entry).
-    // Skipped after a `qualifier.` (there we want only that table's columns).
-    if !qualified {
+    // Skipped after a `qualifier.` (there we want only that table's columns),
+    // and at a cast's target, which takes a type and nothing else.
+    if !qualified && *ctx != ClauseCtx::Type {
         for kw in &cont.keywords {
             add(&mut cands, &mut seen, kw, SuggestKind::Keyword, "", 0);
         }
@@ -643,6 +644,13 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
             for k in clause_keywords() {
                 let tier = if begins_with(k, prefix) { 2 } else { 3 };
                 add(&mut cands, &mut seen, k, SuggestKind::Keyword, "", tier);
+            }
+        }
+        // A cast's target: the engine's cast types and nothing else, in the
+        // typed case as a keyword is.
+        ClauseCtx::Type => {
+            for t in crate::intel::cast_target_types(input.dialect, input.flavour) {
+                add(&mut cands, &mut seen, &t, SuggestKind::Keyword, "type", 0);
             }
         }
         ClauseCtx::Start => {
@@ -1230,6 +1238,34 @@ mod tests {
         // still sits under the builtins — past the last row on PostgreSQL.
         let rows = col("");
         assert!(!offers(&rows, "PARTITION"), "{rows:?}");
+    }
+
+    /// A cast's target offers the engine's cast types alone — no columns, no
+    /// functions — in the case they are typed, as a keyword is.
+    #[test]
+    fn a_cast_target_offers_the_engines_types() {
+        let s = shop();
+        let scope = [tref("orders", None)];
+        let ty = |d, f, p| ranked_on_flavour(&s, d, f, ClauseCtx::Type, &scope, p);
+        let my = ty(SqlDialect::MySql, ServerFlavour::MySql, "si");
+        assert_eq!(my.first().map(String::as_str), Some("signed"), "{my:?}");
+        assert!(my.iter().all(|r| r != "id"), "no columns: {my:?}");
+        assert!(!offers(
+            &ty(SqlDialect::MySql, ServerFlavour::MySql, "in"),
+            "INT"
+        ));
+        assert!(offers(
+            &ty(SqlDialect::MySql, ServerFlavour::MariaDb, "in"),
+            "INT"
+        ));
+        let pg = ty(SqlDialect::Postgres, ServerFlavour::Unknown, "INT");
+        assert_eq!(pg.first().map(String::as_str), Some("INTEGER"), "{pg:?}");
+        // With nothing typed, every type and nothing else.
+        let all = ty(SqlDialect::MsSql, ServerFlavour::Unknown, "");
+        assert!(
+            offers(&all, "nvarchar") && !offers(&all, "total"),
+            "{all:?}"
+        );
     }
 
     /// A name that bare would be something else — a reserved word, a space,

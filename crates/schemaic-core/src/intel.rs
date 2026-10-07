@@ -3611,6 +3611,55 @@ pub fn engine_keywords(
     SHARED.iter().chain(own).copied()
 }
 
+/// The type names completion offers where a cast's target goes
+/// ([`ClauseCtx::Type`]): `CAST(x AS |`, PostgreSQL's `x::|`.
+///
+/// **MySQL's `CAST` takes a list of its own, not its column types**:
+/// `CAST('1' AS INT)` is a syntax error on MySQL 8.4.11, as are `INTEGER`
+/// and `VARCHAR`, while MariaDB 10.11.14 takes `INT`/`INTEGER` and refuses
+/// `YEAR`, `REAL` and `JSON`, which MySQL takes. Both measured, each word
+/// through `SELECT CAST('1' AS …)`. A MySQL-family server not yet asked is
+/// offered both families', as [`engine_keywords`] is. The other three take
+/// any type name, so they are offered their column types' base names
+/// ([`crate::ddl::common_types`], less the size). Written upper-case, as a
+/// keyword list is, for [`in_typed_case`].
+pub fn cast_target_types(
+    dialect: SqlDialect,
+    flavour: crate::schema::ServerFlavour,
+) -> Vec<String> {
+    use crate::schema::ServerFlavour;
+    const MYSQL_FAMILY: &[&str] = &[
+        "SIGNED", "UNSIGNED", "DECIMAL", "DOUBLE", "FLOAT", "CHAR", "NCHAR", "BINARY", "DATE",
+        "DATETIME", "TIME",
+    ];
+    const MYSQL_ONLY: &[&str] = &["JSON", "YEAR", "REAL"];
+    const MARIADB_ONLY: &[&str] = &["INT", "INTEGER"];
+    match dialect {
+        SqlDialect::MySql => {
+            let own: &[&[&'static str]] = match flavour {
+                ServerFlavour::MySql => &[MYSQL_ONLY],
+                ServerFlavour::MariaDb => &[MARIADB_ONLY],
+                ServerFlavour::Unknown => &[MYSQL_ONLY, MARIADB_ONLY],
+            };
+            MYSQL_FAMILY
+                .iter()
+                .chain(own.iter().flat_map(|l| l.iter()))
+                .map(|t| t.to_string())
+                .collect()
+        }
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => {
+            let mut out: Vec<String> = Vec::new();
+            for t in crate::ddl::common_types(dialect) {
+                let base = t.split('(').next().unwrap_or(t).trim().to_ascii_uppercase();
+                if !out.contains(&base) {
+                    out.push(base);
+                }
+            }
+            out
+        }
+    }
+}
+
 /// Clause keywords that determine the completion context (see [`clause_context`]).
 const CLAUSE_KEYWORDS: &[&str] = &[
     "SELECT", "FROM", "WHERE", "JOIN", "ON", "AND", "OR", "HAVING", "SET", "USING", "BY", "GROUP",
@@ -3913,10 +3962,49 @@ pub enum ClauseCtx {
     Table,
     /// Right after `qualifier.` → that table's columns (or that db's tables).
     Qualified(String),
+    /// A cast's target type — `CAST(x AS |`, `TRY_CAST(x AS |`,
+    /// PostgreSQL's `x::|` → [`cast_target_types`].
+    Type,
     /// After a statement-opening `USE` → databases.
     Database,
     /// Anything else → the full mixed list (keywords + tables + columns).
     Other,
+}
+
+/// Is the word at `word_lo` a cast's target type? Straight after an `AS`
+/// whose innermost open paren is a `CAST(` or `TRY_CAST(` — an `AS` anywhere
+/// else names an alias — or after `::` where the engine casts with it.
+/// `toks` are `sql`'s tokens up to the word.
+fn cast_target_at(sql: &str, toks: &[Token], word_lo: usize, dialect: SqlDialect) -> bool {
+    // The tokenizer keeps no operators, so `::` is read off the bytes.
+    let before = sql[..word_lo].trim_end_matches([' ', '\t', '\r', '\n']);
+    if casts_with_double_colon(dialect) && before.ends_with("::") {
+        return true;
+    }
+    let is_word = |t: &Token, any: &[&str]| matches!(&t.kind, TkKind::Word(w) if !t.quoted && any.iter().any(|k| w.eq_ignore_ascii_case(k)));
+    if !toks.last().is_some_and(|t| is_word(t, &["AS"])) {
+        return false;
+    }
+    let mut open: Vec<usize> = Vec::new();
+    for (i, t) in toks.iter().enumerate() {
+        match t.kind {
+            TkKind::LParen => open.push(i),
+            TkKind::RParen => {
+                open.pop();
+            }
+            _ => {}
+        }
+    }
+    open.last()
+        .is_some_and(|&p| p > 0 && is_word(&toks[p - 1], &["CAST", "TRY_CAST"]))
+}
+
+/// Does the engine spell a cast `x::type`? PostgreSQL's alone.
+fn casts_with_double_colon(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::Postgres => true,
+        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+    }
 }
 
 /// Byte offset where the identifier ending at `offset` begins.
@@ -3951,6 +4039,9 @@ pub fn clause_context(sql: &str, lo: usize, word_lo: usize, dialect: SqlDialect)
         && !name.is_empty()
     {
         return ClauseCtx::Qualified(name.clone());
+    }
+    if cast_target_at(sql, &toks, word_lo, dialect) {
+        return ClauseCtx::Type;
     }
     // The last clause keyword strictly before the caret's word decides the rest
     // — **within the caret's paren**: each `(` opens a scope whose keywords
@@ -18517,6 +18608,64 @@ mod tests {
     fn ctx_at(sql: &str, caret: usize) -> ClauseCtx {
         let word_lo = word_start(sql, caret);
         clause_context(sql, 0, word_lo, SqlDialect::MySql)
+    }
+
+    /// A cast's target is a type: after `AS` inside `CAST(`/`TRY_CAST(`, and
+    /// after PostgreSQL's `::`. An `AS` anywhere else names an alias.
+    #[test]
+    fn a_cast_target_is_a_type_slot() {
+        let on = |sql: &str, d| clause_context(sql, 0, word_start(sql, sql.len()), d);
+        for d in SqlDialect::ALL {
+            assert_eq!(on("SELECT CAST(a AS ", d), ClauseCtx::Type, "{d:?}");
+            assert_eq!(on("SELECT CAST(a AS dec", d), ClauseCtx::Type, "{d:?}");
+            assert_eq!(on("SELECT cast(t.a + 1 AS ", d), ClauseCtx::Type, "{d:?}");
+            assert_eq!(on("SELECT CAST(f(a, b) AS ", d), ClauseCtx::Type, "{d:?}");
+            assert_ne!(on("SELECT a AS ", d), ClauseCtx::Type, "{d:?}");
+            assert_ne!(on("SELECT CAST(a AS int) AS ", d), ClauseCtx::Type, "{d:?}");
+            assert_ne!(on("SELECT CAST(", d), ClauseCtx::Type, "{d:?}");
+            assert_ne!(on("SELECT f(a AS ", d), ClauseCtx::Type, "{d:?}");
+        }
+        assert_eq!(
+            on("SELECT TRY_CAST(a AS ", SqlDialect::MsSql),
+            ClauseCtx::Type
+        );
+        let pg = SqlDialect::Postgres;
+        assert_eq!(on("SELECT a::", pg), ClauseCtx::Type);
+        assert_eq!(on("SELECT a::te", pg), ClauseCtx::Type);
+        assert_eq!(on("SELECT (a + 1)::", pg), ClauseCtx::Type);
+        assert_ne!(on("SELECT a::", SqlDialect::MySql), ClauseCtx::Type);
+    }
+
+    /// Each engine's cast targets: MySQL's and MariaDB's own lists, each
+    /// measured, and the column types' base names elsewhere.
+    #[test]
+    fn each_engine_is_offered_its_own_cast_targets() {
+        use crate::schema::ServerFlavour::{MariaDb, MySql as My, Unknown};
+        let has = |d, f, t: &str| cast_target_types(d, f).iter().any(|x| x == t);
+        let my = SqlDialect::MySql;
+        for t in [
+            "SIGNED", "UNSIGNED", "CHAR", "DECIMAL", "DATETIME", "BINARY",
+        ] {
+            for f in [My, MariaDb, Unknown] {
+                assert!(has(my, f, t), "{t} {f:?}");
+            }
+        }
+        assert!(has(my, My, "JSON") && !has(my, MariaDb, "JSON"));
+        assert!(has(my, MariaDb, "INT") && !has(my, My, "INT"));
+        assert!(has(my, Unknown, "JSON") && has(my, Unknown, "INT"));
+        assert!(!has(my, Unknown, "VARCHAR"));
+        let pg = |t| has(SqlDialect::Postgres, Unknown, t);
+        assert!(pg("INTEGER") && pg("DOUBLE PRECISION") && pg("VARCHAR") && pg("NUMERIC"));
+        for d in [SqlDialect::Postgres, SqlDialect::Sqlite, SqlDialect::MsSql] {
+            let types = cast_target_types(d, Unknown);
+            assert!(!types.is_empty(), "{d:?}");
+            assert!(types.iter().all(|t| !t.contains('(')), "{d:?}: {types:?}");
+            assert!(
+                types.iter().all(|t| *t == t.to_ascii_uppercase()),
+                "{types:?}"
+            );
+        }
+        assert!(has(SqlDialect::MsSql, Unknown, "NVARCHAR"));
     }
 
     #[test]

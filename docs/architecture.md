@@ -941,7 +941,12 @@ existing prose was left alone.
     without a clause of their own: MySQL's `ON DUPLICATE KEY UPDATE` is read as `SET`, and inside
     an `ALTER TABLE` the word after `DROP`/`ALTER`/`RENAME`/`MODIFY`/`CHANGE COLUMN`, or a bare
     `MODIFY`/`CHANGE`, is `Column`, where the `TABLE` before it had left a table slot
-    (`an_upsert_or_altered_column_is_a_column_context`).
+    (`an_upsert_or_altered_column_is_a_column_context`). **A cast's target is `Type`**, asked
+    before any of that (`cast_target_at`): the word straight after an `AS` whose innermost open
+    paren is a `CAST(`/`TRY_CAST(` — an `AS` anywhere else is an alias's — or after `::` where the
+    engine casts with it (`casts_with_double_colon`, PostgreSQL), read off the bytes since the
+    tokenizer keeps no operators (`a_cast_target_is_a_type_slot`). A column definition's type
+    and T-SQL's `CONVERT(type, …)` are not type slots yet.
     **`signature_help` asks what the word before the `(` names before it asks the catalogue** —
     the column list above, met again in the signature bar: `INSERT INTO log (` opened `LOG(x)`'s
     help over a list of columns nobody was calling. `names_an_object` reads back over an `a.b`
@@ -12930,6 +12935,16 @@ existing prose was left alone.
       whose only word so far is `USE` (`use_names_a_database`): its arm offers every database but
       the tab's own, with no prefix needed, and nothing else — the mixed list it fell into before
       offered tables and columns where only a database can go (`use_offers_the_other_databases`).
+      **`ClauseCtx::Type` offers `intel::cast_target_types` and nothing else** — no columns, no
+      grammar continuations — as keyword rows, so in the typed case
+      (`a_cast_target_offers_the_engines_types`). **MySQL's `CAST` takes a list of its own, not
+      its column types**, and the two servers' lists differ: measured with `SELECT CAST('1' AS …)`,
+      MySQL 8.4.11 refuses `INT`, `INTEGER` and `VARCHAR` and takes `JSON`, `YEAR` and `REAL`;
+      MariaDB 10.11.14 takes `INT`/`INTEGER` and refuses those three; eleven are common to both. A
+      MySQL-family tab whose flavour is not known yet is offered both, as `engine_keywords` does.
+      PostgreSQL, SQLite and SQL Server take any type name, so theirs are `ddl::common_types`'
+      base names, upper-cased for `in_typed_case`
+      (`each_engine_is_offered_its_own_cast_targets`).
       **`add` asks `worth_offering` before it builds anything, which is `add_col`'s shape adopted
       for `add_col`'s reason.** A PostgreSQL tab offers 863 builtins where a MySQL 8 one offers 341
       (`FUNCTIONS`' 463 less `MARIADB_ONLY`, which contains every `DEPRECATED_ALIASES` name), and
