@@ -635,8 +635,14 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
                     c.insert = Some(fun.name.to_string());
                 }
             }
+            // A keyword the typed word begins competes with the builtins on
+            // score, where its prefix bonus lifts it past every builtin that
+            // only fuzzy-matches: under them, PostgreSQL's `parti` filled the
+            // list with `pg_*` names and buried `PARTITION`. A fuzzy keyword
+            // match stays under them all.
             for k in clause_keywords() {
-                add(&mut cands, &mut seen, k, SuggestKind::Keyword, "", 3);
+                let tier = if begins_with(k, prefix) { 2 } else { 3 };
+                add(&mut cands, &mut seen, k, SuggestKind::Keyword, "", tier);
             }
         }
         ClauseCtx::Start => {
@@ -724,6 +730,15 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
         })
         .collect();
     (items, completes_a_word)
+}
+
+/// Does `cand` begin with a non-empty `prefix`, ignoring ASCII case?
+fn begins_with(cand: &str, prefix: &str) -> bool {
+    !prefix.is_empty()
+        && cand
+            .as_bytes()
+            .get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix.as_bytes()))
 }
 
 /// Would this candidate survive scoring at all? The same question
@@ -1139,10 +1154,12 @@ mod tests {
             assert!(offers(&col(d, any, "ove"), "OVER"), "{d:?}");
             assert!(offers(&col(d, any, "inters"), "INTERSECT"), "{d:?}");
         }
-        // Not PostgreSQL: there `parti` fuzzy-matches enough builtins to fill
-        // the list, and a builtin's tier ranks above every keyword's — a
-        // ranking question, not this list's.
-        for d in [SqlDialect::MySql, SqlDialect::Sqlite, SqlDialect::MsSql] {
+        for d in [
+            SqlDialect::MySql,
+            SqlDialect::Postgres,
+            SqlDialect::Sqlite,
+            SqlDialect::MsSql,
+        ] {
             assert!(offers(&col(d, any, "parti"), "PARTITION"), "{d:?}");
         }
         assert!(offers(&col(SqlDialect::MsSql, any, "to"), "TOP"));
@@ -1163,6 +1180,30 @@ mod tests {
         let start = |d, p| ranked_on(&s, d, ClauseCtx::Start, &[], p);
         assert!(offers(&start(SqlDialect::MsSql, "mer"), "MERGE"));
         assert!(!offers(&start(SqlDialect::Sqlite, "mer"), "MERGE"));
+    }
+
+    /// A keyword the typed word begins is ranked with the builtins rather than
+    /// under them, so a builtin that only fuzzy-matches cannot bury it:
+    /// PostgreSQL's `parti` matches enough `pg_*` names to fill the list, and
+    /// `PARTITION` fell past the last row. A keyword it only fuzzy-matches stays
+    /// below every builtin, and nothing typed promotes nothing.
+    #[test]
+    fn a_keyword_the_word_begins_outranks_a_builtin_it_only_fuzzy_matches() {
+        let s = shop();
+        let scope = [tref("orders", None)];
+        let col = |p| ranked_on(&s, SqlDialect::Postgres, ClauseCtx::Column, &scope, p);
+        let rows = col("parti");
+        let at = |name: &str| rows.iter().position(|r| r.eq_ignore_ascii_case(name));
+        let kw = at("PARTITION").unwrap_or_else(|| panic!("PARTITION offered: {rows:?}"));
+        let fuzzy = rows
+            .iter()
+            .position(|r| !r.to_ascii_lowercase().starts_with("parti"))
+            .expect("a fuzzy builtin match");
+        assert!(kw < fuzzy, "{rows:?}");
+        // With nothing typed there is no prefix to begin, and every keyword
+        // still sits under the builtins — past the last row on PostgreSQL.
+        let rows = col("");
+        assert!(!offers(&rows, "PARTITION"), "{rows:?}");
     }
 
     /// The engine's own keywords complete a row; they do not make a word an

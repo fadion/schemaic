@@ -12869,13 +12869,15 @@ existing prose was left alone.
       ones**: a `clause_keywords` closure chains `intel::engine_keywords(dialect, flavour)` onto
       the filtered `SQL_KEYWORDS` at all three sites that offer it, in the same tier — 3 in
       `Column`, 2 in `Other`, and 1 at `Start`, so `MERGE` begins a statement on PostgreSQL and
-      SQL Server (`each_engine_is_offered_its_own_keywords`). **A keyword can be crowded out of
-      PostgreSQL's column context entirely, and nothing here prevents it**: the sort is by tier
-      first, a builtin's tier (2) outranks every keyword's (3), and `parti` is a fuzzy match for
-      enough of the 863 offered builtins to fill `MAX_ROWS` before `PARTITION` is reached — which
-      is why that test leaves PostgreSQL out of its `PARTITION` assertion. It is a ranking
-      question rather than this list's, and older than it: the shared forty are exposed the same
-      way.
+      SQL Server (`each_engine_is_offered_its_own_keywords`). **In `Column`, a keyword the typed
+      word begins is promoted to the builtins' tier (2)** (`begins_with`), where the prefix bonus
+      in `fuzzy_score` lifts it past every builtin that only fuzzy-matches. Left at 3 it could be
+      crowded out entirely: the sort is by tier first, and `parti` is a fuzzy match for enough of
+      PostgreSQL's 863 offered builtins to fill `MAX_ROWS` before `PARTITION` was reached
+      (`a_keyword_the_word_begins_outranks_a_builtin_it_only_fuzzy_matches`). A keyword matched
+      only fuzzily stays at 3, and so does every keyword with nothing typed, where every word
+      "begins" with the empty prefix and the promotion would put forty keywords among the
+      functions.
       **A keyword row is in the typed case**: `add` writes it through `intel::in_typed_case`, the
       inline predictions' rule — all lower typed, lower offered; anything else, and nothing typed,
       the conventional upper — so `sel` accepts `select` (`a_keyword_is_offered_in_the_typed_case`).
