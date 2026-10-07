@@ -95,7 +95,7 @@ pub(crate) const SHORTCUTS: &[ShortcutGroup] = &[
             ("Ctrl+/", "Toggle line comment"),
             ("Ctrl+Shift+U", "Toggle case"),
             ("Ctrl+D", "Duplicate line / selection"),
-            ("Ctrl+X", "Delete line"),
+            ("Ctrl+X", "Cut line / selection"),
             ("Ctrl+Alt+L", "Format code"),
             ("Alt+↑ / Alt+↓", "Move line up / down"),
             ("Tab / Shift+Tab", "Indent / outdent"),

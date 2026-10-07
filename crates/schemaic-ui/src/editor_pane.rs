@@ -3061,11 +3061,11 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             return CommandExecuted::Yes;
         }
         // Editor line operations (DataGrip-ish): Ctrl+/ toggle line comment,
-        // Ctrl+D duplicate line/selection, Ctrl+X delete line. `--` is the SQL
-        // comment token; Floem's built-in ToggleLineComment hardcodes an empty
-        // token, so the toggle is computed in `core::text_ops` and applied as one
-        // full-buffer edit (a single undo step). Ctrl+X diverges from DataGrip
-        // (which cuts) — here it deletes the line.
+        // Ctrl+D duplicate line/selection, Ctrl+X cut line/selection. `--` is the
+        // SQL comment token; Floem's built-in ToggleLineComment hardcodes an
+        // empty token, so the toggle is computed in `core::text_ops` and applied
+        // as one full-buffer edit (a single undo step). Ctrl+X on bare carets
+        // cuts their lines, as DataGrip does (`text_ops::cut_lines`).
         if primary_held(mods)
             && !mods.shift()
             && let KeyInput::Keyboard(Key::Character(c), _) = &kp.key
