@@ -198,6 +198,12 @@ pub struct LocalNames {
     /// The select-list aliases the caret's clause may name
     /// ([`crate::intel::output_aliases_at`]), offered where a column goes.
     pub output_aliases: Vec<crate::intel::LocalName>,
+    /// The document's variables ([`crate::intel::variables_at`]), offered
+    /// straight after `@`.
+    pub variables: Vec<crate::intel::LocalName>,
+    /// The document's temporary tables ([`crate::intel::temp_tables_at`]),
+    /// offered straight after `#`.
+    pub temp_tables: Vec<crate::intel::LocalName>,
 }
 
 /// Everything ranking needs that is not the schema.
@@ -528,7 +534,12 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
     // per-context candidates so they claim tier 0 (dedup keeps the first entry).
     // Skipped after a `qualifier.` (there we want only that table's columns),
     // and at a cast's target, which takes a type and nothing else.
-    if !qualified && *ctx != ClauseCtx::Type {
+    if !qualified
+        && !matches!(
+            ctx,
+            ClauseCtx::Type | ClauseCtx::Variable | ClauseCtx::TempTable
+        )
+    {
         for kw in &cont.keywords {
             add(&mut cands, &mut seen, kw, SuggestKind::Keyword, "", 0);
         }
@@ -781,6 +792,36 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
             for k in clause_keywords() {
                 let tier = if begins_with(k, prefix) { 2 } else { 3 };
                 add(&mut cands, &mut seen, k, SuggestKind::Keyword, "", tier);
+            }
+        }
+        // Straight after a sigil: the document's own names, and nothing the
+        // schema could put there.
+        ClauseCtx::Variable => {
+            for v in &input.local.variables {
+                let glyph = SuggestGlyph::Kind;
+                add_local(
+                    &mut cands,
+                    &mut seen,
+                    v,
+                    SuggestKind::Column,
+                    "variable",
+                    glyph,
+                    0,
+                );
+            }
+        }
+        ClauseCtx::TempTable => {
+            for t in &input.local.temp_tables {
+                let glyph = SuggestGlyph::Table;
+                add_local(
+                    &mut cands,
+                    &mut seen,
+                    t,
+                    SuggestKind::Table,
+                    "temp table",
+                    glyph,
+                    0,
+                );
             }
         }
         // A value with no columns in reach: functions first, then keywords.
@@ -1390,6 +1431,50 @@ mod tests {
         assert!(!offers(&rows, "PARTITION"), "{rows:?}");
     }
 
+    /// Straight after `@` the document's variables, and after `#` its
+    /// temporary tables — those alone, nothing from the schema.
+    #[test]
+    fn a_sigil_offers_the_documents_variables_or_temp_tables() {
+        let s = shop();
+        let local = |n: &str| crate::intel::LocalName {
+            name: n.to_string(),
+            written: n.to_string(),
+        };
+        let names = LocalNames {
+            variables: vec![local("total"), local("tag")],
+            temp_tables: vec![local("work")],
+            ..LocalNames::default()
+        };
+        let rows = |ctx: ClauseCtx, prefix: &str| {
+            let cont = Continuation::default();
+            let used = HashSet::new();
+            rank(
+                &s,
+                &RankInput {
+                    ctx: &ctx,
+                    cont: &cont,
+                    scope: &[tref("orders", None)],
+                    prefix,
+                    snippets: &[],
+                    join_targets: &[],
+                    star: None,
+                    used: &used,
+                    active_db: Some("shop"),
+                    dialect: SqlDialect::MsSql,
+                    flavour: ServerFlavour::Unknown,
+                    local: &names,
+                    wide: false,
+                },
+            )
+            .into_iter()
+            .map(|r| r.text)
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(rows(ClauseCtx::Variable, "t"), ["tag", "total"]);
+        assert_eq!(rows(ClauseCtx::TempTable, ""), ["work"]);
+        assert!(rows(ClauseCtx::Variable, "to").iter().all(|r| r != "TOP"));
+    }
+
     /// **The widened list** names every database's and schema's tables at a
     /// table slot, each inserting the reference that reaches it from the tab's
     /// database — and nothing PostgreSQL could not reach. Without it, the
@@ -1524,6 +1609,7 @@ mod tests {
         let names = LocalNames {
             ctes: vec![local("recent", "recent"), local("Big", "\"Big\"")],
             output_aliases: vec![local("Total", "Total")],
+            ..LocalNames::default()
         };
         let rows = |ctx: ClauseCtx, scope: &[TableRef], prefix: &str| {
             let cont = Continuation::default();

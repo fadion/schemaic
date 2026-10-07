@@ -1153,6 +1153,18 @@ pub(crate) fn recompute_completions(
         } else {
             Vec::new()
         },
+        // The whole document's: a variable or temporary table outlives the
+        // statement that made it.
+        variables: if matches!(ctx, ClauseCtx::Variable) {
+            intel::variables_at(&text, offset, dialect)
+        } else {
+            Vec::new()
+        },
+        temp_tables: if matches!(ctx, ClauseCtx::TempTable) {
+            intel::temp_tables_at(&text, offset, dialect)
+        } else {
+            Vec::new()
+        },
     };
 
     let ranked = rank::rank_full(

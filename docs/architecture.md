@@ -13027,6 +13027,17 @@ existing prose was left alone.
       `a_table_is_named_from_the_sessions_database`). The row shows the reference with its quotes
       off and is matched by it. In the UI `Completion::wide` is set by a Ctrl+Space over an open
       list, kept while it stays open, and cleared when a list next opens by typing.
+      **Straight after a sigil the list is the document's own names and nothing else**:
+      `ClauseCtx::Variable` after one `@` where the engine has `@` variables (`has_at_variables`:
+      SQL Server's declared ones, MySQL's user variables — not `@@`, a system function's) offers
+      `intel::variables_at`, and `ClauseCtx::TempTable` after a T-SQL `#` or `##` offers
+      `intel::temp_tables_at` — each read from the whole document, since a variable or temporary
+      table outlives its statement, through the one boundary lexer (`sigiled_names`), the word
+      being typed left out. A temporary table is offered only with the sigil typed (`#` local,
+      `##` global) and named without it, since the replaced word starts after it
+      (`the_documents_variables_and_temp_tables_are_read`,
+      `a_sigil_before_the_word_makes_a_variable_or_temp_table_slot`,
+      `a_sigil_offers_the_documents_variables_or_temp_tables`).
       **`add` asks `worth_offering` before it builds anything, which is `add_col`'s shape adopted
       for `add_col`'s reason.** A PostgreSQL tab offers 863 builtins where a MySQL 8 one offers 341
       (`FUNCTIONS`' 463 less `MARIADB_ONLY`, which contains every `DEPRECATED_ALIASES` name), and

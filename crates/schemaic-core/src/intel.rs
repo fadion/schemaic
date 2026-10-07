@@ -3969,6 +3969,12 @@ pub enum ClauseCtx {
     /// default, the value a statement-opening `SET` gives a variable →
     /// functions and keywords, no columns.
     Value,
+    /// Straight after `@`, on an engine with `@` variables → the document's
+    /// variables ([`variables_at`]).
+    Variable,
+    /// Straight after a T-SQL `#`/`##` → the document's temporary tables
+    /// ([`temp_tables_at`]).
+    TempTable,
     /// After a statement-opening `USE` → databases.
     Database,
     /// Anything else → the full mixed list (keywords + tables + columns).
@@ -4085,6 +4091,18 @@ pub fn clause_context(sql: &str, lo: usize, word_lo: usize, dialect: SqlDialect)
         && !name.is_empty()
     {
         return ClauseCtx::Qualified(name.clone());
+    }
+    // Straight after a sigil: a variable's name (not `@@`, a system
+    // function's), or a T-SQL temporary table's.
+    if word_lo > lo {
+        let b = sql.as_bytes();
+        let one_at = b[word_lo - 1] == b'@' && (word_lo < 2 || b[word_lo - 2] != b'@');
+        if one_at && has_at_variables(dialect) {
+            return ClauseCtx::Variable;
+        }
+        if b[word_lo - 1] == b'#' && dialect.prefixed_names() {
+            return ClauseCtx::TempTable;
+        }
     }
     if cast_target_at(sql, &toks, word_lo, dialect) {
         return ClauseCtx::Type;
@@ -15076,6 +15094,89 @@ pub fn ctes_at(sql: &str, lo: usize, caret: usize, dialect: SqlDialect) -> Vec<L
         .collect()
 }
 
+/// Does the engine name variables `@x` — SQL Server's declared ones, MySQL's
+/// user variables? PostgreSQL's `@` is an operator, and SQLite's a parameter.
+fn has_at_variables(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MySql | SqlDialect::MsSql => true,
+        SqlDialect::Postgres | SqlDialect::Sqlite => false,
+    }
+}
+
+/// The variables `sql` writes anywhere — `@x`, not `@@x` — named without
+/// the `@`, for a caret whose word follows one (`ClauseCtx::Variable`). The
+/// word at `caret` is left out. Empty on an engine with none.
+pub fn variables_at(sql: &str, caret: usize, dialect: SqlDialect) -> Vec<LocalName> {
+    if !has_at_variables(dialect) {
+        return Vec::new();
+    }
+    sigiled_names(sql, caret, dialect, b'@', 1)
+}
+
+/// The names `sql` writes after exactly `run` `sigil` bytes, in code, bare —
+/// the word at `caret` left out, each name once (case-insensitively, as both
+/// engines compare them). A sigil glued to a word before it (`root@host`) or
+/// part of a longer run is not one.
+fn sigiled_names(
+    sql: &str,
+    caret: usize,
+    dialect: SqlDialect,
+    sigil: u8,
+    run: usize,
+) -> Vec<LocalName> {
+    let b = sql.as_bytes();
+    let typing = word_start(sql, caret.min(sql.len()));
+    let in_name = |c: u8| is_word_byte(c) || crate::sql::continues_name(c, dialect);
+    let mut out: Vec<LocalName> = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if let Some(j) = skip_noncode(b, i, dialect) {
+            i = j.max(i + 1);
+            continue;
+        }
+        let glued = i > 0 && (in_name(b[i - 1]) || b[i - 1] == sigil);
+        if b[i] != sigil || glued {
+            i += 1;
+            continue;
+        }
+        let mut s = i;
+        while s < b.len() && b[s] == sigil {
+            s += 1;
+        }
+        let mut e = s;
+        while e < b.len() && in_name(b[e]) {
+            e += 1;
+        }
+        if s - i == run && e > s && s != typing {
+            let name = &sql[s..e];
+            if !out.iter().any(|n| n.name.eq_ignore_ascii_case(name)) {
+                out.push(LocalName {
+                    name: name.to_string(),
+                    written: name.to_string(),
+                });
+            }
+        }
+        i = e.max(i + 1);
+    }
+    out
+}
+
+/// The temporary tables `sql` names anywhere with the sigil the caret's word
+/// follows — `#` a local one's, `##` a global one's — named without it
+/// (`ClauseCtx::TempTable`). The word at `caret` is left out.
+pub fn temp_tables_at(sql: &str, caret: usize, dialect: SqlDialect) -> Vec<LocalName> {
+    if !dialect.prefixed_names() {
+        return Vec::new();
+    }
+    let b = sql.as_bytes();
+    let word = word_start(sql, caret.min(sql.len()));
+    let run = b[..word].iter().rev().take_while(|&&c| c == b'#').count();
+    if !(1..=2).contains(&run) {
+        return Vec::new();
+    }
+    sigiled_names(sql, caret, dialect, b'#', run)
+}
+
 /// The select-list aliases a name typed at `word_lo` may use: those of the
 /// caret's own query when the caret is in its `ORDER BY`, or in its `HAVING`
 /// where the engine lets that see them ([`having_sees_output_aliases`]).
@@ -19024,6 +19125,51 @@ mod tests {
     fn ctx_at(sql: &str, caret: usize) -> ClauseCtx {
         let word_lo = word_start(sql, caret);
         clause_context(sql, 0, word_lo, SqlDialect::MySql)
+    }
+
+    /// Straight after `@` is a variable's name, on the engines that have them;
+    /// straight after a T-SQL `#` a temporary table's. `@@` is a system
+    /// function's, and `#` elsewhere is a comment or an operator.
+    #[test]
+    fn a_sigil_before_the_word_makes_a_variable_or_temp_table_slot() {
+        let on = |sql: &str, d| clause_context(sql, 0, word_start(sql, sql.len()), d);
+        let (my, ms, pg) = (SqlDialect::MySql, SqlDialect::MsSql, SqlDialect::Postgres);
+        assert_eq!(on("SELECT @to", ms), ClauseCtx::Variable);
+        assert_eq!(on("SET @", my), ClauseCtx::Variable);
+        assert_eq!(on("SELECT * FROM t WHERE id = @i", ms), ClauseCtx::Variable);
+        assert_ne!(on("SELECT @@ro", ms), ClauseCtx::Variable);
+        assert_ne!(on("SELECT @x", pg), ClauseCtx::Variable);
+        assert_eq!(on("SELECT * FROM #wo", ms), ClauseCtx::TempTable);
+        assert_eq!(on("SELECT * FROM ##sh", ms), ClauseCtx::TempTable);
+        assert_ne!(on("SELECT a #b", pg), ClauseCtx::TempTable);
+    }
+
+    /// The variables and temporary tables a document writes, with the sigil
+    /// typed before the caret's word — `#` a local temporary table's, `##` a
+    /// global one's — and named without it, since the word replaced starts
+    /// after it. The word being typed is left out, and nothing in a string or
+    /// comment counts.
+    #[test]
+    fn the_documents_variables_and_temp_tables_are_read() {
+        let names = |v: Vec<LocalName>| v.into_iter().map(|n| n.name).collect::<Vec<_>>();
+        let body = "DECLARE @total INT, @Name nvarchar(9);\nSELECT @total = 1, '@not' -- @nor\n\
+                    CREATE TABLE #work (id int); SELECT * INTO ##shared FROM #work;\n";
+        let ms = SqlDialect::MsSql;
+        let at = |tail: &str| format!("{body}{tail}");
+        let s = at("SELECT @to");
+        assert_eq!(names(variables_at(&s, s.len(), ms)), ["total", "Name"]);
+        let s = at("SELECT * FROM #wo");
+        assert_eq!(names(temp_tables_at(&s, s.len(), ms)), ["work"]);
+        let s = at("SELECT * FROM ##");
+        assert_eq!(names(temp_tables_at(&s, s.len(), ms)), ["shared"]);
+        // MySQL's user variables; no temporary-table sigil there.
+        let my = "SET @a := 1; SELECT @a + @b INTO @c; SELECT @";
+        assert_eq!(
+            names(variables_at(my, my.len(), SqlDialect::MySql)),
+            ["a", "b", "c"]
+        );
+        assert!(temp_tables_at(my, my.len(), SqlDialect::MySql).is_empty());
+        assert!(variables_at("SELECT @a", 9, SqlDialect::Postgres).is_empty());
     }
 
     /// A value with no columns in reach: a `VALUES` tuple, a `DECLARE`'s
