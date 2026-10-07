@@ -909,7 +909,20 @@ existing prose was left alone.
     is refused there and passes here (`a_bare_insert_row_is_measured_against_the_table`,
     `a_bare_insert_may_leave_out_what_the_server_assigns`). A table the catalogue does not know, a
     name two tables share (`Catalog::is_union`) and a three-part name, which may be another
-    database's, are not measured.
+    database's, are not measured — `local_table` is that last refusal, shared with the next lint.
+    **`NOT IN` over a column that can hold NULL is a warning** (`not_in_nullable`): once the
+    subquery returns one NULL, `x NOT IN (…)` is never true, and the query quietly returns no rows
+    rather than failing. `Catalog` keeps which columns can (`nullable`, from `ColumnInfo::nullable`,
+    keyed as `insert_skips` is), and the squiggle sits on the subquery's column, naming both
+    `WHERE c IS NOT NULL` and `NOT EXISTS`. Only the plain shape is judged — `SELECT c` or
+    `SELECT t.c`, aliased or not, from exactly one table with no join (`sole_column`) — and a
+    subquery whose `WHERE` says `c IS NOT NULL` is left alone (`filters_nulls`)
+    (`not_in_over_a_nullable_column_is_flagged`). That test is *anywhere* in the `WHERE`, under an
+    `OR` too and with any qualifier, which errs towards silence. `IN`, an expression, a set
+    operation and a join are not judged, nor is a column `Catalog::column_nullable` cannot answer:
+    a table the catalogue does not know, a name two tables share (`is_union`) and a three-part name.
+    Nor is a bare name the statement declares as a CTE (`ast_scope::collect_statement`'s list, the
+    one the table check reads): the catalogue's table of that name is not what the subquery reads.
     **AST for classification, `skip_noncode` for byte positions by default** —
     except `colres` and `lints`, which use sqlparser 0.62's now-accurate per-identifier *spans* (verified) so the
     same column name in an inner vs outer scope is placed independently. **A base table exposes more than

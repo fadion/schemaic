@@ -5071,6 +5071,10 @@ pub struct Catalog {
     /// reference) exactly as the column maps are, for
     /// [`Catalog::insert_columns_of`].
     insert_skips: HashSet<(String, String, String)>,
+    /// `(qualifier_lower, table_lower, column_lower)` for each column that
+    /// can hold a NULL, keyed as [`Catalog::insert_skips`] is — for
+    /// [`Catalog::column_nullable`].
+    nullable: HashSet<(String, String, String)>,
     /// Table names (lower) two in-scope tables share with **different** keys —
     /// `sales.orders` and `dbo.orders`. [`Catalog::pks`] is keyed by the bare
     /// name, so it holds whichever was indexed last; a question that names the
@@ -5227,6 +5231,7 @@ impl Catalog {
         let mut opaque_qualified = HashSet::new();
         let mut opaque_unqualified = HashSet::new();
         let mut insert_skips = HashSet::new();
+        let mut nullable = HashSet::new();
         let mut pk_shared = HashSet::new();
         let mut unioned = HashSet::new();
         let mut keys_seen: HashMap<String, Vec<String>> = HashMap::new();
@@ -5299,6 +5304,19 @@ impl Catalog {
                 }
                 let named = crate::skeleton::skeleton_columns(t);
                 let table_lower = t.name.to_ascii_lowercase();
+                for c in t.columns.iter().filter(|c| c.nullable) {
+                    let col_lower = c.name.to_ascii_lowercase();
+                    let mut note = |qualifier: String| {
+                        nullable.insert((qualifier, table_lower.clone(), col_lower.clone()));
+                    };
+                    note(db_lower.clone());
+                    if in_scope {
+                        note(String::new());
+                        if let Some(ns) = &t.schema {
+                            note(ns.to_ascii_lowercase());
+                        }
+                    }
+                }
                 // Most tables name every column; only the rest pay the scan.
                 let all_named = named.len() == t.columns.len();
                 for c in t.columns.iter().filter(|_| !all_named) {
@@ -5435,6 +5453,7 @@ impl Catalog {
             opaque_qualified,
             opaque_unqualified,
             insert_skips,
+            nullable,
             pk_shared,
             unioned,
             flavour,
@@ -5493,6 +5512,23 @@ impl Catalog {
                 })
                 .collect(),
         )
+    }
+
+    /// Can column `col` of `r` hold a NULL? `None` when the column, or the
+    /// table, is not known — or the name is two tables' ([`Catalog::is_union`]).
+    fn column_nullable(&self, r: &TableRef, col: &str) -> Option<bool> {
+        if self.is_union(r) {
+            return None;
+        }
+        let col = col.to_ascii_lowercase();
+        self.columns_of(r)?
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case(&col))
+            .then(|| {
+                let qualifier = r.db.as_deref().unwrap_or("").to_ascii_lowercase();
+                self.nullable
+                    .contains(&(qualifier, r.name.to_ascii_lowercase(), col))
+            })
     }
 
     /// The primary-key columns (lower) of an active-db table, if known and non-empty.
@@ -11444,6 +11480,7 @@ mod lints {
             }
             null_comparisons(stmt, lo, ast, out);
             insert_row_lengths(stmt, lo, ast, catalog, dialect, out);
+            not_in_nullable(stmt, lo, ast, catalog, out);
         }
     }
 
@@ -11510,6 +11547,116 @@ mod lints {
         }
     }
 
+    /// A one- or two-part table name as the catalogue is asked about it;
+    /// `None` for a three-part one, which may be another database's.
+    fn local_table(name: &sqlparser::ast::ObjectName) -> Option<TableRef> {
+        let (db, table) = match super::object_name_parts(name).as_slice() {
+            [t] => (None, t.clone()),
+            [q, t] => (Some(q.clone()), t.clone()),
+            _ => return None,
+        };
+        Some(TableRef {
+            name: table,
+            alias: None,
+            db,
+        })
+    }
+
+    /// `x NOT IN (SELECT c FROM t)` where the catalogue says `c` can be NULL:
+    /// once it holds one, `x NOT IN (…)` is never true, and the query quietly
+    /// returns no rows. A warning on the subquery's column. Only the plain
+    /// shape is judged — one column of one table, no join — and a subquery
+    /// that filters with `c IS NOT NULL` is left alone.
+    fn not_in_nullable(
+        stmt: &str,
+        lo: usize,
+        ast: &Statement,
+        catalog: &Catalog,
+        out: &mut Vec<Diagnostic>,
+    ) {
+        // A CTE named like a table is the CTE — the scope check's own list.
+        let mut scope = super::Scope::default();
+        super::ast_scope::collect_statement(ast, &mut scope);
+        let _ = visit_expressions(ast, |e| {
+            if let Expr::InSubquery {
+                negated: true,
+                subquery,
+                ..
+            } = e
+                && let Some((col_expr, r, col)) = sole_column(subquery)
+                && !(r.db.is_none() && scope.ctes.iter().any(|c| c.eq_ignore_ascii_case(&r.name)))
+                && catalog.column_nullable(&r, &col) == Some(true)
+                && !filters_nulls(subquery, &col)
+            {
+                out.push(Diagnostic {
+                    range: to_range(stmt, lo, col_expr.span()),
+                    severity: Severity::Warning,
+                    message: format!(
+                        "`{col}` can be NULL, and `NOT IN` matches no row once the subquery \
+                         returns one — add `WHERE {col} IS NOT NULL` to it, or use NOT EXISTS"
+                    ),
+                });
+            }
+            ControlFlow::<()>::Continue(())
+        });
+    }
+
+    /// The one column a subquery selects, of its one table: the column's
+    /// expression, the table and the column's name.
+    fn sole_column(q: &sqlparser::ast::Query) -> Option<(&Expr, TableRef, String)> {
+        use sqlparser::ast::{SelectItem, TableFactor};
+        let SetExpr::Select(s) = q.body.as_ref() else {
+            return None;
+        };
+        let [item] = s.projection.as_slice() else {
+            return None;
+        };
+        let e = match item {
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
+            _ => return None,
+        };
+        let col = match e {
+            Expr::Identifier(i) => i.value.clone(),
+            Expr::CompoundIdentifier(parts) if parts.len() == 2 => parts[1].value.clone(),
+            _ => return None,
+        };
+        let [from] = s.from.as_slice() else {
+            return None;
+        };
+        if !from.joins.is_empty() {
+            return None;
+        }
+        let TableFactor::Table { name, .. } = &from.relation else {
+            return None;
+        };
+        Some((e, local_table(name)?, col))
+    }
+
+    /// Does the subquery's `WHERE` say `col IS NOT NULL` anywhere?
+    fn filters_nulls(q: &sqlparser::ast::Query, col: &str) -> bool {
+        let SetExpr::Select(s) = q.body.as_ref() else {
+            return false;
+        };
+        let Some(selection) = &s.selection else {
+            return false;
+        };
+        visit_expressions(selection, |e| match e {
+            Expr::IsNotNull(inner) => match inner.as_ref() {
+                Expr::Identifier(i) if i.value.eq_ignore_ascii_case(col) => ControlFlow::Break(()),
+                Expr::CompoundIdentifier(parts)
+                    if parts
+                        .last()
+                        .is_some_and(|p| p.value.eq_ignore_ascii_case(col)) =>
+                {
+                    ControlFlow::Break(())
+                }
+                _ => ControlFlow::Continue(()),
+            },
+            _ => ControlFlow::Continue(()),
+        })
+        .is_break()
+    }
+
     /// [`insert_row_lengths`] for an `INSERT` with no column list.
     fn bare_insert_row_lengths(
         stmt: &str,
@@ -11523,18 +11670,8 @@ mod lints {
         let TableObject::TableName(name) = &ins.table else {
             return;
         };
-        let r = match super::object_name_parts(name).as_slice() {
-            [t] => TableRef {
-                name: t.clone(),
-                alias: None,
-                db: None,
-            },
-            [q, t] => TableRef {
-                name: t.clone(),
-                alias: None,
-                db: Some(q.clone()),
-            },
-            _ => return,
+        let Some(r) = local_table(name) else {
+            return;
         };
         let (Some(all), Some(needed)) = (catalog.columns_of(&r), catalog.insert_columns_of(&r))
         else {
@@ -21645,6 +21782,62 @@ mod tests {
         );
         assert!(hits("SELECT * FROM employees;").is_empty());
         assert!(hits("SELECT * FROM employees CROSS JOIN departments;").is_empty());
+    }
+
+    /// `NOT IN (SELECT c FROM t)` matches no row once `c` holds a NULL — a
+    /// warning on the subquery's column when the catalogue says it can,
+    /// unless the subquery filters NULLs out itself.
+    #[test]
+    fn not_in_over_a_nullable_column_is_flagged() {
+        let mut ids = tbl("ids", &["id", "maybe"]);
+        ids.columns[0].nullable = false;
+        let schema = DbSchema {
+            tables: vec![tbl("employees", &["id", "dept_id"]), ids],
+            ..Default::default()
+        };
+        let cat = Catalog::build(&[("company", &schema)], Some("company"));
+        let hits = |sql: &str| -> Vec<String> {
+            diagnostics(sql, &cat, SqlDialect::Postgres)
+                .into_iter()
+                .filter(|d| d.severity == Severity::Warning && d.message.contains("NOT IN"))
+                .map(|d| sql[d.range.0..d.range.1].to_string())
+                .collect()
+        };
+        let base = "SELECT * FROM employees WHERE dept_id NOT IN";
+        assert_eq!(hits(&format!("{base} (SELECT maybe FROM ids)")), ["maybe"]);
+        assert_eq!(
+            hits(&format!("{base} (SELECT i.maybe FROM ids i)")),
+            ["i.maybe"]
+        );
+        // NOT NULL in the catalogue, or filtered in the subquery: safe.
+        assert!(hits(&format!("{base} (SELECT id FROM ids)")).is_empty());
+        assert!(
+            hits(&format!(
+                "{base} (SELECT maybe FROM ids WHERE maybe IS NOT NULL)"
+            ))
+            .is_empty()
+        );
+        // `IN` is not `NOT IN`; a table the catalogue does not know, a join
+        // or an expression is not judged.
+        assert!(
+            hits("SELECT * FROM employees WHERE dept_id IN (SELECT maybe FROM ids)").is_empty()
+        );
+        assert!(hits(&format!("{base} (SELECT x FROM nosuch)")).is_empty());
+        assert!(
+            hits(&format!(
+                "{base} (SELECT maybe FROM ids JOIN employees e ON e.id = ids.id)"
+            ))
+            .is_empty()
+        );
+        assert!(hits(&format!("{base} (SELECT maybe + 1 FROM ids)")).is_empty());
+        // A CTE by a table's name is the CTE, which the catalogue knows
+        // nothing about.
+        assert!(
+            hits(&format!(
+                "WITH ids AS (SELECT 1 AS maybe) {base} (SELECT maybe FROM ids)"
+            ))
+            .is_empty()
+        );
     }
 
     /// `= NULL` and `<> NULL` are never true; `IS NULL` is what was meant.
