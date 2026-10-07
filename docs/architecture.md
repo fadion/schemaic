@@ -12072,7 +12072,12 @@ existing prose was left alone.
     RECURSIVE` keeps its word on the head's line (`head_followers`), `WINDOW` is a clause head, and
     MySQL's `LIMIT offset, count` keeps its comma inline — `limit_depth` holds the paren depth the
     `LIMIT` opened at, so a comma after a subquery's `LIMIT` breaks as the list's again
-    (`recursive_window_and_limit_lay_out_as_clauses`).
+    (`recursive_window_and_limit_lay_out_as_clauses`). T-SQL's `TOP (n)` keeps its space (`TOP`
+    is in `is_keyword`, so its paren is a clause's, not a call's), and a write's `OUTPUT` is a head
+    — only where `has_output_clause` (SQL Server), only in an `INSERT`/`UPDATE`/`DELETE`/`MERGE`
+    (`Fmt::verb`, the statement's first word), and only with a name after it, since a procedure
+    parameter's `@x int OUTPUT` takes no parens and a column may be called `output`
+    (`top_keeps_its_space_and_output_is_a_clause`).
     **A T-SQL `@x`, `@@ROWCOUNT`, `#t` or `##g` is one `Kind::Word`.** `@` and `#` fell to the
     operator arm and `need_space` separated them from their name, so one Format Code broke nearly
     every T-SQL script: `SELECT @ x` is Msg 137, `SELECT @ @ VERSION` and `CREATE TABLE # t` are

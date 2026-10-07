@@ -830,7 +830,18 @@ fn is_keyword(w: &str) -> bool {
                 | "PARTITION"
                 | "RETURNING"
                 | "DEFAULT"
+                // T-SQL's `TOP (n)` is a clause's parens, not a call's.
+                | "TOP"
         )
+}
+
+/// Does the engine have T-SQL's `OUTPUT` clause on a write? SQL Server's
+/// alone — elsewhere `output` is a name.
+fn has_output_clause(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MsSql => true,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+    }
 }
 
 /// Is `w` a clause keyword that is also a function, so a `(` straight after it
@@ -915,6 +926,11 @@ struct Fmt<'a> {
     limit_depth: Option<usize>,
     /// The `CASE`s open, innermost last.
     cases: Vec<CaseFrame>,
+    /// The statement's first word, upper-cased — what an `OUTPUT` is a
+    /// clause of ([`has_output_clause`]).
+    verb: Option<String>,
+    /// `OUTPUT` can be a write's clause here ([`has_output_clause`]).
+    output_clause: bool,
 }
 
 /// One open `CASE`: the indent of the line it opened on, the paren depth it
@@ -947,6 +963,8 @@ impl<'a> Fmt<'a> {
             tight_next: false,
             limit_depth: None,
             cases: Vec::new(),
+            verb: None,
+            output_clause: has_output_clause(dialect),
         }
     }
 
@@ -1143,6 +1161,18 @@ impl<'a> Fmt<'a> {
                 Kind::Word => {
                     let up = text.to_ascii_uppercase();
                     let in_expr = self.in_expr_paren();
+                    if self.prev.is_none() {
+                        self.verb = Some(up.clone());
+                    }
+                    // A write's `OUTPUT inserted.id`, not a parameter's
+                    // direction (`@x int OUTPUT`) nor a column (`output = 1`).
+                    let output_head = up == "OUTPUT"
+                        && self.output_clause
+                        && matches!(
+                            self.verb.as_deref(),
+                            Some("INSERT" | "UPDATE" | "DELETE" | "MERGE")
+                        )
+                        && matches!(toks.get(k + 1), Some((Kind::Word, _)));
                     // **A word after `.` is a name**: MySQL reads `t.order` as
                     // a column only with nothing between the two, and laid out
                     // as a clause it became `t.⏎order` — `ORDER` again.
@@ -1185,7 +1215,7 @@ impl<'a> Fmt<'a> {
                             self.break_to(f.indent);
                         }
                         self.emit(Kind::Word, text, false);
-                    } else if !in_expr && HEADS.contains(&up.as_str()) {
+                    } else if !in_expr && (HEADS.contains(&up.as_str()) || output_head) {
                         self.limit_depth = (up == "LIMIT").then_some(self.parens.len());
                         self.break_to(self.base);
                         self.emit(Kind::Word, text, false);
@@ -1625,6 +1655,38 @@ mod tests {
         ] {
             let once = format_sql(sql, IND);
             assert_eq!(format_sql(&once, IND), once, "idempotent: {sql}");
+        }
+    }
+
+    /// T-SQL's `TOP (n)` keeps its space, and a write's `OUTPUT` clause takes
+    /// a line of its own — but not a procedure parameter's `OUTPUT`, nor a
+    /// column of that name, nor anywhere but SQL Server.
+    #[test]
+    fn top_keeps_its_space_and_output_is_a_clause() {
+        let ms = |s: &str| super::format_sql(s, IND, SqlDialect::MsSql);
+        assert_eq!(
+            ms("select top (5) a from t"),
+            "select\n  top (5) a\nfrom\n  t"
+        );
+        assert_eq!(
+            ms("update t set n = 1 output inserted.id where id = 2"),
+            "update\n  t\nset\n  n = 1\noutput\n  inserted.id\nwhere\n  id = 2"
+        );
+        assert_eq!(
+            ms("delete from t output deleted.id, deleted.name where id = 1"),
+            "delete from\n  t\noutput\n  deleted.id,\n  deleted.name\nwhere\n  id = 1"
+        );
+        let proc = ms("create procedure p @x int output as select 1");
+        assert!(proc.contains("@x int output"), "{proc}");
+        let col = ms("update t set output = 1");
+        assert!(col.contains("output = 1"), "{col}");
+        let my = super::format_sql("update t set a = 1 output x", IND, SqlDialect::MySql);
+        assert!(!my.contains("\noutput"), "{my}");
+        for s in [
+            "select top (5) a from t",
+            "update t set n = 1 output inserted.id where id = 2",
+        ] {
+            assert_eq!(ms(&ms(s)), ms(s), "idempotent: {s}");
         }
     }
 
