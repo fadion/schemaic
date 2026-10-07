@@ -258,6 +258,26 @@ pub fn find_matches(hay: &str, needle: &str) -> Vec<usize> {
     out
 }
 
+/// What Ctrl+F / Ctrl+H put in the find field: the selected text, when there
+/// is some and it sits on one line. A multi-line selection is a block being
+/// worked on, not a needle — the field is one line — so it seeds nothing and
+/// the field keeps what it held. `sel` is `(start, end)` in either order.
+pub fn find_seed(text: &str, sel: (usize, usize)) -> Option<&str> {
+    let (a, b) = (sel.0.min(sel.1), sel.0.max(sel.1));
+    let s = text.get(a..b)?;
+    (!s.is_empty() && !s.contains(['\n', '\r'])).then_some(s)
+}
+
+/// The hit a new find query starts at: the first at or after `from` (the
+/// selection's start, or the caret), wrapping to the first in the document —
+/// so a needle seeded from the selection, or typed one character at a time,
+/// stays on the match the user is looking at rather than leaping to the top.
+/// `0` for no hits, which the caller reads as "none" by the list's length.
+pub fn first_hit_from(hits: &[usize], from: usize) -> usize {
+    let i = hits.partition_point(|&h| h < from);
+    if i < hits.len() { i } else { 0 }
+}
+
 /// Is `needle` still exactly at byte offset `off` in `hay`, by the same
 /// ASCII-case-insensitive rule [`find_matches`] uses?
 ///
@@ -915,6 +935,28 @@ mod tests {
         assert_eq!(find_matches("abc", "xyz"), Vec::<usize>::new());
         // Offsets index into the original string (é is 2 bytes → bar at byte 6).
         assert_eq!(find_matches("café bar", "bar"), vec![6]);
+    }
+
+    #[test]
+    fn find_seeds_from_a_one_line_selection_only() {
+        let t = "SELECT id\nFROM users";
+        assert_eq!(find_seed(t, (7, 9)), Some("id"));
+        assert_eq!(find_seed(t, (9, 7)), Some("id"), "a backwards selection");
+        assert_eq!(find_seed(t, (7, 7)), None, "a bare caret");
+        assert_eq!(find_seed(t, (7, 14)), None, "across a line break");
+        assert_eq!(find_seed("a\r\nb", (0, 3)), None);
+        assert_eq!(find_seed(t, (15, 99)), None, "past the end");
+        assert_eq!(find_seed("café", (3, 4)), None, "inside a character");
+    }
+
+    #[test]
+    fn a_new_find_query_starts_at_the_selection_and_wraps() {
+        let hits = [3, 10, 20];
+        assert_eq!(first_hit_from(&hits, 10), 1, "the selection's own match");
+        assert_eq!(first_hit_from(&hits, 11), 2);
+        assert_eq!(first_hit_from(&hits, 0), 0);
+        assert_eq!(first_hit_from(&hits, 21), 0, "wraps to the top");
+        assert_eq!(first_hit_from(&[], 5), 0);
     }
 
     /// The corruption this exists to prevent, as bytes: hits taken over one

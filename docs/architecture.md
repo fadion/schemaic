@@ -11758,6 +11758,12 @@ existing prose was left alone.
       both.
   - `text_ops.rs` — Ctrl+/ `toggle_line_comment` + `find_matches`/`replace_all`/
     `contains_ignore_ascii_case` (find bars). Pure, ASCII-case-insensitive, byte-offset-preserving.
+    `find_seed` and `first_hit_from` are how the editor's find bar opens: Ctrl+F/Ctrl+H seed the
+    field from the selection only when it is non-empty and on one line — a multi-line selection is
+    a block being worked on, not a needle, and the field is one line, so it seeds nothing and the
+    field keeps what it held — and a new query starts at the first hit at or after the selection's
+    start or the caret, wrapping to the first, rather than at match 0
+    (`find_seeds_from_a_one_line_selection_only`, `a_new_find_query_starts_at_the_selection_and_wraps`).
     `duplicate_lines` is Ctrl+D's: the spanned lines copied as `\n` + lines at the end of the last
     one, so the newline-less last line gets a line of its own, with the selection or caret moved
     onto the copy (`duplicating_the_last_line_makes_a_new_line`).
@@ -23484,8 +23490,15 @@ existing prose was left alone.
     head of a query turned `SELECT a FROM t;` into `-- SELECT a FRx t;`, destroying the `OM` of
     `FROM` while the `t;` the user searched for was left alone. The effect's previous value is the
     query it last ran for, which is what separates the two. A **new query** recomputes now and
-    reveals the first match, because the user is watching `n/total` and waiting to be taken there;
-    a delay in that path is a find bar that feels broken. It reads the haystack with `query.with`
+    reveals a match, because the user is watching `n/total` and waiting to be taken there;
+    a delay in that path is a find bar that feels broken. The match is the first at or after the
+    selection's start, or the caret (`text_ops::first_hit_from`), not match 0: a needle Ctrl+F
+    seeded from the selection stays on that occurrence, and one typed a character at a time stays
+    on the match in view instead of leaping to the top — VS Code's behaviour. **While the bar is
+    closed the effect returns an empty string, not the query it ran for**, so reopening on the same
+    needle is a new query too. Carrying the old one over sent that reopen down the edit path below:
+    no reveal, and a `find_idx` still on whichever occurrence the user had last stepped to rather
+    than the one just selected. It reads the haystack with `query.with`
     rather than `get`, since the scan borrows the document and cloning a 16 MiB buffer to hand to a
     function taking `&str` was 2.4 ms of a 20.3 ms keystroke. An **edit** rides a 120 ms
     generation-counter debounce, the same one the diagnostics pass beside it uses (the live-DB

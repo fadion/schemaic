@@ -45,8 +45,8 @@ use schemaic_core::params;
 use schemaic_core::prompt::{self, FixOrigin};
 use schemaic_core::sql::statement_range;
 use schemaic_core::text_ops::{
-    find_matches, matches_at, move_line, offset_of_line, replace_all, soft_tab_indent,
-    soft_tab_outdent, toggle_line_comment,
+    find_matches, find_seed, first_hit_from, matches_at, move_line, offset_of_line, replace_all,
+    soft_tab_indent, soft_tab_outdent, toggle_line_comment,
 };
 
 use crate::completion::{
@@ -3087,11 +3087,22 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 }
                 // else: fall through → default handler cuts the selection.
             }
+            // A one-line selection seeds the find field (`text_ops::find_seed`);
+            // the bar's new-query path then starts at that very match.
+            let seed_find = || {
+                let sel = editor_sig.with_untracked(|e| e.cursor.get_untracked().get_selection());
+                let seed = sel
+                    .and_then(|sel| query.with_untracked(|t| find_seed(t, sel).map(str::to_owned)));
+                if let Some(seed) = seed {
+                    find_query.set(seed);
+                }
+            };
             if c.eq_ignore_ascii_case("f") {
                 // Open the find bar in find-only mode (collapse any replace row left
                 // over from a previous Ctrl+H). Its input autofocuses on mount.
                 goto_open.set(false);
                 find_replace_visible.set(false);
+                seed_find();
                 find_open.set(true);
                 return CommandExecuted::Yes;
             }
@@ -3104,6 +3115,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             if c.eq_ignore_ascii_case("h") {
                 // Open the find bar with the replace row expanded.
                 find_replace_visible.set(true);
+                seed_find();
                 if !find_open.get_untracked() {
                     find_open.set(true);
                 }
@@ -5690,7 +5702,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         })
     };
     // Recompute matches whenever the query changes while the bar is open, and jump
-    // to the first. The haystack is read from `query` (kept in sync with the doc).
+    // to the first from the selection. The haystack is read from `query` (kept in sync with the doc).
     {
         let reveal = reveal.clone();
         // The document is **tracked**: an edit while the bar is open moves every
@@ -5702,14 +5714,17 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         // on the document as it was when the bar opened.
         //
         // The effect's previous value is the query it last ran for, which is what
-        // separates the two reasons it runs: a *new query* starts at match 1 and
-        // reveals it, an *edit* keeps the user where they are and scrolls nothing.
+        // separates the two reasons it runs: a *new query* starts at the first
+        // match from the selection and reveals it, an *edit* keeps the user where they are and scrolls nothing.
         // The generation guard for the edit path below, in the shape the
         // diagnostics and live-validation passes in this file already use.
         let find_gen: Rc<std::cell::Cell<u64>> = Rc::new(std::cell::Cell::new(0));
+        let ed = ed_find.clone();
         create_effect(move |prev: Option<String>| {
+            // Closed, it forgets the query it ran for: reopening — seeded with
+            // the needle it last had, say — is a new query, not an edit.
             if !find_open.get() {
-                return prev.unwrap_or_default();
+                return String::new();
             }
             let q = find_query.get();
             if q.is_empty() {
@@ -5730,9 +5745,14 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 // the document, and cloning a 16 MiB buffer to hand it to a
                 // function that takes `&str` was 2.4 ms of a 20.3 ms keystroke.
                 let hits = query.with(|text| find_matches(text, &q));
-                find_idx.set(0);
-                if let Some(&first) = hits.first() {
-                    reveal(first, q.len());
+                // From the selection's start, so a seeded needle — or one typed
+                // a character at a time — stays on the match in view.
+                let cur = ed.cursor.get_untracked();
+                let from = cur.get_selection().map_or(cur.offset(), |(a, b)| a.min(b));
+                let i = first_hit_from(&hits, from);
+                find_idx.set(i);
+                if let Some(&hit) = hits.get(i) {
+                    reveal(hit, q.len());
                 }
                 find_hits.set(hits);
                 return q;
