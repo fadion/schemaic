@@ -356,6 +356,9 @@ mod index {
     ) -> SchemaIndex {
         let mut databases = Vec::new();
         let mut tables = Vec::new();
+        // Each in-scope table name's namespaces, so `rank` can qualify one no
+        // bare name reaches.
+        let mut namespaces: HashMap<String, Vec<Option<String>>> = HashMap::new();
         let mut columns: HashMap<String, Vec<ColMeta>> = HashMap::new();
         let mut columns_by_db: HashMap<(String, String), Rc<Vec<ColMeta>>> = HashMap::new();
         let mut tables_by_db: HashMap<String, Vec<String>> = HashMap::new();
@@ -408,6 +411,10 @@ mod index {
                     );
                     if in_scope {
                         tables.push((t.name.clone(), node.database.clone()));
+                        namespaces
+                            .entry(t.name.to_ascii_lowercase())
+                            .or_default()
+                            .push(t.schema.clone());
                         let entry = columns.entry(t.name.to_ascii_lowercase()).or_default();
                         if entry.is_empty() {
                             // The ordinary case — nothing to dedup against, so skip
@@ -469,6 +476,7 @@ mod index {
         SchemaIndex {
             databases,
             tables,
+            namespaces,
             columns,
             columns_by_db,
             tables_by_db,

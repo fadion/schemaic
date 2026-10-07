@@ -127,6 +127,12 @@ pub struct SchemaIndex {
     pub databases: Vec<String>,
     /// (table name, database it lives in).
     pub tables: Vec<(String, String)>,
+    /// A [`SchemaIndex::tables`] name (lowercase) → the namespace of each table
+    /// by that name (`None` for one with none). When **no bare name reaches**
+    /// any of them ([`crate::filter::bare_name_reaches`]), the row inserts
+    /// `schema.table` with the first: PostgreSQL's `sales.ledger`, inserted as
+    /// `ledger`, read whatever `search_path` found first — or nothing.
+    pub namespaces: HashMap<String, Vec<Option<String>>>,
     /// table name (lowercase) → its columns — the *active-database* unqualified pool.
     pub columns: HashMap<String, Vec<ColMeta>>,
     /// (database, table) (both lowercase) → its columns, for *every* loaded database.
@@ -379,6 +385,29 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
             && let Some(c) = cands.last_mut()
         {
             c.glyph = SuggestGlyph::View;
+        }
+    };
+    // A table row no bare name reaches ([`SchemaIndex::namespaces`]) inserts
+    // the name that does, while still reading as the table.
+    let qualify_unreached = |cands: &mut Vec<Cand>, before: usize, db: &str, name: &str| {
+        let unreached = schema
+            .namespaces
+            .get(&name.to_ascii_lowercase())
+            .filter(|nss| {
+                nss.iter()
+                    .all(|ns| !crate::filter::bare_name_reaches(input.dialect, ns.as_deref()))
+            })
+            .and_then(|nss| nss.first().cloned().flatten());
+        if cands.len() > before
+            && let Some(ns) = unreached
+            && let Some(c) = cands.last_mut()
+        {
+            c.insert = Some(crate::filter::qualified_table_name(
+                input.dialect,
+                db,
+                Some(&ns),
+                name,
+            ));
         }
     };
     // A name the statement declares itself: inserted as the statement spelled
@@ -713,6 +742,7 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
                     plain_tier,
                 );
                 mark_view(&mut cands, before, db, name);
+                qualify_unreached(&mut cands, before, db, name);
             }
             // Databases are offered only once a prefix is typed (so an empty
             // FROM/JOIN list stays tables-only) and never the active one — cross-db
@@ -882,7 +912,9 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
                 }
             }
             for (name, db) in &schema.tables {
+                let before = cands.len();
                 add(&mut cands, &mut seen, name, SuggestKind::Table, db, 1);
+                qualify_unreached(&mut cands, before, db, name);
             }
             for k in clause_keywords() {
                 add(&mut cands, &mut seen, k, SuggestKind::Keyword, "", 2);
@@ -968,6 +1000,12 @@ pub fn accepted_insert(
     dialect: crate::intel::SqlDialect,
     in_quoted_name: bool,
 ) -> Option<String> {
+    // Inside a quote the user opened, a table row is its name alone: a
+    // qualified insert (`sales.ledger`, the widened list's references) would
+    // land after the quote as one identifier with a dot in it.
+    if in_quoted_name && s.kind == SuggestKind::Table {
+        return None;
+    }
     if s.insert.is_some() {
         return s.insert.clone();
     }
@@ -1547,6 +1585,142 @@ mod tests {
         assert_eq!(glyph(ClauseCtx::Table, "orders"), Some(SuggestGlyph::Kind));
         let q = ClauseCtx::Qualified("shop".to_string());
         assert_eq!(glyph(q, "open_orders"), Some(SuggestGlyph::View));
+    }
+
+    /// A table no bare name reaches — PostgreSQL's `sales.ledger`, outside
+    /// `search_path`'s `public` — is offered under its name and inserted
+    /// qualified, where a table is offered: after `FROM`, and with no clause
+    /// yet. One a bare name does reach still inserts bare.
+    #[test]
+    fn a_table_outside_the_default_namespace_inserts_qualified() {
+        let mut s = shop();
+        s.tables.push(("ledger".to_string(), "shop".to_string()));
+        s.tables.push(("audit".to_string(), "shop".to_string()));
+        let ns = |n: &[Option<&str>]| n.iter().map(|s| s.map(str::to_string)).collect();
+        s.namespaces
+            .insert("ledger".to_string(), ns(&[Some("sales")]));
+        s.namespaces
+            .insert("orders".to_string(), ns(&[Some("public")]));
+        // One `audit` in `public`, another in `sales`: the bare name reaches one.
+        s.namespaces
+            .insert("audit".to_string(), ns(&[Some("sales"), Some("public")]));
+        for ctx in [ClauseCtx::Table, ClauseCtx::Other] {
+            let cont = Continuation::default();
+            let used = HashSet::new();
+            let rows = rank(
+                &s,
+                &RankInput {
+                    ctx: &ctx,
+                    cont: &cont,
+                    scope: &[],
+                    prefix: "",
+                    snippets: &[],
+                    join_targets: &[],
+                    star: None,
+                    used: &used,
+                    active_db: Some("shop"),
+                    dialect: SqlDialect::Postgres,
+                    flavour: ServerFlavour::Unknown,
+                    local: &LocalNames::default(),
+                    wide: false,
+                },
+            );
+            let row = |name: &str| {
+                rows.iter()
+                    .find(|r| r.text == name)
+                    .unwrap_or_else(|| panic!("{name} offered in {ctx:?}: {rows:?}"))
+                    .clone()
+            };
+            assert_eq!(
+                row("ledger").insert.as_deref(),
+                Some("sales.ledger"),
+                "{ctx:?}"
+            );
+            assert_eq!(row("orders").insert, None, "{ctx:?}");
+            assert_eq!(row("audit").insert, None, "{ctx:?}");
+        }
+    }
+
+    /// **Inside a quoted name a table row is its name**: the user opened the
+    /// quote, so `"led|` takes `ledger`, never `sales.ledger` spliced after
+    /// the quote — which is one identifier with a dot in it.
+    #[test]
+    fn a_qualified_table_row_inserts_its_bare_name_inside_a_quote() {
+        let row = Suggestion {
+            text: "ledger".to_string(),
+            kind: SuggestKind::Table,
+            detail: String::new(),
+            table: String::new(),
+            alias: String::new(),
+            glyph: SuggestGlyph::Kind,
+            key: KeyKind::None,
+            insert: Some("sales.ledger".to_string()),
+            replace: None,
+        };
+        assert_eq!(
+            accepted_insert(&row, SqlDialect::Postgres, false).as_deref(),
+            Some("sales.ledger")
+        );
+        assert_eq!(accepted_insert(&row, SqlDialect::Postgres, true), None);
+    }
+
+    /// **Another database's `dbo.orders` completes its own columns**, read
+    /// through the scope the editor builds. The scope kept the schema, `dbo`,
+    /// and the schema map answered with the tab's own `dbo.orders`.
+    #[test]
+    fn another_databases_three_part_table_completes_its_own_columns() {
+        let col = |n: &str| ColMeta {
+            name: n.to_string(),
+            type_name: "int".to_string(),
+            nullable: true,
+            primary_key: false,
+            foreign_key: false,
+        };
+        let mut s = shop();
+        s.columns_by_db.insert(
+            ("archive".to_string(), "orders".to_string()),
+            Rc::new(vec![col("archived_at")]),
+        );
+        s.columns_by_schema.insert(
+            ("dbo".to_string(), "orders".to_string()),
+            Rc::new(vec![col("placed_at")]),
+        );
+        // Mid-edit (the lexer's scope) and a statement that parses (the
+        // parsed scope's `table_ref_of`), each with the caret after `o.`.
+        for sql in [
+            "SELECT o. FROM archive.dbo.orders o",
+            "SELECT o.x FROM archive.dbo.orders o WHERE o.",
+            "SELECT o.x FROM archive.dbo.orders o WHERE o.x = 1",
+        ] {
+            let caret = if sql.ends_with("o.") { sql.len() } else { 9 };
+            let scope =
+                crate::intel::statement_scope(sql, 0, sql.len(), caret, SqlDialect::MsSql).tables;
+            let cont = Continuation::default();
+            let used = HashSet::new();
+            let texts: Vec<String> = rank(
+                &s,
+                &RankInput {
+                    ctx: &ClauseCtx::Qualified("o".to_string()),
+                    cont: &cont,
+                    scope: &scope,
+                    prefix: "",
+                    snippets: &[],
+                    join_targets: &[],
+                    star: None,
+                    used: &used,
+                    active_db: Some("shop"),
+                    dialect: SqlDialect::MsSql,
+                    flavour: ServerFlavour::Unknown,
+                    local: &LocalNames::default(),
+                    wide: false,
+                },
+            )
+            .into_iter()
+            .map(|r| r.text)
+            .collect();
+            assert!(texts.iter().any(|t| t == "archived_at"), "{sql}: {texts:?}");
+            assert!(!texts.iter().any(|t| t == "placed_at"), "{sql}: {texts:?}");
+        }
     }
 
     /// **The widened list** names every database's and schema's tables at a

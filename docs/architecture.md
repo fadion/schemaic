@@ -1068,8 +1068,8 @@ existing prose was left alone.
     (`a_t_sql_table_hint_without_with_is_not_a_call`). **The list is one reader**,
     `read_table_list`, shared by `located_table_refs` and completion's `lexer_scope`, whose two
     copies had drifted: it reads every part of a name (`dotted_name`), so `lexer_scope` too sees
-    `company.dbo.employees e` as `employees` under `dbo` with its alias, where it saw the table `dbo`
-    and `e.` completed nothing (`a_three_part_name_is_in_completions_scope_mid_edit`); it ends at a
+    `company.dbo.employees e` as `employees` in `company` with its alias, where it saw the table
+    `dbo` and `e.` completed nothing (`a_three_part_name_is_in_completions_scope_mid_edit`); it ends at a
     reserved word only **unquoted**, so `[order]`, `` `group` `` and `"user"` — quoting being the
     remedy for exactly those names — are judged (`a_quoted_reserved_table_name_is_checked`); and
     **a list goes on past a parenthesised item**: a derived table or a call stopped it on its `(`,
@@ -1349,7 +1349,20 @@ existing prose was left alone.
     table), and not at all in one never loaded. `colres` asks the same of the AST's parts, and a
     linked server's four-part name is judged by nothing (`a_three_part_name_is_database_schema_table`;
     the other-database arm, `a_three_part_name_in_another_loaded_database_is_judged_there`).
-    Completion's mid-edit scope reads the same parts through the same list reader (above).
+    Completion's mid-edit scope reads the same parts through the same list reader (above), and
+    **both of completion's scope readers keep the database, not the schema** — `lexer_scope`'s
+    `emit_in` and the parsed `ast_scope::table_ref_of` alike: `company.dbo.employees e` is
+    `TableRef { name: employees, alias: e, db: Some("company") }`, and `company..employees` keeps
+    `company` too. They kept `dbo` (and `..` kept nothing), and `rank`'s `cols_of` looks a
+    reference up in `columns_by_db` first and then in `columns_by_schema`, which holds the tab's own
+    database only — so `archive.dbo.orders o` then `o.` offered the *tab's* `dbo.orders` columns
+    (`another_databases_three_part_table_completes_its_own_columns`, through `statement_scope`
+    composed with `rank`). Now it finds `archive`'s, and a database never loaded finds nothing —
+    unless the tab's database has a schema of that name, which the fallback then reads. The cost:
+    the scope reference drops the schema, so two same-named tables in different schemas of another
+    database merge, as `columns_by_db` already merges them. A four-part name registers nothing in
+    either reader. Diagnostics are untouched by this — they read `located_table_refs`, which was
+    already database-aware.
     The error's remedy
     names the engine's quote (backticks, double quotes, brackets); it said "backticks" on every
     engine, advice neither PostgreSQL nor SQL Server accepts
@@ -2744,6 +2757,14 @@ existing prose was left alone.
     `"$user"`, so with a schema named after the login the bare `public` form read the login's
     `orders` into a tab whose identity, and every write from its grid, stayed `public.orders`
     (live, `public_objects_are_named_in_every_statement_that_runs`).
+    **`bare_name_reaches` is the weaker question completion asks**: whether a bare name *probably*
+    reaches a table in a given namespace — PostgreSQL's `public` and SQL Server's `dbo` (or no
+    namespace) yes, any other no, and MySQL and SQLite always yes, their database being the
+    namespace (`a_bare_name_reaches_the_default_namespace_only`). *Probably*, because the real
+    `search_path` and the login's default schema are the session's and nothing here reads them —
+    which is why a caller may only **add** a qualifier on a no, never strip one on a yes, and why
+    `qualified_table_name` above does not ask it. The `match` is exhaustive, so a fifth engine has
+    to say where its bare names go.
     **SQL Server's `]` is the one quote `sqlparser` will not escape**, and two rules follow from it.
     The sort column goes into the AST **already quoted** by the one quoter and wrapped as an
     unquoted `Ident`, which renders verbatim: `Ident::with_quote` took the quote character and
@@ -13094,7 +13115,11 @@ existing prose was left alone.
       completion runs there on purpose (`intel::caret_in_literal_or_comment` lets a quoted name
       through), and the quote before the word is the user's, so the UI asks
       `intel::caret_in_quoted_name` — the same probe, answering the other kind of span — and passes
-      it in (`a_name_that_needs_quoting_inserts_quoted`). **`rank_full` is `rank` plus the one fact the rows cannot carry**:
+      it in (`a_name_that_needs_quoting_inserts_quoted`). For a **table** row that check comes
+      *ahead of* the row's own `insert`, which is otherwise never overridden: a qualified insert —
+      the tab's list's `sales.ledger`, the widened list's references, which had the flaw first —
+      landed after the user's opening quote as one identifier with a dot in it
+      (`a_qualified_table_row_inserts_its_bare_name_inside_a_quote`). **`rank_full` is `rank` plus the one fact the rows cannot carry**:
       `Ranked::completes_a_word`, whether the word typed already spells a candidate in full. The
       exact match is left out of the rows, and that was also what hid it — after `FROM` the list
       held `FROM_BASE64()` and `FROM_DAYS()`, and Enter, meant as a newline, accepted the first (the
@@ -13211,6 +13236,20 @@ existing prose was left alone.
       schema tree's `TABLE_CELLS_MERGE`), from `SchemaIndex::views`, at a table slot and after its
       database's qualifier (`a_view_is_told_from_a_table`). In the UI `Completion::wide` is set by a Ctrl+Space over an open
       list, kept while it stays open, and cleared when a list next opens by typing.
+      **The tab's own list qualifies a table no bare name reaches.** It offered every in-scope
+      table under its bare name, so PostgreSQL's `sales.ledger` went in as `ledger` — which reads
+      whatever `search_path` finds first, or nothing. `SchemaIndex::namespaces` maps each `tables`
+      name to the namespace of every in-scope table carrying it, and `qualify_unreached` (beside
+      `mark_view`, and guarded by `cands.len() > before` for the same reason) runs after each table
+      row in both `ClauseCtx::Table` and `ClauseCtx::Other`: when **every** namespace of the name
+      fails `filter::bare_name_reaches`, the row's `insert` becomes
+      `filter::qualified_table_name` with the first of them, while the row still reads as the bare
+      name. SQL Server takes the same path with `dbo` as its default. A name with one table in the
+      default namespace stays bare — the rows are deduped by text, so that row stands for both, and
+      the bare name reaches one of them (`a_table_outside_the_default_namespace_inserts_qualified`:
+      `sales.ledger` qualified, `public.orders` bare, `audit` in `sales` and `public` bare). Two
+      same-named tables both outside the default get the *first* namespace the index met; the
+      widened list is what names the other.
       **Straight after a sigil the list is the document's own names and nothing else**:
       `ClauseCtx::Variable` after one `@` where the engine has `@` variables (`has_at_variables`:
       SQL Server's declared ones, MySQL's user variables — not `@@`, a system function's) offers
@@ -23348,6 +23387,10 @@ existing prose was left alone.
     database of that name has had its turn (`a_schema_qualified_table_offers_its_columns`,
     `the_tabs_database_is_indexed_by_schema_too`, both red before). Limited to the in-scope database
     as `intel::Catalog`'s `schema_qualified` is, since a `schema.table` never crosses a database.
+    Beside each `tables` push, `index::build` records the table's namespace under its lower-cased
+    name in `SchemaIndex::namespaces`, which is how `rank` decides that a table no bare name reaches
+    inserts qualified (under `rank.rs`). A synonym pushed into `tables` gets no entry and so always
+    goes in bare. No `index_tests` case covers that line.
     **The inline prediction is asked before the popup, and a reasoned one outranks it on an empty
     word.**
     `recompute_completions` asks `prediction_at` — `intel::predict` over the *offer* catalogue

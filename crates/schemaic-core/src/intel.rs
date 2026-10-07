@@ -4750,7 +4750,16 @@ fn lexer_scope(
         let Some((name, _)) = parts.pop() else {
             return;
         };
-        let db = parts.pop().map(|p| p.0).filter(|d| !d.is_empty());
+        // `db.schema.t` (and `db..t`) keeps its database, which is what
+        // finds another database's table; a linked server's four parts name
+        // nothing this can look up. See `table_ref_of`.
+        let db = match parts.len() {
+            0 | 1 => parts.pop(),
+            2 => parts.into_iter().next(),
+            _ => return,
+        }
+        .map(|p| p.0)
+        .filter(|d| !d.is_empty());
         out.push(TableRef { name, alias, db });
     };
     let mut next_id = 1usize;
@@ -4959,9 +4968,13 @@ mod ast_scope {
         let (db, table) = match parts.as_slice() {
             [t] => (None, t.clone()),
             [d, t] => (Some(d.clone()), t.clone()),
-            // db.schema.table etc. → last is the table, prior is its db.
-            [.., d, t] => (Some(d.clone()), t.clone()),
-            [] => return None,
+            // `db.schema.table` → the table in its **database**, which is
+            // what completion looks another database's columns up by; the
+            // schema it kept found the tab's own `dbo.t` instead. `db..t`
+            // keeps its database too.
+            [d, _, t] => ((!d.is_empty()).then(|| d.clone()), t.clone()),
+            // A linked server's four parts: nothing here can know the table.
+            _ => return None,
         };
         Some(TableRef {
             name: table,
@@ -24459,8 +24472,12 @@ mod tests {
     /// statement does not parse, so the lexer's scope answers, and it took
     /// one optional `.name`: `company.dbo.employees e` read as the table `dbo`
     /// in `company`, the alias slot then met a `.`, and `e.` offered nothing.
-    /// It is the table, under its schema, with its alias — what the parsed
-    /// statement's scope holds.
+    /// It is the table, with its alias, **in its database** — what the parsed
+    /// statement's scope holds. The database, not the schema: completion
+    /// looks a reference's columns up by database first, and the schema it
+    /// used to keep found the *tab's own* `dbo.employees` for another
+    /// database's (`another_databases_three_part_table_completes_its_own_columns`).
+    /// A linked server's four-part name is no table it can know.
     #[test]
     fn a_three_part_name_is_in_completions_scope_mid_edit() {
         let ms = |sql: &str, caret: usize| {
@@ -24473,17 +24490,22 @@ mod tests {
         };
         assert_eq!(
             ms("SELECT e. FROM company.dbo.employees e", 9),
-            [employees(Some("dbo"))]
+            [employees(Some("company"))]
         );
         let sql = "SELECT e.id FROM company.dbo.employees e WHERE e.";
-        assert_eq!(ms(sql, sql.len()), [employees(Some("dbo"))]);
+        assert_eq!(ms(sql, sql.len()), [employees(Some("company"))]);
         let sql = "SELECT e.id FROM company..employees e WHERE e.";
-        assert_eq!(ms(sql, sql.len()), [employees(None)]);
+        assert_eq!(ms(sql, sql.len()), [employees(Some("company"))]);
         // The parsed statement agrees.
         let sql = "SELECT e.id FROM company.dbo.employees e";
-        assert_eq!(ms(sql, sql.len()), [employees(Some("dbo"))]);
+        assert_eq!(ms(sql, sql.len()), [employees(Some("company"))]);
         // A qualifier still being typed is no table.
         let sql = "SELECT * FROM company.dbo.";
+        assert_eq!(ms(sql, sql.len()), []);
+        // Four parts, mid-edit and parsed: nothing to look up.
+        let sql = "SELECT e. FROM srv.company.dbo.employees e";
+        assert_eq!(ms(sql, 9), []);
+        let sql = "SELECT e.id FROM srv.company.dbo.employees e";
         assert_eq!(ms(sql, sql.len()), []);
     }
 

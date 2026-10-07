@@ -544,6 +544,23 @@ pub fn qualified_table_name(
     }
 }
 
+/// Does a bare table name **probably** reach a table in namespace `schema`?
+/// PostgreSQL's stock `search_path` (`"$user", public`) and a SQL Server
+/// login's usual default schema (`dbo`) say yes for those two and no for any
+/// other; where the database is the namespace (MySQL, SQLite) a table in the
+/// session's database is always reached bare. Probably, because the real
+/// `search_path` and default schema are the session's and not read here —
+/// which is why the callers only ever *add* a qualifier on a no, never take
+/// one away on a yes.
+pub fn bare_name_reaches(dialect: SqlDialect, schema: Option<&str>) -> bool {
+    let default = match dialect {
+        SqlDialect::Postgres => "public",
+        SqlDialect::MsSql => "dbo",
+        SqlDialect::MySql | SqlDialect::Sqlite => return true,
+    };
+    schema.is_none_or(|s| s.is_empty() || s.eq_ignore_ascii_case(default))
+}
+
 /// How a session whose database is `active_db` names `table` of `database`
 /// — [`qualified_table_name`]'s spelling, and on SQL Server the database in
 /// front when it is another one (`db.schema.table`, three-part names being
@@ -639,6 +656,25 @@ mod tests {
     }
 
     const EVERY_DIALECT: [SqlDialect; 4] = SqlDialect::ALL;
+
+    /// A bare name reaches the default namespace's tables — PostgreSQL's
+    /// `public`, SQL Server's `dbo` — and every table where the database is
+    /// the namespace.
+    #[test]
+    fn a_bare_name_reaches_the_default_namespace_only() {
+        use SqlDialect::*;
+        assert!(bare_name_reaches(Postgres, Some("public")));
+        assert!(bare_name_reaches(Postgres, Some("PUBLIC")));
+        assert!(bare_name_reaches(Postgres, None));
+        assert!(!bare_name_reaches(Postgres, Some("sales")));
+        assert!(!bare_name_reaches(Postgres, Some("dbo")));
+        assert!(bare_name_reaches(MsSql, Some("dbo")));
+        assert!(!bare_name_reaches(MsSql, Some("sales")));
+        assert!(!bare_name_reaches(MsSql, Some("public")));
+        for d in [MySql, Sqlite] {
+            assert!(bare_name_reaches(d, Some("anything")), "{d:?}");
+        }
+    }
 
     // ── SQL Server ────────────────────────────────────────────────────────
 
