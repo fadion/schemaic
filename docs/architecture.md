@@ -11922,9 +11922,15 @@ existing prose was left alone.
     those two bytes, a paren pair only in code, so `'it'|'s'` and `'f(|)'` lose one character,
     `backspace_takes_only_an_empty_pair_the_lexer_agrees_is_one`), `bracket_jump` (Ctrl+Shift+\,
     matched on the physical key: the caret to the same side of `match_paren`'s partner as it was
-    of the paren beside it, so a second press returns —
-    `a_bracket_jump_lands_beside_the_partner_and_comes_back`), `match_paren` (the
-    paren adjacent to the caret + its partner, ignoring parens in strings/comments),
+    of the bracket beside it, so a second press returns —
+    `a_bracket_jump_lands_beside_the_partner_and_comes_back`), `match_paren` (the paren or square
+    bracket adjacent to the caret + its partner, ignoring both in strings/comments — so the pair
+    highlight and the jump reach a PostgreSQL array or slice too. **Each kind pairs only with its
+    own**: a `]` never closes a `(`, and a close at the caret with nothing open or the other kind
+    innermost has no partner; a stray close anywhere else is passed over rather than popped, so it
+    cannot take the pair from the close of the right kind — `(a])` still pairs `(` with `)`,
+    `match_paren_pairs_square_brackets_by_kind`. Where `[name]` is a quoted identifier, SQL Server
+    and SQLite, `skip_noncode` skips it and it pairs nothing),
     `identifier_occurrences` (every whole-word, ASCII-case-insensitive occurrence of the identifier
     under the caret — excludes keywords/numbers/strings, needs ≥2 to fire), and `region_at`
     (`Code`/`Str`/`Comment` classification). Pure + unit-tested; dialect-aware, and its two "is a

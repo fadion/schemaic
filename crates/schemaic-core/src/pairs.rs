@@ -334,10 +334,12 @@ pub fn bracket_jump(text: &str, caret: usize, dialect: SqlDialect) -> Option<usi
     Some(if here == caret { partner } else { partner + 1 })
 }
 
-/// If the caret is adjacent to a parenthesis that isn't inside a string/comment,
-/// return `(here, partner)` — the byte offset of that paren and of its match.
-/// Prefers the paren to the *right* of the caret, else the one to the *left*.
-/// `None` when there's no adjacent (code) paren or it has no match.
+/// If the caret is adjacent to a parenthesis or square bracket that isn't inside
+/// a string/comment, return `(here, partner)` — the byte offset of that paren
+/// and of its match, which is always of the same kind. Prefers the paren to the
+/// *right* of the caret, else the one to the *left*. `None` when there's no
+/// adjacent (code) paren or it has no match. On SQL Server and SQLite a
+/// `[name]` is a quoted name the lexer skips, so it pairs nothing here.
 ///
 /// **Returns at the pair, not after every pair.** This used to build a `Vec` of
 /// every balanced pair in the document and then `find_map` the one touching the
@@ -350,7 +352,7 @@ pub fn bracket_jump(text: &str, caret: usize, dialect: SqlDialect) -> Option<usi
 /// order, and a position is the open or the close of exactly one pair.
 pub fn match_paren(text: &str, caret: usize, dialect: SqlDialect) -> Option<(usize, usize)> {
     let b = text.as_bytes();
-    let is_paren = |p: usize| matches!(b.get(p), Some(b'(') | Some(b')'));
+    let is_paren = |p: usize| matches!(b.get(p), Some(b'(' | b')' | b'[' | b']'));
     let here = if is_paren(caret) {
         caret
     } else if caret > 0 && is_paren(caret - 1) {
@@ -368,15 +370,28 @@ pub fn match_paren(text: &str, caret: usize, dialect: SqlDialect) -> Option<(usi
             continue;
         }
         match b[i] {
-            b'(' => stack.push(i),
-            b')' => match stack.pop() {
-                Some(open) if open == here => return Some((here, i)),
-                Some(open) if i == here => return Some((here, open)),
-                // An unmatched `)` **at** the caret has no partner and never
-                // will — the pairs after it belong to somebody else.
-                None if i == here => return None,
-                _ => {}
-            },
+            b'(' | b'[' => stack.push(i),
+            close @ (b')' | b']') => {
+                let opener = if close == b')' { b'(' } else { b'[' };
+                match stack.last() {
+                    Some(&open) if b[open] == opener => {
+                        stack.pop();
+                        if open == here {
+                            return Some((here, i));
+                        }
+                        if i == here {
+                            return Some((here, open));
+                        }
+                    }
+                    // An unmatched close **at** the caret — none open, or one
+                    // of the other kind — has no partner and never will: the
+                    // pairs after it belong to somebody else. Elsewhere a
+                    // stray close is passed over, so it cannot take the pair
+                    // from the close of the right kind.
+                    _ if i == here => return None,
+                    _ => {}
+                }
+            }
             _ => {}
         }
         i += 1;
@@ -469,7 +484,7 @@ pub fn identifier_occurrences(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use SqlDialect::{MySql, Postgres, Sqlite};
+    use SqlDialect::{MsSql, MySql, Postgres, Sqlite};
 
     // --- region_at ---------------------------------------------------------
 
@@ -771,6 +786,28 @@ mod tests {
         // "( ')' )" → outer parens at 0 and 6
         let sql = "( ')' )";
         assert_eq!(match_paren(sql, 0, MySql), Some((0, 6)));
+    }
+
+    /// Square brackets pair as parens do — PostgreSQL's arrays and slices —
+    /// each with its own kind: a `]` never closes a `(`, and a stray close of
+    /// the wrong kind is passed over rather than taking the pair from the
+    /// right one. On SQL Server and SQLite `[x]` is a quoted name, not a bracket.
+    #[test]
+    fn match_paren_pairs_square_brackets_by_kind() {
+        let sql = "SELECT a[f(1)][2:3]";
+        assert_eq!(match_paren(sql, 8, Postgres), Some((8, 13)));
+        assert_eq!(match_paren(sql, 13, Postgres), Some((13, 8)));
+        // Between `][` the right-hand one is taken, as with `)(`.
+        assert_eq!(match_paren(sql, 14, Postgres), Some((14, 18)));
+        assert_eq!(match_paren(sql, 10, Postgres), Some((10, 12)));
+        assert_eq!(bracket_jump(sql, 19, Postgres), Some(15));
+        // A stray `]` inside parens neither matches `(` nor steals its `)`.
+        assert_eq!(match_paren("(a])", 0, MySql), Some((0, 3)));
+        assert_eq!(match_paren("(a])", 2, MySql), None);
+        assert_eq!(match_paren("(a]", 0, MySql), None);
+        assert_eq!(match_paren("[a)", 0, MySql), None);
+        assert_eq!(match_paren("SELECT [a b]", 7, MsSql), None);
+        assert_eq!(match_paren("SELECT [a b]", 7, Sqlite), None);
     }
 
     #[test]

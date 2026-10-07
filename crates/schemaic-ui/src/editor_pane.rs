@@ -3514,7 +3514,8 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
 
     // Bracket matching: recompute the matched-paren offsets on every caret move
     // (tracks `ed.cursor`) and edit (tracks `query`). Pure/boundary-aware via
-    // `core::pairs::match_paren`, so parens inside strings/comments are ignored.
+    // `core::pairs::match_paren`, so parens and square brackets inside
+    // strings/comments are ignored.
     create_effect(move |_| {
         let caret = ed_bm.cursor.get().offset();
         let sql = query.get();
