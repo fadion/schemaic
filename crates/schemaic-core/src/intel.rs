@@ -5535,6 +5535,30 @@ impl Catalog {
         }
     }
 
+    /// The tables a reference qualified by `qualifier` — or unqualified, for
+    /// `None` — could name, lower-cased as [`Catalog::table_status`] keys
+    /// them: the candidates a "did you mean" picks from.
+    fn table_names(&self, qualifier: Option<&str>) -> Vec<&str> {
+        match qualifier {
+            None => self
+                .unqualified
+                .keys()
+                .chain(&self.opaque_unqualified)
+                .map(String::as_str)
+                .collect(),
+            Some(q) => {
+                let q = q.to_ascii_lowercase();
+                self.qualified
+                    .keys()
+                    .chain(self.schema_qualified.keys())
+                    .chain(&self.opaque_qualified)
+                    .filter(|(d, _)| *d == q)
+                    .map(|(_, t)| t.as_str())
+                    .collect()
+            }
+        }
+    }
+
     /// The reference to judge a three-part name by — `r` names a table (and,
     /// in `r.db`, a schema, `None` for `db..t`'s default one) in `database`.
     ///
@@ -6387,6 +6411,50 @@ fn is_probable_typo(word: &str, catalog: &Catalog, dialect: SqlDialect) -> bool 
         (kw.len() as isize - up.len() as isize).unsigned_abs() <= thresh
             && crate::sql::edit_distance(&up, kw) <= thresh
     })
+}
+
+/// The one candidate nearest `name`, for a "did you mean" — within the typo
+/// checker's distance (one edit, two from seven characters on), ignoring
+/// case. `None` when nothing is that near, when `name` itself is among them,
+/// or when two are equally near: naming one of them is a guess.
+pub fn nearest_name<'a>(
+    name: &str,
+    candidates: impl IntoIterator<Item = &'a str>,
+) -> Option<&'a str> {
+    let lw = name.to_ascii_lowercase();
+    let thresh = if name.len() >= 7 { 2 } else { 1 };
+    let mut best: Option<(usize, &'a str)> = None;
+    let mut tied = false;
+    for c in candidates {
+        if (c.len() as isize - lw.len() as isize).unsigned_abs() > thresh {
+            continue;
+        }
+        let d = crate::sql::edit_distance(&lw, &c.to_ascii_lowercase());
+        if d == 0 {
+            return None;
+        }
+        if d > thresh {
+            continue;
+        }
+        match best {
+            Some((b, _)) if d > b => {}
+            // The same name twice — two maps hold it — is no tie.
+            Some((b, n)) if d == b => tied |= !n.eq_ignore_ascii_case(c),
+            _ => {
+                best = Some((d, c));
+                tied = false;
+            }
+        }
+    }
+    best.filter(|_| !tied).map(|(_, c)| c)
+}
+
+/// [`nearest_name`] as the tail of a "not found" message — empty when there
+/// is no one name to suggest.
+fn did_you_mean<'a>(name: &str, candidates: impl IntoIterator<Item = &'a str>) -> String {
+    nearest_name(name, candidates)
+        .map(|n| format!(" — did you mean `{n}`?"))
+        .unwrap_or_default()
 }
 
 /// Catalog-aware offline diagnostics: instant, no DB round-trip. For each
@@ -10234,10 +10302,11 @@ fn table_existence_checks(
                 .written_qualifier()
                 .map(|d| format!(" in `{d}`"))
                 .unwrap_or_default();
+            let hint = did_you_mean(&r.name, catalog.table_names(r.db.as_deref()));
             out.push(Diagnostic {
                 range: l.pos,
                 severity: Severity::Error,
-                message: format!("Table `{}` not found{where_db}", r.name),
+                message: format!("Table `{}` not found{where_db}{hint}", r.name),
             });
         }
     }
@@ -10274,10 +10343,11 @@ fn qualified_column_checks(
             // The engine's own undeclared columns are in no catalogue.
             && !dialect.is_implicit_column(col)
         {
+            let hint = did_you_mean(col, cols.iter().map(String::as_str));
             out.push(Diagnostic {
                 range: (w[2].at, w[2].end),
                 severity: Severity::Error,
-                message: format!("Column `{col}` not found in `{}`", table.name),
+                message: format!("Column `{col}` not found in `{}`{hint}", table.name),
             });
         }
     }
@@ -10734,12 +10804,16 @@ mod colres {
                             return match &src.cols {
                                 Cols::Open => None,
                                 Cols::Known(cols) if cols.contains(&r.col) => None,
-                                Cols::Known(_) => Some(err(
+                                Cols::Known(cols) => Some(err(
                                     r,
                                     &format!(
-                                        "Column `{}` not found in `{}`",
+                                        "Column `{}` not found in `{}`{}",
                                         r.col,
-                                        src.table.clone().unwrap_or_else(|| q.clone())
+                                        src.table.clone().unwrap_or_else(|| q.clone()),
+                                        super::did_you_mean(
+                                            &r.col,
+                                            cols.iter().map(String::as_str)
+                                        ),
                                     ),
                                 )),
                             };
@@ -10826,7 +10900,23 @@ mod colres {
                     [Src { table: Some(t), .. }] => format!(" in `{t}`"),
                     _ => String::new(),
                 };
-                Some(err(r, &format!("Column `{}` not found{where_tbl}", r.col)))
+                // The suggestion is from what the innermost scope can see.
+                let hint = super::did_you_mean(
+                    &r.col,
+                    chain[0]
+                        .sources
+                        .iter()
+                        .filter(visible)
+                        .filter_map(|src| match &src.cols {
+                            Cols::Known(cols) => Some(cols.iter().map(String::as_str)),
+                            Cols::Open => None,
+                        })
+                        .flatten(),
+                );
+                Some(err(
+                    r,
+                    &format!("Column `{}` not found{where_tbl}{hint}", r.col),
+                ))
             }
         }
     }
@@ -20558,6 +20648,67 @@ mod tests {
         assert_eq!(
             &"SELECT e.salery FROM employees e"[d[0].range.0..d[0].range.1],
             "salery"
+        );
+    }
+
+    /// The nearest name to a misspelling, by the typo checker's distance: one
+    /// edit for a short name, two from seven characters on. Nothing on a tie,
+    /// since naming one of two equally near names is a guess.
+    #[test]
+    fn the_nearest_name_is_within_the_typo_distance_and_unique() {
+        let names = ["employees", "departments", "salary", "name", "id"];
+        assert_eq!(nearest_name("employes", names), Some("employees"));
+        assert_eq!(nearest_name("EMPLOYES", names), Some("employees"));
+        assert_eq!(nearest_name("salery", names), Some("salary"));
+        assert_eq!(nearest_name("nmae", names), None, "a swap is two edits");
+        assert_eq!(nearest_name("nme", names), Some("name"));
+        assert_eq!(nearest_name("nosuchtable", names), None);
+        // The name itself, in any case, is no suggestion.
+        assert_eq!(nearest_name("Salary", names), None);
+        assert_eq!(nearest_name("ab", ["ax", "ay"]), None, "a tie");
+        assert_eq!(
+            nearest_name("ab", ["ax", "AX"]),
+            Some("ax"),
+            "one name twice"
+        );
+        assert_eq!(nearest_name("x", Vec::<&str>::new()), None);
+    }
+
+    /// Each "not found" says what was probably meant, where one name is near.
+    #[test]
+    fn a_name_not_found_suggests_the_nearest_one() {
+        let msg = |sql: &str| -> Vec<String> {
+            diag(sql)
+                .into_iter()
+                .filter(|d| d.message.contains("not found"))
+                .map(|d| d.message)
+                .collect()
+        };
+        assert_eq!(
+            msg("SELECT * FROM employes"),
+            ["Table `employes` not found — did you mean `employees`?"]
+        );
+        assert_eq!(
+            msg("SELECT * FROM company.employes"),
+            ["Table `employes` not found in `company` — did you mean `employees`?"]
+        );
+        assert_eq!(
+            msg("SELECT e.salery FROM employees e"),
+            ["Column `salery` not found in `employees` — did you mean `salary`?"]
+        );
+        assert_eq!(
+            msg("SELECT salery FROM employees"),
+            ["Column `salery` not found in `employees` — did you mean `salary`?"]
+        );
+        // The flat check, for a statement that is not a query.
+        assert_eq!(
+            msg("UPDATE employees SET salary = 1 WHERE employees.salery = 2"),
+            ["Column `salery` not found in `employees` — did you mean `salary`?"]
+        );
+        // Nothing near: the message is as it was.
+        assert_eq!(
+            msg("SELECT * FROM nosuchtable"),
+            ["Table `nosuchtable` not found"]
         );
     }
 

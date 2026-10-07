@@ -864,7 +864,8 @@ existing prose was left alone.
     mid-edit), `clause_context`/`clause_continuation` (caret context + expected-token model for
     completion), and `diagnostics` → `Vec<Diagnostic>` (catalog-aware unknown-table, unknown-column via
     the per-scope resolver `colres` — qualified *and* unqualified, across subqueries/derived-tables/CTEs
-    with correlation — reserved-keyword-alias errors, syntax errors on completed statements save
+    with correlation, either one ending in a "did you mean" when one name is near (`nearest_name`,
+    below) — reserved-keyword-alias errors, syntax errors on completed statements save
     those sqlparser has no grammar for (`parser_lacks_statement` and `grammar_gap_masks`,
     below), keyword-typo warnings, and two warnings raised per `SELECT` scope as `colres` walks it,
     a derived table's own included (`diag_only_full_group_by_inside_subquery`): the
@@ -1747,6 +1748,25 @@ existing prose was left alone.
     so that one is covered exactly when a kept error (for an error) or any kept diagnostic (for a
     warning) reaches as far, and two running maxima answer it. It compared each diagnostic with
     every one kept before it, O(d²) on the flood a long routine could raise.
+    **A "not found" names what was probably meant, but only when exactly one name is that near.**
+    `nearest_name` measures with the keyword-typo checker's own yardstick — `sql::edit_distance`,
+    one edit, two from seven characters on, case ignored, behind the same length pre-filter — and
+    the private `did_you_mean` renders its answer as the message's tail,
+    `` — did you mean `employees`?``, or as nothing. All four not-found sites carry it:
+    `table_existence_checks`, from `Catalog::table_names` (the keys a reference under that qualifier
+    could name, opaque synonyms included); `qualified_column_checks`, from the table's `columns_of`;
+    and both arms of `colres::resolve` — the qualified one from that source's known columns, the
+    unqualified one from every known column of the **innermost** scope's visible sources, which is
+    narrower than the chain the resolver walks before giving up. **It says nothing rather than
+    guess**: two *different* names equally near is `None`, naming one of them being a guess
+    presented as advice; the same name twice — two catalogue maps, or two sources in one scope,
+    holding it — is not a tie; and `name` itself among the candidates, in any case, is `None` too.
+    With nothing near, the message is exactly what it was
+    (`the_nearest_name_is_within_the_typo_distance_and_unique`,
+    `a_name_not_found_suggests_the_nearest_one`). What it costs is case: the catalogue keys tables
+    lower-cased and the resolver lower-cases a source's columns, so a mixed-case PostgreSQL table is
+    suggested in lower case, which is not the name to type; only the flat column check, reading
+    `columns_of` directly, suggests the server's own spelling.
     **The false-positive corpus is only half a defence on its own, and that is why there are now two
     passes over it.** `diag_bare` builds `Catalog::build(&[], None)`, so `unqualified_db_loaded` is
     false, `table_status` answers `Unknown` for every unqualified reference, and
