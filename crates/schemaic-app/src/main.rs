@@ -1899,6 +1899,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                 crlf: s.file_crlf,
                                 bom: s.file_bom,
                                 lossy: s.file_lossy,
+                                utf16: s.file_utf16,
                             },
                         );
                         t.path.set(binding.path);
@@ -6860,7 +6861,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // confirmed the overwrite for means. `sqlfile::expected_disk_text` decides
     // which of the two this is, and carries why it is the text rather than the
     // bytes.
-    type FileWriteReq = (std::path::PathBuf, String, Option<String>);
+    type FileWriteReq = (std::path::PathBuf, Vec<u8>, Option<String>);
     let write_sql_file: Rc<dyn Fn(FileWriteReq, FileWriteDone)> = {
         let handle = handle.clone();
         Rc::new(
@@ -6887,7 +6888,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     }
                     // Atomic: `fs::write` truncates first, and this file is the
                     // one thing Schemaic can't regenerate.
-                    let res = schemaic_core::persist::write_file_atomic(&path, contents.as_bytes())
+                    let res = schemaic_core::persist::write_file_atomic(&path, &contents)
                         .map_err(|e| format!("Couldn't save {}: {e}", path.display()));
                     report(res);
                 });
@@ -6966,8 +6967,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                 }
                                 tab.path.set(Some(landed2.clone()));
                                 tab.disk_sql.set(Some(text.clone()));
-                                // Saved as UTF-8, so what was unreadable is gone
-                                // and the tab and the file now agree. Asking again
+                                // Saved as the tab shows it, so what was
+                                // unreadable is gone and the tab and the file
+                                // now agree. Asking again
                                 // would be asking about a file that no longer
                                 // exists.
                                 tab.file_format.update(
@@ -6984,7 +6986,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 return;
             }
             confirm.set(Some(Confirm {
-                title: "Save as UTF-8?".to_string(),
+                // Not "Save as UTF-8?": a damaged UTF-16 file is lossy too, and
+                // it is saved as UTF-16.
+                title: "Replace unreadable bytes?".to_string(),
                 message: format!(
                     "Schemaic couldn't read every byte of “{}” as text and showed \
                      those bytes as “�”. Saving writes what you see, so each of \
@@ -7535,6 +7539,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                 path: t.path.get_untracked(),
                                 file_crlf: t.file_format.get_untracked().crlf,
                                 file_bom: t.file_format.get_untracked().bom,
+                                file_utf16: t.file_format.get_untracked().utf16,
                                 // The warning has to survive a relaunch: the
                                 // restored tab holds the *decoded* text, so
                                 // nothing in it would show that a save destroys

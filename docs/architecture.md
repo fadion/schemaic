@@ -12291,15 +12291,22 @@ existing prose was left alone.
     may legitimately hold. `decode` also strips a UTF-8 BOM — a Windows tool writes one and it
     arrives as an invisible character in front of the first keyword — and `encode` puts that back
     too, on the same argument: dropping it rewrites the file's first three bytes for a one-line
-    edit. Both flags, and one more, ride on `SqlFormat`, which is what the tab and its `SavedTab`
-    carry.
+    edit. **A UTF-16 BOM, in either byte order, makes it a UTF-16 read** (`SqlFormat::utf16`, a
+    `Utf16::{Le, Be}`), which `encode` writes back in kind, BOM first — so `encode` answers bytes,
+    not a `String`. Nothing but the BOM identifies UTF-16, and read as UTF-8 it came back as a NUL
+    between every character and flagged lossy, so the one way to keep such a file — what Notepad's
+    and SSMS's *Unicode* write — was never to save it. A trailing odd byte or a lone surrogate is
+    substituted and flagged as a bad UTF-8 byte is
+    (`a_utf16_file_is_read_as_text_and_written_back_in_kind`, `a_damaged_utf16_file_is_read_lossily`).
+    Those flags, and one more, ride on `SqlFormat`, which is what the tab and its `SavedTab` carry.
     **A lossy read is not a licence to write.** `decode` reads bytes it cannot make sense of as
     U+FFFD, because a mis-encoded byte should cost a replacement character rather than the whole
     file — and that is a decision about *reading*. Writing the result back is a different act: it
     replaces every unreadable byte in the file permanently, including in the thousands of lines
     nobody touched, and a Latin-1 `mysqldump` is the ordinary shape of it. So `SqlFormat::lossy`
     records that it happened (free — `from_utf8_lossy` already allocates only when it substituted),
-    persists across a relaunch, and the app confirms before such a save. The `.sql` file is the one
+    persists across a relaunch, and the app confirms before such a save — titled *Replace unreadable
+    bytes?* rather than after UTF-8, since a damaged UTF-16 file is saved as UTF-16. The `.sql` file is the one
     artefact in this application Schemaic cannot regenerate, which is also why the write is
     `persist::write_file_atomic` (stage beside, rename over — no `.bak`, since it is the user's own
     file, and the mode it had carried onto the new inode; see `persist.rs` for the four parts of
@@ -25868,10 +25875,10 @@ existing prose was left alone.
   holds every `(drop_session)` call site to it, with `open_session`'s own release exempt as data —
   it drops only in order to re-pin, and its `Err` arm is what falls back to Auto.
   A file tab survives both kinds of restore. `persist::SavedTab` carries `path`, `file_crlf`,
-  `file_bom`, `file_lossy` and
+  `file_bom`, `file_utf16`, `file_lossy` and
   `file_dirty`, each `#[serde(default, skip_serializing_if = …)]` so a session file written before
-  the feature still restores its tabs — flat bools rather than a nested struct for exactly that
-  reason; `ClosedTab` carries `path`/`disk_sql`/`file_format` so
+  the feature still restores its tabs — flat fields rather than a nested struct for exactly that
+  reason (`file_utf16` is an `Option`, absent meaning UTF-8); `ClosedTab` carries `path`/`disk_sql`/`file_format` so
   Ctrl+Shift+T brings back a *file* tab rather than an untitled copy of its text, and its "worth
   restoring" guard counts a path as worth restoring on its own — the binding is the thing being
   lost, even from an empty file. The file's *contents* are deliberately not persisted: `file_dirty`

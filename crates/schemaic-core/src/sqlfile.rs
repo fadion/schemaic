@@ -18,7 +18,7 @@
 //! Mixed endings resolve to the majority, and a tie to CRLF: a file that is
 //! mostly CRLF with one stray LF is a CRLF file, and normalising the stray one
 //! on save is the smaller lie. A UTF-8 BOM is remembered the same way, and for
-//! the same reason.
+//! the same reason, and so is a UTF-16 file's encoding, told by its BOM.
 //!
 //! # A lossy read is not a licence to write
 //!
@@ -70,6 +70,23 @@ pub struct SqlFormat {
     /// anything Notepad wrote in the ANSI codepage, is exactly this shape. So
     /// the fact travels with the text, and the caller must ask before it saves.
     pub lossy: bool,
+    /// The file was UTF-16 in this byte order, told by its BOM, which
+    /// [`encode`] writes back with the text. `None` is UTF-8 — with a BOM or
+    /// without, which is [`SqlFormat::bom`]'s question and never asked of a
+    /// UTF-16 file.
+    pub utf16: Option<Utf16>,
+}
+
+/// A UTF-16 file's byte order. Persisted on a file-backed tab, so a restored
+/// one still saves in the encoding it was read in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Utf16 {
+    /// Little-endian — what Windows tools write, Notepad's *Unicode* and
+    /// SSMS's *Unicode* among them.
+    Le,
+    /// Big-endian.
+    Be,
 }
 
 /// A file's text as the editor wants it, plus what its bytes were.
@@ -132,26 +149,70 @@ pub fn open_verdict(bytes: u64) -> OpenVerdict {
 /// whole file — and normalises line endings. **Each of those three is recorded**
 /// in the returned [`SqlFormat`], because each is something `encode` has to put
 /// back or a caller has to warn about.
+///
+/// A UTF-16 BOM, in either byte order, makes it a UTF-16 read instead, recorded
+/// as [`SqlFormat::utf16`]. Nothing but the BOM identifies UTF-16, and read as
+/// UTF-8 it is a NUL between every character rather than a failure. A trailing
+/// odd byte or a lone surrogate is substituted and flagged, as a bad UTF-8 byte
+/// is.
 pub fn decode(bytes: &[u8]) -> SqlText {
-    let bom = bytes.starts_with(b"\xEF\xBB\xBF");
-    let bytes = if bom { &bytes[3..] } else { bytes };
-    let raw = String::from_utf8_lossy(bytes);
-    // `from_utf8_lossy` borrows when every byte was valid UTF-8 and allocates
-    // only when it had to substitute — so the fact is already in hand, free.
-    let lossy = matches!(raw, std::borrow::Cow::Owned(_));
+    let utf16 = match bytes {
+        [0xFF, 0xFE, rest @ ..] => Some((rest, Utf16::Le)),
+        [0xFE, 0xFF, rest @ ..] => Some((rest, Utf16::Be)),
+        _ => None,
+    };
+    let (raw, bom, lossy, utf16) = match utf16 {
+        Some((rest, order)) => {
+            let (text, lossy) = decode_utf16(rest, order);
+            (text.into(), false, lossy, Some(order))
+        }
+        None => {
+            let bom = bytes.starts_with(b"\xEF\xBB\xBF");
+            let bytes = if bom { &bytes[3..] } else { bytes };
+            // `from_utf8_lossy` borrows when every byte was valid UTF-8 and
+            // allocates only when it had to substitute — so the fact is
+            // already in hand, free.
+            let raw = String::from_utf8_lossy(bytes);
+            let lossy = matches!(raw, std::borrow::Cow::Owned(_));
+            (raw, bom, lossy, None)
+        }
+    };
     let crlf = is_crlf(&raw);
     SqlText {
         text: raw.replace("\r\n", "\n"),
-        format: SqlFormat { crlf, bom, lossy },
+        format: SqlFormat {
+            crlf,
+            bom,
+            lossy,
+            utf16,
+        },
     }
 }
 
-/// Turn editor text back into the bytes to write, restoring the BOM and the CRLF
-/// the file had. The inverse of [`decode`] for any text the editor can hold
+/// The UTF-16 half of [`decode`], past the BOM: the text, and whether anything
+/// was substituted.
+fn decode_utf16(bytes: &[u8], order: Utf16) -> (String, bool) {
+    let (pairs, odd) = bytes.as_chunks::<2>();
+    let units: Vec<u16> = pairs
+        .iter()
+        .map(|&p| match order {
+            Utf16::Le => u16::from_le_bytes(p),
+            Utf16::Be => u16::from_be_bytes(p),
+        })
+        .collect();
+    let (text, bad) = match String::from_utf16(&units) {
+        Ok(text) => (text, false),
+        Err(_) => (String::from_utf16_lossy(&units), true),
+    };
+    (text, bad || !odd.is_empty())
+}
+
+/// Turn editor text back into the bytes to write, restoring the BOM, the CRLF
+/// and the UTF-16 the file had. The inverse of [`decode`] for any text the editor can hold
 /// (which is `\n`-only, since `decode` is the only way text arrives from a file)
 /// **and any file `decode` read without loss** — a lossy read has no inverse,
 /// which is what [`SqlFormat::lossy`] is for.
-pub fn encode(text: &str, format: SqlFormat) -> String {
+pub fn encode(text: &str, format: SqlFormat) -> Vec<u8> {
     // A stray `\r\n` already in the buffer — pasted from another Windows
     // application, which floem inserts verbatim — is normalised out **on both
     // branches**. On the CRLF branch that stops it doubling into `\r\r\n`; on
@@ -165,10 +226,17 @@ pub fn encode(text: &str, format: SqlFormat) -> String {
     } else {
         text
     };
-    if format.bom {
-        format!("\u{FEFF}{body}")
-    } else {
-        body
+    match format.utf16 {
+        // A UTF-16 file is told by its BOM alone, so it always gets one.
+        Some(order) => std::iter::once(0xFEFF)
+            .chain(body.encode_utf16())
+            .flat_map(|u| match order {
+                Utf16::Le => u.to_le_bytes(),
+                Utf16::Be => u.to_be_bytes(),
+            })
+            .collect(),
+        None if format.bom => format!("\u{FEFF}{body}").into_bytes(),
+        None => body.into_bytes(),
     }
 }
 
@@ -470,7 +538,7 @@ mod tests {
         let crlf_bom = SqlFormat {
             crlf: true,
             bom: true,
-            lossy: false,
+            ..plain()
         };
         let b = restored_binding(Some(PathBuf::from("/w/a.sql")), false, "x", crlf_bom);
         assert_eq!(b.format, crlf_bom);
@@ -565,10 +633,7 @@ mod tests {
     fn decode_reports_whether_it_had_to_substitute() {
         assert!(decode(b"-- caf\xE9\nSELECT 1;\n").format.lossy, "latin-1");
         assert!(decode(b"-- don\x92t\n").format.lossy, "cp-1252 apostrophe");
-        assert!(
-            decode(b"\xFF\xFES\0E\0").format.lossy,
-            "utf-16le with a BOM"
-        );
+        assert!(decode(b"\xFF\xFES\0E\0\0").format.lossy, "utf-16 cut short");
         assert!(!decode("-- café\nSELECT 1;\n".as_bytes()).format.lossy);
         assert!(!decode(b"").format.lossy);
         assert!(
@@ -585,7 +650,7 @@ mod tests {
         let d = decode(raw);
         assert!(d.format.lossy);
         assert_ne!(
-            encode(&d.text, d.format).as_bytes(),
+            encode(&d.text, d.format),
             raw,
             "if this ever passes, the flag can go"
         );
@@ -628,7 +693,7 @@ mod tests {
         ] {
             let d = decode(raw);
             assert_eq!(
-                encode(&d.text, d.format).as_bytes(),
+                encode(&d.text, d.format),
                 raw,
                 "decode → encode must be the identity on a file we opened"
             );
@@ -645,8 +710,62 @@ mod tests {
                     ..plain()
                 }
             ),
-            "a\r\nb\r\nc"
+            b"a\r\nb\r\nc"
         );
+    }
+
+    /// `text` in UTF-16 of the given order, BOM first — what Notepad's and
+    /// SSMS's *Unicode* write.
+    fn utf16(text: &str, order: Utf16) -> Vec<u8> {
+        let word = |u: u16| match order {
+            Utf16::Le => u.to_le_bytes(),
+            Utf16::Be => u.to_be_bytes(),
+        };
+        std::iter::once(0xFEFF)
+            .chain(text.encode_utf16())
+            .flat_map(word)
+            .collect()
+    }
+
+    /// **A UTF-16 file is text, not a NUL between every character.** Read as
+    /// UTF-8 it came back as `��S\0E\0L\0…` and flagged lossy, so the one way to
+    /// keep the file was not to save it. It is read by its BOM, in either byte
+    /// order, and written back in the same encoding — endings, BOM and all.
+    #[test]
+    fn a_utf16_file_is_read_as_text_and_written_back_in_kind() {
+        for order in [Utf16::Le, Utf16::Be] {
+            for raw in ["SELECT 'é';\r\nSELECT 2;\r\n", "SELECT '😀';\n", ""] {
+                let bytes = utf16(raw, order);
+                let d = decode(&bytes);
+                assert_eq!(d.text, raw.replace("\r\n", "\n"), "{order:?}");
+                assert_eq!(d.format.utf16, Some(order));
+                assert_eq!(d.format.crlf, raw.contains("\r\n"));
+                assert!(!d.format.lossy && !d.format.bom, "{order:?}");
+                assert_eq!(encode(&d.text, d.format), bytes, "{order:?} {raw:?}");
+                assert!(!changed_on_disk(&bytes, &d.text));
+            }
+        }
+        // An edit is written in the file's encoding too.
+        let d = decode(&utf16("SELECT 1;\r\n", Utf16::Le));
+        assert_eq!(
+            encode("SELECT 2;\n", d.format),
+            utf16("SELECT 2;\r\n", Utf16::Le)
+        );
+    }
+
+    /// A damaged UTF-16 file — a trailing odd byte, a lone surrogate — is read
+    /// as far as it goes and flagged, as a mis-encoded UTF-8 byte is.
+    #[test]
+    fn a_damaged_utf16_file_is_read_lossily() {
+        let mut odd = utf16("SELECT 1;", Utf16::Le);
+        odd.push(b'x');
+        let d = decode(&odd);
+        assert_eq!(d.text, "SELECT 1;");
+        assert!(d.format.lossy);
+        let lone = [0xFF, 0xFE, 0x00, 0xD8, b'a', 0x00];
+        let d = decode(&lone);
+        assert_eq!(d.text, "\u{FFFD}a");
+        assert!(d.format.lossy);
     }
 
     #[test]
@@ -779,7 +898,7 @@ mod tests {
         // record rather than implied.
         assert_ne!(
             encode(&read.text, read.format),
-            mixed,
+            mixed.as_bytes(),
             "if this ever becomes an equality the byte comparison was fine after all"
         );
         assert!(!changed_on_disk(mixed.as_bytes(), &read.text));
@@ -834,12 +953,11 @@ mod tests {
         for format in [
             SqlFormat::default(),
             SqlFormat {
-                crlf: false,
                 bom: true,
-                lossy: false,
+                ..SqlFormat::default()
             },
         ] {
-            let bytes = encode(pasted, format);
+            let bytes = String::from_utf8(encode(pasted, format)).unwrap();
             assert!(!bytes.contains("\r\n"), "an LF file stays LF: {:?}", bytes);
             assert!(
                 !changed_on_disk(bytes.as_bytes(), pasted),
@@ -850,10 +968,9 @@ mod tests {
         // against a stray `\r\n` doubling into `\r\r\n`.
         let crlf = SqlFormat {
             crlf: true,
-            bom: false,
-            lossy: false,
+            ..SqlFormat::default()
         };
-        let bytes = encode(pasted, crlf);
+        let bytes = String::from_utf8(encode(pasted, crlf)).unwrap();
         assert!(!bytes.contains("\r\r\n"));
         assert!(!changed_on_disk(bytes.as_bytes(), pasted));
     }

@@ -506,6 +506,11 @@ pub struct SavedTab {
     /// — `#[serde(default)]` on a flat `bool` is what makes that free.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub file_bom: bool,
+    /// The file was UTF-16 in this byte order, which a save writes back
+    /// (see [`crate::sqlfile::SqlFormat::utf16`]). Meaningless without `path`;
+    /// absent — an older build's `tabs.json` too — is UTF-8.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_utf16: Option<crate::sqlfile::Utf16>,
     /// Schemaic could not read every byte of the file as UTF-8 and substituted
     /// replacement characters (see [`crate::sqlfile::SqlFormat::lossy`]).
     ///
@@ -3298,9 +3303,29 @@ mod tests {
             path: path.map(PathBuf::from),
             file_crlf: false,
             file_bom: false,
+            file_utf16: None,
             file_lossy: false,
             file_dirty: dirty,
         }
+    }
+
+    /// A UTF-16 file tab keeps its byte order across a relaunch, so its next
+    /// save is still UTF-16; a session written before the field existed
+    /// restores as UTF-8, which is what every file tab then was.
+    #[test]
+    fn a_file_tabs_utf16_survives_the_session_file() {
+        let tab = super::SavedTab {
+            file_utf16: Some(crate::sqlfile::Utf16::Be),
+            ..saved(Some("/sql/a.sql"), false, "select 1")
+        };
+        let json = serde_json::to_string(&tab).unwrap();
+        assert!(json.contains(r#""file_utf16":"be""#), "{json}");
+        let back: super::SavedTab = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.file_utf16, Some(crate::sqlfile::Utf16::Be));
+        let plain = serde_json::to_string(&saved(Some("/sql/a.sql"), false, "x")).unwrap();
+        assert!(!plain.contains("file_utf16"), "{plain}");
+        let older: super::SavedTab = serde_json::from_str(&plain).unwrap();
+        assert_eq!(older.file_utf16, None);
     }
 
     /// With the setting off, the only tab worth keeping is the one whose text is
