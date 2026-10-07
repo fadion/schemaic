@@ -1664,6 +1664,44 @@ mod tests {
         assert_eq!(accepted_insert(&row, SqlDialect::Postgres, true), None);
     }
 
+    /// **`NEW.` in a trigger completes the trigger table's columns**, through
+    /// the scope the editor builds and the alias it holds.
+    #[test]
+    fn a_triggers_new_completes_its_tables_columns() {
+        let s = shop();
+        let sql = "CREATE TRIGGER trg BEFORE UPDATE ON orders FOR EACH ROW SET NEW.";
+        let scope =
+            crate::intel::statement_scope(sql, 0, sql.len(), sql.len(), SqlDialect::MySql).tables;
+        let want: Vec<String> = s.columns["orders"].iter().map(|c| c.name.clone()).collect();
+        let cont = Continuation::default();
+        let used = HashSet::new();
+        let texts: Vec<String> = rank(
+            &s,
+            &RankInput {
+                ctx: &ClauseCtx::Qualified("NEW".to_string()),
+                cont: &cont,
+                scope: &scope,
+                prefix: "",
+                snippets: &[],
+                join_targets: &[],
+                star: None,
+                used: &used,
+                active_db: Some("shop"),
+                dialect: SqlDialect::MySql,
+                flavour: ServerFlavour::Unknown,
+                local: &LocalNames::default(),
+                wide: false,
+            },
+        )
+        .into_iter()
+        .map(|r| r.text)
+        .collect();
+        assert!(!want.is_empty());
+        for c in &want {
+            assert!(texts.contains(c), "{c} missing from {texts:?}");
+        }
+    }
+
     /// **Another database's `dbo.orders` completes its own columns**, read
     /// through the scope the editor builds. The scope kept the schema, `dbo`,
     /// and the schema map answered with the tab's own `dbo.orders`.

@@ -4834,19 +4834,143 @@ pub fn statement_scope(
     dialect: SqlDialect,
 ) -> Scope {
     let stmt = sql.get(lo..hi).unwrap_or("");
-    if let Ok(mut asts) = sqlparser::parser::Parser::parse_sql(&*dialect.parser(), stmt)
-        && asts.len() == 1
-    {
-        let mut scope = Scope::default();
-        ast_scope::collect_statement(&asts.pop().unwrap(), &mut scope);
-        if !scope.tables.is_empty() || !scope.ctes.is_empty() {
-            return scope;
+    let parsed = match sqlparser::parser::Parser::parse_sql(&*dialect.parser(), stmt) {
+        Ok(mut asts) if asts.len() == 1 => {
+            let mut scope = Scope::default();
+            ast_scope::collect_statement(&asts.pop().unwrap(), &mut scope);
+            Some(scope).filter(|s| !s.tables.is_empty() || !s.ctes.is_empty())
         }
-    }
-    Scope {
+        _ => None,
+    };
+    let mut scope = parsed.unwrap_or_else(|| Scope {
         tables: lexer_scope(sql, lo, hi, caret, dialect),
         ctes: Vec::new(),
+    });
+    let toks = tokenize_range(sql, lo, hi, dialect);
+    let mut rows = Vec::new();
+    // A trigger's `NEW` and `OLD` are rows of the table it is defined on.
+    if trigger_rows_are_records(dialect)
+        && let Some(table) = trigger_table(&toks)
+    {
+        for alias in ["new", "old"] {
+            rows.push(TableRef {
+                alias: Some(alias.to_string()),
+                ..table.clone()
+            });
+        }
     }
+    // An upsert's proposed row is a row of its target.
+    rows.extend(upsert_row_alias(&toks, dialect));
+    for r in rows {
+        if !scope.tables.contains(&r) {
+            scope.tables.push(r);
+        }
+    }
+    scope
+}
+
+/// Are `dialect`'s trigger rows the `NEW` and `OLD` records? MySQL's,
+/// PostgreSQL's and SQLite's are; SQL Server's are the `inserted` and
+/// `deleted` tables ([`pseudo_tables`]), and it has no `NEW`.
+fn trigger_rows_are_records(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => true,
+        SqlDialect::MsSql => false,
+    }
+}
+
+/// The table a `CREATE … TRIGGER name … ON [db.]table` statement is defined
+/// on — `toks` from the statement's start. A `DEFINER = …` clause, `OR
+/// REPLACE`, `TEMP` and a PostgreSQL `UPDATE OF col, …` list may sit between;
+/// the window is generous and the words are unquoted keywords. `None` for
+/// anything else.
+fn trigger_table(toks: &[Token]) -> Option<TableRef> {
+    let keyword = |t: &Token, kw: &str| {
+        !t.quoted && matches!(&t.kind, TkKind::Word(w) if w.eq_ignore_ascii_case(kw))
+    };
+    if !toks.first().is_some_and(|t| keyword(t, "CREATE")) {
+        return None;
+    }
+    let trigger = toks.iter().take(16).position(|t| keyword(t, "TRIGGER"))?;
+    let on = trigger
+        + toks[trigger..]
+            .iter()
+            .take(48)
+            .position(|t| keyword(t, "ON"))?;
+    table_name_at(toks, on + 1)
+}
+
+/// The `[db.]table` name starting at `toks[i]`, quoted parts allowed.
+fn table_name_at(toks: &[Token], mut i: usize) -> Option<TableRef> {
+    let mut parts = Vec::new();
+    while let Some(Token {
+        kind: TkKind::Word(w),
+        ..
+    }) = toks.get(i)
+    {
+        parts.push(w.clone());
+        if !matches!(toks.get(i + 1).map(|t| &t.kind), Some(TkKind::Dot)) {
+            break;
+        }
+        i += 2;
+    }
+    let name = parts.pop()?;
+    Some(TableRef {
+        name,
+        alias: None,
+        db: parts.pop(),
+    })
+}
+
+/// The name an upsert gives its **proposed row**, and the `INSERT`'s target
+/// it is a row of: PostgreSQL's and SQLite's `excluded` once there is an `ON
+/// CONFLICT`, MySQL 8's row alias — the `AS n` after the `VALUES` rows, at
+/// the statement's own depth, before `ON DUPLICATE KEY`. SQL Server writes
+/// an upsert as a `MERGE`, whose source is an ordinary table reference.
+fn upsert_row_alias(toks: &[Token], dialect: SqlDialect) -> Option<TableRef> {
+    let keyword = |t: &Token, kw: &str| {
+        !t.quoted && matches!(&t.kind, TkKind::Word(w) if w.eq_ignore_ascii_case(kw))
+    };
+    if !toks.first().is_some_and(|t| keyword(t, "INSERT")) {
+        return None;
+    }
+    let into = toks.iter().take(6).position(|t| keyword(t, "INTO"))?;
+    let target = table_name_at(toks, into + 1)?;
+    // Each token with the paren depth it sits at.
+    let mut depth = 0usize;
+    let at_depth: Vec<(usize, &Token)> = toks
+        .iter()
+        .map(|t| {
+            match t.kind {
+                TkKind::LParen => depth += 1,
+                TkKind::RParen => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+            (depth, t)
+        })
+        .collect();
+    let top = |kw: &str| at_depth.iter().position(|&(d, t)| d == 0 && keyword(t, kw));
+    let alias = match dialect {
+        SqlDialect::Postgres | SqlDialect::Sqlite => {
+            top("CONFLICT").map(|_| "excluded".to_string())
+        }
+        SqlDialect::MySql => {
+            let values = top("VALUES")?;
+            let dup = top("DUPLICATE")?;
+            (values..dup).find_map(|k| match (at_depth[k], at_depth.get(k + 1)) {
+                ((0, t), Some(&(0, next))) if keyword(t, "AS") => match &next.kind {
+                    TkKind::Word(w) => Some(w.clone()),
+                    _ => None,
+                },
+                _ => None,
+            })
+        }
+        SqlDialect::MsSql => None,
+    }?;
+    Some(TableRef {
+        alias: Some(alias),
+        ..target
+    })
 }
 
 /// AST-walk helpers: collect the table refs + CTE names from a parsed statement.
@@ -24700,6 +24824,88 @@ mod tests {
         assert_eq!(ms(sql, 9), []);
         let sql = "SELECT e.id FROM srv.company.dbo.employees e";
         assert_eq!(ms(sql, sql.len()), []);
+    }
+
+    /// **A trigger's `NEW` and `OLD` are its table's row**, so the scope holds
+    /// the table under both names and `NEW.` completes its columns — on the
+    /// engines whose trigger rows are records. SQL Server's are the
+    /// `inserted` and `deleted` tables, and it has no `NEW`.
+    #[test]
+    fn a_triggers_new_and_old_are_its_tables_row() {
+        let row = |alias: &str| TableRef {
+            name: "orders".to_string(),
+            alias: Some(alias.to_string()),
+            db: None,
+        };
+        for (d, sql) in [
+            (
+                SqlDialect::MySql,
+                "CREATE TRIGGER trg BEFORE UPDATE ON orders FOR EACH ROW SET NEW.",
+            ),
+            (
+                SqlDialect::MySql,
+                "CREATE DEFINER = `app`@`%` TRIGGER trg AFTER INSERT ON orders FOR EACH ROW \
+                 BEGIN INSERT INTO log VALUES (NEW.",
+            ),
+            (
+                SqlDialect::Sqlite,
+                "CREATE TRIGGER trg AFTER DELETE ON orders BEGIN DELETE FROM x WHERE id = OLD.",
+            ),
+            (
+                SqlDialect::Postgres,
+                "CREATE TRIGGER t BEFORE UPDATE ON orders FOR EACH ROW WHEN (NEW.",
+            ),
+        ] {
+            let tables = statement_scope(sql, 0, sql.len(), sql.len(), d).tables;
+            assert!(tables.contains(&row("new")), "{d:?}: {tables:?}");
+            assert!(tables.contains(&row("old")), "{d:?}: {tables:?}");
+        }
+        let ms = "CREATE TRIGGER trg ON orders AFTER INSERT AS SELECT * FROM inserted";
+        let tables = statement_scope(ms, 0, ms.len(), ms.len(), SqlDialect::MsSql).tables;
+        assert!(!tables.contains(&row("new")), "{tables:?}");
+        // Not a trigger: nothing added.
+        let sql = "SELECT * FROM orders WHERE ";
+        let tables = statement_scope(sql, 0, sql.len(), sql.len(), SqlDialect::MySql).tables;
+        assert!(!tables.iter().any(|t| t.alias.as_deref() == Some("new")));
+    }
+
+    /// **An upsert's proposed row is the target's row**: PostgreSQL's and
+    /// SQLite's `EXCLUDED` in `ON CONFLICT … DO UPDATE`, and MySQL 8's row
+    /// alias in `VALUES (…) AS n ON DUPLICATE KEY UPDATE`.
+    #[test]
+    fn an_upserts_proposed_row_is_its_targets_row() {
+        let row = |alias: &str| TableRef {
+            name: "orders".to_string(),
+            alias: Some(alias.to_string()),
+            db: None,
+        };
+        let scope = |sql: &str, d| statement_scope(sql, 0, sql.len(), sql.len(), d).tables;
+        let upsert = "INSERT INTO orders (id, total) VALUES (1, 2) \
+                      ON CONFLICT (id) DO UPDATE SET total = EXCLUDED.";
+        for d in [SqlDialect::Postgres, SqlDialect::Sqlite] {
+            assert!(scope(upsert, d).contains(&row("excluded")), "{d:?}");
+        }
+        let my = "INSERT INTO orders (id, total) VALUES (1, 2) AS n \
+                  ON DUPLICATE KEY UPDATE total = n.";
+        assert!(scope(my, SqlDialect::MySql).contains(&row("n")));
+        // No upsert, no row alias.
+        let plain = "INSERT INTO orders (id) VALUES (1)";
+        for d in SqlDialect::ALL {
+            assert!(
+                !scope(plain, d)
+                    .iter()
+                    .any(|t| matches!(t.alias.as_deref(), Some("excluded" | "n"))),
+                "{d:?}"
+            );
+        }
+        // `AS` inside the row is a cast's, not the alias.
+        let cast = "INSERT INTO orders (id) VALUES (CAST(1 AS SIGNED)) \
+                    ON DUPLICATE KEY UPDATE id = VALUES(id)";
+        assert!(
+            !scope(cast, SqlDialect::MySql)
+                .iter()
+                .any(|t| t.alias.as_deref() == Some("signed"))
+        );
     }
 
     /// **A reserved word quoted is a name.** The reference scanner stopped at

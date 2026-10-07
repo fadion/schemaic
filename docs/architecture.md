@@ -861,7 +861,7 @@ existing prose was left alone.
     *complete* statement with a real per-dialect AST (`sqlparser`; `SqlDialect` seam — MySQL,
     PostgreSQL and SQLite all wired) and answers what a token stream can't: `statement_scope`
     (tables/aliases/CTEs/derived-tables in scope, AST-backed with a `skip_noncode` lexer fallback for
-    mid-edit), `clause_context`/`clause_continuation` (caret context + expected-token model for
+    mid-edit, and a trigger's `NEW`/`OLD` as its table — below), `clause_context`/`clause_continuation` (caret context + expected-token model for
     completion), and `diagnostics` → `Vec<Diagnostic>` (catalog-aware unknown-table, unknown-column via
     the per-scope resolver `colres` — qualified *and* unqualified, across subqueries/derived-tables/CTEs
     with correlation, either one ending in a "did you mean" when one name is near (`nearest_name`,
@@ -1342,7 +1342,8 @@ existing prose was left alone.
     mistyped `LIKE` (`an_alias_declared_with_as_is_not_a_keyword_typo`). `is_session_source` exempts a temporary table, a table
     variable and `pseudo_tables` — T-SQL's `inserted`/`deleted`, which every trigger reads and the
     typo check also exempts — from the table check, which cannot judge absent what lives in the
-    session; the per-dialect list is empty where trigger rows are `NEW`/`OLD` records. A T-SQL
+    session; the per-dialect list is empty where trigger rows are `NEW`/`OLD` records, which
+    completion's scope supplies instead (`trigger_rows_are_records`, below). A T-SQL
     write's target may name the alias its own `FROM` defines (`UPDATE e SET … FROM employees e`),
     so `write_target_at` exempts that target alone, where `write_target_may_name_an_alias` (an
     exhaustive per-dialect `match`, SQL Server's alone — MySQL's multi-table `UPDATE` names
@@ -1376,6 +1377,30 @@ existing prose was left alone.
     database merge, as `columns_by_db` already merges them. A four-part name registers nothing in
     either reader. Diagnostics are untouched by this — they read `located_table_refs`, which was
     already database-aware.
+    **A trigger's `NEW` and `OLD` are rows of its table, and completion's scope says so.** Neither
+    reader saw them: a `CREATE TRIGGER` gives the parsed reader no tables (or does not parse
+    mid-edit), and the lexer's scope of `… ON orders FOR EACH ROW SET NEW.` on MySQL was empty, so
+    `NEW.` completed nothing. `statement_scope` now takes the parsed scope when it has tables or
+    CTEs and the lexer's otherwise, as before, and then — where `trigger_rows_are_records` (MySQL,
+    PostgreSQL, SQLite; an exhaustive `match`, false for SQL Server, whose rows are the
+    `inserted`/`deleted` tables of `pseudo_tables` and which has no `NEW`) — appends the trigger's
+    table twice, aliased `new` and `old`, skipping a reference already identical. `trigger_table`
+    reads it off the statement's tokens: an unquoted `CREATE` first, an unquoted `TRIGGER` within
+    the first 16 tokens (room for `OR REPLACE`, `TEMP`, a `DEFINER = …`), the first unquoted `ON`
+    within 48 tokens after it (room for PostgreSQL's `UPDATE OF col, …`), and the `[db.]table`
+    after that, quoted parts allowed. So MySQL's `SET NEW.`, a SQLite body's `OLD.` and
+    PostgreSQL's `WHEN (NEW.` complete the table's columns through `rank`'s ordinary alias path,
+    with nothing in `rank` changed (`a_triggers_new_and_old_are_its_tables_row`, red before; the
+    composition, `rank::tests::a_triggers_new_completes_its_tables_columns`). The two aliases are
+    in scope for **every** `statement_scope` caller inside a trigger statement, join targets
+    included, not for completion alone. Diagnostics are untouched — they read
+    `located_table_refs`, not this scope. **An upsert's proposed row is added the same way**
+    (`upsert_row_alias`): an `INSERT INTO t …` that has, at its own paren depth, an `ON CONFLICT`
+    on PostgreSQL or SQLite gets `t` aliased `excluded`, and one on MySQL with an `AS n` between
+    its `VALUES` and `ON DUPLICATE KEY` gets `t` aliased `n` — an `AS` inside the rows (a cast's)
+    is not it. SQL Server's upsert is a `MERGE`, whose source is an ordinary reference, so it gets
+    none (`an_upserts_proposed_row_is_its_targets_row`, red before). The `[db.]table` reading the
+    two share is `table_name_at`.
     The error's remedy
     names the engine's quote (backticks, double quotes, brackets); it said "backticks" on every
     engine, advice neither PostgreSQL nor SQL Server accepts
