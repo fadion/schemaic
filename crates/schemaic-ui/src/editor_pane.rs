@@ -2366,6 +2366,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         sig_point: RwSignal::new(Point::ZERO),
         ghost: RwSignal::new(None),
         word_complete: RwSignal::new(false),
+        wide: RwSignal::new(false),
     };
     let cmdk = CmdK {
         open: RwSignal::new(false),
@@ -2941,6 +2942,9 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             let space = matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::Space), _))
                 || matches!(&kp.key, KeyInput::Keyboard(Key::Character(c), _) if c.as_str() == " ");
             if space {
+                // A second Ctrl+Space, over a list already open, widens it to
+                // every database and schema (`Completion::wide`).
+                comp.wide.set(comp.open.get_untracked());
                 let adb = active_db.get_untracked();
                 editor_sig.with_untracked(|e| {
                     recompute_completions(

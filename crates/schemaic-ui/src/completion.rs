@@ -92,6 +92,10 @@ pub(crate) struct Completion {
     /// (`rank::Ranked::completes_a_word`), so Enter is a newline, not an
     /// accept of whatever longer word heads the list.
     pub(crate) word_complete: RwSignal<bool>,
+    /// **The widened list** (`rank::RankInput::wide`): set by a Ctrl+Space
+    /// while the list is already open, and kept while it stays open — the
+    /// next list that opens by typing starts narrow again.
+    pub(crate) wide: RwSignal<bool>,
 }
 
 /// The ranking vocabulary, which lives in `core::rank` — see that module for why
@@ -357,6 +361,8 @@ mod index {
         // tables by their namespace, as `intel::Catalog::build` keeps them.
         let mut columns_by_schema: HashMap<(String, String), Rc<Vec<ColMeta>>> = HashMap::new();
         let mut tables_by_schema: HashMap<String, Vec<String>> = HashMap::new();
+        // Every contributing database's tables, for the widened list.
+        let mut all_tables: Vec<rank::IndexedTable> = Vec::new();
         for node in nodes {
             if !db_contributes(hidden, &node.database, active_db) {
                 continue;
@@ -374,6 +380,11 @@ mod index {
                 let in_scope = active_db.is_none_or(|db| db.eq_ignore_ascii_case(&node.database));
                 for t in &schema.tables {
                     by_db.push(t.name.clone());
+                    all_tables.push(rank::IndexedTable {
+                        database: node.database.clone(),
+                        schema: t.schema.clone(),
+                        name: t.name.clone(),
+                    });
                     let metas = col_metas(t);
                     if in_scope && let Some(ns) = &t.schema {
                         let ns = ns.to_ascii_lowercase();
@@ -457,6 +468,7 @@ mod index {
             tables_by_db,
             columns_by_schema,
             tables_by_schema,
+            all_tables,
         }
     }
 }
@@ -1016,6 +1028,11 @@ pub(crate) fn recompute_completions(
     if !popup_may_open(force, comp.open.get_untracked(), typed) {
         return;
     }
+    // A list opening by typing is the narrow one; only Ctrl+Space over an
+    // open list widens it (`Completion::wide`), and it stays wide while open.
+    if !force && !comp.open.get_untracked() {
+        comp.wide.set(false);
+    }
     let word_lo = word_start(&text, offset);
     let prefix = text.get(word_lo..offset).unwrap_or("").to_string();
     // **A reasoned prediction takes the empty word's place** — see
@@ -1164,6 +1181,7 @@ pub(crate) fn recompute_completions(
                 .map(|db| crate::table_designer::db_flavour(db_nodes, db))
                 .unwrap_or_default(),
             local: &local,
+            wide: comp.wide.get_untracked(),
         },
     );
 
@@ -2720,6 +2738,13 @@ mod index_tests {
             ix.tables_by_schema.get("sales"),
             Some(&vec!["orders".to_string()])
         );
+        // The widened list's pool holds every database's, with its namespace.
+        assert!(ix.all_tables.contains(&rank::IndexedTable {
+            database: "archive".to_string(),
+            schema: Some("old".to_string()),
+            name: "orders".to_string(),
+        }));
+        assert_eq!(ix.all_tables.len(), 3);
     }
 
     #[test]

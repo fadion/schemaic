@@ -544,6 +544,31 @@ pub fn qualified_table_name(
     }
 }
 
+/// How a session whose database is `active_db` names `table` of `database`
+/// — [`qualified_table_name`]'s spelling, and on SQL Server the database in
+/// front when it is another one (`db.schema.table`, three-part names being
+/// how T-SQL reads across databases). `None` where no statement can reach it:
+/// PostgreSQL, whose connection is one database. What completion's widened
+/// list inserts.
+pub fn table_name_from(
+    dialect: SqlDialect,
+    active_db: Option<&str>,
+    database: &str,
+    schema: Option<&str>,
+    table: &str,
+) -> Option<String> {
+    let another = active_db.is_some_and(|a| !a.eq_ignore_ascii_case(database));
+    let here = qualified_table_name(dialect, database, schema, table);
+    match dialect {
+        SqlDialect::MySql | SqlDialect::Sqlite => Some(here),
+        SqlDialect::MsSql if another => {
+            Some(format!("{}.{here}", quote_if_needed(database, dialect)))
+        }
+        SqlDialect::MsSql => Some(here),
+        SqlDialect::Postgres => (!another).then_some(here),
+    }
+}
+
 /// The `SELECT` Schemaic generates for a table — opening one from the schema
 /// tree, and the AI's bottom-sample.
 ///
@@ -659,6 +684,42 @@ mod tests {
             "dbo.Orders"
         );
         assert_eq!(qualified_table_name(ms, "app", None, "t"), "t");
+    }
+
+    /// How a session in one database reaches a table: MySQL by its database,
+    /// SQL Server by its schema — and its database too when it is another —
+    /// PostgreSQL by its schema and never in another database, SQLite bare.
+    #[test]
+    fn a_table_is_named_from_the_sessions_database() {
+        use SqlDialect::{MsSql, MySql, Postgres, Sqlite};
+        let from = |d, db, ns, t| table_name_from(d, Some("app"), db, ns, t);
+        assert_eq!(
+            from(MySql, "app", None, "orders").as_deref(),
+            Some("app.orders")
+        );
+        assert_eq!(
+            from(MySql, "shop", None, "order").as_deref(),
+            Some("shop.`order`")
+        );
+        assert_eq!(
+            from(MsSql, "app", Some("dbo"), "Orders").as_deref(),
+            Some("dbo.Orders")
+        );
+        assert_eq!(
+            from(MsSql, "Archive DB", Some("sales"), "Orders").as_deref(),
+            Some("[Archive DB].sales.Orders")
+        );
+        assert_eq!(
+            from(Postgres, "app", Some("sales"), "orders").as_deref(),
+            Some("sales.orders")
+        );
+        assert_eq!(from(Postgres, "other", Some("public"), "orders"), None);
+        assert_eq!(from(Sqlite, "main", None, "t").as_deref(), Some("t"));
+        // With no session database, nothing can be "another" one.
+        assert_eq!(
+            table_name_from(MsSql, None, "x", Some("dbo"), "t").as_deref(),
+            Some("dbo.t")
+        );
     }
 
     /// **A `$` may follow a name's first character, not be it.** T-SQL reads a

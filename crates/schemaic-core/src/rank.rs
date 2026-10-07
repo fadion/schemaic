@@ -150,6 +150,18 @@ pub struct SchemaIndex {
     /// schema (lowercase) → its table names, the tab's own database only —
     /// `sales.|`.
     pub tables_by_schema: HashMap<String, Vec<String>>,
+    /// Every table of every database that contributes, with its namespace —
+    /// what the widened list ([`RankInput::wide`]) names, each through
+    /// [`crate::filter::table_name_from`].
+    pub all_tables: Vec<IndexedTable>,
+}
+
+/// One table as [`SchemaIndex::all_tables`] holds it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexedTable {
+    pub database: String,
+    pub schema: Option<String>,
+    pub name: String,
 }
 
 /// One snippet-abbrev row, as ranking needs it: what the row shows, its snippet's
@@ -240,6 +252,10 @@ pub struct RankInput<'a> {
     pub flavour: crate::schema::ServerFlavour,
     /// The statement's own CTEs and select-list aliases.
     pub local: &'a LocalNames,
+    /// **The widened list**, a second Ctrl+Space: at a table slot, every
+    /// table of every database and schema too, each inserted fully qualified
+    /// ([`SchemaIndex::all_tables`]).
+    pub wide: bool,
 }
 
 /// Rank the candidates a caret position offers.
@@ -680,6 +696,41 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
                         "",
                         table_tier + 1,
                     );
+                }
+            }
+            // The widened list: every table of every database and schema,
+            // under the tab's own, each inserting the reference that reaches
+            // it from here — and none PostgreSQL could not reach. The row
+            // shows that reference with its quotes off, and is matched by it.
+            if input.wide {
+                for t in &schema.all_tables {
+                    let Some(reach) = crate::filter::table_name_from(
+                        input.dialect,
+                        active_db,
+                        &t.database,
+                        t.schema.as_deref(),
+                        &t.name,
+                    ) else {
+                        continue;
+                    };
+                    let shown: String = reach
+                        .chars()
+                        .filter(|c| !matches!(c, '`' | '"' | '[' | ']'))
+                        .collect();
+                    let before = cands.len();
+                    add(
+                        &mut cands,
+                        &mut seen,
+                        &shown,
+                        SuggestKind::Table,
+                        &t.database,
+                        plain_tier + 1,
+                    );
+                    if cands.len() > before
+                        && let Some(c) = cands.last_mut()
+                    {
+                        c.insert = Some(reach);
+                    }
                 }
             }
         }
@@ -1150,6 +1201,7 @@ mod tests {
                 dialect,
                 flavour,
                 local: &LocalNames::default(),
+                wide: false,
             },
         )
         .into_iter()
@@ -1180,6 +1232,7 @@ mod tests {
                     dialect,
                     flavour: ServerFlavour::Unknown,
                     local: &LocalNames::default(),
+                    wide: false,
                 },
             )
             .into_iter()
@@ -1337,6 +1390,61 @@ mod tests {
         assert!(!offers(&rows, "PARTITION"), "{rows:?}");
     }
 
+    /// **The widened list** names every database's and schema's tables at a
+    /// table slot, each inserting the reference that reaches it from the tab's
+    /// database — and nothing PostgreSQL could not reach. Without it, the
+    /// list is the tab's own.
+    #[test]
+    fn the_widened_list_offers_every_table_fully_qualified() {
+        let mut s = shop();
+        let t = |db: &str, ns: Option<&str>, n: &str| IndexedTable {
+            database: db.to_string(),
+            schema: ns.map(str::to_string),
+            name: n.to_string(),
+        };
+        s.all_tables = vec![
+            t("shop", Some("dbo"), "orders"),
+            t("archive", Some("old"), "orders"),
+        ];
+        let rows = |d, wide| {
+            let cont = Continuation::default();
+            let used = HashSet::new();
+            rank(
+                &s,
+                &RankInput {
+                    ctx: &ClauseCtx::Table,
+                    cont: &cont,
+                    scope: &[],
+                    prefix: "ord",
+                    snippets: &[],
+                    join_targets: &[],
+                    star: None,
+                    used: &used,
+                    active_db: Some("shop"),
+                    dialect: d,
+                    flavour: ServerFlavour::Unknown,
+                    local: &LocalNames::default(),
+                    wide,
+                },
+            )
+        };
+        let ms = rows(SqlDialect::MsSql, true);
+        let other = ms
+            .iter()
+            .find(|r| r.text == "archive.old.orders")
+            .expect("{ms:?}");
+        assert_eq!(other.insert.as_deref(), Some("archive.old.orders"));
+        assert!(ms.iter().any(|r| r.insert.as_deref() == Some("dbo.orders")));
+        assert!(ms.iter().any(|r| r.text == "orders"), "the bare row stays");
+        let pg = rows(SqlDialect::Postgres, true);
+        assert!(pg.iter().all(|r| !r.text.starts_with("archive")), "{pg:?}");
+        assert!(
+            rows(SqlDialect::MsSql, false)
+                .iter()
+                .all(|r| !r.text.contains('.'))
+        );
+    }
+
     /// **A schema-qualified table has columns.** On PostgreSQL and SQL Server
     /// `sales.orders` reads as `TableRef.db = sales`, and `sales` is a
     /// namespace in the tab's database, not a database: the lookup keyed by
@@ -1435,6 +1543,7 @@ mod tests {
                     dialect: SqlDialect::Postgres,
                     flavour: ServerFlavour::Unknown,
                     local: &names,
+                    wide: false,
                 },
             )
         };
@@ -1545,6 +1654,7 @@ mod tests {
                     dialect,
                     flavour: ServerFlavour::Unknown,
                     local: &LocalNames::default(),
+                    wide: false,
                 },
             )
             .into_iter()
@@ -1609,6 +1719,7 @@ mod tests {
                 dialect: SqlDialect::MySql,
                 flavour: ServerFlavour::Unknown,
                 local: &LocalNames::default(),
+                wide: false,
             },
         )
         .completes_a_word
@@ -1808,6 +1919,7 @@ mod tests {
                 dialect: SqlDialect::MySql,
                 flavour: ServerFlavour::Unknown,
                 local: &LocalNames::default(),
+                wide: false,
             },
         )
         .into_iter()
@@ -1848,6 +1960,7 @@ mod tests {
                     dialect: SqlDialect::MySql,
                     flavour: ServerFlavour::Unknown,
                     local: &LocalNames::default(),
+                    wide: false,
                 },
             )
             .into_iter()
@@ -1909,6 +2022,7 @@ mod tests {
                     dialect: SqlDialect::MySql,
                     flavour: ServerFlavour::Unknown,
                     local: &LocalNames::default(),
+                    wide: false,
                 },
             )
         };
@@ -1976,6 +2090,7 @@ mod tests {
                 dialect: SqlDialect::MySql,
                 flavour: ServerFlavour::Unknown,
                 local: &LocalNames::default(),
+                wide: false,
             },
         );
         let email = out.iter().find(|s| s.text == "email").expect("offered");
@@ -2015,6 +2130,7 @@ mod tests {
                     dialect: SqlDialect::MySql,
                     flavour: ServerFlavour::Unknown,
                     local: &LocalNames::default(),
+                    wide: false,
                 },
             )
         };
@@ -2059,6 +2175,7 @@ mod tests {
                 dialect: SqlDialect::MySql,
                 flavour: ServerFlavour::Unknown,
                 local: &LocalNames::default(),
+                wide: false,
             },
         )
         .into_iter()
@@ -2104,6 +2221,7 @@ mod tests {
                 dialect: SqlDialect::MySql,
                 flavour: ServerFlavour::Unknown,
                 local: &LocalNames::default(),
+                wide: false,
             },
         );
         let first = out.first().expect("something is offered");
@@ -2170,6 +2288,7 @@ mod tests {
                 dialect: SqlDialect::MySql,
                 flavour: ServerFlavour::Unknown,
                 local: &LocalNames::default(),
+                wide: false,
             },
         );
         let first = out.first().expect("something is offered");

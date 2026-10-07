@@ -21396,6 +21396,7 @@ mod tests {
                     dialect: SqlDialect::MySql,
                     flavour,
                     local: &crate::rank::LocalNames::default(),
+                    wide: false,
                 },
             )
             .into_iter()

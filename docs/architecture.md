@@ -13018,6 +13018,15 @@ existing prose was left alone.
       operation an `ORDER BY` takes the first arm's names and a `HAVING` its own arm's
       (`order_by_and_having_see_the_select_lists_aliases`). `ctes_at` is `cte_names`' walk
       (`cte_name_tokens`) with each name's spelling kept.
+      **A second Ctrl+Space widens the table list** (`RankInput::wide`): every table of every
+      contributing database and schema (`SchemaIndex::all_tables`), under the tab's own list, each
+      **fully qualified** — `filter::table_name_from` gives the reference that reaches it from the
+      tab's database: MySQL's `db.t`, SQL Server's `schema.t` and `db.schema.t` from another
+      database, PostgreSQL's `schema.t` and nothing from another database, which its connection
+      cannot reach (`the_widened_list_offers_every_table_fully_qualified`,
+      `a_table_is_named_from_the_sessions_database`). The row shows the reference with its quotes
+      off and is matched by it. In the UI `Completion::wide` is set by a Ctrl+Space over an open
+      list, kept while it stays open, and cleared when a list next opens by typing.
       **`add` asks `worth_offering` before it builds anything, which is `add_col`'s shape adopted
       for `add_col`'s reason.** A PostgreSQL tab offers 863 builtins where a MySQL 8 one offers 341
       (`FUNCTIONS`' 463 less `MARIADB_ONLY`, which contains every `DEPRECATED_ALIASES` name), and
