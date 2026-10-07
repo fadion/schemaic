@@ -2876,6 +2876,18 @@ fn export_column_csv(gs: GridState, ci: usize) -> String {
     schemaic_core::export::export_column_csv(&rs, order.as_slice(), ci)
 }
 
+fn export_column_in_list(gs: GridState, ci: usize) -> String {
+    let (rs, order) = exported_rows(gs);
+    schemaic_core::export::export_column_in_list(&rs, order.as_slice(), ci, gs.dialect)
+}
+
+/// The rows the gutter menu was opened on as `VALUES` tuples — the rows
+/// [`render_rows_at`] resolves for every other *Copy as* entry.
+fn export_values_at(gs: GridState, pos: usize) -> String {
+    let (rs, order) = exported_rows_at(gs, pos);
+    schemaic_core::export::export_values(&rs, order.as_slice(), gs.dialect)
+}
+
 /// The Download icon's menu: a format per entry, or — when there is more of the
 /// result than the grid fetched — a scope step in front of them.
 ///
@@ -9575,6 +9587,17 @@ fn gutter_menu(gs: GridState, pos: usize, pending: Option<usize>) -> Vec<MenuEnt
                         }
                     })
                 })
+                // The rows without the `INSERT` around them, for a `VALUES`
+                // the user is writing.
+                .chain(std::iter::once(MenuEntry::action(
+                    "SQL VALUES",
+                    move || {
+                        let text = export_values_at(gs, pos);
+                        if !text.is_empty() {
+                            let _ = floem::Clipboard::set_contents(text);
+                        }
+                    },
+                )))
                 .collect(),
         ),
     ];
@@ -10024,6 +10047,13 @@ fn header_cell(
                     }),
                     MenuEntry::action("JSON", move || {
                         let _ = floem::Clipboard::set_contents(export_column_json(gs, ci));
+                    }),
+                    // Empty when every value is NULL — `IN ()` is no list.
+                    MenuEntry::action("SQL IN list", move || {
+                        let text = export_column_in_list(gs, ci);
+                        if !text.is_empty() {
+                            let _ = floem::Clipboard::set_contents(text);
+                        }
                     }),
                 ],
             ));
@@ -11600,6 +11630,8 @@ mod cell_preview_tests {
             "fn render_rows_at(",
             "fn export_column_json(",
             "fn export_column_csv(",
+            "fn export_column_in_list(",
+            "fn export_values_at(",
             "fn save_export(",
             "fn export_menu(",
         ] {
@@ -11647,6 +11679,14 @@ mod cell_preview_tests {
         assert!(
             !f.contains("exported_rows(gs)") && !f.contains("insert_blocks_all("),
             "`render_rows_at` renders the whole result:\n{f}"
+        );
+        // The same menu's *SQL VALUES*, held to the same scope.
+        let at = body.find("fn export_values_at(").expect("export_values_at");
+        let end = body[at..].find("\n}").expect("no end");
+        let f = &body[at..at + end];
+        assert!(
+            f.contains("exported_rows_at(gs, pos)") && !f.contains("exported_rows(gs)"),
+            "`export_values_at` no longer copies just the rows the gesture named:\n{f}"
         );
         // **The file's `INSERT`s are the clipboard's blocks.** `exported_rows`
         // satisfies the resolution check above and still has a pending ＋Row's

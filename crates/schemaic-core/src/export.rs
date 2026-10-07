@@ -871,7 +871,8 @@ pub fn typed_literal(v: &Value, type_name: &str, dialect: SqlDialect) -> String 
 
 /// [`typed_literal`] for a statement written into a **script** — a file or a
 /// copy someone may run with the engine's command-line client: the SQL
-/// export, *Copy as SQL INSERT* and a dump's rows.
+/// export, *Copy as SQL INSERT*, the grid's *SQL IN list* and *SQL VALUES*
+/// copies, and a dump's rows.
 ///
 /// **`sqlcmd` rewrites `$(name)` inside a string literal**, from its
 /// scripting variables and the environment of the shell running it, and
@@ -1474,6 +1475,66 @@ pub fn export_column_csv_to<W: Write>(
         w.write_all(b"\n")?;
     }
     Ok(())
+}
+
+/// One column's values as the parenthesised list an `IN` takes — `(1, 2, 3)`
+/// — each distinct value once, in `order`, as `dialect`'s literal for the
+/// column's type ([`script_literal`], since it is pasted wherever *Copy as SQL
+/// INSERT* is, a `sqlcmd` script included). A NULL is left out: `x IN (NULL)`
+/// matches nothing, and a NULL in a `NOT IN` list makes it match nothing at
+/// all. So is a withheld binary cell. Empty when no value is left, since
+/// `IN ()` is a syntax error and the caller then leaves the clipboard alone.
+pub fn export_column_in_list(
+    rs: &ResultSet,
+    order: &[usize],
+    ci: usize,
+    dialect: SqlDialect,
+) -> String {
+    let Some(col) = rs.columns.get(ci) else {
+        return String::new();
+    };
+    let mask = binary_mask(rs, &dropped_binary_columns(rs, order));
+    let mut seen = std::collections::HashSet::new();
+    let items: Vec<String> = order
+        .iter()
+        .filter_map(|&di| rs.cell(di, ci))
+        .filter(|c| !c.is_null() && !withheld_binary(&mask, ci, c))
+        .map(|c| script_literal(&c.to_value(), &col.type_name, dialect))
+        .filter(|lit| seen.insert(lit.clone()))
+        .collect();
+    if items.is_empty() {
+        return String::new();
+    }
+    format!("({})", items.join(", "))
+}
+
+/// The rows of `order` as the tuples a `VALUES` takes, one per line and
+/// comma-separated — the rows *Copy as SQL INSERT* writes, without the
+/// statement around them, for pasting after a `VALUES` the user has written,
+/// through the same [`script_literal`]. A NULL, and a withheld binary cell, is
+/// `NULL` — and so is a pending row's unset cell, which the caller's rows
+/// already hold as one: a tuple cannot leave a column out.
+pub fn export_values(rs: &ResultSet, order: &[usize], dialect: SqlDialect) -> String {
+    let mask = binary_mask(rs, &dropped_binary_columns(rs, order));
+    order
+        .iter()
+        .filter(|&&di| di < rs.row_count())
+        .map(|&di| {
+            let cells: Vec<String> = rs
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(ci, col)| match rs.cell(di, ci) {
+                    Some(c) if !withheld_binary(&mask, ci, &c) => {
+                        script_literal(&c.to_value(), &col.type_name, dialect)
+                    }
+                    _ => "NULL".to_string(),
+                })
+                .collect();
+            format!("({})", cells.join(", "))
+        })
+        .collect::<Vec<_>>()
+        .join(",\n")
 }
 
 /// The whole result as CSV (header row + data rows; NULL → empty field).
@@ -6719,6 +6780,62 @@ mod tests {
         // Column 0 (id): 1, then NULL → blank line.
         let out = export_column_csv(&rs(), &[0, 1], 0);
         assert_eq!(out, "1\n\n");
+    }
+
+    /// A column as the list an `IN` takes: each value once, in the grid's
+    /// order, as this engine's literal. A NULL is left out — `x IN (NULL)`
+    /// matches nothing, and `NOT IN` with one matches nothing at all.
+    #[test]
+    fn a_column_copies_as_an_in_list() {
+        let rs = ResultSet::from_rows(
+            vec![col("id"), col("name")],
+            vec![
+                vec![Value::Int(2), Value::Str("O'Brien".to_string())],
+                vec![Value::Int(1), Value::Null],
+                vec![Value::Int(2), Value::Str("a\\b".to_string())],
+            ],
+        );
+        assert_eq!(export_column_in_list(&rs, &[0, 1, 2], 0, MySql), "(2, 1)");
+        assert_eq!(export_column_in_list(&rs, &[1, 0, 2], 0, MySql), "(1, 2)");
+        assert_eq!(
+            export_column_in_list(&rs, &[0, 1, 2], 1, MySql),
+            "('O''Brien', 'a\\\\b')"
+        );
+        assert_eq!(
+            export_column_in_list(&rs, &[0, 1, 2], 1, MsSql),
+            "(N'O''Brien', N'a\\b')"
+        );
+        // Nothing but NULLs is no list: `IN ()` is a syntax error.
+        assert_eq!(export_column_in_list(&rs, &[1], 1, Postgres), "");
+        assert_eq!(export_column_in_list(&rs, &[], 0, Postgres), "");
+    }
+
+    /// Rows as the tuples a `VALUES` takes, one per line, a NULL as `NULL`
+    /// — the rows of *Copy as SQL INSERT* without the statement around them.
+    #[test]
+    fn rows_copy_as_values_tuples() {
+        assert_eq!(
+            export_values(&rs(), &[0, 1], Sqlite),
+            "(1, 'x'),\n(NULL, 'y')"
+        );
+        assert_eq!(export_values(&rs(), &[1], MsSql), "(NULL, N'y')");
+        assert_eq!(export_values(&rs(), &[], MySql), "");
+    }
+
+    /// Both copies are pasted where *Copy as SQL INSERT* is — possibly into a
+    /// script `sqlcmd` runs — so a `$(` is cut as `script_literal` cuts it.
+    #[test]
+    fn the_in_list_and_values_copies_keep_sqlcmd_out_of_a_value() {
+        let rs = ResultSet::from_rows(
+            vec![col("v")],
+            vec![vec![Value::Str("cost $(HOME)".to_string())]],
+        );
+        let want = "(N'cost $' + N'(HOME)')";
+        assert_eq!(
+            export_column_in_list(&rs, &[0], 0, MsSql),
+            format!("({want})")
+        );
+        assert_eq!(export_values(&rs, &[0], MsSql), format!("({want})"));
     }
 
     #[test]

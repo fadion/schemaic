@@ -3744,6 +3744,26 @@ existing prose was left alone.
     and the gutter's *Copy as* of those — which puts the caveat on `commit_note` through
     `export_note(…, "the clipboard", false)`; the clipboard used to write `null` or an empty field
     for a withheld blob and say nothing, and a JSON `null` reads as a NULL.
+    **`export_column_in_list(rs, order, ci, dialect)` and `export_values(rs, order, dialect)` are
+    two clipboard shapes with no `ExportFormat` variant**, like `export_jsonl`: the enum is matched
+    exhaustively by the Download and streaming paths, and these are copies, never files. The first
+    is one column as the list an `IN` takes — `(2, 1)` — each distinct value once, in `order`, as
+    `script_literal` writes it for the column's type, so a SQL Server `datetime` keeps its day under
+    a day-first login, a string is `N'…'` there and MySQL's backslash doubles; *distinct* is judged
+    on the rendered literal. **A NULL is left out, not written**: `x IN (NULL)` matches nothing, and
+    a NULL in a `NOT IN` list makes it match nothing at all. A withheld binary cell is left out too.
+    With nothing left the answer is the empty string, because `IN ()` is a syntax error, and the
+    caller then leaves the clipboard alone (`a_column_copies_as_an_in_list`). The second is the
+    rows as `VALUES` tuples — what *Copy as SQL INSERT* writes, without the statement around it —
+    one per line and comma-separated, a NULL and a withheld binary cell both `NULL`
+    (`rows_copy_as_values_tuples`). **Both take `script_literal`, as *Copy as SQL INSERT* does**:
+    a copy lands wherever it is pasted, a `sqlcmd` script included, so a SQL Server value holding
+    `$(` is cut there as it is in the `INSERT`
+    (`the_in_list_and_values_copies_keep_sqlcmd_out_of_a_value`). **And a tuple cannot leave a column
+    out**: a pending ＋Row's unset cell reaches it from `exported_rows_at` as `NULL` — the rendering
+    `insert_blocks_at` exists to avoid — so such a row, pasted after an `INSERT … VALUES`, writes
+    NULL over the column's default. Neither puts a withheld-column caveat on `commit_note`; nor do
+    the column's CSV and JSON copies.
     **`insert_shape(rs, tab)` is where an `INSERT` export lands, and it reads the result rather than
     the tab.** A grid tab's `source` is the table it was *opened* on and is kept however its text is
     edited, so a tab opened on `users` and rerun as `SELECT … FROM customers` exported
@@ -15636,8 +15656,9 @@ existing prose was left alone.
   the ISO `T` form (`export::language_safe_datetime`: `2026-01-02T00:00:00.000`, a bare date as
   midnight), which every language reads the same — **core's, because the same text reaches SQL by
   three other roads**: `export::typed_literal`, behind every `INSERT` the export renderer writes
-  (the SQL export, *Copy as SQL INSERT*, a dump's rows) and the grid's *Filter by / Exclude this
-  value*, which wrote `N'2026-01-02 10:30:00.000'` and so pasted or filtered February for January
+  (the SQL export, *Copy as SQL INSERT*, a dump's rows — and the grid's *SQL IN list* and *SQL
+  VALUES* copies, which are its literals without the statement, through `script_literal`) and the grid's *Filter by /
+  Exclude this value*, which wrote `N'2026-01-02 10:30:00.000'` and so pasted or filtered February for January
   (`a_copied_insert_and_a_cell_filter_keep_their_day_under_a_day_first_language`); the predicate
   all four ask is `export::reads_dates_by_language`. The column's type comes from the same `ColumnFacts` the
   guards read, so `refetch_on` and `blob_on` read them too, and the import rewrites each batch
@@ -34292,8 +34313,9 @@ this bundle's.
   the save dialog opens, for the reason the statement beside it is snapshotted: the dialog is modal
   and slow, and an edit typed while it stands open must not change what was asked for. The gate is
   `no_export_path_renders_the_unresolved_result`, which lists every export path — those four,
-  `export_menu` (whose `Fetched rows (N)` label counts what the file will hold) and the gutter
-  menu's *Copy as* — holds each to one of three resolvers, and holds every resolver, the
+  `export_menu` (whose `Fetched rows (N)` label counts what the file will hold), the header's
+  *SQL IN list* (`export_column_in_list`) and the gutter menu's *Copy as* (`render_rows_at`, and
+  `export_values_at` for its *SQL VALUES*) — holds each to one of three resolvers, and holds every resolver, the
   `INSERT` pair `insert_blocks_at`/`insert_blocks_all` included, to `grid_cells`; fixing one of
   four is exactly how this class came back. The resolvers are
   `exported_rows`, its count-only half `exported_row_count` (what `export_menu` needs, with
@@ -34303,7 +34325,8 @@ this bundle's.
   contain `exported_rows_at(gs, pos)` and `insert_blocks_at(gs, pos)` and neither
   `exported_rows(gs)` nor `insert_blocks_all(`, because any resolver passed the first check, and
   `exported_rows(gs)` swapped in copied the whole result — up to the row cap — off a right-click
-  on one row with the suite green. It shares `render_order`
+  on one row with the suite green. `export_values_at`, the same menu's *SQL VALUES*, is held to
+  that scope too: `exported_rows_at(gs, pos)` and never `exported_rows(gs)`. It shares `render_order`
   with `render_export`, so a row copy and the whole-result copy cannot render a format differently.
   An `INSERT` reaches it through `render_inserts`, which renders each of `insert_blocks_*`'s blocks
   (see `core::edit`: a pending row's unset cells are left out rather than written `NULL`) and joins
@@ -34383,8 +34406,9 @@ this bundle's.
 - **Right-click menus** (generic `menu_panel` / `ui.popup_menu`): a header offers flat `Copy name`
   (the name the header shows — the alias where the query gave one) and `Copy qualified name`
   (`database.<display_name(schema, table)>.column`, the schema tree column entry's shape, offered
-  only when the column has a `model::ColumnOrigin`), then `Copy values › CSV / JSON` of that
-  column's values (`export_column_csv`/`_json`). The two names differ on an aliased base column:
+  only when the column has a `model::ColumnOrigin`), then `Copy values › CSV / JSON / SQL IN list`
+  of that column's values (`export_column_csv`/`_json`/`_in_list` — the last copies nothing when
+  no non-NULL value is left, `IN ()` being no list). The two names differ on an aliased base column:
   the origin survives an alias, so the qualified entry is offered there and copies the base
   column's real name (`ColumnOrigin::column`), not the alias. A data cell offers `View`,
   `Edit` (editable
@@ -34464,7 +34488,9 @@ this bundle's.
   copies the rows on screen in screen order, staged values and pending rows included — and, when
   the click is inside a highlighted block, only the block's columns in drawn order, which is what
   the *Copy* beside it takes; SQL goes through `insert_blocks_at` instead (the export bullet above
-  says why). Its row
+  says why). *SQL VALUES* follows the list and is not one of its formats: the same rows as bare
+  tuples, through `export_values_at` → `exported_rows_at` (`core::export`'s entry has what it does
+  with a pending row's unset cells). Its row
   actions take **every selected row** (`selected_data_rows` → `set_rows_deleted` /
   `clone_rows`) and count them in the label: the same menu naming five rows in one entry and acting
   on one in the next is how four deletions go missing unnoticed. **`set_rows_deleted` batches, and
