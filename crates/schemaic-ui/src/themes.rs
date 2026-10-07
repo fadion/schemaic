@@ -644,6 +644,9 @@ pub struct EditorTheme {
     pub function: Color,
     pub type_: Color,
     pub constant: Color,
+    /// A variable (`@x`) or a `:name` placeholder — the palette's own colour
+    /// for a parameter.
+    pub variable: Color,
     /// Wavy underline under a misspelled keyword.
     pub underline: Color,
     /// Wavy underline under a *definite* diagnostic error (unknown table or
@@ -669,6 +672,7 @@ impl EditorTheme {
             function: c("#61AFEF"),
             type_: c("#E5C07B"),
             constant: c("#56B6C2"),
+            variable: c("#E06C75"),
             underline: c("#7E6E11"),
             diag_error: c("#E06C75"),
         }
@@ -689,6 +693,7 @@ impl EditorTheme {
             function: c("#7AA2F7"),
             type_: c("#E0AF68"),
             constant: c("#2AC3DE"),
+            variable: c("#F7768E"),
             underline: c("#8A6D3B"),
             diag_error: c("#F7768E"),
         }
@@ -709,6 +714,7 @@ impl EditorTheme {
             function: c("#1E66F5"),
             type_: c("#DF8E1D"),
             constant: c("#04A5E5"),
+            variable: c("#E64553"),
             underline: c("#DF8E1D"),
             diag_error: c("#D20F39"),
         }

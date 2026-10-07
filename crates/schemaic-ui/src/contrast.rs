@@ -954,11 +954,12 @@ mod tests {
                 crate::theme::set_editor(ed_kind);
                 let bg = crate::theme::preview_bg();
                 let ed = crate::theme::editor_theme();
-                let tokens: [(&str, Color, Legibility); 5] = [
+                let tokens: [(&str, Color, Legibility); 6] = [
                     ("keyword", ed.keyword, Legibility::Recessive),
                     ("string", ed.string, Legibility::Recessive),
                     ("number", ed.number, Legibility::Recessive),
                     ("comment", ed.comment, Legibility::Recessive),
+                    ("variable", ed.variable, Legibility::Recessive),
                     // The identifiers — most of the text, and the panel's body.
                     (
                         "the base text",

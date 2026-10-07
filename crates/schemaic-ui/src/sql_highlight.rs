@@ -34,6 +34,8 @@ enum Tok {
     Str,
     Number,
     Comment,
+    /// A variable (`@x`, `@@version`) or a `:name` placeholder.
+    Variable,
 }
 
 impl Tok {
@@ -46,6 +48,7 @@ impl Tok {
             Tok::Str => t.string,
             Tok::Number => t.number,
             Tok::Comment => t.comment,
+            Tok::Variable => t.variable,
         }
     }
 }
@@ -455,8 +458,35 @@ fn lex_line(line: &str, dialect: SqlDialect, start_in_block: bool) -> Vec<(usize
         i = hi;
     }
 
+    // The `:name` placeholders the parameters bar fills, by its own rule
+    // (`params::scan`) — which already tells a cast, a `:=` and a slice from
+    // one — over the line from where code starts.
+    let from = i;
+    let mut params = if line[from..].contains(':') {
+        schemaic_core::params::scan(&line[from..], dialect)
+    } else {
+        Vec::new()
+    }
+    .into_iter()
+    .map(|p| (from + p.start, from + p.end))
+    .peekable();
+
     while i < n {
         let c = b[i];
+
+        // One the lexer has stepped past is not waited for, or it would hold
+        // back every placeholder after it on the line.
+        while params.peek().is_some_and(|&(lo, _)| lo < i) {
+            params.next();
+        }
+        if let Some(&(lo, hi)) = params.peek()
+            && lo == i
+        {
+            params.next();
+            out.push((lo, hi, Tok::Variable));
+            i = hi;
+            continue;
+        }
 
         // A string, identifier, dollar-quote, or comment: color by which one it
         // is — asked of `core::sql::noncode_kind`, which answers with the same
@@ -489,11 +519,15 @@ fn lex_line(line: &str, dialect: SqlDialect, start_in_block: bool) -> Vec<(usize
         }
         // A variable — T-SQL's and MySQL's `@x`, `@@version` — or a T-SQL
         // temporary table (`#t`, `##t`) is a name, so `@select` and `#order`
-        // keep the default colour.
+        // are no keywords. The variable wears the variable colour; the table
+        // keeps the default, as a bare one does.
         if c == b'@' || t_sql_name_prefix(b, i, dialect) > 0 {
             let mut j = i + 1;
             while j < n && (matches!(b[j], b'@' | b'#') || is_word_byte(b[j])) {
                 j += 1;
+            }
+            if c == b'@' {
+                out.push((i, j, Tok::Variable));
             }
             i = j;
             continue;
@@ -696,6 +730,7 @@ mod tests {
                         | (Tok::Str, "string")
                         | (Tok::Keyword, "keyword")
                         | (Tok::Number, "number")
+                        | (Tok::Variable, "variable")
                 )
             })
             .map(|(s, e, _)| line[s..e].to_string())
@@ -745,6 +780,45 @@ mod tests {
             spans_of("SELECT a$from FROM t", Postgres, "keyword"),
             ["SELECT", "FROM"]
         );
+    }
+
+    /// A variable — `@x`, `@@version` — and a `:name` placeholder the
+    /// parameters bar fills (`params::scan`) wear the variable colour; a
+    /// PostgreSQL cast, MySQL's `:=`, an array slice and a `:name` in a string
+    /// do not, nor a T-SQL temporary table.
+    #[test]
+    fn variables_and_placeholders_are_coloured() {
+        use SqlDialect::{MsSql, MySql, Postgres};
+        assert_eq!(
+            spans_of("SELECT @total, @@version FROM #t", MsSql, "variable"),
+            ["@total", "@@version"]
+        );
+        assert_eq!(spans_of("SET @n := 1", MySql, "variable"), ["@n"]);
+        assert_eq!(
+            spans_of(
+                "SELECT * FROM t WHERE id = :id LIMIT :limit",
+                MySql,
+                "variable"
+            ),
+            [":id", ":limit"]
+        );
+        assert_eq!(
+            spans_of(
+                "SELECT * FROM t WHERE id = :id LIMIT :limit",
+                MySql,
+                "keyword"
+            ),
+            ["SELECT", "FROM", "WHERE", "LIMIT"],
+            "a placeholder named like a keyword is a placeholder"
+        );
+        assert!(spans_of("SELECT id::text, a[lo:hi], ':x'", Postgres, "variable").is_empty());
+        let in_block = lex_line("WHERE id = :id */ AND a = :b", MySql, true);
+        let vars: Vec<_> = in_block
+            .iter()
+            .filter(|(_, _, t)| matches!(t, Tok::Variable))
+            .map(|&(s, e, _)| &"WHERE id = :id */ AND a = :b"[s..e])
+            .collect();
+        assert_eq!(vars, [":b"], "past a block comment's end only");
     }
 
     /// A number is coloured whole — exponent, hex — and a literal's prefix

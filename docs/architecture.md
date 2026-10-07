@@ -24973,7 +24973,14 @@ existing prose was left alone.
     correctly matches nothing. A word runs on through `sql::continues_name` (`a$from` is one name),
     a word straight after a `.` is a member, and a variable (`@x`, `@@version`) or a T-SQL temporary
     table (`sql::t_sql_name_prefix`: `#t`, `##t`) is a name — none is a keyword however it is spelled
-    (`a_keyword_spelling_after_a_dot_an_at_or_in_a_dollar_name_is_not_coloured`). A number is
+    (`a_keyword_spelling_after_a_dot_an_at_or_in_a_dollar_name_is_not_coloured`). The variable
+    then wears the editor theme's `variable` colour — it used only to be kept from being a keyword —
+    while the temporary table keeps the default, as a bare table name does. So does a `:name`
+    placeholder, which is found by `core::params::scan` — the parameters bar's own rule, not a
+    second scanner — run over the line from where code starts (past a continued block comment's
+    `*/`, or a directive). That rule is what leaves a PostgreSQL `::` cast, MySQL's `:=`, an array
+    slice and a `:x` in a string or comment uncoloured, and a placeholder spelled like a keyword
+    (`:limit`) is a placeholder, not a keyword (`variables_and_placeholders_are_coloured`). A number is
     coloured whole by `number_end` — `0x1F`, `1.5E-3`, an `e` counting only with a digit after it —
     and a one-letter literal prefix glued to its `'` (`N`, `E`, `X`, `B`) takes the string's colour
     (`whole_numbers_and_literal_prefixes_are_coloured`). A client directive line — `GO 5`,
