@@ -4,6 +4,7 @@
 //! `edit_single` (so it's one undo step).
 
 use crate::intel::SqlDialect;
+use crate::pairs::{Region, region_at};
 
 /// SQL line-comment token.
 const TOKEN: &str = "--";
@@ -472,8 +473,8 @@ pub fn line_col_of_offset(text: &str, offset: usize) -> (usize, usize) {
 }
 
 /// A single text replacement plus the selection to apply afterward — the result
-/// of a Tab or Shift+Tab ([`soft_tab_indent`], [`hard_tab_indent`],
-/// [`soft_tab_outdent`]).
+/// of a Tab, Shift+Tab or Enter ([`soft_tab_indent`], [`hard_tab_indent`],
+/// [`soft_tab_outdent`], [`newline_indent`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndentEdit {
     /// Byte range in the original text to replace.
@@ -517,6 +518,94 @@ pub fn soft_tab_indent(full: &str, sel_a: usize, sel_b: usize, tw: usize) -> Ind
     }
 
     indent_lines(full, lo, hi, &" ".repeat(tw))
+}
+
+/// Compute pressing Enter over the selection `[sel_a, sel_b]` (either order):
+/// the selection becomes a line break plus an indent, with `unit` — one level
+/// as the tab settings spell it, spaces or `\t` — standing for a level.
+///
+/// - The new line keeps the caret's line's indent, cut at the caret, so Enter
+///   inside the indent does not add to it.
+/// - **After an open `(` or `[` in code** it goes one `unit` deeper; and when
+///   the matching closer follows the caret (`(|)`), the closer moves to a line
+///   of its own at the old indent, the caret on the deeper line between them.
+///   A bracket in a string or comment opens nothing.
+/// - At the end of a line whose next line is deeper, it takes that line's
+///   indent — the way floem's own Enter answered, kept so a list being
+///   extended stays in step.
+///
+/// Floem's Enter never added a level, and its auto-indent, had it been on,
+/// adds the buffer's own unit — four spaces, which nothing here can set —
+/// rather than the configured one.
+///
+/// An offset inside a character is taken back to that character's start,
+/// rather than panicking on the slice: the caller reads the text from the
+/// pane's `query` mirror, not the buffer the offsets came from.
+pub fn newline_indent(
+    full: &str,
+    sel_a: usize,
+    sel_b: usize,
+    unit: &str,
+    dialect: SqlDialect,
+) -> IndentEdit {
+    let len = full.len();
+    let floor = |mut i: usize| {
+        i = i.min(len);
+        while !full.is_char_boundary(i) {
+            i -= 1;
+        }
+        i
+    };
+    let lo = floor(sel_a.min(sel_b));
+    let hi = floor(sel_a.max(sel_b));
+    let is_blank = |c: char| c == ' ' || c == '\t';
+    let ls = full[..lo].rfind('\n').map_or(0, |i| i + 1);
+    let indent_of = |from: usize| {
+        let line = &full[from..];
+        &line[..line.len() - line.trim_start_matches(is_blank).len()]
+    };
+    let mut base = indent_of(ls);
+    base = &base[..base.len().min(lo - ls)];
+    let line_end = full[hi..].find('\n').map_or(len, |i| hi + i);
+    let rest = full[hi..line_end]
+        .trim_end_matches('\r')
+        .trim_start_matches(is_blank);
+
+    // The position *before* the bracket is asked, not after: a `(` closing a
+    // line comment would read as code one byte later, at the comment's end.
+    let before = full[ls..lo].trim_end_matches(is_blank);
+    let in_code = |at: usize| region_at(full, at, dialect) == Region::Code;
+    let opener = before
+        .bytes()
+        .last()
+        .filter(|&b| b == b'(' || b == b'[')
+        .filter(|_| in_code(ls + before.len() - 1));
+    let edit = |text: String, caret_in_text: usize| IndentEdit {
+        start: lo,
+        end: hi,
+        text,
+        sel: (lo + caret_in_text, lo + caret_in_text),
+    };
+    if let Some(open) = opener {
+        let inner = format!("\n{base}{unit}");
+        let closer = if open == b'(' { ')' } else { ']' };
+        if rest.starts_with(closer) {
+            let caret = inner.len();
+            return edit(format!("{inner}\n{base}"), caret);
+        }
+        let caret = inner.len();
+        return edit(inner, caret);
+    }
+    // At a line's end, a deeper next line lends its indent (floem's answer).
+    if rest.is_empty() && line_end < len {
+        let next = indent_of(line_end + 1);
+        if next.len() > base.len() {
+            base = next;
+        }
+    }
+    let text = format!("\n{base}");
+    let caret = text.len();
+    edit(text, caret)
 }
 
 /// [`soft_tab_indent`] with **hard tabs**: a bare caret inserts one `\t`, a
@@ -1208,6 +1297,77 @@ mod tests {
     fn soft_tab_clamps_zero_width() {
         let e = soft_tab_indent("a", 0, 0, 0);
         assert_eq!(e.text, " "); // tw clamped to 1
+    }
+
+    /// Press Enter at the `|` (or over `{`…`}`) in `src` and render the result
+    /// with the caret as `|`.
+    fn enter(src: &str, unit: &str, dialect: SqlDialect) -> String {
+        let (sel, clean) = match (src.find('{'), src.find('}')) {
+            (Some(lo), Some(hi)) => ((lo, hi - 1), src.replacen(['{', '}'], "", 2)),
+            _ => {
+                let at = src.find('|').expect("a caret");
+                ((at, at), src.replacen('|', "", 1))
+            }
+        };
+        let e = newline_indent(&clean, sel.0, sel.1, unit, dialect);
+        assert_eq!(e.sel.0, e.sel.1, "Enter leaves a bare caret");
+        let mut out = format!("{}{}{}", &clean[..e.start], e.text, &clean[e.end..]);
+        out.insert(e.sel.0, '|');
+        out
+    }
+
+    #[test]
+    fn enter_keeps_the_lines_indent_cut_at_the_caret() {
+        use SqlDialect::MySql;
+        assert_eq!(enter("  SELECT a|", "    ", MySql), "  SELECT a\n  |");
+        assert_eq!(enter("\tSELECT a,| b", "\t", MySql), "\tSELECT a,\n\t| b");
+        // Inside the indent, the new line takes only what is left of the caret.
+        assert_eq!(enter("  |  SELECT", "  ", MySql), "  \n  |  SELECT");
+        assert_eq!(enter("|", "  ", MySql), "\n|");
+        // A selection is replaced.
+        assert_eq!(enter("  a {xyz}b", "  ", MySql), "  a \n  |b");
+    }
+
+    #[test]
+    fn enter_after_an_open_bracket_goes_one_unit_deeper() {
+        use SqlDialect::{MySql, Postgres};
+        assert_eq!(enter("  IN (|", "    ", MySql), "  IN (\n      |");
+        assert_eq!(enter("IN (|", "\t", MySql), "IN (\n\t|");
+        // Trailing blanks after the bracket still count as after it.
+        assert_eq!(enter("f(  |", "  ", MySql), "f(  \n  |");
+        assert_eq!(enter("a[|", "  ", Postgres), "a[\n  |");
+    }
+
+    #[test]
+    fn enter_between_a_pair_puts_the_closer_on_its_own_line() {
+        use SqlDialect::MySql;
+        assert_eq!(enter("  f(|)", "  ", MySql), "  f(\n    |\n  )");
+        assert_eq!(enter("f(|  )", "\t", MySql), "f(\n\t|\n  )");
+        // A closer of the other kind is not the pair's.
+        assert_eq!(enter("f(|]", "  ", MySql), "f(\n  |]");
+    }
+
+    #[test]
+    fn enter_after_a_bracket_in_a_string_or_comment_adds_nothing() {
+        use SqlDialect::MySql;
+        assert_eq!(enter("  SELECT '(|", "  ", MySql), "  SELECT '(\n  |");
+        assert_eq!(enter("  -- note (|", "  ", MySql), "  -- note (\n  |");
+        assert_eq!(enter("  /* ( */|", "  ", MySql), "  /* ( */\n  |");
+    }
+
+    #[test]
+    fn enter_at_a_line_end_takes_a_deeper_next_lines_indent() {
+        use SqlDialect::MySql;
+        assert_eq!(enter("SELECT|\n    a", "  ", MySql), "SELECT\n    |\n    a");
+        // Not a shallower one, and not when the line goes on past the caret.
+        assert_eq!(enter("  x|\ny", "  ", MySql), "  x\n  |\ny");
+        assert_eq!(enter("SELECT| b\n    a", "  ", MySql), "SELECT\n| b\n    a");
+        // A CRLF line's `\r` is its end, not text after the caret.
+        assert_eq!(enter("f(|)\r\n", "  ", MySql), "f(\n  |\n)\r\n");
+        assert_eq!(enter("SELECT|\r\n  a", "  ", MySql), "SELECT\n  |\r\n  a");
+        // An offset inside a character is answered, not panicked on.
+        let e = newline_indent("é", 1, 1, "  ", MySql);
+        assert_eq!((e.start, e.end), (0, 0));
     }
 
     #[test]

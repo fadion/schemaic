@@ -45,8 +45,8 @@ use schemaic_core::params;
 use schemaic_core::prompt::{self, FixOrigin};
 use schemaic_core::sql::statement_range;
 use schemaic_core::text_ops::{
-    find_matches, find_seed, first_hit_from, matches_at, move_line, offset_of_line, replace_all,
-    soft_tab_indent, soft_tab_outdent, toggle_line_comment,
+    find_matches, find_seed, first_hit_from, matches_at, move_line, newline_indent, offset_of_line,
+    replace_all, soft_tab_indent, soft_tab_outdent, toggle_line_comment,
 };
 
 use crate::completion::{
@@ -2818,6 +2818,49 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             });
             return CommandExecuted::Yes;
         }
+        // Enter, computed here for the same reason as Tab: floem's keeps the
+        // line's indent and never adds a level, and its auto-indent would add
+        // the buffer's own unit, not the tab settings'. `text_ops::newline_indent`
+        // keeps the indent and goes one level deeper after an open bracket.
+        // Several carets still take floem's, which handles each of them.
+        if !primary_held(mods)
+            && !mods.alt()
+            && matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::Enter), _))
+        {
+            let unit = if theme::editor_soft_tabs() {
+                " ".repeat(theme::editor_tab_width())
+            } else {
+                "\t".to_string()
+            };
+            let dia = dialect.get_untracked();
+            let taken = editor_sig.with_untracked(|e| {
+                let cursor = e.cursor.get_untracked();
+                let (a, b) = match &cursor.mode {
+                    floem::views::editor::core::cursor::CursorMode::Insert(sel) => {
+                        match sel.regions() {
+                            [r] => (r.start, r.end),
+                            _ => return false,
+                        }
+                    }
+                    _ => return false,
+                };
+                let ed = query.with_untracked(|full| newline_indent(full, a, b, &unit, dia));
+                if edit_untyped(
+                    e,
+                    comp,
+                    Selection::region(ed.start, ed.end),
+                    &ed.text,
+                    EditType::InsertNewline,
+                ) {
+                    e.cursor
+                        .update(|c| c.set_insert(Selection::caret(ed.sel.0)));
+                }
+                true
+            });
+            if taken {
+                return CommandExecuted::Yes;
+            }
+        }
         // Outdent (Shift+Tab): the inverse of the above. Same reason — floem's
         // built-in outdent uses the buffer's fixed indent width — so we remove one
         // level (a leading tab, or up to `tw` spaces) per line ourselves, which
@@ -4150,6 +4193,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         // Tab and Shift+Tab are the key handler's (`soft_tab_indent` /
         // `hard_tab_indent` / `soft_tab_outdent`), with the suggestion list
         // open or not, so this matters only where floem's own Tab still runs.
+        // Enter is the handler's too (`newline_indent`), but for several carets.
         // `wrap_method` follows the word-wrap setting (default off = scroll long
         // SQL lines horizontally; on = wrap to the viewport width).
         .editor_style(move |s| {
@@ -4179,7 +4223,10 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 .indent_guide_color(t.selection)
                 .visible_whitespace(t.selection)
                 // Soft tabs → insert spaces to the next stop; hard tabs → literal
-                // `\t`. `tab_width` sets both the indent size and the display width.
+                // `\t`. This `indent_style` only spaces the indent guides: the
+                // unit floem's own edit commands indent by is the buffer's, a
+                // fixed four spaces, which is why Tab, Shift+Tab and Enter are
+                // computed in the key handler.
                 .smart_tab(soft)
                 .indent_style(if soft {
                     IndentStyle::Spaces(tw as u8)

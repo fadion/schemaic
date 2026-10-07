@@ -11791,7 +11791,22 @@ existing prose was left alone.
     one level of either kind — a leading tab, or up to the tab width in spaces — so `editor_pane`
     now asks it whatever the setting, and a plain Shift+Tab no longer reaches floem's
     `OutdentLine` and its fixed `Spaces(4)` unit — with the suggestion list open too, which it
-    closes (it did reach it there, Tab accepting a row and Shift+Tab falling through). **`cut_lines` is Ctrl+X on
+    closes (it did reach it there, Tab accepting a row and Shift+Tab falling through).
+    **Enter is computed here too, by `newline_indent`, for the same reason** — floem's
+    `InsertNewLine` never adds a level, and its `auto_indent` would add four spaces whatever the tab
+    settings (the two indent units are under *Floem 0.2 gotchas*). The selection becomes `\n` plus
+    the caret line's indent **cut at the caret**, because floem copied the whole line's indent and
+    so made Enter inside an indent add to it; one `unit` deeper — `editor_tab_width` spaces, or
+    `\t` — after an open `(` or `[` in code, trailing blanks allowed; and with the same kind of
+    closer next after the caret (`(|)`) the closer goes to a line of its own at the old indent, the
+    caret on the deeper line between — floem split the pair too, but left both lines at the old
+    indent. At a line's end a deeper next line still lends its indent, floem's rule kept, and a CRLF
+    line's `\r` counts as its end. **The bracket is asked about at the byte *before* it**: one byte
+    later, `pairs::region_at` reads a `(` ending a `--` comment as code, at the comment's end
+    (`enter_after_a_bracket_in_a_string_or_comment_adds_nothing`). The pane takes Enter with no
+    primary modifier or Alt, after the completion and Ctrl+K arms — so a word typed in full now
+    reaches it — and leaves several carets to floem's Enter, which handles each one.
+    **`cut_lines` is Ctrl+X on
     bare carets**: each caret's line, line end included, onto the clipboard once and in document
     order, a last line with no line end of its own taking the one before it and going onto the
     clipboard with a `\n`. It replaces floem's `DeleteLine`, which never copies — Ctrl+X then
@@ -23519,7 +23534,8 @@ existing prose was left alone.
     selection (`list_takes_arrow`: with Shift, Alt or Ctrl the arrow closes the list and does its
     own work — Shift+↓ used to walk the rows instead of extending the selection) and Enter or Tab
     accept `items[sel]` — except Enter with `comp.word_complete` set and
-    the selection still on row 0, which closes the list and lets the key through to the editor.
+    the selection still on row 0, which closes the list and lets the key through to the pane's own
+    newline (`text_ops::newline_indent`, under `text_ops.rs`).
     The exact match is never a row (under `core/rank.rs`), so after `FROM` the list held
     `FROM_BASE64()` and `FROM_DAYS()`, and Enter, meant to end the line, accepted the first. An
     arrow onto a row first still accepts that row, and Tab still accepts row 0. The handler reads
@@ -31944,6 +31960,15 @@ Re-introducing the anti-patterns these guard against is a regression:
   `edit_untyped`'s own body for the check and the refusal, the other scans for a raw `.edit_single(`
   with no `read_only` question within 30 logical lines above it, `FREEZE-EXEMPT` being the marker the
   funnel's own pair carries. Against the unfixed tree it reports nine offenders.
+- **The editor has two indent units, and floem's edit commands read the one we cannot set.** The
+  `indent_style` `editor_pane` hands `editor_style` from the tab settings is the *style's*, which
+  floem reads only to space the indent guides. `InsertTab` (with `smart_tab`), `OutdentLine` and
+  `InsertNewLine`'s `auto_indent` take `Buffer::indent_unit` from `floem-editor-core`, which is
+  `IndentStyle::DEFAULT_INDENT` — `Spaces(4)` — and has no setter: `Buffer::detect_indent`, the
+  only way to move it, prefers whatever the text already holds, and nothing here calls it. So
+  turning `TextDocument::auto_indent` on is not how to make Enter indent — it would indent by four
+  spaces under any setting — and every indenting key is computed in `core::text_ops` and applied
+  through `edit_untyped` instead: Tab, Shift+Tab and Enter (under `text_ops.rs`).
 - **Shift+wheel → horizontal scroll in the editor.** The editor owns its scroll internally, so
   `shift_hscroll` can't reach it. Register a `PointerWheel` listener on the internal scroll view —
   reached via `ed.editor_view_id.get_untracked().and_then(|c| c.parent())` (the content view's parent
