@@ -20769,7 +20769,8 @@ existing prose was left alone.
     one-word edits because those are the same act as renaming a tab; a body is SQL, multi-line, and
     a 300px panel row is the wrong shape for it, so it gets the modal chrome the view/trigger
     editors wear (`modal_title_owned` / `modal_footer` / `panel_style`) and the same multi-line
-    mono field with `tab_indents`. **Save writes only the fields that changed, through the same
+    mono field with `tab_indents` — though not their colouring, a snippet carrying a scope rather
+    than a dialect for `FieldCfg::sql` to take. **Save writes only the fields that changed, through the same
     per-field actions the inline edits use** — there is deliberately no fourth "save everything"
     action, because two paths writing one field is how the two drift. *Which* fields changed is
     `core::snippet::edits`, not three comparisons written here: the body's comparison and its
@@ -21873,7 +21874,9 @@ existing prose was left alone.
     The preview's SQL box is a read-only monospace `edit_field` that **wraps**: it was `no_wrap`,
     and an `edit_field` has no wheel to scroll sideways (only the editor pane wires Shift+wheel, see
     the Floem gotchas), so the end of a long statement — a selective XML index's paths, a rebuild's
-    column list — ran past the box's edge and could not be read before Apply.
+    column list — ran past the box's edge and could not be read before Apply. It is syntax-coloured
+    in the plan's dialect (`FieldCfg::sql`, `p.dialect`), and so sits on the preview surface rather
+    than a field's — under `lib.rs`.
     `preview_proposal` is the AI's way in, beside `preview_change`'s: it seeds from `loaded_table`
     like every editor, applies the ops with `propose::apply`, diffs against
     `Target::new(dialect, db_flavour(…))` — the flavour matters, or the same change would preview
@@ -22126,7 +22129,8 @@ existing prose was left alone.
     Same seed-local-signals-then-write-back rule as the designer (the form is built once per
     open; only the footer is keyed on the draft). The options are shown because they're
     *carried* through a replace, and the PG "re-create instead of replacing" toggle is the
-    override for the cases `ddl::pg_replaceable` can't read off the statement.
+    override for the cases `ddl::pg_replaceable` can't read off the statement. The `SELECT` body is
+    coloured as the SQL editor colours it, in the target's dialect (`FieldCfg::sql`, under `lib.rs`).
     The form is built **per engine** — check option for MySQL and PostgreSQL, the security/definer
     block for MySQL, the re-create toggle for PostgreSQL, and a "Column names" field for
     `ViewOptions::column_list` on SQLite and SQL Server. The first and last ask
@@ -22283,7 +22287,8 @@ existing prose was left alone.
     under the list (no ↑/↓: list position is display order, while firing order is MySQL's
     `FOLLOWS`, PostgreSQL's alphabetical and SQL Server's `sp_settriggerorder` rank) — so one plan can drop one trigger, edit another and
     add a third. It shares the designer's `selected`/`rev` signals, since only one of the two is
-    ever open, and splits list-vs-form re-rendering the same way for the same reason.
+    ever open, and splits list-vs-form re-rendering the same way for the same reason. The Body field
+    is SQL-coloured in the target's dialect (`FieldCfg::sql`, under `lib.rs`).
     **It is deliberately not a designer tab**: what belongs there is what can be a *clause* of
     `ALTER TABLE`, which is why checks are and triggers aren't — a trigger needs its own
     statement, so folding it in would turn MySQL's one coalesced `ALTER TABLE` into an `ALTER`
@@ -22419,6 +22424,7 @@ existing prose was left alone.
     with the old scope. `edit_field` now reconciles its doc from the signal in place. The
     write-back contract is unchanged: `prev` is `None` on the first run, so seeding is never
     mistaken for an edit, and an external correction reaches the draft exactly as a keystroke does.
+    The field is SQL-coloured in the target's dialect (`FieldCfg::sql`, under `lib.rs`).
     Three things are load-bearing: **the form is per-engine *and* per-kind because the objects
     are** — volatility, strictness, language and per-routine `SET` clauses on PostgreSQL;
     determinism, data access, definer and comment on MySQL, which has no `LANGUAGE` clause at all;
@@ -25238,10 +25244,24 @@ existing prose was left alone.
     and its setter bumps no `editor_gen`, because nothing is drawn from it: Format Code
     (`format_editor`'s `format_range`) and both *Format statement* sites — the key/palette request
     and the right-click menu — ask for it at the moment they run. What it does to the text is the
-    `core/sqlfmt.rs` entry's. the surface and base text of a **syntax-coloured preview**, and
-    they are named here rather than spelled at each site so the cross-axis gate in `contrast.rs`
-    measures the surface the previews actually paint — the account browser's `GRANT` block is the
-    latest caller, and its move off `code_bg` is exactly that distinction and nothing else:
+    `core/sqlfmt.rs` entry's.
+    **`FieldSql` carries the same colouring into an `edit_field`** — the DDL preview's SQL box and
+    the view, trigger and routine bodies, each of which sets `FieldCfg::sql` (under `lib.rs`). It
+    is the same `lex_line_with` with the same cross-line block-comment state: the per-revision
+    `block_lines` cache is `starts_in_block_cached` now, which `SqlStyling::starts_in_block` calls
+    too, so the forward pass that removed the Θ(visible × document) re-lex is one piece of code
+    rather than two copies of it. It leaves out what only the tab editor has — the zoom, the inline
+    diff and rainbow brackets (`lex_line_with` is handed `None` for the depth) — and its dialect is a
+    plain `SqlDialect` fixed when the field is built, where `SqlStyling`'s is a memo.
+    `FieldSql::generation` is `theme::editor_generation()`, which `FieldStyling::id` adds to its key
+    so an editor-theme switch re-lays out lines already coloured. The snippet editor's body is not
+    coloured: a snippet carries a scope, not a dialect. **No test covers `FieldSql`** — it needs a
+    floem `Document`, and there is no fixture for one.
+    `theme::preview_bg`/`preview_fg` are the surface and base text of a **syntax-coloured preview**,
+    and they are named here rather than spelled at each site so the cross-axis gate in `contrast.rs`
+    measures the surface the previews actually paint — the SQL-holding `edit_field`s are the latest
+    callers (`FieldCfg::sql`), and the account browser's `GRANT` block the one before them, whose
+    move off `code_bg` is exactly that distinction and nothing else:
     `preview_bg()` *is* `code_bg()`, the same pixel, but spelled through the accessor the gate reads
     rather than through one it does not. Both come from the *editor* axis, which is the
     whole point: the token colours are reproductions of palettes tuned against their own background,
@@ -25302,7 +25322,10 @@ existing prose was left alone.
     rather than a copy of it — and pointed back at `bg_editor` it fails on 6 of the 12 pairs. Tokens
     are held to *Recessive* for `EDITOR_PAIRINGS`' reason (each is a reproduction of a published
     palette, so the assertion is that it is a colour and not a stain) and the uncoloured base to
-    *Body*, being the panel's real body text. The active theme is process state, so the loop restores
+    *Body*, being the panel's real body text. The SQL fields `edit_field` colours (`FieldCfg::sql`)
+    sit on the same two accessors, so this test is their gate as well — their placeholder included,
+    which takes the palette's `comment` (`sql_placeholder`) rather than the UI axis's
+    `theme::placeholder`, a pairing nothing would measure. The active theme is process state, so the loop restores
     it through a `Drop` guard: a panic inside it would otherwise leave the thread on Light + Latte
     and surface as some unrelated later test failing.
   - `lib.rs` (with `grid.rs`, one of the crate's two largest modules) — the `Ui` struct + bundles,
@@ -25932,6 +25955,19 @@ existing prose was left alone.
     the common prefix, which leaves it mid-text whenever the typed head already matched the
     option's case. Every caller reaches it through `table_designer::suggest_field`; Tab's precedence
     is under *Floem 0.2 gotchas*.
+    **`FieldCfg::sql` colours a field holding SQL as the editor colours it** —
+    `sql_highlight::FieldSql`, built over the field's own `ed.doc()` and driven from
+    `FieldStyling::apply_attr_styles`. Setting it **overrides `background` and `text_color`** with
+    `theme::preview_bg` and `preview_fg`: the token colours are the *editor* theme's, a field's usual
+    surface is the *UI* theme's, and the two are chosen independently, so the editor palette on a
+    field surface is a pairing nothing measures — while
+    `a_coloured_preview_is_legible_in_every_ui_and_editor_theme_pair` measures exactly this one in
+    every UI × editor theme combination. A caller's `background` is therefore ignored on a SQL field,
+    deliberately. `FieldStyling::id` adds `FieldSql::generation` (the editor generation) to the UI
+    generation in its key, so an editor-theme switch re-lays the lines out rather than leaving them
+    in the old palette, the hazard `SqlStyling::id` documents. The callers are the DDL preview's SQL
+    box, the view editor's `SELECT` and the trigger and routine bodies; the snippet editor's body
+    sets none, a snippet carrying a scope rather than a dialect.
     The shared types living in the crate root is what stalls further splitting: the
     root depends on the leaves (`mod`) and the leaves depend on the root (types), so a view builder
     can't move out until the types do.

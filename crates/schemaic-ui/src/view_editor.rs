@@ -319,6 +319,7 @@ fn form(ui: DdlUi, target: &ViewTarget, ring: FocusRing) -> AnyView {
                 multiline: true,
                 no_wrap: true,
                 mono: true,
+                sql: Some(target.dialect),
                 font_size: theme::font_body,
                 max_rows: Some(ui.view_rows),
                 placeholder: "SELECT …",

@@ -105,6 +105,70 @@ pub struct SqlStyling {
 /// revision and the dialect.
 type BlockKey = (u64, SqlDialect);
 
+/// Does `line` of `doc` begin inside a `/* … */` opened above it? One forward
+/// pass ([`block_comment_lines`]) per document revision and dialect, kept in
+/// `cache` — what [`SqlStyling`] and [`FieldSql`] both ask.
+fn starts_in_block_cached(
+    doc: &dyn Document,
+    dialect: SqlDialect,
+    cache: &RefCell<Option<(BlockKey, Vec<bool>)>>,
+    line: usize,
+) -> bool {
+    if line == 0 {
+        return false;
+    }
+    let key = (doc.cache_rev().get_untracked(), dialect);
+    let mut cache = cache.borrow_mut();
+    if cache.as_ref().map(|(k, _)| *k) != Some(key) {
+        let text = doc.text().to_string();
+        *cache = Some((key, block_comment_lines(&text, key.1)));
+    }
+    cache
+        .as_ref()
+        .is_some_and(|(_, flags)| flags.get(line).copied().unwrap_or(false))
+}
+
+/// The SQL editor's colouring for an `edit_field` that holds SQL — the DDL
+/// preview and the view, trigger and routine bodies — through the same lexer
+/// and the same cross-line block-comment state, without the tab editor's zoom,
+/// inline diff or rainbow brackets. Its field sits on the preview surface
+/// (`theme::preview_bg`), which is the one the editor palette is measured on.
+pub(crate) struct FieldSql {
+    doc: Rc<dyn Document>,
+    dialect: SqlDialect,
+    block_lines: RefCell<Option<(BlockKey, Vec<bool>)>>,
+}
+
+impl FieldSql {
+    pub(crate) fn new(doc: Rc<dyn Document>, dialect: SqlDialect) -> Self {
+        Self {
+            doc,
+            dialect,
+            block_lines: RefCell::new(None),
+        }
+    }
+
+    /// What the field's layout cache key must also follow: the editor theme,
+    /// whose palette these colours are.
+    pub(crate) fn generation(&self) -> u64 {
+        crate::theme::editor_generation()
+    }
+
+    /// Colour `line` — `Styling::apply_attr_styles`' body.
+    pub(crate) fn apply(&self, line: usize, default: Attrs, attrs: &mut AttrsList) {
+        let rope = self.doc.rope_text();
+        if line >= rope.num_lines() {
+            return;
+        }
+        let content = rope.line_content(line);
+        let start_in_block =
+            starts_in_block_cached(&*self.doc, self.dialect, &self.block_lines, line);
+        for (start, end, tok) in lex_line_with(&content, self.dialect, start_in_block, None) {
+            attrs.add_span(start..end, default.color(tok.color()));
+        }
+    }
+}
+
 impl SqlStyling {
     pub fn new(
         doc: Rc<dyn Document>,
@@ -141,21 +205,12 @@ impl SqlStyling {
     /// call (`cache_rev` is bumped by every edit), and answers from the cache
     /// otherwise — so a relayout's ~45 line callbacks share one pass.
     fn starts_in_block(&self, line: usize) -> bool {
-        if line == 0 {
-            return false;
-        }
-        let key = (
-            self.doc.cache_rev().get_untracked(),
+        starts_in_block_cached(
+            &*self.doc,
             self.dialect.get_untracked(),
-        );
-        let mut cache = self.block_lines.borrow_mut();
-        if cache.as_ref().map(|(k, _)| *k) != Some(key) {
-            let text = self.doc.text().to_string();
-            *cache = Some((key, block_comment_lines(&text, key.1)));
-        }
-        cache
-            .as_ref()
-            .is_some_and(|(_, flags)| flags.get(line).copied().unwrap_or(false))
+            &self.block_lines,
+            line,
+        )
     }
 
     /// How many brackets are open where `line` begins

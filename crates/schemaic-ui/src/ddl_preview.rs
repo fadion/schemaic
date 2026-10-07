@@ -1066,6 +1066,7 @@ pub(crate) fn ddl_preview_overlay(
                             multiline: true,
                             read_only: true,
                             mono: true,
+                            sql: Some(p.dialect),
                             font_size: theme::font_body,
                             max_rows: Some(d.sql_rows),
                             focus: Some((ring.clone(), 10)),

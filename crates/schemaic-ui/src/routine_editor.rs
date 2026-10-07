@@ -617,6 +617,7 @@ fn routine_form(ui: DdlUi, target: &RoutineTarget, ring: FocusRing) -> AnyView {
                     "BEGIN\n    SELECT 1;\nEND"
                 },
                 mono: true,
+                sql: Some(target.dialect),
                 multiline: true,
                 max_rows: Some(ui.view_rows),
                 // Logical lines, so the box hugs its content on the first frame

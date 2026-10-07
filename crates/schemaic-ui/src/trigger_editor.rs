@@ -1081,6 +1081,7 @@ fn form(
                 FieldCfg {
                     placeholder: "BEGIN … END",
                     mono: true,
+                    sql: Some(target.dialect),
                     multiline: true,
                     max_rows: Some(ui.view_rows),
                     // Height from the *logical* line count, not the wrapped one.
