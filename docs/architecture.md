@@ -11924,7 +11924,14 @@ existing prose was left alone.
     code — not `t.begin`, `@case`, a quoted `` `case` `` or one in a comment — and `BEGIN TRAN`/
     `BEGIN;` end in another word or a `;`, so a transaction opens nothing
     (`enter_after_a_block_opening_word_goes_one_unit_deeper`,
-    `enter_after_a_word_that_opens_no_block_adds_nothing`). The pane takes Enter with no
+    `enter_after_a_word_that_opens_no_block_adds_nothing`). **And the level closes as `END` is
+    typed**: `dedent_typed_end` answers the `D` that makes a line's only word `END` — nothing after
+    it on the line — with the edit that moves the line to the indent of the line whose `BEGIN` or
+    `CASE` it closes, asked of the text as it will be through `pairs::match_block`; `None` leaves the
+    character to floem (`typing_an_end_dedents_it_to_its_opener`). The pane applies it as the
+    auto-pair does — floem's own insert suppressed through `read_only`, a Ctrl+K freeze left alone
+    — and as `InsertChars`, so it undoes with the typing it finished, never alone. The pane takes
+    Enter with no
     primary modifier or Alt, after the completion and Ctrl+K arms — so a word typed in full now
     reaches it — and leaves several carets to floem's Enter, which handles each one.
     **`cut_lines` is Ctrl+X on

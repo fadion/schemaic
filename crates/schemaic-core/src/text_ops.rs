@@ -923,6 +923,53 @@ fn opens_block(before: &str, in_code: impl Fn(usize) -> bool) -> bool {
     }
 }
 
+/// Typing `ch` at a bare caret (`sel_a == sel_b`) when it completes `END` as
+/// the only word on its line: the edit that puts the line at the indent of
+/// the line whose `BEGIN` or `CASE` it closes ([`crate::pairs::match_block`]),
+/// `ch` included. `None` — the character types as usual — when it does not
+/// complete such an `END`, there is more on the line, nothing matches, or the
+/// line is already at that indent.
+pub fn dedent_typed_end(
+    full: &str,
+    sel_a: usize,
+    sel_b: usize,
+    ch: char,
+    dialect: SqlDialect,
+) -> Option<IndentEdit> {
+    if sel_a != sel_b || !ch.eq_ignore_ascii_case(&'d') {
+        return None;
+    }
+    let caret = floor_char(full, sel_a);
+    let ls = full[..caret].rfind('\n').map_or(0, |i| i + 1);
+    let line_end = full[caret..].find('\n').map_or(full.len(), |i| caret + i);
+    if !full[caret..line_end].trim().is_empty() {
+        return None;
+    }
+    let before = &full[ls..caret];
+    let word = before.trim_start_matches([' ', '\t']);
+    if !word.eq_ignore_ascii_case("EN") {
+        return None;
+    }
+    // Asked of the text as it will be, with `ch` typed.
+    let typed = format!("{}{ch}{}", &full[..caret], &full[caret..]);
+    let end_at = caret - word.len();
+    let (_, (opener, _)) = crate::pairs::match_block(&typed, end_at, dialect)?;
+    let ols = typed[..opener].rfind('\n').map_or(0, |i| i + 1);
+    let line = &typed[ols..];
+    let indent = &line[..line.len() - line.trim_start_matches([' ', '\t']).len()];
+    if indent == &before[..before.len() - word.len()] {
+        return None;
+    }
+    let text = format!("{indent}{word}{ch}");
+    let at = ls + text.len();
+    Some(IndentEdit {
+        start: ls,
+        end: caret,
+        text,
+        sel: (at, at),
+    })
+}
+
 /// [`soft_tab_indent`] with **hard tabs**: a bare caret inserts one `\t`, a
 /// selection indents each spanned line by one, as the soft-tab one does.
 ///
@@ -1853,6 +1900,42 @@ mod tests {
             enter("BEGIN TRY|END TRY", "  ", MsSql),
             "BEGIN TRY\n  |\nEND TRY"
         );
+    }
+
+    /// Typing the `D` that makes a line's only word `END` puts the line at
+    /// the indent of the `BEGIN`'s or `CASE`'s line it closes; `None` leaves
+    /// the character to type as usual.
+    #[test]
+    fn typing_an_end_dedents_it_to_its_opener() {
+        use SqlDialect::{MsSql, MySql};
+        let typed = |src: &str, ch: char, d| {
+            let at = src.find('|').unwrap();
+            let clean = src.replacen('|', "", 1);
+            dedent_typed_end(&clean, at, at, ch, d).map(|e| {
+                let mut out = format!("{}{}{}", &clean[..e.start], e.text, &clean[e.end..]);
+                out.insert(e.sel.0, '|');
+                out
+            })
+        };
+        assert_eq!(
+            typed("BEGIN\n  SELECT 1;\n  EN|", 'D', MsSql).as_deref(),
+            Some("BEGIN\n  SELECT 1;\nEND|")
+        );
+        assert_eq!(
+            typed("  begin\n    x;\n      en|", 'd', MsSql).as_deref(),
+            Some("  begin\n    x;\n  end|")
+        );
+        assert_eq!(
+            typed("SELECT CASE\n    WHEN a THEN 1\n    EN|", 'D', MySql).as_deref(),
+            Some("SELECT CASE\n    WHEN a THEN 1\nEND|")
+        );
+        // Already where it belongs, not the line's only word, nothing to
+        // close, or more on the line: the character types as usual.
+        assert_eq!(typed("BEGIN\n  x;\nEN|", 'D', MsSql), None);
+        assert_eq!(typed("BEGIN\n  SET a = EN|", 'D', MsSql), None);
+        assert_eq!(typed("-- BEGIN\n  EN|", 'D', MsSql), None);
+        assert_eq!(typed("BEGIN\n  x;\n  EN| -- c", 'D', MsSql), None);
+        assert_eq!(typed("BEGIN\n  x;\n  EN|", 'X', MsSql), None);
     }
 
     /// Not a block: the word is part of a name, in a comment or string, or a

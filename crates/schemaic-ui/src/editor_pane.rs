@@ -3413,6 +3413,51 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             });
             return CommandExecuted::Yes;
         }
+        // Typing the `D` of a line's lone `END` puts the line at the indent of
+        // the `BEGIN`/`CASE` it closes (`text_ops::dedent_typed_end`). Same
+        // shape as the auto-pair below — the edit made here, floem's own
+        // insert suppressed through `read_only`, a freeze left alone — and the
+        // edit is `InsertChars`, so it undoes with the word it finished.
+        if !primary_held(mods)
+            && !mods.alt()
+            && let KeyInput::Keyboard(Key::Character(cs), _) = &kp.key
+            && let Some(ch) = single_char(cs)
+            && ch.eq_ignore_ascii_case(&'d')
+        {
+            let dia = dialect.get_untracked();
+            let acted = editor_sig.with_untracked(|e| {
+                let ro = e.read_only;
+                let was = ro.get_untracked();
+                if was {
+                    return false;
+                }
+                let doc = e.doc();
+                let full = doc.text().to_string();
+                let cur = e.cursor.get_untracked();
+                let off = cur.offset();
+                let (a, b) = cur.get_selection().unwrap_or((off, off));
+                let Some(edit) = schemaic_core::text_ops::dedent_typed_end(&full, a, b, ch, dia)
+                else {
+                    return false;
+                };
+                ro.set(true);
+                floem::action::exec_after(std::time::Duration::ZERO, move |_| {
+                    if ro.try_get_untracked().is_some() {
+                        ro.set(was);
+                    }
+                });
+                doc.edit_single(
+                    Selection::region(edit.start, edit.end),
+                    &edit.text,
+                    EditType::InsertChars,
+                );
+                e.cursor.update(|c| c.set_offset(edit.sel.0, false, false));
+                true
+            });
+            if acted {
+                return CommandExecuted::Yes;
+            }
+        }
         // Auto-close bracket/quote pairs, type-over an existing closer, and wrap a
         // selection — via the pure, boundary-aware `core::pairs`. Plain character
         // input only (Ctrl/Alt combos are handled above and never reach here).
