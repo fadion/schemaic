@@ -137,6 +137,19 @@ pub struct SchemaIndex {
     pub columns_by_db: HashMap<(String, String), Rc<Vec<ColMeta>>>,
     /// database name (lowercase) → its table names.
     pub tables_by_db: HashMap<String, Vec<String>>,
+    /// (schema, table) (both lowercase) → its columns, for the tab's own
+    /// database's tables that live in a schema (PostgreSQL, SQL Server).
+    ///
+    /// `intel::statement_scope` reads `sales.orders` as `TableRef.db =
+    /// sales`, which on those engines names a namespace inside the database
+    /// rather than a database, so [`SchemaIndex::columns_by_db`] answers
+    /// nothing for it. The diagnostics `intel::Catalog` keeps the same map
+    /// (`schema_qualified`) for the same reason, limited the same way: a
+    /// `schema.table` never crosses a database.
+    pub columns_by_schema: HashMap<(String, String), Rc<Vec<ColMeta>>>,
+    /// schema (lowercase) → its table names, the tab's own database only —
+    /// `sales.|`.
+    pub tables_by_schema: HashMap<String, Vec<String>>,
 }
 
 /// One snippet-abbrev row, as ranking needs it: what the row shows, its snippet's
@@ -457,12 +470,18 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
     // keystroke, 4.0 ms at 500×25 and 11.4 ms at 1,000×30, with the popup often
     // showing nothing. The `Rc` at `columns_by_db` exists precisely to stop a
     // second copy of each table's columns, and this took one anyway.
+    // A qualifier is a database (MySQL), else a schema of the tab's own
+    // database (PostgreSQL, SQL Server) — `SchemaIndex::columns_by_schema`.
     let cols_of = |db: Option<&str>, name: &str| -> &[ColMeta] {
         match db {
-            Some(db) => schema
-                .columns_by_db
-                .get(&(db.to_ascii_lowercase(), name.to_ascii_lowercase()))
-                .map_or(&[][..], |m| m.as_slice()),
+            Some(db) => {
+                let key = (db.to_ascii_lowercase(), name.to_ascii_lowercase());
+                schema
+                    .columns_by_db
+                    .get(&key)
+                    .or_else(|| schema.columns_by_schema.get(&key))
+                    .map_or(&[][..], |m| m.as_slice())
+            }
             None => schema
                 .columns
                 .get(&name.to_ascii_lowercase())
@@ -576,7 +595,11 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
                 for c in cols_of(db.as_deref(), &table) {
                     add_col(&mut cands, &mut seen, c, &table, alias.as_deref(), 0);
                 }
-            } else if let Some(tbls) = schema.tables_by_db.get(&q.to_ascii_lowercase()) {
+            } else if let Some(tbls) = schema
+                .tables_by_db
+                .get(&q.to_ascii_lowercase())
+                .or_else(|| schema.tables_by_schema.get(&q.to_ascii_lowercase()))
+            {
                 for t in tbls {
                     add(&mut cands, &mut seen, t, SuggestKind::Table, q, 0);
                 }
@@ -1066,6 +1089,7 @@ mod tests {
             columns,
             columns_by_db,
             tables_by_db,
+            ..SchemaIndex::default()
         }
     }
 
@@ -1313,6 +1337,52 @@ mod tests {
         assert!(!offers(&rows, "PARTITION"), "{rows:?}");
     }
 
+    /// **A schema-qualified table has columns.** On PostgreSQL and SQL Server
+    /// `sales.orders` reads as `TableRef.db = sales`, and `sales` is a
+    /// namespace in the tab's database, not a database: the lookup keyed by
+    /// database found nothing, so `s.` offered no columns. The schema's own
+    /// map answers it, and `sales.` offers the schema's tables.
+    #[test]
+    fn a_schema_qualified_table_offers_its_columns() {
+        let meta = |n: &str| ColMeta {
+            name: n.to_string(),
+            type_name: "int".to_string(),
+            nullable: false,
+            primary_key: false,
+            foreign_key: false,
+        };
+        let mut s = shop();
+        s.columns_by_schema.insert(
+            ("sales".to_string(), "orders".to_string()),
+            Rc::new(vec![meta("region"), meta("amount")]),
+        );
+        s.tables_by_schema.insert(
+            "sales".to_string(),
+            vec!["orders".to_string(), "Leads".to_string()],
+        );
+        let scoped = TableRef {
+            name: "orders".to_string(),
+            alias: Some("s".to_string()),
+            db: Some("sales".to_string()),
+        };
+        let pg = SqlDialect::Postgres;
+        let col = ranked_on(
+            &s,
+            pg,
+            ClauseCtx::Column,
+            std::slice::from_ref(&scoped),
+            "reg",
+        );
+        assert!(offers(&col, "region"), "{col:?}");
+        let q = ranked_on(&s, pg, ClauseCtx::Qualified("s".into()), &[scoped], "");
+        assert!(offers(&q, "amount") && !offers(&q, "total"), "{q:?}");
+        let ns = ranked_on(&s, pg, ClauseCtx::Qualified("sales".into()), &[], "");
+        assert!(offers(&ns, "Leads"), "{ns:?}");
+        // A database of the qualifier's name still answers first.
+        let db = ranked_on(&s, pg, ClauseCtx::Qualified("shop".into()), &[], "");
+        assert!(offers(&db, "customers"), "{db:?}");
+    }
+
     /// A value slot offers functions first and no columns — not even the
     /// tables in scope, which a `VALUES` tuple or a variable's value cannot
     /// read. A builtin called bare still goes in bare.
@@ -1455,6 +1525,7 @@ mod tests {
             columns,
             columns_by_db,
             tables_by_db: HashMap::new(),
+            ..SchemaIndex::default()
         };
         let row = |dialect, ctx: ClauseCtx, scope: &[TableRef], prefix: &str, name: &str| {
             let cont = Continuation::default();
@@ -1682,6 +1753,7 @@ mod tests {
             columns,
             columns_by_db,
             tables_by_db,
+            ..SchemaIndex::default()
         }
     }
 

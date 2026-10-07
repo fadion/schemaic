@@ -23092,6 +23092,14 @@ existing prose was left alone.
     squiggled — and **merged** into a same-named table's entries rather than written over them,
     as the diagnostics catalogue does (`a_synonym_is_offered_its_resolved_tables_columns`,
     S4.2-L1-05, red before).
+    **The in-scope database's tables are indexed by schema too** — `columns_by_schema` and
+    `tables_by_schema`, from `TableInfo::schema`, which PostgreSQL and SQL Server fill. On those
+    engines `sales.orders` reads as `TableRef.db = sales`, a namespace in the tab's database, so the
+    `columns_by_db` lookup `rank`'s `cols_of` makes found nothing and `s.` offered no columns; it
+    now falls back to the schema's map, and a `sales.` qualifier offers the schema's tables after a
+    database of that name has had its turn (`a_schema_qualified_table_offers_its_columns`,
+    `the_tabs_database_is_indexed_by_schema_too`, both red before). Limited to the in-scope database
+    as `intel::Catalog`'s `schema_qualified` is, since a `schema.table` never crosses a database.
     **The inline prediction is asked before the popup, and a reasoned one outranks it on an empty
     word.**
     `recompute_completions` asks `prediction_at` — `intel::predict` over the *offer* catalogue

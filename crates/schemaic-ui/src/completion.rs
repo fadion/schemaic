@@ -353,6 +353,10 @@ mod index {
         let mut columns: HashMap<String, Vec<ColMeta>> = HashMap::new();
         let mut columns_by_db: HashMap<(String, String), Rc<Vec<ColMeta>>> = HashMap::new();
         let mut tables_by_db: HashMap<String, Vec<String>> = HashMap::new();
+        // `schema.table` on PostgreSQL and SQL Server: the in-scope database's
+        // tables by their namespace, as `intel::Catalog::build` keeps them.
+        let mut columns_by_schema: HashMap<(String, String), Rc<Vec<ColMeta>>> = HashMap::new();
+        let mut tables_by_schema: HashMap<String, Vec<String>> = HashMap::new();
         for node in nodes {
             if !db_contributes(hidden, &node.database, active_db) {
                 continue;
@@ -371,6 +375,14 @@ mod index {
                 for t in &schema.tables {
                     by_db.push(t.name.clone());
                     let metas = col_metas(t);
+                    if in_scope && let Some(ns) = &t.schema {
+                        let ns = ns.to_ascii_lowercase();
+                        tables_by_schema
+                            .entry(ns.clone())
+                            .or_default()
+                            .push(t.name.clone());
+                        columns_by_schema.insert((ns, t.name.to_ascii_lowercase()), metas.clone());
+                    }
                     // Every database's columns are keyed by (db, table) for qualified
                     // (incl. cross-database) completion.
                     columns_by_db.insert(
@@ -443,6 +455,8 @@ mod index {
             columns,
             columns_by_db,
             tables_by_db,
+            columns_by_schema,
+            tables_by_schema,
         }
     }
 }
@@ -2674,6 +2688,40 @@ mod index_tests {
     /// **A hidden database contributes nothing at all** — not its name, not its
     /// tables, not its columns. The function's own doc says so; nothing asserted
     /// it for the index.
+    /// The tab's own database's tables are indexed by their schema too —
+    /// `sales.orders` on PostgreSQL or SQL Server — and another database's
+    /// are not, since a `schema.table` never crosses a database.
+    #[test]
+    fn the_tabs_database_is_indexed_by_schema_too() {
+        let in_ns = |ns: &str, name: &str, cols: &[&str]| TableInfo {
+            schema: Some(ns.to_string()),
+            ..tbl(name, cols, None)
+        };
+        let nodes = [
+            node(
+                "shop",
+                vec![
+                    in_ns("sales", "orders", &["region"]),
+                    in_ns("dbo", "orders", &["id"]),
+                ],
+            ),
+            node("archive", vec![in_ns("old", "orders", &["x"])]),
+        ];
+        let ix = index::build(&nodes, &HashSet::new(), Some("shop"));
+        let cols = |ns: &str| {
+            ix.columns_by_schema
+                .get(&(ns.to_string(), "orders".to_string()))
+                .map(|c| c.iter().map(|m| m.name.clone()).collect::<Vec<_>>())
+        };
+        assert_eq!(cols("sales"), Some(vec!["region".to_string()]));
+        assert_eq!(cols("dbo"), Some(vec!["id".to_string()]));
+        assert_eq!(cols("old"), None, "another database's schema");
+        assert_eq!(
+            ix.tables_by_schema.get("sales"),
+            Some(&vec!["orders".to_string()])
+        );
+    }
+
     #[test]
     fn a_hidden_database_contributes_no_name_no_table_and_no_column() {
         let nodes = [
