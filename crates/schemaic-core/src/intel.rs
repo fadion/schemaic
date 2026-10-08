@@ -14228,6 +14228,53 @@ fn clean_db_message(message: &str) -> String {
     cleaned.trim().to_string()
 }
 
+/// Where a failed run's `message` belongs in the buffer `sql`, given the byte
+/// ranges of the statements that **ran** (`crate::sql::executable_spans`), or
+/// `None` where that cannot be told.
+///
+/// Placed as live validation places its error ([`db_error_diagnostic`]), with
+/// one difference that is the reason to know what ran: the token is looked for
+/// **only in a statement that ran**. Read off the whole buffer, a column the
+/// server names in an `INSERT`'s complaint is often found in the statement
+/// *above* it, healthy, which is what `error_fix_range`'s doc warns of. That
+/// is settled when one statement ran; when several did, the one holding the
+/// token can still be a healthy one that ran before the failing one, and only
+/// the server's own error position would settle it.
+///
+/// One statement ran: the token in it, else its first word — it is the one
+/// that failed either way. Several: the one statement whose text holds the
+/// token, and nothing when two do or none does, since the message does not
+/// say which of them failed. A range the buffer no longer has (it was edited
+/// since) gives nothing too.
+pub fn run_error_diagnostic(
+    sql: &str,
+    ran: &[(usize, usize)],
+    message: &str,
+    dialect: SqlDialect,
+) -> Option<Diagnostic> {
+    if ran
+        .iter()
+        .any(|&(lo, hi)| lo > hi || sql.get(lo..hi).is_none())
+    {
+        return None;
+    }
+    let (lo, hi) = match ran {
+        [] => return None,
+        [one] => *one,
+        many => {
+            let mut holding = many
+                .iter()
+                .filter(|&&(lo, hi)| locate_db_error(&sql[lo..hi], message, dialect).is_some());
+            let one = *holding.next()?;
+            if holding.next().is_some() {
+                return None;
+            }
+            one
+        }
+    };
+    Some(db_error_diagnostic(sql, lo, hi, message, dialect))
+}
+
 /// Turn a database validation error (`message`, from a failed PREPARE/EXPLAIN) into
 /// a [`Diagnostic`] positioned within the statement `sql[lo..hi]`. The server names
 /// the offending token — a `near '<tok>'` clause or a quoted object name — which we
@@ -28533,6 +28580,54 @@ mod tests {
                 "Unknown column 'salery'".to_string()
             ]
         );
+    }
+
+    /// `run_error_diagnostic`'s range, as the text under it.
+    fn run_err_at(sql: &str, ran: &[(usize, usize)], msg: &str) -> Option<String> {
+        super::run_error_diagnostic(sql, ran, msg, SqlDialect::MySql)
+            .map(|d| sql[d.range.0..d.range.1].to_string())
+    }
+
+    #[test]
+    fn a_failed_run_is_underlined_where_the_server_points() {
+        let msg = "query failed: Unknown column 'salery' in 'field list'";
+        let sql = "SELECT salery FROM employees";
+        assert_eq!(
+            run_err_at(sql, &[(0, sql.len())], msg).as_deref(),
+            Some("salery")
+        );
+        // Of several that ran, the one statement holding the token.
+        let sql = "SELECT id FROM employees;\nSELECT salery FROM employees";
+        let ran = [(0, 25), (26, sql.len())];
+        let d = super::run_error_diagnostic(sql, &ran, msg, SqlDialect::MySql).unwrap();
+        assert_eq!(&sql[d.range.0..d.range.1], "salery");
+        assert_eq!(d.range.0, sql.rfind("salery").unwrap());
+        assert_eq!(d.severity, Severity::Error);
+        assert!(
+            d.message.starts_with("query failed: Unknown column"),
+            "{}",
+            d.message
+        );
+    }
+
+    #[test]
+    fn a_failed_run_is_underlined_only_in_what_ran() {
+        let msg = "query failed: Unknown column 'salery' in 'field list'";
+        // The token is in the statement above, which did not run: the one
+        // that did gets its first word, never the healthy neighbour.
+        let sql = "SELECT salery FROM employees;\nINSERT INTO t VALUES (1)";
+        assert_eq!(
+            run_err_at(sql, &[(30, sql.len())], msg).as_deref(),
+            Some("INSERT")
+        );
+        // Two that ran both hold it, or neither does: no telling which failed.
+        let sql = "SELECT salery FROM a;\nSELECT salery FROM b";
+        assert_eq!(run_err_at(sql, &[(0, 21), (22, sql.len())], msg), None);
+        let sql = "SELECT 1;\nSELECT 2";
+        assert_eq!(run_err_at(sql, &[(0, 9), (10, sql.len())], msg), None);
+        // A range the buffer no longer has.
+        assert_eq!(run_err_at("SELECT 1", &[(0, 40)], msg), None);
+        assert_eq!(run_err_at("SELECT 1", &[], msg), None);
     }
 
     #[test]

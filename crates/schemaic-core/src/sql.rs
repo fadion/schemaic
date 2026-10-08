@@ -1262,6 +1262,16 @@ pub fn statement_bounds(sql: &str, dialect: SqlDialect) -> Vec<usize> {
 /// failed at its first routine, half-loaded, on both the script runner and Run
 /// Everything.
 pub fn executable_statements(sql: &str, dialect: SqlDialect) -> Vec<String> {
+    executable_spans(sql, dialect)
+        .into_iter()
+        .map(|(lo, hi)| sql[lo..hi].to_string())
+        .collect()
+}
+
+/// [`executable_statements`] as the byte ranges of `sql` they are taken from:
+/// where each statement that runs **sits in the buffer**, which is what a
+/// failed run's error is placed against (`intel::run_error_diagnostic`).
+pub fn executable_spans(sql: &str, dialect: SqlDialect) -> Vec<(usize, usize)> {
     let mut delim: Vec<u8> = vec![b';'];
     let bounds = scan_bounds(sql, dialect, &mut delim, true, None);
     let mut out = Vec::new();
@@ -1271,11 +1281,21 @@ pub fn executable_statements(sql: &str, dialect: SqlDialect) -> Vec<String> {
         strip: 0,
     })) {
         if let Some(text) = executable_range(sql, prev, bound, dialect) {
-            out.push(text.to_string());
+            out.push(span_in(sql, text));
         }
         prev = bound.at;
     }
     out
+}
+
+/// Where `part`, a slice borrowed from `whole`, sits in it.
+pub fn span_in(whole: &str, part: &str) -> (usize, usize) {
+    let lo = part.as_ptr() as usize - whole.as_ptr() as usize;
+    debug_assert!(
+        lo + part.len() <= whole.len(),
+        "`part` is not a slice of `whole`"
+    );
+    (lo, lo + part.len())
 }
 
 /// One segment as the server should receive it, or `None` when it is not a
@@ -1679,13 +1699,32 @@ pub fn selection_statements(
     sel: Option<(usize, usize)>,
     dialect: SqlDialect,
 ) -> Option<Vec<String>> {
+    let spans = selection_spans(sql, sel, dialect)?;
+    Some(
+        spans
+            .into_iter()
+            .map(|(lo, hi)| sql[lo..hi].to_string())
+            .collect(),
+    )
+}
+
+/// [`selection_statements`] as byte ranges of `sql` — see [`executable_spans`].
+pub fn selection_spans(
+    sql: &str,
+    sel: Option<(usize, usize)>,
+    dialect: SqlDialect,
+) -> Option<Vec<(usize, usize)>> {
     let (a, b) = sel?;
-    let text = sql.get(a.min(b)..a.max(b))?;
+    let lo = a.min(b);
+    let text = sql.get(lo..a.max(b))?;
     if !holds_code(text, dialect) {
         return None;
     }
-    let stmts = executable_statements(text, dialect);
-    (!stmts.is_empty()).then_some(stmts)
+    let spans: Vec<(usize, usize)> = executable_spans(text, dialect)
+        .into_iter()
+        .map(|(s, e)| (lo + s, lo + e))
+        .collect();
+    (!spans.is_empty()).then_some(spans)
 }
 
 /// The statement the caret is **writing**: [`statement_range`]'s, or an empty
@@ -5171,6 +5210,39 @@ const SECRET_CALLS: &[&str] = &[
     "DBLINK_CONNECT_U",
     "DBLINK_EXEC",
 ];
+
+#[cfg(test)]
+mod span_tests {
+    use super::{executable_spans, executable_statements, selection_spans};
+    use crate::intel::SqlDialect;
+
+    #[test]
+    fn the_spans_are_where_the_executable_statements_sit() {
+        let sql = "SELECT 1;\nDELIMITER $$\nCREATE TRIGGER t BEFORE INSERT ON x FOR EACH ROW BEGIN SET @a = 1; END$$\nDELIMITER ;\n-- note\nSELECT 2";
+        let d = SqlDialect::MySql;
+        let spans = executable_spans(sql, d);
+        let texts: Vec<String> = spans.iter().map(|&(a, b)| sql[a..b].to_string()).collect();
+        assert_eq!(texts, executable_statements(sql, d));
+        assert_eq!(spans.len(), 3, "{texts:?}");
+        // The trigger's `$$` is not sent, and the span says so.
+        assert!(texts[1].ends_with("END"), "{texts:?}");
+        // A comment above a statement is sent with it.
+        assert_eq!(spans[2], (sql.find("-- note").unwrap(), sql.len()));
+    }
+
+    #[test]
+    fn a_selections_spans_are_in_the_buffer_not_the_selection() {
+        let sql = "SELECT 0;\nSELECT 1;\nSELECT 2;";
+        let d = SqlDialect::Postgres;
+        let lo = sql.find("SELECT 1").unwrap();
+        let spans = selection_spans(sql, Some((sql.len(), lo)), d).unwrap();
+        let texts: Vec<&str> = spans.iter().map(|&(a, b)| &sql[a..b]).collect();
+        assert_eq!(texts, ["SELECT 1;", "SELECT 2;"]);
+        assert_eq!(spans[0].0, lo);
+        assert_eq!(selection_spans(sql, Some((3, 3)), d), None);
+        assert_eq!(selection_spans(sql, None, d), None);
+    }
+}
 
 #[cfg(test)]
 mod holds_code_tests {

@@ -2708,6 +2708,33 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     // `live_validate` is on. Debounced: each edit bumps `val_gen`, and only the
     // latest generation's deferred round-trip fires (and its result is accepted).
     let db_diag: RwSignal<Vec<Diagnostic>> = RwSignal::new(Vec::new());
+    // A failed run's squiggle (`intel::run_error_diagnostic`), placed in what
+    // **ran**: each launch below records the buffer ranges it sent in
+    // `run_spans`, and the shown result failing places its message in them.
+    // Both go on the next edit, as the error bar does. A sibling of `db_diag`
+    // rather than an entry in it, because live validation's `set` would
+    // overwrite it.
+    let run_spans: RwSignal<Vec<(usize, usize)>> = RwSignal::new(Vec::new());
+    let run_diag: RwSignal<Vec<Diagnostic>> = RwSignal::new(Vec::new());
+    // Tracks the result only: a launch recording new spans must not re-place
+    // the error the last run left.
+    create_effect(move |_| {
+        let placed = match results.get() {
+            QueryState::Failed(err)
+                if err.source == schemaic_core::model::ErrorSource::Statement
+                    && !results.frozen() =>
+            {
+                let spans = run_spans.get_untracked();
+                query.with_untracked(|sql| {
+                    intel::run_error_diagnostic(sql, &spans, &err.text, dialect.get_untracked())
+                })
+            }
+            _ => None,
+        };
+        if placed.is_some() || !run_diag.with_untracked(Vec::is_empty) {
+            run_diag.set(placed.into_iter().collect());
+        }
+    });
     let val_gen: Rc<std::cell::Cell<u64>> = Rc::new(std::cell::Cell::new(0));
     // Offline diagnostics are likewise debounced: a burst of keystrokes bumps
     // `diag_gen` and only the latest generation's deferred pass re-parses, so we
@@ -3489,6 +3516,9 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 // selecting already said what to run.
                 let sel = e.cursor.get_untracked().get_selection();
                 if let Some(mut stmts) = schemaic_core::sql::selection_statements(&sql, sel, dia) {
+                    run_spans.set(
+                        schemaic_core::sql::selection_spans(&sql, sel, dia).unwrap_or_default(),
+                    );
                     comp.open.set(false);
                     if stmts.len() == 1 {
                         (guarded_run_key)(stmts.remove(0));
@@ -3528,6 +3558,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     )));
                     comp.open.set(false);
                 } else {
+                    run_spans.set(schemaic_core::sql::executable_spans(&sql, dia));
                     (guarded_run_key)(sql.clone());
                 }
             });
@@ -4204,6 +4235,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 });
                 let mut diags = syntax.get_untracked();
                 db_diag.with_untracked(|d| diags.extend_from_slice(d));
+                run_diag.with_untracked(|d| diags.extend_from_slice(d));
                 ((lo, hi), intel::problems_in_range(&diags, lo, hi))
             };
             // **No AI entry while the assistant is off** — absent rather than
@@ -4814,6 +4846,14 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             // memo rebuilds every squiggle's view.
             if !db_diag.with_untracked(Vec::is_empty) {
                 db_diag.set(Vec::new());
+            }
+            // The run's squiggle and the ranges it was placed in describe
+            // text that has just changed.
+            if !run_diag.with_untracked(Vec::is_empty) {
+                run_diag.set(Vec::new());
+            }
+            if !run_spans.with_untracked(Vec::is_empty) {
+                run_spans.set(Vec::new());
             }
             if live_validate.get_untracked() {
                 let g = val_gen.get().wrapping_add(1);
@@ -5544,6 +5584,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                             run_menu_offset.get_untracked(),
                             dialect.get_untracked(),
                         ) {
+                            run_spans.set(vec![schemaic_core::sql::span_in(&sql, stmt)]);
                             (run)(stmt.to_string());
                         }
                         // Down with the menu, as on Escape and Run Everything. The
@@ -5573,6 +5614,10 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                             &sql,
                             dialect.get_untracked(),
                         );
+                        run_spans.set(schemaic_core::sql::executable_spans(
+                            &sql,
+                            dialect.get_untracked(),
+                        ));
                         (run_all)(stmts);
                         highlight.set(None);
                         run_menu.set(None);
@@ -5962,6 +6007,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         create_memo(move |_| {
             let mut diags = syntax.get();
             diags.extend(db_diag.get());
+            diags.extend(run_diag.get());
             let vp = ed.viewport.get();
             let points = editor_points(&ed);
             // **Once for the whole list.** `content_x_of` counts every newline
@@ -6196,6 +6242,9 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             if query.with_untracked(|q| q.trim().is_empty()) {
                 return;
             }
+            run_spans.set(query.with_untracked(|q| {
+                schemaic_core::sql::executable_spans(q, dialect.get_untracked())
+            }));
             (run)(query.get_untracked())
         })
         .on_event(EventListener::PointerEnter, move |_| {

@@ -1030,7 +1030,21 @@ existing prose was left alone.
     and wrong when it is handed a script — `near 'FROM t2'` names a word every statement has, so the
     fix scoped to the first one, a working statement that Accept would then overwrite while the
     broken one stayed broken. A token that appears twice identifies nothing, so `repeats_ci` sends
-    it back to the whole-buffer fallback.
+    it back to the whole-buffer fallback. What the text alone cannot settle is a token the failing
+    statement does not hold at all — a `NOT NULL` column an `INSERT` omitted — which is unique code
+    in the statement *above*, so `error_fix_range` still scopes the fix there; that range has to
+    come from the run, and the fix does not take it yet.
+    **`run_error_diagnostic` is where a failed run is squiggled, and it is handed what ran** — the
+    buffer ranges the launch sent (`sql::executable_spans`/`selection_spans`), which is the range
+    `error_fix_range` lacks. One range is the statement that failed whatever the message names, so
+    it goes to `db_error_diagnostic` (the token, else the first word); with several, the token is
+    looked for only in what ran, and exactly one holding it decides — two, or none, and nothing is
+    drawn, since the message does not say which failed. An empty list, or a range the buffer no
+    longer has, draws nothing either (`a_failed_run_is_underlined_where_the_server_points`,
+    `a_failed_run_is_underlined_only_in_what_ran`). So Ctrl+Enter on one statement can no longer
+    land in its neighbour; Run Everything still can, when the token's one holder is a statement
+    that ran *before* the failing one. PostgreSQL reports the error's own position, which would
+    settle that, but `db::pg` flattens the error to a string (`db_text`) and it is not used yet.
     **`code_names` is that same scan reduced to a yes/no, and it is `pub` for a caller outside this
     crate.** `db::sqlite`'s introspection needs to know which triggers name a table — that is
     `TableInfo::referring_ddl` — and a `contains` there matches the word inside a comment or a `'…'`
@@ -23787,6 +23801,16 @@ existing prose was left alone.
     (`query_pane` + the Ctrl+K bar, statement highlight, custom scrollbars). `compute_diagnostics`
     bridges the tab's schema/active-db to `intel::diagnostics`; `syntax_view` draws severity-coloured
     squiggles (red errors / amber typo warnings).
+    **A failed run's squiggle is `run_diag`, a sibling of live validation's `db_diag`** rather than
+    an entry in it, because validation `set`s `db_diag` whole and would wipe it. Every launch — the
+    selection and lone-statement Ctrl+Enter, the run menu's two entries, the play button — records
+    the buffer ranges it sends in `run_spans` (Run Current's through `sql::span_in` over
+    `executable_at`'s slice), and an effect that tracks only the shown result places
+    `intel::run_error_diagnostic` there when it is a statement's `Failed` and not frozen. It reads
+    `run_spans` **untracked**, and that is load-bearing: tracked, the next launch's new spans would
+    re-place the previous run's error in them before the new result arrived. The next edit clears
+    both, as it does the error bar. Both merge sites that read `db_diag` — `diag_hits` and the
+    menu's `statement_problems` for *AI fix* — read `run_diag` too.
     **Hovering a squiggle shows its message, and nothing about the squiggle is hoverable** — a
     `.tooltip()` on each one never fired and cannot be made to (the *Floem 0.2 gotchas* pointer
     bullet says why). `editor_area` watches `PointerMove` with `on_event_cont` and hit-tests the
@@ -30075,7 +30099,7 @@ Re-introducing the anti-patterns these guard against is a regression:
   **It's dialect-aware:** `skip_noncode`/
   `skip_comment` (and the `sql.rs` helpers built on them — `statement_bounds`/`ranges`/`range`/
   `first_statement`, `statement_bounds_open` (the resumable form the script splitter feeds),
-  `executable_statements`/`executable_range`/`executable_at`,
+  `executable_statements`/`executable_spans`/`executable_range`/`executable_at`,
   `read_only_reason`, `has_top_level_where`/`unsafe_reason`/`first_unsafe`/`contains_write`) take a
   `SqlDialect`, so pass the connection's dialect (Postgres `#` is an operator not a comment, `$tag$…$tag$`
   is a string, `"…"` an identifier, `\`-escapes only in MySQL / PG `E'…'`; SQLite takes `"x"`,
@@ -30104,7 +30128,12 @@ Re-introducing the anti-patterns these guard against is a regression:
   was left behind by the first two and shipped a release sending `…END$$`). Anything that
   *executes* uses one of those three; anything that selects, highlights or measures keeps
   `statement_range` — save Run Current's own outline, which is `run_current_range`, the range
-  `executable_at` sends (shorter inside a T-SQL batch scope; see `BatchScope` above). The other half of that
+  `executable_at` sends (shorter inside a T-SQL batch scope; see `BatchScope` above). Where those
+  statements *sit* is `executable_spans` (and `selection_spans`, offset into the buffer rather than
+  the selection), and `executable_statements`/`selection_statements` are those spans sliced — one
+  computation, so the ranges a failed run is squiggled in (`intel::run_error_diagnostic`) cannot
+  drift from the text that was sent (`the_spans_are_where_the_executable_statements_sit`,
+  `a_selections_spans_are_in_the_buffer_not_the_selection`). The other half of that
   is `ddl::client_script` — what `ChangeSet::editor_script` and a routine's `Generate DDL` both go
   through — which asks `== MySql` before reaching for `DELIMITER $$` so a SQLite plan is never
   handed a directive the engine has never heard of, and **terminates every statement** on the way
