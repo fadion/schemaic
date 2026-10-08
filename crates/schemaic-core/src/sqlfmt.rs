@@ -923,6 +923,11 @@ fn is_keyword(w: &str) -> bool {
                 | "DEFAULT"
                 // T-SQL's `TOP (n)` is a clause's parens, not a call's.
                 | "TOP"
+                // A key's or a check's column list: `PRIMARY KEY (id)`,
+                // `UNIQUE (email)`, `CHECK (qty > 0)`.
+                | "KEY"
+                | "UNIQUE"
+                | "CHECK"
         )
 }
 
@@ -978,6 +983,9 @@ struct Paren {
     subquery: bool,
     saved_base: usize,
     saved_content: usize,
+    /// A `CREATE TABLE`'s body ([`Fmt::opens_table_body`]): one item a line,
+    /// the `)` back at this indent.
+    listed: Option<usize>,
 }
 
 struct Fmt<'a> {
@@ -1015,6 +1023,9 @@ struct Fmt<'a> {
     /// comma is MySQL's `LIMIT offset, count`, not a list's. A depth, so the
     /// comma after a subquery's `LIMIT` closes back into an ordinary list.
     limit_depth: Option<usize>,
+    /// The `(` being written is a table body's, set off from the name before
+    /// it ([`Fmt::opens_table_body`]).
+    spaced_paren: bool,
     /// The `CASE`s open, innermost last.
     cases: Vec<CaseFrame>,
     /// The statement's first word, upper-cased — what an `OUTPUT` is a
@@ -1065,6 +1076,7 @@ impl<'a> Fmt<'a> {
             suppress_and: false,
             tight_next: false,
             limit_depth: None,
+            spaced_paren: false,
             cases: Vec::new(),
             verb: None,
             output_clause: has_output_clause(dialect),
@@ -1288,6 +1300,9 @@ impl<'a> Fmt<'a> {
         {
             return true;
         }
+        if cur_kind == Kind::Punct && cur == "(" && self.spaced_paren {
+            return true;
+        }
         if cur_kind == Kind::Punct && cur == "(" {
             // Function call `name(` / `)(` → tight; `KEYWORD (` → spaced —
             // save a keyword that is also a function, whose `(` is a call's.
@@ -1306,6 +1321,76 @@ impl<'a> Fmt<'a> {
         match &self.prev {
             Some((Kind::Word, t)) => Some(t.to_ascii_uppercase()),
             _ => None,
+        }
+    }
+
+    /// Is the `(` at `toks[k]` a table's body — `CREATE [TEMPORARY] TABLE [IF
+    /// NOT EXISTS] name (` — whose items go one a line?
+    fn opens_table_body(&self, toks: &[(Kind, &str)], k: usize) -> bool {
+        if self.verb.as_deref() != Some("CREATE") {
+            return false;
+        }
+        // Back over the name — `a.b.c`, quoted or not — to the words before it.
+        let mut i = k;
+        loop {
+            match i.checked_sub(1).map(|j| toks[j].0) {
+                Some(Kind::Word | Kind::Quoted) => i -= 1,
+                _ => return false,
+            }
+            match i.checked_sub(1).map(|j| toks[j]) {
+                Some((Kind::Punct, ".")) => i -= 1,
+                _ => break,
+            }
+        }
+        let word = |j: usize, w: &str| matches!(toks.get(j), Some((Kind::Word, t)) if t.eq_ignore_ascii_case(w));
+        // `IF NOT EXISTS` between `TABLE` and the name.
+        if i >= 3 && word(i - 1, "EXISTS") && word(i - 2, "NOT") && word(i - 3, "IF") {
+            i -= 3;
+        }
+        i >= 1 && word(i - 1, "TABLE")
+    }
+
+    /// Is the head word `up` at `toks[k]` only **spelling** a clause, inside
+    /// something else that uses the word? Then it stays on its line:
+    ///
+    /// - `DELETE`/`UPDATE`/`INSERT` naming an event — a foreign key's
+    ///   `ON DELETE`, a lock's `FOR UPDATE`, a trigger's `AFTER INSERT`,
+    ///   `BEFORE UPDATE`, `INSERT OR UPDATE`, `UPDATE OF`;
+    /// - `SET` in `CHARACTER SET`, an action's `ON DELETE SET NULL`, and any
+    ///   `SET` of an `ALTER` (`ALTER COLUMN c SET DEFAULT 0`);
+    /// - `REPLACE` of `CREATE OR REPLACE`;
+    /// - `WITH` that opens no CTE list — `WITH ROLLUP`, `WITH CHECK OPTION`,
+    ///   `TIMESTAMP WITH TIME ZONE`, a table hint's `WITH (NOLOCK)` — which is
+    ///   every `WITH` not followed by `RECURSIVE` or by a name and then `AS`
+    ///   or a column list.
+    fn only_spells_a_clause(
+        up: &str,
+        prev: Option<&str>,
+        verb: Option<&str>,
+        toks: &[(Kind, &str)],
+        k: usize,
+    ) -> bool {
+        let word_at = |i: usize| match toks.get(i) {
+            Some((Kind::Word, w)) => Some(w.to_ascii_uppercase()),
+            _ => None,
+        };
+        match up {
+            "DELETE" | "UPDATE" | "INSERT" => matches!(
+                prev,
+                Some("ON" | "FOR" | "BEFORE" | "AFTER" | "OF" | "OR" | "INSTEAD")
+            ),
+            "SET" => {
+                matches!(prev, Some("CHARACTER" | "DELETE" | "UPDATE")) || verb == Some("ALTER")
+            }
+            "REPLACE" => prev == Some("OR"),
+            "WITH" => {
+                let opens = word_at(k + 1).as_deref() == Some("RECURSIVE")
+                    || (word_at(k + 1).is_some()
+                        && (word_at(k + 2).as_deref() == Some("AS")
+                            || matches!(toks.get(k + 2), Some((Kind::Punct, "(")))));
+                !opens
+            }
+            _ => false,
         }
     }
 
@@ -1551,7 +1636,17 @@ impl<'a> Fmt<'a> {
                         }
                         self.emit(Kind::Word, text, false);
                         k += self.emit_block_follower(toks, k);
-                    } else if !in_expr && (HEADS.contains(&up.as_str()) || output_head) {
+                    } else if !in_expr
+                        && ((HEADS.contains(&up.as_str())
+                            && !Self::only_spells_a_clause(
+                                &up,
+                                self.prev_word_upper().as_deref(),
+                                self.verb.as_deref(),
+                                toks,
+                                k,
+                            ))
+                            || output_head)
+                    {
                         self.limit_depth = (up == "LIMIT").then_some(self.parens.len());
                         self.break_to(self.base);
                         self.emit(Kind::Word, text, false);
@@ -1587,21 +1682,35 @@ impl<'a> Fmt<'a> {
                 Kind::Punct => match text {
                     "(" => {
                         let sub = self.next_is_subquery(toks, k);
+                        let body = !sub && self.opens_table_body(toks, k);
+                        // A table's body is set off from its name; a call's
+                        // `(` would sit against it.
+                        self.spaced_paren = body;
                         self.emit(Kind::Punct, "(", false);
+                        self.spaced_paren = false;
                         self.parens.push(Paren {
                             subquery: sub,
                             saved_base: self.base,
                             saved_content: self.content,
+                            listed: body.then_some(self.line_indent),
                         });
                         if sub {
                             self.base = self.line_indent + 1;
                             self.content = self.base;
                             self.break_to(self.base);
+                        } else if body {
+                            self.content = self.line_indent + 1;
+                            self.break_to(self.content);
                         }
                     }
                     ")" => {
                         if let Some(p) = self.parens.pop() {
-                            if p.subquery {
+                            if let Some(at) = p.listed {
+                                self.break_to(at);
+                                self.emit(Kind::Punct, ")", true);
+                                self.base = p.saved_base;
+                                self.content = p.saved_content;
+                            } else if p.subquery {
                                 let close = self.base.saturating_sub(1);
                                 self.break_to(close);
                                 self.emit(Kind::Punct, ")", true);
@@ -1622,7 +1731,7 @@ impl<'a> Fmt<'a> {
                             && self.limit_depth != Some(self.parens.len())
                             && match self.parens.last() {
                                 None => true,
-                                Some(p) => p.subquery,
+                                Some(p) => p.subquery || p.listed.is_some(),
                             };
                         if breakable {
                             self.break_to(self.content);
@@ -1719,6 +1828,58 @@ impl<'a> Fmt<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn my(sql: &str) -> String {
+        super::format_sql(sql, "    ", SqlDialect::MySql)
+    }
+
+    #[test]
+    fn a_create_tables_body_is_one_item_a_line() {
+        assert_eq!(
+            my(
+                "CREATE TABLE t (id int NOT NULL, name varchar(40) CHARACTER SET utf8mb4, \
+                PRIMARY KEY (id), CONSTRAINT fk FOREIGN KEY (a) REFERENCES b (id) \
+                ON DELETE CASCADE ON UPDATE SET NULL)"
+            ),
+            "CREATE TABLE t (\n    id int NOT NULL,\n    name varchar(40) CHARACTER SET utf8mb4,\n    \
+             PRIMARY KEY (id),\n    CONSTRAINT fk FOREIGN KEY (a) REFERENCES b(id) \
+             ON DELETE CASCADE ON UPDATE SET NULL\n)"
+        );
+        assert_eq!(
+            super::format_sql(
+                "create table if not exists sales.t (id int, n numeric(10, 2)) engine=InnoDB",
+                "  ",
+                SqlDialect::MySql
+            ),
+            "create table if not exists sales.t (\n  id int,\n  n numeric(10, 2)\n) engine = InnoDB"
+        );
+    }
+
+    #[test]
+    fn a_word_that_only_spells_a_clause_does_not_open_one() {
+        // A foreign key's actions, a charset, a row lock, a rollup.
+        assert_eq!(
+            my(
+                "ALTER TABLE t ADD CONSTRAINT fk FOREIGN KEY (a) REFERENCES b (id) ON DELETE CASCADE"
+            ),
+            "ALTER TABLE t ADD CONSTRAINT fk FOREIGN KEY (a) REFERENCES b(id) ON DELETE CASCADE"
+        );
+        assert_eq!(
+            my("SELECT a, count(*) FROM t GROUP BY a WITH ROLLUP"),
+            "SELECT\n    a,\n    count(*)\nFROM\n    t\nGROUP BY\n    a WITH ROLLUP"
+        );
+        assert_eq!(
+            my("SELECT * FROM t WHERE id = 1 FOR UPDATE"),
+            "SELECT\n    *\nFROM\n    t\nWHERE\n    id = 1 FOR UPDATE"
+        );
+        assert_eq!(
+            my("ALTER TABLE t MODIFY c varchar(9) CHARACTER SET latin1"),
+            "ALTER TABLE t MODIFY c varchar(9) CHARACTER SET latin1"
+        );
+        // A real clause still opens: a CTE's `WITH`, an UPDATE's `SET`.
+        assert!(my("WITH x AS (SELECT 1) SELECT * FROM x").starts_with("WITH\n"));
+        assert!(my("UPDATE t SET a = 1").contains("\nSET\n"));
+    }
 
     /// Upper or lower case for keywords — the words every server of the
     /// dialect reserves, and the formatter's own layout keywords — and nothing

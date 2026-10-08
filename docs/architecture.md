@@ -12505,7 +12505,20 @@ existing prose was left alone.
     `LEFT`, `RIGHT`, `REPLACE` and `INSERT` with a `(` straight after them are calls, a plain word
     with a tight `(` (`is_called_keyword`); laid out as the clause or join they also spell, these
     everyday string functions broke the select list. None of those clauses is ever followed by `(`
-    (`a_keyword_called_as_a_function_stays_a_call`). And a `'…'` literal that
+    (`a_keyword_called_as_a_function_stays_a_call`). **A head word that only spells a clause
+    inside something else stays on its line** (`only_spells_a_clause`): `DELETE`/`UPDATE`/`INSERT`
+    after `ON`, `FOR`, `BEFORE`, `AFTER`, `OF`, `OR` or `INSTEAD` (a foreign key's action, a row
+    lock, a trigger's event); `SET` after `CHARACTER` or an action's `DELETE`/`UPDATE`, and every
+    `SET` of an `ALTER`; `REPLACE` of `CREATE OR REPLACE`; and a `WITH` that opens no CTE list —
+    one not followed by `RECURSIVE` or by a name and then `AS` or a column list, so `WITH
+    ROLLUP`, `WITH CHECK OPTION` and `TIMESTAMP WITH TIME ZONE`. `ON DELETE CASCADE` came out
+    `ON` / `DELETE` / `CASCADE` on three lines, `DELETE` laid out as a statement
+    (`a_word_that_only_spells_a_clause_does_not_open_one`). **A `CREATE TABLE`'s body is one item a
+    line** (`opens_table_body`: `CREATE [TEMPORARY] TABLE [IF NOT EXISTS] name (`): its `(` is set
+    off from the name (`spaced_paren`), each top-level comma breaks, and its `)` returns to the
+    opener's indent — a `Paren::listed`, whose inside is still an expression paren, so `CHARACTER
+    SET` and `ON DELETE` keep their lines; `KEY`, `UNIQUE` and `CHECK` take a spaced `(` as a
+    clause's does (`a_create_tables_body_is_one_item_a_line`). And a `'…'` literal that
     followed another across a newline in the input breaks to a new line again, through `between`:
     on PostgreSQL `'foo'⏎'bar'` is one literal only because of the newline, and joined onto one line
     it is a syntax error. Literals written on one line stay on one
