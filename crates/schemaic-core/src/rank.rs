@@ -165,6 +165,32 @@ pub struct SchemaIndex {
     /// `(database, name)` (both lowercase) of every view, so a table row can
     /// say it is one.
     pub views: HashSet<(String, String)>,
+    /// A PostgreSQL enum type's labels, in order, by its name (lowercase) and
+    /// by `schema.name`: a column of one carries only the name, so its members
+    /// are here rather than in its type ([`enum_value_suggestions`]).
+    pub enum_types: HashMap<String, Vec<String>>,
+}
+
+impl SchemaIndex {
+    /// A table's columns as a reference in scope reaches it: through its
+    /// database (or, on PostgreSQL and SQL Server, its namespace) when
+    /// qualified, the active database's pool when bare. Empty for one not
+    /// loaded.
+    pub fn columns_of(&self, db: Option<&str>, name: &str) -> &[ColMeta] {
+        match db {
+            Some(db) => {
+                let key = (db.to_ascii_lowercase(), name.to_ascii_lowercase());
+                self.columns_by_db
+                    .get(&key)
+                    .or_else(|| self.columns_by_schema.get(&key))
+                    .map_or(&[][..], |m| m.as_slice())
+            }
+            None => self
+                .columns
+                .get(&name.to_ascii_lowercase())
+                .map_or(&[][..], Vec::as_slice),
+        }
+    }
 }
 
 /// One table as [`SchemaIndex::all_tables`] holds it.
@@ -539,22 +565,7 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
     // second copy of each table's columns, and this took one anyway.
     // A qualifier is a database (MySQL), else a schema of the tab's own
     // database (PostgreSQL, SQL Server) — `SchemaIndex::columns_by_schema`.
-    let cols_of = |db: Option<&str>, name: &str| -> &[ColMeta] {
-        match db {
-            Some(db) => {
-                let key = (db.to_ascii_lowercase(), name.to_ascii_lowercase());
-                schema
-                    .columns_by_db
-                    .get(&key)
-                    .or_else(|| schema.columns_by_schema.get(&key))
-                    .map_or(&[][..], |m| m.as_slice())
-            }
-            None => schema
-                .columns
-                .get(&name.to_ascii_lowercase())
-                .map_or(&[][..], Vec::as_slice),
-        }
-    };
+    let cols_of = |db: Option<&str>, name: &str| schema.columns_of(db, name);
     // Snippet abbrevs, in the top tier and ahead of the keyword continuations: an
     // abbrev is a name its owner chose *in order to type it*, so when one matches
     // what is being typed it is not a guess the way a ranked keyword is.
@@ -1018,6 +1029,84 @@ pub fn accepted_insert(
         }
         _ => None,
     }
+}
+
+/// The members of the column a string is compared with — `status = '|` —
+/// offered in the string ([`crate::intel::enum_value_slot`]), or nothing when
+/// the column is not in scope or not an enum or set.
+///
+/// The column is the one `slot` names in the statement's `scope`: through its
+/// qualifier (an alias, or a table's own name), or the first table in scope
+/// that has it. Its members are its type's — a MySQL `enum(…)`/`set(…)`,
+/// read as the grid's cell editor reads them (`celledit::editor_for_type`) —
+/// or, for a PostgreSQL enum, the labels [`SchemaIndex::enum_types`] holds.
+/// Kept in declaration order, which for an enum is its meaning, and narrowed
+/// to those starting with what is typed.
+///
+/// Each row replaces the literal's contents, written as the dialect writes a
+/// string literal (`export::sql_literal`, quotes off), so `won't` arrives as
+/// `won''t`; the closing quote comes with it where the literal had none.
+pub fn enum_value_suggestions(
+    schema: &SchemaIndex,
+    scope: &[TableRef],
+    slot: &crate::intel::EnumSlot,
+    sql: &str,
+    caret: usize,
+    dialect: crate::intel::SqlDialect,
+) -> Vec<Suggestion> {
+    let named = |r: &&TableRef| {
+        slot.qualifier.as_deref().is_none_or(|q| {
+            r.alias
+                .as_deref()
+                .unwrap_or(&r.name)
+                .eq_ignore_ascii_case(q)
+        })
+    };
+    let Some(type_name) = scope.iter().filter(named).find_map(|r| {
+        schema
+            .columns_of(r.db.as_deref(), &r.name)
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(&slot.column))
+            .map(|c| c.type_name.clone())
+    }) else {
+        return Vec::new();
+    };
+    use crate::celledit::{CellEditor, editor_for_type};
+    let members = match editor_for_type(&type_name, dialect) {
+        CellEditor::Enum(m) | CellEditor::Set(m) => m,
+        _ => match schema
+            .enum_types
+            .get(&type_name.trim().to_ascii_lowercase())
+        {
+            Some(m) => m.clone(),
+            None => return Vec::new(),
+        },
+    };
+    let typed = sql.get(slot.value.0..caret.max(slot.value.0)).unwrap_or("");
+    members
+        .into_iter()
+        .filter(|m| typed.is_empty() || begins_with(m, typed))
+        .map(|m| {
+            let lit = crate::export::sql_literal(&crate::model::Value::Str(m.clone()), dialect);
+            let inner = &lit[lit.find('\'').map_or(0, |i| i + 1)..lit.len() - 1];
+            let insert = if slot.closed {
+                inner.to_string()
+            } else {
+                format!("{inner}'")
+            };
+            Suggestion {
+                text: m,
+                kind: SuggestKind::Column,
+                detail: type_name.clone(),
+                table: String::new(),
+                alias: String::new(),
+                glyph: SuggestGlyph::Kind,
+                key: KeyKind::None,
+                insert: Some(insert),
+                replace: Some(slot.value),
+            }
+        })
+        .collect()
 }
 
 /// Does `cand` begin with a non-empty `prefix`, ignoring ASCII case?
@@ -2622,6 +2711,111 @@ mod tests {
         );
         // And the plain `orders` row is still below it rather than gone.
         assert!(out.iter().any(|s| s.text == "orders"), "{out:?}");
+    }
+
+    /// `enum_value_suggestions` at the `|`, as `(text, insert, replaced text)`.
+    fn enum_rows(sql: &str, s: &SchemaIndex, dialect: SqlDialect) -> Vec<(String, String, String)> {
+        let caret = sql.find('|').unwrap();
+        let sql = sql.replace('|', "");
+        let Some(slot) = crate::intel::enum_value_slot(&sql, 0, caret, dialect) else {
+            return Vec::new();
+        };
+        let scope = crate::intel::statement_scope(&sql, 0, sql.len(), caret, dialect).tables;
+        enum_value_suggestions(s, &scope, &slot, &sql, caret, dialect)
+            .into_iter()
+            .map(|r| {
+                let (a, b) = r.replace.unwrap();
+                (r.text, r.insert.unwrap(), sql[a..b].to_string())
+            })
+            .collect()
+    }
+
+    fn ticketed() -> SchemaIndex {
+        let col = |n: &str, t: &str| ColMeta {
+            name: n.to_string(),
+            type_name: t.to_string(),
+            nullable: false,
+            primary_key: false,
+            foreign_key: false,
+        };
+        let tickets = vec![
+            col("id", "int"),
+            col("status", "enum('open','in review','won''t fix')"),
+            col("mood", "mood"),
+        ];
+        let mut columns = HashMap::new();
+        columns.insert("tickets".to_string(), tickets);
+        let mut enum_types = HashMap::new();
+        enum_types.insert(
+            "mood".to_string(),
+            vec!["happy".to_string(), "sad".to_string()],
+        );
+        SchemaIndex {
+            tables: vec![("tickets".to_string(), "shop".to_string())],
+            columns,
+            enum_types,
+            ..SchemaIndex::default()
+        }
+    }
+
+    #[test]
+    fn a_column_s_enum_members_are_offered_in_its_string() {
+        let s = ticketed();
+        let texts = |sql: &str, d| -> Vec<String> {
+            enum_rows(sql, &s, d).into_iter().map(|r| r.0).collect()
+        };
+        // In declaration order, and narrowed by what is typed.
+        assert_eq!(
+            texts("SELECT * FROM tickets WHERE status = '|", SqlDialect::MySql),
+            ["open", "in review", "won't fix"]
+        );
+        assert_eq!(
+            texts(
+                "SELECT * FROM tickets t WHERE t.status = 'IN|",
+                SqlDialect::MySql
+            ),
+            ["in review"]
+        );
+        // A PostgreSQL enum is a named type, its labels the schema's.
+        assert_eq!(
+            texts(
+                "SELECT * FROM tickets WHERE mood IN ('happy', '|",
+                SqlDialect::Postgres
+            ),
+            ["happy", "sad"]
+        );
+        // Not an enum, not a column, not in scope: nothing.
+        assert!(texts("SELECT * FROM tickets WHERE id = '|", SqlDialect::MySql).is_empty());
+        assert!(texts("SELECT * FROM tickets WHERE nope = '|", SqlDialect::MySql).is_empty());
+        assert!(texts("SELECT * FROM other WHERE status = '|", SqlDialect::MySql).is_empty());
+    }
+
+    #[test]
+    fn an_enum_member_is_written_as_a_literal_and_closes_its_quote() {
+        let s = ticketed();
+        let rows = enum_rows(
+            "SELECT * FROM tickets WHERE status = 'w|",
+            &s,
+            SqlDialect::MySql,
+        );
+        assert_eq!(
+            rows,
+            [(
+                "won't fix".to_string(),
+                "won''t fix'".to_string(),
+                "w".to_string()
+            )]
+        );
+        // A closed literal is replaced inside its quotes, and keeps them.
+        let rows = enum_rows(
+            "SELECT * FROM tickets WHERE status = 'op|x' AND 1",
+            &s,
+            SqlDialect::MySql,
+        );
+        assert_eq!(
+            rows,
+            [("open".to_string(), "open".to_string(), "opx".to_string())]
+        );
     }
 
     /// A target that carries an aliased form inserts it — the alias and the

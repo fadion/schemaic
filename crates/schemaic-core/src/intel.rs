@@ -15229,6 +15229,137 @@ pub fn caret_in_literal_or_comment(
     )
 }
 
+/// A string literal the caret is in, where the string is a column's **value**:
+/// what [`enum_value_slot`] answers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnumSlot {
+    /// `x` of `x.status`, as written.
+    pub qualifier: Option<String>,
+    pub column: String,
+    /// The literal's contents, quotes excluded: through its closing quote
+    /// when it has one, else through the caret.
+    pub value: (usize, usize),
+    /// Whether the literal has its closing quote.
+    pub closed: bool,
+}
+
+/// Is `caret` inside a `'…'` that a column is compared with — `status = '`,
+/// `x.status <> '`, `!=`, `status IN ('a', '` and `NOT IN`, an `UPDATE`'s
+/// `SET status = '` — reading `sql` from `lo`? Where completion offers the
+/// column's enum members (`rank::enum_value_suggestions`).
+///
+/// Narrow on purpose: the left side is a bare or qualified column name and
+/// nothing else, so `f(a) = '` or `(a) = '` is not one, and neither is an
+/// ordering comparison, a `LIKE` or a `VALUES` tuple, where a member is not
+/// what is wanted. Read through [`skip_noncode`] for the literal and the token
+/// stream for the names, so a comment or a quoted name reads as it should.
+pub fn enum_value_slot(
+    sql: &str,
+    lo: usize,
+    caret: usize,
+    dialect: SqlDialect,
+) -> Option<EnumSlot> {
+    if !matches!(
+        caret_noncode(sql, lo, caret, dialect),
+        Some(crate::sql::NonCode::Literal)
+    ) {
+        return None;
+    }
+    let b = sql.as_bytes();
+    let (lo, caret) = (lo.min(caret), caret.min(sql.len()));
+    // The literal open at the caret.
+    let mut i = lo;
+    let (q, end) = loop {
+        if i >= caret {
+            return None;
+        }
+        match skip_noncode(b, i, dialect) {
+            Some(j) if j >= caret => break (i, j),
+            Some(j) => i = j.max(i + 1),
+            None => i += 1,
+        }
+    };
+    if b[q] != b'\'' {
+        return None;
+    }
+    let closed = end > caret && b[end - 1] == b'\'';
+    let value = (q + 1, if closed { end - 1 } else { caret });
+    // What the literal is compared with: an operator, or an `IN (` list.
+    let before = sql[lo..q].trim_end();
+    let toks = tokenize_range(sql, lo, lo + before.len(), dialect);
+    let lhs_end = if let Some(op) = ["<>", "!=", "="].iter().find(|o| before.ends_with(**o)) {
+        let at = before.len() - op.len();
+        // `<=`, `>=`, `:=`, `==` are not a column's equality.
+        if *op == "=" && before[..at].ends_with(['<', '>', '!', ':', '=']) {
+            return None;
+        }
+        Some(lo + before[..at].trim_end().len())
+    } else {
+        None
+    };
+    let col_at = match lhs_end {
+        // The name must end right where the operator's left side does.
+        Some(end) => toks
+            .iter()
+            .rposition(|t| t.end == end && matches!(t.kind, TkKind::Word(_)))?,
+        None => {
+            // `IN (` then literals and commas (which the tokenizer keeps no
+            // trace of but the commas) up to the caret's.
+            let mut k = toks.len().checked_sub(1)?;
+            while matches!(toks[k].kind, TkKind::Comma) {
+                k = k.checked_sub(1)?;
+            }
+            if !matches!(toks[k].kind, TkKind::LParen) {
+                return None;
+            }
+            let in_at = k.checked_sub(1)?;
+            match &toks[in_at].kind {
+                TkKind::Word(w) if !toks[in_at].quoted && w.eq_ignore_ascii_case("IN") => {}
+                _ => return None,
+            }
+            let mut c = in_at.checked_sub(1)?;
+            if matches!(&toks[c].kind, TkKind::Word(w) if !toks[c].quoted && w.eq_ignore_ascii_case("NOT"))
+            {
+                c = c.checked_sub(1)?;
+            }
+            c
+        }
+    };
+    // Every token past the name's must be gone — `(a) = '` ends in `)`.
+    if lhs_end.is_some() && col_at + 1 != toks.len() {
+        return None;
+    }
+    let TkKind::Word(column) = &toks[col_at].kind else {
+        return None;
+    };
+    // A variable (`@v`, whose sigil the tokenizer drops) or a number.
+    let at = toks[col_at].at;
+    if (at > 0 && b[at - 1] == b'@')
+        || (!toks[col_at].quoted && column.starts_with(|c: char| c.is_ascii_digit()))
+    {
+        return None;
+    }
+    let qualifier = match (
+        col_at.checked_sub(2).map(|k| &toks[k]),
+        col_at.checked_sub(1).map(|k| &toks[k].kind),
+    ) {
+        (
+            Some(Token {
+                kind: TkKind::Word(q),
+                ..
+            }),
+            Some(TkKind::Dot),
+        ) => Some(q.clone()),
+        _ => None,
+    };
+    Some(EnumSlot {
+        qualifier,
+        column: column.clone(),
+        value,
+        closed,
+    })
+}
+
 /// Is `caret` inside a quoted name — `` `ord ``, `"Ord`, `[Order De` —
 /// reading `sql` from `lo`? Accepting a completion there inserts the name
 /// bare (`rank::accepted_insert`), since the quote before it is the user's.
@@ -28580,6 +28711,80 @@ mod tests {
                 "Unknown column 'salery'".to_string()
             ]
         );
+    }
+
+    /// `enum_value_slot` at the `|`: `(qualifier, column, typed, closed)`.
+    fn enum_slot(sql: &str) -> Option<(Option<String>, String, String, bool)> {
+        let caret = sql.find('|').unwrap();
+        let sql = sql.replace('|', "");
+        enum_value_slot(&sql, 0, caret, SqlDialect::MySql).map(|s| {
+            (
+                s.qualifier,
+                s.column,
+                sql[s.value.0..s.value.1].to_string(),
+                s.closed,
+            )
+        })
+    }
+
+    #[test]
+    fn a_string_compared_to_a_column_is_an_enum_slot() {
+        let some = |q: Option<&str>, c: &str, typed: &str, closed| {
+            Some((
+                q.map(str::to_string),
+                c.to_string(),
+                typed.to_string(),
+                closed,
+            ))
+        };
+        assert_eq!(
+            enum_slot("SELECT * FROM t WHERE status = '|"),
+            some(None, "status", "", false)
+        );
+        assert_eq!(
+            enum_slot("SELECT * FROM t WHERE status = 'Ac|"),
+            some(None, "status", "Ac", false)
+        );
+        // Inside a closed literal, the whole of it is the value.
+        assert_eq!(
+            enum_slot("SELECT * FROM t x WHERE x.status <> 'Ac|tive' AND 1"),
+            some(Some("x"), "status", "Active", true)
+        );
+        assert_eq!(
+            enum_slot("SELECT 1 FROM t WHERE status != '|"),
+            some(None, "status", "", false)
+        );
+        assert_eq!(
+            enum_slot("SELECT 1 FROM t WHERE status IN ('a', '|"),
+            some(None, "status", "", false)
+        );
+        assert_eq!(
+            enum_slot("SELECT 1 FROM t WHERE `status` NOT IN ('|"),
+            some(None, "status", "", false)
+        );
+        assert_eq!(
+            enum_slot("UPDATE t SET status = 'P|"),
+            some(None, "status", "P", false)
+        );
+    }
+
+    #[test]
+    fn other_strings_are_no_enum_slot() {
+        for sql in [
+            "SELECT * FROM t WHERE name LIKE '|",
+            "INSERT INTO t VALUES ('|",
+            "SELECT '|",
+            "SELECT 1 FROM t WHERE created >= '|",
+            "SELECT 1 FROM t WHERE created <= '|",
+            "SELECT 1 FROM t WHERE (a) = '|",
+            "SELECT 1 FROM t WHERE f(a) IN ('|",
+            "SELECT 1 FROM t WHERE status = |",
+            "SELECT 1 FROM t -- status = '|",
+            "SELECT 1 FROM t WHERE status = \"|",
+            "SET @v = '|",
+        ] {
+            assert_eq!(enum_slot(sql), None, "{sql}");
+        }
     }
 
     /// `run_error_diagnostic`'s range, as the text under it.

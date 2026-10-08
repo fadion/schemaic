@@ -1015,6 +1015,17 @@ existing prose was left alone.
     the buffer's end and a `'jo'` just closed both ending where the text does
     (`the_caret_in_a_literal_or_comment_is_told_apart_from_a_quoted_name`). The popup's half is
     under `completion.rs`.
+    **`enum_value_slot` is the one literal the gate lets back in** — a `'…'` a column is compared
+    with, where completion offers the column's enum members (`rank::enum_value_suggestions`). It
+    is the same `caret_noncode` probe answering `Literal`, with the literal's start found through
+    `skip_noncode`, and it is narrow on purpose: the left side must be a bare or qualified column
+    name ending exactly where an `=`, `<>` or `!=` begins (not `<=`, `>=`, `:=`, `==`), or an
+    `IN (`/`NOT IN (` list with commas and earlier literals between. `(a) = '`, `f(a) IN ('`,
+    `LIKE '` and a `VALUES (` tuple are not slots — a member is not what is wanted there — nor is a
+    number. **The `@` check reads the byte, not the token**: the tokenizer drops the sigil, so
+    `@v = '` would otherwise read as a column `v`. `EnumSlot::value` is the literal's contents —
+    through the closing quote when it has one, else through the caret — and `closed` says which
+    (`a_string_compared_to_a_column_is_an_enum_slot`, `other_strings_are_no_enum_slot`).
     **`error_fix_range` decides what an AI fix is allowed to rewrite**, and it is a range question
     rather than a prompt one: a fix replaces text in the editor, so hand the model the buffer and
     every statement the user did not ask about comes back rewritten — which is what the error bar
@@ -13418,6 +13429,21 @@ existing prose was left alone.
       (`the_documents_variables_and_temp_tables_are_read`,
       `a_sigil_before_the_word_makes_a_variable_or_temp_table_slot`,
       `a_sigil_offers_the_documents_variables_or_temp_tables`).
+      **Inside a string compared with an enum or set column, the list is that column's members**
+      (`enum_value_suggestions`, which `rank` never reaches — its caller is the literal gate's
+      exception, under `completion.rs`). The column is resolved in the statement's scope through the slot's
+      qualifier — matched against a table's alias, or its name where it has none — else the first
+      scope table that has it, through `SchemaIndex::columns_of` — the
+      `columns_by_db`/`columns_by_schema`/`columns` lookup `rank`'s `cols_of` asks too. Members come from
+      `celledit::editor_for_type`, the grid cell editor's reading of a MySQL `enum(…)`/`set(…)`,
+      or, for a PostgreSQL column whose type carries only the enum's name, from
+      `SchemaIndex::enum_types` — labels by lowercase `name` and `schema.name`, the bare key taking
+      the first enum the index met. They keep declaration order, which for an enum is its meaning,
+      and are narrowed to a case-insensitive prefix of what is typed. Each row is a `Column` with
+      the type as its detail, `replace`s the literal's contents and inserts the member through
+      `export::sql_literal` with its quotes off — so `won't` arrives as `won''t` — plus the
+      closing `'` the literal lacked (`a_column_s_enum_members_are_offered_in_its_string`,
+      `an_enum_member_is_written_as_a_literal_and_closes_its_quote`).
       **`add` asks `worth_offering` before it builds anything, which is `add_col`'s shape adopted
       for `add_col`'s reason.** A PostgreSQL tab offers 863 builtins where a MySQL 8 one offers 341
       (`FUNCTIONS`' 463 less `MARIADB_ONLY`, which contains every `DEPRECATED_ALIASES` name), and
@@ -23505,7 +23531,12 @@ existing prose was left alone.
     popup where it answers. `WHERE name = 'jo` offered columns, and Tab spliced one into the
     literal. A quoted name is not a value, so `"Ord` still completes (why the gate is not
     `caret_touches_noncode` is under `intel.rs`). It gates the list only: the ghost is published
-    above it, and `predict` and `recall` refuse such a caret on their own terms.
+    above it, and `predict` and `recall` refuse such a caret on their own terms. **The one value
+    it lets through is an enum's**: inside the gate, `intel::enum_value_slot` is asked first, and
+    where it answers and `rank::enum_value_suggestions` — over the memoised `SchemaIndex` and the
+    statement's scope — is non-empty, the popup opens on those rows (anchored at the caret,
+    selection 0, `give_way(true)`) instead of closing. Any other literal or comment still closes
+    it. `SchemaIndex::build` fills `enum_types` from the in-scope databases' `DbSchema::enums`.
     **`Completion::word_complete` carries `rank::Ranked::completes_a_word` to the key handler**
     (under `editor_pane.rs`). `set_items` resets it to `false` — every path that fills the list goes
     through there, so the FK join row or an emptied list never inherits the last ranked list's

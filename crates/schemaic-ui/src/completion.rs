@@ -369,6 +369,7 @@ mod index {
         // Every contributing database's tables, for the widened list.
         let mut all_tables: Vec<rank::IndexedTable> = Vec::new();
         let mut views: HashSet<(String, String)> = HashSet::new();
+        let mut enum_types: HashMap<String, Vec<String>> = HashMap::new();
         for node in nodes {
             if !db_contributes(hidden, &node.database, active_db) {
                 continue;
@@ -384,6 +385,20 @@ mod index {
                 let by_db = tables_by_db.entry(db_lower.clone()).or_default();
                 // Unqualified pool: only the selected database (or all, if none).
                 let in_scope = active_db.is_none_or(|db| db.eq_ignore_ascii_case(&node.database));
+                // A PostgreSQL enum's labels, by the name a column's type
+                // carries — bare or `schema.name`.
+                if in_scope {
+                    for e in &schema.enums {
+                        let name = e.name.to_ascii_lowercase();
+                        if let Some(ns) = &e.schema {
+                            enum_types.insert(
+                                format!("{}.{name}", ns.to_ascii_lowercase()),
+                                e.values.clone(),
+                            );
+                        }
+                        enum_types.entry(name).or_insert_with(|| e.values.clone());
+                    }
+                }
                 for t in &schema.tables {
                     by_db.push(t.name.clone());
                     all_tables.push(rank::IndexedTable {
@@ -484,6 +499,7 @@ mod index {
             tables_by_schema,
             all_tables,
             views,
+            enum_types,
         }
     }
 }
@@ -1072,6 +1088,22 @@ pub(crate) fn recompute_completions(
     // offered columns, and Tab spliced one into the literal. A quoted name
     // is still a name, and completes.
     if intel::caret_in_literal_or_comment(&text, lo, offset, dialect) {
+        // …except the one value completion knows: a string compared with an
+        // enum or set column offers that column's members.
+        if let Some(slot) = intel::enum_value_slot(&text, lo, offset, dialect) {
+            let schema = hidden_dbs.with_untracked(|h| schema_index(db_nodes, h, active_db));
+            let scope = intel::statement_scope(&text, lo, hi, offset, dialect).tables;
+            let items =
+                rank::enum_value_suggestions(&schema, &scope, &slot, &text, offset, dialect);
+            if !items.is_empty() {
+                set_anchor(ed, comp, offset);
+                set_items(comp, items);
+                comp.sel.set(0);
+                give_way(true);
+                comp.open.set(true);
+                return;
+            }
+        }
         comp.open.set(false);
         set_items(comp, Vec::new());
         return;
