@@ -965,6 +965,52 @@ pub(crate) fn go_directive(sql: &str, i: usize, dialect: SqlDialect) -> Option<u
     }
 }
 
+/// The T-SQL batch holding `caret`: from just past the `GO` line before it
+/// to the start of the `GO` line after it, the whole of `sql` on an engine
+/// with no batches ([`go_directive`]). A `GO` is one only at a line's start
+/// in code — inside a comment or a string it is text.
+///
+/// What a variable is scoped to: one `DECLARE`d in another batch does not
+/// exist in this one, so it is not offered there.
+pub fn batch_range(sql: &str, caret: usize, dialect: SqlDialect) -> (usize, usize) {
+    let (mut lo, mut hi) = (0, sql.len());
+    if !dialect.batch_separator() {
+        return (lo, hi);
+    }
+    let b = sql.as_bytes();
+    let caret = caret.min(sql.len());
+    let mut line_start = true;
+    let mut i = 0;
+    while i < b.len() {
+        if let Some(j) = skip_noncode(b, i, dialect) {
+            line_start = false;
+            i = j.max(i + 1);
+            continue;
+        }
+        match b[i] {
+            b'\n' => line_start = true,
+            b' ' | b'\t' | b'\r' => {}
+            _ if line_start => {
+                if let Some(end) = go_directive(sql, i, dialect) {
+                    if end <= caret {
+                        lo = end;
+                    } else if i >= caret {
+                        hi = i;
+                        break;
+                    }
+                    i = end;
+                    line_start = true;
+                    continue;
+                }
+                line_start = false;
+            }
+            _ => line_start = false,
+        }
+        i += 1;
+    }
+    (lo, hi)
+}
+
 /// The directive's own text on `line` — `GO` and its count, `DELIMITER` and
 /// its token — when the line is a client directive on this engine
 /// ([`go_directive`], [`delimiter_directive`]), for the editor to colour it.

@@ -1171,11 +1171,18 @@ pub(crate) fn recompute_completions(
     // The statement's own CTEs and derived tables, where a column goes: their
     // columns are in no catalogue. A derived table's alias is in no scope
     // either (the scope reads through it to the tables inside), so it joins.
-    let relations = if matches!(ctx, ClauseCtx::Column | ClauseCtx::Qualified(_)) {
+    let mut relations = if matches!(ctx, ClauseCtx::Column | ClauseCtx::Qualified(_)) {
         intel::local_relations(&text, lo, hi, dialect)
     } else {
         Vec::new()
     };
+    // …and the document's temporary tables, read only when the statement
+    // names one, since that reading parses every statement that makes one.
+    if matches!(ctx, ClauseCtx::Column | ClauseCtx::Qualified(_))
+        && scope.iter().any(|t| t.name.starts_with('#'))
+    {
+        relations.extend(intel::temp_table_relations(&text, dialect));
+    }
     for r in relations.iter().filter(|r| r.derived) {
         let named = |t: &intel::TableRef| {
             t.alias

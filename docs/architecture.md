@@ -13437,13 +13437,23 @@ existing prose was left alone.
       `ClauseCtx::Variable` after one `@` where the engine has `@` variables (`has_at_variables`:
       SQL Server's declared ones, MySQL's user variables — not `@@`, a system function's) offers
       `intel::variables_at`, and `ClauseCtx::TempTable` after a T-SQL `#` or `##` offers
-      `intel::temp_tables_at` — each read from the whole document, since a variable or temporary
-      table outlives its statement, through the one boundary lexer (`sigiled_names`), the word
-      being typed left out. A temporary table is offered only with the sigil typed (`#` local,
-      `##` global) and named without it, since the replaced word starts after it
+      `intel::temp_tables_at` — each read beyond the statement, since a variable or temporary
+      table outlives it, through the one boundary lexer (`sigiled_names`), the word being typed
+      left out. A temporary table is read from the whole document; a variable from the whole
+      document on MySQL, whose user variables live for the session, and from the caret's own
+      batch on SQL Server, where a `DECLARE` does not outlive its `GO` (`sql::batch_range`, which
+      takes a `GO` at a line's start in code only — `a_t_sql_variable_is_offered_only_in_its_batch`).
+      A temporary table is offered only with the sigil typed (`#` local, `##` global) and named
+      without it, since the replaced word starts after it
       (`the_documents_variables_and_temp_tables_are_read`,
       `a_sigil_before_the_word_makes_a_variable_or_temp_table_slot`,
-      `a_sigil_offers_the_documents_variables_or_temp_tables`).
+      `a_sigil_offers_the_documents_variables_or_temp_tables`). **Its columns** come with it
+      where the statement names one: `intel::temp_table_relations` reads every `CREATE TABLE
+      #name (…)` and `SELECT … INTO #name` in the document, each statement parsed alone, into
+      `LocalNames::relations` under the name with its sigil, which is how the scope and
+      `#work.` name it (`a_temp_tables_columns_are_read_from_where_it_is_made`). The caller
+      reads them only when the scope names a `#` table, since the reading parses every
+      statement that makes one.
       **A CTE's and a derived table's columns are offered as a table's are**, from
       `LocalNames::relations`: `cols_of` asks them first for a bare name, since a CTE shadows a
       table it is named after, and the schema otherwise. The caller reads them with

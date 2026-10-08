@@ -16739,6 +16739,62 @@ pub fn local_relations(sql: &str, lo: usize, hi: usize, dialect: SqlDialect) -> 
     out
 }
 
+/// The temporary tables the document `sql` makes — `CREATE TABLE #work (…)`,
+/// `SELECT … INTO #work` — each with its columns, named with its sigil as the
+/// completion scope names it (`#work`, `##shared`). Read statement by
+/// statement, each parsed alone, so a broken one elsewhere costs only itself.
+/// Empty on an engine with no `#` tables ([`SqlDialect::prefixed_names`]).
+/// The document, not the statement, because a temporary table outlives the
+/// statement that made it.
+pub fn temp_table_relations(sql: &str, dialect: SqlDialect) -> Vec<LocalRelation> {
+    use sqlparser::ast::{SetExpr, Statement};
+    if !dialect.prefixed_names() || !sql.contains('#') {
+        return Vec::new();
+    }
+    let temp = |n: &sqlparser::ast::ObjectName| {
+        n.0.last()
+            .and_then(|p| p.as_ident())
+            .map(|i| i.value.clone())
+            .filter(|v| v.starts_with('#'))
+    };
+    let mut out: Vec<LocalRelation> = Vec::new();
+    for (lo, hi) in crate::sql::statement_ranges(sql, dialect) {
+        let text = &sql[lo..hi];
+        if !text.contains('#') {
+            continue;
+        }
+        let Ok(asts) = parse_statements(text, dialect) else {
+            continue;
+        };
+        for ast in &asts {
+            let made = match ast {
+                Statement::CreateTable(ct) => temp(&ct.name)
+                    .map(|n| (n, ct.columns.iter().map(|c| c.name.value.clone()).collect())),
+                Statement::Query(q) => match q.body.as_ref() {
+                    SetExpr::Select(sel) => sel
+                        .into
+                        .as_ref()
+                        .and_then(|into| temp(&into.name))
+                        .map(|n| (n, select_list_names(q))),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some((name, columns)) = made
+                && !columns.is_empty()
+                && !out.iter().any(|r| r.name.eq_ignore_ascii_case(&name))
+            {
+                out.push(LocalRelation {
+                    name,
+                    columns,
+                    derived: false,
+                });
+            }
+        }
+    }
+    out
+}
+
 /// The output names of `q`'s leftmost select list, in order — see
 /// [`local_relations`] for which items name one.
 fn select_list_names(q: &sqlparser::ast::Query) -> Vec<String> {
@@ -16792,14 +16848,19 @@ fn has_at_variables(dialect: SqlDialect) -> bool {
     }
 }
 
-/// The variables `sql` writes anywhere — `@x`, not `@@x` — named without
-/// the `@`, for a caret whose word follows one (`ClauseCtx::Variable`). The
-/// word at `caret` is left out. Empty on an engine with none.
+/// The variables `sql` writes — `@x`, not `@@x` — named without the `@`, for
+/// a caret whose word follows one (`ClauseCtx::Variable`): anywhere in the
+/// document on MySQL, whose user variables live for the session, and in the
+/// caret's own batch on SQL Server ([`crate::sql::batch_range`]), where a
+/// `DECLARE` does not outlive its `GO`. The word at `caret` is left out.
+/// Empty on an engine with none.
 pub fn variables_at(sql: &str, caret: usize, dialect: SqlDialect) -> Vec<LocalName> {
     if !has_at_variables(dialect) {
         return Vec::new();
     }
-    sigiled_names(sql, caret, dialect, b'@', 1)
+    // A T-SQL variable lives in its batch alone.
+    let (lo, hi) = crate::sql::batch_range(sql, caret, dialect);
+    sigiled_names(&sql[lo..hi], caret.clamp(lo, hi) - lo, dialect, b'@', 1)
 }
 
 /// The names `sql` writes after exactly `run` `sigil` bytes, in code, bare —
@@ -21029,6 +21090,24 @@ mod tests {
         );
         assert!(temp_tables_at(my, my.len(), SqlDialect::MySql).is_empty());
         assert!(variables_at("SELECT @a", 9, SqlDialect::Postgres).is_empty());
+    }
+
+    #[test]
+    fn a_t_sql_variable_is_offered_only_in_its_batch() {
+        let names = |v: Vec<LocalName>| v.into_iter().map(|n| n.name).collect::<Vec<_>>();
+        let ms = SqlDialect::MsSql;
+        let s = "DECLARE @gone int;\nGO\nDECLARE @here int;\nSELECT @";
+        assert_eq!(names(variables_at(s, s.len(), ms)), ["here"]);
+        // The batch after the caret's is not this one either.
+        let caret = s.find("SELECT @").unwrap() + 8;
+        let s2 = format!("{s}\nGO 2 -- again\nDECLARE @later int;");
+        assert_eq!(names(variables_at(&s2, caret, ms)), ["here"]);
+        // `GO` inside a comment or a string is not a separator, and
+        // MySQL has no batches.
+        let s = "DECLARE @kept int; /*\nGO\n*/ SELECT @";
+        assert_eq!(names(variables_at(s, s.len(), ms)), ["kept"]);
+        let my = "SET @a := 1;\nGO\nSELECT @";
+        assert_eq!(names(variables_at(my, my.len(), SqlDialect::MySql)), ["a"]);
     }
 
     /// A value with no columns in reach: a `VALUES` tuple, a `DECLARE`'s
@@ -29080,6 +29159,30 @@ mod tests {
             relations("SELECT * FROM t WHERE x IN (SELECT a FROM (SELECT 1 AS a) d)"),
             [("d".to_string(), v(&["a"]), true)]
         );
+    }
+
+    #[test]
+    fn a_temp_tables_columns_are_read_from_where_it_is_made() {
+        let got = |sql: &str, d| -> Vec<(String, Vec<String>)> {
+            temp_table_relations(sql, d)
+                .into_iter()
+                .map(|r| (r.name, r.columns))
+                .collect()
+        };
+        let v = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let sql = "CREATE TABLE #work (id int, label nvarchar(40));\n\
+                   SELECT e.id, e.name AS who INTO ##shared FROM employees e;\n\
+                   SELECT #work. FROM #work";
+        assert_eq!(
+            got(sql, SqlDialect::MsSql),
+            [
+                ("#work".to_string(), v(&["id", "label"])),
+                ("##shared".to_string(), v(&["id", "who"]))
+            ]
+        );
+        // A real table, and an engine with no `#` tables.
+        assert!(got("CREATE TABLE work (id int)", SqlDialect::MsSql).is_empty());
+        assert!(got("CREATE TABLE #work (id int)", SqlDialect::Postgres).is_empty());
     }
 
     #[test]
