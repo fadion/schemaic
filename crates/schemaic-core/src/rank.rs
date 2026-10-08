@@ -721,7 +721,10 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
                     glyph: SuggestGlyph::ForeignKey,
                     key: KeyKind::Foreign,
                     tier: 0,
-                    insert: Some(format!("{} ON {}", jt.table_sql, jt.predicate)),
+                    insert: Some(match &jt.aliased {
+                        Some(a) => format!("{} {} ON {}", jt.table_sql, a.alias, a.predicate),
+                        None => format!("{} ON {}", jt.table_sql, jt.predicate),
+                    }),
                     replace: None,
                 });
             }
@@ -2589,6 +2592,7 @@ mod tests {
             table: "customers".to_string(),
             table_sql: "customers".to_string(),
             predicate: "customers.id = o.customer_id".to_string(),
+            aliased: None,
         }];
         let out = rank(
             &s,
@@ -2618,6 +2622,47 @@ mod tests {
         );
         // And the plain `orders` row is still below it rather than gone.
         assert!(out.iter().any(|s| s.text == "orders"), "{out:?}");
+    }
+
+    /// A target that carries an aliased form inserts it — the alias and the
+    /// predicate that uses it. The caller has already dropped it where the
+    /// setting is off.
+    #[test]
+    fn an_aliased_join_target_inserts_its_alias() {
+        let s = shop();
+        let cont = Continuation::default();
+        let used = HashSet::new();
+        let targets = vec![JoinTarget {
+            table: "customers".to_string(),
+            table_sql: "customers".to_string(),
+            predicate: "customers.id = o.customer_id".to_string(),
+            aliased: Some(crate::intel::AliasedJoin {
+                alias: "c".to_string(),
+                predicate: "c.id = o.customer_id".to_string(),
+            }),
+        }];
+        let out = rank(
+            &s,
+            &RankInput {
+                ctx: &ClauseCtx::Table,
+                cont: &cont,
+                scope: &[tref("orders", Some("o"))],
+                prefix: "",
+                snippets: &[],
+                join_targets: &targets,
+                star: None,
+                used: &used,
+                active_db: Some("shop"),
+                dialect: SqlDialect::MySql,
+                flavour: ServerFlavour::Unknown,
+                local: &LocalNames::default(),
+                wide: false,
+            },
+        );
+        assert_eq!(
+            out.first().and_then(|s| s.insert.as_deref()),
+            Some("customers c ON c.id = o.customer_id")
+        );
     }
 
     /// **A candidate equal to what is typed is dropped**, whatever tier it would

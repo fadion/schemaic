@@ -1142,7 +1142,11 @@ pub(crate) fn recompute_completions(
     // and only a table slot ever wanted it.
     let join_targets = if matches!(ctx, ClauseCtx::Table) {
         let catalog = hidden_dbs.with_untracked(|h| build_offer_catalog(db_nodes, h, active_db));
-        intel::join_targets(&text, lo, hi, offset, &catalog, dialect)
+        let mut targets = intel::join_targets(&text, lo, hi, offset, &catalog, dialect);
+        if !theme::completion_table_aliases() {
+            targets.iter_mut().for_each(|t| t.aliased = None);
+        }
+        targets
     } else {
         Vec::new()
     };
@@ -1236,12 +1240,15 @@ pub(crate) fn accept_completion(ed: &Editor, comp: Completion, dialect: SqlDiale
     let start = word_start(&text, offset);
     let end = word_end(&text, offset);
     let idx = comp.sel.get_untracked();
-    let (lo, _) = schemaic_core::sql::writing_range(&text, offset, dialect);
+    let (lo, hi) = schemaic_core::sql::writing_range(&text, offset, dialect);
     let in_quoted_name = intel::caret_in_quoted_name(&text, lo, start, dialect);
-    if let Some((word, kind, over, replace)) = comp.items.with_untracked(|v| {
+    if let Some((word, kind, over, replace, alias)) = comp.items.with_untracked(|v| {
         v.get(idx).map(|s| {
             let over = rank::accepted_insert(s, dialect, in_quoted_name);
-            (s.text.clone(), s.kind, over, s.replace)
+            let alias = (theme::completion_table_aliases() && !in_quoted_name)
+                .then(|| accepted_table_alias(s, &text, lo, hi, offset, dialect))
+                .flatten();
+            (s.text.clone(), s.kind, over, s.replace, alias)
         })
     }) {
         comp.suppress.set(true);
@@ -1259,6 +1266,10 @@ pub(crate) fn accept_completion(ed: &Editor, comp: Completion, dialect: SqlDiale
                 call_parens_follow(&text[end..]),
             )
         };
+        let (insert, caret) = match alias {
+            Some(a) => (format!("{insert} {a}"), caret + 1 + a.len()),
+            None => (insert, caret),
+        };
         // Most completions replace the word being typed — the whole of it, the
         // part after the caret too; a `replace` override (star expansion) swaps
         // a specific range instead (the `*` / `t.*`).
@@ -1270,6 +1281,23 @@ pub(crate) fn accept_completion(ed: &Editor, comp: Completion, dialect: SqlDiale
     }
     comp.open.set(false);
     set_items(comp, Vec::new());
+}
+
+/// The alias to write after an accepted row, or `None`: only a plain table row
+/// takes one (`intel::table_alias_at` decides where). An FK join target carries
+/// its own in its insert, and a star expansion replaces a range of its own.
+fn accepted_table_alias(
+    s: &Suggestion,
+    text: &str,
+    lo: usize,
+    hi: usize,
+    offset: usize,
+    dialect: SqlDialect,
+) -> Option<String> {
+    if s.kind != SuggestKind::Table || s.glyph == SuggestGlyph::ForeignKey || s.replace.is_some() {
+        return None;
+    }
+    intel::table_alias_at(text, lo, hi, offset, &s.text, dialect)
 }
 
 /// `SELECT *` expansion for the candidate at the caret, or `None`. Cheap-guards on
@@ -2150,9 +2178,9 @@ mod ghost_choice_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        KeyKind, SuggestGlyph, SuggestKind, Suggestion, call_parens_follow, completion_insertion,
-        natural_width, popup_may_open, popup_placement, popup_w, popup_x, row_width,
-        types_a_character, word_end, word_start,
+        KeyKind, SuggestGlyph, SuggestKind, Suggestion, accepted_table_alias, call_parens_follow,
+        completion_insertion, natural_width, popup_may_open, popup_placement, popup_w, popup_x,
+        row_width, types_a_character, word_end, word_start,
     };
     // These moved to `core::rank` with the policy that reads them; the tests stay
     // here because what they pin is this pane's behaviour, and the popup is here.
@@ -2481,6 +2509,26 @@ mod tests {
             insert: None,
             replace: None,
         }
+    }
+
+    #[test]
+    fn only_a_plain_table_row_is_given_an_alias_on_accept() {
+        let sql = "SELECT * FROM ord";
+        let at = |s: &Suggestion| {
+            accepted_table_alias(s, sql, 0, sql.len(), sql.len(), SqlDialect::MySql)
+        };
+        let table = Suggestion {
+            kind: SuggestKind::Table,
+            ..sugg("orders", "", "")
+        };
+        assert_eq!(at(&table).as_deref(), Some("o"));
+        // A column never; an FK target's insert already carries its own.
+        assert_eq!(at(&sugg("orders", "", "")), None);
+        let fk = Suggestion {
+            glyph: SuggestGlyph::ForeignKey,
+            ..table.clone()
+        };
+        assert_eq!(at(&fk), None);
     }
 
     #[test]

@@ -2263,6 +2263,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let word_wrap = RwSignal::new(ui_state.word_wrap);
     let rainbow_brackets = RwSignal::new(ui_state.editor_rainbow_brackets);
     let keyword_case = RwSignal::new(ui_state.format_keyword_case);
+    let table_aliases = RwSignal::new(ui_state.completion_table_aliases);
     let show_whitespace = RwSignal::new(ui_state.editor_show_whitespace);
     let indent_guides = RwSignal::new(ui_state.editor_indent_guides);
     let row_limit = RwSignal::new(ui_state.row_limit);
@@ -2284,6 +2285,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     create_effect(move |_| schemaic_ui::theme::set_editor_rainbow_brackets(rainbow_brackets.get()));
     schemaic_ui::theme::set_format_keyword_case(keyword_case.get_untracked());
     create_effect(move |_| schemaic_ui::theme::set_format_keyword_case(keyword_case.get()));
+    schemaic_ui::theme::set_completion_table_aliases(table_aliases.get_untracked());
+    create_effect(move |_| schemaic_ui::theme::set_completion_table_aliases(table_aliases.get()));
     schemaic_ui::theme::set_editor_show_whitespace(show_whitespace.get_untracked());
     create_effect(move |_| schemaic_ui::theme::set_editor_show_whitespace(show_whitespace.get()));
     schemaic_ui::theme::set_editor_indent_guides(indent_guides.get_untracked());
@@ -7423,6 +7426,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     word_wrap: word_wrap.get_untracked(),
                     editor_rainbow_brackets: rainbow_brackets.get_untracked(),
                     format_keyword_case: keyword_case.get_untracked(),
+                    completion_table_aliases: table_aliases.get_untracked(),
                     editor_show_whitespace: show_whitespace.get_untracked(),
                     editor_indent_guides: indent_guides.get_untracked(),
                     restore_tabs: restore_tabs.get_untracked(),
@@ -7518,6 +7522,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             word_wrap.get();
             rainbow_brackets.get();
             keyword_case.get();
+            table_aliases.get();
             show_whitespace.get();
             indent_guides.get();
             row_limit.get();
@@ -12625,6 +12630,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             word_wrap,
             rainbow_brackets,
             keyword_case,
+            table_aliases,
             show_whitespace,
             indent_guides,
             row_limit,

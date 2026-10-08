@@ -954,6 +954,8 @@ struct ThemeState {
     editor_rainbow_brackets: RwSignal<bool>,
     // How Format Code cases keywords.
     format_keyword_case: RwSignal<schemaic_core::sqlfmt::KeywordCase>,
+    // Whether completion writes an alias after a table it inserts.
+    completion_table_aliases: RwSignal<bool>,
     // Whether the editor draws whitespace marks, and indent guides.
     editor_show_whitespace: RwSignal<bool>,
     editor_indent_guides: RwSignal<bool>,
@@ -995,6 +997,7 @@ fn with_state<R>(f: impl FnOnce(&ThemeState) -> R) -> R {
                 editor_rainbow_brackets: scope.create_rw_signal(false),
                 format_keyword_case: scope
                     .create_rw_signal(schemaic_core::sqlfmt::KeywordCase::Keep),
+                completion_table_aliases: scope.create_rw_signal(true),
                 editor_show_whitespace: scope.create_rw_signal(false),
                 editor_indent_guides: scope.create_rw_signal(false),
                 ui_scale: scope.create_rw_signal(UiScale::Normal),
@@ -1252,6 +1255,17 @@ pub fn format_keyword_case() -> schemaic_core::sqlfmt::KeywordCase {
 /// Set how Format Code cases keywords.
 pub fn set_format_keyword_case(case: schemaic_core::sqlfmt::KeywordCase) {
     with_state(|st| st.format_keyword_case.set(case));
+}
+
+/// Whether completion writes an alias after a table it inserts. Read when an
+/// item is offered and accepted, so nothing repaints.
+pub fn completion_table_aliases() -> bool {
+    with_state(|st| st.completion_table_aliases.get_untracked())
+}
+
+/// Set whether completion writes table aliases.
+pub fn set_completion_table_aliases(on: bool) {
+    with_state(|st| st.completion_table_aliases.set(on));
 }
 
 /// Whether the editor draws spaces and tabs as marks. Read by `editor_style`.

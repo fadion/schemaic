@@ -1804,6 +1804,7 @@ pub(crate) fn theme_settings_overlay(
     let editor_remembered_predictions = layout.editor_remembered_predictions;
     let rainbow_brackets = layout.rainbow_brackets;
     let keyword_case = layout.keyword_case;
+    let table_aliases = layout.table_aliases;
     let show_whitespace = layout.show_whitespace;
     let indent_guides = layout.indent_guides;
     let restore_tabs = layout.restore_tabs;
@@ -1878,6 +1879,15 @@ pub(crate) fn theme_settings_overlay(
                 ring.clone(),
                 120,
             );
+            let aliases_row = focusable_toggle_row(
+                "Table aliases",
+                "When completion writes a table after FROM or JOIN, follow it with a short \
+                 alias made of its initials — orders o, order_items oi — and use the alias \
+                 in a join's ON condition.",
+                table_aliases,
+                ring.clone(),
+                125,
+            );
             let rainbow_row = focusable_toggle_row(
                 "Rainbow brackets",
                 "Colour each pair of brackets by how deeply it is nested, so a closing \
@@ -1921,6 +1931,7 @@ pub(crate) fn theme_settings_overlay(
                 font_section,
                 predictions_row,
                 remembered_row,
+                aliases_row,
                 rainbow_row,
                 whitespace_row,
                 guides_row,

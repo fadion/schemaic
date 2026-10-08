@@ -6063,6 +6063,9 @@ pub struct LayoutUi {
     /// How Format Code cases keywords; drives
     /// `theme::set_format_keyword_case`. Persisted.
     pub keyword_case: RwSignal<schemaic_core::sqlfmt::KeywordCase>,
+    /// Write an alias after a table completion inserts; drives
+    /// `theme::set_completion_table_aliases`. Persisted.
+    pub table_aliases: RwSignal<bool>,
     /// Draw whitespace as marks in the editor; drives
     /// `theme::set_editor_show_whitespace`. Persisted.
     pub show_whitespace: RwSignal<bool>,

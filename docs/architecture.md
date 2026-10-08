@@ -2357,6 +2357,31 @@ existing prose was left alone.
     (`a_cross_or_natural_join_predicts_no_condition`; `a_join_modifier_is_not_the_left_table_alias`
     holds both popup surfaces to `join_takes_a_condition`, the table rows red before — on MySQL,
     PostgreSQL and SQLite; its loop leaves SQL Server out, though it shares PostgreSQL's arm).
+    **Completion writes a table's alias only where one cannot be wrong.** `table_alias` makes it
+    from the name alone: the initials of the last `.` part's words — split at anything not
+    alphanumeric and at a lower→upper camel boundary, so `order_items` and `OrderItems` are both
+    `oi` — lower-cased, leading digits dropped (`2fa_codes` is `c`), and numbered (`o2`, `on2`)
+    where that is taken, in any case, or could not stand bare after a table on some server of the
+    dialect: `reserved_anywhere`, `is_implicit_alias`, and T-SQL's `GO`, which no list reserves.
+    It is `None` where the alias would equal the name or there is no ASCII initial to make one
+    from, so what it returns never needs quoting. `table_alias_at` puts `alias_slot` in front of it
+    and reads what is taken from `taken_names` — every in-scope table's alias and name, less the
+    half-typed word, which `query_scope` reads in `FROM o|` as a table `o` and would push `orders`
+    to `o2`. The slot is narrow on purpose. The last clause keyword is `FROM` or `JOIN`, and the
+    statement opens with `SELECT`, `WITH`, `INSERT`, `REPLACE`, `UPDATE`, `CREATE`, `EXPLAIN` or
+    `(` — which leaves out `DELETE FROM`, where some engines take an alias and others refuse it,
+    and the `FROM` of `SHOW … FROM` and a cursor's `FETCH … FROM`, which name nothing to alias.
+    The head is the *statement's*, so a subquery inside a `DELETE` is given none either. The word
+    is its item's first — only `name .` qualifiers between it and the keyword or the list's last
+    comma — so a table accepted into the alias slot of `FROM orders o|` gets no second alias and
+    `FROM (|` none. And nothing but `,`, `)`, `;` or the line's end follows it: whatever else does
+    may already be the alias, or the clause it would have to come before. `join_targets` asks the
+    same slot and fills `JoinTarget::aliased` — the alias, and the predicate rebuilt through it
+    (`customers c ON o.customer_id = c.id`), a second string because the alias hides the table's
+    own name from it — which `rank.rs`'s FK row inserts in place of the plain form. The ghost's
+    `join_target_guess` passes `join_targets_for` no taken names and stays unaliased
+    (`a_table_alias_is_written_at_a_from_or_join_slot`, `no_table_alias_outside_a_query_table_slot`,
+    `a_join_target_carries_its_aliased_form`).
     **A `(` is filled from the schema only where the schema names one answer.** `paren_contents`,
     asked right after `insert_columns`, answers three openers through the same `column_list`.
     `REFERENCES t (` gets `t`'s primary key from `Catalog::key_columns_of` — its columns in the
@@ -23406,6 +23431,16 @@ existing prose was left alone.
     part after the caret too, and the `(` test reads past it — so accepting `customer_id` at
     `cust|_id` no longer writes `customer_id_id`
     (`an_accept_replaces_the_whole_word_the_caret_is_in`).
+    **A table row writes its alias after it** (`orders o`) where `intel::table_alias_at` finds the
+    slot for one (under `intel.rs`), behind Settings → Editor → *Table aliases* — on by default,
+    `UiState::completion_table_aliases` (`default_true`, pinned by
+    `table_aliases_default_on_and_keep_an_off`), `LayoutUi::table_aliases`. `accepted_table_alias`
+    gives one only to a plain table row: an FK join row carries its own inside its `insert`, a star
+    expansion replaces a range of its own, and inside a quoted name there is none
+    (`only_a_plain_table_row_is_given_an_alias_on_accept`). The gatherer clears each
+    `JoinTarget::aliased` while the setting is off, so `rank.rs` needs no flag of its own.
+    `theme::completion_table_aliases` is read untracked at the moment a list is gathered or a row
+    accepted; nothing is drawn from it, so its setter repaints nothing.
     **No list opens inside a string literal or a comment, not even on Ctrl+Space**:
     `recompute_completions` asks `intel::caret_in_literal_or_comment` of the caret's statement
     before it reads the clause, ahead of the FK join row and the ranked list alike, and closes the

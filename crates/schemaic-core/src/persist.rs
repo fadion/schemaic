@@ -339,6 +339,10 @@ pub struct UiState {
     /// How Format Code cases keywords. Default: as typed.
     #[serde(default)]
     pub format_keyword_case: crate::sqlfmt::KeywordCase,
+    /// Completion writes an alias after a table it inserts into a `FROM` or
+    /// `JOIN` (`orders o`). Default: on.
+    #[serde(default = "default_true")]
+    pub completion_table_aliases: bool,
     /// Draw spaces and tabs as visible marks in the editor. Default: off.
     #[serde(default)]
     pub editor_show_whitespace: bool,
@@ -463,6 +467,7 @@ impl Default for UiState {
             word_wrap: false,
             editor_rainbow_brackets: false,
             format_keyword_case: crate::sqlfmt::KeywordCase::Keep,
+            completion_table_aliases: true,
             editor_show_whitespace: false,
             editor_indent_guides: false,
             restore_tabs: true,
@@ -1888,6 +1893,20 @@ mod tests {
 
     /// Rainbow brackets are off for a new install and a file written before
     /// the setting existed, and an on stays on.
+    #[test]
+    fn table_aliases_default_on_and_keep_an_off() {
+        assert!(UiState::default().completion_table_aliases);
+        let old: UiState = serde_json::from_str("{}").expect("parses");
+        assert!(old.completion_table_aliases);
+        let off = UiState {
+            completion_table_aliases: false,
+            ..UiState::default()
+        };
+        let back: UiState = serde_json::from_str(&serde_json::to_string(&off).expect("serialises"))
+            .expect("parses");
+        assert!(!back.completion_table_aliases);
+    }
+
     #[test]
     fn rainbow_brackets_default_off_and_keep_an_on() {
         assert!(!UiState::default().editor_rainbow_brackets);

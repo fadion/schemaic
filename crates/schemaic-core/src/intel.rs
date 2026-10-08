@@ -12550,6 +12550,18 @@ pub struct JoinTarget {
     pub table_sql: String,
     /// The `ON` predicate (without the `ON` keyword), e.g. `orders.customer_id = c.id`.
     pub predicate: String,
+    /// The same join written with an alias — `customers c ON o.customer_id =
+    /// c.id` — where [`table_alias_at`] would give one. The caller takes it or
+    /// leaves it by the user's setting; the predicate is a second string because
+    /// the alias hides the table's own name from it.
+    pub aliased: Option<AliasedJoin>,
+}
+
+/// [`JoinTarget::aliased`]: the alias and the predicate that uses it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AliasedJoin {
+    pub alias: String,
+    pub predicate: String,
 }
 
 /// FK-aware JOIN targets for completion. When the caret sits at a `JOIN` table slot
@@ -12596,15 +12608,36 @@ pub fn join_targets(
             return Vec::new();
         }
     }
-    join_targets_for(&query_scope(sql, lo, hi, caret, dialect), catalog, dialect)
+    let scope = query_scope(sql, lo, hi, caret, dialect);
+    let typed = &sql[word_lo..word_end_at(sql, caret, hi)];
+    let taken = alias_slot(sql, lo, hi, caret, dialect).then(|| taken_names(&scope, typed));
+    join_targets_for(&scope, catalog, dialect, taken.as_deref())
 }
 
 /// The FK-connected join candidates for a set of in-scope tables (both edge
-/// directions), deduped by candidate table.
-fn join_targets_for(scope: &[TableRef], catalog: &Catalog, dialect: SqlDialect) -> Vec<JoinTarget> {
+/// directions), deduped by candidate table. With `alias_taken` (the names an
+/// alias must not repeat), each also carries its [`JoinTarget::aliased`] form.
+fn join_targets_for(
+    scope: &[TableRef],
+    catalog: &Catalog,
+    dialect: SqlDialect,
+    alias_taken: Option<&[String]>,
+) -> Vec<JoinTarget> {
     let mut out = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     let in_scope = |name: &str| scope.iter().any(|s| s.name.eq_ignore_ascii_case(name));
+    // The candidate under an alias, and the predicate `build` writes for it.
+    let aliased = |cand: &TableRef, build: &dyn Fn(&TableRef) -> String| {
+        let alias = table_alias(&cand.name, alias_taken?, dialect)?;
+        let named = TableRef {
+            alias: Some(alias.clone()),
+            ..cand.clone()
+        };
+        Some(AliasedJoin {
+            predicate: build(&named),
+            alias,
+        })
+    };
     // Forward: an in-scope table's FK references candidate `T`.
     for s in scope {
         if let Some(edges) = catalog.fks_of(&s.name) {
@@ -12617,10 +12650,13 @@ fn join_targets_for(scope: &[TableRef], catalog: &Catalog, dialect: SqlDialect) 
                     alias: None,
                     db: None,
                 };
+                let build =
+                    |c: &TableRef| build_predicate(s, &e.columns, c, &e.ref_columns, dialect);
                 out.push(JoinTarget {
                     table: e.ref_table.clone(),
                     table_sql: crate::export::ident_if_needed(&e.ref_table, dialect),
-                    predicate: build_predicate(s, &e.columns, &cand, &e.ref_columns, dialect),
+                    predicate: build(&cand),
+                    aliased: aliased(&cand, &build),
                 });
             }
         }
@@ -12643,10 +12679,13 @@ fn join_targets_for(scope: &[TableRef], catalog: &Catalog, dialect: SqlDialect) 
                     db: None,
                 };
                 if seen.insert(t.clone()) {
+                    let build =
+                        |c: &TableRef| build_predicate(c, &e.columns, s, &e.ref_columns, dialect);
                     out.push(JoinTarget {
                         table: e.table.clone(),
                         table_sql: crate::export::ident_if_needed(&e.table, dialect),
-                        predicate: build_predicate(&cand, &e.columns, s, &e.ref_columns, dialect),
+                        predicate: build(&cand),
+                        aliased: aliased(&cand, &build),
                     });
                 }
                 break;
@@ -12654,6 +12693,159 @@ fn join_targets_for(scope: &[TableRef], catalog: &Catalog, dialect: SqlDialect) 
         }
     }
     out
+}
+
+/// The alias completion writes after `name`, accepted at `caret` — `orders` →
+/// `orders o` — or `None` where none belongs ([`alias_slot`]) or none can be
+/// made ([`table_alias`]). Clear of every alias and table name the query
+/// already has in scope.
+pub fn table_alias_at(
+    sql: &str,
+    lo: usize,
+    hi: usize,
+    caret: usize,
+    name: &str,
+    dialect: SqlDialect,
+) -> Option<String> {
+    if !alias_slot(sql, lo, hi, caret, dialect) {
+        return None;
+    }
+    let scope = query_scope(sql, lo, hi, caret, dialect);
+    let typed = &sql[word_start(sql, caret)..word_end_at(sql, caret, hi)];
+    table_alias(name, &taken_names(&scope, typed), dialect)
+}
+
+/// The alias for a table called `name` (its last `.` part): the initials of
+/// its words, lower-cased — `order_items` and `OrderItems` both `oi`. A
+/// number follows where that is `taken` (any case) or could not stand bare
+/// after a table on some server of `dialect` (`on`, `is`, `as`): `o2`, `on2`.
+///
+/// `None` where an alias would add nothing (a table called `o` already) or
+/// cannot be made: initials come from ASCII letters, and a name with none
+/// has no alias that both reads as its own and needs no quotes.
+pub fn table_alias(name: &str, taken: &[String], dialect: SqlDialect) -> Option<String> {
+    let base = name.rsplit('.').next().unwrap_or(name);
+    let mut initials = String::new();
+    let mut prev: Option<char> = None;
+    for c in base.chars() {
+        let starts_word = prev.is_none_or(|p| {
+            !p.is_ascii_alphanumeric() || (p.is_ascii_lowercase() && c.is_ascii_uppercase())
+        });
+        if starts_word && c.is_ascii_alphanumeric() {
+            initials.push(c.to_ascii_lowercase());
+        }
+        prev = Some(c);
+    }
+    let initials = initials.trim_start_matches(|c: char| c.is_ascii_digit());
+    if initials.is_empty() || initials.eq_ignore_ascii_case(base) {
+        return None;
+    }
+    let free = |a: &str| {
+        !reserved_anywhere(a, dialect)
+            && is_implicit_alias(a, dialect)
+            // A T-SQL batch separator, which no list reserves.
+            && !a.eq_ignore_ascii_case("GO")
+            && !taken.iter().any(|t| t.eq_ignore_ascii_case(a))
+    };
+    (1..)
+        .map(|n| {
+            if n == 1 {
+                initials.to_string()
+            } else {
+                format!("{initials}{n}")
+            }
+        })
+        .find(|a| free(a))
+}
+
+/// Is the word at `caret` a table that an alias may follow? It must be:
+///
+/// - **in a query's `FROM` or `JOIN` list** — not `INSERT INTO`, `UPDATE` or
+///   `DELETE FROM`, which take an alias on some engines and not others, nor a
+///   `SHOW … FROM` or a cursor's `FETCH … FROM`, which name no table to alias;
+/// - **the item's first word** — nothing between the keyword (or the list's
+///   last comma) and it but a qualifier, so a table accepted in the alias slot
+///   of `FROM orders o|` is not given a second;
+/// - **the end of what is written on its line** but for a `,`, `)` or `;`:
+///   whatever else follows may already be the alias, or the clause it would
+///   have to come before.
+fn alias_slot(sql: &str, lo: usize, hi: usize, caret: usize, dialect: SqlDialect) -> bool {
+    let rest = sql
+        .get(word_end_at(sql, caret, hi)..hi)
+        .unwrap_or("")
+        .trim_start_matches([' ', '\t']);
+    if !(rest.is_empty() || rest.starts_with(['\r', '\n', ',', ')', ';'])) {
+        return false;
+    }
+    let toks = tokenize_range(sql, lo, hi, dialect);
+    let query_head = match toks.first().map(|t| &t.kind) {
+        Some(TkKind::LParen) => true,
+        Some(TkKind::Word(w)) => [
+            "SELECT", "WITH", "INSERT", "REPLACE", "UPDATE", "CREATE", "EXPLAIN",
+        ]
+        .iter()
+        .any(|h| h.eq_ignore_ascii_case(w)),
+        _ => false,
+    };
+    if !query_head {
+        return false;
+    }
+    let word_lo = word_start(sql, caret);
+    let before: Vec<&Token> = toks.iter().take_while(|t| t.at < word_lo).collect();
+    let Some(kw) = before.iter().rposition(|t| {
+        matches!(&t.kind, TkKind::Word(w) if !t.quoted
+            && CLAUSE_KEYWORDS.contains(&w.to_ascii_uppercase().as_str()))
+    }) else {
+        return false;
+    };
+    let TkKind::Word(w) = &before[kw].kind else {
+        return false;
+    };
+    if !(w.eq_ignore_ascii_case("FROM") || w.eq_ignore_ascii_case("JOIN")) {
+        return false;
+    }
+    let item = before[kw + 1..]
+        .iter()
+        .rposition(|t| matches!(t.kind, TkKind::Comma))
+        .map_or(kw + 1, |c| kw + 2 + c);
+    // A qualifier only: `name .` pairs.
+    before[item..].chunks(2).all(|pair| {
+        matches!(
+            pair,
+            [
+                Token {
+                    kind: TkKind::Word(_),
+                    ..
+                },
+                Token {
+                    kind: TkKind::Dot,
+                    ..
+                }
+            ]
+        )
+    })
+}
+
+/// One past the word at `caret` (identifier bytes only), at most `hi`.
+fn word_end_at(sql: &str, caret: usize, hi: usize) -> usize {
+    let b = sql.as_bytes();
+    let mut end = caret.min(hi);
+    while end < hi && is_word_byte(b[end]) {
+        end += 1;
+    }
+    end
+}
+
+/// Every name an alias must not repeat: each in-scope table's alias and its
+/// own name. Not the word being `typed` — the scope reads the half-written
+/// `FROM o|` as a table called `o`, which would push `orders` to `o2`.
+fn taken_names(scope: &[TableRef], typed: &str) -> Vec<String> {
+    scope
+        .iter()
+        .filter(|r| r.alias.is_some() || !r.name.eq_ignore_ascii_case(typed))
+        .flat_map(|r| r.alias.iter().chain(std::iter::once(&r.name)))
+        .cloned()
+        .collect()
 }
 
 /// A `SELECT *` / `t.*` expansion: the byte range of the star (or `qualifier.*`) and
@@ -15991,7 +16183,7 @@ fn join_target_guess(
         return None;
     }
     let scope = query_scope(sql, lo, hi, caret, dialect);
-    let targets = join_targets_for(&scope, catalog, dialect);
+    let targets = join_targets_for(&scope, catalog, dialect, None);
     let [target] = targets.as_slice() else {
         return None;
     };
@@ -27023,6 +27215,124 @@ mod tests {
         // `customers` already joined → don't re-suggest it.
         let ts = jt("SELECT * FROM orders o JOIN customers c JOIN ");
         assert!(!ts.iter().any(|t| t.table == "customers"));
+    }
+
+    #[test]
+    fn a_join_target_carries_its_aliased_form() {
+        // The alias is in the predicate too — `customers c ON o.customer_id =
+        // customers.id` would name a table the alias has just hidden.
+        let ts = jt("SELECT * FROM orders o JOIN ");
+        let cust = ts.iter().find(|t| t.table == "customers").unwrap();
+        let aliased = cust.aliased.as_ref().expect("an alias at a JOIN slot");
+        assert_eq!(aliased.alias, "c");
+        assert_eq!(aliased.predicate, "o.customer_id = c.id");
+        let li = ts.iter().find(|t| t.table == "line_items").unwrap();
+        let aliased = li.aliased.as_ref().unwrap();
+        assert_eq!(aliased.alias, "li");
+        assert_eq!(aliased.predicate, "li.order_id = o.id");
+        // Not when something already follows on the line.
+        let sql = "SELECT * FROM orders o JOIN  WHERE 1";
+        let (schema, db) = fk_catalog();
+        let cat = Catalog::build(&[(db, &schema)], Some(db));
+        let ts = join_targets(sql, 0, sql.len(), 28, &cat, SqlDialect::MySql);
+        assert!(ts.iter().all(|t| t.aliased.is_none()), "{ts:?}");
+    }
+
+    // ── Table aliases on accept ───────────────────────────────────────────────
+
+    #[test]
+    fn a_table_alias_is_its_words_initials() {
+        let a = |n: &str| table_alias(n, &[], SqlDialect::MySql);
+        assert_eq!(a("orders").as_deref(), Some("o"));
+        assert_eq!(a("order_items").as_deref(), Some("oi"));
+        assert_eq!(a("OrderItems").as_deref(), Some("oi"));
+        assert_eq!(a("sales.orders").as_deref(), Some("o"));
+        assert_eq!(a("2fa_codes").as_deref(), Some("c"));
+    }
+
+    #[test]
+    fn a_table_alias_avoids_what_is_taken_and_what_is_reserved() {
+        let taken = ["O".to_string(), "o2".to_string()];
+        assert_eq!(
+            table_alias("offices", &taken, SqlDialect::MySql).as_deref(),
+            Some("o3")
+        );
+        // `on`, `is`, `as` and `or` cannot stand bare after a table.
+        for (name, want) in [
+            ("order_notes", "on2"),
+            ("in_stock", "is2"),
+            ("audit_snapshots", "as2"),
+        ] {
+            assert_eq!(
+                table_alias(name, &[], SqlDialect::Postgres).as_deref(),
+                Some(want),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_alias_where_it_would_add_nothing_or_could_not_be_written() {
+        // A table already named like its alias, and a name with no ASCII
+        // letter to take an initial from.
+        assert_eq!(table_alias("o", &[], SqlDialect::MySql), None);
+        assert_eq!(table_alias("名前", &[], SqlDialect::MySql), None);
+    }
+
+    /// `table_alias_at` with the caret at the `|`.
+    fn alias_at(sql: &str, name: &str) -> Option<String> {
+        let caret = sql.find('|').unwrap();
+        let sql = sql.replace('|', "");
+        table_alias_at(&sql, 0, sql.len(), caret, name, SqlDialect::MySql)
+    }
+
+    #[test]
+    fn a_table_alias_is_written_at_a_from_or_join_slot() {
+        assert_eq!(
+            alias_at("SELECT * FROM ord|", "orders").as_deref(),
+            Some("o")
+        );
+        // The half-typed word is not a table that takes `o` first.
+        assert_eq!(alias_at("SELECT * FROM o|", "orders").as_deref(), Some("o"));
+        assert_eq!(
+            alias_at("SELECT * FROM orders o JOIN order_i|", "order_items").as_deref(),
+            Some("oi")
+        );
+        // A second item of the list, clear of the first's alias.
+        assert_eq!(
+            alias_at("SELECT * FROM orders o, off|", "offices").as_deref(),
+            Some("o2")
+        );
+        // A qualified name, with the line going on after it.
+        assert_eq!(
+            alias_at("SELECT * FROM sales.ord|\nWHERE 1", "orders").as_deref(),
+            Some("o")
+        );
+        assert_eq!(
+            alias_at("SELECT * FROM (SELECT 1 FROM ord|)", "orders").as_deref(),
+            Some("o")
+        );
+    }
+
+    #[test]
+    fn no_table_alias_outside_a_query_table_slot() {
+        for sql in [
+            // Not a FROM/JOIN slot.
+            "INSERT INTO ord|",
+            "UPDATE ord|",
+            "SELECT ord|",
+            // A statement whose FROM does not take one everywhere.
+            "DELETE FROM ord|",
+            "SHOW COLUMNS FROM ord|",
+            // The alias slot itself, and a derived table's paren.
+            "SELECT * FROM orders ord|",
+            "SELECT * FROM (ord|",
+            // Something already follows on the line.
+            "SELECT * FROM ord| WHERE 1",
+            "SELECT * FROM ord| o",
+        ] {
+            assert_eq!(alias_at(sql, "orders"), None, "{sql}");
+        }
     }
 
     // ── SELECT * expansion ────────────────────────────────────────────────────
