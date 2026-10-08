@@ -875,7 +875,18 @@ existing prose was left alone.
     aggregated — judged only over a single, fully known base table and a grouping list of bare
     columns, skipping wildcards and a table whose name another in scope shares with a different key
     (`Catalog::pk_shared`, under `predict` below), and exempting a query grouped by the table's
-    whole primary key, MySQL's own functional-dependency exemption (`pk_of`) — and
+    whole primary key, MySQL's own functional-dependency exemption (`pk_of`). **It is drawn only
+    where every server of the engine refuses the query** (`GroupByRules`, read once per check
+    from three capability predicates): `rejects_ungrouped_columns` is true for PostgreSQL and SQL
+    Server, for a MySQL-family tab only once the server is known to be MySQL's (MariaDB's default
+    mode takes the column, and a tab whose server is not asked yet may be MariaDB's), and never for
+    SQLite, whose "bare column" is legal; `group_by_sees_output_aliases` lets `GROUP BY d` group
+    the column `AS d` names (not SQL Server's, whose `GROUP BY` sees input columns only); and
+    `unique_key_determines_row` exempts a fully grouped unique key of `NOT NULL` columns
+    (`Catalog::unique_keys`), which MySQL takes as determining the row and PostgreSQL does not
+    (`group_by_flags_only_what_every_server_of_the_engine_refuses`,
+    `group_by_an_output_alias_groups_the_column_it_names`,
+    `group_by_a_unique_not_null_key_determines_the_row_on_mysql`) — and
     `cartesian_check` on a `JOIN`/`INNER JOIN`/`STRAIGHT_JOIN` with no `ON`/`USING`, which runs as a
     cross join; an explicit `CROSS JOIN` is meant, and left alone, and so is a comma-join with a
     `WHERE` — one with no `WHERE` at all to a plain table (not a table function such as `,

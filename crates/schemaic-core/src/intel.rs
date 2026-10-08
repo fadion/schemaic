@@ -3993,6 +3993,39 @@ pub enum ClauseCtx {
     Other,
 }
 
+/// Does **every** server `dialect` reaches refuse a select-list column that is
+/// neither grouped nor aggregated? The GROUP BY warning is drawn only where it
+/// does. PostgreSQL and SQL Server always; MySQL 8 by its default
+/// `only_full_group_by`, but MariaDB's default mode takes the column, so a
+/// MySQL-family tab is judged only once the server is known to be MySQL's;
+/// SQLite never refuses one (a "bare column", taken from some row of the group).
+fn rejects_ungrouped_columns(dialect: SqlDialect, flavour: crate::schema::ServerFlavour) -> bool {
+    match dialect {
+        SqlDialect::Postgres | SqlDialect::MsSql => true,
+        SqlDialect::MySql => flavour == crate::schema::ServerFlavour::MySql,
+        SqlDialect::Sqlite => false,
+    }
+}
+
+/// Does grouping by a unique key of `NOT NULL` columns determine the rest of
+/// the row, as grouping by the primary key does? MySQL's functional-dependency
+/// reading takes it; PostgreSQL's takes the primary key alone.
+fn unique_key_determines_row(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MySql => true,
+        SqlDialect::Postgres | SqlDialect::MsSql | SqlDialect::Sqlite => false,
+    }
+}
+
+/// May `GROUP BY` name a select-list alias, grouping the expression it names?
+/// SQL Server's `GROUP BY` sees only the input columns.
+fn group_by_sees_output_aliases(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => true,
+        SqlDialect::MsSql => false,
+    }
+}
+
 /// Does a procedure call take its arguments in parens — `CALL p(1)` — rather
 /// than bare after the name, as T-SQL's `EXEC p @a = 1` does? What a
 /// procedure accepted from the list inserts after its name.
@@ -5336,6 +5369,10 @@ pub struct Catalog {
     /// table_lower → its primary-key column names (lower, active-db scoped), for
     /// the `only_full_group_by` functional-dependency exemption.
     pks: HashMap<String, Vec<String>>,
+    /// table_lower → each unique key whose columns are all `NOT NULL` (lower,
+    /// active-db scoped): what MySQL also takes as determining the row
+    /// ([`unique_key_determines_row`]).
+    unique_keys: HashMap<String, Vec<Vec<String>>>,
     /// Loaded database names (lower).
     loaded_dbs: HashSet<String>,
     /// The active database (lower), if any.
@@ -5513,6 +5550,7 @@ impl Catalog {
         let mut unqualified: HashMap<String, Vec<String>> = HashMap::new();
         let mut fks: HashMap<String, Vec<FkEdge>> = HashMap::new();
         let mut pks: HashMap<String, Vec<String>> = HashMap::new();
+        let mut unique_keys: HashMap<String, Vec<Vec<String>>> = HashMap::new();
         let mut loaded_dbs = HashSet::new();
         let mut known_idents = HashSet::new();
         let mut opaque_qualified = HashSet::new();
@@ -5668,6 +5706,32 @@ impl Catalog {
                     {
                         pk_shared.insert(name_lower.clone());
                     }
+                    // Unique keys of plain, NOT NULL columns: a NULL is
+                    // unequal to every other, so a nullable one determines
+                    // nothing.
+                    let not_null = |n: &str| {
+                        t.columns
+                            .iter()
+                            .any(|c| c.name.eq_ignore_ascii_case(n) && !c.nullable)
+                    };
+                    let keys: Vec<Vec<String>> = t
+                        .indexes
+                        .iter()
+                        .filter(|i| {
+                            i.unique
+                                && !i.columns.is_empty()
+                                && i.columns.iter().all(|c| !c.expression && not_null(&c.name))
+                        })
+                        .map(|i| {
+                            i.columns
+                                .iter()
+                                .map(|c| c.name.to_ascii_lowercase())
+                                .collect()
+                        })
+                        .collect();
+                    if !keys.is_empty() {
+                        unique_keys.insert(name_lower.clone(), keys);
+                    }
                     if !pk.is_empty() {
                         pks.insert(name_lower, pk);
                     }
@@ -5734,6 +5798,7 @@ impl Catalog {
             unqualified,
             fks,
             pks,
+            unique_keys,
             loaded_dbs,
             active_db: active_lower,
             known_idents,
@@ -10857,6 +10922,11 @@ mod colres {
             dateparts: super::datepart_functions(dialect),
             alias_in_where: super::select_alias_in_where(dialect),
             alias_in_having: super::select_alias_in_having(dialect),
+            group_by: GroupByRules {
+                judged: super::rejects_ungrouped_columns(dialect, catalog.flavour),
+                unique_keys: super::unique_key_determines_row(dialect),
+                aliases: super::group_by_sees_output_aliases(dialect),
+            },
             ctes: HashMap::new(),
             cte_frames: Vec::new(),
             scopes: Vec::new(),
@@ -10910,6 +10980,8 @@ mod colres {
         /// this engine — see [`Scope::alias_blind`].
         alias_in_where: bool,
         alias_in_having: bool,
+        /// What this engine's `GROUP BY` accepts — see [`GroupByRules`].
+        group_by: GroupByRules,
         /// Populated as queries are visited. See [`Ctes`].
         ctes: Ctes,
         /// What each enclosing query put into [`Collector::ctes`], and what it
@@ -11123,6 +11195,7 @@ mod colres {
                 sel,
                 &sources,
                 self.catalog,
+                self.group_by,
                 self.stmt,
                 self.lo,
                 &mut self.gb,
@@ -11555,14 +11628,35 @@ mod colres {
     /// skipping a table whose name another in-scope table shares with a
     /// different key ([`Catalog::pk_shared`]), since which key is its own is
     /// unknown.
+    /// The engine's answers [`group_by_check`] needs, read once per check.
+    #[derive(Clone, Copy)]
+    pub(super) struct GroupByRules {
+        /// Every server of the engine refuses an ungrouped column
+        /// ([`super::rejects_ungrouped_columns`]); otherwise nothing is drawn.
+        pub judged: bool,
+        /// A unique `NOT NULL` key determines the row
+        /// ([`super::unique_key_determines_row`]).
+        pub unique_keys: bool,
+        /// `GROUP BY` may name a select-list alias
+        /// ([`super::group_by_sees_output_aliases`]).
+        pub aliases: bool,
+    }
+
     fn group_by_check(
         sel: &Select,
         sources: &[Src],
         catalog: &Catalog,
+        rules: GroupByRules,
         stmt: &str,
         lo: usize,
         out: &mut Vec<Diagnostic>,
     ) {
+        // **Only what every server of the engine refuses**: a warning on SQL
+        // SQLite runs, or MariaDB's default mode does, is a squiggle on a
+        // working query.
+        if !rules.judged {
+            return;
+        }
         let GroupByExpr::Expressions(exprs, _) = &sel.group_by else {
             return;
         };
@@ -11596,9 +11690,36 @@ mod colres {
         if catalog.pk_shared.contains(&table_lower) {
             return;
         }
+        // Grouping by a select-list alias groups the column it names.
+        if rules.aliases {
+            for item in &sel.projection {
+                if let SelectItem::ExprWithAlias { expr, alias } = item
+                    && grouped.contains(&alias.value.to_ascii_lowercase())
+                {
+                    match expr {
+                        Expr::Identifier(id) => {
+                            grouped.insert(id.value.to_ascii_lowercase());
+                        }
+                        Expr::CompoundIdentifier(parts) if !parts.is_empty() => {
+                            grouped.insert(parts[parts.len() - 1].value.to_ascii_lowercase());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
         // Grouping by the full primary key functionally determines every column.
         if let Some(pk) = catalog.pk_of(&table_lower)
             && pk.iter().all(|k| grouped.contains(k))
+        {
+            return;
+        }
+        // …and, where the engine reads it so, a unique key of NOT NULL columns.
+        if rules.unique_keys
+            && catalog
+                .unique_keys
+                .get(&table_lower)
+                .is_some_and(|keys| keys.iter().any(|k| k.iter().all(|c| grouped.contains(c))))
         {
             return;
         }
@@ -22999,10 +23120,90 @@ mod tests {
         emp.columns[0].primary_key = true;
         let schema = DbSchema {
             tables: vec![emp, tbl("departments", &["id", "name"])],
+            // MySQL 8, as `sample_catalog`: a MySQL tab whose server is not
+            // known draws no GROUP BY warning (`rejects_ungrouped_columns`).
+            flavour: crate::schema::ServerFlavour::MySql,
             ..Default::default()
         };
         let cat = Catalog::build(&[("company", &schema)], Some("company"));
         diagnostics(sql, &cat, SqlDialect::MySql)
+    }
+
+    /// The GROUP BY warnings `sql` draws against `schema` on `dialect`.
+    fn gb_on(sql: &str, schema: &DbSchema, dialect: SqlDialect) -> Vec<String> {
+        let cat = Catalog::build(&[("company", schema)], Some("company"));
+        diagnostics(sql, &cat, dialect)
+            .into_iter()
+            .filter(|d| d.message.contains("GROUP BY"))
+            .map(|d| sql[d.range.0..d.range.1].to_string())
+            .collect()
+    }
+
+    #[test]
+    fn group_by_flags_only_what_every_server_of_the_engine_refuses() {
+        use crate::schema::ServerFlavour;
+        let schema = |flavour| DbSchema {
+            tables: vec![tbl("employees", &["id", "name", "dept_id"])],
+            flavour,
+            ..Default::default()
+        };
+        let sql = "SELECT dept_id, name FROM employees GROUP BY dept_id";
+        // PostgreSQL and SQL Server refuse it everywhere; MySQL 8 by default.
+        for d in [SqlDialect::Postgres, SqlDialect::MsSql] {
+            assert_eq!(
+                gb_on(sql, &schema(ServerFlavour::Unknown), d),
+                ["name"],
+                "{d:?}"
+            );
+        }
+        assert_eq!(
+            gb_on(sql, &schema(ServerFlavour::MySql), SqlDialect::MySql),
+            ["name"]
+        );
+        // SQLite takes a bare column; MariaDB's default mode does too, and a
+        // MySQL tab whose server is not known yet may be MariaDB's.
+        assert!(gb_on(sql, &schema(ServerFlavour::Unknown), SqlDialect::Sqlite).is_empty());
+        assert!(gb_on(sql, &schema(ServerFlavour::MariaDb), SqlDialect::MySql).is_empty());
+        assert!(gb_on(sql, &schema(ServerFlavour::Unknown), SqlDialect::MySql).is_empty());
+    }
+
+    #[test]
+    fn group_by_an_output_alias_groups_the_column_it_names() {
+        use crate::schema::ServerFlavour;
+        let schema = DbSchema {
+            tables: vec![tbl("employees", &["id", "name", "dept_id"])],
+            flavour: ServerFlavour::MySql,
+            ..Default::default()
+        };
+        let sql = "SELECT dept_id AS d, COUNT(*) FROM employees GROUP BY d";
+        for d in [SqlDialect::MySql, SqlDialect::Postgres] {
+            assert!(gb_on(sql, &schema, d).is_empty(), "{d:?}");
+        }
+    }
+
+    #[test]
+    fn group_by_a_unique_not_null_key_determines_the_row_on_mysql() {
+        use crate::schema::{IndexColumn, IndexInfo, ServerFlavour};
+        let mut people = tbl("people", &["id", "email", "name"]);
+        people.columns[1].nullable = false;
+        people.indexes = vec![IndexInfo {
+            name: "people_email".into(),
+            columns: vec![IndexColumn {
+                name: "email".into(),
+                ..Default::default()
+            }],
+            unique: true,
+            ..Default::default()
+        }];
+        let schema = DbSchema {
+            tables: vec![people],
+            flavour: ServerFlavour::MySql,
+            ..Default::default()
+        };
+        let sql = "SELECT email, name FROM people GROUP BY email";
+        assert!(gb_on(sql, &schema, SqlDialect::MySql).is_empty());
+        // PostgreSQL takes only a primary key as determining the row.
+        assert_eq!(gb_on(sql, &schema, SqlDialect::Postgres), ["name"]);
     }
 
     #[test]
