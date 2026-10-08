@@ -64,15 +64,74 @@ pub enum InlineView {
     /// is painted.
     Working(std::ops::Range<usize>),
     /// A settled suggestion: the lines it replaces are faded and banded, and its
-    /// own lines are added after them as phantom rows.
-    Plan(InlinePlan),
+    /// own lines are added after them as phantom rows — lexed with what the
+    /// document around them opens ([`HunkCarries`]).
+    Plan(InlinePlan, HunkCarries),
+}
+
+/// For each hunk of a plan, the non-code region each added row starts inside
+/// **in the buffer the suggestion would leave** — a comment or a string opened
+/// above the hunk, by the document or by an earlier hunk, as much as one the
+/// hunk opens itself. Computed once per plan ([`InlineView::settled`]), since
+/// [`segments`] runs per laid-out line. Empty for a hunk whose rows could not
+/// be found there, which then lexes as a text of its own.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct HunkCarries(Vec<Vec<Option<crate::sql_highlight::LineCarry>>>);
+
+impl HunkCarries {
+    fn of(plan: &InlinePlan, new_full: &str, dialect: SqlDialect) -> Self {
+        let carries = crate::sql_highlight::carried_lines(new_full, dialect);
+        let lines: Vec<&str> = new_full.split('\n').collect();
+        // Where each hunk's first added row sits in the new buffer: its spot in
+        // the old one, moved by what the hunks before it added and removed.
+        let mut shift = 0isize;
+        let per_hunk = plan
+            .hunks
+            .iter()
+            .map(|h| {
+                let old_at = if !h.del.is_empty() {
+                    h.del.start
+                } else if h.before {
+                    h.anchor
+                } else {
+                    h.anchor + 1
+                };
+                let at = old_at as isize + shift;
+                shift += h.add.len() as isize - h.del.len() as isize;
+                let Ok(at) = usize::try_from(at) else {
+                    return Vec::new();
+                };
+                // Only where the rows really are there, line ending aside.
+                let found = h.add.iter().enumerate().all(|(i, a)| {
+                    lines
+                        .get(at + i)
+                        .is_some_and(|l| l.strip_suffix('\r').unwrap_or(l) == a)
+                });
+                match found {
+                    true => carries
+                        .get(at..at + h.add.len())
+                        .map(<[_]>::to_vec)
+                        .unwrap_or_default(),
+                    false => Vec::new(),
+                }
+            })
+            .collect();
+        HunkCarries(per_hunk)
+    }
 }
 
 impl InlineView {
+    /// A settled suggestion, `plan` of the buffer the suggestion turns into
+    /// `new_full`, whose rows are lexed in that buffer.
+    pub fn settled(plan: InlinePlan, new_full: &str, dialect: SqlDialect) -> Self {
+        let carries = HunkCarries::of(&plan, new_full, dialect);
+        InlineView::Plan(plan, carries)
+    }
+
     /// The settled plan, if this is one.
     pub fn plan(&self) -> Option<&InlinePlan> {
         match self {
-            InlineView::Plan(p) => Some(p),
+            InlineView::Plan(p, _) => Some(p),
             InlineView::Working(_) => None,
         }
     }
@@ -82,7 +141,7 @@ impl InlineView {
     pub fn fades(&self, line: usize) -> bool {
         match self {
             InlineView::Working(lines) => lines.contains(&line),
-            InlineView::Plan(p) => p.hunks.iter().any(|h| h.del.contains(&line)),
+            InlineView::Plan(p, _) => p.hunks.iter().any(|h| h.del.contains(&line)),
         }
     }
 
@@ -93,7 +152,7 @@ impl InlineView {
     pub fn fade(&self) -> f32 {
         match self {
             InlineView::Working(_) => 0.45,
-            InlineView::Plan(_) => 0.65,
+            InlineView::Plan(..) => 0.65,
         }
     }
 }
@@ -297,15 +356,20 @@ fn phantom_slot(cols: impl IntoIterator<Item = usize>, col: usize) -> usize {
 /// with no glyphs (`relevant_layouts` filters on exactly that), so a truly empty
 /// row would collapse and the diff would be one line short of what it claims.
 pub fn segments(view: &InlineView, line: usize, dialect: SqlDialect) -> Option<Segments> {
-    let hunk = view
-        .plan()?
+    let InlineView::Plan(plan, carries) = view else {
+        return None;
+    };
+    let (k, hunk) = plan
         .hunks
         .iter()
-        .find(|h| h.anchor == line && !h.add.is_empty())?;
+        .enumerate()
+        .find(|(_, h)| h.anchor == line && !h.add.is_empty())?;
     let mut parts: Vec<(String, Option<Color>)> = Vec::new();
-    // The hunk's rows lexed as one text, so a comment or string the
-    // suggestion opens on one row is coloured as one on the next.
-    let spans = crate::sql_highlight::highlight_lines(&hunk.add, dialect);
+    // The hunk's rows lexed where they land, so a comment or string opened
+    // above them — or on one row of the suggestion — is coloured as one on
+    // the next.
+    let context = carries.0.get(k).map_or(&[][..], Vec::as_slice);
+    let spans = crate::sql_highlight::highlight_lines_in(&hunk.add, dialect, context);
     for (i, added) in hunk.add.iter().enumerate() {
         // A `before` block ends each row with the newline; an after-block starts
         // each row with one. Either way there is exactly one `\n` per added row,
@@ -718,11 +782,16 @@ mod tests {
     fn plan(hunks: Vec<InlineHunk>) -> InlineView {
         let added = hunks.iter().map(|h| h.add.len()).sum();
         let removed = hunks.iter().map(|h| h.del.len()).sum();
-        InlineView::Plan(InlinePlan {
-            hunks,
-            added,
-            removed,
-        })
+        // Hand-built, with no buffer to lex the rows in: each hunk's rows
+        // stand alone.
+        InlineView::Plan(
+            InlinePlan {
+                hunks,
+                added,
+                removed,
+            },
+            HunkCarries::default(),
+        )
     }
 
     fn hunk(del: std::ops::Range<usize>, add: &[&str], anchor: usize, before: bool) -> InlineHunk {
@@ -973,7 +1042,7 @@ mod tests {
             ("a\nb\nc\nd", "d\nc\nb\na"),
         ] {
             let p = schemaic_core::diff::inline_plan(old, new);
-            let v = InlineView::Plan(p.clone());
+            let v = InlineView::settled(p.clone(), new, SqlDialect::MySql);
             // Every line of the old buffer, plus one past it: a hunk can anchor
             // at the last line, and `inline_plan` anchors a leading insertion at
             // line 0 with `before`.
@@ -991,6 +1060,41 @@ mod tests {
         }
     }
 
+    /// **A suggestion's rows are lexed in the document they land in.** A
+    /// comment or a string opened *above* the hunk ran on into its rows in the
+    /// buffer, and the rows were drawn as code: only what the hunk itself
+    /// opened was carried.
+    #[test]
+    fn a_hunks_rows_carry_what_the_document_above_them_opened() {
+        let d = SqlDialect::MySql;
+        let comment = crate::sql_highlight::highlight_spans("/* x", d)[0].2;
+        let string = crate::sql_highlight::highlight_spans("'x'", d)[0].2;
+        for (old, new, want) in [
+            (
+                "/* start\nold\n*/ select 1",
+                "/* start\nzork\n*/ select 1",
+                comment,
+            ),
+            ("select 'a\nold\nb'", "select 'a\nzork\nb'", string),
+            // After an earlier hunk has opened it.
+            ("select 1\nkeep\nold", "/* select 1\nkeep\nzork */", comment),
+        ] {
+            let p = schemaic_core::diff::inline_plan(old, new);
+            let v = InlineView::settled(p, new, d);
+            let last = old.lines().count() - 1;
+            let row = (0..=last)
+                .rev()
+                .find_map(|l| segments(&v, l, d))
+                .expect("the hunk holding `new`");
+            let (_, color) = row
+                .parts
+                .iter()
+                .find(|(t, _)| t.contains("zork"))
+                .unwrap_or_else(|| panic!("{new:?}: no `zork` part in {:?}", row.parts));
+            assert_eq!(*color, Some(want), "{new:?}");
+        }
+    }
+
     /// The cheap and expensive halves have to agree on plans the differ really
     /// produces, not only on hand-built ones — `row_split` uses `block_at`'s
     /// `len` as a byte column into the text `segments` built, so a disagreement
@@ -1003,7 +1107,7 @@ mod tests {
             ("a\nb", "\na\n\nb"),
         ] {
             let p = schemaic_core::diff::inline_plan(old, new);
-            let v = InlineView::Plan(p);
+            let v = InlineView::settled(p, new, SqlDialect::MySql);
             for l in 0..=old.lines().count().max(1) {
                 let cheap = block_at(&v, l);
                 let full = segments(&v, l, SqlDialect::MySql);

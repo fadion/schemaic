@@ -577,6 +577,8 @@ fn cmdk_popup(
     // Editor-area height, so the verdict bar can tell when the block it closes has
     // scrolled out of the pane and take itself off screen with it.
     area_h: RwSignal<f64>,
+    // The tab's engine, which the suggestion's rows are lexed in.
+    dialect: Memo<SqlDialect>,
 ) -> impl IntoView {
     // The editor's own view id, so closing the overlay can hand focus back to
     // the editor (else focus is left dangling after the input is torn down).
@@ -647,7 +649,9 @@ fn cmdk_popup(
                     // A suggestion identical to what the user already has has no
                     // rows to draw; leaving it unset keeps the editor untouched
                     // and lets the footer say so instead.
-                    (!plan.is_empty()).then_some(inline_diff::InlineView::Plan(plan))
+                    (!plan.is_empty()).then(|| {
+                        inline_diff::InlineView::settled(plan, &new_full, dialect.get_untracked())
+                    })
                 }
                 _ => None,
             };
@@ -5333,6 +5337,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         ed_cmdk,
         comp,
         area_h,
+        dialect,
     );
     // Error bar: pinned to the editor's bottom (5px inset) when the last run
     // failed. Truncated error + View (opens the modal) + Explain + AI fix.

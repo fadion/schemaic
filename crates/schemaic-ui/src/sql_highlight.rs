@@ -483,7 +483,7 @@ pub(crate) struct LineCarry {
 /// happens on every keystroke, so the per-line form was Θ(visible × document).
 /// Built on the shared `schemaic_core::sql::skip_noncode` primitive, so every
 /// boundary agrees with the rest of the SQL tooling.
-fn carried_lines(text: &str, dialect: SqlDialect) -> Vec<Option<LineCarry>> {
+pub(crate) fn carried_lines(text: &str, dialect: SqlDialect) -> Vec<Option<LineCarry>> {
     let b = text.as_bytes();
     let n = b.len();
     // Every non-code region that spans a line break; an unterminated one runs
@@ -552,12 +552,29 @@ pub fn highlight_lines<S: AsRef<str>>(
     lines: &[S],
     dialect: SqlDialect,
 ) -> Vec<Vec<(usize, usize, Color)>> {
-    let text = lines
-        .iter()
-        .map(AsRef::as_ref)
-        .collect::<Vec<_>>()
-        .join("\n");
-    let carries = carried_lines(&text, dialect);
+    highlight_lines_in(lines, dialect, &[])
+}
+
+/// [`highlight_lines`] for rows whose carries are already known — each
+/// row's from the document it sits in ([`carried_lines`] over that
+/// document), which is what lets a comment opened above them carry in. A
+/// `context` that is not one carry per row is ignored, and the rows are lexed
+/// as a text of their own.
+pub(crate) fn highlight_lines_in<S: AsRef<str>>(
+    lines: &[S],
+    dialect: SqlDialect,
+    context: &[Option<LineCarry>],
+) -> Vec<Vec<(usize, usize, Color)>> {
+    let carries = if context.len() == lines.len() && !lines.is_empty() {
+        context.to_vec()
+    } else {
+        let text = lines
+            .iter()
+            .map(AsRef::as_ref)
+            .collect::<Vec<_>>()
+            .join("\n");
+        carried_lines(&text, dialect)
+    };
     let brackets = crate::theme::editor_rainbow_brackets().then_some(0);
     lines
         .iter()

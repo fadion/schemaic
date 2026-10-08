@@ -24654,8 +24654,23 @@ existing prose was left alone.
     `Working(Range<usize>)` is the request in flight — the document lines it covers (from
     `diff::line_span`, since the request is a byte range) fade to say so, and nothing else happens:
     no rows are added and **no band is painted**, because nothing has been proposed yet.
-    `Plan(InlinePlan)` is the settled suggestion, whose replaced lines fade *and* get the band while
-    its own lines arrive as phantom rows. The two fade depths differ deliberately — `fade()` returns
+    `Plan(InlinePlan, HunkCarries)` is the settled suggestion, whose replaced lines fade *and* get
+    the band while its own lines arrive as phantom rows. **Its rows are lexed where they land, not as
+    a text of their own.** `InlineView::settled` — what `cmdk_popup` builds, which is why it now
+    takes the tab's `dialect` — runs `sql_highlight::carried_lines` once over `new_full`, the buffer
+    as `diff::inline_splice` says Accept would leave it, and `HunkCarries::of` keeps each hunk's
+    rows' carries. Lexed standalone, a comment or string opened *above* a hunk — by the document or
+    by an earlier hunk — never reached its rows, which were drawn as code; only what the hunk itself
+    opened carried. The hunk's first added row is found in the new buffer at its old spot (`del.start`,
+    or `anchor` for a `before` block, else `anchor + 1`) shifted by the earlier hunks' added-minus-
+    removed lines, and the carries are kept **only if the rows are really there**, line ending
+    aside; otherwise that hunk gets none and lexes standalone as it used to, which is a colour
+    degraded rather than a colour wrong. It is computed once per plan rather than in `segments`
+    because `segments` runs per laid-out line, and a whole-document pass there is the same
+    per-line cost `before_col_of` (below) was written to keep off that path. Test plans built by
+    hand carry `HunkCarries::default()`; `a_hunks_rows_carry_what_the_document_above_them_opened`
+    pins a block comment and a string opened above, and a comment opened by an earlier hunk.
+    The two fade depths differ deliberately — `fade()` returns
     0.45 for `Working` and 0.65 for `Plan`: waiting is the stronger dim because the faded text is
     all there is to look at, while a replaced line still has to stay readable against the one
     proposed under it. Both that depth and the `fades(line)` predicate live on the enum, so
@@ -25644,10 +25659,12 @@ existing prose was left alone.
     where comments nest, and not on MySQL (`every_noncode_region_carries_across_lines`).
     `highlight_spans` still lexes one line with no carry — it has no document — so a string or
     comment spanning a preview's lines is coloured line by line there. The Ctrl+K diff's added
-    rows go through `highlight_lines` instead, which lexes a hunk's rows as one text and carries
-    what one row opens into the next (`a_run_of_lines_carries_its_regions`); the document around
-    the hunk is still not read, so a hunk that starts inside a string the lines above opened is
-    coloured as code.
+    rows go through `highlight_lines_in`, which takes each row's carry from the document the rows
+    land in (`inline_diff::HunkCarries`, under `inline_diff.rs`), so a hunk that starts inside a
+    string or comment the lines above opened is coloured as one. A context that is not one carry
+    per row falls back to lexing the rows as one text, carrying only what one row opens into the
+    next — which is all `highlight_lines`, now a wrapper over it with no context, does
+    (`a_run_of_lines_carries_its_regions`).
     **Rainbow brackets** (Settings → Editor, off by default — `UiState::editor_rainbow_brackets`,
     `theme::editor_rainbow_brackets`) are the one colour that depends on lines other than its own.
     `lex_line_with` takes the depth its line starts at, or `None` while the setting is off, which
