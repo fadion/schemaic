@@ -323,10 +323,21 @@ impl Resolver<'_, '_> {
                 .and_then(|r| self.scoped(r))
                 .or_else(|| self.table(None, name))
                 .or_else(|| {
-                    self.scope
+                    // Only where exactly one table in scope holds it: the
+                    // server refuses one two tables hold, and naming either
+                    // would be a guess. A table joined to itself is one.
+                    let mut found: Vec<NamedObject> = Vec::new();
+                    for c in self
+                        .scope
                         .iter()
                         .filter_map(|r| self.scoped(r))
-                        .find_map(|t| self.column_of(t, name))
+                        .filter_map(|t| self.column_of(t, name))
+                    {
+                        if !found.contains(&c) {
+                            found.push(c);
+                        }
+                    }
+                    (found.len() == 1).then(|| found.remove(0))
                 }),
             [q, name] if called => self.routine(Some(q), name),
             [q, name] => match self.qualifier(q).and_then(|r| self.scoped(r)) {
@@ -465,6 +476,22 @@ mod tests {
         // In a database-qualified name too.
         let sql = "select * from shop.orders";
         assert_eq!(at(sql, "orders", 0).unwrap().object, table("orders", false));
+    }
+
+    /// **A bare column two tables in scope both hold names neither** — the
+    /// server would refuse it as ambiguous, and Ctrl+click on it opened the
+    /// first table's, a guess. The same table twice is still one.
+    #[test]
+    fn an_ambiguous_bare_column_names_nothing() {
+        let sql = "select id from orders o join customers c on c.id = o.customer_id";
+        assert_eq!(at(sql, "id", 0), None);
+        // Qualified, it is no longer ambiguous.
+        assert_eq!(at(sql, "id", 1).unwrap().object, column("customers", "id"));
+        let twice = "select total from orders a join orders b on a.id = b.id";
+        assert_eq!(
+            at(twice, "total", 0).unwrap().object,
+            column("orders", "total")
+        );
     }
 
     #[test]

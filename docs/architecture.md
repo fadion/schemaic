@@ -2949,9 +2949,10 @@ existing prose was left alone.
     `pub(crate)` for this, with `Token`'s fields and `TkKind`) and the scope is
     `intel::statement_scope`'s, so there is no scanner here of its own. A bare word is a scope alias
     or table, then a table of the active database, then a column of a table in scope — in that
-    order, so a column sharing a table's name answers as the table, and a bare column two tables in
-    scope both hold answers as the first one's: this is a lookup, not `colres`'s resolution, and it
-    reports no ambiguity. `q.name` is a column of the alias or table `q`, else a table of the
+    order, so a column sharing a table's name answers as the table. **A bare column two tables in
+    scope both hold names nothing** — the server refuses it as ambiguous, and Ctrl+click opening the
+    first table's was a guess; a table joined to itself is still one
+    (`an_ambiguous_bare_column_names_nothing`). `q.name` is a column of the alias or table `q`, else a table of the
     database `q` where one is loaded by that name (MySQL's `db.t`), else of schema `q` in the active
     database; three parts are a table's column or SQL Server's `db.schema.table`; a name followed by
     `(` is a routine. Every match is exact first, then case-insensitive (`find_table`). **What no
