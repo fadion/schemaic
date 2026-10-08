@@ -99,24 +99,27 @@ pub struct SqlText {
 
 /// Past this, opening a `.sql` file asks first. See [`open_verdict`].
 ///
-/// 4 MiB, measured (release, a realistic script, a 200-table catalogue). What
+/// 8 MiB, measured (release, a realistic script, a 200-table catalogue). What
 /// set it at 1 MB was the diagnostics pass — the whole document on the UI
 /// thread after every pause in typing, 710 ms at 1 MB — which now runs on a
-/// worker through a statement cache: 116 ms after an edit at 4 MiB, 1.2 s for
-/// the first pass, with nothing frozen. What is left on the UI thread per
+/// worker through a statement cache: ~230 ms after an edit at 8 MiB, ~2.4 s
+/// for the first pass, with nothing frozen. What is left on the UI thread per
 /// keystroke is taken forward over the edit rather than redone — the colouring
-/// and bracket passes and the statement index, under 3 ms together at 4 MiB,
-/// plus a few ~0.5 ms copies of the text, against 86 ms of whole-document walks
-/// before. At 16 MiB the same is 30–40 ms a
-/// keystroke plus a 5 s first diagnostics pass, which is a slow editor: past 4
-/// MiB the question stands.
-pub const OPEN_WARN_BYTES: u64 = 4 << 20;
+/// and bracket passes and the statement index — plus the one copy of the text
+/// an edit makes and the caret's line and column: 6–8 ms at 8 MiB, ~3.5 ms at
+/// 4 MiB, under a frame, against 86 ms of whole-document walks at 4 MiB
+/// before. Once typing pauses, the parameter names (20 ms) and the identifier
+/// highlight (16 ms) are read once. Opening one costs ~160 ms of first passes.
+/// At 16 MiB the same comes to a frame or more a keystroke and a ~5 s first
+/// diagnostics pass (extrapolated, both linear in the size), which is a slow
+/// editor: past 8 MiB the question stands.
+pub const OPEN_WARN_BYTES: u64 = 8 << 20;
 
 /// Past this, opening is refused outright.
 ///
 /// 64 MB puts the first diagnostics pass near 20 s and every keystroke near
-/// 100 ms — extrapolated from the 16 MiB measurements above, both linear in
-/// the size — which is not a slow editor but a hung one. The number is deliberately far above
+/// 60 ms — extrapolated from the 8 MiB measurements above, both linear in the
+/// size — which is not a slow editor but a hung one. The number is deliberately far above
 /// anything a hand-written script reaches: what lands here is a database dump,
 /// and the answer for one of those is the import path or a query tab, not a
 /// syntax-highlighted editor holding four copies of it.
@@ -571,13 +574,13 @@ mod tests {
         use OpenVerdict::*;
         assert_eq!(open_verdict(0), Open, "an empty file");
         assert_eq!(open_verdict(47_000), Open, "an ordinary script");
-        // 4 MiB opens without asking: what the editor does per keystroke
-        // there was measured at a few milliseconds (see `OPEN_WARN_BYTES`).
-        assert_eq!(open_verdict(4 << 20), Open, "a large script");
+        // 8 MiB opens without asking: what the editor does per keystroke
+        // there was measured under a frame (see `OPEN_WARN_BYTES`).
+        assert_eq!(open_verdict(8 << 20), Open, "a large script");
         assert_eq!(
-            open_verdict((4 << 20) + 1),
-            Confirm((4 << 20) + 1),
-            "past 4 MiB it asks"
+            open_verdict((8 << 20) + 1),
+            Confirm((8 << 20) + 1),
+            "past 8 MiB it asks"
         );
         assert_eq!(
             open_verdict(OPEN_WARN_BYTES),
