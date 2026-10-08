@@ -13724,10 +13724,13 @@ fn alias_slot(sql: &str, lo: usize, hi: usize, caret: usize, dialect: SqlDialect
     })
 }
 
-/// One past the word at `caret` (identifier bytes only), at most `hi`.
+/// One past the word at `caret` (identifier bytes only), at most `hi` — and
+/// never before `caret`, which sits past `hi` in the blank after a statement's
+/// last word: `sql[word_start(caret)..word_end_at(..)]` is then empty rather
+/// than a reversed range that panics.
 fn word_end_at(sql: &str, caret: usize, hi: usize) -> usize {
     let b = sql.as_bytes();
-    let mut end = caret.min(hi);
+    let mut end = caret;
     while end < hi && is_word_byte(b[end]) {
         end += 1;
     }
@@ -29346,6 +29349,22 @@ mod tests {
         let cat = Catalog::build(&[(db, &schema)], Some(db));
         let ts = join_targets(sql, 0, sql.len(), 28, &cat, SqlDialect::MySql);
         assert!(ts.iter().all(|t| t.aliased.is_none()), "{ts:?}");
+    }
+
+    /// **A caret in the blank after a statement's last word is past its `hi`.**
+    /// The editor's statement range ends at the last token, so typing `JOIN `
+    /// put the caret one byte past it, and slicing the word under the caret
+    /// from there to `hi` panicked ("byte range starts at 28 but ends at 27")
+    /// on the completion timer — the app gone.
+    #[test]
+    fn a_caret_past_the_statements_end_offers_its_joins_without_panicking() {
+        let sql = "SELECT * FROM orders o JOIN ";
+        let hi = sql.trim_end().len();
+        let (schema, db) = fk_catalog();
+        let cat = Catalog::build(&[(db, &schema)], Some(db));
+        let ts = join_targets(sql, 0, hi, sql.len(), &cat, SqlDialect::MySql);
+        let cust = ts.iter().find(|t| t.table == "customers").expect("{ts:?}");
+        assert_eq!(cust.aliased.as_ref().map(|a| a.alias.as_str()), Some("c"));
     }
 
     // ── Table aliases on accept ───────────────────────────────────────────────
