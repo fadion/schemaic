@@ -292,6 +292,20 @@ pub(crate) fn build_offer_catalog(
     catalog_of(db_nodes, Some(hidden), active_db)
 }
 
+/// Every database of the connection whose schema has loaded, by name — the
+/// `Arc`s out of `SchemaState`, so refcount bumps rather than copies.
+pub(crate) fn loaded_schemas(db_nodes: RwSignal<Vec<ConnNode>>) -> Vec<(String, Arc<DbSchema>)> {
+    db_nodes.with_untracked(|nodes| {
+        nodes
+            .iter()
+            .filter_map(|node| match node.schema.get_untracked() {
+                SchemaState::Loaded(schema) => Some((node.database.clone(), schema)),
+                _ => None,
+            })
+            .collect()
+    })
+}
+
 fn catalog_of(
     db_nodes: RwSignal<Vec<ConnNode>>,
     hidden: Option<&HashSet<String>>,

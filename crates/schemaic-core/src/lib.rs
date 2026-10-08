@@ -48,6 +48,7 @@ pub mod pg_builtins;
 pub mod plan;
 pub mod prompt;
 pub mod propose;
+pub mod quickinfo;
 pub mod rank;
 pub mod resource;
 pub mod resultsel;

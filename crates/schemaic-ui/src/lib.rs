@@ -8974,6 +8974,13 @@ fn center(ui: Ui) -> impl IntoView {
         })
     };
 
+    // Ctrl+click's go to definition, built once for every tab's editor.
+    let open_object = open_named_object(
+        &ui.tab_actions,
+        (ui.conn, ui.schema, ui.ddl),
+        ui.schema_actions.clone(),
+        db_nodes,
+    );
     // Editor area: the active tab's query editor — or, while that tab is
     // "flashing" closed, a solid placeholder of identical size, so nothing
     // below it shifts.
@@ -9040,6 +9047,7 @@ fn center(ui: Ui) -> impl IntoView {
                     remembered_predictions,
                     history: ui.history.entries,
                     accepted: ui.accepted,
+                    open_object: open_object.clone(),
                     tabs,
                     validate_stmt: validate_stmt.clone(),
                     popup_menu: popup,
@@ -9907,6 +9915,62 @@ fn result_chip_menu(id: u64, tab: Tab, gctx: &GridCtx) {
     gctx.popup_anchor.set(None); // right-click → open at the cursor
     gctx.popup_width.set(170.0);
     gctx.popup.set(Some(entries));
+}
+
+/// What Ctrl+click on a name in the editor opens
+/// ([`schemaic_core::quickinfo::NamedObject`]): a table's or a view's data
+/// tab — at the column, for a column — or a routine's editor, through the
+/// same doors the schema tree and Find Anywhere use.
+fn open_named_object(
+    tabs: &TabsActions,
+    (conn, tree, ddl): (ConnUi, SchemaUi, DdlUi),
+    actions: Rc<SchemaActions>,
+    db_nodes: RwSignal<Vec<ConnNode>>,
+) -> Rc<dyn Fn(schemaic_core::quickinfo::NamedObject)> {
+    use schemaic_core::quickinfo::NamedObject;
+    use schemaic_core::schema::{ObjectItem, TableSource};
+    let open_table = tabs.open_table.clone();
+    let open_col = tabs.open_table_col.clone();
+    Rc::new(move |object| match object {
+        NamedObject::Table {
+            database,
+            schema,
+            table,
+            ..
+        } => open_table(TableSource::new(database, schema, table)),
+        NamedObject::Column {
+            database,
+            schema,
+            table,
+            column,
+        } => open_col(TableSource::new(database, schema, table), column),
+        NamedObject::Routine {
+            database,
+            schema,
+            name,
+            kind,
+        } => {
+            let routine = completion::loaded_schemas(db_nodes)
+                .into_iter()
+                .find(|(d, _)| *d == database)
+                .and_then(|(_, s)| {
+                    s.routines
+                        .iter()
+                        .find(|r| r.name == name && r.schema == schema && r.kind == kind)
+                        .cloned()
+                });
+            if let Some(r) = routine {
+                crate::object_editor::open_for_object(
+                    conn,
+                    tree,
+                    ddl,
+                    &actions,
+                    &database,
+                    &ObjectItem::Routine(r),
+                );
+            }
+        }
+    })
 }
 
 /// Now, in epoch seconds — for a result's age in the strip's tooltip, and an

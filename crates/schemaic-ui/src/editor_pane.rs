@@ -1676,7 +1676,12 @@ fn single_char(s: &str) -> Option<char> {
 /// `points_of_offset().x` is text-layout-relative (0 = code start), so this is
 /// what turns it into editor-area x.
 fn content_x_of(sql: &str) -> f64 {
-    let total_lines = sql.bytes().filter(|&c| c == b'\n').count() + 1;
+    content_x_for_lines(sql.bytes().filter(|&c| c == b'\n').count() + 1)
+}
+
+/// [`content_x_of`] for a document of `total_lines` lines — for a caller that
+/// has the count without the text, as the editor's rope does.
+fn content_x_for_lines(total_lines: usize) -> f64 {
     let digits = total_lines.to_string().len();
     HL_GUTTER + digits.saturating_sub(1) as f64 * HL_DIGIT_W
 }
@@ -2203,6 +2208,86 @@ struct DiagHit {
     bottom: f64,
     severity: Severity,
     message: String,
+    /// A name's quick-info rather than a diagnostic: the name starts at this
+    /// offset, and `message` is filled in when the tip's delay runs out
+    /// ([`schemaic_core::quickinfo`]), so a pointer passing over words
+    /// resolves none of them.
+    name_at: Option<usize>,
+}
+
+/// The word under `p` (in `editor_area` coords) as a quick-info hover target
+/// — its box, and where it starts — or `None` off the text or off a word. A
+/// diagnostic over the same word answers first ([`diag_under`]).
+///
+/// Asked on every pointer move, so it reads nothing the size of the document:
+/// the code column from the line count, not from the text.
+fn name_box_at(ed: &Editor, p: Point) -> Option<DiagHit> {
+    let rope = ed.rope_text();
+    let cx = content_x_for_lines(rope.num_lines());
+    let vp = ed.viewport.get_untracked();
+    let doc = Point::new(p.x - cx + vp.x0, p.y - EDITOR_PAD_TOP + vp.y0);
+    if doc.x < 0.0 {
+        return None;
+    }
+    let (off, inside) = ed.offset_of_point(floem::views::editor::core::mode::Mode::Insert, doc);
+    if !inside {
+        return None;
+    }
+    let line = rope.line_of_offset(off);
+    let start = rope.offset_of_line(line);
+    let text = rope.line_content(line);
+    let b = text.as_bytes();
+    let at = (off - start).min(b.len());
+    let word = |c: &&u8| schemaic_core::sql::is_word_byte(**c);
+    let back = b[..at].iter().rev().take_while(word).count();
+    let ahead = b[at..].iter().take_while(word).count();
+    let (lo, hi) = (off - back, off + ahead);
+    if lo == hi {
+        return None;
+    }
+    let points = editor_points(ed);
+    let (top, bot) = points(lo)?;
+    let (end, _) = points(hi)?;
+    Some(DiagHit {
+        x: cx + top.x - vp.x0,
+        top: top.y + EDITOR_PAD_TOP - vp.y0,
+        w: end.x - top.x,
+        bottom: bot.y + EDITOR_PAD_TOP - vp.y0,
+        severity: Severity::Warning,
+        message: String::new(),
+        name_at: Some(lo),
+    })
+}
+
+/// The quick-info for the name starting at `at` in `sql`, against the
+/// connection's loaded schemas — `None` where it names nothing they hold.
+fn quick_info(
+    sql: &str,
+    at: usize,
+    dialect: SqlDialect,
+    db_nodes: RwSignal<Vec<crate::ConnNode>>,
+    active_db: Option<&str>,
+) -> Option<String> {
+    let loaded = crate::completion::loaded_schemas(db_nodes);
+    let refs: Vec<(&str, &schemaic_core::schema::DbSchema)> =
+        loaded.iter().map(|(d, s)| (d.as_str(), &**s)).collect();
+    let hit = schemaic_core::quickinfo::name_at(sql, at, dialect, &refs, active_db)?;
+    schemaic_core::quickinfo::describe(&hit.object, &refs)
+}
+
+/// What the name at `at` names, against the connection's loaded schemas —
+/// Ctrl+click's question, [`quick_info`]'s first half.
+fn named_object_at(
+    sql: &str,
+    at: usize,
+    dialect: SqlDialect,
+    db_nodes: RwSignal<Vec<crate::ConnNode>>,
+    active_db: Option<&str>,
+) -> Option<schemaic_core::quickinfo::NamedObject> {
+    let loaded = crate::completion::loaded_schemas(db_nodes);
+    let refs: Vec<(&str, &schemaic_core::schema::DbSchema)> =
+        loaded.iter().map(|(d, s)| (d.as_str(), &**s)).collect();
+    schemaic_core::quickinfo::name_at(sql, at, dialect, &refs, active_db).map(|h| h.object)
 }
 
 /// The hover box `(x, top, w, bottom)` for the diagnostic `[lo, hi]` — the
@@ -2612,6 +2697,9 @@ pub(crate) struct QueryPaneParams {
     /// The completion items each connection's user has accepted before
     /// ([`Ui::accepted`](crate::Ui::accepted)).
     pub accepted: crate::stored::Stored<schemaic_core::accepted::AcceptedFile>,
+    /// Ctrl+click's go to definition: open what the name names — a table or
+    /// view's data tab (at the column, for a column), a routine's editor.
+    pub open_object: Rc<dyn Fn(schemaic_core::quickinfo::NamedObject)>,
     /// Every open tab, whose statements a prediction remembers from too.
     pub tabs: RwSignal<Vec<crate::Tab>>,
     /// Requests a debounced DB validation of the statement under the cursor.
@@ -2687,6 +2775,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         nav,
         zoom,
         conn_status,
+        open_object,
     } = p;
     let comp = Completion {
         items: RwSignal::new(Vec::new()),
@@ -5227,6 +5316,25 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     }
                     return EventPropagation::Stop;
                 }
+                // Ctrl+click opens what the name under it names: go to
+                // definition. floem's own click, which runs first, has put
+                // the caret there already.
+                if pe.button.is_primary()
+                    && primary_held(pe.modifiers)
+                    && !pe.modifiers.alt()
+                    && !pe.modifiers.shift()
+                {
+                    let off = ed_menu.cursor.get_untracked().offset();
+                    let adb = active_db.get_untracked();
+                    let found = query.with_untracked(|sql| {
+                        named_object_at(sql, off, dialect.get_untracked(), db_nodes, adb.as_deref())
+                    });
+                    if let Some(object) = found {
+                        comp.open.set(false);
+                        open_object(object);
+                        return EventPropagation::Stop;
+                    }
+                }
                 if pe.button.is_secondary() {
                     let off = ed_menu.cursor.get_untracked().offset();
                     menu_offset.set(off);
@@ -6343,6 +6451,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                         bottom,
                         severity: d.severity,
                         message: d.message.clone(),
+                        name_at: None,
                     })
                 })
                 .collect::<Vec<_>>()
@@ -6357,12 +6466,17 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     // Set by an overlay the pointer is over, read by `editor_area`'s move — see
     // `marks_pointer`.
     let on_overlay: Rc<std::cell::Cell<bool>> = Rc::new(std::cell::Cell::new(false));
+    // The editor, held where the `Copy` hover closure can reach it.
+    let ed_qi = RwSignal::new(ed_tip.clone());
     let hover_diag = move |p: Option<Point>| {
         // Not over the completion list: typing is what opens it, and a message
         // about the text being replaced is noise over the list replacing it.
+        let p = p.filter(|_| !comp.open.get_untracked());
+        // A diagnostic first; else the name under the pointer, whose
+        // quick-info is resolved only once the delay has run out.
         let under = p
-            .filter(|_| !comp.open.get_untracked())
-            .and_then(|p| diag_hits.with_untracked(|hs| diag_under(hs, p).cloned()));
+            .and_then(|p| diag_hits.with_untracked(|hs| diag_under(hs, p).cloned()))
+            .or_else(|| p.and_then(|p| ed_qi.with_untracked(|ed| name_box_at(ed, p))));
         // Every pointer move lands here, so a move that changes nothing must
         // not touch a signal — a set notifies even when the value is equal, and
         // the tip view would rebuild on every pixel.
@@ -6383,7 +6497,24 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 if diag_tip_gen.try_get_untracked() == Some(this)
                     && crate::widgets::innermost_focus_root().is_none()
                 {
-                    diag_tip.set(Some(hit));
+                    let hit = match hit.name_at {
+                        None => Some(hit),
+                        Some(at) => query
+                            .with_untracked(|sql| {
+                                let adb = active_db.get_untracked();
+                                quick_info(
+                                    sql,
+                                    at,
+                                    dialect.get_untracked(),
+                                    db_nodes,
+                                    adb.as_deref(),
+                                )
+                            })
+                            .map(|message| DiagHit { message, ..hit }),
+                    };
+                    if hit.is_some() {
+                        diag_tip.set(hit);
+                    }
                 }
             });
         }
@@ -8025,6 +8156,7 @@ mod geometry_tests {
             bottom: 60.0,
             severity,
             message: message.to_string(),
+            name_at: None,
         }
     }
 

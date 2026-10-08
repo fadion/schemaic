@@ -3690,7 +3690,7 @@ pub(crate) use crate::sql::{is_word_byte, is_word_start};
 /// Lightweight SQL token used by the context analysis (words + the punctuation
 /// that matters for it). Strings and comments are skipped by the tokenizer.
 #[derive(Clone)]
-enum TkKind {
+pub(crate) enum TkKind {
     Word(String),
     Dot,
     Comma,
@@ -3699,8 +3699,8 @@ enum TkKind {
 }
 
 /// A token plus its absolute byte offset in `sql`.
-struct Token {
-    at: usize,
+pub(crate) struct Token {
+    pub(crate) at: usize,
     /// One past the token's last byte **in the source**, quotes included.
     ///
     /// Carried rather than recomputed as `at + text.len()`, which is wrong for
@@ -3709,8 +3709,8 @@ struct Token {
     /// underlined `"NoSuchTb` — starting on the quote and stopping two bytes
     /// short — and a doubled quote inside the name widened the error further.
     /// The tokenizer is the only place that knows what it consumed.
-    end: usize,
-    kind: TkKind,
+    pub(crate) end: usize,
+    pub(crate) kind: TkKind,
     /// The word came from a quoted identifier (`` `select` ``). Quoting is what
     /// makes a reserved word legal as a name, so the alias checks must not flag
     /// it — and the scope resolver must still see the name.
@@ -3789,7 +3789,7 @@ pub(crate) fn ident_quote(dialect: SqlDialect, open: u8) -> Option<(u8, bool)> {
 /// PG string whose contents must not be read as code). `skip_noncode` decides
 /// every boundary, so there's no second scanner here — only the content of a
 /// quoted-identifier span is lifted out.
-fn tokenize_range(sql: &str, lo: usize, hi: usize, dialect: SqlDialect) -> Vec<Token> {
+pub(crate) fn tokenize_range(sql: &str, lo: usize, hi: usize, dialect: SqlDialect) -> Vec<Token> {
     let b = sql.as_bytes();
     let mut out = Vec::new();
     let mut i = lo;

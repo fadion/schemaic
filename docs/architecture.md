@@ -2918,6 +2918,29 @@ existing prose was left alone.
     `DATEADDD`; it was watched fail against the `None` arm.
     `only_the_engines_with_a_catalog_are_authoritative` covers this catalog too, in both directions — SQL Server knows `datediff` and `iif` and not
     MySQL's `curdate`, and neither MySQL nor PostgreSQL knows `eomonth`.
+  - `quickinfo.rs` — **what a name in the editor names**: the one answer behind the hover's
+    quick-info and Ctrl+click's go to definition (both under `editor_pane.rs`). `name_at` takes the
+    statement round the offset (`sql::statement_range`), refuses inside a string or comment
+    (`intel::caret_in_literal_or_comment`), finds the word token the offset is on — or just after
+    it, since a click at a word's end leaves the caret there — and takes the whole dotted chain
+    around it, resolving the chain only *up to the part under the offset*, so `o` of `o.total`
+    names the table and `total` the column. The tokens are `intel::tokenize_range`'s (made
+    `pub(crate)` for this, with `Token`'s fields and `TkKind`) and the scope is
+    `intel::statement_scope`'s, so there is no scanner here of its own. A bare word is a scope alias
+    or table, then a table of the active database, then a column of a table in scope — in that
+    order, so a column sharing a table's name answers as the table, and a bare column two tables in
+    scope both hold answers as the first one's: this is a lookup, not `colres`'s resolution, and it
+    reports no ambiguity. `q.name` is a column of the alias or table `q`, else a table of the
+    database `q` where one is loaded by that name (MySQL's `db.t`), else of schema `q` in the active
+    database; three parts are a table's column or SQL Server's `db.schema.table`; a name followed by
+    `(` is a routine. Every match is exact first, then case-insensitive (`find_table`). **What no
+    loaded schema holds is `None`**, never a nearest guess — the database is the semantic authority,
+    and a guess would open the wrong object. `describe` renders a `NamedObject` as the tip's lines:
+    a table or view with its column count and comment; a column with its type, then *primary key ·
+    not null · auto increment · default … · generated as …*, then its comment; a routine as its
+    signature. **It fetches nothing**: types, constraints and comments are already in the loaded
+    `DbSchema`, so the lazy fetch once planned for this had nothing to do. The module's own tests
+    pin both halves.
   - `filter.rs` — the header filter/sort bar: a dialect-aware `sqlparser` **AST rewrite** that
     splices a `WHERE`/`ORDER BY` into the `SELECT` that produced the result and hands back SQL to
     re-run — so filtering covers the whole table, not the loaded page. `build_query` rewrites only
@@ -24132,6 +24155,26 @@ existing prose was left alone.
     holds the hover box to the wave, and
     `the_tip_stays_inside_the_pane_margins_wherever_the_squiggle_is` sweeps pane widths and squiggle
     positions for either edge ever reaching past a margin.
+    **The same tip is a name's quick-info**, and Ctrl+click opens what the name names — both over
+    `core::quickinfo`. `DiagHit` carries `name_at: Option<usize>`: where `diag_under` finds no
+    squiggle, `hover_diag` asks `name_box_at`, which undoes `content_x`, `EDITOR_PAD_TOP` and the
+    viewport to reach a document point, takes `Editor::offset_of_point` only when that lands inside
+    the text, and boxes the run of word bytes on the line — so a diagnostic on the same word wins.
+    It runs on every pointer move and so reads nothing document-sized: the code column comes from
+    the rope's line count through `content_x_for_lines` (which `content_x_of`, counting the text's
+    newlines, now calls), not from the text. **Resolution waits for the delay** — `quick_info`
+    (`completion::loaded_schemas` → `name_at` → `describe`) runs only when `DIAG_TIP_DELAY` fires,
+    so a pointer crossing a line of words resolves none of them, and a name that names nothing shows
+    no tip rather than an empty one. Being the same `diag_tip`, it keeps everything above — the
+    overlay gate, what retires it, its placement. The `Copy` hover closure reaches the `Editor`
+    through a `RwSignal` (`ed_qi`). **Ctrl+click** is the editor's outer `PointerDown`, which runs
+    after floem's own click has put the caret under the pointer: the primary button with the
+    primary modifier and neither Alt nor Shift asks `named_object_at` at the caret and hands the
+    hit to `QueryPaneParams::open_object`, built once in `lib.rs` by `open_named_object` — a table
+    or view through `open_table`, a column through `open_table_col` (which scrolls to it), a routine
+    through `object_editor::open_for_object` with the loaded `RoutineInfo`, the doors the schema
+    tree and Find Anywhere use. Alt+click is left to floem and still adds a caret; a Ctrl+click on
+    nothing resolvable just places the caret.
     **The right-click menu's *Copy as single line*** puts `sqlfmt::single_line_copy`'s answer on the
     clipboard — the selection, or with none the statement under the right-click, on one line (the
     `sqlfmt.rs` entry has what that keeps and what it refuses). It is **absent rather than dimmed**
