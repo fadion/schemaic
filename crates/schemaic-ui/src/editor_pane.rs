@@ -6046,14 +6046,17 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                         // identifier in MySQL, so pasting a dump's trigger block
                         // in here and pressing Run Everything failed at the
                         // trigger with a syntax error.
-                        let stmts = schemaic_core::sql::executable_statements(
+                        // And the tail no `;` ends cut at its blank lines, as
+                        // Run Current cuts it (`editor_executable_spans`).
+                        let spans = schemaic_core::sql::editor_executable_spans(
                             &sql,
                             dialect.get_untracked(),
                         );
-                        run_spans.set(schemaic_core::sql::executable_spans(
-                            &sql,
-                            dialect.get_untracked(),
-                        ));
+                        let stmts = spans
+                            .iter()
+                            .map(|&(lo, hi)| sql[lo..hi].to_string())
+                            .collect();
+                        run_spans.set(spans);
                         run_sent.set(None);
                         (run_all)(stmts);
                         highlight.set(None);
@@ -6759,12 +6762,25 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             if query.with_untracked(|q| q.trim().is_empty()) {
                 return;
             }
-            run_spans.set(query.with_untracked(|q| {
-                schemaic_core::sql::executable_spans(q, dialect.get_untracked())
-            }));
-            // The whole buffer is what is sent.
+            let sql = query.get_untracked();
+            let dia = dialect.get_untracked();
+            let spans = schemaic_core::sql::editor_executable_spans(&sql, dia);
+            // A blank line cut the tail no `;` ends: send its pieces one by
+            // one, as Run Everything does. Otherwise the whole buffer is what
+            // is sent, as it always was.
+            if spans.len() > schemaic_core::sql::executable_spans(&sql, dia).len() {
+                let stmts = spans
+                    .iter()
+                    .map(|&(lo, hi)| sql[lo..hi].to_string())
+                    .collect();
+                run_spans.set(spans);
+                run_sent.set(None);
+                (run_all)(stmts);
+                return;
+            }
+            run_spans.set(spans);
             run_sent.set(Some(0));
-            (run)(query.get_untracked())
+            (run)(sql)
         })
         .on_event(EventListener::PointerEnter, move |_| {
             hovered.set(true);

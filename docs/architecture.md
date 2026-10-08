@@ -781,11 +781,16 @@ existing prose was left alone.
     `INSERT`/`REPLACE` header whose `SELECT`, `WITH`, `VALUES` or `TABLE` comes after the blank
     line. A statement a `;` ends keeps its blank lines
     (`a_blank_line_separates_statements_where_no_terminator_does`,
-    `a_blank_line_inside_a_statement_does_not_cut_it`). **The scope is deliberate, and it is a
-    divergence**: `statement_range` (completion, signature help, the AI actions),
-    `statement_ranges`, `executable_statements` (Run Everything) and the script runner still split
-    at terminators only, so the same unterminated buffer is one statement to them and several to
-    Ctrl+Enter.
+    `a_blank_line_inside_a_statement_does_not_cut_it`). **Run Everything cuts the same way**:
+    `editor_executable_spans` is `executable_spans` with the unterminated tail cut by the same
+    `blank_line_cuts`, read by the run menu's Run Everything and by the toolbar's Run — which sends
+    the pieces through `run_all` when a blank line cut something, and the whole buffer through `run`
+    as before when none did; both stay behind the write guard
+    (`run_everything_cuts_the_unterminated_tail_at_blank_lines`). **The rest is deliberately
+    terminator-only**: `statement_range` (completion, signature help, the AI actions),
+    `statement_ranges`, `executable_statements`, the script runner, a dump and `schemaic exec` — a
+    file is not a buffer someone is writing in, and a blank line inside a long statement there must
+    not cut it.
     **`unsafe_reason` asks first about what destroys stored rows, and about nothing else.** It is
     the warning behind `first_unsafe`, which `run_verdict` turns into `Confirm` whatever
     `confirm_writes` says: `every_row_reason` (below), or `drop_reason`, a statement that destroys

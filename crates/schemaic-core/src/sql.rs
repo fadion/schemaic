@@ -1421,6 +1421,38 @@ pub fn executable_spans(sql: &str, dialect: SqlDialect) -> Vec<(usize, usize)> {
     out
 }
 
+/// [`executable_spans`] for the editor's **Run Everything**: the stretch no
+/// terminator ends — the tail after the last `;`, or the whole buffer without
+/// one — is cut again at its blank lines, as Run at the caret cuts it
+/// ([`blank_line_cuts`]), so each piece is what Ctrl+Enter on it would send.
+///
+/// The editor's alone. The script runner, a dump and `schemaic exec` keep
+/// [`executable_statements`]' terminators-only split: a file is not a buffer
+/// someone is writing in, and a blank line inside a long statement there must
+/// not cut it.
+pub fn editor_executable_spans(sql: &str, dialect: SqlDialect) -> Vec<(usize, usize)> {
+    let mut delim: Vec<u8> = vec![b';'];
+    let mut bounds = scan_bounds(sql, dialect, &mut delim, true, None);
+    let tail = bounds.last().map_or(0, |b| b.at);
+    bounds.extend(
+        blank_line_cuts(sql, tail, sql.len(), dialect)
+            .into_iter()
+            .map(|at| Bound { at, strip: 0 }),
+    );
+    let mut out = Vec::new();
+    let mut prev = 0usize;
+    for bound in bounds.iter().skip(1).copied().chain(std::iter::once(Bound {
+        at: sql.len(),
+        strip: 0,
+    })) {
+        if let Some(text) = executable_range(sql, prev, bound, dialect) {
+            out.push(span_in(sql, text));
+        }
+        prev = bound.at;
+    }
+    out
+}
+
 /// Where `part`, a slice borrowed from `whole`, sits in it.
 pub fn span_in(whole: &str, part: &str) -> (usize, usize) {
     let lo = part.as_ptr() as usize - whole.as_ptr() as usize;
@@ -6644,6 +6676,40 @@ mod tests {
             assert_eq!(run_at(tail, "elect 1", d), "select 1");
             assert_eq!(run_at(tail, "elect 0", d), "select 0;");
         }
+    }
+
+    /// **Run Everything cuts where Run at the caret cuts**: the tail no
+    /// terminator ends is split at its blank lines as Ctrl+Enter splits it,
+    /// so a script written without `;` runs statement by statement, and every
+    /// piece is one Ctrl+Enter on it would send.
+    #[test]
+    fn run_everything_cuts_the_unterminated_tail_at_blank_lines() {
+        for d in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::MsSql] {
+            let sql = "select 0;\nselect 1\n\nselect 2\nfrom t\n\nselect a,\n\nb from t";
+            let got: Vec<&str> = super::editor_executable_spans(sql, d)
+                .into_iter()
+                .map(|(lo, hi)| &sql[lo..hi])
+                .collect();
+            assert_eq!(
+                got,
+                vec![
+                    "select 0;",
+                    "select 1",
+                    "select 2\nfrom t",
+                    "select a,\n\nb from t"
+                ],
+                "{d:?}"
+            );
+            for (lo, hi) in super::editor_executable_spans(sql, d) {
+                assert_eq!(super::executable_at(sql, lo + 1, d), Some(&sql[lo..hi]));
+            }
+        }
+        // Terminated throughout: what `executable_spans` answers.
+        let sql = "select 1\n\nfrom t;\nselect 2;";
+        assert_eq!(
+            super::editor_executable_spans(sql, SqlDialect::MySql),
+            super::executable_spans(sql, SqlDialect::MySql)
+        );
     }
 
     /// **Only a fallback.** A statement a `;` ends keeps its blank lines, and
