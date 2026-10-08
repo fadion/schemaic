@@ -1600,6 +1600,43 @@ fn run_result(state: &QueryState, duration_ms: u64) -> Option<schemaic_core::his
 /// MySQL's is the safe default to answer with — Postgres' would report a
 /// transaction as poisoned when there is no transaction at all. The reasoning
 /// lives with the mapping now.)
+/// The schema reload a run's completion calls, filled once `refresh_db`
+/// exists (see `refresh_after_run`).
+type LateRefresh = Rc<RefCell<Option<Rc<dyn Fn(String)>>>>;
+
+/// Settle a tab's schema after a run lands or its transaction ends, by
+/// `sql::schema_reload`: reload its database now, or owe it until the open
+/// transaction ends (`owed`, by tab id). Only on the tree's own connection —
+/// `refresh_db` reads the active one.
+fn settle_schema(
+    tab: schemaic_ui::Tab,
+    changed: bool,
+    dialect: SqlDialect,
+    owed: &RefCell<HashSet<usize>>,
+    active_conn: u64,
+    refresh: &LateRefresh,
+) {
+    let was_owed = owed.borrow().contains(&tab.id);
+    let (now, still) = schemaic_core::sql::schema_reload(
+        changed,
+        tab.tx.get_untracked().is_open(),
+        dialect,
+        was_owed,
+    );
+    if still {
+        owed.borrow_mut().insert(tab.id);
+    } else {
+        owed.borrow_mut().remove(&tab.id);
+    }
+    if now
+        && tab.conn_id.get_untracked() == active_conn
+        && let Some(database) = tab.database.get_untracked()
+        && let Some(reload) = refresh.borrow().clone()
+    {
+        reload(database);
+    }
+}
+
 fn tx_engine(db: &Db) -> TxEngine {
     schemaic_db::session::tx_engine_of(db.engine())
 }
@@ -2774,10 +2811,13 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // run paths call, filled with `refresh_db` once that exists, far below:
     // `refresh_db` needs `start_fetch`, which needs everything the tree does.
     // Empty until then, and nothing runs that early.
-    type LateRefresh = Rc<RefCell<Option<Rc<dyn Fn(String)>>>>;
     let refresh_after_run: LateRefresh = Rc::new(RefCell::new(None));
+    // The tabs whose open transaction holds DDL a reload is owed for
+    // (`settle_schema`).
+    let ddl_owed: Rc<RefCell<HashSet<usize>>> = Rc::new(RefCell::new(HashSet::new()));
     let run_query_core: Rc<dyn Fn(String, bool)> = {
         let refresh_after_run = refresh_after_run.clone();
+        let ddl_owed = ddl_owed.clone();
         let handle = handle.clone();
         let tokens = tokens.clone();
         let run_gen = run_gen.clone();
@@ -2891,7 +2931,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             let dialect = dialect_of(&db);
             let finish_history = finish_history.clone();
             let refresh_after_run = refresh_after_run.clone();
-            let ran_in = database.clone();
+            let ddl_owed = ddl_owed.clone();
             let send = create_ext_action(
                 cx,
                 move |(state, stmt, took): (QueryState, Option<StmtOutcome>, u64)| {
@@ -2902,26 +2942,23 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         tab.tx
                             .update(|t| *t = t.on_statement(engine, &tx_sql, stmt));
                     }
-                    // **The schema it changed is reloaded**, before the supersede
-                    // check like the transaction and the history: the change
-                    // happened whichever run the tab shows. Only on the tree's
-                    // own connection (`refresh_db` reads the active one), and
-                    // not while an open transaction still hides the change
-                    // from the fresh connection a reload reads on
-                    // (`sql::run_stales_schema`).
-                    if !is_view
+                    // **The schema it changed is reloaded** — or owed until the
+                    // open transaction ends (`settle_schema`) — before the
+                    // supersede check like the transaction and the history: the
+                    // change happened whichever run the tab shows. A run that
+                    // ended the transaction (`COMMIT` typed in the editor)
+                    // settles what it owed.
+                    let changed = !is_view
                         && matches!(state, QueryState::Loaded(_))
-                        && tab.conn_id.get_untracked() == active_conn.get_untracked()
-                        && schemaic_core::sql::run_stales_schema(
-                            &tx_sql,
-                            dialect,
-                            tab.tx.get_untracked().is_open(),
-                        )
-                        && let Some(database) = &ran_in
-                        && let Some(refresh) = refresh_after_run.borrow().clone()
-                    {
-                        refresh(database.clone());
-                    }
+                        && schemaic_core::sql::changes_schema(&tx_sql, dialect);
+                    settle_schema(
+                        tab,
+                        changed,
+                        dialect,
+                        &ddl_owed,
+                        active_conn.get_untracked(),
+                        &refresh_after_run,
+                    );
                     // History is about the *run*, not this tab's display, so it
                     // too is recorded before the supersede check — and only for a
                     // run that reached a verdict (a cancelled one leaves the entry
@@ -3349,6 +3386,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         let record_history = record_history.clone();
         let finish_history = finish_history.clone();
         let refresh_after_run = refresh_after_run.clone();
+        let ddl_owed = ddl_owed.clone();
         Rc::new(move |stmts: Vec<String>| {
             let stmts: Vec<String> = stmts.into_iter().filter(|s| !s.trim().is_empty()).collect();
             if stmts.is_empty() {
@@ -3439,7 +3477,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             let finish_history = finish_history.clone();
             let dialect = dialect_of(&db);
             let refresh_after_run = refresh_after_run.clone();
-            let ran_in = tab.database.get_untracked();
+            let ddl_owed = ddl_owed.clone();
             let send = create_ext_action(
                 cx,
                 move |(states, outcomes, took): (
@@ -3454,18 +3492,18 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     }
                     // A statement that changed the schema reloads it, once for
                     // the batch — see the single run's.
-                    let in_tx = tab.tx.get_untracked().is_open();
-                    let stale = tx_stmts.iter().zip(&states).any(|(sql, state)| {
+                    let changed = tx_stmts.iter().zip(&states).any(|(sql, state)| {
                         matches!(state, QueryState::Loaded(_))
-                            && schemaic_core::sql::run_stales_schema(sql, dialect, in_tx)
+                            && schemaic_core::sql::changes_schema(sql, dialect)
                     });
-                    if stale
-                        && tab.conn_id.get_untracked() == active_conn.get_untracked()
-                        && let Some(database) = &ran_in
-                        && let Some(refresh) = refresh_after_run.borrow().clone()
-                    {
-                        refresh(database.clone());
-                    }
+                    settle_schema(
+                        tab,
+                        changed,
+                        dialect,
+                        &ddl_owed,
+                        active_conn.get_untracked(),
+                        &refresh_after_run,
+                    );
                     // Before the supersede check, for the same reasons as a single
                     // run's — and handed over as one batch, so the whole script
                     // costs one history save rather than one per statement.
@@ -5286,16 +5324,42 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let end_tx: EndTxFn = {
         let sessions = sessions.clone();
         let handle = handle.clone();
+        let db_for = db_for.clone();
+        let refresh_after_run = refresh_after_run.clone();
+        let ddl_owed = ddl_owed.clone();
         Rc::new(
             move |tab_id: usize, commit: bool, then: Option<Rc<dyn Fn()>>| {
                 let Some(tab) = tabs.with_untracked(|v| v.iter().find(|t| t.id == tab_id).copied())
                 else {
                     return;
                 };
+                // The transaction's end settles a reload its DDL owed — a
+                // ROLLBACK's too, which shows the schema as it is
+                // (`sql::schema_reload`).
+                let settle = {
+                    let db_for = db_for.clone();
+                    let refresh_after_run = refresh_after_run.clone();
+                    let ddl_owed = ddl_owed.clone();
+                    move || {
+                        if let Ok(db) = db_for(tab.conn_id.get_untracked()) {
+                            settle_schema(
+                                tab,
+                                false,
+                                dialect_of(&db),
+                                &ddl_owed,
+                                active_conn.get_untracked(),
+                                &refresh_after_run,
+                            );
+                        } else {
+                            ddl_owed.borrow_mut().remove(&tab.id);
+                        }
+                    }
+                };
                 let Some(session) = sessions.borrow().get(&tab_id).cloned() else {
                     // No session: nothing to end, but the state machine may still
                     // be showing a lost transaction — clear it and carry on.
                     tab.tx.set(TxState::closed());
+                    settle();
                     if let Some(then) = then {
                         then();
                     }
@@ -5314,6 +5378,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         }
                         None => tab.tx.set(TxState::closed()),
                     }
+                    settle();
                     if let Some(then) = then.clone() {
                         then();
                     }

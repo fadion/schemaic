@@ -1340,14 +1340,30 @@ pub fn changes_schema(sql: &str, dialect: SqlDialect) -> bool {
     })
 }
 
-/// Should a successful run of `sql` re-introspect its database? When it
-/// [`changes_schema`] — unless it ran inside a transaction still open
-/// (`in_open_tx`) on an engine whose DDL is transactional
-/// (`ddl::ddl_is_transactional`): the reload reads on a fresh connection,
-/// which cannot see the change before `COMMIT`, and would only put the old
-/// schema back. MySQL commits a DDL statement implicitly, so it reloads there.
-pub fn run_stales_schema(sql: &str, dialect: SqlDialect, in_open_tx: bool) -> bool {
-    changes_schema(sql, dialect) && !(in_open_tx && crate::ddl::ddl_is_transactional(dialect))
+/// Whether to re-introspect a tab's database **now**, and whether a reload is
+/// still owed after — at each run that lands, and at each end of the tab's
+/// transaction. `changed` is whether what just ran [`changes_schema`];
+/// `in_open_tx` whether a transaction is open after it; `pending` whether an
+/// earlier change in that transaction is still owed one.
+///
+/// Inside an open transaction on an engine whose DDL is transactional
+/// (`ddl::ddl_is_transactional`) nothing reloads: the reload reads on a fresh
+/// connection, which cannot see the change before `COMMIT`, and would only put
+/// the old schema back — so the change is owed instead. Anywhere else a change,
+/// or one owed, reloads now: MySQL commits DDL on the spot, and a transaction's
+/// end settles what it held — a `ROLLBACK` too, whose reload costs one
+/// introspection and shows the schema as it is.
+pub fn schema_reload(
+    changed: bool,
+    in_open_tx: bool,
+    dialect: SqlDialect,
+    pending: bool,
+) -> (bool, bool) {
+    if in_open_tx && crate::ddl::ddl_is_transactional(dialect) {
+        (false, pending || changed)
+    } else {
+        (changed || pending, false)
+    }
 }
 
 /// Does the `TABLE` of `stmt`'s header name a T-SQL temporary table — the
@@ -5371,17 +5387,25 @@ mod changes_schema_tests {
     }
 
     #[test]
-    fn ddl_inside_an_open_transaction_waits_where_ddl_is_transactional() {
-        use super::run_stales_schema;
-        let ddl = "CREATE TABLE t (id int)";
+    fn ddl_inside_an_open_transaction_waits_for_it_to_end() {
+        use super::schema_reload;
+        // `(changed, in_open_tx, pending)` → `(reload now, still pending)`.
         for d in [MySql, Postgres, Sqlite, MsSql] {
-            assert!(run_stales_schema(ddl, d, false), "{d:?}");
-            assert!(!run_stales_schema("SELECT 1", d, false), "{d:?}");
+            assert_eq!(schema_reload(true, false, d, false), (true, false), "{d:?}");
+            assert_eq!(
+                schema_reload(false, false, d, false),
+                (false, false),
+                "{d:?}"
+            );
         }
         // MySQL commits DDL on the spot; the others hold it in the transaction.
-        assert!(run_stales_schema(ddl, MySql, true));
+        assert_eq!(schema_reload(true, true, MySql, false), (true, false));
         for d in [Postgres, Sqlite, MsSql] {
-            assert!(!run_stales_schema(ddl, d, true), "{d:?}");
+            assert_eq!(schema_reload(true, true, d, false), (false, true), "{d:?}");
+            // More of the transaction keeps it waiting…
+            assert_eq!(schema_reload(false, true, d, true), (false, true), "{d:?}");
+            // …and its end, a COMMIT or a ROLLBACK, reloads.
+            assert_eq!(schema_reload(false, false, d, true), (true, false), "{d:?}");
         }
     }
 }
