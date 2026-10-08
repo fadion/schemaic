@@ -12705,8 +12705,21 @@ existing prose was left alone.
     never takes the depth below zero; and a SQL Server/SQLite `[name]` is a quoted name and counts
     nothing — `bracket_depth_is_counted_at_each_line_start`. **It keeps one depth for both kinds**,
     where `match_paren` pairs each only with its own, so on mismatched input such as `(a])` the
-    colours and the pair highlight can disagree; the depth only ever chooses a colour. It walks the
-    whole document, but once per edit from `SqlStyling`'s cache, not on the per-caret path below).
+    colours and the pair highlight can disagree; the depth only ever chooses a colour. It is now
+    `line_depths(..).depth`: `line_depths` makes the same one pass and also records whether each
+    line starts in code (`LineDepths { depth, code }`), which is what lets `line_depths_after` take
+    the previous revision's answer forward over an edit instead of walking the whole document — a
+    full pass measured 3.0 / 12.5 / 52 ms at 1 / 4 / 16 MiB (release, a realistic script) per
+    keystroke on the UI thread. It resyncs as `sql_highlight::carried_lines_after` does, restarting
+    at the last line before the edit that starts in code, at its depth, and stopping at the first
+    line start past the edit that is in code in both texts — **and at the same depth in both**. That
+    third condition is load-bearing: a stray close saturates at zero, so a depth below an edit
+    is not the old one plus a constant offset, and only an equal depth makes the old tail true. An
+    edit that leaves a bracket open past itself changes every depth below and rescans to the end.
+    Both functions run through one scan, `scan_depths`, and
+    `line_depths_after_an_edit_match_a_full_pass` holds them equal over a corpus of edits on every
+    engine, bracket-heavy bases included. Called once per edit from `SqlStyling`'s cache, not on
+    the per-caret path below).
     Pure + unit-tested; dialect-aware, and its two "is a
     backtick an identifier quote here" sites ask `SqlDialect::backtick_ident` (`pub(crate)` for
     them) rather than re-spelling `!= Postgres`, which is the capability rule one module over.
@@ -25788,6 +25801,23 @@ existing prose was left alone.
     PostgreSQL function's `$$` body as keywords. Where a comment closes is the dialect's, since
     `skip_noncode` decides it: `/* a /* b */⏎c */` carries into its second line on PostgreSQL,
     where comments nest, and not on MySQL (`every_noncode_region_carries_across_lines`).
+    **After an edit the pass is taken forward, not redone.** Once per revision was still a whole
+    document per keystroke on the UI thread — measured at 3.5 / 14 / 59 ms at 1 / 4 / 16 MiB
+    (release, a realistic script, 200-table catalogue). The `CarryCache` keeps the text its answer
+    was computed for, and `carry_at_cached` hands the previous revision's answer to
+    `carried_lines_after` while the dialect is unchanged; a new dialect, or the first ask, is the
+    whole `carried_lines`. It finds the edit by comparing the two texts from each end — a memory
+    compare — restarts the scan at the last line at or before the edit that starts in code
+    (`prev[line] == None`, so its start lies before the edit and is identical in both texts), and
+    stops at the first line start past the edit (its newline in the common suffix) that is in code
+    in the new text *and* whose old counterpart, shifted by the edit's net newlines, started in
+    code too; the old answer stands for every line after. Both halves of that test are needed — the
+    old answers below a line that began inside a region describe that region, not the new text. An
+    edit that opens a comment or string rescans as far as the change runs, which for an unclosed
+    `/*` is the rest of the document. `carried_lines_after_an_edit_match_a_full_pass` holds it
+    equal to the full pass over every edit of a corpus — each base document edited at every byte by
+    inserting `/*`, `*/`, `'`, a newline, `$$`, `--` or a bracket, or deleting one or three bytes —
+    on all four engines.
     `highlight_spans` still lexes one line with no carry — it has no document — so a string or
     comment spanning a preview's lines is coloured line by line there. The Ctrl+K diff's added
     rows go through `highlight_lines_in`, which takes each row's carry from the document the rows
@@ -25803,10 +25833,11 @@ existing prose was left alone.
     `Tok::Bracket(depth)` — an opener the depth it opens at, a closer its opener's — painted in turn
     from the editor theme's own `type_`, `keyword` and `function` (`[..][depth % 3]`) rather than a
     palette of its own (`rainbow_brackets_are_coloured_by_depth`). The starting depths are
-    `pairs::bracket_depth_at_lines`, cached in `SqlStyling::bracket_lines` per document revision and
-    dialect (`depth_at`) beside `block_lines`, the carried regions above, and for the
-    same reason: the styling hook runs per visible line on every relayout, and re-walking the
-    document before each line is the Θ(visible × document) cost `block_lines` was added to remove.
+    `pairs::line_depths`, cached in `SqlStyling::bracket_lines` per document revision and
+    dialect (`depth_at`) beside `block_lines`, the carried regions above, with the text they were
+    computed for, and taken forward over an edit by `pairs::line_depths_after` (under `pairs.rs`)
+    as `block_lines` is by `carried_lines_after`. Cached for the same reason: the styling hook
+    runs per visible line on every relayout, and re-walking the document before each line is the Θ(visible × document) cost `block_lines` was added to remove.
     It is computed only while the setting is on. `set_editor_rainbow_brackets` bumps `editor_gen`,
     which `SqlStyling::id()` folds into the layout cache key, so a flip re-colours lines already laid
     out. `highlight_spans` has no document, so each standalone line of the Ctrl+K diff or a preview

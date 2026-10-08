@@ -105,21 +105,25 @@ pub struct SqlStyling {
     /// once per edit instead of ~45 times.
     block_lines: CarryCache,
     /// Per-line bracket depth at the line's start, for rainbow brackets, with
-    /// the revision it was computed for — one pass per edit, as
-    /// `block_lines` is, and only while rainbow brackets are on.
-    bracket_lines: RefCell<Option<(BlockKey, Vec<usize>)>>,
+    /// the revision and the text it was computed for — taken forward from the
+    /// last edit's as `block_lines` is, and only while rainbow brackets are on.
+    bracket_lines: RefCell<Option<(BlockKey, String, schemaic_core::pairs::LineDepths)>>,
 }
 
 /// What a [`CarryCache`]'s answers were computed for: the document
 /// revision and the dialect.
 type BlockKey = (u64, SqlDialect);
 
-/// [`carried_lines`]' answer for a document, with what it was computed for.
-type CarryCache = RefCell<Option<(BlockKey, Vec<Option<LineCarry>>)>>;
+/// [`carried_lines`]' answer for a document, with what it was computed for —
+/// the revision and dialect, and the text, which the next edit's answer is
+/// taken forward from ([`carried_lines_after`]).
+type CarryCache = RefCell<Option<(BlockKey, String, Vec<Option<LineCarry>>)>>;
 
 /// The non-code region `line` of `doc` begins inside, opened above it. One
-/// forward pass ([`carried_lines`]) per document revision and dialect, kept
-/// in `cache` — what [`SqlStyling`] and [`FieldSql`] both ask.
+/// pass per document revision and dialect, kept in `cache` — what
+/// [`SqlStyling`] and [`FieldSql`] both ask. After an edit the pass is
+/// [`carried_lines_after`], about the edit's own lines; a new dialect, or the
+/// first ask, is the whole [`carried_lines`].
 fn carry_at_cached(
     doc: &dyn Document,
     dialect: SqlDialect,
@@ -131,13 +135,19 @@ fn carry_at_cached(
     }
     let key = (doc.cache_rev().get_untracked(), dialect);
     let mut cache = cache.borrow_mut();
-    if cache.as_ref().map(|(k, _)| *k) != Some(key) {
+    if cache.as_ref().map(|(k, _, _)| *k) != Some(key) {
         let text = doc.text().to_string();
-        *cache = Some((key, carried_lines(&text, key.1)));
+        let carries = match cache.take() {
+            Some(((_, d), old, prev)) if d == dialect => {
+                carried_lines_after(&old, &prev, &text, dialect)
+            }
+            _ => carried_lines(&text, dialect),
+        };
+        *cache = Some((key, text, carries));
     }
     cache
         .as_ref()
-        .and_then(|(_, carries)| carries.get(line).copied().flatten())
+        .and_then(|(_, _, carries)| carries.get(line).copied().flatten())
 }
 
 /// The SQL editor's colouring for an `edit_field` that holds SQL — the DDL
@@ -212,9 +222,10 @@ impl SqlStyling {
 
     /// The non-code region `line` begins inside, opened earlier.
     ///
-    /// Recomputes the whole document's answers when it has changed since the
-    /// last call (`cache_rev` is bumped by every edit), and answers from the
-    /// cache otherwise — so a relayout's ~45 line callbacks share one pass.
+    /// Takes the answers forward over the edit when the document has changed
+    /// since the last call (`cache_rev` is bumped by every edit;
+    /// [`carried_lines_after`]), and answers from the cache otherwise — so a
+    /// relayout's ~45 line callbacks share one pass.
     fn carry_at(&self, line: usize) -> Option<LineCarry> {
         carry_at_cached(
             &*self.doc,
@@ -225,24 +236,27 @@ impl SqlStyling {
     }
 
     /// How many brackets are open where `line` begins
-    /// (`pairs::bracket_depth_at_lines`), cached per revision as
-    /// [`carry_at`](Self::carry_at) is.
+    /// (`pairs::line_depths`), cached per revision and taken forward over an
+    /// edit (`pairs::line_depths_after`) as [`carry_at`](Self::carry_at) is.
     fn depth_at(&self, line: usize) -> usize {
         let key = (
             self.doc.cache_rev().get_untracked(),
             self.dialect.get_untracked(),
         );
         let mut cache = self.bracket_lines.borrow_mut();
-        if cache.as_ref().map(|(k, _)| *k) != Some(key) {
+        if cache.as_ref().map(|(k, _, _)| *k) != Some(key) {
             let text = self.doc.text().to_string();
-            *cache = Some((
-                key,
-                schemaic_core::pairs::bracket_depth_at_lines(&text, key.1),
-            ));
+            let depths = match cache.take() {
+                Some(((_, d), old, prev)) if d == key.1 => {
+                    schemaic_core::pairs::line_depths_after(&old, &prev, &text, d)
+                }
+                _ => schemaic_core::pairs::line_depths(&text, key.1),
+            };
+            *cache = Some((key, text, depths));
         }
         cache
             .as_ref()
-            .and_then(|(_, depths)| depths.get(line).copied())
+            .and_then(|(_, _, depths)| depths.depth.get(line).copied())
             .unwrap_or(0)
     }
 }
@@ -470,6 +484,118 @@ pub(crate) struct LineCarry {
     pub(crate) end: Option<usize>,
 }
 
+/// [`carried_lines`] of `new`, from `prev` — `carried_lines(old)` — where an
+/// edit turned `old` into `new`: what lies before the edit is reused, the scan
+/// restarts at the last line before it that starts in code, and it stops at
+/// the first line start past the edit that is in code in both texts, the old
+/// answer standing for everything after it, its lines shifted by what the
+/// edit added or removed. So a keystroke rescans about its own lines, not the
+/// document; an edit that opens a comment or a string rescans as far as the
+/// text it changes runs.
+///
+/// Finding the edit compares the two texts from each end — a memory compare,
+/// far cheaper than the lexer. `carried_lines_after_an_edit_match_a_full_pass`
+/// holds the two equal over a corpus of edits on every engine.
+pub(crate) fn carried_lines_after(
+    old: &str,
+    prev: &[Option<LineCarry>],
+    new: &str,
+    dialect: SqlDialect,
+) -> Vec<Option<LineCarry>> {
+    let (o, n) = (old.as_bytes(), new.as_bytes());
+    let pre = o.iter().zip(n).take_while(|(a, b)| a == b).count();
+    if pre == o.len() && pre == n.len() {
+        return prev.to_vec();
+    }
+    let room = o.len().min(n.len()) - pre;
+    let suf = o
+        .iter()
+        .rev()
+        .zip(n.iter().rev())
+        .take(room)
+        .take_while(|(a, b)| a == b)
+        .count();
+    let newlines = |s: &[u8]| s.iter().filter(|&&c| c == b'\n').count();
+    // Lines the edit added, less those it removed.
+    let shift =
+        newlines(&n[pre..n.len() - suf]) as isize - newlines(&o[pre..o.len() - suf]) as isize;
+    // Back from the edited line to the last one that starts in code — all of
+    // it before the edit, so the same in both texts.
+    let mut line = newlines(&n[..pre]).min(prev.len().saturating_sub(1));
+    let mut start = n[..pre]
+        .iter()
+        .rposition(|&c| c == b'\n')
+        .map_or(0, |p| p + 1);
+    while line > 0 && prev[line].is_some() {
+        line -= 1;
+        start = n[..start - 1]
+            .iter()
+            .rposition(|&c| c == b'\n')
+            .map_or(0, |p| p + 1);
+    }
+    let mut out: Vec<Option<LineCarry>> = prev[..=line].to_vec();
+    let common_from = n.len() - suf;
+    // At a line start in code past the edit, where the old text's same line
+    // started in code too, everything after is the old answer.
+    let resync = |out: &mut Vec<Option<LineCarry>>, s: usize| -> bool {
+        if s == 0 || s - 1 < common_from {
+            return false;
+        }
+        let Some(old_line) = (out.len() as isize - 1 - shift)
+            .try_into()
+            .ok()
+            .filter(|&l: &usize| l < prev.len())
+        else {
+            return false;
+        };
+        if prev[old_line].is_some() {
+            return false;
+        }
+        out.extend_from_slice(&prev[old_line + 1..]);
+        true
+    };
+    let line_end = |s: usize| {
+        n[s..]
+            .iter()
+            .position(|&c| c == b'\n')
+            .map_or(n.len(), |p| s + p)
+    };
+    let mut i = start;
+    while i < n.len() {
+        match schemaic_core::sql::skip_noncode(n, i, dialect) {
+            Some(end) => {
+                let end = end.min(n.len());
+                let kind = schemaic_core::sql::noncode_kind(n, i, dialect);
+                for p in (i..end).filter(|&p| n[p] == b'\n') {
+                    let s = p + 1;
+                    if s < end {
+                        out.push(Some(LineCarry {
+                            kind,
+                            end: (end <= line_end(s)).then(|| end - s),
+                        }));
+                    } else {
+                        out.push(None);
+                        if resync(&mut out, s) {
+                            return out;
+                        }
+                    }
+                }
+                i = end.max(i + 1);
+            }
+            None => {
+                if n[i] == b'\n' {
+                    out.push(None);
+                    if resync(&mut out, i + 1) {
+                        return out;
+                    }
+                }
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
 /// For every line of `text`, the non-code region it starts inside, if any
 /// ([`LineCarry`]) — every kind `skip_noncode` knows, not `/* … */` alone,
 /// which was all this once carried. A per-line lexer cannot see a string that
@@ -482,7 +608,8 @@ pub(crate) struct LineCarry {
 /// per line: the editor asks this ~45 times per relayout and a relayout
 /// happens on every keystroke, so the per-line form was Θ(visible × document).
 /// Built on the shared `schemaic_core::sql::skip_noncode` primitive, so every
-/// boundary agrees with the rest of the SQL tooling.
+/// boundary agrees with the rest of the SQL tooling. After an edit,
+/// [`carried_lines_after`] answers the same from the previous answer.
 pub(crate) fn carried_lines(text: &str, dialect: SqlDialect) -> Vec<Option<LineCarry>> {
     let b = text.as_bytes();
     let n = b.len();
@@ -956,6 +1083,63 @@ mod tests {
             }
         }
         out
+    }
+
+    /// Every `(old, new)` a corpus of edits makes: each base document, edited
+    /// at every byte by inserting each snippet and by deleting one or three
+    /// bytes — the edits that open and close comments, strings and dollar
+    /// quotes, and add and remove lines.
+    pub(crate) fn edit_corpus() -> Vec<(String, String)> {
+        let bases = [
+            "select 1;\n/* a\nb */ select (2);\nselect 'x\ny' from t;\n-- c\nselect [3];\n",
+            "select $$a\nb$$, $q$c\n$q$;\n\nselect (1,\n 2)\n;",
+            "a\n\n(b\n)\n'c\n'\n/*\n*/\n",
+        ];
+        let snippets = ["/*", "*/", "'", "\n", "x", "(", ")", "$$", "--", "\n\n"];
+        let mut out = Vec::new();
+        for base in bases {
+            for at in 0..=base.len() {
+                if !base.is_char_boundary(at) {
+                    continue;
+                }
+                for s in snippets {
+                    out.push((
+                        base.to_string(),
+                        format!("{}{s}{}", &base[..at], &base[at..]),
+                    ));
+                }
+                for n in [1, 3] {
+                    if at + n <= base.len() {
+                        out.push((
+                            base.to_string(),
+                            format!("{}{}", &base[..at], &base[at + n..]),
+                        ));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// **The incremental pass answers what the whole pass does**, for every
+    /// edit of the corpus, on every dialect.
+    #[test]
+    fn carried_lines_after_an_edit_match_a_full_pass() {
+        for d in [
+            SqlDialect::MySql,
+            SqlDialect::Postgres,
+            SqlDialect::MsSql,
+            SqlDialect::Sqlite,
+        ] {
+            for (old, new) in edit_corpus() {
+                let prev = carried_lines(&old, d);
+                assert_eq!(
+                    carried_lines_after(&old, &prev, &new, d),
+                    carried_lines(&new, d),
+                    "{d:?}: {old:?} -> {new:?}"
+                );
+            }
+        }
     }
 
     /// **A run of lines is lexed as one text**, for the Ctrl+K diff's added

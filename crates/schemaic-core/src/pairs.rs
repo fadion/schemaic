@@ -331,31 +331,135 @@ fn noncode_span_at(b: &[u8], pos: usize, dialect: SqlDialect) -> Option<(usize, 
 /// opens nothing below zero. Brackets in a string or comment are not counted,
 /// and nor is a SQL Server or SQLite `[name]`, which is a quoted name.
 pub fn bracket_depth_at_lines(text: &str, dialect: SqlDialect) -> Vec<usize> {
-    let b = text.as_bytes();
-    let mut out = vec![0];
-    let mut depth = 0usize;
-    let mut i = 0;
+    line_depths(text, dialect).depth
+}
+
+/// Each line's bracket depth ([`bracket_depth_at_lines`]), and whether the
+/// line starts in code rather than inside a string or comment — which is what
+/// lets [`line_depths_after`] take an edit without rescanning the document.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LineDepths {
+    pub depth: Vec<usize>,
+    pub code: Vec<bool>,
+}
+
+/// [`LineDepths`] of `text`, in one pass.
+pub fn line_depths(text: &str, dialect: SqlDialect) -> LineDepths {
+    let mut out = LineDepths {
+        depth: vec![0],
+        code: vec![true],
+    };
+    scan_depths(text.as_bytes(), 0, 0, dialect, &mut out, |_, _, _| false);
+    out
+}
+
+/// [`line_depths`] of `new`, from `prev` — `line_depths(old)` — where an edit
+/// turned `old` into `new`: the scan restarts at the last line before the edit
+/// that starts in code, at its depth, and stops at the first line start past
+/// the edit that is in code at the same depth in both texts; the old answer
+/// stands for everything after it. An edit that leaves a bracket open past
+/// itself changes every depth below, and rescans to the end.
+pub fn line_depths_after(
+    old: &str,
+    prev: &LineDepths,
+    new: &str,
+    dialect: SqlDialect,
+) -> LineDepths {
+    let (o, n) = (old.as_bytes(), new.as_bytes());
+    let pre = o.iter().zip(n).take_while(|(a, b)| a == b).count();
+    if pre == o.len() && pre == n.len() {
+        return prev.clone();
+    }
+    let room = o.len().min(n.len()) - pre;
+    let suf = o
+        .iter()
+        .rev()
+        .zip(n.iter().rev())
+        .take(room)
+        .take_while(|(a, b)| a == b)
+        .count();
+    let newlines = |s: &[u8]| s.iter().filter(|&&c| c == b'\n').count();
+    let shift =
+        newlines(&n[pre..n.len() - suf]) as isize - newlines(&o[pre..o.len() - suf]) as isize;
+    let mut line = newlines(&n[..pre]).min(prev.code.len().saturating_sub(1));
+    let mut start = n[..pre]
+        .iter()
+        .rposition(|&c| c == b'\n')
+        .map_or(0, |p| p + 1);
+    while line > 0 && !prev.code[line] {
+        line -= 1;
+        start = n[..start - 1]
+            .iter()
+            .rposition(|&c| c == b'\n')
+            .map_or(0, |p| p + 1);
+    }
+    let mut out = LineDepths {
+        depth: prev.depth[..=line].to_vec(),
+        code: prev.code[..=line].to_vec(),
+    };
+    let common_from = n.len() - suf;
+    let depth = prev.depth[line];
+    scan_depths(n, start, depth, dialect, &mut out, |out, s, depth| {
+        if s - 1 < common_from {
+            return false;
+        }
+        let Ok(old_line) = usize::try_from(out.depth.len() as isize - 1 - shift) else {
+            return false;
+        };
+        if old_line >= prev.code.len() || !prev.code[old_line] || prev.depth[old_line] != depth {
+            return false;
+        }
+        out.depth.extend_from_slice(&prev.depth[old_line + 1..]);
+        out.code.extend_from_slice(&prev.code[old_line + 1..]);
+        true
+    });
+    out
+}
+
+/// The one depth scan: from `start`, in code at `depth`, pushing each line
+/// start after it onto `out`, until the end — or until `stop`, asked at each
+/// line start reached in code with its offset and depth, says the rest of
+/// `out` is filled.
+fn scan_depths(
+    b: &[u8],
+    start: usize,
+    mut depth: usize,
+    dialect: SqlDialect,
+    out: &mut LineDepths,
+    mut stop: impl FnMut(&mut LineDepths, usize, usize) -> bool,
+) {
+    let mut i = start;
     while i < b.len() {
         if let Some(j) = skip_noncode(b, i, dialect) {
             // A string or comment over several lines: each line it starts is
-            // at the depth outside it.
+            // at the depth outside it, and inside it — unless it ends right
+            // where the line starts.
             let j = j.max(i + 1).min(b.len());
-            out.extend(std::iter::repeat_n(
-                depth,
-                b[i..j].iter().filter(|&&c| c == b'\n').count(),
-            ));
+            for p in (i..j).filter(|&p| b[p] == b'\n') {
+                out.depth.push(depth);
+                let code = p + 1 >= j;
+                out.code.push(code);
+                if code && stop(out, p + 1, depth) {
+                    return;
+                }
+            }
             i = j;
             continue;
         }
         match b[i] {
             b'(' | b'[' => depth += 1,
             b')' | b']' => depth = depth.saturating_sub(1),
-            b'\n' => out.push(depth),
+            b'\n' => {
+                out.depth.push(depth);
+                out.code.push(true);
+                if stop(out, i + 1, depth) {
+                    return;
+                }
+            }
             _ => {}
         }
         i += 1;
     }
-    out
 }
 
 /// Where Ctrl+Shift+\ puts the caret: on the same side of the matching paren
@@ -790,6 +894,58 @@ pub fn identifier_occurrences(
 mod tests {
     use super::*;
     use SqlDialect::{MsSql, MySql, Postgres, Sqlite};
+
+    /// Every `(old, new)` a corpus of edits makes: each base document edited at
+    /// every byte by inserting each snippet and by deleting one or three bytes
+    /// — edits that open and close comments, strings, dollar quotes and
+    /// brackets, and add and remove lines.
+    pub(crate) fn edit_corpus() -> Vec<(String, String)> {
+        let bases = [
+            "select 1;\n/* a\nb */ select (2);\nselect 'x\ny' from t;\n-- c\nselect [3];\n",
+            "select $$a\nb$$, $q$c\n$q$;\n\nselect (1,\n 2)\n;",
+            "a\n\n(b\n)\n'c\n'\n/*\n*/\n",
+            "f((\n(\n))\n)\nx",
+        ];
+        let snippets = [
+            "/*", "*/", "'", "\n", "x", "(", ")", "$$", "--", "\n\n", "[", "]",
+        ];
+        let mut out = Vec::new();
+        for base in bases {
+            for at in 0..=base.len() {
+                for s in snippets {
+                    out.push((
+                        base.to_string(),
+                        format!("{}{s}{}", &base[..at], &base[at..]),
+                    ));
+                }
+                for n in [1, 3] {
+                    if at + n <= base.len() {
+                        out.push((
+                            base.to_string(),
+                            format!("{}{}", &base[..at], &base[at + n..]),
+                        ));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// **The incremental depths answer what the whole pass does**, for every
+    /// edit of the corpus, on every engine.
+    #[test]
+    fn line_depths_after_an_edit_match_a_full_pass() {
+        for d in [MySql, Postgres, MsSql, Sqlite] {
+            for (old, new) in edit_corpus() {
+                let prev = line_depths(&old, d);
+                assert_eq!(
+                    line_depths_after(&old, &prev, &new, d),
+                    line_depths(&new, d),
+                    "{d:?}: {old:?} -> {new:?}"
+                );
+            }
+        }
+    }
 
     /// The depth at each line's start counts the code brackets above it,
     /// through strings and comments that span lines, never below zero; and a
