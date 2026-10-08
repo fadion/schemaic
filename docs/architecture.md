@@ -1487,7 +1487,15 @@ existing prose was left alone.
     `Found` while `columns_of` stays `None`, and the column checks read that as can't-judge. That is
     the three-part name's rule again: a relation whose columns are unknown may let a wrong column
     through but must never report a real one missing
-    (`a_synonym_is_a_relation_with_its_targets_columns`, red before). By the same rule a resolved
+    (`a_synonym_is_a_relation_with_its_targets_columns`, red before). **A table or view the
+    document creates itself joins the same opaque maps for that run**: `diagnostics` reads
+    `created_tables` — each `CREATE [TEMPORARY] TABLE`, `CREATE VIEW` and table-making
+    `SELECT … INTO` (SQL Server's and PostgreSQL's; MySQL's fills variables), statement by
+    statement — and, only when there are some, checks against `Catalog::with_created`, a copy
+    with each one found and its columns unjudged, rather than reading columns out of the
+    `CREATE`, which would be a second schema reader. Order is not asked, so a reference above the
+    `CREATE` is quiet too, the safe direction (`a_table_the_script_creates_is_not_reported_missing`,
+    red before). By the same rule a resolved
     synonym's columns are **merged** into a same-named table's `(database, name)` and bare-name
     entries, never written over them, since `dbo.orders` replacing `sales.orders`' entry made the
     correct `SELECT total FROM hist.sales.orders` a "Column not found"

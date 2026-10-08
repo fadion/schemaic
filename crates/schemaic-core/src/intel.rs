@@ -5316,6 +5316,7 @@ enum TableStatus {
 /// A case-folded view over the introspected schema, answering the existence /
 /// column questions offline diagnostics need. Built from the *loaded* database
 /// schemas plus the tab's active database (which scopes unqualified references).
+#[derive(Clone)]
 pub struct Catalog {
     /// (db_lower, table_lower) → column names (original case).
     qualified: HashMap<(String, String), Vec<String>>,
@@ -5829,6 +5830,30 @@ impl Catalog {
             Some(a) => self.loaded_dbs.contains(a),
             None => !self.loaded_dbs.is_empty(),
         }
+    }
+
+    /// This catalogue with `created` — `(qualifier, name)` of each table or
+    /// view the document makes ([`created_tables`]) — known to exist but not
+    /// what columns it has: **opaque**, as a synonym over another database's
+    /// table is, so a reference to one is found and its columns are not
+    /// judged. Introspection has not seen it; guessing its columns from the
+    /// `CREATE` would be a second schema reader.
+    pub fn with_created(&self, created: &[(Option<String>, String)]) -> Catalog {
+        let mut c = self.clone();
+        for (q, name) in created {
+            let name = name.to_ascii_lowercase();
+            match q {
+                Some(q) => {
+                    c.opaque_qualified
+                        .insert((q.to_ascii_lowercase(), name.clone()));
+                }
+                None => {
+                    c.opaque_unqualified.insert(name.clone());
+                }
+            }
+            c.known_idents.insert(name);
+        }
+        c
     }
 
     fn table_status(&self, r: &TableRef) -> TableStatus {
@@ -6804,6 +6829,17 @@ fn did_you_mean<'a>(name: &str, candidates: impl IntoIterator<Item = &'a str>) -
 /// Byte ranges come from the [`skip_noncode`] lexer, not AST spans (which are
 /// still maturing upstream), so squiggle placement is exact.
 pub fn diagnostics(sql: &str, catalog: &Catalog, dialect: SqlDialect) -> Vec<Diagnostic> {
+    // The tables and views the document creates itself are no catalogue's yet,
+    // and a script that makes one and then uses it is not wrong. Copied only
+    // when there are some.
+    let created = created_tables(sql, dialect);
+    let overlaid;
+    let catalog = if created.is_empty() {
+        catalog
+    } else {
+        overlaid = catalog.with_created(&created);
+        &overlaid
+    };
     let ranges = join_procedure_numbers(sql, crate::sql::statement_ranges(sql, dialect), dialect);
     let last = ranges.len().saturating_sub(1);
     let mut out: Vec<Diagnostic> = Vec::new();
@@ -16919,6 +16955,56 @@ pub fn local_relations(sql: &str, lo: usize, hi: usize, dialect: SqlDialect) -> 
                 columns,
                 derived: true,
             });
+        }
+    }
+    out
+}
+
+/// The tables and views the document `sql` creates — `CREATE [TEMPORARY]
+/// TABLE`, `CREATE [OR REPLACE] VIEW`, and a `SELECT … INTO t` that makes a
+/// table (SQL Server's and PostgreSQL's; MySQL's `INTO` fills variables) —
+/// each as `(qualifier, name)`, quotes off. Statement by statement, each
+/// parsed alone, and only one that holds `CREATE` or `INTO` at all.
+///
+/// Order is not asked: a reference above the `CREATE` is quiet too. Being
+/// quiet about a script's own table is the safe direction for an offline
+/// check; the server still says what it thinks when the script runs.
+pub fn created_tables(sql: &str, dialect: SqlDialect) -> Vec<(Option<String>, String)> {
+    use sqlparser::ast::{SetExpr, Statement};
+    let mentions = |t: &str, w: &str| {
+        t.as_bytes()
+            .windows(w.len())
+            .any(|x| x.eq_ignore_ascii_case(w.as_bytes()))
+    };
+    let split = |n: &sqlparser::ast::ObjectName| -> Option<(Option<String>, String)> {
+        let parts = object_name_parts(n);
+        let (name, rest) = parts.split_last()?;
+        Some((rest.last().cloned(), name.clone()))
+    };
+    let into_makes_a_table = match dialect {
+        SqlDialect::MsSql | SqlDialect::Postgres => true,
+        SqlDialect::MySql | SqlDialect::Sqlite => false,
+    };
+    let mut out = Vec::new();
+    for (lo, hi) in crate::sql::statement_ranges(sql, dialect) {
+        let text = &sql[lo..hi];
+        if !mentions(text, "CREATE") && !(into_makes_a_table && mentions(text, "INTO")) {
+            continue;
+        }
+        let Ok(asts) = parse_statements(text, dialect) else {
+            continue;
+        };
+        for ast in &asts {
+            let made = match ast {
+                Statement::CreateTable(ct) => split(&ct.name),
+                Statement::CreateView(v) => split(&v.name),
+                Statement::Query(q) if into_makes_a_table => match q.body.as_ref() {
+                    SetExpr::Select(sel) => sel.into.as_ref().and_then(|i| split(&i.name)),
+                    _ => None,
+                },
+                _ => None,
+            };
+            out.extend(made);
         }
     }
     out
@@ -29422,6 +29508,40 @@ mod tests {
             relations("SELECT * FROM t WHERE x IN (SELECT a FROM (SELECT 1 AS a) d)"),
             [("d".to_string(), v(&["a"]), true)]
         );
+    }
+
+    #[test]
+    fn a_table_the_script_creates_is_not_reported_missing() {
+        let not_found = |sql: &str, d| -> Vec<String> {
+            diag_d(sql, d)
+                .into_iter()
+                .filter(|x| x.message.starts_with("Table"))
+                .map(|x| sql[x.range.0..x.range.1].to_string())
+                .collect()
+        };
+        for d in [
+            SqlDialect::MySql,
+            SqlDialect::Postgres,
+            SqlDialect::MsSql,
+            SqlDialect::Sqlite,
+        ] {
+            let sql = "CREATE TABLE staging (id int);\nINSERT INTO staging VALUES (1);\nSELECT anything FROM staging;";
+            assert!(not_found(sql, d).is_empty(), "{d:?}: {:?}", diag_d(sql, d));
+            // Its columns are not judged — it is not introspected.
+            assert!(
+                !diag_d(sql, d)
+                    .iter()
+                    .any(|x| x.message.starts_with("Column")),
+                "{d:?}"
+            );
+            let sql = "CREATE VIEW v_recent AS SELECT id FROM employees;\nSELECT id FROM v_recent;";
+            assert!(not_found(sql, d).is_empty(), "{d:?}");
+            // A table nobody creates is still missing.
+            let sql = "CREATE TABLE staging (id int);\nSELECT * FROM stagin;";
+            assert_eq!(not_found(sql, d), ["stagin"], "{d:?}");
+        }
+        let sql = "SELECT id INTO archive FROM employees;\nSELECT * FROM archive;";
+        assert!(not_found(sql, SqlDialect::MsSql).is_empty());
     }
 
     #[test]
