@@ -19,6 +19,59 @@ pub fn strip_bom(s: &str) -> &str {
     s.strip_prefix('\u{feff}').unwrap_or(s)
 }
 
+/// How many `\n` bytes `b` holds — eight at a time: a byte is zero after the
+/// XOR exactly when it was a newline, and `((t & 0x7f…) + 0x7f…) | t` sets a
+/// byte's high bit exactly when the byte is not zero, so the high bits left
+/// clear count the newlines with no false positives. The editor's incremental
+/// passes ask it of everything before an edit, per keystroke.
+pub fn count_newlines(b: &[u8]) -> usize {
+    const NL: u64 = 0x0a0a_0a0a_0a0a_0a0a;
+    const LOW: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+    let (chunks, rest) = b.as_chunks::<8>();
+    let mut n = 0usize;
+    for c in chunks {
+        let t = u64::from_le_bytes(*c) ^ NL;
+        let nonzero = ((t & LOW).wrapping_add(LOW)) | t;
+        n += (!nonzero & HIGH).count_ones() as usize;
+    }
+    n + rest.iter().filter(|&&c| c == b'\n').count()
+}
+
+/// How many bytes `a` and `b` share at the front, and then — of what is
+/// left — at the back: where one edit turned `a` into `b`, everything outside
+/// `[pre, len - suf)` of each. What the editor's incremental passes find an
+/// edit with, per keystroke, so compared a block at a time (a `memcmp`) and
+/// only the block that differs byte by byte.
+pub fn common_affixes(a: &[u8], b: &[u8]) -> (usize, usize) {
+    const BLOCK: usize = 4096;
+    let shortest = a.len().min(b.len());
+    let mut pre = 0;
+    while pre + BLOCK <= shortest && a[pre..pre + BLOCK] == b[pre..pre + BLOCK] {
+        pre += BLOCK;
+    }
+    pre += a[pre..shortest]
+        .iter()
+        .zip(&b[pre..shortest])
+        .take_while(|(x, y)| x == y)
+        .count();
+    let room = shortest - pre;
+    let mut suf = 0;
+    while suf + BLOCK <= room
+        && a[a.len() - suf - BLOCK..a.len() - suf] == b[b.len() - suf - BLOCK..b.len() - suf]
+    {
+        suf += BLOCK;
+    }
+    suf += a[..a.len() - suf]
+        .iter()
+        .rev()
+        .zip(b[..b.len() - suf].iter().rev())
+        .take(room - suf)
+        .take_while(|(x, y)| x == y)
+        .count();
+    (pre, suf)
+}
+
 /// Read a text file somebody else's tool wrote, whatever it encoded it in.
 ///
 /// **A config file that is not UTF-8 must not simply vanish.** `read_to_string`
@@ -170,6 +223,66 @@ pub fn field_suggestion<'a>(typed: &str, options: &'a [String]) -> Option<&'a st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The block compare answers what a byte-by-byte one does — across block
+    /// edges, with the shared front and back overlapping in a repetitive text,
+    /// and for equal, empty and wholly different texts.
+    #[test]
+    fn common_affixes_find_the_edit() {
+        let naive = |a: &[u8], b: &[u8]| {
+            let pre = a.iter().zip(b).take_while(|(x, y)| x == y).count();
+            let room = a.len().min(b.len()) - pre;
+            let suf = a
+                .iter()
+                .rev()
+                .zip(b.iter().rev())
+                .take(room)
+                .take_while(|(x, y)| x == y)
+                .count();
+            (pre, suf)
+        };
+        let base: Vec<u8> = (0..20_000u32)
+            .map(|i| b"abcab\n"[(i % 6) as usize])
+            .collect();
+        for at in [0, 1, 4095, 4096, 4097, 8191, 10_000, 19_999, 20_000] {
+            for ins in [&b""[..], b"x", b"ab", &[b'q'; 5000][..]] {
+                for del in [0usize, 1, 3, 4096] {
+                    let end = (at + del).min(base.len());
+                    let mut new = base[..at].to_vec();
+                    new.extend_from_slice(ins);
+                    new.extend_from_slice(&base[end..]);
+                    assert_eq!(
+                        common_affixes(&base, &new),
+                        naive(&base, &new),
+                        "at {at} del {del}"
+                    );
+                    assert_eq!(
+                        common_affixes(&new, &base),
+                        naive(&new, &base),
+                        "at {at} del {del}"
+                    );
+                }
+            }
+        }
+        // Newlines counted eight at a time match a plain count, whatever
+        // surrounds them — every byte value beside one, and every tail length.
+        let all: Vec<u8> = (0..=255u8).flat_map(|c| [c, b'\n', c, c]).collect();
+        for len in 0..all.len() {
+            let s = &all[..len];
+            assert_eq!(
+                count_newlines(s),
+                s.iter().filter(|&&c| c == b'\n').count(),
+                "{len}"
+            );
+        }
+        assert_eq!(
+            count_newlines(&base),
+            base.iter().filter(|&&c| c == b'\n').count()
+        );
+        assert_eq!(common_affixes(b"", b""), (0, 0));
+        assert_eq!(common_affixes(b"abc", b"abc"), (3, 0));
+        assert_eq!(common_affixes(b"abc", b"xyz"), (0, 0));
+    }
 
     fn opts(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()

@@ -366,19 +366,11 @@ pub fn line_depths_after(
     dialect: SqlDialect,
 ) -> LineDepths {
     let (o, n) = (old.as_bytes(), new.as_bytes());
-    let pre = o.iter().zip(n).take_while(|(a, b)| a == b).count();
+    let (pre, suf) = crate::text::common_affixes(o, n);
     if pre == o.len() && pre == n.len() {
         return prev.clone();
     }
-    let room = o.len().min(n.len()) - pre;
-    let suf = o
-        .iter()
-        .rev()
-        .zip(n.iter().rev())
-        .take(room)
-        .take_while(|(a, b)| a == b)
-        .count();
-    let newlines = |s: &[u8]| s.iter().filter(|&&c| c == b'\n').count();
+    let newlines = crate::text::count_newlines;
     let shift =
         newlines(&n[pre..n.len() - suf]) as isize - newlines(&o[pre..o.len() - suf]) as isize;
     let mut line = newlines(&n[..pre]).min(prev.code.len().saturating_sub(1));

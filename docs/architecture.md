@@ -13924,7 +13924,16 @@ existing prose was left alone.
       never do anything (`recheck_stops_once_something_is_staged`, `a_refused_gate_never_re_arms`). A
       *failed* check does re-arm — it is the one negative outcome expected to be temporary, and it is
       invisible anyway, so retrying costs the user nothing.
-    - `text.rs` — `plural(n, one, many)`, returning only the noun form so a humanized count
+    - `text.rs` — **`common_affixes(a, b)`** (the bytes two texts share at the front, then at
+      the back: where one edit turned one into the other, compared a 4 KiB block at a time — a
+      `memcmp` — and byte by byte only in the block that differs) and **`count_newlines`** (eight
+      bytes at a time, exact: a byte is zero after the XOR with `\n` exactly when it was one, and
+      `((t & 0x7f…) + 0x7f…) | t` sets a byte's high bit exactly when the byte is not zero) are what
+      the editor's incremental passes — `sql_highlight::carried_lines_after`,
+      `pairs::line_depths_after`, `sql::StatementIndex::after` — find an edit and its line with, per
+      keystroke; a byte-at-a-time compare and count were most of those passes' cost
+      (`common_affixes_find_the_edit` holds both to the naive form). `plural(n, one, many)`,
+      returning only the noun form so a humanized count
       (`"1.2k"`) can be displayed while the singular/plural decision still follows the true `n` —
       a contract that reads as "returns the phrase" if you skim it, and the export note shipped as
       `Exported rows to employees.csv` on exactly that misreading, so a call site here owes the

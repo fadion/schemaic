@@ -503,19 +503,11 @@ pub(crate) fn carried_lines_after(
     dialect: SqlDialect,
 ) -> Vec<Option<LineCarry>> {
     let (o, n) = (old.as_bytes(), new.as_bytes());
-    let pre = o.iter().zip(n).take_while(|(a, b)| a == b).count();
+    let (pre, suf) = schemaic_core::text::common_affixes(o, n);
     if pre == o.len() && pre == n.len() {
         return prev.to_vec();
     }
-    let room = o.len().min(n.len()) - pre;
-    let suf = o
-        .iter()
-        .rev()
-        .zip(n.iter().rev())
-        .take(room)
-        .take_while(|(a, b)| a == b)
-        .count();
-    let newlines = |s: &[u8]| s.iter().filter(|&&c| c == b'\n').count();
+    let newlines = schemaic_core::text::count_newlines;
     // Lines the edit added, less those it removed.
     let shift =
         newlines(&n[pre..n.len() - suf]) as isize - newlines(&o[pre..o.len() - suf]) as isize;
