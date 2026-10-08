@@ -13560,9 +13560,9 @@ pub fn expand_star(
 /// byte range of that parameter within `signature` (for emphasis).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SignatureHelp {
-    pub name: &'static str,
-    pub signature: &'static str,
-    pub summary: &'static str,
+    pub name: String,
+    pub signature: String,
+    pub summary: String,
     pub active_arg: usize,
     pub active_range: Option<(usize, usize)>,
 }
@@ -13571,12 +13571,17 @@ pub struct SignatureHelp {
 /// signature help. Resolves the *innermost* enclosing call (so `POWER(a, FLOOR(b|`
 /// describes `FLOOR`), counts top-level commas to find the active argument, and
 /// ignores grouping parens / non-function calls (`(a+b)`, `IN (…)`, subqueries).
+///
+/// The database's own `routines` are asked first — one named like a builtin is
+/// the one the call reaches — and answer `name(arguments) → returns` from the
+/// server's own rendering of the list, with no summary but what they are.
 pub fn signature_help(
     sql: &str,
     lo: usize,
     hi: usize,
     caret: usize,
     dialect: SqlDialect,
+    routines: &[crate::rank::IndexedRoutine],
 ) -> Option<SignatureHelp> {
     let toks = tokenize_range(sql, lo, hi, dialect);
     // Stack of open parens up to the caret, each with its top-level comma count.
@@ -13609,6 +13614,24 @@ pub fn signature_help(
     if names_an_object(&toks, paren_idx - 1) {
         return None;
     }
+    if let Some(r) = routines.iter().find(|r| r.name.eq_ignore_ascii_case(name)) {
+        let signature = if r.returns.is_empty() {
+            format!("{}({})", r.name, r.arguments)
+        } else {
+            format!("{}({}) → {}", r.name, r.arguments, r.returns)
+        };
+        let summary = match r.kind {
+            crate::schema::RoutineKind::Function => "Stored function",
+            crate::schema::RoutineKind::Procedure => "Stored procedure",
+        };
+        return Some(SignatureHelp {
+            name: r.name.clone(),
+            active_range: active_param_range(&signature, comma_count),
+            signature,
+            summary: summary.to_string(),
+            active_arg: comma_count,
+        });
+    }
     // **This engine's catalog, asked as the capability** — the third surface to
     // do so, after the typo checker and `rank`. It named `FUNCTIONS` outright
     // for a release while `builtin_catalog`'s own doc said there were two
@@ -13619,9 +13642,9 @@ pub fn signature_help(
         .iter()
         .find(|f| f.name.eq_ignore_ascii_case(name))?;
     Some(SignatureHelp {
-        name: func.name,
-        signature: func.signature,
-        summary: func.summary,
+        name: func.name.to_string(),
+        signature: func.signature.to_string(),
+        summary: func.summary.to_string(),
         active_arg: comma_count,
         active_range: active_param_range(func.signature, comma_count),
     })
@@ -28848,11 +28871,54 @@ mod tests {
     // ── signature help ────────────────────────────────────────────────────────
 
     fn sig(sql: &str) -> Option<SignatureHelp> {
-        signature_help(sql, 0, sql.len(), sql.len(), SqlDialect::MySql)
+        signature_help(sql, 0, sql.len(), sql.len(), SqlDialect::MySql, &[])
     }
 
     fn sig_on(sql: &str, dialect: SqlDialect) -> Option<SignatureHelp> {
-        signature_help(sql, 0, sql.len(), sql.len(), dialect)
+        signature_help(sql, 0, sql.len(), sql.len(), dialect, &[])
+    }
+
+    #[test]
+    fn a_stored_routines_signature_is_helped_as_a_builtins_is() {
+        use crate::rank::IndexedRoutine;
+        use crate::schema::RoutineKind;
+        let routines = [
+            IndexedRoutine {
+                name: "order_total".into(),
+                kind: RoutineKind::Function,
+                arguments: "o integer, with_tax boolean DEFAULT true".into(),
+                returns: "numeric".into(),
+            },
+            IndexedRoutine {
+                name: "refresh_totals".into(),
+                kind: RoutineKind::Procedure,
+                arguments: "IN d DATE".into(),
+                returns: String::new(),
+            },
+            // Named like a builtin: the database's own answers.
+            IndexedRoutine {
+                name: "length".into(),
+                kind: RoutineKind::Function,
+                arguments: "t text".into(),
+                returns: "integer".into(),
+            },
+        ];
+        let at = |sql: &str, d| signature_help(sql, 0, sql.len(), sql.len(), d, &routines);
+        let h = at("SELECT order_total(o.id, ", SqlDialect::Postgres).unwrap();
+        assert_eq!(
+            h.signature,
+            "order_total(o integer, with_tax boolean DEFAULT true) → numeric"
+        );
+        assert_eq!(h.active_arg, 1);
+        let (s, e) = h.active_range.unwrap();
+        assert_eq!(&h.signature[s..e], "with_tax boolean DEFAULT true");
+        let h = at("CALL refresh_totals(", SqlDialect::MySql).unwrap();
+        assert_eq!(h.signature, "refresh_totals(IN d DATE)");
+        assert_eq!(h.summary, "Stored procedure");
+        let h = at("SELECT length(", SqlDialect::Postgres).unwrap();
+        assert_eq!(h.signature, "length(t text) → integer");
+        // A builtin is helped as before.
+        assert!(at("SELECT upper(", SqlDialect::Postgres).is_some());
     }
 
     /// A function's name used as a table's or a defined object's opens a

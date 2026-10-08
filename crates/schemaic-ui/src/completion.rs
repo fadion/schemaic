@@ -685,11 +685,21 @@ fn popup_x(caret_x: f64, w: f64, area_w: f64) -> f64 {
 /// Update the signature-help state for the caret. Independent of the suggestion
 /// list — runs on every edit so it appears the moment the caret enters a builtin's
 /// parentheses (including right after accepting `func()`), and clears when it leaves.
-pub(crate) fn update_signature_help(ed: &Editor, comp: Completion, dialect: SqlDialect) {
+pub(crate) fn update_signature_help(
+    ed: &Editor,
+    comp: Completion,
+    dialect: SqlDialect,
+    db_nodes: RwSignal<Vec<ConnNode>>,
+    hidden_dbs: floem::reactive::Memo<HashSet<String>>,
+    active_db: Option<&str>,
+) {
     let offset = ed.cursor.get_untracked().offset();
     let text = ed.doc().text().to_string();
     let (lo, hi) = statement_range(&text, offset, dialect);
-    let help = intel::signature_help(&text, lo, hi, offset, dialect);
+    // The database's own routines too — the index is memoised, so this is a
+    // lookup on a caret move, not a rebuild.
+    let schema = hidden_dbs.with_untracked(|h| schema_index(db_nodes, h, active_db));
+    let help = intel::signature_help(&text, lo, hi, offset, dialect, &schema.routines);
     if help.is_some() {
         // `.0` is the point at the *top* of the caret's line; the popup sits above it.
         let mut p = ed.points_of_offset(offset, CursorAffinity::Backward).0;

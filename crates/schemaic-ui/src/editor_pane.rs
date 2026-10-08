@@ -4678,7 +4678,15 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             ed_caret.cursor.track();
             query.track(); // also on text edits that don't move the caret (forward-delete)
             if editor_focused.get_untracked() {
-                update_signature_help(&ed_caret, comp, dialect.get_untracked());
+                let adb = active_db.get_untracked();
+                update_signature_help(
+                    &ed_caret,
+                    comp,
+                    dialect.get_untracked(),
+                    db_nodes,
+                    hidden_dbs,
+                    adb.as_deref(),
+                );
             }
         });
     }

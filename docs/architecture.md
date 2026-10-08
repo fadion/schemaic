@@ -1006,6 +1006,13 @@ existing prose was left alone.
     So `JOIN b ON LOG(` and `VALUES (LOG(` still open it
     (`signature_help_does_not_open_on_a_table_named_like_a_function`). `FROM` and `JOIN` are not
     on the list, so a rowset function after one — PostgreSQL's `generate_series(` — still does.
+    **The database's own routines answer before the catalogue**: `signature_help` takes
+    `SchemaIndex::routines` (the caller reads the memoised index on each caret move) and a name
+    one of them has is helped as `name(arguments) → returns` from the server's own rendering of
+    the list, `Stored function` or `Stored procedure` its summary — one named like a builtin is
+    the one the call reaches, so it is asked first. `SignatureHelp`'s text is owned for that
+    reason; the builtins' is copied out of the catalogue
+    (`a_stored_routines_signature_is_helped_as_a_builtins_is`).
     **`caret_in_literal_or_comment` is the completion popup's gate, and it is not
     `caret_touches_noncode`** (under `predict`, below), which differs on both counts that matter
     to a list: a quoted name is a name, and completes — `"Ord`, `` `ord ``, `[Order De` are what
