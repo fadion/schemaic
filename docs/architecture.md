@@ -1038,8 +1038,11 @@ existing prose was left alone.
     growing a scanner of its own; `ddl::rebuild_strands_a_trigger` is the other caller, asking the
     same question of a column name. `problems_in_range` is its companion for the
     editor's own diagnostics — every message touching a range, ordered, **deduplicated**, since the
-    offline and DB-validated passes report an unknown column in the same words and the count reaches
-    the user as "fix these 2 problems". Both of its arms are **half-open**, the zero-width one
+    offline and DB-validated passes both report an unknown column and the count reaches the user as
+    "fix these 2 problems". They never report it in the same words (`Column … not found` against the
+    server's `Unknown column …`), so a dedup on text never fired: the key is the **token** — two
+    errors on the identical range are one problem, and the first (the offline one, which the caller
+    puts first and which carries the "did you mean") speaks for it. Both of its arms are **half-open**, the zero-width one
     included: a point sitting on a statement boundary belongs to the range that starts there, and
     read inclusively it was reported for both neighbours at once.
     **A keyword's position is not its meaning, and the diagnostics' worst false positives were all

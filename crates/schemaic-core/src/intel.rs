@@ -13806,7 +13806,12 @@ pub(crate) fn code_word_hits_in(sql: &str, code: &[bool], needle: &str) -> Vec<(
 /// appear, without repeats — what an AI fix for that range is being asked about.
 ///
 /// The two diagnostic sources ([`diagnostics`] offline and the DB-validated ones)
-/// overlap by design: an unknown column is reported by both, with the same text.
+/// overlap by design: an unknown column is reported by both — but **never in the
+/// same words** (`Column … not found` against the server's `Unknown column …`),
+/// so text alone is no key. What they share is the token: both underline the
+/// name. Two errors on the identical range are one problem, and the first in
+/// `diags` speaks for it — the caller puts the offline ones first, which carry
+/// the "did you mean". A warning on that token is a different remark, and kept.
 /// Deduplicating is not tidiness — the count goes into the prompt, and "fix these
 /// 2 problems" for one problem is a claim about the statement that isn't true.
 ///
@@ -13827,14 +13832,21 @@ pub fn problems_in_range(diags: &[Diagnostic], lo: usize, hi: usize) -> Vec<Stri
             }
         })
         .collect();
+    // Stable, so of two errors on one token the caller's first stays first.
     hits.sort_by_key(|d| d.range.0);
-    let mut out: Vec<String> = Vec::with_capacity(hits.len());
+    let mut kept: Vec<&Diagnostic> = Vec::with_capacity(hits.len());
     for d in hits {
-        if !out.iter().any(|m| m == &d.message) {
-            out.push(d.message.clone());
+        let said = kept.iter().any(|k| {
+            k.message == d.message
+                || (k.range == d.range
+                    && k.severity == Severity::Error
+                    && d.severity == Severity::Error)
+        });
+        if !said {
+            kept.push(d);
         }
     }
-    out
+    kept.into_iter().map(|d| d.message.clone()).collect()
 }
 
 /// How many lines [`sql_reply`] will strip from each end of a model's reply
@@ -27499,9 +27511,9 @@ mod tests {
 
     #[test]
     fn problems_in_range_is_ordered_and_deduplicated() {
-        // The two diagnostic sources overlap by design — the offline analysis and
-        // the live DB validation both report an unknown column — and "Fix these 2
-        // problems" for one problem is a lie the prompt would repeat.
+        // A message said twice is said once — "Fix these 2 problems" for one
+        // problem is a lie the prompt would repeat. (The two sources' overlap,
+        // which never shares text, is the next test's.)
         let d = |lo: usize, hi: usize, m: &str| Diagnostic {
             range: (lo, hi),
             severity: Severity::Error,
@@ -27519,6 +27531,45 @@ mod tests {
                 "Unknown column 'salery'".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn one_unknown_column_from_both_sources_is_one_problem() {
+        // The pin above wrote both messages by hand and identically, which no
+        // two sources ever do: the offline check says `Column … not found`, the
+        // server says `Unknown column …`, and the dedup on text never fired.
+        // Built from the two real producers, as the editor merges them.
+        let sql = "SELECT salery FROM employees";
+        let mut diags = diag(sql);
+        diags.push(db_error_diagnostic(
+            sql,
+            0,
+            sql.len(),
+            "query failed: Unknown column 'salery' in 'field list'",
+        ));
+        let problems = problems_in_range(&diags, 0, sql.len());
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        // The offline one is kept: it carries the "did you mean".
+        assert!(
+            problems[0].contains("did you mean `salary`"),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn two_problems_on_one_token_are_not_merged_unless_both_are_errors() {
+        // A warning sharing an error's token is a second thing to say about
+        // it, not the same thing said twice.
+        let d = |sev: Severity, m: &str| Diagnostic {
+            range: (7, 13),
+            severity: sev,
+            message: m.to_string(),
+        };
+        let diags = vec![
+            d(Severity::Error, "Column `salery` not found"),
+            d(Severity::Warning, "NOT IN over a nullable column"),
+        ];
+        assert_eq!(problems_in_range(&diags, 0, 40).len(), 2);
     }
 
     #[test]
