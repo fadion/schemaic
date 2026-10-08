@@ -4113,8 +4113,12 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     let fix_error: Rc<dyn Fn(String)> = {
         let fix_with_ai = fix_with_ai.clone();
         Rc::new(move |err: String| {
-            let range = query
-                .with_untracked(|sql| intel::error_fix_range(sql, &err, dialect.get_untracked()));
+            // What ran, where the editor still has it (`run_spans`, cleared on
+            // the next edit); the text's own guess otherwise.
+            let ran = run_spans.get_untracked();
+            let range = query.with_untracked(|sql| {
+                intel::run_fix_range(sql, &ran, &err, dialect.get_untracked())
+            });
             (fix_with_ai)(range, vec![err], FixOrigin::Run);
         })
     };

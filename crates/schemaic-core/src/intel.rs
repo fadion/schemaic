@@ -14228,6 +14228,43 @@ fn clean_db_message(message: &str) -> String {
     cleaned.trim().to_string()
 }
 
+/// The range an AI fix of a failed run rewrites, given the byte ranges of the
+/// statements that **ran** (`crate::sql::executable_spans`).
+///
+/// [`error_fix_range`] guesses the failing statement from the message, and
+/// its own doc names the case it cannot see: a token the failing statement
+/// does not hold, found unique in the healthy one above. What ran settles it.
+/// One statement ran: it. Several: the one holding the server's token, as
+/// [`run_error_diagnostic`] picks it, else everything that ran — wider than
+/// one statement, never the lines that did not run. With no record, or one
+/// the buffer has outgrown, the guess as before.
+pub fn run_fix_range(
+    sql: &str,
+    ran: &[(usize, usize)],
+    message: &str,
+    dialect: SqlDialect,
+) -> (usize, usize) {
+    if ran.is_empty()
+        || ran
+            .iter()
+            .any(|&(lo, hi)| lo > hi || sql.get(lo..hi).is_none())
+    {
+        return error_fix_range(sql, message, dialect);
+    }
+    let holding: Vec<&(usize, usize)> = ran
+        .iter()
+        .filter(|&&(lo, hi)| locate_db_error(&sql[lo..hi], message, dialect).is_some())
+        .collect();
+    match (ran, holding.as_slice()) {
+        ([one], _) => *one,
+        (_, [one]) => **one,
+        _ => (
+            ran.iter().map(|r| r.0).min().unwrap_or(0),
+            ran.iter().map(|r| r.1).max().unwrap_or(0),
+        ),
+    }
+}
+
 /// Where a failed run's `message` belongs in the buffer `sql`, given the byte
 /// ranges of the statements that **ran** (`crate::sql::executable_spans`), or
 /// `None` where that cannot be told.
@@ -28812,6 +28849,36 @@ mod tests {
             d.message.starts_with("query failed: Unknown column"),
             "{}",
             d.message
+        );
+    }
+
+    #[test]
+    fn a_run_errors_fix_is_scoped_to_what_ran() {
+        let msg = "query failed: Unknown column 'salery' in 'field list'";
+        let d = SqlDialect::MySql;
+        // The healthy statement above holds the token; the one that ran does
+        // not, and it is still the one to fix.
+        let sql = "SELECT salery FROM employees;\nINSERT INTO t VALUES (1)";
+        assert_eq!(
+            super::run_fix_range(sql, &[(30, sql.len())], msg, d),
+            (30, sql.len())
+        );
+        // Of several, the one holding the token…
+        let sql = "SELECT 1;\nSELECT salery FROM e;\nSELECT 3";
+        let ran = [(0, 9), (10, 31), (32, sql.len())];
+        assert_eq!(super::run_fix_range(sql, &ran, msg, d), (10, 31));
+        // …else all that ran, never the lines that did not.
+        let sql = "SELECT 0;\nSELECT 1;\nSELECT 2";
+        let ran = [(10, 19), (20, sql.len())];
+        assert_eq!(super::run_fix_range(sql, &ran, msg, d), (10, sql.len()));
+        // Nothing recorded (or out of date): the text's own guess.
+        assert_eq!(
+            super::run_fix_range(sql, &[], msg, d),
+            super::error_fix_range(sql, msg, d)
+        );
+        assert_eq!(
+            super::run_fix_range("SELECT 1", &[(0, 99)], msg, d),
+            super::error_fix_range("SELECT 1", msg, d)
         );
     }
 

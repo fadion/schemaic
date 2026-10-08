@@ -1043,8 +1043,11 @@ existing prose was left alone.
     broken one stayed broken. A token that appears twice identifies nothing, so `repeats_ci` sends
     it back to the whole-buffer fallback. What the text alone cannot settle is a token the failing
     statement does not hold at all — a `NOT NULL` column an `INSERT` omitted — which is unique code
-    in the statement *above*, so `error_fix_range` still scopes the fix there; that range has to
-    come from the run, and the fix does not take it yet.
+    in the statement *above*, so `error_fix_range` alone scopes the fix there; that range has to
+    come from the run. **`run_fix_range` takes it**: the editor's run-error fix hands it what ran
+    (`run_spans`) — one statement ran, it; several, the one holding the token, else all that ran,
+    never the lines that did not — and only with no record, or one an edit has cleared, does the
+    guess decide (`a_run_errors_fix_is_scoped_to_what_ran`, which fails on the guess).
     **`run_error_diagnostic` is where a failed run is squiggled, and it is handed what ran** — the
     buffer ranges the launch sent (`sql::executable_spans`/`selection_spans`), which is the range
     `error_fix_range` lacks. One range is the statement that failed whatever the message names, so
