@@ -2541,6 +2541,7 @@ fn run_menu_wanted(sql: &str, lo: usize, hi: usize, dialect: SqlDialect) -> bool
 /// [`run_menu_wanted`] sees no choice to make, so a lone query carries no mark.
 fn run_outline_range(
     sql: &str,
+    index: &schemaic_core::sql::StatementIndex,
     caret: usize,
     selection: Option<(usize, usize)>,
     dialect: SqlDialect,
@@ -2548,7 +2549,9 @@ fn run_outline_range(
     if selection.is_some_and(|(a, b)| a != b) {
         return None;
     }
-    let (lo, hi) = schemaic_core::sql::run_current_range(sql, caret, dialect);
+    // The pane's index of `sql`: a search, where the walk is the document up
+    // to the caret on every move.
+    let (lo, hi) = index.run_current_range(sql, caret);
     (lo < hi && run_menu_wanted(sql, lo, hi, dialect)).then_some((lo, hi))
 }
 
@@ -2837,6 +2840,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         wide: RwSignal::new(false),
         accepted,
         conn: active_conn,
+        stmts: RwSignal::new(None),
     };
     let cmdk = CmdK {
         open: RwSignal::new(false),
@@ -4321,18 +4325,40 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     // Highlight all occurrences of the identifier under the caret. Same triggers
     // as bracket matching (caret + text); pure/boundary-aware via
     // `core::pairs::identifier_occurrences` (keywords/numbers/strings excluded).
-    create_effect(move |_| {
+    //
+    // **Once the caret settles**, not on every move: the scan reads the whole
+    // document, 2 ms a MiB, and an arrow key held down asked it per repeat. An
+    // edit retires the boxes at once — their offsets have moved — and a caret
+    // still inside one of them keeps them while the next answer waits.
+    let occ_gen = RwSignal::new(0u64);
+    create_effect(move |prev_len: Option<usize>| {
         let caret = ed_occ.cursor.get().offset();
-        let sql = query.get();
-        let hits = pairs::identifier_occurrences(&sql, caret, dialect.get_untracked());
-        // Guarded: `set` never dedups, and `dyn_container` swaps its child on
-        // every *run* of the key closure rather than on every change of its
-        // value. So a caret walking *within* one identifier — the commonest
-        // arrow-key move there is — tore down and rebuilt every occurrence box,
-        // each of which then re-ran its own geometry.
-        if ident_occurrences.with_untracked(|cur| cur != &hits) {
-            ident_occurrences.set(hits);
+        let len = query.with(String::len);
+        let g = occ_gen.get_untracked().wrapping_add(1);
+        occ_gen.set(g);
+        let stale = prev_len.is_some_and(|l| l != len)
+            || !ident_occurrences
+                .with_untracked(|hs| hs.iter().any(|&(a, b)| a <= caret && caret <= b));
+        if stale && ident_occurrences.with_untracked(|hs| !hs.is_empty()) {
+            ident_occurrences.set(Vec::new());
         }
+        floem::action::exec_after(std::time::Duration::from_millis(80), move |_| {
+            if occ_gen.try_get_untracked() != Some(g) {
+                return;
+            }
+            let hits = query.with_untracked(|sql| {
+                pairs::identifier_occurrences(sql, caret, dialect.get_untracked())
+            });
+            // Guarded: `set` never dedups, and `dyn_container` swaps its child
+            // on every *run* of the key closure rather than on every change of
+            // its value. So a caret walking *within* one identifier — the
+            // commonest arrow-key move there is — tore down and rebuilt every
+            // occurrence box, each of which then re-ran its own geometry.
+            if ident_occurrences.with_untracked(|cur| cur != &hits) {
+                ident_occurrences.set(hits);
+            }
+        });
+        len
     });
 
     // The run outline: what Ctrl+Enter would run from here, on every caret
@@ -4340,8 +4366,12 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     // one statement rebuilds nothing.
     create_effect(move |_| {
         let cursor = ed_ro.cursor.get();
-        let sql = query.get();
-        let range = run_outline_range(&sql, cursor.offset(), cursor.get_selection(), dialect.get());
+        let dia = dialect.get();
+        // `with`, not `get`: a caret move need not copy the document.
+        let range = query.with(|sql| {
+            let index = crate::completion::stmt_index(comp.stmts, sql, dia);
+            run_outline_range(sql, &index, cursor.offset(), cursor.get_selection(), dia)
+        });
         if run_outline.with_untracked(|cur| cur != &range) {
             run_outline.set(range);
         }
@@ -8761,21 +8791,22 @@ mod geometry_tests {
     #[test]
     fn the_run_outline_marks_what_ctrl_enter_would_run() {
         let my = SqlDialect::MySql;
+        let outline = |sql: &str, caret: usize, sel: Option<(usize, usize)>| {
+            let index = schemaic_core::sql::StatementIndex::new(sql, my);
+            run_outline_range(sql, &index, caret, sel, my)
+        };
         let sql = "select 1\n\nselect 2\nfrom t";
         let at = |needle: &str| sql.find(needle).unwrap() + 1;
-        let second = run_outline_range(sql, at("from"), None, my).unwrap();
+        let second = outline(sql, at("from"), None).unwrap();
         assert_eq!(&sql[second.0..second.1], "select 2\nfrom t");
-        let first = run_outline_range(sql, at("elect 1"), None, my).unwrap();
+        let first = outline(sql, at("elect 1"), None).unwrap();
         assert_eq!(&sql[first.0..first.1], "select 1");
         // A selection runs instead; a bare caret's empty one does not count.
-        assert_eq!(run_outline_range(sql, at("from"), Some((0, 3)), my), None);
-        assert_eq!(
-            run_outline_range(sql, at("from"), Some((5, 5)), my),
-            Some(second)
-        );
+        assert_eq!(outline(sql, at("from"), Some((0, 3))), None);
+        assert_eq!(outline(sql, at("from"), Some((5, 5))), Some(second));
         // A lone query is what runs; there is nothing to tell it from.
-        assert_eq!(run_outline_range("select 1", 3, None, my), None);
-        assert_eq!(run_outline_range("", 0, None, my), None);
+        assert_eq!(outline("select 1", 3, None), None);
+        assert_eq!(outline("", 0, None), None);
     }
 
     /// The composition `cmdk_open_gate` could not see: it proves the four

@@ -1511,15 +1511,32 @@ fn scan_bounds_with(
     delim: &mut Vec<u8>,
     at_eof: bool,
     until: Option<usize>,
+    soft: Option<&mut Vec<usize>>,
+) -> Vec<Bound> {
+    scan_bounds_from(sql, dialect, delim, 0, at_eof, until, soft)
+}
+
+/// [`scan_bounds_with`] **resumed at `from`**, a boundary an earlier scan of
+/// `sql` recorded — where every state the scan carries is reset but the
+/// terminator in force, `delim`. The answer starts with `from` itself.
+/// [`StatementIndex::after`] resumes here rather than at a slice, which would
+/// put a mid-line `GO` at the start of a line.
+fn scan_bounds_from(
+    sql: &str,
+    dialect: SqlDialect,
+    delim: &mut Vec<u8>,
+    from: usize,
+    at_eof: bool,
+    until: Option<usize>,
     mut soft: Option<&mut Vec<usize>>,
 ) -> Vec<Bound> {
     let b = sql.as_bytes();
     let n = b.len();
-    let mut bounds = vec![Bound { at: 0, strip: 0 }];
-    let mut i = 0;
+    let mut bounds = vec![Bound { at: from, strip: 0 }];
+    let mut i = from;
     // Where the current segment begins, for recognising a directive only at the
     // start of one.
-    let mut seg = 0usize;
+    let mut seg = from;
     // SQLite alone. The other two engines keep exactly the boundaries they had —
     // MySQL's trigger bodies go behind `DELIMITER`, and changing that would
     // silently alter what Run Everything sends to a server.
@@ -1622,10 +1639,13 @@ fn scan_bounds_with(
             // The directive's own segment is dropped whole by
             // `is_runnable_segment`, so there is nothing to strip off it.
             bounds.push(Bound { at: end, strip: 0 });
+            // In force before the stop below, so a scan stopped here hands
+            // back the terminator its next segment is read with — what a
+            // resumed scan ([`StatementIndex::after`]) continues from.
+            *delim = token.into_bytes();
             if until.is_some_and(|u| end > u) {
                 break;
             }
-            *delim = token.into_bytes();
             i = end;
             seg = end;
             scan = TriggerScan::Start;
@@ -1840,13 +1860,41 @@ fn run_current_bounds(sql: &str, offset: usize, dialect: SqlDialect) -> (usize, 
             strip: 0,
         });
     }
-    // The same choice `statement_range` makes, from the same function.
     let ats: Vec<usize> = bounds.iter().map(|b| b.at).collect();
-    let k = caret_segment(sql, &ats, offset, dialect);
+    run_current_at(
+        sql,
+        &bounds,
+        &ats,
+        tail,
+        &soft,
+        offset,
+        dialect,
+        |lo, hi| blank_line_cuts(sql, lo, hi, dialect),
+    )
+}
+
+/// [`run_current_bounds`]' answer from its boundaries — `bounds` (and their
+/// offsets, `ats`) as far as the first past the caret, or closed by the
+/// document's end where none is, `tail` saying which — the batch scope's soft
+/// `;`s, and the blank-line cuts of the tail, asked only when the caret is
+/// in it. What the walk records and what a [`StatementIndex`] holds.
+#[allow(clippy::too_many_arguments)]
+fn run_current_at(
+    sql: &str,
+    bounds: &[Bound],
+    ats: &[usize],
+    tail: bool,
+    soft: &[usize],
+    offset: usize,
+    dialect: SqlDialect,
+    tail_cuts: impl FnOnce(usize, usize) -> Vec<usize>,
+) -> (usize, Bound) {
+    // The same choice `statement_range` makes, from the same function.
+    let k = caret_segment(sql, ats, offset, dialect);
     let (mut lo, mut hi) = (bounds[k].at, bounds[k + 1]);
     // No terminator ends the last segment: its blank lines may.
     if tail && k + 2 == bounds.len() {
-        let cuts = blank_line_cuts(sql, lo, hi.at, dialect);
+        let cuts = tail_cuts(lo, hi.at);
         // A cut is where the next statement starts, so a caret on the blank
         // lines above it is still in the one before.
         if let Some(&c) = cuts.iter().rev().find(|&&c| c <= offset) {
@@ -2120,14 +2168,235 @@ fn blank_line_ends(
     !(query && matches!(head.first().map(String::as_str), Some("INSERT" | "REPLACE")))
 }
 
+/// **One revision of a buffer's statement boundaries**, for the editor's
+/// questions asked on every caret move — the statement at the caret
+/// ([`statement_range_ended`]) and what Run at the caret runs
+/// ([`run_current_range`]). Each of those walks the document from its start
+/// to the caret; asked of an index, they are a search.
+///
+/// Built once ([`StatementIndex::new`]) and then **taken forward over each
+/// edit** ([`StatementIndex::after`]): the scan resumes at a boundary before
+/// the edit and stops at the first boundary past it that the old scan also
+/// recorded — at the same place once shifted, with the same terminator in
+/// force — the old boundaries standing for the rest. The scan resets
+/// everything it carries at a boundary but the terminator, so resuming at one
+/// is exact. A keystroke rescans about its own statement; an edit that opens a
+/// string, a comment or a routine body rescans as far as its effect runs.
+///
+/// `a_statement_index_answers_what_the_walks_do` holds both halves equal to
+/// the walks, over a corpus of edits on every engine.
+pub struct StatementIndex {
+    dialect: SqlDialect,
+    /// Every boundary of the document, as the full walk records them, and
+    /// then the document's end — so `bounds[..real]` are the walk's.
+    bounds: Vec<Bound>,
+    real: usize,
+    /// The boundaries' offsets.
+    ats: Vec<usize>,
+    /// Where the terminator in force changes: after the boundary at this
+    /// index, to this — a `DELIMITER` directive's doing.
+    delims: Vec<(usize, Vec<u8>)>,
+    /// The `;`s only a T-SQL batch scope held ([`scan_bounds_with`]'s `soft`).
+    soft: Vec<usize>,
+    /// The blank-line cuts of the stretch no terminator ends, found the first
+    /// time a caret is in it.
+    tail_cuts: std::cell::OnceCell<Vec<usize>>,
+}
+
+impl StatementIndex {
+    /// The index of `sql`, in one walk.
+    pub fn new(sql: &str, dialect: SqlDialect) -> Self {
+        let mut delim = vec![b';'];
+        let mut soft = Vec::new();
+        let bounds = scan_bounds_with(sql, dialect, &mut delim, true, None, Some(&mut soft));
+        Self::from_parts(sql, dialect, bounds, soft)
+    }
+
+    fn from_parts(
+        sql: &str,
+        dialect: SqlDialect,
+        mut bounds: Vec<Bound>,
+        soft: Vec<usize>,
+    ) -> Self {
+        let real = bounds.len();
+        bounds.push(Bound {
+            at: sql.len(),
+            strip: 0,
+        });
+        let ats: Vec<usize> = bounds.iter().map(|b| b.at).collect();
+        // A directive's segment starts at its own boundary, the comments ahead
+        // of it being a segment of their own.
+        let b = sql.as_bytes();
+        let delims = (1..real)
+            .filter_map(|k| {
+                let mut j = bounds[k - 1].at;
+                while b.get(j).is_some_and(u8::is_ascii_whitespace) {
+                    j += 1;
+                }
+                delimiter_directive(sql, j, dialect)
+                    .filter(|(end, _)| *end == bounds[k].at)
+                    .map(|(_, token)| (k, token.into_bytes()))
+            })
+            .collect();
+        StatementIndex {
+            dialect,
+            bounds,
+            real,
+            ats,
+            delims,
+            soft,
+            tail_cuts: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// The terminator in force after the boundary at index `k`.
+    fn delim_after(&self, k: usize) -> Vec<u8> {
+        self.delims
+            .iter()
+            .rev()
+            .find(|(at, _)| *at <= k)
+            .map_or_else(|| vec![b';'], |(_, d)| d.clone())
+    }
+
+    /// The index of `new`, where an edit turned `old` — this index's text —
+    /// into it. See the type's doc.
+    pub fn after(&self, old: &str, new: &str) -> Self {
+        let dialect = self.dialect;
+        let (o, n) = (old.as_bytes(), new.as_bytes());
+        let (pre, suf) = crate::text::common_affixes(o, n);
+        let common_from = n.len() - suf;
+        let shift = n.len() as isize - o.len() as isize;
+        // Resume a boundary further back than the last one before the edit:
+        // that one's own decision may have looked past it, into the edit.
+        let real = self.real;
+        let before = self.ats[..real].partition_point(|&a| a < pre);
+        let r = before.saturating_sub(2);
+        let mut bounds: Vec<Bound> = self.bounds[..r].to_vec();
+        let mut soft: Vec<usize> = self
+            .soft
+            .iter()
+            .copied()
+            .take_while(|&s| s <= self.bounds[r].at)
+            .collect();
+        let mut delim = self.delim_after(r);
+        let mut from = self.bounds[r].at;
+        bounds.push(self.bounds[r]);
+        loop {
+            let chunk = scan_bounds_from(
+                new,
+                dialect,
+                &mut delim,
+                from,
+                true,
+                Some(from),
+                Some(&mut soft),
+            );
+            let last = *chunk.last().expect("starts with `from`");
+            // Its first entry is `from`, already recorded with its own strip.
+            bounds.extend_from_slice(&chunk[1..]);
+            if last.at == from {
+                // The end of the document, with no boundary past `from`.
+                break;
+            }
+            // Past the edit, at a boundary the old scan also made, in the same
+            // state: the rest is the old scan's.
+            if last.at > common_from {
+                let old_at = (last.at as isize - shift) as usize;
+                let m = self.ats[..real].partition_point(|&a| a < old_at);
+                if m < real
+                    && self.bounds[m].at == old_at
+                    && self.bounds[m].strip == last.strip
+                    && self.delim_after(m) == delim
+                {
+                    let moved = |at: usize| (at as isize + shift) as usize;
+                    bounds.extend(self.bounds[m + 1..real].iter().map(|b| Bound {
+                        at: moved(b.at),
+                        strip: b.strip,
+                    }));
+                    soft.retain(|&s| s <= last.at);
+                    soft.extend(self.soft.iter().filter(|&&s| s > old_at).map(|&s| moved(s)));
+                    break;
+                }
+            }
+            from = last.at;
+        }
+        Self::from_parts(new, dialect, bounds, soft)
+    }
+
+    /// [`statement_range_ended`] at `offset`, from the index.
+    pub fn statement_range_ended(&self, sql: &str, offset: usize) -> ((usize, usize), bool) {
+        let offset = offset.min(sql.len());
+        // As far as the first boundary past the caret, as the walk stops —
+        // or closed by the document's end where there is none.
+        let j = self.ats[..self.real].partition_point(|&a| a <= offset);
+        let ats = if j < self.real {
+            &self.ats[..=j]
+        } else {
+            &self.ats[..]
+        };
+        statement_at(sql, ats, offset, self.dialect)
+    }
+
+    /// [`statement_range`] at `offset`, from the index.
+    pub fn statement_range(&self, sql: &str, offset: usize) -> (usize, usize) {
+        self.statement_range_ended(sql, offset).0
+    }
+
+    /// [`writing_range`] at `offset`, from the index.
+    pub fn writing_range(&self, sql: &str, offset: usize) -> (usize, usize) {
+        match self.statement_range_ended(sql, offset) {
+            (_, true) => {
+                let at = offset.min(sql.len());
+                (at, at)
+            }
+            (range, false) => range,
+        }
+    }
+
+    /// [`run_current_range`] at `offset`, from the index.
+    pub fn run_current_range(&self, sql: &str, offset: usize) -> (usize, usize) {
+        let offset = offset.min(sql.len());
+        let real = self.real;
+        let j = self.ats[..real].partition_point(|&a| a <= offset);
+        let (lo, hi) = if j < real {
+            run_current_at(
+                sql,
+                &self.bounds[..=j],
+                &self.ats[..=j],
+                false,
+                &self.soft,
+                offset,
+                self.dialect,
+                |_, _| Vec::new(),
+            )
+        } else {
+            run_current_at(
+                sql,
+                &self.bounds,
+                &self.ats,
+                true,
+                &self.soft,
+                offset,
+                self.dialect,
+                |lo, hi| {
+                    self.tail_cuts
+                        .get_or_init(|| blank_line_cuts(sql, lo, hi, self.dialect))
+                        .clone()
+                },
+            )
+        };
+        trim_range(sql, lo, hi.at)
+    }
+}
+
 /// The trimmed byte range of the statement containing `offset`.
 ///
 /// **Scans as far as the caret's statement and stops**, not to the end of the
-/// document: `update_signature_help` asks this on every caret move with no
-/// debounce and no size cap, and `sqlfile::open_verdict` will open a 64 MiB
-/// script. Over the whole buffer it measured 5.0 / 20.5 / 80.7 ms at
-/// 1 / 4 / 16 MiB — an arrow key's worth of UI-thread work to locate a
-/// statement whose signature help then costs 8 µs.
+/// document: over the whole buffer it measured 5.0 / 20.5 / 80.7 ms at
+/// 1 / 4 / 16 MiB. Even cut short it is a walk to the caret, so what asks per
+/// caret move — signature help, completion, the run outline — asks a
+/// [`StatementIndex`] instead, which answers the same by search; this is for
+/// one-off asks.
 ///
 /// The boundaries are the same lexer's, cut short (see `scan_bounds`' `until`),
 /// so the answer is unchanged; only the boundaries *after* the caret's
@@ -2217,7 +2486,19 @@ pub fn statement_range_ended(
     if bounds.last().is_none_or(|&last| last <= offset) {
         bounds.push(sql.len());
     }
-    let k = caret_segment(sql, &bounds, offset, dialect);
+    statement_at(sql, &bounds, offset, dialect)
+}
+
+/// [`statement_range_ended`]'s answer from its boundaries: `bounds` as far as
+/// the first past the caret, or closed by the document's end where none is —
+/// what the walk records and what a [`StatementIndex`] holds.
+fn statement_at(
+    sql: &str,
+    bounds: &[usize],
+    offset: usize,
+    dialect: SqlDialect,
+) -> ((usize, usize), bool) {
+    let k = caret_segment(sql, bounds, offset, dialect);
     // Past it exactly when the choice fell back to the segment before the
     // caret's own — whose end bound is then a real one, not the closing
     // document end the caret may sit at.
@@ -2241,12 +2522,11 @@ pub fn statement_range_ended(
 ///   line used to be in the second statement, and Ctrl+Enter there — the end of
 ///   the line just typed — ran the statement below it.
 fn caret_segment(sql: &str, bounds: &[usize], offset: usize, dialect: SqlDialect) -> usize {
-    let mut k = 0;
-    for (w, &b) in bounds.iter().enumerate().take(bounds.len() - 1) {
-        if b <= offset {
-            k = w;
-        }
-    }
+    // The last bound at or before the caret, closing bound aside — a search,
+    // since a `StatementIndex` hands it a whole document's.
+    let k = bounds[..bounds.len() - 1]
+        .partition_point(|&b| b <= offset)
+        .saturating_sub(1);
     if k == 0 {
         return k;
     }
@@ -6675,6 +6955,100 @@ mod tests {
             let tail = "select 0;\nselect 1\n\nselect 2";
             assert_eq!(run_at(tail, "elect 1", d), "select 1");
             assert_eq!(run_at(tail, "elect 0", d), "select 0;");
+        }
+    }
+
+    /// **The index answers what the walks do**, built whole and taken forward
+    /// over every edit of a corpus: each engine's base script edited at every
+    /// byte by inserting terminators, `GO`, `DELIMITER`, block words, quotes
+    /// and comments, or deleting a few bytes. Each edit's index must equal one
+    /// built from scratch, and answer the caret's statement and Run at the
+    /// caret as the walks do at every offset.
+    #[test]
+    fn a_statement_index_answers_what_the_walks_do() {
+        let bases = [
+            (
+                SqlDialect::MySql,
+                "select 1;\nDELIMITER $$\ncreate trigger t before insert on x for each row \
+                 begin set @a = 1; end$$\nDELIMITER ;\nselect 'a;b'; -- c;\nselect 2\n\nselect 3",
+            ),
+            (
+                SqlDialect::MsSql,
+                "declare @x int = 1;\nselect @x;\nif @x = 1 select 1; else select 2;\nGO\n\
+                 begin\n select 3;\nend\nGO\nselect 4\n\nselect 5",
+            ),
+            (
+                SqlDialect::Sqlite,
+                "create trigger tr after insert on t begin select 1; select 2; end;\nselect 3;\nselect 4",
+            ),
+            (
+                SqlDialect::Postgres,
+                "select $$a;b$$;\ncreate function f() returns int as $$ select 1; $$ language sql;\n\
+                 select 2\n\nselect 3",
+            ),
+        ];
+        let snippets = [
+            ";",
+            "\n",
+            "GO\n",
+            "\nGO\n",
+            "begin ",
+            "end",
+            "'",
+            "/*",
+            "*/",
+            "else ",
+            "DELIMITER $$\n",
+            "$$",
+            "x",
+            "\n\n",
+        ];
+        let ranges = |idx: &StatementIndex, sql: &str, d: SqlDialect, step: usize| {
+            for off in (0..=sql.len()).step_by(step).chain([sql.len()]) {
+                if !sql.is_char_boundary(off) {
+                    continue;
+                }
+                assert_eq!(
+                    idx.statement_range_ended(sql, off),
+                    super::statement_range_ended(sql, off, d),
+                    "{d:?} statement at {off} of {sql:?}"
+                );
+                assert_eq!(
+                    idx.run_current_range(sql, off),
+                    super::run_current_range(sql, off, d),
+                    "{d:?} run current at {off} of {sql:?}"
+                );
+                assert_eq!(
+                    idx.writing_range(sql, off),
+                    super::writing_range(sql, off, d),
+                    "{d:?} writing at {off} of {sql:?}"
+                );
+            }
+        };
+        for (d, base) in bases {
+            let old_idx = StatementIndex::new(base, d);
+            ranges(&old_idx, base, d, 1);
+            for at in 0..=base.len() {
+                let mut edits: Vec<String> = snippets
+                    .iter()
+                    .map(|s| format!("{}{s}{}", &base[..at], &base[at..]))
+                    .collect();
+                for n in [1, 3] {
+                    if at + n <= base.len() {
+                        edits.push(format!("{}{}", &base[..at], &base[at + n..]));
+                    }
+                }
+                for new in edits {
+                    let taken = old_idx.after(base, &new);
+                    let fresh = StatementIndex::new(&new, d);
+                    assert_eq!(
+                        (&taken.bounds, &taken.delims, &taken.soft),
+                        (&fresh.bounds, &fresh.delims, &fresh.soft),
+                        "{d:?}: {base:?} -> {new:?}"
+                    );
+                    ranges(&taken, &new, d, 7);
+                }
+            }
         }
     }
 

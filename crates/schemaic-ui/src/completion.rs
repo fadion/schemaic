@@ -27,7 +27,7 @@ use floem::views::editor::core::selection::Selection;
 use schemaic_core::intel::{self, ClauseCtx, SqlDialect};
 use schemaic_core::schema::{DbSchema, SchemaState, db_contributes};
 use schemaic_core::snippet;
-use schemaic_core::sql::statement_range;
+use schemaic_core::sql::StatementIndex;
 
 // The keyword/function sets live in `schemaic_core::intel` (so the core analysis
 // + diagnostics share one authoritative copy), and the ranking that seeds itself
@@ -102,6 +102,33 @@ pub(crate) struct Completion {
     pub(crate) accepted: crate::stored::Stored<schemaic_core::accepted::AcceptedFile>,
     /// The tab's connection, which an accepted word is recorded against.
     pub(crate) conn: RwSignal<u64>,
+    /// The buffer's statement boundaries ([`stmt_index`]), which signature
+    /// help and the run outline read on every caret move.
+    pub(crate) stmts: StmtIndex,
+}
+
+/// A pane's [`StatementIndex`], with the text and dialect it was built for.
+pub(crate) type StmtIndex = RwSignal<Option<(String, SqlDialect, Rc<StatementIndex>)>>;
+
+/// The statement index of `sql` — the one held when the text is unchanged,
+/// else the held one taken forward over the edit ([`StatementIndex::after`]),
+/// else a new one. So a caret move searches and a keystroke rescans about its
+/// own statement, where each used to walk the document to the caret.
+pub(crate) fn stmt_index(cell: StmtIndex, sql: &str, dialect: SqlDialect) -> Rc<StatementIndex> {
+    let held = cell.with_untracked(|c| {
+        c.as_ref()
+            .filter(|(text, d, _)| *d == dialect && text == sql)
+            .map(|(_, _, idx)| idx.clone())
+    });
+    if let Some(idx) = held {
+        return idx;
+    }
+    let next = Rc::new(cell.with_untracked(|c| match c {
+        Some((text, d, idx)) if *d == dialect => idx.after(text, sql),
+        _ => StatementIndex::new(sql, dialect),
+    }));
+    cell.set(Some((sql.to_string(), dialect, next.clone())));
+    next
 }
 
 /// The ranking vocabulary, which lives in `core::rank` — see that module for why
@@ -715,7 +742,7 @@ pub(crate) fn update_signature_help(
 ) {
     let offset = ed.cursor.get_untracked().offset();
     let text = ed.doc().text().to_string();
-    let (lo, hi) = statement_range(&text, offset, dialect);
+    let (lo, hi) = stmt_index(comp.stmts, &text, dialect).statement_range(&text, offset);
     // The database's own routines too — the index is memoised, so this is a
     // lookup on a caret move, not a rebuild.
     let schema = hidden_dbs.with_untracked(|h| schema_index(db_nodes, h, active_db));
@@ -1122,8 +1149,8 @@ pub(crate) fn recompute_completions(
 
     // The statement being *written*: past a `;` the caret starts a new one, and
     // Ctrl+Space on the blank line below `DELETE FROM t;` offered the `DELETE`'s
-    // `WHERE` and columns.
-    let (lo, hi) = schemaic_core::sql::writing_range(&text, offset, dialect);
+    // `WHERE` and columns. From the pane's index: this runs per keystroke.
+    let (lo, hi) = stmt_index(comp.stmts, &text, dialect).writing_range(&text, offset);
     // **Not inside a value or a remark**, not even on Ctrl+Space: `name = 'jo`
     // offered columns, and Tab spliced one into the literal. A quoted name
     // is still a name, and completes.

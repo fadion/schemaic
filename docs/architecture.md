@@ -738,12 +738,46 @@ existing prose was left alone.
     *past* that offset has been recorded — everything after belongs to statements the caller has
     already said it does not care about — and the boundaries produced before the stop are
     byte-for-byte the ones the full walk produces, this being the same lexer cut short and not a
-    second one. It exists for `statement_range`, which answers "which statement is the caret in" on
+    second one. It exists for `statement_range`, which answered "which statement is the caret in" on
     **every caret move**, undebounced, through `update_signature_help`, and which nothing caps:
     `sqlfile::open_verdict` will open a 64 MiB script, and over the whole document the walk measured
     5.0 / 20.5 / 80.7 ms at 1 / 4 / 16 MiB — an arrow key's worth of UI-thread work to locate a
     statement whose actual work, `intel::signature_help` on the isolated statement, is 8 µs. `None`
-    keeps the full walk, which is what every other caller wants.
+    keeps the full walk, which is what every other caller wants. **Cut short was not short enough,
+    and the per-move callers now ask a `StatementIndex` instead** (below): with the caret mid-file
+    the walk to it still measured 6.3 / 25 / 104 ms at 1 / 4 / 16 MiB (release, a realistic
+    script), and the run outline paid it a second time on the same move. `until` stays for the
+    walks that remain — Ctrl+Enter, the menu actions — one call per press.
+    **`StatementIndex` is one revision of a buffer's boundaries, and what a caret move asks.**
+    `new` is one full walk (`scan_bounds_with`, soft `;`s collected), keeping the walk's bounds
+    closed by the document's end, where a `DELIMITER` directive changes the terminator in force
+    (`delims`), the soft `;`s, and — the first time a caret is in the unterminated tail — that
+    tail's blank-line cuts (`tail_cuts`). Its `statement_range_ended`, `statement_range`,
+    `writing_range` and `run_current_range` answer exactly what the free functions do, by binary
+    search: the walk's bounds up to the first past the caret, or closed by the end, which is the
+    list the cut-short walk produces. That is why the pick is shared rather than copied —
+    `statement_at` and `run_current_at` take the boundaries as slices from either source — and why
+    `caret_segment` searches (`partition_point`) rather than looping, handed a whole document's.
+    `after(old, new)` takes the index forward over an edit: it finds the edit with
+    `text::common_affixes`, resumes **two** boundaries before it — the last one's own decision may
+    have read into the edit, as T-SQL's `IF … ; ELSE` lookahead does — and scans a statement at a
+    time through `scan_bounds_from`, stopping at the first boundary past the edit that the old scan
+    also recorded at the shifted position, with the same `strip` and the same terminator in force;
+    the old boundaries and soft `;`s after it, shifted, stand for the rest. **It resumes at a
+    recorded boundary of the whole text, never at a slice**, which would put a mid-line `GO` at a
+    line start; resuming is exact because every state the scan carries resets at a boundary but the
+    terminator. Measured (release, a realistic script, after a one-character edit): `after`
+    0.09–0.16 / 0.49–0.58 / 3.5–6.6 ms at 1 / 4 / 16 MiB, a caret-move lookup ~0.0001 ms at any
+    size, and `new` 14 / 58 / 230–350 ms, once, on the first ask. The index's test found a scanner
+    bug on the way: on a `DELIMITER` directive the new terminator was set only *after* the `until`
+    stop, so a scan stopped at a directive handed back the old one. It is set before the stop now —
+    invisible to every earlier caller, none of which reads the terminator after a stop, and
+    load-bearing for `after`, which resumes with it. `a_statement_index_answers_what_the_walks_do`
+    edits per-engine scripts (MySQL `DELIMITER` and triggers, T-SQL `DECLARE`/`IF … ELSE`/`GO`/
+    `BEGIN … END`, a SQLite trigger, PostgreSQL dollar quotes, unterminated tails with blank lines)
+    at every byte — inserting `;`, newlines, `GO`, block words, quotes, comments, `DELIMITER $$` or
+    `$$`, or deleting — and holds each taken-forward index equal to a fresh one and its answers to
+    the walks'. Who holds the index is under `completion.rs`.
     **Which segment the caret means is `caret_segment`'s, the one choice `statement_range` and
     `run_current_bounds` share** — so Run at the caret's outline and what `executable_at` sends
     are chosen there too. It is the segment the caret falls in, save in two places where it means
@@ -12723,10 +12757,14 @@ existing prose was left alone.
     Pure + unit-tested; dialect-aware, and its two "is a
     backtick an identifier quote here" sites ask `SqlDialect::backtick_ident` (`pub(crate)` for
     them) rather than re-spelling `!= Postgres`, which is the capability rule one module over.
-    **Three of those walk the document, and all three are on the editor's *undebounced*
-    per-caret-move path** — `match_paren` and `identifier_occurrences` are two `create_effect`s with
+    **Three of those walk the document, and all three were on the editor's *undebounced*
+    per-caret-move path** — `match_paren` and `identifier_occurrences` were two `create_effect`s with
     no debounce and no size cap, and `sqlfile::open_verdict` will open a 64 MiB script — so each
-    stops as early as its answer allows. `region_at` stops **at the caret**: the answer is settled
+    stops as early as its answer allows. `identifier_occurrences`' answer is the whole document, so
+    it cannot stop early (2 / 8 / 32 ms at 1 / 4 / 16 MiB per move); it is the one taken off that
+    path instead: the effect in `editor_pane.rs` asks it 80 ms after the caret settles (a
+    generation, `occ_gen`, retiring superseded asks), and clears the boxes at once on an edit — the
+    text's length moved, so their offsets have — or when the caret leaves them. `region_at` stops **at the caret**: the answer is settled
     once the walk reaches `offset`, since a span opening at or after it cannot contain it, and
     everything past that was a scan of the rest of the document for nothing (at 16 MiB the full walk
     measured 37.9 ms, so one arrow key was ~123 ms of UI-thread work across the two effects).
@@ -23881,6 +23919,13 @@ existing prose was left alone.
     re-introspection changes and so nothing has to be invalidated by hand. `LoadedNode` exists so
     the snapshot is taken out of the signals **once**: reading `node.schema` twice could key an
     index on a schema it was not built from.
+    **`Completion::stmts` holds the pane's `sql::StatementIndex`** (`StmtIndex`, the text and
+    dialect it was built for beside it), and `stmt_index(cell, sql, dialect)` is the one way in:
+    the held index when the text is unchanged, the held one taken forward (`after`) when it is not,
+    a new one otherwise. Three readers ask it — `update_signature_help` per caret move (it was
+    `sql::statement_range`, a walk to the caret), `recompute_completions` per keystroke
+    (`writing_range`), and the run outline's effect in `editor_pane.rs` — so the walk each made
+    becomes a search, and a keystroke rescans about its own statement (the costs under `sql.rs`).
     **`index::build` had no test of its own**, which is the other thing to know about it: it is a
     pure function over a slice — no signal, no `Editor`, nothing that needs a mounted view — while
     the hidden-database rule it enforces was pinned only for the *catalogue* half (`catalog_tests`),
@@ -24595,9 +24640,10 @@ existing prose was left alone.
     gutter just left of the code column (`content_x - HL_PAD - 4`), `theme::query_highlight()` at
     0.6 alpha, beside the lines of `run_outline`'s range. An effect over the caret (`ed.cursor`),
     `query` and `dialect` recomputes it on every move and edit through the pure
-    `run_outline_range`: `sql::run_current_range`'s piece, or `None` with a non-empty selection
-    (Ctrl+Enter runs the selection instead) and wherever `run_menu_wanted` sees no choice to make,
-    so a lone query carries no mark. That is the menu's own question, so the bar and the menu agree
+    `run_outline_range`: `StatementIndex::run_current_range`'s piece — the pane's index, from
+    `completion::stmt_index`, answering as `sql::run_current_range` does — or `None` with a
+    non-empty selection (Ctrl+Enter runs the selection instead) and wherever `run_menu_wanted` sees
+    no choice to make, so a lone query carries no mark. That is the menu's own question, so the bar and the menu agree
     about when there is anything to tell apart. The set is guarded as `ident_occurrences`' is, so a
     caret moving within one statement rebuilds nothing. The bar asks for points only on the
     statement's lines that are on screen — its line span intersected with `screen_lines`'
@@ -24609,10 +24655,12 @@ existing prose was left alone.
     run_outline_view))`, because `editor_area`'s tuple is at floem's 16: an `absolute().inset(0)`
     wrapper with `pointer_events(false)` — the pane-sized shape the scrollbar note forbids, harmless
     here for the squiggle tip's reason, being click-through with nothing in it to hover.
-    **It asks undebounced on every move, so `run_current_bounds` walks only as far as the caret's
-    statement**, handing `scan_bounds_with` the caret as its `until` as `statement_range` does
-    (under `sql.rs`); only a caret in the tail no terminator ends reads to the document's end, which
-    the blank-line cuts need.
+    **It asks undebounced on every move, so it asks the index, not the walk.** Handing
+    `scan_bounds_with` the caret as its `until` was the first fix and was not enough: with the caret
+    mid-file the walk still measured 6.3 / 25 / 104 ms at 1 / 4 / 16 MiB per move (release), where
+    the index answers in ~0.0001 ms (under `sql.rs`); a caret in the tail no terminator ends finds
+    that tail's blank-line cuts once per revision. The effect reads `query.with`, not `get`, so a
+    caret move copies no document. Ctrl+Enter and the run menu still walk, one call per press.
     **`visible_hunk_lines` is a filter, never a clamp.** A line outside the viewport is dropped, not
     pulled to the nearest one — the rule `top_of` already states for a line past the end of the
     document, and for its reason: a band placed against whatever text happens to be at the clamped
