@@ -111,6 +111,7 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
                     ui.overlay,
                     ui.snippets,
                     ui.snippet_actions.clone(),
+                    ui.conn.dialect,
                 ),
                 import_view::import_overlay(import_view::ImportCtx::new(
                     ui.import,

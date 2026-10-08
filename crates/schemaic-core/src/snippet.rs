@@ -257,6 +257,17 @@ pub fn collapsed_for_highlight(body: &str, dialect: SqlDialect) -> String {
     collapsed(&crate::sql::inline_line_comments(body, dialect))
 }
 
+/// The dialect a snippet's body is coloured in when it is edited: its scope's
+/// engine where the scope names one, the active connection's otherwise. A
+/// global snippet is written for whatever is in front of you, and the library
+/// offers a connection's own only on that connection.
+pub fn body_dialect(scope: &Scope, active: SqlDialect) -> SqlDialect {
+    match scope {
+        Scope::Dialect(d) => *d,
+        Scope::Global | Scope::Conn(_) | Scope::Unknown(_) => active,
+    }
+}
+
 /// The panel's groups for a connection, narrowed by the filter.
 ///
 /// Buckets run **narrowest first** — this connection, then this engine, then
@@ -695,6 +706,18 @@ pub fn remove(all: &mut Vec<Snippet>, id: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_snippet_body_is_coloured_in_its_own_engine_where_it_names_one() {
+        let pg = SqlDialect::Postgres;
+        assert_eq!(
+            body_dialect(&Scope::Dialect(SqlDialect::MsSql), pg),
+            SqlDialect::MsSql
+        );
+        for scope in [Scope::Global, Scope::Conn(7), Scope::Unknown("x".into())] {
+            assert_eq!(body_dialect(&scope, pg), pg, "{scope:?}");
+        }
+    }
 
     /// A real selection is what gets saved, and the rest of the buffer does not.
     #[test]

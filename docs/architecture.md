@@ -20834,8 +20834,11 @@ existing prose was left alone.
     one-word edits because those are the same act as renaming a tab; a body is SQL, multi-line, and
     a 300px panel row is the wrong shape for it, so it gets the modal chrome the view/trigger
     editors wear (`modal_title_owned` / `modal_footer` / `panel_style`) and the same multi-line
-    mono field with `tab_indents` — though not their colouring, a snippet carrying a scope rather
-    than a dialect for `FieldCfg::sql` to take. **Save writes only the fields that changed, through the same
+    mono field with `tab_indents`, SQL-coloured as theirs are (`FieldCfg::sql`). A snippet carries
+    a scope rather than a dialect, so `snippet::body_dialect` answers it: the scope's engine where it
+    names one, else the active connection's (`ConnUi::dialect`, passed in by `modals.rs`) — a global
+    snippet is written for whatever is in front of you, and a connection's own is offered only on
+    that connection. **Save writes only the fields that changed, through the same
     per-field actions the inline edits use** — there is deliberately no fourth "save everything"
     action, because two paths writing one field is how the two drift. *Which* fields changed is
     `core::snippet::edits`, not three comparisons written here: the body's comparison and its
@@ -25341,15 +25344,15 @@ existing prose was left alone.
     and the right-click menu — ask for it at the moment they run. What it does to the text is the
     `core/sqlfmt.rs` entry's.
     **`FieldSql` carries the same colouring into an `edit_field`** — the DDL preview's SQL box and
-    the view, trigger and routine bodies, each of which sets `FieldCfg::sql` (under `lib.rs`). It
+    the view, trigger, routine and snippet bodies, each of which sets `FieldCfg::sql` (under
+    `lib.rs`). It
     is the same `lex_line_with` with the same cross-line state: the per-revision `CarryCache` is
     filled by `carry_at_cached`, which `SqlStyling::carry_at` calls too, so the forward pass that removed the Θ(visible × document) re-lex is one piece of code
     rather than two copies of it. It leaves out what only the tab editor has — the zoom, the inline
     diff and rainbow brackets (`lex_line_with` is handed `None` for the depth) — and its dialect is a
     plain `SqlDialect` fixed when the field is built, where `SqlStyling`'s is a memo.
     `FieldSql::generation` is `theme::editor_generation()`, which `FieldStyling::id` adds to its key
-    so an editor-theme switch re-lays out lines already coloured. The snippet editor's body is not
-    coloured: a snippet carries a scope, not a dialect. **No test covers `FieldSql`** — it needs a
+    so an editor-theme switch re-lays out lines already coloured. **No test covers `FieldSql`** — it needs a
     floem `Document`, and there is no fixture for one.
     `theme::preview_bg`/`preview_fg` are the surface and base text of a **syntax-coloured preview**,
     and they are named here rather than spelled at each site so the cross-axis gate in `contrast.rs`

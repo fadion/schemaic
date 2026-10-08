@@ -43,6 +43,8 @@ pub(crate) fn snippet_edit_overlay(
     o: OverlayUi,
     snippets: SnippetsUi,
     actions: Rc<SnippetActions>,
+    // The active connection's, for a body whose scope names no engine.
+    dialect: floem::reactive::Memo<schemaic_core::intel::SqlDialect>,
 ) -> impl IntoView {
     let open = o.snippet_edit;
     let library = snippets.items;
@@ -122,8 +124,9 @@ pub(crate) fn snippet_edit_overlay(
                             focus: Some((ring.clone(), 30)),
                             // It's SQL: Tab indents rather than leaving the
                             // field, the same bargain the view editor's body
-                            // takes.
+                            // takes — and it is coloured as SQL, as that one is.
                             tab_indents: true,
+                            sql: Some(snippet::body_dialect(&snip.scope, dialect.get_untracked())),
                             ..Default::default()
                         },
                     )
