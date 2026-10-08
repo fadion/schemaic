@@ -3068,7 +3068,12 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         // saw the connection die under a statement that did
                         // nothing wrong.
                         let source = tx::run_error_source(e.modal_source(), stmt);
-                        QueryState::Failed(ModalError::new(note(e.to_string()), source))
+                        // With the server's position where it gave one: the
+                        // editor places its squiggle by it. A filter re-run's
+                        // error drops it again (`about_another_statement`).
+                        QueryState::Failed(
+                            ModalError::new(note(e.to_string()), source).at(e.position()),
+                        )
                     }
                 };
                 send((state, stmt, started.elapsed().as_millis() as u64));

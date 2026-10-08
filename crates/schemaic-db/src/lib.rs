@@ -104,6 +104,14 @@ pub enum DbError {
     Connect(String),
     #[error("query failed: {0}")]
     Query(String),
+    /// A [`DbError::Query`] the server **placed**: `at` is its 1-based
+    /// character index into the statement text as sent — PostgreSQL's `P`
+    /// field, and only that one (an `Internal` position indexes a query the
+    /// server built itself, a function body's, never the user's text).
+    /// Produced on the run path alone (`pg::run_err`), where the text sent is
+    /// the editor's, unrewritten; everything else is told as before.
+    #[error("query failed: {message}")]
+    QueryAt { message: String, at: usize },
     #[error("query cancelled")]
     Cancelled,
     /// **Schemaic's own sentence**, not the server's — a refusal written before
@@ -136,9 +144,19 @@ impl DbError {
     /// name.
     pub fn modal_source(&self) -> ErrorSource {
         match self {
-            DbError::Query(_) => ErrorSource::Statement,
+            DbError::Query(_) | DbError::QueryAt { .. } => ErrorSource::Statement,
             DbError::Connect(_) => ErrorSource::Server,
             DbError::Cancelled | DbError::Refused(_) => ErrorSource::App,
+        }
+    }
+
+    /// Where the server placed the error, as [`DbError::QueryAt::at`] says.
+    pub fn position(&self) -> Option<usize> {
+        match self {
+            DbError::QueryAt { at, .. } => Some(*at),
+            DbError::Query(_) | DbError::Connect(_) | DbError::Cancelled | DbError::Refused(_) => {
+                None
+            }
         }
     }
 

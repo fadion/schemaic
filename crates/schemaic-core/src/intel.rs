@@ -14290,6 +14290,7 @@ pub fn run_fix_range(
 pub fn run_error_diagnostic(
     sql: &str,
     ran: &[(usize, usize)],
+    at: Option<(usize, usize)>,
     message: &str,
     dialect: SqlDialect,
 ) -> Option<Diagnostic> {
@@ -14298,6 +14299,30 @@ pub fn run_error_diagnostic(
         .any(|&(lo, hi)| lo > hi || sql.get(lo..hi).is_none())
     {
         return None;
+    }
+    // **The server's own position, where it gave one**: PostgreSQL's is a
+    // 1-based *character* index into the text sent, which began at `sent`.
+    // It settles what a token search cannot — which of two `x`s — and is
+    // trusted only inside what ran.
+    if let Some((sent, chars)) = at
+        && let Some(p) = chars
+            .checked_sub(1)
+            .and_then(|n| sql.get(sent..)?.char_indices().nth(n))
+            .map(|(i, _)| sent + i)
+        && ran.iter().any(|&(lo, hi)| lo <= p && p < hi)
+    {
+        let (s, e) = word_range_at(sql, p);
+        let one_char = p + sql[p..].chars().next().map_or(1, char::len_utf8);
+        let range = if is_word_byte(sql.as_bytes()[p]) {
+            (s, e)
+        } else {
+            (p, one_char)
+        };
+        return Some(Diagnostic {
+            range,
+            severity: Severity::Error,
+            message: clean_db_message(message),
+        });
     }
     let (lo, hi) = match ran {
         [] => return None,
@@ -28875,8 +28900,35 @@ mod tests {
 
     /// `run_error_diagnostic`'s range, as the text under it.
     fn run_err_at(sql: &str, ran: &[(usize, usize)], msg: &str) -> Option<String> {
-        super::run_error_diagnostic(sql, ran, msg, SqlDialect::MySql)
+        super::run_error_diagnostic(sql, ran, None, msg, SqlDialect::MySql)
             .map(|d| sql[d.range.0..d.range.1].to_string())
+    }
+
+    #[test]
+    fn a_servers_own_position_places_the_squiggle() {
+        // PostgreSQL names `x` and says where: the second one, which the
+        // token search alone would never pick.
+        let msg = "query failed: column \"x\" does not exist";
+        let d = SqlDialect::Postgres;
+        let sql = "SELECT 1;\nSELECT x AS a FROM t WHERE x > 1";
+        let stmt = 10;
+        let second = sql.rfind('x').unwrap();
+        // 1-based characters into the text sent, which began at `stmt`.
+        let at = Some((stmt, second - stmt + 1));
+        let got = super::run_error_diagnostic(sql, &[(stmt, sql.len())], at, msg, d).unwrap();
+        assert_eq!(got.range, (second, second + 1));
+        // Characters, not bytes: `é` is two bytes and one character.
+        let sql = "SELECT 'é', x FROM t";
+        let x = sql.find('x').unwrap();
+        let chars = sql[..x].chars().count();
+        let got = super::run_error_diagnostic(sql, &[(0, sql.len())], Some((0, chars + 1)), msg, d)
+            .unwrap();
+        assert_eq!(&sql[got.range.0..got.range.1], "x");
+        // A position past what ran is not trusted; the token search answers.
+        let sql = "SELECT x FROM t";
+        let got =
+            super::run_error_diagnostic(sql, &[(0, sql.len())], Some((0, 99)), msg, d).unwrap();
+        assert_eq!(&sql[got.range.0..got.range.1], "x");
     }
 
     #[test]
@@ -28890,7 +28942,7 @@ mod tests {
         // Of several that ran, the one statement holding the token.
         let sql = "SELECT id FROM employees;\nSELECT salery FROM employees";
         let ran = [(0, 25), (26, sql.len())];
-        let d = super::run_error_diagnostic(sql, &ran, msg, SqlDialect::MySql).unwrap();
+        let d = super::run_error_diagnostic(sql, &ran, None, msg, SqlDialect::MySql).unwrap();
         assert_eq!(&sql[d.range.0..d.range.1], "salery");
         assert_eq!(d.range.0, sql.rfind("salery").unwrap());
         assert_eq!(d.severity, Severity::Error);

@@ -1793,6 +1793,12 @@ pub enum ErrorSource {
 pub struct ModalError {
     pub text: String,
     pub source: ErrorSource,
+    /// Where the server said the error is, when it said: a 1-based
+    /// **character** index into the statement as it was sent — PostgreSQL's
+    /// `P` field. The editor places its squiggle by it
+    /// (`intel::run_error_diagnostic`). `None` from every other engine, and
+    /// from every surface but a run.
+    pub at: Option<usize>,
 }
 
 impl ModalError {
@@ -1834,7 +1840,12 @@ impl ModalError {
         Self {
             text: text.into(),
             source,
+            at: None,
         }
+    }
+    /// The same error, with the server's position ([`ModalError::at`]).
+    pub fn at(self, at: Option<usize>) -> Self {
+        Self { at, ..self }
     }
 }
 
@@ -1873,7 +1884,7 @@ impl ErrorModalContent {
         kept: bool,
     ) -> Self {
         let kept = kept && over.is_none();
-        let Some(ModalError { text, source }) = over.or(tab_error) else {
+        let Some(ModalError { text, source, .. }) = over.or(tab_error) else {
             return Self::default();
         };
         // A match, not `!= App`: a fourth source has to decide its own actions

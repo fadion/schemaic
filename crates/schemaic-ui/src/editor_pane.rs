@@ -2716,6 +2716,10 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     // overwrite it.
     let run_spans: RwSignal<Vec<(usize, usize)>> = RwSignal::new(Vec::new());
     let run_diag: RwSignal<Vec<Diagnostic>> = RwSignal::new(Vec::new());
+    // Where the **one** text a launch sent began in the buffer, for the
+    // server's own position into it (`ModalError::at`, PostgreSQL's); `None`
+    // when it sent several, whose failing one the result does not name.
+    let run_sent: RwSignal<Option<usize>> = RwSignal::new(None);
     // Tracks the result only: a launch recording new spans must not re-place
     // the error the last run left.
     create_effect(move |_| {
@@ -2725,8 +2729,9 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     && !results.frozen() =>
             {
                 let spans = run_spans.get_untracked();
+                let at = run_sent.get_untracked().zip(err.at);
                 query.with_untracked(|sql| {
-                    intel::run_error_diagnostic(sql, &spans, &err.text, dialect.get_untracked())
+                    intel::run_error_diagnostic(sql, &spans, at, &err.text, dialect.get_untracked())
                 })
             }
             _ => None,
@@ -3516,9 +3521,13 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 // selecting already said what to run.
                 let sel = e.cursor.get_untracked().get_selection();
                 if let Some(mut stmts) = schemaic_core::sql::selection_statements(&sql, sel, dia) {
-                    run_spans.set(
-                        schemaic_core::sql::selection_spans(&sql, sel, dia).unwrap_or_default(),
-                    );
+                    let spans =
+                        schemaic_core::sql::selection_spans(&sql, sel, dia).unwrap_or_default();
+                    run_sent.set(match spans.as_slice() {
+                        [one] => Some(one.0),
+                        _ => None,
+                    });
+                    run_spans.set(spans);
                     comp.open.set(false);
                     if stmts.len() == 1 {
                         (guarded_run_key)(stmts.remove(0));
@@ -3559,6 +3568,8 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     comp.open.set(false);
                 } else {
                     run_spans.set(schemaic_core::sql::executable_spans(&sql, dia));
+                    // The whole buffer is what is sent.
+                    run_sent.set(Some(0));
                     (guarded_run_key)(sql.clone());
                 }
             });
@@ -4859,6 +4870,9 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             if !run_spans.with_untracked(Vec::is_empty) {
                 run_spans.set(Vec::new());
             }
+            if run_sent.get_untracked().is_some() {
+                run_sent.set(None);
+            }
             if live_validate.get_untracked() {
                 let g = val_gen.get().wrapping_add(1);
                 val_gen.set(g);
@@ -5588,7 +5602,9 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                             run_menu_offset.get_untracked(),
                             dialect.get_untracked(),
                         ) {
-                            run_spans.set(vec![schemaic_core::sql::span_in(&sql, stmt)]);
+                            let span = schemaic_core::sql::span_in(&sql, stmt);
+                            run_sent.set(Some(span.0));
+                            run_spans.set(vec![span]);
                             (run)(stmt.to_string());
                         }
                         // Down with the menu, as on Escape and Run Everything. The
@@ -5622,6 +5638,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                             &sql,
                             dialect.get_untracked(),
                         ));
+                        run_sent.set(None);
                         (run_all)(stmts);
                         highlight.set(None);
                         run_menu.set(None);
@@ -6249,6 +6266,8 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             run_spans.set(query.with_untracked(|q| {
                 schemaic_core::sql::executable_spans(q, dialect.get_untracked())
             }));
+            // The whole buffer is what is sent.
+            run_sent.set(Some(0));
             (run)(query.get_untracked())
         })
         .on_event(EventListener::PointerEnter, move |_| {

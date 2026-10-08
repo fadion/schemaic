@@ -578,6 +578,27 @@ fn db_err(e: &tokio_postgres::Error) -> DbError {
     DbError::Query(db_text(e))
 }
 
+/// [`db_err`] for the statement the user ran, keeping where the server put
+/// the error ([`DbError::QueryAt`]). Only [`run_statement`] asks: its text is
+/// sent as the editor handed it, so the position indexes the editor's text.
+fn run_err(e: &tokio_postgres::Error) -> DbError {
+    placed(db_text(e), e.as_db_error().and_then(|d| d.position()))
+}
+
+/// The error for `message` at `pos`: placed when the position is in the text
+/// that was sent (`Original`), and told as before when it is in a query the
+/// server built itself (`Internal`, a function body's) or there is none.
+fn placed(message: String, pos: Option<&tokio_postgres::error::ErrorPosition>) -> DbError {
+    use tokio_postgres::error::ErrorPosition;
+    match pos {
+        Some(ErrorPosition::Original(at)) => DbError::QueryAt {
+            message,
+            at: *at as usize,
+        },
+        Some(ErrorPosition::Internal { .. }) | None => DbError::Query(message),
+    }
+}
+
 /// The server refusing the `SET` that makes a session read-only — its words,
 /// but about Schemaic's statement rather than the user's, which was never sent.
 /// `Connect`, not [`db_err`]'s `Query`: a `Query` is offered *AI fix* over the
@@ -1100,7 +1121,7 @@ pub(crate) async fn run_statement(
     // cap is reached.
     let token = client.cancel_token();
     let stream = tokio::select! {
-        r = client.simple_query_raw(sql) => r.map_err(|e| db_err(&e))?,
+        r = client.simple_query_raw(sql) => r.map_err(|e| run_err(&e))?,
         _ = cancel.cancelled() => {
             cancel_query(db, &token).await;
             return Err(DbError::Cancelled);
@@ -1149,7 +1170,7 @@ pub(crate) async fn run_statement(
             }
         };
         let Some(msg) = next else { break };
-        match msg.map_err(|e| db_err(&e))? {
+        match msg.map_err(|e| run_err(&e))? {
             SimpleQueryMessage::Row(r) => {
                 let (builder, kinds) = grid.get_or_insert_with(|| {
                     let names: Vec<&str> = r.columns().iter().map(|c| c.name()).collect();
@@ -5944,6 +5965,23 @@ mod index_key_tests {
     /// A label may be the empty string, a comma, or a newline — which is why the
     /// labels arrive one per row instead of string-aggregated. Any separator at
     /// all would be a value some database already stores.
+    /// A position is kept only where it indexes the text that was sent.
+    #[test]
+    fn a_run_error_keeps_the_servers_position_into_what_was_sent() {
+        use tokio_postgres::error::ErrorPosition;
+        let e = super::placed("boom".into(), Some(&ErrorPosition::Original(8)));
+        assert_eq!(e.position(), Some(8));
+        assert_eq!(e.to_string(), "query failed: boom");
+        // A function body's own query: not the user's text.
+        let internal = ErrorPosition::Internal {
+            position: 3,
+            query: "SELECT 1".into(),
+        };
+        let e = super::placed("boom".into(), Some(&internal));
+        assert!(matches!(e, DbError::Query(ref m) if m == "boom"), "{e:?}");
+        assert_eq!(super::placed("boom".into(), None).position(), None);
+    }
+
     #[test]
     fn enum_labels_survive_being_commas_newlines_and_empty() {
         let types = vec![row(&["public", "weird", "e", "", "", "0", "", "", "0"])];

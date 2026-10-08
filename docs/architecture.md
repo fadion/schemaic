@@ -1057,8 +1057,17 @@ existing prose was left alone.
     longer has, draws nothing either (`a_failed_run_is_underlined_where_the_server_points`,
     `a_failed_run_is_underlined_only_in_what_ran`). So Ctrl+Enter on one statement can no longer
     land in its neighbour; Run Everything still can, when the token's one holder is a statement
-    that ran *before* the failing one. PostgreSQL reports the error's own position, which would
-    settle that, but `db::pg` flattens the error to a string (`db_text`) and it is not used yet.
+    that ran *before* the failing one. **Where the server placed the error, that decides first**:
+    PostgreSQL's `P` field arrives as `DbError::QueryAt` (produced by `pg::run_err` on the run path
+    alone, and only for an `ErrorPosition::Original` — an `Internal` one indexes a function body's
+    own query), the app carries it on `ModalError::at`, and the editor pairs it with `run_sent`,
+    where the **one** text it sent began (none for Run Everything, whose failing statement the
+    result does not name). It is a 1-based *character* index — measured on PostgreSQL 16, `nope`
+    after an `é` is character 13 and byte 14 — trusted only inside what ran, and it picks the
+    second of two `x`s where the token search takes the first
+    (`a_servers_own_position_places_the_squiggle`). The text sent is the editor's unrewritten:
+    `run_statement` sends it whole through the simple protocol, and the read-only `SET` and a
+    Manual tab's `BEGIN` go as their own messages.
     **`code_names` is that same scan reduced to a yes/no, and it is `pub` for a caller outside this
     crate.** `db::sqlite`'s introspection needs to know which triggers name a table — that is
     `TableInfo::referring_ddl` — and a `contains` there matches the word inside a comment or a `'…'`

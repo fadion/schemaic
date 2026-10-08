@@ -5206,6 +5206,10 @@ fn err_clone(e: &DbError) -> DbError {
     match e {
         DbError::Connect(s) => DbError::Connect(s.clone()),
         DbError::Query(s) => DbError::Query(s.clone()),
+        DbError::QueryAt { message, at } => DbError::QueryAt {
+            message: message.clone(),
+            at: *at,
+        },
         DbError::Cancelled => DbError::Cancelled,
         DbError::Refused(s) => DbError::Refused(s.clone()),
     }
