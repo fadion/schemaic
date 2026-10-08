@@ -11772,6 +11772,207 @@ mod colres {
     }
 }
 
+/// Every place the table alias at `caret` is written — its definition and each
+/// qualifier bound to it (`o.id`, `o.*`, `SET o.x`) — in the statement the
+/// caret is in, in order, or `None` when the caret is on no alias or the
+/// statement does not parse. What *Rename alias* selects, so typing renames
+/// them together.
+///
+/// Bound the way the server binds them: a qualifier names the alias of the
+/// innermost query that defines one by that name, so a subquery's own `o`
+/// shadows the outer one inside it, while a correlated reference reaches out.
+/// A quoted name's range is the name inside its quotes, which stay.
+pub fn alias_occurrences(
+    sql: &str,
+    caret: usize,
+    dialect: SqlDialect,
+) -> Option<Vec<(usize, usize)>> {
+    let (lo, hi) = crate::sql::statement_range(sql, caret, dialect);
+    let stmt = sql.get(lo..hi)?;
+    let asts = parse_statements(stmt, dialect).ok()?;
+    let [ast] = asts.as_slice() else {
+        return None;
+    };
+    alias_refs::occurrences(stmt, lo, ast, caret)
+}
+
+/// [`alias_occurrences`]' walk: alias definitions and qualifier uses, each
+/// placed by its span, with the queries that scope them.
+mod alias_refs {
+    use std::ops::ControlFlow;
+
+    use sqlparser::ast::{
+        AssignmentTarget, Expr, Ident, ObjectName, Query, SelectItem,
+        SelectItemQualifiedWildcardKind, SetExpr, Spanned, Statement, TableFactor, Visit, Visitor,
+    };
+
+    use super::colres::to_range;
+
+    struct Walk<'a> {
+        stmt: &'a str,
+        lo: usize,
+        /// Every query's byte range, and the statement's own, outermost.
+        scopes: Vec<(usize, usize)>,
+        /// `(name_lower, range)` of each alias definition.
+        defs: Vec<(String, (usize, usize))>,
+        /// `(name_lower, range)` of each qualifier.
+        uses: Vec<(String, (usize, usize))>,
+    }
+
+    impl Walk<'_> {
+        fn place(&self, id: &Ident) -> (String, (usize, usize)) {
+            (
+                id.value.to_ascii_lowercase(),
+                to_range(self.stmt, self.lo, id.span),
+            )
+        }
+
+        /// The qualifier of a dotted name: its second part from the end.
+        fn qualifier(&mut self, parts: &[&Ident]) {
+            if parts.len() >= 2 {
+                let at = self.place(parts[parts.len() - 2]);
+                self.uses.push(at);
+            }
+        }
+
+        fn object_name(&mut self, n: &ObjectName) {
+            let parts: Vec<&Ident> = n.0.iter().filter_map(|p| p.as_ident()).collect();
+            self.qualifier(&parts);
+        }
+
+        /// `o.*` in a select list, which is no expression.
+        fn select_items(&mut self, body: &SetExpr) {
+            match body {
+                SetExpr::Select(sel) => {
+                    for item in &sel.projection {
+                        if let SelectItem::QualifiedWildcard(
+                            SelectItemQualifiedWildcardKind::ObjectName(n),
+                            _,
+                        ) = item
+                        {
+                            // `o.*` names the qualifier as the *last* part.
+                            if let Some(id) = n.0.last().and_then(|p| p.as_ident()) {
+                                let at = self.place(id);
+                                self.uses.push(at);
+                            }
+                        }
+                    }
+                }
+                SetExpr::SetOperation { left, right, .. } => {
+                    self.select_items(left);
+                    self.select_items(right);
+                }
+                _ => {}
+            }
+        }
+
+        /// The scopes containing `r`, innermost first.
+        fn chain(&self, r: (usize, usize)) -> Vec<(usize, usize)> {
+            let mut c: Vec<(usize, usize)> = self
+                .scopes
+                .iter()
+                .copied()
+                .filter(|s| s.0 <= r.0 && r.1 <= s.1)
+                .collect();
+            c.sort_by_key(|s| s.1 - s.0);
+            c
+        }
+
+        /// The definition a use names: the innermost scope's alias by that name.
+        fn binding(&self, name: &str, at: (usize, usize)) -> Option<usize> {
+            self.chain(at).into_iter().find_map(|scope| {
+                self.defs
+                    .iter()
+                    .position(|(n, r)| n == name && self.chain(*r).first() == Some(&scope))
+            })
+        }
+    }
+
+    impl Visitor for Walk<'_> {
+        type Break = ();
+
+        fn pre_visit_query(&mut self, q: &Query) -> ControlFlow<()> {
+            self.scopes.push(to_range(self.stmt, self.lo, q.span()));
+            self.select_items(&q.body);
+            ControlFlow::Continue(())
+        }
+
+        fn pre_visit_table_factor(&mut self, t: &TableFactor) -> ControlFlow<()> {
+            if let TableFactor::Table { alias: Some(a), .. }
+            | TableFactor::Derived { alias: Some(a), .. } = t
+            {
+                let at = self.place(&a.name);
+                self.defs.push(at);
+            }
+            ControlFlow::Continue(())
+        }
+
+        fn pre_visit_expr(&mut self, e: &Expr) -> ControlFlow<()> {
+            if let Expr::CompoundIdentifier(parts) = e {
+                let parts: Vec<&Ident> = parts.iter().collect();
+                self.qualifier(&parts);
+            }
+            ControlFlow::Continue(())
+        }
+
+        fn pre_visit_statement(&mut self, s: &Statement) -> ControlFlow<()> {
+            if let Statement::Update(u) = s {
+                for a in &u.assignments {
+                    match &a.target {
+                        AssignmentTarget::ColumnName(n) => self.object_name(n),
+                        AssignmentTarget::Tuple(ns) => ns.iter().for_each(|n| self.object_name(n)),
+                    }
+                }
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    pub(super) fn occurrences(
+        stmt: &str,
+        lo: usize,
+        ast: &Statement,
+        caret: usize,
+    ) -> Option<Vec<(usize, usize)>> {
+        let mut w = Walk {
+            stmt,
+            lo,
+            scopes: vec![(lo, lo + stmt.len())],
+            defs: Vec::new(),
+            uses: Vec::new(),
+        };
+        let _ = ast.visit(&mut w);
+        let on = |r: &(usize, usize)| r.0 <= caret && caret <= r.1;
+        let def = match w.defs.iter().position(|(_, r)| on(r)) {
+            Some(d) => d,
+            None => {
+                let (name, at) = w.uses.iter().find(|(_, r)| on(r))?;
+                w.binding(name, *at)?
+            }
+        };
+        let (name, def_at) = &w.defs[def];
+        let mut out = vec![*def_at];
+        out.extend(
+            w.uses
+                .iter()
+                .filter(|(n, at)| n == name && w.binding(n, *at) == Some(def))
+                .map(|(_, at)| *at),
+        );
+        out.sort_unstable();
+        out.dedup();
+        // The name inside its quotes.
+        let b = (stmt.as_bytes(), lo);
+        Some(
+            out.into_iter()
+                .map(|(s, e)| {
+                    let quoted = e - s >= 2 && matches!(b.0.get(s - b.1), Some(b'"' | b'`' | b'['));
+                    if quoted { (s + 1, e - 1) } else { (s, e) }
+                })
+                .collect(),
+        )
+    }
+}
+
 /// Warnings about a statement that parses and almost certainly does not do
 /// what was meant, placed by the AST's spans ([`colres::to_range`]). Run on
 /// every clean parse of a unit (`unit_diagnostics`), the typing tail included,
@@ -23781,6 +23982,103 @@ mod tests {
                 "false positive: {sql}"
             );
         }
+    }
+
+    /// `alias_occurrences` at the `|`, as the texts it would select.
+    fn alias_hits(sql: &str, dialect: SqlDialect) -> Option<Vec<String>> {
+        let caret = sql.find('|').unwrap();
+        let sql = sql.replace('|', "");
+        alias_occurrences(&sql, caret, dialect).map(|v| {
+            v.iter()
+                .map(|&(a, b)| format!("{}@{a}", &sql[a..b]))
+                .collect()
+        })
+    }
+
+    #[test]
+    fn an_alias_is_found_with_every_reference_to_it() {
+        let want = Some(vec![
+            "o@7".to_string(),
+            "o@13".to_string(),
+            "o@33".to_string(),
+            "o@41".to_string(),
+        ]);
+        // From its definition and from any reference.
+        for sql in [
+            "SELECT o.id, o.total FROM orders o| WHERE o.id = 1",
+            "SELECT o|.id, o.total FROM orders o WHERE o.id = 1",
+            "SELECT o.id, o.total FROM orders |o WHERE o.id = 1",
+        ] {
+            assert_eq!(alias_hits(sql, SqlDialect::MySql), want, "{sql}");
+        }
+    }
+
+    #[test]
+    fn an_alias_is_bound_by_its_own_query() {
+        // The inner `o` shadows the outer one inside the subquery.
+        let sql = "SELECT o.id FROM orders o| WHERE EXISTS (SELECT 1 FROM items o WHERE o.x = 1)";
+        assert_eq!(
+            alias_hits(sql, SqlDialect::Postgres),
+            Some(vec!["o@7".to_string(), "o@24".to_string()])
+        );
+        let sql = "SELECT o.id FROM orders o WHERE EXISTS (SELECT 1 FROM items o WHERE o|.x = 1)";
+        assert_eq!(
+            alias_hits(sql, SqlDialect::Postgres),
+            Some(vec!["o@60".to_string(), "o@68".to_string()])
+        );
+        // A correlated reference reaches the outer one.
+        let sql =
+            "SELECT 1 FROM orders o| WHERE EXISTS (SELECT 1 FROM items i WHERE i.order_id = o.id)";
+        assert_eq!(
+            alias_hits(sql, SqlDialect::Postgres),
+            Some(vec!["o@21".to_string(), "o@78".to_string()])
+        );
+    }
+
+    #[test]
+    fn an_alias_is_found_in_a_star_an_update_and_quotes() {
+        assert_eq!(
+            alias_hits("SELECT o.* FROM orders o|", SqlDialect::MySql),
+            Some(vec!["o@7".to_string(), "o@23".to_string()])
+        );
+        assert_eq!(
+            alias_hits(
+                "UPDATE employees e| SET e.salary = 1 WHERE e.id = 2",
+                SqlDialect::MySql
+            ),
+            Some(vec![
+                "e@17".to_string(),
+                "e@23".to_string(),
+                "e@42".to_string()
+            ])
+        );
+        // The quotes stay; the name inside them is what is selected.
+        assert_eq!(
+            alias_hits("SELECT \"o\".id FROM orders \"o|\"", SqlDialect::Postgres),
+            Some(vec!["o@8".to_string(), "o@27".to_string()])
+        );
+    }
+
+    #[test]
+    fn no_alias_where_the_caret_is_not_on_one() {
+        for sql in [
+            // A table's own name, a column, a keyword.
+            "SELECT orders|.id FROM orders",
+            "SELECT o.id| FROM orders o",
+            "SEL|ECT o.id FROM orders o",
+            // A statement that does not parse.
+            "SELECT o.id FROM orders o| WHERE",
+        ] {
+            assert_eq!(alias_hits(sql, SqlDialect::MySql), None, "{sql}");
+        }
+        // Only the statement the caret is in.
+        assert_eq!(
+            alias_hits(
+                "SELECT o.id FROM orders o;\nSELECT o.id FROM orders o|",
+                SqlDialect::MySql
+            ),
+            Some(vec!["o@34".to_string(), "o@51".to_string()])
+        );
     }
 
     /// The text under every column diagnostic in `sql` (not found, ambiguous).

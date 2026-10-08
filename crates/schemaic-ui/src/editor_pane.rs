@@ -29,7 +29,7 @@ use floem::views::editor::core::command::EditCommand;
 use floem::views::editor::core::cursor::CursorAffinity;
 use floem::views::editor::core::editor::EditType;
 use floem::views::editor::core::indent::IndentStyle;
-use floem::views::editor::core::selection::Selection;
+use floem::views::editor::core::selection::{SelRegion, Selection};
 use floem::views::editor::gutter::GutterClass;
 use floem::views::editor::keypress::default_key_handler;
 use floem::views::editor::keypress::key::KeyInput;
@@ -4181,6 +4181,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             let ed_one_line = ed_fmt.clone();
             let ed_one_line_edit = ed_fmt.clone();
             let ed_stmt_format = ed_fmt.clone();
+            let ed_rename = ed_fmt.clone();
             let make_view = create_view.clone();
             // "AI fix" — offered only over a statement the editor has something
             // to say about, which is what the user is pointing at when they
@@ -4442,6 +4443,32 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                         }
                     }),
                 );
+            }
+            // "Rename alias": over a table alias or a qualifier naming one,
+            // every place it is written (`intel::alias_occurrences`, bound
+            // the way the server binds it) becomes one selection, a caret
+            // per name, so what is typed next renames them together.
+            let alias_at = move || {
+                query.with_untracked(|sql| {
+                    intel::alias_occurrences(
+                        sql,
+                        menu_offset.get_untracked(),
+                        dialect.get_untracked(),
+                    )
+                })
+            };
+            if alias_at().is_some() {
+                let ed = ed_rename.clone();
+                entries.push(MenuEntry::action("Rename alias", move || {
+                    let Some(ranges) = alias_at() else {
+                        return;
+                    };
+                    let mut sel = Selection::new();
+                    for (a, b) in ranges {
+                        sel.add_region(SelRegion::new(a, b, None));
+                    }
+                    ed.cursor.update(|c| c.set_insert(sel));
+                }));
             }
             // First when it's there: over a squiggle it is the most specific
             // thing this menu can offer, and the one the user came for.

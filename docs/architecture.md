@@ -2406,6 +2406,23 @@ existing prose was left alone.
     `join_target_guess` passes `join_targets_for` no taken names and stays unaliased
     (`a_table_alias_is_written_at_a_from_or_join_slot`, `no_table_alias_outside_a_query_table_slot`,
     `a_join_target_carries_its_aliased_form`).
+    **`alias_occurrences` is *Rename alias*'s answer**: the table alias under the caret — its
+    definition or any qualifier naming it — and every other place it is written in the statement
+    there, sorted. It reads the AST rather than the text because binding is the whole question: a
+    qualifier names the alias of the *innermost* query that defines one by that name, so a
+    subquery's own `o` shadows the outer one inside it while a correlated `o.id` reaches out — a
+    distinction a search for `o.` cannot make. The `alias_refs` walk takes every `Query` span as a
+    scope, with the statement's own range outermost (an `UPDATE`'s alias belongs to no query). A
+    definition is a `TableFactor::Table` or `Derived` alias, scoped by the innermost query containing
+    its *ident*, so a derived table's alias belongs to the query it is joined into, not to its own
+    body. A use is the qualifier of a `CompoundIdentifier`, an `o.*` (no expression, so read off the
+    select list in `pre_visit_query`) or an `UPDATE`'s `SET o.x` target (`pre_visit_statement`). A
+    quoted name's range is the name inside its quotes, which stay. It is `None` where the text at the
+    caret does not parse to exactly one statement, or the caret is on no alias — a qualifier that is
+    a table's own name or a CTE's binds to no definition, and a select-list `AS` is not one, so none
+    of those is offered (`an_alias_is_found_with_every_reference_to_it`,
+    `an_alias_is_bound_by_its_own_query`, `an_alias_is_found_in_a_star_an_update_and_quotes`,
+    `no_alias_where_the_caret_is_not_on_one`).
     **A `(` is filled from the schema only where the schema names one answer.** `paren_contents`,
     asked right after `insert_columns`, answers three openers through the same `column_list`.
     `REFERENCES t (` gets `t`'s primary key from `Catalog::key_columns_of` — its columns in the
@@ -23846,6 +23863,13 @@ existing prose was left alone.
     formats is asked — and the same `sqlfmt` answer and `rewrite_range`. **The menu entries wear no
     keycap on purpose**: they act on the statement under the click, the key on the one at the caret,
     so a keycap would claim the key does what the click does.
+    ***Rename alias*** is offered where `intel::alias_occurrences` answers at the right-click —
+    absent otherwise, and re-derived when clicked, like the rest — and is appended after the entries
+    above, ahead of *Create view*'s group. It opens no modal and has no key: it sets the cursor to a
+    `Selection` of one `SelRegion` per occurrence, so the next word typed replaces every one at once.
+    That leans on multi-region editing, which not every editing path here survives yet — Backspace
+    and an auto-paired `(` among them — so a rename is clean when it is typed straight over the
+    selection and not otherwise.
     **The Ctrl+K suggestion is not drawn here** — it is phantom rows in the editor's own line flow
     (`inline_diff`, below), and what `cmdk_popup` still draws is the two ends of the block: the
     question bar (sparkle, a `multiline` `edit_field` capped at three rows, then a send affordance or
