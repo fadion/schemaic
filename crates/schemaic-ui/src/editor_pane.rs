@@ -1367,7 +1367,27 @@ fn params_bar(
     // Rows follow the **names**, not the values. A memo over the values would
     // rebuild the row being typed into on every keystroke, and floem takes the
     // focus and the caret with a rebuilt view.
-    let names = create_memo(move |_| query.with(|q| params::names(q, dialect.get())));
+    //
+    // **Read once typing settles**, not per keystroke: `params::names` scans the
+    // whole document (20 ms at 8 MiB, release), and a placeholder appearing a
+    // moment after it is typed costs nothing. Set only when the names change.
+    let names = RwSignal::new(query.with_untracked(|q| params::names(q, dialect.get_untracked())));
+    let names_gen = RwSignal::new(0u64);
+    create_effect(move |_| {
+        query.track();
+        let dia = dialect.get();
+        let g = names_gen.get_untracked().wrapping_add(1);
+        names_gen.set(g);
+        floem::action::exec_after(std::time::Duration::from_millis(150), move |_| {
+            if names_gen.try_get_untracked() != Some(g) {
+                return;
+            }
+            let found = query.with_untracked(|q| params::names(q, dia));
+            if names.with_untracked(|n| n != &found) {
+                names.set(found);
+            }
+        });
+    });
     let list = dyn_stack(
         move || names.get(),
         |name: &String| name.clone(),

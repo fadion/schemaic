@@ -12863,7 +12863,10 @@ existing prose was left alone.
     `ParamValue` has no `Serialize` derive), `editor_pane::params_bar` renders one row per distinct
     name under the editor, and `guarded_run`/`guarded_run_all` in `schemaic-app` substitute with it.
     Rows are keyed by **name**, not value, so typing into a field never rebuilds the field being
-    typed into. **Tier-2 live validation is skipped for a statement holding a placeholder**, and
+    typed into. **The names are read once typing settles** (150 ms, a generation retiring the
+    asks it overtook), not per keystroke: `params::names` scans the whole document, measured 9.7 /
+    20 ms at 4 / 8 MiB (release) — more than every other per-keystroke pass together — and is set
+    only when the names change. **Tier-2 live validation is skipped for a statement holding a placeholder**, and
     `intel::parses` does not cover that: `sqlparser` accepts `:id` as a placeholder in all three
     dialects, so the statement parses, the round-trip happens, and the squiggle is the *server*
     complaining about text the user is still filling in. A placeholder in an identifier position

@@ -732,17 +732,12 @@ pub fn line_col_of_offset(text: &str, offset: usize) -> (usize, usize) {
     while end > 0 && !text.is_char_boundary(end) {
         end -= 1;
     }
-    let mut line = 1usize;
-    let mut col = 1usize;
-    for ch in text[..end].chars() {
-        if ch == '\n' {
-            line += 1;
-            col = 1;
-        } else {
-            col += 1;
-        }
-    }
-    (line, col)
+    // The lines eight bytes at a time, and the column over the last line only:
+    // the status bar asks this on every caret move.
+    let before = &text[..end];
+    let line = crate::text::count_newlines(before.as_bytes()) + 1;
+    let line_start = before.rfind('\n').map_or(0, |p| p + 1);
+    (line, before[line_start..].chars().count() + 1)
 }
 
 /// A single text replacement plus the selection to apply afterward — the result

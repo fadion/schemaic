@@ -292,7 +292,7 @@ impl SqlStyling {
             let held = cache.take();
             let since = Self::since(log, held.as_ref().map(|(k, _, _)| *k), dialect);
             let carries = self.with_text(text, |t| {
-                let lines = schemaic_core::text::count_newlines(t.as_bytes()) + 1;
+                // The rope's own count, above, rather than another scan.
                 match (since, held) {
                     (schemaic_core::text::Since::Edit { pre, suf }, Some((_, _, prev)))
                         if pre + suf <= t.len() =>
@@ -332,23 +332,20 @@ impl SqlStyling {
                 if cache.as_ref().map(|(k, _, d)| (*k, d.depth.len())) != Some((key, lines)) {
                     let held = cache.take();
                     let since = Self::since(log, held.as_ref().map(|(k, _, _)| *k), dialect);
-                    let depths = self.with_text(text, |t| {
-                        let lines = schemaic_core::text::count_newlines(t.as_bytes()) + 1;
-                        match (since, held) {
-                            (schemaic_core::text::Since::Edit { pre, suf }, Some((_, _, prev)))
-                                if pre + suf <= t.len() =>
-                            {
-                                let out = schemaic_core::pairs::line_depths_after_edit(
-                                    &prev, t, pre, suf, dialect,
-                                );
-                                if out.depth.len() == lines {
-                                    out
-                                } else {
-                                    schemaic_core::pairs::line_depths(t, dialect)
-                                }
+                    let depths = self.with_text(text, |t| match (since, held) {
+                        (schemaic_core::text::Since::Edit { pre, suf }, Some((_, _, prev)))
+                            if pre + suf <= t.len() =>
+                        {
+                            let out = schemaic_core::pairs::line_depths_after_edit(
+                                &prev, t, pre, suf, dialect,
+                            );
+                            if out.depth.len() == lines {
+                                out
+                            } else {
+                                schemaic_core::pairs::line_depths(t, dialect)
                             }
-                            _ => schemaic_core::pairs::line_depths(t, dialect),
                         }
+                        _ => schemaic_core::pairs::line_depths(t, dialect),
                     });
                     *cache = Some((key, String::new(), depths));
                 }
