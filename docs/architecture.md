@@ -1842,8 +1842,11 @@ existing prose was left alone.
     a red squiggle on valid SQL; an unknown column is still found. `pre_visit_expr` passes an
     unquoted `DEFAULT`, which sqlparser reads in `SET x = DEFAULT` as a name. `insert_columns`
     resolves an `INSERT`'s column list against `named_source` — `add_source`'s table-name arm,
-    extracted — so a table not loaded or not known stays silent. Every other statement, and the
-    `SELECT` of an `INSERT … SELECT`, still takes only the flat qualified scan
+    extracted — so a table not loaded or not known stays silent. An `INSERT … SELECT`'s query goes
+    through the resolver too, its scopes the query's own; the upsert clauses outside it
+    (`ON DUPLICATE KEY UPDATE`, `ON CONFLICT … DO UPDATE`) resolve against no scope and keep the
+    flat qualified scan, and a name both report is one diagnostic by `dedup_diagnostics`
+    (`an_insert_selects_columns_are_checked`). Every other statement takes the flat scan only
     (`an_unknown_bare_column_in_an_update_or_delete_is_flagged`,
     `a_valid_update_or_delete_draws_no_column_flag`, `an_unknown_column_in_an_insert_list_is_flagged`).
     **`dedup_diagnostics` is the last gate every offline diagnostic passes, and it had no test.** It

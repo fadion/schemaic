@@ -7678,14 +7678,18 @@ fn unit_diagnostics(
                     | sqlparser::ast::Statement::Update(_)
                     | sqlparser::ast::Statement::Delete(_)),
                 ] => colres::check(text, tlo, thi, catalog, dialect, ast, &mut found),
-                // Other statements (INSERT/…), and a condition, → the flat
-                // qualified scan; an INSERT's column list besides.
-                _ => {
-                    if let [ast] = asts.as_slice() {
-                        colres::insert_columns(text, tlo, thi, catalog, dialect, ast, &mut found);
-                    }
+                // An INSERT: its column list, its `SELECT` through the
+                // resolver (whose scopes are the query's own, so the upsert
+                // clauses outside it resolve against nothing), and the flat
+                // qualified scan for those clauses — what both report on one
+                // name is one diagnostic by `dedup_diagnostics`.
+                [ast @ sqlparser::ast::Statement::Insert(_)] => {
+                    colres::insert_columns(text, tlo, thi, catalog, dialect, ast, &mut found);
+                    colres::check(text, tlo, thi, catalog, dialect, ast, &mut found);
                     qualified_column_checks(text, tlo, thi, catalog, dialect, &mut found)
                 }
+                // Other statements, and a condition, → the flat qualified scan.
+                _ => qualified_column_checks(text, tlo, thi, catalog, dialect, &mut found),
             }
         }
         // Don't nag about the fragment the user is still typing, nor about a
@@ -24364,6 +24368,51 @@ mod tests {
             for &d in dialects {
                 assert_eq!(column_flags(sql, d), vec![want.to_string()], "{d:?}: {sql}");
             }
+        }
+    }
+
+    #[test]
+    fn an_insert_selects_columns_are_checked() {
+        for d in [
+            SqlDialect::MySql,
+            SqlDialect::Postgres,
+            SqlDialect::Sqlite,
+            SqlDialect::MsSql,
+        ] {
+            assert_eq!(
+                column_flags("INSERT INTO employees (id) SELECT nme FROM departments", d),
+                vec!["nme".to_string()],
+                "{d:?}"
+            );
+            // Qualified, once — not again by the flat scan.
+            assert_eq!(
+                column_flags(
+                    "INSERT INTO employees (id) SELECT d.nme FROM departments d",
+                    d
+                ),
+                vec!["nme".to_string()],
+                "{d:?}"
+            );
+            for ok in [
+                "INSERT INTO employees (id, name) SELECT id, name FROM departments",
+                "INSERT INTO employees (id) SELECT d.id FROM departments d WHERE d.name = 'x'",
+                "INSERT INTO employees (id) VALUES (1)",
+            ] {
+                assert!(column_flags(ok, d).is_empty(), "{d:?}: {ok}");
+            }
+        }
+        // The upsert clauses read the target and the proposed row.
+        for (ok, d) in [
+            (
+                "INSERT INTO employees (id) VALUES (1) ON DUPLICATE KEY UPDATE salary = VALUES(salary)",
+                SqlDialect::MySql,
+            ),
+            (
+                "INSERT INTO employees (id) VALUES (1) ON CONFLICT (id) DO UPDATE SET salary = excluded.salary",
+                SqlDialect::Postgres,
+            ),
+        ] {
+            assert!(column_flags(ok, d).is_empty(), "{d:?}: {ok}");
         }
     }
 
