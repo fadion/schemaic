@@ -860,8 +860,9 @@ existing prose was left alone.
   - `intel.rs` — the **SQL intelligence** layer (structure-aware, dialect-pluggable). Parses a
     *complete* statement with a real per-dialect AST (`sqlparser`; `SqlDialect` seam — MySQL,
     PostgreSQL and SQLite all wired) and answers what a token stream can't: `statement_scope`
-    (tables/aliases/CTEs/derived-tables in scope, AST-backed with a `skip_noncode` lexer fallback for
-    mid-edit, and a trigger's `NEW`/`OLD` as its table — below), `clause_context`/`clause_continuation` (caret context + expected-token model for
+    (the tables and aliases of every query around the caret and the statement's CTE names,
+    AST-backed with a `skip_noncode` lexer fallback for mid-edit, and a trigger's `NEW`/`OLD` as
+    its table — below), `clause_context`/`clause_continuation` (caret context + expected-token model for
     completion), and `diagnostics` → `Vec<Diagnostic>` (catalog-aware unknown-table, unknown-column via
     the per-scope resolver `colres` — qualified *and* unqualified, in a query, `UPDATE` or `DELETE`
     (`write_scope`, below), across subqueries/derived-tables/CTEs
@@ -1442,6 +1443,28 @@ existing prose was left alone.
     is not it. SQL Server's upsert is a `MERGE`, whose source is an ordinary reference, so it gets
     none (`an_upserts_proposed_row_is_its_targets_row`, red before). The `[db.]table` reading the
     two share is `table_name_at`.
+    **The parsed scope is the queries around the caret, not the statement.** `statement_scope`'s
+    parsed arm is `ast_scope::collect_at`: a visitor records every `Query` as a frame — its span
+    as buffer offsets (`colres::to_range`) and its *own* `FROM` tables, joins and nested joins
+    included but not a derived table's inside, which is that table's own frame — under a root
+    frame spanning the statement that holds the statement's own tables (an `INSERT`'s target, an
+    `UPDATE`'s target, joins and `FROM`, a `DELETE`'s `FROM` and `USING`). The scope is every frame
+    whose span holds the caret, **widest first**, so the innermost query's tables come last, where
+    completion's last-table bias wants them; reorder that sort and the bias points at the outer
+    query.
+    It was the union of every table in the statement, kept as "the safe direction": a subquery's
+    tables were offered in the outer `WHERE`, a CTE body's or derived table's inner table in the
+    outer select list, and `expand_star` over `(SELECT id FROM events) d` emitted every column of
+    `events`, which `d` does not expose — while `UPDATE … FROM` and `DELETE … USING` tables were
+    not read at all. Now a subquery in a `WHERE`, a select list or a `HAVING` contributes its
+    tables only with the caret inside it, and a CTE's or derived table's columns reach the outer
+    query through `local_relations` instead (`the_parsed_scope_is_the_queries_around_the_caret`,
+    `the_parsed_scope_reads_an_update_from_and_a_delete_using`;
+    `scope_resolves_cte_names_and_inner_tables` and `scope_recurses_into_derived_table` had pinned
+    the union and were rewritten). Every CTE name
+    is still kept. `ast_scope::collect_statement`, the flat walk, stays for the table check's CTE
+    set, which wants the whole statement's; the lexer fallback for a statement that does not parse
+    is unchanged.
     The error's remedy
     names the engine's quote (backticks, double quotes, brackets); it said "backticks" on every
     engine, advice neither PostgreSQL nor SQL Server accepts
@@ -2387,7 +2410,8 @@ existing prose was left alone.
     **The tables these producers pair are the caret's own query's** — `on_condition_guess`,
     `join_target_guess`, `join_on_guess` and the `USING (` arm all read `query_scope`, as do the
     popup's `join_condition` and `join_targets`, where
-    `statement_scope` reads the whole statement: from `local_scope_start`, at the last `SELECT` at
+    `statement_scope` reads every query around the caret and the statement's own target with
+    them: from `local_scope_start`, at the last `SELECT` at
     that depth (a set operation's last arm, the query after an `INSERT … `). The whole statement
     held an `INSERT`'s target beside the `SELECT` feeding it, and an `UPDATE`'s beside a subquery
     in its `SET`, so a key from the joined table to that target produced `invoices.customer_id =
@@ -13458,8 +13482,8 @@ existing prose was left alone.
       `LocalNames::relations`: `cols_of` asks them first for a bare name, since a CTE shadows a
       table it is named after, and the schema otherwise. The caller reads them with
       `intel::local_relations` at a column or qualified slot, and adds each derived table's alias
-      to the scope, which reads through a derived table to the tables inside and holds no
-      reference for it. `local_relations` finds them by the lexer — `WITH name [(cols)] AS [[NOT]
+      to the scope, which holds no reference for one — the tables inside are its own query's,
+      in scope only with the caret inside it. `local_relations` finds them by the lexer — `WITH name [(cols)] AS [[NOT]
       MATERIALIZED] (…)`, and a `(SELECT …)` after `FROM`, `JOIN`, `LATERAL` or a list's comma
       followed by its alias — because the statement being written does not parse whole; each
       **body** is parsed alone, and the one still being typed gives nothing. Its columns are a

@@ -4822,10 +4822,11 @@ fn lexer_scope(
 ///
 /// Uses the real AST when the statement parses (robust alias/CTE/`db.table`/
 /// derived-table resolution the paren hack got wrong); falls back to the
-/// byte-position lexer scope when it doesn't (mid-edit). AST resolution returns
-/// the union of table refs across the statement — a superset is the safe
-/// direction for both completion (extra candidates rank low) and diagnostics
-/// (never a false "unknown column").
+/// byte-position lexer scope when it doesn't (mid-edit). AST resolution reads
+/// the queries **around the caret** (`ast_scope::collect_at`), outermost first,
+/// with the statement's own write targets: a subquery's tables only with the
+/// caret inside it, and a derived table's or CTE body's inner tables only
+/// there too — outside, their columns come through `local_relations`.
 pub fn statement_scope(
     sql: &str,
     lo: usize,
@@ -4837,7 +4838,7 @@ pub fn statement_scope(
     let parsed = match sqlparser::parser::Parser::parse_sql(&*dialect.parser(), stmt) {
         Ok(mut asts) if asts.len() == 1 => {
             let mut scope = Scope::default();
-            ast_scope::collect_statement(&asts.pop().unwrap(), &mut scope);
+            ast_scope::collect_at(&asts.pop().unwrap(), stmt, lo, caret, &mut scope);
             Some(scope).filter(|s| !s.tables.is_empty() || !s.ctes.is_empty())
         }
         _ => None,
@@ -4973,13 +4974,135 @@ fn upsert_row_alias(toks: &[Token], dialect: SqlDialect) -> Option<TableRef> {
     })
 }
 
-/// AST-walk helpers: collect the table refs + CTE names from a parsed statement.
-/// Recurses into subqueries/CTE bodies (union of all refs).
+/// AST-walk helpers: collect the table refs + CTE names from a parsed statement —
+/// those around a caret ([`ast_scope::collect_at`], completion's), or the union
+/// of every query's ([`ast_scope::collect_statement`], the table check's CTEs).
 mod ast_scope {
     use super::{Scope, TableRef};
     use sqlparser::ast::{
         Cte, FromTable, Query, Select, SetExpr, Statement, TableFactor, TableObject, TableWithJoins,
     };
+
+    /// The scope **at `caret`**: the tables of every query whose span holds it,
+    /// outermost first — so the innermost query's come last, where completion's
+    /// "last table" bias wants them — after the statement's own (an `INSERT`'s
+    /// target, an `UPDATE`'s target and `FROM`, a `DELETE`'s `FROM` and
+    /// `USING`). A query is any the statement holds: a subquery in a `WHERE`,
+    /// a select list or a `HAVING` as much as a derived table, whose inner
+    /// tables are its own query's and not the outer one's. Every CTE name is
+    /// kept, as [`collect_statement`] keeps them.
+    ///
+    /// `text` is the statement and `lo` its offset, so spans become buffer
+    /// offsets ([`super::colres::to_range`]).
+    pub(super) fn collect_at(
+        stmt: &Statement,
+        text: &str,
+        lo: usize,
+        caret: usize,
+        out: &mut Scope,
+    ) {
+        use sqlparser::ast::{Spanned, Visit, Visitor};
+        use std::ops::ControlFlow;
+        struct Walk<'a> {
+            text: &'a str,
+            lo: usize,
+            frames: Vec<((usize, usize), Vec<TableRef>)>,
+            ctes: Vec<String>,
+        }
+        impl Visitor for Walk<'_> {
+            type Break = ();
+            fn pre_visit_query(&mut self, q: &Query) -> ControlFlow<()> {
+                if let Some(with) = &q.with {
+                    self.ctes
+                        .extend(with.cte_tables.iter().map(|c| c.alias.name.value.clone()));
+                }
+                let mut tables = Vec::new();
+                own_setexpr(&q.body, &mut tables);
+                let range = super::colres::to_range(self.text, self.lo, q.span());
+                self.frames.push((range, tables));
+                ControlFlow::Continue(())
+            }
+        }
+        let mut root = Vec::new();
+        match stmt {
+            Statement::Insert(insert) => {
+                if let TableObject::TableName(name) = &insert.table
+                    && let Some(r) = table_ref_of(name, None)
+                {
+                    root.push(r);
+                }
+            }
+            Statement::Update(u) => {
+                own_twj(&u.table, &mut root);
+                if let Some(
+                    sqlparser::ast::UpdateTableFromKind::BeforeSet(f)
+                    | sqlparser::ast::UpdateTableFromKind::AfterSet(f),
+                ) = &u.from
+                {
+                    f.iter().for_each(|t| own_twj(t, &mut root));
+                }
+            }
+            Statement::Delete(del) => {
+                let (FromTable::WithFromKeyword(v) | FromTable::WithoutKeyword(v)) = &del.from;
+                v.iter()
+                    .chain(del.using.iter().flatten())
+                    .for_each(|t| own_twj(t, &mut root));
+            }
+            _ => {}
+        }
+        let mut w = Walk {
+            text,
+            lo,
+            frames: vec![((lo, lo + text.len()), root)],
+            ctes: Vec::new(),
+        };
+        let _ = stmt.visit(&mut w);
+        let mut around: Vec<_> = w
+            .frames
+            .into_iter()
+            .filter(|((a, b), _)| *a <= caret && caret <= *b)
+            .collect();
+        // Outermost first; the statement's own frame is the widest.
+        around.sort_by_key(|((a, b), _)| std::cmp::Reverse(b - a));
+        for (_, tables) in around {
+            for r in tables {
+                push_ref(r, out);
+            }
+        }
+        out.ctes.extend(w.ctes);
+    }
+
+    /// A query body's own tables: each leaf `SELECT`'s `FROM`, a derived
+    /// table's inside left to its own query.
+    fn own_setexpr(body: &SetExpr, out: &mut Vec<TableRef>) {
+        match body {
+            SetExpr::Select(sel) => sel.from.iter().for_each(|t| own_twj(t, out)),
+            SetExpr::SetOperation { left, right, .. } => {
+                own_setexpr(left, out);
+                own_setexpr(right, out);
+            }
+            _ => {}
+        }
+    }
+
+    fn own_twj(twj: &TableWithJoins, out: &mut Vec<TableRef>) {
+        std::iter::once(&twj.relation)
+            .chain(twj.joins.iter().map(|j| &j.relation))
+            .for_each(|f| own_factor(f, out));
+    }
+
+    fn own_factor(factor: &TableFactor, out: &mut Vec<TableRef>) {
+        match factor {
+            TableFactor::Table { name, alias, .. } => {
+                let alias = alias.as_ref().map(|a| a.name.value.clone());
+                out.extend(table_ref_of(name, alias));
+            }
+            TableFactor::NestedJoin {
+                table_with_joins, ..
+            } => own_twj(table_with_joins, out),
+            _ => {}
+        }
+    }
 
     pub(super) fn collect_statement(stmt: &Statement, out: &mut Scope) {
         match stmt {
@@ -20978,17 +21101,25 @@ mod tests {
 
     #[test]
     fn scope_resolves_cte_names_and_inner_tables() {
-        // The CTE name is recorded; the real table inside its body resolves too.
+        // The CTE name is recorded. The real table inside its body is the
+        // body's: in scope with the caret there, not in the outer query,
+        // whose `recent.` reads the CTE's own columns (`local_relations`).
         let s = scope("WITH recent AS (SELECT * FROM orders) SELECT * FROM recent");
         assert!(s.ctes.iter().any(|c| c == "recent"));
+        assert!(!s.tables.iter().any(|t| t.name == "orders"));
+        let sql = "WITH recent AS (SELECT * FROM orders) SELECT * FROM recent";
+        let s = statement_scope(sql, 0, sql.len(), 20, SqlDialect::MySql);
         assert!(s.tables.iter().any(|t| t.name == "orders"));
     }
 
     #[test]
     fn scope_recurses_into_derived_table() {
-        // The paren-hack over-scoped derived tables; the AST resolves the inner
-        // real table (`events`) while not inventing a catalog table for `d`.
-        let s = scope("SELECT * FROM (SELECT id FROM events) d");
+        // A derived table's inner table is its own query's — the outer query
+        // sees `d`, whose columns are its select list's (`local_relations`),
+        // and never invents a catalogue table for it.
+        let sql = "SELECT * FROM (SELECT id FROM events) d";
+        assert!(names(&scope(sql)).is_empty());
+        let s = statement_scope(sql, 0, sql.len(), 24, SqlDialect::MySql);
         assert_eq!(names(&s), vec!["events"]);
     }
 
@@ -28611,6 +28742,18 @@ mod tests {
     }
 
     #[test]
+    fn a_star_over_a_derived_table_is_not_its_inner_tables_columns() {
+        // `d` exposes `id` alone; `employees`' other columns are not its.
+        let sql = "SELECT * FROM (SELECT id FROM employees) d";
+        let got = expand(sql, 8);
+        assert!(
+            got.as_ref()
+                .is_none_or(|e| !e.replacement.contains("salary")),
+            "{got:?}"
+        );
+    }
+
+    #[test]
     fn expand_star_single_table_unqualified() {
         let sql = "SELECT * FROM employees";
         let e = expand(sql, 8).unwrap(); // caret right after `*`
@@ -29183,6 +29326,74 @@ mod tests {
         // A real table, and an engine with no `#` tables.
         assert!(got("CREATE TABLE work (id int)", SqlDialect::MsSql).is_empty());
         assert!(got("CREATE TABLE #work (id int)", SqlDialect::Postgres).is_empty());
+    }
+
+    /// The parsed scope's table names at the `|`.
+    fn scope_at(sql: &str, d: SqlDialect) -> Vec<String> {
+        let caret = sql.find('|').unwrap();
+        let sql = sql.replace('|', "");
+        statement_scope(&sql, 0, sql.len(), caret, d)
+            .tables
+            .into_iter()
+            .map(|t| t.name)
+            .collect()
+    }
+
+    #[test]
+    fn the_parsed_scope_is_the_queries_around_the_caret() {
+        let my = SqlDialect::MySql;
+        // In a WHERE subquery: its table last, after the outer one's.
+        assert_eq!(
+            scope_at("SELECT * FROM a WHERE x IN (SELECT y| FROM b)", my),
+            ["a", "b"]
+        );
+        // Outside it: the outer query's alone.
+        assert_eq!(
+            scope_at("SELECT * FROM a WHERE x| IN (SELECT y FROM b)", my),
+            ["a"]
+        );
+        // A select list's and a HAVING's subquery too.
+        assert_eq!(
+            scope_at("SELECT (SELECT max(z|) FROM c) FROM a", my),
+            ["a", "c"]
+        );
+        assert_eq!(
+            scope_at(
+                "SELECT k FROM a GROUP BY k HAVING k > (SELECT min(z|) FROM c)",
+                my
+            ),
+            ["a", "c"]
+        );
+        // A derived table's inner table is its own query's, not the outer one's.
+        assert_eq!(
+            scope_at(
+                "SELECT x| FROM (SELECT x FROM inner_t) d JOIN a ON true",
+                my
+            ),
+            ["a"]
+        );
+        assert_eq!(
+            scope_at("SELECT x FROM (SELECT x| FROM inner_t) d", my),
+            ["inner_t"]
+        );
+    }
+
+    #[test]
+    fn the_parsed_scope_reads_an_update_from_and_a_delete_using() {
+        let pg = SqlDialect::Postgres;
+        assert_eq!(
+            scope_at("UPDATE a SET x = 1 FROM b WHERE a.id = b.id AND y| > 0", pg),
+            ["a", "b"]
+        );
+        assert_eq!(
+            scope_at("DELETE FROM a USING b WHERE a.id = b.id AND y| > 0", pg),
+            ["a", "b"]
+        );
+        // A subquery in the write's WHERE sees the write's tables.
+        assert_eq!(
+            scope_at("DELETE FROM a WHERE id IN (SELECT a_id| FROM b)", pg),
+            ["a", "b"]
+        );
     }
 
     #[test]

@@ -1170,7 +1170,8 @@ pub(crate) fn recompute_completions(
     let mut scope = intel::statement_scope(&text, lo, hi, offset, dialect).tables;
     // The statement's own CTEs and derived tables, where a column goes: their
     // columns are in no catalogue. A derived table's alias is in no scope
-    // either (the scope reads through it to the tables inside), so it joins.
+    // either (the scope holds the tables inside only for a caret inside it),
+    // so it joins.
     let mut relations = if matches!(ctx, ClauseCtx::Column | ClauseCtx::Qualified(_)) {
         intel::local_relations(&text, lo, hi, dialect)
     } else {
