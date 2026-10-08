@@ -15602,24 +15602,45 @@ impl Recall {
         } else {
             std::borrow::Cow::Borrowed(text)
         };
-        crate::sql::statement_ranges(&text, self.dialect)
-            .into_iter()
-            .find_map(|(a, b)| {
-                let stmt = skip_leading_noncode(&text[a..b], self.dialect);
-                let more = strip_prefix_loose(stmt, &self.typed, self.dialect)?;
-                // `history::push` keeps these out of the history; a tab or a
-                // snippet holds whatever was typed into it.
-                if crate::sql::carries_credential(stmt, self.dialect) {
-                    return None;
-                }
-                let mut line = first_code_line(more, self.dialect)?.trim_end();
-                if self.followed {
-                    line = before_line_comment(line, self.dialect).trim_end();
-                }
-                let line = line.strip_suffix(';').unwrap_or(line).trim_end();
-                let line = line.strip_suffix(self.closers.as_str())?.trim_end();
-                (!line.is_empty()).then(|| line.to_string())
-            })
+        self.find_in(&text, &crate::sql::statement_ranges(&text, self.dialect))
+    }
+
+    /// [`Recall::from`] over a text whose statements are already known —
+    /// the caret's own tab, whose ranges the editor's
+    /// [`crate::sql::StatementIndex`] holds — so it is not lexed again on a
+    /// keystroke. `ranges` are [`crate::sql::statement_ranges`]' of `text`. A
+    /// text holding `\r` is read through [`Recall::from`], whose offsets are
+    /// those of the text with its line endings normalised.
+    pub fn from_ranges(&self, text: &str, ranges: &[(usize, usize)]) -> Option<String> {
+        if text.contains('\r') {
+            return self.from(text);
+        }
+        if text.len() > RECALL_MAX_BYTES {
+            return None;
+        }
+        self.find_in(text, ranges)
+    }
+
+    /// The rest of the line from the first of `ranges` of `text` that begins
+    /// with what was typed — [`Recall::from`]'s and [`Recall::from_ranges`]'
+    /// one reading.
+    fn find_in(&self, text: &str, ranges: &[(usize, usize)]) -> Option<String> {
+        ranges.iter().copied().find_map(|(a, b)| {
+            let stmt = skip_leading_noncode(&text[a..b], self.dialect);
+            let more = strip_prefix_loose(stmt, &self.typed, self.dialect)?;
+            // `history::push` keeps these out of the history; a tab or a
+            // snippet holds whatever was typed into it.
+            if crate::sql::carries_credential(stmt, self.dialect) {
+                return None;
+            }
+            let mut line = first_code_line(more, self.dialect)?.trim_end();
+            if self.followed {
+                line = before_line_comment(line, self.dialect).trim_end();
+            }
+            let line = line.strip_suffix(';').unwrap_or(line).trim_end();
+            let line = line.strip_suffix(self.closers.as_str())?.trim_end();
+            (!line.is_empty()).then(|| line.to_string())
+        })
     }
 }
 
@@ -18319,6 +18340,39 @@ mod history_prediction_tests {
             None => (sql.to_string(), sql.len()),
         };
         predict_from_history(&text, caret, SqlDialect::MySql, past.iter().copied())
+    }
+
+    /// **The caret's own tab, read through its index, recalls what a lexed
+    /// read does** — the ranges an index holds are the lexer's, and a text
+    /// with `\r` is still read the long way, its offsets being another text's.
+    #[test]
+    fn recall_from_known_ranges_answers_as_a_lexed_read() {
+        let d = SqlDialect::MySql;
+        let typed = "select 1;\nSELECT id FROM orders ";
+        let caret = typed.len();
+        let r = Recall::at(typed, caret, d).unwrap();
+        for text in [
+            "select 0;\nSELECT id FROM orders WHERE total > 9 ORDER BY id;\nselect 2",
+            "-- note\nselect id from   orders where a = 1",
+            "select 1;\r\nSELECT id FROM orders WHERE b = 2;\r\n",
+            "select nothing_alike",
+            "",
+        ] {
+            let idx = crate::sql::StatementIndex::new(text, d);
+            assert_eq!(
+                r.from_ranges(text, &idx.statement_ranges(text)),
+                r.from(text),
+                "{text:?}"
+            );
+        }
+        // Not agreement on nothing: the first text does recall a line.
+        let first = "select 0;\nSELECT id FROM orders WHERE total > 9 ORDER BY id;\nselect 2";
+        let idx = crate::sql::StatementIndex::new(first, d);
+        assert_eq!(
+            r.from_ranges(first, &idx.statement_ranges(first))
+                .as_deref(),
+            Some("WHERE total > 9 ORDER BY id")
+        );
     }
 
     /// Recall reads the typed statement as SQL does: keywords and bare names

@@ -19,6 +19,68 @@ pub fn strip_bom(s: &str) -> &str {
     s.strip_prefix('\u{feff}').unwrap_or(s)
 }
 
+/// **The edits made to a text, by revision**, so what keeps an answer about
+/// the text can take it forward without keeping a copy of the text to compare
+/// with ([`common_affixes`] is that comparison's other form). Each edit is
+/// recorded as the bytes it left alone at the front and at the back; the
+/// edits since any revision then read as one, the smallest front and the
+/// smallest back of them all — bytes outside every edit's window are bytes no
+/// edit touched. A bounded number are kept; an answer older than that is
+/// rebuilt whole.
+#[derive(Clone, Debug, Default)]
+pub struct EditLog {
+    rev: u64,
+    edits: std::collections::VecDeque<(u64, usize, usize)>,
+}
+
+/// What [`EditLog::since`] knows of the text since a revision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Since {
+    /// Nothing has changed.
+    Same,
+    /// Changed, and the first `pre` and last `suf` bytes are as they were.
+    Edit { pre: usize, suf: usize },
+    /// Too long ago to say.
+    Unknown,
+}
+
+impl EditLog {
+    /// How many edits are kept.
+    const KEEP: usize = 512;
+
+    /// The text's revision now.
+    pub fn rev(&self) -> u64 {
+        self.rev
+    }
+
+    /// An edit that left the first `pre` and the last `suf` bytes alone.
+    pub fn record(&mut self, pre: usize, suf: usize) {
+        self.rev += 1;
+        self.edits.push_back((self.rev, pre, suf));
+        if self.edits.len() > Self::KEEP {
+            self.edits.pop_front();
+        }
+    }
+
+    /// Every edit since revision `rev`, as one.
+    pub fn since(&self, rev: u64) -> Since {
+        if rev == self.rev {
+            return Since::Same;
+        }
+        if rev > self.rev || self.edits.front().is_none_or(|&(r, _, _)| r > rev + 1) {
+            return Since::Unknown;
+        }
+        let (pre, suf) = self
+            .edits
+            .iter()
+            .filter(|&&(r, _, _)| r > rev)
+            .fold((usize::MAX, usize::MAX), |(p, s), &(_, ep, es)| {
+                (p.min(ep), s.min(es))
+            });
+        Since::Edit { pre, suf }
+    }
+}
+
 /// How many `\n` bytes `b` holds — eight at a time: a byte is zero after the
 /// XOR exactly when it was a newline, and `((t & 0x7f…) + 0x7f…) | t` sets a
 /// byte's high bit exactly when the byte is not zero, so the high bits left
@@ -223,6 +285,54 @@ pub fn field_suggestion<'a>(typed: &str, options: &'a [String]) -> Option<&'a st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The log's merged edit leaves alone only what every edit did**: after
+    /// any run of edits, the text at an older revision and the text now agree
+    /// on the first `pre` and the last `suf` bytes it answers, with no overlap.
+    #[test]
+    fn the_edit_log_merges_edits_into_bytes_none_touched() {
+        let edits: [(usize, usize, &str); 6] = [
+            (3, 5, "XYZ"),
+            (0, 0, "head "),
+            (20, 22, ""),
+            (10, 10, "\n\n"),
+            (2, 30, "mid"),
+            (8, 8, "tail"),
+        ];
+        let mut texts = vec!["select a, b from orders where a = 1 and b = 2".to_string()];
+        let mut log = EditLog::default();
+        assert_eq!(log.since(0), Since::Same);
+        for &(lo, hi, ins) in &edits {
+            let old = texts.last().unwrap().clone();
+            let (lo, hi) = (lo.min(old.len()), hi.min(old.len()));
+            let new = format!("{}{ins}{}", &old[..lo], &old[hi..]);
+            log.record(lo, old.len() - hi);
+            texts.push(new);
+        }
+        let now = texts.last().unwrap();
+        for (rev, old) in texts.iter().enumerate() {
+            match log.since(rev as u64) {
+                Since::Same => assert_eq!(old, now),
+                Since::Unknown => panic!("revision {rev} is kept"),
+                Since::Edit { pre, suf } => {
+                    assert!(pre + suf <= old.len().min(now.len()), "{rev}");
+                    assert_eq!(old[..pre], now[..pre], "front since {rev}");
+                    assert_eq!(
+                        old[old.len() - suf..],
+                        now[now.len() - suf..],
+                        "back since {rev}"
+                    );
+                }
+            }
+        }
+        // Past what is kept, it does not guess.
+        let mut long = EditLog::default();
+        for _ in 0..EditLog::KEEP + 5 {
+            long.record(0, 0);
+        }
+        assert_eq!(long.since(1), Since::Unknown);
+        assert_eq!(long.since(long.rev() + 1), Since::Unknown);
+    }
 
     /// The block compare answers what a byte-by-byte one does — across block
     /// edges, with the shared front and back overlapping in a repetitive text,

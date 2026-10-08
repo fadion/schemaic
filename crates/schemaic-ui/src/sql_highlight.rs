@@ -93,6 +93,14 @@ pub struct SqlStyling {
     /// by counting the phantom rows the document emitted, so a second source of
     /// truth would paint bands over the wrong lines.
     preview: crate::inline_diff::InlinePreview,
+    /// The tab editor's edit log and its text ([`SqlStyling::following_edits`]):
+    /// with them the caches below are keyed on the text's own revision and
+    /// taken forward over the edits the log records, borrowing the text — no
+    /// copy of it kept to compare, and the inline prediction's ghost
+    /// (`inline_diff::set_ghost`) and the Ctrl+K preview (`set_preview`), which
+    /// bump `cache_rev` without touching the text, recompute nothing. Without
+    /// them, `cache_rev` and a kept copy, as [`FieldSql`] does.
+    edits: Option<(RwSignal<schemaic_core::text::EditLog>, RwSignal<String>)>,
     /// Per-line "starts inside a non-code region" answers ([`LineCarry`]),
     /// with the document revision they were computed for.
     ///
@@ -105,8 +113,9 @@ pub struct SqlStyling {
     /// once per edit instead of ~45 times.
     block_lines: CarryCache,
     /// Per-line bracket depth at the line's start, for rainbow brackets, with
-    /// the revision and the text it was computed for — taken forward from the
-    /// last edit's as `block_lines` is, and only while rainbow brackets are on.
+    /// the revision it was computed for (and, without an edit log, the text) —
+    /// taken forward from the last edit's as `block_lines` is, and only while
+    /// rainbow brackets are on.
     bracket_lines: RefCell<Option<(BlockKey, String, schemaic_core::pairs::LineDepths)>>,
 }
 
@@ -115,8 +124,9 @@ pub struct SqlStyling {
 type BlockKey = (u64, SqlDialect);
 
 /// [`carried_lines`]' answer for a document, with what it was computed for —
-/// the revision and dialect, and the text, which the next edit's answer is
-/// taken forward from ([`carried_lines_after`]).
+/// the revision and dialect, and, where no edit log is followed, the text the
+/// next edit's answer is taken forward from ([`carried_lines_after`]); with a
+/// log the text slot is left empty.
 type CarryCache = RefCell<Option<(BlockKey, String, Vec<Option<LineCarry>>)>>;
 
 /// The non-code region `line` of `doc` begins inside, opened above it. One
@@ -202,6 +212,7 @@ impl SqlStyling {
             dialect,
             zoom,
             preview,
+            edits: None,
             block_lines: RefCell::new(None),
             bracket_lines: RefCell::new(None),
             // Explicit IBM Plex Mono (the bundled face) rather than the generic
@@ -220,39 +231,141 @@ impl SqlStyling {
             .unwrap_or_else(crate::theme::editor_font_size)
     }
 
+    /// Follow the tab editor's edit log and text (see the field's doc): `log`
+    /// records every edit before `text` is set to its result.
+    pub fn following_edits(
+        mut self,
+        log: RwSignal<schemaic_core::text::EditLog>,
+        text: RwSignal<String>,
+    ) -> Self {
+        self.edits = Some((log, text));
+        self
+    }
+
+    /// `f` over the document's text: `text` borrowed while it holds the
+    /// document — its length the document's — else a copy.
+    fn with_text<R>(&self, text: RwSignal<String>, f: impl FnOnce(&str) -> R) -> R {
+        let len = self.doc.text().len();
+        if text.with_untracked(String::len) == len {
+            text.with_untracked(|t| f(t))
+        } else {
+            f(&self.doc.text().to_string())
+        }
+    }
+
+    /// What has changed since the revision `held` was computed at, for the
+    /// edit-log path: an edit, or `Unknown` where the dialect moved too.
+    fn since(
+        log: RwSignal<schemaic_core::text::EditLog>,
+        held: Option<BlockKey>,
+        dialect: SqlDialect,
+    ) -> schemaic_core::text::Since {
+        match held {
+            Some((rev, d)) if d == dialect => log.with_untracked(|l| l.since(rev)),
+            _ => schemaic_core::text::Since::Unknown,
+        }
+    }
+
     /// The non-code region `line` begins inside, opened earlier.
     ///
-    /// Takes the answers forward over the edit when the document has changed
-    /// since the last call (`cache_rev` is bumped by every edit;
-    /// [`carried_lines_after`]), and answers from the cache otherwise — so a
-    /// relayout's ~45 line callbacks share one pass.
+    /// Takes the answers forward over the edit when the text has changed since
+    /// the last call ([`carried_lines_after_edit`] from the edit log, or
+    /// [`carried_lines_after`] by `cache_rev` without one), and answers from
+    /// the cache otherwise — so a relayout's ~45 line callbacks share one pass.
     fn carry_at(&self, line: usize) -> Option<LineCarry> {
-        carry_at_cached(
-            &*self.doc,
-            self.dialect.get_untracked(),
-            &self.block_lines,
-            line,
-        )
+        let dialect = self.dialect.get_untracked();
+        let Some((log, text)) = self.edits else {
+            return carry_at_cached(&*self.doc, dialect, &self.block_lines, line);
+        };
+        if line == 0 {
+            return None;
+        }
+        let key = (
+            log.with_untracked(schemaic_core::text::EditLog::rev),
+            dialect,
+        );
+        let lines = self.doc.rope_text().num_lines();
+        let mut cache = self.block_lines.borrow_mut();
+        // Its revision, and as many lines as the document: an edit the log
+        // somehow missed cannot leave a stale answer standing.
+        if cache.as_ref().map(|(k, _, c)| (*k, c.len())) != Some((key, lines)) {
+            let held = cache.take();
+            let since = Self::since(log, held.as_ref().map(|(k, _, _)| *k), dialect);
+            let carries = self.with_text(text, |t| {
+                let lines = schemaic_core::text::count_newlines(t.as_bytes()) + 1;
+                match (since, held) {
+                    (schemaic_core::text::Since::Edit { pre, suf }, Some((_, _, prev)))
+                        if pre + suf <= t.len() =>
+                    {
+                        let out = carried_lines_after_edit(&prev, t, pre, suf, dialect);
+                        // A log that missed an edit would leave the lines
+                        // miscounted; the whole pass is the answer then.
+                        if out.len() == lines {
+                            out
+                        } else {
+                            carried_lines(t, dialect)
+                        }
+                    }
+                    _ => carried_lines(t, dialect),
+                }
+            });
+            *cache = Some((key, String::new(), carries));
+        }
+        cache
+            .as_ref()
+            .and_then(|(_, _, carries)| carries.get(line).copied().flatten())
     }
 
     /// How many brackets are open where `line` begins
     /// (`pairs::line_depths`), cached per revision and taken forward over an
-    /// edit (`pairs::line_depths_after`) as [`carry_at`](Self::carry_at) is.
+    /// edit as [`carry_at`](Self::carry_at) is.
     fn depth_at(&self, line: usize) -> usize {
-        let key = (
-            self.doc.cache_rev().get_untracked(),
-            self.dialect.get_untracked(),
-        );
+        let dialect = self.dialect.get_untracked();
         let mut cache = self.bracket_lines.borrow_mut();
-        if cache.as_ref().map(|(k, _, _)| *k) != Some(key) {
-            let text = self.doc.text().to_string();
-            let depths = match cache.take() {
-                Some(((_, d), old, prev)) if d == key.1 => {
-                    schemaic_core::pairs::line_depths_after(&old, &prev, &text, d)
+        match self.edits {
+            Some((log, text)) => {
+                let key = (
+                    log.with_untracked(schemaic_core::text::EditLog::rev),
+                    dialect,
+                );
+                let lines = self.doc.rope_text().num_lines();
+                if cache.as_ref().map(|(k, _, d)| (*k, d.depth.len())) != Some((key, lines)) {
+                    let held = cache.take();
+                    let since = Self::since(log, held.as_ref().map(|(k, _, _)| *k), dialect);
+                    let depths = self.with_text(text, |t| {
+                        let lines = schemaic_core::text::count_newlines(t.as_bytes()) + 1;
+                        match (since, held) {
+                            (schemaic_core::text::Since::Edit { pre, suf }, Some((_, _, prev)))
+                                if pre + suf <= t.len() =>
+                            {
+                                let out = schemaic_core::pairs::line_depths_after_edit(
+                                    &prev, t, pre, suf, dialect,
+                                );
+                                if out.depth.len() == lines {
+                                    out
+                                } else {
+                                    schemaic_core::pairs::line_depths(t, dialect)
+                                }
+                            }
+                            _ => schemaic_core::pairs::line_depths(t, dialect),
+                        }
+                    });
+                    *cache = Some((key, String::new(), depths));
                 }
-                _ => schemaic_core::pairs::line_depths(&text, key.1),
-            };
-            *cache = Some((key, text, depths));
+            }
+            None => {
+                let key = (self.doc.cache_rev().get_untracked(), dialect);
+                if cache.as_ref().map(|(k, _, _)| *k) != Some(key) {
+                    let text = self.doc.text().to_string();
+                    let depths = match cache.take() {
+                        Some(((_, d), old, prev)) if d == key.1 => {
+                            schemaic_core::pairs::line_depths_after(&old, &prev, &text, d)
+                        }
+                        _ => schemaic_core::pairs::line_depths(&text, key.1),
+                    };
+                    *cache = Some((key, text, depths));
+                }
+            }
         }
         cache
             .as_ref()
@@ -507,10 +620,24 @@ pub(crate) fn carried_lines_after(
     if pre == o.len() && pre == n.len() {
         return prev.to_vec();
     }
+    carried_lines_after_edit(prev, new, pre, suf, dialect)
+}
+
+/// [`carried_lines_after`] with the edit already known — the first `pre` and
+/// last `suf` bytes of the old text and `new` the same — as the editor knows it
+/// from its own edits ([`schemaic_core::text::EditLog`]), with no copy of the
+/// old text kept to compare. The lines it moved come from the two line counts.
+pub(crate) fn carried_lines_after_edit(
+    prev: &[Option<LineCarry>],
+    new: &str,
+    pre: usize,
+    suf: usize,
+    dialect: SqlDialect,
+) -> Vec<Option<LineCarry>> {
+    let n = new.as_bytes();
     let newlines = schemaic_core::text::count_newlines;
     // Lines the edit added, less those it removed.
-    let shift =
-        newlines(&n[pre..n.len() - suf]) as isize - newlines(&o[pre..o.len() - suf]) as isize;
+    let shift = (newlines(n) + 1) as isize - prev.len() as isize;
     // Back from the edited line to the last one that starts in code — all of
     // it before the edit, so the same in both texts.
     let mut line = newlines(&n[..pre]).min(prev.len().saturating_sub(1));
@@ -1129,6 +1256,16 @@ mod tests {
                     carried_lines_after(&old, &prev, &new, d),
                     carried_lines(&new, d),
                     "{d:?}: {old:?} -> {new:?}"
+                );
+                // As the editor's edit log hands it over: a front and back
+                // smaller than the most the texts share, as merged edits
+                // leave them.
+                let (pre, suf) =
+                    schemaic_core::text::common_affixes(old.as_bytes(), new.as_bytes());
+                assert_eq!(
+                    carried_lines_after_edit(&prev, &new, pre / 2, suf / 2, d),
+                    carried_lines(&new, d),
+                    "{d:?} merged: {old:?} -> {new:?}"
                 );
             }
         }

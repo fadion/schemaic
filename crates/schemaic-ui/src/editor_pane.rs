@@ -2846,6 +2846,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         conn: active_conn,
         stmts: RwSignal::new(None),
         query,
+        edits: RwSignal::new(schemaic_core::text::EditLog::default()),
     };
     let cmdk = CmdK {
         open: RwSignal::new(false),
@@ -4381,7 +4382,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         let dia = dialect.get();
         // `with`, not `get`: a caret move need not copy the document.
         let range = query.with(|sql| {
-            let index = crate::completion::stmt_index(comp.stmts, sql, dia);
+            let index = crate::completion::stmt_index(comp, sql, dia);
             run_outline_range(sql, &index, cursor.offset(), cursor.get_selection(), dia)
         });
         if run_outline.with_untracked(|cur| cur != &range) {
@@ -5140,12 +5141,10 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         // `SqlStyling` reads the INNER document deliberately: same rope, same
         // `cache_rev` signal (the wrapper delegates both), and it must not depend
         // on a wrapper installed later in this chain.
-        .styling(sql_highlight::SqlStyling::new(
-            inner_doc.clone(),
-            dialect,
-            zoom,
-            cmdk.preview,
-        ))
+        .styling(
+            sql_highlight::SqlStyling::new(inner_doc.clone(), dialect, zoom, cmdk.preview)
+                .following_edits(comp.edits, query),
+        )
         // `smart_tab` makes floem's own Tab insert spaces to the next tab stop.
         // Tab and Shift+Tab are the key handler's (`soft_tab_indent` /
         // `hard_tab_indent` / `soft_tab_outdent`), with the suggestion list
@@ -5227,7 +5226,15 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 s.current_line_color(clear).gutter_current_color(clear)
             }
         })
-        .update(move |_| {
+        .update(move |upd| {
+            // Each edit into the log first — what `query` sets off reads it —
+            // as the bytes it left alone at either end.
+            comp.edits.update(|log| {
+                for d in upd.deltas() {
+                    let (iv, _) = d.summary();
+                    log.record(iv.start, d.base_len - iv.end);
+                }
+            });
             // **The one copy of the document an edit makes.** Everything below
             // reads `query` when it runs — a debounce at the time it fires — so
             // a burst of keystrokes copies it once each, not once per reader.

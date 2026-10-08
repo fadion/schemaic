@@ -109,6 +109,10 @@ pub(crate) struct Completion {
     /// runs per keystroke and caret move rather than copied out of the
     /// document each time.
     pub(crate) query: RwSignal<String>,
+    /// The editor's edits, by revision: recorded before `query` is set, so
+    /// what keeps an answer about the text ([`stmt_index`], the styling's
+    /// caches) takes it forward without keeping a copy of the text.
+    pub(crate) edits: RwSignal<schemaic_core::text::EditLog>,
 }
 
 /// `f` over the editor's text, **borrowed** from the pane's `query` — set from
@@ -125,27 +129,37 @@ pub(crate) fn with_text<R>(ed: &Editor, comp: Completion, f: impl FnOnce(&str) -
     }
 }
 
-/// A pane's [`StatementIndex`], with the text and dialect it was built for.
-pub(crate) type StmtIndex = RwSignal<Option<(String, SqlDialect, Rc<StatementIndex>)>>;
+/// A pane's [`StatementIndex`], with the text revision
+/// ([`Completion::edits`]) and dialect it was built for.
+pub(crate) type StmtIndex = RwSignal<Option<(u64, SqlDialect, Rc<StatementIndex>)>>;
 
-/// The statement index of `sql` — the one held when the text is unchanged,
-/// else the held one taken forward over the edit ([`StatementIndex::after`]),
-/// else a new one. So a caret move searches and a keystroke rescans about its
-/// own statement, where each used to walk the document to the caret.
-pub(crate) fn stmt_index(cell: StmtIndex, sql: &str, dialect: SqlDialect) -> Rc<StatementIndex> {
-    let held = cell.with_untracked(|c| {
-        c.as_ref()
-            .filter(|(text, d, _)| *d == dialect && text == sql)
-            .map(|(_, _, idx)| idx.clone())
-    });
-    if let Some(idx) = held {
-        return idx;
+/// The statement index of `sql`, the pane's text — the one held at this
+/// revision, else the held one taken forward over the edits the log recorded
+/// since ([`StatementIndex::after_edit`]), else a new one. So a caret move
+/// searches and a keystroke rescans about its own statement, where each used
+/// to walk the document to the caret — and no copy of the text is kept, nor
+/// compared, to find the edit.
+pub(crate) fn stmt_index(comp: Completion, sql: &str, dialect: SqlDialect) -> Rc<StatementIndex> {
+    use schemaic_core::text::{EditLog, Since};
+    let rev = comp.edits.with_untracked(EditLog::rev);
+    let held = comp.stmts.with_untracked(Clone::clone);
+    if let Some((r, d, idx)) = &held
+        && *r == rev
+        && *d == dialect
+        && idx.text_len() == sql.len()
+    {
+        return idx.clone();
     }
-    let next = Rc::new(cell.with_untracked(|c| match c {
-        Some((text, d, idx)) if *d == dialect => idx.after(text, sql),
+    let next = Rc::new(match held {
+        Some((r, d, idx)) if d == dialect => match comp.edits.with_untracked(|l| l.since(r)) {
+            Since::Edit { pre, suf } if pre + suf <= sql.len().min(idx.text_len()) => {
+                idx.after_edit(sql, pre, suf)
+            }
+            _ => StatementIndex::new(sql, dialect),
+        },
         _ => StatementIndex::new(sql, dialect),
-    }));
-    cell.set(Some((sql.to_string(), dialect, next.clone())));
+    });
+    comp.stmts.set(Some((rev, dialect, next.clone())));
     next
 }
 
@@ -763,7 +777,7 @@ pub(crate) fn update_signature_help(
     // lookup on a caret move, not a rebuild.
     let schema = hidden_dbs.with_untracked(|h| schema_index(db_nodes, h, active_db));
     let help = with_text(ed, comp, |text| {
-        let (lo, hi) = stmt_index(comp.stmts, text, dialect).statement_range(text, offset);
+        let (lo, hi) = stmt_index(comp, text, dialect).statement_range(text, offset);
         intel::signature_help(text, lo, hi, offset, dialect, &schema.routines)
     });
     if help.is_some() {
@@ -864,6 +878,7 @@ fn prediction_at(
     text: &str,
     offset: usize,
     ctx: &CompletionCtx<'_>,
+    own: Option<OwnTab<'_>>,
 ) -> Option<crate::inline_diff::EditorGhost> {
     if !ctx.predictions {
         return None;
@@ -878,9 +893,13 @@ fn prediction_at(
             intel::predict(text, offset, &catalog, ctx.dialect)
         })
         .flatten();
-    let (guess, remembered) = pick_prediction(reasoned, || recall(text, offset, ctx))?;
+    let (guess, remembered) = pick_prediction(reasoned, || recall(text, offset, ctx, own))?;
     Some(ghost_at(ed, offset, guess, false, remembered))
 }
+
+/// The tab the caret is in, for [`recall`]: its text's signal, and the
+/// statement index the pane already holds of that text.
+type OwnTab<'a> = (RwSignal<String>, &'a StatementIndex);
 
 /// The remembered prediction at `offset` — [`intel::Recall`], its gate run
 /// once, asked of each text in the order it is trusted: this connection's
@@ -890,8 +909,16 @@ fn prediction_at(
 /// among them. `None` with remembered predictions switched off.
 ///
 /// Each tab's text is read inside its own signal rather than cloned out: this
-/// runs on a keystroke, and a tab disposed under it answers nothing.
-fn recall(text: &str, offset: usize, ctx: &CompletionCtx<'_>) -> Option<String> {
+/// runs on a keystroke, and a tab disposed under it answers nothing. **The
+/// caret's own tab is not lexed again**: `own` is its text's signal and the
+/// pane's index of it, whose statements are read straight off
+/// ([`intel::Recall::from_ranges`]).
+fn recall(
+    text: &str,
+    offset: usize,
+    ctx: &CompletionCtx<'_>,
+    own: Option<OwnTab<'_>>,
+) -> Option<String> {
     if !ctx.remembered {
         return None;
     }
@@ -918,7 +945,15 @@ fn recall(text: &str, offset: usize, ctx: &CompletionCtx<'_>) -> Option<String> 
                     if !same_place(ctx.dialect, conn, db.as_deref(), ctx.conn_id, ctx.active_db) {
                         return None;
                     }
-                    t.query.try_with_untracked(|q| q.and_then(|q| r.from(q)))
+                    t.query.try_with_untracked(|q| {
+                        let q = q?;
+                        match own {
+                            Some((sig, idx)) if sig == t.query && idx.text_len() == q.len() => {
+                                r.from_ranges(q, &idx.statement_ranges(q))
+                            }
+                            _ => r.from(q),
+                        }
+                    })
                 })
             })
         })
@@ -1136,7 +1171,10 @@ fn recompute_completions_in(
     } else {
         comp.ghost
             .with_untracked(|g| g.clone().filter(|g| keeps_ghost(g, offset, text.len())))
-            .or_else(|| prediction_at(ed, text, offset, &ctx))
+            .or_else(|| {
+                let index = stmt_index(comp, text, dialect);
+                prediction_at(ed, text, offset, &ctx, Some((comp.query, &index)))
+            })
     };
     let remembered = ghost.as_ref().is_some_and(|g| g.remembered);
     let displaces = |prefix: &str| ghost_displaces_the_list(ghost.as_ref(), prefix);
@@ -1182,7 +1220,7 @@ fn recompute_completions_in(
     // The statement being *written*: past a `;` the caret starts a new one, and
     // Ctrl+Space on the blank line below `DELETE FROM t;` offered the `DELETE`'s
     // `WHERE` and columns. From the pane's index: this runs per keystroke.
-    let (lo, hi) = stmt_index(comp.stmts, text, dialect).writing_range(text, offset);
+    let (lo, hi) = stmt_index(comp, text, dialect).writing_range(text, offset);
     // **Not inside a value or a remark**, not even on Ctrl+Space: `name = 'jo`
     // offered columns, and Tab spliced one into the literal. A quoted name
     // is still a name, and completes.
@@ -2053,7 +2091,7 @@ mod recall_order_tests {
             history: RwSignal::new(runs),
             tabs: RwSignal::new(open),
         };
-        let got = recall(TYPED, TYPED.len(), &ctx);
+        let got = recall(TYPED, TYPED.len(), &ctx, None);
         ctx.tabs.update(|t| t.clear());
         cx.dispose();
         got

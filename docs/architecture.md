@@ -758,8 +758,10 @@ existing prose was left alone.
     list the cut-short walk produces. That is why the pick is shared rather than copied —
     `statement_at` and `run_current_at` take the boundaries as slices from either source — and why
     `caret_segment` searches (`partition_point`) rather than looping, handed a whole document's.
-    `after(old, new)` takes the index forward over an edit: it finds the edit with
-    `text::common_affixes`, resumes **two** boundaries before it — the last one's own decision may
+    `after_edit(new, pre, suf)` takes the index forward over an edit already known — the front and
+    back a `text::EditLog` hands over, so no copy of the old text is kept; `text_len` is the length
+    it was built for, which its holder checks before trusting one — and `after(old, new)` is the
+    same after finding the edit with `text::common_affixes`. It resumes **two** boundaries before it — the last one's own decision may
     have read into the edit, as T-SQL's `IF … ; ELSE` lookahead does — and scans a statement at a
     time through `scan_bounds_from`, stopping at the first boundary past the edit that the old scan
     also recorded at the shifted position, with the same `strip` and the same terminator in force;
@@ -777,7 +779,8 @@ existing prose was left alone.
     `BEGIN … END`, a SQLite trigger, PostgreSQL dollar quotes, unterminated tails with blank lines)
     at every byte — inserting `;`, newlines, `GO`, block words, quotes, comments, `DELIMITER $$` or
     `$$`, or deleting — and holds each taken-forward index equal to a fresh one and its answers to
-    the walks'. Who holds the index is under `completion.rs`.
+    the walks', and takes every edit forward a second time through `after_edit` at half the shared
+    front and back, as merged edits hand them over. Who holds the index is under `completion.rs`.
     **Which segment the caret means is `caret_segment`'s, the one choice `statement_range` and
     `run_current_bounds` share** — so Run at the caret's outline and what `executable_at` sends
     are chosen there too. It is the segment the caret falls in, save in two places where it means
@@ -2818,7 +2821,13 @@ existing prose was left alone.
     hold the typed text — searched as loosely as it is matched, by
     `text_ops::contains_collapsed_ignore_ascii_case` over `Recall::needle`, the typed text with its
     white space collapsed — is passed over; and only one that does is given its `\r\n` copy (where it holds a `\r`) and
-    lexed by `statement_ranges`. **The cap was 16 KiB until open tabs were read too**: a scratch
+    lexed by `statement_ranges`. **The caret's own tab is not lexed again**: that search always
+    finds the typed text in it, so it was always lexed — and the pane's `sql::StatementIndex`
+    already holds its statements. `Recall::from_ranges(text, ranges)` reads ranges handed in
+    (`StatementIndex::statement_ranges`, `statement_ranges`' answer from the index's boundaries, which
+    `a_statement_index_answers_what_the_walks_do` holds equal), and `completion::recall` hands it the
+    own tab's (identified by its `query` signal); a text with `\r` still goes through `from`, its
+    offsets being the normalised text's (`recall_from_known_ranges_answers_as_a_lexed_read`). **The cap was 16 KiB until open tabs were read too**: a scratch
     tab is routinely longer than that, and at that cap would not have been read at all. The
     substring search is what keeps a keystroke cheap — most texts do not hold the typed line — and
     the cap is left to keep a dump or seed script run whole from being lexed whenever one does. The
@@ -12752,8 +12761,13 @@ existing prose was left alone.
     edit that leaves a bracket open past itself changes every depth below and rescans to the end.
     Both functions run through one scan, `scan_depths`, and
     `line_depths_after_an_edit_match_a_full_pass` holds them equal over a corpus of edits on every
-    engine, bracket-heavy bases included. Called once per edit from `SqlStyling`'s cache, not on
-    the per-caret path below).
+    engine, bracket-heavy bases included. `line_depths_after` finds the edit by comparing the old
+    text (`text::common_affixes`) and hands it to `line_depths_after_edit`, which takes the edit
+    already known — as the tab editor knows it from its `text::EditLog`, with no old text kept. The
+    lines an edit moved come from the two line counts (`count_newlines(new) + 1` against `prev`'s),
+    not from the old edit region, which the `_edit` form never sees; the same test runs every corpus
+    edit through it again at half the shared front and back, as merged edits hand them over.
+    Called once per edit from `SqlStyling`'s cache, not on the per-caret path below).
     Pure + unit-tested; dialect-aware, and its two "is a
     backtick an identifier quote here" sites ask `SqlDialect::backtick_ident` (`pub(crate)` for
     them) rather than re-spelling `!= Postgres`, which is the capability rule one module over.
@@ -13967,15 +13981,31 @@ existing prose was left alone.
       never do anything (`recheck_stops_once_something_is_staged`, `a_refused_gate_never_re_arms`). A
       *failed* check does re-arm — it is the one negative outcome expected to be temporary, and it is
       invisible anyway, so retrying costs the user nothing.
-    - `text.rs` — **`common_affixes(a, b)`** (the bytes two texts share at the front, then at
-      the back: where one edit turned one into the other, compared a 4 KiB block at a time — a
-      `memcmp` — and byte by byte only in the block that differs) and **`count_newlines`** (eight
-      bytes at a time, exact: a byte is zero after the XOR with `\n` exactly when it was one, and
-      `((t & 0x7f…) + 0x7f…) | t` sets a byte's high bit exactly when the byte is not zero) are what
-      the editor's incremental passes — `sql_highlight::carried_lines_after`,
-      `pairs::line_depths_after`, `sql::StatementIndex::after` — find an edit and its line with, per
-      keystroke; a byte-at-a-time compare and count were most of those passes' cost
-      (`common_affixes_find_the_edit` holds both to the naive form). `plural(n, one, many)`,
+    - `text.rs` — **`EditLog`**, the edits made to a text by revision, so that what keeps an
+      answer about the text can take it forward without keeping a copy of the text to compare with.
+      `record(pre, suf)` takes one edit as the bytes it left alone at the front and the back and
+      bumps `rev`; `since(rev)` reads every edit after `rev` as one, `Since::Edit { pre, suf }` —
+      the smallest front and the smallest back of them all, since bytes outside every edit's window
+      are bytes no edit touched — or `Since::Unknown` for a revision older than the 512 edits it
+      keeps (or one it has not reached). **A merged front and back can be smaller than what the two
+      texts share**, so every `_edit` pass it feeds must be exact for any front and back the texts
+      do share, not only the largest; each pass's equivalence test runs its corpus again at half
+      of them for that reason. `the_edit_log_merges_edits_into_bytes_none_touched` holds the log to
+      the texts: after a run of edits, each older revision and the text now agree on the merged
+      front and back, which never overlap. The tab editor records its edits into one per pane
+      (under `completion.rs`). **`common_affixes(a, b)`** (the bytes two texts share at the front,
+      then at the back: where one edit turned one into the other, compared a 4 KiB block at a time —
+      a `memcmp` — and byte by byte only in the block that differs) is the same question asked of a
+      kept copy instead — what the old-text forms `sql_highlight::carried_lines_after`,
+      `pairs::line_depths_after` and `sql::StatementIndex::after` find the edit with before calling
+      their `_edit` forms. Only `carried_lines_after` is still reached outside the tests, by
+      `FieldSql`: `SqlStyling` falls back to `line_depths_after` only without an edit log, and its
+      one construction has one. **`count_newlines`** (eight bytes at a time, exact: a byte is zero
+      after the XOR with `\n` exactly when it was one, and `((t & 0x7f…) + 0x7f…) | t` sets a
+      byte's high bit exactly when the byte is not zero) is how every one of those passes finds the edit's line
+      and how many lines it moved, per keystroke; a byte-at-a-time compare and count were most of
+      those passes' cost (`common_affixes_find_the_edit` holds both to the naive form).
+      `plural(n, one, many)`,
       returning only the noun form so a humanized count
       (`"1.2k"`) can be displayed while the singular/plural decision still follows the true `n` —
       a contract that reads as "returns the phrase" if you skim it, and the export note shipped as
@@ -23924,10 +23954,17 @@ existing prose was left alone.
     re-introspection changes and so nothing has to be invalidated by hand. `LoadedNode` exists so
     the snapshot is taken out of the signals **once**: reading `node.schema` twice could key an
     index on a schema it was not built from.
-    **`Completion::stmts` holds the pane's `sql::StatementIndex`** (`StmtIndex`, the text and
-    dialect it was built for beside it), and `stmt_index(cell, sql, dialect)` is the one way in:
-    the held index when the text is unchanged, the held one taken forward (`after`) when it is not,
-    a new one otherwise. Three readers ask it — `update_signature_help` per caret move (it was
+    **`Completion::stmts` holds the pane's `sql::StatementIndex`** (`StmtIndex`, the text revision
+    and dialect it was built for beside it), and `stmt_index(comp, sql, dialect)` is the one way
+    in: the held index when the revision, the dialect and its `text_len` all match, the held one
+    taken forward (`after_edit`, with `edits.since(rev)`) when it is not, a new one otherwise — a
+    new dialect, a revision the log no longer keeps, or a merged front and back longer than either
+    text. The revision is `Completion::edits`, the pane's `text::EditLog`, which the editor's
+    `.update` fills from every delta (`RopeDelta::summary()`: the interval's start is the front,
+    `base_len` less its end the back) **before** it sets `query`, so anything `query` sets off
+    already sees the new revision. It used to keep a copy of the text beside the index and compare
+    it with `==` on every call, which was a document's copy per keystroke and a document's compare
+    per caret move. Three readers ask it — `update_signature_help` per caret move (it was
     `sql::statement_range`, a walk to the caret), `recompute_completions` per keystroke
     (`writing_range`), and the run outline's effect in `editor_pane.rs` — so the walk each made
     becomes a search, and a keystroke rescans about its own statement (the costs under `sql.rs`).
@@ -25879,7 +25916,22 @@ existing prose was left alone.
     `/*` is the rest of the document. `carried_lines_after_an_edit_match_a_full_pass` holds it
     equal to the full pass over every edit of a corpus — each base document edited at every byte by
     inserting `/*`, `*/`, `'`, a newline, `$$`, `--` or a bracket, or deleting one or three bytes —
-    on all four engines.
+    on all four engines, and again through `carried_lines_after_edit` at half the shared front and
+    back. **The tab editor keeps no copy of the text for it.** `carried_lines_after` above is
+    `FieldSql`'s path, and it now only finds the edit and calls `carried_lines_after_edit`, which
+    takes the edit already known and counts the lines it moved from the two line counts
+    (`count_newlines(new) + 1` against `prev`'s length) rather than from the old edit region.
+    `SqlStyling::following_edits(log, query)` hands the tab editor's styling the pane's
+    `text::EditLog` and `query`, and `carry_at` then keys its cache on the log's revision instead of
+    `cache_rev`, takes it forward with `log.since(rev)`, and borrows the text from `query`
+    (`with_text`, a copy only if `query`'s length is not the document's). Keying on `cache_rev` cost
+    twice over: the cache kept its own copy of the document per edit, and `inline_diff::set_ghost`
+    and `set_preview` bump `cache_rev` without changing a byte, so every ghost the completion
+    recompute published re-ran the pass. **The cache key also holds the document's line count**,
+    and that is not redundant: an edit the log somehow missed cannot leave a stale answer standing.
+    A merged front and back longer than the text, or an answer whose line count is not the text's,
+    falls back to the whole `carried_lines` — the second being what a log that missed an edit would
+    produce.
     `highlight_spans` still lexes one line with no carry — it has no document — so a string or
     comment spanning a preview's lines is coloured line by line there. The Ctrl+K diff's added
     rows go through `highlight_lines_in`, which takes each row's carry from the document the rows
@@ -25895,10 +25947,11 @@ existing prose was left alone.
     `Tok::Bracket(depth)` — an opener the depth it opens at, a closer its opener's — painted in turn
     from the editor theme's own `type_`, `keyword` and `function` (`[..][depth % 3]`) rather than a
     palette of its own (`rainbow_brackets_are_coloured_by_depth`). The starting depths are
-    `pairs::line_depths`, cached in `SqlStyling::bracket_lines` per document revision and
-    dialect (`depth_at`) beside `block_lines`, the carried regions above, with the text they were
-    computed for, and taken forward over an edit by `pairs::line_depths_after` (under `pairs.rs`)
-    as `block_lines` is by `carried_lines_after`. Cached for the same reason: the styling hook
+    `pairs::line_depths`, cached in `SqlStyling::bracket_lines` per edit-log revision, dialect and
+    line count (`depth_at`) beside `block_lines`, the carried regions above, and taken forward over
+    an edit by `pairs::line_depths_after_edit` (under `pairs.rs`) as `block_lines` is by
+    `carried_lines_after_edit`, borrowing `query` the same way and falling back to the whole pass on
+    the same two conditions. Cached for the same reason: the styling hook
     runs per visible line on every relayout, and re-walking the document before each line is the Θ(visible × document) cost `block_lines` was added to remove.
     It is computed only while the setting is on. `set_editor_rainbow_brackets` bumps `editor_gen`,
     which `SqlStyling::id()` folds into the layout cache key, so a flip re-colours lines already laid
@@ -25930,8 +25983,10 @@ existing prose was left alone.
     the view, trigger, routine and snippet bodies, each of which sets `FieldCfg::sql` (under
     `lib.rs`). It
     is the same `lex_line_with` with the same cross-line state: the per-revision `CarryCache` is
-    filled by `carry_at_cached`, which `SqlStyling::carry_at` calls too, so the forward pass that removed the Θ(visible × document) re-lex is one piece of code
-    rather than two copies of it. It leaves out what only the tab editor has — the zoom, the inline
+    filled by `carry_at_cached` — keyed on `cache_rev` and keeping a copy of the text, since a field
+    has no edit log, which is the path `SqlStyling::carry_at` takes only without one — and both
+    end in `carried_lines_after_edit`, so the forward pass that removed the Θ(visible × document)
+    re-lex is one piece of code rather than two copies of it. It leaves out what only the tab editor has — the zoom, the inline
     diff and rainbow brackets (`lex_line_with` is handed `None` for the depth) — and its dialect is a
     plain `SqlDialect` fixed when the field is built, where `SqlStyling`'s is a memo.
     `FieldSql::generation` is `theme::editor_generation()`, which `FieldStyling::id` adds to its key
@@ -34226,7 +34281,11 @@ Re-introducing the anti-patterns these guard against is a regression:
   of the document an edit makes**: what runs per keystroke or caret move borrows `query` (`with`,
   `track`, `completion::with_text`, which falls back to copying the document only if `query`'s
   length disagrees with it), and a debounce reads `query` when it fires rather than copying the
-  text at the keystroke. It used to be a dozen copies a keystroke — `query.get()` to track, every
+  text at the keystroke. The caches that take an answer forward over an edit — the statement index
+  and the styling's carried regions and bracket depths — keep **no** copy: they follow the pane's
+  `text::EditLog`, which `.update` fills from the edit's deltas before it sets `query` (under
+  `completion.rs` and `sql_highlight.rs`); until then each kept one of its own. It used to be a
+  dozen copies a keystroke — `query.get()` to track, every
   open tab's text cloned by the tabs-persist effect, eager clones for each debounce — ~0.5 ms each
   at 4 MiB. A planned edit (auto-pair, Backspace) is computed under the borrow and applied after
   it ends, since the edit re-enters `.update` and sets `query`. There is no effect pushing `query`

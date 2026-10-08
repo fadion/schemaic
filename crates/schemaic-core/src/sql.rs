@@ -2261,11 +2261,35 @@ impl StatementIndex {
     /// The index of `new`, where an edit turned `old` — this index's text —
     /// into it. See the type's doc.
     pub fn after(&self, old: &str, new: &str) -> Self {
+        let (pre, suf) = crate::text::common_affixes(old.as_bytes(), new.as_bytes());
+        self.after_edit(new, pre, suf)
+    }
+
+    /// How long the text this index is of was.
+    pub fn text_len(&self) -> usize {
+        self.ats[self.real]
+    }
+
+    /// [`statement_ranges`] of `sql`, the index's text, from its boundaries —
+    /// no walk.
+    pub fn statement_ranges(&self, sql: &str) -> Vec<(usize, usize)> {
+        self.ats
+            .windows(2)
+            .map(|w| trim_range(sql, w[0], w[1]))
+            .filter(|&(lo, hi)| is_runnable_segment(sql, lo, hi, self.dialect))
+            .collect()
+    }
+
+    /// [`StatementIndex::after`] with the edit already known — the first
+    /// `pre` and last `suf` bytes of this index's text and `new` the same — as
+    /// the editor knows it from its own edits ([`crate::text::EditLog`]), with
+    /// no copy of the old text kept to compare.
+    pub fn after_edit(&self, new: &str, pre: usize, suf: usize) -> Self {
         let dialect = self.dialect;
-        let (o, n) = (old.as_bytes(), new.as_bytes());
-        let (pre, suf) = crate::text::common_affixes(o, n);
+        let n = new.as_bytes();
+        let old_len = self.ats[self.real];
         let common_from = n.len() - suf;
-        let shift = n.len() as isize - o.len() as isize;
+        let shift = n.len() as isize - old_len as isize;
         // Resume a boundary further back than the last one before the edit:
         // that one's own decision may have looked past it, into the edit.
         let real = self.real;
@@ -7024,6 +7048,11 @@ mod tests {
                     "{d:?} writing at {off} of {sql:?}"
                 );
             }
+            assert_eq!(
+                idx.statement_ranges(sql),
+                super::statement_ranges(sql, d),
+                "{d:?} statements of {sql:?}"
+            );
         };
         for (d, base) in bases {
             let old_idx = StatementIndex::new(base, d);
@@ -7047,6 +7076,15 @@ mod tests {
                         "{d:?}: {base:?} -> {new:?}"
                     );
                     ranges(&taken, &new, d, 7);
+                    // As the editor's edit log hands it over: a front and back
+                    // smaller than the most the texts share.
+                    let (pre, suf) = crate::text::common_affixes(base.as_bytes(), new.as_bytes());
+                    let merged = old_idx.after_edit(&new, pre / 2, suf / 2);
+                    assert_eq!(
+                        (&merged.bounds, &merged.delims, &merged.soft),
+                        (&fresh.bounds, &fresh.delims, &fresh.soft),
+                        "{d:?} merged: {base:?} -> {new:?}"
+                    );
                 }
             }
         }

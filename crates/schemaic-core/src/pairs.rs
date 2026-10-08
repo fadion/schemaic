@@ -370,9 +370,23 @@ pub fn line_depths_after(
     if pre == o.len() && pre == n.len() {
         return prev.clone();
     }
+    line_depths_after_edit(prev, new, pre, suf, dialect)
+}
+
+/// [`line_depths_after`] with the edit already known — the first `pre` and
+/// last `suf` bytes of the old text and `new` the same — as the editor knows it
+/// from its own edits ([`crate::text::EditLog`]), with no copy of the old text
+/// kept to compare. The lines it moved come from the two line counts.
+pub fn line_depths_after_edit(
+    prev: &LineDepths,
+    new: &str,
+    pre: usize,
+    suf: usize,
+    dialect: SqlDialect,
+) -> LineDepths {
+    let n = new.as_bytes();
     let newlines = crate::text::count_newlines;
-    let shift =
-        newlines(&n[pre..n.len() - suf]) as isize - newlines(&o[pre..o.len() - suf]) as isize;
+    let shift = (newlines(n) + 1) as isize - prev.depth.len() as isize;
     let mut line = newlines(&n[..pre]).min(prev.code.len().saturating_sub(1));
     let mut start = n[..pre]
         .iter()
@@ -934,6 +948,15 @@ mod tests {
                     line_depths_after(&old, &prev, &new, d),
                     line_depths(&new, d),
                     "{d:?}: {old:?} -> {new:?}"
+                );
+                // As the editor's edit log hands it over: a front and back
+                // smaller than the most the texts share, as several merged
+                // edits leave them.
+                let (pre, suf) = crate::text::common_affixes(old.as_bytes(), new.as_bytes());
+                assert_eq!(
+                    line_depths_after_edit(&prev, &new, pre / 2, suf / 2, d),
+                    line_depths(&new, d),
+                    "{d:?} merged: {old:?} -> {new:?}"
                 );
             }
         }
