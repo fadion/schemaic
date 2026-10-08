@@ -169,6 +169,21 @@ pub struct SchemaIndex {
     /// by `schema.name`: a column of one carries only the name, so its members
     /// are here rather than in its type ([`enum_value_suggestions`]).
     pub enum_types: HashMap<String, Vec<String>>,
+    /// The tab's database's stored functions and procedures, offered where
+    /// each can be called: a procedure after `CALL`/`EXEC`
+    /// (`ClauseCtx::Routine`), a function where an expression goes.
+    pub routines: Vec<IndexedRoutine>,
+}
+
+/// One stored routine as [`SchemaIndex::routines`] holds it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexedRoutine {
+    pub name: String,
+    pub kind: crate::schema::RoutineKind,
+    /// The parameter list as the server renders it (`RoutineInfo::arguments`).
+    pub arguments: String,
+    /// A function's return type; empty for a procedure.
+    pub returns: String,
 }
 
 impl SchemaIndex {
@@ -689,8 +704,47 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
             }
         }
     };
+    // The database's own functions, where an expression goes — ahead of the
+    // builtins, so one named like a builtin claims its row. Not a trigger
+    // function, which no expression can call.
+    let add_user_functions = |cands: &mut Vec<Cand>, seen: &mut HashSet<String>, tier: u8| {
+        for r in &schema.routines {
+            if r.kind == crate::schema::RoutineKind::Function
+                && !r.returns.eq_ignore_ascii_case("trigger")
+            {
+                let detail = format!("({}) → {}", r.arguments, r.returns);
+                add(cands, seen, &r.name, SuggestKind::Function, &detail, tier);
+            }
+        }
+    };
 
     match ctx {
+        // The name a `CALL` or `EXEC` runs: the procedures, whose arguments
+        // come in parens where the engine's call takes them and bare after a
+        // T-SQL `EXEC` (`intel::procedure_args_in_parens`).
+        ClauseCtx::Routine => {
+            for r in &schema.routines {
+                if r.kind != crate::schema::RoutineKind::Procedure {
+                    continue;
+                }
+                let before = cands.len();
+                let detail = format!("({})", r.arguments);
+                add(
+                    &mut cands,
+                    &mut seen,
+                    &r.name,
+                    SuggestKind::Function,
+                    &detail,
+                    0,
+                );
+                if cands.len() > before
+                    && !crate::intel::procedure_args_in_parens(input.dialect)
+                    && let Some(c) = cands.last_mut()
+                {
+                    c.insert = Some(r.name.clone());
+                }
+            }
+        }
         ClauseCtx::Qualified(q) => {
             // A qualifier is either a table/alias (→ its columns) or a database name
             // (→ its tables, for `db.table`). The scope resolver no longer misparses
@@ -895,6 +949,7 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
                     }
                 }
             }
+            add_user_functions(&mut cands, &mut seen, 2);
             add_builtins(&mut cands, &mut seen, 2);
             // A keyword the typed word begins competes with the builtins on
             // score, where its prefix bonus lifts it past every builtin that
@@ -945,6 +1000,7 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
         }
         // A value with no columns in reach: functions first, then keywords.
         ClauseCtx::Value => {
+            add_user_functions(&mut cands, &mut seen, 0);
             add_builtins(&mut cands, &mut seen, 0);
             for k in clause_keywords() {
                 let tier = if begins_with(k, prefix) { 0 } else { 1 };
@@ -2797,6 +2853,79 @@ mod tests {
         .filter(|r| r.kind == SuggestKind::Column)
         .map(|r| (r.text, r.insert))
         .collect()
+    }
+
+    #[test]
+    fn the_databases_routines_are_offered_where_each_can_be_called() {
+        use crate::schema::RoutineKind;
+        let routine = |name: &str, kind, args: &str, returns: &str| IndexedRoutine {
+            name: name.to_string(),
+            kind,
+            arguments: args.to_string(),
+            returns: returns.to_string(),
+        };
+        let s = SchemaIndex {
+            routines: vec![
+                routine("refresh_totals", RoutineKind::Procedure, "IN d DATE", ""),
+                routine(
+                    "order_total",
+                    RoutineKind::Function,
+                    "o INT",
+                    "decimal(10,2)",
+                ),
+                routine("audit_row", RoutineKind::Function, "", "trigger"),
+            ],
+            ..shop()
+        };
+        let cont = Continuation::default();
+        let used = HashSet::new();
+        let local = LocalNames::default();
+        let rows = |ctx: ClauseCtx, dialect, prefix: &str| -> Vec<Suggestion> {
+            rank(
+                &s,
+                &RankInput {
+                    ctx: &ctx,
+                    cont: &cont,
+                    scope: &[],
+                    prefix,
+                    snippets: &[],
+                    join_targets: &[],
+                    star: None,
+                    used: &used,
+                    active_db: Some("shop"),
+                    dialect,
+                    flavour: ServerFlavour::Unknown,
+                    local: &local,
+                    wide: false,
+                },
+            )
+        };
+        // After `CALL`: the procedures, and nothing a call cannot run.
+        let call = rows(ClauseCtx::Routine, SqlDialect::MySql, "");
+        let names: Vec<&str> = call.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(names, ["refresh_totals"]);
+        assert_eq!(call[0].kind, SuggestKind::Function);
+        assert_eq!(call[0].detail, "(IN d DATE)");
+        assert_eq!(call[0].insert, None, "the parens come with a function row");
+        // T-SQL's `EXEC` passes its arguments without parens.
+        let exec = rows(ClauseCtx::Routine, SqlDialect::MsSql, "");
+        assert_eq!(exec[0].insert.as_deref(), Some("refresh_totals"));
+        // Where an expression goes: the functions, never a trigger's.
+        let col = rows(ClauseCtx::Column, SqlDialect::Postgres, "order_t");
+        let f = col
+            .iter()
+            .find(|r| r.text == "order_total")
+            .expect("offered");
+        assert_eq!(f.kind, SuggestKind::Function);
+        assert_eq!(f.detail, "(o INT) → decimal(10,2)");
+        for other in ["refresh", "audit"] {
+            let col = rows(ClauseCtx::Column, SqlDialect::Postgres, other);
+            assert!(
+                !col.iter()
+                    .any(|r| r.text == "refresh_totals" || r.text == "audit_row"),
+                "{other}"
+            );
+        }
     }
 
     #[test]

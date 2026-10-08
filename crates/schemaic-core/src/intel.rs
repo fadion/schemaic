@@ -3986,8 +3986,44 @@ pub enum ClauseCtx {
     TempTable,
     /// After a statement-opening `USE` → databases.
     Database,
+    /// The name a statement-opening `CALL` or `EXEC` runs → the database's
+    /// procedures ([`routine_slot`]).
+    Routine,
     /// Anything else → the full mixed list (keywords + tables + columns).
     Other,
+}
+
+/// Does a procedure call take its arguments in parens — `CALL p(1)` — rather
+/// than bare after the name, as T-SQL's `EXEC p @a = 1` does? What a
+/// procedure accepted from the list inserts after its name.
+pub fn procedure_args_in_parens(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => true,
+        SqlDialect::MsSql => false,
+    }
+}
+
+/// Is the word after `toks` — a statement's tokens up to it — the name a
+/// `CALL` (MySQL, PostgreSQL) or `EXEC`/`EXECUTE` (SQL Server) runs? Only
+/// straight after the statement-opening keyword: past the name come the
+/// arguments, which are values.
+fn routine_slot(toks: &[Token], dialect: SqlDialect) -> bool {
+    let [
+        Token {
+            kind: TkKind::Word(w),
+            quoted: false,
+            ..
+        },
+    ] = toks
+    else {
+        return false;
+    };
+    let runs: &[&str] = match dialect {
+        SqlDialect::MySql | SqlDialect::Postgres => &["CALL"],
+        SqlDialect::MsSql => &["EXEC", "EXECUTE"],
+        SqlDialect::Sqlite => &[],
+    };
+    runs.iter().any(|k| k.eq_ignore_ascii_case(w))
 }
 
 /// Is the word at `word_lo` a cast's target type? Straight after an `AS`
@@ -4153,6 +4189,9 @@ pub fn clause_context(sql: &str, lo: usize, word_lo: usize, dialect: SqlDialect)
     }
     if cast_target_at(sql, &toks, word_lo, dialect) {
         return ClauseCtx::Type;
+    }
+    if routine_slot(&toks, dialect) {
+        return ClauseCtx::Routine;
     }
     // The last clause keyword strictly before the caret's word decides the rest
     // — **within the caret's paren**: each `(` opens a scope whose keywords
@@ -21540,6 +21579,21 @@ mod tests {
 
     fn ctx(sql: &str) -> ClauseCtx {
         ctx_at(sql, sql.len())
+    }
+
+    #[test]
+    fn the_name_a_call_or_exec_runs_is_a_routine_slot() {
+        let on = |sql: &str, d| clause_context(sql, 0, word_start(sql, sql.len()), d);
+        assert_eq!(on("CALL ", SqlDialect::MySql), ClauseCtx::Routine);
+        assert_eq!(on("call refre", SqlDialect::Postgres), ClauseCtx::Routine);
+        assert_eq!(on("EXEC usp_", SqlDialect::MsSql), ClauseCtx::Routine);
+        assert_eq!(on("EXECUTE ", SqlDialect::MsSql), ClauseCtx::Routine);
+        // Its arguments are values, and past the name is no longer the slot.
+        assert_ne!(on("CALL p(", SqlDialect::MySql), ClauseCtx::Routine);
+        assert_ne!(on("EXEC p @a = 1, ", SqlDialect::MsSql), ClauseCtx::Routine);
+        // An engine whose statement it is not.
+        assert_ne!(on("CALL ", SqlDialect::Sqlite), ClauseCtx::Routine);
+        assert_ne!(on("EXEC ", SqlDialect::MySql), ClauseCtx::Routine);
     }
 
     /// The word after a statement-opening `USE` is a database; past it, or

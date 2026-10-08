@@ -13379,6 +13379,18 @@ existing prose was left alone.
       `None` beside it). **The `cands.len() > before` guard is load-bearing**: `add` returns
       without pushing for a name the prefix filter, the dedup or the exact match turns away, and
       without the guard `cands.last_mut()` would stamp the name onto whatever was pushed last.
+      **The database's own routines are offered where each can be called**, from
+      `SchemaIndex::routines` (the in-scope database's `DbSchema::routines`, as `IndexedRoutine`).
+      A function joins the builtins wherever an expression goes (`Column`, `Value`), ahead of
+      them so one named like a builtin claims its row, its detail `(arguments) → returns`; a
+      trigger function, which no expression can call, is left out. A procedure is offered at
+      `ClauseCtx::Routine` — the name a statement-opening `CALL` (MySQL, PostgreSQL) or
+      `EXEC`/`EXECUTE` (SQL Server) runs, and nothing past it (`intel::routine_slot`) — where the
+      list opens on an empty word as it does after `FROM`. It is a `Function` row, so it goes in
+      as `name()`, except where `intel::procedure_args_in_parens` says the call passes its
+      arguments bare, T-SQL's `EXEC p @a = 1`, which inserts the name alone
+      (`the_databases_routines_are_offered_where_each_can_be_called`,
+      `the_name_a_call_or_exec_runs_is_a_routine_slot`).
       **The keyword lists are filtered per engine** in every arm that offers them, through a local
       `keywords` closure over `intel::keyword_offered`: `SQL_KEYWORDS` and `STMT_KEYWORDS` are
       shared, and a word the engine has no use for is a row that writes an error — `LIMIT` on SQL

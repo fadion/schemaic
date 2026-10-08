@@ -370,6 +370,7 @@ mod index {
         let mut all_tables: Vec<rank::IndexedTable> = Vec::new();
         let mut views: HashSet<(String, String)> = HashSet::new();
         let mut enum_types: HashMap<String, Vec<String>> = HashMap::new();
+        let mut routines: Vec<rank::IndexedRoutine> = Vec::new();
         for node in nodes {
             if !db_contributes(hidden, &node.database, active_db) {
                 continue;
@@ -398,6 +399,14 @@ mod index {
                         }
                         enum_types.entry(name).or_insert_with(|| e.values.clone());
                     }
+                    // Its stored functions and procedures, offered where each
+                    // can be called.
+                    routines.extend(schema.routines.iter().map(|r| rank::IndexedRoutine {
+                        name: r.name.clone(),
+                        kind: r.kind,
+                        arguments: r.arguments.clone(),
+                        returns: r.returns.clone(),
+                    }));
                 }
                 for t in &schema.tables {
                     by_db.push(t.name.clone());
@@ -500,6 +509,7 @@ mod index {
             all_tables,
             views,
             enum_types,
+            routines,
         }
     }
 }
@@ -1151,9 +1161,11 @@ pub(crate) fn recompute_completions(
 
     // Don't pop the list on every space: an empty prefix only shows suggestions
     // right after a `.`, right after an operand-taking clause keyword (`cont.
-    // auto_show` — columns after WHERE/ON/BY/SET, tables after FROM), or when
+    // auto_show` — columns after WHERE/ON/BY/SET, tables after FROM), after a
+    // `CALL`/`EXEC` (whose name is the one thing the slot can hold), or when
     // explicitly requested (Ctrl+Space).
-    if prefix.is_empty() && !qualified && !force && !cont.auto_show {
+    let routine = matches!(ctx, ClauseCtx::Routine);
+    if prefix.is_empty() && !qualified && !routine && !force && !cont.auto_show {
         comp.open.set(false);
         set_items(comp, Vec::new());
         return;
