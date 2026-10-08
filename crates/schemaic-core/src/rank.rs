@@ -245,6 +245,10 @@ pub struct LocalNames {
     /// `USING (…)` list ([`crate::intel::in_using_list`]) — so a name two
     /// tables share is not qualified there.
     pub bare_columns: bool,
+    /// The statement's CTEs and derived tables, by name, with the columns
+    /// each exposes ([`crate::intel::local_relations`]). Asked before the
+    /// schema for an unqualified name, since a CTE shadows a table of its name.
+    pub relations: Vec<(String, Vec<ColMeta>)>,
 }
 
 /// Everything ranking needs that is not the schema.
@@ -569,7 +573,21 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
     // second copy of each table's columns, and this took one anyway.
     // A qualifier is a database (MySQL), else a schema of the tab's own
     // database (PostgreSQL, SQL Server) — `SchemaIndex::columns_by_schema`.
-    let cols_of = |db: Option<&str>, name: &str| schema.columns_of(db, name);
+    // A bare name is the statement's own CTE or derived table first — one
+    // shadows a table of its name — and the schema's otherwise.
+    let cols_of = |db: Option<&str>, name: &str| -> &[ColMeta] {
+        let local = db.is_none().then(|| {
+            input
+                .local
+                .relations
+                .iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case(name))
+        });
+        match local.flatten() {
+            Some((_, cols)) => cols,
+            None => schema.columns_of(db, name),
+        }
+    };
     // Snippet abbrevs, in the top tier and ahead of the keyword continuations: an
     // abbrev is a name its owner chose *in order to type it*, so when one matches
     // what is being typed it is not a guess the way a ranked keyword is.
@@ -2779,6 +2797,66 @@ mod tests {
         .filter(|r| r.kind == SuggestKind::Column)
         .map(|r| (r.text, r.insert))
         .collect()
+    }
+
+    #[test]
+    fn a_ctes_and_a_derived_tables_columns_are_offered() {
+        let s = shop();
+        let meta = |n: &str| ColMeta {
+            name: n.to_string(),
+            type_name: String::new(),
+            nullable: true,
+            primary_key: false,
+            foreign_key: false,
+        };
+        let local = LocalNames {
+            relations: vec![
+                ("recent".to_string(), vec![meta("id"), meta("pay")]),
+                // A CTE shadows the table it is named after.
+                ("orders".to_string(), vec![meta("only_this")]),
+            ],
+            ..LocalNames::default()
+        };
+        let cont = Continuation::default();
+        let used = HashSet::new();
+        let texts = |ctx: ClauseCtx, scope: &[TableRef]| -> Vec<String> {
+            rank(
+                &s,
+                &RankInput {
+                    ctx: &ctx,
+                    cont: &cont,
+                    scope,
+                    prefix: "",
+                    snippets: &[],
+                    join_targets: &[],
+                    star: None,
+                    used: &used,
+                    active_db: Some("shop"),
+                    dialect: SqlDialect::MySql,
+                    flavour: ServerFlavour::Unknown,
+                    local: &local,
+                    wide: false,
+                },
+            )
+            .into_iter()
+            .filter(|r| r.kind == SuggestKind::Column)
+            .map(|r| r.text)
+            .collect()
+        };
+        let recent = [tref("recent", Some("r"))];
+        assert_eq!(
+            texts(ClauseCtx::Qualified("r".into()), &recent),
+            ["id", "pay"]
+        );
+        let bare = texts(ClauseCtx::Column, &recent);
+        assert!(bare.contains(&"pay".to_string()), "{bare:?}");
+        assert_eq!(
+            texts(
+                ClauseCtx::Qualified("orders".into()),
+                &[tref("orders", None)]
+            ),
+            ["only_this"]
+        );
     }
 
     #[test]

@@ -1167,7 +1167,30 @@ pub(crate) fn recompute_completions(
     // `core::rank`'s module doc for why: all of it used to live here, inside a
     // function taking `&Editor`, where nothing could call it.
     let schema = hidden_dbs.with_untracked(|h| schema_index(db_nodes, h, active_db));
-    let scope = intel::statement_scope(&text, lo, hi, offset, dialect).tables;
+    let mut scope = intel::statement_scope(&text, lo, hi, offset, dialect).tables;
+    // The statement's own CTEs and derived tables, where a column goes: their
+    // columns are in no catalogue. A derived table's alias is in no scope
+    // either (the scope reads through it to the tables inside), so it joins.
+    let relations = if matches!(ctx, ClauseCtx::Column | ClauseCtx::Qualified(_)) {
+        intel::local_relations(&text, lo, hi, dialect)
+    } else {
+        Vec::new()
+    };
+    for r in relations.iter().filter(|r| r.derived) {
+        let named = |t: &intel::TableRef| {
+            t.alias
+                .as_deref()
+                .unwrap_or(&t.name)
+                .eq_ignore_ascii_case(&r.name)
+        };
+        if !scope.iter().any(named) {
+            scope.push(intel::TableRef {
+                name: r.name.clone(),
+                alias: None,
+                db: None,
+            });
+        }
+    }
 
     // Gathered on exactly the paths that used to gather them, which is what keeps
     // the cost where it was: the FK catalog is a walk of the whole schema tree,
@@ -1222,6 +1245,23 @@ pub(crate) fn recompute_completions(
         },
         bare_columns: matches!(ctx, ClauseCtx::Column)
             && intel::in_using_list(&text, lo, offset, dialect),
+        relations: relations
+            .into_iter()
+            .map(|r| {
+                let cols = r
+                    .columns
+                    .into_iter()
+                    .map(|name| rank::ColMeta {
+                        name,
+                        type_name: String::new(),
+                        nullable: true,
+                        primary_key: false,
+                        foreign_key: false,
+                    })
+                    .collect();
+                (r.name, cols)
+            })
+            .collect(),
     };
 
     let ranked = rank::rank_full(

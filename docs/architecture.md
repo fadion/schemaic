@@ -13444,6 +13444,20 @@ existing prose was left alone.
       (`the_documents_variables_and_temp_tables_are_read`,
       `a_sigil_before_the_word_makes_a_variable_or_temp_table_slot`,
       `a_sigil_offers_the_documents_variables_or_temp_tables`).
+      **A CTE's and a derived table's columns are offered as a table's are**, from
+      `LocalNames::relations`: `cols_of` asks them first for a bare name, since a CTE shadows a
+      table it is named after, and the schema otherwise. The caller reads them with
+      `intel::local_relations` at a column or qualified slot, and adds each derived table's alias
+      to the scope, which reads through a derived table to the tables inside and holds no
+      reference for it. `local_relations` finds them by the lexer — `WITH name [(cols)] AS [[NOT]
+      MATERIALIZED] (…)`, and a `(SELECT …)` after `FROM`, `JOIN`, `LATERAL` or a list's comma
+      followed by its alias — because the statement being written does not parse whole; each
+      **body** is parsed alone, and the one still being typed gives nothing. Its columns are a
+      given column list, else the leftmost select list's names (a column's own, an alias's); an
+      unnamed expression and a `*` name nothing knowable and are left out
+      (`a_ctes_columns_are_its_select_lists_names`,
+      `a_derived_tables_columns_are_its_select_lists_names`,
+      `a_ctes_and_a_derived_tables_columns_are_offered`).
       **A column two tables in scope share is inserted qualified** — `c.id`, by the alias of the
       table whose row it is (the last table claims a shared name), else that table's own name —
       because bare, the server refuses it as ambiguous. Not with one table in scope, nor where

@@ -16584,6 +16584,189 @@ pub struct LocalName {
     pub written: String,
 }
 
+/// A relation the statement declares itself, with the columns it exposes —
+/// what [`local_relations`] answers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalRelation {
+    /// As written, quotes off.
+    pub name: String,
+    /// In order: the column list it was given, else its select list's names.
+    pub columns: Vec<String>,
+    /// A derived table (`FROM (SELECT …) d`) rather than a CTE: the scope
+    /// holds no reference for one, so the caller adds it.
+    pub derived: bool,
+}
+
+/// The CTEs and derived tables of the statement at `sql[lo..hi]`, each with
+/// the columns it exposes — what completion offers for `r.` and for a bare
+/// column over `FROM r`, which no catalogue holds.
+///
+/// Found by the lexer, since a statement being written does not parse whole:
+/// `WITH name [(cols)] AS [[NOT] MATERIALIZED] (…)` for a CTE, a `(SELECT …)`
+/// or `(WITH …)` straight after `FROM`, `JOIN`, `LATERAL` or a list's comma,
+/// then its alias and optional column list, for a derived table. Each **body**
+/// is then parsed alone, and a body that does not parse yet — the one being
+/// typed — gives nothing. Its columns are its leftmost select list's: a
+/// column's own name, an alias's; an unnamed expression and a `*` name none
+/// this can know, so they are left out rather than guessed.
+pub fn local_relations(sql: &str, lo: usize, hi: usize, dialect: SqlDialect) -> Vec<LocalRelation> {
+    let toks = tokenize_range(sql, lo, hi, dialect);
+    let word = |i: usize, w: &str| matches!(toks.get(i), Some(Token { kind: TkKind::Word(x), quoted: false, .. }) if x.eq_ignore_ascii_case(w));
+    // The index of the paren closing the one at `open`.
+    let closing = |open: usize| {
+        let mut depth = 0usize;
+        for (k, t) in toks.iter().enumerate().skip(open) {
+            match t.kind {
+                TkKind::LParen => depth += 1,
+                // A `)` before any `(`: `open` was not one.
+                TkKind::RParen if depth == 0 => return None,
+                TkKind::RParen => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(k);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    };
+    // The names in a `(a, b)` list opening at `open`.
+    let list = |open: usize, close: usize| -> Vec<String> {
+        toks[open + 1..close]
+            .iter()
+            .filter_map(|t| match &t.kind {
+                TkKind::Word(w) => Some(w.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    let body_cols = |open: usize, close: usize| -> Vec<String> {
+        let body = &sql[toks[open].end..toks[close].at];
+        match parse_statements(body, dialect).as_deref() {
+            Ok([sqlparser::ast::Statement::Query(q)]) => select_list_names(q),
+            _ => Vec::new(),
+        }
+    };
+    let mut out = Vec::new();
+    // CTEs.
+    for name_tok in cte_name_tokens(&toks) {
+        let TkKind::Word(name) = &name_tok.kind else {
+            continue;
+        };
+        let Some(mut i) = toks.iter().position(|t| std::ptr::eq(t, name_tok)) else {
+            continue;
+        };
+        i += 1;
+        let mut given = None;
+        if matches!(toks.get(i).map(|t| &t.kind), Some(TkKind::LParen))
+            && let Some(c) = closing(i)
+        {
+            given = Some(list(i, c));
+            i = c + 1;
+        }
+        if !word(i, "AS") {
+            continue;
+        }
+        i += 1;
+        if word(i, "NOT") {
+            i += 1;
+        }
+        if word(i, "MATERIALIZED") {
+            i += 1;
+        }
+        let (true, Some(close)) = (
+            matches!(toks.get(i).map(|t| &t.kind), Some(TkKind::LParen)),
+            closing(i),
+        ) else {
+            continue;
+        };
+        let columns = given.unwrap_or_else(|| body_cols(i, close));
+        if !columns.is_empty() {
+            out.push(LocalRelation {
+                name: name.clone(),
+                columns,
+                derived: false,
+            });
+        }
+    }
+    // Derived tables.
+    for (open, t) in toks.iter().enumerate() {
+        if !matches!(t.kind, TkKind::LParen)
+            || !(word(open + 1, "SELECT") || word(open + 1, "WITH"))
+        {
+            continue;
+        }
+        let after_from = open.checked_sub(1).is_some_and(|p| {
+            word(p, "FROM")
+                || word(p, "JOIN")
+                || word(p, "LATERAL")
+                || (matches!(toks[p].kind, TkKind::Comma) && !word(open + 1, "WITH"))
+        });
+        if !after_from {
+            continue;
+        }
+        let Some(close) = closing(open) else {
+            continue;
+        };
+        let mut i = close + 1;
+        if word(i, "AS") {
+            i += 1;
+        }
+        let Some(Token {
+            kind: TkKind::Word(alias),
+            quoted,
+            ..
+        }) = toks.get(i)
+        else {
+            continue;
+        };
+        if !quoted && !is_implicit_alias(alias, dialect) && !word(i - 1, "AS") {
+            continue;
+        }
+        let columns = match (toks.get(i + 1).map(|t| &t.kind), closing(i + 1)) {
+            (Some(TkKind::LParen), Some(c)) => list(i + 1, c),
+            _ => body_cols(open, close),
+        };
+        if !columns.is_empty() {
+            out.push(LocalRelation {
+                name: alias.clone(),
+                columns,
+                derived: true,
+            });
+        }
+    }
+    out
+}
+
+/// The output names of `q`'s leftmost select list, in order — see
+/// [`local_relations`] for which items name one.
+fn select_list_names(q: &sqlparser::ast::Query) -> Vec<String> {
+    use sqlparser::ast::{Expr, SelectItem, SetExpr};
+    let mut body = q.body.as_ref();
+    loop {
+        match body {
+            SetExpr::SetOperation { left, .. } => body = left,
+            SetExpr::Query(inner) => body = inner.body.as_ref(),
+            _ => break,
+        }
+    }
+    let SetExpr::Select(sel) = body else {
+        return Vec::new();
+    };
+    sel.projection
+        .iter()
+        .filter_map(|item| match item {
+            SelectItem::ExprWithAlias { alias, .. } => Some(alias.value.clone()),
+            SelectItem::UnnamedExpr(Expr::Identifier(id)) => Some(id.value.clone()),
+            SelectItem::UnnamedExpr(Expr::CompoundIdentifier(parts)) => {
+                parts.last().map(|p| p.value.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// The CTEs the statement opening at `lo` has declared before `caret` —
 /// [`cte_names`]' reading, with each name's spelling.
 pub fn ctes_at(sql: &str, lo: usize, caret: usize, dialect: SqlDialect) -> Vec<LocalName> {
@@ -28845,6 +29028,57 @@ mod tests {
                 "Unknown table 'employes'".to_string(),
                 "Unknown column 'salery'".to_string()
             ]
+        );
+    }
+
+    fn relations(sql: &str) -> Vec<(String, Vec<String>, bool)> {
+        local_relations(sql, 0, sql.len(), SqlDialect::Postgres)
+            .into_iter()
+            .map(|r| (r.name, r.columns, r.derived))
+            .collect()
+    }
+
+    #[test]
+    fn a_ctes_columns_are_its_select_lists_names() {
+        let v = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            relations(
+                "WITH r AS (SELECT id, e.name, salary * 2 AS pay, count(*) FROM e) SELECT r. FROM r"
+            ),
+            [("r".to_string(), v(&["id", "name", "pay"]), false)]
+        );
+        // A column list renames them, and every CTE of the list is read.
+        assert_eq!(
+            relations(
+                "WITH a (x, y) AS (SELECT 1, 2), b AS MATERIALIZED (SELECT x FROM a) SELECT "
+            ),
+            [
+                ("a".to_string(), v(&["x", "y"]), false),
+                ("b".to_string(), v(&["x"]), false)
+            ]
+        );
+        // A body being written does not parse, and gives nothing.
+        assert!(relations("WITH r AS (SELECT id, FROM e) SELECT").is_empty());
+    }
+
+    #[test]
+    fn a_derived_tables_columns_are_its_select_lists_names() {
+        let v = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            relations("SELECT d. FROM (SELECT id, name AS label FROM e) AS d WHERE"),
+            [("d".to_string(), v(&["id", "label"]), true)]
+        );
+        assert_eq!(
+            relations("SELECT * FROM t JOIN (SELECT 1, 2) d (a, b) ON true"),
+            [("d".to_string(), v(&["a", "b"]), true)]
+        );
+        // A subquery in WHERE is no relation; nor is an unaliased one.
+        assert!(relations("SELECT * FROM t WHERE id IN (SELECT id FROM e) AND").is_empty());
+        assert!(relations("SELECT * FROM (SELECT 1)").is_empty());
+        // Nested in another's parens, the alias is followed by a `)`.
+        assert_eq!(
+            relations("SELECT * FROM t WHERE x IN (SELECT a FROM (SELECT 1 AS a) d)"),
+            [("d".to_string(), v(&["a"]), true)]
         );
     }
 
