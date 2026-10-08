@@ -2032,11 +2032,11 @@ pub struct Tab {
     pub fix_req: RwSignal<Option<String>>,
     /// This tab's offline diagnostics — the squiggles — published by the editor
     /// pane's **debounced** analysis (`editor_pane`, 120 ms with a generation
-    /// guard).
+    /// guard, run on a worker thread).
     ///
     /// It lives on the tab so the status bar can read the result instead of
-    /// re-deriving it: the footer's warning count used to call
-    /// `compute_diagnostics` itself, on every keystroke, undebounced — a full
+    /// re-deriving it: the footer's warning count used to run the analysis
+    /// itself, on every keystroke, undebounced — a full
     /// catalog rebuild plus a full parse of the whole document, measured at
     /// 20 ms per keypress on a 500-table schema with a 47 KB script, walking
     /// straight around the debounce the editor implements for exactly this.

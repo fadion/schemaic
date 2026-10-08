@@ -1851,8 +1851,8 @@ existing prose was left alone.
     `is_known_function(<slice>, name)` to a `catalog_knows(dialect, name)` helper that goes through
     the index the checker itself reads, so a dialect wired to the wrong catalog *or* an index built
     from the wrong slice fails them the same way.
-    **`diagnostics` runs over the whole document on the UI thread 120 ms after a keystroke, with no
-    size cap, and two things in it were redoing work the statement could not change.**
+    **`diagnostics` runs over the whole document 120 ms after a keystroke, with no size cap, and two
+    things in it were redoing work the statement could not change.**
     `static_words` is every keyword and builtin name this crate knows, lowercased, behind a
     `OnceLock` — it was rebuilt inside `typo_checks`, which runs once per statement per tick, so
     ~700 `String` allocations per statement per tick for a value that depends on neither the schema,
@@ -1861,10 +1861,31 @@ existing prose was left alone.
     identical statement** and, on a parse failure, tokenizes it a second time on top — everything
     but `.ctes` then thrown away. Measured at 500 statements, that redundant parse was 10% of an
     `INSERT`-heavy pass and 18% of a `SELECT … JOIN … ORDER BY` one; 72 ms at 98 KB, four dropped
-    frames, on a file size that is an ordinary thing to open here. The one call site is
+    frames while the pass still ran on the UI thread, on a file size that is an ordinary thing to
+    open here. The one call site is
     `diagnostics`' `Ok(asts)` arm, so an AST is always in hand and the `Err` arm never reached this
     function at all — `statement_scope`'s lexer fallback is not lost, only unreachable from here,
     and it yields the same empty CTE list a `len() != 1` parse gives.
+    **`DiagnosticsCache` is `diagnostics` remembered statement by statement**, so a keystroke
+    re-checks the statement it changed and reads the rest back; the editor keeps one per pane and
+    runs it on a worker thread (`editor_pane.rs`). Off T-SQL a range's answer is a function of its
+    own text, of whether it is the buffer's last (redundant in practice — only the last range can
+    be unterminated — but kept in the key), and of the catalog overlaid with the document's
+    `created_tables`. So an entry is keyed by `(text, is_last)` and holds offsets relative to the
+    range's start — a line inserted above moves every statement and invalidates none — and every
+    entry is dropped when the catalog, the dialect or the created set changes. The catalog is
+    compared by `Arc::ptr_eq`, and **the basis holds the `Arc`** so a freed catalog's address cannot
+    be reused by the next one and pass as unchanged. The overlaid catalog is built once per basis
+    rather than once per pass, and entries the latest pass did not use are dropped, so the cache
+    holds one document's worth. **The created set is load-bearing in the basis**: adding or removing
+    a `CREATE TABLE` changes what every *other* statement's unknown-table check sees without
+    touching their text. **T-SQL passes straight through** to `diagnostics` and clears the cache —
+    its ranges share `TsqlFlow` state (an `IF`'s body, a `BEGIN`'s `END`, a batch's `GO`) held as
+    absolute spans, so no range's answer there is its own.
+    `the_diagnostics_cache_answers_what_the_whole_pass_does` drives one cache through typing inside
+    a statement, inserting above it, a `CREATE TABLE` added then removed, a catalog swap and T-SQL,
+    and asserts it equals `diagnostics` at every step; it was watched failing with the created set
+    left out of the basis.
     **Two facts about a FROM source that the resolver was not recording.** `Src::shadowed` is the
     table name an alias **replaced**: an alias is a rename for the whole query rather than a second
     name, and MariaDB 10.11.14 answers `SELECT employees.id FROM employees e` with
@@ -12944,9 +12965,11 @@ existing prose was left alone.
     and refuses when they are not what the tab read.
     **Size is asked before the bytes are.** `open_verdict` confirms past 1 MB and refuses past 64
     MB, and the reason is the editor rather than the read: `fs::read` and `decode` are cheap even at
-    256 MB, while `intel::diagnostics` runs over the whole document on the UI thread 120 ms after
-    every pause in typing — measured 710 ms at 1 MB, 11.4 s at 16 MB, 44.8 s at 64 MB, on an *empty*
-    catalogue.
+    256 MB, while `intel::diagnostics` runs over the whole document 120 ms after every pause in
+    typing — measured 710 ms at 1 MB, 11.4 s at 16 MB, 44.8 s at 64 MB, on an *empty* catalogue.
+    Those figures are a whole uncached pass on the UI thread, which is where it ran when they were
+    taken; it now runs on a worker through a per-statement cache (`intel::DiagnosticsCache`), and
+    the thresholds have not been re-measured against that.
     The naming half is entirely about what a file system will refuse: `suggested_name` maps the
     characters Windows forbids to `-`, trims the trailing dots and spaces it also refuses, appends
     `.sql` only when it isn't already there (a tab opened from `orders.sql` must not suggest
@@ -24096,9 +24119,18 @@ existing prose was left alone.
     would otherwise repaint the accent border grey under the pointer.
   - `grid.rs` — the whole results grid (`GridState`/`GridCtx`; `loaded_view` is the entry point,
     called from the results strip's body). `editor_pane.rs` — SQL editor pane
-    (`query_pane` + the Ctrl+K bar, statement highlight, custom scrollbars). `compute_diagnostics`
-    bridges the tab's schema/active-db to `intel::diagnostics`; `syntax_view` draws severity-coloured
-    squiggles (red errors / amber typo warnings).
+    (`query_pane` + the Ctrl+K bar, statement highlight, custom scrollbars). `syntax_view` draws
+    severity-coloured squiggles (red errors / amber typo warnings).
+    **The diagnostics run off the UI thread.** Both triggers — the 120 ms debounced edit path and
+    the effect that re-checks when the catalog changes — go through `diagnose_in_background`, which
+    builds the catalog on the UI thread (`completion::build_catalog` reads the schema tree's
+    signals), then spawns a `std::thread` that locks the pane's `diag_cache` — one
+    `Arc<Mutex<intel::DiagnosticsCache>>` per pane, recovered if poisoned — and runs
+    `diagnostics_with`, which keeps the `:param` neutralise-then-strip handling in front of the
+    cache. Passes queue on that lock in order. The answer comes back through `create_ext_action`
+    and is set on `syntax` **only if its generation is still the pane's latest** (`diag_gen`) and
+    the tab still lives, so a pass overtaken by typing never paints over a newer one; the status bar
+    goes on reading `Tab::diagnostics`.
     **A failed run's squiggle is `run_diag`, a sibling of live validation's `db_diag`** rather than
     an entry in it, because validation `set`s `db_diag` whole and would wipe it. Every launch — the
     selection and lone-statement Ctrl+Enter, the run menu's two entries, the play button — records

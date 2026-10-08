@@ -7005,6 +7005,103 @@ pub fn diagnostics(sql: &str, catalog: &Catalog, dialect: SqlDialect) -> Vec<Dia
     dedup_diagnostics(out)
 }
 
+/// [`diagnostics`] remembered **statement by statement**, so a keystroke
+/// re-checks the statement it changed and reads the rest from here.
+///
+/// Off T-SQL a statement's diagnostics are a function of its own text, of
+/// whether it is the buffer's last (whose unterminated end is still being
+/// typed), and of the catalog — the loaded schemas overlaid with the tables
+/// the document itself creates ([`created_tables`]). So an entry is keyed by
+/// its text and its being last, holds offsets relative to its start, and every
+/// entry is dropped when the catalog, the dialect or the created set changes.
+/// Entries the latest pass did not use are dropped too, so the cache holds one
+/// document's worth.
+///
+/// **T-SQL passes straight through to [`diagnostics`]**: needing no `;`, its
+/// statements share state across ranges ([`TsqlFlow`]: an `IF`'s body, a
+/// `BEGIN`'s `END`, a batch's `GO`), held as absolute spans — no statement's
+/// answer there is its own. `the_diagnostics_cache_answers_what_the_whole_pass_does`
+/// holds the two equal.
+#[derive(Default)]
+pub struct DiagnosticsCache {
+    /// What the entries were computed against: the catalog as passed (held,
+    /// so its address cannot be reused while it is compared), the dialect, the
+    /// created set, and the catalog that set overlays.
+    basis: Option<CacheBasis>,
+    /// Each statement's diagnostics, offsets relative to its start.
+    stmts: std::collections::HashMap<(String, bool), Vec<Diagnostic>>,
+}
+
+struct CacheBasis {
+    catalog: std::sync::Arc<Catalog>,
+    dialect: SqlDialect,
+    created: Vec<(Option<String>, String)>,
+    overlaid: Option<Catalog>,
+}
+
+impl DiagnosticsCache {
+    /// [`diagnostics`] of `sql`, from the cache where a statement is unchanged.
+    pub fn diagnostics(
+        &mut self,
+        sql: &str,
+        catalog: &std::sync::Arc<Catalog>,
+        dialect: SqlDialect,
+    ) -> Vec<Diagnostic> {
+        if statements_need_no_terminator(dialect) {
+            self.basis = None;
+            self.stmts.clear();
+            return diagnostics(sql, catalog, dialect);
+        }
+        let created = created_tables(sql, dialect);
+        let same = self.basis.as_ref().is_some_and(|b| {
+            std::sync::Arc::ptr_eq(&b.catalog, catalog)
+                && b.dialect == dialect
+                && b.created == created
+        });
+        if !same {
+            self.stmts.clear();
+            let overlaid = (!created.is_empty()).then(|| catalog.with_created(&created));
+            self.basis = Some(CacheBasis {
+                catalog: catalog.clone(),
+                dialect,
+                created,
+                overlaid,
+            });
+        }
+        let basis = self.basis.as_ref().expect("set above");
+        let cat = basis.overlaid.as_ref().unwrap_or(catalog);
+        let ranges =
+            join_procedure_numbers(sql, crate::sql::statement_ranges(sql, dialect), dialect);
+        let last = ranges.len().saturating_sub(1);
+        let mut fresh = std::collections::HashMap::with_capacity(ranges.len());
+        let mut out = Vec::new();
+        for (idx, &(lo, hi)) in ranges.iter().enumerate() {
+            let key = (sql[lo..hi].to_string(), idx == last);
+            let rel = match self.stmts.get(&key) {
+                Some(rel) => rel.clone(),
+                None => {
+                    let mut own = Vec::new();
+                    let mut flow = TsqlFlow::new();
+                    range_diagnostics(sql, lo, hi, idx == last, cat, dialect, &mut flow, &mut own);
+                    own.into_iter()
+                        .map(|d| Diagnostic {
+                            range: (d.range.0.saturating_sub(lo), d.range.1.saturating_sub(lo)),
+                            ..d
+                        })
+                        .collect()
+                }
+            };
+            out.extend(rel.iter().map(|d| Diagnostic {
+                range: (d.range.0 + lo, d.range.1 + lo),
+                ..d.clone()
+            }));
+            fresh.insert(key, rel);
+        }
+        self.stmts = fresh;
+        dedup_diagnostics(out)
+    }
+}
+
 /// `ranges` with each range that a procedure's group number cut — `EXEC
 /// p;2 @a` is two ranges to [`crate::sql::statement_ranges`], whose `;` it is
 /// — joined back to the one before it, where [`numbered_procedures`].
@@ -22504,6 +22601,45 @@ mod tests {
 
     fn pg_diag(sql: &str) -> Vec<Diagnostic> {
         diagnostics(sql, &pg_catalog(), SqlDialect::Postgres)
+    }
+
+    /// **The cache answers exactly what the whole pass does**, edit after
+    /// edit — typing into one statement, inserting one above another (every
+    /// offset below it moves), creating a table the next statement reads, and
+    /// T-SQL, which it passes straight through — with one cache kept across
+    /// the run, as the editor keeps it.
+    #[test]
+    fn the_diagnostics_cache_answers_what_the_whole_pass_does() {
+        let cat = std::sync::Arc::new(pg_catalog());
+        let other = std::sync::Arc::new(pg_catalog());
+        for d in [
+            SqlDialect::Postgres,
+            SqlDialect::MySql,
+            SqlDialect::Sqlite,
+            SqlDialect::MsSql,
+        ] {
+            let mut cache = DiagnosticsCache::default();
+            let steps = [
+                "SELECT nope FROM sales.orders;\nSELECT id FROM customers;",
+                "SELECT nope FROM sales.orders;\nSELECT id FROM customers;\nSELEC",
+                "SELECT x;\nSELECT nope FROM sales.orders;\nSELECT id FROM customers;\nSELEC",
+                "SELECT x;\nSELECT nope FROM sales.orders;\nSELECT id FROM customers;\nSELECT idd FROM customers",
+                "CREATE TABLE t (a int);\nSELECT a FROM t;\nSELECT b FROM t;",
+                "SELECT a FROM t;\nSELECT b FROM t;",
+                "SELECT nope FROM sales.orders;\nSELECT nope FROM sales.orders;",
+                "",
+                "SELECT id FROM customers;\n\n  ",
+            ];
+            for (i, sql) in steps.iter().enumerate() {
+                // Halfway, the catalog itself changes, as a schema reload does.
+                let c = if i < 4 { &cat } else { &other };
+                assert_eq!(
+                    cache.diagnostics(sql, c, d),
+                    diagnostics(sql, c, d),
+                    "{d:?} step {i}: {sql:?}"
+                );
+            }
+        }
     }
 
     #[test]

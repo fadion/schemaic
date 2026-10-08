@@ -3,8 +3,8 @@
 //! the run/AI anchored menus, the statement-highlight + syntax-squiggle overlays
 //! and their geometry helpers
 //! (`underline_seg`/`highlight_pick`/`statement_line_boxes`/`wavy_svg`), the
-//! catalog-aware diagnostics bridge (`compute_diagnostics` → `schemaic_core::
-//! intel`), and the custom overlay scrollbars. `query_pane` is the entry point
+//! catalog-aware diagnostics bridge (`diagnose_in_background` → `schemaic_core::
+//! intel`, on a worker thread), and the custom overlay scrollbars. `query_pane` is the entry point
 //! wired into `center`;
 //! `editor_placeholder` is the no-tab fallback. Autocomplete lives in
 //! `completion`, statement/guard logic in `schemaic_core::sql`.
@@ -1504,21 +1504,19 @@ fn param_row(name: String, store: RwSignal<Vec<params::Binding>>) -> impl IntoVi
 
 // ── Diagnostics (catalog-aware) ──────────────────────────────────────────────
 
-/// Compute the editor's diagnostics for `sql`: catalog-aware unknown-table /
+/// The editor's diagnostics for `sql`: catalog-aware unknown-table /
 /// unknown-column errors, syntax errors on completed statements, and probable
 /// keyword-typo warnings — all from the pure `schemaic_core::intel` engine, which
 /// parses each statement with a real dialect AST and resolves references against
-/// the introspected schema. `active_db` scopes unqualified references (a tab's
-/// selected database); the whole `db_nodes` catalog is still available so an
-/// explicit `otherdb.table` resolves. `pub(crate)` so the status bar reports a
-/// live count from the same analysis that draws the squiggles.
-pub(crate) fn compute_diagnostics(
+/// the introspected schema — through a statement cache the caller keeps
+/// ([`intel::DiagnosticsCache`]). Plain data in and out, so a worker thread can
+/// run it ([`diagnose_in_background`]).
+fn diagnostics_with(
+    cache: &mut intel::DiagnosticsCache,
     sql: &str,
-    db_nodes: RwSignal<Vec<ConnNode>>,
-    active_db: Option<&str>,
+    catalog: &std::sync::Arc<intel::Catalog>,
     dialect: SqlDialect,
 ) -> Vec<Diagnostic> {
-    let catalog = crate::completion::build_catalog(db_nodes, active_db);
     // A `:name` is a syntax error to the parser, and one of those blanks the
     // diagnostics for the whole statement — so the analysis reads a neutralised
     // copy (`:id` → `_id`, byte offsets intact) and the reports that land on the
@@ -1526,11 +1524,46 @@ pub(crate) fn compute_diagnostics(
     // statement is still checked while the query is parameterised.
     let refs = params::scan(sql, dialect);
     if refs.is_empty() {
-        return intel::diagnostics(sql, &catalog, dialect);
+        return cache.diagnostics(sql, catalog, dialect);
     }
     let analysable = params::neutralize(sql, dialect);
-    let diagnostics = intel::diagnostics(&analysable, &catalog, dialect);
+    let diagnostics = cache.diagnostics(&analysable, catalog, dialect);
     params::strip_param_diagnostics(diagnostics, &refs)
+}
+
+/// The pane's diagnostics, **off the UI thread**: the catalog is taken here
+/// (it reads the schema tree's signals), the analysis runs on a worker against
+/// the pane's own statement cache, and the answer is set on `syntax` back on the
+/// UI thread — only if `g` is still the pane's latest generation, so a pass
+/// overtaken by typing never paints over a newer one, and only while the tab
+/// lives. Passes queue on the cache's lock, in order.
+#[allow(clippy::too_many_arguments)]
+fn diagnose_in_background(
+    syntax: RwSignal<Vec<Diagnostic>>,
+    dgen: Rc<std::cell::Cell<u64>>,
+    g: u64,
+    cache: std::sync::Arc<std::sync::Mutex<intel::DiagnosticsCache>>,
+    sql: String,
+    db_nodes: RwSignal<Vec<ConnNode>>,
+    active_db: Option<&str>,
+    dialect: SqlDialect,
+) {
+    let catalog = crate::completion::build_catalog(db_nodes, active_db);
+    let deliver = floem::ext_event::create_ext_action(
+        floem::reactive::Scope::current(),
+        move |diags: Vec<Diagnostic>| {
+            if dgen.get() == g && syntax.try_get_untracked().is_some() {
+                syntax.set(diags);
+            }
+        },
+    );
+    std::thread::spawn(move || {
+        let diags = {
+            let mut cache = cache.lock().unwrap_or_else(|p| p.into_inner());
+            diagnostics_with(&mut cache, &sql, &catalog, dialect)
+        };
+        deliver(diags);
+    });
 }
 
 /// What one editor pane should do about the inline-AI state it is watching.
@@ -2956,6 +2989,8 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     // `diag_gen` and only the latest generation's deferred pass re-parses, so we
     // don't re-parse the whole document on every character.
     let diag_gen: Rc<std::cell::Cell<u64>> = Rc::new(std::cell::Cell::new(0));
+    // The pane's statement cache, which the worker passes share.
+    let diag_cache = std::sync::Arc::new(std::sync::Mutex::new(intel::DiagnosticsCache::default()));
     // Seed the tab's diagnostics from the text this pane opens on, and re-run when
     // the *catalog* moves under them — unknown-table/unknown-column errors depend
     // on it, so a set computed before introspection landed is stale. Tracks
@@ -2964,12 +2999,14 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     // schema arrivals coalesces into one parse.
     {
         let dgen = diag_gen.clone();
+        let cache = diag_cache.clone();
         create_effect(move |_| {
             db_nodes.track();
             let adb = active_db.get();
             let g = dgen.get().wrapping_add(1);
             dgen.set(g);
             let dgen = dgen.clone();
+            let cache = cache.clone();
             let dia = dialect.get_untracked();
             floem::action::exec_after(std::time::Duration::from_millis(120), move |_| {
                 if dgen.get() != g || syntax.try_get_untracked().is_none() {
@@ -2978,7 +3015,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 let Some(q) = query.try_get_untracked() else {
                     return;
                 };
-                syntax.set(compute_diagnostics(&q, db_nodes, adb.as_deref(), dia));
+                diagnose_in_background(syntax, dgen, g, cache, q, db_nodes, adb.as_deref(), dia);
             });
         });
     }
@@ -5162,16 +5199,21 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 diag_gen.set(g);
                 let text = text.clone();
                 let dgen = diag_gen.clone();
+                let cache = diag_cache.clone();
                 floem::action::exec_after(std::time::Duration::from_millis(120), move |_| {
                     if dgen.get() != g || syntax.try_get_untracked().is_none() {
                         return;
                     }
-                    syntax.set(compute_diagnostics(
-                        &text,
+                    diagnose_in_background(
+                        syntax,
+                        dgen,
+                        g,
+                        cache,
+                        text,
                         db_nodes,
                         active_db.get_untracked().as_deref(),
                         dialect.get_untracked(),
-                    ));
+                    );
                 });
             }
             // Tier-2: debounced live DB validation of the statement under the
