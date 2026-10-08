@@ -53,3 +53,16 @@ matching.
 
 Schemaic passes `schemaic_core::APP_ID`. Upstream Floem (after 0.2) may grow
 its own setter; if it does, drop this entry and use theirs.
+
+### 2. The gutter fills every caret's band before drawing any number
+
+**Why.** `EditorGutterView::paint` drew the line numbers top to bottom and,
+on reaching the primary caret's line, filled the current-line band for *every*
+caret. A secondary caret above the primary one therefore had its band painted
+over its own, already-drawn number (Alt+click lines 1 and 3: line 1's number
+vanished), and once the primary caret's line scrolled out of view no caret's
+band was filled at all.
+
+**What.** `src/views/editor/gutter.rs`, `paint`: the band-filling block is
+moved, unchanged, out of the number loop to just before it, inside the same
+`screen_lines.with_untracked`. Nothing else in the method changes.

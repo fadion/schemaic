@@ -32639,8 +32639,11 @@ Re-introducing the anti-patterns these guard against is a regression:
   them all, and the procedure for a new release — vendor it the same way, re-apply the list, drop
   what upstream has absorbed, and delete the directory and the `[patch]` entry once the list is
   empty. The first entry is `WindowConfig::app_id`, which Floem 0.2 has no counterpart for; why the
-  app needs it is under `app::update`'s Linux packaging. **Three measures keep upstream's code out
-  of the workspace's checks, and each looks removable**: `exclude = ["vendor"]` in the root
+  app needs it is under `app::update`'s Linux packaging. The second moves the gutter's
+  current-line band fill in `EditorGutterView::paint` ahead of the number loop: upstream filled
+  every caret's band on reaching the *primary* caret's line, over a secondary caret's number
+  already drawn above it, and filled none once the primary's line scrolled off. **Three measures
+  keep upstream's code out of the workspace's checks, and each looks removable**: `exclude = ["vendor"]` in the root
   manifest, since a path dependency inside the workspace directory would otherwise join it as a
   member; `vendor/floem/rustfmt.toml` with `disable_all_formatting = true`, since `cargo fmt --all`
   formats local path dependencies too and CI's `--check` would fail on code that is not ours; and a
