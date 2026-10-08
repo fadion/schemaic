@@ -12483,8 +12483,12 @@ existing prose was left alone.
     SQLite's `?1`, `$p` and `@p` came out `? 1`, `$ p` and `@ p`, and MySQL's `@x`, `@@version` and
     an account's host, `'u'@'h'`, came out `@ x`, `@ @ version` and `'u' @ 'h'` — each refused
     where the input ran (MySQL 8 and MariaDB 10.11 measured; `'u' @'h'` and `u @h`, the spaced forms
-    the fix still writes, both run — measured again on 2026-10-05, after an audit took them for
-    refused: the space *after* the `@` is the one MySQL 8 refuses). So `$` before a word byte is a
+    the fix wrote, both run — measured again on 2026-10-05, after an audit took them for
+    refused: the space *after* the `@` is the one MySQL 8 refuses). A quoted user's host is now
+    written tight, `'u'@'h'` and `` `u`@`h` `` (`need_space`; a view's `DEFINER` pins the backtick
+    form in `a_views_header_keeps_its_line_and_its_check_option_takes_one`); a bare `u @h` is still
+    spaced.
+    So `$` before a word byte is a
     prefix on all four (a dollar *quote* is `skip_noncode`'s and taken first; MySQL's `$p` is a
     name, T-SQL's `$1.50` money and `$action` `MERGE`'s), `?` before a digit on SQLite, and
     `@`/`@@` on MySQL and SQLite, MySQL's also before a quote, so `@'q v'` is one `Kind::Quoted`.
@@ -12518,7 +12522,22 @@ existing prose was left alone.
     off from the name (`spaced_paren`), each top-level comma breaks, and its `)` returns to the
     opener's indent — a `Paren::listed`, whose inside is still an expression paren, so `CHARACTER
     SET` and `ON DELETE` keep their lines; `KEY`, `UNIQUE` and `CHECK` take a spaced `(` as a
-    clause's does (`a_create_tables_body_is_one_item_a_line`). And a `'…'` literal that
+    clause's does (`a_create_tables_body_is_one_item_a_line`). **A column list after a name is
+    set off the same way** (`opens_column_list`): `REFERENCES u (id)`, `INDEX ix (a)`, `KEY k (a)`,
+    a view's `VIEW v (x, y)`, and — only in a `CREATE … INDEX` statement — its `ON t (a)` and the
+    method's `USING btree (…)`, so a join's `ON f(x)` stays a call; `INCLUDE (x)` is a keyword's
+    paren (`an_indexs_column_list_is_set_off_from_its_table`). **An `ALTER TABLE` with several
+    actions puts one on a line**, one in from `ALTER TABLE [IF EXISTS] [ONLY] name`
+    (`opens_alter_actions`, which looks ahead for a top-level comma before the statement ends); a
+    single action keeps the header's line, and a comma inside its own parens — `ADD INDEX ix (a,
+    b)` — is not a second (`an_alter_tables_actions_go_one_a_line`,
+    `a_single_alter_action_keeps_its_line`). The `OR` of `CREATE OR REPLACE` broke the line as a
+    boolean `OR` and no longer does, and SQLite's `INSERT OR IGNORE INTO`/`UPDATE OR ROLLBACK` and
+    MySQL's `INSERT IGNORE INTO` keep their conflict words on the head's line (`head_followers`;
+    `an_or_that_spells_a_statement_is_no_boolean`). A view's `WITH [CASCADED | LOCAL] CHECK OPTION`
+    takes a line of its own at the statement's base, ending the query
+    (`a_views_header_keeps_its_line_and_its_check_option_takes_one`). Like everything here, these
+    move only whitespace — no token's text changes. And a `'…'` literal that
     followed another across a newline in the input breaks to a new line again, through `between`:
     on PostgreSQL `'foo'⏎'bar'` is one literal only because of the newline, and joined onto one line
     it is a syntax error. Literals written on one line stay on one

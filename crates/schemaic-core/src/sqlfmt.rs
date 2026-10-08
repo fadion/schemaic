@@ -567,6 +567,27 @@ fn sigil_len(b: &[u8], i: usize, dialect: SqlDialect) -> usize {
     }
 }
 
+/// Where the name that ends just before `toks[k]` begins — back over `a.b.c`,
+/// quoted or not — or `None` when no name ends there.
+fn name_start(toks: &[(Kind, &str)], k: usize) -> Option<usize> {
+    let mut i = k;
+    loop {
+        match i.checked_sub(1).map(|j| toks[j].0) {
+            Some(Kind::Word | Kind::Quoted) => i -= 1,
+            _ => return None,
+        }
+        match i.checked_sub(1).map(|j| toks[j]) {
+            Some((Kind::Punct, ".")) => i -= 1,
+            _ => return Some(i),
+        }
+    }
+}
+
+/// Is `toks[j]` the word `w`, in any case?
+fn word_is(toks: &[(Kind, &str)], j: usize, w: &str) -> bool {
+    matches!(toks.get(j), Some((Kind::Word, t)) if t.eq_ignore_ascii_case(w))
+}
+
 /// Does the next token begin a statement — is the last one before it, comments
 /// aside, the statement terminator in force (`delim`, or `;` when that is
 /// `None`), a directive, or nothing at all?
@@ -847,7 +868,13 @@ fn head_followers(up: &str) -> &'static [&'static str] {
         "GROUP" | "ORDER" => &["BY"],
         "SELECT" => &["DISTINCT", "ALL", "DISTINCTROW", "SQL_CALC_FOUND_ROWS"],
         "UNION" => &["ALL", "DISTINCT"],
-        "INSERT" | "REPLACE" => &["INTO"],
+        // SQLite's conflict clause, `INSERT OR IGNORE INTO`, and MySQL's
+        // `INSERT IGNORE INTO`.
+        "INSERT" => &[
+            "OR", "REPLACE", "IGNORE", "ABORT", "FAIL", "ROLLBACK", "INTO",
+        ],
+        "REPLACE" => &["INTO"],
+        "UPDATE" => &["OR", "REPLACE", "IGNORE", "ABORT", "FAIL", "ROLLBACK"],
         "DELETE" => &["FROM"],
         "WITH" => &["RECURSIVE"],
         _ => &[],
@@ -928,6 +955,8 @@ fn is_keyword(w: &str) -> bool {
                 | "KEY"
                 | "UNIQUE"
                 | "CHECK"
+                // An index's covered columns: `INCLUDE (x)`.
+                | "INCLUDE"
         )
 }
 
@@ -1277,6 +1306,11 @@ impl<'a> Fmt<'a> {
         if *pk == Kind::Punct && (pt == "(" || pt == "." || pt == "::" || pt == "[") {
             return false;
         }
+        // An account's host sits against its user, `'u'@'h'`, as it is written.
+        // The spaced `'u' @'h'` runs too (measured); it only reads wrong.
+        if *pk == Kind::Quoted && (cur.starts_with("@'") || cur.starts_with("@`")) {
+            return false;
+        }
         // cur forces no preceding space
         if cur_kind == Kind::Punct && matches!(cur, ")" | "," | ";" | "." | "::" | "]") {
             return false;
@@ -1330,24 +1364,87 @@ impl<'a> Fmt<'a> {
         if self.verb.as_deref() != Some("CREATE") {
             return false;
         }
-        // Back over the name — `a.b.c`, quoted or not — to the words before it.
-        let mut i = k;
-        loop {
-            match i.checked_sub(1).map(|j| toks[j].0) {
-                Some(Kind::Word | Kind::Quoted) => i -= 1,
-                _ => return false,
-            }
-            match i.checked_sub(1).map(|j| toks[j]) {
-                Some((Kind::Punct, ".")) => i -= 1,
-                _ => break,
-            }
-        }
-        let word = |j: usize, w: &str| matches!(toks.get(j), Some((Kind::Word, t)) if t.eq_ignore_ascii_case(w));
+        let Some(mut i) = name_start(toks, k) else {
+            return false;
+        };
+        let word = |j: usize, w: &str| word_is(toks, j, w);
         // `IF NOT EXISTS` between `TABLE` and the name.
         if i >= 3 && word(i - 1, "EXISTS") && word(i - 2, "NOT") && word(i - 3, "IF") {
             i -= 3;
         }
         i >= 1 && word(i - 1, "TABLE")
+    }
+
+    /// Is the `(` at `toks[k]` a column list after a name — `REFERENCES u
+    /// (id)`, `INDEX ix (a)`, `KEY k (a)`, a view's `VIEW v (x, y)`, an index's
+    /// `ON t (a)` and its method's `USING btree (a)`? Set off from the name, as
+    /// a table body's `(` is, rather than read as a call's.
+    fn opens_column_list(&self, toks: &[(Kind, &str)], k: usize) -> bool {
+        let Some(i) = name_start(toks, k).filter(|&i| i > 0) else {
+            return false;
+        };
+        let Some((Kind::Word, before)) = toks.get(i - 1) else {
+            return false;
+        };
+        let creates = matches!(self.verb.as_deref(), Some("CREATE"));
+        match before.to_ascii_uppercase().as_str() {
+            "REFERENCES" | "INDEX" | "KEY" => true,
+            "VIEW" => creates || self.verb.as_deref() == Some("ALTER"),
+            // A join's `ON f(x)` is a call; only an index's `ON` names a table.
+            "ON" | "USING" => {
+                creates
+                    && toks[..i]
+                        .iter()
+                        .rev()
+                        .take_while(|&&(kind, t)| {
+                            !matches!(
+                                (kind, t),
+                                (Kind::Terminator | Kind::Directive, _) | (Kind::Punct, ";")
+                            )
+                        })
+                        .any(|&(kind, t)| kind == Kind::Word && t.eq_ignore_ascii_case("INDEX"))
+            }
+            _ => false,
+        }
+    }
+
+    /// Does the word at `toks[k]` open the first of an `ALTER TABLE`'s several
+    /// actions — `ALTER TABLE [IF EXISTS] [ONLY] name ACTION …, ACTION …`?
+    /// Then each goes on a line of its own, one in from the header. A single
+    /// action keeps the header's line, and a comma inside its own parens
+    /// (`ADD INDEX ix (a, b)`) is not a second.
+    fn opens_alter_actions(&self, toks: &[(Kind, &str)], k: usize) -> bool {
+        if self.verb.as_deref() != Some("ALTER") || !self.parens.is_empty() {
+            return false;
+        }
+        let Some(mut i) = name_start(toks, k) else {
+            return false;
+        };
+        let word = |j: usize, w: &str| word_is(toks, j, w);
+        // Still in the header: what ends there is `IF EXISTS` or `ONLY`.
+        if ["IF", "EXISTS", "ONLY"].iter().any(|w| word(k - 1, w)) {
+            return false;
+        }
+        if i >= 1 && word(i - 1, "ONLY") {
+            i -= 1;
+        }
+        if i >= 2 && word(i - 1, "EXISTS") && word(i - 2, "IF") {
+            i -= 2;
+        }
+        if !(i >= 2 && word(i - 1, "TABLE") && word(i - 2, "ALTER")) {
+            return false;
+        }
+        let mut depth = 0usize;
+        for &(kind, t) in &toks[k..] {
+            match (kind, t) {
+                (Kind::Terminator | Kind::Directive, _) | (Kind::Punct, ";") => break,
+                (Kind::Punct, "(") => depth += 1,
+                (Kind::Punct, ")") => depth = depth.saturating_sub(1),
+                (Kind::Punct, ",") if depth == 0 => return true,
+                _ => {}
+            }
+        }
+        false
     }
 
     /// Is the head word `up` at `toks[k]` only **spelling** a clause, inside
@@ -1480,6 +1577,22 @@ impl<'a> Fmt<'a> {
                     let after_dot = matches!(&self.prev, Some((Kind::Punct, p)) if p == ".");
                     let called = is_called_keyword(&up)
                         && matches!(toks.get(k + 1), Some((Kind::Punct, "(")));
+                    if self.opens_alter_actions(toks, k) {
+                        self.content = self.base + 1;
+                        self.break_to(self.content);
+                    }
+                    // `CREATE OR REPLACE` is no boolean `OR`. (SQLite's `INSERT
+                    // OR IGNORE` is its head's follower.)
+                    let verb_or = up == "OR"
+                        && self.verb.as_deref() == Some("CREATE")
+                        && self.prev_word_upper().as_deref() == Some("CREATE");
+                    // A view's `WITH [CASCADED | LOCAL] CHECK OPTION` ends its
+                    // query on a line of its own.
+                    let check_option = up == "WITH"
+                        && !in_expr
+                        && matches!(self.verb.as_deref(), Some("CREATE" | "ALTER"))
+                        && (word_is(toks, k + 2, "OPTION") || word_is(toks, k + 3, "OPTION"))
+                        && (word_is(toks, k + 1, "CHECK") || word_is(toks, k + 2, "CHECK"));
                     if self.go_separates && up == "GO" && !after_dot && self.pending.is_some() {
                         // **Never alone on a line where `GO` separates
                         // batches**, which a name `go` would be once its
@@ -1583,7 +1696,10 @@ impl<'a> Fmt<'a> {
                             self.awaiting = Some(("THEN", "WHEN"));
                             self.content = level + 1;
                         }
-                    } else if called {
+                    } else if called || verb_or {
+                        self.emit(Kind::Word, text, false);
+                    } else if check_option {
+                        self.break_to(self.base);
                         self.emit(Kind::Word, text, false);
                     } else if up == "CASE" && self.prev_word_upper().as_deref() != Some("END") {
                         // Opens a frame; `END CASE`'s word closes one instead.
@@ -1683,9 +1799,9 @@ impl<'a> Fmt<'a> {
                     "(" => {
                         let sub = self.next_is_subquery(toks, k);
                         let body = !sub && self.opens_table_body(toks, k);
-                        // A table's body is set off from its name; a call's
-                        // `(` would sit against it.
-                        self.spaced_paren = body;
+                        // A table's body or a column list is set off from its
+                        // name; a call's `(` would sit against it.
+                        self.spaced_paren = body || (!sub && self.opens_column_list(toks, k));
                         self.emit(Kind::Punct, "(", false);
                         self.spaced_paren = false;
                         self.parens.push(Paren {
@@ -1842,7 +1958,7 @@ mod tests {
                 ON DELETE CASCADE ON UPDATE SET NULL)"
             ),
             "CREATE TABLE t (\n    id int NOT NULL,\n    name varchar(40) CHARACTER SET utf8mb4,\n    \
-             PRIMARY KEY (id),\n    CONSTRAINT fk FOREIGN KEY (a) REFERENCES b(id) \
+             PRIMARY KEY (id),\n    CONSTRAINT fk FOREIGN KEY (a) REFERENCES b (id) \
              ON DELETE CASCADE ON UPDATE SET NULL\n)"
         );
         assert_eq!(
@@ -1862,7 +1978,7 @@ mod tests {
             my(
                 "ALTER TABLE t ADD CONSTRAINT fk FOREIGN KEY (a) REFERENCES b (id) ON DELETE CASCADE"
             ),
-            "ALTER TABLE t ADD CONSTRAINT fk FOREIGN KEY (a) REFERENCES b(id) ON DELETE CASCADE"
+            "ALTER TABLE t ADD CONSTRAINT fk FOREIGN KEY (a) REFERENCES b (id) ON DELETE CASCADE"
         );
         assert_eq!(
             my("SELECT a, count(*) FROM t GROUP BY a WITH ROLLUP"),
@@ -3245,5 +3361,77 @@ mod tests {
         let caret = old.find(" from").unwrap();
         let at = caret_after_format(old, caret, &new);
         assert!(new[..at].ends_with('b'), "{:?}", &new[..at]);
+    }
+
+    #[test]
+    fn an_alter_tables_actions_go_one_a_line() {
+        assert_eq!(
+            my(
+                "ALTER TABLE t ADD COLUMN a int NOT NULL DEFAULT 0, DROP COLUMN b, \
+                MODIFY c varchar(10), ADD INDEX ix (a, c)"
+            ),
+            "ALTER TABLE t\n    ADD COLUMN a int NOT NULL DEFAULT 0,\n    DROP COLUMN b,\n    \
+             MODIFY c varchar(10),\n    ADD INDEX ix (a, c)"
+        );
+        assert_eq!(
+            super::format_sql(
+                "alter table if exists only s.t alter column a set default 0, \
+                 alter column b drop not null",
+                "    ",
+                SqlDialect::Postgres
+            ),
+            "alter table if exists only s.t\n    alter column a set default 0,\n    \
+             alter column b drop not null"
+        );
+    }
+
+    #[test]
+    fn a_single_alter_action_keeps_its_line() {
+        let one =
+            "ALTER TABLE t ADD CONSTRAINT fk FOREIGN KEY (a) REFERENCES u (id) ON DELETE CASCADE";
+        assert_eq!(my(one), one);
+        // A comma inside the action's own parens is not a second action.
+        let cols = "ALTER TABLE t ADD INDEX ix (a, b)";
+        assert_eq!(my(cols), cols);
+    }
+
+    #[test]
+    fn an_indexs_column_list_is_set_off_from_its_table() {
+        assert_eq!(
+            my("CREATE UNIQUE INDEX ix_a ON t(a, b DESC) WHERE a > 0"),
+            "CREATE UNIQUE INDEX ix_a ON t (a, b DESC)\nWHERE\n    a > 0"
+        );
+        let pg = "CREATE INDEX ix ON t USING btree (lower(name)) INCLUDE (x)";
+        assert_eq!(super::format_sql(pg, "    ", SqlDialect::Postgres), pg);
+        // A join's `ON f(x)` is still a call.
+        assert!(my("SELECT a FROM t JOIN u ON f(u.id) = t.id").contains("ON f(u.id)"));
+    }
+
+    #[test]
+    fn a_views_header_keeps_its_line_and_its_check_option_takes_one() {
+        assert_eq!(
+            my("CREATE OR REPLACE VIEW v (x, y) AS SELECT a, b FROM t WITH CHECK OPTION"),
+            "CREATE OR REPLACE VIEW v (x, y) AS\nSELECT\n    a,\n    b\nFROM\n    t\nWITH CHECK OPTION"
+        );
+        let out = my("CREATE DEFINER=`root`@`%` VIEW v AS SELECT a FROM t WITH LOCAL CHECK OPTION");
+        assert!(
+            out.starts_with("CREATE DEFINER = `root`@`%` VIEW v AS\n"),
+            "{out}"
+        );
+        assert!(out.ends_with("\nWITH LOCAL CHECK OPTION"), "{out}");
+        assert!(my("CREATE USER 'a'@'h'").ends_with("'a'@'h'"));
+    }
+
+    #[test]
+    fn an_or_that_spells_a_statement_is_no_boolean() {
+        for (d, sql) in [
+            (SqlDialect::Postgres, "CREATE OR REPLACE FUNCTION"),
+            (SqlDialect::Sqlite, "INSERT OR REPLACE INTO"),
+            (SqlDialect::Sqlite, "UPDATE OR IGNORE"),
+            (SqlDialect::MySql, "INSERT IGNORE INTO"),
+        ] {
+            let out = super::format_sql(&format!("{sql} t"), "    ", d);
+            assert!(out.starts_with(sql), "{out}");
+        }
     }
 }
