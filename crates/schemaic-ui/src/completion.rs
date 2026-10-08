@@ -1220,6 +1220,8 @@ pub(crate) fn recompute_completions(
         } else {
             Vec::new()
         },
+        bare_columns: matches!(ctx, ClauseCtx::Column)
+            && intel::in_using_list(&text, lo, offset, dialect),
     };
 
     let ranked = rank::rank_full(

@@ -241,6 +241,10 @@ pub struct LocalNames {
     /// The document's temporary tables ([`crate::intel::temp_tables_at`]),
     /// offered straight after `#`.
     pub temp_tables: Vec<crate::intel::LocalName>,
+    /// The slot takes a column's bare name and nothing else — a join's
+    /// `USING (…)` list ([`crate::intel::in_using_list`]) — so a name two
+    /// tables share is not qualified there.
+    pub bare_columns: bool,
 }
 
 /// Everything ranking needs that is not the schema.
@@ -840,10 +844,36 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
                 // rank first (tier 0) and claim shared names; earlier tables fall to
                 // tier 1 (still above functions/keywords).
                 let last = scope.len() - 1;
+                let first_col = cands.len();
                 for (i, r) in scope.iter().enumerate().rev() {
                     let tier = if i == last { 0 } else { 1 };
                     for c in cols_of(r.db.as_deref(), &r.name) {
                         add_col(&mut cands, &mut seen, c, &r.name, r.alias.as_deref(), tier);
+                    }
+                }
+                // **A name two tables share is inserted qualified** — bare, the
+                // server refuses it as ambiguous — by the table whose row it is
+                // (its alias, else its name). Not where the slot takes a bare
+                // name only (`USING (…)`).
+                if scope.len() > 1 && !input.local.bare_columns {
+                    let q = |s: &str| crate::export::ident_if_needed(s, input.dialect);
+                    for c in &mut cands[first_col..] {
+                        let shared = scope
+                            .iter()
+                            .filter(|r| {
+                                cols_of(r.db.as_deref(), &r.name)
+                                    .iter()
+                                    .any(|m| m.name.eq_ignore_ascii_case(&c.text))
+                            })
+                            .count();
+                        if c.kind == SuggestKind::Column && shared > 1 {
+                            let qual = if c.alias.is_empty() {
+                                &c.table
+                            } else {
+                                &c.alias
+                            };
+                            c.insert = Some(format!("{}.{}", q(qual), q(&c.text)));
+                        }
                     }
                 }
             }
@@ -1016,8 +1046,9 @@ pub fn accepted_insert(
 ) -> Option<String> {
     // Inside a quote the user opened, a table row is its name alone: a
     // qualified insert (`sales.ledger`, the widened list's references) would
-    // land after the quote as one identifier with a dot in it.
-    if in_quoted_name && s.kind == SuggestKind::Table {
+    // land after the quote as one identifier with a dot in it. So is a column
+    // row, which is qualified where two tables share its name.
+    if in_quoted_name && matches!(s.kind, SuggestKind::Table | SuggestKind::Column) {
         return None;
     }
     if s.insert.is_some() {
@@ -2711,6 +2742,67 @@ mod tests {
         );
         // And the plain `orders` row is still below it rather than gone.
         assert!(out.iter().any(|s| s.text == "orders"), "{out:?}");
+    }
+
+    /// `(text, insert)` of each column row ranked at a column slot over `scope`.
+    fn column_inserts(
+        scope: &[TableRef],
+        prefix: &str,
+        bare: bool,
+    ) -> Vec<(String, Option<String>)> {
+        let s = shop();
+        let cont = Continuation::default();
+        let used = HashSet::new();
+        let local = LocalNames {
+            bare_columns: bare,
+            ..LocalNames::default()
+        };
+        rank(
+            &s,
+            &RankInput {
+                ctx: &ClauseCtx::Column,
+                cont: &cont,
+                scope,
+                prefix,
+                snippets: &[],
+                join_targets: &[],
+                star: None,
+                used: &used,
+                active_db: Some("shop"),
+                dialect: SqlDialect::MySql,
+                flavour: ServerFlavour::Unknown,
+                local: &local,
+                wide: false,
+            },
+        )
+        .into_iter()
+        .filter(|r| r.kind == SuggestKind::Column)
+        .map(|r| (r.text, r.insert))
+        .collect()
+    }
+
+    #[test]
+    fn a_column_two_tables_share_is_inserted_qualified() {
+        let scope = [tref("orders", Some("o")), tref("customers", Some("c"))];
+        let rows = column_inserts(&scope, "", false);
+        let insert = |n: &str| rows.iter().find(|r| r.0 == n).map(|r| r.1.clone());
+        // `id` is in both: the row is the last table's, and says which.
+        assert_eq!(insert("id"), Some(Some("c.id".to_string())));
+        // A name only one table has stays bare.
+        assert_eq!(insert("total"), Some(None));
+        assert_eq!(insert("email"), Some(None));
+        // A table with no alias is qualified by its own name.
+        let rows = column_inserts(&[tref("orders", None), tref("customers", None)], "i", false);
+        assert!(
+            rows.contains(&("id".to_string(), Some("customers.id".to_string()))),
+            "{rows:?}"
+        );
+        // One table in scope: nothing to tell apart.
+        let rows = column_inserts(&[tref("orders", Some("o"))], "i", false);
+        assert!(rows.contains(&("id".to_string(), None)), "{rows:?}");
+        // A `USING (…)` list takes the bare name, whatever is in scope.
+        let rows = column_inserts(&scope, "i", true);
+        assert!(rows.contains(&("id".to_string(), None)), "{rows:?}");
     }
 
     /// `enum_value_suggestions` at the `|`, as `(text, insert, replaced text)`.

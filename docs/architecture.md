@@ -13444,6 +13444,14 @@ existing prose was left alone.
       (`the_documents_variables_and_temp_tables_are_read`,
       `a_sigil_before_the_word_makes_a_variable_or_temp_table_slot`,
       `a_sigil_offers_the_documents_variables_or_temp_tables`).
+      **A column two tables in scope share is inserted qualified** — `c.id`, by the alias of the
+      table whose row it is (the last table claims a shared name), else that table's own name —
+      because bare, the server refuses it as ambiguous. Not with one table in scope, nor where
+      the slot takes a bare name only: a join's `USING (…)` list, which `intel::in_using_list`
+      reads as the innermost paren open at the word being a `USING (`'s and the caller passes as
+      `LocalNames::bare_columns`. Inside a quoted name `accepted_insert` gives a column its bare
+      name, as it gives a table (`a_column_two_tables_share_is_inserted_qualified`,
+      `a_using_list_is_told_from_other_parens`).
       **Inside a string compared with an enum or set column, the list is that column's members**
       (`enum_value_suggestions`, which `rank` never reaches — its caller is the literal gate's
       exception, under `completion.rs`). The column is resolved in the statement's scope through the slot's

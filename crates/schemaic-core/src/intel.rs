@@ -15295,6 +15295,30 @@ pub fn caret_in_literal_or_comment(
     )
 }
 
+/// Is the word at `caret` inside a join's `USING (…)` column list — the one
+/// place a column must be named bare? Reading `sql` from `lo`: the innermost
+/// paren open at the word is a `USING (`'s.
+pub fn in_using_list(sql: &str, lo: usize, caret: usize, dialect: SqlDialect) -> bool {
+    let word_lo = word_start(sql, caret);
+    let toks = tokenize_range(sql, lo, word_lo, dialect);
+    // The innermost paren still open at the word.
+    let mut open: Vec<usize> = Vec::new();
+    for (i, t) in toks.iter().enumerate() {
+        match t.kind {
+            TkKind::LParen => open.push(i),
+            TkKind::RParen => {
+                open.pop();
+            }
+            _ => {}
+        }
+    }
+    open.last()
+        .and_then(|&i| i.checked_sub(1))
+        .is_some_and(|k| {
+            matches!(&toks[k].kind, TkKind::Word(w) if !toks[k].quoted && w.eq_ignore_ascii_case("USING"))
+        })
+}
+
 /// A string literal the caret is in, where the string is a column's **value**:
 /// what [`enum_value_slot`] answers.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -28822,6 +28846,28 @@ mod tests {
                 "Unknown column 'salery'".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn a_using_list_is_told_from_other_parens() {
+        let at = |sql: &str, d| {
+            let caret = sql.find('|').unwrap();
+            let sql = sql.replace('|', "");
+            in_using_list(&sql, 0, caret, d)
+        };
+        let my = SqlDialect::MySql;
+        assert!(at("SELECT * FROM a JOIN b USING (|", my));
+        assert!(at("SELECT * FROM a JOIN b USING (id, na|", my));
+        assert!(at("SELECT * FROM a JOIN b using(|", my));
+        assert!(!at("SELECT * FROM a JOIN b USING (id) WHERE |", my));
+        assert!(!at("SELECT * FROM a JOIN b ON (|", my));
+        assert!(!at("SELECT f(|", my));
+        assert!(!at(
+            "SELECT * FROM a WHERE x IN (SELECT y FROM b USING (id) WHERE |",
+            my
+        ));
+        // PostgreSQL's `DELETE … USING` lists tables, with no paren.
+        assert!(!at("DELETE FROM a USING b WHERE |", SqlDialect::Postgres));
     }
 
     /// `enum_value_slot` at the `|`: `(qualifier, column, typed, closed)`.
