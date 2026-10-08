@@ -96,6 +96,12 @@ pub(crate) struct Completion {
     /// while the list is already open, and kept while it stays open — the
     /// next list that opens by typing starts narrow again.
     pub(crate) wide: RwSignal<bool>,
+    /// What each connection's user has accepted before (`accepted.json`):
+    /// recorded by [`accept_completion`], read as a ranking bonus by
+    /// [`recompute_completions`].
+    pub(crate) accepted: crate::stored::Stored<schemaic_core::accepted::AcceptedFile>,
+    /// The tab's connection, which an accepted word is recorded against.
+    pub(crate) conn: RwSignal<u64>,
 }
 
 /// The ranking vocabulary, which lives in `core::rank` — see that module for why
@@ -1321,6 +1327,10 @@ pub(crate) fn recompute_completions(
                 .unwrap_or_default(),
             local: &local,
             wide: comp.wide.get_untracked(),
+            accepted: &comp
+                .accepted
+                .read_only()
+                .with_untracked(|f| f.bonuses(conn_id, crate::now_secs())),
         },
     );
 
@@ -1382,6 +1392,10 @@ pub(crate) fn accept_completion(ed: &Editor, comp: Completion, dialect: SqlDiale
         // `edit_single` doesn't move the caret, so place it explicitly.
         ed.cursor
             .update(|c| c.set_offset(from + caret, false, false));
+        // Taken once more on this connection: it ranks higher next time.
+        let conn = comp.conn.get_untracked();
+        comp.accepted
+            .update(|f| f.record(conn, &word, crate::now_secs()));
     }
     comp.open.set(false);
     set_items(comp, Vec::new());

@@ -6,6 +6,7 @@
 //! connection + schema models in [`connection`]/[`schema`]; and config
 //! persistence in [`persist`].
 
+pub mod accepted;
 pub mod activity;
 pub mod aggregate;
 pub mod blob;

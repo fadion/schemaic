@@ -289,6 +289,9 @@ pub struct RankInput<'a> {
     pub star: Option<&'a StarExpansion>,
     /// Lowercased identifiers already written in this statement (recency).
     pub used: &'a HashSet<String>,
+    /// What this connection's user has accepted before, lower-cased, with the
+    /// bonus each has earned ([`crate::accepted::AcceptedFile::bonuses`]).
+    pub accepted: &'a HashMap<String, i32>,
     /// The tab's database, for the "don't offer the database you are in" rule.
     pub active_db: Option<&'a str>,
     /// The tab's engine, which decides **which builtin catalog** is offered.
@@ -1076,8 +1079,10 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
     let mut scored: Vec<(u8, i32, Cand)> = cands
         .into_iter()
         .filter_map(|c| {
-            fuzzy_score(&c.text, prefix)
-                .map(|s| (c.tier, s + recency_bonus(&c.text, c.kind, used), c))
+            fuzzy_score(&c.text, prefix).map(|s| {
+                let earned = accepted_bonus(&c.text, input.accepted);
+                (c.tier, s + recency_bonus(&c.text, c.kind, used) + earned, c)
+            })
         })
         .collect();
     scored.sort_by(|a, b| {
@@ -1397,6 +1402,17 @@ pub fn recency_bonus(text: &str, kind: SuggestKind, used: &HashSet<String>) -> i
     }
 }
 
+/// The bonus a candidate has earned by being accepted on this connection
+/// before ([`RankInput::accepted`]) — any kind, a keyword or a snippet as much
+/// as a name: what the user keeps choosing is what they will choose again.
+/// Free when nothing has been.
+pub fn accepted_bonus(text: &str, accepted: &HashMap<String, i32>) -> i32 {
+    if accepted.is_empty() {
+        return 0;
+    }
+    accepted.get(&text.to_lowercase()).copied().unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1505,11 +1521,63 @@ mod tests {
                 flavour,
                 local: &LocalNames::default(),
                 wide: false,
+                accepted: &Default::default(),
             },
         )
         .into_iter()
         .map(|s| s.text)
         .collect()
+    }
+
+    /// **What the user keeps accepting ranks higher**, through `rank` itself:
+    /// `customers` sorts below the shorter `orders` until it has been taken
+    /// before — and a prefix that matches one name better still wins.
+    #[test]
+    fn a_word_accepted_before_ranks_above_its_equals() {
+        let schema = shop();
+        let rank_with = |prefix: &str, accepted: &HashMap<String, i32>| -> Vec<String> {
+            let (cont, used) = (Continuation::default(), HashSet::new());
+            rank(
+                &schema,
+                &RankInput {
+                    ctx: &ClauseCtx::Table,
+                    cont: &cont,
+                    scope: &[],
+                    prefix,
+                    snippets: &[],
+                    join_targets: &[],
+                    star: None,
+                    used: &used,
+                    active_db: Some("shop"),
+                    dialect: SqlDialect::MySql,
+                    flavour: ServerFlavour::Unknown,
+                    local: &LocalNames::default(),
+                    wide: false,
+                    accepted,
+                },
+            )
+            .into_iter()
+            .map(|s| s.text)
+            .collect()
+        };
+        let pos = |rows: &[String], w: &str| rows.iter().position(|r| r == w).unwrap();
+        let none = rank_with("", &HashMap::new());
+        assert!(pos(&none, "orders") < pos(&none, "customers"), "{none:?}");
+        let mut taken = HashMap::new();
+        taken.insert("customers".to_string(), crate::accepted::bonus(3, 60));
+        let after = rank_with("", &taken);
+        assert!(
+            pos(&after, "customers") < pos(&after, "orders"),
+            "{after:?}"
+        );
+        // `ord` is a prefix of one and not the other: the earned bonus does
+        // not outweigh it.
+        let typed = rank_with("ord", &taken);
+        assert_eq!(
+            typed.first().map(String::as_str),
+            Some("orders"),
+            "{typed:?}"
+        );
     }
 
     /// A builtin the engine calls bare is offered with its bare name to insert,
@@ -1536,6 +1604,7 @@ mod tests {
                     flavour: ServerFlavour::Unknown,
                     local: &LocalNames::default(),
                     wide: false,
+                    accepted: &Default::default(),
                 },
             )
             .into_iter()
@@ -1726,6 +1795,7 @@ mod tests {
                     flavour: ServerFlavour::Unknown,
                     local: &names,
                     wide: false,
+                    accepted: &Default::default(),
                 },
             )
             .into_iter()
@@ -1769,6 +1839,7 @@ mod tests {
                     flavour: ServerFlavour::Unknown,
                     local: &LocalNames::default(),
                     wide: false,
+                    accepted: &Default::default(),
                 },
             )
             .into_iter()
@@ -1820,6 +1891,7 @@ mod tests {
                     flavour: ServerFlavour::Unknown,
                     local: &LocalNames::default(),
                     wide: false,
+                    accepted: &Default::default(),
                 },
             );
             let row = |name: &str| {
@@ -1888,6 +1960,7 @@ mod tests {
                 flavour: ServerFlavour::Unknown,
                 local: &LocalNames::default(),
                 wide: false,
+                accepted: &Default::default(),
             },
         )
         .into_iter()
@@ -1948,6 +2021,7 @@ mod tests {
                     flavour: ServerFlavour::Unknown,
                     local: &LocalNames::default(),
                     wide: false,
+                    accepted: &Default::default(),
                 },
             )
             .into_iter()
@@ -1993,6 +2067,7 @@ mod tests {
                     flavour: ServerFlavour::Unknown,
                     local: &LocalNames::default(),
                     wide,
+                    accepted: &Default::default(),
                 },
             )
         };
@@ -2113,6 +2188,7 @@ mod tests {
                     flavour: ServerFlavour::Unknown,
                     local: &names,
                     wide: false,
+                    accepted: &Default::default(),
                 },
             )
         };
@@ -2236,6 +2312,7 @@ mod tests {
                     flavour: ServerFlavour::Unknown,
                     local: &LocalNames::default(),
                     wide: false,
+                    accepted: &Default::default(),
                 },
             )
             .into_iter()
@@ -2301,6 +2378,7 @@ mod tests {
                 flavour: ServerFlavour::Unknown,
                 local: &LocalNames::default(),
                 wide: false,
+                accepted: &Default::default(),
             },
         )
         .completes_a_word
@@ -2501,6 +2579,7 @@ mod tests {
                 flavour: ServerFlavour::Unknown,
                 local: &LocalNames::default(),
                 wide: false,
+                accepted: &Default::default(),
             },
         )
         .into_iter()
@@ -2542,6 +2621,7 @@ mod tests {
                     flavour: ServerFlavour::Unknown,
                     local: &LocalNames::default(),
                     wide: false,
+                    accepted: &Default::default(),
                 },
             )
             .into_iter()
@@ -2604,6 +2684,7 @@ mod tests {
                     flavour: ServerFlavour::Unknown,
                     local: &LocalNames::default(),
                     wide: false,
+                    accepted: &Default::default(),
                 },
             )
         };
@@ -2672,6 +2753,7 @@ mod tests {
                 flavour: ServerFlavour::Unknown,
                 local: &LocalNames::default(),
                 wide: false,
+                accepted: &Default::default(),
             },
         );
         let email = out.iter().find(|s| s.text == "email").expect("offered");
@@ -2712,6 +2794,7 @@ mod tests {
                     flavour: ServerFlavour::Unknown,
                     local: &LocalNames::default(),
                     wide: false,
+                    accepted: &Default::default(),
                 },
             )
         };
@@ -2757,6 +2840,7 @@ mod tests {
                 flavour: ServerFlavour::Unknown,
                 local: &LocalNames::default(),
                 wide: false,
+                accepted: &Default::default(),
             },
         )
         .into_iter()
@@ -2804,6 +2888,7 @@ mod tests {
                 flavour: ServerFlavour::Unknown,
                 local: &LocalNames::default(),
                 wide: false,
+                accepted: &Default::default(),
             },
         );
         let first = out.first().expect("something is offered");
@@ -2847,6 +2932,7 @@ mod tests {
                 flavour: ServerFlavour::Unknown,
                 local: &local,
                 wide: false,
+                accepted: &Default::default(),
             },
         )
         .into_iter()
@@ -2897,6 +2983,7 @@ mod tests {
                     flavour: ServerFlavour::Unknown,
                     local: &local,
                     wide: false,
+                    accepted: &Default::default(),
                 },
             )
         };
@@ -2965,6 +3052,7 @@ mod tests {
                     flavour: ServerFlavour::Unknown,
                     local: &local,
                     wide: false,
+                    accepted: &Default::default(),
                 },
             )
             .into_iter()
@@ -3150,6 +3238,7 @@ mod tests {
                 flavour: ServerFlavour::Unknown,
                 local: &LocalNames::default(),
                 wide: false,
+                accepted: &Default::default(),
             },
         );
         assert_eq!(
@@ -3211,6 +3300,7 @@ mod tests {
                 flavour: ServerFlavour::Unknown,
                 local: &LocalNames::default(),
                 wide: false,
+                accepted: &Default::default(),
             },
         );
         let first = out.first().expect("something is offered");

@@ -1874,6 +1874,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         db_colors,
         table_colors,
         db_favorites,
+        accepted,
     } = ui_stores::wire();
 
     // Tab state. When "restore tabs on startup" is on and the last session saved
@@ -10695,6 +10696,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             db_colors.erase(|v| schemaic_core::db_color::clear_conn(v, id));
             table_colors.erase(|v| schemaic_core::db_color::table_clear_conn(v, id));
             db_favorites.erase(|v| schemaic_core::favorite::clear_conn(v, id));
+            accepted.erase(|f| schemaic_core::accepted::clear_conn(&mut f.rules, id));
             // Its poll interval too. Not because the id could come back —
             // `next_id_after` sees to that — but because a rule keyed to a
             // connection that is gone is a row nothing will ever read, in a file
@@ -12772,6 +12774,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         db_colors,
         table_colors,
         db_favorites,
+        accepted,
         resources,
         update_state,
         apply_update,
@@ -13498,14 +13501,20 @@ mod app_tests {
         // erase this gate can no longer see. Add a needle here *and* a gate
         // there, never only the needle.
         //
-        // **The four `Stored` stores count by their writer, and only one of
+        // **The five `Stored` stores count by their writer, and only one of
         // their two writers may appear.** `Stored::erase` saves `Erasing` by
         // construction (`schemaic_ui::stored`'s tests pin it), so its call is the
         // erase this gate counts. `Stored::update` saves `Replacing` just as
         // invisibly — no `Saving::Replacing` in the text for the ban above to
         // find — so for these stores `update` is banned by name: pruning one
         // with it would keep the deleted connection's rules in `<store>.bak`.
-        let stored = ["db_colors", "table_colors", "db_favorites", "formats"];
+        let stored = [
+            "db_colors",
+            "table_colors",
+            "db_favorites",
+            "formats",
+            "accepted",
+        ];
         for store in stored {
             let update = format!("{store}.update(");
             assert!(
@@ -13542,8 +13551,8 @@ mod app_tests {
         // green — the slack a floor leaves is exactly one lost store. A new
         // store raises this number in the same change that adds its erase.
         assert_eq!(
-            erasing, 11,
-            "{erasing} erasing saves in the delete closure, not the eleven stores \
+            erasing, 12,
+            "{erasing} erasing saves in the delete closure, not the twelve stores \
              keyed to the connection; every one has to be erased, and a new one \
              raises this count"
         );

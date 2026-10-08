@@ -2526,6 +2526,9 @@ pub(crate) struct QueryPaneParams {
     /// The run history, every connection's — what an inline prediction
     /// remembers when `intel::predict` has nothing (`completion::prediction_at`).
     pub history: RwSignal<Vec<schemaic_core::history::HistoryEntry>>,
+    /// The completion items each connection's user has accepted before
+    /// ([`Ui::accepted`](crate::Ui::accepted)).
+    pub accepted: crate::stored::Stored<schemaic_core::accepted::AcceptedFile>,
     /// Every open tab, whose statements a prediction remembers from too.
     pub tabs: RwSignal<Vec<crate::Tab>>,
     /// Requests a debounced DB validation of the statement under the cursor.
@@ -2590,6 +2593,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         predictions,
         remembered_predictions,
         history,
+        accepted,
         tabs,
         validate_stmt,
         popup_menu,
@@ -2615,6 +2619,8 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         ghost: RwSignal::new(None),
         word_complete: RwSignal::new(false),
         wide: RwSignal::new(false),
+        accepted,
+        conn: active_conn,
     };
     let cmdk = CmdK {
         open: RwSignal::new(false),

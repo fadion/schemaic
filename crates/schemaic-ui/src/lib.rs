@@ -6499,6 +6499,10 @@ pub struct Ui {
     /// `(conn_id, database)` in favorite order (oldest first); set from the schema
     /// tree's right-click menu, shown as a gold star and sorted to the top.
     pub db_favorites: stored::Stored<Vec<FavoriteRule>>,
+    /// The completion items each connection's user has accepted (persisted to
+    /// `accepted.json`), which rank the suggestion list by how often and how
+    /// lately each was taken.
+    pub accepted: stored::Stored<schemaic_core::accepted::AcceptedFile>,
     /// The app process's own CPU/RAM usage, sampled on a timer at the app
     /// boundary and shown in the status bar. Transient (never persisted).
     pub resources: RwSignal<ResourceSample>,
@@ -9035,6 +9039,7 @@ fn center(ui: Ui) -> impl IntoView {
                     predictions,
                     remembered_predictions,
                     history: ui.history.entries,
+                    accepted: ui.accepted,
                     tabs,
                     validate_stmt: validate_stmt.clone(),
                     popup_menu: popup,
@@ -9904,8 +9909,9 @@ fn result_chip_menu(id: u64, tab: Tab, gctx: &GridCtx) {
     gctx.popup.set(Some(entries));
 }
 
-/// Now, in epoch seconds — for a result's age in the strip's tooltip.
-fn now_secs() -> u64 {
+/// Now, in epoch seconds — for a result's age in the strip's tooltip, and an
+/// accepted completion's.
+pub(crate) fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())

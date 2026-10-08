@@ -9097,7 +9097,7 @@ existing prose was left alone.
     the pack above a user snippet moved to "All connections" — a snippet they wrote, losing its
     abbrev to one they cannot delete or re-spell.
     `clear_conn`/`count_conn` drop a deleted connection's `Scope::Conn` snippets, for the two
-    reasons `delete_conn_now` states about its twelve siblings: a deleted connection should not be
+    reasons `delete_conn_now` states about its thirteen siblings: a deleted connection should not be
     reconstructable from what is left on disk, and connection ids are **recycled**, so a snippet
     left behind is inherited by the next connection to take the freed id, under a heading reading
     "THIS CONNECTION".
@@ -11241,7 +11241,7 @@ existing prose was left alone.
     the next candidate and finally to `None` is what the callers already handle.
     `UiState`/`ui_state.json` is the original tenant and
     `tabs.json`, `connections.json`, `history.json`, `chats.json`, `snippets.json`,
-    `favorites.json`, `db_colors.json`, `diagrams.json`, `search_history.json` and
+    `favorites.json`, `db_colors.json`, `diagrams.json`, `search_history.json`, `accepted.json` and
     `ssh_known_hosts.json` all arrived behind it. Every decision in it is pure and testable because
     **the filesystem is an argument**: `FileStore` is the seam `write_bytes` and `read_bytes` take,
     the way `secrets::SecretStore` does for the keyring and for the same reason. What had no test
@@ -11363,11 +11363,12 @@ existing prose was left alone.
     `saver(file, build)`, which passes the argument straight through to `write_json_store` and so
     keeps no policy of its own. They are no longer on `Ui` at all: each is sealed with its signal
     inside a `ui/stored.rs` `Stored`, whose `update` passes `Replacing` and whose `erase` passes
-    `Erasing`; the app's `save_ui` takes one directly. The delete closure's own gate asserts a
-    floor of ten erasing saves in it — **two of the ten delegated**, since the history store's
+    `Erasing`; the app's `save_ui` takes one directly. The delete closure's own gate asserts
+    exactly twelve erasing saves in it — an equality, since a floor of ten stayed green with
+    `table_colors.erase` deleted — **two of the twelve delegated**, since the history store's
     prune moved to `app/history_store.rs` and the snippet store's to `app/snippet_store.rs`, the
     closure holding only the call to each, whose erase is gated in the module it moved to — and
-    counts the four `Stored` stores' `.erase(` calls toward the same floor.
+    counts the five `Stored` stores' `.erase(` calls toward the same total.
     **The tenth is the Find-Anywhere search history, and it was pruned in that closure while being
     saved nowhere in it** — its persistence was a `create_effect` at the top of `main` calling
     `persist::save_json`, so the prune notified the effect, the effect saved `Replacing`, and the
@@ -13291,6 +13292,21 @@ existing prose was left alone.
     - `favorite.rs` — the `(conn_id, database)` star list. `toggle` appends newest-**last** on
       purpose: `rank` (0 = that connection's oldest) is what the schema tree sorts by, so order in
       the `Vec` *is* the sort key.
+    - `accepted.rs` — the completion items the user has taken, per connection (`AcceptedFile`,
+      `accepted.json`), which `rank` reads as a bonus (under `rank.rs`). A rule is
+      `(conn_id, text)` with a `count` and a `last` (Unix seconds), and the lower-cased text is the
+      whole key: the list a caret offers has already decided what a word *is* there, and this only
+      says how much the user has wanted it before. `record` bumps both; past `PER_CONN` (500) words
+      on one connection it evicts **that connection's** longest-unused word, never another's
+      (`a_full_connection_forgets_its_longest_unused_word_only`), so the file stays bounded however
+      long it is used. `bonus(count, age)` is frequency in steps — 4 for one accept, 7 for two or
+      three, 10 up to nine, 12 beyond — halved past a week and quartered past a month, plus 4 inside
+      the hour or 2 inside the day, capped at `MAX_BONUS` (16). **The cap is the design, not a
+      tidy-up**: it sits under a prefix match's +40 in `fuzzy_score`, so a word that matches what
+      is typed better still wins over one merely chosen often; it is about the size of the
+      in-statement `recency_bonus`'s 18. `bonuses` is the
+      map `rank` takes for one connection, words earning nothing left out. `clear_conn` is the
+      deleted connection's half, as on its siblings.
     - `db_hidden.rs` — the `(conn_id, database)` set behind the SCHEMA panel's eye, the third store
       on that context menu and the last one to be keyed by connection. A flat `Vec<String>` of bare
       names meant hiding `world` on one server hid a live `world` on every other — out of the tree,
@@ -13390,8 +13406,11 @@ existing prose was left alone.
     - `rank.rs` — the autocomplete **ranking policy**: which candidates a caret position offers and
       in what order. `rank(&SchemaIndex, &RankInput)` collects candidates into context tiers (dedup
       by text, first/lowest tier wins, and a candidate equal to the typed prefix is dropped), scores
-      each by `fuzzy_score` plus `recency_bonus`, and sorts by tier, then score, then length,
-      capped at `MAX_ROWS`. `fuzzy_score` is a subsequence match that rewards a hit at a word's
+      each by `fuzzy_score` plus `recency_bonus` plus `accepted_bonus`, and sorts by tier, then
+      score, then length, capped at `MAX_ROWS`. `accepted_bonus` is what this connection has
+      accepted before (`RankInput::accepted`, under `accepted.rs`) and applies to any kind — a
+      keyword or a snippet as much as a name — where `recency_bonus` lifts identifiers only; it is
+      asserted through `rank` itself (`a_word_accepted_before_ranks_above_its_equals`). `fuzzy_score` is a subsequence match that rewards a hit at a word's
       start — the name's, after `_`, or at a camelCase hump, so `oi` finds `OrderItem`'s words as
       it finds `order_item`'s (`a_camel_case_hump_scores_as_a_word_boundary`). **A table, column
       or database row inserts its name through `export::ident_if_needed`** where that differs from
@@ -21383,9 +21402,10 @@ existing prose was left alone.
     are `get`, `get_untracked`, `with`, `with_untracked` and `read_only() -> ReadSignal<T>`, and the
     last is what every consumer that only reads now takes — `db_color_dot`, `table_color_dot`,
     `favorite_star`, the ER overlay, the history panel, the tab strip, `visible_nav_rows` and the
-    schema tree's node-context structs — so the writable handle reaches only the two places that
+    schema tree's node-context structs — so the writable handle reaches only the three places that
     write: the schema tree's right-click menu in `overlays.rs` (four colour entries and one
-    favourite) and the grid's `set_format`, through `GridState::fmt_rules`.
+    favourite), the grid's `set_format`, through `GridState::fmt_rules`, and
+    `completion::accept_completion`, through `Completion::accepted` (under `completion.rs`).
     **The saver sits in a signal of its own (`RwSignal<Rc<dyn Fn(Saving)>>`) so that `Stored` is
     `Copy`**, like the `RwSignal` it replaced: `GridState` stays `Copy` and every closure that
     captured the old field keeps its shape, and the grid's `RwSignal<Option<SaveFormats>>` wrapper
@@ -23695,6 +23715,14 @@ existing prose was left alone.
     part after the caret too, and the `(` test reads past it — so accepting `customer_id` at
     `cust|_id` no longer writes `customer_id_id`
     (`an_accept_replaces_the_whole_word_the_caret_is_in`).
+    **An accept is remembered per connection**: `accept_completion` records the taken row's text
+    against the tab's connection (`Completion::conn`, the editor's `active_conn`) in
+    `Completion::accepted`, and `recompute_completions` hands that connection's `bonuses` to
+    `RankInput::accepted` (under `accepted.rs`). Both accept routes — the key in `editor_pane.rs`
+    and a click on the popup — go through `accept_completion`, so neither can skip the record. The
+    cost is named: the record is a `Stored::update`, a `Replacing` save written synchronously on
+    the UI thread, once per accept and never per keystroke. `Ui::accepted` and
+    `QueryPaneParams::accepted` carry the store in from `app/ui_stores.rs`.
     **A table row writes its alias after it** (`orders o`) where `intel::table_alias_at` finds the
     slot for one (under `intel.rs`), behind Settings → Editor → *Table aliases* — on by default,
     `UiState::completion_table_aliases` (`default_true`, pinned by
@@ -28393,7 +28421,7 @@ existing prose was left alone.
     tab-id allocator and the placement closure and never touches this store; it is put into
     `HistoryActions` beside `clear` and `remove` at the `Ui` literal. And the connection-deletion
     prune became a one-line `(history_clear_conn)(id)` call rather than moving, because the block it
-    sits in erases thirteen stores in a row under an invariant of its own, and each store being one
+    sits in erases fourteen stores in a row under an invariant of its own, and each store being one
     line is what keeps that readable.
     `the_removal_paths_erase` is the module's reason for existing, as a gate: exactly three erasing
     and two replacing saves inside `wire`, and `history.json` named once, as `FILE`. It scans its own
@@ -28423,11 +28451,11 @@ existing prose was left alone.
     file to `search_history.json.bak` under a confirm reading *"It can't be undone"*. It has an
     explicit saver now and the closure calls it with `Saving::Erasing` right after the prune, the
     floor going 9 → 10 and watched failing at the old state.
-    **`ui/stored.rs`'s `Stored` is the same blind spot reached from the other side.** The four
+    **`ui/stored.rs`'s `Stored` is the same blind spot reached from the other side.** The five
     stores it wraps save inside their own writers, so there is no `Saving::` text in the closure for
     either half of the gate to see — and `Stored::update` saves `Replacing` just as invisibly as
     `erase` saves `Erasing`. So the gate counts `<store>.erase(` for `db_colors`, `table_colors`,
-    `db_favorites` and `formats` toward the same floor, and **bans `<store>.update(` for them in the
+    `db_favorites`, `formats` and `accepted` toward the same count, and **bans `<store>.update(` for them in the
     closure by name**, since the text ban on `Saving::Replacing` cannot. That ban was watched
     failing against a `db_colors.update(` prune before the prune was switched to `erase`.
   - `snippet_store.rs` — the snippet library's store: the persisted **user** list and the nine
@@ -28480,19 +28508,21 @@ existing prose was left alone.
     needle (`"(snippet_clear_conn)("` beside `"(history_clear_conn)("`), exactly as its own comment
     instructs. `clear_conn` is the prune that block's prose calls *the twelfth store, and the one
     that was missed*, and that reasoning now also sits on `SnippetStore::clear_conn`'s doc.
-  - `ui_stores.rs` — the three small stores **the UI owns and the app only persists**: per-column
-    display formatters (`format.json`), identity colours for databases and tables (`db_colors.json`)
-    and favourited databases (`favorites.json`). **The third cut of the `app_view` split, and
+  - `ui_stores.rs` — the small stores **the UI owns and the app only persists**: per-column
+    display formatters (`format.json`), identity colours for databases and tables (`db_colors.json`),
+    favourited databases (`favorites.json`) and the completion items each connection has accepted
+    (`accepted.json`, the fourth and latest). **The third cut of the `app_view` split, and
     deliberately *not* the sibling of the two above — the difference is what this entry is for.**
     Those two own their mutators, so each can hold the rule *every mutation is followed by the right
-    kind of save* and gate it exactly. These three cannot: every mutation is in `schemaic-ui` — the
-    grid's "Format as" menu, the schema tree's Colour swatches and Favourite/Unfavourite — so the rule
+    kind of save* and gate it exactly. These cannot: every mutation is in `schemaic-ui` — the
+    grid's "Format as" menu, the schema tree's Colour swatches and Favourite/Unfavourite, the
+    completion popup's accept — so the rule
     lives in the type they are handed as instead, `ui/stored.rs`'s `Stored`, whose only writers
     save. **This module is the one place a writable signal for them exists**, and only for as long
     as it takes to build the savers that read it: `wire()` makes each `RwSignal` and its saver and
-    returns `Stored::new(signal, saver)` for each — four handles over three files, the colour pair
-    sharing `save_db_colors` — and `UiStores` holds those four and nothing else. What the module
-    owns beyond that is the three file names, once each as consts, and one `saver(file, build)`
+    returns `Stored::new(signal, saver)` for each — five handles over four files, the colour pair
+    sharing `save_db_colors` — and `UiStores` holds those five and nothing else. What the module
+    owns beyond that is the four file names, once each as consts, and one `saver(file, build)`
     helper so a fourth store cannot arrive with a fifth shape. `build` is re-run
     on every save rather than captured once, because the UI writes these signals between saves and a
     captured value would persist whatever the store held when `wire` ran. Its own gate,
@@ -28512,7 +28542,7 @@ existing prose was left alone.
     `persist::Saving`, because each has a caller that is a **deletion**: the connection-deletion
     prune must erase, or the deleted connection's databases, tables and columns stay readable in
     `<store>.json.bak` under a confirm saying they cannot be recovered. It does so with
-    `Stored::erase` on all four, so the colour pair's file is written twice — the second write the
+    `Stored::erase` on all five, so the colour pair's file is written twice — the second write the
     one with both halves pruned, and neither leaving a `.bak`. That dispatch is
     `persist::write_json_store`'s, which is why — unlike the other two stores — this module holds no
     `match` of its own. It made `serde` a direct dependency of `schemaic-app`, which it already was

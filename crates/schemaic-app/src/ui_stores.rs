@@ -1,6 +1,6 @@
-//! The three small stores **the UI owns and the app only persists**: per-column
-//! display formatters, identity colours (database and table), and favourited
-//! databases.
+//! The small stores **the UI owns and the app only persists**: per-column
+//! display formatters, identity colours (database and table), favourited
+//! databases, and the completion items each connection's user has accepted.
 //!
 //! The third cut of the `app_view` split, and it is deliberately *not* shaped
 //! like [`crate::history_store`] and [`crate::snippet_store`] — the difference
@@ -8,14 +8,15 @@
 //! siblings and guarantees nothing.
 //!
 //! Those two own their mutators, so each can hold the rule *every mutation is
-//! followed by the right kind of save* and gate it. These three are mutated in
+//! followed by the right kind of save* and gate it. These are mutated in
 //! `schemaic-ui` — the grid's "Format as" menu, the schema tree's Colour and
-//! Favorite entries — so the rule lives in the type they are handed as:
+//! Favorite entries, the completion popup's accept — so the rule lives in the
+//! type they are handed as:
 //! [`Stored`], whose only writers save. **This module is the one place a
 //! writable signal for them exists**, and only for as long as it takes to build
 //! the savers that read it; what leaves [`wire`] is `Stored` and nothing else.
-//! What the module owns beyond that is the three file names, once each, and one
-//! [`saver`] so a fourth store cannot arrive with a fourth shape.
+//! What the module owns beyond that is the file names, once each, and one
+//! [`saver`] so another store cannot arrive with a shape of its own.
 //!
 //! That replaced a source gate in `schemaic-ui` which matched a
 //! `persist::Saving::` within 700 bytes of each core mutator. It worked, but it
@@ -31,7 +32,7 @@
 //!
 //! Each save takes its [`persist::Saving`] rather than assuming `Replacing`,
 //! because each has a caller that is a **deletion**: connection deletion prunes
-//! all three with `Stored::erase`, or the deleted connection's databases, tables
+//! every one with `Stored::erase`, or the deleted connection's databases, tables
 //! and columns would stay readable in `<store>.json.bak` under a confirm saying
 //! they cannot be recovered. That dispatch is `persist::write_json_store`'s,
 //! which is why — unlike the two stores above — this module holds no `match` of
@@ -42,6 +43,7 @@ use std::rc::Rc;
 use floem::prelude::*;
 use serde::Serialize;
 
+use schemaic_core::accepted::AcceptedFile;
 use schemaic_core::db_color::{DbColorRule, DbColorsFile, TableColorRule};
 use schemaic_core::favorite::{FavoriteRule, FavoritesFile};
 use schemaic_core::format::{ColumnFormatRule, FormatsFile};
@@ -63,7 +65,7 @@ fn saver<F: Serialize + 'static>(
     Rc::new(move |saving| persist::write_json_store(file, &build(), saving))
 }
 
-/// The three stores, as `app_view` receives them. Every field goes into the `Ui`
+/// The stores, as `app_view` receives them. Every field goes into the `Ui`
 /// bundle unchanged; nothing here is consumed on this side except by the
 /// connection-deletion prune.
 pub(crate) struct UiStores {
@@ -81,9 +83,12 @@ pub(crate) struct UiStores {
     /// Favourited (bookmarked) databases — a gold star, sorted to the top of the
     /// tree.
     pub(crate) db_favorites: Stored<Vec<FavoriteRule>>,
+    /// The completion items each connection's user has accepted, which rank
+    /// the suggestion list.
+    pub(crate) accepted: Stored<AcceptedFile>,
 }
 
-/// Load all three and build their savers.
+/// Load every store and build its saver.
 pub(crate) fn wire() -> UiStores {
     let formats = RwSignal::new(persist::load_json::<FormatsFile>(FORMATS_FILE).rules);
     let save_formats = saver(FORMATS_FILE, move || FormatsFile {
@@ -104,6 +109,9 @@ pub(crate) fn wire() -> UiStores {
         rules: db_favorites.get_untracked(),
     });
 
+    let accepted = RwSignal::new(persist::load_json::<AcceptedFile>(ACCEPTED_FILE));
+    let save_accepted = saver(ACCEPTED_FILE, move || accepted.get_untracked());
+
     // The writable signals end here: from this line on, the only way to change
     // any of them is a `Stored` writer, and each of those saves.
     UiStores {
@@ -111,12 +119,14 @@ pub(crate) fn wire() -> UiStores {
         db_colors: Stored::new(db_colors, save_db_colors.clone()),
         table_colors: Stored::new(table_colors, save_db_colors),
         db_favorites: Stored::new(db_favorites, save_db_favorites),
+        accepted: Stored::new(accepted, save_accepted),
     }
 }
 
 const FORMATS_FILE: &str = "format.json";
 const COLORS_FILE: &str = "db_colors.json";
 const FAVORITES_FILE: &str = "favorites.json";
+const ACCEPTED_FILE: &str = "accepted.json";
 
 #[cfg(test)]
 mod tests {
@@ -134,6 +144,7 @@ mod tests {
             ("format", ".json"),
             ("db_colors", ".json"),
             ("favorites", ".json"),
+            ("accepted", ".json"),
         ] {
             let needle = [file, ext].concat();
             assert_eq!(
@@ -146,12 +157,12 @@ mod tests {
         // would otherwise leave this passing on the two that remain, since each
         // surviving name would still be named exactly once.
         //
-        // Three, not four: the definition is `saver<F: …>(` and does not match
+        // Four, not five: the definition is `saver<F: …>(` and does not match
         // this needle. Counted wrong on the first draft, which is the gate
         // catching its author before it caught anyone else.
         assert_eq!(
             src.matches("saver(").count(),
-            3,
+            4,
             "one `saver` call site per store"
         );
     }

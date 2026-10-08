@@ -24413,6 +24413,7 @@ mod tests {
                     flavour,
                     local: &crate::rank::LocalNames::default(),
                     wide: false,
+                    accepted: &Default::default(),
                 },
             )
             .into_iter()
