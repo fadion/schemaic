@@ -3295,16 +3295,10 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     let edits = regions
                         .iter()
                         .map(|&(a, b)| {
-                            let ed = if soft {
-                                soft_tab_indent(&full, a, b, tw)
+                            if soft {
+                                soft_tab_indent(&full, a, b, tw).into()
                             } else {
-                                schemaic_core::text_ops::hard_tab_indent(&full, a, b)
-                            };
-                            schemaic_core::text_ops::RegionEdit {
-                                start: ed.start,
-                                end: ed.end,
-                                insert: ed.text,
-                                sel: ed.sel,
+                                schemaic_core::text_ops::hard_tab_indent(&full, a, b).into()
                             }
                         })
                         .collect();
@@ -3389,6 +3383,17 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             let tw = theme::editor_tab_width();
             editor_sig.with_untracked(|e| {
                 let full = e.doc().text().to_string();
+                // Several carets: each one's lines, once a block.
+                if let Some(regions) = several_regions(&e.cursor.get_untracked()) {
+                    let m =
+                        schemaic_core::text_ops::per_line_block(&full, &regions, |t, lo, hi| {
+                            Some(soft_tab_outdent(t, lo, hi, tw).into())
+                        });
+                    if let Some(m) = m {
+                        edit_untyped_multi(e, comp, &m, EditType::Outdent);
+                    }
+                    return;
+                }
                 let (a, b) = e.cursor.get_untracked().get_selection().unwrap_or_else(|| {
                     let o = e.cursor.get_untracked().offset();
                     (o, o)
@@ -3574,6 +3579,31 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             let dia = dialect.get_untracked();
             editor_sig.with_untracked(|e| {
                 let cur = e.cursor.get_untracked();
+                // Several carets: a join once a block of lines, a case or a
+                // block comment at each caret.
+                if let Some(regions) = several_regions(&cur) {
+                    let m = query.with_untracked(|t| {
+                        let one = |t: &str, a: usize, b: usize| {
+                            match op {
+                                'j' => join_lines(t, a, b, dia),
+                                '/' => toggle_block_comment(t, a, b, dia),
+                                _ => toggle_case(t, a, b),
+                            }
+                            .map(Into::into)
+                        };
+                        if op == 'j' {
+                            schemaic_core::text_ops::per_line_block(t, &regions, one)
+                        } else {
+                            let edits: Option<Vec<_>> =
+                                regions.iter().map(|&(a, b)| one(t, a, b)).collect();
+                            edits.and_then(schemaic_core::text_ops::compose)
+                        }
+                    });
+                    if let Some(m) = m {
+                        edit_untyped_multi(e, comp, &m, EditType::Other);
+                    }
+                    return;
+                }
                 let off = cur.offset();
                 let (a, b) = cur.get_selection().unwrap_or((off, off));
                 let Some(ed) = query.with_untracked(|t| match op {

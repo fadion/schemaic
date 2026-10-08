@@ -12350,7 +12350,9 @@ existing prose was left alone.
     `backspace_pair_all` is the same for Backspace at bare carets: an empty pair whole, one
     character elsewhere, `None` when no caret sits in a pair
     (`backspace_deletes_each_carets_empty_pair_and_one_char_elsewhere`). Tab composes each caret's
-    `soft_tab_indent`/`hard_tab_indent`. The line operations — Ctrl+/, Ctrl+D, Alt+↑/↓ — go through
+    `soft_tab_indent`/`hard_tab_indent`, and Ctrl+Shift+U and Ctrl+Shift+/ each caret's
+    `toggle_case`/`toggle_block_comment` — an `IndentEdit` converts to a `RegionEdit` (`From`). The
+    line operations — Ctrl+/, Ctrl+D, Alt+↑/↓, Shift+Tab's outdent, Ctrl+Shift+J's join — go through
     `per_line_block`, which runs the existing single-range function once per `line_blocks` block:
     carets whose lines overlap **or touch** merge into one, so two carets on one line comment it once
     rather than twice, and neighbouring lines move as one block
@@ -24255,8 +24257,7 @@ existing prose was left alone.
     `Selection` of one `SelRegion` per occurrence, so the next word typed replaces every one at once.
     That leans on multi-region editing. Backspace and an auto-paired `(` used to collapse the
     regions to the primary one; they now act at every caret (`text_ops.rs`, *Several carets*), as
-    do Tab, Ctrl+/, Ctrl+D and Alt+↑/↓. Shift+Tab, Ctrl+Shift+U and Ctrl+Shift+J still read the
-    primary caret alone.
+    do Tab, Shift+Tab, Ctrl+/, Ctrl+D, Alt+↑/↓, Ctrl+Shift+U, Ctrl+Shift+J and Ctrl+Shift+/.
     **The Ctrl+K suggestion is not drawn here** — it is phantom rows in the editor's own line flow
     (`inline_diff`, below), and what `cmdk_popup` still draws is the two ends of the block: the
     question bar (sparkle, a `multiline` `edit_field` capped at three rows, then a send affordance or

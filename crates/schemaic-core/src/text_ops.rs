@@ -1264,6 +1264,19 @@ impl RegionEdit {
     }
 }
 
+impl From<IndentEdit> for RegionEdit {
+    /// The single-caret operations' answer — a span, its replacement, the
+    /// selection after — as one caret's share.
+    fn from(e: IndentEdit) -> Self {
+        RegionEdit {
+            start: e.start,
+            end: e.end,
+            insert: e.text,
+            sel: e.sel,
+        }
+    }
+}
+
 /// Every caret's edit made as one: the replacements in the **original**
 /// text's offsets, ascending — what one multi-region document edit takes —
 /// and each caret's selection in the text they leave.
@@ -1642,6 +1655,29 @@ mod tests {
             apply(text, &m),
             "select 1\nselect 1\nselect 2\nselect 3\nselect 4\nselect 4"
         );
+    }
+
+    #[test]
+    fn outdent_join_and_case_act_at_every_caret() {
+        let my = SqlDialect::MySql;
+        // Two carets on one indented line outdent it once, not twice.
+        let text = "        a\nb\n    c";
+        let out = |t: &str, lo: usize, hi: usize| Some(soft_tab_outdent(t, lo, hi, 4).into());
+        let m = per_line_block(text, &[(8, 8), (9, 9), (17, 17)], out).unwrap();
+        assert_eq!(apply(text, &m), "    a\nb\nc");
+        // Join each block's line with the next.
+        let text = "a\nb\nc\nd";
+        let join = |t: &str, lo: usize, hi: usize| join_lines(t, lo, hi, my).map(Into::into);
+        let m = per_line_block(text, &[(0, 0), (4, 4)], join).unwrap();
+        assert_eq!(apply(text, &m), "a b\nc d");
+        // Toggle the case of the word at each caret.
+        let text = "select x from t";
+        let edits: Option<Vec<RegionEdit>> = [(1, 1), (9, 9)]
+            .iter()
+            .map(|&(a, b)| toggle_case(text, a, b).map(Into::into))
+            .collect();
+        let m = compose(edits.unwrap()).unwrap();
+        assert_eq!(apply(text, &m), "SELECT x FROM t");
     }
 
     #[test]
