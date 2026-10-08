@@ -15069,6 +15069,19 @@ existing prose was left alone.
   ordinary plan calls `refresh_db(database)`. Left on the latter, a drop re-introspected a name
   that no longer exists and a create re-introspected one the tree had never heard of — both find
   no node and return, leaving the tree showing a database that is gone.
+  **A run from the editor refreshes too.** `run_query_core` and `run_all` call `refresh_db` for the
+  tab's database when a statement that succeeded `sql::changes_schema` — a `CREATE`, `ALTER` or
+  `DROP` other than a temporary table's, MySQL's `RENAME TABLE`, PostgreSQL's `COMMENT ON`, SQL
+  Server's `EXEC sp_rename`, read by each statement's leading words — so the tree, the completion
+  index and the diagnostics catalogue stop showing the schema the run replaced. It is decided by
+  `sql::run_stales_schema`, which waits while a transaction is still open on an engine whose DDL
+  is transactional (`ddl::ddl_is_transactional`): the reload reads on a fresh connection that
+  cannot see the change before `COMMIT`. Only on the tree's own connection, since `refresh_db`
+  reads the active one; a filter re-run never does. `refresh_db` is defined thousands of lines
+  below the run paths (it needs `start_fetch`), so they call it through `refresh_after_run`, a
+  slot filled once it exists (`ddl_changes_the_schema_and_data_does_not`,
+  `ddl_inside_an_open_transaction_waits_where_ddl_is_transactional`). A `CREATE`/`DROP
+  DATABASE` from the editor still needs the SCHEMA header's Refresh.
   **An account plan needs a third refresh on top of whichever branch it took.** It runs the
   `Database` route (`ddl::is_account_change`), whose refresh re-introspects a *schema* and knows
   nothing about `mysql.user` — so a created account never appeared and a dropped one stayed on the

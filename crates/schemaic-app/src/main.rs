@@ -2770,7 +2770,14 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // drives the whole results pane (Running → Loaded/Failed), whereas a view re-run
     // keeps the current table visible and, on error, surfaces the message in the
     // grid's bottom bar (`tab.view_err`) instead of replacing the grid.
+    // **A run that changed the schema reloads its database** — the slot the
+    // run paths call, filled with `refresh_db` once that exists, far below:
+    // `refresh_db` needs `start_fetch`, which needs everything the tree does.
+    // Empty until then, and nothing runs that early.
+    type LateRefresh = Rc<RefCell<Option<Rc<dyn Fn(String)>>>>;
+    let refresh_after_run: LateRefresh = Rc::new(RefCell::new(None));
     let run_query_core: Rc<dyn Fn(String, bool)> = {
+        let refresh_after_run = refresh_after_run.clone();
         let handle = handle.clone();
         let tokens = tokens.clone();
         let run_gen = run_gen.clone();
@@ -2881,7 +2888,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             let tokens_done = tokens.clone();
             let tx_sql = sql.clone();
             let engine = tx_engine(&db);
+            let dialect = dialect_of(&db);
             let finish_history = finish_history.clone();
+            let refresh_after_run = refresh_after_run.clone();
+            let ran_in = database.clone();
             let send = create_ext_action(
                 cx,
                 move |(state, stmt, took): (QueryState, Option<StmtOutcome>, u64)| {
@@ -2891,6 +2901,26 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     if let Some(stmt) = stmt {
                         tab.tx
                             .update(|t| *t = t.on_statement(engine, &tx_sql, stmt));
+                    }
+                    // **The schema it changed is reloaded**, before the supersede
+                    // check like the transaction and the history: the change
+                    // happened whichever run the tab shows. Only on the tree's
+                    // own connection (`refresh_db` reads the active one), and
+                    // not while an open transaction still hides the change
+                    // from the fresh connection a reload reads on
+                    // (`sql::run_stales_schema`).
+                    if !is_view
+                        && matches!(state, QueryState::Loaded(_))
+                        && tab.conn_id.get_untracked() == active_conn.get_untracked()
+                        && schemaic_core::sql::run_stales_schema(
+                            &tx_sql,
+                            dialect,
+                            tab.tx.get_untracked().is_open(),
+                        )
+                        && let Some(database) = &ran_in
+                        && let Some(refresh) = refresh_after_run.borrow().clone()
+                    {
+                        refresh(database.clone());
                     }
                     // History is about the *run*, not this tab's display, so it
                     // too is recorded before the supersede check — and only for a
@@ -3318,6 +3348,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         let session_for = session_for.clone();
         let record_history = record_history.clone();
         let finish_history = finish_history.clone();
+        let refresh_after_run = refresh_after_run.clone();
         Rc::new(move |stmts: Vec<String>| {
             let stmts: Vec<String> = stmts.into_iter().filter(|s| !s.trim().is_empty()).collect();
             if stmts.is_empty() {
@@ -3406,6 +3437,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // statements after it belong to a *new* transaction.
             let tx_stmts = stmts.clone();
             let finish_history = finish_history.clone();
+            let dialect = dialect_of(&db);
+            let refresh_after_run = refresh_after_run.clone();
+            let ran_in = tab.database.get_untracked();
             let send = create_ext_action(
                 cx,
                 move |(states, outcomes, took): (
@@ -3417,6 +3451,20 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         if let Some(stmt) = stmt {
                             tab.tx.update(|t| *t = t.on_statement(engine, sql, *stmt));
                         }
+                    }
+                    // A statement that changed the schema reloads it, once for
+                    // the batch — see the single run's.
+                    let in_tx = tab.tx.get_untracked().is_open();
+                    let stale = tx_stmts.iter().zip(&states).any(|(sql, state)| {
+                        matches!(state, QueryState::Loaded(_))
+                            && schemaic_core::sql::run_stales_schema(sql, dialect, in_tx)
+                    });
+                    if stale
+                        && tab.conn_id.get_untracked() == active_conn.get_untracked()
+                        && let Some(database) = &ran_in
+                        && let Some(refresh) = refresh_after_run.borrow().clone()
+                    {
+                        refresh(database.clone());
                     }
                     // Before the supersede check, for the same reasons as a single
                     // run's — and handed over as one batch, so the whole script
@@ -8516,6 +8564,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             }
         })
     };
+
+    *refresh_after_run.borrow_mut() = Some(refresh_db.clone());
 
     // Full refresh of the active connection (SCHEMA settings → Refresh): re-lists
     // databases and reloads every schema, and re-checks reachability.

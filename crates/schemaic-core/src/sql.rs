@@ -1314,6 +1314,77 @@ pub fn executable_statements(sql: &str, dialect: SqlDialect) -> Vec<String> {
         .collect()
 }
 
+/// Does any statement of `sql` change what the schema tree shows — a
+/// `CREATE`, `ALTER`, `DROP`, MySQL's `RENAME TABLE`, PostgreSQL's
+/// `COMMENT ON`, SQL Server's `EXEC sp_rename`? What tells the editor a run
+/// has made the loaded schema stale, so its database is introspected again.
+///
+/// A temporary table changes nothing the tree holds — `CREATE TEMP[ORARY]`,
+/// `DROP TEMPORARY`, and a T-SQL `#`/`##` table — nor does `TRUNCATE`, which
+/// empties a table and keeps it. Read by the leading words of each statement,
+/// so a `CREATE` in a comment or a string is not one.
+pub fn changes_schema(sql: &str, dialect: SqlDialect) -> bool {
+    statement_ranges(sql, dialect).into_iter().any(|(lo, hi)| {
+        let stmt = &sql[lo..hi];
+        let words = leading_words(stmt, 3, dialect);
+        let w = |i: usize| words.get(i).map(String::as_str).unwrap_or("");
+        let temporary = (1..3).any(|i| matches!(w(i), "TEMP" | "TEMPORARY"))
+            || (dialect.prefixed_names() && names_a_temp_table(stmt, dialect));
+        match w(0) {
+            "CREATE" | "ALTER" | "DROP" => !temporary,
+            "RENAME" => w(1) == "TABLE",
+            "COMMENT" => w(1) == "ON",
+            "EXEC" | "EXECUTE" => w(1) == "SP_RENAME",
+            _ => false,
+        }
+    })
+}
+
+/// Should a successful run of `sql` re-introspect its database? When it
+/// [`changes_schema`] — unless it ran inside a transaction still open
+/// (`in_open_tx`) on an engine whose DDL is transactional
+/// (`ddl::ddl_is_transactional`): the reload reads on a fresh connection,
+/// which cannot see the change before `COMMIT`, and would only put the old
+/// schema back. MySQL commits a DDL statement implicitly, so it reloads there.
+pub fn run_stales_schema(sql: &str, dialect: SqlDialect, in_open_tx: bool) -> bool {
+    changes_schema(sql, dialect) && !(in_open_tx && crate::ddl::ddl_is_transactional(dialect))
+}
+
+/// Does the `TABLE` of `stmt`'s header name a T-SQL temporary table — the
+/// name after it starts with `#`?
+fn names_a_temp_table(stmt: &str, dialect: SqlDialect) -> bool {
+    let b = stmt.as_bytes();
+    let (mut i, mut words) = (0, 0);
+    while i < b.len() && words < 4 {
+        if let Some(j) = skip_noncode(b, i, dialect) {
+            i = j;
+            continue;
+        }
+        if !is_word_start(b[i]) {
+            i += 1;
+            continue;
+        }
+        let s = i;
+        while i < b.len() && is_word_byte(b[i]) {
+            i += 1;
+        }
+        words += 1;
+        if stmt[s..i].eq_ignore_ascii_case("TABLE") {
+            let mut rest = stmt[i..].trim_start();
+            for guard in ["IF NOT EXISTS", "IF EXISTS"] {
+                if rest
+                    .get(..guard.len())
+                    .is_some_and(|h| h.eq_ignore_ascii_case(guard))
+                {
+                    rest = rest[guard.len()..].trim_start();
+                }
+            }
+            return rest.starts_with('#');
+        }
+    }
+    false
+}
+
 /// [`executable_statements`] as the byte ranges of `sql` they are taken from:
 /// where each statement that runs **sits in the buffer**, which is what a
 /// failed run's error is placed against (`intel::run_error_diagnostic`).
@@ -5256,6 +5327,64 @@ const SECRET_CALLS: &[&str] = &[
     "DBLINK_CONNECT_U",
     "DBLINK_EXEC",
 ];
+
+#[cfg(test)]
+mod changes_schema_tests {
+    use super::changes_schema;
+    use crate::intel::SqlDialect::{self, MsSql, MySql, Postgres, Sqlite};
+
+    #[test]
+    fn ddl_changes_the_schema_and_data_does_not() {
+        let all: [SqlDialect; 4] = [MySql, Postgres, Sqlite, MsSql];
+        for d in all {
+            for sql in [
+                "CREATE TABLE t (id int)",
+                "create or replace view v as select 1",
+                "ALTER TABLE t ADD c int",
+                "DROP VIEW v",
+                "SELECT 1; DROP TABLE t;",
+                "-- note\nCREATE INDEX i ON t (c)",
+            ] {
+                assert!(changes_schema(sql, d), "{d:?}: {sql}");
+            }
+            for sql in [
+                "SELECT * FROM t",
+                "INSERT INTO t VALUES (1)",
+                "UPDATE t SET c = 1",
+                "DELETE FROM t",
+                "TRUNCATE TABLE t",
+                "",
+            ] {
+                assert!(!changes_schema(sql, d), "{d:?}: {sql}");
+            }
+        }
+        // A temporary table is in no tree.
+        assert!(!changes_schema("CREATE TEMPORARY TABLE t (id int)", MySql));
+        assert!(!changes_schema("CREATE TEMP TABLE t (id int)", Postgres));
+        assert!(!changes_schema("DROP TEMPORARY TABLE t", MySql));
+        assert!(!changes_schema("CREATE TABLE #work (id int)", MsSql));
+        assert!(!changes_schema("DROP TABLE ##shared", MsSql));
+        // Engine-specific spellings of a schema change.
+        assert!(changes_schema("RENAME TABLE a TO b", MySql));
+        assert!(changes_schema("COMMENT ON TABLE t IS 'x'", Postgres));
+        assert!(changes_schema("EXEC sp_rename 'a', 'b'", MsSql));
+    }
+
+    #[test]
+    fn ddl_inside_an_open_transaction_waits_where_ddl_is_transactional() {
+        use super::run_stales_schema;
+        let ddl = "CREATE TABLE t (id int)";
+        for d in [MySql, Postgres, Sqlite, MsSql] {
+            assert!(run_stales_schema(ddl, d, false), "{d:?}");
+            assert!(!run_stales_schema("SELECT 1", d, false), "{d:?}");
+        }
+        // MySQL commits DDL on the spot; the others hold it in the transaction.
+        assert!(run_stales_schema(ddl, MySql, true));
+        for d in [Postgres, Sqlite, MsSql] {
+            assert!(!run_stales_schema(ddl, d, true), "{d:?}");
+        }
+    }
+}
 
 #[cfg(test)]
 mod span_tests {
