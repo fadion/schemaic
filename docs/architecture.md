@@ -24273,6 +24273,24 @@ existing prose was left alone.
     message-only change still rebuilds nothing drawn and the wave and its hover box are one
     computation that cannot drift apart; the geometry's two perf rules (`content_x_of` once per list,
     the document read with `with`, not `get`) moved onto `diag_hits` with their measured comments.
+    **Every overlay's points come through `editor_points`, which tracks `screen_lines` and never
+    makes floem lay a line out.** The tracking is the fix for drift: `points_of_offset` reads
+    `screen_lines` untracked, so an overlay whose closure tracked only `viewport` re-ran with last
+    frame's line positions, its boxes slid a few rows onto unrelated text, and — the tell — they did
+    not come back when the editor scrolled back. But a tracker must not ask about a line with no text
+    layout: `points_of_offset` builds the layout, building one fires floem's `LayoutEvent`, and the
+    effect answering it rewrites `screen_lines`, which re-runs the asker from inside its own run —
+    "RefCell already borrowed" in `floem_reactive`, and the app gone. Every edit opens that window,
+    since bumping `cache_rev` drops floem's layout cache (`Lines::check_cache`) until the next layout
+    pass, and the viewport `Rect` set in `EditorView::compute_layout` ran `diag_hits` inside it:
+    typing into a 7 MB script of ~70k statements crashed. So the lookup is the pure
+    `points_on_screen`, which answers `None` without asking floem for an offset whose buffer line is
+    outside `screen_lines`' `rvline_range` or has no layout yet (`Lines::try_get_text_layout` at the
+    current `cache_rev`); the layout pass rewrites `screen_lines` and the caller re-runs with the
+    layouts in place. **The layout check is the one that stops the crash** — floem already answers
+    `(ZERO, ZERO)` early for a line outside its screen lines — and the range check only spares a walk
+    of `screen_lines` per diagnostic in a long script; drop the layout check as redundant with the
+    range check and the crash is back. `points_on_screen_tests` pins both refusals with floem never asked.
     `diag_under` settles an overlap —
     the offline pass and the server's verdict on the same token — error before warning, then the
     narrower span, inclusive on the left and exclusive on the right. `hover_diag` returns before
@@ -32927,6 +32945,15 @@ Re-introducing the anti-patterns these guard against is a regression:
   `edit_field`'s auto-grow tracks both — the guard is `viewport.width() >= 1.0` (a zero-width
   measurement wraps at `MIN_WRAPPED_WIDTH` and inflates the box), the *count* comes after
   `screen_lines`.
+- **A memo or effect that tracks `screen_lines` must not make floem build a text layout.**
+  `points_of_offset`, `text_layout` and `line_point_of_line_col` build one for a line that has none,
+  building one sets floem's `LayoutEvent` signal, and its listener in `create_view_effects` updates
+  `screen_lines` — so the tracker re-runs from inside its own run and the memo's `set` panics with
+  "RefCell already borrowed". After every edit no line has a layout until floem's next layout pass,
+  because bumping `cache_rev` drops the cache. Check `Lines::try_get_text_layout` first and answer
+  "not yet": the pass rewrites `screen_lines`, and the tracker runs again with the layouts there.
+  This is the price of the bullet above. `editor_points` is the instance (under `editor_pane.rs`),
+  found when the squiggle memo crashed the app while someone typed into a 7 MB script.
 - **`.get()` clones the whole value — use `.with()` to read part of a collection.** `SignalGet::get`
   is documented as *"try to **clone** and return the current value"*, so `widths.get().get(ci)`
   allocates and frees the entire `Vec` to read one slot, and `expanded.get().contains(&k)` clones the

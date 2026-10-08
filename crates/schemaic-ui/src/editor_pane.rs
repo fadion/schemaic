@@ -1801,10 +1801,53 @@ fn placed(top: Point, bot: Point) -> bool {
 /// when the editor scrolled back, because the staleness was carried rather than
 /// computed. Tracking it here fixes every caller at once, since this is the one
 /// funnel they all go through.
+///
+/// **And it never makes floem lay a line out** ([`points_on_screen`]).
 fn editor_points(ed: &Editor) -> impl Fn(usize) -> Option<(Point, Point)> + '_ {
-    ed.screen_lines.track();
+    let shown = ed
+        .screen_lines
+        .with(|s| s.rvline_range().map(|(f, l)| (f.line, l.line)));
+    let rope = ed.rope_text();
+    let cache_rev = ed.doc().cache_rev().get_untracked();
+    let config = ed.config_id();
+    points_on_screen(
+        shown,
+        move |off| rope.line_of_offset(off),
+        move |line| {
+            ed.lines()
+                .try_get_text_layout(cache_rev, config, line)
+                .is_some()
+        },
+        move |off| ed.points_of_offset(off, CursorAffinity::Backward),
+    )
+}
+
+/// A point lookup that answers `None`, without calling `points` at all, for an
+/// offset outside the buffer lines `shown` or on a line not `laid_out` yet.
+///
+/// floem's `points_of_offset` builds the line's text layout when it has none —
+/// the case after every edit, which drops the layout cache, until floem's next
+/// layout pass — and building one fires floem's layout event, whose effect
+/// rewrites `screen_lines`. A memo that tracks `screen_lines` and asks then
+/// re-runs itself from inside its own run: "RefCell already borrowed", the app
+/// gone. The squiggle memo did exactly that typing into a 7 MB script with tens
+/// of thousands of diagnostics. Answering "not yet" instead costs nothing: the
+/// layout pass rewrites `screen_lines`, and that re-runs the caller with the
+/// layouts in place. Off-screen lines are refused first, so a lookup per
+/// diagnostic in a long script does not walk floem's screen lines for each.
+fn points_on_screen(
+    shown: Option<(usize, usize)>,
+    line_of: impl Fn(usize) -> usize,
+    laid_out: impl Fn(usize) -> bool,
+    points: impl Fn(usize) -> (Point, Point),
+) -> impl Fn(usize) -> Option<(Point, Point)> {
     move |off| {
-        let (top, bot) = ed.points_of_offset(off, CursorAffinity::Backward);
+        let (first, last) = shown?;
+        let line = line_of(off);
+        if !(first..=last).contains(&line) || !laid_out(line) {
+            return None;
+        }
+        let (top, bot) = points(off);
         placed(top, bot).then_some((top, bot))
     }
 }
@@ -9605,6 +9648,86 @@ mod diag_tip_occlusion_gate {
                  if it moved"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod points_on_screen_tests {
+    use super::points_on_screen;
+    use floem::kurbo::Point;
+    use std::cell::RefCell;
+
+    /// Ten-byte lines: offset `o` is on line `o / 10`.
+    fn line_of(off: usize) -> usize {
+        off / 10
+    }
+
+    fn every_line(_: usize) -> bool {
+        true
+    }
+
+    #[test]
+    fn an_offset_off_screen_is_never_asked_about() {
+        let asked = RefCell::new(Vec::new());
+        let at = points_on_screen(Some((3, 5)), line_of, every_line, |off| {
+            asked.borrow_mut().push(off);
+            (Point::new(1.0, 2.0), Point::new(1.0, 20.0))
+        });
+        assert_eq!(at(5), None, "line 0, above the screen");
+        assert_eq!(at(65), None, "line 6, below it");
+        assert!(
+            asked.borrow().is_empty(),
+            "floem was asked: {:?}",
+            asked.borrow()
+        );
+    }
+
+    /// The crash: after an edit floem has dropped its layouts, and asking for a
+    /// point then builds one and fires the event that re-runs the asker.
+    #[test]
+    fn a_line_not_laid_out_yet_is_never_asked_about() {
+        let asked = RefCell::new(Vec::new());
+        let at = points_on_screen(
+            Some((3, 5)),
+            line_of,
+            |line| line != 4,
+            |off| {
+                asked.borrow_mut().push(off);
+                (Point::new(1.0, 2.0), Point::new(1.0, 20.0))
+            },
+        );
+        assert_eq!(at(45), None, "line 4 has no layout");
+        assert!(
+            asked.borrow().is_empty(),
+            "floem was asked: {:?}",
+            asked.borrow()
+        );
+        assert!(at(35).is_some(), "line 3 has one");
+    }
+
+    #[test]
+    fn an_offset_on_screen_is_answered_including_the_edge_lines() {
+        let at = points_on_screen(Some((3, 5)), line_of, every_line, |off| {
+            (Point::new(off as f64, 2.0), Point::new(off as f64, 20.0))
+        });
+        assert_eq!(at(30).map(|(t, _)| t.x), Some(30.0));
+        assert_eq!(at(59).map(|(t, _)| t.x), Some(59.0));
+    }
+
+    #[test]
+    fn nothing_is_on_screen_before_the_first_layout() {
+        let at = points_on_screen(None, line_of, every_line, |_| {
+            panic!("asked with no screen lines")
+        });
+        assert_eq!(at(0), None);
+    }
+
+    #[test]
+    fn an_unplaced_answer_on_screen_is_still_none() {
+        let at = points_on_screen(Some((0, 9)), line_of, every_line, |_| {
+            (Point::ZERO, Point::ZERO)
+        });
+        assert_eq!(at(4), None);
     }
 }
 
