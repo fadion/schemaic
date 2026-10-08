@@ -863,7 +863,8 @@ existing prose was left alone.
     (tables/aliases/CTEs/derived-tables in scope, AST-backed with a `skip_noncode` lexer fallback for
     mid-edit, and a trigger's `NEW`/`OLD` as its table — below), `clause_context`/`clause_continuation` (caret context + expected-token model for
     completion), and `diagnostics` → `Vec<Diagnostic>` (catalog-aware unknown-table, unknown-column via
-    the per-scope resolver `colres` — qualified *and* unqualified, across subqueries/derived-tables/CTEs
+    the per-scope resolver `colres` — qualified *and* unqualified, in a query, `UPDATE` or `DELETE`
+    (`write_scope`, below), across subqueries/derived-tables/CTEs
     with correlation, either one ending in a "did you mean" when one name is near (`nearest_name`,
     below) — reserved-keyword-alias errors, syntax errors on completed statements save
     those sqlparser has no grammar for (`parser_lacks_statement` and `grammar_gap_masks`,
@@ -1794,6 +1795,29 @@ existing prose was left alone.
     query that does not rebind the name — restoring, not clearing.
     `a_nested_ctes_name_does_not_leak_into_a_later_sibling_subquery` carries both counterweights,
     since the fix must not simply stop shadowing.
+    **`UPDATE` and `DELETE` go through `colres` too, and an `INSERT`'s column list is measured.**
+    Only a `Query` reached the resolver, so a write got the flat `qualified_column_checks` alone and
+    an unqualified name in its `WHERE` or `SET` was never checked. `Collector::write_scope`, pushed
+    before the visit, gives the statement one scope over every table it reads — the target and its
+    joins, an `UPDATE`'s `FROM`, a `DELETE`'s `FROM` and `USING` — which `WHERE`, the `SET` values,
+    `RETURNING`/`OUTPUT` and `ORDER BY` resolve against and a subquery's references fall through
+    to. The `SET` *targets* are names rather than expressions, so the visitor never sees them; they
+    get a scope of their own — the target table alone where a `FROM` follows, since PostgreSQL and
+    SQL Server never read a `SET` column from it and `SET name = d.name FROM departments d` is not
+    ambiguous, and the whole join list on MySQL's `UPDATE a JOIN b SET`, which assigns to either.
+    A `SET @v` is skipped. **T-SQL's `UPDATE e … FROM employees e` names an alias as its target**:
+    read as a table of its own, `e` is unknown and so open to every column, and it answered for
+    `e.nope` — `t_sql_clauses_read_past_hide_nothing_beside_them` caught it — so a bare target
+    naming a `FROM` alias is replaced by that `FROM` item. **Over more than one source neither scope
+    checks ambiguity** (`natural`): doing it right needs a `USING` join's coalescing and the
+    per-engine reading of a target alias that lists the same table twice, and an over-eager check is
+    a red squiggle on valid SQL; an unknown column is still found. `pre_visit_expr` passes an
+    unquoted `DEFAULT`, which sqlparser reads in `SET x = DEFAULT` as a name. `insert_columns`
+    resolves an `INSERT`'s column list against `named_source` — `add_source`'s table-name arm,
+    extracted — so a table not loaded or not known stays silent. Every other statement, and the
+    `SELECT` of an `INSERT … SELECT`, still takes only the flat qualified scan
+    (`an_unknown_bare_column_in_an_update_or_delete_is_flagged`,
+    `a_valid_update_or_delete_draws_no_column_flag`, `an_unknown_column_in_an_insert_list_is_flagged`).
     **`dedup_diagnostics` is the last gate every offline diagnostic passes, and it had no test.** It
     promises to drop what an earlier, *higher-or-equal severity* diagnostic already covers; the
     severity half was only in the sort, and only at an equal start offset, so the coverage test read

@@ -7671,12 +7671,21 @@ fn unit_diagnostics(
             match asts.as_slice() {
                 // A single SELECT/query → per-scope column resolution (aware of
                 // subqueries / derived tables / CTEs; qualified + unqualified).
-                [ast @ sqlparser::ast::Statement::Query(_)] => {
-                    colres::check(text, tlo, thi, catalog, dialect, ast, &mut found)
+                // UPDATE/DELETE too, through a scope of their own (see
+                // `colres::Collector::write_scope`).
+                [
+                    ast @ (sqlparser::ast::Statement::Query(_)
+                    | sqlparser::ast::Statement::Update(_)
+                    | sqlparser::ast::Statement::Delete(_)),
+                ] => colres::check(text, tlo, thi, catalog, dialect, ast, &mut found),
+                // Other statements (INSERT/…), and a condition, → the flat
+                // qualified scan; an INSERT's column list besides.
+                _ => {
+                    if let [ast] = asts.as_slice() {
+                        colres::insert_columns(text, tlo, thi, catalog, dialect, ast, &mut found);
+                    }
+                    qualified_column_checks(text, tlo, thi, catalog, dialect, &mut found)
                 }
-                // Other statements (UPDATE/DELETE/…), and a condition, → the
-                // flat qualified scan.
-                _ => qualified_column_checks(text, tlo, thi, catalog, dialect, &mut found),
             }
         }
         // Don't nag about the fragment the user is still typing, nor about a
@@ -10547,9 +10556,9 @@ mod colres {
     use std::ops::ControlFlow;
 
     use sqlparser::ast::{
-        Cte, Expr, FunctionArguments, GroupByExpr, JoinConstraint, JoinOperator, Query, Select,
-        SelectItem, SetExpr, Spanned, Statement, TableAlias, TableFactor, TableWithJoins, Visit,
-        Visitor,
+        AssignmentTarget, Cte, Expr, FromTable, FunctionArguments, GroupByExpr, JoinConstraint,
+        JoinOperator, ObjectName, Query, Select, SelectItem, SetExpr, Spanned, Statement,
+        TableAlias, TableFactor, TableWithJoins, UpdateTableFromKind, Visit, Visitor,
     };
     use sqlparser::tokenizer::Span;
 
@@ -10653,12 +10662,17 @@ mod colres {
             gb: Vec::new(),
             not_columns: Vec::new(),
         };
+        let targets = c.write_scope(ast, (lo, hi));
         let _ = ast.visit(&mut c);
         let whole_row = super::names_whole_rows(dialect);
         for r in &c.refs {
             if let Some(d) = resolve(r, &c.scopes, whole_row) {
                 out.push(d);
             }
+        }
+        if let Some((scope, refs)) = targets {
+            let scope = [scope];
+            out.extend(refs.iter().filter_map(|r| resolve(r, &scope, whole_row)));
         }
         out.append(&mut c.gb);
     }
@@ -10847,11 +10861,13 @@ mod colres {
                 // A variable — `@x`, `@@ROWCOUNT` on SQL Server, `@x` and
                 // `@@version` on MySQL — keeps its sigil in the identifier and
                 // is never a column; nor is a builtin written without
-                // parentheses (`SYSTEM_USER`).
+                // parentheses (`SYSTEM_USER`), nor `SET x = DEFAULT`, which
+                // sqlparser reads as a name and every engine reserves.
                 Expr::Identifier(id)
                     if id.value.starts_with('@')
                         || (id.quote_style.is_none()
-                            && self.niladic.contains(&id.value.to_ascii_lowercase())) => {}
+                            && (self.niladic.contains(&id.value.to_ascii_lowercase())
+                                || id.value.eq_ignore_ascii_case("DEFAULT"))) => {}
                 Expr::Identifier(id) => self.refs.push(Ref {
                     qualifier: None,
                     col: id.value.to_ascii_lowercase(),
@@ -10930,6 +10946,132 @@ mod colres {
                 coalesced,
                 natural,
             });
+        }
+    }
+
+    impl Collector<'_> {
+        /// An `UPDATE` or `DELETE`'s own scope: one covering the whole
+        /// statement `range`, over every table it reads — the target, its
+        /// joins, `FROM`, `USING` — which its `WHERE`, its `SET` values and its
+        /// `RETURNING` resolve against, and which a subquery's references fall
+        /// through to. Pushed before the visit, so a subquery's scope is
+        /// always the smaller and is asked first.
+        ///
+        /// Returns the scope its `SET` **targets** resolve against, and those
+        /// targets, which are names rather than expressions and so are never
+        /// visited. That is the target table alone wherever a `FROM` follows —
+        /// PostgreSQL and SQL Server never read a `SET` column from it, so
+        /// `SET name = d.name FROM departments d` is not ambiguous — and the
+        /// whole join list on MySQL's `UPDATE a JOIN b SET`, which assigns
+        /// to either.
+        ///
+        /// **More than one source, no ambiguity check.** It would need the
+        /// coalescing a `USING` join does and the per-engine reading of a
+        /// target alias (T-SQL's `UPDATE e … FROM employees e` lists the same
+        /// table twice), and an over-eager one is a red squiggle on valid SQL;
+        /// an unknown column is still found.
+        fn write_scope(
+            &mut self,
+            ast: &Statement,
+            range: (usize, usize),
+        ) -> Option<(Scope, Vec<Ref>)> {
+            fn factors(twj: &TableWithJoins) -> impl Iterator<Item = &TableFactor> {
+                std::iter::once(&twj.relation).chain(twj.joins.iter().map(|j| &j.relation))
+            }
+            let (all, target, assignments): (Vec<&TableFactor>, Vec<&TableFactor>, &[_]) = match ast
+            {
+                Statement::Update(u) => {
+                    let from = match &u.from {
+                        Some(
+                            UpdateTableFromKind::BeforeSet(f) | UpdateTableFromKind::AfterSet(f),
+                        ) => f.as_slice(),
+                        None => &[],
+                    };
+                    // T-SQL's `UPDATE e … FROM employees e`: the target is
+                    // the alias, and the table is the FROM item it names.
+                    // Read as a table of its own, `e` is unknown, so open
+                    // to every column, and it would answer for `e.nope`.
+                    let aliased = match &u.table.relation {
+                        TableFactor::Table {
+                            name, alias: None, ..
+                        } if name.0.len() == 1 => name.0[0].as_ident().and_then(|t| {
+                            from.iter().flat_map(factors).find(|f| {
+                                matches!(f, TableFactor::Table { alias: Some(a), .. }
+                                            if a.name.value.eq_ignore_ascii_case(&t.value))
+                            })
+                        }),
+                        _ => None,
+                    };
+                    let target = match aliased {
+                        Some(f) => vec![f],
+                        None if from.is_empty() => factors(&u.table).collect(),
+                        None => vec![&u.table.relation],
+                    };
+                    let all = factors(&u.table)
+                        .filter(|f| aliased.is_none() || !std::ptr::eq(*f, &u.table.relation))
+                        .chain(from.iter().flat_map(factors))
+                        .collect();
+                    (all, target, u.assignments.as_slice())
+                }
+                Statement::Delete(d) => {
+                    let (FromTable::WithFromKeyword(from) | FromTable::WithoutKeyword(from)) =
+                        &d.from;
+                    let all = from
+                        .iter()
+                        .chain(d.using.iter().flatten())
+                        .flat_map(factors)
+                        .collect();
+                    (all, Vec::new(), &[])
+                }
+                _ => return None,
+            };
+            let scope = |c: &Self, rels: &[&TableFactor]| {
+                let mut sources = Vec::new();
+                for f in rels {
+                    add_source(
+                        f,
+                        &mut sources,
+                        c.catalog,
+                        c.implicit,
+                        &c.ctes,
+                        c.stmt,
+                        c.lo,
+                    );
+                }
+                let natural = sources.len() > 1;
+                Scope {
+                    range,
+                    sources,
+                    proj_aliases: HashSet::new(),
+                    alias_blind: Vec::new(),
+                    coalesced: HashSet::new(),
+                    natural,
+                }
+            };
+            let whole = scope(self, &all);
+            self.scopes.push(whole);
+            let refs = assignments
+                .iter()
+                .flat_map(|a| match &a.target {
+                    AssignmentTarget::ColumnName(n) => std::slice::from_ref(n),
+                    AssignmentTarget::Tuple(ns) => ns.as_slice(),
+                })
+                .filter_map(|n| {
+                    let parts: Vec<_> = n.0.iter().filter_map(|p| p.as_ident()).collect();
+                    let col = *parts.last()?;
+                    // A T-SQL `SET @v = …` assigns a variable.
+                    if col.value.starts_with('@') {
+                        return None;
+                    }
+                    Some(Ref {
+                        qualifier: (parts.len() >= 2)
+                            .then(|| parts[parts.len() - 2].value.to_ascii_lowercase()),
+                        col: col.value.to_ascii_lowercase(),
+                        range: to_range(self.stmt, self.lo, col.span),
+                    })
+                })
+                .collect();
+            Some((scope(self, &target), refs))
         }
     }
 
@@ -11341,6 +11483,146 @@ mod colres {
         }
     }
 
+    /// The source a table **name** reads as, aliased `alias_name` or not: a
+    /// CTE's columns where a bare name is one, the catalogue's otherwise, and
+    /// `Open` where they cannot be judged. `None` only for an empty name.
+    /// [`add_source`]'s table arm, and what an `INSERT`'s column list is
+    /// measured against ([`insert_columns`]).
+    fn named_source(
+        name: &ObjectName,
+        alias_name: Option<String>,
+        catalog: &Catalog,
+        implicit: &'static [&'static str],
+        ctes: &Ctes,
+    ) -> Option<Src> {
+        let parts: Vec<String> = super::object_name_parts(name);
+        // `db.schema.t` (and `db..t`, whose schema part is empty) is
+        // judged through its database — see `Catalog::in_database` —
+        // and anything longer is a linked server's, which nothing
+        // here can judge.
+        let (db, tname, database) = match parts.as_slice() {
+            [t] => (None, t.clone(), None),
+            [d, t] => (Some(d.clone()), t.clone(), None),
+            [database, schema, t] => (
+                Some(schema.clone()).filter(|s| !s.is_empty()),
+                t.clone(),
+                Some(database.clone()),
+            ),
+            [_, _, _, _, ..] => return Some(open_src()),
+            [] => return None,
+        };
+        // **An alias replaces the table name; it does not add to it.**
+        // Registering both spellings let `SELECT employees.id FROM
+        // employees e` pass clean, and MariaDB 10.11.14 answers
+        // `ERROR 1054: Unknown column 'employees.id' in 'SELECT'`
+        // (PostgreSQL likewise) — a statement the server rejects, which
+        // is the exact thing the qualified-column tier exists to say
+        // before the round trip.
+        let quals: Vec<String> = match &alias_name {
+            Some(a) => vec![a.to_ascii_lowercase()],
+            None => vec![tname.to_ascii_lowercase()],
+        };
+        let shadowed = alias_name.as_ref().map(|_| tname.to_ascii_lowercase());
+        // A bare name matching a CTE resolves to the CTE's columns.
+        if db.is_none()
+            && database.is_none()
+            && let Some((cols, body)) = ctes.get(&tname.to_ascii_lowercase())
+        {
+            return Some(Src {
+                quals,
+                cols: cols.clone(),
+                table: None,
+                shadowed,
+                defines: *body,
+            });
+        }
+        let tref = TableRef {
+            name: tname.clone(),
+            alias: alias_name,
+            db,
+        };
+        let resolved = match &database {
+            None => Some(tref),
+            Some(d) => catalog.in_database(d, &tref),
+        };
+        let cols = match resolved.as_ref().map(|r| (catalog.table_status(r), r)) {
+            // The engine's undeclared columns join the introspected ones, so
+            // `rowid` on SQLite resolves through the same scope walk as a real
+            // column — including the ambiguity count, which is what SQLite
+            // itself reports for `rowid` over two tables.
+            Some((TableStatus::Found, tref)) => catalog
+                .columns_of(tref)
+                .map(|c| {
+                    Cols::Known(
+                        c.iter()
+                            .map(|s| s.to_ascii_lowercase())
+                            .chain(implicit.iter().map(|s| s.to_string()))
+                            .collect(),
+                    )
+                })
+                .unwrap_or(Cols::Open),
+            _ => Cols::Open, // not loaded / not found → can't judge its columns
+        };
+        Some(Src {
+            quals,
+            cols,
+            table: Some(tname),
+            shadowed,
+            defines: None,
+        })
+    }
+
+    /// An `INSERT`'s column list measured against its table: each name the
+    /// table does not have, as a diagnostic on that name. Nothing for a table
+    /// whose columns cannot be judged — not loaded, or not found (the table
+    /// check's to say).
+    pub(super) fn insert_columns(
+        sql: &str,
+        lo: usize,
+        hi: usize,
+        catalog: &Catalog,
+        dialect: super::SqlDialect,
+        ast: &Statement,
+        out: &mut Vec<Diagnostic>,
+    ) {
+        let Statement::Insert(ins) = ast else {
+            return;
+        };
+        let sqlparser::ast::TableObject::TableName(name) = &ins.table else {
+            return;
+        };
+        let Some(src) = named_source(
+            name,
+            None,
+            catalog,
+            dialect.implicit_columns(),
+            &HashMap::new(),
+        ) else {
+            return;
+        };
+        let stmt = &sql[lo..hi];
+        let scope = [Scope {
+            range: (lo, hi),
+            sources: vec![src],
+            proj_aliases: HashSet::new(),
+            alias_blind: Vec::new(),
+            coalesced: HashSet::new(),
+            natural: false,
+        }];
+        let whole_row = super::names_whole_rows(dialect);
+        for c in &ins.columns {
+            let Some(col) = c.0.last().and_then(|p| p.as_ident()) else {
+                continue;
+            };
+            let r = Ref {
+                qualifier: None,
+                col: col.value.to_ascii_lowercase(),
+                range: to_range(stmt, lo, col.span),
+            };
+            out.extend(resolve(&r, &scope, whole_row));
+        }
+    }
+
     fn add_source(
         factor: &TableFactor,
         sources: &mut Vec<Src>,
@@ -11359,86 +11641,8 @@ mod colres {
                     sources.push(open_src());
                     return;
                 }
-                let parts: Vec<String> = super::object_name_parts(name);
-                // `db.schema.t` (and `db..t`, whose schema part is empty) is
-                // judged through its database — see `Catalog::in_database` —
-                // and anything longer is a linked server's, which nothing
-                // here can judge.
-                let (db, tname, database) = match parts.as_slice() {
-                    [t] => (None, t.clone(), None),
-                    [d, t] => (Some(d.clone()), t.clone(), None),
-                    [database, schema, t] => (
-                        Some(schema.clone()).filter(|s| !s.is_empty()),
-                        t.clone(),
-                        Some(database.clone()),
-                    ),
-                    [_, _, _, _, ..] => {
-                        sources.push(open_src());
-                        return;
-                    }
-                    [] => return,
-                };
                 let alias_name = alias.as_ref().map(|a| a.name.value.clone());
-                // **An alias replaces the table name; it does not add to it.**
-                // Registering both spellings let `SELECT employees.id FROM
-                // employees e` pass clean, and MariaDB 10.11.14 answers
-                // `ERROR 1054: Unknown column 'employees.id' in 'SELECT'`
-                // (PostgreSQL likewise) — a statement the server rejects, which
-                // is the exact thing the qualified-column tier exists to say
-                // before the round trip.
-                let quals: Vec<String> = match &alias_name {
-                    Some(a) => vec![a.to_ascii_lowercase()],
-                    None => vec![tname.to_ascii_lowercase()],
-                };
-                let shadowed = alias_name.as_ref().map(|_| tname.to_ascii_lowercase());
-                // A bare name matching a CTE resolves to the CTE's columns.
-                if db.is_none()
-                    && database.is_none()
-                    && let Some((cols, body)) = ctes.get(&tname.to_ascii_lowercase())
-                {
-                    sources.push(Src {
-                        quals,
-                        cols: cols.clone(),
-                        table: None,
-                        shadowed: shadowed.clone(),
-                        defines: *body,
-                    });
-                    return;
-                }
-                let tref = TableRef {
-                    name: tname.clone(),
-                    alias: alias_name,
-                    db,
-                };
-                let resolved = match &database {
-                    None => Some(tref),
-                    Some(d) => catalog.in_database(d, &tref),
-                };
-                let cols = match resolved.as_ref().map(|r| (catalog.table_status(r), r)) {
-                    // The engine's undeclared columns join the introspected ones, so
-                    // `rowid` on SQLite resolves through the same scope walk as a real
-                    // column — including the ambiguity count, which is what SQLite
-                    // itself reports for `rowid` over two tables.
-                    Some((TableStatus::Found, tref)) => catalog
-                        .columns_of(tref)
-                        .map(|c| {
-                            Cols::Known(
-                                c.iter()
-                                    .map(|s| s.to_ascii_lowercase())
-                                    .chain(implicit.iter().map(|s| s.to_string()))
-                                    .collect(),
-                            )
-                        })
-                        .unwrap_or(Cols::Open),
-                    _ => Cols::Open, // not loaded / not found → can't judge its columns
-                };
-                sources.push(Src {
-                    quals,
-                    cols,
-                    table: Some(tname),
-                    shadowed,
-                    defines: None,
-                });
+                sources.extend(named_source(name, alias_name, catalog, implicit, ctes));
             }
             TableFactor::Derived {
                 subquery, alias, ..
@@ -23576,6 +23780,196 @@ mod tests {
                     .any(|x| x.message.contains("reserved keyword")),
                 "false positive: {sql}"
             );
+        }
+    }
+
+    /// The text under every column diagnostic in `sql` (not found, ambiguous).
+    fn column_flags(sql: &str, dialect: SqlDialect) -> Vec<String> {
+        diag_d(sql, dialect)
+            .into_iter()
+            .filter(|d| d.message.starts_with("Column"))
+            .map(|d| sql[d.range.0..d.range.1].to_string())
+            .collect()
+    }
+
+    #[test]
+    fn an_unknown_bare_column_in_an_update_or_delete_is_flagged() {
+        use SqlDialect::*;
+        for (sql, dialects, want) in [
+            (
+                "UPDATE employees SET salery = 1",
+                &[MySql, Postgres, Sqlite, MsSql][..],
+                "salery",
+            ),
+            (
+                "UPDATE employees SET salary = 1 WHERE nme = 'x'",
+                &[MySql, Postgres, Sqlite, MsSql],
+                "nme",
+            ),
+            (
+                "UPDATE employees SET salary = salery + 1",
+                &[MySql, Postgres, Sqlite, MsSql],
+                "salery",
+            ),
+            (
+                "DELETE FROM employees WHERE nme = 'x'",
+                &[MySql, Postgres, Sqlite, MsSql],
+                "nme",
+            ),
+            (
+                "UPDATE employees SET salary = 1 FROM departments d WHERE d.id = dept_id AND nme = 'x'",
+                &[Postgres, MsSql],
+                "nme",
+            ),
+            (
+                "DELETE e FROM employees e JOIN departments d ON d.id = e.dept_id WHERE nme = 1",
+                &[MySql],
+                "nme",
+            ),
+            (
+                "UPDATE employees e JOIN departments d ON d.id = e.dept_id SET e.salary = 1 WHERE nme = 1",
+                &[MySql],
+                "nme",
+            ),
+            (
+                "DELETE FROM employees USING departments d WHERE d.id = dept_id AND nme = 1",
+                &[Postgres],
+                "nme",
+            ),
+            // The target is an alias of the FROM item, which still answers.
+            (
+                "UPDATE e SET salery = 1 FROM employees e",
+                &[MsSql],
+                "salery",
+            ),
+            (
+                "UPDATE e SET salary = 1 FROM employees e WHERE nme = 1",
+                &[MsSql],
+                "nme",
+            ),
+        ] {
+            for &d in dialects {
+                assert_eq!(column_flags(sql, d), vec![want.to_string()], "{d:?}: {sql}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_unknown_column_in_an_insert_list_is_flagged() {
+        for d in [
+            SqlDialect::MySql,
+            SqlDialect::Postgres,
+            SqlDialect::Sqlite,
+            SqlDialect::MsSql,
+        ] {
+            assert_eq!(
+                column_flags("INSERT INTO employees (id, nme) VALUES (1, 'a')", d),
+                vec!["nme".to_string()],
+                "{d:?}"
+            );
+            assert_eq!(
+                column_flags(
+                    "INSERT INTO employees (id, nme) SELECT id, name FROM departments",
+                    d
+                ),
+                vec!["nme".to_string()],
+                "{d:?}"
+            );
+            for ok in [
+                "INSERT INTO employees (id, name) VALUES (1, 'a')",
+                "INSERT INTO employees VALUES (1, 'a', 2, 3)",
+                // A table nobody knows is the table check's.
+                "INSERT INTO nosuch (a, b) VALUES (1, 2)",
+            ] {
+                assert!(column_flags(ok, d).is_empty(), "{d:?}: {ok}");
+            }
+        }
+        assert!(
+            column_flags(
+                "INSERT INTO employees (rowid, id) VALUES (1, 2)",
+                SqlDialect::Sqlite
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_valid_update_or_delete_draws_no_column_flag() {
+        use SqlDialect::*;
+        let all = &[MySql, Postgres, Sqlite, MsSql][..];
+        for (sql, dialects) in [
+            ("UPDATE employees SET salary = DEFAULT", all),
+            (
+                "UPDATE employees SET salary = salary + 1 WHERE dept_id = 2",
+                all,
+            ),
+            (
+                "UPDATE employees SET employees.salary = 1",
+                &[MySql, MsSql][..],
+            ),
+            // A subquery sees the statement's table, and keeps its own.
+            (
+                "UPDATE employees SET salary = (SELECT MAX(id) FROM departments WHERE departments.id = dept_id)",
+                all,
+            ),
+            (
+                "DELETE FROM employees WHERE id IN (SELECT id FROM departments)",
+                all,
+            ),
+            // A SET target is the target table's, never FROM's, so `name`
+            // (in both tables) is not ambiguous.
+            (
+                "UPDATE employees SET name = d.name FROM departments d WHERE d.id = dept_id",
+                &[Postgres, MsSql],
+            ),
+            // T-SQL's target is an alias its own FROM defines.
+            (
+                "UPDATE e SET salary = 1 FROM employees e WHERE dept_id = 2",
+                &[MsSql],
+            ),
+            (
+                "UPDATE e SET name = d.name FROM employees e JOIN departments d ON d.id = e.dept_id",
+                &[MsSql],
+            ),
+            (
+                "DELETE e FROM employees e WHERE dept_id = 2",
+                &[MsSql, MySql],
+            ),
+            (
+                "UPDATE employees SET salary = 1 OUTPUT inserted.id WHERE id = 1",
+                &[MsSql],
+            ),
+            (
+                "DELETE FROM employees OUTPUT deleted.id WHERE id = 1",
+                &[MsSql],
+            ),
+            (
+                "UPDATE employees SET salary = 1 RETURNING id, name",
+                &[Postgres, Sqlite],
+            ),
+            (
+                "DELETE FROM employees USING departments d WHERE d.id = dept_id",
+                &[Postgres],
+            ),
+            (
+                "UPDATE employees SET salary = 1 ORDER BY id LIMIT 1",
+                &[MySql],
+            ),
+            ("UPDATE employees SET salary = 1 WHERE rowid = 1", &[Sqlite]),
+            (
+                "UPDATE employees e JOIN departments d USING (id) SET e.salary = 1 WHERE id = 2",
+                &[MySql],
+            ),
+            // A table nobody knows is the table check's to report.
+            ("UPDATE nosuch SET x = 1 WHERE y = 2", all),
+        ] {
+            for &d in dialects {
+                assert!(
+                    column_flags(sql, d).is_empty(),
+                    "{d:?}: {sql} → {:?}",
+                    column_flags(sql, d)
+                );
+            }
         }
     }
 
