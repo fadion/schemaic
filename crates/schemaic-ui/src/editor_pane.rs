@@ -7517,6 +7517,15 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 ed_qi.with_untracked(|ed| {
                     let (at, _) = pointer_offset(ed, pe.pos)?;
                     ed.cursor.update(|c| c.set_insert(Selection::caret(at)));
+                    // The press made floem's content view *active*, and floem
+                    // sends an active view's moves to it directly, so they would
+                    // never bubble up to the listener above and the drag would
+                    // stay floem's stream selection. Handing the activity back
+                    // (queued after the content view's own request, so it lands
+                    // second) lets the moves dispatch by position again.
+                    if let Some(id) = ed.editor_view_id.get_untracked() {
+                        id.clear_active();
+                    }
                     Some(at)
                 })
             }
@@ -7527,6 +7536,16 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     .on_event_cont(EventListener::PointerUp, move |_| {
         if box_anchor.get_untracked().is_some() {
             box_anchor.set(None);
+        }
+    })
+    // With the capture handed back, a release outside the pane reaches neither
+    // the listener above nor floem's own, so leaving ends the box: it keeps the
+    // last one drawn, and moving back with no button held draws no more —
+    // `ed.active` is floem's "button held", and only its `pointer_up` clears it.
+    .on_event_cont(EventListener::PointerLeave, move |_| {
+        if box_anchor.get_untracked().is_some() {
+            box_anchor.set(None);
+            ed_qi.with_untracked(|ed| ed.active.set(false));
         }
     })
     // A press starts a selection (the editor then owns every move until the

@@ -24344,12 +24344,22 @@ existing prose was left alone.
     whether it is inside the text, `None` over the gutter — which the drag shares. The same outer
     `PointerDown`, again after floem's own click (which with Shift+Alt would extend the selection or
     add a caret instead), sets `box_anchor` at the pointer and puts a lone caret there on the
-    primary button with Alt and Shift; any other press clears it, as does a `PointerUp`. The outer
+    primary button with Alt and Shift; any other press clears it, as does a `PointerUp`. **That
+    press also hands floem's pointer capture back** — `clear_active()` on `ed.editor_view_id` — and
+    the box depends on it: the content view calls `request_active()` on every press, an active view
+    is sent every move directly, and so the listener below never heard one; the drag stayed floem's
+    stream selection and Alt+Shift+drag drew no box in the running app. The clear works only
+    because it is queued behind the content view's own request (*Floem 0.2 gotchas* has why). With
+    the capture gone a release outside the pane reaches neither `editor_area`'s `PointerUp` nor
+    floem's, so `PointerLeave` ends the box as well, clearing `ed.active` — floem's "button held",
+    which only its `pointer_up` resets — or moving back over the text with no button down kept
+    drawing one. The outer
     `PointerMove`, while an anchor is set and floem's `ed.active` says the button is still held,
     **replaces the selection whole** with `box_regions(query, anchor, head)` on every move —
     floem's own drag handling runs first and is overwritten each time. Unlike the hover, this does read the document: `box_regions` walks the query's line
     starts on each move, but only while a box is being dragged. Alt+click and Alt+drag without
-    Shift stay floem's. The view side has no test; it was build-only.
+    Shift stay floem's. The view side has no test; it was build-only, which is how the capture
+    above went unnoticed.
     **The right-click menu's *Copy as single line*** puts `sqlfmt::single_line_copy`'s answer on the
     clipboard — the selection, or with none the statement under the right-click, on one line (the
     `sqlfmt.rs` entry has what that keeps and what it refuses). It is **absent rather than dimmed**
@@ -33498,6 +33508,17 @@ Re-introducing the anti-patterns these guard against is a regression:
   over the squiggle beneath it and opened the tip over the menu. Each such overlay now marks the
   moves it receives (`marks_pointer`, see `editor_pane.rs`), which relies on the same ordering —
   child first, ancestor after, in one dispatch.
+  **Except while a button is held over the text: then the ancestor hears no move at all.** Floem's
+  content view calls `request_active()` on every press (`views/editor/view.rs:1147`), and while
+  `app_state.active` is set every pointer event goes to that one view
+  (`window_handle.rs:294-319`, `unconditional_view_event(id, …, true)`) — no walk by position, so
+  nothing bubbles to `editor_area` — until the release clears it. Alt+Shift+drag's box selection
+  is built in exactly that listener and so never drew a box. An ancestor that needs the drag has to
+  hand the capture back, as the Alt+Shift `PointerDown` does with `clear_active()` on
+  `ed.editor_view_id`, and **the order is load-bearing**: `UpdateMessage::ClearActive` is honoured
+  only when its id is the active one (`window_handle.rs:862-866`), so it works because the
+  ancestor's listener runs after the content view's and its clear is queued behind the `Active`
+  request. Issued from anywhere that runs before floem's press, it is silently dropped.
   **A container introduced for layout or arity reasons is a hit target too**, and this is the trap
   rather than any one overlay. `absolute().inset(0)` on a wrapper whose children are small and
   edge-pinned turns a few thin overlays into a single pane-sized one, and nothing about it says so:
