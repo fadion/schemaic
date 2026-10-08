@@ -12340,6 +12340,16 @@ existing prose was left alone.
     (`a_whole_text_rewrite_narrows_to_what_changed`). The pane applies a `MultiEdit` through
     `edit_untyped_multi` (under *Floem 0.2 gotchas*); where `compose` refuses, Tab, Ctrl+/ and
     Ctrl+D fall back to the primary caret as before, and Alt+↑/↓ does nothing.
+    **`box_regions` is Alt+Shift+drag's box selection** — one region a line from the upper of the
+    anchor's and the head's lines to the lower, each across the columns between the two, with the
+    caret on the head's side (dragged leftwards a region is `(right, left)`). Columns are counted in
+    characters, the editor font being monospaced; a tab counts as one, a known approximation, and a
+    CRLF line's `\r` is not a column. A line with nothing inside the box — no longer than its left
+    column — is left out, while a box of no width puts a caret on every line, at the line's end
+    where it is shorter; never empty, the head alone at worst
+    (`a_box_selection_takes_the_same_columns_on_every_line`). There is **no virtual space**: the
+    head is the clamped offset under the pointer, so dragging past a short line's end narrows the
+    box to that line's length. The pane's drag is under `editor_pane.rs`.
   - `sqlfmt.rs` — `format_sql` (Ctrl+Alt+L pretty-printer): re-flows whitespace/indent/line-breaks
     "block" style, **preserving keyword case** itself; built on `skip_noncode` so comments/strings/
     backtick idents pass through untouched; indent follows editor tab-width/soft-tabs.
@@ -24175,6 +24185,17 @@ existing prose was left alone.
     through `object_editor::open_for_object` with the loaded `RoutineInfo`, the doors the schema
     tree and Find Anywhere use. Alt+click is left to floem and still adds a caret; a Ctrl+click on
     nothing resolvable just places the caret.
+    **Alt+Shift+drag is a box selection** (`text_ops::box_regions`). `name_box_at`'s way back from
+    a pointer to the document is factored out as `pointer_offset` — the offset under the pointer and
+    whether it is inside the text, `None` over the gutter — which the drag shares. The same outer
+    `PointerDown`, again after floem's own click (which with Shift+Alt would extend the selection or
+    add a caret instead), sets `box_anchor` at the pointer and puts a lone caret there on the
+    primary button with Alt and Shift; any other press clears it, as does a `PointerUp`. The outer
+    `PointerMove`, while an anchor is set and floem's `ed.active` says the button is still held,
+    **replaces the selection whole** with `box_regions(query, anchor, head)` on every move —
+    floem's own drag handling runs first and is overwritten each time. Unlike the hover, this does read the document: `box_regions` walks the query's line
+    starts on each move, but only while a box is being dragged. Alt+click and Alt+drag without
+    Shift stay floem's. The view side has no test; it was build-only.
     **The right-click menu's *Copy as single line*** puts `sqlfmt::single_line_copy`'s answer on the
     clipboard — the selection, or with none the statement under the right-click, on one line (the
     `sqlfmt.rs` entry has what that keeps and what it refuses). It is **absent rather than dimmed**

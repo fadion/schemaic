@@ -1335,6 +1335,46 @@ pub fn line_blocks(text: &str, regions: &[(usize, usize)]) -> Vec<(usize, usize)
     out.into_iter().map(|(_, _, lo, hi)| (lo, hi)).collect()
 }
 
+/// A **box selection** dragged from `anchor` to `head` (byte offsets): one
+/// region a line, from the top line of the two to the bottom, each spanning
+/// the columns between theirs — counted in characters, the editor's font being
+/// monospaced — with the caret on the head's side. A line with nothing inside
+/// the box is left out; a box of no width puts a caret on every line, at its
+/// end where the line is shorter. Never empty: the head alone at least.
+pub fn box_regions(text: &str, anchor: usize, head: usize) -> Vec<(usize, usize)> {
+    let len = text.len();
+    let (anchor, head) = (anchor.min(len), head.min(len));
+    let starts = line_start_offsets(text);
+    let line_end = |l: usize| {
+        let end = starts.get(l + 1).map_or(len, |&s| s - 1);
+        // A CRLF line's `\r` is not a column.
+        if text[..end].ends_with('\r') {
+            end - 1
+        } else {
+            end
+        }
+    };
+    let col = |off: usize, l: usize| text[starts[l]..off].chars().count();
+    let (la, lh) = (line_index_of(&starts, anchor), line_index_of(&starts, head));
+    let (ca, ch) = (col(anchor, la), col(head, lh));
+    let (c0, c1) = (ca.min(ch), ca.max(ch));
+    let mut out = Vec::new();
+    for l in la.min(lh)..=la.max(lh) {
+        let line = &text[starts[l]..line_end(l)];
+        let chars = line.chars().count();
+        if chars <= c0 && c0 != c1 {
+            continue;
+        }
+        let at = |c: usize| starts[l] + line.char_indices().nth(c).map_or(line.len(), |(i, _)| i);
+        let (s, e) = (at(c0.min(chars)), at(c1.min(chars)));
+        out.push(if ch < ca { (e, s) } else { (s, e) });
+    }
+    if out.is_empty() {
+        out.push((head, head));
+    }
+    out
+}
+
 /// A line operation — comment, move, duplicate — at every caret: once per
 /// [`line_blocks`] block, each asked of the original text (`op(text, lo,
 /// hi)`), then put together. `None` when any block refuses (a move past the
@@ -1511,6 +1551,56 @@ mod tests {
         assert_eq!(blocks, vec![(0, 0), (6, 6), (10, 11)]);
         // A selection ending at a line's start does not reach that line.
         assert_eq!(line_blocks(text, &[(0, 2), (6, 6)]), vec![(0, 2), (6, 6)]);
+    }
+
+    #[test]
+    fn a_box_selection_takes_the_same_columns_on_every_line() {
+        let text = "select a,\nb\n  from t\r\nwhere";
+        let off = |line: usize, col: usize| {
+            text.split('\n')
+                .take(line)
+                .map(|l| l.len() + 1)
+                .sum::<usize>()
+                + col
+        };
+        let pick = |rs: Vec<(usize, usize)>| -> Vec<String> {
+            rs.into_iter()
+                .map(|(a, b)| text[a.min(b)..a.max(b)].to_string())
+                .collect()
+        };
+        // Columns 2..6 of lines 0–2; line 1 is too short and is left out.
+        let rs = box_regions(text, off(0, 2), off(2, 6));
+        assert_eq!(pick(rs.clone()), vec!["lect", "from"]);
+        // Through the last line, which ends inside the box.
+        let rs = box_regions(text, off(0, 2), off(3, 4));
+        assert_eq!(pick(rs), vec!["le", "fr", "er"]);
+        // The caret on the head's side: dragged leftwards, each region ends
+        // at its left column.
+        let back = box_regions(text, off(2, 6), off(0, 2));
+        assert_eq!(back.len(), 2);
+        assert!(back.iter().all(|&(a, b)| b < a), "{back:?}");
+        // No width: a caret on every line, at the end of a shorter one, and
+        // the `\r` of a CRLF line is no column.
+        let carets = box_regions(text, off(0, 8), off(2, 8));
+        assert_eq!(carets, vec![(8, 8), (11, 11), (20, 20)]);
+        // Upwards, the lines are still top to bottom.
+        let up = box_regions(text, off(2, 4), off(0, 2));
+        assert!(up.windows(2).all(|w| w[0].0 < w[1].0), "{up:?}");
+        // Over nothing reachable, the head alone.
+        assert_eq!(box_regions("a\nb", 2, 2), vec![(2, 2)]);
+        let wide = "abcdef\nx";
+        // `x` ends where the box begins: nothing of it is inside.
+        assert_eq!(box_regions(wide, 3, 8), vec![(3, 1)]);
+        // Columns count characters, not bytes.
+        let utf = "città x\nabcde x";
+        let r = box_regions(utf, 0, utf.find("abcd").unwrap() + 4);
+        assert_eq!(pick_in(utf, &r), vec!["citt", "abcd"]);
+    }
+
+    fn pick_in(text: &str, rs: &[(usize, usize)]) -> Vec<String> {
+        rs.iter()
+            .map(|&(a, b)| text[a.min(b)..a.max(b)].to_string())
+            .collect()
     }
 
     #[test]

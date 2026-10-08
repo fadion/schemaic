@@ -2222,17 +2222,13 @@ struct DiagHit {
 /// Asked on every pointer move, so it reads nothing the size of the document:
 /// the code column from the line count, not from the text.
 fn name_box_at(ed: &Editor, p: Point) -> Option<DiagHit> {
-    let rope = ed.rope_text();
-    let cx = content_x_for_lines(rope.num_lines());
-    let vp = ed.viewport.get_untracked();
-    let doc = Point::new(p.x - cx + vp.x0, p.y - EDITOR_PAD_TOP + vp.y0);
-    if doc.x < 0.0 {
-        return None;
-    }
-    let (off, inside) = ed.offset_of_point(floem::views::editor::core::mode::Mode::Insert, doc);
+    let (off, inside) = pointer_offset(ed, p)?;
     if !inside {
         return None;
     }
+    let rope = ed.rope_text();
+    let cx = content_x_for_lines(rope.num_lines());
+    let vp = ed.viewport.get_untracked();
     let line = rope.line_of_offset(off);
     let start = rope.offset_of_line(line);
     let text = rope.line_content(line);
@@ -2257,6 +2253,21 @@ fn name_box_at(ed: &Editor, p: Point) -> Option<DiagHit> {
         message: String::new(),
         name_at: Some(lo),
     })
+}
+
+/// The document offset under `p` (in `editor_area` coords), and whether `p`
+/// is inside the text rather than past a line's end — `None` over the gutter.
+/// The inverse of the overlays' placement: the code column, the editor's top
+/// padding and the scroll undone. Reads nothing document-sized, as a pointer
+/// move asks it.
+fn pointer_offset(ed: &Editor, p: Point) -> Option<(usize, bool)> {
+    let cx = content_x_for_lines(ed.rope_text().num_lines());
+    let vp = ed.viewport.get_untracked();
+    let doc = Point::new(p.x - cx + vp.x0, p.y - EDITOR_PAD_TOP + vp.y0);
+    if doc.x < 0.0 {
+        return None;
+    }
+    Some(ed.offset_of_point(floem::views::editor::core::mode::Mode::Insert, doc))
 }
 
 /// The quick-info for the name starting at `at` in `sql`, against the
@@ -6468,6 +6479,8 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     let on_overlay: Rc<std::cell::Cell<bool>> = Rc::new(std::cell::Cell::new(false));
     // The editor, held where the `Copy` hover closure can reach it.
     let ed_qi = RwSignal::new(ed_tip.clone());
+    // Where an Alt+Shift drag's box selection started, while it is dragged.
+    let box_anchor: RwSignal<Option<usize>> = RwSignal::new(None);
     let hover_diag = move |p: Option<Point>| {
         // Not over the completion list: typing is what opens it, and a message
         // about the text being replaced is noise over the list replacing it.
@@ -7300,7 +7313,50 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 // overlay took is a move over the overlay, not over the text.
                 let covered = on_overlay.replace(false);
                 hover_diag((!covered).then_some(pe.pos));
+                // A box selection being dragged: every line between the anchor
+                // and the pointer, across the same columns. After floem's own
+                // drag handling, which this replaces whole.
+                if let Some(anchor) = box_anchor.get_untracked() {
+                    ed_qi.with_untracked(|ed| {
+                        if !ed.active.get_untracked() {
+                            return;
+                        }
+                        let Some((head, _)) = pointer_offset(ed, pe.pos) else {
+                            return;
+                        };
+                        let regions = query.with_untracked(|sql| {
+                            schemaic_core::text_ops::box_regions(sql, anchor, head)
+                        });
+                        let mut sel = Selection::new();
+                        for (a, b) in regions {
+                            sel.add_region(SelRegion::new(a, b, None));
+                        }
+                        ed.cursor.update(|c| c.set_insert(sel));
+                    });
+                }
             }
+        }
+    })
+    // Alt+Shift+press starts a box selection at the pointer; a press without
+    // them, or the release, ends one.
+    .on_event_cont(EventListener::PointerDown, move |e| {
+        let anchor = match e {
+            Event::PointerDown(pe)
+                if pe.button.is_primary() && pe.modifiers.alt() && pe.modifiers.shift() =>
+            {
+                ed_qi.with_untracked(|ed| {
+                    let (at, _) = pointer_offset(ed, pe.pos)?;
+                    ed.cursor.update(|c| c.set_insert(Selection::caret(at)));
+                    Some(at)
+                })
+            }
+            _ => None,
+        };
+        box_anchor.set(anchor);
+    })
+    .on_event_cont(EventListener::PointerUp, move |_| {
+        if box_anchor.get_untracked().is_some() {
+            box_anchor.set(None);
         }
     })
     // A press starts a selection (the editor then owns every move until the
