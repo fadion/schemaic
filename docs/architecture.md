@@ -12291,6 +12291,32 @@ existing prose was left alone.
     The pane applies it as one whole-buffer edit through `edit_untyped` and writes the clipboard
     only when that edit went through, so a cut the Ctrl+K freeze refuses leaves the clipboard as it
     was.
+    **Several carets are answered here too.** Floem's `Selection` holds one `SelRegion` per caret —
+    its Alt+click adds one, *Rename alias* sets several — and the pane's own key actions read the
+    primary caret alone and set one selection after, collapsing the rest into it. `RegionEdit` is
+    one caret's share: a replacement in the original text's offsets, and the selection *that edit
+    alone* would leave. `compose` puts them together as a `MultiEdit` — sorted, each selection
+    shifted by what the edits before it added or removed — and answers `None` on an overlap, which
+    no single document edit can make
+    (`overlapping_edits_are_refused_and_selections_move_with_earlier_edits`). `auto_pair_all` asks
+    `pairs::auto_pair` at each caret of the original text — pair, wrap a selection, or step over a
+    closer — a caret with nothing to pair typing the character plainly; it is `None` when no caret
+    pairs, floem's own insert then serving them all (`each_caret_pairs_where_it_would_alone`).
+    `backspace_pair_all` is the same for Backspace at bare carets: an empty pair whole, one
+    character elsewhere, `None` when no caret sits in a pair
+    (`backspace_deletes_each_carets_empty_pair_and_one_char_elsewhere`). Tab composes each caret's
+    `soft_tab_indent`/`hard_tab_indent`. The line operations — Ctrl+/, Ctrl+D, Alt+↑/↓ — go through
+    `per_line_block`, which runs the existing single-range function once per `line_blocks` block:
+    carets whose lines overlap **or touch** merge into one, so two carets on one line comment it once
+    rather than twice, and neighbouring lines move as one block
+    (`carets_on_touching_lines_make_one_block`, `a_line_operation_acts_once_on_each_carets_block`).
+    Each block is asked of the original text, and one refusing refuses all — Alt+↑ with a caret on
+    the first line moves no block. `toggle_line_comment` and `move_line` answer with the whole text,
+    so `RegionEdit::between` narrows each answer to the span that changed, backing the common prefix
+    and suffix off to char boundaries so the narrowed edit never splits a character
+    (`a_whole_text_rewrite_narrows_to_what_changed`). The pane applies a `MultiEdit` through
+    `edit_untyped_multi` (under *Floem 0.2 gotchas*); where `compose` refuses, Tab, Ctrl+/ and
+    Ctrl+D fall back to the primary caret as before, and Alt+↑/↓ does nothing.
   - `sqlfmt.rs` — `format_sql` (Ctrl+Alt+L pretty-printer): re-flows whitespace/indent/line-breaks
     "block" style, **preserving keyword case** itself; built on `skip_noncode` so comments/strings/
     backtick idents pass through untouched; indent follows editor tab-width/soft-tabs.
@@ -24130,9 +24156,10 @@ existing prose was left alone.
     absent otherwise, and re-derived when clicked, like the rest — and is appended after the entries
     above, ahead of *Create view*'s group. It opens no modal and has no key: it sets the cursor to a
     `Selection` of one `SelRegion` per occurrence, so the next word typed replaces every one at once.
-    That leans on multi-region editing, which not every editing path here survives yet — Backspace
-    and an auto-paired `(` among them — so a rename is clean when it is typed straight over the
-    selection and not otherwise.
+    That leans on multi-region editing. Backspace and an auto-paired `(` used to collapse the
+    regions to the primary one; they now act at every caret (`text_ops.rs`, *Several carets*), as
+    do Tab, Ctrl+/, Ctrl+D and Alt+↑/↓. Shift+Tab, Ctrl+Shift+U and Ctrl+Shift+J still read the
+    primary caret alone.
     **The Ctrl+K suggestion is not drawn here** — it is phantom rows in the editor's own line flow
     (`inline_diff`, below), and what `cmdk_popup` still draws is the two ends of the block: the
     question bar (sparkle, a `multiline` `edit_field` capped at three rows, then a send affordance or
@@ -24553,7 +24580,8 @@ existing prose was left alone.
     open list owns Tab, and `completion::lone_caret` still answering the offset the ghost was made
     for (`ghost_at.is_some() && ghost_at == caret`, the caret being `lone_caret`'s `Option`).
     Anything else falls through to the indent. With several carets or a selection there is no lone
-    caret, so Tab indents and Ctrl+→ moves every caret
+    caret, so Tab indents — each caret by its own indent, in one edit (`text_ops.rs`) — and Ctrl+→
+    moves every caret
     (`no_lone_caret_leaves_both_keys_to_what_they_always_did`): both keys used to compare
     `cursor.offset()`, the last-inserted region, so a ghost was inserted at one caret of several
     and `set_offset` collapsed the rest. The insert goes through `edit_untyped`, so the Ctrl+K
@@ -33111,6 +33139,17 @@ Re-introducing the anti-patterns these guard against is a regression:
   `edit_untyped`'s own body for the check and the refusal, the other scans for a raw `.edit_single(`
   with no `read_only` question within 30 logical lines above it, `FREEZE-EXEMPT` being the marker the
   funnel's own pair carries. Against the unfixed tree it reports nine offenders.
+  **`edit_untyped_multi` is the funnel for an edit at several carets** (a `text_ops::MultiEdit`):
+  one `Document::edit` of every replacement, so one undo step, then every caret's selection set
+  from the `MultiEdit` — refused while frozen, as `edit_untyped` is. `several_regions` answers the
+  regions only when there are several, so a lone caret keeps the single-caret path. The
+  several-caret auto-pair is `auto_pair_several`, which asks the freeze itself and suppresses
+  floem's insert through `read_only` as the lone path does, and spends the `comp.typed` one-shot
+  when every caret only stepped over. **The gate counts it**: it scans for `.edit(&mut` as well as
+  `.edit_single(`, since the multi edit is the same ungated door. The new helpers sit below
+  `edit_untyped_frozen`, and the multi-caret auto-pair branch is a helper call ahead of the lone
+  path's freeze check, so that every edit the gate counts keeps its check within its 30-line
+  window.
 - **The editor has two indent units, and floem's edit commands read the one we cannot set.** The
   `indent_style` `editor_pane` hands `editor_style` from the tab settings is the *style's*, which
   floem reads only to space the indent guides (drawn only while Settings → Editor → *Indent
@@ -33134,7 +33173,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   bar's Replace and Replace All and the snippet library. **Two keep a merging kind on purpose**,
   both through a raw `doc.edit_single` rather than the funnel: the auto-pair insert is
   `InsertChars` because it *is* a typed character, and the empty-pair Backspace is `Delete`
-  because it is a Backspace. What it costs: two Tabs in a row are two undo steps, since a
+  because it is a Backspace — their several-caret forms keep the same kinds through
+  `edit_untyped_multi`, as Tab, Ctrl+/, Ctrl+D and Alt+↑/↓ keep theirs. What it costs: two Tabs in a row are two undo steps, since a
   non-merging kind does not merge with itself either. What it does not cover: every keystroke is
   `InsertChars`, so a run of typing is still one undo step however long — nothing breaks it at
   word boundaries. No test can fail on any of this, the choice being made at view call sites and

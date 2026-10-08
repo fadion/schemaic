@@ -441,6 +441,85 @@ fn edit_untyped_frozen(ed: &Editor, comp: Completion, sel: Selection, text: &str
     ed.doc().edit_single(sel, text, ty);
 }
 
+/// [`edit_untyped`] for an edit made **at every caret**
+/// ([`schemaic_core::text_ops::MultiEdit`]): one document edit, so one undo
+/// step, then every caret's selection after it. Refused while the editor is
+/// frozen, as the funnel is.
+fn edit_untyped_multi(
+    ed: &Editor,
+    comp: Completion,
+    m: &schemaic_core::text_ops::MultiEdit,
+    ty: EditType,
+) -> bool {
+    if ed.read_only.get_untracked() {
+        return false;
+    }
+    comp.suppress.set(true);
+    if !m.edits.is_empty() {
+        let mut edits = m
+            .edits
+            .iter()
+            .map(|(s, e, t)| (Selection::region(*s, *e), t.as_str()));
+        ed.doc().edit(&mut edits, ty);
+    }
+    let mut sel = Selection::new();
+    for &(a, b) in &m.sels {
+        sel.add_region(SelRegion::new(a, b, None));
+    }
+    ed.cursor.update(|c| c.set_insert(sel));
+    true
+}
+
+/// Every caret's `(start, end)` when there are **several** — `None` for one,
+/// which the single-caret paths serve as they always have.
+fn several_regions(
+    cursor: &floem::views::editor::core::cursor::Cursor,
+) -> Option<Vec<(usize, usize)>> {
+    use floem::views::editor::core::cursor::CursorMode;
+    let CursorMode::Insert(sel) = &cursor.mode else {
+        return None;
+    };
+    let regions = sel.regions();
+    (regions.len() > 1).then(|| regions.iter().map(|r| (r.start, r.end)).collect())
+}
+
+/// A typed pair character at **several** carets
+/// ([`schemaic_core::text_ops::auto_pair_all`]), made here with floem's own
+/// insert suppressed through `read_only` for the rest of the dispatch, and
+/// put back after it — the lone caret's auto-pair, at every caret. `false`
+/// when the editor is frozen (the Ctrl+K preview), or when no caret pairs and
+/// the character inserts normally everywhere.
+fn auto_pair_several(
+    e: &Editor,
+    comp: Completion,
+    regions: &[(usize, usize)],
+    ch: char,
+    dia: SqlDialect,
+) -> bool {
+    let ro = e.read_only;
+    let was = ro.get_untracked();
+    if was {
+        return false;
+    }
+    let full = e.doc().text().to_string();
+    let Some(m) = schemaic_core::text_ops::auto_pair_all(&full, regions, ch, dia) else {
+        return false;
+    };
+    if m.edits.is_empty() {
+        // Only stepped over: no document change, so spend the typing
+        // one-shot here, as the lone caret's `Skip` does.
+        comp.typed.set(false);
+    }
+    edit_untyped_multi(e, comp, &m, EditType::InsertChars);
+    ro.set(true);
+    floem::action::exec_after(std::time::Duration::ZERO, move |_| {
+        if ro.try_get_untracked().is_some() {
+            ro.set(was);
+        }
+    });
+    true
+}
+
 /// Reformat the SQL in `ed` (the Ctrl+Alt+L action, also the editor's right-click
 /// "Format SQL"). Formats the current selection if there is one, else the whole
 /// document; indentation follows the editor's tab-width / soft-tabs settings and
@@ -3074,6 +3153,29 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             let soft = theme::editor_soft_tabs();
             editor_sig.with_untracked(|e| {
                 let full = e.doc().text().to_string();
+                // Several carets: each indents where it is, in one edit.
+                if let Some(regions) = several_regions(&e.cursor.get_untracked()) {
+                    let edits = regions
+                        .iter()
+                        .map(|&(a, b)| {
+                            let ed = if soft {
+                                soft_tab_indent(&full, a, b, tw)
+                            } else {
+                                schemaic_core::text_ops::hard_tab_indent(&full, a, b)
+                            };
+                            schemaic_core::text_ops::RegionEdit {
+                                start: ed.start,
+                                end: ed.end,
+                                insert: ed.text,
+                                sel: ed.sel,
+                            }
+                        })
+                        .collect();
+                    if let Some(m) = schemaic_core::text_ops::compose(edits) {
+                        edit_untyped_multi(e, comp, &m, EditType::Indent);
+                        return;
+                    }
+                }
                 let (a, b) = e.cursor.get_untracked().get_selection().unwrap_or_else(|| {
                     let o = e.cursor.get_untracked().offset();
                     (o, o)
@@ -3378,10 +3480,27 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     let doc = e.doc();
                     let full = doc.text().to_string();
                     let cur = e.cursor.get_untracked();
+                    let dia = dialect.get_untracked();
+                    // Several carets: each one's lines, once a block.
+                    if let Some(regions) = several_regions(&cur) {
+                        let m = schemaic_core::text_ops::per_line_block(
+                            &full,
+                            &regions,
+                            |t, lo, hi| {
+                                let ed = toggle_line_comment(t, lo, hi, dia);
+                                Some(schemaic_core::text_ops::RegionEdit::between(
+                                    t, &ed.text, ed.sel,
+                                ))
+                            },
+                        );
+                        if let Some(m) = m {
+                            edit_untyped_multi(e, comp, &m, EditType::ToggleComment);
+                            return;
+                        }
+                    }
                     let off = cur.offset();
                     let (a, b) = cur.get_selection().unwrap_or((off, off));
-                    let edit =
-                        toggle_line_comment(&full, a.min(b), a.max(b), dialect.get_untracked());
+                    let edit = toggle_line_comment(&full, a.min(b), a.max(b), dia);
                     if edit_untyped(
                         e,
                         comp,
@@ -3402,9 +3521,30 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 // last line put the copy on the same line.
                 editor_sig.with_untracked(|e| {
                     let cur = e.cursor.get_untracked();
+                    let full = e.doc().text().to_string();
+                    // Several carets: each one's lines copied below them.
+                    if let Some(regions) = several_regions(&cur) {
+                        let m = schemaic_core::text_ops::per_line_block(
+                            &full,
+                            &regions,
+                            |t, lo, hi| {
+                                let (at, insert, sel) =
+                                    schemaic_core::text_ops::duplicate_lines(t, lo, hi);
+                                Some(schemaic_core::text_ops::RegionEdit {
+                                    start: at,
+                                    end: at,
+                                    insert,
+                                    sel,
+                                })
+                            },
+                        );
+                        if let Some(m) = m {
+                            edit_untyped_multi(e, comp, &m, EditType::Other);
+                            return;
+                        }
+                    }
                     let off = cur.offset();
                     let (a, b) = cur.get_selection().unwrap_or((off, off));
-                    let full = e.doc().text().to_string();
                     let (at, insert, (lo, hi)) =
                         schemaic_core::text_ops::duplicate_lines(&full, a, b);
                     if edit_untyped(
@@ -3631,6 +3771,20 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 let doc = e.doc();
                 let full = doc.text().to_string();
                 let cur = e.cursor.get_untracked();
+                // Several carets: every block moves, or — one at the edge —
+                // none does.
+                if let Some(regions) = several_regions(&cur) {
+                    let m =
+                        schemaic_core::text_ops::per_line_block(&full, &regions, |t, lo, hi| {
+                            move_line(t, lo, hi, up).map(|ed| {
+                                schemaic_core::text_ops::RegionEdit::between(t, &ed.text, ed.sel)
+                            })
+                        });
+                    if let Some(m) = m {
+                        edit_untyped_multi(e, comp, &m, EditType::MoveLine);
+                    }
+                    return;
+                }
                 let off = cur.offset();
                 let (a, b) = cur.get_selection().unwrap_or((off, off));
                 if let Some(edit) = move_line(&full, a.min(b), a.max(b), up)
@@ -3722,6 +3876,12 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         {
             let dia = dialect.get_untracked();
             let acted = editor_sig.with_untracked(|e| {
+                let cur = e.cursor.get_untracked();
+                // Several carets: each pairs, wraps or steps over as it would
+                // alone, and the rest type the character — all in one edit.
+                if let Some(regions) = several_regions(&cur) {
+                    return auto_pair_several(e, comp, &regions, ch, dia);
+                }
                 let ro = e.read_only;
                 // Already frozen — by the Ctrl+K preview, the only other owner.
                 // An edit here would bypass the freeze, so there is nothing to do.
@@ -3731,7 +3891,6 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 }
                 let doc = e.doc();
                 let full = doc.text().to_string();
-                let cur = e.cursor.get_untracked();
                 let off = cur.offset();
                 let (a, b) = cur.get_selection().unwrap_or((off, off));
                 let Some(action) = pairs::auto_pair(&full, a, b, ch, dia) else {
@@ -3798,6 +3957,17 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             let dia = dialect.get_untracked();
             let acted = editor_sig.with_untracked(|e| {
                 let cur = e.cursor.get_untracked();
+                // Several bare carets: each deletes its empty pair whole, the
+                // rest one character, in one edit.
+                if let Some(regions) = several_regions(&cur) {
+                    if regions.iter().any(|&(a, b)| a != b) {
+                        return false;
+                    }
+                    let carets: Vec<usize> = regions.iter().map(|r| r.1).collect();
+                    let full = e.doc().text().to_string();
+                    return schemaic_core::text_ops::backspace_pair_all(&full, &carets, dia)
+                        .is_some_and(|m| edit_untyped_multi(e, comp, &m, EditType::Delete));
+                }
                 if cur.get_selection().is_some_and(|(a, b)| a != b) {
                     return false; // let the default delete a real selection
                 }
@@ -8979,7 +9149,9 @@ mod editor_freeze_gate {
         let mut edits = 0usize;
         let mut offenders: Vec<String> = Vec::new();
         for (i, line) in lines.iter().enumerate() {
-            if !line.contains(".edit_single(") {
+            // `.edit(&mut` too: the several-caret funnel's one document edit
+            // is the same ungated door, many regions wide.
+            if !line.contains(".edit_single(") && !line.contains(".edit(&mut") {
                 continue;
             }
             edits += 1;

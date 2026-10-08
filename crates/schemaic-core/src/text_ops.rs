@@ -1222,9 +1222,368 @@ pub fn selected_text(text: &str, range: Option<(usize, usize)>) -> Option<&str> 
     text.get(a..b).filter(|s| !s.trim().is_empty())
 }
 
+/// One caret's share of an edit made at every caret: replace `[start, end)` of
+/// the original text with `insert`, leaving the selection `sel` — offsets in
+/// the text **this edit alone** would produce. A caret that only moves is an
+/// empty edit at its own spot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RegionEdit {
+    pub start: usize,
+    pub end: usize,
+    pub insert: String,
+    pub sel: (usize, usize),
+}
+
+impl RegionEdit {
+    /// A whole-text rewrite (`old` → `new`, as [`toggle_line_comment`] and
+    /// [`move_line`] answer) narrowed to the span that changed, so it can sit
+    /// beside the other carets' edits.
+    pub fn between(old: &str, new: &str, sel: (usize, usize)) -> RegionEdit {
+        let (a, b) = (old.as_bytes(), new.as_bytes());
+        let mut pre = a.iter().zip(b).take_while(|(x, y)| x == y).count();
+        while !old.is_char_boundary(pre) {
+            pre -= 1;
+        }
+        let room = a.len().min(b.len()) - pre;
+        let mut suf = a
+            .iter()
+            .rev()
+            .zip(b.iter().rev())
+            .take(room)
+            .take_while(|(x, y)| x == y)
+            .count();
+        while !old.is_char_boundary(a.len() - suf) || !new.is_char_boundary(b.len() - suf) {
+            suf -= 1;
+        }
+        RegionEdit {
+            start: pre,
+            end: a.len() - suf,
+            insert: new[pre..b.len() - suf].to_string(),
+            sel,
+        }
+    }
+}
+
+/// Every caret's edit made as one: the replacements in the **original**
+/// text's offsets, ascending — what one multi-region document edit takes —
+/// and each caret's selection in the text they leave.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MultiEdit {
+    pub edits: Vec<(usize, usize, String)>,
+    pub sels: Vec<(usize, usize)>,
+}
+
+/// Put the carets' edits together ([`MultiEdit`]): each selection moved by
+/// what the edits before it added or removed. `None` when two of them overlap,
+/// which no single edit can make — the caller then leaves the keystroke to
+/// the primary caret, as before.
+pub fn compose(mut edits: Vec<RegionEdit>) -> Option<MultiEdit> {
+    edits.sort_by_key(|e| (e.start, e.end));
+    let mut out = MultiEdit {
+        edits: Vec::new(),
+        sels: Vec::new(),
+    };
+    let mut shift = 0isize;
+    let mut last_end = 0usize;
+    for (i, e) in edits.into_iter().enumerate() {
+        if i > 0 && e.start < last_end {
+            return None;
+        }
+        last_end = e.end;
+        let at = |p: usize| (p as isize + shift).max(0) as usize;
+        out.sels.push((at(e.sel.0), at(e.sel.1)));
+        shift += e.insert.len() as isize - (e.end - e.start) as isize;
+        if e.start != e.end || !e.insert.is_empty() {
+            out.edits.push((e.start, e.end, e.insert));
+        }
+    }
+    Some(out)
+}
+
+/// The carets' selections gathered into **line blocks**: those whose lines
+/// touch or overlap merged into one `(lo, hi)` span, ascending — what a line
+/// operation (comment, move, duplicate) acts on once per block, so two carets
+/// on one line comment it once, and two on neighbouring lines move together.
+pub fn line_blocks(text: &str, regions: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let len = text.len();
+    let starts = line_start_offsets(text);
+    let mut spans: Vec<(usize, usize, usize, usize)> = regions
+        .iter()
+        .map(|&(a, b)| {
+            let (lo, hi) = (a.min(b).min(len), a.max(b).min(len));
+            let first = line_index_of(&starts, lo);
+            let mut last = line_index_of(&starts, hi);
+            // A selection ending at a line's start does not take that line.
+            if hi > lo && last > first && starts[last] == hi {
+                last -= 1;
+            }
+            (first, last, lo, hi)
+        })
+        .collect();
+    spans.sort();
+    let mut out: Vec<(usize, usize, usize, usize)> = Vec::new();
+    for s in spans {
+        match out.last_mut() {
+            Some(m) if s.0 <= m.1 + 1 => {
+                m.1 = m.1.max(s.1);
+                m.2 = m.2.min(s.2);
+                m.3 = m.3.max(s.3);
+            }
+            _ => out.push(s),
+        }
+    }
+    out.into_iter().map(|(_, _, lo, hi)| (lo, hi)).collect()
+}
+
+/// A line operation — comment, move, duplicate — at every caret: once per
+/// [`line_blocks`] block, each asked of the original text (`op(text, lo,
+/// hi)`), then put together. `None` when any block refuses (a move past the
+/// first or last line moves nothing at all) or the edits would overlap.
+pub fn per_line_block(
+    text: &str,
+    regions: &[(usize, usize)],
+    op: impl Fn(&str, usize, usize) -> Option<RegionEdit>,
+) -> Option<MultiEdit> {
+    let edits = line_blocks(text, regions)
+        .into_iter()
+        .map(|(lo, hi)| op(text, lo, hi))
+        .collect::<Option<Vec<_>>>()?;
+    compose(edits)
+}
+
+/// [`crate::pairs::auto_pair`] at every caret: each decided against the
+/// original text, a caret with no pair to make typing `ch` plainly. `None`
+/// when no caret pairs — the editor's own insert then does it everywhere —
+/// or when the edits would overlap.
+pub fn auto_pair_all(
+    text: &str,
+    regions: &[(usize, usize)],
+    ch: char,
+    dialect: SqlDialect,
+) -> Option<MultiEdit> {
+    let mut paired = false;
+    let edits = regions
+        .iter()
+        .map(|&(a, b)| {
+            let (lo, hi) = (a.min(b), a.max(b));
+            match crate::pairs::auto_pair(text, a, b, ch, dialect) {
+                Some(crate::pairs::PairAction::Insert {
+                    start,
+                    end,
+                    insert,
+                    sel,
+                }) => {
+                    paired = true;
+                    RegionEdit {
+                        start,
+                        end,
+                        insert,
+                        sel,
+                    }
+                }
+                Some(crate::pairs::PairAction::Skip { caret }) => {
+                    paired = true;
+                    RegionEdit {
+                        start: lo,
+                        end: lo,
+                        insert: String::new(),
+                        sel: (caret, caret),
+                    }
+                }
+                None => {
+                    let at = lo + ch.len_utf8();
+                    RegionEdit {
+                        start: lo,
+                        end: hi,
+                        insert: ch.to_string(),
+                        sel: (at, at),
+                    }
+                }
+            }
+        })
+        .collect();
+    if !paired {
+        return None;
+    }
+    compose(edits)
+}
+
+/// Backspace at every bare caret, an empty pair (`(|)`, `'|'`) deleted whole
+/// as [`crate::pairs::backspace_pair`] does it and anything else one
+/// character. `None` when no caret sits in a pair — the editor's own
+/// Backspace then serves them all.
+pub fn backspace_pair_all(text: &str, carets: &[usize], dialect: SqlDialect) -> Option<MultiEdit> {
+    let mut paired = false;
+    let edits = carets
+        .iter()
+        .map(|&c| {
+            let c = c.min(text.len());
+            if let Some((s, e)) = crate::pairs::backspace_pair(text, c, dialect) {
+                paired = true;
+                return RegionEdit {
+                    start: s,
+                    end: e,
+                    insert: String::new(),
+                    sel: (s, s),
+                };
+            }
+            let prev = text[..c].char_indices().next_back().map_or(c, |(i, _)| i);
+            RegionEdit {
+                start: prev,
+                end: c,
+                insert: String::new(),
+                sel: (prev, prev),
+            }
+        })
+        .collect();
+    if !paired {
+        return None;
+    }
+    compose(edits)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Apply a [`MultiEdit`] as the editor would: every replacement in the
+    /// original offsets, at once.
+    fn apply(text: &str, m: &MultiEdit) -> String {
+        let mut out = String::new();
+        let mut at = 0;
+        for (s, e, ins) in &m.edits {
+            out.push_str(&text[at..*s]);
+            out.push_str(ins);
+            at = *e;
+        }
+        out.push_str(&text[at..]);
+        out
+    }
+
+    #[test]
+    fn each_caret_pairs_where_it_would_alone() {
+        let my = SqlDialect::MySql;
+        let text = "a \nb \nc";
+        let carets: Vec<(usize, usize)> = [2, 5].iter().map(|&c| (c, c)).collect();
+        let m = auto_pair_all(text, &carets, '(', my).unwrap();
+        assert_eq!(apply(text, &m), "a ()\nb ()\nc");
+        assert_eq!(m.sels, vec![(3, 3), (8, 8)]);
+        // Typing the closer steps over each one.
+        let after = apply(text, &m);
+        let m2 = auto_pair_all(&after, &m.sels, ')', my).unwrap();
+        assert!(m2.edits.is_empty());
+        assert_eq!(m2.sels, vec![(4, 4), (9, 9)]);
+        // A caret before a word types plainly beside one that pairs.
+        let mixed = "x\n ";
+        let m3 = auto_pair_all(mixed, &[(0, 0), (3, 3)], '(', my).unwrap();
+        assert_eq!(apply(mixed, &m3), "(x\n ()");
+        assert_eq!(m3.sels, vec![(1, 1), (5, 5)]);
+        // A selection at each caret is wrapped.
+        let words = "ab cd";
+        let m4 = auto_pair_all(words, &[(0, 2), (3, 5)], '\'', my).unwrap();
+        assert_eq!(apply(words, &m4), "'ab' 'cd'");
+        // No caret pairs: the editor's own insert serves them all.
+        assert_eq!(auto_pair_all("xy", &[(0, 0), (1, 1)], '(', my), None);
+    }
+
+    #[test]
+    fn backspace_deletes_each_carets_empty_pair_and_one_char_elsewhere() {
+        let my = SqlDialect::MySql;
+        let text = "f()\ng('')\nhi";
+        let m = backspace_pair_all(text, &[2, 7, 12], my).unwrap();
+        assert_eq!(apply(text, &m), "f\ng()\nh");
+        assert_eq!(m.sels, vec![(1, 1), (4, 4), (7, 7)]);
+        assert_eq!(backspace_pair_all("ab", &[1, 2], my), None);
+        // At the very start, nothing to delete.
+        let m = backspace_pair_all("()", &[0, 1], my).unwrap();
+        assert_eq!(apply("()", &m), "");
+        assert_eq!(m.sels, vec![(0, 0), (0, 0)]);
+    }
+
+    #[test]
+    fn carets_on_touching_lines_make_one_block() {
+        let text = "a\nb\nc\nd\ne\nf";
+        // Lines 0 and 1 touch, 3 and 4 touch, line 2 parts them; two carets
+        // on line 5, apart from line 4 by nothing, join it too.
+        let blocks = line_blocks(text, &[(0, 0), (2, 2), (6, 6), (8, 8)]);
+        assert_eq!(blocks, vec![(0, 2), (6, 8)]);
+        let blocks = line_blocks(text, &[(0, 0), (6, 6), (10, 10), (11, 11)]);
+        assert_eq!(blocks, vec![(0, 0), (6, 6), (10, 11)]);
+        // A selection ending at a line's start does not reach that line.
+        assert_eq!(line_blocks(text, &[(0, 2), (6, 6)]), vec![(0, 2), (6, 6)]);
+    }
+
+    #[test]
+    fn a_line_operation_acts_once_on_each_carets_block() {
+        let my = SqlDialect::MySql;
+        let text = "select 1\nselect 2\nselect 3\nselect 4";
+        // Carets on lines 0 and 2 (and a second on line 2): two blocks.
+        let comment = |t: &str, lo: usize, hi: usize| {
+            let e = toggle_line_comment(t, lo, hi, my);
+            Some(RegionEdit::between(t, &e.text, e.sel))
+        };
+        let m = per_line_block(text, &[(3, 3), (20, 20), (22, 22)], comment).unwrap();
+        assert_eq!(
+            apply(text, &m),
+            "-- select 1\nselect 2\n-- select 3\nselect 4"
+        );
+        assert_eq!(m.sels.len(), 2);
+        // Moving up: the first block cannot, so nothing moves.
+        let up = |t: &str, lo: usize, hi: usize| {
+            move_line(t, lo, hi, true).map(|e| RegionEdit::between(t, &e.text, e.sel))
+        };
+        assert_eq!(per_line_block(text, &[(3, 3), (20, 20)], up), None);
+        let m = per_line_block(text, &[(12, 12), (30, 30)], up).unwrap();
+        assert_eq!(apply(text, &m), "select 2\nselect 1\nselect 4\nselect 3");
+        // Each caret stays on its own line, now one up.
+        assert_eq!(m.sels, vec![(3, 3), (21, 21)]);
+        // Duplicate each.
+        let dup = |t: &str, lo: usize, hi: usize| {
+            let (at, insert, sel) = duplicate_lines(t, lo, hi);
+            Some(RegionEdit {
+                start: at,
+                end: at,
+                insert,
+                sel,
+            })
+        };
+        let m = per_line_block(text, &[(0, 0), (27, 27)], dup).unwrap();
+        assert_eq!(
+            apply(text, &m),
+            "select 1\nselect 1\nselect 2\nselect 3\nselect 4\nselect 4"
+        );
+    }
+
+    #[test]
+    fn a_whole_text_rewrite_narrows_to_what_changed() {
+        let e = RegionEdit::between("select 1\nselect 2", "-- select 1\nselect 2", (3, 3));
+        assert_eq!((e.start, e.end, e.insert.as_str()), (0, 0, "-- "));
+        let e = RegionEdit::between("aXb", "ab", (1, 1));
+        assert_eq!((e.start, e.end, e.insert.as_str()), (1, 2, ""));
+        let e = RegionEdit::between("città", "città!", (0, 0));
+        assert_eq!((e.start, e.end, e.insert.as_str()), (6, 6, "!"));
+        assert_eq!(RegionEdit::between("same", "same", (0, 0)).insert, "");
+    }
+
+    #[test]
+    fn overlapping_edits_are_refused_and_selections_move_with_earlier_edits() {
+        let at = |s, e, i: &str, sel| RegionEdit {
+            start: s,
+            end: e,
+            insert: i.to_string(),
+            sel,
+        };
+        assert_eq!(
+            compose(vec![at(0, 3, "x", (1, 1)), at(2, 4, "", (2, 2))]),
+            None
+        );
+        let m = compose(vec![at(5, 5, "--", (7, 7)), at(0, 2, "", (0, 0))]).unwrap();
+        assert_eq!(
+            m.edits,
+            vec![(0, 2, String::new()), (5, 5, "--".to_string())]
+        );
+        assert_eq!(m.sels, vec![(0, 0), (5, 5)]);
+    }
 
     #[test]
     fn a_selection_is_the_text_between_its_ends() {
