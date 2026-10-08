@@ -4370,9 +4370,12 @@ thread_local! {
 /// [`menu_panel`] as it builds** — so the slot lives only between the two and
 /// cannot go stale. A menu opened with no return set simply has none.
 ///
-/// Only the keyboard wants this: after a *click*, moving focus to the control
-/// that was clicked would take the arrow keys away from whatever had them
-/// (the grid's own cell navigation). `keyboard_nav` is what an opener asks.
+/// Mostly only the keyboard wants this: after a *click*, moving focus to the
+/// control that was clicked would take the arrow keys away from whatever had
+/// them (the grid's own cell navigation). `keyboard_nav` is what such an opener
+/// asks. The exceptions are the right-clicks on a surface that owned the
+/// keyboard — the schema tree, and the SQL editor — where floem's press placed
+/// no focus at all and the surface is where it belongs.
 pub(crate) fn set_menu_return(f: Rc<dyn Fn()>) {
     MENU_RETURN.with_borrow_mut(|s| *s = Some(f));
 }

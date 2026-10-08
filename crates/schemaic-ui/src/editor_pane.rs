@@ -5503,6 +5503,16 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     // at the workspace root so it floats over the results pane.
                     popup_anchor.set(None);
                     popup_width.set(120.0);
+                    // The keyboard comes back here when the menu closes by
+                    // Escape or an entry. A right-click places no focus, so
+                    // without this the panel's hand-back lands on the grid, and
+                    // what "Rename alias" leaves for typing receives nothing.
+                    // Armed on the line before the panel builds and takes it.
+                    if let Some(vid) = ed_menu.editor_view_id.get_untracked() {
+                        crate::widgets::set_menu_return(crate::widgets::menu_return(move || {
+                            vid.request_focus()
+                        }));
+                    }
                     popup_menu.set(Some((build_editor_menu)()));
                     comp.open.set(false);
                     return EventPropagation::Stop;
@@ -9595,5 +9605,38 @@ mod diag_tip_occlusion_gate {
                  if it moved"
             );
         }
+    }
+}
+
+/// **The editor's right-click menu hands the keyboard back to the editor.**
+///
+/// A right-click places no focus (`widgets::press_places_focus`), so when the
+/// menu closed by Escape or by an entry, the panel's hand-back fell through to
+/// the grid's keyboard home: typing after Escape went nowhere, and "Rename
+/// alias" put a caret on every occurrence that no key could reach. The opener
+/// is the only place that knows where the keyboard belongs, so the return is
+/// armed there, before the panel builds and takes it.
+#[cfg(test)]
+mod editor_menu_return_gate {
+    use crate::source_gate::production_code;
+
+    #[test]
+    fn the_right_click_menu_arms_a_return_before_it_opens() {
+        let src =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/editor_pane.rs"))
+                .expect("this file");
+        let body = production_code(&src);
+        let open = format!("popup_menu.set(Some((build_{}_menu)()))", "editor");
+        let at = body
+            .find(&open)
+            .expect("the editor's right-click opens its menu");
+        let branch_start = body[..at]
+            .rfind("if pe.button.is_secondary()")
+            .expect("the menu opens in the secondary-button branch");
+        assert!(
+            body[branch_start..at].contains(&format!("set_menu_{}(", "return")),
+            "the editor's right-click menu opens with no return armed, so Escape \
+             or an entry leaves the keyboard on the grid instead of the editor"
+        );
     }
 }

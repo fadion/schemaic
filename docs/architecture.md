@@ -34888,6 +34888,17 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   `Nav::focused`, which arms the return only when the tree actually held the keyboard and leaves
   every other trigger's rule intact. `Nav` carries the tree container's own `ViewId` for it
   (`tree_id`, published once the view exists), which was a local before there was a second caller.
+  **The SQL editor's right-click menu arms one too, and unconditionally** — `set_menu_return(
+  menu_return(…))` focusing the content view (`editor_view_id`), in the secondary-button branch on
+  the line before `popup_menu.set`. Without it, closing that menu by Escape or by an entry left the
+  keyboard on the grid: a right-click places no focus (`widgets::press_places_focus` — floem clears
+  focus on every press and re-places it on a primary one only), so `hand_keyboard_back` fell through
+  to the workspace's keyboard home, `refocus_grid`. Typing after Escape went nowhere, and *Rename
+  alias* left a caret on every occurrence that no key could reach. The click-withholds-a-return
+  premise fails here as it does in the tree: the right-click took the keyboard from nobody but
+  floem, and the editor that raised the menu is where it belongs.
+  `editor_menu_return_gate::the_right_click_menu_arms_a_return_before_it_opens` fails if that branch
+  opens the menu with no return armed ahead of it.
   **Handing focus back is a focus *event*, and a handler that re-seeds state on one is a bug waiting
   for a caller.** The tree's `FocusGained` seeded the nav cursor from the open table unconditionally
   — correct while the only way in was a click from outside, and wrong the moment the menu started
