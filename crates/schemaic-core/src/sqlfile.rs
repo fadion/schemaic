@@ -99,15 +99,24 @@ pub struct SqlText {
 
 /// Past this, opening a `.sql` file asks first. See [`open_verdict`].
 ///
-/// 1 MB is where the editor's own analysis crosses half a second on an *empty*
-/// catalogue — measured at 710 ms for a 1 MB document, 2.78 s at 4 MB, 11.4 s at
-/// 16 MB — and a real catalogue is worse than that, not better.
-pub const OPEN_WARN_BYTES: u64 = 1 << 20;
+/// 4 MiB, measured (release, a realistic script, a 200-table catalogue). What
+/// set it at 1 MB was the diagnostics pass — the whole document on the UI
+/// thread after every pause in typing, 710 ms at 1 MB — which now runs on a
+/// worker through a statement cache: 116 ms after an edit at 4 MiB, 1.2 s for
+/// the first pass, with nothing frozen. What is left on the UI thread per
+/// keystroke is taken forward over the edit rather than redone — the colouring
+/// and bracket passes and the statement index, under 3 ms together at 4 MiB,
+/// plus a few ~0.5 ms copies of the text, against 86 ms of whole-document walks
+/// before. At 16 MiB the same is 30–40 ms a
+/// keystroke plus a 5 s first diagnostics pass, which is a slow editor: past 4
+/// MiB the question stands.
+pub const OPEN_WARN_BYTES: u64 = 4 << 20;
 
 /// Past this, opening is refused outright.
 ///
-/// 64 MB puts the same analysis at ~45 s per pause in typing, forever, which is
-/// not a slow editor but a hung window. The number is deliberately far above
+/// 64 MB puts the first diagnostics pass near 20 s and every keystroke near
+/// 100 ms — extrapolated from the 16 MiB measurements above, both linear in
+/// the size — which is not a slow editor but a hung one. The number is deliberately far above
 /// anything a hand-written script reaches: what lands here is a database dump,
 /// and the answer for one of those is the import path or a query tab, not a
 /// syntax-highlighted editor holding four copies of it.
@@ -116,10 +125,10 @@ pub const OPEN_REFUSE_BYTES: u64 = 64 << 20;
 /// What opening a file of `bytes` should do.
 ///
 /// **The editor's cost is the whole reason this exists**, not the read: `fs::read`
-/// and [`decode`] are cheap even at 256 MB. What is not cheap is
-/// `intel::diagnostics`, which runs over the *whole* document on the UI thread
-/// 120 ms after every burst of typing — so a file that opens in a moment leaves
-/// the window unresponsive for as long as the user keeps it open.
+/// and [`decode`] are cheap even at 256 MB. What is not cheap is what the
+/// editor does with the document for as long as it is open — once the work
+/// per keystroke outgrows a frame, a file that opened in a moment leaves the
+/// window sluggish until it is closed. See [`OPEN_WARN_BYTES`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OpenVerdict {
     /// Open it.
@@ -562,6 +571,14 @@ mod tests {
         use OpenVerdict::*;
         assert_eq!(open_verdict(0), Open, "an empty file");
         assert_eq!(open_verdict(47_000), Open, "an ordinary script");
+        // 4 MiB opens without asking: what the editor does per keystroke
+        // there was measured at a few milliseconds (see `OPEN_WARN_BYTES`).
+        assert_eq!(open_verdict(4 << 20), Open, "a large script");
+        assert_eq!(
+            open_verdict((4 << 20) + 1),
+            Confirm((4 << 20) + 1),
+            "past 4 MiB it asks"
+        );
         assert_eq!(
             open_verdict(OPEN_WARN_BYTES),
             Open,

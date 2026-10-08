@@ -6900,12 +6900,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 handle.spawn_blocking(move || {
                     use schemaic_core::sqlfile::{OpenVerdict, open_verdict};
                     // **The size is asked before the bytes are.** The read itself
-                    // is cheap; what is not is the editor's own analysis, which
-                    // runs over the whole document on the UI thread 120 ms after
-                    // every pause in typing — so a 16 MB script is an
-                    // eleven-second freeze per burst, for as long as the tab is
-                    // open. The import path already asks this question the same
-                    // way (`fs::metadata().len()`).
+                    // is cheap; what is not is the editor's own work on the
+                    // document for as long as the tab is open (the bands and
+                    // their measurements are `sqlfile::OPEN_WARN_BYTES`'). The
+                    // import path already asks this question the same way
+                    // (`fs::metadata().len()`).
                     let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                     match open_verdict(size) {
                         OpenVerdict::Open => {}

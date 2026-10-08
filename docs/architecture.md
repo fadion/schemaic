@@ -13022,13 +13022,18 @@ existing prose was left alone.
     file, and the mode it had carried onto the new inode; see `persist.rs` for the four parts of
     that which read as tidiable) and why the save re-reads the bytes immediately before the rename
     and refuses when they are not what the tab read.
-    **Size is asked before the bytes are.** `open_verdict` confirms past 1 MB and refuses past 64
+    **Size is asked before the bytes are.** `open_verdict` confirms past 4 MiB and refuses past 64
     MB, and the reason is the editor rather than the read: `fs::read` and `decode` are cheap even at
-    256 MB, while `intel::diagnostics` runs over the whole document 120 ms after every pause in
-    typing — measured 710 ms at 1 MB, 11.4 s at 16 MB, 44.8 s at 64 MB, on an *empty* catalogue.
-    Those figures are a whole uncached pass on the UI thread, which is where it ran when they were
-    taken; it now runs on a worker through a per-statement cache (`intel::DiagnosticsCache`), and
-    the thresholds have not been re-measured against that.
+    256 MB, while the editor works on the document for as long as it is open. The confirm stood at
+    1 MB while `intel::diagnostics` ran over the whole document on the UI thread 120 ms after every
+    pause in typing (710 ms at 1 MB, 11.4 s at 16 MB, on an empty catalogue). It was re-measured
+    once that pass had moved to a worker through `intel::DiagnosticsCache` and the per-keystroke
+    walks had become passes taken forward over the edit (release, a realistic script, a 200-table
+    catalogue): at 4 MiB the passes taken forward cost under 3 ms a keystroke together, plus a few
+    copies of the text at ~0.5 ms each, and the worker's
+    re-check 116 ms after an edit (1.2 s for the first pass), nothing frozen; at 16 MiB 30–40 ms a
+    keystroke and a 5 s first pass — a slow editor, which is why past 4 MiB it still asks.
+    `OPEN_WARN_BYTES`' doc holds the figures; the 64 MB refusal's are extrapolated from them.
     The naming half is entirely about what a file system will refuse: `suggested_name` maps the
     characters Windows forbids to `-`, trims the trailing dots and spaces it also refuses, appends
     `.sql` only when it isn't already there (a tab opened from `orders.sql` must not suggest
