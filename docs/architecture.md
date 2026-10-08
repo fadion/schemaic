@@ -25497,7 +25497,16 @@ existing prose was left alone.
     ASCII rule of its own: this was invariant 11's first site outside `core/sql.rs`, and it painted
     `select` as a keyword *inside* the legal column name `éselect`, spans that reach the Ctrl+K diff
     through `highlight_spans` too. `is_keyword` folds ASCII only, so a whole non-ASCII word now
-    correctly matches nothing. A word runs on through `sql::continues_name` (`a$from` is one name),
+    correctly matches nothing. **What a word is, it asks the engine first**:
+    `intel::word_class` reads core's lists for the dialect — a builtin of its catalogue *called*
+    (a `(` follows on the line) or one it calls bare is a `Tok::Function`, a type where only a type
+    can stand (after a PostgreSQL `::`, or given a size, `VARCHAR(40)`) a `Tok::Type`, `TRUE`,
+    `FALSE`, `NULL` and `UNKNOWN` a `Tok::Constant`, each in the theme's own colour for it, and
+    a word the engine reserves a keyword. Its answer wins over the fixed `is_keyword` list where it
+    names a function, type or constant, so `COUNT(` and `VARCHAR(40)` stop being keyword-coloured
+    while `LEFT` before `JOIN`, not called, stays one; a column named `date` or `text` is a type
+    nowhere it is not one (`a_word_is_classed_by_what_it_is_on_the_engine`,
+    `functions_types_and_constants_take_their_own_colours`). A word runs on through `sql::continues_name` (`a$from` is one name),
     a word straight after a `.` is a member, and a variable (`@x`, `@@version`) or a T-SQL temporary
     table (`sql::t_sql_name_prefix`: `#t`, `##t`) is a name — none is a keyword however it is spelled
     (`a_keyword_spelling_after_a_dot_an_at_or_in_a_dollar_name_is_not_coloured`). The variable

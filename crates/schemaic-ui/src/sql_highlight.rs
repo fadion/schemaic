@@ -28,7 +28,7 @@ use floem::views::editor::text::{Document, Styling};
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::sql::{NonCode, continues_name, is_word_byte, is_word_start, t_sql_name_prefix};
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Tok {
     Keyword,
     Str,
@@ -38,6 +38,12 @@ enum Tok {
     Variable,
     /// A code bracket at this nesting depth, with rainbow brackets on.
     Bracket(usize),
+    /// A builtin called, or one the engine calls bare (`intel::word_class`).
+    Function,
+    /// A type where only a type can stand (`::integer`, `VARCHAR(40)`).
+    Type,
+    /// `TRUE`, `FALSE`, `NULL`.
+    Constant,
 }
 
 impl Tok {
@@ -51,6 +57,9 @@ impl Tok {
             Tok::Number => t.number,
             Tok::Comment => t.comment,
             Tok::Variable => t.variable,
+            Tok::Function => t.function,
+            Tok::Type => t.type_,
+            Tok::Constant => t.constant,
             // Three of the palette's own colours, in turn — the gold, orchid,
             // blue round most editors give nested brackets.
             Tok::Bracket(depth) => [t.type_, t.keyword, t.function][depth % 3],
@@ -720,8 +729,24 @@ fn lex_line_with(
                 && b.get(j) == Some(&b'\'')
             {
                 out.push((i, j, Tok::Str));
-            } else if !member && is_keyword(&line[i..j]) {
-                out.push((i, j, Tok::Keyword));
+            } else if !member {
+                // The engine's own reading first (`intel::word_class`): a
+                // called builtin, a type where only a type can stand and a
+                // constant take their own colours — `COUNT(` and `VARCHAR(40)`
+                // too, which the fixed list below holds as keywords. Then the
+                // fixed list, and the words the engine reserves.
+                use schemaic_core::intel::WordClass;
+                let tok = match schemaic_core::intel::word_class(line, i, j, dialect) {
+                    Some(WordClass::Function) => Some(Tok::Function),
+                    Some(WordClass::Type) => Some(Tok::Type),
+                    Some(WordClass::Constant) => Some(Tok::Constant),
+                    _ if is_keyword(&line[i..j]) => Some(Tok::Keyword),
+                    Some(WordClass::Keyword) => Some(Tok::Keyword),
+                    None => None,
+                };
+                if let Some(tok) = tok {
+                    out.push((i, j, tok));
+                }
             }
             i = j;
             continue;
@@ -1069,6 +1094,26 @@ mod tests {
             .map(|&(s, e, _)| &"WHERE id = :id */ AND a = :b"[s..e])
             .collect();
         assert_eq!(vars, [":b"], "past a block comment's end only");
+    }
+
+    /// The engine's own reading wins over the fixed list: a called builtin is
+    /// a function, `VARCHAR(40)` a type, `TRUE` a constant — and `LEFT` before
+    /// `JOIN`, not called, stays a keyword.
+    #[test]
+    fn functions_types_and_constants_take_their_own_colours() {
+        let line = "SELECT COUNT(x), CAST(y AS VARCHAR(40)), TRUE FROM a LEFT JOIN b ON true";
+        let kinds: Vec<(&str, Tok)> = lex_line(line, SqlDialect::MySql, false)
+            .into_iter()
+            .map(|(s, e, t)| (&line[s..e], t))
+            .collect();
+        let of = |w: &str| kinds.iter().find(|(x, _)| *x == w).map(|(_, t)| *t);
+        assert_eq!(of("SELECT"), Some(Tok::Keyword));
+        assert_eq!(of("COUNT"), Some(Tok::Function));
+        assert_eq!(of("CAST"), Some(Tok::Function));
+        assert_eq!(of("VARCHAR"), Some(Tok::Type));
+        assert_eq!(of("TRUE"), Some(Tok::Constant));
+        assert_eq!(of("LEFT"), Some(Tok::Keyword));
+        assert_eq!(of("x"), None);
     }
 
     /// With rainbow brackets on, a code bracket is coloured by its nesting —

@@ -4026,6 +4026,79 @@ fn group_by_sees_output_aliases(dialect: SqlDialect) -> bool {
     }
 }
 
+/// What a word is, for the editor's colours ([`word_class`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WordClass {
+    Keyword,
+    Function,
+    Type,
+    Constant,
+}
+
+/// What the word `line[lo..hi]` is on `dialect`, read from core's own lists
+/// rather than a fixed one: a **constant** (`TRUE`, `FALSE`, `NULL`,
+/// `UNKNOWN`); a **function** — a builtin of this engine's catalogue that is
+/// called (a `(` follows on the line), or one it calls bare
+/// (`CURRENT_TIMESTAMP`); a **type**, only where nothing but a type can stand —
+/// after a PostgreSQL `::`, or given a size (`VARCHAR(40)`), since a column
+/// named `date` or `text` is common; a **keyword** the engine reserves.
+/// `None` for anything else, a name.
+///
+/// One line at a time, as the editor lexes, so a call whose `(` is on the
+/// next line reads as a name.
+pub fn word_class(line: &str, lo: usize, hi: usize, dialect: SqlDialect) -> Option<WordClass> {
+    let word = line.get(lo..hi)?;
+    let up = word.to_ascii_uppercase();
+    if matches!(up.as_str(), "TRUE" | "FALSE" | "NULL" | "UNKNOWN") {
+        return Some(WordClass::Constant);
+    }
+    let rest = line[hi..].trim_start_matches([' ', '\t']);
+    let called = rest.starts_with('(');
+    if called
+        && catalog_index(dialect).is_some_and(|ix| {
+            ix.lower.contains(word.to_ascii_lowercase().as_str()) || ix.lower.contains(up.as_str())
+        })
+        || called_bare(word, dialect)
+    {
+        return Some(WordClass::Function);
+    }
+    let sized = called
+        && rest[1..]
+            .trim_start()
+            .starts_with(|c: char| c.is_ascii_digit());
+    let cast = line[..lo].trim_end().ends_with("::") && casts_with_double_colon(dialect);
+    if (sized || cast) && names_a_column_type(&up, dialect) {
+        return Some(WordClass::Type);
+    }
+    // `is_reserved_word`, on the upper-casing already made.
+    reserved_words(dialect)
+        .contains(&up.as_str())
+        .then_some(WordClass::Keyword)
+}
+
+/// Is `upper` the base name of one of `dialect`'s column types
+/// ([`column_types`]), cached per engine? The highlighter's question;
+/// [`is_column_type`] is the proposal check's, of a whole type text.
+fn names_a_column_type(upper: &str, dialect: SqlDialect) -> bool {
+    use std::collections::HashSet;
+    use std::sync::OnceLock;
+    static SETS: [OnceLock<HashSet<String>>; 4] = [
+        OnceLock::new(),
+        OnceLock::new(),
+        OnceLock::new(),
+        OnceLock::new(),
+    ];
+    let slot = match dialect {
+        SqlDialect::MySql => 0,
+        SqlDialect::Postgres => 1,
+        SqlDialect::Sqlite => 2,
+        SqlDialect::MsSql => 3,
+    };
+    SETS[slot]
+        .get_or_init(|| column_types(dialect).into_iter().collect())
+        .contains(upper)
+}
+
 /// Does a procedure call take its arguments in parens — `CALL p(1)` — rather
 /// than bare after the name, as T-SQL's `EXEC p @a = 1` does? What a
 /// procedure accepted from the list inserts after its name.
@@ -21809,6 +21882,90 @@ mod tests {
 
     fn ctx(sql: &str) -> ClauseCtx {
         ctx_at(sql, sql.len())
+    }
+
+    #[test]
+    fn a_word_is_classed_by_what_it_is_on_the_engine() {
+        let class = |line: &str, word: &str, d| {
+            let lo = line.find(word).unwrap();
+            word_class(line, lo, lo + word.len(), d)
+        };
+        use WordClass::*;
+        // A builtin called is a function; the same word not called is not.
+        assert_eq!(
+            class("SELECT upper(name)", "upper", SqlDialect::Postgres),
+            Some(Function)
+        );
+        assert_eq!(
+            class("SELECT COUNT (*)", "COUNT", SqlDialect::MySql),
+            Some(Function)
+        );
+        assert_eq!(
+            class("SELECT upper FROM t", "upper", SqlDialect::Postgres),
+            None
+        );
+        // A function only one engine has.
+        assert_eq!(
+            class("SELECT btrim(x)", "btrim", SqlDialect::Postgres),
+            Some(Function)
+        );
+        assert_eq!(class("SELECT btrim(x)", "btrim", SqlDialect::MySql), None);
+        // A builtin the engine calls bare.
+        assert_eq!(
+            class(
+                "SELECT CURRENT_TIMESTAMP",
+                "CURRENT_TIMESTAMP",
+                SqlDialect::Postgres
+            ),
+            Some(Function)
+        );
+        // Constants.
+        assert_eq!(
+            class("WHERE ok = TRUE", "TRUE", SqlDialect::MySql),
+            Some(Constant)
+        );
+        assert_eq!(
+            class("SET x = null", "null", SqlDialect::Postgres),
+            Some(Constant)
+        );
+        // A type where only a type can be: after `::`, or with a size.
+        assert_eq!(
+            class("SELECT x::integer", "integer", SqlDialect::Postgres),
+            Some(Type)
+        );
+        assert_eq!(
+            class("  name VARCHAR(40),", "VARCHAR", SqlDialect::MySql),
+            Some(Type)
+        );
+        // A column named like a type is a name.
+        assert_eq!(
+            class("SELECT date, text FROM t", "text", SqlDialect::Postgres),
+            None
+        );
+        // A word the engine reserves is a keyword.
+        assert_eq!(
+            class("SELECT 1 FROM t LIMIT 5", "LIMIT", SqlDialect::Postgres),
+            Some(Keyword)
+        );
+        assert_eq!(
+            class("SELECT TOP 5 * FROM t", "TOP", SqlDialect::MsSql),
+            Some(Keyword)
+        );
+        assert_eq!(class("SELECT name FROM t", "name", SqlDialect::MySql), None);
+        // A clause word before a paren is no call, though MySQL has a
+        // `VALUES()` and a `DEFAULT()`.
+        for (line, word) in [
+            ("INSERT INTO t VALUES (1)", "VALUES"),
+            ("WHERE id IN (1, 2)", "IN"),
+            ("WHERE EXISTS (SELECT 1)", "EXISTS"),
+            ("  c int DEFAULT (0),", "DEFAULT"),
+        ] {
+            assert_eq!(
+                class(line, word, SqlDialect::MySql),
+                Some(Keyword),
+                "{line}"
+            );
+        }
     }
 
     #[test]
