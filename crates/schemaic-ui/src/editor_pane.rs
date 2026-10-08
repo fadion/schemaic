@@ -501,8 +501,12 @@ fn auto_pair_several(
     if was {
         return false;
     }
-    let full = e.doc().text().to_string();
-    let Some(m) = schemaic_core::text_ops::auto_pair_all(&full, regions, ch, dia) else {
+    // Planned over the borrowed text, and the borrow over before the edit —
+    // which sets `query` again.
+    let planned = crate::completion::with_text(e, comp, |t| {
+        schemaic_core::text_ops::auto_pair_all(t, regions, ch, dia)
+    });
+    let Some(m) = planned else {
         return false;
     };
     if m.edits.is_empty() {
@@ -1157,7 +1161,7 @@ fn cmdk_popup(
                             .gap(theme::scaled(12.0))
                             // Aligns the verdict with the code column, so the bar
                             // reads as the block's last row.
-                            .padding_left(content_x_of(&query.get()))
+                            .padding_left(query.with(|q| content_x_of(q)))
                             .padding_right(theme::scaled(10.0))
                             // Nothing here is selectable, so the editor's I-beam
                             // (which this sits on top of) would be a lie.
@@ -2841,6 +2845,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         accepted,
         conn: active_conn,
         stmts: RwSignal::new(None),
+        query,
     };
     let cmdk = CmdK {
         open: RwSignal::new(false),
@@ -4061,10 +4066,12 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     return false;
                 }
                 let doc = e.doc();
-                let full = doc.text().to_string();
                 let off = cur.offset();
                 let (a, b) = cur.get_selection().unwrap_or((off, off));
-                let Some(action) = pairs::auto_pair(&full, a, b, ch, dia) else {
+                // The text borrowed, the borrow over before the edit below.
+                let planned =
+                    crate::completion::with_text(e, comp, |t| pairs::auto_pair(t, a, b, ch, dia));
+                let Some(action) = planned else {
                     return false;
                 };
                 // Suppress the built-in char insert for the rest of this dispatch,
@@ -4135,16 +4142,19 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                         return false;
                     }
                     let carets: Vec<usize> = regions.iter().map(|r| r.1).collect();
-                    let full = e.doc().text().to_string();
-                    return schemaic_core::text_ops::backspace_pair_all(&full, &carets, dia)
+                    let planned = crate::completion::with_text(e, comp, |t| {
+                        schemaic_core::text_ops::backspace_pair_all(t, &carets, dia)
+                    });
+                    return planned
                         .is_some_and(|m| edit_untyped_multi(e, comp, &m, EditType::Delete));
                 }
                 if cur.get_selection().is_some_and(|(a, b)| a != b) {
                     return false; // let the default delete a real selection
                 }
                 let off = cur.offset();
-                let full = e.doc().text().to_string();
-                let Some((s, en)) = pairs::backspace_pair(&full, off, dia) else {
+                let planned =
+                    crate::completion::with_text(e, comp, |t| pairs::backspace_pair(t, off, dia));
+                let Some((s, en)) = planned else {
                     return false;
                 };
                 // The auto-pair *insert* branch above checks the freeze and this
@@ -4314,11 +4324,13 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     // (`pairs::match_block`), which asks its own word before scanning.
     create_effect(move |_| {
         let caret = ed_bm.cursor.get().offset();
-        let sql = query.get();
         let dia = dialect.get_untracked();
-        let found = pairs::match_paren(&sql, caret, dia)
-            .map(|(p, q)| ((p, p + 1), (q, q + 1)))
-            .or_else(|| pairs::match_block(&sql, caret, dia));
+        // `with`: a caret move need not copy the document.
+        let found = query.with(|sql| {
+            pairs::match_paren(sql, caret, dia)
+                .map(|(p, q)| ((p, p + 1), (q, q + 1)))
+                .or_else(|| pairs::match_block(sql, caret, dia))
+        });
         bracket_match.set(found);
     });
 
@@ -5216,8 +5228,10 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             }
         })
         .update(move |_| {
-            let text = ed.doc().text().to_string();
-            query.set(text.clone());
+            // **The one copy of the document an edit makes.** Everything below
+            // reads `query` when it runs — a debounce at the time it fires — so
+            // a burst of keystrokes copies it once each, not once per reader.
+            query.set(ed.doc().text().to_string());
             // Defer the completion recompute one tick. Inside `.update` the doc
             // is already edited but the caret hasn't advanced past the just-typed
             // char yet, so reading `cursor.offset()` here yields a prefix one char
@@ -5257,13 +5271,17 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             {
                 let g = diag_gen.get().wrapping_add(1);
                 diag_gen.set(g);
-                let text = text.clone();
                 let dgen = diag_gen.clone();
                 let cache = diag_cache.clone();
                 floem::action::exec_after(std::time::Duration::from_millis(120), move |_| {
                     if dgen.get() != g || syntax.try_get_untracked().is_none() {
                         return;
                     }
+                    // Read now, not copied at the keystroke: a pass a later
+                    // keystroke supersedes never copies the text at all.
+                    let Some(text) = query.try_get_untracked() else {
+                        return;
+                    };
                     diagnose_in_background(
                         syntax,
                         dgen,
@@ -5302,7 +5320,6 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             if live_validate.get_untracked() {
                 let g = val_gen.get().wrapping_add(1);
                 val_gen.set(g);
-                let text2 = text.clone();
                 let ed2 = ed.clone();
                 let validate = validate_stmt.clone();
                 let vgen = val_gen.clone();
@@ -5316,6 +5333,10 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     let caret = match ed2.cursor.try_get_untracked() {
                         Some(c) => c.offset(),
                         None => return, // pane disposed
+                    };
+                    // Read when it fires, as the diagnostics pass is.
+                    let Some(text2) = query.try_get_untracked() else {
+                        return;
                     };
                     let (lo, hi) = statement_range(&text2, caret, dialect.get_untracked());
                     if lo >= hi || !intel::parses(&text2[lo..hi], dia) {
@@ -5551,7 +5572,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         let v = empty();
         let vid = v.id();
         v.style(move |s| {
-            let _ = query.get(); // re-run on edits (content height isn't a signal)
+            query.track(); // re-run on edits (content height isn't a signal)
             let _ = bar_gen.get(); // re-run once the first layout has settled
             let vp = ed_vbar.viewport.get();
             let Some((track_h, thumb_h, max_scroll)) = v_geo(&ed_vbar) else {
@@ -5643,7 +5664,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         let h = empty();
         let hid = h.id();
         h.style(move |s| {
-            let _ = query.get(); // re-run on edits (content width isn't a signal)
+            query.track(); // re-run on edits (content width isn't a signal)
             let _ = area_w.get(); // re-run on pane resize
             let _ = bar_gen.get(); // re-run once the first layout has settled
             let vp = ed_hbar.viewport.get();
@@ -6550,7 +6571,11 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             // full-document allocation and memcpy per **scroll frame** as well
             // as per keystroke, on a document with zero diagnostics as much as
             // on one covered in them.
-            let content_x = query.with(|sql| content_x_of(sql));
+            //
+            // And not the text's newlines either, counted per scroll frame:
+            // the rope keeps its line count. `track` keeps the edit re-run.
+            query.track();
+            let content_x = content_x_for_lines(ed.rope_text().num_lines());
             diags
                 .iter()
                 .filter_map(|d| {

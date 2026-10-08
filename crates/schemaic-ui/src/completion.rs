@@ -105,6 +105,24 @@ pub(crate) struct Completion {
     /// The buffer's statement boundaries ([`stmt_index`]), which signature
     /// help and the run outline read on every caret move.
     pub(crate) stmts: StmtIndex,
+    /// The tab's text, as the editor's last edit left it — borrowed by what
+    /// runs per keystroke and caret move rather than copied out of the
+    /// document each time.
+    pub(crate) query: RwSignal<String>,
+}
+
+/// `f` over the editor's text, **borrowed** from the pane's `query` — set from
+/// the document on every edit, before anything that reads it here runs — rather
+/// than copied out of the document per keystroke and caret move. A `query`
+/// whose length is not the document's is not trusted, and the document is
+/// copied instead.
+pub(crate) fn with_text<R>(ed: &Editor, comp: Completion, f: impl FnOnce(&str) -> R) -> R {
+    let len = ed.doc().text().len();
+    if comp.query.with_untracked(String::len) == len {
+        comp.query.with_untracked(|q| f(q))
+    } else {
+        f(&ed.doc().text().to_string())
+    }
 }
 
 /// A pane's [`StatementIndex`], with the text and dialect it was built for.
@@ -741,12 +759,13 @@ pub(crate) fn update_signature_help(
     active_db: Option<&str>,
 ) {
     let offset = ed.cursor.get_untracked().offset();
-    let text = ed.doc().text().to_string();
-    let (lo, hi) = stmt_index(comp.stmts, &text, dialect).statement_range(&text, offset);
     // The database's own routines too — the index is memoised, so this is a
     // lookup on a caret move, not a rebuild.
     let schema = hidden_dbs.with_untracked(|h| schema_index(db_nodes, h, active_db));
-    let help = intel::signature_help(&text, lo, hi, offset, dialect, &schema.routines);
+    let help = with_text(ed, comp, |text| {
+        let (lo, hi) = stmt_index(comp.stmts, text, dialect).statement_range(text, offset);
+        intel::signature_help(text, lo, hi, offset, dialect, &schema.routines)
+    });
     if help.is_some() {
         // `.0` is the point at the *top* of the caret's line; the popup sits above it.
         let mut p = ed.points_of_offset(offset, CursorAffinity::Backward).0;
@@ -1060,6 +1079,20 @@ pub(crate) fn recompute_completions(
     comp: Completion,
     force: bool,
 ) {
+    // Per keystroke: the text borrowed, not copied out of the document.
+    with_text(ed, comp, |text| {
+        recompute_completions_in(ed, ctx, comp, force, text)
+    });
+}
+
+/// [`recompute_completions`]' body, over the editor's text.
+fn recompute_completions_in(
+    ed: &Editor,
+    ctx: CompletionCtx<'_>,
+    comp: Completion,
+    force: bool,
+    text: &str,
+) {
     let CompletionCtx {
         db_nodes,
         hidden_dbs,
@@ -1073,7 +1106,6 @@ pub(crate) fn recompute_completions(
         tabs: _,
     } = ctx;
     let offset = ed.cursor.get_untracked().offset();
-    let text = ed.doc().text().to_string();
     // A `.` just typed is a qualifier trigger — reveal the qualifier's members even
     // right after accepting it (otherwise `suppress`, set by the accept, would swallow
     // the very next keystroke and the popup wouldn't reopen until another char).
@@ -1104,7 +1136,7 @@ pub(crate) fn recompute_completions(
     } else {
         comp.ghost
             .with_untracked(|g| g.clone().filter(|g| keeps_ghost(g, offset, text.len())))
-            .or_else(|| prediction_at(ed, &text, offset, &ctx))
+            .or_else(|| prediction_at(ed, text, offset, &ctx))
     };
     let remembered = ghost.as_ref().is_some_and(|g| g.remembered);
     let displaces = |prefix: &str| ghost_displaces_the_list(ghost.as_ref(), prefix);
@@ -1135,7 +1167,7 @@ pub(crate) fn recompute_completions(
     if !force && !comp.open.get_untracked() {
         comp.wide.set(false);
     }
-    let word_lo = word_start(&text, offset);
+    let word_lo = word_start(text, offset);
     let prefix = text.get(word_lo..offset).unwrap_or("").to_string();
     // **A reasoned prediction takes the empty word's place** — see
     // `ghost_displaces_the_list`. Two offers at one caret would leave Tab meaning
@@ -1150,18 +1182,17 @@ pub(crate) fn recompute_completions(
     // The statement being *written*: past a `;` the caret starts a new one, and
     // Ctrl+Space on the blank line below `DELETE FROM t;` offered the `DELETE`'s
     // `WHERE` and columns. From the pane's index: this runs per keystroke.
-    let (lo, hi) = stmt_index(comp.stmts, &text, dialect).writing_range(&text, offset);
+    let (lo, hi) = stmt_index(comp.stmts, text, dialect).writing_range(text, offset);
     // **Not inside a value or a remark**, not even on Ctrl+Space: `name = 'jo`
     // offered columns, and Tab spliced one into the literal. A quoted name
     // is still a name, and completes.
-    if intel::caret_in_literal_or_comment(&text, lo, offset, dialect) {
+    if intel::caret_in_literal_or_comment(text, lo, offset, dialect) {
         // …except the one value completion knows: a string compared with an
         // enum or set column offers that column's members.
-        if let Some(slot) = intel::enum_value_slot(&text, lo, offset, dialect) {
+        if let Some(slot) = intel::enum_value_slot(text, lo, offset, dialect) {
             let schema = hidden_dbs.with_untracked(|h| schema_index(db_nodes, h, active_db));
-            let scope = intel::statement_scope(&text, lo, hi, offset, dialect).tables;
-            let items =
-                rank::enum_value_suggestions(&schema, &scope, &slot, &text, offset, dialect);
+            let scope = intel::statement_scope(text, lo, hi, offset, dialect).tables;
+            let items = rank::enum_value_suggestions(&schema, &scope, &slot, text, offset, dialect);
             if !items.is_empty() {
                 set_anchor(ed, comp, offset);
                 set_items(comp, items);
@@ -1177,13 +1208,13 @@ pub(crate) fn recompute_completions(
     }
     // Context is lexer-based (correct mid-edit); scope prefers the real AST
     // (robust CTE/alias/derived-table resolution), falling back to the lexer.
-    let ctx = intel::clause_context(&text, lo, word_lo, dialect);
+    let ctx = intel::clause_context(text, lo, word_lo, dialect);
     let qualified = matches!(ctx, ClauseCtx::Qualified(_));
     // Expected next keyword/phrase continuations from SQL clause grammar (the
     // `WHERE` after a complete table ref, `FROM` after the projection, `GROUP BY`
     // as one item). These seed the top suggestion tier; `auto_show` opens the popup
     // on an empty prefix right after an operand-taking clause keyword.
-    let cont = intel::clause_continuation(&text, lo, word_lo, dialect);
+    let cont = intel::clause_continuation(text, lo, word_lo, dialect);
 
     // FK-aware auto-join: right after a fresh `JOIN … ON `, offer the foreign-key
     // join predicate as a single, ready-to-insert suggestion (DataGrip-style). Only
@@ -1192,7 +1223,7 @@ pub(crate) fn recompute_completions(
     if prefix.is_empty() && matches!(ctx, ClauseCtx::Column) {
         // The *offer* catalog: a hidden database must not be joined to.
         let catalog = hidden_dbs.with_untracked(|h| build_offer_catalog(db_nodes, h, active_db));
-        if let Some(pred) = intel::join_condition(&text, lo, hi, offset, &catalog, dialect) {
+        if let Some(pred) = intel::join_condition(text, lo, hi, offset, &catalog, dialect) {
             set_anchor(ed, comp, offset);
             set_items(
                 comp,
@@ -1236,13 +1267,13 @@ pub(crate) fn recompute_completions(
     // `core::rank`'s module doc for why: all of it used to live here, inside a
     // function taking `&Editor`, where nothing could call it.
     let schema = hidden_dbs.with_untracked(|h| schema_index(db_nodes, h, active_db));
-    let mut scope = intel::statement_scope(&text, lo, hi, offset, dialect).tables;
+    let mut scope = intel::statement_scope(text, lo, hi, offset, dialect).tables;
     // The statement's own CTEs and derived tables, where a column goes: their
     // columns are in no catalogue. A derived table's alias is in no scope
     // either (the scope holds the tables inside only for a caret inside it),
     // so it joins.
     let mut relations = if matches!(ctx, ClauseCtx::Column | ClauseCtx::Qualified(_)) {
-        intel::local_relations(&text, lo, hi, dialect)
+        intel::local_relations(text, lo, hi, dialect)
     } else {
         Vec::new()
     };
@@ -1251,7 +1282,7 @@ pub(crate) fn recompute_completions(
     if matches!(ctx, ClauseCtx::Column | ClauseCtx::Qualified(_))
         && scope.iter().any(|t| t.name.starts_with('#'))
     {
-        relations.extend(intel::temp_table_relations(&text, dialect));
+        relations.extend(intel::temp_table_relations(text, dialect));
     }
     for r in relations.iter().filter(|r| r.derived) {
         let named = |t: &intel::TableRef| {
@@ -1274,7 +1305,7 @@ pub(crate) fn recompute_completions(
     // and only a table slot ever wanted it.
     let join_targets = if matches!(ctx, ClauseCtx::Table) {
         let catalog = hidden_dbs.with_untracked(|h| build_offer_catalog(db_nodes, h, active_db));
-        let mut targets = intel::join_targets(&text, lo, hi, offset, &catalog, dialect);
+        let mut targets = intel::join_targets(text, lo, hi, offset, &catalog, dialect);
         if !theme::completion_table_aliases() {
             targets.iter_mut().for_each(|t| t.aliased = None);
         }
@@ -1283,7 +1314,7 @@ pub(crate) fn recompute_completions(
         Vec::new()
     };
     let star = hidden_dbs
-        .with_untracked(|h| star_expansion(&text, lo, hi, offset, db_nodes, h, active_db, dialect));
+        .with_untracked(|h| star_expansion(text, lo, hi, offset, db_nodes, h, active_db, dialect));
     let snippet_rows = rank::snippet_abbrev_rows(
         &snippets.get_untracked(),
         &prefix,
@@ -1293,35 +1324,35 @@ pub(crate) fn recompute_completions(
     );
     // Identifiers already written in this statement rank a little higher (recency):
     // you tend to reference the same columns/tables again.
-    let used = rank::statement_identifiers(&text, lo, hi, (word_lo, offset));
+    let used = rank::statement_identifiers(text, lo, hi, (word_lo, offset));
     // The statement's own names, read only where they are offered: its CTEs
     // at a table slot, its select list's aliases where a column goes (the
     // reader answers nothing outside an `ORDER BY` or `HAVING`).
     let local = rank::LocalNames {
         ctes: if matches!(ctx, ClauseCtx::Table) {
-            intel::ctes_at(&text, lo, word_lo, dialect)
+            intel::ctes_at(text, lo, word_lo, dialect)
         } else {
             Vec::new()
         },
         output_aliases: if matches!(ctx, ClauseCtx::Column) {
-            intel::output_aliases_at(&text, lo, word_lo, dialect)
+            intel::output_aliases_at(text, lo, word_lo, dialect)
         } else {
             Vec::new()
         },
         // The whole document's: a variable or temporary table outlives the
         // statement that made it.
         variables: if matches!(ctx, ClauseCtx::Variable) {
-            intel::variables_at(&text, offset, dialect)
+            intel::variables_at(text, offset, dialect)
         } else {
             Vec::new()
         },
         temp_tables: if matches!(ctx, ClauseCtx::TempTable) {
-            intel::temp_tables_at(&text, offset, dialect)
+            intel::temp_tables_at(text, offset, dialect)
         } else {
             Vec::new()
         },
         bare_columns: matches!(ctx, ClauseCtx::Column)
-            && intel::in_using_list(&text, lo, offset, dialect),
+            && intel::in_using_list(text, lo, offset, dialect),
         relations: relations
             .into_iter()
             .map(|r| {

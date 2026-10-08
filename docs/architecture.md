@@ -34222,8 +34222,15 @@ Re-introducing the anti-patterns these guard against is a regression:
   the menu off at the editor's right edge on a long line.
 - **The floem editor owns its document once mounted, and the sync is one-way — writing the `query`
   signal from outside is not merely invisible, it is lost.** Every edit runs
-  `query.set(doc.text())` from the editor's `.update` callback (`editor_pane.rs`), and there is no
-  effect pushing `query` back into the doc, so a write from outside a mounted editor changes nothing
+  `query.set(doc.text())` from the editor's `.update` callback (`editor_pane.rs`) — **the one copy
+  of the document an edit makes**: what runs per keystroke or caret move borrows `query` (`with`,
+  `track`, `completion::with_text`, which falls back to copying the document only if `query`'s
+  length disagrees with it), and a debounce reads `query` when it fires rather than copying the
+  text at the keystroke. It used to be a dozen copies a keystroke — `query.get()` to track, every
+  open tab's text cloned by the tabs-persist effect, eager clones for each debounce — ~0.5 ms each
+  at 4 MiB. A planned edit (auto-pair, Backspace) is computed under the borrow and applied after
+  it ends, since the edit re-enters `.update` and sets `query`. There is no effect pushing `query`
+  back into the doc, so a write from outside a mounted editor changes nothing
   the user can see and the next keystroke overwrites the signal back from the doc. Replacing a tab's
   text from outside — reload from disk — therefore bumps `Tab::reload_gen`, which is part of the
   `editor_area` `dyn_container` key in `lib.rs` (`(active id, is_flashing, reload_gen)`), and the

@@ -2757,7 +2757,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         tabs.with(|v| {
             v.iter()
                 .find(|t| t.id == id)
-                .is_some_and(|t| schemaic_core::snippet::can_save(&t.query.get()))
+                .is_some_and(|t| t.query.with(|q| schemaic_core::snippet::can_save(q)))
         })
     });
     let rename_snippet = snippet_store.rename.clone();
@@ -7744,7 +7744,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // Read structure + each tab's persisted fields so an edit re-runs us.
             tabs.with(|v| {
                 for t in v {
-                    t.query.get();
+                    // `track`, not `get`: tracking every tab's text cloned all
+                    // of them on every keystroke in any one.
+                    t.query.track();
                     t.conn_id.get();
                     t.database.get();
                     t.source.get();
