@@ -2323,6 +2323,23 @@ fn run_menu_wanted(sql: &str, lo: usize, hi: usize, dialect: SqlDialect) -> bool
         || schemaic_core::sql::holds_several_statements(&sql[lo..hi], dialect)
 }
 
+/// What the gutter's run outline marks with the caret at `caret`: the range
+/// Ctrl+Enter would run ([`schemaic_core::sql::run_current_range`]) — or
+/// `None` with a selection, which Ctrl+Enter runs instead, and wherever
+/// [`run_menu_wanted`] sees no choice to make, so a lone query carries no mark.
+fn run_outline_range(
+    sql: &str,
+    caret: usize,
+    selection: Option<(usize, usize)>,
+    dialect: SqlDialect,
+) -> Option<(usize, usize)> {
+    if selection.is_some_and(|(a, b)| a != b) {
+        return None;
+    }
+    let (lo, hi) = schemaic_core::sql::run_current_range(sql, caret, dialect);
+    (lo < hi && run_menu_wanted(sql, lo, hi, dialect)).then_some((lo, hi))
+}
+
 /// Outline what Run Current will run, when [`run_menu_wanted`] says there is a
 /// choice to show it for.
 fn highlight_run_pick(
@@ -2677,6 +2694,11 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     // under the caret (empty when the caret isn't on a repeated identifier).
     // Recomputed from caret + text below; drawn by `occurrences_view`.
     let ident_occurrences: RwSignal<Vec<(usize, usize)>> = RwSignal::new(Vec::new());
+
+    // The statement Ctrl+Enter would run from the caret, kept up to date as it
+    // moves ([`run_outline_range`]); drawn as a bar in the gutter by
+    // `run_outline_view`.
+    let run_outline: RwSignal<Option<(usize, usize)>> = RwSignal::new(None);
 
     // While the run menu is open, tie the statement highlight to the selection:
     // "Run Current" highlights the statement under the caret; "Run Everything"
@@ -3806,6 +3828,8 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     let ed_bm2 = ed.clone(); // bracket-matching overlay geometry
     let ed_occ = ed.clone(); // occurrences: recompute ranges on caret/text
     let ed_occ2 = ed.clone(); // occurrences overlay geometry
+    let ed_ro = ed.clone(); // run outline: recompute its range on caret/text
+    let ed_ro2 = ed.clone(); // run outline overlay geometry
     let ed_vbar = ed.clone(); // custom vertical scrollbar geometry
     let ed_hbar = ed.clone(); // custom horizontal scrollbar geometry
     let ed_vdrag = ed.clone(); // vertical scrollbar drag → scroll
@@ -3961,6 +3985,18 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         // each of which then re-ran its own geometry.
         if ident_occurrences.with_untracked(|cur| cur != &hits) {
             ident_occurrences.set(hits);
+        }
+    });
+
+    // The run outline: what Ctrl+Enter would run from here, on every caret
+    // move and edit. Guarded as the occurrences are, so a caret moving within
+    // one statement rebuilds nothing.
+    create_effect(move |_| {
+        let cursor = ed_ro.cursor.get();
+        let sql = query.get();
+        let range = run_outline_range(&sql, cursor.offset(), cursor.get_selection(), dialect.get());
+        if run_outline.with_untracked(|cur| cur != &range) {
+            run_outline.set(range);
         }
     });
 
@@ -5884,6 +5920,61 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         .pointer_events(|| false)
     };
 
+    // The run outline: a thin bar in the gutter, just left of the code column,
+    // beside the lines of the statement Ctrl+Enter would run. Only the lines on
+    // screen are asked for points, so a scroll frame costs the same for a
+    // statement of three lines or three thousand.
+    let run_outline_view = {
+        let ed = ed_ro2;
+        dyn_container(
+            move || run_outline.get(),
+            move |range| match range {
+                None => empty().into_any(),
+                Some((lo, hi)) => {
+                    // Once per rebuild: `content_x_of` is O(document).
+                    let cx = content_x_of(&query.get_untracked());
+                    let rope = ed.rope_text();
+                    let (first, last) = (rope.line_of_offset(lo), rope.line_of_offset(hi));
+                    let ed = ed.clone();
+                    empty()
+                        .style(move |s| {
+                            let points = editor_points(&ed);
+                            let vp = ed.viewport.get();
+                            let rope = ed.rope_text();
+                            let shown = ed
+                                .screen_lines
+                                .get()
+                                .rvline_range()
+                                .map(|(f, l)| (f.line, l.line));
+                            let span = shown.and_then(|(f, l)| {
+                                let (a, b) = (first.max(f), last.min(l));
+                                if a > b {
+                                    return None;
+                                }
+                                let (top, _) = points(rope.offset_of_line(a))?;
+                                let (_, bot) = points(rope.line_end_offset(b, true))?;
+                                Some((top.y, bot.y))
+                            });
+                            match span {
+                                None => s.hide(),
+                                Some((top, bot)) => s
+                                    .absolute()
+                                    .inset_left(cx - HL_PAD - 4.0)
+                                    .inset_top(top + EDITOR_PAD_TOP - vp.y0)
+                                    .width(2.0)
+                                    .height(bot - top)
+                                    .border_radius(1.0)
+                                    .background(theme::query_highlight().multiply_alpha(0.6)),
+                            }
+                        })
+                        .into_any()
+                }
+            },
+        )
+        .style(|s| s.absolute().inset(0.0))
+        .pointer_events(|| false)
+    };
+
     // Bracket matching: two faint boxes around the paren adjacent to the caret and
     // its partner. Click-through like the other overlays; each box reads the editor
     // `viewport` (inside `span_box`) so it tracks scroll, and bounds itself to
@@ -6828,7 +6919,10 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         stack((editor_box, inline_band_view))
             .style(|s| s.flex_grow(1.0_f32).width_full().flex_col().min_height(0.0)),
         syntax_view,
-        highlight_view,
+        // One slot for the two run outlines: the tuple is at floem's limit.
+        stack((highlight_view, run_outline_view))
+            .style(|s| s.absolute().inset(0.0))
+            .pointer_events(|| false),
         bracket_match_view,
         occurrences_view,
         run_overlay,
@@ -8201,6 +8295,30 @@ mod geometry_tests {
         let (lo, hi) = run_range(sql, "SELECT");
         assert!(!run_menu_wanted(sql, lo, hi, ms));
         assert!(!run_menu_wanted(sql, 0, sql.len(), SqlDialect::MySql));
+    }
+
+    /// **The gutter marks what Ctrl+Enter would run**, the menu's question
+    /// answering whether to: one of several statements, nothing for a lone one
+    /// or a selection — and a statement a blank line ends, as Run Current
+    /// takes it.
+    #[test]
+    fn the_run_outline_marks_what_ctrl_enter_would_run() {
+        let my = SqlDialect::MySql;
+        let sql = "select 1\n\nselect 2\nfrom t";
+        let at = |needle: &str| sql.find(needle).unwrap() + 1;
+        let second = run_outline_range(sql, at("from"), None, my).unwrap();
+        assert_eq!(&sql[second.0..second.1], "select 2\nfrom t");
+        let first = run_outline_range(sql, at("elect 1"), None, my).unwrap();
+        assert_eq!(&sql[first.0..first.1], "select 1");
+        // A selection runs instead; a bare caret's empty one does not count.
+        assert_eq!(run_outline_range(sql, at("from"), Some((0, 3)), my), None);
+        assert_eq!(
+            run_outline_range(sql, at("from"), Some((5, 5)), my),
+            Some(second)
+        );
+        // A lone query is what runs; there is nothing to tell it from.
+        assert_eq!(run_outline_range("select 1", 3, None, my), None);
+        assert_eq!(run_outline_range("", 0, None, my), None);
     }
 
     /// The composition `cmdk_open_gate` could not see: it proves the four

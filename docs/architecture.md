@@ -764,6 +764,28 @@ existing prose was left alone.
     `writing_range`, the same pair as an empty range at the caret when it has fallen back, so
     Ctrl+Space below `DELETE FROM t;` offers what starts a statement rather than the `DELETE`'s
     `WHERE` (`the_writing_range_is_empty_past_a_terminator`).
+    **Where no terminator ends the statement, a blank line may — for Run at the caret alone.** Two
+    queries written one under the other without a `;` ran together on Ctrl+Enter, and the server
+    refused the pair. So when the caret's segment is the last one — the tail after the final `;`,
+    or the whole buffer when there is none — `run_current_bounds` asks `blank_line_cuts` where a
+    blank line ends a statement inside it, and narrows the piece to the cuts either side of the
+    caret. A cut is the first byte of the next statement, its leading comments included, so a caret
+    on the blank lines themselves is still in the statement above, as it is past a `;`. **It is a
+    fallback, never a second way to separate statements**, so the cut is refused wherever the
+    statement is plainly not over: inside parens, a string or a comment; inside a routine's body (a
+    `CREATE`/`ALTER` whose first eight words name a `PROC`, `PROCEDURE`, `FUNCTION`, `TRIGGER` or
+    `EVENT`, which then runs to the end of the tail), a T-SQL batch scope or block (`BatchScope`,
+    `BodyScan`) or a trigger's `BEGIN … END` (`TriggerScan`); unless the next code word opens a
+    statement (`STATEMENT_STARTS`); and where the code before it carries on (`blank_line_ends`) — a
+    trailing `,`, `(` or operator, a `CARRIES_ON` word such as `UNION`, `AS`, `FROM` or `AND`, or an
+    `INSERT`/`REPLACE` header whose `SELECT`, `WITH`, `VALUES` or `TABLE` comes after the blank
+    line. A statement a `;` ends keeps its blank lines
+    (`a_blank_line_separates_statements_where_no_terminator_does`,
+    `a_blank_line_inside_a_statement_does_not_cut_it`). **The scope is deliberate, and it is a
+    divergence**: `statement_range` (completion, signature help, the AI actions),
+    `statement_ranges`, `executable_statements` (Run Everything) and the script runner still split
+    at terminators only, so the same unterminated buffer is one statement to them and several to
+    Ctrl+Enter.
     **`unsafe_reason` asks first about what destroys stored rows, and about nothing else.** It is
     the warning behind `first_unsafe`, which `run_verdict` turns into `Confirm` whatever
     `confirm_writes` says: `every_row_reason` (below), or `drop_reason`, a statement that destroys
@@ -24389,6 +24411,28 @@ existing prose was left alone.
     layer is why the tip must never *open* where something covers its squiggle: 1001 is above every
     bar in the stack, so a tip raised under the run menu or the find bar paints over it, and
     `marks_pointer` (above) is what keeps it from being raised there.
+    **The run outline marks what Ctrl+Enter would run before it is pressed** — a 2px bar in the
+    gutter just left of the code column (`content_x - HL_PAD - 4`), `theme::query_highlight()` at
+    0.6 alpha, beside the lines of `run_outline`'s range. An effect over the caret (`ed.cursor`),
+    `query` and `dialect` recomputes it on every move and edit through the pure
+    `run_outline_range`: `sql::run_current_range`'s piece, or `None` with a non-empty selection
+    (Ctrl+Enter runs the selection instead) and wherever `run_menu_wanted` sees no choice to make,
+    so a lone query carries no mark. That is the menu's own question, so the bar and the menu agree
+    about when there is anything to tell apart. The set is guarded as `ident_occurrences`' is, so a
+    caret moving within one statement rebuilds nothing. The bar asks for points only on the
+    statement's lines that are on screen — its line span intersected with `screen_lines`'
+    `rvline_range` — so a scroll frame costs the same for a statement of three lines or three
+    thousand, and `content_x_of`, which counts the document's lines, runs once per rebuild rather
+    than per frame. `the_run_outline_marks_what_ctrl_enter_would_run` pins the range, and was red
+    against a core without the blank-line cuts (under `sql.rs`). **It shares a slot with
+    `highlight_view`**, the run menu's statement border, as `stack((highlight_view,
+    run_outline_view))`, because `editor_area`'s tuple is at floem's 16: an `absolute().inset(0)`
+    wrapper with `pointer_events(false)` — the pane-sized shape the scrollbar note forbids, harmless
+    here for the squiggle tip's reason, being click-through with nothing in it to hover.
+    **It asks undebounced on every move, so `run_current_bounds` walks only as far as the caret's
+    statement**, handing `scan_bounds_with` the caret as its `until` as `statement_range` does
+    (under `sql.rs`); only a caret in the tail no terminator ends reads to the document's end, which
+    the blank-line cuts need.
     **`visible_hunk_lines` is a filter, never a clamp.** A line outside the viewport is dropped, not
     pulled to the nearest one — the rule `top_of` already states for a line past the end of the
     document, and for its reason: a band placed against whatever text happens to be at the clamped
@@ -30326,7 +30370,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   was left behind by the first two and shipped a release sending `…END$$`). Anything that
   *executes* uses one of those three; anything that selects, highlights or measures keeps
   `statement_range` — save Run Current's own outline, which is `run_current_range`, the range
-  `executable_at` sends (shorter inside a T-SQL batch scope; see `BatchScope` above). Where those
+  `executable_at` sends (shorter inside a T-SQL batch scope, see `BatchScope` above, and at a blank
+  line in the tail no `;` ends, see `blank_line_cuts`). Where those
   statements *sit* is `executable_spans` (and `selection_spans`, offset into the buffer rather than
   the selection), and `executable_statements`/`selection_statements` are those spans sliced — one
   computation, so the ranges a failed run is squiggled in (`intel::run_error_diagnostic`) cannot

@@ -1789,20 +1789,303 @@ fn run_current_bounds(sql: &str, offset: usize, dialect: SqlDialect) -> (usize, 
     let offset = offset.min(sql.len());
     let mut delim: Vec<u8> = vec![b';'];
     let mut soft = Vec::new();
-    let mut bounds = scan_bounds_with(sql, dialect, &mut delim, true, None, Some(&mut soft));
-    bounds.push(Bound {
-        at: sql.len(),
-        strip: 0,
-    });
+    // As far as the caret's statement, as `statement_range` walks: the editor's
+    // run outline asks this on every caret move.
+    let mut bounds = scan_bounds_with(
+        sql,
+        dialect,
+        &mut delim,
+        true,
+        Some(offset),
+        Some(&mut soft),
+    );
+    // Ran out of document rather than stopping at a terminator past the caret:
+    // the last segment is a tail no terminator ends.
+    let tail = bounds.last().is_none_or(|b| b.at <= offset);
+    if tail {
+        bounds.push(Bound {
+            at: sql.len(),
+            strip: 0,
+        });
+    }
     // The same choice `statement_range` makes, from the same function.
     let ats: Vec<usize> = bounds.iter().map(|b| b.at).collect();
     let k = caret_segment(sql, &ats, offset, dialect);
-    let (lo, hi) = (bounds[k].at, bounds[k + 1]);
+    let (mut lo, mut hi) = (bounds[k].at, bounds[k + 1]);
+    // No terminator ends the last segment: its blank lines may.
+    if tail && k + 2 == bounds.len() {
+        let cuts = blank_line_cuts(sql, lo, hi.at, dialect);
+        // A cut is where the next statement starts, so a caret on the blank
+        // lines above it is still in the one before.
+        if let Some(&c) = cuts.iter().rev().find(|&&c| c <= offset) {
+            lo = c;
+        }
+        if let Some(&c) = cuts.iter().find(|&&c| c > offset) {
+            hi = Bound { at: c, strip: 0 };
+        }
+    }
     // The first `;` past the caret that only the batch scope held ends it.
     match soft.iter().find(|&&s| s > offset && s > lo && s < hi.at) {
         Some(&at) => (lo, Bound { at, strip: 0 }),
         None => (lo, hi),
     }
+}
+
+/// Words that open a statement, for [`blank_line_cuts`]: a blank line cuts
+/// only where the code after it starts with one.
+const STATEMENT_STARTS: &[&str] = &[
+    "ALTER",
+    "ANALYZE",
+    "BEGIN",
+    "CALL",
+    "CHECKPOINT",
+    "CLUSTER",
+    "COMMENT",
+    "COMMIT",
+    "COPY",
+    "CREATE",
+    "DEALLOCATE",
+    "DECLARE",
+    "DELETE",
+    "DESC",
+    "DESCRIBE",
+    "DO",
+    "DROP",
+    "EXEC",
+    "EXECUTE",
+    "EXPLAIN",
+    "FLUSH",
+    "GRANT",
+    "HANDLER",
+    "INSERT",
+    "KILL",
+    "LISTEN",
+    "LOAD",
+    "LOCK",
+    "MERGE",
+    "NOTIFY",
+    "OPTIMIZE",
+    "PRAGMA",
+    "PREPARE",
+    "PRINT",
+    "REFRESH",
+    "REINDEX",
+    "RELEASE",
+    "RENAME",
+    "REPAIR",
+    "REPLACE",
+    "RESET",
+    "REVOKE",
+    "ROLLBACK",
+    "SAVEPOINT",
+    "SELECT",
+    "SET",
+    "SHOW",
+    "START",
+    "TABLE",
+    "TRUNCATE",
+    "UNLOCK",
+    "UPDATE",
+    "USE",
+    "VACUUM",
+    "VALUES",
+    "WITH",
+];
+
+/// Words after which a statement is plainly not over, whatever comes next:
+/// `UNION` and its kin, `AS` (a view's or a `CREATE TABLE … AS`'s query
+/// follows), and the operators and clause words a line can end on.
+const CARRIES_ON: &[&str] = &[
+    "ALL",
+    "AND",
+    "AS",
+    "BY",
+    "DISTINCT",
+    "ELSE",
+    "EXCEPT",
+    "FROM",
+    "IN",
+    "INTERSECT",
+    "INTO",
+    "JOIN",
+    "MINUS",
+    "NOT",
+    "ON",
+    "OR",
+    "SET",
+    "THEN",
+    "UNION",
+    "USING",
+    "WHEN",
+    "WHERE",
+];
+
+/// Where a blank line ends a statement in `sql[lo..hi]`, a stretch **no
+/// terminator ends** — each cut is the first byte of the next statement (its
+/// leading comments included).
+///
+/// The fallback for a script written without `;`, never a second way to
+/// separate statements: a statement a terminator ends keeps its blank lines,
+/// and so does one where the blank line falls plainly inside it. A blank line
+/// cuts only
+///
+/// - outside parens, a string and a comment;
+/// - outside a routine's body (`CREATE … PROCEDURE`, `FUNCTION`, `TRIGGER`,
+///   `EVENT`, which runs to the end of the stretch), a T-SQL batch scope or
+///   block ([`BatchScope`]) and a SQLite trigger's body ([`TriggerScan`]);
+/// - where the code after it opens a statement ([`STATEMENT_STARTS`]);
+/// - where the code before it does not carry on — a trailing `,`, `(` or
+///   operator, or a word of [`CARRIES_ON`] — and is not an `INSERT`'s or a
+///   `REPLACE`'s header waiting for its query.
+fn blank_line_cuts(sql: &str, lo: usize, hi: usize, dialect: SqlDialect) -> Vec<usize> {
+    let b = sql.as_bytes();
+    let tsql = dialect.batch_separator();
+    let mut cuts = Vec::new();
+    // The piece being read: where it starts, and its state.
+    let mut start = lo;
+    let mut depth = 0usize;
+    let mut body = BodyScan::Start;
+    let mut batch = BatchScope::default();
+    let mut scan = TriggerScan::Start;
+    // The last code byte, and the last word if code ended on one.
+    let mut last: Option<u8> = None;
+    let mut last_word: Option<&str> = None;
+    let mut i = lo;
+    while i < hi {
+        if let Some(j) = skip_noncode(b, i, dialect) {
+            // A string or quoted name is code; a comment is not.
+            if skip_comment(b, i, dialect).is_none() {
+                last = Some(b'\'');
+                last_word = None;
+            }
+            i = j;
+            continue;
+        }
+        let c = b[i];
+        if tsql && t_sql_name_prefix(b, i, dialect) > 0 {
+            i += t_sql_name_prefix(b, i, dialect);
+            while i < hi && continues_name(b[i], dialect) {
+                i += 1;
+            }
+            last = Some(b'@');
+            last_word = None;
+            continue;
+        }
+        if is_word_start(c) {
+            let s = i;
+            while i < hi && continues_name(b[i], dialect) {
+                i += 1;
+            }
+            let w = &sql[s..i];
+            if tsql {
+                body = body.word(w);
+                if s == 0 || b[s - 1] != b'.' {
+                    batch = batch.word(w);
+                }
+            }
+            scan = scan.word(w);
+            last = Some(b'a');
+            last_word = Some(w);
+            continue;
+        }
+        if c == b'\n' && depth == 0 && last.is_some() {
+            // A blank line: only whitespace up to the next newline.
+            let mut j = i + 1;
+            while j < hi && matches!(b[j], b' ' | b'\t' | b'\r') {
+                j += 1;
+            }
+            if j < hi && b[j] == b'\n' {
+                let mut next = j;
+                while next < hi && b[next].is_ascii_whitespace() {
+                    next += 1;
+                }
+                if next < hi
+                    && blank_line_ends(sql, start, i, next, hi, dialect, last, last_word)
+                    && !(body == BodyScan::In || batch.holds() || scan.inside_body())
+                {
+                    cuts.push(next);
+                    start = next;
+                    body = BodyScan::Start;
+                    batch = BatchScope::default();
+                    scan = TriggerScan::Start;
+                    last = None;
+                    last_word = None;
+                }
+                i = next;
+                continue;
+            }
+        }
+        match c {
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        if !c.is_ascii_whitespace() {
+            last = Some(c);
+            last_word = None;
+        }
+        i += 1;
+    }
+    cuts
+}
+
+/// [`blank_line_cuts`]' question at one blank line: the piece read so far is
+/// `sql[start..at]`, ending on `last` (`last_word` when that is a word), and
+/// the next code or comment starts at `next`.
+#[allow(clippy::too_many_arguments)]
+fn blank_line_ends(
+    sql: &str,
+    start: usize,
+    at: usize,
+    next: usize,
+    hi: usize,
+    dialect: SqlDialect,
+    last: Option<u8>,
+    last_word: Option<&str>,
+) -> bool {
+    let carries = match (last, last_word) {
+        (_, Some(w)) => CARRIES_ON.iter().any(|k| w.eq_ignore_ascii_case(k)),
+        (Some(c), None) => matches!(
+            c,
+            b',' | b'('
+                | b'='
+                | b'<'
+                | b'>'
+                | b'+'
+                | b'-'
+                | b'*'
+                | b'/'
+                | b'%'
+                | b'|'
+                | b'&'
+                | b'.'
+        ),
+        (None, None) => true,
+    };
+    if carries {
+        return false;
+    }
+    let Some(opens) = leading_words(&sql[next..hi], 1, dialect).into_iter().next() else {
+        return false;
+    };
+    if !STATEMENT_STARTS.contains(&opens.as_str()) {
+        return false;
+    }
+    let head = leading_words(&sql[start..at], 8, dialect);
+    // A routine's body runs on, on every engine.
+    if matches!(head.first().map(String::as_str), Some("CREATE" | "ALTER"))
+        && head.iter().any(|w| {
+            matches!(
+                w.as_str(),
+                "PROC" | "PROCEDURE" | "FUNCTION" | "TRIGGER" | "EVENT"
+            )
+        })
+    {
+        return false;
+    }
+    // `INSERT INTO t (a)` ⏎⏎ `SELECT …` is one statement.
+    let query = matches!(opens.as_str(), "SELECT" | "WITH" | "VALUES" | "TABLE");
+    !(query && matches!(head.first().map(String::as_str), Some("INSERT" | "REPLACE")))
 }
 
 /// The trimmed byte range of the statement containing `offset`.
@@ -1965,6 +2248,10 @@ fn caret_segment(sql: &str, bounds: &[usize], offset: usize, dialect: SqlDialect
 /// The editor's statement for everything else — completion, signature help,
 /// the AI actions — stays [`statement_range`]'s whole piece, which is where the
 /// variable a statement reads is declared.
+///
+/// **And in the stretch no terminator ends, a blank line may end the
+/// statement** ([`blank_line_cuts`]) — the fallback for a script written
+/// without `;`, never a second way to separate statements.
 pub fn run_current_range(sql: &str, offset: usize, dialect: SqlDialect) -> (usize, usize) {
     let (lo, hi) = run_current_bounds(sql, offset, dialect);
     trim_range(sql, lo, hi.at)
@@ -6316,6 +6603,96 @@ mod tests {
         assert_eq!(
             super::executable_statements("BEGIN; SELECT 1; END;", SqlDialect::Postgres).len(),
             3
+        );
+    }
+
+    /// What Run at the caret sends with the caret just inside `needle` —
+    /// asserted to be the range the editor outlines, too.
+    fn run_at<'a>(sql: &'a str, needle: &str, d: SqlDialect) -> &'a str {
+        let caret = sql.find(needle).unwrap() + 1;
+        let run = super::executable_at(sql, caret, d);
+        let (lo, hi) = super::run_current_range(sql, caret, d);
+        assert_eq!(run, Some(&sql[lo..hi]), "{sql}");
+        run.unwrap()
+    }
+
+    /// **A blank line ends a statement no terminator ends.** Two queries
+    /// written one under the other with no `;` ran together on Ctrl+Enter, and
+    /// the server refused the pair.
+    #[test]
+    fn a_blank_line_separates_statements_where_no_terminator_does() {
+        for d in [
+            SqlDialect::MySql,
+            SqlDialect::Postgres,
+            SqlDialect::Sqlite,
+            SqlDialect::MsSql,
+        ] {
+            let sql = "select 1\n\n-- the second\nselect 2\nfrom t\n\n\nupdate t set a = 1";
+            assert_eq!(run_at(sql, "elect 1", d), "select 1");
+            assert_eq!(
+                run_at(sql, "the second", d),
+                "-- the second\nselect 2\nfrom t"
+            );
+            assert_eq!(run_at(sql, "from t", d), "-- the second\nselect 2\nfrom t");
+            assert_eq!(run_at(sql, "update", d), "update t set a = 1");
+            // On the blank line below a statement, that statement — as after
+            // a `;`.
+            let caret = sql.find("\n\n").unwrap() + 1;
+            assert_eq!(super::executable_at(sql, caret, d), Some("select 1"));
+            // After the last `;`, only the tail is cut.
+            let tail = "select 0;\nselect 1\n\nselect 2";
+            assert_eq!(run_at(tail, "elect 1", d), "select 1");
+            assert_eq!(run_at(tail, "elect 0", d), "select 0;");
+        }
+    }
+
+    /// **Only a fallback.** A statement a `;` ends keeps its blank lines, and
+    /// so does one whose blank line falls where the statement is plainly not
+    /// over.
+    #[test]
+    fn a_blank_line_inside_a_statement_does_not_cut_it() {
+        let my = SqlDialect::MySql;
+        for sql in [
+            // A terminator ends it, so the blank line is the writer's.
+            "select 1\n\nselect 2;",
+            "select a\n\nfrom t;",
+            // What follows is no statement's start.
+            "select a,\n  b\n\nfrom t\n\nwhere a = 1",
+            // Inside parens.
+            "select * from (\n\nselect 1\n\n) x",
+            // The code before it carries on.
+            "select 1\nunion\n\nselect 2",
+            "create view v as\n\nselect 1",
+            "select a,\n\nselect_b from t",
+            "insert into t (a)\n\nselect 1",
+            // A string or a comment.
+            "select 'a\n\nselect 2'",
+            "select 1 /*\n\nselect 2 */",
+        ] {
+            let caret = sql.len() - 1;
+            assert_eq!(
+                super::executable_at(sql, caret, my),
+                Some(sql),
+                "{sql:?} was cut"
+            );
+        }
+        // A routine's body runs to the end of what no terminator ended.
+        let ms = SqlDialect::MsSql;
+        for sql in [
+            "create procedure p as\nselect 1\n\nselect 2",
+            "declare @x int = 1\n\nselect @x",
+            "if 1 = 1\nbegin\n  select 1\n\n  select 2\nend",
+        ] {
+            assert_eq!(
+                super::executable_at(sql, sql.len() - 1, ms),
+                Some(sql),
+                "{sql:?} was cut"
+            );
+        }
+        let trigger = "create trigger tr after insert on t begin\n\nselect 1\n\nselect 2\nend";
+        assert_eq!(
+            super::executable_at(trigger, trigger.len() - 1, SqlDialect::Postgres),
+            Some(trigger)
         );
     }
 
