@@ -2885,7 +2885,15 @@ existing prose was left alone.
     `fetch_rows_tail` are asked as capabilities through an exhaustive match, as `has_apply_joins`
     and `has_full_joins` are, so a new engine has to answer them. A name a routine is being
     declared under (`FUNCTION`, `PROCEDURE`, `AGGREGATE` or `ROUTINE` before it) is no call and gets
-    nothing, nor does a quoted name; each answer is in the case its word was typed
+    nothing, nor does a quoted name, **nor an object's name before its column list** — a word of
+    `NAMES_AN_OBJECT` (`INTO`, `INSERT`, `TABLE`, `EXISTS`, `VIEW`, `INDEX`, `ON`, `REFERENCES`,
+    `JOIN`, `TRIGGER`, `COPY`) in front of it, read past a qualifier: a CRM table called `lead`
+    ghosted `over` after `INSERT INTO lead (name, email) ` (S8.4-L1-01). `FROM` is not one of them,
+    since `IS DISTINCT FROM lag(x) OVER …` is an expression. PostgreSQL's `RANK`, `DENSE_RANK`,
+    `PERCENT_RANK` and `CUME_DIST` given an argument are hypothetical-set aggregates and get
+    `WITHIN GROUP` instead (`ranks_hypothetically`, a capability like the rest;
+    `a_table_named_like_a_window_function_takes_no_over`, red first). Each answer is in the case
+    its word was typed
     (`a_construct_predicts_the_words_it_cannot_do_without`, red first on
     `SELECT id, ROW_NUMBER() `; `the_constructs_words_are_offered_only_where_they_are_required`,
     the guards — a function that is no window function, SQLite's two-argument `percentile_cont`,

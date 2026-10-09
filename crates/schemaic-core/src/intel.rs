@@ -17139,7 +17139,8 @@ fn when_then(sql: &str, caret: usize, toks: &[Token]) -> Option<String> {
 }
 
 /// The functions that are window functions and nothing else — whose call
-/// cannot stand without its `OVER`.
+/// cannot stand without its `OVER`. PostgreSQL's ranking ones given an
+/// argument aside ([`ranks_hypothetically`]).
 const WINDOW_ONLY: &[&str] = &[
     "ROW_NUMBER",
     "RANK",
@@ -17154,9 +17155,40 @@ const WINDOW_ONLY: &[&str] = &[
     "NTH_VALUE",
 ];
 
+/// Words a name follows when it names an object rather than calls a function
+/// — so the `(…)` after it is a column list, and [`clause_partner`] ghosts no
+/// `OVER` after `INSERT INTO lead (name, email)`. Never one an expression can
+/// follow: `FROM` is left out for `IS DISTINCT FROM lag(x) OVER …`.
+const NAMES_AN_OBJECT: &[&str] = &[
+    "INTO",
+    "INSERT",
+    "TABLE",
+    "EXISTS",
+    "VIEW",
+    "INDEX",
+    "ON",
+    "REFERENCES",
+    "JOIN",
+    "TRIGGER",
+    "COPY",
+];
+
+/// Whether this engine's ranking functions (`rank`, `dense_rank`,
+/// `percent_rank`, `cume_dist`) given an argument are hypothetical-set
+/// aggregates, taking `WITHIN GROUP (ORDER BY …)` rather than `OVER`.
+/// PostgreSQL's alone; elsewhere they take no argument.
+fn ranks_hypothetically(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::Postgres => true,
+        SqlDialect::MySql | SqlDialect::MsSql | SqlDialect::Sqlite => false,
+    }
+}
+
 /// [`predict`]'s construct producer: a word a written construct cannot do
-/// without. A window function's call its `OVER`; an ordered-set aggregate's
-/// its `WITHIN GROUP` ([`takes_within_group`]), and `WITHIN GROUP (` its
+/// without. A window function's call its `OVER` — a call, not an object's
+/// name before its column list ([`NAMES_AN_OBJECT`]); an ordered-set or
+/// hypothetical-set aggregate's its `WITHIN GROUP` ([`takes_within_group`],
+/// [`ranks_hypothetically`]), and `WITHIN GROUP (` its
 /// `ORDER BY`; a table-level `FOREIGN KEY (…)` its `REFERENCES`; and a row
 /// count its `ROWS` — T-SQL's `OFFSET n` ([`offset_takes_rows`]) and a `FETCH
 /// NEXT|FIRST n` ([`fetch_rows_tail`]), in a query. Each answers in the case
@@ -17200,13 +17232,33 @@ fn clause_partner(
         }
         let before = open.checked_sub(2).and_then(|i| bare_upper(&toks[i]));
         let upper = name.to_ascii_uppercase();
-        // A routine being declared under the name is not a call.
+        // A routine being declared under the name is not a call; nor is an
+        // object's name before its column list — `INSERT INTO lead (…)`,
+        // `CREATE INDEX ix ON lead (…)` — read past any qualifier in front.
+        let mut q = open - 1;
+        while q >= 2 && matches!(toks[q - 1].kind, TkKind::Dot) {
+            q -= 2;
+        }
+        let ahead = q.checked_sub(1).and_then(|i| bare_upper(&toks[i]));
         let declared = matches!(
             before.as_deref(),
             Some("FUNCTION" | "PROCEDURE" | "AGGREGATE" | "ROUTINE")
-        );
+        ) || ahead
+            .as_deref()
+            .is_some_and(|w| NAMES_AN_OBJECT.contains(&w));
+        // PostgreSQL's ranking functions given an argument are
+        // hypothetical-set aggregates: `rank(5) WITHIN GROUP (ORDER BY …)`.
+        let hypothetical = ranks_hypothetically(dialect)
+            && matches!(
+                upper.as_str(),
+                "RANK" | "DENSE_RANK" | "PERCENT_RANK" | "CUME_DIST"
+            )
+            && sql
+                .get(toks[open].end..last.at)
+                .is_some_and(|args| !args.trim().is_empty());
         let partner = match upper.as_str() {
             _ if declared => return None,
+            _ if hypothetical => "WITHIN GROUP ",
             w if WINDOW_ONLY.contains(&w) => "OVER ",
             w if takes_within_group(w, dialect) => "WITHIN GROUP ",
             "KEY" if before.as_deref() == Some("FOREIGN") => "REFERENCES ",
@@ -21764,6 +21816,49 @@ mod predict_tests {
             ),
             None
         );
+    }
+
+    /// **A table named like a window function is no call** (S8.4-L1-01): its
+    /// column list after `INTO`, `TABLE`, `ON`, `REFERENCES` — qualified or
+    /// not — gets no `OVER`, nor `mode`'s a `WITHIN GROUP`. A call in an
+    /// expression still does, `IS DISTINCT FROM lag(x)` and a qualified one
+    /// among them. And PostgreSQL's ranking functions with an argument are
+    /// hypothetical-set aggregates, which take `WITHIN GROUP`, not `OVER`.
+    #[test]
+    fn a_table_named_like_a_window_function_takes_no_over() {
+        for d in [
+            SqlDialect::MySql,
+            SqlDialect::Postgres,
+            SqlDialect::MsSql,
+            SqlDialect::Sqlite,
+        ] {
+            for sql in [
+                "INSERT INTO lead (name, email) ",
+                "INSERT INTO shop.lead (name) ",
+                "CREATE TABLE lead (id int, name text) ",
+                "CREATE TABLE IF NOT EXISTS rank (id int) ",
+                "CREATE INDEX ix ON lead (email) ",
+                "CREATE TABLE t (a int REFERENCES lead (id) ",
+                "CREATE VIEW ntile (a) ",
+            ] {
+                assert_eq!(at_end(sql, d), None, "{d:?} {sql}");
+            }
+            assert_eq!(
+                at_end("SELECT x IS DISTINCT FROM lag(x) ", d).as_deref(),
+                Some("over "),
+                "{d:?}"
+            );
+        }
+        let pg = |sql: &str| at_end(sql, SqlDialect::Postgres);
+        assert_eq!(pg("CREATE TABLE mode (a int) "), None);
+        assert_eq!(pg("SELECT pg_catalog.rank() ").as_deref(), Some("over "));
+        assert_eq!(pg("SELECT rank() ").as_deref(), Some("over "));
+        assert_eq!(pg("SELECT rank(5) ").as_deref(), Some("within group "));
+        assert_eq!(
+            pg("SELECT percent_rank(50000) ").as_deref(),
+            Some("within group ")
+        );
+        assert_eq!(my("SELECT rank() ").as_deref(), Some("over "));
     }
 
     /// An upsert's update list is the columns the `INSERT` writes, less its
