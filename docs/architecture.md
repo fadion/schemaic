@@ -28117,7 +28117,12 @@ existing prose was left alone.
     (`the_sweep_targets_every_tool_not_just_the_current_level`), and it removes the rules even with
     no `agy` on the machine — that half is our own file surgery, while the `agy mcp remove` half is
     skipped unless the binary is actually there, rather than shelling out on every launch to clean
-    up state that cannot exist.
+    up state that cannot exist. **And unless a dead owner's claim is on disk** (`sweep_plan`,
+    `the_sweep_starts_agy_only_on_a_dead_owners_claim`): it used to shell out at every launch
+    whenever `agy` was found, for a user who had switched the assistant off too, against the
+    settings modal's promise that no agent CLI is started while it is off. `install` claims before
+    it registers and `Drop` releases only after it removes, so a registration of ours is never on
+    disk without a claim beside it — no claim, nothing of ours to remove.
     **And withdrawing never creates the file it withdraws from**, which is what
     `settings_to_edit(create, existing)` decides for `edit_settings`. Granting passes `create: true`
     — a fresh Antigravity install has no settings file yet and the rules are what its tools need to
@@ -28265,7 +28270,8 @@ existing prose was left alone.
     **A second limit, recorded rather than guarded: the server name is not ours to reserve.**
     `agy mcp add` is an upsert and `agy mcp remove` is unconditional, so a user who has registered
     their *own* MCP server under the name `schemaic` — or one pointing at a different Schemaic build
-    — has it replaced on the first AI turn and deleted by the next `sweep`. Telling ours from theirs
+    — has it replaced on the first AI turn and deleted when that session ends (or by the next
+    `sweep`, if it crashed). Telling ours from theirs
     needs a read of that CLI's registry (`agy mcp list`) whose output nobody has measured, and
     guessing at a format in order to decide whether to delete somebody's configuration is worse than
     the collision.
@@ -30826,7 +30832,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   the rule: they withdraw what an earlier session granted — an `agy` registration and its standing
   tool rules, Schemaic's own per-instance homes, what Cursor kept in `~/.cursor` — and ask no model
   anything, and an assistant switched off after a crash is exactly the case whose leftovers should
-  not stand. What this does **not** have is a test that reaches the guards: all four are closures in
+  not stand. The one of them that starts a process, `agy mcp remove`, does so only on a crashed
+  session's claim (`antigravity::sweep_plan`), so an ordinary launch with the assistant off starts
+  no agent CLI — it used to run at every launch wherever `agy` was found. What this does **not** have is a test that reaches the guards: all four are closures in
   `main.rs`, and the pinned halves are the pure ones, `Agent::of` and `ai_panel::input_state_of`.
 - **One SQL boundary lexer.** Any code scanning SQL for string / `-- ` / `#` / `/* */` / backtick /
   `$tag$` boundaries MUST build on `schemaic_core::sql::skip_noncode` (statement split, WHERE guard, AI

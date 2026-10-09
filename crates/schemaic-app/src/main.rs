@@ -2380,7 +2380,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     //
     // **Whether or not the assistant is on.** These withdraw what an earlier
     // session granted and never ask a model anything; an assistant switched off
-    // after a crash is exactly the case whose leftovers should not stand.
+    // after a crash is exactly the case whose leftovers should not stand. The
+    // one that starts a process — `agy mcp remove` — does so only on a crashed
+    // session's claim (`antigravity::sweep_plan`), so an ordinary launch with
+    // the assistant off starts no agent CLI, as the settings modal says.
     {
         let agy = detect_bin(Harness::Antigravity);
         std::thread::spawn(move || {

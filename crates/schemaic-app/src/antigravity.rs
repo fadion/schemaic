@@ -73,7 +73,7 @@
 //! upsert and `agy mcp remove` is unconditional, so a user who has registered
 //! their *own* MCP server under the name `schemaic` — or one pointing at a
 //! different Schemaic build — has it replaced on the first AI turn and deleted
-//! by the next [`sweep`]. Telling ours from theirs needs a read of that CLI's
+//! when that session ends (or by the next [`sweep`], if it crashed). Telling ours from theirs needs a read of that CLI's
 //! registry (`agy mcp list`) whose output has not been measured, and guessing at
 //! a format in order to decide whether to delete somebody's configuration is
 //! worse than the collision. Recorded rather than guarded, and the name is a
@@ -685,9 +685,11 @@ impl Drop for AgyRegistration {
 /// Remove any Schemaic registration and allow-rules left behind by a session
 /// that never got to run its [`Drop`] — a crash, a kill, a power loss.
 ///
-/// Called once at startup, and only when `agy` is actually present: shelling out
-/// to a binary the user does not have, on every launch, to clean up state that
-/// cannot exist, is a cost paid by everyone for a case that applies to nobody.
+/// Called once at startup. It shells out to `agy` only when the binary is
+/// actually present *and* a dead owner's claim is on disk ([`sweep_plan`]):
+/// starting a CLI on every launch to clean up state that cannot exist is a
+/// cost paid by everyone for a case that applies to nobody — and, with the
+/// assistant switched off, a broken promise.
 pub(crate) fn sweep(bin: Option<&str>) {
     // **Not while another Schemaic is using it.** This runs at every launch, and
     // the state it cleans is global to the machine rather than to a process, so
@@ -696,10 +698,14 @@ pub(crate) fn sweep(bin: Option<&str>) {
     // silently stopped existing. A claim written by `install` says who owns it;
     // only a claim whose owner is gone is a crash's leftovers.
     let held = claim_on_disk();
-    if !crate::liveness::may_sweep(
-        held.map(|c| c.owner),
-        held.and_then(|c| crate::liveness::process_start(c.owner.pid)),
-    ) {
+    let plan = sweep_plan(
+        held.is_some(),
+        crate::liveness::may_sweep(
+            held.map(|c| c.owner),
+            held.and_then(|c| crate::liveness::process_start(c.owner.pid)),
+        ),
+    );
+    if plan == SweepPlan::Nothing {
         return;
     }
     // Whatever was on disk is a dead instance's, so it is ours to drop — and
@@ -724,8 +730,45 @@ pub(crate) fn sweep(bin: Option<&str>) {
              Antigravity's settings file; they are still granted"
         );
     }
-    if let Some(bin) = bin {
+    if plan == SweepPlan::RulesAndRegistration
+        && let Some(bin) = bin
+    {
         agy_mcp(bin, &["remove", SERVER]);
+    }
+}
+
+/// What the startup [`sweep`] does — the decision, kept apart from its IO so a
+/// test can reach it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SweepPlan {
+    /// Another live Schemaic owns the state: touch nothing.
+    Nothing,
+    /// Withdraw the allow-rules from the settings file — our own file surgery,
+    /// no process started.
+    RulesOnly,
+    /// The rules, and `agy mcp remove` for the registration.
+    RulesAndRegistration,
+}
+
+/// The sweep's plan, from whether a claim is on disk (`held`) and whether
+/// [`crate::liveness::may_sweep`] lets it act on what is there.
+///
+/// **`agy mcp remove` only on a claim's evidence.** It is the one sweep that
+/// starts an agent CLI, and it used to run at every launch whenever `agy` was
+/// found — for a user who had switched the assistant off too, against the
+/// settings modal's promise that no agent CLI is started while it is off.
+/// [`AgyRegistration::install`] claims *before* it registers, and `Drop`
+/// releases only *after* it removes, so a registration this module made is
+/// never on disk without a claim beside it: no claim, nothing of ours to
+/// remove. The rules half stays unconditional, since it is file surgery and
+/// a settings file is the user's to inspect, not a process.
+fn sweep_plan(held: bool, may_sweep: bool) -> SweepPlan {
+    if !may_sweep {
+        SweepPlan::Nothing
+    } else if held {
+        SweepPlan::RulesAndRegistration
+    } else {
+        SweepPlan::RulesOnly
     }
 }
 
@@ -1140,6 +1183,20 @@ mod tests {
         ] {
             assert_eq!(parse_claim(junk), None, "{junk:?} parsed as a claim");
         }
+    }
+
+    /// **No claim, no `agy` process.** The sweep runs at every launch, the
+    /// assistant switched off included, and the settings modal promises that
+    /// no agent CLI is started then. A registration of ours is never on disk
+    /// without a claim (`install` claims first, `Drop` releases last), so a
+    /// launch with no claim withdraws the rules — file surgery — and starts
+    /// nothing; only a dead owner's claim is evidence worth an `agy mcp remove`.
+    #[test]
+    fn the_sweep_starts_agy_only_on_a_dead_owners_claim() {
+        assert_eq!(sweep_plan(false, true), SweepPlan::RulesOnly);
+        assert_eq!(sweep_plan(true, true), SweepPlan::RulesAndRegistration);
+        // A live owner's state is left alone, rules and all.
+        assert_eq!(sweep_plan(true, false), SweepPlan::Nothing);
     }
 
     /// **The arm that is deliberately gone.** `may_sweep` used to answer `true`
