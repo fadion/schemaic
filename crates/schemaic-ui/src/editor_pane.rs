@@ -6290,6 +6290,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                         .padding_vert(theme::scaled(6.0))
                         .font_size(theme::font_title())
                 });
+                let ed_lines = ed_rm.clone();
                 let positioned = container(panel).style(move |s| {
                     // `pos` is a *content* anchor, so the viewport comes off here —
                     // a reactive read, which is also what keeps the menu on the
@@ -6300,7 +6301,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     let p = run_menu_pos(
                         pos,
                         (run_menu_w(), run_menu_h()),
-                        content_x_of(&query.get_untracked()),
+                        content_x_for_lines(ed_lines.rope_text().num_lines()),
                         ed_vp.get(),
                     );
                     s.absolute().inset_left(p.x).inset_top(p.y)
@@ -6341,6 +6342,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     // which solves the same problem the other way because it needs clicks).
     let inline_band_view = {
         let ed = ed_band;
+        let ed_lines = ed.clone();
         dyn_container(
             move || inline_band_runs(&ed, cmdk.preview),
             move |runs| {
@@ -6351,7 +6353,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 // as the code column's origin does; the code column ends where the
                 // scroll viewport does, and everything past that is the wrapper's
                 // right padding.
-                let content_x = content_x_of(&query.get_untracked());
+                let content_x = content_x_for_lines(ed_lines.rope_text().num_lines());
                 let content_right = content_x + ed_vp.get().width();
                 v_stack_from_iter(runs.into_iter().flat_map(move |(y, h, is_add)| {
                     let bg = move || {
@@ -6479,8 +6481,11 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             move |range| match range {
                 None => empty().into_any(),
                 Some((lo, hi)) => {
-                    // Once per rebuild: `content_x_of` is O(document).
-                    let cx = content_x_of(&query.get_untracked());
+                    // The rope's line count, not the text's: this rebuilds on
+                    // every keystroke that moves the statement's end, and
+                    // copying the document to count its newlines cost ~1 ms
+                    // a keystroke at 4 MiB.
+                    let cx = content_x_for_lines(ed.rope_text().num_lines());
                     let rope = ed.rope_text();
                     let (first, last) = (rope.line_of_offset(lo), rope.line_of_offset(hi));
                     let ed = ed.clone();
@@ -6535,10 +6540,10 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 None => empty().into_any(),
                 Some(((p, p_end), (q, q_end))) => {
                     // Once per rebuild, not once per style-closure run: the
-                    // two boxes' closures re-run on every scroll frame and
-                    // `content_x_of` counts every newline in the document.
-                    // Read untracked here exactly as the text was before it.
-                    let cx = content_x_of(&query.get_untracked());
+                    // two boxes' closures re-run on every scroll frame. The
+                    // rope's line count, never a copy of the text: this
+                    // rebuilds per keystroke while the caret sits by a bracket.
+                    let cx = content_x_for_lines(ed.rope_text().num_lines());
                     let (edp, edq) = (ed.clone(), ed.clone());
                     v_stack((
                         empty().style(move |s| match span_box(cx, &edp, p, p_end) {
@@ -6589,9 +6594,9 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     return empty().into_any();
                 }
                 // Once for the whole list. Each box's style closure re-runs
-                // on every scroll frame, and `content_x_of` is O(document) —
-                // N occurrences meant N full scans per frame.
-                let cx = content_x_of(&query.get_untracked());
+                // on every scroll frame — N occurrences meant N full scans
+                // per frame — and the rope's line count costs no copy.
+                let cx = content_x_for_lines(ed.rope_text().num_lines());
                 let ed = ed.clone();
                 v_stack_from_iter(ranges.into_iter().map(move |(lo, hi)| {
                     let ed = ed.clone();
@@ -9292,6 +9297,31 @@ mod geometry_tests {
                 );
             }
         }
+    }
+
+    /// Hoisted is not enough when the builder itself rebuilds per keystroke —
+    /// the run outline's key is a range whose end follows the text, and the
+    /// bracket box's follows the caret — so no overlay copies the document to
+    /// count its lines: the rope already knows (`content_x_for_lines`).
+    #[test]
+    fn no_overlay_copies_the_document_for_the_code_column() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("editor_pane.rs"),
+        )
+        .expect("editor_pane.rs");
+        let body = crate::source_gate::production_code(&src);
+        let copies: Vec<&str> = body
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.contains("content_x_of(&query.get_untracked())"))
+            .collect();
+        assert!(
+            copies.is_empty(),
+            "the code column derived from a copy of the whole document:\n  {}",
+            copies.join("\n  ")
+        );
     }
 
     // ── The run menu's placement ──────────────────────────────────────────

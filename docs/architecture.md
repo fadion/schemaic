@@ -25119,8 +25119,12 @@ existing prose was left alone.
     caret moving within one statement rebuilds nothing. The bar asks for points only on the
     statement's lines that are on screen — its line span intersected with `screen_lines`'
     `rvline_range` — so a scroll frame costs the same for a statement of three lines or three
-    thousand, and `content_x_of`, which counts the document's lines, runs once per rebuild rather
-    than per frame. `the_run_outline_marks_what_ctrl_enter_would_run` pins the range, and was red
+    thousand, and the code column comes once per rebuild from the rope's line count
+    (`content_x_for_lines`), never from a copy of the text: the range's end follows the text, so
+    the bar rebuilds on most keystrokes in a script, and `content_x_of(&query.get_untracked())`
+    cost ~1 ms of each at 4 MiB. The run menu, the Ctrl+K band, the bracket boxes and the
+    occurrence boxes read it the same way (`no_overlay_copies_the_document_for_the_code_column`,
+    red before). `the_run_outline_marks_what_ctrl_enter_would_run` pins the range, and was red
     against a core without the blank-line cuts (under `sql.rs`). **It shares a slot with
     `highlight_view`**, the run menu's statement border, as `stack((highlight_view,
     run_outline_view))`, because `editor_area`'s tuple is at floem's 16: an `absolute().inset(0)`
