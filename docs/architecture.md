@@ -13605,7 +13605,13 @@ existing prose was left alone.
       tidy-up**: it sits under a prefix match's +40 in `fuzzy_score`, so a word that matches what
       is typed better still wins over one merely chosen often; it is about the size of the
       in-statement `recency_bonus`'s 18. `bonuses` is the
-      map `rank` takes for one connection, words earning nothing left out. `clear_conn` is the
+      map `rank` takes for one connection, words earning nothing left out. **`BonusCache` keeps it
+      between keystrokes**: building it walks every rule and clones each word, up to 500
+      allocations on the undebounced recompute, while it changes only on an accept or a
+      forgetting, or when a word's age crosses one of `bonus`'s steps (`STEPS`, which `bonus`
+      itself reads). So it is rebuilt only when the connection's rules differ from the ones it was
+      built from (compared, not cloned) or `now` has left the span in which no bonus can change
+      (`the_cached_bonuses_are_always_the_fresh_ones`). `clear_conn` is the
       deleted connection's half, as on its siblings.
     - `db_hidden.rs` — the `(conn_id, database)` set behind the SCHEMA panel's eye, the third store
       on that context menu and the last one to be keyed by connection. A flat `Vec<String>` of bare
@@ -24098,7 +24104,8 @@ existing prose was left alone.
     **An accept is remembered per connection**: `accept_completion` records the taken row's text
     against the tab's connection (`Completion::conn`, the editor's `active_conn`) in
     `Completion::accepted`, and `recompute_completions` hands that connection's `bonuses` to
-    `RankInput::accepted` (under `accepted.rs`). Both accept routes — the key in `editor_pane.rs`
+    `RankInput::accepted` (under `accepted.rs`), borrowed from a thread-local `BonusCache`
+    (`ACCEPTED_BONUSES`, beside the catalog and index caches) rather than rebuilt per keystroke. Both accept routes — the key in `editor_pane.rs`
     and a click on the popup — go through `accept_completion`, so neither can skip the record. The
     cost is named: the record is a `Stored::update`, a `Replacing` save written synchronously on
     the UI thread, once per accept and never per keystroke. `Ui::accepted` and

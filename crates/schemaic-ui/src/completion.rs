@@ -234,6 +234,11 @@ thread_local! {
     /// fixed once, for `Catalog`, with a cache keyed on `Arc` identity; the
     /// index kept paying it.
     static SCHEMA_INDEX: RefCell<Option<CachedIndex>> = const { RefCell::new(None) };
+
+    /// The accepted-words bonus map, kept between keystrokes — see
+    /// [`schemaic_core::accepted::BonusCache`] for when it is rebuilt.
+    static ACCEPTED_BONUSES: RefCell<schemaic_core::accepted::BonusCache> =
+        RefCell::new(Default::default());
 }
 
 /// One database node as the index reads it: its name and the schema `Arc` it
@@ -1403,39 +1408,46 @@ fn recompute_completions_in(
             .collect(),
     };
 
-    let ranked = rank::rank_full(
-        &schema,
-        &rank::RankInput {
-            ctx: &ctx,
-            cont: &cont,
-            scope: &scope,
-            prefix: &prefix,
-            snippets: &snippet_rows,
-            join_targets: &join_targets,
-            star: star.as_ref(),
-            used: &used,
-            active_db,
-            dialect,
-            // **Which MySQL-family server, read where `SELECT VERSION()` was
-            // actually asked** — the loaded `DbSchema` for the tab's active
-            // database. `SqlDialect` cannot say, and for one thing only it
-            // has to: a MySQL 8 tab was offered forty-nine names from
-            // MariaDB's manual that it cannot call. The same lookup the
-            // table designer makes for `ddl::Target`, so there is one of it.
-            //
-            // No active database means no schema to read it off, and
-            // `Unknown` offers everything — see `RankInput::flavour`.
-            flavour: active_db
-                .map(|db| crate::table_designer::db_flavour(db_nodes, db))
-                .unwrap_or_default(),
-            local: &local,
-            wide: comp.wide.get_untracked(),
-            accepted: &comp
-                .accepted
-                .read_only()
-                .with_untracked(|f| f.bonuses(conn_id, crate::now_secs())),
-        },
-    );
+    // The accepted-words map is borrowed from its cache, not rebuilt per
+    // keystroke (`ACCEPTED_BONUSES`).
+    let now = crate::now_secs();
+    let rank_with = |accepted: &HashMap<String, i32>| {
+        rank::rank_full(
+            &schema,
+            &rank::RankInput {
+                ctx: &ctx,
+                cont: &cont,
+                scope: &scope,
+                prefix: &prefix,
+                snippets: &snippet_rows,
+                join_targets: &join_targets,
+                star: star.as_ref(),
+                used: &used,
+                active_db,
+                dialect,
+                // **Which MySQL-family server, read where `SELECT VERSION()` was
+                // actually asked** — the loaded `DbSchema` for the tab's active
+                // database. `SqlDialect` cannot say, and for one thing only it
+                // has to: a MySQL 8 tab was offered forty-nine names from
+                // MariaDB's manual that it cannot call. The same lookup the
+                // table designer makes for `ddl::Target`, so there is one of it.
+                //
+                // No active database means no schema to read it off, and
+                // `Unknown` offers everything — see `RankInput::flavour`.
+                flavour: active_db
+                    .map(|db| crate::table_designer::db_flavour(db_nodes, db))
+                    .unwrap_or_default(),
+                local: &local,
+                wide: comp.wide.get_untracked(),
+                accepted,
+            },
+        )
+    };
+    let ranked = ACCEPTED_BONUSES.with_borrow_mut(|cache| {
+        comp.accepted
+            .read_only()
+            .with_untracked(|f| rank_with(cache.bonuses(f, conn_id, now)))
+    });
 
     set_anchor(ed, comp, offset);
     let items = ranked.items;

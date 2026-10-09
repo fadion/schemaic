@@ -1601,7 +1601,17 @@ pub fn accepted_bonus(text: &str, accepted: &HashMap<String, i32>) -> i32 {
     if accepted.is_empty() {
         return 0;
     }
-    accepted.get(&text.to_lowercase()).copied().unwrap_or(0)
+    // Most candidates are lower-case already, and are their own key: the
+    // `String` a lower-casing allocates is paid only by the others.
+    let bonus = if text
+        .bytes()
+        .any(|b| b.is_ascii_uppercase() || !b.is_ascii())
+    {
+        accepted.get(&text.to_lowercase())
+    } else {
+        accepted.get(text)
+    };
+    bonus.copied().unwrap_or(0)
 }
 
 #[cfg(test)]
