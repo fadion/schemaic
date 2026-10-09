@@ -13651,7 +13651,11 @@ pub fn table_alias_at(
     if !alias_slot(sql, lo, hi, caret, dialect) {
         return None;
     }
-    let scope = query_scope(sql, lo, hi, caret, dialect);
+    // The query's own tables, after the caret too, and every enclosing
+    // query's: a correlated subquery sees the outer aliases, and taking one
+    // would shadow it. Avoiding a name the statement holds elsewhere is free.
+    let mut scope = query_scope(sql, lo, hi, caret, dialect);
+    scope.extend(statement_scope(sql, lo, hi, caret, dialect).tables);
     let typed = &sql[word_start(sql, caret)..word_end_at(sql, caret, hi)];
     table_alias(name, &taken_names(&scope, typed), dialect)
 }
@@ -30220,6 +30224,20 @@ mod tests {
             alias_at("SELECT * FROM (SELECT 1 FROM ord|)", "orders").as_deref(),
             Some("o")
         );
+    }
+
+    /// An enclosing query's alias is in scope in a correlated subquery: taking
+    /// it would shadow it, and `o.office_id = o.id` would compare the inner
+    /// table with itself.
+    #[test]
+    fn a_subquerys_table_alias_clears_the_enclosing_querys() {
+        for sql in [
+            "SELECT * FROM offices o WHERE EXISTS (SELECT 1 FROM ord|",
+            "SELECT * FROM orders o WHERE total > (SELECT AVG(total) FROM ord|",
+            "SELECT * FROM offices o WHERE EXISTS (SELECT 1 FROM ord|)",
+        ] {
+            assert_eq!(alias_at(sql, "orders").as_deref(), Some("o2"), "{sql}");
+        }
     }
 
     #[test]

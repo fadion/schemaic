@@ -2581,7 +2581,11 @@ existing prose was left alone.
     (`a_join_pairs_with_no_table_written_after_it`, and the popup's half in
     `the_popups_join_rows_read_the_joins_own_query`, both red before). What an alias must clear
     is still the whole query's: `join_targets`' aliased rows and `table_alias_at` read `taken_names`
-    off `query_scope`, after the caret too, since a later `JOIN customers c` already holds `c`.
+    off `query_scope`, after the caret too, since a later `JOIN customers c` already holds `c`;
+    `table_alias_at` adds `statement_scope`'s tables, the enclosing queries' among them, since a
+    correlated subquery sees the outer aliases and `FROM orders o` inside `… FROM offices o WHERE
+    EXISTS (` shadowed the outer `o` (`a_subquerys_table_alias_clears_the_enclosing_querys`, red
+    before).
     **Only a join that takes a condition is given one.** `empty_on_join` — split out of
     `join_condition` and shared by both surfaces, so the popup row refuses too — answers only the
     first `ON` after its `JOIN`, a second being MySQL's `ON DUPLICATE KEY` or PostgreSQL's
