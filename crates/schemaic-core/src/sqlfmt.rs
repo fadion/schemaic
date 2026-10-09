@@ -79,7 +79,7 @@ fn format_sql_under(
     dialect: SqlDialect,
     mut delim: Option<String>,
 ) -> String {
-    let toks = tokenize_under(sql, dialect, &mut delim);
+    let toks = tokenize(sql, dialect, &mut delim);
     let mut f = Fmt::new(indent_unit, sql, dialect);
     f.run(&toks);
     let out = f.out.trim_end();
@@ -164,7 +164,7 @@ fn apply_keyword_case_under(
     if case == KeywordCase::Keep {
         return sql.to_string();
     }
-    let toks = tokenize_under(sql, dialect, &mut delim);
+    let toks = tokenize(sql, dialect, &mut delim);
     let base = sql.as_ptr() as usize;
     let mut out = sql.to_string();
     let dot = |t: Option<&(Kind, &str)>| matches!(t, Some((Kind::Punct, ".")));
@@ -333,7 +333,7 @@ pub fn format_range(
 fn terminator_at(full: &str, lo: usize, dialect: SqlDialect) -> Option<String> {
     let mut delim = None;
     if let Some(head) = full.get(..lo) {
-        tokenize_under(head, dialect, &mut delim);
+        tokenize(head, dialect, &mut delim);
     }
     delim
 }
@@ -783,13 +783,10 @@ fn at_statement_start(toks: &[(Kind, &str)], delim: Option<&str>) -> bool {
     }
 }
 
-fn tokenize(sql: &str, dialect: SqlDialect) -> Vec<(Kind, &str)> {
-    tokenize_under(sql, dialect, &mut None)
-}
-
-/// [`tokenize`], with `delim` the terminator a MySQL `DELIMITER` set where
-/// `sql` begins (`None` for `;`), and left as the one in force where it ends.
-fn tokenize_under<'s>(
+/// `sql`'s tokens, with `delim` the terminator a MySQL `DELIMITER` set where
+/// `sql` begins (`None` for `;`, and for a whole document), left as the one
+/// in force where it ends.
+fn tokenize<'s>(
     sql: &'s str,
     dialect: SqlDialect,
     delim: &mut Option<String>,
@@ -3187,7 +3184,7 @@ mod tests {
     /// green while its own corpus line `select data #> '{a,b}' from t` came out
     /// `data # > '{a,b}'`, which PostgreSQL 16.15 rejects.
     fn token_texts(s: &str, dialect: SqlDialect) -> Vec<String> {
-        super::tokenize(s, dialect)
+        super::tokenize(s, dialect, &mut None)
             .into_iter()
             .map(|(_, t)| t.to_string())
             .collect()

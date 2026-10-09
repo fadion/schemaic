@@ -12589,7 +12589,8 @@ existing prose was left alone.
     selection hand `format_range` a routine's `END//` without the `DELIMITER //` line above it, so
     the `//` lexed as two `/`s and came back `END / /` (and `;;` as two `;`s) — no terminator, and
     the client ran the routine on through `DELIMITER ;`. `terminator_at` tokenizes the document up
-    to the fragment and hands the state it ends in to `tokenize_under`, through `format_sql_under`
+    to the fragment and hands the state it ends in to `tokenize` (whose `delim` is that state, `None` for a whole
+    document), through `format_sql_under`
     and `apply_keyword_case_under`, so the directive is taken exactly where `tokenize` takes one
     (`a_fragment_under_a_delimiter_keeps_its_terminator`).
     **Idempotence is held as a property over the widest corpus the crate has**: `intel`'s
