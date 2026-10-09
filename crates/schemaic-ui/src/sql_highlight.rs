@@ -950,9 +950,21 @@ fn lex_line_with(
         // temporary table (`#t`, `##t`) is a name, so `@select` and `#order`
         // are no keywords. The variable wears the variable colour; the table
         // keeps the default, as a bare one does.
-        if c == b'@' || t_sql_name_prefix(b, i, dialect) > 0 {
-            let mut j = i + 1;
-            while j < n && (matches!(b[j], b'@' | b'#') || is_word_byte(b[j])) {
+        //
+        // Only where the engine names variables so
+        // (`intel::has_at_variables`): PostgreSQL's `@>`, `<@`, `@@` and `@`
+        // are operators. And the name runs as far as the engine continues one
+        // (`continues_name`), not over any `@`/`#`: on MySQL a `#` after a
+        // variable opens a comment, which this read as part of the name.
+        let lead = match t_sql_name_prefix(b, i, dialect) {
+            0 if c == b'@' && schemaic_core::intel::has_at_variables(dialect) => {
+                if b.get(i + 1) == Some(&b'@') { 2 } else { 1 }
+            }
+            len => len,
+        };
+        if lead > 0 {
+            let mut j = i + lead;
+            while j < n && continues_name(b[j], dialect) {
                 j += 1;
             }
             if c == b'@' {
@@ -1421,6 +1433,33 @@ mod tests {
             .map(|&(s, e, _)| &"WHERE id = :id */ AND a = :b"[s..e])
             .collect();
         assert_eq!(vars, [":b"], "past a block comment's end only");
+    }
+
+    /// **`@` is a variable only where the engine names variables so**:
+    /// PostgreSQL's `@>`, `<@`, `@@` and `@` are operators. And a variable
+    /// ends where the engine ends a name (`sql::continues_name`): on MySQL a
+    /// `#` after one opens a comment, which the line lexer swallowed into the
+    /// name, so the comment's `'` then opened a string to the line's end.
+    #[test]
+    fn an_at_is_a_variable_only_where_the_engine_has_them() {
+        use SqlDialect::{MsSql, MySql, Postgres};
+        for line in [
+            "SELECT * FROM t WHERE tags @> ARRAY[1]",
+            "SELECT x <@ y",
+            "SELECT doc @@ to_tsquery('a')",
+            "SELECT @ -5, @col",
+        ] {
+            assert!(spans_of(line, Postgres, "variable").is_empty(), "{line}");
+        }
+        let line = "WHERE id = @id# it's the key";
+        assert_eq!(spans_of(line, MySql, "variable"), ["@id"]);
+        assert_eq!(spans_of(line, MySql, "comment"), ["# it's the key"]);
+        assert!(spans_of(line, MySql, "string").is_empty());
+        // T-SQL continues a variable's name through `#`, `@` and `$`.
+        assert_eq!(
+            spans_of("SELECT @a#b, @@ver$x", MsSql, "variable"),
+            ["@a#b", "@@ver$x"]
+        );
     }
 
     /// The engine's own reading wins over the fixed list: a called builtin is

@@ -26114,7 +26114,13 @@ existing prose was left alone.
     table (`sql::t_sql_name_prefix`: `#t`, `##t`) is a name — none is a keyword however it is spelled
     (`a_keyword_spelling_after_a_dot_an_at_or_in_a_dollar_name_is_not_coloured`). The variable
     then wears the editor theme's `variable` colour — it used only to be kept from being a keyword —
-    while the temporary table keeps the default, as a bare table name does. So does a `:name`
+    while the temporary table keeps the default, as a bare table name does. **An `@` is a variable
+    only where `intel::has_at_variables` says the engine names them so** — PostgreSQL's `@>`,
+    `<@`, `@@` and `@` are operators — and the name after the sigil runs through
+    `sql::continues_name`, not over any `@`/`#`: on MySQL a `#` glued to `@id` opens a comment, as
+    the document pass already read it, and the line lexer took it for part of the name and then
+    opened a string at the comment's `'` (`an_at_is_a_variable_only_where_the_engine_has_them`).
+    So does a `:name`
     placeholder, which is found by `core::params::scan` — the parameters bar's own rule, not a
     second scanner — run over the line from where code starts (past the close of a region carried
     in from the line above, or a directive). That rule is what leaves a PostgreSQL `::` cast, MySQL's `:=`, an array

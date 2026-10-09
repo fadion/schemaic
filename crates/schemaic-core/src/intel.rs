@@ -17491,7 +17491,7 @@ pub fn ctes_at(sql: &str, lo: usize, caret: usize, dialect: SqlDialect) -> Vec<L
 
 /// Does the engine name variables `@x` — SQL Server's declared ones, MySQL's
 /// user variables? PostgreSQL's `@` is an operator, and SQLite's a parameter.
-fn has_at_variables(dialect: SqlDialect) -> bool {
+pub fn has_at_variables(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MySql | SqlDialect::MsSql => true,
         SqlDialect::Postgres | SqlDialect::Sqlite => false,
