@@ -12855,7 +12855,10 @@ mod lints {
         Some((e, local_table(name)?, col))
     }
 
-    /// Does the subquery's `WHERE` say `col IS NOT NULL` anywhere?
+    /// Does the subquery's `WHERE` filter `col`'s NULLs out — say `col IS NOT
+    /// NULL` anywhere, or compare `col` in a top-level `AND` conjunct (`=`,
+    /// `<>`, `<`, `>`, `IN (…)`, `LIKE`, `BETWEEN`, negated or not), which is
+    /// unknown for a NULL and so keeps no such row (S8.2-L1-03)?
     fn filters_nulls(q: &sqlparser::ast::Query, col: &str) -> bool {
         let SetExpr::Select(s) = q.body.as_ref() else {
             return false;
@@ -12863,6 +12866,50 @@ mod lints {
         let Some(selection) = &s.selection else {
             return false;
         };
+        let names_col = |e: &Expr| match e {
+            Expr::Identifier(i) => i.value.eq_ignore_ascii_case(col),
+            Expr::CompoundIdentifier(parts) => parts
+                .last()
+                .is_some_and(|p| p.value.eq_ignore_ascii_case(col)),
+            _ => false,
+        };
+        fn conjuncts<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+            match e {
+                Expr::BinaryOp {
+                    left,
+                    op: BinaryOperator::And,
+                    right,
+                } => {
+                    conjuncts(left, out);
+                    conjuncts(right, out);
+                }
+                Expr::Nested(inner) => conjuncts(inner, out),
+                _ => out.push(e),
+            }
+        }
+        let mut terms = Vec::new();
+        conjuncts(selection, &mut terms);
+        let compares = terms.iter().any(|t| match t {
+            Expr::BinaryOp { left, op, right } => {
+                matches!(
+                    op,
+                    BinaryOperator::Eq
+                        | BinaryOperator::NotEq
+                        | BinaryOperator::Lt
+                        | BinaryOperator::LtEq
+                        | BinaryOperator::Gt
+                        | BinaryOperator::GtEq
+                ) && (names_col(left) || names_col(right))
+            }
+            Expr::InList { expr, list, .. } => !list.is_empty() && names_col(expr),
+            Expr::Like { expr, .. } | Expr::ILike { expr, .. } | Expr::Between { expr, .. } => {
+                names_col(expr)
+            }
+            _ => false,
+        });
+        if compares {
+            return true;
+        }
         visit_expressions(selection, |e| match e {
             Expr::IsNotNull(inner) => match inner.as_ref() {
                 Expr::Identifier(i) if i.value.eq_ignore_ascii_case(col) => ControlFlow::Break(()),
@@ -24845,6 +24892,31 @@ mod tests {
                 "{base} (SELECT maybe FROM ids WHERE maybe IS NOT NULL)"
             ))
             .is_empty()
+        );
+        // A comparison on the column in a top-level `AND` is unknown for a
+        // NULL, so it filters NULLs too (S8.2-L1-03); under an `OR` it does
+        // not.
+        for filter in [
+            "maybe > 0",
+            "id = 1 AND ids.maybe <> 'x'",
+            "maybe IN (1, 2)",
+            "maybe LIKE 'a%'",
+            "(maybe BETWEEN 1 AND 9)",
+        ] {
+            assert!(
+                hits(&format!("{base} (SELECT maybe FROM ids WHERE {filter})")).is_empty(),
+                "{filter}"
+            );
+        }
+        assert_eq!(
+            hits(&format!(
+                "{base} (SELECT maybe FROM ids WHERE maybe > 0 OR id = 1)"
+            )),
+            ["maybe"]
+        );
+        assert_eq!(
+            hits(&format!("{base} (SELECT maybe FROM ids WHERE id > 0)")),
+            ["maybe"]
         );
         // `IN` is not `NOT IN`; a table the catalogue does not know, a join
         // or an expression is not judged.

@@ -1009,7 +1009,10 @@ existing prose was left alone.
     `SELECT t.c`, aliased or not, from exactly one table with no join (`sole_column`) — and a
     subquery whose `WHERE` says `c IS NOT NULL` is left alone (`filters_nulls`)
     (`not_in_over_a_nullable_column_is_flagged`). That test is *anywhere* in the `WHERE`, under an
-    `OR` too and with any qualifier, which errs towards silence. `IN`, an expression, a set
+    `OR` too and with any qualifier, which errs towards silence. So is one that compares `c` in a
+    top-level `AND` conjunct — `=`, `<>`, `<`, `>`, `IN (…)`, `LIKE`, `BETWEEN` — which is unknown
+    for a NULL and keeps no such row: the warning told the user to add a filter the query already
+    had (S8.2-L1-03, red before). Under an `OR` a comparison filters nothing and is not counted. `IN`, an expression, a set
     operation and a join are not judged, nor is a column `Catalog::column_nullable` cannot answer:
     a table the catalogue does not know, a name two tables share (`is_union`) and a three-part name.
     Nor is a bare name the statement declares as a CTE (`ast_scope::collect_statement`'s list, the
