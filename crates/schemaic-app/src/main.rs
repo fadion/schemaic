@@ -793,6 +793,92 @@ enum Refusal {
     TabMovedOn,
 }
 
+/// A reply the grid waits on, delivered **at most once** — by the task's own
+/// result or by the off switch, whichever comes first. The grid's `done`
+/// callbacks are not idempotent (a second `Value` stages twice), and the two
+/// can race: a task can finish and queue its result just as the user picks
+/// *Disabled*.
+struct OnceReply<T>(Rc<RefCell<Option<ReplyFn<T>>>>);
+
+/// The grid's `done` callback, as `AiFillDoneFn` / `AiSeedDoneFn` spell it.
+type ReplyFn<T> = Rc<dyn Fn(T)>;
+
+impl<T> Clone for OnceReply<T> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<T> OnceReply<T> {
+    fn new(done: ReplyFn<T>) -> Self {
+        Self(Rc::new(RefCell::new(Some(done))))
+    }
+
+    /// Deliver `v`, unless a reply already went; the callback runs outside the
+    /// borrow, so it may itself start another request.
+    fn send(&self, v: T) {
+        let done = self.0.borrow_mut().take();
+        if let Some(done) = done {
+            done(v);
+        }
+    }
+
+    fn spent(&self) -> bool {
+        self.0.borrow().is_none()
+    }
+}
+
+/// A grid AI fill or seed under way: its task, and how to answer the grid
+/// for it if it is stopped.
+struct GridAiJob {
+    task: tokio::task::JoinHandle<()>,
+    spent: Box<dyn Fn() -> bool>,
+    refuse: Box<dyn Fn()>,
+}
+
+/// The grid AI fills and seeds under way, kept — as `inline_ai_task` is — so
+/// switching the assistant off can stop them rather than let them fetch the
+/// sample, start the CLI and stage the answer after the user said no.
+#[derive(Default)]
+struct GridAiJobs(Vec<GridAiJob>);
+
+impl GridAiJobs {
+    /// Keep `task`, whose result goes through `reply`; `off` is the answer the
+    /// grid gets instead if it is stopped. Jobs already answered are dropped
+    /// here, so the list holds only what is still owed a reply.
+    fn track<T: 'static>(
+        &mut self,
+        task: tokio::task::JoinHandle<()>,
+        reply: OnceReply<T>,
+        off: impl Fn() -> T + 'static,
+    ) {
+        self.0.retain(|j| !(j.spent)());
+        let seen = reply.clone();
+        self.0.push(GridAiJob {
+            task,
+            spent: Box::new(move || seen.spent()),
+            refuse: Box::new(move || reply.send(off())),
+        });
+    }
+
+    /// Abort every task and answer each grid still waiting with `off`. A task
+    /// whose result is already queued is answered here too, and its queued
+    /// result then finds the reply spent — nothing stages after the switch.
+    fn stop_all(self) {
+        for job in self.0 {
+            job.task.abort();
+            (job.refuse)();
+        }
+    }
+}
+
+/// Stop the grid jobs in `slot`, taken out first so that a grid callback the
+/// refusal runs can never find the slot borrowed.
+fn stop_grid_ai_jobs(slot: &RefCell<GridAiJobs>) {
+    let jobs = std::mem::take(&mut *slot.borrow_mut());
+    jobs.stop_all();
+}
+
 /// What the session running the user's SQL on connection `conn_id` must
 /// enforce: `Enforce::ReadOnly` on a read-only connection, nothing otherwise.
 ///
@@ -11299,15 +11385,20 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // `output()` future → the child is killed (no orphaned request).
     let inline_ai_task: Rc<RefCell<Option<tokio::task::JoinHandle<()>>>> =
         Rc::new(RefCell::new(None));
+    // The grid's AI fills and seeds under way — see `GridAiJobs`.
+    let grid_ai_jobs: Rc<RefCell<GridAiJobs>> = Rc::new(RefCell::new(GridAiJobs::default()));
     // **Switching the assistant off ends what it is doing**, the moment it is
     // picked rather than when the settings close: the live session is dropped,
     // which kills its CLI (as `ai_apply`'s respawn does), and an in-flight
-    // inline generation is aborted, which kills its child (`kill_on_drop`). The
-    // gear is live mid-turn, so a turn can be streaming as this runs; it is
-    // settled the way `ai_apply` settles one.
+    // inline generation is aborted, which kills its child (`kill_on_drop`). So
+    // are the grid's fills and seeds, each grid told why, so none goes on to
+    // fetch its sample or start the CLI after the user said no. The gear is
+    // live mid-turn, so a turn can be streaming as this runs; it is settled the
+    // way `ai_apply` settles one.
     {
         let ai_session = ai_session.clone();
         let task_slot = inline_ai_task.clone();
+        let grid_ai_jobs = grid_ai_jobs.clone();
         create_effect(move |_| {
             if ai_enabled.get() {
                 return;
@@ -11316,6 +11407,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             if let Some(task) = task_slot.borrow_mut().take() {
                 task.abort();
             }
+            stop_grid_ai_jobs(&grid_ai_jobs);
             if matches!(inline_ai.get_untracked(), InlineAiState::Busy) {
                 inline_ai.set(InlineAiState::Idle);
             }
@@ -11452,6 +11544,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let ai_fill: schemaic_ui::AiFillFn = {
         let handle = handle.clone();
         let db_for = db_for.clone();
+        let grid_ai_jobs = grid_ai_jobs.clone();
         Rc::new(
             move |req: schemaic_ui::AiFillRequest, done: schemaic_ui::AiFillDoneFn| {
                 use schemaic_ui::AiFillResult;
@@ -11484,14 +11577,20 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 let cli_path = ai_cli_path.get_untracked();
                 let model = ai_model.get_untracked();
                 let effort = ai_effort.get_untracked().cli().to_string();
-                let finish = create_ext_action(cx, move |res: AiFillResult| (done)(res));
+                // Through a `OnceReply`, so the off switch and this result
+                // cannot both answer the grid — see `GridAiJobs`.
+                let reply = OnceReply::new(done);
+                let finish = {
+                    let reply = reply.clone();
+                    create_ext_action(cx, move |res: AiFillResult| reply.send(res))
+                };
                 let schemaic_ui::AiFillRequest {
                     source,
                     column,
                     row_context,
                     ..
                 } = req;
-                handle.spawn(async move {
+                let task = handle.spawn(async move {
                     let database = source.database.clone();
                     // **Not fetched at all below `may_query`**, rather than
                     // fetched and dropped: a `SELECT * … LIMIT 20` the user never
@@ -11546,6 +11645,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     };
                     finish(res);
                 });
+                grid_ai_jobs.borrow_mut().track(task, reply, || {
+                    AiFillResult::Failed(schemaic_ui::AI_OFF_NOTE.to_string())
+                });
             },
         )
     };
@@ -11556,6 +11658,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let ai_seed: schemaic_ui::AiSeedFn = {
         let handle = handle.clone();
         let db_for = db_for.clone();
+        let grid_ai_jobs = grid_ai_jobs.clone();
         Rc::new(
             move |req: schemaic_ui::AiSeedRequest, done: schemaic_ui::AiSeedDoneFn| {
                 use schemaic_ui::AiSeedResult;
@@ -11581,14 +11684,19 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 let cli_path = ai_cli_path.get_untracked();
                 let model = ai_model.get_untracked();
                 let effort = ai_effort.get_untracked().cli().to_string();
-                let finish = create_ext_action(cx, move |res: AiSeedResult| (done)(res));
+                // At most one answer — see the fill callback above.
+                let reply = OnceReply::new(done);
+                let finish = {
+                    let reply = reply.clone();
+                    create_ext_action(cx, move |res: AiSeedResult| reply.send(res))
+                };
                 let schemaic_ui::AiSeedRequest {
                     source,
                     fill_columns,
                     count,
                     ..
                 } = req;
-                handle.spawn(async move {
+                let task = handle.spawn(async move {
                     let database = source.database.clone();
                     // Not fetched below `may_query` — see the fill callback.
                     let sample = if ai_data.may_query() {
@@ -11633,6 +11741,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         Err(why) => AiSeedResult::Failed(why),
                     };
                     finish(res);
+                });
+                grid_ai_jobs.borrow_mut().track(task, reply, || {
+                    AiSeedResult::Failed(schemaic_ui::AI_OFF_NOTE.to_string())
                 });
             },
         )
@@ -13393,11 +13504,12 @@ mod app_tests {
     use std::rc::Rc;
 
     use super::{
-        Action, CheckAnswer, CliLauncher, ConnGate, ConnGateElse, Refusal, RunTimeout, gate1,
-        gate1_on_tab, gate1_on_tab_answered, health_check_lets_through, inline_outcome,
-        mssql_shell_config, mysql_shell_config, owning_tab_of, plan_refusal_text, plan_refused,
-        psql_database, psql_shell_config, resolve_cli_with, resolve_native_cli,
-        sqlite_shell_config, test_outcome, timeout_message, tx_engine, unique_name,
+        Action, CheckAnswer, CliLauncher, ConnGate, ConnGateElse, GridAiJobs, OnceReply, Refusal,
+        RunTimeout, gate1, gate1_on_tab, gate1_on_tab_answered, health_check_lets_through,
+        inline_outcome, mssql_shell_config, mysql_shell_config, owning_tab_of, plan_refusal_text,
+        plan_refused, psql_database, psql_shell_config, resolve_cli_with, resolve_native_cli,
+        sqlite_shell_config, stop_grid_ai_jobs, test_outcome, timeout_message, tx_engine,
+        unique_name,
     };
     use floem::prelude::{SignalGet, SignalUpdate};
     use floem::reactive::RwSignal;
@@ -15430,6 +15542,113 @@ mod app_tests {
             g < c,
             "the off check runs after the transcript is cut — the turn is already lost"
         );
+    }
+
+    /// **Switching the assistant off stops a grid fill or seed already under
+    /// way.** Both callbacks refuse at click time, but their work was spawned
+    /// with no handle kept, so a fill started a moment before *Disabled* went
+    /// on to fetch the sample, start the CLI and stage its answer. Each spawn
+    /// is now tracked, and the off effect stops what is tracked. A source
+    /// assertion because the callbacks and the effect are closures over app
+    /// signals; `GridAiJobs` itself is tested below.
+    #[test]
+    fn switching_off_stops_the_grid_fills_and_seeds_under_way() {
+        let src = production_main();
+        // Assembled, so this test's own source is not the hit.
+        let tracked = format!("grid_ai_jobs.borrow_mut().{}(", "track");
+        for name in ["ai_fill", "ai_seed"] {
+            let at = src
+                .find(&format!("let {name}: schemaic_ui::"))
+                .unwrap_or_else(|| panic!("`{name}` is gone or was renamed"));
+            let body = closure_body(&src, at);
+            assert!(
+                body.contains(&tracked),
+                "`{name}` spawns its work without keeping the handle the off switch needs"
+            );
+        }
+        let at = src
+            .find("if ai_enabled.get() {")
+            .expect("the off effect is gone");
+        let effect = &src[at..at + src[at..].find("\n    }\n").expect("the effect's end")];
+        assert!(
+            effect.contains(&format!("{}(&grid_ai_jobs)", "stop_grid_ai_jobs")),
+            "the off effect leaves grid fills and seeds running"
+        );
+    }
+
+    /// A recorder standing in for the grid's `done`.
+    fn recorded() -> (Rc<RefCell<Vec<&'static str>>>, OnceReply<&'static str>) {
+        let got = Rc::new(RefCell::new(Vec::new()));
+        let sink = got.clone();
+        (
+            got,
+            OnceReply::new(Rc::new(move |v| sink.borrow_mut().push(v))),
+        )
+    }
+
+    #[test]
+    fn a_reply_is_delivered_once_and_later_sends_are_dropped() {
+        let (got, reply) = recorded();
+        assert!(!reply.spent());
+        reply.send("value");
+        reply.clone().send("off");
+        assert!(reply.spent());
+        assert_eq!(*got.borrow(), ["value"]);
+    }
+
+    #[tokio::test]
+    async fn stopping_aborts_the_task_and_answers_the_grid_with_the_off_note() {
+        let (got, reply) = recorded();
+        let task = tokio::spawn(std::future::pending::<()>());
+        let abort = task.abort_handle();
+        let mut jobs = GridAiJobs::default();
+        jobs.track(task, reply.clone(), || "off");
+        jobs.stop_all();
+        tokio::task::yield_now().await;
+        assert!(abort.is_finished(), "the task is still running");
+        assert_eq!(*got.borrow(), ["off"]);
+        // The task's own result, had it been queued, now finds nobody waiting.
+        reply.send("value");
+        assert_eq!(*got.borrow(), ["off"]);
+    }
+
+    #[tokio::test]
+    async fn a_job_already_answered_is_not_answered_again_when_stopped() {
+        let (got, reply) = recorded();
+        let mut jobs = GridAiJobs::default();
+        jobs.track(tokio::spawn(async {}), reply.clone(), || "off");
+        reply.send("value");
+        jobs.stop_all();
+        assert_eq!(*got.borrow(), ["value"]);
+    }
+
+    #[tokio::test]
+    async fn tracking_a_new_job_lets_go_of_the_answered_ones() {
+        let mut jobs = GridAiJobs::default();
+        let (_, first) = recorded();
+        jobs.track(tokio::spawn(async {}), first.clone(), || "off");
+        first.send("value");
+        let (_, second) = recorded();
+        jobs.track(tokio::spawn(async {}), second, || "off");
+        assert_eq!(jobs.0.len(), 1, "an answered job is still held");
+    }
+
+    #[tokio::test]
+    async fn stopping_through_the_slot_leaves_it_empty_and_free_to_borrow() {
+        let slot = Rc::new(RefCell::new(GridAiJobs::default()));
+        let inner = slot.clone();
+        // A grid callback that starts something new from inside the refusal.
+        let reply: OnceReply<&'static str> = OnceReply::new(Rc::new(move |_| {
+            assert!(inner.try_borrow_mut().is_ok(), "the slot is still borrowed");
+        }));
+        slot.borrow_mut().track(
+            tokio::spawn(std::future::pending::<()>()),
+            reply.clone(),
+            || "off",
+        );
+        stop_grid_ai_jobs(&slot);
+        assert!(reply.spent());
+        assert!(slot.borrow().0.is_empty());
     }
 
     fn dbs(names: &[&str]) -> Vec<String> {

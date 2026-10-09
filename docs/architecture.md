@@ -31143,7 +31143,18 @@ Re-introducing the anti-patterns these guard against is a regression:
   what is running**, at the pick rather than when the modal closes: an effect on `ai_enabled` going
   false drops the live session, which kills its CLI, aborts an in-flight inline task, whose child is
   `kill_on_drop`, resets a Busy inline state, and settles a streaming turn with `mark_stopped`, since
-  the gear is live mid-turn. **"No process" includes the probe**: `warm_probe_cache`'s effect
+  the gear is live mid-turn. **The grid's AI fills and seeds stop with it** — before, they ran on
+  past the switch, fetching their sample, starting the CLI and staging the answer after the user
+  had said no. Each is tracked in the `GridAiJobs` slot (its `JoinHandle`, and the grid's `done`
+  wrapped in a `OnceReply`), and the effect empties it through `stop_grid_ai_jobs`: each task is
+  aborted, which reaps its CLI by the same `kill_on_drop`, and each grid answered
+  `Failed(AI_OFF_NOTE)`, so its busy pulse clears and a seed's skeleton rows roll back. **The
+  `OnceReply` is load-bearing**: the grid's `done` is not idempotent (a second `Value` stages
+  twice), and a task can finish and queue its result just as *Disabled* is picked — that result
+  then finds the reply spent, so nothing stages after the switch. The slot is taken out of its
+  `RefCell` before any reply runs, so a grid callback can never find it borrowed
+  (`switching_off_stops_the_grid_fills_and_seeds_under_way`, with `GridAiJobs` and `OnceReply`
+  unit-tested beside it). **"No process" includes the probe**: `warm_probe_cache`'s effect
   returns early while off, because the probe is a spawn and it runs at every launch (`agent_cli.rs`).
   **The Antigravity, OpenCode, Copilot and Cursor sweeps run regardless**, and that is not a leak in
   the rule: they withdraw what an earlier session granted — an `agy` registration and its standing
