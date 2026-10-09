@@ -419,7 +419,11 @@ existing prose was left alone.
     statement the server refuses, `a_selection_is_cut_at_its_blank_lines_as_run_everything_cuts`)
     and handed to the guarded `run` —
     or `run_all` for several — with no menu, a fragment of a statement included
-    (`a_selection_runs_as_its_statements`). The missing-`WHERE` guards lose nothing by the larger
+    (`a_selection_runs_as_its_statements`). **A multi-region selection** (an Alt+Shift box, several
+    carets) runs every region's statements in document order (`sql::regions_spans`), where floem's
+    single-cursor `get_selection` had run the first region alone while every line showed selected;
+    carets with nothing selected run nothing and say so on the guard bar, since no region names a
+    statement (`several_regions_run_every_region_in_document_order`). The missing-`WHERE` guards lose nothing by the larger
     piece, since `tsql_statements` (below) cuts at statement words and not at `;` — and the `.sql`
     panel's probe, which read a piece by its head and so missed everything after a `DECLARE`, now
     counts through it too (`core::script`). **`nested_block_comments` was a divergence the table did not have**:

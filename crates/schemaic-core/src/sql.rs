@@ -2847,6 +2847,36 @@ pub fn selection_spans(
     (!spans.is_empty()).then_some(spans)
 }
 
+/// What Ctrl+Enter runs over **several** regions — an Alt+Shift box, or
+/// several carets: every selected region's statements ([`selection_spans`]),
+/// in document order, or `None` when no region selects any code, and the
+/// editor runs nothing.
+///
+/// It ran the **first** region alone (floem's single-cursor
+/// `get_selection`), while the editor showed every line of the box selected.
+/// Running them all is what the selection says; an empty region (a caret, or
+/// a ragged box's short line) says nothing and adds nothing. Carets alone are
+/// refused rather than guessed at: which caret's statement was meant is not
+/// written anywhere.
+pub fn regions_spans(
+    sql: &str,
+    regions: &[(usize, usize)],
+    dialect: SqlDialect,
+) -> Option<Vec<(usize, usize)>> {
+    let mut ordered: Vec<(usize, usize)> =
+        regions.iter().map(|&(a, b)| (a.min(b), a.max(b))).collect();
+    ordered.sort_unstable();
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    for sel in ordered {
+        for span in selection_spans(sql, Some(sel), dialect).unwrap_or_default() {
+            if !spans.contains(&span) {
+                spans.push(span);
+            }
+        }
+    }
+    (!spans.is_empty()).then_some(spans)
+}
+
 /// The statement the caret is **writing**: [`statement_range`]'s, or an empty
 /// range at the caret when it is past that statement's end
 /// ([`statement_range_ended`]). What completion reads its context from:
@@ -6666,6 +6696,38 @@ mod span_tests {
             .collect();
         assert_eq!(got, spans);
         assert!(run_everything_statements("  -- nothing\n", my).is_empty());
+    }
+
+    /// **Every region runs, in document order.** Ctrl+Enter over an
+    /// Alt+Shift box across three statements ran only the first region while
+    /// all three showed selected.
+    #[test]
+    fn several_regions_run_every_region_in_document_order() {
+        use super::regions_spans;
+        let my = SqlDialect::MySql;
+        let sql = "SELECT 1;\nSELECT 2;\nSELECT 3;";
+        let line = |n: usize| (n * 10, n * 10 + 9);
+        let texts = |spans: Vec<(usize, usize)>| -> Vec<&str> {
+            spans.into_iter().map(|(a, b)| &sql[a..b]).collect()
+        };
+        let boxed = [line(0), line(1), line(2)];
+        assert_eq!(
+            texts(regions_spans(sql, &boxed, my).unwrap()),
+            ["SELECT 1;", "SELECT 2;", "SELECT 3;"]
+        );
+        // Added out of order (Alt+click upwards), run as the document reads.
+        assert_eq!(
+            texts(regions_spans(sql, &[line(2), line(0)], my).unwrap()),
+            ["SELECT 1;", "SELECT 3;"]
+        );
+        // A region selecting nothing (a ragged box's short line) adds nothing.
+        assert_eq!(
+            texts(regions_spans(sql, &[(9, 9), line(1)], my).unwrap()),
+            ["SELECT 2;"]
+        );
+        // Only carets: no region says what to run, so nothing runs.
+        assert_eq!(regions_spans(sql, &[(3, 3), (13, 13)], my), None);
+        assert_eq!(regions_spans(sql, &[], my), None);
     }
 }
 

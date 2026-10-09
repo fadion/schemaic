@@ -3932,6 +3932,38 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             editor_sig.with_untracked(|e| {
                 let offset = e.cursor.get_untracked().offset();
                 let dia = dialect.get_untracked();
+                // **Several regions run every one**, in document order
+                // (`sql::regions_spans`) — floem's `get_selection` below is the
+                // first region alone. Carets with nothing selected name no
+                // statement, so they run nothing and say why.
+                if let Some(regions) = several_regions(&e.cursor.get_untracked()) {
+                    comp.open.set(false);
+                    match schemaic_core::sql::regions_spans(&sql, &regions, dia) {
+                        Some(spans) => {
+                            let mut stmts: Vec<String> = spans
+                                .iter()
+                                .map(|&(lo, hi)| sql[lo..hi].to_string())
+                                .collect();
+                            run_sent.set(match spans.as_slice() {
+                                [one] => Some(one.0),
+                                _ => None,
+                            });
+                            run_spans.set(spans);
+                            if stmts.len() == 1 {
+                                (guarded_run_key)(stmts.remove(0));
+                            } else {
+                                (guarded_run_all_key)(stmts);
+                            }
+                        }
+                        None => guard.set(Some(crate::RunGuard {
+                            message: "Several carets and nothing selected: select what to run, \
+                                      or leave one caret"
+                                .to_string(),
+                            pending: None,
+                        })),
+                    }
+                    return;
+                }
                 // **A selection runs as written** — its statements, through the
                 // same guarded actions (`sql::selection_statements`). No menu:
                 // selecting already said what to run.
