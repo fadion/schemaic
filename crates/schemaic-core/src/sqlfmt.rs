@@ -1152,6 +1152,9 @@ struct Fmt<'a> {
     awaiting: Option<(&'static str, &'static str)>,
     /// Compound statements are bodies here ([`crate::pairs::names_its_block_ends`]).
     named_ends: bool,
+    /// Operators are composed of operator characters here
+    /// ([`operators_are_composable`]), so two written tight are one.
+    composable: bool,
 }
 
 /// One open `CASE`: the indent of the line it opened on, the paren depth it
@@ -1190,6 +1193,7 @@ impl<'a> Fmt<'a> {
             blocks: Vec::new(),
             awaiting: None,
             named_ends: crate::pairs::names_its_block_ends(dialect),
+            composable: operators_are_composable(dialect),
         }
     }
 
@@ -1358,14 +1362,20 @@ impl<'a> Fmt<'a> {
     /// "re-flow whitespace, indentation and line breaks **without changing any
     /// token's text**". `/*` and `*/` are guarded on the same principle, though
     /// no valid statement is known to produce either.
+    ///
+    /// **Where operators compose ([`operators_are_composable`]) any two
+    /// operator characters fuse**: PostgreSQL reads `-~` as one operator, so
+    /// a unary `-` written tight against a prefix `~` turned `- ~5` (6) into
+    /// `-~ 5`, *operator does not exist* on 16.15 — and `- @ -3` into `-@ -3`.
     fn would_fuse(&self, text: &str) -> bool {
-        let Some((_, pt)) = &self.prev else {
+        let Some((pk, pt)) = &self.prev else {
             return false;
         };
-        matches!(
-            (pt.as_bytes().last(), text.as_bytes().first()),
-            (Some(b'-'), Some(b'-')) | (Some(b'/'), Some(b'*')) | (Some(b'*'), Some(b'/'))
-        )
+        let (Some(&l), Some(&r)) = (pt.as_bytes().last(), text.as_bytes().first()) else {
+            return false;
+        };
+        matches!((l, r), (b'-', b'-') | (b'/', b'*') | (b'*', b'/'))
+            || (self.composable && *pk == Kind::Punct && is_operator_byte(l) && is_operator_byte(r))
     }
 
     fn need_space(&self, cur_kind: Kind, cur: &str) -> bool {
@@ -2857,6 +2867,27 @@ mod tests {
                 "{dialect:?}"
             );
         }
+    }
+
+    /// **Where operators compose, a unary sign is not written against the
+    /// operator after it.** PostgreSQL builds an operator's name out of any
+    /// run of operator characters, so `- ~5` written tight is `-~ 5`, the
+    /// operator `-~` — *operator does not exist: -~ integer* on 16.15, as
+    /// `- @ -3` became `-@ -3` and `2 * - |/ 25` became `2 * -|/ 25`.
+    #[test]
+    fn a_unary_sign_does_not_fuse_into_a_composed_operator() {
+        let pg = SqlDialect::Postgres;
+        for (sql, fused) in [
+            ("select - ~5", "-~"),
+            ("select - @ -3", "-@"),
+            ("select 2 * - |/ 25", "-|/"),
+        ] {
+            let out = super::format_sql(sql, IND, pg);
+            assert!(!out.contains(fused), "{sql}: {out}");
+            assert_preserves(sql, pg);
+        }
+        // A sign before a number is still tight.
+        assert!(super::format_sql("select - ~5, -5", IND, pg).contains("-5"));
     }
 
     #[test]

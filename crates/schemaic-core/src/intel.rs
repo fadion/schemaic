@@ -25203,6 +25203,8 @@ mod tests {
                 "select 0.5 between .1 and .9, case when x then .5 else .25 end from t",
             ),
             (Postgres, "select 1. as x, 2. from t where y=.5"),
+            // A unary sign before a prefix operator (S4-L1-05).
+            (Postgres, "select - ~5, - @ -3, 2 * - |/ 25"),
         ]
     }
 
