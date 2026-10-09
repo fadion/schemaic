@@ -13745,6 +13745,21 @@ fn alias_slot(sql: &str, lo: usize, hi: usize, caret: usize, dialect: SqlDialect
     if !(w.eq_ignore_ascii_case("FROM") || w.eq_ignore_ascii_case("JOIN")) {
         return false;
     }
+    // A `DELETE`'s `FROM`, wherever it sits — after a `WITH` or an `EXPLAIN`,
+    // in a routine or trigger body — which the statement's head cannot see:
+    // back over MySQL's `LOW_PRIORITY QUICK IGNORE` and T-SQL's `TOP (n)`.
+    let deletes = before[..kw]
+        .iter()
+        .rev()
+        .find(|t| match bare_upper(t).as_deref() {
+            Some("LOW_PRIORITY" | "QUICK" | "IGNORE" | "TOP" | "PERCENT") => false,
+            Some(w) => !w.bytes().all(|b| b.is_ascii_digit()),
+            None => !matches!(t.kind, TkKind::LParen | TkKind::RParen),
+        })
+        .is_some_and(|t| bare_upper(t).as_deref() == Some("DELETE"));
+    if deletes {
+        return false;
+    }
     let item = before[kw + 1..]
         .iter()
         .rposition(|t| matches!(t.kind, TkKind::Comma))
@@ -30226,6 +30241,45 @@ mod tests {
         ] {
             assert_eq!(alias_at(sql, "orders"), None, "{sql}");
         }
+    }
+
+    /// A `DELETE FROM` that does not open its statement — after a `WITH`, an
+    /// `EXPLAIN`, inside a routine or trigger body — is still a `DELETE`'s
+    /// target, which SQLite takes no bare alias on and T-SQL none at all.
+    #[test]
+    fn no_table_alias_after_a_delete_from_anywhere_in_the_statement() {
+        for d in [
+            SqlDialect::Sqlite,
+            SqlDialect::MsSql,
+            SqlDialect::MySql,
+            SqlDialect::Postgres,
+        ] {
+            for sql in [
+                "WITH x AS (SELECT 1 AS a) DELETE FROM ord|",
+                "EXPLAIN DELETE FROM ord|",
+                "CREATE PROCEDURE p AS BEGIN DELETE FROM ord|",
+                "CREATE TRIGGER t AFTER INSERT ON a BEGIN DELETE FROM ord|",
+                "CREATE PROCEDURE p AS BEGIN DELETE TOP (5) FROM ord|",
+                "CREATE PROCEDURE p() BEGIN DELETE LOW_PRIORITY QUICK IGNORE FROM ord|",
+            ] {
+                let caret = sql.find('|').unwrap();
+                let sql = sql.replace('|', "");
+                assert_eq!(
+                    table_alias_at(&sql, 0, sql.len(), caret, "orders", d),
+                    None,
+                    "{sql} on {d:?}"
+                );
+            }
+        }
+        // A query's FROM inside such a statement still takes one.
+        assert_eq!(
+            alias_at(
+                "EXPLAIN DELETE FROM a WHERE id IN (SELECT id FROM ord|)",
+                "orders"
+            )
+            .as_deref(),
+            Some("o")
+        );
     }
 
     // ── SELECT * expansion ────────────────────────────────────────────────────

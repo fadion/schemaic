@@ -2615,7 +2615,12 @@ existing prose was left alone.
     statement opens with `SELECT`, `WITH`, `INSERT`, `REPLACE`, `UPDATE`, `CREATE`, `EXPLAIN` or
     `(` — which leaves out `DELETE FROM`, where some engines take an alias and others refuse it,
     and the `FROM` of `SHOW … FROM` and a cursor's `FETCH … FROM`, which name nothing to alias.
-    The head is the *statement's*, so a subquery inside a `DELETE` is given none either. The word
+    The head is the *statement's*, so a subquery inside a `DELETE` is given none either. A `FROM`
+    is refused too when the word before it — back over MySQL's `LOW_PRIORITY`/`QUICK`/`IGNORE` and
+    T-SQL's `TOP (n)` — is `DELETE`: the head cannot see a `DELETE` after a `WITH` or an `EXPLAIN`
+    or inside a routine or trigger body, and accepting a table there wrote `DELETE FROM orders o`,
+    which SQLite and SQL Server refuse (`no_table_alias_after_a_delete_from_anywhere_in_the_statement`,
+    red before). The word
     is its item's first — only `name .` qualifiers between it and the keyword or the list's last
     comma — so a table accepted into the alias slot of `FROM orders o|` gets no second alias and
     `FROM (|` none. And nothing but `,`, `)`, `;` or the line's end follows it: whatever else does
