@@ -979,8 +979,11 @@ existing prose was left alone.
     after the verb, or `LIMIT n`) is a batch — while a `FROM`/`USING` that only lists a table is a
     cross join and still flagged. Nor does it run inside a T-SQL routine's body (`range_diagnostics`'
     `in_body`, from `Unit::header`), where `DELETE FROM staging` is the point of the routine. The
-    `NULL` check skips a variable on the left, since T-SQL's `SELECT @v = NULL` is an assignment that
-    parses as a comparison; `SET a = NULL` is an `Assignment` and never reaches it. One lint is an
+    `NULL` check passes over an `EXEC p @a = NULL` whole, whose named arguments the parser reads
+    as comparisons; T-SQL's `SELECT @v = NULL` is an aliased item and `SET a = NULL` an
+    `Assignment`, and neither reaches it. A variable compared with NULL anywhere else is flagged —
+    `WHERE (@p = NULL OR c = @p)` is the optional filter that never applies, which a blanket
+    exemption for an `@`-name on the left hid while its test passed without it (S8.2-L1-08). One lint is an
     **error**, being refused by every engine: an `INSERT` naming its columns with a `VALUES` row of
     another length, squiggled on the row's own parens (`Parens`' tokens)
     (`an_insert_row_of_the_wrong_length_is_an_error`). **With no column list the count is the

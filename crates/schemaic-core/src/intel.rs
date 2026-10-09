@@ -13049,17 +13049,22 @@ mod lints {
     /// `x = NULL`, `x <> NULL`, `x != NULL`: under the standard's (and every
     /// engine's default) null semantics the answer is unknown for every row,
     /// so a filter on one keeps nothing. An assignment is not a comparison
-    /// and never reaches here (`SET a = NULL` is an `Assignment`), and a
-    /// variable on the left is left alone, since T-SQL's `SELECT @v = NULL`
-    /// is one parsed as a comparison.
+    /// and never reaches here (`SET a = NULL` is an `Assignment`, T-SQL's
+    /// `SELECT @v = NULL` an aliased item). An `EXEC p @a = NULL` is passed
+    /// over whole: its arguments are named-parameter assignments that the
+    /// parser reads as expressions. A variable compared with NULL elsewhere
+    /// is flagged — `WHERE (@p = NULL OR c = @p)` is the classic optional
+    /// filter that never applies (S8.2-L1-08); exempting every `@`-name on
+    /// the left hid it.
     fn null_comparisons(stmt: &str, lo: usize, ast: &Statement, out: &mut Vec<Diagnostic>) {
+        if matches!(ast, Statement::Execute { .. }) {
+            return;
+        }
         let is_null = |e: &Expr| matches!(e, Expr::Value(v) if v.value == Value::Null);
-        let is_variable = |e: &Expr| matches!(e, Expr::Identifier(id) if id.value.starts_with('@'));
         let _ = visit_expressions(ast, |e| {
             if let Expr::BinaryOp { left, op, right } = e
                 && matches!(op, BinaryOperator::Eq | BinaryOperator::NotEq)
                 && (is_null(left) || is_null(right))
-                && !is_variable(left)
             {
                 let fix = if *op == BinaryOperator::Eq {
                     "IS NULL"
@@ -24942,8 +24947,9 @@ mod tests {
     }
 
     /// `= NULL` and `<> NULL` are never true; `IS NULL` is what was meant.
-    /// An assignment is not a comparison — `SET a = NULL` — and neither is
-    /// T-SQL's `SELECT @v = NULL`.
+    /// An assignment is not a comparison — `SET a = NULL`, T-SQL's `SELECT
+    /// @v = NULL` and an `EXEC p @a = NULL` argument — but a variable compared
+    /// with NULL is the textbook optional-parameter mistake (S8.2-L1-08).
     #[test]
     fn a_comparison_with_null_is_flagged() {
         let my = |sql| lint_hits(sql, SqlDialect::MySql, "IS ");
@@ -24960,9 +24966,21 @@ mod tests {
         assert!(my("UPDATE employees SET name = NULL WHERE id = 1;").is_empty());
         let ms = |sql| lint_hits(sql, SqlDialect::MsSql, "IS ");
         assert!(ms("DECLARE @v INT; SELECT @v = NULL;").is_empty());
+        assert!(ms("EXEC p @a = NULL;").is_empty());
+        assert!(ms("EXECUTE dbo.p @a = NULL, @b = 1;").is_empty());
         assert_eq!(
             ms("SELECT * FROM employees WHERE name = NULL;"),
             ["name = NULL"]
+        );
+        assert_eq!(
+            ms(
+                "DECLARE @status INT; SELECT * FROM employees WHERE (@status = NULL OR id = @status);"
+            ),
+            ["@status = NULL"]
+        );
+        assert_eq!(
+            my("SELECT * FROM employees WHERE @v = NULL;"),
+            ["@v = NULL"]
         );
     }
 
