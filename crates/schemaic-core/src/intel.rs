@@ -13672,10 +13672,13 @@ pub fn table_alias(name: &str, taken: &[String], dialect: SqlDialect) -> Option<
     let base = name.rsplit('.').next().unwrap_or(name);
     let mut initials = String::new();
     let mut prev: Option<char> = None;
+    // Inside a word as `is_word_byte` reads one — a non-ASCII letter is, so
+    // `straße_orders`' `e` continues `straße` — but for the `_` that splits
+    // the words of a name.
+    let in_word = |p: char| p != '_' && (!p.is_ascii() || is_word_byte(p as u8));
     for c in base.chars() {
-        let starts_word = prev.is_none_or(|p| {
-            !p.is_ascii_alphanumeric() || (p.is_ascii_lowercase() && c.is_ascii_uppercase())
-        });
+        let starts_word =
+            prev.is_none_or(|p| !in_word(p) || (p.is_ascii_lowercase() && c.is_ascii_uppercase()));
         if starts_word && c.is_ascii_alphanumeric() {
             initials.push(c.to_ascii_lowercase());
         }
@@ -30189,6 +30192,17 @@ mod tests {
         // letter to take an initial from.
         assert_eq!(table_alias("o", &[], SqlDialect::MySql), None);
         assert_eq!(table_alias("名前", &[], SqlDialect::MySql), None);
+    }
+
+    /// A non-ASCII letter is part of its word, as `sql::is_word_byte` reads
+    /// it: the ASCII letter after it is not a new word's initial. A word that
+    /// opens on one has no ASCII initial and gives none.
+    #[test]
+    fn a_non_ascii_letter_does_not_start_a_word_of_the_alias() {
+        let a = |n: &str| table_alias(n, &[], SqlDialect::MySql);
+        assert_eq!(a("straße_orders").as_deref(), Some("so"));
+        assert_eq!(a("cafés").as_deref(), Some("c"));
+        assert_eq!(a("über_items").as_deref(), Some("i"));
     }
 
     /// `table_alias_at` with the caret at the `|`.

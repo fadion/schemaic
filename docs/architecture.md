@@ -2606,9 +2606,10 @@ existing prose was left alone.
     holds both popup surfaces to `join_takes_a_condition`, the table rows red before — on MySQL,
     PostgreSQL and SQLite; its loop leaves SQL Server out, though it shares PostgreSQL's arm).
     **Completion writes a table's alias only where one cannot be wrong.** `table_alias` makes it
-    from the name alone: the initials of the last `.` part's words — split at anything not
-    alphanumeric and at a lower→upper camel boundary, so `order_items` and `OrderItems` are both
-    `oi` — lower-cased, leading digits dropped (`2fa_codes` is `c`), and numbered (`o2`, `on2`)
+    from the name alone: the initials of the last `.` part's words — split at `_`, at anything
+    else `is_word_byte` does not take, and at a lower→upper camel boundary, so `order_items` and
+    `OrderItems` are both `oi`, and a non-ASCII letter continues its word (`straße_orders` is `so`,
+    not `seo`; `a_non_ascii_letter_does_not_start_a_word_of_the_alias`, red before) — lower-cased, leading digits dropped (`2fa_codes` is `c`), and numbered (`o2`, `on2`)
     where that is taken, in any case, or could not stand bare after a table on some server of the
     dialect: `reserved_anywhere`, `is_implicit_alias`, and T-SQL's `GO`, which no list reserves.
     It is `None` where the alias would equal the name or there is no ASCII initial to make one
