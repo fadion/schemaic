@@ -2802,6 +2802,8 @@ pub(crate) struct QueryPaneParams {
     /// Ctrl+K opens nothing.
     pub ai_enabled: RwSignal<bool>,
     pub error_modal_open: RwSignal<bool>,
+    /// Raises *Rename alias*'s dialog ([`crate::OverlayUi::alias_rename`]).
+    pub alias_rename: RwSignal<Option<crate::AliasRenameRequest>>,
     pub schema_visible: RwSignal<bool>,
     pub right_panel: RwSignal<RightPanel>,
     pub ai_send: Rc<dyn Fn(String)>,
@@ -2899,6 +2901,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         inline_ai_cancel,
         ai_enabled,
         error_modal_open,
+        alias_rename,
         schema_visible,
         right_panel,
         ai_send,
@@ -5078,29 +5081,44 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 );
             }
             // "Rename alias": over a table alias or a qualifier naming one,
-            // every place it is written (`intel::alias_occurrences`, bound
-            // the way the server binds it) becomes one selection, a caret
-            // per name, so what is typed next renames them together.
-            let alias_at = move || {
+            // a dialog asks for the new name, and `intel::alias_rename`
+            // renames every place it is written (bound the way the server
+            // binds it) in one edit — or refuses a name that would rebind a
+            // reference (R3-L5-03), which typing at a caret per name could
+            // never be checked against.
+            let alias_name = move || {
                 query.with_untracked(|sql| {
-                    intel::alias_occurrences(
-                        sql,
-                        menu_offset.get_untracked(),
-                        dialect.get_untracked(),
-                    )
+                    intel::alias_name_at(sql, menu_offset.get_untracked(), dialect.get_untracked())
                 })
             };
-            if alias_at().is_some() {
+            if alias_name().is_some() {
                 let ed = ed_rename.clone();
                 entries.push(MenuEntry::action("Rename alias", move || {
-                    let Some(ranges) = alias_at() else {
+                    let Some(name) = alias_name() else {
                         return;
                     };
-                    let mut sel = Selection::new();
-                    for (a, b) in ranges {
-                        sel.add_region(SelRegion::new(a, b, None));
-                    }
-                    ed.cursor.update(|c| c.set_insert(sel));
+                    let at = menu_offset.get_untracked();
+                    // The text the offset was taken in: changed under the
+                    // dialog (an agent's edit, say), `at` may be on another
+                    // alias than the one the field names, so it refuses.
+                    let opened_on = query.get_untracked();
+                    let ed = ed.clone();
+                    let apply = move |new: &str| {
+                        let m = query.with_untracked(|sql| {
+                            if *sql != opened_on {
+                                return Err(intel::AliasRenameRefusal::Changed);
+                            }
+                            intel::alias_rename(sql, at, new, dialect.get_untracked())
+                        })?;
+                        if !edit_untyped_multi(&ed, comp, &m, EditType::Other) {
+                            return Err(intel::AliasRenameRefusal::ReadOnly);
+                        }
+                        Ok(())
+                    };
+                    alias_rename.set(Some(crate::AliasRenameRequest {
+                        name,
+                        apply: Rc::new(apply),
+                    }));
                 }));
             }
             // First when it's there: over a squiggle it is the most specific

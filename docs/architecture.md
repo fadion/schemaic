@@ -2710,7 +2710,7 @@ existing prose was left alone.
     `join_target_guess` passes `join_targets_for` no taken names and stays unaliased
     (`a_table_alias_is_written_at_a_from_or_join_slot`, `no_table_alias_outside_a_query_table_slot`,
     `a_join_target_carries_its_aliased_form`).
-    **`alias_occurrences` is *Rename alias*'s answer**: the table alias under the caret — its
+    **`alias_occurrences` is *Rename alias*'s walk**: the table alias under the caret — its
     definition or any qualifier naming it — and every other place it is written in the statement
     there, sorted. It reads the AST rather than the text because binding is the whole question: a
     qualifier names the alias of the *innermost* query that defines one by that name, so a
@@ -2739,9 +2739,27 @@ existing prose was left alone.
     reference and the definition defines it — the correlated `o.id` renamed to the inner `i` binds
     to the inner row, and a `DELETE … WHERE EXISTS` removes every row or none — or where a reference
     inside the definition's query to an outer one by that name would find the renamed alias first
-    (`renaming_an_alias_to_a_name_that_would_rebind_is_a_conflict`, red before). The editor does
-    not ask it yet: *Rename alias* hands over a multi-caret selection and the name arrives as typing,
-    so there is no single moment to ask at.
+    (`renaming_an_alias_to_a_name_that_would_rebind_is_a_conflict`, red before).
+    **`alias_rename` is *Rename alias*'s decision, and the capture check is its gate, not a warning
+    beside it.** The entry used to make `alias_occurrences` one multi-caret selection and let the
+    typing do the rename — and a name typed a keystroke at a time is never *finished* anywhere a check
+    could stand, so nothing asked the question above and the capture shipped. Now the editor asks for
+    the name in a dialog (`alias_rename.rs`, in `schemaic-ui`) and hands it here. The name is trimmed;
+    the answer is `AliasRenameRefusal::Empty` where nothing is left, `Conflict` wherever
+    `alias_rename_conflicts` says anything but `Some(false)`, and `NoAlias` where the walk finds no
+    alias — whose `message` is the sentence the dialog shows. Two more variants, `Changed` and
+    `ReadOnly`, are the *editor's* to return, never this function's (the context-menu passage under
+    `editor_pane.rs` has why); they live on the same enum so the dialog has one refusal to show.
+    Otherwise it is a `text_ops::MultiEdit`
+    replacing each occurrence's **whole** spelling, quotes included, with
+    `export::ident_if_needed(name, dialect)` — `Ord` on PostgreSQL is written `"Ord"`, and a quoted
+    `"o"` renamed to `x` loses its quotes — and leaving one caret at the end of the occurrence the
+    caret was on. That is why `alias_refs` keeps two views of one walk: `spans` is the raw ranges,
+    quotes and all, which the rename writes over, while `alias_occurrences` and `alias_name_at` (the
+    alias as its definition writes it, quotes off — what the dialog opens with) take them through
+    `unquoted` (`an_alias_rename_writes_every_occurrence`,
+    `an_alias_rename_refuses_a_capturing_or_empty_name`, `an_alias_name_is_its_definition_as_written`).
+    `alias_occurrences` has no production caller since; its tests go on pinning the walk.
     **A `(` is filled from the schema only where the schema names one answer.** `paren_contents`,
     asked right after `insert_columns`, answers three openers through the same `column_list`.
     `REFERENCES t (` gets `t`'s primary key from `Catalog::key_columns_of` — its columns in the
@@ -12610,7 +12628,7 @@ existing prose was left alone.
     only when that edit went through, so a cut the Ctrl+K freeze refuses leaves the clipboard as it
     was.
     **Several carets are answered here too.** Floem's `Selection` holds one `SelRegion` per caret —
-    its Alt+click adds one, *Rename alias* sets several — and the pane's own key actions read the
+    its Alt+click adds one — and the pane's own key actions read the
     primary caret alone and set one selection after, collapsing the rest into it. `RegionEdit` is
     one caret's share: a replacement in the original text's offsets, and the selection *that edit
     alone* would leave. `compose` puts them together as a `MultiEdit` — sorted, each selection
@@ -21713,7 +21731,30 @@ existing prose was left alone.
     `core/snippet.rs`. It is painted inside the
     `ddl_modals_up` group and is therefore *in* that predicate: an overlay in that group whose flag
     the predicate doesn't know about resolves its `inset(0)` against a zero-by-zero box and paints
-    nothing, which is exactly how the event editor once shipped invisible.
+    nothing, which is exactly how the event editor once shipped invisible. It shares its tuple
+    element with *Rename alias* (`alias_rename.rs`, next).
+  - `alias_rename.rs` — the SQL editor's *Rename alias* dialog (`alias_rename_overlay`, raised by
+    `OverlayUi::alias_rename`): a title, one *New name* field opened on the alias as its definition
+    writes it, Cancel and Rename. **It exists because a name has to be finished before it can be
+    checked.** The entry used to hand over a multi-caret selection and let typing do the rename, so
+    nothing ever compared the name with those the query already binds, and renaming the outer `o` to
+    an inner query's `i` rebound a correlated `o.id` — in a `DELETE … WHERE EXISTS`, every row or
+    none (R3-L5-03). The decision is `intel::alias_rename`'s (under `intel.rs`); this file asks and
+    shows the answer, and `AliasRenameRequest::apply` is the editor's own rename, so it knows no
+    buffer or offset. A refusal — `AliasRenameRefusal::message` — is written in the error colour
+    under the field and **the dialog stays open on it**, the name still there to correct; editing
+    the name retracts it, since it answered the name it was given. Enter submits, Escape and ✕
+    close, and there is **no click-away**, as the snippet editor has none: the name is applied only
+    by Rename. The outer `dyn_container` is keyed on *whether* a request is open rather than on the
+    request, so nothing rebuilds the field and takes its caret; the footer is keyed on whether the
+    trimmed name is empty, so the buttons rebuild when Rename turns on and not on every keystroke.
+    It shares `snippet_edit.rs`'s tuple element in the modal layer's DDL group — that stack is at
+    floem's 16-arity limit, and the two are not up together: that is a stated claim rather than a
+    check, resting on both being modal, so neither can be raised from behind the other — so the
+    element fills the layer while
+    either is open, `ddl_modals_up` has an `alias_rename` arm, and the file is on
+    `PAINTS_A_BACKDROP`. Left out of the predicate it would paint nothing, for the reason the snippet
+    editor's entry gives.
   - `source_gate.rs` — the shared machinery behind the crate's *source gates*:
     the tests that read the crate's own `.rs` files and fail on a spelling production code must not
     contain (a floem `Dropdown`, a captured `Color`, a raw pixel inset, an unguarded `exec_after`,
@@ -24857,11 +24898,24 @@ existing prose was left alone.
     formats is asked — and the same `sqlfmt` answer and `rewrite_range`. **The menu entries wear no
     keycap on purpose**: they act on the statement under the click, the key on the one at the caret,
     so a keycap would claim the key does what the click does.
-    ***Rename alias*** is offered where `intel::alias_occurrences` answers at the right-click —
+    ***Rename alias*** is offered where `intel::alias_name_at` answers at the right-click —
     absent otherwise, and re-derived when clicked, like the rest — and is appended after the entries
-    above, ahead of *Create view*'s group. It opens no modal and has no key: it sets the cursor to a
-    `Selection` of one `SelRegion` per occurrence, so the next word typed replaces every one at once.
-    That leans on multi-region editing. Backspace and an auto-paired `(` used to collapse the
+    above, ahead of *Create view*'s group. It has no key. It used to open no modal either: it set the
+    cursor to one `SelRegion` per `alias_occurrences` range and let the next word typed replace every
+    one at once, which left the name nowhere a check could stand — renaming the outer `o` to an inner
+    query's `i` silently rebound a correlated `o.id` (R3-L5-03, under `intel.rs`). It now sets
+    `OverlayUi::alias_rename` (threaded in as `QueryPaneParams::alias_rename`) to an
+    `AliasRenameRequest`: the name `alias_name_at` read, and an `apply` that re-runs
+    `intel::alias_rename` against the buffer **when Rename is pressed**, at the offset the menu was
+    opened on, and writes the `MultiEdit` through `edit_untyped_multi` — one undo step. Its `Err` is
+    the refusal the dialog (`alias_rename.rs`) shows, and two of them are decided here rather than
+    by the walk. **`Changed`**: the click also captures the query text, and Rename refuses when the
+    buffer differs from it — the stored offset was taken in that text, so after an edit under the
+    dialog (an agent's, say) it may sit on another alias than the one the field names, and the
+    rename would go through under the wrong name. **`ReadOnly`**: where `edit_untyped_multi` refuses
+    (the Ctrl+K freeze) the refusal is returned rather than dropped — dropped, the dialog would close
+    as if it had renamed. The multi-region editing the old entry leaned
+    on stays: Backspace and an auto-paired `(` used to collapse the
     regions to the primary one; they now act at every caret (`text_ops.rs`, *Several carets*), as
     do Tab, Shift+Tab, Ctrl+/, Ctrl+D, Alt+↑/↓, Ctrl+Shift+U, Ctrl+Shift+J and Ctrl+Shift+/.
     **The Ctrl+K suggestion is not drawn here** — it is phantom rows in the editor's own line flow

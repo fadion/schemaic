@@ -12551,8 +12551,8 @@ mod colres {
 /// Every place the table alias at `caret` is written — its definition and each
 /// qualifier bound to it (`o.id`, `o.*`, `SET o.x`) — in the statement the
 /// caret is in, in order, or `None` when the caret is on no alias or the
-/// statement does not parse. What *Rename alias* selects, so typing renames
-/// them together.
+/// statement does not parse. [`alias_rename`]'s walk, as the names a reader
+/// sees: the quotes off.
 ///
 /// Bound the way the server binds them: a qualifier names the alias of the
 /// innermost query that defines one by that name, so a subquery's own `o`
@@ -12598,6 +12598,116 @@ pub fn alias_rename_conflicts(
         return None;
     };
     alias_refs::rename_conflicts(stmt, lo, ast, caret, new_name)
+}
+
+/// Why *Rename alias* will not rename to a name ([`alias_rename`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AliasRenameRefusal {
+    /// The caret is on no alias whose every occurrence the walk can see.
+    NoAlias,
+    /// No name was given.
+    Empty,
+    /// The name would rebind a reference or clash with one the query
+    /// already exposes ([`alias_rename_conflicts`]).
+    Conflict,
+    /// The text changed while the dialog was open, so the place it was
+    /// opened on may now be another alias. The editor's call, not this walk's.
+    Changed,
+    /// The editor takes no edit just now (an AI suggestion is pending). The
+    /// editor's call, not this walk's.
+    ReadOnly,
+}
+
+/// The name *Rename alias*'s dialog opens with: the alias at `caret` as its
+/// definition writes it, quotes off. `None` where [`alias_occurrences`] finds
+/// nothing to rename.
+pub fn alias_name_at(sql: &str, caret: usize, dialect: SqlDialect) -> Option<String> {
+    let (lo, hi) = crate::sql::statement_range(sql, caret, dialect);
+    let stmt = sql.get(lo..hi)?;
+    let asts = parse_statements(stmt, dialect).ok()?;
+    let [ast] = asts.as_slice() else {
+        return None;
+    };
+    let (a, b) = alias_refs::definition(stmt, lo, ast, caret)?;
+    sql.get(a..b).map(str::to_string)
+}
+
+/// *Rename alias*'s decision: the edits that rename the alias at `caret` to
+/// `new_name` — in order and disjoint, each a whole spelling (quotes
+/// included) replaced by the name as [`crate::export::ident_if_needed`]
+/// writes it, and one caret at the end of the occurrence `caret` was on — or
+/// why it will not.
+///
+/// **The capture check is the gate, not a warning beside it** (R3-L5-03): a
+/// name [`alias_rename_conflicts`] reports would leave a statement that
+/// parses, runs, and binds a reference to another row, so no edit is made.
+/// Blanks around the name are not part of it.
+pub fn alias_rename(
+    sql: &str,
+    caret: usize,
+    new_name: &str,
+    dialect: SqlDialect,
+) -> Result<crate::text_ops::MultiEdit, AliasRenameRefusal> {
+    let (lo, hi) = crate::sql::statement_range(sql, caret, dialect);
+    let stmt = sql.get(lo..hi).ok_or(AliasRenameRefusal::NoAlias)?;
+    let asts = parse_statements(stmt, dialect).map_err(|_| AliasRenameRefusal::NoAlias)?;
+    let [ast] = asts.as_slice() else {
+        return Err(AliasRenameRefusal::NoAlias);
+    };
+    let (_, spans) = alias_refs::spans(stmt, lo, ast, caret).ok_or(AliasRenameRefusal::NoAlias)?;
+    let name = new_name.trim();
+    if name.is_empty() {
+        return Err(AliasRenameRefusal::Empty);
+    }
+    if alias_refs::rename_conflicts(stmt, lo, ast, caret, name) != Some(false) {
+        return Err(AliasRenameRefusal::Conflict);
+    }
+    let text = crate::export::ident_if_needed(name, dialect);
+    // The caret, moved by what the edits before it add or remove.
+    let mut at = caret as isize;
+    let mut shift = 0isize;
+    for &(a, b) in &spans {
+        let grows = text.len() as isize - (b - a) as isize;
+        if (a..=b).contains(&caret) {
+            at = a as isize + shift + text.len() as isize;
+            break;
+        }
+        if b <= caret {
+            shift += grows;
+            at = caret as isize + shift;
+        }
+    }
+    let at = at.max(0) as usize;
+    Ok(crate::text_ops::MultiEdit {
+        edits: spans
+            .into_iter()
+            .map(|(a, b)| (a, b, text.clone()))
+            .collect(),
+        sels: vec![(at, at)],
+    })
+}
+
+impl AliasRenameRefusal {
+    /// What the dialog says under the field when it will not rename to
+    /// `new_name`.
+    pub fn message(self, new_name: &str) -> String {
+        match self {
+            Self::NoAlias => "There is no alias here to rename any more.".to_string(),
+            Self::Empty => "Give the alias a name.".to_string(),
+            Self::Conflict => format!(
+                "“{}” is already a name in this query: renaming to it would change \
+                 which table a reference reads.",
+                new_name.trim()
+            ),
+            Self::Changed => {
+                "The query changed while this was open. Close it and rename again.".to_string()
+            }
+            Self::ReadOnly => {
+                "The editor is read-only until the AI suggestion is accepted or rejected."
+                    .to_string()
+            }
+        }
+    }
 }
 
 /// [`alias_occurrences`]' walk: alias definitions and qualifier uses, each
@@ -12881,6 +12991,33 @@ mod alias_refs {
         ast: &Statement,
         caret: usize,
     ) -> Option<Vec<(usize, usize)>> {
+        let (_, all) = spans(stmt, lo, ast, caret)?;
+        Some(all.into_iter().map(|r| unquoted(stmt, lo, r)).collect())
+    }
+
+    /// [`super::alias_name_at`]: the definition, the name inside its quotes.
+    pub(super) fn definition(
+        stmt: &str,
+        lo: usize,
+        ast: &Statement,
+        caret: usize,
+    ) -> Option<(usize, usize)> {
+        let (def, _) = spans(stmt, lo, ast, caret)?;
+        Some(unquoted(stmt, lo, def))
+    }
+
+    /// A byte range in the buffer.
+    type Span = (usize, usize);
+
+    /// The definition, and it with every use bound to it in order — each
+    /// range a name's whole spelling, quotes and all. `None` where a bare
+    /// name may be the alias, which no walk here tells apart.
+    pub(super) fn spans(
+        stmt: &str,
+        lo: usize,
+        ast: &Statement,
+        caret: usize,
+    ) -> Option<(Span, Vec<Span>)> {
         let (w, def) = walk_at(stmt, lo, ast, caret)?;
         let (name, def_at) = &w.defs[def];
         if w.bare
@@ -12893,16 +13030,13 @@ mod alias_refs {
         out.extend(bound_uses(&w, def));
         out.sort_unstable();
         out.dedup();
-        // The name inside its quotes.
-        let b = (stmt.as_bytes(), lo);
-        Some(
-            out.into_iter()
-                .map(|(s, e)| {
-                    let quoted = e - s >= 2 && matches!(b.0.get(s - b.1), Some(b'"' | b'`' | b'['));
-                    if quoted { (s + 1, e - 1) } else { (s, e) }
-                })
-                .collect(),
-        )
+        Some((*def_at, out))
+    }
+
+    /// The name inside a quoted spelling's quotes; a bare one as it is.
+    fn unquoted(stmt: &str, lo: usize, (s, e): (usize, usize)) -> (usize, usize) {
+        let quoted = e - s >= 2 && matches!(stmt.as_bytes().get(s - lo), Some(b'"' | b'`' | b'['));
+        if quoted { (s + 1, e - 1) } else { (s, e) }
     }
 
     /// [`super::alias_rename_conflicts`].
@@ -27394,6 +27528,104 @@ mod tests {
         assert_eq!(rename_conflicts(sql, "i"), Some(false));
         // Not on an alias.
         assert_eq!(rename_conflicts("SELECT 1 FROM orders|", "x"), None);
+    }
+
+    /// `alias_rename` at the `|`, applied: the statement it would leave.
+    fn renamed(sql: &str, new: &str, dialect: SqlDialect) -> Result<String, AliasRenameRefusal> {
+        let caret = sql.find('|').unwrap();
+        let mut sql = sql.replace('|', "");
+        let m = alias_rename(&sql, caret, new, dialect)?;
+        assert!(m.edits.windows(2).all(|w| w[0].1 <= w[1].0), "{m:?}");
+        for (a, b, text) in m.edits.into_iter().rev() {
+            sql.replace_range(a..b, &text);
+        }
+        let [(c, c2)] = m.sels.as_slice() else {
+            panic!("one caret: {:?}", m.sels);
+        };
+        assert_eq!(c, c2);
+        sql.insert(*c, '|');
+        Ok(sql)
+    }
+
+    /// *Rename alias*'s dialog: every occurrence takes the new name in one
+    /// edit, written as a name the engine reads back as typed.
+    #[test]
+    fn an_alias_rename_writes_every_occurrence() {
+        let my = SqlDialect::MySql;
+        let pg = SqlDialect::Postgres;
+        assert_eq!(
+            renamed("SELECT o.id FROM orders o| WHERE o.id = 1", "x", my),
+            Ok("SELECT x.id FROM orders x| WHERE x.id = 1".to_string())
+        );
+        // Surrounding blanks are not part of the name; the caret ends the
+        // occurrence it was on, past what the edits before it added.
+        assert_eq!(
+            renamed("SELECT o|.id FROM orders o", "  ord ", my),
+            Ok("SELECT ord|.id FROM orders ord".to_string())
+        );
+        assert_eq!(
+            renamed("SELECT o.id FROM orders o WHERE o|.id = 1", "ord", my),
+            Ok("SELECT ord.id FROM orders ord WHERE ord|.id = 1".to_string())
+        );
+        // A name a bare word cannot carry is quoted; a quoted alias given a
+        // plain name loses its quotes.
+        assert_eq!(
+            renamed("SELECT o.id FROM orders o|", "Ord", pg),
+            Ok("SELECT \"Ord\".id FROM orders \"Ord\"|".to_string())
+        );
+        assert_eq!(
+            renamed("SELECT o.id FROM orders o|", "order items", my),
+            Ok("SELECT `order items`.id FROM orders `order items`|".to_string())
+        );
+        assert_eq!(
+            renamed("SELECT \"o\".id FROM orders \"o|\"", "x", pg),
+            Ok("SELECT x.id FROM orders x|".to_string())
+        );
+    }
+
+    /// **The dialog refuses a name that would rebind a reference**
+    /// (R3-L5-03): the correlated `o.id` renamed to the inner `i` would make
+    /// the `DELETE` remove every order or none.
+    #[test]
+    fn an_alias_rename_refuses_a_capturing_or_empty_name() {
+        let pg = SqlDialect::Postgres;
+        let sql =
+            "DELETE FROM orders o| WHERE EXISTS (SELECT 1 FROM items i WHERE i.order_id = o.id)";
+        assert_eq!(renamed(sql, "i", pg), Err(AliasRenameRefusal::Conflict));
+        assert_eq!(renamed(sql, " I ", pg), Err(AliasRenameRefusal::Conflict));
+        assert!(AliasRenameRefusal::Conflict.message(" i ").contains("“i”"));
+        assert!(renamed(sql, "ord", pg).is_ok());
+        assert_eq!(renamed(sql, "", pg), Err(AliasRenameRefusal::Empty));
+        assert_eq!(renamed(sql, "   ", pg), Err(AliasRenameRefusal::Empty));
+        // No alias here, or one a bare name may be the whole row of.
+        assert_eq!(
+            renamed("SELECT 1 FROM orders|", "x", pg),
+            Err(AliasRenameRefusal::NoAlias)
+        );
+        assert_eq!(
+            renamed("SELECT row_to_json(o) FROM orders o|", "x", pg),
+            Err(AliasRenameRefusal::NoAlias)
+        );
+    }
+
+    /// What the dialog's field opens with: the alias as its definition
+    /// writes it, quotes off, from the definition or any reference.
+    #[test]
+    fn an_alias_name_is_its_definition_as_written() {
+        let my = SqlDialect::MySql;
+        let pg = SqlDialect::Postgres;
+        let at = |sql: &str, d| {
+            let caret = sql.find('|').unwrap();
+            alias_name_at(&sql.replace('|', ""), caret, d)
+        };
+        assert_eq!(at("SELECT o|.id FROM orders o", my), Some("o".into()));
+        assert_eq!(at("SELECT Ord.id FROM orders Ord|", my), Some("Ord".into()));
+        assert_eq!(
+            at("SELECT \"Ord\"|.id FROM orders \"Ord\"", pg),
+            Some("Ord".into())
+        );
+        assert_eq!(at("SELECT 1 FROM orders|", my), None);
+        assert_eq!(at("SELECT row_to_json(o) FROM orders o|", pg), None);
     }
 
     #[test]

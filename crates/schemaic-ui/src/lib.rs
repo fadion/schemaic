@@ -50,10 +50,12 @@ mod script_view;
 pub use schema_tree::{
     column_key_named, db_key, db_name_of_key, key_under, table_key_named, wants_db_stats,
 };
+mod alias_rename;
 mod settings;
 mod shortcuts;
 mod snippet_edit;
 mod snippet_panel;
+pub use alias_rename::AliasRenameRequest;
 /// The shared machinery behind this crate's source gates.
 ///
 /// **The module is compiled always, its corpus walkers only under `cfg(test)`.**
@@ -6396,6 +6398,9 @@ pub struct OverlayUi {
     /// The snippet whose body is being edited, or `None`. One at a time, like
     /// every other editor here.
     pub snippet_edit: RwSignal<Option<u64>>,
+    /// *Rename alias*'s dialog: the alias's name and the editor's rename, or
+    /// `None`. Set by the SQL editor's context menu.
+    pub alias_rename: RwSignal<Option<AliasRenameRequest>>,
     /// A run the write guard held back, or `None`. Set by
     /// [`TabsActions::run`]/[`TabsActions::run_all`] — which *are* the guarded
     /// run path — and rendered as the editor's guard bar. It lives here, not in
@@ -9053,6 +9058,7 @@ fn center(ui: Ui) -> impl IntoView {
                     inline_ai_cancel: inline_ai_cancel.clone(),
                     ai_enabled: ui.ai.enabled,
                     error_modal_open,
+                    alias_rename: ui.overlay.alias_rename,
                     schema_visible,
                     right_panel,
                     ai_send: ai_send.clone(),

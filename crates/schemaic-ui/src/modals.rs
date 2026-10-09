@@ -106,13 +106,30 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
             let grant_open = ui.ddl.grant;
             let dump_open = ui.dump.target;
             let script_open = ui.script.target;
+            let snippet_open = ui.overlay.snippet_edit;
+            let alias_open = ui.overlay.alias_rename;
             stack((
-                crate::snippet_edit::snippet_edit_overlay(
-                    ui.overlay,
-                    ui.snippets,
-                    ui.snippet_actions.clone(),
-                    ui.conn.dialect,
-                ),
+                // The snippet editor and *Rename alias* share one tuple
+                // element (this stack is at Floem's 16-arity limit): both are
+                // small dialogs about the editor's text, and only one is ever
+                // up. The style fills the layer while either is, as the
+                // Export/script element below explains.
+                stack((
+                    crate::snippet_edit::snippet_edit_overlay(
+                        ui.overlay,
+                        ui.snippets,
+                        ui.snippet_actions.clone(),
+                        ui.conn.dialect,
+                    ),
+                    crate::alias_rename::alias_rename_overlay(alias_open),
+                ))
+                .style(move |s| {
+                    if snippet_open.get().is_some() || alias_open.with(Option::is_some) {
+                        s.absolute().inset(0.0)
+                    } else {
+                        s
+                    }
+                }),
                 import_view::import_overlay(import_view::ImportCtx::new(
                     ui.import,
                     ui.conn,
@@ -427,6 +444,7 @@ fn ddl_modals_up(
     let dump_open = dump.target;
     let script_open = script.target;
     let snippet_edit = overlay.snippet_edit;
+    let alias_rename = overlay.alias_rename;
     let editors = ddl_editors_up(ddl);
     move || {
         // **The shared error modal is deliberately not here.** It is its own
@@ -457,6 +475,9 @@ fn ddl_modals_up(
             // rendered nothing at all, because the wrapper's `inset(0)` resolved
             // against a box this predicate was keeping at zero by zero.
             || snippet_edit.get().is_some()
+            // *Rename alias* shares the snippet editor's tuple element, so it
+            // is painted in this group too.
+            || alias_rename.with(Option::is_some)
             || editors()
     }
 }
@@ -634,6 +655,9 @@ mod modal_backdrop_gate {
     /// more often than not. The floor below is what stops a rename making it pass by
     /// finding nothing.
     const PAINTS_A_BACKDROP: &[&str] = &[
+        // In the layer's DDL group, sharing `snippet_edit.rs`'s tuple element,
+        // raised by `ddl_modals_up`'s `alias_rename` arm.
+        "alias_rename.rs",
         // In the layer's workspace group, beside `properties.rs`, raised by
         // `workspace_modals_up`'s `blob_open.get().is_some()` arm.
         "blob_view.rs",

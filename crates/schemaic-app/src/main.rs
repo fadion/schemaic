@@ -2620,6 +2620,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // Which snippet the snippet editor is open on — the modal itself lives in
     // `schemaic-ui`; this is only the signal that raises it.
     let snippet_edit_open: RwSignal<Option<u64>> = RwSignal::new(None);
+    // The SQL editor's *Rename alias* dialog, raised from its context menu.
+    let alias_rename_open: RwSignal<Option<schemaic_ui::AliasRenameRequest>> = RwSignal::new(None);
 
     // Query-plan (EXPLAIN) modal signals.
     let plan_open = RwSignal::new(false);
@@ -12550,6 +12552,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             users_generation,
             run_guard,
             snippet_edit: snippet_edit_open,
+            alias_rename: alias_rename_open,
         },
         schema: SchemaUi {
             db_nodes,
