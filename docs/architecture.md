@@ -753,8 +753,12 @@ existing prose was left alone.
     keeps the full walk, which is what every other caller wants. **Cut short was not short enough,
     and the per-move callers now ask a `StatementIndex` instead** (below): with the caret mid-file
     the walk to it still measured 6.3 / 25 / 104 ms at 1 / 4 / 16 MiB (release, a realistic
-    script), and the run outline paid it a second time on the same move. `until` stays for the
-    walks that remain — Ctrl+Enter, the menu actions — one call per press.
+    script), and the run outline paid it a second time on the same move. The inline prediction was
+    the last per-keystroke caller left on the walk: its gate ran it twice and `Recall::at` once more,
+    so a space typed at a line's end in a 4 MB MySQL script cost about 100 ms (33 ms a walk,
+    release) before any producer ran; through the index the three measure under 4 µs together
+    (`predict_indexed`, under `intel.rs`). `until` stays for the walks that remain — Ctrl+Enter,
+    the menu actions — one call per press.
     **`StatementIndex` is one revision of a buffer's boundaries, and what a caret move asks.**
     `new` is one full walk (`scan_bounds_with`, soft `;`s collected), keeping the walk's bounds
     closed by the document's end, where a `DELIMITER` directive changes the terminator in force
@@ -2900,7 +2904,15 @@ existing prose was left alone.
     producer still predicts correctly but leaves `may_predict_at` passing where nothing could be
     offered, and one moved the other way that needs the catalogue cannot be asked without it
     (`the_gate_refuses_only_where_nothing_could_be_predicted`, which also asks that the gate pass
-    wherever `predict` answers). `predict_tests` covers
+    wherever `predict` answers). **The gate finds the caret's statement in one place,
+    `caret_statement`**, which `Recall::at` asks too: off a `sql::StatementIndex` of the text where
+    the caller passes one — `predict_indexed`, `may_predict_indexed`, `Recall::at_indexed`, the
+    forms the editor calls — and by the walk from the document's start (`sql::statement_range_ended`)
+    otherwise, or where the index's `text_len` is not the text's. That walk is a document's lex per
+    call, which the plain forms keep for tests and one-off callers;
+    `the_indexed_prediction_answers_what_the_walk_does` holds the two forms equal at every caret of
+    a corpus on every engine, with an index built whole and one carried across an edit.
+    `predict_tests` covers
     each producer and gate, `an_auto_paired_closer_after_the_caret_still_predicts` the `)` one.
     **`predict_from_history` is the ghost remembered rather than reasoned**, asked only when
     `predict` has nothing, under the same *Inline predictions* switch and a second of its own,
@@ -24289,10 +24301,12 @@ existing prose was left alone.
     `base_len` less its end the back) **before** it sets `query`, so anything `query` sets off
     already sees the new revision. It used to keep a copy of the text beside the index and compare
     it with `==` on every call, which was a document's copy per keystroke and a document's compare
-    per caret move. Three readers ask it — `update_signature_help` per caret move (it was
+    per caret move. Four readers ask it — `update_signature_help` per caret move (it was
     `sql::statement_range`, a walk to the caret), `recompute_completions` per keystroke
-    (`writing_range`), and the run outline's effect in `editor_pane.rs` — so the walk each made
-    becomes a search, and a keystroke rescans about its own statement (the costs under `sql.rs`).
+    (`writing_range`), `prediction_at` per keystroke at a lone caret (the gate, `predict` and
+    `Recall` through their `_indexed` forms, and the own tab's ranges for `Recall::from_ranges`),
+    and the run outline's effect in `editor_pane.rs` — so the walk each made becomes a search, and
+    a keystroke rescans about its own statement (the costs under `sql.rs`).
     **`index::build` had no test of its own**, which is the other thing to know about it: it is a
     pure function over a slice — no signal, no `Editor`, nothing that needs a mounted view — while
     the hidden-database rule it enforces was pinned only for the *catalogue* half (`catalog_tests`),
@@ -24338,12 +24352,13 @@ existing prose was left alone.
     one-shot can return**. `suppress` is set by an accept, and the next prediction is wanted
     straight after one: Tab on a `BY ` ghost leaves `GROUP BY `, whose grouping columns are the next
     thing to offer, so a ghost asked after the one-shot would break that chain at its second link.
-    **The offer catalogue is built only where `intel::may_predict_at` passes** (under `intel.rs`):
+    **The offer catalogue is built only where the gate passes** (`intel::may_predict_indexed`, the
+    caret's statement read off the pane's index — under `intel.rs`):
     building it is the costly half of a keystroke's prediction, and most carets — mid-word, in a
     string — are ones `predict` would refuse before reading it. The gate decides the reasoned ghost
     alone; `recall` is asked whenever that is `None`, the gate's refusal included, and runs its own.
-    **Where `predict` has nothing, `prediction_at` asks `recall`**, which runs `intel::Recall::at`
-    once and asks `Recall::from` of three sources in the order they are trusted, the first to answer
+    **Where `predict` has nothing, `prediction_at` asks `recall`**, which runs
+    `intel::Recall::at_indexed` once and asks `Recall::from` of three sources in the order they are trusted, the first to answer
     winning — an order `runs_come_before_snippets_and_snippets_before_tabs` pins through the real
     `recall` (red with runs and snippets swapped). **First the runs `recallable` keeps, newest first**: this connection's
     (`HistoryEntry::conn_id == ctx.conn_id`), leaving out `Outcome::Failed` ones — a statement the

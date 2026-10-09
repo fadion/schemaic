@@ -15916,13 +15916,40 @@ fn is_real_statement(stmt: &sqlparser::ast::Statement) -> bool {
 /// ([`opens_a_clause_or_statement`]), the prediction may not hold it, and it
 /// must be a clause that may come first ([`may_precede`]) — unless the caret
 /// is in a closed paren, whose contents end at its `)`.
+///
+/// This finds the caret's statement by walking `sql` from its start; an
+/// editor that keeps a [`crate::sql::StatementIndex`] asks
+/// [`predict_indexed`] instead, which answers the same without the walk.
 pub fn predict(sql: &str, caret: usize, catalog: &Catalog, dialect: SqlDialect) -> Option<String> {
+    predict_with(sql, caret, catalog, dialect, None)
+}
+
+/// [`predict`], the caret's statement read off `index` — the editor's index
+/// of `sql` — rather than walked to from the document's start. An index of
+/// some other text (its length differs) is not trusted, and the walk is made.
+pub fn predict_indexed(
+    sql: &str,
+    caret: usize,
+    catalog: &Catalog,
+    dialect: SqlDialect,
+    index: &crate::sql::StatementIndex,
+) -> Option<String> {
+    predict_with(sql, caret, catalog, dialect, Some(index))
+}
+
+fn predict_with(
+    sql: &str,
+    caret: usize,
+    catalog: &Catalog,
+    dialect: SqlDialect,
+    index: Option<&crate::sql::StatementIndex>,
+) -> Option<String> {
     let PredictGate {
         lo,
         hi,
         mid_line,
         closed,
-    } = predict_gate(sql, caret, dialect)?;
+    } = predict_gate(sql, caret, dialect, index)?;
     let toks = tokenize_range(sql, lo, caret, dialect);
     let guess = on_condition_guess(sql, (lo, hi, caret), catalog, dialect)
         .or_else(|| insert_columns(&toks, catalog, dialect, closed))
@@ -15944,7 +15971,34 @@ pub fn predict(sql: &str, caret: usize, catalog: &Catalog, dialect: SqlDialect) 
 /// which is the costly half of a keystroke's prediction. `false` means
 /// `predict` answers `None` whatever the catalog.
 pub fn may_predict_at(sql: &str, caret: usize, dialect: SqlDialect) -> bool {
-    predict_gate(sql, caret, dialect).is_some()
+    predict_gate(sql, caret, dialect, None).is_some()
+}
+
+/// [`may_predict_at`], the caret's statement read off `index`, as
+/// [`predict_indexed`] reads it.
+pub fn may_predict_indexed(
+    sql: &str,
+    caret: usize,
+    dialect: SqlDialect,
+    index: &crate::sql::StatementIndex,
+) -> bool {
+    predict_gate(sql, caret, dialect, Some(index)).is_some()
+}
+
+/// The caret's statement and whether it has ended
+/// ([`crate::sql::statement_range_ended`]) — off `index` where it is one of
+/// `sql`, else walked to. The one place the prediction and recall gates find
+/// it, so neither walks the document when the editor holds its index.
+fn caret_statement(
+    sql: &str,
+    caret: usize,
+    dialect: SqlDialect,
+    index: Option<&crate::sql::StatementIndex>,
+) -> ((usize, usize), bool) {
+    match index {
+        Some(ix) if ix.text_len() == sql.len() => ix.statement_range_ended(sql, caret),
+        _ => crate::sql::statement_range_ended(sql, caret, dialect),
+    }
 }
 
 /// What [`predict`]'s gate found: the caret's statement `lo..hi`, whether the
@@ -15958,7 +16012,12 @@ struct PredictGate {
 }
 
 /// [`may_predict_at`]'s answer, with what it read for [`predict`] to use.
-fn predict_gate(sql: &str, caret: usize, dialect: SqlDialect) -> Option<PredictGate> {
+fn predict_gate(
+    sql: &str,
+    caret: usize,
+    dialect: SqlDialect,
+    index: Option<&crate::sql::StatementIndex>,
+) -> Option<PredictGate> {
     if caret > sql.len() || !sql.is_char_boundary(caret) {
         return None;
     }
@@ -15989,7 +16048,7 @@ fn predict_gate(sql: &str, caret: usize, dialect: SqlDialect) -> Option<PredictG
     }
     // Past a finished statement there is nothing to continue: the range is the
     // statement *before* the caret, and its next word would land after its `;`.
-    let ((lo, hi), ended) = crate::sql::statement_range_ended(sql, caret, dialect);
+    let ((lo, hi), ended) = caret_statement(sql, caret, dialect, index);
     if ended || lo > caret || caret_touches_noncode(sql, lo, caret, dialect) {
         return None;
     }
@@ -16210,6 +16269,7 @@ pub fn predict_from_history<'a>(
 /// [`predict_from_history`] in two steps, for a caller whose texts are not all
 /// at hand at once — each behind its own signal, say: [`Recall::at`] runs the
 /// caret's gate once, and [`Recall::from`] asks it of one text at a time.
+#[derive(Debug, PartialEq)]
 pub struct Recall {
     /// The statement typed so far, its line endings made `\n`.
     typed: String,
@@ -16229,6 +16289,26 @@ impl Recall {
     /// The statement typed up to `caret`, when the gate
     /// [`predict_from_history`] describes lets it be remembered from.
     pub fn at(sql: &str, caret: usize, dialect: SqlDialect) -> Option<Recall> {
+        Recall::at_with(sql, caret, dialect, None)
+    }
+
+    /// [`Recall::at`], the caret's statement read off `index` — the editor's
+    /// index of `sql` — as [`predict_indexed`] reads it.
+    pub fn at_indexed(
+        sql: &str,
+        caret: usize,
+        dialect: SqlDialect,
+        index: &crate::sql::StatementIndex,
+    ) -> Option<Recall> {
+        Recall::at_with(sql, caret, dialect, Some(index))
+    }
+
+    fn at_with(
+        sql: &str,
+        caret: usize,
+        dialect: SqlDialect,
+        index: Option<&crate::sql::StatementIndex>,
+    ) -> Option<Recall> {
         if caret > sql.len() || !sql.is_char_boundary(caret) {
             return None;
         }
@@ -16237,7 +16317,7 @@ impl Recall {
             return None;
         }
         // Past a finished statement, as `predict` refuses it.
-        let ((lo, hi), ended) = crate::sql::statement_range_ended(sql, caret, dialect);
+        let ((lo, hi), ended) = caret_statement(sql, caret, dialect, index);
         if ended || lo > caret || caret_touches_noncode(sql, lo, caret, dialect) {
             return None;
         }
@@ -19716,6 +19796,74 @@ mod predict_tests {
             let text = sql.replacen('|', "", 1);
             assert!(predict(&text, caret, &cat, my).is_some(), "{sql}");
             assert!(may_predict_at(&text, caret, my), "{sql}");
+        }
+    }
+
+    /// **The editor's index answers what the walk does**: at every caret of
+    /// a corpus of documents on every engine — several statements, a
+    /// `DELIMITER`, a `GO`, a dollar-quoted body, strings and comments, a
+    /// tail no terminator ends — [`predict_indexed`], [`may_predict_indexed`]
+    /// and [`Recall::at_indexed`] answer as [`predict`], [`may_predict_at`]
+    /// and [`Recall::at`] do, with the index built whole and with one carried
+    /// across an edit, as the pane carries it. An index of another text is
+    /// not trusted.
+    #[test]
+    fn the_indexed_prediction_answers_what_the_walk_does() {
+        use crate::sql::StatementIndex;
+        let cat = Catalog::build(&[("shop", &keyed())], Some("shop"));
+        let corpus: &[(SqlDialect, &str)] = &[
+            (
+                SqlDialect::MySql,
+                "SELECT * FROM orders ORDER \nLIMIT 1;\nSELECT 'a;b' -- c;\nFROM orders o JOIN \
+                 customers c ON ;\nDELIMITER //\nCREATE PROCEDURE p() BEGIN SELECT 1; END //\n\
+                 DELIMITER ;\nINSERT INTO orders (\n)\n\nSELECT * FROM orders GROUP \n\nDELETE \
+                 FROM orders /* x; */ WHERE ",
+            ),
+            (
+                SqlDialect::Postgres,
+                "SELECT * FROM orders o LEFT \n;\nCREATE FUNCTION f() RETURNS int AS $$ SELECT 1; \
+                 $$ LANGUAGE sql;\nSELECT customer_id, COUNT(*) FROM orders GROUP BY \n\nSELECT \
+                 \"a;b\" FROM orders WHERE x IS DISTINCT ",
+            ),
+            (
+                SqlDialect::MsSql,
+                "SELECT TOP 1 * FROM orders ORDER \nGO\nSELECT [a;b] FROM orders o JOIN \r\nGO\n\
+                 BEGIN TRAN; UPDATE orders SET total = 1 WHERE ; COMMIT;\nSELECT * FROM t \
+                 OFFSET 10 ",
+            ),
+            (
+                SqlDialect::Sqlite,
+                "SELECT * FROM orders ORDER ;\nCREATE TRIGGER tr AFTER INSERT ON orders BEGIN \
+                 SELECT 1; END;\nSELECT * FROM invoices JOIN \n\nSELECT 1 FROM t WHERE a BETWEEN \
+                 1 ",
+            ),
+        ];
+        for &(d, doc) in corpus {
+            let whole = StatementIndex::new(doc, d);
+            // The same text reached through an edit: its first statement typed
+            // over, as the pane's index follows a keystroke.
+            let before = doc.replacen("SELECT", "SELEC", 1);
+            let carried = StatementIndex::new(&before, d).after(&before, doc);
+            let other = StatementIndex::new("SELECT 1;", d);
+            for caret in (0..=doc.len()).filter(|&c| doc.is_char_boundary(c)) {
+                for idx in [&whole, &carried, &other] {
+                    assert_eq!(
+                        may_predict_indexed(doc, caret, d, idx),
+                        may_predict_at(doc, caret, d),
+                        "{d:?} gate at {caret} of {doc:?}"
+                    );
+                    assert_eq!(
+                        predict_indexed(doc, caret, &cat, d, idx),
+                        predict(doc, caret, &cat, d),
+                        "{d:?} prediction at {caret} of {doc:?}"
+                    );
+                    assert_eq!(
+                        Recall::at_indexed(doc, caret, d, idx),
+                        Recall::at(doc, caret, d),
+                        "{d:?} recall at {caret} of {doc:?}"
+                    );
+                }
+            }
         }
     }
 

@@ -902,17 +902,36 @@ fn prediction_at(
         return None;
     }
     // The catalog only where a ghost could go: building it is the costly half
-    // of a keystroke's prediction, and most carets are mid-word.
-    let reasoned = intel::may_predict_at(text, offset, ctx.dialect)
+    // of a keystroke's prediction, and most carets are mid-word. The caret's
+    // statement is read off the pane's index of `text`, not walked to from the
+    // document's start — on each of the gate, the prediction and the recall.
+    let index = own.map(|(_, idx)| idx);
+    let reasoned = may_predict(text, offset, ctx.dialect, index)
         .then(|| {
             let catalog = ctx
                 .hidden_dbs
                 .with_untracked(|h| build_offer_catalog(ctx.db_nodes, h, ctx.active_db));
-            intel::predict(text, offset, &catalog, ctx.dialect)
+            match index {
+                Some(idx) => intel::predict_indexed(text, offset, &catalog, ctx.dialect, idx),
+                None => intel::predict(text, offset, &catalog, ctx.dialect),
+            }
         })
         .flatten();
     let (guess, remembered) = pick_prediction(reasoned, || recall(text, offset, ctx, own))?;
     Some(ghost_at(ed, offset, guess, false, remembered))
+}
+
+/// [`intel::may_predict_at`], off `index` where the pane holds one.
+fn may_predict(
+    text: &str,
+    offset: usize,
+    dialect: SqlDialect,
+    index: Option<&StatementIndex>,
+) -> bool {
+    match index {
+        Some(idx) => intel::may_predict_indexed(text, offset, dialect, idx),
+        None => intel::may_predict_at(text, offset, dialect),
+    }
 }
 
 /// The tab the caret is in, for [`recall`]: its text's signal, and the
@@ -940,7 +959,10 @@ fn recall(
     if !ctx.remembered {
         return None;
     }
-    let r = intel::Recall::at(text, offset, ctx.dialect)?;
+    let r = match own {
+        Some((_, idx)) => intel::Recall::at_indexed(text, offset, ctx.dialect, idx),
+        None => intel::Recall::at(text, offset, ctx.dialect),
+    }?;
     ctx.history
         .with_untracked(|entries| {
             entries
