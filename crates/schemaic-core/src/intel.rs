@@ -18331,7 +18331,11 @@ fn aggregates_rows(f: &sqlparser::ast::Function) -> bool {
 /// **An item that reads no column is left out**, along with one holding a
 /// subquery: it groups nothing, and the engines refuse it — PostgreSQL a
 /// non-integer constant (`GROUP BY 'x'`), SQL Server any expression without a
-/// column, and a subquery there too.
+/// column, and a subquery there too. A variable (`@region`) is no column.
+///
+/// **A column an aggregate or window item reads outside an aggregate's
+/// arguments** (`total * count(*)`, `sum(total) OVER ()`) must be grouped too;
+/// when the projection's keys do not cover it, nothing is predicted.
 fn group_by_items(sql: &str, lo: usize, toks: &[Token], dialect: SqlDialect) -> Option<String> {
     use sqlparser::ast::{Expr, SelectItem, SetExpr, Statement, visit_expressions};
     use std::ops::ControlFlow;
@@ -18362,33 +18366,75 @@ fn group_by_items(sql: &str, lo: usize, toks: &[Token], dialect: SqlDialect) -> 
     let SetExpr::Select(sel) = body else {
         return None;
     };
-    // A grouping key reads a column and holds no aggregate, window or subquery.
-    let is_key = |e: &Expr| {
-        let mut reads_column = false;
-        let refused = visit_expressions(e, |x| match x {
-            Expr::Function(f) if aggregates_rows(f) => ControlFlow::Break(()),
-            Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => {
-                ControlFlow::Break(())
-            }
-            Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
-                reads_column = true;
-                ControlFlow::Continue(())
-            }
-            _ => ControlFlow::Continue(()),
-        })
-        .is_break();
-        !refused && reads_column
+    // A column reference, as written — a variable (T-SQL's `@region`, MySQL's
+    // `@x`) is one value for every row, and no column.
+    let column_of = |x: &Expr| -> Option<String> {
+        let first = match x {
+            Expr::Identifier(i) => i,
+            Expr::CompoundIdentifier(parts) => parts.first()?,
+            _ => return None,
+        };
+        (!first.value.starts_with('@')).then(|| x.to_string())
     };
+    // What an item reads of the grouped rows: the columns it reads *outside*
+    // a plain aggregate's arguments (a window's arguments, `PARTITION BY` and
+    // `ORDER BY` run over the grouped rows, so those count), whether it
+    // aggregates or windows at all, and whether it holds a subquery.
+    let reads = |e: &Expr| {
+        let mut outside = Vec::new();
+        let mut summarised = Vec::new();
+        let mut aggregates = false;
+        let mut subquery = false;
+        let _ = visit_expressions(e, |x| {
+            match x {
+                Expr::Function(f) if aggregates_rows(f) => {
+                    aggregates = true;
+                    if f.over.is_none() {
+                        let _ = visit_expressions(x, |y| {
+                            summarised.extend(column_of(y));
+                            ControlFlow::<()>::Continue(())
+                        });
+                    }
+                }
+                Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => {
+                    subquery = true;
+                }
+                _ => outside.extend(column_of(x)),
+            }
+            ControlFlow::<()>::Continue(())
+        });
+        for s in &summarised {
+            if let Some(i) = outside.iter().position(|c| c.eq_ignore_ascii_case(s)) {
+                outside.remove(i);
+            }
+        }
+        (outside, aggregates, subquery)
+    };
+    // A grouping key reads a column and holds no aggregate, window or
+    // subquery. A column an aggregate or window item reads outside an
+    // aggregate must be grouped as well.
     let mut keys = Vec::new();
+    let mut must_group = Vec::new();
     for item in &sel.projection {
         let e = match item {
             SelectItem::UnnamedExpr(e) => e,
             SelectItem::ExprWithAlias { expr, .. } => expr,
             _ => return None,
         };
-        if is_key(e) {
-            keys.push(e.to_string());
+        match reads(e) {
+            (_, _, true) => {}
+            (outside, true, _) => must_group.extend(outside),
+            (outside, false, _) if !outside.is_empty() => keys.push(e.to_string()),
+            _ => {}
         }
+    }
+    // One the keys do not already cover leaves no list the server accepts —
+    // and grouping by it silently would change what the query counts.
+    if !must_group
+        .iter()
+        .all(|c| keys.iter().any(|k| k.eq_ignore_ascii_case(c)))
+    {
+        return None;
     }
     (!keys.is_empty()).then(|| keys.join(", "))
 }
@@ -19325,6 +19371,51 @@ mod predict_tests {
         assert_eq!(my("SELECT customer_id FROM orders GROUP BY total, "), None);
     }
 
+    /// A column read beside an aggregate (`total * count(*)`) or inside a
+    /// window (`sum(total) OVER ()`, which runs over the grouped rows) must be
+    /// grouped too, and the projection's own keys may not cover it: with one
+    /// they do not, there is no list to predict the server accepts
+    /// (S8.5-L1-06 — PostgreSQL refuses both below).
+    #[test]
+    fn group_by_predicts_nothing_beside_an_ungrouped_aggregated_read() {
+        for dialect in [SqlDialect::Postgres, SqlDialect::MySql] {
+            assert_eq!(
+                at_end(
+                    "SELECT customer_id, total * count(*) FROM orders GROUP BY ",
+                    dialect
+                ),
+                None
+            );
+            assert_eq!(
+                at_end(
+                    "SELECT customer_id, sum(total) OVER () FROM orders GROUP BY ",
+                    dialect
+                ),
+                None
+            );
+            assert_eq!(
+                at_end(
+                    "SELECT customer_id, count(*) OVER (PARTITION BY total) FROM orders GROUP BY ",
+                    dialect
+                ),
+                None
+            );
+        }
+        // Read inside the aggregate, or already a key: still listed.
+        assert_eq!(
+            my("SELECT customer_id, sum(total) * 2 FROM orders GROUP BY ").as_deref(),
+            Some("customer_id")
+        );
+        assert_eq!(
+            my("SELECT customer_id, customer_id * count(*) FROM orders GROUP BY ").as_deref(),
+            Some("customer_id")
+        );
+        assert_eq!(
+            my("SELECT customer_id, sum(sum(total)) OVER () FROM orders GROUP BY ").as_deref(),
+            Some("customer_id")
+        );
+    }
+
     /// An item that reads no column of the row groups nothing, and grouping by
     /// one is refused: PostgreSQL rejects `GROUP BY 'x'` as a non-integer
     /// constant, SQL Server any expression without a column, and a subquery as
@@ -19348,6 +19439,27 @@ mod predict_tests {
             Some("customer_id")
         );
         assert_eq!(my("SELECT 1, count(*) FROM orders GROUP BY "), None);
+        // A variable is no column either: SQL Server refuses `GROUP BY @region`
+        // (Msg 164), and MySQL's `@x` is one value for every row (S8.5-L1-05).
+        for dialect in [SqlDialect::MsSql, SqlDialect::MySql] {
+            assert_eq!(
+                at_end(
+                    "SELECT @region AS region, customer_id, count(*) FROM orders GROUP BY ",
+                    dialect
+                )
+                .as_deref(),
+                Some("customer_id"),
+                "{dialect:?}"
+            );
+        }
+        assert_eq!(
+            at_end(
+                "SELECT @region + customer_id, count(*) FROM orders GROUP BY ",
+                SqlDialect::MsSql
+            )
+            .as_deref(),
+            Some("@region + customer_id")
+        );
     }
 
     /// An aggregate is known by its shape as well as its name: only an

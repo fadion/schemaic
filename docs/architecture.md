@@ -2480,7 +2480,14 @@ existing prose was left alone.
     only if it reads a column** and holds no aggregate, window or subquery: a constant or a
     column-less expression groups nothing, and the engines refuse it — PostgreSQL a non-integer
     constant (`GROUP BY 'x'`), SQL Server any expression without a column, and a subquery there too
-    (`group_by_leaves_out_constants_and_subqueries`). `aggregates_rows` knows an aggregate by its
+    (`group_by_leaves_out_constants_and_subqueries`). A variable is no column: T-SQL's `@region`
+    reaches the AST as an identifier, and SQL Server refuses `GROUP BY @region` (Msg 164), so a
+    name beginning `@` does not count as a read. **An aggregate or window item is no key, but what
+    it reads outside a plain aggregate's arguments still has to be grouped** — `total * count(*)`,
+    or `sum(total) OVER ()`, whose window runs over the grouped rows — and when the projection's
+    own keys do not already cover such a column nothing is predicted, rather than a list
+    PostgreSQL (and MySQL under `ONLY_FULL_GROUP_BY`) refuses
+    (`group_by_predicts_nothing_beside_an_ungrouped_aggregated_read`). `aggregates_rows` knows an aggregate by its
     shape before its name — `OVER`, `FILTER (…)`, `WITHIN GROUP (…)`, a `DISTINCT` argument or an
     `ORDER BY` among the arguments, which only an aggregate or a window takes, so a user-defined
     aggregate written any of those ways needs no list — and only then by `GROUP_AGGREGATES`, on the
