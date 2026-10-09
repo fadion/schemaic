@@ -211,7 +211,8 @@ pub fn move_line(text: &str, sel_start: usize, sel_end: usize, up: bool) -> Opti
 /// case lower-case it — so presses alternate between the two cases, though
 /// mixed case does not come back (`Name` → `NAME` → `name`). A selection stays
 /// selected over its new extent (a character can change length: `ß` → `SS`);
-/// a bare caret stays where it was. `None` when there is nothing to change.
+/// a bare caret stays after the same characters, which may have moved it (`İ`
+/// → `i̇` is a byte longer). `None` when there is nothing to change.
 pub fn toggle_case(full: &str, sel_a: usize, sel_b: usize) -> Option<IndentEdit> {
     let b = full.as_bytes();
     let lo = sel_a.min(sel_b).min(full.len());
@@ -230,16 +231,26 @@ pub fn toggle_case(full: &str, sel_a: usize, sel_b: usize) -> Option<IndentEdit>
         (lo, hi)
     };
     let old = full.get(start..end)?;
-    let text = if old.chars().any(char::is_lowercase) {
-        old.to_uppercase()
-    } else {
-        old.to_lowercase()
+    let upper = old.chars().any(char::is_lowercase);
+    let recase = |s: &str| {
+        if upper {
+            s.to_uppercase()
+        } else {
+            s.to_lowercase()
+        }
     };
+    let text = recase(old);
     if text == old {
         return None;
     }
     let sel = if lo == hi {
-        let at = lo.min(start + text.len());
+        // The characters before the caret can change byte length (`İ` → `i̇`
+        // grows, `ı` → `I` shrinks), so the caret's old offset may now fall
+        // inside a character: re-case just that prefix and stand after it.
+        // A case mapping is per character, so the prefix's length is the
+        // length of the same prefix of `text`.
+        let before = &old[..floor_char(old, lo - start)];
+        let at = start + recase(before).len();
         (at, at)
     } else {
         (start, start + text.len())
@@ -2196,6 +2207,29 @@ mod tests {
         // At a word's end, that word.
         let e = toggle_case(src, 6, 6).unwrap();
         assert_eq!(applied(src, &e), "select| user_id FROM t");
+    }
+
+    /// The caret follows the characters before it when the case change
+    /// alters their byte length — `İ` lower-cases to `i` + U+0307 (2 → 3
+    /// bytes), `ı` upper-cases to `I` (2 → 1) — so it never lands inside a
+    /// character, where the next keystroke panicked the rope.
+    #[test]
+    fn toggle_case_keeps_a_bare_caret_on_a_character_boundary() {
+        let e = toggle_case("İZMİR", 2, 2).unwrap();
+        assert_eq!(e.text, "i\u{307}zmi\u{307}r");
+        assert_eq!(e.sel, (3, 3), "just after the i̇");
+        assert!(e.text.is_char_boundary(e.sel.0 - e.start));
+
+        let e = toggle_case("ışık", 2, 2).unwrap();
+        assert_eq!(e.text, "IŞIK");
+        assert_eq!(e.sel, (1, 1), "just after the I");
+
+        // Inside a longer text, measured from the word's start.
+        let src = "SELECT 'İZMİR'";
+        let e = toggle_case(src, 10, 10).unwrap();
+        assert_eq!(e.sel, (11, 11));
+        let out = format!("{}{}{}", &src[..e.start], e.text, &src[e.end..]);
+        assert!(out.is_char_boundary(e.sel.0));
     }
 
     #[test]

@@ -12291,7 +12291,10 @@ existing prose was left alone.
     upper-cased unless it holds no lower-case letter, and then lower-cased. It toggles between the
     two cases rather than undoing: `Name` goes to `NAME` and then `name`, `ß` to `SS` and then `ss`
     — the length change being why a selection is re-selected over its *new* extent, while a bare
-    caret stays put. Nothing to change (no word at the caret, no letters) is `None`, so the pane
+    caret stays after the same characters: `İ` lower-cases to `i̇`, a byte longer, and `ı`
+    upper-cases to `I`, a byte shorter, so keeping the caret's old offset left it inside a
+    character and the next keystroke panicked the rope; the prefix before it is re-cased to find
+    where it now ends (`toggle_case_keeps_a_bare_caret_on_a_character_boundary`). Nothing to change (no word at the caret, no letters) is `None`, so the pane
     makes no edit and no undo step (`toggle_case_upper_cases_then_lower_cases_a_selection`,
     `toggle_case_with_nothing_to_change_is_none`). The pane applies it to one caret or selection
     only, through `edit_untyped`.
