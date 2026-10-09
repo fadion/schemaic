@@ -4539,6 +4539,20 @@ fn local_scope_start(sql: &str, lo: usize, caret: usize, dialect: SqlDialect) ->
     stack.last().map(|&at| at + 1).unwrap_or(lo)
 }
 
+/// Is `toks[i]` the `FROM` of an `IS [NOT] DISTINCT FROM` comparison — an
+/// operator's word, not the clause? `SELECT DISTINCT * FROM` is the clause:
+/// the tokenizer drops the `*`, but no `IS` stands before its `DISTINCT`.
+fn is_distinct_from(toks: &[Token], i: usize) -> bool {
+    let up = |k: usize| toks.get(k).and_then(bare_upper);
+    i >= 2
+        && up(i - 1).as_deref() == Some("DISTINCT")
+        && match up(i - 2).as_deref() {
+            Some("IS") => true,
+            Some("NOT") => i >= 3 && up(i - 3).as_deref() == Some("IS"),
+            _ => false,
+        }
+}
+
 /// Reduce the top-level token sequence before the caret into the current clause,
 /// how much of its operand slot is filled, and which clauses have already appeared.
 /// Returns `(kind, current_clause, operand_count, seen, select_has_content,
@@ -4592,6 +4606,9 @@ fn scan_clauses(
                     select_kw_end = toks[i].at + 6;
                     push_seen(&mut seen, Clause::Select);
                 }
+                // `IS [NOT] DISTINCT FROM` is an operator, not the clause: read
+                // as one, `ON a.x IS DISTINCT FROM LEFT ` was a join position.
+                "FROM" if is_distinct_from(toks, i) => {}
                 "FROM" => {
                     cur = Clause::From;
                     operand = 0;
@@ -17084,6 +17101,12 @@ const OPERAND_PENDING: &[&str] = &[
     "REGEXP",
     "RLIKE",
     "INTERVAL",
+    "SIMILAR",
+    "GLOB",
+    "MATCH",
+    "OVERLAPS",
+    "SOUNDS",
+    "MEMBER",
     // `ORDER BY`, and T-SQL's `WHEN NOT MATCHED BY` still wanting its
     // `TARGET` or `SOURCE`.
     "BY",
@@ -17092,8 +17115,11 @@ const OPERAND_PENDING: &[&str] = &[
 /// Is `text` (the source from a construct's keyword to the caret, `toks` its
 /// tokens) one finished operand? Something is written, its parens are closed,
 /// and it does not end on an operator or on a word that wants another operand
-/// ([`OPERAND_PENDING`]; `AT TIME`, and MySQL's `INTERVAL 1` still wanting its
-/// unit). The word must be what the text *ends* on: a number or a string after
+/// ([`OPERAND_PENDING`]; `AT TIME`, `DISTINCT FROM`, `SIMILAR TO`, `MEMBER
+/// OF`, and MySQL's `INTERVAL 1` still wanting its unit — the second word of a
+/// pair only after its first, so `EXTRACT(year FROM` is untouched). An
+/// operator includes PostgreSQL's `@@`, `<@`, `@>` and `#`. The word must be
+/// what the text *ends* on: a number or a string after
 /// it is a token nobody kept, so `BETWEEN SYMMETRIC 1` ends on `SYMMETRIC`
 /// among the tokens and on `1` in the text.
 fn operand_finished(text: &str, toks: &[Token]) -> bool {
@@ -17101,7 +17127,7 @@ fn operand_finished(text: &str, toks: &[Token]) -> bool {
     let Some(last) = text.chars().next_back() else {
         return false;
     };
-    let ends_on_operator = "+-*/%|&^=<>,(!~:".contains(last);
+    let ends_on_operator = "+-*/%|&^=<>,(!~:@#".contains(last);
     let ends_on = |w: &str| {
         let cut = text.len().saturating_sub(w.len());
         text.is_char_boundary(cut)
@@ -17117,9 +17143,13 @@ fn operand_finished(text: &str, toks: &[Token]) -> bool {
     let pending = final_word
         .as_deref()
         .is_some_and(|w| OPERAND_PENDING.contains(&w) && ends_on(w))
-        || prev.as_deref() == Some("AT")
-            && final_word.as_deref() == Some("TIME")
-            && ends_on("TIME")
+        || matches!(
+            (prev.as_deref(), final_word.as_deref()),
+            (Some("AT"), Some("TIME"))
+                | (Some("DISTINCT"), Some("FROM"))
+                | (Some("SIMILAR"), Some("TO"))
+                | (Some("MEMBER"), Some("OF"))
+        ) && final_word.as_deref().is_some_and(ends_on)
         || final_word.as_deref() == Some("INTERVAL") && last.is_ascii_digit();
     !ends_on_operator && !pending && depth_after(toks) == Some(0)
 }
@@ -21595,6 +21625,62 @@ mod predict_tests {
         assert_eq!(
             my("SELECT * FROM t WHERE d BETWEEN now() - INTERVAL 1 DAY ").as_deref(),
             Some("AND ")
+        );
+    }
+
+    /// **The rest of the infix words wait for their operand too**
+    /// (S8.4-L1-03): `IS [NOT] DISTINCT FROM` — the very `FROM` the app ghosts
+    /// after `DISTINCT` — `SIMILAR TO`, `GLOB`, `MATCH`, `OVERLAPS`, `SOUNDS
+    /// LIKE`, `MEMBER OF`, and PostgreSQL's `@@`/`<@`/`@>`/`#` operators. So no
+    /// `THEN` after them, no `AND` in a `BETWEEN`, no `JOIN` after an `ON`'s.
+    #[test]
+    fn an_operand_waits_after_distinct_from_and_the_other_infix_words() {
+        for d in [
+            SqlDialect::MySql,
+            SqlDialect::Postgres,
+            SqlDialect::MsSql,
+            SqlDialect::Sqlite,
+        ] {
+            for tail in [
+                "a IS DISTINCT FROM ",
+                "a IS NOT DISTINCT FROM ",
+                "a SIMILAR TO ",
+                "a NOT SIMILAR TO ",
+                "name GLOB ",
+                "body MATCH ",
+                "p OVERLAPS ",
+                "a SOUNDS ",
+                "x MEMBER OF ",
+                "tsv @@ ",
+                "r <@ ",
+                "r @> ",
+                "a # ",
+            ] {
+                let sql = format!("SELECT CASE WHEN {tail}");
+                assert_eq!(at_end(&sql, d), None, "{d:?} {sql}");
+            }
+            assert_eq!(
+                at_end("SELECT * FROM t WHERE a BETWEEN x IS DISTINCT FROM ", d),
+                None,
+                "{d:?}"
+            );
+            assert_eq!(
+                at_end("SELECT CASE WHEN a IS DISTINCT FROM b ", d).as_deref(),
+                Some("THEN "),
+                "{d:?}"
+            );
+            assert_eq!(
+                at_end("SELECT CASE WHEN a SIMILAR TO 'x%' ", d).as_deref(),
+                Some("THEN "),
+                "{d:?}"
+            );
+        }
+        assert_eq!(
+            at_end(
+                "SELECT * FROM a JOIN b ON a.x IS DISTINCT FROM LEFT ",
+                SqlDialect::Postgres
+            ),
+            None
         );
     }
 

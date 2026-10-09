@@ -2859,7 +2859,16 @@ existing prose was left alone.
     `BETWEEN SYMMETRIC 1` ends on `SYMMETRIC` among the tokens and on `1` in the text, and is
     finished — the same reading that keeps `INTERVAL '1 day'` finished while `INTERVAL 1`, whose
     text ends in a digit after that last token, is not (`between_waits_for_a_whole_bound`,
-    `an_operand_waits_for_its_infix_words_and_its_unit`;
+    `an_operand_waits_for_its_infix_words_and_its_unit`). It still knew too few: `CASE WHEN a IS
+    DISTINCT ` ghosted `FROM `, and taking it ghosted `THEN ` straight after — `IS DISTINCT FROM
+    THEN` in two Tabs (S8.4-L1-03). `SIMILAR`, `GLOB`, `MATCH`, `OVERLAPS`, `SOUNDS` and `MEMBER`
+    joined the list; `DISTINCT FROM`, `SIMILAR TO` and `MEMBER OF` are pending as pairs, like `AT
+    TIME`, so a lone `FROM`, `TO` or `OF` (`EXTRACT(year FROM `) is not; and `@` and `#` joined the
+    operator characters for PostgreSQL's `@@`, `<@`, `@>` and `#` — not `?`, which ends a
+    placeholder as often as a `jsonb` operator. `scan_clauses` reads that `FROM` as the
+    operator's too (`is_distinct_from`, an `IS [NOT]` before the `DISTINCT`), or `ON a.x IS
+    DISTINCT FROM LEFT ` was a `FROM` clause and ghosted `JOIN`
+    (`an_operand_waits_after_distinct_from_and_the_other_infix_words`, red first;
     `a_finished_operand_predicts_the_word_its_construct_takes`, `a_star_projection_predicts_from`,
     `a_common_table_expressions_name_predicts_as`, `a_delete_target_predicts_where`,
     `a_privilege_object_predicts_its_grantee_word`).
