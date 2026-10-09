@@ -387,6 +387,51 @@ impl Agent {
     pub fn from_key(s: &str) -> Option<Agent> {
         Agent::ALL.into_iter().find(|a| a.key() == s)
     }
+
+    /// What picking `self` in the settings dropdown does to the pair an app
+    /// holds — `enabled`, and the `harness` held while on or off.
+    ///
+    /// The inverse of [`Agent::of`], and the one place it is decided: it used
+    /// to be a view effect and an app effect, with the bug between them that an
+    /// unknown key loads as off holding Claude, so picking *Claude Code* flipped
+    /// `enabled` and not `harness` — the app's harness-switch effect never saw
+    /// a pick, the unknown key stayed held, the save wrote it back and the next
+    /// launch started off again.
+    ///
+    /// - *Disabled* turns the assistant off and keeps the harness, so picking
+    ///   that same CLI again turns it back on at no cost.
+    /// - A CLI turns it on, and names the harness **only when it differs**: the
+    ///   app's harness-switch effect files the old harness's path and model on
+    ///   every set it sees, so a set of the harness already held re-files them.
+    /// - The unknown key the file named is dropped once the pick **changes
+    ///   anything** — the user has chosen, and the file should start naming
+    ///   what runs. Re-picking *Disabled* while it is held (it loads as off)
+    ///   changes nothing, so the key survives for a build that knows it.
+    pub fn apply(self, enabled: bool, harness: Harness) -> AgentPick {
+        let (now_enabled, now_harness) = match self {
+            Agent::Disabled => (false, harness),
+            Agent::Cli(h) => (true, h),
+        };
+        let switch = (now_harness != harness).then_some(now_harness);
+        AgentPick {
+            enabled: now_enabled,
+            harness: switch,
+            drop_unknown_key: now_enabled != enabled || switch.is_some(),
+        }
+    }
+}
+
+/// [`Agent::apply`]'s answer: the writes a dropdown pick makes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AgentPick {
+    /// Whether the assistant is on after the pick.
+    pub enabled: bool,
+    /// The harness to switch to, `None` to leave the held one alone — see
+    /// [`Agent::apply`] for why an unchanged harness is not set again.
+    pub harness: Option<Harness>,
+    /// Whether the unrecognised key a settings file named is to be dropped,
+    /// so the next save writes what runs.
+    pub drop_unknown_key: bool,
 }
 
 /// How well a harness's built-in tools are shut off for this session.
@@ -2500,6 +2545,95 @@ mod tests {
         assert_eq!(Agent::from_key("gemini"), None);
         assert_eq!(Agent::from_key(""), None);
         assert_eq!(Agent::from_key("Disabled"), None);
+    }
+
+    /// **From the unknown-key state** — a file naming a harness this build
+    /// does not know loads as off holding Claude. Picking the CLI held turns
+    /// the assistant on without setting the harness again, and drops the key:
+    /// the bug was that this pick changed `enabled` and not `harness`, so the
+    /// key survived and the next launch started off again.
+    #[test]
+    fn picking_the_held_cli_from_an_unknown_key_turns_on_and_drops_the_key() {
+        let pick = Agent::Cli(Harness::Claude).apply(false, Harness::Claude);
+        assert_eq!(
+            pick,
+            AgentPick {
+                enabled: true,
+                harness: None,
+                drop_unknown_key: true,
+            }
+        );
+    }
+
+    /// Another CLI from the same state: on, switched, key dropped.
+    #[test]
+    fn picking_another_cli_from_an_unknown_key_switches_and_drops_the_key() {
+        let pick = Agent::Cli(Harness::Codex).apply(false, Harness::Claude);
+        assert_eq!(
+            pick,
+            AgentPick {
+                enabled: true,
+                harness: Some(Harness::Codex),
+                drop_unknown_key: true,
+            }
+        );
+    }
+
+    /// *Disabled* from the same state changes nothing — it is what the
+    /// dropdown already shows — so the key survives for a build that knows it.
+    #[test]
+    fn picking_disabled_while_an_unknown_key_is_held_keeps_the_key() {
+        let pick = Agent::Disabled.apply(false, Harness::Claude);
+        assert_eq!(
+            pick,
+            AgentPick {
+                enabled: false,
+                harness: None,
+                drop_unknown_key: false,
+            }
+        );
+    }
+
+    /// Re-picking the CLI already running sets nothing: a set of the same
+    /// harness would have the app's switch effect re-file its path and model.
+    #[test]
+    fn picking_the_running_cli_again_changes_nothing() {
+        for h in Harness::ALL {
+            assert_eq!(
+                Agent::Cli(h).apply(true, h),
+                AgentPick {
+                    enabled: true,
+                    harness: None,
+                    drop_unknown_key: false,
+                },
+                "{h:?}"
+            );
+        }
+    }
+
+    /// Off keeps the harness held, so turning back on with it costs nothing.
+    /// (Turning off changes `enabled`, so it answers "drop" — moot, since an
+    /// unknown key loads as off and is gone by the time the assistant is on.)
+    #[test]
+    fn picking_disabled_while_on_keeps_the_harness() {
+        let pick = Agent::Disabled.apply(true, Harness::Cursor);
+        assert_eq!(
+            pick,
+            AgentPick {
+                enabled: false,
+                harness: None,
+                drop_unknown_key: true,
+            }
+        );
+        // `apply` and `of` are inverses on every pick.
+        for a in Agent::ALL {
+            for h in Harness::ALL {
+                for on in [false, true] {
+                    let p = a.apply(on, h);
+                    assert_eq!(Agent::of(p.enabled, p.harness.unwrap_or(h)), a, "{a:?}");
+                }
+            }
+        }
     }
 
     fn spec() -> TurnSpec {

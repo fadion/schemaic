@@ -844,6 +844,7 @@ pub(crate) fn ai_settings_overlay(ai: AiUi, conn: ConnUi, actions: Rc<AiActions>
     let open = ai.settings_open;
     let harness = ai.harness;
     let enabled = ai.enabled;
+    let unknown_key = ai.unknown_key;
     let cli_path = ai.cli_path;
     let model = ai.model;
     let effort = ai.effort;
@@ -894,26 +895,23 @@ pub(crate) fn ai_settings_overlay(ai: AiUi, conn: ConnUi, actions: Rc<AiActions>
             // `enabled`, and the `harness` an assistant that is on drives — so
             // everything below that takes a `Harness` goes on taking one. This
             // signal is the dropdown's view of the pair (`Agent::of`), written
-            // back on a pick. Picking a CLI while off turns the assistant on
-            // with that CLI; picking *Disabled* keeps the harness held, so
-            // turning it back on by picking the same one costs nothing.
+            // back on a pick. What a pick writes is `Agent::apply`'s answer,
+            // pure and tested in `schemaic-ai` — the decision used to live
+            // here and in an app effect, and the bug sat between the two.
             let agent = RwSignal::new(Agent::of(enabled.get_untracked(), harness.get_untracked()));
             floem::reactive::create_effect(move |prev: Option<()>| {
                 let picked = agent.get();
                 if prev.is_none() {
                     return;
                 }
-                match picked {
-                    Agent::Disabled => enabled.set(false),
-                    Agent::Cli(h) => {
-                        // Only a real change: the app's switch effect files the
-                        // old harness's path and model on every set it sees.
-                        if harness.get_untracked() != h {
-                            harness.set(h);
-                        }
-                        enabled.set(true);
-                    }
+                let pick = picked.apply(enabled.get_untracked(), harness.get_untracked());
+                if pick.drop_unknown_key {
+                    unknown_key.set(None);
                 }
+                if let Some(h) = pick.harness {
+                    harness.set(h);
+                }
+                enabled.set(pick.enabled);
             });
             // `Agent` is `Copy` and `Agent::label` is a plain
             // `fn(Agent) -> &'static str`, so it satisfies this widget's bounds

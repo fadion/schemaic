@@ -18874,14 +18874,17 @@ existing prose was left alone.
     the user's file carried was replaced by the next thing that touched the settings, and a build
     that later grew that harness had nothing to restore. The rule is
     `persist::ai_harness_to_persist(unknown, running)`: `main.rs` holds the raw key in
-    `ai_harness_unknown` and writes it back
-    until the user picks, at which point it is cleared and the file starts naming what runs — by the
-    harness-switch effect when the pick changes the harness, and by a second effect on
-    `ai_enabled` when it only turns the assistant on or off. **That second effect is not
-    redundant**: an unknown key loads off *holding Claude*, so picking *Claude Code* changes
-    `ai_enabled` and not `ai_harness`, and with only the first effect the save went on writing the
-    unknown key back and the next launch started off again. Picking *Disabled* while already off
-    changes neither, so the key is still kept. **The same load also clears `ai_model` and
+    `ai_harness_unknown` (the modal's `AiUi::unknown_key`) and writes it back
+    until the user picks, at which point it is cleared and the file starts naming what runs.
+    **Whether a pick clears it is `Agent::apply(enabled, harness)`'s answer**, the inverse of
+    `Agent::of` and pure in `schemaic-ai`: it drops the key when the pick changes `enabled` *or*
+    the harness. It used to be two effects, the harness-switch effect and a second one on
+    `ai_enabled`, and the bug sat between them: an unknown key loads off *holding Claude*, so
+    picking *Claude Code* changes `ai_enabled` and not `ai_harness`, and with only the first effect
+    the save went on writing the unknown key back and the next launch started off again
+    (`picking_the_held_cli_from_an_unknown_key_turns_on_and_drops_the_key`). Picking *Disabled*
+    while already off changes neither, so the key is still kept
+    (`picking_disabled_while_an_unknown_key_is_held_keeps_the_key`). **The same load also clears `ai_model` and
     `ai_cli_path`**, which were chosen for a CLI this build does not have: the switch effect clears
     those on a *switch* and a restore is not one, so an unknown harness paired with
     `opencode/claude-sonnet-5` started a Claude session with that model id and died on an unknown
@@ -20817,10 +20820,12 @@ existing prose was left alone.
     definitions free to drift, which is precisely what `AiModel::from_cli` was. `Agent` is `Copy`
     and `label` is a plain `fn(Agent) -> &'static str`, so it meets the widget's bounds with no
     wrapper. `agent` is a modal-local `RwSignal<Agent>` seeded from `Agent::of(enabled, harness)`
-    and written back on a pick: *Disabled* sets `AiUi::enabled` false and keeps the harness, so
-    turning the assistant back on by picking the same CLI costs nothing; a CLI sets the harness
-    **only if it differs** — the app's switch effect files the old harness's path and model on every
-    set it sees — and then sets `enabled`.
+    and written back on a pick through `Agent::apply`, whose `AgentPick` the effect only performs:
+    *Disabled* sets `AiUi::enabled` false and keeps the harness, so turning the assistant back on by
+    picking the same CLI costs nothing; a CLI sets the harness **only if it differs** — the app's
+    switch effect files the old harness's path and model on every set it sees
+    (`picking_the_running_cli_again_changes_nothing`) — and then sets `enabled`; and a pick that
+    changes either clears `AiUi::unknown_key`.
     **Off builds nothing below the choice.** A muted hint under the dropdown says what off means, and
     every control after it is made by a `build_rest` closure inside a `dyn_container` keyed on
     `enabled`, whose off arm is `widgets::nothing()` — torn down rather than hidden, because a hidden
@@ -30834,8 +30839,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   anything, and an assistant switched off after a crash is exactly the case whose leftovers should
   not stand. The one of them that starts a process, `agy mcp remove`, does so only on a crashed
   session's claim (`antigravity::sweep_plan`), so an ordinary launch with the assistant off starts
-  no agent CLI — it used to run at every launch wherever `agy` was found. What this does **not** have is a test that reaches the guards: all four are closures in
-  `main.rs`, and the pinned halves are the pure ones, `Agent::of` and `ai_panel::input_state_of`.
+  no agent CLI — it used to run at every launch wherever `agy` was found. What this does **not**
+  have is a test that reaches the guards: all four are closures in `main.rs`, and the pinned halves
+  are the pure ones, `Agent::of`, `Agent::apply` and `ai_panel::input_state_of`.
 - **One SQL boundary lexer.** Any code scanning SQL for string / `-- ` / `#` / `/* */` / backtick /
   `$tag$` boundaries MUST build on `schemaic_core::sql::skip_noncode` (statement split, WHERE guard, AI
   read-only gate, `intel`'s tokenizer, `sql_highlight`, `sqlfmt`, and `users::redact_secrets`, where

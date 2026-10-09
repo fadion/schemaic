@@ -3960,6 +3960,11 @@ pub struct AiUi {
     /// seed actions each refuse while this is off, so a control the hiding
     /// missed still sends nothing.
     pub enabled: RwSignal<bool>,
+    /// The agent key `ui_state.json` named that this build does not know,
+    /// held (and written back) until the user picks something that changes
+    /// [`Self::enabled`] or [`Self::harness`] — `Agent::apply` decides when,
+    /// and the settings modal's pick is the one writer that clears it.
+    pub unknown_key: RwSignal<Option<String>>,
     /// Override path to the selected harness's CLI (empty = auto-detect, via
     /// [`AiActions::detect_path`]).
     ///

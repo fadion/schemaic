@@ -2445,8 +2445,6 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         if let Some(p) = prev
             && p != now
         {
-            // The user has chosen, so the file should start naming what runs.
-            ai_harness_unknown.set(None);
             // **All three**, including the effort — the field that was left
             // out is the one a round trip through the dropdown lost.
             let held = schemaic_ui::HarnessFields {
@@ -2477,18 +2475,12 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         }
         now
     });
-    // **Turning the assistant on or off is a pick too**, and the effect above
-    // cannot see it when the harness stays put. An unknown key loads as off
-    // holding Claude, so picking *Claude Code* changes `ai_enabled` and not
-    // `ai_harness` — and with the unknown key still held, the save wrote it back
-    // and the next launch started off again.
-    create_effect(move |prev: Option<bool>| {
-        let now = ai_enabled.get();
-        if prev.is_some_and(|p| p != now) {
-            ai_harness_unknown.set(None);
-        }
-        now
-    });
+    // **Dropping the unknown key is the pick's to decide**, not this effect's:
+    // an unknown key loads as off holding Claude, so picking *Claude Code*
+    // changes `ai_enabled` and not `ai_harness`, which the effect above cannot
+    // see — the key stayed held, the save wrote it back and the next launch
+    // started off again. `Agent::apply` answers it for every pick, and the
+    // settings modal clears `AiUi::unknown_key` on its say-so.
     let db_menu_open = RwSignal::new(false);
     let schema_menu_open = RwSignal::new(false);
     let context_menu: RwSignal<Option<CtxMenu>> = RwSignal::new(None);
@@ -12618,6 +12610,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             settings_open: ai_settings_open,
             harness: ai_harness,
             enabled: ai_enabled,
+            unknown_key: ai_harness_unknown,
             cli_path: ai_cli_path,
             model: ai_model,
             effort: ai_effort,
