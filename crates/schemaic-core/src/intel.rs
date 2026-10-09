@@ -25208,6 +25208,14 @@ mod tests {
             (Postgres, "select 1. as x, 2. from t where y=.5"),
             // A unary sign before a prefix operator (S4-L1-05).
             (Postgres, "select - ~5, - @ -3, 2 * - |/ 25"),
+            // Unreserved layout keywords used as names (S4-L1-04; their case
+            // is `keyword_case_leaves_an_unreserved_keyword_used_as_a_name`'s
+            // to guard, since `sqlparser` reads every one as a keyword).
+            (
+                MySql,
+                "select offset, end from top join full on top.a = full.a",
+            ),
+            (MsSql, "select partition, include, offset from window"),
         ]
     }
 

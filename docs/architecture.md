@@ -12439,7 +12439,18 @@ existing prose was left alone.
     and an unquoted MySQL table called `status` is case-sensitive on a Linux server. For the same
     reason a word beside a `.` is left alone — MySQL takes a reserved word as a qualified name
     (`shop.order`). Strings, comments and quoted names are tokens of their own and never words
-    (`keyword_case_recases_keywords_and_nothing_else`, both halves). The recasing is **ASCII only**, so every byte stays where it was — that is what keeps
+    (`keyword_case_recases_keywords_and_nothing_else`, both halves). **"Wherever it stands" was
+    too wide for the second half**: several layout keywords are reserved nowhere — `top`, `full`,
+    `include`, `offset`, `end` on MySQL, `partition`, `window`, `include` on SQL Server — so they
+    are legal unquoted names, and `select * from top` written `FROM TOP` was *Table 'db.TOP'
+    doesn't exist* on MariaDB 10.11. Where a name's case can matter (`names_may_be_case_sensitive`:
+    MySQL's tables on Linux, SQL Server under a `_CS_` collation; PostgreSQL folds and SQLite
+    ignores it) such a word is recased only where it stands as its keyword — `stands_as_name`,
+    conservative in the name's favour: a name after `FROM`/`JOIN`/`INTO`/`UPDATE`/`TABLE`/`AS`,
+    and otherwise wherever the keyword's own shape is missing (`FULL` ahead of a join word, `ANY`/
+    `INCLUDE` ahead of `(`, `TOP` ahead of a count, `PARTITION` ahead of `BY`, `END` with a `CASE`
+    or body `BEGIN` open, the rest followed by a comma, a close, a comparison or a clause word)
+    (`keyword_case_leaves_an_unreserved_keyword_used_as_a_name`). The recasing is **ASCII only**, so every byte stays where it was — that is what keeps
     `caret_after_format` right over a recased result. `KeywordCase` serialises as a lower-case word
     and **deserialises leniently** through a hand-written impl: a word this version does not know
     reads as `Keep`, so a value a later version writes never fails the `ui_state.json` it sits in

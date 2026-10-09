@@ -142,6 +142,13 @@ impl<'de> serde::Deserialize<'de> for KeywordCase {
 /// qualified name (`shop.order`). Strings, comments and quoted names are
 /// tokens of their own and never words. ASCII case only, so every byte stays
 /// where it was and a caret mapped over the formatted text still lands.
+///
+/// **A layout keyword the dialect does not reserve may be a name all the
+/// same** — `top`, `full`, `include`, `offset`, `end` on MySQL, `partition`
+/// and `window` on SQL Server — and where a name's case can matter
+/// ([`names_may_be_case_sensitive`]) it is recased only where it stands as the
+/// keyword ([`stands_as_name`]): `select * from top` written `FROM TOP` was
+/// *Table 'db.TOP' doesn't exist* on MariaDB 10.11.
 pub fn apply_keyword_case(sql: &str, dialect: SqlDialect, case: KeywordCase) -> String {
     apply_keyword_case_under(sql, dialect, case, None)
 }
@@ -161,16 +168,17 @@ fn apply_keyword_case_under(
     let base = sql.as_ptr() as usize;
     let mut out = sql.to_string();
     let dot = |t: Option<&(Kind, &str)>| matches!(t, Some((Kind::Punct, ".")));
+    let guard_names = names_may_be_case_sensitive(dialect);
     for (i, (kind, text)) in toks.iter().enumerate() {
         if *kind != Kind::Word
             || dot(i.checked_sub(1).and_then(|p| toks.get(p)))
             || dot(toks.get(i + 1))
-            || !(is_keyword(text)
-                || crate::intel::is_reserved_word_on(
-                    text,
-                    dialect,
-                    crate::schema::ServerFlavour::Unknown,
-                ))
+        {
+            continue;
+        }
+        let reserved =
+            crate::intel::is_reserved_word_on(text, dialect, crate::schema::ServerFlavour::Unknown);
+        if !(reserved || is_keyword(text)) || (!reserved && guard_names && stands_as_name(&toks, i))
         {
             continue;
         }
@@ -183,6 +191,98 @@ fn apply_keyword_case_under(
         out.replace_range(at..at + text.len(), &recased);
     }
     out
+}
+
+/// May an unquoted name's **case** tell two objects apart in `dialect`?
+///
+/// MySQL's table and database names are case-sensitive on a server on Linux
+/// (`lower_case_table_names = 0`), and SQL Server's names follow the
+/// database's collation, case-sensitive under a `_CS_` one. PostgreSQL folds
+/// an unquoted name to lower case and SQLite matches names without regard to
+/// case, so recasing one there changes nothing it names. An exhaustive
+/// `match`, for the reason [`ops`] gives.
+fn names_may_be_case_sensitive(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MySql | SqlDialect::MsSql => true,
+        SqlDialect::Postgres | SqlDialect::Sqlite => false,
+    }
+}
+
+/// Does the layout keyword at `toks[i]` — one the dialect does not reserve —
+/// stand where a name would rather than where its keyword does?
+///
+/// **Conservative in the name's favour**: a word left in its case is a
+/// cosmetic miss, a name recased is a different table. So it is a name
+/// straight after a word that introduces one (`FROM top`, `AS offset`,
+/// `UPDATE top`), and otherwise wherever its own keyword's shape is missing:
+/// `FULL`/`NATURAL` ahead of a join word, `ANY`/`SOME`/`INCLUDE` ahead of
+/// `(`, `TOP` ahead of a count, `PARTITION` ahead of `BY` or `(`, `END`
+/// closing an open `CASE` or `BEGIN` — and for the rest, a name is what is
+/// followed by a list's comma, a close, a comparison, the end, or a clause
+/// word (`select offset from t`).
+fn stands_as_name(toks: &[(Kind, &str)], i: usize) -> bool {
+    let code = |k: &usize| !matches!(toks[*k].0, Kind::LineComment | Kind::BlockComment);
+    let prev = (0..i).rev().find(code).map(|k| toks[k]);
+    let next = (i + 1..toks.len()).find(code).map(|k| toks[k]);
+    let word_in = |t: Option<(Kind, &str)>, set: &[&str]| matches!(t, Some((Kind::Word, w)) if set.iter().any(|s| w.eq_ignore_ascii_case(s)));
+    let paren_next = matches!(next, Some((Kind::Punct, "(")));
+    if word_in(prev, &["FROM", "JOIN", "INTO", "UPDATE", "TABLE", "AS"]) {
+        return true;
+    }
+    let text = toks[i].1;
+    match text.to_ascii_uppercase().as_str() {
+        "FULL" | "NATURAL" => !word_in(next, &["JOIN", "OUTER", "LEFT", "RIGHT", "INNER"]),
+        "ANY" | "SOME" | "INCLUDE" => !paren_next,
+        "TOP" => {
+            !(paren_next
+                || matches!(next, Some((Kind::Word, w)) if w.starts_with(|c: char| c.is_ascii_digit())))
+        }
+        "PARTITION" => !(paren_next || word_in(next, &["BY"])),
+        "END" => !closes_an_open_block(&toks[..i]),
+        _ => match next {
+            None | Some((Kind::Terminator | Kind::Directive, _)) => true,
+            Some((Kind::Punct, p)) => matches!(
+                p,
+                "," | ")" | ";" | "=" | "<" | ">" | "<=" | ">=" | "<>" | "!=" | "<=>"
+            ),
+            Some((Kind::Word, _)) => word_in(
+                next,
+                &[
+                    "FROM", "WHERE", "AS", "AND", "OR", "IS", "IN", "LIKE", "BETWEEN", "ON",
+                    "THEN", "ELSE", "END", "WHEN", "ORDER", "GROUP", "HAVING", "UNION", "JOIN",
+                    "SET",
+                ],
+            ),
+            Some(_) => false,
+        },
+    }
+}
+
+/// Is a `CASE` or a body's `BEGIN` open at the end of `toks`, for an `END` to
+/// close? An `END IF`/`LOOP`/`WHILE`/`REPEAT`/`FOR` closes neither, and a
+/// transaction's `BEGIN` opens nothing.
+fn closes_an_open_block(toks: &[(Kind, &str)]) -> bool {
+    let mut open = 0usize;
+    for (k, &(kind, w)) in toks.iter().enumerate() {
+        if kind != Kind::Word {
+            continue;
+        }
+        let up = w.to_ascii_uppercase();
+        match up.as_str() {
+            "CASE" if !(k > 0 && word_is(toks, k - 1, "END")) => open += 1,
+            "BEGIN" if toks.len() > k + 1 && Fmt::opens_body(toks, k) => open += 1,
+            "END" => {
+                let names = ["IF", "LOOP", "WHILE", "REPEAT", "FOR"]
+                    .iter()
+                    .any(|n| word_is(toks, k + 1, n));
+                if !names {
+                    open = open.saturating_sub(1);
+                }
+            }
+            _ => {}
+        }
+    }
+    open > 0
 }
 
 /// The text Format Code writes over `full[lo..hi]` — [`format_sql`]'s, with
@@ -2156,6 +2256,91 @@ mod tests {
         assert_eq!(
             apply_keyword_case("insert into t values (1)", pg, Upper),
             "INSERT INTO t VALUES (1)"
+        );
+    }
+
+    /// **A layout keyword the server does not reserve may be a name, and a
+    /// name's case matters on MySQL and SQL Server** — a MySQL table on
+    /// Linux, anything under a case-sensitive collation. `from top` written
+    /// `FROM TOP` was ERROR 1146 on MariaDB 10.11. There such a word is
+    /// recased only where it stands as the keyword.
+    #[test]
+    fn keyword_case_leaves_an_unreserved_keyword_used_as_a_name() {
+        use KeywordCase::*;
+        use SqlDialect::{MsSql, MySql, Postgres};
+        for (d, sql) in [
+            (MySql, "select * from top"),
+            (MySql, "select * from full where x = 1"),
+            (MySql, "select * from include, top"),
+            (MySql, "select offset, end from t"),
+            (MySql, "select a as offset from t"),
+            (MySql, "update top set a = 1"),
+            (MsSql, "select partition, include, offset from t"),
+            (MsSql, "select * from window"),
+        ] {
+            let up = apply_keyword_case(sql, d, Upper);
+            assert_eq!(
+                up.to_ascii_lowercase(),
+                sql,
+                "{d:?}: lower-cased differently: {up}"
+            );
+            for w in [
+                "top",
+                "full",
+                "include",
+                "offset",
+                "end",
+                "partition",
+                "window",
+            ] {
+                if sql
+                    .split(|c: char| !c.is_ascii_alphanumeric())
+                    .any(|x| x == w)
+                {
+                    assert!(
+                        up.split(|c: char| !c.is_ascii_alphanumeric())
+                            .any(|x| x == w),
+                        "{d:?}: recased the name {w}: {up}"
+                    );
+                }
+            }
+        }
+        // Where it is the keyword, it is still recased.
+        for (d, sql, want) in [
+            (
+                MySql,
+                "select a from t full join u on 1 = 1 limit 1 offset 5",
+                "SELECT a FROM t FULL JOIN u ON 1 = 1 LIMIT 1 OFFSET 5",
+            ),
+            (
+                MySql,
+                "select case when a then 1 end from t where a = any (select 1)",
+                "SELECT CASE WHEN a THEN 1 END FROM t WHERE a = ANY (SELECT 1)",
+            ),
+            (
+                MySql,
+                "create procedure p() begin select 1; end",
+                // `begin` is neither reserved nor a layout keyword.
+                "CREATE PROCEDURE p() begin SELECT 1; END",
+            ),
+            (
+                MsSql,
+                "select sum(a) over (partition by b) from t order by a offset 5 rows",
+                "SELECT sum(a) OVER (PARTITION BY b) FROM t ORDER BY a OFFSET 5 rows",
+            ),
+            (
+                MsSql,
+                "create index ix on t (a) include (b)",
+                "CREATE INDEX ix ON t (a) INCLUDE (b)",
+            ),
+        ] {
+            assert_eq!(apply_keyword_case(sql, d, Upper), want, "{d:?}");
+        }
+        // PostgreSQL folds an unquoted name to lower case, so recasing one
+        // there changes nothing it names: the old rule stands.
+        assert_eq!(
+            apply_keyword_case("select * from include", Postgres, Upper),
+            "SELECT * FROM INCLUDE"
         );
     }
 
