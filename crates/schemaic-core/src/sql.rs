@@ -9243,6 +9243,22 @@ mod tests {
             assert!(super::read_only_reason(sql, d).is_err(), "{d:?}");
             assert!(super::contains_write(sql, d), "{d:?}");
         }
+        // **A quoted name before `(` is not let through as the builtin.**
+        // Whether it reaches the builtin or a user function of that name
+        // differs by engine, so `called_word_tokens` marks it uncalled on
+        // purpose — and nothing held that decision: marking it called let all
+        // three through the gate the headless paths read.
+        for (d, sql) in [
+            (
+                SqlDialect::Postgres,
+                "SELECT \"replace\"(name, 'a', 'b') FROM t",
+            ),
+            (SqlDialect::MySql, "SELECT `insert`('ab', 1, 1, 'x')"),
+            (SqlDialect::MsSql, "SELECT [replace](n, 'a', 'b') FROM t"),
+        ] {
+            assert!(super::read_only_reason(sql, d).is_err(), "{d:?}: {sql}");
+            assert!(super::contains_write(sql, d), "{d:?}: {sql}");
+        }
     }
 
     /// **A locking read is refused as a lock, not as a write.** `SELECT … FOR
