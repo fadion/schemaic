@@ -2554,6 +2554,16 @@ existing prose was left alone.
     red before). `empty_on_join` still asks `statement_scope` whether the joined table is in scope
     at all — the check that keeps a table inside a joined subquery from being taken for the join's
     own — but returns only that table; which tables it is paired with is the caller's `query_scope`.
+    **And only the tables written before the caret** (`pairing_scope`, `query_scope` cut at the
+    caret): a later `JOIN` is not yet joined where this one's `ON` is evaluated, and a later
+    `UNION` arm is another query at the same depth, yet the lexer fallback read every `FROM`/`JOIN`
+    list up to the statement's end, so inserting a join above an existing one, or editing a
+    `UNION`'s first arm, was offered `i.customer_id = c.id` for an `invoices i` written below it —
+    *Unknown column … in 'on clause'* on every engine
+    (`a_join_pairs_with_no_table_written_after_it`, and the popup's half in
+    `the_popups_join_rows_read_the_joins_own_query`, both red before). What an alias must clear
+    is still the whole query's: `join_targets`' aliased rows and `table_alias_at` read `taken_names`
+    off `query_scope`, after the caret too, since a later `JOIN customers c` already holds `c`.
     **Only a join that takes a condition is given one.** `empty_on_join` — split out of
     `join_condition` and shared by both surfaces, so the popup row refuses too — answers only the
     first `ON` after its `JOIN`, a second being MySQL's `ON DUPLICATE KEY` or PostgreSQL's

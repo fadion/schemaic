@@ -13293,7 +13293,7 @@ pub fn join_condition(
 ) -> Option<String> {
     let joined = empty_on_join(sql, lo, hi, caret, dialect)?;
     // Pair it with each other table of its query; first FK match wins.
-    for other in &query_scope(sql, lo, hi, caret, dialect) {
+    for other in &pairing_scope(sql, lo, hi, caret, dialect) {
         if other.name.eq_ignore_ascii_case(&joined.name) && other.alias == joined.alias {
             continue;
         }
@@ -13506,9 +13506,12 @@ pub fn join_targets(
             return Vec::new();
         }
     }
-    let scope = query_scope(sql, lo, hi, caret, dialect);
+    // Paired with the tables before the join; the alias clears the whole
+    // query's names.
     let typed = &sql[word_lo..word_end_at(sql, caret, hi)];
-    let taken = alias_slot(sql, lo, hi, caret, dialect).then(|| taken_names(&scope, typed));
+    let taken = alias_slot(sql, lo, hi, caret, dialect)
+        .then(|| taken_names(&query_scope(sql, lo, hi, caret, dialect), typed));
+    let scope = pairing_scope(sql, lo, hi, caret, dialect);
     join_targets_for(&scope, catalog, dialect, taken.as_deref())
 }
 
@@ -17068,6 +17071,23 @@ fn query_scope(
         .collect()
 }
 
+/// The tables a join written at the caret can pair with: [`query_scope`]'s,
+/// written **before the caret**. A `JOIN` later in the chain is not yet joined
+/// where this one's `ON` is evaluated, and a later `UNION` arm is another
+/// query, so a key to either wrote a condition naming a table the `ON` cannot
+/// see (*Unknown column 'i.customer_id' in 'on clause'*). An alias a new
+/// table takes must still clear every name in the query, after the caret too,
+/// which is why that reading ([`table_alias_at`]) keeps [`query_scope`].
+fn pairing_scope(
+    sql: &str,
+    lo: usize,
+    hi: usize,
+    caret: usize,
+    dialect: SqlDialect,
+) -> Vec<TableRef> {
+    query_scope(sql, lo, caret.min(hi), caret, dialect)
+}
+
 /// The names a statement's `WITH` gives its CTEs, read off its tokens: the
 /// word after `WITH` (or `WITH RECURSIVE`) and after each comma at depth 0,
 /// until the query proper begins.
@@ -17689,7 +17709,7 @@ fn on_condition_guess(
     dialect: SqlDialect,
 ) -> Option<String> {
     let joined = empty_on_join(sql, lo, hi, caret, dialect)?;
-    let scope = query_scope(sql, lo, hi, caret, dialect);
+    let scope = pairing_scope(sql, lo, hi, caret, dialect);
     let joined = scope.iter().find(|s| same_ref(s, &joined))?;
     let other = sole_fk_partner(catalog, &scope, joined)?;
     fk_predicate(catalog, joined, other, dialect)
@@ -17722,7 +17742,7 @@ fn join_target_guess(
     {
         return None;
     }
-    let scope = query_scope(sql, lo, hi, caret, dialect);
+    let scope = pairing_scope(sql, lo, hi, caret, dialect);
     let targets = join_targets_for(&scope, catalog, dialect, None);
     let [target] = targets.as_slice() else {
         return None;
@@ -17768,7 +17788,7 @@ fn join_on_guess(
     }
     let written = joined_table(&toks[join_idx + 1..], dialect)?;
     written.1.as_ref()?;
-    let scope = query_scope(sql, lo, hi, caret, dialect);
+    let scope = pairing_scope(sql, lo, hi, caret, dialect);
     let joined = find_joined(&scope, &written)?;
     let other = sole_fk_partner(catalog, &scope, joined)?;
     let condition = fk_predicate(catalog, joined, other, dialect)?;
@@ -18001,7 +18021,7 @@ fn paren_contents(
             }
             let written = joined_table(&body[join + 1..body.len() - 1], dialect)?;
             // From before `USING (`, whose paren is not a query's.
-            let scope = query_scope(sql, lo, hi, lp.at, dialect);
+            let scope = pairing_scope(sql, lo, hi, lp.at, dialect);
             let joined = find_joined(&scope, &written)?;
             let other = sole_fk_partner(catalog, &scope, joined)?;
             let edge = catalog.fk_edge_between(&joined.name, &other.name)?;
@@ -20203,6 +20223,51 @@ mod predict_tests {
         assert_eq!(
             my("SELECT * FROM orders o JOIN customers c ON o.customer_id = c.id ON "),
             None
+        );
+    }
+
+    /// A join pairs only with the tables written *before* it: a later `JOIN`
+    /// is not yet joined where the `ON` is evaluated, and a later `UNION` arm
+    /// is another query (S8.5-L1-03 — `Unknown column 'i.customer_id' in 'on
+    /// clause'` on each of these, as the ghost used to write them).
+    #[test]
+    fn a_join_pairs_with_no_table_written_after_it() {
+        let schema = joined_up();
+        let at = |sql: &str| {
+            let caret = sql.find('|').expect("a caret");
+            let text = sql.replacen('|', "", 1);
+            let cat = Catalog::build(&[("shop", &schema)], Some("shop"));
+            predict(&text, caret, &cat, SqlDialect::MySql)
+        };
+        assert_eq!(
+            at(
+                "SELECT * FROM notes n JOIN customers c ON |\nJOIN invoices i ON i.customer_id = c.id"
+            ),
+            None
+        );
+        assert_eq!(
+            at("SELECT * FROM notes n JOIN customers c |\nJOIN invoices i ON i.customer_id = c.id"),
+            None
+        );
+        assert_eq!(
+            at(
+                "SELECT c.id FROM notes n JOIN customers c ON |\nUNION ALL\nSELECT i.id FROM invoices i"
+            ),
+            None
+        );
+        assert_eq!(
+            at("SELECT n.id FROM notes n JOIN |\nUNION ALL\nSELECT o.id FROM orders o"),
+            None
+        );
+        // The tables before it still pair, whatever follows.
+        assert_eq!(
+            at("SELECT * FROM orders o JOIN customers c ON |\nJOIN notes n ON n.id = o.id")
+                .as_deref(),
+            Some("o.customer_id = c.id")
+        );
+        assert_eq!(
+            at("SELECT * FROM orders o JOIN |\nWHERE o.total > 1").as_deref(),
+            Some("customers ON o.customer_id = customers.id")
         );
     }
 
@@ -29720,6 +29785,19 @@ mod tests {
             .find(|t| t.table == "orders")
             .expect("orders is offered");
         assert_eq!(orders.predicate, "orders.customer_id = c.id");
+        // Nor a table written after the join: not yet joined at its `ON`.
+        let later =
+            "SELECT * FROM notes n JOIN customers c ON \nJOIN orders o ON o.customer_id = c.id";
+        let caret = later.find('\n').unwrap();
+        assert_eq!(join_at_on(later, caret, SqlDialect::MySql), None);
+        let later = "SELECT * FROM notes n JOIN \nUNION ALL SELECT o.id FROM orders o";
+        let (schema, db) = fk_catalog();
+        let cat = Catalog::build(&[(db, &schema)], Some(db));
+        let caret = later.find('\n').unwrap();
+        assert!(
+            join_targets(later, 0, later.len(), caret, &cat, SqlDialect::MySql).is_empty(),
+            "a later arm's orders paired"
+        );
     }
 
     #[test]
