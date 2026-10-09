@@ -2971,7 +2971,12 @@ existing prose was left alone.
     `skip_noncode`), and a run whose block comment or string crosses a line end before it offers
     nothing. The line was once cut at the first `\n` wherever it sat, so a past
     `SELECT * FROM orders /* multi⏎line */ WHERE id = 1` offered `/* multi`, and Tab left that
-    comment open over the rest of the buffer — a multi-line string likewise. A line comment ends
+    comment open over the rest of the buffer — a multi-line string likewise. **So does one the
+    text's end cuts off unclosed**: an open tab stops mid-statement, and a tab ending
+    `WHERE note = 'abc` ghosted that and left the `'` open (S8.4-L1-04). `skip_noncode` ends an
+    open span at the text's end as it ends a closed one there, so a span reaching the end is asked
+    again with `\nx` after it: an open one runs on to the new end
+    (`a_remembered_line_never_ends_inside_an_unclosed_span`, red first). A line comment ends
     its own line, and is offered whole **only where nothing follows the caret on it**
     (`Recall::followed`): where the statement's `;` or the `)`s bracket pairing made sit there, a
     trailing `--` (or MySQL's `#`) is cut off (`before_line_comment`), since Tab would comment out

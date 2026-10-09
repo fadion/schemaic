@@ -16496,7 +16496,8 @@ fn before_line_comment(line: &str, dialect: SqlDialect) -> &str {
 }
 
 /// `text` up to its first line end in code — `None` when a comment or a
-/// string runs across one before that, so the line would end inside it.
+/// string runs across one before that, so the line would end inside it, or
+/// runs to the text's end unclosed: an open tab stops mid-statement.
 fn first_code_line(text: &str, dialect: SqlDialect) -> Option<&str> {
     let b = text.as_bytes();
     let mut i = 0;
@@ -16506,6 +16507,17 @@ fn first_code_line(text: &str, dialect: SqlDialect) -> Option<&str> {
         }
         match skip_noncode(b, i, dialect) {
             Some(end) if text[i..end].contains('\n') => return None,
+            // [`skip_noncode`] ends an unclosed span at the text's end, as it
+            // ends one closed there: asked again with more text after it, the
+            // closed one stops where it did (a line comment at the new line
+            // end) and the open one runs on to the new end.
+            Some(end) if end == b.len() => {
+                let more = format!("{}\nx", &text[i..]);
+                if skip_noncode(more.as_bytes(), 0, dialect) == Some(more.len()) {
+                    return None;
+                }
+                i = end;
+            }
             Some(end) => i = end,
             None => i += 1,
         }
@@ -19561,6 +19573,42 @@ mod history_prediction_tests {
             )
             .as_deref(),
             Some("-- recent")
+        );
+    }
+
+    /// **Nor where the text itself ends inside one** (S8.4-L1-04): an open
+    /// tab routinely stops mid-statement, and a string or block comment its
+    /// end cuts off is as open as one a line end cuts. One closed right at
+    /// the text's end, and a line comment running to it, are whole.
+    #[test]
+    fn a_remembered_line_never_ends_inside_an_unclosed_span() {
+        for past in [
+            "SELECT * FROM orders WHERE note = 'abc",
+            "SELECT * FROM orders /* todo",
+            "SELECT * FROM orders WHERE `note",
+            "SELECT * FROM orders WHERE note = 'it''",
+        ] {
+            assert_eq!(hist("SELECT * FROM orders ", &[past]), None, "{past}");
+        }
+        assert_eq!(
+            hist(
+                "SELECT * FROM orders ",
+                &["SELECT * FROM orders WHERE note = 'abc'"]
+            )
+            .as_deref(),
+            Some("WHERE note = 'abc'")
+        );
+        assert_eq!(
+            hist(
+                "SELECT * FROM orders ",
+                &["SELECT * FROM orders /* todo */"]
+            )
+            .as_deref(),
+            Some("/* todo */")
+        );
+        assert_eq!(
+            hist("SELECT * FROM orders ", &["SELECT * FROM orders -- todo"]).as_deref(),
+            Some("-- todo")
         );
     }
 
