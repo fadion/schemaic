@@ -25236,9 +25236,11 @@ existing prose was left alone.
     layer is why the tip must never *open* where something covers its squiggle: 1001 is above every
     bar in the stack, so a tip raised under the run menu or the find bar paints over it, and
     `marks_pointer` (above) is what keeps it from being raised there.
-    **The run outline marks what Ctrl+Enter would run before it is pressed** — a 2px bar in the
-    gutter just left of the code column (`content_x - HL_PAD - 4`), `theme::query_highlight()` at
-    0.6 alpha, beside the lines of `run_outline`'s range. An effect over the caret (`ed.cursor`),
+    **The run outline marks what Ctrl+Enter would run before it is pressed** — a 4px bar set
+    back into the gutter (`content_x - HL_PAD - 12`, 11px clear of the code, and dropped 1px to sit
+    flush with the current-line band — a 2px bar hard
+    against it read as a caret), `theme::query_highlight()` at 0.6 alpha — a muted accent tint, not
+    a red, which read as an error — beside the lines of `run_outline`'s range. An effect over the caret (`ed.cursor`),
     `query` and `dialect` recomputes it on every move and edit through the pure
     `run_outline_range`: `StatementIndex::run_current_range`'s piece — the pane's index, from
     `completion::stmt_index`, answering as `sql::run_current_range` does — or `None` with a

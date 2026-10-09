@@ -107,6 +107,9 @@ pub struct UiTheme {
     pub resize_handle: Color,
     pub field_border: Color,
     pub field_border_active: Color,
+    /// The run outline's gutter bar and the picked statement's border — "this is
+    /// what would run", a scope rather than a verdict. A muted tint of the accent
+    /// on purpose: it was a red once, and a red bar in the gutter read as an error.
     pub query_highlight: Color,
     /// Box around the paren matching the one under the caret (bracket matching).
     pub bracket_match: Color,
@@ -343,7 +346,7 @@ impl UiTheme {
             resize_handle: c("#4C516B"),
             field_border: c("#24252D"),
             field_border_active: c("#303453"),
-            query_highlight: c("#FF7373"),
+            query_highlight: c("#5C6B8F"),
             bracket_match: c("#7C8CA8"),
             match_highlight: c("#7C9CF0"),
             text: c("#C6C8D6"),
@@ -491,7 +494,7 @@ impl UiTheme {
             resize_handle: c("#B7BEDC"),
             field_border: c("#D4D7E0"),
             field_border_active: c("#9DB0EC"),
-            query_highlight: c("#E5484D"),
+            query_highlight: c("#9AA8CF"),
             bracket_match: c("#8894A8"),
             match_highlight: c("#3355C4"),
             text: c("#2B2E3A"),

@@ -6623,11 +6623,15 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                                 None => s.hide(),
                                 Some((top, bot)) => s
                                     .absolute()
-                                    .inset_left(cx - HL_PAD - 4.0)
-                                    .inset_top(top + EDITOR_PAD_TOP - vp.y0)
-                                    .width(2.0)
+                                    // Set back into the gutter, 4px wide: hard
+                                    // against the code, a 2px bar read as a caret.
+                                    // The 1px drop sits it flush with the
+                                    // current-line band.
+                                    .inset_left(cx - HL_PAD - 12.0)
+                                    .inset_top(top + EDITOR_PAD_TOP - vp.y0 + 1.0)
+                                    .width(4.0)
                                     .height(bot - top)
-                                    .border_radius(1.0)
+                                    .border_radius(2.0)
                                     .background(theme::query_highlight().multiply_alpha(0.6)),
                             }
                         })
