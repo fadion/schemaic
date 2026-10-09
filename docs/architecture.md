@@ -12485,7 +12485,8 @@ existing prose was left alone.
     where it now ends (`toggle_case_keeps_a_bare_caret_on_a_character_boundary`). Nothing to change (no word at the caret, no letters) is `None`, so the pane
     makes no edit and no undo step (`toggle_case_upper_cases_then_lower_cases_a_selection`,
     `toggle_case_with_nothing_to_change_is_none`). The pane applies it at every caret — a lone one
-    through `edit_untyped`, several through `edit_untyped_multi` (*Several carets*, below).
+    through `edit_untyped`, several through `per_caret` and `edit_untyped_multi` (*Several carets*,
+    below), where a caret's `None` only keeps that caret in place rather than refusing the others.
     `join_lines` is Ctrl+Shift+J, DataGrip's key again: the caret's line joined with the next, or
     every line a selection spans — one ending at a line's start leaving that line out, as Tab's
     does. Each break and the blanks around it (spaces, tabs and a CRLF's `\r` before; spaces and
@@ -12623,9 +12624,22 @@ existing prose was left alone.
     3,200-line script measured 600 ms a keystroke, and Backspace there 262 ms, against 1.8 ms and
     0.9 ms for the one walk (release). `many_carets_pair_exactly_as_each_would_alone` and
     `noncode_spans_at_answers_position_for_position_what_noncode_span_at_does` hold the batch to
-    the lone answers. Tab composes each caret's
-    `soft_tab_indent`/`hard_tab_indent`, and Ctrl+Shift+U and Ctrl+Shift+/ each caret's
-    `toggle_case`/`toggle_block_comment` — an `IndentEdit` converts to a `RegionEdit` (`From`). The
+    the lone answers. **Ctrl+Shift+U and Ctrl+Shift+/ go through `per_caret`**, each caret's
+    `toggle_case`/`toggle_block_comment` asked of the original text. Composed plainly, one caret
+    with nothing to change — a word with no letters, a blank line — answered `None` and refused the
+    keystroke at every caret, and two carets in one word or on one line asked for the same edit
+    twice, an overlap `compose` refuses. So a caret whose op answers `None` now only keeps its
+    place, carried through the others' edits by `moved_by` (clamped into an edit it falls inside);
+    identical edits are made once, each caret keeping its own selection; and the answer is `None`
+    only when no caret changes anything or two *different* edits overlap
+    (`a_caret_with_nothing_to_change_does_not_stop_the_others`). **Tab goes through `indent_all`**,
+    which cannot refuse: each caret's `soft_tab_indent`/`hard_tab_indent`, with the edits that
+    would overlap — two selections on one line, a bare caret inside another's selected lines —
+    grouped and their lines indented **once** by `indent_lines`, every caret in the group moved by
+    the indent added before it (`tab_with_overlapping_carets_indents_once_and_keeps_them_all`).
+    Before, that overlap was `compose`'s refusal, and Tab fell back to the primary caret and dropped
+    the rest. An `IndentEdit` converts to a `RegionEdit` (`From`), and both helpers share
+    `compose_members` with `per_line_block_each`, below. The
     line operations — Ctrl+/, Ctrl+D, Alt+↑/↓, Shift+Tab's outdent, Ctrl+Shift+J's join — go through
     `per_line_block`, which runs the existing single-range function once per `line_blocks` block:
     carets whose lines overlap **or touch** merge into one, so two carets on one line comment it once
@@ -12650,8 +12664,9 @@ existing prose was left alone.
     so `RegionEdit::between` narrows each answer to the span that changed, backing the common prefix
     and suffix off to char boundaries so the narrowed edit never splits a character
     (`a_whole_text_rewrite_narrows_to_what_changed`). The pane applies a `MultiEdit` through
-    `edit_untyped_multi` (under *Floem 0.2 gotchas*); where `compose` refuses, Tab, Ctrl+/ and
-    Ctrl+D fall back to the primary caret as before, and Alt+↑/↓ does nothing.
+    `edit_untyped_multi` (under *Floem 0.2 gotchas*); where `compose` refuses, Ctrl+/ and Ctrl+D
+    fall back to the primary caret as before, while Alt+↑/↓, Ctrl+Shift+U and Ctrl+Shift+/ do
+    nothing — and Tab, through `indent_all`, is never refused.
     **`box_regions` is Alt+Shift+drag's box selection** — one region a line from the upper of the
     anchor's and the head's lines to the lower, each across the columns between the two, with the
     caret on the head's side (dragged leftwards a region is `(right, left)`). Columns are counted in

@@ -1387,8 +1387,8 @@ pub struct MultiEdit {
 
 /// Put the carets' edits together ([`MultiEdit`]): each selection moved by
 /// what the edits before it added or removed. `None` when two of them overlap,
-/// which no single edit can make — the caller then leaves the keystroke to
-/// the primary caret, as before.
+/// which no single edit can make — [`per_caret`] and [`indent_all`] merge the
+/// overlaps a keystroke can mean before they get here.
 pub fn compose(mut edits: Vec<RegionEdit>) -> Option<MultiEdit> {
     edits.sort_by_key(|e| (e.start, e.end));
     let mut out = MultiEdit {
@@ -1561,10 +1561,17 @@ fn per_line_block_each(
     regions: &[(usize, usize)],
     op: impl Fn(&LineBlock) -> Option<(RegionEdit, Vec<(usize, usize)>)>,
 ) -> Option<MultiEdit> {
-    let mut parts = line_blocks(text, regions)
+    let parts = line_blocks(text, regions)
         .iter()
         .map(op)
         .collect::<Option<Vec<_>>>()?;
+    compose_members(parts)
+}
+
+/// [`compose`] for edits each carrying **several** carets' selections, in
+/// the text that edit alone leaves: every selection moved by what the edits
+/// before it added or removed. `None` when two of the edits overlap.
+fn compose_members(mut parts: Vec<(RegionEdit, Vec<(usize, usize)>)>) -> Option<MultiEdit> {
     // `compose` sorts its edits the same way, so its answer lines up.
     parts.sort_by_key(|(e, _)| (e.start, e.end));
     let mut sels = Vec::new();
@@ -1630,6 +1637,154 @@ pub fn outdent_all(text: &str, regions: &[(usize, usize)], tw: usize) -> Option<
             .map(|&(a, b)| (map(a), map(b)))
             .collect();
         Some((e.into(), sels))
+    })
+}
+
+/// An edit made **at each caret** — Ctrl+Shift+U ([`toggle_case`]),
+/// Ctrl+Shift+/ ([`toggle_block_comment`]) — each asked of the original
+/// text (`op(text, a, b)`), then put together.
+///
+/// A caret `op` answers `None` for has nothing to change there (a word with
+/// no letters, a blank line): it only keeps its place, moved by the others'
+/// edits, rather than refusing the keystroke at every caret. Carets asking
+/// for the **same** edit — two in one word, two on one line — make it once,
+/// each keeping its own selection. `None` when no caret changes anything, or
+/// when two different edits overlap.
+pub fn per_caret(
+    text: &str,
+    regions: &[(usize, usize)],
+    op: impl Fn(&str, usize, usize) -> Option<RegionEdit>,
+) -> Option<MultiEdit> {
+    let mut parts: Vec<(RegionEdit, Vec<(usize, usize)>)> = Vec::new();
+    let mut idle = Vec::new();
+    for &(a, b) in regions {
+        let Some(e) = op(text, a, b) else {
+            idle.push((a, b));
+            continue;
+        };
+        let same = parts
+            .iter_mut()
+            .find(|(p, _)| (p.start, p.end, &p.insert) == (e.start, e.end, &e.insert));
+        match same {
+            Some((_, sels)) => sels.push(e.sel),
+            None => {
+                let sel = e.sel;
+                parts.push((e, vec![sel]));
+            }
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    let mut m = compose_members(parts)?;
+    let idle: Vec<_> = idle
+        .into_iter()
+        .map(|(a, b)| (moved_by(&m.edits, a), moved_by(&m.edits, b)))
+        .collect();
+    m.sels.extend(idle);
+    Some(m)
+}
+
+/// Where offset `p` of the original text lands after `edits` (ascending, in
+/// the original's offsets): moved by every edit ending at or before it, and
+/// one it falls inside clamped into that edit's replacement.
+fn moved_by(edits: &[(usize, usize, String)], p: usize) -> usize {
+    let mut shift = 0isize;
+    for (s, e, t) in edits {
+        if *e <= p {
+            shift += t.len() as isize - (e - s) as isize;
+        } else if *s < p {
+            return (*s as isize + shift) as usize + (p - s).min(t.len());
+        } else {
+            break;
+        }
+    }
+    (p as isize + shift) as usize
+}
+
+/// Tab at every caret ([`soft_tab_indent`] with `soft`, else
+/// [`hard_tab_indent`]): each caret indents where it is, in one edit.
+///
+/// Carets whose edits would overlap — two selections on one line, a bare
+/// caret inside another's selected lines — indent those lines **once**
+/// together, and each keeps its own place, moved by the indent added before
+/// it. A bare caret at a line's first non-blank column goes with the text;
+/// a selection's end at a line start with no indent keeps the indent inside.
+pub fn indent_all(text: &str, regions: &[(usize, usize)], tw: usize, soft: bool) -> MultiEdit {
+    let tw = tw.max(1);
+    let pad = if soft {
+        " ".repeat(tw)
+    } else {
+        "\t".to_string()
+    };
+    let mut edits: Vec<((usize, usize), IndentEdit)> = regions
+        .iter()
+        .map(|&(a, b)| {
+            let e = if soft {
+                soft_tab_indent(text, a, b, tw)
+            } else {
+                hard_tab_indent(text, a, b)
+            };
+            ((a, b), e)
+        })
+        .collect();
+    // Widest first at one start, so a bare caret at a selected line's start
+    // falls inside that selection's edit rather than before it.
+    edits.sort_by_key(|(_, e)| (e.start, std::cmp::Reverse(e.end)));
+    let mut clusters: Vec<Vec<((usize, usize), IndentEdit)>> = Vec::new();
+    let mut last_end = 0usize;
+    for item in edits {
+        match clusters.last_mut() {
+            Some(c) if item.1.start < last_end => {
+                last_end = last_end.max(item.1.end);
+                c.push(item);
+            }
+            _ => {
+                last_end = item.1.end;
+                clusters.push(vec![item]);
+            }
+        }
+    }
+    let parts = clusters
+        .into_iter()
+        .map(|mut c| {
+            if c.len() == 1 {
+                let (_, e) = c.remove(0);
+                let sel = e.sel;
+                return (e.into(), vec![sel]);
+            }
+            // A cluster holds a selection's edit, which spans whole lines.
+            let lo = c.iter().map(|(_, e)| e.start).min().unwrap_or(0);
+            let hi = c.iter().map(|(_, e)| e.end).max().unwrap_or(lo);
+            let e = indent_lines(text, lo, hi, &pad);
+            // Each indented line's insertion point, and whether it has an
+            // indent of its own already.
+            let mut ins = Vec::new();
+            let mut at = e.start;
+            for line in text[e.start..e.end].split('\n') {
+                if !line.is_empty() {
+                    let fnb = line.len() - line.trim_start().len();
+                    ins.push((at + fnb, fnb > 0));
+                }
+                at += line.len() + 1;
+            }
+            let map = |p: usize, bare: bool| {
+                let n = ins
+                    .iter()
+                    .filter(|&&(i, indented)| i < p || (i == p && (indented || bare)))
+                    .count();
+                p + pad.len() * n
+            };
+            let sels = c
+                .iter()
+                .map(|&((a, b), _)| (map(a, a == b), map(b, a == b)))
+                .collect();
+            (e.into(), sels)
+        })
+        .collect();
+    compose_members(parts).unwrap_or_else(|| MultiEdit {
+        edits: Vec::new(),
+        sels: regions.to_vec(),
     })
 }
 
@@ -2192,6 +2347,66 @@ mod tests {
         let m = join_lines_all(text, &[(0, 0), (6, 6)], my).unwrap();
         assert_eq!(apply(text, &m), "a b\nc\nd e");
         assert_eq!(m.sels, vec![(1, 1), (7, 7)]);
+    }
+
+    /// Ctrl+Shift+U and Ctrl+Shift+/ at several carets: a caret with nothing
+    /// to change only keeps its place, and carets asking for the same edit
+    /// make it once, rather than either refusing the whole keystroke.
+    #[test]
+    fn a_caret_with_nothing_to_change_does_not_stop_the_others() {
+        let case = |t: &str, a, b| toggle_case(t, a, b).map(Into::into);
+        // `1` has no letters; `select` still upper-cases, both carets kept.
+        let m = per_caret("select 1", &[(3, 3), (7, 7)], case).unwrap();
+        assert_eq!(apply("select 1", &m), "SELECT 1");
+        assert_eq!(m.sels, vec![(3, 3), (7, 7)]);
+        // Two carets in one word re-case it once.
+        let m = per_caret("select 1", &[(1, 1), (4, 4)], case).unwrap();
+        assert_eq!(apply("select 1", &m), "SELECT 1");
+        assert_eq!(m.sels, vec![(1, 1), (4, 4)]);
+        // Nothing to change anywhere is still no edit at all.
+        assert_eq!(per_caret("1 2", &[(0, 0), (2, 2)], case), None);
+
+        let my = SqlDialect::MySql;
+        let comment = |t: &str, a, b| toggle_block_comment(t, a, b, my).map(Into::into);
+        // Two carets on one line wrap it once, each keeping its place.
+        let text = "select 1\nselect 2";
+        let one = toggle_block_comment(text, 1, 1, my).unwrap();
+        let m = per_caret(text, &[(1, 1), (5, 5)], comment).unwrap();
+        let mut want = text.to_string();
+        want.replace_range(one.start..one.end, &one.text);
+        assert_eq!(apply(text, &m), want);
+        let grew = want.len() - text.len();
+        let other = toggle_block_comment(text, 5, 5, my).unwrap();
+        assert_eq!((other.start, other.end), (one.start, one.end));
+        assert_eq!(m.sels, vec![one.sel, other.sel]);
+        // A caret on a blank line comments nothing and moves with the edit.
+        let text = "select 1\n\nselect 2";
+        let m = per_caret(text, &[(1, 1), (9, 9)], comment).unwrap();
+        assert!(apply(text, &m).starts_with("/*"));
+        assert_eq!(m.sels, vec![one.sel, (9 + grew, 9 + grew)]);
+    }
+
+    /// Tab at several carets whose edits overlap — two selections on one
+    /// line, a bare caret inside another's selected lines — indents those
+    /// lines once and keeps every caret, rather than only the first.
+    #[test]
+    fn tab_with_overlapping_carets_indents_once_and_keeps_them_all() {
+        // Two selections on one line.
+        let m = indent_all("select 1", &[(0, 2), (4, 6)], 4, true);
+        assert_eq!(apply("select 1", &m), "    select 1");
+        assert_eq!(m.sels, vec![(0, 6), (8, 10)]);
+        // A bare caret at the start of a line another caret has selected.
+        let m = indent_all("a\nb", &[(0, 3), (2, 2)], 4, true);
+        assert_eq!(apply("a\nb", &m), "    a\n    b");
+        assert_eq!(m.sels, vec![(0, 11), (10, 10)]);
+        // Hard tabs the same way.
+        let m = indent_all("select 1", &[(0, 2), (4, 6)], 4, false);
+        assert_eq!(apply("select 1", &m), "\tselect 1");
+        assert_eq!(m.sels, vec![(0, 3), (5, 7)]);
+        // Carets whose edits do not meet each indent where they are.
+        let m = indent_all("a\nb", &[(1, 1), (3, 3)], 4, true);
+        assert_eq!(apply("a\nb", &m), "a   \nb   ");
+        assert_eq!(m.sels, vec![(4, 4), (9, 9)]);
     }
 
     #[test]
