@@ -976,7 +976,8 @@ existing prose was left alone.
     text and a confirm only on Run: a write that *joins* (`UPDATE … FROM t JOIN u ON …`, MySQL's
     `UPDATE a JOIN b`, `DELETE t FROM t JOIN u ON …`) is filtered by its join, and a bounded one
     (`TOP (n)`, which reaches it blanked by `grammar_gap_masks` and is read from the unmasked text
-    after the verb, or `LIMIT n`) is a batch — while a `FROM`/`USING` that only lists a table is a
+    after the verb — past any comment, through `skip_leading_noncode`, since a whitespace-only trim
+    missed `DELETE /* c */ TOP (n)` (R1-L2-03) — or `LIMIT n`) is a batch — while a `FROM`/`USING` that only lists a table is a
     cross join and still flagged. Nor does it run inside a T-SQL routine's body (`range_diagnostics`'
     `in_body`, from `Unit::header`), where `DELETE FROM staging` is the point of the routine. The
     `NULL` check passes over an `EXEC p @a = NULL` whole, whose named arguments the parser reads

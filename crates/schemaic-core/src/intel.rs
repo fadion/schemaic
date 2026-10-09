@@ -12699,7 +12699,7 @@ mod lints {
     ) {
         for ast in asts {
             if !in_body {
-                unfiltered_write(stmt, raw, lo, ast, out);
+                unfiltered_write(stmt, raw, lo, ast, dialect, out);
             }
             null_comparisons(stmt, lo, ast, out);
             insert_row_lengths(stmt, lo, ast, catalog, dialect, out);
@@ -12987,12 +12987,14 @@ mod lints {
     /// statements only, for the same reason. And a bounded write — T-SQL's
     /// `TOP (n)`, MySQL's `LIMIT n` — is the batched delete it looks like.
     /// `TOP` is not in sqlparser's grammar for a write and reaches it
-    /// blanked, so it is read from `raw`, straight after the verb.
+    /// blanked, so it is read from `raw`, straight after the verb — past any
+    /// comment there, which hid it (R1-L2-03).
     fn unfiltered_write(
         stmt: &str,
         raw: &str,
         lo: usize,
         ast: &Statement,
+        dialect: SqlDialect,
         out: &mut Vec<Diagnostic>,
     ) {
         let joins = |t: &[TableWithJoins]| t.iter().any(|t| !t.joins.is_empty());
@@ -13028,11 +13030,8 @@ mod lints {
             _ => return,
         };
         let range = to_range(stmt, lo, token.0.span);
-        let after = raw
-            .get(range.1 - lo..)
-            .unwrap_or("")
-            .trim_start()
-            .as_bytes();
+        let after =
+            super::skip_leading_noncode(raw.get(range.1 - lo..).unwrap_or(""), dialect).as_bytes();
         let top = after.len() > 3
             && after[..3].eq_ignore_ascii_case(b"TOP")
             && !crate::sql::is_word_byte(after[3]);
@@ -24697,6 +24696,9 @@ mod tests {
         assert!(ms("DELETE TOP (10) FROM employees;").is_empty());
         assert!(ms("UPDATE TOP (5) employees SET name = N'x';").is_empty());
         assert!(my("DELETE FROM employees LIMIT 100;").is_empty());
+        // A comment before the `TOP` is no reason to miss it (R1-L2-03).
+        assert!(ms("DELETE /* batch */ TOP (10) FROM employees;").is_empty());
+        assert!(ms("UPDATE -- x\n TOP (5) employees SET name = N'x';").is_empty());
         // A table called `top_x` is no TOP.
         assert_eq!(ms("UPDATE topx SET a = 1;"), ["UPDATE"]);
     }
