@@ -14979,7 +14979,14 @@ pub fn run_error_diagnostic(
     {
         let (s, e) = word_range_at(sql, p);
         let one_char = p + sql[p..].chars().next().map_or(1, char::len_utf8);
-        let range = if is_word_byte(sql.as_bytes()[p]) {
+        // PostgreSQL points a quoted name's error at its opening quote: the
+        // span `skip_noncode` gives the name, quotes and all.
+        let quoted = ident_quote(dialect, sql.as_bytes()[p])
+            .and_then(|_| skip_noncode(sql.as_bytes(), p, dialect))
+            .filter(|&end| ran.iter().any(|&(lo, hi)| lo <= p && end <= hi));
+        let range = if let Some(end) = quoted {
+            (p, end)
+        } else if is_word_byte(sql.as_bytes()[p]) {
             (s, e)
         } else {
             (p, one_char)
@@ -31343,6 +31350,36 @@ mod tests {
         let got =
             super::run_error_diagnostic(sql, &[(0, sql.len())], Some((0, 99)), msg, d).unwrap();
         assert_eq!(&sql[got.range.0..got.range.1], "x");
+    }
+
+    /// PostgreSQL points a quoted name's error at its opening quote: the
+    /// squiggle is the whole quoted name, not the quote alone.
+    #[test]
+    fn a_servers_position_on_a_quoted_name_takes_the_whole_name() {
+        let msg = "query failed: relation \"Orderz\" does not exist";
+        let sql = "SELECT * FROM \"Orderz\" WHERE 1 = 1";
+        let quote = sql.find('"').unwrap();
+        let got = super::run_error_diagnostic(
+            sql,
+            &[(0, sql.len())],
+            Some((0, quote + 1)),
+            msg,
+            SqlDialect::Postgres,
+        )
+        .unwrap();
+        assert_eq!(&sql[got.range.0..got.range.1], "\"Orderz\"");
+        // A string literal at the position is not a name: its first byte only.
+        let sql = "SELECT 'abc'::int";
+        let lit = sql.find('\'').unwrap();
+        let got = super::run_error_diagnostic(
+            sql,
+            &[(0, sql.len())],
+            Some((0, lit + 1)),
+            "query failed: invalid input syntax for type integer: \"abc\"",
+            SqlDialect::Postgres,
+        )
+        .unwrap();
+        assert_eq!(got.range, (lit, lit + 1));
     }
 
     #[test]
