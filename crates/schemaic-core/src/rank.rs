@@ -492,13 +492,17 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
     // Column candidates carry their owning `table` (+ in-scope `alias`) as the mid
     // annotation and the type as `detail`. The leading glyph is the column's *type
     // family* (schema-tree style), tinted gold (PK) / purple (FK) via `key`. Deduped
-    // by column name (first table in scope wins).
+    // by column name (first table in scope wins). A column the statement
+    // `written` itself (a CTE's, a derived table's) inserts as it was spelled
+    // (`intel::written_name_sql`), never through `accepted_insert`'s quoting:
+    // PostgreSQL folded a bare `Total` to `total`, so `"Total"` names nothing.
     let add_col = |cands: &mut Vec<Cand>,
                    seen: &mut HashSet<String>,
                    c: &ColMeta,
                    table: &str,
                    alias: Option<&str>,
-                   tier: u8| {
+                   tier: u8,
+                   written: bool| {
         // **Ask the question that decides it before paying for the answer.**
         // Every `Cand` costs four fresh `String`s, and the ranking below drops any
         // candidate `fuzzy_score` refuses — so building one for a column that
@@ -543,13 +547,50 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
             glyph: SuggestGlyph::ColumnType(classify_column_type(&c.type_name)),
             key,
             tier,
-            insert: None,
+            insert: written.then(|| crate::intel::written_name_sql(&c.name, input.dialect)),
             replace: None,
         });
+    };
+    // The statement's own CTE or derived table of this name, which shadows a
+    // table of its name.
+    let local_rel = |name: &str| {
+        input
+            .local
+            .relations
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+    };
+    // A scope reference's qualifier as SQL: its alias as the statement wrote
+    // it, else its name — on a folding engine as the catalogue spells it,
+    // which is the table the server resolved however the statement cased it
+    // (`intel::written_name_sql`'s reason). Searched for only when the name
+    // has a capital in it, which is the one case the two spellings can differ.
+    let qualifier_sql = |name: &str, alias: Option<&str>| -> String {
+        let d = input.dialect;
+        if let Some(a) = alias {
+            return crate::intel::written_name_sql(a, d);
+        }
+        if !d.folds_unquoted_names() {
+            return crate::export::ident_if_needed(name, d);
+        }
+        let catalogued = (local_rel(name).is_none()
+            && name.bytes().any(|b| b.is_ascii_uppercase()))
+        .then(|| {
+            schema
+                .tables
+                .iter()
+                .find(|(t, _)| t.eq_ignore_ascii_case(name))
+        })
+        .flatten();
+        match catalogued {
+            Some((t, _)) => crate::export::ident_if_needed(t, d),
+            None => crate::intel::written_name_sql(name, d),
+        }
     };
     // In-scope table references as qualifier candidates: an alias (`ac`, tag glyph,
     // detail = the table it stands for) or, for an unaliased table, its name (table
     // glyph). Offered in column contexts so `ON a` suggests `ac` before you type `.`.
+    // Each inserts as `qualifier_sql` writes it.
     let add_aliases = |cands: &mut Vec<Cand>, seen: &mut HashSet<String>| {
         for r in scope {
             let qtext = r.alias.as_deref().unwrap_or(&r.name);
@@ -576,7 +617,7 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
                 },
                 key: KeyKind::None,
                 tier: 0,
-                insert: None,
+                insert: Some(qualifier_sql(&r.name, r.alias.as_deref())),
                 replace: None,
             });
         }
@@ -593,17 +634,12 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
     // database (PostgreSQL, SQL Server) — `SchemaIndex::columns_by_schema`.
     // A bare name is the statement's own CTE or derived table first — one
     // shadows a table of its name — and the schema's otherwise.
-    let cols_of = |db: Option<&str>, name: &str| -> &[ColMeta] {
-        let local = db.is_none().then(|| {
-            input
-                .local
-                .relations
-                .iter()
-                .find(|(n, _)| n.eq_ignore_ascii_case(name))
-        });
-        match local.flatten() {
-            Some((_, cols)) => cols,
-            None => schema.columns_of(db, name),
+    // The flag says which: a local relation's columns are spelled as the
+    // statement wrote them (`add_col`'s `written`).
+    let cols_of = |db: Option<&str>, name: &str| -> (&[ColMeta], bool) {
+        match db.is_none().then(|| local_rel(name)).flatten() {
+            Some((_, cols)) => (cols, true),
+            None => (schema.columns_of(db, name), false),
         }
     };
     // Snippet abbrevs, in the top tier and ahead of the keyword continuations: an
@@ -754,8 +790,17 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
             // a dangling `db.` as a table (fixed in `intel::lexer_scope`), so the
             // natural table-first order is safe.
             if let Some((table, db, alias)) = resolve(q) {
-                for c in cols_of(db.as_deref(), &table) {
-                    add_col(&mut cands, &mut seen, c, &table, alias.as_deref(), 0);
+                let (cols, written) = cols_of(db.as_deref(), &table);
+                for c in cols {
+                    add_col(
+                        &mut cands,
+                        &mut seen,
+                        c,
+                        &table,
+                        alias.as_deref(),
+                        0,
+                        written,
+                    );
                 }
             } else if let Some(tbls) = schema
                 .tables_by_db
@@ -907,8 +952,9 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
                 // No FROM yet: offer every column, annotated by its owning table so
                 // the broader list stays navigable.
                 for (name, _) in &schema.tables {
-                    for c in cols_of(None, name) {
-                        add_col(&mut cands, &mut seen, c, name, None, 1);
+                    let (cols, written) = cols_of(None, name);
+                    for c in cols {
+                        add_col(&mut cands, &mut seen, c, name, None, 1, written);
                     }
                 }
             } else {
@@ -922,14 +968,16 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
                 let first_col = cands.len();
                 for (i, r) in scope.iter().enumerate().rev() {
                     let tier = if i == last { 0 } else { 1 };
-                    for c in cols_of(r.db.as_deref(), &r.name) {
-                        add_col(&mut cands, &mut seen, c, &r.name, r.alias.as_deref(), tier);
+                    let (cols, written) = cols_of(r.db.as_deref(), &r.name);
+                    for c in cols {
+                        let alias = r.alias.as_deref();
+                        add_col(&mut cands, &mut seen, c, &r.name, alias, tier, written);
                     }
                 }
                 // **A name two tables share is inserted qualified** — bare, the
                 // server refuses it as ambiguous — by the table whose row it is
-                // (its alias, else its name). Not where the slot takes a bare
-                // name only (`USING (…)`).
+                // (its alias, else its name, through `qualifier_sql`). Not where
+                // the slot takes a bare name only (`USING (…)`).
                 if scope.len() > 1 && !input.local.bare_columns {
                     let q = |s: &str| crate::export::ident_if_needed(s, input.dialect);
                     for c in &mut cands[first_col..] {
@@ -937,17 +985,15 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
                             .iter()
                             .filter(|r| {
                                 cols_of(r.db.as_deref(), &r.name)
+                                    .0
                                     .iter()
                                     .any(|m| m.name.eq_ignore_ascii_case(&c.text))
                             })
                             .count();
                         if c.kind == SuggestKind::Column && shared > 1 {
-                            let qual = if c.alias.is_empty() {
-                                &c.table
-                            } else {
-                                &c.alias
-                            };
-                            c.insert = Some(format!("{}.{}", q(qual), q(&c.text)));
+                            let alias = (!c.alias.is_empty()).then_some(c.alias.as_str());
+                            let col = c.insert.take().unwrap_or_else(|| q(&c.text));
+                            c.insert = Some(format!("{}.{col}", qualifier_sql(&c.table, alias)));
                         }
                     }
                 }
@@ -1028,8 +1074,17 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
         ClauseCtx::Other => {
             add_aliases(&mut cands, &mut seen);
             for r in scope {
-                for c in cols_of(r.db.as_deref(), &r.name) {
-                    add_col(&mut cands, &mut seen, c, &r.name, r.alias.as_deref(), 0);
+                let (cols, written) = cols_of(r.db.as_deref(), &r.name);
+                for c in cols {
+                    add_col(
+                        &mut cands,
+                        &mut seen,
+                        c,
+                        &r.name,
+                        r.alias.as_deref(),
+                        0,
+                        written,
+                    );
                 }
             }
             for (name, db) in &schema.tables {
@@ -2365,6 +2420,78 @@ mod tests {
             ..table.clone()
         };
         assert_eq!(ins(my, &own), own.insert);
+    }
+
+    /// **A name the statement spelled bare is not re-quoted** on PostgreSQL,
+    /// which folded it: a CTE's `Total` is `total` there, and `"Total"` names
+    /// no column. Nor is a bare alias (`O` → `"O".id`) or table name the user
+    /// cased (`Orders`, written as the catalogue's `orders`). A catalogue
+    /// column keeps its quoting: `"OrderDate"` is its real name.
+    #[test]
+    fn a_name_the_statement_wrote_bare_is_not_re_quoted() {
+        let pg = SqlDialect::Postgres;
+        let meta = |n: &str| ColMeta {
+            name: n.to_string(),
+            type_name: String::new(),
+            nullable: true,
+            primary_key: false,
+            foreign_key: false,
+        };
+        let local = LocalNames {
+            relations: vec![(
+                "t".to_string(),
+                vec![meta("Total"), meta("Unit Price"), meta("id")],
+            )],
+            ..LocalNames::default()
+        };
+        let cont = Continuation::default();
+        let used = HashSet::new();
+        let s = shop();
+        let rows = |ctx: ClauseCtx, scope: &[TableRef], prefix: &str| -> Vec<Suggestion> {
+            rank(
+                &s,
+                &RankInput {
+                    ctx: &ctx,
+                    cont: &cont,
+                    scope,
+                    prefix,
+                    snippets: &[],
+                    join_targets: &[],
+                    star: None,
+                    used: &used,
+                    active_db: Some("shop"),
+                    dialect: pg,
+                    flavour: ServerFlavour::Unknown,
+                    local: &local,
+                    wide: false,
+                    accepted: &Default::default(),
+                },
+            )
+        };
+        let accepted = |rows: &[Suggestion], name: &str| {
+            let row = rows
+                .iter()
+                .find(|r| r.text == name)
+                .unwrap_or_else(|| panic!("{name} offered: {rows:?}"));
+            accepted_insert(row, pg, false).unwrap_or_else(|| row.text.clone())
+        };
+        let t = [tref("t", None)];
+        let col = rows(ClauseCtx::Column, &t, "");
+        assert_eq!(accepted(&col, "Total"), "Total");
+        assert_eq!(accepted(&col, "Unit Price"), "\"Unit Price\"");
+        let q = rows(ClauseCtx::Qualified("t".into()), &t, "");
+        assert_eq!(accepted(&q, "Total"), "Total");
+        // A shared column's qualifier, and an alias row, as the user wrote it.
+        let scope = [tref("orders", Some("O")), tref("customers", Some("C"))];
+        let col = rows(ClauseCtx::Column, &scope, "");
+        assert_eq!(accepted(&col, "id"), "C.id");
+        assert_eq!(accepted(&col, "O"), "O");
+        let scope = [tref("Orders", None), tref("customers", None)];
+        let col = rows(ClauseCtx::Column, &scope, "");
+        assert_eq!(accepted(&col, "Orders"), "orders");
+        let scope = [tref("customers", None), tref("Orders", None)];
+        let col = rows(ClauseCtx::Column, &scope, "");
+        assert_eq!(accepted(&col, "id"), "orders.id");
     }
 
     /// **The FK `ON` predicate goes in as written**, on every engine: it is a

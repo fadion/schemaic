@@ -13220,34 +13220,56 @@ impl Catalog {
     }
 }
 
-/// The qualifier to write for a table reference in a predicate: its alias if it
-/// has one, else its (bare) name.
-fn ref_qualifier(r: &TableRef) -> &str {
-    r.alias.as_deref().unwrap_or(&r.name)
+/// A name **the user wrote** in the statement, quotes off, as SQL naming the
+/// same thing — where [`crate::export::ident_if_needed`] is for a name the
+/// catalogue spelled.
+///
+/// The two differ on an engine that folds a bare name's case
+/// ([`SqlDialect::folds_unquoted_names`]): PostgreSQL read a bare `O` as `o`,
+/// so `"O"` names nothing, while a catalogue's `OrderDate` does need its
+/// quotes. So a name that is plain once folded goes in as written; one that
+/// needs quotes for another reason (a space, a reserved word) must have had
+/// them, and keeps them. The one spelling this cannot tell apart is a quoted
+/// name that differs from a bare one only by case (`"O"`): the statement's
+/// quotes are off by the time a name gets here, and the bare spelling is the
+/// common one.
+pub fn written_name_sql(name: &str, dialect: SqlDialect) -> String {
+    if dialect.folds_unquoted_names() {
+        let folded = name.to_ascii_lowercase();
+        if crate::export::ident_if_needed(&folded, dialect) == folded {
+            return name.to_string();
+        }
+    }
+    crate::export::ident_if_needed(name, dialect)
 }
 
-/// Build the equality predicate joining `left`'s `lcols` to `right`'s `rcols`
-/// (aligned by position), e.g. `o.customer_id = c.id` (composite → `AND`-joined).
-fn build_predicate(
-    left: &TableRef,
-    lcols: &[String],
-    right: &TableRef,
-    rcols: &[String],
-    dialect: SqlDialect,
-) -> String {
+/// The qualifier to write for a table reference in a predicate: its alias if it
+/// has one ([`written_name_sql`]), else its name — on a folding engine as the
+/// catalogue spells it (`catalogued`), which is the table the server resolved
+/// whichever way the statement cased it.
+fn ref_qualifier(r: &TableRef, catalogued: &str, dialect: SqlDialect) -> String {
+    match &r.alias {
+        Some(a) => written_name_sql(a, dialect),
+        None if dialect.folds_unquoted_names() => {
+            crate::export::ident_if_needed(catalogued, dialect)
+        }
+        None => crate::export::ident_if_needed(&r.name, dialect),
+    }
+}
+
+/// Build the equality predicate joining `left`, the table declaring the key
+/// `e`, to `right`, the one it references (columns aligned by position), e.g.
+/// `o.customer_id = c.id` (composite → `AND`-joined).
+fn build_predicate(left: &TableRef, e: &FkEdge, right: &TableRef, dialect: SqlDialect) -> String {
     let q = |s: &str| crate::export::ident_if_needed(s, dialect);
-    lcols
+    let (lq, rq) = (
+        ref_qualifier(left, &e.table, dialect),
+        ref_qualifier(right, &e.ref_table, dialect),
+    );
+    e.columns
         .iter()
-        .zip(rcols)
-        .map(|(lc, rc)| {
-            format!(
-                "{}.{} = {}.{}",
-                q(ref_qualifier(left)),
-                q(lc),
-                q(ref_qualifier(right)),
-                q(rc)
-            )
-        })
+        .zip(&e.ref_columns)
+        .map(|(lc, rc)| format!("{lq}.{} = {rq}.{}", q(lc), q(rc)))
         .collect::<Vec<_>>()
         .join(" AND ")
 }
@@ -13263,14 +13285,14 @@ fn fk_predicate(
     if let Some(edges) = catalog.fks_of(&a.name) {
         for e in edges {
             if e.ref_table.eq_ignore_ascii_case(&b.name) {
-                return Some(build_predicate(a, &e.columns, b, &e.ref_columns, dialect));
+                return Some(build_predicate(a, e, b, dialect));
             }
         }
     }
     if let Some(edges) = catalog.fks_of(&b.name) {
         for e in edges {
             if e.ref_table.eq_ignore_ascii_case(&a.name) {
-                return Some(build_predicate(b, &e.columns, a, &e.ref_columns, dialect));
+                return Some(build_predicate(b, e, a, dialect));
             }
         }
     }
@@ -13551,8 +13573,7 @@ fn join_targets_for(
                     alias: None,
                     db: None,
                 };
-                let build =
-                    |c: &TableRef| build_predicate(s, &e.columns, c, &e.ref_columns, dialect);
+                let build = |c: &TableRef| build_predicate(s, e, c, dialect);
                 out.push(JoinTarget {
                     table: e.ref_table.clone(),
                     table_sql: crate::export::ident_if_needed(&e.ref_table, dialect),
@@ -13580,8 +13601,7 @@ fn join_targets_for(
                     db: None,
                 };
                 if seen.insert(t.clone()) {
-                    let build =
-                        |c: &TableRef| build_predicate(c, &e.columns, s, &e.ref_columns, dialect);
+                    let build = |c: &TableRef| build_predicate(c, e, s, dialect);
                     out.push(JoinTarget {
                         table: e.table.clone(),
                         table_sql: crate::export::ident_if_needed(&e.table, dialect),
@@ -26440,6 +26460,37 @@ mod tests {
         assert_eq!(
             join_at(sql, sql.len()),
             Some("o.customer_id = c.id".to_string())
+        );
+    }
+
+    /// **A name the user wrote bare is not re-quoted** on PostgreSQL, which
+    /// folded it: `"O".customer_id` names no table in `FROM orders O`. An
+    /// unaliased table is written as the catalogue spells it, which is what
+    /// the server resolved. Asked of the popup's row and of the ghost alike.
+    #[test]
+    fn a_bare_upper_case_qualifier_is_not_quoted_on_a_folding_engine() {
+        let (schema, db) = fk_catalog();
+        let cat = Catalog::build(&[(db, &schema)], Some(db));
+        let pg = SqlDialect::Postgres;
+        let ghost = |sql: &str| predict(sql, sql.len(), &cat, pg);
+        let sql = "SELECT * FROM orders O JOIN customers c ON ";
+        assert_eq!(
+            join_at_on(sql, sql.len(), pg).as_deref(),
+            Some("O.customer_id = c.id")
+        );
+        assert_eq!(ghost(sql).as_deref(), Some("O.customer_id = c.id"));
+        let sql = "SELECT * FROM orders o JOIN customers C ";
+        assert_eq!(ghost(sql).as_deref(), Some("ON o.customer_id = C.id"));
+        let sql = "SELECT * FROM Line_Items JOIN ";
+        assert_eq!(
+            ghost(sql).as_deref(),
+            Some("orders ON line_items.order_id = orders.id")
+        );
+        // A name that needs its quotes for another reason keeps them.
+        let sql = "SELECT * FROM orders \"Order Rows\" JOIN customers c ON ";
+        assert_eq!(
+            join_at_on(sql, sql.len(), pg).as_deref(),
+            Some("\"Order Rows\".customer_id = c.id")
         );
     }
 

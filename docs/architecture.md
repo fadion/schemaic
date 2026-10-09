@@ -13922,6 +13922,17 @@ existing prose was left alone.
       `LocalNames::bare_columns`. Inside a quoted name `accepted_insert` gives a column its bare
       name, as it gives a table (`a_column_two_tables_share_is_inserted_qualified`,
       `a_using_list_is_told_from_other_parens`).
+      **A name the statement wrote is not quoted as if the catalogue had spelled it.** A local
+      relation's column, an in-scope alias row and the shared column's qualifier go in through
+      `intel::written_name_sql`, which on a folding engine writes a name that is plain once folded
+      as written: PostgreSQL read a bare `Total` or `O` as `total`/`o`, so `accepted_insert`'s
+      `"Total"` and `"O".id` named nothing. An unaliased table's name is written as the catalogue
+      spells it, the table the server resolved however the statement cased it. The FK predicate
+      writes its qualifiers the same way (`intel::build_predicate`, from the `FkEdge`'s own
+      spellings). Its quotes are off by the time a name reaches ranking, so a quoted `"O"` alias is
+      the one spelling this cannot tell from a bare `O`, and takes the bare one's reading
+      (`a_name_the_statement_wrote_bare_is_not_re_quoted`,
+      `a_bare_upper_case_qualifier_is_not_quoted_on_a_folding_engine`).
       **Inside a string compared with an enum or set column, the list is that column's members**
       (`enum_value_suggestions`, which `rank` never reaches — its caller is the literal gate's
       exception, under `completion.rs`). The column is resolved in the statement's scope through the slot's
