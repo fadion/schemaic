@@ -12562,9 +12562,17 @@ existing prose was left alone.
     and `run` treats as `;` (`end_statement`), written tight unless spelled in word bytes
     (`a_mysql_delimiter_line_survives_formatting`, by the same split-and-compare, and idempotent).
     **Idempotence is held as a property over the widest corpus the crate has**: `intel`'s
-    `valid_corpus`, formatted on all four engines, must format to itself a second time and keep
-    every non-blank character in order (`the_corpus_formats_idempotently_on_every_engine`, under
-    `intel`'s tests for where the corpus lives). The token-preservation test runs its shared shapes
+    `valid_corpus`, formatted on all four engines, and `format_corpus` — the shapes Format Code
+    has got wrong, each on its own engine — must format to itself a second time and **say the same
+    thing**: the same statements as `sql::executable_statements` splits them, each the same
+    `sqlparser` tokens with the blanks dropped (`what_it_says`). The *Format statement* of each
+    statement alone, spliced back, is held to the same (`the_corpus_formats_idempotently_on_every_engine`,
+    under `intel`'s tests for where the corpus lives). It compared non-blank characters until
+    then, which is blind to every split and fusion this formatter can make — `END//` and
+    `END / /`, `between .1` and `between.1`, `- ~5` and `-~ 5` have the same ink — and a census
+    taken with `sqlfmt::tokenize` itself agrees with itself about a token it mis-splits, so the
+    reader is deliberately another lexer. What it still cannot see is a blank that matters
+    *between* two tokens (PostgreSQL's `'foo'⏎'bar'`), which the module's own tests pin. The token-preservation test runs its shared shapes
     on all four engines too, and SQL Server's own besides — bracketed names with `]]`, `N'…'`,
     `@x`/`@@x`/`#t`/`##t`, compound assignment, `TOP (n)`, `OUTPUT`, `APPLY`, `type::Method`,
     `!<`/`!>` — each idempotent. Both were green on arrival: they guard, they did not find.

@@ -25174,25 +25174,91 @@ mod tests {
         ]
     }
 
-    /// **Format Code is idempotent over the whole corpus, on every engine**:
-    /// a second Format changes nothing, and neither changes what the
-    /// statement says — the same non-blank characters, in order. Asserted
-    /// here because this is the widest body of SQL the crate holds; the
-    /// formatter's own tests pin layout, one shape at a time.
+    /// Shapes Format Code has got wrong, each with the engine it is SQL on —
+    /// kept apart from [`valid_corpus`], whose entries must also draw no
+    /// diagnostic on MySQL, which a `DELIMITER` script or a PostgreSQL
+    /// operator would.
+    fn format_corpus() -> &'static [(SqlDialect, &'static str)] {
+        use SqlDialect::*;
+        &[
+            (MsSql, "SELECT 1\nGO\nSELECT 2\n"),
+            (
+                Postgres,
+                "select id::text, data #> '{a,b}' from t where x = -1",
+            ),
+            (Postgres, "select 'foo'\n'bar' from t"),
+        ]
+    }
+
+    /// What `sql` says, read by lexers that are not the formatter's: the
+    /// statements a client sends ([`crate::sql::executable_statements`], which
+    /// knows `DELIMITER` and `GO`), each as `sqlparser`'s tokens with the
+    /// blanks between them dropped. A statement `sqlparser` cannot tokenize
+    /// is compared by its non-blank characters instead.
+    ///
+    /// **Independent of `sqlfmt::tokenize` on purpose**: a census taken with
+    /// the tokenizer under test agrees with itself about every token it
+    /// splits or fuses. What this still cannot see is a blank that matters
+    /// *between* two tokens — PostgreSQL joins `'foo'⏎'bar'` into one string
+    /// only across the newline — which the formatter's own tests pin.
+    fn what_it_says(sql: &str, d: SqlDialect) -> Vec<Vec<String>> {
+        use sqlparser::tokenizer::{Token, Tokenizer, Whitespace};
+        crate::sql::executable_statements(sql, d)
+            .iter()
+            .map(|s| match Tokenizer::new(&*d.parser(), s).tokenize() {
+                Ok(toks) => toks
+                    .into_iter()
+                    .filter_map(|t| match t {
+                        Token::Whitespace(
+                            Whitespace::Space | Whitespace::Newline | Whitespace::Tab,
+                        ) => None,
+                        Token::Whitespace(Whitespace::SingleLineComment { comment, prefix }) => {
+                            Some(format!("{prefix}{}", comment.trim_end()))
+                        }
+                        t => Some(t.to_string()),
+                    })
+                    .collect(),
+                Err(_) => vec![s.split_whitespace().collect::<String>()],
+            })
+            .collect()
+    }
+
+    /// **Format Code is idempotent over the whole corpus, on every engine,
+    /// and changes nothing the statement says** — the same statements, each
+    /// the same tokens, as [`what_it_says`] reads them. So does *Format
+    /// statement* on each statement alone, which formats a fragment cut out
+    /// of the document. Asserted here because this is the widest body of SQL
+    /// the crate holds; the formatter's own tests pin layout, one shape at a
+    /// time.
     #[test]
     fn the_corpus_formats_idempotently_on_every_engine() {
         let mut failures = Vec::new();
-        let ink = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
-        for d in SqlDialect::ALL {
-            for sql in valid_corpus() {
-                let once = crate::sqlfmt::format_sql(sql, "  ", d);
-                let twice = crate::sqlfmt::format_sql(&once, "  ", d);
-                if twice != once {
+        let keep = crate::sqlfmt::KeywordCase::Keep;
+        let cases = SqlDialect::ALL
+            .iter()
+            .flat_map(|&d| valid_corpus().iter().map(move |&sql| (d, sql)))
+            .chain(format_corpus().iter().copied());
+        for (d, sql) in cases {
+            let said = what_it_says(sql, d);
+            let once = crate::sqlfmt::format_sql(sql, "  ", d);
+            let twice = crate::sqlfmt::format_sql(&once, "  ", d);
+            if twice != once {
+                failures.push(format!(
+                    "[{d:?}] not idempotent: {sql}\n{once}\n--\n{twice}"
+                ));
+            } else if what_it_says(&once, d) != said {
+                failures.push(format!("[{d:?}] changed what it says: {sql}\n{once}"));
+            }
+            for (lo, _) in crate::sql::statement_ranges(sql, d) {
+                let Some((lo, hi, text)) = crate::sqlfmt::format_statement(sql, lo, "  ", d, keep)
+                else {
+                    continue;
+                };
+                let out = format!("{}{text}{}", &sql[..lo], &sql[hi..]);
+                if what_it_says(&out, d) != said {
                     failures.push(format!(
-                        "[{d:?}] not idempotent: {sql}\n{once}\n--\n{twice}"
+                        "[{d:?}] Format statement at {lo} changed what it says: {sql}\n{out}"
                     ));
-                } else if ink(&once) != ink(sql) {
-                    failures.push(format!("[{d:?}] changed the text: {sql}\n{once}"));
                 }
             }
         }
