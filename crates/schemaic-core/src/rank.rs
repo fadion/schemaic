@@ -1000,17 +1000,29 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
                 // the slot takes a bare name only (`USING (…)`).
                 if scope.len() > 1 && !input.local.bare_columns {
                     let q = |s: &str| crate::export::ident_if_needed(s, input.dialect);
+                    // How many references in scope have each name, counted
+                    // once up front: asking every scope table's column list
+                    // per candidate was quadratic in the joined columns, on
+                    // the undebounced path (20 tables × 60 columns: 1.7 ms a
+                    // keystroke). Each reference counts a name once, however
+                    // many of its columns spell it.
+                    let mut holders: HashMap<String, (usize, usize)> = HashMap::new();
+                    for (i, r) in scope.iter().enumerate() {
+                        for m in cols_of(r.db.as_deref(), &r.name).0 {
+                            let e = holders
+                                .entry(m.name.to_ascii_lowercase())
+                                .or_insert((0, usize::MAX));
+                            if e.1 != i {
+                                *e = (e.0 + 1, i);
+                            }
+                        }
+                    }
                     for c in &mut cands[first_col..] {
-                        let shared = scope
-                            .iter()
-                            .filter(|r| {
-                                cols_of(r.db.as_deref(), &r.name)
-                                    .0
-                                    .iter()
-                                    .any(|m| m.name.eq_ignore_ascii_case(&c.text))
-                            })
-                            .count();
-                        if c.kind == SuggestKind::Column && shared > 1 {
+                        if c.kind != SuggestKind::Column {
+                            continue;
+                        }
+                        let shared = holders.get(&c.text.to_ascii_lowercase()).map_or(0, |e| e.0);
+                        if shared > 1 {
                             let alias = (!c.alias.is_empty()).then_some(c.alias.as_str());
                             let col = c.insert.take().unwrap_or_else(|| q(&c.text));
                             c.insert = Some(format!("{}.{col}", qualifier_sql(&c.table, alias)));
