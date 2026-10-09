@@ -1587,10 +1587,11 @@ fn run_result(state: &QueryState, duration_ms: u64) -> Option<schemaic_core::his
 /// exists (see `refresh_after_run`).
 type LateRefresh = Rc<RefCell<Option<Rc<dyn Fn(String)>>>>;
 
-/// Settle a tab's schema after a run lands or its transaction ends, by
-/// `sql::schema_reload`: reload its database now, or owe it until the open
-/// transaction ends (`owed`, by tab id). Only on the tree's own connection —
-/// `refresh_db` reads the active one.
+/// Settle a tab's schema after a run lands or its transaction ends: reload its
+/// database now, or owe it until the open transaction ends (`owed`, by tab id).
+/// The decision is `sql::schema_settle`, pure and tested — including why a
+/// reload off the tree's connection is dropped rather than owed; this only
+/// reads the signals and performs it.
 fn settle_schema(
     tab: schemaic_ui::Tab,
     changed: bool,
@@ -1599,20 +1600,19 @@ fn settle_schema(
     active_conn: u64,
     refresh: &LateRefresh,
 ) {
-    let was_owed = owed.borrow().contains(&tab.id);
-    let (now, still) = schemaic_core::sql::schema_reload(
+    let plan = schemaic_core::sql::schema_settle(
         changed,
         tab.tx.get_untracked().is_open(),
         dialect,
-        was_owed,
+        owed.borrow().contains(&tab.id),
+        tab.conn_id.get_untracked() == active_conn,
     );
-    if still {
+    if plan.owe {
         owed.borrow_mut().insert(tab.id);
     } else {
         owed.borrow_mut().remove(&tab.id);
     }
-    if now
-        && tab.conn_id.get_untracked() == active_conn
+    if plan.reload
         && let Some(database) = tab.database.get_untracked()
         && let Some(reload) = refresh.borrow().clone()
     {
@@ -2945,8 +2945,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     // ended the transaction (`COMMIT` typed in the editor)
                     // settles what it owed.
                     let changed = !is_view
-                        && matches!(state, QueryState::Loaded(_))
-                        && schemaic_core::sql::changes_schema(&tx_sql, dialect);
+                        && schemaic_core::sql::run_changes_schema(
+                            [(tx_sql.as_str(), matches!(state, QueryState::Loaded(_)))],
+                            dialect,
+                        );
                     settle_schema(
                         tab,
                         changed,
@@ -3488,10 +3490,12 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     }
                     // A statement that changed the schema reloads it, once for
                     // the batch — see the single run's.
-                    let changed = tx_stmts.iter().zip(&states).any(|(sql, state)| {
-                        matches!(state, QueryState::Loaded(_))
-                            && schemaic_core::sql::changes_schema(sql, dialect)
-                    });
+                    let changed = schemaic_core::sql::run_changes_schema(
+                        tx_stmts.iter().zip(&states).map(|(sql, state)| {
+                            (sql.as_str(), matches!(state, QueryState::Loaded(_)))
+                        }),
+                        dialect,
+                    );
                     settle_schema(
                         tab,
                         changed,

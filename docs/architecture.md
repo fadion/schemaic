@@ -15483,14 +15483,21 @@ existing prose was left alone.
   `IF OBJECT_ID(…) IS NOT NULL DROP TABLE t` and `SET NOCOUNT ON` ⏎ `CREATE TABLE …` put the DDL
   behind another statement's head, and a control-flow piece the splitter keeps whole counts a
   `CREATE`/`ALTER`/`DROP` anywhere in it, erring wide — so the tree, the completion
-  index and the diagnostics catalogue stop showing the schema the run replaced. It is decided by
-  `sql::schema_reload`, through the app's `settle_schema`, at each run that lands and at each end
+  index and the diagnostics catalogue stop showing the schema the run replaced. Both run paths
+  decide that through `sql::run_changes_schema` (a landed statement that changes it), and the rest
+  is `sql::schema_settle` — `sql::schema_reload` plus the tree's connection, pure and tested —
+  which the app's `settle_schema` only performs, at each run that lands and at each end
   of the tab's transaction: inside a transaction still open on an engine whose DDL is
   transactional (`ddl::ddl_is_transactional`) the reload is **owed** instead (`ddl_owed`, by
   tab id), since it reads on a fresh connection that cannot see the change before `COMMIT`; the
   transaction's end — the Commit and Rollback buttons (`end_tx`), or a `COMMIT` typed and run —
   pays it, a `ROLLBACK`'s too, which costs one introspection and shows the schema as it is. Only
-  on the tree's own connection, since `refresh_db` reads the active one; a filter re-run never
+  on the tree's own connection, since `refresh_db` reads the active one — and a reload due off it
+  is **dropped, not owed**: switching back to that connection clears the tree and `load_schema`
+  re-reads every database fresh, which already shows what was committed, while a debt the
+  transaction still holds open is kept, since a switch back before the `COMMIT` reads the old
+  schema (`a_commit_off_the_trees_connection_reloads_nothing_and_owes_nothing`,
+  `an_open_transactions_debt_survives_the_tree_showing_another_connection`). A filter re-run never
   does. `refresh_db` is defined thousands of lines below the run paths (it needs `start_fetch`),
   so they call it through `refresh_after_run`, a slot filled once it exists
   (`ddl_changes_the_schema_and_data_does_not`,

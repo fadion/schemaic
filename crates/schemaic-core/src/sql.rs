@@ -1466,6 +1466,57 @@ pub fn schema_reload(
     }
 }
 
+/// [`schema_settle`]'s answer: reload the tab's database now, and whether a
+/// reload is still owed for it afterwards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SchemaSettle {
+    /// Re-introspect the tab's database now.
+    pub reload: bool,
+    /// Keep (or start) owing one, to pay when the tab's transaction ends.
+    pub owe: bool,
+}
+
+/// Settle a tab's schema after a run lands or its transaction ends — the
+/// whole decision the app's `settle_schema` used to compose by hand around
+/// [`schema_reload`]. `on_tree_conn` is whether the tab's connection is the
+/// one the schema tree is showing.
+///
+/// **A reload off the tree's connection is dropped, not owed.** The tree reads
+/// only the active connection, so there is nothing of the tab's to reload
+/// while another is shown — and nothing to pay later either: switching back
+/// to the tab's connection re-introspects every database fresh (the switch
+/// clears the tree and `load_schema` fetches it whole), which already shows
+/// what the transaction committed. Owing it across the switch would only buy
+/// a second introspection of a tree that was just read. What *is* kept off
+/// the tree's connection is a debt the transaction still holds open: a
+/// switch back before the `COMMIT` reads the old schema, so the end of the
+/// transaction must still settle it.
+pub fn schema_settle(
+    changed: bool,
+    in_open_tx: bool,
+    dialect: SqlDialect,
+    owed: bool,
+    on_tree_conn: bool,
+) -> SchemaSettle {
+    let (now, still) = schema_reload(changed, in_open_tx, dialect, owed);
+    SchemaSettle {
+        reload: now && on_tree_conn,
+        owe: still,
+    }
+}
+
+/// Whether a run changed the schema: any statement that ran to a result
+/// (`landed`) and [`changes_schema`]. A statement that failed or never ran
+/// changed nothing. The single run and the batch both ask it, so the two
+/// cannot decide `changed` differently.
+pub fn run_changes_schema<'a>(
+    ran: impl IntoIterator<Item = (&'a str, bool)>,
+    dialect: SqlDialect,
+) -> bool {
+    ran.into_iter()
+        .any(|(sql, landed)| landed && changes_schema(sql, dialect))
+}
+
 /// Does the `TABLE` of `stmt`'s header name a T-SQL temporary table — the
 /// name after it starts with `#`?
 fn names_a_temp_table(stmt: &str, dialect: SqlDialect) -> bool {
@@ -6425,6 +6476,92 @@ mod changes_schema_tests {
             // …and its end, a COMMIT or a ROLLBACK, reloads.
             assert_eq!(schema_reload(false, false, d, true), (true, false), "{d:?}");
         }
+    }
+
+    /// The composition the app used to hold: `schema_reload` plus the tree's
+    /// connection. On the tree's connection it is `schema_reload` exactly.
+    #[test]
+    fn settling_on_the_trees_connection_is_schema_reload() {
+        use super::{SchemaSettle, schema_reload, schema_settle};
+        for d in [MySql, Postgres, Sqlite, MsSql] {
+            for changed in [false, true] {
+                for tx in [false, true] {
+                    for owed in [false, true] {
+                        let (reload, owe) = schema_reload(changed, tx, d, owed);
+                        assert_eq!(
+                            schema_settle(changed, tx, d, owed, true),
+                            SchemaSettle { reload, owe },
+                            "{d:?} changed={changed} tx={tx} owed={owed}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// **Off the tree's connection a reload is dropped, not owed**: switching
+    /// back re-reads that connection whole. A PostgreSQL Manual tab on B owes
+    /// a reload for its `CREATE TABLE`; the tree is on A when it commits — no
+    /// reload (the tree shows A) and no debt left behind.
+    #[test]
+    fn a_commit_off_the_trees_connection_reloads_nothing_and_owes_nothing() {
+        use super::{SchemaSettle, schema_settle};
+        assert_eq!(
+            schema_settle(false, false, Postgres, true, false),
+            SchemaSettle {
+                reload: false,
+                owe: false
+            }
+        );
+        // MySQL's DDL commits on the spot: same answer for the change itself.
+        assert_eq!(
+            schema_settle(true, true, MySql, false, false),
+            SchemaSettle {
+                reload: false,
+                owe: false
+            }
+        );
+    }
+
+    /// …but a transaction still open keeps its debt off the tree's connection
+    /// too: a switch back before the `COMMIT` reads the old schema, so its end
+    /// must still reload.
+    #[test]
+    fn an_open_transactions_debt_survives_the_tree_showing_another_connection() {
+        use super::{SchemaSettle, schema_settle};
+        for d in [Postgres, Sqlite, MsSql] {
+            let want = SchemaSettle {
+                reload: false,
+                owe: true,
+            };
+            assert_eq!(schema_settle(true, true, d, false, false), want, "{d:?}");
+            assert_eq!(schema_settle(false, true, d, true, false), want, "{d:?}");
+        }
+    }
+
+    /// `changed` for a run: a landed statement that changes the schema. A
+    /// failed `CREATE` changed nothing; one landed DDL in a batch is enough.
+    #[test]
+    fn a_run_changed_the_schema_only_through_a_statement_that_landed() {
+        use super::run_changes_schema;
+        assert!(run_changes_schema(
+            [("CREATE TABLE t (a int)", true)],
+            MySql
+        ));
+        assert!(!run_changes_schema(
+            [("CREATE TABLE t (a int)", false)],
+            MySql
+        ));
+        assert!(!run_changes_schema([("SELECT 1", true)], MySql));
+        assert!(run_changes_schema(
+            [
+                ("SELECT 1", true),
+                ("DROP TABLE t", true),
+                ("CREATE TABLE u (a int)", false),
+            ],
+            Postgres
+        ));
+        assert!(!run_changes_schema([], Postgres));
     }
 }
 
