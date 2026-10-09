@@ -15942,7 +15942,11 @@ pub fn enum_value_slot(
     if b[q] != b'\'' {
         return None;
     }
-    let closed = end > caret && b[end - 1] == b'\'';
+    // Closed only by a quote on the caret's own line: with none there, the
+    // next `'` the lexer reaches is another statement's, often lines below,
+    // and an accept would replace everything up to it. No member of an enum
+    // spans a line.
+    let closed = end > caret && b[end - 1] == b'\'' && !b[caret..end].contains(&b'\n');
     let value = (q + 1, if closed { end - 1 } else { caret });
     // What the literal is compared with: an operator, or an `IN (` list.
     let before = sql[lo..q].trim_end();
@@ -30948,6 +30952,22 @@ mod tests {
         assert_eq!(
             enum_slot("UPDATE t SET status = 'P|"),
             some(None, "status", "P", false)
+        );
+    }
+
+    /// **An unclosed literal is not closed by a quote on a later line**: the
+    /// next `'` in the document is another statement's, and taking it as the
+    /// closer made an accept replace every line up to it.
+    #[test]
+    fn a_quote_on_a_later_line_does_not_close_an_enum_slot() {
+        assert_eq!(
+            enum_slot("SELECT * FROM t WHERE status = 'sh|\nSELECT 1 FROM u WHERE n = 'x';"),
+            Some((None, "status".to_string(), "sh".to_string(), false))
+        );
+        // On the caret's own line the closer is the literal's.
+        assert_eq!(
+            enum_slot("SELECT * FROM t WHERE status = 'sh|ipped'\nAND 1"),
+            Some((None, "status".to_string(), "shipped".to_string(), true))
         );
     }
 

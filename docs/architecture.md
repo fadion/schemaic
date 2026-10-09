@@ -1118,7 +1118,10 @@ existing prose was left alone.
     number. **The `@` check reads the byte, not the token**: the tokenizer drops the sigil, so
     `@v = '` would otherwise read as a column `v`. `EnumSlot::value` is the literal's contents —
     through the closing quote when it has one, else through the caret — and `closed` says which
-    (`a_string_compared_to_a_column_is_an_enum_slot`, `other_strings_are_no_enum_slot`).
+    (`a_string_compared_to_a_column_is_an_enum_slot`, `other_strings_are_no_enum_slot`). **Only a
+    quote on the caret's own line closes it**: `skip_noncode` runs an unclosed `'` to the next
+    quote anywhere below, usually another statement's, and an accept replaced every line up to it
+    (`a_quote_on_a_later_line_does_not_close_an_enum_slot`).
     **`error_fix_range` decides what an AI fix is allowed to rewrite**, and it is a range question
     rather than a prompt one: a fix replaces text in the editor, so hand the model the buffer and
     every statement the user did not ask about comes back rewritten — which is what the error bar
