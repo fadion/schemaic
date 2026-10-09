@@ -280,6 +280,26 @@ pub fn join_lines(
     sel_b: usize,
     dialect: SqlDialect,
 ) -> Option<IndentEdit> {
+    let lo = floor_char(full, sel_a.min(sel_b));
+    let hi = floor_char(full, sel_a.max(sel_b));
+    let plan = join_breaks(full, join_candidates(full, lo, hi)?, dialect)?;
+    let sel = if lo == hi {
+        (plan.start, plan.start)
+    } else {
+        (plan.coarse(lo), plan.coarse(hi))
+    };
+    Some(IndentEdit {
+        start: plan.start,
+        end: plan.end,
+        text: plan.out,
+        sel,
+    })
+}
+
+/// The line breaks [`join_lines`] would join for the selection `sel_a..sel_b`
+/// before asking which are code: every break inside the lines it spans, or —
+/// within one line — the one ending it. `None` on the last line alone.
+fn join_candidates(full: &str, sel_a: usize, sel_b: usize) -> Option<Vec<usize>> {
     let b = full.as_bytes();
     let len = full.len();
     let lo = floor_char(full, sel_a.min(sel_b));
@@ -297,6 +317,76 @@ pub fn join_lines(
             return None;
         }
         breaks.push(last_le);
+    }
+    Some(breaks)
+}
+
+/// A join worked out ([`join_breaks`]): `[start, end)` of the text becomes
+/// `out`, made of one replacement per joined break — `segs`, each its old
+/// `(start, end)`, its start in the new text and its length there.
+struct JoinPlan {
+    start: usize,
+    end: usize,
+    out: String,
+    segs: Vec<(usize, usize, usize, usize)>,
+}
+
+impl JoinPlan {
+    /// `off` in the joined text, as [`join_lines`] has always mapped a
+    /// selection's ends: anything inside the replaced span goes to its end.
+    fn coarse(&self, off: usize) -> usize {
+        if off <= self.start {
+            off
+        } else if off >= self.end {
+            off - (self.end - self.start) + self.out.len()
+        } else {
+            self.start + self.out.len()
+        }
+    }
+
+    /// `off` in the joined text, break by break: text between two joins
+    /// keeps its place, and an offset inside a joined break goes to where
+    /// that break's replacement starts.
+    fn map(&self, off: usize) -> usize {
+        let mut delta = 0isize;
+        for &(s, e, new_s, new_len) in &self.segs {
+            if off <= s {
+                break;
+            }
+            if off < e {
+                return new_s;
+            }
+            delta = (new_s + new_len) as isize - e as isize;
+        }
+        (off as isize + delta) as usize
+    }
+
+    /// Where the replacement of the joined break covering `nl` starts.
+    fn seg_start(&self, nl: usize) -> Option<usize> {
+        self.segs
+            .iter()
+            .find(|&&(s, e, _, _)| s <= nl && nl < e)
+            .map(|&(_, _, new_s, _)| new_s)
+    }
+
+    fn edit(self) -> RegionEdit {
+        RegionEdit {
+            start: self.start,
+            end: self.end,
+            insert: self.out,
+            sel: (self.start, self.start),
+        }
+    }
+}
+
+/// Join the candidate `breaks` (ascending, every one a `\n`) that are code,
+/// each with the blanks around it, as [`join_lines`] describes. `None` when
+/// none joins.
+fn join_breaks(full: &str, breaks: Vec<usize>, dialect: SqlDialect) -> Option<JoinPlan> {
+    let b = full.as_bytes();
+    let len = full.len();
+    if breaks.is_empty() {
+        return None;
     }
 
     // Which breaks the lexer says are not code: inside a span, or the end of
@@ -327,6 +417,7 @@ pub fn join_lines(
     let blank = |c: u8| c == b' ' || c == b'\t';
     let mut out = String::new();
     let mut span: Option<(usize, usize)> = None; // (start, end) replaced
+    let mut segs = Vec::new();
     for (&nl, _) in breaks.iter().zip(&kept).filter(|(_, kept)| !**kept) {
         let floor = span.map_or(0, |(_, e)| e);
         let mut s = nl;
@@ -343,31 +434,19 @@ pub fn join_lines(
         let right = full[e..].chars().next();
         let tight = matches!(left, None | Some('\n' | '(' | '['))
             || matches!(right, None | Some('\n' | '\r' | ')' | ']' | ',' | ';'));
+        let new_s = start + out.len();
         if !tight {
             out.push(' ');
         }
+        segs.push((s, e, new_s, start + out.len() - new_s));
         span = Some((start, e));
     }
     let (start, end) = span?;
-    let map = |off: usize| {
-        if off <= start {
-            off
-        } else if off >= end {
-            off - (end - start) + out.len()
-        } else {
-            start + out.len()
-        }
-    };
-    let sel = if lo == hi {
-        (start, start)
-    } else {
-        (map(lo), map(hi))
-    };
-    Some(IndentEdit {
+    Some(JoinPlan {
         start,
         end,
-        text: out,
-        sel,
+        out,
+        segs,
     })
 }
 
@@ -1319,39 +1398,73 @@ pub fn compose(mut edits: Vec<RegionEdit>) -> Option<MultiEdit> {
     Some(out)
 }
 
+/// One [`line_blocks`] block: the carets whose lines touch or overlap.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LineBlock {
+    /// The members' extent, `(lowest start, highest end)`.
+    pub lo: usize,
+    pub hi: usize,
+    /// The block's whole lines as a selection no line operation misreads:
+    /// from its first line's start to the next line's start (which, being
+    /// a line start, does not pull that line in), or to the text's end. The
+    /// members' extent can end at a line start that one of them *does* take
+    /// — a bare caret there.
+    pub lines: (usize, usize),
+    /// Each caret's own `(anchor, head)`, in order, as it was given.
+    pub members: Vec<(usize, usize)>,
+}
+
 /// The carets' selections gathered into **line blocks**: those whose lines
-/// touch or overlap merged into one `(lo, hi)` span, ascending — what a line
-/// operation (comment, move, duplicate) acts on once per block, so two carets
-/// on one line comment it once, and two on neighbouring lines move together.
-pub fn line_blocks(text: &str, regions: &[(usize, usize)]) -> Vec<(usize, usize)> {
+/// touch or overlap merged into one block, ascending — what a line operation
+/// (comment, move, duplicate, outdent, join) acts on once per block, so two
+/// carets on one line comment it once, and two on neighbouring lines move
+/// together. Each block keeps its members, so every caret can follow the edit.
+pub fn line_blocks(text: &str, regions: &[(usize, usize)]) -> Vec<LineBlock> {
     let len = text.len();
     let starts = line_start_offsets(text);
-    let mut spans: Vec<(usize, usize, usize, usize)> = regions
+    // (first line, last line, lo, hi, the member as given)
+    let mut spans: Vec<_> = regions
         .iter()
         .map(|&(a, b)| {
-            let (lo, hi) = (a.min(b).min(len), a.max(b).min(len));
+            let (a, b) = (a.min(len), b.min(len));
+            let (lo, hi) = (a.min(b), a.max(b));
             let first = line_index_of(&starts, lo);
             let mut last = line_index_of(&starts, hi);
             // A selection ending at a line's start does not take that line.
             if hi > lo && last > first && starts[last] == hi {
                 last -= 1;
             }
-            (first, last, lo, hi)
+            (first, last, lo, hi, (a, b))
         })
         .collect();
     spans.sort();
-    let mut out: Vec<(usize, usize, usize, usize)> = Vec::new();
-    for s in spans {
+    let mut out: Vec<(usize, usize, LineBlock)> = Vec::new();
+    for (first, last, lo, hi, member) in spans {
         match out.last_mut() {
-            Some(m) if s.0 <= m.1 + 1 => {
-                m.1 = m.1.max(s.1);
-                m.2 = m.2.min(s.2);
-                m.3 = m.3.max(s.3);
+            Some((_, m_last, m)) if first <= *m_last + 1 => {
+                *m_last = (*m_last).max(last);
+                m.lo = m.lo.min(lo);
+                m.hi = m.hi.max(hi);
+                m.members.push(member);
             }
-            _ => out.push(s),
+            _ => out.push((
+                first,
+                last,
+                LineBlock {
+                    lo,
+                    hi,
+                    lines: (0, 0),
+                    members: vec![member],
+                },
+            )),
         }
     }
-    out.into_iter().map(|(_, _, lo, hi)| (lo, hi)).collect()
+    out.into_iter()
+        .map(|(first, last, mut block)| {
+            block.lines = (starts[first], starts.get(last + 1).copied().unwrap_or(len));
+            block
+        })
+        .collect()
 }
 
 /// A **box selection** dragged from `anchor` to `head` (byte offsets): one
@@ -1405,9 +1518,170 @@ pub fn per_line_block(
 ) -> Option<MultiEdit> {
     let edits = line_blocks(text, regions)
         .into_iter()
-        .map(|(lo, hi)| op(text, lo, hi))
+        .map(|b| op(text, b.lo, b.hi))
         .collect::<Option<Vec<_>>>()?;
     compose(edits)
+}
+
+/// A line operation at every caret that **keeps every caret**: once per
+/// [`line_blocks`] block, `op` answering the block's edit and each member's
+/// selection in the text that edit alone leaves, then put together as
+/// [`compose`] does. `None` when any block refuses or the edits overlap.
+fn per_line_block_each(
+    text: &str,
+    regions: &[(usize, usize)],
+    op: impl Fn(&LineBlock) -> Option<(RegionEdit, Vec<(usize, usize)>)>,
+) -> Option<MultiEdit> {
+    let mut parts = line_blocks(text, regions)
+        .iter()
+        .map(op)
+        .collect::<Option<Vec<_>>>()?;
+    // `compose` sorts its edits the same way, so its answer lines up.
+    parts.sort_by_key(|(e, _)| (e.start, e.end));
+    let mut sels = Vec::new();
+    let mut shift = 0isize;
+    for (e, members) in &parts {
+        let at = |p: usize| (p as isize + shift).max(0) as usize;
+        sels.extend(members.iter().map(|&(a, b)| (at(a), at(b))));
+        shift += e.insert.len() as isize - (e.end - e.start) as isize;
+    }
+    let mut m = compose(parts.into_iter().map(|(e, _)| e).collect())?;
+    m.sels = sels;
+    Some(m)
+}
+
+/// A block whose lines move as one ([`move_line`], [`duplicate_lines`]):
+/// a lone caret keeps the operation's own answer, several each slide by the
+/// distance the block's first line went.
+fn shifted_members(
+    block: &LineBlock,
+    edit: RegionEdit,
+    from: usize,
+) -> (RegionEdit, Vec<(usize, usize)>) {
+    let sels = if block.members.len() == 1 {
+        vec![edit.sel]
+    } else {
+        let shift = edit.sel.0 as isize - from as isize;
+        let at = |p: usize| (p as isize + shift) as usize;
+        block.members.iter().map(|&(a, b)| (at(a), at(b))).collect()
+    };
+    (edit, sels)
+}
+
+/// Shift+Tab at every caret ([`soft_tab_outdent`]): each block's lines lose
+/// one level once, and each caret moves left by what was removed before it —
+/// on its own line no further than the line's new start.
+pub fn outdent_all(text: &str, regions: &[(usize, usize)], tw: usize) -> Option<MultiEdit> {
+    let tw = tw.max(1);
+    per_line_block_each(text, regions, |block| {
+        if let [(a, b)] = block.members[..] {
+            let e = soft_tab_outdent(text, a, b, tw);
+            let sel = e.sel;
+            return Some((e.into(), vec![sel]));
+        }
+        let (lo, hi) = block.lines;
+        let e = soft_tab_outdent(text, lo, hi, tw);
+        // Each line's start, and the bytes removed from the lines before it.
+        let mut cuts = Vec::new();
+        let (mut at, mut removed) = (e.start, 0usize);
+        for line in text[e.start..e.end].split('\n') {
+            let r = outdent_strip_len(line, tw);
+            cuts.push((at, r, removed));
+            removed += r;
+            at += line.len() + 1;
+        }
+        let map = |p: usize| {
+            let i = cuts.partition_point(|&(s, _, _)| s <= p).saturating_sub(1);
+            let (s, r, before) = cuts[i];
+            p - before - r.min(p - s)
+        };
+        let sels = block
+            .members
+            .iter()
+            .map(|&(a, b)| (map(a), map(b)))
+            .collect();
+        Some((e.into(), sels))
+    })
+}
+
+/// Alt+Up/Down at every caret ([`move_line`]): every block moves, or — one
+/// at the edge — none does, each caret with its own line.
+pub fn move_lines_all(text: &str, regions: &[(usize, usize)], up: bool) -> Option<MultiEdit> {
+    per_line_block_each(text, regions, |block| {
+        let (lo, hi) = match block.members[..] {
+            [(a, b)] => (a.min(b), a.max(b)),
+            _ => block.lines,
+        };
+        let e = move_line(text, lo, hi, up)?;
+        Some(shifted_members(
+            block,
+            RegionEdit::between(text, &e.text, e.sel),
+            lo,
+        ))
+    })
+}
+
+/// Ctrl+D at every caret ([`duplicate_lines`]): each block's lines copied
+/// once below them, each caret onto its own line's copy.
+pub fn duplicate_lines_all(text: &str, regions: &[(usize, usize)]) -> Option<MultiEdit> {
+    per_line_block_each(text, regions, |block| {
+        let (lo, hi) = match block.members[..] {
+            [(a, b)] => (a.min(b), a.max(b)),
+            _ => block.lines,
+        };
+        let (at, insert, sel) = duplicate_lines(text, lo, hi);
+        let edit = RegionEdit {
+            start: at,
+            end: at,
+            insert,
+            sel,
+        };
+        Some(shifted_members(block, edit, lo))
+    })
+}
+
+/// Ctrl+Shift+J at every caret ([`join_lines`]): the breaks each caret would
+/// join alone, joined once a block — so carets on two touching lines join
+/// three lines — with each caret at its own line's join and a selection kept
+/// over the same text. A lone caret is exactly [`join_lines`]'s. `None` when
+/// nothing joins.
+pub fn join_lines_all(
+    text: &str,
+    regions: &[(usize, usize)],
+    dialect: SqlDialect,
+) -> Option<MultiEdit> {
+    per_line_block_each(text, regions, |block| {
+        if let [(a, b)] = block.members[..] {
+            let e = join_lines(text, a, b, dialect)?;
+            let sel = e.sel;
+            return Some((e.into(), vec![sel]));
+        }
+        let mut breaks: Vec<usize> = block
+            .members
+            .iter()
+            .flat_map(|&(a, b)| join_candidates(text, a, b).unwrap_or_default())
+            .collect();
+        breaks.sort_unstable();
+        breaks.dedup();
+        let plan = join_breaks(text, breaks, dialect)?;
+        let sels = block
+            .members
+            .iter()
+            .map(|&(a, b)| {
+                if a == b {
+                    // Where this caret's own line joins, as a lone caret
+                    // lands at its join; on its spot when that break stays.
+                    let p = floor_char(text, a);
+                    let nl = text[p..].find('\n').map_or(text.len(), |i| p + i);
+                    let at = plan.seg_start(nl).unwrap_or_else(|| plan.map(p));
+                    (at, at)
+                } else {
+                    (plan.map(a), plan.map(b))
+                }
+            })
+            .collect();
+        Some((plan.edit(), sels))
+    })
 }
 
 /// [`crate::pairs::auto_pair`] at every caret: each decided against the
@@ -1564,12 +1838,26 @@ mod tests {
         let text = "a\nb\nc\nd\ne\nf";
         // Lines 0 and 1 touch, 3 and 4 touch, line 2 parts them; two carets
         // on line 5, apart from line 4 by nothing, join it too.
-        let blocks = line_blocks(text, &[(0, 0), (2, 2), (6, 6), (8, 8)]);
-        assert_eq!(blocks, vec![(0, 2), (6, 8)]);
-        let blocks = line_blocks(text, &[(0, 0), (6, 6), (10, 10), (11, 11)]);
-        assert_eq!(blocks, vec![(0, 0), (6, 6), (10, 11)]);
+        let spans = |rs: &[(usize, usize)]| -> Vec<(usize, usize)> {
+            line_blocks(text, rs).iter().map(|b| (b.lo, b.hi)).collect()
+        };
+        assert_eq!(
+            spans(&[(0, 0), (2, 2), (6, 6), (8, 8)]),
+            vec![(0, 2), (6, 8)]
+        );
+        assert_eq!(
+            spans(&[(0, 0), (6, 6), (10, 10), (11, 11)]),
+            vec![(0, 0), (6, 6), (10, 11)]
+        );
         // A selection ending at a line's start does not reach that line.
-        assert_eq!(line_blocks(text, &[(0, 2), (6, 6)]), vec![(0, 2), (6, 6)]);
+        assert_eq!(spans(&[(0, 2), (6, 6)]), vec![(0, 2), (6, 6)]);
+        // Each block keeps its members, as given, and its whole lines —
+        // through the next line's start, or the text's end.
+        let blocks = line_blocks(text, &[(8, 8), (3, 2), (0, 0)]);
+        assert_eq!(blocks[0].members, vec![(0, 0), (3, 2)]);
+        assert_eq!(blocks[0].lines, (0, 4));
+        assert_eq!(blocks[1].members, vec![(8, 8)]);
+        assert_eq!(line_blocks(text, &[(10, 10)])[0].lines, (10, 11));
     }
 
     #[test]
@@ -1684,6 +1972,61 @@ mod tests {
             .collect();
         let m = compose(edits.unwrap()).unwrap();
         assert_eq!(apply(text, &m), "SELECT x FROM t");
+    }
+
+    /// Carets on touching lines, or on one line, share a block — and each
+    /// keeps its own place through the block's edit rather than the block
+    /// becoming one selection the next key would replace.
+    #[test]
+    fn every_caret_in_a_line_block_survives_its_edit() {
+        let my = SqlDialect::MySql;
+        // Shift+Tab with a caret at the end of each of three indented lines.
+        let text = "    a\n    b\n    c";
+        let m = outdent_all(text, &[(5, 5), (11, 11), (17, 17)], 4).unwrap();
+        assert_eq!(apply(text, &m), "a\nb\nc");
+        assert_eq!(m.sels, vec![(1, 1), (3, 3), (5, 5)]);
+        // Two carets on one line, a third on a line of its own.
+        let text = "        a\nb\n    c";
+        let m = outdent_all(text, &[(8, 8), (9, 9), (17, 17)], 4).unwrap();
+        assert_eq!(apply(text, &m), "    a\nb\nc");
+        assert_eq!(m.sels, vec![(4, 4), (5, 5), (9, 9)]);
+        // A caret inside the indent stops at the line's new start.
+        let text = "    a\n    b";
+        let m = outdent_all(text, &[(2, 2), (11, 11)], 4).unwrap();
+        assert_eq!(apply(text, &m), "a\nb");
+        assert_eq!(m.sels, vec![(0, 0), (3, 3)]);
+
+        let text = "a\nb\nc\nd";
+        // Alt+Down: both lines move, each caret with its own.
+        let m = move_lines_all(text, &[(1, 1), (3, 3)], false).unwrap();
+        assert_eq!(apply(text, &m), "c\na\nb\nd");
+        assert_eq!(m.sels, vec![(3, 3), (5, 5)]);
+        let m = move_lines_all(text, &[(5, 5), (7, 7)], true).unwrap();
+        assert_eq!(apply(text, &m), "a\nc\nd\nb");
+        assert_eq!(m.sels, vec![(3, 3), (5, 5)]);
+        assert_eq!(move_lines_all(text, &[(0, 0), (2, 2)], true), None);
+        // Carets at the start of touching lines move both lines, not one.
+        let m = move_lines_all(text, &[(0, 0), (2, 2)], false).unwrap();
+        assert_eq!(apply(text, &m), "c\na\nb\nd");
+        assert_eq!(m.sels, vec![(2, 2), (4, 4)]);
+        // Ctrl+D: the block copied once, each caret onto its line's copy.
+        let m = duplicate_lines_all(text, &[(1, 1), (3, 3)]).unwrap();
+        assert_eq!(apply(text, &m), "a\nb\na\nb\nc\nd");
+        assert_eq!(m.sels, vec![(5, 5), (7, 7)]);
+        // Ctrl+Shift+J: each caret's line joins the next, so two carets on
+        // touching lines join three lines, each caret at its own join.
+        let m = join_lines_all(text, &[(1, 1), (3, 3)], my).unwrap();
+        assert_eq!(apply(text, &m), "a b c\nd");
+        assert_eq!(m.sels, vec![(1, 1), (3, 3)]);
+        // A selection keeps covering the same text through the join.
+        let m = join_lines_all("ab\ncd\nef", &[(0, 2), (4, 4)], my).unwrap();
+        assert_eq!(apply("ab\ncd\nef", &m), "ab cd ef");
+        assert_eq!(m.sels, vec![(0, 2), (5, 5)]);
+        // A lone caret in its block behaves exactly as it would alone.
+        let text = "a\nb\nc\nd\ne";
+        let m = join_lines_all(text, &[(0, 0), (6, 6)], my).unwrap();
+        assert_eq!(apply(text, &m), "a b\nc\nd e");
+        assert_eq!(m.sels, vec![(1, 1), (7, 7)]);
     }
 
     #[test]

@@ -12425,7 +12425,21 @@ existing prose was left alone.
     rather than twice, and neighbouring lines move as one block
     (`carets_on_touching_lines_make_one_block`, `a_line_operation_acts_once_on_each_carets_block`).
     Each block is asked of the original text, and one refusing refuses all — Alt+↑ with a caret on
-    the first line moves no block. `toggle_line_comment` and `move_line` answer with the whole text,
+    the first line moves no block. **A block keeps its members**, each caret's own region:
+    `per_line_block` hands the op the members' extent and leaves one selection a block, which is
+    Ctrl+/'s answer alone (it selects the commented lines, as a lone caret's does), while
+    `outdent_all`, `move_lines_all`, `duplicate_lines_all` and `join_lines_all` — Shift+Tab,
+    Alt+↑/↓, Ctrl+D, Ctrl+Shift+J — map every member through the block's edit, so three carets on
+    touching lines are still three carets after it. Before that they became one selection over the
+    block, and the next key replaced everything between them. Move and duplicate slide each member
+    by the distance the block's first line went; outdent takes off what each line lost before the
+    caret, never past its line's new start; join joins the union of the breaks each caret would
+    join alone — carets on two touching lines join three lines — with a bare caret at its own
+    line's join and a selection mapped break by break (`every_caret_in_a_line_block_survives_its_edit`).
+    A block of several members is given its whole lines (`LineBlock::lines`, through the next line's
+    start), because the members' extent can end on a bare caret at a line's start, which every line
+    operation reads as a selection leaving that line out. A lone member is asked exactly as a lone
+    caret is. `toggle_line_comment` and `move_line` answer with the whole text,
     so `RegionEdit::between` narrows each answer to the span that changed, backing the common prefix
     and suffix off to char boundaries so the narrowed edit never splits a character
     (`a_whole_text_rewrite_narrows_to_what_changed`). The pane applies a `MultiEdit` through

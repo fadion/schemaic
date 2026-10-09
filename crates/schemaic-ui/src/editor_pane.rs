@@ -3456,12 +3456,10 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             let tw = theme::editor_tab_width();
             editor_sig.with_untracked(|e| {
                 let full = e.doc().text().to_string();
-                // Several carets: each one's lines, once a block.
+                // Several carets: each one's lines, once a block, every
+                // caret kept.
                 if let Some(regions) = several_regions(&e.cursor.get_untracked()) {
-                    let m =
-                        schemaic_core::text_ops::per_line_block(&full, &regions, |t, lo, hi| {
-                            Some(soft_tab_outdent(t, lo, hi, tw).into())
-                        });
+                    let m = schemaic_core::text_ops::outdent_all(&full, &regions, tw);
                     if let Some(m) = m {
                         edit_untyped_multi(e, comp, &m, EditType::Outdent);
                     }
@@ -3665,7 +3663,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                             .map(Into::into)
                         };
                         if op == 'j' {
-                            schemaic_core::text_ops::per_line_block(t, &regions, one)
+                            schemaic_core::text_ops::join_lines_all(t, &regions, dia)
                         } else {
                             let edits: Option<Vec<_>> =
                                 regions.iter().map(|&(a, b)| one(t, a, b)).collect();
@@ -3764,20 +3762,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     let full = e.doc().text().to_string();
                     // Several carets: each one's lines copied below them.
                     if let Some(regions) = several_regions(&cur) {
-                        let m = schemaic_core::text_ops::per_line_block(
-                            &full,
-                            &regions,
-                            |t, lo, hi| {
-                                let (at, insert, sel) =
-                                    schemaic_core::text_ops::duplicate_lines(t, lo, hi);
-                                Some(schemaic_core::text_ops::RegionEdit {
-                                    start: at,
-                                    end: at,
-                                    insert,
-                                    sel,
-                                })
-                            },
-                        );
+                        let m = schemaic_core::text_ops::duplicate_lines_all(&full, &regions);
                         if let Some(m) = m {
                             edit_untyped_multi(e, comp, &m, EditType::Other);
                             return;
@@ -4014,12 +3999,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 // Several carets: every block moves, or — one at the edge —
                 // none does.
                 if let Some(regions) = several_regions(&cur) {
-                    let m =
-                        schemaic_core::text_ops::per_line_block(&full, &regions, |t, lo, hi| {
-                            move_line(t, lo, hi, up).map(|ed| {
-                                schemaic_core::text_ops::RegionEdit::between(t, &ed.text, ed.sel)
-                            })
-                        });
+                    let m = schemaic_core::text_ops::move_lines_all(&full, &regions, up);
                     if let Some(m) = m {
                         edit_untyped_multi(e, comp, &m, EditType::MoveLine);
                     }
