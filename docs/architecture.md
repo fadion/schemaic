@@ -2690,13 +2690,28 @@ existing prose was left alone.
     definition is a `TableFactor::Table` or `Derived` alias, scoped by the innermost query containing
     its *ident*, so a derived table's alias belongs to the query it is joined into, not to its own
     body. A use is the qualifier of a `CompoundIdentifier`, an `o.*` (no expression, so read off the
-    select list in `pre_visit_query`) or an `UPDATE`'s `SET o.x` target (`pre_visit_statement`). A
-    quoted name's range is the name inside its quotes, which stay. It is `None` where the text at the
+    select list in `pre_visit_query`, and off a `RETURNING` in `pre_visit_statement`), a function's
+    `count(o.*)` argument, a lock clause's `FOR UPDATE OF o` (outside sqlparser's `Query` span, so the
+    query's scope is widened to cover it), an `UPDATE`'s `SET o.x` target, and a one-part write
+    target — MySQL's and T-SQL's `DELETE o FROM orders o`, T-SQL's `UPDATE o SET … FROM orders o`.
+    Missed, each left one `o` behind and a statement the server refuses
+    (`an_alias_is_found_in_every_place_it_is_written`, S8.2-L1-07, red before). **A bare
+    identifier naming the alias refuses the rename** (`None`): on PostgreSQL it is the whole row
+    (`row_to_json(o)`), elsewhere a column that may share the name, and the walk cannot tell which.
+    A quoted name's range is the name inside its quotes, which stay. It is `None` where the text at the
     caret does not parse to exactly one statement, or the caret is on no alias — a qualifier that is
     a table's own name or a CTE's binds to no definition, and a select-list `AS` is not one, so none
     of those is offered (`an_alias_is_found_with_every_reference_to_it`,
     `an_alias_is_bound_by_its_own_query`, `an_alias_is_found_in_a_star_an_update_and_quotes`,
-    `no_alias_where_the_caret_is_not_on_one`).
+    `no_alias_where_the_caret_is_not_on_one`). **`alias_rename_conflicts` is the capture check**
+    the same walk answers for a proposed name (R3-L5-03): `true` where the definition's own query
+    already exposes it (an alias, or a table written without one), where a query between a renamed
+    reference and the definition defines it — the correlated `o.id` renamed to the inner `i` binds
+    to the inner row, and a `DELETE … WHERE EXISTS` removes every row or none — or where a reference
+    inside the definition's query to an outer one by that name would find the renamed alias first
+    (`renaming_an_alias_to_a_name_that_would_rebind_is_a_conflict`, red before). The editor does
+    not ask it yet: *Rename alias* hands over a multi-caret selection and the name arrives as typing,
+    so there is no single moment to ask at.
     **A `(` is filled from the schema only where the schema names one answer.** `paren_contents`,
     asked right after `insert_columns`, answers three openers through the same `column_list`.
     `REFERENCES t (` gets `t`'s primary key from `Catalog::key_columns_of` — its columns in the

@@ -12555,14 +12555,43 @@ pub fn alias_occurrences(
     alias_refs::occurrences(stmt, lo, ast, caret)
 }
 
+/// Would renaming the alias at `caret` to `new_name` change what a reference
+/// binds to, or clash with a name its query already exposes? `None` where
+/// [`alias_occurrences`] finds no alias to rename.
+///
+/// **A rename is a capture check, not only a text edit** (R3-L5-03). Three
+/// ways one goes wrong, each a statement that still parses and runs:
+/// a query between a renamed reference and the definition defines
+/// `new_name` (the correlated `o.id` renamed to the inner `i` becomes the
+/// inner row's, and a `DELETE … WHERE EXISTS` removes every row or none); the
+/// definition's own query already exposes `new_name`; or a reference inside
+/// the definition's query to an outer `new_name` would now find the renamed
+/// one first. A table written without an alias defines its own name, as an
+/// alias does.
+pub fn alias_rename_conflicts(
+    sql: &str,
+    caret: usize,
+    new_name: &str,
+    dialect: SqlDialect,
+) -> Option<bool> {
+    let (lo, hi) = crate::sql::statement_range(sql, caret, dialect);
+    let stmt = sql.get(lo..hi)?;
+    let asts = parse_statements(stmt, dialect).ok()?;
+    let [ast] = asts.as_slice() else {
+        return None;
+    };
+    alias_refs::rename_conflicts(stmt, lo, ast, caret, new_name)
+}
+
 /// [`alias_occurrences`]' walk: alias definitions and qualifier uses, each
 /// placed by its span, with the queries that scope them.
 mod alias_refs {
     use std::ops::ControlFlow;
 
     use sqlparser::ast::{
-        AssignmentTarget, Expr, Ident, ObjectName, Query, SelectItem,
-        SelectItemQualifiedWildcardKind, SetExpr, Spanned, Statement, TableFactor, Visit, Visitor,
+        AssignmentTarget, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, ObjectName,
+        Query, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Spanned, Statement,
+        TableFactor, Visit, Visitor,
     };
 
     use super::colres::to_range;
@@ -12576,6 +12605,15 @@ mod alias_refs {
         defs: Vec<(String, (usize, usize))>,
         /// `(name_lower, range)` of each qualifier.
         uses: Vec<(String, (usize, usize))>,
+        /// `(name_lower, range)` of each table written without an alias,
+        /// which a query exposes by its own name — what a rename can collide
+        /// with as much as an alias ([`rename_conflicts`]).
+        tables: Vec<(String, (usize, usize))>,
+        /// `(name_lower, range)` of each bare identifier: on PostgreSQL one
+        /// naming an alias is its whole row (`row_to_json(o)`), elsewhere a
+        /// column that may share the alias's name. Either way the rename
+        /// cannot tell, so it refuses.
+        bare: Vec<(String, (usize, usize))>,
     }
 
     impl Walk<'_> {
@@ -12599,24 +12637,33 @@ mod alias_refs {
             self.qualifier(&parts);
         }
 
-        /// `o.*` in a select list, which is no expression.
+        /// A name that is the qualifier itself, as its **last** part: `o.*`,
+        /// `count(o.*)`, `FOR UPDATE OF o`, a `DELETE o FROM …` target.
+        fn last_part(&mut self, n: &ObjectName) {
+            if let Some(id) = n.0.last().and_then(|p| p.as_ident()) {
+                let at = self.place(id);
+                self.uses.push(at);
+            }
+        }
+
+        /// `o.*` among select items — a select list's or a `RETURNING`'s —
+        /// which is no expression.
+        fn wildcard_items(&mut self, items: &[SelectItem]) {
+            for item in items {
+                if let SelectItem::QualifiedWildcard(
+                    SelectItemQualifiedWildcardKind::ObjectName(n),
+                    _,
+                ) = item
+                {
+                    self.last_part(n);
+                }
+            }
+        }
+
+        /// `o.*` in a select list.
         fn select_items(&mut self, body: &SetExpr) {
             match body {
-                SetExpr::Select(sel) => {
-                    for item in &sel.projection {
-                        if let SelectItem::QualifiedWildcard(
-                            SelectItemQualifiedWildcardKind::ObjectName(n),
-                            _,
-                        ) = item
-                        {
-                            // `o.*` names the qualifier as the *last* part.
-                            if let Some(id) = n.0.last().and_then(|p| p.as_ident()) {
-                                let at = self.place(id);
-                                self.uses.push(at);
-                            }
-                        }
-                    }
-                }
+                SetExpr::Select(sel) => self.wildcard_items(&sel.projection),
                 SetExpr::SetOperation { left, right, .. } => {
                     self.select_items(left);
                     self.select_items(right);
@@ -12645,60 +12692,146 @@ mod alias_refs {
                     .position(|(n, r)| n == name && self.chain(*r).first() == Some(&scope))
             })
         }
+
+        /// The innermost scope holding `r`.
+        fn scope_of(&self, r: (usize, usize)) -> Option<(usize, usize)> {
+            self.chain(r).first().copied()
+        }
+
+        /// Does `scope` expose `name` — an alias, or a table written without
+        /// one — other than the definition at `except`?
+        fn exposes(&self, scope: (usize, usize), name: &str, except: (usize, usize)) -> bool {
+            self.defs
+                .iter()
+                .chain(&self.tables)
+                .any(|(n, r)| n == name && *r != except && self.scope_of(*r) == Some(scope))
+        }
     }
 
     impl Visitor for Walk<'_> {
         type Break = ();
 
         fn pre_visit_query(&mut self, q: &Query) -> ControlFlow<()> {
-            self.scopes.push(to_range(self.stmt, self.lo, q.span()));
+            let mut range = to_range(self.stmt, self.lo, q.span());
+            // A lock clause's `OF o` is the query's, though sqlparser leaves
+            // it out of the query's span.
+            for of in q.locks.iter().filter_map(|l| l.of.as_ref()) {
+                self.last_part(of);
+                if let Some((_, at)) = self.uses.last() {
+                    range.1 = range.1.max(at.1);
+                }
+            }
+            self.scopes.push(range);
             self.select_items(&q.body);
             ControlFlow::Continue(())
         }
 
         fn pre_visit_table_factor(&mut self, t: &TableFactor) -> ControlFlow<()> {
-            if let TableFactor::Table { alias: Some(a), .. }
-            | TableFactor::Derived { alias: Some(a), .. } = t
-            {
-                let at = self.place(&a.name);
-                self.defs.push(at);
+            match t {
+                TableFactor::Table { alias: Some(a), .. }
+                | TableFactor::Derived { alias: Some(a), .. } => {
+                    let at = self.place(&a.name);
+                    self.defs.push(at);
+                }
+                TableFactor::Table {
+                    name, alias: None, ..
+                } => {
+                    if let Some(id) = name.0.last().and_then(|p| p.as_ident()) {
+                        let at = self.place(id);
+                        self.tables.push(at);
+                    }
+                }
+                _ => {}
             }
             ControlFlow::Continue(())
         }
 
         fn pre_visit_expr(&mut self, e: &Expr) -> ControlFlow<()> {
-            if let Expr::CompoundIdentifier(parts) = e {
-                let parts: Vec<&Ident> = parts.iter().collect();
-                self.qualifier(&parts);
+            match e {
+                Expr::CompoundIdentifier(parts) => {
+                    let parts: Vec<&Ident> = parts.iter().collect();
+                    self.qualifier(&parts);
+                }
+                Expr::Identifier(id) => {
+                    let at = self.place(id);
+                    self.bare.push(at);
+                }
+                // `count(o.*)`: a function's argument, which is no expression.
+                Expr::Function(f) => {
+                    if let FunctionArguments::List(list) = &f.args {
+                        for a in &list.args {
+                            let (FunctionArg::Unnamed(arg)
+                            | FunctionArg::Named { arg, .. }
+                            | FunctionArg::ExprNamed { arg, .. }) = a;
+                            if let FunctionArgExpr::QualifiedWildcard(n) = arg {
+                                self.last_part(n);
+                            }
+                        }
+                    }
+                }
+                _ => {}
             }
             ControlFlow::Continue(())
         }
 
         fn pre_visit_statement(&mut self, s: &Statement) -> ControlFlow<()> {
-            if let Statement::Update(u) = s {
-                for a in &u.assignments {
-                    match &a.target {
-                        AssignmentTarget::ColumnName(n) => self.object_name(n),
-                        AssignmentTarget::Tuple(ns) => ns.iter().for_each(|n| self.object_name(n)),
-                    }
+            // A one-part name as a write's target is an alias where the
+            // statement defines one by it — MySQL's and T-SQL's `DELETE o
+            // FROM orders o`, T-SQL's `UPDATE o SET … FROM orders o` — and
+            // binds to nothing otherwise.
+            let target = |w: &mut Self, n: &ObjectName| {
+                if n.0.len() == 1 {
+                    w.last_part(n);
                 }
+            };
+            match s {
+                Statement::Update(u) => {
+                    for a in &u.assignments {
+                        match &a.target {
+                            AssignmentTarget::ColumnName(n) => self.object_name(n),
+                            AssignmentTarget::Tuple(ns) => {
+                                ns.iter().for_each(|n| self.object_name(n))
+                            }
+                        }
+                    }
+                    if let TableFactor::Table {
+                        name, alias: None, ..
+                    } = &u.table.relation
+                    {
+                        target(self, name);
+                    }
+                    self.wildcard_items(u.returning.as_deref().unwrap_or_default());
+                }
+                Statement::Delete(d) => {
+                    for n in &d.tables {
+                        target(self, n);
+                    }
+                    self.wildcard_items(d.returning.as_deref().unwrap_or_default());
+                }
+                Statement::Insert(i) => {
+                    self.wildcard_items(i.returning.as_deref().unwrap_or_default());
+                }
+                _ => {}
             }
             ControlFlow::Continue(())
         }
     }
 
-    pub(super) fn occurrences(
-        stmt: &str,
+    /// The statement walked, and the definition the alias at `caret` is.
+    fn walk_at<'a>(
+        stmt: &'a str,
         lo: usize,
         ast: &Statement,
         caret: usize,
-    ) -> Option<Vec<(usize, usize)>> {
+    ) -> Option<(Walk<'a>, usize)> {
         let mut w = Walk {
             stmt,
             lo,
             scopes: vec![(lo, lo + stmt.len())],
             defs: Vec::new(),
             uses: Vec::new(),
+            tables: Vec::new(),
+            bare: Vec::new(),
         };
         let _ = ast.visit(&mut w);
         let on = |r: &(usize, usize)| r.0 <= caret && caret <= r.1;
@@ -12709,14 +12842,38 @@ mod alias_refs {
                 w.binding(name, *at)?
             }
         };
+        Some((w, def))
+    }
+
+    /// The uses bound to definition `def`.
+    fn bound_uses(w: &Walk<'_>, def: usize) -> Vec<(usize, usize)> {
+        let name = &w.defs[def].0;
+        w.uses
+            .iter()
+            .filter(|(n, at)| n == name && w.binding(n, *at) == Some(def))
+            .map(|(_, at)| *at)
+            .collect()
+    }
+
+    /// [`super::alias_occurrences`]. `None` — no rename offered — where a
+    /// bare identifier names the alias: PostgreSQL's whole-row `o`, or a
+    /// column called `o`, which no walk here can tell apart (S8.2-L1-07).
+    pub(super) fn occurrences(
+        stmt: &str,
+        lo: usize,
+        ast: &Statement,
+        caret: usize,
+    ) -> Option<Vec<(usize, usize)>> {
+        let (w, def) = walk_at(stmt, lo, ast, caret)?;
         let (name, def_at) = &w.defs[def];
+        if w.bare
+            .iter()
+            .any(|(n, at)| n == name && w.binding(n, *at) == Some(def))
+        {
+            return None;
+        }
         let mut out = vec![*def_at];
-        out.extend(
-            w.uses
-                .iter()
-                .filter(|(n, at)| n == name && w.binding(n, *at) == Some(def))
-                .map(|(_, at)| *at),
-        );
+        out.extend(bound_uses(&w, def));
         out.sort_unstable();
         out.dedup();
         // The name inside its quotes.
@@ -12729,6 +12886,50 @@ mod alias_refs {
                 })
                 .collect(),
         )
+    }
+
+    /// [`super::alias_rename_conflicts`].
+    pub(super) fn rename_conflicts(
+        stmt: &str,
+        lo: usize,
+        ast: &Statement,
+        caret: usize,
+        new_name: &str,
+    ) -> Option<bool> {
+        let (w, def) = walk_at(stmt, lo, ast, caret)?;
+        let new = new_name.to_ascii_lowercase();
+        let (old, def_at) = &w.defs[def];
+        if new == *old {
+            return Some(false);
+        }
+        let home = w.scope_of(*def_at)?;
+        // The definition's own query already exposes the name.
+        if w.exposes(home, &new, *def_at) {
+            return Some(true);
+        }
+        // A query between a renamed reference and the definition defines
+        // it: the reference would bind there instead.
+        let captured = bound_uses(&w, def).into_iter().any(|at| {
+            w.chain(at)
+                .into_iter()
+                .take_while(|s| *s != home)
+                .any(|s| w.exposes(s, &new, *def_at))
+        });
+        if captured {
+            return Some(true);
+        }
+        // A reference inside the definition's query to an outer `new` — or
+        // to nothing a query here defines — would find the renamed one first.
+        let reaches_out = w.uses.iter().any(|(n, at)| {
+            n == &new
+                && w.chain(*at).contains(&home)
+                && !w
+                    .chain(*at)
+                    .into_iter()
+                    .take_while(|s| *s != home)
+                    .any(|s| w.exposes(s, &new, *def_at))
+        });
+        Some(reaches_out)
     }
 }
 
@@ -26628,6 +26829,80 @@ mod tests {
             alias_hits("SELECT \"o\".id FROM orders \"o|\"", SqlDialect::Postgres),
             Some(vec!["o@8".to_string(), "o@27".to_string()])
         );
+    }
+
+    /// Every place an alias is written is renamed with it — a multi-table
+    /// `DELETE`'s target, a T-SQL `UPDATE` naming its alias, a `count(o.*)`,
+    /// `RETURNING o.*`, `FOR UPDATE OF o` — and a bare name that may be the
+    /// whole row, or a column so named, refuses the rename rather than leave
+    /// one behind (S8.2-L1-07).
+    #[test]
+    fn an_alias_is_found_in_every_place_it_is_written() {
+        let (my, ms, pg) = (SqlDialect::MySql, SqlDialect::MsSql, SqlDialect::Postgres);
+        for (sql, d, n) in [
+            ("DELETE o FROM orders o| WHERE o.id = 1", my, 3),
+            ("DELETE o FROM orders o| WHERE o.id = 1", ms, 3),
+            (
+                "UPDATE o SET o.total = 0 FROM orders o| WHERE o.id = 1",
+                ms,
+                4,
+            ),
+            ("SELECT count(o.*) FROM orders o|", pg, 2),
+            ("UPDATE orders o| SET total = 0 RETURNING o.*", pg, 2),
+            ("DELETE FROM orders o| RETURNING o.id, o.*", pg, 3),
+            ("SELECT o.id FROM orders o| FOR UPDATE OF o", pg, 3),
+        ] {
+            let hits = alias_hits(sql, d);
+            assert_eq!(
+                hits.as_ref().map(Vec::len),
+                Some(n),
+                "{d:?} {sql}: {hits:?}"
+            );
+            assert!(hits.unwrap().iter().all(|h| h.starts_with("o@")), "{sql}");
+        }
+        assert_eq!(alias_hits("SELECT row_to_json(o) FROM orders o|", pg), None);
+        assert_eq!(alias_hits("SELECT o FROM orders o|", my), None);
+    }
+
+    /// `alias_rename_conflicts` at the `|`.
+    fn rename_conflicts(sql: &str, new: &str) -> Option<bool> {
+        let caret = sql.find('|').unwrap();
+        let sql = sql.replace('|', "");
+        alias_rename_conflicts(&sql, caret, new, SqlDialect::Postgres)
+    }
+
+    /// **A rename that would rebind a reference is a conflict** (R3-L5-03):
+    /// renaming the outer `o` to the inner query's `i` makes the correlated
+    /// `o.id` the inner row's, and the `DELETE` removes every order or none.
+    #[test]
+    fn renaming_an_alias_to_a_name_that_would_rebind_is_a_conflict() {
+        let sql =
+            "DELETE FROM orders o| WHERE EXISTS (SELECT 1 FROM items i WHERE i.order_id = o.id)";
+        assert_eq!(rename_conflicts(sql, "i"), Some(true));
+        assert_eq!(rename_conflicts(sql, "I"), Some(true));
+        assert_eq!(rename_conflicts(sql, "x"), Some(false));
+        assert_eq!(rename_conflicts(sql, "o"), Some(false));
+        // An unaliased table's name captures as an alias does.
+        let sql =
+            "DELETE FROM orders o| WHERE EXISTS (SELECT 1 FROM items WHERE items.order_id = o.id)";
+        assert_eq!(rename_conflicts(sql, "items"), Some(true));
+        // Another name the same query exposes.
+        let sql = "SELECT 1 FROM orders o| JOIN items i ON i.order_id = o.id";
+        assert_eq!(rename_conflicts(sql, "i"), Some(true));
+        let sql = "SELECT 1 FROM orders o| JOIN items ON items.order_id = o.id";
+        assert_eq!(rename_conflicts(sql, "items"), Some(true));
+        // The other way round: the inner alias renamed to the outer one's
+        // name captures the correlated reference to it.
+        let sql =
+            "SELECT 1 FROM orders o WHERE EXISTS (SELECT 1 FROM items i| WHERE i.order_id = o.id)";
+        assert_eq!(rename_conflicts(sql, "o"), Some(true));
+        let sql = "SELECT 1 FROM orders WHERE EXISTS (SELECT 1 FROM items i| WHERE i.order_id = orders.id)";
+        assert_eq!(rename_conflicts(sql, "orders"), Some(true));
+        // An inner query that only shadows it, using none of it, is fine.
+        let sql = "SELECT o.id FROM orders o| WHERE o.id IN (SELECT i.order_id FROM items i)";
+        assert_eq!(rename_conflicts(sql, "i"), Some(false));
+        // Not on an alias.
+        assert_eq!(rename_conflicts("SELECT 1 FROM orders|", "x"), None);
     }
 
     #[test]
