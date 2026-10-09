@@ -10066,6 +10066,9 @@ fn is_table_ref_continuation(word: &str) -> bool {
             | "HAVING"
             | "LIMIT"
             | "OFFSET"
+            // `FROM t FETCH FIRST 5 ROWS ONLY` — reserved wherever the
+            // clause exists, so never an alias (S8.1-L1-06).
+            | "FETCH"
             | "UNION"
             | "EXCEPT"
             | "INTERSECT"
@@ -10812,13 +10815,17 @@ fn alias_checks(
     let body_as = routine_body_as(&toks, dialect);
     // Only a CTAS / view (`CREATE … AS SELECT`) legitimately puts a query *body*
     // after `AS`; in a plain SELECT, `col AS select` is a reserved-word alias mistake.
-    let is_create = toks
-        .iter()
-        .find_map(|t| match &t.kind {
-            TkKind::Word(w) => Some(w.to_ascii_uppercase()),
-            _ => None,
-        })
-        .is_some_and(|w| w == "CREATE");
+    // `ALTER [ALGORITHM = …] VIEW v AS SELECT` redefines a view on MySQL and
+    // SQL Server, and was squiggled at its `SELECT` (S8.1-L1-02).
+    let first = toks.iter().find_map(|t| match &t.kind {
+        TkKind::Word(w) => Some(w.to_ascii_uppercase()),
+        _ => None,
+    });
+    let is_create = first.as_deref() == Some("CREATE")
+        || (first.as_deref() == Some("ALTER")
+            && toks.iter().any(|t| {
+                !t.quoted && matches!(&t.kind, TkKind::Word(w) if w.eq_ignore_ascii_case("VIEW"))
+            }));
     let creates_type = head_words(&toks, 2) == ["CREATE", "TYPE"];
     // A default's or a rule's first `AS` opens its definition: T-SQL's
     // `CREATE DEFAULT d AS NULL`, PostgreSQL's `CREATE RULE r AS ON …`.
@@ -10847,6 +10854,13 @@ fn alias_checks(
         if i > 0
             && matches!(&toks[i - 1].kind, TkKind::Word(p)
                 if p.eq_ignore_ascii_case("EXECUTE") || p.eq_ignore_ascii_case("EXEC"))
+        {
+            continue;
+        }
+        // Nor does a temporal table's `FOR SYSTEM_TIME AS OF '…'` — SQL
+        // Server reserves `OF` (S8.1-L1-03).
+        if i > 0
+            && matches!(&toks[i - 1].kind, TkKind::Word(p) if p.eq_ignore_ascii_case("SYSTEM_TIME"))
         {
             continue;
         }
@@ -26633,6 +26647,48 @@ mod tests {
                     .any(|x| x.message.contains("reserved keyword")),
                 "false positive on: {sql}"
             );
+        }
+    }
+
+    /// Three standard spellings the reserved-alias check read as an alias:
+    /// `ALTER VIEW v AS SELECT` (S8.1-L1-02), SQL Server's temporal `FOR
+    /// SYSTEM_TIME AS OF` (S8.1-L1-03) and a bare `FETCH FIRST` after a table
+    /// (S8.1-L1-06). A real reserved alias is still one.
+    #[test]
+    fn a_view_body_a_temporal_clause_and_fetch_are_no_alias() {
+        let reserved = |sql: &str, d| -> Vec<String> {
+            diag_d(sql, d)
+                .into_iter()
+                .filter(|x| x.message.contains("reserved keyword"))
+                .map(|x| x.message)
+                .collect()
+        };
+        let (my, ms, pg) = (SqlDialect::MySql, SqlDialect::MsSql, SqlDialect::Postgres);
+        for (sql, d) in [
+            ("ALTER VIEW v AS SELECT id FROM employees;", my),
+            (
+                "ALTER ALGORITHM = MERGE VIEW v AS SELECT id FROM employees;",
+                my,
+            ),
+            ("ALTER VIEW v AS SELECT id FROM employees;", ms),
+            (
+                "SELECT * FROM employees FOR SYSTEM_TIME AS OF '2020-01-01';",
+                ms,
+            ),
+            ("SELECT * FROM employees FETCH FIRST 5 ROWS ONLY;", pg),
+        ] {
+            assert!(
+                reserved(sql, d).is_empty(),
+                "{d:?} {sql}: {:?}",
+                reserved(sql, d)
+            );
+        }
+        for (sql, d) in [
+            ("SELECT 1 AS select;", my),
+            ("SELECT 1 AS of;", ms),
+            ("SELECT * FROM employees or;", pg),
+        ] {
+            assert_eq!(reserved(sql, d).len(), 1, "{d:?} {sql}");
         }
     }
 

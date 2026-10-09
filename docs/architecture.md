@@ -1298,7 +1298,12 @@ existing prose was left alone.
     takes `WITH` as one. The hint's inside needed a second fix in `colres`: sqlparser carries a
     hint as an `Expr`, so the visitor resolved `NOLOCK` as a column (``Column `nolock` not
     found``); `Collector::not_columns` records each `TableFactor::Table`'s `with_hints` ranges in
-    `pre_visit_table_factor`, and an expression inside one is skipped. **A select-list alias
+    `pre_visit_table_factor`, and an expression inside one is skipped. A `FETCH` arm ends
+    `FROM t FETCH FIRST 5 ROWS ONLY` the same way. The explicit `AS <reserved>` scan has its own
+    exemptions: a query body after `CREATE … AS` **or `ALTER … VIEW … AS`** (MySQL's and SQL
+    Server's redefinition), and the `OF` of SQL Server's temporal `FOR SYSTEM_TIME AS OF`
+    (`a_view_body_a_temporal_clause_and_fetch_are_no_alias`, S8.1-L1-02/-03/-06, red before).
+    **A select-list alias
     resolves an unqualified name except in the clauses the engine reads before it**
     (`Scope::alias_blind`): `WHERE` everywhere but SQLite, which resolves one there
     (`select_alias_in_where`), and `HAVING` on PostgreSQL and SQL Server, which do not
