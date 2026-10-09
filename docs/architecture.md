@@ -13870,7 +13870,12 @@ existing prose was left alone.
       `a_table_is_named_from_the_sessions_database`). The row shows the reference with its quotes
       off and is matched by it. **A view's row wears the view glyph** (`SuggestGlyph::View`, the
       schema tree's `TABLE_CELLS_MERGE`), from `SchemaIndex::views`, at a table slot and after its
-      database's qualifier (`a_view_is_told_from_a_table`). In the UI `Completion::wide` is set by a Ctrl+Space over an open
+      database's qualifier (`a_view_is_told_from_a_table`). Where the row names a schema it is told
+      by `SchemaIndex::views_by_schema` instead: after a `schema.` qualifier, and for a bare row
+      by the namespace the bare name reaches (the first `filter::bare_name_reaches` lets through,
+      else the first, as `qualify_unreached` writes it) — keyed by database alone, `sales.` never
+      showed the glyph, and a view `archive.orders` marked the bare `orders` row that reaches the
+      table `public.orders` (`a_view_is_told_by_its_schema`). In the UI `Completion::wide` is set by a Ctrl+Space over an open
       list, kept while it stays open, and cleared when a list next opens by typing.
       **The tab's own list qualifies a table no bare name reaches.** It offered every in-scope
       table under its bare name, so PostgreSQL's `sales.ledger` went in as `ledger` — which reads

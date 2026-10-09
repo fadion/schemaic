@@ -165,6 +165,12 @@ pub struct SchemaIndex {
     /// `(database, name)` (both lowercase) of every view, so a table row can
     /// say it is one.
     pub views: HashSet<(String, String)>,
+    /// `(schema, name)` (both lowercase) of every view of the tab's own
+    /// database that lives in a schema (PostgreSQL, SQL Server) — the key a
+    /// `schema.` listing, and a bare row on those engines, are told by:
+    /// `views` alone made `archive.orders`, a view, mark the bare `orders`
+    /// row that reaches the table `public.orders`.
+    pub views_by_schema: HashSet<(String, String)>,
     /// A PostgreSQL enum type's labels, in order, by its name (lowercase) and
     /// by `schema.name`: a column of one carries only the name, so its members
     /// are here rather than in its type ([`enum_value_suggestions`]).
@@ -442,16 +448,34 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
     // of them were just refused by the prefix — the lower-cased keys, the
     // namespace lookup and its clone were paid for each one regardless (10,000
     // tables, `ord` typed: 3.0 ms a keystroke).
-    let mark_view = |cands: &mut Vec<Cand>, before: usize, db: &str, name: &str| {
-        if cands.len() == before {
-            return;
-        }
-        let key = (db.to_ascii_lowercase(), name.to_ascii_lowercase());
-        if schema.views.contains(&key)
-            && let Some(c) = cands.last_mut()
-        {
-            c.glyph = SuggestGlyph::View;
-        }
+    //
+    // Told by the namespace the row names where it has one
+    // (`SchemaIndex::views_by_schema`), else by its database.
+    let mark_view =
+        |cands: &mut Vec<Cand>, before: usize, db: &str, ns: Option<&str>, name: &str| {
+            if cands.len() == before {
+                return;
+            }
+            let name = name.to_ascii_lowercase();
+            let view = match ns {
+                Some(ns) => schema
+                    .views_by_schema
+                    .contains(&(ns.to_ascii_lowercase(), name)),
+                None => schema.views.contains(&(db.to_ascii_lowercase(), name)),
+            };
+            if view && let Some(c) = cands.last_mut() {
+                c.glyph = SuggestGlyph::View;
+            }
+        };
+    // The namespace a bare table name reaches — the first of its namespaces
+    // `filter::bare_name_reaches` lets through, else the first, which
+    // `qualify_unreached` then writes — or `None` on an engine without them.
+    let bare_namespace = |name: &str| -> Option<&str> {
+        let nss = schema.namespaces.get(&name.to_ascii_lowercase())?;
+        nss.iter()
+            .find(|ns| crate::filter::bare_name_reaches(input.dialect, ns.as_deref()))
+            .or(nss.first())?
+            .as_deref()
     };
     // A table row no bare name reaches ([`SchemaIndex::namespaces`]) inserts
     // the name that does, while still reading as the table.
@@ -832,15 +856,20 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
                         written,
                     );
                 }
-            } else if let Some(tbls) = schema
-                .tables_by_db
-                .get(&q.to_ascii_lowercase())
-                .or_else(|| schema.tables_by_schema.get(&q.to_ascii_lowercase()))
-            {
-                for t in tbls {
-                    let before = cands.len();
-                    add(&mut cands, &mut seen, t, SuggestKind::Table, q, 0);
-                    mark_view(&mut cands, before, q, t);
+            } else {
+                // A database's tables, else a schema's of the tab's own
+                // database — and each view told by whichever `q` named.
+                let ql = q.to_ascii_lowercase();
+                let listed = match schema.tables_by_db.get(&ql) {
+                    Some(tbls) => Some((tbls, None)),
+                    None => schema.tables_by_schema.get(&ql).map(|t| (t, Some(q))),
+                };
+                if let Some((tbls, ns)) = listed {
+                    for t in tbls {
+                        let before = cands.len();
+                        add(&mut cands, &mut seen, t, SuggestKind::Table, q, 0);
+                        mark_view(&mut cands, before, q, ns.map(String::as_str), t);
+                    }
                 }
             }
         }
@@ -909,7 +938,9 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
                     db,
                     plain_tier,
                 );
-                mark_view(&mut cands, before, db, name);
+                if cands.len() > before {
+                    mark_view(&mut cands, before, db, bare_namespace(name), name);
+                }
                 qualify_unreached(&mut cands, before, db, name);
             }
             // Databases are offered only once a prefix is typed (so an empty
@@ -2013,6 +2044,64 @@ mod tests {
         assert_eq!(glyph(ClauseCtx::Table, "orders"), Some(SuggestGlyph::Kind));
         let q = ClauseCtx::Qualified("shop".to_string());
         assert_eq!(glyph(q, "open_orders"), Some(SuggestGlyph::View));
+    }
+
+    /// **On an engine with schemas the view is told by its schema**: after
+    /// `sales.` the view `sales.open_orders` wears the view glyph, and the
+    /// bare `orders` row — which reaches the table `public.orders` — does not
+    /// wear it for a view `archive.orders`.
+    #[test]
+    fn a_view_is_told_by_its_schema() {
+        let mut s = shop();
+        let pair = |a: &str, b: &str| (a.to_string(), b.to_string());
+        s.tables.push(pair("open_orders", "shop"));
+        s.tables.push(pair("orders", "shop"));
+        s.tables_by_schema
+            .insert("sales".to_string(), vec!["open_orders".to_string()]);
+        s.namespaces.insert(
+            "orders".to_string(),
+            vec![Some("public".to_string()), Some("archive".to_string())],
+        );
+        s.namespaces
+            .insert("open_orders".to_string(), vec![Some("sales".to_string())]);
+        // The builder's two keys for each view.
+        s.views.insert(pair("shop", "open_orders"));
+        s.views.insert(pair("shop", "orders"));
+        s.views_by_schema.insert(pair("sales", "open_orders"));
+        s.views_by_schema.insert(pair("archive", "orders"));
+        let glyph = |ctx: ClauseCtx, name: &str| {
+            let cont = Continuation::default();
+            let used = HashSet::new();
+            rank(
+                &s,
+                &RankInput {
+                    ctx: &ctx,
+                    cont: &cont,
+                    scope: &[],
+                    prefix: "o",
+                    snippets: &[],
+                    join_targets: &[],
+                    star: None,
+                    used: &used,
+                    active_db: Some("shop"),
+                    dialect: SqlDialect::Postgres,
+                    flavour: ServerFlavour::Unknown,
+                    local: &LocalNames::default(),
+                    wide: false,
+                    accepted: &Default::default(),
+                },
+            )
+            .into_iter()
+            .find(|r| r.text == name)
+            .map(|r| r.glyph)
+        };
+        let q = ClauseCtx::Qualified("sales".to_string());
+        assert_eq!(glyph(q, "open_orders"), Some(SuggestGlyph::View));
+        assert_eq!(glyph(ClauseCtx::Table, "orders"), Some(SuggestGlyph::Kind));
+        assert_eq!(
+            glyph(ClauseCtx::Table, "open_orders"),
+            Some(SuggestGlyph::View)
+        );
     }
 
     /// A table no bare name reaches — PostgreSQL's `sales.ledger`, outside

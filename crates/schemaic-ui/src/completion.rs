@@ -448,6 +448,7 @@ mod index {
         // Every contributing database's tables, for the widened list.
         let mut all_tables: Vec<rank::IndexedTable> = Vec::new();
         let mut views: HashSet<(String, String)> = HashSet::new();
+        let mut views_by_schema: HashSet<(String, String)> = HashSet::new();
         let mut enum_types: HashMap<String, Vec<String>> = HashMap::new();
         let mut routines: Vec<rank::IndexedRoutine> = Vec::new();
         for node in nodes {
@@ -497,6 +498,10 @@ mod index {
                     });
                     if t.is_view {
                         views.insert((db_lower.clone(), t.name.to_ascii_lowercase()));
+                        if in_scope && let Some(ns) = &t.schema {
+                            views_by_schema
+                                .insert((ns.to_ascii_lowercase(), t.name.to_ascii_lowercase()));
+                        }
                     }
                     let metas = col_metas(t);
                     if in_scope && let Some(ns) = &t.schema {
@@ -588,6 +593,7 @@ mod index {
             tables_by_schema,
             all_tables,
             views,
+            views_by_schema,
             enum_types,
             routines,
         }
