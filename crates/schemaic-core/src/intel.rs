@@ -17331,8 +17331,10 @@ pub fn created_tables(sql: &str, dialect: SqlDialect) -> Vec<(Option<String>, St
 /// statement, each parsed alone, so a broken one elsewhere costs only itself.
 /// Empty on an engine with no `#` tables ([`SqlDialect::prefixed_names`]).
 /// The document, not the statement, because a temporary table outlives the
-/// statement that made it.
-pub fn temp_table_relations(sql: &str, dialect: SqlDialect) -> Vec<LocalRelation> {
+/// statement that made it. A name made more than once (dropped and made
+/// again) has the columns of its last definition in a statement starting
+/// before `caret` — the one the caret's statement meets — else its first.
+pub fn temp_table_relations(sql: &str, caret: usize, dialect: SqlDialect) -> Vec<LocalRelation> {
     use sqlparser::ast::{SetExpr, Statement};
     if !dialect.prefixed_names() || !sql.contains('#') {
         return Vec::new();
@@ -17366,15 +17368,22 @@ pub fn temp_table_relations(sql: &str, dialect: SqlDialect) -> Vec<LocalRelation
                 },
                 _ => None,
             };
-            if let Some((name, columns)) = made
-                && !columns.is_empty()
-                && !out.iter().any(|r| r.name.eq_ignore_ascii_case(&name))
-            {
-                out.push(LocalRelation {
+            let Some((name, columns)) = made else {
+                continue;
+            };
+            if columns.is_empty() {
+                continue;
+            }
+            match out.iter_mut().find(|r| r.name.eq_ignore_ascii_case(&name)) {
+                // Made again before the caret: that later definition is the
+                // one the caret's statement meets.
+                Some(r) if lo < caret => r.columns = columns,
+                Some(_) => {}
+                None => out.push(LocalRelation {
                     name,
                     columns,
                     derived: false,
-                });
+                }),
             }
         }
     }
@@ -30543,7 +30552,7 @@ mod tests {
     #[test]
     fn a_temp_tables_columns_are_read_from_where_it_is_made() {
         let got = |sql: &str, d| -> Vec<(String, Vec<String>)> {
-            temp_table_relations(sql, d)
+            temp_table_relations(sql, sql.len(), d)
                 .into_iter()
                 .map(|r| (r.name, r.columns))
                 .collect()
@@ -30562,6 +30571,42 @@ mod tests {
         // A real table, and an engine with no `#` tables.
         assert!(got("CREATE TABLE work (id int)", SqlDialect::MsSql).is_empty());
         assert!(got("CREATE TABLE #work (id int)", SqlDialect::Postgres).is_empty());
+    }
+
+    /// A temporary table the script drops and makes again has the columns of
+    /// the definition last made before the caret — the one the server holds
+    /// when the caret's statement runs (S8.5-L1-08).
+    #[test]
+    fn a_remade_temp_table_has_its_latest_columns_before_the_caret() {
+        let cols = |sql: &str| -> Vec<Vec<String>> {
+            let caret = sql.find('|').unwrap();
+            let sql = sql.replacen('|', "", 1);
+            temp_table_relations(&sql, caret, SqlDialect::MsSql)
+                .into_iter()
+                .map(|r| r.columns)
+                .collect()
+        };
+        let v = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            cols(
+                "CREATE TABLE #t (a int);\nDROP TABLE #t;\nCREATE TABLE #t (b int);\n\
+                 SELECT | FROM #t;"
+            ),
+            [v(&["b"])]
+        );
+        // Between the two, the first is still the one there.
+        assert_eq!(
+            cols(
+                "CREATE TABLE #t (a int);\nSELECT | FROM #t;\nDROP TABLE #t;\n\
+                 SELECT b INTO #t FROM src;"
+            ),
+            [v(&["a"])]
+        );
+        // Made only after the caret: that definition is all there is.
+        assert_eq!(
+            cols("SELECT | FROM #t;\nCREATE TABLE #t (c int);"),
+            [v(&["c"])]
+        );
     }
 
     /// The parsed scope's table names at the `|`.

@@ -1320,7 +1320,7 @@ fn recompute_completions_in(
     if matches!(ctx, ClauseCtx::Column | ClauseCtx::Qualified(_))
         && scope.iter().any(|t| t.name.starts_with('#'))
     {
-        relations.extend(intel::temp_table_relations(text, dialect));
+        relations.extend(intel::temp_table_relations(text, offset, dialect));
     }
     for r in relations.iter().filter(|r| r.derived) {
         let named = |t: &intel::TableRef| {

@@ -13872,7 +13872,10 @@ existing prose was left alone.
       where the statement names one: `intel::temp_table_relations` reads every `CREATE TABLE
       #name (…)` and `SELECT … INTO #name` in the document, each statement parsed alone, into
       `LocalNames::relations` under the name with its sigil, which is how the scope and
-      `#work.` name it (`a_temp_tables_columns_are_read_from_where_it_is_made`). The caller
+      `#work.` name it (`a_temp_tables_columns_are_read_from_where_it_is_made`). A table the
+      script drops and makes again has its last definition before the caret, the one the caret's
+      statement meets, and not its first
+      (`a_remade_temp_table_has_its_latest_columns_before_the_caret`). The caller
       reads them only when the scope names a `#` table, since the reading parses every
       statement that makes one.
       **A CTE's and a derived table's columns are offered as a table's are**, from
