@@ -248,13 +248,21 @@ fn terminator_at(full: &str, lo: usize, dialect: SqlDialect) -> Option<String> {
 /// `None` when the text cannot be one line and mean the same: a `GO` or
 /// `DELIMITER` line, which a client only reads standing on its own line, or a
 /// line comment whose text would not lex back as one block comment (a `*/` in
-/// it, or a `/*` where comments nest).
+/// it, or a `/*` where comments nest) — or, where a line break joins two
+/// strings into one ([`newline_continues_strings`]), a string continued on
+/// the next line: PostgreSQL reads `'foo'⏎'bar'` as `'foobar'`, and
+/// `'foo' 'bar'` is a syntax error there.
 pub fn single_line(sql: &str, dialect: SqlDialect) -> Option<String> {
     let b = sql.as_bytes();
     let collapse = |s: &str| s.split_ascii_whitespace().collect::<Vec<_>>().join(" ");
     let mut out = String::with_capacity(sql.len());
     let mut space = false;
     let mut line_start = true;
+    // The last piece was a string, and a line break has passed since —
+    // through blanks and line comments only, which is what PostgreSQL's
+    // lexer lets stand between a string and its continuation.
+    let mut after_string = false;
+    let mut newline_since = false;
     // A MySQL executable comment (`/*!…*/`, `/*M!…*/`) is code to the lexer,
     // so a line comment inside one is lexed as one — and rewritten, its `*/`
     // would close the executable comment. Where one has opened, a line comment
@@ -264,6 +272,7 @@ pub fn single_line(sql: &str, dialect: SqlDialect) -> Option<String> {
     while i < b.len() {
         if b[i].is_ascii_whitespace() {
             line_start |= b[i] == b'\n';
+            newline_since |= b[i] == b'\n';
             space = !out.is_empty();
             i += 1;
             continue;
@@ -274,7 +283,7 @@ pub fn single_line(sql: &str, dialect: SqlDialect) -> Option<String> {
         {
             return None;
         }
-        let (piece, next) = match skip_noncode(b, i, dialect) {
+        let (piece, next, line_comment) = match skip_noncode(b, i, dialect) {
             Some(j) => {
                 let j = j.max(i + 1);
                 let span = &sql[i..j];
@@ -285,6 +294,8 @@ pub fn single_line(sql: &str, dialect: SqlDialect) -> Option<String> {
                 let line_body = span.strip_prefix("--").or_else(|| span.strip_prefix('#'));
                 let piece = match line_body {
                     Some(body) => {
+                        // A line comment ends at a line break.
+                        newline_since = true;
                         let body = collapse(body);
                         if body.is_empty() {
                             i = j;
@@ -302,13 +313,25 @@ pub fn single_line(sql: &str, dialect: SqlDialect) -> Option<String> {
                     None if span.starts_with("/*") => collapse(span),
                     None => span.to_string(),
                 };
-                (piece, j)
+                (piece, j, line_body.is_some())
             }
             None => {
                 let ch = sql[i..].chars().next()?;
-                (ch.to_string(), i + ch.len_utf8())
+                (ch.to_string(), i + ch.len_utf8(), false)
             }
         };
+        if !line_comment {
+            let string = piece.len() > 1 && piece.starts_with('\'') && piece.ends_with('\'');
+            if string
+                && std::mem::take(&mut after_string)
+                && newline_since
+                && newline_continues_strings(dialect)
+            {
+                return None;
+            }
+            after_string = string;
+            newline_since = false;
+        }
         if std::mem::take(&mut space) {
             out.push(' ');
         }
@@ -502,6 +525,20 @@ fn ops(dialect: SqlDialect) -> &'static [&'static str] {
 ///
 /// An exhaustive `match`, for the reason [`ops`] gives.
 fn operators_are_composable(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::Postgres => true,
+        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+    }
+}
+
+/// Does a line break between two string literals make them **one** string
+/// in `dialect`, which the same two on one line are not?
+///
+/// PostgreSQL's (the SQL standard's rule): `'foo'⏎'bar'` is `'foobar'`, and
+/// `'foo' 'bar'` is a syntax error. MySQL joins adjacent strings on one line
+/// as well, so a line break changes nothing there; SQLite and SQL Server
+/// join them nowhere. An exhaustive `match`, for the reason [`ops`] gives.
+pub(crate) fn newline_continues_strings(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::Postgres => true,
         SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => false,
@@ -2233,6 +2270,40 @@ mod tests {
         );
         // `GO` is only a directive on SQL Server.
         assert_eq!(single_line("SELECT 1\nGO", MySql).unwrap(), "SELECT 1 GO");
+    }
+
+    /// **PostgreSQL joins two strings into one only across a newline**, so
+    /// `'foo'⏎'bar'` is `'foobar'` there and `'foo' 'bar'` is a syntax error
+    /// (16.15). A line comment between them still carries the newline; a
+    /// block comment breaks the continuation, and elsewhere two strings on
+    /// one line mean what they did on two.
+    #[test]
+    fn single_line_refuses_a_postgres_string_continued_on_the_next_line() {
+        use SqlDialect::{MySql, Postgres};
+        for sql in [
+            "select 'foo'\n'bar'",
+            "select 'a' -- c\n'b'",
+            "select E'a\\n'\n  'b' from t",
+        ] {
+            assert_eq!(single_line(sql, Postgres), None, "{sql:?}");
+        }
+        assert_eq!(
+            single_line("select 'a' /* c */\n'b'", Postgres).unwrap(),
+            "select 'a' /* c */ 'b'"
+        );
+        assert_eq!(
+            single_line("select 'a',\n'b'", Postgres).unwrap(),
+            "select 'a', 'b'"
+        );
+        assert_eq!(
+            single_line("select 'foo'\n'bar'", MySql).unwrap(),
+            "select 'foo' 'bar'"
+        );
+        // And *Make single line* leaves the entry out.
+        assert_eq!(
+            single_line_in_place("select 'foo'\n'bar';", (0, 0), 0, Postgres),
+            None
+        );
     }
 
     #[test]

@@ -25186,7 +25186,10 @@ mod tests {
                 Postgres,
                 "select id::text, data #> '{a,b}' from t where x = -1",
             ),
+            // A string continued on the next line, which *Make single line*
+            // must not join (S4-L1-03).
             (Postgres, "select 'foo'\n'bar' from t"),
+            (Postgres, "select 'a' -- c\n'b', E'x\\n'\n  'y' from t"),
             // A routine's terminator under `DELIMITER`, in the fragment
             // *Format statement* formats (S4-L1-01).
             (
@@ -25211,31 +25214,46 @@ mod tests {
     /// What `sql` says, read by lexers that are not the formatter's: the
     /// statements a client sends ([`crate::sql::executable_statements`], which
     /// knows `DELIMITER` and `GO`), each as `sqlparser`'s tokens with the
-    /// blanks between them dropped. A statement `sqlparser` cannot tokenize
-    /// is compared by its non-blank characters instead.
+    /// blanks and comments between them dropped — a comment that swallowed
+    /// code still shows, as the code's tokens gone missing. A statement
+    /// `sqlparser` cannot tokenize is compared by its non-blank characters
+    /// instead.
     ///
     /// **Independent of `sqlfmt::tokenize` on purpose**: a census taken with
     /// the tokenizer under test agrees with itself about every token it
-    /// splits or fuses. What this still cannot see is a blank that matters
-    /// *between* two tokens — PostgreSQL joins `'foo'⏎'bar'` into one string
-    /// only across the newline — which the formatter's own tests pin.
+    /// splits or fuses. The one blank it keeps is the line break that joins
+    /// two strings into one where [`crate::sqlfmt::newline_continues_strings`]
+    /// — PostgreSQL's `'foo'⏎'bar'` is `'foobar'` — written as a `⏎` token.
     fn what_it_says(sql: &str, d: SqlDialect) -> Vec<Vec<String>> {
         use sqlparser::tokenizer::{Token, Tokenizer, Whitespace};
+        let continues = crate::sqlfmt::newline_continues_strings(d);
         crate::sql::executable_statements(sql, d)
             .iter()
             .map(|s| match Tokenizer::new(&*d.parser(), s).tokenize() {
-                Ok(toks) => toks
-                    .into_iter()
-                    .filter_map(|t| match t {
-                        Token::Whitespace(
-                            Whitespace::Space | Whitespace::Newline | Whitespace::Tab,
-                        ) => None,
-                        Token::Whitespace(Whitespace::SingleLineComment { comment, prefix }) => {
-                            Some(format!("{prefix}{}", comment.trim_end()))
+                Ok(toks) => {
+                    let mut said = Vec::new();
+                    // After a string, and has a line break passed since?
+                    let (mut after_string, mut broke) = (false, false);
+                    for t in toks {
+                        match t {
+                            Token::Whitespace(Whitespace::Space | Whitespace::Tab) => {}
+                            Token::Whitespace(
+                                Whitespace::Newline | Whitespace::SingleLineComment { .. },
+                            ) => broke = true,
+                            Token::Whitespace(_) => after_string = false,
+                            t => {
+                                let text = t.to_string();
+                                let string = text.ends_with('\'');
+                                if continues && string && after_string && broke {
+                                    said.push("⏎".to_string());
+                                }
+                                (after_string, broke) = (string, false);
+                                said.push(text);
+                            }
                         }
-                        t => Some(t.to_string()),
-                    })
-                    .collect(),
+                    }
+                    said
+                }
                 Err(_) => vec![s.split_whitespace().collect::<String>()],
             })
             .collect()
@@ -25245,9 +25263,9 @@ mod tests {
     /// and changes nothing the statement says** — the same statements, each
     /// the same tokens, as [`what_it_says`] reads them. So does *Format
     /// statement* on each statement alone, which formats a fragment cut out
-    /// of the document. Asserted here because this is the widest body of SQL
-    /// the crate holds; the formatter's own tests pin layout, one shape at a
-    /// time.
+    /// of the document, and *Make single line* wherever it does not refuse.
+    /// Asserted here because this is the widest body of SQL the crate holds;
+    /// the formatter's own tests pin layout, one shape at a time.
     #[test]
     fn the_corpus_formats_idempotently_on_every_engine() {
         let mut failures = Vec::new();
@@ -25266,6 +25284,13 @@ mod tests {
                 ));
             } else if what_it_says(&once, d) != said {
                 failures.push(format!("[{d:?}] changed what it says: {sql}\n{once}"));
+            }
+            if let Some(one) = crate::sqlfmt::single_line(sql, d)
+                && what_it_says(&one, d) != said
+            {
+                failures.push(format!(
+                    "[{d:?}] one line changed what it says: {sql}\n{one}"
+                ));
             }
             for (lo, _) in crate::sql::statement_ranges(sql, d) {
                 let Some((lo, hi, text)) = crate::sqlfmt::format_statement(sql, lo, "  ", d, keep)

@@ -12489,7 +12489,13 @@ existing prose was left alone.
     asked at the first non-blank code byte of each line), since a client reads either only standing
     on a line of its own. That is deliberately conservative: unlike `tokenize`, it does not ask
     whether a statement begins there, so a line that merely opens with a word `delimiter`
-    mid-statement refuses as well (`single_line_refuses_what_one_line_would_change`).
+    mid-statement refuses as well (`single_line_refuses_what_one_line_would_change`). **So does a
+    string continued on the next line where a line break joins two strings into one**
+    (`newline_continues_strings`, PostgreSQL's alone): `'foo'⏎'bar'` is `'foobar'` there and
+    `'foo' 'bar'` a syntax error, which *Make single line* wrote over the statement. The break may
+    pass through blanks and line comments but not a block comment, as PostgreSQL's lexer has it;
+    MySQL joins adjacent strings on one line too, so there the copy stands
+    (`single_line_refuses_a_postgres_string_continued_on_the_next_line`).
     `single_line_copy` picks what is copied — the selection when there is one, else
     `sql::statement_range` at the right-click, trimmed, an empty answer being `None` — and puts the
     selection through `formattable_range` for that function's reason: `single_line` lexes from byte
@@ -12579,14 +12585,16 @@ existing prose was left alone.
     `valid_corpus`, formatted on all four engines, and `format_corpus` — the shapes Format Code
     has got wrong, each on its own engine — must format to itself a second time and **say the same
     thing**: the same statements as `sql::executable_statements` splits them, each the same
-    `sqlparser` tokens with the blanks dropped (`what_it_says`). The *Format statement* of each
-    statement alone, spliced back, is held to the same (`the_corpus_formats_idempotently_on_every_engine`,
+    `sqlparser` tokens with the blanks and comments dropped (`what_it_says`) — save the line break
+    that joins two strings where `newline_continues_strings`, kept as a token of its own. The
+    *Format statement* of each statement alone, spliced back, and `single_line` wherever it does
+    not refuse are held to the same (`the_corpus_formats_idempotently_on_every_engine`,
     under `intel`'s tests for where the corpus lives). It compared non-blank characters until
     then, which is blind to every split and fusion this formatter can make — `END//` and
     `END / /`, `between .1` and `between.1`, `- ~5` and `-~ 5` have the same ink — and a census
     taken with `sqlfmt::tokenize` itself agrees with itself about a token it mis-splits, so the
-    reader is deliberately another lexer. What it still cannot see is a blank that matters
-    *between* two tokens (PostgreSQL's `'foo'⏎'bar'`), which the module's own tests pin. The token-preservation test runs its shared shapes
+    reader is deliberately another lexer. Any other blank that matters *between* two tokens it
+    cannot see, and the module's own tests pin those. The token-preservation test runs its shared shapes
     on all four engines too, and SQL Server's own besides — bracketed names with `]]`, `N'…'`,
     `@x`/`@@x`/`#t`/`##t`, compound assignment, `TOP (n)`, `OUTPUT`, `APPLY`, `type::Method`,
     `!<`/`!>` — each idempotent. Both were green on arrival: they guard, they did not find.
