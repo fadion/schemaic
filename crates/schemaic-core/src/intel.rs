@@ -25187,6 +25187,16 @@ mod tests {
                 "select id::text, data #> '{a,b}' from t where x = -1",
             ),
             (Postgres, "select 'foo'\n'bar' from t"),
+            // A routine's terminator under `DELIMITER`, in the fragment
+            // *Format statement* formats (S4-L1-01).
+            (
+                MySql,
+                "DELIMITER //\nCREATE PROCEDURE p()\nBEGIN\nSELECT 1;\nEND//\nDELIMITER ;\nSELECT 2;\n",
+            ),
+            (
+                MySql,
+                "DELIMITER ;;\nCREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW BEGIN SET NEW.a = 1; END;;\nDELIMITER ;\n",
+            ),
         ]
     }
 

@@ -12561,6 +12561,13 @@ existing prose was left alone.
     terminator it set is not `;` reads it as one `Kind::Terminator`, which a word stops at (`END$$`)
     and `run` treats as `;` (`end_statement`), written tight unless spelled in word bytes
     (`a_mysql_delimiter_line_survives_formatting`, by the same split-and-compare, and idempotent).
+    **A fragment is lexed under the terminator in force where it begins**: *Format statement* and a
+    selection hand `format_range` a routine's `END//` without the `DELIMITER //` line above it, so
+    the `//` lexed as two `/`s and came back `END / /` (and `;;` as two `;`s) — no terminator, and
+    the client ran the routine on through `DELIMITER ;`. `terminator_at` tokenizes the document up
+    to the fragment and hands the state it ends in to `tokenize_under`, through `format_sql_under`
+    and `apply_keyword_case_under`, so the directive is taken exactly where `tokenize` takes one
+    (`a_fragment_under_a_delimiter_keeps_its_terminator`).
     **Idempotence is held as a property over the widest corpus the crate has**: `intel`'s
     `valid_corpus`, formatted on all four engines, and `format_corpus` — the shapes Format Code
     has got wrong, each on its own engine — must format to itself a second time and **say the same

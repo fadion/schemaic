@@ -67,7 +67,19 @@ pub fn formattable_range(
 /// One newline either way: the trailing blank lines a document collects are
 /// still whitespace to re-flow.
 pub fn format_sql(sql: &str, indent_unit: &str, dialect: SqlDialect) -> String {
-    let toks = tokenize(sql, dialect);
+    format_sql_under(sql, indent_unit, dialect, None)
+}
+
+/// [`format_sql`] of a fragment that begins where `delim` is the statement
+/// terminator a MySQL `DELIMITER` set (`None` for `;`) — see
+/// [`terminator_at`].
+fn format_sql_under(
+    sql: &str,
+    indent_unit: &str,
+    dialect: SqlDialect,
+    mut delim: Option<String>,
+) -> String {
+    let toks = tokenize_under(sql, dialect, &mut delim);
     let mut f = Fmt::new(indent_unit, sql, dialect);
     f.run(&toks);
     let out = f.out.trim_end();
@@ -131,10 +143,21 @@ impl<'de> serde::Deserialize<'de> for KeywordCase {
 /// tokens of their own and never words. ASCII case only, so every byte stays
 /// where it was and a caret mapped over the formatted text still lands.
 pub fn apply_keyword_case(sql: &str, dialect: SqlDialect, case: KeywordCase) -> String {
+    apply_keyword_case_under(sql, dialect, case, None)
+}
+
+/// [`apply_keyword_case`] of a fragment that begins where `delim` is the
+/// statement terminator in force, as [`format_sql_under`] takes it.
+fn apply_keyword_case_under(
+    sql: &str,
+    dialect: SqlDialect,
+    case: KeywordCase,
+    mut delim: Option<String>,
+) -> String {
     if case == KeywordCase::Keep {
         return sql.to_string();
     }
-    let toks = tokenize(sql, dialect);
+    let toks = tokenize_under(sql, dialect, &mut delim);
     let base = sql.as_ptr() as usize;
     let mut out = sql.to_string();
     let dot = |t: Option<&(Kind, &str)>| matches!(t, Some((Kind::Punct, ".")));
@@ -171,6 +194,13 @@ pub fn apply_keyword_case(sql: &str, dialect: SqlDialect, case: KeywordCase) -> 
 /// selection: selecting `select a from ` out of `select a from t` — a
 /// Ctrl+Shift+→ selection ends after the space — wrote back a fragment ending
 /// in `from`, and the splice fused it with `t` into `fromt`.
+///
+/// **A fragment is formatted under the terminator in force where it
+/// begins** ([`terminator_at`]). The `DELIMITER //` line that makes `//` one
+/// is above the statement, not in it, so *Format statement* lexed the
+/// routine's `END//` as two `/`s and wrote `END / /` — no terminator at all,
+/// and the client ran the routine on through `DELIMITER ;` and whatever
+/// followed.
 pub fn format_range(
     full: &str,
     lo: usize,
@@ -179,9 +209,8 @@ pub fn format_range(
     dialect: SqlDialect,
     case: KeywordCase,
 ) -> String {
-    let cased = |s: String| apply_keyword_case(&s, dialect, case);
     if lo == 0 && hi == full.len() {
-        return cased(format_sql(full, indent_unit, dialect));
+        return apply_keyword_case(&format_sql(full, indent_unit, dialect), dialect, case);
     }
     let frag = &full[lo..hi];
     let body = frag.trim();
@@ -190,10 +219,23 @@ pub fn format_range(
     }
     let lead = &frag[..frag.len() - frag.trim_start().len()];
     let trail = &frag[frag.trim_end().len()..];
+    let delim = terminator_at(full, lo, dialect);
+    let formatted = format_sql_under(body, indent_unit, dialect, delim.clone());
     format!(
         "{lead}{}{trail}",
-        cased(format_sql(body, indent_unit, dialect))
+        apply_keyword_case_under(&formatted, dialect, case, delim)
     )
+}
+
+/// The statement terminator a MySQL `DELIMITER` line set above `lo` in
+/// `full`, or `None` where it is `;` — the lexer's own state at `lo`, so a
+/// directive is taken exactly where [`tokenize`] takes one.
+fn terminator_at(full: &str, lo: usize, dialect: SqlDialect) -> Option<String> {
+    let mut delim = None;
+    if let Some(head) = full.get(..lo) {
+        tokenize_under(head, dialect, &mut delim);
+    }
+    delim
 }
 
 /// `sql` on one line, for the editor's *Copy as single line*: every run of
@@ -605,11 +647,19 @@ fn at_statement_start(toks: &[(Kind, &str)], delim: Option<&str>) -> bool {
 }
 
 fn tokenize(sql: &str, dialect: SqlDialect) -> Vec<(Kind, &str)> {
+    tokenize_under(sql, dialect, &mut None)
+}
+
+/// [`tokenize`], with `delim` the terminator a MySQL `DELIMITER` set where
+/// `sql` begins (`None` for `;`), and left as the one in force where it ends.
+fn tokenize_under<'s>(
+    sql: &'s str,
+    dialect: SqlDialect,
+    delim: &mut Option<String>,
+) -> Vec<(Kind, &'s str)> {
     let b = sql.as_bytes();
     let n = b.len();
     let mut toks: Vec<(Kind, &str)> = Vec::new();
-    // The terminator a MySQL `DELIMITER` set, while it is not `;`.
-    let mut delim: Option<String> = None;
     let mut i = 0;
     while i < n {
         let c = b[i];
@@ -627,13 +677,13 @@ fn tokenize(sql: &str, dialect: SqlDialect) -> Vec<(Kind, &str)> {
             && let Some((end, token)) = crate::sql::delimiter_directive(sql, i, dialect)
         {
             toks.push((Kind::Directive, sql[i..end].trim_end()));
-            delim = (token != ";").then_some(token);
+            *delim = (token != ";").then_some(token);
             i = end;
             continue;
         }
         // The terminator it set ends a statement as `;` does, and is one
         // token — `//` spaced to `/ /` is no terminator at all.
-        if let Some(d) = &delim
+        if let Some(d) = delim.as_deref()
             && b[i..].starts_with(d.as_bytes())
         {
             toks.push((Kind::Terminator, &sql[i..i + d.len()]));
@@ -2229,6 +2279,36 @@ mod tests {
         assert_eq!(format_statement(&formatted, 2, IND, MySql, keep), None);
         assert_eq!(format_statement("  \n ", 1, IND, MySql, keep), None);
         assert_eq!(format_statement("", 0, IND, MySql, keep), None);
+    }
+
+    /// **A statement under a MySQL `DELIMITER` keeps its terminator whole.**
+    /// The fragment *Format statement* and a selection hand the formatter
+    /// holds the `//` but not the `DELIMITER` line that made it one, so it
+    /// lexed as two `/`s and came back `END / /` — no terminator at all, and
+    /// the client ran the routine on through `DELIMITER ;` and what follows.
+    #[test]
+    fn a_fragment_under_a_delimiter_keeps_its_terminator() {
+        use SqlDialect::MySql;
+        let keep = KeywordCase::Keep;
+        for (d, end) in [("//", "END//"), (";;", "END;;"), ("$$", "END$$")] {
+            let doc = format!(
+                "DELIMITER {d}\nCREATE PROCEDURE p()\nBEGIN\nSELECT 1;\nEND{d}\nDELIMITER ;\n"
+            );
+            let at = doc.find("BEGIN").unwrap();
+            let (lo, hi, text) = format_statement(&doc, at, IND, MySql, keep).unwrap();
+            assert!(text.ends_with(end), "{d}: {text}");
+            let out = splice(&doc, (lo, hi, text));
+            assert_eq!(
+                crate::sql::executable_statements(&out, MySql).len(),
+                crate::sql::executable_statements(&doc, MySql).len(),
+                "{out}"
+            );
+            // A selection over the routine and its terminator, likewise.
+            let lo = doc.find("CREATE").unwrap();
+            let hi = doc.find(end).unwrap() + end.len();
+            let text = format_range(&doc, lo, hi, IND, MySql, KeywordCase::Upper);
+            assert!(text.ends_with(end), "{d}: {text}");
+        }
     }
 
     /// A caret before the rewritten range stays, one after it moves by the
