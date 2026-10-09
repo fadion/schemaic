@@ -1428,13 +1428,50 @@ pub fn worth_offering(name: &str, prefix: &str) -> bool {
 /// Subsequence match with a score: boundaries and runs score well, gaps and a
 /// late first hit score badly, a prefix match wins outright. `None` when the query
 /// is not a subsequence of the candidate at all.
+///
+/// **By character once either side is not ASCII**: matched byte by byte, a
+/// non-ASCII letter's case was never folded (`über` did not find
+/// `Überweisung`), and a multi-byte query matched pieces of two characters
+/// (`é`'s `C3 A9` in `ú` then `ũ`). Every name here is ASCII far more often
+/// than not and this runs per candidate per keystroke, so the byte loop stays
+/// the path for those, and only a non-ASCII pair pays for decoding.
 pub fn fuzzy_score(cand: &str, query: &str) -> Option<i32> {
     if query.is_empty() {
         return Some(0);
     }
-    let c = cand.as_bytes();
-    let q = query.as_bytes();
-    let lc = |x: u8| x.to_ascii_lowercase();
+    if cand.is_ascii() && query.is_ascii() {
+        return score_units(
+            cand.as_bytes(),
+            query.as_bytes(),
+            |x: u8| x.to_ascii_lowercase(),
+            |x| x == b'_',
+            |x, before| x.is_ascii_uppercase() && before.is_ascii_lowercase(),
+        );
+    }
+    // A character's lower case is its first, which is what a name's own
+    // folding keeps (`İ` lower-cases to two).
+    let fold = |x: char| x.to_lowercase().next().unwrap_or(x);
+    let c: Vec<char> = cand.chars().collect();
+    let q: Vec<char> = query.chars().collect();
+    score_units(
+        &c,
+        &q,
+        fold,
+        |x| x == '_',
+        |x, before| x.is_uppercase() && before.is_lowercase(),
+    )
+}
+
+/// [`fuzzy_score`] over a name's units — its bytes, or its characters —
+/// with the unit's case fold, its `_` test and its camelCase hump test (a
+/// unit, and the one before it).
+fn score_units<T: Copy + PartialEq>(
+    c: &[T],
+    q: &[T],
+    lc: impl Fn(T) -> T,
+    underscore: impl Fn(T) -> bool,
+    hump: impl Fn(T, T) -> bool,
+) -> Option<i32> {
     let mut score = 0i32;
     let mut qi = 0usize;
     let mut prev: Option<usize> = None;
@@ -1450,9 +1487,7 @@ pub fn fuzzy_score(cand: &str, query: &str) -> Option<i32> {
             // A word starts at the name's start, after `_`, and at a camelCase
             // hump — an upper-case letter after a lower-case one, so `oi`
             // finds `OrderItem`'s two words as it finds `order_item`'s.
-            let boundary = ci == 0
-                || c[ci - 1] == b'_'
-                || (c[ci].is_ascii_uppercase() && c[ci - 1].is_ascii_lowercase());
+            let boundary = ci == 0 || underscore(c[ci - 1]) || hump(c[ci], c[ci - 1]);
             score += if boundary { 18 } else { 4 };
             if let Some(p) = prev {
                 if ci == p + 1 {
@@ -1840,6 +1875,27 @@ mod tests {
         assert_eq!(
             fuzzy_score("ORDERINGX", "oi"),
             fuzzy_score("orderingx", "oi")
+        );
+    }
+
+    /// **Characters, not bytes**, once either side is not ASCII: a non-ASCII
+    /// letter's case is folded (`über` finds `Überweisung`), a multi-byte
+    /// query never matches pieces of two characters (`é` is not the `C3` of
+    /// `ú` and the `A9` of `ũ`), and a non-ASCII capital is a hump.
+    #[test]
+    fn a_non_ascii_name_is_matched_by_its_characters() {
+        assert!(fuzzy_score("Überweisung", "über").is_some());
+        assert!(fuzzy_score("überweisung", "ÜBER").is_some());
+        assert!(fuzzy_score("phúc_lũy", "é").is_none());
+        assert!(fuzzy_score("café", "é").is_some());
+        // Scored as the ASCII path scores the same shape.
+        assert_eq!(
+            fuzzy_score("Überweisung", "über"),
+            fuzzy_score("Uberweisung", "uber")
+        );
+        assert_eq!(
+            fuzzy_score("orderÜbersicht", "oü"),
+            fuzzy_score("orderUbersicht", "ou")
         );
     }
 

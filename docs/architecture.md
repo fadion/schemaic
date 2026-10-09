@@ -13718,7 +13718,11 @@ existing prose was left alone.
       keyword or a snippet as much as a name — where `recency_bonus` lifts identifiers only; it is
       asserted through `rank` itself (`a_word_accepted_before_ranks_above_its_equals`). `fuzzy_score` is a subsequence match that rewards a hit at a word's
       start — the name's, after `_`, or at a camelCase hump, so `oi` finds `OrderItem`'s words as
-      it finds `order_item`'s (`a_camel_case_hump_scores_as_a_word_boundary`). **A table, column
+      it finds `order_item`'s (`a_camel_case_hump_scores_as_a_word_boundary`). It matches bytes
+      while both sides are ASCII and characters once either is not, so `über` finds
+      `Überweisung` and `é` never matches the halves of two other letters
+      (`a_non_ascii_name_is_matched_by_its_characters`); the byte loop is kept for the common
+      case because this runs per candidate per keystroke. **A table, column
       or database row inserts its name through `export::ident_if_needed`** where that differs from
       the bare name — `` `order` ``, `` `Unit Price` ``, PostgreSQL's `"OrderDate"` — while the row
       shows, and was matched by, the bare one. That is `accepted_insert`'s answer, asked at accept

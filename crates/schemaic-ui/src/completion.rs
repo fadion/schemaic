@@ -2903,16 +2903,15 @@ mod tests {
         better("id", "identifier_column", "id");
     }
 
-    /// Case is folded, and only over ASCII — the scan compares bytes, so a
-    /// candidate with a non-ASCII letter matches byte-for-byte and its case is
-    /// not folded. Recorded rather than desired: `is_word_byte` admits
-    /// `>= 0x80`, so such candidates do reach here.
+    /// Case is folded, a non-ASCII letter's too: `is_word_byte` admits
+    /// `>= 0x80`, so such candidates do reach here, and the scan compares
+    /// characters once either side is not ASCII (`rank::fuzzy_score`).
     #[test]
-    fn matching_folds_ascii_case_only() {
+    fn matching_folds_case() {
         assert!(fuzzy_score("Orders", "ord").is_some());
         assert!(fuzzy_score("orders", "ORD").is_some());
         assert!(fuzzy_score("café", "café").is_some());
-        assert_eq!(fuzzy_score("café", "CAFÉ"), None);
+        assert!(fuzzy_score("café", "CAFÉ").is_some());
         // The ASCII head of the same name still folds.
         assert!(fuzzy_score("café", "CAF").is_some());
     }
