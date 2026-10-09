@@ -5962,9 +5962,6 @@ mod index_key_tests {
         assert_eq!(enums[0].comment.as_deref(), Some("how it went"));
     }
 
-    /// A label may be the empty string, a comma, or a newline — which is why the
-    /// labels arrive one per row instead of string-aggregated. Any separator at
-    /// all would be a value some database already stores.
     /// A position is kept only where it indexes the text that was sent.
     #[test]
     fn a_run_error_keeps_the_servers_position_into_what_was_sent() {
@@ -5982,6 +5979,9 @@ mod index_key_tests {
         assert_eq!(super::placed("boom".into(), None).position(), None);
     }
 
+    /// A label may be the empty string, a comma, or a newline — which is why the
+    /// labels arrive one per row instead of string-aggregated. Any separator at
+    /// all would be a value some database already stores.
     #[test]
     fn enum_labels_survive_being_commas_newlines_and_empty() {
         let types = vec![row(&["public", "weird", "e", "", "", "0", "", "", "0"])];

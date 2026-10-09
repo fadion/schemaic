@@ -1583,23 +1583,6 @@ fn run_result(state: &QueryState, duration_ms: u64) -> Option<schemaic_core::his
     }
 }
 
-/// Which engine's transaction semantics apply — the divergence that
-/// [`schemaic_core::tx`] encodes (Postgres poisons a transaction on any error;
-/// MySQL implicitly commits on DDL).
-///
-/// **`schemaic_db`'s mapping, not a second copy of it.** This decides the footer
-/// pill and what Commit and Rollback may do; `Session`'s decides whether the next
-/// statement issues a `BEGIN`. They are the two halves of one tab's transaction
-/// model, and they were the same three-arm match written out twice — one pinned
-/// by `session.rs`'s tests and one structurally unreachable from them, so a
-/// fourth engine was one clean-compiling edit away from a pill that disagreed
-/// with the session it describes.
-///
-/// (SQLite takes MySQL's arm and never reaches it: manual-transaction mode isn't
-/// offered on a SQLite connection and `Session::open` refuses one. Of the two,
-/// MySQL's is the safe default to answer with — Postgres' would report a
-/// transaction as poisoned when there is no transaction at all. The reasoning
-/// lives with the mapping now.)
 /// The schema reload a run's completion calls, filled once `refresh_db`
 /// exists (see `refresh_after_run`).
 type LateRefresh = Rc<RefCell<Option<Rc<dyn Fn(String)>>>>;
@@ -1637,6 +1620,23 @@ fn settle_schema(
     }
 }
 
+/// Which engine's transaction semantics apply — the divergence that
+/// [`schemaic_core::tx`] encodes (Postgres poisons a transaction on any error;
+/// MySQL implicitly commits on DDL).
+///
+/// **`schemaic_db`'s mapping, not a second copy of it.** This decides the footer
+/// pill and what Commit and Rollback may do; `Session`'s decides whether the next
+/// statement issues a `BEGIN`. They are the two halves of one tab's transaction
+/// model, and they were the same three-arm match written out twice — one pinned
+/// by `session.rs`'s tests and one structurally unreachable from them, so a
+/// fourth engine was one clean-compiling edit away from a pill that disagreed
+/// with the session it describes.
+///
+/// (SQLite takes MySQL's arm and never reaches it: manual-transaction mode isn't
+/// offered on a SQLite connection and `Session::open` refuses one. Of the two,
+/// MySQL's is the safe default to answer with — Postgres' would report a
+/// transaction as poisoned when there is no transaction at all. The reasoning
+/// lives with the mapping now.)
 fn tx_engine(db: &Db) -> TxEngine {
     schemaic_db::session::tx_engine_of(db.engine())
 }

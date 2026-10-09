@@ -3163,9 +3163,6 @@ mod index_tests {
         names.iter().map(|s| s.to_string()).collect()
     }
 
-    /// **A hidden database contributes nothing at all** — not its name, not its
-    /// tables, not its columns. The function's own doc says so; nothing asserted
-    /// it for the index.
     /// The tab's own database's tables are indexed by their schema too —
     /// `sales.orders` on PostgreSQL or SQL Server — and another database's
     /// are not, since a `schema.table` never crosses a database.
@@ -3207,6 +3204,9 @@ mod index_tests {
         assert_eq!(ix.all_tables.len(), 3);
     }
 
+    /// **A hidden database contributes nothing at all** — not its name, not its
+    /// tables, not its columns. The function's own doc says so; nothing asserted
+    /// it for the index.
     #[test]
     fn a_hidden_database_contributes_no_name_no_table_and_no_column() {
         let nodes = [

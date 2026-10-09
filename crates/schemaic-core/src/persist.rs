@@ -1891,8 +1891,8 @@ mod tests {
         assert_eq!(back.format_keyword_case, KeywordCase::Upper);
     }
 
-    /// Rainbow brackets are off for a new install and a file written before
-    /// the setting existed, and an on stays on.
+    /// Completion writes table aliases for a new install and a file written
+    /// before the setting existed, and an off stays off.
     #[test]
     fn table_aliases_default_on_and_keep_an_off() {
         assert!(UiState::default().completion_table_aliases);
@@ -1907,6 +1907,8 @@ mod tests {
         assert!(!back.completion_table_aliases);
     }
 
+    /// Rainbow brackets are off for a new install and a file written before
+    /// the setting existed, and an on stays on.
     #[test]
     fn rainbow_brackets_default_off_and_keep_an_on() {
         assert!(!UiState::default().editor_rainbow_brackets);
