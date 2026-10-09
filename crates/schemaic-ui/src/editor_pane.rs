@@ -4091,15 +4091,24 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 if was {
                     return false;
                 }
-                let doc = e.doc();
-                let full = doc.text().to_string();
                 let cur = e.cursor.get_untracked();
+                // Several carets: the letter types at each, undented. The
+                // edit below is one caret's — `get_selection` is the first
+                // region — and `read_only` suppresses floem's insert at all of
+                // them, so going on dropped the letter at every other caret
+                // and collapsed them into one.
+                if several_regions(&cur).is_some() {
+                    return false;
+                }
+                let doc = e.doc();
                 let off = cur.offset();
                 let (a, b) = cur.get_selection().unwrap_or((off, off));
                 let unit = indent_unit();
-                let Some(edit) =
-                    schemaic_core::text_ops::dedent_typed_word(&full, a, b, ch, &unit, dia)
-                else {
+                // The text borrowed, the borrow over before the edit below.
+                let planned = crate::completion::with_text(e, comp, |full| {
+                    schemaic_core::text_ops::dedent_typed_word(full, a, b, ch, &unit, dia)
+                });
+                let Some(edit) = planned else {
                     return false;
                 };
                 ro.set(true);
@@ -9566,6 +9575,25 @@ mod editor_freeze_gate {
             )
             .expect("this file"),
         )
+    }
+
+    /// **The END/WHEN/ELSE dedent bows out with several carets.** Its edit is
+    /// the first caret's, and the `read_only` it sets suppresses floem's insert
+    /// at all of them — so the letter was dropped at every other caret and the
+    /// carets collapsed into one. The decision lives in the key handler, where
+    /// only a census can see it.
+    #[test]
+    fn the_typed_word_dedent_leaves_several_carets_to_floem() {
+        let src = source();
+        let branch = src
+            .split_once("matches!(ch.to_ascii_lowercase(), 'd' | 'n' | 'e')")
+            .and_then(|(_, rest)| rest.split_once("text_ops::dedent_typed_word("))
+            .map(|(head, _)| head.to_string())
+            .expect("the dedent branch is still keyed on d/n/e");
+        assert!(
+            branch.contains("several_regions(&cur).is_some()"),
+            "the dedent branch must decline before planning a one-caret edit:\n{branch}"
+        );
     }
 
     /// **The funnel asks.** This is the load-bearing half: every programmatic

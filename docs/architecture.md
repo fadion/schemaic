@@ -12579,7 +12579,14 @@ existing prose was left alone.
     character to floem (`typing_an_end_dedents_it_to_its_opener`,
     `typing_a_case_branch_indents_it_under_its_case`). The pane applies it as the
     auto-pair does — floem's own insert suppressed through `read_only`, a Ctrl+K freeze left alone
-    — and as `InsertChars`, so it undoes with the typing it finished, never alone. The pane takes
+    — and as `InsertChars`, so it undoes with the typing it finished, never alone. With several
+    carets it bows out and the letter types, undented, at each: its edit is one caret's, and the
+    `read_only` it sets suppresses floem's insert at all of them, so going on dropped the letter at
+    every other caret and collapsed them into one
+    (`the_typed_word_dedent_leaves_several_carets_to_floem`). It plans on the borrowed text
+    (`completion::with_text`), and `dedent_typed_word` declines before it copies anything unless
+    the line spells the rest of one of its words — a `d`, `n` or `e` is a large share of all
+    typing. The pane takes
     Enter with no
     primary modifier or Alt, after the completion and Ctrl+K arms — so a word typed in full now
     reaches it — and leaves several carets to floem's Enter, which handles each one.

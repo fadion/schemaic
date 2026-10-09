@@ -1045,6 +1045,11 @@ pub fn dedent_typed_word(
             && w[..word.len()].eq_ignore_ascii_case(word)
             && ch.eq_ignore_ascii_case(&(w.as_bytes()[word.len()] as char))
     };
+    // Before the copy below: a `d`, `n` or `e` is a large share of all typing,
+    // and the line almost never spells the rest of one of these words.
+    if !(completes("END") || completes("WHEN") || completes("ELSE")) {
+        return None;
+    }
     // Asked of the text as it will be, with `ch` typed.
     let typed = format!("{}{ch}{}", &full[..caret], &full[caret..]);
     let word_at = caret - word.len();
