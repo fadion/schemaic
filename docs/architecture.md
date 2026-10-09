@@ -13793,6 +13793,16 @@ existing prose was left alone.
       arguments bare, T-SQL's `EXEC p @a = 1`, which inserts the name alone
       (`the_databases_routines_are_offered_where_each_can_be_called`,
       `the_name_a_call_or_exec_runs_is_a_routine_slot`).
+      **A routine goes in by the name that reaches it** (`rank::routine_sql`): `IndexedRoutine`
+      carries its schema, and the row inserts `schema.name` where no bare name reaches that schema
+      (`filter::bare_name_reaches`, as for a table) and, for a function, wherever
+      `intel::user_function_call_needs_schema` says the engine calls one only by its two-part name
+      — SQL Server, whose bare `f()` is Msg 195 even in `dbo`. Each part goes through
+      `ident_if_needed`, so PostgreSQL's `"calcTotal"` keeps its quotes. Such a row's `insert`
+      ends in the call's `()`, and `rank::override_splice` puts the caret between them at accept,
+      or drops them where the call's parens already follow, as a plain function row's `name()`
+      does (`a_routine_inserts_the_name_that_reaches_it`,
+      `a_routine_override_places_the_caret_in_its_parens`).
       **The keyword lists are filtered per engine** in every arm that offers them, through a local
       `keywords` closure over `intel::keyword_offered`: `SQL_KEYWORDS` and `STMT_KEYWORDS` are
       shared, and a word the engine has no use for is a row that writes an error — `LIMIT` on SQL
@@ -24073,7 +24083,9 @@ existing prose was left alone.
     `snippet::by_abbrev` so the narrowest scope wins by the same rule everywhere; the row shows the
     abbrev and inserts the **body**, through the same `Suggestion::insert` override an FK-JOIN row
     uses — as does a builtin the engine calls bare (`CURRENT_TIMESTAMP`, under `rank.rs`), which
-    is why `accept_completion` appends `()` to a function row only when it carries no `insert`.
+    is why `accept_completion` appends `()` to a function row only when it carries no `insert` —
+    a routine inserted qualified or quoted carries its `()` in the `insert`, and
+    `rank::override_splice` places the caret between them.
     **An accept replaces the whole word the caret is in**, from `word_start` to `word_end` — the
     part after the caret too, and the `(` test reads past it — so accepting `customer_id` at
     `cust|_id` no longer writes `customer_id_id`

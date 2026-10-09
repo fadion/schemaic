@@ -482,6 +482,7 @@ mod index {
                     // can be called.
                     routines.extend(schema.routines.iter().map(|r| rank::IndexedRoutine {
                         name: r.name.clone(),
+                        schema: r.schema.clone(),
                         kind: r.kind,
                         arguments: r.arguments.clone(),
                         returns: r.returns.clone(),
@@ -1464,9 +1465,9 @@ pub(crate) fn accept_completion(ed: &Editor, comp: Completion, dialect: SqlDiale
         comp.suppress.set(true);
         let (insert, caret) = if let Some(over) = over {
             // An explicit splice override (e.g. an FK JOIN target: `orders ON …`, or a
-            // `SELECT *` expansion); caret lands at its end.
-            let len = over.len();
-            (over, len)
+            // `SELECT *` expansion); caret lands at its end — or, for a routine
+            // called by a qualified or quoted name, between its parens.
+            rank::override_splice(over, kind, call_parens_follow(&text[end..]))
         } else {
             // A function inserts `name()` with the caret between the parens — unless
             // the call parens are already there just ahead (re-accepting over a call).

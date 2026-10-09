@@ -4109,6 +4109,17 @@ pub fn procedure_args_in_parens(dialect: SqlDialect) -> bool {
     }
 }
 
+/// Does a call of the database's own function need its schema even where a
+/// bare name would reach a table of that schema? T-SQL invokes a scalar
+/// user-defined function only by at least its two-part name — `dbo.f()`;
+/// bare, `f()` is "not a recognized built-in function name" (Msg 195).
+pub fn user_function_call_needs_schema(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MsSql => true,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+    }
+}
+
 /// Is the word after `toks` — a statement's tokens up to it — the name a
 /// `CALL` (MySQL, PostgreSQL) or `EXEC`/`EXECUTE` (SQL Server) runs? Only
 /// straight after the statement-opening keyword: past the name come the
@@ -30159,12 +30170,14 @@ mod tests {
         let routines = [
             IndexedRoutine {
                 name: "order_total".into(),
+                schema: None,
                 kind: RoutineKind::Function,
                 arguments: "o integer, with_tax boolean DEFAULT true".into(),
                 returns: "numeric".into(),
             },
             IndexedRoutine {
                 name: "refresh_totals".into(),
+                schema: None,
                 kind: RoutineKind::Procedure,
                 arguments: "IN d DATE".into(),
                 returns: String::new(),
@@ -30172,6 +30185,7 @@ mod tests {
             // Named like a builtin: the database's own answers.
             IndexedRoutine {
                 name: "length".into(),
+                schema: None,
                 kind: RoutineKind::Function,
                 arguments: "t text".into(),
                 returns: "integer".into(),

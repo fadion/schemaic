@@ -179,6 +179,12 @@ pub struct SchemaIndex {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IndexedRoutine {
     pub name: String,
+    /// Its namespace (`RoutineInfo::schema`): `None` on MySQL, where the
+    /// database is the namespace. A routine no bare name reaches
+    /// ([`crate::filter::bare_name_reaches`]) — and on SQL Server any
+    /// function, which T-SQL calls only by its two-part name — inserts
+    /// qualified ([`routine_sql`]).
+    pub schema: Option<String>,
     pub kind: crate::schema::RoutineKind,
     /// The parameter list as the server renders it (`RoutineInfo::arguments`).
     pub arguments: String,
@@ -745,14 +751,21 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
     };
     // The database's own functions, where an expression goes — ahead of the
     // builtins, so one named like a builtin claims its row. Not a trigger
-    // function, which no expression can call.
+    // function, which no expression can call. Each is called by the name
+    // that reaches it (`routine_sql`), parens and all.
     let add_user_functions = |cands: &mut Vec<Cand>, seen: &mut HashSet<String>, tier: u8| {
         for r in &schema.routines {
             if r.kind == crate::schema::RoutineKind::Function
                 && !r.returns.eq_ignore_ascii_case("trigger")
             {
+                let before = cands.len();
                 let detail = format!("({}) → {}", r.arguments, r.returns);
                 add(cands, seen, &r.name, SuggestKind::Function, &detail, tier);
+                if cands.len() > before
+                    && let Some(c) = cands.last_mut()
+                {
+                    c.insert = routine_sql(r, input.dialect).map(|n| format!("{n}()"));
+                }
             }
         }
     };
@@ -776,11 +789,18 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
                     &detail,
                     0,
                 );
+                // By the name that reaches it (`routine_sql`); a T-SQL
+                // `EXEC` takes no parens, so its row's insert is that name
+                // even where it is the bare one.
                 if cands.len() > before
-                    && !crate::intel::procedure_args_in_parens(input.dialect)
                     && let Some(c) = cands.last_mut()
                 {
-                    c.insert = Some(r.name.clone());
+                    let name = routine_sql(r, input.dialect);
+                    c.insert = if crate::intel::procedure_args_in_parens(input.dialect) {
+                        name.map(|n| format!("{n}()"))
+                    } else {
+                        Some(name.unwrap_or_else(|| r.name.clone()))
+                    };
                 }
             }
         }
@@ -1216,6 +1236,47 @@ pub fn join_condition_row(predicate: String) -> Suggestion {
         key: KeyKind::Foreign,
         replace: None,
     }
+}
+
+/// A stored routine's name as a statement calls it, or `None` where that is
+/// its bare name: qualified where no bare name reaches its namespace
+/// ([`crate::filter::bare_name_reaches`]) and, for a function, where the
+/// engine calls one only by its schema
+/// ([`crate::intel::user_function_call_needs_schema`]); each part through
+/// [`crate::export::ident_if_needed`], since it is the catalogue's spelling.
+pub fn routine_sql(r: &IndexedRoutine, dialect: crate::intel::SqlDialect) -> Option<String> {
+    let q = |s: &str| crate::export::ident_if_needed(s, dialect);
+    let schema = r.schema.as_deref().filter(|s| !s.is_empty());
+    let qualify = schema.is_some()
+        && (!crate::filter::bare_name_reaches(dialect, schema)
+            || (crate::intel::user_function_call_needs_schema(dialect)
+                && r.kind == crate::schema::RoutineKind::Function));
+    let name = match schema {
+        Some(ns) if qualify => format!("{}.{}", q(ns), q(&r.name)),
+        _ => q(&r.name),
+    };
+    (name != r.name).then_some(name)
+}
+
+/// What accepting a row with an override (`accepted_insert`'s answer)
+/// splices, and the caret within it. A function row's override that ends in
+/// a call's `()` — a routine inserted qualified or quoted ([`routine_sql`]) —
+/// is a call like the `name()` a plain function row gets: the caret goes
+/// between the parens, and the parens are left out where the call's own
+/// already follow. Anything else goes in whole, the caret at its end.
+pub fn override_splice(over: String, kind: SuggestKind, parens_follow: bool) -> (String, usize) {
+    if kind == SuggestKind::Function
+        && let Some(name) = over.strip_suffix("()")
+    {
+        return if parens_follow {
+            (name.to_string(), name.len())
+        } else {
+            let caret = name.len() + 1;
+            (over, caret)
+        };
+    }
+    let len = over.len();
+    (over, len)
 }
 
 /// The members of the column a string is compared with — `status = '|` —
@@ -3111,6 +3172,7 @@ mod tests {
         use crate::schema::RoutineKind;
         let routine = |name: &str, kind, args: &str, returns: &str| IndexedRoutine {
             name: name.to_string(),
+            schema: None,
             kind,
             arguments: args.to_string(),
             returns: returns.to_string(),
@@ -3178,6 +3240,124 @@ mod tests {
                 "{other}"
             );
         }
+    }
+
+    /// **A routine goes in by the name that reaches it**: qualified outside
+    /// the default schema, and on SQL Server every function, which T-SQL
+    /// calls only by its two-part name (Msg 195 otherwise); quoted where its
+    /// name needs it (PostgreSQL's `"calcTotal"`). The parens still come with
+    /// a call, and not with a T-SQL `EXEC`.
+    #[test]
+    fn a_routine_inserts_the_name_that_reaches_it() {
+        use crate::schema::RoutineKind;
+        let routine = |schema: Option<&str>, name: &str, kind| IndexedRoutine {
+            name: name.to_string(),
+            schema: schema.map(str::to_string),
+            kind,
+            arguments: String::new(),
+            returns: if kind == RoutineKind::Function {
+                "int".to_string()
+            } else {
+                String::new()
+            },
+        };
+        let (f, p) = (RoutineKind::Function, RoutineKind::Procedure);
+        let s = SchemaIndex {
+            routines: vec![
+                routine(Some("dbo"), "fn_order_total", f),
+                routine(Some("reporting"), "monthly_total", f),
+                routine(Some("public"), "calcTotal", f),
+                routine(Some("public"), "order_count", f),
+                routine(Some("sales"), "refresh_totals", p),
+                routine(Some("dbo"), "purge_logs", p),
+                routine(None, "my_fn", f),
+            ],
+            ..shop()
+        };
+        let cont = Continuation::default();
+        let used = HashSet::new();
+        let local = LocalNames::default();
+        let insert = |ctx: ClauseCtx, dialect, name: &str| -> Option<String> {
+            rank(
+                &s,
+                &RankInput {
+                    ctx: &ctx,
+                    cont: &cont,
+                    scope: &[],
+                    // Short of the whole name, which is not offered back.
+                    prefix: &name[..name.len() - 1],
+                    snippets: &[],
+                    join_targets: &[],
+                    star: None,
+                    used: &used,
+                    active_db: Some("shop"),
+                    dialect,
+                    flavour: ServerFlavour::Unknown,
+                    local: &local,
+                    wide: false,
+                    accepted: &Default::default(),
+                },
+            )
+            .into_iter()
+            .find(|r| r.text == name)
+            .unwrap_or_else(|| panic!("{name} offered"))
+            .insert
+        };
+        let (ms, pg, my) = (SqlDialect::MsSql, SqlDialect::Postgres, SqlDialect::MySql);
+        let value = ClauseCtx::Value;
+        assert_eq!(
+            insert(value.clone(), ms, "fn_order_total").as_deref(),
+            Some("dbo.fn_order_total()")
+        );
+        assert_eq!(
+            insert(value.clone(), pg, "monthly_total").as_deref(),
+            Some("reporting.monthly_total()")
+        );
+        assert_eq!(
+            insert(value.clone(), pg, "calcTotal").as_deref(),
+            Some("\"calcTotal\"()")
+        );
+        // Reached bare and spelled plain: the row's own name, parens added on accept.
+        assert_eq!(insert(value.clone(), pg, "order_count"), None);
+        assert_eq!(insert(value, my, "my_fn"), None);
+        // A procedure: after `CALL` with its parens, after `EXEC` without.
+        let call = ClauseCtx::Routine;
+        assert_eq!(
+            insert(call.clone(), pg, "refresh_totals").as_deref(),
+            Some("sales.refresh_totals()")
+        );
+        assert_eq!(
+            insert(call.clone(), ms, "refresh_totals").as_deref(),
+            Some("sales.refresh_totals")
+        );
+        assert_eq!(
+            insert(call, ms, "purge_logs").as_deref(),
+            Some("purge_logs")
+        );
+    }
+
+    /// An override ending in a call's `()` puts the caret between them, and
+    /// drops them where the call's parens already follow.
+    #[test]
+    fn a_routine_override_places_the_caret_in_its_parens() {
+        let f = SuggestKind::Function;
+        assert_eq!(
+            override_splice("dbo.f()".to_string(), f, false),
+            ("dbo.f()".to_string(), 6)
+        );
+        assert_eq!(
+            override_splice("dbo.f()".to_string(), f, true),
+            ("dbo.f".to_string(), 5)
+        );
+        // A builtin called bare, or any other row, goes in whole.
+        assert_eq!(
+            override_splice("CURRENT_DATE".to_string(), f, false),
+            ("CURRENT_DATE".to_string(), 12)
+        );
+        assert_eq!(
+            override_splice("a()".to_string(), SuggestKind::Snippet, true),
+            ("a()".to_string(), 3)
+        );
     }
 
     #[test]
