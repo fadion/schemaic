@@ -436,10 +436,18 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
     };
     // A table row just added (past `before`) that names a view wears the
     // view's glyph, as the schema tree's node does.
+    //
+    // **Both of these ask whether a row was added before anything else**: at
+    // a table slot they run for every table in the catalogue, and nearly all
+    // of them were just refused by the prefix — the lower-cased keys, the
+    // namespace lookup and its clone were paid for each one regardless (10,000
+    // tables, `ord` typed: 3.0 ms a keystroke).
     let mark_view = |cands: &mut Vec<Cand>, before: usize, db: &str, name: &str| {
+        if cands.len() == before {
+            return;
+        }
         let key = (db.to_ascii_lowercase(), name.to_ascii_lowercase());
-        if cands.len() > before
-            && schema.views.contains(&key)
+        if schema.views.contains(&key)
             && let Some(c) = cands.last_mut()
         {
             c.glyph = SuggestGlyph::View;
@@ -448,6 +456,9 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
     // A table row no bare name reaches ([`SchemaIndex::namespaces`]) inserts
     // the name that does, while still reading as the table.
     let qualify_unreached = |cands: &mut Vec<Cand>, before: usize, db: &str, name: &str| {
+        if cands.len() == before {
+            return;
+        }
         let unreached = schema
             .namespaces
             .get(&name.to_ascii_lowercase())
@@ -456,8 +467,7 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
                     .all(|ns| !crate::filter::bare_name_reaches(input.dialect, ns.as_deref()))
             })
             .and_then(|nss| nss.first().cloned().flatten());
-        if cands.len() > before
-            && let Some(ns) = unreached
+        if let Some(ns) = unreached
             && let Some(c) = cands.last_mut()
         {
             c.insert = Some(crate::filter::qualified_table_name(
