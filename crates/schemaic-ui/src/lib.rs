@@ -2143,6 +2143,7 @@ impl Tab {
         ShownResult {
             panels: self.result_tabs,
             active: self.active_result,
+            next: self.next_panel,
         }
     }
 
@@ -2623,9 +2624,26 @@ impl Tab {
 pub struct ShownResult {
     panels: RwSignal<Vec<ResultPanel>>,
     active: RwSignal<u64>,
+    /// The tab's next panel id — what a launch about to happen will number its
+    /// first panel, `begin_run` numbering a batch's panels consecutively.
+    next: RwSignal<u64>,
 }
 
 impl ShownResult {
+    /// The id the next run's first panel will take. A launcher that records
+    /// what it sent stamps the record with this, so a result can be traced back
+    /// to the launch (and, in a batch, the statement) that produced it.
+    pub fn launch_mark(&self) -> u64 {
+        self.next.get_untracked()
+    }
+
+    /// The shown panel's id, untracked — `None` with no panel.
+    pub fn shown_id_untracked(&self) -> Option<u64> {
+        let active = self.active.get_untracked();
+        self.panels
+            .with_untracked(|p| shown_panel(p, active).map(|p| p.id))
+    }
+
     /// The shown result's state, tracked.
     pub fn get(&self) -> QueryState {
         let active = self.active.get();

@@ -1175,7 +1175,9 @@ existing prose was left alone.
     come from the run. **`run_fix_range` takes it**: the editor's run-error fix hands it what ran
     (`run_spans`) — one statement ran, it; several, the one holding the token, else all that ran,
     never the lines that did not — and only with no record, or one an edit has cleared, does the
-    guess decide (`a_run_errors_fix_is_scoped_to_what_ran`, which fails on the guess).
+    guess decide (`a_run_errors_fix_is_scoped_to_what_ran`, which fails on the guess). In a batch
+    the pane hands it only the failing panel's own statement (`ui::editor_pane`'s `launch_spans`),
+    and nothing for a result its last launch did not produce, which sends it to the guess.
     **`run_error_diagnostic` is where a failed run is squiggled, and it is handed what ran** — the
     buffer ranges the launch sent (`sql::executable_spans`/`selection_spans`), which is the range
     `error_fix_range` lacks. One range is the statement that failed whatever the message names, so
@@ -1184,13 +1186,18 @@ existing prose was left alone.
     drawn, since the message does not say which failed. An empty list, or a range the buffer no
     longer has, draws nothing either (`a_failed_run_is_underlined_where_the_server_points`,
     `a_failed_run_is_underlined_only_in_what_ran`). So Ctrl+Enter on one statement can no longer
-    land in its neighbour; Run Everything still can, when the token's one holder is a statement
-    that ran *before* the failing one. **Where the server placed the error, that decides first**:
+    land in its neighbour, and Run Everything no longer does either: handed every statement the
+    batch sent, the several-range search put the squiggle on a healthy statement naming the same
+    column, and with two holders or none drew nothing — but a batch makes one panel per statement,
+    so the pane now hands this function the failing panel's span alone (`launch_spans`, under
+    `ui::editor_pane`). The several-range arm is left to the one launch that sends several ranges
+    as *one* text — the whole buffer — where the result really does not say which statement
+    failed. **Where the server placed the error, that decides first**:
     PostgreSQL's `P` field arrives as `DbError::QueryAt` (produced by `pg::run_err` on the run path
     alone, and only for an `ErrorPosition::Original` — an `Internal` one indexes a function body's
     own query), the app carries it on `ModalError::at`, and the editor pairs it with `run_sent`,
-    where the **one** text it sent began (none for Run Everything, whose failing statement the
-    result does not name). It is a 1-based *character* index — measured on PostgreSQL 16, `nope`
+    where the **one** text it sent began (none for a batch, so a batch statement is placed by the
+    token search over its one span, never by the server's position). It is a 1-based *character* index — measured on PostgreSQL 16, `nope`
     after an `é` is character 13 and byte 14 — trusted only inside what ran, and it picks the
     second of two `x`s where the token search takes the first
     (`a_servers_own_position_places_the_squiggle`). On a quoted name it points at the opening
@@ -24683,6 +24690,24 @@ existing prose was left alone.
     re-place the previous run's error in them before the new result arrived. The next edit clears
     both, as it does the error bar. Both merge sites that read `db_diag` — `diag_hits` and the
     menu's `statement_problems` for *AI fix* — read `run_diag` too.
+    **The record says which launch it describes, and a result is placed in it only if that launch
+    made its panel.** Every launch goes through one `record_launch(spans, sent, batch)` closure,
+    which stamps `run_mark` (`RunMark { first_panel, batch }`) with `ShownResult::launch_mark` — the
+    tab's `next_panel`, the id the run's first panel is about to take — and the error effect and
+    `fix_error` both ask the pure `launch_spans(mark, shown_id, spans)` which spans the shown panel
+    ran in. In a batch `begin_run` numbers the panels consecutively, so `shown - first_panel` is the
+    statement's index and the answer is that one span; a single launch — one text, possibly over
+    several spans, as the whole-buffer send is — answers with all of them, for its first panel
+    only; and any other panel, or no record, answers empty, which makes `run_error_diagnostic`
+    place nothing and `run_fix_range` fall back to its guess. Both halves were review findings. A
+    run started outside the pane — the command palette's Run, the AI panel's code-block Run —
+    left the record as it was, so Run Current on `SELECT 1;` followed by a palette Run whose
+    `SELECT nope FROM t;` failed drew the squiggle under line 1's `SELECT`. And Run Everything
+    handed both intel functions every span, so the token search picked a healthy statement naming
+    the same column, or placed nothing, or widened the AI fix to statements the batch never
+    reached. The edit handler clears `run_mark` with `run_spans`. A run the write guard holds and
+    *Run anyway* releases keeps its stamp, since no panel is made in between (`launch_spans_tests`,
+    three, red against a stub returning every span).
     **Hovering a squiggle shows its message, and nothing about the squiggle is hoverable** — a
     `.tooltip()` on each one never fired and cannot be made to (the *Floem 0.2 gotchas* pointer
     bullet says why). `editor_area` watches `PointerMove` with `on_event_cont` and hit-tests the

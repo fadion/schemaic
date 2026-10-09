@@ -1736,6 +1736,44 @@ fn content_x_of(sql: &str) -> f64 {
     content_x_for_lines(sql.bytes().filter(|&c| c == b'\n').count() + 1)
 }
 
+/// What the pane recorded about its last launch: the id its first result panel
+/// took ([`crate::ShownResult::launch_mark`]) and whether it sent each recorded
+/// span as a statement of its own (a batch: a panel per span, numbered
+/// consecutively) or one text over all of them (one panel).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RunMark {
+    first_panel: u64,
+    batch: bool,
+}
+
+/// The spans the shown panel's result ran in, read off the pane's record of
+/// its last launch — empty when that panel is not one the launch made.
+///
+/// A run started anywhere else (the command palette's Run, the AI panel's code
+/// block) leaves the record as it was, and pairing its error with it put a
+/// squiggle on a statement that had succeeded. In a batch only the shown
+/// panel's own statement ran into the error — the rest succeeded before it or
+/// were never reached — so that one span is the answer, and the token search
+/// over all of them that picked a healthy statement naming the same column is
+/// never asked.
+fn launch_spans(
+    mark: Option<RunMark>,
+    shown: Option<u64>,
+    spans: &[(usize, usize)],
+) -> &[(usize, usize)] {
+    let (Some(mark), Some(shown)) = (mark, shown) else {
+        return &[];
+    };
+    let Some(i) = shown.checked_sub(mark.first_panel) else {
+        return &[];
+    };
+    match (mark.batch, usize::try_from(i)) {
+        (true, Ok(i)) => spans.get(i).map_or(&[], std::slice::from_ref),
+        (false, Ok(0)) => spans,
+        _ => &[],
+    }
+}
+
 /// [`content_x_of`] for a document of `total_lines` lines — for a caller that
 /// has the count without the text, as the editor's rope does.
 fn content_x_for_lines(total_lines: usize) -> f64 {
@@ -3038,6 +3076,18 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     // server's own position into it (`ModalError::at`, PostgreSQL's); `None`
     // when it sent several, whose failing one the result does not name.
     let run_sent: RwSignal<Option<usize>> = RwSignal::new(None);
+    // Which launch `run_spans` describes (`RunMark`): a result is placed in
+    // them only when its panel is one that launch made (`launch_spans`).
+    let run_mark: RwSignal<Option<RunMark>> = RwSignal::new(None);
+    // Every launch below records itself through this, before it runs.
+    let record_launch = move |spans: Vec<(usize, usize)>, sent: Option<usize>, batch: bool| {
+        run_mark.set(Some(RunMark {
+            first_panel: results.launch_mark(),
+            batch,
+        }));
+        run_sent.set(sent);
+        run_spans.set(spans);
+    };
     // Tracks the result only: a launch recording new spans must not re-place
     // the error the last run left.
     create_effect(move |_| {
@@ -3046,7 +3096,9 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 if err.source == schemaic_core::model::ErrorSource::Statement
                     && !results.frozen() =>
             {
-                let spans = run_spans.get_untracked();
+                let all = run_spans.get_untracked();
+                let spans =
+                    launch_spans(run_mark.get_untracked(), results.shown_id_untracked(), &all);
                 query.with_untracked(|sql| {
                     // The server's position counts in the text it was *sent*,
                     // the tab's parameters substituted: mapped back into the
@@ -3939,11 +3991,11 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                                 .iter()
                                 .map(|&(lo, hi)| sql[lo..hi].to_string())
                                 .collect();
-                            run_sent.set(match spans.as_slice() {
+                            let sent = match spans.as_slice() {
                                 [one] => Some(one.0),
                                 _ => None,
-                            });
-                            run_spans.set(spans);
+                            };
+                            record_launch(spans, sent, stmts.len() > 1);
                             if stmts.len() == 1 {
                                 (guarded_run_key)(stmts.remove(0));
                             } else {
@@ -3966,11 +4018,11 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 if let Some(mut stmts) = schemaic_core::sql::selection_statements(&sql, sel, dia) {
                     let spans =
                         schemaic_core::sql::selection_spans(&sql, sel, dia).unwrap_or_default();
-                    run_sent.set(match spans.as_slice() {
+                    let sent = match spans.as_slice() {
                         [one] => Some(one.0),
                         _ => None,
-                    });
-                    run_spans.set(spans);
+                    };
+                    record_launch(spans, sent, stmts.len() > 1);
                     comp.open.set(false);
                     if stmts.len() == 1 {
                         (guarded_run_key)(stmts.remove(0));
@@ -4010,9 +4062,12 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     )));
                     comp.open.set(false);
                 } else {
-                    run_spans.set(schemaic_core::sql::executable_spans(&sql, dia));
-                    // The whole buffer is what is sent.
-                    run_sent.set(Some(0));
+                    // The whole buffer is what is sent: one text, one panel.
+                    record_launch(
+                        schemaic_core::sql::executable_spans(&sql, dia),
+                        Some(0),
+                        false,
+                    );
                     (guarded_run_key)(sql.clone());
                 }
             });
@@ -4653,10 +4708,13 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         let fix_with_ai = fix_with_ai.clone();
         Rc::new(move |err: String| {
             // What ran, where the editor still has it (`run_spans`, cleared on
-            // the next edit); the text's own guess otherwise.
-            let ran = run_spans.get_untracked();
+            // the next edit) and the shown panel is the launch's — in a batch,
+            // that panel's own statement (`launch_spans`); the text's own
+            // guess otherwise.
+            let all = run_spans.get_untracked();
+            let ran = launch_spans(run_mark.get_untracked(), results.shown_id_untracked(), &all);
             let range = query.with_untracked(|sql| {
-                intel::run_fix_range(sql, &ran, &err, dialect.get_untracked())
+                intel::run_fix_range(sql, ran, &err, dialect.get_untracked())
             });
             (fix_with_ai)(range, vec![err], FixOrigin::Run);
         })
@@ -5422,6 +5480,9 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             }
             if !run_spans.with_untracked(Vec::is_empty) {
                 run_spans.set(Vec::new());
+            }
+            if run_mark.get_untracked().is_some() {
+                run_mark.set(None);
             }
             if run_sent.get_untracked().is_some() {
                 run_sent.set(None);
@@ -6207,8 +6268,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                             dialect.get_untracked(),
                         ) {
                             let span = schemaic_core::sql::span_in(&sql, stmt);
-                            run_sent.set(Some(span.0));
-                            run_spans.set(vec![span]);
+                            record_launch(vec![span], Some(span.0), false);
                             (run)(stmt.to_string());
                         }
                         // Down with the menu, as on Escape and Run Everything. The
@@ -6244,8 +6304,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                             .iter()
                             .map(|&(lo, hi)| sql[lo..hi].to_string())
                             .collect();
-                        run_spans.set(spans);
-                        run_sent.set(None);
+                        record_launch(spans, None, true);
                         (run_all)(stmts);
                         highlight.set(None);
                         run_menu.set(None);
@@ -6970,13 +7029,11 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     .iter()
                     .map(|&(lo, hi)| sql[lo..hi].to_string())
                     .collect();
-                run_spans.set(spans);
-                run_sent.set(None);
+                record_launch(spans, None, true);
                 (run_all)(stmts);
                 return;
             }
-            run_spans.set(spans);
-            run_sent.set(Some(0));
+            record_launch(spans, Some(0), false);
             (run)(sql)
         })
         .on_event(EventListener::PointerEnter, move |_| {
@@ -9868,6 +9925,52 @@ mod editor_menu_return_gate {
             "the editor's right-click menu opens with no return armed, so Escape \
              or an entry leaves the keyboard on the grid instead of the editor"
         );
+    }
+}
+
+#[cfg(test)]
+mod launch_spans_tests {
+    use super::{RunMark, launch_spans};
+
+    const SPANS: &[(usize, usize)] = &[(0, 9), (11, 30), (32, 50)];
+
+    fn batch(first_panel: u64) -> Option<RunMark> {
+        Some(RunMark {
+            first_panel,
+            batch: true,
+        })
+    }
+
+    /// In a batch, the shown panel's own statement and no other: the one that
+    /// failed, never a healthy one naming the same token, nor ones the batch
+    /// stopped before.
+    #[test]
+    fn a_batch_panel_answers_its_own_statement() {
+        assert_eq!(launch_spans(batch(7), Some(7), SPANS), &[(0, 9)]);
+        assert_eq!(launch_spans(batch(7), Some(8), SPANS), &[(11, 30)]);
+        assert_eq!(launch_spans(batch(7), Some(9), SPANS), &[(32, 50)]);
+    }
+
+    /// One text sent over several spans is one panel, answering all of them.
+    #[test]
+    fn a_single_launch_answers_every_span_it_sent() {
+        let one = Some(RunMark {
+            first_panel: 4,
+            batch: false,
+        });
+        assert_eq!(launch_spans(one, Some(4), SPANS), SPANS);
+        assert_eq!(launch_spans(one, Some(5), SPANS), &[] as &[(usize, usize)]);
+    }
+
+    /// A panel the launch did not make — a later run from the palette, an
+    /// older pinned one, nothing recorded, nothing shown — places nothing.
+    #[test]
+    fn a_panel_from_another_launch_answers_nothing() {
+        let none: &[(usize, usize)] = &[];
+        assert_eq!(launch_spans(batch(7), Some(10), SPANS), none);
+        assert_eq!(launch_spans(batch(7), Some(3), SPANS), none);
+        assert_eq!(launch_spans(None, Some(7), SPANS), none);
+        assert_eq!(launch_spans(batch(7), None, SPANS), none);
     }
 }
 
