@@ -5509,6 +5509,10 @@ pub struct Catalog {
     /// database's, else the first loaded one's that says. The alias
     /// diagnostic asks it ([`is_reserved_word_on`]); `Unknown` elsewhere.
     flavour: crate::schema::ServerFlavour,
+    /// A bare name is another database's, which this catalogue has not read
+    /// for bare names: below a script's `USE` of it
+    /// ([`Catalog::used_elsewhere`]).
+    bare_unjudged: bool,
 }
 
 /// A memo over [`Catalog::build`], keyed on the **identity** of the schemas the
@@ -5902,6 +5906,7 @@ impl Catalog {
             pk_shared,
             unioned,
             flavour,
+            bare_unjudged: false,
         }
     }
 
@@ -5984,6 +5989,9 @@ impl Catalog {
     /// The database whose schema decides an unqualified reference: the active db,
     /// or (no active db) the sole loaded db if there's exactly one.
     fn unqualified_db_loaded(&self) -> bool {
+        if self.bare_unjudged {
+            return false;
+        }
         match &self.active_db {
             Some(a) => self.loaded_dbs.contains(a),
             None => !self.loaded_dbs.is_empty(),
@@ -6040,6 +6048,23 @@ impl Catalog {
             }
             c.known_idents.insert(name);
         }
+        c
+    }
+
+    /// This catalogue as a script sees it below a `USE` of another database
+    /// (S8.1-L1-05): a bare name — and a namespace-qualified one, whose
+    /// namespace is now that database's — is no longer the active database's,
+    /// and this catalogue holds no other's bare names, so it can't judge them.
+    /// A database-qualified reference is judged as before. Pretending the
+    /// `USE` was not there made every table of the database it named "not
+    /// found", while the run paths follow it ([`crate::sql::use_target`]).
+    fn used_elsewhere(&self) -> Catalog {
+        let mut c = self.clone();
+        c.unqualified.clear();
+        c.opaque_unqualified.clear();
+        c.schema_qualified.clear();
+        c.known_schemas.clear();
+        c.bare_unjudged = true;
         c
     }
 
@@ -7031,6 +7056,7 @@ pub fn diagnostics(sql: &str, catalog: &Catalog, dialect: SqlDialect) -> Vec<Dia
     let last = ranges.len().saturating_sub(1);
     let mut out: Vec<Diagnostic> = Vec::new();
     let mut flow = TsqlFlow::new();
+    let mut uses = UseScope::default();
     let mut prev_hi = 0;
     for (idx, &(lo, hi)) in ranges.iter().enumerate() {
         if idx > 0 && gap_holds_go(sql, prev_hi, lo, dialect) {
@@ -7044,6 +7070,7 @@ pub fn diagnostics(sql: &str, catalog: &Catalog, dialect: SqlDialect) -> Vec<Dia
             catalog,
             dialect,
             &mut flow,
+            &mut uses,
             &mut out,
         );
         prev_hi = hi;
@@ -7060,11 +7087,12 @@ pub fn diagnostics(sql: &str, catalog: &Catalog, dialect: SqlDialect) -> Vec<Dia
 /// Off T-SQL a statement's diagnostics are a function of its own text, of
 /// whether it is the buffer's last (whose unterminated end is still being
 /// typed), and of the catalog — the loaded schemas overlaid with the tables
-/// the document itself creates ([`created_tables`]). So an entry is keyed by
-/// its text and its being last, holds offsets relative to its start, and every
-/// entry is dropped when the catalog, the dialect or the created set changes.
-/// Entries the latest pass did not use are dropped too, so the cache holds one
-/// document's worth.
+/// the document itself creates ([`created_tables`]) — and of whether a `USE`
+/// of another database stands above it ([`UseScope`]). So an entry is keyed
+/// by its text, its being last and that `USE`, holds offsets relative to its
+/// start, and every entry is dropped when the catalog, the dialect or the
+/// created set changes. Entries the latest pass did not use are dropped too,
+/// so the cache holds one document's worth.
 ///
 /// **T-SQL passes straight through to [`diagnostics`]**: needing no `;`, its
 /// statements share state across ranges ([`TsqlFlow`]: an `IF`'s body, a
@@ -7077,8 +7105,9 @@ pub struct DiagnosticsCache {
     /// so its address cannot be reused while it is compared), the dialect, the
     /// created set, and the catalog that set overlays.
     basis: Option<CacheBasis>,
-    /// Each statement's diagnostics, offsets relative to its start.
-    stmts: std::collections::HashMap<(String, bool), Vec<Diagnostic>>,
+    /// Each statement's diagnostics, offsets relative to its start, keyed by
+    /// its text, its being last, and its standing below a `USE` elsewhere.
+    stmts: std::collections::HashMap<(String, bool, bool), Vec<Diagnostic>>,
 }
 
 struct CacheBasis {
@@ -7086,6 +7115,41 @@ struct CacheBasis {
     dialect: SqlDialect,
     created: Vec<(Option<String>, String)>,
     overlaid: Option<Catalog>,
+    /// The overlaid catalogue below a `USE` of another database, once a
+    /// pass has needed it ([`UseScope`]).
+    elsewhere: Option<Catalog>,
+}
+
+/// Which database a script's `USE` statements leave its bare names in, as
+/// the checks walk down it (S8.1-L1-05): the active one, until a `USE` of
+/// another — below which [`Catalog::used_elsewhere`] answers — and again after
+/// a `USE` back. The run paths follow a `USE` the same way
+/// ([`crate::sql::use_target`]).
+#[derive(Default)]
+struct UseScope {
+    /// Below a `USE` of a database other than the active one.
+    away: bool,
+    /// The catalogue that answers while `away`, built the first time it does.
+    elsewhere: Option<Catalog>,
+}
+
+impl UseScope {
+    /// Read `unit` — one statement — for a `USE`.
+    fn step(&mut self, unit: &str, home: &Catalog, dialect: SqlDialect) {
+        if let Some(db) = crate::sql::use_target(unit, dialect) {
+            self.away = home.active_db.as_deref() != Some(db.to_ascii_lowercase().as_str());
+        }
+    }
+
+    /// The catalogue that answers here: `home`, or it [used
+    /// elsewhere](Catalog::used_elsewhere).
+    fn catalog<'a>(&'a mut self, home: &'a Catalog) -> &'a Catalog {
+        if self.away {
+            self.elsewhere.get_or_insert_with(|| home.used_elsewhere())
+        } else {
+            home
+        }
+    }
 }
 
 impl DiagnosticsCache {
@@ -7115,9 +7179,14 @@ impl DiagnosticsCache {
                 dialect,
                 created,
                 overlaid,
+                elsewhere: None,
             });
         }
-        let basis = self.basis.as_ref().expect("set above");
+        let basis = self.basis.as_mut().expect("set above");
+        let mut uses = UseScope {
+            away: false,
+            elsewhere: basis.elsewhere.take(),
+        };
         let cat = basis.overlaid.as_ref().unwrap_or(catalog);
         let ranges =
             join_procedure_numbers(sql, crate::sql::statement_ranges(sql, dialect), dialect);
@@ -7125,13 +7194,28 @@ impl DiagnosticsCache {
         let mut fresh = std::collections::HashMap::with_capacity(ranges.len());
         let mut out = Vec::new();
         for (idx, &(lo, hi)) in ranges.iter().enumerate() {
-            let key = (sql[lo..hi].to_string(), idx == last);
+            let key = (sql[lo..hi].to_string(), idx == last, uses.away);
             let rel = match self.stmts.get(&key) {
-                Some(rel) => rel.clone(),
+                Some(rel) => {
+                    // Off T-SQL a range is one statement: the step
+                    // `range_diagnostics` would have taken.
+                    uses.step(&sql[lo..hi], cat, dialect);
+                    rel.clone()
+                }
                 None => {
                     let mut own = Vec::new();
                     let mut flow = TsqlFlow::new();
-                    range_diagnostics(sql, lo, hi, idx == last, cat, dialect, &mut flow, &mut own);
+                    range_diagnostics(
+                        sql,
+                        lo,
+                        hi,
+                        idx == last,
+                        cat,
+                        dialect,
+                        &mut flow,
+                        &mut uses,
+                        &mut own,
+                    );
                     own.into_iter()
                         .map(|d| Diagnostic {
                             range: (d.range.0.saturating_sub(lo), d.range.1.saturating_sub(lo)),
@@ -7145,6 +7229,9 @@ impl DiagnosticsCache {
                 ..d.clone()
             }));
             fresh.insert(key, rel);
+        }
+        if let Some(basis) = self.basis.as_mut() {
+            basis.elsewhere = uses.elsewhere;
         }
         self.stmts = fresh;
         dedup_diagnostics(out)
@@ -7208,6 +7295,7 @@ fn range_diagnostics(
     catalog: &Catalog,
     dialect: SqlDialect,
     flow: &mut TsqlFlow,
+    uses: &mut UseScope,
     out: &mut Vec<Diagnostic>,
 ) {
     let terminated = range_is_terminated(sql, hi);
@@ -7219,6 +7307,7 @@ fn range_diagnostics(
     for (k, u) in units.iter().enumerate() {
         let is_typing_tail = is_last && k + 1 == n && !terminated;
         in_body |= u.header;
+        uses.step(&sql[u.lo..u.hi], catalog, dialect);
         if u.kind != UnitKind::Structure {
             unit_diagnostics(
                 sql,
@@ -7227,7 +7316,7 @@ fn range_diagnostics(
                 u.kind,
                 is_typing_tail,
                 in_body,
-                catalog,
+                uses.catalog(catalog),
                 dialect,
                 out,
             );
@@ -27525,7 +27614,18 @@ mod tests {
         let cat = Catalog::build(&[(db, &schema)], Some(db));
         let mut out = Vec::new();
         let mut flow = TsqlFlow::new();
-        range_diagnostics(sql, 0, sql.len(), true, &cat, dialect, &mut flow, &mut out);
+        let mut uses = UseScope::default();
+        range_diagnostics(
+            sql,
+            0,
+            sql.len(),
+            true,
+            &cat,
+            dialect,
+            &mut flow,
+            &mut uses,
+            &mut out,
+        );
         flow.end_batch(range_is_terminated(sql, sql.len()), &mut out);
         dedup_diagnostics(out)
     }
@@ -31287,6 +31387,61 @@ mod tests {
             ),
             [(None, "made".to_string())]
         );
+    }
+
+    /// Below a `USE` of another database a bare name is that database's,
+    /// which the catalogue has not read for bare names: can't judge — until a
+    /// `USE` back (S8.1-L1-05).
+    #[test]
+    fn a_bare_name_below_a_use_of_another_database_is_not_judged() {
+        let judged = |sql: &str, d| -> Vec<String> {
+            diag_d(sql, d)
+                .into_iter()
+                .map(|x| sql[x.range.0..x.range.1].to_string())
+                .collect()
+        };
+        let my = SqlDialect::MySql;
+        assert!(judged("USE other;\nSELECT * FROM widgets;", my).is_empty());
+        assert!(judged("USE other;\nSELECT nickname FROM employees;", my).is_empty());
+        assert!(judged("USE `other`;\nSELECT * FROM widgets;", my).is_empty());
+        // Back home, bare names are judged again; a qualified one always was.
+        assert_eq!(
+            judged(
+                "USE other;\nSELECT * FROM widgets;\nUSE company;\nSELECT * FROM gadgets;",
+                my
+            ),
+            ["gadgets"]
+        );
+        assert_eq!(
+            judged("USE other;\nSELECT * FROM company.gadgets;", my),
+            ["gadgets"]
+        );
+        // Above the `USE`, the active database still decides.
+        assert_eq!(
+            judged("SELECT * FROM gadgets;\nUSE other;", my),
+            ["gadgets"]
+        );
+        // T-SQL's script header, with no `;` and in one range.
+        let ms = SqlDialect::MsSql;
+        assert!(judged("USE [other]\nGO\nSELECT * FROM widgets", ms).is_empty());
+        assert!(judged("USE other\nSELECT * FROM widgets", ms).is_empty());
+        assert_eq!(judged("SELECT * FROM widgets\nUSE other", ms), ["widgets"]);
+        // The cache answers what the whole pass does.
+        let (schema, db) = sample_catalog();
+        let cat = std::sync::Arc::new(Catalog::build(&[(db, &schema)], Some(db)));
+        let mut cache = DiagnosticsCache::default();
+        for sql in [
+            "SELECT * FROM widgets;\nSELECT * FROM gadgets;",
+            "USE other;\nSELECT * FROM widgets;\nSELECT * FROM gadgets;",
+            "USE other;\nSELECT * FROM widgets;\nUSE company;\nSELECT * FROM gadgets;",
+            "SELECT * FROM widgets;\nSELECT * FROM gadgets;",
+        ] {
+            assert_eq!(
+                cache.diagnostics(sql, &cat, my),
+                diagnostics(sql, &cat, my),
+                "{sql}"
+            );
+        }
     }
 
     #[test]

@@ -1945,8 +1945,14 @@ existing prose was left alone.
     re-checks the statement it changed and reads the rest back; the editor keeps one per pane and
     runs it on a worker thread (`editor_pane.rs`). Off T-SQL a range's answer is a function of its
     own text, of whether it is the buffer's last (redundant in practice — only the last range can
-    be unterminated — but kept in the key), and of the catalog overlaid with the document's
-    `created_tables`. So an entry is keyed by `(text, is_last)` and holds offsets relative to the
+    be unterminated — but kept in the key), of the catalog overlaid with the document's
+    `created_tables`, and of whether a `USE` of another database stands above it. That last is
+    `UseScope`, which both passes walk down the script: below a `USE` other than the active
+    database, `Catalog::used_elsewhere` answers — bare and namespace-qualified names can't be
+    judged, since the catalogue never read that database's — and a `USE` back restores the active
+    one. Ignoring the `USE` made every table of the database it named "not found", while the run
+    paths follow it (`a_bare_name_below_a_use_of_another_database_is_not_judged`, S8.1-L1-05, red
+    before). So an entry is keyed by `(text, is_last, below_use)` and holds offsets relative to the
     range's start — a line inserted above moves every statement and invalidates none — and every
     entry is dropped when the catalog, the dialect or the created set changes. The catalog is
     compared by `Arc::ptr_eq`, and **the basis holds the `Arc`** so a freed catalog's address cannot
