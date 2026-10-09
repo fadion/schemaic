@@ -4054,10 +4054,19 @@ pub fn word_class(line: &str, lo: usize, hi: usize, dialect: SqlDialect) -> Opti
     }
     let rest = line[hi..].trim_start_matches([' ', '\t']);
     let called = rest.starts_with('(');
+    // A table or an object being defined before its column list —
+    // `INSERT INTO log (`, `CREATE TABLE log (` — is no call, however its
+    // name is spelled: `names_an_object`, signature help's answer to the same
+    // question, asked only of a catalogue name, so the line is read once.
+    let names_an_object_here = || {
+        let toks = tokenize_range(line, 0, hi, dialect);
+        toks.last().is_some_and(|t| t.at == lo) && names_an_object(&toks, toks.len() - 1)
+    };
     if called
         && catalog_index(dialect).is_some_and(|ix| {
             ix.lower.contains(word.to_ascii_lowercase().as_str()) || ix.lower.contains(up.as_str())
         })
+        && !names_an_object_here()
         || called_bare(word, dialect)
     {
         return Some(WordClass::Function);
@@ -14049,8 +14058,10 @@ fn names_an_object(toks: &[Token], at: usize) -> bool {
     let head = |i: usize| toks.get(i).and_then(bare_upper);
     match prev.as_str() {
         // T-SQL's `INSERT log (…)`, whose `INTO` is optional.
+        // `EXISTS` for `CREATE TABLE IF NOT EXISTS log (`: no call stands
+        // between an `EXISTS` and its subquery's paren.
         "INTO" | "INSERT" | "TABLE" | "REFERENCES" | "VIEW" | "INDEX" | "KEY" | "FUNCTION"
-        | "PROCEDURE" | "TYPE" | "WITH" => true,
+        | "PROCEDURE" | "TYPE" | "WITH" | "EXISTS" => true,
         // An index's table; elsewhere `ON` opens a condition that may call one.
         "ON" => {
             head(0).as_deref() == Some("CREATE")
@@ -22594,6 +22605,40 @@ mod tests {
                 "{line}"
             );
         }
+    }
+
+    /// **A table named like a builtin is no call before its column list**:
+    /// `INSERT INTO log (`, `CREATE TABLE log (`, `REFERENCES log (` open a
+    /// column list — the question `names_an_object` answers for signature
+    /// help. A rowset function after `FROM` is still called.
+    #[test]
+    fn a_table_named_like_a_builtin_is_not_a_call_before_its_columns() {
+        let class = |line: &str, word: &str, d| {
+            let lo = line.rfind(word).unwrap();
+            word_class(line, lo, lo + word.len(), d)
+        };
+        let (my, pg) = (SqlDialect::MySql, SqlDialect::Postgres);
+        for d in [my, pg] {
+            for line in [
+                "INSERT INTO log (id, msg)",
+                "CREATE TABLE log (",
+                "CREATE TABLE IF NOT EXISTS log (",
+                "  a int REFERENCES log (id),",
+                "INSERT INTO app.log (id)",
+            ] {
+                assert_eq!(class(line, "log", d), None, "{d:?} {line}");
+            }
+        }
+        assert_eq!(class("INSERT INTO position (id)", "position", pg), None);
+        // Called, it is the function still.
+        assert_eq!(
+            class("SELECT log(x) FROM t", "log", pg),
+            Some(WordClass::Function)
+        );
+        assert_eq!(
+            class("SELECT * FROM generate_series(1, 3)", "generate_series", pg),
+            Some(WordClass::Function)
+        );
     }
 
     #[test]

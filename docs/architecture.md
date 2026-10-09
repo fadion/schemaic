@@ -1086,7 +1086,8 @@ existing prose was left alone.
     help over a list of columns nobody was calling. `names_an_object` reads back over an `a.b`
     qualification to the word before the name and answers yes after `INTO`, `INSERT` (T-SQL's
     `INTO` is optional), `TABLE`, `REFERENCES`, `VIEW`, `INDEX`, `KEY`, `FUNCTION`, `PROCEDURE`,
-    `TYPE` or `WITH` (a CTE's column list), and after `ON` only in a statement that begins `CREATE`
+    `TYPE`, `WITH` (a CTE's column list) or `EXISTS` (`CREATE TABLE IF NOT EXISTS log (`), and
+    after `ON` only in a statement that begins `CREATE`
     with `INDEX` among its next three words — elsewhere `ON` opens a condition, which may call one.
     So `JOIN b ON LOG(` and `VALUES (LOG(` still open it
     (`signature_help_does_not_open_on_a_table_named_like_a_function`). `FROM` and `JOIN` are not
@@ -26109,7 +26110,10 @@ existing prose was left alone.
     names a function, type or constant, so `COUNT(` and `VARCHAR(40)` stop being keyword-coloured
     while `LEFT` before `JOIN`, not called, stays one; a column named `date` or `text` is a type
     nowhere it is not one (`a_word_is_classed_by_what_it_is_on_the_engine`,
-    `functions_types_and_constants_take_their_own_colours`). A word runs on through `sql::continues_name` (`a$from` is one name),
+    `functions_types_and_constants_take_their_own_colours`). A table named like a builtin is no
+    call before its column list — `INSERT INTO log (`, `CREATE TABLE log (`, `REFERENCES log (` —
+    which `word_class` asks of `names_an_object`, signature help's answer to the same question
+    (`a_table_named_like_a_builtin_is_not_a_call_before_its_columns`). A word runs on through `sql::continues_name` (`a$from` is one name),
     a word straight after a `.` is a member, and a variable (`@x`, `@@version`) or a T-SQL temporary
     table (`sql::t_sql_name_prefix`: `#t`, `##t`) is a name — none is a keyword however it is spelled
     (`a_keyword_spelling_after_a_dot_an_at_or_in_a_dollar_name_is_not_coloured`). The variable
