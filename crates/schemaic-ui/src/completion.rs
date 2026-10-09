@@ -1263,21 +1263,7 @@ fn recompute_completions_in(
         let catalog = hidden_dbs.with_untracked(|h| build_offer_catalog(db_nodes, h, active_db));
         if let Some(pred) = intel::join_condition(text, lo, hi, offset, &catalog, dialect) {
             set_anchor(ed, comp, offset);
-            set_items(
-                comp,
-                vec![Suggestion {
-                    text: pred,
-                    kind: SuggestKind::Column,
-                    detail: "foreign key".to_string(),
-                    table: String::new(),
-                    alias: String::new(),
-                    // A purple key-square marks the ready-to-insert FK join predicate.
-                    glyph: SuggestGlyph::ForeignKey,
-                    key: KeyKind::Foreign,
-                    insert: None,
-                    replace: None,
-                }],
-            );
+            set_items(comp, vec![rank::join_condition_row(pred)]);
             comp.sel.set(0);
             give_way(true);
             comp.open.set(true);

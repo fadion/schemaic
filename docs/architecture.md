@@ -13717,7 +13717,10 @@ existing prose was left alone.
       the bare name — `` `order` ``, `` `Unit Price` ``, PostgreSQL's `"OrderDate"` — while the row
       shows, and was matched by, the bare one. That is `accepted_insert`'s answer, asked at accept
       for the one row taken rather than while ranking, and never over a row's own `insert` (an FK
-      join target's `table_sql` is quoted already). **Inside a quoted name the name goes in bare**:
+      join target's `table_sql` is quoted already). So the FK `ON` predicate row is built by
+      `rank::join_condition_row`, which carries the predicate as its own `insert`: built in the UI
+      with none, it was a column row whose text failed `ident_if_needed`, and went in quoted whole
+      as one name (`the_join_condition_row_inserts_its_predicate_unquoted`). **Inside a quoted name the name goes in bare**:
       completion runs there on purpose (`intel::caret_in_literal_or_comment` lets a quoted name
       through), and the quote before the word is the user's, so the UI asks
       `intel::caret_in_quoted_name` — the same probe, answering the other kind of span — and passes

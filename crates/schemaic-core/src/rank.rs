@@ -1141,6 +1141,28 @@ pub fn accepted_insert(
     }
 }
 
+/// The one row offered straight after a fresh `JOIN … ON `: the foreign-key
+/// predicate ([`crate::intel::join_condition`]), ready to insert.
+///
+/// **It carries its own `insert`.** The row is a predicate, not a name, so
+/// [`accepted_insert`]'s quoting of a bare column row must never reach it: it
+/// wrapped `o.customer_id = c.id` whole in identifier quotes, a server error on
+/// three engines and, on SQLite, a string literal that silently matched no row.
+pub fn join_condition_row(predicate: String) -> Suggestion {
+    Suggestion {
+        insert: Some(predicate.clone()),
+        text: predicate,
+        kind: SuggestKind::Column,
+        detail: "foreign key".to_string(),
+        table: String::new(),
+        alias: String::new(),
+        // A purple key-square marks the ready-to-insert FK join predicate.
+        glyph: SuggestGlyph::ForeignKey,
+        key: KeyKind::Foreign,
+        replace: None,
+    }
+}
+
 /// The members of the column a string is compared with — `status = '|` —
 /// offered in the string ([`crate::intel::enum_value_slot`]), or nothing when
 /// the column is not in scope or not an enum or set.
@@ -2343,6 +2365,22 @@ mod tests {
             ..table.clone()
         };
         assert_eq!(ins(my, &own), own.insert);
+    }
+
+    /// **The FK `ON` predicate goes in as written**, on every engine: it is a
+    /// predicate, and quoting it whole as one name broke the join everywhere —
+    /// silently on SQLite, where `"o.customer_id = c.id"` is a string.
+    #[test]
+    fn the_join_condition_row_inserts_its_predicate_unquoted() {
+        let pred = "o.customer_id = c.id";
+        let row = join_condition_row(pred.to_string());
+        for d in SqlDialect::ALL {
+            assert_eq!(
+                accepted_insert(&row, d, false).as_deref(),
+                Some(pred),
+                "{d:?}"
+            );
+        }
     }
 
     /// The engine's own keywords complete a row; they do not make a word an
