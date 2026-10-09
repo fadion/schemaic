@@ -794,10 +794,15 @@ fn tokenize<'s>(
     let b = sql.as_bytes();
     let n = b.len();
     let mut toks: Vec<(Kind, &str)> = Vec::new();
+    // The brackets the code so far leaves open, for the placeholder arm: the
+    // bytes are fed here as each arm consumes them, so a `[` in a string or a
+    // comment is never one.
+    let mut brackets = crate::params::Brackets::default();
     let mut i = 0;
     while i < n {
         let c = b[i];
         if c.is_ascii_whitespace() {
+            brackets.step(b, i);
             i += 1;
             continue;
         }
@@ -821,6 +826,7 @@ fn tokenize<'s>(
             && b[i..].starts_with(d.as_bytes())
         {
             toks.push((Kind::Terminator, &sql[i..i + d.len()]));
+            brackets = crate::params::Brackets::default();
             i += d.len();
             continue;
         }
@@ -1011,7 +1017,9 @@ fn tokenize<'s>(
         // `lo :hi`, which `params` *does* read as a placeholder — so the
         // formatter created a parameter by moving a space, the exact inverse of
         // the defect this arm exists to fix.
-        if crate::params::opens_placeholder(b, i) {
+        let opens = crate::params::opens_placeholder(b, i, &brackets);
+        if opens {
+            brackets.step(b, i);
             let mut end = i + 1;
             while end < b.len() && crate::sql::is_word_byte(b[end]) {
                 end += 1;
@@ -1043,6 +1051,9 @@ fn tokenize<'s>(
             })
             .unwrap_or(1);
         toks.push((Kind::Punct, &sql[i..i + len]));
+        for k in i..i + len {
+            brackets.step(b, k);
+        }
         i += len;
     }
     toks
@@ -3262,6 +3273,16 @@ mod tests {
         // The operators that really do start with `:` are untouched.
         assert_preserves("select a::text from t", SqlDialect::Postgres);
         assert_preserves("select @x := 1", SqlDialect::MySql);
+        // A `[` in a string earlier on the line opens no subscript, so the
+        // placeholder after it is still one token.
+        let sql = "select * from t where note = 'see item[' and id = :id";
+        let out = super::format_sql(sql, IND, SqlDialect::Postgres);
+        assert_eq!(
+            crate::params::names(&out, SqlDialect::Postgres),
+            ["id"],
+            "{out}"
+        );
+        assert!(!out.contains(": "), "split the placeholder:\n{out}");
     }
 
     #[test]

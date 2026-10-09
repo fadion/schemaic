@@ -31,7 +31,7 @@
 //!   *before* the `:` not to be part of a word (or a `]`), which a placeholder's
 //!   never is and a slice bound's always is — plus the open-ended `arr[:hi]`
 //!   and the spaced `arr[lo :hi]`, which have neither and are settled by
-//!   [`slices_a_subscript`]. `ARRAY[:a]` is a constructor rather than a
+//!   the open code-level `[` a [`Brackets`] tracks. `ARRAY[:a]` is a constructor rather than a
 //!   subscript, and `:a` there is a parameter.
 //! - **`:setvar`, `:r`** — sqlcmd command lines in a SQL Server script,
 //!   skipped whole (`sqlcmd_line_end`).
@@ -216,6 +216,7 @@ impl fmt::Display for ParamError {
 pub fn scan(sql: &str, dialect: SqlDialect) -> Vec<ParamRef> {
     let b = sql.as_bytes();
     let mut out = Vec::new();
+    let mut brackets = Brackets::default();
     let mut i = 0;
     while i < b.len() {
         // Strings, comments, dollar-quoted bodies, quoted identifiers.
@@ -224,6 +225,7 @@ pub fn scan(sql: &str, dialect: SqlDialect) -> Vec<ParamRef> {
             continue;
         }
         if b[i] != b':' {
+            brackets.step(b, i);
             i += 1;
             continue;
         }
@@ -237,7 +239,9 @@ pub fn scan(sql: &str, dialect: SqlDialect) -> Vec<ParamRef> {
             i = end;
             continue;
         }
-        if !opens_placeholder(b, i) {
+        let opens = opens_placeholder(b, i, &brackets);
+        brackets.step(b, i);
+        if !opens {
             i += 1;
             continue;
         }
@@ -334,54 +338,72 @@ fn has_sqlcmd_commands(dialect: SqlDialect) -> bool {
 ///
 /// The first two must look at the byte *immediately* before, not the last
 /// non-space one — `SELECT :a` has `T` a space away, and skipping the space
-/// would swallow every placeholder in the language. The `[` rule reads back to
-/// the open bracket, and has to ask what the `[` hangs off — see
-/// [`slices_a_subscript`]. Where `[` quotes an identifier (SQLite)
+/// would swallow every placeholder in the language. The `[` rule asks the
+/// caller's [`Brackets`] for the open bracket, and what it hangs off — see
+/// [`Brackets::slices`]. Where `[` quotes an identifier (SQLite, SQL Server)
 /// `skip_noncode` has already consumed it, and a `::` cast is consumed whole by
 /// the caller before it gets here.
-pub(crate) fn opens_placeholder(b: &[u8], i: usize) -> bool {
+pub(crate) fn opens_placeholder(b: &[u8], i: usize, brackets: &Brackets) -> bool {
     if b.get(i) != Some(&b':') {
         return false;
     }
-    let attached =
-        i > 0 && (is_word_byte(b[i - 1]) || b[i - 1] == b']') || slices_a_subscript(b, i);
+    let attached = i > 0 && (is_word_byte(b[i - 1]) || b[i - 1] == b']') || brackets.slices(b);
     !attached && b.get(i + 1).copied().is_some_and(is_word_start)
 }
 
-/// Is the `:` at `i` a **subscript's** slice colon — `arr[:hi]`, and with a
-/// space before it, `arr[lo :hi]`?
+/// The brackets a forward walk over **code** is inside — what
+/// [`opens_placeholder`] asks to tell a subscript's slice colon from a
+/// placeholder. Its two callers ([`scan`], and `sqlfmt`'s tokenizer) walk
+/// forward through [`skip_noncode`] already, and hand it every code byte
+/// ([`Brackets::step`]), so a `[` or `]` inside a string, a comment, a
+/// dollar-quoted body or a quoted name never reaches it.
 ///
-/// It is, when it is the first `:` (a `::` cast aside) inside an open `[` that
-/// hangs off something subscriptable ([`hangs_off_subscriptable`]). The first
-/// only: in `arr[1 : :n]` the second is a placeholder for the upper bound. Read
-/// back over raw bytes to the start of the line or statement — a slice is not
-/// written across lines, and an unbounded walk per `:` was quadratic in a long
-/// script. `arr[lo :hi]` used to grow a parameter row named `hi` and hold the
-/// run with no "Run anyway", as `arr[:hi]` once did: the space put the bound's
-/// own word out of reach of the "word byte immediately before" rule.
-fn slices_a_subscript(b: &[u8], i: usize) -> bool {
-    // Brackets and parens closed between the colon and the bracket it is in.
-    let mut depth = 0usize;
-    let mut k = i;
-    while k > 0 {
-        k -= 1;
-        match b[k] {
-            b'\n' | b';' => return false,
-            b']' | b')' => depth += 1,
-            b'(' if depth == 0 => return false,
-            b'[' if depth == 0 => return hangs_off_subscriptable(b, k),
-            b'(' | b'[' => depth -= 1,
-            b':' if depth == 0 => {
-                let cast = (k > 0 && b[k - 1] == b':') || b.get(k + 1) == Some(&b':');
-                if !cast {
-                    // This subscript's slice colon came first.
-                    return false;
+/// It replaced a walk *back* over raw bytes to the line's start, which
+/// read the `[` in `'see item[' AND id = :id` as an open subscript: `:id` was
+/// taken for its slice colon, the bar asked nothing, and the server got `:id`
+/// verbatim. A `\n` or `;` still closes everything, as that walk stopped at
+/// one — a slice is not written across lines.
+#[derive(Default)]
+pub(crate) struct Brackets {
+    /// Each open `(` or `[`: where it is, whether it is a `[`, and whether a
+    /// `:` (a `::` cast aside) has appeared in it at its own depth.
+    open: Vec<(usize, bool, bool)>,
+}
+
+impl Brackets {
+    /// Take in the code byte at `b[i]`. A `:` is counted only once
+    /// [`opens_placeholder`] has been asked about it.
+    pub(crate) fn step(&mut self, b: &[u8], i: usize) {
+        match b[i] {
+            b'\n' | b';' => self.open.clear(),
+            b'(' => self.open.push((i, false, false)),
+            b'[' => self.open.push((i, true, false)),
+            b')' | b']' => {
+                self.open.pop();
+            }
+            b':' => {
+                let cast = (i > 0 && b[i - 1] == b':') || b.get(i + 1) == Some(&b':');
+                if !cast && let Some(top) = self.open.last_mut() {
+                    top.2 = true;
                 }
             }
             _ => {}
         }
     }
-    false
+
+    /// Is a `:` here a **subscript's** slice colon — `arr[:hi]`, and with a
+    /// space before it, `arr[lo :hi]`?
+    ///
+    /// It is, when it is the first `:` (a `::` cast aside) inside an open `[`
+    /// that hangs off something subscriptable ([`hangs_off_subscriptable`]).
+    /// The first only: in `arr[1 : :n]` the second is a placeholder for the
+    /// upper bound. `arr[lo :hi]` used to grow a parameter row named `hi` and
+    /// hold the run with no "Run anyway", as `arr[:hi]` once did: the space put
+    /// the bound's own word out of reach of the "word byte immediately before"
+    /// rule.
+    fn slices(&self, b: &[u8]) -> bool {
+        matches!(self.open.last(), Some(&(at, true, false)) if hangs_off_subscriptable(b, at))
+    }
 }
 
 /// Does the `[` at `open` subscript something — an identifier, or the `]` of
@@ -706,6 +728,29 @@ mod tests {
         assert_eq!(found("SELECT arr[x::int : :n] FROM t", PG), ["n"]);
         assert_eq!(found("SELECT ARRAY[:a, :b], f(:c)", PG), ["a", "b", "c"]);
         assert_eq!(found("SELECT a[1], :p FROM t", PG), ["p"]);
+    }
+
+    /// **A `[` in a string, a comment or a quoted name opens no subscript.**
+    /// The slice test walked raw bytes back to the line's start, so the `[`
+    /// inside `'see item['` read as an open subscript hanging off `m`, `:id`
+    /// was taken for its slice colon, the bar asked nothing, and the server
+    /// got `:id` verbatim.
+    #[test]
+    fn a_bracket_in_a_string_or_comment_hides_no_placeholder() {
+        let ms = SqlDialect::MsSql;
+        for (sql, d) in [
+            ("SELECT * FROM t WHERE note = 'see item[' AND id = :id", PG),
+            ("SELECT 1 WHERE n = 'a[' AND id = :id", PG),
+            ("SELECT /* a[ */ :id", PG),
+            ("SELECT $$x[$$ AS s, :id", PG),
+            ("SELECT \"a[\" FROM t WHERE id = :id", PG),
+            ("SELECT [a[b] FROM t WHERE id = :id", ms),
+            ("SELECT `a[` FROM t WHERE id = :id", MY),
+        ] {
+            assert_eq!(found(sql, d), ["id"], "{d:?}: {sql}");
+        }
+        // And a `]` in one closes nothing: the subscript is still open.
+        assert!(found("SELECT arr[f(']') :hi] FROM t", PG).is_empty());
     }
 
     #[test]

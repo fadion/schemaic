@@ -12879,13 +12879,17 @@ existing prose was left alone.
     `Err(Missing)`, which stops the run *before* the guard and so offers no "Run anyway" — there is
     no way through the app at all. Three shapes say "subscript": a word byte immediately before
     (`arr[1:2]`), a `]` immediately before (`m[1][2:3]`), and being **the first `:` inside an open
-    `[`** — `slices_a_subscript`, for PostgreSQL's open-ended lower bound `arr[:hi]`, which all
+    `[`** — `Brackets::slices`, for PostgreSQL's open-ended lower bound `arr[:hi]`, which all
     three existing slice tests had missed by writing a lower bound, and for a bound with a space
     before the colon, `arr[lo :hi]`, which the first rule cannot see past. The first two look at the
     byte *immediately* before rather than the last non-space one, since `SELECT :a` has its `T` a
     space away and skipping the space would swallow every placeholder in the language. The `[` rule
-    reads back to the open bracket (over closed brackets and parens, and a `::` cast, to the start of
-    the line or statement — an unbounded walk per `:` was quadratic in a long script); only the
+    asks the caller's `Brackets` — the `(`/`[` the code so far leaves open, fed every **code** byte by
+    the two callers' own forward walks through `skip_noncode` (`scan`, `sqlfmt`'s tokenizer), and
+    closed by a `\n` or `;` since a slice is not written across lines. It used to walk *back* over
+    raw bytes to the line's start, so the `[` in `'see item[' AND id = :id` read as an open
+    subscript and `:id` vanished from the bar
+    (`a_bracket_in_a_string_or_comment_hides_no_placeholder`). Only the
     *first* colon in it is the slice's, so `arr[1 : :n]` keeps its `:n`
     (`a_spaced_slice_colon_is_not_a_placeholder`). It then has to ask **what the bracket hangs
     off**, which is the whole of `hangs_off_subscriptable`: `ARRAY[…]` is a *constructor*, not a
