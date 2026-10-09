@@ -2069,6 +2069,20 @@ existing prose was left alone.
     **`StarExpansion::columns` is carried rather than re-derived**: the completion row counted the
     commas in the emitted SQL, which is the wrong quantity — a quoted identifier holding one
     (`` `a,b` ``, legal on MySQL) over-reports — and the expander is the side that built the list.
+    **`expand_star` reads the star's own query**, not the statement: `star_query` bounds it from
+    its `SELECT` (the last at its depth in the innermost open paren, as `query_scope` finds it) to
+    the `)` that closes it, the next set-operation arm, or an upsert's `ON CONFLICT`/`ON DUPLICATE
+    KEY`, and `statement_scope` is asked of that slice alone. Over the whole statement the list
+    gained an `INSERT`'s target, the other `UNION` arm's tables, and — once `statement_scope`
+    appended them for `new.` to complete — a trigger's `NEW`/`OLD` and an upsert's `excluded`,
+    none of which the `SELECT` can name (*Unknown table 'new'*). Those rows are read off a
+    statement head the slice has not got, so it has none. An unqualified star over a `USING` or
+    `NATURAL` join is declined: `*` returns the merged column once — coalesced, under an outer
+    join — so a list of each side's would add a column and change its values; `t.*` is `t`'s own
+    and still expands. So is one over a CTE, which is not the catalogue table it may be named like
+    (`a_star_expands_to_its_own_querys_tables_only`,
+    `a_star_over_a_using_or_natural_join_is_not_expanded`,
+    `a_star_over_a_cte_named_like_a_table_is_not_expanded`, all red before).
     **`simple_select_source` is the one definition of "structurally simple enough to aim a write
     at"** — one statement, a `SELECT` body, no CTE, one `FROM` entry, no joins, a plain named table
     — shared by `filter::build_query` (which needs to know it may splice a `WHERE` into the

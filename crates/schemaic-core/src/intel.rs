@@ -13881,10 +13881,24 @@ pub fn expand_star(
             return None;
         }
     }
-    let scope = statement_scope(sql, lo, hi, caret, dialect).tables;
+    let query = star_query(sql, lo, hi, star, dialect)?;
+    // `*` returns a `USING`/`NATURAL` join's column once — coalesced, under an
+    // outer join — and a list of each side's would not; `t.*` is `t`'s own.
+    if qualifier.is_none() && query.merges_join_columns {
+        return None;
+    }
+    // Read from the query's own `SELECT`, so the scope has no trigger `NEW`/
+    // `OLD` or upsert row (each read off a statement head this slice has not
+    // got), no `INSERT` target and no other set-operation arm.
+    let scope = statement_scope(sql, query.start, query.end, caret, dialect).tables;
     if scope.is_empty() {
         return None;
     }
+    // A CTE is not the catalogue table it may be named like: its columns are
+    // its own query's, which the catalogue does not hold.
+    let ctes = cte_names(&tokenize_range(sql, lo, caret, dialect));
+    let is_cte =
+        |t: &TableRef| t.db.is_none() && ctes.iter().any(|c| c.eq_ignore_ascii_case(&t.name));
     let mut parts: Vec<String> = Vec::new();
     // Quoted per dialect: the expansion is spliced into the editor and run, and
     // PostgreSQL folds a bare `ArtistId` to `artistid`, which resolves to nothing.
@@ -13897,11 +13911,17 @@ pub fn expand_star(
                     .is_some_and(|a| a.eq_ignore_ascii_case(qual))
                     || (r.alias.is_none() && r.name.eq_ignore_ascii_case(qual))
             })?;
+            if is_cte(tref) {
+                return None;
+            }
             for c in catalog.columns_of(tref)? {
                 parts.push(format!("{}.{}", q(qual), q(c)));
             }
         }
         None => {
+            if scope.iter().any(is_cte) {
+                return None;
+            }
             let multi = scope.len() > 1;
             for r in &scope {
                 let cols = catalog.columns_of(r)?; // any unknown → bail (conservative)
@@ -13923,6 +13943,70 @@ pub fn expand_star(
         range: (range_start, star_end),
         columns: parts.len(),
         replacement: parts.join(", "),
+    })
+}
+
+/// The query a projection `*` at `star` belongs to ([`star_query`]).
+struct StarQuery {
+    /// Its own `SELECT`.
+    start: usize,
+    /// One past its last byte: the `)` that closes it, the set operator that
+    /// opens the next arm, an upsert's `ON CONFLICT`/`ON DUPLICATE KEY`, or
+    /// the statement's end.
+    end: usize,
+    /// Does it join with `USING` or `NATURAL`, which merge the join columns?
+    merges_join_columns: bool,
+}
+
+/// The bounds of the query whose projection holds the `*` at `star`: from the
+/// last `SELECT` at its depth inside the innermost open paren (as
+/// [`query_scope`] finds it — a set operation's arm, the query after an
+/// `INSERT … `) to where that query ends. `None` with no `SELECT` before it.
+fn star_query(
+    sql: &str,
+    lo: usize,
+    hi: usize,
+    star: usize,
+    dialect: SqlDialect,
+) -> Option<StarQuery> {
+    let open = local_scope_start(sql, lo, star, dialect);
+    let toks = tokenize_range(sql, open, hi, dialect);
+    let mut depth = 0usize;
+    let mut start = None;
+    let mut end = hi;
+    let mut merges_join_columns = false;
+    for (i, t) in toks.iter().enumerate() {
+        let word = bare_upper(t);
+        match t.kind {
+            TkKind::LParen => depth += 1,
+            TkKind::RParen if depth == 0 => {
+                if t.at >= star {
+                    end = t.at;
+                    break;
+                }
+            }
+            TkKind::RParen => depth -= 1,
+            _ if depth > 0 => {}
+            _ if t.at < star && word.as_deref() == Some("SELECT") => start = Some(t.at),
+            _ if t.at < star => {}
+            _ => {
+                let next = toks.get(i + 1).and_then(bare_upper);
+                match (word.as_deref(), next.as_deref()) {
+                    (Some("UNION" | "INTERSECT" | "EXCEPT" | "MINUS"), _)
+                    | (Some("ON"), Some("CONFLICT" | "DUPLICATE")) => {
+                        end = t.at;
+                        break;
+                    }
+                    (Some("USING" | "NATURAL"), _) => merges_join_columns = true,
+                    _ => {}
+                }
+            }
+        }
+    }
+    Some(StarQuery {
+        start: start?,
+        end,
+        merges_join_columns,
     })
 }
 
@@ -30200,6 +30284,113 @@ mod tests {
         assert!(expand("SELECT id FROM employees", 9).is_none());
         // No FROM/scope → nothing to expand.
         assert!(expand("SELECT * ", 8).is_none());
+    }
+
+    /// `expand` at the `|`, on `dialect`.
+    fn expand_at(sql: &str, dialect: SqlDialect) -> Option<String> {
+        let caret = sql.find('|').unwrap();
+        let sql = sql.replace('|', "");
+        let (schema, db) = sample_catalog();
+        let cat = Catalog::build(&[(db, &schema)], Some(db));
+        expand_star(&sql, 0, sql.len(), caret, &cat, dialect).map(|e| e.replacement)
+    }
+
+    /// A star expands to the tables **its own query** reads: not a trigger's
+    /// `NEW`/`OLD` or an upsert's `excluded` (rows the `SELECT` cannot name),
+    /// not an `INSERT`'s target, not another `UNION` arm's tables.
+    #[test]
+    fn a_star_expands_to_its_own_querys_tables_only() {
+        let my = SqlDialect::MySql;
+        let pg = SqlDialect::Postgres;
+        for (sql, d, want) in [
+            (
+                "CREATE TRIGGER t AFTER UPDATE ON employees FOR EACH ROW \
+                 INSERT INTO employees SELECT *| FROM departments",
+                my,
+                "id, name",
+            ),
+            (
+                "INSERT INTO employees SELECT *| FROM employees \
+                 ON CONFLICT (id) DO UPDATE SET name = excluded.name",
+                pg,
+                "id, name, salary, dept_id",
+            ),
+            (
+                "INSERT INTO employees SELECT *| FROM departments",
+                my,
+                "id, name",
+            ),
+            (
+                "INSERT INTO employees SELECT *| FROM departments",
+                pg,
+                "id, name",
+            ),
+            (
+                "SELECT *| FROM employees UNION SELECT * FROM departments",
+                my,
+                "id, name, salary, dept_id",
+            ),
+            (
+                "SELECT * FROM employees UNION SELECT *| FROM departments",
+                my,
+                "id, name",
+            ),
+            (
+                "SELECT id FROM employees WHERE dept_id IN (SELECT *| FROM departments)",
+                my,
+                "id, name",
+            ),
+        ] {
+            assert_eq!(expand_at(sql, d).as_deref(), Some(want), "{sql}");
+        }
+    }
+
+    /// `*` over `USING` or a `NATURAL` join returns the join column once (the
+    /// coalesced value, under an outer join); a list naming each side's would
+    /// return another column, and other values. Declined, as for unknown
+    /// columns. A qualified `t.*` is each table's own and still expands.
+    #[test]
+    fn a_star_over_a_using_or_natural_join_is_not_expanded() {
+        for d in [SqlDialect::MySql, SqlDialect::Postgres] {
+            for sql in [
+                "SELECT *| FROM employees JOIN departments USING (id)",
+                "SELECT *| FROM employees e LEFT JOIN departments d USING (id, name)",
+                "SELECT *| FROM employees NATURAL JOIN departments",
+            ] {
+                assert_eq!(expand_at(sql, d), None, "{sql}");
+            }
+            assert_eq!(
+                expand_at(
+                    "SELECT d.*| FROM employees e JOIN departments d USING (id)",
+                    d
+                )
+                .as_deref(),
+                Some("d.id, d.name")
+            );
+        }
+        // A `USING` in a subquery is that query's, not this one's.
+        assert_eq!(
+            expand_at(
+                "SELECT *| FROM departments WHERE id IN \
+                 (SELECT id FROM employees JOIN departments USING (id))",
+                SqlDialect::MySql
+            )
+            .as_deref(),
+            Some("id, name")
+        );
+    }
+
+    /// A CTE named like a catalogue table is not that table: its columns are
+    /// its own query's, which the catalogue does not hold.
+    #[test]
+    fn a_star_over_a_cte_named_like_a_table_is_not_expanded() {
+        assert_eq!(
+            expand_at(
+                "WITH departments AS (SELECT 1 AS x) SELECT *| FROM departments",
+                SqlDialect::MySql
+            ),
+            None
+        );
     }
 
     // ── signature help ────────────────────────────────────────────────────────
