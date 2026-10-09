@@ -17514,9 +17514,11 @@ pub fn temp_tables_at(sql: &str, caret: usize, dialect: SqlDialect) -> Vec<Local
 }
 
 /// The select-list aliases a name typed at `word_lo` may use: those of the
-/// caret's own query when the caret is in its `ORDER BY`, or in its `HAVING`
-/// where the engine lets that see them ([`having_sees_output_aliases`]).
-/// Empty anywhere else.
+/// caret's own query when the caret is in its `ORDER BY` — at the start of a
+/// sort item, or anywhere in one where the engine resolves them inside an
+/// expression ([`order_by_expression_sees_output_aliases`]) — or in its
+/// `HAVING` where the engine lets that see them
+/// ([`having_sees_output_aliases`]). Empty anywhere else.
 ///
 /// **Read off the parse, as [`group_by_items`] reads a projection**: the query
 /// up to the `ORDER`/`HAVING` is a whole query, parsed from the innermost open
@@ -17571,6 +17573,19 @@ pub fn output_aliases_at(
         && toks.get(k + 1).and_then(bare_upper).as_deref() == Some("BY");
     let having = kw.as_deref() == Some("HAVING") && having_sees_output_aliases(dialect);
     if !ordering && !having {
+        return Vec::new();
+    }
+    // Where an output name stands alone only, the caret must start a sort
+    // item: nothing but blanks after the `BY`, or after a comma at the
+    // clause's own depth (one inside a paren left `last` unset above). The
+    // tokens carry no literal or operator, so the text decides what follows.
+    let item_start = toks.last().is_some_and(|t| {
+        (toks.len() == k + 2 || matches!(t.kind, TkKind::Comma))
+            && sql
+                .get(t.end..word_lo)
+                .is_some_and(|gap| gap.trim().is_empty())
+    });
+    if ordering && !item_start && !order_by_expression_sees_output_aliases(dialect) {
         return Vec::new();
     }
     let at = toks[k].at;
@@ -17630,6 +17645,19 @@ pub fn output_aliases_at(
 /// exist* and SQL Server 2022 *Invalid column name 'x'*. An `ORDER BY` sees
 /// them on all four.
 fn having_sees_output_aliases(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MySql | SqlDialect::Sqlite => true,
+        SqlDialect::Postgres | SqlDialect::MsSql => false,
+    }
+}
+
+/// Does an `ORDER BY` see the select list's aliases *inside* an expression,
+/// not only as a whole sort item? Measured with `SELECT v * 2 AS doubled …
+/// ORDER BY 1 + doubled` (and a `CASE WHEN doubled > 2 …`): MariaDB 10.11.14,
+/// MySQL 8.4.11 and SQLite 3.50.4 answer it; PostgreSQL 16.15 answers *column
+/// "doubled" does not exist* and SQL Server 2022 *Invalid column name
+/// 'doubled'*. Standing alone (`ORDER BY doubled`) all four take it.
+fn order_by_expression_sees_output_aliases(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MySql | SqlDialect::Sqlite => true,
         SqlDialect::Postgres | SqlDialect::MsSql => false,
@@ -22251,6 +22279,33 @@ mod tests {
             pairs(output_aliases_at(sql, 0, sql.len(), SqlDialect::Postgres)),
             [("Total".to_string(), "\"Total\"".to_string())]
         );
+    }
+
+    /// PostgreSQL and SQL Server resolve an output name in `ORDER BY` only as
+    /// a whole sort item; inside an expression (`1 + doubled`, a `CASE`) it is
+    /// *column does not exist* / *Invalid column name* there, while MySQL,
+    /// MariaDB and SQLite take it anywhere (S8.5-L1-07).
+    #[test]
+    fn an_order_by_expression_sees_aliases_only_where_the_engine_resolves_them() {
+        let inside = [
+            "SELECT total * 2 AS doubled FROM orders ORDER BY 1 + dou",
+            "SELECT total * 2 AS doubled FROM orders ORDER BY CASE WHEN dou",
+            "SELECT total * 2 AS doubled FROM orders ORDER BY doubled DESC, 1 + dou",
+        ];
+        for d in SqlDialect::ALL {
+            let sees = matches!(d, SqlDialect::MySql | SqlDialect::Sqlite);
+            for sql in inside {
+                assert_eq!(!aliases(sql, d).is_empty(), sees, "{d:?}: {sql}");
+            }
+            // Standing alone, every engine resolves it.
+            for sql in [
+                "SELECT total * 2 AS doubled FROM orders ORDER BY dou",
+                "SELECT total * 2 AS doubled FROM orders ORDER BY id DESC, dou",
+                "SELECT total * 2 AS doubled FROM orders ORDER BY abs(id), dou",
+            ] {
+                assert_eq!(aliases(sql, d), ["doubled"], "{d:?}: {sql}");
+            }
+        }
     }
 
     /// The CTEs a statement has declared before the caret, as spelled.

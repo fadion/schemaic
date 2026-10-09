@@ -13818,7 +13818,12 @@ existing prose was left alone.
       (`the_statements_own_ctes_and_aliases_are_offered`). `output_aliases_at` answers only in the
       caret's own query's `ORDER BY`, or its `HAVING` where `having_sees_output_aliases` —
       measured: MariaDB 10.11.14 and SQLite 3.45.1 resolve `HAVING x` against the select list,
-      PostgreSQL 16.15 and SQL Server 2022 refuse it, and all four take an `ORDER BY` alias. It
+      PostgreSQL 16.15 and SQL Server 2022 refuse it, and all four take an `ORDER BY` alias —
+      but PostgreSQL and SQL Server only as a whole sort item, so there the aliases are offered
+      only right after the `BY` or a comma, not inside `1 + …` or a `CASE`
+      (`order_by_expression_sees_output_aliases`, measured the same way with `ORDER BY 1 +
+      doubled`;
+      `an_order_by_expression_sees_aliases_only_where_the_engine_resolves_them`). It
       parses the query up to the keyword from `local_scope_start`, as `group_by_items` does, so a
       subquery's aliases stay its own and a window's `OVER (ORDER BY` reads nothing; after a set
       operation an `ORDER BY` takes the first arm's names and a `HAVING` its own arm's
