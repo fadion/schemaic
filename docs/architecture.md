@@ -1057,7 +1057,7 @@ existing prose was left alone.
     `STMT_KEYWORDS` (the UI's completion + editor build on these); shared across engines, so
     completion offers a keyword only where `keyword_offered` says the engine takes it — the words
     each lacks are `keywords_not_taken`, an exhaustive `match` (under `rank.rs`). **Past those
-    forty, `engine_keywords(dialect, flavour)` is what each engine has of its own** — the window
+    shared lists, `engine_keywords(dialect, flavour)` is what each engine has of its own** — the window
     clauses and `INTERSECT`/`EXCEPT` on all four, then `TOP`, `APPLY` and `OUTPUT` on SQL Server,
     `MERGE` there and on PostgreSQL, `RETURNING` on PostgreSQL, SQLite and MariaDB, and `LATERAL`
     on PostgreSQL and MySQL. A MySQL-family server not yet asked (`ServerFlavour::Unknown`) is
@@ -1167,8 +1167,9 @@ existing prose was left alone.
     (`db_error_locates_the_named_token_in_code_and_whole`) — which is right when it is handed one statement
     and wrong when it is handed a script — `near 'FROM t2'` names a word every statement has, so the
     fix scoped to the first one, a working statement that Accept would then overwrite while the
-    broken one stayed broken. A token that appears twice identifies nothing, so `repeats_ci` sends
-    it back to the whole-buffer fallback. What the text alone cannot settle is a token the failing
+    broken one stayed broken. A token that appears twice identifies nothing, so `error_fix_range` —
+    which takes every one of `code_word_hits` and scopes only on exactly one — sends it back to the
+    whole-buffer fallback. What the text alone cannot settle is a token the failing
     statement does not hold at all — a `NOT NULL` column an `INSERT` omitted — which is unique code
     in the statement *above*, so `error_fix_range` alone scopes the fix there; that range has to
     come from the run. **`run_fix_range` takes it**: the editor's run-error fix hands it what ran
@@ -3187,8 +3188,11 @@ existing prose was left alone.
     else of schema `q` in the active database; three parts are a table's column or SQL Server's
     `db.schema.table`; a name followed by `(` is a routine where one is so named and otherwise what
     it would be without the paren, so `INSERT INTO orders (id)`'s target is found
-    (`a_table_name_before_a_paren_is_the_table`, S8.2-L1-05, red before). Every match is exact
-    first, then case-insensitive (`find_table`). **What no
+    (`a_table_name_before_a_paren_is_the_table`, S8.2-L1-05, red before). **Only a table is matched
+    exact first, then case-insensitive** (`find_table`); a column, a routine, a database and a scope
+    alias or table are matched case-insensitively from the start, the first listed winning — so of
+    PostgreSQL's quoted `"Name"` and `name` on one table, whichever is listed first answers for
+    both, a known gap (R2.1-L8-04). **What no
     loaded schema holds is `None`**, never a nearest guess — the database is the semantic authority,
     and a guess would open the wrong object. `describe` renders a `NamedObject` as the tip's lines:
     a table or view with its column count and comment; a column with its type, then *primary key ·
@@ -12480,8 +12484,8 @@ existing prose was left alone.
     character and the next keystroke panicked the rope; the prefix before it is re-cased to find
     where it now ends (`toggle_case_keeps_a_bare_caret_on_a_character_boundary`). Nothing to change (no word at the caret, no letters) is `None`, so the pane
     makes no edit and no undo step (`toggle_case_upper_cases_then_lower_cases_a_selection`,
-    `toggle_case_with_nothing_to_change_is_none`). The pane applies it to one caret or selection
-    only, through `edit_untyped`.
+    `toggle_case_with_nothing_to_change_is_none`). The pane applies it at every caret — a lone one
+    through `edit_untyped`, several through `edit_untyped_multi` (*Several carets*, below).
     `join_lines` is Ctrl+Shift+J, DataGrip's key again: the caret's line joined with the next, or
     every line a selection spans — one ending at a line's start leaving that line out, as Tab's
     does. Each break and the blanks around it (spaces, tabs and a CRLF's `\r` before; spaces and
@@ -12496,7 +12500,8 @@ existing prose was left alone.
     (`join_lines_leaves_a_break_in_a_string_or_ending_a_line_comment`). The caret lands at the
     first join, and a selection is re-mapped over the joined text
     (`join_lines_joins_every_spanned_line_and_keeps_the_selection`). The pane takes it in
-    `toggle_case`'s arm, so on one caret or selection only and through `edit_untyped`.
+    `toggle_case`'s arm, a lone caret through `edit_untyped` and several through `join_lines_all`
+    and `edit_untyped_multi` (*Several carets*, below).
     `toggle_block_comment` is Ctrl+Shift+/, DataGrip's key as well. It **unwraps first**: a walk over
     `sql::skip_noncode` looks for the block comment that strictly contains a bare caret, or is
     exactly a bare caret's line text — so a caret at either end of a line that is only a comment
@@ -13970,17 +13975,18 @@ existing prose was left alone.
       `intel`'s `keywords_not_taken`, an exhaustive `match`, so a fifth engine has to answer
       rather than inherit MySQL's empty list. **Each engine's own keywords follow the shared
       ones**: a `clause_keywords` closure chains `intel::engine_keywords(dialect, flavour)` onto
-      the filtered `SQL_KEYWORDS` at all three sites that offer it, in the same tier — 3 in
-      `Column`, 2 in `Other`, and 1 at `Start`, so `MERGE` begins a statement on PostgreSQL and
-      SQL Server (`each_engine_is_offered_its_own_keywords`). **In `Column`, a keyword the typed
+      the filtered `SQL_KEYWORDS` at all four sites that offer it, in the same tier — 3 in
+      `Column`, 1 in `Value` (0 where the typed word begins it, the builtins sharing tier 0), 2 in
+      `Other`, and 1 at `Start`, so `MERGE` begins a statement on PostgreSQL and SQL Server
+      (`each_engine_is_offered_its_own_keywords`). **In `Column`, a keyword the typed
       word begins is promoted to the builtins' tier (2)** (`begins_with`), where the prefix bonus
       in `fuzzy_score` lifts it past every builtin that only fuzzy-matches. Left at 3 it could be
       crowded out entirely: the sort is by tier first, and `parti` is a fuzzy match for enough of
       PostgreSQL's 863 offered builtins to fill `MAX_ROWS` before `PARTITION` was reached
       (`a_keyword_the_word_begins_outranks_a_builtin_it_only_fuzzy_matches`). A keyword matched
       only fuzzily stays at 3, and so does every keyword with nothing typed, where every word
-      "begins" with the empty prefix and the promotion would put forty keywords among the
-      functions.
+      "begins" with the empty prefix and the promotion would put every keyword — `SQL_KEYWORDS`
+      alone holds 57 — among the functions.
       **A keyword row is in the typed case**: `add` writes it through `intel::in_typed_case`, the
       inline predictions' rule — all lower typed, lower offered; anything else, and nothing typed,
       the conventional upper — so `sel` accepts `select` (`a_keyword_is_offered_in_the_typed_case`).
@@ -24636,7 +24642,16 @@ existing prose was left alone.
     computation that cannot drift apart; the geometry's two perf rules (`content_x_of` once per list,
     the document read with `with`, not `get`) moved onto `diag_hits` with their measured comments.
     **Every overlay's points come through `editor_points`, which tracks `screen_lines` and never
-    makes floem lay a line out.** The tracking is the fix for drift: `points_of_offset` reads
+    makes floem lay a line out — except the two Ctrl+K preview overlays, which do not yet.**
+    `inline_footer_y` (the verdict bar's y) and `inline_band_runs` (the gutter and padding strips of
+    the inline-diff bands) each track `screen_lines` and then call `points_of_offset` and
+    `text_layout` raw — the shape the rest of this paragraph forbids. `inline_band_runs` asks only
+    about lines inside `rvline_range` (`visible_hunk_lines`), which is the range check alone, not
+    the layout check that stops the crash; `inline_footer_y` asks about the line after the last
+    hunk's anchor, or the anchor itself, wherever it is. Whether either can actually panic — the
+    preview's lines may always be laid out by the time they are asked — has not been checked; until
+    they move onto `editor_points` (R2.1-L8-01), they are the two places to audit. The tracking is
+    the fix for drift: `points_of_offset` reads
     `screen_lines` untracked, so an overlay whose closure tracked only `viewport` re-ran with last
     frame's line positions, its boxes slid a few rows onto unrelated text, and — the tell — they did
     not come back when the editor scrolled back. But a tracker must not ask about a line with no text
@@ -27105,8 +27120,8 @@ existing prose was left alone.
     deliberately. `FieldStyling::id` adds `FieldSql::generation` (the editor generation) to the UI
     generation in its key, so an editor-theme switch re-lays the lines out rather than leaving them
     in the old palette, the hazard `SqlStyling::id` documents. The callers are the DDL preview's SQL
-    box, the view editor's `SELECT` and the trigger and routine bodies; the snippet editor's body
-    sets none, a snippet carrying a scope rather than a dialect.
+    box, the view editor's `SELECT`, the trigger and routine bodies, and the snippet editor's body —
+    a snippet carries a scope rather than a dialect, so `snippet::body_dialect` picks one for it.
     The shared types living in the crate root is what stalls further splitting: the
     root depends on the leaves (`mod`) and the leaves depend on the root (types), so a view builder
     can't move out until the types do.
@@ -29229,7 +29244,7 @@ existing prose was left alone.
     returns `Stored::new(signal, saver)` for each — five handles over four files, the colour pair
     sharing `save_db_colors` — and `UiStores` holds those five and nothing else. What the module
     owns beyond that is the four file names, once each as consts, and one `saver(file, build)`
-    helper so a fourth store cannot arrive with a fifth shape. `build` is re-run
+    helper so a fifth store cannot arrive with a shape of its own. `build` is re-run
     on every save rather than captured once, because the UI writes these signals between saves and a
     captured value would persist whatever the store held when `wire` ran. Its own gate,
     `each_store_is_named_once`, is correspondingly narrow — one name and one `saver` call per store —
@@ -33343,7 +33358,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   because bumping `cache_rev` drops the cache. Check `Lines::try_get_text_layout` first and answer
   "not yet": the pass rewrites `screen_lines`, and the tracker runs again with the layouts there.
   This is the price of the bullet above. `editor_points` is the instance (under `editor_pane.rs`),
-  found when the squiggle memo crashed the app while someone typed into a 7 MB script.
+  found when the squiggle memo crashed the app while someone typed into a 7 MB script. The Ctrl+K
+  preview's `inline_footer_y` and `inline_band_runs` still break this rule — tracking
+  `screen_lines`, then `points_of_offset`/`text_layout` raw (under `editor_pane.rs`).
 - **`.get()` clones the whole value — use `.with()` to read part of a collection.** `SignalGet::get`
   is documented as *"try to **clone** and return the current value"*, so `widths.get().get(ci)`
   allocates and frees the entire `Vec` to read one slot, and `expanded.get().contains(&k)` clones the
@@ -33853,10 +33870,12 @@ Re-introducing the anti-patterns these guard against is a regression:
   `Outdent`, `Other` and `Cut`. The pane's other programmatic edits already carried a kind that
   never merges — `InsertNewline` for Enter, `ToggleComment`, `MoveLine`, `Completion`, `Paste`
   for the Ctrl+K accept, `Other` for the Ctrl+Shift+J/U and Ctrl+Shift+/ arms, the format, the find
-  bar's Replace and Replace All and the snippet library. **Two keep a merging kind on purpose**,
-  both through a raw `doc.edit_single` rather than the funnel: the auto-pair insert is
-  `InsertChars` because it *is* a typed character, and the empty-pair Backspace is `Delete`
-  because it is a Backspace — their several-caret forms keep the same kinds through
+  bar's Replace and Replace All and the snippet library. **Three keep a merging kind on purpose**,
+  all through a raw `doc.edit_single` rather than the funnel: the auto-pair insert is
+  `InsertChars` because it *is* a typed character, the `END`/`WHEN`/`ELSE` dedent
+  (`text_ops::dedent_typed_word`) is `InsertChars` because it is the typed letter that finishes the
+  word, so it undoes with that typing rather than alone, and the empty-pair Backspace is `Delete`
+  because it is a Backspace — the auto-pair's and the Backspace's several-caret forms keep the same kinds through
   `edit_untyped_multi`, as Tab, Ctrl+/, Ctrl+D and Alt+↑/↓ keep theirs. What it costs: two Tabs in a row are two undo steps, since a
   non-merging kind does not merge with itself either. What it does not cover: every keystroke is
   `InsertChars`, so a run of typing is still one undo step however long — nothing breaks it at
