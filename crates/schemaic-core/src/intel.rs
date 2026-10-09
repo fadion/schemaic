@@ -14051,9 +14051,10 @@ pub struct SignatureHelp {
 /// describes `FLOOR`), counts top-level commas to find the active argument, and
 /// ignores grouping parens / non-function calls (`(a+b)`, `IN (…)`, subqueries).
 ///
-/// The database's own `routines` are asked first — one named like a builtin is
-/// the one the call reaches — and answer `name(arguments) → returns` from the
-/// server's own rendering of the list, with no summary but what they are.
+/// The database's own `routines` answer `name(arguments) → returns` from the
+/// server's own rendering of the list, with no summary but what they are. One
+/// named like a builtin answers only a qualified call (`shop.length(`): an
+/// unqualified one reaches the builtin on MySQL and PostgreSQL.
 pub fn signature_help(
     sql: &str,
     lo: usize,
@@ -14093,7 +14094,28 @@ pub fn signature_help(
     if names_an_object(&toks, paren_idx - 1) {
         return None;
     }
-    if let Some(r) = routines.iter().find(|r| r.name.eq_ignore_ascii_case(name)) {
+    // An unqualified call reaches the builtin of its name: MySQL resolves a
+    // native function's name to the native one, and PostgreSQL's search path
+    // has `pg_catalog` first. A qualified one names the database's own.
+    let qualified = paren_idx >= 2 && matches!(toks[paren_idx - 2].kind, TkKind::Dot);
+    // **This engine's catalog, asked as the capability** — the third surface to
+    // do so, after the typo checker and `rank`. It named `FUNCTIONS` outright
+    // for a release while `builtin_catalog`'s own doc said there were two
+    // callers and "both surfaces route here rather than each keeping a map", so
+    // a PostgreSQL tab got nothing for `btrim(` and MySQL's
+    // `DATE_FORMAT(date, format)` for a function PostgreSQL has not got.
+    let builtin = || {
+        builtin_catalog(dialect)?
+            .iter()
+            .find(|f| f.name.eq_ignore_ascii_case(name))
+    };
+    let routine = routines.iter().find(|r| r.name.eq_ignore_ascii_case(name));
+    let routine = if qualified {
+        routine
+    } else {
+        routine.filter(|_| builtin().is_none())
+    };
+    if let Some(r) = routine {
         let signature = if r.returns.is_empty() {
             format!("{}({})", r.name, r.arguments)
         } else {
@@ -14111,15 +14133,7 @@ pub fn signature_help(
             active_arg: comma_count,
         });
     }
-    // **This engine's catalog, asked as the capability** — the third surface to
-    // do so, after the typo checker and `rank`. It named `FUNCTIONS` outright
-    // for a release while `builtin_catalog`'s own doc said there were two
-    // callers and "both surfaces route here rather than each keeping a map", so
-    // a PostgreSQL tab got nothing for `btrim(` and MySQL's
-    // `DATE_FORMAT(date, format)` for a function PostgreSQL has not got.
-    let func = builtin_catalog(dialect)?
-        .iter()
-        .find(|f| f.name.eq_ignore_ascii_case(name))?;
+    let func = builtin()?;
     Some(SignatureHelp {
         name: func.name.to_string(),
         signature: func.signature.to_string(),
@@ -30515,7 +30529,7 @@ mod tests {
                 arguments: "IN d DATE".into(),
                 returns: String::new(),
             },
-            // Named like a builtin: the database's own answers.
+            // Named like a builtin: reached only when the call is qualified.
             IndexedRoutine {
                 name: "length".into(),
                 schema: None,
@@ -30536,8 +30550,26 @@ mod tests {
         let h = at("CALL refresh_totals(", SqlDialect::MySql).unwrap();
         assert_eq!(h.signature, "refresh_totals(IN d DATE)");
         assert_eq!(h.summary, "Stored procedure");
+        // An unqualified call reaches the builtin: MySQL resolves a native
+        // function's name to the native one, PostgreSQL searches `pg_catalog`
+        // first.
+        for d in [SqlDialect::Postgres, SqlDialect::MySql] {
+            let h = at("SELECT length(", d);
+            assert!(
+                h.as_ref().is_none_or(|h| h.summary != "Stored function"),
+                "{d:?}: {h:?}"
+            );
+        }
         let h = at("SELECT length(", SqlDialect::Postgres).unwrap();
-        assert_eq!(h.signature, "length(t text) → integer");
+        assert_ne!(h.signature, "length(t text) → integer");
+        // A qualified one reaches the database's own.
+        for (sql, d) in [
+            ("SELECT public.length(", SqlDialect::Postgres),
+            ("SELECT shop.length(", SqlDialect::MySql),
+        ] {
+            let h = at(sql, d).unwrap();
+            assert_eq!(h.signature, "length(t text) → integer", "{sql}");
+        }
         // A builtin is helped as before.
         assert!(at("SELECT upper(", SqlDialect::Postgres).is_some());
     }

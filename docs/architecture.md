@@ -1092,12 +1092,16 @@ existing prose was left alone.
     So `JOIN b ON LOG(` and `VALUES (LOG(` still open it
     (`signature_help_does_not_open_on_a_table_named_like_a_function`). `FROM` and `JOIN` are not
     on the list, so a rowset function after one — PostgreSQL's `generate_series(` — still does.
-    **The database's own routines answer before the catalogue**: `signature_help` takes
+    **The database's own routines are helped as the builtins are**: `signature_help` takes
     `SchemaIndex::routines` (the caller reads the memoised index on each caret move) and a name
     one of them has is helped as `name(arguments) → returns` from the server's own rendering of
-    the list, `Stored function` or `Stored procedure` its summary — one named like a builtin is
-    the one the call reaches, so it is asked first. `SignatureHelp`'s text is owned for that
-    reason; the builtins' is copied out of the catalogue
+    the list, `Stored function` or `Stored procedure` its summary. One named like a builtin
+    answers only a **qualified** call (`shop.length(`): MySQL resolves an unqualified native
+    function's name to the native one (warning 1585 when such a routine is created says so), and
+    PostgreSQL's search path has `pg_catalog` first, so an unqualified `length(` reaches the
+    builtin. It was asked first, on the reasoning that the database's own is the one the call
+    reaches, which is the inverse of both engines' rule. `SignatureHelp`'s text is owned for the
+    routines' sake; the builtins' is copied out of the catalogue
     (`a_stored_routines_signature_is_helped_as_a_builtins_is`).
     **`caret_in_literal_or_comment` is the completion popup's gate, and it is not
     `caret_touches_noncode`** (under `predict`, below), which differs on both counts that matter
