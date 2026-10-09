@@ -402,6 +402,7 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
             }
             let actions = code_actions.clone();
             let regen = regenerate.clone();
+            let enabled = enabled_for_empty;
             // Width pinned to the scroll viewport (`panel_w`, measured below) so a
             // scroll's unbounded child width doesn't stop the text wrapping, while
             // still tracking the panel as it's resized. 16px between messages —
@@ -491,6 +492,7 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
                                     elapsed_ms,
                                     is_last,
                                     regen.clone(),
+                                    enabled,
                                     pop.replace(false),
                                     gutter,
                                     attach_open,
@@ -1182,6 +1184,7 @@ fn message_bubble(
     elapsed_ms: RwSignal<u64>,
     is_last: bool,
     regenerate: Rc<dyn Fn()>,
+    enabled: RwSignal<bool>,
     animate: bool,
     gutter: RwSignal<bool>,
     attach_open: RwSignal<bool>,
@@ -1227,7 +1230,7 @@ fn message_bubble(
             render_segments(m.segs, m.role, actions, !m.pending).into_any()
         };
         let footer = assistant_footer(
-            m.pending, m.stats, elapsed_ms, copy_text, is_last, regenerate,
+            m.pending, m.stats, elapsed_ms, copy_text, is_last, regenerate, enabled,
         );
         v_stack((content, footer))
             .style(|s| s.flex_col().width_full())
@@ -1370,8 +1373,8 @@ fn footer_icon(svg: &'static str, on_click: impl Fn() + 'static) -> impl IntoVie
 
 /// Footer under an assistant turn: on the left a live elapsed timer (while
 /// pending) or the final `time · ↑in ↓out` summary; on the right the Copy action
-/// (every done turn) and Regenerate (last turn only), 10px apart. Nothing at all
-/// when the turn is empty.
+/// (every done turn) and Regenerate (last turn only, and only while the
+/// assistant is on), 10px apart. Nothing at all when the turn is empty.
 fn assistant_footer(
     pending: bool,
     stats: Option<TurnStats>,
@@ -1379,6 +1382,7 @@ fn assistant_footer(
     copy_text: String,
     is_last: bool,
     regenerate: Rc<dyn Fn()>,
+    enabled: RwSignal<bool>,
 ) -> AnyView {
     let style =
         |s: floem::style::Style| s.font_size(theme::font_label()).color(theme::text_muted());
@@ -1421,9 +1425,14 @@ fn assistant_footer(
                 .margin_top(theme::scaled(-2.0))
         };
         if is_last {
-            h_stack((copy, footer_icon(icons::REFRESH_CW, move || (regenerate)())))
-                .style(icons_style)
-                .into_any()
+            // **Absent while the assistant is off**, as every other AI action
+            // is: the transcript stays on screen, but a regenerate has nothing
+            // to send it to. A style rather than a rebuild, because the bubble's
+            // container is keyed on the message, not on `enabled`;
+            // `ai_regenerate` refuses on its own as well.
+            let regen = footer_icon(icons::REFRESH_CW, move || (regenerate)())
+                .style(move |s| s.apply_if(!enabled.get(), |s| s.hide()));
+            h_stack((copy, regen)).style(icons_style).into_any()
         } else {
             h_stack((copy,)).style(icons_style).into_any()
         }

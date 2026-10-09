@@ -23935,7 +23935,9 @@ existing prose was left alone.
     keep their old order). It is one memo over all three inputs, for the reason the pair memo it
     replaced was one: two memos would be two keys. **The gear stays live** — it is the only way into
     the settings, and so the only way back on — and the panel toggle and Ctrl+Shift+A stay too, so
-    the panel is there to say that it is off.
+    the panel is there to say that it is off. The transcript stays on screen, but the last reply's
+    Regenerate icon does not: it has nothing to send to (the off rule under *Architecture
+    invariants*).
   - `overlays.rs` — absolutely-positioned popups: connection/active-db/schema menus, schema context
     menu, generic grid popup, the date picker's calendar (`date_pick_overlay`, whose panel is
     `cell_editors::calendar_panel` — up here because the field it drops from sits inside a scrolling
@@ -31120,15 +31122,22 @@ Re-introducing the anti-patterns these guard against is a regression:
   and on the one-shot path through `harness::inline_argv`, and how far each gets is `Constraint`.
 - **An assistant that is off sends nothing and starts no agent process — refused at the action, not
   only hidden.** Off (`AiUi::enabled` false: *Disabled* in the *Agent CLI* dropdown, a new install's
-  default, and what an unrecognised persisted key loads as) is checked by the four app actions every
-  AI path goes through. `ai_send` returns before anything else, and with it go regenerate, the grid's
-  AI summary, the plan modal's and the palette's Ask AI and the schema tree's AI explain;
+  default, and what an unrecognised persisted key loads as) is checked by the five app actions every
+  AI path goes through. `ai_send` returns before anything else, and with it go the grid's AI
+  summary, the plan modal's and the palette's Ask AI and the schema tree's AI explain;
   `inline_ai_run` (Ctrl+K) answers `InlineAiState::Failed(AI_OFF_NOTE)`; `ai_fill` and `ai_seed`
-  answer `Failed` with the same note. The entry points are **absent, not greyed**, which was the
+  answer `Failed` with the same note. **`ai_regenerate` refuses on its own, before it touches the
+  transcript** (on `ai_busy || !ai_enabled`): it used to lean on `ai_send`'s guard, but it cuts the
+  last question and its answer *first* and then hands the question on — so off, the turn was
+  deleted with nothing sent, and the next persisted turn made the loss permanent
+  (`regenerate_refuses_while_off_before_it_truncates_the_transcript`). The entry points are
+  **absent, not greyed**, which was the
   user's call — the editor's right-click Ask AI/Explain/Optimise/AI fix and their separator, the
   error bar's and the error modal's Explain and AI fix, the schema tree's *AI explain*, the
   palette's *Ask AI*, the plan modal's button, the grid's sparkle and every `grid::ai_offered`
-  entry; Ctrl+K is consumed and opens nothing, so it cannot fall through to an editor binding. But
+  entry, and the last reply's Regenerate icon in `ai_panel::assistant_footer` — hidden by a style
+  on `enabled` rather than a rebuild, since the bubble's container is keyed on the message; Ctrl+K
+  is consumed and opens nothing, so it cannot fall through to an editor binding. But
   **hiding is the courtesy, not the guard**, for the write guard's reason: a control the hiding
   missed, or a menu built a moment before the switch, must still send nothing. **Switching off ends
   what is running**, at the pick rather than when the modal closes: an effect on `ai_enabled` going

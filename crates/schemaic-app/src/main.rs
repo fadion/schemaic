@@ -11201,12 +11201,19 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // Regenerate the last assistant turn: drop the trailing assistant bubble(s),
     // re-show "Thinking…", and re-send the last user message to the LIVE session
     // (which still holds full context). Last-turn-only, so there's nothing after it
-    // to discard. No-op while busy or with no session / no prior user message.
+    // to discard. No-op while busy, while the assistant is off, or with no
+    // session / no prior user message.
     let ai_regenerate: Rc<dyn Fn()> = {
         let ai_session = ai_session.clone();
         let ai_send = ai_send.clone();
         Rc::new(move || {
-            if ai_busy.get_untracked() {
+            // **Refused at the action, before the transcript is touched.** The
+            // cut below deletes the question and its answer and then hands the
+            // question to `ai_send` — whose own off guard returned without it,
+            // so the turn was lost with nothing sent, and the next persisted
+            // turn made the loss permanent. The panel hides the icon while off
+            // too, but the guard lives here, as the other actions' do.
+            if ai_busy.get_untracked() || !ai_enabled.get_untracked() {
                 return;
             }
             // The attachment travels with the question, not in its text, so it
@@ -15396,6 +15403,32 @@ mod app_tests {
         assert!(
             a < r,
             "the check runs after the read — that is `fetch_landing`, and the cost is already paid"
+        );
+    }
+
+    /// **Regenerate refuses while the assistant is off, before it touches the
+    /// transcript.** It deletes the last question and answer and then hands the
+    /// question to `ai_send` — which returns at its own off guard, so the turn
+    /// was lost with nothing sent, and the next persisted turn made the loss
+    /// durable in `chats.json`. A source assertion because `ai_regenerate` is a
+    /// closure over app signals that no test can construct.
+    #[test]
+    fn regenerate_refuses_while_off_before_it_truncates_the_transcript() {
+        let src = production_main();
+        let at = src
+            .find("let ai_regenerate: Rc<dyn Fn()> = {")
+            .expect("`ai_regenerate` is gone or was renamed");
+        let body = closure_body(&src, at);
+        // Assembled, so this test's own source is not the hit.
+        let guard = format!("!{}.get_untracked()", "ai_enabled");
+        let cut = format!("transcript::{}(", "regenerate_keep_len");
+        let g = body
+            .find(&guard)
+            .expect("`ai_regenerate` never asks whether the assistant is on");
+        let c = body.find(&cut).expect("the truncation is gone");
+        assert!(
+            g < c,
+            "the off check runs after the transcript is cut — the turn is already lost"
         );
     }
 
