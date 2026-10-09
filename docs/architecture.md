@@ -12397,7 +12397,9 @@ existing prose was left alone.
     **`cut_lines` is Ctrl+X on
     bare carets**: each caret's line, line end included, onto the clipboard once and in document
     order, a last line with no line end of its own taking the one before it and going onto the
-    clipboard with a `\n`. It replaces floem's `DeleteLine`, which never copies — Ctrl+X then
+    clipboard with a `\n` — and where the cut before it already took that line end (carets on the
+    last two lines), the run of cuts takes the one before its first line, so no blank line is left
+    either way. It replaces floem's `DeleteLine`, which never copies — Ctrl+X then
     Ctrl+V pasted whatever the clipboard held before — and which, with carets on lines 1 and 50,
     deleted every line from 1 to 50 (`cutting_lines_takes_each_carets_line_onto_the_clipboard`).
     The pane applies it as one whole-buffer edit through `edit_untyped` and writes the clipboard

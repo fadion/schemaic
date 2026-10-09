@@ -1185,8 +1185,17 @@ pub fn cut_lines(full: &str, carets: &[usize]) -> LineCut {
         } else {
             a
         };
-        let a = a.max(at);
-        text.push_str(&full[at..a]);
+        if a < at {
+            // The cut before this one ends where this line starts, and took
+            // that line end with it: the run of cuts ending the text takes
+            // the line end before its first line instead — the last thing
+            // kept, since that first line starts right after it.
+            if text.ends_with('\n') {
+                text.pop();
+            }
+        } else {
+            text.push_str(&full[at..a]);
+        }
         first_cut.get_or_insert(text.len());
         at = b;
     }
@@ -2473,6 +2482,18 @@ mod tests {
         // CRLF lines are cut whole.
         let c = cut_lines("a\r\nb\r\n", &[0]);
         assert_eq!((c.clipboard.as_str(), c.text.as_str()), ("a\r\n", "b\r\n"));
+        // Carets on the last two lines: the run of cuts ending the text takes
+        // the line end before its first line, leaving no blank line.
+        let c = cut_lines("w\nx\ny", &[2, 4]);
+        assert_eq!(
+            (c.clipboard.as_str(), c.text.as_str(), c.caret),
+            ("x\ny\n", "w", 0)
+        );
+        let c = cut_lines(full, &[1, 5, 10, full.len()]);
+        assert_eq!(c.clipboard, format!("{full}\n"));
+        assert_eq!(c.text, "");
+        let c = cut_lines(full, &[1, 10, full.len()]);
+        assert_eq!(c.text, "two");
     }
 
     #[test]
