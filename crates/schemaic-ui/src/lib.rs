@@ -4287,11 +4287,12 @@ mod engine_comparison_gate {
         ),
         (
             "schemaic-core/sql.rs",
-            17,
-            "Thirteen are the [`SqlDialect`] capability table itself — \
+            18,
+            "Fourteen are the [`SqlDialect`] capability table itself — \
              `backtick_ident`, `double_quote_is_ident`, `dollar_quoted`, \
              `nested_block_comments`, `e_string_backslash`, `prefixed_names`, \
-             `read_only_is_a_rollback` and the rest — which is the one place in the \
+             `read_only_is_a_rollback`, `if_is_control_flow` and the rest — which \
+             is the one place in the \
              workspace where naming an engine is the whole job. The four others \
              are the boundary lexer's own per-engine rules (SQLite's `''` \
              doubling, its trigger bodies, MySQL's `USE`, PostgreSQL's \

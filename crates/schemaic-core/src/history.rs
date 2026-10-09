@@ -1437,6 +1437,52 @@ mod tests {
         }
     }
 
+    /// **What Run at the caret and Run Everything record of a principal
+    /// statement a blank line runs through** — the composition: a blank line
+    /// cut `WITH PASSWORD = '…'` into a piece of its own, the launch recorded
+    /// that piece, and the password went to `history.json` and its `.bak`.
+    #[test]
+    fn a_password_clause_under_a_blank_line_is_not_recorded() {
+        for (sql, d) in [
+            (
+                "CREATE LOGIN app\n\nWITH PASSWORD = 'S3cret!'",
+                SqlDialect::MsSql,
+            ),
+            (
+                "ALTER LOGIN sa\n\nWITH PASSWORD = 'S3cret!'",
+                SqlDialect::MsSql,
+            ),
+            (
+                "CREATE USER app\n\nWITH PASSWORD = 'S3cret!'",
+                SqlDialect::MsSql,
+            ),
+            (
+                "CREATE ROLE app\n\nWITH LOGIN PASSWORD 'S3cret!'",
+                SqlDialect::Postgres,
+            ),
+            (
+                "ALTER ROLE app\n\nWITH PASSWORD 'S3cret!'",
+                SqlDialect::Postgres,
+            ),
+        ] {
+            // Ctrl+Enter with the caret on the password's line.
+            let caret = sql.find("PASSWORD").unwrap();
+            let run = crate::sql::executable_at(sql, caret, d).unwrap();
+            let mut v = Vec::new();
+            assert!(
+                !super::push(&mut v, entry(1, run, 100), d) && v.is_empty(),
+                "{d:?}: recorded {run:?}"
+            );
+            // Run Everything's pieces, recorded at launch.
+            let batch = crate::sql::editor_executable_spans(sql, d)
+                .into_iter()
+                .map(|(lo, hi)| entry(1, &sql[lo..hi], 100))
+                .collect();
+            assert_eq!(super::push_batch(&mut v, batch, d), 0, "{d:?}: {sql:?}");
+            assert!(v.is_empty(), "{d:?}: recorded {v:?}");
+        }
+    }
+
     #[test]
     fn an_ordinary_statement_naming_a_password_column_is_still_recorded() {
         // Omitting is the safe direction, but not at the cost of dropping every

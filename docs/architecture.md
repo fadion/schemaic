@@ -816,9 +816,19 @@ existing prose was left alone.
     statement (`STATEMENT_STARTS`); and where the code before it carries on (`blank_line_ends`) — a
     trailing `,`, `(` or operator, a `CARRIES_ON` word such as `UNION`, `AS`, `FROM` or `AND`, or an
     `INSERT`/`REPLACE` header whose `SELECT`, `WITH`, `VALUES` or `TABLE` comes after the blank
-    line. A statement a `;` ends keeps its blank lines
+    line. **Nor is a statement cut from the head that governs it** (`awaits_statement`): a T-SQL
+    `IF`/`WHILE`/`ELSE` with no statement after it yet, an `EXPLAIN`/`DESC`/`DESCRIBE` with only
+    its options, a `WITH` whose CTEs await their main statement. The first spelling had none of
+    these, so Ctrl+Enter on the `DELETE` under `IF EXISTS (…)` ⏎⏎ ran it unconditionally, and
+    under `EXPLAIN` ⏎⏎ ran the `DELETE` a plan was asked of. And a `WITH` that opens no CTE
+    (`opens_cte`) opens no statement: it is an options clause continuing the one above —
+    `CREATE LOGIN app` ⏎⏎ `WITH PASSWORD = …` was cut into a piece of its own that no credential
+    rule recognised, and its password went to `history.json`. Each kept-together shape was run
+    live as the one statement it is (SQL Server 2022, PostgreSQL 16, MariaDB 10.11). A statement a
+    `;` ends keeps its blank lines
     (`a_blank_line_separates_statements_where_no_terminator_does`,
-    `a_blank_line_inside_a_statement_does_not_cut_it`). **Run Everything cuts the same way**:
+    `a_blank_line_inside_a_statement_does_not_cut_it`,
+    `a_blank_line_does_not_cut_a_governed_statement_from_its_head`). **Run Everything cuts the same way**:
     `editor_executable_spans` is `executable_spans` with the unterminated tail cut by the same
     `blank_line_cuts`, read by the run menu's Run Everything and by the toolbar's Run — which sends
     the pieces through `run_all` when a blank line cut something, and the whole buffer through `run`
@@ -9255,7 +9265,13 @@ existing prose was left alone.
     agents, `ENCRYPTBYPASSPHRASE`, and those whose argument is a connection string —
     `OPENROWSET` but for `OPENROWSET(BULK …)`, `OPENDATASOURCE`, `sp_addlinkedserver`'s
     `@provstr`, PostgreSQL's `dblink`/`dblink_connect`/`dblink_exec` — where the password sits
-    inside a literal the tokens never read). SQL Server
+    inside a literal the tokens never read), and three more of that last kind with no
+    `SECRET_CALLS` entry to find: PostgreSQL's `CREATE`/`ALTER SUBSCRIPTION … CONNECTION '…'`,
+    a MySQL federated `CREATE`/`ALTER SERVER … OPTIONS (PASSWORD '…')`, and MariaDB's
+    `PASSWORD('…')`/`OLD_PASSWORD('…')` — as calls, so a `password` column stays recorded. A
+    statement headed by a `WITH` that opens no CTE and holding `PASSWORD` counts too: it can only
+    be a principal's options clause cut from its header, as a blank line once cut `CREATE LOGIN
+    app` ⏎⏎ `WITH PASSWORD = …`. SQL Server
     arrived without the T-SQL words, so a typed `ALTER LOGIN … WITH PASSWORD` went to
     `history.json` and its `.bak` in the clear; the rule is deliberately not per dialect, since
     none of the words means anything else as a statement's shape. **It judges each T-SQL

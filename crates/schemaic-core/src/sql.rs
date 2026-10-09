@@ -148,6 +148,14 @@ impl SqlDialect {
         matches!(self, SqlDialect::MsSql)
     }
 
+    /// Is `IF (…)` always control flow — a statement governing the next one —
+    /// and never a function call? SQL Server's: T-SQL's conditional function
+    /// is `IIF`, while MySQL's and SQLite's `IF(c, a, b)` is an expression.
+    /// See [`awaits_statement`].
+    pub(crate) fn if_is_control_flow(self) -> bool {
+        matches!(self, SqlDialect::MsSql)
+    }
+
     /// Is a read-only connection's session **only a transaction that is rolled
     /// back**, rather than one the server refuses writes in? SQL Server's —
     /// it has no read-only session to ask for (`db::mssql::fetch_query`) — so
@@ -1974,17 +1982,23 @@ const STATEMENT_STARTS: &[&str] = &[
 
 /// Words after which a statement is plainly not over, whatever comes next:
 /// `UNION` and its kin, `AS` (a view's or a `CREATE TABLE … AS`'s query
-/// follows), and the operators and clause words a line can end on.
+/// follows), the operators and clause words a line can end on, and the words
+/// a statement follows inside another — `CURSOR FOR`, `ON CONFLICT … DO`, a
+/// PostgreSQL rule's `DO [ALSO | INSTEAD]`.
 const CARRIES_ON: &[&str] = &[
     "ALL",
+    "ALSO",
     "AND",
     "AS",
     "BY",
     "DISTINCT",
+    "DO",
     "ELSE",
     "EXCEPT",
+    "FOR",
     "FROM",
     "IN",
+    "INSTEAD",
     "INTERSECT",
     "INTO",
     "JOIN",
@@ -2079,9 +2093,11 @@ fn blank_line_cuts(sql: &str, lo: usize, hi: usize, dialect: SqlDialect) -> Vec<
                 while next < hi && b[next].is_ascii_whitespace() {
                     next += 1;
                 }
+                // The scopes first: they are a field each, and the question
+                // after them may walk the piece.
                 if next < hi
-                    && blank_line_ends(sql, start, i, next, hi, dialect, last, last_word)
                     && !(body == BodyScan::In || batch.holds() || scan.inside_body())
+                    && blank_line_ends(sql, start, i, next, hi, dialect, last, last_word)
                 {
                     cuts.push(next);
                     start = next;
@@ -2151,6 +2167,19 @@ fn blank_line_ends(
     if !STATEMENT_STARTS.contains(&opens.as_str()) {
         return false;
     }
+    // A `WITH` that opens no CTE opens no statement: it is an options clause
+    // continuing the one above — `CREATE LOGIN app` ⏎⏎ `WITH PASSWORD = …`,
+    // whose password a cut made a "statement" of its own that no credential
+    // rule recognised, `… FROM t` ⏎⏎ `WITH (NOLOCK)`, `GRANT …` ⏎⏎ `WITH
+    // GRANT OPTION`.
+    if opens == "WITH" && !opens_cte(&sql[next..hi], dialect) {
+        return false;
+    }
+    // A head that governs the statement under it, with that statement still
+    // to come: Run at the caret ran an `IF`'s `DELETE` without its condition.
+    if awaits_statement(&sql[start..at], dialect) {
+        return false;
+    }
     let head = leading_words(&sql[start..at], 8, dialect);
     // A routine's body runs on, on every engine.
     if matches!(head.first().map(String::as_str), Some("CREATE" | "ALTER"))
@@ -2166,6 +2195,197 @@ fn blank_line_ends(
     // `INSERT INTO t (a)` ⏎⏎ `SELECT …` is one statement.
     let query = matches!(opens.as_str(), "SELECT" | "WITH" | "VALUES" | "TABLE");
     !(query && matches!(head.first().map(String::as_str), Some("INSERT" | "REPLACE")))
+}
+
+/// The options an `EXPLAIN` — or MySQL's `DESC`/`DESCRIBE` of a statement —
+/// takes before the statement it plans, outside parens: PostgreSQL's
+/// parenthesised list is skipped whole. Upper case.
+const EXPLAIN_OPTIONS: &[&str] = &[
+    "ANALYZE",
+    "EXTENDED",
+    "FORMAT",
+    "JSON",
+    "PARTITIONS",
+    "PLAN",
+    "QUERY",
+    "TRADITIONAL",
+    "TREE",
+    "VERBOSE",
+];
+
+/// Does the piece `sql` end on a head still waiting for the statement it
+/// governs, so that a blank line after it would cut that statement from it?
+///
+/// - an `EXPLAIN`, `DESC` or `DESCRIBE` with nothing after it but its options
+///   ([`EXPLAIN_OPTIONS`]) — `DESC users` is a statement of its own;
+/// - a `WITH` whose CTEs no statement follows yet;
+/// - T-SQL's `IF`, `WHILE` or `ELSE` (MariaDB's too, outside a routine) with no
+///   statement after the last of them — wherever it stands, since `IF` opens
+///   no statement a blank line cuts before, so `SELECT 1` ⏎⏎ `IF …` is one
+///   piece.
+///
+/// Read off the words outside parens, strings, quoted names and comments
+/// ([`top_level_words`]). A word an argument list follows is a call
+/// (`UPDATE(col)`, and `IF(…)` where `IF` can be a function —
+/// [`SqlDialect::if_is_control_flow`]), but a `WHILE (…)` or a T-SQL `IF (…)`
+/// is a parenthesised condition; an `IF [NOT] EXISTS` before a name is a clause, a `CASE …
+/// END` is passed over whole, and `END IF`/`END WHILE` close rather than open.
+/// Where it is unsure it says yes: a cut not made sends a statement with its
+/// neighbour, which the server refuses; a cut made wrongly runs a statement
+/// without its condition.
+fn awaits_statement(sql: &str, dialect: SqlDialect) -> bool {
+    let words = top_level_words(sql, dialect);
+    let word = |k: usize| words.get(k).map(|(w, c)| (w.as_str(), *c));
+    let explain = matches!(word(0), Some(("EXPLAIN" | "DESC" | "DESCRIBE", _)));
+    let mut pending = explain || matches!(word(0), Some(("WITH", _)));
+    let mut case = 0usize;
+    for k in usize::from(pending)..words.len() {
+        let (w, called) = (words[k].0.as_str(), words[k].1);
+        let after_end = k > 0 && words[k - 1].0 == "END";
+        match w {
+            "CASE" if !after_end => {
+                case += 1;
+                continue;
+            }
+            "END" if case > 0 => {
+                case -= 1;
+                continue;
+            }
+            _ if case > 0 => continue,
+            _ => {}
+        }
+        // `IF EXISTS t`, `IF NOT EXISTS t`: a clause of the statement it is in.
+        let clause = |n: usize| matches!(word(k + n), Some(("EXISTS", false)));
+        // A condition in parens is no call — `WHILE (SELECT …) > 0`, T-SQL's
+        // `IF (@a = 1)` — but MySQL's `IF(c, a, b)` is.
+        let control = match w {
+            "ELSE" => true,
+            "WHILE" => !after_end,
+            "IF" => {
+                !after_end
+                    && (!called || dialect.if_is_control_flow())
+                    && !clause(1)
+                    && !(word(k + 1) == Some(("NOT", false)) && clause(2))
+            }
+            _ => false,
+        };
+        if called && !control {
+            continue;
+        }
+        // An `EXPLAIN`'s option is no statement, though `ANALYZE` can be one.
+        let ends = if explain {
+            !EXPLAIN_OPTIONS.contains(&w)
+        } else {
+            STATEMENT_STARTS.contains(&w)
+        };
+        if control {
+            pending = true;
+        } else if pending && ends {
+            pending = false;
+        }
+    }
+    pending
+}
+
+/// The words of `sql` outside parens, upper-cased, each marked by whether an
+/// argument list follows it — a statement's skeleton, for
+/// [`awaits_statement`]. Strings, quoted names and comments are stepped over
+/// by [`skip_noncode`], and a T-SQL `@x` or `#t` is a name, not a word.
+fn top_level_words(sql: &str, dialect: SqlDialect) -> Vec<(String, bool)> {
+    let b = sql.as_bytes();
+    let mut out = Vec::new();
+    let (mut i, mut depth) = (0, 0usize);
+    while i < b.len() {
+        if let Some(j) = skip_noncode(b, i, dialect) {
+            i = j;
+            continue;
+        }
+        let prefix = t_sql_name_prefix(b, i, dialect);
+        if prefix > 0 || is_word_start(b[i]) {
+            let s = i;
+            i += prefix.max(1);
+            while i < b.len() && continues_name(b[i], dialect) {
+                i += 1;
+            }
+            if prefix == 0 && depth == 0 {
+                let called = next_code_byte(b, i, dialect) == Some(b'(');
+                out.push((sql[s..i].to_ascii_uppercase(), called));
+            }
+            continue;
+        }
+        match b[i] {
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Does `sql`, which opens with `WITH`, open a common table expression —
+/// `WITH [RECURSIVE] name [(cols)] AS [[NOT] MATERIALIZED] (`, or T-SQL's
+/// `WITH XMLNAMESPACES (` — rather than an options clause continuing the
+/// statement above it (`WITH PASSWORD = …`, `WITH (NOLOCK)`, `WITH GRANT
+/// OPTION`, `WITH ROLLBACK IMMEDIATE`, a view's `WITH SCHEMABINDING AS`)?
+fn opens_cte(sql: &str, dialect: SqlDialect) -> bool {
+    let b = sql.as_bytes();
+    // The bare word at the next code byte past `i`, upper-cased, and where it
+    // ends.
+    let word = |i: usize| -> Option<(String, usize)> {
+        let k = next_code_at(b, i, dialect)?;
+        if !is_word_start(b[k]) {
+            return None;
+        }
+        let mut e = k + 1;
+        while e < b.len() && continues_name(b[e], dialect) {
+            e += 1;
+        }
+        Some((sql[k..e].to_ascii_uppercase(), e))
+    };
+    let opens_paren = |i: usize| next_code_at(b, i, dialect).filter(|&k| b[k] == b'(');
+    let Some((_, mut i)) = word(0).filter(|(w, _)| w == "WITH") else {
+        return false;
+    };
+    match word(i) {
+        Some((w, _)) if w == "XMLNAMESPACES" => return true,
+        Some((w, e)) if w == "RECURSIVE" => i = e,
+        _ => {}
+    }
+    // The CTE's name: a bare word or a quoted one.
+    let Some(k) = next_code_at(b, i, dialect) else {
+        return false;
+    };
+    i = if noncode_kind(b, k, dialect) == Some(NonCode::Identifier) {
+        match skip_noncode(b, k, dialect) {
+            Some(e) => e,
+            None => return false,
+        }
+    } else {
+        match word(k) {
+            Some((_, e)) => e,
+            None => return false,
+        }
+    };
+    // Its column list.
+    if let Some(open) = opens_paren(i) {
+        match matching_paren(b, open, dialect) {
+            Some(close) => i = close + 1,
+            None => return false,
+        }
+    }
+    let Some((_, e)) = word(i).filter(|(w, _)| w == "AS") else {
+        return false;
+    };
+    i = e;
+    for opt in ["NOT", "MATERIALIZED"] {
+        if let Some((w, e)) = word(i)
+            && w == opt
+        {
+            i = e;
+        }
+    }
+    opens_paren(i).is_some()
 }
 
 /// **One revision of a buffer's statement boundaries**, for the editor's
@@ -5314,7 +5534,12 @@ fn unlisted_call(sql: &str, dialect: SqlDialect, policy: &CallPolicy) -> Option<
 /// [`skip_noncode`] like everything else that reads SQL boundaries here, and on
 /// [`noncode_kind`] so that a *string* or a quoted *identifier* — which are
 /// code, not gaps — stop the scan rather than being stepped over.
-fn next_code_byte(b: &[u8], mut i: usize, dialect: SqlDialect) -> Option<u8> {
+fn next_code_byte(b: &[u8], i: usize, dialect: SqlDialect) -> Option<u8> {
+    next_code_at(b, i, dialect).map(|k| b[k])
+}
+
+/// [`next_code_byte`]'s offset rather than its byte.
+fn next_code_at(b: &[u8], mut i: usize, dialect: SqlDialect) -> Option<usize> {
     let n = b.len();
     while i < n {
         if b[i].is_ascii_whitespace() {
@@ -5328,7 +5553,7 @@ fn next_code_byte(b: &[u8], mut i: usize, dialect: SqlDialect) -> Option<u8> {
             i = j;
             continue;
         }
-        return Some(b[i]);
+        return Some(i);
     }
     None
 }
@@ -5845,7 +6070,15 @@ pub fn limited_select(dialect: SqlDialect, projection: &str, rest: &str, limit: 
 /// - a `SET` statement containing `PASSWORD` — `SET PASSWORD FOR … = …`;
 /// - a `CREATE`/`ALTER`/`DROP`/`GRANT`/`REVOKE` naming a `USER` or `ROLE` *and*
 ///   `PASSWORD` — PostgreSQL's `CREATE ROLE … WITH PASSWORD '…'` — or, as
-///   its second word, T-SQL's `LOGIN` (`ALTER LOGIN sa WITH PASSWORD = …`);
+///   its second word, T-SQL's `LOGIN` (`ALTER LOGIN sa WITH PASSWORD = …`) or
+///   a MySQL federated `SERVER` (`ALTER SERVER s OPTIONS (PASSWORD '…')`);
+/// - a statement headed by a `WITH` that opens no CTE, holding `PASSWORD` —
+///   the options clause of one of those, cut from its header by a blank line
+///   (`CREATE LOGIN app` ⏎⏎ `WITH PASSWORD = …`) and run or recorded alone;
+/// - a call to `PASSWORD(…)` or `OLD_PASSWORD(…)`, MariaDB's, whose argument
+///   is the secret — a call, so a `password` column stays allowed;
+/// - PostgreSQL's `CREATE`/`ALTER SUBSCRIPTION … CONNECTION '…'`, whose
+///   conninfo string holds the password where no token can see it;
 /// - `BY PASSWORD` anywhere — T-SQL's `CREATE MASTER KEY ENCRYPTION BY
 ///   PASSWORD`, `OPEN … DECRYPTION BY PASSWORD`, a certificate's or a
 ///   symmetric key's;
@@ -5884,7 +6117,16 @@ pub fn carries_credential(sql: &str, dialect: SqlDialect) -> bool {
 
 /// [`carries_credential`]'s rules, for one statement.
 fn statement_carries_credential(stmt: &str, dialect: SqlDialect) -> bool {
-    let (words, _) = word_tokens(stmt, dialect);
+    let (called, _) = called_word_tokens(stmt, dialect);
+    // MariaDB's `PASSWORD('…')` and `OLD_PASSWORD('…')`: the secret is the
+    // argument. Only as a call — a `password` column is no credential.
+    if called
+        .iter()
+        .any(|(w, c)| *c && matches!(w.as_str(), "PASSWORD" | "OLD_PASSWORD"))
+    {
+        return true;
+    }
+    let words: Vec<String> = called.into_iter().map(|(w, _)| w).collect();
     if words.iter().any(|w| w == "IDENTIFIED") {
         return true;
     }
@@ -5906,6 +6148,14 @@ fn statement_carries_credential(stmt: &str, dialect: SqlDialect) -> bool {
     {
         return true;
     }
+    // PostgreSQL's `CREATE|ALTER SUBSCRIPTION … CONNECTION '…'`: a conninfo
+    // string, whose `password=` the tokens never see — as `dblink`'s.
+    if matches!(head, Some("CREATE" | "ALTER"))
+        && words.get(1).is_some_and(|w| w == "SUBSCRIPTION")
+        && words.iter().any(|w| w == "CONNECTION")
+    {
+        return true;
+    }
     // A password set by a word rather than a principal statement: MySQL's
     // `CHANGE REPLICATION SOURCE TO SOURCE_PASSWORD = …`, `START REPLICA …
     // PASSWORD = …`, and a T-SQL procedure's `@password`/`@…_password`
@@ -5919,11 +6169,20 @@ fn statement_carries_credential(stmt: &str, dialect: SqlDialect) -> bool {
     if !words.iter().any(|w| w == "PASSWORD") {
         return false;
     }
+    // A principal, or a MySQL federated `SERVER`, whose `OPTIONS (PASSWORD
+    // '…')` names no user.
     let names_a_principal = words.iter().any(|w| w == "USER" || w == "ROLE")
-        || words.get(1).is_some_and(|w| w == "LOGIN");
+        || words
+            .get(1)
+            .is_some_and(|w| w == "LOGIN" || (w == "SERVER" && head != Some("DROP")));
     match head {
         Some("SET") => true,
         Some("CREATE" | "ALTER" | "DROP" | "GRANT" | "REVOKE") => names_a_principal,
+        // An options clause a blank line cut off its principal's header —
+        // `CREATE LOGIN app` ⏎⏎ `WITH PASSWORD = …`. A `WITH` opening no CTE
+        // is a fragment of a statement, never one, so it is judged as the
+        // statement it came from would be.
+        Some("WITH") => !opens_cte(stmt, dialect),
         _ => false,
     }
 }
@@ -7174,6 +7433,169 @@ mod tests {
         );
     }
 
+    /// **A blank line never cuts a statement from the head that governs it.**
+    /// Ctrl+Enter on the `DELETE` under `IF EXISTS (…)` ⏎⏎ ran the `DELETE`
+    /// alone, unconditionally; under `EXPLAIN` ⏎⏎ it ran the `DELETE` the
+    /// user had asked a plan of. The caret is on the governed statement's
+    /// line, and what runs is the whole text.
+    #[test]
+    fn a_blank_line_does_not_cut_a_governed_statement_from_its_head() {
+        let all = [
+            SqlDialect::MySql,
+            SqlDialect::Postgres,
+            SqlDialect::Sqlite,
+            SqlDialect::MsSql,
+        ];
+        let whole = |sql: &str, d: SqlDialect| {
+            assert_eq!(
+                super::executable_at(sql, sql.len() - 1, d),
+                Some(sql),
+                "{d:?}: {sql:?} was cut"
+            );
+            // Run Everything sends it as one statement too.
+            assert_eq!(
+                super::editor_executable_spans(sql, d),
+                vec![(0, sql.len())],
+                "{d:?}: {sql:?} was split"
+            );
+        };
+        // T-SQL's control flow governs the one statement after it.
+        for sql in [
+            "IF EXISTS (SELECT 1 FROM staging WHERE batch = 7)\n\n    DELETE FROM target WHERE batch = 7",
+            "IF @debug = 0\n\nBEGIN\n  DELETE FROM t\nEND",
+            "WHILE @@ROWCOUNT > 0\n\nDELETE TOP (1000) FROM t",
+            // A parenthesised condition is no function call.
+            "WHILE (SELECT COUNT(*) FROM t) > 5\n\nDELETE TOP (1) FROM t",
+            "IF (@a = 1)\n\nDELETE FROM t",
+            "IF(@a = 1)\n\nDELETE FROM t",
+            "IF @a = 1\n\nIF @b = 2\n\nDELETE FROM t",
+            "IF @a = 1 SELECT 1 ELSE IF @b = 2\n\nDELETE FROM t",
+            "SELECT 1\n\nIF @a = 1\n\nDELETE FROM t",
+            "IF @a = 1 SELECT CASE WHEN 1 = 1 THEN 1 ELSE 2 END ELSE\n\nDELETE FROM t",
+        ] {
+            whole(sql, SqlDialect::MsSql);
+        }
+        // A plan of the statement under it, not the statement.
+        for d in all {
+            for sql in [
+                "explain\n\ndelete from t",
+                "EXPLAIN ANALYZE\n\nDELETE FROM t WHERE id = 1",
+                "explain (analyze, buffers)\n\ndelete from t",
+                "explain format=json\n\ndelete from t",
+                "explain query plan\n\ndelete from t",
+                "describe\n\ndelete from t",
+                // A CTE's main statement.
+                "with x as (select 1 as id)\n\ndelete from t where id in (select id from x)",
+                "with recursive x (n) as (select 1)\n\nupdate t set a = 1",
+                // A clause that only continues a statement, never opens one.
+                "grant select on t to u\n\nwith grant option",
+            ] {
+                whole(sql, d);
+            }
+        }
+        // An options clause after a principal's or an object's header.
+        for sql in [
+            "CREATE LOGIN app\n\nWITH PASSWORD = 'S3cret!'",
+            "ALTER LOGIN sa\n\nWITH PASSWORD = 'x'",
+            "CREATE USER app\n\nWITH PASSWORD = 'x'",
+            "SELECT * FROM t\n\nWITH (NOLOCK)",
+            "ALTER DATABASE d SET SINGLE_USER\n\nWITH ROLLBACK IMMEDIATE",
+            "CREATE INDEX ix ON t (a)\n\nWITH (ONLINE = ON)",
+        ] {
+            whole(sql, SqlDialect::MsSql);
+        }
+        for sql in [
+            "create role r\n\nwith login password 'x'",
+            "alter role r\n\nwith password 'x'",
+            // Words a statement never ends on.
+            "create rule r as on delete to t do instead\n\ndelete from u",
+            "insert into t values (1) on conflict (id) do\n\nupdate set a = 1",
+            "declare c cursor for\n\nselect 1",
+        ] {
+            whole(sql, SqlDialect::Postgres);
+        }
+    }
+
+    /// The other half: a head whose statement is already there, or a
+    /// `DESC`/`EXPLAIN` of a table, or a `WITH` opening a CTE, still lets a
+    /// blank line end it.
+    #[test]
+    fn a_blank_line_still_cuts_after_a_governed_statement() {
+        let at = |sql: &str, needle: &str, d: SqlDialect| {
+            super::executable_at(sql, sql.find(needle).unwrap() + 1, d)
+                .unwrap()
+                .to_string()
+        };
+        let ms = SqlDialect::MsSql;
+        assert_eq!(
+            at("IF @x = 1 DELETE FROM a\n\nSELECT 1", "SELECT 1", ms),
+            "SELECT 1"
+        );
+        assert_eq!(
+            at(
+                "IF @x = 1\nBEGIN\n  DELETE FROM a\nEND\n\nSELECT 1",
+                "SELECT 1",
+                ms
+            ),
+            "SELECT 1"
+        );
+        // `IF EXISTS` naming an object is a clause, not control flow.
+        assert_eq!(
+            at("DROP TABLE IF EXISTS t\n\nSELECT 1", "SELECT 1", ms),
+            "SELECT 1"
+        );
+        // MySQL's and SQLite's `IF(c, a, b)` is a function.
+        for d in [SqlDialect::MySql, SqlDialect::Sqlite] {
+            assert_eq!(
+                at("select if(a, 1, 2) from t\n\nselect 2", "select 2", d),
+                "select 2"
+            );
+        }
+        for d in [
+            SqlDialect::MySql,
+            SqlDialect::Postgres,
+            SqlDialect::Sqlite,
+            SqlDialect::MsSql,
+        ] {
+            assert_eq!(
+                at("explain select 1\n\nselect 2", "select 2", d),
+                "select 2"
+            );
+            assert_eq!(at("desc users\n\nselect 2", "select 2", d), "select 2");
+            assert_eq!(
+                at(
+                    "with x as (select 1) select * from x\n\nwith y as (select 2) select * from y",
+                    "with y",
+                    d
+                ),
+                "with y as (select 2) select * from y"
+            );
+            assert_eq!(
+                at(
+                    "select 1\n\nwith recursive y (n) as materialized (select 2) select * from y",
+                    "with",
+                    d
+                ),
+                "with recursive y (n) as materialized (select 2) select * from y"
+            );
+            // A quoted name, where `"` quotes one (on MySQL it is a string).
+            if d.double_quote_is_ident() {
+                assert_eq!(
+                    at("select 1\n\nwith \"y\" as (select 2) select 3", "with", d),
+                    "with \"y\" as (select 2) select 3"
+                );
+            }
+        }
+        assert_eq!(
+            at(
+                "select 1\n\nWITH XMLNAMESPACES ('urn:x' AS x) SELECT 2",
+                "WITH",
+                ms
+            ),
+            "WITH XMLNAMESPACES ('urn:x' AS x) SELECT 2"
+        );
+    }
+
     /// **Run at the caret runs up to the caret's statement, never past it.**
     /// A `DECLARE` makes the rest of its batch one piece, and Run Current took
     /// that piece whole: Ctrl+Enter on a `SELECT` below a `DECLARE` ran the
@@ -8370,6 +8792,74 @@ mod tests {
         }
         assert!(!carries_credential("SELECT master_password FROM t"));
         assert!(!carries_credential("START TRANSACTION"));
+    }
+
+    /// **A principal's options clause cut off its header still holds the
+    /// password.** A blank line made `WITH PASSWORD = '…'` a piece of its own,
+    /// which names no principal, so no rule above recognised it and it went
+    /// to `history.json`. A `WITH` that opens no CTE is never a statement —
+    /// only a fragment of one — and one holding `PASSWORD` is judged as the
+    /// statement it came from would be.
+    #[test]
+    fn carries_credential_reads_an_options_clause_cut_from_its_statement() {
+        let ms = |s: &str| super::carries_credential(s, SqlDialect::MsSql);
+        assert!(ms("WITH PASSWORD = 'S3cret!'"));
+        assert!(ms("  WITH PASSWORD = N'x' , CHECK_POLICY = OFF"));
+        assert!(super::carries_credential("WITH LOGIN PASSWORD 'x'", PG));
+        assert!(super::carries_credential("with password 'x'", PG));
+        // A CTE reading a password column is a query like any other.
+        assert!(!ms(
+            "WITH x AS (SELECT password FROM dbo.accounts) SELECT * FROM x"
+        ));
+        assert!(!super::carries_credential(
+            "with recursive x (password) as (select 1) select password from x",
+            PG
+        ));
+    }
+
+    /// **The secret in a subscription's connection string, a federated
+    /// server's options and MariaDB's `PASSWORD()` is a credential too.** None
+    /// has the principal shape the rules above read: PostgreSQL's conninfo sits
+    /// in a string the tokens skip, a MySQL `SERVER` names no user, and
+    /// `PASSWORD('…')` hashes its argument the way `PWDENCRYPT` does. Each went
+    /// to `history.json`, and recall ghosted it in every tab on the connection.
+    #[test]
+    fn carries_credential_knows_subscriptions_servers_and_password_calls() {
+        for s in [
+            "CREATE SUBSCRIPTION s CONNECTION 'host=h dbname=d user=u password=S3cret' \
+             PUBLICATION p",
+            "ALTER SUBSCRIPTION s CONNECTION 'password=S3cret'",
+        ] {
+            assert!(super::carries_credential(s, PG), "{s}");
+        }
+        for s in [
+            "ALTER SERVER s OPTIONS (PASSWORD 'S3cret')",
+            "CREATE SERVER s FOREIGN DATA WRAPPER mysql OPTIONS (HOST 'h', DATABASE 'd', \
+             PASSWORD 'S3cret')",
+            "UPDATE mysql.user SET authentication_string = PASSWORD('S3cret') WHERE User = 'root'",
+            "SELECT PASSWORD('S3cret')",
+            "SELECT OLD_PASSWORD('S3cret')",
+            "SELECT password /* the hash */ ('S3cret')",
+        ] {
+            assert!(carries_credential(s), "{s}");
+        }
+        // A subscription or a server statement with no secret in it, and a
+        // column of that name, are recorded as before.
+        for s in [
+            "ALTER SUBSCRIPTION s DISABLE",
+            "ALTER SUBSCRIPTION s REFRESH PUBLICATION",
+            "DROP SUBSCRIPTION s",
+        ] {
+            assert!(!super::carries_credential(s, PG), "{s}");
+        }
+        for s in [
+            "ALTER SERVER s OPTIONS (HOST 'h')",
+            "SELECT password FROM users",
+            "INSERT INTO users (name, password) VALUES ('a', 'b')",
+            "SELECT old_password, password FROM users WHERE id IN (1)",
+        ] {
+            assert!(!carries_credential(s), "{s}");
+        }
     }
 
     /// **A client terminator glued to `END` is not a misspelled keyword.**
