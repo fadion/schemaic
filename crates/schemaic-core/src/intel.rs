@@ -5996,18 +5996,47 @@ impl Catalog {
     /// table is, so a reference to one is found and its columns are not
     /// judged. Introspection has not seen it; guessing its columns from the
     /// `CREATE` would be a second schema reader.
+    ///
+    /// **Under every spelling that reaches it** (S8.1-L1-01): `CREATE TABLE
+    /// dbo.t` is a bare `t` too, when `dbo` is the active database or one of
+    /// its namespaces, and a bare `CREATE TABLE t` is `company.t` and `dbo.t`
+    /// — every namespace, which is the side uncertainty takes. Keyed only as
+    /// written, the ordinary T-SQL `CREATE TABLE dbo.t` then `SELECT … FROM t`
+    /// was "Table not found".
+    ///
+    /// **And the introspected table of the same name is set aside**
+    /// (S8.1-L1-04): a script that drops and makes `t` again has the new
+    /// definition, so the old columns were judging its `INSERT` lists and
+    /// `SELECT`s with a false "Column not found". With the entry gone,
+    /// [`Catalog::columns_of`] answers `None` — "can't judge".
     pub fn with_created(&self, created: &[(Option<String>, String)]) -> Catalog {
         let mut c = self.clone();
         for (q, name) in created {
             let name = name.to_ascii_lowercase();
-            match q {
+            let q = q.as_deref().map(str::to_ascii_lowercase);
+            let home =
+                |q: &str| self.active_db.as_deref() == Some(q) || self.known_schemas.contains(q);
+            let mut quals: Vec<String> = Vec::new();
+            let bare = match &q {
                 Some(q) => {
-                    c.opaque_qualified
-                        .insert((q.to_ascii_lowercase(), name.clone()));
+                    quals.push(q.clone());
+                    home(q)
                 }
                 None => {
-                    c.opaque_unqualified.insert(name.clone());
+                    quals.extend(self.active_db.iter().cloned());
+                    quals.extend(self.known_schemas.iter().cloned());
+                    true
                 }
+            };
+            for q in quals {
+                let key = (q, name.clone());
+                c.qualified.remove(&key);
+                c.schema_qualified.remove(&key);
+                c.opaque_qualified.insert(key);
+            }
+            if bare {
+                c.unqualified.remove(&name);
+                c.opaque_unqualified.insert(name.clone());
             }
             c.known_idents.insert(name);
         }
@@ -17472,18 +17501,13 @@ pub fn local_relations(sql: &str, lo: usize, hi: usize, dialect: SqlDialect) -> 
 /// TABLE`, `CREATE [OR REPLACE] VIEW`, and a `SELECT … INTO t` that makes a
 /// table (SQL Server's and PostgreSQL's; MySQL's `INTO` fills variables) —
 /// each as `(qualifier, name)`, quotes off. Statement by statement, each
-/// parsed alone, and only one that holds `CREATE` or `INTO` at all.
+/// parsed alone, and only one that could make one ([`may_create_a_table`]).
 ///
 /// Order is not asked: a reference above the `CREATE` is quiet too. Being
 /// quiet about a script's own table is the safe direction for an offline
 /// check; the server still says what it thinks when the script runs.
 pub fn created_tables(sql: &str, dialect: SqlDialect) -> Vec<(Option<String>, String)> {
     use sqlparser::ast::{SetExpr, Statement};
-    let mentions = |t: &str, w: &str| {
-        t.as_bytes()
-            .windows(w.len())
-            .any(|x| x.eq_ignore_ascii_case(w.as_bytes()))
-    };
     let split = |n: &sqlparser::ast::ObjectName| -> Option<(Option<String>, String)> {
         let parts = object_name_parts(n);
         let (name, rest) = parts.split_last()?;
@@ -17496,7 +17520,7 @@ pub fn created_tables(sql: &str, dialect: SqlDialect) -> Vec<(Option<String>, St
     let mut out = Vec::new();
     for (lo, hi) in crate::sql::statement_ranges(sql, dialect) {
         let text = &sql[lo..hi];
-        if !mentions(text, "CREATE") && !(into_makes_a_table && mentions(text, "INTO")) {
+        if !may_create_a_table(text, into_makes_a_table) {
             continue;
         }
         let Ok(asts) = parse_statements(text, dialect) else {
@@ -17516,6 +17540,43 @@ pub fn created_tables(sql: &str, dialect: SqlDialect) -> Vec<(Option<String>, St
         }
     }
     out
+}
+
+/// Could the statements in `text` make a table — is the **word** `CREATE`
+/// there, or (where `into_makes_a_table`) an `INTO` that does not follow
+/// `INSERT` or `MERGE`? [`created_tables`]' prefilter: a statement it passes
+/// is parsed, on every diagnostics pass. It was a substring test, so every
+/// `created_at` column and, on PostgreSQL and SQL Server, every `INSERT INTO`
+/// was parsed — three quarters of a warm pass over an INSERT script
+/// (S8.1-L4-01). It may pass what makes nothing (a comment, a string), which
+/// costs a parse; it must never refuse what does.
+fn may_create_a_table(text: &str, into_makes_a_table: bool) -> bool {
+    let b = text.as_bytes();
+    // Each whole word `w` (case-folded), as the byte where it starts.
+    let words = |w: &'static str| {
+        let n = w.len();
+        (0..b.len().saturating_sub(n - 1)).filter(move |&i| {
+            b[i..i + n].eq_ignore_ascii_case(w.as_bytes())
+                && (i == 0 || !is_word_byte(b[i - 1]))
+                && b.get(i + n).is_none_or(|&c| !is_word_byte(c))
+        })
+    };
+    // The word that ends just before byte `i`, past whitespace.
+    let word_before = |i: usize| {
+        let end = b[..i].iter().rposition(|c| !c.is_ascii_whitespace())? + 1;
+        let start = b[..end]
+            .iter()
+            .rposition(|&c| !is_word_byte(c))
+            .map_or(0, |p| p + 1);
+        Some(&b[start..end])
+    };
+    words("CREATE").next().is_some()
+        || (into_makes_a_table
+            && words("INTO").any(|i| {
+                !word_before(i).is_some_and(|w| {
+                    w.eq_ignore_ascii_case(b"INSERT") || w.eq_ignore_ascii_case(b"MERGE")
+                })
+            }))
 }
 
 /// The temporary tables the document `sql` makes — `CREATE TABLE #work (…)`,
@@ -31109,6 +31170,123 @@ mod tests {
         }
         let sql = "SELECT id INTO archive FROM employees;\nSELECT * FROM archive;";
         assert!(not_found(sql, SqlDialect::MsSql).is_empty());
+    }
+
+    /// A creation is found under every spelling that reaches it: `CREATE
+    /// TABLE dbo.t` then a bare `t`, and the other way round — the ordinary
+    /// way to write T-SQL (S8.1-L1-01).
+    #[test]
+    fn a_created_table_is_found_qualified_or_bare() {
+        let tables = |d: SqlDialect, sql: &str| -> Vec<String> {
+            let ns = match d {
+                SqlDialect::MsSql => "dbo",
+                _ => "public",
+            };
+            let schema = DbSchema {
+                tables: vec![tbl_in(ns, "employees", &["id", "name"])],
+                ..Default::default()
+            };
+            let cat = Catalog::build(&[("company", &schema)], Some("company"));
+            diagnostics(sql, &cat, d)
+                .into_iter()
+                .filter(|x| x.message.starts_with("Table"))
+                .map(|x| x.message)
+                .collect()
+        };
+        let ms = SqlDialect::MsSql;
+        let pg = SqlDialect::Postgres;
+        for (d, sql) in [
+            (
+                ms,
+                "CREATE TABLE dbo.staging (id int);\nINSERT INTO staging VALUES (1);\nSELECT * FROM staging;",
+            ),
+            (
+                ms,
+                "CREATE TABLE staging (id int);\nSELECT * FROM dbo.staging;",
+            ),
+            (
+                pg,
+                "CREATE TABLE public.staging (id int);\nSELECT * FROM staging;",
+            ),
+            (
+                pg,
+                "CREATE TABLE staging (id int);\nSELECT * FROM public.staging;",
+            ),
+        ] {
+            assert!(
+                tables(d, sql).is_empty(),
+                "{d:?} {sql}: {:?}",
+                tables(d, sql)
+            );
+        }
+        let (schema, db) = sample_catalog();
+        let cat = Catalog::build(&[(db, &schema)], Some(db));
+        let sql = "CREATE TABLE company.staging (id int);\nSELECT * FROM staging;";
+        assert!(diagnostics(sql, &cat, SqlDialect::MySql).is_empty());
+        // Made in another database, a bare name still does not reach it.
+        let sql = "CREATE TABLE elsewhere.staging (id int);\nSELECT * FROM staging;";
+        assert_eq!(diagnostics(sql, &cat, SqlDialect::MySql).len(), 1);
+    }
+
+    /// A table the script drops and makes again is the script's, not the
+    /// catalogue's: its columns are not judged by the introspected definition
+    /// (S8.1-L1-04, S8.2-L1-02).
+    #[test]
+    fn a_recreated_table_is_not_judged_by_its_old_columns() {
+        for d in [
+            SqlDialect::MySql,
+            SqlDialect::Postgres,
+            SqlDialect::MsSql,
+            SqlDialect::Sqlite,
+        ] {
+            let sql = "DROP TABLE employees;\nCREATE TABLE employees (id int, nickname int);\n\
+                       INSERT INTO employees (id, nickname) VALUES (1, 2);\n\
+                       INSERT INTO employees VALUES (1, 2);\n\
+                       UPDATE employees SET nickname = 0 WHERE nickname = 1;\n\
+                       SELECT nickname, employees.nickname FROM employees;";
+            let found = diag_d(sql, d);
+            assert!(found.is_empty(), "{d:?}: {found:?}");
+        }
+        // A table the script does not make is still judged.
+        let found = diag_d(
+            "CREATE TABLE staging (id int);\nSELECT nickname FROM employees;",
+            SqlDialect::MySql,
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+    }
+
+    /// The statements `created_tables` parses are the ones that could make a
+    /// table — not every `created_at` and every `INSERT INTO` (S8.1-L4-01).
+    #[test]
+    fn only_a_statement_that_could_make_a_table_is_parsed_for_one() {
+        for into in [false, true] {
+            assert!(!may_create_a_table(
+                "INSERT INTO t (id, created_at) VALUES (1, now())",
+                into
+            ));
+            assert!(!may_create_a_table(
+                "insert\n  into t select created_by from s",
+                into
+            ));
+            assert!(!may_create_a_table("MERGE INTO t USING s ON 1 = 1", into));
+            assert!(may_create_a_table("create table t (id int)", into));
+            assert!(may_create_a_table(
+                "/*x*/CREATE OR REPLACE VIEW v AS SELECT 1",
+                into
+            ));
+        }
+        assert!(may_create_a_table("SELECT id INTO archive FROM t", true));
+        assert!(!may_create_a_table("SELECT id INTO @v FROM t", false));
+        // A doubtful one is parsed: that costs a parse, never a creation.
+        assert!(may_create_a_table("INSERT TOP (5) INTO t SELECT 1", true));
+        // The prefilter is not what decides — the parse is.
+        assert_eq!(
+            created_tables(
+                "INSERT INTO t (created_at) VALUES (1);\nSELECT 1 INTO made FROM t;",
+                SqlDialect::Postgres
+            ),
+            [(None, "made".to_string())]
+        );
     }
 
     #[test]

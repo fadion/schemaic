@@ -1592,7 +1592,18 @@ existing prose was left alone.
     with each one found and its columns unjudged, rather than reading columns out of the
     `CREATE`, which would be a second schema reader. Order is not asked, so a reference above the
     `CREATE` is quiet too, the safe direction (`a_table_the_script_creates_is_not_reported_missing`,
-    red before). By the same rule a resolved
+    red before). A creation is registered **under every spelling that reaches it** — `CREATE TABLE
+    dbo.t` as a bare `t` too when `dbo` is the active database or one of its namespaces, and a bare
+    `CREATE TABLE t` under the active database and every namespace — since keyed only as written,
+    T-SQL's ordinary `CREATE TABLE dbo.t` then `FROM t` was "Table not found"
+    (`a_created_table_is_found_qualified_or_bare`, S8.1-L1-01, red before). And **the introspected
+    table of the same name is taken out of the column maps**, so a script that drops and makes
+    `employees` again is not judged by the old columns: `columns_of` reaches only the maps, so the
+    opaque entry alone left every new column "not found" (`a_recreated_table_is_not_judged_by_its_old_columns`,
+    S8.1-L1-04, red before). `created_tables` parses only a statement that could make a table —
+    the *word* `CREATE`, or an `INTO` not after `INSERT`/`MERGE` (`may_create_a_table`); a
+    substring test parsed every `created_at` and every `INSERT INTO`, three quarters of a warm
+    cache pass (S8.1-L4-01). By the same rule a resolved
     synonym's columns are **merged** into a same-named table's `(database, name)` and bare-name
     entries, never written over them, since `dbo.orders` replacing `sales.orders`' entry made the
     correct `SELECT total FROM hist.sales.orders` a "Column not found"
