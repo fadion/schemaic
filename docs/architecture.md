@@ -24472,14 +24472,22 @@ existing prose was left alone.
     **Typing into a ghost leaves the rest of it** (`typed_through`) — the fish shell's and the code
     editors' rule. A ghost used to vanish at the first letter, the caret no longer being at its
     offset and neither predictor answering mid-word, and came back only after the next space.
-    `typed_through(g, caret, doc_len, typed)` answers the rest only when the edit was exactly the
+    `typed_through(g, caret, rope)` answers the rest only when the edit was exactly the
     ghost's next characters typed at it: the caret ahead of `g.offset` by k > 0 bytes, the document
     grown by exactly k since the ghost was published, the text between equal to `g.text[..k]`, and
     something left over. **The comparison is exact, case included** — Tab would write the ghost's
     own text, so a `b` typed at a `BY ` ghost is not a step towards it — and a k that splits one of
     the ghost's characters answers `None`, as does a caret that moved without the document growing
     by as much (`typing_into_a_ghost_leaves_the_rest_of_it`, red against a stub returning `None`;
-    `anything_but_the_ghosts_own_letters_drops_it`).
+    `anything_but_the_ghosts_own_letters_drops_it`). **It takes the rope, not the typed text, and
+    every check that can refuse — the length, and both `g.offset` and the caret on a codepoint
+    boundary — comes before it slices.** The cursor effect used to slice `g.offset..caret` itself
+    and hand over the result, and an edit *elsewhere* that grew the text by as many bytes as the
+    caret moved — Ctrl+/ putting `-- ` before the line, Format Code — left `g.offset` inside a
+    multi-byte character: xi-rope panics on such a cut, and this was the UI thread, a High release
+    blocker (`an_edit_elsewhere_that_splits_a_character_drops_the_ghost_without_slicing`, red
+    before with xi-rope's own panic). Hoisting
+    the slice back into the caller, or putting it ahead of the boundary checks, brings it back.
     **Only a reasoned ghost takes the empty word's place** (`ghost_displaces_the_list`). With the
     word at the caret empty and an `intel::predict` ghost showing, the popup does not open: that is
     a slot the list opens on its own guesses — `auto_show`'s columns after
@@ -25243,8 +25251,9 @@ existing prose was left alone.
     second caret is added — so after a click elsewhere Tab indents again; an edit moves the caret
     too, and the recompute it schedules asks again for the new spot — or keeps the `kept` rest
     Ctrl+→ left there (under `completion.rs`). **Except a move that typed the ghost's own next
-    letters**: before clearing, the effect reads the rope between the ghost's offset and the new
-    caret and asks `completion::typed_through`, and where that answers it publishes the rest at
+    letters**: before clearing, the effect hands the rope and the new caret to
+    `completion::typed_through` — and slices nothing itself, since the offset may no longer fall on
+    a character (under `completion.rs`) — and where that answers it publishes the rest at
     the new caret through `ghost_at` as a `kept` ghost, `remembered` carried on — which the
     recompute the keystroke schedules then keeps (`keeps_ghost`) instead of asking mid-word, where
     neither predictor answers. It fires on the cursor change and reads the document untracked, so
@@ -25402,7 +25411,16 @@ existing prose was left alone.
     clause and a hint would sit between the two
     (`a_hint_follows_a_prediction_only_at_the_end_of_its_line`). **It is display only**: Tab, →
     and Ctrl+→ take `EditorGhost.text` and never the hint, and `EditorGhost` does not carry it —
-    `ghost_on` derives it per relayout from `remembered` and the line. It is not drawn while a Ctrl+K view
+    `ghost_on` derives it per relayout from `remembered` and the line.
+    **A ghost's `(line, col)` are stale during the edit's own relayout**, so `ghost_on` draws
+    nothing where the line has no character boundary at `col`, past its end included.
+    `Document::edit` lays the lines out again synchronously, inside the edit, before the caret moves
+    and before the effect that drops a stale ghost can run — so for that one layout the coordinates
+    describe the old text. Alt+↓ swapping a `-- 注释…` line in under a `BY ` ghost at column 22 put
+    the column inside a CJK character, and floem's layout (`VisualLinesRelative` →
+    `slice_to_cow`) panicked on the UI thread — reproduced in the running app, and the fix verified
+    there (`a_ghost_whose_column_now_falls_inside_a_character_is_not_drawn`, red before).
+    It is not drawn while a Ctrl+K view
     is up in either state, nor when its text holds a `\n` — and `has_multiline_phantom` does not
     consult the ghost, so that refusal is what keeps its answer true. **The refusal is
     `shown_ghost(ghost, preview_up)`, and the keys ask it too**: `ghost_on` draws by it, and the

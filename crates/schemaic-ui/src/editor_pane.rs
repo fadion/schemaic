@@ -4374,11 +4374,8 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             }
             let rope = ed_ghost.doc().text();
             let shifted = caret
-                .filter(|&c| c > g.offset && c <= rope.len())
                 .and_then(|c| {
-                    let typed = rope.slice_to_cow(g.offset..c);
-                    crate::completion::typed_through(&g, c, rope.len(), &typed)
-                        .map(|rest| (c, rest.to_string()))
+                    crate::completion::typed_through(&g, c, &rope).map(|rest| (c, rest.to_string()))
                 })
                 .map(|(c, rest)| {
                     crate::completion::ghost_at(&ed_ghost, c, rest, true, g.remembered)

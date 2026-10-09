@@ -514,7 +514,16 @@ impl InlineDiffDoc {
         })?;
         let rope = self.inner.rope_text();
         let content = rope.line_content(line);
-        let hint = ghost_hint(remembered, content.get(col..).unwrap_or(""));
+        // **Only where the line still has a character boundary at `col`.** An
+        // edit lays the lines out again inside `Document::edit`, before the
+        // caret moves and the effect that drops a stale ghost can run — so for
+        // that one layout the ghost's `(line, col)` describe the old text.
+        // Alt+↓ swapping a CJK line in under it put `col` inside a character,
+        // and floem slicing the line there panicked on the UI thread.
+        if !content.is_char_boundary(col) {
+            return None;
+        }
+        let hint = ghost_hint(remembered, &content[col..]);
         Some((col, text, hint))
     }
 }
@@ -777,6 +786,39 @@ mod tests {
         assert_eq!(shown_ghost(Some(&by), true), None);
         assert_eq!(shown_ghost(Some(&ghost("a\nb")), false), None);
         assert_eq!(shown_ghost(None, false), None);
+    }
+
+    /// The layout an edit runs before the caret moves still sees the ghost's
+    /// old `(line, col)`. Where that column is no longer on a character
+    /// boundary — Alt+↓ swapped `-- 注释…` in under a ghost at column 22 —
+    /// there is no ghost to draw, rather than a column floem slices the line
+    /// at and panics. Asked through the doc floem asks, not a helper beside it.
+    #[test]
+    fn a_ghost_whose_column_now_falls_inside_a_character_is_not_drawn() {
+        let cx = floem::reactive::Scope::new();
+        let swapped = "-- 注释注释注释注释注释注释\nSELECT * FROM t ORDER ";
+        let inner = floem::views::editor::text_document::TextDocument::new(cx, swapped);
+        let ghost_sig = cx.create_rw_signal(Some(EditorGhost {
+            offset: 22,
+            line: 0,
+            col: 22,
+            doc_len: swapped.len(),
+            ..ghost("BY ")
+        }));
+        let doc = InlineDiffDoc::new(
+            Rc::new(inner),
+            cx.create_rw_signal(None),
+            ghost_sig,
+            SqlDialect::MySql,
+        );
+        assert_eq!(doc.ghost_on(0), None);
+
+        // On a boundary it is drawn as before.
+        ghost_sig.update(|g| g.as_mut().unwrap().col = 21);
+        assert_eq!(doc.ghost_on(0).map(|(col, ..)| col), Some(21));
+        // And past the line's end there is nothing to draw either.
+        ghost_sig.update(|g| g.as_mut().unwrap().col = 200);
+        assert_eq!(doc.ghost_on(0), None);
     }
 
     fn plan(hunks: Vec<InlineHunk>) -> InlineView {

@@ -1072,9 +1072,8 @@ fn ghost_displaces_the_list(ghost: Option<&crate::inline_diff::EditorGhost>, pre
     ghost.is_some_and(|g| g.kept || (prefix.is_empty() && !g.remembered))
 }
 
-/// The rest of `g` once the user has typed its first characters: `typed` is
-/// the document's text from the ghost's offset to the `caret`, now `doc_len`
-/// bytes long. `None` unless that edit was exactly those characters typed at
+/// The rest of `g` once the user has typed its first characters, the caret
+/// now at `caret` in `rope`. `None` unless that edit was exactly those characters typed at
 /// the ghost — the caret ahead of it by as many bytes as the document grew,
 /// and the text there the ghost's own — or the ghost is used up.
 ///
@@ -1084,11 +1083,17 @@ fn ghost_displaces_the_list(ghost: Option<&crate::inline_diff::EditorGhost>, pre
 pub(crate) fn typed_through<'g>(
     g: &'g crate::inline_diff::EditorGhost,
     caret: usize,
-    doc_len: usize,
-    typed: &str,
+    rope: &floem::views::editor::core::xi_rope::Rope,
 ) -> Option<&'g str> {
     let k = caret.checked_sub(g.offset).filter(|&k| k > 0)?;
-    if doc_len != g.doc_len + k || g.text.get(..k)? != typed {
+    // Every check that can refuse comes before the slice: an edit elsewhere
+    // that grew the text by `k` (Ctrl+/, Alt+↓) can leave either end inside a
+    // character, and xi-rope panics on such a cut.
+    if rope.len() != g.doc_len + k
+        || !rope.is_codepoint_boundary(g.offset)
+        || !rope.is_codepoint_boundary(caret)
+        || g.text.get(..k)? != rope.slice_to_cow(g.offset..caret)
+    {
         return None;
     }
     let rest = &g.text[k..];
@@ -2173,6 +2178,7 @@ mod recall_order_tests {
 mod kept_ghost_tests {
     use super::{keeps_ghost, typed_through};
     use crate::inline_diff::EditorGhost;
+    use floem::views::editor::core::xi_rope::Rope;
 
     /// A ghost at `offset`, kept at document length `kept` when that is given.
     fn ghost(offset: usize, kept: Option<usize>) -> EditorGhost {
@@ -2196,14 +2202,20 @@ mod kept_ghost_tests {
         }
     }
 
+    /// A `len`-byte document holding `typed` at the fresh ghost's offset, 20.
+    fn doc(len: usize, typed: &str) -> Rope {
+        let pad = len.saturating_sub(20 + typed.len());
+        Rope::from(format!("{}{typed}{}", "a".repeat(20), "a".repeat(pad)))
+    }
+
     /// Typing the ghost's next letters leaves the rest of it — however many
     /// were typed at once, and a character outside ASCII whole.
     #[test]
     fn typing_into_a_ghost_leaves_the_rest_of_it() {
-        assert_eq!(typed_through(&fresh("BY "), 21, 41, "B"), Some("Y "));
-        assert_eq!(typed_through(&fresh("BY "), 22, 42, "BY"), Some(" "));
+        assert_eq!(typed_through(&fresh("BY "), 21, &doc(41, "B")), Some("Y "));
+        assert_eq!(typed_through(&fresh("BY "), 22, &doc(42, "BY")), Some(" "));
         assert_eq!(
-            typed_through(&fresh("名前, x"), 23, 43, "名"),
+            typed_through(&fresh("名前, x"), 23, &doc(43, "名")),
             Some("前, x")
         );
     }
@@ -2213,13 +2225,37 @@ mod kept_ghost_tests {
     /// end, or a caret behind it leave nothing to keep.
     #[test]
     fn anything_but_the_ghosts_own_letters_drops_it() {
-        assert_eq!(typed_through(&fresh("BY "), 21, 41, "b"), None);
-        assert_eq!(typed_through(&fresh("BY "), 21, 41, "X"), None);
-        assert_eq!(typed_through(&fresh("BY "), 21, 40, "B"), None);
-        assert_eq!(typed_through(&fresh("BY "), 23, 43, "BY "), None);
-        assert_eq!(typed_through(&fresh("BY "), 20, 40, ""), None);
-        assert_eq!(typed_through(&fresh("BY "), 19, 39, ""), None);
-        assert_eq!(typed_through(&fresh("名前"), 21, 41, "\u{FFFD}"), None);
+        assert_eq!(typed_through(&fresh("BY "), 21, &doc(41, "b")), None);
+        assert_eq!(typed_through(&fresh("BY "), 21, &doc(41, "X")), None);
+        assert_eq!(typed_through(&fresh("BY "), 21, &doc(40, "B")), None);
+        assert_eq!(typed_through(&fresh("BY "), 23, &doc(43, "BY ")), None);
+        assert_eq!(typed_through(&fresh("BY "), 20, &doc(40, "")), None);
+        assert_eq!(typed_through(&fresh("BY "), 19, &doc(39, "")), None);
+    }
+
+    /// An edit that grew the text by as many bytes as the caret moved, but
+    /// not at the ghost — Ctrl+/ puts `-- ` before the line, Alt+↓ swaps a
+    /// line in under it — can leave the ghost's offset, or the caret, inside a
+    /// character. That is not typing into it, and must not slice the text
+    /// there: xi-rope panics on a cut inside a character, and this runs on
+    /// the UI thread.
+    #[test]
+    fn an_edit_elsewhere_that_splits_a_character_drops_the_ghost_without_slicing() {
+        let line = "SELECT * FROM t WHERE name = 'Zoë' ";
+        let at_end = EditorGhost {
+            offset: line.len(),
+            col: line.len(),
+            doc_len: line.len(),
+            text: "ORDER BY id".to_string(),
+            ..fresh("")
+        };
+        let commented = Rope::from(format!("-- {line}"));
+        assert_eq!(typed_through(&at_end, line.len() + 3, &commented), None);
+
+        // The caret inside a character: a ghost of 名前 with one byte typed.
+        assert_eq!(typed_through(&fresh("名前"), 21, &doc(41, "名")), None);
+        // A caret past the end of the text.
+        assert_eq!(typed_through(&fresh("BY "), 45, &doc(41, "B")), None);
     }
 
     /// The recompute a Ctrl+→ schedules keeps the rest it left.
