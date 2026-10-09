@@ -105,6 +105,10 @@ pub(crate) struct Completion {
     /// The buffer's statement boundaries ([`stmt_index`]), which signature
     /// help and the run outline read on every caret move.
     pub(crate) stmts: StmtIndex,
+    /// The document's temporary tables as of a text revision
+    /// ([`intel::TempTableCache`]), read by a column slot naming a `#` table
+    /// on every keystroke — see [`temp_table_relations`].
+    pub(crate) temps: RwSignal<intel::TempTableCache>,
     /// The tab's text, as the editor's last edit left it — borrowed by what
     /// runs per keystroke and caret move rather than copied out of the
     /// document each time.
@@ -161,6 +165,34 @@ pub(crate) fn stmt_index(comp: Completion, sql: &str, dialect: SqlDialect) -> Rc
     });
     comp.stmts.set(Some((rev, dialect, next.clone())));
     next
+}
+
+/// [`intel::temp_table_relations`] of `sql`, the pane's text, for a statement
+/// at `caret`: the document's definitions are read once per text revision
+/// ([`Completion::temps`]), from the pane's statement index rather than a
+/// fresh walk, and only the caret's fold runs per keystroke (S5-L4-01).
+fn temp_table_relations(
+    comp: Completion,
+    sql: &str,
+    caret: usize,
+    dialect: SqlDialect,
+) -> Vec<intel::LocalRelation> {
+    if !dialect.prefixed_names() {
+        return Vec::new();
+    }
+    let rev = comp.edits.with_untracked(schemaic_core::text::EditLog::rev);
+    // Held already at this revision — the caller has just read its writing
+    // range from it — and taken here so no signal is written inside another's
+    // update.
+    let index = stmt_index(comp, sql, dialect);
+    comp.temps
+        .try_update(|cache| {
+            let defs = cache.get_or_compute(rev, dialect, sql.len(), || {
+                intel::temp_table_definitions(sql, index.statement_ranges(sql), dialect)
+            });
+            intel::temp_table_columns_at(defs, caret)
+        })
+        .unwrap_or_default()
 }
 
 /// The ranking vocabulary, which lives in `core::rank` — see that module for why
@@ -1351,7 +1383,7 @@ fn recompute_completions_in(
     if matches!(ctx, ClauseCtx::Column | ClauseCtx::Qualified(_))
         && scope.iter().any(|t| t.name.starts_with('#'))
     {
-        relations.extend(intel::temp_table_relations(text, offset, dialect));
+        relations.extend(temp_table_relations(comp, text, offset, dialect));
     }
     for r in relations.iter().filter(|r| r.derived) {
         let named = |t: &intel::TableRef| {

@@ -14086,7 +14086,17 @@ existing prose was left alone.
       statement meets, and not its first
       (`a_remade_temp_table_has_its_latest_columns_before_the_caret`). The caller
       reads them only when the scope names a `#` table, since the reading parses every
-      statement that makes one.
+      statement that makes one — and once that was so it still parsed them on every keystroke
+      and every caret move in such a slot, though only an edit can change the answer. So
+      `temp_table_relations` is now two halves composed: `temp_table_definitions(sql, ranges,
+      dialect)`, the parse, which knows no caret and returns every `TempTableDef` (name, columns,
+      the byte its statement starts at) with each remaking kept; and `temp_table_columns_at(defs,
+      caret)`, the cheap fold that picks a remade table's definition for the caret. The editor
+      keeps the first in an `intel::TempTableCache`, keyed like `stmt_index` on the text revision,
+      the dialect and the text's length, and cuts the statements from the pane's `StatementIndex`
+      rather than a fresh walk — so only an edit pays the parse
+      (`the_temp_table_cache_reads_a_text_once`,
+      `temp_tables_from_the_index_ranges_answer_what_the_walk_does`).
       **A CTE's and a derived table's columns are offered as a table's are**, from
       `LocalNames::relations`: `cols_of` asks them first for a bare name, since a CTE shadows a
       table it is named after, and the schema otherwise. The caller reads them with
@@ -24347,6 +24357,12 @@ existing prose was left alone.
     `Recall` through their `_indexed` forms, and the own tab's ranges for `Recall::from_ranges`),
     and the run outline's effect in `editor_pane.rs` — so the walk each made becomes a search, and
     a keystroke rescans about its own statement (the costs under `sql.rs`).
+    **`Completion::temps` sits beside it**, an `intel::TempTableCache` holding the document's
+    temporary-table definitions under the same revision, dialect and length. On a miss the
+    statements come from `stmt_index(...).statement_ranges`, which the caller has just taken
+    forward to this revision for its writing range, and the cache is updated with `try_update`
+    with the index already in hand, so no signal is written inside another's update. A caret move
+    or a re-rank in a `#` table's column slot is the fold alone (the split is under `rank.rs`).
     **`index::build` had no test of its own**, which is the other thing to know about it: it is a
     pure function over a slice — no signal, no `Editor`, nothing that needs a mounted view — while
     the hidden-database rule it enforces was pinned only for the *catalogue* half (`catalog_tests`),

@@ -2908,6 +2908,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         accepted,
         conn: active_conn,
         stmts: RwSignal::new(None),
+        temps: RwSignal::new(Default::default()),
         query,
         edits: RwSignal::new(schemaic_core::text::EditLog::default()),
     };

@@ -18265,7 +18265,41 @@ fn may_create_a_table(text: &str, into_makes_a_table: bool) -> bool {
 /// statement that made it. A name made more than once (dropped and made
 /// again) has the columns of its last definition in a statement starting
 /// before `caret` — the one the caret's statement meets — else its first.
+///
+/// The composition of [`temp_table_definitions`] (the parse, which knows no
+/// caret) and [`temp_table_columns_at`] (the fold, which does) — split so the editor
+/// can keep the first per text revision ([`TempTableCache`]) and run only the
+/// second per keystroke.
 pub fn temp_table_relations(sql: &str, caret: usize, dialect: SqlDialect) -> Vec<LocalRelation> {
+    if !dialect.prefixed_names() || !sql.contains('#') {
+        return Vec::new();
+    }
+    let defs = temp_table_definitions(sql, crate::sql::statement_ranges(sql, dialect), dialect);
+    temp_table_columns_at(&defs, caret)
+}
+
+/// One temporary table made in a document: its name with its sigil, its
+/// columns, and where the statement making it starts — what
+/// [`temp_table_columns_at`] needs to pick a remade table's definition for a caret.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TempTableDef {
+    pub name: String,
+    pub columns: Vec<String>,
+    /// The byte the making statement starts at.
+    pub at: usize,
+}
+
+/// Every temporary table `sql` makes, in document order and with every
+/// remaking kept, read from the statements `ranges` cuts it into (the
+/// document's [`crate::sql::statement_ranges`], or a
+/// [`crate::sql::StatementIndex`]'s, which needs no walk). Each `#`-holding
+/// statement is parsed alone; no caret is involved, so the answer holds for
+/// as long as the text does. Empty on an engine with no `#` tables.
+pub fn temp_table_definitions(
+    sql: &str,
+    ranges: impl IntoIterator<Item = (usize, usize)>,
+    dialect: SqlDialect,
+) -> Vec<TempTableDef> {
     use sqlparser::ast::{SetExpr, Statement};
     if !dialect.prefixed_names() || !sql.contains('#') {
         return Vec::new();
@@ -18276,9 +18310,11 @@ pub fn temp_table_relations(sql: &str, caret: usize, dialect: SqlDialect) -> Vec
             .map(|i| i.value.clone())
             .filter(|v| v.starts_with('#'))
     };
-    let mut out: Vec<LocalRelation> = Vec::new();
-    for (lo, hi) in crate::sql::statement_ranges(sql, dialect) {
-        let text = &sql[lo..hi];
+    let mut out = Vec::new();
+    for (lo, hi) in ranges {
+        let Some(text) = sql.get(lo..hi) else {
+            continue;
+        };
         if !text.contains('#') {
             continue;
         }
@@ -18305,20 +18341,68 @@ pub fn temp_table_relations(sql: &str, caret: usize, dialect: SqlDialect) -> Vec
             if columns.is_empty() {
                 continue;
             }
-            match out.iter_mut().find(|r| r.name.eq_ignore_ascii_case(&name)) {
-                // Made again before the caret: that later definition is the
-                // one the caret's statement meets.
-                Some(r) if lo < caret => r.columns = columns,
-                Some(_) => {}
-                None => out.push(LocalRelation {
-                    name,
-                    columns,
-                    derived: false,
-                }),
-            }
+            out.push(TempTableDef {
+                name,
+                columns,
+                at: lo,
+            });
         }
     }
     out
+}
+
+/// The temporary tables `defs` ([`temp_table_definitions`]) hold for a
+/// statement at `caret`: one per name, first-made order, and a name made
+/// more than once has the columns of its last definition starting before
+/// `caret`, else its first.
+pub fn temp_table_columns_at(defs: &[TempTableDef], caret: usize) -> Vec<LocalRelation> {
+    let mut out: Vec<LocalRelation> = Vec::new();
+    for d in defs {
+        match out
+            .iter_mut()
+            .find(|r| r.name.eq_ignore_ascii_case(&d.name))
+        {
+            // Made again before the caret: that later definition is the
+            // one the caret's statement meets.
+            Some(r) if d.at < caret => r.columns.clone_from(&d.columns),
+            Some(_) => {}
+            None => out.push(LocalRelation {
+                name: d.name.clone(),
+                columns: d.columns.clone(),
+                derived: false,
+            }),
+        }
+    }
+    out
+}
+
+/// [`temp_table_definitions`] kept for one text: the editor's revision
+/// ([`crate::text::EditLog::rev`]), the dialect and the text's length it was
+/// read for. A column slot naming a `#` table asks on every keystroke, and
+/// the reading parses every statement that makes one (S5-L4-01); the caret
+/// moving or the popup re-ranking changes none of the key, so only an edit
+/// pays for it again.
+#[derive(Debug, Default)]
+pub struct TempTableCache {
+    held: Option<((u64, SqlDialect, usize), Vec<TempTableDef>)>,
+}
+
+impl TempTableCache {
+    /// The definitions held for `(rev, dialect, len)`, else `read`'s, which
+    /// are kept in their place.
+    pub fn get_or_compute(
+        &mut self,
+        rev: u64,
+        dialect: SqlDialect,
+        len: usize,
+        read: impl FnOnce() -> Vec<TempTableDef>,
+    ) -> &[TempTableDef] {
+        let key = (rev, dialect, len);
+        if self.held.as_ref().is_none_or(|(k, _)| *k != key) {
+            self.held = Some((key, read()));
+        }
+        &self.held.as_ref().expect("held or just set").1
+    }
 }
 
 /// The output names of `q`'s leftmost select list, in order — see
@@ -32508,6 +32592,69 @@ mod tests {
             cols("SELECT | FROM #t;\nCREATE TABLE #t (c int);"),
             [v(&["c"])]
         );
+    }
+
+    /// The temp-table cache reads a text once: the same revision, dialect and
+    /// length answer from what is held, whatever the caret, and any one of
+    /// the three changing reads again (S5-L4-01).
+    #[test]
+    fn the_temp_table_cache_reads_a_text_once() {
+        use std::cell::Cell;
+        let sql = "CREATE TABLE #t (a int);\nSELECT  FROM #t;";
+        let ms = SqlDialect::MsSql;
+        let reads = Cell::new(0);
+        let read = || {
+            reads.set(reads.get() + 1);
+            temp_table_definitions(sql, crate::sql::statement_ranges(sql, ms), ms)
+        };
+        let mut cache = TempTableCache::default();
+        let first = cache.get_or_compute(7, ms, sql.len(), read).to_vec();
+        assert_eq!(reads.get(), 1);
+        // The same key — a caret move, a re-rank — reads nothing.
+        assert_eq!(cache.get_or_compute(7, ms, sql.len(), read), first);
+        assert_eq!(cache.get_or_compute(7, ms, sql.len(), read), first);
+        assert_eq!(reads.get(), 1, "the same text was parsed again");
+        // An edit, another dialect, a text of another length: each reads.
+        cache.get_or_compute(8, ms, sql.len(), read);
+        assert_eq!(reads.get(), 2);
+        cache.get_or_compute(8, SqlDialect::MySql, sql.len(), read);
+        assert_eq!(reads.get(), 3);
+        cache.get_or_compute(8, SqlDialect::MySql, sql.len() + 1, read);
+        assert_eq!(reads.get(), 4);
+        // …and the key it moved to is now the one held.
+        cache.get_or_compute(8, SqlDialect::MySql, sql.len() + 1, read);
+        assert_eq!(reads.get(), 4);
+    }
+
+    /// Read from a statement index's ranges, as the editor reads them, and
+    /// folded for a caret, the definitions answer what the document walk
+    /// does — remade tables and every caret included.
+    #[test]
+    fn temp_tables_from_the_index_ranges_answer_what_the_walk_does() {
+        let ms = SqlDialect::MsSql;
+        for sql in [
+            "CREATE TABLE #work (id int, label nvarchar(40));\n\
+             SELECT e.id, e.name AS who INTO ##shared FROM employees e;\n\
+             SELECT #work. FROM #work",
+            "CREATE TABLE #t (a int);\nSELECT  FROM #t;\nDROP TABLE #t;\n\
+             SELECT b INTO #t FROM src;\nSELECT  FROM #t;",
+            "CREATE TABLE #t (a int)\nGO\nCREATE TABLE #t (b int)\nGO\nSELECT  FROM #t",
+            "SELECT 1",
+        ] {
+            let index = crate::sql::StatementIndex::new(sql, ms);
+            let defs = temp_table_definitions(sql, index.statement_ranges(sql), ms);
+            for caret in 0..=sql.len() {
+                assert_eq!(
+                    temp_table_columns_at(&defs, caret),
+                    temp_table_relations(sql, caret, ms),
+                    "{sql:?} at {caret}"
+                );
+            }
+        }
+        // No `#` tables on this engine, whatever the ranges.
+        let sql = "CREATE TABLE #t (a int)";
+        let pg = SqlDialect::Postgres;
+        assert!(temp_table_definitions(sql, [(0, sql.len())], pg).is_empty());
     }
 
     /// The parsed scope's table names at the `|`.
