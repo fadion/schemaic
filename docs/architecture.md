@@ -24107,7 +24107,11 @@ existing prose was left alone.
     **An accept replaces the whole word the caret is in**, from `word_start` to `word_end` — the
     part after the caret too, and the `(` test reads past it — so accepting `customer_id` at
     `cust|_id` no longer writes `customer_id_id`
-    (`an_accept_replaces_the_whole_word_the_caret_is_in`).
+    (`an_accept_replaces_the_whole_word_the_caret_is_in`). Both edges run as far as the engine
+    continues a name (`sql::continues_name`), so `v$se` is one word and accepting `v$session` no
+    longer writes `v$v$session`; a byte that only continues a name never starts the word, so a
+    sigil that begins one — T-SQL's `@x`, `#t`, `@@x`, PostgreSQL's `$1` — stays before it, where
+    the sigil slots read it (`a_word_runs_as_far_as_the_engine_continues_a_name`).
     **An accept is remembered per connection**: `accept_completion` records the taken row's text
     against the tab's connection (`Completion::conn`, the editor's `active_conn`) in
     `Completion::accepted`, and `recompute_completions` hands that connection's `bonuses` to

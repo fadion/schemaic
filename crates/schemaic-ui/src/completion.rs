@@ -188,14 +188,20 @@ fn glyph_icon(glyph: SuggestGlyph, kind: SuggestKind) -> &'static str {
     }
 }
 
-use schemaic_core::sql::is_word_byte;
+use schemaic_core::sql::{continues_name, is_word_byte};
 
-/// Byte offset where the identifier ending at `offset` begins.
-fn word_start(text: &str, offset: usize) -> usize {
+/// Byte offset where the identifier ending at `offset` begins — as far back as
+/// `dialect` continues a name (`sql::continues_name`: `v$se` is one word, and
+/// T-SQL's `h#x`), but never onto a byte that only continues one: a sigil
+/// that begins the word (`@x`, `#t`, `@@x`, `$1`) is left before it.
+fn word_start(text: &str, offset: usize, dialect: SqlDialect) -> usize {
     let bytes = text.as_bytes();
     let mut start = offset.min(text.len());
-    while start > 0 && is_word_byte(bytes[start - 1]) {
+    while start > 0 && continues_name(bytes[start - 1], dialect) {
         start -= 1;
+    }
+    while start < offset && !is_word_byte(bytes[start]) {
+        start += 1;
     }
     start
 }
@@ -203,10 +209,10 @@ fn word_start(text: &str, offset: usize) -> usize {
 /// Byte offset where the identifier the caret is in ends — [`word_start`]'s
 /// mirror. An accept replaces the word from its start to here, not to the
 /// caret: accepting `customer_id` at `cust|_id` wrote `customer_id_id`.
-fn word_end(text: &str, offset: usize) -> usize {
+fn word_end(text: &str, offset: usize, dialect: SqlDialect) -> usize {
     let bytes = text.as_bytes();
     let mut end = offset.min(text.len());
-    while end < bytes.len() && is_word_byte(bytes[end]) {
+    while end < bytes.len() && continues_name(bytes[end], dialect) {
         end += 1;
     }
     end
@@ -1217,7 +1223,7 @@ fn recompute_completions_in(
     if !force && !comp.open.get_untracked() {
         comp.wide.set(false);
     }
-    let word_lo = word_start(text, offset);
+    let word_lo = word_start(text, offset, dialect);
     let prefix = text.get(word_lo..offset).unwrap_or("").to_string();
     // **A reasoned prediction takes the empty word's place** — see
     // `ghost_displaces_the_list`. Two offers at one caret would leave Tab meaning
@@ -1466,8 +1472,8 @@ pub(crate) fn accept_completion(ed: &Editor, comp: Completion, dialect: SqlDiale
     let offset = ed.cursor.get_untracked().offset();
     let doc = ed.doc();
     let text = doc.text().to_string();
-    let start = word_start(&text, offset);
-    let end = word_end(&text, offset);
+    let start = word_start(&text, offset, dialect);
+    let end = word_end(&text, offset, dialect);
     let idx = comp.sel.get_untracked();
     let (lo, hi) = schemaic_core::sql::writing_range(&text, offset, dialect);
     let in_quoted_name = intel::caret_in_quoted_name(&text, lo, start, dialect);
@@ -2610,19 +2616,49 @@ mod tests {
     fn an_accept_replaces_the_whole_word_the_caret_is_in() {
         let text = "SELECT cust_id FROM t";
         let at = 11; // cust|_id
+        let my = SqlDialect::MySql;
         assert_eq!(&text[..at], "SELECT cust");
         assert_eq!(
-            (word_start(text, at), word_end(text, at)),
+            (word_start(text, at, my), word_end(text, at, my)),
             (7, 14),
             "the whole of `cust_id`"
         );
-        assert_eq!(word_end(text, 14), 14, "at the word's end");
+        assert_eq!(word_end(text, 14, my), 14, "at the word's end");
         assert_eq!(
-            word_end(text, 6),
+            word_end(text, 6, my),
             6,
             "on the space before a word, nothing after"
         );
-        assert_eq!(word_end("SELECT cou", 10), 10, "at the end of the text");
+        assert_eq!(word_end("SELECT cou", 10, my), 10, "at the end of the text");
+    }
+
+    /// **A name's edges are where the engine ends it** (`sql::continues_name`):
+    /// `v$se` is one word, so accepting `v$session` there replaced only `se`
+    /// and wrote `v$v$session`. A sigil that begins a name — T-SQL's `@x`,
+    /// `#t`, `@@x`, PostgreSQL's `$1` — stays outside the word, which is what
+    /// the sigil slots read.
+    #[test]
+    fn a_word_runs_as_far_as_the_engine_continues_a_name() {
+        let (my, ms, pg) = (SqlDialect::MySql, SqlDialect::MsSql, SqlDialect::Postgres);
+        let text = "SELECT * FROM v$se";
+        assert_eq!(word_start(text, text.len(), my), 14);
+        assert_eq!(word_start(text, text.len(), pg), 14);
+        let text = "SELECT * FROM v|$session";
+        let at = text.find('|').unwrap();
+        let text = text.replace('|', "");
+        assert_eq!(word_end(&text, at, my), text.len());
+        // T-SQL continues a name through `#` and `@` too, but not past a prefix.
+        let text = "SELECT * FROM dbo.h#x";
+        assert_eq!(word_start(text, text.len(), ms), 18);
+        assert_eq!(word_start(text, text.len(), my), 20);
+        for (text, at) in [
+            ("SELECT @va", 8),
+            ("SELECT @@ver", 9),
+            ("SELECT * FROM #tm", 15),
+        ] {
+            assert_eq!(word_start(text, text.len(), ms), at, "{text}");
+        }
+        assert_eq!(word_start("WHERE id = $1", 13, pg), 12);
     }
 
     #[test]
