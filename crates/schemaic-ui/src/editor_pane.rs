@@ -3114,7 +3114,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                             })
                             .map(|at| (sent, at))
                     });
-                    intel::run_error_diagnostic(sql, &spans, at, &err.text, dialect.get_untracked())
+                    intel::run_error_diagnostic(sql, spans, at, &err.text, dialect.get_untracked())
                 })
             }
             _ => None,
