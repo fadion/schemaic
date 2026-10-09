@@ -33,6 +33,7 @@ use floem::views::editor::core::selection::{SelRegion, Selection};
 use floem::views::editor::gutter::GutterClass;
 use floem::views::editor::keypress::default_key_handler;
 use floem::views::editor::keypress::key::KeyInput;
+use floem::views::editor::layout::TextLayoutLine;
 use floem::views::editor::text::{RenderWhitespace, WrapMethod};
 use floem::views::scroll::{Handle, Thickness};
 use schemaic_core::connection::ConnStatus;
@@ -1846,18 +1847,23 @@ fn editor_points(ed: &Editor) -> impl Fn(usize) -> Option<(Point, Point)> + '_ {
         .screen_lines
         .with(|s| s.rvline_range().map(|(f, l)| (f.line, l.line)));
     let rope = ed.rope_text();
-    let cache_rev = ed.doc().cache_rev().get_untracked();
-    let config = ed.config_id();
     points_on_screen(
         shown,
         move |off| rope.line_of_offset(off),
-        move |line| {
-            ed.lines()
-                .try_get_text_layout(cache_rev, config, line)
-                .is_some()
-        },
+        move |line| layout_if_built(ed, line).is_some(),
         move |off| ed.points_of_offset(off, CursorAffinity::Backward),
     )
+}
+
+/// `line`'s text layout if floem has already built it, `None` otherwise —
+/// **never building one**, which is [`editor_points`]' rule for the overlays
+/// that need a line's rows as well as its position. `ed.text_layout` builds a
+/// missing layout, and from inside a run that tracks `screen_lines` that
+/// rewrites `screen_lines` under it ([`points_on_screen`] has the panic).
+fn layout_if_built(ed: &Editor, line: usize) -> Option<std::sync::Arc<TextLayoutLine>> {
+    let cache_rev = ed.doc().cache_rev().get_untracked();
+    ed.lines()
+        .try_get_text_layout(cache_rev, ed.config_id(), line)
 }
 
 /// A point lookup that answers `None`, without calling `points` at all, for an
@@ -2073,22 +2079,21 @@ pub(crate) fn footer_fits(y: f64, bar_h: f64, area_h: f64) -> bool {
 /// phantom rows are exactly what pushed it down — and the last-line case, which
 /// has no next line, is the one that has to count the rows itself.
 ///
-/// Reactive: `screen_lines` is tracked, so the footer follows a scroll under it
-/// rather than staying where the suggestion arrived.
+/// Reactive: `screen_lines` is tracked (through [`editor_points`]), so the
+/// footer follows a scroll under it rather than staying where the suggestion
+/// arrived — and, through it, never lays a line out.
 fn inline_footer_y(
     ed: &Editor,
     preview: inline_diff::InlinePreview,
     area_h: RwSignal<f64>,
 ) -> Option<f64> {
-    ed.screen_lines.track();
+    let points = editor_points(ed);
     let view = preview.get()?;
     let hunk = view.plan()?.hunks.last()?;
     let rope = ed.rope_text();
     let vp_y = ed.viewport.get().y0;
-    let (top, bot) = if hunk.anchor + 1 < rope.num_lines() {
-        let off = rope.offset_of_line(hunk.anchor + 1);
-        let (top, _) = ed.points_of_offset(off, CursorAffinity::Backward);
-        (top, top)
+    let top = if hunk.anchor + 1 < rope.num_lines() {
+        points(rope.offset_of_line(hunk.anchor + 1))?.0
     } else {
         // Last line of the document: there is no next line to ask, so step past
         // the anchor's own rows. **`line_count()`, not `add.len()`** — it counts
@@ -2096,19 +2101,17 @@ fn inline_footer_y(
         // wrap on a long added line occupies more rows than it has lines. Counting
         // lines put the bar one row short and left the tail of the suggestion
         // stranded below it.
-        let off = rope.offset_of_line(hunk.anchor);
-        let (mut t, _) = ed.points_of_offset(off, CursorAffinity::Backward);
-        t.y += ed.text_layout(hunk.anchor).line_count() as f64
+        let (mut t, _) = points(rope.offset_of_line(hunk.anchor))?;
+        t.y += layout_if_built(ed, hunk.anchor)?.line_count() as f64
             * f64::from(ed.line_height(hunk.anchor));
-        (t, t)
+        t
     };
     let y = top.y + EDITOR_PAD_TOP - vp_y;
     // Off screen when the block has scrolled out of the pane. The bar is placed by
     // line geometry against an editor that scrolls under it, so without this it
     // rides up over the toolbar and the tab strip — it is absolutely positioned in
     // the pane, not clipped to the editor.
-    let fits = footer_fits(y, theme::scaled(VERDICT_BAR_H), area_h.get());
-    (placed(top, bot) && fits).then_some(y)
+    footer_fits(y, theme::scaled(VERDICT_BAR_H), area_h.get()).then_some(y)
 }
 
 /// The inline-diff bands as one `(y, height, is_add)` entry **per banded line** in
@@ -2171,9 +2174,11 @@ pub(crate) fn visible_hunk_lines(
     (clipped, anchor.filter(|a| *a >= first && *a <= last))
 }
 
-/// Reactive on `screen_lines`, so the strips follow a scroll like the rest.
+/// Reactive on `screen_lines` (through [`editor_points`]), so the strips follow
+/// a scroll like the rest — and never lay a line out: a line floem has not laid
+/// out yet is skipped this run, and the layout pass that builds it re-runs this.
 fn inline_band_runs(ed: &Editor, preview: inline_diff::InlinePreview) -> Vec<(f64, f64, bool)> {
-    ed.screen_lines.track();
+    let points = editor_points(ed);
     let Some(view) = preview.get() else {
         return Vec::new();
     };
@@ -2192,18 +2197,15 @@ fn inline_band_runs(ed: &Editor, preview: inline_diff::InlinePreview) -> Vec<(f6
         if line > last_line {
             return None;
         }
-        let off = rope.offset_of_line(line);
-        let (top, bot) = ed.points_of_offset(off, CursorAffinity::Backward);
-        placed(top, bot).then_some(top.y + EDITOR_PAD_TOP - vp_y)
+        let (top, _) = points(rope.offset_of_line(line))?;
+        Some(top.y + EDITOR_PAD_TOP - vp_y)
     };
     let mut rows = Vec::new();
     // The lines on screen, so the walk below is bounded by the viewport rather
     // than by the size of the plan — see `visible_hunk_lines`.
     let visible = ed
         .screen_lines
-        .get()
-        .rvline_range()
-        .map(|(f, l)| (f.line, l.line));
+        .with(|s| s.rvline_range().map(|(f, l)| (f.line, l.line)));
     // Every line the diff touches, banded by its **visual** rows. Each line is
     // asked for its own split through `inline_diff::row_split`, the same function
     // the code column's bands go through, so the two halves of a band cannot
@@ -2214,10 +2216,13 @@ fn inline_band_runs(ed: &Editor, preview: inline_diff::InlinePreview) -> Vec<(f6
             visible_hunk_lines(hunk.del.clone(), hunk.anchor, !hunk.add.is_empty(), visible);
         for line in del_lines.chain(anchor) {
             let Some(top) = top_of(line) else { continue };
+            let Some(layout) = layout_if_built(ed, line) else {
+                continue;
+            };
             let line_h = f64::from(ed.line_height(line));
             let own_len = rope.line_content(line).len();
             let (added, own) = inline_diff::row_split(
-                &ed.text_layout(line),
+                &layout,
                 line_h,
                 inline_diff::block_at(&view, line),
                 own_len,
@@ -9113,6 +9118,58 @@ mod geometry_tests {
         assert!(
             !f.contains("ed.points_of_offset(end"),
             "and it must not read the end's point directly:\n{f}"
+        );
+    }
+
+    /// **A function that reads `screen_lines` reactively never makes floem lay
+    /// a line out** (R2.1-L8-01). `points_of_offset` and `text_layout` build a
+    /// missing layout, which rewrites `screen_lines` from inside the run that
+    /// tracks it — "RefCell already borrowed". `editor_points` is the one
+    /// funnel allowed both, because it asks only for lines already laid out;
+    /// the Ctrl+K preview's footer and band strips were the two that did not.
+    #[test]
+    fn a_screen_lines_reader_never_lays_a_line_out() {
+        let reads = [
+            "screen_lines.track()",
+            "screen_lines.get()",
+            "screen_lines.with(",
+        ];
+        let builds = ["points_of_offset(", ".text_layout("];
+        let mut bad = Vec::new();
+        for (file, code) in crate::source_gate::crate_sources() {
+            let mut from = 0;
+            while let Some(i) = code[from..].find("fn ") {
+                let at = from + i;
+                from = at + 3;
+                let word_start = at == 0 || !code.as_bytes()[at - 1].is_ascii_alphanumeric();
+                let Some(end) = word_start
+                    .then(|| crate::source_gate::item_end(&code, at))
+                    .flatten()
+                else {
+                    continue;
+                };
+                let body = &code[at..end];
+                let name: String = body[3..]
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                if name == "editor_points" {
+                    continue;
+                }
+                if reads.iter().any(|r| body.contains(r)) {
+                    for b in builds.iter().filter(|b| body.contains(*b)) {
+                        bad.push(format!(
+                            "{file}: fn {name} reads screen_lines and calls {b}"
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "a layout built while `screen_lines` is tracked re-enters it — go \
+             through `editor_points` and `layout_if_built`:\n{}",
+            bad.join("\n")
         );
     }
 

@@ -24765,16 +24765,20 @@ existing prose was left alone.
     computation that cannot drift apart; the geometry's two perf rules (`content_x_of` once per list,
     the document read with `with`, not `get`) moved onto `diag_hits` with their measured comments.
     **Every overlay's points come through `editor_points`, which tracks `screen_lines` and never
-    makes floem lay a line out — except the two Ctrl+K preview overlays, which do not yet.**
+    makes floem lay a line out.** An overlay that needs a line's *rows* as well as its position
+    takes the layout from `layout_if_built` beside it — `Lines::try_get_text_layout` at the current
+    `cache_rev`, `None` for a line floem has not built, never building one. The Ctrl+K preview's
     `inline_footer_y` (the verdict bar's y) and `inline_band_runs` (the gutter and padding strips of
-    the inline-diff bands) each track `screen_lines` and then call `points_of_offset` and
-    `text_layout` raw — the shape the rest of this paragraph forbids. `inline_band_runs` asks only
-    about lines inside `rvline_range` (`visible_hunk_lines`), which is the range check alone, not
-    the layout check that stops the crash; `inline_footer_y` asks about the line after the last
-    hunk's anchor, or the anchor itself, wherever it is. Whether either can actually panic — the
-    preview's lines may always be laid out by the time they are asked — has not been checked; until
-    they move onto `editor_points` (R2.1-L8-01), they are the two places to audit. The tracking is
-    the fix for drift: `points_of_offset` reads
+    the inline-diff bands) were the two exceptions until R2.1-L8-01: each tracked `screen_lines` by
+    hand and then called `points_of_offset` and `text_layout` raw, and `visible_hunk_lines` gave the
+    bands the range check alone, not the layout check that stops the crash. Both now take
+    `editor_points` and `layout_if_built`; a line not laid out yet is skipped this run (a band) or
+    answers `None` (the footer), and the layout pass that rewrites `screen_lines` re-runs them.
+    `geometry_tests::a_screen_lines_reader_never_lays_a_line_out` holds the rule over the crate's
+    source — a `fn` whose body reads `screen_lines` through `.track()`, `.get()` or `.with(` must
+    not contain `points_of_offset(` or `.text_layout(`, `editor_points` alone excepted — and was red
+    naming exactly those two. It reads one body's text, so a tracker reaching a layout through a
+    helper in another `fn` passes it. The tracking is the fix for drift: `points_of_offset` reads
     `screen_lines` untracked, so an overlay whose closure tracked only `viewport` re-ran with last
     frame's line positions, its boxes slid a few rows onto unrelated text, and — the tell — they did
     not come back when the editor scrolled back. But a tracker must not ask about a line with no text
@@ -25111,7 +25115,7 @@ existing prose was left alone.
     the anchor line's end: that offset maps to a column *before* the phantom rows, so its `bot` is
     the bottom of the line's own row. The **next** document line's top is the honest answer — the
     added rows are exactly what pushed it down — and the last-line case, which has no next line,
-    steps past them with `ed.text_layout(anchor).line_count()`, **visual rows and not `add.len()`**:
+    steps past them with `layout_if_built(ed, anchor)?.line_count()`, **visual rows and not `add.len()`**:
     with word wrap on a long added line occupies more rows than it has lines, and counting lines put
     the bar one row short with the tail of the suggestion stranded below it. It also takes `area_h`
     and answers `None` when the bar would not fit inside the pane — it is absolutely positioned in
@@ -33534,9 +33538,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   because bumping `cache_rev` drops the cache. Check `Lines::try_get_text_layout` first and answer
   "not yet": the pass rewrites `screen_lines`, and the tracker runs again with the layouts there.
   This is the price of the bullet above. `editor_points` is the instance (under `editor_pane.rs`),
-  found when the squiggle memo crashed the app while someone typed into a 7 MB script. The Ctrl+K
-  preview's `inline_footer_y` and `inline_band_runs` still break this rule — tracking
-  `screen_lines`, then `points_of_offset`/`text_layout` raw (under `editor_pane.rs`).
+  found when the squiggle memo crashed the app while someone typed into a 7 MB script, and
+  `layout_if_built` its counterpart for a caller that needs the line's layout itself.
+  `a_screen_lines_reader_never_lays_a_line_out` is the source gate (both under `editor_pane.rs`).
 - **`.get()` clones the whole value — use `.with()` to read part of a collection.** `SignalGet::get`
   is documented as *"try to **clone** and return the current value"*, so `widths.get().get(ci)`
   allocates and frees the entire `Vec` to read one slot, and `expanded.get().contains(&k)` clones the
