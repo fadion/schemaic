@@ -2659,7 +2659,10 @@ existing prose was left alone.
     defaults, and an update naming them sets the stored row's values to those — the predicted
     `email = EXCLUDED.email` wiped a PostgreSQL 16 row's `email` this way — so with no list and any
     other source nothing is predicted. MySQL's arm writes `a = VALUES(a), b = VALUES(b)`, or
-    `a = new.a` where MySQL 8's row alias (`VALUES (…) AS new ON DUPLICATE KEY UPDATE`) is written.
+    `a = new.a` where MySQL 8's row alias (`VALUES (…) AS new ON DUPLICATE KEY UPDATE`) is written —
+    found by `upsert_row_alias`, the scope builder's own reading (the `AS` after the `VALUES` rows,
+    at the statement's depth), since an `INSERT … SELECT … FROM src AS s` puts the source table's
+    alias in the same place and `s.a` is that table's column, not the row inserted.
     `VALUES()` is the default because it is MariaDB's only spelling and MySQL 8 still accepts it,
     though deprecated; the alias is MySQL 8's alone. The conflict arm writes `a = EXCLUDED.a`. Both
     write `VALUES`/`EXCLUDED` in the case `UPDATE`/`SET` was typed (`in_typed_case`). What

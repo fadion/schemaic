@@ -18181,15 +18181,16 @@ fn upsert_assignments(toks: &[Token], catalog: &Catalog, dialect: SqlDialect) ->
     if set.is_empty() {
         return None;
     }
-    // MySQL 8's `VALUES (…) AS new` names the row it would have inserted.
+    // MySQL 8's `VALUES (…) AS new` names the row it would have inserted —
+    // read as the scope builder reads it ([`upsert_row_alias`]: the `AS` after
+    // the `VALUES` rows, at the statement's depth), so an `INSERT … SELECT …
+    // FROM src AS s` is not taken for one. Only when it stands right before
+    // `ON DUPLICATE KEY UPDATE`: `AS new (m, n)` renames the columns too.
     let row_alias = mysql
         .then(|| n.checked_sub(6))
         .flatten()
         .filter(|&i| is(i, "AS"))
-        .and_then(|i| match &toks[i + 1].kind {
-            TkKind::Word(a) => Some(a.clone()),
-            _ => None,
-        });
+        .and_then(|_| upsert_row_alias(toks, SqlDialect::MySql)?.alias);
     let source = |col: &str| match (&row_alias, conflict) {
         (Some(alias), _) => format!("{alias}.{col}"),
         (None, true) => format!("{}.{col}", in_typed_case("EXCLUDED", kw)),
@@ -20736,6 +20737,29 @@ mod predict_tests {
                 SqlDialect::MySql
             ),
             None
+        );
+    }
+
+    /// MySQL 8's row alias is the `AS` after the `VALUES` rows; an `AS` in an
+    /// `INSERT … SELECT`'s `FROM` names the source table, whose columns are not
+    /// the row inserted (S8.5-L1-02, reproduced on MariaDB 10.11).
+    #[test]
+    fn an_insert_selects_source_alias_is_no_row_alias() {
+        let my = |sql: &str| keyed_at(sql, SqlDialect::MySql);
+        assert_eq!(
+            my("INSERT INTO customers (id, name) SELECT customer_id, name FROM clients AS s ON DUPLICATE KEY UPDATE ")
+                .as_deref(),
+            Some("name = VALUES(name)")
+        );
+        assert_eq!(
+            my("INSERT INTO customers (id, name) SELECT * FROM (SELECT 1, 'a') AS dt ON DUPLICATE KEY UPDATE ")
+                .as_deref(),
+            Some("name = VALUES(name)")
+        );
+        assert_eq!(
+            my("INSERT INTO customers (id, name) VALUES (1, 'a'), (2, 'b') AS new ON DUPLICATE KEY UPDATE ")
+                .as_deref(),
+            Some("name = new.name")
         );
     }
 
