@@ -14079,7 +14079,12 @@ existing prose was left alone.
       because bare, the server refuses it as ambiguous. Not with one table in scope, nor where
       the slot takes a bare name only: a join's `USING (…)` list, which `intel::in_using_list`
       reads as the innermost paren open at the word being a `USING (`'s and the caller passes as
-      `LocalNames::bare_columns`. Inside a quoted name `accepted_insert` gives a column its bare
+      `LocalNames::bare_columns`. **A join's `USING`, read back to its `JOIN`**
+      (`using_follows_a_join`, over the table, its alias and a closed derived table): a `MERGE`'s
+      source and PostgreSQL's `DELETE … USING (SELECT …)` put a whole derived table in that paren,
+      and every column slot in it went in bare — `id` that `deliveries` and `items` share, which
+      SQL Server called ambiguous (S8.4-L1-02, `a_merge_or_delete_source_is_no_using_list`, red
+      first). Inside a quoted name `accepted_insert` gives a column its bare
       name, as it gives a table (`a_column_two_tables_share_is_inserted_qualified`,
       `a_using_list_is_told_from_other_parens`).
       **A name the statement wrote is not quoted as if the catalogue had spelled it.** A local

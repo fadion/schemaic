@@ -16587,7 +16587,9 @@ pub fn caret_in_literal_or_comment(
 
 /// Is the word at `caret` inside a join's `USING (…)` column list — the one
 /// place a column must be named bare? Reading `sql` from `lo`: the innermost
-/// paren open at the word is a `USING (`'s.
+/// paren open at the word is a `USING (`'s, and that `USING` is a join's
+/// ([`using_follows_a_join`]) — not a `MERGE`'s source or PostgreSQL's
+/// `DELETE … USING (SELECT …)`, whose paren holds a derived table.
 pub fn in_using_list(sql: &str, lo: usize, caret: usize, dialect: SqlDialect) -> bool {
     let word_lo = word_start(sql, caret);
     let toks = tokenize_range(sql, lo, word_lo, dialect);
@@ -16606,7 +16608,35 @@ pub fn in_using_list(sql: &str, lo: usize, caret: usize, dialect: SqlDialect) ->
         .and_then(|&i| i.checked_sub(1))
         .is_some_and(|k| {
             matches!(&toks[k].kind, TkKind::Word(w) if !toks[k].quoted && w.eq_ignore_ascii_case("USING"))
+                && using_follows_a_join(&toks[..k])
         })
+}
+
+/// Is the `USING` after `toks` a join's — `JOIN t [AS] [alias]`, the table
+/// qualified or a derived one? Read back over the table and its alias,
+/// a closed paren skipped whole, to the first word that says whose it is:
+/// `JOIN`, or one that heads another clause — `MERGE INTO t`'s `INTO`,
+/// `DELETE FROM t`'s `FROM` — or a `(` or `,` the read cannot pass.
+fn using_follows_a_join(toks: &[Token]) -> bool {
+    let mut depth = 0usize;
+    for t in toks.iter().rev() {
+        match &t.kind {
+            TkKind::RParen => depth += 1,
+            TkKind::LParen if depth == 0 => return false,
+            TkKind::LParen => depth -= 1,
+            _ if depth > 0 => {}
+            TkKind::Comma => return false,
+            TkKind::Dot => {}
+            TkKind::Word(w) if !t.quoted => match w.to_ascii_uppercase().as_str() {
+                "JOIN" => return true,
+                "INTO" | "FROM" | "USING" | "MERGE" | "DELETE" | "UPDATE" | "SELECT" | "WHERE"
+                | "ON" | "SET" => return false,
+                _ => {}
+            },
+            TkKind::Word(_) => {}
+        }
+    }
+    false
 }
 
 /// A string literal the caret is in, where the string is a column's **value**:
@@ -32434,6 +32464,36 @@ mod tests {
         ));
         // PostgreSQL's `DELETE … USING` lists tables, with no paren.
         assert!(!at("DELETE FROM a USING b WHERE |", SqlDialect::Postgres));
+    }
+
+    /// **Only a join's `USING (` is a column list** (S8.4-L1-02): a `MERGE`'s
+    /// source and PostgreSQL's `DELETE … USING (SELECT …)` put a derived table
+    /// in the paren, whose columns two joined tables share must stay
+    /// qualified. A join's `USING` after an alias, a qualified table, a
+    /// derived table or inside a MySQL `DELETE … USING` still is one.
+    #[test]
+    fn a_merge_or_delete_source_is_no_using_list() {
+        let at = |sql: &str, d| {
+            let caret = sql.find('|').unwrap();
+            let sql = sql.replace('|', "");
+            in_using_list(&sql, 0, caret, d)
+        };
+        let (ms, pg, my) = (SqlDialect::MsSql, SqlDialect::Postgres, SqlDialect::MySql);
+        assert!(!at(
+            "MERGE INTO stock s USING (SELECT d.qty, i.sku FROM deliveries d JOIN items i \
+             ON i.id = d.item_id WHERE |",
+            ms
+        ));
+        assert!(!at("MERGE INTO stock s USING (|", ms));
+        assert!(!at("MERGE INTO t USING (SELECT a FROM x WHERE |", pg));
+        assert!(!at(
+            "DELETE FROM a USING (SELECT b.id FROM b JOIN c ON c.id = b.id WHERE |",
+            pg
+        ));
+        assert!(at("SELECT * FROM a JOIN b AS x USING (|", pg));
+        assert!(at("SELECT * FROM a JOIN s.b x USING (|", pg));
+        assert!(at("SELECT * FROM a JOIN (SELECT 1 AS id) d USING (|", pg));
+        assert!(at("DELETE FROM t1 USING t1 JOIN t2 USING (|", my));
     }
 
     /// `enum_value_slot` at the `|`: `(qualifier, column, typed, closed)`.
