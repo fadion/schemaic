@@ -15393,7 +15393,11 @@ existing prose was left alone.
   **A run from the editor refreshes too.** `run_query_core` and `run_all` call `refresh_db` for the
   tab's database when a statement that succeeded `sql::changes_schema` — a `CREATE`, `ALTER` or
   `DROP` other than a temporary table's, MySQL's `RENAME TABLE`, PostgreSQL's `COMMENT ON`, SQL
-  Server's `EXEC sp_rename`, read by each statement's leading words — so the tree, the completion
+  Server's `sp_rename` (bare or qualified), a `SELECT … INTO` a new table, read by each
+  statement's leading words — each T-SQL statement where it begins (`tsql_statements`), since
+  `IF OBJECT_ID(…) IS NOT NULL DROP TABLE t` and `SET NOCOUNT ON` ⏎ `CREATE TABLE …` put the DDL
+  behind another statement's head, and a control-flow piece the splitter keeps whole counts a
+  `CREATE`/`ALTER`/`DROP` anywhere in it, erring wide — so the tree, the completion
   index and the diagnostics catalogue stop showing the schema the run replaced. It is decided by
   `sql::schema_reload`, through the app's `settle_schema`, at each run that lands and at each end
   of the tab's transaction: inside a transaction still open on an engine whose DDL is

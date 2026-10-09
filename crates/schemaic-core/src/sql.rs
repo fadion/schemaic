@@ -1331,21 +1331,113 @@ pub fn executable_statements(sql: &str, dialect: SqlDialect) -> Vec<String> {
 /// `DROP TEMPORARY`, and a T-SQL `#`/`##` table — nor does `TRUNCATE`, which
 /// empties a table and keeps it. Read by the leading words of each statement,
 /// so a `CREATE` in a comment or a string is not one.
+///
+/// **Each T-SQL statement where it begins** ([`tsql_statements`]), not only
+/// the range's head: a script there needs no `;`, so `IF OBJECT_ID(…) IS NOT
+/// NULL DROP TABLE t`, `SET NOCOUNT ON` ⏎ `CREATE TABLE …` and a `DECLARE`'s
+/// batch put the DDL behind another statement's words, and the tree kept
+/// showing a table the run had dropped. Then whatever the guard misses is
+/// caught by [`ddl_word_follows`]: an `IF … BEGIN DROP … END` is one piece to
+/// the splitter, and a reload too many costs one introspection. And
+/// `SELECT … INTO name`, which creates a table on SQL Server and PostgreSQL
+/// ([`selects_into_a_table`]); and `sp_rename` under any qualifier, or called
+/// bare as a batch's first statement.
 pub fn changes_schema(sql: &str, dialect: SqlDialect) -> bool {
     statement_ranges(sql, dialect).into_iter().any(|(lo, hi)| {
-        let stmt = &sql[lo..hi];
-        let words = leading_words(stmt, 3, dialect);
-        let w = |i: usize| words.get(i).map(String::as_str).unwrap_or("");
-        let temporary = (1..3).any(|i| matches!(w(i), "TEMP" | "TEMPORARY"))
-            || (dialect.prefixed_names() && names_a_temp_table(stmt, dialect));
-        match w(0) {
-            "CREATE" | "ALTER" | "DROP" => !temporary,
-            "RENAME" => w(1) == "TABLE",
-            "COMMENT" => w(1) == "ON",
-            "EXEC" | "EXECUTE" => w(1) == "SP_RENAME",
-            _ => false,
-        }
+        tsql_statements(&sql[lo..hi], dialect)
+            .into_iter()
+            .any(|stmt| statement_changes_schema(stmt, dialect))
     })
+}
+
+/// [`changes_schema`]'s reading of one statement.
+fn statement_changes_schema(stmt: &str, dialect: SqlDialect) -> bool {
+    let words = leading_words(stmt, 4, dialect);
+    let w = |i: usize| words.get(i).map(String::as_str).unwrap_or("");
+    let temporary = (1..3).any(|i| matches!(w(i), "TEMP" | "TEMPORARY"))
+        || (dialect.prefixed_names() && names_a_temp_table(stmt, dialect));
+    match w(0) {
+        "CREATE" | "ALTER" | "DROP" => !temporary,
+        "RENAME" => w(1) == "TABLE",
+        "COMMENT" => w(1) == "ON",
+        // `EXEC sp_rename`, `EXEC dbo.sp_rename`, `EXEC master.sys.sp_rename`.
+        "EXEC" | "EXECUTE" => (1..4).any(|i| w(i) == "SP_RENAME"),
+        "SP_RENAME" => true,
+        "SELECT" | "WITH" => selects_into_a_table(stmt, dialect),
+        // Control flow, a block: what it governs.
+        "IF" | "WHILE" | "BEGIN" | "ELSE" => ddl_word_follows(stmt, dialect),
+        _ => false,
+    }
+}
+
+/// Does a T-SQL control-flow piece hold a schema change the splitter left
+/// inside it — `IF 1 = 1 BEGIN DROP VIEW v END`? Any top-level `CREATE`,
+/// `ALTER` or `DROP`, or a `SELECT … INTO` a table. Errs wide, as
+/// [`changes_schema`] may: a `#` table dropped inside a block costs one
+/// introspection too many.
+fn ddl_word_follows(stmt: &str, dialect: SqlDialect) -> bool {
+    top_level_words(stmt, dialect)
+        .iter()
+        .any(|(w, _)| matches!(w.as_str(), "CREATE" | "ALTER" | "DROP"))
+        || selects_into_a_table(stmt, dialect)
+}
+
+/// Does `stmt` select **into a new table** — `SELECT … INTO name`, which
+/// creates one on SQL Server and PostgreSQL? Not into a variable (`@a`), a
+/// T-SQL `#` table, PostgreSQL's `TEMP`/`TEMPORARY` table or MySQL's file
+/// (`OUTFILE`, `DUMPFILE`); and not an `INSERT … INTO` (or a `MERGE`'s,
+/// `REPLACE`'s) a `WITH` feeds. A MySQL `SELECT … INTO x` names a local
+/// variable, but only inside a routine, whose text is a `CREATE` already — so
+/// the rule asks no engine.
+fn selects_into_a_table(stmt: &str, dialect: SqlDialect) -> bool {
+    let words = top_level_words(stmt, dialect);
+    if words
+        .iter()
+        .any(|(w, _)| matches!(w.as_str(), "INSERT" | "REPLACE" | "MERGE" | "UPSERT"))
+    {
+        return false;
+    }
+    let b = stmt.as_bytes();
+    // Where each top-level `INTO` ends, to read what follows it.
+    let mut i = 0;
+    let mut depth = 0usize;
+    while i < b.len() {
+        if let Some(j) = skip_noncode(b, i, dialect) {
+            i = j;
+            continue;
+        }
+        let prefix = t_sql_name_prefix(b, i, dialect);
+        if prefix > 0 || is_word_start(b[i]) {
+            let s = i;
+            i += prefix.max(1);
+            while i < b.len() && continues_name(b[i], dialect) {
+                i += 1;
+            }
+            if prefix > 0 || depth > 0 || !stmt[s..i].eq_ignore_ascii_case("INTO") {
+                continue;
+            }
+            let Some(k) = next_code_at(b, i, dialect) else {
+                return false;
+            };
+            if matches!(b[k], b'@' | b'#') {
+                continue;
+            }
+            let target = leading_words(&stmt[k..], 1, dialect);
+            if !target.first().is_some_and(|t| {
+                matches!(t.as_str(), "TEMP" | "TEMPORARY" | "OUTFILE" | "DUMPFILE")
+            }) {
+                return true;
+            }
+            continue;
+        }
+        match b[i] {
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Whether to re-introspect a tab's database **now**, and whether a reload is
@@ -6266,6 +6358,50 @@ mod changes_schema_tests {
         assert!(changes_schema("RENAME TABLE a TO b", MySql));
         assert!(changes_schema("COMMENT ON TABLE t IS 'x'", Postgres));
         assert!(changes_schema("EXEC sp_rename 'a', 'b'", MsSql));
+    }
+
+    /// **T-SQL's DDL idioms are not at a range's head.** A script there needs
+    /// no `;`, so the guard, the setting and the `IF` come first, and the
+    /// head-only reading left the tree showing a table the run had dropped.
+    /// `SELECT … INTO` creates one on SQL Server and PostgreSQL.
+    #[test]
+    fn ddl_behind_a_guard_or_a_setting_changes_the_schema() {
+        for sql in [
+            "IF OBJECT_ID('dbo.t') IS NOT NULL DROP TABLE dbo.t",
+            "IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE name = 't') CREATE TABLE t (id int)",
+            "IF 1 = 1 BEGIN DROP VIEW v END",
+            "SET NOCOUNT ON\nCREATE TABLE t (id int)",
+            "DECLARE @n int = 1; CREATE TABLE t (id int)",
+            "SELECT * INTO dbo.copy FROM t",
+            "EXEC dbo.sp_rename 'a', 'b'",
+            "EXECUTE sys.sp_rename 'a', 'b'",
+            "sp_rename 'a', 'b'",
+        ] {
+            assert!(changes_schema(sql, MsSql), "{sql}");
+        }
+        assert!(changes_schema("SELECT * INTO copy FROM t", Postgres));
+        assert!(changes_schema(
+            "SELECT * INTO UNLOGGED copy FROM t",
+            Postgres
+        ));
+        // Into a variable, a temporary table or a file: nothing in the tree.
+        for (sql, d) in [
+            ("SELECT * INTO #copy FROM t", MsSql),
+            ("IF 1 = 1 SELECT * INTO #copy FROM t", MsSql),
+            ("SELECT * INTO TEMP copy FROM t", Postgres),
+            ("SELECT * INTO TEMPORARY copy FROM t", Postgres),
+            ("SELECT a INTO @a FROM t", MySql),
+            ("SELECT a INTO OUTFILE '/tmp/x' FROM t", MySql),
+            ("INSERT INTO t SELECT * FROM u", MsSql),
+            (
+                "WITH c AS (SELECT 1 AS a) INSERT INTO t SELECT a FROM c",
+                MsSql,
+            ),
+            ("IF @x = 1 DELETE FROM t", MsSql),
+            ("SET NOCOUNT ON\nSELECT * FROM t", MsSql),
+        ] {
+            assert!(!changes_schema(sql, d), "{d:?}: {sql}");
+        }
     }
 
     #[test]
