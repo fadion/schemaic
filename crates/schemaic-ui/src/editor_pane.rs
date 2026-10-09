@@ -5102,6 +5102,12 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     // dialog (an agent's edit, say), `at` may be on another
                     // alias than the one the field names, so it refuses.
                     let opened_on = query.get_untracked();
+                    // The keyboard comes back here however the dialog closes:
+                    // its root's own hand-back finds no other root to give it.
+                    let back = ed
+                        .editor_view_id
+                        .get_untracked()
+                        .map(|vid| crate::widgets::menu_return(move || vid.request_focus()));
                     let ed = ed.clone();
                     let apply = move |new: &str| {
                         let m = query.with_untracked(|sql| {
@@ -5118,6 +5124,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     alias_rename.set(Some(crate::AliasRenameRequest {
                         name,
                         apply: Rc::new(apply),
+                        back,
                     }));
                 }));
             }
@@ -5688,8 +5695,15 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     // what "Rename alias" leaves for typing receives nothing.
                     // Armed on the line before the panel builds and takes it.
                     if let Some(vid) = ed_menu.editor_view_id.get_untracked() {
+                        // Unless the entry opened a modal: by the time this
+                        // lands the menu's own root is gone, so a root still
+                        // mounted is that modal's (*Rename alias*), and taking
+                        // the keyboard back would leave its field typing into
+                        // the editor behind it — which one won was timer order.
                         crate::widgets::set_menu_return(crate::widgets::menu_return(move || {
-                            vid.request_focus()
+                            if crate::widgets::innermost_focus_root().is_none() {
+                                vid.request_focus()
+                            }
                         }));
                     }
                     popup_menu.set(Some((build_editor_menu)()));

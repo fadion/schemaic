@@ -27,6 +27,9 @@ use crate::{FieldCfg, edit_field, theme};
 pub struct AliasRenameRequest {
     pub name: String,
     pub apply: AliasRenameApply,
+    /// Gives the keyboard back to the editor, however the dialog closes —
+    /// its root's own hand-back finds no other root to give it to.
+    pub back: Option<Rc<dyn Fn()>>,
 }
 
 /// The editor's rename of the alias to a name, or why it will not.
@@ -40,8 +43,6 @@ fn panel_w() -> f64 {
 // entry is the one caller.
 
 pub(crate) fn alias_rename_overlay(open: RwSignal<Option<AliasRenameRequest>>) -> impl IntoView {
-    let close = move || open.set(None);
-
     dyn_container(
         // Keyed on *whether* it is open: the request does not change while it
         // is up, and a rebuild would take the field's caret with it.
@@ -54,11 +55,19 @@ pub(crate) fn alias_rename_overlay(open: RwSignal<Option<AliasRenameRequest>>) -
             let refusal: RwSignal<Option<String>> = RwSignal::new(None);
             let ring = FocusRing::new();
             let root_ring = ring.clone();
+            let back = req.back.clone();
+            let close: Rc<dyn Fn()> = Rc::new(move || {
+                open.set(None);
+                if let Some(back) = &back {
+                    back();
+                }
+            });
 
+            let done = close.clone();
             let rename: Rc<dyn Fn()> = Rc::new(move || {
                 let typed = name.get_untracked();
                 match (req.apply)(&typed) {
-                    Ok(()) => open.set(None),
+                    Ok(()) => done(),
                     Err(why) => refusal.set(Some(why.message(&typed))),
                 }
             });
@@ -82,7 +91,7 @@ pub(crate) fn alias_rename_overlay(open: RwSignal<Option<AliasRenameRequest>>) -
                             focus: Some((ring.clone(), 10)),
                             autofocus: true,
                             on_submit: Some(Rc::new(move || (submit)())),
-                            on_escape: Some(Rc::new(close)),
+                            on_escape: Some(close.clone()),
                             ..Default::default()
                         },
                     )
@@ -113,10 +122,12 @@ pub(crate) fn alias_rename_overlay(open: RwSignal<Option<AliasRenameRequest>>) -
             // Keyed on the name's emptiness, so the buttons rebuild when
             // Rename turns on and not on every keystroke.
             let ring_actions = ring.clone();
+            let cancel = close.clone();
             let footer = modal_footer(dyn_container(
                 move || name.with(|n| !n.trim().is_empty()),
                 move |ready: bool| {
                     let rename = rename.clone();
+                    let cancel = cancel.clone();
                     h_stack((
                         action_button(
                             "Cancel",
@@ -124,7 +135,7 @@ pub(crate) fn alias_rename_overlay(open: RwSignal<Option<AliasRenameRequest>>) -
                             true,
                             ring_actions.clone(),
                             ACTION_TAB,
-                            close,
+                            move || cancel(),
                         ),
                         action_button(
                             "Rename",
@@ -140,9 +151,8 @@ pub(crate) fn alias_rename_overlay(open: RwSignal<Option<AliasRenameRequest>>) -
                 },
             ));
 
-            let close_x: Rc<dyn Fn()> = Rc::new(close);
             let panel = v_stack((
-                modal_title("Rename alias", close_x, root_ring.clone()),
+                modal_title("Rename alias", close.clone(), root_ring.clone()),
                 form,
                 footer,
             ))

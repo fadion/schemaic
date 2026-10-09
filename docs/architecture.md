@@ -21745,8 +21745,13 @@ existing prose was left alone.
     under the field and **the dialog stays open on it**, the name still there to correct; editing
     the name retracts it, since it answered the name it was given. Enter submits, Escape and ✕
     close, and there is **no click-away**, as the snippet editor has none: the name is applied only
-    by Rename. The outer `dyn_container` is keyed on *whether* a request is open rather than on the
-    request, so nothing rebuilds the field and takes its caret; the footer is keyed on whether the
+    by Rename. **However it closes — Cancel, Escape, ✕ or a successful Rename, all through the one
+    `close` — it calls `AliasRenameRequest::back`**, which the editor fills with
+    `menu_return(move || vid.request_focus())` on its own content view: the dialog's `focus_root`
+    hands back to the next root out, and over the workspace there is none, so the keyboard went
+    nowhere and Ctrl+Z after a rename did nothing until the editor was clicked (`None` only when
+    `editor_view_id` is unset). The outer `dyn_container` is keyed on *whether* a request is open
+    rather than on the request, so nothing rebuilds the field and takes its caret; the footer is keyed on whether the
     trimmed name is empty, so the buttons rebuild when Rename turns on and not on every keystroke.
     It shares `snippet_edit.rs`'s tuple element in the modal layer's DDL group — that stack is at
     floem's 16-arity limit, and the two are not up together: that is a stated claim rather than a
@@ -24907,7 +24912,10 @@ existing prose was left alone.
     `OverlayUi::alias_rename` (threaded in as `QueryPaneParams::alias_rename`) to an
     `AliasRenameRequest`: the name `alias_name_at` read, and an `apply` that re-runs
     `intel::alias_rename` against the buffer **when Rename is pressed**, at the offset the menu was
-    opened on, and writes the `MultiEdit` through `edit_untyped_multi` — one undo step. Its `Err` is
+    opened on, and writes the `MultiEdit` through `edit_untyped_multi` — one undo step — plus a
+    `back` that returns the keyboard to the editor when the dialog closes (*A menu the keyboard
+    opened gives focus back*, under *Popup menus*, says why the menu's own return cannot). Its
+    `Err` is
     the refusal the dialog (`alias_rename.rs`) shows, and two of them are decided here rather than
     by the walk. **`Changed`**: the click also captures the query text, and Rename refuses when the
     buffer differs from it — the stored offset was taken in that text, so after an edit under the
@@ -34326,7 +34334,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   behind an open modal: deleting a connection from Manage Connections takes its tabs with it, so
   the editor stole the keyboard out from under the modal, which then had to be clicked again
   before it answered Escape. The registry is the honest test — a list of the modals that are open
-  would rot on the next one added.
+  would rot on the next one added. A deferred *restore* asks the same question: the SQL editor's
+  menu return, landing after an entry had opened *Rename alias*, took the keyboard from the
+  dialog's field (*A menu the keyboard opened gives focus back*, below).
 - **The results toolbar is the one `FocusRing` outside an overlay.** Every other ring belongs to a
   modal, and a ring *wraps* precisely so a modal's Tab order is a trap — which is why the workspace
   has none. Scoped to a single strip that property is the right one: the walk stays in the toolbar
@@ -35503,6 +35513,20 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   floem, and the editor that raised the menu is where it belongs.
   `editor_menu_return_gate::the_right_click_menu_arms_a_return_before_it_opens` fails if that branch
   opens the menu with no return armed ahead of it.
+  **The arming is unconditional; the restore is not — it stands down while a `focus_root` is
+  mounted** (`widgets::innermost_focus_root().is_none()`, inside the editor's closure). The restore
+  is an `exec_after(ZERO)`, and so is `edit_field`'s autofocus, so when *Rename alias* opened its
+  dialog both were queued in one pass and fired in floem's arbitrary timer order: when the restore
+  won, the dialog's field never had the keyboard and what was typed into it — Backspace, `i`, Enter,
+  seen in the window — edited the query behind the modal. By the time the timer fires the menu's own
+  root is gone, so a root still mounted is a modal the entry opened, and the check settles it
+  whichever timer runs first. **It lives in the editor's closure, not in `widgets::menu_return`, on
+  purpose**: a menu opened *inside* a modal — the settings pickers' — must still restore to a control
+  in that modal, where the innermost root is the modal itself and the same guard would strand it.
+  Standing down leaves the editor with nothing to come back to once the dialog closes — its root's
+  own hand-back finds no other root — so the dialog carries its own return
+  (`AliasRenameRequest::back`, under `alias_rename.rs`); without it Ctrl+Z after a rename did nothing
+  until the editor was clicked.
   **Handing focus back is a focus *event*, and a handler that re-seeds state on one is a bug waiting
   for a caller.** The tree's `FocusGained` seeded the nav cursor from the open table unconditionally
   — correct while the only way in was a click from outside, and wrong the moment the menu started
