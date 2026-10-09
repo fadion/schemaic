@@ -1188,9 +1188,16 @@ existing prose was left alone.
     quote, so the squiggle is the span `skip_noncode` gives the name, quotes and all — the offline
     check's range — where it was the quote alone, which an AI fix counted as a second problem
     beside the offline one (`a_servers_position_on_a_quoted_name_takes_the_whole_name`, red
-    before). The text sent is the editor's unrewritten:
+    before). The text sent is the editor's with **only the tab's parameters rewritten**:
     `run_statement` sends it whole through the simple protocol, and the read-only `SET` and a
-    Manual tab's `BEGIN` go as their own messages.
+    Manual tab's `BEGIN` go as their own messages — but `params::prepare_run` has replaced each
+    `:name` by its value first, so the server counts in that text, and a placeholder is not the
+    length of its value. Used unmapped, `:name` bound to a 26-letter string moved the squiggle 23
+    characters on, onto a healthy word. The pane maps it back through `params::template_position`
+    (`substitute`'s walk, stopped at the position; inside a value it is the placeholder's `:`) with
+    the tab's bindings, and a parameter changed after the launch clears `run_sent`, so a value the
+    run did not use never measures it
+    (`a_servers_error_position_is_mapped_back_through_the_substitution`, red before).
     **`code_names` is that same scan reduced to a yes/no, and it is `pub` for a caller outside this
     crate.** `db::sqlite`'s introspection needs to know which triggers name a table — that is
     `TableInfo::referring_ddl` — and a `contains` there matches the word inside a comment or a `'…'`

@@ -580,7 +580,9 @@ fn db_err(e: &tokio_postgres::Error) -> DbError {
 
 /// [`db_err`] for the statement the user ran, keeping where the server put
 /// the error ([`DbError::QueryAt`]). Only [`run_statement`] asks: its text is
-/// sent as the editor handed it, so the position indexes the editor's text.
+/// sent as the app handed it — the editor's, with the tab's `:name`
+/// parameters substituted — so the position indexes that text, and the
+/// editor maps it back into its own (`params::template_position`).
 fn run_err(e: &tokio_postgres::Error) -> DbError {
     placed(db_text(e), e.as_db_error().and_then(|d| d.position()))
 }

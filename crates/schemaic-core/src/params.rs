@@ -617,6 +617,53 @@ pub fn prepare_run(
     Ok((prepared, verdict))
 }
 
+/// A server's error position into the text [`substitute`] made of `template`,
+/// as the same position in `template` — both 1-based **character** indexes,
+/// PostgreSQL's `P` field and what `intel::run_error_diagnostic` reads.
+///
+/// **The server counts in the text it received**, and a placeholder is not
+/// the length of its value: placed in the template unmapped, `:name` bound to
+/// a 26-letter string moved the squiggle 23 characters on, onto a healthy
+/// word in the same statement, and `:customer_id` bound to `7` moved it back.
+///
+/// The walk is [`substitute`]'s — [`scan`] then [`render`] — up to the
+/// position and no further, so a placeholder *after* it needs no value (the
+/// text from where the run began may run on past what was sent). A position
+/// inside a value is the placeholder's own `:`. `None` when a placeholder
+/// ahead of it has no value, or one that does not render, since its length
+/// cannot be known — and for position 0, which is no position.
+pub fn template_position(
+    template: &str,
+    bindings: &[Binding],
+    dialect: SqlDialect,
+    sent_chars: usize,
+) -> Option<usize> {
+    let target = sent_chars.checked_sub(1)?;
+    // Characters consumed so far, in the template and in what was sent.
+    let (mut in_template, mut in_sent) = (0usize, 0usize);
+    let mut cut = 0;
+    for r in scan(template, dialect) {
+        let plain = template[cut..r.start].chars().count();
+        if target < in_sent + plain {
+            return Some(in_template + (target - in_sent) + 1);
+        }
+        in_template += plain;
+        in_sent += plain;
+        let value = bindings
+            .iter()
+            .find(|b| b.name == r.name)
+            .and_then(|b| b.value.as_ref())?;
+        let rendered = render(&r.name, value, dialect).ok()?.chars().count();
+        if target < in_sent + rendered {
+            return Some(in_template + 1);
+        }
+        in_template += template[r.start..r.end].chars().count();
+        in_sent += rendered;
+        cut = r.end;
+    }
+    Some(in_template + (target - in_sent) + 1)
+}
+
 /// Is `s` a plain numeric literal — optional sign, digits with at most one
 /// decimal point, optional exponent, and nothing else?
 ///
@@ -1329,6 +1376,74 @@ mod tests {
             matches!(verdict, crate::sql::RunVerdict::Confirm(_)),
             "an unguarded DELETE with no WHERE still confirms, got {verdict:?}"
         );
+    }
+
+    // ── template_position ───────────────────────────────────────────────────
+
+    /// Where the squiggle lands for a PostgreSQL error at `bad` in the text
+    /// `prepare_run` sent — the server's position, mapped back to `template`
+    /// and placed as the editor places it.
+    fn squiggle(template: &str, bindings: &[Binding], bad: &str) -> Option<String> {
+        let pg = crate::sql::GuardPolicy {
+            dialect: PG,
+            ..policy(false)
+        };
+        let (sent, _) = prepare_run(&[template.to_string()], bindings, pg).expect("bound");
+        let byte = sent[0].find(bad).expect("the error token was sent");
+        let server_at = sent[0][..byte].chars().count() + 1;
+        let at = template_position(template, bindings, PG, server_at).map(|c| (0, c));
+        let d = crate::intel::run_error_diagnostic(
+            template,
+            &[(0, template.len())],
+            at,
+            &format!("column \"{bad}\" does not exist"),
+            PG,
+        )?;
+        Some(template[d.range.0..d.range.1].to_string())
+    }
+
+    /// **The server counts in the text it was sent**, and a placeholder is
+    /// not the length of its value: the squiggle moved by the difference, onto
+    /// `created_at_long_column` for a long value and backwards for a short one.
+    #[test]
+    fn a_servers_error_position_is_mapped_back_through_the_substitution() {
+        let long =
+            "SELECT * FROM t WHERE name = :name AND nme = 1 ORDER BY created_at_long_column DESC";
+        let value = vec![bound(
+            "name",
+            ParamValue::Text("abcdefghijklmnopqrstuvwxyz".to_string()),
+        )];
+        assert_eq!(squiggle(long, &value, "nme").as_deref(), Some("nme"));
+
+        let short = "SELECT a, bb FROM t WHERE c = :customer_id AND nope > 1";
+        let seven = vec![bound("customer_id", ParamValue::Number("7".to_string()))];
+        assert_eq!(squiggle(short, &seven, "nope").as_deref(), Some("nope"));
+
+        // Several, and a multi-byte value: still characters, not bytes.
+        let two = "SELECT :a, :b, nope FROM t";
+        let both = vec![
+            bound("a", ParamValue::Text("ééé".to_string())),
+            bound("b", ParamValue::Raw("1 + 2 + 3".to_string())),
+        ];
+        assert_eq!(squiggle(two, &both, "nope").as_deref(), Some("nope"));
+    }
+
+    /// A position inside a value is the placeholder's; one with no
+    /// placeholder ahead of it is unchanged; and a placeholder ahead of it
+    /// with no value cannot be measured, so nothing is claimed.
+    #[test]
+    fn a_position_inside_a_value_is_the_placeholders() {
+        let t = "SELECT :v, x";
+        let b = vec![bound("v", ParamValue::Text("abcdef".to_string()))];
+        // Sent: `SELECT 'abcdef', x` — char 10 is inside the literal.
+        assert_eq!(template_position(t, &b, PG, 10), Some(8));
+        assert_eq!(template_position(t, &b, PG, 3), Some(3));
+        assert_eq!(template_position(t, &b, PG, 18), Some(12));
+        assert_eq!(template_position("SELECT 1", &[], PG, 5), Some(5));
+        assert_eq!(template_position(t, &[], PG, 17), None);
+        // Before the unbound one is still known.
+        assert_eq!(template_position(t, &[], PG, 3), Some(3));
+        assert_eq!(template_position(t, &b, PG, 0), None);
     }
 
     // ── neutralize ──────────────────────────────────────────────────────────

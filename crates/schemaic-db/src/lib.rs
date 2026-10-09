@@ -109,7 +109,9 @@ pub enum DbError {
     /// field, and only that one (an `Internal` position indexes a query the
     /// server built itself, a function body's, never the user's text).
     /// Produced on the run path alone (`pg::run_err`), where the text sent is
-    /// the editor's, unrewritten; everything else is told as before.
+    /// the editor's with its `:name` parameters substituted — the editor maps
+    /// the position back through them (`params::template_position`);
+    /// everything else is told as before.
     #[error("query failed: {message}")]
     QueryAt { message: String, at: usize },
     #[error("query cancelled")]

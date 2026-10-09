@@ -3046,8 +3046,18 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     && !results.frozen() =>
             {
                 let spans = run_spans.get_untracked();
-                let at = run_sent.get_untracked().zip(err.at);
                 query.with_untracked(|sql| {
+                    // The server's position counts in the text it was *sent*,
+                    // the tab's parameters substituted: mapped back into the
+                    // buffer's own (`params::template_position`).
+                    let at = run_sent.get_untracked().zip(err.at).and_then(|(sent, at)| {
+                        let template = sql.get(sent..)?;
+                        tab_params
+                            .with_untracked(|b| {
+                                params::template_position(template, b, dialect.get_untracked(), at)
+                            })
+                            .map(|at| (sent, at))
+                    });
                     intel::run_error_diagnostic(sql, &spans, at, &err.text, dialect.get_untracked())
                 })
             }
@@ -3055,6 +3065,15 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         };
         if placed.is_some() || !run_diag.with_untracked(Vec::is_empty) {
             run_diag.set(placed.into_iter().collect());
+        }
+    });
+    // A parameter changed after the launch: the values the run substituted are
+    // no longer the ones the position would be mapped through, so the
+    // position goes and the token search places the error, as after an edit.
+    create_effect(move |first: Option<()>| {
+        tab_params.track();
+        if first.is_some() && run_sent.get_untracked().is_some() {
+            run_sent.set(None);
         }
     });
     let val_gen: Rc<std::cell::Cell<u64>> = Rc::new(std::cell::Cell::new(0));
