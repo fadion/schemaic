@@ -2878,14 +2878,32 @@ fn export_column_csv(gs: GridState, ci: usize) -> String {
 
 fn export_column_in_list(gs: GridState, ci: usize) -> String {
     let (rs, order) = exported_rows(gs);
-    schemaic_core::export::export_column_in_list(&rs, order.as_slice(), ci, gs.dialect)
+    sql_copy_text(
+        gs,
+        schemaic_core::export::export_column_in_list(&rs, order.as_slice(), ci, gs.dialect),
+    )
 }
 
 /// The rows the gutter menu was opened on as `VALUES` tuples — the rows
 /// [`render_rows_at`] resolves for every other *Copy as* entry.
 fn export_values_at(gs: GridState, pos: usize) -> String {
     let (rs, order) = exported_rows_at(gs, pos);
-    schemaic_core::export::export_values(&rs, order.as_slice(), gs.dialect)
+    sql_copy_text(
+        gs,
+        schemaic_core::export::export_values(&rs, order.as_slice(), gs.dialect),
+    )
+}
+
+/// A SQL fragment's text for the clipboard, with its withheld binary columns
+/// said on the bar — as [`render_order`] says them for JSON and CSV, since the
+/// fragment has nowhere to carry a note. Said even when the text is empty: an
+/// IN list of a binary key copies nothing, and the clipboard still holding
+/// what it held before is the surprise the note is for.
+fn sql_copy_text(gs: GridState, copy: schemaic_core::export::SqlCopy) -> String {
+    if let Some(note) = copy.note() {
+        gs.commit_note.set(Some(note));
+    }
+    copy.text
 }
 
 /// The Download icon's menu: a format per entry, or — when there is more of the

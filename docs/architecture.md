@@ -4151,7 +4151,16 @@ existing prose was left alone.
     caller then leaves the clipboard alone (`a_column_copies_as_an_in_list`). The second is the
     rows as `VALUES` tuples — what *Copy as SQL INSERT* writes, without the statement around it —
     one per line and comma-separated, a NULL and a withheld binary cell both `NULL`
-    (`rows_copy_as_values_tuples`). **Both take `script_literal`, as *Copy as SQL INSERT* does**:
+    (`rows_copy_as_values_tuples`). **Both return a `SqlCopy` — the text and the binary columns it
+    withheld — rather than a bare string**, because a fragment pasted after a `VALUES` or into an
+    `IN (…)` cannot carry the `-- NOTE:` line the INSERT export writes, and every engine renders
+    every binary value as the placeholder: a `BINARY(16)` key's tuples came out all `NULL` and its
+    IN list came out empty, leaving the clipboard as it was, both without a word. `SqlCopy::note`
+    is the sentence for the bar, worded by what happened to the cells — written as NULL, left out,
+    or *Nothing copied* when nothing was left — and the grid's `sql_copy_text` puts it on
+    `commit_note` even when the text is empty
+    (`a_binary_columns_in_list_withholds_its_values_and_names_the_column`,
+    `values_tuples_name_the_binary_columns_they_write_as_null`). **Both take `script_literal`, as *Copy as SQL INSERT* does**:
     a copy lands wherever it is pasted, a `sqlcmd` script included, so a SQL Server value holding
     `$(` is cut there as it is in the `INSERT`
     (`the_in_list_and_values_copies_keep_sqlcmd_out_of_a_value`). **And a tuple cannot leave a column
@@ -35576,7 +35585,8 @@ this bundle's.
   (`database.<display_name(schema, table)>.column`, the schema tree column entry's shape, offered
   only when the column has a `model::ColumnOrigin`), then `Copy values › CSV / JSON / SQL IN list`
   of that column's values (`export_column_csv`/`_json`/`_in_list` — the last copies nothing when
-  no non-NULL value is left, `IN ()` being no list). The two names differ on an aliased base column:
+  no non-NULL value is left, `IN ()` being no list, and says on the bar when a binary column is
+  why). The two names differ on an aliased base column:
   the origin survives an alias, so the qualified entry is offered there and copies the base
   column's real name (`ColumnOrigin::column`), not the alias. A data cell offers `View`,
   `Edit` (editable
@@ -35658,7 +35668,8 @@ this bundle's.
   the *Copy* beside it takes; SQL goes through `insert_blocks_at` instead (the export bullet above
   says why). *SQL VALUES* follows the list and is not one of its formats: the same rows as bare
   tuples, through `export_values_at` → `exported_rows_at` (`core::export`'s entry has what it does
-  with a pending row's unset cells). Its row
+  with a pending row's unset cells, and with a binary cell, which it writes as `NULL` and names on
+  the bar). Its row
   actions take **every selected row** (`selected_data_rows` → `set_rows_deleted` /
   `clone_rows`) and count them in the label: the same menu naming five rows in one entry and acting
   on one in the next is how four deletions go missing unnoticed. **`set_rows_deleted` batches, and

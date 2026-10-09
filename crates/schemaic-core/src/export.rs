@@ -1477,21 +1477,80 @@ pub fn export_column_csv_to<W: Write>(
     Ok(())
 }
 
+/// A SQL fragment copied to the clipboard — [`export_values`]' tuples or
+/// [`export_column_in_list`]'s list — with the binary columns whose cells it
+/// could not carry.
+///
+/// **The text and what it withheld come back together** because the clipboard
+/// string has nowhere to say it: *Copy as SQL INSERT* writes a `-- NOTE:` line,
+/// but a fragment pasted after a `VALUES` or into an `IN (…)` cannot carry a
+/// comment line, and every engine renders every binary value as the
+/// `<n bytes>` placeholder — so a `BINARY(16)` key's tuples came out all
+/// `NULL`, and its `IN` list came out empty and left the clipboard as it was,
+/// both without a word. [`SqlCopy::note`] is the word, for the grid's bar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqlCopy {
+    /// The fragment. Empty when there is nothing to paste (`IN ()` is a syntax
+    /// error), and the caller then leaves the clipboard alone.
+    pub text: String,
+    /// The binary columns whose cells the fragment does not carry, in column
+    /// order — [`withheld_columns`]' answer over the columns the copy reads.
+    pub withheld: Vec<String>,
+    /// `true` when a withheld cell was written as `NULL` (a tuple cannot leave
+    /// a column out), `false` when it was left out of the list.
+    as_null: bool,
+}
+
+impl SqlCopy {
+    /// The sentence the grid's bar shows after the copy, or `None` when
+    /// nothing was withheld — silence is the default, as in [`export_note`].
+    ///
+    /// It says what happened to the cells, because the two copies do different
+    /// things with them and the fix differs: `NULL` in a tuple overwrites the
+    /// bytes if pasted into an `INSERT`, and a value left out of an `IN` list
+    /// narrows what it matches — down to *nothing copied at all* when the
+    /// column held only bytes, the case where the clipboard still holds
+    /// whatever was there before.
+    pub fn note(&self) -> Option<String> {
+        if self.withheld.is_empty() {
+            return None;
+        }
+        let cols = self.withheld.join(", ");
+        let holds = crate::text::plural(self.withheld.len(), "holds", "hold");
+        Some(if self.as_null {
+            format!(
+                "Copied to the clipboard — {cols} {holds} bytes SQL text cannot carry: written as NULL"
+            )
+        } else if self.text.is_empty() {
+            format!("Nothing copied — {cols} {holds} bytes SQL text cannot carry")
+        } else {
+            format!(
+                "Copied to the clipboard — {cols} {holds} bytes SQL text cannot carry: those values are left out"
+            )
+        })
+    }
+}
+
 /// One column's values as the parenthesised list an `IN` takes — `(1, 2, 3)`
 /// — each distinct value once, in `order`, as `dialect`'s literal for the
 /// column's type ([`script_literal`], since it is pasted wherever *Copy as SQL
 /// INSERT* is, a `sqlcmd` script included). A NULL is left out: `x IN (NULL)`
 /// matches nothing, and a NULL in a `NOT IN` list makes it match nothing at
-/// all. So is a withheld binary cell. Empty when no value is left, since
-/// `IN ()` is a syntax error and the caller then leaves the clipboard alone.
+/// all. So is a withheld binary cell, which [`SqlCopy::withheld`] names. Empty
+/// when no value is left, since `IN ()` is a syntax error and the caller then
+/// leaves the clipboard alone.
 pub fn export_column_in_list(
     rs: &ResultSet,
     order: &[usize],
     ci: usize,
     dialect: SqlDialect,
-) -> String {
+) -> SqlCopy {
     let Some(col) = rs.columns.get(ci) else {
-        return String::new();
+        return SqlCopy {
+            text: String::new(),
+            withheld: Vec::new(),
+            as_null: false,
+        };
     };
     let mask = binary_mask(rs, &dropped_binary_columns(rs, order));
     let mut seen = std::collections::HashSet::new();
@@ -1502,10 +1561,22 @@ pub fn export_column_in_list(
         .map(|c| script_literal(&c.to_value(), &col.type_name, dialect))
         .filter(|lit| seen.insert(lit.clone()))
         .collect();
-    if items.is_empty() {
-        return String::new();
+    // Only this column's own withholding: the list reads no other.
+    let withheld = if mask.get(ci).copied().unwrap_or(false) {
+        vec![col.name.clone()]
+    } else {
+        Vec::new()
+    };
+    let text = if items.is_empty() {
+        String::new()
+    } else {
+        format!("({})", items.join(", "))
+    };
+    SqlCopy {
+        text,
+        withheld,
+        as_null: false,
     }
-    format!("({})", items.join(", "))
 }
 
 /// The rows of `order` as the tuples a `VALUES` takes, one per line and
@@ -1513,10 +1584,12 @@ pub fn export_column_in_list(
 /// statement around them, for pasting after a `VALUES` the user has written,
 /// through the same [`script_literal`]. A NULL, and a withheld binary cell, is
 /// `NULL` — and so is a pending row's unset cell, which the caller's rows
-/// already hold as one: a tuple cannot leave a column out.
-pub fn export_values(rs: &ResultSet, order: &[usize], dialect: SqlDialect) -> String {
-    let mask = binary_mask(rs, &dropped_binary_columns(rs, order));
-    order
+/// already hold as one: a tuple cannot leave a column out. The withheld
+/// columns are [`SqlCopy::withheld`], for the note the text cannot carry.
+pub fn export_values(rs: &ResultSet, order: &[usize], dialect: SqlDialect) -> SqlCopy {
+    let dropped = dropped_binary_columns(rs, order);
+    let mask = binary_mask(rs, &dropped);
+    let text = order
         .iter()
         .filter(|&&di| di < rs.row_count())
         .map(|&di| {
@@ -1534,7 +1607,16 @@ pub fn export_values(rs: &ResultSet, order: &[usize], dialect: SqlDialect) -> St
             format!("({})", cells.join(", "))
         })
         .collect::<Vec<_>>()
-        .join(",\n")
+        .join(",\n");
+    SqlCopy {
+        text,
+        // `withheld_columns`' answer, from the scan already made for the mask.
+        withheld: dropped
+            .into_iter()
+            .filter_map(|ci| rs.columns.get(ci).map(|c| c.name.clone()))
+            .collect(),
+        as_null: true,
+    }
 }
 
 /// The whole result as CSV (header row + data rows; NULL → empty field).
@@ -6787,27 +6869,91 @@ mod tests {
     /// matches nothing, and `NOT IN` with one matches nothing at all.
     #[test]
     fn a_column_copies_as_an_in_list() {
+        let mut uid = col("uid");
+        uid.type_name = "BINARY(16)".to_string();
         let rs = ResultSet::from_rows(
-            vec![col("id"), col("name")],
+            vec![col("id"), col("name"), uid],
             vec![
-                vec![Value::Int(2), Value::Str("O'Brien".to_string())],
-                vec![Value::Int(1), Value::Null],
-                vec![Value::Int(2), Value::Str("a\\b".to_string())],
+                vec![
+                    Value::Int(2),
+                    Value::Str("O'Brien".to_string()),
+                    Value::Str(crate::model::binary_display(16)),
+                ],
+                vec![Value::Int(1), Value::Null, Value::Null],
+                vec![
+                    Value::Int(2),
+                    Value::Str("a\\b".to_string()),
+                    Value::Str(crate::model::binary_display(16)),
+                ],
             ],
         );
-        assert_eq!(export_column_in_list(&rs, &[0, 1, 2], 0, MySql), "(2, 1)");
-        assert_eq!(export_column_in_list(&rs, &[1, 0, 2], 0, MySql), "(1, 2)");
-        assert_eq!(
-            export_column_in_list(&rs, &[0, 1, 2], 1, MySql),
-            "('O''Brien', 'a\\\\b')"
-        );
-        assert_eq!(
-            export_column_in_list(&rs, &[0, 1, 2], 1, MsSql),
-            "(N'O''Brien', N'a\\b')"
-        );
+        let list = |order: &[usize], ci, d| export_column_in_list(&rs, order, ci, d);
+        assert_eq!(list(&[0, 1, 2], 0, MySql).text, "(2, 1)");
+        assert_eq!(list(&[1, 0, 2], 0, MySql).text, "(1, 2)");
+        assert_eq!(list(&[0, 1, 2], 1, MySql).text, "('O''Brien', 'a\\\\b')");
+        assert_eq!(list(&[0, 1, 2], 1, MsSql).text, "(N'O''Brien', N'a\\b')");
         // Nothing but NULLs is no list: `IN ()` is a syntax error.
-        assert_eq!(export_column_in_list(&rs, &[1], 1, Postgres), "");
-        assert_eq!(export_column_in_list(&rs, &[], 0, Postgres), "");
+        assert_eq!(list(&[1], 1, Postgres).text, "");
+        assert_eq!(list(&[], 0, Postgres).text, "");
+        // A column beside a binary one withholds nothing: the list reads only
+        // its own column.
+        assert!(list(&[0, 1, 2], 0, MySql).withheld.is_empty());
+        assert_eq!(list(&[0, 1, 2], 0, MySql).note(), None);
+        // A NULL-only list is empty for a reason the bar need not explain.
+        assert_eq!(list(&[1], 1, Postgres).note(), None);
+    }
+
+    /// **A binary column's IN list is empty, and says why.** Every engine
+    /// renders every binary value as the `<n bytes>` placeholder, so a
+    /// `BINARY(16)` UUID key's list carries none of its values — never the
+    /// placeholder as `0x…` or `'<16 bytes>'` — and the copy names the column,
+    /// since an empty list leaves the clipboard holding whatever it held.
+    #[test]
+    fn a_binary_columns_in_list_withholds_its_values_and_names_the_column() {
+        let mut uid = col("uid");
+        uid.type_name = "BINARY(16)".to_string();
+        let rs = ResultSet::from_rows(
+            vec![col("id"), uid],
+            vec![
+                vec![Value::Int(1), Value::Str(crate::model::binary_display(16))],
+                vec![Value::Int(2), Value::Null],
+            ],
+        );
+        let copy = export_column_in_list(&rs, &[0, 1], 1, MySql);
+        assert_eq!(copy.text, "");
+        assert_eq!(copy.withheld, vec!["uid".to_string()]);
+        let note = copy
+            .note()
+            .expect("an empty copy of a binary column says so");
+        assert!(note.starts_with("Nothing copied"), "{note}");
+        assert!(note.contains("uid"), "{note}");
+        // Rows that hold no placeholder withhold nothing.
+        assert!(
+            export_column_in_list(&rs, &[1], 1, MySql)
+                .withheld
+                .is_empty()
+        );
+    }
+
+    /// A column that held a blob in one row and real text in another keeps the
+    /// text, and the note says the rest were left out rather than "nothing".
+    #[test]
+    fn a_mixed_binary_columns_in_list_keeps_its_text_and_says_the_rest_were_left_out() {
+        let mut payload = col("payload");
+        payload.type_name = "BYTEA".to_string();
+        let rs = ResultSet::from_rows(
+            vec![payload],
+            vec![
+                vec![Value::Str("\\x4869".to_string())],
+                vec![Value::Str(crate::model::binary_display(3))],
+            ],
+        );
+        let copy = export_column_in_list(&rs, &[0, 1], 0, Postgres);
+        assert!(copy.text.contains("4869"), "{}", copy.text);
+        assert!(!copy.text.contains("bytes"), "{}", copy.text);
+        assert_eq!(copy.withheld, vec!["payload".to_string()]);
+        let note = copy.note().expect("a withheld value is said");
+        assert!(note.contains("left out"), "{note}");
     }
 
     /// Rows as the tuples a `VALUES` takes, one per line, a NULL as `NULL`
@@ -6815,11 +6961,27 @@ mod tests {
     #[test]
     fn rows_copy_as_values_tuples() {
         assert_eq!(
-            export_values(&rs(), &[0, 1], Sqlite),
+            export_values(&rs(), &[0, 1], Sqlite).text,
             "(1, 'x'),\n(NULL, 'y')"
         );
-        assert_eq!(export_values(&rs(), &[1], MsSql), "(NULL, N'y')");
-        assert_eq!(export_values(&rs(), &[], MySql), "");
+        assert_eq!(export_values(&rs(), &[1], MsSql).text, "(NULL, N'y')");
+        assert_eq!(export_values(&rs(), &[], MySql).text, "");
+        assert!(export_values(&rs(), &[0, 1], Sqlite).withheld.is_empty());
+        assert_eq!(export_values(&rs(), &[0, 1], Sqlite).note(), None);
+    }
+
+    /// **A binary cell's `NULL` in a tuple is said, not just written.** The
+    /// fragment cannot carry a `-- NOTE:` the way *Copy as SQL INSERT* does, so
+    /// the copy names the column for the bar — pasted after an `INSERT … VALUES`
+    /// those tuples would load the column as NULL, or fail a NOT NULL key.
+    #[test]
+    fn values_tuples_name_the_binary_columns_they_write_as_null() {
+        let copy = export_values(&blob_rs(), &[0], MySql);
+        assert_eq!(copy.text, "(1, NULL)");
+        assert_eq!(copy.withheld, vec!["thumb".to_string()]);
+        let note = copy.note().expect("a withheld column is said");
+        assert!(note.contains("thumb"), "{note}");
+        assert!(note.contains("NULL"), "{note}");
     }
 
     /// Both copies are pasted where *Copy as SQL INSERT* is — possibly into a
@@ -6832,10 +6994,10 @@ mod tests {
         );
         let want = "(N'cost $' + N'(HOME)')";
         assert_eq!(
-            export_column_in_list(&rs, &[0], 0, MsSql),
+            export_column_in_list(&rs, &[0], 0, MsSql).text,
             format!("({want})")
         );
-        assert_eq!(export_values(&rs, &[0], MsSql), format!("({want})"));
+        assert_eq!(export_values(&rs, &[0], MsSql).text, format!("({want})"));
     }
 
     #[test]
