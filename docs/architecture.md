@@ -414,7 +414,10 @@ existing prose was left alone.
     (`run_at_the_caret_stops_at_the_carets_statement_in_a_batch_scope`,
     `ctrl_enter_outlines_a_batch_scoped_piece_before_running_it`). **None of that applies to a
     selection**: Ctrl+Enter over selected code runs exactly it, split into its statements
-    (`sql::selection_statements`, over `executable_statements`) and handed to the guarded `run` —
+    (`sql::selection_statements`, over `editor_executable_spans` — cut as Run Everything cuts, so
+    Select All over a script written without `;` runs it piece by piece rather than sending it as one
+    statement the server refuses, `a_selection_is_cut_at_its_blank_lines_as_run_everything_cuts`)
+    and handed to the guarded `run` —
     or `run_all` for several — with no menu, a fragment of a statement included
     (`a_selection_runs_as_its_statements`). The missing-`WHERE` guards lose nothing by the larger
     piece, since `tsql_statements` (below) cuts at statement words and not at `;` — and the `.sql`
@@ -830,10 +833,14 @@ existing prose was left alone.
     `a_blank_line_inside_a_statement_does_not_cut_it`,
     `a_blank_line_does_not_cut_a_governed_statement_from_its_head`). **Run Everything cuts the same way**:
     `editor_executable_spans` is `executable_spans` with the unterminated tail cut by the same
-    `blank_line_cuts`, read by the run menu's Run Everything and by the toolbar's Run — which sends
+    `blank_line_cuts`, read by the run menu's Run Everything, by a selection's Ctrl+Enter
+    (`selection_spans`), by the command palette's *Run* (`run_everything_statements`, those spans
+    sliced — it split with `statement_ranges` and so sent `END$$` and a `;`-less script as one
+    statement) and by the toolbar's Run — which sends
     the pieces through `run_all` when a blank line cut something, and the whole buffer through `run`
-    as before when none did; both stay behind the write guard
-    (`run_everything_cuts_the_unterminated_tail_at_blank_lines`). **The rest is deliberately
+    as before when none did; all stay behind the write guard
+    (`run_everything_cuts_the_unterminated_tail_at_blank_lines`,
+    `run_everything_statements_drop_the_delimiter_and_cut_blank_lines`). **The rest is deliberately
     terminator-only**: `statement_range` (completion, signature help, the AI actions),
     `statement_ranges`, `executable_statements`, the script runner, a dump and `schemaic exec` — a
     file is not a buffer someone is writing in, and a blank line inside a long statement there must

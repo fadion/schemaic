@@ -1604,6 +1604,18 @@ pub fn editor_executable_spans(sql: &str, dialect: SqlDialect) -> Vec<(usize, us
     out
 }
 
+/// **What Run Everything sends** for `sql`: [`editor_executable_spans`]' text,
+/// statement by statement. Every whole-buffer run in the editor reads it — the
+/// run menu's Run Everything, the command palette's *Run* — so none of them can
+/// hold a split of its own: the palette's kept the ranges' `DELIMITER` token
+/// (`END$$`) and sent a script written without `;` as one statement.
+pub fn run_everything_statements(sql: &str, dialect: SqlDialect) -> Vec<String> {
+    editor_executable_spans(sql, dialect)
+        .into_iter()
+        .map(|(lo, hi)| sql[lo..hi].to_string())
+        .collect()
+}
+
 /// Where `part`, a slice borrowed from `whole`, sits in it.
 pub fn span_in(whole: &str, part: &str) -> (usize, usize) {
     let lo = part.as_ptr() as usize - whole.as_ptr() as usize;
@@ -2793,7 +2805,10 @@ pub fn statement_range(sql: &str, offset: usize, dialect: SqlDialect) -> (usize,
 }
 
 /// What Ctrl+Enter runs when text is selected: the selection's statements,
-/// split as Run Everything splits ([`executable_statements`]) — or `None` when
+/// split as Run Everything splits ([`editor_executable_spans`] — the client's
+/// `DELIMITER` token dropped, and the stretch no `;` ends cut at its blank
+/// lines, so Select All over a script written without `;` runs it statement
+/// by statement rather than as one the server refuses) — or `None` when
 /// nothing is selected, or nothing in it is code ([`holds_code`]), and the
 /// statement at the caret runs as before. The selection is run as written, a
 /// fragment of a statement included: selecting is how one asks for exactly
@@ -2812,7 +2827,8 @@ pub fn selection_statements(
     )
 }
 
-/// [`selection_statements`] as byte ranges of `sql` — see [`executable_spans`].
+/// [`selection_statements`] as byte ranges of `sql` — see
+/// [`editor_executable_spans`].
 pub fn selection_spans(
     sql: &str,
     sel: Option<(usize, usize)>,
@@ -2824,7 +2840,7 @@ pub fn selection_spans(
     if !holds_code(text, dialect) {
         return None;
     }
-    let spans: Vec<(usize, usize)> = executable_spans(text, dialect)
+    let spans: Vec<(usize, usize)> = editor_executable_spans(text, dialect)
         .into_iter()
         .map(|(s, e)| (lo + s, lo + e))
         .collect();
@@ -6595,6 +6611,61 @@ mod span_tests {
         assert_eq!(spans[0].0, lo);
         assert_eq!(selection_spans(sql, Some((3, 3)), d), None);
         assert_eq!(selection_spans(sql, None, d), None);
+    }
+
+    /// **A selection runs as Run Everything runs it.** Select All over a
+    /// script written without `;` and Ctrl+Enter sent `select 1⏎⏎select 2`
+    /// as one statement, which the server refused, where Run Everything sent
+    /// two.
+    #[test]
+    fn a_selection_is_cut_at_its_blank_lines_as_run_everything_cuts() {
+        use super::{editor_executable_spans, selection_statements};
+        for d in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::MsSql] {
+            let sql = "select 1\n\nselect 2";
+            assert_eq!(
+                selection_statements(sql, Some((0, sql.len())), d),
+                Some(vec!["select 1".to_string(), "select 2".to_string()]),
+                "{d:?}"
+            );
+            // The whole buffer selected is Run Everything, span for span.
+            assert_eq!(
+                selection_spans(sql, Some((0, sql.len())), d),
+                Some(editor_executable_spans(sql, d)),
+                "{d:?}"
+            );
+        }
+        // A blank line inside a statement still does not cut it.
+        let sql = "select a,\n\nb from t";
+        assert_eq!(
+            selection_statements(sql, Some((0, sql.len())), SqlDialect::MySql),
+            Some(vec![sql.to_string()])
+        );
+    }
+
+    /// **The command palette's Run sends what Run Everything sends**: it
+    /// split with the ranges, so a dump's trigger went out ending `END$$` —
+    /// one identifier to MySQL, a syntax error — and a script without `;` as
+    /// one statement.
+    #[test]
+    fn run_everything_statements_drop_the_delimiter_and_cut_blank_lines() {
+        use super::{editor_executable_spans, run_everything_statements};
+        let my = SqlDialect::MySql;
+        assert_eq!(
+            run_everything_statements("SELECT 1\n\nSELECT 2", my),
+            ["SELECT 1", "SELECT 2"]
+        );
+        let sql = "SELECT 1;\nDELIMITER $$\nCREATE TRIGGER t BEFORE INSERT ON x FOR EACH ROW BEGIN SET @a = 1; END$$\nDELIMITER ;\nSELECT 2";
+        let got = run_everything_statements(sql, my);
+        assert_eq!(got.len(), 3, "{got:?}");
+        assert!(got.iter().all(|s| !s.contains("$$")), "{got:?}");
+        assert!(got[1].ends_with("END"), "{got:?}");
+        // The spans the editor records are the same statements.
+        let spans: Vec<String> = editor_executable_spans(sql, my)
+            .into_iter()
+            .map(|(lo, hi)| sql[lo..hi].to_string())
+            .collect();
+        assert_eq!(got, spans);
+        assert!(run_everything_statements("  -- nothing\n", my).is_empty());
     }
 }
 

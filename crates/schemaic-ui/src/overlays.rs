@@ -3943,11 +3943,10 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
                                     })
                             })
                             .unwrap_or_default();
-                        let stmts: Vec<String> = schemaic_core::sql::statement_ranges(&q, dialect)
-                            .into_iter()
-                            .map(|(lo, hi)| q[lo..hi].to_string())
-                            .filter(|s| !s.trim().is_empty())
-                            .collect();
+                        // What Run Everything sends, not the ranges: a range
+                        // keeps a `DELIMITER` terminator (`END$$`) and has no
+                        // blank-line cut for a script written without `;`.
+                        let stmts = schemaic_core::sql::run_everything_statements(&q, dialect);
                         if !stmts.is_empty() {
                             (run_all)(stmts);
                         }
