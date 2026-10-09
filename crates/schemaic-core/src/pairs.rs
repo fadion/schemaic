@@ -186,6 +186,23 @@ pub fn auto_pair(
     ch: char,
     dialect: SqlDialect,
 ) -> Option<PairAction> {
+    let caret = sel_start.min(sel_end);
+    auto_pair_in(text, sel_start, sel_end, ch, dialect, || {
+        region_at(text, caret, dialect)
+    })
+}
+
+/// [`auto_pair`] with the caret's [`Region`] answered by the caller — asked
+/// at most once, and only for a bare caret — so many carets can share one
+/// [`regions_at`] walk rather than each walking the text from its start.
+pub(crate) fn auto_pair_in(
+    text: &str,
+    sel_start: usize,
+    sel_end: usize,
+    ch: char,
+    dialect: SqlDialect,
+    region: impl FnOnce() -> Region,
+) -> Option<PairAction> {
     let lo = sel_start.min(sel_end);
     let hi = sel_start.max(sel_end);
     let b = text.as_bytes();
@@ -218,7 +235,7 @@ pub fn auto_pair(
         Cat::Open(o, c) => {
             // Only auto-close in code, and not when it would run straight into a
             // word (`(name` must stay `(name`, not become `()name`).
-            if region_at(text, caret, dialect) != Region::Code {
+            if region() != Region::Code {
                 return None;
             }
             if next.is_some_and(is_word_byte) {
@@ -234,7 +251,7 @@ pub fn auto_pair(
         Cat::Close(c) => {
             // Type over an existing closer sitting at the caret (only in code — a
             // `)` inside a string/comment is literal text).
-            if region_at(text, caret, dialect) == Region::Code && next == Some(c as u8) {
+            if next == Some(c as u8) && region() == Region::Code {
                 Some(PairAction::Skip { caret: caret + 1 })
             } else {
                 None
@@ -242,7 +259,7 @@ pub fn auto_pair(
         }
         Cat::Quote(q) => {
             let qb = q as u8;
-            match region_at(text, caret, dialect) {
+            match region() {
                 // Never auto-anything inside a comment.
                 Region::Comment => None,
                 // Inside a string: typing the same quote at its close types over
@@ -289,19 +306,43 @@ pub fn auto_pair(
 /// Backspace took both, leaving `'its'`; inside a string `'f(|)'` it took a
 /// paren pair nobody had typed as one.
 pub fn backspace_pair(text: &str, caret: usize, dialect: SqlDialect) -> Option<(usize, usize)> {
+    backspace_pair_in(text, caret, dialect, || {
+        noncode_span_at(text.as_bytes(), caret - 1, dialect)
+    })
+}
+
+/// Do the bytes either side of `caret` look like an empty pair — the cheap
+/// question [`backspace_pair`] asks before the lexer's?
+pub(crate) fn may_be_empty_pair(text: &str, caret: usize, dialect: SqlDialect) -> bool {
     let b = text.as_bytes();
-    if caret == 0 || caret >= b.len() {
+    caret > 0
+        && caret < b.len()
+        && match (b[caret - 1], b[caret]) {
+            (b'(', b')') | (b'\'', b'\'') | (b'"', b'"') => true,
+            (b'`', b'`') => dialect.backtick_ident(),
+            _ => false,
+        }
+}
+
+/// [`backspace_pair`] with the span holding `caret - 1` answered by the
+/// caller — asked at most once, and only when the two bytes look like a pair
+/// ([`may_be_empty_pair`]) — so many carets can share one
+/// [`noncode_spans_at`] walk.
+pub(crate) fn backspace_pair_in(
+    text: &str,
+    caret: usize,
+    dialect: SqlDialect,
+    span: impl FnOnce() -> Option<(usize, usize)>,
+) -> Option<(usize, usize)> {
+    if !may_be_empty_pair(text, caret, dialect) {
         return None;
     }
-    let (quote, paren) = match (b[caret - 1], b[caret]) {
-        (b'(', b')') => (false, true),
-        (b'\'', b'\'') | (b'"', b'"') => (true, false),
-        (b'`', b'`') => (dialect.backtick_ident(), false),
-        _ => (false, false),
+    let span = span();
+    let empty_pair = if text.as_bytes()[caret - 1] == b'(' {
+        span.is_none()
+    } else {
+        span == Some((caret - 1, caret + 1))
     };
-    let span = || noncode_span_at(b, caret - 1, dialect);
-    let empty_pair =
-        (quote && span() == Some((caret - 1, caret + 1))) || (paren && span().is_none());
     empty_pair.then_some((caret - 1, caret + 1))
 }
 
@@ -323,6 +364,40 @@ fn noncode_span_at(b: &[u8], pos: usize, dialect: SqlDialect) -> Option<(usize, 
         }
     }
     None
+}
+
+/// [`noncode_span_at`] for **many** positions, in one walk: `positions` must
+/// be non-decreasing, and each answer is exactly what `noncode_span_at` says.
+/// The walk visits the same offsets whatever position it is asked about, and
+/// stops for one only where that position is settled — so the next one picks
+/// it up from there, a span holding both answering both.
+pub(crate) fn noncode_spans_at(
+    b: &[u8],
+    positions: &[usize],
+    dialect: SqlDialect,
+) -> Vec<Option<(usize, usize)>> {
+    debug_assert!(
+        positions.windows(2).all(|w| w[0] <= w[1]),
+        "noncode_spans_at needs its positions in order"
+    );
+    let mut out = vec![None; positions.len()];
+    let mut i = 0;
+    for (k, &pos) in positions.iter().enumerate() {
+        while i <= pos {
+            match skip_noncode(b, i, dialect) {
+                Some(j) => {
+                    let j = j.max(i + 1);
+                    if pos < j {
+                        out[k] = Some((i, j));
+                        break;
+                    }
+                    i = j;
+                }
+                None => i += 1,
+            }
+        }
+    }
+    out
 }
 
 /// How many brackets — `(` and `[`, in code — are open at the start of each
@@ -1677,6 +1752,39 @@ mod tests {
                 let got = regions_at(sql, &dup, d);
                 for (k, &o) in dup.iter().enumerate() {
                     assert_eq!(got[k], region_at(sql, o, d), "{d:?} {sql:?} sparse at {o}");
+                }
+            }
+        }
+    }
+
+    /// `noncode_spans_at` answers position for position what
+    /// `noncode_span_at` does — the batch Backspace at many carets asks — on
+    /// the same corpora, every position and a sparse duplicated list.
+    #[test]
+    fn noncode_spans_at_answers_position_for_position_what_noncode_span_at_does() {
+        let corpora = [
+            "",
+            "select 'a b' from t -- tail",
+            "/* head */ select 1 /* tail",
+            "select \"q\" , `b` , [c] from t",
+            "select $$ a 'b' -- c $$ , $tag$ d $tag$ from t",
+            "'it''s' , '' , ('')",
+            "a\n  'str\n  more\n  ' end\nb",
+        ];
+        for sql in corpora {
+            let b = sql.as_bytes();
+            for d in [MySql, Postgres, MsSql, Sqlite] {
+                let all: Vec<usize> = (0..sql.len()).collect();
+                let got = noncode_spans_at(b, &all, d);
+                for &p in &all {
+                    assert_eq!(got[p], noncode_span_at(b, p, d), "{d:?} {sql:?} at {p}");
+                }
+                let mut dup: Vec<usize> = all.iter().copied().filter(|p| p % 3 == 1).collect();
+                dup.extend(dup.clone());
+                dup.sort_unstable();
+                let got = noncode_spans_at(b, &dup, d);
+                for (k, &p) in dup.iter().enumerate() {
+                    assert_eq!(got[k], noncode_span_at(b, p, d), "{d:?} {sql:?} sparse {p}");
                 }
             }
         }

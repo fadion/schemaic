@@ -1485,9 +1485,24 @@ pub fn line_blocks(text: &str, regions: &[(usize, usize)]) -> Vec<LineBlock> {
 pub fn box_regions(text: &str, anchor: usize, head: usize) -> Vec<(usize, usize)> {
     let len = text.len();
     let (anchor, head) = (anchor.min(len), head.min(len));
-    let starts = line_start_offsets(text);
+    // The starts of the box's own lines only, from the upper end's line to
+    // the lower end: this runs on every pointer move of the drag, and a table
+    // of the whole document was a full pass of a 16 MiB script per move.
+    let (top, bottom) = (anchor.min(head), anchor.max(head));
+    let first = text[..top].rfind('\n').map_or(0, |i| i + 1);
+    let mut starts = vec![first];
+    starts.extend(
+        text.as_bytes()[first..bottom]
+            .iter()
+            .enumerate()
+            .filter(|&(_, &c)| c == b'\n')
+            .map(|(i, _)| first + i + 1),
+    );
     let line_end = |l: usize| {
-        let end = starts.get(l + 1).map_or(len, |&s| s - 1);
+        let end = starts.get(l + 1).map_or_else(
+            || text[starts[l]..].find('\n').map_or(len, |i| starts[l] + i),
+            |&s| s - 1,
+        );
         // A CRLF line's `\r` is not a column.
         if text[..end].ends_with('\r') {
             end - 1
@@ -1703,12 +1718,30 @@ pub fn auto_pair_all(
     ch: char,
     dialect: SqlDialect,
 ) -> Option<MultiEdit> {
+    // **Every caret's region from one walk** (`pairs::regions_at`), not a
+    // `region_at` walk from byte 0 per caret: a zero-width box down a
+    // 3,200-line script made typing a quote there quadratic — 600 ms a
+    // keystroke, measured, where one walk is a couple of milliseconds.
+    let mut order: Vec<usize> = (0..regions.len()).collect();
+    order.sort_by_key(|&k| regions[k].0.min(regions[k].1));
+    let offsets: Vec<usize> = order
+        .iter()
+        .map(|&k| regions[k].0.min(regions[k].1))
+        .collect();
+    let mut region = vec![crate::pairs::Region::Code; regions.len()];
+    for (&k, r) in order
+        .iter()
+        .zip(crate::pairs::regions_at(text, &offsets, dialect))
+    {
+        region[k] = r;
+    }
     let mut paired = false;
     let edits = regions
         .iter()
-        .map(|&(a, b)| {
+        .zip(&region)
+        .map(|(&(a, b), &r)| {
             let (lo, hi) = (a.min(b), a.max(b));
-            match crate::pairs::auto_pair(text, a, b, ch, dialect) {
+            match crate::pairs::auto_pair_in(text, a, b, ch, dialect, || r) {
                 Some(crate::pairs::PairAction::Insert {
                     start,
                     end,
@@ -1755,12 +1788,24 @@ pub fn auto_pair_all(
 /// character. `None` when no caret sits in a pair — the editor's own
 /// Backspace then serves them all.
 pub fn backspace_pair_all(text: &str, carets: &[usize], dialect: SqlDialect) -> Option<MultiEdit> {
+    // The spans the lexer answers, from one walk for every caret that looks
+    // like it sits in a pair, rather than one walk from byte 0 each.
+    let carets: Vec<usize> = carets.iter().map(|&c| c.min(text.len())).collect();
+    let mut asked: Vec<usize> = carets
+        .iter()
+        .copied()
+        .filter(|&c| crate::pairs::may_be_empty_pair(text, c, dialect))
+        .map(|c| c - 1)
+        .collect();
+    asked.sort_unstable();
+    asked.dedup();
+    let spans = crate::pairs::noncode_spans_at(text.as_bytes(), &asked, dialect);
+    let span_of = |c: usize| asked.binary_search(&(c - 1)).ok().and_then(|k| spans[k]);
     let mut paired = false;
     let edits = carets
         .iter()
         .map(|&c| {
-            let c = c.min(text.len());
-            if let Some((s, e)) = crate::pairs::backspace_pair(text, c, dialect) {
+            if let Some((s, e)) = crate::pairs::backspace_pair_in(text, c, dialect, || span_of(c)) {
                 paired = true;
                 return RegionEdit {
                     start: s,
@@ -1842,6 +1887,107 @@ mod tests {
         assert_eq!(m.sels, vec![(0, 0), (0, 0)]);
     }
 
+    /// The batched lexer walk behind `auto_pair_all` and `backspace_pair_all`
+    /// answers what asking each caret alone does — every caret position of a
+    /// text with strings, comments and pairs, carets given out of order and
+    /// two at one spot included.
+    #[test]
+    fn many_carets_pair_exactly_as_each_would_alone() {
+        let texts = [
+            "f() x '' \"\" `` y\n('a') /* ( */ 'it''s' -- ''\nz $$ () $$ []",
+            "select (1, 'two', 3);\nselect '' , (), x;\n",
+        ];
+        for text in texts {
+            for d in [
+                SqlDialect::MySql,
+                SqlDialect::Postgres,
+                SqlDialect::MsSql,
+                SqlDialect::Sqlite,
+            ] {
+                // Every third position, from each of three starting points,
+                // so neighbouring carets' edits never overlap and the
+                // composed answers are worth comparing.
+                for phase in 0..3 {
+                    let mut carets: Vec<usize> = (0..=text.len())
+                        .filter(|&c| c % 3 == phase && text.is_char_boundary(c))
+                        .rev()
+                        .collect();
+                    carets.push(carets[3]);
+                    for ch in ['(', ')', '\'', '"', '`', '[', 'x'] {
+                        let regions: Vec<(usize, usize)> = carets.iter().map(|&c| (c, c)).collect();
+                        let one =
+                            |&(a, b): &(usize, usize)| crate::pairs::auto_pair(text, a, b, ch, d);
+                        let alone: Vec<_> = regions.iter().map(one).collect();
+                        let together = auto_pair_all(text, &regions, ch, d);
+                        // Rebuilt from the lone answers, as auto_pair_all did.
+                        let expect = alone.iter().any(Option::is_some).then(|| {
+                            let edits = regions
+                                .iter()
+                                .zip(&alone)
+                                .map(|(&(c, _), a)| match a {
+                                    Some(crate::pairs::PairAction::Insert {
+                                        start,
+                                        end,
+                                        insert,
+                                        sel,
+                                    }) => RegionEdit {
+                                        start: *start,
+                                        end: *end,
+                                        insert: insert.clone(),
+                                        sel: *sel,
+                                    },
+                                    Some(crate::pairs::PairAction::Skip { caret }) => RegionEdit {
+                                        start: c,
+                                        end: c,
+                                        insert: String::new(),
+                                        sel: (*caret, *caret),
+                                    },
+                                    None => RegionEdit {
+                                        start: c,
+                                        end: c,
+                                        insert: ch.to_string(),
+                                        sel: (c + ch.len_utf8(), c + ch.len_utf8()),
+                                    },
+                                })
+                                .collect();
+                            compose(edits)
+                        });
+                        assert_eq!(together, expect.flatten(), "{d:?} {ch:?} {text:?}");
+                    }
+                    carets.pop();
+                    carets.retain(|&c| c > 0);
+                    let alone: Vec<_> = carets
+                        .iter()
+                        .map(|&c| crate::pairs::backspace_pair(text, c, d))
+                        .collect();
+                    let expect = alone.iter().any(Option::is_some).then(|| {
+                        let edits = carets
+                            .iter()
+                            .zip(&alone)
+                            .map(|(&c, a)| {
+                                let (s, e) = a.unwrap_or_else(|| {
+                                    (text[..c].char_indices().next_back().unwrap().0, c)
+                                });
+                                RegionEdit {
+                                    start: s,
+                                    end: e,
+                                    insert: String::new(),
+                                    sel: (s, s),
+                                }
+                            })
+                            .collect();
+                        compose(edits)
+                    });
+                    assert_eq!(
+                        backspace_pair_all(text, &carets, d),
+                        expect.flatten(),
+                        "{d:?} {text:?} phase {phase}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn carets_on_touching_lines_make_one_block() {
         let text = "a\nb\nc\nd\ne\nf";
@@ -1890,6 +2036,11 @@ mod tests {
         // Through the last line, which ends inside the box.
         let rs = box_regions(text, off(0, 2), off(3, 4));
         assert_eq!(pick(rs), vec!["le", "fr", "er"]);
+        // Starting below the first line, and ending above the last.
+        let rs = box_regions(text, off(3, 4), off(2, 2));
+        assert_eq!(pick(rs), vec!["fr", "er"]);
+        let rs = box_regions(text, off(1, 0), off(2, 4));
+        assert_eq!(pick(rs), vec!["b", "  fr"]);
         // The caret on the head's side: dragged leftwards, each region ends
         // at its left column.
         let back = box_regions(text, off(2, 6), off(0, 2));

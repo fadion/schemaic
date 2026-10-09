@@ -12418,7 +12418,16 @@ existing prose was left alone.
     pairs, floem's own insert then serving them all (`each_caret_pairs_where_it_would_alone`).
     `backspace_pair_all` is the same for Backspace at bare carets: an empty pair whole, one
     character elsewhere, `None` when no caret sits in a pair
-    (`backspace_deletes_each_carets_empty_pair_and_one_char_elsewhere`). Tab composes each caret's
+    (`backspace_deletes_each_carets_empty_pair_and_one_char_elsewhere`). **Both ask the lexer once
+    for every caret**, not once each: `auto_pair_all` takes every caret's region from one
+    `pairs::regions_at` walk into `pairs::auto_pair_in`, and `backspace_pair_all` every span it
+    needs from one `pairs::noncode_spans_at` walk into `backspace_pair_in`, asked only for a caret
+    whose two bytes look like a pair (`may_be_empty_pair`). Each caret walking from byte 0 was
+    the quadratic shape `regions_at` exists to remove: a quote typed at a zero-width box down a
+    3,200-line script measured 600 ms a keystroke, and Backspace there 262 ms, against 1.8 ms and
+    0.9 ms for the one walk (release). `many_carets_pair_exactly_as_each_would_alone` and
+    `noncode_spans_at_answers_position_for_position_what_noncode_span_at_does` hold the batch to
+    the lone answers. Tab composes each caret's
     `soft_tab_indent`/`hard_tab_indent`, and Ctrl+Shift+U and Ctrl+Shift+/ each caret's
     `toggle_case`/`toggle_block_comment` — an `IndentEdit` converts to a `RegionEdit` (`From`). The
     line operations — Ctrl+/, Ctrl+D, Alt+↑/↓, Shift+Tab's outdent, Ctrl+Shift+J's join — go through
@@ -12456,7 +12465,10 @@ existing prose was left alone.
     where it is shorter; never empty, the head alone at worst
     (`a_box_selection_takes_the_same_columns_on_every_line`). There is **no virtual space**: the
     head is the clamped offset under the pointer, so dragging past a short line's end narrows the
-    box to that line's length. The pane's drag is under `editor_pane.rs`.
+    box to that line's length. It runs on every pointer move of the drag, so it finds only the box's
+    own line starts — back from the upper end to its line's start, forward to the lower end — where
+    a table of the whole document's lines was a full pass of the text per move, 6.8 ms at 16 MiB
+    against microseconds now. The pane's drag is under `editor_pane.rs`.
   - `sqlfmt.rs` — `format_sql` (Ctrl+Alt+L pretty-printer): re-flows whitespace/indent/line-breaks
     "block" style, **preserving keyword case** itself; built on `skip_noncode` so comments/strings/
     backtick idents pass through untouched; indent follows editor tab-width/soft-tabs.
