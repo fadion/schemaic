@@ -2055,8 +2055,11 @@ existing prose was left alone.
     one edit, two from seven characters on, case ignored, behind the same length pre-filter — and
     the private `did_you_mean` renders its answer as the message's tail,
     `` — did you mean `employees`?``, or as nothing. All four not-found sites carry it:
-    `table_existence_checks`, from `Catalog::table_names` (the keys a reference under that qualifier
-    could name, opaque synonyms included); `qualified_column_checks`, from the table's `columns_of`;
+    `table_existence_checks`, from `Catalog::table_names` (the names a reference under that
+    qualifier could name, opaque synonyms included, **in the server's spelling** through
+    `Catalog::spelling` and quoted by `ident_if_needed` — the lower-cased key suggested `orderitems`
+    for PostgreSQL's `"OrderItems"`, which names no table; `a_suggested_table_keeps_the_servers_spelling`,
+    S8.1-L1-07, red before); `qualified_column_checks`, from the table's `columns_of`;
     and both arms of `colres::resolve` — the qualified one from that source's known columns, the
     unqualified one from every known column of the **innermost** scope's visible sources, which is
     narrower than the chain the resolver walks before giving up. **It says nothing rather than

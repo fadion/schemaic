@@ -5513,6 +5513,10 @@ pub struct Catalog {
     /// for bare names: below a script's `USE` of it
     /// ([`Catalog::used_elsewhere`]).
     bare_unjudged: bool,
+    /// table_lower → the name as the server spelled it, for a "did you
+    /// mean" ([`Catalog::table_names`]): the lower-cased key names no table on
+    /// PostgreSQL, or on a case-sensitive MySQL (S8.1-L1-07).
+    spelling: HashMap<String, String>,
 }
 
 /// A memo over [`Catalog::build`], keyed on the **identity** of the schemas the
@@ -5656,6 +5660,7 @@ impl Catalog {
         let mut nullable = HashSet::new();
         let mut pk_shared = HashSet::new();
         let mut unioned = HashSet::new();
+        let mut spelling: HashMap<String, String> = HashMap::new();
         let mut keys_seen: HashMap<String, Vec<String>> = HashMap::new();
         let active_lower = active_db.map(|d| d.to_ascii_lowercase());
         // The active database's server, else the first loaded one that says:
@@ -5726,6 +5731,9 @@ impl Catalog {
                 }
                 let named = crate::skeleton::skeleton_columns(t);
                 let table_lower = t.name.to_ascii_lowercase();
+                spelling
+                    .entry(table_lower.clone())
+                    .or_insert_with(|| t.name.clone());
                 for c in t.columns.iter().filter(|c| c.nullable) {
                     let col_lower = c.name.to_ascii_lowercase();
                     let mut note = |qualifier: String| {
@@ -5853,6 +5861,9 @@ impl Catalog {
             for (syn, target) in schema.synonyms(db) {
                 let name_lower = syn.name.to_ascii_lowercase();
                 known_idents.insert(name_lower.clone());
+                spelling
+                    .entry(name_lower.clone())
+                    .or_insert_with(|| syn.name.clone());
                 let ns_lower = syn.schema.as_deref().map(str::to_ascii_lowercase);
                 match target {
                     Some(t) => {
@@ -5907,6 +5918,7 @@ impl Catalog {
             unioned,
             flavour,
             bare_unjudged: false,
+            spelling,
         }
     }
 
@@ -6019,8 +6031,11 @@ impl Catalog {
     /// [`Catalog::columns_of`] answers `None` — "can't judge".
     pub fn with_created(&self, created: &[(Option<String>, String)]) -> Catalog {
         let mut c = self.clone();
-        for (q, name) in created {
-            let name = name.to_ascii_lowercase();
+        for (q, written) in created {
+            let name = written.to_ascii_lowercase();
+            c.spelling
+                .entry(name.clone())
+                .or_insert_with(|| written.clone());
             let q = q.as_deref().map(str::to_ascii_lowercase);
             let home =
                 |q: &str| self.active_db.as_deref() == Some(q) || self.known_schemas.contains(q);
@@ -6108,15 +6123,16 @@ impl Catalog {
     }
 
     /// The tables a reference qualified by `qualifier` — or unqualified, for
-    /// `None` — could name, lower-cased as [`Catalog::table_status`] keys
-    /// them: the candidates a "did you mean" picks from.
+    /// `None` — could name, as the server spells them
+    /// ([`Catalog::spelling`](Catalog#structfield.spelling)): the candidates a
+    /// "did you mean" picks from.
     fn table_names(&self, qualifier: Option<&str>) -> Vec<&str> {
         match qualifier {
             None => self
                 .unqualified
                 .keys()
                 .chain(&self.opaque_unqualified)
-                .map(String::as_str)
+                .map(|k| self.spelling.get(k).unwrap_or(k).as_str())
                 .collect(),
             Some(q) => {
                 let q = q.to_ascii_lowercase();
@@ -6125,7 +6141,7 @@ impl Catalog {
                     .chain(self.schema_qualified.keys())
                     .chain(&self.opaque_qualified)
                     .filter(|(d, _)| *d == q)
-                    .map(|(_, t)| t.as_str())
+                    .map(|(_, t)| self.spelling.get(t).unwrap_or(t).as_str())
                     .collect()
             }
         }
@@ -11073,7 +11089,16 @@ fn table_existence_checks(
                 .written_qualifier()
                 .map(|d| format!(" in `{d}`"))
                 .unwrap_or_default();
-            let hint = did_you_mean(&r.name, catalog.table_names(r.db.as_deref()));
+            // Quoted where the engine folds the bare spelling: `OrderItems`
+            // unquoted is `orderitems` on PostgreSQL, which names no table.
+            let hint = nearest_name(&r.name, catalog.table_names(r.db.as_deref()))
+                .map(|n| {
+                    format!(
+                        " — did you mean `{}`?",
+                        crate::export::ident_if_needed(n, dialect)
+                    )
+                })
+                .unwrap_or_default();
             out.push(Diagnostic {
                 range: l.pos,
                 severity: Severity::Error,
@@ -23720,6 +23745,32 @@ mod tests {
         assert_eq!(
             msg("SELECT * FROM nosuchtable"),
             ["Table `nosuchtable` not found"]
+        );
+    }
+
+    /// The suggested table is spelled as the server has it — and, on an
+    /// engine that folds an unquoted name, quoted — since the lower-cased key
+    /// names no table there (S8.1-L1-07).
+    #[test]
+    fn a_suggested_table_keeps_the_servers_spelling() {
+        let schema = DbSchema {
+            tables: vec![tbl_in("public", "OrderItems", &["id"])],
+            ..Default::default()
+        };
+        let cat = Catalog::build(&[("shop", &schema)], Some("shop"));
+        let msg = |sql: &str, d| -> Vec<String> {
+            diagnostics(sql, &cat, d)
+                .into_iter()
+                .map(|x| x.message)
+                .collect()
+        };
+        assert_eq!(
+            msg("SELECT * FROM orderitem;", SqlDialect::Postgres),
+            ["Table `orderitem` not found — did you mean `\"OrderItems\"`?"]
+        );
+        assert_eq!(
+            msg("SELECT * FROM orderitem;", SqlDialect::MySql),
+            ["Table `orderitem` not found — did you mean `OrderItems`?"]
         );
     }
 
