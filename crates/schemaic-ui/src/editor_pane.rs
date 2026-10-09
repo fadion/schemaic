@@ -4304,6 +4304,13 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     let ed_hbar = ed.clone(); // custom horizontal scrollbar geometry
     let ed_vdrag = ed.clone(); // vertical scrollbar drag → scroll
     let ed_hdrag = ed.clone(); // horizontal scrollbar drag → scroll
+    // Where the pointer last moved, in `editor_area` coords — what Ctrl+click
+    // asks `pointer_offset` about. The click itself arrives in the editor
+    // view's coords, and floem's own click has already put the caret at the
+    // line's end for a click past it, which reads the same as one on the last
+    // letter's right half.
+    let last_pointer: Rc<std::cell::Cell<Option<Point>>> = Rc::new(std::cell::Cell::new(None));
+    let ctrl_click_pointer = last_pointer.clone();
     let ed_bar_poke = ed.clone(); // auto-hide: poke the bars on scroll/resize
     let ed_wheel = ed.clone(); // shift+wheel → horizontal scroll
     let ed_find = ed.clone(); // Ctrl+F find: select + centre a match
@@ -5571,10 +5578,28 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     && !pe.modifiers.shift()
                 {
                     let off = ed_menu.cursor.get_untracked().offset();
+                    // A click past the line's end landed on nothing, though
+                    // floem put the caret just after its last word — the
+                    // hover asks the same point the same question and shows
+                    // nothing there.
+                    let on_text = ctrl_click_pointer
+                        .get()
+                        .and_then(|p| pointer_offset(&ed_menu, p))
+                        .is_none_or(|(_, inside)| inside);
                     let adb = active_db.get_untracked();
-                    let found = query.with_untracked(|sql| {
-                        named_object_at(sql, off, dialect.get_untracked(), db_nodes, adb.as_deref())
-                    });
+                    let found = on_text
+                        .then(|| {
+                            query.with_untracked(|sql| {
+                                named_object_at(
+                                    sql,
+                                    off,
+                                    dialect.get_untracked(),
+                                    db_nodes,
+                                    adb.as_deref(),
+                                )
+                            })
+                        })
+                        .flatten();
                     if let Some(object) = found {
                         comp.open.set(false);
                         open_object(object);
@@ -7582,6 +7607,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 // Read and cleared in one step — see `marks_pointer`. A move an
                 // overlay took is a move over the overlay, not over the text.
                 let covered = on_overlay.replace(false);
+                last_pointer.set(Some(pe.pos));
                 hover_diag((!covered).then_some(pe.pos));
                 // A box selection being dragged: every line between the anchor
                 // and the pointer, across the same columns. After floem's own
@@ -9855,7 +9881,8 @@ mod editor_menu_return_gate {
     }
 }
 
-/// The offline diagnostics re-run when a database's schema lands, not only
+/// Two decisions made in the view, where only a census sees them. The first:
+/// the offline diagnostics re-run when a database's schema lands, not only
 /// when the database list changes: a schema arriving, a per-database Refresh
 /// and the re-introspection after DDL write the node's own `schema` signal and
 /// never the list, so an effect tracking the list alone left a restored tab's
@@ -9878,6 +9905,33 @@ mod diagnostics_catalog_gate {
         assert!(
             effect.contains("n.schema.track()"),
             "the catalog-driven diagnostics effect tracks no database's schema:\n{effect}"
+        );
+    }
+
+    /// Ctrl+click opens a name only where the pointer is on the text: floem's
+    /// own click puts the caret just after a line's last word for a click
+    /// well past its end, and `name_at` accepts a caret just after a word —
+    /// so without asking `pointer_offset`'s `inside`, the blank space past
+    /// `SELECT * FROM orders` opened `orders`, where the hover showed nothing.
+    #[test]
+    fn ctrl_click_asks_whether_the_pointer_is_on_the_text() {
+        let src =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/editor_pane.rs"))
+                .expect("this file");
+        let body = production_code(&src);
+        let call = body
+            .match_indices("named_object_at(")
+            .map(|(i, _)| i)
+            .find(|&i| !body[..i].ends_with("fn "))
+            .expect("the Ctrl+click branch's lookup");
+        let start = body[..call]
+            .rfind("if pe.button.is_primary()")
+            .expect("in the primary-button branch");
+        let branch = &body[start..call];
+        assert!(
+            branch.contains("pointer_offset(") && branch.contains("inside"),
+            "the Ctrl+click branch opens a name without asking whether the click \
+             was on the text:\n{branch}"
         );
     }
 }

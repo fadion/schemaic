@@ -24752,7 +24752,12 @@ existing prose was left alone.
     or view through `open_table`, a column through `open_table_col` (which scrolls to it), a routine
     through `object_editor::open_for_object` with the loaded `RoutineInfo`, the doors the schema
     tree and Find Anywhere use. Alt+click is left to floem and still adds a caret; a Ctrl+click on
-    nothing resolvable just places the caret.
+    nothing resolvable just places the caret. **Nor does one past a line's end**: floem puts the
+    caret just after the line's last word there, which `name_at` accepts, so the branch first asks
+    `pointer_offset`'s `inside` of the last point the `editor_area` PointerMove saw
+    (`last_pointer` — the click arrives in the editor view's coords, which `pointer_offset` does
+    not take) and opens nothing outside the text, as the hover shows nothing there
+    (`ctrl_click_asks_whether_the_pointer_is_on_the_text`).
     **Alt+Shift+drag is a box selection** (`text_ops::box_regions`). `name_box_at`'s way back from
     a pointer to the document is factored out as `pointer_offset` — the offset under the pointer and
     whether it is inside the text, `None` over the gutter — which the drag shares. The same outer
