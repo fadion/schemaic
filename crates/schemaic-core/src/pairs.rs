@@ -438,16 +438,17 @@ fn scan_depths(
     while i < b.len() {
         if let Some(j) = skip_noncode(b, i, dialect) {
             // A string or comment over several lines: each line it starts is
-            // at the depth outside it, and inside it — unless it ends right
-            // where the line starts.
+            // at the depth outside it, and inside it. **Never in code**, even
+            // where the span ends right at the line start: no closed span ends
+            // in a `\n` (a line comment stops before its own), so that is an
+            // unterminated one running to the end of the text — `/* a\n` —
+            // and the empty line after it is still inside. Marked code, the
+            // incremental scan restarted there outside the comment when the
+            // next character was typed, and every depth below drifted.
             let j = j.max(i + 1).min(b.len());
-            for p in (i..j).filter(|&p| b[p] == b'\n') {
+            for _ in (i..j).filter(|&p| b[p] == b'\n') {
                 out.depth.push(depth);
-                let code = p + 1 >= j;
-                out.code.push(code);
-                if code && stop(out, p + 1, depth) {
-                    return;
-                }
+                out.code.push(false);
             }
             i = j;
             continue;
@@ -1004,6 +1005,26 @@ mod tests {
                     line_depths(&new, d),
                     "{d:?} merged: {old:?} -> {new:?}"
                 );
+            }
+        }
+    }
+
+    /// **Typing on past an open comment at the end of the text** — the way a
+    /// block comment gets written, `/*` not being auto-paired — keeps the
+    /// incremental depths equal to a full pass: the empty line after the
+    /// comment's last `\n` is still inside it, not code.
+    #[test]
+    fn line_depths_after_typing_into_an_open_comment_match_a_full_pass() {
+        let full = "/* a\n(\n*/ (b)\nx";
+        for d in [MySql, Postgres, MsSql, Sqlite] {
+            let mut old = String::new();
+            let mut depths = line_depths(&old, d);
+            for ch in full.chars() {
+                let mut new = old.clone();
+                new.push(ch);
+                depths = line_depths_after(&old, &depths, &new, d);
+                assert_eq!(depths, line_depths(&new, d), "{d:?}: {new:?}");
+                old = new;
             }
         }
     }

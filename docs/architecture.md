@@ -12837,7 +12837,13 @@ existing prose was left alone.
     edit that leaves a bracket open past itself changes every depth below and rescans to the end.
     Both functions run through one scan, `scan_depths`, and
     `line_depths_after_an_edit_match_a_full_pass` holds them equal over a corpus of edits on every
-    engine, bracket-heavy bases included. `line_depths_after` finds the edit by comparing the old
+    engine, bracket-heavy bases included. A line a string or comment starts is never in code, even
+    one starting right where the span ends: no closed span ends in a `\n`, so that is an
+    unterminated span at the end of the text — `/* a\n`, the ordinary way a block comment gets typed
+    — and marking its empty last line code restarted the next keystroke's scan outside the comment,
+    every depth below it one too deep until a full rebuild
+    (`line_depths_after_typing_into_an_open_comment_match_a_full_pass`; the corpus only ever
+    appended to a closed text). `line_depths_after` finds the edit by comparing the old
     text (`text::common_affixes`) and hands it to `line_depths_after_edit`, which takes the edit
     already known — as the tab editor knows it from its `text::EditLog`, with no old text kept. The
     lines an edit moved come from the two line counts (`count_newlines(new) + 1` against `prev`'s),
