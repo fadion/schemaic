@@ -994,7 +994,11 @@ existing prose was left alone.
     leaves out (`Catalog::insert_columns_of`): exact for a table with no server-assigned column,
     and silent where the engines disagree — a MySQL row that leaves out its `AUTO_INCREMENT` key
     is refused there and passes here (`a_bare_insert_row_is_measured_against_the_table`,
-    `a_bare_insert_may_leave_out_what_the_server_assigns`). A table the catalogue does not know, a
+    `a_bare_insert_may_leave_out_what_the_server_assigns`). A MySQL/MariaDB `INVISIBLE` column is
+    out of the count altogether — the implicit column list leaves it out, so counted, the correct
+    row was the short one and a row naming it the whole one (`Catalog::column_invisible`, keyed as
+    `insert_skips` is; `a_bare_insert_row_does_not_count_an_invisible_column`, S8.2-L1-01, red
+    before). `skeleton_columns` still names it, an explicit list being free to. A table the catalogue does not know, a
     name two tables share (`Catalog::is_union`) and a three-part name, which may be another
     database's, are not measured — `local_table` is that last refusal, shared with the next lint.
     **`NOT IN` over a column that can hold NULL is a warning** (`not_in_nullable`): once the

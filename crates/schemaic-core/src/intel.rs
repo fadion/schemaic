@@ -5492,6 +5492,11 @@ pub struct Catalog {
     /// can hold a NULL, keyed as [`Catalog::insert_skips`] is — for
     /// [`Catalog::column_nullable`].
     nullable: HashSet<(String, String, String)>,
+    /// `(qualifier_lower, table_lower, column_lower)` for each MySQL/MariaDB
+    /// `INVISIBLE` column, keyed as [`Catalog::insert_skips`] is — which a
+    /// bare `INSERT`'s implicit column list leaves out
+    /// ([`Catalog::column_invisible`]).
+    invisible: HashSet<(String, String, String)>,
     /// Table names (lower) two in-scope tables share with **different** keys —
     /// `sales.orders` and `dbo.orders`. [`Catalog::pks`] is keyed by the bare
     /// name, so it holds whichever was indexed last; a question that names the
@@ -5658,6 +5663,7 @@ impl Catalog {
         let mut opaque_unqualified = HashSet::new();
         let mut insert_skips = HashSet::new();
         let mut nullable = HashSet::new();
+        let mut invisible = HashSet::new();
         let mut pk_shared = HashSet::new();
         let mut unioned = HashSet::new();
         let mut spelling: HashMap<String, String> = HashMap::new();
@@ -5734,10 +5740,16 @@ impl Catalog {
                 spelling
                     .entry(table_lower.clone())
                     .or_insert_with(|| t.name.clone());
-                for c in t.columns.iter().filter(|c| c.nullable) {
+                for c in t.columns.iter().filter(|c| c.nullable || c.invisible) {
                     let col_lower = c.name.to_ascii_lowercase();
                     let mut note = |qualifier: String| {
-                        nullable.insert((qualifier, table_lower.clone(), col_lower.clone()));
+                        let key = (qualifier, table_lower.clone(), col_lower.clone());
+                        if c.invisible {
+                            invisible.insert(key.clone());
+                        }
+                        if c.nullable {
+                            nullable.insert(key);
+                        }
                     };
                     note(db_lower.clone());
                     if in_scope {
@@ -5914,6 +5926,7 @@ impl Catalog {
             opaque_unqualified,
             insert_skips,
             nullable,
+            invisible,
             pk_shared,
             unioned,
             flavour,
@@ -5991,6 +6004,17 @@ impl Catalog {
                 self.nullable
                     .contains(&(qualifier, r.name.to_ascii_lowercase(), col))
             })
+    }
+
+    /// Is column `col` of `r` an `INVISIBLE` one, which a bare `INSERT`'s
+    /// implicit column list leaves out?
+    fn column_invisible(&self, r: &TableRef, col: &str) -> bool {
+        let qualifier = r.db.as_deref().unwrap_or("").to_ascii_lowercase();
+        self.invisible.contains(&(
+            qualifier,
+            r.name.to_ascii_lowercase(),
+            col.to_ascii_lowercase(),
+        ))
     }
 
     /// The primary-key columns (lower) of an active-db table, if known and non-empty.
@@ -12876,7 +12900,11 @@ mod lints {
         else {
             return;
         };
-        let (all, needed) = (all.len(), needed.len());
+        // The implicit column list leaves an `INVISIBLE` column out
+        // (S8.2-L1-01): counted, the correct row was the short one.
+        let visible = |c: &String| !catalog.column_invisible(&r, c);
+        let all = all.iter().filter(|c| visible(c)).count();
+        let needed = needed.into_iter().filter(|c| visible(c)).count();
         for row in &values.rows {
             let m = row.content.len();
             let short = m < needed && !short_row_takes_defaults(dialect);
@@ -24731,6 +24759,38 @@ mod tests {
                 "{d:?}"
             );
         }
+    }
+
+    /// A bare `INSERT`'s implicit column list leaves an `INVISIBLE` column
+    /// out on MySQL and MariaDB, so a row of the visible ones is whole and a
+    /// row naming the invisible one too is one value long (S8.2-L1-01).
+    #[test]
+    fn a_bare_insert_row_does_not_count_an_invisible_column() {
+        let mut t = tbl("z_inv", &["a", "b", "r"]);
+        t.columns[2].invisible = true;
+        let schema = DbSchema {
+            tables: vec![t],
+            ..Default::default()
+        };
+        let cat = Catalog::build(&[("company", &schema)], Some("company"));
+        let errs = |sql: &str| -> Vec<String> {
+            diagnostics(sql, &cat, SqlDialect::MySql)
+                .into_iter()
+                .filter(|x| x.severity == Severity::Error && x.message.contains("this row has"))
+                .map(|x| x.message)
+                .collect()
+        };
+        assert!(errs("INSERT INTO z_inv VALUES (1, 2);").is_empty());
+        assert_eq!(
+            errs("INSERT INTO z_inv VALUES (1, 2, 3);"),
+            ["`z_inv` has 2 columns but this row has 3 values"]
+        );
+        assert_eq!(
+            errs("INSERT INTO z_inv VALUES (1);"),
+            ["`z_inv` has 2 columns but this row has 1 value"]
+        );
+        // Named in a column list, it is an ordinary column.
+        assert!(errs("INSERT INTO z_inv (a, b, r) VALUES (1, 2, 3);").is_empty());
     }
 
     /// A comma join with no `WHERE` at all combines every row with every row.
