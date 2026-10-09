@@ -670,6 +670,9 @@ fn block_words(text: &str, dialect: SqlDialect) -> Vec<BlockWord> {
     let mut words: Vec<(usize, usize, String, bool, bool)> = Vec::new();
     // What the last token of code was: nothing yet, a word, or this byte.
     let mut last: Option<Option<u8>> = None;
+    // The terminator a MySQL `DELIMITER` set, while it is not `;`: it ends a
+    // statement as `;` does, and a name — `END$$` is an `END`.
+    let mut delim: Option<String> = None;
     let mut i = 0;
     while i < b.len() {
         if let Some(j) = skip_noncode(b, i, dialect) {
@@ -682,9 +685,35 @@ fn block_words(text: &str, dialect: SqlDialect) -> Vec<BlockWord> {
             i = j.max(i + 1);
             continue;
         }
-        if crate::sql::is_word_start(b[i]) {
-            let mut j = i + 1;
-            while j < b.len() && crate::sql::is_word_byte(b[j]) {
+        if matches!(b[i], b'd' | b'D')
+            && matches!(last, None | Some(Some(b';')))
+            && let Some((end, token)) = crate::sql::delimiter_directive(text, i, dialect)
+        {
+            delim = (token != ";").then_some(token);
+            last = Some(Some(b';'));
+            i = end;
+            continue;
+        }
+        if let Some(d) = &delim
+            && b[i..].starts_with(d.as_bytes())
+        {
+            last = Some(Some(b';'));
+            i += d.len();
+            continue;
+        }
+        // **A name ends where its engine ends it** (`sql::continues_name`),
+        // and T-SQL's `@end`, `@@x` and `#begin` are names with their sigil
+        // (`sql::t_sql_name_prefix`): read from the byte after it, `SET @end
+        // = 1` closed the `BEGIN` above it, and `a$end` did on MySQL.
+        let prefix = crate::sql::t_sql_name_prefix(b, i, dialect);
+        if prefix > 0 || crate::sql::is_word_start(b[i]) {
+            let mut j = i + prefix.max(1);
+            while j < b.len()
+                && crate::sql::continues_name(b[j], dialect)
+                && !delim
+                    .as_ref()
+                    .is_some_and(|d| b[j..].starts_with(d.as_bytes()))
+            {
                 j += 1;
             }
             let member = i > 0 && b[i - 1] == b'.';
@@ -819,7 +848,9 @@ fn block_words(text: &str, dialect: SqlDialect) -> Vec<BlockWord> {
 /// sits on an identifier in *code* (not a string/comment), the identifier is
 /// neither a bare number nor a SQL keyword, and it occurs at least twice.
 ///
-/// Matching is whole-word and ASCII-case-insensitive (SQL identifiers fold for
+/// A word is a name as its engine spells it — through `$`, and on SQL Server
+/// with its `@`/`#` — so `@id` and `id` are two names. Matching is whole-word
+/// and ASCII-case-insensitive (SQL identifiers fold for
 /// ASCII); occurrences inside strings/comments are skipped via the shared lexer.
 /// The occurrence under the caret is included in the result.
 pub fn identifier_occurrences(
@@ -828,22 +859,36 @@ pub fn identifier_occurrences(
     dialect: SqlDialect,
 ) -> Vec<(usize, usize)> {
     let b = text.as_bytes();
-    // The caret is "on" a word if the byte at it or just before it is a word byte.
+    // **A name is its whole spelling on its engine**: it runs on where
+    // `sql::continues_name` says (`a$b` is one name), and on SQL Server a
+    // leading `@`/`@@`/`#`/`##` is part of it (`sql::t_sql_name_prefix`) —
+    // `@id` is a variable, not the column `id`. The scan below reads names
+    // the same way, so the two cannot disagree about where one starts.
+    let in_name = |c: u8| crate::sql::continues_name(c, dialect);
+    let name_at = |i: usize| crate::sql::t_sql_name_prefix(b, i, dialect) > 0;
+    // The caret is "on" a word if the byte at it or just before it is a name
+    // byte, or it stands on a name's sigil.
     let on_word = b.get(caret).is_some_and(|&c| is_word_byte(c))
-        || (caret > 0 && b.get(caret - 1).is_some_and(|&c| is_word_byte(c)));
+        || name_at(caret)
+        || (caret > 0 && b.get(caret - 1).is_some_and(|&c| in_name(c)));
     if !on_word {
         return Vec::new();
     }
     // Expand to the whole word straddling the caret.
     let mut ws = caret;
-    while ws > 0 && is_word_byte(b[ws - 1]) {
+    while ws > 0 && in_name(b[ws - 1]) {
         ws -= 1;
     }
-    let mut we = caret;
-    while we < b.len() && is_word_byte(b[we]) {
+    let mut we = caret + crate::sql::t_sql_name_prefix(b, caret, dialect);
+    while we < b.len() && in_name(b[we]) {
         we += 1;
     }
-    if ws == we {
+    // The run takes in a T-SQL sigil, `continues_name` holding `@` and `#`
+    // there; a byte that can only continue a name (`$`) starts none.
+    while ws < we && !is_word_byte(b[ws]) && !name_at(ws) {
+        ws += 1;
+    }
+    if ws >= we {
         return Vec::new();
     }
     let target = &text[ws..we];
@@ -874,9 +919,10 @@ pub fn identifier_occurrences(
             i = j.max(i + 1);
             continue;
         }
-        if is_word_byte(b[i]) {
+        if is_word_byte(b[i]) || name_at(i) {
             let start = i;
-            while i < b.len() && is_word_byte(b[i]) {
+            i += 1;
+            while i < b.len() && in_name(b[i]) {
                 i += 1;
             }
             if start == ws {
@@ -1322,6 +1368,40 @@ mod tests {
         assert_eq!(blocks("BEGIN SELECT 1", 0, MsSql), None, "unclosed");
     }
 
+    /// A name is read where it ends on its engine: T-SQL's `@end`, `@@x`
+    /// and `#begin` and MySQL's `a$end` are names, not the keyword after the
+    /// sigil or the `$` — while a `DELIMITER`'s `$$` still ends an `END`.
+    #[test]
+    fn a_prefixed_or_dollar_name_is_no_block_word() {
+        use SqlDialect::{MsSql, MySql};
+        let sql = "BEGIN\n  SET @end = 1;\nEND";
+        let end = sql.rfind("END").unwrap();
+        assert_eq!(blocks(sql, 0, MsSql), Some(("BEGIN", "END", 0, end)));
+        assert_eq!(blocks(sql, sql.find("end").unwrap() + 1, MsSql), None);
+        let sql = "BEGIN\n  DECLARE @begin date;\n  SELECT #end.x FROM #end;\nEND";
+        let end = sql.rfind("END").unwrap();
+        assert_eq!(blocks(sql, 0, MsSql), Some(("BEGIN", "END", 0, end)));
+        // Inside a `CASE`, `@end` closes nothing: the `ELSE` line is the CASE's.
+        let sql = "SELECT CASE WHEN @end > 0 THEN 1\nELSE";
+        let case = sql.find("CASE").unwrap();
+        assert_eq!(
+            enclosing_block(sql, sql.len(), MsSql),
+            Some((case, case + 4, true))
+        );
+        // MySQL: `a$end` is one name.
+        let sql = "BEGIN SELECT a$end FROM t; END";
+        let end = sql.rfind("END").unwrap();
+        assert_eq!(blocks(sql, 0, MySql), Some(("BEGIN", "END", 0, end)));
+        // … and `END$$` after `DELIMITER $$` is still an `END`.
+        let sql = "DELIMITER $$\nCREATE PROCEDURE p() BEGIN SELECT 1; END$$\nDELIMITER ;";
+        let begin = sql.find("BEGIN").unwrap();
+        let end = sql.find("END").unwrap();
+        assert_eq!(
+            blocks(sql, begin, MySql),
+            Some(("BEGIN", "END", begin, end))
+        );
+    }
+
     /// MySQL's compound statements pair with their named `END`: `IF … END
     /// IF`, `[label:] LOOP … END LOOP`, `WHILE … END WHILE`, `REPEAT … END
     /// REPEAT` and MariaDB's `FOR … END FOR`, nested in each other and in a
@@ -1505,6 +1585,35 @@ mod tests {
         assert!(identifier_occurrences("alpha beta", 0, MySql).is_empty());
         // caret on whitespace, not adjacent to any word
         assert!(identifier_occurrences("a   a", 2, MySql).is_empty());
+    }
+
+    /// A name is its whole spelling on its engine: on SQL Server `@id` and
+    /// `#t` are not the column `id` or the table `t`, and `a$b` is one name
+    /// everywhere rather than an `a` and a `b`.
+    #[test]
+    fn occurrences_keep_a_sigil_or_dollar_as_part_of_the_name() {
+        let sql = "DECLARE @id int; SELECT id FROM t WHERE id = @id";
+        let vars = vec![(8, 11), (45, 48)];
+        assert_eq!(identifier_occurrences(sql, 9, MsSql), vars);
+        assert_eq!(identifier_occurrences(sql, 8, MsSql), vars, "on the @");
+        assert_eq!(
+            identifier_occurrences(sql, 25, MsSql),
+            vec![(24, 26), (40, 42)]
+        );
+        let sql = "SELECT * FROM #t JOIN t ON #t.a = t.a";
+        assert_eq!(
+            identifier_occurrences(sql, 15, MsSql),
+            vec![(14, 16), (27, 29)]
+        );
+        let sql = "SELECT a$b, b FROM t WHERE b = a$b";
+        assert_eq!(
+            identifier_occurrences(sql, 9, MySql),
+            vec![(7, 10), (31, 34)]
+        );
+        assert_eq!(
+            identifier_occurrences(sql, 12, MySql),
+            vec![(12, 13), (27, 28)]
+        );
     }
 
     /// **`regions_at` must answer exactly what `region_at` would**, offset for

@@ -12815,7 +12815,8 @@ existing prose was left alone.
     at an offset — an open compound statement included
     (`an_open_compound_statement_encloses_what_follows`) — reads the same `block_words`),
     `identifier_occurrences` (every whole-word, ASCII-case-insensitive occurrence of the identifier
-    under the caret — excludes keywords/numbers/strings, needs ≥2 to fire), `region_at`
+    under the caret — a name being its whole spelling on its engine, so on SQL Server `@id` is not
+    the column `id` — excludes keywords/numbers/strings, needs ≥2 to fire), `region_at`
     (`Code`/`Str`/`Comment` classification), and `bracket_depth_at_lines` (how many code `(`/`[`
     are open where each line starts, one entry per line — the depth the editor's rainbow brackets
     start a line's lexing at, under `sql_highlight.rs`. A string or comment over several lines is
@@ -32166,7 +32167,14 @@ Re-introducing the anti-patterns these guard against is a regression:
   and read the rest, so `SELECT @delete = 1` was refused as a `DELETE` and `SELECT * FROM #update`
   blocked on a read-only connection; it keeps the prefix on the word now (`@DELETE`, no keyword any
   list holds), and the keyword spelled without one is read as before
-  (`a_t_sql_variable_spelled_like_a_keyword_is_no_write`). A new T-SQL
+  (`a_t_sql_variable_spelled_like_a_keyword_is_no_write`). The editor's two word scanners in
+  `pairs.rs` were the same defect again: `block_words` read `SET @end = 1` as the keyword `END`,
+  so a `BEGIN` paired with a variable and a typed `END` found nothing to dedent to, and MySQL's
+  `a$end` the same; `identifier_occurrences` boxed the column `id` with the caret on `@id` and
+  split `a$b` at the `$` (R1-L2-01, R1-L2-02). Both read a name as prefix plus `continues_name`
+  run now (`a_prefixed_or_dollar_name_is_no_block_word`,
+  `occurrences_keep_a_sigil_or_dollar_as_part_of_the_name`), `block_words` cutting a name at a
+  `DELIMITER`'s terminator as `sqlfmt::tokenize` does, so `END$$` is still an `END`. A new T-SQL
   scanner asks these two rather than adding the bytes locally.
 - **A Velopack channel name is app identity, like `--packId`: add a name, never rename one.** The
   three `release.yml` packs with — `win-x64`, `linux-x64`, `osx-arm64` — are explicit because a
