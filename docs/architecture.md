@@ -24627,7 +24627,11 @@ existing prose was left alone.
     (`query_pane` + the Ctrl+K bar, statement highlight, custom scrollbars). `syntax_view` draws
     severity-coloured squiggles (red errors / amber typo warnings).
     **The diagnostics run off the UI thread.** Both triggers — the 120 ms debounced edit path and
-    the effect that re-checks when the catalog changes — go through `diagnose_in_background`, which
+    the effect that re-checks when the catalog changes (it tracks every node's inner `schema`, not
+    only the `db_nodes` list, since a schema landing, a per-database Refresh and the re-introspection
+    after DDL write the inner signal alone and a restored tab otherwise kept no squiggle until the
+    next keystroke — `the_diagnostics_re_run_when_any_databases_schema_lands`) — go through
+    `diagnose_in_background`, which
     builds the catalog on the UI thread (`completion::build_catalog` reads the schema tree's
     signals), then spawns a `std::thread` that locks the pane's `diag_cache` — one
     `Arc<Mutex<intel::DiagnosticsCache>>` per pane, recovered if poisoned — and runs

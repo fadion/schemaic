@@ -3089,11 +3089,16 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     // `db_nodes`/`active_db` only (never `query`, which is the debounced path
     // below), and rides the same generation guard so a burst of per-database
     // schema arrivals coalesces into one parse.
+    //
+    // **Each database's own model too**, not just the list: a schema landing,
+    // a per-database Refresh and the re-introspection after DDL write the
+    // node's `schema` and never the list, so tracking the list alone left a
+    // restored tab with no squiggle until the next keystroke.
     {
         let dgen = diag_gen.clone();
         let cache = diag_cache.clone();
         create_effect(move |_| {
-            db_nodes.track();
+            db_nodes.with(|ns| ns.iter().for_each(|n| n.schema.track()));
             let adb = active_db.get();
             let g = dgen.get().wrapping_add(1);
             dgen.set(g);
@@ -9816,6 +9821,33 @@ mod editor_menu_return_gate {
             body[branch_start..at].contains(&format!("set_menu_{}(", "return")),
             "the editor's right-click menu opens with no return armed, so Escape \
              or an entry leaves the keyboard on the grid instead of the editor"
+        );
+    }
+}
+
+/// The offline diagnostics re-run when a database's schema lands, not only
+/// when the database list changes: a schema arriving, a per-database Refresh
+/// and the re-introspection after DDL write the node's own `schema` signal and
+/// never the list, so an effect tracking the list alone left a restored tab's
+/// unknown-table squiggle missing until the next keystroke. Which signals an
+/// effect reads is decided in the view, so only a census can see it.
+#[cfg(test)]
+mod diagnostics_catalog_gate {
+    use crate::source_gate::production_code;
+
+    #[test]
+    fn the_diagnostics_re_run_when_any_databases_schema_lands() {
+        let src =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/editor_pane.rs"))
+                .expect("this file");
+        let body = production_code(&src);
+        let at = body
+            .find("diagnose_in_background(syntax, dgen, g, cache, q, db_nodes")
+            .expect("the catalog-driven diagnostics pass");
+        let effect = &body[body[..at].rfind("create_effect(").expect("in an effect")..at];
+        assert!(
+            effect.contains("n.schema.track()"),
+            "the catalog-driven diagnostics effect tracks no database's schema:\n{effect}"
         );
     }
 }
