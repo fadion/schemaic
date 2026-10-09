@@ -18,7 +18,8 @@
 //!   • **Hairlines** (`GRID_CELL_DIVIDER`, `COMPLETION_BORDER`) — a rule is one
 //!     physical line at every size; 2px of it reads as a border, not a seam.
 //!   • **Editor-relative metrics** (`EDITOR_PAD_TOP`, `COMPLETION_GUTTER`,
-//!     `COMPLETION_LINE_H`, `HL_GUTTER`, `HL_DIGIT_W`, `WAVE_H`, `HL_PAD`) —
+//!     `COMPLETION_LINE_H`, `GUTTER_LEFT_PAD`, `GUTTER_RIGHT_PAD`, `HL_DIGIT_W`,
+//!     `WAVE_H`, `HL_PAD`) —
 //!     they measure against the *code* font, which has its own size setting and
 //!     which the interface scale deliberately doesn't touch. Scaling them would
 //!     slide the statement highlight and the squiggles off the glyphs they mark.
@@ -303,11 +304,16 @@ pub(crate) const WAVE_H: f64 = 5.0;
 
 /// Horizontal padding on the statement-highlight border so it clears the glyphs.
 pub(crate) const HL_PAD: f64 = 3.0;
-/// Editor-area x where the code text starts (past the gutter), for a 1-digit
-/// line-number gutter. Measured — larger than `COMPLETION_GUTTER` (which the
-/// completion popup hides behind its own padding); a tight border needs the
-/// real value. `HL_DIGIT_W` widens it per extra line-number digit.
-pub(crate) const HL_GUTTER: f64 = 56.0;
+/// The line-number gutter's padding left and right of its digits, which the
+/// editor sets explicitly (`gutter_left_padding`/`gutter_right_padding`) so the
+/// overlays can add them up: floem sizes the gutter to `left + the last line
+/// number's measured width + right`, and the code column starts past it. The
+/// digits' width scales with the code font, so it is measured, never a const
+/// (`editor_pane::content_x`) — a measured 56px stood in for the whole sum and
+/// was right only at about 20pt.
+pub(crate) const GUTTER_LEFT_PAD: f64 = 14.0;
+pub(crate) const GUTTER_RIGHT_PAD: f64 = 30.0;
+/// The inline diff's `+`/`−` marker inset from the code column.
 pub(crate) const HL_DIGIT_W: f64 = 8.0;
 
 /// The app's monospace face — the bundled family the SQL editor resolves
@@ -1222,7 +1228,11 @@ mod unscaled_const_gate {
             "COMPLETION_LINE_H",
             "editor-relative: a gap from the caret's own line geometry",
         ),
-        ("HL_GUTTER", "editor-relative"),
+        ("GUTTER_LEFT_PAD", "editor-relative: floem's gutter padding"),
+        (
+            "GUTTER_RIGHT_PAD",
+            "editor-relative: floem's gutter padding",
+        ),
         ("HL_DIGIT_W", "editor-relative"),
         ("WAVE_H", "editor-relative: squiggle amplitude"),
         ("HL_PAD", "editor-relative"),

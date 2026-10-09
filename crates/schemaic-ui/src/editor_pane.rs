@@ -894,6 +894,7 @@ fn cmdk_popup(
     // child — and a `Memo` so the field's style re-runs only when the answer to
     // *this* question changes, not on every `inline_ai` transition.
     let asking = create_memo(move |_| matches!(inline_ai.get(), InlineAiState::Busy));
+    let ed_verdict = ed.clone();
     let content = dyn_container(
         // `ui_generation` used to be in this key: the child resolved two things no
         // style closure could re-read — `diff_view`'s `content_w` (the diff's
@@ -1089,6 +1090,7 @@ fn cmdk_popup(
                 {
                     let discard_b = discard.clone();
                     let accept_b = accept.clone();
+                    let ed_v = ed_verdict.clone();
                     // Floem gives no way to pass a pointer event on once a view is
                     // eligible for it — the child walk `break`s on the first such
                     // view, handled or not (`context.rs:143-158`) — so a 26px bar
@@ -1162,7 +1164,10 @@ fn cmdk_popup(
                             .gap(theme::scaled(12.0))
                             // Aligns the verdict with the code column, so the bar
                             // reads as the block's last row.
-                            .padding_left(query.with(|q| content_x_of(q)))
+                            .padding_left({
+                                query.track();
+                                content_x(&ed_v)
+                            })
                             .padding_right(theme::scaled(10.0))
                             // Nothing here is selectable, so the editor's I-beam
                             // (which this sits on top of) would be a lie.
@@ -1729,12 +1734,13 @@ fn single_char(s: &str) -> Option<char> {
 // opened at — which is the bug that walked the suggestion list down over the
 // results grid. Rule 2 doesn't reach them: the caret is on screen by definition.
 
-/// The x origin of the code column in `editor_area` coords: the gutter widens
-/// with the line-number digit count, since it sizes to the last line number.
-/// `points_of_offset().x` is text-layout-relative (0 = code start), so this is
-/// what turns it into editor-area x.
+/// The code column for `sql` at a nominal 8px digit — the tests' fixed
+/// origin. The app measures its own (`content_x`): `points_of_offset().x` is
+/// text-layout-relative (0 = code start), and that is what turns it into
+/// editor-area x.
+#[cfg(test)]
 fn content_x_of(sql: &str) -> f64 {
-    content_x_for_lines(sql.bytes().filter(|&c| c == b'\n').count() + 1)
+    content_x_for_lines(sql.bytes().filter(|&c| c == b'\n').count() + 1, 8.0)
 }
 
 /// What the pane recorded about its last launch: the id its first result panel
@@ -1775,11 +1781,55 @@ fn launch_spans(
     }
 }
 
-/// [`content_x_of`] for a document of `total_lines` lines — for a caller that
-/// has the count without the text, as the editor's rope does.
-fn content_x_for_lines(total_lines: usize) -> f64 {
+/// The code column's x in `editor_area` coords for a document of `total_lines`
+/// lines, whose line-number digits are each `digit_w` wide in the code font.
+///
+/// What floem's gutter sizes itself to — its left padding, the last line
+/// number's width, its right padding — past `editor_box`'s 1px border. The
+/// digit width is a parameter because it is the one term that scales with the
+/// font: a measured 56px once stood in for the whole sum, right at about 20pt
+/// and a few px into the first glyph at the default size. Code fonts set
+/// digits tabular, so `digits × digit_w` is the number's width.
+fn content_x_for_lines(total_lines: usize, digit_w: f64) -> f64 {
     let digits = total_lines.to_string().len();
-    HL_GUTTER + digits.saturating_sub(1) as f64 * HL_DIGIT_W
+    1.0 + GUTTER_LEFT_PAD + digits as f64 * digit_w + GUTTER_RIGHT_PAD
+}
+
+/// One line-number digit's width in `ed`'s code font, at its effective size —
+/// measured as floem's gutter measures its numbers, with the same family and
+/// the same rounded size. Cached on (size, family): a pointer move and a
+/// scroll frame both ask, and shaping text for each was not free.
+fn gutter_digit_w(ed: &Editor) -> f64 {
+    use floem::text::{Attrs, AttrsList, FamilyOwned, TextLayout};
+    thread_local! {
+        static LAST: std::cell::RefCell<Option<(usize, Vec<FamilyOwned>, f64)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    let style = ed.style();
+    let size = style.font_size(ed.id(), 0);
+    let family = style.font_family(ed.id(), 0);
+    LAST.with_borrow_mut(|last| {
+        if let Some((s, f, w)) = last.as_ref()
+            && *s == size
+            && f.as_slice() == &*family
+        {
+            return *w;
+        }
+        let attrs = Attrs::new().family(&family).font_size(size as f32);
+        let mut text = TextLayout::new();
+        text.set_text("0", AttrsList::new(attrs));
+        let w = text.size().width;
+        *last = Some((size, family.into_owned(), w));
+        w
+    })
+}
+
+/// The code column's x in `editor_area` coords for `ed` as it is now: the
+/// rope's line count, never a copy of the text, and the digit width its font
+/// gives. Reactive on the font size inside a style closure, so a zoom moves
+/// the overlays with the text.
+fn content_x(ed: &Editor) -> f64 {
+    content_x_for_lines(ed.rope_text().num_lines(), gutter_digit_w(ed))
 }
 
 /// Top-left corner for the Ctrl+Enter run menu, in `editor_area` coords.
@@ -2370,7 +2420,7 @@ fn name_box_at(ed: &Editor, p: Point) -> Option<DiagHit> {
         return None;
     }
     let rope = ed.rope_text();
-    let cx = content_x_for_lines(rope.num_lines());
+    let cx = content_x(ed);
     let vp = ed.viewport.get_untracked();
     let line = rope.line_of_offset(off);
     let start = rope.offset_of_line(line);
@@ -2404,7 +2454,7 @@ fn name_box_at(ed: &Editor, p: Point) -> Option<DiagHit> {
 /// padding and the scroll undone. Reads nothing document-sized, as a pointer
 /// move asks it.
 fn pointer_offset(ed: &Editor, p: Point) -> Option<(usize, bool)> {
-    let cx = content_x_for_lines(ed.rope_text().num_lines());
+    let cx = content_x(ed);
     let vp = ed.viewport.get_untracked();
     let doc = Point::new(p.x - cx + vp.x0, p.y - EDITOR_PAD_TOP + vp.y0);
     if doc.x < 0.0 {
@@ -2691,15 +2741,16 @@ fn highlight_run_pick(
 ///
 /// `vp` is the editor's viewport rect — origin *and* size, since the clamp needs
 /// the width. A zero-width one (before first layout) means "unknown", not "no
-/// room": it clamps nothing, rather than blanking the highlight.
+/// room": it clamps nothing, rather than blanking the highlight. `content_x` is
+/// the code column's origin ([`content_x`]).
 fn statement_line_boxes_at(
     points: impl Fn(usize) -> Option<(Point, Point)>,
+    content_x: f64,
     sql: &str,
     lo: usize,
     hi: usize,
     vp: Rect,
 ) -> Vec<(f64, f64, f64, f64)> {
-    let content_x = content_x_of(sql);
     // The visible slice of the code column, in `editor_area` coords.
     let vis_hi = visible_hi(content_x, vp);
     let mut boxes = Vec::new();
@@ -2720,9 +2771,11 @@ fn statement_line_boxes_at(
             // tight box clips them). Only horizontal — the vertical extent must
             // stay one line tall (+1) so adjacent lines' borders overlap into a
             // single 1px middle border.
-            // Clamped left to the code column (never over the line-number gutter)
-            // and right to the fold.
-            let x0 = (content_x + top.x - HL_PAD - vp.x0).max(content_x);
+            // Clamped left to the code column's margin (never over the line
+            // numbers — the gutter's right padding has room for it) and right to
+            // the fold. Clamped at the column itself, a line starting at column 0
+            // lost its left margin and the border sat on the first glyph.
+            let x0 = (content_x + top.x - HL_PAD - vp.x0).max(content_x - HL_PAD);
             let x1 = content_x + end.x + HL_PAD - vp.x0;
             // The 6px floor keeps an empty statement visible, but never at the
             // cost of reaching past the fold.
@@ -2741,7 +2794,14 @@ fn statement_line_boxes_at(
 
 /// Per-line boxes for the picked statement, in `editor_area` coords.
 fn statement_line_boxes(sql: &str, ed: &Editor, lo: usize, hi: usize) -> Vec<(f64, f64, f64, f64)> {
-    statement_line_boxes_at(editor_points(ed), sql, lo, hi, ed.viewport.get())
+    statement_line_boxes_at(
+        editor_points(ed),
+        content_x(ed),
+        sql,
+        lo,
+        hi,
+        ed.viewport.get(),
+    )
 }
 
 /// The full set of signals/callbacks `query_pane` threads into the editor and its
@@ -4058,14 +4118,14 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     // under the caret — `COMPLETION_GUTTER` (which the completion
                     // popup hides behind its own padding) underestimates the real
                     // gutter, so the menu drifted ~18px left (§7.4). Through
-                    // `content_x_of`, which is also what `run_menu_pos` finds the
+                    // `content_x`, which is also what `run_menu_pos` finds the
                     // code column's right edge from.
                     //
                     // Stored in **content** coords, scroll included: the view
                     // subtracts the viewport itself, so the menu keeps up with a
                     // scroll rather than freezing where the caret was when it opened.
                     run_menu.set(Some(Point::new(
-                        content_x_of(&sql) + below.x,
+                        content_x(e) + below.x,
                         below.y + 4.0 + EDITOR_PAD_TOP,
                     )));
                     comp.open.set(false);
@@ -5397,8 +5457,10 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     WrapMethod::None
                 })
                 // Tuck the line numbers closer to the editor's left edge
-                // (Floem's default is 25).
-                .gutter_left_padding(14.0)
+                // (Floem's default is 25). Both set here, not left to floem's
+                // defaults, because `content_x` adds them up.
+                .gutter_left_padding(GUTTER_LEFT_PAD)
+                .gutter_right_padding(GUTTER_RIGHT_PAD)
                 // Virtual space below the document: the last row can be scrolled
                 // up to the top of the viewport, so the line you're editing never
                 // has to sit on the bottom edge. Floem adds it as a bottom margin
@@ -6412,7 +6474,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     let p = run_menu_pos(
                         pos,
                         (run_menu_w(), run_menu_h()),
-                        content_x_for_lines(ed_lines.rope_text().num_lines()),
+                        content_x(&ed_lines),
                         ed_vp.get(),
                     );
                     s.absolute().inset_left(p.x).inset_top(p.y)
@@ -6464,7 +6526,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 // as the code column's origin does; the code column ends where the
                 // scroll viewport does, and everything past that is the wrapper's
                 // right padding.
-                let content_x = content_x_for_lines(ed_lines.rope_text().num_lines());
+                let content_x = content_x(&ed_lines);
                 let content_right = content_x + ed_vp.get().width();
                 v_stack_from_iter(runs.into_iter().flat_map(move |(y, h, is_add)| {
                     let bg = move || {
@@ -6498,12 +6560,10 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                         s.absolute()
                             .inset_left(0.0)
                             .inset_top(y)
-                            // Stop `HL_PAD` short of the code column. `HL_GUTTER`
-                            // is a measured estimate that runs a shade generous —
-                            // fine for the statement-highlight *border* it was
-                            // tuned for, which pads outward by exactly this much to
-                            // clear the glyphs, but a filled band inherits no such
-                            // margin and was painting over the first character.
+                            // Stop `HL_PAD` short of the code column: the
+                            // statement-highlight *border* pads outward by exactly
+                            // this much to clear the glyphs, and a filled band
+                            // reaching the column would sit on the first character.
                             .width((content_x - HL_PAD).max(0.0))
                             .height(h)
                             .flex_row()
@@ -6592,16 +6652,17 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             move |range| match range {
                 None => empty().into_any(),
                 Some((lo, hi)) => {
-                    // The rope's line count, not the text's: this rebuilds on
-                    // every keystroke that moves the statement's end, and
-                    // copying the document to count its newlines cost ~1 ms
-                    // a keystroke at 4 MiB.
-                    let cx = content_x_for_lines(ed.rope_text().num_lines());
                     let rope = ed.rope_text();
                     let (first, last) = (rope.line_of_offset(lo), rope.line_of_offset(hi));
                     let ed = ed.clone();
                     empty()
                         .style(move |s| {
+                            // In the closure, so a zoom moves the bar with the
+                            // text. The rope's line count, not the text's: this
+                            // runs on every keystroke that moves the statement's
+                            // end, and copying the document to count its newlines
+                            // cost ~1 ms a keystroke at 4 MiB.
+                            let cx = content_x(&ed);
                             let points = editor_points(&ed);
                             let vp = ed.viewport.get();
                             let rope = ed.rope_text();
@@ -6658,7 +6719,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     // two boxes' closures re-run on every scroll frame. The
                     // rope's line count, never a copy of the text: this
                     // rebuilds per keystroke while the caret sits by a bracket.
-                    let cx = content_x_for_lines(ed.rope_text().num_lines());
+                    let cx = content_x(&ed);
                     let (edp, edq) = (ed.clone(), ed.clone());
                     v_stack((
                         empty().style(move |s| match span_box(cx, &edp, p, p_end) {
@@ -6711,7 +6772,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 // Once for the whole list. Each box's style closure re-runs
                 // on every scroll frame — N occurrences meant N full scans
                 // per frame — and the rope's line count costs no copy.
-                let cx = content_x_for_lines(ed.rope_text().num_lines());
+                let cx = content_x(&ed);
                 let ed = ed.clone();
                 v_stack_from_iter(ranges.into_iter().map(move |(lo, hi)| {
                     let ed = ed.clone();
@@ -6798,26 +6859,20 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             diags.extend(run_diag.get());
             let vp = ed.viewport.get();
             let points = editor_points(&ed);
-            // **Once for the whole list.** `content_x_of` counts every newline
-            // in the document and its answer does not depend on the span it is
-            // asked about, so paying for it per diagnostic made a scroll frame
-            // O(document × diagnostics): 7.7 ms at 1 MiB with 30 squiggles,
-            // 125 ms at 16 MiB, on the UI thread, on a memo that re-runs on
-            // every scroll tick and every keystroke.
+            // **Once for the whole list.** The code column does not depend on
+            // the span it is asked about, and it was once derived by counting
+            // every newline in the document — per diagnostic, that made a
+            // scroll frame O(document × diagnostics): 7.7 ms at 1 MiB with 30
+            // squiggles, 125 ms at 16 MiB, on a memo that re-runs on every
+            // scroll tick and every keystroke.
             //
-            // **`with`, not `get`**, for the reason the find scan further down
-            // writes down: "the scan borrows the document, and cloning a 16 MiB
-            // buffer to hand it to a function that takes `&str` was 2.4 ms of a
-            // 20.3 ms keystroke". `content_x_of` is the only use of the document
-            // in this whole memo, and it takes `&str` — so `get` was a
-            // full-document allocation and memcpy per **scroll frame** as well
-            // as per keystroke, on a document with zero diagnostics as much as
-            // on one covered in them.
-            //
-            // And not the text's newlines either, counted per scroll frame:
-            // the rope keeps its line count. `track` keeps the edit re-run.
+            // **Never a copy of the document**, either: a `get` here was a
+            // full-document allocation and memcpy per scroll frame, on a
+            // document with zero diagnostics as much as on one covered in them.
+            // `content_x` reads the rope's line count; `track` keeps the edit
+            // re-run.
             query.track();
-            let content_x = content_x_for_lines(ed.rope_text().num_lines());
+            let content_x = content_x(&ed);
             diags
                 .iter()
                 .filter_map(|d| {
@@ -8938,7 +8993,9 @@ mod geometry_tests {
             None
         );
         assert_eq!(span_box_at(|_| None, content_x_of(SQL), 30, 40, VP), None);
-        assert!(statement_line_boxes_at(|_| None, SQL, 0, SQL.len(), VP).is_empty());
+        assert!(
+            statement_line_boxes_at(|_| None, content_x_of(SQL), SQL, 0, SQL.len(), VP).is_empty()
+        );
     }
 
     #[test]
@@ -9191,8 +9248,14 @@ mod geometry_tests {
         let b = span_box_at(at(450.0), content_x_of(SQL), 10, 18, scrolled_down).unwrap();
         assert!(b.1 < 200.0, "y must be viewport-relative, got {}", b.1);
 
-        let boxes =
-            statement_line_boxes_at(at(450.0), SQL, 10, 18, Rect::new(0.0, 400.0, 800.0, 590.0));
+        let boxes = statement_line_boxes_at(
+            at(450.0),
+            content_x_of(SQL),
+            SQL,
+            10,
+            18,
+            Rect::new(0.0, 400.0, 800.0, 590.0),
+        );
         assert!(boxes.iter().all(|b| b.1 < 200.0), "{boxes:?}");
     }
 
@@ -9221,7 +9284,7 @@ mod geometry_tests {
 
     #[test]
     fn a_multi_line_statement_gets_one_box_per_line() {
-        let boxes = statement_line_boxes_at(at(0.0), SQL, 0, SQL.len(), VP);
+        let boxes = statement_line_boxes_at(at(0.0), content_x_of(SQL), SQL, 0, SQL.len(), VP);
         assert_eq!(boxes.len(), 3, "three lines in the fixture");
     }
 
@@ -9234,7 +9297,8 @@ mod geometry_tests {
         let first_line_only = |off: usize| {
             (off < 10).then(|| (Point::new(off as f64 * 8.0, 0.0), Point::new(0.0, 18.0)))
         };
-        let boxes = statement_line_boxes_at(first_line_only, SQL, 0, SQL.len(), VP);
+        let boxes =
+            statement_line_boxes_at(first_line_only, content_x_of(SQL), SQL, 0, SQL.len(), VP);
         assert_eq!(boxes.len(), 1);
     }
 
@@ -9251,7 +9315,7 @@ mod geometry_tests {
         let sql = "x".repeat(50);
         let vp = Rect::new(0.0, 0.0, 200.0, 180.0);
         let content_x = content_x_of(&sql);
-        let b = statement_line_boxes_at(wide, &sql, 0, sql.len(), vp)[0];
+        let b = statement_line_boxes_at(wide, content_x, &sql, 0, sql.len(), vp)[0];
         assert!(
             b.0 + b.2 <= content_x + 200.0 + 0.01,
             "right edge {} past the fold at {}",
@@ -9263,18 +9327,34 @@ mod geometry_tests {
     #[test]
     fn a_box_scrolled_off_to_the_left_never_covers_the_gutter() {
         // Scrolled 300px right, so the statement's start is off-screen left. The
-        // box begins at the code column, not over the line numbers.
+        // box begins at the code column's margin, not over the line numbers.
         let wide = |off: usize| Some((Point::new(off as f64 * 8.0, 0.0), Point::new(0.0, 18.0)));
         let sql = "x".repeat(50);
         let content_x = content_x_of(&sql);
         let b = statement_line_boxes_at(
             wide,
+            content_x,
             &sql,
             0,
             sql.len(),
             Rect::new(300.0, 0.0, 500.0, 180.0),
         )[0];
-        assert!(b.0 >= content_x, "{} is left of the code column", b.0);
+        assert!(
+            b.0 >= content_x - HL_PAD,
+            "{} is over the line numbers",
+            b.0
+        );
+    }
+
+    /// A statement whose line starts at column 0 is boxed with the same margin
+    /// on its left as on its right. The clamp that keeps a scrolled box off the
+    /// line numbers stopped at the code column itself, so it ate the left
+    /// margin: flush against the first glyph with the code column measured, and
+    /// into it with the old generous estimate.
+    #[test]
+    fn a_statement_at_column_zero_keeps_its_left_margin() {
+        let b = statement_line_boxes_at(at(0.0), content_x_of(SQL), SQL, 0, 9, VP)[0];
+        assert_eq!(b.0, content_x_of(SQL) - HL_PAD, "{b:?}");
     }
 
     #[test]
@@ -9283,7 +9363,8 @@ mod geometry_tests {
         // drop every box; it means "unknown".
         let wide = |off: usize| Some((Point::new(off as f64 * 8.0, 0.0), Point::new(0.0, 18.0)));
         let sql = "x".repeat(50);
-        let boxes = statement_line_boxes_at(wide, &sql, 0, sql.len(), Rect::ZERO);
+        let boxes =
+            statement_line_boxes_at(wide, content_x_of(&sql), &sql, 0, sql.len(), Rect::ZERO);
         assert_eq!(boxes.len(), 1);
         assert!(boxes[0].2 > 300.0, "{:?}", boxes[0]);
     }
@@ -9375,10 +9456,24 @@ mod geometry_tests {
 
     #[test]
     fn the_code_column_widens_with_the_line_number_digit_count() {
-        let one_digit = content_x_of("SELECT 1;");
-        let two_digit = content_x_of(&"x\n".repeat(20));
+        let one_digit = content_x_for_lines(9, 8.4);
+        let two_digit = content_x_for_lines(10, 8.4);
         assert!(two_digit > one_digit);
-        assert_eq!(two_digit - one_digit, HL_DIGIT_W);
+        assert!((two_digit - one_digit - 8.4).abs() < 1e-9);
+    }
+
+    /// The gutter is its two paddings plus the number's measured width, past
+    /// the editor's border — so the code column follows the font size. A fixed
+    /// 56px stood in for it, which put the statement box and the occurrence
+    /// boxes a few px into the first glyph at the default size and fitted only
+    /// at about 20pt.
+    #[test]
+    fn the_code_column_follows_the_code_font_s_digit_width() {
+        let at = |digit_w| content_x_for_lines(4, digit_w);
+        let edge = 1.0 + GUTTER_LEFT_PAD + GUTTER_RIGHT_PAD;
+        assert!((at(8.4) - (edge + 8.4)).abs() < 1e-9, "14px mono");
+        assert!((at(12.0) - (edge + 12.0)).abs() < 1e-9, "20px mono");
+        assert!(at(12.0) > at(8.4));
     }
 
     /// **The code column is a property of the document, so it is derived once
@@ -9443,7 +9538,7 @@ mod geometry_tests {
             let at = body.find(f).unwrap_or_else(|| panic!("{f} is gone"));
             let end = at + body[at..].find("\n}").expect("its end");
             assert!(
-                !body[at..end].contains("content_x_of("),
+                !body[at..end].contains("content_x(") && !body[at..end].contains("content_x_of("),
                 "{f} derives the code column itself again — its callers run it \
                  once per diagnostic, bracket and occurrence, on every scroll \
                  frame"
@@ -9452,7 +9547,7 @@ mod geometry_tests {
         // And no call site may pass it *inline* to one of them, which is the
         // per-element scan wearing the hoisted spelling.
         for line in body.lines().map(str::trim) {
-            if !line.contains("content_x_of(") {
+            if !line.contains("content_x(") && !line.contains("content_x_of(") {
                 continue;
             }
             for f in ["span_box(", "span_box_at(", "underline_seg_at("] {

@@ -24762,8 +24762,9 @@ existing prose was left alone.
     a message exactly where a wave is drawn and nowhere else, from the line's top down to the wave's
     bottom. The drawing memo `segs` is *derived* from `diag_hits` and drops the message, so a
     message-only change still rebuilds nothing drawn and the wave and its hover box are one
-    computation that cannot drift apart; the geometry's two perf rules (`content_x_of` once per list,
-    the document read with `with`, not `get`) moved onto `diag_hits` with their measured comments.
+    computation that cannot drift apart; the geometry's two perf rules (`content_x` once per list,
+    the document never copied — `track`ed, not `get`) moved onto `diag_hits` with their measured
+    comments.
     **Every overlay's points come through `editor_points`, which tracks `screen_lines` and never
     makes floem lay a line out.** An overlay that needs a line's *rows* as well as its position
     takes the layout from `layout_if_built` beside it — `Lines::try_get_text_layout` at the current
@@ -24847,8 +24848,7 @@ existing prose was left alone.
     viewport to reach a document point, takes `Editor::offset_of_point` only when that lands inside
     the text, and boxes the run of word bytes on the line — so a diagnostic on the same word wins.
     It runs on every pointer move and so reads nothing document-sized: the code column comes from
-    the rope's line count through `content_x_for_lines` (which `content_x_of`, counting the text's
-    newlines, now calls), not from the text. **Resolution waits for the delay** — `quick_info`
+    the rope's line count through `content_x` (below), not from the text. **Resolution waits for the delay** — `quick_info`
     (`completion::loaded_schemas` → `name_at` → `describe`) runs only when `DIAG_TIP_DELAY` fires,
     so a pointer crossing a line of words resolves none of them, and a name that names nothing shows
     no tip rather than an empty one. Being the same `diag_tip`, it keeps everything above — the
@@ -25204,15 +25204,41 @@ existing prose was left alone.
     nothing drawn from inside can reach the gutter or the wrapper's right padding. Those two strips
     carry no text, so an overlay finishes the band across them without covering anything — and the
     left one carries the row's `−`/`+` in place of the line number it hides, which is what the
-    design puts there. The gutter strip stops **`HL_PAD` short of the code column**: `HL_GUTTER` is
-    a measured estimate that runs a shade generous, which is fine for the statement-highlight
-    *border* it was tuned for (that one pads outward by exactly `HL_PAD` to clear the glyphs), but a
-    filled band inherits no such margin and was painting over the first character. The overlay is
+    design puts there. The gutter strip stops **`HL_PAD` short of the code column** — the margin the
+    statement-highlight *border* pads outward by to clear the glyphs; a filled band reaching the
+    column would sit on the first character. (It was added when the column was the constant below
+    and ran generous, so the band was painting over that character outright.) The overlay is
     `.clip()`ed to the editor for `inline_footer_y`'s reason — line geometry against a surface that
     scrolls under it — and is nested with `editor_box` inside the `editor_area` stack (which takes
     at most 16 children, and the pair occupies the same rect either way), sitting **directly over
     the editor, under every other overlay**: the overlays above it carry text and must not be
     covered.
+    **The code column is measured from the code font, never a constant** — `content_x(ed)`, which
+    every overlay here reads: the statement border, the run outline, the bracket and occurrence
+    boxes, the squiggles and their hover boxes, the run menu's anchor and fold, these strips, the
+    Ctrl+K verdict bar's left padding and the quick-info hit test. It was `HL_GUTTER = 56`
+    ("measured") plus `HL_DIGIT_W = 8` per extra digit, and neither follows the font: it fitted at
+    about 20pt, and at the default 14px the statement border and the occurrence boxes sat a few px
+    into the first glyph. It is now what floem's gutter sizes itself to
+    (`vendor/floem/src/views/editor/gutter.rs`: left padding, the last line number's measured width,
+    right padding) past `editor_box`'s 1px border — the pure `content_x_for_lines(total_lines,
+    digit_w)`, over the rope's line count — with the digit measured by `gutter_digit_w` as the gutter
+    measures its numbers: floem's `TextLayout`, the editor's own family, the same rounded size,
+    cached in a one-entry `thread_local` on (size, family), since a pointer move and a scroll frame
+    both ask. `digits × digit_w` assumes the code font sets digits tabular. **The editor sets both
+    gutter paddings explicitly** (`gutter_left_padding(GUTTER_LEFT_PAD)`,
+    `gutter_right_padding(GUTTER_RIGHT_PAD)`) because `content_x` adds them up: drop the left call
+    and the gutter falls back to floem's 25 while the sum keeps 14; the right one equals floem's
+    default of 30 today, and is set all the same so the sum reads the app's number, not upstream's.
+    The font size is a reactive read, so `content_x` inside a style closure moves with a zoom.
+    `the_code_column_follows_the_code_font_s_digit_width` and
+    `the_code_column_widens_with_the_line_number_digit_count` pin the sum; `content_x_of` survives
+    only under `#[cfg(test)]`, the geometry tests' fixed origin at a nominal 8px digit, and
+    `HL_DIGIT_W` only as the inline-diff marker's inset. The statement border's left clamp is the
+    column's **margin**, `content_x - HL_PAD`, not the column: clamped at the column, a line
+    starting at column 0 lost its left `HL_PAD` and the border sat on the first glyph — hidden while
+    the generous constant put it *in* the glyph instead (`a_statement_at_column_zero_keeps_its_left_margin`,
+    red before).
     **The custom scrollbars paint *above* the Ctrl+K bars**, listed after `cmdk_view` as **two
     separate children** — the stack is at exactly 16, which fits. The bars run edge to edge and the
     scrollbars are pinned to the editor's *border* rather than to its content edge, so at their old
@@ -25250,9 +25276,9 @@ existing prose was left alone.
     caret moving within one statement rebuilds nothing. The bar asks for points only on the
     statement's lines that are on screen — its line span intersected with `screen_lines`'
     `rvline_range` — so a scroll frame costs the same for a statement of three lines or three
-    thousand, and the code column comes once per rebuild from the rope's line count
-    (`content_x_for_lines`), never from a copy of the text: the range's end follows the text, so
-    the bar rebuilds on most keystrokes in a script, and `content_x_of(&query.get_untracked())`
+    thousand, and the code column comes from the rope's line count (`content_x`, asked inside the
+    style closure so a zoom moves the bar), never from a copy of the text: the range's end follows
+    the text, so the bar rebuilds on most keystrokes in a script, and `content_x_of(&query.get_untracked())`
     cost ~1 ms of each at 4 MiB. The run menu, the Ctrl+K band, the bracket boxes and the
     occurrence boxes read it the same way (`no_overlay_copies_the_document_for_the_code_column`,
     red before). `the_run_outline_marks_what_ctrl_enter_would_run` pins the range, and was red
@@ -34911,8 +34937,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   the layout is a visibly wrong string.
   The **Ctrl+Enter run menu** is the fourth caret-anchored overlay and obeys both halves the same
   way, through `editor_pane::run_menu_pos`: `run_menu` stores the caret's line-bottom in content
-  coords (via `content_x_of`, the gutter the highlight boxes use — `COMPLETION_GUTTER` is an
-  under-estimate the suggestion list hides behind its own padding) and the style closure subtracts
+  coords (via `content_x`, the code column the highlight boxes use — `COMPLETION_GUTTER`, still a
+  constant, is an under-estimate the suggestion list hides behind its own padding) and the style
+  closure subtracts
   `ed.viewport`, then keeps the panel inside `content_x + vp.width()` — the same fold
   `statement_line_boxes_at` clamps to, rather than `area_w`. Horizontally it **flips** left of the
   caret, so the menu stays beside the statement it is about to run; vertically it **clamps**, since
