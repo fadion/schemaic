@@ -18029,8 +18029,12 @@ fn conflict_key(
     }
     let (target, after) = insert_target(toks, dialect)?;
     let key = catalog.key_columns_of(&catalog.resolve_located(&target)?)?;
-    // The column list, if one follows the name: its words at depth one.
-    if matches!(toks[after].kind, TkKind::LParen) && after + 1 < toks.len() - 1 {
+    // The column list, if one follows the name (and its alias): its words at
+    // depth one.
+    let after = past_insert_alias(toks, after);
+    if matches!(toks.get(after).map(|t| &t.kind), Some(TkKind::LParen))
+        && after + 1 < toks.len() - 1
+    {
         let mut listed = Vec::new();
         for t in &toks[after + 1..] {
             match &t.kind {
@@ -18049,10 +18053,61 @@ fn conflict_key(
     column_list(&key, dialect, closed)
 }
 
+/// `after` (the token past an `INSERT`'s target name, from [`insert_target`])
+/// moved past a target alias — PostgreSQL's and SQLite's `INSERT INTO t AS c
+/// (…)` — so it lands where the column list would start.
+fn past_insert_alias(toks: &[Token], after: usize) -> usize {
+    match (toks.get(after), toks.get(after + 1)) {
+        (Some(as_kw), Some(alias))
+            if bare_upper(as_kw).as_deref() == Some("AS")
+                && matches!(alias.kind, TkKind::Word(_)) =>
+        {
+            after + 2
+        }
+        _ => after,
+    }
+}
+
+/// How many values the first row of a `VALUES` (or MySQL's `VALUE`) list at
+/// `at` holds — its commas at the row's own depth, plus one. `None` when no
+/// such row starts there, or it is empty (MySQL's `VALUES ()`).
+fn values_row_width(toks: &[Token], at: usize) -> Option<usize> {
+    let kw = bare_upper(toks.get(at)?)?;
+    if kw != "VALUES" && kw != "VALUE" {
+        return None;
+    }
+    if !matches!(toks.get(at + 1)?.kind, TkKind::LParen) {
+        return None;
+    }
+    if matches!(toks.get(at + 2)?.kind, TkKind::RParen) {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut width = 1;
+    for t in &toks[at + 1..] {
+        match t.kind {
+            TkKind::LParen => depth += 1,
+            TkKind::RParen => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(width);
+                }
+            }
+            TkKind::Comma if depth == 1 => width += 1,
+            _ => {}
+        }
+    }
+    None
+}
+
 /// [`predict`]'s upsert producer: the update list of an `INSERT` that updates
-/// on a clash — every column the `INSERT` writes (its column list, else the
-/// table's [`Catalog::insert_columns_of`]) set from the row it tried to
-/// insert, less the ones that identify the row.
+/// on a clash — every column the `INSERT` writes (its column list, read past
+/// a target alias; else, for a `VALUES` row as wide as the table, the table's
+/// [`Catalog::insert_columns_of`]) set from the row it tried to insert, less
+/// the ones that identify the row. With no list and any other source — a
+/// `SELECT`, `DEFAULT VALUES`, a short row — nothing: the columns it leaves
+/// to their defaults cannot be told apart, and setting them from the proposed
+/// row overwrites what the stored row held.
 ///
 /// - MySQL's `ON DUPLICATE KEY UPDATE ` → `a = VALUES(a), …`, less the
 ///   primary key ([`Catalog::key_columns_of`], where known) — or `a =
@@ -18095,10 +18150,16 @@ fn upsert_assignments(toks: &[Token], catalog: &Catalog, dialect: SqlDialect) ->
     // Asked even with a column list: a table the catalogue does not know, or
     // a name two tables share, has no key it can subtract.
     let table_columns = catalog.insert_columns_of(&r)?;
+    let after = past_insert_alias(toks, after);
     let written: Vec<String> = if matches!(toks.get(after).map(|t| &t.kind), Some(TkKind::LParen)) {
         words_in_parens(after)
-    } else {
+    } else if values_row_width(toks, after) == Some(catalog.columns_of(&r)?.len()) {
+        // No list: only a row as wide as the table writes every column. A
+        // `SELECT`, `DEFAULT VALUES` or a short row leaves some to their
+        // defaults, and an update naming those would overwrite the stored row.
         table_columns.into_iter().cloned().collect()
+    } else {
+        return None;
     };
     // What identifies the row: a conflict target's own list, else the key.
     let conflict_list = toks
@@ -19887,6 +19948,11 @@ mod predict_tests {
             k("INSERT INTO customers (name) VALUES ('a') ON CONFLICT ("),
             None
         );
+        // The list after a target alias decides it the same way.
+        assert_eq!(
+            k("INSERT INTO customers AS c (name) VALUES ('a') ON CONFLICT ("),
+            None
+        );
         assert_eq!(k("INSERT INTO nowhere VALUES (1) ON CONFLICT ("), None);
     }
 
@@ -20616,6 +20682,60 @@ mod predict_tests {
             )
             .as_deref(),
             Some("name = excluded.name")
+        );
+    }
+
+    /// The update list is what the `INSERT` *wrote*. A target alias (`AS c`)
+    /// stands between the name and its column list, which still decides it;
+    /// with no list, only a `VALUES` row as wide as the table writes every
+    /// column. A `SELECT`, `DEFAULT VALUES` or a short row leaves the rest to
+    /// their defaults, and an update listing them would overwrite the stored
+    /// row with those (S8.5-L1-01, reproduced on PostgreSQL 16).
+    #[test]
+    fn an_upsert_sets_only_the_columns_its_insert_wrote() {
+        let pg = |sql: &str| keyed_at(sql, SqlDialect::Postgres);
+        assert_eq!(
+            pg("INSERT INTO orders AS o (id, total) VALUES (1, 2) ON CONFLICT (id) DO UPDATE SET ")
+                .as_deref(),
+            Some("total = EXCLUDED.total")
+        );
+        assert_eq!(
+            keyed_at(
+                "INSERT INTO orders AS o (id, total) VALUES (1, 2) ON CONFLICT (id) DO UPDATE SET ",
+                SqlDialect::Sqlite
+            )
+            .as_deref(),
+            Some("total = EXCLUDED.total")
+        );
+        assert_eq!(
+            pg("INSERT INTO orders SELECT id, total FROM invoices ON CONFLICT (id) DO UPDATE SET "),
+            None
+        );
+        assert_eq!(
+            pg(
+                "INSERT INTO orders AS o SELECT id, total FROM invoices ON CONFLICT (id) DO UPDATE SET "
+            ),
+            None
+        );
+        assert_eq!(
+            pg("INSERT INTO orders DEFAULT VALUES ON CONFLICT (id) DO UPDATE SET "),
+            None
+        );
+        assert_eq!(
+            pg("INSERT INTO orders VALUES (1, 2) ON CONFLICT (id) DO UPDATE SET "),
+            None
+        );
+        assert_eq!(
+            pg("INSERT INTO orders VALUES (1, coalesce(2, 3), 4) ON CONFLICT (id) DO UPDATE SET ")
+                .as_deref(),
+            Some("customer_id = EXCLUDED.customer_id, total = EXCLUDED.total")
+        );
+        assert_eq!(
+            keyed_at(
+                "INSERT INTO orders SELECT id, customer_id, total FROM invoices ON DUPLICATE KEY UPDATE ",
+                SqlDialect::MySql
+            ),
+            None
         );
     }
 

@@ -2651,8 +2651,14 @@ existing prose was left alone.
     `paren_contents`, answers only with the update word last — MySQL/MariaDB's
     `… ON DUPLICATE KEY UPDATE ` (the word `keyword_partner` offers after a hand-typed
     `ON DUPLICATE KEY`) and PostgreSQL/SQLite's `… ON CONFLICT (k) DO UPDATE SET ` — and reads the
-    columns off the `INSERT`'s column list, else the table's `Catalog::insert_columns_of`, each
-    quoted through `export::ident_if_needed`. MySQL's arm writes `a = VALUES(a), b = VALUES(b)`, or
+    columns off the `INSERT`'s column list — read past a PostgreSQL/SQLite target alias
+    (`INSERT INTO t AS c (…)`, `past_insert_alias`) — else the table's
+    `Catalog::insert_columns_of`, each quoted through `export::ident_if_needed`. **The table's
+    columns stand in only for a `VALUES` row as wide as the table** (`values_row_width`): an
+    `INSERT … SELECT`, `DEFAULT VALUES` or a short row leaves the columns it does not reach to their
+    defaults, and an update naming them sets the stored row's values to those — the predicted
+    `email = EXCLUDED.email` wiped a PostgreSQL 16 row's `email` this way — so with no list and any
+    other source nothing is predicted. MySQL's arm writes `a = VALUES(a), b = VALUES(b)`, or
     `a = new.a` where MySQL 8's row alias (`VALUES (…) AS new ON DUPLICATE KEY UPDATE`) is written.
     `VALUES()` is the default because it is MariaDB's only spelling and MySQL 8 still accepts it,
     though deprecated; the alias is MySQL 8's alone. The conflict arm writes `a = EXCLUDED.a`. Both
