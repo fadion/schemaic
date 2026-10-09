@@ -20271,6 +20271,60 @@ mod predict_tests {
         );
     }
 
+    /// `ships (order_id, line_no) → olines (order_id, line_no)`: one key of
+    /// two columns, named alike on both sides.
+    fn composite() -> DbSchema {
+        let mut ships = tbl("ships", &["id", "order_id", "line_no"]);
+        ships.foreign_keys = vec![ForeignKeyInfo {
+            columns: vec!["order_id".to_string(), "line_no".to_string()],
+            ref_table: "olines".to_string(),
+            ref_columns: vec!["order_id".to_string(), "line_no".to_string()],
+            ..Default::default()
+        }];
+        DbSchema {
+            tables: vec![ships, tbl("olines", &["order_id", "line_no", "sku"])],
+            ..Default::default()
+        }
+    }
+
+    /// A composite key is **one** join (`fk_edge_count` counts the key, not
+    /// its columns), and its condition pairs every column in key order —
+    /// `AND`-joined, or one `USING` list where all are named alike. Counted
+    /// per column, the key would be two "keys" and no ghost would be drawn.
+    #[test]
+    fn a_composite_foreign_key_predicts_every_column_pair() {
+        let schema = composite();
+        for d in [SqlDialect::MySql, SqlDialect::Postgres] {
+            let at = |sql: &str| in_schema(&schema, sql, d);
+            assert_eq!(
+                at("SELECT * FROM ships s JOIN ").as_deref(),
+                Some("olines ON s.order_id = olines.order_id AND s.line_no = olines.line_no"),
+                "{d:?}"
+            );
+            assert_eq!(
+                at("SELECT * FROM ships s JOIN olines l ").as_deref(),
+                Some("ON s.order_id = l.order_id AND s.line_no = l.line_no"),
+                "{d:?}"
+            );
+            assert_eq!(
+                at("SELECT * FROM ships s JOIN olines l ON ").as_deref(),
+                Some("s.order_id = l.order_id AND s.line_no = l.line_no"),
+                "{d:?}"
+            );
+            assert_eq!(
+                at("SELECT * FROM ships s JOIN olines l USING (").as_deref(),
+                Some("order_id, line_no)"),
+                "{d:?}"
+            );
+            // From the referenced side: the same pairs, the other way round.
+            assert_eq!(
+                at("SELECT * FROM olines l JOIN ships s ON ").as_deref(),
+                Some("s.order_id = l.order_id AND s.line_no = l.line_no"),
+                "{d:?}"
+            );
+        }
+    }
+
     /// A `CROSS JOIN` is written without a condition and a `NATURAL` one
     /// writes its own, so no ghost adds an `ON` to either. A typed `ON` after
     /// `CROSS JOIN` is filled only where the engine accepts it — MySQL and
@@ -26258,8 +26312,8 @@ mod tests {
             ..Default::default()
         }];
         let customers = tbl("customers", &["id", "name"]);
-        // Composite FK: order_items(order_id, item_id) → … just test single here,
-        // plus a composite pair below.
+        // Single-column keys only. A composite key's join is pinned in
+        // `predict_tests::a_composite_foreign_key_predicts_every_column_pair`.
         let mut line_items = tbl("line_items", &["order_id", "sku", "qty"]);
         line_items.foreign_keys = vec![ForeignKeyInfo {
             columns: vec!["order_id".to_string()],
