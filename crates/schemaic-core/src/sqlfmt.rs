@@ -752,10 +752,37 @@ fn tokenize_under<'s>(
         // only ahead of a digit, and a sign only ahead of a digit and behind the
         // `e` the word scan already swallowed. So `select a-1` keeps its binary
         // minus and `select 1 e` keeps its two tokens.
-        if c.is_ascii_digit() {
+        //
+        // **A number may also begin or end at its point**, `.5` and `1.`, on
+        // all four. Lexed as a `.` beside a word, `need_space` kept it tight
+        // and wrote `between .1` as `between.1` (MariaDB: ERROR 1064) and
+        // `1. as x` as `1.as x` (PostgreSQL: *trailing junk*). A point
+        // straight after a name, a quote or a `)` is a qualifier's, as the
+        // engines read it, and a second point (`db..t`) is never a number's.
+        let point_number = c == b'.'
+            && b.get(i + 1).is_some_and(u8::is_ascii_digit)
+            && !i.checked_sub(1).is_some_and(|p| {
+                is_word_byte(b[p]) || matches!(b[p], b'.' | b')' | b']' | b'"' | b'`' | b'\'')
+            });
+        if c.is_ascii_digit() || point_number {
             let s = i;
+            i += usize::from(point_number);
             while i < n && is_word_byte(b[i]) {
                 i += 1;
+            }
+            // `1.` — a point ending an integer, with no name or second point
+            // after it, and not a qualified name's part (`t.1.x`).
+            let integer = !point_number && b[s..i].iter().all(u8::is_ascii_digit);
+            let qualified = matches!(toks.last(), Some((Kind::Punct, ".")))
+                && s.checked_sub(1).is_some_and(|p| b[p] == b'.');
+            if integer
+                && !qualified
+                && b.get(i) == Some(&b'.')
+                && !b.get(i + 1).is_some_and(|&c| is_word_byte(c) || c == b'.')
+            {
+                toks.push((Kind::Word, &sql[s..i + 1]));
+                i += 1;
+                continue;
             }
             // `.` ahead of a digit, or of the exponent a bare point may have
             // (`1.e-5` is a number on all four).
@@ -767,7 +794,8 @@ fn tokenize_under<'s>(
                         None => false,
                     }
             };
-            if i < n
+            if !point_number
+                && i < n
                 && b[i] == b'.'
                 && (b.get(i + 1).is_some_and(u8::is_ascii_digit) || exponent_at(i + 1))
             {
@@ -3357,6 +3385,40 @@ mod tests {
             }
             assert_preserves(sql, d);
         }
+    }
+
+    /// **A number may begin or end at its point, and stays set off from the
+    /// words around it.** `.5` lexed as a `.` and a `5`, `1.` as a `1` and a
+    /// `.`, and `need_space` keeps every `.` tight — so `between .1` came out
+    /// `between.1`, which MariaDB 10.11 refuses (ERROR 1064), and `1. as x`
+    /// came out `1.as x`, PostgreSQL 16's *trailing junk after numeric
+    /// literal*. A point against a name is still a qualifier's.
+    #[test]
+    fn a_number_with_a_leading_or_trailing_point_keeps_its_spaces() {
+        for d in SqlDialect::ALL {
+            let out = super::format_sql(
+                "select 0.5 between .1 and .9, case when x then .5 else .25 end from t",
+                IND,
+                d,
+            );
+            for kept in ["between .1", "and .9", "then .5", "else .25"] {
+                assert!(out.contains(kept), "{d:?}: {kept}: {out}");
+            }
+            let out = super::format_sql("select 1. as x, 2. from t where y=.5", IND, d);
+            for kept in ["1. as x", "2.\nfrom", "y = .5"] {
+                assert!(out.contains(kept), "{d:?}: {kept}: {out}");
+            }
+            // Signs and parens around one stay tight as they do around any number.
+            let out = super::format_sql("select f(-.5, (.5), 1.)", IND, d);
+            assert!(out.contains("f(-.5, (.5), 1.)"), "{d:?}: {out}");
+            // A qualifier's point is still tight, a digit-led name's too.
+            let out = super::format_sql("select f(t.a, t.1x, s.t.c) from s.t", IND, d);
+            assert!(
+                out.contains("f(t.a, t.1x, s.t.c)") && out.contains("s.t"),
+                "{out}"
+            );
+        }
+        assert_preserves("select a from db..t", SqlDialect::MsSql);
     }
 
     /// **A name `go` never lands alone on a line where `GO` is a directive.**

@@ -25197,6 +25197,12 @@ mod tests {
                 MySql,
                 "DELIMITER ;;\nCREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW BEGIN SET NEW.a = 1; END;;\nDELIMITER ;\n",
             ),
+            // A number that begins or ends at its point (S4-L1-02).
+            (
+                MySql,
+                "select 0.5 between .1 and .9, case when x then .5 else .25 end from t",
+            ),
+            (Postgres, "select 1. as x, 2. from t where y=.5"),
         ]
     }
 

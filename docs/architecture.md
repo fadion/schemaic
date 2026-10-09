@@ -12521,7 +12521,14 @@ existing prose was left alone.
     already swallowed — so `select a-1` keeps its binary minus and `select 1 e` keeps its two tokens.
     The exponent half came later: `1.e-5` is a number on all four engines, and asking only for a
     digit after the `.` wrote it back as `1.e - 5`
-    (`a_number_with_a_bare_point_before_its_exponent_is_one_token`).
+    (`a_number_with_a_bare_point_before_its_exponent_is_one_token`). So did a number that begins or
+    ends at its point, `.5` and `1.`, valid on all four: lexed as a `.` beside a word, `need_space`
+    kept the point tight and wrote `between .1` as `between.1` (MariaDB: ERROR 1064) and `1. as x`
+    as `1.as x` (PostgreSQL: *trailing junk after numeric literal*). The arm now starts at a `.`
+    ahead of a digit unless a name, a quote, a `)` or another `.` stands straight before it — a
+    qualifier's point, as the engines read it — and takes a trailing `.` after an all-digit integer
+    that no word byte or second `.` follows and that is no qualified name's part
+    (`a_number_with_a_leading_or_trailing_point_keeps_its_spaces`).
     **Two more ways it broke a token's *text*, against its own contract that only whitespace and
     layout change.** It was a fourth caller of `skip_comment` and took the security gates' answer, so
     a `/*! … */` body became ordinary tokens and the closing `*/` fell out as two one-byte puncts
