@@ -3103,15 +3103,25 @@ existing prose was left alone.
     around it, resolving the chain only *up to the part under the offset*, so `o` of `o.total`
     names the table and `total` the column. The tokens are `intel::tokenize_range`'s (made
     `pub(crate)` for this, with `Token`'s fields and `TkKind`) and the scope is
-    `intel::statement_scope`'s, so there is no scanner here of its own. A bare word is a scope alias
-    or table, then a table of the active database, then a column of a table in scope — in that
-    order, so a column sharing a table's name answers as the table. **A bare column two tables in
-    scope both hold names nothing** — the server refuses it as ambiguous, and Ctrl+click opening the
-    first table's was a guess; a table joined to itself is still one
-    (`an_ambiguous_bare_column_names_nothing`). `q.name` is a column of the alias or table `q`, else a table of the
-    database `q` where one is loaded by that name (MySQL's `db.t`), else of schema `q` in the active
-    database; three parts are a table's column or SQL Server's `db.schema.table`; a name followed by
-    `(` is a routine. Every match is exact first, then case-insensitive (`find_table`). **What no
+    `intel::scope_levels` — `statement_scope`'s tables kept **one level per query around the
+    offset, innermost first** — so there is no scanner here of its own. **Names bind as the server
+    binds them**: a qualifier to the innermost query defining it, a bare column to the innermost
+    query holding it; one flat list, outermost first, read a subquery's re-used `t` as the outer
+    table and called a correlated query's bare `id` ambiguous
+    (`a_name_binds_to_the_innermost_query_that_defines_it`, S8.2-L1-06, red before). A word where a
+    table reference is written (`intel::on_table_reference`, the table-list walk's own positions) is
+    a table; anywhere else a bare word is a scope alias, then a column, then a scope table or a
+    table of the active database — a column first, since a table elsewhere sharing its name took
+    Sakila's `customer_list.city` (`a_bare_column_named_like_a_table_is_the_column`, S8.2-L1-04, red
+    before). **A bare column two tables of its query both hold names nothing** — the server refuses
+    it as ambiguous, and Ctrl+click opening the first table's was a guess; a table joined to itself
+    is still one (`an_ambiguous_bare_column_names_nothing`). `q.name` is a column of the alias or
+    table `q`, else a table of the database `q` where one is loaded by that name (MySQL's `db.t`),
+    else of schema `q` in the active database; three parts are a table's column or SQL Server's
+    `db.schema.table`; a name followed by `(` is a routine where one is so named and otherwise what
+    it would be without the paren, so `INSERT INTO orders (id)`'s target is found
+    (`a_table_name_before_a_paren_is_the_table`, S8.2-L1-05, red before). Every match is exact
+    first, then case-insensitive (`find_table`). **What no
     loaded schema holds is `None`**, never a nearest guess — the database is the semantic authority,
     and a guess would open the wrong object. `describe` renders a `NamedObject` as the tip's lines:
     a table or view with its column count and comment; a column with its type, then *primary key ·

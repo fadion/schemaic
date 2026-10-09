@@ -90,13 +90,15 @@ pub fn name_at(
     let pos = (k - first) / 2;
     let called = matches!(toks.get(last + 1).map(|t| &t.kind), Some(TkKind::LParen));
     let span = (toks[k].at, toks[k].end);
-    let scope = intel::statement_scope(sql, lo, hi, offset, dialect).tables;
+    let levels = intel::scope_levels(sql, lo, hi, offset, dialect);
     let r = Resolver {
         loaded,
         active_db,
-        scope: &scope,
+        levels: &levels,
     };
-    let object = r.resolve(&parts[..=pos], called && pos + 1 == parts.len())?;
+    let as_table =
+        pos + 1 == parts.len() && intel::on_table_reference(sql, lo, hi, offset, dialect);
+    let object = r.resolve(&parts[..=pos], called && pos + 1 == parts.len(), as_table)?;
     Some(NameHit { span, object })
 }
 
@@ -200,7 +202,9 @@ fn find_table<'s>(db: &'s DbSchema, schema: Option<&str>, name: &str) -> Option<
 struct Resolver<'a, 'b> {
     loaded: &'a Loaded<'b>,
     active_db: Option<&'a str>,
-    scope: &'a [TableRef],
+    /// The queries around the pointer, innermost first
+    /// ([`intel::scope_levels`]).
+    levels: &'a [Vec<TableRef>],
 }
 
 impl Resolver<'_, '_> {
@@ -247,17 +251,55 @@ impl Resolver<'_, '_> {
         self.table(r.db.as_deref(), &r.name)
     }
 
-    /// The scope entry a qualifier names: its alias, or its name where it has
-    /// none written.
+    /// The scope entry a qualifier names: in the innermost query that
+    /// defines it, its alias, or its name where it has none written.
     fn qualifier(&self, q: &str) -> Option<&TableRef> {
-        self.scope
-            .iter()
-            .find(|r| {
-                r.alias
-                    .as_deref()
-                    .is_some_and(|a| a.eq_ignore_ascii_case(q))
-            })
-            .or_else(|| self.scope.iter().find(|r| r.name.eq_ignore_ascii_case(q)))
+        self.levels.iter().find_map(|level| {
+            level
+                .iter()
+                .find(|r| {
+                    r.alias
+                        .as_deref()
+                        .is_some_and(|a| a.eq_ignore_ascii_case(q))
+                })
+                .or_else(|| level.iter().find(|r| r.name.eq_ignore_ascii_case(q)))
+        })
+    }
+
+    /// The scope entry an alias `a` names, in the innermost query that
+    /// defines it.
+    fn alias(&self, a: &str) -> Option<&TableRef> {
+        self.levels.iter().flatten().find(|r| {
+            r.alias
+                .as_deref()
+                .is_some_and(|x| x.eq_ignore_ascii_case(a))
+        })
+    }
+
+    /// The column a bare `name` is: the innermost query whose tables hold
+    /// one decides, and only where exactly one of its tables does — the
+    /// server refuses one two tables hold, and naming either would be a
+    /// guess. A table joined to itself is one. `Err` when that query holds
+    /// it twice, `Ok(None)` when no query holds it.
+    fn bare_column(&self, name: &str) -> Result<Option<NamedObject>, ()> {
+        for level in self.levels {
+            let mut found: Vec<NamedObject> = Vec::new();
+            for c in level
+                .iter()
+                .filter_map(|r| self.scoped(r))
+                .filter_map(|t| self.column_of(t, name))
+            {
+                if !found.contains(&c) {
+                    found.push(c);
+                }
+            }
+            match found.len() {
+                0 => continue,
+                1 => return Ok(found.pop()),
+                _ => return Err(()),
+            }
+        }
+        Ok(None)
     }
 
     fn column_of(&self, table: NamedObject, column: &str) -> Option<NamedObject> {
@@ -314,32 +356,42 @@ impl Resolver<'_, '_> {
         })
     }
 
-    /// What `parts` — a dotted name up to the part the offset is on — names.
-    fn resolve(&self, parts: &[&str], called: bool) -> Option<NamedObject> {
+    /// What `parts` — a dotted name up to the part the offset is on — names;
+    /// `called` when a `(` follows it, `as_table` when it sits where a table
+    /// reference is written.
+    ///
+    /// A name before `(` is a routine where one is so named, and otherwise
+    /// what it would be without the paren — `INSERT INTO orders (id)`,
+    /// `REFERENCES customers (id)` — which found nothing (S8.2-L1-05).
+    fn resolve(&self, parts: &[&str], called: bool, as_table: bool) -> Option<NamedObject> {
+        let routine = match (called, parts) {
+            (true, [name]) => self.routine(None, name),
+            (true, [q, name]) => self.routine(Some(q), name),
+            _ => None,
+        };
+        routine.or_else(|| self.resolve_name(parts, as_table))
+    }
+
+    fn resolve_name(&self, parts: &[&str], as_table: bool) -> Option<NamedObject> {
         match parts {
-            [name] if called => self.routine(None, name),
-            [name] => self
-                .qualifier(name)
-                .and_then(|r| self.scoped(r))
-                .or_else(|| self.table(None, name))
-                .or_else(|| {
-                    // Only where exactly one table in scope holds it: the
-                    // server refuses one two tables hold, and naming either
-                    // would be a guess. A table joined to itself is one.
-                    let mut found: Vec<NamedObject> = Vec::new();
-                    for c in self
-                        .scope
-                        .iter()
-                        .filter_map(|r| self.scoped(r))
-                        .filter_map(|t| self.column_of(t, name))
-                    {
-                        if !found.contains(&c) {
-                            found.push(c);
-                        }
-                    }
-                    (found.len() == 1).then(|| found.remove(0))
-                }),
-            [q, name] if called => self.routine(Some(q), name),
+            [name] if as_table => self.table(None, name),
+            // **A word in a column's place is a column first** (S8.2-L1-04):
+            // a table elsewhere in the database by the same name — Sakila's
+            // `city` beside `customer_list.city` — took it. An alias of the
+            // scope is the one exception, being the name the query gave a
+            // table; a table's own name only where no query here holds a
+            // column by it.
+            [name] => match self.alias(name).and_then(|r| self.scoped(r)) {
+                Some(t) => Some(t),
+                None => match self.bare_column(name) {
+                    Ok(Some(c)) => Some(c),
+                    Err(()) => None,
+                    Ok(None) => self
+                        .qualifier(name)
+                        .and_then(|r| self.scoped(r))
+                        .or_else(|| self.table(None, name)),
+                },
+            },
             [q, name] => match self.qualifier(q).and_then(|r| self.scoped(r)) {
                 Some(t) => self.column_of(t, name),
                 None => self.table(Some(q), name),
@@ -492,6 +544,78 @@ mod tests {
             at(twice, "total", 0).unwrap().object,
             column("orders", "total")
         );
+    }
+
+    /// **A bare word in a column's place is the column**, even where a
+    /// table of the database shares its name — Sakila's `city` and
+    /// `customer_list.city` — and a table only in a table's place
+    /// (S8.2-L1-04).
+    #[test]
+    fn a_bare_column_named_like_a_table_is_the_column() {
+        let mut s = shop();
+        s.tables.push(TableInfo {
+            name: "city".to_string(),
+            columns: vec![col("city_id", "int"), col("city", "varchar(50)")],
+            ..TableInfo::default()
+        });
+        s.tables.push(TableInfo {
+            name: "customer_list".to_string(),
+            columns: vec![col("address", "varchar(50)"), col("city", "varchar(50)")],
+            is_view: true,
+            ..TableInfo::default()
+        });
+        let loaded = [("shop", &s)];
+        let hit = |sql: &str, needle: &str, nth: usize| {
+            let off = sql.match_indices(needle).nth(nth).unwrap().0 + 1;
+            name_at(sql, off, SqlDialect::MySql, &loaded, Some("shop")).map(|h| h.object)
+        };
+        let sql = "select address, city from customer_list";
+        assert_eq!(hit(sql, "city", 0), Some(column("customer_list", "city")));
+        let sql = "select city from city";
+        assert_eq!(hit(sql, "city", 0), Some(column("city", "city")));
+        assert_eq!(hit(sql, "city", 1), Some(table("city", false)));
+    }
+
+    /// **A table name before `(` that names no routine is still the
+    /// table** — an `INSERT`'s target with its column list (S8.2-L1-05).
+    #[test]
+    fn a_table_name_before_a_paren_is_the_table() {
+        let sql = "insert into orders (id, total) values (1, 2)";
+        assert_eq!(at(sql, "orders", 0).unwrap().object, table("orders", false));
+        let sql = "insert into shop.orders(id) values (1)";
+        assert_eq!(at(sql, "orders", 0).unwrap().object, table("orders", false));
+    }
+
+    /// **The queries around the pointer are levels, innermost first**, as
+    /// the server binds a name (S8.2-L1-06): a subquery's own `t` hides the
+    /// outer one, and a bare column is the innermost query's that holds it.
+    #[test]
+    fn a_name_binds_to_the_innermost_query_that_defines_it() {
+        let sql = "select * from orders t where exists \
+                   (select 1 from customers t where t.name = 'x')";
+        assert_eq!(
+            at(sql, "name", 0).unwrap().object,
+            column("customers", "name")
+        );
+        assert_eq!(
+            at(sql, "t.name", 0).unwrap().object,
+            table("customers", false)
+        );
+        let sql = "select * from orders o where exists \
+                   (select 1 from customers c where id = o.customer_id)";
+        assert_eq!(
+            at(sql, "id =", 0).unwrap().object,
+            column("customers", "id")
+        );
+        // A correlated reference still reaches out.
+        assert_eq!(
+            at(sql, "customer_id", 0).unwrap().object,
+            column("orders", "customer_id")
+        );
+        // Ambiguous within its own level is still nothing.
+        let sql = "select * from orders x where exists \
+                   (select 1 from customers c join big_orders b on true where id = 1)";
+        assert_eq!(at(sql, "id =", 0), None);
     }
 
     #[test]

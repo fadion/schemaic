@@ -5035,6 +5035,41 @@ pub fn statement_scope(
     scope
 }
 
+/// [`statement_scope`]'s tables as **levels, innermost first** — one per
+/// query around `caret` — for a question that binds a name the way the
+/// server does: a qualifier to the innermost query defining it, a bare column
+/// to the innermost query holding it. The flat list hid that, so a
+/// subquery's re-used alias read as the outer table (S8.2-L1-06). What the
+/// AST does not place — a trigger's rows, an upsert's proposed row, or
+/// every table when the statement does not parse — is one last level.
+pub fn scope_levels(
+    sql: &str,
+    lo: usize,
+    hi: usize,
+    caret: usize,
+    dialect: SqlDialect,
+) -> Vec<Vec<TableRef>> {
+    let flat = statement_scope(sql, lo, hi, caret, dialect).tables;
+    let stmt = sql.get(lo..hi).unwrap_or("");
+    let mut levels = match sqlparser::parser::Parser::parse_sql(&*dialect.parser(), stmt) {
+        Ok(mut asts) if asts.len() == 1 => {
+            let (mut levels, _) = ast_scope::levels_at(&asts.pop().unwrap(), stmt, lo, caret);
+            levels.reverse();
+            levels.retain(|l| !l.is_empty());
+            levels
+        }
+        _ => Vec::new(),
+    };
+    let rest: Vec<TableRef> = flat
+        .into_iter()
+        .filter(|r| !levels.iter().flatten().any(|l| l == r))
+        .collect();
+    if !rest.is_empty() {
+        levels.push(rest);
+    }
+    levels
+}
+
 /// Are `dialect`'s trigger rows the `NEW` and `OLD` records? MySQL's,
 /// PostgreSQL's and SQLite's are; SQL Server's are the `inserted` and
 /// `deleted` tables ([`pseudo_tables`]), and it has no `NEW`.
@@ -5166,6 +5201,26 @@ mod ast_scope {
         caret: usize,
         out: &mut Scope,
     ) {
+        let (levels, ctes) = levels_at(stmt, text, lo, caret);
+        for tables in levels {
+            for r in tables {
+                push_ref(r, out);
+            }
+        }
+        out.ctes.extend(ctes);
+    }
+
+    /// [`collect_at`]'s queries around `caret`, each its own list of tables,
+    /// **outermost first** — the statement's own frame, then each query whose
+    /// span holds the caret — and every CTE name. Kept apart for a question
+    /// that binds a name level by level, as the server does
+    /// ([`super::scope_levels`]).
+    pub(super) fn levels_at(
+        stmt: &Statement,
+        text: &str,
+        lo: usize,
+        caret: usize,
+    ) -> (Vec<Vec<TableRef>>, Vec<String>) {
         use sqlparser::ast::{Spanned, Visit, Visitor};
         use std::ops::ControlFlow;
         struct Walk<'a> {
@@ -5229,12 +5284,7 @@ mod ast_scope {
             .collect();
         // Outermost first; the statement's own frame is the widest.
         around.sort_by_key(|((a, b), _)| std::cmp::Reverse(b - a));
-        for (_, tables) in around {
-            for r in tables {
-                push_ref(r, out);
-            }
-        }
-        out.ctes.extend(w.ctes);
+        (around.into_iter().map(|(_, t)| t).collect(), w.ctes)
     }
 
     /// A query body's own tables: each leaf `SELECT`'s `FROM`, a derived
@@ -6442,6 +6492,21 @@ fn located_table_refs(sql: &str, lo: usize, hi: usize, dialect: SqlDialect) -> V
     };
     walk_table_lists(&toks, dialect, true, &mut emit);
     out
+}
+
+/// Is `offset` on the table name of a table reference in `sql[lo..hi]` — a
+/// `FROM`/`JOIN` item, or a write's target ([`located_table_refs`])? Where a
+/// word is a table rather than a column of the same name.
+pub(crate) fn on_table_reference(
+    sql: &str,
+    lo: usize,
+    hi: usize,
+    offset: usize,
+    dialect: SqlDialect,
+) -> bool {
+    located_table_refs(sql, lo, hi, dialect)
+        .iter()
+        .any(|l| l.pos.0 <= offset && offset <= l.pos.1)
 }
 
 /// Every table list in `toks`, each item to `emit` in order — the walk
