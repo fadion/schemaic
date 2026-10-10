@@ -2961,7 +2961,6 @@ pub(crate) fn date_pick_overlay(ui: OverlayUi) -> impl IntoView {
     })
 }
 
-/// Generic popup-menu overlay (the results-grid header/cell menus). Renders a
 /// Which point a cursor-anchored popup menu is placed at, across one opening.
 ///
 /// `held` is what the previous run of the memo decided, and returning it
@@ -2983,6 +2982,7 @@ fn menu_open_point(
     Some(held.unwrap_or_else(pointer))
 }
 
+/// Generic popup-menu overlay (the results-grid header/cell menus). Renders a
 /// `menu_panel` from `ui.overlay.popup_menu` at the cursor, flipping the whole panel left
 /// / up if it would spill past the window edge (the grid sits mid-window, unlike
 /// the left-anchored schema menu). Submenus edge-flip themselves.
@@ -3000,10 +3000,13 @@ pub(crate) fn popup_menu_overlay(o: OverlayUi) -> impl IntoView {
     // by then it was the entry the pointer had wandered onto. The panel jumped
     // so its corner sat under the pointer, taking that entry out from under it.
     //
-    // A memo rather than an effect, and that is not a preference: a memo is
-    // computed when it is *read*, so the style closure below cannot run against
-    // a stale sample on the opening pass. Keyed on open-ness alone, so a menu
-    // whose entries are patched while it stands keeps the point it opened at.
+    // A memo, so the point is a value the style closure below *reads* and
+    // tracks rather than a slot an effect writes beside it. floem_reactive
+    // 0.2's memos are eager — `create_memo` computes at creation and then
+    // inside an effect — so a change to the channel is seen as it is set: a
+    // close followed by a reopen in one handler still resamples (the editor's
+    // right-click relies on that). Keyed on open-ness alone, so a menu whose
+    // entries are patched while it stands keeps the point it opened at.
     //
     // This is `CtxMenu::at`'s answer for the other channel (B16.1-L1-01),
     // reached without a fourth `PopupAnchor` variant: the anchored arms all

@@ -121,6 +121,19 @@ fn scrollbar_geo(lines: usize, line_h: f64, viewport_h: f64) -> Option<(f64, f64
     Some((viewport_h, thumb_h, (content_h - viewport_h).max(1.0)))
 }
 
+/// Does the editor draw its caret and current-line band — look like where the
+/// keyboard is?
+///
+/// While it has the keyboard, and **while its own right-click menu is open**,
+/// which takes the keyboard for its arrows and Escape without the user having
+/// gone anywhere: the caret vanishing there left no sign of where *Format
+/// selection* or *Rename alias* would act (issue #12). Any other overlay that
+/// takes the keyboard — Ctrl+K, the schema panel, the terminal — has taken the
+/// user's attention with it, and the editor rightly looks inert.
+fn looks_focused(focused: bool, own_menu_open: bool) -> bool {
+    focused || own_menu_open
+}
+
 /// Does this Tab take the inline prediction?
 ///
 /// Only a plain Tab, only with the completion list closed — an open list owns
@@ -5317,6 +5330,28 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     // transparent while unfocused (see `editor_style`'s `cursor_color` below); a
     // transparent caret is invisible regardless of the blink.
     let editor_focused = RwSignal::new(false);
+    // Set by this editor's right-click, just before its menu takes the
+    // keyboard; cleared by the next change to the app-wide popup menu after
+    // the one that opened it — the menu going however it goes (an entry,
+    // Escape, a click away) or another menu replacing it outright, which
+    // never passes through `None`. `opening` marks the right-click's own
+    // change so the effect lets that one through. Read beside
+    // `editor_focused` by `looks_focused`, so the caret stays while the menu
+    // is up (issue #12). Focus itself is left alone: the menu owns the keys.
+    let own_menu_open = RwSignal::new(false);
+    let own_menu_opening = Rc::new(std::cell::Cell::new(false));
+    {
+        let opening = own_menu_opening.clone();
+        create_effect(move |_| {
+            popup_menu.track();
+            if opening.replace(false) {
+                return;
+            }
+            if own_menu_open.get_untracked() {
+                own_menu_open.set(false);
+            }
+        });
+    }
     {
         let ed_focus = ed.clone();
         create_effect(move |_| {
@@ -5419,7 +5454,8 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             // paints (and blinks) the caret regardless of focus, so hiding it any
             // other way is fought by its internal blink reset (see the focus block
             // above). This is what keeps the editor from looking active on load.
-            let caret = if editor_focused.get() {
+            let looks_focused = looks_focused(editor_focused.get(), own_menu_open.get());
+            let caret = if looks_focused {
                 t.cursor
             } else {
                 floem::peniko::Color::TRANSPARENT
@@ -5471,7 +5507,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             // Current-line highlight — body AND gutter — only while focused; an
             // unfocused editor looks inert. The gutter band in particular must not
             // linger on blur (it also scrolled oddly with horizontal scroll).
-            if editor_focused.get() {
+            if looks_focused {
                 s.current_line_color(t.current_line)
                     .gutter_current_color(t.current_line)
             } else {
@@ -5751,6 +5787,20 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     }
                 }
                 if pe.button.is_secondary() {
+                    // **A right-click while a menu stands is a new menu, at the
+                    // new click.** The overlay keeps the point a menu opened
+                    // at for as long as one is open — so entries patched in
+                    // place do not move it — and replacing the entries outright
+                    // drew the new menu where the old one was: from where the
+                    // user looked, the second right-click did nothing. Closing
+                    // first makes the overlay sample the pointer afresh (its
+                    // memos are eager, so the close is seen even though the
+                    // reopen follows in this same handler). First of all, so
+                    // the close is not mistaken for this menu's own change by
+                    // `own_menu_open`'s effect.
+                    if popup_menu.with_untracked(Option::is_some) {
+                        popup_menu.set(None);
+                    }
                     let off = ed_menu.cursor.get_untracked().offset();
                     menu_offset.set(off);
                     // Open at the cursor (window coords via `last_mouse`), rendered
@@ -5774,6 +5824,10 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                             }
                         }));
                     }
+                    // Before the panel mounts and takes focus, so the caret
+                    // never blinks out for the frame between.
+                    own_menu_open.set(true);
+                    own_menu_opening.set(true);
                     popup_menu.set(Some((build_editor_menu)()));
                     comp.open.set(false);
                     return EventPropagation::Stop;
@@ -8103,6 +8157,30 @@ mod cmdk_preview_gate {
         }
         // The verdict footer's, and the `preview_up` memo the ghost keys ask.
         assert_eq!(checked, 2, "this gate is stale — it found {checked}");
+    }
+}
+
+#[cfg(test)]
+mod looks_focused_tests {
+    use super::looks_focused;
+
+    #[test]
+    fn the_editor_with_the_keyboard_looks_focused() {
+        assert!(looks_focused(true, false));
+    }
+
+    /// The right-click menu takes the keyboard, and the caret must stay to say
+    /// where its entries will act.
+    #[test]
+    fn its_own_right_click_menu_keeps_the_caret() {
+        assert!(looks_focused(false, true));
+    }
+
+    /// Focus elsewhere — the schema panel, the terminal, Ctrl+K — and no menu
+    /// of its own: inert, as on load.
+    #[test]
+    fn focus_elsewhere_without_its_menu_looks_inert() {
+        assert!(!looks_focused(false, false));
     }
 }
 

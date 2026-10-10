@@ -35713,6 +35713,39 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   own hand-back finds no other root — so the dialog carries its own return
   (`AliasRenameRequest::back`, under `alias_rename.rs`); without it Ctrl+Z after a rename did nothing
   until the editor was clicked.
+  **Opening that menu blurs the editor, and the caret must not go with it** — `looks_focused`
+  (`focused || own_menu_open`), which `editor_style` reads for the caret colour and the
+  current-line band in place of `editor_focused` alone. Both paint `Color::TRANSPARENT` while the
+  editor is unfocused, on purpose: floem resets `cursor_info.hidden` to `false` on every cursor
+  change, so the colour is the only handle, and it is what keeps the editor looking inert on load
+  and while Ctrl+K, the schema panel or the terminal has the keyboard. But `menu_panel` is a
+  `focus_root` that takes the keys for its arrows, Escape and Enter, so the right-click blurred the
+  editor and the caret vanished with the menu still up — no sign left of where *Format selection*
+  or *Rename alias* would act (GitHub #12). `own_menu_open` is set in the secondary-button branch,
+  before `popup_menu.set` so no frame goes caretless, and cleared by an effect on the **next**
+  change to `popup_menu` rather than on its going to `None`, because another menu replacing this
+  one outright never passes through `None`. The right-click's own change is let through by
+  `own_menu_opening`, a non-reactive `Rc<Cell<bool>>` the effect `replace`s with `false`. Focus
+  routing is untouched — the menu still owns the keys, the return above is unchanged, and the
+  diagnostic tip's retire effect still tracks `editor_focused` alone. `looks_focused_tests` pins the
+  predicate (three cases); the effect lives in the view and has no unit test.
+  **A right-click while that menu stands closes it before opening the next** — `if popup_menu
+  .with_untracked(Option::is_some) { popup_menu.set(None); }` at the top of the secondary-button
+  branch. `popup_menu_overlay` keeps the point a menu opened at (`opened_at`, a memo keyed on
+  open-ness through `menu_open_point`) for as long as a menu is open, deliberately, so entries
+  patched in place do not move it. So replacing the entries outright drew the new menu where the
+  old one was, and from where the user looked the second right-click did nothing. Passing through
+  `None` makes the overlay sample the pointer afresh, and it does so even though the reopen follows
+  in the same handler because floem_reactive 0.2's `create_memo` is eager — it runs `f(None)` at
+  creation and recomputes inside a `create_effect`, so the close is seen as it is set. **It comes
+  first in the branch, ahead of `own_menu_open`/`own_menu_opening`, on purpose**: the effect above
+  then takes the close as an ordinary change and clears any stale flag, rather than mistaking it for
+  this menu's own opening. Only the editor's opener does this, because only the editor showed the
+  fault: a second right-click in the history, the snippet library, the schema tree, the tabs,
+  Server Activity and the connection list was checked by hand and already reopens at the new
+  click. Why those differ was not traced, so a new opener should be checked the same way rather
+  than assumed either way. Nothing pins the close: it decides through the overlay's memo and has
+  no test.
   **Handing focus back is a focus *event*, and a handler that re-seeds state on one is a bug waiting
   for a caller.** The tree's `FocusGained` seeded the nav cursor from the open table unconditionally
   — correct while the only way in was a click from outside, and wrong the moment the menu started
