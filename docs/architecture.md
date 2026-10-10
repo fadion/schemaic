@@ -12924,6 +12924,24 @@ existing prose was left alone.
     reads as `Keep`, so a value a later version writes never fails the `ui_state.json` it sits in
     (`keyword_case_persists_as_a_word`). Deriving `Deserialize` as a tidy-up would make it fail the
     whole file. A value that is not a string at all still fails the parse.
+    **Comma placement is the second setting, and it is the layout's, not a pass over it** —
+    `CommaStyle` is `Trailing` (the default, *End of line*: the formatter as it always was) or
+    `Leading` (*Start of line*), serialised and read leniently exactly as `KeywordCase` is, an
+    unknown word being `Trailing` (`comma_style_defaults_to_end_of_line_and_reads_leniently`). The
+    two travel as a `FormatStyle { case, commas }`, and `format_range`/`format_statement` take
+    `impl Into<FormatStyle>`, with `From<KeywordCase>` supplying the default commas — so a caller
+    or test that passes a bare `KeywordCase` says nothing about commas and is unchanged.
+    `format_sql` stays trailing. `format_sql_under` takes the `CommaStyle` into `Fmt::leading_commas`,
+    and the `","` arm moves only a **breakable** comma — the rule the layout already broke at: top
+    level, or a subquery's or a listed paren's list — taking the same `break_to(self.content)`
+    *before* the comma instead of after it. Every other comma stays where it was, so `IN (1, 2)`
+    and a function's arguments are inline either way; the test states that as a property against
+    the default output — each line-ending comma becomes the next line's leading `, ` and nothing
+    else differs (`leading_commas_move_the_breaking_commas_and_no_others`). A line comment after a
+    broken comma still ends its line, never with the next column on it
+    (`a_leading_comma_never_puts_code_after_a_line_comment`). The comma stays between the same two
+    tokens, so only whitespace moves and `caret_after_format` holds over it as it does over a
+    trailing layout.
     **`formattable_range` is what decides how much of the document a Format may touch**, and it is
     here rather than at the call site because `format_sql` lexes what it is handed **from byte 0**
     and takes that for a real token boundary. True of a whole document and of a selection whose ends
@@ -12987,7 +13005,7 @@ existing prose was left alone.
     **`format_statement`** is *Format statement*'s answer in the same shape: the
     `sql::statement_range` at the caret through `format_range`, or `None` for blank text or a
     statement formatted already (`format_statement_formats_only_the_statement_at_the_caret`).
-    "Formatted already" includes the keyword case: both take a `KeywordCase`, so a statement laid
+    "Formatted already" includes the keyword case: both take the `FormatStyle`, so a statement laid
     out already but cased otherwise is still `Some` — and still offered by the editor's menu
     (`formatting_writes_the_keyword_case`).
     **`caret_after_replace`** places a bare caret after either rewrite — unmoved before the range,
@@ -27002,11 +27020,16 @@ existing prose was left alone.
     **Keyword case when formatting** (Settings → Editor, a `focusable_dropdown` after *Indent
     guides*, *As typed* by default — `UiState::format_keyword_case`, pinned by
     `format_keyword_case_defaults_to_as_typed_and_keeps_a_choice`; `LayoutUi::keyword_case`) is the
-    one editor setting here that paints nothing. `theme::format_keyword_case` reads it **untracked**
+    one editor setting here that paints nothing. `theme::format_style` reads it **untracked**
     and its setter bumps no `editor_gen`, because nothing is drawn from it: Format Code
     (`format_editor`'s `format_range`) and both *Format statement* sites — the key/palette request
     and the right-click menu — ask for it at the moment they run. What it does to the text is the
-    `core/sqlfmt.rs` entry's.
+    `core/sqlfmt.rs` entry's. **Commas when formatting** sits after it (*End of line* by default —
+    `UiState::format_comma_style`, pinned by
+    `format_comma_style_defaults_to_end_of_line_and_keeps_a_choice`; `LayoutUi::comma_style`) and
+    is plumbed the same way, an untracked read and a setter that bumps nothing. The three Format
+    sites now ask `theme::format_style()`, which reads both settings untracked into the
+    `FormatStyle` the formatter takes, rather than the keyword case alone.
     **`FieldSql` carries the same colouring into an `edit_field`** — the DDL preview's SQL box and
     the view, trigger, routine and snippet bodies, each of which sets `FieldCfg::sql` (under
     `lib.rs`). It

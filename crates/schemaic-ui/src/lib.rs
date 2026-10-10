@@ -6082,6 +6082,9 @@ pub struct LayoutUi {
     /// How Format Code cases keywords; drives
     /// `theme::set_format_keyword_case`. Persisted.
     pub keyword_case: RwSignal<schemaic_core::sqlfmt::KeywordCase>,
+    /// Where Format Code puts a broken list's commas; drives
+    /// `theme::set_format_comma_style`. Persisted.
+    pub comma_style: RwSignal<schemaic_core::sqlfmt::CommaStyle>,
     /// Write an alias after a table completion inserts; drives
     /// `theme::set_completion_table_aliases`. Persisted.
     pub table_aliases: RwSignal<bool>,

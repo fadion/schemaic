@@ -339,6 +339,9 @@ pub struct UiState {
     /// How Format Code cases keywords. Default: as typed.
     #[serde(default)]
     pub format_keyword_case: crate::sqlfmt::KeywordCase,
+    /// Where Format Code puts a broken list's commas. Default: end of line.
+    #[serde(default)]
+    pub format_comma_style: crate::sqlfmt::CommaStyle,
     /// Completion writes an alias after a table it inserts into a `FROM` or
     /// `JOIN` (`orders o`). Default: on.
     #[serde(default = "default_true")]
@@ -467,6 +470,7 @@ impl Default for UiState {
             word_wrap: false,
             editor_rainbow_brackets: false,
             format_keyword_case: crate::sqlfmt::KeywordCase::Keep,
+            format_comma_style: crate::sqlfmt::CommaStyle::Trailing,
             completion_table_aliases: true,
             editor_show_whitespace: false,
             editor_indent_guides: false,
@@ -1889,6 +1893,24 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&upper).expect("serialises"))
                 .expect("parses");
         assert_eq!(back.format_keyword_case, KeywordCase::Upper);
+    }
+
+    /// Format Code ends lines with a list's commas for a new install and a
+    /// file written before the setting existed, and a choice stays chosen.
+    #[test]
+    fn format_comma_style_defaults_to_end_of_line_and_keeps_a_choice() {
+        use crate::sqlfmt::CommaStyle;
+        assert_eq!(UiState::default().format_comma_style, CommaStyle::Trailing);
+        let old: UiState = serde_json::from_str("{}").expect("parses");
+        assert_eq!(old.format_comma_style, CommaStyle::Trailing);
+        let leading = UiState {
+            format_comma_style: CommaStyle::Leading,
+            ..UiState::default()
+        };
+        let back: UiState =
+            serde_json::from_str(&serde_json::to_string(&leading).expect("serialises"))
+                .expect("parses");
+        assert_eq!(back.format_comma_style, CommaStyle::Leading);
     }
 
     /// Completion writes table aliases for a new install and a file written

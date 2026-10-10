@@ -18,12 +18,11 @@ pub use crate::themes::{
     DEFAULT_EDITOR_FONT, EDITOR_FONT_MAX, EDITOR_FONT_MIN, EditorThemeKind, UiScale, UiThemeKind,
     bump_editor_generation, clamped_editor_font, clamped_tab_width, completion_table_aliases,
     editor_font_size, editor_generation, editor_indent_guides, editor_rainbow_brackets,
-    editor_show_whitespace, editor_soft_tabs, editor_tab_width, editor_word_wrap,
-    format_keyword_case, init, parse_hex, scale_at, scale_font_at, scaled, scaled_font,
-    set_completion_table_aliases, set_editor, set_editor_font, set_editor_indent_guides,
-    set_editor_rainbow_brackets, set_editor_show_whitespace, set_editor_soft_tabs,
-    set_editor_tab_width, set_editor_word_wrap, set_format_keyword_case, set_ui, set_ui_scale,
-    ui_generation, ui_scale,
+    editor_show_whitespace, editor_soft_tabs, editor_tab_width, editor_word_wrap, format_style,
+    init, parse_hex, scale_at, scale_font_at, scaled, scaled_font, set_completion_table_aliases,
+    set_editor, set_editor_font, set_editor_indent_guides, set_editor_rainbow_brackets,
+    set_editor_show_whitespace, set_editor_soft_tabs, set_editor_tab_width, set_editor_word_wrap,
+    set_format_comma_style, set_format_keyword_case, set_ui, set_ui_scale, ui_generation, ui_scale,
 };
 
 /// The active editor theme struct (surface + token palette) — for the SQL editor

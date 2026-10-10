@@ -67,7 +67,7 @@ pub fn formattable_range(
 /// One newline either way: the trailing blank lines a document collects are
 /// still whitespace to re-flow.
 pub fn format_sql(sql: &str, indent_unit: &str, dialect: SqlDialect) -> String {
-    format_sql_under(sql, indent_unit, dialect, None)
+    format_sql_under(sql, indent_unit, dialect, None, CommaStyle::Trailing)
 }
 
 /// [`format_sql`] of a fragment that begins where `delim` is the statement
@@ -78,9 +78,11 @@ fn format_sql_under(
     indent_unit: &str,
     dialect: SqlDialect,
     mut delim: Option<String>,
+    commas: CommaStyle,
 ) -> String {
     let toks = tokenize(sql, dialect, &mut delim);
     let mut f = Fmt::new(indent_unit, sql, dialect);
+    f.leading_commas = commas == CommaStyle::Leading;
     f.run(&toks);
     let out = f.out.trim_end();
     if sql.ends_with('\n') {
@@ -125,6 +127,61 @@ impl<'de> serde::Deserialize<'de> for KeywordCase {
             "lower" => KeywordCase::Lower,
             _ => KeywordCase::Keep,
         })
+    }
+}
+
+/// Where Format Code puts the comma of a list it breaks across lines —
+/// Settings → Editor. `Trailing`, the default, is the formatter as it always
+/// was; `Leading` opens each continued line with it (`, b`), which keeps a
+/// line's removal a one-line diff. Only the commas the layout breaks at move:
+/// an `IN (1, 2)` or a function's arguments, kept on one line, are untouched.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CommaStyle {
+    #[default]
+    Trailing,
+    Leading,
+}
+
+impl CommaStyle {
+    /// Every choice, in the order Settings lists them.
+    pub const ALL: [CommaStyle; 2] = [CommaStyle::Trailing, CommaStyle::Leading];
+
+    /// The setting's label.
+    pub fn label(self) -> &'static str {
+        match self {
+            CommaStyle::Trailing => "End of line",
+            CommaStyle::Leading => "Start of line",
+        }
+    }
+}
+
+/// Read leniently, as [`KeywordCase`] is.
+impl<'de> serde::Deserialize<'de> for CommaStyle {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let word = String::deserialize(d)?;
+        Ok(match word.as_str() {
+            "leading" => CommaStyle::Leading,
+            _ => CommaStyle::Trailing,
+        })
+    }
+}
+
+/// The user's Format Code settings, carried together. A bare [`KeywordCase`]
+/// converts into one with the default commas, so a caller — or a test — that
+/// asks only about case says nothing about commas.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FormatStyle {
+    pub case: KeywordCase,
+    pub commas: CommaStyle,
+}
+
+impl From<KeywordCase> for FormatStyle {
+    fn from(case: KeywordCase) -> Self {
+        FormatStyle {
+            case,
+            ..FormatStyle::default()
+        }
     }
 }
 
@@ -307,10 +364,12 @@ pub fn format_range(
     hi: usize,
     indent_unit: &str,
     dialect: SqlDialect,
-    case: KeywordCase,
+    style: impl Into<FormatStyle>,
 ) -> String {
+    let FormatStyle { case, commas } = style.into();
     if lo == 0 && hi == full.len() {
-        return apply_keyword_case(&format_sql(full, indent_unit, dialect), dialect, case);
+        let formatted = format_sql_under(full, indent_unit, dialect, None, commas);
+        return apply_keyword_case(&formatted, dialect, case);
     }
     let frag = &full[lo..hi];
     let body = frag.trim();
@@ -320,7 +379,7 @@ pub fn format_range(
     let lead = &frag[..frag.len() - frag.trim_start().len()];
     let trail = &frag[frag.trim_end().len()..];
     let delim = terminator_at(full, lo, dialect);
-    let formatted = format_sql_under(body, indent_unit, dialect, delim.clone());
+    let formatted = format_sql_under(body, indent_unit, dialect, delim.clone(), commas);
     format!(
         "{lead}{}{trail}",
         apply_keyword_case_under(&formatted, dialect, case, delim)
@@ -503,13 +562,13 @@ pub fn format_statement(
     offset: usize,
     indent_unit: &str,
     dialect: SqlDialect,
-    case: KeywordCase,
+    style: impl Into<FormatStyle>,
 ) -> Option<(usize, usize, String)> {
     let (lo, hi) = crate::sql::statement_range(full, offset, dialect);
     if full.get(lo..hi)?.trim().is_empty() {
         return None;
     }
-    let text = format_range(full, lo, hi, indent_unit, dialect, case);
+    let text = format_range(full, lo, hi, indent_unit, dialect, style);
     (text != full[lo..hi]).then_some((lo, hi, text))
 }
 
@@ -1300,6 +1359,9 @@ struct Fmt<'a> {
     /// Operators are composed of operator characters here
     /// ([`operators_are_composable`]), so two written tight are one.
     composable: bool,
+    /// A broken list's comma opens the next line rather than ending this one
+    /// ([`CommaStyle::Leading`]).
+    leading_commas: bool,
 }
 
 /// One open `CASE`: the indent of the line it opened on, the paren depth it
@@ -1339,6 +1401,7 @@ impl<'a> Fmt<'a> {
             awaiting: None,
             named_ends: crate::pairs::names_its_block_ends(dialect),
             composable: operators_are_composable(dialect),
+            leading_commas: false,
         }
     }
 
@@ -2073,7 +2136,6 @@ impl<'a> Fmt<'a> {
                         }
                     }
                     "," => {
-                        self.emit(Kind::Punct, ",", true);
                         // Break top-level list commas and subquery SELECT-list
                         // commas; keep function-argument / IN-list commas inline.
                         let breakable = self.brackets == 0
@@ -2082,8 +2144,15 @@ impl<'a> Fmt<'a> {
                                 None => true,
                                 Some(p) => p.subquery || p.listed.is_some(),
                             };
-                        if breakable {
+                        if breakable && self.leading_commas {
+                            // The same break, taken before the comma.
                             self.break_to(self.content);
+                            self.emit(Kind::Punct, ",", true);
+                        } else {
+                            self.emit(Kind::Punct, ",", true);
+                            if breakable {
+                                self.break_to(self.content);
+                            }
                         }
                     }
                     ";" => {
@@ -2387,6 +2456,91 @@ mod tests {
         assert_eq!(
             format_range(full, 3, full.len(), "  ", pg, KeywordCase::Upper),
             format_sql("SELECT a FROM t;", "  ", pg)
+        );
+    }
+
+    /// **Leading commas move exactly the commas the layout breaks at**: each
+    /// line the default ends with `,` becomes the next line opening with `, `
+    /// at the same indent — and nothing else changes, so an `IN (1, 2)` or a
+    /// function's arguments, which stay on one line, keep theirs inline.
+    #[test]
+    fn leading_commas_move_the_breaking_commas_and_no_others() {
+        let sql = "select a, coalesce(b, 0) as b, c from t, u \
+                   where x in (1, 2) and y = (select max(z), 1 from w)";
+        let trailing = format_range(sql, 0, sql.len(), IND, SqlDialect::MySql, KeywordCase::Keep);
+        let leading = format_range(
+            sql,
+            0,
+            sql.len(),
+            IND,
+            SqlDialect::MySql,
+            FormatStyle {
+                case: KeywordCase::Keep,
+                commas: CommaStyle::Leading,
+            },
+        );
+        // The default with each line-ending comma moved onto the next line.
+        let mut expected: Vec<String> = Vec::new();
+        let mut carry = false;
+        for line in trailing.lines() {
+            let indent = &line[..line.len() - line.trim_start().len()];
+            let mut body = line.trim_start().to_string();
+            if std::mem::take(&mut carry) {
+                body = format!(", {body}");
+            }
+            if let Some(stripped) = body.strip_suffix(',') {
+                body = stripped.to_string();
+                carry = true;
+            }
+            expected.push(format!("{indent}{body}"));
+        }
+        assert!(
+            trailing.contains(",\n"),
+            "the fixture breaks at commas:\n{trailing}"
+        );
+        assert_eq!(leading, expected.join("\n"), "trailing:\n{trailing}");
+        assert!(
+            leading.contains("(1, 2)") && leading.contains("(b, 0)"),
+            "{leading}"
+        );
+    }
+
+    /// A line comment after a breaking comma still ends its line: the column
+    /// after it must never land on the comment's line, where it would be
+    /// commented out of the query.
+    #[test]
+    fn a_leading_comma_never_puts_code_after_a_line_comment() {
+        let leading = FormatStyle {
+            case: KeywordCase::Keep,
+            commas: CommaStyle::Leading,
+        };
+        let sql = "select a, -- the key\n b, c from t";
+        let out = format_range(sql, 0, sql.len(), IND, SqlDialect::MySql, leading);
+        for line in out.lines() {
+            if let Some(at) = line.find("--") {
+                assert_eq!(line[at..].trim_end(), "-- the key", "{out}");
+            }
+        }
+        assert!(out.contains('b') && out.contains('c'), "{out}");
+        assert_eq!(
+            super::format_sql(&out, IND, SqlDialect::MySql).replace([' ', '\n', ','], ""),
+            super::format_sql(sql, IND, SqlDialect::MySql).replace([' ', '\n', ','], ""),
+            "the same tokens either way:\n{out}"
+        );
+    }
+
+    /// The setting reads leniently, as Keyword case's does: a word this
+    /// version does not know is the default.
+    #[test]
+    fn comma_style_defaults_to_end_of_line_and_reads_leniently() {
+        assert_eq!(CommaStyle::default(), CommaStyle::Trailing);
+        let back: CommaStyle = serde_json::from_str("\"leading\"").unwrap();
+        assert_eq!(back, CommaStyle::Leading);
+        let odd: CommaStyle = serde_json::from_str("\"diagonal\"").unwrap();
+        assert_eq!(odd, CommaStyle::Trailing);
+        assert_eq!(
+            serde_json::to_string(&CommaStyle::Leading).unwrap(),
+            "\"leading\""
         );
     }
 

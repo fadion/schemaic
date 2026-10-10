@@ -1792,6 +1792,7 @@ pub(crate) fn theme_settings_overlay(
     let editor_remembered_predictions = layout.editor_remembered_predictions;
     let rainbow_brackets = layout.rainbow_brackets;
     let keyword_case = layout.keyword_case;
+    let comma_style = layout.comma_style;
     let table_aliases = layout.table_aliases;
     let show_whitespace = layout.show_whitespace;
     let indent_guides = layout.indent_guides;
@@ -1914,6 +1915,22 @@ pub(crate) fn theme_settings_overlay(
                 ),
             ))
             .style(ctrl);
+            let commas_dd = focusable_dropdown(
+                comma_style,
+                schemaic_core::sqlfmt::CommaStyle::ALL,
+                schemaic_core::sqlfmt::CommaStyle::label,
+                ring.clone(),
+                170,
+            );
+            let commas_section = v_stack((
+                settings_group_label("Commas when formatting"),
+                commas_dd,
+                form_hint(
+                    "Where Format Code puts the comma of a list it breaks across lines. \
+                     Lists kept on one line, like a function's arguments, are left alone.",
+                ),
+            ))
+            .style(ctrl);
             let editor_group = v_stack((
                 form_section_header("Editor"),
                 font_section,
@@ -1924,6 +1941,7 @@ pub(crate) fn theme_settings_overlay(
                 whitespace_row,
                 guides_row,
                 case_section,
+                commas_section,
             ))
             .style(|s| s.flex_col().gap(theme::scaled(16.0)));
 

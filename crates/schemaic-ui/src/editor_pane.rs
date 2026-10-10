@@ -566,7 +566,7 @@ fn format_editor(ed: &Editor, comp: Completion, dialect: SqlDialect) {
         end,
         &unit,
         dialect,
-        theme::format_keyword_case(),
+        theme::format_style(),
     );
     if formatted == full[start..end] {
         return;
@@ -4670,7 +4670,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     caret,
                     &indent_unit(),
                     dia,
-                    theme::format_keyword_case(),
+                    theme::format_style(),
                 ),
                 FormatReq::SingleLine => {
                     let sel = cursor.get_selection().unwrap_or((caret, caret));
@@ -5139,7 +5139,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                         menu_offset.get_untracked(),
                         &indent_unit(),
                         dialect.get_untracked(),
-                        theme::format_keyword_case(),
+                        theme::format_style(),
                     )
                 })
             };
