@@ -20681,7 +20681,11 @@ existing prose was left alone.
     Also the **shared modal form chrome** every modal wears — `form_setting`/`form_section`/
     `form_separator`/`form_gap()`/`control_button`/`modal_footer`. Manage
     Connections set that shape and Import followed it; a new modal builds on these rather
-    than copying them a third time.
+    than copying them a third time. `field_button` is `control_button` with no vertical padding,
+    for `FieldCfg::button` (under `lib.rs`), which stretches it to the field's height; both go
+    through a private `control_button_padded`. Every control button centres its label both ways
+    (`items_center().justify_center()`) — nothing at its natural size, and what keeps the label
+    mid-box once a field has stretched it.
     **A long form's sections are `form_section_header` over its group, `form_section_gap()`
     (`scaled(36)`) apart, and no rule between them** — Settings and Manage Connections, today
     (GitHub #16). The gap is wider than any
@@ -21648,7 +21652,11 @@ existing prose was left alone.
     is the most misleading state the indicator has. `path_field` is the shared path+Browse control
     behind the SSH key and all three certificate paths; folding them together also fixed the
     original, whose picker sat two Tab stops from the field it fills in while its own comment
-    claimed otherwise.
+    claimed otherwise. Its *Browse…* sits **inside** the field (`FieldCfg::button`, under
+    `lib.rs`), where beside it it had stood shorter than the field (GitHub #19). SQLite's *Database
+    file* is a `path_field` too since then, where `sqlite_fields` had carried a hand-copied
+    duplicate of its layout; its Browse went from tabindex 62 to 61 in the move, the order
+    unchanged.
     **An *Authentication* picker appears only on an engine offering more than one mode** — SQL
     Server's, through `AuthMode::offered` — between Database and the credentials, at tabindex 68 in
     the gap the surrounding indices were spaced to leave. `DraftSignals::auth` is threaded through
@@ -21687,7 +21695,11 @@ existing prose was left alone.
     it.
     **Three ways in, and the modal opens empty.** A pasted *Connection URL* at the top, then
     *Choose a file…* and *Scan installed clients* beneath it, then — only once one of them has
-    produced something — the review list. *Scan installed clients* wears the `Primary` fill beside
+    produced something — the review list. The URL field holds its *Add* inside it
+    (`FieldCfg::button`, under `lib.rs`) — beside it, as a `control_button`, it stood shorter than
+    the field — and sits on the default field surface, `bg_deepest`: it wore `bg_editor`, with no
+    recorded reason since the dialog arrived in cc1af200, and was the one lighter form field in the
+    app (GitHub #19). *Scan installed clients* wears the `Primary` fill beside
     the file button's `Quiet` one, since it is what most people come for (GitHub #18); the footer's
     Import, the other `Primary`, stays disabled until something is chosen, so the two never compete
     on an empty dialog. Opening does **not** scan: the walk reads the user's home
@@ -27464,6 +27476,24 @@ existing prose was left alone.
     in the old palette, the hazard `SqlStyling::id` documents. The callers are the DDL preview's SQL
     box, the view editor's `SELECT`, the trigger and routine bodies, and the snippet editor's body —
     a snippet carries a scope rather than a dialect, so `snippet::body_dialect` picks one for it.
+    **`FieldCfg::button` is a labelled button inside a single-line field**, right-aligned — Import
+    Connections' *Add* and `connection_form::path_field`'s *Browse…* (GitHub #19), each built with
+    `widgets::field_button`. Beside the field, as a `control_button`, it stood shorter than the box
+    it serves; inside, its height is the field's. That is the difference from `FieldCfg::trailing`,
+    whose fixed 16px box holds the AI panel's send icon: this one is in flow beside the editor but
+    stretched to the row (`align_self(Stretch)`), and negative margins reach back through the box's
+    padding — `-(pad_v - inset)` top and bottom, `-(chat_pad_h - inset)` on the right — so it stands
+    `field_button_inset()` (`scaled(3)`) off the border on all three sides, with `trailing`'s left
+    gap (`field_button_gap_l()`) between it and the text. **Its width is its label's, so it is
+    measured**: `on_resize` writes `button_w`, and the placeholder and the `suggest` ghost stop short
+    of it through `field_button_right_inset(button_w)` in place of `placeholder_right_inset` — they
+    are absolute overlays, and nothing else keeps a long placeholder from painting under the button
+    (`field_layout_tests::an_inset_button_is_never_painted_over_however_wide`). The padding is not
+    in that sum because the button stands in it. A `debug_assert` refuses the slot alongside
+    `trailing` or `clearable`, which take the same corner, and on a `multiline` field. The box's
+    click-to-focus `PointerDown` leaves a press right of the editor's viewport alone when a button
+    is there: that corner is the button's, and focusing the text under it would take the keyboard
+    from the button being pressed.
     The shared types living in the crate root is what stalls further splitting: the
     root depends on the leaves (`mod`) and the leaves depend on the root (types), so a view builder
     can't move out until the types do.
@@ -33723,7 +33753,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   `width_full().min_width(0.0).text_ellipsis()` on the text inside it: `width_full` because a label
   otherwise sizes to its content and overflows the box meant to bound it, `min_width(0)` because
   without it the label refuses to shrink below that content width. `placeholder_right_inset` is where
-  `edit_field` decides how much room the in-flow trailing action needs.
+  `edit_field` decides how much room the in-flow trailing action needs, and
+  `field_button_right_inset` where it decides for a `FieldCfg::button`, whose width is measured
+  rather than fixed.
   **A centred column is the same trap in flow, with a different fix.** `items_center()` sizes a child
   to its own content rather than stretching it, so a label in one is as unbounded as an absolute
   child is: the export progress modal's result sentence and its `File: <name>` line each carried
@@ -34832,7 +34864,7 @@ Re-introducing the anti-patterns these guard against is a regression:
 - **Buttons are in the ring too, and Space or Enter presses them — but there is no default Enter.**
   Every button a modal has goes through `widgets::in_ring_button` (which the builders —
   `action_button`/`action_button_icon`/`action_face`/`control_button`/`control_button_enabled`/
-  `row_button`/`dialog_button` and `modal_title`'s ✕ — call for you; the ring parameter is
+  `field_button`/`row_button`/`dialog_button` and `modal_title`'s ✕ — call for you; the ring parameter is
   *required*, so a modal button that isn't reachable won't compile). Enter in a *field* fires
   nothing: the DDL preview's Apply is an
   irreversible `ALTER`, and a key meaning "newline" in one control and "apply the plan" in another

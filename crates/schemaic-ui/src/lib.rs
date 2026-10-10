@@ -10642,6 +10642,26 @@ fn placeholder_right_inset(has_trailing: bool) -> f64 {
     }
 }
 
+/// How far [`FieldCfg::button`] stands off the field's border, on the top,
+/// right and bottom alike (GitHub #19).
+fn field_button_inset() -> f64 {
+    theme::scaled(3.0)
+}
+
+/// The gap between the field's text and [`FieldCfg::button`] — `trailing`'s
+/// left gap, so the two side controls leave the text the same room.
+fn field_button_gap_l() -> f64 {
+    trailing_gap_l()
+}
+
+/// [`placeholder_right_inset`] for a field holding [`FieldCfg::button`], whose
+/// width (`button_w`) is measured rather than fixed: the button, its gap, and
+/// the inset it keeps from the border — the padding it reaches back through is
+/// not added, because the button stands in it.
+fn field_button_right_inset(button_w: f64) -> f64 {
+    field_button_inset() + button_w + field_button_gap_l()
+}
+
 /// A `fn`-pointer transparent background for [`FieldCfg::background`] (the
 /// Ctrl+K field, whose surface is owned by an animated outer container).
 pub(crate) fn bg_transparent() -> floem::peniko::Color {
@@ -10907,6 +10927,15 @@ pub(crate) struct FieldCfg {
     /// the clearable ×) — e.g. the AI-panel send/stop icon. A factory so the view
     /// is built inside the field.
     pub trailing: Option<Rc<dyn Fn() -> AnyView>>,
+    /// A **labelled button inside the field**, right-aligned and inset
+    /// [`field_button_inset`] from the box's border on every side — the URL
+    /// field's *Add*, a path field's *Browse* (GitHub #19). Built with
+    /// [`widgets::field_button`]. Where [`FieldCfg::trailing`] pins a 16px icon,
+    /// this slot is sized by the field: stretched to its height less the inset,
+    /// and as wide as its label. Beside the field, a button was either taller or
+    /// shorter than it; inside, it can be neither. Single-line fields only, and
+    /// not with `trailing` or `clearable`, which take the same corner.
+    pub button: Option<Rc<dyn Fn() -> AnyView>>,
     /// **This field's buffer stands in for a value it does not hold** — the
     /// app's one masked secret field ([`connection_form::masked_edit_field`]) —
     /// and this is where every edit of the buffer is reported, as the editor's
@@ -10963,6 +10992,7 @@ impl Default for FieldCfg {
             tab_indents: false,
             caret_end: None,
             trailing: None,
+            button: None,
             masked: None,
         }
     }
@@ -11154,9 +11184,14 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
         tab_indents,
         caret_end,
         trailing,
+        button,
         masked,
         sql,
     } = cfg;
+    debug_assert!(
+        button.is_none() || (trailing.is_none() && !clearable && !multiline),
+        "FieldCfg::button takes the corner trailing and clearable use, on one line"
+    );
     // A SQL field is coloured with the editor palette, so it sits on the
     // surface that palette is measured on — see `FieldCfg::sql`.
     // Its placeholder too: the UI theme's placeholder colour is measured on
@@ -11176,7 +11211,10 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
     let syncing = Rc::new(std::cell::Cell::new(false));
     let mask_seq = Rc::new(std::cell::Cell::new(0u64));
     // An in-flow trailing action (like the clearable ×) shrinks the editor.
-    let has_side = clearable || trailing.is_some();
+    let has_side = clearable || trailing.is_some() || button.is_some();
+    // The inset button's laid-out width, for the placeholder's right inset —
+    // unlike `trailing`'s fixed box, a label's width is only known once laid out.
+    let button_w = RwSignal::new(0.0_f64);
     // Line height derived from the font so the box height matches the rendered
     // text (≈1.46× the app's body rhythm: 13→19, 16→23).
     //
@@ -11931,6 +11969,16 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
     // border (see `placeholder_right_inset`).
     let ph_top = move || pad_v() + (line_h() - font_size() as f64) / 2.0;
     let has_trailing = trailing.is_some();
+    let has_button = button.is_some();
+    // Where the in-flow side control ends for an overlay that must stop short of
+    // it: the inset button's measured width, or `trailing`'s fixed one.
+    let side_inset = move |side: bool| {
+        if has_button {
+            field_button_right_inset(button_w.get())
+        } else {
+            placeholder_right_inset(side)
+        }
+    };
     let placeholder = dyn_container(
         move || text_sig.with(|t| t.is_empty()) && !focused.get(),
         move |show| {
@@ -11958,7 +12006,7 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
     .style(move |s| {
         s.absolute()
             .inset_left(chat_pad_h())
-            .inset_right(placeholder_right_inset(has_trailing))
+            .inset_right(side_inset(has_trailing))
             .inset_top(ph_top())
     })
     // Let clicks fall through to the editor beneath — otherwise clicking on the
@@ -12000,7 +12048,7 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
         // the placeholder is hidden and the only time a ghost can show.
         s.absolute()
             .inset_left(chat_pad_h() + typed_w - scrolled)
-            .inset_right(placeholder_right_inset(has_side))
+            .inset_right(side_inset(has_side))
             .inset_top(ph_top())
     })
     .pointer_events(|| false);
@@ -12008,7 +12056,35 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
     // Trailing × that empties the value. In-flow beside the editor (which
     // flex-grows) — NOT an absolute overlay — so the editor's width is bounded
     // and its text can never scroll underneath the ×.
-    let inner: AnyView = if let Some(trailing) = trailing {
+    let inner: AnyView = if let Some(button) = button {
+        // The inset button (`FieldCfg::button`): in flow beside the editor like
+        // `trailing`, but **stretched to the box** rather than pinned at 16px.
+        // The row is the box's content height; negative margins reach back
+        // through the padding so the button stands `field_button_inset` off the
+        // border on the top, right and bottom alike. Its width is its label's,
+        // measured for the placeholder's right inset.
+        let side = container(button())
+            .on_resize(move |r| {
+                if button_w.try_get_untracked() != Some(r.width()) {
+                    button_w.set(r.width());
+                }
+            })
+            .style(move |s| {
+                let reach_v = -(pad_v() - field_button_inset());
+                s.flex_shrink(0.0_f32)
+                    .align_self(Some(floem::taffy::style::AlignItems::Stretch))
+                    // The arrow, not the field's I-beam: it is a button, not
+                    // editable text — as the clearable × does.
+                    .cursor(CursorStyle::Default)
+                    .margin_left(field_button_gap_l())
+                    .margin_right(-(chat_pad_h() - field_button_inset()))
+                    .margin_top(reach_v)
+                    .margin_bottom(reach_v)
+            });
+        h_stack((editor, side))
+            .style(|s| s.width_full().height_full().min_width(0.0).items_center())
+            .into_any()
+    } else if let Some(trailing) = trailing {
         // Trailing action (e.g. the AI send/stop icon) in-flow beside the editor,
         // right-aligned — same spot as the clearable ×. The negative right margin
         // pulls it 4px closer to the box edge (14px gap).
@@ -12110,6 +12186,12 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
                 && pe.pos.y <= top + vp.height()
             {
                 return; // on the text — the editor already placed the caret
+            }
+            // Past the editor's right edge is the inset button's corner: a press
+            // there is the button's, and pulling focus into the text under it
+            // would take the keyboard from the button being pressed.
+            if has_button && pe.pos.x > left + vp.width() {
+                return;
             }
             let Some(Some(vid)) = ed_click.editor_view_id.try_get_untracked() else {
                 return;
@@ -13599,7 +13681,10 @@ mod effort_clamp_tests {
 
 #[cfg(test)]
 mod field_layout_tests {
-    use super::{chat_pad_h, placeholder_right_inset, trailing_size};
+    use super::{
+        chat_pad_h, field_button_inset, field_button_right_inset, placeholder_right_inset,
+        trailing_size,
+    };
 
     /// With nothing beside the editor the overlay spans the content box exactly —
     /// the same edges the text it stands in for starts and ends at.
@@ -13625,6 +13710,22 @@ mod field_layout_tests {
     #[test]
     fn a_field_without_the_action_reserves_nothing_for_it() {
         assert!(placeholder_right_inset(false) < placeholder_right_inset(true));
+    }
+
+    /// The inset button (`FieldCfg::button`, GitHub #19) is as wide as its
+    /// label, so its reserve follows the measured width: the placeholder stops
+    /// clear of the whole button and the inset it keeps from the border, for a
+    /// short label and a long one alike.
+    #[test]
+    fn an_inset_button_is_never_painted_over_however_wide() {
+        for w in [30.0, 64.0, 140.0] {
+            let inset = field_button_right_inset(w);
+            assert!(
+                inset >= field_button_inset() + w,
+                "{inset} leaves a {w}px button partly under the placeholder"
+            );
+        }
+        assert!(field_button_right_inset(64.0) > field_button_right_inset(30.0));
     }
 }
 

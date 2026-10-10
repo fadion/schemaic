@@ -1908,6 +1908,37 @@ pub(crate) fn control_button_enabled(
     tabindex: u32,
     on_click: impl Fn() + 'static,
 ) -> AnyView {
+    control_button_padded(
+        label,
+        enabled,
+        || theme::scaled(5.0),
+        ring,
+        tabindex,
+        on_click,
+    )
+}
+
+/// [`control_button`] for [`crate::FieldCfg::button`] — the button that sits
+/// **inside** a text field, right-aligned (the URL field's *Add*, a path
+/// field's *Browse*; GitHub #19). No vertical padding: the field stretches it to
+/// its own height less the inset, so its height is the field's to decide.
+pub(crate) fn field_button(
+    label: impl Into<String>,
+    ring: FocusRing,
+    tabindex: u32,
+    on_click: impl Fn() + 'static,
+) -> AnyView {
+    control_button_padded(label, true, || 0.0, ring, tabindex, on_click)
+}
+
+fn control_button_padded(
+    label: impl Into<String>,
+    enabled: bool,
+    pad_v: fn() -> f64,
+    ring: FocusRing,
+    tabindex: u32,
+    on_click: impl Fn() + 'static,
+) -> AnyView {
     let on_click = Rc::new(on_click);
     let pressed = on_click.clone();
     let button = text(label.into())
@@ -1917,10 +1948,15 @@ pub(crate) fn control_button_enabled(
             }
         })
         .style(move |s| {
+            // Centred both ways, so a button stretched to a field's height
+            // ([`field_button`]) keeps its label in the middle rather than at
+            // the top of the taller box. At its own height it changes nothing.
             let s = control_surface(s)
                 .font_size(theme::font_body())
                 .padding_horiz(theme::scaled(10.0))
-                .padding_vert(theme::scaled(5.0))
+                .padding_vert(pad_v())
+                .items_center()
+                .justify_center()
                 .flex_shrink(0.0_f32);
             if enabled {
                 s.color(theme::text())

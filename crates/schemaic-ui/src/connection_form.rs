@@ -37,7 +37,7 @@ use crate::tooltip::TooltipExt;
 use crate::widgets;
 use crate::widgets::{
     ACTION_TAB, ActionKind, FocusRing, MenuEntry, NAV_TAB, NavAxis, action_button,
-    action_button_icon, action_face, action_gap, autohide, control_button, focus_root_with_ring,
+    action_button_icon, action_face, action_gap, autohide, field_button, focus_root_with_ring,
     form_hint, form_label_style, in_ring_button, menu_item_style, modal_h, modal_title, modal_w,
     nav_group, panel_style,
 };
@@ -212,10 +212,10 @@ fn host_port_row(
     })
 }
 
-/// A labelled path field with a native **Browse…** picker beside it, occupying
-/// `tabindex` and `tabindex + 1`.
+/// A labelled path field with a native **Browse…** picker inside it, at its
+/// right edge (`FieldCfg::button`), occupying `tabindex` and `tabindex + 1`.
 ///
-/// One helper because the SSH key and the three TLS certificate paths are the
+/// One helper because the SQLite file, the SSH key and the three TLS certificate paths are the
 /// same control, and the first of them had already drifted: the picker was two
 /// stops away from the field it fills in, so Tab went path → passphrase →
 /// Browse while a comment above it said "its own stop, right after the path".
@@ -232,35 +232,33 @@ fn path_field(
     use floem::file::FileDialogOptions;
     use floem::file_action::open_file;
 
-    let browse = control_button("Browse…", ring.clone(), tabindex + 1, move || {
-        open_file(FileDialogOptions::new().title(dialog_title), move |file| {
-            if let Some(info) = file
-                && let Some(path) = info.path.first()
-            {
-                sig.set(path.to_string_lossy().to_string());
-            }
+    // Browse sits **inside** the field (`FieldCfg::button`), right-aligned:
+    // beside it, the button stood shorter than the field it fills in
+    // (GitHub #19). A cancelled dialog leaves the field alone.
+    let ring_browse = ring.clone();
+    let browse = Rc::new(move || {
+        field_button("Browse…", ring_browse.clone(), tabindex + 1, move || {
+            open_file(FileDialogOptions::new().title(dialog_title), move |file| {
+                if let Some(info) = file
+                    && let Some(path) = info.path.first()
+                {
+                    sig.set(path.to_string_lossy().to_string());
+                }
+            })
         })
     });
 
     v_stack((
         text(label_text).style(form_label_style),
-        h_stack((
-            edit_field(
-                sig,
-                FieldCfg {
-                    focus: Some((ring.clone(), tabindex)),
-                    ..Default::default()
-                },
-            )
-            .style(|s| s.flex_grow(1.0_f32).min_width(0.0)),
-            browse,
-        ))
-        .style(|s| {
-            s.flex_row()
-                .items_center()
-                .gap(theme::scaled(8.0))
-                .width_full()
-        }),
+        edit_field(
+            sig,
+            FieldCfg {
+                focus: Some((ring, tabindex)),
+                button: Some(browse),
+                ..Default::default()
+            },
+        )
+        .style(|s| s.width_full().min_width(0.0)),
     ))
     .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full())
 }
@@ -1511,42 +1509,17 @@ fn windows_sign_in_hint() -> String {
 /// It takes tab index 60, where the host field would be, so the order down the
 /// form is unchanged and the indices after it are untouched.
 fn sqlite_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
-    use floem::file::FileDialogOptions;
-    use floem::file_action::open_file;
-
-    let file = draft.file;
-    // Its own stop right after the path, as the SSH key field's picker is: the
-    // field is editable by hand, but a keyboard user shouldn't have to reach for
-    // the mouse to open the dialog. A cancelled dialog leaves the field alone.
-    let browse = control_button("Browse…", ring.clone(), 62, move || {
-        open_file(
-            FileDialogOptions::new().title("Select SQLite database"),
-            move |f| {
-                if let Some(info) = f
-                    && let Some(path) = info.path.first()
-                {
-                    file.set(path.to_string_lossy().to_string());
-                }
-            },
-        )
-    });
+    // The SSH key's and TLS certificates' control: a path editable by hand, with
+    // Browse inside it as its own stop right after the path (61). It was a
+    // second copy of `path_field` until GitHub #19 moved the button in.
     v_stack((
-        v_stack((
-            text("Database file").style(form_label_style),
-            h_stack((
-                edit_field(
-                    draft.file,
-                    FieldCfg {
-                        focus: Some((ring.clone(), 60)),
-                        ..Default::default()
-                    },
-                )
-                .style(|s| s.flex_grow(1.0_f32)),
-                browse,
-            ))
-            .style(|s| s.gap(theme::scaled(8.0)).width_full().items_center()),
-        ))
-        .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full()),
+        path_field(
+            "Database file",
+            draft.file,
+            "Select SQLite database",
+            ring,
+            60,
+        ),
         form_hint(
             "A SQLite database is a single file, so there is no server to reach — \
              no host, user, password or tunnel. Schema editing and manual \

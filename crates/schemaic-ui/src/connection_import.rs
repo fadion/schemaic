@@ -26,7 +26,7 @@ use floem::prelude::*;
 use schemaic_core::conn_import::{ImportNote, Imported, Skipped};
 
 use crate::widgets::{
-    ACTION_TAB, ActionKind, FocusRing, action_button, action_button_icon, autohide, control_button,
+    ACTION_TAB, ActionKind, FocusRing, action_button, action_button_icon, autohide, field_button,
     focus_root_with_ring, form_hint, form_label_style, link_button, modal_h, modal_pad_h,
     modal_title, modal_w, panel_style,
 };
@@ -129,12 +129,20 @@ pub(crate) fn conn_import_overlay(
 /// nothing is installed at all.
 fn paste_row(imp: ConnImportUi, add: Rc<dyn Fn()>, ring: FocusRing) -> impl IntoView {
     let submit = add.clone();
+    let ring_add = ring.clone();
 
+    // On the default field surface, as every other form field is: it wore
+    // `bg_editor` for no recorded reason, which made it the one lighter field in
+    // the app (GitHub #19). *Add* sits inside it (`FieldCfg::button`), where it
+    // can be neither taller nor shorter than the field.
     let field = edit_field(
         imp.paste,
         FieldCfg {
             placeholder: "postgres://user@host:5432/db",
-            background: theme::bg_editor,
+            button: Some(Rc::new(move || {
+                let add = add.clone();
+                field_button("Add", ring_add.clone(), TAB_ADD, move || (add)())
+            })),
             // Monospace, because what goes in it is a URL: the punctuation that
             // decides where the host stops and the database starts is what the
             // reader is checking, and proportional type is where a `:` and a `/`
@@ -146,7 +154,7 @@ fn paste_row(imp: ConnImportUi, add: Rc<dyn Fn()>, ring: FocusRing) -> impl Into
             ..Default::default()
         },
     )
-    .style(|s| s.flex_grow(1.0_f32).min_width(0.0));
+    .style(|s| s.width_full().min_width(0.0));
 
     // A hint that turns into the parse error, in the same place: the field is
     // where the answer is needed, and a message that appears somewhere else
@@ -171,8 +179,7 @@ fn paste_row(imp: ConnImportUi, add: Rc<dyn Fn()>, ring: FocusRing) -> impl Into
 
     v_stack((
         text("Connection URL").style(form_label_style),
-        h_stack((field, control_button("Add", ring, TAB_ADD, move || (add)())))
-            .style(|s| s.items_center().width_full().gap(theme::scaled(8.0))),
+        field,
         message,
     ))
     .style(|s| s.flex_col().width_full().gap(theme::scaled(6.0)))
