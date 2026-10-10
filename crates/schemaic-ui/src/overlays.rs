@@ -22,10 +22,11 @@ use schemaic_core::skeleton::{delete_skeleton, insert_skeleton, update_skeleton}
 
 use crate::consts::{chat_pad_h, chat_pad_v, db_menu_w};
 use crate::widgets::{
-    ACTION_TAB, CURSOR_MENU_GAP, MenuEntry, autohide, box_menu_inset, cursor_menu_insets,
-    dialog_button, first_enabled, focus_root, list_step_enabled, measure_text_px_at,
-    menu_drawn_height, menu_inset, menu_item_style, menu_panel, menu_panel_width, modal_body_h,
-    modal_title, modal_w, panel_style, window_size,
+    ACTION_TAB, ActionKind, CURSOR_MENU_GAP, MenuEntry, action_button, action_gap, autohide,
+    box_menu_inset, cursor_menu_insets, first_enabled, focus_root, list_step_enabled,
+    measure_text_px_at, menu_drawn_height, menu_inset, menu_item_style, menu_panel,
+    menu_panel_width, modal_body_h, modal_footer, modal_pad_h, modal_title, modal_title_owned,
+    modal_w, panel_style, window_size,
 };
 use crate::{
     ActivityUi, Confirm, ConnNode, ConnUi, CtxKind, CtxMenu, DdlUi, LayoutUi, OverlayUi,
@@ -5153,34 +5154,36 @@ pub(crate) fn tx_prompt_overlay(o: OverlayUi) -> impl IntoView {
             // **uncommitted writes** and its three buttons were once outside
             // every ring, so the keyboard could do nothing about a question the
             // app itself had raised. Escape answers Cancel (see the doc above).
+            //
+            // **The standard modal** (GitHub #25), as `confirm_overlay` is: the
+            // titled bar, a padded body, the footer of filled actions. Cancel is
+            // `Neutral`, Rollback `Danger` — it discards writes — and Commit
+            // `Primary`. The ✕ answers Cancel, as Escape does, and is last in
+            // the ring (`TITLE_CLOSE_TAB`), so the first Tab still lands on
+            // Cancel.
             let ring = crate::widgets::FocusRing::new();
-            let btn = |label: &'static str,
-                       color: fn() -> Color,
-                       hover: fn() -> Color,
-                       tabindex: u32,
-                       act: Rc<dyn Fn()>| {
-                dialog_button(label, color, hover, ring.clone(), tabindex, move || (act)())
-            };
             let resolve = p.resolve.clone();
             let cancel = {
                 let r = resolve.clone();
-                btn(
+                action_button(
                     "Cancel",
-                    theme::text_dim,
-                    theme::text,
+                    ActionKind::Neutral,
+                    true,
+                    ring.clone(),
                     ACTION_TAB,
-                    Rc::new(move || (r)(TxChoice::Cancel)),
+                    move || (r)(TxChoice::Cancel),
                 )
             };
             let rollback = {
                 let r = resolve.clone();
                 // "Rollback", matching the status bar's action and the body text.
-                btn(
+                action_button(
                     "Rollback",
-                    theme::tx_rollback,
-                    theme::tx_rollback_hover,
+                    ActionKind::Danger,
+                    true,
+                    ring.clone(),
                     ACTION_TAB + 10,
-                    Rc::new(move || (r)(TxChoice::Rollback)),
+                    move || (r)(TxChoice::Rollback),
                 )
             };
             // Built only when it applies, never built-and-hidden: `hide()` is
@@ -5189,53 +5192,40 @@ pub(crate) fn tx_prompt_overlay(o: OverlayUi) -> impl IntoView {
             // commit a transaction PostgreSQL has already aborted.
             let commit: AnyView = if p.can_commit {
                 let r = resolve.clone();
-                btn(
+                action_button(
                     "Commit",
-                    theme::tx_commit,
-                    theme::tx_commit_hover,
+                    ActionKind::Primary,
+                    true,
+                    ring.clone(),
                     ACTION_TAB + 20,
-                    Rc::new(move || (r)(TxChoice::Commit)),
+                    move || (r)(TxChoice::Commit),
                 )
                 .into_any()
             } else {
                 crate::widgets::nothing()
             };
+            let close: Rc<dyn Fn()> = {
+                let r = resolve.clone();
+                Rc::new(move || (r)(TxChoice::Cancel))
+            };
 
             let panel = v_stack((
-                text("Open transaction").style(|s| {
-                    s.font_size(theme::scaled_font(15.0))
-                        .font_bold()
-                        .color(theme::text())
-                        .margin_bottom(theme::scaled(10.0))
-                }),
+                modal_title("Open transaction", close, ring.clone()),
                 text(body).style(|s| {
-                    s.width(theme::scaled(420.0))
+                    s.width_full()
                         .color(theme::text())
                         .font_size(theme::font_body())
                         .line_height(1.4)
+                        .padding_horiz(modal_pad_h())
+                        .padding_vert(theme::scaled(18.0))
                 }),
-                h_stack((
-                    empty().style(|s| s.flex_grow(1.0_f32)),
-                    cancel,
-                    rollback,
-                    commit,
-                ))
-                .style(|s| {
-                    s.width_full()
-                        .flex_row()
-                        .items_center()
-                        .gap(theme::scaled(6.0))
-                        .margin_top(theme::scaled(18.0))
-                }),
+                modal_footer(
+                    h_stack((cancel, rollback, commit))
+                        .style(|s| s.flex_row().items_center().gap(action_gap())),
+                ),
             ))
             .on_click_stop(|_| {})
-            .style(|s| {
-                panel_style(s)
-                    .width(modal_w(470.0))
-                    .padding(theme::scaled(20.0))
-                    .flex_col()
-                    .border_color(theme::modal_border())
-            });
+            .style(|s| panel_style(s).width(modal_w(470.0)));
 
             // Take focus so the editor and the global shortcuts behind the
             // backdrop stop receiving keys — Ctrl+W closing another tab while
@@ -5298,67 +5288,61 @@ pub(crate) fn confirm_overlay(confirm: RwSignal<Option<Confirm>>) -> impl IntoVi
                 })
             };
 
+            // **The standard modal** (GitHub #25): the titled bar with its ✕, a
+            // padded body, and the bordered footer of filled actions every other
+            // dialog has. It was a bare panel with a bold line for a title and
+            // two coloured *text* buttons, which nothing else in the app wore.
+            //
             // No before Yes, left to right as they sit — so the *first* Tab
             // lands on declining, which is always the safe side of a confirm.
+            // The ✕ is `TITLE_CLOSE_TAB`, last in the ring, and answers No.
+            // Yes is `Danger`: this is the question raised before a destructive
+            // action, which is why its text was red before it was a fill.
             let ring = crate::widgets::FocusRing::new();
-            let btn = |label: &'static str,
-                       color: fn() -> Color,
-                       hover: fn() -> Color,
-                       tabindex: u32,
-                       act: Rc<dyn Fn()>| {
-                dialog_button(label, color, hover, ring.clone(), tabindex, move || (act)())
-            };
             let no = {
                 let a = answer.clone();
-                btn(
+                action_button(
                     "No",
-                    theme::text_dim,
-                    theme::text,
+                    ActionKind::Neutral,
+                    true,
+                    ring.clone(),
                     ACTION_TAB,
-                    Rc::new(move || (a)(false)),
+                    move || (a)(false),
                 )
             };
             let yes = {
                 let a = answer.clone();
-                btn(
+                action_button(
                     "Yes",
-                    theme::confirm_yes,
-                    theme::confirm_yes_hover,
+                    ActionKind::Danger,
+                    true,
+                    ring.clone(),
                     ACTION_TAB + 10,
-                    Rc::new(move || (a)(true)),
+                    move || (a)(true),
                 )
+            };
+            let close: Rc<dyn Fn()> = {
+                let a = answer.clone();
+                Rc::new(move || (a)(false))
             };
 
             let panel = v_stack((
-                text(c.title).style(|s| {
-                    s.font_size(theme::scaled_font(15.0))
-                        .font_bold()
-                        .color(theme::text())
-                        .margin_bottom(theme::scaled(10.0))
-                }),
+                modal_title_owned(c.title, close, ring.clone()),
                 text(c.message).style(|s| {
-                    s.width(theme::scaled(380.0))
+                    s.width_full()
                         .color(theme::text())
                         .font_size(theme::font_body())
                         .line_height(1.4)
+                        .padding_horiz(modal_pad_h())
+                        .padding_vert(theme::scaled(18.0))
                 }),
-                h_stack((empty().style(|s| s.flex_grow(1.0_f32)), no, yes)).style(|s| {
-                    s.width_full()
-                        .flex_row()
-                        .items_center()
-                        .gap(theme::scaled(6.0))
-                        .margin_top(theme::scaled(18.0))
-                }),
+                modal_footer(
+                    h_stack((no, yes)).style(|s| s.flex_row().items_center().gap(action_gap())),
+                ),
             ))
             // Clicks inside the panel mustn't reach the backdrop's "No".
             .on_click_stop(|_| {})
-            .style(|s| {
-                panel_style(s)
-                    .width(modal_w(430.0))
-                    .padding(theme::scaled(20.0))
-                    .flex_col()
-                    .border_color(theme::modal_border())
-            });
+            .style(|s| panel_style(s).width(modal_w(430.0)));
 
             // Focus so the shortcuts behind the backdrop stop firing while
             // the question is up (Ctrl+W closing a tab mid-confirm would be

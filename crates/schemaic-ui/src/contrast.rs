@@ -336,11 +336,6 @@ pub const UI_PAIRINGS: &[Pairing<UiTheme>] = &[
     // had no row until this one — the colour was already in use here, only
     // unwatched.
     pair!(accent on erd_canvas, Body, "cell editors: the value a control holds"),
-    // [B16-L2-01] read these two as a fill under white text and set them aside
-    // as "therefore fine". They aren't a fill: `dialog_button` takes a colour
-    // fn, so this is red *text* on the modal panel.
-    pair!(confirm_yes on bg_panel, Body, "confirm modal: Yes; DDL preview: a destructive Apply"),
-    pair!(confirm_yes_hover on bg_panel, Body, "confirm modal: hovering Yes"),
     pair!(tx_danger on bg_panel, Body, "transaction modal: an aborted transaction"),
     pair!(key_primary on bg_panel, Icon, "schema tree: the primary-key glyph"),
     pair!(key_index on bg_panel, Icon, "schema tree: the index glyph"),
@@ -1166,8 +1161,6 @@ mod tests {
             "tx_rollback",
             "tx_rollback_hover",
             "change_count",
-            "confirm_yes",
-            "confirm_yes_hover",
         ];
         for name in ACCENTS {
             let rows: Vec<_> = UI_PAIRINGS.iter().filter(|p| p.fg == *name).collect();

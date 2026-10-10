@@ -681,19 +681,6 @@ pub fn tx_rollback_hover() -> Color {
     ui().tx_rollback_hover
 }
 
-/// The affirmative button in the generic confirm modal, and the destructive
-/// Apply in the DDL preview. Starts at the same red as the transaction reds, but
-/// kept separate on purpose: this one answers "yes, do the destructive thing"
-/// for *any* action, so it should be retunable without dragging Rollback along
-/// with it. It is **text**, not a fill — `dialog_button` takes it as a colour fn.
-pub fn confirm_yes() -> Color {
-    ui().confirm_yes
-}
-/// Brighter red for hovering the confirm modal's Yes.
-pub fn confirm_yes_hover() -> Color {
-    ui().confirm_yes_hover
-}
-
 // Connection status: reachable (unreachable reuses `reject_bg`).
 pub fn conn_ok() -> Color {
     ui().conn_ok

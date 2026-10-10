@@ -20710,17 +20710,16 @@ existing prose was left alone.
     `General` (under `settings.rs`).
     **There is no `footer_button` any more.** Every modal with a footer bar wears the filled
     `action_button`, and the text-only button that sat beside it at a smaller padding left with the
-    last of those footers. What remains of that family is `dialog_button`, the **only** text-button
-    family in the app, and its callers are the two question dialogs — the transaction prompt and the
-    confirm modal, which each carried a private copy of it before (same colour-fn signature, same
-    hover, same radius, differing only in the padding that was the reason they were not already
-    sharing one). Its `ring` is required, like `modal_title`'s: these were the last ring-less buttons
-    in the app, and one of the two dialogs they build is the transaction prompt, where Escape was
-    then deliberately dead — so with no ring published no key did anything at all and the user had
-    to reach for the mouse to answer a question about their own uncommitted writes. (Escape answers
-    *Cancel* there now — GitHub #15, under *A modal's click-to-dismiss* in *Floem 0.2 gotchas*.)
-    A new footer takes
-    `action_button`; it does not revive the smaller one.
+    last of those footers. The rest of that family went with GitHub #25: `dialog_button` (over a
+    private `text_button`), whose only callers were the two question dialogs — the transaction
+    prompt and the confirm modal — and which left when they were given the standard modal (under
+    `overlays.rs`). It had begun as a private copy in each of the two, and its `ring` was required,
+    like `modal_title`'s, because the transaction prompt's buttons had once sat outside every ring
+    while Escape there was deliberately dead — so no key did anything at all and the user had to
+    reach for the mouse to answer a question about their own uncommitted writes. `action_button`
+    requires its ring too, so that holds by construction now. (Escape answers *Cancel* there —
+    GitHub #15, under *A modal's click-to-dismiss* in *Floem 0.2 gotchas*.) A new footer, or a new
+    question, takes `action_button`; it does not revive either of the smaller ones.
     **`modal_footer_split` shrinks the status and never the actions.** A flex item's `min-width` is
     `auto`, so a long sentence in the left slot refuses to compress and pushes what follows it out
     of the panel — which is how the binary panel's load line shipped its three buttons off the
@@ -24226,6 +24225,17 @@ existing prose was left alone.
     rather than on the panel, because the title row carries its own padding and a bottom border
     that a padded panel would inset, and the scroll's `min_height` came down 160 → 120 to pay for
     the row the title adds.
+    **The confirm modal and the transaction prompt wear the standard modal too** (GitHub #25) —
+    `modal_title_owned`/`modal_title` with its ✕, a body padded `modal_pad_h()` × `scaled(18)`, and
+    `modal_footer` holding filled `action_button`s — where both were bare panels (`panel_style` at
+    20px, a bold 15px line for a title) answered by coloured *text* buttons nothing else in the app
+    wore. The confirm is No `Neutral` and Yes `Danger`, since it is the question raised before a
+    destructive act (its Yes was red text before it was a fill); the prompt is Cancel `Neutral`,
+    Rollback `Danger` — it discards writes — and Commit `Primary`, still built only when the
+    transaction can commit, never built and hidden. Each ✕ gives the answer Escape gives — No,
+    Cancel — and sits at `TITLE_CLOSE_TAB`, **last** in the ring, so the first Tab still lands on
+    No or Cancel, the side that loses nothing; the buttons keep `ACTION_TAB`, `+10`, `+20`. The
+    prompt still has no click-away (*A modal's click-to-dismiss*).
   - `schema_tree.rs` — SCHEMA sidebar (`schema_panel` + db/table/column/key row builders + keyboard
     nav).
     **`SchemaTreeCtx` names what the rows reach instead of carrying a `Ui`** — `conn`, `schema`,
@@ -34897,7 +34907,7 @@ Re-introducing the anti-patterns these guard against is a regression:
 - **Buttons are in the ring too, and Space or Enter presses them — but there is no default Enter.**
   Every button a modal has goes through `widgets::in_ring_button` (which the builders —
   `action_button`/`action_button_icon`/`action_face`/`control_button`/`control_button_enabled`/
-  `field_button`/`row_button`/`dialog_button` and `modal_title`'s ✕ — call for you; the ring parameter is
+  `field_button`/`row_button` and `modal_title`'s ✕ — call for you; the ring parameter is
   *required*, so a modal button that isn't reachable won't compile). Enter in a *field* fires
   nothing: the DDL preview's Apply is an
   irreversible `ALTER`, and a key meaning "newline" in one control and "apply the plan" in another
@@ -34984,7 +34994,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   a DDL apply that rolls back as a whole) and the modal stays open to report it, and it is ignored
   (`ExitAction::Ignore`) only while `ddl_preview` applies DDL that cannot be rolled back. The transaction prompt answers Escape with
   *Cancel* — it abandons the action that raised the prompt and leaves the transaction as it was;
-  it used to swallow the key — and it still has no click-away.
+  it used to swallow the key — and so does its ✕, which it has had only since GitHub #25; it still
+  has no click-away.
   Each root in the no-click-away set carries a one-line comment pointing at this passage, and each
   is there for a named reason: a **draft with no other copy** — `table_designer`, `view_editor`,
   `trigger_editor`, `routine_editor`, `event_editor`, `object_editor` and `database_editor`, whose

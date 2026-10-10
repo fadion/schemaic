@@ -908,7 +908,7 @@ pub(crate) fn nav_group<V: IntoView + 'static>(
 }
 
 /// The corner radius of a filled [`action_button`], and of the
-/// [`control_surface`] family ([`control_button_enabled`], [`dialog_button`]).
+/// [`control_surface`] family ([`control_button_enabled`], [`field_button`]).
 ///
 /// Named because two views read each of them: the button's own face, and the
 /// focus outline [`in_ring_button`] paints on the wrapper around it. Floem draws
@@ -2055,10 +2055,10 @@ fn action_height() -> f64 {
 }
 
 /// A filled modal action. **Every** modal footer in the app is built from these
-/// now — the schema editors, the DDL preview, Import and Manage Connections — so
-/// keep it free of anything specific to one of them. The only actions that
-/// aren't filled are the question dialogs' ([`dialog_button`]), which have no
-/// footer bar to sit in.
+/// — the schema editors, the DDL preview, Import, Manage Connections, and since
+/// GitHub #25 the confirm modal and the transaction prompt, which were the last
+/// to answer in coloured text with no footer bar — so keep it free of anything
+/// specific to one of them.
 ///
 /// Disabled keeps the fill and fades the label (its `ActionKind` label colour at half alpha),
 /// rather than hiding or unfilling the button: which action is the affirmative
@@ -2266,72 +2266,6 @@ pub(crate) fn action_face<V: IntoView + 'static, F: Fn() + 'static>(
     })
 }
 
-/// A text-only action: no fill, a colour that carries the meaning, brightening
-/// on hover. What the **question dialogs** use — the transaction prompt and the
-/// confirm modal, which each carried a private copy of it before (same
-/// colour-fn signature, same hover, same radius, differing only in padding,
-/// which is the reason they weren't already sharing one).
-///
-/// This is now the *only* text-button family left. Every modal with a footer bar
-/// wears the filled [`action_button`] instead; a `footer_button` at a smaller
-/// padding sat beside this one until the last of those footers moved over.
-///
-/// `ring` is **required**, like [`modal_title`]'s. These were the last ring-less
-/// buttons in the app, and one of the two dialogs they build is the transaction
-/// prompt — raised when something would strand an **open transaction**, with
-/// Escape then deliberately dead (it answers Cancel now) and no ring published,
-/// so no key did anything at all and the user had to reach for the mouse to
-/// answer a question about their own writes.
-pub(crate) fn dialog_button(
-    label: impl Into<String> + 'static,
-    color: fn() -> floem::peniko::Color,
-    hover: fn() -> floem::peniko::Color,
-    ring: FocusRing,
-    tabindex: u32,
-    on_click: impl Fn() + 'static,
-) -> AnyView {
-    let on_click = Rc::new(on_click);
-    let pressed = on_click.clone();
-    in_ring_button(
-        text_button(label, color, hover, true, (10.0, 5.0), move || on_click()),
-        ring,
-        tabindex,
-        true,
-        CONTROL_RADIUS, // `text_button`'s own
-        move || pressed(),
-    )
-}
-
-fn text_button(
-    label: impl Into<String>,
-    color: fn() -> floem::peniko::Color,
-    hover: fn() -> floem::peniko::Color,
-    enabled: bool,
-    (pad_h, pad_v): (f64, f64),
-    on_click: impl Fn() + 'static,
-) -> impl IntoView {
-    text(label.into())
-        .on_click_stop(move |_| {
-            if enabled {
-                on_click()
-            }
-        })
-        .style(move |s| {
-            let s = s
-                .font_size(theme::font_body())
-                .padding_horiz(pad_h)
-                .padding_vert(pad_v)
-                .border_radius(CONTROL_RADIUS);
-            if enabled {
-                s.color(color()).hover(move |s| s.color(hover()))
-            } else {
-                // Dimmed and inert rather than hidden: the button staying put is
-                // what makes it obvious which step you're on.
-                s.color(theme::text_faint())
-            }
-        })
-}
-
 /// A sparkle and a label as one clickable row — the app's "this hands the
 /// statement to the model" control, wherever it is offered outside a menu (the
 /// editor's error bar, the error modal).
@@ -2353,8 +2287,8 @@ fn text_button(
 /// `on_click_stop`, and floem's `can_focus` requires membership in
 /// `keyboard_navigable`, so its own `view_tab_navigation` skipped it too. The
 /// error modal's only two actions, AI fix and Explain, could not be pressed by
-/// any key. `dialog_button`'s doc, a few dozen lines above, called itself the
-/// last ring-less button family in the app; it was not.
+/// any key. The question dialogs' `dialog_button` (gone with GitHub #25) called
+/// itself the last ring-less button family in the app; it was not.
 pub(crate) fn sparkle_action(
     label: &'static str,
     color: fn() -> floem::peniko::Color,

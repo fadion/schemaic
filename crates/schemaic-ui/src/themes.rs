@@ -295,9 +295,6 @@ pub struct UiTheme {
     /// The status bar's Rollback action, resting + hover.
     pub tx_rollback: Color,
     pub tx_rollback_hover: Color,
-    /// The affirmative (destructive) button in a confirm modal, resting + hover.
-    pub confirm_yes: Color,
-    pub confirm_yes_hover: Color,
     pub conn_ok: Color,
     /// **No consumer.** `d133fe9` replaced floem's `Dropdown` with the app's own
     /// menu, which paints on `bg_chrome` through `menu_item_style`. Kept because
@@ -449,8 +446,6 @@ impl UiTheme {
             tx_commit_hover: c("#8FDC8F"),
             tx_rollback: c("#E05A5A"),
             tx_rollback_hover: c("#FF7B7B"),
-            confirm_yes: c("#E05A5A"),
-            confirm_yes_hover: c("#FF7B7B"),
             conn_ok: c("#509950"),
             dropdown_hover: c("#272D3E"),
             dropdown_active: c("#1C1F28"),
@@ -609,8 +604,6 @@ impl UiTheme {
             tx_commit_hover: c("#145423"),
             tx_rollback: c("#A8322F"),
             tx_rollback_hover: c("#8A2422"),
-            confirm_yes: c("#A8322F"),
-            confirm_yes_hover: c("#8A2422"),
             conn_ok: c("#2E8C46"),
             dropdown_hover: c("#E4E8F5"),
             dropdown_active: c("#EDEFF4"),
