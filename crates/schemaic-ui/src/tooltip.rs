@@ -16,8 +16,11 @@
 //! events that dismiss it (leaving, pressing, releasing, scrolling, a key), no
 //! tip while a drag is held (floem also waits out a released drag's animation,
 //! through a field it does not expose), and the same overlay, whose paint
-//! already pulls a tip that would run off the window's right or bottom edge back
-//! inside it.
+//! already pulls a tip that would run off the window's right edge back inside
+//! it. **Not the bottom edge**: pulled back up, a tip with no room below lands
+//! on the element it names — every status-bar icon — so such a tip opens
+//! *above* its element instead ([`tip_top`]), placed once layout has measured
+//! it.
 //!
 //! **The chrome is applied to the tip directly.** floem computes the tip's
 //! style from `TooltipClass` off the tooltip view's style context, because the
@@ -41,6 +44,7 @@ use floem::event::{Event, EventPropagation};
 use floem::kurbo::{Point, Rect, Size};
 use floem::prelude::*;
 use floem::prop_extractor;
+use floem::reactive::Scope;
 use floem::views::{Delay, TooltipContainerClass};
 use floem::{AnyView, View, ViewId};
 
@@ -65,6 +69,40 @@ fn anchor_below(origin: Point, size: Size, gap: f64) -> Point {
     Point::new(origin.x, origin.y + size.height + gap)
 }
 
+/// How far inside the window's right and bottom edges floem's overlay keeps a
+/// tip — the margin its `OverlayView::paint` pulls an overflowing one back to.
+const EDGE: f64 = 5.0;
+
+/// The window y a tip of height `tip_h` should open at for the element `el`:
+/// under it by `gap` where that fits inside the window, **above it** where it
+/// does not. Left to floem, a tip with no room below was pulled back up inside
+/// the window — over the very element it names, which is every status-bar icon
+/// (issue #11). A `window_h` of zero is "not measured yet" and keeps the tip
+/// under the element; a window too short for either side prefers above,
+/// clamped to its top, since that is what leaves the element readable.
+fn tip_top(el: Rect, tip_h: f64, window_h: f64, gap: f64) -> f64 {
+    let below = el.y1 + gap;
+    if window_h <= 0.0 || below + tip_h <= window_h - EDGE {
+        below
+    } else {
+        (el.y0 - gap - tip_h).max(0.0)
+    }
+}
+
+/// floem's own bottom-edge pull-back for an overlay at window y `top`, `h`
+/// tall: how far `OverlayView::paint` moves it up to keep it inside.
+fn floem_pull_back(top: f64, h: f64, window_h: f64) -> f64 {
+    (top + h - (window_h - EDGE)).max(0.0)
+}
+
+/// The vertical translate that puts a tip opened at `at_y` where [`tip_top`]
+/// wants it, net of floem's pull-back — which is applied at paint, before the
+/// tip's own transform, so it has to be undone as well as the move made.
+fn tip_shift(at_y: f64, el: Rect, tip_h: f64, window_h: f64, gap: f64) -> f64 {
+    let painted = at_y - floem_pull_back(at_y, tip_h, window_h);
+    tip_top(el, tip_h, window_h, gap) - painted
+}
+
 /// The hovered element's own box in window coordinates: the child's layout box
 /// (`child`, relative to the wrapper) offset by the wrapper's window origin, or
 /// the wrapper's box when the child has no layout yet.
@@ -85,6 +123,9 @@ pub(crate) struct AnchoredTooltip {
     /// The pending show, keyed so only the latest hover's timer opens a tip.
     hover: Option<TimerToken>,
     overlay: Rc<RefCell<Option<ViewId>>>,
+    /// The open tip's own scope — the signal its measured shift lives in —
+    /// disposed, deferred, when the tip goes.
+    tip_scope: Rc<std::cell::Cell<Option<Scope>>>,
     tip: Rc<dyn Fn() -> AnyView>,
     style: TipStyle,
     /// This view's window origin as of the last layout.
@@ -99,10 +140,12 @@ pub(crate) fn tooltip<V: IntoView + 'static, T: IntoView + 'static>(
     let id = ViewId::new();
     id.set_children(vec![child.into_view()]);
     let overlay = Rc::new(RefCell::new(None));
+    let tip_scope = Rc::new(std::cell::Cell::new(None));
     AnchoredTooltip {
         id,
         hover: None,
         overlay: overlay.clone(),
+        tip_scope: tip_scope.clone(),
         tip: Rc::new(move || tip().into_any()),
         style: Default::default(),
         window_origin: None,
@@ -113,7 +156,17 @@ pub(crate) fn tooltip<V: IntoView + 'static, T: IntoView + 'static>(
         if let Some(overlay_id) = overlay.borrow_mut().take() {
             remove_overlay(overlay_id);
         }
+        dispose_deferred(&tip_scope);
     })
+}
+
+/// Dispose an open tip's scope on the next tick — after the overlay holding
+/// views that read it has been removed (`AGENTS.md`: own per-entity signals
+/// in a child scope, and dispose it deferred).
+fn dispose_deferred(tip_scope: &std::cell::Cell<Option<Scope>>) {
+    if let Some(scope) = tip_scope.take() {
+        exec_after(std::time::Duration::ZERO, move |_| scope.dispose());
+    }
 }
 
 /// `.tooltip(…)`, anchored. Import it by name in any file that calls it — the
@@ -134,6 +187,7 @@ impl AnchoredTooltip {
         if let Some(id) = self.overlay.borrow_mut().take() {
             remove_overlay(id);
         }
+        dispose_deferred(&self.tip_scope);
     }
 }
 
@@ -168,9 +222,33 @@ impl View for AnchoredTooltip {
                 )
             });
         let el = element_box(origin, self.id.get_size().unwrap_or_default(), child);
-        let at = anchor_below(el.origin(), el.size(), theme::scaled(GAP));
+        let gap = theme::scaled(GAP);
+        let at = anchor_below(el.origin(), el.size(), gap);
         let tip = self.tip.clone();
-        let overlay_id = add_overlay(at, move |_| tip().style(widgets::tooltip_style));
+        // **Measured, then placed.** Whether the tip fits under the element
+        // depends on its height, which only layout knows — so it opens under
+        // the element, is painted off-screen for the one frame before its size
+        // is reported, and is then translated to `tip_top`'s answer: under the
+        // element, or above it where there is no room below.
+        let scope = Scope::new();
+        let shift: RwSignal<Option<f64>> = scope.create_rw_signal(None);
+        dispose_deferred(&self.tip_scope);
+        self.tip_scope.set(Some(scope));
+        let overlay_id = add_overlay(at, move |_| {
+            tip()
+                .style(widgets::tooltip_style)
+                .on_resize(move |r| {
+                    let window_h = widgets::window_size().get_untracked().1;
+                    let dy = Some(tip_shift(at.y, el, r.height(), window_h, gap));
+                    if shift.try_get_untracked().is_some_and(|s| s != dy) {
+                        shift.set(dy);
+                    }
+                })
+                .style(move |s| match shift.get() {
+                    None => s.translate_x(-100_000.0),
+                    Some(dy) => s.translate_y(dy),
+                })
+        });
         *self.overlay.borrow_mut() = Some(overlay_id);
     }
 
@@ -254,6 +332,45 @@ mod tests {
     fn without_a_laid_out_child_the_wrappers_box_is_used() {
         let el = element_box(Point::new(3.0, 4.0), Size::new(20.0, 10.0), None);
         assert_eq!(el, Rect::from_origin_size((3.0, 4.0), (20.0, 10.0)));
+    }
+
+    /// Where it fits, a tip stays under its element and is not moved at all.
+    #[test]
+    fn a_tip_with_room_below_stays_under_the_element() {
+        let el = Rect::new(100.0, 8.0, 126.0, 30.0);
+        let at = anchor_below(el.origin(), el.size(), 6.0);
+        assert_eq!(tip_top(el, 26.0, 800.0, 6.0), 36.0);
+        assert_eq!(tip_shift(at.y, el, 26.0, 800.0, 6.0), 0.0);
+    }
+
+    /// **A status-bar icon's tip opens above it** — clear of the icon, by the
+    /// same gap — rather than being pulled back up over it by floem's
+    /// bottom-edge clamp (issue #11). Asserted on where it is finally painted:
+    /// the opening point, less floem's pull-back, plus the shift.
+    #[test]
+    fn a_tip_with_no_room_below_opens_above_the_element() {
+        let (window_h, gap, tip_h) = (800.0, 6.0, 26.0);
+        let el = Rect::new(900.0, 776.0, 916.0, 794.0);
+        let at = anchor_below(el.origin(), el.size(), gap);
+        let painted = at.y - floem_pull_back(at.y, tip_h, window_h)
+            + tip_shift(at.y, el, tip_h, window_h, gap);
+        assert_eq!(painted, el.y0 - gap - tip_h);
+        assert!(painted + tip_h <= el.y0, "the tip's bottom clears the icon");
+    }
+
+    /// Before the window has been measured there is nothing to flip against.
+    #[test]
+    fn an_unmeasured_window_keeps_the_tip_under_the_element() {
+        let el = Rect::new(0.0, 776.0, 16.0, 794.0);
+        assert_eq!(tip_top(el, 26.0, 0.0, 6.0), 800.0);
+    }
+
+    /// A window too short for either side puts the tip above, at the top at
+    /// worst — never over the element it names, and never off the window.
+    #[test]
+    fn a_window_too_short_for_either_side_pins_the_tip_to_the_top() {
+        let el = Rect::new(0.0, 10.0, 16.0, 28.0);
+        assert_eq!(tip_top(el, 26.0, 40.0, 6.0), 0.0);
     }
 }
 

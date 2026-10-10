@@ -20857,10 +20857,30 @@ existing prose was left alone.
     `is_dragging()` goes false the moment a drag is released, whereas floem's view waited for its
     `pub(crate)` `dragging` field (`floem-0.2.0/src/app_state.rs:36`) to clear, and so also held
     tips off through a released drag's animation. It inlines floem's `default_compute_layout`,
-    which 0.2 does not re-export. Keeping the tip inside the window is still floem's `OverlayView`,
-    whose paint pulls one that would run past the right or bottom edge back in by the overflow — a
-    shift, not a flip, so under a control on the window's bottom edge the tip is painted up over the
-    control rather than above it.
+    which 0.2 does not re-export. Keeping the tip inside the window's **right** edge is still floem's
+    `OverlayView`, whose paint pulls an overflowing overlay back in by the overflow (to 5px inside).
+    **The bottom edge is the app's**, because that pull-back is a shift, not a flip: once the
+    status-bar icons had tooltips (GitHub #11), every one of them was pulled straight back up over
+    the icon it names. `tip_top(el, tip_h, window_h, gap)` answers under the element where the tip
+    fits inside `window_h - EDGE`, and otherwise **above** it, `(el.y0 - gap - tip_h).max(0)` — a
+    window too short for either side pins it to the top rather than over the element, and an
+    unmeasured window (`window_h` of 0) keeps it below. Pinned by
+    `a_tip_with_room_below_stays_under_the_element`,
+    `a_tip_with_no_room_below_opens_above_the_element`,
+    `an_unmeasured_window_keeps_the_tip_under_the_element` and
+    `a_window_too_short_for_either_side_pins_the_tip_to_the_top`. **The answer needs the tip's
+    height, which only layout knows**, and floem 0.2 cannot say "minus my own height" in style (a
+    `translate_y` percent is not of the view's size — *Floem 0.2 gotchas*). So `update` still opens
+    the overlay at `anchor_below`, and the tip carries a `shift: RwSignal<Option<f64>>` in a per-tip
+    `Scope` (`tip_scope`, disposed deferred by `dispose_deferred` on dismiss, on a re-open and on
+    cleanup). While it is `None` — the one frame before layout reports a size — the tip is painted
+    off-screen with `translate_x(-100_000)`; its `on_resize` then sets `tip_shift` from the measured
+    height and `widgets::window_size()`, and the style applies it as `translate_y`. **`tip_shift`
+    undoes floem's pull-back as well as making the move**: `OverlayView::paint` offsets the overlay
+    *before* the tip's own transform is applied, so the translate starts from where floem painted
+    the tip, not from where it was opened. `floem_pull_back` mirrors that clamp and `EDGE` (5.0) is
+    floem's margin, both copied from `floem-0.2.0/src/window_handle.rs:1561-1576` — a floem upgrade
+    that changes that clamp has to change them with it, and no test reads floem to notice.
     **The chrome is `widgets::tooltip_style`, applied to the tip directly.** floem computed the tip's
     style from the global `TooltipClass` rule off the tooltip view's style context, because the tip
     is an overlay — a child of the window, not of the app root — and sees none of the root's class
@@ -33085,15 +33105,25 @@ Re-introducing the anti-patterns these guard against is a regression:
   status-bar icons at full brightness whose clicks changed a signal nothing renders, which reads as
   a broken button rather than as a consequence of the window size. They now wear
   `toggle_icon`'s disabled face and carry a tooltip saying to widen the window.
-  **`panel_toggle(fits, offered)` answers the face and the tooltip in one call**, and that is the
-  point of it rather than a convenience: they are the same fact, so two predicates could disagree in
-  two bad ways — a dimmed toggle explaining nothing, and a live toggle insisting the window is too
-  narrow for it. Unit-tested over every input, including the invariant that a tip never accompanies
-  an enabled toggle. **Only the narrow case gets a tip**, deliberately: it is transient and
-  actionable, while Server Activity on an engine with no sessions is permanent and keeps
-  `toggle_icon`'s original ruling that *a toggle which opens an explanation is a worse answer than
-  one that visibly isn't offered*. When both apply the narrow one speaks, being the half the user
-  can act on.
+  **Every toggle names its panel otherwise** — "Schema", "AI assistant", "Query history", "Snippet
+  library", "Server activity", "Terminal", each panel's own title in sentence case — because an
+  icon alone did not say what it opened until it was clicked (GitHub #11). So the tooltip is always
+  there, `PanelToggle::tip` is a plain `&'static str` rather than the `Option` it was, and the
+  footer's call sites are a bare `.tooltip(move || text(…tip))`, not `widgets::tip_when`. The tips
+  open *above* the icons — there is no room below the footer, and floem's overlay pulled them back
+  up over the icon itself (`tooltip.rs`, `tip_top`).
+  **`panel_toggle(panel, fits, offered)` answers the face and the tooltip in one call**, and that
+  is the point of it rather than a convenience: they are the same fact, so two predicates could
+  disagree in two bad ways — a dimmed toggle explaining nothing, and a live toggle insisting the
+  window is too narrow for it. Unit-tested over every input in `panel_toggle_tests`, including the
+  invariant that `PANEL_NARROW_TIP` never accompanies an enabled toggle
+  (`the_narrow_tip_never_appears_on_an_enabled_toggle`). **Only the narrow case explains itself**,
+  its sentence standing in place of the name, deliberately: it is transient and actionable, while
+  Server Activity on an engine with no sessions is permanent and keeps `toggle_icon`'s original
+  ruling that *a toggle which opens an explanation is a worse answer than one that visibly isn't
+  offered* — that toggle is dim and only *named*, and naming explains nothing, so the ruling stands
+  (`a_panel_the_engine_does_not_offer_is_disabled_and_only_named`). When both apply the narrow one
+  speaks, being the half the user can act on.
   **Find-Anywhere's Toggle Panel rows answer the same state, in the palette's own idiom:** dimmed
   and skipped, with no tooltip — a list row is not a control with a hover affordance, and the rows
   beside it are the explanation. They read the same two predicates, so the palette and the status
@@ -33474,6 +33504,13 @@ Re-introducing the anti-patterns these guard against is a regression:
     (`menu_panel_height` predicts, `box_menu_inset` flips) and laid out where it is drawn. The
     interface scale stays a segmented control (`settings::scale_picker`) because it never needed a
     popup, not because dropdowns are still unsafe.
+  - **The nudge is a shift, not a flip, so an overlay hung under something at the window's bottom
+    is pulled back up over it.** That put every status-bar icon's tooltip on the icon it names
+    (GitHub #11). The fix cannot live in style: floem 0.2's `translate_y(pct(…))` is **not** a
+    percentage of the view's own size — `context.rs:653-656` turns `Pct(p)` into `p / 100` *pixels*
+    — so "up by my own height" is inexpressible, and the height has to be measured (`on_resize`)
+    and the translate computed. A translate also lands *after* the nudge, so it must undo it too.
+    `tooltip.rs` (`tip_top`, `tip_shift`) is the worked example.
 - **Enter and Space arrive at a focused view as a synthesised `Click`, *before* its KeyDown
   listeners run — and `Stop` cannot call it off.** `EventCx::unconditional_view_event`
   (`floem-0.2.0/src/context.rs`) applies `EventListener::Click` on the focused view for any
