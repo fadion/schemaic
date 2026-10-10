@@ -9910,6 +9910,41 @@ existing prose was left alone.
     `Statement` + `ConnectionLost` is `Server` (explained, never "fixed" into the buffer) and every
     other pair keeps what the error said. `run_query_core`'s generic error arm and Run All's session
     loop both call it (`a_lost_connection_is_the_servers_failure_not_the_statements`).
+    **`run_failed_message` is `failed_message` given the state the run found**, because a dead
+    pinned connection said nothing about the work that went with it. `ConnectionLost` over an open
+    transaction folds the tab to `Lost`, which keeps no count and whose pill says only "Transaction
+    lost", and the driver's error is about a socket — while the server rolls an unfinished
+    transaction back when its connection ends, so every statement run in it since it began is
+    undone. The sentence says so with the number, which only `before` still knows:
+    `run_query_core` reads `tab.tx` as it launches (one run at a time holds a pinned session, so
+    nothing moves it meanwhile), and Run All's session loop folds each outcome through the same
+    `on_statement` as it goes and hands each statement the state it found. Every other pair is
+    `failed_message`'s (`a_lost_connection_says_the_open_transaction_and_its_statements_are_gone`,
+    `a_run_failure_without_a_lost_transaction_is_failed_messages`). Both paths' timeout arms go
+    through it too. **`run_cancelled_message` is the same for a Stop**: a `DbError::Cancelled`
+    carrying `ConnectionLost` over an open transaction — SQL Server replacing a connection a Stop
+    left out of step, under `db::mssql` — is `run_failed_message` of "The statement was cancelled.",
+    where `cancelled_message`, which has no arm for it, answered the bare *Cancelled*; anything else
+    is `cancelled_message`'s (`a_stop_that_lost_the_connection_says_the_transaction_went_with_it`).
+    Both run paths call it, and it is the name the main.rs source gate over a Stop's disclosure
+    matches.
+    **And `Lost` has no way back on the tab itself.** `can_commit` and `can_rollback` are both false
+    there, so the footer hides Commit and Rollback alike, and a dead MySQL or PostgreSQL connection
+    is never re-dialled — `Session::alive` only classifies, because reconnecting silently would hand
+    the user a fresh, empty transaction over work already discarded. The next run goes to the same
+    dead connection (the session's `in_tx` is still set, so `ensure_tx` sends nothing), comes back
+    `ConnectionLost` again, and since `Lost` is not `is_open` the fold takes it to `Idle`: the pill
+    goes blank over a session that still cannot run anything, and every later run fails the same
+    way. A working connection comes only from something that calls `open_session` — switching the
+    tab to Auto-commit and back (`guard_tx` runs straight through, nothing being open), terminating
+    the session from Server Activity (`repair_killed_session`), or picking another database — and
+    **`open_session` resets `tab.tx` to closed right after dropping the old session**, since a fresh
+    session holds no transaction. That reset is load-bearing for the database switch, which
+    otherwise re-pinned without touching `tab.tx`: from `Lost` it left a live session under a pill
+    still reading "Transaction lost", and `Lost` absorbs every outcome but `ConnectionLost`, so the
+    real transaction the next `BEGIN` opened was never shown — Commit and Rollback hidden, and no
+    close or switch prompt, `is_open` being false
+    (`a_fresh_session_starts_the_tab_with_no_transaction`).
     **And a read on the pinned connection must not report a transaction it never opened.**
     `TxState::on_statement` merges `Idle` with `Open` on the stated premise that the app issues
     `BEGIN` lazily, so the first statement lands as the first statement of a fresh transaction —

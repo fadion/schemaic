@@ -940,6 +940,49 @@ pub fn failed_message(message: &str, stmt: StmtOutcome) -> String {
     }
 }
 
+/// [`failed_message`] for a run on a pinned session, given `before` — the
+/// tab's [`TxState`] as the run was sent.
+///
+/// **A lost connection says what went with it.** [`StmtOutcome::ConnectionLost`]
+/// over an open transaction folds the tab to [`TxState::Lost`], which keeps no
+/// count and whose pill says only "Transaction lost"; the driver's error is
+/// about a socket. An unfinished transaction is rolled back by the server when
+/// its connection ends — on every engine here — so every statement run in it
+/// since it began is undone, and this says so with the number, which only
+/// `before` still knows. Every other outcome is `failed_message`'s.
+pub fn run_failed_message(message: &str, stmt: StmtOutcome, before: TxState) -> String {
+    if stmt != StmtOutcome::ConnectionLost || !before.is_open() {
+        return failed_message(message, stmt);
+    }
+    let what = match before.stmts() {
+        0 => "nothing had run in it yet".to_string(),
+        n => format!(
+            "the {n} {} run in it since it began {} undone",
+            crate::text::plural(n as usize, "statement", "statements"),
+            if n == 1 { "is" } else { "are" }
+        ),
+    };
+    format!(
+        "{message}\n\nThe connection was lost with a transaction open. The server rolls an \
+         unfinished transaction back when its connection ends, so {what}."
+    )
+}
+
+/// [`cancelled_message`] given `before`, as [`run_failed_message`] is
+/// `failed_message` given it: a Stop that cost the connection — SQL Server
+/// replaces one a Stop left out of step, which reports `ConnectionLost` under
+/// a `Cancelled` — over an open transaction says what went with it.
+pub fn run_cancelled_message(stmt: Option<StmtOutcome>, before: TxState) -> Option<String> {
+    match stmt {
+        Some(StmtOutcome::ConnectionLost) if before.is_open() => Some(run_failed_message(
+            "The statement was cancelled.",
+            StmtOutcome::ConnectionLost,
+            before,
+        )),
+        _ => cancelled_message(stmt),
+    }
+}
+
 /// What a **cancelled** run has to say beyond "Cancelled", or `None` when the
 /// bare word is the whole truth.
 ///
@@ -1427,6 +1470,67 @@ mod tests {
         let c = cancelled_message(Some(StmtOutcome::FailedAndRolledBack)).expect("disclosed");
         assert!(c.contains("rolled it back"), "{c}");
         assert!(failed_message("x", StmtOutcome::FailedAndDoomed).contains("Rollback"));
+    }
+
+    /// **A connection lost mid-transaction says what went with it**: the
+    /// driver's error is about a socket, and "Transaction lost" in the footer
+    /// does not say that the statements run in it since it began are undone,
+    /// nor how many. The count is the tab's as the run was sent.
+    #[test]
+    fn a_lost_connection_says_the_open_transaction_and_its_statements_are_gone() {
+        let lost = StmtOutcome::ConnectionLost;
+        let m = run_failed_message(
+            "Lost connection to server",
+            lost,
+            TxState::Open { stmts: 3 },
+        );
+        assert!(m.starts_with("Lost connection to server\n\n"), "{m}");
+        assert!(
+            m.contains("the 3 statements run in it since it began"),
+            "{m}"
+        );
+        let one = run_failed_message("x", lost, TxState::Poisoned { stmts: 1 });
+        assert!(one.contains("the 1 statement run in it"), "{one}");
+        let none = run_failed_message("x", lost, TxState::Open { stmts: 0 });
+        assert!(none.contains("nothing had run in it yet"), "{none}");
+    }
+
+    /// **A Stop that cost the connection says so too.** SQL Server answers a
+    /// Stop that left its connection out of step by replacing it — a
+    /// `Cancelled` carrying `ConnectionLost` — and the bare "Cancelled" hid the
+    /// transaction that went with it.
+    #[test]
+    fn a_stop_that_lost_the_connection_says_the_transaction_went_with_it() {
+        let lost = Some(StmtOutcome::ConnectionLost);
+        let m = run_cancelled_message(lost, TxState::Open { stmts: 2 }).expect("disclosed");
+        assert!(m.starts_with("The statement was cancelled."), "{m}");
+        assert!(m.contains("the 2 statements run in it"), "{m}");
+        assert_eq!(run_cancelled_message(lost, TxState::Idle), None);
+        let committed = Some(StmtOutcome::FailedAndCommitted);
+        assert_eq!(
+            run_cancelled_message(committed, TxState::Open { stmts: 2 }),
+            cancelled_message(committed)
+        );
+    }
+
+    /// With no transaction open there is nothing to mourn, and every other
+    /// outcome is `failed_message`'s, unchanged.
+    #[test]
+    fn a_run_failure_without_a_lost_transaction_is_failed_messages() {
+        let lost = StmtOutcome::ConnectionLost;
+        assert_eq!(run_failed_message("x", lost, TxState::Idle), "x");
+        assert_eq!(run_failed_message("x", lost, TxState::Lost), "x");
+        for stmt in [
+            StmtOutcome::FailedAndCommitted,
+            StmtOutcome::FailedAndRolledBack,
+            StmtOutcome::Ok,
+        ] {
+            assert_eq!(
+                run_failed_message("x", stmt, TxState::Open { stmts: 2 }),
+                failed_message("x", stmt),
+                "{stmt:?}"
+            );
+        }
     }
 
     /// A statement whose connection died did nothing wrong; the bar offered

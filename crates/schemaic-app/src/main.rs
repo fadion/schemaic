@@ -3128,6 +3128,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // (`open_session`); an auto-commit run's own connection asks for it.
             let enforce =
                 connections.with_untracked(|cs| session_enforce(cs, tab.conn_id.get_untracked()));
+            // The transaction as this run found it: a lost connection's message
+            // counts the statements that went with it, and the fold that will
+            // record the loss keeps no count (`tx::run_failed_message`). One run
+            // at a time holds a pinned session, so nothing moves it meanwhile.
+            let tx_before = tab.tx.get_untracked();
             handle.spawn(async move {
                 // Wall-clock, and around everything: connecting, the statement,
                 // and pulling the rows back are all time the user waited — which
@@ -3169,7 +3174,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 // killed one has spent it — and nothing else on screen says so.
                 // `None` (no session) can't have had a transaction to spend.
                 let note = |m: String| match stmt {
-                    Some(o) => tx::failed_message(&m, o),
+                    Some(o) => tx::run_failed_message(&m, o, tx_before),
                     None => m,
                 };
                 let state = match res {
@@ -3204,7 +3209,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     // everything already in it permanent — and the arm above,
                     // which discloses exactly that, is reached only when the
                     // *clock* stopped the run. See `tx::cancelled_message`.
-                    Err(DbError::Cancelled) => match tx::cancelled_message(stmt) {
+                    Err(DbError::Cancelled) => match tx::run_cancelled_message(stmt, tx_before) {
                         Some(m) => {
                             tracing::info!("query cancelled after an implicit commit");
                             QueryState::Failed(ModalError::app(m))
@@ -3637,6 +3642,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // A Manual tab's pinned session carries it already (`open_session`).
             let enforce =
                 connections.with_untracked(|cs| session_enforce(cs, tab.conn_id.get_untracked()));
+            // The transaction as the batch found it, folded statement by
+            // statement below so a lost connection's message can count what
+            // went with it — `run_query_core`'s `tx_before`, per statement.
+            let tx_before = tab.tx.get_untracked();
             handle.spawn(async move {
                 let mut states: Vec<QueryState> = vec![QueryState::Cancelled; n];
                 let mut outcomes: Vec<Option<StmtOutcome>> = vec![None; n];
@@ -3664,6 +3673,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         // The session runs statements one at a time on the pinned
                         // connection, so each outcome is collected as it lands.
                         let mut stopped = false;
+                        let mut running = tx_before;
                         for (i, sql) in stmts.iter().enumerate() {
                             if stopped || token.is_cancelled() {
                                 states[i] = QueryState::Cancelled;
@@ -3699,6 +3709,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             took[i] = clock.elapsed().as_millis() as u64;
                             clock = std::time::Instant::now();
                             outcomes[i] = Some(out.stmt);
+                            let before = running;
+                            running = running.on_statement(engine, sql, out.stmt);
                             // Same disclosure as the single-run path, and it
                             // matters more here: the statements after this one
                             // are skipped, so the pill is the only place the
@@ -3718,16 +3730,17 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                     if tx::timeout_reached(Some(out.stmt), timed_out) =>
                                 {
                                     stopped = true;
-                                    QueryState::Failed(ModalError::app(tx::failed_message(
+                                    QueryState::Failed(ModalError::app(tx::run_failed_message(
                                         &timeout_message(timeout_secs),
                                         out.stmt,
+                                        before,
                                     )))
                                 }
                                 // The same pair as `run_query_core`'s, and the
                                 // same hole: see `tx::cancelled_message`.
                                 Err(DbError::Cancelled) => {
                                     stopped = true;
-                                    match tx::cancelled_message(Some(out.stmt)) {
+                                    match tx::run_cancelled_message(Some(out.stmt), before) {
                                         Some(m) => QueryState::Failed(ModalError::app(m)),
                                         None => QueryState::Cancelled,
                                     }
@@ -3735,7 +3748,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                 Err(e) => {
                                     stopped = true;
                                     QueryState::Failed(ModalError::new(
-                                        tx::failed_message(&e.to_string(), out.stmt),
+                                        tx::run_failed_message(&e.to_string(), out.stmt, before),
                                         tx::run_error_source(e.modal_source(), Some(out.stmt)),
                                     ))
                                 }
@@ -5543,6 +5556,14 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 return;
             };
             (drop_session)(tab_id);
+            // **A fresh session holds no transaction**, whatever the tab's state
+            // said about the old one. Its callers settle an open transaction
+            // first (`guard_tx`), but `Lost` is not open and runs straight
+            // through — and a database switch then re-pinned a working session
+            // under a pill still reading "Transaction lost", which absorbs every
+            // outcome, so the real transaction the next `BEGIN` opened was never
+            // shown: Commit and Rollback hidden, no prompt on close or switch.
+            tab.tx.set(TxState::closed());
             let db = match db_for(tab.conn_id.get_untracked()) {
                 Ok(db) => db,
                 Err(e) => {
@@ -13856,6 +13877,35 @@ mod app_tests {
         }
     }
 
+    /// **Re-pinning a session clears the tab's transaction state**, in the
+    /// step that drops the old one. Only reachable through the closure, so
+    /// pinned by its text: without the line, a database switch from a `Lost`
+    /// tab left the pill on "Transaction lost" over a live session whose real
+    /// transaction then had no Commit, no Rollback and no close prompt.
+    #[test]
+    fn a_fresh_session_starts_the_tab_with_no_transaction() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("main.rs"),
+        )
+        .expect("main.rs");
+        let body = schemaic_ui::source_gate::production_code(&src);
+        let at = body
+            .find("let open_session: Rc<dyn Fn(usize)> = {")
+            .expect("open_session is gone — this gate is stale");
+        let r = &body[at..];
+        let drop = r.find("(drop_session)(tab_id);").expect("the drop");
+        let reset = r
+            .find("tab.tx.set(TxState::closed());")
+            .expect("open_session no longer clears the tab's transaction state");
+        let open = r.find("Session::open_enforced(").expect("the open");
+        assert!(
+            drop < reset && reset < open,
+            "the reset belongs with the drop"
+        );
+    }
+
     /// **A run's own notes reach the bar as Schemaic's words.** "Not sent",
     /// the statement timeout and a Stop's disclosure are sentences this app
     /// wrote, and `ModalError::app` is what withholds *AI fix* and *Explain*
@@ -13911,7 +13961,7 @@ mod app_tests {
         );
         // A Stop's disclosure is matched, then wrapped, one line on.
         let mut stops = 0usize;
-        for (at, _) in body.match_indices("tx::cancelled_message(") {
+        for (at, _) in body.match_indices("tx::run_cancelled_message(") {
             stops += 1;
             let after = &body[at..(at + 400).min(body.len())];
             assert!(
