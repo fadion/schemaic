@@ -20338,7 +20338,7 @@ existing prose was left alone.
     Codex, `step_index` on Antigravity, `callID` on OpenCode, `toolCallId` on Copilot, `call_id` on
     Cursor — and without it a result can only be
     attached by recency, which is exactly backwards for the ordinary parallel shape: the model
-    makes two calls in one step, three of the four tools the panel allow-lists being read-only ones
+    makes two calls in one step, three of the tools the panel allow-lists being read-only ones
     a model routinely batches, and their results arrive in **call** order, so the first result
     landed on the second chip and the second on the first. `is_error` travels with the text, so a
     query that *failed* read as having succeeded and returned another tool's output, under a green
@@ -24518,8 +24518,9 @@ existing prose was left alone.
     mark `archive.orders` as unknown over a view preference. Hiding governs what is *offered*,
     never what is *true*. The same line runs through the built-in **MCP server**: `list_schema`'s
     *overview* asks `mcp::listed_databases` (so the assistant's tools agree with its prompt about
-    what this session can see), while `list_schema {"database": …}`, `describe_table` and
-    `run_query` answer in full — a named lookup is a fact, and half-filtering a fence `run_query`
+    what this session can see), and so does `search_objects` without a `database`, which searches
+    that same overview, while `list_schema {"database": …}`, `search_objects {"database": …}`,
+    `describe_table` and `run_query` answer in full — a named lookup is a fact, and half-filtering a fence `run_query`
     walks through anyway would be theatre. The MCP subprocess is handed a **blob, not a signal**
     (`hidden` on the endpoint JSON, absent in older blobs → nothing hidden), so hiding a database
     mid-session takes effect on the next one, exactly as the system prompt beside it does. **A folder now carries a menu of its own** (`CtxKind::ObjectGroup`), reversing the
@@ -30885,12 +30886,12 @@ existing prose was left alone.
     `relation does not exist` for a table `list_schema` just showed it
     (`the_mcp_notice_says_when_there_is_no_default_database`). `connect` is handed a `ConnArgs` with
     `password_stdin: false`, `mcp` having no such flag.
-  - `cli/mcp.rs` — the **MCP (stdio) server**: newline-delimited JSON-RPC on stdin/stdout, and four
+  - `cli/mcp.rs` — the **MCP (stdio) server**: newline-delimited JSON-RPC on stdin/stdout, and five
     tools, none of which writes anything. It was `app/mcp.rs` until `schemaic mcp` needed it, and it
     lives here so that the second way in is the same server rather than a copy of its gates —
-    `schemaic-cli` cannot reach into `schemaic-app`, which depends on it. The four (`run_query`,
-    `list_schema`, `describe_table`, `propose_table_change`) are described for **this**
-    connection's engine and listed for **this** connection's access levels and **this** host:
+    `schemaic-cli` cannot reach into `schemaic-app`, which depends on it. The five (`run_query`,
+    `list_schema`, `describe_table`, `search_objects`, `propose_table_change`) are described
+    for **this** connection's engine and listed for **this** connection's access levels and **this** host:
     `tools_list(engine, reads_data, schema, host)` builds
     `run_query`'s advertised statement heads from `schemaic_core::sql::read_only_heads`, the same list
     the gate enforces, and names the engine with `SqlDialect::engine_label()`. A hard-coded
@@ -30949,7 +30950,7 @@ existing prose was left alone.
     (`run_query_takes_a_database_and_uses_it`). The panel lists the same tools, so it has the
     argument too, which the SCHEMA eye's rule already allows for: `run_query` answers in full, a
     hidden database included.
-    **The four are a type — `McpTool` — and that is what makes the advertised array and the gates one
+    **The five are a type — `McpTool` — and that is what makes the advertised array and the gates one
     set.** They used to be written out independently in five places the compiler related to nothing:
     the `json!` array in `tools_list`, a `==` in `reads_row_data`, a `matches!` in `reads_schema`,
     `call_tool`'s dispatch with its `other =>` catch-all, and `ai.rs`'s two `mcp__schemaic__*` `const`
@@ -30957,7 +30958,7 @@ existing prose was left alone.
     both gates**, which is exactly how `propose_table_change` came to sit on neither — full
     `fetch_schema` access at the app's tightest setting, with nothing failing to compile and nothing
     failing to run. `name`, `ai_name`, `reads_row_data` and `reads_schema` are exhaustive matches on
-    the enum now — `needs_panel` too — so a fifth variant does not compile until every gate has
+    the enum now — `needs_panel` too — so a new variant does not compile until every gate has
     answered for it: five `non-exhaustive patterns` errors when that was checked, before
     `needs_panel` existed, and the same rule `ai/harness.rs`'s `env_seal` states one crate over. The
     `json!` array survives, each tool's input
@@ -30991,7 +30992,7 @@ existing prose was left alone.
     with — **derived from `McpTool::ALL` rather than typed out**, since it was two more hand-written
     `const` lists (`AI_TOOLS_WITH_QUERY` / `AI_TOOLS_READ_ONLY`) of a set the compiler related to
     nothing, on top of the three in `mcp.rs`, and filtered through `offered(…, Host::Panel)` itself
-    now, where it used to spell the predicate out again inline; a fifth tool now cannot be added
+    now, where it used to spell the predicate out again inline; a new tool now cannot be added
     without answering every gate for it, and that answer is what reaches there. And since `build_session_args` empties the built-in set with `--tools ""`, that list is now
     the session's *entire* tool set rather than an addition to it (on a CLI whose `--help` does not
     advertise the flag it is an addition again, with the twenty-nine-name backstop behind it — see
@@ -31145,10 +31146,35 @@ existing prose was left alone.
     (`the_answer_is_the_newest_version_the_client_can_know`). The loop keeps what was agreed, and
     `tools/list` goes through `annotated`: from `2025-03-26` on — the revision that introduced
     them — every tool carries `annotations: {readOnlyHint}` from `McpTool::read_only`, an
-    exhaustive match that answers `true` for all four (`run_query` runs on a read-only session,
-    `propose_table_change` runs nothing). A `2024-11-05` session, or a `tools/list` sent before the
+    exhaustive match that answers `true` for all five (`run_query` runs on a read-only session,
+    `search_objects` reads only the catalogue, `propose_table_change` runs nothing). A `2024-11-05` session, or a `tools/list` sent before the
     handshake, gets the list as it always was
     (`a_2025_session_is_told_every_tool_is_read_only`).
+    **`search_objects` is Find-Anywhere's question asked over this server's two reads, not a third
+    read.** `query` is required and trimmed, and an empty one is refused ("search_objects needs a
+    `query`.") before anything is dialled. Without `database` it searches `overview(db, hidden,
+    default_db)` — `list_schema`'s overview fetch, factored out so both tools share it, its deadlines
+    and their comments moving with it — so it searches exactly the databases that overview lists, the
+    hidden set applying, and only their table and view names. With `database` it reads that one in
+    full (`fetch_schema` under `with_deadline`) and matches its column names too, printed
+    `table.column` after the object hits: names, then objects, then columns, Find-Anywhere's order.
+    Only the one database is read in full because that is where the columns are; doing it for the
+    whole server is the catalogue of every database for an answer that mostly does not use it, the
+    overview's own reason for listing names. Every comparison is `schema::object_name_matches` over
+    the lowercased needle — the one predicate every schema-search surface uses, an invariant below —
+    and the pure `format_search_hits` prints a `## name` heading per database with hits, `- hit`
+    lines qualified by `table_label` and views marked `(view)`, a database that failed as
+    `## name (error: …)`, and a footer of `(N matches)`, or `(N+ matches, capped)` once
+    `MCP_ROW_CAP` is reached. Finding nothing says what was searched for and over how many databases
+    — "No table or view name contains …", "table, view or column" when columns were searched. **It is a schema tool and not a data one**:
+    `reads_schema` is `true`, because a name search is the existence oracle `propose_table_change`'s
+    `false` turned out to be, asked on purpose — so *Schema context: None* withholds it and
+    `NO_SCHEMA_ACCESS` names it — while `reads_row_data` is `false`, so it is offered at every data
+    level, and it is not `needs_panel` (`search_objects_is_a_schema_tool_and_not_a_data_one`; the
+    shape is pinned by `a_search_names_the_matching_tables_and_views_per_database`,
+    `a_search_of_one_database_also_names_matching_columns`,
+    `a_search_that_finds_nothing_says_so_and_where_it_looked` and
+    `a_search_stops_at_the_cap_and_says_so`).
     `propose_table_change` is the odd one out and stays read-only like the rest: it takes a
     `core::propose::Proposal`, introspects the table, runs `propose::apply` → `ddl::diff` → `emit`,
     and hands the model back the change list in the *preview's own words* plus the SQL and anything
@@ -32841,10 +32867,11 @@ Re-introducing the anti-patterns these guard against is a regression:
   appeared in its owner). They were two predicates and the palette's simply **had no object arm**,
   so on a PostgreSQL connection Ctrl+P for a type you were looking at in the sidebar returned
   nothing. **The name-versus-term rule underneath all of them is `schema::object_name_matches`** —
-  the ER diagram's find bar (`erd::search`) is the third surface and is a *caller*, not a fourth
-  spelling, and `TableInfo::matches_search`/`any_column_matches` were folded onto it rather than
-  each keeping its own `to_lowercase().contains`. The empty needle is why that matters beyond
-  tidiness: the predicate owns the rule that an empty term matches nothing (every caller answers "no
+  the ER diagram's find bar (`erd::search`) is the third surface and the MCP server's
+  `search_objects` (`cli::mcp::format_search_hits`, the one a model asks) the fourth, each a
+  *caller* rather than another spelling, and `TableInfo::matches_search`/`any_column_matches` were
+  folded onto it rather than each keeping its own `to_lowercase().contains`. The empty needle is why
+  that matters beyond tidiness: the predicate owns the rule that an empty term matches nothing (every caller answers "no
   filter" separately), and while the callers spelled the comparison themselves that case was handled
   in some of them and not others. **`schema::name_survives` is the second empty-input rule, and the
   two are deliberately not interchangeable**: an empty *needle* matches nothing, an empty *filter*

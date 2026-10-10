@@ -377,7 +377,7 @@ const INVALID_REQUEST: i64 = -32600;
 /// failing to run.
 ///
 /// Every question about a tool is now an exhaustive `match` on this enum, so a
-/// fifth variant does not compile until both gates have answered for it. Same
+/// new variant does not compile until every gate has answered for it. Same
 /// rule `ai/harness.rs`'s `env_seal` states one crate over — *"a fifth harness
 /// is a compile error here rather than a silent default there"*.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -385,15 +385,17 @@ pub enum McpTool {
     RunQuery,
     ListSchema,
     DescribeTable,
+    SearchObjects,
     ProposeTableChange,
 }
 
 impl McpTool {
     /// Every tool, in the order `tools/list` advertises them.
-    pub const ALL: [McpTool; 4] = [
+    pub const ALL: [McpTool; 5] = [
         McpTool::RunQuery,
         McpTool::ListSchema,
         McpTool::DescribeTable,
+        McpTool::SearchObjects,
         McpTool::ProposeTableChange,
     ];
 
@@ -403,18 +405,20 @@ impl McpTool {
             McpTool::RunQuery => "run_query",
             McpTool::ListSchema => "list_schema",
             McpTool::DescribeTable => "describe_table",
+            McpTool::SearchObjects => "search_objects",
             McpTool::ProposeTableChange => "propose_table_change",
         }
     }
 
     /// The name a CLI harness's allow-list spells it under. Written out rather
     /// than `format!`ed so it is a `&'static str` the allow-lists can hold —
-    /// and so a fifth tool has to state it here too.
+    /// and so a new tool has to state it here too.
     pub fn ai_name(self) -> &'static str {
         match self {
             McpTool::RunQuery => "mcp__schemaic__run_query",
             McpTool::ListSchema => "mcp__schemaic__list_schema",
             McpTool::DescribeTable => "mcp__schemaic__describe_table",
+            McpTool::SearchObjects => "mcp__schemaic__search_objects",
             McpTool::ProposeTableChange => "mcp__schemaic__propose_table_change",
         }
     }
@@ -433,7 +437,10 @@ impl McpTool {
     pub fn reads_row_data(self) -> bool {
         match self {
             McpTool::RunQuery => true,
-            McpTool::ListSchema | McpTool::DescribeTable | McpTool::ProposeTableChange => false,
+            McpTool::ListSchema
+            | McpTool::DescribeTable
+            | McpTool::SearchObjects
+            | McpTool::ProposeTableChange => false,
         }
     }
 
@@ -458,22 +465,29 @@ impl McpTool {
     pub fn reads_schema(self) -> bool {
         match self {
             McpTool::RunQuery => false,
-            McpTool::ListSchema | McpTool::DescribeTable | McpTool::ProposeTableChange => true,
+            // A name search is the existence oracle `propose_table_change`'s
+            // note above describes, asked on purpose.
+            McpTool::ListSchema
+            | McpTool::DescribeTable
+            | McpTool::SearchObjects
+            | McpTool::ProposeTableChange => true,
         }
     }
 
     /// Does this tool leave the database exactly as it found it — the
     /// `readOnlyHint` a `2025` session is told ([`annotated`])?
     ///
-    /// All four do, and that is the server's whole shape rather than a
+    /// All of them do, and that is the server's whole shape rather than a
     /// coincidence: `run_query` goes through `read_only_query` on a read-only
-    /// session, and `propose_table_change` runs nothing — its DDL goes to the
-    /// user's preview. Asked per tool all the same, so a fifth has to answer.
+    /// session, `search_objects` reads only the catalogue, and
+    /// `propose_table_change` runs nothing — its DDL goes to the user's
+    /// preview. Asked per tool all the same, so a new one has to answer.
     pub fn read_only(self) -> bool {
         match self {
             McpTool::RunQuery
             | McpTool::ListSchema
             | McpTool::DescribeTable
+            | McpTool::SearchObjects
             | McpTool::ProposeTableChange => true,
         }
     }
@@ -490,7 +504,10 @@ impl McpTool {
     pub fn needs_panel(self) -> bool {
         match self {
             McpTool::ProposeTableChange => true,
-            McpTool::RunQuery | McpTool::ListSchema | McpTool::DescribeTable => false,
+            McpTool::RunQuery
+            | McpTool::ListSchema
+            | McpTool::DescribeTable
+            | McpTool::SearchObjects => false,
         }
     }
 
@@ -509,8 +526,8 @@ impl McpTool {
 /// Names the setting, because the model's next move should be to ask the user
 /// for the table and column names (or to raise the setting) rather than retry.
 const NO_SCHEMA_ACCESS: &str = "Refused: the user's Schema context setting is None, so the \
-     assistant is given no database structure and list_schema, describe_table and \
-     propose_table_change are unavailable. Ask the user for the table and column names you need \
+     assistant is given no database structure and list_schema, describe_table, search_objects \
+     and propose_table_change are unavailable. Ask the user for the table and column names you need \
      — or tell them to set Schema context to a database in AI settings.";
 
 /// What the server says when a withheld tool is called anyway. It names the
@@ -651,6 +668,27 @@ pub fn tools_list(
             }
         },
         {
+            "name": "search_objects",
+            "description": "Find tables and views by part of their name, case-insensitively, \
+                            across every database list_schema shows. With `database`: that one \
+                            database, and its column names too, printed as `table.column`.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Part of a name — `cust` finds `customers` and \
+                                        `v_customer_orders`."
+                    },
+                    "database": {
+                        "type": "string",
+                        "description": "Search only this database, and its columns as well."
+                    }
+                },
+                "required": ["query"]
+            }
+        },
+        {
             "name": "propose_table_change",
             "description": format!(
                 "Check a proposed change to a table and see the {} SQL it would produce. \
@@ -773,6 +811,10 @@ async fn call_tool(endpoint: &Endpoint, name: &str, args: &Value) -> Value {
         McpTool::DescribeTable => match arg("table") {
             Some(table) => describe_table(db, database, arg("database"), table, reads_data).await,
             None => ("describe_table needs a `table`.".to_string(), true),
+        },
+        McpTool::SearchObjects => match arg("query").map(str::trim).filter(|q| !q.is_empty()) {
+            Some(query) => search_objects(db, query, arg("database"), database, hidden).await,
+            None => ("search_objects needs a `query`.".to_string(), true),
         },
         McpTool::ProposeTableChange => propose_change(db, database, arg("database"), args).await,
     };
@@ -988,6 +1030,22 @@ async fn list_schema(
             ),
         };
     }
+    match overview(db, hidden, default_db).await {
+        Ok(dbs) => (format_database_list(&dbs, samples), false),
+        Err(e) => (e, true),
+    }
+}
+
+/// Every listed database with its table **names** — what `list_schema`'s
+/// overview prints and `search_objects` searches. The hidden set applies, as
+/// it does to any listing (`listed_databases`); `Err` is the message when the
+/// databases themselves could not be listed, and a database that fails on its
+/// own carries its error in place.
+async fn overview(
+    db: &Db,
+    hidden: &HashSet<String>,
+    default_db: Option<&str>,
+) -> Result<Vec<(String, Result<DbSchema, String>)>, String> {
     // **The first read of the overview form, and it had no deadline at all.**
     // This is the tool's advertised entry point — what a fresh turn asks first —
     // and `fetch_databases` is `SHOW DATABASES` on MySQL: behind an
@@ -1004,8 +1062,8 @@ async fn list_schema(
     // than a bound on ours.
     let names = match with_deadline_abandoning(db.fetch_databases()).await {
         Some(Ok(d)) => listed_databases(d, hidden, default_db),
-        Some(Err(e)) => return (format!("Error listing databases: {e}"), true),
-        None => return ("Listing databases timed out (30s).".to_string(), true),
+        Some(Err(e)) => return Err(format!("Error listing databases: {e}")),
+        None => return Err("Listing databases timed out (30s).".to_string()),
     };
     let mut dbs = Vec::with_capacity(names.len());
     for name in names {
@@ -1037,7 +1095,105 @@ async fn list_schema(
         };
         dbs.push((name, schema));
     }
-    (format_database_list(&dbs, samples), false)
+    Ok(dbs)
+}
+
+/// `search_objects` — table and view names containing `query`, across every
+/// listed database, or in `database` alone with its column names as well.
+///
+/// One database is read in full ([`Db::fetch_schema`]) because that is where
+/// the column names are; the whole server only as names, for the reason the
+/// overview gives — introspecting every column of every database for a name
+/// search is the whole catalogue for an answer that mostly doesn't use it.
+async fn search_objects(
+    db: &Db,
+    query: &str,
+    database: Option<&str>,
+    default_db: Option<&str>,
+    hidden: &HashSet<String>,
+) -> (String, bool) {
+    let (dbs, columns) = match database {
+        Some(name) => {
+            let token = CancellationToken::new();
+            let schema = match with_deadline(db.fetch_schema(name, token.clone()), token).await {
+                Some(r) => r.map_err(|e| e.to_string()),
+                None => Err("timed out (30s) and was cancelled".to_string()),
+            };
+            (vec![(name.to_string(), schema)], true)
+        }
+        None => match overview(db, hidden, default_db).await {
+            Ok(dbs) => (dbs, false),
+            Err(e) => return (e, true),
+        },
+    };
+    (format_search_hits(query, &dbs, columns), false)
+}
+
+/// The hits of a name search over `dbs`: per database, the tables and views
+/// whose name contains `query` — matched by `schema::object_name_matches`, the
+/// predicate every schema-search surface in the app uses — then, with
+/// `columns`, the matching columns as `table.column`. At most
+/// [`MCP_ROW_CAP`] hits, and says when it stopped. Pure.
+fn format_search_hits(
+    query: &str,
+    dbs: &[(String, Result<DbSchema, String>)],
+    columns: bool,
+) -> String {
+    let needle = query.to_lowercase();
+    let hit = |name: &str| schemaic_core::schema::object_name_matches(name, &needle);
+    let mut out = String::new();
+    let mut n = 0usize;
+    let mut capped = false;
+    'dbs: for (name, schema) in dbs {
+        let s = match schema {
+            Ok(s) => s,
+            Err(e) => {
+                out.push_str(&format!("## {name} (error: {e})\n"));
+                continue;
+            }
+        };
+        let qualify = needs_qualifier(s);
+        let objects = s.tables.iter().filter(|t| hit(&t.name)).map(|t| {
+            let view = if t.is_view { " (view)" } else { "" };
+            format!("{}{view}", table_label(t, qualify))
+        });
+        let cols = s.tables.iter().filter(|_| columns).flat_map(|t| {
+            t.columns
+                .iter()
+                .filter(|c| hit(&c.name))
+                .map(move |c| format!("{}.{}", table_label(t, qualify), c.name))
+        });
+        let mut lines = objects.chain(cols).peekable();
+        if lines.peek().is_none() {
+            continue;
+        }
+        out.push_str(&format!("## {name}\n"));
+        for line in lines {
+            if n == MCP_ROW_CAP {
+                capped = true;
+                break 'dbs;
+            }
+            out.push_str(&format!("- {line}\n"));
+            n += 1;
+        }
+    }
+    if n == 0 {
+        let what = if columns {
+            "table, view or column"
+        } else {
+            "table or view"
+        };
+        let k = dbs.len();
+        let plural = if k == 1 { "database" } else { "databases" };
+        return format!("No {what} name contains \"{query}\" (searched {k} {plural}).\n{out}");
+    }
+    let plural = if n == 1 { "match" } else { "matches" };
+    if capped {
+        out.push_str(&format!("({n}+ {plural}, capped)\n"));
+    } else {
+        out.push_str(&format!("({n} {plural})\n"));
+    }
+    out
 }
 
 /// The server overview: one heading per database, its tables listed by name.
@@ -1415,10 +1571,11 @@ async fn propose_change(
 #[cfg(test)]
 mod tests {
     use super::{
-        HashSet, Host, McpTool, NO_DATA_ACCESS, NO_DATA_ACCESS_STANDALONE, NO_PANEL,
+        HashSet, Host, MCP_ROW_CAP, McpTool, NO_DATA_ACCESS, NO_DATA_ACCESS_STANDALONE, NO_PANEL,
         SUPPORTED_PROTOCOLS, dialect_of, find_described, format_database_list,
-        format_database_schema, format_table, format_table_detail, format_table_heading,
-        listed_databases, negotiate_protocol, proposal_from_args, refusal_for,
+        format_database_schema, format_search_hits, format_table, format_table_detail,
+        format_table_heading, listed_databases, negotiate_protocol, proposal_from_args,
+        refusal_for,
     };
 
     /// **A read that finishes in time comes back whole**, and the clock is not
@@ -1583,7 +1740,12 @@ mod tests {
             );
             // The schema tools are untouched — the level withholds *data*, not
             // the ability to look at the shape of the database.
-            for kept in ["list_schema", "describe_table", "propose_table_change"] {
+            for kept in [
+                "list_schema",
+                "describe_table",
+                "search_objects",
+                "propose_table_change",
+            ] {
                 assert!(
                     names.contains(&kept.to_string()),
                     "{engine:?} dropped {kept}: {names:?}"
@@ -1697,7 +1859,12 @@ mod tests {
             // set into one `RebuildTable`, whose emitted SQL is the table's
             // complete `CREATE TABLE` plus an `INSERT … SELECT` naming every
             // column again.
-            for gone in ["list_schema", "describe_table", "propose_table_change"] {
+            for gone in [
+                "list_schema",
+                "describe_table",
+                "search_objects",
+                "propose_table_change",
+            ] {
                 assert!(
                     !names.contains(&gone.to_string()),
                     "{engine:?} still advertises {gone}: {names:?}"
@@ -1738,7 +1905,12 @@ mod tests {
             let names = offered_with(engine, true, true, Host::Standalone);
             assert_eq!(
                 names,
-                ["run_query", "list_schema", "describe_table"],
+                [
+                    "run_query",
+                    "list_schema",
+                    "describe_table",
+                    "search_objects"
+                ],
                 "{engine:?}"
             );
             let names = offered_with(engine, true, true, Host::Panel);
@@ -1769,7 +1941,7 @@ mod tests {
     #[test]
     fn rows_are_withheld_standalone_with_advice_that_fits_the_client() {
         let names = offered_with(schemaic_db::Engine::Postgres, false, true, Host::Standalone);
-        assert_eq!(names, ["list_schema", "describe_table"]);
+        assert_eq!(names, ["list_schema", "describe_table", "search_objects"]);
         let refusal = refusal_for(McpTool::RunQuery, false, true, Host::Standalone);
         assert_eq!(refusal, Some(NO_DATA_ACCESS_STANDALONE));
         assert!(!NO_DATA_ACCESS_STANDALONE.contains("grid"));
@@ -1906,6 +2078,26 @@ mod tests {
     /// passed as which argument, and the `Host` — was not, so forcing
     /// `Host::Panel` at the call site kept the suite green while a standalone
     /// client working from a stale tool list reached `propose_table_change`.
+    /// `search_objects` reads the catalogue, so *Schema context: None* withholds
+    /// it as it does `list_schema` — a name search is an existence oracle over
+    /// exactly what that setting publishes none of. It reads no rows, so the
+    /// data level does not.
+    #[tokio::test]
+    async fn search_objects_is_a_schema_tool_and_not_a_data_one() {
+        let tool = McpTool::SearchObjects;
+        assert!(tool.reads_schema() && !tool.reads_row_data() && tool.read_only());
+        let ep = unreachable(false, false, super::Host::Standalone);
+        assert_eq!(
+            call(&ep, "search_objects", r#"{"query":"cust"}"#).await,
+            (super::NO_SCHEMA_ACCESS.to_string(), true)
+        );
+        // Offered at the lowest data level, refused only for want of a query —
+        // before anything is dialled.
+        let ep = unreachable(false, true, super::Host::Standalone);
+        let (text, err) = call(&ep, "search_objects", r#"{"query":"  "}"#).await;
+        assert!(err && text.contains("needs a `query`"), "{text}");
+    }
+
     #[tokio::test]
     async fn a_standalone_call_to_a_withheld_tool_is_refused_by_the_server() {
         let ep = unreachable(false, true, super::Host::Standalone);
@@ -2313,6 +2505,101 @@ mod tests {
             vec!["archive".to_string()]
         );
         assert!(listed_databases(vec!["archive".to_string()], &hidden, Some("shop")).is_empty());
+    }
+
+    /// `search_objects` matches table and view names case-insensitively, as
+    /// Find Anywhere does, and qualifies them as `list_schema` would.
+    #[test]
+    fn a_search_names_the_matching_tables_and_views_per_database() {
+        let mut view = tbl("v_customers", vec![]);
+        view.is_view = true;
+        let dbs = vec![
+            (
+                "shop".to_string(),
+                Ok(DbSchema {
+                    tables: vec![tbl("Customers", vec![]), tbl("orders", vec![]), view],
+                    ..Default::default()
+                }),
+            ),
+            (
+                "hr".to_string(),
+                Ok(DbSchema {
+                    tables: vec![tbl("staff", vec![])],
+                    ..Default::default()
+                }),
+            ),
+            ("locked".to_string(), Err("access denied".to_string())),
+        ];
+        let out = format_search_hits("CUST", &dbs, false);
+        assert!(
+            out.contains("## shop\n- Customers\n- v_customers (view)\n"),
+            "{out}"
+        );
+        assert!(!out.contains("orders"), "{out}");
+        assert!(
+            !out.contains("## hr"),
+            "a database with no hit is left out: {out}"
+        );
+        assert!(out.contains("## locked (error: access denied)"), "{out}");
+        assert!(out.contains("(2 matches)"), "{out}");
+    }
+
+    /// Given one database, the search reaches its columns too — after the
+    /// object names, the order Find Anywhere searches in.
+    #[test]
+    fn a_search_of_one_database_also_names_matching_columns() {
+        let dbs = vec![(
+            "shop".to_string(),
+            Ok(DbSchema {
+                tables: vec![
+                    tbl("orders", vec![c("customer_id", "int", false, false)]),
+                    tbl("customers", vec![c("id", "int", false, true)]),
+                ],
+                ..Default::default()
+            }),
+        )];
+        let out = format_search_hits("customer", &dbs, true);
+        let tables = out.find("- customers\n").expect("the table");
+        let column = out.find("- orders.customer_id\n").expect("the column");
+        assert!(tables < column, "{out}");
+        assert!(out.contains("(2 matches)"), "{out}");
+        assert!(
+            !format_search_hits("customer", &dbs, false).contains("customer_id"),
+            "columns only when they were read"
+        );
+    }
+
+    #[test]
+    fn a_search_that_finds_nothing_says_so_and_where_it_looked() {
+        let dbs = vec![("shop".to_string(), Ok(DbSchema::default()))];
+        let out = format_search_hits("zzz", &dbs, false);
+        assert!(
+            out.starts_with("No table or view name contains \"zzz\""),
+            "{out}"
+        );
+        assert!(out.contains("1 database"), "{out}");
+    }
+
+    /// A long hit list stops at the row cap and says so, rather than spending
+    /// the model's context on every `log_*` table of a fifty-database server.
+    #[test]
+    fn a_search_stops_at_the_cap_and_says_so() {
+        let tables = (0..MCP_ROW_CAP + 5)
+            .map(|i| tbl(&format!("log_{i}"), vec![]))
+            .collect();
+        let dbs = vec![(
+            "shop".to_string(),
+            Ok(DbSchema {
+                tables,
+                ..Default::default()
+            }),
+        )];
+        let out = format_search_hits("log", &dbs, false);
+        assert_eq!(out.matches("\n- log_").count(), MCP_ROW_CAP, "{out}");
+        assert!(
+            out.contains(&format!("({MCP_ROW_CAP}+ matches, capped)")),
+            "{out}"
+        );
     }
 
     #[test]

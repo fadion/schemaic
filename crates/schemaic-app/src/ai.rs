@@ -3342,20 +3342,21 @@ fn render_ai_context(
     // change the connection's setting" instead of apologising vaguely.
     let tools_line = match data {
         AiData::Full => {
-            "You can inspect the live schema with the list_schema and describe_table tools \
-             (describe_table gives one table's DDL, foreign keys, and sample rows) and run \
+            "You can inspect the live schema with the list_schema, search_objects and \
+             describe_table tools (search_objects finds tables and columns by part of their \
+             name; describe_table gives one table's DDL, foreign keys, and sample rows) and run \
              read-only queries (a single SELECT/SHOW/DESCRIBE/EXPLAIN/WITH statement) with the \
              run_query tool. Use them when they help you answer."
         }
         AiData::OnRequest => {
-            "You can inspect the live schema with the list_schema and describe_table tools, but \
-             you cannot read any data: this connection is set to send rows only when the user \
+            "You can inspect the live schema with the list_schema, search_objects and \
+             describe_table tools, but you cannot read any data: this connection is set to send rows only when the user \
              attaches them. describe_table omits its sample rows. When you need values, say so \
              — the user can select rows in the result grid and attach them to a question."
         }
         AiData::SchemaOnly => {
-            "You can inspect the live schema with the list_schema and describe_table tools. \
-             This connection sends no data at all — no queries, no sample rows, and the user \
+            "You can inspect the live schema with the list_schema, search_objects and \
+             describe_table tools. This connection sends no data at all — no queries, no sample rows, and the user \
              cannot attach rows either. Answer from the schema and your knowledge, and say \
              plainly when a question needs data you cannot have."
         }
@@ -3384,7 +3385,8 @@ fn render_ai_context(
     // `render_inline_prompt` writes for the same setting.
     let schema_section = if scope == SchemaScope::None {
         "The user has set Schema context to None, so you are given no database structure and \
-         the list_schema and describe_table tools are unavailable. Ask them for the table and \
+         the list_schema, search_objects and describe_table tools are unavailable. Ask them \
+         for the table and \
          column names you need; they can also raise the setting in AI settings.\n"
             .to_string()
     } else {
