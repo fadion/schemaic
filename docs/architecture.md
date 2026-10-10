@@ -21687,7 +21687,10 @@ existing prose was left alone.
     it.
     **Three ways in, and the modal opens empty.** A pasted *Connection URL* at the top, then
     *Choose a file…* and *Scan installed clients* beneath it, then — only once one of them has
-    produced something — the review list. Opening does **not** scan: the walk reads the user's home
+    produced something — the review list. *Scan installed clients* wears the `Primary` fill beside
+    the file button's `Quiet` one, since it is what most people come for (GitHub #18); the footer's
+    Import, the other `Primary`, stays disabled until something is chosen, so the two never compete
+    on an empty dialog. Opening does **not** scan: the walk reads the user's home
     directory, and a dialog that goes through it because it was opened is doing something nobody
     asked for. The three sources all append through the app's one `add_import_result`, so a scan
     cannot discard a URL pasted before it and the three cannot disagree about ticking or about

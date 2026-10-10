@@ -234,6 +234,11 @@ fn row_of_buttons(
         ),
         // Disabled *while* a scan is out, so a second press can't queue a second
         // walk whose result would land on top of the first's.
+        //
+        // **Primary, not Quiet like Choose a file** (GitHub #18): finding the
+        // clients already installed is what most people open this dialog for,
+        // so it wears the accent fill. It does not compete with the footer's
+        // Import, which is disabled until something has been chosen.
         dyn_container(
             move || scanning.get(),
             move |busy| {
@@ -245,7 +250,7 @@ fn row_of_buttons(
                         "Scan installed clients"
                     },
                     icons::SEARCH,
-                    ActionKind::Quiet,
+                    ActionKind::Primary,
                     !busy,
                     ring,
                     TAB_SCAN,
