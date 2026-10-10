@@ -2600,7 +2600,7 @@ fn object_row(
         move |s| {
             // `level_indent()` is multiplied *inside* the closure, so the length
             // follows the scale — carrying it in as pixels is what froze it.
-            let s = tree_row(s, col_pad() + level_indent() * indent_levels as f64);
+            let s = tree_row(s, leaf_icon_pad(indent_levels));
             if is_nav_selected(nav, &hl) {
                 s.background(theme::row_selected())
             } else {
@@ -2951,7 +2951,8 @@ fn count_row(cols: usize, keys: usize, indent_levels: u32) -> impl IntoView {
     .style(move |s| {
         s.flex_row()
             .gap(theme::scaled(5.0))
-            .padding_left(leaf_pad() + level_indent() * indent_levels as f64)
+            // Under the column icons, not the table's label (GitHub #24).
+            .padding_left(leaf_icon_pad(indent_levels))
             .margin_top(theme::scaled(6.0))
             .margin_bottom(theme::scaled(6.0))
     })
@@ -3081,7 +3082,7 @@ fn column_row(
         move |s| {
             // `level_indent()` is multiplied *inside* the closure, so the length
             // follows the scale — carrying it in as pixels is what froze it.
-            let s = tree_row(s, col_pad() + level_indent() * indent_levels as f64);
+            let s = tree_row(s, leaf_icon_pad(indent_levels));
             if is_nav_selected(nav, &hl) {
                 s.background(theme::row_selected())
             } else {
@@ -3177,7 +3178,7 @@ fn key_row(
     // and while it is open it says so.
     .style(move |s| {
         menu_mark(
-            tree_row_static(s, col_pad() + level_indent() * indent_levels as f64),
+            tree_row_static(s, leaf_icon_pad(indent_levels)),
             nav,
             &mark_key,
         )
@@ -3284,6 +3285,18 @@ fn tree_row_min_w() -> f64 {
 // If this is reopened, reopen it with a **profile of the app**, not a re-reading
 // of the closure: the reads are not what costs, and the number above is what has
 // to be beaten.
+/// Where a table's children start: the left padding of a column row, a key row,
+/// and the "N cols · M keys" capsules above them — the x of the column's type
+/// icon, one `level_indent` right of the table's glyph. One function, because
+/// the capsules padded by `leaf_pad` instead (under the table's *label*) and sat
+/// aligned with neither the icons nor the names (GitHub #24).
+///
+/// Call it inside the style closure: `level_indent()` follows the scale, and a
+/// value carried in as pixels froze at the scale the row was built at.
+fn leaf_icon_pad(indent_levels: u32) -> f64 {
+    col_pad() + level_indent() * indent_levels as f64
+}
+
 fn tree_row(s: floem::style::Style, pad_left: f64) -> floem::style::Style {
     tree_row_static(s, pad_left).hover(|s| s.background(theme::row_hover()))
 }

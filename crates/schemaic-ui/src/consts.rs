@@ -111,8 +111,11 @@ pub(crate) fn row_pad() -> f64 {
 pub(crate) fn level_indent() -> f64 {
     scaled(16.0)
 }
-/// Left padding of leaf rows (columns / keys / count capsules): aligned under
-/// the parent table's *label* — table row pad + chevron + gap + glyph + gap.
+/// Left padding of the status lines with no icon of their own under a node —
+/// *Loading*, an empty or error note, *Single-user — not read*: aligned under
+/// the parent's *label* — row pad + chevron +
+/// gap + glyph + gap. A table's columns, keys and count capsules start at
+/// [`col_pad`] instead, the column icon's x (`schema_tree::leaf_icon_pad`).
 /// (Aligning under the glyph left the leaves hanging left of the table name;
 /// this tracks the label so tuning `chevron_gap` alone can't un-indent them.)
 ///
