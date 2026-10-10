@@ -21412,6 +21412,25 @@ existing prose was left alone.
     in `text_faint` at `font_label`) is the one heading both lists draw: this one and the header's
     `conn_menu_overlay`, which iterates `listed_rows` the same way and looks each connection up by
     id. It is deliberately not a pointer or a keyboard stop — it names a group, it does nothing.
+    **New creates the connection; it does not merely clear the form.** `new_conn` blanks the shared
+    `DraftSignals`, names it a unique *New connection N* with a distinct colour, mints its id through
+    `Connection::next_id_after`, pushes it, persists (`Saving::Replacing`) and selects it by setting
+    `draft.id` — the create, persist, select shape `duplicate_conn` already had. It used to stop at
+    the reset and leave `draft.id` at `None`, listed nowhere until Save, and a New that changed only
+    what was in the inputs read as a button that did nothing (issue #6). It deliberately does **not**
+    load the schema: the blank form points at 127.0.0.1 with no user, and connecting there is an
+    error nobody asked for. Until it is saved its id sits in the app's `unsaved_new`, which is how a
+    first-run import knows the active connection is a blank standing in for nothing (see *A first
+    launch saves nothing and selects nothing* below). Then it raises `DraftSignals::focus_name`, a
+    request rather than form state, which `conn_form` answers in an effect created *after* the Name
+    field — so the pulse it sends lands on Name's own effect once that has taken its first reading.
+    The answer clears the flag, scrolls the form to the top through a `scroll_to` signal cleared on
+    the next tick (the sticky-`scroll_to` trap), and pulses Name's `FieldCfg::caret_end`, so the
+    keyboard lands there with the caret after the default name; Name is `field` spelled out inline
+    for that one addition.
+    **A flag, not a pulse**, because the header's first-run button calls `new_conn` and only then
+    opens the modal: a flag left standing is answered by the form that build creates, as well as by
+    a form already up when New is clicked.
     **The mask is replayed from the editor's own delta, never diffed out of the buffer.** The
     document holds `MASK_CH` throughout, so comparing the text before and after an edit cannot tell
     a mask character the *user* typed from one that was already there — and the ambiguity was not
@@ -27331,11 +27350,22 @@ existing prose was left alone.
     only made the next launch write it back. It is gone; the empty list stands, and the header's
     button is what that state offers. `Connection::startup_active_id(saved, &connections)` picks the
     active id — the saved one while it still names a connection, else the first, else
-    `next_id(&[])`, **the id the first connection saved this session will take**, because
+    `next_id(&[])`, **the id the first connection created this session will take**, because
     `save_conn` loads the schema for a connection only when it is the active one and a new user's
-    first connection should connect on save rather than wait to be selected. That last arm was
+    first connection should connect on save rather than wait to be selected. New now persists that
+    connection on the press, blank and unconnected, so it is still the first Save — the one that
+    fills in a real server — that connects it. That last arm was
     unreachable while the seed existed and read `unwrap_or(1)`; the number is the same and the
-    coupling to `next_id` is the part under test.
+    coupling to `next_id` is the part under test. `import_chosen` is the second creator and asks
+    the same question: when the active id names nothing (`was_dangling`) the first imported
+    connection takes it, so the import loads its schema and calls `reset_activity` itself.
+    Persisting New on the press broke that check — the header's first-run button lists a blank
+    *New connection 1* under that very id, so the id no longer dangles, and a new user's imported
+    servers never connected. So `new_conn` records the id it minted in `unsaved_new` until
+    `save_conn` saves it, and an import while the active id is still that blank (`on_unsaved_new`)
+    calls `switch_conn` on the first id it added — a switch rather than the dangling path's two
+    calls, because here the active id *moves* and the tab strip, the expansion set and the persisted
+    active id have to follow it. The blank stays listed, as the user's to delete.
     **`Connection::rebind_tab(saved, &known, fallback)` is the same question for a restored *tab*,
     and an empty list is deliberately not the same answer.** The saved id wins while it names a
     connection; when it does not, the tab's connection was deleted and the tab moves to the
@@ -27350,14 +27380,15 @@ existing prose was left alone.
     silently re-pointed at someone else's server is not.
     The header's **connection trigger** is one slot with two occupants, chosen by
     `connections.is_empty()`: the switcher normally, and on a first run with nothing saved a
-    `New connection` button in the accent that drafts a connection and opens Manage Connections in
-    one press. With nothing saved there is nothing to switch *between* — the switcher reads "No
+    `New connection` button in the accent that creates a connection (`new_conn`, under
+    `connection_form.rs`) and opens Manage Connections in one press. With nothing saved there is nothing to switch *between* — the switcher reads "No
     connection" and its menu puts the only action a first run has three clicks down (open the menu,
     Manage Connections, New connection), which is a funnel with no traffic at the top. The test is
     "none saved", not "none active": a user with connections and no active one still wants the
     switcher, since choosing is what it is for. Both wear `switcher_chrome`, shared rather than
     spelled twice **because they swap in and out of the same slot** — a margin or radius that
-    differed would show as the header twitching the moment the first connection is saved. The
+    differed would show as the header twitching the moment the first connection exists — which,
+    New persisting at once, is the very press on the button. The
     caller sets the border colour (the active connection's identity colour, or the accent) and may
     re-state the horizontal padding: the button does (9px/10px against 11px/7px), because its
     content is the switcher's mirrored — glyph leading, label trailing — so the plus carries its own

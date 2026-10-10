@@ -3557,6 +3557,11 @@ pub struct DraftSignals {
     /// engine, like `file`, so switching the picker away and back does not
     /// lose it; the connection reads it through `effective_auth`.
     pub auth: RwSignal<AuthMode>,
+    /// A request, not form state: New sets it, and the form answers it by
+    /// scrolling back to the top and focusing Name, then clears it. A flag
+    /// rather than a pulse, so a New that *opens* the modal is answered by the
+    /// form it builds as well as one clicked while the form is already up.
+    pub focus_name: RwSignal<bool>,
 }
 
 impl DraftSignals {
@@ -3591,6 +3596,7 @@ impl DraftSignals {
             ai_data: cx.create_rw_signal(AiData::default()),
             folder: cx.create_rw_signal(String::new()),
             auth: cx.create_rw_signal(AuthMode::default()),
+            focus_name: cx.create_rw_signal(false),
         }
     }
 

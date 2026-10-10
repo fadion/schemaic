@@ -1763,11 +1763,48 @@ fn conn_form(
     // Name + Colour sit closer together (20px) than the rest of the form (25px).
     // The swatch row is one Tab stop, between Name and the toggles below it —
     // a radio group, so Left/Right walk it once the keyboard is there.
-    let name_color = v_stack((
-        field("Name", draft.name, ring.clone(), 10),
-        color_picker(draft.color, ring.clone(), 15),
+    //
+    // Name is `field` spelled out for the one thing it adds: `focus_pulse`,
+    // which `edit_field` answers by focusing the field with the caret after the
+    // default name (`FieldCfg::caret_end`).
+    let focus_pulse = RwSignal::new(0u64);
+    let name_field = v_stack((
+        text("Name").style(form_label_style),
+        edit_field(
+            draft.name,
+            FieldCfg {
+                focus: Some((ring.clone(), 10)),
+                caret_end: Some(focus_pulse),
+                ..Default::default()
+            },
+        )
+        .style(|s| s.width_full()),
     ))
-    .style(|s| s.flex_col().gap(theme::scaled(20.0)).width_full());
+    .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full());
+    let name_color = v_stack((name_field, color_picker(draft.color, ring.clone(), 15)))
+        .style(|s| s.flex_col().gap(theme::scaled(20.0)).width_full());
+
+    // **Answer New's request** (`DraftSignals::focus_name`): back to the top of
+    // the form, and the keyboard into Name. After Name is built, so the pulse
+    // lands on an effect that has already taken its first reading — which is
+    // what lets a New that opened the modal be answered by this build too.
+    // The scroll target is cleared on the next tick: a `scroll_to` left
+    // standing re-applies on every layout pass, and the form would refuse to
+    // scroll away from the top.
+    let to_top: RwSignal<Option<floem::kurbo::Point>> = RwSignal::new(None);
+    create_effect(move |_| {
+        if !draft.focus_name.get() {
+            return;
+        }
+        draft.focus_name.set(false);
+        to_top.set(Some(floem::kurbo::Point::ZERO));
+        focus_pulse.update(|n| *n = n.wrapping_add(1));
+        floem::action::exec_after(std::time::Duration::ZERO, move |_| {
+            if to_top.try_get_untracked().is_some() {
+                to_top.set(None);
+            }
+        });
+    });
 
     // Folder: a heading this connection lists under, in the header's connection
     // menu and the list on the left. Free text — a folder is only its name, and
@@ -1987,7 +2024,8 @@ fn conn_form(
     });
 
     v_stack((
-        autohide(scroll(fields)).style(|s| s.flex_grow(1.0_f32).width_full().min_height(0.0)),
+        autohide(scroll(fields).scroll_to(move || to_top.get()))
+            .style(|s| s.flex_grow(1.0_f32).width_full().min_height(0.0)),
         buttons,
     ))
     .style(|s| s.flex_grow(1.0_f32).height_full().flex_col().min_width(0.0))

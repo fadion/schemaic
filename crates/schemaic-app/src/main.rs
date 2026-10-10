@@ -9949,27 +9949,57 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         }
     });
 
-    // Start editing a brand-new connection: a blank form with a unique default
-    // name. NOT persisted until the user clicks Save.
+    // Create a brand-new connection from the blank form — a unique default name
+    // and a distinct colour — persist it, and select it, so it is in the list
+    // (and the header's switcher) from the click rather than from the first
+    // Save. A New that only reset the form read as a button that did nothing
+    // until the user went looking at the inputs (issue #6).
+    //
+    // **Persisted, not connected.** Nothing loads the schema here: a blank form
+    // points at 127.0.0.1 with no user, and connecting to that is an error the
+    // user did not ask for. On a fresh install the id minted below is the one
+    // `startup_active_id` already made active, so it is the first Save — the
+    // one that fills in a real server — that `save_conn` connects, as before.
+    //
+    // `unsaved_new` remembers the id until `save_conn` saves it: on a first run
+    // that blank is the *active* connection, and the import needs to know it is
+    // standing in for nothing (see `import_chosen`).
+    let unsaved_new: RwSignal<Option<u64>> = RwSignal::new(None);
     let new_conn: Rc<dyn Fn()> = Rc::new(move || {
-        let existing: Vec<String> =
-            connections.with_untracked(|cs| cs.iter().map(|c| c.name.clone()).collect());
-        let used_colors: Vec<String> =
-            connections.with_untracked(|cs| cs.iter().filter_map(|c| c.color.clone()).collect());
+        let (existing, used_colors, id) = connections.with_untracked(|cs| {
+            (
+                cs.iter().map(|c| c.name.clone()).collect::<Vec<_>>(),
+                cs.iter()
+                    .filter_map(|c| c.color.clone())
+                    .collect::<Vec<_>>(),
+                Connection::next_id_after(cs, highest_conn_id.get_untracked()),
+            )
+        });
         draft.blank();
         draft.name.set(unique_name("New connection", &existing));
         // Auto-assign a distinct identity colour (the user can change it below).
         draft.color.set(Some(pick_connection_color(&used_colors)));
+        let conn = draft.to_connection(id);
+        connections.update(|cs| cs.push(conn));
+        draft.id.set(Some(id));
+        unsaved_new.set(Some(id));
+        persist_conns(
+            Some(active_conn.get_untracked()),
+            persist::Saving::Replacing,
+        );
+        // The form scrolls back to the top and puts the caret in Name — the
+        // one field a new connection is certain to want changed.
+        draft.focus_name.set(true);
     });
 
     // Duplicate a saved connection: same server, new identity, selected in the
     // form so the one thing the copy is missing — what makes it different — is
     // where the cursor already is.
     //
-    // Persisted at once, unlike New, which leaves an unsaved draft. The copy's
-    // whole value is the credentials it carries, and those only reach the
-    // keyring through a save; a duplicate that evaporates when the user clicks
-    // another row would have saved them nothing.
+    // Persisted at once, as New is. The copy's whole value is the credentials
+    // it carries, and those only reach the keyring through a save; a duplicate
+    // that evaporates when the user clicks another row would have saved them
+    // nothing.
     let duplicate_conn: Rc<dyn Fn(u64)> = {
         let select_conn = select_conn.clone();
         Rc::new(move |id: u64| {
@@ -10259,6 +10289,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let import_chosen: Rc<dyn Fn()> = {
         let load_schema = load_schema.clone();
         let reset_activity = reset_activity.clone();
+        let switch_conn = switch_conn.clone();
         Rc::new(move || {
             let picked: Vec<Connection> = import_ui.rows.with_untracked(|rows| {
                 import_ui.chosen.with_untracked(|chosen| {
@@ -10285,6 +10316,15 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // servers) ends with an empty schema tree and "Not connected".
             let active = active_conn.get_untracked();
             let was_dangling = connections.with_untracked(|cs| !cs.iter().any(|c| c.id == active));
+            // **Or at a blank New made and nobody has saved?** The same state
+            // in a different shape since New persists on the press: the first-run
+            // header button creates *New connection 1* under the very id above,
+            // so the list is no longer missing it — but it is 127.0.0.1 with no
+            // user, standing in for nothing, and the import is what the user did
+            // instead of filling it in. The first imported connection becomes
+            // the active one; the blank stays listed, as the user's to delete.
+            let on_unsaved_new = unsaved_new.get_untracked() == Some(active);
+            let mut first_added = None;
             connections.update(|cs| {
                 for conn in picked {
                     let names: Vec<String> = cs.iter().map(|c| c.name.clone()).collect();
@@ -10294,6 +10334,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     // `cs` grows as this loop pushes, so the maximum moves with
                     // it; the high-water mark only bounds it from below.
                     conn.id = Connection::next_id_after(cs, highest_conn_id.get_untracked());
+                    first_added.get_or_insert(conn.id);
                     conn.name = unique_name(&conn.name, &names);
                     conn.color = Some(pick_connection_color(&used_colors));
                     // The same sanitising a saved form goes through: a SQLite row
@@ -10310,6 +10351,12 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             {
                 load_schema(conn);
                 (reset_activity)();
+            }
+            // `switch_conn` rather than the two calls above: the active id
+            // *moves* here, so the tab strip, the expansion set and the saved
+            // active id have to follow it, and the switch is what does all of it.
+            if on_unsaved_new && let Some(id) = first_added {
+                (switch_conn)(id);
             }
             // The list behind this modal has just grown, so the imported rows must
             // stop offering themselves: re-marking is cheaper and more honest than
@@ -10375,6 +10422,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 }
             });
             draft.id.set(Some(id));
+            if unsaved_new.get_untracked() == Some(id) {
+                unsaved_new.set(None);
+            }
             persist_conns(
                 Some(active_conn.get_untracked()),
                 persist::Saving::Replacing,
