@@ -24917,7 +24917,7 @@ existing prose was left alone.
     positions for either edge ever reaching past a margin.
     **The same tip is a name's quick-info**, and Ctrl+click opens what the name names — both over
     `core::quickinfo`. `DiagHit` carries `name_at: Option<usize>`: where `diag_under` finds no
-    squiggle, `hover_diag` asks `name_box_at`, which undoes `content_x`, `EDITOR_PAD_TOP` and the
+    squiggle, `hover_diag` asks `name_box_at`, which undoes `content_x`, `EDITOR_TEXT_TOP` and the
     viewport to reach a document point, takes `Editor::offset_of_point` only when that lands inside
     the text, and boxes the run of word bytes on the line — so a diagnostic on the same word wins.
     It runs on every pointer move and so reads nothing document-sized: the code column comes from
@@ -25303,7 +25303,19 @@ existing prose was left alone.
     `gutter_right_padding(GUTTER_RIGHT_PAD)`) because `content_x` adds them up: drop the left call
     and the gutter falls back to floem's 25 while the sum keeps 14; the right one equals floem's
     default of 30 today, and is set all the same so the sum reads the app's number, not upstream's.
-    The font size is a reactive read, so `content_x` inside a style closure moves with a zoom.
+    The font size is a reactive read, so `content_x` inside a style closure, a memo or a
+    `dyn_container` *key* moves with a zoom — and inside a `dyn_container` *builder* does not, floem
+    0.2 calling the builder untracked (the builder-freeze gotcha). The bracket and occurrence boxes
+    took `let cx = content_x(&ed)` there, and the statement border computed its whole
+    `statement_line_boxes` there, so a zoom left all three where it found them until the caret moved
+    (GitHub #20). The two box lists now read a `code_x` memo built *beside* their `dyn_container` —
+    still once per change rather than once per box, so `no_overlay_builder_derives_the_code_column_per_element`
+    holds — and the statement border's key *is* its boxes, `highlight.get().map(|(lo, hi)|
+    statement_line_boxes(..))`, so the font, the line geometry and the scroll all rebuild them. That
+    last part is the trade: the border now follows a scroll as well, by rebuilding its few boxes on
+    every scroll frame while it is up. `no_overlay_freezes_its_geometry_in_an_untracked_builder`
+    refuses a `content_x(` or `statement_line_boxes(` after the builder's `move |` in those three
+    blocks, and only those three — it names them, so a fourth overlay is not covered.
     `the_code_column_follows_the_code_font_s_digit_width` and
     `the_code_column_widens_with_the_line_number_digit_count` pin the sum; `content_x_of` survives
     only under `#[cfg(test)]`, the geometry tests' fixed origin at a nominal 8px digit, and
@@ -25336,8 +25348,7 @@ existing prose was left alone.
     bar in the stack, so a tip raised under the run menu or the find bar paints over it, and
     `marks_pointer` (above) is what keeps it from being raised there.
     **The run outline marks what Ctrl+Enter would run before it is pressed** — a 4px bar set
-    back into the gutter (`content_x - HL_PAD - 12`, 11px clear of the code, and dropped 1px to sit
-    flush with the current-line band — a 2px bar hard
+    back into the gutter (`content_x - HL_PAD - 12`, 11px clear of the code — a 2px bar hard
     against it read as a caret), `theme::query_highlight()` at 0.6 alpha — a muted accent tint, not
     a red, which read as an error — beside the lines of `run_outline`'s range. An effect over the caret (`ed.cursor`),
     `query` and `dialect` recomputes it on every move and edit through the pure
@@ -25353,8 +25364,11 @@ existing prose was left alone.
     style closure so a zoom moves the bar), never from a copy of the text: the range's end follows
     the text, so the bar rebuilds on most keystrokes in a script, and `content_x_of(&query.get_untracked())`
     cost ~1 ms of each at 4 MiB. The run menu, the Ctrl+K band, the bracket boxes and the
-    occurrence boxes read it the same way (`no_overlay_copies_the_document_for_the_code_column`,
-    red before). `the_run_outline_marks_what_ctrl_enter_would_run` pins the range, and was red
+    occurrence boxes read it the same way, the last two through a memo beside their container
+    (`no_overlay_copies_the_document_for_the_code_column`, red before). Its top is
+    `EDITOR_TEXT_TOP` like every overlay's, with no nudge of its own: the `+ 1.0` it carried "to sit
+    flush with the current-line band" was the border pixel every overlay was missing (GitHub #9, the
+    *SQL editor padding* gotcha), and re-adding one now puts the bar a pixel low. `the_run_outline_marks_what_ctrl_enter_would_run` pins the range, and was red
     against a core without the blank-line cuts (under `sql.rs`). **It shares a slot with
     `highlight_view`**, the run menu's statement border, as `stack((highlight_view,
     run_outline_view))`, because `editor_area`'s tuple is at floem's 16: an `absolute().inset(0)`
@@ -33964,6 +33978,14 @@ Re-introducing the anti-patterns these guard against is a regression:
   per-file and per-signal on purpose: the general gate is still the one the paragraph above says
   cannot be written, and this is what a hand walk can leave behind so a swept file does not quietly
   reacquire the bug.
+  **"The only two" was wrong: `editor_pane.rs` held three more, none of them spelled as a read.**
+  The bracket and occurrence boxes computed `let cx = content_x(&ed)` in their builders and the Run
+  Current border computed `statement_line_boxes` in its; `content_x` reads the code font's size and
+  `statement_line_boxes` that and the viewport and the screen lines, all inside the helper, so the
+  builder shows a plain function call. A zoom left all three where it found them until the caret
+  moved (GitHub #20). The fix and its gate, `no_overlay_freezes_its_geometry_in_an_untracked_builder`,
+  are under `editor_pane.rs`'s code column. **A helper that reads a signal is a read**, wherever the
+  signal itself is spelled.
   **The rule both fixes are instances of: a *structural* choice that depends on a signal — which
   child is built — needs that signal in the container's key or a container of its own. Only a
   choice about *style* may be left to a `.style()` closure**, which floem does re-run. The chevron
@@ -34040,11 +34062,19 @@ Re-introducing the anti-patterns these guard against is a regression:
   `padding_*` is ignored. Wrap it in a container carrying the border + padding (`editor_box`); the
   editor fills it flush. Top padding shifts the content origin, so `points_of_offset`-anchored
   overlays (completion popup, statement highlight, squiggles, Ctrl+K's question bar and verdict
-  footer, run menu) each add back `EDITOR_PAD_TOP` to their `y`. **Ctrl+K's *diff* is not on that
+  footer, run menu) each add back **`EDITOR_TEXT_TOP`** to their `y`, and `pointer_offset` takes it
+  back off a pointer. That is `1.0 + EDITOR_PAD_TOP` — `editor_box`'s 1px border *and* its padding,
+  because `editor_area`, the space every overlay is placed in, is the border box. Every overlay
+  used to add `EDITOR_PAD_TOP` alone and sat a pixel above its text, and the run outline hid it
+  with a hand-tuned `+ 1.0` of its own (GitHub #9); `EDITOR_PAD_TOP` is now only `editor_box`'s
+  `padding_top`, and the custom scrollbars' `ESBAR_TOP` is `EDITOR_TEXT_TOP` too.
+  `an_overlay_starts_below_the_border_and_the_padding_both` pins the occurrence box, the squiggle
+  hover box and the statement highlight against a literal `1.0 + 5.0`, so the constant redefined
+  as the padding alone fails it. **Ctrl+K's *diff* is not on that
   list and is not an overlay at all** — it is phantom rows inside the editor's own line flow
   (`inline_diff`), so it is laid out, scrolled and padded as text; only the bar above it and the
   footer below it are anchored, and the footer's `y` comes from `inline_footer_y`, which adds
-  `EDITOR_PAD_TOP` like the rest. The built-in scrollbars float at the *content* edge (can only inset
+  `EDITOR_TEXT_TOP` like the rest. The built-in scrollbars float at the *content* edge (can only inset
   inward), so they're **replaced with custom overlay scrollbars** (`v_scrollbar`/`h_scrollbar` in
   `editor_area`): built-in bars hidden (zero-`Thickness` + transparent `Handle`), two `empty()`
   thumbs pinned to the border (`inset_right/bottom(3)`) with `autohide_state()`. Geometry from
@@ -34966,7 +34996,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   (under `completion.rs`).
 - **`Editor::points_of_offset` returns *content* coords, not viewport-relative** (`.y` is `vline_y`,
   the absolute document y; the gutter view subtracts `viewport.y0` itself). Overlays pinned in
-  `editor_area` must subtract `ed.viewport.get()` `x0`/`y0` to follow scroll — see `span_box_at`
+  `editor_area` must subtract `ed.viewport.get()` `x0`/`y0` to follow scroll, and add
+  `EDITOR_TEXT_TOP` (the border and the padding — the *SQL editor padding* bullet) to `y` — see `span_box_at`
   (bracket matching, identifier occurrences), `underline_seg_at`, `statement_line_boxes_at`, all
   tested against a scrolled viewport. The caret-anchored popups do it one step later:
   `completion::set_anchor` stores the caret line in content coords and

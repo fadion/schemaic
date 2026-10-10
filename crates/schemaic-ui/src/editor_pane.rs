@@ -1866,7 +1866,7 @@ fn run_menu_pos(anchor: Point, menu: (f64, f64), content_x: f64, vp: Rect) -> Po
     let flipped = if x + menu_w > fold { x - menu_w } else { x };
     Point::new(
         flipped.min(fold - menu_w).max(0.0),
-        y.min(EDITOR_PAD_TOP + vp.height() - menu_h).max(0.0),
+        y.min(EDITOR_TEXT_TOP + vp.height() - menu_h).max(0.0),
     )
 }
 
@@ -2044,8 +2044,8 @@ fn cmdk_anchor_at(
     vp_y0: f64,
 ) -> Point {
     match points(end).or_else(|| points(caret)) {
-        Some((_, below)) => Point::new(below.x, below.y + EDITOR_PAD_TOP),
-        None => Point::new(0.0, vp_y0 + EDITOR_PAD_TOP),
+        Some((_, below)) => Point::new(below.x, below.y + EDITOR_TEXT_TOP),
+        None => Point::new(0.0, vp_y0 + EDITOR_TEXT_TOP),
     }
 }
 
@@ -2156,7 +2156,7 @@ fn inline_footer_y(
             * f64::from(ed.line_height(hunk.anchor));
         t
     };
-    let y = top.y + EDITOR_PAD_TOP - vp_y;
+    let y = top.y + EDITOR_TEXT_TOP - vp_y;
     // Off screen when the block has scrolled out of the pane. The bar is placed by
     // line geometry against an editor that scrolls under it, so without this it
     // rides up over the toolbar and the tab strip — it is absolutely positioned in
@@ -2248,7 +2248,7 @@ fn inline_band_runs(ed: &Editor, preview: inline_diff::InlinePreview) -> Vec<(f6
             return None;
         }
         let (top, _) = points(rope.offset_of_line(line))?;
-        Some(top.y + EDITOR_PAD_TOP - vp_y)
+        Some(top.y + EDITOR_TEXT_TOP - vp_y)
     };
     let mut rows = Vec::new();
     // The lines on screen, so the walk below is bounded by the viewport rather
@@ -2354,7 +2354,7 @@ fn span_box_at(
     }
     // The 4px floor keeps a zero-width span visible, but never past the fold.
     let w = (right - left).max(4.0).min(vis_hi - left);
-    let y = top.y + EDITOR_PAD_TOP - vp.y0;
+    let y = top.y + EDITOR_TEXT_TOP - vp.y0;
     Some((left, y, w, bot.y - top.y))
 }
 
@@ -2385,8 +2385,9 @@ fn underline_seg_at(
     }
     // Sit the wave ~2px below the glyphs (bot.y is the line's bottom; the
     // descenders end a few px above it, so drop the wave's top to just past them).
-    // +`EDITOR_PAD_TOP` for the editor's top padding, −`vp.y0` for the scroll.
-    let y = bot.y - WAVE_H + 2.0 + EDITOR_PAD_TOP - vp.y0;
+    // +`EDITOR_TEXT_TOP` for the editor's border and top padding, −`vp.y0` for
+    // the scroll.
+    let y = bot.y - WAVE_H + 2.0 + EDITOR_TEXT_TOP - vp.y0;
     Some((x0, y, (x1 - x0).max(2.0).min(vis_hi - x0)))
 }
 
@@ -2439,9 +2440,9 @@ fn name_box_at(ed: &Editor, p: Point) -> Option<DiagHit> {
     let (end, _) = points(hi)?;
     Some(DiagHit {
         x: cx + top.x - vp.x0,
-        top: top.y + EDITOR_PAD_TOP - vp.y0,
+        top: top.y + EDITOR_TEXT_TOP - vp.y0,
         w: end.x - top.x,
-        bottom: bot.y + EDITOR_PAD_TOP - vp.y0,
+        bottom: bot.y + EDITOR_TEXT_TOP - vp.y0,
         severity: Severity::Warning,
         message: String::new(),
         name_at: Some(lo),
@@ -2450,13 +2451,13 @@ fn name_box_at(ed: &Editor, p: Point) -> Option<DiagHit> {
 
 /// The document offset under `p` (in `editor_area` coords), and whether `p`
 /// is inside the text rather than past a line's end — `None` over the gutter.
-/// The inverse of the overlays' placement: the code column, the editor's top
-/// padding and the scroll undone. Reads nothing document-sized, as a pointer
-/// move asks it.
+/// The inverse of the overlays' placement: the code column, the editor's border
+/// and top padding ([`EDITOR_TEXT_TOP`]) and the scroll undone. Reads nothing
+/// document-sized, as a pointer move asks it.
 fn pointer_offset(ed: &Editor, p: Point) -> Option<(usize, bool)> {
     let cx = content_x(ed);
     let vp = ed.viewport.get_untracked();
-    let doc = Point::new(p.x - cx + vp.x0, p.y - EDITOR_PAD_TOP + vp.y0);
+    let doc = Point::new(p.x - cx + vp.x0, p.y - EDITOR_TEXT_TOP + vp.y0);
     if doc.x < 0.0 {
         return None;
     }
@@ -2508,7 +2509,7 @@ fn diag_hit_at(
 ) -> Option<(f64, f64, f64, f64)> {
     let (x, wave_y, w) = underline_seg_at(&points, content_x, lo, hi, vp)?;
     let (top, _) = points(lo)?;
-    Some((x, top.y + EDITOR_PAD_TOP - vp.y0, w, wave_y + WAVE_H))
+    Some((x, top.y + EDITOR_TEXT_TOP - vp.y0, w, wave_y + WAVE_H))
 }
 
 /// The diagnostic under `p`, if any. Where two overlap — the offline pass and
@@ -2781,7 +2782,7 @@ fn statement_line_boxes_at(
             // cost of reaching past the fold.
             let w = (x1 - x0).max(6.0).min(vis_hi - x0);
             if w > 0.0 {
-                boxes.push((x0, top.y + EDITOR_PAD_TOP - vp.y0, w, bot.y - top.y));
+                boxes.push((x0, top.y + EDITOR_TEXT_TOP - vp.y0, w, bot.y - top.y));
             }
         }
         match nl {
@@ -4126,7 +4127,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     // scroll rather than freezing where the caret was when it opened.
                     run_menu.set(Some(Point::new(
                         content_x(e) + below.x,
-                        below.y + 4.0 + EDITOR_PAD_TOP,
+                        below.y + 4.0 + EDITOR_TEXT_TOP,
                     )));
                     comp.open.set(false);
                 } else {
@@ -5784,7 +5785,8 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     // Wrapper owns the border, rounding, and ALL the breathing room — padding on
     // the editor view itself is ignored (its content scrolls under it), so the
     // insets must live here. The editor fills the padded content box; the top
-    // inset is the `EDITOR_PAD_TOP` const the overlays compensate against. Left
+    // inset is `EDITOR_PAD_TOP`, and the overlays compensate against it *and*
+    // the 1px border above it (`EDITOR_TEXT_TOP`). Left
     // has no padding (the gutter stays flush via `gutter_left_padding`). The custom
     // overlay scrollbars below are pinned to the border (not the content edge), so
     // this padding now cleanly separates the code from both the border and the bars.
@@ -5841,7 +5843,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         });
     }
     // Content top inside `editor_area`: 1px border + the top padding inset.
-    const ESBAR_TOP: f64 = 1.0 + EDITOR_PAD_TOP;
+    const ESBAR_TOP: f64 = EDITOR_TEXT_TOP;
     // Vertical bar geometry, shared by the style closure and the drag handler:
     // returns `(track_h, thumb_h, max_scroll)` for the current viewport/content, or
     // `None` when there's no vertical overflow.
@@ -6611,13 +6613,20 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
 
     let highlight_view = {
         let ed = ed_hl;
+        // The boxes are the **key**, not something the builder derives: the key
+        // closure is tracked, so the code column's font, the line geometry and
+        // the scroll it reads all rebuild the boxes. Derived in the builder —
+        // untracked in floem 0.2 — they stayed where a zoom found them until
+        // the caret moved (issue #20).
         dyn_container(
-            move || highlight.get(),
-            move |range| match range {
+            move || {
+                highlight.get().map(|(lo, hi)| {
+                    query.with_untracked(|sql| statement_line_boxes(sql, &ed, lo, hi))
+                })
+            },
+            move |boxes| match boxes {
                 None => empty().into_any(),
-                Some((lo, hi)) => {
-                    let sql = query.get_untracked();
-                    let boxes = statement_line_boxes(&sql, &ed, lo, hi);
+                Some(boxes) => {
                     v_stack_from_iter(boxes.into_iter().map(|(x, y, w, h)| {
                         empty().style(move |s| {
                             s.absolute()
@@ -6686,10 +6695,8 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                                     .absolute()
                                     // Set back into the gutter, 4px wide: hard
                                     // against the code, a 2px bar read as a caret.
-                                    // The 1px drop sits it flush with the
-                                    // current-line band.
                                     .inset_left(cx - HL_PAD - 12.0)
-                                    .inset_top(top + EDITOR_PAD_TOP - vp.y0 + 1.0)
+                                    .inset_top(top + EDITOR_TEXT_TOP - vp.y0)
                                     .width(4.0)
                                     .height(bot - top)
                                     .border_radius(2.0)
@@ -6710,19 +6717,23 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     // the visible code column so it can't paint outside the editor.
     let bracket_match_view = {
         let ed = ed_bm2;
+        // The code column, once per change rather than once per style-closure
+        // run — the two boxes' closures re-run on every scroll frame — and in a
+        // memo rather than the builder, so a zoom (the font size `content_x`
+        // reads) moves the boxes with the text. The rope's line count, never a
+        // copy of the text.
+        let code_x = {
+            let ed = ed.clone();
+            create_memo(move |_| content_x(&ed))
+        };
         dyn_container(
             move || bracket_match.get(),
             move |m| match m {
                 None => empty().into_any(),
                 Some(((p, p_end), (q, q_end))) => {
-                    // Once per rebuild, not once per style-closure run: the
-                    // two boxes' closures re-run on every scroll frame. The
-                    // rope's line count, never a copy of the text: this
-                    // rebuilds per keystroke while the caret sits by a bracket.
-                    let cx = content_x(&ed);
                     let (edp, edq) = (ed.clone(), ed.clone());
                     v_stack((
-                        empty().style(move |s| match span_box(cx, &edp, p, p_end) {
+                        empty().style(move |s| match span_box(code_x.get(), &edp, p, p_end) {
                             // Scrolled out of view: draw nothing rather than a
                             // box at the editor's origin.
                             None => s.hide(),
@@ -6736,7 +6747,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                                 .border_radius(2.0)
                                 .border_color(theme::bracket_match().multiply_alpha(0.5)),
                         }),
-                        empty().style(move |s| match span_box(cx, &edq, q, q_end) {
+                        empty().style(move |s| match span_box(code_x.get(), &edq, q, q_end) {
                             None => s.hide(),
                             Some((x, y, w, h)) => s
                                 .absolute()
@@ -6763,20 +6774,25 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     // each box reads the editor `viewport` (via `span_box`) so it tracks scroll.
     let occurrences_view = {
         let ed = ed_occ2;
+        // Once for the whole list. Each box's style closure re-runs on every
+        // scroll frame — N occurrences meant N full scans per frame — and the
+        // rope's line count costs no copy. A memo beside the `dyn_container`,
+        // not a `let` in its untracked builder, so a zoom moves the boxes with
+        // the text instead of leaving them where they were (issue #20).
+        let code_x = {
+            let ed = ed.clone();
+            create_memo(move |_| content_x(&ed))
+        };
         dyn_container(
             move || ident_occurrences.get(),
             move |ranges| {
                 if ranges.is_empty() {
                     return empty().into_any();
                 }
-                // Once for the whole list. Each box's style closure re-runs
-                // on every scroll frame — N occurrences meant N full scans
-                // per frame — and the rope's line count costs no copy.
-                let cx = content_x(&ed);
                 let ed = ed.clone();
                 v_stack_from_iter(ranges.into_iter().map(move |(lo, hi)| {
                     let ed = ed.clone();
-                    empty().style(move |s| match span_box(cx, &ed, lo, hi) {
+                    empty().style(move |s| match span_box(code_x.get(), &ed, lo, hi) {
                         // An occurrence scrolled out of view draws nothing —
                         // this is what produced stray boxes over unrelated text.
                         None => s.hide(),
@@ -8687,8 +8703,9 @@ mod geometry_tests {
         let cx = content_x_of(SQL);
         let (_, top, _, bottom) = diag_hit_at(at(36.0), cx, 30, 40, VP).unwrap();
         let (_, wave_y, _) = underline_seg_at(at(36.0), cx, 30, 40, VP).unwrap();
-        // The line's top, in editor_area coords: its document y plus the pad.
-        assert_eq!(top, 36.0 + EDITOR_PAD_TOP);
+        // The line's top, in editor_area coords: its document y plus the
+        // border and the pad.
+        assert_eq!(top, 36.0 + EDITOR_TEXT_TOP);
         assert_eq!(bottom, wave_y + WAVE_H);
         assert!(top < wave_y);
     }
@@ -8698,7 +8715,25 @@ mod geometry_tests {
         let cx = content_x_of(SQL);
         let scrolled = Rect::new(0.0, 100.0, 800.0, 280.0);
         let (_, top, _, _) = diag_hit_at(at(136.0), cx, 30, 40, scrolled).unwrap();
-        assert_eq!(top, 36.0 + EDITOR_PAD_TOP);
+        assert_eq!(top, 36.0 + EDITOR_TEXT_TOP);
+    }
+
+    /// **Every overlay placed by line starts where the line's text does**:
+    /// below `editor_box`'s 1px top border *and* its top padding, since
+    /// `editor_area` — the overlays' coordinate space — is the border box.
+    /// Counting the padding alone put the statement highlight, the occurrence
+    /// and bracket boxes, the squiggles and the run outline a pixel above their
+    /// text, and the run outline hid it with a nudge of its own (issue #9).
+    #[test]
+    fn an_overlay_starts_below_the_border_and_the_padding_both() {
+        const TEXT_TOP: f64 = 1.0 + 5.0;
+        let cx = content_x_of(SQL);
+        let (_, y, _, _) = span_box_at(at(36.0), cx, 30, 38, VP).unwrap();
+        assert_eq!(y, 36.0 + TEXT_TOP, "occurrence / bracket box");
+        let (_, top, _, _) = diag_hit_at(at(36.0), cx, 30, 40, VP).unwrap();
+        assert_eq!(top, 36.0 + TEXT_TOP, "squiggle hover box");
+        let (_, y, _, _) = statement_line_boxes_at(at(36.0), cx, SQL, 30, 38, VP)[0];
+        assert_eq!(y, 36.0 + TEXT_TOP, "statement highlight");
     }
 
     #[test]
@@ -9025,16 +9060,16 @@ mod geometry_tests {
         let both = |off: usize| placed_at(if off == 900 { 2100.0 } else { 2050.0 });
         assert_eq!(
             cmdk_anchor_at(both, 900, 40, VP_Y0),
-            Point::new(0.0, 2118.0 + EDITOR_PAD_TOP),
+            Point::new(0.0, 2118.0 + EDITOR_TEXT_TOP),
         );
 
         // The end is off screen, the caret is not — the bar goes to the caret,
-        // and emphatically not to `EDITOR_PAD_TOP` at the document origin,
+        // and emphatically not to `EDITOR_TEXT_TOP` at the document origin,
         // which is what the unfixed code returned here.
         let caret_only = |off: usize| (off == 40).then(|| placed_at(2050.0)).flatten();
         let p = cmdk_anchor_at(caret_only, 900, 40, VP_Y0);
-        assert_eq!(p, Point::new(0.0, 2068.0 + EDITOR_PAD_TOP));
-        assert_ne!(p, Point::new(0.0, EDITOR_PAD_TOP), "the document origin");
+        assert_eq!(p, Point::new(0.0, 2068.0 + EDITOR_TEXT_TOP));
+        assert_ne!(p, Point::new(0.0, EDITOR_TEXT_TOP), "the document origin");
 
         // Nothing placed at all (no layout yet) — the top of the *viewport*,
         // which is on screen, rather than the top of the document, which at
@@ -9042,7 +9077,7 @@ mod geometry_tests {
         let none = |_: usize| None;
         assert_eq!(
             cmdk_anchor_at(none, 900, 40, VP_Y0),
-            Point::new(0.0, VP_Y0 + EDITOR_PAD_TOP)
+            Point::new(0.0, VP_Y0 + EDITOR_TEXT_TOP)
         );
 
         // And the fallback is not blanket: with the end placed, the caret's
@@ -9050,7 +9085,7 @@ mod geometry_tests {
         let end_only = |off: usize| (off == 900).then(|| placed_at(2100.0)).flatten();
         assert_eq!(
             cmdk_anchor_at(end_only, 900, 40, VP_Y0),
-            Point::new(0.0, 2118.0 + EDITOR_PAD_TOP)
+            Point::new(0.0, 2118.0 + EDITOR_TEXT_TOP)
         );
     }
 
@@ -9560,6 +9595,44 @@ mod geometry_tests {
         }
     }
 
+    /// **Hoisted out of the boxes, but not into the builder.** A
+    /// `dyn_container` builder is untracked in floem 0.2, so geometry derived
+    /// there is frozen at whatever font size the editor had when the key last
+    /// changed: zooming left the occurrence boxes, the bracket boxes and the
+    /// Run Current box where they were until a caret move rebuilt them (issue
+    /// #20). The code column comes from a memo built beside the
+    /// `dyn_container`, the statement's boxes from its (tracked) key.
+    #[test]
+    fn no_overlay_freezes_its_geometry_in_an_untracked_builder() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("editor_pane.rs"),
+        )
+        .expect("editor_pane.rs");
+        let body = crate::source_gate::production_code(&src);
+        for view in [
+            "let highlight_view = {",
+            "let bracket_match_view = {",
+            "let occurrences_view = {",
+        ] {
+            let at = body.find(view).unwrap_or_else(|| panic!("{view} is gone"));
+            let end = at + body[at..].find("\n    };").expect("its end");
+            let block = &body[at..end];
+            let dc = block.find("dyn_container(").expect("a dyn_container");
+            // The builder is the closure after the key: the second `move |`.
+            let key = dc + block[dc..].find("move |").expect("its key");
+            let builder = key + 6 + block[key + 6..].find("move |").expect("its builder");
+            for f in ["content_x(", "statement_line_boxes("] {
+                assert!(
+                    !block[builder..].contains(f),
+                    "{view} derives `{f}` in its dyn_container builder, which \
+                     floem does not track — a zoom will leave it behind"
+                );
+            }
+        }
+    }
+
     /// Hoisted is not enough when the builder itself rebuilds per keystroke —
     /// the run outline's key is a range whose end follows the text, and the
     /// bracket box's follows the caret — so no overlay copies the document to
@@ -9663,7 +9736,7 @@ mod geometry_tests {
     fn a_caret_on_the_last_visible_line_keeps_the_menu_in_the_pane() {
         let p = run_menu_pos(Point::new(cx() + 10.0, 175.0), MENU, cx(), SEEN);
         assert!(
-            p.y + MENU.1 <= EDITOR_PAD_TOP + SEEN.height(),
+            p.y + MENU.1 <= EDITOR_TEXT_TOP + SEEN.height(),
             "{} hangs below the pane",
             p.y
         );

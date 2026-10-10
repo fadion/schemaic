@@ -174,13 +174,20 @@ pub(crate) fn body_scroll_h(content_h: f64, viewport_h: f64, unit_h: f64) -> f64
 
 /// Height of the query editor panel (a multiline SQL editor fills this box).
 pub(crate) const EDITOR_H: f64 = 248.0;
-/// Internal top padding of the SQL editor (breathing room from the border). The
-/// editor's overlays (completion popup, statement-highlight border, squiggles,
-/// Ctrl+K, run menu) anchor via `points_of_offset`, which is relative to the
-/// editor's *content* — it doesn't count this view padding — so each of those
-/// anchors adds `EDITOR_PAD_TOP` back to its `y`. (Right/bottom padding don't
-/// move the content origin, so they need no compensation.)
+/// Internal top padding of the SQL editor (breathing room from the border). An
+/// overlay does not add this to its `y` — it adds [`EDITOR_TEXT_TOP`], which
+/// counts the border above it too.
 pub(crate) const EDITOR_PAD_TOP: f64 = 5.0;
+/// Where the editor's first line of text starts in `editor_area`, the space
+/// every editor overlay is placed in (completion popup, statement highlight,
+/// occurrence and bracket boxes, squiggles, run outline, Ctrl+K, run menu):
+/// `editor_box`'s 1px border, then [`EDITOR_PAD_TOP`]. Those overlays anchor
+/// via `points_of_offset`, which is relative to the editor's *content*, so each
+/// adds this back to its `y` — and `pointer_offset` takes it off again. Adding
+/// the padding alone put them all a pixel above their text (issue #9).
+/// (Right/bottom padding don't move the content origin, so they need no
+/// compensation.)
+pub(crate) const EDITOR_TEXT_TOP: f64 = 1.0 + EDITOR_PAD_TOP;
 
 // The Ctrl+K diff no longer has a height of its own to compute. It is rendered in
 // the editor's own line flow as phantom rows (`inline_diff`), so it is sized by
@@ -1219,6 +1226,10 @@ mod unscaled_const_gate {
         (
             "EDITOR_PAD_TOP",
             "editor-relative: measured against the code font",
+        ),
+        (
+            "EDITOR_TEXT_TOP",
+            "editor-relative: the hairline border plus EDITOR_PAD_TOP",
         ),
         (
             "COMPLETION_GUTTER",

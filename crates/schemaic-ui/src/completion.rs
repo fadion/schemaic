@@ -644,7 +644,8 @@ mod index {
 }
 
 /// Pin the suggestion popup to the caret's line: the line's top and bottom edges,
-/// each plus the editor's top padding (which `points_of_offset` doesn't count).
+/// each plus the editor's border and top padding ([`EDITOR_TEXT_TOP`], which
+/// `points_of_offset` doesn't count).
 ///
 /// These stay in editor-**content** coordinates. `points_of_offset` answers an
 /// absolute document y, so an overlay pinned in the (unscrolling) `editor_area` has
@@ -653,8 +654,8 @@ mod index {
 /// subtraction in here would freeze the popup at the scroll position it opened at.
 fn set_anchor(ed: &Editor, comp: Completion, offset: usize) {
     let (top, bot) = ed.points_of_offset(offset, CursorAffinity::Backward);
-    comp.point.set(Point::new(bot.x, bot.y + EDITOR_PAD_TOP));
-    comp.line_top.set(top.y + EDITOR_PAD_TOP);
+    comp.point.set(Point::new(bot.x, bot.y + EDITOR_TEXT_TOP));
+    comp.line_top.set(top.y + EDITOR_TEXT_TOP);
 }
 
 /// Where the suggestion list goes: its top y in `editor_area` coordinates, and the
@@ -833,7 +834,7 @@ pub(crate) fn update_signature_help(
     if help.is_some() {
         // `.0` is the point at the *top* of the caret's line; the popup sits above it.
         let mut p = ed.points_of_offset(offset, CursorAffinity::Backward).0;
-        p.y += EDITOR_PAD_TOP;
+        p.y += EDITOR_TEXT_TOP;
         comp.sig_point.set(p);
     }
     comp.sig.set(help);
