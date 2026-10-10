@@ -20682,6 +20682,21 @@ existing prose was left alone.
     `form_separator`/`form_gap()`/`control_button`/`modal_footer`. Manage
     Connections set that shape and Import followed it; a new modal builds on these rather
     than copying them a third time.
+    **A long form's sections are `form_section_header` over its group, `form_section_gap()`
+    (`scaled(36)`) apart, and no rule between them** — Settings and Manage Connections, today
+    (GitHub #16). The gap is wider than any
+    gap inside a section (16 in Settings, 20 in the connection form), which is the whole of what
+    sets the sections apart. `form_section_header` is `form_section` in `theme::form_heading`
+    (the palette's `accent_hover` — the lighter blue on dark, the deeper one on light) with a
+    `margin_bottom(scaled(2))` added, built on it rather than restyled beside it. Import and
+    Export (`import_view.rs`, `dump_view.rs`) head their sections with it too, at their own
+    spacing; everywhere else keeps `form_section` in `text` — the object editors, the DDL preview,
+    Run script and the fact panels head a few lines each, where a heading is a label rather than
+    a divider, and the blue was judged to be noise there. A point more size
+    and a rule under each heading were tried first and dropped: a long form ended up striped
+    with lines, and the colour sets a heading off with nothing added. The margin is load-bearing:
+    Settings' version caption copies it so the air under the caption matches the air under
+    `General` (under `settings.rs`).
     **There is no `footer_button` any more.** Every modal with a footer bar wears the filled
     `action_button`, and the text-only button that sat beside it at a smaller padding left with the
     last of those footers. What remains of that family is `dialog_button`, the **only** text-button
@@ -21079,13 +21094,19 @@ existing prose was left alone.
     reading the repository's own files is exempt for (the `ui::source_gate` family, `APP_ID`'s
     packager test), which nobody has judged worth writing for a one-line function.
     It is a **caption, not a fifth heading**: `theme::text_dim()` at `theme::font_body()`, unbold,
-    deliberately not `settings_section_header`'s styling, so it identifies the panel instead of
+    deliberately not `widgets::form_section_header`'s styling, so it identifies the panel instead of
     competing with `General`. **Its spacing is derived from the section header's, not chosen**, and
     that is the part a tidy-up would break: the caption carries the same
     `margin_bottom(theme::scaled(2.0))` a header carries, and is wrapped with `general_group` in an
     `intro` `v_stack` at a group's own `gap(theme::scaled(16.0))`, so the air under the caption is
     exactly the air under `General` and both follow the same two constants. Left in the body's own
-    stack it would have spent the 28 that separates *sections* and floated above the form instead.
+    stack it would have spent the `widgets::form_section_gap()` that separates *sections* and
+    floated above the form instead.
+    **That outer gap is `form_section_gap()` (`scaled(36)`), and it was a literal 28** until the
+    sections ran together once Settings had grown, and the user asked for a little more (GitHub
+    #16). The heading moved out of this module with it — it was a private `settings_section_header`
+    — so the connection form could draw its own sections with the same two calls; the 16 inside a
+    group did not change.
     `log_row` is the General section's one non-toggle: it names the log's **full path** (`log_hint`,
     which is the pure half and is tested) and reveals the folder holding it through
     `Ui::open_config_dir`. The log had been written and rotated since `logging.rs` landed, and
@@ -21450,6 +21471,21 @@ existing prose was left alone.
     That is also what stopped opening the form from rewriting a `MariaDB` label to `MySQL` — the
     write used to be unconditional, and the picker has one name per engine where `db_type` has
     several.
+    **The form is four sections, not one column** (GitHub #16): **General** (Name and colour,
+    Folder), **Safeguards** (Prominent colour, Read-only, CLI access, AI data access), **Database**
+    (Environment, Type, then `engine_block` — Host/Port, Database, Authentication and User/Password
+    for a server, the Database file for SQLite) and **Network** (the SSH tunnel and its fields, SSL /
+    TLS). Each opens with `widgets::form_section_header` and they stand `widgets::form_section_gap()`
+    apart with no divider, as Settings' do; inside a section the fields keep the form's 20. It had
+    been a single 20px-gap column. For Network to be a section of its own, the tunnel and
+    `tls_fields` came out of `server_fields` into **`network_fields`**, which `conn_form` builds in
+    a `network_block` `dyn_container` keyed on `DbKind::is_networked()` — the heading inside it, so
+    an engine with no server loses the heading with the fields. On SQLite the child is `nothing()`
+    **and the container is `widgets::collapse_unless`'d on the same predicate**, which is the
+    half a tidy-up would drop: an empty `dyn_container` is still a box, and this one would leave a
+    36px section gap under Database with nothing after it. The split renumbered nothing —
+    `server_fields` keeps tabindex 60–80 and `network_fields` the 90–160 the tunnel and TLS
+    always had.
     **The *CLI access* toggle is this form's whole write surface for `Connection::cli_access`**, and
     it is the only one anywhere: nothing else in the app sets the flag. It sits at tabindex 33,
     between Read-only (30) and AI data access (35), which is where it sits on screen — a Tab order

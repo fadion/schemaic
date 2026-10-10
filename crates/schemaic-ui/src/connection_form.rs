@@ -1264,13 +1264,10 @@ fn tls_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
     v_stack((picker, files)).style(|s| s.flex_col().gap(theme::scaled(20.0)).width_full())
 }
 
-/// The half of the form that only a **networked** engine has: where the server
-/// is, who you are on it, and the optional tunnel to reach it.
-///
-/// Split out so it can be built per engine rather than built and hidden — see the
-/// `engine_block` comment in [`conn_form`]. Its Tab indices are the ones the
-/// server form has always used (60–160), so nothing else in the modal renumbers.
-fn server_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
+/// The **Network** section — the optional SSH tunnel and SSL / TLS — which only a
+/// networked engine has. Built per engine, as [`server_fields`] is, with the
+/// Tab indices the server form has always used (90–160).
+fn network_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
     // SSH tunnel fields, shown only when enabled. The toggle is the themed switch
     // (like the other toggles); the fields lay out exactly like the normal ones.
     let ssh_enabled = draft.ssh_enabled;
@@ -1367,6 +1364,18 @@ fn server_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
     // default form, where the tunnel is off. See `widgets::collapse_unless`.
     .style(move |s| crate::widgets::collapse_unless(s, ssh_enabled.get()));
 
+    v_stack((ssh_toggle, ssh_fields, tls_fields(draft, ring)))
+        .style(|s| s.flex_col().gap(theme::scaled(20.0)).width_full())
+}
+
+/// The half of the form that only a **networked** engine has: where the server
+/// is and who you are on it. How it is reached — the tunnel and TLS — is
+/// [`network_fields`], a section of its own below this one.
+///
+/// Split out so it can be built per engine rather than built and hidden — see the
+/// `engine_block` comment in [`conn_form`]. Its Tab indices are the ones the
+/// server form has always used (60–80), so nothing else in the modal renumbers.
+fn server_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
     // Between the coordinates and the credentials, where libpq's own field order
     // puts it and where every other client shows it. 65: the gap the surrounding
     // indices were spaced out to leave.
@@ -1474,9 +1483,6 @@ fn server_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
         database_field,
         auth_picker,
         credentials,
-        ssh_toggle,
-        ssh_fields,
-        tls_fields(draft, ring),
     ))
     .style(|s| s.flex_col().gap(theme::scaled(20.0)).width_full())
 }
@@ -1676,6 +1682,25 @@ fn conn_form(
         },
     )
     .style(|s| s.width_full());
+    // The **Network** section, likewise per engine: an engine with no server
+    // has no tunnel and no TLS, and the whole section — heading included — goes,
+    // collapsed rather than emptied so it leaves no section gap behind.
+    let ring_network = ring.clone();
+    let network_block = dyn_container(
+        move || engine.get().is_networked(),
+        move |networked| {
+            if !networked {
+                return widgets::nothing();
+            }
+            v_stack((
+                widgets::form_section_header("Network"),
+                network_fields(draft, ring_network.clone()),
+            ))
+            .style(|s| s.flex_col().gap(theme::scaled(20.0)).width_full())
+            .into_any()
+        },
+    )
+    .style(move |s| widgets::collapse_unless(s.width_full(), engine.get().is_networked()));
 
     // "Prominent colour in editor" — when on, the identity colour frames the
     // query+results editor (a guard-rail for e.g. production connections). Uses
@@ -1874,20 +1899,35 @@ fn conn_form(
     ))
     .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full());
 
-    let fields = v_stack((
+    // Four sections under headings, set apart by space rather than rules, as
+    // Settings is (GitHub #16): what the connection is called, the guard-rails
+    // on it, the database it reaches, and how it is reached. Inside a section
+    // the fields keep the form's 20.
+    let section = |s: floem::style::Style| s.flex_col().gap(theme::scaled(20.0)).width_full();
+    let general = v_stack((
+        widgets::form_section_header("General"),
         name_color,
         folder_field,
+    ))
+    .style(section);
+    let safeguards = v_stack((
+        widgets::form_section_header("Safeguards"),
         prominent_toggle,
         read_only_toggle,
         cli_access_toggle,
         ai_data_field,
+    ))
+    .style(section);
+    let database = v_stack((
+        widgets::form_section_header("Database"),
         env_field,
         type_field,
         engine_block,
     ))
-    .style(|s| {
+    .style(section);
+    let fields = v_stack((general, safeguards, database, network_block)).style(|s| {
         s.flex_col()
-            .gap(theme::scaled(20.0))
+            .gap(widgets::form_section_gap())
             .width_full()
             .padding(theme::scaled(14.0))
     });

@@ -1632,6 +1632,32 @@ pub(crate) fn form_hint(hint: impl Into<String>) -> impl IntoView {
     text(hint.into()).style(form_hint_style)
 }
 
+/// A long form's section heading over a group of fields: [`form_section`] in
+/// `theme::form_heading`'s blue, with 2px under it. Settings and the connection
+/// form both draw theirs with this, and both set their sections
+/// [`form_section_gap`] apart: space, never a rule, separates them (GitHub
+/// #16). Import and Export draw their sections' headings with it too, at their
+/// own spacing. The margin is what Settings' version caption copies, so the air
+/// under the caption matches the air under `General`.
+///
+/// **Not a replacement for [`form_section`].** This heads a *section* of a long
+/// form; the object editors, the DDL preview, Run script and the fact panels
+/// head a few lines with `form_section`, where it reads as a label rather than a
+/// divider, and the blue there was judged to be noise.
+pub(crate) fn form_section_header(t: &'static str) -> impl IntoView {
+    form_section(t).style(|s| {
+        s.color(theme::form_heading())
+            .margin_bottom(theme::scaled(2.0))
+    })
+}
+
+/// The gap between two [`form_section_header`] sections — wider than any gap
+/// inside one, so the sections read apart without a divider. 36: Settings used
+/// 28 and its sections ran together once it grew (GitHub #16).
+pub(crate) fn form_section_gap() -> f64 {
+    theme::scaled(36.0)
+}
+
 /// A labelled control: caption above, control below.
 pub(crate) fn form_setting(label: &'static str, control: impl IntoView + 'static) -> impl IntoView {
     form_setting_owned(label.to_string(), control)

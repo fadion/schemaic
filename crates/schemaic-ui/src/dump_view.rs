@@ -44,8 +44,8 @@ use schemaic_core::intel::SqlDialect;
 use crate::theme;
 use crate::widgets::{
     ACTION_TAB, ActionKind, ExitAction, FocusRing, action_button, autohide, exit_action,
-    focus_root_with_ring, form_hint, form_section, form_separator, link_button, modal_footer_split,
-    modal_h, modal_pad_h, modal_title_owned, modal_w, panel_style,
+    focus_root_with_ring, form_hint, form_section_header, form_separator, link_button,
+    modal_footer_split, modal_h, modal_pad_h, modal_title_owned, modal_w, panel_style,
 };
 use schemaic_core::export::ExportFormat;
 
@@ -594,7 +594,7 @@ fn launch_files(ctx: &DumpCtx, req: FilesRequest, name: String) {
 /// them.
 fn dump_options(d: crate::DumpUi, dialect: SqlDialect, ring: FocusRing) -> impl IntoView {
     let what = v_stack((
-        form_section("Contents"),
+        form_section_header("Contents"),
         crate::settings::focusable_toggle_row(
             "Structure",
             "CREATE TABLE, its triggers, and the foreign keys, restated after the data.",
@@ -624,7 +624,7 @@ fn dump_options(d: crate::DumpUi, dialect: SqlDialect, ring: FocusRing) -> impl 
     // again here.
     let has_guard = schemaic_core::dump::fk_guard_sql(dialect).is_some();
     let replay = v_stack((
-        form_section("Replaying"),
+        form_section_header("Replaying"),
         crate::settings::focusable_toggle_row(
             "Drop before create",
             // What it drops differs by engine — see the core function.

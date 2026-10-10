@@ -298,6 +298,15 @@ pub fn accent() -> Color {
 pub fn accent_hover() -> Color {
     ui().accent_hover
 }
+/// A long form's section heading (`widgets::form_section_header`) — Settings',
+/// the connection form's, Import's and Export's. The accent one step away from the surface, so
+/// the headings stand out from the labels under them without a rule or a
+/// larger size, both of which were tried and read as clutter (GitHub #16).
+/// That is the lighter blue on dark and the deeper one on light, for
+/// `UiTheme::accent_hover`'s contrast reason.
+pub fn form_heading() -> Color {
+    ui().accent_hover
+}
 
 // ── Inline (Ctrl+K) AI prompt + diff overlay ─────────────────────────────────
 pub fn cmdk_placeholder() -> Color {

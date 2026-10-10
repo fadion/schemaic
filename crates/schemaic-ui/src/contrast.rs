@@ -317,6 +317,8 @@ pub const UI_PAIRINGS: &[Pairing<UiTheme>] = &[
     pair!(error on bg_panel, Body, "modal + panel error lines"),
     pair!(accent on bg_panel, Body, "selected/active affordances in a panel"),
     pair!(accent_hover on bg_panel, Body, "error modal: hovering AI fix"),
+    pair!(accent_hover on bg_panel, Body,
+        "Settings, connection form, Import, Export: a section heading (`form_heading`)"),
     pair!(match_highlight on bg_panel, Body, "Find Anywhere: the matched substring"),
     pair!(plan_warn on bg_panel, Body, "import modal: a pre-flight warning"),
     pair!(change_count on bg_panel, Body, "table designer: the N changes count"),

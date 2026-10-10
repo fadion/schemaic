@@ -26,7 +26,7 @@ use crate::consts::row_h;
 use crate::settings::{focusable_dropdown, focusable_toggle_row};
 use crate::widgets::{
     ACTION_TAB, ActionKind, ExitAction, FocusRing, MenuEntry, action_button, action_gap, autohide,
-    control_button, exit_action, focus_root_with_ring, form_gap, form_hint, form_section,
+    control_button, exit_action, focus_root_with_ring, form_gap, form_hint, form_section_header,
     form_separator, form_setting, modal_footer, modal_footer_split, modal_h, modal_pad_h,
     modal_title_owned, modal_w, panel_style, shift_hscroll,
 };
@@ -500,7 +500,7 @@ fn source_step(ctx: &ImportCtx, ring: FocusRing) -> impl IntoView {
                 }
             });
             v_stack((
-                form_section("Reading"),
+                form_section_header("Reading"),
                 picker,
                 focusable_toggle_row(
                     "First row is a header",
@@ -538,7 +538,7 @@ fn source_step(ctx: &ImportCtx, ring: FocusRing) -> impl IntoView {
             }
             let ring = ring_csv.clone();
             v_stack((
-                form_section("Reading"),
+                form_section_header("Reading"),
                 form_setting(
                     "Delimiter",
                     small_field(i.delimiter, delimiter_w, ring.clone(), 20),
@@ -600,7 +600,7 @@ fn source_step(ctx: &ImportCtx, ring: FocusRing) -> impl IntoView {
     });
 
     v_stack((
-        form_section("Source"),
+        form_section_header("Source"),
         form_setting(
             "File",
             h_stack((pick, chosen.style(|s| s.flex_grow(1.0_f32).min_width(0.0))))
@@ -1096,13 +1096,13 @@ fn mapping_step(i: ImportUi, ring: FocusRing) -> impl IntoView {
 
     const GAP: f64 = 8.0;
     v_stack((
-        form_section("Columns"),
+        form_section_header("Columns"),
         autohide(scroll(rows)).style(|s| s.max_height(mapping_list_h()).width_full()),
         missing,
         size_note,
         engine_note,
         form_separator(|| GAP),
-        form_section("Preview"),
+        form_section_header("Preview"),
         preview_table(i),
         issue_list(i).style(|s| s.margin_top(theme::scaled(16.0))),
     ))

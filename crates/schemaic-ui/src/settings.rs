@@ -12,8 +12,8 @@ use floem::prelude::*;
 use crate::consts::{TERM_FONT_SIZES, chat_pad_h};
 use crate::widgets::{
     ActionKind, MenuEntry, action_button, action_button_dyn, action_gap, autohide,
-    focus_root_with_ring, form_hint, form_hint_style, form_label_style, modal_title, nothing,
-    panel_style,
+    focus_root_with_ring, form_hint, form_hint_style, form_label_style, form_section_gap,
+    form_section_header, modal_title, nothing, panel_style,
 };
 use crate::{
     AiActions, AiEffort, AiUi, ConnUi, FieldCfg, LayoutUi, SchemaScope, TermActions, TermCursor,
@@ -1753,16 +1753,6 @@ fn cli_row(
     .style(|s| s.flex_col().width_full().gap(theme::scaled(6.0)))
 }
 
-/// A bold section header separating the functional groups.
-fn settings_section_header(t: &'static str) -> impl IntoView {
-    text(t).style(|s| {
-        s.font_size(theme::font_body())
-            .font_bold()
-            .color(theme::text())
-            .margin_bottom(theme::scaled(2.0))
-    })
-}
-
 /// `Schemaic v0.24.0`, above the first section.
 ///
 /// Dimmed and unbold on purpose: it is a caption identifying the panel, not a
@@ -1771,7 +1761,7 @@ fn settings_section_header(t: &'static str) -> impl IntoView {
 /// edit here — see the tests beside that function for what that does and does
 /// not guarantee.
 ///
-/// The trailing `margin_bottom` is the one [`settings_section_header`] carries,
+/// The trailing `margin_bottom` is the one [`form_section_header`] carries,
 /// for the same reason: paired with a group's 16 gap it puts exactly as much air
 /// under this line as sits under `General`, so the caption and the heading below
 /// it read as one balanced block. Both spacings then move together if either
@@ -1838,7 +1828,7 @@ pub(crate) fn theme_settings_overlay(
                 10,
             );
             let general_group = v_stack((
-                settings_section_header("General"),
+                form_section_header("General"),
                 restore_row,
                 log_row(open_config_dir.clone(), ring.clone(), 20),
                 cli_row(cli_command.clone(), ring.clone(), 30),
@@ -1925,7 +1915,7 @@ pub(crate) fn theme_settings_overlay(
             ))
             .style(ctrl);
             let editor_group = v_stack((
-                settings_section_header("Editor"),
+                form_section_header("Editor"),
                 font_section,
                 predictions_row,
                 remembered_row,
@@ -1977,7 +1967,7 @@ pub(crate) fn theme_settings_overlay(
             ))
             .style(ctrl);
             let query_group = v_stack((
-                settings_section_header("Query"),
+                form_section_header("Query"),
                 row_section,
                 timeout_section,
                 confirm_row,
@@ -2013,7 +2003,7 @@ pub(crate) fn theme_settings_overlay(
             let scale_section =
                 v_stack((settings_group_label("Interface scale"), scale_dd)).style(ctrl);
             let theme_group = v_stack((
-                settings_section_header("Appearance"),
+                form_section_header("Appearance"),
                 ui_section,
                 editor_section,
                 scale_section,
@@ -2021,7 +2011,7 @@ pub(crate) fn theme_settings_overlay(
             .style(|s| s.flex_col().gap(theme::scaled(16.0)));
 
             // The version caption pairs with the first section instead of
-            // standing as a group of its own: the outer 28 is the gap that
+            // standing as a group of its own: the outer gap is the one that
             // separates *sections*, and spending it here would leave the caption
             // floating above the form. Inside this wrapper it gets a group's own
             // 16 — which, with the 2 margin the caption carries, is exactly the
@@ -2031,7 +2021,7 @@ pub(crate) fn theme_settings_overlay(
 
             let body = v_stack((intro, editor_group, query_group, theme_group)).style(|s| {
                 s.flex_col()
-                    .gap(theme::scaled(28.0))
+                    .gap(form_section_gap())
                     .padding(theme::scaled(14.0))
                     .width_full()
             });
