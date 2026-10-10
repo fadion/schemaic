@@ -1572,7 +1572,10 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
     // put the menu 3px under the icon's ink rather than under its hitbox.
     .tooltip(|| text("Show or hide databases").style(crate::widgets::tooltip_style));
     let gear_hov = RwSignal::new(false);
-    let gear = container(icons::icon(icons::SLIDERS_VERTICAL, 16.0).style(move |s| {
+    // `MENU`, not the sliders every other panel's settings button wears: those
+    // open a settings modal and this opens a dropdown, so the same glyph
+    // promised something it did not do (GitHub #23).
+    let gear = container(icons::icon(icons::MENU, 16.0).style(move |s| {
         s.flex_shrink(0.0_f32)
             .color(crate::widgets::menu_icon_color(
                 schema_menu_open.get(),

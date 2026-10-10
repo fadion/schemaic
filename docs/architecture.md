@@ -22338,7 +22338,10 @@ existing prose was left alone.
     All three anchored dropdowns — the schema eye, the schema gear and this one — drop by one shared
     `MENU_ICON_DROP`, measured from the icon's **padded box** rather than from the glyph in it: the
     gear fills its box where the eye does not, and those two have always sat level, so the box is
-    the reference and per-icon tuning by eye is the mistake it looks like a fix for.
+    the reference and per-icon tuning by eye is the mistake it looks like a fix for. The "gear" is
+    a name, not its glyph: it wears Lucide `menu` (`icons::MENU`), because the `sliders-vertical`
+    it wore is what every other panel's settings button shows, and those open a settings modal
+    where this opens a dropdown (GitHub #23).
     The clock's `.style()` is applied **before** its `.tooltip()`, which is not tidiness: `.tooltip()`
     wraps the view in a new one, so a style after it lands on the *wrapper* while the
     `on_move`/`on_resize` that publish the anchor stay on the container inside — which then reports a
