@@ -459,6 +459,9 @@ struct GridState {
     /// `grid_view` from the source table's schema; empty when there's nothing to
     /// follow. Read by the cell menu to offer "Follow".
     follow: RwSignal<Rc<HashMap<usize, Rc<FollowSpec>>>>,
+    /// The tables whose keys reference the source table — the cell menu's
+    /// *Referenced by*. Derived beside `follow`, from the same schema lookup.
+    referenced_by: RwSignal<Rc<Vec<Rc<RefBySpec>>>>,
     /// Open the referenced table filtered to the followed row (wrapped so
     /// `GridState` stays `Copy`).
     follow_fk: RwSignal<Option<FollowFn>>,
@@ -768,6 +771,7 @@ impl GridState {
             goto_step: gctx.goto_step,
             // Empty until `grid_view` resolves the source table's FKs into it.
             follow: RwSignal::new(Rc::new(HashMap::new())),
+            referenced_by: RwSignal::new(Rc::new(Vec::new())),
             follow_fk: RwSignal::new(Some(gctx.follow_fk.clone())),
             ai_fill: RwSignal::new(Some(gctx.ai_fill.clone())),
             ai_seed: RwSignal::new(Some(gctx.ai_seed.clone())),
@@ -3711,6 +3715,92 @@ fn follow_relation(gs: GridState, data_idx: usize, spec: &FollowSpec) {
     }
 }
 
+/// One table whose foreign key points at the result's source table — the cell
+/// menu's **Referenced by** — with the result columns holding the referenced
+/// columns, so a row's own key values can be read.
+struct RefBySpec {
+    child: schemaic_core::schema::InboundForeignKey,
+    /// Result-column indices for `child.key.ref_columns`, in that order.
+    value_cols: Vec<usize>,
+    database: String,
+}
+
+impl RefBySpec {
+    /// The entry's label: the child table, and the columns that point here.
+    fn label(&self) -> String {
+        let table = match &self.child.schema {
+            Some(ns) => format!("{ns}.{}", self.child.table),
+            None => self.child.table.clone(),
+        };
+        format!("{table} ({})", self.child.key.columns.join(", "))
+    }
+}
+
+/// [`build_follow_specs`] run backwards: every key in the source table's
+/// database that references it (`schema::incoming_keys`), kept where the
+/// columns it references are all in the result — by provenance, as Follow's
+/// are — since otherwise a row has no value to filter its children by.
+fn build_referenced_by(
+    rs: &ResultSet,
+    source: RwSignal<Option<TableSource>>,
+    db_nodes: RwSignal<Vec<ConnNode>>,
+    dialect: schemaic_core::intel::SqlDialect,
+) -> Vec<Rc<RefBySpec>> {
+    let Some((src, schema)) = source_schema(source, db_nodes) else {
+        return Vec::new();
+    };
+    let keys = schemaic_core::schema::incoming_keys(
+        &schema,
+        src.schema.as_deref(),
+        &src.table,
+        &src.database,
+        dialect,
+    );
+    let real_to_ci = rs.origin_columns(&src.database, src.schema.as_deref(), &src.table);
+    keys.into_iter()
+        .filter_map(|child| {
+            let value_cols = child
+                .key
+                .ref_columns
+                .iter()
+                .map(|c| real_to_ci.get(c.as_str()).copied())
+                .collect::<Option<Vec<usize>>>()?;
+            Some(Rc::new(RefBySpec {
+                child,
+                value_cols,
+                database: src.database.clone(),
+            }))
+        })
+        .collect()
+}
+
+/// Open `spec`'s table filtered to the rows that reference data row
+/// `data_idx` — `schema::referencing_target`, through the same request and the
+/// same `follow_fk` hand-off as [`follow_relation`].
+fn open_referencing(gs: GridState, data_idx: usize, spec: &RefBySpec) {
+    let rs = gs.rs.get_untracked();
+    let values: Vec<Value> = spec
+        .value_cols
+        .iter()
+        .map(|&vc| {
+            rs.cell(data_idx, vc)
+                .map(|c| c.to_value())
+                .unwrap_or(Value::Null)
+        })
+        .collect();
+    if let Some(ft) = schemaic_core::schema::referencing_target(
+        &spec.child,
+        &values,
+        &spec.database,
+        gs.dialect,
+    ) && let Some(cb) = gs.follow_fk.get_untracked()
+        // Asked though it cannot refuse, for `follow_relation`'s reason.
+        && let Some(req) = crate::RerunRequest::approved(ft.sql, gs.dialect)
+    {
+        (cb)(TableSource::new(ft.database, ft.schema, ft.table), req);
+    }
+}
+
 /// Which of the user's *other* tabs hold an open transaction on this tab's
 /// connection — `(tab id, title)`, in tab order. Answered live (the set changes
 /// under the write), by the UI root, which is what holds the tab list; the rule
@@ -4498,13 +4588,20 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
             key_map.set(Arc::new(fresh));
             key_gen.update(|g| *g += 1);
         }
-        // `follow` has no cheap equality (its specs carry `Rc`s), so it rides
-        // the key map's: both are derived from the same schema lookup, and a
-        // schema that has not moved cannot have changed either of them.
+        // `follow` and `referenced_by` have no cheap equality (their specs
+        // carry `Rc`s), so they are rebuilt on every pass of this effect, from
+        // the same schema lookup the key map is — it, not they, decides
+        // whether anything repaints.
         gs.follow.set(Rc::new(build_follow_specs(
             &rs_for_keys,
             src_sig,
             nodes_sig,
+        )));
+        gs.referenced_by.set(Rc::new(build_referenced_by(
+            &rs_for_keys,
+            src_sig,
+            nodes_sig,
+            gs.dialect,
         )));
     });
     // Editability: which columns can be written back, and each base table's
@@ -11200,6 +11297,24 @@ fn data_cell(
                 entries.push(MenuEntry::action("Follow relation", move || {
                     follow_relation(gs, data_idx, &spec);
                 }));
+            }
+            // "Referenced by" — the other way: the tables whose keys point at
+            // this row's table, each opened filtered to the rows that point at
+            // this row. Real rows only, for Follow's reason.
+            let referencing = gs.referenced_by.get_untracked();
+            if pending.is_none() && !referencing.is_empty() {
+                entries.push(MenuEntry::sub(
+                    "Referenced by",
+                    referencing
+                        .iter()
+                        .map(|spec| {
+                            let spec = spec.clone();
+                            MenuEntry::action(spec.label(), move || {
+                                open_referencing(gs, data_idx, &spec)
+                            })
+                        })
+                        .collect(),
+                ));
             }
             if nullable && !deleted {
                 entries.push(MenuEntry::action("Set to NULL", move || match pending {

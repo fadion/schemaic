@@ -11165,6 +11165,22 @@ existing prose was left alone.
     because the rebuild puts the other table's key back as it was, `ON DELETE` and all
     (`inbound_foreign_keys_land_on_the_table_they_reference`). SQLite's reader sets it empty: its
     rebuild drops nothing another table's key points at without `foreign_keys = OFF`.
+    **The grid's *Referenced by* does not read it**, and it stays SQL Server's alone.
+    `incoming_keys(schema, table_schema, table, database, dialect)` asks the same question on
+    demand, of the loaded `DbSchema`, on every engine — and answers it differently in the one place
+    that matters to the grid: a **self-reference counts**, because an `employees.boss_id` is how a
+    tree finds a node's children, which is precisely the key `referenced_by` leaves out. Views are
+    skipped, carrying no keys. `ref_schema` is matched as the engine resolves it, through
+    `ddl::ref_schema_is_database` rather than exactly: on MySQL it names a database, so `None` or
+    `database` itself matches and a key into another database is not this table's; elsewhere it is
+    a namespace, `None` meaning the declaring table's own. Only `database` is searched — a key
+    declared in another database is in another loaded schema, and is not found.
+    `referencing_target(child, values, database, dialect)` builds the query, and it **is**
+    `follow_target` (Follow relation's) over the key turned round — `columns` and `ref_columns`
+    swapped, the child as `ref_table`, `ref_schema` `None` on MySQL and the child's namespace
+    elsewhere — so the quoting, the `IS NULL` and the qualification are that function's and cannot
+    drift from it (`referenced_by_finds_the_keys_pointing_at_a_table_and_filters_their_rows`,
+    `referenced_by_matches_namespaces_as_the_engine_resolves_them`).
     **The tree's Generate DDL entries are two `DbSchema` methods, one per altitude.**
     `create_ddl_script(schema, dialect)` emits one namespace in **dependency order** — the
     standalone types, then base tables, then views, then the sequences that stand on their own —
@@ -31496,7 +31512,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   `Db::stream_query_enforced`;
   the capped notice's "read N rows" re-executes it through `apply_view` at a bigger ceiling; the
   grid **filter/sort bar** re-executes a rewritten one through the same action; and **Follow
-  relation** opens a new tab running a `SELECT` the grid built, through `open_table_filtered`.
+  relation** and its reverse, **Referenced by**, open a new tab running a `SELECT` the grid built,
+  through `open_table_filtered`.
   All are paths executing user SQL that reached the server without passing `run_verdict` at all —
   so an `UPDATE … RETURNING` on a table past the row cap could be run a second time from a Save
   dialog or from a link that says *read*, with no confirmation, on a read-only connection included.
@@ -36749,6 +36766,20 @@ this bundle's.
   opened on `users`, came from `users` (`an_ai_prompt_names_the_results_table_not_the_tabs`, which
   also pins that both column prompts pass `Some(ci)`). AI Fill and AI Seed never had the fault —
   they take their table from the edit model (`model.table(ti)`, `insert_target()`).
+  **A foreign key is walked both ways, from real rows only** — a pending row has no committed key
+  to navigate by. *Follow relation*, on a cell whose column is in one of the source table's keys
+  (Ctrl+click is the same call, `follow_relation`), opens the referenced table at the row the key
+  names. *Referenced by* is it run backwards: a submenu after it on any cell, one entry per key in
+  the source table's database pointing at that table, labelled `[ns.]table (cols)`
+  (`RefBySpec::label`), each opening the child table filtered to the rows that point at this one
+  (`open_referencing` → `schema::referencing_target`). `build_referenced_by` asks
+  `schema::incoming_keys` and keeps a key only where every column it references is in the result
+  by provenance (`rs.origin_columns`), as `build_follow_specs` does for Follow's, since otherwise
+  the row has no value to filter by. Both lists are rebuilt into `GridState` (`follow`,
+  `referenced_by`) by the effect that rebuilds the key map, from the same `source_schema` lookup,
+  so both need what the key icons need — a source table with its schema loaded. Both mint
+  `RerunRequest::approved` although the `SELECT` is the app's own, and hand off through
+  `follow_fk` to `open_table_filtered` — see the write-guard invariant.
   **`Edit binary` / `View binary` is the one entry that opens a cell the grid is not holding**
   (`blob_launch` →
   `open_blob` → `ui.tab_actions.view_blob`, over `core::blob::blob_source`; a **double-click** on

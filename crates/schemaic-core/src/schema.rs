@@ -6044,6 +6044,76 @@ pub fn follow_target(
     })
 }
 
+/// **Referenced by**: the foreign keys in `schema` — the database `database`,
+/// as loaded — that point at the table `(table_schema, table)`, each with the
+/// table it is declared on. A self-reference counts: an `employees.boss_id`
+/// is how a tree finds a node's children.
+///
+/// A key's `ref_schema` is matched as the engine resolves it
+/// ([`crate::ddl::ref_schema_is_database`]): on MySQL it names a database, so
+/// a key into another one is not this table's; elsewhere it is a namespace,
+/// and a key that names none points into its own table's. Views carry no keys
+/// to ask about. Only `database` is searched — a key declared in another
+/// database is in another loaded schema.
+pub fn incoming_keys(
+    schema: &DbSchema,
+    table_schema: Option<&str>,
+    table: &str,
+    database: &str,
+    dialect: crate::intel::SqlDialect,
+) -> Vec<InboundForeignKey> {
+    let by_database = crate::ddl::ref_schema_is_database(dialect);
+    let mut out = Vec::new();
+    for t in schema.tables.iter().filter(|t| !t.is_view) {
+        for key in &t.foreign_keys {
+            let points_here = key.ref_table == table
+                && if by_database {
+                    key.ref_schema.as_deref().is_none_or(|db| db == database)
+                } else {
+                    key.ref_schema.as_deref().or(t.schema.as_deref()) == table_schema
+                };
+            if points_here {
+                out.push(InboundForeignKey {
+                    schema: t.schema.clone(),
+                    table: t.name.clone(),
+                    key: key.clone(),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// The rows of `child`'s table that reference a parent row whose referenced
+/// columns (`child.key.ref_columns`, in order) hold `values` — **Follow
+/// relation** run backwards. It *is* [`follow_target`], over the key turned
+/// round, so the quoting, the `IS NULL` and the qualification are that
+/// function's and cannot drift from it.
+pub fn referencing_target(
+    child: &InboundForeignKey,
+    values: &[Value],
+    database: &str,
+    dialect: crate::intel::SqlDialect,
+) -> Option<FollowTarget> {
+    if child.key.columns.len() != child.key.ref_columns.len() {
+        return None;
+    }
+    let reversed = ForeignKeyInfo {
+        columns: child.key.ref_columns.clone(),
+        // The child lives in this database: on MySQL that is no `ref_schema`
+        // at all, elsewhere its own namespace.
+        ref_schema: if crate::ddl::ref_schema_is_database(dialect) {
+            None
+        } else {
+            child.schema.clone()
+        },
+        ref_table: child.table.clone(),
+        ref_columns: child.key.columns.clone(),
+        ..ForeignKeyInfo::default()
+    };
+    follow_target(&reversed, values, database, dialect)
+}
+
 /// Look one object up by `(namespace, name)` — the rule every `find_*` on
 /// [`DbSchema`] follows, written once.
 ///
@@ -11960,6 +12030,104 @@ mod tests {
         // A FK with no columns.
         let empty = fk(&[], None, "t", &[]);
         assert!(follow_target(&empty, &[], "db", SqlDialect::MySql).is_none());
+    }
+
+    /// A table with `fks`, in namespace `ns`.
+    fn fk_table(ns: Option<&str>, name: &str, fks: Vec<ForeignKeyInfo>) -> TableInfo {
+        TableInfo {
+            schema: ns.map(str::to_string),
+            name: name.to_string(),
+            foreign_keys: fks,
+            ..Default::default()
+        }
+    }
+
+    /// **Referenced by** finds the keys that point at a table — its own
+    /// self-reference included, a tree's parent link being the commonest — and
+    /// opens a child's rows through `follow_target`, so the quoting, the NULL
+    /// and the qualification are that tested function's.
+    #[test]
+    fn referenced_by_finds_the_keys_pointing_at_a_table_and_filters_their_rows() {
+        use crate::intel::SqlDialect::MySql;
+        let schema = DbSchema {
+            tables: vec![
+                fk_table(None, "customers", vec![]),
+                fk_table(
+                    None,
+                    "orders",
+                    vec![fk(&["customer_id"], None, "customers", &["id"])],
+                ),
+                fk_table(
+                    None,
+                    "staff",
+                    vec![fk(&["boss_id"], Some("shop"), "staff", &["id"])],
+                ),
+                fk_table(
+                    None,
+                    "elsewhere",
+                    vec![fk(&["c"], Some("other_db"), "customers", &["id"])],
+                ),
+            ],
+            ..Default::default()
+        };
+        let keys = incoming_keys(&schema, None, "customers", "shop", MySql);
+        assert_eq!(
+            keys.iter().map(|k| k.table.as_str()).collect::<Vec<_>>(),
+            ["orders"],
+            "another database's `customers` is not this one"
+        );
+        let t = referencing_target(&keys[0], &[Value::Int(7)], "shop", MySql).unwrap();
+        assert_eq!(t.table, "orders");
+        assert_eq!(
+            t.sql,
+            "SELECT * FROM `shop`.`orders` WHERE `customer_id` = 7"
+        );
+        let own = incoming_keys(&schema, None, "staff", "shop", MySql);
+        assert_eq!(own.len(), 1, "a self-reference is a child of its own table");
+    }
+
+    /// On a namespaced engine a key's missing `ref_schema` is its own table's
+    /// namespace, so `sales.orders` → `customers` points at `sales.customers`
+    /// and not at `public.customers`; the child's rows open qualified.
+    #[test]
+    fn referenced_by_matches_namespaces_as_the_engine_resolves_them() {
+        use crate::intel::SqlDialect::Postgres;
+        let schema = DbSchema {
+            tables: vec![
+                fk_table(Some("public"), "customers", vec![]),
+                fk_table(Some("sales"), "customers", vec![]),
+                fk_table(
+                    Some("sales"),
+                    "orders",
+                    vec![fk(
+                        &["cust", "region"],
+                        None,
+                        "customers",
+                        &["id", "region"],
+                    )],
+                ),
+                fk_table(
+                    Some("public"),
+                    "notes",
+                    vec![fk(&["cust"], Some("public"), "customers", &["id"])],
+                ),
+            ],
+            ..Default::default()
+        };
+        let public = incoming_keys(&schema, Some("public"), "customers", "db", Postgres);
+        assert_eq!(
+            public.iter().map(|k| k.table.as_str()).collect::<Vec<_>>(),
+            ["notes"]
+        );
+        let sales = incoming_keys(&schema, Some("sales"), "customers", "db", Postgres);
+        let t =
+            referencing_target(&sales[0], &[Value::Int(1), Value::Null], "db", Postgres).unwrap();
+        assert_eq!(t.schema.as_deref(), Some("sales"));
+        assert_eq!(
+            t.sql,
+            "SELECT * FROM \"sales\".\"orders\" WHERE \"cust\" = 1 AND \"region\" IS NULL"
+        );
+        assert!(referencing_target(&sales[0], &[Value::Int(1)], "db", Postgres).is_none());
     }
 
     // ── Standalone objects ──────────────────────────────────────────────────
