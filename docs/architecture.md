@@ -35786,7 +35786,9 @@ anchor, rather than the window-wide one `menu_panel` applies (GitHub #21; the `o
   subscribes and a scroll that moves it refreshes the point.
 - **An open context menu marks the row it acts on** — a 1px rule above and below in
   `theme::row_menu_edge`, painted by `widgets::row_menu_mark(s, marked)` from the row's own `.style()`.
-  A menu is a panel floating clear of its row, and once the pointer is on the menu nothing on screen
+  The colour is `text_muted` at 45% — a fraction of the token rather than a darker one, so it
+  recedes towards whatever is under it in either palette; `text_muted` at full strength still read
+  as too light a rule (GitHub #22), as `text_dim` had before it. A menu is a panel floating clear of its row, and once the pointer is on the menu nothing on screen
   said which database, table or column the Drop was about. Two lists wear it. The **schema tree**
   (`Nav::menu_row`, `String` keys, through the one-line `schema_tree::menu_mark`) answered that
   first; **Manage Connections'** list (a local `menu_row: RwSignal<Option<u64>>`) needed it for the

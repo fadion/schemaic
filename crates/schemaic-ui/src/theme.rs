@@ -396,8 +396,17 @@ pub fn row_selected() -> Color {
 /// `#5C6270`). It began as `text_dim` and read as too bright for a 1px line, which
 /// makes sense: `text_dim` is tuned to be *read* as text. Retune here if it ever
 /// needs a hue of its own.
+///
+/// **At 45%**, and that is the second step down: `text_muted` itself still read
+/// as too light a rule (GitHub #22), and 60% was tried on the way. A fraction of
+/// the token rather than a darker one, because the fraction moves towards
+/// *whatever surface is under it* — the panel, a hovered row, the active
+/// database's fill — in both palettes alike: about `#363943` on the dark panel
+/// and `#C3C5CE` on the light one, just past the `border` colour. No contrast row: a
+/// rule beside a row's text is not text, and the row's own text is what has to
+/// be legible.
 pub fn row_menu_edge() -> Color {
-    ui().text_muted
+    ui().text_muted.multiply_alpha(0.45)
 }
 // Pill tabs (the table designer's section tabs): the active pill's fill and
 // label, and the hover fill of an inactive one.
