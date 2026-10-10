@@ -5081,10 +5081,12 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
 /// "You have an open transaction" — the question raised by anything that would
 /// strand one (leaving Manual mode, closing the tab, switching its database).
 ///
-/// Deliberately *not* dismissible by clicking away or Escape-ing: those read as
-/// "never mind", and there's no safe default between committing and discarding
-/// someone's uncommitted writes. Cancel is spelled out as a button, and it
-/// abandons the action that raised the prompt rather than the transaction.
+/// Deliberately *not* dismissed by clicking away: there's no safe default
+/// between committing and discarding someone's uncommitted writes. Cancel is
+/// spelled out as a button, and it abandons the action that raised the prompt
+/// rather than the transaction — which is why **Escape answers Cancel** too:
+/// every modal closes on Escape (issue #15), and here closing is the answer
+/// that commits nothing and discards nothing.
 pub(crate) fn tx_prompt_overlay(o: OverlayUi) -> impl IntoView {
     let prompt = o.tx_prompt;
 
@@ -5115,10 +5117,9 @@ pub(crate) fn tx_prompt_overlay(o: OverlayUi) -> impl IntoView {
 
             // One button row: Cancel (quiet) · Rollback (danger) · Commit — all
             // three in a ring of their own, left to right. This modal asks about
-            // **uncommitted writes** and answered no key at all: Escape is a
-            // deliberate no-op (there is no safe "never mind" here), and its
-            // three buttons were outside every ring, so the keyboard could do
-            // nothing about a question the app itself had raised.
+            // **uncommitted writes** and its three buttons were once outside
+            // every ring, so the keyboard could do nothing about a question the
+            // app itself had raised. Escape answers Cancel (see the doc above).
             let ring = crate::widgets::FocusRing::new();
             let btn = |label: &'static str,
                        color: fn() -> Color,
@@ -5205,15 +5206,21 @@ pub(crate) fn tx_prompt_overlay(o: OverlayUi) -> impl IntoView {
 
             // Take focus so the editor and the global shortcuts behind the
             // backdrop stop receiving keys — Ctrl+W closing another tab while
-            // this one is asking about a transaction would be a mess. Escape
-            // is swallowed rather than handled: unlike every other modal here,
-            // there's no safe "never mind" for uncommitted writes.
+            // this one is asking about a transaction would be a mess. Escape is
+            // Cancel: it abandons the action that raised the prompt and leaves
+            // the transaction exactly as it was. It used to be swallowed, the
+            // one modal Escape did not close (issue #15).
             //
             // The ring is what lets Tab reach the three answers. There is
-            // deliberately **no backdrop dismiss** either — clicking away from a
+            // deliberately **no backdrop dismiss** — clicking away from a
             // question about uncommitted writes is not an answer.
+            let esc = resolve.clone();
             crate::widgets::focus_root_with_ring(container(panel), ring)
-                .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| {})
+                .on_key_down(
+                    Key::Named(NamedKey::Escape),
+                    |_| true,
+                    move |_| (esc)(TxChoice::Cancel),
+                )
                 .style(|s| {
                     s.size_full()
                         .flex_col()
@@ -5236,8 +5243,8 @@ pub(crate) fn tx_prompt_overlay(o: OverlayUi) -> impl IntoView {
 /// The shared yes/no confirmation — "are you sure?" for anything destructive.
 /// Same chrome as `tx_prompt_overlay`, but with a safe default: Escape and
 /// clicking the backdrop both answer No, because declining a confirm never
-/// loses anything. (The transaction prompt has no such default, which is why it
-/// swallows Escape instead.)
+/// loses anything. (The transaction prompt answers Escape with Cancel, but
+/// keeps no backdrop dismiss.)
 ///
 /// Generic by design — raise it through [`crate::Confirm`] rather than writing
 /// another one-off modal.

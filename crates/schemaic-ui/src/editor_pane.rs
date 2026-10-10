@@ -5813,15 +5813,12 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     // what "Rename alias" leaves for typing receives nothing.
                     // Armed on the line before the panel builds and takes it.
                     if let Some(vid) = ed_menu.editor_view_id.get_untracked() {
-                        // Unless the entry opened a modal: by the time this
-                        // lands the menu's own root is gone, so a root still
-                        // mounted is that modal's (*Rename alias*), and taking
-                        // the keyboard back would leave its field typing into
-                        // the editor behind it — which one won was timer order.
+                        // Unless the entry opened a modal (*Rename alias*):
+                        // `menu_return` stands down by itself then, as it does
+                        // for every menu — taking the keyboard back would leave
+                        // the modal's field typing into the editor behind it.
                         crate::widgets::set_menu_return(crate::widgets::menu_return(move || {
-                            if crate::widgets::innermost_focus_root().is_none() {
-                                vid.request_focus()
-                            }
+                            vid.request_focus()
                         }));
                     }
                     // Before the panel mounts and takes focus, so the caret

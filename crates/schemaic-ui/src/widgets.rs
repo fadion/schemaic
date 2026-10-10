@@ -2217,9 +2217,9 @@ pub(crate) fn action_face<V: IntoView + 'static, F: Fn() + 'static>(
 /// `ring` is **required**, like [`modal_title`]'s. These were the last ring-less
 /// buttons in the app, and one of the two dialogs they build is the transaction
 /// prompt — raised when something would strand an **open transaction**, with
-/// Escape deliberately dead (there is no safe "never mind" for uncommitted
-/// writes) and no ring published, so no key did anything at all and the user had
-/// to reach for the mouse to answer a question about their own writes.
+/// Escape then deliberately dead (it answers Cancel now) and no ring published,
+/// so no key did anything at all and the user had to reach for the mouse to
+/// answer a question about their own writes.
 pub(crate) fn dialog_button(
     label: impl Into<String> + 'static,
     color: fn() -> floem::peniko::Color,
@@ -4435,14 +4435,36 @@ pub(crate) fn reclaim_focus_at(ring: &FocusRing, tabindex: u32) {
 /// moved and stands down; run second and it simply lands on top. That is the
 /// property `claim_keyboard`'s own doc describes — "the race is settled either
 /// way round" — applied at the sites that had not applied it.
+///
+/// **And it stands down if an entry opened a modal.** The innermost focus root
+/// is noted when the return is built — as the menu is armed, before its own
+/// panel registers — and the restore runs only if the same root is innermost
+/// when it lands ([`restore_stands`]). An entry that opened a modal (the schema
+/// tree's Triggers, Edit table, Live monitor, ER diagram, Export, Import) has
+/// put a root on top by then, and taking the keyboard back to the tree left the
+/// modal mounted with no focus, so its Escape never fired until something in it
+/// was clicked (issue #15). A menu opened inside a modal closes under the same
+/// root it was armed under, so its return still runs.
 pub(crate) fn menu_return(restore: impl Fn() + Clone + 'static) -> Rc<dyn Fn()> {
+    let armed_under = innermost_focus_root();
     Rc::new(move || {
         let restore = restore.clone();
         floem::action::exec_after(std::time::Duration::ZERO, move |_| {
+            if !restore_stands(armed_under, innermost_focus_root()) {
+                return;
+            }
             claim_keyboard();
             restore();
         });
     })
+}
+
+/// Does a menu's focus return still apply when it lands? Only when the
+/// innermost focus root is the one the menu was armed under (`armed_under`);
+/// another on top means an entry opened a modal, which owns the keyboard now.
+/// See [`menu_return`].
+fn restore_stands<T: PartialEq>(armed_under: Option<T>, now: Option<T>) -> bool {
+    armed_under == now
 }
 
 fn take_menu_return() -> Option<Rc<dyn Fn()>> {
@@ -6770,6 +6792,40 @@ mod destructive_launch_gate {
              READ_ONLY_ANSWERED_ELSEWHERE with its reason:\n{}",
             offenders.join("\n")
         );
+    }
+}
+
+/// [`restore_stands`]: a menu's focus return stands down once an entry has put
+/// another focus root on top (issue #15).
+#[cfg(test)]
+mod restore_stands_tests {
+    use super::restore_stands;
+
+    /// A menu in the main workspace (no root) closes with no root mounted:
+    /// focus goes back where it was.
+    #[test]
+    fn a_workspace_menu_that_opened_nothing_restores() {
+        assert!(restore_stands::<u32>(None, None));
+    }
+
+    /// **The issue #15 case.** The schema tree's menu, armed with no modal up,
+    /// lands after an entry mounted one: the modal keeps the keyboard.
+    #[test]
+    fn a_workspace_menu_that_opened_a_modal_stands_down() {
+        assert!(!restore_stands(None, Some(7_u32)));
+    }
+
+    /// A settings picker's menu, armed inside the settings modal, closes under
+    /// that same modal: its return still runs.
+    #[test]
+    fn a_menu_inside_a_modal_restores_within_it() {
+        assert!(restore_stands(Some(3_u32), Some(3)));
+    }
+
+    /// An entry of a menu inside a modal that opened a second modal over it.
+    #[test]
+    fn a_menu_inside_a_modal_that_opened_another_stands_down() {
+        assert!(!restore_stands(Some(3_u32), Some(9)));
     }
 }
 

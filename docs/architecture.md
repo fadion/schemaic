@@ -20689,9 +20689,11 @@ existing prose was left alone.
     confirm modal, which each carried a private copy of it before (same colour-fn signature, same
     hover, same radius, differing only in the padding that was the reason they were not already
     sharing one). Its `ring` is required, like `modal_title`'s: these were the last ring-less buttons
-    in the app, and one of the two dialogs they build is the transaction prompt, where Escape is
-    deliberately dead — so with no ring published no key did anything at all and the user had to
-    reach for the mouse to answer a question about their own uncommitted writes. A new footer takes
+    in the app, and one of the two dialogs they build is the transaction prompt, where Escape was
+    then deliberately dead — so with no ring published no key did anything at all and the user had
+    to reach for the mouse to answer a question about their own uncommitted writes. (Escape answers
+    *Cancel* there now — GitHub #15, under *A modal's click-to-dismiss* in *Floem 0.2 gotchas*.)
+    A new footer takes
     `action_button`; it does not revive the smaller one.
     **`modal_footer_split` shrinks the status and never the actions.** A flex item's `min-width` is
     `auto`, so a long sentence in the left slot refuses to compress and pushes what follows it out
@@ -23304,8 +23306,11 @@ existing prose was left alone.
     invisible, since the window root's own listeners still see the key — over a **modal** it is not,
     because the modal's `focus_root` requests focus once on build and nothing re-requests it, so the
     panel went keyboard-dead: its ✕ and Cancel still worked, Tab recovered through the root's ring
-    backstop, and **Escape has no equivalent backstop**, so the one keyboard route out of the modal
-    was gone until the panel was clicked. `None` is the argument because that call already resolves
+    backstop, and **Escape had no equivalent backstop**, so the one keyboard route out of the modal
+    was gone until the panel was clicked. It has one now — the window root forwards an unanswered
+    Escape to the innermost focus root (GitHub #15; *A key event goes to the focused view* in
+    *Floem 0.2 gotchas*) — but that backstop answers Escape alone, so the hand-back is still what
+    gives the panel's other keys a focused view to reach. `None` is the argument because that call already resolves
     the innermost mounted focus root and falls back to the workspace's keyboard home, so the chrome
     needs to know neither. Deferred because the clear happens *before* the listeners run, so a
     request inside the same dispatch would be undone by it. **Close is excluded** — it is the one
@@ -33400,7 +33405,13 @@ Re-introducing the anti-patterns these guard against is a regression:
   `CursorStyle::Grabbing`, mapped to winit's `CursorIcon::Grabbing` in `WindowHandle::set_cursor`:
   Floem 0.2 names fifteen cursors and no grab cursor, and the ER diagram wears the closed hand
   while its canvas is panned (GitHub #14). Only that one variant — winit's open-hand `Grab` and
-  the rest are not added. No test covers it either. **Three measures
+  the rest are not added. No test covers it either. The sixth makes `ViewId::apply_event` `pub`,
+  its body unchanged: a `KeyDown` goes to the focused view and, unanswered, to the window root's
+  own listeners and never up through ancestors, so with a modal mounted and focus on nothing or
+  behind it the modal's Escape listener never heard the key (GitHub #15). The window root now
+  forwards such an Escape to the innermost focus root's listeners, and running a view's listeners
+  for an event is exactly what `apply_event` does — see *A key event goes to the focused view*,
+  below. **Three measures
   keep upstream's code out of the workspace's checks, and each looks removable**: `exclude = ["vendor"]` in the root
   manifest, since a path dependency inside the workspace directory would otherwise join it as a
   member; `vendor/floem/rustfmt.toml` with `disable_all_formatting = true`, since `cargo fmt --all`
@@ -34508,7 +34519,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   now opens with `if modal_up() { return Continue }` — everything below it acts on the workspace
   *behind* the backdrop, and none of it should. The Escape and Tab branches sit above the guard on
   purpose: the first closes a control's popup *inside* a modal, the second steps the innermost
-  modal's own focus ring, and both are modal-aware by design. A modal's focus root consumes nothing
+  modal's own focus ring, and both are modal-aware by design (so is the Escape backstop between
+  them, below). A modal's focus root consumes nothing
   but Tab, so KeyDown reaches this handler whenever focus is on its root or on a button rather than
   in a text field — floem's editor is what swallowed these keys before, which is why the failure
   read as intermittent. Two were serious: Ctrl+W mid-confirm `set` the single-slot `Confirm` signal
@@ -34535,6 +34547,23 @@ Re-introducing the anti-patterns these guard against is a regression:
   behaviour — one keypress dismissing two layers is the bug, not the fix. Don't chain your own
   `.on_cleanup` onto a `focus_root`: floem keeps one cleanup slot per view, so a second silently
   replaces both the unregister and the hand-back.
+  **And an Escape nobody answered is forwarded to the innermost focus root**, from the window
+  root's KeyDown listener, straight after `dismiss_open_popup` and above the `modal_up()` guard: if
+  `widgets::innermost_focus_root()` is `Some`, its KeyDown listeners are run with the event through
+  `ViewId::apply_event`, and a processed answer stops there. Every modal closes there, a menu panel
+  dismisses there and the transaction prompt cancels there. The two-step above assumed the
+  keyboard was somewhere inside the modal, and GitHub #15 was a modal it never reached: the Trigger
+  editor (with no triggers), Edit table, Live monitor, ER diagram, Export and Import ignored Escape
+  until something in them was clicked, because they open from the schema tree's right-click menu,
+  whose return landed a tick after the modal's `focus_root` had taken focus and took it back to the
+  tree (*A menu the keyboard opened gives focus back*, below — the root cause, fixed there). A modal
+  with an autofocusing field raced that return and won about half the time. The backstop is the
+  second half of the fix and covers what no restore can: focus on nothing (floem clears it on a
+  press it does not place, and when a focused view is removed) or on a view behind the modal. It
+  only ever sees an Escape the focused view left unconsumed, so a field inside a modal that answers
+  Escape itself still does, and the two-step stands. `apply_event` was `pub(crate)` in Floem 0.2;
+  making it `pub` is vendored Floem's sixth patch (*`floem` is vendored and patched*, above). No
+  test pins the forwarding.
 - **A view that takes focus *on mount* must first check that no overlay owns the keyboard**
   (`widgets::innermost_focus_root().is_some()` → don't). The query pane focuses its editor when it
   is built, which is right for every route it was written for — each is a tab the user just asked
@@ -34542,9 +34571,11 @@ Re-introducing the anti-patterns these guard against is a regression:
   behind an open modal: deleting a connection from Manage Connections takes its tabs with it, so
   the editor stole the keyboard out from under the modal, which then had to be clicked again
   before it answered Escape. The registry is the honest test — a list of the modals that are open
-  would rot on the next one added. A deferred *restore* asks the same question: the SQL editor's
-  menu return, landing after an entry had opened *Rename alias*, took the keyboard from the
-  dialog's field (*A menu the keyboard opened gives focus back*, below).
+  would rot on the next one added. A deferred *restore* asks a form of the same question: a menu's
+  return, landing after an entry had opened a modal — *Rename alias* from the SQL editor's menu,
+  Edit table and the rest from the schema tree's — took the keyboard from the dialog, so
+  `widgets::menu_return` stands down when the innermost root is no longer the one it was armed
+  under (*A menu the keyboard opened gives focus back*, below).
 - **The results toolbar is the one `FocusRing` outside an overlay.** Every other ring belongs to a
   modal, and a ring *wraps* precisely so a modal's Tab order is a trap — which is why the workspace
   has none. Scoped to a single strip that property is the right one: the walk stays in the toolbar
@@ -34843,6 +34874,13 @@ Re-introducing the anti-patterns these guard against is a regression:
   asked again: **a modal that could lose data on a stray click has no click-away** — only its ✕
   and Escape close it — and every other modal closes on a backdrop click through `dismiss_layer`.
   Escape stays in both because pressing it is deliberate; a click on the backdrop often is not.
+  **Every modal closes on Escape, every time** — the user's decision on GitHub #15, raised by
+  modals that ignored it until clicked. The only exceptions are a busy modal's, decided by
+  `widgets::exit_action`: Escape *stops* cancellable work in flight (a dump, an import, a script,
+  a DDL apply that rolls back as a whole) and the modal stays open to report it, and it is ignored
+  (`ExitAction::Ignore`) only while `ddl_preview` applies DDL that cannot be rolled back. The transaction prompt answers Escape with
+  *Cancel* — it abandons the action that raised the prompt and leaves the transaction as it was;
+  it used to swallow the key — and it still has no click-away.
   Each root in the no-click-away set carries a one-line comment pointing at this passage, and each
   is there for a named reason: a **draft with no other copy** — `table_designer`, `view_editor`,
   `trigger_editor`, `routine_editor`, `event_editor`, `object_editor` and `database_editor`, whose
@@ -35723,16 +35761,26 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   floem, and the editor that raised the menu is where it belongs.
   `editor_menu_return_gate::the_right_click_menu_arms_a_return_before_it_opens` fails if that branch
   opens the menu with no return armed ahead of it.
-  **The arming is unconditional; the restore is not — it stands down while a `focus_root` is
-  mounted** (`widgets::innermost_focus_root().is_none()`, inside the editor's closure). The restore
-  is an `exec_after(ZERO)`, and so is `edit_field`'s autofocus, so when *Rename alias* opened its
-  dialog both were queued in one pass and fired in floem's arbitrary timer order: when the restore
-  won, the dialog's field never had the keyboard and what was typed into it — Backspace, `i`, Enter,
-  seen in the window — edited the query behind the modal. By the time the timer fires the menu's own
-  root is gone, so a root still mounted is a modal the entry opened, and the check settles it
-  whichever timer runs first. **It lives in the editor's closure, not in `widgets::menu_return`, on
-  purpose**: a menu opened *inside* a modal — the settings pickers' — must still restore to a control
-  in that modal, where the innermost root is the modal itself and the same guard would strand it.
+  **The arming is unconditional; the restore is not — it stands down when the entry opened a
+  modal**, and that is now `widgets::menu_return`'s rule for every menu (below), not a guard in the
+  editor's closure. The restore is an `exec_after(ZERO)`, and so is `edit_field`'s autofocus, so
+  when *Rename alias* opened its dialog both were queued in one pass and fired in floem's arbitrary
+  timer order: when the restore won, the dialog's field never had the keyboard and what was typed
+  into it — Backspace, `i`, Enter, seen in the window — edited the query behind the modal.
+  **The stand-down is `menu_return`'s, and it compares roots rather than asking whether one is
+  mounted.** `menu_return` notes `innermost_focus_root()` when the return is *built* — as the menu
+  is armed, before its own panel's root registers — and the timer restores only if the same root
+  is innermost when it lands (`widgets::restore_stands`, pinned by `restore_stands_tests`). A modal
+  an entry opened is on top by then, so the return stands down whichever timer runs first; a menu
+  opened *inside* a modal — the settings pickers' — was armed under that modal and closes under it,
+  so it still restores to the control it came from. The editor used to carry the check itself, as
+  `innermost_focus_root().is_none()`, and kept it out of `menu_return` on purpose, because that
+  question would have stranded the settings pickers. Kept local, it covered the one menu that had
+  been seen to race: the schema tree's return had no guard, and it took the keyboard back from
+  every modal its entries open — the Trigger editor, Edit table, Live monitor, ER diagram, Export,
+  Import — leaving each deaf to Escape until it was clicked (GitHub #15). The grid toolbar's
+  keyboard-only returns were exposed the same way. Comparing against the armed-under root answers
+  both cases, so the editor's guard is gone, subsumed.
   Standing down leaves the editor with nothing to come back to once the dialog closes — its root's
   own hand-back finds no other root — so the dialog carries its own return
   (`AliasRenameRequest::back`, under `alias_rename.rs`); without it Ctrl+Z after a rename did nothing

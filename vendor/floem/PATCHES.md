@@ -112,3 +112,15 @@ canvas is being panned.
 
 Only the one variant the app uses; winit's `Grab` (the open hand) and the rest
 are not added. Upstream may grow its own; if it does, drop this entry.
+
+### 6. `ViewId::apply_event` is `pub`
+
+**Why.** A `KeyDown` goes to the focused view and, unanswered, to the window
+root's own listeners — never up through ancestors. So with a modal mounted and
+focus on nothing (floem clears it on a press it does not place) or on a view
+behind the modal, the modal's Escape listener never hears the key. Schemaic's
+window root forwards an unanswered Escape to the innermost modal's `KeyDown`
+listeners, and running a view's listeners for an event is exactly what
+`ViewId::apply_event` does — but it was `pub(crate)`.
+
+**What.** `src/id.rs`: `apply_event` is `pub`. Its body is unchanged.

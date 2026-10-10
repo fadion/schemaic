@@ -7378,6 +7378,25 @@ pub fn workspace(ui: Ui, window: WindowId) -> impl IntoView {
                 {
                     return EventPropagation::Stop;
                 }
+                // **Escape reaches the innermost modal however focus stands**
+                // (issue #15). It only gets this far when the focused view did
+                // not answer it — and while a modal is up that means focus is on
+                // nothing (floem clears it on a press it does not place, and
+                // when a focused view is removed) or somewhere behind the modal,
+                // and in both the modal's own Escape listener never heard the
+                // key. Run the innermost focus root's KeyDown listeners with it,
+                // which is where every modal closes, a menu panel dismisses and
+                // the transaction prompt cancels. A field inside a modal that
+                // answers Escape itself (blurring) still does: it consumed the
+                // key, and this never runs.
+                if matches!(ke.key.logical_key, Key::Named(NamedKey::Escape))
+                    && let Some(root) = widgets::innermost_focus_root()
+                    && root
+                        .apply_event(&EventListener::KeyDown, e)
+                        .is_some_and(|p| p.is_processed())
+                {
+                    return EventPropagation::Stop;
+                }
                 // The Tab trap's backstop, and the mirror of the Escape branch
                 // above: a plain Tab only gets this far when nothing in the overlay
                 // consumed it, which means focus is on a dropdown's popup list or

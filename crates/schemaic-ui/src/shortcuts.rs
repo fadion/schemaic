@@ -54,10 +54,6 @@ pub(crate) type ShortcutGroup = (&'static str, &'static [(&'static str, &'static
 /// edits a cell, Tab hops between cells. Plain arrow keys and "Escape closes this"
 /// are left out on purpose: they are what everyone already tries, and listing them
 /// would bury the handful of bindings that genuinely cannot be discovered.
-///
-/// Escape is also not uniformly true, which is a second reason not to claim it
-/// here: `tx_prompt_overlay` swallows it deliberately, because there is no safe
-/// "never mind" for uncommitted writes.
 pub(crate) const SHORTCUTS: &[ShortcutGroup] = &[
     (
         "Global",

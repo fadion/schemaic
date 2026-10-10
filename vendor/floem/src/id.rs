@@ -475,7 +475,9 @@ impl ViewId {
         }
     }
 
-    pub(crate) fn apply_event(
+    /// schemaic patch (PATCHES.md): `pub`, not `pub(crate)` — the app's window
+    /// root forwards an unanswered Escape to the innermost modal's listeners.
+    pub fn apply_event(
         &self,
         listener: &EventListener,
         event: &crate::event::Event,
