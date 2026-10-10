@@ -1658,16 +1658,22 @@ fn column_form(d: DdlUi, overlay: OverlayUi, target: &DesignerTarget, ring: Focu
 fn indexes_list(d: DdlUi, ring: FocusRing) -> AnyView {
     let draft = d.draft.get_untracked();
     let selected = d.selected;
+    let hints = hints_of(d, &draft);
     let rows = v_stack_from_iter(draft.indexes.iter().enumerate().map(|(i, ix)| {
+        // Advice rides the row's faint detail — the footer says why.
+        let redundant = hints
+            .iter()
+            .any(|h| matches!(h, ddl::IndexHint::Redundant { index, .. } if *index == i));
+        let detail = match (ix.info.unique, redundant) {
+            (true, _) => "unique",
+            (false, true) => "redundant",
+            (false, false) => "",
+        };
         list_row(
             selected,
             i,
             ix.info.name.clone(),
-            if ix.info.unique {
-                "unique".to_string()
-            } else {
-                String::new()
-            },
+            detail.to_string(),
             Some((icons::KEY_SQUARE, theme::key_index)),
         )
     }))
@@ -2025,15 +2031,32 @@ fn index_form(d: DdlUi, target: &DesignerTarget, ring: FocusRing) -> AnyView {
 
 // ── the Foreign keys section ─────────────────────────────────────────────────
 
+/// The designer's index advice for `draft` (`ddl::index_hints`), on the
+/// designer's own engine; none before a target is set.
+fn hints_of(d: DdlUi, draft: &ddl::TableDraft) -> Vec<ddl::IndexHint> {
+    d.designer
+        .get_untracked()
+        .map(|t| ddl::index_hints(draft, t.dialect))
+        .unwrap_or_default()
+}
+
 fn fks_list(d: DdlUi, ring: FocusRing) -> AnyView {
     let draft = d.draft.get_untracked();
     let selected = d.selected;
+    let hints = hints_of(d, &draft);
     let rows = v_stack_from_iter(draft.foreign_keys.iter().enumerate().map(|(i, fk)| {
+        let unindexed = hints
+            .iter()
+            .any(|h| matches!(h, ddl::IndexHint::UnindexedForeignKey { fk } if *fk == i));
         list_row(
             selected,
             i,
             fk.info.name.clone(),
-            format!("→ {}", fk.info.ref_table),
+            if unindexed {
+                format!("→ {} · no index", fk.info.ref_table)
+            } else {
+                format!("→ {}", fk.info.ref_table)
+            },
             Some((icons::KEY_SQUARE, theme::key_foreign)),
         )
     }))
@@ -2592,7 +2615,7 @@ pub(crate) fn table_designer_overlay(d: DdlUi, overlay_ui: OverlayUi) -> impl In
                         return crate::widgets::footer_error(first.clone());
                     }
                     let n = change_set(&status_target, &draft).len();
-                    text(match n {
+                    let count = text(match n {
                         0 => "No changes".to_string(),
                         1 => "1 change".to_string(),
                         n => format!("{n} changes"),
@@ -2606,8 +2629,37 @@ pub(crate) fn table_designer_overlay(d: DdlUi, overlay_ui: OverlayUi) -> impl In
                         } else {
                             theme::change_count()
                         })
-                    })
-                    .into_any()
+                    });
+                    // **Advice, after the count and never instead of it**: an
+                    // index hint does not block Preview (`ddl::index_hints` is
+                    // not `validate`). The first one, cut to the footer with
+                    // the whole sentence on hover; the list rows mark the rest.
+                    let hint = ddl::index_hints(&draft, status_target.dialect)
+                        .first()
+                        .map(|h| h.message(&draft));
+                    match hint {
+                        None => count.into_any(),
+                        Some(m) => {
+                            let tip = m.clone();
+                            h_stack((
+                                count,
+                                text(m)
+                                    .style(|s| {
+                                        s.font_size(theme::font_label())
+                                            .color(theme::plan_warn())
+                                            .text_ellipsis()
+                                            .min_width(0.0)
+                                            .max_width(theme::scaled(420.0))
+                                            .margin_left(theme::scaled(12.0))
+                                    })
+                                    .tooltip(move || {
+                                        text(tip.clone()).style(crate::widgets::tooltip_style)
+                                    }),
+                            ))
+                            .style(|s| s.items_center().min_width(0.0))
+                            .into_any()
+                        }
+                    }
                 },
             );
 

@@ -6849,6 +6849,23 @@ existing prose was left alone.
     precedent: refused in the modal, which can say which control is wrong, rather than at Apply.
     Both answer for every engine — the clauses exist on no other one today, so there is nothing
     there to require, and a fourth engine that grew them answers for itself.
+    **Index advice is `index_hints(draft, dialect) -> Vec<IndexHint>`, and it never enters
+    `validate`** — `validate` is what blocks Preview, and an `IndexHint` is advice, never a refusal.
+    Redundant indexes come first, in list order, then unindexed foreign keys; each carries its own
+    sentence (`IndexHint::message`). **Only a plain index is offered as redundant**: not unique —
+    it enforces what its cover may not — with no predicate, no `INCLUDE`, and not columnstore, XML
+    or spatial. Its key columns must lead the cover's, compared ASCII-case-insensitively as
+    `validate` compares names, with the same prefix length, sort order and expression flag, and
+    under the same `method`. The primary key is no row of `draft.indexes` (`from_table` filters it
+    out — `find_key` below), so it is asked separately and first, and covers only a default-method
+    index. An identical pair flags only the **later** index, so taking the advice leaves one rather
+    than dropping both. A foreign key is covered by the primary key or any non-partial index whose
+    leading columns are its own in any order, and is asked about only where
+    `foreign_keys_create_their_index` is false — every engine but MySQL, whose InnoDB indexes a
+    key's columns itself; elsewhere a key with no index makes every delete or key update on the
+    referenced table scan this one (`an_index_led_by_another_is_flagged_redundant`,
+    `an_index_that_does_more_than_its_cover_is_not_redundant`,
+    `a_foreign_key_with_no_index_of_its_own_is_flagged_where_the_engine_makes_none`).
     **`TableDraft::find_key(index, foreign_key) -> Option<DraftKey>`** says where one of a table's
     keys sits in the draft — which of the designer's sections holds it, and which row of that
     section — and it exists because the schema tree's sequence of keys and the draft's are **not
@@ -14657,7 +14674,9 @@ existing prose was left alone.
       `information_schema` stats for `information_schema_stats_expiry`, a day by default;
       PostgreSQL's `reltuples` is only as fresh as the last `ANALYZE`), and `IndexStats::is_unused`
       flags an index only when the server actually counted zero scans — `scans: None` is "nobody
-      was counting", never "drop this". `count_rows_sql` builds the exact-count statement here
+      was counting", never "drop this". The counts come from MySQL's `performance_schema`,
+      PostgreSQL's `pg_stat_all_indexes` and SQL Server's `sys.dm_db_index_usage_stats`; SQLite
+      keeps none. `count_rows_sql` builds the exact-count statement here
       rather than three times in the db crate, through the one quoter (`export::ident_sql`).
       Filled by `Db::fetch_table_stats`; rendered by `ui/properties.rs`, the schema tree's
       size column, the results toolbar, the Truncate confirmation and a table drop's preview.
@@ -15772,7 +15791,11 @@ existing prose was left alone.
   runs on every connect. MySQL adds `STATISTICS` for cardinality and
   `performance_schema.table_io_waits_summary_by_index_usage` for index usage — that last one is
   routinely off or ungranted, and a failure there leaves every scan count `None`, because zero is
-  what marks an index unused. PostgreSQL reads `pg_table_size`/`pg_indexes_size`, `reltuples`
+  what marks an index unused. SQL Server (`mssql.rs`'s `INDEX_STATS`) sums `user_seeks`,
+  `user_scans` and `user_lookups` from `sys.dm_db_index_usage_stats`, and an index with no row
+  there reads as zero rather than `None` — the `COALESCE`s in that query — so `is_unused` can flag
+  it; the count runs from the last restart, not from the index's creation. PostgreSQL reads
+  `pg_table_size`/`pg_indexes_size`, `reltuples`
   (`-1` is "don't know", so it becomes `None`), `n_dead_tup` and the last analyze, through
   `query_all_optional` so a restricted `pg_stat_*` can't fail the fetch; a **partitioned parent**
   is listed with null sizes rather than the truthful `0` that would read as an empty table.
@@ -23196,6 +23219,12 @@ existing prose was left alone.
     back through effects, so a draft-keyed form would tear down the field being typed into
     (it's keyed on `(tab, selected, rev)`, where `rev` is bumped on structural edits because
     removing the selected row leaves `selected` unchanged over a different item).
+    The footer status is validation first, since it blocks; then the change count; then — only when
+    nothing fails validation, and **after** the count, never instead of it — the first of
+    `ddl::index_hints` in `theme::plan_warn()`, cut with an ellipsis at 420px with the whole sentence
+    on hover. The rest ride the list rows' faint detail (`hints_of`, on the designer's own dialect):
+    an Indexes row reads *redundant* (a unique one still reads *unique*, and is never flagged), a
+    Foreign keys row *→ t · no index*. None of it touches Preview.
     It also owns three things the other editors reuse: `list_pane` — the list-plus-action-bar that
     is **one** Tab stop with Up/Down inside it (over `widgets::list_step`) —
     `focusable_owned_dropdown`, the picker for a value that isn't `Copy`, and `suggest_field`, the

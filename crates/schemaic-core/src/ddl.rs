@@ -1129,6 +1129,147 @@ pub fn pg_replaceable(current: &[String], select: &str, dialect: SqlDialect) -> 
     )
 }
 
+/// Does `dialect` create an index for a foreign key by itself? MySQL's InnoDB
+/// does, on the referencing columns, so a key there is never unindexed; the
+/// others index only what they are told to, and a key without one makes every
+/// delete or key update on the referenced table scan the referencing one.
+pub fn foreign_keys_create_their_index(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MySql => true,
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+    }
+}
+
+/// Advice about a table's indexes, for the designer — never a refusal:
+/// [`TableDraft::validate`] blocks a plan, and nothing here should.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IndexHint {
+    /// `draft.indexes[index]` is served by `covered_by` — another index, or
+    /// `"PRIMARY KEY"` — whose columns it leads, or which is identical to it
+    /// and comes first.
+    Redundant { index: usize, covered_by: String },
+    /// `draft.foreign_keys[fk]` has no index whose leading columns are its own.
+    UnindexedForeignKey { fk: usize },
+}
+
+impl IndexHint {
+    /// The sentence the designer shows for it.
+    pub fn message(&self, draft: &TableDraft) -> String {
+        match self {
+            IndexHint::Redundant { index, covered_by } => format!(
+                "Index {} is covered by {covered_by}: every lookup it serves, that one serves too.",
+                draft
+                    .indexes
+                    .get(*index)
+                    .map_or("?", |ix| ix.info.name.as_str())
+            ),
+            IndexHint::UnindexedForeignKey { fk } => format!(
+                "Foreign key {} has no index starting with its columns, so a delete or key \
+                 update on the table it references scans this one.",
+                draft
+                    .foreign_keys
+                    .get(*fk)
+                    .map_or("?", |f| f.info.name.as_str())
+            ),
+        }
+    }
+}
+
+/// The designer's index advice for `draft` ([`IndexHint`]): redundant indexes
+/// first, in list order, then unindexed foreign keys.
+///
+/// **Only a plain index is offered as redundant** — not unique (it enforces
+/// what its cover may not), not partial, and built as its cover is (same
+/// method, no `INCLUDE`, a B-tree-shaped storage). Its key columns must lead
+/// the cover's, compared by name ASCII-case-insensitively as `validate` does,
+/// with the same prefix length and sort order; an identical pair flags only
+/// the later, so taking the advice leaves one. The primary key is a cover
+/// like any index, and the first one asked.
+///
+/// A foreign key is covered by any index (or the primary key) whose leading
+/// columns are its own in any order, and is asked about only where the engine
+/// does not index it itself ([`foreign_keys_create_their_index`]).
+pub fn index_hints(draft: &TableDraft, dialect: SqlDialect) -> Vec<IndexHint> {
+    use crate::schema::IndexColumn;
+    let same = |a: &IndexColumn, b: &IndexColumn| {
+        a.name.eq_ignore_ascii_case(&b.name)
+            && a.prefix == b.prefix
+            && a.descending == b.descending
+            && a.expression == b.expression
+    };
+    // A plain B-tree-shaped index, the only kind that serves another's
+    // lookups and the only kind offered as redundant.
+    let plain = |ix: &IndexInfo| {
+        ix.predicate.is_none()
+            && ix.include.is_empty()
+            && !ix.is_columnstore()
+            && !ix.is_tsql_xml_or_spatial()
+            && !ix.columns.is_empty()
+    };
+    let pk: Vec<IndexColumn> = draft
+        .primary_key
+        .iter()
+        .map(|c| IndexColumn::plain(c.as_str()))
+        .collect();
+    let mut hints = Vec::new();
+    for (i, ix) in draft.indexes.iter().map(|d| &d.info).enumerate() {
+        if ix.unique || !plain(ix) {
+            continue;
+        }
+        let leads = |cover: &[IndexColumn]| {
+            cover.len() >= ix.columns.len() && ix.columns.iter().zip(cover).all(|(a, b)| same(a, b))
+        };
+        // The primary key first; then the other indexes — a longer one at any
+        // position, an identical one only before this.
+        let by_pk = ix.method.is_none() && !pk.is_empty() && leads(&pk);
+        let by_index = draft.indexes.iter().enumerate().find_map(|(j, other)| {
+            let o = &other.info;
+            let counts = j != i
+                && plain(o)
+                && o.method == ix.method
+                && leads(&o.columns)
+                && (o.columns.len() > ix.columns.len() || j < i);
+            counts.then(|| o.name.clone())
+        });
+        let covered_by = if by_pk {
+            Some("PRIMARY KEY".to_string())
+        } else {
+            by_index
+        };
+        if let Some(covered_by) = covered_by {
+            hints.push(IndexHint::Redundant {
+                index: i,
+                covered_by,
+            });
+        }
+    }
+    if !foreign_keys_create_their_index(dialect) {
+        let leading: Vec<Vec<String>> = std::iter::once(draft.primary_key.clone())
+            .chain(
+                draft
+                    .indexes
+                    .iter()
+                    .filter(|d| d.info.predicate.is_none())
+                    .map(|d| d.info.column_names().map(str::to_string).collect()),
+            )
+            .collect();
+        for (k, fk) in draft.foreign_keys.iter().enumerate() {
+            let cols = &fk.info.columns;
+            let covered = cols.is_empty()
+                || leading.iter().any(|lead| {
+                    lead.len() >= cols.len()
+                        && lead[..cols.len()]
+                            .iter()
+                            .all(|l| cols.iter().any(|c| c.eq_ignore_ascii_case(l)))
+                });
+            if !covered {
+                hints.push(IndexHint::UnindexedForeignKey { fk: k });
+            }
+        }
+    }
+    hints
+}
+
 /// A table's primary-key columns in key order: the `PRIMARY` index when the
 /// server reported one (authoritative for a composite key's order), else the
 /// flagged columns in column order.
@@ -23538,6 +23679,120 @@ mod tests {
                 (MsSql, false)
             ]
         );
+    }
+
+    /// A table draft for the index hints: primary key `pk`, plain indexes
+    /// `(name, columns, unique)`, and foreign keys `(name, columns)`.
+    fn hinted(
+        pk: &[&str],
+        indexes: &[(&str, &[&str], bool)],
+        fks: &[(&str, &[&str])],
+    ) -> TableDraft {
+        let mut d = TableDraft::blank("t", None);
+        d.primary_key = pk.iter().map(|c| c.to_string()).collect();
+        d.indexes = indexes
+            .iter()
+            .map(|(name, cols, unique)| {
+                IndexDraft::new(IndexInfo {
+                    name: name.to_string(),
+                    columns: cols.iter().map(|c| IndexColumn::plain(*c)).collect(),
+                    unique: *unique,
+                    ..Default::default()
+                })
+            })
+            .collect();
+        d.foreign_keys = fks
+            .iter()
+            .map(|(name, cols)| {
+                ForeignKeyDraft::new(ForeignKeyInfo {
+                    name: name.to_string(),
+                    columns: cols.iter().map(|c| c.to_string()).collect(),
+                    ref_table: "p".into(),
+                    ref_columns: cols.iter().map(|c| c.to_string()).collect(),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        d
+    }
+
+    /// An index whose columns lead another index — or the primary key — is
+    /// one the other already serves; of two identical ones only the later is
+    /// named, so removing the one flagged leaves the other.
+    #[test]
+    fn an_index_led_by_another_is_flagged_redundant() {
+        let d = hinted(
+            &["id"],
+            &[
+                ("ix_a", &["a"], false),
+                ("ix_ab", &["A", "b"], false),
+                ("ix_id", &["id"], false),
+                ("ix_ab2", &["a", "b"], false),
+            ],
+            &[],
+        );
+        assert_eq!(
+            index_hints(&d, Postgres),
+            vec![
+                IndexHint::Redundant {
+                    index: 0,
+                    covered_by: "ix_ab".into()
+                },
+                IndexHint::Redundant {
+                    index: 2,
+                    covered_by: "PRIMARY KEY".into()
+                },
+                IndexHint::Redundant {
+                    index: 3,
+                    covered_by: "ix_ab".into()
+                },
+            ]
+        );
+    }
+
+    /// Only a plain index is offered as redundant: a unique one enforces
+    /// something its cover does not, a partial or differently-built one
+    /// answers other queries, and a sort order or prefix that differs is a
+    /// different key.
+    #[test]
+    fn an_index_that_does_more_than_its_cover_is_not_redundant() {
+        let mut d = hinted(
+            &[],
+            &[
+                ("u_a", &["a"], true),
+                ("ix_ab", &["a", "b"], false),
+                ("part_a", &["a"], false),
+                ("hash_a", &["a"], false),
+                ("desc_a", &["a"], false),
+            ],
+            &[],
+        );
+        d.indexes[2].info.predicate = Some("a > 0".into());
+        d.indexes[3].info.method = Some("hash".into());
+        d.indexes[4].info.columns[0].descending = true;
+        assert_eq!(index_hints(&d, Postgres), Vec::new());
+    }
+
+    /// A foreign key with no index leading with its columns — in any order —
+    /// makes every delete or key update on the table it references scan this
+    /// one. MySQL builds that index itself, so it is not told.
+    #[test]
+    fn a_foreign_key_with_no_index_of_its_own_is_flagged_where_the_engine_makes_none() {
+        let d = hinted(
+            &["id"],
+            &[("ix_ba", &["b", "a", "c"], false)],
+            &[("fk_ab", &["a", "b"]), ("fk_x", &["x"]), ("fk_id", &["id"])],
+        );
+        assert_eq!(
+            index_hints(&d, Postgres),
+            vec![IndexHint::UnindexedForeignKey { fk: 1 }]
+        );
+        assert_eq!(index_hints(&d, MsSql), index_hints(&d, Postgres));
+        assert_eq!(index_hints(&d, MySql), Vec::new());
+        assert!(foreign_keys_create_their_index(MySql));
+        for e in [Postgres, Sqlite, MsSql] {
+            assert!(!foreign_keys_create_their_index(e), "{e:?}");
+        }
     }
 
     /// The table designer's MySQL-only fields, each asked as what it is:
