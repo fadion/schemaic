@@ -2373,13 +2373,13 @@ fn underline_seg_at(
 ) -> Option<(f64, f64, f64)> {
     let (top, bot) = points(lo)?;
     let (end, _) = points(hi)?;
-    // `content_x` slightly over-estimates the code start (the padded statement-
-    // highlight border masked it; a tight underline exposes it), so nudge left to
-    // sit flush with the glyphs.
-    const WAVE_X_ADJUST: f64 = 3.0;
+    // No nudge: `content_x` is measured from the code font, so the column plus
+    // a glyph's x is that glyph's edge. A 3px left nudge for a column that once
+    // over-estimated the code's start outlived the estimate and shifted every
+    // squiggle off its word.
     let vis_hi = visible_hi(content_x, vp);
-    let x0 = (content_x + top.x - WAVE_X_ADJUST - vp.x0).max(content_x);
-    let x1 = (content_x + end.x - WAVE_X_ADJUST - vp.x0).min(vis_hi);
+    let x0 = (content_x + top.x - vp.x0).max(content_x);
+    let x1 = (content_x + end.x - vp.x0).min(vis_hi);
     if x1 <= x0 {
         return None;
     }
@@ -8696,6 +8696,22 @@ mod geometry_tests {
         let (x, _, w, _) = diag_hit_at(at(36.0), cx, 30, 40, VP).unwrap();
         let (ux, _, uw) = underline_seg_at(at(36.0), cx, 30, 40, VP).unwrap();
         assert_eq!((x, w), (ux, uw));
+    }
+
+    /// **The squiggle spans its word's glyphs, edge to edge** — from the code
+    /// column plus the first glyph's x to the code column plus the end's, as
+    /// the occurrence box does. It carried a 3px left nudge for a `content_x`
+    /// that once over-estimated the code's start; once the column was measured
+    /// from the code font, the nudge put every squiggle 3px left of its word,
+    /// starting early and ending short.
+    #[test]
+    fn the_squiggle_spans_exactly_its_words_glyphs() {
+        let cx = content_x_of(SQL);
+        let (x, _, w) = underline_seg_at(at(36.0), cx, 30, 38, VP).unwrap();
+        // `at` places offset n at n·8px.
+        assert_eq!((x, x + w), (cx + 30.0 * 8.0, cx + 38.0 * 8.0));
+        let (bx, _, bw, _) = span_box_at(at(36.0), cx, 30, 38, VP).unwrap();
+        assert_eq!((x, w), (bx, bw), "level with the occurrence box");
     }
 
     #[test]
