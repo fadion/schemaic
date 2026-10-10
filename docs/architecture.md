@@ -3430,9 +3430,11 @@ existing prose was left alone.
     excluding the column made the cell unwritable by any means at all, which is what kept the blob
     panel a viewer. So a binary column is `editable` like any other now, and
     `EditModel::text_editable(ci)` — `editable(ci) && !binary(ci)` — is the narrower refusal that
-    replaced it: the grid asks it wherever text would land in the cell (`plan_paste`'s predicate,
+    replaced it: the grid asks it wherever text would land in the cell (`plan_paste`'s and
+    `fill_plan`'s predicates,
     `start_edit`, the Tab/Enter hop `next_editable_col`, the row panel's `ColSpec::editable`, AI
-    Fill Value and the AI seed, `add_cloned_rows`, the *Edit field* and *Paste* cell-menu entries,
+    Fill Value and the AI seed, `add_cloned_rows`, the *Edit field*, *Paste* and *Fill* cell-menu
+    entries,
     and — through `activation`, below — the Enter key and the double-click). *Set to NULL*
     deliberately still asks `editable`, because
     emptying a blob writes no text. `resolve_key`'s half is unchanged — a binary column is still no
@@ -3697,6 +3699,21 @@ existing prose was left alone.
     will hold is a server default, previewed as `<auto>`, and it counts as neither a value nor a
     null. It returns a `Cow`, for `with_text`'s reason — a Ctrl+A over a 200,000-row column
     resolves every cell and only a staged blob's `<n bytes>` has to be built.
+    **`fill_plan(rect, layout, editable, fill)` is the cell menu's *Fill down* / *Fill up*, and it
+    reads its source through `summary_text` because both of that reader's distinctions are the
+    ones a fill needs.** For each selected *drawn* column (`selected_cols`, hidden ones out) it
+    takes the selection's top cell (`Fill::Down`) or bottom cell (`Fill::Up`) and plans it into
+    every other row of the selection, as `(display row, column, Option<String>)` for the grid to
+    stage as it stages a paste. The value is what the grid shows less the formatter — a staged
+    edit wins over the stored cell, a NULL is `None` and so fills as SQL NULL rather than the
+    string `NULL` — which is the paste round-trip's reading of the same cell. The **unset** cell
+    of a pending row is the other distinction: it will take a server default, so a column whose
+    source is one plans nothing at all rather than writing NULLs over the rows below it. A column
+    `editable` refuses is skipped in place, as a paste's is; a selection of one row, after the
+    rows are clipped to the real ones plus the pending ones, plans nothing
+    (`fill_down_copies_each_columns_top_cell_into_the_rows_below`,
+    `fill_up_copies_the_bottom_cell_as_the_grid_shows_it`,
+    `fill_skips_what_it_cannot_write_or_has_no_value_for`).
     **`staged_sql` is the staged batch as SQL a person reads — the commit strip's *Copy the changes
     as SQL* — and it renders the very `GridWrite` Commit would send** rather than reading `dirty` a
     second time, so the copy and the commit cannot come to differ on which rows or which keys: the
@@ -36475,6 +36492,20 @@ this bundle's.
   inline editor takes Ctrl+V back — `paste_selection` returns early while `edit_cell` is set,
   explicitly rather than trusting the text field to swallow the key first, because being wrong
   about the dispatch order costs a block overwrite instead of a caret insertion.
+  **Fill down / Fill up are a paste whose clipboard is the selection's own edge row.** The cell
+  menu offers them after *Paste* and under its gate (`text_editable`, not a row marked for
+  deletion), and only when the right-clicked cell is in a selection of two or more rows — a
+  right-click outside the selection collapses it to that cell first, so the menu never offers a
+  fill of one row. `fill_selection` asks `core::edit::GridCells::fill_plan` and stages the plan
+  the way `paste_selection` does: display rows to data rows through `order`, pending rows through
+  `stage_new_many` with `BlankCell::IsAValue`, a cell on a row in `del_rows` skipped and counted
+  (`Filled N cells, skipping M in rows marked for deletion.` on `commit_note`), and two signal
+  updates for the lot. Unlike `paste_selection` it does not return on an open in-cell editor: it
+  commits the edit first, so the value being typed is in `dirty` before the plan reads it — a
+  source cell mid-edit fills with what the user is looking at. An empty plan is a `commit_err`
+  naming both of its causes — no writable column, or a source that is a new row's unset cell —
+  since `fill_plan` cannot say which. Unlike a paste, a fill does not report the read-only
+  columns it skipped: they are the selection's own, not cells a clipboard aimed at them.
 - **What a cell *says* is resolved in one place, and it isn't the view.** `copy_selection` and
   `attached_rows` read the signals once into `grid_cells` — a `core::edit::GridCells` borrow over
   `rs`, `order`, `formats`, `dirty` and `new_rows` — and ask it for `tsv(rect, layout)` or

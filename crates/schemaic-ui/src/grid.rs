@@ -2531,6 +2531,64 @@ fn paste_selection(gs: GridState) {
     }
 }
 
+/// **Fill Down / Fill Up** over the selection — `edit::GridCells::fill_plan`,
+/// staged exactly as a paste is: display rows to data rows through `order`,
+/// pending rows to `stage_new_many`, a row marked for deletion skipped and
+/// said. Two signal updates for the lot, for `paste_selection`'s reason.
+fn fill_selection(gs: GridState, fill: schemaic_core::edit::Fill) {
+    if gs.edit_cell.get_untracked().is_some() {
+        gs.commit_edit();
+    }
+    let Some(rect) = gs.bounds_untracked() else {
+        return;
+    };
+    let rs = gs.rs.get_untracked();
+    let (order, formats) = (gs.order.get_untracked(), gs.formats.get_untracked());
+    let (dirty, new_rows) = (gs.dirty.get_untracked(), gs.new_rows.get_untracked());
+    let model = gs.edit_model.get_untracked();
+    let plan = grid_cells(&rs, &order, &formats, &dirty, &new_rows).fill_plan(
+        rect,
+        gs.layout_untracked(),
+        |ci| model.text_editable(ci),
+        fill,
+    );
+    if plan.is_empty() {
+        gs.commit_err.set(Some(ModalError::app(
+            "Nothing to fill: the selected columns can't be written, or the cell to copy is a new \
+             row's unset value."
+                .to_string(),
+        )));
+        return;
+    }
+    let nrows = rs.row_count();
+    let del = gs.del_rows.get_untracked();
+    let (mut real, mut pending, mut skipped) = (Vec::new(), Vec::new(), 0usize);
+    for (row, ci, value) in plan {
+        if row >= nrows {
+            pending.push((row - nrows, ci, value));
+            continue;
+        }
+        let di = order.get(row).copied().unwrap_or(row);
+        if del.contains(&di) {
+            skipped += 1;
+            continue;
+        }
+        real.push((di, ci, value));
+    }
+    let staged =
+        gs.stage_many(real) + gs.stage_new_many(pending, schemaic_core::edit::BlankCell::IsAValue);
+    // After staging, because `stage` clears the bar.
+    if skipped > 0 {
+        let n = schemaic_core::text::human_count;
+        gs.commit_note.set(Some(format!(
+            "Filled {} {}, skipping {} in rows marked for deletion.",
+            n(staged),
+            schemaic_core::text::plural(staged, "cell", "cells"),
+            n(skipped)
+        )));
+    }
+}
+
 /// Rows of the grid as the user sees them — display order, staged edits and
 /// pending new rows included — over the rectangle `(r0, c0, r1, c1)`, capped at
 /// `core::prompt::ATTACH_ROW_CAP`.
@@ -11105,6 +11163,20 @@ fn data_cell(
                     MenuEntry::action("Paste", move || paste_selection(gs))
                         .shortcut(MenuKey::GridPaste),
                 );
+                // Over a block of two rows or more that this cell is part of —
+                // the selection the entries act on, as Paste's does.
+                let in_block = gs
+                    .bounds_untracked()
+                    .is_some_and(|(r0, _, r1, _)| r1 > r0 && (r0..=r1).contains(&i));
+                if in_block {
+                    use schemaic_core::edit::Fill;
+                    entries.push(MenuEntry::action("Fill down", move || {
+                        fill_selection(gs, Fill::Down)
+                    }));
+                    entries.push(MenuEntry::action("Fill up", move || {
+                        fill_selection(gs, Fill::Up)
+                    }));
+                }
             }
             // Server-side filter: splice this value into the base query's WHERE and
             // re-run (full table). NULL cells become IS NULL / IS NOT NULL.

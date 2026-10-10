@@ -606,6 +606,14 @@ pub fn row_key(rs: &ResultSet, tbl: &EditTable, di: usize) -> Vec<(String, Value
         .collect()
 }
 
+/// Which way [`GridCells::fill_plan`] copies: the selection's top row into the
+/// rows below it, or its bottom row into the rows above.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fill {
+    Down,
+    Up,
+}
+
 /// What Copy as ▸ SQL UPDATE / WHERE IN say for a result with no single keyed
 /// table — the [`EditModel::insert_target`] refusal.
 const COPY_NEEDS_ONE_KEYED_TABLE: &str =
@@ -1789,6 +1797,56 @@ impl GridCells<'_> {
             return Err("Nothing to copy: a new row has no key until it is saved.");
         }
         Ok(saved)
+    }
+
+    /// **Fill Down / Fill Up** over the selection `(r0, c0, r1, c1)`: each
+    /// selected column's top (or bottom) cell, as the grid shows it — a staged
+    /// edit included — copied into the selection's other rows. `(display row,
+    /// column, value)`, `None` being SQL NULL, for the grid to stage as it
+    /// stages a paste.
+    ///
+    /// Columns are the **drawn** ones of the selection (`selected_cols`, hidden
+    /// ones out), and one `editable` refuses is skipped in place. A pending
+    /// row's **unset** cell is not a NULL — it will take the server's default —
+    /// so a column whose source is one fills nothing rather than NULLs.
+    pub fn fill_plan(
+        &self,
+        (r0, c0, r1, c1): (usize, usize, usize, usize),
+        layout: impl Into<ColLayout>,
+        editable: impl Fn(usize) -> bool,
+        fill: Fill,
+    ) -> Vec<(usize, usize, Option<String>)> {
+        let nreal = self.rs.row_count();
+        let last = (nreal + self.new_rows.len()).saturating_sub(1);
+        let r1 = r1.min(last);
+        if r0 >= r1 {
+            return Vec::new();
+        }
+        let source = match fill {
+            Fill::Down => r0,
+            Fill::Up => r1,
+        };
+        let unset = |ci: usize| {
+            source >= nreal
+                && self
+                    .new_rows
+                    .get(source - nreal)
+                    .is_none_or(|r| !r.contains_key(&ci))
+        };
+        let ncols = self.rs.col_count();
+        let mut plan = Vec::new();
+        for ci in selected_cols((c0, c1), ncols, &layout.into()) {
+            if ci >= ncols || !editable(ci) || unset(ci) {
+                continue;
+            }
+            let value = self.summary_text(source, ci).map(|v| v.into_owned());
+            plan.extend(
+                (r0..=r1)
+                    .filter(|&d| d != source)
+                    .map(|d| (d, ci, value.clone())),
+            );
+        }
+        plan
     }
 
     /// [`GridCells::insert_blocks_at`] over the whole result, every column in
@@ -4663,6 +4721,67 @@ mod tests {
             dirty,
             new_rows,
         }
+    }
+
+    // ── Fill Down / Fill Up ───────────────────────────────────────────────────
+
+    /// Fill Down copies the selection's top cell, column by column, into every
+    /// row below it — in **display** rows, so a sorted grid fills what it shows.
+    #[test]
+    fn fill_down_copies_each_columns_top_cell_into_the_rows_below() {
+        let (r, m) = keyed_people();
+        // Displayed as rows 2, 0, 1 — `bo`, `ann`, `o'neil`.
+        let (order, formats, dirty, new) = (vec![2, 0, 1], vec![], HashMap::new(), vec![]);
+        let c = cells(&r, &order, &formats, &dirty, &new);
+        let plan = c.fill_plan((0, 1, 2, 2), None, |ci| m.text_editable(ci), Fill::Down);
+        assert_eq!(
+            plan,
+            vec![
+                (1, 1, Some("bo".to_string())),
+                (2, 1, Some("bo".to_string())),
+                (1, 2, None),
+                (2, 2, None),
+            ],
+            "a NULL at the top fills as NULL"
+        );
+    }
+
+    /// Fill Up is the same from the bottom; a staged edit is the value the
+    /// grid shows, so it is the one copied.
+    #[test]
+    fn fill_up_copies_the_bottom_cell_as_the_grid_shows_it() {
+        let (r, m) = keyed_people();
+        let mut dirty = HashMap::new();
+        dirty.insert((2, 1), CellEdit::Text("staged".into()));
+        let (order, formats, new) = (vec![0, 1, 2], vec![], vec![]);
+        let c = cells(&r, &order, &formats, &dirty, &new);
+        let plan = c.fill_plan((0, 1, 2, 1), None, |ci| m.text_editable(ci), Fill::Up);
+        assert_eq!(
+            plan,
+            vec![
+                (0, 1, Some("staged".to_string())),
+                (1, 1, Some("staged".to_string())),
+            ]
+        );
+    }
+
+    /// A column nothing can write is left alone rather than shifted onto, one
+    /// row fills nothing, and a new row's **unset** cell is a server default
+    /// rather than a NULL — so it is no value to fill with.
+    #[test]
+    fn fill_skips_what_it_cannot_write_or_has_no_value_for() {
+        let (r, m) = keyed_people();
+        let mut pending = HashMap::new();
+        pending.insert(2usize, CellEdit::Text("typed".into()));
+        let (order, formats, dirty, new) = (vec![0, 1, 2], vec![], HashMap::new(), vec![pending]);
+        let c = cells(&r, &order, &formats, &dirty, &new);
+        let editable = |ci: usize| ci != 0 && m.text_editable(ci);
+        assert!(
+            c.fill_plan((1, 0, 1, 2), None, editable, Fill::Down)
+                .is_empty()
+        );
+        let up = c.fill_plan((2, 0, 3, 2), None, editable, Fill::Up);
+        assert_eq!(up, vec![(2, 2, Some("typed".to_string()))], "{up:?}");
     }
 
     // ── The staged changes as SQL ─────────────────────────────────────────────
