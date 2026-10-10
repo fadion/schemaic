@@ -3016,9 +3016,9 @@ existing prose was left alone.
     statement beside it in the same text is still offered
     (`a_statement_carrying_a_credential_is_never_remembered`).
     **It runs on every keystroke, so what it reads is bounded.** Each space at a statement's end
-    used to re-lex every stored run of the connection — up to `history::MAX_PER_CONN` (50), each
-    stored whole — and a review measured 432 ms a keystroke, in a release build, after a Run All of
-    a mysqldump. Now a text longer than `RECALL_MAX_BYTES` (256 KiB) is skipped; one that does not
+    used to re-lex every stored run of the connection — up to `history::MAX_PER_CONN`, then 50 (now
+    200), each stored whole — and a review measured 432 ms a keystroke, in a release build, after a
+    Run All of a mysqldump. Now a text longer than `RECALL_MAX_BYTES` (256 KiB) is skipped; one that does not
     hold the typed text — searched as loosely as it is matched, by
     `text_ops::contains_collapsed_ignore_ascii_case` over `Recall::needle`, the typed text with its
     white space collapsed — is passed over; and only one that does is given its `\r\n` copy (where it holds a `\r`) and
@@ -9467,7 +9467,11 @@ existing prose was left alone.
     one spelling is a coin toss, `last_used` is `None`, the name gains ` copy`, and `scope` is
     inherited because the copy is for the same place as the original.
   - `history.rs` — query-history model (`push`/`clear_conn`/`preview`/`relative_time`),
-    persisted to `history.json`. **A statement carrying a credential is not recorded at all**
+    persisted to `history.json`, capped at `MAX_PER_CONN` (200, was 50) entries per connection.
+    **Not higher, because both readers walk all of them**: the history panel builds a highlighted
+    row for every visible entry in a `dyn_container` over `banded_list` — no virtual list — and
+    rebuilds them on each run and each search keystroke, and completion's `Recall` searches every
+    stored run of the connection as statements are typed. **A statement carrying a credential is not recorded at all**
     (`sql::carries_credential`, asked inside `push` so no caller can skip it): `IDENTIFIED`,
     `SET PASSWORD`, a `USER`/`ROLE` statement with `PASSWORD`, and T-SQL's own shapes — `CREATE`/
     `ALTER LOGIN … PASSWORD`, `BY PASSWORD` (a master key, certificate or symmetric key), a
@@ -9516,10 +9520,10 @@ existing prose was left alone.
     whole atomic rewrite of the file for nothing, and `drop_runs` deletes the entries of runs that
     never happened: a batch stops at its first failure and reports the rest `Cancelled` without
     dispatching them, so a 60-statement script failing at statement 2 evicted the connection's 50
-    real entries in favour of 48 that never ran. Deliberately **not** applied to a single run —
+    real entries (the cap then) in favour of 48 that never ran. Deliberately **not** applied to a single run —
     one the user cancels *was* dispatched and may have written something.
     **A batch does not get to evict history it did not contribute, so the cap is deferred.** Pushing
-    a Run Everything one statement at a time applied the per-connection cap on each, so a
+    a Run Everything one statement at a time applied the per-connection cap (then 50) on each, so a
     51-statement script cost the connection all 50 of its real entries *plus* its own first
     statement before anything ran — and the batch then stopped at statement 1, so `drop_runs`
     removed the 50 that never happened and the log came back **completely empty**, from an ordinary

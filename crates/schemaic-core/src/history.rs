@@ -15,7 +15,12 @@ use crate::intel::SqlDialect;
 use crate::sql;
 
 /// Cap on stored entries **per connection**; the oldest beyond this are dropped.
-pub const MAX_PER_CONN: usize = 50;
+///
+/// Not much higher, because the history panel builds a highlighted row for
+/// every entry it shows (no virtual list) and rebuilds them on each run and
+/// each search keystroke; and completion's recall searches every stored run
+/// of the connection as statements are typed. It was 50.
+pub const MAX_PER_CONN: usize = 200;
 
 /// One executed query.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
