@@ -66,3 +66,17 @@ band was filled at all.
 **What.** `src/views/editor/gutter.rs`, `paint`: the band-filling block is
 moved, unchanged, out of the number loop to just before it, inside the same
 `screen_lines.with_untracked`. Nothing else in the method changes.
+
+### 3. Whitespace marks are centred in their line, as the text is
+
+**Why.** With `RenderWhitespace` on, `EditorView::paint_text` draws each `·` and
+`→` from a text layout of its own, at the line's top. The line's text layout is
+built with the editor's line height (`LineHeightValue::Px(style.line_height)`),
+which is what centres a line's glyphs in a line taller than the font; the
+marks' layout was not, so it took the font's natural height and every mark rode
+at the top of the line, above the middle of the text beside it.
+
+**What.** `src/views/editor/view.rs`, `paint_text`: the marks' `Attrs` gain
+`.line_height(LineHeightValue::Px(style.line_height(edid, line)))`, the same
+value the line's own layout is given in `Editor::new_text_layout`. Nothing
+else changes; the marks keep their x, colour, family and size.

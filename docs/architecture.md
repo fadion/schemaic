@@ -26657,8 +26657,9 @@ existing prose was left alone.
     are floem's own, not ours: `editor_pane`'s `editor_style` closure passes
     `render_white_space(RenderWhitespace::All | None)` and `indent_guide(bool)`, and they draw in the
     `visible_whitespace`/`indent_guide_color` the closure already set — the editor theme's
-    `selection`. There is no rendering code of ours behind either. The palette's *Toggle Whitespace*
-    and *Toggle Indent Guides* sit beside *Toggle Word Wrap*.
+    `selection`. There is no rendering code of ours behind either — only vendored Floem's third
+    patch, which centres the whitespace marks in their line (*Floem 0.2 gotchas*). The palette's
+    *Toggle Whitespace* and *Toggle Indent Guides* sit beside *Toggle Word Wrap*.
     **Keyword case when formatting** (Settings → Editor, a `focusable_dropdown` after *Indent
     guides*, *As typed* by default — `UiState::format_keyword_case`, pinned by
     `format_keyword_case_defaults_to_as_typed_and_keeps_a_choice`; `LayoutUi::keyword_case`) is the
@@ -33343,7 +33344,11 @@ Re-introducing the anti-patterns these guard against is a regression:
   app needs it is under `app::update`'s Linux packaging. The second moves the gutter's
   current-line band fill in `EditorGutterView::paint` ahead of the number loop: upstream filled
   every caret's band on reaching the *primary* caret's line, over a secondary caret's number
-  already drawn above it, and filled none once the primary's line scrolled off. **Three measures
+  already drawn above it, and filled none once the primary's line scrolled off. The third gives
+  the whitespace marks' `Attrs` in `EditorView::paint_text` the line's line height
+  (`LineHeightValue::Px(style.line_height(edid, line))`, as `Editor::new_text_layout` gives the line
+  itself): the `·`/`→` are laid out separately from the line, and without it they took the font's
+  natural height and rode at the top of any line taller than the font. **Three measures
   keep upstream's code out of the workspace's checks, and each looks removable**: `exclude = ["vendor"]` in the root
   manifest, since a path dependency inside the workspace directory would otherwise join it as a
   member; `vendor/floem/rustfmt.toml` with `disable_all_formatting = true`, since `cargo fmt --all`

@@ -771,10 +771,15 @@ impl EditorView {
             if let Some(whitespaces) = &text_layout.whitespaces {
                 let family = style.font_family(edid, line);
                 let font_size = style.font_size(edid, line) as f32;
+                // schemaic patch (PATCHES.md): the line's own line height, as
+                // the line's text layout is given it, so each mark is centred
+                // in its line as the text is — without it a mark rode at the
+                // top of any line taller than the font.
                 let attrs = Attrs::new()
                     .color(ed.es.with_untracked(|es| es.visible_whitespace()))
                     .family(&family)
-                    .font_size(font_size);
+                    .font_size(font_size)
+                    .line_height(crate::text::LineHeightValue::Px(style.line_height(edid, line)));
                 let attrs_list = AttrsList::new(attrs);
                 let mut space_text = TextLayout::new();
                 space_text.set_text("·", attrs_list.clone());
