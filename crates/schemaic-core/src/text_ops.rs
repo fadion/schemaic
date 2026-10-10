@@ -596,23 +596,30 @@ pub fn duplicate_lines(
     (le, format!("\n{}", &text[ls..le]), (lo + shift, hi + shift))
 }
 
-/// Byte offsets of every (non-overlapping) ASCII-case-insensitive occurrence of
-/// `needle` in `hay`. Offsets index into `hay` directly (the search is byte-wise
-/// and boundary-checked, so no `to_lowercase` reallocation shifts them). Empty
-/// needle → no matches.
+/// Byte offsets of every (non-overlapping) case-insensitive occurrence of
+/// `needle` in `hay`. Offsets index into `hay` directly (the search walks `hay`
+/// itself, so no `to_lowercase` reallocation shifts them). Empty needle → no
+/// matches.
+///
+/// **Every hit spans exactly `needle.len()` bytes**, which is what the find
+/// bar selects, highlights and replaces by. So the folding is per character,
+/// by a character's lowercase when that is one character ([`fold_char`]), and
+/// two characters are the same only when they are as wide in UTF-8 as well:
+/// `É`/`é`, `Ö`/`ö`, Cyrillic and Greek fold, while the few pairs whose cases
+/// differ in width — the Kelvin sign `K` and `k`, `ſ` and `s` — stay
+/// case-sensitive rather than report a span that cuts a character. An ASCII
+/// needle takes the byte-wise path, and matches exactly what it would by the
+/// character walk: no other character is as narrow as an ASCII one.
 pub fn find_matches(hay: &str, needle: &str) -> Vec<usize> {
     let n = needle.len();
     if n == 0 || hay.len() < n {
         return Vec::new();
     }
-    let (hb, nb) = (hay.as_bytes(), needle.as_bytes());
+    let ascii = needle.is_ascii();
     let mut out = Vec::new();
     let mut i = 0;
-    while i + n <= hb.len() {
-        if hb[i..i + n].eq_ignore_ascii_case(nb)
-            && hay.is_char_boundary(i)
-            && hay.is_char_boundary(i + n)
-        {
+    while i + n <= hay.len() {
+        if folded_match_at(hay, i, needle, ascii) {
             out.push(i);
             i += n; // non-overlapping
         } else {
@@ -620,6 +627,36 @@ pub fn find_matches(hay: &str, needle: &str) -> Vec<usize> {
         }
     }
     out
+}
+
+/// A character's lowercase, when it is a single character; the character
+/// itself otherwise (`İ` lowercases to two). [`find_matches`]' folding.
+fn fold_char(c: char) -> char {
+    let mut lower = c.to_lowercase();
+    match (lower.next(), lower.next()) {
+        (Some(l), None) => l,
+        _ => c,
+    }
+}
+
+/// [`matches_at`] with the needle's ASCII-ness worked out once by the caller,
+/// since [`find_matches`] asks it at every byte of the document.
+fn folded_match_at(hay: &str, off: usize, needle: &str, ascii: bool) -> bool {
+    // `get` refuses an offset out of range or off a char boundary.
+    let Some(span) = off
+        .checked_add(needle.len())
+        .and_then(|end| hay.get(off..end))
+    else {
+        return false;
+    };
+    if ascii {
+        return span.as_bytes().eq_ignore_ascii_case(needle.as_bytes());
+    }
+    // Equal byte lengths, and every pair as wide as each other, so the two
+    // run out of characters together.
+    span.chars()
+        .zip(needle.chars())
+        .all(|(a, b)| a == b || (a.len_utf8() == b.len_utf8() && fold_char(a) == fold_char(b)))
 }
 
 /// What Ctrl+F / Ctrl+H put in the find field: the selected text, when there
@@ -643,7 +680,7 @@ pub fn first_hit_from(hits: &[usize], from: usize) -> usize {
 }
 
 /// Is `needle` still exactly at byte offset `off` in `hay`, by the same
-/// ASCII-case-insensitive rule [`find_matches`] uses?
+/// case-insensitive rule [`find_matches`] uses?
 ///
 /// The question a *stored* match offset has to answer before anything edits it.
 /// The find bar keeps its hit list in a signal, and an edit elsewhere in the
@@ -657,17 +694,10 @@ pub fn first_hit_from(hits: &[usize], from: usize) -> usize {
 /// caller can treat "not a match any more" and "not addressable any more" the
 /// same way: re-derive.
 pub fn matches_at(hay: &str, off: usize, needle: &str) -> bool {
-    if needle.is_empty() {
-        return false;
-    }
-    let end = off + needle.len();
-    end <= hay.len()
-        && hay.is_char_boundary(off)
-        && hay.is_char_boundary(end)
-        && hay.as_bytes()[off..end].eq_ignore_ascii_case(needle.as_bytes())
+    !needle.is_empty() && folded_match_at(hay, off, needle, needle.is_ascii())
 }
 
-/// Replace every non-overlapping ASCII-case-insensitive occurrence of `needle`
+/// Replace every non-overlapping case-insensitive occurrence of `needle`
 /// in `hay` with `replacement`, returning the new string and the number of
 /// replacements. Matches are the same ones [`find_matches`] reports (so the UI's
 /// count and replace-all agree). Empty needle → unchanged, zero replacements.
@@ -2622,6 +2652,38 @@ mod tests {
         assert_eq!(find_matches("abc", "xyz"), Vec::<usize>::new());
         // Offsets index into the original string (é is 2 bytes → bar at byte 6).
         assert_eq!(find_matches("café bar", "bar"), vec![6]);
+    }
+
+    /// Case folding reaches past ASCII: a German, French or Cyrillic name is
+    /// found whichever case it was typed in, as an ASCII one always was.
+    #[test]
+    fn find_folds_the_case_of_non_ascii_letters() {
+        assert_eq!(find_matches("CAFÉ café Café", "café"), vec![0, 6, 12]);
+        assert_eq!(find_matches("Привет ПРИВЕТ", "привет"), vec![0, 13]);
+        assert_eq!(find_matches("Größe GRÖSSE größe", "GRÖßE"), vec![0, 16]);
+        assert_eq!(find_matches("ΣΟΦΊΑ σοφία", "σοφία"), vec![0, 11]);
+        assert!(matches_at("Élan", 0, "élan"));
+        assert_eq!(
+            replace_all("Ärger ärger", "ärger", "x"),
+            ("x x".to_string(), 2)
+        );
+    }
+
+    /// Every hit still spans exactly `needle.len()` bytes, which is what the
+    /// find bar's selection, highlight and replace all measure it by. A pair
+    /// whose two cases differ in UTF-8 length — the Kelvin sign `K` (3 bytes)
+    /// and `k`, the long `ſ` and `s` — is therefore left case-sensitive
+    /// rather than reported with a span that cuts a character.
+    #[test]
+    fn a_folded_match_never_changes_the_hits_byte_length() {
+        assert_eq!(find_matches("\u{212A}elvin kelvin", "kelvin"), vec![9]);
+        assert_eq!(find_matches("ſ s S", "s"), vec![3, 5]);
+        for (hay, needle) in [("Größe GRÖSSE", "größe"), ("Привет", "ПРИВЕТ")] {
+            for off in find_matches(hay, needle) {
+                assert!(hay.get(off..off + needle.len()).is_some());
+                assert!(matches_at(hay, off, needle));
+            }
+        }
     }
 
     #[test]

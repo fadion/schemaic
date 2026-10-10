@@ -12513,7 +12513,20 @@ existing prose was left alone.
       takes the harness key for it, so the level and the vendor are read at the one seam that knows
       both.
   - `text_ops.rs` — Ctrl+/ `toggle_line_comment` + `find_matches`/`replace_all`/
-    `contains_ignore_ascii_case` (find bars). Pure, ASCII-case-insensitive, byte-offset-preserving.
+    `contains_ignore_ascii_case` (find bars). Pure and byte-offset-preserving.
+    **`find_matches`, `matches_at` and `replace_all` fold non-ASCII letters too** — `É`/`é`,
+    `Ö`/`ö`, Cyrillic, Greek — where they used to fold ASCII only; `contains_ignore_ascii_case`
+    (called from `grid`, `history`, `snippet`, `users` and `activity`) still folds ASCII only, as
+    its name says. The fold is per character, a char's lowercase when that is one char
+    (`fold_char`), and **two chars are equal only if they are as wide in UTF-8 as well**. That is
+    load-bearing: every hit spans exactly `needle.len()` bytes, because that is what the editor's
+    find bar selects, highlights and replaces by, and what the match highlights in `overlays.rs`
+    and `widgets.rs` span with `t.len()`. So the few pairs whose cases differ in width — the
+    Kelvin sign `K` and `k`, `ſ` and `s` — stay case-sensitive rather than report a span that cuts
+    a character, and the search walks the haystack itself rather than a `to_lowercase` copy, whose
+    offsets would not be the document's. An ASCII needle keeps the byte-wise path, which matches
+    exactly what the char walk would, no other character being as narrow as an ASCII one
+    (`find_folds_the_case_of_non_ascii_letters`, `a_folded_match_never_changes_the_hits_byte_length`).
     `find_seed` and `first_hit_from` are how the editor's find bar opens: Ctrl+F/Ctrl+H seed the
     field from the selection only when it is non-empty and on one line — a multi-line selection is
     a block being worked on, not a needle, and the field is one line, so it seeds nothing and the
