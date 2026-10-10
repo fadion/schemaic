@@ -10462,7 +10462,11 @@ existing prose was left alone.
     order. A folder is its name **as read**: trimmed, a blank one is none, and names differing only
     in case are one folder headed by the spelling met first, since two folders a user cannot tell
     apart on screen would be a place to lose a connection
-    (`a_folder_name_is_trimmed_and_matched_ignoring_case`). `listed_rows` is that as the rows a list
+    (`a_folder_name_is_trimmed_and_matched_ignoring_case`). `folder_names` is those headings without
+    the ungrouped `""` — what the connection form's Folder field suggests — so accepting one, which
+    writes the list's spelling (`FieldCfg::suggest`), files the connection under the folder already
+    on screen rather than a second casing of it
+    (`the_folder_suggestions_are_each_folder_once_as_the_lists_spell_it`). `listed_rows` is that as the rows a list
     draws — a `ListedRow::Folder` heading over its `ListedRow::Connection(id)`s, and no folders at
     all is the saved order with no headings — and `listed_ids` is the ids in drawn order, which is
     what the arrow keys walk: stepping in saved order would jump between folders on screen
@@ -21435,9 +21439,17 @@ existing prose was left alone.
     `false` at `to_connection` would have compiled and silently cleared the flag every time a user
     edited an exposed connection for any other reason.
     **The *Folder* field is free text, right after Name and Colour**, because a folder is only its
-    name (`Connection::folder`) and there is no list of them to pick from. It sits at tabindex 17 —
-    after the swatches' 15, before the first toggle's 20 — which is where it sits on screen, for the
-    CLI toggle's reason; its hint is *"Optional. Connections with the same folder are listed
+    name (`Connection::folder`) and there is nothing to create first. It is still **suggested**:
+    `table_designer::suggest_field` over `connection::folder_names`, a ghost to Tab into and a
+    chevron listing the folders in use, as a column's type and a database's collation are — because
+    retyping a folder by hand could quietly start a second one under a misspelling (issue #8). It is
+    `clearable`, as the schema tree's search is: the trailing × is the visible way back to *no
+    folder*, which an empty box otherwise only implies — and the ghost already makes room for it,
+    `edit_field` passing `has_side` to the ghost's `inset_right`. The
+    list is read untracked from the saved `connections`, which `conn_form` takes for this alone,
+    with the `OverlayUi` the menu opens on, both passed from `manage_modal`. It sits at tabindex 17
+    — after the swatches' 15, before the first toggle's 20, the chevron taking 18 — which is where
+    it sits on screen, for the CLI toggle's reason; its hint is *"Optional. Connections with the same folder are listed
     together."*, and `DraftSignals::folder` is threaded through create, load, reset and
     `to_connection` like the rest. The list on the left iterates `connection::listed_rows`, keyed by
     the `ListedRow`, and its Up/Down `nav_group` steps through `listed_ids` — the order drawn, not the
@@ -22912,7 +22924,8 @@ existing prose was left alone.
     `tabindex + 1`. The pair was hand-assembled in four modules before the ghost came, and a field
     built on its own copy would have gained the menu and not the ghost — the column Type and MySQL
     Engine (`bound_field_with_menu`), the database editor's `optional_field`, the grant form's
-    `suggested_field` and the domain's base Type all go through it now.
+    `suggested_field` and the domain's base Type all go through it now, as does the connection
+    form's Folder.
     The preview's SQL box is a read-only monospace `edit_field` that **wraps**: it was `no_wrap`,
     and an `edit_field` has no wheel to scroll sideways (only the editor pane wires Shift+wheel, see
     the Floem gotchas), so the end of a long statement — a selective XML index's paths, a rebuild's

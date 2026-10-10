@@ -25,13 +25,14 @@ use floem::reactive::create_effect;
 use schemaic_core::connection::AiData;
 use schemaic_core::connection::AuthMode;
 use schemaic_core::connection::Environment;
-use schemaic_core::connection::{ListedRow, listed_ids, listed_rows};
+use schemaic_core::connection::{Connection, ListedRow, folder_names, listed_ids, listed_rows};
 
 use schemaic_core::connection::SshAuth;
 use schemaic_core::connection::SslMode;
 
 use crate::consts::MASK_CH;
 use crate::settings::{focusable_dropdown, focusable_toggle_row};
+use crate::table_designer::suggest_field;
 use crate::tooltip::TooltipExt;
 use crate::widgets;
 use crate::widgets::{
@@ -1003,6 +1004,8 @@ pub(crate) fn manage_modal(conn: ConnUi, o: OverlayUi, actions: Rc<ConnActions>)
                 save_flash,
                 test_flash,
                 ring.clone(),
+                connections,
+                o,
             );
             let root_ring = ring;
 
@@ -1562,6 +1565,11 @@ fn conn_form(
     // block — built only once its toggle is on — claims the 100s so it lands
     // between the toggle that reveals it and the fields below.
     ring: FocusRing,
+    // The saved connections, read only for the folders Folder suggests.
+    connections: RwSignal<Vec<Connection>>,
+    // For the Folder field's suggestion menu, which opens on the app-wide popup
+    // channel like every other menu.
+    overlay: OverlayUi,
 ) -> impl IntoView {
     // Editing any connection parameter invalidates a prior Test result, so reset
     // the indicator whenever host/port/user/password or the SSH fields change.
@@ -1813,8 +1821,29 @@ fn conn_form(
     // `conn_field_w`, like Database and User: a folder name is a short word, and
     // a full-width box made it the widest field on the form. The hint below
     // keeps the full width so it stays on one line.
+    //
+    // It suggests the folders already in use (`connection::folder_names`): a
+    // ghost to Tab into and a chevron listing them, through `suggest_field` as
+    // a column's type and a database's collation do — so retyping a folder
+    // cannot quietly start a second one under a misspelling. The chevron takes
+    // 18, the slot after the field's. Clearable, as the schema search is: the
+    // × is the visible way back to "no folder", which an empty box otherwise
+    // only implies.
     let folder_field = v_stack((
-        field("Folder", draft.folder, ring.clone(), 17).style(|s| s.width(conn_field_w())),
+        text("Folder").style(form_label_style),
+        suggest_field(
+            overlay,
+            draft.folder,
+            FieldCfg {
+                clearable: true,
+                ..Default::default()
+            },
+            conn_field_w,
+            move || connections.with_untracked(|cs| folder_names(cs)),
+            "No folders yet",
+            ring.clone(),
+            17,
+        ),
         text("Optional. Connections with the same folder are listed together.").style(|s| {
             s.width_full()
                 .font_size(theme::font_hint())

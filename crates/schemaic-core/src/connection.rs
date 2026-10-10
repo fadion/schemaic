@@ -1575,6 +1575,20 @@ pub fn group_by_folder(conns: &[Connection]) -> Vec<(String, Vec<&Connection>)> 
     groups
 }
 
+/// The folders the connections already use, as the Folder field suggests
+/// them: [`group_by_folder`]'s headings without the ungrouped one, so each is
+/// read the way the lists read it — trimmed, case-folded into one under the
+/// spelling met first, A–Z ignoring case. Accepting a suggestion writes that
+/// spelling, so the folder a user picks is the one already on screen rather
+/// than a second casing of it.
+pub fn folder_names(conns: &[Connection]) -> Vec<String> {
+    group_by_folder(conns)
+        .into_iter()
+        .map(|(folder, _)| folder)
+        .filter(|f| !f.is_empty())
+        .collect()
+}
+
 /// One row of a connection list: a folder's heading, or a connection by id.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ListedRow {
@@ -2874,6 +2888,26 @@ mod tests {
         assert_eq!(groups[0].0, "");
         assert_eq!(groups[1].0, "Prod");
         assert_eq!(groups[1].1.len(), 2);
+    }
+
+    /// What the Folder field suggests: each folder once, in the spelling the
+    /// lists head it with, A–Z — and never the blank "no folder".
+    #[test]
+    fn the_folder_suggestions_are_each_folder_once_as_the_lists_spell_it() {
+        let cs = [
+            in_folder(1, "a", "staging"),
+            in_folder(2, "b", " Prod "),
+            in_folder(3, "c", ""),
+            in_folder(4, "d", "prod"),
+            in_folder(5, "e", "   "),
+        ];
+        assert_eq!(folder_names(&cs), vec!["Prod", "staging"]);
+    }
+
+    #[test]
+    fn no_folders_means_no_suggestions() {
+        assert!(folder_names(&[]).is_empty());
+        assert!(folder_names(&[in_folder(1, "a", ""), in_folder(2, "b", " ")]).is_empty());
     }
 
     /// A file written before folders existed has none, and loads ungrouped.
