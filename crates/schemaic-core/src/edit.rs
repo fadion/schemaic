@@ -634,6 +634,118 @@ fn key_match(rs: &ResultSet, tbl: &EditTable, di: usize, dialect: SqlDialect) ->
         .join(" AND ")
 }
 
+/// The staged changes as the SQL **Commit would run** — [`GridWrite::plan`]'s
+/// statements in its own order (deletes, updates, inserts), one a line, for the
+/// user to read or copy before committing.
+///
+/// Rendered, not executed: the commit binds its values and matches its key
+/// NULL-safely (`<=>`, `IS NOT DISTINCT FROM`), where this writes literals
+/// through `export::script_literal` — with the column's type from `rs`, so SQL
+/// Server's `N'…'` and its language-safe dates are the ones a script gets — and
+/// a key as `=` / `IS NULL`, the spelling a person runs. **A staged blob is
+/// not written as data**: no literal here carries bytes, so its value is the
+/// grid's own `<n bytes>`, unquoted, and the copy fails loudly if it is run
+/// rather than storing the placeholder; a `-- NOTE` heads the text to say so.
+///
+/// [`GridWrite::plan`]: crate::model::GridWrite::plan
+pub fn staged_sql(write: &crate::model::GridWrite, rs: &ResultSet, dialect: SqlDialect) -> String {
+    use crate::export::{ident_sql, qualified_table, script_literal};
+    use crate::model::WriteStep;
+    // The type a written column has in the result, matched on its provenance —
+    // the statements name columns, and the literal needs the type.
+    let type_of = |database: &str, schema: Option<&str>, table: &str, column: &str| {
+        rs.columns
+            .iter()
+            .find(|c| {
+                c.origin.as_ref().is_some_and(|o| {
+                    o.database == database
+                        && o.schema.as_deref() == schema
+                        && o.table == table
+                        && o.column == column
+                })
+            })
+            .map_or(String::new(), |c| c.type_name.clone())
+    };
+    let mut bytes = false;
+    let mut cell = |e: &CellEdit, ty: &str| match e {
+        CellEdit::Bytes(b) => {
+            bytes = true;
+            crate::model::binary_display(b.len())
+        }
+        e => script_literal(&e.to_value(), ty, dialect),
+    };
+    let key = |key: &[(String, Value)], ty: &dyn Fn(&str) -> String| {
+        key.iter()
+            .map(|(name, v)| match v {
+                Value::Null => format!("{} IS NULL", ident_sql(name, dialect)),
+                v => format!(
+                    "{} = {}",
+                    ident_sql(name, dialect),
+                    script_literal(v, &ty(name), dialect)
+                ),
+            })
+            .collect::<Vec<_>>()
+            .join(" AND ")
+    };
+    let mut lines = Vec::new();
+    for step in write.plan() {
+        let (database, schema, table) = match step {
+            WriteStep::Delete(d) => (&d.database, d.schema.as_deref(), &d.table),
+            WriteStep::Update(u) => (&u.database, u.schema.as_deref(), &u.table),
+            WriteStep::Insert(i) => (&i.database, i.schema.as_deref(), &i.table),
+        };
+        let target = qualified_table(database, schema, table, dialect);
+        let ty = |column: &str| type_of(database, schema, table, column);
+        lines.push(match step {
+            WriteStep::Delete(d) => format!("DELETE FROM {target} WHERE {};", key(&d.key, &ty)),
+            WriteStep::Update(u) => {
+                let set = u
+                    .set
+                    .iter()
+                    .map(|(c, e)| format!("{} = {}", ident_sql(c, dialect), cell(e, &ty(c))))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("UPDATE {target} SET {set} WHERE {};", key(&u.key, &ty))
+            }
+            // Every column left out takes its default, and with none named the
+            // engines disagree on how to say so.
+            WriteStep::Insert(i) if i.cols.is_empty() => match dialect {
+                SqlDialect::MySql => format!("INSERT INTO {target} () VALUES ();"),
+                SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => {
+                    format!("INSERT INTO {target} DEFAULT VALUES;")
+                }
+            },
+            WriteStep::Insert(i) => {
+                let names = i
+                    .cols
+                    .iter()
+                    .map(|(c, _)| ident_sql(c, dialect))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let values = i
+                    .cols
+                    .iter()
+                    .map(|(c, e)| cell(e, &ty(c)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("INSERT INTO {target} ({names}) VALUES ({values});")
+            }
+        });
+    }
+    let mut out = String::new();
+    if bytes {
+        out.push_str(
+            "-- NOTE: a staged binary value is shown as its size, not its bytes; the statement \
+             carrying it will not run as written.\n",
+        );
+    }
+    for line in lines {
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out
+}
+
 /// A result column's **real** name on its base table, from the wire provenance.
 /// Empty for an expression column, which is never written to.
 pub fn origin_column(rs: &ResultSet, ci: usize) -> String {
@@ -4551,6 +4663,89 @@ mod tests {
             dirty,
             new_rows,
         }
+    }
+
+    // ── The staged changes as SQL ─────────────────────────────────────────────
+
+    fn staged_write() -> crate::model::GridWrite {
+        use crate::model::{GridWrite, RowDelete, RowEdit, RowInsert};
+        let at = |table: &str| ("db".to_string(), None, table.to_string());
+        let (database, schema, table) = at("t");
+        GridWrite {
+            updates: vec![RowEdit {
+                database: database.clone(),
+                schema: schema.clone(),
+                table: table.clone(),
+                set: vec![
+                    ("name".into(), CellEdit::Text("o'neil".into())),
+                    ("note".into(), CellEdit::Null),
+                ],
+                key: vec![("id".into(), Value::Int(2))],
+            }],
+            inserts: vec![RowInsert {
+                database: database.clone(),
+                schema: schema.clone(),
+                table: table.clone(),
+                cols: vec![("name".into(), CellEdit::Text("new".into()))],
+            }],
+            deletes: vec![RowDelete {
+                database,
+                schema,
+                table,
+                key: vec![("id".into(), Value::Int(3))],
+            }],
+        }
+    }
+
+    /// What Commit would run, as SQL a person reads: the plan's own order
+    /// (deletes, updates, inserts), one statement a line, through the export's
+    /// quoter and literals.
+    #[test]
+    fn staged_sql_is_the_plan_in_its_own_order() {
+        let (r, _) = keyed_people();
+        assert_eq!(
+            staged_sql(&staged_write(), &r, SqlDialect::MySql),
+            "DELETE FROM `db`.`t` WHERE `id` = 3;\n\
+             UPDATE `db`.`t` SET `name` = 'o''neil', `note` = NULL WHERE `id` = 2;\n\
+             INSERT INTO `db`.`t` (`name`) VALUES ('new');\n"
+        );
+    }
+
+    /// A new row with nothing typed takes every default, which each engine
+    /// spells its own way — and SQL Server's `N'…'` is the column's type speaking.
+    #[test]
+    fn staged_sql_speaks_each_engines_dialect() {
+        let (r, _) = keyed_people();
+        let mut w = staged_write();
+        w.inserts[0].cols.clear();
+        let mysql = staged_sql(&w, &r, SqlDialect::MySql);
+        assert!(
+            mysql.contains("INSERT INTO `db`.`t` () VALUES ();"),
+            "{mysql}"
+        );
+        let pg = staged_sql(&w, &r, SqlDialect::Postgres);
+        assert!(
+            pg.contains("INSERT INTO \"db\".\"t\" DEFAULT VALUES;"),
+            "{pg}"
+        );
+        let mssql = staged_sql(&staged_write(), &r, SqlDialect::MsSql);
+        assert!(mssql.contains("SET [name] = N'o''neil'"), "{mssql}");
+        assert!(mssql.contains("DELETE FROM [t] WHERE [id] = 3;"), "{mssql}");
+    }
+
+    /// A NULL key is matched with `IS NULL` — `=` never matches one — and a
+    /// staged blob is shown as what it is, unquoted, so the copy fails loudly if
+    /// run rather than writing a placeholder into the column.
+    #[test]
+    fn staged_sql_says_null_keys_and_withholds_bytes() {
+        let (r, _) = keyed_people();
+        let mut w = staged_write();
+        w.deletes[0].key.push(("note".into(), Value::Null));
+        w.updates[0].set = vec![("name".into(), CellEdit::Bytes(vec![1u8, 2, 3].into()))];
+        let sql = staged_sql(&w, &r, SqlDialect::MySql);
+        assert!(sql.contains("WHERE `id` = 3 AND `note` IS NULL;"), "{sql}");
+        assert!(sql.contains("SET `name` = <3 bytes> WHERE"), "{sql}");
+        assert!(sql.starts_with("-- NOTE: "), "{sql}");
     }
 
     // ── Copy as UPDATE / WHERE key IN ─────────────────────────────────────────

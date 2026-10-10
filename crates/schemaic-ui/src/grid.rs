@@ -5668,6 +5668,30 @@ fn arm_wait_note(gs: GridState) {
     );
 }
 
+/// Copy the staged changes as the SQL **Commit would run** —
+/// `edit::staged_sql` over the very `GridWrite` [`commit_grid`] builds, after
+/// the same flush of an open in-cell edit, so what is copied is what the tick
+/// would send. Rendered with literals for a person to read or keep; the commit
+/// itself still binds.
+fn copy_staged_sql(gs: GridState) {
+    if gs.edit_cell.get_untracked().is_some() {
+        gs.commit_edit();
+    }
+    let write = GridWrite {
+        updates: gs.build_edits(),
+        inserts: gs.build_inserts(),
+        deletes: gs.build_deletes(),
+    };
+    if write.is_empty() {
+        return;
+    }
+    let rs = gs.rs.get_untracked();
+    let sql = schemaic_core::edit::staged_sql(&write, &rs, gs.dialect);
+    let _ = floem::Clipboard::set_contents(sql);
+    gs.commit_note
+        .set(Some("Copied the staged changes as SQL.".to_string()));
+}
+
 /// Execute all staged edits (Ctrl+Enter or the toolbar ✓). The app runs them
 /// transactionally, then — when the result is a spliceable single table — re-
 /// fetches just the edited rows and hands them back so the grid splices them in
@@ -8320,6 +8344,7 @@ fn filter_bar(gs: GridState) -> impl IntoView {
 /// ring — it holds nothing else — and spaced by ten so a control can be added
 /// between two without renumbering.
 const TB_COMMIT: u32 = 10;
+const TB_COPY_SQL: u32 = 15;
 const TB_DISCARD: u32 = 20;
 const TB_ADD: u32 = 30;
 const TB_DELETE: u32 = 40;
@@ -8790,11 +8815,46 @@ fn grid_toolbar(
             // not just the edited cells — the ✗ sits next to a count that reads
             // like it belongs to the ✓ alone.
             .tooltip(|| text("Discard all pending changes").style(crate::widgets::tooltip_style));
-            let (r1, r2) = (strip_commit.clone(), strip_commit.clone());
+            // Between the two it is about: what the tick would send, as text.
+            let sql_hov = RwSignal::new(false);
+            let copy_sql = container(
+                icons::icon(icons::COPY, crate::consts::TOOLBAR_ICON_BASE).style(move |s| {
+                    let c = if sql_hov.get() {
+                        theme::text()
+                    } else {
+                        theme::text_muted()
+                    };
+                    s.color(c).flex_shrink(0.0_f32)
+                }),
+            )
+            .on_click_stop(move |_| copy_staged_sql(gs))
+            .on_event_cont(EventListener::PointerEnter, move |_| sql_hov.set(true))
+            .on_event_cont(EventListener::PointerLeave, move |_| sql_hov.set(false))
+            .style(|s| {
+                s.items_center()
+                    .padding_vert(theme::scaled(3.0))
+                    .padding_horiz(theme::scaled(5.0))
+                    .cursor(CursorStyle::Default)
+            })
+            .tooltip(|| text("Copy the changes as SQL").style(crate::widgets::tooltip_style));
+            let (r1, r2, r3) = (
+                strip_commit.clone(),
+                strip_commit.clone(),
+                strip_commit.clone(),
+            );
             h_stack((
                 in_strip_button(commit, r1, TB_COMMIT, true, leave, panel_keys, move || {
                     commit_grid(gs)
                 }),
+                in_strip_button(
+                    copy_sql,
+                    r3,
+                    TB_COPY_SQL,
+                    true,
+                    leave,
+                    panel_keys,
+                    move || copy_staged_sql(gs),
+                ),
                 in_strip_button(
                     discard,
                     r2,

@@ -3697,6 +3697,22 @@ existing prose was left alone.
     will hold is a server default, previewed as `<auto>`, and it counts as neither a value nor a
     null. It returns a `Cow`, for `with_text`'s reason — a Ctrl+A over a 200,000-row column
     resolves every cell and only a staged blob's `<n bytes>` has to be built.
+    **`staged_sql` is the staged batch as SQL a person reads — the commit strip's *Copy the changes
+    as SQL* — and it renders the very `GridWrite` Commit would send** rather than reading `dirty` a
+    second time, so the copy and the commit cannot come to differ on which rows or which keys: the
+    statements are `GridWrite::plan`'s, in its order (DELETEs, UPDATEs, INSERTs), one a line
+    (`staged_sql_is_the_plan_in_its_own_order`). **It is not what Commit executes, and does not
+    pretend to be**: the commit binds its values and matches a key NULL-safely (`<=>`, `IS NOT
+    DISTINCT FROM`), where this writes literals through `export::script_literal` and a key as `=` or
+    `IS NULL`, `key_match`'s spelling. A literal's type is its result column's, found by matching
+    provenance because the plan names columns rather than indexing them — which is what gives SQL
+    Server its `N'…'` (`staged_sql_speaks_each_engines_dialect`); names go through
+    `export::ident_sql` and the table through `export::qualified_table`. An `INSERT` that sets no
+    column is `() VALUES ()` on MySQL and `DEFAULT VALUES` elsewhere. **A staged blob is withheld,
+    not written**: no literal here carries bytes, so its value is the grid's `<n bytes>`
+    placeholder *unquoted* and a `-- NOTE:` line heads the text — the statement fails loudly if run,
+    where a quoted placeholder would store that string in the column
+    (`staged_sql_says_null_keys_and_withholds_bytes`).
     **`order_key_columns` is `resolve_key`'s ladder walked over the *table* alone**, for a caller
     that needs the key before it has a result set. The Live Monitor is that caller: it must put an
     `ORDER BY` on the very first poll and cannot ask `analyze_edit` until a poll has come back, and
@@ -36793,8 +36809,12 @@ this bundle's.
   when schema isn't loaded; else, last, a backend-asserted implicit key — SQLite's projected
   `rowid` — which keys the write but is itself never editable). Flow: double-click an editable cell (or Enter) → inline editor; **Enter**
   stages into `gs.dirty` and paints the cell `grid_edit_staged()`; **Ctrl+Enter** / toolbar ✓ calls
-  `commit_grid` → a `GridWrite { updates, inserts }` → the app's `commit_edits`. On success the app
-  re-runs the query; on failure the error shows in the toolbar and green edits stay. No global "Edit"
+  `commit_grid` → a `GridWrite { updates, inserts, deletes }` → the app's `commit_edits`. On success
+  the app re-runs the query; on failure the error shows in the toolbar and green edits stay. The
+  strip's copy icon between ✓ and ✗ (*Copy the changes as SQL*, `copy_staged_sql`) builds that same
+  `GridWrite` after the same flush of an open in-cell edit and puts `edit::staged_sql` of it on the
+  clipboard, with the confirmation on `commit_note` — readable SQL with literals, not the bound
+  statements the commit runs (see `core::edit`). No global "Edit"
   toggle. A read-only cell's double-click only selects it — **except a binary one**, where it opens
   the binary-cell panel (`open_blob`, the same call the cell menu's entry makes). C2 — now
   `EditModel::text_editable` — keeps the inline editor off that column whether or not the column
