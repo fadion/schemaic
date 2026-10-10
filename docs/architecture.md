@@ -12648,6 +12648,19 @@ existing prose was left alone.
     offsets would not be the document's. An ASCII needle keeps the byte-wise path, which matches
     exactly what the char walk would, no other character being as narrow as an ASCII one
     (`find_folds_the_case_of_non_ascii_letters`, `a_folded_match_never_changes_the_hits_byte_length`).
+    **The find bar's Match case and Whole word are `FindOptions`**, taken by `find_matches_in`,
+    `matches_at_in` and `replace_all_in`; the three names without the suffix are those with the
+    default (both off), unchanged in behaviour, so the highlight callers above never see the
+    options. Every entry point asks one private `hit_at`, so the count, the step and Replace All
+    cannot disagree about what a hit is. Match case compares the span byte for byte instead of
+    folding; whole word then refuses a hit with a word byte beside it, by `sql::is_word_byte` — the
+    one definition, so `_` and a non-ASCII letter continue a word as they do an identifier — asked
+    only on a side where the needle's own edge is a word byte, so `f(` wants a boundary on its left
+    alone. Both options keep every hit exactly `needle.len()` bytes, one by comparing the same span
+    more strictly and the other by only refusing, and that invariant is **why regex is not among
+    them**: a pattern's match has its own length, and the bar selects, reveals and replaces by the
+    needle's (`match_case_finds_only_the_exact_spelling`,
+    `whole_word_finds_the_word_and_not_the_identifier_containing_it`).
     `find_seed` and `first_hit_from` are how the editor's find bar opens: Ctrl+F/Ctrl+H seed the
     field from the selection only when it is non-empty and on one line — a multi-line selection is
     a block being worked on, not a needle, and the field is one line, so it seeds nothing and the
@@ -25709,6 +25722,19 @@ existing prose was left alone.
     the user never searched for"), so a list that lags a tick cannot become an edit. The empty-query
     arm still calls `query.track()`, or typing a needle after clearing one would read a document the
     effect had stopped following.
+    **Match case and Whole word are part of the query, not a filter on its hits.** They are a
+    per-pane `find_opts: RwSignal<FindOptions>` (`text_ops`, above), held for the pane's life like
+    the needle beside them and not persisted, and the effect's previous value is `(query, opts)`
+    rather than the query alone — so flipping one is a new query, rescanned and revealed at once,
+    not an edit left to the debounce. **A new query bumps `find_gen` too**: it was bumped by the
+    edit path alone, so an edit's 120 ms tick still out when a new needle — or now an option flip —
+    landed would fire after it and put the old needle's hits back under `n/total`.
+    `replace_one`'s revalidation and its rescan, and
+    `replace_all_cb`, take the same options through the `_in` forms: revalidating by the default
+    rule would let a hit Whole word had refused pass as a fold-equal span and be replaced. The
+    toggles are two text glyphs right of the find field, `Aa` and `W` (tooltips *Match case*,
+    *Whole word*), lit `chip_active` when on and `chip_idle` when off — the status bar's toggle
+    colours — which is what took the bar's content width from 283 to 331. Neither has a key.
     **Replace All honours `edit_untyped`'s refusal before it touches `find_hits`**, which is the
     guard `replace_one` beside it already had. `replace_all_cb` wrote the new hit list unconditionally
     and it was computed from `new_text` — text that, when the editor is frozen, was never written. For

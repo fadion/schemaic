@@ -611,6 +611,25 @@ pub fn duplicate_lines(
 /// needle takes the byte-wise path, and matches exactly what it would by the
 /// character walk: no other character is as narrow as an ASCII one.
 pub fn find_matches(hay: &str, needle: &str) -> Vec<usize> {
+    find_matches_in(hay, needle, FindOptions::default())
+}
+
+/// The find bar's two options. Both keep every hit exactly `needle.len()`
+/// bytes long — **match case** compares byte for byte, **whole word** only
+/// refuses a hit — which is why they can share [`find_matches`]' callers
+/// unchanged, where a regex could not.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FindOptions {
+    pub match_case: bool,
+    /// No word byte either side of the hit, by [`crate::sql::is_word_byte`] —
+    /// the one definition, so `_` and a non-ASCII letter continue a word as
+    /// they do an identifier. Asked only on a side where the needle's own edge
+    /// is a word byte: `f(` has a boundary to want on its left alone.
+    pub whole_word: bool,
+}
+
+/// [`find_matches`] under `opts`.
+pub fn find_matches_in(hay: &str, needle: &str, opts: FindOptions) -> Vec<usize> {
     let n = needle.len();
     if n == 0 || hay.len() < n {
         return Vec::new();
@@ -619,7 +638,7 @@ pub fn find_matches(hay: &str, needle: &str) -> Vec<usize> {
     let mut out = Vec::new();
     let mut i = 0;
     while i + n <= hay.len() {
-        if folded_match_at(hay, i, needle, ascii) {
+        if hit_at(hay, i, needle, ascii, opts) {
             out.push(i);
             i += n; // non-overlapping
         } else {
@@ -694,7 +713,31 @@ pub fn first_hit_from(hits: &[usize], from: usize) -> usize {
 /// caller can treat "not a match any more" and "not addressable any more" the
 /// same way: re-derive.
 pub fn matches_at(hay: &str, off: usize, needle: &str) -> bool {
-    !needle.is_empty() && folded_match_at(hay, off, needle, needle.is_ascii())
+    matches_at_in(hay, off, needle, FindOptions::default())
+}
+
+/// [`matches_at`] under `opts` — the same rule [`find_matches_in`] uses.
+pub fn matches_at_in(hay: &str, off: usize, needle: &str, opts: FindOptions) -> bool {
+    !needle.is_empty() && hit_at(hay, off, needle, needle.is_ascii(), opts)
+}
+
+/// Is `needle` a hit at `off` under `opts`? The one test every entry point
+/// above asks, so the count, the step and Replace All agree on what a hit is.
+fn hit_at(hay: &str, off: usize, needle: &str, ascii: bool, opts: FindOptions) -> bool {
+    let end = off + needle.len();
+    let spelled = if opts.match_case {
+        hay.get(off..end) == Some(needle)
+    } else {
+        folded_match_at(hay, off, needle, ascii)
+    };
+    if !spelled || !opts.whole_word {
+        return spelled;
+    }
+    use crate::sql::is_word_byte;
+    let (hb, nb) = (hay.as_bytes(), needle.as_bytes());
+    let open_left = !is_word_byte(nb[0]) || off == 0 || !is_word_byte(hb[off - 1]);
+    let open_right = !is_word_byte(nb[nb.len() - 1]) || end == hb.len() || !is_word_byte(hb[end]);
+    open_left && open_right
 }
 
 /// Replace every non-overlapping case-insensitive occurrence of `needle`
@@ -705,7 +748,18 @@ pub fn matches_at(hay: &str, off: usize, needle: &str) -> bool {
 /// match (not inside the inserted text), so a replacement that itself contains
 /// the needle won't be re-replaced in the same pass.
 pub fn replace_all(hay: &str, needle: &str, replacement: &str) -> (String, usize) {
-    let hits = find_matches(hay, needle);
+    replace_all_in(hay, needle, replacement, FindOptions::default())
+}
+
+/// [`replace_all`] under `opts`, over exactly the hits [`find_matches_in`]
+/// reports with them.
+pub fn replace_all_in(
+    hay: &str,
+    needle: &str,
+    replacement: &str,
+    opts: FindOptions,
+) -> (String, usize) {
+    let hits = find_matches_in(hay, needle, opts);
     if hits.is_empty() {
         return (hay.to_string(), 0);
     }
@@ -2654,7 +2708,49 @@ mod tests {
         assert_eq!(find_matches("café bar", "bar"), vec![6]);
     }
 
-    /// Case folding reaches past ASCII: a German, French or Cyrillic name is
+    /// **Match case** takes the needle byte for byte; off, the fold is the
+    /// default search's — so the default entry points are unchanged.
+    #[test]
+    fn match_case_finds_only_the_exact_spelling() {
+        let exact = FindOptions {
+            match_case: true,
+            ..FindOptions::default()
+        };
+        assert_eq!(find_matches_in("Id id ID", "id", exact), vec![3]);
+        assert_eq!(find_matches_in("Café café", "café", exact), vec![6]);
+        assert_eq!(
+            find_matches_in("Id id ID", "id", FindOptions::default()),
+            find_matches("Id id ID", "id")
+        );
+        assert!(matches_at_in("xId", 1, "Id", exact));
+        assert!(!matches_at_in("xid", 1, "Id", exact));
+        assert_eq!(
+            replace_all_in("Id id", "id", "n", exact),
+            ("Id n".to_string(), 1)
+        );
+    }
+
+    /// **Whole word** wants no word byte either side of the hit — by
+    /// `sql::is_word_byte`, the one definition, so `_` and a non-ASCII letter
+    /// continue a word as they do in an identifier. An edge of the needle that
+    /// is not itself a word byte has no boundary to ask for.
+    #[test]
+    fn whole_word_finds_the_word_and_not_the_identifier_containing_it() {
+        let word = FindOptions {
+            whole_word: true,
+            ..FindOptions::default()
+        };
+        let sql = "SELECT id, user_id, idé, ID FROM t WHERE (id)";
+        let hits = find_matches_in(sql, "id", word);
+        let words: Vec<&str> = hits.iter().map(|&h| &sql[h..h + 2]).collect();
+        assert_eq!(words, ["id", "ID", "id"], "{hits:?}");
+        assert_eq!(hits, vec![7, 26, 43]);
+        // A needle that ends in punctuation still bounds the side that is a word.
+        assert_eq!(find_matches_in("f(x) ff(x)", "f(", word), vec![0]);
+        assert!(!matches_at_in("user_id", 5, "id", word));
+        assert!(matches_at_in("(id)", 1, "id", word));
+    }
+
     /// found whichever case it was typed in, as an ASCII one always was.
     #[test]
     fn find_folds_the_case_of_non_ascii_letters() {

@@ -46,9 +46,9 @@ use schemaic_core::params;
 use schemaic_core::prompt::{self, FixOrigin};
 use schemaic_core::sql::statement_range;
 use schemaic_core::text_ops::{
-    find_matches, find_seed, first_hit_from, join_lines, matches_at, move_line, newline_indent,
-    offset_of_line, replace_all, soft_tab_indent, soft_tab_outdent, toggle_block_comment,
-    toggle_case, toggle_line_comment,
+    FindOptions, find_matches_in, find_seed, first_hit_from, join_lines, matches_at_in, move_line,
+    newline_indent, offset_of_line, replace_all_in, soft_tab_indent, soft_tab_outdent,
+    toggle_block_comment, toggle_case, toggle_line_comment,
 };
 
 use crate::completion::{
@@ -3077,6 +3077,10 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     let find_replace_visible: RwSignal<bool> = RwSignal::new(false);
     let find_hits: RwSignal<Vec<usize>> = RwSignal::new(Vec::new());
     let find_idx: RwSignal<usize> = RwSignal::new(0usize);
+    // Match case / whole word. Per pane and for the pane's life, like the
+    // needle beside them; flipping one is a new query (the effect below keys on
+    // both), so it rescans and reveals rather than waiting out the edit debounce.
+    let find_opts: RwSignal<FindOptions> = RwSignal::new(FindOptions::default());
 
     // Go-to-line (Ctrl+G, or clicking Ln/Col in the status bar): a small popup
     // styled like the find bar. `goto_open` lives on the `Tab` so the status bar
@@ -7254,11 +7258,12 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         // diagnostics and live-validation passes in this file already use.
         let find_gen: Rc<std::cell::Cell<u64>> = Rc::new(std::cell::Cell::new(0));
         let ed = ed_find.clone();
-        create_effect(move |prev: Option<String>| {
+        create_effect(move |prev: Option<(String, FindOptions)>| {
+            let opts = find_opts.get();
             // Closed, it forgets the query it ran for: reopening — seeded with
             // the needle it last had, say — is a new query, not an edit.
             if !find_open.get() {
-                return String::new();
+                return (String::new(), opts);
             }
             let q = find_query.get();
             if q.is_empty() {
@@ -7270,15 +7275,18 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 if !find_hits.with_untracked(Vec::is_empty) {
                     find_hits.set(Vec::new());
                 }
-                return q;
+                return (q, opts);
             }
-            if prev.as_deref() != Some(q.as_str()) {
+            if prev.as_ref().map(|(p, o)| (p.as_str(), *o)) != Some((q.as_str(), opts)) {
                 // **A new query recomputes now.** The user is watching `n/total`
                 // and waiting to be taken to the first match; a delay here is a
                 // find bar that feels broken. `with`, not `get`: the scan borrows
                 // the document, and cloning a 16 MiB buffer to hand it to a
                 // function that takes `&str` was 2.4 ms of a 20.3 ms keystroke.
-                let hits = query.with(|text| find_matches(text, &q));
+                // Superseding any edit tick still out: it captured the old needle
+                // and options, and landing after this would put their hits back.
+                find_gen.set(find_gen.get().wrapping_add(1));
+                let hits = query.with(|text| find_matches_in(text, &q, opts));
                 // From the selection's start, so a seeded needle — or one typed
                 // a character at a time — stays on the match in view.
                 let cur = ed.cursor.get_untracked();
@@ -7289,7 +7297,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     reveal(hit, q.len());
                 }
                 find_hits.set(hits);
-                return q;
+                return (q, opts);
             }
             // **An edit debounces.** Rescanning the whole document synchronously
             // on every keystroke is 17 ms at 16 MiB, on the UI thread, while the
@@ -7310,14 +7318,14 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 if fgen.get() != g || find_hits.try_get_untracked().is_none() {
                     return;
                 }
-                let hits = query.with_untracked(|text| find_matches(text, &needle));
+                let hits = query.with_untracked(|text| find_matches_in(text, &needle, opts));
                 // Same query, edited document: hold the position, clamped.
                 if !hits.is_empty() {
                     find_idx.update(|i| *i = (*i).min(hits.len() - 1));
                 }
                 find_hits.set(hits);
             });
-            q
+            (q, opts)
         });
     }
     // Step to the next (+1) / previous (-1) match, wrapping.
@@ -7401,10 +7409,13 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             // the hit list is a signal, and one stale offset here rewrites text
             // the user never searched for.
             let text_now = ed.doc().text().to_string();
-            let off = if matches_at(&text_now, hits[idx], &q) {
+            // Under the options the hits were found with, or a hit that whole
+            // word refused would pass the revalidation as a fold-equal span.
+            let opts = find_opts.get_untracked();
+            let off = if matches_at_in(&text_now, hits[idx], &q, opts) {
                 hits[idx]
             } else {
-                let fresh = find_matches(&text_now, &q);
+                let fresh = find_matches_in(&text_now, &q, opts);
                 let Some(&off) = fresh.get(idx).or(fresh.first()) else {
                     find_hits.set(Vec::new());
                     find_idx.set(0);
@@ -7425,7 +7436,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 return;
             }
             let text = ed.doc().text().to_string();
-            let new_hits = find_matches(&text, &q);
+            let new_hits = find_matches_in(&text, &q, opts);
             if new_hits.is_empty() {
                 find_hits.set(new_hits);
                 find_idx.set(0);
@@ -7451,7 +7462,8 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             }
             let repl = find_replace.get_untracked();
             let text = ed.doc().text().to_string();
-            let (new_text, n) = replace_all(&text, &q, &repl);
+            let opts = find_opts.get_untracked();
+            let (new_text, n) = replace_all_in(&text, &q, &repl, opts);
             if n == 0 {
                 return;
             }
@@ -7471,7 +7483,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             ) {
                 return;
             }
-            find_hits.set(find_matches(&new_text, &q));
+            find_hits.set(find_matches_in(&new_text, &q, opts));
             find_idx.set(0);
         })
     };
@@ -7575,10 +7587,49 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     Rc::new(move || (g)(1))
                 });
                 let close_btn = icon_btn(icons::X, 14.0, close.clone());
+                // Match case / whole word, beside the needle they qualify: a
+                // two-letter glyph each, lit with `chip_active` when on — the
+                // status bar's toggle colours — and `chip_idle` when off.
+                let opt_toggle = |glyph: &'static str,
+                                  tip: &'static str,
+                                  on: fn(&FindOptions) -> bool,
+                                  flip: fn(&mut FindOptions)| {
+                    container(text(glyph))
+                        .on_click_stop(move |_| find_opts.update(flip))
+                        .style(move |s| {
+                            let lit = find_opts.with(on);
+                            s.items_center()
+                                .justify_center()
+                                .min_width(theme::scaled(18.0))
+                                .font_size(theme::font_label())
+                                .font_bold()
+                                .color(if lit {
+                                    theme::chip_active()
+                                } else {
+                                    theme::chip_idle()
+                                })
+                                .hover(|s| s.color(theme::chip_active()))
+                        })
+                        .tooltip(move || text(tip).style(crate::widgets::tooltip_style))
+                };
+                let case_btn = opt_toggle(
+                    "Aa",
+                    "Match case",
+                    |o| o.match_case,
+                    |o| o.match_case = !o.match_case,
+                );
+                let word_btn = opt_toggle(
+                    "W",
+                    "Whole word",
+                    |o| o.whole_word,
+                    |o| o.whole_word = !o.whole_word,
+                );
                 // A flex spacer pins the counter + nav + × to the right edge; row 2
                 // does the same, so `All` lines up under the ×.
                 let row1 = h_stack((
                     input,
+                    case_btn,
+                    word_btn,
                     empty().style(|s| s.flex_grow(1.0_f32)),
                     count,
                     prev_btn,
@@ -7644,7 +7695,9 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 // collapses, leaving `All` hugging `Replace` instead of pinned under
                 // the ×. Sized just to the find row's packed width so the leftover
                 // spacer (hence the field→controls gap) is ~15px, not ~33px.
-                let content = v_stack((row1, replace_row)).style(|s| s.width(theme::scaled(283.0)));
+                // Wide enough for the two option toggles beside the find field
+                // (283 before them).
+                let content = v_stack((row1, replace_row)).style(|s| s.width(theme::scaled(331.0)));
                 h_stack((toggle, content))
                     .style(|s| {
                         s.items_center()
