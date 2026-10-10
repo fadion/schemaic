@@ -143,6 +143,13 @@ pub fn diag_error() -> Color {
     editor().diag_error
 }
 
+// Wavy underline under a style hint (a join with no condition): legal SQL that
+// may be meant. The editor's comment colour — the quietest one the syntax
+// palette has, so it neither reads as the amber typo nor as an error.
+pub fn diag_hint() -> Color {
+    editor().comment
+}
+
 /// Text on the top-bar environment badge, **for the fill it is drawn on**.
 ///
 /// This was a fixed white, on the reasoning that the badge "sits on the

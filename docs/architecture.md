@@ -979,7 +979,10 @@ existing prose was left alone.
     `cartesian_check` on a `JOIN`/`INNER JOIN`/`STRAIGHT_JOIN` with no `ON`/`USING`, which runs as a
     cross join; an explicit `CROSS JOIN` is meant, and left alone, and so is a comma-join with a
     `WHERE` — one with no `WHERE` at all to a plain table (not a table function such as `,
-    unnest(t.a)`, which is correlated) is warned of too (`a_comma_join_without_a_where_is_flagged`).
+    unnest(t.a)`, which is correlated) is flagged too (`a_comma_join_without_a_where_is_flagged`).
+    Both are a `Severity::Hint`, not a warning: the SQL is legal and sometimes meant, and a
+    warning's amber squiggle is the one a probable typo wears, so these read as typos when they
+    wore it (`diag_unconstrained_join_flagged`).
     The valid-SQL corpora held the bare comma join clean when it was left alone; their entry now has
     a `WHERE`).
     **The `lints` module** adds warnings on every clean parse of a unit, whatever the statement:
@@ -2089,7 +2092,9 @@ existing prose was left alone.
     combinations, which is what says the fix is about severity rather than about that one statement.
     It is **one sweep after the sort**: everything kept starts no later than the diagnostic in hand,
     so that one is covered exactly when a kept error (for an error) or any kept diagnostic (for a
-    warning) reaches as far, and two running maxima answer it. It compared each diagnostic with
+    warning or a hint) reaches as far, and two running maxima answer it. The sort's tie-break at an
+    equal start is `Severity::rank` (error, warning, hint), the same order the editor's hover
+    `diag_under` settles an overlap by — the two have to agree, which is why it is one method. It compared each diagnostic with
     every one kept before it, O(d²) on the flood a long routine could raise.
     **A "not found" names what was probably meant, but only when exactly one name is that near.**
     `nearest_name` measures with the keyword-typo checker's own yardstick — `sql::edit_distance`,
@@ -24916,7 +24921,9 @@ existing prose was left alone.
   - `grid.rs` — the whole results grid (`GridState`/`GridCtx`; `loaded_view` is the entry point,
     called from the results strip's body). `editor_pane.rs` — SQL editor pane
     (`query_pane` + the Ctrl+K bar, statement highlight, custom scrollbars). `syntax_view` draws
-    severity-coloured squiggles (red errors / amber typo warnings).
+    severity-coloured squiggles (red errors / amber typo warnings / style hints in
+    `theme::diag_hint`, the editor's comment colour — the quietest the syntax palette has, so a
+    join with no condition reads as neither a typo nor an error).
     **The diagnostics run off the UI thread.** Both triggers — the 120 ms debounced edit path and
     the effect that re-checks when the catalog changes (it tracks every node's inner `schema`, not
     only the `db_nodes` list, since a schema landing, a per-database Refresh and the re-introspection
@@ -25002,8 +25009,8 @@ existing prose was left alone.
     of `screen_lines` per diagnostic in a long script; drop the layout check as redundant with the
     range check and the crash is back. `points_on_screen_tests` pins both refusals with floem never asked.
     `diag_under` settles an overlap —
-    the offline pass and the server's verdict on the same token — error before warning, then the
-    narrower span, inclusive on the left and exclusive on the right. `hover_diag` returns before
+    the offline pass and the server's verdict on the same token — the stronger severity by
+    `Severity::rank` (error, warning, hint, as `dedup_diagnostics` sorts), then the narrower span, inclusive on the left and exclusive on the right. `hover_diag` returns before
     touching a signal on a move that changes nothing, because every pointer move lands there and a
     set notifies even when the value is equal; otherwise it records the candidate in `diag_pending`
     and shows it after `DIAG_TIP_DELAY` — 300 ms, the app-wide `.tooltip()` delay set on

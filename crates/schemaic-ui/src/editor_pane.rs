@@ -2526,18 +2526,16 @@ fn diag_hit_at(
 }
 
 /// The diagnostic under `p`, if any. Where two overlap — the offline pass and
-/// the server's verdict on the same token — the error beats the warning and
-/// then the narrower span wins, since it is the more specific claim.
+/// the server's verdict on the same token — the stronger severity wins
+/// (`Severity::rank`: error, warning, hint) and then the narrower span, since
+/// it is the more specific claim.
 fn diag_under(hits: &[DiagHit], p: Point) -> Option<&DiagHit> {
-    let rank = |s: Severity| match s {
-        Severity::Error => 0,
-        Severity::Warning => 1,
-    };
     hits.iter()
         .filter(|h| p.x >= h.x && p.x < h.x + h.w && p.y >= h.top && p.y <= h.bottom)
         .min_by(|a, b| {
-            rank(a.severity)
-                .cmp(&rank(b.severity))
+            a.severity
+                .rank()
+                .cmp(&b.severity.rank())
                 .then(a.w.total_cmp(&b.w))
         })
 }
@@ -7139,6 +7137,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                             .color(match sev {
                                 Severity::Error => theme::diag_error(),
                                 Severity::Warning => theme::syntax_underline(),
+                                Severity::Hint => theme::diag_hint(),
                             })
                     })
                 }))

@@ -6295,6 +6295,23 @@ pub enum Severity {
     Error,
     /// A heuristic hint (a probable keyword typo).
     Warning,
+    /// A style note about SQL that is legal and may well be meant — a join
+    /// with no condition. Quieter than a [`Severity::Warning`], so it does not
+    /// read as the typo a warning usually is.
+    Hint,
+}
+
+impl Severity {
+    /// Which of two overlapping diagnostics is the stronger claim: lower
+    /// outranks higher. Shared by the de-duplication here and the editor's
+    /// hover, which have to agree on it.
+    pub fn rank(self) -> u8 {
+        match self {
+            Severity::Error => 0,
+            Severity::Warning => 1,
+            Severity::Hint => 2,
+        }
+    }
 }
 
 /// One editor diagnostic: a byte range to underline, its severity, and the hover
@@ -12007,12 +12024,13 @@ mod colres {
         (sources, proj_aliases(sel))
     }
 
-    /// Warn on an inner `JOIN`/`INNER JOIN`/`STRAIGHT_JOIN` with no `ON`/`USING`
+    /// Hint at an inner `JOIN`/`INNER JOIN`/`STRAIGHT_JOIN` with no `ON`/`USING`
     /// condition — MySQL treats it as a cross join (every row combined), almost
     /// always an accident. An explicit `CROSS JOIN` (a distinct operator) is
     /// intentional and left alone, and so is a comma-join (a separate
     /// `TableWithJoins`, no join node) with a `WHERE`; one with no `WHERE` at all
-    /// to a plain table is warned of the same way. Squiggles the joined relation.
+    /// to a plain table is noted the same way. Squiggles the joined relation —
+    /// as a [`Severity::Hint`], because the SQL is legal and sometimes meant.
     fn cartesian_check(sel: &Select, stmt: &str, lo: usize, out: &mut Vec<Diagnostic>) {
         fn walk(twj: &TableWithJoins, stmt: &str, lo: usize, out: &mut Vec<Diagnostic>) {
             walk_factor(&twj.relation, stmt, lo, out);
@@ -12021,7 +12039,7 @@ mod colres {
                 if is_unconstrained_inner_join(&join.join_operator) {
                     out.push(Diagnostic {
                         range: to_range(stmt, lo, join.relation.span()),
-                        severity: Severity::Warning,
+                        severity: Severity::Hint,
                         message: "JOIN has no ON/USING condition — this is a cross join; \
                                   use CROSS JOIN if that's intended"
                             .to_string(),
@@ -12049,7 +12067,7 @@ mod colres {
                 if let TableFactor::Table { args: None, .. } = &twj.relation {
                     out.push(Diagnostic {
                         range: to_range(stmt, lo, twj.relation.span()),
-                        severity: Severity::Warning,
+                        severity: Severity::Hint,
                         message: "Comma join with no WHERE — this is a cross join; add a \
                                   WHERE, or use CROSS JOIN if that's intended"
                             .to_string(),
@@ -13790,15 +13808,16 @@ fn friendly_syntax_message(msg: &str) -> String {
 /// compared each diagnostic with every one kept before it, O(d²) on the flood
 /// a long routine can raise (`diagnostics_work_grows_linearly_with_a_long_range`).
 fn dedup_diagnostics(mut v: Vec<Diagnostic>) -> Vec<Diagnostic> {
-    // Errors first so a Warning on the same span is the one dropped.
+    // The stronger claim first, so a warning or hint on the same span is the
+    // one dropped.
     v.sort_by(|a, b| {
         a.range
             .0
             .cmp(&b.range.0)
-            .then((a.severity == Severity::Warning).cmp(&(b.severity == Severity::Warning)))
+            .then(a.severity.rank().cmp(&b.severity.rank()))
     });
-    // How far the kept errors, and the kept diagnostics of either severity,
-    // reach.
+    // How far the kept errors, and the kept diagnostics of any severity,
+    // reach. A hint is covered as a warning is.
     let (mut error_reach, mut any_reach) = (None::<usize>, None::<usize>);
     let mut out: Vec<Diagnostic> = Vec::new();
     for d in v {
@@ -13806,7 +13825,7 @@ fn dedup_diagnostics(mut v: Vec<Diagnostic>) -> Vec<Diagnostic> {
         work::tick(&work::DEDUP);
         let reach = match d.severity {
             Severity::Error => error_reach,
-            Severity::Warning => any_reach,
+            Severity::Warning | Severity::Hint => any_reach,
         };
         if reach.is_some_and(|r| d.range.1 <= r) {
             continue;
@@ -25493,8 +25512,13 @@ mod tests {
         let sql = "SELECT * FROM employees e JOIN departments d";
         let w = cross_warnings(sql);
         assert_eq!(w.len(), 1, "{:?}", diag(sql));
-        assert_eq!(w[0].severity, Severity::Warning);
+        // A hint, not a warning: a cross join is legal and may be meant, and
+        // a warning's squiggle is the one a typo wears.
+        assert_eq!(w[0].severity, Severity::Hint);
         assert_eq!(&sql[w[0].range.0..w[0].range.1], "departments d");
+        let comma = cross_warnings("SELECT * FROM employees, departments");
+        assert_eq!(comma.len(), 1);
+        assert_eq!(comma[0].severity, Severity::Hint);
         // `INNER JOIN` with no ON is the same.
         assert_eq!(
             cross_warnings("SELECT * FROM employees INNER JOIN departments").len(),
@@ -25523,7 +25547,7 @@ mod tests {
     fn lint_hits(sql: &str, dialect: SqlDialect, needle: &str) -> Vec<String> {
         diag_d(sql, dialect)
             .into_iter()
-            .filter(|d| d.severity == Severity::Warning && d.message.contains(needle))
+            .filter(|d| d.severity != Severity::Error && d.message.contains(needle))
             .map(|d| sql[d.range.0..d.range.1].to_string())
             .collect()
     }
