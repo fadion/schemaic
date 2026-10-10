@@ -25722,7 +25722,12 @@ existing prose was left alone.
     `(p − pan) / z`. A pan press captures the pointer (`request_active`) and its `PointerUp` ends
     it; a middle-button release outside the canvas reached that listener only once vendored Floem's
     fourth patch (*Floem 0.2 gotchas*) stopped gating non-primary releases on the view's rect —
-    before it, the pan outlived the button (GitHub #13).
+    before it, the pan outlived the button (GitHub #13). While `panning` is set the canvas's own
+    style wears `CursorStyle::Grabbing` (the fifth patch; GitHub #14): a captured view's moves are
+    routed straight to it and Floem takes the cursor from that view's style while the pointer is
+    inside its rect, so the cards under the pointer cannot override it — outside the canvas it
+    falls back to the default. The `apply_if` sits in the style closure *before* `.clip()`, like
+    the size beside it. No test covers it.
     **The edge geometry is one memo with two readers** (`EdgeGeometry`, built by `edge_geometry`
     over the positions, sizes and collapse maps). `rects` + `visible_map` + `edge_shapes` is
     O(cards) + O(edges × 32) — a fresh `HashMap<String, Rect>` over every card, `card_metrics`
@@ -33391,7 +33396,11 @@ Re-introducing the anti-patterns these guard against is a regression:
   left-drag ended correctly. `should_run` there is now also true for a directed `PointerUp` of a
   non-primary button; undirected dispatch is unchanged. The OS does deliver that release — winit
   captures the mouse for the middle button too (0.30.13, Windows `WM_MBUTTONDOWN` →
-  `capture_mouse`) — so the drop was Floem's alone. No test covers it. **Three measures
+  `capture_mouse`) — so the drop was Floem's alone. No test covers it. The fifth adds
+  `CursorStyle::Grabbing`, mapped to winit's `CursorIcon::Grabbing` in `WindowHandle::set_cursor`:
+  Floem 0.2 names fifteen cursors and no grab cursor, and the ER diagram wears the closed hand
+  while its canvas is panned (GitHub #14). Only that one variant — winit's open-hand `Grab` and
+  the rest are not added. No test covers it either. **Three measures
   keep upstream's code out of the workspace's checks, and each looks removable**: `exclude = ["vendor"]` in the root
   manifest, since a path dependency inside the workspace directory would otherwise join it as a
   member; `vendor/floem/rustfmt.toml` with `disable_all_formatting = true`, since `cargo fmt --all`

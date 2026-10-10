@@ -97,3 +97,18 @@ diagram went on panning with no button held.
 block: `should_run` is also true for a `PointerUp` of a non-primary button when
 the event is `directed`. Primary releases are excluded because the `PointerUp`
 arm has already run their listeners; undirected dispatch is unchanged.
+
+### 5. `CursorStyle::Grabbing` — the closed hand
+
+**Why.** Floem 0.2's `CursorStyle` names fifteen cursors and no grab cursor,
+though winit's `CursorIcon` has one. Schemaic's ER diagram wears it while its
+canvas is being panned.
+
+**What.**
+
+- `src/style.rs`: a `Grabbing` variant at the end of `CursorStyle`.
+- `src/window_handle.rs`, `set_cursor`: `CursorStyle::Grabbing` maps to
+  `CursorIcon::Grabbing`.
+
+Only the one variant the app uses; winit's `Grab` (the open hand) and the rest
+are not added. Upstream may grow its own; if it does, drop this entry.

@@ -1100,6 +1100,8 @@ impl WindowHandle {
             Some(CursorStyle::NResize) => CursorIcon::NResize,
             Some(CursorStyle::NeswResize) => CursorIcon::NeswResize,
             Some(CursorStyle::NwseResize) => CursorIcon::NwseResize,
+            // schemaic patch (PATCHES.md): winit has it; floem 0.2 had no name.
+            Some(CursorStyle::Grabbing) => CursorIcon::Grabbing,
             None => CursorIcon::Default,
         };
         if cursor != self.app_state.last_cursor {

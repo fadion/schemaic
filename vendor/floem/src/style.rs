@@ -1474,6 +1474,8 @@ pub enum CursorStyle {
     SeResize,
     NeswResize,
     NwseResize,
+    /// schemaic patch (PATCHES.md): the closed hand of a surface being dragged.
+    Grabbing,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

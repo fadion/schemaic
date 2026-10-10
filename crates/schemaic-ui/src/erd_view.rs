@@ -2651,7 +2651,17 @@ pub(crate) fn erd_overlay(
                 // (which holds the children) zero-sized → nothing renders.
                 .style(move |s| {
                     let (vw, vh) = viewport_size.get();
-                    s.width(vw).height(vh).background(theme::erd_canvas())
+                    s.width(vw)
+                        .height(vh)
+                        .background(theme::erd_canvas())
+                        // A closed hand while the surface is held — a left drag
+                        // on empty space and a middle drag anywhere both set
+                        // `panning` (issue #14). floem takes a captured view's
+                        // cursor from its own style while the pointer is over it,
+                        // so the cards under the pointer do not override it.
+                        .apply_if(panning.get(), |s| {
+                            s.cursor(floem::style::CursorStyle::Grabbing)
+                        })
                 })
                 .clip();
 
