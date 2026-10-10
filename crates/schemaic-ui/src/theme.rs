@@ -42,6 +42,10 @@ pub fn bg_chrome() -> Color {
 pub fn bg_panel() -> Color {
     ui().bg_panel
 } // side panels
+/// The UI theme's **inset surface** — the SQL editor's backdrop, the blob
+/// viewer, striped preview rows, the record editor's value fields. Not the
+/// text-field surface, whatever older notes say: [`crate::FieldCfg`] defaults
+/// to [`bg_deepest`], and only the few fields that set it paint this.
 pub fn bg_editor() -> Color {
     ui().bg_editor
 }
@@ -80,8 +84,8 @@ pub fn code_bg() -> Color {
 /// Catppuccin Latte) tuned against their own background, and the editor theme is
 /// chosen *independently* of the light/dark UI theme — so pairing them with a UI
 /// surface is a cross-axis combination nobody chose. Both previews used to paint
-/// [`bg_editor`], which despite the name is the UI theme's **text-field**
-/// surface (`contrast.rs`'s own entry says so), and on the Light UI theme with
+/// [`bg_editor`], the UI theme's inset surface — a colour of the *other*
+/// axis — and on the Light UI theme with
 /// the shipped-default Tokyo Night that put `string` at 1.70:1 and `number` at
 /// 1.90:1 — under even the *Recessive* floor of 2.0, while the uncoloured text
 /// beside them sat at 5.70:1. The text the colour was added to make stand out

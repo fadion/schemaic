@@ -22222,7 +22222,7 @@ existing prose was left alone.
     independently of the light/dark UI theme (Catppuccin Latte's dark-on-light tokens can be live
     while the panel is dark). That surface is `theme::preview_bg` and the uncoloured base beside it
     `theme::preview_fg`, both named there rather than spelled here so the cross-axis gate measures
-    what the panel paints. It was `bg_editor` — the UI theme's text-field surface, chosen off the
+    what the panel paints. It was `bg_editor` — the UI theme's inset surface, chosen off the
     *other* axis — which is the pairing `contrast.rs`'s entry records at 1.70:1. The Query History
     panel's preview runs through the same `highlight_sql_mono` onto the same two colours (a long
     list of past runs read as the same wall of grey this one did); and the AI panel's fenced blocks
@@ -26821,8 +26821,9 @@ existing prose was left alone.
     Every row above holds one theme against itself, so neither table could ever see the combination
     two panels really paint: the *editor* theme's token palette on a surface the **UI** theme chose.
     The History and Snippet previews took their token colours from the editor theme and their
-    background from `bg_editor` — which despite the name is the UI theme's text-**field** surface —
-    and on the Light UI theme with the shipped-default Tokyo Night that put `string` at 1.70:1 and
+    background from `bg_editor` — the UI theme's inset surface (the SQL editor's backdrop, the blob
+    viewer, the record editor's value fields; form fields default to `bg_deepest`, whatever the
+    table's first labels said) — and on the Light UI theme with the shipped-default Tokyo Night that put `string` at 1.70:1 and
     `number` at 1.90:1, under even the *Recessive* floor of 2.0, while the uncoloured text beside
     them sat at 5.70:1. The text the colour was added to make stand out was the only text made
     unreadable. The test walks the whole `(UiThemeKind, EditorThemeKind)` product asking

@@ -285,11 +285,14 @@ pub const UI_PAIRINGS: &[Pairing<UiTheme>] = &[
     pair!(tx_rollback on bg_deepest, Body, "footer: Rollback"),
     pair!(tx_rollback_hover on bg_deepest, Body, "footer: hovering Rollback"),
     pair!(chip_active on bg_deepest, Body, "footer: hovering a status segment"),
-    pair!(text on bg_deepest, Body, "AI chat code block, completion doc popup"),
+    pair!(text on bg_deepest, Body,
+        "every form field's content (`FieldCfg`'s default surface), AI chat code block, \
+         completion doc popup"),
     pair!(text_dim on bg_deepest, Body,
         "completion popup: the doc line; AI panel: a sent attachment's summary and table"),
     pair!(text_muted on bg_deepest, Icon, "completion popup: the kind label"),
-    pair!(placeholder on bg_deepest, Recessive, "AI panel: the message field"),
+    pair!(placeholder on bg_deepest, Recessive,
+        "every form field's placeholder (`FieldCfg`'s default surface), the AI message field"),
     // Half-strength, because `edit_field` dims a frozen field's *own* colour
     // rather than swapping in a theme grey — so what the eye reads is the
     // composite, and measuring `cmdk_text` itself would measure a colour this
@@ -409,9 +412,13 @@ pub const UI_PAIRINGS: &[Pairing<UiTheme>] = &[
     pair!(text on dropdown_hover, Body, "an unused palette entry, still checked"),
     pair!(text on dropdown_active, Body, "the grid's formatted-value tint"),
     pair!(conn_list_sel_text on conn_list_sel_bg, Body, "Manage Connections: the selected row"),
-    // ── Text inputs (`bg_editor` is the field surface, not the SQL editor).
-    pair!(text on bg_editor, Body, "every text field's content"),
-    pair!(placeholder on bg_editor, Recessive, "every text field's placeholder"),
+    // ── The inset surface (`bg_editor`): the few fields that ask for it — the
+    // record editor's value and raw-JSON fields, the cell editor's date — and
+    // the insets around them. Form fields default to `bg_deepest`, above; this
+    // was labelled "every text field" when the table was written, which it
+    // never was.
+    pair!(text on bg_editor, Body, "record editor: a value field's content"),
+    pair!(placeholder on bg_editor, Recessive, "record editor: a value field's placeholder"),
     pair!(text_faint on bg_editor, Recessive, "import modal: an inferred value"),
     pair!(cmdk_text on bg_editor, Body, "Ctrl+K: the prompt line"),
     pair!(cmdk_placeholder on bg_editor, Recessive, "Ctrl+K: its placeholder"),
