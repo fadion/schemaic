@@ -5329,12 +5329,15 @@ pub(crate) async fn explain(
             .fetch_query(database, &primary, EXPLAIN_ROW_CAP, cancel)
             .await;
     }
-    match explain_in_rolled_back_tx(db, database, &primary, read_only, cancel.clone()).await {
+    match (
+        explain_in_rolled_back_tx(db, database, &primary, read_only, cancel.clone()).await,
+        fallback,
+    ) {
         // MariaDB: `EXPLAIN ANALYZE` is invalid — retry with `ANALYZE <stmt>`.
-        Err(DbError::Query(_)) if fallback.is_some() => {
-            explain_in_rolled_back_tx(db, database, &fallback.unwrap(), read_only, cancel).await
+        (Err(DbError::Query(_)), Some(fb)) => {
+            explain_in_rolled_back_tx(db, database, &fb, read_only, cancel).await
         }
-        other => other,
+        (other, _) => other,
     }
 }
 
