@@ -14682,8 +14682,9 @@ existing prose was left alone.
       size column, the results toolbar, the Truncate confirmation and a table drop's preview.
       - **Where a figure may be printed, and in what words, is decided here too** — the surfaces
         that print one hold no rules of their own. `catalogue_key` says where a statement's
-        `qualifier.table` sits in the catalogue, because the two engines that publish statistics
-        disagree about what a qualifier *is* (a database on MySQL, a namespace on PostgreSQL) and
+        `qualifier.table` sits in the catalogue, because the engines that publish statistics
+        disagree about what a qualifier *is* (a database on MySQL, a namespace on PostgreSQL and
+        SQL Server) and
         getting it backwards reports one table's figures for another with nothing to show that it
         happened. `SchemaStats::find` then resolves the name a *statement* wrote — unlike `get`,
         whose `None` namespace means "this engine has none", `find`'s means "the statement didn't

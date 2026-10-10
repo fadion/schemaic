@@ -689,10 +689,11 @@ pub fn count_rows_sql(schema: Option<&str>, table: &str, dialect: SqlDialect) ->
 /// Where the `qualifier.table` a statement wrote sits in the catalogue:
 /// `(database, namespace)`.
 ///
-/// **The two engines that publish statistics disagree about what a qualifier
+/// **The engines that publish statistics disagree about what a qualifier
 /// is.** A MySQL connection is server-level, so `shop.orders` names a *database*
-/// and there is no level under it; a PostgreSQL connection is already bound to
-/// its database, so `sales.orders` names a *namespace* inside it. Asked here
+/// and there is no level under it; a PostgreSQL or SQL Server connection is
+/// already bound to its database, so `sales.orders` names a *namespace* inside
+/// it. Asked here
 /// rather than at each call site because getting it backwards looks up a
 /// different table and reports its figures without anything showing that it
 /// happened.
