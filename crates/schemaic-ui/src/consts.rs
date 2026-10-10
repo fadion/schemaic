@@ -624,8 +624,9 @@ pub(crate) fn follow_slack() -> f64 {
 // ── Menus / misc ────────────────────────────────────────────────────────────
 
 /// Fixed width of the active-database menu (right-aligned under its trigger).
+/// 220: at 170 a longish database name ran past the panel's edge.
 pub(crate) fn db_menu_w() -> f64 {
-    scaled(170.0)
+    scaled(220.0)
 }
 
 /// The masking glyph used by password fields. Must be a single ASCII byte so the

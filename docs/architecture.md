@@ -20673,6 +20673,13 @@ existing prose was left alone.
     rule a row wears while its own context menu is open, which lives here rather than in either list
     because the schema tree and Manage Connections must wear the *same* mark and neither owns the
     other (*Popup menus* again, for the 2px the caller has to give back).
+    Also `room_below` — the tallest a dropdown hung under an anchor *by hand* may be, for the three
+    in `overlays.rs` that are not `menu_panel`s (*Popup menus*): the window under the anchor less
+    `scaled(8)`, floored at `scaled(80)` so an anchor near the bottom edge still leaves a few rows,
+    that floor itself clamped to the window, and `0` — read as "no cap" — before the window has
+    been measured, the answer `menu_panel`'s own `menu_max_h` gives. Callers read it inside the
+    panel's style closure, so a resize moves the cap with it. The arithmetic is `cap_below`, pure
+    and pinned by `cap_below_tests` (four, run red against a stub returning `0.0` first).
     Also `focus_root` — the **one** way an overlay claims the keyboard (see the Floem gotcha on
     directed key dispatch): it takes focus on build *and* registers the view so Escape in a
     text field inside it hands focus back rather than dead-ending. Never spell out
@@ -24158,6 +24165,25 @@ existing prose was left alone.
     would predict. `menu_icon_tuck()` and `menu_edge_pad()` are functions for the same reason — an
     offset frozen between two growing boxes is not an offset but a drift, and at 160% a 154px panel
     tucked by a literal 30 landed its right edge ~18px inside the icon instead of flush past it.
+    **The three dropdowns placed by hand cap at the room below their anchor and scroll** (GitHub
+    #21) — `active_db_menu_overlay`, `conn_menu_overlay` and `db_visibility_overlay`, which build
+    their own panels rather than going through `menu_panel` and so never had its cap: a connection
+    with many databases ran the QUERY toolbar's selector off the bottom of the window, the
+    databases below the fold out of reach. Each takes `max_height(widgets::room_below(…))` from its
+    own anchor's bottom edge — `active_db_anchor`'s `y`, the switcher's `header_h() - scaled(4)`
+    (the same term its `margin_top` is), the gear's `anchor.y + MENU_ICON_DROP` — and each list
+    carries `min_width_full` for `menu_stack`'s reason: floem's `Scroll` lays its child out at
+    content width, so without it the rows' hover and hit box stop short of the panel's right edge.
+    The scroll is `widgets::shift_hscroll`, not a bare `scroll`: a name wider than the panel pans
+    on a horizontal wheel *and* on Shift+wheel, which Windows delivers as a vertical delta — the
+    rule every scroll in the app follows. The selector's panel is `db_menu_w()`, 220 since the
+    same change (170 let a longish database name run past its edge).
+    **In the connection switcher only the connections scroll.** The list is
+    `flex_shrink(1).min_height(0)` and the rule and *Manage Connections* under it `flex_shrink(0)`,
+    because the way out of a long list must not be the thing scrolled out of sight — wrapping the
+    whole panel in the scroll, as the database selector's is, would be the tidy-up that loses it.
+    None of the three flips above its anchor or takes arrow-key navigation, before or after; the
+    cap, the scroll and the selector's width are all that changed.
     **No Drop here asks before its preview.** The table/view/sequence Drop, a standalone object's,
     the database's and the schema's each open the DDL preview directly — `preview_change_warning`,
     `preview_of`/`open_preview` over `ddl::drop_item`, and `preview_container` twice — where every
@@ -33604,8 +33630,11 @@ Re-introducing the anti-patterns these guard against is a regression:
     control (a `max_height` cap would have to be ≤ 5px to guarantee no nudge), so the class was
     removed rather than the instances: every `<select>`-shaped control drops a `widgets::menu_panel`
     through `settings::in_ring_picker`, and that panel is placed by the app's own arithmetic
-    (`menu_panel_height` predicts, `box_menu_inset` flips) and laid out where it is drawn. The
-    interface scale stays a segmented control (`settings::scale_picker`) because it never needed a
+    (`menu_panel_height` predicts, `box_menu_inset` flips) and laid out where it is drawn. (The
+    QUERY toolbar's database selector and the header's connection switcher are `<select>`-shaped
+    and are *not* that panel — `overlays.rs` hangs them by hand — but they are no floem overlay
+    either, so they too are laid out where they are drawn; what they lack is the flip, *Popup
+    menus*.) The interface scale stays a segmented control (`settings::scale_picker`) because it never needed a
     popup, not because dropdowns are still unsafe.
   - **The nudge is a shift, not a flip, so an overlay hung under something at the window's bottom
     is pulled back up over it.** That put every status-bar icon's tooltip on the icon it names
@@ -35283,7 +35312,12 @@ Re-introducing the anti-patterns these guard against is a regression:
 Custom themed overlays, not Floem's native `Menu` (native renders OS-styled, clashes with the dark
 theme). `menu_panel(entries: Vec<MenuEntry>, close)` takes `Action`/`Sub`/`Separator` entries and
 renders the themed panel; the caller positions it absolutely. Used by the schema right-click menu
-(`context_menu_overlay`).
+(`context_menu_overlay`) and by every other popup through `popup_menu_overlay` — which makes it
+every `<select>` built on `settings::in_ring_picker` too. **Three dropdowns are not `menu_panel`s**:
+the QUERY toolbar's database selector, the header's connection switcher and the SCHEMA gear's
+database list build their own panels in `overlays.rs`, so nothing below holds for them — no edge
+flip, no keyboard cursor — and their height cap is `widgets::room_below`, the room under their
+anchor, rather than the window-wide one `menu_panel` applies (GitHub #21; the `overlays.rs` entry).
 
 - **Separators are tidied by the panel, not the builder** (`tidy_separators`, applied first thing in
   `menu_panel` and by `menu_panel_height` so the measured panel matches the drawn one): leading and

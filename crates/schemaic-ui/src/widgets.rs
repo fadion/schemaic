@@ -3704,6 +3704,33 @@ fn menu_max_h() -> f64 {
     (h - theme::header_h() - theme::scaled(16.0)).max(theme::scaled(80.0))
 }
 
+/// The tallest a dropdown opened **below an anchor** may be, for the panels
+/// placed by hand rather than through [`menu_panel`] — the QUERY toolbar's
+/// database selector, the header's connection switcher, the SCHEMA gear's
+/// database list (GitHub #21). The window under `anchor_bottom` less a margin,
+/// so a long list scrolls inside its panel instead of running off the bottom of
+/// the window. Read inside the style closure, so a resize moves it.
+///
+/// Zero — no cap — before the window is measured, as [`menu_max_h`] does.
+pub(crate) fn room_below(anchor_bottom: f64) -> f64 {
+    cap_below(
+        anchor_bottom,
+        window_size().get().1,
+        theme::scaled(8.0),
+        theme::scaled(80.0),
+    )
+}
+
+/// [`room_below`]'s arithmetic, given the window's height. Never under `floor`,
+/// so an anchor near the bottom edge still leaves a usable few rows, and never
+/// more than the window itself.
+fn cap_below(anchor_bottom: f64, window_h: f64, margin: f64, floor: f64) -> f64 {
+    if window_h <= 1.0 {
+        return 0.0;
+    }
+    (window_h - anchor_bottom - margin).max(floor.min(window_h))
+}
+
 /// Gap between the cursor and the corner of a menu opened at it.
 pub(crate) const CURSOR_MENU_GAP: f64 = 3.0;
 
@@ -6854,6 +6881,42 @@ mod destructive_launch_gate {
              READ_ONLY_ANSWERED_ELSEWHERE with its reason:\n{}",
             offenders.join("\n")
         );
+    }
+}
+
+/// [`cap_below`]: a dropdown opened under an anchor caps at the window below it
+/// (GitHub #21).
+#[cfg(test)]
+mod cap_below_tests {
+    use super::cap_below;
+
+    /// **The issue #21 case.** The QUERY toolbar's selector on a 700px window,
+    /// its trigger's bottom at 80: the list may take what is under it, less the
+    /// margin — not run on past the bottom edge.
+    #[test]
+    fn a_list_under_an_anchor_stops_short_of_the_bottom_edge() {
+        assert_eq!(cap_below(80.0, 700.0, 8.0, 80.0), 612.0);
+    }
+
+    /// An anchor low in the window still leaves a usable few rows rather than a
+    /// sliver or a negative height.
+    #[test]
+    fn an_anchor_near_the_bottom_keeps_the_floor() {
+        assert_eq!(cap_below(660.0, 700.0, 8.0, 80.0), 80.0);
+        assert_eq!(cap_below(900.0, 700.0, 8.0, 80.0), 80.0);
+    }
+
+    /// Before the window is measured there is nothing to cap against: zero,
+    /// which the caller reads as "no cap", as `menu_max_h` does.
+    #[test]
+    fn an_unmeasured_window_caps_nothing() {
+        assert_eq!(cap_below(80.0, 0.0, 8.0, 80.0), 0.0);
+    }
+
+    /// The floor never outgrows a tiny window.
+    #[test]
+    fn the_floor_is_clamped_to_the_window() {
+        assert_eq!(cap_below(10.0, 50.0, 8.0, 80.0), 50.0);
     }
 }
 

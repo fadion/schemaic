@@ -832,10 +832,22 @@ pub(crate) fn conn_menu_overlay(
             .style(menu_item_style)
             .style(|s| s.padding_vert(theme::scaled(8.0)));
 
+            // **Only the connections scroll** (GitHub #21): the panel caps at the
+            // room under the switcher, and the list shrinks inside that cap while
+            // *Manage Connections* keeps its row — the way out of a long list
+            // must not be the thing scrolled out of sight. `shift_hscroll`, as
+            // every scroll here: a long name pans on Shift+wheel too.
+            let list = crate::widgets::shift_hscroll(list.style(|s| s.min_width_full()))
+                .style(|s| s.flex_shrink(1.0_f32).min_height(0.0).width_full());
             let panel = v_stack((
                 list,
-                empty().style(|s| s.width_full().height(1.0).background(theme::border())),
-                manage,
+                empty().style(|s| {
+                    s.width_full()
+                        .height(1.0)
+                        .flex_shrink(0.0_f32)
+                        .background(theme::border())
+                }),
+                manage.style(|s| s.flex_shrink(0.0_f32)),
             ))
             .on_click_stop(|_| {})
             // **The panel absorbs its own pointer-downs**, or the root's
@@ -853,6 +865,8 @@ pub(crate) fn conn_menu_overlay(
             // survive a click inside it.
             .on_event_stop(EventListener::PointerDown, |_| {})
             .style(|s| {
+                let cap = crate::widgets::room_below(theme::header_h() - theme::scaled(4.0));
+                let s = if cap > 0.0 { s.max_height(cap) } else { s };
                 panel_style(s)
                     .background(theme::bg_chrome())
                     // Paired with the name and endpoint limits above — see the
@@ -984,9 +998,17 @@ pub(crate) fn active_db_menu_overlay(
                         })
                 },
             )
-            .style(|s| s.flex_col());
+            // `min_width_full`: the scroll lays its child out at content width,
+            // and the rows' hover would stop short of the panel's edge — see
+            // `widgets::menu_stack`.
+            .style(|s| s.flex_col().min_width_full());
 
-            let panel = container(list)
+            // **Scrolls past the room below the trigger** (GitHub #21): a
+            // connection with many databases ran this list off the bottom of
+            // the window, the ones below the fold unreachable. `shift_hscroll`,
+            // so a name wider than the panel pans on Shift+wheel as well as on
+            // a horizontal wheel, as every other scroll in the app does.
+            let panel = crate::widgets::shift_hscroll(list)
                 .on_click_stop(|_| {})
                 // Same absorb, same reason as the connection menu's panel: the
                 // root's dismissal now covers this menu too, and without this it
@@ -995,6 +1017,8 @@ pub(crate) fn active_db_menu_overlay(
                 .on_event_stop(EventListener::PointerDown, |_| {})
                 .style(move |s| {
                     let a = anchor.get();
+                    let cap = crate::widgets::room_below(a.y);
+                    let s = if cap > 0.0 { s.max_height(cap) } else { s };
                     panel_style(s)
                         .background(theme::bg_chrome())
                         .width(db_menu_w())
@@ -1099,6 +1123,13 @@ pub(crate) fn db_visibility_overlay(schema: SchemaUi, toggle: Rc<dyn Fn(String)>
             // on the gear from switching menus). Dismissal is via the root-level
             // pointer-down handler; the panel absorbs its own pointer-downs so it
             // isn't closed while flipping items.
+            //
+            // Scrolls past the room under the gear (GitHub #21), as the QUERY
+            // toolbar's database selector does: a server with many databases ran
+            // this list off the bottom of the window. `shift_hscroll` for the
+            // horizontal axis, as every scroll here.
+            let list = crate::widgets::shift_hscroll(list.style(|s| s.min_width_full()))
+                .style(|s| s.flex_shrink(1.0_f32).min_height(0.0).width_full());
             focus_root(v_stack((list,)))
                 .on_key_down(
                     Key::Named(NamedKey::Escape),
@@ -1106,7 +1137,9 @@ pub(crate) fn db_visibility_overlay(schema: SchemaUi, toggle: Rc<dyn Fn(String)>
                     move |_| open.set(false),
                 )
                 .on_event_stop(EventListener::PointerDown, |_| {})
-                .style(|s| {
+                .style(move |s| {
+                    let cap = crate::widgets::room_below(anchor.get().y + MENU_ICON_DROP);
+                    let s = if cap > 0.0 { s.max_height(cap) } else { s };
                     panel_style(s)
                         .background(theme::bg_chrome())
                         .min_width(theme::scaled(170.0))
