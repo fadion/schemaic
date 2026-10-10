@@ -2894,6 +2894,71 @@ fn export_values_at(gs: GridState, pos: usize) -> String {
     )
 }
 
+/// Which keyed statement [`copy_keyed_sql`] writes.
+#[derive(Clone, Copy)]
+enum KeyedCopy {
+    Update,
+    WhereIn,
+}
+
+/// Copy as ▸ **SQL UPDATE** / **SQL WHERE IN** for the rows a menu was opened
+/// on — `edit::GridCells::updates_at` / `where_in_at`, which aim by the
+/// write-back's own row key. Empty, with the reason on the bar, where there is
+/// no honest key to aim by.
+///
+/// **Behind `row_gestures_are_safe`, as Delete and Duplicate row are.** These
+/// copy text rather than write, but the text is a statement aimed at one table
+/// by key, and a join that projects one table's columns (`insert_target`'s
+/// blind spot) would aim it at rows the display row only partly stands for.
+fn copy_keyed_sql(gs: GridState, pos: usize, what: KeyedCopy) -> String {
+    let result = if gs.row_gestures_are_safe() {
+        let model = gs.edit_model.get_untracked();
+        let (rs, order) = (gs.rs.get_untracked(), gs.order.get_untracked());
+        let (dirty, new_rows) = (gs.dirty.get_untracked(), gs.new_rows.get_untracked());
+        let formats = gs.formats.get_untracked();
+        let cells = grid_cells(&rs, &order, &formats, &dirty, &new_rows);
+        let (sel, layout) = (gs.bounds_untracked(), gs.layout_untracked());
+        match what {
+            KeyedCopy::Update => cells.updates_at(&model, sel, pos, layout, gs.dialect),
+            KeyedCopy::WhereIn => cells.where_in_at(&model, sel, pos, layout, gs.dialect),
+        }
+    } else {
+        Err("Nothing to copy as SQL: these rows come from a query over more than one table.")
+    };
+    result.unwrap_or_else(|why| {
+        gs.commit_note.set(Some(why.to_string()));
+        String::new()
+    })
+}
+
+/// The *Copy as* submenu, shared by the gutter's menu and the cell's: the
+/// text formats, then the SQL fragments — `VALUES`, and the two keyed ones.
+fn copy_as_menu(gs: GridState, pos: usize) -> MenuEntry {
+    let copy = |text: String| {
+        // Empty is said on the bar by the renderer, not copied.
+        if !text.is_empty() {
+            let _ = floem::Clipboard::set_contents(text);
+        }
+    };
+    MenuEntry::sub(
+        "Copy as",
+        ExportFormat::clipboard_formats()
+            .map(|f| MenuEntry::action(f.label(), move || copy(render_rows_at(gs, pos, f))))
+            // The rows without the `INSERT` around them, for a `VALUES` the
+            // user is writing.
+            .chain([
+                MenuEntry::action("SQL VALUES", move || copy(export_values_at(gs, pos))),
+                MenuEntry::action("SQL UPDATE", move || {
+                    copy(copy_keyed_sql(gs, pos, KeyedCopy::Update))
+                }),
+                MenuEntry::action("SQL WHERE IN", move || {
+                    copy(copy_keyed_sql(gs, pos, KeyedCopy::WhereIn))
+                }),
+            ])
+            .collect(),
+    )
+}
+
 /// A SQL fragment's text for the clipboard, with its withheld binary columns
 /// said on the bar — as [`render_order`] says them for JSON and CSV, since the
 /// fragment has nowhere to carry a note. Said even when the text is empty: an
@@ -9593,33 +9658,9 @@ fn gutter_menu(gs: GridState, pos: usize, pending: Option<usize>) -> Vec<MenuEnt
     let mut entries = vec![
         MenuEntry::action("Copy", move || copy_selection(gs)).shortcut(MenuKey::GridCopy),
         // The rows as the toolbar's Copy renders the whole result — an
-        // `INSERT`, a JSON array, a Markdown table — for just these rows. Text
-        // formats only, for the reason that menu gives.
-        MenuEntry::sub(
-            "Copy as",
-            ExportFormat::clipboard_formats()
-                .map(|f| {
-                    MenuEntry::action(f.label(), move || {
-                        // See the toolbar's twin: empty is said, not copied.
-                        let text = render_rows_at(gs, pos, f);
-                        if !text.is_empty() {
-                            let _ = floem::Clipboard::set_contents(text);
-                        }
-                    })
-                })
-                // The rows without the `INSERT` around them, for a `VALUES`
-                // the user is writing.
-                .chain(std::iter::once(MenuEntry::action(
-                    "SQL VALUES",
-                    move || {
-                        let text = export_values_at(gs, pos);
-                        if !text.is_empty() {
-                            let _ = floem::Clipboard::set_contents(text);
-                        }
-                    },
-                )))
-                .collect(),
-        ),
+        // `INSERT`, a JSON array, a Markdown table — for just these rows, plus
+        // the SQL fragments only a row gesture can mean (`copy_as_menu`).
+        copy_as_menu(gs, pos),
     ];
     // Row actions, on the same terms the cell menu offers them: real (already
     // committed) rows of a single writable table.
@@ -10992,6 +11033,9 @@ fn data_cell(
                     let _ = floem::Clipboard::set_contents(formatted_val.clone());
                 }));
             }
+            // The gutter's *Copy as*, over the same gesture: the selected block
+            // when this cell is inside it, else this cell's row.
+            entries.push(copy_as_menu(gs, i));
             // Beside Copy, and gated the same way Edit Field is: a paste is a
             // batch of edits, so a result nothing can be typed into has nothing
             // to paste into either. The action still lands on the *selection*,
@@ -11708,6 +11752,26 @@ mod cell_preview_tests {
             f.contains("exported_rows_at(gs, pos)") && !f.contains("exported_rows(gs)"),
             "`export_values_at` no longer copies just the rows the gesture named:\n{f}"
         );
+        // And its *SQL UPDATE* / *SQL WHERE IN*, which resolve inside
+        // `GridCells` (`updates_at` reads `exported()`, held to the staged value
+        // by `copy_as_update_sets_the_staged_value_and_keys_by_the_original`) —
+        // so here the question is only that they go through it, over the
+        // gesture's selection.
+        let at = body.find("fn copy_keyed_sql(").expect("copy_keyed_sql");
+        let end = body[at..].find("\n}").expect("no end");
+        let f = &body[at..at + end];
+        for needle in [
+            "grid_cells(",
+            ".updates_at(",
+            ".where_in_at(",
+            "gs.bounds_untracked()",
+        ] {
+            assert!(
+                f.contains(needle),
+                "`copy_keyed_sql` no longer resolves the gesture's rows through \
+                 `GridCells` (`{needle}` is gone):\n{f}"
+            );
+        }
         // **The file's `INSERT`s are the clipboard's blocks.** `exported_rows`
         // satisfies the resolution check above and still has a pending ＋Row's
         // unset cells as `NULL`, so Save .sql wrote them — overriding the

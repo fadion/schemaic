@@ -606,6 +606,34 @@ pub fn row_key(rs: &ResultSet, tbl: &EditTable, di: usize) -> Vec<(String, Value
         .collect()
 }
 
+/// What Copy as ▸ SQL UPDATE / WHERE IN say for a result with no single keyed
+/// table — the [`EditModel::insert_target`] refusal.
+const COPY_NEEDS_ONE_KEYED_TABLE: &str =
+    "Nothing to copy as SQL: the rows need to come from one table with a key.";
+
+/// [`row_key`] as **SQL text** the user reads and runs: `a = 1 AND b = 'x'`,
+/// with `IS NULL` for a NULL — `=` never matches one, and an implicit key's
+/// confirming column may well hold it. Quoted by `export::ident_sql`, valued by
+/// `export::script_literal`, the two the `INSERT` copy uses.
+fn key_match(rs: &ResultSet, tbl: &EditTable, di: usize, dialect: SqlDialect) -> String {
+    tbl.key_cols
+        .iter()
+        .chain(tbl.confirm_cols.iter())
+        .zip(row_key(rs, tbl, di))
+        .map(|(&kci, (name, v))| {
+            let name = crate::export::ident_sql(&name, dialect);
+            match v {
+                Value::Null => format!("{name} IS NULL"),
+                v => format!(
+                    "{name} = {}",
+                    crate::export::script_literal(&v, &rs.columns[kci].type_name, dialect)
+                ),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ")
+}
+
 /// A result column's **real** name on its base table, from the wire provenance.
 /// Empty for an expression column, which is never written to.
 pub fn origin_column(rs: &ResultSet, ci: usize) -> String {
@@ -1515,6 +1543,140 @@ impl GridCells<'_> {
     ) -> Vec<(ResultSet, Vec<usize>)> {
         let (rows, cols) = self.gesture_at(selection, pos, &layout.into());
         self.insert_blocks(rows, &cols)
+    }
+
+    /// Copy as ▸ **SQL UPDATE** for the gesture at `pos`: one `UPDATE` per
+    /// selected saved row, setting the selected columns to what the grid shows
+    /// (a staged edit included) and aimed by [`row_key`] — the identity the
+    /// write-back itself uses, the row's **original** key values.
+    ///
+    /// Only a result [`EditModel::insert_target`] names one table for — the
+    /// gate Duplicate and Delete row ask — because an `UPDATE` with no single
+    /// table and key has nowhere honest to point. Key columns are the `WHERE`
+    /// and never a `SET`; a column that is not text-writable (an expression, a
+    /// blob shown as `<n bytes>`) is left out; a pending row has no key yet and
+    /// is skipped. `Err` is the sentence the grid shows instead of copying.
+    pub fn updates_at(
+        &self,
+        model: &EditModel,
+        selection: Option<(usize, usize, usize, usize)>,
+        pos: usize,
+        layout: impl Into<ColLayout>,
+        dialect: SqlDialect,
+    ) -> Result<String, &'static str> {
+        let tbl = model.insert_target().ok_or(COPY_NEEDS_ONE_KEYED_TABLE)?;
+        let (rows, cols) = self.gesture_at(selection, pos, &layout.into());
+        let (out, order) = self.exported();
+        let saved = self.saved_rows(&order, rows)?;
+        let sets: Vec<usize> = cols
+            .into_iter()
+            .filter(|&ci| model.text_editable(ci) && !tbl.key_cols.contains(&ci))
+            .collect();
+        if sets.is_empty() {
+            return Err("Nothing to copy as UPDATE: none of the selected columns can be written.");
+        }
+        let target = crate::export::qualified_table(
+            &tbl.database,
+            tbl.schema.as_deref(),
+            &tbl.table,
+            dialect,
+        );
+        let mut sql = String::new();
+        for di in saved {
+            let set = sets
+                .iter()
+                .map(|&ci| {
+                    let v = out
+                        .cell(di, ci)
+                        .map(|c| c.to_value())
+                        .unwrap_or(Value::Null);
+                    format!(
+                        "{} = {}",
+                        crate::export::ident_sql(&origin_column(self.rs, ci), dialect),
+                        crate::export::script_literal(&v, &self.rs.columns[ci].type_name, dialect)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let key = key_match(self.rs, tbl, di, dialect);
+            sql.push_str(&format!("UPDATE {target} SET {set} WHERE {key};\n"));
+        }
+        Ok(sql)
+    }
+
+    /// Copy as ▸ **SQL WHERE IN** for the gesture at `pos`: the selected saved
+    /// rows named by their key — `WHERE id IN (3, 1)` for one key column, and
+    /// `OR`ed matches for a composite one, which has no tuple `IN` on SQL
+    /// Server. Each row once, in display order.
+    ///
+    /// Refused on an **implicit** key (SQLite's `rowid` with its confirming
+    /// columns, [`EditTable::confirm_cols`]): a rowid alone is not an identity
+    /// a pasted predicate should rest on, and with the confirming values it is
+    /// no longer a key list.
+    pub fn where_in_at(
+        &self,
+        model: &EditModel,
+        selection: Option<(usize, usize, usize, usize)>,
+        pos: usize,
+        layout: impl Into<ColLayout>,
+        dialect: SqlDialect,
+    ) -> Result<String, &'static str> {
+        let tbl = model.insert_target().ok_or(COPY_NEEDS_ONE_KEYED_TABLE)?;
+        if !tbl.confirm_cols.is_empty() {
+            return Err(
+                "Nothing to copy as WHERE IN: this table has no primary or unique key to name its \
+                 rows by.",
+            );
+        }
+        let (rows, _) = self.gesture_at(selection, pos, &layout.into());
+        let (_, order) = self.exported();
+        let mut seen = std::collections::HashSet::new();
+        let saved: Vec<usize> = self
+            .saved_rows(&order, rows)?
+            .into_iter()
+            .filter(|&di| seen.insert(key_match(self.rs, tbl, di, dialect)))
+            .collect();
+        if let [kci] = tbl.key_cols[..] {
+            let values = saved
+                .iter()
+                .map(|&di| {
+                    let v = self
+                        .rs
+                        .cell(di, kci)
+                        .map(|c| c.to_value())
+                        .unwrap_or(Value::Null);
+                    crate::export::script_literal(&v, &self.rs.columns[kci].type_name, dialect)
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let name = crate::export::ident_sql(&origin_column(self.rs, kci), dialect);
+            return Ok(format!("WHERE {name} IN ({values})"));
+        }
+        let rows = saved
+            .iter()
+            .map(|&di| format!("({})", key_match(self.rs, tbl, di, dialect)))
+            .collect::<Vec<_>>()
+            .join("\n   OR ");
+        Ok(format!("WHERE {rows}"))
+    }
+
+    /// The **saved** data rows among display `rows` of `order` — a pending row
+    /// sits past the stored ones and has no key yet. `Err` when that leaves
+    /// none.
+    fn saved_rows(
+        &self,
+        order: &[usize],
+        rows: std::ops::RangeInclusive<usize>,
+    ) -> Result<Vec<usize>, &'static str> {
+        let nreal = self.rs.row_count();
+        let saved: Vec<usize> = pick(order, rows)
+            .into_iter()
+            .filter(|&di| di < nreal)
+            .collect();
+        if saved.is_empty() {
+            return Err("Nothing to copy: a new row has no key until it is saved.");
+        }
+        Ok(saved)
     }
 
     /// [`GridCells::insert_blocks_at`] over the whole result, every column in
@@ -4389,6 +4551,148 @@ mod tests {
             dirty,
             new_rows,
         }
+    }
+
+    // ── Copy as UPDATE / WHERE key IN ─────────────────────────────────────────
+
+    /// `t (id INT PK, name VARCHAR, note VARCHAR)` with three rows, and its model.
+    fn keyed_people() -> (ResultSet, EditModel) {
+        let r = ResultSet::from_rows(
+            vec![
+                col("id", "INT", "t", true, false),
+                col("name", "VARCHAR", "t", false, false),
+                col("note", "VARCHAR", "t", false, false),
+            ],
+            vec![
+                vec![Value::Int(1), Value::Str("ann".into()), Value::Null],
+                vec![
+                    Value::Int(2),
+                    Value::Str("o'neil".into()),
+                    Value::Str("x".into()),
+                ],
+                vec![Value::Int(3), Value::Str("bo".into()), Value::Null],
+            ],
+        );
+        let schema = |_db: &str, _s: Option<&str>, t: &str| {
+            (t == "t").then(|| {
+                schema_with_pk(
+                    "t",
+                    &["id"],
+                    &[("id", "int"), ("name", "varchar"), ("note", "varchar")],
+                )
+            })
+        };
+        let m = analyze_edit(&r, schema);
+        (r, m)
+    }
+
+    /// One `UPDATE` per selected row, setting the selected columns to what the
+    /// grid shows and aimed by the same key the write-back uses — the key
+    /// column itself is the `WHERE`, never a `SET`.
+    #[test]
+    fn copy_as_update_writes_one_statement_per_row_keyed_like_the_write_back() {
+        let (r, m) = keyed_people();
+        let (order, formats, dirty, new) = (vec![0, 1, 2], vec![], HashMap::new(), vec![]);
+        let c = cells(&r, &order, &formats, &dirty, &new);
+        let sql = c
+            .updates_at(&m, Some((0, 0, 1, 2)), 0, None, SqlDialect::MySql)
+            .unwrap();
+        assert_eq!(
+            sql,
+            "UPDATE `db`.`t` SET `name` = 'ann', `note` = NULL WHERE `id` = 1;\n\
+             UPDATE `db`.`t` SET `name` = 'o''neil', `note` = 'x' WHERE `id` = 2;\n"
+        );
+    }
+
+    /// A staged edit is what the grid shows, so it is what the copy sets — but
+    /// the `WHERE` still names the row by its **original** key, or an edited
+    /// key would aim the statement at a row that does not exist yet.
+    #[test]
+    fn copy_as_update_sets_the_staged_value_and_keys_by_the_original() {
+        let (r, m) = keyed_people();
+        let mut dirty = HashMap::new();
+        dirty.insert((0, 0), CellEdit::Text("10".into()));
+        dirty.insert((0, 1), CellEdit::Text("anne".into()));
+        let (order, formats, new) = (vec![0, 1, 2], vec![], vec![]);
+        let c = cells(&r, &order, &formats, &dirty, &new);
+        let sql = c
+            .updates_at(&m, Some((0, 1, 0, 1)), 0, None, SqlDialect::Postgres)
+            .unwrap();
+        assert_eq!(
+            sql,
+            "UPDATE \"db\".\"t\" SET \"name\" = 'anne' WHERE \"id\" = 1;\n"
+        );
+    }
+
+    /// A pending row has no key until it is saved, and a selection of nothing
+    /// but the key has nothing to set — each says so rather than copying an
+    /// empty string.
+    #[test]
+    fn copy_as_update_refuses_what_it_cannot_aim_or_set() {
+        let (r, m) = keyed_people();
+        let mut pending = HashMap::new();
+        pending.insert(1usize, CellEdit::Text("new".into()));
+        let (order, formats, dirty, new) = (vec![0, 1, 2], vec![], HashMap::new(), vec![pending]);
+        let c = cells(&r, &order, &formats, &dirty, &new);
+        assert!(c.updates_at(&m, None, 3, None, SqlDialect::MySql).is_err());
+        let only_key = c.updates_at(&m, Some((0, 0, 2, 0)), 0, None, SqlDialect::MySql);
+        assert!(
+            only_key
+                .unwrap_err()
+                .contains("none of the selected columns")
+        );
+        let no_model = EditModel::default();
+        assert!(
+            c.updates_at(&no_model, None, 0, None, SqlDialect::MySql)
+                .is_err()
+        );
+    }
+
+    /// `WHERE key IN (…)` names the selected rows by their keys, once each.
+    #[test]
+    fn copy_as_where_in_lists_the_selected_keys() {
+        let (r, m) = keyed_people();
+        let (order, formats, dirty, new) = (vec![2, 0, 1], vec![], HashMap::new(), vec![]);
+        let c = cells(&r, &order, &formats, &dirty, &new);
+        assert_eq!(
+            c.where_in_at(&m, Some((0, 1, 1, 1)), 0, None, SqlDialect::MySql)
+                .unwrap(),
+            "WHERE `id` IN (3, 1)"
+        );
+    }
+
+    /// A composite key has no portable tuple `IN` (SQL Server has none), so
+    /// its rows are `OR`ed key matches instead.
+    #[test]
+    fn copy_as_where_in_ors_a_composite_key() {
+        let r = ResultSet::from_rows(
+            vec![
+                col("a", "INT", "t", true, false),
+                col("b", "VARCHAR", "t", true, false),
+                col("v", "INT", "t", false, false),
+            ],
+            vec![
+                vec![Value::Int(1), Value::Str("x".into()), Value::Int(0)],
+                vec![Value::Int(2), Value::Str("y".into()), Value::Int(0)],
+            ],
+        );
+        let schema = |_db: &str, _s: Option<&str>, t: &str| {
+            (t == "t").then(|| {
+                schema_with_pk(
+                    "t",
+                    &["a", "b"],
+                    &[("a", "int"), ("b", "varchar"), ("v", "int")],
+                )
+            })
+        };
+        let m = analyze_edit(&r, schema);
+        let (order, formats, dirty, new) = (vec![0, 1], vec![], HashMap::new(), vec![]);
+        let c = cells(&r, &order, &formats, &dirty, &new);
+        assert_eq!(
+            c.where_in_at(&m, Some((0, 2, 1, 2)), 0, None, SqlDialect::MsSql)
+                .unwrap(),
+            "WHERE ([a] = 1 AND [b] = N'x')\n   OR ([a] = 2 AND [b] = N'y')"
+        );
     }
 
     /// **The clipboard and the file answer the same question the same way.**

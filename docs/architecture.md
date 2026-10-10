@@ -3617,7 +3617,7 @@ existing prose was left alone.
     listed cell really differs. `exported_rows_at(selection, pos, layout)` is that resolution
     narrowed to what a gutter gesture at **display** row `pos` means — the highlighted rows when
     the click is inside them, else that row alone, the reading `selected_data_rows` gives — for the
-    row menu's *Copy as*. It slices the *exported* order by display position rather than reading the
+    *Copy as* on the gutter's menu and the cell's. It slices the *exported* order by display position rather than reading the
     selection as data indices, which on a sorted grid are different numbers and would copy the wrong
     rows; slicing the resolved order is what carries the sort, the staged values and the pending
     rows at once. Unlike the delete it keeps the pending rows, since a copy has nothing to refuse
@@ -3640,7 +3640,24 @@ existing prose was left alone.
     pending row with nothing set has nothing to insert and is left out
     (`an_insert_of_a_pending_row_omits_the_cells_it_did_not_set`). `DEFAULT` in `VALUES` would say
     the same in one statement, and SQLite refuses it. CSV and JSON keep `exported_rows_at`'s single
-    result, blank cells and all. One rule,
+    result, blank cells and all.
+    **`updates_at` and `where_in_at` are the two *keyed* copies — *Copy as ▸ SQL UPDATE* and *SQL
+    WHERE IN* — and they aim by `row_key`, the identity the write-back itself uses**, so a copied
+    `UPDATE` names the row the grid's own Commit would, by its **original** key values rather than
+    a staged one. The private `key_match` is that key as SQL text, with `IS NULL` for a NULL, since
+    `=` never matches one and an implicit key's confirming column may hold it. The `SET` list is the
+    gesture's columns that are `text_editable` and not key columns, valued from `exported()` — what
+    the grid shows, staged edits included — through `export::script_literal` and named by
+    `origin_column` through `export::ident_sql`; so a staged change to a key column is in neither
+    half of the copy. A pending row has no key yet and is skipped (`saved_rows`)
+    (`copy_as_update_sets_the_staged_value_and_keys_by_the_original`). `where_in_at` writes
+    `WHERE k IN (…)` for one key column and `OR`ed, parenthesised matches for a composite one — SQL
+    Server has no tuple `IN` — each row once, in display order
+    (`copy_as_where_in_ors_a_composite_key`); it refuses an implicit key (non-empty `confirm_cols`,
+    SQLite's `rowid`), a rowid alone being no identity a pasted predicate should rest on and, with
+    its confirming values, no longer a key list. Both refuse with `COPY_NEEDS_ONE_KEYED_TABLE`
+    unless `EditModel::insert_target()` names one table — the gate Duplicate and Delete row ask —
+    and the refusal is the `Err` sentence the grid puts on the bar instead of copying. One rule,
     because this resolution kept going out one source short where nothing could test it:
     `attached_rows` first read `rs.cell` and never `dirty`, so a green uncommitted edit was on
     screen while the pre-edit value went to the model, and the fix for *that* left the rule in
@@ -32517,7 +32534,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   Delete key over a gutter selection — so it is on `GridState::toggle_delete`, its batched twin
   `GridState::mark_deleted` and `clone_rows` now, which is the rule `clone_rows` already states for
   its own size question and this invariant states for writes; the menu and strip terms are
-  presentation after that. **This paragraph claimed the Delete key for a release while it was not
+  presentation after that. *Copy as ▸ SQL UPDATE* and *SQL WHERE IN* ask it too (`copy_keyed_sql`),
+  though they only copy text: the text is a statement aimed at one table by key, and on that join
+  it would be aimed at a parent the display row only partly stands for. **This paragraph claimed the Delete key for a release while it was not
   so**: the key had been batched into a direct `del_rows` write before the guard moved onto
   `toggle_delete`, so on a 1:many join Del marked the parent row every menu refused, and the commit
   deleted it. The batched write is `mark_deleted` now, and
@@ -36645,7 +36664,13 @@ this bundle's.
   says why). *SQL VALUES* follows the list and is not one of its formats: the same rows as bare
   tuples, through `export_values_at` → `exported_rows_at` (`core::export`'s entry has what it does
   with a pending row's unset cells, and with a binary cell, which it writes as `NULL` and names on
-  the bar). Its row
+  the bar). *SQL UPDATE* and *SQL WHERE IN* close it — `copy_keyed_sql` →
+  `edit::GridCells::updates_at`/`where_in_at`, keyed by the write-back's own `row_key` (`core::edit`'s
+  entry has the statement shapes and the refusals) — behind `row_gestures_are_safe`, as Delete and
+  Duplicate row are, and a refusal goes on `commit_note` with the clipboard left as it was. The
+  submenu is `copy_as_menu`, and **the cell menu carries it too**, after *Copy* / *Copy formatted*,
+  with the cell's display row as `pos`: the gesture is the highlighted block when the cell is
+  inside it, else that cell's whole row. The gutter menu's row
   actions take **every selected row** (`selected_data_rows` → `set_rows_deleted` /
   `clone_rows`) and count them in the label: the same menu naming five rows in one entry and acting
   on one in the next is how four deletions go missing unnoticed. **`set_rows_deleted` batches, and
