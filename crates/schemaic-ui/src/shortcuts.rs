@@ -98,6 +98,7 @@ pub(crate) const SHORTCUTS: &[ShortcutGroup] = &[
             ("Ctrl+Alt+Shift+L", "Format statement"),
             ("Ctrl+Alt+J", "Make single line"),
             ("Alt+↑ / Alt+↓", "Move line up / down"),
+            ("Alt+Enter", "Apply the quick fix under the caret"),
             ("Tab / Shift+Tab", "Indent / outdent"),
             (
                 "Tab / Ctrl+→",

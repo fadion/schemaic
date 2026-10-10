@@ -6321,6 +6321,11 @@ pub struct Diagnostic {
     pub range: (usize, usize),
     pub severity: Severity,
     pub message: String,
+    /// Alt+Enter's quick fix: the text that replaces **exactly `range`** —
+    /// the nearest keyword for a typo, `x IS NULL` for `x = NULL`. `None` where
+    /// there is no one answer. Its own range would have to be shifted
+    /// wherever `range` is (the per-statement cache moves it), so it has none.
+    pub fix: Option<String>,
 }
 
 /// Convert a 1-based (line, column) — as reported by a `sqlparser` / DB error
@@ -7160,6 +7165,19 @@ pub fn nearest_name<'a>(
     best.filter(|_| !tied).map(|(_, c)| c)
 }
 
+/// `name` in the case `typed` was written in — all lower, all upper, or as
+/// `name` has it — so a typo's fix reads like the text around it.
+fn in_case_of(typed: &str, name: &str) -> String {
+    let letters = || typed.chars().filter(|c| c.is_ascii_alphabetic());
+    if letters().all(|c| c.is_ascii_lowercase()) {
+        name.to_ascii_lowercase()
+    } else if letters().all(|c| c.is_ascii_uppercase()) {
+        name.to_ascii_uppercase()
+    } else {
+        name.to_string()
+    }
+}
+
 /// [`nearest_name`] as the tail of a "not found" message — empty when there
 /// is no one name to suggest.
 fn did_you_mean<'a>(name: &str, candidates: impl IntoIterator<Item = &'a str>) -> String {
@@ -7666,6 +7684,7 @@ fn flow_error(out: &mut Vec<Diagnostic>, range: (usize, usize), message: &str) {
         range,
         severity: Severity::Error,
         message: message.to_string(),
+        fix: None,
     });
 }
 
@@ -8417,6 +8436,7 @@ fn unit_diagnostics(
                 range,
                 severity: Severity::Error,
                 message: friendly_syntax_message(&msg),
+                fix: None,
             });
         }
         Err(_) => {}
@@ -10947,6 +10967,7 @@ fn alias_checks(
             message: format!(
                 "`{kw}` is a reserved keyword and can't be used as an alias (quote it with {quote})"
             ),
+            fix: None,
         });
     };
     // A T-SQL routine's header ends in an `AS` its body follows — see
@@ -11226,6 +11247,7 @@ fn table_existence_checks(
                 range: l.pos,
                 severity: Severity::Error,
                 message: format!("Table `{}` not found{where_db}{hint}", r.name),
+                fix: None,
             });
         }
     }
@@ -11267,6 +11289,7 @@ fn qualified_column_checks(
                 range: (w[2].at, w[2].end),
                 severity: Severity::Error,
                 message: format!("Column `{col}` not found in `{}`{hint}", table.name),
+                fix: None,
             });
         }
     }
@@ -11986,6 +12009,7 @@ mod colres {
             range: r.range,
             severity: Severity::Error,
             message: message.to_string(),
+            fix: None,
         }
     }
 
@@ -12043,6 +12067,7 @@ mod colres {
                         message: "JOIN has no ON/USING condition — this is a cross join; \
                                   use CROSS JOIN if that's intended"
                             .to_string(),
+                        fix: None,
                     });
                 }
             }
@@ -12071,6 +12096,7 @@ mod colres {
                         message: "Comma join with no WHERE — this is a cross join; add a \
                                   WHERE, or use CROSS JOIN if that's intended"
                             .to_string(),
+                        fix: None,
                     });
                 }
             }
@@ -12219,6 +12245,7 @@ mod colres {
                 message: format!(
                     "Column `{name}` must appear in GROUP BY or be used in an aggregate"
                 ),
+                fix: None,
             });
         }
     }
@@ -13233,6 +13260,7 @@ mod lints {
                     crate::text::plural(n, "column", "columns"),
                     crate::text::plural(m, "value", "values"),
                 ),
+                fix: None,
             });
         }
     }
@@ -13295,6 +13323,7 @@ mod lints {
                         "`{col}` can be NULL, and `NOT IN` matches no row once the subquery \
                          returns one — add `WHERE {col} IS NOT NULL` to it, or use NOT EXISTS"
                     ),
+                    fix: None,
                 });
             }
             ControlFlow::<()>::Continue(())
@@ -13445,6 +13474,7 @@ mod lints {
                     crate::text::plural(all, "column", "columns"),
                     crate::text::plural(m, "value", "values"),
                 ),
+                fix: None,
             });
         }
     }
@@ -13519,6 +13549,7 @@ mod lints {
             range,
             severity: Severity::Warning,
             message: message.to_string(),
+            fix: None,
         });
     }
 
@@ -13547,10 +13578,19 @@ mod lints {
                 } else {
                     "IS NOT NULL"
                 };
+                // The operand that is not the NULL, as written, with the test
+                // that works: the whole comparison is the range it replaces.
+                let other = if is_null(left) { right } else { left };
+                let (a, b) = to_range(stmt, lo, other.span());
+                let replacement = stmt
+                    .get(a - lo..b - lo)
+                    .filter(|t| !t.trim().is_empty() && !is_null(other))
+                    .map(|t| format!("{} {fix}", t.trim()));
                 out.push(Diagnostic {
                     range: to_range(stmt, lo, e.span()),
                     severity: Severity::Warning,
                     message: format!("A comparison with NULL is never true — use {fix}"),
+                    fix: replacement,
                 });
             }
             ControlFlow::<()>::Continue(())
@@ -13623,10 +13663,13 @@ fn typo_checks(
                 && !aliases.iter().any(|a| a.eq_ignore_ascii_case(&sql[s..j]))
                 && is_probable_typo(&sql[s..j], catalog, dialect)
             {
+                let word = &sql[s..j];
                 out.push(Diagnostic {
                     range: (s, j),
                     severity: Severity::Warning,
-                    message: format!("`{}` looks like a misspelled keyword", &sql[s..j]),
+                    message: format!("`{word}` looks like a misspelled keyword"),
+                    fix: nearest_name(word, SQL_KEYWORDS.iter().chain(STMT_KEYWORDS).copied())
+                        .map(|kw| in_case_of(word, kw)),
                 });
             }
             i = j;
@@ -13728,6 +13771,8 @@ fn function_typo_checks(
                     range: (s, j),
                     severity: Severity::Warning,
                     message: format!("`{word}` looks like a misspelled function"),
+                    fix: nearest_name(word, index.lower.iter().map(|n| &**n))
+                        .map(|f| in_case_of(word, f)),
                 });
             }
             i = j;
@@ -15723,6 +15768,7 @@ pub fn run_error_diagnostic(
             range,
             severity: Severity::Error,
             message: clean_db_message(message),
+            fix: None,
         });
     }
     let (lo, hi) = match ran {
@@ -15767,6 +15813,7 @@ pub fn db_error_diagnostic(
         range,
         severity: Severity::Error,
         message: clean_db_message(message),
+        fix: None,
     }
 }
 
@@ -15911,6 +15958,20 @@ pub(crate) fn code_word_hits_in(sql: &str, code: &[bool], needle: &str) -> Vec<(
         }
     }
     out
+}
+
+/// Alt+Enter's quick fix at `caret`: the replacement of the diagnostic the
+/// caret is on (its range, inclusive at both ends, so a caret just after a
+/// typo still reaches it) that carries a [`Diagnostic::fix`] — the strongest
+/// by [`Severity::rank`], then the narrowest, as the hover picks. `None` where
+/// no diagnostic there has one.
+pub fn fix_at(diags: &[Diagnostic], caret: usize) -> Option<(usize, usize, &str)> {
+    diags
+        .iter()
+        .filter(|d| d.range.0 <= caret && caret <= d.range.1)
+        .filter_map(|d| d.fix.as_deref().map(|f| (d, f)))
+        .min_by_key(|(d, _)| (d.severity.rank(), d.range.1 - d.range.0))
+        .map(|(d, f)| (d.range.0, d.range.1, f))
 }
 
 /// The messages of every diagnostic touching `sql[lo..hi]`, in the order they
@@ -26388,6 +26449,81 @@ mod tests {
         );
     }
 
+    /// The fix a diagnostic carries, for the one whose range spells `at`.
+    fn fix_for(sql: &str, at: &str) -> Option<String> {
+        diag(sql)
+            .into_iter()
+            .find(|d| &sql[d.range.0..d.range.1] == at)
+            .and_then(|d| d.fix)
+    }
+
+    /// **Alt+Enter's fixes**: each replaces exactly the diagnostic's own
+    /// range. A misspelled keyword or function takes the nearest name, in the
+    /// case it was typed; a comparison with NULL becomes the test that works.
+    #[test]
+    fn a_fixable_diagnostic_carries_its_replacement() {
+        assert_eq!(
+            fix_for("SELCT * FROM employees", "SELCT").as_deref(),
+            Some("SELECT")
+        );
+        assert_eq!(
+            fix_for("selct * from employees", "selct").as_deref(),
+            Some("select")
+        );
+        assert_eq!(
+            fix_for("SELECT * FROM employees WHERE name = NULL", "name = NULL").as_deref(),
+            Some("name IS NULL")
+        );
+        assert_eq!(
+            fix_for(
+                "SELECT * FROM employees WHERE NULL <> salary",
+                "NULL <> salary"
+            )
+            .as_deref(),
+            Some("salary IS NOT NULL")
+        );
+        assert_eq!(
+            fix_for("SELECT coalese(name, 'x') FROM employees", "coalese").as_deref(),
+            Some("coalesce")
+        );
+    }
+
+    /// Alt+Enter finds the fix under the caret, the caret just past the word
+    /// included, and nothing where the caret is off every fixable range.
+    #[test]
+    fn fix_at_finds_the_fix_under_the_caret() {
+        let typo = diag("selct * from employees");
+        assert_eq!(fix_at(&typo, 2), Some((0, 5, "select")));
+        assert_eq!(
+            fix_at(&typo, 5),
+            Some((0, 5, "select")),
+            "just after the word"
+        );
+        assert_eq!(fix_at(&typo, 9), None, "on `from`, which is fine");
+        let sql = "select * from employees where name = NULL";
+        let d = diag(sql);
+        let at = sql.find("name =").unwrap();
+        assert_eq!(fix_at(&d, at + 1).map(|f| f.2), Some("name IS NULL"));
+    }
+
+    /// No fix where there is no one answer: an unknown table is not a typo
+    /// of anything this checker knows.
+    #[test]
+    fn a_diagnostic_with_no_single_answer_carries_no_fix() {
+        let sql = "SELECT * FROM no_such_table";
+        let d = diag(sql);
+        assert!(!d.is_empty(), "{d:?}");
+        assert!(d.iter().all(|x| x.fix.is_none()), "{d:?}");
+        // A transposition is flagged, but is two edits away from `COUNT` by
+        // the yardstick the fix is chosen with — a squiggle, not a guess.
+        let sql = "SELECT COUTN(*) FROM employees";
+        let typo = diag(sql)
+            .into_iter()
+            .find(|x| &sql[x.range.0..x.range.1] == "COUTN")
+            .expect("flagged");
+        assert_eq!(typo.fix, None);
+    }
+
     #[test]
     fn diag_keyword_typo_is_a_warning() {
         let sql = "SELCT * FROM employees";
@@ -31331,6 +31467,7 @@ mod tests {
             range: (lo, hi),
             severity,
             message: msg.to_string(),
+            fix: None,
         };
         let outer_warn = d(0, 100, Severity::Warning, "outer warning");
         let outer_err = d(0, 100, Severity::Error, "outer error");
@@ -31486,6 +31623,7 @@ mod tests {
                     range: (i * 10, i * 10 + 5),
                     severity: Severity::Error,
                     message: String::new(),
+                    fix: None,
                 })
                 .collect::<Vec<_>>()
         };
@@ -32591,6 +32729,7 @@ mod tests {
             range: (lo, hi),
             severity: Severity::Warning,
             message: m.to_string(),
+            fix: None,
         };
         let diags = vec![
             d(0, 6, "before"),
@@ -32616,6 +32755,7 @@ mod tests {
             range: (lo, hi),
             severity: Severity::Error,
             message: m.to_string(),
+            fix: None,
         };
         let diags = vec![
             d(20, 26, "Unknown column 'salery'"),
@@ -33387,6 +33527,7 @@ mod tests {
             range: (7, 13),
             severity: sev,
             message: m.to_string(),
+            fix: None,
         };
         let diags = vec![
             d(Severity::Error, "Column `salery` not found"),
@@ -33401,6 +33542,7 @@ mod tests {
             range: (12, 12),
             severity: Severity::Warning,
             message: "missing something".to_string(),
+            fix: None,
         }];
         assert_eq!(problems_in_range(&diags, 10, 20).len(), 1);
         assert!(problems_in_range(&diags, 0, 5).is_empty());
@@ -33416,6 +33558,7 @@ mod tests {
             range: (40, 40),
             severity: Severity::Warning,
             message: "missing something".to_string(),
+            fix: None,
         }];
         assert!(problems_in_range(&diags, 10, 40).is_empty());
         assert_eq!(problems_in_range(&diags, 40, 70).len(), 1);

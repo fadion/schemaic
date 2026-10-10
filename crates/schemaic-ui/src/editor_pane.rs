@@ -4018,6 +4018,29 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 return CommandExecuted::Yes;
             }
         }
+        // Alt+Enter applies the quick fix of the diagnostic under the caret
+        // (`intel::fix_at`) — the nearest keyword for a typo, `x IS NULL` for
+        // `x = NULL` — as one undoable edit over exactly that diagnostic's
+        // range. Nothing to fix there is no edit, and the key is still spent.
+        if mods.alt()
+            && !primary_held(mods)
+            && !mods.shift()
+            && matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::Enter), _))
+        {
+            editor_sig.with_untracked(|e| {
+                let caret = e.cursor.get_untracked().offset();
+                let fix = syntax.with_untracked(|d| {
+                    schemaic_core::intel::fix_at(d, caret).map(|(a, b, t)| (a, b, t.to_string()))
+                });
+                if let Some((a, b, text)) = fix
+                    && edit_untyped(e, comp, Selection::region(a, b), &text, EditType::Other)
+                {
+                    e.cursor
+                        .update(|c| c.set_offset(a + text.len(), false, false));
+                }
+            });
+            return CommandExecuted::Yes;
+        }
         // Panel toggles (also handled at the workspace root for non-editor
         // focus). Ctrl+Shift+E = Schema, Ctrl+Shift+A = AI, Ctrl+` = Terminal.
         // AI/Terminal share the right slot, so each key shows-or-hides its panel.
@@ -6976,7 +6999,15 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                         w,
                         bottom,
                         severity: d.severity,
-                        message: d.message.clone(),
+                        // The fix the key would make, said where the problem is.
+                        message: match &d.fix {
+                            Some(fix) => format!(
+                                "{}\n{}: {fix}",
+                                d.message,
+                                crate::shortcuts::keys_label("Alt+Enter")
+                            ),
+                            None => d.message.clone(),
+                        },
                         name_at: None,
                     })
                 })

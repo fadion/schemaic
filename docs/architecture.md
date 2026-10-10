@@ -2132,6 +2132,25 @@ existing prose was left alone.
     lower-cased and the resolver lower-cases a source's columns, so a mixed-case PostgreSQL table is
     suggested in lower case, which is not the name to type; only the flat column check, reading
     `columns_of` directly, suggests the server's own spelling.
+    **A diagnostic with one right answer carries it as `Diagnostic::fix`**, Alt+Enter's quick fix
+    (the key is under `editor_pane.rs`). It is the text that replaces **exactly the diagnostic's own
+    `range`**, and has no range of its own on purpose: the per-statement cache shifts `range` when
+    an edit moves the statement, and a second span would have to be shifted everywhere the first
+    is. Three checks fill it and every other construction site states `None`: `null_comparisons`
+    writes `x IS NULL` for `x = NULL` (`IS NOT NULL` for `<>`/`!=`, the `NULL` on either side), the
+    other operand as written, sliced by its AST span — nothing for `NULL = NULL`; the keyword-typo
+    check asks `nearest_name` over `SQL_KEYWORDS` and `STMT_KEYWORDS`, and the function-typo check
+    over the dialect's `CatalogIndex::lower`, both through the private `in_case_of`, which writes
+    the answer all lower or all upper when the typed word was, and as the name has it otherwise. So
+    a fix inherits `nearest_name`'s refusal to guess: a tie, or a typo the checker flags beyond the
+    yardstick's distance — `COUTN` is squiggled, but a transposition is two Levenshtein edits — is a
+    squiggle with no fix rather than a guess one key applies. `fix_at(diags, caret)` picks the
+    diagnostic: its range holds the caret **inclusively at both ends**, unlike the hover's
+    half-open `diag_under`, so a caret left just after the typo it finished still reaches it; and
+    among those *with a fix*, the strongest by `Severity::rank`, then the narrowest
+    (`a_fixable_diagnostic_carries_its_replacement`, `fix_at_finds_the_fix_under_the_caret`;
+    `a_diagnostic_with_no_single_answer_carries_no_fix` holds an unknown table and the `COUTN`
+    transposition to `None`; no test pins the tie).
     **The false-positive corpus is only half a defence on its own, and that is why there are now two
     passes over it.** `diag_bare` builds `Catalog::build(&[], None)`, so `unqualified_db_loaded` is
     false, `table_status` answers `Unknown` for every unqualified reference, and
@@ -25291,6 +25310,17 @@ existing prose was left alone.
     holds the hover box to the wave, and
     `the_tip_stays_inside_the_pane_margins_wherever_the_squiggle_is` sweeps pane widths and squiggle
     positions for either edge ever reaching past a margin.
+    **Alt+Enter applies the quick fix under the caret** (`Diagnostic::fix`, under `intel.rs`). The
+    key handler's arm — Alt, neither the primary modifier nor Shift — asks `intel::fix_at` over the
+    pane's `syntax` diagnostics alone, the offline pass's, since nothing the server reports carries
+    a fix, and writes the answer over that diagnostic's range through `edit_untyped`: one undo step,
+    refused under the Ctrl+K freeze, the caret left after the replacement. **The key is spent even
+    with nothing to fix**, so a stray Alt+Enter never falls through to a newline. The tip says what
+    the key would do: `diag_hits` appends a line `Alt+Enter: <fix>` (the keycap through
+    `shortcuts::keys_label`) to a diagnostic that has one. The two do not pick alike — the tip
+    shows `diag_under`'s strongest diagnostic, fix or none, and the key `fix_at`'s strongest *with*
+    one — so where a server error covers a fixable offline warning, the tip names the error and
+    Alt+Enter still applies the warning's fix.
     **The same tip is a name's quick-info**, and Ctrl+click opens what the name names — both over
     `core::quickinfo`. `DiagHit` carries `name_at: Option<usize>`: where `diag_under` finds no
     squiggle, `hover_diag` asks `name_box_at`, which undoes `content_x`, `EDITOR_TEXT_TOP` and the

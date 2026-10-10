@@ -1258,6 +1258,7 @@ mod tests {
             range,
             severity: crate::intel::Severity::Error,
             message: "unknown column".to_string(),
+            fix: None,
         }
     }
 
