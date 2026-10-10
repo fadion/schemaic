@@ -25719,7 +25719,10 @@ existing prose was left alone.
     edges keep logical positions and multiply by `z` only at render, so text stays crisp at any
     zoom. The surface is an infinite free pan (not a scroll view) — drag/middle-drag pans, Ctrl+wheel
     zooms about the cursor, plain/Shift+wheel pans — and hit-testing maps cursor → logical space via
-    `(p − pan) / z`.
+    `(p − pan) / z`. A pan press captures the pointer (`request_active`) and its `PointerUp` ends
+    it; a middle-button release outside the canvas reached that listener only once vendored Floem's
+    fourth patch (*Floem 0.2 gotchas*) stopped gating non-primary releases on the view's rect —
+    before it, the pan outlived the button (GitHub #13).
     **The edge geometry is one memo with two readers** (`EdgeGeometry`, built by `edge_geometry`
     over the positions, sizes and collapse maps). `rects` + `visible_map` + `edge_shapes` is
     O(cards) + O(edges × 32) — a fresh `HashMap<String, Rect>` over every card, `card_metrics`
@@ -33378,7 +33381,17 @@ Re-introducing the anti-patterns these guard against is a regression:
   the whitespace marks' `Attrs` in `EditorView::paint_text` the line's line height
   (`LineHeightValue::Px(style.line_height(edid, line))`, as `Editor::new_text_layout` gives the line
   itself): the `·`/`→` are laid out separately from the line, and without it they took the font's
-  natural height and rode at the top of any line taller than the font. **Three measures
+  natural height and rode at the top of any line taller than the font. The fourth lets a captured
+  view hear a **non-primary** release wherever it lands. With a view active (`request_active`)
+  every pointer event is routed to it with `directed = true`; `unconditional_view_event`'s
+  `PointerUp` arm runs a primary release's listeners unconditionally, but any other button's fell
+  through to the generic listener block, which is gated on the view's own rect. Moves are not, so
+  a middle-drag pan of the ER diagram released outside the canvas — elsewhere in the app or outside
+  the window — never ended, and moving back went on panning with no button held (GitHub #13); a
+  left-drag ended correctly. `should_run` there is now also true for a directed `PointerUp` of a
+  non-primary button; undirected dispatch is unchanged. The OS does deliver that release — winit
+  captures the mouse for the middle button too (0.30.13, Windows `WM_MBUTTONDOWN` →
+  `capture_mouse`) — so the drop was Floem's alone. No test covers it. **Three measures
   keep upstream's code out of the workspace's checks, and each looks removable**: `exclude = ["vendor"]` in the root
   manifest, since a path dependency inside the workspace directory would otherwise join it as a
   member; `vendor/floem/rustfmt.toml` with `disable_all_formatting = true`, since `cargo fmt --all`
@@ -34308,7 +34321,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   content view calls `request_active()` on every press (`views/editor/view.rs:1147`), and while
   `app_state.active` is set every pointer event goes to that one view
   (`window_handle.rs:294-319`, `unconditional_view_event(id, …, true)`) — no walk by position, so
-  nothing bubbles to `editor_area` — until the release clears it. Alt+Shift+drag's box selection
+  nothing bubbles to `editor_area` — until the release clears it. (A non-primary release outside
+  the active view's rect used to be dropped there, so a middle-drag never heard its own end;
+  vendored Floem's fourth patch delivers it, above.) Alt+Shift+drag's box selection
   is built in exactly that listener and so never drew a box. An ancestor that needs the drag has to
   hand the capture back, as the Alt+Shift `PointerDown` does with `clear_active()` on
   `ed.editor_view_id`, and **the order is load-bearing**: `UpdateMessage::ClearActive` is honoured

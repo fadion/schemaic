@@ -408,7 +408,14 @@ impl<'a> EventCx<'a> {
                 if let Some(handlers) = event_listeners.get(&listener).cloned() {
                     let should_run = if let Some(pos) = event.point() {
                         let rect = view_id.get_size().unwrap_or_default().to_rect();
-                        rect.contains(pos)
+                        // schemaic patch (PATCHES.md): a release routed to the
+                        // active view reaches it wherever it lands, for every
+                        // button — the primary one already did, above. Gated on
+                        // the view's rect, a middle-drag released outside it
+                        // never ended, and the view kept tracking the pointer.
+                        let captured_release = directed
+                            && matches!(&event, Event::PointerUp(pe) if !pe.button.is_primary());
+                        captured_release || rect.contains(pos)
                     } else {
                         true
                     };

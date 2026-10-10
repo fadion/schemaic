@@ -80,3 +80,20 @@ at the top of the line, above the middle of the text beside it.
 `.line_height(LineHeightValue::Px(style.line_height(edid, line)))`, the same
 value the line's own layout is given in `Editor::new_text_layout`. Nothing
 else changes; the marks keep their x, colour, family and size.
+
+### 4. A captured view hears its release wherever it lands, for every button
+
+**Why.** A pointer event goes straight to the active view (`request_active`)
+once one is set — `WindowHandle::event` routes it there with `directed = true`.
+For a **primary** release, `EventCx::unconditional_view_event`'s `PointerUp`
+arm runs the view's `PointerUp` listeners unconditionally. Any other button's
+release falls through to the generic listener block, which runs a listener only
+when the event's point lies inside the view's own rect. So a middle-button drag
+released outside the view — elsewhere in the window, or outside it — never
+reached the view that captured it, while every move still did: Schemaic's ER
+diagram went on panning with no button held.
+
+**What.** `src/context.rs`, `unconditional_view_event`, the generic listener
+block: `should_run` is also true for a `PointerUp` of a non-primary button when
+the event is `directed`. Primary releases are excluded because the `PointerUp`
+arm has already run their listeners; undirected dispatch is unchanged.
