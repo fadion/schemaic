@@ -297,26 +297,6 @@ pub fn shown_ghost(ghost: Option<&EditorGhost>, preview_up: bool) -> Option<&Edi
 /// alpha. Dim enough to read as not-yet-yours, strong enough to read at all.
 const GHOST_ALPHA: f32 = 0.45;
 
-/// How strongly the hint after a prediction ([`ghost_hint`]) is drawn —
-/// fainter than the prediction, being about it rather than part of it.
-const GHOST_HINT_ALPHA: f32 = 0.28;
-
-/// What is drawn after a prediction to say how to take it — and, for one
-/// remembered from a past statement, that it is one — or `None` where it
-/// would sit between the prediction and text after the caret on its line
-/// (`rest_of_line`, the line's content after the caret). Display only: Tab
-/// and Ctrl+→ take the prediction's own text and never this.
-pub fn ghost_hint(remembered: bool, rest_of_line: &str) -> Option<&'static str> {
-    if !rest_of_line.trim().is_empty() {
-        return None;
-    }
-    Some(if remembered {
-        "  Tab · remembered"
-    } else {
-        "  Tab"
-    })
-}
-
 /// The editor's one ghost slot — see [`EditorGhost`].
 pub type GhostSignal = RwSignal<Option<EditorGhost>>;
 
@@ -502,15 +482,14 @@ impl InlineDiffDoc {
         }
     }
 
-    /// The ghost to draw on `line`, as `(col, text, hint)` — none while a
-    /// Ctrl+K preview is showing, and none whose text would need a second row.
-    /// `hint` is [`ghost_hint`]'s, drawn after it.
-    fn ghost_on(&self, line: usize) -> Option<(usize, String, Option<&'static str>)> {
+    /// The ghost to draw on `line`, as `(col, text)` — none while a Ctrl+K
+    /// preview is showing, and none whose text would need a second row.
+    fn ghost_on(&self, line: usize) -> Option<(usize, String)> {
         let preview_up = self.preview.with_untracked(|p| p.is_some());
-        let (col, text, remembered) = self.ghost.with_untracked(|g| {
+        let (col, text) = self.ghost.with_untracked(|g| {
             shown_ghost(g.as_ref(), preview_up)
                 .filter(|g| g.line == line)
-                .map(|g| (g.col, g.text.clone(), g.remembered))
+                .map(|g| (g.col, g.text.clone()))
         })?;
         let rope = self.inner.rope_text();
         let content = rope.line_content(line);
@@ -523,8 +502,7 @@ impl InlineDiffDoc {
         if !content.is_char_boundary(col) {
             return None;
         }
-        let hint = ghost_hint(remembered, &content[col..]);
-        Some((col, text, hint))
+        Some((col, text))
     }
 }
 
@@ -620,11 +598,9 @@ impl DocumentPhantom for InlineDiffDoc {
             spans.push((self.inner.rope_text().line_content(line).len(), b.len));
         }
         // Where `phantom_text` puts it, so the two agree about every column.
-        // The hint after it sits at the same column, and a run of phantoms at
-        // one column shifts as one of their combined length.
-        if let Some((at, text, hint)) = self.ghost_on(line) {
+        if let Some((at, text)) = self.ghost_on(line) {
             let slot = phantom_slot(spans.iter().map(|s| s.0), at);
-            spans.insert(slot, (at, text.len() + hint.map_or(0, str::len)));
+            spans.insert(slot, (at, text.len()));
         }
         before_col_of(&spans, col)
     }
@@ -636,29 +612,26 @@ impl DocumentPhantom for InlineDiffDoc {
         // The prediction: dim, at the caret, and `Backward` — floem's own rule
         // for completion phantoms, which keeps the caret *before* the text it
         // has not been given yet (`PhantomText::affinity`).
-        if let Some((col, text, hint)) = self.ghost_on(line) {
+        if let Some((col, text)) = self.ghost_on(line) {
             let slot = phantom_slot(out.text.iter().map(|p| p.col), col);
             // The editor theme's own foreground, faded — not the field
             // placeholder colour, which was drawn but all but invisible on the
             // current-line band. Read per relayout, and an editor-theme switch
             // relays out every line.
             let fg = crate::theme::editor_theme().fg;
-            let phantom = |text: String, alpha: f32| PhantomText {
-                kind: PhantomTextKind::Completion,
-                col,
-                affinity: Some(CursorAffinity::Backward),
-                text,
-                font_size: None,
-                fg: Some(fg.multiply_alpha(alpha)),
-                bg: None,
-                under_line: None,
-            };
-            out.text.insert(slot, phantom(text, GHOST_ALPHA));
-            // Right after it, at the same column: how to take it.
-            if let Some(hint) = hint {
-                out.text
-                    .insert(slot + 1, phantom(hint.to_string(), GHOST_HINT_ALPHA));
-            }
+            out.text.insert(
+                slot,
+                PhantomText {
+                    kind: PhantomTextKind::Completion,
+                    col,
+                    affinity: Some(CursorAffinity::Backward),
+                    text,
+                    font_size: None,
+                    fg: Some(fg.multiply_alpha(GHOST_ALPHA)),
+                    bg: None,
+                    under_line: None,
+                },
+            );
             return out;
         }
         // `with_untracked`, not `get_untracked`: the latter clones the whole
@@ -740,23 +713,6 @@ impl Document for InlineDiffDoc {
 
     fn edit(&self, iter: &mut dyn Iterator<Item = (Selection, &str)>, edit_type: EditType) {
         self.inner.edit(iter, edit_type)
-    }
-}
-
-#[cfg(test)]
-mod ghost_hint_tests {
-    use super::ghost_hint;
-
-    /// At a line's end the hint says Tab takes it, and that a remembered one
-    /// is remembered; with text after the caret on the line — a clause the
-    /// prediction goes in front of — there is no room for one.
-    #[test]
-    fn a_hint_follows_a_prediction_only_at_the_end_of_its_line() {
-        assert_eq!(ghost_hint(false, ""), Some("  Tab"));
-        assert_eq!(ghost_hint(false, "  \r\n"), Some("  Tab"));
-        assert_eq!(ghost_hint(true, "\n"), Some("  Tab · remembered"));
-        assert_eq!(ghost_hint(false, " LIMIT 10"), None);
-        assert_eq!(ghost_hint(true, ")"), None);
     }
 }
 
