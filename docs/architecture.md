@@ -321,9 +321,22 @@ existing prose was left alone.
     the average divides, and it carries extra places to say so. Overflow degrades to *no* aggregate
     rather than wrapping — a silently wrong total is worse than an absent one. NULLs are counted
     but excluded (the average divides by what it actually had), a numeric cell that doesn't parse
-    is present-but-skipped rather than treated as zero, and a non-numeric column gets counts only:
-    there is nothing to sum in a name, and a lexicographic min/max reads as a bug more often than
-    it answers anything.
+    is present-but-skipped rather than treated as zero, and a non-numeric column gets no arithmetic
+    — counts, a distinct count and its length range only: there is nothing to sum in a name, and a
+    lexicographic min/max reads as a bug more often than it answers anything.
+    **Distinct, median and length** came later, and two of them break the fold's rule on purpose.
+    `distinct` counts different non-NULL values — a parsed number by its value (the trimmed
+    `Fixed`'s text, so `1.0` and `1.00` are one), anything else by its text. `median` is exact like
+    the rest: the middle value, or the mean of the two middles, which is at most a half-unit off
+    the shared scale, so an odd pair takes one more decimal place (units × 5 at scale + 1) rather
+    than rounding (`the_median_is_the_exact_middle`). `length` is the shortest and longest value of
+    a non-numeric column in `char`s, not bytes. Distinct and median need every value kept, which is
+    exactly what the fold below refuses to do, so they stop at their own `KEPT_VALUE_BUDGET`
+    (10,000 *cells*, NULLs included — ten times under the scan's cap) and are then omitted while
+    Sum, Min and Max still cover the whole selection (`distinct_and_median_stop_at_their_own_budget`);
+    a truncated scan reports none of the three. `summary` prints distinct and median only once
+    there are two non-NULL values — one value is its own of each, and `1 row · Sum 7` stays
+    unpadded (`a_single_value_is_not_padded_with_distinct_or_median`).
     **There are four overflow sites and they do not degrade alike**, which is how three different
     answers to one question shipped; each is tested apart. `Fixed::parse` answers
     `Parsed::{Value, Overflow, NotANumber}` — three, not two, because a number too wide returning
@@ -336,9 +349,10 @@ existing prose was left alone.
     on `NumericAggregates`: carried as a plain `Fixed` it propagated `?` and withheld an exact Sum,
     Min and Max because the *mean* of them didn't fit — and it divides before it scales, so the
     `DECIMAL(38,10)` case `Fixed`'s own headroom paragraph calls comfortable is representable.
-    `aggregate_texts` is the entry point the grid uses: a staged (green) edit and a pending new row
-    are both on screen and neither is in the `ResultSet`, and a total under an edit it doesn't
-    include is the same defect as a stale one. The fold keeps no `Vec` — it raises its own
+    The grid enters through the *text*-taking form — `aggregate_texts`' signature, which
+    `aggregate_capped` (what it actually calls) shares — not `aggregate` over stored cells: a staged
+    (green) edit and a pending new row are both on screen and neither is in the `ResultSet`, and a
+    total under an edit it doesn't include is the same defect as a stale one. The fold keeps no `Vec` — it raises its own
     accumulators when it meets a wider scale — because the vector was 32 bytes per selected cell,
     allocated and freed on **every** recompute (6.4 MB for a Ctrl+A over 200k rows, once per
     auto-repeat and once per cell crossed in a drag).

@@ -174,6 +174,14 @@ pub struct Aggregates {
     /// which is the idiom the find bar's `find_more` already uses in the same
     /// panel.
     pub truncated: bool,
+    /// How many different non-NULL values the selection holds — compared as
+    /// numbers in a numeric column (`1.0` and `1.00` are one), as written
+    /// otherwise. `None` past [`KEPT_VALUE_BUDGET`], or when truncated.
+    pub distinct: Option<usize>,
+    /// The shortest and longest non-NULL value of a **non-numeric** column, in
+    /// characters. `None` for a numeric column, an all-NULL selection, or a
+    /// truncated one.
+    pub length: Option<(usize, usize)>,
 }
 
 /// The arithmetic half, present only when the column is numeric and at least one
@@ -189,6 +197,9 @@ pub struct NumericAggregates {
     /// Max down with it through `numeric_of`'s `?`, and a total that fits was
     /// withheld because the *mean* of it didn't.
     pub avg: Option<Fixed>,
+    /// The middle value, or the exact mean of the two middles. `None` past
+    /// [`KEPT_VALUE_BUDGET`], since it needs every value kept and sorted.
+    pub median: Option<Fixed>,
     pub min: Fixed,
     pub max: Fixed,
 }
@@ -234,6 +245,17 @@ pub fn aggregate_texts<S: AsRef<str>>(
 /// run, and this bounds it.
 pub const AGGREGATE_CELL_BUDGET: usize = 100_000;
 
+/// How many cells a selection may span and still be given its **distinct
+/// count and median** — the two figures that need every value kept, which
+/// [`Fold`] exists not to do.
+///
+/// Ten times under [`AGGREGATE_CELL_BUDGET`] for the reason `Fold` records: a
+/// kept value per cell, allocated and freed on every recompute, once per row
+/// a drag crosses. Past it the two are left out rather than reported over
+/// part of the selection, and the sum, which needs nothing kept, still covers
+/// all of it.
+pub const KEPT_VALUE_BUDGET: usize = 10_000;
+
 /// [`aggregate_texts`] over at most `budget` cells, saying so when it stopped.
 ///
 /// Reading one cell past the budget is deliberate: it is how "there were more"
@@ -249,6 +271,10 @@ pub fn aggregate_capped<S: AsRef<str>>(
     // `None` once anything has overflowed: there is then no honest number to
     // report, only a total over some of what was selected.
     let mut fold = Some(Fold::default());
+    // The values distinct and median need, kept only while the selection
+    // fits `KEPT_VALUE_BUDGET` and dropped the moment it doesn't.
+    let mut kept = Some(Kept::default());
+    let mut length: Option<(usize, usize)> = None;
     for cell in cells {
         if agg.rows >= budget {
             // One past the budget: something is there, so the counts are a
@@ -258,28 +284,95 @@ pub fn aggregate_capped<S: AsRef<str>>(
             return agg;
         }
         agg.rows += 1;
+        if agg.rows > KEPT_VALUE_BUDGET {
+            kept = None;
+        }
         let Some(text) = cell else {
             continue;
         };
+        let text = text.as_ref();
         agg.non_null += 1;
-        if numeric_column {
-            match Fixed::parse(text.as_ref()) {
-                Parsed::Value(f) => fold = fold.and_then(|acc| acc.push(f)),
-                // A number too wide to hold degrades the whole aggregate, the
-                // same answer every later overflow gives. Skipping it — which is
-                // what an untyped `None` bought — left a Sum computed over
-                // *some* of the selected values and labelled as if it were all
-                // of them.
-                Parsed::Overflow => fold = None,
-                // Deliberately not: the column type says what the cell should
-                // be, and a wire value that isn't a number is not something to
-                // guess about. It stays counted in `rows`/`non_null`.
-                Parsed::NotANumber => {}
+        if !numeric_column {
+            if let Some(k) = kept.as_mut() {
+                k.distinct.insert(text.to_string());
             }
+            let n = text.chars().count();
+            length = Some(length.map_or((n, n), |(lo, hi)| (lo.min(n), hi.max(n))));
+            continue;
+        }
+        let parsed = Fixed::parse(text);
+        if let Some(k) = kept.as_mut() {
+            // A number by its value, so `1.0` and `1.00` are one; anything
+            // else by its text, which no number's rendering can collide with.
+            k.distinct.insert(match parsed {
+                Parsed::Value(f) => {
+                    k.values.push(f);
+                    f.trimmed().text()
+                }
+                Parsed::Overflow | Parsed::NotANumber => text.to_string(),
+            });
+        }
+        match parsed {
+            Parsed::Value(f) => fold = fold.and_then(|acc| acc.push(f)),
+            // A number too wide to hold degrades the whole aggregate, the
+            // same answer every later overflow gives. Skipping it — which is
+            // what an untyped `None` bought — left a Sum computed over
+            // *some* of the selected values and labelled as if it were all
+            // of them.
+            Parsed::Overflow => fold = None,
+            // Deliberately not: the column type says what the cell should
+            // be, and a wire value that isn't a number is not something to
+            // guess about. It stays counted in `rows`/`non_null`.
+            Parsed::NotANumber => {}
         }
     }
-    agg.numeric = fold.and_then(Fold::finish);
+    agg.numeric = fold.and_then(Fold::finish).map(|mut n| {
+        n.median = kept.as_ref().and_then(|k| median(&k.values));
+        n
+    });
+    agg.distinct = kept.map(|k| k.distinct.len());
+    agg.length = length;
     agg
+}
+
+/// What [`aggregate_capped`] keeps for the two figures a fold can't give —
+/// see [`KEPT_VALUE_BUDGET`].
+#[derive(Default)]
+struct Kept {
+    distinct: std::collections::HashSet<String>,
+    values: Vec<Fixed>,
+}
+
+/// The exact median of `values`: the middle one, or the mean of the two
+/// middles — which is a half-unit at most, so it takes one more decimal place
+/// when it needs it rather than rounding. `None` for no values, or when the
+/// values cannot share a scale (the overflow `Fold` already reports).
+fn median(values: &[Fixed]) -> Option<Fixed> {
+    let scale = values.iter().map(|f| f.scale).max()?;
+    let mut units = values
+        .iter()
+        .map(|f| f.rescale(scale).map(|r| r.units))
+        .collect::<Option<Vec<i128>>>()?;
+    units.sort_unstable();
+    let mid = units.len() / 2;
+    if units.len() % 2 == 1 {
+        return Some(Fixed {
+            units: units[mid],
+            scale,
+        });
+    }
+    let pair = units[mid - 1].checked_add(units[mid])?;
+    Some(if pair % 2 == 0 {
+        Fixed {
+            units: pair / 2,
+            scale,
+        }
+    } else {
+        Fixed {
+            units: pair.checked_mul(5)?,
+            scale: scale + 1,
+        }
+    })
 }
 
 /// The running total, min and max, held at the widest scale seen so far.
@@ -343,6 +436,8 @@ impl Fold {
                 scale,
             },
             avg: mean(self.sum, scale, self.n),
+            // Filled in by `aggregate_capped`, which holds the values.
+            median: None,
             min: Fixed {
                 units: self.min,
                 scale,
@@ -431,6 +526,12 @@ impl Aggregates {
         if nulls > 0 {
             parts.push(format!("{nulls} null"));
         }
+        // One value is its own distinct count and its own median, so neither
+        // is printed until there are two.
+        let several = self.non_null > 1;
+        if let Some(d) = self.distinct.filter(|_| several) {
+            parts.push(format!("{d} distinct"));
+        }
         if let Some(n) = &self.numeric {
             parts.push(format!("Sum {}", grouped(&n.sum.text())));
             // Omitted, not printed as a placeholder, when the mean can't be
@@ -439,8 +540,16 @@ impl Aggregates {
             if let Some(avg) = n.avg {
                 parts.push(format!("Avg {}", grouped(&avg.text())));
             }
+            if let Some(median) = n.median.filter(|_| several) {
+                parts.push(format!("Median {}", grouped(&median.text())));
+            }
             parts.push(format!("Min {}", grouped(&n.min.text())));
             parts.push(format!("Max {}", grouped(&n.max.text())));
+        }
+        match self.length {
+            Some((lo, hi)) if lo == hi => parts.push(format!("Length {lo}")),
+            Some((lo, hi)) => parts.push(format!("Length {lo}–{hi}")),
+            None => {}
         }
         parts.join(" · ")
     }
@@ -660,7 +769,7 @@ mod tests {
         );
         assert_eq!((a.rows, a.non_null), (3, 2));
         assert!(a.numeric.is_none());
-        assert_eq!(a.summary(), "3 rows · 1 null");
+        assert_eq!(a.summary(), "3 rows · 1 null · 2 distinct · Length 3–5");
     }
 
     /// A numeric column whose cell isn't a number is counted as present and left
@@ -852,8 +961,106 @@ mod tests {
         );
         assert_eq!(
             a.summary(),
-            "2 rows · Sum 3.00 · Avg 1.5 · Min 1.00 · Max 2.00"
+            "2 rows · 2 distinct · Sum 3.00 · Avg 1.5 · Median 1.50 · Min 1.00 · Max 2.00"
         );
+    }
+
+    /// Distinct counts **values**, not spellings: `1.0` and `1.00` are one
+    /// number in a numeric column. NULL is no value and is not counted.
+    #[test]
+    fn distinct_counts_numeric_values_and_skips_nulls() {
+        let a = agg_of(
+            "decimal(10,2)",
+            &[
+                Value::Str("1.0".into()),
+                Value::Str("1.00".into()),
+                Value::Null,
+                Value::Str("2".into()),
+            ],
+        );
+        assert_eq!(a.distinct, Some(2));
+        let t = agg_of(
+            "varchar(9)",
+            &[
+                Value::Str("a".into()),
+                Value::Str("A".into()),
+                Value::Str("a".into()),
+            ],
+        );
+        assert_eq!(t.distinct, Some(2), "text is compared as written");
+    }
+
+    /// The median is exact: an odd count is its middle value, an even one the
+    /// mean of its two middles — with one more decimal place when that mean
+    /// needs it, never a rounding.
+    #[test]
+    fn the_median_is_the_exact_middle() {
+        let med = |ty: &str, vals: &[&str]| {
+            let rows: Vec<Value> = vals.iter().map(|v| Value::Str((*v).into())).collect();
+            agg_of(ty, &rows)
+                .numeric
+                .and_then(|n| n.median)
+                .map(|m| m.text())
+        };
+        assert_eq!(med("int", &["3", "1", "2"]).as_deref(), Some("2"));
+        assert_eq!(med("int", &["4", "1", "3", "2"]).as_deref(), Some("2.5"));
+        assert_eq!(med("int", &["2", "4"]).as_deref(), Some("3"));
+        assert_eq!(
+            med("decimal(5,2)", &["1.01", "1.00"]).as_deref(),
+            Some("1.005")
+        );
+        assert_eq!(med("int", &["-3", "-1"]).as_deref(), Some("-2"));
+        assert_eq!(med("int", &["-2", "-1"]).as_deref(), Some("-1.5"));
+    }
+
+    /// A text column reports the shortest and longest value, in characters —
+    /// what a `VARCHAR(n)` limit is counted in — rather than bytes.
+    #[test]
+    fn a_text_column_reports_its_length_range_in_characters() {
+        let a = agg_of(
+            "varchar(9)",
+            &[
+                Value::Str("café".into()),
+                Value::Null,
+                Value::Str("ab".into()),
+            ],
+        );
+        assert_eq!(a.length, Some((2, 4)));
+        assert_eq!(a.summary(), "3 rows · 1 null · 2 distinct · Length 2–4");
+        assert_eq!(
+            agg_of("int", &[Value::Str("12".into())]).length,
+            None,
+            "a number's length is not a question anyone asks"
+        );
+    }
+
+    /// Distinct and median need every value kept, which the fold exists to
+    /// avoid, so they stop at a smaller budget than the scan — and are then
+    /// left out rather than reported over part of the selection, while the
+    /// sum still covers all of it.
+    #[test]
+    fn distinct_and_median_stop_at_their_own_budget() {
+        let c = col("int");
+        let over = (0..=KEPT_VALUE_BUDGET).map(|i| Some(i.to_string()));
+        let agg = aggregate_texts(&c, over);
+        assert_eq!(agg.distinct, None);
+        let n = agg
+            .numeric
+            .as_ref()
+            .expect("the sum covers the whole selection");
+        assert_eq!(n.median, None);
+        assert!(!agg.summary().contains("distinct"), "{}", agg.summary());
+        assert!(!agg.summary().contains("Median"), "{}", agg.summary());
+        let fits = aggregate_texts(&c, (0..KEPT_VALUE_BUDGET).map(|i| Some(i.to_string())));
+        assert_eq!(fits.distinct, Some(KEPT_VALUE_BUDGET));
+    }
+
+    /// One value is its own distinct count and its own median, so a single
+    /// cell's readout is not padded with either.
+    #[test]
+    fn a_single_value_is_not_padded_with_distinct_or_median() {
+        let a = agg_of("int", &[Value::Str("7".into())]);
+        assert_eq!(a.summary(), "1 row · Sum 7 · Avg 7 · Min 7 · Max 7");
     }
 
     #[test]

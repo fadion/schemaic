@@ -5177,6 +5177,8 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
                 // selection can honestly report.
                 non_null: r1 - r0 + 1,
                 numeric: None,
+                distinct: None,
+                length: None,
             },
         };
         let label = match column {
