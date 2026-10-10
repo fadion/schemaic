@@ -1259,6 +1259,11 @@ impl TriggerDraft {
                             .to_string(),
                     );
                 }
+                // `create_sql` writes `UPDATE OF` only under an UPDATE event, so
+                // a column list on any other would be dropped without a word.
+                if !t.update_columns.is_empty() && !t.events.contains(&TriggerEvent::Update) {
+                    out.push("UPDATE OF names columns on an UPDATE trigger.".to_string());
+                }
             }
             SqlDialect::Sqlite => {
                 // Every rule below is one SQLite states itself, quoted from 3.45:
@@ -1389,6 +1394,11 @@ impl TriggerDraft {
                 }
             }
             SqlDialect::MySql => {
+                // `ERROR 1347: 'db.v' is not BASE TABLE` — no timing makes one
+                // legal, which is what `supports_view_triggers` answers.
+                if view {
+                    out.push("MySQL takes no trigger on a view.".to_string());
+                }
                 if t.events.len() > 1 {
                     out.push(
                         "MySQL fires a trigger on one event — make a separate trigger per event."
@@ -1760,7 +1770,7 @@ impl RoutineDraft {
         if f.name.trim().is_empty() {
             out.push(format!("The {what} needs a name."));
         }
-        if dialect == SqlDialect::Postgres && f.language.trim().is_empty() {
+        if routine_takes_language(dialect) && f.language.trim().is_empty() {
             out.push(format!("The {what} needs a language (plpgsql, sql)."));
         }
         // A procedure has no return type on either engine, and `RETURNS` on one
@@ -9132,10 +9142,34 @@ fn inlines_indexes(dialect: SqlDialect) -> bool {
 }
 
 /// Does `dialect`'s `CREATE TABLE` take MySQL's trailing table options —
-/// `ENGINE=`, `COLLATE=`, `COMMENT=`?
-fn takes_table_options(dialect: SqlDialect) -> bool {
+/// `ENGINE=`, `COLLATE=`, `COMMENT=`? The emitter's question, and the table
+/// designer's for its storage-engine and table-collation fields.
+pub fn takes_table_options(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MySql => true,
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+    }
+}
+
+/// Does a column take MySQL's `ON UPDATE CURRENT_TIMESTAMP` attribute? MySQL's
+/// alone: PostgreSQL and SQLite would need a trigger for it, and SQL Server
+/// has no such column attribute — so the designer's field, offered anywhere
+/// else, would take input the emitter drops.
+pub fn supports_column_on_update(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MySql => true,
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+    }
+}
+
+/// May a `CHECK` constraint be declared `NOT ENFORCED`? **MySQL's server's,
+/// not the MySQL dialect's**: MariaDB has no such clause (unticking it there
+/// emitted `ERROR 1064 … near 'NOT ENFORCED'`, measured live), PostgreSQL and
+/// SQL Server none either — and an `Unknown` flavour is not offered it, since
+/// the form withholds what the server may reject.
+pub fn supports_unenforced_check(dialect: SqlDialect, flavour: ServerFlavour) -> bool {
+    match dialect {
+        SqlDialect::MySql => flavour == ServerFlavour::MySql,
         SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => false,
     }
 }
@@ -11638,6 +11672,8 @@ pub fn trigger_timings(dialect: SqlDialect, host: TriggerHost) -> Vec<TriggerTim
         SqlDialect::Postgres if view => vec![Before, After, InsteadOf],
         SqlDialect::Sqlite if view => vec![InsteadOf],
         SqlDialect::MsSql if view => vec![InsteadOf],
+        // None: MySQL takes no trigger on a view (`supports_view_triggers`).
+        SqlDialect::MySql if view => Vec::new(),
         SqlDialect::MsSql => vec![After, InsteadOf],
         SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MySql => vec![Before, After],
     }
@@ -11691,6 +11727,75 @@ pub fn supports_trigger_firing_rank(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MsSql => true,
         SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+    }
+}
+
+/// Does the catalogue hand back a routine's or trigger's body **with its
+/// escapes resolved**, so the editor has to read the source as written
+/// (`SHOW CREATE`) before anything can be restated from it?
+///
+/// MySQL 8's, alone: `information_schema` returns `'C:\temp'` with a literal
+/// tab and `'it''s'` as `'it's'`, a 1064 on restate after the `DROP` has
+/// committed. PostgreSQL's `pg_get_functiondef`, SQLite's `sqlite_master` and
+/// SQL Server's `sys.sql_modules` hold the text as it was written.
+pub fn catalogue_body_is_unescaped(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MySql => true,
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+    }
+}
+
+/// Does a **view** take a trigger at all? Every engine here but MySQL's, which
+/// refuses one outright: PostgreSQL, SQLite and SQL Server take `INSTEAD OF`
+/// on a view (and PostgreSQL statement-level `BEFORE`/`AFTER` as well, which
+/// [`trigger_timings`] lists). The Triggers entry on a view's menu and the
+/// timing a new view trigger opens on both ask it.
+pub fn supports_view_triggers(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => true,
+        SqlDialect::MySql => false,
+    }
+}
+
+/// Does a trigger **call a function** rather than carry its own body?
+/// PostgreSQL's alone (`EXECUTE FUNCTION f()`), so its form picks one from the
+/// database's trigger functions where the others edit a body.
+pub fn trigger_runs_function(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::Postgres => true,
+        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+    }
+}
+
+/// Does a trigger **choose its level** — `FOR EACH ROW` or `FOR EACH
+/// STATEMENT`? PostgreSQL's alone: MySQL's and SQLite's are row-level only
+/// (`FOR EACH STATEMENT` is a syntax error on SQLite), and SQL Server's are
+/// statement-level only, with no clause to say so.
+pub fn supports_trigger_level_choice(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::Postgres => true,
+        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+    }
+}
+
+/// Does a trigger take a `WHEN` guard? PostgreSQL's and SQLite's — the second
+/// had one all along, which is why this is not "not MySQL": SQL Server has
+/// none either, and tests inside the body instead.
+pub fn supports_trigger_when(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::Postgres | SqlDialect::Sqlite => true,
+        SqlDialect::MySql | SqlDialect::MsSql => false,
+    }
+}
+
+/// Does an `UPDATE` trigger take `UPDATE OF a, b`, narrowing it to named
+/// columns? PostgreSQL's and SQLite's, both carried as
+/// [`TriggerInfo::update_columns`]. MySQL has no such clause, and SQL Server
+/// asks `UPDATE(col)` inside the body.
+pub fn supports_trigger_update_of(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::Postgres | SqlDialect::Sqlite => true,
+        SqlDialect::MySql | SqlDialect::MsSql => false,
     }
 }
 
@@ -11928,6 +12033,18 @@ pub fn supports_or_replace_routine(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::Postgres | SqlDialect::MsSql => true,
         SqlDialect::MySql | SqlDialect::Sqlite => false,
+    }
+}
+
+/// Is a routine written in a **language** it names — `LANGUAGE plpgsql`,
+/// `sql`, `plpython3u`? PostgreSQL's alone, where the clause is required; a
+/// MySQL or SQL Server routine is SQL with no clause to choose, and SQLite has
+/// no stored routines. The form's Language field and
+/// [`RoutineDraft::validate`]'s "needs a language" both ask it.
+pub fn routine_takes_language(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::Postgres => true,
+        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => false,
     }
 }
 
@@ -23368,6 +23485,154 @@ mod tests {
         for d in [Postgres, Sqlite, MsSql] {
             assert!(!supports_index_prefix(d), "{d:?}");
         }
+    }
+
+    /// The table designer's MySQL-only fields, each asked as what it is:
+    /// trailing table options (`ENGINE=`, `COLLATE=`), a column's `ON UPDATE`,
+    /// and `NOT ENFORCED` — which is MySQL's *server's*, not its dialect's:
+    /// MariaDB answers it with a 1064, and an unknown server is not offered it.
+    #[test]
+    fn the_designers_mysql_fields_are_asked_as_capabilities() {
+        let table = |f: fn(SqlDialect) -> bool| SqlDialect::ALL.map(|d| (d, f(d)));
+        let mysql_only = [
+            (MySql, true),
+            (Postgres, false),
+            (Sqlite, false),
+            (MsSql, false),
+        ];
+        assert_eq!(table(takes_table_options), mysql_only);
+        assert_eq!(table(supports_column_on_update), mysql_only);
+        use crate::schema::ServerFlavour as F;
+        for d in SqlDialect::ALL {
+            for f in [F::Unknown, F::MySql, F::MariaDb] {
+                assert_eq!(
+                    supports_unenforced_check(d, f),
+                    d == MySql && f == F::MySql,
+                    "{d:?} {f:?}"
+                );
+            }
+        }
+    }
+
+    /// The trigger form's per-engine controls, each a capability: MySQL is
+    /// the engine with no trigger on a view, PostgreSQL the one whose trigger
+    /// calls a function and chooses its level, and `WHEN` and `UPDATE OF` are
+    /// PostgreSQL's and SQLite's.
+    #[test]
+    fn the_trigger_forms_controls_are_offered_where_the_clause_exists() {
+        let table = |f: fn(SqlDialect) -> bool| SqlDialect::ALL.map(|d| (d, f(d)));
+        assert_eq!(
+            table(catalogue_body_is_unescaped),
+            [
+                (MySql, true),
+                (Postgres, false),
+                (Sqlite, false),
+                (MsSql, false)
+            ]
+        );
+        assert_eq!(
+            table(routine_takes_language),
+            [
+                (MySql, false),
+                (Postgres, true),
+                (Sqlite, false),
+                (MsSql, false)
+            ]
+        );
+        assert_eq!(
+            table(supports_view_triggers),
+            [
+                (MySql, false),
+                (Postgres, true),
+                (Sqlite, true),
+                (MsSql, true)
+            ]
+        );
+        assert_eq!(
+            table(trigger_runs_function),
+            [
+                (MySql, false),
+                (Postgres, true),
+                (Sqlite, false),
+                (MsSql, false)
+            ]
+        );
+        assert_eq!(
+            table(supports_trigger_level_choice),
+            [
+                (MySql, false),
+                (Postgres, true),
+                (Sqlite, false),
+                (MsSql, false)
+            ]
+        );
+        assert_eq!(
+            table(supports_trigger_when),
+            [
+                (MySql, false),
+                (Postgres, true),
+                (Sqlite, true),
+                (MsSql, false)
+            ]
+        );
+        assert_eq!(
+            table(supports_trigger_update_of),
+            [
+                (MySql, false),
+                (Postgres, true),
+                (Sqlite, true),
+                (MsSql, false)
+            ]
+        );
+    }
+
+    /// A view trigger is offered exactly where some timing for a view is one
+    /// `validate` accepts — the menu entry and the form cannot disagree.
+    #[test]
+    fn view_triggers_are_offered_where_a_view_trigger_validates() {
+        for d in SqlDialect::ALL {
+            let shapes = trigger_timings(d, TriggerHost::View)
+                .into_iter()
+                .flat_map(|t| [(t, TriggerLevel::Row), (t, TriggerLevel::Statement)]);
+            let any_valid = shapes.into_iter().any(|(t, level)| {
+                let mut draft = TriggerDraft::blank("tr", "v", None);
+                draft.info.events = vec![TriggerEvent::Insert];
+                draft.info.timing = t;
+                draft.info.level = level;
+                draft.info.action = if trigger_runs_function(d) {
+                    TriggerAction::Function {
+                        name: "f".into(),
+                        args: Vec::new(),
+                    }
+                } else {
+                    TriggerAction::Body("BEGIN SELECT 1; END".into())
+                };
+                draft.validate(d, TriggerHost::View).is_empty()
+            });
+            assert_eq!(supports_view_triggers(d), any_valid, "{d:?}");
+        }
+    }
+
+    /// PostgreSQL's `UPDATE OF` is written only under an `UPDATE` event, so a
+    /// column list on any other is refused rather than dropped — SQLite's rule,
+    /// which PostgreSQL now that its form offers the control.
+    #[test]
+    fn update_of_without_an_update_event_is_refused_on_postgres() {
+        let mut draft = TriggerDraft::blank("tr", "t", Some("public".into()));
+        draft.info.events = vec![TriggerEvent::Insert];
+        draft.info.action = TriggerAction::Function {
+            name: "f".into(),
+            args: Vec::new(),
+        };
+        draft.info.update_columns = vec!["a".into()];
+        let problems = |d: &TriggerDraft| d.validate(Postgres, TriggerHost::Table);
+        assert!(
+            problems(&draft).iter().any(|e| e.contains("UPDATE OF")),
+            "{:?}",
+            problems(&draft)
+        );
+        draft.info.events = vec![TriggerEvent::Update];
+        assert!(problems(&draft).is_empty(), "{:?}", problems(&draft));
     }
 
     #[test]

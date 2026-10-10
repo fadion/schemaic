@@ -376,10 +376,11 @@ pub(crate) fn object_entries(
                 dialect,
                 &schemaic_core::ddl::Change::TruncateTable,
             ),
-        // **A view really does carry triggers on two of the three engines** —
-        // `INSTEAD OF` lives on PostgreSQL and on SQLite, where it is the only
-        // way a view is written to at all — so this is not simply `!is_view`.
-        // MySQL is the one that takes no trigger on a view. A *materialized*
+        // **A view really does carry triggers on three of the four engines** —
+        // `INSTEAD OF` lives on PostgreSQL, SQL Server and SQLite, where it is
+        // the only way a view is written to at all — so this is not simply
+        // `!is_view`. MySQL is the one that takes no trigger on a view
+        // (`ddl::supports_view_triggers`). A *materialized*
         // view is excluded even on PostgreSQL: the server refuses outright
         // (`relation "mv" cannot have triggers`), which is the same call
         // `is_editable_view` makes.
@@ -388,7 +389,7 @@ pub(crate) fn object_entries(
         triggers: edits_triggers
             && (is_table
                 || (is_view
-                    && dialect != schemaic_core::intel::SqlDialect::MySql
+                    && schemaic_core::ddl::supports_view_triggers(dialect)
                     && !materialized)),
         // A table's designer, or a view's editor — the entry reads "Edit table"
         // or "Edit view" and they are not the same capability. The table half was

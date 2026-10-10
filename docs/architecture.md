@@ -6422,7 +6422,8 @@ existing prose was left alone.
     T-SQL's — and it takes none of MySQL's `ENGINE=`/`COLLATE=`/`COMMENT=`: the table's and the
     columns' comments follow the table as `sp_addextendedproperty` calls, as PostgreSQL's follow it
     as `COMMENT ON` (`create_table_on_sql_server_writes_comments_as_extended_properties`). So the split is asked of
-    two private capabilities, `inlines_indexes` and `takes_table_options`, both MySQL's alone, where
+    two capabilities, `inlines_indexes` and `takes_table_options` (public, since the designer asks
+    it for its storage-engine and table-collation row), both MySQL's alone, where
     it had been `!pg && !sqlite` — a test a fourth engine passes as MySQL. The columns are
     `ColumnInfo::definition_sql`'s T-SQL arm (under `schema.rs`), and a check writes no
     `NOT ENFORCED` there (`CheckInfo::clause_sql`, asking `writes_not_enforced`), T-SQL having no
@@ -6971,7 +6972,9 @@ existing prose was left alone.
     not the list, since one re-made under a new name has no add of its own name and a deleted one
     may share its name with another renamed onto it (`a_re_added_constraint_is_not_a_loss`).
     `a_re_added_constraint_is_not_a_loss` pins that composition, which is the half
-    neither predicate can be tested for alone. `enforced` is MySQL's `NOT ENFORCED` only: PG's
+    neither predicate can be tested for alone. `enforced` is MySQL's `NOT ENFORCED` only — the
+    server's, not the dialect's, so the designer's toggle asks `supports_unenforced_check` with the
+    flavour, MariaDB having no such clause: PG's
     `NOT VALID` exempts existing rows and so can't silently change what a write does.
     **`CheckInfo::column_level` is MariaDB's `CHECK_CONSTRAINTS.LEVEL`**, and it is the
     one place a check is not a table-level object: `q INT CHECK (q > 0)` makes a
@@ -7560,7 +7563,19 @@ existing prose was left alone.
     `supports_trigger_execute_as`, `supports_trigger_firing_rank` (the last three SQL Server's alone) — and
     `the_offered_timings_and_events_are_ones_the_validator_accepts` holds every offered timing and
     event to a clean validation on every engine and host, since an option offered and then refused is
-    the form opening on an error. `TriggerSetDraft::validate` refuses a *change* to a trigger
+    the form opening on an error. The rest of the form's controls ask predicates of their own rather
+    than a dialect: `trigger_runs_function` and `supports_trigger_level_choice` (PostgreSQL's alone),
+    `supports_trigger_when` and `supports_trigger_update_of` (PostgreSQL's and SQLite's — neither is
+    "not MySQL", since SQL Server has neither clause), pinned as a truth table in
+    `the_trigger_forms_controls_are_offered_where_the_clause_exists`; and `supports_view_triggers`,
+    false on MySQL alone (`ERROR 1347: … is not BASE TABLE`), for whether a view takes one at all.
+    `view_triggers_are_offered_where_a_view_trigger_validates` holds that last one to the validator,
+    which is why `trigger_timings(MySql, View)` is now empty and the MySQL arm refuses a trigger on a
+    view — it accepted one before, so the predicate and the validator disagreed with nothing to say
+    so. PostgreSQL's arm took SQLite's rule refusing `UPDATE OF` without an `UPDATE` event when its
+    form gained the field: the clause is written only under an `UPDATE` event, so a column list on
+    any other would be dropped rather than refused
+    (`update_of_without_an_update_event_is_refused_on_postgres`). `TriggerSetDraft::validate` refuses a *change* to a trigger
     `TriggerInfo::is_editable` says no to, on the constraint trigger's terms: it may sit in the set
     while a neighbour is edited, and dropping it is fine
     (`an_unreadable_sql_server_trigger_can_be_dropped_but_not_changed`).
@@ -23061,7 +23076,17 @@ existing prose was left alone.
     column — ask `ddl::supports_comments`, so SQL Server's were hidden rather than typed into and
     dropped, until the emitter wrote them and the predicate turned them back on; the identity toggle asks `ddl::identity_wording`, having said *Auto-increment
     (AUTO_INCREMENT)* there; the index key hint asks `ddl::supports_index_prefix`, having named
-    MySQL's `bio(20)` prefix on every engine but PostgreSQL. The index form's *Include* field, after
+    MySQL's `bio(20)` prefix on every engine but PostgreSQL. **The MySQL-only fields took it
+    4 → 1**: the storage-engine and table-collation row asks `ddl::takes_table_options` — the
+    emitter's own question, made public for it — a column's *On update* `supports_column_on_update`,
+    and a check's *Enforced* toggle `supports_unenforced_check(dialect, flavour)`, which is MySQL's
+    *server's* rather than its dialect's: MariaDB answers `NOT ENFORCED` with `ERROR 1064`
+    (measured live), and an `Unknown` flavour is withheld it rather than offered a clause the server
+    may reject (`the_designers_mysql_fields_are_asked_as_capabilities`). The one comparison left is
+    the index form's PostgreSQL-only *Method* and partial-index predicate block, kept because
+    splitting it honestly widens the form: a partial index is SQLite's and SQL Server's too, but
+    SQLite's introspection reads no predicate back (the index is replayed verbatim), so the field
+    would open empty over one. The index form's *Include* field, after
     *Columns*, is built only where `ddl::index_takes_include` answers yes — an engine with `INCLUDE`
     (`supports_index_include`, SQL Server and PostgreSQL), a kind that keeps a list, and neither a
     SQL Server unique constraint nor a clustered index, on either of which the server refuses one
@@ -23442,7 +23467,9 @@ existing prose was left alone.
     `TriggerSetDraft`. Reached from the schema context menu's per-table
     **Triggers…** entry — and from a **view's**, on every engine but MySQL, since `INSTEAD OF`
     lives on PostgreSQL, on SQLite and on SQL Server, and on the last two it is the only way a view
-    is written to at all (`overlays::object_entries`, which still excludes a materialized view:
+    is written to at all (`overlays::object_entries` asks `ddl::supports_view_triggers`, as
+    `blank_trigger` does for the `INSTEAD OF` a new view trigger opens on, where the two used to
+    spell `!= MySql` each their own way; it still excludes a materialized view:
     PostgreSQL refuses one outright); same chrome, same seed-local-signals-then-write-back rule and same
     `ddl_preview` ending as `view_editor`. The trigger modal is the **designer's list-plus-form
     shape** — the table's triggers on the left, the selected one's form on the right, `+`/`−`
@@ -23461,14 +23488,21 @@ existing prose was left alone.
     their own right; what didn't change is the handoff below. Three rules are written down because
     each was a bug waiting: **the form is
     per-engine because the objects are** (MySQL owns a body and one event; PG calls a function,
-    takes several events and a `WHEN`; SQLite owns a body, one event, a `WHEN` and `UPDATE OF`
-    columns through a "Of columns" field, and offers a view only `INSTEAD OF`; SQL Server owns a
+    takes several events, a `WHEN` and `UPDATE OF` columns; SQLite owns a body, one event, a `WHEN`
+    and `UPDATE OF` columns, and offers a view only `INSTEAD OF`; SQL Server owns a
     body and several events, fires once per statement, takes `AFTER` or `INSTEAD OF` on a table and
     only `INSTEAD OF` on a view, and has a **NOT FOR REPLICATION** toggle no other engine is built),
     so it *hides* what an engine can't express rather than offering it and failing at apply. The
     lists come from `core::ddl` rather than a `(dialect, is_view)` match here — `trigger_timings`,
     `trigger_events`, and `trigger_fires_on_several_events` choosing between the event toggles and
     the one-event dropdown — and are held there to exactly what `TriggerDraft::validate` accepts.
+    So does every other control: the function picker, the level, `WHEN` and the "Of columns" field
+    ask `trigger_runs_function`, `supports_trigger_level_choice`, `supports_trigger_when` and
+    `supports_trigger_update_of`, and the *Condition* header shows when either of the last two is
+    offered. **PostgreSQL's "Of columns" came with that change** — the field was SQLite's alone
+    while `TriggerInfo::update_columns`, PostgreSQL's introspection and `create_sql` all carried the
+    clause, so a PostgreSQL trigger's `UPDATE OF` list was restated on apply but could be neither
+    seen nor changed in the form.
     The event toggles write through `TriggerInfo::set_event` rather than editing `events` here, so
     the order the emitter round-trips against and the rule that an event switched off drops its rank
     live in core. **Beside each event toggle on SQL Server sits that event's rank** — `rank_choice`,
@@ -23484,7 +23518,8 @@ existing prose was left alone.
     level and `NEW_BODY_MSSQL`, a `BEGIN SET NOCOUNT ON; END` rather than MySQL's empty block, which T-SQL refuses as SQLite does
     (`a_new_sql_server_trigger_opens_valid`). That per-engine shape is also why
     `blank_trigger`/`trigger_list` take a `SqlDialect` rather than a `pg: bool`, and why the
-    MySQL-only `fetch_sources` (`SHOW CREATE TRIGGER`) is gated `== MySql` — whose reply is also why
+    MySQL-only `fetch_sources` (`SHOW CREATE TRIGGER`) is gated on `ddl::catalogue_body_is_unescaped`
+    — whose reply is also why
     **this overlay's `dyn_container` key is deliberately not the memo the routine and view editors
     took** (*Floem 0.2 gotchas*): `form` is built once per `(selected, rev)` and its Body seeds at
     build, so the rebuild that key causes is the only delivery of the escape-corrected body.
@@ -23592,7 +23627,9 @@ existing prose was left alone.
     determinism, data access, definer and comment on MySQL, which has no `LANGUAGE` clause at all;
     and neither volatility nor strictness on a PostgreSQL *procedure*, whose `CREATE` rejects both
     outright — so it hides what an engine can't express rather than offering it and failing at
-    apply, which is a rule the kind axis needs as much as the engine one. The Language dropdown
+    apply, which is a rule the kind axis needs as much as the engine one. The Language field is
+    offered where `ddl::routine_takes_language` says so — PostgreSQL's alone, where the clause is
+    required — and `RoutineDraft::validate`'s "needs a language" asks the same predicate. The dropdown
     carries the routine's own language alongside the two it proposes, for the same reason: a list
     that didn't would silently retype a `plpython3u` function the moment the control was touched.
     **SQL Server's options are an arm of their own**, and that is the fix as much as the feature:
@@ -23614,7 +23651,8 @@ existing prose was left alone.
     Parameters and Returns placeholders are a `match` per engine too, SQL Server's naming the `@`
     its parameters take and the `TABLE` a table function returns.
     **MySQL's body is fetched a
-    second time and it is not an optimisation** (`Db::routine_source` via `RoutineSrcFn`, applied
+    second time and it is not an optimisation** (`Db::routine_source` via `RoutineSrcFn`, gated on
+    `ddl::catalogue_body_is_unescaped` as the trigger editor's fetch is, applied
     to *both* sides of the diff so a routine doesn't open already-changed, and guarded by
     `DdlUi::session` so a slow reply for a closed modal can't land); and **a new routine's
     namespace is inherited, not chosen** — there is no Schema field, for the reason the view
@@ -31703,12 +31741,14 @@ Re-introducing the anti-patterns these guard against is a regression:
   sites, each then admitted with its reason, and verified by a planted comparison — and three are
   labelled **not clean** rather than approved, because a gate that launders debt into approval is
   worse than none: `overlays.rs`'s `!= MySql` for whether a *view* may take a trigger (asked again
-  in `trigger_editor.rs`' own spelling, which is defence in depth today and divergence the moment
-  one is edited — it wants a `ddl::supports_view_triggers`, which does not exist), and
+  in `trigger_editor.rs`' own spelling, which was defence in depth and divergence the moment one
+  was edited — paid off since as `ddl::supports_view_triggers`, which both ask, taking
+  `overlays.rs` and `routine_editor.rs` off the list and `trigger_editor.rs` 6 → 1), and
   `table_designer.rs`'s column-comment and `ON UPDATE` availability, which want
   `supports_column_comments` and `supports_on_update_current_timestamp` — the first paid off since
   as `ddl::supports_comments`, asked of the table's comment field too, when SQL Server's Create
-  table needed both hidden; `ON UPDATE` is still an `== MySql`. Giving the predicates a
+  table needed both hidden; `ON UPDATE` as `ddl::supports_column_on_update`, with the storage row
+  and the check's *Enforced* toggle beside it, taking the file 4 → 1. Giving the predicates a
   named home outside `ddl.rs` — which is legitimately per-dialect throughout, and long enough that
   a view author looking for one does not find it — is the half the gate does not do, and is open.
   `export::qualified_table` was the same sitting's other half: its per-engine `match` spells the
@@ -32254,9 +32294,14 @@ Re-introducing the anti-patterns these guard against is a regression:
   it is offered — `supports_or_replace_view`, false on SQLite alone, `supports_view_rename`, false
   on SQLite and SQL Server, `supports_view_check_option` and `view_keeps_column_list`,
   `supports_trigger_alter_in_place`, true on SQL Server alone, with the trigger form's
-  `trigger_timings`, `trigger_events`, `trigger_fires_on_several_events` and
-  `supports_trigger_not_for_replication`, `supports_trigger_execute_as` and
-  `supports_trigger_firing_rank`, plus
+  `trigger_timings`, `trigger_events`, `trigger_fires_on_several_events`,
+  `supports_trigger_not_for_replication`, `supports_trigger_execute_as`,
+  `supports_trigger_firing_rank`, `trigger_runs_function`, `supports_trigger_level_choice`,
+  `supports_trigger_when`, `supports_trigger_update_of` and `supports_view_triggers`, the routine
+  form's `routine_takes_language`, `catalogue_body_is_unescaped` for both editors' source fetch, the
+  table designer's `takes_table_options`, `supports_column_on_update` and
+  `supports_unenforced_check` — the last asked with the `ServerFlavour`, MariaDB lacking the clause
+  MySQL has — plus
   `supports_column_reorder`, `rebuilds_tables`, `alter_column_disturbs_checks`,
   `alter_column_disturbs_dependents`, `refreshes_star_dependents`, `publishes_index_ddl`,
   `renames_indexes_in_place`, true on SQL Server alone,

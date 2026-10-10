@@ -288,7 +288,7 @@ fn fetch_source(d: DdlUi, source: &RoutineSrcFn) {
         // A routine that doesn't exist yet has no source to read.
         return;
     };
-    if target.dialect != SqlDialect::MySql {
+    if !ddl::catalogue_body_is_unescaped(target.dialect) {
         return;
     }
     let session = d.session.get_untracked();
@@ -494,7 +494,7 @@ const TAB_OPT: u32 = 60;
 fn routine_form(ui: DdlUi, target: &RoutineTarget, ring: FocusRing) -> AnyView {
     let d = ui.routine_draft;
     let draft = d.get_untracked();
-    let postgres = target.dialect == SqlDialect::Postgres;
+    let takes_language = ddl::routine_takes_language(target.dialect);
     let is_function = draft.info.kind == RoutineKind::Function;
     // A trigger function has no arguments to declare and no return type to
     // choose — both are fixed by what a trigger is — so the two fields are
@@ -573,7 +573,7 @@ fn routine_form(ui: DdlUi, target: &RoutineTarget, ring: FocusRing) -> AnyView {
     // PostgreSQL's alone. MySQL stores only `SQL` routines and accepts no
     // `LANGUAGE` clause, so the control is absent there rather than offering a
     // choice with one entry.
-    let language = postgres.then(|| {
+    let language = takes_language.then(|| {
         form_setting("Language", {
             let current = draft.info.language.trim().to_string();
             // The two Schemaic proposes, **plus whatever this routine already
@@ -611,10 +611,11 @@ fn routine_form(ui: DdlUi, target: &RoutineTarget, ring: FocusRing) -> AnyView {
             d,
             ui.routine_body,
             FieldCfg {
-                placeholder: if postgres {
-                    "BEGIN\n    RETURN NEW;\nEND;"
-                } else {
-                    "BEGIN\n    SELECT 1;\nEND"
+                placeholder: match target.dialect {
+                    SqlDialect::Postgres => "BEGIN\n    RETURN NEW;\nEND;",
+                    SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => {
+                        "BEGIN\n    SELECT 1;\nEND"
+                    }
                 },
                 mono: true,
                 sql: Some(target.dialect),

@@ -4272,12 +4272,12 @@ mod engine_comparison_gate {
         ),
         (
             "schemaic-core/ddl.rs",
-            15,
-            "Five of the fifteen are in the capability definitions the \
+            14,
+            "Five of the fourteen are in the capability definitions the \
              rest of the app asks — `requires_named_checks`, \
              `requires_rowid_key`, `strict_type_allowed`, and two in \
              `supports_change` — and a comparison is how they answer. The \
-             other ten are DDL grammar \
+             other nine are DDL grammar \
              inside the emitters and validators (`create_view_sql`, \
              `create_table_sql`, `client_script`'s `DELIMITER`, \
              `repoint_check_column`, the drafts' `validate`), where the engines \
@@ -4300,7 +4300,8 @@ mod engine_comparison_gate {
              `rebuilds_tables` where it asked `== Sqlite`, which would have \
              kept the rebuild SQLite's alone. 16 → 15: a new account's \
              `host is %` sentence asks `users::accounts_have_hosts` where it \
-             asked `== MySql`.",
+             asked `== MySql`. 15 → 14: `RoutineDraft::validate`'s \"needs a \
+             language\" asks `routine_takes_language`, as the form's field does.",
         ),
         (
             "schemaic-core/filter.rs",
@@ -4350,24 +4351,6 @@ mod engine_comparison_gate {
              belonged), and the next one like it should have to be argued.",
         ),
         (
-            "overlays.rs",
-            1,
-            "**Not clean.** `dialect != MySql` decides whether a *view* is \
-             offered a trigger, and `trigger_editor.rs` asks the same question \
-             again in its own spelling to default the draft. That is defence \
-             in depth today and divergence the moment one is edited — it wants \
-             a `ddl::supports_view_triggers`, which does not exist yet. The \
-             Postgres-only Create entries beside it were the second, and ask \
-             `ddl::supports_object_creation` now.",
-        ),
-        (
-            "routine_editor.rs",
-            2,
-            "Routine grammar: MySQL's characteristics block and PostgreSQL's \
-             `LANGUAGE`/`RETURNS` are different statements, not one statement \
-             an engine may or may not support.",
-        ),
-        (
             "schemaic-app/ai.rs",
             1,
             "The dialect handed to the AI prompt when no connection is \
@@ -4376,12 +4359,15 @@ mod engine_comparison_gate {
         ),
         (
             "table_designer.rs",
-            4,
-            "**Partly not clean.** `has_on_update == MySql` is a capability \
-             question with no predicate — `supports_on_update_current_timestamp` \
-             is the one this file is waiting for. The others are per-engine \
-             *grammar*: MySQL's storage row, PostgreSQL's index method and \
-             partial-index fields, and `NOT ENFORCED`. 9 → 8: a new column's \
+            1,
+            "PostgreSQL's index method and partial-index fields, built as one \
+             block. Not split into capabilities yet because the honest ones \
+             widen the form: a partial index is SQLite's and SQL Server's too, \
+             but SQLite's introspection reads no predicate back (the index is \
+             replayed verbatim), so the field would open empty over one. \
+             4 → 1: the storage row asks `ddl::takes_table_options`, the \
+             column's On update `supports_column_on_update`, and `NOT \
+             ENFORCED` `supports_unenforced_check(dialect, flavour)`. 9 → 8: a new column's \
              placeholder type is `ddl::default_new_column_type`. 8 → 5, with \
              SQL Server's Create table: both comment fields ask \
              `ddl::supports_comments`, the identity toggle \
@@ -4392,16 +4378,22 @@ mod engine_comparison_gate {
         ),
         (
             "trigger_editor.rs",
-            6,
-            "Trigger grammar throughout: the body template, `INSTEAD OF` \
-             timing, `FOR EACH ROW`, and PostgreSQL's separate function. \
-             `supports_trigger_editing` already answers the capability half \
-             and this file calls it; what is left is which statement to write. \
+            1,
+            "A trigger function's name is qualified as PostgreSQL's, because \
+             only PostgreSQL has trigger functions — a constant, but one whose \
+             every caller sits behind `ddl::trigger_runs_function`. \
              8 → 6, with SQL Server's trigger editing: the timing list is \
              `ddl::trigger_timings` rather than a `(dialect, is_view)` match, \
              and the events control asks `trigger_fires_on_several_events` and \
              `trigger_events` where it asked `pg` — each held by a test to \
-             what `TriggerDraft::validate` accepts.",
+             what `TriggerDraft::validate` accepts. 6 → 1: the view-trigger \
+             default, the level, `WHEN`, `UPDATE OF`, the function picker and \
+             the MySQL source fetch ask `supports_view_triggers`, \
+             `supports_trigger_level_choice`, `supports_trigger_when`, \
+             `supports_trigger_update_of`, `trigger_runs_function` and \
+             `catalogue_body_is_unescaped`. Leaving `overlays.rs` (the view's \
+             Triggers entry) and `routine_editor.rs` (the source fetch and the \
+             Language field, `routine_takes_language`) at none.",
         ),
         (
             "view_editor.rs",

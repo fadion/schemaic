@@ -117,7 +117,6 @@ const NEW_BODY_MSSQL: &str = "BEGIN\n    SET NOCOUNT ON;\n    \nEND";
 /// off the dialect, so naming both would be two parameters of which exactly one
 /// is ever used at the one call site.
 fn open_editor(d: DdlUi, actions: &SchemaActions, target: TriggerTarget, draft: TriggerSetDraft) {
-    let pg = target.dialect == SqlDialect::Postgres;
     // A new editing session: any lazy fetch still in flight for the last one is
     // now for the wrong target and must not land.
     d.session.update(|g| *g += 1);
@@ -133,13 +132,13 @@ fn open_editor(d: DdlUi, actions: &SchemaActions, target: TriggerTarget, draft: 
     d.functions.set(Vec::new());
     let dialect = target.dialect;
     d.trigger.set(Some(target));
-    if pg {
+    if ddl::trigger_runs_function(dialect) {
         fetch_functions(d, &actions.trigger_functions);
-    } else if dialect == SqlDialect::MySql {
-        // MySQL's correction alone, and asked for by name: SQLite's bodies come
-        // from `sqlite_master`, which is the source, so there is nothing to
-        // correct — and `trigger_source` is a `SHOW CREATE TRIGGER` no SQLite
-        // connection can answer.
+    } else if ddl::catalogue_body_is_unescaped(dialect) {
+        // MySQL's correction alone: SQLite's bodies come from `sqlite_master`,
+        // which is the source, so there is nothing to correct — and
+        // `trigger_source` is a `SHOW CREATE TRIGGER` no SQLite connection can
+        // answer.
         fetch_sources(d, &actions.trigger_source);
     }
 }
@@ -424,7 +423,7 @@ fn blank_trigger(
     // the *only* trigger a view takes at all — so opening on `BEFORE` there
     // would be the same "opens on a validation error" the rest of this function
     // exists to avoid.
-    if is_view && dialect != SqlDialect::MySql {
+    if is_view && ddl::supports_view_triggers(dialect) {
         draft.info.timing = TriggerTiming::InsteadOf;
     }
     draft.info.action = match dialect {
@@ -746,11 +745,12 @@ fn form(
         // beside it is what fills it.
         return empty_hint("No trigger selected.").into_any();
     };
-    let pg = target.dialect == SqlDialect::Postgres;
     // SQLite is a third shape here, not MySQL's: it has PostgreSQL's `WHEN` and
-    // `UPDATE OF` alongside MySQL's inline body, so every control below asks for
-    // the engines that have it rather than falling off a `!pg`.
-    let sqlite = target.dialect == SqlDialect::Sqlite;
+    // `UPDATE OF` alongside MySQL's inline body, so every control below asks
+    // the capability it needs rather than falling off a "PostgreSQL or not".
+    let dialect = target.dialect;
+    let has_when = ddl::supports_trigger_when(dialect);
+    let has_update_of = ddl::supports_trigger_update_of(dialect);
 
     // A constraint trigger is shown so it can be seen and removed, but its
     // deferral settings aren't modelled, so editing it would silently drop them;
@@ -920,7 +920,7 @@ fn form(
     // is a syntax error on SQLite — so the control is PostgreSQL's, and it is
     // built only there rather than built and hidden, since a `hide()`n control is
     // still in the modal's Tab order.
-    let level: AnyView = if !pg {
+    let level: AnyView = if !ddl::supports_trigger_level_choice(dialect) {
         crate::widgets::nothing()
     } else {
         form_setting(
@@ -1000,9 +1000,7 @@ fn form(
     };
 
     // A `WHEN` guard is **not** PostgreSQL's alone — SQLite has one too, and had
-    // it all along. MySQL is the engine without one, which is why this asks for
-    // the two that have it rather than for "not MySQL".
-    let has_when = pg || sqlite;
+    // it all along (`ddl::supports_trigger_when`).
     let when: AnyView = if !has_when {
         crate::widgets::nothing()
     } else {
@@ -1013,10 +1011,12 @@ fn form(
                 i,
                 draft.info.condition.clone().unwrap_or_default(),
                 FieldCfg {
-                    placeholder: if sqlite {
-                        "NEW.total > 0"
-                    } else {
-                        "new.total > 0"
+                    // Each engine's documentation's own spelling.
+                    placeholder: match dialect {
+                        SqlDialect::Sqlite => "NEW.total > 0",
+                        SqlDialect::Postgres | SqlDialect::MySql | SqlDialect::MsSql => {
+                            "new.total > 0"
+                        }
                     },
                     mono: true,
                     focus: Some((ring.clone(), 50)),
@@ -1031,12 +1031,11 @@ fn form(
         .into_any()
     };
 
-    // `UPDATE OF a, b` narrows an UPDATE trigger to named columns. SQLite's, and
-    // built only there: PostgreSQL has the clause too but no control for it yet,
-    // and MySQL has no such thing at all. Shown whatever the event, because
-    // hiding it on a switch to INSERT would hide a value the model still carries
-    // — `TriggerDraft::validate` is what says the pairing is wrong.
-    let update_of: AnyView = if !sqlite {
+    // `UPDATE OF a, b` narrows an UPDATE trigger to named columns — PostgreSQL's
+    // and SQLite's; MySQL has no such thing at all. Shown whatever the event,
+    // because hiding it on a switch to INSERT would hide a value the model still
+    // carries — `TriggerDraft::validate` is what says the pairing is wrong.
+    let update_of: AnyView = if !has_update_of {
         crate::widgets::nothing()
     } else {
         form_setting(
@@ -1065,8 +1064,8 @@ fn form(
         .into_any()
     };
 
-    // The action: a body on MySQL, a function to call on PostgreSQL.
-    let action: AnyView = if pg {
+    // The action: a function to call on PostgreSQL, a body everywhere else.
+    let action: AnyView = if ddl::trigger_runs_function(dialect) {
         pg_action(conn, ui, source, i, &draft, target, ring.clone()).into_any()
     } else {
         form_setting(
@@ -1113,7 +1112,11 @@ fn form(
         execute_as,
         form_section("Condition").style(move |s| {
             let s = s.margin_top(theme::scaled(4.0));
-            if has_when { s } else { s.hide() }
+            if has_when || has_update_of {
+                s
+            } else {
+                s.hide()
+            }
         }),
         when,
         update_of,

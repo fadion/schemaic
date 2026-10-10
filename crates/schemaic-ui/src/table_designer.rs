@@ -1283,10 +1283,11 @@ fn table_section(
     ring: FocusRing,
 ) -> AnyView {
     let d = ddl.draft;
-    // **The engine, not "not PostgreSQL".** A storage engine and a table
-    // collation are MySQL's, and asking the question the other way put SQLite —
-    // which has neither, and no comments either — on the side that gets both.
-    let mysql = target.dialect == SqlDialect::MySql;
+    // **Asked as table options, not "not PostgreSQL".** A storage engine and a
+    // table collation are MySQL's trailing options, and asking the question the
+    // other way put SQLite — which has neither, and no comments either — on the
+    // side that gets both.
+    let table_options = ddl::takes_table_options(target.dialect);
     let has_comments = ddl::supports_comments(target.dialect);
     let draft = d.get_untracked();
     let name = form_setting(
@@ -1325,7 +1326,7 @@ fn table_section(
     // controls aren't built rather than built and ignored. Built, not hidden: a
     // `hide()`n view is still in the tree, so its fields would still be in the
     // modal's Tab order and Tab would land on something nobody can see.
-    let mysql_only: AnyView = if mysql {
+    let mysql_only: AnyView = if table_options {
         v_stack((
             form_setting(
                 "Engine",
@@ -1460,7 +1461,7 @@ fn column_form(d: DdlUi, overlay: OverlayUi, target: &DesignerTarget, ring: Focu
     // field for it would take input the emitter then drops on the floor. SQL
     // Server has no comment the emitter writes either (`ddl::supports_comments`).
     let has_comments = ddl::supports_comments(target.dialect);
-    let has_on_update = target.dialect == SqlDialect::MySql;
+    let has_on_update = ddl::supports_column_on_update(target.dialect);
     let (identity_label, identity_hint) = ddl::identity_wording(target.dialect);
     let in_pk = draft.is_in_primary_key(i);
 
@@ -2357,9 +2358,7 @@ fn check_form(
     // `Unknown` hides it too: the form withholds a feature rather than offering
     // one the server may reject, which is the call the trigger editor's
     // per-engine form already makes.
-    let enforced: AnyView = if dialect == SqlDialect::Postgres
-        || target_flavour != ServerFlavour::MySql
-    {
+    let enforced: AnyView = if !ddl::supports_unenforced_check(dialect, target_flavour) {
         crate::widgets::nothing()
     } else {
         bound_toggle(
