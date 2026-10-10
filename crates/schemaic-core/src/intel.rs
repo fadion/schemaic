@@ -11235,19 +11235,18 @@ fn table_existence_checks(
                 .unwrap_or_default();
             // Quoted where the engine folds the bare spelling: `OrderItems`
             // unquoted is `orderitems` on PostgreSQL, which names no table.
-            let hint = nearest_name(&r.name, catalog.table_names(r.db.as_deref()))
-                .map(|n| {
-                    format!(
-                        " — did you mean `{}`?",
-                        crate::export::ident_if_needed(n, dialect)
-                    )
-                })
+            let suggestion = nearest_name(&r.name, catalog.table_names(r.db.as_deref()))
+                .map(|n| crate::export::ident_if_needed(n, dialect));
+            let hint = suggestion
+                .as_ref()
+                .map(|n| format!(" — did you mean `{n}`?"))
                 .unwrap_or_default();
             out.push(Diagnostic {
                 range: l.pos,
                 severity: Severity::Error,
                 message: format!("Table `{}` not found{where_db}{hint}", r.name),
-                fix: None,
+                // `pos` is the name token alone, so the qualifier stays.
+                fix: suggestion,
             });
         }
     }
@@ -11289,7 +11288,8 @@ fn qualified_column_checks(
                 range: (w[2].at, w[2].end),
                 severity: Severity::Error,
                 message: format!("Column `{col}` not found in `{}`{hint}", table.name),
-                fix: None,
+                fix: nearest_name(col, cols.iter().map(String::as_str))
+                    .map(|n| crate::export::ident_if_needed(n, dialect)),
             });
         }
     }
@@ -11431,13 +11431,16 @@ mod colres {
         let _ = ast.visit(&mut c);
         let whole_row = super::names_whole_rows(dialect);
         for r in &c.refs {
-            if let Some(d) = resolve(r, &c.scopes, whole_row) {
+            if let Some(d) = resolve(r, &c.scopes, whole_row, dialect) {
                 out.push(d);
             }
         }
         if let Some((scope, refs)) = targets {
             let scope = [scope];
-            out.extend(refs.iter().filter_map(|r| resolve(r, &scope, whole_row)));
+            out.extend(
+                refs.iter()
+                    .filter_map(|r| resolve(r, &scope, whole_row, dialect)),
+            );
         }
         out.append(&mut c.gb);
     }
@@ -11859,7 +11862,12 @@ mod colres {
     /// Resolve one column ref against the scopes containing its position (innermost
     /// first). Returns a diagnostic only when the column definitively doesn't exist.
     /// `whole_row` is [`super::names_whole_rows`]' answer for the engine.
-    fn resolve(r: &Ref, scopes: &[Scope], whole_row: bool) -> Option<Diagnostic> {
+    fn resolve(
+        r: &Ref,
+        scopes: &[Scope],
+        whole_row: bool,
+        dialect: super::SqlDialect,
+    ) -> Option<Diagnostic> {
         // Scopes whose range contains this ref, smallest (innermost) first.
         let mut chain: Vec<&Scope> = scopes
             .iter()
@@ -11887,18 +11895,27 @@ mod colres {
                             return match &src.cols {
                                 Cols::Open => None,
                                 Cols::Known(cols) if cols.contains(&r.col) => None,
-                                Cols::Known(cols) => Some(err(
-                                    r,
-                                    &format!(
-                                        "Column `{}` not found in `{}`{}",
-                                        r.col,
-                                        src.table.clone().unwrap_or_else(|| q.clone()),
-                                        super::did_you_mean(
-                                            &r.col,
-                                            cols.iter().map(String::as_str)
+                                Cols::Known(cols) => {
+                                    let mut d = err(
+                                        r,
+                                        &format!(
+                                            "Column `{}` not found in `{}`{}",
+                                            r.col,
+                                            src.table.clone().unwrap_or_else(|| q.clone()),
+                                            super::did_you_mean(
+                                                &r.col,
+                                                cols.iter().map(String::as_str)
+                                            ),
                                         ),
-                                    ),
-                                )),
+                                    );
+                                    // The message's "did you mean", as the fix.
+                                    d.fix = super::nearest_name(
+                                        &r.col,
+                                        cols.iter().map(String::as_str),
+                                    )
+                                    .map(|n| crate::export::ident_if_needed(n, dialect));
+                                    Some(d)
+                                }
                             };
                         }
                     }
@@ -11983,8 +12000,9 @@ mod colres {
                     [Src { table: Some(t), .. }] => format!(" in `{t}`"),
                     _ => String::new(),
                 };
-                // The suggestion is from what the innermost scope can see.
-                let hint = super::did_you_mean(
+                // The suggestion is from what the innermost scope can see — the
+                // message's "did you mean" and Alt+Enter's fix alike.
+                let suggestion = super::nearest_name(
                     &r.col,
                     chain[0]
                         .sources
@@ -11996,10 +12014,12 @@ mod colres {
                         })
                         .flatten(),
                 );
-                Some(err(
-                    r,
-                    &format!("Column `{}` not found{where_tbl}{hint}", r.col),
-                ))
+                let hint = suggestion
+                    .map(|n| format!(" — did you mean `{n}`?"))
+                    .unwrap_or_default();
+                let mut d = err(r, &format!("Column `{}` not found{where_tbl}{hint}", r.col));
+                d.fix = suggestion.map(|n| crate::export::ident_if_needed(n, dialect));
+                Some(d)
             }
         }
     }
@@ -12440,7 +12460,7 @@ mod colres {
                 col: col.value.to_ascii_lowercase(),
                 range: to_range(stmt, lo, col.span),
             };
-            out.extend(resolve(&r, &scope, whole_row));
+            out.extend(resolve(&r, &scope, whole_row, dialect));
         }
     }
 
@@ -26485,6 +26505,16 @@ mod tests {
         assert_eq!(
             fix_for("SELECT coalese(name, 'x') FROM employees", "coalese").as_deref(),
             Some("coalesce")
+        );
+        // A not-found name with one "did you mean" takes it, quoted as the
+        // message quotes it.
+        assert_eq!(
+            fix_for("SELECT * FROM employes", "employes").as_deref(),
+            Some("employees")
+        );
+        assert_eq!(
+            fix_for("SELECT e.salery FROM employees e", "salery").as_deref(),
+            Some("salary")
         );
     }
 

@@ -2136,7 +2136,11 @@ existing prose was left alone.
     (the key is under `editor_pane.rs`). It is the text that replaces **exactly the diagnostic's own
     `range`**, and has no range of its own on purpose: the per-statement cache shifts `range` when
     an edit moves the statement, and a second span would have to be shifted everywhere the first
-    is. Three checks fill it and every other construction site states `None`: `null_comparisons`
+    is. The not-found checks fill it with their own "did you mean" — an unknown table (its range is
+    the name token alone, so a qualifier stays) and an unknown column, qualified or bare, in the
+    per-scope resolver and the flat qualified check alike — quoted by `export::ident_if_needed` as
+    the message quotes it. Three more checks fill it, and every other construction site states
+    `None`: `null_comparisons`
     writes `x IS NULL` for `x = NULL` (`IS NOT NULL` for `<>`/`!=`, the `NULL` on either side), the
     other operand as written, sliced by its AST span — nothing for `NULL = NULL`; the keyword-typo
     check asks `nearest_name` over `SQL_KEYWORDS` and `STMT_KEYWORDS`, and the function-typo check
