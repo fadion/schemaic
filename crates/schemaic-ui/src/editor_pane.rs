@@ -5768,6 +5768,25 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                         .get()
                         .and_then(|p| pointer_offset(&ed_menu, p))
                         .is_none_or(|(_, inside)| inside);
+                    // **A name the statement defines itself jumps to where it
+                    // does** — an alias, a derived table, a CTE — before the
+                    // catalogue is asked: `name_at` would resolve an alias to
+                    // its table and open that, which is not where `o` is.
+                    let defined = on_text
+                        .then(|| {
+                            query.with_untracked(|sql| {
+                                intel::definition_at(sql, off, dialect.get_untracked())
+                            })
+                        })
+                        .flatten();
+                    if let Some((a, b)) = defined {
+                        comp.open.set(false);
+                        ed_menu
+                            .cursor
+                            .update(|c| c.set_insert(Selection::region(a, b)));
+                        ed_menu.center_window();
+                        return EventPropagation::Stop;
+                    }
                     let adb = active_db.get_untracked();
                     let found = on_text
                         .then(|| {

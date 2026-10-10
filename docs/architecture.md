@@ -2779,6 +2779,19 @@ existing prose was left alone.
     `unquoted` (`an_alias_rename_writes_every_occurrence`,
     `an_alias_rename_refuses_a_capturing_or_empty_name`, `an_alias_name_is_its_definition_as_written`).
     `alias_occurrences` has no production caller since; its tests go on pinning the walk.
+    **`definition_at` is Ctrl+click's jump**, and another reader of that walk: where the statement
+    defines the name at the caret, quotes off. It asks `alias_refs::definition` first — the range
+    `alias_name_at` reads — so a derived table's alias is found as a table's is, and a subquery's
+    shadowing `o` is the one a click inside it reaches. Where that walk finds no alias it falls back
+    to the statement's CTE names through `cte_name_tokens`, the token walk `cte_names` already is
+    rather than a second scanner, so that half answers on text that does not parse as well. An
+    unquoted name matches ASCII-case-insensitively and a quoted one exactly, and a word after a `.`
+    is never the CTE — `x.n` is a column of `x`, whatever the `WITH` calls `n`. Only the
+    statement's leading `WITH` is read, so a CTE declared inside a subquery is not found. It is
+    `None` on the definition itself, so a click there falls through and still opens what the name
+    names, and on anything the statement does not define
+    (`a_reference_leads_to_where_the_statement_defines_it`,
+    `no_definition_where_the_caret_is_not_on_a_reference`).
     **A `(` is filled from the schema only where the schema names one answer.** `paren_contents`,
     asked right after `insert_columns`, answers three openers through the same `column_list`.
     `REFERENCES t (` gets `t`'s primary key from `Catalog::key_columns_of` — its columns in the
@@ -3208,7 +3221,8 @@ existing prose was left alone.
     `only_the_engines_with_a_catalog_are_authoritative` covers this catalog too, in both directions — SQL Server knows `datediff` and `iif` and not
     MySQL's `curdate`, and neither MySQL nor PostgreSQL knows `eomonth`.
   - `quickinfo.rs` — **what a name in the editor names**: the one answer behind the hover's
-    quick-info and Ctrl+click's go to definition (both under `editor_pane.rs`). `name_at` takes the
+    quick-info and Ctrl+click's go to definition (both under `editor_pane.rs`), except that a name
+    the statement defines itself is `intel::definition_at`'s, asked first. `name_at` takes the
     statement round the offset (`sql::statement_range`), refuses inside a string or comment
     (`intel::caret_in_literal_or_comment`), finds the word token the offset is on — or just after
     it, since a click at a word's end leaves the caret there — and takes the whole dotted chain
@@ -25237,6 +25251,12 @@ existing prose was left alone.
     (`last_pointer` — the click arrives in the editor view's coords, which `pointer_offset` does
     not take) and opens nothing outside the text, as the hover shows nothing there
     (`ctrl_click_asks_whether_the_pointer_is_on_the_text`).
+    **A name the statement defines itself jumps instead of opening** — an alias, a derived table, a
+    CTE. The branch asks `intel::definition_at` at the caret *before* `named_object_at`, and the
+    order is load-bearing: `quickinfo::name_at` resolves an alias to its table, so asked first it
+    opens `orders` for a click on `o`, which is not where `o` is. A hit closes completion, selects
+    the definition (`Selection::region`) and `center_window()`s; on the definition itself
+    `definition_at` answers `None`, so a click there still opens what the name names.
     **Alt+Shift+drag is a box selection** (`text_ops::box_regions`). `name_box_at`'s way back from
     a pointer to the document is factored out as `pointer_offset` — the offset under the pointer and
     whether it is inside the text, `None` over the gutter — which the drag shares. The same outer

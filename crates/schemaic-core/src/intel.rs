@@ -12650,6 +12650,48 @@ pub fn alias_name_at(sql: &str, caret: usize, dialect: SqlDialect) -> Option<Str
     sql.get(a..b).map(str::to_string)
 }
 
+/// Ctrl+click's **jump**: where the statement defines the name at `caret` —
+/// a table alias or a derived table's (through [`alias_refs`], the walk
+/// *Rename alias* uses, so a subquery's shadowing alias is the one found), or
+/// a CTE's name in the statement's `WITH`. The name's range, quotes off.
+///
+/// `None` on the definition itself, so a click there still opens what it
+/// names, and on anything the statement does not define: a table, a column —
+/// a qualified `x.n` is never the CTE `n`.
+pub fn definition_at(sql: &str, caret: usize, dialect: SqlDialect) -> Option<(usize, usize)> {
+    let (lo, hi) = crate::sql::statement_range(sql, caret, dialect);
+    let stmt = sql.get(lo..hi)?;
+    let on = |(a, b): (usize, usize)| a <= caret && caret <= b;
+    if let Ok(asts) = parse_statements(stmt, dialect)
+        && let [ast] = asts.as_slice()
+        && let Some(def) = alias_refs::definition(stmt, lo, ast, caret)
+    {
+        return (!on(def)).then_some(def);
+    }
+    let toks = tokenize_range(sql, lo, hi, dialect);
+    let at = toks.iter().position(|t| t.at <= caret && caret <= t.end)?;
+    let TkKind::Word(name) = &toks[at].kind else {
+        return None;
+    };
+    if at > 0 && matches!(toks[at - 1].kind, TkKind::Dot) {
+        return None;
+    }
+    let def = cte_name_tokens(&toks).into_iter().find(|d| match &d.kind {
+        TkKind::Word(w) if d.quoted || toks[at].quoted => w == name,
+        TkKind::Word(w) => w.eq_ignore_ascii_case(name),
+        _ => false,
+    })?;
+    if def.at == toks[at].at {
+        return None;
+    }
+    // The name inside its quotes, as `alias_refs::definition` answers.
+    Some(if def.quoted {
+        (def.at + 1, def.end - 1)
+    } else {
+        (def.at, def.end)
+    })
+}
+
 /// *Rename alias*'s decision: the edits that rename the alias at `caret` to
 /// `new_name` — in order and disjoint, each a whole spelling (quotes
 /// included) replaced by the name as [`crate::export::ident_if_needed`]
@@ -27629,6 +27671,62 @@ mod tests {
         assert_eq!(
             renamed("SELECT row_to_json(o) FROM orders o|", "x", pg),
             Err(AliasRenameRefusal::NoAlias)
+        );
+    }
+
+    /// Ctrl+click's jump: the text a `|`-marked reference's definition spans.
+    fn defined(sql: &str) -> Option<String> {
+        let caret = sql.find('|').unwrap();
+        let sql = sql.replace('|', "");
+        definition_at(&sql, caret, SqlDialect::MySql).map(|(a, b)| format!("{}@{a}", &sql[a..b]))
+    }
+
+    /// A table alias, a derived table's and a CTE's reference each lead to
+    /// the name where the statement defines it — through the alias walk the
+    /// rename uses, so a shadowing subquery's own alias is the one found.
+    #[test]
+    fn a_reference_leads_to_where_the_statement_defines_it() {
+        assert_eq!(
+            defined("SELECT o|.id FROM orders o").as_deref(),
+            Some("o@24")
+        );
+        assert_eq!(
+            defined("SELECT d|.n FROM (SELECT 1 AS n) d").as_deref(),
+            Some("d@32")
+        );
+        assert_eq!(
+            defined(
+                "SELECT o.id FROM orders o WHERE EXISTS (SELECT 1 FROM items o WHERE o|.x = 1)"
+            )
+            .as_deref(),
+            Some("o@60"),
+            "the subquery's own `o`, which shadows the outer one"
+        );
+        assert_eq!(
+            defined("WITH recent AS (SELECT 1 AS n) SELECT * FROM rec|ent").as_deref(),
+            Some("recent@5")
+        );
+        assert_eq!(
+            defined("WITH a AS (SELECT 1), `b c` AS (SELECT 2) SELECT * FROM a, `b| c`").as_deref(),
+            Some("b c@23"),
+            "a quoted CTE name, quotes off"
+        );
+    }
+
+    /// Nothing to jump to: the definition itself, a plain table, and a
+    /// column that only shares a CTE's name.
+    #[test]
+    fn no_definition_where_the_caret_is_not_on_a_reference() {
+        assert_eq!(defined("SELECT o.id FROM orders o|"), None);
+        assert_eq!(
+            defined("WITH rec|ent AS (SELECT 1) SELECT * FROM recent"),
+            None
+        );
+        assert_eq!(defined("SELECT * FROM ord|ers"), None);
+        assert_eq!(
+            defined("WITH n AS (SELECT 1 AS n) SELECT x.n| FROM n, t x"),
+            None,
+            "a qualified column is not the CTE"
         );
     }
 
