@@ -4272,12 +4272,12 @@ mod engine_comparison_gate {
         ),
         (
             "schemaic-core/ddl.rs",
-            14,
-            "Five of the fourteen are in the capability definitions the \
+            13,
+            "Five of the thirteen are in the capability definitions the \
              rest of the app asks — `requires_named_checks`, \
              `requires_rowid_key`, `strict_type_allowed`, and two in \
              `supports_change` — and a comparison is how they answer. The \
-             other nine are DDL grammar \
+             other eight are DDL grammar \
              inside the emitters and validators (`create_view_sql`, \
              `create_table_sql`, `client_script`'s `DELIMITER`, \
              `repoint_check_column`, the drafts' `validate`), where the engines \
@@ -4301,7 +4301,9 @@ mod engine_comparison_gate {
              kept the rebuild SQLite's alone. 16 → 15: a new account's \
              `host is %` sentence asks `users::accounts_have_hosts` where it \
              asked `== MySql`. 15 → 14: `RoutineDraft::validate`'s \"needs a \
-             language\" asks `routine_takes_language`, as the form's field does.",
+             language\" asks `routine_takes_language`, as the form's field does. \
+             14 → 13: `diff_view`'s re-create override asks \
+             `view_replace_can_refuse`, as the view editor's toggle does.",
         ),
         (
             "schemaic-core/filter.rs",
@@ -4393,18 +4395,11 @@ mod engine_comparison_gate {
              `supports_trigger_update_of`, `trigger_runs_function` and \
              `catalogue_body_is_unescaped`. Leaving `overlays.rs` (the view's \
              Triggers entry) and `routine_editor.rs` (the source fetch and the \
-             Language field, `routine_takes_language`) at none.",
-        ),
-        (
-            "view_editor.rs",
-            3,
-            "View grammar: MySQL's `ALGORITHM=`/`SQL SECURITY` and \
-             PostgreSQL's re-create toggle. `supports_or_replace_view` and \
-             `supports_view_rename` carry the capability half and are called \
-             here. 4 → 3: the check option and the column list ask \
-             `supports_view_check_option` and `view_keeps_column_list`, where \
-             they asked `== Sqlite` — which offered SQL Server a CASCADED/LOCAL \
-             picker nothing writes, and hid the column list it keeps.",
+             Language field, `routine_takes_language`) at none. \
+             `view_editor.rs` went 3 → none the same way: MySQL's \
+             `ALGORITHM=`/`SQL SECURITY` fetch and fields ask \
+             `supports_view_security`, PostgreSQL's re-create toggle \
+             `view_replace_can_refuse` — which `diff_view` asks too.",
         ),
     ];
 

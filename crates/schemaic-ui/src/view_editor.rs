@@ -30,7 +30,6 @@ use floem::prelude::*;
 use floem::reactive::create_effect;
 
 use schemaic_core::ddl::{self, ViewDraft};
-use schemaic_core::intel::SqlDialect;
 
 use crate::settings::focusable_toggle_row;
 use crate::table_designer::{edit_ctx, focusable_owned_dropdown, loaded_table};
@@ -106,9 +105,9 @@ pub(crate) fn open_for_view(
         return;
     }
     // MySQL's question and nobody else's — `SHOW CREATE VIEW` is the only place
-    // the algorithm lives. Asked as `== MySql`, not `!= Postgres`: the second
+    // the algorithm lives. Asked as the capability, not `!= Postgres`: that
     // spelling sent SQLite off to fetch an option it has no concept of.
-    let needs_algorithm = ctx.dialect == SqlDialect::MySql
+    let needs_algorithm = ddl::supports_view_security(ctx.dialect)
         && info
             .view_options
             .as_ref()
@@ -284,10 +283,10 @@ fn bound_choice(
 fn form(ui: DdlUi, target: &ViewTarget, ring: FocusRing) -> AnyView {
     let d = ui.view_draft;
     let draft = d.get_untracked();
-    // Asked per engine rather than as `pg` / `!pg`: SQLite is a third shape, not
-    // MySQL's, and every option below belongs to exactly one of them.
-    let my = target.dialect == SqlDialect::MySql;
-    let pg = target.dialect == SqlDialect::Postgres;
+    // Asked as capabilities rather than as `pg` / `!pg`: SQLite is a third
+    // shape, not MySQL's, and every option below belongs to exactly one engine.
+    let has_security = ddl::supports_view_security(target.dialect);
+    let replace_can_refuse = ddl::view_replace_can_refuse(target.dialect);
 
     // No "In {database}" row: the modal title names the place now.
     let name = form_setting(
@@ -393,7 +392,7 @@ fn form(ui: DdlUi, target: &ViewTarget, ring: FocusRing) -> AnyView {
     // MySQL's alone, and built only there rather than built and hidden: a
     // `hide()`n control is still in the modal's Tab order, so Tab would land on
     // something nobody can see.
-    let mysql_only: AnyView = if !my {
+    let mysql_only: AnyView = if !has_security {
         crate::widgets::nothing()
     } else {
         let security = form_setting(
@@ -425,7 +424,7 @@ fn form(ui: DdlUi, target: &ViewTarget, ring: FocusRing) -> AnyView {
 
     // PostgreSQL's escape hatch. Off by default — a drop is never the quiet
     // answer — and the preview spells out what taking it costs.
-    let recreate: AnyView = if !pg {
+    let recreate: AnyView = if !replace_can_refuse {
         crate::widgets::nothing()
     } else {
         let sig = floem::reactive::create_rw_signal(draft.force_recreate);

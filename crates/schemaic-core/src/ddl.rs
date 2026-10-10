@@ -11432,6 +11432,34 @@ pub fn supports_view_check_option(dialect: SqlDialect) -> bool {
     }
 }
 
+/// Does a view carry MySQL's `ALGORITHM=`, `SQL SECURITY` and `DEFINER`?
+/// MySQL's alone — and `ALGORITHM` lives only in `SHOW CREATE VIEW`, which is
+/// why the view editor fetches it on open where this answers `true`.
+/// PostgreSQL's `security_invoker` and SQL Server's `WITH` attributes are
+/// options of another shape, carried elsewhere in [`ViewOptions`].
+pub fn supports_view_security(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MySql => true,
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+    }
+}
+
+/// Can `CREATE OR REPLACE VIEW` **refuse** a redefinition, so that a
+/// re-create (a drop and a create) has to be chosen instead — by the plan
+/// when the column list narrows, or by the user's *Re-create instead of
+/// replacing*?
+///
+/// PostgreSQL's alone: it replaces only a view whose new columns extend the
+/// old ones (no drop, rename or retype). MySQL's replace takes anything and
+/// SQL Server's `CREATE OR ALTER` likewise, while SQLite has no replace at all
+/// and always re-creates ([`supports_or_replace_view`]).
+pub fn view_replace_can_refuse(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::Postgres => true,
+        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+    }
+}
+
 /// Does a view on `dialect` keep an explicit column list —
 /// `CREATE VIEW v (x, y) AS …` — that the body does not restate
 /// ([`crate::schema::ViewOptions::column_list`])?
@@ -16865,7 +16893,7 @@ pub fn diff_view(current: &TableInfo, draft: &ViewDraft, dialect: SqlDialect) ->
         // `RenameView` below would be a change nothing can write.
         let recreate = !supports_or_replace_view(dialect)
             || (renamed && !supports_view_rename(dialect))
-            || (dialect == SqlDialect::Postgres
+            || (view_replace_can_refuse(dialect)
                 && (draft.force_recreate || {
                     let cols: Vec<String> =
                         current.columns.iter().map(|c| c.name.clone()).collect();
@@ -23485,6 +23513,31 @@ mod tests {
         for d in [Postgres, Sqlite, MsSql] {
             assert!(!supports_index_prefix(d), "{d:?}");
         }
+    }
+
+    /// The view editor's per-engine options: MySQL's security and algorithm,
+    /// PostgreSQL's re-create override.
+    #[test]
+    fn the_view_editors_options_are_asked_as_capabilities() {
+        let table = |f: fn(SqlDialect) -> bool| SqlDialect::ALL.map(|d| (d, f(d)));
+        assert_eq!(
+            table(supports_view_security),
+            [
+                (MySql, true),
+                (Postgres, false),
+                (Sqlite, false),
+                (MsSql, false)
+            ]
+        );
+        assert_eq!(
+            table(view_replace_can_refuse),
+            [
+                (MySql, false),
+                (Postgres, true),
+                (Sqlite, false),
+                (MsSql, false)
+            ]
+        );
     }
 
     /// The table designer's MySQL-only fields, each asked as what it is:

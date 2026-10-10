@@ -7043,7 +7043,9 @@ existing prose was left alone.
     that renames/retypes/reorders one needs `DROP` + `CREATE`, which takes dependent
     views and grants with it: `pg_replaceable` (over `intel::select_output_names`)
     decides where it can, **uncertainty resolves to replace-and-let-the-server-refuse,
-    never to drop**, and `ViewDraft::force_recreate` is the user's override.
+    never to drop**, and `ViewDraft::force_recreate` is the user's override. `diff_view` reads
+    both only where `view_replace_can_refuse` says a replace can be refused — PostgreSQL alone,
+    where it asked `dialect == Postgres` — and ignores the override elsewhere.
     SQLite's is the pair of predicates above: every edit is a drop and a create, so nothing is
     carried through a *replace* there — it is carried through the re-create, which is why
     `ViewOptions::column_list` had to be modelled (see `core::schema`). **SQL Server's is
@@ -23323,7 +23325,13 @@ existing prose was left alone.
     and hid the column list its `ALTER VIEW` has to restate. SQL Server's attributes
     (`SCHEMABINDING`, `VIEW_METADATA`) have no control: they are carried through the draft, not
     edited. `needs_algorithm` asked `!= Postgres`, which sent a SQLite
-    connection off to fetch a `SHOW CREATE VIEW` algorithm; it asks `== MySql`.
+    connection off to fetch a `SHOW CREATE VIEW` algorithm; it asked `== MySql` after that, and
+    now asks `ddl::supports_view_security` (MySQL alone), as the security/definer block does. The
+    re-create toggle asks `ddl::view_replace_can_refuse` (PostgreSQL alone), the same predicate
+    `diff_view` asks before it will re-create, so the toggle is offered exactly where the plan
+    reads it. Both are pinned as a truth table in
+    `the_view_editors_options_are_asked_as_capabilities`, and with them the file has no entry left
+    in `engine_comparison_gate`'s budget (3 → none).
     `is_editable_view` is the entry point's gate — a materialized view reaches no editor, and
     the two things its context menu can still do to it are **Drop** and **Refresh view**
     (`ObjectEntries::refresh_view`, over `ddl::refresh_view_change`), neither of which opens a
@@ -32293,6 +32301,7 @@ Re-introducing the anti-patterns these guard against is a regression:
   moved down to the narrower predicates that decide how an edit is *performed* rather than whether
   it is offered — `supports_or_replace_view`, false on SQLite alone, `supports_view_rename`, false
   on SQLite and SQL Server, `supports_view_check_option` and `view_keeps_column_list`,
+  `supports_view_security` and `view_replace_can_refuse`,
   `supports_trigger_alter_in_place`, true on SQL Server alone, with the trigger form's
   `trigger_timings`, `trigger_events`, `trigger_fires_on_several_events`,
   `supports_trigger_not_for_replication`, `supports_trigger_execute_as`,
