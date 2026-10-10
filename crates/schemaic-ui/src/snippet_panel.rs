@@ -27,7 +27,8 @@ use crate::consts::{MONO_FAMILY, SEARCH_DEBOUNCE_MS};
 use crate::theme::{font_body, font_label};
 use crate::tooltip::TooltipExt;
 use crate::widgets::{
-    MenuEntry, autohide, debounced, highlight_sql_mono, highlight_text, section_title, toolbar_icon,
+    MenuEntry, autohide_tracking, debounced, highlight_sql_mono, highlight_text, section_title,
+    toolbar_icon,
 };
 use crate::{ConnUi, FieldCfg, OverlayUi, SnippetActions, SnippetsUi, edit_field, icons, theme};
 
@@ -75,6 +76,9 @@ pub(crate) fn snippet_panel(
     // keystroke that does not change the matched set never rebuilt the rows: the
     // highlight term (read `get_untracked` inside the child builder) froze on the
     // previous word, and the preview stayed lexed with the previous engine.
+    //
+    // `viewport` outlives the rebuilds: it belongs to the scroll, which stays.
+    let viewport: RwSignal<floem::kurbo::Rect> = RwSignal::new(floem::kurbo::Rect::ZERO);
     let list = dyn_container(move || (groups.get(), search.get(), dialect.get()), {
         let actions = actions.clone();
         move |(groups, _, _): (Vec<snippet::Group>, String, SqlDialect)| {
@@ -86,43 +90,37 @@ pub(crate) fn snippet_panel(
                 let t = t.trim().to_string();
                 (!t.is_empty()).then_some(t)
             };
-            let actions = actions.clone();
-            let rows = groups
+            let bands = groups
                 .into_iter()
-                .enumerate()
-                .flat_map(|(gi, group)| {
-                    let header = group_header(group.bucket, group.items.len(), gi == 0);
-                    let (actions, term) = (actions.clone(), term.clone());
-                    std::iter::once(header).chain(
-                        group
-                            .items
-                            .into_iter()
-                            .map(move |s| {
-                                snippet_row(
-                                    s,
-                                    actions.clone(),
-                                    term.clone(),
-                                    dialect.get_untracked(),
-                                    active_conn,
-                                    renaming,
-                                    rename_buf,
-                                    overlay,
-                                    menus,
-                                )
-                                .into_any()
-                            })
-                            .collect::<Vec<_>>(),
-                    )
+                .map(|group| {
+                    let count = group.items.len();
+                    let rows = group
+                        .items
+                        .into_iter()
+                        .map(|s| {
+                            snippet_row(
+                                s,
+                                actions.clone(),
+                                term.clone(),
+                                dialect.get_untracked(),
+                                active_conn,
+                                renaming,
+                                rename_buf,
+                                overlay,
+                                menus,
+                            )
+                            .into_any()
+                        })
+                        .collect::<Vec<_>>();
+                    (group_title(group.bucket), count, rows)
                 })
                 .collect::<Vec<_>>();
-            v_stack_from_iter(rows)
-                .style(|s| s.flex_col().width_full())
-                .into_any()
+            crate::widgets::banded_list(bands, viewport)
         }
     })
     .style(|s| s.flex_col().width_full());
 
-    let scrolled = autohide(scroll(list).scroll_to(move || list_scroll.get()))
+    let scrolled = autohide_tracking(scroll(list).scroll_to(move || list_scroll.get()), viewport)
         .style(|s| s.flex_grow(1.0_f32).width_full().min_height(0.0));
 
     // Title row: "SNIPPET LIBRARY" left, a + right — save what the editor holds.
@@ -197,23 +195,21 @@ fn empty_state() -> impl IntoView {
     .style(|s| s.width_full())
 }
 
-/// A scope band — `THIS CONNECTION` / `MYSQL` / `ALL CONNECTIONS` — and how many
-/// are under it.
+/// A scope band's title — `THIS CONNECTION` / `MYSQL` / `ALL CONNECTIONS`.
 ///
 /// The band is `widgets::panel_group_header`, shared with the history panel's
-/// recency bands, which is where the design rulings behind it are written down —
-/// including the top rule on the first one only. What is this panel's own is the
-/// naming below.
-fn group_header(bucket: Bucket, count: usize, first: bool) -> floem::AnyView {
-    let title = match bucket {
+/// recency bands and laid out (sticky) by `widgets::banded_list`, which is where
+/// the design rulings behind it are written down. What is this panel's own is
+/// the naming below.
+fn group_title(bucket: Bucket) -> String {
+    match bucket {
         // Named for what it *means* rather than for the connection: the panel is
         // already scoped to the active connection, and repeating its name here
         // says nothing the header above the panel doesn't.
         Bucket::Conn(_) => "THIS CONNECTION".to_string(),
         Bucket::Dialect(d) => d.engine_label().to_uppercase(),
         Bucket::Global => "ALL CONNECTIONS".to_string(),
-    };
-    crate::widgets::panel_group_header(title, count, first)
+    }
 }
 
 /// One snippet row.

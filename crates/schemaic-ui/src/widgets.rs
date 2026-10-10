@@ -13,7 +13,7 @@ use floem::event::{Event, EventListener, EventPropagation};
 use floem::keyboard::{Key, NamedKey};
 use floem::kurbo::Rect;
 use floem::prelude::*;
-use floem::reactive::{Scope, create_effect};
+use floem::reactive::{Scope, create_effect, create_memo};
 use floem::style::Transition;
 use floem::views::Scroll;
 use floem::views::scroll::ScrollCustomStyle;
@@ -5142,6 +5142,23 @@ pub(crate) fn autohide(s: Scroll) -> Scroll {
         .on_scroll(move |_| poke())
 }
 
+/// [`autohide`], also publishing the visible rect into `viewport` — for a list
+/// that draws something against the scroll position ([`banded_list`]'s pinned
+/// header). One function rather than a second `on_scroll` on top of
+/// `autohide`'s: a scroll holds one handler, and setting another replaces it.
+pub(crate) fn autohide_tracking(s: Scroll, viewport: RwSignal<Rect>) -> Scroll {
+    let (shown, poke) = autohide_state();
+    s.scroll_style(move |cs| thin_scroll(cs).hide_bars(!shown.get()))
+        .on_scroll(move |vp| {
+            // `try_` for the reason `autohide_state`'s poke gives: a deferred
+            // clamp can scroll a list whose scope has gone.
+            if viewport.try_get_untracked().is_some_and(|v| v != vp) {
+                viewport.set(vp);
+            }
+            poke();
+        })
+}
+
 /// Wrap a child in a `scroll` that also treats **Shift + wheel** as horizontal
 /// scrolling (common browser/app combo). The built-in scroll runs registered
 /// `PointerWheel` listeners first, so we intercept Shift there and drive a
@@ -5308,6 +5325,81 @@ pub(crate) fn panel_group_header(title: String, count: usize, first: bool) -> An
             if first { s.border_top(1.0) } else { s }
         })
         .into_any()
+}
+
+/// A list of bands — each a [`panel_group_header`] over its rows — whose
+/// header **sticks**: the band under the top edge keeps its header pinned there
+/// while its rows scroll, and the next header pushes it out as it arrives.
+///
+/// `bands` is `(title, count, rows)` per band, in order; `viewport` is the
+/// enclosing scroll's visible rect, published by [`autohide_tracking`].
+///
+/// **The pinned copy lives inside the scrolled content**, absolutely placed at
+/// the viewport's top, rather than as a layer over the scroll: there the
+/// scroll's own clip trims a header being pushed out instead of letting it
+/// paint over the search box above, and a wheel over the copy bubbles to the
+/// scroll as it does from any row, with no `pointer_events` opt-out to keep.
+///
+/// The in-flow headers are measured rather than computed — the rows wrap, so a
+/// band's height is whatever layout made it — and what that geometry means is
+/// [`schemaic_core::sticky_header::pinned`]'s to decide. The copy is drawn as
+/// `first`, with its own top rule: it stands where the first header stands at
+/// rest, and that header's measured height is therefore the copy's too.
+pub(crate) fn banded_list(
+    bands: Vec<(String, usize, Vec<AnyView>)>,
+    viewport: RwSignal<Rect>,
+) -> AnyView {
+    // `(top, height)` per header, in the list's coordinates. Unmeasured headers
+    // stand infinitely far down, so they pin nothing until layout places them.
+    let geometry: RwSignal<Vec<(f64, f64)>> =
+        RwSignal::new(vec![(f64::INFINITY, 0.0); bands.len()]);
+    let mut titles: Vec<(String, usize)> = Vec::with_capacity(bands.len());
+    let mut items: Vec<AnyView> = Vec::new();
+    for (i, (title, count, rows)) in bands.into_iter().enumerate() {
+        titles.push((title.clone(), count));
+        items.push(
+            panel_group_header(title, count, i == 0)
+                .on_resize(move |r| {
+                    geometry.try_update(|g| {
+                        if let Some(slot) = g.get_mut(i) {
+                            *slot = (r.y0, r.height());
+                        }
+                    });
+                })
+                .into_any(),
+        );
+        items.extend(rows);
+    }
+    let pin = create_memo(move |_| {
+        let y = viewport.get().y0;
+        geometry.with(|g| {
+            let h = g.first().map_or(0.0, |&(_, h)| h);
+            schemaic_core::sticky_header::pinned(g, y, h)
+        })
+    });
+    // Keyed on the band alone, so the copy is rebuilt when the pin changes hands
+    // and only restyled while it is pushed.
+    let pinned_band = create_memo(move |_| pin.get().map(|p| p.index));
+    let copy = dyn_container(
+        move || pinned_band.get(),
+        move |band| match band.and_then(|i| titles.get(i).cloned()) {
+            Some((title, count)) => panel_group_header(title, count, true),
+            None => empty().into_any(),
+        },
+    )
+    .style(move |s| {
+        let offset = pin.get().map_or(0.0, |p| p.offset);
+        s.absolute()
+            .inset_left(0.0)
+            .width_full()
+            .inset_top(viewport.get().y0 + offset)
+    });
+    stack((
+        v_stack_from_iter(items).style(|s| s.flex_col().width_full()),
+        copy,
+    ))
+    .style(|s| s.flex_col().width_full())
+    .into_any()
 }
 
 /// A centred status line filling its container (empty state, failure, cancel).
@@ -7270,7 +7362,10 @@ mod exit_tests {
             ("snippet_panel.rs", include_str!("snippet_panel.rs")),
         ] {
             let body = crate::source_gate::production_code(src);
-            for shared in ["panel_search(", "panel_group_header("] {
+            // The bands arrive through `banded_list`, which is what builds each
+            // `panel_group_header` (and makes it sticky); a panel that stopped
+            // calling it would be laying its bands out some other way.
+            for shared in ["panel_search(", "banded_list("] {
                 assert!(
                     body.contains(shared),
                     "{file} no longer calls `{shared}` — if the chrome really has \

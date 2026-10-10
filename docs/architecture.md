@@ -9577,6 +9577,22 @@ existing prose was left alone.
     (`database_names_compare_by_the_engines_case_rule`). The SQL Server arm is the *default*
     collation's answer; nothing consults the server's own, so on one installed case-sensitive
     the rule errs towards offering.
+  - `sticky_header.rs` — which band header of a scrolled list is **pinned** to its top edge, and
+    how far the next one has pushed it: the pure half of the history and snippet panels' sticky
+    bands (the view half is `widgets::banded_list`). `pinned(headers, scroll_y, pinned_height)`
+    takes each in-flow header's measured `(top, height)` in list order and answers
+    `Option<Pinned { index, offset }>`. **It is `None` until the first header's top has gone
+    *strictly* above the edge**: at rest the in-flow header already stands where the copy would,
+    and drawing both paints the same band twice — so a header lying exactly at the top is left to
+    show itself. Past that the pinned band is the last one whose top is above the edge, and
+    `offset` is how far the next header has climbed into the copy (`next_top − scroll_y −
+    pinned_height`, clamped to `[−pinned_height, 0]`), which is what makes the arriving header push
+    the pinned one out rather than slide under it. The last band has no next header and is never
+    pushed. **The push is measured against the copy's height, not the in-flow header's**, because
+    the two differ: the copy wears `first`'s top rule and is a pixel taller than every header but
+    the first (`the_push_is_measured_against_the_pinned_copys_height_not_the_in_flow_one`). An
+    unmeasured height (`0`, before layout has reported one) pins without pushing, and the clamp's
+    lower bound is `max(0)`-guarded so a negative height cannot panic `f64::clamp`.
   - `health.rs` — connection health-poll policy: `tick(HealthCfg, TickCtx) -> Tick` decides
     ping-or-skip + the delay until the next tick (exponential `backoff` on consecutive failures,
     longer interval for SSH-tunnelled connections, skip while the window is unfocused / a query is
@@ -20602,7 +20618,8 @@ existing prose was left alone.
     to be compact says so with this metric and never with a literal.
   - `widgets.rs` — reusable widgets: `menu_panel`/`MenuEntry`, `keycap`/`keycap_width` (the one
     keycap, drawn by the palette and the menus alike), `modal_title`/`panel_style`/
-    `menu_item_style`, `window_size`, `autohide`/`shift_hscroll`/`wheel_hscroll` scroll wrappers,
+    `menu_item_style`, `window_size`, `autohide`/`autohide_tracking`/`shift_hscroll`/`wheel_hscroll`
+    scroll wrappers,
     `check_box` — **the app's one checkbox**, drawn by every multi-select list there is (the import
     review list and the dump modal's table picker), so a picker cannot quietly grow a second look;
     it fills and empties **by style, never a rebuild**, which is why its `checked` predicate is
@@ -20733,6 +20750,22 @@ existing prose was left alone.
     `users_view::section`/`detail`/`note`) for the label column and row gap that legitimately differ
     between the two panels. The gap and the label width are `fn() -> f64` and not numbers, for the
     reason every other length here is: one resolved at build freezes at the scale it was built at.
+    Also the right-hand panels' shared list chrome — `panel_search`, `panel_group_header` (a band's
+    title and count; its colour and border rulings are on the function) and **`banded_list`, which
+    makes those bands sticky**: the band under the top edge keeps its header pinned while its rows
+    scroll, and the next header pushes it out as it arrives. It takes `(title, count, rows)` per
+    band and the enclosing scroll's visible rect, which `autohide_tracking` publishes from the
+    scroll's one `on_scroll` (*One `on_scroll` per scroll*). The in-flow headers are measured with
+    `on_resize` rather than computed — rows wrap, so a band is as tall as layout made it — and an
+    unmeasured one stands at an infinite top so it pins nothing; what the geometry means is
+    `core::sticky_header::pinned`'s to decide. The copy is a `dyn_container` keyed on the band index
+    alone, so it is rebuilt only when the pin changes hands and merely restyled while it is pushed.
+    It is drawn as `first`, with its own top rule, because it stands where the first header stands
+    at rest — which is why the **first** header's measured height is the one the push is measured
+    against. **The copy lives inside the scrolled content**, absolutely placed at
+    `inset_top(viewport.y0 + offset)`, not in a layer over the scroll: there the scroll's own clip
+    trims a header being pushed out instead of letting it paint over the search box above, and a
+    wheel over the copy bubbles to the scroll as it does from any row.
     And the **keyboard-navigation cluster**, which is the subject of the Tab gotchas below:
     `FocusRing` (a modal's Tab order — `register`/`unregister`/`step_from`/`remember`/`focus_at`,
     plus the `ring_step` wrap rule and its deliberate opposite `list_step`, which clamps),
@@ -21719,6 +21752,11 @@ existing prose was left alone.
     memo is tracked in the row `dyn_container`'s trigger tuple alongside `visible` and `search` —
     two connections that both have no history yield the same empty `visible`, and without it the
     rows would stay built with the previous engine's lexer.
+    Its TODAY / THIS WEEK / EARLIER bands (`history::group_by_recency`, titled by `bucket.label()`)
+    are laid out by `widgets::banded_list`, so their headers stick while their rows scroll. The
+    `viewport` signal that list reads is created at panel level, outside that `dyn_container`: it
+    belongs to the scroll, which outlives every rebuild of the rows, and the scroll publishes into
+    it through `autohide_tracking`.
     **A row's right-click menu takes the snippet library's route exactly** —
     `menus.close_except(Some(MenuId::Popup))`, `popup_anchor` cleared so the panel opens at the
     pointer, `popup_width` from `menu_panel_width(&entries)`, then the fill — and the width is
@@ -22117,7 +22155,10 @@ existing prose was left alone.
     could find the thing they had just saved. Widening it afterwards is one click in *Show in*. The
     scroll goes through a `scroll_to` signal **cleared on the next tick**: a `Some` left standing
     re-scrolls on every later layout pass, which is the sticky-`scroll_to` trap that also shaped the
-    grid's tail-follow.
+    grid's tail-follow. That same scroll is wrapped in `autohide_tracking` rather than `autohide`,
+    because the scope bands are laid out by `widgets::banded_list` and their headers stick, as the
+    history panel's do — the bands are titled by `group_title`, the one part of them that is this
+    panel's own, and the `viewport` they read is panel-level for the reason given there.
     Naming that new snippet is inline (an `edit_field` in place of the name), matching the tab
     rename, because there is no text-prompt modal here and naming a saved query is the same kind of
     act. That is the **only** inline edit: the name and the abbrev both used to have menu entries
@@ -33307,6 +33348,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   manifest (the keyring there is the other zbus user — see `schemaic-conn`).
 - **One `on_scroll` per scroll** — setting it twice clobbers. `autohide` sets its own; a scroll
   needing custom `on_scroll` must inline `autohide_state()` (results grid + AI convo).
+  `autohide_tracking` is `autohide` plus publishing the visible rect into a signal, from the same
+  handler, for a list that draws against its scroll position (`banded_list`'s sticky header) — one
+  wrapper rather than a second `on_scroll` chained after `autohide`'s, which would replace it.
 - **No `opacity` property.** Fade via color alpha (`multiply_alpha`) + `.transition_*`. Toggle
   visibility with `.hide()`/`.flex()` (display none/flex).
 - **Inherited color doesn't animate to a child.** A parent's `.transition_color()` won't fade a

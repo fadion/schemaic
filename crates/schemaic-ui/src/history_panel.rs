@@ -23,7 +23,7 @@ use crate::consts::SEARCH_DEBOUNCE_MS;
 use crate::theme::{font_body, font_label};
 use crate::tooltip::TooltipExt;
 use crate::widgets::{
-    MenuEntry, autohide, debounced, highlight_sql_mono, highlight_text, menu_panel_width,
+    MenuEntry, autohide_tracking, debounced, highlight_sql_mono, highlight_text, menu_panel_width,
     section_title, toolbar_icon,
 };
 use crate::{ConnUi, HistoryActions, HistoryUi, OverlayUi, db_color_dot, icons, theme};
@@ -103,6 +103,9 @@ pub(crate) fn history_panel(
     // changes `visible` as well, but two connections with no history between them
     // both yield an empty list, and the memo would hold the rows at the previous
     // engine's lexer.
+    //
+    // `viewport` outlives the rebuilds: it belongs to the scroll, which stays.
+    let viewport: RwSignal<floem::kurbo::Rect> = RwSignal::new(floem::kurbo::Rect::ZERO);
     let list = dyn_container(
         move || (visible.get(), search.get(), dialect.get()),
         move |(rows, q, dialect)| {
@@ -129,44 +132,37 @@ pub(crate) fn history_panel(
                 let t = q.trim();
                 (!t.is_empty()).then(|| t.to_string())
             };
-            // Grouped by when they ran, each group under its own header. The
-            // headers scroll with the list rather than sticking: this list is a
-            // few dozen rows, and a sticky header would need its own layer over
-            // a scroll that already owns one for its autohiding bar.
-            let items = history::group_by_recency(rows, now)
+            // Grouped by when they ran, each group under its own header, which
+            // sticks while its group scrolls (`widgets::banded_list`).
+            let bands = history::group_by_recency(rows, now)
                 .into_iter()
-                .enumerate()
-                .flat_map(|(gi, (bucket, group))| {
-                    let header = group_header(bucket, group.len(), gi == 0);
-                    let (oh, om, term) = (oh.clone(), om.clone(), term.clone());
-                    std::iter::once(header).chain(
-                        group
-                            .into_iter()
-                            .map(move |e| {
-                                history_row(
-                                    e,
-                                    now,
-                                    oh.clone(),
-                                    om.clone(),
-                                    db_colors,
-                                    term.clone(),
-                                    dialect,
-                                )
-                                .into_any()
-                            })
-                            .collect::<Vec<_>>(),
-                    )
+                .map(|(bucket, group)| {
+                    let count = group.len();
+                    let rows = group
+                        .into_iter()
+                        .map(|e| {
+                            history_row(
+                                e,
+                                now,
+                                oh.clone(),
+                                om.clone(),
+                                db_colors,
+                                term.clone(),
+                                dialect,
+                            )
+                            .into_any()
+                        })
+                        .collect::<Vec<_>>();
+                    (bucket.label().to_string(), count, rows)
                 })
                 .collect::<Vec<_>>();
-            v_stack_from_iter(items)
-                .style(|s| s.flex_col().width_full())
-                .into_any()
+            crate::widgets::banded_list(bands, viewport)
         },
     )
     .style(|s| s.flex_col().width_full());
 
-    let scrolled =
-        autohide(scroll(list)).style(|s| s.flex_grow(1.0_f32).width_full().min_height(0.0));
+    let scrolled = autohide_tracking(scroll(list), viewport)
+        .style(|s| s.flex_grow(1.0_f32).width_full().min_height(0.0));
 
     // Title row: "QUERY HISTORY" left; a trash-2 (clear) right.
     //
@@ -237,15 +233,6 @@ pub(crate) fn history_panel(
 // only part of it that is this panel's.
 fn history_search(filter: RwSignal<String>) -> impl IntoView {
     crate::widgets::panel_search(filter)
-}
-
-/// A recency group's header — `TODAY` and how many ran in it.
-///
-/// The band itself is `widgets::panel_group_header`, shared with the snippet
-/// panel, which is where the design rulings behind it are written down. What is
-/// this panel's own is only the naming: [`history::Bucket::label`].
-fn group_header(bucket: history::Bucket, count: usize, first: bool) -> floem::AnyView {
-    crate::widgets::panel_group_header(bucket.label().to_string(), count, first)
 }
 
 /// A history row's right-click menu: what the single click already does, and the

@@ -65,6 +65,7 @@ pub mod sql;
 pub mod sqlfile;
 pub mod sqlfmt;
 pub mod stats;
+pub mod sticky_header;
 pub mod summary;
 pub mod tabsel;
 pub mod text;
