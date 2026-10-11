@@ -3726,9 +3726,19 @@ fn highlighted_primary(primary: &str, term: &Option<String>, live: bool) -> AnyV
             c.multiply_alpha(ROW_DEAD_ALPHA)
         }
     };
+    // The text either side of the match may shrink to a `…`, and so may the
+    // whole: an option's label can be a statement the width of a script (Go to
+    // Statement), and a row that cannot shrink ran past the palette's edge. The
+    // match itself never shrinks — shrinking all three alike collapsed a hit
+    // deep in a statement to `c…`, which hid the one part the row is showing.
     let seg = move |t: &str, hit: bool| {
         text(t.to_string()).style(move |s| {
             let s = s.font_size(theme::scaled_font(14.0));
+            let s = if hit {
+                s.flex_shrink(0.0_f32)
+            } else {
+                s.min_width(0.0).text_ellipsis()
+            };
             if hit {
                 s.color(fade(theme::match_highlight())).font_bold()
             } else {
@@ -3747,7 +3757,7 @@ fn highlighted_primary(primary: &str, term: &Option<String>, live: bool) -> AnyV
             seg(&primary[start..end], true),
             seg(&primary[end..], false),
         ))
-        .style(|s| s.flex_row().items_center())
+        .style(|s| s.flex_row().items_center().min_width(0.0))
         .into_any(),
         None => seg(primary, false).into_any(),
     }
@@ -5135,10 +5145,17 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
                         // default, tighter line box floated it ~4px too high). The
                         // placeholder colour keeps it a subtle hint, not competing
                         // with the typed text.
+                        //
+                        // Ends in a `…` at the field's inner edge: a completion
+                        // can be a whole statement (Go to Statement), and an
+                        // unbounded ghost ran past the field and the palette.
                         .style(|s| {
                             s.color(theme::placeholder())
                                 .font_size(theme::scaled_font(16.0))
                                 .line_height(1.46)
+                                .min_width(0.0)
+                                .max_width_full()
+                                .text_ellipsis()
                         })
                         .into_any(),
                     None => empty().into_any(),
@@ -5152,7 +5169,10 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
                 // laid the ghost suffix on top of the query instead of after it.
                 let x =
                     1.0 + chat_pad_h() + measure_text_px_at(&query.get(), crate::palette_font());
-                s.absolute().inset_left(x).inset_top(1.0 + chat_pad_v())
+                s.absolute()
+                    .inset_left(x)
+                    .inset_right(1.0 + chat_pad_h())
+                    .inset_top(1.0 + chat_pad_v())
             })
             .pointer_events(|| false);
             let input = stack((field, ghost)).style(|s| s.width_full());

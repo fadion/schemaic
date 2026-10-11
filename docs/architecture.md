@@ -25123,6 +25123,11 @@ existing prose was left alone.
     *Go to Line* uses. A long script's `CREATE`s, temp tables and `WITH`s are found by typing part
     of what they say; the options filter also matches the value, the offset, so a typed number can
     match a statement by its byte position as well as its line.
+    **A label that long is why the palette truncates.** A row's text either side of the match
+    shrinks to a `…` while the match itself does not (`highlighted_primary`; shrinking all three
+    alike collapsed a hit deep in a statement to `c…`), and the field's grey completion ghost is
+    bounded at the field's inner edge with `inset_right` and ends in a `…` too — both used to run
+    past the palette. Text Tab writes into the field is the field's own and scrolls there.
     **The error modal wears `modal_title("Error", …)` and its ✕**, where it used to have neither a
     title row nor a close button and only click-away and Escape closed it. All three exits run the
     one `close`, which is also what clears `error_modal_text` so the editor bar's next *View* falls

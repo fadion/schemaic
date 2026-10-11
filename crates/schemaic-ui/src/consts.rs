@@ -1370,6 +1370,12 @@ mod float_inset_gate {
             "a hairline border offset added to a scaled padding — the scaling \
              term is there, and a 1px rule is 1px at every scale",
         ),
+        (
+            "overlays.rs",
+            "inset_right(1.0 + chat_pad_h())",
+            "the same ghost's right edge: the field's border and padding, so a \
+             long completion ends in a `…` inside the field rather than past it",
+        ),
     ];
 
     fn src_dir() -> PathBuf {
