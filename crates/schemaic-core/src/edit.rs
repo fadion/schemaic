@@ -1992,15 +1992,20 @@ pub fn attach_span(r0: usize, r1: usize, cap: usize) -> (usize, usize) {
 /// and hidden columns ([`ColLayout::scrolling`]), and a second spelling of the
 /// order is a second chance to disagree with it.
 ///
+/// **Several columns may be frozen**: they are drawn first in *index* order,
+/// whatever order they were frozen in, then the rest. `frozen` is any
+/// iterable of indices — an `Option<usize>` is the one-column case.
+///
 /// A `frozen` index at or past `ncols` is ignored — it cannot be drawn, so it
 /// does not move anything.
-pub fn visual_cols(ncols: usize, frozen: Option<usize>) -> Vec<usize> {
-    match frozen.filter(|f| *f < ncols) {
-        Some(f) => std::iter::once(f)
-            .chain((0..ncols).filter(move |c| *c != f))
-            .collect(),
-        None => (0..ncols).collect(),
-    }
+pub fn visual_cols(ncols: usize, frozen: impl IntoIterator<Item = usize>) -> Vec<usize> {
+    let pinned: std::collections::BTreeSet<usize> =
+        frozen.into_iter().filter(|f| *f < ncols).collect();
+    pinned
+        .iter()
+        .copied()
+        .chain((0..ncols).filter(|c| !pinned.contains(c)))
+        .collect()
 }
 
 /// **Which of the grid's columns are drawn, and in what order**: the frozen
@@ -2023,8 +2028,8 @@ pub fn visual_cols(ncols: usize, frozen: Option<usize>) -> Vec<usize> {
 /// every caller that predates hiding still passes.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ColLayout {
-    /// The frozen column's absolute index, if any.
-    pub frozen: Option<usize>,
+    /// Absolute indices of the frozen columns — drawn first, in index order.
+    pub frozen: std::collections::BTreeSet<usize>,
     /// Absolute indices of the columns not drawn.
     pub hidden: std::collections::BTreeSet<usize>,
 }
@@ -2032,7 +2037,7 @@ pub struct ColLayout {
 impl From<Option<usize>> for ColLayout {
     fn from(frozen: Option<usize>) -> ColLayout {
         ColLayout {
-            frozen,
+            frozen: frozen.into_iter().collect(),
             hidden: Default::default(),
         }
     }
@@ -2044,9 +2049,19 @@ impl ColLayout {
         self.hidden.contains(&ci)
     }
 
-    /// The frozen column as drawn: none when it is hidden or past the result.
-    pub fn frozen_drawn(&self, ncols: usize) -> Option<usize> {
-        self.frozen.filter(|&f| f < ncols && !self.is_hidden(f))
+    /// Is column `ci` frozen?
+    pub fn is_frozen(&self, ci: usize) -> bool {
+        self.frozen.contains(&ci)
+    }
+
+    /// The frozen columns as drawn, in index order: none that is hidden or
+    /// past the result.
+    pub fn frozen_drawn(&self, ncols: usize) -> Vec<usize> {
+        self.frozen
+            .iter()
+            .copied()
+            .filter(|&f| f < ncols && !self.is_hidden(f))
+            .collect()
     }
 
     /// The drawn columns in the order they are drawn — [`visual_cols`] with the
@@ -2071,14 +2086,13 @@ impl ColLayout {
         self.hidden.iter().filter(|&&ci| ci < ncols).count()
     }
 
-    /// The scrolling pane's columns: every drawn column but the frozen one, in
-    /// index order. The grid lays these out beside the frozen pane, and
+    /// The scrolling pane's columns: every drawn column but the frozen ones,
+    /// in index order. The grid lays these out beside the frozen pane, and
     /// scroll-into-view sums their widths — one list, so the two agree.
     pub fn scrolling(&self, ncols: usize) -> Vec<usize> {
-        let frozen = self.frozen_drawn(ncols);
         self.shown(ncols)
             .into_iter()
-            .filter(|&ci| Some(ci) != frozen)
+            .filter(|ci| !self.is_frozen(*ci))
             .collect()
     }
 
@@ -2164,9 +2178,7 @@ impl ColLayout {
         if !self.may_hide(ci, ncols) {
             return false;
         }
-        if self.frozen == Some(ci) {
-            self.frozen = None;
-        }
+        self.frozen.remove(&ci);
         self.hidden.insert(ci);
         let shown = self.shown(ncols);
         for (_, c) in corners.iter_mut().flatten() {
@@ -5960,11 +5972,41 @@ mod tests {
         assert_eq!(visual_cols(0, Some(0)), Vec::<usize>::new());
     }
 
+    /// **Several columns frozen**: each one the user froze, drawn first in
+    /// index order whatever order they were frozen in, then the rest in index
+    /// order — one frozen column is the case it generalises, unchanged. The
+    /// scrolling pane is every drawn column but those, and hiding one of
+    /// them unfreezes that one alone.
+    #[test]
+    fn several_frozen_columns_are_drawn_first_in_index_order() {
+        assert_eq!(visual_cols(6, [4, 1]), vec![1, 4, 0, 2, 3, 5]);
+        assert_eq!(visual_cols(4, [0, 1]), vec![0, 1, 2, 3]);
+        assert_eq!(
+            visual_cols(3, [2, 9]),
+            vec![2, 0, 1],
+            "past the result moves nothing"
+        );
+        let mut l = ColLayout {
+            frozen: [4, 1].into_iter().collect(),
+            hidden: [2].into_iter().collect(),
+        };
+        assert_eq!(l.frozen_drawn(6), vec![1, 4]);
+        assert_eq!(l.visual_cols(6), vec![1, 4, 0, 3, 5]);
+        assert_eq!(l.scrolling(6), vec![0, 3, 5]);
+        assert!(l.hide(4, 6, &mut []));
+        assert_eq!(
+            l.frozen_drawn(6),
+            vec![1],
+            "hiding unfreezes that column only"
+        );
+        assert_eq!(l.visual_cols(6), vec![1, 0, 3, 5]);
+    }
+
     // ── Hidden columns: what is drawn at all ─────────────────────────────────
 
     fn hiding(frozen: Option<usize>, hidden: &[usize]) -> ColLayout {
         ColLayout {
-            frozen,
+            frozen: frozen.into_iter().collect(),
             hidden: hidden.iter().copied().collect(),
         }
     }
@@ -5976,8 +6018,8 @@ mod tests {
         assert_eq!(hiding(None, &[1, 3]).visual_cols(5), vec![0, 2, 4]);
         assert_eq!(hiding(Some(3), &[1]).visual_cols(5), vec![3, 0, 2, 4]);
         assert_eq!(hiding(Some(3), &[3]).visual_cols(5), vec![0, 1, 2, 4]);
-        assert_eq!(hiding(Some(3), &[3]).frozen_drawn(5), None);
-        assert_eq!(hiding(Some(3), &[1]).frozen_drawn(5), Some(3));
+        assert_eq!(hiding(Some(3), &[3]).frozen_drawn(5), Vec::<usize>::new());
+        assert_eq!(hiding(Some(3), &[1]).frozen_drawn(5), vec![3]);
         // A hidden index the result does not have hides nothing, and is not
         // counted as hidden either.
         assert_eq!(hiding(None, &[9]).visual_cols(3), vec![0, 1, 2]);
@@ -6036,9 +6078,7 @@ mod tests {
             hiding(Some(0), &[]),
         ] {
             let mut drawn = l.visual_cols(5);
-            if l.frozen_drawn(5).is_some() {
-                drawn.remove(0);
-            }
+            drawn.drain(..l.frozen_drawn(5).len());
             assert_eq!(l.scrolling(5), drawn, "{l:?}");
         }
         assert_eq!(hiding(Some(3), &[1]).scrolling(5), vec![0, 2, 4]);
@@ -6122,7 +6162,7 @@ mod tests {
         let mut l = hiding(Some(1), &[]);
         let mut corners = [Some((4, 1)), Some((0, 0)), None];
         assert!(l.hide(1, 3, &mut corners));
-        assert_eq!(l.frozen, None);
+        assert!(l.frozen.is_empty());
         assert!(l.is_hidden(1));
         assert_eq!(corners, [Some((4, 2)), Some((0, 0)), None]);
         let mut edge = [Some((2, 2))];

@@ -3437,7 +3437,7 @@ mod tests {
     #[test]
     fn a_row_gesture_spans_only_the_drawn_columns() {
         let hiding = |hidden: &[usize]| crate::edit::ColLayout {
-            frozen: None,
+            frozen: Default::default(),
             hidden: hidden.iter().copied().collect(),
         };
         assert_eq!(row_selection(4, hiding(&[0]).edges(5)), ((4, 1), (4, 4)));

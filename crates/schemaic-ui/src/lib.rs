@@ -3264,15 +3264,16 @@ pub struct PanelView {
     pub widths_at: RwSignal<f64>,
     /// The client-side sort: `(column, ascending)`.
     pub sort: RwSignal<Option<(usize, bool)>>,
-    /// The frozen (pinned-left) column's absolute index.
+    /// The frozen (pinned-left) columns' absolute indices.
     ///
-    /// **`frozen_col`, not `frozen`.** A *frozen column* and a *frozen result*
-    /// are different things one field apart here — `gctx.panel.frozen_col` is an
-    /// index, `gctx.panel_frozen` is whether the result is pinned — and the two
-    /// spelled the same way is a wrong-variable bug waiting for the next reader.
-    pub frozen_col: RwSignal<Option<usize>>,
+    /// **`frozen_cols`, not `frozen`.** A *frozen column* and a *frozen
+    /// result* are different things one field apart here —
+    /// `gctx.panel.frozen_cols` is a set of indices, `gctx.panel_frozen` is
+    /// whether the result is pinned — and the two spelled the same way is a
+    /// wrong-variable bug waiting for the next reader.
+    pub frozen_cols: RwSignal<std::collections::BTreeSet<usize>>,
     /// The columns hidden from the grid, by absolute index — the panel's for
-    /// `frozen_col`'s reason: it is about this result's columns.
+    /// `frozen_cols`' reason: it is about this result's columns.
     pub hidden_cols: RwSignal<std::collections::BTreeSet<usize>>,
     /// Staged cell edits: `(data row, column) → the new value`, uncommitted.
     pub dirty: RwSignal<schemaic_core::edit::DirtyCells>,
@@ -3298,7 +3299,7 @@ impl PanelView {
             widths: cx.create_rw_signal(None),
             widths_at: cx.create_rw_signal(0.0),
             sort: cx.create_rw_signal(None),
-            frozen_col: cx.create_rw_signal(None),
+            frozen_cols: cx.create_rw_signal(Default::default()),
             hidden_cols: cx.create_rw_signal(Default::default()),
             dirty: cx.create_rw_signal(Default::default()),
             new_rows: cx.create_rw_signal(Vec::new()),
@@ -14300,7 +14301,7 @@ mod result_panel_tab_tests {
     /// `RwSignal::new`, so they belonged to *that* scope and came back empty.
     /// One level up, `PanelView` is created in the panel's own scope, which
     /// survives every such swap, and its doc is the codebase's explicit
-    /// survivor list — widths, `widths_at`, sort, `frozen_col` — going out of
+    /// survivor list — widths, `widths_at`, sort, `frozen_cols` — going out of
     /// its way to say what is excluded and why. Staged edits were in neither
     /// list and no comment anywhere recorded excluding them.
     ///

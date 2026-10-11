@@ -272,9 +272,10 @@ struct GridState {
     widths_at: RwSignal<f64>,
     active: RwSignal<Option<(usize, usize)>>,
     anchor: RwSignal<Option<(usize, usize)>>,
-    /// The frozen column: its *absolute* index, pinned to the left of the grid
-    /// (`None` = nothing frozen). Set from the header right-click menu.
-    frozen: RwSignal<Option<usize>>,
+    /// The frozen columns: their *absolute* indices, pinned to the left of the
+    /// grid in index order (empty = nothing frozen). Each added or removed from
+    /// the header right-click menu.
+    frozen: RwSignal<std::collections::BTreeSet<usize>>,
     /// Columns the user has hidden, by *absolute* index. Set from the header
     /// right-click menu; the panel's, like `frozen`. Read through
     /// [`GridState::layout_untracked`], which is what every reader of draw
@@ -687,7 +688,11 @@ impl GridState {
             widths_at: RwSignal::new(widths_at),
             active: RwSignal::new(None),
             anchor: RwSignal::new(None),
-            frozen: RwSignal::new(gctx.panel.and_then(|p| p.frozen_col.get_untracked())),
+            frozen: RwSignal::new(
+                gctx.panel
+                    .map(|p| p.frozen_cols.get_untracked())
+                    .unwrap_or_default(),
+            ),
             hidden: RwSignal::new(
                 gctx.panel
                     .map(|p| p.hidden_cols.get_untracked())
@@ -2347,7 +2352,7 @@ pub(crate) struct CommittedStaging {
 /// one answer.
 fn body_rebuild_key<T: 'static>(
     sort: RwSignal<SortState>,
-    frozen: RwSignal<Option<usize>>,
+    frozen: RwSignal<std::collections::BTreeSet<usize>>,
     hidden: RwSignal<std::collections::BTreeSet<usize>>,
     new_rows: RwSignal<Vec<T>>,
     key_gen: RwSignal<u64>,
@@ -4833,7 +4838,7 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
     if let Some(pv) = gctx.panel {
         create_effect(move |_| pv.widths.set(Some(gs.widths.get())));
         create_effect(move |_| pv.widths_at.set(gs.widths_at.get()));
-        create_effect(move |_| pv.frozen_col.set(gs.frozen.get()));
+        create_effect(move |_| pv.frozen_cols.set(gs.frozen.get()));
         create_effect(move |_| pv.hidden_cols.set(gs.hidden.get()));
         create_effect(move |_| pv.sort.set(sort.get()));
     }
@@ -4862,8 +4867,8 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
     // Header + body rebuild together on a sort change OR a change of the column
     // layout — a freeze toggle or a column hidden or shown, which all repartition
     // the columns between the frozen pane and the scrolling pane.
-    // Layout is two panes side by side: a frozen pane (row-number gutter + an
-    // optional frozen first column) and a horizontally-scrolling data pane. Both
+    // Layout is two panes side by side: a frozen pane (row-number gutter + the
+    // frozen columns, if any) and a horizontally-scrolling data pane. Both
     // panes are vertical scrolls kept in lockstep through `gs.scroll_to` (the
     // shared offset — data pane also owns the horizontal `h_off`).
     // The body rebuilds on every sort/layout/new-row change, so the ring is cloned
@@ -4879,11 +4884,11 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
             let rs = gs.rs.get_untracked();
             // Total displayed rows = real rows + pending new rows (rendered below).
             let total = nrows + new_len;
-            // The frozen column (if any, and not hidden), clamped to the valid
-            // range. The data pane renders every *other* drawn column, in order —
-            // cells keep their absolute `ci`, so selection/sort/resize stay
+            // The frozen columns (not hidden, within the result), in index
+            // order. The data pane renders every *other* drawn column, in order
+            // — cells keep their absolute `ci`, so selection/sort/resize stay
             // consistent. Both from `ColLayout`, which copy and paste ask too.
-            let frozen_col = layout.frozen_drawn(ncols);
+            let frozen_cols: Arc<Vec<usize>> = Arc::new(layout.frozen_drawn(ncols));
             let data_cols: Arc<Vec<usize>> = Arc::new(layout.scrolling(ncols));
             let order = Arc::new(compute_order(&rs, sort_val));
             gs.order.set(order.clone());
@@ -4970,7 +4975,7 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
                     .background(theme::bg_header_row())
             });
             let mut fhead: Vec<AnyView> = vec![gutter_header.into_any()];
-            if let Some(fc) = frozen_col {
+            for &fc in frozen_cols.iter() {
                 fhead.push(header_cell(gs, fc, sort_val, sort, key_map.get_untracked()).into_any());
             }
             let frozen_header = h_stack_from_iter(fhead).style(|s| {
@@ -5048,6 +5053,7 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
             // ── Bodies ──
             let (grid_shown, grid_poke) = autohide_state();
             let order_f = order.clone();
+            let frozen_f = frozen_cols.clone();
             let frozen_body = scroll(
                 virtual_stack(
                     VirtualDirection::Vertical,
@@ -5056,9 +5062,9 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
                     |i| *i,
                     move |i| {
                         if i < nrows {
-                            frozen_row(gs, i, order_f[i], frozen_col, ncols, None)
+                            frozen_row(gs, i, order_f[i], frozen_f.clone(), ncols, None)
                         } else {
-                            frozen_row(gs, i, 0, frozen_col, ncols, Some(i - nrows))
+                            frozen_row(gs, i, 0, frozen_f.clone(), ncols, Some(i - nrows))
                         }
                     },
                 )
@@ -5092,10 +5098,12 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
             .scroll_style(|s| s.hide_bars(true))
             .style(move |s| {
                 let w = gutter_w()
-                    + match frozen_col {
-                        Some(fc) => gs.widths.with(|w| w.get(fc).copied().unwrap_or(0.0)),
-                        None => 0.0,
-                    };
+                    + gs.widths.with(|w| {
+                        frozen_cols
+                            .iter()
+                            .map(|&fc| w.get(fc).copied().unwrap_or(0.0))
+                            .sum::<f64>()
+                    });
                 s.width(w)
                     .flex_shrink(0.0_f32)
                     .min_height(0.0)
@@ -5328,7 +5336,7 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
         gs.new_rows.track();
         // Tracked: hiding an edge column turns a row's span into a range.
         let shown = ColLayout {
-            frozen: None,
+            frozen: Default::default(),
             hidden: gs.hidden.get(),
         }
         .shown(ncols);
@@ -9946,17 +9954,17 @@ fn zebra_bg(s: floem::style::Style, pos: usize) -> floem::style::Style {
     }
 }
 
-/// Frozen-pane row: the gutter + (optionally) the frozen column.
+/// Frozen-pane row: the gutter + the frozen columns, in index order.
 fn frozen_row(
     gs: GridState,
     pos: usize,
     data_idx: usize,
-    frozen_col: Option<usize>,
+    frozen_cols: Arc<Vec<usize>>,
     ncols: usize,
     pending: Option<usize>,
 ) -> impl IntoView {
     let mut children: Vec<AnyView> = vec![gutter_cell(gs, pos, ncols, pending).into_any()];
-    if let Some(fc) = frozen_col {
+    for &fc in frozen_cols.iter() {
         children.push(cell_at(gs, pos, data_idx, fc, pending).into_any());
     }
     h_stack_from_iter(children).style(move |s| {
@@ -9970,7 +9978,7 @@ fn frozen_row(
     })
 }
 
-/// Data-pane row: cells for `cols` (every column except the frozen one, in order).
+/// Data-pane row: cells for `cols` (every drawn column but the frozen ones, in order).
 fn data_row(
     gs: GridState,
     pos: usize,
@@ -10249,10 +10257,20 @@ fn header_cell(
         // Right-click → Freeze this column (pin left) · Copy its name or values.
         .on_secondary_click_stop(move |_| {
             gs.dismiss_overlays();
-            let freeze_item = if gs.frozen.get_untracked() == Some(ci) {
-                MenuEntry::action("Unfreeze", move || gs.frozen.set(None))
+            // Each column freezes on its own and joins the ones already
+            // frozen; they are drawn first, in index order (`ColLayout`).
+            let freeze_item = if gs.frozen.with_untracked(|f| f.contains(&ci)) {
+                MenuEntry::action("Unfreeze", move || {
+                    gs.frozen.update(|f| {
+                        f.remove(&ci);
+                    })
+                })
             } else {
-                MenuEntry::action("Freeze", move || gs.frozen.set(Some(ci)))
+                MenuEntry::action("Freeze", move || {
+                    gs.frozen.update(|f| {
+                        f.insert(ci);
+                    })
+                })
             };
             // "AI summary" for the whole column: what is this field *for*? The
             // prompt carries a sample of the loaded values, which usually settles
@@ -12540,7 +12558,7 @@ mod body_key_tests {
     fn filling_a_pending_row_cell_by_cell_rebuilds_nothing() {
         let scope = Scope::new();
         let sort: RwSignal<SortState> = scope.create_rw_signal(Some((2, true)));
-        let frozen = scope.create_rw_signal(Some(0usize));
+        let frozen = scope.create_rw_signal(std::collections::BTreeSet::from([0usize]));
         // One pending row, whose contents are patched in place.
         let new_rows: RwSignal<Vec<Vec<u8>>> = scope.create_rw_signal(vec![Vec::new()]);
         let key_gen = scope.create_rw_signal(0u64);
@@ -12560,7 +12578,7 @@ mod body_key_tests {
 
         // A write that lands on the value already there is not news either.
         sort.set(Some((2, true)));
-        frozen.set(Some(0));
+        frozen.set(std::collections::BTreeSet::from([0]));
         assert_eq!(runs.get(), 1, "a no-op sort/freeze write rebuilt the grid");
 
         // **And the same key spelled the way it was.** `dyn_container` takes a
@@ -12602,7 +12620,7 @@ mod body_key_tests {
     fn a_key_map_arriving_after_the_result_rebuilds_the_body() {
         let scope = Scope::new();
         let sort: RwSignal<SortState> = scope.create_rw_signal(None);
-        let frozen = scope.create_rw_signal(None);
+        let frozen = scope.create_rw_signal(std::collections::BTreeSet::new());
         let new_rows: RwSignal<Vec<Vec<u8>>> = scope.create_rw_signal(Vec::new());
         let key_gen = scope.create_rw_signal(0u64);
         let hidden = scope.create_rw_signal(std::collections::BTreeSet::new());
@@ -12625,7 +12643,7 @@ mod body_key_tests {
     fn adding_a_row_or_changing_the_sort_still_rebuilds() {
         let scope = Scope::new();
         let sort: RwSignal<SortState> = scope.create_rw_signal(None);
-        let frozen = scope.create_rw_signal(None);
+        let frozen = scope.create_rw_signal(std::collections::BTreeSet::new());
         let new_rows: RwSignal<Vec<Vec<u8>>> = scope.create_rw_signal(Vec::new());
         let key_gen = scope.create_rw_signal(0u64);
         let hidden = scope.create_rw_signal(std::collections::BTreeSet::new());
@@ -12636,7 +12654,9 @@ mod body_key_tests {
         assert_eq!(runs.get(), 2, "adding a pending row must rebuild");
         sort.set(Some((1, false))); // a header click
         assert_eq!(runs.get(), 3, "a sort change must rebuild");
-        frozen.set(Some(0)); // freeze the first column
+        frozen.update(|f| {
+            f.insert(0);
+        }); // freeze the first column
         assert_eq!(runs.get(), 4, "a freeze toggle must rebuild");
         new_rows.update(|v| {
             v.pop();
@@ -14340,7 +14360,7 @@ mod row_selection_tests {
     #[test]
     fn a_row_gesture_over_hidden_edges_reads_as_a_row_selection() {
         let layout = ColLayout {
-            frozen: None,
+            frozen: Default::default(),
             hidden: [0, 4].into_iter().collect(),
         };
         let shown = layout.shown(5);
@@ -14403,7 +14423,7 @@ mod selection_kind_tests {
     #[test]
     fn the_attach_label_counts_only_the_drawn_columns() {
         let hidden = ColLayout {
-            frozen: None,
+            frozen: Default::default(),
             hidden: [3].into_iter().collect(),
         };
         let none = ColLayout::default();

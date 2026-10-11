@@ -3817,7 +3817,14 @@ existing prose was left alone.
     `rowid` is likewise out of reach — it is asserted by the backend on a returned column, not by
     the schema.
     **`visual_cols(ncols, frozen)` is the one definition of the order the grid draws columns in** —
-    the frozen column, then every other column in index order. A frozen column keeps its *absolute*
+    the frozen columns, then every other column in index order. **Several may be frozen**, and they
+    are drawn first in *index* order whatever order they were frozen in; `frozen` is any iterable of
+    indices, an `Option<usize>` being the one-column case, so every caller from before there could be
+    several is unchanged (`several_frozen_columns_are_drawn_first_in_index_order`). It is a set
+    rather than Excel's "freeze through this column" because Freeze was already offered on any
+    column — column 3 alone, drawn first — and a through-column reading would have changed what that
+    one gesture meant; a set keeps it and makes a second freeze its generalisation. A frozen column
+    keeps its *absolute*
     index on purpose, so selection, sort and resize stay consistent, which means draw order and index
     order disagree the moment `frozen` is `Some(f)` with `f > 0`. That is fine for a rectangle's
     *membership* and wrong for everything about adjacency or reading order: `plan_paste` extends a
@@ -3830,22 +3837,22 @@ existing prose was left alone.
     second chance to disagree with it. The **single-value** paste is not
     an exception: it fills the *selection*, which is the set of cells already painted highlighted, so
     no translation applies. **What this deliberately does not fix**: a selection whose absolute range
-    straddles the frozen column is visually discontiguous, so copy→paste of such a selection no
+    straddles a frozen column is visually discontiguous, so copy→paste of such a selection no
     longer round-trips. The ambiguity is in the selection model, not in either surface, and both now
     agree with what is drawn rather than with each other.
-    **`ColLayout` is that order once columns can be hidden** — the frozen column plus a `BTreeSet`
-    of hidden indices — and hiding is the stronger of the two reasons draw and index order part: a
+    **`ColLayout` is that order once columns can be hidden** — the frozen and the hidden columns,
+    each a `BTreeSet` of absolute indices (`is_frozen`, `is_hidden`) — and hiding is the stronger of the two reasons draw and index order part: a
     frozen column only moves, a hidden one is not there. Every surface above takes
     `layout: impl Into<ColLayout>` where it took `frozen`, and `From<Option<usize>>` makes a frozen
     column alone a layout, so every caller and test that predates hiding still passes `Some(n)` or
     `None`. It answers four different lists, and they differ on purpose: `visual_cols` is the free
     function's order less the hidden — what copy, attach and a block paste walk; `shown` is the drawn
     columns in **index** order — what the arrow keys step through; `scrolling` is `shown` less the
-    drawn frozen column — the data pane's columns and what scroll-into-view sums widths over, equal
-    to `visual_cols` less its head under a freeze
-    (`the_scrolling_pane_is_the_draw_order_less_the_frozen_column`); and `frozen_drawn` is `None`
-    for a frozen column that is hidden, which is not drawn first but not drawn at all
-    (`a_hidden_column_leaves_the_draw_order`). `selected_cols` keeps the absolute range as
+    frozen columns — the data pane's columns and what scroll-into-view sums widths over, equal
+    to `visual_cols` less its frozen head
+    (`the_scrolling_pane_is_the_draw_order_less_the_frozen_column`); and `frozen_drawn` is the frozen
+    columns the frozen pane draws, in index order, leaving out one that is hidden — not drawn first
+    but not drawn at all (`a_hidden_column_leaves_the_draw_order`) — or past the result. `selected_cols` keeps the absolute range as
     membership and subtracts the hidden, since the grid paints a hidden column inside the range not
     at all (`a_copy_across_a_hidden_column_leaves_it_out`). A block paste extends across a hidden
     column to the next drawn one, and the single-value fill skips it, its span taken from the columns
@@ -3867,7 +3874,7 @@ existing prose was left alone.
     dropped every value (`a_block_paste_onto_a_gutter_selected_row_lands_past_a_hidden_first_column`),
     and Enter opened an editor the data pane never built. With nothing drawn it is `(0, ncols - 1)`,
     saturating (`the_edges_are_the_first_and_last_drawn_columns`). `hide` is the hide itself — the
-    unfreeze and the corner move described under *Data grid*, through a private `nearest_shown` that
+    unfreeze, of that column alone, and the corner move described under *Data grid*, through a private `nearest_shown` that
     used to live in the grid (`hiding_a_column_unfreezes_it_and_moves_the_corners_off_it`,
     `a_corner_on_a_hidden_column_moves_to_the_nearest_shown`). **What hiding deliberately does not
     reach**: the whole-result exports, `exported` and `insert_blocks_all`. They are about the result,
@@ -36553,8 +36560,8 @@ its × would be, and "Close all" spares the pins — the query strip's rules, re
   `Tab::shown_frozen` is the untracked half of the pair, for callers acting *now* inside an event
   handler; anything answering the question while a grid is mounted takes the memo.
 - **What a panel remembers.** `PanelView` — column widths (with the `grid_char_w` they were measured
-  against), the client-side sort, the frozen column, the hidden columns (`hidden_cols`, an index set,
-  the panel's for the frozen column's reason), and the **staged-edit trio** `dirty` /
+  against), the client-side sort, the frozen columns, the hidden columns (`hidden_cols`, an index set,
+  the panel's for the frozen columns' reason), and the **staged-edit trio** `dirty` /
   `new_rows` / `del_rows` — as **signals in the panel's own child scope**, not fields in the panel
   list: the grid writes a width on every mouse-move of a resize
   drag, and through the list that would clone and re-notify the whole strip each time. `GridState::new`
@@ -36576,8 +36583,8 @@ its × would be, and "Close all" spares the pins — the query strip's rules, re
   that means "these rows are being replaced", `Tab::bump_panel_load`, calling
   `PanelView::clear_staged`. A fresh run needs no clear (`begin_run` builds new panels, empty by
   construction) and a commit splice deliberately bumps nothing, which is why it keeps its state.
-  The frozen column is `frozen_col`, spelled out because a *frozen column* and a *frozen result* are
-  different things one field apart (`gctx.panel.frozen_col` is an index, `gctx.panel_frozen` is
+  The frozen columns are `frozen_cols`, spelled out because a *frozen column* and a *frozen result* are
+  different things one field apart (`gctx.panel.frozen_cols` is a set of indices, `gctx.panel_frozen` is
   whether the result is pinned), and two `.frozen`s in one data path is a wrong-variable bug waiting
   for its reader.
 - **The list and the selection move together, under `batch`.** `begin_run`, `close_panels` and
@@ -36636,9 +36643,9 @@ for keyboard nav. **`dirty`, `new_rows` and `del_rows` are not its own**: they a
 panel (`PanelView`, under *The results strip*), whose scope survives the tab switch that disposes
 this bundle's.
 
-- **Two panes** side by side (`h_stack`): a **frozen pane** (row-number gutter + optional frozen
-  column) and a horizontally-scrolling **data pane**. Rebuilt by a `dyn_container` keyed on
-  `body_rebuild_key` — sort state, the column layout (the frozen column and the hidden set as one
+- **Two panes** side by side (`h_stack`): a **frozen pane** (row-number gutter + any frozen
+  columns) and a horizontally-scrolling **data pane**. Rebuilt by a `dyn_container` keyed on
+  `body_rebuild_key` — sort state, the column layout (the frozen set and the hidden set as one
   `core::edit::ColLayout`, since both repartition the columns between the panes), **how many**
   pending new rows there are, and a
   `key_gen` counter — and it is a **memo, not the bare closure it used to be**. `dyn_container`
@@ -36662,11 +36669,18 @@ this bundle's.
   the life of the result. A counter and not the map, so the memo compares a `u64` per notification
   instead of a `HashMap`. It is generic in the row type purely so the composition can be tested
   with no window (`body_key_tests`); only `Vec::len` is called.
-  **Freeze is per-column, any column**: `gs.frozen` holds the frozen column's
-  *absolute* index, set from the header right-click menu (no toolbar button). The data pane renders
-  `data_cols` = `ColLayout::scrolling` (an `Arc<Vec<usize>>`) and the frozen pane
-  `ColLayout::frozen_drawn`; cells keep their
-  *absolute* `ci` so selection/resize/sort stay consistent. Frozen pane width = `GUTTER_W + widths[frozen]`.
+  **Freeze is per-column, any column, and several at once**: `gs.frozen` is a `BTreeSet` of the
+  frozen columns' *absolute* indices, written from the header right-click menu (no toolbar button),
+  where *Freeze* **adds** that column to the set and *Unfreeze* removes that one alone. It used to
+  hold one index, and Freeze replaced it; why a set rather than a freeze-through-this-column is
+  under `core::edit`'s `visual_cols`. The data pane renders
+  `data_cols` = `ColLayout::scrolling` (an `Arc<Vec<usize>>`) and the frozen pane's header and
+  rows (`frozen_row`) draw the gutter and then `ColLayout::frozen_drawn`, an `Arc<Vec<usize>>` in
+  index order; cells keep their
+  *absolute* `ci` so selection/resize/sort stay consistent. Frozen pane width = `gutter_w()` plus
+  the sum of the frozen columns' widths, and it does not shrink (`flex_shrink(0)`). **There is no
+  cap on it, deliberately**: freeze enough wide columns and the data pane is left little or no room,
+  which is the user's choice to make rather than the grid's to refuse.
   The list used to be an inline `(0..ncols).filter(!= frozen)` — the second spelling `core::edit`
   warns about — and is now the same core list scroll-into-view sums over.
   The resulting **draw order** — frozen first, then the rest in index order — is
@@ -36676,7 +36690,7 @@ this bundle's.
   where `ColLayout::may_hide` refuses — the last drawn column), and while any are hidden a *Show
   hidden columns (N)* submenu, one entry per column by name and then *Show all*, because a menu
   closes on a click and one click can only show one. `gs.hidden` is seeded from
-  `PanelView::hidden_cols` and mirrored back beside `frozen_col` — session-only, like the rest of
+  `PanelView::hidden_cols` and mirrored back beside `frozen_cols` — session-only, like the rest of
   the panel. `hide_column` is a wrapper over `ColLayout::hide`, which unfreezes a column it hides,
   since frozen and not drawn is no state anyone asked for and it would come back pinned, and moves
   the active and anchor corners off it through `nearest_shown` — the right neighbour, the one that
@@ -38068,4 +38082,4 @@ this bundle's.
   aligned. Invariant: `gs.widths` stays full-length and each row's total width = `sum(widths[data_cols])`
   (spacers make up the hidden columns), so `h_off`/`scroll_to` geometry is unchanged —
   `scroll_active_into_view` sums in data-pane space (`ColLayout::scrolling`, which excludes the
-  frozen column and the hidden ones) to match.
+  frozen columns and the hidden ones) to match.
