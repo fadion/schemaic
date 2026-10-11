@@ -1788,6 +1788,7 @@ pub(crate) fn theme_settings_overlay(
     let statement_timeout = layout.statement_timeout;
     let confirm_writes = layout.confirm_writes;
     let live_validate = layout.live_validate;
+    let notify_finished = layout.notify_finished;
     let editor_predictions = layout.editor_predictions;
     let editor_remembered_predictions = layout.editor_remembered_predictions;
     let rainbow_brackets = layout.rainbow_brackets;
@@ -1975,6 +1976,16 @@ pub(crate) fn theme_settings_overlay(
                 ring.clone(),
                 230,
             );
+            let notify_row = focusable_toggle_row(
+                "Notify when a run finishes in the background",
+                "Show a desktop notification when a query, script, export or dump that \
+                 took a second or more ends while Schemaic is not the active window. The \
+                 taskbar button is highlighted either way. The notification never \
+                 includes the SQL.",
+                notify_finished,
+                ring.clone(),
+                240,
+            );
             let timeout_section = v_stack((
                 settings_group_label("Statement timeout"),
                 timeout_dd,
@@ -1990,6 +2001,7 @@ pub(crate) fn theme_settings_overlay(
                 timeout_section,
                 confirm_row,
                 validate_row,
+                notify_row,
             ))
             .style(|s| s.flex_col().gap(theme::scaled(16.0)));
 

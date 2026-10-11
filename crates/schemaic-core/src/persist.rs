@@ -360,6 +360,11 @@ pub struct UiState {
     /// squiggles. Adds a debounced DB round-trip per edit pause. Default: off.
     #[serde(default)]
     pub live_validate: bool,
+    /// Show a desktop notification when a run the taskbar flashes for ends
+    /// (`history::wants_attention`, `history::finished_note`). Default: off —
+    /// the flash is the quiet half, this is the one that interrupts.
+    #[serde(default)]
+    pub notify_finished: bool,
     /// Show the SQL editor's inline predictions — the dim text after the caret
     /// that Tab takes (`intel::predict`). Default: on.
     #[serde(default = "default_true")]
@@ -476,6 +481,7 @@ impl Default for UiState {
             editor_indent_guides: false,
             restore_tabs: true,
             live_validate: false,
+            notify_finished: false,
             editor_predictions: true,
             editor_remembered_predictions: true,
             statement_timeout_secs: 0,
@@ -1982,6 +1988,7 @@ mod tests {
         let mut state = UiState {
             schema_visible: false,
             live_validate: true,
+            notify_finished: true,
             schema_w: 412.5,
             editor_font_size: 17.0,
             row_limit: 1_234,
@@ -1999,6 +2006,7 @@ mod tests {
 
         assert!(!back.schema_visible);
         assert!(back.live_validate);
+        assert!(back.notify_finished);
         assert_eq!(back.schema_w, 412.5);
         assert_eq!(back.editor_font_size, 17.0);
         assert_eq!(back.row_limit, 1_234);

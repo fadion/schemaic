@@ -23,6 +23,7 @@ mod history_store;
 mod install_cli;
 mod liveness;
 mod logging;
+mod notify;
 mod opencode;
 mod script;
 mod snippet_store;
@@ -67,6 +68,7 @@ use schemaic_core::conn_import;
 use schemaic_core::connection::{ConnStatus, Connection, LoadFailure};
 use schemaic_core::edit::analyze_edit;
 use schemaic_core::health;
+use schemaic_core::history::Finished;
 use schemaic_core::model::{
     CommitDone, GridWrite, ModalError, QueryState, RefetchRequest, ResultSet,
 };
@@ -2395,6 +2397,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let statement_timeout = RwSignal::new(ui_state.statement_timeout_secs);
     let confirm_writes = RwSignal::new(ui_state.confirm_writes);
     let live_validate = RwSignal::new(ui_state.live_validate);
+    let notify_finished = RwSignal::new(ui_state.notify_finished);
     let editor_predictions = RwSignal::new(ui_state.editor_predictions);
     let editor_remembered_predictions = RwSignal::new(ui_state.editor_remembered_predictions);
     let restore_tabs = RwSignal::new(ui_state.restore_tabs);
@@ -2916,10 +2919,16 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // the window is focused; both run paths ask it, after their supersede
     // checks, so only the run a tab still shows does. A `.sql` file run, an
     // export, a dump and a folder export ask it too, timed from their launch,
-    // unless the user stopped them.
-    let call_back_after = move |took_ms: u64| {
+    // unless the user stopped them. With *Notify when a run finishes in the
+    // background* on, the same moment also shows a desktop notification
+    // (`notify::show`, worded by `history::finished_note`).
+    let call_back_after = move |what: Finished, failed: bool, took_ms: u64| {
         if schemaic_core::history::wants_attention(took_ms, window_focused.get_untracked()) {
             floem::WindowIdExt::request_attention(&window, floem::Urgency::Informational);
+            if notify_finished.get_untracked() {
+                let (title, body) = schemaic_core::history::finished_note(what, failed, took_ms);
+                notify::show(title, body);
+            }
         }
     };
     let run_query_core: Rc<dyn Fn(String, bool)> = {
@@ -3088,8 +3097,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         return;
                     }
                     tokens_done.borrow_mut().remove(&id);
-                    if run_result(&state, took).is_some() {
-                        call_back_after(took);
+                    if let Some(r) = run_result(&state, took) {
+                        call_back_after(Finished::Query, !r.ok, took);
                     }
                     if is_view {
                         // Cleared for every arm, and **after** the supersede check
@@ -3654,7 +3663,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     // script of quick statements is as much a walk-away as one
                     // slow one. Asked only of a batch that reached a verdict.
                     if !runs.is_empty() {
-                        call_back_after(took.iter().sum());
+                        let failed = runs.iter().any(|(_, r)| !r.ok);
+                        call_back_after(Finished::Query, failed, took.iter().sum());
                     }
                     // By id, statement for statement: the strip may have been
                     // pinned, reordered or partly closed while the batch ran, and
@@ -4275,7 +4285,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                     if !asked.replace(true)
                                         && !matches!(o, ExportOutcome::Cancelled)
                                     {
-                                        call_back_after(started.elapsed().as_millis() as u64);
+                                        call_back_after(
+                                            Finished::Export,
+                                            matches!(o, ExportOutcome::Failed { .. }),
+                                            started.elapsed().as_millis() as u64,
+                                        );
                                     }
                                     // **Only a run that took the slot may clear
                                     // it**, or an unstoppable log export
@@ -4515,7 +4529,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             create_ext_action(cx, move |o: ExportOutcome| {
                                 *export_token.borrow_mut() = None;
                                 if !matches!(o, ExportOutcome::Cancelled) {
-                                    call_back_after(started.elapsed().as_millis() as u64);
+                                    call_back_after(
+                                        Finished::Export,
+                                        matches!(o, ExportOutcome::Failed { .. }),
+                                        started.elapsed().as_millis() as u64,
+                                    );
                                 }
                                 (done)(o)
                             })
@@ -4789,7 +4807,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     create_ext_action(cx, move |o: DumpOutcome| {
                         *dump_token.borrow_mut() = None;
                         if !matches!(o, DumpOutcome::Cancelled { .. }) {
-                            call_back_after(started.elapsed().as_millis() as u64);
+                            call_back_after(
+                                Finished::Dump,
+                                matches!(o, DumpOutcome::Failed { .. }),
+                                started.elapsed().as_millis() as u64,
+                            );
                         }
                         (done)(o);
                     })
@@ -4842,7 +4864,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     create_ext_action(cx, move |o: FilesOutcome| {
                         *dump_token.borrow_mut() = None;
                         if !matches!(o, FilesOutcome::Cancelled { .. }) {
-                            call_back_after(started.elapsed().as_millis() as u64);
+                            call_back_after(
+                                Finished::Export,
+                                matches!(o, FilesOutcome::Failed { .. }),
+                                started.elapsed().as_millis() as u64,
+                            );
                         }
                         (done)(o);
                     })
@@ -4946,7 +4972,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     create_ext_action(cx, move |o: RunOutcome| {
                         *script_token.borrow_mut() = None;
                         if !matches!(o, RunOutcome::Cancelled { .. }) {
-                            call_back_after(started.elapsed().as_millis() as u64);
+                            call_back_after(
+                                Finished::Script,
+                                matches!(o, RunOutcome::Failed { .. }),
+                                started.elapsed().as_millis() as u64,
+                            );
                         }
                         (done)(o);
                     })
@@ -7771,6 +7801,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     editor_indent_guides: indent_guides.get_untracked(),
                     restore_tabs: restore_tabs.get_untracked(),
                     live_validate: live_validate.get_untracked(),
+                    notify_finished: notify_finished.get_untracked(),
                     editor_predictions: editor_predictions.get_untracked(),
                     editor_remembered_predictions: editor_remembered_predictions.get_untracked(),
                     show_table_sizes: table_sizes.get_untracked(),
@@ -7871,6 +7902,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             confirm_writes.get();
             restore_tabs.get();
             live_validate.get();
+            notify_finished.get();
             editor_predictions.get();
             editor_remembered_predictions.get();
             save_ui(persist::Saving::Replacing);
@@ -13288,6 +13320,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             confirm_writes,
             restore_tabs,
             live_validate,
+            notify_finished,
             editor_predictions,
             editor_remembered_predictions,
             window_focused,

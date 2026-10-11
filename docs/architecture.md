@@ -9906,6 +9906,15 @@ existing prose was left alone.
     (`database_names_compare_by_the_engines_case_rule`). The SQL Server arm is the *default*
     collation's answer; nothing consults the server's own, so on one installed case-sensitive
     the rule errs towards offering.
+    `wants_attention` (with `ATTENTION_AFTER_MS`) is the taskbar call-back's question, and
+    `finished_note(Finished, failed, took_ms)` the wording of the desktop notification that can
+    follow it — *Query finished* / *Script failed* and so on over `Took 12.3s.` through
+    `format_duration` (`a_finished_note_names_what_ended_and_how_long_it_took`). **It never
+    carries the statement**, for this module's credential reason one step further out: a
+    notification outlives the run in the system's notification history, readable by anyone at the
+    machine, and the SQL may carry the very values it wrote. `Finished` is four kinds — `Query`
+    (one statement or Run Everything's batch), `Script`, `Export` (a file or a folder of them),
+    `Dump` — and whether it failed is the caller's to read off its own outcome type.
   - `sticky_header.rs` — which band header of a scrolled list is **pinned** to its top edge, and
     how far the next one has pushed it: the pure half of the history and snippet panels' sticky
     bands (the view half is `widgets::banded_list`). `pinned(headers, scroll_y, pinned_height)`
@@ -29007,6 +29016,20 @@ existing prose was left alone.
   they have switched away, where a flash would call them back to something they ended. The fetched
   export's two ext actions over one `done` share an `asked` cell, so only the report that lands
   first asks — the same one `ExportTarget::run` keeps.
+  **The same moment can also show a desktop notification, and only if the user asked for one.**
+  `call_back_after` takes `(Finished, failed, took_ms)` rather than the time alone, and when
+  `wants_attention` says yes and the `notify_finished` signal is on (Settings → Query, *Notify
+  when a run finishes in the background*; `persist::UiState::notify_finished`, `serde`-defaulted
+  off and autosaved as `live_validate` is) it hands `history::finished_note`'s title and body to
+  `notify::show`. Each caller says what ended and whether it failed: the single run
+  `Finished::Query` with `!ok`, Run Everything `Query` failed if any statement's `RunResult` is
+  not `ok`, `script_run` `Script`, both `export_file` paths and `files_run` `Export`, `dump_run`
+  `Dump` — each failed on its outcome's `Failed` arm. **There is no second gate**: the
+  notification is asked behind the flash's `wants_attention`, never beside it, so a cancelled run,
+  a run in a focused window and a superseded one stay as quiet as they were. Off by default
+  because the flash is the quiet half and this is the half that interrupts. Seen live on Windows 11
+  in a sandboxed profile — a toast headed *Schemaic* with the app icon, *Query finished* / *Took
+  2.0s.*, and none with the toggle off; macOS and Linux have not been watched.
   **A file changed by another program is offered back when the window regains focus**, not by a
   filesystem watcher: the edit that matters was made elsewhere, and coming back is when the user
   would act on a stale copy. A second `create_effect` on `window_focused`, beside the connection
@@ -30796,6 +30819,33 @@ existing prose was left alone.
     `the_hook_test_puts_the_process_back_as_it_found_it` is the pin: it installs a hook it can
     recognise, calls the test above directly (ordering is not left to libtest), fires a swallowed
     panic and checks the recognisable one is what the process still holds.
+  - `notify.rs` — the opt-in **desktop notification** for a run that ended behind another window:
+    `show(title, body)`, called from `main.rs`'s `call_back_after` only after
+    `history::wants_attention` has said yes and only with *Notify when a run finishes in the
+    background* on; the words are `history::finished_note`'s. Through `notify-rust` 4.18 — a
+    WinRT toast on Windows (`tauri-winrt-notification`, over the `windows` 0.62 already in the
+    tree), the notification centre on macOS, `org.freedesktop.Notifications` on Linux. **It runs on
+    a `std::thread` of its own** because on Linux it is a blocking D-Bus call, and a notification
+    daemon that never answers must not freeze the window; a failure is a `tracing::warn!` and
+    nothing else, since the taskbar has already been asked either way. The crate's default `z`
+    feature puts it on zbus 5 over `async-io`, beside the zbus 4 the keyring and rfd's `ashpd`
+    share — which `conn::secrets`'s `zbus_is_not_on_its_tokio_backend` checks along with the
+    other, since it reads every `zbus` the lock resolves (see *Floem 0.2 gotchas*).
+    **Every platform needs the app's identity to put a name on it, and takes it differently.**
+    Windows shows a toast only for an AppUserModelID it can resolve; without one it drops the toast
+    or shows it as PowerShell's. An unpackaged app's is registered under
+    `HKCU\Software\Classes\AppUserModelId\<core::APP_ID>` — `DisplayName` *Schemaic* and an
+    `IconUri` naming `notification-icon.png` in `persist::config_dir()`, written from the bundled
+    `assets/icon.png` when it is missing or differs from it — and the toast is sent under that id. The key is
+    **rewritten on every notification** rather than once: two values, and a key someone deleted
+    comes back without anyone having to notice it went. The icon file is compared with the bundled
+    bytes each time, so a new icon reaches the toast with the release that ships it. Nothing — the
+    `--veloapp-uninstall` hook included — removes the key or the file on uninstall. **The
+    *process's* AppUserModelID is deliberately left alone**: setting it would move the window to a
+    different taskbar group from the installed shortcut's. macOS attributes the notification to a
+    bundle id through `notify_rust::set_application(APP_ID)`; Linux names the icon `APP_ID` and
+    sends `Hint::DesktopEntry(APP_ID)`, the desktop entry's file name. That makes the toast's
+    registry key one more thing `APP_ID` names (*Architecture invariants*).
   - `update.rs` — the Velopack half of `core::update`: a background check at startup and every three
     hours after (`RECHECK_INTERVAL`), and the "Restart to update" action `start` hands back for the
     header chip. **Velopack's API is synchronous and does network + file I/O**, so every call into it
@@ -34103,7 +34153,10 @@ Re-introducing the anti-patterns these guard against is a regression:
   crate names it.** It is the Linux window's `app_id`/`WM_CLASS`, the desktop entry's file name and
   the macOS `--bundleId` at once, and a shell draws a window's icon by matching the first against
   the second, so renaming it orphans every entry already installed under the old name — the
-  constant's own doc says as much. `the_app_id_names_the_desktop_entry_and_matches_every_packager`
+  constant's own doc says as much — and, on Windows, the
+  `HKCU\Software\Classes\AppUserModelId\<APP_ID>` key a desktop notification is registered under
+  (`app::notify`), which the app would simply write afresh under the new name and leave the old
+  one behind. `the_app_id_names_the_desktop_entry_and_matches_every_packager`
   pins it against `packaging/linux/<APP_ID>.desktop` and every packager's copy of the id, down to
   `release.yml`'s `--bundleId`; the list, and why the value exists, are under `app::update`.
   **The published package-repository identity is the same rule with a second instance**, and a more
@@ -34681,7 +34734,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   `zbus/async-io` plus `async-fs`/`async-net` — and zbus's `async-io` executor needs no runtime.
   Cargo unifies features, so any dependency enabling `zbus/tokio` brings the bug back; that is why
   the guard, `conn::secrets`'s `zbus_is_not_on_its_tokio_backend`, reads `Cargo.lock` rather than a
-  manifest (the keyring there is the other zbus user — see `schemaic-conn`).
+  manifest (the keyring there is the other zbus user — see `schemaic-conn` — and `app::notify`'s
+  `notify-rust` a third, on zbus 5 beside the other two's zbus 4).
 - **One `on_scroll` per scroll** — setting it twice clobbers. `autohide` sets its own; a scroll
   needing custom `on_scroll` must inline `autohide_state()` (results grid + AI convo).
   `autohide_tracking` is `autohide` plus publishing the visible rect into a signal, from the same

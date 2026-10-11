@@ -6186,6 +6186,9 @@ pub struct LayoutUi {
     /// Validate the statement under the cursor against the live DB (non-executing
     /// PREPARE) as you type. Drives the editor's Tier-2 diagnostics.
     pub live_validate: RwSignal<bool>,
+    /// Show a desktop notification when a run that flashes the taskbar ends
+    /// (`history::finished_note`). Persisted; off by default.
+    pub notify_finished: RwSignal<bool>,
     /// Show the SQL editor's inline predictions (`intel::predict`). Persisted.
     pub editor_predictions: RwSignal<bool>,
     /// Let them be remembered too — from past runs, open tabs and snippets

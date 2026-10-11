@@ -28,6 +28,12 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 # Decode the embedded window-icon PNG to RGBA at startup (png feature only).
 image = { version = "0.25", default-features = false, features = ["png"] }
+# The opt-in desktop notification for a run that ended in the background
+# (`notify.rs`): WinRT toasts on Windows, the bundle's notification centre on
+# macOS, `org.freedesktop.Notifications` on Linux. Its default `z` feature is
+# zbus on `async-io`, never `tokio` — the same rule
+# `secrets::tests::zbus_is_not_on_its_tokio_backend` holds every zbus to.
+notify-rust = "4.18"
 
 # The OS keyring moved to `schemaic-conn` with `secrets.rs`, so the headless CLI
 # can reach a saved connection without linking floem. The backend notes that used

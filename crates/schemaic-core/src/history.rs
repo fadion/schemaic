@@ -347,6 +347,40 @@ pub fn wants_attention(took_ms: u64, window_focused: bool) -> bool {
     !window_focused && took_ms >= ATTENTION_AFTER_MS
 }
 
+/// What ended, for [`finished_note`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Finished {
+    /// An editor run: one statement, or Run Everything's batch.
+    Query,
+    /// A `.sql` file run.
+    Script,
+    /// A result or table exported to a file, or a folder of them.
+    Export,
+    /// A database dumped to a `.sql` file.
+    Dump,
+}
+
+/// The desktop notification for a run that [`wants_attention`]: a title and
+/// a body.
+///
+/// **Never the statement.** A notification outlives the run in the system's
+/// notification history, where anyone at the machine can read it, and the SQL
+/// may carry the very values it wrote. What ended, how, and how long it took
+/// is what calls the user back; the result is in the window.
+pub fn finished_note(what: Finished, failed: bool, took_ms: u64) -> (String, String) {
+    let noun = match what {
+        Finished::Query => "Query",
+        Finished::Script => "Script",
+        Finished::Export => "Export",
+        Finished::Dump => "Dump",
+    };
+    let verb = if failed { "failed" } else { "finished" };
+    (
+        format!("{noun} {verb}"),
+        format!("Took {}.", format_duration(took_ms)),
+    )
+}
+
 /// Record how a run turned out, onto the entry [`push`] wrote when it launched.
 /// Returns whether one was found.
 ///
@@ -723,6 +757,47 @@ mod tests {
     fn a_run_walked_away_from_after_a_second_asks_for_attention() {
         assert!(wants_attention(1_200, false));
         assert!(!wants_attention(300, false), "over before anyone left");
+    }
+
+    /// The notification says what ended and how, and how long it took —
+    /// **and never the statement.** A notification outlives the run in the
+    /// system's notification history, and the SQL may carry the values it
+    /// wrote: emails, names, addresses.
+    #[test]
+    fn a_finished_note_names_what_ended_and_how_long_it_took() {
+        assert_eq!(
+            finished_note(Finished::Query, false, 12_300),
+            ("Query finished".to_string(), "Took 12.3s.".to_string())
+        );
+        assert_eq!(
+            finished_note(Finished::Query, true, 2_000).0,
+            "Query failed"
+        );
+        assert_eq!(
+            finished_note(Finished::Script, false, 1_000).0,
+            "Script finished"
+        );
+        assert_eq!(
+            finished_note(Finished::Script, true, 1_000).0,
+            "Script failed"
+        );
+        assert_eq!(
+            finished_note(Finished::Export, false, 1_000).0,
+            "Export finished"
+        );
+        assert_eq!(
+            finished_note(Finished::Export, true, 1_000).0,
+            "Export failed"
+        );
+        assert_eq!(
+            finished_note(Finished::Dump, false, 1_000).0,
+            "Dump finished"
+        );
+        assert_eq!(finished_note(Finished::Dump, true, 1_000).0, "Dump failed");
+        assert_eq!(
+            finished_note(Finished::Export, false, 125_000).1,
+            "Took 2m 05s."
+        );
     }
 
     /// `ts` doubles as the run id — every entry in a test gets its own, which is
