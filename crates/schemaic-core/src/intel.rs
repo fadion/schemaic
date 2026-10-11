@@ -27815,6 +27815,12 @@ mod tests {
             FormatStyle {
                 river: true,
                 align: true,
+                wrap: 40,
+                ..FormatStyle::default()
+            },
+            FormatStyle {
+                wrap: 30,
+                commas: crate::sqlfmt::CommaStyle::Leading,
                 ..FormatStyle::default()
             },
         ];

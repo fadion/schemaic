@@ -13292,13 +13292,14 @@ existing prose was left alone.
     `Leading` (*Start of line*), serialised and read leniently exactly as `KeywordCase` is, an
     unknown word being `Trailing` (`comma_style_defaults_to_end_of_line_and_reads_leniently`). The
     settings travel as a `FormatStyle { case, commas, gap, join_on_own_line, river, align,
-    tab_width }`, and `format_range`/`format_statement`
+    tab_width, wrap }`, and `format_range`/`format_statement`
     take `impl Into<FormatStyle>`, with `From<KeywordCase>` putting every other setting at its
     default — so a caller or test that passes a bare `KeywordCase` says nothing about the rest and
     is unchanged. `format_sql` stays at the defaults. `format_sql_under` takes the whole
     `FormatStyle` and sets the commas into `Fmt::leading_commas`,
     and the `","` arm moves only a **breakable** comma — the rule the layout already broke at: top
-    level, or a subquery's or a listed paren's list — taking the same `break_to(self.content)`
+    level, or a subquery's or a listed paren's list (a table body, or a list `wrap` broke) — taking
+    the same `break_to(self.content)`
     *before* the comma instead of after it. Every other comma stays where it was, so `IN (1, 2)`
     and a function's arguments are inline either way; the test states that as a property against
     the default output — each line-ending comma becomes the next line's leading `, ` and nothing
@@ -13390,13 +13391,41 @@ existing prose was left alone.
     word) and when a subquery's or a table body's paren opens (no clause), and
     `Paren::saved_align` keeps the outer `(group, clause, item)` for its `)` to restore — so a
     subquery's aliases line up among themselves and the outer list's go on around it
-    (`each_list_lines_up_on_its_own`). Then `Fmt::apply_alignment`, which `format_sql_under` calls
+    (`each_list_lines_up_on_its_own`). A list `wrap` broke opens no group but saves and restores
+    the same state, because its own commas are breakable and each sets `Item::fresh` — without the
+    restore they would end the item the list sits in, the `coalesce(…)` whose `as n` is to line up
+    (`a_wrapped_list_does_not_disturb_alignment`). The column-type mark asks
+    `Paren::table`, not `Paren::listed`: `listed` means only "one item a line" now, and a wrapped
+    call's second token is no column type. Then `Fmt::apply_alignment`, which `format_sql_under` calls
     after `run`, measures every mark's column from its line's start — a tab as `tab_width` — and
     pads each mark of a group with two or more to the group's widest, inserting from the end back
     so no offset still to pad moves. A leading comma is part of its line, so `, bbbb as y` still
     shares the column (`aliases_line_up_after_leading_commas`). Only spaces go in, so
     `caret_after_format` holds over it. `tab_width` `0` reads as 4: `theme::format_style()` fills
     in the editor's tab width each time it is read, and the app's composing effect sets `0`.
+    **The wrap width is the seventh** — `FormatStyle::wrap`, a `usize`, `0` meaning off and the
+    default (`wrapping_is_off_by_default`). A list the layout keeps on one line — a call's
+    arguments, an `IN` list, a `VALUES` tuple: any expression paren with a comma at its own depth —
+    goes one item a line once its line would run past the width
+    (`a_list_that_overflows_the_width_goes_one_item_a_line`). The `(` arm asks `Fmt::overflows`
+    for a paren that is neither a subquery nor a table body. It finds the matching `)` — giving up
+    at a terminator, a directive or a `;` — and wants a comma at depth 1, so a paren with no list
+    in it never breaks however long, there being nothing to break it at. Then it **measures by
+    doing**, which is what the `step` seam is for: it takes `out` and `marks` aside, clones the
+    `Fmt` and puts them back — so the clone is the layout state, not the text written so far —
+    sets `Fmt::measuring`, steps from the `(` to its `)`, and asks whether any line from the `(`'s
+    line on is wider than `wrap`, a tab counted as `tab_width`; then it truncates `out` and
+    `marks` to where they were and restores the clone. So the width it measures is the one it
+    would write, spacing and case frames and all, rather than an estimate of it. While `measuring`
+    is set `overflows` answers `false`, so the lists inside stay on one line for the measure; each
+    is asked again when its own `(` comes round, and only the lists that overflow break —
+    `f(g(a, b), long_one, long_two)` puts `g(a, b)` whole on its new line
+    (`only_the_overflowing_list_breaks`, which holds the comma-less paren too). A list that
+    overflows becomes a listed paren as a table body is: `Paren::listed` holds its anchor, the
+    items go at anchor + 1 and the `)` back at the anchor. The anchor is `line_indent`, or under
+    the river `content` — the body's column, a river line's own indent being its keyword's pad
+    (`a_list_wraps_from_the_rivers_body`). `Paren::table` is what tells a table body from a
+    wrapped list now (above).
     **`formattable_range` is what decides how much of the document a Format may touch**, and it is
     here rather than at the call site because `format_sql` lexes what it is handed **from byte 0**
     and takes that for a real token boundary. True of a whole document and of a selection whose ends
@@ -13546,7 +13575,8 @@ existing prose was left alone.
     is held to the same two properties** over the same corpus and engines —
     `the_corpus_formats_idempotently_under_every_layout_setting`, for a list `styles` of non-default
     `FormatStyle`s (the river; the river with `join_on_own_line`, `StatementGap::Keep` and leading
-    commas; `join_on_own_line` with `StatementGap::None` and `align`; the river with `align`) —
+    commas; `join_on_own_line` with `StatementGap::None` and `align`; the river with `align` and
+    `wrap` 40; the block layout with `wrap` 30 and leading commas) —
     never a keyword case, which changes a
     token's text by design — where a second format must move nothing and
     `what_it_says` must not change. The formatter's own tests pin a setting a shape at a time, and
@@ -27949,7 +27979,7 @@ existing prose was left alone.
     patch, which centres the whitespace marks in their line (*Floem 0.2 gotchas*). The palette's
     *Toggle Whitespace* and *Toggle Indent Guides* sit beside *Toggle Word Wrap*.
     **Keyword case** (Settings → *Code formatting*, its own section between *Editor* and *Query*,
-    the first of its three `focusable_dropdown`s; *As typed* by default — `UiState::format_keyword_case`,
+    the first of its four `focusable_dropdown`s; *As typed* by default — `UiState::format_keyword_case`,
     pinned by
     `format_keyword_case_defaults_to_as_typed_and_keeps_a_choice`; `LayoutUi::keyword_case`) is the
     one editor setting here that paints nothing. **Commas** sits after it (*End of line* by
@@ -27958,6 +27988,10 @@ existing prose was left alone.
     **Between statements** after that (*One blank line* by default, focus order 180 —
     `UiState::format_statement_gap`, pinned by
     `format_statement_gap_defaults_to_one_and_keeps_a_choice`; `LayoutUi::statement_gap`), then
+    **Wrap width** (*Off* by default, focus order 183 — `UiState::format_wrap_width`, pinned by
+    `format_wrap_width_defaults_off_and_keeps_a_width`; `LayoutUi::wrap_width`), whose choices are
+    `settings.rs`'s `WRAP_WIDTHS = [0, 80, 100, 120]` labelled by `wrap_width_label`, `0` leading
+    as *Off* (`the_wrap_widths_lead_with_off`), then
     the section's three switches, each a `focusable_toggle_row` off by default: **Right-align clause
     keywords** (focus order 185 — `UiState::format_river`, pinned by
     `format_river_defaults_off_and_keeps_an_on`; `LayoutUi::river`), **Align columns** (focus
@@ -27967,7 +28001,7 @@ existing prose was left alone.
     `format_join_on_own_line_defaults_off_and_keeps_an_on`; `LayoutUi::join_on_own_line`). What
     each does to the text is the `core/sqlfmt.rs` entry's. **They reach the formatter as one
     value**: the theme state holds a single `format_style: RwSignal<FormatStyle>`, and the app
-    composes it in one `create_effect` beside the other editor-setting effects, from the six
+    composes it in one `create_effect` beside the other editor-setting effects, from the seven
     signals Settings edits one at a time, into `theme::set_format_style` — which replaced a setter
     per setting. Its `tab_width` is not one of them: the effect writes `0`, and
     `theme::format_style()` fills in `editor_tab_width` each time it is read, so the formatter

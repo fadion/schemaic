@@ -87,6 +87,7 @@ fn format_sql_under(
     f.join_on_own_line = style.join_on_own_line;
     f.river = style.river;
     f.align = style.align;
+    f.wrap = style.wrap;
     if style.tab_width > 0 {
         f.tab_width = style.tab_width;
     }
@@ -233,6 +234,9 @@ pub struct FormatStyle {
     /// How many columns a tab takes, for measuring a line indented with
     /// tabs. `0` reads as 4.
     pub tab_width: usize,
+    /// The line width a list kept on one line may run to before it goes one
+    /// item a line. `0` is off.
+    pub wrap: usize,
 }
 
 impl From<KeywordCase> for FormatStyle {
@@ -1394,9 +1398,12 @@ struct Paren {
     subquery: bool,
     saved_base: Ind,
     saved_content: Ind,
-    /// A `CREATE TABLE`'s body ([`Fmt::opens_table_body`]): one item a line,
-    /// the `)` back at this indent.
+    /// One item a line, the `)` back at this indent: a `CREATE TABLE`'s body
+    /// ([`Fmt::opens_table_body`]), or a list that overflowed the wrap width
+    /// ([`Fmt::overflows`]).
     listed: Option<Ind>,
+    /// It is a table's body, whose columns' types line up.
+    table: bool,
     /// [`Fmt::joined`] and [`Fmt::in_on`] outside a subquery, which has joins
     /// of its own.
     saved_joined: bool,
@@ -1545,6 +1552,12 @@ struct Fmt<'a> {
     item: Item,
     /// The token about to be written lines up with its list's others.
     mark_next: bool,
+    /// The width a list kept on one line may run to ([`FormatStyle::wrap`]);
+    /// `0` is off.
+    wrap: usize,
+    /// A list is being tried on one line to measure it ([`Fmt::overflows`]):
+    /// the lists inside it stay on one line too.
+    measuring: bool,
 }
 
 /// The width the river's keywords right-align to: `SELECT`'s, and that of
@@ -1608,6 +1621,8 @@ impl<'a> Fmt<'a> {
             clause: None,
             item: Item::default(),
             mark_next: false,
+            wrap: 0,
+            measuring: false,
         }
     }
 
@@ -1776,6 +1791,71 @@ impl<'a> Fmt<'a> {
         self.out.push_str(text);
         self.line_has_content = true;
         self.prev = Some((kind, text.to_string()));
+    }
+
+    /// Would the list the `(` at `toks[k]` opens run past the wrap width, laid
+    /// out on one line as it otherwise is? Then it goes one item a line.
+    ///
+    /// **Measured, not estimated**: the layout is run over the list for real,
+    /// from a copy of the state, and taken back — so the width it measures is
+    /// the one it would write, spacing and case frames and all. Lists inside
+    /// it stay on one line while it is measured ([`Fmt::measuring`]); each is
+    /// asked again in its turn if this one breaks. Only a paren with a comma
+    /// of its own is a list: one without has nothing to break at.
+    fn overflows(&mut self, toks: &[(Kind, &str)], k: usize) -> bool {
+        if self.wrap == 0 || self.measuring {
+            return false;
+        }
+        let mut depth = 0usize;
+        let mut comma = false;
+        let mut close = None;
+        for (j, &(kind, t)) in toks.iter().enumerate().skip(k) {
+            match (kind, t) {
+                (Kind::Terminator | Kind::Directive, _) | (Kind::Punct, ";") => break,
+                (Kind::Punct, "(") => depth += 1,
+                (Kind::Punct, ")") => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(j);
+                        break;
+                    }
+                }
+                (Kind::Punct, ",") if depth == 1 => comma = true,
+                _ => {}
+            }
+        }
+        let Some(close) = close.filter(|_| comma) else {
+            return false;
+        };
+        let out = std::mem::take(&mut self.out);
+        let marks = std::mem::take(&mut self.marks);
+        let saved = self.clone();
+        self.out = out;
+        self.marks = marks;
+        let (out_len, marks_len) = (self.out.len(), self.marks.len());
+        let line_start = self.out.rfind('\n').map_or(0, |n| n + 1);
+        self.measuring = true;
+        let mut j = k;
+        while j <= close {
+            j = self.step(toks, j);
+        }
+        let tab = self.tab_width;
+        let width = |line: &str| {
+            line.chars()
+                .map(|c| if c == '\t' { tab } else { 1 })
+                .sum::<usize>()
+        };
+        let over = self.out[line_start..]
+            .split('\n')
+            .any(|line| width(line) > self.wrap);
+        let mut out = std::mem::take(&mut self.out);
+        let mut marks = std::mem::take(&mut self.marks);
+        out.truncate(out_len);
+        marks.truncate(marks_len);
+        *self = saved;
+        self.out = out;
+        self.marks = marks;
+        over
     }
 
     /// A new list starts — a clause's body, a subquery's, a table's — under
@@ -2110,7 +2190,7 @@ impl<'a> Fmt<'a> {
             // up — unless the item is a key's or a constraint's.
             self.mark_next = self.align
                 && !matches!(kind, Kind::LineComment | Kind::BlockComment)
-                && self.parens.last().is_some_and(|p| p.listed.is_some())
+                && self.parens.last().is_some_and(|p| p.table)
                 && !self.item.fresh
                 && self.item.tokens == 1
                 && !TABLE_ITEM_WORDS.contains(&self.item.first.as_str());
@@ -2497,21 +2577,43 @@ impl<'a> Fmt<'a> {
                     "(" => {
                         let sub = self.next_is_subquery(toks, k);
                         let body = !sub && self.opens_table_body(toks, k);
+                        let wraps = !sub && !body && self.overflows(toks, k);
                         // A table's body or a column list is set off from its
                         // name; a call's `(` would sit against it.
                         self.spaced_paren = body || (!sub && self.opens_column_list(toks, k));
                         self.emit(Kind::Punct, "(", false);
                         self.spaced_paren = false;
+                        // A wrapped list hangs from its line's indent — under
+                        // the river, from the body's column, the line's own
+                        // indent being its keyword's pad.
+                        let listed = if body {
+                            Some(self.line_indent)
+                        } else if wraps {
+                            Some(if self.river {
+                                self.content
+                            } else {
+                                self.line_indent
+                            })
+                        } else {
+                            None
+                        };
                         self.parens.push(Paren {
                             subquery: sub,
                             saved_base: self.base,
                             saved_content: self.content,
-                            listed: body.then_some(self.line_indent),
+                            listed,
+                            table: body,
                             saved_joined: self.joined,
                             saved_on: self.in_on,
-                            saved_align: (sub || body)
+                            // A wrapped list's commas start items of its own,
+                            // which must not end the item it sits in.
+                            saved_align: (sub || listed.is_some())
                                 .then(|| (self.group, self.clause.clone(), self.item.clone())),
                         });
+                        if let (true, Some(at)) = (wraps, listed) {
+                            self.content = at + 1;
+                            self.break_to(self.content);
+                        }
                         if sub || body {
                             self.new_list(None);
                         }
@@ -3353,6 +3455,100 @@ mod tests {
             styled("select a as x, bbbb as y from t", FormatStyle::default()),
             "select\n  a as x,\n  bbbb as y\nfrom\n  t"
         );
+    }
+
+    fn wrapped(width: usize) -> FormatStyle {
+        FormatStyle {
+            wrap: width,
+            ..FormatStyle::default()
+        }
+    }
+
+    /// A list the layout keeps on one line — a call's arguments, an `IN` —
+    /// goes one item a line once that line would pass the width, and stays
+    /// put while it fits.
+    #[test]
+    fn a_list_that_overflows_the_width_goes_one_item_a_line() {
+        assert_eq!(
+            settled(
+                "select coalesce(first_name, last_name, nickname, 'unknown') as n from t",
+                wrapped(40)
+            ),
+            "select\n  coalesce(\n    first_name,\n    last_name,\n    nickname,\n    'unknown'\n  \
+             ) as n\nfrom\n  t"
+        );
+        assert_eq!(
+            settled(
+                "select * from t where status in ('new', 'open', 'pending_review', 'escalated')",
+                wrapped(40)
+            ),
+            "select\n  *\nfrom\n  t\nwhere\n  status in (\n    'new',\n    'open',\n    \
+             'pending_review',\n    'escalated'\n  )"
+        );
+        let short = "select coalesce(a, b) from t where s in (1, 2)";
+        assert_eq!(
+            settled(short, wrapped(40)),
+            styled(short, FormatStyle::default())
+        );
+    }
+
+    /// Only the lists that overflow break: an inner one that fits on its new
+    /// line stays whole, and a paren with no list in it is never broken.
+    #[test]
+    fn only_the_overflowing_list_breaks() {
+        assert_eq!(
+            settled(
+                "select f(g(a, b), long_argument_number_one, long_argument_number_two) from t",
+                wrapped(40)
+            ),
+            "select\n  f(\n    g(a, b),\n    long_argument_number_one,\n    \
+             long_argument_number_two\n  )\nfrom\n  t"
+        );
+        let no_list = "select (a_very_long_column_name + another_long_column_name) from t";
+        assert_eq!(
+            settled(no_list, wrapped(20)),
+            styled(no_list, FormatStyle::default())
+        );
+    }
+
+    /// Under the river the list hangs from the body's column.
+    #[test]
+    fn a_list_wraps_from_the_rivers_body() {
+        let style = FormatStyle {
+            river: true,
+            ..wrapped(40)
+        };
+        assert_eq!(
+            settled(
+                "select a from t where status in ('new', 'open', 'pending_review', 'escalated')",
+                style
+            ),
+            "select a\n  from t\n where status in (\n         'new',\n         'open',\n         \
+             'pending_review',\n         'escalated'\n       )"
+        );
+    }
+
+    /// A list's own commas break it, so its items' marks never join the
+    /// alignment of the list around it.
+    #[test]
+    fn a_wrapped_list_does_not_disturb_alignment() {
+        let style = FormatStyle {
+            align: true,
+            ..wrapped(40)
+        };
+        let out = settled(
+            "select coalesce(first_name, last_name, nickname) as n, id as i from t",
+            style,
+        );
+        assert!(out.contains("  ) as n,\n  id as i\n"), "{out}");
+        assert!(out.contains("    first_name,\n    last_name,\n"), "{out}");
+    }
+
+    #[test]
+    fn wrapping_is_off_by_default() {
+        let sql = "select coalesce(first_name, last_name, nickname, 'unknown') as n from t";
+        assert_eq!(FormatStyle::default().wrap, 0);
+        assert!(styled(sql, FormatStyle::default()).contains("coalesce(first_name, last_name"));
     }
 
     // These tests predate the dialect parameter and assert MySQL formatting; a thin

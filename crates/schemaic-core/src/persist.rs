@@ -356,6 +356,10 @@ pub struct UiState {
     /// types. Default: off.
     #[serde(default)]
     pub format_align: bool,
+    /// The line width past which Format Code breaks a list it would keep on
+    /// one line. Default: `0`, off.
+    #[serde(default)]
+    pub format_wrap_width: usize,
     /// Completion writes an alias after a table it inserts into a `FROM` or
     /// `JOIN` (`orders o`). Default: on.
     #[serde(default = "default_true")]
@@ -494,6 +498,7 @@ impl Default for UiState {
             format_join_on_own_line: false,
             format_river: false,
             format_align: false,
+            format_wrap_width: 0,
             completion_table_aliases: true,
             editor_show_whitespace: false,
             editor_indent_guides: false,
@@ -2001,6 +2006,23 @@ mod tests {
         let back: UiState =
             serde_json::from_str(&serde_json::to_string(&on).expect("serialises")).expect("parses");
         assert!(back.format_align);
+    }
+
+    /// No wrap width for a new install and a file written before the setting
+    /// existed, and a width stays chosen.
+    #[test]
+    fn format_wrap_width_defaults_off_and_keeps_a_width() {
+        assert_eq!(UiState::default().format_wrap_width, 0);
+        let old: UiState = serde_json::from_str("{}").expect("parses");
+        assert_eq!(old.format_wrap_width, 0);
+        let wide = UiState {
+            format_wrap_width: 100,
+            ..UiState::default()
+        };
+        let back: UiState =
+            serde_json::from_str(&serde_json::to_string(&wide).expect("serialises"))
+                .expect("parses");
+        assert_eq!(back.format_wrap_width, 100);
     }
 
     /// Completion writes table aliases for a new install and a file written

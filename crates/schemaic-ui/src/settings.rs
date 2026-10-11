@@ -1492,6 +1492,18 @@ fn row_limit_label(n: usize) -> String {
     thousands(n)
 }
 
+/// Format Code's wrap widths, in characters. **`0` leads and means off**,
+/// which is the default and the formatter before the setting existed.
+const WRAP_WIDTHS: [usize; 4] = [0, 80, 100, 120];
+
+fn wrap_width_label(n: usize) -> String {
+    if n == 0 {
+        "Off".to_string()
+    } else {
+        format!("{n} characters")
+    }
+}
+
 /// The statement-timeout choices, in seconds. **`0` leads and means off**,
 /// which is the default and what every release before the setting did.
 ///
@@ -1797,6 +1809,7 @@ pub(crate) fn theme_settings_overlay(
     let join_on_own_line = layout.join_on_own_line;
     let river = layout.river;
     let align = layout.align;
+    let wrap_width = layout.wrap_width;
     let table_aliases = layout.table_aliases;
     let show_whitespace = layout.show_whitespace;
     let indent_guides = layout.indent_guides;
@@ -1931,7 +1944,8 @@ pub(crate) fn theme_settings_overlay(
                 commas_dd,
                 form_hint(
                     "Where Format Code puts the comma of a list it breaks across lines. \
-                     Lists kept on one line, like a function's arguments, are left alone.",
+                     Lists kept on one line, like a function's arguments, are left alone \
+                     unless the wrap width breaks them.",
                 ),
             ))
             .style(ctrl);
@@ -1948,6 +1962,17 @@ pub(crate) fn theme_settings_overlay(
                 form_hint(
                     "The blank lines Format Code leaves between two statements. As typed \
                      keeps a blank line wherever there was one.",
+                ),
+            ))
+            .style(ctrl);
+            let wrap_dd =
+                focusable_dropdown(wrap_width, WRAP_WIDTHS, wrap_width_label, ring.clone(), 183);
+            let wrap_section = v_stack((
+                settings_group_label("Wrap width"),
+                wrap_dd,
+                form_hint(
+                    "A list Format Code keeps on one line, like a function's arguments, \
+                     goes one item a line once its line would run past this width.",
                 ),
             ))
             .style(ctrl);
@@ -1991,6 +2016,7 @@ pub(crate) fn theme_settings_overlay(
                 case_section,
                 commas_section,
                 gap_section,
+                wrap_section,
                 river_row,
                 align_row,
                 join_on_row,
@@ -2372,6 +2398,18 @@ mod tests {
         assert_eq!(editor_font_label(17.0), "17 px");
         assert_eq!(row_limit_label(50_000), "50,000");
         assert_ne!(row_limit_label(50_000), row_limit_label(200_000));
+        assert_eq!(wrap_width_label(90), "90 characters");
+    }
+
+    /// The wrap width's list leads with off, the default, and labels it so;
+    /// every other width says its count.
+    #[test]
+    fn the_wrap_widths_lead_with_off() {
+        assert_eq!(WRAP_WIDTHS[0], 0);
+        assert_eq!(wrap_width_label(0), "Off");
+        for n in &WRAP_WIDTHS[1..] {
+            assert_eq!(wrap_width_label(*n), format!("{n} characters"));
+        }
     }
 
     #[test]

@@ -6176,6 +6176,9 @@ pub struct LayoutUi {
     /// Format Code lines up a list's aliases, assignments and column types;
     /// one part of `theme::set_format_style`. Persisted.
     pub align: RwSignal<bool>,
+    /// The width past which Format Code breaks a one-line list, `0` off; one
+    /// part of `theme::set_format_style`. Persisted.
+    pub wrap_width: RwSignal<usize>,
     /// Write an alias after a table completion inserts; drives
     /// `theme::set_completion_table_aliases`. Persisted.
     pub table_aliases: RwSignal<bool>,
