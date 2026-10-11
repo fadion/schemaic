@@ -1793,6 +1793,7 @@ pub(crate) fn theme_settings_overlay(
     let rainbow_brackets = layout.rainbow_brackets;
     let keyword_case = layout.keyword_case;
     let comma_style = layout.comma_style;
+    let statement_gap = layout.statement_gap;
     let table_aliases = layout.table_aliases;
     let show_whitespace = layout.show_whitespace;
     let indent_guides = layout.indent_guides;
@@ -1931,6 +1932,22 @@ pub(crate) fn theme_settings_overlay(
                 ),
             ))
             .style(ctrl);
+            let gap_dd = focusable_dropdown(
+                statement_gap,
+                schemaic_core::sqlfmt::StatementGap::ALL,
+                schemaic_core::sqlfmt::StatementGap::label,
+                ring.clone(),
+                180,
+            );
+            let gap_section = v_stack((
+                settings_group_label("Between statements"),
+                gap_dd,
+                form_hint(
+                    "The blank lines Format Code leaves between two statements. As typed \
+                     keeps a blank line wherever there was one.",
+                ),
+            ))
+            .style(ctrl);
             let editor_group = v_stack((
                 form_section_header("Editor"),
                 font_section,
@@ -1946,6 +1963,7 @@ pub(crate) fn theme_settings_overlay(
                 form_section_header("Code formatting"),
                 case_section,
                 commas_section,
+                gap_section,
             ))
             .style(|s| s.flex_col().gap(theme::scaled(16.0)));
 

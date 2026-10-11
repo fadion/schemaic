@@ -6158,12 +6158,15 @@ pub struct LayoutUi {
     /// Colour the editor's brackets by nesting; drives
     /// `theme::set_editor_rainbow_brackets`. Persisted.
     pub rainbow_brackets: RwSignal<bool>,
-    /// How Format Code cases keywords; drives
-    /// `theme::set_format_keyword_case`. Persisted.
+    /// How Format Code cases keywords; one part of
+    /// `theme::set_format_style`. Persisted.
     pub keyword_case: RwSignal<schemaic_core::sqlfmt::KeywordCase>,
-    /// Where Format Code puts a broken list's commas; drives
-    /// `theme::set_format_comma_style`. Persisted.
+    /// Where Format Code puts a broken list's commas; one part of
+    /// `theme::set_format_style`. Persisted.
     pub comma_style: RwSignal<schemaic_core::sqlfmt::CommaStyle>,
+    /// The blank lines Format Code leaves between statements; one part of
+    /// `theme::set_format_style`. Persisted.
+    pub statement_gap: RwSignal<schemaic_core::sqlfmt::StatementGap>,
     /// Write an alias after a table completion inserts; drives
     /// `theme::set_completion_table_aliases`. Persisted.
     pub table_aliases: RwSignal<bool>,

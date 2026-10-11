@@ -541,7 +541,8 @@ fn auto_pair_several(
 /// Reformat the SQL in `ed` (the Ctrl+Alt+L action, also the editor's right-click
 /// "Format SQL"). Formats the current selection if there is one, else the whole
 /// document; indentation follows the editor's tab-width / soft-tabs settings and
-/// keyword case is preserved. Applied as one `edit_single` (a single undo step);
+/// the rest of the layout Settings → Code formatting (`theme::format_style`).
+/// Applied as one `edit_single` (a single undo step);
 /// a no-op when the text is already formatted. A formatted selection stays
 /// selected; after the whole document, the caret keeps its place among the
 /// tokens; and a refused edit (the Ctrl+K preview's freeze) moves nothing.

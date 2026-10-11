@@ -13249,6 +13249,12 @@ existing prose was left alone.
   - `sqlfmt.rs` — `format_sql` (Ctrl+Alt+L pretty-printer): re-flows whitespace/indent/line-breaks
     "block" style, **preserving keyword case** itself; built on `skip_noncode` so comments/strings/
     backtick idents pass through untouched; indent follows editor tab-width/soft-tabs.
+    A line's indent is an `Ind { lv, col }` — `lv` indent units, then `col` spaces of alignment, two
+    parts because a unit may be a tab and an alignment never can be; the block layout moves only
+    `lv` (`ind + 1` adds a level, `up()` steps one out, never below the margin). `Fmt::run` is a loop
+    over `Fmt::step(toks, k)`, which lays out one token — and any follower it takes with it, a
+    head's `BY`, a `BEGIN`'s `TRY` — and answers the next index, so a layout can be tried and taken
+    back; the per-token arms below are `step`'s.
     **Keyword case is a setting now, and `format_sql` still does not know it** — the recasing is
     `apply_keyword_case(sql, dialect, KeywordCase)`, applied over `format_sql`'s output by
     `format_range` (and so by `format_statement`), the two functions a Format writes through.
@@ -13284,10 +13290,11 @@ existing prose was left alone.
     `CommaStyle` is `Trailing` (the default, *End of line*: the formatter as it always was) or
     `Leading` (*Start of line*), serialised and read leniently exactly as `KeywordCase` is, an
     unknown word being `Trailing` (`comma_style_defaults_to_end_of_line_and_reads_leniently`). The
-    two travel as a `FormatStyle { case, commas }`, and `format_range`/`format_statement` take
-    `impl Into<FormatStyle>`, with `From<KeywordCase>` supplying the default commas — so a caller
-    or test that passes a bare `KeywordCase` says nothing about commas and is unchanged.
-    `format_sql` stays trailing. `format_sql_under` takes the `CommaStyle` into `Fmt::leading_commas`,
+    settings travel as a `FormatStyle { case, commas, gap }`, and `format_range`/`format_statement`
+    take `impl Into<FormatStyle>`, with `From<KeywordCase>` putting every other setting at its
+    default — so a caller or test that passes a bare `KeywordCase` says nothing about the rest and
+    is unchanged. `format_sql` stays at the defaults. `format_sql_under` takes the whole
+    `FormatStyle` and sets the commas into `Fmt::leading_commas`,
     and the `","` arm moves only a **breakable** comma — the rule the layout already broke at: top
     level, or a subquery's or a listed paren's list — taking the same `break_to(self.content)`
     *before* the comma instead of after it. Every other comma stays where it was, so `IN (1, 2)`
@@ -13298,6 +13305,23 @@ existing prose was left alone.
     (`a_leading_comma_never_puts_code_after_a_line_comment`). The comma stays between the same two
     tokens, so only whitespace moves and `caret_after_format` holds over it as it does over a
     trailing layout.
+    **The blank lines between statements are the third** — `StatementGap`, read leniently as the
+    other two are, an unknown word being `One` (`statement_gap_reads_leniently`). `One` (the
+    default, *One blank line*) is the formatter as it always was: one blank line after a statement
+    at the margin, none between a body's, whatever the input had
+    (`one_blank_line_between_statements_is_the_default`); `None` (*No blank line*) runs every
+    statement into the next (`no_blank_line_runs_the_statements_together`). `Keep` (*As typed*)
+    writes one blank line wherever the input had one or more and none where it had none, **at any
+    depth**, so a body's statements may be parted too, which the other two never do. Both live in
+    `end_statement`: `One` sets `blank` only at level 0, and `Keep` sets `Fmt::gap_pending`
+    instead, which the next token settles by counting the newlines the input had before it. **It
+    is read at the first token that starts a new line, not the first token** — a line comment with
+    no newline before it trailed the terminator and is still the statement's line, so
+    `select 1; -- one⏎⏎select 2;` keeps its gap after the comment rather than losing it to the
+    comment's own blank-free run-up (`as_typed_keeps_the_blank_lines_the_input_had`, which holds
+    both that and a procedure body). Several blank lines become one; the setting does not keep
+    counts. A `GO` line is outside it: the batch after one starts after a blank line under all
+    three, as it always did.
     **`formattable_range` is what decides how much of the document a Format may touch**, and it is
     here rather than at the call site because `format_sql` lexes what it is handed **from byte 0**
     and takes that for a real token boundary. True of a whole document and of a selection whose ends
@@ -13454,7 +13478,7 @@ existing prose was left alone.
     `!<`/`!>` — each idempotent. Both were green on arrival: they guard, they did not find.
     **A line comment that trailed its line's code stays on that line**: with no newline before it in
     the input, the break the code before it asked for — a list comma's, a clause head's, a `;`'s —
-    is taken after it instead (`deferred` in `run`'s `LineComment` arm). Moved down past the break,
+    is taken after it instead (`deferred` in `step`'s `LineComment` arm). Moved down past the break,
     `a, -- first` came out over `b` and read as `b`'s note. `need_space` sets a line comment off
     from the code before it first thing, since after a `;` `end_statement` has cleared `prev` and
     `1;-- done` came out tight (`a_trailing_comment_stays_with_the_code_it_followed`).
@@ -13474,7 +13498,8 @@ existing prose was left alone.
     parameter's `@x int OUTPUT` takes no parens and a column may be called `output`
     (`top_keeps_its_space_and_output_is_a_clause`). **A `BEGIN … END` body is indented**
     (`Fmt::blocks`, a stack of the word that opened each open body): `end_statement` returns a
-    body's `;` to the body's level, not the margin, and with no blank line between its statements;
+    body's `;` to the body's level, not the margin, and with no blank line between its statements
+    unless `StatementGap::Keep` finds one in the input;
     `END` steps back to its `BEGIN`'s; T-SQL's `TRY`/`CATCH` stay with their word
     (`emit_block_follower`); a `BEGIN` takes a line of its own unless it ends a header (`AS BEGIN`,
     `THEN BEGIN`) or follows a label (`lbl: begin`). A transaction's `BEGIN` — `TRAN`,
@@ -27840,19 +27865,23 @@ existing prose was left alone.
     patch, which centres the whitespace marks in their line (*Floem 0.2 gotchas*). The palette's
     *Toggle Whitespace* and *Toggle Indent Guides* sit beside *Toggle Word Wrap*.
     **Keyword case** (Settings → *Code formatting*, its own section between *Editor* and *Query*,
-    the first of its two `focusable_dropdown`s; *As typed* by default — `UiState::format_keyword_case`,
+    the first of its three `focusable_dropdown`s; *As typed* by default — `UiState::format_keyword_case`,
     pinned by
     `format_keyword_case_defaults_to_as_typed_and_keeps_a_choice`; `LayoutUi::keyword_case`) is the
-    one editor setting here that paints nothing. `theme::format_style` reads it **untracked**
-    and its setter bumps no `editor_gen`, because nothing is drawn from it: Format Code
-    (`format_editor`'s `format_range`) and both *Format statement* sites — the key/palette request
-    and the right-click menu — ask for it at the moment they run. What it does to the text is the
-    `core/sqlfmt.rs` entry's. **Commas** sits after it (*End of line* by default —
-    `UiState::format_comma_style`, pinned by
-    `format_comma_style_defaults_to_end_of_line_and_keeps_a_choice`; `LayoutUi::comma_style`) and
-    is plumbed the same way, an untracked read and a setter that bumps nothing. The three Format
-    sites now ask `theme::format_style()`, which reads both settings untracked into the
-    `FormatStyle` the formatter takes, rather than the keyword case alone.
+    one editor setting here that paints nothing. **Commas** sits after it (*End of line* by
+    default — `UiState::format_comma_style`, pinned by
+    `format_comma_style_defaults_to_end_of_line_and_keeps_a_choice`; `LayoutUi::comma_style`), and
+    **Between statements** after that (*One blank line* by default, focus order 180 —
+    `UiState::format_statement_gap`, pinned by
+    `format_statement_gap_defaults_to_one_and_keeps_a_choice`; `LayoutUi::statement_gap`). What
+    each does to the text is the `core/sqlfmt.rs` entry's. **They reach the formatter as one
+    value**: the theme state holds a single `format_style: RwSignal<FormatStyle>`, and the app
+    composes it in one `create_effect` beside the other editor-setting effects, from the three
+    signals Settings edits one at a time, into `theme::set_format_style` — which replaced a setter
+    per setting. `theme::format_style()` reads it **untracked** and the setter bumps no
+    `editor_gen`, because nothing is drawn from it: Format Code (`format_editor`'s `format_range`)
+    and both *Format statement* sites — the key/palette request and the right-click menu — ask for
+    it at the moment they run.
     **`FieldSql` carries the same colouring into an `edit_field`** — the DDL preview's SQL box and
     the view, trigger, routine and snippet bodies, each of which sets `FieldCfg::sql` (under
     `lib.rs`). It

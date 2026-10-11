@@ -342,6 +342,9 @@ pub struct UiState {
     /// Where Format Code puts a broken list's commas. Default: end of line.
     #[serde(default)]
     pub format_comma_style: crate::sqlfmt::CommaStyle,
+    /// The blank lines Format Code leaves between statements. Default: one.
+    #[serde(default)]
+    pub format_statement_gap: crate::sqlfmt::StatementGap,
     /// Completion writes an alias after a table it inserts into a `FROM` or
     /// `JOIN` (`orders o`). Default: on.
     #[serde(default = "default_true")]
@@ -476,6 +479,7 @@ impl Default for UiState {
             editor_rainbow_brackets: false,
             format_keyword_case: crate::sqlfmt::KeywordCase::Keep,
             format_comma_style: crate::sqlfmt::CommaStyle::Trailing,
+            format_statement_gap: crate::sqlfmt::StatementGap::One,
             completion_table_aliases: true,
             editor_show_whitespace: false,
             editor_indent_guides: false,
@@ -1917,6 +1921,24 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&leading).expect("serialises"))
                 .expect("parses");
         assert_eq!(back.format_comma_style, CommaStyle::Leading);
+    }
+
+    /// One blank line between statements for a new install and a file written
+    /// before the setting existed, and a choice stays chosen.
+    #[test]
+    fn format_statement_gap_defaults_to_one_and_keeps_a_choice() {
+        use crate::sqlfmt::StatementGap;
+        assert_eq!(UiState::default().format_statement_gap, StatementGap::One);
+        let old: UiState = serde_json::from_str("{}").expect("parses");
+        assert_eq!(old.format_statement_gap, StatementGap::One);
+        let keep = UiState {
+            format_statement_gap: StatementGap::Keep,
+            ..UiState::default()
+        };
+        let back: UiState =
+            serde_json::from_str(&serde_json::to_string(&keep).expect("serialises"))
+                .expect("parses");
+        assert_eq!(back.format_statement_gap, StatementGap::Keep);
     }
 
     /// Completion writes table aliases for a new install and a file written

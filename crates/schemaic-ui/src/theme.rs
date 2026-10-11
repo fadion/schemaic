@@ -22,7 +22,7 @@ pub use crate::themes::{
     init, parse_hex, scale_at, scale_font_at, scaled, scaled_font, set_completion_table_aliases,
     set_editor, set_editor_font, set_editor_indent_guides, set_editor_rainbow_brackets,
     set_editor_show_whitespace, set_editor_soft_tabs, set_editor_tab_width, set_editor_word_wrap,
-    set_format_comma_style, set_format_keyword_case, set_ui, set_ui_scale, ui_generation, ui_scale,
+    set_format_style, set_ui, set_ui_scale, ui_generation, ui_scale,
 };
 
 /// The active editor theme struct (surface + token palette) — for the SQL editor

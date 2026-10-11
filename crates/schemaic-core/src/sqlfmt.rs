@@ -67,7 +67,7 @@ pub fn formattable_range(
 /// One newline either way: the trailing blank lines a document collects are
 /// still whitespace to re-flow.
 pub fn format_sql(sql: &str, indent_unit: &str, dialect: SqlDialect) -> String {
-    format_sql_under(sql, indent_unit, dialect, None, CommaStyle::Trailing)
+    format_sql_under(sql, indent_unit, dialect, None, FormatStyle::default())
 }
 
 /// [`format_sql`] of a fragment that begins where `delim` is the statement
@@ -78,11 +78,12 @@ fn format_sql_under(
     indent_unit: &str,
     dialect: SqlDialect,
     mut delim: Option<String>,
-    commas: CommaStyle,
+    style: FormatStyle,
 ) -> String {
     let toks = tokenize(sql, dialect, &mut delim);
     let mut f = Fmt::new(indent_unit, sql, dialect);
-    f.leading_commas = commas == CommaStyle::Leading;
+    f.leading_commas = style.commas == CommaStyle::Leading;
+    f.gap = style.gap;
     f.run(&toks);
     let out = f.out.trim_end();
     if sql.ends_with('\n') {
@@ -167,13 +168,53 @@ impl<'de> serde::Deserialize<'de> for CommaStyle {
     }
 }
 
+/// How many blank lines Format Code leaves between two statements —
+/// Settings → Code formatting. `One`, the default, is the formatter as it
+/// always was: one between statements at the margin, none between a body's.
+/// `Keep` writes one wherever the input had at least one, at any depth.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StatementGap {
+    #[default]
+    One,
+    None,
+    Keep,
+}
+
+impl StatementGap {
+    /// Every choice, in the order Settings lists them.
+    pub const ALL: [StatementGap; 3] = [StatementGap::One, StatementGap::None, StatementGap::Keep];
+
+    /// The setting's label.
+    pub fn label(self) -> &'static str {
+        match self {
+            StatementGap::One => "One blank line",
+            StatementGap::None => "No blank line",
+            StatementGap::Keep => "As typed",
+        }
+    }
+}
+
+/// Read leniently, as [`KeywordCase`] is.
+impl<'de> serde::Deserialize<'de> for StatementGap {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let word = String::deserialize(d)?;
+        Ok(match word.as_str() {
+            "none" => StatementGap::None,
+            "keep" => StatementGap::Keep,
+            _ => StatementGap::One,
+        })
+    }
+}
+
 /// The user's Format Code settings, carried together. A bare [`KeywordCase`]
-/// converts into one with the default commas, so a caller — or a test — that
-/// asks only about case says nothing about commas.
+/// converts into one with every other setting at its default, so a caller —
+/// or a test — that asks only about case says nothing about the rest.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FormatStyle {
     pub case: KeywordCase,
     pub commas: CommaStyle,
+    pub gap: StatementGap,
 }
 
 impl From<KeywordCase> for FormatStyle {
@@ -366,9 +407,10 @@ pub fn format_range(
     dialect: SqlDialect,
     style: impl Into<FormatStyle>,
 ) -> String {
-    let FormatStyle { case, commas } = style.into();
+    let style = style.into();
+    let case = style.case;
     if lo == 0 && hi == full.len() {
-        let formatted = format_sql_under(full, indent_unit, dialect, None, commas);
+        let formatted = format_sql_under(full, indent_unit, dialect, None, style);
         return apply_keyword_case(&formatted, dialect, case);
     }
     let frag = &full[lo..hi];
@@ -379,7 +421,7 @@ pub fn format_range(
     let lead = &frag[..frag.len() - frag.trim_start().len()];
     let trail = &frag[frag.trim_end().len()..];
     let delim = terminator_at(full, lo, dialect);
-    let formatted = format_sql_under(body, indent_unit, dialect, delim.clone(), commas);
+    let formatted = format_sql_under(body, indent_unit, dialect, delim.clone(), style);
     format!(
         "{lead}{}{trail}",
         apply_keyword_case_under(&formatted, dialect, case, delim)
@@ -1401,6 +1443,11 @@ struct Fmt<'a> {
     /// A broken list's comma opens the next line rather than ending this one
     /// ([`CommaStyle::Leading`]).
     leading_commas: bool,
+    /// The blank lines between statements ([`StatementGap`]).
+    gap: StatementGap,
+    /// A statement has just ended under [`StatementGap::Keep`], and the
+    /// blank line after it waits on the input's gap before the next one.
+    gap_pending: bool,
 }
 
 /// One open `CASE`: the indent of the line it opened on, the paren depth it
@@ -1442,6 +1489,8 @@ impl<'a> Fmt<'a> {
             named_ends: crate::pairs::names_its_block_ends(dialect),
             composable: operators_are_composable(dialect),
             leading_commas: false,
+            gap: StatementGap::One,
+            gap_pending: false,
         }
     }
 
@@ -1850,6 +1899,13 @@ impl<'a> Fmt<'a> {
             // What the input had between this token and the one before it.
             let prev_tok = k.checked_sub(1).map(|j| toks[j]);
             let gap = prev_tok.map_or("", |(_, p)| self.between(p, text));
+            // After a statement under `Keep`: the blank line is the input's,
+            // read at the first token on a new line — a comment trailing the
+            // terminator is still the statement's line.
+            if self.gap_pending && (kind != Kind::LineComment || gap.contains('\n')) {
+                self.gap_pending = false;
+                self.blank = gap.matches('\n').count() >= 2;
+            }
             match kind {
                 Kind::LineComment => {
                     // A comment that trailed its line's code stays on that
@@ -2264,7 +2320,8 @@ impl<'a> Fmt<'a> {
         self.cases.clear();
         self.awaiting = None;
         self.prev = None;
-        self.blank = level.lv == 0;
+        self.blank = level.lv == 0 && self.gap == StatementGap::One;
+        self.gap_pending = self.gap == StatementGap::Keep;
         self.break_to(level);
     }
 
@@ -2529,6 +2586,7 @@ mod tests {
             FormatStyle {
                 case: KeywordCase::Keep,
                 commas: CommaStyle::Leading,
+                ..FormatStyle::default()
             },
         );
         // The default with each line-ending comma moved onto the next line.
@@ -2565,6 +2623,7 @@ mod tests {
         let leading = FormatStyle {
             case: KeywordCase::Keep,
             commas: CommaStyle::Leading,
+            ..FormatStyle::default()
         };
         let sql = "select a, -- the key\n b, c from t";
         let out = format_range(sql, 0, sql.len(), IND, SqlDialect::MySql, leading);
@@ -2593,6 +2652,75 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&CommaStyle::Leading).unwrap(),
             "\"leading\""
+        );
+    }
+
+    /// Format the whole of `sql` on MySQL with two-space indents under `style`.
+    fn styled(sql: &str, style: FormatStyle) -> String {
+        format_range(sql, 0, sql.len(), IND, SqlDialect::MySql, style)
+    }
+
+    fn gap(gap: StatementGap) -> FormatStyle {
+        FormatStyle {
+            gap,
+            ..FormatStyle::default()
+        }
+    }
+
+    /// The default is the formatter as it always was: one blank line between
+    /// two statements at the margin, whatever the input had there.
+    #[test]
+    fn one_blank_line_between_statements_is_the_default() {
+        assert_eq!(StatementGap::default(), StatementGap::One);
+        let sql = "select 1;select 2;\n\n\n\nselect 3;";
+        let want = "select\n  1;\n\nselect\n  2;\n\nselect\n  3;";
+        assert_eq!(styled(sql, gap(StatementGap::One)), want);
+        assert_eq!(styled(sql, FormatStyle::default()), want);
+    }
+
+    #[test]
+    fn no_blank_line_runs_the_statements_together() {
+        assert_eq!(
+            styled("select 1;\n\n\nselect 2;", gap(StatementGap::None)),
+            "select\n  1;\nselect\n  2;"
+        );
+    }
+
+    /// As typed: a blank line where the input had one or more, none where it
+    /// had none — counted after a comment trailing the terminator, which is
+    /// still the statement's line.
+    #[test]
+    fn as_typed_keeps_the_blank_lines_the_input_had() {
+        let keep = gap(StatementGap::Keep);
+        assert_eq!(
+            styled("select 1;select 2;\n\n\n\nselect 3;", keep),
+            "select\n  1;\nselect\n  2;\n\nselect\n  3;"
+        );
+        assert_eq!(
+            styled("select 1; -- one\n\nselect 2; -- two\nselect 3;", keep),
+            "select\n  1; -- one\n\nselect\n  2; -- two\nselect\n  3;"
+        );
+        // A body's statements too, which the other two never part.
+        assert_eq!(
+            styled(
+                "create procedure p() begin select 1;\n\nselect 2; select 3; end",
+                keep
+            ),
+            "create procedure p()\nbegin\n  select\n    1;\n\n  select\n    2;\n  select\n    3;\nend"
+        );
+    }
+
+    #[test]
+    fn statement_gap_reads_leniently() {
+        let back: StatementGap = serde_json::from_str("\"keep\"").unwrap();
+        assert_eq!(back, StatementGap::Keep);
+        let back: StatementGap = serde_json::from_str("\"none\"").unwrap();
+        assert_eq!(back, StatementGap::None);
+        let odd: StatementGap = serde_json::from_str("\"two\"").unwrap();
+        assert_eq!(odd, StatementGap::One);
+        assert_eq!(
+            serde_json::to_string(&StatementGap::Keep).unwrap(),
+            "\"keep\""
         );
     }
 

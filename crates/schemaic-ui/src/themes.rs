@@ -948,10 +948,8 @@ struct ThemeState {
     editor_word_wrap: RwSignal<bool>,
     // Whether the editor colours brackets by their nesting.
     editor_rainbow_brackets: RwSignal<bool>,
-    // How Format Code cases keywords.
-    format_keyword_case: RwSignal<schemaic_core::sqlfmt::KeywordCase>,
-    // Where Format Code puts a broken list's commas.
-    format_comma_style: RwSignal<schemaic_core::sqlfmt::CommaStyle>,
+    // Every Format Code setting, as the formatter takes them.
+    format_style: RwSignal<schemaic_core::sqlfmt::FormatStyle>,
     // Whether completion writes an alias after a table it inserts.
     completion_table_aliases: RwSignal<bool>,
     // Whether the editor draws whitespace marks, and indent guides.
@@ -993,10 +991,7 @@ fn with_state<R>(f: impl FnOnce(&ThemeState) -> R) -> R {
                 editor_soft_tabs: scope.create_rw_signal(true),
                 editor_word_wrap: scope.create_rw_signal(false),
                 editor_rainbow_brackets: scope.create_rw_signal(false),
-                format_keyword_case: scope
-                    .create_rw_signal(schemaic_core::sqlfmt::KeywordCase::Keep),
-                format_comma_style: scope
-                    .create_rw_signal(schemaic_core::sqlfmt::CommaStyle::Trailing),
+                format_style: scope.create_rw_signal(Default::default()),
                 completion_table_aliases: scope.create_rw_signal(true),
                 editor_show_whitespace: scope.create_rw_signal(false),
                 editor_indent_guides: scope.create_rw_signal(false),
@@ -1247,23 +1242,16 @@ pub fn set_editor_rainbow_brackets(on: bool) {
     });
 }
 
-/// Set how Format Code cases keywords.
-pub fn set_format_keyword_case(case: schemaic_core::sqlfmt::KeywordCase) {
-    with_state(|st| st.format_keyword_case.set(case));
-}
-
-/// Set where Format Code puts a broken list's commas.
-pub fn set_format_comma_style(commas: schemaic_core::sqlfmt::CommaStyle) {
-    with_state(|st| st.format_comma_style.set(commas));
+/// Set every Format Code setting at once — the app composes them from the
+/// separate signals Settings edits.
+pub fn set_format_style(style: schemaic_core::sqlfmt::FormatStyle) {
+    with_state(|st| st.format_style.set(style));
 }
 
 /// Every Format Code setting, as the formatter takes them. Read when it runs,
 /// so nothing repaints.
 pub fn format_style() -> schemaic_core::sqlfmt::FormatStyle {
-    with_state(|st| schemaic_core::sqlfmt::FormatStyle {
-        case: st.format_keyword_case.get_untracked(),
-        commas: st.format_comma_style.get_untracked(),
-    })
+    with_state(|st| st.format_style.get_untracked())
 }
 
 /// Whether completion writes an alias after a table it inserts. Read when an
