@@ -8358,20 +8358,23 @@ async fn a_lock_wait_lists_the_waiter_and_its_holder() {
     let s = Scratch::create("locks_wait").await;
     s.exec("CREATE TABLE dbo.t (id int NOT NULL PRIMARY KEY, v int); INSERT dbo.t VALUES (1, 0)")
         .await;
-    let holder = {
-        let (db, name) = (s.db.clone(), s.name.clone());
-        tokio::spawn(async move {
-            db.fetch_query(
-                Some(&name),
-                "BEGIN TRANSACTION; UPDATE dbo.t SET v = 1 WHERE id = 1; \
-                 WAITFOR DELAY '00:00:04'; ROLLBACK",
-                1,
-                CancellationToken::new(),
-            )
-            .await
-        })
-    };
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    // A pinned session holds the row until the test lets it go — a holder
+    // on a timer (`WAITFOR`) could roll back before a loaded machine's poll
+    // saw the wait, and did.
+    let holder = schemaic_db::session::Session::open(&s.db, Some(&s.name))
+        .await
+        .expect("pin a session");
+    holder.ensure_tx().await.expect("BEGIN");
+    holder
+        .fetch_query(
+            "UPDATE dbo.t SET v = 1 WHERE id = 1",
+            1,
+            CancellationToken::new(),
+        )
+        .await
+        .result
+        .expect("the holder's update");
+    let holder_id = holder.server_id().expect("the session's server id");
     let waiter = {
         let (db, name) = (s.db.clone(), s.name.clone());
         tokio::spawn(async move {
@@ -8385,32 +8388,74 @@ async fn a_lock_wait_lists_the_waiter_and_its_holder() {
         })
     };
     let mut seen = None;
-    for _ in 0..30 {
+    for _ in 0..100 {
         let list = s.db.fetch_locks().await.expect("fetch_locks");
         if list
             .locks
             .iter()
-            .any(|l| !l.granted && !l.blocked_by.is_empty())
+            .any(|l| !l.granted && l.blocked_by.contains(&holder_id))
         {
             seen = Some(list);
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    let list = seen.expect("a waiting lock with its blocker");
-    let waiting = &list.locks[0];
-    assert!(!waiting.granted, "the waits lead: {:?}", list.locks);
-    let blocker = waiting.blocked_by[0];
+    let list = seen.expect("a waiting lock blocked by the holder");
+    assert!(!list.locks[0].granted, "the waits lead: {:?}", list.locks);
     assert!(
         list.locks
             .iter()
-            .any(|l| l.granted && l.session == blocker && l.object.contains(".dbo.t")),
+            // Named, or by id when another session's DDL elsewhere put the
+            // poll on its nameless fallback (`fetch_locks`) — which a
+            // concurrent `the_lock_list_answers_while_ddl_holds_a_table` does.
+            .any(|l| l.granted
+                && l.session == holder_id
+                && (l.object.contains(".dbo.t") || l.object.contains(": object "))),
         "the holder's lock on the table: {:?}",
         list.locks
     );
     assert!(!list.contended_only);
-    let _ = holder.await;
-    let _ = waiter.await;
+    holder.rollback().await.expect("rollback");
+    waiter
+        .await
+        .expect("the waiter's task")
+        .expect("the waiter's update");
+    holder.close().await;
+}
+
+/// **The Locks view answers while a DDL statement holds its table.** An
+/// uncommitted `ALTER TABLE` holds `Sch-M`, and `OBJECT_NAME` on that table
+/// waits behind it under any isolation level — so the named query, asked
+/// with nothing else in front of it, hung until the poll's deadline and the
+/// list said "timed out" exactly when it was wanted. It falls back to ids.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_lock_list_answers_while_ddl_holds_a_table() {
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("locks_ddl").await;
+    s.exec("CREATE TABLE dbo.t (id int NOT NULL PRIMARY KEY, v int)")
+        .await;
+    let holder = schemaic_db::session::Session::open(&s.db, Some(&s.name))
+        .await
+        .expect("pin a session");
+    holder.ensure_tx().await.expect("BEGIN");
+    holder
+        .fetch_query("ALTER TABLE dbo.t ADD c int", 1, CancellationToken::new())
+        .await
+        .result
+        .expect("the holder's ALTER");
+    let holder_id = holder.server_id().expect("the session's server id");
+    let list = s.db.fetch_locks().await.expect("the list answers");
+    assert!(
+        list.locks
+            .iter()
+            .any(|l| l.granted && l.session == holder_id && l.mode == "Sch-M"),
+        "the holder's schema lock: {:?}",
+        list.locks
+    );
+    holder.rollback().await.expect("rollback");
+    holder.close().await;
 }
 
 /// The activity panel sees the server's other sessions — not the one

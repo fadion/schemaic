@@ -3433,7 +3433,21 @@ pub(crate) async fn fetch_sessions(
 pub(crate) async fn fetch_locks(db: &Db) -> Result<schemaic_core::activity::LockList, DbError> {
     use schemaic_core::activity;
     let mut client = connect(db, None).await?;
-    let rows = query_rows(&mut client, &locks_sql(activity::MAX_LOCKS + 1)).await?;
+    // **Names are asked for under a short lock timeout, and dropped when they
+    // would block.** `OBJECT_NAME` and `sys.partitions` wait on an object a
+    // DDL statement holds `Sch-M` on — under READ UNCOMMITTED too (Msg 1222
+    // under a `LOCK_TIMEOUT`, measured on 2022) — so a lock list asked for
+    // while an `ALTER TABLE` is stuck would itself hang behind it, which is
+    // the moment the list is wanted. One second for the names, then the same
+    // list labelled by database and id.
+    query_rows(&mut client, "SET LOCK_TIMEOUT 1000").await?;
+    let limit = activity::MAX_LOCKS + 1;
+    let rows = match query_rows(&mut client, &locks_sql(limit, true)).await {
+        Err(e) if e.to_string().contains("Msg 1222") => {
+            query_rows(&mut client, &locks_sql(limit, false)).await?
+        }
+        other => other?,
+    };
     let truncated = rows.len() > activity::MAX_LOCKS;
     let locks = rows
         .into_iter()
@@ -3483,18 +3497,33 @@ pub(crate) async fn fetch_server_vars(
         .collect())
 }
 
-/// [`fetch_locks`]' query, its first `limit` rows, waits first.
-fn locks_sql(limit: usize) -> String {
+/// [`fetch_locks`]' query, its first `limit` rows, waits first — with the
+/// objects' names (`named`), or labelled by database and id where asking for
+/// a name would wait behind the lock being listed.
+fn locks_sql(limit: usize, named: bool) -> String {
+    let object = if named {
+        "WHEN l.resource_type = 'OBJECT' THEN DB_NAME(l.resource_database_id) + '.' \
+           + OBJECT_SCHEMA_NAME(l.resource_associated_entity_id, l.resource_database_id) \
+           + '.' + OBJECT_NAME(l.resource_associated_entity_id, l.resource_database_id) \
+         WHEN p.object_id IS NOT NULL THEN DB_NAME(l.resource_database_id) + '.' \
+           + OBJECT_SCHEMA_NAME(p.object_id) + '.' + OBJECT_NAME(p.object_id) \
+           + ISNULL(' ' + NULLIF(RTRIM(l.resource_description), ''), '')"
+    } else {
+        "WHEN l.resource_type = 'OBJECT' THEN DB_NAME(l.resource_database_id) \
+           + ': object ' + CAST(l.resource_associated_entity_id AS varchar(20))"
+    };
+    let partitions = if named {
+        "LEFT JOIN sys.partitions p ON p.hobt_id = l.resource_associated_entity_id \
+           AND l.resource_database_id = DB_ID() \
+           AND l.resource_type IN ('KEY', 'PAGE', 'RID', 'HOBT')"
+    } else {
+        ""
+    };
     format!(
         "SELECT TOP ({limit}) CAST(l.request_session_id AS varchar(20)), \
            CASE \
-             WHEN l.resource_type = 'OBJECT' THEN DB_NAME(l.resource_database_id) + '.' \
-               + OBJECT_SCHEMA_NAME(l.resource_associated_entity_id, l.resource_database_id) \
-               + '.' + OBJECT_NAME(l.resource_associated_entity_id, l.resource_database_id) \
+             {object} \
              WHEN l.resource_type = 'DATABASE' THEN DB_NAME(l.resource_database_id) \
-             WHEN p.object_id IS NOT NULL THEN DB_NAME(l.resource_database_id) + '.' \
-               + OBJECT_SCHEMA_NAME(p.object_id) + '.' + OBJECT_NAME(p.object_id) \
-               + ISNULL(' ' + NULLIF(RTRIM(l.resource_description), ''), '') \
              ELSE ISNULL(DB_NAME(l.resource_database_id), '') \
                + ISNULL(' ' + NULLIF(RTRIM(l.resource_description), ''), '') \
            END, \
@@ -3502,9 +3531,7 @@ fn locks_sql(limit: usize) -> String {
            CASE WHEN l.request_status = 'GRANT' THEN '1' ELSE '0' END, \
            CAST(w.blocking_session_id AS varchar(20)) \
          FROM sys.dm_tran_locks l \
-         LEFT JOIN sys.partitions p ON p.hobt_id = l.resource_associated_entity_id \
-           AND l.resource_database_id = DB_ID() \
-           AND l.resource_type IN ('KEY', 'PAGE', 'RID', 'HOBT') \
+         {partitions} \
          LEFT JOIN sys.dm_os_waiting_tasks w ON w.resource_address = l.lock_owner_address \
            AND w.blocking_session_id IS NOT NULL \
          WHERE l.request_session_id > 0 AND l.request_session_id <> @@SPID \

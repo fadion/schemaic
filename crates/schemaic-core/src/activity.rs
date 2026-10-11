@@ -1197,7 +1197,8 @@ pub const MAX_LOCKS: usize = 500;
 /// Order a fetched lock list and bound it: every **waiting** lock first —
 /// what is stuck is what the view is opened for — then the held ones, each
 /// by object and session. Blockers are deduplicated (one row per lock pair is
-/// the engines' unit, as for [`prepare`]). Returns whether the cap cut it.
+/// the engines' unit, as for [`prepare`]), and identical rows are merged —
+/// SQL Server answers one per lock owner. Returns whether the cap cut it.
 pub fn prepare_locks(locks: &mut Vec<LockInfo>) -> bool {
     for l in locks.iter_mut() {
         l.blocked_by.sort_unstable();
@@ -1209,7 +1210,12 @@ pub fn prepare_locks(locks: &mut Vec<LockInfo>) -> bool {
             .then_with(|| a.object.cmp(&b.object))
             .then_with(|| a.session.cmp(&b.session))
             .then_with(|| a.mode.cmp(&b.mode))
+            .then_with(|| a.kind.cmp(&b.kind))
     });
+    // An identical row is one lock: SQL Server answers a row per lock
+    // *owner*, so one `ALTER TABLE`'s schema lock came back twenty times.
+    // Sorted on every field first, so duplicates are adjacent.
+    locks.dedup();
     let truncated = locks.len() > MAX_LOCKS;
     if truncated {
         locks.truncate(MAX_LOCKS);
@@ -2802,6 +2808,16 @@ mod tests {
         let order: Vec<(i64, bool)> = locks.iter().map(|l| (l.session, l.granted)).collect();
         assert_eq!(order, [(7, false), (9, false), (3, true), (5, true)]);
         assert_eq!(locks[1].blocked_by, [5]);
+        // **An identical row is one lock.** SQL Server answers one row per
+        // lock *owner*, so an `ALTER TABLE`'s schema lock came back twenty
+        // times over, identical, burying everything else.
+        let mut twice = vec![
+            lock(5, "t", true, &[]),
+            lock(5, "t", true, &[]),
+            lock(6, "t", true, &[]),
+        ];
+        prepare_locks(&mut twice);
+        assert_eq!(twice.len(), 2, "{twice:?}");
         let mut many: Vec<LockInfo> = (0..MAX_LOCKS as i64 + 3)
             .map(|i| lock(i, "t", true, &[]))
             .collect();

@@ -15442,7 +15442,16 @@ existing prose was left alone.
   connection is in, so elsewhere it shows the database and the engine's own `resource_description`.
   Blockers come from `sys.dm_os_waiting_tasks` on `lock_owner_address`, and besides `@@SPID` it
   leaves out every session's granted shared `DATABASE` lock, which is held by existing and would be
-  most of the list. What the live tests saw (below): MariaDB `db.imp (PRIMARY) 1`, `RECORD` `X`;
+  most of the list. **The names are asked for under `SET LOCK_TIMEOUT 1000`, and dropped when they
+  would block**: `OBJECT_NAME` waits behind another session's `Sch-M` under any isolation level
+  (Msg 1222 with READ UNCOMMITTED, measured on 2022), so a lock list asked for while an `ALTER
+  TABLE` was stuck hung to the poll's deadline — exactly when it was wanted. On 1222 the query is
+  re-run with `locks_sql(_, false)`, which labels objects `db: object <id>` and skips
+  `sys.partitions` (`the_lock_list_answers_while_ddl_holds_a_table`). SQL Server also answers a
+  row per lock *owner*, so `prepare_locks` merges identical rows; one `ALTER TABLE` came back
+  twenty times. Under the full live tier's load the two SQL Server lock tests can still meet the
+  poll's deadline, and pass alone — a load flake, not a wrong answer.
+  What the live tests saw (below): MariaDB `db.imp (PRIMARY) 1`, `RECORD` `X`;
   MySQL `RECORD` `X,REC_NOT_GAP` beside a `TABLE` `IX`; PostgreSQL the waiter on `transaction N`,
   `transactionid` `ShareLock`, with relation and tuple locks on `imp` and `imp_pkey`.
   **`Db::fetch_server_vars(kind)` is the Server variables viewer's backend**, beside the two above
