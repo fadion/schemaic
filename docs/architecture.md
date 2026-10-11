@@ -24638,6 +24638,15 @@ existing prose was left alone.
     `the_scan_sees_the_export_submenu_in_all_three_arms` reads this file's own source for lines
     beginning `entries.push(export_submenu(` and `entries.extend(create_submenu(`, so changing what
     those two calls *take* costs nothing and re-wrapping how they are *written* blinds the gate.
+    **The palette's *Go to Statement* is the script's outline**: a `CmdArg::Options` command whose
+    list is `core::sql::outline` over the active tab's text in its connection's dialect — each
+    statement `statement_ranges` finds, labelled `line: code` with the code folded onto one line by
+    `history::preview` and both the line and the offset taken **past any comment above the
+    statement**, so a leading `-- note` is neither the label nor where the jump lands
+    (`each_statement_is_listed_at_its_code`). The pick sets `Tab::jump_offset`, the request
+    *Go to Line* uses. A long script's `CREATE`s, temp tables and `WITH`s are found by typing part
+    of what they say; the options filter also matches the value, the offset, so a typed number can
+    match a statement by its byte position as well as its line.
     **The error modal wears `modal_title("Error", …)` and its ✕**, where it used to have neither a
     title row nor a close button and only click-away and Escape closed it. All three exits run the
     one `close`, which is also what clears `error_modal_text` so the editor bar's next *View* falls

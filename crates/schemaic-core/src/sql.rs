@@ -3068,6 +3068,36 @@ pub fn is_runnable_segment(sql: &str, lo: usize, hi: usize, dialect: SqlDialect)
         && !is_delimiter_directive(sql, lo, hi, dialect)
 }
 
+/// The script's **outline** — the palette's *Go to statement* list: each
+/// statement [`statement_ranges`] finds, as `(offset, line, label)`.
+///
+/// The offset and the 1-based line are where the statement's **code**
+/// starts, past any comment above it, which is where the jump lands; the
+/// label is that code folded onto one line ([`crate::history::preview`],
+/// clamped), so a `CREATE TEMPORARY TABLE`, a `WITH` and its CTE names, or a
+/// procedure's header read as what they are.
+pub fn outline(sql: &str, dialect: SqlDialect) -> Vec<(usize, usize, String)> {
+    let b = sql.as_bytes();
+    let (mut line, mut counted) = (1usize, 0usize);
+    statement_ranges(sql, dialect)
+        .into_iter()
+        .map(|(lo, hi)| {
+            // Past whitespace and comments to the first byte of code.
+            let mut at = lo;
+            while at < hi {
+                match skip_comment(b, at, dialect) {
+                    Some(j) => at = j.max(at + 1),
+                    None if b[at].is_ascii_whitespace() => at += 1,
+                    None => break,
+                }
+            }
+            line += sql[counted..at].matches('\n').count();
+            counted = at;
+            (at, line, crate::history::preview(&sql[at..hi]))
+        })
+        .collect()
+}
+
 /// The uppercased first keyword of `sql` (skipping leading whitespace and
 /// comments), or `None` if it doesn't start with a word.
 pub fn leading_keyword(sql: &str, dialect: SqlDialect) -> Option<String> {
@@ -6414,6 +6444,29 @@ const SECRET_CALLS: &[&str] = &[
     "DBLINK_CONNECT_U",
     "DBLINK_EXEC",
 ];
+
+#[cfg(test)]
+mod outline_tests {
+    use super::outline;
+    use crate::intel::SqlDialect::MySql;
+
+    /// **One row per statement, where its code starts**: a leading comment is
+    /// neither its label nor where the jump lands, the line is the code's, and
+    /// a comment-only tail is no statement.
+    #[test]
+    fn each_statement_is_listed_at_its_code() {
+        let sql = "-- setup\nCREATE TEMPORARY TABLE t (id int);\n\n\
+                   WITH recent AS (SELECT 1)\n  SELECT *\n  FROM recent;\n-- done\n";
+        let rows = outline(sql, MySql);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0].0, sql.find("CREATE").unwrap());
+        assert_eq!(rows[0].1, 2);
+        assert_eq!(rows[0].2, "CREATE TEMPORARY TABLE t (id int);");
+        assert_eq!(rows[1].1, 4);
+        assert_eq!(rows[1].2, "WITH recent AS (SELECT 1) SELECT * FROM recent;");
+        assert!(outline("  -- nothing here\n", MySql).is_empty());
+    }
+}
 
 #[cfg(test)]
 mod changes_schema_tests {

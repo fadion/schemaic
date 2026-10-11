@@ -4026,6 +4026,46 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
                 }),
             },
         },
+        // The script's outline (`sql::outline`): every statement of the active
+        // tab, by line and as its code reads, and the pick jumps there — a
+        // long script's `CREATE`s, temp tables and `WITH`s found by typing.
+        Command {
+            name: "go to statement",
+            label: "Go to Statement",
+            hint: "<search>",
+            arg: CmdArg::Options {
+                list: Rc::new(move || {
+                    let Some(t) = active_tab() else {
+                        return Vec::new();
+                    };
+                    let dialect = connections
+                        .with_untracked(|cs| {
+                            cs.iter()
+                                .find(|c| c.id == t.conn_id.get_untracked())
+                                .map(|c| schemaic_core::intel::SqlDialect::from_db_type(&c.db_type))
+                        })
+                        .unwrap_or_default();
+                    t.query.with_untracked(|q| {
+                        schemaic_core::sql::outline(q, dialect)
+                            .into_iter()
+                            .map(|(at, line, label)| (at.to_string(), format!("{line}: {label}")))
+                            .collect()
+                    })
+                }),
+                run: {
+                    let close = close.clone();
+                    Rc::new(move |at: String| {
+                        if let Some(t) = active_tab()
+                            && let Ok(off) = at.parse::<usize>()
+                        {
+                            t.jump_offset.set(Some(off));
+                        }
+                        (close)();
+                    })
+                },
+                live: None,
+            },
+        },
         Command {
             name: "history",
             label: "History",
