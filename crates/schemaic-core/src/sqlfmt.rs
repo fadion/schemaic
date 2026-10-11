@@ -1290,28 +1290,67 @@ fn unary_context(prev_punct: &str) -> bool {
     )
 }
 
-struct Paren {
-    subquery: bool,
-    saved_base: usize,
-    saved_content: usize,
-    /// A `CREATE TABLE`'s body ([`Fmt::opens_table_body`]): one item a line,
-    /// the `)` back at this indent.
-    listed: Option<usize>,
+/// Where a line starts: `lv` indent units, then `col` spaces of alignment.
+///
+/// Two parts because a unit may be a tab, and an alignment never can be — a
+/// column lined up under a word is a count of characters. The block layout
+/// only ever moves `lv`; `col` is the river's and an aligned list's. Adding a
+/// number adds levels, which is what every `base + 1` in the layout means.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Ind {
+    lv: usize,
+    col: usize,
 }
 
+impl Ind {
+    /// `lv` levels and no alignment.
+    fn lv(lv: usize) -> Ind {
+        Ind { lv, col: 0 }
+    }
+
+    /// One level out, never below the margin.
+    fn up(self) -> Ind {
+        Ind {
+            lv: self.lv.saturating_sub(1),
+            ..self
+        }
+    }
+}
+
+impl std::ops::Add<usize> for Ind {
+    type Output = Ind;
+    fn add(self, levels: usize) -> Ind {
+        Ind {
+            lv: self.lv + levels,
+            ..self
+        }
+    }
+}
+
+#[derive(Clone)]
+struct Paren {
+    subquery: bool,
+    saved_base: Ind,
+    saved_content: Ind,
+    /// A `CREATE TABLE`'s body ([`Fmt::opens_table_body`]): one item a line,
+    /// the `)` back at this indent.
+    listed: Option<Ind>,
+}
+
+#[derive(Clone)]
 struct Fmt<'a> {
     unit: &'a str,
     out: String,
-    /// Pending line break to this indent level, materialized on the next emit.
-    pending: Option<usize>,
+    /// Pending line break to this indent, materialized on the next emit.
+    pending: Option<Ind>,
     /// Emit a blank line (double newline) at the next materialized break.
     blank: bool,
-    line_indent: usize,
+    line_indent: Ind,
     line_has_content: bool,
     /// Clause base indent for the current block; clause keywords print here.
-    base: usize,
+    base: Ind,
     /// Where clause bodies / commas / `AND`/`OR` break to (usually `base + 1`).
-    content: usize,
+    content: Ind,
     parens: Vec<Paren>,
     /// How many `[` are open — an array constructor's or a subscript's. Their
     /// commas are an element list's, never a clause list's, and the brackets
@@ -1367,8 +1406,9 @@ struct Fmt<'a> {
 /// One open `CASE`: the indent of the line it opened on, the paren depth it
 /// opened at (its `WHEN`/`ELSE`/`END` are the ones at that depth), and whether
 /// it is laid out — not inside a function's parens, where it stays inline.
+#[derive(Clone)]
 struct CaseFrame {
-    indent: usize,
+    indent: Ind,
     depth: usize,
     laid_out: bool,
 }
@@ -1383,10 +1423,10 @@ impl<'a> Fmt<'a> {
             out: String::new(),
             pending: None,
             blank: false,
-            line_indent: 0,
+            line_indent: Ind::default(),
             line_has_content: false,
-            base: 0,
-            content: 0,
+            base: Ind::default(),
+            content: Ind::default(),
             parens: Vec::new(),
             brackets: 0,
             prev: None,
@@ -1409,7 +1449,7 @@ impl<'a> Fmt<'a> {
     /// a statement one level in.
     fn open_block(&mut self, kind: &'static str) {
         self.blocks.push(kind);
-        self.base = self.blocks.len();
+        self.base = Ind::lv(self.blocks.len());
         self.content = self.base;
         self.prev = None;
         self.break_to(self.base);
@@ -1507,7 +1547,7 @@ impl<'a> Fmt<'a> {
         self.cases.last().filter(|f| f.depth == self.parens.len())
     }
 
-    fn break_to(&mut self, level: usize) {
+    fn break_to(&mut self, level: Ind) {
         // Overwrites any prior pending break, so repeated breaks before real text
         // coalesce to the last requested level (no blank clause lines).
         self.pending = Some(level);
@@ -1535,8 +1575,11 @@ impl<'a> Fmt<'a> {
                 }
             }
             self.blank = false;
-            for _ in 0..level {
+            for _ in 0..level.lv {
                 self.out.push_str(self.unit);
+            }
+            for _ in 0..level.col {
+                self.out.push(' ');
             }
             self.line_indent = level;
             self.line_has_content = false;
@@ -1794,6 +1837,15 @@ impl<'a> Fmt<'a> {
     fn run(&mut self, toks: &[(Kind, &str)]) {
         let mut k = 0;
         while k < toks.len() {
+            k = self.step(toks, k);
+        }
+    }
+
+    /// Lay out `toks[k]` — and any follower it takes with it, a head's `BY`
+    /// or a `BEGIN`'s `TRY` — answering the index of the next token to lay
+    /// out. One token at a time so a layout can be tried and taken back.
+    fn step(&mut self, toks: &[(Kind, &str)], mut k: usize) -> usize {
+        {
             let (kind, text) = toks[k];
             // What the input had between this token and the one before it.
             let prev_tok = k.checked_sub(1).map(|j| toks[j]);
@@ -1832,18 +1884,18 @@ impl<'a> Fmt<'a> {
                     // batch it ends; the next batch starts afresh after a
                     // blank line, as a statement does after its `;`.
                     self.blank = false;
-                    self.break_to(0);
+                    self.break_to(Ind::default());
                     self.emit(kind, text, false);
                     // A batch's end closes whatever body it left open.
                     self.blocks.clear();
                     self.awaiting = None;
-                    self.base = 0;
-                    self.content = 0;
+                    self.base = Ind::default();
+                    self.content = Ind::default();
                     self.parens.clear();
                     self.suppress_and = false;
                     self.prev = None;
                     self.blank = true;
-                    self.break_to(0);
+                    self.break_to(Ind::default());
                 }
                 Kind::Terminator => {
                     // Tight against the statement, as `;` is — unless it is
@@ -1940,7 +1992,7 @@ impl<'a> Fmt<'a> {
                     {
                         // An `IF`'s next branch, at the `IF`'s level.
                         self.blocks.pop();
-                        let level = self.blocks.len();
+                        let level = Ind::lv(self.blocks.len());
                         self.base = level;
                         self.content = level;
                         self.break_to(level);
@@ -1956,7 +2008,7 @@ impl<'a> Fmt<'a> {
                         // REPEAT` after it stays on its line.
                         self.blocks.pop();
                         self.blocks.push("UNTIL");
-                        let level = self.blocks.len() - 1;
+                        let level = Ind::lv(self.blocks.len() - 1);
                         self.base = level;
                         self.content = level + 1;
                         self.break_to(level);
@@ -1970,7 +2022,7 @@ impl<'a> Fmt<'a> {
                         // and its branches open bodies as an `IF`'s do.
                         self.emit(Kind::Word, text, false);
                         self.blocks.push("CASE");
-                        self.content = self.blocks.len();
+                        self.content = Ind::lv(self.blocks.len());
                     } else if !in_expr
                         && self.case_here().is_none()
                         && matches!(self.blocks.last(), Some(&("CASE" | "WHEN")))
@@ -1981,7 +2033,7 @@ impl<'a> Fmt<'a> {
                         if self.blocks.last() == Some(&"WHEN") {
                             self.blocks.pop();
                         }
-                        let level = self.blocks.len();
+                        let level = Ind::lv(self.blocks.len());
                         self.base = level;
                         self.content = level;
                         self.break_to(level);
@@ -2040,7 +2092,7 @@ impl<'a> Fmt<'a> {
                             self.blocks.pop();
                         }
                         let until = popped == Some("UNTIL");
-                        let level = self.blocks.len();
+                        let level = Ind::lv(self.blocks.len());
                         self.base = level;
                         self.content = level;
                         if !until {
@@ -2123,7 +2175,7 @@ impl<'a> Fmt<'a> {
                                 self.base = p.saved_base;
                                 self.content = p.saved_content;
                             } else if p.subquery {
-                                let close = self.base.saturating_sub(1);
+                                let close = self.base.up();
                                 self.break_to(close);
                                 self.emit(Kind::Punct, ")", true);
                                 self.base = p.saved_base;
@@ -2194,8 +2246,8 @@ impl<'a> Fmt<'a> {
                     }
                 },
             }
-            k += 1;
         }
+        k + 1
     }
 
     /// A statement's terminator was just written: the next one starts afresh
@@ -2203,7 +2255,7 @@ impl<'a> Fmt<'a> {
     fn end_statement(&mut self) {
         // Back to the open body's level, not the margin — and no blank line
         // between a body's statements.
-        let level = self.blocks.len();
+        let level = Ind::lv(self.blocks.len());
         self.base = level;
         self.content = level;
         self.parens.clear();
@@ -2212,7 +2264,7 @@ impl<'a> Fmt<'a> {
         self.cases.clear();
         self.awaiting = None;
         self.prev = None;
-        self.blank = level == 0;
+        self.blank = level.lv == 0;
         self.break_to(level);
     }
 
