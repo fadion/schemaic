@@ -1794,6 +1794,7 @@ pub(crate) fn theme_settings_overlay(
     let keyword_case = layout.keyword_case;
     let comma_style = layout.comma_style;
     let statement_gap = layout.statement_gap;
+    let join_on_own_line = layout.join_on_own_line;
     let table_aliases = layout.table_aliases;
     let show_whitespace = layout.show_whitespace;
     let indent_guides = layout.indent_guides;
@@ -1948,6 +1949,14 @@ pub(crate) fn theme_settings_overlay(
                 ),
             ))
             .style(ctrl);
+            let join_on_row = focusable_toggle_row(
+                "Join condition on its own line",
+                "Put a join's ON, and the AND and OR of its condition, on a line of \
+                 their own under the join.",
+                join_on_own_line,
+                ring.clone(),
+                190,
+            );
             let editor_group = v_stack((
                 form_section_header("Editor"),
                 font_section,
@@ -1964,6 +1973,7 @@ pub(crate) fn theme_settings_overlay(
                 case_section,
                 commas_section,
                 gap_section,
+                join_on_row,
             ))
             .style(|s| s.flex_col().gap(theme::scaled(16.0)));
 

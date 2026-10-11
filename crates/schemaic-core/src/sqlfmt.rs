@@ -84,6 +84,7 @@ fn format_sql_under(
     let mut f = Fmt::new(indent_unit, sql, dialect);
     f.leading_commas = style.commas == CommaStyle::Leading;
     f.gap = style.gap;
+    f.join_on_own_line = style.join_on_own_line;
     f.run(&toks);
     let out = f.out.trim_end();
     if sql.ends_with('\n') {
@@ -215,6 +216,8 @@ pub struct FormatStyle {
     pub case: KeywordCase,
     pub commas: CommaStyle,
     pub gap: StatementGap,
+    /// A join's `ON` opens a line of its own, one in from the join.
+    pub join_on_own_line: bool,
 }
 
 impl From<KeywordCase> for FormatStyle {
@@ -1377,6 +1380,10 @@ struct Paren {
     /// A `CREATE TABLE`'s body ([`Fmt::opens_table_body`]): one item a line,
     /// the `)` back at this indent.
     listed: Option<Ind>,
+    /// [`Fmt::joined`] and [`Fmt::in_on`] outside a subquery, which has joins
+    /// of its own.
+    saved_joined: bool,
+    saved_on: bool,
 }
 
 #[derive(Clone)]
@@ -1448,6 +1455,14 @@ struct Fmt<'a> {
     /// A statement has just ended under [`StatementGap::Keep`], and the
     /// blank line after it waits on the input's gap before the next one.
     gap_pending: bool,
+    /// A join's `ON` opens a line of its own ([`FormatStyle::join_on_own_line`]).
+    join_on_own_line: bool,
+    /// A join has been written since this level's last clause head, so an
+    /// `ON` here is its condition — not an index's, a trigger's or a key's.
+    joined: bool,
+    /// Inside a join condition laid out on its own line: its `AND`/`OR`
+    /// break to the `ON`'s indent rather than the join's.
+    in_on: bool,
 }
 
 /// One open `CASE`: the indent of the line it opened on, the paren depth it
@@ -1491,6 +1506,9 @@ impl<'a> Fmt<'a> {
             leading_commas: false,
             gap: StatementGap::One,
             gap_pending: false,
+            join_on_own_line: false,
+            joined: false,
+            in_on: false,
         }
     }
 
@@ -2181,13 +2199,32 @@ impl<'a> Fmt<'a> {
                         }
                         self.content = self.base + 1;
                         self.break_to(self.content);
-                    } else if !in_expr
-                        && (self.is_join_break(&up)
-                            || ((up == "AND" || up == "OR") && !(up == "AND" && self.suppress_and)))
-                    {
-                        // A join keyword (JOIN/LEFT/…) or a boolean AND/OR both
-                        // break to the content indent before emitting.
+                        self.joined = false;
+                        self.in_on = false;
+                    } else if !in_expr && self.is_join_break(&up) {
+                        // A join keyword (JOIN/LEFT/…) breaks to the content
+                        // indent before emitting.
                         self.break_to(self.content);
+                        self.emit(Kind::Word, text, false);
+                        self.joined = true;
+                        self.in_on = false;
+                    } else if up == "ON" && self.join_on_own_line && self.joined && !in_expr {
+                        // The join's condition, one in from the join.
+                        self.break_to(self.content + 1);
+                        self.emit(Kind::Word, text, false);
+                        self.in_on = true;
+                    } else if !in_expr
+                        && (up == "AND" || up == "OR")
+                        && !(up == "AND" && self.suppress_and)
+                    {
+                        // A boolean AND/OR breaks to the content indent — or to
+                        // the `ON`'s, inside a join condition on its own line.
+                        let to = if self.in_on {
+                            self.content + 1
+                        } else {
+                            self.content
+                        };
+                        self.break_to(to);
                         self.emit(Kind::Word, text, false);
                     } else {
                         if up == "AND" && self.suppress_and {
@@ -2213,8 +2250,12 @@ impl<'a> Fmt<'a> {
                             saved_base: self.base,
                             saved_content: self.content,
                             listed: body.then_some(self.line_indent),
+                            saved_joined: self.joined,
+                            saved_on: self.in_on,
                         });
                         if sub {
+                            self.joined = false;
+                            self.in_on = false;
                             self.base = self.line_indent + 1;
                             self.content = self.base;
                             self.break_to(self.base);
@@ -2236,6 +2277,8 @@ impl<'a> Fmt<'a> {
                                 self.emit(Kind::Punct, ")", true);
                                 self.base = p.saved_base;
                                 self.content = p.saved_content;
+                                self.joined = p.saved_joined;
+                                self.in_on = p.saved_on;
                             } else {
                                 self.emit(Kind::Punct, ")", true);
                             }
@@ -2319,6 +2362,8 @@ impl<'a> Fmt<'a> {
         self.suppress_and = false;
         self.cases.clear();
         self.awaiting = None;
+        self.joined = false;
+        self.in_on = false;
         self.prev = None;
         self.blank = level.lv == 0 && self.gap == StatementGap::One;
         self.gap_pending = self.gap == StatementGap::Keep;
@@ -2722,6 +2767,61 @@ mod tests {
             serde_json::to_string(&StatementGap::Keep).unwrap(),
             "\"keep\""
         );
+    }
+
+    fn on_own_line() -> FormatStyle {
+        FormatStyle {
+            join_on_own_line: true,
+            ..FormatStyle::default()
+        }
+    }
+
+    /// A join's `ON` opens a line one in from its join, and the condition's
+    /// `AND`/`OR` stay with it; `USING` and everything else keep their place.
+    #[test]
+    fn a_joins_on_can_take_its_own_line() {
+        let sql = "select * from t join u on u.id = t.u_id and u.x = 1 \
+                   left join v using (id) where a = 1 and b = 2";
+        assert_eq!(
+            styled(sql, FormatStyle::default()),
+            "select\n  *\nfrom\n  t\n  join u on u.id = t.u_id\n  and u.x = 1\n  \
+             left join v using (id)\nwhere\n  a = 1\n  and b = 2"
+        );
+        let once = styled(sql, on_own_line());
+        assert_eq!(
+            once,
+            "select\n  *\nfrom\n  t\n  join u\n    on u.id = t.u_id\n    and u.x = 1\n  \
+             left join v using (id)\nwhere\n  a = 1\n  and b = 2"
+        );
+        assert_eq!(
+            styled(&once, on_own_line()),
+            once,
+            "a second format moves nothing"
+        );
+    }
+
+    /// Only a join's `ON` moves: an index's, a trigger's, a key's action and a
+    /// `MERGE`'s are no join condition — and a subquery's joins are its own.
+    #[test]
+    fn an_on_that_is_no_joins_keeps_its_line() {
+        for sql in [
+            "create index ix on t (a)",
+            "alter table t add constraint fk foreign key (a) references b (id) on delete cascade",
+            "create trigger tr after insert on t for each row set @a = 1",
+            "merge into t using s on t.id = s.id when matched then update set a = 1",
+        ] {
+            assert_eq!(
+                styled(sql, on_own_line()),
+                styled(sql, FormatStyle::default()),
+                "{sql}"
+            );
+        }
+        let nested =
+            "select * from t join (select * from a join b on b.id = a.id) x on x.id = t.id";
+        let out = styled(nested, on_own_line());
+        assert!(out.contains("join b\n"), "{out}");
+        assert!(out.contains(") x\n"), "the outer ON moves too:\n{out}");
+        assert!(out.contains("on x.id = t.id"), "{out}");
     }
 
     // These tests predate the dialect parameter and assert MySQL formatting; a thin

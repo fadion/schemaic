@@ -345,6 +345,9 @@ pub struct UiState {
     /// The blank lines Format Code leaves between statements. Default: one.
     #[serde(default)]
     pub format_statement_gap: crate::sqlfmt::StatementGap,
+    /// Format Code puts a join's `ON` on a line of its own. Default: off.
+    #[serde(default)]
+    pub format_join_on_own_line: bool,
     /// Completion writes an alias after a table it inserts into a `FROM` or
     /// `JOIN` (`orders o`). Default: on.
     #[serde(default = "default_true")]
@@ -480,6 +483,7 @@ impl Default for UiState {
             format_keyword_case: crate::sqlfmt::KeywordCase::Keep,
             format_comma_style: crate::sqlfmt::CommaStyle::Trailing,
             format_statement_gap: crate::sqlfmt::StatementGap::One,
+            format_join_on_own_line: false,
             completion_table_aliases: true,
             editor_show_whitespace: false,
             editor_indent_guides: false,
@@ -1939,6 +1943,22 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&keep).expect("serialises"))
                 .expect("parses");
         assert_eq!(back.format_statement_gap, StatementGap::Keep);
+    }
+
+    /// A join's `ON` keeps its join's line for a new install and a file
+    /// written before the setting existed, and an on stays on.
+    #[test]
+    fn format_join_on_own_line_defaults_off_and_keeps_an_on() {
+        assert!(!UiState::default().format_join_on_own_line);
+        let old: UiState = serde_json::from_str("{}").expect("parses");
+        assert!(!old.format_join_on_own_line);
+        let on = UiState {
+            format_join_on_own_line: true,
+            ..UiState::default()
+        };
+        let back: UiState =
+            serde_json::from_str(&serde_json::to_string(&on).expect("serialises")).expect("parses");
+        assert!(back.format_join_on_own_line);
     }
 
     /// Completion writes table aliases for a new install and a file written

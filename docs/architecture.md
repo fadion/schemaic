@@ -13290,7 +13290,7 @@ existing prose was left alone.
     `CommaStyle` is `Trailing` (the default, *End of line*: the formatter as it always was) or
     `Leading` (*Start of line*), serialised and read leniently exactly as `KeywordCase` is, an
     unknown word being `Trailing` (`comma_style_defaults_to_end_of_line_and_reads_leniently`). The
-    settings travel as a `FormatStyle { case, commas, gap }`, and `format_range`/`format_statement`
+    settings travel as a `FormatStyle { case, commas, gap, join_on_own_line }`, and `format_range`/`format_statement`
     take `impl Into<FormatStyle>`, with `From<KeywordCase>` putting every other setting at its
     default — so a caller or test that passes a bare `KeywordCase` says nothing about the rest and
     is unchanged. `format_sql` stays at the defaults. `format_sql_under` takes the whole
@@ -13322,6 +13322,23 @@ existing prose was left alone.
     both that and a procedure body). Several blank lines become one; the setting does not keep
     counts. A `GO` line is outside it: the batch after one starts after a blank line under all
     three, as it always did.
+    **A join's condition on its own line is the fourth**, and the first that is a plain `bool` —
+    `FormatStyle::join_on_own_line`, off by default, which is the formatter as it always was:
+    `join u on u.id = t.u_id` on one line, its `AND`/`OR` breaking back to the join's own indent.
+    On, the `ON` breaks to `content + 1`, one in from the join, and the condition's `AND`/`OR`
+    follow it there while `Fmt::in_on` is set; a second format moves nothing
+    (`a_joins_on_can_take_its_own_line`). **Only a join's `ON` moves, and that is the state's whole
+    job**: `ON` is also an index's `ON t`, a trigger's `ON t`, a key's `ON DELETE` and a `MERGE`'s
+    `ON`, none of which is a join condition. So `Fmt::joined` is set only where a join keyword
+    breaks (`is_join_break`) and cleared by a clause head and in `end_statement`, and the `ON` arm
+    asks for it — a test of the word alone would break every one of those
+    (`an_on_that_is_no_joins_keeps_its_line`, which holds all four — a `MERGE`'s keeps its line
+    because no join keyword precedes its `ON`). **A subquery
+    has joins of its own**: a subquery `(` saves both flags in `Paren::saved_joined`/`saved_on`
+    and clears them, and its `)` restores them, so the inner join's `ON` and the outer one's after
+    `) x` each answer for their own join. What was one branch for a join keyword and `AND`/`OR`
+    together is three — the join break, the `ON`, the `AND`/`OR` — since the last now asks which
+    indent it breaks to.
     **`formattable_range` is what decides how much of the document a Format may touch**, and it is
     here rather than at the call site because `format_sql` lexes what it is handed **from byte 0**
     and takes that for a real token boundary. True of a whole document and of a selection whose ends
@@ -27873,10 +27890,13 @@ existing prose was left alone.
     `format_comma_style_defaults_to_end_of_line_and_keeps_a_choice`; `LayoutUi::comma_style`), and
     **Between statements** after that (*One blank line* by default, focus order 180 —
     `UiState::format_statement_gap`, pinned by
-    `format_statement_gap_defaults_to_one_and_keeps_a_choice`; `LayoutUi::statement_gap`). What
+    `format_statement_gap_defaults_to_one_and_keeps_a_choice`; `LayoutUi::statement_gap`), then
+    the section's one switch, **Join condition on its own line** (a `focusable_toggle_row`, off by
+    default, focus order 190 — `UiState::format_join_on_own_line`, pinned by
+    `format_join_on_own_line_defaults_off_and_keeps_an_on`; `LayoutUi::join_on_own_line`). What
     each does to the text is the `core/sqlfmt.rs` entry's. **They reach the formatter as one
     value**: the theme state holds a single `format_style: RwSignal<FormatStyle>`, and the app
-    composes it in one `create_effect` beside the other editor-setting effects, from the three
+    composes it in one `create_effect` beside the other editor-setting effects, from the four
     signals Settings edits one at a time, into `theme::set_format_style` — which replaced a setter
     per setting. `theme::format_style()` reads it **untracked** and the setter bumps no
     `editor_gen`, because nothing is drawn from it: Format Code (`format_editor`'s `format_range`)

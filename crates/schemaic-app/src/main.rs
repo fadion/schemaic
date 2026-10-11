@@ -2391,6 +2391,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let keyword_case = RwSignal::new(ui_state.format_keyword_case);
     let comma_style = RwSignal::new(ui_state.format_comma_style);
     let statement_gap = RwSignal::new(ui_state.format_statement_gap);
+    let join_on_own_line = RwSignal::new(ui_state.format_join_on_own_line);
     let table_aliases = RwSignal::new(ui_state.completion_table_aliases);
     let show_whitespace = RwSignal::new(ui_state.editor_show_whitespace);
     let indent_guides = RwSignal::new(ui_state.editor_indent_guides);
@@ -2419,6 +2420,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             case: keyword_case.get(),
             commas: comma_style.get(),
             gap: statement_gap.get(),
+            join_on_own_line: join_on_own_line.get(),
         })
     });
     schemaic_ui::theme::set_completion_table_aliases(table_aliases.get_untracked());
@@ -7803,6 +7805,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     format_keyword_case: keyword_case.get_untracked(),
                     format_comma_style: comma_style.get_untracked(),
                     format_statement_gap: statement_gap.get_untracked(),
+                    format_join_on_own_line: join_on_own_line.get_untracked(),
                     completion_table_aliases: table_aliases.get_untracked(),
                     editor_show_whitespace: show_whitespace.get_untracked(),
                     editor_indent_guides: indent_guides.get_untracked(),
@@ -7902,6 +7905,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             keyword_case.get();
             comma_style.get();
             statement_gap.get();
+            join_on_own_line.get();
             table_aliases.get();
             show_whitespace.get();
             indent_guides.get();
@@ -13321,6 +13325,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             keyword_case,
             comma_style,
             statement_gap,
+            join_on_own_line,
             table_aliases,
             show_whitespace,
             indent_guides,

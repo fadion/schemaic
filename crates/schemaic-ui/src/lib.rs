@@ -6167,6 +6167,9 @@ pub struct LayoutUi {
     /// The blank lines Format Code leaves between statements; one part of
     /// `theme::set_format_style`. Persisted.
     pub statement_gap: RwSignal<schemaic_core::sqlfmt::StatementGap>,
+    /// Format Code puts a join's `ON` on its own line; one part of
+    /// `theme::set_format_style`. Persisted.
+    pub join_on_own_line: RwSignal<bool>,
     /// Write an alias after a table completion inserts; drives
     /// `theme::set_completion_table_aliases`. Persisted.
     pub table_aliases: RwSignal<bool>,
