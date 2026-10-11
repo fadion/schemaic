@@ -6108,8 +6108,10 @@ pub struct ActivityActions {
     pub refresh: Rc<dyn Fn()>,
     /// Cancel a statement or terminate a session, behind the shared confirm, then
     /// refresh. The confirm is raised by the app rather than here so the panel
-    /// can't offer a kill that skips it.
-    pub kill: Rc<dyn Fn(i64, schemaic_core::activity::KillKind)>,
+    /// can't offer a kill that skips it. The `KillFrom` says which list asked,
+    /// which decides what an id the sessions snapshot lacks means
+    /// (`activity::kill_subject`).
+    pub kill: Rc<dyn Fn(i64, schemaic_core::activity::KillKind, schemaic_core::activity::KillFrom)>,
     /// Set the **active connection's** poll interval (seconds; `0` is off) and
     /// persist it. Which connection that is belongs to the app, not the panel.
     pub set_interval: Rc<dyn Fn(u64)>,

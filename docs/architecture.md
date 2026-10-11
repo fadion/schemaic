@@ -9037,6 +9037,21 @@ existing prose was left alone.
     (`5,9`). The pins are `waiting_locks_lead_and_their_blockers_are_distinct` and
     `a_lock_is_found_by_what_its_row_says`; they arrived with the functions they test, so there was
     no unfixed tree for them to be watched failing against.
+    **A kill asked from a lock row means something different by a miss**, and `KillFrom` names the
+    list it came from so `kill_subject` — what the app's kill handler looks its confirm's subject up
+    through — can tell. From the sessions list (a row or the lock-wait banner) an id the snapshot no
+    longer holds is a row that went away between the right-click and the click, and `None` asks
+    nothing. From the Locks view it is the ordinary case: the sessions list is polled only while it
+    is shown, and capped, so a lock's session is routinely absent from it, and the subject is a bare
+    `SessionInfo` carrying the id alone — no user, host, database or statement. `kill_confirm` names
+    a session with neither user nor client as `session N` rather than through `who()`, whose em
+    dash made the question "Disconnect —?". `LockInfo::offers` stands in for `applies_to`, which a
+    lock row cannot ask — it carries no session state: *Cancel query* only on a **waiting** lock,
+    a statement stuck in its wait, and *Kill session* always, since a held lock may belong to a
+    session idle in its transaction with nothing to cancel. The pins are
+    `a_lock_row_kill_names_a_session_the_snapshot_does_not_hold`,
+    `a_confirm_for_a_session_known_only_by_id_names_the_id` and
+    `a_lock_row_offers_a_cancel_only_while_it_waits`.
   - `users.rs` — the **Users and privileges** browser's model: which accounts a server knows, and
     what each of them is allowed to do, over an already-fetched snapshot. No DB, no UI, no engine,
     and deliberately the same shape as `activity.rs` — the fetch is one query set per engine in
@@ -23006,10 +23021,11 @@ existing prose was left alone.
     *Floem 0.2 gotchas*) — because it is built by hand rather than through `widgets::action_button`, whose family is the
     modal-footer one and needs a `FocusRing` this panel has none of. It carries the id it will kill in
     its label: a button reading just *Kill* on a panel where several sessions are killable is the one
-    misread that cannot be undone. The **per-row** Kill and Cancel hang off a right-click menu with no
-    keyboard opener and are still pointer-only, which is why `README.md`'s accessibility sentence was
-    narrowed to claim only what is true.
-    **The read-only flag reaches all three kill surfaces as a `Memo`, never as its value**, and that
+    misread that cannot be undone. The **per-row** Kill and Cancel — a session row's and a lock
+    row's alike — hang off a right-click menu with no keyboard opener and are still pointer-only,
+    which is why `README.md`'s accessibility sentence was narrowed to claim only what is true.
+    **The read-only flag reaches every kill surface as a `Memo`, never as its value** — the banner's
+    `Kill <id>`, a session row's menu and a lock row's — and that
     distinction is the whole of a bug the memo's own comment had already predicted in the imperative:
     it says "the two containers below read it inside their own bodies, and a value captured at build
     would freeze", and both call sites then passed `read_only.get()` from inside a `dyn_container`
@@ -23024,8 +23040,8 @@ existing prose was left alone.
     `accept_launch`'s contract asks this side to supply, the disabled button being what *says* the
     action is unavailable. The memo is now read where reading is meaningful: `.get()` in the style
     closure, which re-runs; `.get_untracked()` in the press and in the tip, which want the answer at
-    the moment they are asked; and again in the right-click handler that builds the row menu, which
-    is later still than the row. The clock in the title bar wears the same grey as
+    the moment they are asked; and again in the right-click handlers that build the row and lock
+    menus, which is later still than the row. The clock in the title bar wears the same grey as
     the refresh icon beside it: it was tinted while polling, on the reasoning that "Off" and "every
     2s" look identical between ticks, but two icons a few pixels apart in different colours read as
     one of them being *active* in the toggle sense. The interval is stated where a state belongs —
@@ -23083,11 +23099,17 @@ existing prose was left alone.
     — read as `Idle` alone it said "Loading…" forever with auto-refresh off (found documenting it,
     before it shipped). `lock_row` is a dot, red while waiting;
     the session id, "holds" or "waits for", and the engine's kind and mode; the object in mono; and
-    "held by …" for a wait. **Lock rows offer no kill, on purpose.** The app's kill handler names
-    the session it is about to confirm from the *sessions* snapshot — `kill_confirm` takes its
-    `SessionInfo` — and returns silently when the id is not in it, which a session seen only in the
-    Locks list need not be; a Kill there would be a button that sometimes does nothing. The Sessions
-    view's lock-wait banner remains the way to end a blocker.
+    "held by …" for a wait. **Right-click offers the lock's session the same two kills as a session
+    row** (`lock_menu`, asked `KillFrom::Locks`), reversing a rule this entry used to state. Lock
+    rows offered no kill because the app's kill handler named the session it confirmed from the
+    *sessions* snapshot and returned silently on an id not in it — which a session seen only in the
+    Locks list need not be, so a Kill there would have been a button that sometimes did nothing, and
+    the Sessions view's lock-wait banner was the only way to end a blocker. The handler now looks
+    the subject up through `activity::kill_subject` with the list the kill came from, and from Locks
+    a miss is confirmed by the id alone (`core::activity`). *Cancel query* is dimmed on a held lock
+    (`LockInfo::offers`: the row has no session state to say whether anything is running), absent
+    where the engine has no statement for it as on a session row, and both kills are dimmed on a
+    read-only connection.
   - `plan_view.rs` — Query Plan modal (`EXPLAIN`/`EXPLAIN ANALYZE` table + warnings + "Ask AI"),
     via `TabsActions::run_plan` → `Db::explain`. On a read-only connection the plain plan runs on a
     read-only session too, so on MySQL/MariaDB the plan of a write is refused, in
@@ -28895,7 +28917,11 @@ existing prose was left alone.
   modal is open across an unbounded stretch of time, and reading `active_conn` inside `resolve` sent
   `KILL CONNECTION 1148` to whatever connection was active by then, under a title naming the first
   one. A **cancel** is not a kill and repairs nothing: it stops the statement and leaves the session
-  and its transaction alive.
+  and its transaction alive. The session the confirm names comes from `activity::kill_subject`, told
+  which list the kill was asked from (`KillFrom`): from a session row or the banner, an id the
+  snapshot no longer holds asks nothing, the row having gone away; from a Locks row it is confirmed
+  by its id alone, that list's session being routinely absent from a snapshot polled only while
+  shown. Everything after the lookup — both guards, the target, the confirm — is the same for both.
   **Opening and saving a tab's `.sql` file** is `TabsActions::open_sql_file`/`save_sql_file`/
   `save_sql_file_as`/`reload_sql_file` (Ctrl+O / Ctrl+S / Ctrl+Shift+S, bound in `NavKeys::handle`
   so they work at the workspace root and inside the editor alike, and offered as Open File / Save

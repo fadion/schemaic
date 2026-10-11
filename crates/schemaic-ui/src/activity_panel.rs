@@ -25,7 +25,7 @@ use floem::kurbo::Point;
 use floem::prelude::*;
 use floem::reactive::create_effect;
 
-use schemaic_core::activity::{self, KillKind, SessionInfo, SessionState};
+use schemaic_core::activity::{self, KillFrom, KillKind, SessionInfo, SessionState};
 use schemaic_core::text::plural;
 
 use crate::consts::{MONO_FAMILY, SEARCH_DEBOUNCE_MS};
@@ -45,6 +45,9 @@ use crate::{
 /// to open it there ([`schemaic_core::activity::supports_activity`]).
 const SQLITE_HAS_NO_SESSIONS: &str = "SQLite has no server sessions — it runs inside \
      this process, so there is nothing else connected to see.";
+
+/// [`crate::ActivityActions::kill`]: the session, the kind, and which list asked.
+type KillFn = Rc<dyn Fn(i64, KillKind, KillFrom)>;
 
 /// The dot beside a session id, and the colour its state word is written in.
 ///
@@ -217,7 +220,9 @@ pub(crate) fn activity_panel(
                     (ActivityState::Unsupported, _) => {
                         list_message(SQLITE_HAS_NO_SESSIONS, theme::text_muted)
                     }
-                    (_, crate::LocksState::Loaded(list)) => locks_list(&list, &q),
+                    (_, crate::LocksState::Loaded(list)) => {
+                        locks_list(&list, &q, kill.clone(), overlay, menus, read_only, dialect)
+                    }
                     (_, crate::LocksState::Failed(e)) => list_message(e, theme::error),
                     // The connection could not be reached at all — the refresh
                     // says so on the sessions state, before it asks for either
@@ -546,7 +551,7 @@ fn counts_line(sessions: &[SessionInfo], truncated: bool) -> impl IntoView {
 /// `accept_launch`'s contract asks this side to supply.
 fn banner(
     sessions: &[SessionInfo],
-    kill: Rc<dyn Fn(i64, KillKind)>,
+    kill: KillFn,
     read_only: floem::reactive::Memo<bool>,
 ) -> floem::AnyView {
     let Some((waiter, holder)) = activity::lock_wait(sessions) else {
@@ -611,7 +616,7 @@ fn banner(
             // fire-and-forget: there is no signal to read), which is what the
             // `false` says.
             if crate::widgets::accept_launch(false, read_only.get_untracked()) {
-                (kill)(holder_id, KillKind::Session);
+                (kill)(holder_id, KillKind::Session, KillFrom::Sessions);
             }
         },
     )
@@ -679,7 +684,7 @@ fn banner(
 fn session_row(
     s: Rc<SessionInfo>,
     term: Option<String>,
-    kill: Rc<dyn Fn(i64, KillKind)>,
+    kill: KillFn,
     overlay: crate::OverlayUi,
     menus: crate::widgets::MenuFlags,
     // The memo, for the reason `banner` takes it: this is built in a
@@ -907,7 +912,15 @@ fn locks_header(list: &activity::LockList) -> floem::AnyView {
 /// The *Locks* list: the locks [`activity::lock_matches`] the search, the
 /// front [`activity::RENDER_CAP`] of them as rows for the sessions list's
 /// reason, the rest counted.
-fn locks_list(list: &activity::LockList, q: &str) -> floem::AnyView {
+fn locks_list(
+    list: &activity::LockList,
+    q: &str,
+    kill: KillFn,
+    overlay: crate::OverlayUi,
+    menus: crate::widgets::MenuFlags,
+    read_only: floem::reactive::Memo<bool>,
+    dialect: floem::reactive::Memo<schemaic_core::intel::SqlDialect>,
+) -> floem::AnyView {
     let matched: Vec<&activity::LockInfo> = list
         .locks
         .iter()
@@ -926,7 +939,10 @@ fn locks_list(list: &activity::LockList, q: &str) -> floem::AnyView {
         );
     }
     let (rows, undrawn) = activity::render_slice(&matched);
-    let mut items: Vec<floem::AnyView> = rows.iter().map(|l| lock_row(l)).collect();
+    let mut items: Vec<floem::AnyView> = rows
+        .iter()
+        .map(|l| lock_row(l, kill.clone(), overlay, menus, read_only, dialect))
+        .collect();
     if undrawn > 0 {
         items.push(list_message(
             format!(
@@ -944,8 +960,16 @@ fn locks_list(list: &activity::LockList, q: &str) -> floem::AnyView {
 
 /// One lock: the session (dotted red while it waits), whether it holds or
 /// waits, the engine's own kind and mode, what it is on, and for a wait who
-/// holds it up.
-fn lock_row(l: &activity::LockInfo) -> floem::AnyView {
+/// holds it up. Right-click offers the session's kills ([`lock_menu`]), as a
+/// session row does — left-click nothing, for that row's reason.
+fn lock_row(
+    l: &activity::LockInfo,
+    kill: KillFn,
+    overlay: crate::OverlayUi,
+    menus: crate::widgets::MenuFlags,
+    read_only: floem::reactive::Memo<bool>,
+    dialect: floem::reactive::Memo<schemaic_core::intel::SqlDialect>,
+) -> floem::AnyView {
     let color: fn() -> floem::peniko::Color = if l.granted {
         theme::text_muted
     } else {
@@ -990,7 +1014,21 @@ fn lock_row(l: &activity::LockInfo) -> floem::AnyView {
                 .into_any(),
         );
     }
+    let menu_lock = l.clone();
     floem::views::stack_from_iter(rows)
+        .on_secondary_click_stop(move |_| {
+            // As `session_row`'s: the shared list closes whatever else is open,
+            // and the entries' enablement is read at the right-click.
+            menus.close_except(Some(crate::widgets::MenuId::Popup));
+            overlay.popup_anchor.set(None);
+            overlay.popup_width.set(160.0);
+            overlay.popup_menu.set(Some(lock_menu(
+                &menu_lock,
+                kill.clone(),
+                read_only.get_untracked(),
+                dialect.get_untracked(),
+            )));
+        })
         .style(|s| {
             s.flex_col()
                 .width_full()
@@ -1025,7 +1063,7 @@ fn lock_row(l: &activity::LockInfo) -> floem::AnyView {
 /// it is no row's.
 fn row_menu(
     s: &SessionInfo,
-    kill: Rc<dyn Fn(i64, KillKind)>,
+    kill: KillFn,
     read_only: bool,
     dialect: schemaic_core::intel::SqlDialect,
 ) -> Vec<MenuEntry> {
@@ -1035,14 +1073,14 @@ fn row_menu(
     if activity::supports_kill_kind(dialect, KillKind::Query) {
         entries.push(
             MenuEntry::action(KillKind::Query.label(), move || {
-                (cancel)(id, KillKind::Query)
+                (cancel)(id, KillKind::Query, KillFrom::Sessions)
             })
             .disabled(read_only || !KillKind::Query.applies_to(s)),
         );
     }
     entries.push(
         MenuEntry::action(KillKind::Session.label(), move || {
-            (kill)(id, KillKind::Session)
+            (kill)(id, KillKind::Session, KillFrom::Sessions)
         })
         .disabled(read_only),
     );
@@ -1052,5 +1090,40 @@ fn row_menu(
             let _ = floem::Clipboard::set_contents(sql.clone());
         }));
     }
+    entries
+}
+
+/// A lock row's right-click menu: the same two kills as [`row_menu`], on the
+/// lock's session, asked `KillFrom::Locks` — that session need not be in the
+/// sessions snapshot, and the app confirms it by id when it is not
+/// (`activity::kill_subject`).
+///
+/// *Cancel query* is dimmed on a held lock ([`activity::LockInfo::offers`]):
+/// its session may be idle in its transaction with nothing to cancel, and the
+/// row has no session state to tell. Absent, as on a session row, where the
+/// engine has no statement for it.
+fn lock_menu(
+    l: &activity::LockInfo,
+    kill: KillFn,
+    read_only: bool,
+    dialect: schemaic_core::intel::SqlDialect,
+) -> Vec<MenuEntry> {
+    let id = l.session;
+    let cancel = kill.clone();
+    let mut entries = Vec::new();
+    if activity::supports_kill_kind(dialect, KillKind::Query) {
+        entries.push(
+            MenuEntry::action(KillKind::Query.label(), move || {
+                (cancel)(id, KillKind::Query, KillFrom::Locks)
+            })
+            .disabled(read_only || !l.offers(KillKind::Query)),
+        );
+    }
+    entries.push(
+        MenuEntry::action(KillKind::Session.label(), move || {
+            (kill)(id, KillKind::Session, KillFrom::Locks)
+        })
+        .disabled(read_only || !l.offers(KillKind::Session)),
+    );
     entries
 }

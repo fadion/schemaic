@@ -1353,7 +1353,14 @@ pub fn kill_confirm(
     dialect: SqlDialect,
     ours: Option<&str>,
 ) -> (String, String) {
-    let who = s.who();
+    // A session nothing attributes — one known only by id from the Locks view
+    // (`kill_subject`) — is named by that id; the row's dash asks nothing.
+    let who = if s.user.trim().is_empty() && s.client.as_deref().is_none_or(|c| c.trim().is_empty())
+    {
+        format!("session {}", s.id)
+    } else {
+        s.who()
+    };
     let where_ = match s.database.as_deref() {
         Some(db) if !db.is_empty() => format!(" on {db}"),
         _ => String::new(),
@@ -1399,6 +1406,63 @@ pub fn read_only_refusal(kind: KillKind) -> String {
         "This connection is marked read-only, so Schemaic won't {what} on it. \
          Clear read-only in the connection's settings first."
     )
+}
+
+/// Which list a kill was asked from — and so what an id the sessions snapshot
+/// does not hold means.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KillFrom {
+    /// A session row, or the lock-wait banner over that list.
+    Sessions,
+    /// A row of the *Locks* view.
+    Locks,
+}
+
+/// The session a kill's confirm names ([`kill_confirm`]): its row in the
+/// sessions snapshot, where there is one.
+///
+/// **What a miss means depends on the list it was asked from.** From the
+/// sessions list, the row went away between the right-click and the click — a
+/// poll landed, or the session ended — and `None` asks nothing, which is the
+/// outcome the click wanted. From the *Locks* view it means nothing of the
+/// kind: the sessions list is polled only while it is shown, and capped, so a
+/// session holding a lock is routinely absent from it. There the session is
+/// confirmed by its id alone — no user, host or database — rather than the
+/// row offering a Kill that sometimes did nothing.
+pub fn kill_subject(
+    sessions: Option<&[SessionInfo]>,
+    id: i64,
+    from: KillFrom,
+) -> Option<SessionInfo> {
+    let known = sessions.and_then(|ss| ss.iter().find(|s| s.id == id).cloned());
+    match from {
+        KillFrom::Sessions => known,
+        KillFrom::Locks => Some(known.unwrap_or(SessionInfo {
+            id,
+            user: String::new(),
+            client: None,
+            database: None,
+            state: SessionState::Idle,
+            sql: None,
+            seconds: None,
+            blocked_by: Vec::new(),
+            blocks: Vec::new(),
+        })),
+    }
+}
+
+impl LockInfo {
+    /// Whether this row's menu offers `kind` of kill. A waiting lock is a
+    /// statement stuck inside its wait, so there is a query to cancel; a held
+    /// lock may belong to a session idle in its transaction with nothing
+    /// running, so it offers only the kill — the lock row has no session state
+    /// to ask [`KillKind::applies_to`] with.
+    pub fn offers(&self, kind: KillKind) -> bool {
+        match kind {
+            KillKind::Query => !self.granted,
+            KillKind::Session => true,
+        }
+    }
 }
 
 /// What a cancelled statement leaves behind, per engine — the second half of
@@ -2790,6 +2854,57 @@ mod tests {
             granted,
             blocked_by: blocked_by.to_vec(),
         }
+    }
+
+    /// **A Locks row's session need not be in the sessions snapshot** — that
+    /// list is polled only while it is shown, and capped — so an id it does not
+    /// hold, asked from there, is still a session to confirm by its id. From
+    /// the sessions list the same miss means the row went away between the
+    /// right-click and the click, and nothing is asked.
+    #[test]
+    fn a_lock_row_kill_names_a_session_the_snapshot_does_not_hold() {
+        let held = [sess(7, SessionState::IdleInTx, 40.0)];
+
+        let known = kill_subject(Some(&held), 7, KillFrom::Locks).expect("in the snapshot");
+        assert_eq!(known.user, "app", "the snapshot's row, with its who");
+
+        let bare = kill_subject(Some(&held), 1148, KillFrom::Locks).expect("asked by id");
+        assert_eq!(bare.id, 1148);
+        assert_eq!(bare.who(), "—");
+        assert!(bare.sql.is_none() && bare.database.is_none());
+        assert!(
+            kill_subject(None, 1148, KillFrom::Locks).is_some(),
+            "no snapshot at all"
+        );
+
+        assert!(kill_subject(Some(&held), 1148, KillFrom::Sessions).is_none());
+        assert!(kill_subject(None, 7, KillFrom::Sessions).is_none());
+    }
+
+    /// A session known only by its id is named by it, not by the dash the
+    /// row shows for an unattributable session: "Disconnect —?" asks nothing.
+    #[test]
+    fn a_confirm_for_a_session_known_only_by_id_names_the_id() {
+        let bare = kill_subject(None, 1148, KillFrom::Locks).unwrap();
+        let (title, body) = kill_confirm(KillKind::Session, &bare, SqlDialect::MySql, None);
+        assert_eq!(title, "Kill session 1148");
+        assert!(body.starts_with("Disconnect session 1148?"), "{body}");
+        assert!(!body.contains('—'), "{body}");
+        let (_, body) = kill_confirm(KillKind::Query, &bare, SqlDialect::Postgres, None);
+        assert!(body.contains("session 1148 is running"), "{body}");
+    }
+
+    /// A waiting lock is a statement stuck inside its wait, so its session has
+    /// a query to cancel; a held lock may belong to a session idle in its
+    /// transaction, with nothing running, so only the kill is offered there.
+    #[test]
+    fn a_lock_row_offers_a_cancel_only_while_it_waits() {
+        let waits = lock(9, "t", false, &[7]);
+        let holds = lock(7, "t", true, &[]);
+        assert!(waits.offers(KillKind::Query));
+        assert!(waits.offers(KillKind::Session));
+        assert!(!holds.offers(KillKind::Query));
+        assert!(holds.offers(KillKind::Session));
     }
 
     /// **The waits first**, longest-standing question first: a lock list is

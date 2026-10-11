@@ -5981,155 +5981,162 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // confirm is raised here rather than in the panel so no route to a kill can
     // skip it, and the refresh afterwards is what makes the list agree with the
     // server again without waiting for the next tick.
-    let kill_session: Rc<dyn Fn(i64, schemaic_core::activity::KillKind)> = {
+    let kill_session: Rc<
+        dyn Fn(i64, schemaic_core::activity::KillKind, schemaic_core::activity::KillFrom),
+    > = {
         let db_for = db_for.clone();
         let handle = handle.clone();
         let refresh = refresh_activity.clone();
-        Rc::new(move |id: i64, kind: schemaic_core::activity::KillKind| {
-            // The confirm has to name the session, so it is built from the row in
-            // the current snapshot rather than from the id alone.
-            let session = activity_state.with_untracked(|st| match st {
-                ActivityState::Loaded { sessions, .. } => {
-                    sessions.iter().find(|s| s.id == id).cloned()
+        Rc::new(
+            move |id: i64, kind: schemaic_core::activity::KillKind, from| {
+                // The confirm has to name the session, so it is built from the row in
+                // the current snapshot where there is one — and from the id alone
+                // for a Locks row, whose session that list need not hold.
+                let session = activity_state.with_untracked(|st| {
+                    let sessions = match st {
+                        ActivityState::Loaded { sessions, .. } => Some(sessions.as_slice()),
+                        _ => None,
+                    };
+                    schemaic_core::activity::kill_subject(sessions, id, from)
+                });
+                // Gone between the right-click and the click — a poll landed, or the
+                // session ended on its own. Nothing to ask about and nothing left to
+                // kill, which is the outcome the click wanted.
+                let Some(session) = session else {
+                    return;
+                };
+                // **The target is resolved now, not when the button is clicked.**
+                // A session id means nothing without the server that issued it, and a
+                // modal is open across an unbounded stretch of time. Reading
+                // `active_conn` inside `resolve` meant a connection change while the
+                // confirm was up sent `KILL CONNECTION 1148` to a *different* server —
+                // terminating whichever unrelated session there happened to hold that
+                // id, under a modal whose title named the first one. Everything else
+                // in this panel is generation-guarded against exactly this drift;
+                // capturing the handle is that guard for the one destructive path.
+                let conn_id = active_conn.get_untracked();
+                let Ok(db) = db_for(conn_id) else {
+                    return;
+                };
+                // **The shared destructive guard, at the launch.** A connection
+                // marked read-only is the protection with no "Run anyway", and
+                // terminating a live client session — rolling back its transaction
+                // under it — is the most destructive thing this app can do to a
+                // server it has been told not to write to. Every other destructive
+                // modal action asks this function; this one asked nothing at all.
+                let read_only = connections
+                    .with_untracked(|cs| schemaic_core::connection::read_only_of(cs, conn_id));
+                // The `false` is not a placeholder: a kill is fire-and-forget and
+                // this action has no in-flight state of its own to read, which is
+                // the one thing that would make a literal here the failure
+                // CLAUDE.md warns about ("a constant in place of a capability").
+                // `read_only`, the term that does vary, is read live above.
+                if !schemaic_ui::may_launch_destructive(false, read_only) {
+                    // Per kind: this refusal answered *Cancel query* with a sentence
+                    // about terminating sessions, which is a different action.
+                    activity_kill_error.set(Some(schemaic_core::activity::read_only_refusal(kind)));
+                    return;
                 }
-                _ => None,
-            });
-            // Gone between the right-click and the click — a poll landed, or the
-            // session ended on its own. Nothing to ask about and nothing left to
-            // kill, which is the outcome the click wanted.
-            let Some(session) = session else {
-                return;
-            };
-            // **The target is resolved now, not when the button is clicked.**
-            // A session id means nothing without the server that issued it, and a
-            // modal is open across an unbounded stretch of time. Reading
-            // `active_conn` inside `resolve` meant a connection change while the
-            // confirm was up sent `KILL CONNECTION 1148` to a *different* server —
-            // terminating whichever unrelated session there happened to hold that
-            // id, under a modal whose title named the first one. Everything else
-            // in this panel is generation-guarded against exactly this drift;
-            // capturing the handle is that guard for the one destructive path.
-            let conn_id = active_conn.get_untracked();
-            let Ok(db) = db_for(conn_id) else {
-                return;
-            };
-            // **The shared destructive guard, at the launch.** A connection
-            // marked read-only is the protection with no "Run anyway", and
-            // terminating a live client session — rolling back its transaction
-            // under it — is the most destructive thing this app can do to a
-            // server it has been told not to write to. Every other destructive
-            // modal action asks this function; this one asked nothing at all.
-            let read_only = connections
-                .with_untracked(|cs| schemaic_core::connection::read_only_of(cs, conn_id));
-            // The `false` is not a placeholder: a kill is fire-and-forget and
-            // this action has no in-flight state of its own to read, which is
-            // the one thing that would make a literal here the failure
-            // CLAUDE.md warns about ("a constant in place of a capability").
-            // `read_only`, the term that does vary, is read live above.
-            if !schemaic_ui::may_launch_destructive(false, read_only) {
-                // Per kind: this refusal answered *Cancel query* with a sentence
-                // about terminating sessions, which is a different action.
-                activity_kill_error.set(Some(schemaic_core::activity::read_only_refusal(kind)));
-                return;
-            }
-            let dialect = db.engine().dialect();
-            // **Asked before the confirm, not after the kill.** A Manual tab's
-            // pinned session is an ordinary row here and wears the same
-            // `user@host` as every other row from that connection, so the modal
-            // was describing the user's own uncommitted work as a stranger's.
-            let ours = (owning_tab)(conn_id, id).map(|t| t.title());
-            let (title, message) =
-                schemaic_core::activity::kill_confirm(kind, &session, dialect, ours.as_deref());
-            let (handle, refresh) = (handle.clone(), refresh.clone());
-            let repair_killed_session = repair_killed_session.clone();
-            confirm.set(Some(Confirm {
-                title,
-                message,
-                resolve: Rc::new(move |yes| {
-                    if !yes {
-                        return;
-                    }
-                    // **And again here, in the step that launches the kill.**
-                    // The check above happens before the modal opens; the modal
-                    // stands for an unbounded stretch of time, which is the
-                    // reason the *connection handle* three lines up is captured
-                    // early and the reason the flag must not be. A guard that
-                    // runs once, early, is the shape `accept_launch`'s contract
-                    // forbids — its sibling in `users_view` re-asks inside its
-                    // own resolve and `ddl_preview::apply` asks at the press.
-                    // The early one stays: it is what produces the per-kind
-                    // refusal message before the user is asked a question that
-                    // would be refused anyway.
-                    //
-                    // `conn_id` is the one captured above, so the second read is
-                    // about the same connection by construction.
-                    let read_only = connections
-                        .with_untracked(|cs| schemaic_core::connection::read_only_of(cs, conn_id));
-                    if !schemaic_ui::may_launch_destructive(false, read_only) {
-                        activity_kill_error
-                            .set(Some(schemaic_core::activity::read_only_refusal(kind)));
-                        return;
-                    }
-                    let db = db.clone();
-                    let refresh = refresh.clone();
-                    let repair = repair_killed_session.clone();
-                    activity_kill_error.set(None);
-
-                    let report = create_ext_action(cx, move |res: Result<(), String>| {
-                        match res {
-                            // A refused kill (no `CONNECTION_ADMIN`, no
-                            // `pg_signal_backend`) says nothing about the snapshot
-                            // on screen, so it no longer replaces it: routing this
-                            // through `ActivityState::Failed` threw away the list
-                            // someone was reading mid-incident — banner included —
-                            // and with auto-refresh Off nothing brought it back.
-                            Err(e) => activity_kill_error.set(Some(e)),
-                            Ok(()) => {
-                                (repair)(conn_id, id, kind);
-                                // **Bump the generation first.** The refresh is
-                                // guarded against a fetch already in flight, and
-                                // a poll started while the kill was travelling
-                                // swallowed it silently — so with auto-refresh
-                                // Off the killed session stayed on the list with
-                                // a live *Kill session* under it, and nothing
-                                // said the kill had worked. Bumping strands the
-                                // in-flight reply (it would be describing a
-                                // server state that no longer holds) and frees
-                                // the guard for this one.
-                                //
-                                // **And re-arms.** The bump strands the poll
-                                // loop as surely as it strands the fetch, and
-                                // for a while nothing here started a new one:
-                                // auto-refresh died permanently at the first
-                                // successful kill, on the panel whose subject is
-                                // a live server, immediately after the one
-                                // action that changes it.
-                                //
-                                // **Re-arms to `activity_polling()`, not to
-                                // `true`.** A literal here says "there is
-                                // someone watching" on the strength of a reply
-                                // that has just come back from the network —
-                                // by which time the panel may be closed, the
-                                // window unfocused or the column collapsed to
-                                // zero width, all three of which `should_poll`
-                                // exists to answer No to. The two sibling
-                                // callers below already pass it.
-                                rearm_activity(
-                                    activity_gen,
-                                    activity_interval,
-                                    refresh.clone(),
-                                    activity_polling(),
-                                );
-                                (refresh)();
-                            }
+                let dialect = db.engine().dialect();
+                // **Asked before the confirm, not after the kill.** A Manual tab's
+                // pinned session is an ordinary row here and wears the same
+                // `user@host` as every other row from that connection, so the modal
+                // was describing the user's own uncommitted work as a stranger's.
+                let ours = (owning_tab)(conn_id, id).map(|t| t.title());
+                let (title, message) =
+                    schemaic_core::activity::kill_confirm(kind, &session, dialect, ours.as_deref());
+                let (handle, refresh) = (handle.clone(), refresh.clone());
+                let repair_killed_session = repair_killed_session.clone();
+                confirm.set(Some(Confirm {
+                    title,
+                    message,
+                    resolve: Rc::new(move |yes| {
+                        if !yes {
+                            return;
                         }
-                    });
-                    handle.spawn(async move {
-                        report(db.kill_session(id, kind).await.map_err(|e| e.to_string()));
-                    });
-                }),
-            }));
-        })
+                        // **And again here, in the step that launches the kill.**
+                        // The check above happens before the modal opens; the modal
+                        // stands for an unbounded stretch of time, which is the
+                        // reason the *connection handle* three lines up is captured
+                        // early and the reason the flag must not be. A guard that
+                        // runs once, early, is the shape `accept_launch`'s contract
+                        // forbids — its sibling in `users_view` re-asks inside its
+                        // own resolve and `ddl_preview::apply` asks at the press.
+                        // The early one stays: it is what produces the per-kind
+                        // refusal message before the user is asked a question that
+                        // would be refused anyway.
+                        //
+                        // `conn_id` is the one captured above, so the second read is
+                        // about the same connection by construction.
+                        let read_only = connections.with_untracked(|cs| {
+                            schemaic_core::connection::read_only_of(cs, conn_id)
+                        });
+                        if !schemaic_ui::may_launch_destructive(false, read_only) {
+                            activity_kill_error
+                                .set(Some(schemaic_core::activity::read_only_refusal(kind)));
+                            return;
+                        }
+                        let db = db.clone();
+                        let refresh = refresh.clone();
+                        let repair = repair_killed_session.clone();
+                        activity_kill_error.set(None);
+
+                        let report = create_ext_action(cx, move |res: Result<(), String>| {
+                            match res {
+                                // A refused kill (no `CONNECTION_ADMIN`, no
+                                // `pg_signal_backend`) says nothing about the snapshot
+                                // on screen, so it no longer replaces it: routing this
+                                // through `ActivityState::Failed` threw away the list
+                                // someone was reading mid-incident — banner included —
+                                // and with auto-refresh Off nothing brought it back.
+                                Err(e) => activity_kill_error.set(Some(e)),
+                                Ok(()) => {
+                                    (repair)(conn_id, id, kind);
+                                    // **Bump the generation first.** The refresh is
+                                    // guarded against a fetch already in flight, and
+                                    // a poll started while the kill was travelling
+                                    // swallowed it silently — so with auto-refresh
+                                    // Off the killed session stayed on the list with
+                                    // a live *Kill session* under it, and nothing
+                                    // said the kill had worked. Bumping strands the
+                                    // in-flight reply (it would be describing a
+                                    // server state that no longer holds) and frees
+                                    // the guard for this one.
+                                    //
+                                    // **And re-arms.** The bump strands the poll
+                                    // loop as surely as it strands the fetch, and
+                                    // for a while nothing here started a new one:
+                                    // auto-refresh died permanently at the first
+                                    // successful kill, on the panel whose subject is
+                                    // a live server, immediately after the one
+                                    // action that changes it.
+                                    //
+                                    // **Re-arms to `activity_polling()`, not to
+                                    // `true`.** A literal here says "there is
+                                    // someone watching" on the strength of a reply
+                                    // that has just come back from the network —
+                                    // by which time the panel may be closed, the
+                                    // window unfocused or the column collapsed to
+                                    // zero width, all three of which `should_poll`
+                                    // exists to answer No to. The two sibling
+                                    // callers below already pass it.
+                                    rearm_activity(
+                                        activity_gen,
+                                        activity_interval,
+                                        refresh.clone(),
+                                        activity_polling(),
+                                    );
+                                    (refresh)();
+                                }
+                            }
+                        });
+                        handle.spawn(async move {
+                            report(db.kill_session(id, kind).await.map_err(|e| e.to_string()));
+                        });
+                    }),
+                }));
+            },
+        )
     };
 
     // Open / close / repoint the panel. One effect rather than three, because the
