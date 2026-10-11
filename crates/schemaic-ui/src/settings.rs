@@ -2262,8 +2262,8 @@ pub(crate) fn help_overlay(layout: LayoutUi) -> impl IntoView {
 mod tests {
     use super::{
         EDITOR_FONT_SIZES, ROW_LIMITS, STATEMENT_TIMEOUTS, editor_font_label, log_hint,
-        row_limit_label, should_ask_for_a_notice, statement_timeout_label, term_font_label,
-        thousands,
+        WRAP_WIDTHS, row_limit_label, should_ask_for_a_notice, statement_timeout_label,
+        term_font_label, thousands, wrap_width_label,
     };
     use crate::consts::TERM_FONT_SIZES;
 

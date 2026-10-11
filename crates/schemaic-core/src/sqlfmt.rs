@@ -1902,7 +1902,7 @@ impl<'a> Fmt<'a> {
                 (n >= 2 && max > c).then_some((at, max - c))
             })
             .collect();
-        pads.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        pads.sort_unstable_by_key(|&(at, _)| std::cmp::Reverse(at));
         for (at, pad) in pads {
             self.out.insert_str(at, &" ".repeat(pad));
         }
