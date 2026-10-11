@@ -417,6 +417,19 @@ pub fn changed_on_disk(now: &[u8], expected: &str) -> bool {
     decode(now).text != expected.replace("\r\n", "\n")
 }
 
+/// The file's text now, when it has changed under a tab that last read or
+/// wrote `disk` — what the window-focus check offers to reload. Through
+/// [`changed_on_disk`], so a change the save guard would not block is no
+/// change here either.
+///
+/// `None` where there is nothing to offer: no `disk` to compare against (a
+/// tab restored with unsaved edits holds none), or a file gone or unreadable
+/// (`now` an error), which a reload could not load either.
+pub fn disk_change(disk: Option<&str>, now: std::io::Result<Vec<u8>>) -> Option<String> {
+    let now = now.ok()?;
+    changed_on_disk(&now, disk?).then(|| decode(&now).text)
+}
+
 /// [`same_file`]'s rule with the platform's answer passed in, so both sides of it
 /// are testable on either platform.
 ///
@@ -993,6 +1006,27 @@ mod tests {
         let bytes = String::from_utf8(encode(pasted, crlf)).unwrap();
         assert!(!bytes.contains("\r\r\n"));
         assert!(!changed_on_disk(bytes.as_bytes(), pasted));
+    }
+
+    /// **What the window-focus check offers a reload for**: the file's text
+    /// now, where it differs from the text the tab last read or wrote — read
+    /// the way the save guard reads it, so a line-ending conversion and
+    /// nothing else is no change. Nothing to compare against (a tab restored
+    /// with unsaved edits holds no `disk_sql`), a file gone or unreadable: no
+    /// offer, since a reload would have nothing to load.
+    #[test]
+    fn a_file_changed_under_its_tab_is_offered_back() {
+        assert_eq!(
+            disk_change(Some("SELECT 1;\n"), Ok(b"SELECT 2;\n".to_vec())).as_deref(),
+            Some("SELECT 2;\n")
+        );
+        assert_eq!(
+            disk_change(Some("SELECT 1;\n"), Ok(b"SELECT 1;\r\n".to_vec())),
+            None
+        );
+        assert_eq!(disk_change(None, Ok(b"SELECT 2;\n".to_vec())), None);
+        let gone = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert_eq!(disk_change(Some("SELECT 1;\n"), Err(gone)), None);
     }
 
     /// **A Save As names somebody else's file**, and the user has already

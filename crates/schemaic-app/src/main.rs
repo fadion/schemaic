@@ -6434,6 +6434,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 tab.path.set(shed.path);
                 tab.disk_sql.set(shed.disk_sql);
                 tab.file_format.set(shed.format);
+                // A *changed on disk* offer was about the file just shed; left
+                // up, it showed over a tab with no file and, once Open reused
+                // this slate, offered the old file's text as the new one's.
+                tab.disk_changed.set(None);
                 // Also reset the results pane so the reopened tab is fully fresh:
                 // one empty result, and the pins go with the rest — they belong
                 // to the tab that was closed, not to the one respawning here.
@@ -7211,6 +7215,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                 }
                                 tab.path.set(Some(landed2.clone()));
                                 tab.disk_sql.set(Some(text.clone()));
+                                // The file is the tab's again: a change the
+                                // focus check found is settled by this write.
+                                tab.disk_changed.set(None);
                                 // Saved as the tab shows it, so what was
                                 // unreadable is gone and the tab and the file
                                 // now agree. Asking again
@@ -7460,6 +7467,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                 }
                                 tab.query.set(f.text.clone());
                                 tab.disk_sql.set(Some(f.text.clone()));
+                                tab.disk_changed.set(None);
                                 tab.file_format.set(f.format);
                                 // The mounted editor owns its document, so the
                                 // new text only shows once the pane remounts.
@@ -11925,6 +11933,54 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // the startup check above already covers it).
             if prev == Some(false) && focused {
                 check_conn();
+            }
+            focused
+        });
+    }
+
+    // **Coming back to the window re-reads every file-bound tab's file**, off
+    // the UI thread, and a file that changed under its tab raises the bar above
+    // the editor that offers it back (`Tab::disk_changed`). Focus rather than a
+    // watcher: the edit that matters is the one made in another program, and
+    // returning here is when the user is about to act on a stale copy.
+    {
+        let handle = handle.clone();
+        create_effect(move |prev: Option<bool>| {
+            let focused = window_focused.get();
+            if prev == Some(false) && focused {
+                let bound: Vec<(Tab, std::path::PathBuf, Option<String>)> =
+                    tabs.with_untracked(|v| {
+                        v.iter()
+                            .filter_map(|t| {
+                                let path = t.path.try_get_untracked().flatten()?;
+                                Some((*t, path, t.disk_sql.try_get_untracked().flatten()))
+                            })
+                            .collect()
+                    });
+                for (tab, path, disk) in bound {
+                    // Nothing to compare against (restored with unsaved edits).
+                    if disk.is_none() {
+                        continue;
+                    }
+                    let expected = disk.clone();
+                    let report = create_ext_action(cx, move |changed: Option<String>| {
+                        // Closed while the read was in flight, or settled since
+                        // by a save or reload: the comparison was against a
+                        // `disk_sql` the tab no longer holds.
+                        if tab.disk_sql.try_get_untracked().flatten() != disk {
+                            return;
+                        }
+                        if tab.disk_changed.try_get_untracked().flatten() != changed {
+                            tab.disk_changed.set(changed);
+                        }
+                    });
+                    handle.spawn_blocking(move || {
+                        report(schemaic_core::sqlfile::disk_change(
+                            expected.as_deref(),
+                            std::fs::read(&path),
+                        ));
+                    });
+                }
             }
             focused
         });

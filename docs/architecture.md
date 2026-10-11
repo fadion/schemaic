@@ -13708,6 +13708,13 @@ existing prose was left alone.
     file, and the mode it had carried onto the new inode; see `persist.rs` for the four parts of
     that which read as tidiable) and why the save re-reads the bytes immediately before the rename
     and refuses when they are not what the tab read.
+    **The same question is asked without a save, too.** `disk_change(disk, now)` is what the app's
+    window-focus check asks of each file-bound tab: the file's decoded text, but only where it
+    differs from the tab's `disk_sql` *through* `changed_on_disk` — so a line-ending conversion
+    alone is no change here, as it is none to the save guard, and a change that guard would not
+    block is never offered back. It answers `None` with no `disk` (a tab restored with unsaved edits
+    holds none, so there is nothing to compare against) and for a file gone or unreadable, which a
+    reload could not load either (`a_file_changed_under_its_tab_is_offered_back`).
     **Size is asked before the bytes are.** `open_verdict` confirms past 8 MiB and refuses past 64
     MB, and the reason is the editor rather than the read: `fs::read` and `decode` are cheap even at
     256 MB, while the editor works on the document for as long as it is open. The confirm stood at
@@ -25222,9 +25229,11 @@ existing prose was left alone.
     the other is a box taller than the space it was placed in. No test covers the footer; it is a
     view.
   - `tabs.rs` — query-tab strip, and where a **`.sql`-backed tab** shows itself. The state behind
-    that is four signals on `Tab`: `path`, `disk_sql` (the file's text as of the last open / save /
+    that is five signals on `Tab`: `path`, `disk_sql` (the file's text as of the last open / save /
     reload — `None` means *unknown*, which reads as modified, the safe direction), `file_format`
-    (the `SqlFormat` a save has to put back, and whether the read was lossy) and `reload_gen`. `Tab::title` falls back name → file name → "Query N", the user-assigned name
+    (the `SqlFormat` a save has to put back, and whether the read was lossy), `reload_gen`, and
+    `disk_changed` (the file's text as the app's window-focus check last found it, when that differs
+    from `disk_sql` — what the bar above the editor offers back; see the app's file wiring). `Tab::title` falls back name → file name → "Query N", the user-assigned name
     winning on purpose, since renaming a tab is an explicit act a Save As shouldn't silently undo;
     `Tab::modified` is `path.is_some() && query != disk_sql`, and so always false for a tab with no
     file — an ordinary tab is session-persisted and has nothing to be unsaved *against*.
@@ -28446,7 +28455,10 @@ existing prose was left alone.
   raised only on a file-backed tab, since `Tab::modified` is false for an ordinary one.
   `close_tab_now`'s keep-≥1 branch clears `path`/`disk_sql`/
   `file_format` along with the text: the blank slate it leaves behind must not still point at a
-  file, or the next Ctrl+S would overwrite that file with an empty document.
+  file, or the next Ctrl+S would overwrite that file with an empty document. It clears
+  `disk_changed` too — the *changed on disk* offer was about the file just shed, and left up it
+  showed over a tab with no file and, once Open reused the slate, offered the old file's text as
+  the new one's (found documenting the bar, before it shipped).
   **It drops the tab out of `TxMode::Manual` too, and that is a rule about every release rather than
   about this branch.** `session_for` matches `Manual` and then looks the tab up in `sessions`; with
   the entry gone it returns `None` and the run fails before dispatch with *"the transaction
@@ -28469,6 +28481,31 @@ existing prose was left alone.
   is one bit that lets the restore decide whether the `query` it already has **is** the on-disk copy
   (`disk_sql = Some(query)`) or unknown (`None`, which reads as modified until the next save or
   reload settles it).
+  **A file changed by another program is offered back when the window regains focus**, not by a
+  filesystem watcher: the edit that matters was made elsewhere, and coming back is when the user
+  would act on a stale copy. A second `create_effect` on `window_focused`, beside the connection
+  re-check and with the same false → true test (the effect's own first run is a mount, so a launch
+  is not a focus gain), collects every tab holding both a `path` and a `Some` `disk_sql`, and for
+  each reads the file on `handle.spawn_blocking` and asks `sqlfile::disk_change`; the answer comes
+  back through `create_ext_action` into `Tab::disk_changed`. **The report is dropped when the tab's
+  `disk_sql` is no longer the one it was compared against** — a tab closed, saved or reloaded
+  while the read was in flight — and it writes the signal only when the value differs, so a file
+  changed *back* clears the bar. `write_tab_to`'s and `reload_sql_file`'s success branches clear it
+  too, since either makes the file the tab's again. What it does not cover, stated rather than
+  implied: a tab restored with unsaved edits (`disk_sql` `None`) is never checked until a save or
+  reload settles it, and a tab restored clean against a file changed while the app was closed is
+  caught at the first focus regain, not at launch — the restore does not re-read the file.
+  The offer is `lib.rs`'s `disk_bar`, **a row of the centre column's `v_stack` between the tab strip
+  and `editor_area`, not another overlay over the text** — `editor_area`'s `stack` is at floem's
+  16-child limit, and freeing a slot by wrapping is the trap described under *Floem 0.2 gotchas*.
+  It is a `dyn_container` keyed on the active tab's id while that tab's `disk_changed` is `Some`,
+  reading "“<file>” changed on disk.", in `text_dim` with `status_warn`/`status_warn_hover`
+  actions on `bg_deepest` (pairs `contrast.rs` gates). **Reload** is the tab menu's own
+  `TabsActions::reload_sql_file`, which asks through `Confirm` first when the tab is modified.
+  **Keep mine** sets `disk_sql` to the text the check found and clears the bar, so the tab reads
+  modified and the next save overwrites the file deliberately. That assignment is load-bearing:
+  leaving `disk_sql` at the old text would have the save-time guard — which refuses when the bytes
+  are not what the tab read — refuse exactly the save the user just chose.
   **Quitting the window is the one close path `guard_close` never sees, so it is answered by a
   flush rather than a question.** Floem 0.2 handles `WindowEvent::CloseRequested` by closing
   unconditionally — there is no veto to hang a prompt off — but the close *is* observable

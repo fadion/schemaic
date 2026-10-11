@@ -2122,6 +2122,11 @@ pub struct Tab {
     /// leave the visible text stale until the next keystroke overwrote the signal
     /// back from the doc.
     pub reload_gen: RwSignal<u64>,
+    /// The file's text as the window-focus check last found it, when that
+    /// differs from `disk_sql` — what the *changed on disk* bar above the
+    /// editor offers to reload (`schemaic_core::sqlfile::disk_change`).
+    /// Cleared by whatever settles it: a reload, a save, *Keep mine*.
+    pub disk_changed: RwSignal<Option<String>>,
 }
 
 impl Tab {
@@ -2575,6 +2580,7 @@ impl Tab {
             disk_sql: cx.create_rw_signal(None),
             file_format: cx.create_rw_signal(schemaic_core::sqlfile::SqlFormat::default()),
             reload_gen: cx.create_rw_signal(0),
+            disk_changed: cx.create_rw_signal(None),
         }
     }
 
@@ -9272,7 +9278,77 @@ fn center(ui: Ui) -> impl IntoView {
     ))
     .style(|s| s.width_full().flex_shrink(0.0_f32));
 
-    v_stack((tabs_row, editor_area, results_area, split_handle)).style(|s| {
+    // **The active tab's file changed on disk** (`Tab::disk_changed`, found by
+    // the app's window-focus check): a row between the tab strip and the
+    // editor, rather than another overlay over the text, offering the file
+    // back. *Reload* is the tab menu's own (which asks first when the tab has
+    // unsaved edits); *Keep mine* adopts the disk text as what the tab last
+    // read, so the tab reads modified and the next save overwrites the file
+    // deliberately — where leaving it would have the save guard refuse.
+    let disk_bar = {
+        let reload = ui.tab_actions.reload_sql_file.clone();
+        dyn_container(
+            move || {
+                let id = active.get();
+                tabs.with_untracked(|v| v.iter().find(|t| t.id == id).copied())
+                    .filter(|t| t.disk_changed.try_get().flatten().is_some())
+                    .map(|t| t.id)
+            },
+            move |shown| {
+                let Some(id) = shown else {
+                    return empty().into_any();
+                };
+                let Some(tab) = tabs.with_untracked(|v| v.iter().find(|t| t.id == id).copied())
+                else {
+                    return empty().into_any();
+                };
+                let name = tab
+                    .path
+                    .get_untracked()
+                    .map(|p| schemaic_core::sqlfile::tab_title(&p))
+                    .unwrap_or_default();
+                let act = |label: &'static str, on: Rc<dyn Fn()>| {
+                    text(label).on_click_stop(move |_| on()).style(|s| {
+                        s.color(theme::status_warn())
+                            .cursor(floem::style::CursorStyle::Pointer)
+                            .margin_left(theme::scaled(12.0))
+                            .hover(|s| s.color(theme::status_warn_hover()))
+                    })
+                };
+                let reload = reload.clone();
+                h_stack((
+                    text(format!("“{name}” changed on disk."))
+                        .style(|s| s.color(theme::text_dim()).min_width(0.0).text_ellipsis()),
+                    empty().style(|s| s.flex_grow(1.0_f32)),
+                    act("Reload", Rc::new(move || (reload)(id))),
+                    act(
+                        "Keep mine",
+                        Rc::new(move || {
+                            if let Some(now) = tab.disk_changed.try_get_untracked().flatten() {
+                                tab.disk_sql.set(Some(now));
+                                tab.disk_changed.set(None);
+                            }
+                        }),
+                    ),
+                ))
+                .style(|s| {
+                    s.flex_row()
+                        .items_center()
+                        .width_full()
+                        .font_size(theme::font_body())
+                        .padding_horiz(theme::scaled(10.0))
+                        .padding_vert(theme::scaled(5.0))
+                        .background(theme::bg_deepest())
+                        .border_bottom(1.0)
+                        .border_color(theme::border())
+                })
+                .into_any()
+            },
+        )
+        .style(|s| s.width_full().flex_shrink(0.0_f32))
+    };
+
+    v_stack((tabs_row, disk_bar, editor_area, results_area, split_handle)).style(|s| {
         s.flex_grow(1.0_f32)
             .height_full()
             .flex_col()
