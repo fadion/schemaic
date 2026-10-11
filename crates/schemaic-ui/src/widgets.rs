@@ -5216,20 +5216,68 @@ pub(crate) fn shift_hscroll<V: IntoView + 'static>(child: V) -> Scroll {
             if let Event::PointerWheel(pe) = e
                 && pe.modifiers.shift()
             {
-                // Windows sends Shift+wheel as a vertical delta; map it to x.
-                let dx = if pe.delta.x != 0.0 {
-                    pe.delta.x
-                } else {
-                    pe.delta.y
-                };
-                if dx != 0.0 {
-                    wheel.set(floem::kurbo::Vec2::new(dx, 0.0));
+                let pan = wheel_pan(pe.delta, true);
+                if pan.x != 0.0 {
+                    wheel.set(pan);
                 }
                 return EventPropagation::Stop;
             }
             EventPropagation::Continue
         },
     )
+}
+
+/// The scroll a wheel event asks for, as `(dx, dy)` in pixels.
+///
+/// Unshifted, it is the delta as given — a tilt wheel or a touchpad carries
+/// `x`, a plain wheel `y`. **Shifted, it is horizontal only**: Windows sends
+/// Shift+wheel as a vertical delta, so a zero `x` takes `y`'s value instead.
+/// [`shift_hscroll`] reads its Shift case here, and so does every grid pane that
+/// forwards the wheel to the data pane rather than scrolling itself — the frozen
+/// columns read only `y` once, so with enough of them frozen the strip of data
+/// pane left over was the only place a horizontal wheel reached.
+pub(crate) fn wheel_pan(delta: floem::kurbo::Vec2, shift: bool) -> floem::kurbo::Vec2 {
+    if !shift {
+        return delta;
+    }
+    let dx = if delta.x != 0.0 { delta.x } else { delta.y };
+    floem::kurbo::Vec2::new(dx, 0.0)
+}
+
+#[cfg(test)]
+mod wheel_pan_tests {
+    use super::wheel_pan;
+    use floem::kurbo::Vec2;
+
+    #[test]
+    fn an_unshifted_wheel_scrolls_both_axes_as_given() {
+        assert_eq!(wheel_pan(Vec2::new(0.0, 40.0), false), Vec2::new(0.0, 40.0));
+        assert_eq!(
+            wheel_pan(Vec2::new(-30.0, 0.0), false),
+            Vec2::new(-30.0, 0.0)
+        );
+        assert_eq!(wheel_pan(Vec2::new(5.0, 7.0), false), Vec2::new(5.0, 7.0));
+    }
+
+    #[test]
+    fn a_shifted_vertical_wheel_becomes_horizontal() {
+        assert_eq!(wheel_pan(Vec2::new(0.0, 40.0), true), Vec2::new(40.0, 0.0));
+        assert_eq!(
+            wheel_pan(Vec2::new(0.0, -40.0), true),
+            Vec2::new(-40.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn a_shifted_wheel_that_already_carries_x_keeps_it_and_drops_y() {
+        assert_eq!(wheel_pan(Vec2::new(25.0, 40.0), true), Vec2::new(25.0, 0.0));
+    }
+
+    #[test]
+    fn no_motion_stays_no_motion() {
+        assert_eq!(wheel_pan(Vec2::ZERO, true), Vec2::ZERO);
+        assert_eq!(wheel_pan(Vec2::ZERO, false), Vec2::ZERO);
+    }
 }
 
 /// Wrap a child in a horizontal `scroll` with **permanently hidden bars** that

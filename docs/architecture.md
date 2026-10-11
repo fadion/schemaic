@@ -21330,7 +21330,9 @@ existing prose was left alone.
   - `widgets.rs` — reusable widgets: `menu_panel`/`MenuEntry`, `keycap`/`keycap_width` (the one
     keycap, drawn by the palette and the menus alike), `modal_title`/`panel_style`/
     `menu_item_style`, `window_size`, `autohide`/`autohide_tracking`/`shift_hscroll`/`wheel_hscroll`
-    scroll wrappers,
+    scroll wrappers, `wheel_pan` — the one reading of a wheel event as a pan, Shift meaning
+    horizontal only and taking `y` when `x` is 0 (Windows sends Shift+wheel as vertical), which
+    `shift_hscroll` and every grid pane that forwards its wheel share (`wheel_pan_tests`),
     `check_box` — **the app's one checkbox**, drawn by every multi-select list there is (the import
     review list and the dump modal's table picker), so a picker cannot quietly grow a second look;
     it fills and empties **by style, never a rebuild**, which is why its `checked` predicate is
@@ -37342,7 +37344,9 @@ this bundle's.
   *absolute* `ci` so selection/resize/sort stay consistent. Frozen pane width = `gutter_w()` plus
   the sum of the frozen columns' widths, and it does not shrink (`flex_shrink(0)`). **There is no
   cap on it, deliberately**: freeze enough wide columns and the data pane is left little or no room,
-  which is the user's choice to make rather than the grid's to refuse.
+  which is the user's choice to make rather than the grid's to refuse. What it must not cost is the
+  horizontal wheel: the frozen pane forwards both axes to the data pane (the scroll-sync rule
+  below), so a pane frozen wide still pans the columns behind it.
   The list used to be an inline `(0..ncols).filter(!= frozen)` — the second spelling `core::edit`
   warns about — and is now the same core list scroll-into-view sums over.
   The resulting **draw order** — frozen first, then the rest in index order — is
@@ -37388,8 +37392,16 @@ this bundle's.
   the **data pane writes `vscroll`** (`on_scroll`) and reads `gs.scroll_to` (keyboard channel); the
   **frozen pane reads `vscroll`** (its `scroll_to`), has **no `on_scroll`**, and never scrolls itself
   on the wheel — it consumes the event (`Stop`) and forwards the delta into `gs.scroll_to`, so the
-  gutter isn't a dead zone under the pointer while the data pane still moves. The header pane
-  forwards **both** axes the same way.
+  gutter isn't a dead zone under the pointer while the data pane still moves. **All three follower
+  panes — the frozen header, the data header and the frozen body — forward through one closure**,
+  `forward_wheel` in the body builder, which clamps `x` to the scrolling columns' width less the
+  viewport and `y` to the bodies' height less the viewport, and writes `gs.scroll_to` from
+  `h_off`/`vscroll`; each reads its pan through `widgets::wheel_pan`, so **both** axes and Shift as
+  horizontal. The frozen body used to forward only `y` and ignore Shift, and the frozen header had
+  no handler at all, so a horizontal wheel — a tilt wheel, a touchpad's `x`, or Shift+wheel —
+  reached the grid only over the data pane: freeze enough columns and the sliver left over was the
+  only place it worked, reported as "frozen columns block horizontal scrolling". The data header
+  had its own inline copy of the clamp, without the Shift reading; it shares the closure now too.
 - **Virtual space under the last row.** Both bodies lay out to `consts::body_scroll_h` — the rows
   plus `min(viewport, rows) − one row` — so the last row can be scrolled up to the top rather than
   sitting on the bottom edge, and the maximum scroll is `rows − one row` whether or not the result
@@ -37398,8 +37410,9 @@ this bundle's.
   margin falls outside it. Held in a `Memo` beside `win` (recomputes on scroll, notifies only on a
   resize) that **both** panes read: a frozen pane sized to the bare rows would clamp its own
   `scroll_to` a viewport early and drift out of line exactly when the virtual space came into view.
-  The two wheel handlers that clamp a vertical offset themselves (header, frozen) read that same
-  memo — clamping either to `rows × row_h` stops the wheel early over that pane alone. The SQL
+  The wheel forwarding that clamps a vertical offset itself (`forward_wheel`, shared by the headers
+  and the frozen body) reads that same memo — clamping to `rows × row_h` stops the wheel early over
+  those panes alone. The SQL
   editor gets the identical rule from Floem's `ScrollBeyondLastLine`, which is why `body_scroll_h`
   is one function and not two.
 - **Column widths** (`gs.widths`) are estimated from content on load; the header's `col_resize_handle`

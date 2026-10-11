@@ -54,7 +54,7 @@ use crate::shortcuts::MenuKey;
 use crate::tooltip::TooltipExt;
 use crate::widgets::{
     MenuEntry, autohide, autohide_state, centered_msg, in_strip_button, loading_dots,
-    measure_text_px, shift_hscroll, thin_scroll, toolbar_icon, verb_spinner,
+    measure_text_px, shift_hscroll, thin_scroll, toolbar_icon, verb_spinner, wheel_pan,
 };
 use crate::{BlobTarget, ConnNode, FieldCfg, PopupAnchor, cell_editors, edit_field, icons, theme};
 
@@ -5032,11 +5032,50 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
             for &fc in frozen_cols.iter() {
                 fhead.push(header_cell(gs, fc, sort_val, sort, key_map.get_untracked()).into_any());
             }
-            let frozen_header = h_stack_from_iter(fhead).style(|s| {
-                s.flex_row()
-                    .flex_shrink(0.0_f32)
-                    .background(theme::bg_header_row())
+            // Every pane but the data body is a follower of the data pane's
+            // offsets, so none of them scrolls on the wheel: each forwards the
+            // pan into `gs.scroll_to`, the channel the data pane follows (the
+            // same one keyboard navigation uses). Floem applies
+            // `child_viewport + delta` in pixels, so reusing the delta with its
+            // own sign matches the data pane's native feel. Both axes, and
+            // Shift as horizontal through `wheel_pan` — the frozen body once read
+            // only `y`, so with enough columns frozen the sliver of data pane
+            // left over was the only place a horizontal wheel reached.
+            let wheel_cols = data_cols.clone();
+            let forward_wheel = Rc::new(move |pan: floem::kurbo::Vec2| {
+                if pan == floem::kurbo::Vec2::ZERO {
+                    return;
+                }
+                let vp = gs.vp.get_untracked();
+                let content_w = gs.widths.with_untracked(|w| {
+                    wheel_cols
+                        .iter()
+                        .map(|&ci| w.get(ci).copied().unwrap_or(0.0))
+                        .sum::<f64>()
+                });
+                let max_x = (content_w - vp.width()).max(0.0);
+                // Against the bodies' laid-out height, virtual space and all —
+                // clamping to the rows alone would stop the wheel a viewport
+                // early over the followers, and only there.
+                let max_y = (body_h.get_untracked() - vp.height()).max(0.0);
+                gs.scroll_to.set(Some(Point::new(
+                    (h_off.get_untracked() + pan.x).clamp(0.0, max_x),
+                    (vscroll.get_untracked() + pan.y).clamp(0.0, max_y),
+                )));
             });
+            let fw = forward_wheel.clone();
+            let frozen_header = h_stack_from_iter(fhead)
+                .on_event(EventListener::PointerWheel, move |e| {
+                    if let Event::PointerWheel(pe) = e {
+                        fw(wheel_pan(pe.delta, pe.modifiers.shift()));
+                    }
+                    EventPropagation::Stop
+                })
+                .style(|s| {
+                    s.flex_row()
+                        .flex_shrink(0.0_f32)
+                        .background(theme::bg_header_row())
+                });
             let km = key_map.get_untracked();
             let hdr_cols = data_cols.clone();
             // Virtualized header: leading spacer + the visible window's header cells
@@ -5059,7 +5098,6 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
                 },
             )
             .style(|s| s.flex_row().background(theme::bg_header_row()));
-            let wheel_cols = data_cols.clone();
             let data_header = scroll(data_header_row)
                 .scroll_to(move || Some(Point::new(h_off.get(), 0.0)))
                 // A pure follower of `h_off`, which only the data pane writes — so
@@ -5071,28 +5109,16 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
                 // sat over the wrong column — including its sort target and its
                 // resize divider — until the body happened to be scrolled.
                 //
-                // Forward both axes into the shared channel the data pane follows
-                // instead, exactly as the frozen pane forwards its vertical wheel.
-                .on_event(EventListener::PointerWheel, move |e| {
-                    if let Event::PointerWheel(pe) = e {
-                        let vp = gs.vp.get_untracked();
-                        let content_w = gs.widths.with_untracked(|w| {
-                            wheel_cols
-                                .iter()
-                                .map(|&ci| w.get(ci).copied().unwrap_or(0.0))
-                                .sum::<f64>()
-                        });
-                        let max_x = (content_w - vp.width()).max(0.0);
-                        // Against the bodies' laid-out height, virtual space and
-                        // all — clamping to the rows alone would stop the wheel a
-                        // viewport early over the header, and only there.
-                        let max_y = (body_h.get_untracked() - vp.height()).max(0.0);
-                        gs.scroll_to.set(Some(Point::new(
-                            (h_off.get_untracked() + pe.delta.x).clamp(0.0, max_x),
-                            (vscroll.get_untracked() + pe.delta.y).clamp(0.0, max_y),
-                        )));
+                // Forward it into the shared channel the data pane follows
+                // instead, exactly as the frozen panes do (`forward_wheel`).
+                .on_event(EventListener::PointerWheel, {
+                    let fw = forward_wheel.clone();
+                    move |e| {
+                        if let Event::PointerWheel(pe) = e {
+                            fw(wheel_pan(pe.delta, pe.modifiers.shift()));
+                        }
+                        EventPropagation::Stop
                     }
-                    EventPropagation::Stop
                 })
                 .scroll_style(|s| s.hide_bars(true))
                 .style(|s| {
@@ -5131,21 +5157,11 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
             // not scroll *itself* on the wheel either (it would desync from the data
             // pane, which has no way to follow it). But swallowing the wheel outright
             // left the gutter/frozen column a dead zone — hovering it while scrolling
-            // did nothing. Instead we forward the wheel to the shared scroll channel
-            // the data pane follows (`gs.scroll_to`, same one keyboard nav uses): the
-            // data pane scrolls, republishes `vscroll`, and this pane follows. Floem
-            // applies `child_viewport + delta` in pixels, so reusing `delta.y` with
-            // the same sign matches the native data-pane feel exactly.
+            // did nothing. Instead we forward the wheel (`forward_wheel`): the data
+            // pane scrolls, republishes `vscroll`, and this pane follows.
             .on_event(EventListener::PointerWheel, move |e| {
                 if let Event::PointerWheel(pe) = e {
-                    let dy = pe.delta.y;
-                    if dy != 0.0 {
-                        let vp = gs.vp.get_untracked();
-                        // Same height the bodies lay out to — see the header's twin.
-                        let max_y = (body_h.get_untracked() - vp.height()).max(0.0);
-                        let new_y = (vscroll.get_untracked() + dy).clamp(0.0, max_y);
-                        gs.scroll_to.set(Some(Point::new(vp.x0, new_y)));
-                    }
+                    forward_wheel(wheel_pan(pe.delta, pe.modifiers.shift()));
                 }
                 EventPropagation::Stop
             })
