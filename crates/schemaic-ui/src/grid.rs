@@ -3996,7 +3996,7 @@ pub(crate) struct GridCtx {
     /// One signal is enough because only one result grid is mounted at a time:
     /// `results_multi` is a tab strip keyed on `active_result`, not several grids
     /// side by side.
-    pub(crate) sel_summary: RwSignal<Option<String>>,
+    pub(crate) sel_summary: RwSignal<Option<SelReadout>>,
     /// Last commit error (grid write-back), shown in a bottom error bar at the
     /// panel level (like the find bar at the top). Cleared by the next edit/commit.
     pub(crate) commit_err: RwSignal<Option<ModalError>>,
@@ -4414,39 +4414,96 @@ pub(crate) fn grid_find_bar(
 /// bottom-anchored overlay. They coincide exactly when a bulk delete fails, so
 /// "it's transient" is not an answer — that is the moment both have something to
 /// say.
+/// What the selection bar reads: the column its figures are over (`None` for
+/// a row selection), and the figures themselves — kept whole rather than as
+/// the one summary line, so each can be clicked and copied as its own value.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SelReadout {
+    pub(crate) column: Option<String>,
+    pub(crate) figures: Vec<schemaic_core::aggregate::Figure>,
+}
+
+/// How long a copied figure reads *Copied* before showing its value again.
+const FIGURE_COPIED_FOR: std::time::Duration = std::time::Duration::from_millis(1200);
+
 pub(crate) fn grid_selection_bar(
-    sel_summary: RwSignal<Option<String>>,
+    sel_summary: RwSignal<Option<SelReadout>>,
     error_shown: impl Fn() -> bool + 'static + Copy,
 ) -> impl IntoView {
+    // The figure last clicked, by position, and a generation so a second click
+    // inside the first one's window is not cut short by the first's reset.
+    let copied: RwSignal<Option<(usize, u64)>> = RwSignal::new(None);
     dyn_container(
         move || sel_summary.get(),
-        move |summary| match summary {
+        move |readout| match readout {
             None => empty().into_any(),
-            Some(text_line) => text(text_line)
-                .style(|s| {
-                    // `bg_deepest`, the footer's surface — darker than the panel
-                    // it floats over, which is what makes the readout legible
-                    // against the grid behind it. Already a gated pairing with
-                    // `text_dim` (the completion popup's doc line), so this
-                    // introduces no combination the contrast test hasn't judged.
-                    s.color(theme::text_dim())
-                        .font_size(theme::font_label())
-                        .padding_horiz(theme::scaled(10.0))
-                        .padding_vert(theme::scaled(4.0))
-                        .background(theme::bg_deepest())
-                        .border(1.0)
-                        .border_color(theme::border())
-                        .border_radius(6.0)
-                })
-                .into_any(),
+            Some(r) => {
+                let sep = || text("·").style(|s| s.padding_horiz(theme::scaled(5.0)));
+                let mut parts: Vec<AnyView> = Vec::new();
+                if let Some(column) = r.column {
+                    parts.push(text(column).into_any());
+                    parts.push(sep().into_any());
+                }
+                let n = r.figures.len();
+                for (i, f) in r.figures.into_iter().enumerate() {
+                    let shown = f.shown;
+                    let copy = f.copy;
+                    parts.push(
+                        label(move || match copied.get() {
+                            Some((at, _)) if at == i => "Copied".to_string(),
+                            _ => shown.clone(),
+                        })
+                        .on_click_stop(move |_| {
+                            let _ = floem::Clipboard::set_contents(copy.clone());
+                            let generation = copied.get_untracked().map_or(0, |(_, g)| g + 1);
+                            copied.set(Some((i, generation)));
+                            floem::action::exec_after(FIGURE_COPIED_FOR, move |_| {
+                                if copied.try_get_untracked().flatten().map(|(_, g)| g)
+                                    == Some(generation)
+                                {
+                                    copied.set(None);
+                                }
+                            });
+                        })
+                        .style(|s| {
+                            s.cursor(floem::style::CursorStyle::Pointer)
+                                .hover(|s| s.color(theme::text()))
+                        })
+                        .into_any(),
+                    );
+                    if i + 1 < n {
+                        parts.push(sep().into_any());
+                    }
+                }
+                h_stack_from_iter(parts)
+                    .style(|s| {
+                        // `bg_deepest`, the footer's surface — darker than the
+                        // panel it floats over, which is what makes the readout
+                        // legible against the grid behind it. `text_dim` on it,
+                        // and `text` for a hovered figure, are both gated
+                        // pairings (`contrast.rs` names this bar beside each).
+                        s.items_center()
+                            .color(theme::text_dim())
+                            .font_size(theme::font_label())
+                            .padding_horiz(theme::scaled(10.0))
+                            .padding_vert(theme::scaled(4.0))
+                            .background(theme::bg_deepest())
+                            .border(1.0)
+                            .border_color(theme::border())
+                            .border_radius(6.0)
+                    })
+                    .into_any()
+            }
         },
     )
-    // **Clicks fall through it.** It is the last child of the results stack and
-    // has no interactive content, so without this it swallowed every pointer
-    // event over the cells it covers — no selection, no menu dismissal, no drag
-    // release, in the bottom-right corner of every grid. `grid_error_bar`
-    // legitimately keeps its events: it owns a clickable **View**.
-    .pointer_events(|| false)
+    // **No click-through, and no need for one.** It was `pointer_events(false)`
+    // while it was one line of text, since as the last child of the results
+    // stack it swallowed every pointer event over the cells it covered. Each
+    // figure is clickable now (copy its bare value), and the opt-out is not
+    // inheritable — a flagged container hides its children from the hit walk
+    // — so the flag is gone. What it takes is the chip's own shrink-wrapped
+    // box, and nothing at all while hidden: the absolute placement below is
+    // applied only while there is a readout, and an `empty()` has no size.
     .style(move |s| {
         if sel_summary.with(Option::is_some) {
             // Above `grid_error_bar` when that one is up, at the edge otherwise —
@@ -5409,11 +5466,10 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
                 length: None,
             },
         };
-        let label = match column {
-            Some(column) => format!("{} · {}", column.name, agg.summary()),
-            None => agg.summary(),
-        };
-        sel_summary.set(Some(label));
+        sel_summary.set(Some(SelReadout {
+            column: column.map(|c| c.name.clone()),
+            figures: agg.figures(),
+        }));
     });
     // **The rest of the window's pointer-ups.** A drag-select is armed by a
     // cell's `PointerDown` and continued by other cells' `PointerEnter`, which

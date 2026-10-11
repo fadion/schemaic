@@ -37427,10 +37427,20 @@ this bundle's.
   replaced counted as a value — the grid holds `<n bytes>` for that one, and that is a text.
   `grid_selection_bar` renders at panel level (like the find bar, so it can sit at the panel's
   edge) while `grid_view` computes it, and it lifts itself above `grid_error_bar` when that one is
-  up: they coincide exactly when a bulk delete fails, which is when both have something to say. It
-  sets `.pointer_events(|| false)` — it has no interactive content and otherwise swallowed every
-  click on the cells it covers — where `grid_error_bar` keeps its events, owning a clickable
-  **View**. **Every panel-level bar is cleared when the result stops being `Loaded`**, in one
+  up: they coincide exactly when a bulk delete fails, which is when both have something to say.
+  **Each figure is clicked to copy it.** `GridCtx::sel_summary` carries a `SelReadout` — the
+  column's name and `Aggregates::figures`, each shown as the summary shows it (`Sum 1,234.50`) and
+  copied as the bare value (`1234.50`: no label, no grouping commas, which a spreadsheet or a
+  `WHERE` would read as text; `each_figure_copies_as_its_bare_value`) — rather than the one
+  flattened line, and `Aggregates::summary` is now those figures joined, so the summary's tests
+  guard both. A clicked figure reads *Copied* for `FIGURE_COPIED_FOR`, behind a generation so a
+  second click is not cut short by the first one's reset. The bar was `.pointer_events(|| false)`
+  while it was one line of text — as the last child of the results stack it swallowed every click
+  on the cells it covered — and **the flag had to go rather than be undone per figure**: the
+  opt-out is not inheritable (above), so a flagged container hides its children from the hit walk.
+  What it takes now is the chip's own shrink-wrapped box, and nothing while hidden (the absolute
+  placement applies only while there is a readout); `grid_error_bar` keeps its events as before.
+  **Every panel-level bar is cleared when the result stops being `Loaded`**, in one
   effect in `results_section`: their only writer lives inside `grid_view`, so a failed re-run left
   the previous total and a live-looking Go-to-row popup pinned to a panel saying "Query failed."
   That means the **shown** result (`shown_panel_loaded`), not "any result in the tab": only one grid

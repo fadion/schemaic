@@ -287,9 +287,10 @@ pub const UI_PAIRINGS: &[Pairing<UiTheme>] = &[
     pair!(chip_active on bg_deepest, Body, "footer: hovering a status segment"),
     pair!(text on bg_deepest, Body,
         "every form field's content (`FieldCfg`'s default surface), AI chat code block, \
-         completion doc popup"),
+         completion doc popup, the grid selection bar's hovered figure"),
     pair!(text_dim on bg_deepest, Body,
-        "completion popup: the doc line; AI panel: a sent attachment's summary and table"),
+        "completion popup: the doc line; AI panel: a sent attachment's summary and table; \
+         the grid selection bar"),
     pair!(text_muted on bg_deepest, Icon, "completion popup: the kind label"),
     pair!(placeholder on bg_deepest, Recessive,
         "every form field's placeholder (`FieldCfg`'s default surface), the AI message field"),

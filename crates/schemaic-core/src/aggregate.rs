@@ -511,48 +511,75 @@ impl Aggregates {
     /// arithmetic.
     ///
     /// The NULL count appears only when there is one, so an ordinary selection
-    /// isn't padded with `0 null`.
+    /// isn't padded with `0 null`. It is [`Aggregates::figures`] joined.
     pub fn summary(&self) -> String {
+        self.figures()
+            .into_iter()
+            .map(|f| f.shown)
+            .collect::<Vec<_>>()
+            .join(" · ")
+    }
+
+    /// The readout's figures one by one, each as shown and as **copied**: the
+    /// bare value, without its label or the grouping commas a spreadsheet or
+    /// a `WHERE` would read as text — what clicking a figure puts on the
+    /// clipboard.
+    pub fn figures(&self) -> Vec<Figure> {
+        let fig = |shown: String, copy: String| Figure { shown, copy };
+        let exact =
+            |label: &str, v: &Fixed| fig(format!("{label} {}", grouped(&v.text())), v.text());
         // `N+` when the scan stopped at its budget — the same `+` the find
         // bar's count uses for the same reason, rather than a number that
         // reads exact and is not.
         let more = if self.truncated { "+" } else { "" };
-        let mut parts = vec![format!(
-            "{}{more} {}",
-            self.rows,
-            crate::text::plural(self.rows, "row", "rows")
+        let mut parts = vec![fig(
+            format!(
+                "{}{more} {}",
+                self.rows,
+                crate::text::plural(self.rows, "row", "rows")
+            ),
+            self.rows.to_string(),
         )];
         let nulls = self.rows - self.non_null;
         if nulls > 0 {
-            parts.push(format!("{nulls} null"));
+            parts.push(fig(format!("{nulls} null"), nulls.to_string()));
         }
         // One value is its own distinct count and its own median, so neither
         // is printed until there are two.
         let several = self.non_null > 1;
         if let Some(d) = self.distinct.filter(|_| several) {
-            parts.push(format!("{d} distinct"));
+            parts.push(fig(format!("{d} distinct"), d.to_string()));
         }
         if let Some(n) = &self.numeric {
-            parts.push(format!("Sum {}", grouped(&n.sum.text())));
+            parts.push(exact("Sum", &n.sum));
             // Omitted, not printed as a placeholder, when the mean can't be
             // represented: the other three are exact and saying so about them is
             // the whole job. An `Avg —` beside them would read as a value.
-            if let Some(avg) = n.avg {
-                parts.push(format!("Avg {}", grouped(&avg.text())));
+            if let Some(avg) = &n.avg {
+                parts.push(exact("Avg", avg));
             }
-            if let Some(median) = n.median.filter(|_| several) {
-                parts.push(format!("Median {}", grouped(&median.text())));
+            if let Some(median) = n.median.as_ref().filter(|_| several) {
+                parts.push(exact("Median", median));
             }
-            parts.push(format!("Min {}", grouped(&n.min.text())));
-            parts.push(format!("Max {}", grouped(&n.max.text())));
+            parts.push(exact("Min", &n.min));
+            parts.push(exact("Max", &n.max));
         }
         match self.length {
-            Some((lo, hi)) if lo == hi => parts.push(format!("Length {lo}")),
-            Some((lo, hi)) => parts.push(format!("Length {lo}–{hi}")),
+            Some((lo, hi)) if lo == hi => parts.push(fig(format!("Length {lo}"), lo.to_string())),
+            Some((lo, hi)) => parts.push(fig(format!("Length {lo}–{hi}"), format!("{lo}–{hi}"))),
             None => {}
         }
-        parts.join(" · ")
+        parts
     }
+}
+
+/// One figure of a selection's readout ([`Aggregates::figures`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Figure {
+    /// As the bar shows it: `Sum 1,234.50`.
+    pub shown: String,
+    /// As clicking it copies it: `1234.50`.
+    pub copy: String,
 }
 
 #[cfg(test)]
@@ -962,6 +989,43 @@ mod tests {
         assert_eq!(
             a.summary(),
             "2 rows · 2 distinct · Sum 3.00 · Avg 1.5 · Median 1.50 · Min 1.00 · Max 2.00"
+        );
+    }
+
+    /// **Each figure copies as the bare value** — no label and no grouping
+    /// commas, which a spreadsheet or a `WHERE` reads as text — while it shows
+    /// as the summary does, which is its figures joined.
+    #[test]
+    fn each_figure_copies_as_its_bare_value() {
+        let a = agg_of(
+            "decimal(12,2)",
+            &[
+                Value::Str("1234.50".into()),
+                Value::Str("2000.00".into()),
+                Value::Null,
+            ],
+        );
+        let figs = a.figures();
+        let shown: Vec<&str> = figs.iter().map(|f| f.shown.as_str()).collect();
+        assert_eq!(shown.join(" · "), a.summary());
+        let copy = |label: &str| {
+            figs.iter()
+                .find(|f| f.shown.starts_with(label))
+                .map(|f| f.copy.clone())
+                .unwrap_or_else(|| panic!("{label} in {shown:?}"))
+        };
+        assert_eq!(copy("Sum"), "3234.50");
+        assert_eq!(copy("Max"), "2000.00");
+        assert_eq!(copy("3 rows"), "3");
+        assert_eq!(copy("1 null"), "1");
+        let text = agg_of(
+            "varchar(10)",
+            &[Value::Str("ab".into()), Value::Str("abcd".into())],
+        );
+        let len = text.figures().into_iter().last().unwrap();
+        assert_eq!(
+            (len.shown.as_str(), len.copy.as_str()),
+            ("Length 2–4", "2–4")
         );
     }
 
