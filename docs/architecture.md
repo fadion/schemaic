@@ -26067,7 +26067,13 @@ existing prose was left alone.
     editor's `pointer_cursor` — `CursorStyle::Default` while `ctrl_link` is `Some`, `Text`
     otherwise. That signal is vendored floem's seventh patch (*Floem 0.2 gotchas*), because
     `editor_content` set the I-beam in the text view's own style, which no ancestor class outranks,
-    and `ctrl_link_view` is click-through, so it cannot wear a cursor of its own.
+    and `ctrl_link_view` is click-through, so it cannot wear a cursor of its own. **And no hover
+    tip while Ctrl is held** — the pointer is hunting for something to open, and a box over the
+    text only hides it: the `editor_area` move asks `hover_diag` for nothing while the modifier is
+    down, the effect that follows `primary_key_down` retires a shown or pending tip on the press
+    and re-arms the delay for the word under the pointer on the release — that call untracked, as
+    its word lookup reads `screen_lines` and a scroll re-running it would bring back a tip the
+    scroll had just retired.
     **Alt+Shift+drag is a box selection** (`text_ops::box_regions`). `name_box_at`'s way back from
     a pointer to the document is factored out as `pointer_offset` — the offset under the pointer and
     whether it is inside the text, `None` over the gutter — which the drag shares. *Inside* is

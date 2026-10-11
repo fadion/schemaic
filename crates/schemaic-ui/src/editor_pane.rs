@@ -8114,9 +8114,11 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 // overlay took is a move over the overlay, not over the text.
                 let covered = on_overlay.replace(false);
                 last_pointer.set(Some(pe.pos));
-                hover_diag((!covered).then_some(pe.pos));
-                link_pointer_move.set((!covered).then_some(pe.pos));
                 let held = crate::shortcuts::primary_held(pe.modifiers);
+                // No tip while Ctrl is held: the pointer is looking for
+                // something to open, and a box over the text only hides it.
+                hover_diag((!covered && !held).then_some(pe.pos));
+                link_pointer_move.set((!covered).then_some(pe.pos));
                 // A release the window never heard (it lost focus first) is
                 // corrected by the next move that sees no modifier.
                 if !held {
@@ -8220,9 +8222,17 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     // ancestors between, so a listener here hears nothing —
     // `shortcuts::primary_key_down` is noted where the key does arrive.
     create_effect(move |_| {
+        // The hover tip follows it the other way: Ctrl takes a shown tip away
+        // (and cancels a pending one), and letting go starts the delay afresh
+        // for whatever is under the pointer — untracked: its word lookup reads
+        // `screen_lines`, and a scroll re-running this would re-arm the tip
+        // the scroll just retired.
         if crate::shortcuts::primary_key_down().get() {
+            hover_diag(None);
             update_ctrl_link(link_pointer.get(), true);
         } else {
+            let p = link_pointer.get();
+            floem::reactive::untrack(|| hover_diag(p));
             update_ctrl_link(None, false);
         }
     });
