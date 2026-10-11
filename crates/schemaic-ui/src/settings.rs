@@ -1810,6 +1810,8 @@ pub(crate) fn theme_settings_overlay(
     let river = layout.river;
     let align = layout.align;
     let wrap_width = layout.wrap_width;
+    let function_case = layout.function_case;
+    let type_case = layout.type_case;
     let table_aliases = layout.table_aliases;
     let show_whitespace = layout.show_whitespace;
     let indent_guides = layout.indent_guides;
@@ -1932,6 +1934,38 @@ pub(crate) fn theme_settings_overlay(
                 ),
             ))
             .style(ctrl);
+            let function_case_dd = focusable_dropdown(
+                function_case,
+                schemaic_core::sqlfmt::KeywordCase::ALL,
+                schemaic_core::sqlfmt::KeywordCase::label,
+                ring.clone(),
+                163,
+            );
+            let function_case_section = v_stack((
+                settings_group_label("Function case"),
+                function_case_dd,
+                form_hint(
+                    "How Format Code writes the engine's own functions, such as COUNT and \
+                     COALESCE, where they are called. Your own functions keep their case.",
+                ),
+            ))
+            .style(ctrl);
+            let type_case_dd = focusable_dropdown(
+                type_case,
+                schemaic_core::sqlfmt::KeywordCase::ALL,
+                schemaic_core::sqlfmt::KeywordCase::label,
+                ring.clone(),
+                166,
+            );
+            let type_case_section = v_stack((
+                settings_group_label("Type case"),
+                type_case_dd,
+                form_hint(
+                    "How Format Code writes the engine's own data types, such as INT and \
+                     VARCHAR. Types you created keep their case.",
+                ),
+            ))
+            .style(ctrl);
             let commas_dd = focusable_dropdown(
                 comma_style,
                 schemaic_core::sqlfmt::CommaStyle::ALL,
@@ -2014,6 +2048,8 @@ pub(crate) fn theme_settings_overlay(
             let formatting_group = v_stack((
                 form_section_header("Code formatting"),
                 case_section,
+                function_case_section,
+                type_case_section,
                 commas_section,
                 gap_section,
                 wrap_section,
@@ -2261,8 +2297,8 @@ pub(crate) fn help_overlay(layout: LayoutUi) -> impl IntoView {
 #[cfg(test)]
 mod tests {
     use super::{
-        EDITOR_FONT_SIZES, ROW_LIMITS, STATEMENT_TIMEOUTS, editor_font_label, log_hint,
-        WRAP_WIDTHS, row_limit_label, should_ask_for_a_notice, statement_timeout_label,
+        EDITOR_FONT_SIZES, ROW_LIMITS, STATEMENT_TIMEOUTS, WRAP_WIDTHS, editor_font_label,
+        log_hint, row_limit_label, should_ask_for_a_notice, statement_timeout_label,
         term_font_label, thousands, wrap_width_label,
     };
     use crate::consts::TERM_FONT_SIZES;

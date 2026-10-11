@@ -13287,12 +13287,57 @@ existing prose was left alone.
     reads as `Keep`, so a value a later version writes never fails the `ui_state.json` it sits in
     (`keyword_case_persists_as_a_word`). Deriving `Deserialize` as a tidy-up would make it fail the
     whole file. A value that is not a string at all still fails the parse.
+    **Function case and type case are two more passes of the same kind, run after it** —
+    `FormatStyle::function_case` and `type_case`, each a `KeywordCase` and `Keep` by default,
+    applied by `apply_name_case(sql, dialect, functions, types)` (and `apply_name_case_under`,
+    taking the `DELIMITER` terminator as the keyword-case pair does) over `apply_keyword_case`'s
+    output in `format_range`. The order is load-bearing: a keyword that is also a function (`LEFT`)
+    is recased as a keyword first and then takes the function's case where it is called, so `LEFT
+    JOIN` and `left(s, 3)` can differ (`keyword_function_and_type_case_compose`). **A name has to
+    pass two questions, because a recased name is a different object wherever names are
+    case-sensitive.** *Is it the engine's own?* A function is one in this app's catalogue for the
+    dialect — `intel::is_builtin_function`, a `pub(crate)` wrapper over the private `catalog_index`
+    and `is_known_function`, so the dialect's whole catalogue, every flavour's names together; a
+    type is one of `is_builtin_type`'s per-dialect lists, kept in this module. A user's function or
+    type is never touched, nor anything beside a `.` (`t.lower(c)`, `dbo.money2`). *Does it stand
+    where it is that?* A function only unqualified, straight before its `(`, and where `is_call`
+    says it is called: not a layout keyword whose parens are a clause's (`VALUES (`, `IN (`) unless
+    `is_called_keyword`, not after `INTO`/`TABLE`/`FROM`/`JOIN`/`UPDATE`/`REFERENCES`/`FUNCTION`/
+    `PROCEDURE`/`VIEW`/`INDEX`/`KEY`/`TRIGGER`/`TYPE`, nor after an index's `ON` in a `CREATE` —
+    `insert into year(a)` names a table, not `YEAR()`, and a MySQL table's name may be
+    case-sensitive (`function_case_recases_built_in_calls`,
+    `function_case_leaves_a_name_before_a_paren`). That is conservative on purpose, and `from
+    json_table(…)` is missed with it, deliberately: the word before the paren is all the rule reads.
+    A type only where `type_position` puts one: after `::`; after the `AS` inside a `CAST`/
+    `TRY_CAST`/`SAFE_CAST` paren; a table body item's second token unless its first is one of
+    `TABLE_ITEM_WORDS`; a routine parameter's, after its name and any `IN`/`OUT`/`INOUT`/
+    `VARIADIC`; after `RETURNS`; on SQL Server after an `@var` or `@var AS`; and in an `ALTER TABLE`
+    after `ADD [COLUMN] c`, `MODIFY [COLUMN] c`, `ALTER COLUMN c`, `CHANGE [COLUMN] old new` and
+    `TYPE`. A type's tail words go with it, past a size's parens — `TYPE_TAILS` (`PRECISION`,
+    `VARYING`, `UNSIGNED`, `SIGNED`, `ZEROFILL`), and `WITH`/`WITHOUT TIME ZONE` after `TIME` or
+    `TIMESTAMP` (`type_case_recases_built_in_types_where_they_are_types`). What each open paren
+    holds is a stack of `NameFrame { holds: ParenHolds, n, first }` — `Table`, `Params`, `Cast` or
+    `Other`, with the item at its depth counted and its first word kept — the item reset at a comma
+    and the whole stack at a terminator. `paren_holds` asks the same free `is_table_body_open` that
+    `Fmt::opens_table_body` does, so the layout and the type case never disagree about which `(` is
+    a table's body.
+    **The type list holds only what the engine resolves in any case, and that was measured live
+    when the setting landed.** On SQL Server 2022 in a `Latin1_General_CS_AS` database, `INT`,
+    `NVARCHAR`, `DATETIME2`, `UNIQUEIDENTIFIER`, `SQL_VARIANT`, `ROWVERSION`, `SYSNAME`,
+    `GEOGRAPHY` and `HIERARCHYID` all resolve upper-cased, and `GETDATE`/`getdate`, `ISNULL`,
+    `STRING_AGG`/`string_agg` and `COALESCE` resolve in either case — but an alias type created as
+    `mytype` and written `MYTYPE` fails with *Msg 2715, Cannot find data type*. That is why a
+    user's type is never recased and a qualified name is skipped
+    (`type_case_leaves_types_it_does_not_ship`): recasing "whatever stands in a type position"
+    would rename a user's type under exactly the collation where its case is its name. Both passes
+    are ASCII only, so every byte stays where it was and `caret_after_format` holds over them as it
+    does over the keyword case.
     **Comma placement is the second setting, and it is the layout's, not a pass over it** —
     `CommaStyle` is `Trailing` (the default, *End of line*: the formatter as it always was) or
     `Leading` (*Start of line*), serialised and read leniently exactly as `KeywordCase` is, an
     unknown word being `Trailing` (`comma_style_defaults_to_end_of_line_and_reads_leniently`). The
     settings travel as a `FormatStyle { case, commas, gap, join_on_own_line, river, align,
-    tab_width, wrap }`, and `format_range`/`format_statement`
+    tab_width, wrap, function_case, type_case }`, and `format_range`/`format_statement`
     take `impl Into<FormatStyle>`, with `From<KeywordCase>` putting every other setting at its
     default — so a caller or test that passes a bare `KeywordCase` says nothing about the rest and
     is unchanged. `format_sql` stays at the defaults. `format_sql_under` takes the whole
@@ -13449,8 +13494,9 @@ existing prose was left alone.
     non-whitespace bytes before the caret and finds as many in the result, a caret in whitespace
     landing straight after the token before it (`the_caret_keeps_its_place_through_a_format`). That
     leans on this module's contract that only whitespace moves: a layout that ever changed a token's
-    text would put the caret somewhere else. Keyword case is the one sanctioned change to a token's
-    text, and it survives that only because it is ASCII and leaves every token's length alone.
+    text would put the caret somewhere else. Keyword, function and type case are the only
+    sanctioned changes to a token's text, and they survive that only because they are ASCII and
+    leave every token's length alone.
     **`single_line` is the editor's *Copy as single line*, and it is not `format_sql` with the
     breaks left out, because a line break is not always layout.** A whitespace run in code becomes
     one space and a block comment's runs collapse too, but a `--` or `#` comment ends at its line
@@ -13489,8 +13535,8 @@ existing prose was left alone.
     **`format_statement`** is *Format statement*'s answer in the same shape: the
     `sql::statement_range` at the caret through `format_range`, or `None` for blank text or a
     statement formatted already (`format_statement_formats_only_the_statement_at_the_caret`).
-    "Formatted already" includes the keyword case: both take the `FormatStyle`, so a statement laid
-    out already but cased otherwise is still `Some` — and still offered by the editor's menu
+    "Formatted already" includes the keyword, function and type case: both take the `FormatStyle`,
+    so a statement laid out already but cased otherwise is still `Some` — and still offered by the editor's menu
     (`formatting_writes_the_keyword_case`).
     **`caret_after_replace`** places a bare caret after either rewrite — unmoved before the range,
     shifted by the length change after it, `caret_after_format` within it — and is approximate inside
@@ -13577,7 +13623,7 @@ existing prose was left alone.
     `FormatStyle`s (the river; the river with `join_on_own_line`, `StatementGap::Keep` and leading
     commas; `join_on_own_line` with `StatementGap::None` and `align`; the river with `align` and
     `wrap` 40; the block layout with `wrap` 30 and leading commas) —
-    never a keyword case, which changes a
+    never a keyword, function or type case, each of which changes a
     token's text by design — where a second format must move nothing and
     `what_it_says` must not change. The formatter's own tests pin a setting a shape at a time, and
     this is where a shape none of them thought of shows up. **A new layout setting joins
@@ -13695,7 +13741,8 @@ existing prose was left alone.
     ROLLUP`, `WITH CHECK OPTION` and `TIMESTAMP WITH TIME ZONE`. `ON DELETE CASCADE` came out
     `ON` / `DELETE` / `CASCADE` on three lines, `DELETE` laid out as a statement
     (`a_word_that_only_spells_a_clause_does_not_open_one`). **A `CREATE TABLE`'s body is one item a
-    line** (`opens_table_body`: `CREATE [TEMPORARY] TABLE [IF NOT EXISTS] name (`): its `(` is set
+    line** (`opens_table_body`: `CREATE [TEMPORARY] TABLE [IF NOT EXISTS] name (`, over the free
+    `is_table_body_open` that the type case's `paren_holds` shares): its `(` is set
     off from the name (`spaced_paren`), each top-level comma breaks, and its `)` returns to the
     opener's indent — a `Paren::listed`, whose inside is still an expression paren, so `CHARACTER
     SET` and `ON DELETE` keep their lines; `KEY`, `UNIQUE` and `CHECK` take a spaced `(` as a
@@ -27979,10 +28026,14 @@ existing prose was left alone.
     patch, which centres the whitespace marks in their line (*Floem 0.2 gotchas*). The palette's
     *Toggle Whitespace* and *Toggle Indent Guides* sit beside *Toggle Word Wrap*.
     **Keyword case** (Settings → *Code formatting*, its own section between *Editor* and *Query*,
-    the first of its four `focusable_dropdown`s; *As typed* by default — `UiState::format_keyword_case`,
+    the first of its six `focusable_dropdown`s; *As typed* by default — `UiState::format_keyword_case`,
     pinned by
     `format_keyword_case_defaults_to_as_typed_and_keeps_a_choice`; `LayoutUi::keyword_case`) is the
-    one editor setting here that paints nothing. **Commas** sits after it (*End of line* by
+    one editor setting here that paints nothing. **Function case** and **Type case** follow it
+    (focus order 163 and 166, both *As typed* by default — `UiState::format_function_case`/
+    `format_type_case`, pinned by `format_function_and_type_case_default_as_typed_and_keep_a_choice`;
+    `LayoutUi::function_case`/`type_case`), reusing `KeywordCase::ALL` and `label` for their choices
+    rather than a list of their own. **Commas** sits after them (*End of line* by
     default — `UiState::format_comma_style`, pinned by
     `format_comma_style_defaults_to_end_of_line_and_keeps_a_choice`; `LayoutUi::comma_style`), and
     **Between statements** after that (*One blank line* by default, focus order 180 —
@@ -28001,7 +28052,7 @@ existing prose was left alone.
     `format_join_on_own_line_defaults_off_and_keeps_an_on`; `LayoutUi::join_on_own_line`). What
     each does to the text is the `core/sqlfmt.rs` entry's. **They reach the formatter as one
     value**: the theme state holds a single `format_style: RwSignal<FormatStyle>`, and the app
-    composes it in one `create_effect` beside the other editor-setting effects, from the seven
+    composes it in one `create_effect` beside the other editor-setting effects, from the nine
     signals Settings edits one at a time, into `theme::set_format_style` — which replaced a setter
     per setting. Its `tab_width` is not one of them: the effect writes `0`, and
     `theme::format_style()` fills in `editor_tab_width` each time it is read, so the formatter

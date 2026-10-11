@@ -2395,6 +2395,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let format_river = RwSignal::new(ui_state.format_river);
     let format_align = RwSignal::new(ui_state.format_align);
     let wrap_width = RwSignal::new(ui_state.format_wrap_width);
+    let function_case = RwSignal::new(ui_state.format_function_case);
+    let type_case = RwSignal::new(ui_state.format_type_case);
     let table_aliases = RwSignal::new(ui_state.completion_table_aliases);
     let show_whitespace = RwSignal::new(ui_state.editor_show_whitespace);
     let indent_guides = RwSignal::new(ui_state.editor_indent_guides);
@@ -2427,6 +2429,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             river: format_river.get(),
             align: format_align.get(),
             wrap: wrap_width.get(),
+            function_case: function_case.get(),
+            type_case: type_case.get(),
             // The editor's own, filled in as the formatter is asked
             // (`theme::format_style`).
             tab_width: 0,
@@ -7818,6 +7822,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     format_river: format_river.get_untracked(),
                     format_align: format_align.get_untracked(),
                     format_wrap_width: wrap_width.get_untracked(),
+                    format_function_case: function_case.get_untracked(),
+                    format_type_case: type_case.get_untracked(),
                     completion_table_aliases: table_aliases.get_untracked(),
                     editor_show_whitespace: show_whitespace.get_untracked(),
                     editor_indent_guides: indent_guides.get_untracked(),
@@ -7921,6 +7927,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             format_river.get();
             format_align.get();
             wrap_width.get();
+            function_case.get();
+            type_case.get();
             table_aliases.get();
             show_whitespace.get();
             indent_guides.get();
@@ -13344,6 +13352,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             river: format_river,
             align: format_align,
             wrap_width,
+            function_case,
+            type_case,
             table_aliases,
             show_whitespace,
             indent_guides,

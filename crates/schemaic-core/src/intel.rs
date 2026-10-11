@@ -3358,6 +3358,12 @@ fn catalog_index(dialect: SqlDialect) -> Option<&'static CatalogIndex> {
     Some(cell.get_or_init(|| CatalogIndex::build(dialect, catalog)))
 }
 
+/// Is `word`, in any case, a function this app's catalogue says `dialect`
+/// ships? Format Code's function case asks it ([`crate::sqlfmt::apply_name_case`]).
+pub(crate) fn is_builtin_function(word: &str, dialect: SqlDialect) -> bool {
+    catalog_index(dialect).is_some_and(|i| is_known_function(i, &word.to_ascii_lowercase()))
+}
+
 /// The catalog entries autocomplete may offer on this engine, on the server
 /// flavour in front of the tab.
 ///

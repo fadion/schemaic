@@ -237,6 +237,510 @@ pub struct FormatStyle {
     /// The line width a list kept on one line may run to before it goes one
     /// item a line. `0` is off.
     pub wrap: usize,
+    /// How built-in functions are cased where they are called.
+    pub function_case: KeywordCase,
+    /// How built-in data types are cased where they stand as types.
+    pub type_case: KeywordCase,
+}
+
+/// `sql` with its built-in function calls in `functions` and its built-in
+/// types in `types` — applied over Format Code's output after the keyword
+/// case, so a keyword that is also a function (`LEFT`) takes the function's
+/// case where it is called.
+///
+/// **Both ask two questions, and a name has to pass both**, because a
+/// recased name is a different object wherever names are case-sensitive (a
+/// MySQL table on Linux, anything under a `_CS_` collation on SQL Server):
+///
+/// - *Is it the engine's own?* A function is one in this app's catalogue for
+///   the dialect ([`crate::intel::is_builtin_function`]); a type is one of
+///   the dialect's built-in type names ([`is_builtin_type`]). A user's
+///   function or type, and anything qualified (`t.lower`, `dbo.money2`), is
+///   never touched.
+/// - *Does it stand where that is what it is?* A function where it is
+///   called — straight before its `(`, and not where a name before a paren
+///   is a table's or a routine's being named (`insert into year(a)`,
+///   `create function lower(…)`, an index's `on t(a)`, `from json_table(…)`
+///   too, conservatively). A type where a type goes ([`type_position`]): a
+///   column's, a cast's, a variable's, a parameter's, a routine's result.
+///
+/// ASCII case only, as [`apply_keyword_case`], so every byte stays where it
+/// was.
+pub fn apply_name_case(
+    sql: &str,
+    dialect: SqlDialect,
+    functions: KeywordCase,
+    types: KeywordCase,
+) -> String {
+    apply_name_case_under(sql, dialect, functions, types, None)
+}
+
+/// What a paren holds, for [`type_position`]: a table's body, a routine's
+/// parameters, a `CAST`'s operand, or anything else.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ParenHolds {
+    Table,
+    Params,
+    Cast,
+    Other,
+}
+
+/// One open paren for [`apply_name_case`]: what it holds, and the item at
+/// its own depth being read — how many tokens of it so far, and its first
+/// word.
+struct NameFrame {
+    holds: ParenHolds,
+    n: usize,
+    first: String,
+}
+
+/// The words after a type that are still the type: `DOUBLE PRECISION`,
+/// `CHARACTER VARYING`, `INT UNSIGNED`.
+const TYPE_TAILS: &[&str] = &["PRECISION", "VARYING", "UNSIGNED", "SIGNED", "ZEROFILL"];
+
+/// [`apply_name_case`] of a fragment under the terminator `delim`, as
+/// [`apply_keyword_case_under`] takes it.
+fn apply_name_case_under(
+    sql: &str,
+    dialect: SqlDialect,
+    functions: KeywordCase,
+    types: KeywordCase,
+    mut delim: Option<String>,
+) -> String {
+    if functions == KeywordCase::Keep && types == KeywordCase::Keep {
+        return sql.to_string();
+    }
+    let toks = tokenize(sql, dialect, &mut delim);
+    let code: Vec<(Kind, &str)> = toks
+        .into_iter()
+        .filter(|(k, _)| !matches!(k, Kind::LineComment | Kind::BlockComment))
+        .collect();
+    let base = sql.as_ptr() as usize;
+    let mut out = sql.to_string();
+    let mut recase = |text: &str, case: KeywordCase| {
+        let at = text.as_ptr() as usize - base;
+        let recased = match case {
+            KeywordCase::Upper => text.to_ascii_uppercase(),
+            KeywordCase::Lower => text.to_ascii_lowercase(),
+            KeywordCase::Keep => return,
+        };
+        out.replace_range(at..at + text.len(), &recased);
+    };
+    let mut verb: Option<String> = None;
+    let mut frames: Vec<NameFrame> = Vec::new();
+    for i in 0..code.len() {
+        let (kind, text) = code[i];
+        match (kind, text) {
+            (Kind::Terminator | Kind::Directive, _) | (Kind::Punct, ";") => {
+                verb = None;
+                frames.clear();
+                continue;
+            }
+            (Kind::Punct, ")") => {
+                frames.pop();
+                continue;
+            }
+            (Kind::Punct, ",") => {
+                if let Some(f) = frames.last_mut() {
+                    f.n = 0;
+                    f.first.clear();
+                }
+                continue;
+            }
+            _ => {}
+        }
+        if verb.is_none() && kind == Kind::Word {
+            verb = Some(text.to_ascii_uppercase());
+        }
+        if kind == Kind::Word {
+            let dot =
+                |j: Option<usize>| matches!(j.and_then(|j| code.get(j)), Some((Kind::Punct, ".")));
+            let dotted = dot(i.checked_sub(1)) || dot(Some(i + 1));
+            let typed = !dotted && type_position(&code, i, frames.last(), verb.as_deref(), dialect);
+            if typed && is_builtin_type(text, dialect) {
+                recase(text, types);
+                // The rest of a type spelled in several words.
+                let mut j = i + 1;
+                if matches!(code.get(j), Some((Kind::Punct, "("))) {
+                    let mut depth = 0usize;
+                    while let Some(&(k, t)) = code.get(j) {
+                        j += 1;
+                        match (k, t) {
+                            (Kind::Punct, "(") => depth += 1,
+                            (Kind::Punct, ")") => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                let word_at = |j: usize, set: &[&str]| matches!(code.get(j), Some((Kind::Word, w)) if set.iter().any(|s| w.eq_ignore_ascii_case(s)));
+                while word_at(j, TYPE_TAILS) {
+                    recase(code[j].1, types);
+                    j += 1;
+                }
+                let timed = ["TIME", "TIMESTAMP"]
+                    .iter()
+                    .any(|t| text.eq_ignore_ascii_case(t));
+                if timed
+                    && word_at(j, &["WITH", "WITHOUT"])
+                    && word_at(j + 1, &["TIME"])
+                    && word_at(j + 2, &["ZONE"])
+                {
+                    for t in &code[j..j + 3] {
+                        recase(t.1, types);
+                    }
+                }
+            } else if !typed
+                && !dotted
+                && matches!(code.get(i + 1), Some((Kind::Punct, "(")))
+                && is_call(&code, i, verb.as_deref())
+                && crate::intel::is_builtin_function(text, dialect)
+            {
+                recase(text, functions);
+            }
+        }
+        // The token counts toward the item at its paren's depth; a `(` then
+        // opens a paren of its own.
+        if let Some(f) = frames.last_mut() {
+            if f.n == 0 {
+                f.first = text.to_ascii_uppercase();
+            }
+            f.n += 1;
+        }
+        if (kind, text) == (Kind::Punct, "(") {
+            frames.push(NameFrame {
+                holds: paren_holds(&code, i, verb.as_deref()),
+                n: 0,
+                first: String::new(),
+            });
+        }
+    }
+    out
+}
+
+/// What the `(` at `code[i]` holds ([`ParenHolds`]).
+fn paren_holds(code: &[(Kind, &str)], i: usize, verb: Option<&str>) -> ParenHolds {
+    if ["CAST", "TRY_CAST", "SAFE_CAST"]
+        .iter()
+        .any(|w| i > 0 && word_is(code, i - 1, w))
+    {
+        return ParenHolds::Cast;
+    }
+    let creates = verb == Some("CREATE");
+    if creates && is_table_body_open(code, i) {
+        return ParenHolds::Table;
+    }
+    if (creates || verb == Some("ALTER"))
+        && let Some(n) = name_start(code, i).filter(|&n| n > 0)
+        && (word_is(code, n - 1, "FUNCTION") || word_is(code, n - 1, "PROCEDURE"))
+    {
+        return ParenHolds::Params;
+    }
+    ParenHolds::Other
+}
+
+/// Is the word at `code[i]`, which a `(` follows, called — rather than a
+/// name a paren follows: a table's (`into year(a)`, `table date(…)`,
+/// `from json_table(…)`, an index's `on t(a)`), a routine's being created, a
+/// clause keyword's own parens (`VALUES (`, `IN (`)?
+fn is_call(code: &[(Kind, &str)], i: usize, verb: Option<&str>) -> bool {
+    let w = code[i].1;
+    if is_keyword(w) && !is_called_keyword(w) {
+        return false;
+    }
+    let Some(prev) = i.checked_sub(1) else {
+        return true;
+    };
+    let names = [
+        "INTO",
+        "TABLE",
+        "FROM",
+        "JOIN",
+        "UPDATE",
+        "REFERENCES",
+        "FUNCTION",
+        "PROCEDURE",
+        "VIEW",
+        "INDEX",
+        "KEY",
+        "TRIGGER",
+        "TYPE",
+    ];
+    if names.iter().any(|n| word_is(code, prev, n)) {
+        return false;
+    }
+    !(verb == Some("CREATE") && word_is(code, prev, "ON"))
+}
+
+/// Does the word at `code[i]` stand where a type goes?
+///
+/// After a cast's `::`; after the `AS` of a `CAST(`; a table body's item's
+/// second token, where the first is a column's name; a routine parameter's
+/// type, after its name and any `IN`/`OUT`; after `RETURNS`; on SQL Server
+/// after a variable or parameter (`@x int`, `@x AS int`); and in an
+/// `ALTER TABLE`, after `ADD [COLUMN] c`, `MODIFY [COLUMN] c`,
+/// `ALTER COLUMN c`, `CHANGE [COLUMN] old new` and `TYPE`. The type list
+/// still has to agree ([`is_builtin_type`]), so a position read too widely
+/// costs nothing but a name it already would not touch.
+fn type_position(
+    code: &[(Kind, &str)],
+    i: usize,
+    frame: Option<&NameFrame>,
+    verb: Option<&str>,
+    dialect: SqlDialect,
+) -> bool {
+    let word = |j: Option<usize>, w: &str| j.is_some_and(|j| word_is(code, j, w));
+    let back = |n: usize| i.checked_sub(n);
+    let name_at = |j: Option<usize>| {
+        j.and_then(|j| code.get(j))
+            .is_some_and(|(k, _)| matches!(k, Kind::Word | Kind::Quoted))
+    };
+    if matches!(back(1).map(|j| code[j]), Some((Kind::Punct, "::"))) || word(back(1), "RETURNS") {
+        return true;
+    }
+    if let Some(f) = frame {
+        match f.holds {
+            ParenHolds::Cast => return word(back(1), "AS"),
+            ParenHolds::Table => {
+                return f.n == 1 && !TABLE_ITEM_WORDS.contains(&f.first.as_str());
+            }
+            ParenHolds::Params => {
+                let mode = ["IN", "OUT", "INOUT", "VARIADIC"].contains(&f.first.as_str());
+                return f.n == 1 + usize::from(mode);
+            }
+            ParenHolds::Other => return false,
+        }
+    }
+    let variable = |j: Option<usize>| matches!(j.map(|j| code[j]), Some((Kind::Word, w)) if w.starts_with('@') && !w.starts_with("@@"));
+    if variables_are_typed_by_name(dialect)
+        && (variable(back(1)) || (word(back(1), "AS") && variable(back(2))))
+    {
+        return true;
+    }
+    if verb != Some("ALTER") {
+        return false;
+    }
+    if word(back(1), "TYPE") {
+        return true;
+    }
+    if !name_at(back(1)) {
+        return false;
+    }
+    let prev = code[i - 1].1.to_ascii_uppercase();
+    word(back(2), "MODIFY")
+        || (word(back(2), "COLUMN")
+            && (word(back(3), "ADD") || word(back(3), "MODIFY") || word(back(3), "ALTER")))
+        || (word(back(2), "ADD") && prev != "COLUMN" && !TABLE_ITEM_WORDS.contains(&prev.as_str()))
+        || (name_at(back(2))
+            && (word(back(3), "CHANGE") || (word(back(3), "COLUMN") && word(back(4), "CHANGE"))))
+}
+
+/// Does a type follow an `@name` here — `DECLARE @x int`, a procedure's
+/// `@p nvarchar(10)`? T-SQL's variables and parameters alone; elsewhere an
+/// `@x` is a user variable (MySQL) or a parameter (SQLite) with no type
+/// after it. An exhaustive `match`, for the reason [`ops`] gives.
+fn variables_are_typed_by_name(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MsSql => true,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+    }
+}
+
+/// Is `word` one of `dialect`'s built-in type names, in any case?
+///
+/// **The engine's own, which it resolves without regard to case** — a user's
+/// type is the one that would break. Measured on SQL Server 2022 in a
+/// `Latin1_General_CS_AS` database: `INT`, `NVARCHAR`, `SYSNAME`, `GEOGRAPHY`
+/// and `HIERARCHYID` all resolve upper-cased, while an alias type created as
+/// `mytype` and written `MYTYPE` is *Msg 2715, Cannot find data type*. An
+/// exhaustive `match`, for the reason [`ops`] gives.
+fn is_builtin_type(word: &str, dialect: SqlDialect) -> bool {
+    let list: &[&str] = match dialect {
+        SqlDialect::MySql => &[
+            "TINYINT",
+            "SMALLINT",
+            "MEDIUMINT",
+            "INT",
+            "INTEGER",
+            "BIGINT",
+            "DECIMAL",
+            "DEC",
+            "NUMERIC",
+            "FIXED",
+            "FLOAT",
+            "DOUBLE",
+            "REAL",
+            "BIT",
+            "BOOL",
+            "BOOLEAN",
+            "SERIAL",
+            "DATE",
+            "DATETIME",
+            "TIMESTAMP",
+            "TIME",
+            "YEAR",
+            "CHAR",
+            "VARCHAR",
+            "NCHAR",
+            "NVARCHAR",
+            "BINARY",
+            "VARBINARY",
+            "TINYBLOB",
+            "BLOB",
+            "MEDIUMBLOB",
+            "LONGBLOB",
+            "TINYTEXT",
+            "TEXT",
+            "MEDIUMTEXT",
+            "LONGTEXT",
+            "ENUM",
+            "SET",
+            "JSON",
+            "GEOMETRY",
+            "POINT",
+            "LINESTRING",
+            "POLYGON",
+            "MULTIPOINT",
+            "MULTILINESTRING",
+            "MULTIPOLYGON",
+            "GEOMETRYCOLLECTION",
+            "UUID",
+            "INET4",
+            "INET6",
+            "SIGNED",
+            "UNSIGNED",
+        ],
+        SqlDialect::Postgres => &[
+            "SMALLINT",
+            "INTEGER",
+            "INT",
+            "INT2",
+            "INT4",
+            "INT8",
+            "BIGINT",
+            "DECIMAL",
+            "NUMERIC",
+            "REAL",
+            "DOUBLE",
+            "FLOAT",
+            "FLOAT4",
+            "FLOAT8",
+            "SMALLSERIAL",
+            "SERIAL",
+            "BIGSERIAL",
+            "SERIAL2",
+            "SERIAL4",
+            "SERIAL8",
+            "MONEY",
+            "CHAR",
+            "CHARACTER",
+            "VARCHAR",
+            "TEXT",
+            "BYTEA",
+            "TIMESTAMP",
+            "TIMESTAMPTZ",
+            "DATE",
+            "TIME",
+            "TIMETZ",
+            "INTERVAL",
+            "BOOLEAN",
+            "BOOL",
+            "POINT",
+            "LINE",
+            "LSEG",
+            "BOX",
+            "PATH",
+            "POLYGON",
+            "CIRCLE",
+            "CIDR",
+            "INET",
+            "MACADDR",
+            "MACADDR8",
+            "BIT",
+            "VARBIT",
+            "TSVECTOR",
+            "TSQUERY",
+            "UUID",
+            "XML",
+            "JSON",
+            "JSONB",
+            "INT4RANGE",
+            "INT8RANGE",
+            "NUMRANGE",
+            "TSRANGE",
+            "TSTZRANGE",
+            "DATERANGE",
+            "OID",
+            "REGCLASS",
+            "NAME",
+        ],
+        SqlDialect::Sqlite => &[
+            "INTEGER",
+            "INT",
+            "TINYINT",
+            "SMALLINT",
+            "MEDIUMINT",
+            "BIGINT",
+            "REAL",
+            "DOUBLE",
+            "FLOAT",
+            "NUMERIC",
+            "DECIMAL",
+            "BOOLEAN",
+            "DATE",
+            "DATETIME",
+            "TEXT",
+            "CHAR",
+            "CHARACTER",
+            "VARCHAR",
+            "NCHAR",
+            "NVARCHAR",
+            "CLOB",
+            "BLOB",
+        ],
+        SqlDialect::MsSql => &[
+            "BIGINT",
+            "INT",
+            "SMALLINT",
+            "TINYINT",
+            "BIT",
+            "DECIMAL",
+            "NUMERIC",
+            "MONEY",
+            "SMALLMONEY",
+            "FLOAT",
+            "REAL",
+            "DATE",
+            "TIME",
+            "DATETIME",
+            "DATETIME2",
+            "DATETIMEOFFSET",
+            "SMALLDATETIME",
+            "CHAR",
+            "VARCHAR",
+            "TEXT",
+            "NCHAR",
+            "NVARCHAR",
+            "NTEXT",
+            "BINARY",
+            "VARBINARY",
+            "IMAGE",
+            "UNIQUEIDENTIFIER",
+            "XML",
+            "SQL_VARIANT",
+            "ROWVERSION",
+            "TIMESTAMP",
+            "SYSNAME",
+            "GEOGRAPHY",
+            "GEOMETRY",
+            "HIERARCHYID",
+        ],
+    };
+    list.iter().any(|t| word.eq_ignore_ascii_case(t))
 }
 
 impl From<KeywordCase> for FormatStyle {
@@ -433,7 +937,8 @@ pub fn format_range(
     let case = style.case;
     if lo == 0 && hi == full.len() {
         let formatted = format_sql_under(full, indent_unit, dialect, None, style);
-        return apply_keyword_case(&formatted, dialect, case);
+        let cased = apply_keyword_case(&formatted, dialect, case);
+        return apply_name_case(&cased, dialect, style.function_case, style.type_case);
     }
     let frag = &full[lo..hi];
     let body = frag.trim();
@@ -444,9 +949,10 @@ pub fn format_range(
     let trail = &frag[frag.trim_end().len()..];
     let delim = terminator_at(full, lo, dialect);
     let formatted = format_sql_under(body, indent_unit, dialect, delim.clone(), style);
+    let cased = apply_keyword_case_under(&formatted, dialect, case, delim.clone());
     format!(
         "{lead}{}{trail}",
-        apply_keyword_case_under(&formatted, dialect, case, delim)
+        apply_name_case_under(&cased, dialect, style.function_case, style.type_case, delim)
     )
 }
 
@@ -883,6 +1389,20 @@ fn name_start(toks: &[(Kind, &str)], k: usize) -> Option<usize> {
             _ => return Some(i),
         }
     }
+}
+
+/// Does the `(` at `toks[k]` follow `TABLE [IF NOT EXISTS] name` — a table's
+/// body, in a statement that creates one?
+fn is_table_body_open(toks: &[(Kind, &str)], k: usize) -> bool {
+    let Some(mut i) = name_start(toks, k) else {
+        return false;
+    };
+    let word = |j: usize, w: &str| word_is(toks, j, w);
+    // `IF NOT EXISTS` between `TABLE` and the name.
+    if i >= 3 && word(i - 1, "EXISTS") && word(i - 2, "NOT") && word(i - 3, "IF") {
+        i -= 3;
+    }
+    i >= 1 && word(i - 1, "TABLE")
 }
 
 /// Is `toks[j]` the word `w`, in any case?
@@ -2036,18 +2556,7 @@ impl<'a> Fmt<'a> {
     /// Is the `(` at `toks[k]` a table's body — `CREATE [TEMPORARY] TABLE [IF
     /// NOT EXISTS] name (` — whose items go one a line?
     fn opens_table_body(&self, toks: &[(Kind, &str)], k: usize) -> bool {
-        if self.verb.as_deref() != Some("CREATE") {
-            return false;
-        }
-        let Some(mut i) = name_start(toks, k) else {
-            return false;
-        };
-        let word = |j: usize, w: &str| word_is(toks, j, w);
-        // `IF NOT EXISTS` between `TABLE` and the name.
-        if i >= 3 && word(i - 1, "EXISTS") && word(i - 2, "NOT") && word(i - 3, "IF") {
-            i -= 3;
-        }
-        i >= 1 && word(i - 1, "TABLE")
+        self.verb.as_deref() == Some("CREATE") && is_table_body_open(toks, k)
     }
 
     /// Is the `(` at `toks[k]` a column list after a name — `REFERENCES u
@@ -3549,6 +4058,170 @@ mod tests {
         let sql = "select coalesce(first_name, last_name, nickname, 'unknown') as n from t";
         assert_eq!(FormatStyle::default().wrap, 0);
         assert!(styled(sql, FormatStyle::default()).contains("coalesce(first_name, last_name"));
+    }
+
+    /// A built-in function is recased where it is called — its name, unqualified,
+    /// straight before its `(` — and nowhere else: a user's function, a
+    /// qualified call, a column that shares a function's name, and a keyword
+    /// whose parens are a clause's (`VALUES (`) all keep their case.
+    #[test]
+    fn function_case_recases_built_in_calls() {
+        use KeywordCase::*;
+        use SqlDialect::{MySql, Postgres};
+        let up = |sql: &str, d| apply_name_case(sql, d, Upper, Keep);
+        assert_eq!(
+            up(
+                "select count(*), coalesce(a, 0), my_func(b), t.lower(c), count from t",
+                MySql
+            ),
+            "select COUNT(*), COALESCE(a, 0), my_func(b), t.lower(c), count from t"
+        );
+        assert_eq!(
+            up("select left(s, 3) from t where x in (1)", MySql),
+            "select LEFT(s, 3) from t where x in (1)"
+        );
+        assert_eq!(
+            up("insert into t values (1)", MySql),
+            "insert into t values (1)"
+        );
+        assert_eq!(
+            apply_name_case("SELECT COUNT(*), NOW() FROM t", MySql, Lower, Keep),
+            "SELECT count(*), now() FROM t"
+        );
+        assert_eq!(
+            up("select string_agg(a, ',') from t", Postgres),
+            "select STRING_AGG(a, ',') from t"
+        );
+    }
+
+    /// **A name is never recased as a call** — a table or a function being
+    /// created, an index's table — since a MySQL table's name may be
+    /// case-sensitive, and `insert into year(a)` names a table, not `YEAR()`.
+    #[test]
+    fn function_case_leaves_a_name_before_a_paren() {
+        use KeywordCase::*;
+        use SqlDialect::MySql;
+        for sql in [
+            "insert into year(a) values (1)",
+            "create table date(a int)",
+            "create index ix on year(a)",
+            "create function lower(a int) returns int return a",
+            "select * from json_table(a, '$') as j",
+        ] {
+            let out = apply_name_case(sql, MySql, Upper, Keep);
+            for w in ["year", "date", "lower"] {
+                if sql.contains(&format!("{w}(")) {
+                    assert!(
+                        out.contains(&format!("{w}(")),
+                        "recased the name {w}: {out}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A built-in type is recased where it stands as a type — a column's,
+    /// a cast's, a variable's, a parameter's, a routine's result — and never
+    /// as a name, however it is spelled.
+    #[test]
+    fn type_case_recases_built_in_types_where_they_are_types() {
+        use KeywordCase::*;
+        use SqlDialect::{MsSql, MySql, Postgres};
+        let up = |sql: &str, d| apply_name_case(sql, d, Keep, Upper);
+        assert_eq!(
+            up(
+                "create table t (id int not null, name varchar(40), d double precision, \
+                 n decimal(10, 2) unsigned, date date, primary key (id))",
+                MySql
+            ),
+            "create table t (id INT not null, name VARCHAR(40), d DOUBLE PRECISION, \
+             n DECIMAL(10, 2) UNSIGNED, date DATE, primary key (id))"
+        );
+        assert_eq!(
+            up(
+                "select a::text, cast(b as integer), date, text from t",
+                Postgres
+            ),
+            "select a::TEXT, cast(b as INTEGER), date, text from t"
+        );
+        assert_eq!(
+            up(
+                "alter table t add column c int, modify d varchar(10), change e f bigint",
+                MySql
+            ),
+            "alter table t add column c INT, modify d VARCHAR(10), change e f BIGINT"
+        );
+        assert_eq!(
+            up("alter table t alter column c type text", Postgres),
+            "alter table t alter column c type TEXT"
+        );
+        assert_eq!(
+            up(
+                "create function f(a int, out b text) returns integer as $$ select 1 $$ \
+                 language sql",
+                Postgres
+            ),
+            "create function f(a INT, out b TEXT) returns INTEGER as $$ select 1 $$ language sql"
+        );
+        assert_eq!(
+            up("declare @x int; declare @n as nvarchar(10)", MsSql),
+            "declare @x INT; declare @n as NVARCHAR(10)"
+        );
+        assert_eq!(
+            up("create table t (ts timestamp with time zone)", Postgres),
+            "create table t (ts TIMESTAMP WITH TIME ZONE)"
+        );
+        assert_eq!(
+            apply_name_case("CREATE TABLE t (ID INT)", MySql, Keep, Lower),
+            "CREATE TABLE t (ID int)"
+        );
+    }
+
+    /// **Only the engine's own types**: a user's type — SQL Server's alias
+    /// types, whose names follow a case-sensitive collation (`MYTYPE` for
+    /// `mytype` is Msg 2715 under `Latin1_General_CS_AS`, measured) — and a
+    /// qualified one are left alone. The engine's own resolve in any case,
+    /// `sysname` among them.
+    #[test]
+    fn type_case_leaves_types_it_does_not_ship() {
+        use KeywordCase::*;
+        use SqlDialect::{MsSql, Postgres};
+        assert_eq!(
+            apply_name_case("declare @s sysname", MsSql, Keep, Upper),
+            "declare @s SYSNAME"
+        );
+        for (d, sql) in [
+            (MsSql, "create table t (a mytype, b dbo.money2)"),
+            (MsSql, "declare @x mytype"),
+            (Postgres, "create table t (a my_domain, b pg_catalog.int4)"),
+        ] {
+            assert_eq!(apply_name_case(sql, d, Keep, Upper), sql, "{d:?}");
+        }
+    }
+
+    /// Format Code writes all three cases together, keyword case first: a
+    /// keyword that is also a function (`LEFT`) takes the function's case
+    /// where it is called.
+    #[test]
+    fn keyword_function_and_type_case_compose() {
+        let style = FormatStyle {
+            case: KeywordCase::Upper,
+            function_case: KeywordCase::Lower,
+            type_case: KeywordCase::Lower,
+            ..FormatStyle::default()
+        };
+        let out = styled(
+            "select left(s, 3), COUNT(*), cast(a as SIGNED) from t left join u on 1 = 1",
+            style,
+        );
+        assert!(out.contains("left(s, 3)"), "{out}");
+        assert!(out.contains("count(*)"), "{out}");
+        assert!(
+            out.contains("CAST(a AS signed)") || out.contains("cast(a AS signed)"),
+            "{out}"
+        );
+        assert!(out.contains("LEFT JOIN"), "{out}");
+        assert!(out.starts_with("SELECT"), "{out}");
     }
 
     // These tests predate the dialect parameter and assert MySQL formatting; a thin
