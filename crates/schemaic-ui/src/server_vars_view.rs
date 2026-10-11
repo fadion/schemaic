@@ -158,31 +158,48 @@ pub(crate) fn server_vars_overlay(ctx: VarsCtx) -> impl IntoView {
                 ring.clone(),
             );
 
+            // The table designer's section strip, border and all: the switch
+            // spans the panel and the rule under it does too, so the search
+            // reads as part of the list below rather than of the tabs.
             let switch = if server_vars::supports_status(t.dialect) {
-                kind_switch(kind).into_any()
+                container(kind_switch(kind))
+                    .style(|s| {
+                        s.width_full()
+                            .flex_shrink(0.0_f32)
+                            .padding_horiz(modal_pad_h())
+                            .padding_vert(theme::scaled(8.0))
+                            .border_bottom(1.0)
+                            .border_color(theme::border())
+                    })
+                    .into_any()
             } else {
                 empty().into_any()
             };
 
-            let field = edit_field(
-                filter,
-                FieldCfg {
-                    placeholder: "Search settings",
-                    clearable: true,
-                    focus: Some((ring.clone(), 10)),
-                    ..Default::default()
-                },
+            // The inset is on a wrapper, not the field: `users_view`'s shape.
+            // A full-width field inside a padded stack overran the padding on
+            // the right, leaving its edge a few pixels off the rows'.
+            let field = container(
+                edit_field(
+                    filter,
+                    FieldCfg {
+                        placeholder: "Search settings",
+                        clearable: true,
+                        focus: Some((ring.clone(), 10)),
+                        ..Default::default()
+                    },
+                )
+                .style(|s| s.width_full()),
             )
-            .style(|s| s.width_full());
-
-            let top = v_stack((switch, field)).style(|s| {
+            .style(|s| {
                 s.width_full()
-                    .flex_col()
-                    .gap(theme::scaled(8.0))
+                    .flex_shrink(0.0_f32)
                     .padding_horiz(modal_pad_h())
                     .padding_top(theme::scaled(10.0))
-                    .flex_shrink(0.0_f32)
             });
+
+            let top =
+                v_stack((switch, field)).style(|s| s.width_full().flex_col().flex_shrink(0.0_f32));
 
             let list = autohide(scroll(var_list(state, filter)).style(|s| {
                 s.width_full()
