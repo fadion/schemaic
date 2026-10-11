@@ -12709,8 +12709,12 @@ pub fn definition_at(sql: &str, caret: usize, dialect: SqlDialect) -> Option<(us
     let (lo, hi) = crate::sql::statement_range(sql, caret, dialect);
     let stmt = sql.get(lo..hi)?;
     let on = |(a, b): (usize, usize)| a <= caret && caret <= b;
-    if let Ok(asts) = parse_statements(stmt, dialect)
-        && let [ast] = asts.as_slice()
+    let asts = parse_statements(stmt, dialect).ok();
+    let ast = match asts.as_deref() {
+        Some([ast]) => Some(ast),
+        _ => None,
+    };
+    if let Some(ast) = ast
         && let Some(def) = alias_refs::definition(stmt, lo, ast, caret)
     {
         return (!on(def)).then_some(def);
@@ -12722,6 +12726,14 @@ pub fn definition_at(sql: &str, caret: usize, dialect: SqlDialect) -> Option<(us
     };
     if at > 0 && matches!(toks[at - 1].kind, TkKind::Dot) {
         return None;
+    }
+    // A CTE by scope where the statement parses, so one a subquery declares
+    // is found and shadows an outer one; the leading `WITH`'s token walk
+    // below where it does not.
+    if let Some(ast) = ast
+        && let Some(def) = alias_refs::cte_definition(stmt, lo, ast, name, toks[at].quoted, caret)
+    {
+        return (!on(def)).then_some(def);
     }
     let def = cte_name_tokens(&toks).into_iter().find(|d| match &d.kind {
         TkKind::Word(w) if d.quoted || toks[at].quoted => w == name,
@@ -13100,6 +13112,60 @@ mod alias_refs {
     ) -> Option<Vec<(usize, usize)>> {
         let (_, all) = spans(stmt, lo, ast, caret)?;
         Some(all.into_iter().map(|r| unquoted(stmt, lo, r)).collect())
+    }
+
+    /// [`super::definition_at`]'s CTE half over the tree: the CTE called
+    /// `name` declared by the **innermost** query that holds `caret` — so one
+    /// declared inside a subquery is found, and shadows an outer one of the
+    /// same name there. Its name's range, quotes off. A quoted name on either
+    /// side matches exactly, a bare pair as the server folds it.
+    pub(super) fn cte_definition(
+        stmt: &str,
+        lo: usize,
+        ast: &Statement,
+        name: &str,
+        quoted: bool,
+        caret: usize,
+    ) -> Option<(usize, usize)> {
+        /// Each declared CTE: the query it is scoped to, its name's range,
+        /// and the name as an `Ident`.
+        struct Ctes<'a> {
+            stmt: &'a str,
+            lo: usize,
+            found: Vec<(Span, Span, Ident)>,
+        }
+        impl Visitor for Ctes<'_> {
+            type Break = ();
+            fn pre_visit_query(&mut self, q: &Query) -> ControlFlow<()> {
+                if let Some(with) = &q.with {
+                    let scope = to_range(self.stmt, self.lo, q.span());
+                    for cte in &with.cte_tables {
+                        let at = to_range(self.stmt, self.lo, cte.alias.name.span);
+                        self.found.push((scope, at, cte.alias.name.clone()));
+                    }
+                }
+                ControlFlow::Continue(())
+            }
+        }
+        let mut v = Ctes {
+            stmt,
+            lo,
+            found: Vec::new(),
+        };
+        let _ = ast.visit(&mut v);
+        v.found
+            .into_iter()
+            .filter(|(scope, _, id)| {
+                scope.0 <= caret
+                    && caret <= scope.1
+                    && if quoted || id.quote_style.is_some() {
+                        id.value == name
+                    } else {
+                        id.value.eq_ignore_ascii_case(name)
+                    }
+            })
+            .min_by_key(|(scope, ..)| scope.1 - scope.0)
+            .map(|(_, at, _)| unquoted(stmt, lo, at))
     }
 
     /// [`super::alias_name_at`]: the definition, the name inside its quotes.
@@ -27876,6 +27942,31 @@ mod tests {
             defined("WITH a AS (SELECT 1), `b c` AS (SELECT 2) SELECT * FROM a, `b| c`").as_deref(),
             Some("b c@23"),
             "a quoted CTE name, quotes off"
+        );
+    }
+
+    /// **A CTE declared inside a subquery is found too**, by scope: the
+    /// innermost query that declares the name and holds the reference. Only
+    /// the statement's leading `WITH` was read, so a nested one led nowhere —
+    /// and where it shadowed an outer CTE of the same name, the jump went to
+    /// the outer one.
+    #[test]
+    fn a_cte_declared_inside_a_subquery_is_found_by_scope() {
+        let sql = "SELECT * FROM (WITH inner_c AS (SELECT 1 AS n) SELECT n FROM inner_|c) d";
+        assert_eq!(defined(sql).as_deref(), Some("inner_c@20"));
+        let sql = "WITH c AS (SELECT 1 AS n) \
+                   SELECT * FROM c WHERE n IN (WITH c AS (SELECT 2 AS n) SELECT n FROM |c)";
+        assert_eq!(
+            defined(sql).as_deref(),
+            Some("c@59"),
+            "the inner `c`, which shadows the outer one"
+        );
+        let sql = "WITH c AS (SELECT 1 AS n) \
+                   SELECT * FROM |c WHERE n IN (WITH c AS (SELECT 2 AS n) SELECT n FROM c)";
+        assert_eq!(
+            defined(sql).as_deref(),
+            Some("c@5"),
+            "outside the subquery its `c` is out of scope"
         );
     }
 

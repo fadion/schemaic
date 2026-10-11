@@ -2805,15 +2805,19 @@ existing prose was left alone.
     **`definition_at` is Ctrl+click's jump**, and another reader of that walk: where the statement
     defines the name at the caret, quotes off. It asks `alias_refs::definition` first — the range
     `alias_name_at` reads — so a derived table's alias is found as a table's is, and a subquery's
-    shadowing `o` is the one a click inside it reaches. Where that walk finds no alias it falls back
-    to the statement's CTE names through `cte_name_tokens`, the token walk `cte_names` already is
-    rather than a second scanner, so that half answers on text that does not parse as well. An
-    unquoted name matches ASCII-case-insensitively and a quoted one exactly, and a word after a `.`
-    is never the CTE — `x.n` is a column of `x`, whatever the `WITH` calls `n`. Only the
-    statement's leading `WITH` is read, so a CTE declared inside a subquery is not found. It is
-    `None` on the definition itself, so a click there falls through and still opens what the name
-    names, and on anything the statement does not define
-    (`a_reference_leads_to_where_the_statement_defines_it`,
+    shadowing `o` is the one a click inside it reaches. Where that walk finds no alias, a CTE is
+    looked up **by scope** where the statement parses — `alias_refs::cte_definition`, a visitor
+    recording each query's `WITH` names against that query's span, which answers with the
+    innermost query holding the caret that declares the name — so a CTE a subquery declares is
+    found, and shadows an outer one of the same name inside it while the outer one still answers
+    outside (`a_cte_declared_inside_a_subquery_is_found_by_scope`; only the leading `WITH` was read
+    before, so a nested one led nowhere and a shadowing one led to the outer). Where the statement
+    does not parse it falls back to the leading `WITH`'s names through `cte_name_tokens`, the token
+    walk `cte_names` already is rather than a second scanner. An unquoted name matches
+    ASCII-case-insensitively and a quoted one exactly on both paths, and a word after a `.` is never
+    the CTE — `x.n` is a column of `x`, whatever the `WITH` calls `n`. It is `None` on the
+    definition itself, so a click there falls through and still opens what the name names, and on
+    anything the statement does not define (`a_reference_leads_to_where_the_statement_defines_it`,
     `no_definition_where_the_caret_is_not_on_a_reference`).
     **A `(` is filled from the schema only where the schema names one answer.** `paren_contents`,
     asked right after `insert_columns`, answers three openers through the same `column_list`.
