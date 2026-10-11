@@ -2429,25 +2429,9 @@ struct DiagHit {
 /// Asked on every pointer move, so it reads nothing the size of the document:
 /// the code column from the line count, not from the text.
 fn name_box_at(ed: &Editor, p: Point) -> Option<DiagHit> {
-    let (off, inside) = pointer_offset(ed, p)?;
-    if !inside {
-        return None;
-    }
-    let rope = ed.rope_text();
+    let (lo, hi) = word_under(ed, p)?;
     let cx = content_x(ed);
     let vp = ed.viewport.get_untracked();
-    let line = rope.line_of_offset(off);
-    let start = rope.offset_of_line(line);
-    let text = rope.line_content(line);
-    let b = text.as_bytes();
-    let at = (off - start).min(b.len());
-    let word = |c: &&u8| schemaic_core::sql::is_word_byte(**c);
-    let back = b[..at].iter().rev().take_while(word).count();
-    let ahead = b[at..].iter().take_while(word).count();
-    let (lo, hi) = (off - back, off + ahead);
-    if lo == hi {
-        return None;
-    }
     let points = editor_points(ed);
     let (top, bot) = points(lo)?;
     let (end, _) = points(hi)?;
@@ -2460,6 +2444,29 @@ fn name_box_at(ed: &Editor, p: Point) -> Option<DiagHit> {
         message: String::new(),
         name_at: Some(lo),
     })
+}
+
+/// The word under `p` (in `editor_area` coords) as `[lo, hi)` byte offsets —
+/// `None` off the text, past a line's end, or between words. Word bytes are
+/// `sql::is_word_byte`'s, so a quoted or non-ASCII name is one word. Shared by
+/// the quick-info hover ([`name_box_at`]) and the Ctrl+hover underline, which
+/// must agree about where a name starts and ends.
+fn word_under(ed: &Editor, p: Point) -> Option<(usize, usize)> {
+    let (off, inside) = pointer_offset(ed, p)?;
+    if !inside {
+        return None;
+    }
+    let rope = ed.rope_text();
+    let line = rope.line_of_offset(off);
+    let start = rope.offset_of_line(line);
+    let text = rope.line_content(line);
+    let b = text.as_bytes();
+    let at = (off - start).min(b.len());
+    let word = |c: &&u8| schemaic_core::sql::is_word_byte(**c);
+    let back = b[..at].iter().rev().take_while(word).count();
+    let ahead = b[at..].iter().take_while(word).count();
+    let (lo, hi) = (off - back, off + ahead);
+    (lo != hi).then_some((lo, hi))
 }
 
 /// The document offset under `p` (in `editor_area` coords), and whether `p`
@@ -2507,6 +2514,37 @@ fn named_object_at(
         loaded.iter().map(|(d, s)| (d.as_str(), &**s)).collect();
     schemaic_core::quickinfo::name_at(sql, at, dialect, &refs, active_db).map(|h| h.object)
 }
+
+/// Where a Ctrl+click at `off` goes.
+#[derive(Clone, Debug, PartialEq)]
+enum CtrlTarget {
+    /// A name the statement defines itself — an alias, a derived table, a CTE:
+    /// select its definition, `[from, to)`.
+    Defined(usize, usize),
+    /// A catalogue object: open it.
+    Object(schemaic_core::quickinfo::NamedObject),
+}
+
+/// **Ctrl+click's question, asked in one place**, so the Ctrl+hover underline
+/// promises exactly the words the click will act on. A name the statement
+/// defines itself answers before the catalogue: `name_at` would resolve an
+/// alias to its table and open that, which is not where `o` is.
+fn ctrl_click_target(
+    sql: &str,
+    off: usize,
+    dialect: SqlDialect,
+    db_nodes: RwSignal<Vec<crate::ConnNode>>,
+    active_db: Option<&str>,
+) -> Option<CtrlTarget> {
+    if let Some((a, b)) = intel::definition_at(sql, off, dialect) {
+        return Some(CtrlTarget::Defined(a, b));
+    }
+    named_object_at(sql, off, dialect, db_nodes, active_db).map(CtrlTarget::Object)
+}
+
+/// The Ctrl+hover underline: the word `(lo, hi)` it is under, and where it is
+/// drawn, `(x, y, w)` in `editor_area` coords ([`underline_seg_at`]'s answer).
+type CtrlLink = ((usize, usize), (f64, f64, f64));
 
 /// The hover box `(x, top, w, bottom)` for the diagnostic `[lo, hi]` — the
 /// squiggle's own horizontal extent from [`underline_seg_at`], so the pointer
@@ -3341,6 +3379,11 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             KeyInput::Keyboard(key, _) => types_a_character(key, primary_held(mods), mods.alt()),
             _ => false,
         });
+        // A lone Ctrl is consumed here, so the Ctrl+hover underline hears its
+        // press only through this note (`shortcuts::primary_key_down`).
+        if let KeyInput::Keyboard(key, _) = &kp.key {
+            crate::shortcuts::note_primary_key(key, true);
+        }
         // Any keypress dismisses the unsafe-run notice (and doesn't execute). The
         // Ctrl+Enter branch below may re-raise it if the run is still unsafe.
         if guard.get_untracked().is_some() {
@@ -4486,6 +4529,11 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     // letter's right half.
     let last_pointer: Rc<std::cell::Cell<Option<Point>>> = Rc::new(std::cell::Cell::new(None));
     let ctrl_click_pointer = last_pointer.clone();
+    // The Ctrl+hover underline's own: the pointer while it is over the text and
+    // no overlay — `None` over the find bar, a menu, off the pane — so a Ctrl
+    // pressed there underlines nothing beneath.
+    let link_pointer: Rc<std::cell::Cell<Option<Point>>> = Rc::new(std::cell::Cell::new(None));
+    let link_pointer_move = link_pointer.clone();
     let ed_bar_poke = ed.clone(); // auto-hide: poke the bars on scroll/resize
     let ed_wheel = ed.clone(); // shift+wheel → horizontal scroll
     let ed_find = ed.clone(); // Ctrl+F find: select + centre a match
@@ -5858,30 +5906,15 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                         .get()
                         .and_then(|p| pointer_offset(&ed_menu, p))
                         .is_none_or(|(_, inside)| inside);
-                    // **A name the statement defines itself jumps to where it
-                    // does** — an alias, a derived table, a CTE — before the
-                    // catalogue is asked: `name_at` would resolve an alias to
-                    // its table and open that, which is not where `o` is.
-                    let defined = on_text
-                        .then(|| {
-                            query.with_untracked(|sql| {
-                                intel::definition_at(sql, off, dialect.get_untracked())
-                            })
-                        })
-                        .flatten();
-                    if let Some((a, b)) = defined {
-                        comp.open.set(false);
-                        ed_menu
-                            .cursor
-                            .update(|c| c.set_insert(Selection::region(a, b)));
-                        ed_menu.center_window();
-                        return EventPropagation::Stop;
-                    }
+                    // A name the statement defines itself jumps to where it
+                    // does; anything else opens what the catalogue says it is
+                    // (`ctrl_click_target`, which the Ctrl+hover underline asks
+                    // too).
                     let adb = active_db.get_untracked();
-                    let found = on_text
+                    let target = on_text
                         .then(|| {
                             query.with_untracked(|sql| {
-                                named_object_at(
+                                ctrl_click_target(
                                     sql,
                                     off,
                                     dialect.get_untracked(),
@@ -5891,10 +5924,21 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                             })
                         })
                         .flatten();
-                    if let Some(object) = found {
-                        comp.open.set(false);
-                        open_object(object);
-                        return EventPropagation::Stop;
+                    match target {
+                        Some(CtrlTarget::Defined(a, b)) => {
+                            comp.open.set(false);
+                            ed_menu
+                                .cursor
+                                .update(|c| c.set_insert(Selection::region(a, b)));
+                            ed_menu.center_window();
+                            return EventPropagation::Stop;
+                        }
+                        Some(CtrlTarget::Object(object)) => {
+                            comp.open.set(false);
+                            open_object(object);
+                            return EventPropagation::Stop;
+                        }
+                        None => {}
                     }
                 }
                 if pe.button.is_secondary() {
@@ -7139,6 +7183,51 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             });
         }
     };
+    // **The Ctrl+hover underline**: while the primary modifier is held, the word
+    // under the pointer is underlined if a Ctrl+click on it would go somewhere
+    // (`ctrl_click_target`, the click's own question) — the affordance that
+    // tells a clickable name from one that is not. `(lo, hi)` is the word, kept
+    // so a move within it asks nothing again; `(x, y, w)` is where it is drawn.
+    let ctrl_link: RwSignal<Option<CtrlLink>> = RwSignal::new(None);
+    let update_ctrl_link = move |p: Option<Point>, held: bool| {
+        let next = p
+            .filter(|_| held && !comp.open.get_untracked())
+            .and_then(|p| {
+                ed_qi.with_untracked(|ed| {
+                    let (lo, hi) = word_under(ed, p)?;
+                    let seg = underline_seg_at(
+                        editor_points(ed),
+                        content_x(ed),
+                        lo,
+                        hi,
+                        ed.viewport.get_untracked(),
+                    )?;
+                    // The same word as now, at the same place: already answered.
+                    if ctrl_link.with_untracked(|l| l.as_ref() == Some(&((lo, hi), seg))) {
+                        return Some(((lo, hi), seg));
+                    }
+                    // At the offset the click's caret would land on, not the
+                    // word's start, so the two ask the identical question.
+                    let (off, _) = pointer_offset(ed, p)?;
+                    let adb = active_db.get_untracked();
+                    query
+                        .with_untracked(|sql| {
+                            ctrl_click_target(
+                                sql,
+                                off,
+                                dialect.get_untracked(),
+                                db_nodes,
+                                adb.as_deref(),
+                            )
+                        })
+                        .map(|_| ((lo, hi), seg))
+                })
+            });
+        // Every pointer move lands here — touch the signal only on a change.
+        if ctrl_link.with_untracked(|l| *l != next) {
+            ctrl_link.set(next);
+        }
+    };
     // Anything that moves or rewrites the text under the tip retires it: an
     // edit, a scroll, a new set of diagnostics, the completion list opening —
     // and anything that comes up over the text: the run menu, the Ctrl+K bar,
@@ -7170,6 +7259,11 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         }
         if diag_tip.with_untracked(Option::is_some) {
             diag_tip.set(None);
+        }
+        // The Ctrl+hover underline is placed in the same coordinates, so it is
+        // stale on the same triggers.
+        if ctrl_link.with_untracked(Option::is_some) {
+            ctrl_link.set(None);
         }
     });
     let diag_tip_view = {
@@ -7263,6 +7357,21 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         .style(|s| s.absolute().inset(0.0))
         .pointer_events(|| false)
     };
+    // A straight 1px rule in the accent, at the middle of where a squiggle's
+    // wave would sit — under the glyphs, in the descender gap. Paint-only:
+    // the click is the editor's own.
+    let ctrl_link_view = empty()
+        .style(move |s| match ctrl_link.get() {
+            None => s.hide(),
+            Some((_, (x, y, w))) => s
+                .absolute()
+                .inset_left(x)
+                .inset_top(y + (WAVE_H / 2.0).floor())
+                .width(w)
+                .height(1.0)
+                .background(theme::accent()),
+        })
+        .pointer_events(|| false);
 
     // Run button: a Lucide play overlay pinned to the editor's bottom-right
     // (7px insets). The whole pill is clickable (not just the glyph); hover
@@ -7911,7 +8020,11 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         // rect either way, so the absolute overlays below still share its coords.
         stack((editor_box, inline_band_view))
             .style(|s| s.flex_grow(1.0_f32).width_full().flex_col().min_height(0.0)),
-        syntax_view,
+        // The squiggles and the Ctrl+hover underline share a slot — the tuple
+        // is at floem's limit — both paint-only, click-through as a whole.
+        stack((syntax_view, ctrl_link_view))
+            .style(|s| s.absolute().inset(0.0))
+            .pointer_events(|| false),
         // One slot for the two run outlines: the tuple is at floem's limit.
         stack((highlight_view, run_outline_view))
             .style(|s| s.absolute().inset(0.0))
@@ -7982,6 +8095,19 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 let covered = on_overlay.replace(false);
                 last_pointer.set(Some(pe.pos));
                 hover_diag((!covered).then_some(pe.pos));
+                link_pointer_move.set((!covered).then_some(pe.pos));
+                let held = crate::shortcuts::primary_held(pe.modifiers);
+                // A release the window never heard (it lost focus first) is
+                // corrected by the next move that sees no modifier.
+                if !held {
+                    crate::shortcuts::note_primary_up();
+                }
+                // The click's own modifier rule: Ctrl+Shift or Ctrl+Alt opens
+                // nothing, so it underlines nothing either.
+                update_ctrl_link(
+                    (!covered).then_some(pe.pos),
+                    held && !pe.modifiers.alt() && !pe.modifiers.shift(),
+                );
                 // A box selection being dragged: every line between the anchor
                 // and the pointer, across the same columns. After floem's own
                 // drag handling, which this replaces whole.
@@ -8050,11 +8176,36 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     // A press starts a selection (the editor then owns every move until the
     // release) or a click somewhere else entirely; either way the tip is done.
     .on_event_cont(EventListener::PointerDown, move |_| hover_diag(None))
-    // **And so does a key**, floem's own tooltip rule, for the keys that reach
-    // here — the ones the editor does not consume. The ones it does move the
-    // caret, which the retire effect watches.
+    // **And so does a key**, floem's own tooltip rule — in intent. In practice
+    // almost no key reaches this listener: floem hands a key to the focused view
+    // and then to the root, never to an ancestor between (see the Ctrl+hover
+    // effect below). The keys the editor takes move the caret, and a shortcut's
+    // modal blurs the editor, which the retire effect watches; that is what
+    // actually retires the tip on the keyboard.
     .on_event_cont(EventListener::KeyDown, move |_| hover_diag(None))
-    .on_event_cont(EventListener::PointerLeave, move |_| hover_diag(None));
+    .on_event_cont(EventListener::PointerLeave, move |_| hover_diag(None))
+    // Off the pane, a Ctrl pressed later has no word to underline: forget
+    // where the pointer was (the next move over the pane says it again).
+    .on_event_cont(EventListener::PointerLeave, {
+        let link_pointer = link_pointer.clone();
+        move |_| {
+            link_pointer.set(None);
+            update_ctrl_link(None, false)
+        }
+    });
+    // The Ctrl+hover underline follows the modifier itself as well as the
+    // pointer: pressing Ctrl over a name underlines it without a move, and
+    // letting go takes the line away. Not a key listener on `editor_area`:
+    // floem hands a key to the focused view and then the root, never to the
+    // ancestors between, so a listener here hears nothing —
+    // `shortcuts::primary_key_down` is noted where the key does arrive.
+    create_effect(move |_| {
+        if crate::shortcuts::primary_key_down().get() {
+            update_ctrl_link(link_pointer.get(), true);
+        } else {
+            update_ctrl_link(None, false);
+        }
+    });
     // The pane no longer pads its contents (so the title can sit flush at the
     // pane edge, matching SCHEMA); the editor's inset moves to this wrapper.
     // Padding the wrapper — not `editor_area` itself — keeps editor_area's
@@ -10568,6 +10719,10 @@ mod diagnostics_catalog_gate {
     /// well past its end, and `name_at` accepts a caret just after a word —
     /// so without asking `pointer_offset`'s `inside`, the blank space past
     /// `SELECT * FROM orders` opened `orders`, where the hover showed nothing.
+    ///
+    /// The lookup is `ctrl_click_target`, which the Ctrl+hover underline calls
+    /// too (through `word_under`, which asks `inside` itself); the click's call
+    /// is the first one in the file.
     #[test]
     fn ctrl_click_asks_whether_the_pointer_is_on_the_text() {
         let src =
@@ -10575,7 +10730,7 @@ mod diagnostics_catalog_gate {
                 .expect("this file");
         let body = production_code(&src);
         let call = body
-            .match_indices("named_object_at(")
+            .match_indices("ctrl_click_target(")
             .map(|(i, _)| i)
             .find(|&i| !body[..i].ends_with("fn "))
             .expect("the Ctrl+click branch's lookup");

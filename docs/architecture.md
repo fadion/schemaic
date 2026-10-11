@@ -22186,6 +22186,14 @@ existing prose was left alone.
     `control() || meta()` reads. They answer as `primary_held` does on macOS and a shade wider
     elsewhere, since they also take Super; and `encode_key`'s `!mods.control()` on the Alt branch is
     byte encoding for AltGr rather than an app shortcut, so converting that one would be a bug.
+    **The modifier going down or up on its own is a key, not a state**: `is_primary_key` (Control;
+    Meta only where `PRIMARY_IS_CMD`, through the testable `primary_key_from`) asks about the key,
+    since a lone Ctrl's own key-down does not reliably carry Ctrl in its modifiers yet.
+    `primary_key_down()` is the window-wide answer — an `RwSignal<bool>` in a detached-scope
+    `thread_local`, the `widgets::window_size` shape — written by `note_primary_key` only on a
+    change, because a held key repeats its key-down. It exists for the editor's Ctrl+hover
+    underline (`editor_pane.rs`), and is a signal of its own because floem never hands a key to an
+    ancestor of the focused view (*Floem 0.2 gotchas*). `primary_key_tests` pin both platforms.
   - `connection_form.rs` — Manage Connections modal + password-mask (+ tests). The form is built
     **once per open** while the list on its left keeps loading a different connection into the same
     `DraftSignals` — so every control the form owns a *separate* signal for has to be synced back
@@ -25959,9 +25967,11 @@ existing prose was left alone.
     of `diag_hits` (a scroll, a new set of diagnostics), of the document, of `comp.open`, of
     anything that comes up over the text (`run_menu`, `cmdk.open`, `find_open`, `goto_open`,
     `error_msg`, `guard`), of the caret (`ed.cursor`) and of `editor_focused`. **The caret and the
-    focus are what catch the keyboard, not the `KeyDown` listener**: the editor consumes the keys it
-    handles, so `editor_area` hears only the rest, while a key the editor takes moves the caret and a
-    modal a shortcut opens blurs the editor. The delay also refuses to show while
+    focus are what catch the keyboard, not the `KeyDown` listener**: floem hands a key to the
+    focused view and then to the window root, never to an ancestor between (*Floem 0.2 gotchas*),
+    so `editor_area` hears effectively no key at all — the listener's own comment, that it sees
+    "the ones the editor does not consume", is wrong, and the listener is close to dead — while a
+    key the editor takes moves the caret and a modal a shortcut opens blurs the editor. The delay also refuses to show while
     `widgets::innermost_focus_root()` is `Some`, for a keyboard route to a modal or menu that never
     reached this pane to retire it. `diag_tip_view` is paint-only, styled with
     `widgets::tooltip_style` and placed by `diag_tip_place`, below the line in the pane's upper half
@@ -26005,8 +26015,8 @@ existing prose was left alone.
     overlay gate, what retires it, its placement. The `Copy` hover closure reaches the `Editor`
     through a `RwSignal` (`ed_qi`). **Ctrl+click** is the editor's outer `PointerDown`, which runs
     after floem's own click has put the caret under the pointer: the primary button with the
-    primary modifier and neither Alt nor Shift asks `named_object_at` at the caret and hands the
-    hit to `QueryPaneParams::open_object`, built once in `lib.rs` by `open_named_object` — a table
+    primary modifier and neither Alt nor Shift asks `ctrl_click_target` at the caret and hands a
+    `CtrlTarget::Object` to `QueryPaneParams::open_object`, built once in `lib.rs` by `open_named_object` — a table
     or view through `open_table`, a column through `open_table_col` (which scrolls to it), a routine
     through `object_editor::open_for_object` with the loaded `RoutineInfo`, the doors the schema
     tree and Find Anywhere use. Alt+click is left to floem and still adds a caret; a Ctrl+click on
@@ -26017,11 +26027,40 @@ existing prose was left alone.
     not take) and opens nothing outside the text, as the hover shows nothing there
     (`ctrl_click_asks_whether_the_pointer_is_on_the_text`).
     **A name the statement defines itself jumps instead of opening** — an alias, a derived table, a
-    CTE. The branch asks `intel::definition_at` at the caret *before* `named_object_at`, and the
-    order is load-bearing: `quickinfo::name_at` resolves an alias to its table, so asked first it
-    opens `orders` for a click on `o`, which is not where `o` is. A hit closes completion, selects
-    the definition (`Selection::region`) and `center_window()`s; on the definition itself
+    CTE. `ctrl_click_target` asks `intel::definition_at` *before* `named_object_at`, answering
+    `CtrlTarget::Defined` or `CtrlTarget::Object`, and the order is load-bearing:
+    `quickinfo::name_at` resolves an alias to its table, so asked first it opens `orders` for a
+    click on `o`, which is not where `o` is. A `Defined` hit closes completion, selects the
+    definition (`Selection::region`) and `center_window()`s; on the definition itself
     `definition_at` answers `None`, so a click there still opens what the name names.
+    **Holding the primary modifier underlines what a Ctrl+click would act on**, because without it
+    which words were clickable was, in the user's words, a guessing game. That is why the
+    resolution is one function rather than the click's branch: `ctrl_click_target` was lifted out
+    of `PointerDown` so the click and the underline ask the identical question, and a word is
+    underlined exactly when the click would go somewhere — a column, an alias, a table, but not a
+    keyword or a database qualifier, which the click does nothing on either. The pane's
+    `update_ctrl_link(p, held)` asks it while the modifier is held — on a move, under the click's
+    own rule of neither Alt nor Shift with it — and the completion list is closed, at **the
+    pointer's own offset** (`pointer_offset`, the offset floem's click puts the
+    caret on), not the word's start, so the two cannot disagree at a word's edge. The word's bounds
+    are `word_under`, split out of `name_box_at` (which now calls it) so the quick-info box and the
+    line agree on where a name starts and ends. `ctrl_link` holds the word and its
+    `underline_seg_at` segment; a move within the same word at the same place re-asks nothing, and
+    the signal is written only on a change, since every pointer move lands here. `ctrl_link_view`
+    draws it as a 1px `theme::accent()` rule at `y + floor(WAVE_H / 2)` — where a squiggle's wave
+    sits — paint-only, in `syntax_view`'s slot (*Floem 0.2 gotchas*: the stack is at its 16). The
+    tip-retire effect clears it on the same triggers, as it is placed in the same coordinates, and
+    `PointerLeave` clears it along with `link_pointer` — the underline's own record of the pointer,
+    `None` while an overlay (find bar, menu) covers the text, so a Ctrl pressed there underlines
+    nothing beneath. **Pressing or releasing the modifier with
+    the pointer still has to move the line too, and no listener on `editor_area` can hear that**:
+    floem gives a key to the focused view and then the root, never the ancestors between, and the
+    editor consumes a lone Ctrl. So `shortcuts::primary_key_down` is noted where the key does
+    arrive — the editor's own key handler, the root's `KeyDown` (focus elsewhere) and a root
+    `KeyUp` (the editor takes no key-ups) — and an effect in each pane re-asks at `link_pointer`
+    when it goes true and clears the line when it goes false. A release while the window is
+    unfocused never arrives, so a pointer move that sees no modifier writes it back to `false`
+    (`shortcuts::note_primary_up`) — otherwise the next press would change nothing and draw nothing.
     **Alt+Shift+drag is a box selection** (`text_ops::box_regions`). `name_box_at`'s way back from
     a pointer to the document is factored out as `pointer_offset` — the offset under the pointer and
     whether it is inside the text, `None` over the gutter — which the drag shares. The same outer
@@ -35697,7 +35736,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   wraps the editor *itself* rather than floating above it: the question is never how big the wrapper
   is, but whether it sits over other interactive views. `stack((signature_popup(..), diag_tip_view))`
   is an arity wrapper that *does* float over the editor at full pane size, and it is safe only
-  because it is `pointer_events(false)` with nothing to hover beneath it.
+  because it is `pointer_events(false)` with nothing to hover beneath it — as is
+  `stack((syntax_view, ctrl_link_view))`, the squiggles and the Ctrl+hover underline, on the same
+  terms.
 - **A programmatic `cursor` change shows a phantom caret on an *unfocused* editor.** `edit_field`'s
   signal→doc reconcile sets `cursor` to preserve caret position, but floem's internal "reset cursor
   blinking" effect tracks `ed.cursor` → `cursor_info.reset()` → shows + blinks the caret even with no
@@ -35835,6 +35876,17 @@ Re-introducing the anti-patterns these guard against is a regression:
 - **A key event goes to the focused view and, if consumed, to *nobody* else.** The dispatch is
   `directed` — no bubbling to ancestors, and with focus on nothing only the root view's own
   listeners run.
+  **So a `KeyDown`/`KeyUp` listener on a container around the focused view hears nothing** — not
+  even the keys the focused view leaves alone, which go past it to the root (`window_handle.rs`
+  `event()`: `unconditional_view_event` on the focus, then `main_view.apply_event`). The SQL
+  editor's Ctrl+hover underline needed a lone Ctrl's press and release, and `editor_area` is
+  exactly such a container: the editor `on_event_stop`s every `KeyDown`, a lone Ctrl included, and
+  takes no `KeyUp`, which therefore reaches the root alone. A view that has to follow a key it is
+  not focused for reads a window-wide signal noted where the key does arrive —
+  `shortcuts::primary_key_down`, written from the editor's key handler and the root's `KeyDown`
+  and `KeyUp` (see `editor_pane.rs` under *Crates*). `editor_area`'s own `KeyDown` listener, which
+  retires the diagnostic tip, is the instance that was already in the tree under a comment
+  claiming otherwise.
   **"The root view" means the view the app's view function *returned*, and nothing inside it.**
   That distinction is the whole of a bug this survived a release with. `WindowHandle` keeps
   `main_view` = `view_fn(window_id).id()`, and the unconsumed-key fallback is

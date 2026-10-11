@@ -301,6 +301,105 @@ fn primary_from(control: bool, meta: bool, primary_is_cmd: bool) -> bool {
     control || (primary_is_cmd && meta)
 }
 
+/// Is `key` itself the platform's primary modifier — the key [`primary_held`]
+/// answers for, pressed or released on its own?
+///
+/// A lone Ctrl's own key-down does not reliably carry Ctrl in its modifiers
+/// yet, so a view that reacts to the modifier going down or up (the editor's
+/// Ctrl+hover underline) asks about the key, not the state.
+pub(crate) fn is_primary_key(key: &floem::keyboard::Key) -> bool {
+    primary_key_from(key, PRIMARY_IS_CMD)
+}
+
+fn primary_key_from(key: &floem::keyboard::Key, primary_is_cmd: bool) -> bool {
+    use floem::keyboard::{Key, NamedKey};
+    match key {
+        Key::Named(NamedKey::Control) => true,
+        Key::Named(NamedKey::Meta) => primary_is_cmd,
+        _ => false,
+    }
+}
+
+thread_local! {
+    static PRIMARY_DOWN: std::cell::RefCell<
+        Option<(floem::reactive::RwSignal<bool>, floem::reactive::Scope)>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+/// Whether the primary modifier is down, as its own key events last said —
+/// window-wide, in a detached scope like `widgets::window_size`.
+///
+/// **Its own signal because floem delivers a key only to the focused view and
+/// then to the root view's listeners**, never to the ancestors between: a
+/// lone Ctrl pressed over the SQL editor reaches the editor's key handler (which
+/// consumes it), and its release, which nothing focused answers, reaches only
+/// the root. The editor's Ctrl+hover underline has to hear both, so the three
+/// places a key arrives — the editor's key handler, the root's `KeyDown` and its
+/// `KeyUp` — note it here ([`note_primary_key`]) and each pane reads it. A
+/// release while the window is not focused never arrives; a pointer move that
+/// sees no modifier corrects it ([`note_primary_up`]).
+pub(crate) fn primary_key_down() -> floem::reactive::RwSignal<bool> {
+    PRIMARY_DOWN.with(|cell| {
+        if cell.borrow().is_none() {
+            let scope = floem::reactive::Scope::new();
+            let sig = scope.create_rw_signal(false);
+            *cell.borrow_mut() = Some((sig, scope));
+        }
+        cell.borrow().as_ref().unwrap().0
+    })
+}
+
+/// Record a key event in [`primary_key_down`] if `key` is the primary
+/// modifier. A held key repeats its key-down, so only a change is written.
+pub(crate) fn note_primary_key(key: &floem::keyboard::Key, down: bool) {
+    use floem::reactive::{SignalGet, SignalUpdate};
+    if is_primary_key(key) {
+        let sig = primary_key_down();
+        if sig.get_untracked() != down {
+            sig.set(down);
+        }
+    }
+}
+
+/// Record that the primary modifier is up, from a pointer event whose
+/// modifiers say so — the repair for a key-up that went to another window.
+pub(crate) fn note_primary_up() {
+    use floem::reactive::{SignalGet, SignalUpdate};
+    let sig = primary_key_down();
+    if sig.get_untracked() {
+        sig.set(false);
+    }
+}
+
+#[cfg(test)]
+mod primary_key_tests {
+    use super::primary_key_from;
+    use floem::keyboard::{Key, NamedKey};
+
+    #[test]
+    fn control_is_the_primary_key_everywhere() {
+        assert!(primary_key_from(&Key::Named(NamedKey::Control), false));
+        assert!(primary_key_from(&Key::Named(NamedKey::Control), true));
+    }
+
+    #[test]
+    fn meta_is_the_primary_key_only_where_cmd_is() {
+        assert!(primary_key_from(&Key::Named(NamedKey::Meta), true));
+        assert!(!primary_key_from(&Key::Named(NamedKey::Meta), false));
+    }
+
+    #[test]
+    fn no_other_key_is_the_primary_key() {
+        for k in [
+            Key::Named(NamedKey::Shift),
+            Key::Named(NamedKey::Alt),
+            Key::Character("c".into()),
+        ] {
+            assert!(!primary_key_from(&k, true), "{k:?}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
