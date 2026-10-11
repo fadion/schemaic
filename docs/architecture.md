@@ -2773,7 +2773,8 @@ existing prose was left alone.
     A quoted name's range is the name inside its quotes, which stay. It is `None` where the text at the
     caret does not parse to exactly one statement, or the caret is on no alias — a qualifier that is
     a table's own name or a CTE's binds to no definition, and a select-list `AS` is not one, so none
-    of those is offered (`an_alias_is_found_with_every_reference_to_it`,
+    of those is offered here — a CTE's name is *Rename CTE*'s, below
+    (`an_alias_is_found_with_every_reference_to_it`,
     `an_alias_is_bound_by_its_own_query`, `an_alias_is_found_in_a_star_an_update_and_quotes`,
     `no_alias_where_the_caret_is_not_on_one`). **`alias_rename_conflicts` is the capture check**
     the same walk answers for a proposed name (R3-L5-03): `true` where the definition's own query
@@ -2806,9 +2807,9 @@ existing prose was left alone.
     defines the name at the caret, quotes off. It asks `alias_refs::definition` first — the range
     `alias_name_at` reads — so a derived table's alias is found as a table's is, and a subquery's
     shadowing `o` is the one a click inside it reaches. Where that walk finds no alias, a CTE is
-    looked up **by scope** where the statement parses — `alias_refs::cte_definition`, a visitor
-    recording each query's `WITH` names against that query's span, which answers with the
-    innermost query holding the caret that declares the name — so a CTE a subquery declares is
+    looked up **by scope** where the statement parses — `alias_refs::cte_definition`, which is
+    *Rename CTE*'s `Ctes::bound` (below) at the caret: the innermost query holding it that declares
+    the name, where the CTE is visible — so a CTE a subquery declares is
     found, and shadows an outer one of the same name inside it while the outer one still answers
     outside (`a_cte_declared_inside_a_subquery_is_found_by_scope`; only the leading `WITH` was read
     before, so a nested one led nowhere and a shadowing one led to the outer). Where the statement
@@ -2819,6 +2820,39 @@ existing prose was left alone.
     definition itself, so a click there falls through and still opens what the name names, and on
     anything the statement does not define (`a_reference_leads_to_where_the_statement_defines_it`,
     `no_definition_where_the_caret_is_not_on_a_reference`).
+    **`cte_rename` is *Rename CTE*'s decision**, shaped as `alias_rename`'s and sharing its refusals
+    and its edit — `rename_edit`, factored out of `alias_rename`, writes the one spelling over every
+    range and leaves the one caret — with `cte_name_at` as the menu's offer predicate and the
+    dialog's starting name, quotes off. Both read `alias_refs::cte_spans`, over a visitor of its
+    own, `Ctes`: each `WITH`'s `CteDecl`s — the name as written and whether it is quoted, its range, its body, its index, and
+    a scope that is the declaring query's span widened to hold the `WITH` — and every
+    `TableFactor::Table` reference, with whether its name is one part, since `s.c` is never the CTE
+    `c`. `Ctes::bound` binds a reference to the innermost declaring query that holds it where the
+    CTE is visible — inside a sibling's body only when declared before that sibling, in its own body
+    only when the `WITH` is recursive — and `None` is a real table, so the outer `c` a subquery's
+    `WITH c` does not reach is left alone, and a subquery's shadowing `c` is renamed without the
+    outer one (`a_cte_rename_follows_scope`). A qualifier `c.n` comes off the alias walk's `uses`,
+    and is the CTE's only where no alias of that name is in reach (`Walk::binding`) and the nearest
+    query exposing an unaliased table of that name exposes a one-part reference bound to it. It is
+    `None` — not offered — on anything not bound to a CTE, where the CTE's own `WITH` declares the
+    name twice, and where a bare identifier of its name stands in its scope: a column or
+    PostgreSQL's whole row, which, as with an alias, no walk tells apart. **The capture check is a
+    re-binding, not a list of cases**: `cte_rename` writes the renamed statement, parses it, runs
+    `cte_spans` again at the moved declaration, and stands only if exactly the moved ranges come
+    back. A name that is a table the statement reads, a sibling CTE, an alias a qualifier would bind
+    to instead, or a duplicate in the one `WITH` changes that answer, and each is `Conflict` with no
+    rule of its own (`a_cte_rename_writes_its_declaration_and_every_reference`,
+    `a_cte_rename_refuses_a_capturing_name` — neither could fail first, the functions not existing).
+    The refusals' `message`s are worded for either rename: `NoAlias` says *There is nothing here to
+    rename any more.*, `Empty` *Give it a name.* **Ctrl+click binds through the same `Ctes`**:
+    `cte_definition` is `Ctes::bound` at the caret, so the jump and the rename cannot disagree
+    about what a name names. Names compare by `same_name` — a quoted one on either side exactly, a
+    bare pair ASCII-case-insensitively — so on PostgreSQL, where `WITH "C"` and `FROM c` name two
+    things, the rename takes only the first; it once lowercased every name in a second visitor,
+    found while documenting it (`a_quoted_cte_name_binds_only_its_own_spelling`, red until the
+    two were one). Where the statement parses, the tree's answer is final — `definition_at` no
+    longer falls through to the leading-`WITH` token walk, which had reached a later sibling from an
+    earlier one's body.
     **A `(` is filled from the schema only where the schema names one answer.** `paren_contents`,
     asked right after `insert_columns`, answers three openers through the same `column_list`.
     `REFERENCES t (` gets `t`'s primary key from `Catalog::key_columns_of` — its columns in the
@@ -22203,9 +22237,11 @@ existing prose was left alone.
     the predicate doesn't know about resolves its `inset(0)` against a zero-by-zero box and paints
     nothing, which is exactly how the event editor once shipped invisible. It shares its tuple
     element with *Rename alias* (`alias_rename.rs`, next).
-  - `alias_rename.rs` — the SQL editor's *Rename alias* dialog (`alias_rename_overlay`, raised by
-    `OverlayUi::alias_rename`): a title, one *New name* field opened on the alias as its definition
-    writes it, Cancel and Rename. **It exists because a name has to be finished before it can be
+  - `alias_rename.rs` — the SQL editor's *Rename alias* and *Rename CTE* dialog
+    (`alias_rename_overlay`, raised by `OverlayUi::alias_rename`): a title, one *New name* field
+    opened on the name as its definition writes it, Cancel and Rename. The two share it whole;
+    `AliasRenameRequest::title` and `placeholder` are all that differ — *Rename alias*/*Alias*,
+    *Rename CTE*/*CTE name* — and the second's decision is `intel::cte_rename`'s. **It exists because a name has to be finished before it can be
     checked.** The entry used to hand over a multi-caret selection and let typing do the rename, so
     nothing ever compared the name with those the query already binds, and renaming the outer `o` to
     an inner query's `i` rebound a correlated `o.id` — in a `DELETE … WHERE EXISTS`, every row or
@@ -25509,7 +25545,10 @@ existing prose was left alone.
     dialog (an agent's, say) it may sit on another alias than the one the field names, and the
     rename would go through under the wrong name. **`ReadOnly`**: where `edit_untyped_multi` refuses
     (the Ctrl+K freeze) the refusal is returned rather than dropped — dropped, the dialog would close
-    as if it had renamed. The multi-region editing the old entry leaned
+    as if it had renamed. ***Rename CTE*** comes right after it, offered where
+    `intel::cte_name_at` answers, and is the same entry over `intel::cte_rename` (under `intel.rs`):
+    the same dialog titled for it, the same `Changed` and `ReadOnly` answers, the same `back`, and
+    the same one undo step through `edit_untyped_multi`. The multi-region editing the old entry leaned
     on stays: Backspace and an auto-paired `(` used to collapse the
     regions to the primary one; they now act at every caret (`text_ops.rs`, *Several carets*), as
     do Tab, Shift+Tab, Ctrl+/, Ctrl+D, Alt+↑/↓, Ctrl+Shift+U, Ctrl+Shift+J and Ctrl+Shift+/.

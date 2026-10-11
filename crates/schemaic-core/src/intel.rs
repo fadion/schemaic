@@ -12730,10 +12730,9 @@ pub fn definition_at(sql: &str, caret: usize, dialect: SqlDialect) -> Option<(us
     // A CTE by scope where the statement parses, so one a subquery declares
     // is found and shadows an outer one; the leading `WITH`'s token walk
     // below where it does not.
-    if let Some(ast) = ast
-        && let Some(def) = alias_refs::cte_definition(stmt, lo, ast, name, toks[at].quoted, caret)
-    {
-        return (!on(def)).then_some(def);
+    if let Some(ast) = ast {
+        return alias_refs::cte_definition(stmt, lo, ast, name, toks[at].quoted, caret)
+            .filter(|&def| !on(def));
     }
     let def = cte_name_tokens(&toks).into_iter().find(|d| match &d.kind {
         TkKind::Word(w) if d.quoted || toks[at].quoted => w == name,
@@ -12781,7 +12780,21 @@ pub fn alias_rename(
     if alias_refs::rename_conflicts(stmt, lo, ast, caret, name) != Some(false) {
         return Err(AliasRenameRefusal::Conflict);
     }
-    let text = crate::export::ident_if_needed(name, dialect);
+    Ok(rename_edit(
+        spans,
+        caret,
+        crate::export::ident_if_needed(name, dialect),
+    ))
+}
+
+/// One rename as a [`crate::text_ops::MultiEdit`]: `text` over every range in
+/// `spans` (in order, disjoint), and one caret at the end of the occurrence
+/// `caret` was on — or where `caret` lands once the edits before it moved it.
+fn rename_edit(
+    spans: Vec<(usize, usize)>,
+    caret: usize,
+    text: String,
+) -> crate::text_ops::MultiEdit {
     // The caret, moved by what the edits before it add or remove.
     let mut at = caret as isize;
     let mut shift = 0isize;
@@ -12797,13 +12810,13 @@ pub fn alias_rename(
         }
     }
     let at = at.max(0) as usize;
-    Ok(crate::text_ops::MultiEdit {
+    crate::text_ops::MultiEdit {
         edits: spans
             .into_iter()
             .map(|(a, b)| (a, b, text.clone()))
             .collect(),
         sels: vec![(at, at)],
-    })
+    }
 }
 
 impl AliasRenameRefusal {
@@ -12811,8 +12824,9 @@ impl AliasRenameRefusal {
     /// `new_name`.
     pub fn message(self, new_name: &str) -> String {
         match self {
-            Self::NoAlias => "There is no alias here to rename any more.".to_string(),
-            Self::Empty => "Give the alias a name.".to_string(),
+            // Said of either: *Rename CTE* shares the refusals.
+            Self::NoAlias => "There is nothing here to rename any more.".to_string(),
+            Self::Empty => "Give it a name.".to_string(),
             Self::Conflict => format!(
                 "“{}” is already a name in this query: renaming to it would change \
                  which table a reference reads.",
@@ -12827,6 +12841,81 @@ impl AliasRenameRefusal {
             }
         }
     }
+}
+
+/// The name *Rename CTE*'s dialog opens with: the CTE at `caret` — its
+/// declaration, or a reference bound to it — as its declaration writes it,
+/// quotes off. `None` where [`cte_rename`] has nothing to rename.
+pub fn cte_name_at(sql: &str, caret: usize, dialect: SqlDialect) -> Option<String> {
+    let (lo, hi) = crate::sql::statement_range(sql, caret, dialect);
+    let stmt = sql.get(lo..hi)?;
+    let asts = parse_statements(stmt, dialect).ok()?;
+    let [ast] = asts.as_slice() else {
+        return None;
+    };
+    let (def, _) = alias_refs::cte_spans(stmt, lo, ast, caret)?;
+    let (a, b) = alias_refs::unquoted(stmt, lo, def);
+    sql.get(a..b).map(str::to_string)
+}
+
+/// *Rename CTE*: the edits that rename the CTE at `caret` to `new_name` —
+/// its declaration in whichever `WITH` declares it, a subquery's included,
+/// and every reference **bound to it by scope** (a `FROM` naming it, a later
+/// sibling's body, its own body when recursive, a qualifier through it) —
+/// shaped as [`alias_rename`]'s are, or why not.
+///
+/// **The capture check is a re-binding**, not a list of cases: the renamed
+/// statement is parsed and bound again, and the edit stands only if exactly
+/// the references that were the CTE's are the renamed CTE's — so a name
+/// that is a real table the statement reads, a sibling CTE, or an alias a
+/// qualifier would bind to instead is refused, and so is a duplicate in one
+/// `WITH`. A CTE a bare identifier of the same name may be (a column, or
+/// PostgreSQL's whole row) is not offered at all, as with an alias.
+pub fn cte_rename(
+    sql: &str,
+    caret: usize,
+    new_name: &str,
+    dialect: SqlDialect,
+) -> Result<crate::text_ops::MultiEdit, AliasRenameRefusal> {
+    let (lo, hi) = crate::sql::statement_range(sql, caret, dialect);
+    let stmt = sql.get(lo..hi).ok_or(AliasRenameRefusal::NoAlias)?;
+    let asts = parse_statements(stmt, dialect).map_err(|_| AliasRenameRefusal::NoAlias)?;
+    let [ast] = asts.as_slice() else {
+        return Err(AliasRenameRefusal::NoAlias);
+    };
+    let (def, spans) =
+        alias_refs::cte_spans(stmt, lo, ast, caret).ok_or(AliasRenameRefusal::NoAlias)?;
+    let name = new_name.trim();
+    if name.is_empty() {
+        return Err(AliasRenameRefusal::Empty);
+    }
+    let text = crate::export::ident_if_needed(name, dialect);
+    // The statement as the rename leaves it, and where each renamed range
+    // lands in it.
+    let mut after = String::with_capacity(stmt.len());
+    let mut moved = Vec::with_capacity(spans.len());
+    let mut from = lo;
+    for &(a, b) in &spans {
+        after.push_str(&sql[from..a]);
+        let at = lo + after.len();
+        after.push_str(&text);
+        moved.push((at, at + text.len()));
+        from = b;
+    }
+    after.push_str(&sql[from..hi]);
+    let rebound = parse_statements(&after, dialect)
+        .ok()
+        .and_then(|asts| match asts.as_slice() {
+            [ast] => {
+                let caret_after = moved[spans.iter().position(|s| *s == def)?].0;
+                alias_refs::cte_spans(&after, lo, ast, caret_after)
+            }
+            _ => None,
+        });
+    if !rebound.is_some_and(|(_, now)| now == moved) {
+        return Err(AliasRenameRefusal::Conflict);
+    }
+    Ok(rename_edit(spans, caret, text))
 }
 
 /// [`alias_occurrences`]' walk: alias definitions and qualifier uses, each
@@ -13115,10 +13204,12 @@ mod alias_refs {
     }
 
     /// [`super::definition_at`]'s CTE half over the tree: the CTE called
-    /// `name` declared by the **innermost** query that holds `caret` — so one
-    /// declared inside a subquery is found, and shadows an outer one of the
-    /// same name there. Its name's range, quotes off. A quoted name on either
-    /// side matches exactly, a bare pair as the server folds it.
+    /// `name` that a reference at `caret` binds to ([`Ctes::bound`]) — the
+    /// innermost declaring query, so one declared inside a subquery is found
+    /// and shadows an outer one there, and a later sibling is out of an
+    /// earlier one's reach. The same walk *Rename CTE* binds by, so the jump
+    /// and the rename cannot disagree about what a name names. Its name's
+    /// range, quotes off.
     pub(super) fn cte_definition(
         stmt: &str,
         lo: usize,
@@ -13127,45 +13218,222 @@ mod alias_refs {
         quoted: bool,
         caret: usize,
     ) -> Option<(usize, usize)> {
-        /// Each declared CTE: the query it is scoped to, its name's range,
-        /// and the name as an `Ident`.
-        struct Ctes<'a> {
-            stmt: &'a str,
-            lo: usize,
-            found: Vec<(Span, Span, Ident)>,
+        let c = Ctes::of(stmt, lo, ast);
+        let d = c.bound(name, quoted, (caret, caret))?;
+        Some(unquoted(stmt, lo, c.decls[d].at))
+    }
+
+    /// Do two names name the same thing? A quoted one on either side is that
+    /// spelling exactly; a bare pair compares as the server folds it.
+    fn same_name(a: &str, a_quoted: bool, b: &str, b_quoted: bool) -> bool {
+        if a_quoted || b_quoted {
+            a == b
+        } else {
+            a.eq_ignore_ascii_case(b)
         }
-        impl Visitor for Ctes<'_> {
-            type Break = ();
-            fn pre_visit_query(&mut self, q: &Query) -> ControlFlow<()> {
-                if let Some(with) = &q.with {
-                    let scope = to_range(self.stmt, self.lo, q.span());
-                    for cte in &with.cte_tables {
-                        let at = to_range(self.stmt, self.lo, cte.alias.name.span);
-                        self.found.push((scope, at, cte.alias.name.clone()));
-                    }
+    }
+
+    /// One CTE a `WITH` declares.
+    struct CteDecl {
+        /// As written, quotes off — compared by [`same_name`].
+        name: String,
+        quoted: bool,
+        /// The name's whole spelling.
+        at: Span,
+        /// The query whose `WITH` declares it — what it is visible in.
+        scope: Span,
+        /// Its own body, where only earlier siblings (and itself, when
+        /// recursive) are visible.
+        body: Span,
+        index: usize,
+        recursive: bool,
+    }
+
+    /// A table reference's last name part.
+    struct CteRef {
+        name: String,
+        quoted: bool,
+        at: Span,
+        /// One part — `s.c` is never the CTE `c`.
+        single: bool,
+    }
+
+    /// Every CTE declaration, and every table reference.
+    struct Ctes<'a> {
+        stmt: &'a str,
+        lo: usize,
+        decls: Vec<CteDecl>,
+        refs: Vec<CteRef>,
+    }
+
+    impl Visitor for Ctes<'_> {
+        type Break = ();
+
+        fn pre_visit_query(&mut self, q: &Query) -> ControlFlow<()> {
+            if let Some(with) = &q.with {
+                let mut scope = to_range(self.stmt, self.lo, q.span());
+                let first = self.decls.len();
+                for (index, cte) in with.cte_tables.iter().enumerate() {
+                    let at = to_range(self.stmt, self.lo, cte.alias.name.span);
+                    let body = to_range(self.stmt, self.lo, cte.query.span());
+                    // The scope holds the `WITH` itself, whether or not the
+                    // query's span does.
+                    scope = (scope.0.min(at.0), scope.1.max(body.1));
+                    self.decls.push(CteDecl {
+                        name: cte.alias.name.value.clone(),
+                        quoted: cte.alias.name.quote_style.is_some(),
+                        at,
+                        scope,
+                        body,
+                        index,
+                        recursive: with.recursive,
+                    });
                 }
-                ControlFlow::Continue(())
+                for d in &mut self.decls[first..] {
+                    d.scope = scope;
+                }
             }
+            ControlFlow::Continue(())
         }
-        let mut v = Ctes {
+
+        fn pre_visit_table_factor(&mut self, t: &TableFactor) -> ControlFlow<()> {
+            if let TableFactor::Table { name, .. } = t
+                && let Some(id) = name.0.last().and_then(|p| p.as_ident())
+            {
+                self.refs.push(CteRef {
+                    name: id.value.clone(),
+                    quoted: id.quote_style.is_some(),
+                    at: to_range(self.stmt, self.lo, id.span),
+                    single: name.0.len() == 1,
+                });
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    impl<'a> Ctes<'a> {
+        fn of(stmt: &'a str, lo: usize, ast: &Statement) -> Ctes<'a> {
+            let mut c = Ctes {
+                stmt,
+                lo,
+                decls: Vec::new(),
+                refs: Vec::new(),
+            };
+            let _ = ast.visit(&mut c);
+            c
+        }
+
+        /// The declaration a reference to `name` at `at` binds to: the
+        /// innermost query that declares it and holds `at`, where it is
+        /// visible — inside a sibling's body only when declared before it, or
+        /// it is that body's own and recursive. `None`: a real table.
+        fn bound(&self, name: &str, quoted: bool, at: Span) -> Option<usize> {
+            let mut cands: Vec<usize> = (0..self.decls.len())
+                .filter(|&i| {
+                    let d = &self.decls[i];
+                    same_name(&d.name, d.quoted, name, quoted)
+                        && d.scope.0 <= at.0
+                        && at.1 <= d.scope.1
+                })
+                .collect();
+            cands.sort_by_key(|&i| self.decls[i].scope.1 - self.decls[i].scope.0);
+            cands.into_iter().find(|&i| {
+                let d = &self.decls[i];
+                match self
+                    .decls
+                    .iter()
+                    .find(|k| k.scope == d.scope && k.body.0 <= at.0 && at.1 <= k.body.1)
+                {
+                    Some(k) => d.index < k.index || (d.index == k.index && d.recursive),
+                    None => true,
+                }
+            })
+        }
+    }
+
+    /// [`super::cte_rename`]'s walk: the CTE at `caret` — its declaration, or
+    /// a reference bound to it — and every place it is written, its
+    /// declaration first in the list's order, each a whole spelling. `None`
+    /// on anything else, on a CTE its own `WITH` declares twice, and where a
+    /// bare identifier of its name stands in its scope (a column, or
+    /// PostgreSQL's whole row — no walk tells them apart).
+    pub(super) fn cte_spans(
+        stmt: &str,
+        lo: usize,
+        ast: &Statement,
+        caret: usize,
+    ) -> Option<(Span, Vec<Span>)> {
+        let c = Ctes::of(stmt, lo, ast);
+        let mut w = Walk {
             stmt,
             lo,
-            found: Vec::new(),
+            scopes: vec![(lo, lo + stmt.len())],
+            defs: Vec::new(),
+            uses: Vec::new(),
+            tables: Vec::new(),
+            bare: Vec::new(),
         };
-        let _ = ast.visit(&mut v);
-        v.found
-            .into_iter()
-            .filter(|(scope, _, id)| {
-                scope.0 <= caret
-                    && caret <= scope.1
-                    && if quoted || id.quote_style.is_some() {
-                        id.value == name
-                    } else {
-                        id.value.eq_ignore_ascii_case(name)
-                    }
-            })
-            .min_by_key(|(scope, ..)| scope.1 - scope.0)
-            .map(|(_, at, _)| unquoted(stmt, lo, at))
+        let _ = ast.visit(&mut w);
+        let on = |r: &Span| r.0 <= caret && caret <= r.1;
+        // A qualifier's CTE: no alias of its name in reach, and the nearest
+        // query exposing a table by that name exposes a reference bound here.
+        let qualifier_of = |name: &str, at: Span| -> Option<usize> {
+            if w.binding(name, at).is_some() {
+                return None;
+            }
+            let table = w.chain(at).into_iter().find_map(|scope| {
+                w.tables
+                    .iter()
+                    .find(|(n, r)| n == name && w.scope_of(*r) == Some(scope))
+                    .map(|(_, r)| *r)
+            })?;
+            bound_ref(&c, c.refs.iter().find(|r| r.at == table)?)
+        };
+        fn bound_ref(c: &Ctes, r: &CteRef) -> Option<usize> {
+            r.single.then(|| c.bound(&r.name, r.quoted, r.at)).flatten()
+        }
+        let ref_of = |r: &CteRef| bound_ref(&c, r);
+        let decl = c
+            .decls
+            .iter()
+            .position(|d| on(&d.at))
+            .or_else(|| c.refs.iter().find(|r| on(&r.at)).and_then(ref_of))
+            .or_else(|| {
+                w.uses
+                    .iter()
+                    .find(|(_, r)| on(r))
+                    .and_then(|(n, r)| qualifier_of(n, *r))
+            })?;
+        let d = &c.decls[decl];
+        // The bare check compares folded, as `Walk` keeps every name: a bare
+        // `C` beside a quoted `"c"` refuses where it need not, never the other
+        // way.
+        let folded = d.name.to_ascii_lowercase();
+        if c.decls.iter().any(|k| {
+            k.scope == d.scope && same_name(&k.name, k.quoted, &d.name, d.quoted) && k.at != d.at
+        }) || w
+            .bare
+            .iter()
+            .any(|(n, r)| *n == folded && d.scope.0 <= r.0 && r.1 <= d.scope.1)
+        {
+            return None;
+        }
+        let mut all = vec![d.at];
+        all.extend(
+            c.refs
+                .iter()
+                .filter(|r| ref_of(r) == Some(decl))
+                .map(|r| r.at),
+        );
+        all.extend(
+            w.uses
+                .iter()
+                .filter(|(n, r)| qualifier_of(n, *r) == Some(decl))
+                .map(|(_, r)| *r),
+        );
+        all.sort_unstable();
+        all.dedup();
+        Some((d.at, all))
     }
 
     /// [`super::alias_name_at`]: the definition, the name inside its quotes.
@@ -13207,7 +13475,7 @@ mod alias_refs {
     }
 
     /// The name inside a quoted spelling's quotes; a bare one as it is.
-    fn unquoted(stmt: &str, lo: usize, (s, e): (usize, usize)) -> (usize, usize) {
+    pub(super) fn unquoted(stmt: &str, lo: usize, (s, e): (usize, usize)) -> (usize, usize) {
         let quoted = e - s >= 2 && matches!(stmt.as_bytes().get(s - lo), Some(b'"' | b'`' | b'['));
         if quoted { (s + 1, e - 1) } else { (s, e) }
     }
@@ -27903,6 +28171,151 @@ mod tests {
         assert_eq!(
             renamed("SELECT row_to_json(o) FROM orders o|", "x", pg),
             Err(AliasRenameRefusal::NoAlias)
+        );
+    }
+
+    /// [`cte_rename`] with the result written back, the caret marked.
+    fn cte_renamed(
+        sql: &str,
+        new: &str,
+        dialect: SqlDialect,
+    ) -> Result<String, AliasRenameRefusal> {
+        let caret = sql.find('|').unwrap();
+        let mut sql = sql.replace('|', "");
+        let m = cte_rename(&sql, caret, new, dialect)?;
+        assert!(m.edits.windows(2).all(|w| w[0].1 <= w[1].0), "{m:?}");
+        for (a, b, text) in m.edits.into_iter().rev() {
+            sql.replace_range(a..b, &text);
+        }
+        let [(c, _)] = m.sels.as_slice() else {
+            panic!("one caret: {:?}", m.sels);
+        };
+        sql.insert(*c, '|');
+        Ok(sql)
+    }
+
+    /// **A CTE renames everywhere it is bound** — its declaration, every
+    /// `FROM` naming it, a later sibling's body and a qualifier through it —
+    /// from the declaration or from any reference.
+    #[test]
+    fn a_cte_rename_writes_its_declaration_and_every_reference() {
+        let my = SqlDialect::MySql;
+        assert_eq!(
+            cte_renamed(
+                "WITH r|ecent AS (SELECT 1 AS n), b AS (SELECT n FROM recent) \
+                 SELECT recent.n FROM recent JOIN b ON b.n = recent.n",
+                "latest",
+                my
+            )
+            .unwrap(),
+            "WITH latest| AS (SELECT 1 AS n), b AS (SELECT n FROM latest) \
+             SELECT latest.n FROM latest JOIN b ON b.n = latest.n"
+        );
+        // From a reference, and written as the engine reads it back.
+        assert_eq!(
+            cte_renamed("WITH c AS (SELECT 1 AS n) SELECT * FROM c|", "new name", my).unwrap(),
+            "WITH `new name` AS (SELECT 1 AS n) SELECT * FROM `new name`|"
+        );
+        // A recursive CTE's reference to itself is its own.
+        assert_eq!(
+            cte_renamed(
+                "WITH RECURSIVE t| AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM t WHERE n < 3) \
+                 SELECT * FROM t",
+                "seq",
+                my
+            )
+            .unwrap(),
+            "WITH RECURSIVE seq| AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM seq WHERE n < 3) \
+             SELECT * FROM seq"
+        );
+    }
+
+    /// **Bound by scope, as the server binds it.** A subquery's own `c`
+    /// shadows the outer one inside it and is renamed alone; outside its
+    /// query a CTE's name is a real table's, and stays.
+    #[test]
+    fn a_cte_rename_follows_scope() {
+        let my = SqlDialect::MySql;
+        assert_eq!(
+            cte_renamed(
+                "WITH c AS (SELECT 1 AS n) SELECT * FROM c \
+                 WHERE n IN (WITH c AS (SELECT 2 AS n) SELECT n FROM c|)",
+                "inner_c",
+                my
+            )
+            .unwrap(),
+            "WITH c AS (SELECT 1 AS n) SELECT * FROM c \
+             WHERE n IN (WITH inner_c AS (SELECT 2 AS n) SELECT n FROM inner_c|)"
+        );
+        assert_eq!(
+            cte_renamed(
+                "SELECT * FROM c WHERE n IN (WITH c| AS (SELECT 2 AS n) SELECT n FROM c)",
+                "d",
+                my
+            )
+            .unwrap(),
+            "SELECT * FROM c WHERE n IN (WITH d| AS (SELECT 2 AS n) SELECT n FROM d)",
+            "the outer `c` is a table the inner CTE does not reach"
+        );
+        // A schema-qualified name is never the CTE.
+        assert_eq!(
+            cte_renamed("WITH c| AS (SELECT 1 AS n) SELECT * FROM c, s.c", "d", my).unwrap(),
+            "WITH d| AS (SELECT 1 AS n) SELECT * FROM d, s.c"
+        );
+    }
+
+    /// **A quoted name is that spelling exactly**, as the server reads it: on
+    /// PostgreSQL `WITH "C"` and `FROM c` name two things, and the rename
+    /// takes only the first — where Ctrl+click already told them apart, and
+    /// the rename's walk once lowercased both. A later sibling is not in
+    /// reach of an earlier one's body for the jump either.
+    #[test]
+    fn a_quoted_cte_name_binds_only_its_own_spelling() {
+        let pg = SqlDialect::Postgres;
+        assert_eq!(
+            cte_renamed(
+                r#"WITH "C"| AS (SELECT 1 AS n) SELECT * FROM "C", c"#,
+                "d",
+                pg
+            )
+            .unwrap(),
+            r#"WITH d| AS (SELECT 1 AS n) SELECT * FROM d, c"#
+        );
+        let sql = "WITH a AS (SELECT * FROM b), b AS (SELECT 1) SELECT * FROM a";
+        let caret = sql.find("FROM b").unwrap() + 5;
+        assert_eq!(definition_at(sql, caret, SqlDialect::MySql), None);
+    }
+
+    /// **A name that would change what a reference reads is refused**: a
+    /// table the statement already reads, a sibling CTE, an alias the
+    /// qualifier would bind to instead — and a bare name the CTE's own may be,
+    /// which no walk tells apart.
+    #[test]
+    fn a_cte_rename_refuses_a_capturing_name() {
+        let my = SqlDialect::MySql;
+        let sql = "WITH c| AS (SELECT 1 AS n), d AS (SELECT 2 AS n) \
+                   SELECT c.n FROM c JOIN orders o ON o.id = c.n";
+        assert_eq!(cte_renamed(sql, "d", my), Err(AliasRenameRefusal::Conflict));
+        assert_eq!(
+            cte_renamed(sql, "orders", my),
+            Err(AliasRenameRefusal::Conflict)
+        );
+        assert_eq!(cte_renamed(sql, "o", my), Err(AliasRenameRefusal::Conflict));
+        assert!(cte_renamed(sql, "e", my).is_ok());
+        assert_eq!(cte_renamed(sql, " ", my), Err(AliasRenameRefusal::Empty));
+        assert_eq!(
+            cte_renamed("WITH n| AS (SELECT 1 AS n) SELECT n FROM n", "m", my),
+            Err(AliasRenameRefusal::NoAlias),
+            "a bare `n` may be the column or the CTE"
+        );
+        assert_eq!(
+            cte_renamed("SELECT * FROM orders|", "x", my),
+            Err(AliasRenameRefusal::NoAlias)
+        );
+        assert_eq!(cte_name_at("SELECT * FROM orders", 15, my), None);
+        assert_eq!(
+            cte_name_at("WITH c AS (SELECT 1) SELECT * FROM c", 35, my).as_deref(),
+            Some("c")
         );
     }
 

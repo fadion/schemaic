@@ -5249,6 +5249,50 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                         Ok(())
                     };
                     alias_rename.set(Some(crate::AliasRenameRequest {
+                        title: "Rename alias",
+                        placeholder: "Alias",
+                        name,
+                        apply: Rc::new(apply),
+                        back,
+                    }));
+                }));
+            }
+            // "Rename CTE": the same dialog over a CTE's declaration or a
+            // reference bound to it, renamed by scope through
+            // `intel::cte_rename`, which re-binds the result before it edits.
+            let cte_name = move || {
+                query.with_untracked(|sql| {
+                    intel::cte_name_at(sql, menu_offset.get_untracked(), dialect.get_untracked())
+                })
+            };
+            if cte_name().is_some() {
+                let ed = ed_rename.clone();
+                entries.push(MenuEntry::action("Rename CTE", move || {
+                    let Some(name) = cte_name() else {
+                        return;
+                    };
+                    let at = menu_offset.get_untracked();
+                    let opened_on = query.get_untracked();
+                    let back = ed
+                        .editor_view_id
+                        .get_untracked()
+                        .map(|vid| crate::widgets::menu_return(move || vid.request_focus()));
+                    let ed = ed.clone();
+                    let apply = move |new: &str| {
+                        let m = query.with_untracked(|sql| {
+                            if *sql != opened_on {
+                                return Err(intel::AliasRenameRefusal::Changed);
+                            }
+                            intel::cte_rename(sql, at, new, dialect.get_untracked())
+                        })?;
+                        if !edit_untyped_multi(&ed, comp, &m, EditType::Other) {
+                            return Err(intel::AliasRenameRefusal::ReadOnly);
+                        }
+                        Ok(())
+                    };
+                    alias_rename.set(Some(crate::AliasRenameRequest {
+                        title: "Rename CTE",
+                        placeholder: "CTE name",
                         name,
                         apply: Rc::new(apply),
                         back,

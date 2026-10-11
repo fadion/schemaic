@@ -7,6 +7,7 @@
 //! query's `i` silently rebinds a correlated `o.id`, which in a
 //! `DELETE … WHERE EXISTS` removes every row or none (R3-L5-03). The decision is
 //! `intel::alias_rename`'s; this file asks for the name and shows its refusal.
+//! *Rename CTE* is the same dialog over `intel::cte_rename`, titled for it.
 
 use std::rc::Rc;
 
@@ -20,11 +21,15 @@ use crate::widgets::{
 };
 use crate::{FieldCfg, edit_field, theme};
 
-/// What raises the dialog: the alias's name as its definition writes it, and
-/// the editor's own rename, which re-asks `intel::alias_rename` against the
-/// buffer as it is when Rename is pressed.
+/// What raises the dialog: the name as its definition writes it, and the
+/// editor's own rename, which re-asks `intel::alias_rename` (or
+/// `intel::cte_rename`) against the buffer as it is when Rename is pressed.
 #[derive(Clone)]
 pub struct AliasRenameRequest {
+    /// What is renamed, as the dialog's title and field say it — *Rename
+    /// alias* and *Rename CTE* share the dialog.
+    pub title: &'static str,
+    pub placeholder: &'static str,
     pub name: String,
     pub apply: AliasRenameApply,
     /// Gives the keyboard back to the editor, however the dialog closes —
@@ -32,7 +37,7 @@ pub struct AliasRenameRequest {
     pub back: Option<Rc<dyn Fn()>>,
 }
 
-/// The editor's rename of the alias to a name, or why it will not.
+/// The editor's rename to a name, or why it will not.
 pub type AliasRenameApply = Rc<dyn Fn(&str) -> Result<(), AliasRenameRefusal>>;
 
 fn panel_w() -> f64 {
@@ -40,7 +45,7 @@ fn panel_w() -> f64 {
 }
 
 // Opened by setting `OverlayUi::alias_rename` — the editor's *Rename alias*
-// entry is the one caller.
+// and *Rename CTE* entries are the callers.
 
 pub(crate) fn alias_rename_overlay(open: RwSignal<Option<AliasRenameRequest>>) -> impl IntoView {
     dyn_container(
@@ -87,7 +92,7 @@ pub(crate) fn alias_rename_overlay(open: RwSignal<Option<AliasRenameRequest>>) -
                     edit_field(
                         name,
                         FieldCfg {
-                            placeholder: "Alias",
+                            placeholder: req.placeholder,
                             focus: Some((ring.clone(), 10)),
                             autofocus: true,
                             on_submit: Some(Rc::new(move || (submit)())),
@@ -152,7 +157,7 @@ pub(crate) fn alias_rename_overlay(open: RwSignal<Option<AliasRenameRequest>>) -
             ));
 
             let panel = v_stack((
-                modal_title("Rename alias", close.clone(), root_ring.clone()),
+                modal_title(req.title, close.clone(), root_ring.clone()),
                 form,
                 footer,
             ))
