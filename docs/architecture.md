@@ -28965,9 +28965,13 @@ existing prose was left alone.
   **A long run that ends behind another window calls the user back**: the taskbar flash on Windows
   and Linux, the dock bounce on macOS (`WindowIdExt::request_attention` with
   `Urgency::Informational`, which stops on its own once the window is focused). `call_back_after`
-  asks `history::wants_attention(took, window_focused)` — at least `ATTENTION_AFTER_MS`, ten
-  seconds, and the window not in front, where the result is already on screen
-  (`a_long_run_finishing_in_the_background_asks_for_attention`). Both run paths ask it after their
+  asks `history::wants_attention(took, window_focused)` — at least `ATTENTION_AFTER_MS`, one
+  second, and the window not in front, where the result is already on screen
+  (`a_long_run_finishing_in_the_background_asks_for_attention`). **The bar is low on purpose**: a
+  window not in front when the run ends is already the evidence the user walked away, so the bar
+  only keeps a run that was over before anyone could leave from asking. It was ten seconds, and a
+  1.2 s query switched away from the moment it was run never flashed
+  (`a_run_walked_away_from_after_a_second_asks_for_attention`). Both run paths ask it after their
   supersede checks, so only a run the tab still shows does, and only one that reached a verdict:
   the single run with its `took`, Run Everything with its statements' times summed, since a long
   script of quick statements is as much a walk-away as one slow statement. A `.sql` file run and

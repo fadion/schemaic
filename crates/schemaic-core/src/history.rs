@@ -332,9 +332,12 @@ impl RunResult {
 }
 
 /// How long a run takes before its end is worth calling the user back for.
-/// Ten seconds: long enough that they may have switched away, short enough
-/// that they have not yet forgotten what they ran.
-pub const ATTENTION_AFTER_MS: u64 = 10_000;
+/// One second. A window that is not in front when the run ends is already
+/// the evidence that the user switched away while it ran; the bar only keeps
+/// a run that was over before anyone could leave from asking. It was ten
+/// seconds once, and a 1.2 s query walked away from read as a flash that
+/// never came.
+pub const ATTENTION_AFTER_MS: u64 = 1_000;
 
 /// Should a run that just reached a verdict after `took_ms` ask for the
 /// window's attention — the taskbar flash, the dock bounce? Only a long one,
@@ -710,6 +713,16 @@ mod tests {
             !wants_attention(ATTENTION_AFTER_MS * 6, true),
             "the user is watching"
         );
+    }
+
+    /// **Reported**: a query of 1.2 s, the window left the moment it was run,
+    /// ended with no flash — the bar was ten seconds. A window that is not in
+    /// front when the run ends is the evidence that the user walked away; the
+    /// bar only has to keep an instant run from asking.
+    #[test]
+    fn a_run_walked_away_from_after_a_second_asks_for_attention() {
+        assert!(wants_attention(1_200, false));
+        assert!(!wants_attention(300, false), "over before anyone left");
     }
 
     /// `ts` doubles as the run id — every entry in a test gets its own, which is
