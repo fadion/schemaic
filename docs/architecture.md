@@ -27311,7 +27311,10 @@ existing prose was left alone.
     edit and this panel knows the cell only well enough to *name* it — giving it the coordinates
     would put one cell's identity in two places, which `BlobTarget` already refuses for the read
     half. `None` there is a cell nothing can write, and it is what leaves *Load from file*
-    disabled; the button sits before *Save to file* and the three actions take `ACTION_TAB + 1/2/3`.
+    disabled. The two file actions sit at the footer's **left**, *Load from file* (upload icon)
+    then *Save to file* (download icon), with the status line after them as the part that
+    shrinks, and *Close* alone on the right — they act on the value, Close on the panel; the
+    three take `ACTION_TAB + 1/2/3`, left to right.
     **It is a struct with two closures — `put` and `live` — and not a bare `Rc<dyn Fn(Arc<[u8]>) ->
     bool>`**, because `put` asks `is_live` inside itself and so no caller can skip the check. The
     signal holding it is window-scoped while the sink closes over a `GridState`, so the two do not

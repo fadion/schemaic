@@ -944,35 +944,46 @@ pub(crate) fn blob_overlay(b: BlobUi, tab_actions: Rc<TabsActions>) -> impl Into
                         .padding_horiz(modal_pad_h())
                         .padding_vert(theme::scaled(14.0))
                 }),
+                // The file actions on the left, apart from Close: they act on
+                // the value, Close on the panel. The status line follows them
+                // and is still the part that shrinks.
                 modal_footer_split(
-                    status,
                     h_stack((
-                        action_button(
+                        crate::widgets::action_button_icon(
                             "Load from file",
+                            crate::icons::UPLOAD,
                             ActionKind::Neutral,
                             loadable,
                             ring.clone(),
                             ACTION_TAB + 1,
                             load_click,
-                        ),
-                        action_button(
+                        )
+                        .style(|s| s.flex_shrink(0.0_f32)),
+                        crate::widgets::action_button_icon(
                             "Save to file",
+                            crate::icons::DOWNLOAD,
                             ActionKind::Neutral,
                             saveable,
                             ring.clone(),
                             ACTION_TAB + 2,
                             save_click,
-                        ),
-                        action_button(
-                            "Close",
-                            ActionKind::Primary,
-                            true,
-                            ring.clone(),
-                            ACTION_TAB + 3,
-                            move || (exit_btn)(),
-                        ),
+                        )
+                        .style(|s| s.flex_shrink(0.0_f32)),
+                        container(status).style(|s| {
+                            s.min_width(0.0)
+                                .flex_shrink(1.0_f32)
+                                .margin_left(theme::scaled(4.0))
+                        }),
                     ))
-                    .style(|s| s.gap(theme::scaled(8.0)))
+                    .style(|s| s.items_center().min_width(0.0).gap(theme::scaled(8.0))),
+                    action_button(
+                        "Close",
+                        ActionKind::Primary,
+                        true,
+                        ring.clone(),
+                        ACTION_TAB + 3,
+                        move || (exit_btn)(),
+                    )
                     .into_any(),
                 )
                 .into_any(),
