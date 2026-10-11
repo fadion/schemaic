@@ -1248,10 +1248,14 @@ pub fn set_format_style(style: schemaic_core::sqlfmt::FormatStyle) {
     with_state(|st| st.format_style.set(style));
 }
 
-/// Every Format Code setting, as the formatter takes them. Read when it runs,
-/// so nothing repaints.
+/// Every Format Code setting, as the formatter takes them — with the editor's
+/// tab width, which measures a tab-indented line for alignment. Read when it
+/// runs, so nothing repaints.
 pub fn format_style() -> schemaic_core::sqlfmt::FormatStyle {
-    with_state(|st| st.format_style.get_untracked())
+    with_state(|st| schemaic_core::sqlfmt::FormatStyle {
+        tab_width: st.editor_tab_width.get_untracked(),
+        ..st.format_style.get_untracked()
+    })
 }
 
 /// Whether completion writes an alias after a table it inserts. Read when an

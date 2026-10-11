@@ -2393,6 +2393,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let statement_gap = RwSignal::new(ui_state.format_statement_gap);
     let join_on_own_line = RwSignal::new(ui_state.format_join_on_own_line);
     let format_river = RwSignal::new(ui_state.format_river);
+    let format_align = RwSignal::new(ui_state.format_align);
     let table_aliases = RwSignal::new(ui_state.completion_table_aliases);
     let show_whitespace = RwSignal::new(ui_state.editor_show_whitespace);
     let indent_guides = RwSignal::new(ui_state.editor_indent_guides);
@@ -2423,6 +2424,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             gap: statement_gap.get(),
             join_on_own_line: join_on_own_line.get(),
             river: format_river.get(),
+            align: format_align.get(),
+            // The editor's own, filled in as the formatter is asked
+            // (`theme::format_style`).
+            tab_width: 0,
         })
     });
     schemaic_ui::theme::set_completion_table_aliases(table_aliases.get_untracked());
@@ -7809,6 +7814,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     format_statement_gap: statement_gap.get_untracked(),
                     format_join_on_own_line: join_on_own_line.get_untracked(),
                     format_river: format_river.get_untracked(),
+                    format_align: format_align.get_untracked(),
                     completion_table_aliases: table_aliases.get_untracked(),
                     editor_show_whitespace: show_whitespace.get_untracked(),
                     editor_indent_guides: indent_guides.get_untracked(),
@@ -7910,6 +7916,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             statement_gap.get();
             join_on_own_line.get();
             format_river.get();
+            format_align.get();
             table_aliases.get();
             show_whitespace.get();
             indent_guides.get();
@@ -13331,6 +13338,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             statement_gap,
             join_on_own_line,
             river: format_river,
+            align: format_align,
             table_aliases,
             show_whitespace,
             indent_guides,

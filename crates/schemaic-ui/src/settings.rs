@@ -1796,6 +1796,7 @@ pub(crate) fn theme_settings_overlay(
     let statement_gap = layout.statement_gap;
     let join_on_own_line = layout.join_on_own_line;
     let river = layout.river;
+    let align = layout.align;
     let table_aliases = layout.table_aliases;
     let show_whitespace = layout.show_whitespace;
     let indent_guides = layout.indent_guides;
@@ -1958,6 +1959,14 @@ pub(crate) fn theme_settings_overlay(
                 ring.clone(),
                 185,
             );
+            let align_row = focusable_toggle_row(
+                "Align columns",
+                "Line up the AS of a select list's aliases, the = of an UPDATE's \
+                 assignments and the types of a table's columns.",
+                align,
+                ring.clone(),
+                188,
+            );
             let join_on_row = focusable_toggle_row(
                 "Join condition on its own line",
                 "Put a join's ON, and the AND and OR of its condition, on a line of \
@@ -1983,6 +1992,7 @@ pub(crate) fn theme_settings_overlay(
                 commas_section,
                 gap_section,
                 river_row,
+                align_row,
                 join_on_row,
             ))
             .style(|s| s.flex_col().gap(theme::scaled(16.0)));

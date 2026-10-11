@@ -86,7 +86,12 @@ fn format_sql_under(
     f.gap = style.gap;
     f.join_on_own_line = style.join_on_own_line;
     f.river = style.river;
+    f.align = style.align;
+    if style.tab_width > 0 {
+        f.tab_width = style.tab_width;
+    }
     f.run(&toks);
+    f.apply_alignment();
     let out = f.out.trim_end();
     if sql.ends_with('\n') {
         format!("{out}\n")
@@ -222,6 +227,12 @@ pub struct FormatStyle {
     /// Clause keywords right-aligned on one edge, each body on its keyword's
     /// line — the "river" layout — in place of a keyword on a line of its own.
     pub river: bool,
+    /// Line up what a broken list's items share: a select list's `AS`, an
+    /// `UPDATE`'s `=`, a table body's column types.
+    pub align: bool,
+    /// How many columns a tab takes, for measuring a line indented with
+    /// tabs. `0` reads as 4.
+    pub tab_width: usize,
 }
 
 impl From<KeywordCase> for FormatStyle {
@@ -1343,7 +1354,9 @@ fn unary_context(prev_punct: &str) -> bool {
 ///
 /// Two parts because a unit may be a tab, and an alignment never can be — a
 /// column lined up under a word is a count of characters. The block layout
-/// only ever moves `lv`; `col` is the river's and an aligned list's. Adding a
+/// only ever moves `lv`; `col` is the river's — its edge, and a list going on
+/// under its first item. (Aligned columns are padded into the finished text
+/// instead: [`Fmt::apply_alignment`].) Adding a
 /// number adds levels, which is what every `base + 1` in the layout means.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Ind {
@@ -1388,7 +1401,46 @@ struct Paren {
     /// of its own.
     saved_joined: bool,
     saved_on: bool,
+    /// The alignment state outside a subquery or a table body, which is a
+    /// list of its own: its group, its clause, and the item it interrupted.
+    saved_align: Option<(usize, Option<String>, Item)>,
 }
+
+/// The broken list's item being written, for lining items up
+/// ([`FormatStyle::align`]).
+#[derive(Clone, Default)]
+struct Item {
+    /// Where its first line's text starts in `out` — a mark is taken only on
+    /// that line, since a column on an item's later line lines up with
+    /// nothing.
+    line: usize,
+    /// How many tokens of it have been written.
+    tokens: usize,
+    /// Its first token, upper-cased — a table body's item is a column, whose
+    /// type lines up, unless this is a key's or a constraint's word.
+    first: String,
+    /// It has a mark already: one per item.
+    marked: bool,
+    /// The next token starts a new item.
+    fresh: bool,
+}
+
+/// The words that open a table body's item that is no column: a key, an
+/// index, a constraint, a `LIKE` copy.
+const TABLE_ITEM_WORDS: &[&str] = &[
+    "PRIMARY",
+    "UNIQUE",
+    "KEY",
+    "INDEX",
+    "CONSTRAINT",
+    "FOREIGN",
+    "CHECK",
+    "FULLTEXT",
+    "SPATIAL",
+    "EXCLUDE",
+    "PERIOD",
+    "LIKE",
+];
 
 #[derive(Clone)]
 struct Fmt<'a> {
@@ -1475,6 +1527,24 @@ struct Fmt<'a> {
     /// Where the current line's text starts in `out`, past its indent — what
     /// [`Fmt::line_cols`] counts from.
     line_body_start: usize,
+    /// Line up what a broken list's items share ([`FormatStyle::align`]).
+    align: bool,
+    /// Columns a tab takes, measuring a line for alignment.
+    tab_width: usize,
+    /// Where a token that lines up was written: its group, and its offset in
+    /// `out`. Padded once the layout is done ([`Fmt::apply_alignment`]).
+    marks: Vec<(usize, usize)>,
+    /// The list being written — the group its marks line up within.
+    group: usize,
+    /// The last group handed out.
+    groups: usize,
+    /// The clause head this list belongs to, upper-cased: `AS` lines up in a
+    /// `SELECT`'s, `=` in a `SET`'s.
+    clause: Option<String>,
+    /// The list item being written.
+    item: Item,
+    /// The token about to be written lines up with its list's others.
+    mark_next: bool,
 }
 
 /// The width the river's keywords right-align to: `SELECT`'s, and that of
@@ -1530,6 +1600,14 @@ impl<'a> Fmt<'a> {
             river: false,
             river_inline_head: false,
             line_body_start: 0,
+            align: false,
+            tab_width: 4,
+            marks: Vec::new(),
+            group: 0,
+            groups: 0,
+            clause: None,
+            item: Item::default(),
+            mark_next: false,
         }
     }
 
@@ -1680,9 +1758,74 @@ impl<'a> Fmt<'a> {
         }
         self.tight_next = false;
         self.river_inline_head = false;
+        if std::mem::take(&mut self.item.fresh) {
+            self.item = Item {
+                line: self.line_body_start,
+                first: text.to_ascii_uppercase(),
+                ..Item::default()
+            };
+        }
+        if std::mem::take(&mut self.mark_next)
+            && !self.item.marked
+            && self.line_body_start == self.item.line
+        {
+            self.marks.push((self.group, self.out.len()));
+            self.item.marked = true;
+        }
+        self.item.tokens += 1;
         self.out.push_str(text);
         self.line_has_content = true;
         self.prev = Some((kind, text.to_string()));
+    }
+
+    /// A new list starts — a clause's body, a subquery's, a table's — under
+    /// `clause`: its marks line up with each other and no others.
+    fn new_list(&mut self, clause: Option<String>) {
+        self.groups += 1;
+        self.group = self.groups;
+        self.clause = clause;
+        self.item = Item {
+            fresh: true,
+            ..Item::default()
+        };
+    }
+
+    /// Pad every mark of a group with two or more out to the group's widest
+    /// column. Columns are counted from the line's start, a tab as
+    /// `tab_width`, all of them before any padding moves an offset — and the
+    /// padding goes in from the end back, so no offset still to pad moves.
+    fn apply_alignment(&mut self) {
+        if self.marks.is_empty() {
+            return;
+        }
+        let tab = self.tab_width;
+        let out = &self.out;
+        let col = |at: usize| {
+            let start = out[..at].rfind('\n').map_or(0, |n| n + 1);
+            out[start..at]
+                .chars()
+                .map(|c| if c == '\t' { tab } else { 1 })
+                .sum::<usize>()
+        };
+        let cols: Vec<(usize, usize, usize)> =
+            self.marks.iter().map(|&(g, at)| (g, at, col(at))).collect();
+        let mut widest: std::collections::HashMap<usize, (usize, usize)> = Default::default();
+        for &(g, _, c) in &cols {
+            let w = widest.entry(g).or_default();
+            w.0 = w.0.max(c);
+            w.1 += 1;
+        }
+        let mut pads: Vec<(usize, usize)> = cols
+            .into_iter()
+            .filter_map(|(g, at, c)| {
+                let (max, n) = widest[&g];
+                (n >= 2 && max > c).then_some((at, max - c))
+            })
+            .collect();
+        pads.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        for (at, pad) in pads {
+            self.out.insert_str(at, &" ".repeat(pad));
+        }
     }
 
     /// How many characters the current line holds past its indent.
@@ -1963,6 +2106,14 @@ impl<'a> Fmt<'a> {
             // What the input had between this token and the one before it.
             let prev_tok = k.checked_sub(1).map(|j| toks[j]);
             let gap = prev_tok.map_or("", |(_, p)| self.between(p, text));
+            // A table body's column: its type, the item's second token, lines
+            // up — unless the item is a key's or a constraint's.
+            self.mark_next = self.align
+                && !matches!(kind, Kind::LineComment | Kind::BlockComment)
+                && self.parens.last().is_some_and(|p| p.listed.is_some())
+                && !self.item.fresh
+                && self.item.tokens == 1
+                && !TABLE_ITEM_WORDS.contains(&self.item.first.as_str());
             // After a statement under `Keep`: the blank line is the input's,
             // read at the first token on a new line — a comment trailing the
             // terminator is still the statement's line.
@@ -2050,6 +2201,15 @@ impl<'a> Fmt<'a> {
                     // a column only with nothing between the two, and laid out
                     // as a clause it became `t.⏎order` — `ORDER` again.
                     let after_dot = matches!(&self.prev, Some((Kind::Punct, p)) if p == ".");
+                    // A select list's alias lines up.
+                    if self.align
+                        && up == "AS"
+                        && !in_expr
+                        && !after_dot
+                        && self.clause.as_deref() == Some("SELECT")
+                    {
+                        self.mark_next = true;
+                    }
                     let called = is_called_keyword(&up)
                         && matches!(toks.get(k + 1), Some((Kind::Punct, "(")));
                     if self.opens_alter_actions(toks, k) {
@@ -2270,6 +2430,7 @@ impl<'a> Fmt<'a> {
                             self.emit(Kind::Word, toks[k + 1].1, false);
                             k += 1;
                         }
+                        self.new_list(Some(up.clone()));
                         if self.river {
                             // The body goes on, and a list continues under its
                             // first item.
@@ -2348,7 +2509,12 @@ impl<'a> Fmt<'a> {
                             listed: body.then_some(self.line_indent),
                             saved_joined: self.joined,
                             saved_on: self.in_on,
+                            saved_align: (sub || body)
+                                .then(|| (self.group, self.clause.clone(), self.item.clone())),
                         });
+                        if sub || body {
+                            self.new_list(None);
+                        }
                         if sub && self.river {
                             // On the paren's line, with a river of its own:
                             // its edge falls where its first keyword ends.
@@ -2378,6 +2544,11 @@ impl<'a> Fmt<'a> {
                     }
                     ")" => {
                         if let Some(p) = self.parens.pop() {
+                            if let Some((group, clause, item)) = p.saved_align.clone() {
+                                self.group = group;
+                                self.clause = clause;
+                                self.item = item;
+                            }
                             if let Some(at) = p.listed {
                                 self.break_to(at);
                                 self.emit(Kind::Punct, ")", true);
@@ -2420,6 +2591,9 @@ impl<'a> Fmt<'a> {
                                 self.break_to(self.content);
                             }
                         }
+                        if breakable {
+                            self.item.fresh = true;
+                        }
                     }
                     ";" => {
                         self.emit(Kind::Punct, ";", true);
@@ -2456,6 +2630,14 @@ impl<'a> Fmt<'a> {
                         self.brackets = self.brackets.saturating_sub(1);
                     }
                     _ => {
+                        // An assignment's `=` lines up in a `SET`'s list.
+                        if self.align
+                            && text == "="
+                            && !self.in_expr_paren()
+                            && self.clause.as_deref() == Some("SET")
+                        {
+                            self.mark_next = true;
+                        }
                         self.emit(Kind::Punct, text, false);
                     }
                 },
@@ -3075,6 +3257,101 @@ mod tests {
         assert_eq!(
             squash(settled(sql, river())),
             squash(styled(sql, FormatStyle::default()))
+        );
+    }
+
+    fn aligned() -> FormatStyle {
+        FormatStyle {
+            align: true,
+            ..FormatStyle::default()
+        }
+    }
+
+    /// A broken select list's `AS` lines up, item to item — under the block
+    /// layout and the river alike. An item with no alias is left as it is.
+    #[test]
+    fn a_select_lists_aliases_line_up() {
+        let sql = "select t.id as id, t.created_at as created, u.name as owner, 1 from t";
+        assert_eq!(
+            settled(sql, aligned()),
+            "select\n  t.id         as id,\n  t.created_at as created,\n  u.name       as owner,\n  \
+             1\nfrom\n  t"
+        );
+        let style = FormatStyle {
+            river: true,
+            ..aligned()
+        };
+        assert_eq!(
+            settled(sql, style),
+            "select t.id         as id,\n       t.created_at as created,\n       \
+             u.name       as owner,\n       1\n  from t"
+        );
+    }
+
+    /// An `UPDATE`'s assignments line up on their `=`, and a table body's
+    /// column types line up — its keys and constraints are left alone.
+    #[test]
+    fn assignments_and_column_types_line_up() {
+        assert_eq!(
+            settled(
+                "update t set a = 1, longer_name = 2 where id = 3",
+                aligned()
+            ),
+            "update\n  t\nset\n  a           = 1,\n  longer_name = 2\nwhere\n  id = 3"
+        );
+        assert_eq!(
+            settled(
+                "create table t (id int not null, created_at datetime, \
+                 primary key (id), constraint u unique (created_at))",
+                aligned()
+            ),
+            "create table t (\n  id         int not null,\n  created_at datetime,\n  \
+             primary key (id),\n  constraint u unique (created_at)\n)"
+        );
+    }
+
+    /// Each list lines up with itself alone: a subquery's aliases are their
+    /// own group, and the outer list's go on around it. A comparison's `=`
+    /// in a `WHERE` is no assignment.
+    #[test]
+    fn each_list_lines_up_on_its_own() {
+        let out = settled(
+            "select a as x, (select bbbbbb as y, c as z from u) as sub, dd as w from t \
+             where a = 1",
+            aligned(),
+        );
+        assert!(
+            out.contains("      bbbbbb as y,\n      c      as z\n"),
+            "{out}"
+        );
+        assert!(out.contains("  a  as x,\n"), "{out}");
+        assert!(out.contains("  dd as w\n"), "{out}");
+        // The subquery's alias is on its item's last line: it lines up with
+        // nothing.
+        assert!(out.contains("  ) as sub,\n"), "{out}");
+        assert!(out.contains("  a = 1"), "{out}");
+    }
+
+    /// Leading commas: the column is counted from the line's start, comma
+    /// and all, so the aliases still share one.
+    #[test]
+    fn aliases_line_up_after_leading_commas() {
+        let style = FormatStyle {
+            commas: CommaStyle::Leading,
+            ..aligned()
+        };
+        assert_eq!(
+            settled("select a as x, bbbb as y from t", style),
+            "select\n  a      as x\n  , bbbb as y\nfrom\n  t"
+        );
+    }
+
+    /// Off, nothing lines up: the formatter as it always was.
+    #[test]
+    fn alignment_is_off_by_default() {
+        assert_eq!(
+            styled("select a as x, bbbb as y from t", FormatStyle::default()),
+            "select\n  a as x,\n  bbbb as y\nfrom\n  t"
         );
     }
 

@@ -13291,7 +13291,8 @@ existing prose was left alone.
     `CommaStyle` is `Trailing` (the default, *End of line*: the formatter as it always was) or
     `Leading` (*Start of line*), serialised and read leniently exactly as `KeywordCase` is, an
     unknown word being `Trailing` (`comma_style_defaults_to_end_of_line_and_reads_leniently`). The
-    settings travel as a `FormatStyle { case, commas, gap, join_on_own_line, river }`, and `format_range`/`format_statement`
+    settings travel as a `FormatStyle { case, commas, gap, join_on_own_line, river, align,
+    tab_width }`, and `format_range`/`format_statement`
     take `impl Into<FormatStyle>`, with `From<KeywordCase>` putting every other setting at its
     default — so a caller or test that passes a bare `KeywordCase` says nothing about the rest and
     is unchanged. `format_sql` stays at the defaults. `format_sql_under` takes the whole
@@ -13367,6 +13368,35 @@ existing prose was left alone.
     (`the_river_aligns_with_spaces_after_the_indent`). Only whitespace moves, held against the
     default layout's tokens (`the_river_moves_only_whitespace`); every river test also formats its
     output again through a `settled` helper that asserts nothing moves.
+    **Aligned columns are the sixth** — `FormatStyle::align`, a `bool`, off by default
+    (`alignment_is_off_by_default`). On, a broken list's items line up on what they share: a select
+    list's `AS` (the clause is `SELECT`, the word is not in an expression paren and not after a
+    `.`, where it is a name), an `UPDATE`'s assignment `=` (the clause is `SET`, not in an
+    expression paren — so a `WHERE`'s comparison never moves), and a table body's column type, the
+    item's second token, unless the item's first word is a key's or a constraint's
+    (`TABLE_ITEM_WORDS`: `PRIMARY`, `UNIQUE`, `KEY`, `INDEX`, `CONSTRAINT`, `FOREIGN`, `CHECK`,
+    `FULLTEXT`, `SPATIAL`, `EXCLUDE`, `PERIOD`, `LIKE`). An item with no such token is left as it
+    is (`a_select_lists_aliases_line_up`, block and river; `assignments_and_column_types_line_up`).
+    **It is a pass over the finished text, not the layout's `Ind::col`** — the pad goes in
+    mid-line, ahead of the marked token, and a group's widest column is known only once its last
+    item is written. During layout `step` sets `Fmt::mark_next` for such a token, and `emit`
+    records a mark, `(group, offset in out)`, only if the item has none yet (`Item::marked`) and
+    the token is on the item's **first line** (`Item::line` against `line_body_start`): a column
+    on an item's later line lines up with nothing, and `) as sub` after a subquery laid out over
+    several lines would otherwise be padded out to the aliases above it. `Item::fresh` is set by
+    `Fmt::new_list` and after every breakable comma, under either comma style, and the next `emit`
+    starts the item — its line, and its first word upper-cased. **Each list is a group of its
+    own**: `new_list(clause)` hands out a new one at every clause head (the clause being the head
+    word) and when a subquery's or a table body's paren opens (no clause), and
+    `Paren::saved_align` keeps the outer `(group, clause, item)` for its `)` to restore — so a
+    subquery's aliases line up among themselves and the outer list's go on around it
+    (`each_list_lines_up_on_its_own`). Then `Fmt::apply_alignment`, which `format_sql_under` calls
+    after `run`, measures every mark's column from its line's start — a tab as `tab_width` — and
+    pads each mark of a group with two or more to the group's widest, inserting from the end back
+    so no offset still to pad moves. A leading comma is part of its line, so `, bbbb as y` still
+    shares the column (`aliases_line_up_after_leading_commas`). Only spaces go in, so
+    `caret_after_format` holds over it. `tab_width` `0` reads as 4: `theme::format_style()` fills
+    in the editor's tab width each time it is read, and the app's composing effect sets `0`.
     **`formattable_range` is what decides how much of the document a Format may touch**, and it is
     here rather than at the call site because `format_sql` lexes what it is handed **from byte 0**
     and takes that for a real token boundary. True of a whole document and of a selection whose ends
@@ -13516,7 +13546,8 @@ existing prose was left alone.
     is held to the same two properties** over the same corpus and engines —
     `the_corpus_formats_idempotently_under_every_layout_setting`, for a list `styles` of non-default
     `FormatStyle`s (the river; the river with `join_on_own_line`, `StatementGap::Keep` and leading
-    commas; `join_on_own_line` with `StatementGap::None`) — never a keyword case, which changes a
+    commas; `join_on_own_line` with `StatementGap::None` and `align`; the river with `align`) —
+    never a keyword case, which changes a
     token's text by design — where a second format must move nothing and
     `what_it_says` must not change. The formatter's own tests pin a setting a shape at a time, and
     this is where a shape none of them thought of shows up. **A new layout setting joins
@@ -27927,16 +27958,21 @@ existing prose was left alone.
     **Between statements** after that (*One blank line* by default, focus order 180 —
     `UiState::format_statement_gap`, pinned by
     `format_statement_gap_defaults_to_one_and_keeps_a_choice`; `LayoutUi::statement_gap`), then
-    the section's two switches, each a `focusable_toggle_row` off by default: **Right-align clause
+    the section's three switches, each a `focusable_toggle_row` off by default: **Right-align clause
     keywords** (focus order 185 — `UiState::format_river`, pinned by
-    `format_river_defaults_off_and_keeps_an_on`; `LayoutUi::river`), and **Join condition on its
+    `format_river_defaults_off_and_keeps_an_on`; `LayoutUi::river`), **Align columns** (focus
+    order 188 — `UiState::format_align`, pinned by `format_align_defaults_off_and_keeps_an_on`;
+    `LayoutUi::align`), and **Join condition on its
     own line** (focus order 190 — `UiState::format_join_on_own_line`, pinned by
     `format_join_on_own_line_defaults_off_and_keeps_an_on`; `LayoutUi::join_on_own_line`). What
     each does to the text is the `core/sqlfmt.rs` entry's. **They reach the formatter as one
     value**: the theme state holds a single `format_style: RwSignal<FormatStyle>`, and the app
-    composes it in one `create_effect` beside the other editor-setting effects, from the five
+    composes it in one `create_effect` beside the other editor-setting effects, from the six
     signals Settings edits one at a time, into `theme::set_format_style` — which replaced a setter
-    per setting. `theme::format_style()` reads it **untracked** and the setter bumps no
+    per setting. Its `tab_width` is not one of them: the effect writes `0`, and
+    `theme::format_style()` fills in `editor_tab_width` each time it is read, so the formatter
+    measures a tab as wide as the editor draws one.
+    `theme::format_style()` reads both **untracked** and the setter bumps no
     `editor_gen`, because nothing is drawn from it: Format Code (`format_editor`'s `format_range`)
     and both *Format statement* sites — the key/palette request and the right-click menu — ask for
     it at the moment they run.

@@ -352,6 +352,10 @@ pub struct UiState {
     /// layout. Default: off, a keyword on a line of its own.
     #[serde(default)]
     pub format_river: bool,
+    /// Format Code lines up a broken list's aliases, assignments and column
+    /// types. Default: off.
+    #[serde(default)]
+    pub format_align: bool,
     /// Completion writes an alias after a table it inserts into a `FROM` or
     /// `JOIN` (`orders o`). Default: on.
     #[serde(default = "default_true")]
@@ -489,6 +493,7 @@ impl Default for UiState {
             format_statement_gap: crate::sqlfmt::StatementGap::One,
             format_join_on_own_line: false,
             format_river: false,
+            format_align: false,
             completion_table_aliases: true,
             editor_show_whitespace: false,
             editor_indent_guides: false,
@@ -1980,6 +1985,22 @@ mod tests {
         let back: UiState =
             serde_json::from_str(&serde_json::to_string(&on).expect("serialises")).expect("parses");
         assert!(back.format_river);
+    }
+
+    /// Nothing lines up for a new install and a file written before the
+    /// setting existed, and an on stays on.
+    #[test]
+    fn format_align_defaults_off_and_keeps_an_on() {
+        assert!(!UiState::default().format_align);
+        let old: UiState = serde_json::from_str("{}").expect("parses");
+        assert!(!old.format_align);
+        let on = UiState {
+            format_align: true,
+            ..UiState::default()
+        };
+        let back: UiState =
+            serde_json::from_str(&serde_json::to_string(&on).expect("serialises")).expect("parses");
+        assert!(back.format_align);
     }
 
     /// Completion writes table aliases for a new install and a file written

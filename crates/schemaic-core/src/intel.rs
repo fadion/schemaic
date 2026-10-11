@@ -27809,6 +27809,12 @@ mod tests {
             FormatStyle {
                 join_on_own_line: true,
                 gap: StatementGap::None,
+                align: true,
+                ..FormatStyle::default()
+            },
+            FormatStyle {
+                river: true,
+                align: true,
                 ..FormatStyle::default()
             },
         ];
