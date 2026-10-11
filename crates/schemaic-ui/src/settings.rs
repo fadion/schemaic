@@ -1907,7 +1907,7 @@ pub(crate) fn theme_settings_overlay(
                 160,
             );
             let case_section = v_stack((
-                settings_group_label("Keyword case when formatting"),
+                settings_group_label("Keyword case"),
                 case_dd,
                 form_hint(
                     "How Format Code writes keywords such as SELECT and FROM. Names, \
@@ -1923,7 +1923,7 @@ pub(crate) fn theme_settings_overlay(
                 170,
             );
             let commas_section = v_stack((
-                settings_group_label("Commas when formatting"),
+                settings_group_label("Commas"),
                 commas_dd,
                 form_hint(
                     "Where Format Code puts the comma of a list it breaks across lines. \
@@ -1940,6 +1940,10 @@ pub(crate) fn theme_settings_overlay(
                 rainbow_row,
                 whitespace_row,
                 guides_row,
+            ))
+            .style(|s| s.flex_col().gap(theme::scaled(16.0)));
+            let formatting_group = v_stack((
+                form_section_header("Code formatting"),
                 case_section,
                 commas_section,
             ))
@@ -2048,7 +2052,14 @@ pub(crate) fn theme_settings_overlay(
             let intro = v_stack((settings_version_line(), general_group))
                 .style(|s| s.flex_col().gap(theme::scaled(16.0)));
 
-            let body = v_stack((intro, editor_group, query_group, theme_group)).style(|s| {
+            let body = v_stack((
+                intro,
+                editor_group,
+                formatting_group,
+                query_group,
+                theme_group,
+            ))
+            .style(|s| {
                 s.flex_col()
                     .gap(form_section_gap())
                     .padding(theme::scaled(14.0))

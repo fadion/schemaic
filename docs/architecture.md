@@ -21764,8 +21764,8 @@ existing prose was left alone.
     would execute the block in whatever tab is in front, which is the connection the insert had just
     declined to open on. The `bool` exists for that one question; the refusal itself is reported by
     the action.
-  - `settings.rs` — the three settings modals (the main one's groups are General / Editor / Query /
-    **Appearance**, the last holding the two theme pickers and the **interface scale**) **and the
+  - `settings.rs` — the three settings modals (the main one's groups are General / Editor / Code formatting /
+    Query / **Appearance**, the last holding the two theme pickers and the **interface scale**) **and the
     four shared controls every modal's form is
     built from**: `focusable_toggle`/`focusable_toggle_row` (the switch — Space is ours, Enter is
     floem's), `focusable_dropdown` and the picker-agnostic **`in_ring_picker`** under it — the box
@@ -27755,14 +27755,15 @@ existing prose was left alone.
     `selection`. There is no rendering code of ours behind either — only vendored Floem's third
     patch, which centres the whitespace marks in their line (*Floem 0.2 gotchas*). The palette's
     *Toggle Whitespace* and *Toggle Indent Guides* sit beside *Toggle Word Wrap*.
-    **Keyword case when formatting** (Settings → Editor, a `focusable_dropdown` after *Indent
-    guides*, *As typed* by default — `UiState::format_keyword_case`, pinned by
+    **Keyword case** (Settings → *Code formatting*, its own section between *Editor* and *Query*,
+    the first of its two `focusable_dropdown`s; *As typed* by default — `UiState::format_keyword_case`,
+    pinned by
     `format_keyword_case_defaults_to_as_typed_and_keeps_a_choice`; `LayoutUi::keyword_case`) is the
     one editor setting here that paints nothing. `theme::format_style` reads it **untracked**
     and its setter bumps no `editor_gen`, because nothing is drawn from it: Format Code
     (`format_editor`'s `format_range`) and both *Format statement* sites — the key/palette request
     and the right-click menu — ask for it at the moment they run. What it does to the text is the
-    `core/sqlfmt.rs` entry's. **Commas when formatting** sits after it (*End of line* by default —
+    `core/sqlfmt.rs` entry's. **Commas** sits after it (*End of line* by default —
     `UiState::format_comma_style`, pinned by
     `format_comma_style_defaults_to_end_of_line_and_keeps_a_choice`; `LayoutUi::comma_style`) and
     is plumbed the same way, an untracked read and a setter that bumps nothing. The three Format
