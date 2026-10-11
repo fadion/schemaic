@@ -29062,8 +29062,11 @@ existing prose was left alone.
   and `editor_area`, not another overlay over the text** — `editor_area`'s `stack` is at floem's
   16-child limit, and freeing a slot by wrapping is the trap described under *Floem 0.2 gotchas*.
   It is a `dyn_container` keyed on the active tab's id while that tab's `disk_changed` is `Some`,
-  reading "“<file>” changed on disk.", in `text_dim` with `status_warn`/`status_warn_hover`
-  actions on `bg_deepest` (pairs `contrast.rs` gates). **Reload** is the tab menu's own
+  reading "“<file>” changed on disk.", in `text_dim` on `bg_deepest`, with **Reload** in the
+  footer's `tx_commit` green and **Keep mine** in its `tx_rollback` red (hovers likewise) — a
+  commit/discard pair, on the same surface whose pairs `contrast.rs` gates. Not the grid's
+  `grid_edit_staged`/`grid_edit_discard`, which are icon colours and fail as body text there
+  (2.6:1 at best). **Reload** is the tab menu's own
   `TabsActions::reload_sql_file`, which asks through `Confirm` first when the tab is modified.
   **Keep mine** sets `disk_sql` to the text the check found and clears the bar, so the tab reads
   modified and the next save overwrites the file deliberately. That assignment is load-bearing:

@@ -9415,11 +9415,18 @@ fn center(ui: Ui) -> impl IntoView {
                     .get_untracked()
                     .map(|p| schemaic_core::sqlfile::tab_title(&p))
                     .unwrap_or_default();
-                let act = |label: &'static str, on: Rc<dyn Fn()>| {
-                    text(label).on_click_stop(move |_| on()).style(|s| {
-                        s.color(theme::status_warn())
+                // The footer's Commit/Rollback pair, on the same `bg_deepest`:
+                // taking the disk's text is the commit, keeping the tab's own the
+                // discard of the offer. Not the grid's `grid_edit_staged` /
+                // `grid_edit_discard` — those are icon colours and fail as text.
+                let act = |label: &'static str,
+                           color: fn() -> floem::peniko::Color,
+                           hover: fn() -> floem::peniko::Color,
+                           on: Rc<dyn Fn()>| {
+                    text(label).on_click_stop(move |_| on()).style(move |s| {
+                        s.color(color())
                             .margin_left(theme::scaled(12.0))
-                            .hover(|s| s.color(theme::status_warn_hover()))
+                            .hover(move |s| s.color(hover()))
                     })
                 };
                 let reload = reload.clone();
@@ -9427,9 +9434,16 @@ fn center(ui: Ui) -> impl IntoView {
                     text(format!("“{name}” changed on disk."))
                         .style(|s| s.color(theme::text_dim()).min_width(0.0).text_ellipsis()),
                     empty().style(|s| s.flex_grow(1.0_f32)),
-                    act("Reload", Rc::new(move || (reload)(id))),
+                    act(
+                        "Reload",
+                        theme::tx_commit,
+                        theme::tx_commit_hover,
+                        Rc::new(move || (reload)(id)),
+                    ),
                     act(
                         "Keep mine",
+                        theme::tx_rollback,
+                        theme::tx_rollback_hover,
                         Rc::new(move || {
                             if let Some(now) = tab.disk_changed.try_get_untracked().flatten() {
                                 tab.disk_sql.set(Some(now));
@@ -9444,7 +9458,7 @@ fn center(ui: Ui) -> impl IntoView {
                         .width_full()
                         .font_size(theme::font_body())
                         .padding_horiz(theme::scaled(10.0))
-                        .padding_vert(theme::scaled(5.0))
+                        .padding_vert(theme::scaled(7.0))
                         .background(theme::bg_deepest())
                         .border_bottom(1.0)
                         .border_color(theme::border())
