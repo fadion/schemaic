@@ -638,3 +638,176 @@ async fn an_installed_extensions_functions_are_names_the_checker_knows() {
 
     scratch.teardown().await;
 }
+
+/// **An extension is created and dropped through the statements its picker
+/// and its row plan**, read back between the two, and a drop the server
+/// refuses over a dependent comes back as the run's error rather than being
+/// forced. The picker's list offers what the database does not have and
+/// stops offering it once it does.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_extension_is_created_and_dropped_through_its_plans() {
+    use schemaic_core::ddl::{create_extension, drop_item};
+    use schemaic_core::intel::SqlDialect::Postgres;
+    use schemaic_core::schema::{ObjectItem, installable_extensions};
+
+    if !POSTGRES.enabled() {
+        endpoint::note_skipped(&POSTGRES);
+        return;
+    }
+    let s = crate::scratch::Scratch::create(&POSTGRES, "ext_plan").await;
+    let read = || async {
+        s.db.fetch_schema(&s.database, CancellationToken::new())
+            .await
+            .unwrap_or_else(|e| panic!("fetch_schema: {e}"))
+    };
+    let offered = || async {
+        let available =
+            s.db.available_extensions(&s.database)
+                .await
+                .unwrap_or_else(|e| panic!("available_extensions: {e}"));
+        installable_extensions(&available, &read().await.extensions)
+            .into_iter()
+            .map(|x| x.name)
+            .collect::<Vec<_>>()
+    };
+    // The premise: a stock server ships it, and a fresh database lacks it.
+    let before = offered().await;
+    assert!(before.iter().any(|n| n == "pg_trgm"), "{before:?}");
+    assert!(
+        !before.iter().any(|n| n == "plpgsql"),
+        "plpgsql is in every database, so it is never offered: {before:?}"
+    );
+
+    let create = create_extension("pg_trgm", Postgres).emit();
+    assert_eq!(create, vec![r#"CREATE EXTENSION "pg_trgm";"#.to_string()]);
+    s.db.run_ddl(&s.database, &create, CancellationToken::new())
+        .await
+        .unwrap_or_else(|e| panic!("{}\n{create:?}", e.message));
+    let schema = read().await;
+    let trgm = schema
+        .extensions
+        .iter()
+        .find(|x| x.name == "pg_trgm")
+        .unwrap_or_else(|| panic!("not read back: {:?}", schema.extensions))
+        .clone();
+    assert_eq!(trgm.schema, "public");
+    assert!(!trgm.version.is_empty());
+    assert!(
+        schema.extensions.iter().any(|x| x.name == "plpgsql"),
+        "{:?}",
+        schema.extensions
+    );
+    assert!(!offered().await.iter().any(|n| n == "pg_trgm"));
+
+    let drop = drop_item(&ObjectItem::Extension(trgm), Postgres).emit();
+    assert_eq!(drop, vec![r#"DROP EXTENSION "pg_trgm";"#.to_string()]);
+    s.db.run_ddl(&s.database, &drop, CancellationToken::new())
+        .await
+        .unwrap_or_else(|e| panic!("{}\n{drop:?}", e.message));
+    assert!(!read().await.extensions.iter().any(|x| x.name == "pg_trgm"));
+
+    // A column of its type: the server refuses, and nothing cascades.
+    s.exec("CREATE EXTENSION citext").await;
+    s.exec("CREATE TABLE t (email citext)").await;
+    let citext = read()
+        .await
+        .extensions
+        .into_iter()
+        .find(|x| x.name == "citext")
+        .expect("citext read back");
+    let drop = drop_item(&ObjectItem::Extension(citext), Postgres).emit();
+    let refused =
+        s.db.run_ddl(&s.database, &drop, CancellationToken::new())
+            .await
+            .expect_err("a column still uses its type");
+    assert!(refused.message.contains("depend"), "{}", refused.message);
+    let after = read().await;
+    assert!(after.extensions.iter().any(|x| x.name == "citext"));
+    assert!(after.tables.iter().any(|t| t.name == "t"));
+    s.teardown().await;
+}
+
+/// **A foreign table is read as one and dropped as one.** It was listed as a
+/// base table, so its Drop wrote `DROP TABLE`, which PostgreSQL refuses on one
+/// ("is not a table"). Over `postgres_fdw`, whose `CREATE FOREIGN TABLE`
+/// connects nowhere until the table is read, so no second server is needed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_foreign_table_is_read_and_dropped_as_one() {
+    use schemaic_core::ddl::single;
+    use schemaic_core::intel::SqlDialect::Postgres;
+    use schemaic_core::schema::TableShape;
+
+    if !POSTGRES.enabled() {
+        endpoint::note_skipped(&POSTGRES);
+        return;
+    }
+    let s = crate::scratch::Scratch::create(&POSTGRES, "ext_ft").await;
+    s.exec("CREATE EXTENSION postgres_fdw").await;
+    s.exec(
+        "CREATE SERVER remote FOREIGN DATA WRAPPER postgres_fdw \
+         OPTIONS (host '127.0.0.1', dbname 'nowhere')",
+    )
+    .await;
+    s.exec("CREATE FOREIGN TABLE ft (a int, b text) SERVER remote")
+        .await;
+    s.exec("CREATE TABLE plain (id int PRIMARY KEY)").await;
+
+    let schema =
+        s.db.fetch_schema(&s.database, CancellationToken::new())
+            .await
+            .unwrap_or_else(|e| panic!("fetch_schema: {e}"));
+    let ft = schema
+        .tables
+        .iter()
+        .find(|t| t.name == "ft")
+        .expect("the foreign table is listed");
+    assert_eq!(ft.shape(), TableShape::ForeignTable);
+    assert_eq!(ft.columns.len(), 2, "its columns are read like a table's");
+    let plain = schema.tables.iter().find(|t| t.name == "plain").unwrap();
+    assert_eq!(plain.shape(), TableShape::Table);
+    // The light list the tree paints first agrees.
+    let light = s.db.fetch_table_list(&s.database).await.unwrap();
+    assert!(
+        light
+            .tables
+            .iter()
+            .any(|t| t.name == "ft" && t.shape() == TableShape::ForeignTable),
+        "{:?}",
+        light.tables
+    );
+
+    // The premise: `DROP TABLE` is refused on it.
+    let as_table = single(
+        "ft",
+        Some("public"),
+        Postgres,
+        schemaic_core::ddl::Change::DropTable,
+    )
+    .emit();
+    let refused =
+        s.db.run_ddl(&s.database, &as_table, CancellationToken::new())
+            .await
+            .expect_err("DROP TABLE on a foreign table");
+    assert!(
+        refused.message.contains("not a table"),
+        "{}",
+        refused.message
+    );
+
+    let drop = single(
+        "ft",
+        Some("public"),
+        Postgres,
+        schemaic_core::stats::drop_change(ft.shape(), false),
+    )
+    .emit();
+    s.db.run_ddl(&s.database, &drop, CancellationToken::new())
+        .await
+        .unwrap_or_else(|e| panic!("{}\n{drop:?}", e.message));
+    let after =
+        s.db.fetch_schema(&s.database, CancellationToken::new())
+            .await
+            .unwrap();
+    assert!(!after.tables.iter().any(|t| t.name == "ft"));
+    s.teardown().await;
+}

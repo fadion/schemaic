@@ -1398,6 +1398,7 @@ pub(crate) fn test_ddl_ui(scope: floem::reactive::Scope) -> crate::DdlUi {
         grant: scope.create_rw_signal(None),
         grant_draft: scope.create_rw_signal(Default::default()),
         roles: scope.create_rw_signal(Vec::new()),
+        extensions: scope.create_rw_signal(Vec::new()),
         object: scope.create_rw_signal(None),
         object_draft: scope.create_rw_signal(Default::default()),
         object_errors: scope.create_rw_signal(Vec::new()),

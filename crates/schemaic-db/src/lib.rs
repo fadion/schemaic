@@ -1307,6 +1307,22 @@ impl Db {
         }
     }
 
+    /// The extensions the server could install into `database`
+    /// (`pg_available_extensions`), each with whether that database already has
+    /// it — the Create extension picker's list, which
+    /// `schema::installable_extensions` narrows. The same standing as
+    /// [`Db::roles`]: it feeds a shortcut beside a free-text field. Empty on the
+    /// three engines that have no extensions (`ddl::supports_extensions`).
+    pub async fn available_extensions(
+        &self,
+        database: &str,
+    ) -> Result<Vec<schemaic_core::schema::AvailableExtension>, DbError> {
+        match self.engine {
+            Engine::Postgres => pg::available_extensions(self, database).await,
+            Engine::MySql | Engine::Sqlite | Engine::MsSql => Ok(Vec::new()),
+        }
+    }
+
     /// A MySQL routine's body **as written**, plus the session state it was
     /// written under — read lazily, when the routine editor opens.
     ///
@@ -2150,6 +2166,9 @@ pub(crate) fn assemble_schema(
             // counters — arrived as an editable base table. See
             // `TableInfo::is_sequence` for what that cost.
             is_sequence: ty.eq_ignore_ascii_case("SEQUENCE"),
+            // PostgreSQL's table list types `relkind = 'f'` so (`pg`'s
+            // `table_list_sql`); no MySQL `TABLE_TYPE` is spelled this way.
+            is_foreign: ty.eq_ignore_ascii_case("FOREIGN TABLE"),
             ..Default::default()
         });
     }

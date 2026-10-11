@@ -1277,10 +1277,16 @@ impl ObjectTarget {
 /// being folded into "a container" because the two are **not the same statement
 /// at the same level** — a database is server-level and a namespace is not (see
 /// [`DdlScope`]), and on MySQL the first exists and the second does not.
+///
+/// **A PostgreSQL extension rides the same modal** though it contains nothing:
+/// its picker is this form's one shape — a name, a chevron of what the server
+/// offers, and a plan that leaves through `ddl_preview::preview_container` —
+/// and, like a namespace, it is made *in* the database the menu was raised on.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ContainerKind {
     Database,
     Schema,
+    Extension,
 }
 
 impl ContainerKind {
@@ -1295,6 +1301,7 @@ impl ContainerKind {
         match self {
             ContainerKind::Database => "database",
             ContainerKind::Schema => "schema",
+            ContainerKind::Extension => "extension",
         }
     }
 }
@@ -1310,8 +1317,8 @@ impl ContainerKind {
 pub struct DatabaseTarget {
     pub conn_id: u64,
     pub kind: ContainerKind,
-    /// The database a new **namespace** goes in, and what the plan then runs
-    /// against. `None` for [`ContainerKind::Database`], which is server-level
+    /// The database a new **namespace** or **extension** goes in, and what the
+    /// plan then runs against. `None` for [`ContainerKind::Database`], which is server-level
     /// and has no database to run in — see [`DdlScope::Server`].
     pub database: Option<String>,
     pub dialect: SqlDialect,
@@ -1401,6 +1408,16 @@ pub type RolesDoneFn = Rc<dyn Fn(Vec<String>)>;
 /// this feeds a menu beside a field that stays free text, so an empty list
 /// costs a shortcut and never a value.
 pub type RolesFn = Rc<dyn Fn(u64, RolesDoneFn)>;
+
+/// Hands the fetched `pg_available_extensions` rows back on the UI thread.
+pub type ExtensionsDoneFn = Rc<dyn Fn(Vec<schemaic_core::schema::AvailableExtension>)>;
+
+/// Fetches what the server could install into one database
+/// (`Db::available_extensions`) — the Create extension picker's list. Takes
+/// the database because the view's `installed_version` is the connected
+/// database's. Failure is silent for [`RolesFn`]'s reason: the name field
+/// stays free text.
+pub type ExtensionsFn = Rc<dyn Fn(u64, String, ExtensionsDoneFn)>;
 
 /// Which section of the designer is showing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1749,6 +1766,10 @@ pub struct DdlUi {
     /// form is built, so a late reply needs no rebuild and takes no caret with
     /// it.
     pub roles: RwSignal<Vec<String>>,
+    /// The extensions a database could still install, by name, fetched when the
+    /// Create extension picker opens — its name chevron's list. Same standing
+    /// as `roles`: read when pressed, and empty until the fetch lands.
+    pub extensions: RwSignal<Vec<String>>,
     /// The object editor's target; doubles as its open flag.
     pub object: RwSignal<Option<ObjectTarget>>,
     /// The enum / domain / sequence being edited. Same rule as `draft`: one
@@ -5337,6 +5358,9 @@ pub struct SchemaActions {
     pub trigger_functions: TriggerFnFn,
     /// Read the server's roles, for the database editor's Owner shortcut.
     pub roles: RolesFn,
+    /// Read what the server could install into a database, for the Create
+    /// extension picker.
+    pub extensions: ExtensionsFn,
     /// Read a MySQL trigger's body as written, which `information_schema`
     /// cannot report faithfully.
     pub trigger_source: TriggerSrcFn,

@@ -1392,7 +1392,7 @@ fn user_schema_filter(ns: &str) -> String {
 }
 
 /// Every browsable object in the database, as `(namespace, name, "BASE TABLE" |
-/// "VIEW", comment)` — the list that **decides what exists**, since
+/// "VIEW" | "FOREIGN TABLE", comment)` — the list that **decides what exists**, since
 /// `assemble_schema` builds its tables from it alone and drops every other row
 /// set whose table isn't in it.
 ///
@@ -1419,7 +1419,9 @@ fn user_schema_filter(ns: &str) -> String {
 fn table_list_sql() -> String {
     format!(
         "SELECT n.nspname, c.relname, \
-                CASE WHEN c.relkind IN ('v','m') THEN 'VIEW' ELSE 'BASE TABLE' END, \
+                CASE WHEN c.relkind IN ('v','m') THEN 'VIEW' \
+                     WHEN c.relkind = 'f' THEN 'FOREIGN TABLE' \
+                     ELSE 'BASE TABLE' END, \
                 COALESCE(obj_description(c.oid, 'pg_class'), '') \
          FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
          WHERE c.relkind IN ('r','v','m','p','f') AND {} \
@@ -1520,6 +1522,7 @@ pub(crate) async fn fetch_table_list(db: &Db, database: &str) -> Result<DbSchema
             schema: Some(cell(&r, 0)),
             name: cell(&r, 1),
             is_view: cell(&r, 2) == "VIEW",
+            is_foreign: cell(&r, 2) == "FOREIGN TABLE",
             ..Default::default()
         })
         .collect();
@@ -2441,7 +2444,58 @@ async fn collect_schema(client: &Client) -> Result<DbSchema, DbError> {
         // A quoted identifier is case-sensitive here, and the reader keeps
         // names as the catalogue stores them: compared exactly.
         names_ignore_case: false,
+        extensions: pg_extensions(client).await?,
     })
+}
+
+/// The database's installed extensions (`pg_extension` joined to
+/// `pg_namespace`), by name — `DbSchema::extensions`. Not on the namespace
+/// filter the other reads use: an extension is the database's, and `plpgsql`
+/// lives in `pg_catalog`, which that filter hides.
+fn extension_list_sql() -> &'static str {
+    "SELECT e.extname::text, e.extversion::text, n.nspname::text \
+     FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace \
+     ORDER BY e.extname"
+}
+
+async fn pg_extensions(
+    client: &Client,
+) -> Result<Vec<schemaic_core::schema::ExtensionInfo>, DbError> {
+    Ok(query_all(client, extension_list_sql())
+        .await?
+        .iter()
+        .map(|r| schemaic_core::schema::ExtensionInfo {
+            name: cell(r, 0),
+            version: cell(r, 1),
+            schema: cell(r, 2),
+        })
+        .collect())
+}
+
+/// What the server could install into `database`, with whether that
+/// database already has each — the Create extension picker's list, filtered
+/// by `schema::installable_extensions`. Per database: the view's
+/// `installed_version` is the connected database's.
+pub(crate) async fn available_extensions(
+    db: &Db,
+    database: &str,
+) -> Result<Vec<schemaic_core::schema::AvailableExtension>, DbError> {
+    let client = connect_to(db, database).await?;
+    Ok(query_all(
+        &client,
+        "SELECT name::text, COALESCE(default_version, '')::text, \
+                installed_version::text, COALESCE(comment, '')::text \
+         FROM pg_available_extensions ORDER BY name",
+    )
+    .await?
+    .iter()
+    .map(|r| schemaic_core::schema::AvailableExtension {
+        name: cell(r, 0),
+        default_version: cell(r, 1),
+        installed_version: opt(r, 2),
+        comment: cell(r, 3),
+    })
+    .collect())
 }
 
 /// The database's schemas, empty ones included, on the filter every object
@@ -5850,6 +5904,33 @@ mod table_list_tests {
     fn views_and_matviews_are_both_typed_view() {
         let sql = table_list_sql();
         assert!(sql.contains("IN ('v','m') THEN 'VIEW'"));
+    }
+
+    /// A foreign table arrives typed `FOREIGN TABLE`, not `BASE TABLE`, so
+    /// `assemble_schema` marks it and the menus stop offering the `DROP TABLE`,
+    /// `TRUNCATE` and designer the server refuses on one.
+    #[test]
+    fn a_foreign_table_is_typed_as_one() {
+        let sql = table_list_sql();
+        assert!(
+            sql.contains("WHEN c.relkind = 'f' THEN 'FOREIGN TABLE'"),
+            "{sql}"
+        );
+        let s = |x: &str| x.to_string();
+        let schema = crate::assemble_schema(
+            Some("public"),
+            &[(s("ft"), s("FOREIGN TABLE")), (s("t"), s("BASE TABLE"))],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        assert!(schema.tables[0].is_foreign);
+        assert_eq!(
+            schema.tables[0].shape(),
+            schemaic_core::schema::TableShape::ForeignTable
+        );
+        assert!(!schema.tables[1].is_foreign);
     }
 
     #[test]

@@ -245,6 +245,15 @@ fn create_submenu(
                     crate::ContainerKind::Schema,
                     Some(&db),
                 ),
+                // Into the database the menu was raised on, never into `ns`:
+                // an extension belongs to the database.
+                CreateKind::Extension => crate::database_editor::open_for_extension(
+                    conn,
+                    schema_ui,
+                    ddl,
+                    &actions.extensions,
+                    &db,
+                ),
             })
             .disabled(e.disabled)
         })
@@ -402,7 +411,15 @@ pub(crate) fn object_entries(
             // There is no sequence editor, and the table designer emits the
             // `ALTER TABLE` the server refuses on one — so no entry at all,
             // rather than one that opens a form leading nowhere.
-            TableShape::Sequence => false,
+            //
+            // Nor a foreign-table editor. PostgreSQL takes `ALTER TABLE` on one
+            // for its columns, but refuses its keys and indexes (`cannot create
+            // index on relation`, measured on 16) and the designer has no field
+            // for its server or options — a form that is half refusals. Like
+            // Import and Truncate above, it is not a table for these entries:
+            // the wrapper may be read-only and `TRUNCATE` is the wrapper's to
+            // allow (`file_fdw` refuses it).
+            TableShape::Sequence | TableShape::ForeignTable => false,
         },
         // **The one entry that is about the view's rows rather than its
         // definition.** A plain view stores nothing, so there is nothing to
@@ -544,6 +561,9 @@ pub(crate) enum CreateKind {
     /// A namespace inside the database the menu was raised on — PostgreSQL's
     /// alone (`ddl::supports_namespace_editing`).
     Schema,
+    /// A PostgreSQL extension, installed into the database the menu was raised
+    /// on (`ddl::supports_extensions`) — the picker, not the object editor.
+    Extension,
 }
 
 /// One Create entry as data: its label, what it opens, and whether it is inert.
@@ -641,6 +661,15 @@ pub(crate) fn create_children(
         out.push(CreateEntry {
             label: "Event",
             kind: CreateKind::Object(ObjectKind::Event),
+            disabled: read_only,
+        });
+    }
+    // An extension, on the one engine that has them — the database's own, so
+    // after everything that lives in a namespace and before the containers.
+    if schemaic_core::ddl::supports_extensions(dialect) {
+        out.push(CreateEntry {
+            label: "Extension",
+            kind: CreateKind::Extension,
             disabled: read_only,
         });
     }
@@ -1916,7 +1945,10 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         entries.push(MenuEntry::action("Refresh", move || (rf)(db.clone())));
                     }
                     entries.push(MenuEntry::Separator);
-                    {
+                    // Absent, not dimmed, for an extension: it has no form,
+                    // which no state of the connection changes — the row's
+                    // write is its Drop.
+                    if item.extension().is_none() {
                         let ui = import_ui.clone();
                         let (db, obj) = (database.clone(), item.clone());
                         let read_only = conn_read_only(&connections, active_conn);
@@ -2125,6 +2157,31 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                     &db,
                                     ns.as_deref(),
                                     kind,
+                                );
+                            })
+                            .disabled(conn_read_only(&connections, active_conn)),
+                        );
+                    }
+                    // The Extensions folder's Create is the picker, not the
+                    // object editor (which has no extension form, so
+                    // `creates` is false for it) — the same entry the
+                    // database node's Create submenu carries.
+                    if kind == schemaic_core::ddl::ObjectKind::Extension
+                        && schemaic_core::ddl::supports_extensions(
+                            crate::table_designer::edit_ctx(import_ui.conn).dialect,
+                        )
+                    {
+                        let ui = import_ui.clone();
+                        let db = database.clone();
+                        entries.push(MenuEntry::Separator);
+                        entries.push(
+                            MenuEntry::action("Create extension", move || {
+                                crate::database_editor::open_for_extension(
+                                    ui.conn,
+                                    ui.schema,
+                                    ui.ddl,
+                                    &ui.schema_actions.extensions,
+                                    &db,
                                 );
                             })
                             .disabled(conn_read_only(&connections, active_conn)),
@@ -3252,8 +3309,9 @@ struct PaletteItem {
 /// its normal colour.
 #[derive(Clone, Copy)]
 enum ResultIcon {
-    Table,
-    View,
+    /// A table, view, sequence or foreign table — the glyph and tint the tree
+    /// gives its row (`schema_tree::table_glyph`), so the two cannot drift.
+    Relation(schemaic_core::schema::TableShape),
     Column(schemaic_core::schema::ColumnTypeClass, ColKeyRole),
     /// A PostgreSQL standalone object — enum / domain / sequence. Same glyph and
     /// same muted tint the schema tree gives its row, so the thing you found in
@@ -3276,8 +3334,7 @@ enum ColKeyRole {
 impl ResultIcon {
     fn glyph(self) -> &'static str {
         match self {
-            ResultIcon::Table => icons::TABLE,
-            ResultIcon::View => icons::TABLE_CELLS_MERGE,
+            ResultIcon::Relation(shape) => crate::schema_tree::table_glyph(shape).0,
             ResultIcon::Column(class, _) => crate::schema_tree::column_type_icon(class),
             ResultIcon::Object(kind) => crate::schema_tree::object_icon(kind),
             ResultIcon::Snippet => icons::BOOKMARK,
@@ -3285,8 +3342,7 @@ impl ResultIcon {
     }
     fn color(self) -> floem::peniko::Color {
         match self {
-            ResultIcon::Table => theme::table_icon(),
-            ResultIcon::View => theme::view_icon(),
+            ResultIcon::Relation(shape) => (crate::schema_tree::table_glyph(shape).1)(),
             // The tree's object rows, which are muted at the same alpha.
             ResultIcon::Object(_) => theme::text_muted().multiply_alpha(0.7),
             // The accent, and the only row here that gets it: a snippet is the
@@ -3307,11 +3363,7 @@ impl ResultIcon {
 
 /// The result icon for a table/view (schema-tree parity).
 fn table_result_icon(t: &schemaic_core::schema::TableInfo) -> ResultIcon {
-    if t.is_view {
-        ResultIcon::View
-    } else {
-        ResultIcon::Table
-    }
+    ResultIcon::Relation(t.shape())
 }
 
 /// The result icon for a column: its type family, tinted by key role (PK / FK /
@@ -6025,14 +6077,17 @@ fn body_matches_across<'a>(
                     is_palette_target(&item).then(|| ResultIcon::Object(item.kind()))
                 };
                 let icon = match &hit.owner {
-                    BodyOwner::View { .. } => ResultIcon::View,
+                    BodyOwner::View { .. } => {
+                        ResultIcon::Relation(schemaic_core::schema::TableShape::View)
+                    }
                     BodyOwner::Routine(r) => object(ObjectItem::Routine(r.clone()))?,
                     BodyOwner::Event(e) => object(ObjectItem::Event(e.clone()))?,
                     BodyOwner::Trigger {
                         schema: ns, table, ..
-                    } => schema
-                        .find_table(ns.as_deref(), table)
-                        .map_or(ResultIcon::Table, table_result_icon),
+                    } => schema.find_table(ns.as_deref(), table).map_or(
+                        ResultIcon::Relation(schemaic_core::schema::TableShape::Table),
+                        table_result_icon,
+                    ),
                 };
                 Some(BodyFindHit {
                     database: database.to_string(),
@@ -6325,6 +6380,30 @@ mod object_menu_tests {
         // assertions above are about the shape and not about the dialect.
         let t = object_entries(Shape::Table, MySql, false);
         assert!(t.import && t.truncate && t.edit);
+    }
+
+    /// **A PostgreSQL foreign table is offered what its server takes.** Its
+    /// Drop is `DROP FOREIGN TABLE` and is offered; the designer (whose keys
+    /// and indexes the server refuses on one), Truncate (`file_fdw` refuses
+    /// it), Import and triggers are not — and neither are its columns' and
+    /// keys' shortcuts, which open the same designer.
+    #[test]
+    fn a_foreign_table_offers_its_drop_and_not_the_designer() {
+        let e = object_entries(Shape::ForeignTable, Postgres, false);
+        assert!(e.drop, "DROP FOREIGN TABLE is offered");
+        assert!(!e.edit && !e.truncate && !e.import && !e.triggers);
+        assert!(!e.refresh_view);
+        assert_eq!(
+            super::object_drop_change(Shape::ForeignTable, false),
+            schemaic_core::ddl::Change::DropForeignTable
+        );
+        let f = super::field_entries(Postgres, Shape::ForeignTable);
+        assert!(!f.edit && !f.drop);
+        let k = super::key_entries(Postgres, None, Shape::ForeignTable);
+        assert!(!k.edit && !k.drop_index && !k.drop_foreign_key);
+        // The premise: a PostgreSQL table offers all of them.
+        let t = object_entries(Shape::Table, Postgres, false);
+        assert!(t.edit && t.truncate && t.drop);
     }
 
     /// The column and index shortcuts are the second door into the same
@@ -6625,6 +6704,8 @@ mod create_menu_tests {
                 "Sequence",
                 "Function",
                 "Procedure",
+                // The database's own, after everything in a namespace.
+                "Extension",
                 // The containers last — everything above makes something inside
                 // the node the menu was raised on, and these two do not.
                 "Database",
@@ -6645,10 +6726,20 @@ mod create_menu_tests {
                 CreateKind::Object(ObjectKind::Sequence),
                 CreateKind::Object(ObjectKind::Function),
                 CreateKind::Object(ObjectKind::Procedure),
+                CreateKind::Extension,
                 CreateKind::Database,
                 CreateKind::Schema,
             ]
         );
+    }
+
+    /// **An extension is PostgreSQL's alone** (`ddl::supports_extensions`), so
+    /// the entry is absent elsewhere rather than dimmed.
+    #[test]
+    fn only_postgres_is_offered_an_extension() {
+        for d in [SqlDialect::MySql, SqlDialect::Sqlite, SqlDialect::MsSql] {
+            assert!(!labels(d).contains(&"Extension"), "{d:?}");
+        }
     }
 
     /// **A namespace is offered where `CREATE SCHEMA` makes one** — PostgreSQL
@@ -7947,7 +8038,9 @@ fn ",
             // rewrites the view's stored rows on the server. A materialized
             // view's menu carries both, and this table is what keeps them on
             // opposite sides of the separator.
-            CREATE_SUBMENU | "Create {}" | "Import" | "Edit table" | "Edit view"
+            // `Create extension` is the Extensions folder's `Create {}`: the
+            // picker rather than the object editor, spelled as a literal.
+            CREATE_SUBMENU | "Create {}" | "Create extension" | "Import" | "Edit table" | "Edit view"
             | "Edit column" | "Edit index" | "Edit primary key" | "Edit foreign key"
             | "Edit {}" | "Triggers" | "Refresh view" | "Truncate" | "Drop" | "Drop index"
             | "Drop foreign key" => 4,

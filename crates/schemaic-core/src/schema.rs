@@ -314,7 +314,9 @@ pub struct IndexInfo {
 /// table" side and was offered every table action there is. Passing `is_view =
 /// true` for one would be no better — it is not a view either, and the
 /// view-only entries (triggers, refresh, *Edit view*) would light up instead.
-/// Three states, so a caller has to say which of the three it means.
+/// Separate states, so a caller has to say which one it means — and a fourth,
+/// PostgreSQL's foreign table, had to answer at every one of them when it
+/// arrived.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TableShape {
     #[default]
@@ -323,6 +325,8 @@ pub enum TableShape {
     /// MariaDB's `CREATE SEQUENCE`, which the catalogue lists as a table. See
     /// [`TableInfo::is_sequence`].
     Sequence,
+    /// PostgreSQL's `CREATE FOREIGN TABLE`. See [`TableInfo::is_foreign`].
+    ForeignTable,
 }
 
 impl IndexInfo {
@@ -1447,6 +1451,18 @@ pub struct TableInfo {
     /// SQLite, where a sequence is not a table at all — PostgreSQL's are
     /// modelled properly, in [`DbSchema::sequences`].
     pub is_sequence: bool,
+    /// True for a **PostgreSQL foreign table** (`pg_class.relkind = 'f'`) —
+    /// rows read through a foreign-data wrapper from somewhere else.
+    ///
+    /// It was read as a base table, and the server treats it as one only in
+    /// part. Measured on PostgreSQL 16 over `file_fdw`: `ALTER TABLE` renames
+    /// it and adds a column, but `DROP TABLE` is refused (*"is not a table"*,
+    /// `DROP FOREIGN TABLE` being the statement), and so are `TRUNCATE` and
+    /// `CREATE INDEX` — so the menus offered a red Drop that could only fail,
+    /// and a designer whose keys and indexes the server refuses.
+    /// [`TableInfo::shape`] answers [`TableShape::ForeignTable`] for one.
+    /// Always `false` on the other engines.
+    pub is_foreign: bool,
     /// The name of a row identity this table has that is **not one of its
     /// columns** — SQLite's `rowid`, and nothing on MySQL or PostgreSQL, where
     /// every way of naming a row is a column. `None` for a table that has none,
@@ -5147,6 +5163,9 @@ pub enum ObjectItem {
     /// `Sequence`'s, whose model is PostgreSQL's `i64` counters and whose
     /// emitters write PostgreSQL's grammar.
     Tsql(TsqlObject),
+    /// A PostgreSQL extension ([`DbSchema::extensions`]) — the database's, so
+    /// it carries no namespace of its own ([`ExtensionInfo`]).
+    Extension(ExtensionInfo),
 }
 
 impl ObjectItem {
@@ -5158,6 +5177,7 @@ impl ObjectItem {
             ObjectItem::Routine(r) => crate::ddl::ObjectKind::of_routine(r.kind),
             ObjectItem::Event(_) => crate::ddl::ObjectKind::Event,
             ObjectItem::Tsql(t) => t.object_kind(),
+            ObjectItem::Extension(_) => crate::ddl::ObjectKind::Extension,
         }
     }
 
@@ -5188,6 +5208,7 @@ impl ObjectItem {
             ObjectItem::Routine(r) => &r.name,
             ObjectItem::Event(e) => &e.name,
             ObjectItem::Tsql(t) => &t.name,
+            ObjectItem::Extension(x) => &x.name,
         }
     }
 
@@ -5199,6 +5220,9 @@ impl ObjectItem {
             ObjectItem::Routine(r) => r.schema.as_deref(),
             ObjectItem::Event(e) => e.schema.as_deref(),
             ObjectItem::Tsql(t) => t.schema.as_deref(),
+            // The database's own: where it installed its objects is not its
+            // address — see `ExtensionInfo`.
+            ObjectItem::Extension(_) => None,
         }
     }
 
@@ -5206,6 +5230,14 @@ impl ObjectItem {
     pub fn tsql(&self) -> Option<&TsqlObject> {
         match self {
             ObjectItem::Tsql(t) => Some(t),
+            _ => None,
+        }
+    }
+
+    /// The PostgreSQL extension behind this item, when it is one.
+    pub fn extension(&self) -> Option<&ExtensionInfo> {
+        match self {
+            ObjectItem::Extension(x) => Some(x),
             _ => None,
         }
     }
@@ -5287,6 +5319,7 @@ impl ObjectItem {
             // [`EventInfo::detail`].
             ObjectItem::Event(e) => e.detail(),
             ObjectItem::Tsql(t) => t.detail(),
+            ObjectItem::Extension(x) => x.detail(),
         }
     }
 
@@ -5393,6 +5426,7 @@ impl ObjectItem {
             ),
             // The dump's own builder: one statement, terminated.
             ObjectItem::Tsql(t) => t.create_sql(),
+            ObjectItem::Extension(x) => x.create_sql(dialect),
         }
     }
 }
@@ -5406,6 +5440,8 @@ impl TableInfo {
             TableShape::View
         } else if self.is_sequence {
             TableShape::Sequence
+        } else if self.is_foreign {
+            TableShape::ForeignTable
         } else {
             TableShape::Table
         }
@@ -5475,6 +5511,17 @@ impl TableInfo {
                 "-- {cname} is a sequence. Schemaic reads its definition from the row, not the\n\
                  -- catalogue, so this script cannot restate it. Copy it from\n\
                  -- `SHOW CREATE SEQUENCE {cname}` on the source server."
+            );
+        }
+        // **A foreign table's columns are not its definition either**: what
+        // makes it one is the server and options it reads through, which this
+        // model does not hold. A `CREATE TABLE` restored an empty local table
+        // under the same name, so the script says what it cannot restate.
+        if self.is_foreign {
+            return format!(
+                "-- {cname} is a foreign table. Schemaic does not read its server or\n\
+                 -- options, so this script cannot restate it. Copy it from\n\
+                 -- `pg_dump --schema-only --table` on the source server."
             );
         }
         if self.is_view {
@@ -6290,6 +6337,94 @@ pub struct DbSchema {
     /// `rule_object_id`) — what a dump's `CREATE TYPE` does not restate, so
     /// its header names them. Empty on every other engine.
     pub tsql_type_bindings: Vec<TsqlTypeBinding>,
+    /// **PostgreSQL's installed extensions** (`pg_extension`) — empty on every
+    /// other engine, none of which has the object. See [`ExtensionInfo`].
+    pub extensions: Vec<ExtensionInfo>,
+}
+
+/// One installed PostgreSQL extension (`pg_extension` joined to
+/// `pg_namespace`).
+///
+/// **The database's, not a namespace's.** An extension's name is unique in its
+/// database and `DROP EXTENSION` takes no schema; `schema` is only where it put
+/// its objects (`extnamespace`), so it is a detail the tree shows, never part of
+/// the address. That is why [`ObjectItem::schema`] answers `None` for one and
+/// the tree files the Extensions folder under the database rather than under
+/// whichever namespace it installed into (`ObjectKind::is_database_wide`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExtensionInfo {
+    pub name: String,
+    /// `extversion`, as the catalogue spells it (`1.6`).
+    pub version: String,
+    /// The namespace its objects went into (`public`, `pg_catalog` for
+    /// `plpgsql`).
+    pub schema: String,
+}
+
+impl ExtensionInfo {
+    /// The tree row's summary: its version, and where its objects live.
+    pub fn detail(&self) -> String {
+        match (self.version.is_empty(), self.schema.is_empty()) {
+            (false, false) => format!("{} · {}", self.version, self.schema),
+            (false, true) => self.version.clone(),
+            (true, false) => self.schema.clone(),
+            (true, true) => String::new(),
+        }
+    }
+
+    /// Its `CREATE` as a reader copies it — the statement the Create
+    /// extension picker emits ([`crate::ddl::create_extension`]) with the
+    /// namespace it went into, so the copy installs it where this one is. No
+    /// `VERSION`: the target server ships its own default, and pinning one it
+    /// may not have is a refusal for a detail nobody chose.
+    pub fn create_sql(&self, dialect: crate::intel::SqlDialect) -> String {
+        let schema = if self.schema.is_empty() {
+            String::new()
+        } else {
+            format!(" SCHEMA {}", ddl_ident_in(&self.schema, dialect))
+        };
+        format!(
+            "CREATE EXTENSION {}{schema};",
+            ddl_ident_in(&self.name, dialect)
+        )
+    }
+}
+
+/// One row of `pg_available_extensions` — what the server could install, and
+/// whether this database already has it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AvailableExtension {
+    pub name: String,
+    /// The version `CREATE EXTENSION` installs when it names none.
+    pub default_version: String,
+    /// `Some` when the database already has it installed.
+    pub installed_version: Option<String>,
+    /// The extension's own one-line description, as the server ships it.
+    pub comment: String,
+}
+
+/// The extensions the Create extension picker offers: what the server ships and
+/// this database does not have yet, by name.
+///
+/// A name `installed` lists is left out as well as one the row itself marks
+/// installed, so a picker opened against a catalogue read a moment before a
+/// `CREATE EXTENSION` elsewhere offers neither copy of the answer. Sorted and
+/// de-duplicated, because the view lists one row per name and a server with
+/// two control files of one name is the server's mistake to report, not this
+/// list's to repeat.
+pub fn installable_extensions(
+    available: &[AvailableExtension],
+    installed: &[ExtensionInfo],
+) -> Vec<AvailableExtension> {
+    let mut out: Vec<AvailableExtension> = available
+        .iter()
+        .filter(|a| a.installed_version.is_none())
+        .filter(|a| !installed.iter().any(|i| i.name == a.name))
+        .cloned()
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out.dedup_by(|a, b| a.name == b.name);
+    out
 }
 
 /// An alias type's bound default and rule, by their qualified names — the
@@ -6862,6 +6997,8 @@ impl DbSchema {
                 .events
                 .iter()
                 .any(|e| keep(e.schema.as_deref(), &e.name)),
+            // No namespace, as `ObjectItem::schema` answers for one.
+            K::Extension => self.extensions.iter().any(|x| keep(None, &x.name)),
         }
     }
 
@@ -6926,6 +7063,13 @@ impl DbSchema {
                 .cloned()
                 .map(ObjectItem::Event)
                 .collect(),
+            K::Extension => self
+                .extensions
+                .iter()
+                .filter(|x| keep(None, &x.name))
+                .cloned()
+                .map(ObjectItem::Extension)
+                .collect(),
         }
     }
 
@@ -6957,9 +7101,15 @@ impl DbSchema {
     /// The question behind the tree's "No tables" hint, which asked it by
     /// building every group's owned list and testing `.is_empty()`. `None`
     /// means the flat case — any object anywhere in the database.
+    ///
+    /// **Not a database-wide one** (`ObjectKind::is_database_wide`): every
+    /// PostgreSQL database has `plpgsql` installed, so counting extensions
+    /// here took the "No tables" hint off every empty database. The tree shows
+    /// that folder beside the hint instead.
     pub fn has_objects_in(&self, schema: Option<Option<&str>>) -> bool {
         crate::ddl::ObjectKind::ALL
             .into_iter()
+            .filter(|k| !k.is_database_wide())
             .any(|k| match schema {
                 Some(ns) => self.objects_any(k, &|s, _| s == ns),
                 None => self.objects_any(k, &|_, _| true),
@@ -7021,6 +7171,14 @@ impl DbSchema {
                 .find_event(schema, name)
                 .cloned()
                 .map(ObjectItem::Event),
+            // By name alone, whatever namespace is asked: one name is one
+            // extension in a database.
+            crate::ddl::ObjectKind::Extension => self
+                .extensions
+                .iter()
+                .find(|x| x.name == name)
+                .cloned()
+                .map(ObjectItem::Extension),
         }
     }
 
@@ -9501,6 +9659,134 @@ mod tests {
         assert_eq!(of(true, true).shape(), TableShape::View);
         // A default `TableInfo` — what every hand-built draft is — is a table.
         assert_eq!(TableInfo::default().shape(), TableShape::Table);
+    }
+
+    /// A PostgreSQL foreign table is its own shape — not a table, whose Drop,
+    /// Truncate and designer the server refuses on one.
+    #[test]
+    fn a_foreign_table_is_its_own_shape() {
+        let ft = TableInfo {
+            name: "ft".into(),
+            schema: Some("public".into()),
+            is_foreign: true,
+            ..Default::default()
+        };
+        assert_eq!(ft.shape(), TableShape::ForeignTable);
+    }
+
+    /// **A foreign table's script says what it cannot restate** rather than
+    /// writing a `CREATE TABLE`: restored, that made an empty local table where
+    /// the wrapper's view of another server's rows had been, under the same
+    /// name, and nothing said so. Every line is a comment, so a dump holding it
+    /// still runs; the name is comment-safed, as the sequence's is.
+    #[test]
+    fn a_foreign_tables_script_is_a_note_not_a_create_table() {
+        let ft = TableInfo {
+            name: "ft\nDROP DATABASE prod; --".into(),
+            schema: Some("public".into()),
+            is_foreign: true,
+            columns: vec![ColumnInfo {
+                name: "a".into(),
+                type_name: "integer".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let ddl = ft.create_ddl(crate::intel::SqlDialect::Postgres);
+        assert!(!ddl.contains("CREATE TABLE"), "{ddl}");
+        assert!(ddl.contains("foreign table"), "{ddl}");
+        assert!(
+            ddl.lines().all(|l| l.trim_start().starts_with("--")),
+            "{ddl}"
+        );
+    }
+
+    /// An extension is the **database's**: it lists in the flat folder and by
+    /// name, never under the namespace it installed into, and it is not a
+    /// reason to drop the "No tables" hint — `plpgsql` is in every database.
+    #[test]
+    fn an_extension_belongs_to_the_database_not_a_namespace() {
+        use crate::ddl::ObjectKind;
+        let s = DbSchema {
+            extensions: vec![ExtensionInfo {
+                name: "citext".into(),
+                version: "1.6".into(),
+                schema: "public".into(),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(s.objects_all(ObjectKind::Extension).len(), 1);
+        assert!(
+            s.objects_in(Some("public"), ObjectKind::Extension)
+                .is_empty()
+        );
+        assert!(!s.any_object_in_matches(Some("public"), "cit"));
+        assert!(s.any_object_matches("cit"));
+        assert_eq!(
+            s.objects_matching(ObjectKind::Extension, "cit").len(),
+            1,
+            "Find Anywhere reaches it"
+        );
+        assert!(!s.has_objects_in(None), "the hint still shows");
+        assert!(!s.has_objects_in(Some(Some("public"))));
+        let found = s
+            .find_object(None, ObjectKind::Extension, "citext")
+            .expect("found by name");
+        assert_eq!(found.schema(), None);
+        assert_eq!(found.kind(), ObjectKind::Extension);
+        assert_eq!(found.detail(), "1.6 · public");
+        assert!(
+            s.find_object(Some("public"), ObjectKind::Extension, "citext")
+                .is_some(),
+            "a remembered hit carrying a namespace still resolves"
+        );
+    }
+
+    /// An extension's copied `CREATE` installs it where it is: the name and the
+    /// namespace quoted by the one quoter, no version pinned.
+    #[test]
+    fn an_extensions_create_names_its_schema_and_no_version() {
+        let x = ExtensionInfo {
+            name: "uuid-ossp".into(),
+            version: "1.1".into(),
+            schema: "public".into(),
+        };
+        assert_eq!(
+            ObjectItem::Extension(x).create_sql(crate::intel::SqlDialect::Postgres),
+            r#"CREATE EXTENSION "uuid-ossp" SCHEMA "public";"#
+        );
+    }
+
+    /// The picker's list: what is not installed, by name, sorted, once each.
+    #[test]
+    fn installable_extensions_leave_out_what_is_installed() {
+        let a = |name: &str, installed: Option<&str>| AvailableExtension {
+            name: name.into(),
+            default_version: "1.0".into(),
+            installed_version: installed.map(str::to_string),
+            comment: String::new(),
+        };
+        let installed = vec![ExtensionInfo {
+            name: "hstore".into(),
+            version: "1.8".into(),
+            schema: "public".into(),
+        }];
+        let available = vec![
+            a("pg_trgm", None),
+            a("plpgsql", Some("1.0")),
+            // Installed a moment ago, by the catalogue the tree read — the
+            // view's row is stale, the tree's is not.
+            a("hstore", None),
+            a("citext", None),
+            a("citext", None),
+        ];
+        let names: Vec<String> = installable_extensions(&available, &installed)
+            .into_iter()
+            .map(|x| x.name)
+            .collect();
+        assert_eq!(names, ["citext", "pg_trgm"]);
+        assert!(installable_extensions(&[], &installed).is_empty());
+        assert!(installable_extensions(&[a("plpgsql", Some("1.0"))], &[]).is_empty());
     }
 
     #[test]

@@ -7638,6 +7638,42 @@ existing prose was left alone.
     SQLite has no stored routines at all — a function there is registered by the host program,
     not stored in the database — so its arms are absent from `supports_change`,
     `supports_routine_editing` is false, and the tree grows no folder and the Create menu no entry.
+    **`ObjectKind::Extension` is PostgreSQL's extension**, the last of `ObjectKind::ALL` (label
+    *extension*, folder *Extensions*, keyword `EXTENSION`), and the first kind that belongs to the
+    **database** rather than a namespace — `ObjectKind::is_database_wide`, an exhaustive `match` with
+    it alone on `true`, is what the tree's folder placement and `DbSchema::has_objects_in` ask
+    (under `schema.rs`). Its create is `Change::CreateExtension { name }`, built by
+    `create_extension(name, dialect)` against the name and no namespace and emitted by
+    `object_statements` as `CREATE EXTENSION "name";` — no `SCHEMA`, `VERSION` or `CASCADE`: the
+    server installs its default version into the first schema on the path, and an extension that
+    needs another installed first is refused by name, which is the plan's answer. Its drop is the
+    shared `DropObject` through `drop_item` (`uses_shared_changes` is true for it), `DROP EXTENSION
+    "name";`, never `CASCADE` for `DROP SCHEMA`'s reason; the risk sentence says the server refuses
+    while anything still depends on it — a column of its type, an index, a server on its wrapper
+    — and names what (measured on 16: `file_fdw` with a server on it is refused, naming the server
+    and the foreign table behind it). **`supports_change` asks two new early arms, both ahead of
+    the blanket "everything but SQLite"**, which would otherwise have admitted MySQL: a
+    `RenameObject` of an extension is refused on every engine, `ALTER EXTENSION` naming nothing new;
+    and `CreateExtension`, `DropForeignTable` and the extension's `DropObject`/`SetObjectComment`
+    are PostgreSQL's alone through an exhaustive dialect `match` — objects the other three cannot
+    hold, not arms they lack. `supports_extensions(dialect)` is the capability every menu asks,
+    computed from `supports_change` over the create and the drop, as `supports_namespace_editing`
+    is, so the entry and the plan cannot disagree (`extensions_are_postgresqls_alone`, which also
+    asserts the refused sets emit nothing). **`supports_object_creation(_, Extension)` is false**,
+    because there is no `ObjectDraft` for one (`from_item`/`blank` answer `None`): the folder's
+    Create and the Create ▸ entry open the picker in `database_editor.rs`, gated on
+    `supports_extensions` instead (`an_extension_has_no_rename_and_no_object_form`,
+    `an_extension_is_created_by_name_alone`, `an_extension_is_dropped_by_name_without_cascade`;
+    live, `pg_catalog::an_extension_is_created_and_dropped_through_its_plans` installs `pg_trgm`
+    through the emitted plans via `Db::run_ddl` and reads it back, the picker's list before and
+    after, and has `citext`'s drop refused with *"depend"* while a column is of its type).
+    **`Change::DropForeignTable` is a foreign table's drop**, `DROP FOREIGN TABLE <qname>;` from
+    `emit_postgres`, since PostgreSQL refuses `DROP TABLE` on one (`TableShape::ForeignTable`, under
+    `schema.rs`). Destructive all the same — the definition, its server and options go and nothing
+    here can restate them — though its risk sentence says the rows stay where the wrapper reads
+    them (`a_foreign_table_is_dropped_as_one`; live,
+    `pg_catalog::a_foreign_table_is_read_and_dropped_as_one`, over a `postgres_fdw` server, has
+    `DROP TABLE` refused and this land).
 
     **MySQL's scheduled events** — `EventDraft` → `diff_event` → `event_alter_clauses` → the same
     preview — are the fourth browsable object kind, and the one whose shape is dictated by what
@@ -8391,6 +8427,17 @@ existing prose was left alone.
     for. **Measured on MariaDB 10.11.14**: a sequence reports `TABLE_TYPE = SEQUENCE` with eight
     counter columns, `DROP TABLE sq1` on one *succeeds*, and `CREATE TABLE sq2 (…)` over an existing
     sequence is ERROR 1050.
+    **A PostgreSQL foreign table takes the same road one step removed.** It keys `f:`, so it never
+    pairs with a same-named table and is never planned as that table's alter; it is filed under
+    `CompareKind::Table`, which is where the tree shows it; and its change set is empty, so it is
+    disclosed in `omitted` as a sequence is. The model holds its columns and not its server or
+    options, so the only statements the table arms could write are a `CREATE TABLE` making an empty
+    local table where the wrapper's rows were, and an `ALTER` or `DROP TABLE` the server refuses on
+    one (`a_foreign_table_is_disclosed_not_planned`). **Extensions are not compared at all**:
+    installing one is a server-side act — its control files must be on the target's disk — rather
+    than a definition a plan can restate, and the comparison does not read the two sides' lists.
+    `a_compare_group_is_named_as_the_tree_names_it` names `ObjectKind::Extension` as the one kind
+    with no comparison group, so the next kind cannot slip through the same exemption unnoticed.
     **An unreadable view is a real producer of that path now, as is a routine**: a SQL Server
     *source* view or routine the server shows no text for (`WITH ENCRYPTION`) or whose header the
     walk could not hold (`verbatim`) gets the empty set — the same two the editor refuses
@@ -8583,6 +8630,9 @@ existing prose was left alone.
     nothing to say about. Leaving it out costs the diagram nothing, since it can be neither end of
     an edge. `a_sequence_is_left_out_of_the_diagram_entirely` pins the node set, the island list and
     the table-seeded case, where naming a sequence as the seed now yields an empty graph.
+    A PostgreSQL **foreign table** is drawable and is drawn as the table it reads as
+    (`NodeKind::Table`), its columns being real ones. The `match` on
+    `shape()` names all four shapes rather than taking a `_`, so a fifth is a compile error there.
     `fit_toolbar` is the diagram **toolbar's responsive rule**, and it is here rather than in the
     view because it is arithmetic over widths: given the room available and what each optional
     group costs, it drops them in a fixed priority order — the count pills, then the zoom stepper,
@@ -11156,6 +11206,22 @@ existing prose was left alone.
     partition below. `is_view` and `is_sequence` stay public because the three backends fill them
     directly and privatising them needs a constructor first; what they are not is the question a
     decision asks.
+    **`TableShape::ForeignTable` is the fourth answer, and it arrived the same way the third did.**
+    PostgreSQL's `table_list_sql` already listed `relkind = 'f'` but typed it `BASE TABLE`, so a
+    foreign table was indistinguishable from a table: it was offered Edit table, Truncate, Import
+    and triggers, and its Drop emitted `DROP TABLE`, which PostgreSQL 16 refuses (*"is not a
+    table"*, hinting `DROP FOREIGN TABLE`). Measured on 16 over `file_fdw`: `ALTER TABLE`'s rename
+    and `ADD COLUMN` and `COMMENT ON TABLE` succeed on one, while `DROP TABLE`, `TRUNCATE` and
+    `CREATE INDEX` are refused. `TableInfo::is_foreign` carries it (false on every other engine),
+    and `shape()` answers it after view and sequence. `create_ddl` for one is a comment-only note
+    with the name comment-safed, as the MariaDB-sequence arm's is, rather than a `CREATE TABLE`:
+    the model holds the columns and not the server or options, and restored, a `CREATE TABLE` made
+    an empty local table under the name where the wrapper's rows had been
+    (`a_foreign_table_is_its_own_shape`, `a_foreign_tables_script_is_a_note_not_a_create_table`).
+    The consumers follow under their own modules: its drop is `ddl::Change::DropForeignTable`
+    (`stats::drop_change`), the comparison keys it apart and plans nothing for it, the diagram
+    draws it as a table, and the tree and the palette give it `schema_tree::table_glyph`'s
+    `EXTERNAL_LINK`.
     **`IndexInfo::identifies_a_row` is the one answer to "does this index name a row", and it is not
     "is it unique"** — the question three parts of the app ask and used to answer three ways. Unique,
     not a foreign key, not partial (a `WHERE deleted_at IS NULL` promises uniqueness only over the
@@ -11784,6 +11850,26 @@ existing prose was left alone.
     without reopening what the tree settled: no bodies, no arguments, no settings, nothing the
     Functions folder would then have to hide again. See `intel.rs` above for the measurement, and
     `db/pg.rs`'s `extension_routine_names` for the query.
+    **`DbSchema::extensions` is the extensions themselves** — `ExtensionInfo { name, version,
+    schema }`, PostgreSQL's alone and empty on the other three engines, browsed as
+    `ObjectItem::Extension` (`ObjectItem::extension()` asks whether a row is one). **An extension
+    is the database's, not a namespace's**: its name is unique in its database and `DROP EXTENSION`
+    takes no schema, so `schema` is only where its objects went (`extnamespace`) — a detail the
+    row's `detail()` shows as `<version> · <schema>`, never part of the address. `ObjectItem::schema`
+    therefore answers `None` for one, `objects_any`/`objects_where` see it with no namespace (so it
+    lists in a flat folder and never under the namespace it installed into), and `find_object`
+    finds it by name whatever namespace is asked. Its `create_sql` is `CREATE EXTENSION "x" SCHEMA
+    "s";` — the picker's statement plus the namespace, so a copy installs it where this one is —
+    and deliberately no `VERSION`, since pinning one the target may not ship is a refusal for a
+    detail nobody chose (`an_extensions_create_names_its_schema_and_no_version`).
+    **`has_objects_in` skips the database-wide kinds** (`ddl::ObjectKind::is_database_wide`), and
+    that is load-bearing: every PostgreSQL database has `plpgsql`, so counting it took the tree's
+    "No tables" hint off every empty database (`an_extension_belongs_to_the_database_not_a_namespace`
+    pins both halves). `AvailableExtension` is one row of `pg_available_extensions`, and
+    `installable_extensions(available, installed)` is the Create extension picker's list: a row
+    the view marks installed is dropped, **and so is any name `installed` lists**, so a picker
+    opened against a tree read a moment before a `CREATE EXTENSION` elsewhere offers neither copy
+    of the answer; sorted and de-duplicated (`installable_extensions_leave_out_what_is_installed`).
     **`SchemaState::begin_refresh` is why a refresh doesn't blank the tree.** Re-introspection
     is whole-database on both engines and always will be — the cost is ~10 catalogue
     round-trips, not the rows, so scoping it to one table would optimise the term that doesn't
@@ -14220,7 +14306,10 @@ existing prose was left alone.
       every file written before objects were searchable still loads): a type and a table may share
       a name in one namespace and are different places to go back to. The three SQL Server tags
       went unwritten while the palette did not offer those objects — both `push` sites are its — and
-      are written now that it does (under `object_editor.rs`). The tag is a **persisted** enum of its own rather than `ddl::ObjectKind` so a kind
+      are written now that it does (under `object_editor.rs`). PostgreSQL's extension has a tag
+      too, persisted as `extension`, so `ObjectTag::of` stays total over `ObjectKind`; nothing
+      writes it today, the palette offering no extension (`is_editable_object` answers no for one).
+      The tag is a **persisted** enum of its own rather than `ddl::ObjectKind` so a kind
       written by a newer build degrades instead of failing the file and losing every connection's
       history, the rule `SshAuth`/`Environment` follow; it resolves to no live kind, so the row is
       dropped from the recents list exactly as an entry for a since-renamed table is. `Unknown`
@@ -14964,11 +15053,17 @@ existing prose was left alone.
         `drop_warning` over the risks — handed to `preview_change_warning` as one closure. The
         property is pinned rather than the strings: for every shape on every engine that takes its
         drop, the line's noun is the warning's (`a_drops_line_and_warning_name_the_same_object`,
-        R2-L6-02). And **every drop a Drop entry routes carries a warning** — the tree's three
-        shapes, each object kind's row drop, a numbered and a plain routine, an event, a database,
+        R2-L6-02). And **every drop a Drop entry routes carries a warning** — every table-shaped
+        row, each object kind's row drop, a numbered and a plain routine, an event, a database,
         a schema and each account kind — since `Change::risks` ends in a catch-all `Vec::new()`
         and the confirm with the non-blank fallback that once caught an emptied arm is gone
-        (`every_drop_a_drop_entry_routes_carries_a_warning`, R2-L6-01). **Truncate
+        (`every_drop_a_drop_entry_routes_carries_a_warning`, R2-L6-01). **A PostgreSQL foreign
+        table is the fourth shape** (`TableShape::ForeignTable`, under `schema.rs`): `drop_change`
+        gives it `Change::DropForeignTable`, since the server refuses `DROP TABLE` on one, and
+        `drop_summary`/`drop_warning` keep that change's own line and risk — which already name a
+        foreign table — with no row figure, the rows not being here to count. Both pins above walk
+        it, and the first is why its risk opens *"Drops the foreign table:"* — worded *"Drops the
+        foreign table's definition."*, its noun was not the line's. **Truncate
         keeps its confirm-then-preview**: it is not a drop, and `truncate_prompt` is its question.
       - **`SchemaStats` carries a lookup index and its `tables` are private**, because the badge
         lookup is per *row* of the schema tree and one landing invalidates every badge in the
@@ -15573,6 +15668,21 @@ existing prose was left alone.
   it either, a draft whose comment matches the empty read raising no change at all. Found by
   writing the live tier's `a_table_comment_lands_and_reads_back`, which failed on exactly that
   before the four-line read was added.
+  **Its third column types `relkind = 'f'` as `FOREIGN TABLE`.** The query already listed foreign
+  tables and typed them `BASE TABLE`, so nothing downstream could tell one from a table and every
+  table action was offered on it, `DROP TABLE` included, which the server refuses on one.
+  `assemble_schema` (under `lib.rs`) and `pg::fetch_table_list` both set `TableInfo::is_foreign`
+  off that value, so the first-paint list and the full read agree (`a_foreign_table_is_typed_as_one`;
+  live, `a_foreign_table_is_read_and_dropped_as_one` asserts both reads). What follows from the
+  shape is under `schema.rs`'s `TableShape`.
+  **`pg_extensions` fills `DbSchema::extensions`** from `pg_extension` joined to `pg_namespace` for
+  `extnamespace`, and is **deliberately not on `user_schema_filter`**: an extension is the
+  database's rather than a namespace's, and `plpgsql` lives in `pg_catalog`, which that filter
+  hides. `pg::available_extensions(db, database)` reads `pg_available_extensions` on a connection
+  to that database — the view's `installed_version` is the connected database's — behind
+  `Db::available_extensions(database)`, which answers empty on the other three engines and has
+  `Db::roles`' standing: it feeds a shortcut beside a free-text field, so a failure costs the
+  picker's chevron and never the name.
   **`index_list_sql` reports one row per key position, and its `lossy` term is what the model
   admits it did not read.** It was a non-default opclass and a non-default `indoption`; it is now
   also `ic.reloptions IS NOT NULL` (a storage parameter such as `fillfactor`, which nothing had
@@ -24377,7 +24487,10 @@ existing prose was left alone.
     while there was no form for one, and since the palette's gate delegates here, Find-Anywhere
     withheld them while the tree's filter found them. They have a form now, the `item.tsql()`
     exclusion is gone, and the palette offers them again — the divergence the schema-search
-    invariant records has ended (under *Architecture invariants*).
+    invariant records has ended (under *Architecture invariants*). **A PostgreSQL extension answers
+    no**, having no form at all (`ObjectDraft::from_item`/`blank` are `None`): it is created from
+    `database_editor`'s picker and dropped from its row. So the tree's filter finds one and the
+    palette, through the same delegation, does not offer it.
     **`tsql_form` is SQL Server's four forms**, over `TsqlObjectDraft` through `tsql_field`,
     `tsql_toggle` and `with_sequence`. **Numbers are text here, as the model holds them**: a
     `decimal(38,0)` sequence's bounds pass any integer type the form could parse into, so nothing
@@ -24400,14 +24513,16 @@ existing prose was left alone.
     type a *Base type* and a Nullable toggle; a collection one multi-line, monospaced *Schemas*
     field.
   - `database_editor.rs` — the **container** form: a database, or one of PostgreSQL's or SQL
-    Server's namespaces inside one, over `core::ddl`'s `DatabaseDraft`. The smallest of the schema
+    Server's namespaces inside one, over `core::ddl`'s `DatabaseDraft` — and PostgreSQL's
+    **Create extension** picker, the same form (below). The smallest of the schema
     editors and the only one that **only ever creates** — there is no `current`, no diff and
     no change count, because a container is dropped from its own row's menu and a rename is
     offered on no engine — MySQL and PostgreSQL have none that is safe to perform (MySQL withdrew
     `RENAME DATABASE` in 5.1.23; PostgreSQL's needs every session off the database), and no reason
     is recorded for SQL Server's. The footer therefore says what will be
-    made rather than counting changes, and the panel takes its height from its content, since
-    it is two to four rows tall depending on the engine.
+    made rather than counting changes. The panel has a **fixed** height (`PANEL_H`), like every
+    other modal here, though it is two to four rows tall: sized to its content, the body's
+    `flex_grow` scroll resolved to zero and the modal rendered a title sitting on its footer.
     **Three homes.** The schema tree's **Create ▸ Database / Schema**, the SCHEMA gear's
     **Create database**, and a right-click on the tree's **empty space** — which is the one
     people reach for first, since every file manager trains it. The gear is not a duplicate of
@@ -24493,6 +24608,29 @@ existing prose was left alone.
     narrower than this file. One thing the narrowing was *not* checked against: `fetch_roles`' round
     trip went unexercised by hand, because MySQL has no owners and `ddl::supports_owners` returns
     before the fetch fires — only a PostgreSQL **Create database** reaches it.
+    **PostgreSQL's Create extension picker is this form too** (`ContainerKind::Extension`), because
+    what it needs is exactly this form's shape: a name, a chevron, and an exit that only ever
+    creates. `open_for_extension(ConnUi, SchemaUi, DdlUi, &ExtensionsFn, database)` is its door,
+    with the read-only refusal inside it for `open_for_new`'s reason — it has two homes, the
+    Create ▸ submenu's *Extension* and the Extensions folder's *Create extension* (under
+    `overlays.rs`). **It opens on a blank name, not a proposal**: an extension's name is a control
+    file the server ships, so a `new_extension` would be a name no server has, and the empty-name
+    refusal keeps Preview SQL off until one is picked or typed. The Name row is `optional_field`'s
+    free text with a chevron of installable names — free text for the reason the other fields are,
+    so a name the fetch missed is still reachable — reading *No extensions left to install* when
+    the list is empty, which it is until the fetch lands and for good once the server's every
+    extension is in. `fetch_extensions` clears `DdlUi::extensions`, asks only where
+    `ddl::supports_extensions` says yes, and drops a reply whose `DdlUi::session` stamp is stale,
+    as `fetch_roles` does; the reply is narrowed by `schema::installable_extensions` against the
+    tree's loaded list as well as the view's own flag. `SchemaActions::extensions` is the
+    `ExtensionsFn` (`Rc<dyn Fn(u64, String, ExtensionsDoneFn)>`) behind it, wired in the app beside
+    `roles` and failing as silently. No owner, character-set or collation row: an extension
+    belongs to whoever installs it. The title is *Create extension in {database}*; `change_of`
+    maps it to `Change::CreateExtension { name }`, the name alone
+    (`the_extension_picker_asks_for_create_extension_in_its_database`, through
+    `container_preview`); and it leaves through
+    `preview_container` like a schema — `is_server_level` is false for it, so it runs inside the
+    database through `Db::run_ddl`.
   - `account_editor.rs` — the Users and privileges browser's **write half**: two overlays in one
     module, `account_editor_overlay` (create an account, or reset one's password) and
     `grant_editor_overlay` (grant or
@@ -24897,6 +25035,19 @@ existing prose was left alone.
     table `DROP TABLE` treats it as — and both now ride into the preview's warning through
     `stats::drop_warning`. **Truncate still asks first** (`stats::truncate_prompt`): it is
     not a drop, and it keeps its confirm-then-preview.
+    **A PostgreSQL foreign table is offered what its server takes** (`object_entries` over
+    `TableShape::ForeignTable`): its Drop, which `object_drop_change` makes `DROP FOREIGN TABLE`;
+    not Edit table, since the designer's keys and indexes are refused on one (*cannot create index
+    on relation*, measured on 16) and it has no field for the server or options, so the form would
+    be half refusals; not Truncate, which is the wrapper's to allow and `file_fdw` refuses; and not
+    Import or triggers. `field_entries` and `key_entries` answer no for it as well, being the
+    second door into the same designer (`a_foreign_table_offers_its_drop_and_not_the_designer`).
+    **`CreateKind::Extension` is the Create ▸ submenu's *Extension***, gated on
+    `ddl::supports_extensions` and placed after Procedure and Event and before Database and Schema
+    — after everything that lives in a namespace, the extension being the database's own, and
+    before the containers (`only_postgres_is_offered_an_extension`;
+    `postgres_offers_its_standalone_objects_too` pins PostgreSQL's whole list). It opens
+    `database_editor::open_for_extension` on the node's database rather than the object editor.
     **`whole_ui_gate` 13 → 4, and six of the nine that came down were the small menus** — they read
     their bundles into locals at the top and never touch the root again, so `popup_menu_overlay`
     and `tx_prompt_overlay` take `OverlayUi`, `db_visibility_overlay` `SchemaUi`,
@@ -25050,7 +25201,16 @@ existing prose was left alone.
     routines; and events on MySQL — so a SQLite tree grows none of them. They are
     scoped by `TableScope` for the reason
     it exists — *flat* means the database has no schema level, not that its objects have no
-    namespace. **Whether there is a level is `schema_groups(schema, dialect)`**: none when the only
+    namespace. **PostgreSQL's `Extensions` folder (`icons::PUZZLE`) is the database's, and so is
+    `TableScope::Database`, the third scope**: in a tree with a schema level, `object_groups`
+    under it lists only the database-wide kinds (`ddl::ObjectKind::is_database_wide`), and
+    `db_node` renders those folders **after the namespace rows**, at the database's child level —
+    also when no namespace survives the filter, since an extension's name can be the only match —
+    while `nav_rows` pushes them in the same place, after its namespace loop. In a flat tree the
+    folder is simply one of `Flat`'s. Never under the namespace it installed into: that is where
+    its objects went, not its address (under `schema.rs`). `object_group_nodes` takes a `database_level` flag to build that
+    level's folders (`the_extensions_folder_hangs_off_the_database`, which also searches for one).
+    **Whether there is a level is `schema_groups(schema, dialect)`**: none when the only
     namespace `schemas()` returns is the engine's default (`schema::default_namespace` — PostgreSQL's
     `public`, SQL Server's `dbo`; MySQL has none at all), one row per namespace otherwise —
     **including a lone namespace that is not the default**. That case was flattened like `public`,
@@ -25064,7 +25224,10 @@ existing prose was left alone.
     (Msg 3729 while anything is left inside). So `public` beside an empty `sales` now groups, while
     a lone default still flattens. Nothing in `schema_groups` changed for it and no tree test pins
     the empty case; `schemas_lists_a_listed_namespace_with_nothing_in_it` does, one level down, and
-    live `an_empty_schema_is_listed_compared_into_and_dropped` drops one. The dialect is the active connection's
+    live `an_empty_schema_is_listed_compared_into_and_dropped` drops one. **The "No tables" hint
+    asks `DbSchema::has_objects_in`, which does not count a database-wide folder** — every
+    PostgreSQL database has `plpgsql`, so counting it removed the hint from every empty one — and a
+    flat empty database renders the hint with its Extensions folder beneath it. The dialect is the active connection's
     (`active_dialect`), the render's and the nav walk's alike. Two filter rules follow from the level above being evaluated first: a database
     and a namespace both survive a search that only one of their **objects** matches, or the
     match would be hidden by the row that contains it. `nav_rows` carries the folders and their
@@ -25170,6 +25333,19 @@ existing prose was left alone.
     dimmed as on any other object row on a read-only connection or where `is_editable_object`
     answers no. Its **Drop** stays, gated as every row's is on
     `object_drop_offered`.
+    **The Extensions folder is the exception to both.** Its Create is *Create extension*, which
+    opens `database_editor`'s picker rather than the object editor — there is no `ObjectDraft` for
+    an extension, so `supports_object_creation` answers no and the entry asks
+    `ddl::supports_extensions` instead; `menu_order_gate` lists the literal beside `Create {}`.
+    An extension row has **no Edit entry at all** — absent, as SQL Server's objects' once was,
+    since no state of the connection gives it a form — and its Drop goes to the preview through
+    `ddl::drop_item` like any other row's.
+    **`table_glyph(shape)` is a table-shaped row's glyph and tint**, shared by the tree's row and
+    the Find-Anywhere palette's (`ResultIcon::Relation(TableShape)`, which replaced separate
+    `Table`/`View` icons), so the two cannot draw one object differently: a view wears
+    `TABLE_CELLS_MERGE` in the view tint, a PostgreSQL foreign table `EXTERNAL_LINK` in the table
+    tint, and a table or a MariaDB sequence `TABLE`. The tint is returned as a colour *function*,
+    for the theme-switch reason `table_node` gives.
     - The **size column** (`size_badge`) puts each table's on-disk size at the right edge of the
       *panel*, from the same `core::stats` figures the properties modal shows. It answers the
       question that modal cannot — *which* of these is the big one — and is off by default behind
@@ -33122,7 +33298,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   `renames_indexes_in_place`, true on SQL Server alone,
   `bare_reference_is_own_namespace` — which asks where a bare table name resolves, and so whether a
   foreign key with no namespace may be written without one — and
-  `stats::supports_table_stats`; and, for the *comparison* rather than
+  `stats::supports_table_stats`; `supports_extensions`, which decides whether the Create ▸
+  *Extension* entry and the Extensions folder's *Create extension* exist at all, PostgreSQL alone
+  and computed from `supports_change` like the editor predicates above; and, for the *comparison* rather than
   any editor, `ref_schema_is_database` and `view_definition_is_qualified`. **The same rule applies
   inside the emitter, and two loops there answered it by not asking.** `emit_sqlite`'s table-rename
   loop iterated `&self.changes` where every loop above it iterates `supported()`, and
@@ -33680,7 +33858,7 @@ Re-introducing the anti-patterns these guard against is a regression:
   needle its name does not contain, duplicate what pass 3 already reports per column, and crowd out
   the object pass. `overlays::schema_hits` is the palette's half split out as plain data for exactly
   this reason, and `overlays::find_tests` asserts the two surfaces return the same objects for a set
-  of terms. **One deliberate divergence, and it is the only one allowed without a test change:** an
+  of terms. **One deliberate divergence — one gate, `is_editable_object`, and no other allowed without a test change:** an
   *internal* object (an identity column's counter) is listed by the tree and withheld by the
   palette — a tree row is context, sitting under the table that owns it, while a palette row is a
   destination, and this one's activation is an editor that refuses to open. That withholding is
@@ -33694,7 +33872,12 @@ Re-introducing the anti-patterns these guard against is a regression:
   for as long as they had no form — `is_editable_object` answered no for `ObjectItem::tsql()` — so
   the tree's filter found them and the palette did not, through the one delegation rather than a
   second exclusion; and when the form landed, removing that one term ended the divergence on
-  both producers at once, the remembered row included. Every path to `open_for_object` is gated (the tree's two, and this one) — don't add an ungated one.
+  both producers at once, the remembered row included. **A PostgreSQL extension is withheld the
+  same way and for the same reason, and is the second standing case:** it has no form (it is
+  created from its picker and dropped from its row), so `is_editable_object` answers no for
+  `ObjectItem::extension()` and the palette leaves it out while the tree's filter finds it. It is
+  the same gate, not a second exclusion; give extensions a palette destination and the one term
+  goes. Every path to `open_for_object` is gated (the tree's two, and this one) — don't add an ungated one.
   **The palette's body tier (`core::body_search`) is neither a fifth caller nor an exception.** It
   asks whether an object's *definition* contains the term, not whether its name does, so it does
   not go through `object_name_matches` for its match and this rule does not reach it; the one

@@ -39,7 +39,7 @@ offered, because the clause behind it is one engine's alone:
 `supports_trigger_when`, `supports_trigger_update_of`, `trigger_runs_function`,
 `routine_takes_language`, `takes_table_options`, `supports_column_on_update`,
 `supports_unenforced_check`, `supports_view_security`, `view_replace_can_refuse`,
-`supports_fk_set_default`, `supports_fk_restrict`,
+`supports_fk_set_default`, `supports_fk_restrict`, `supports_extensions`,
 `users::accounts_have_hosts` — and, for the *comparison* rather than any editor,
 `ddl::ref_schema_is_database` and `view_definition_is_qualified`, which ask whether a field the
 differ reads names the object or the database it was read from, and

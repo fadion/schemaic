@@ -9739,6 +9739,28 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         })
     };
 
+    // What a database could install, for the Create extension picker. The
+    // shape `roles` has, plus the database: `pg_available_extensions` says
+    // which are installed in the database it is read from.
+    let extensions: schemaic_ui::ExtensionsFn = {
+        let handle = handle.clone();
+        let db_for = db_for.clone();
+        Rc::new(
+            move |conn_id: u64, database: String, done: schemaic_ui::ExtensionsDoneFn| {
+                let Ok(db) = db_for(conn_id) else {
+                    // Nothing to report: the name field is free text.
+                    return;
+                };
+                let report = create_ext_action(cx, move |available| (done)(available));
+                handle.spawn(async move {
+                    // A failure costs the chevron's list, never the name —
+                    // see `ExtensionsFn`.
+                    report(db.available_extensions(&database).await.unwrap_or_default());
+                });
+            },
+        )
+    };
+
     // The token the running apply observes, so the preview modal's exit can
     // stop it where stopping means something — see `ddl::ddl_rolls_back_as_a_whole`.
     // The same shape as `script_token` above, and for the same reason: the token
@@ -12939,6 +12961,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             view_algorithm,
             trigger_functions,
             roles,
+            extensions,
             trigger_source,
             routine_source,
             event_source,
@@ -13032,6 +13055,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             grant: RwSignal::new(None),
             grant_draft: RwSignal::new(schemaic_core::users::GrantDraft::default()),
             roles: RwSignal::new(Vec::new()),
+            extensions: RwSignal::new(Vec::new()),
             object: RwSignal::new(None),
             object_draft: RwSignal::new(schemaic_core::ddl::ObjectDraft::default()),
             object_errors: RwSignal::new(Vec::new()),

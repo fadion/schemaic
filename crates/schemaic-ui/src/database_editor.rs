@@ -1,5 +1,7 @@
 //! The form for creating a **container**: a database, or one of PostgreSQL's
-//! or SQL Server's namespaces inside one.
+//! or SQL Server's namespaces inside one — and PostgreSQL's **Create extension
+//! picker**, which is the same form with a chevron of what the server could
+//! still install ([`open_for_extension`]).
 //!
 //! The smallest of the schema editors, and deliberately so — a name, and the one
 //! or two options the engine has that are safe to offer. Everything a server
@@ -104,6 +106,9 @@ pub(crate) fn open_for_new(
             match kind {
                 ContainerKind::Database => "new_database",
                 ContainerKind::Schema => "new_schema",
+                // Not reached — an extension opens through
+                // `open_for_extension`, on a blank name — but answered.
+                ContainerKind::Extension => "new_extension",
             },
         )));
     d.error.set(None);
@@ -119,6 +124,85 @@ pub(crate) fn open_for_new(
         read_only: ctx.read_only,
     }));
     fetch_roles(d, roles, &ctx);
+}
+
+/// Open the form as the **Create extension picker**, on `database`.
+///
+/// The name starts **blank**, not on a proposal: an extension's name is the
+/// control file the server ships, so a made-up `new_extension` is a name no
+/// server has, and the empty-name refusal keeps Preview SQL off until one is
+/// picked from the chevron or typed. The chevron's list is fetched here
+/// ([`fetch_extensions`]). Refuses on a read-only connection, as
+/// [`open_for_new`] does and for its reason: this action has two homes.
+pub(crate) fn open_for_extension(
+    conn: ConnUi,
+    schema: SchemaUi,
+    d: DdlUi,
+    extensions: &crate::ExtensionsFn,
+    database: &str,
+) {
+    let ctx = edit_ctx(conn);
+    if ctx.read_only {
+        return;
+    }
+    d.session.update(|g| *g += 1);
+    d.database_draft.set(DatabaseDraft::blank(String::new()));
+    d.error.set(None);
+    d.preview.set(None);
+    ddl_preview::close_peers(d, false);
+    d.database.set(Some(DatabaseTarget {
+        conn_id: ctx.conn_id,
+        kind: ContainerKind::Extension,
+        database: Some(database.to_string()),
+        dialect: ctx.dialect,
+        read_only: ctx.read_only,
+    }));
+    fetch_extensions(d, extensions, &ctx, schema, database);
+}
+
+/// Start the picker's fetch of what `database` could still install.
+///
+/// Cleared first and stamped with the session, as [`fetch_roles`] is and for
+/// its reasons. The reply is narrowed by `schema::installable_extensions`
+/// against the tree's own list as well as the view's flag, so an extension the
+/// tree already shows is not offered again.
+fn fetch_extensions(
+    d: DdlUi,
+    extensions: &crate::ExtensionsFn,
+    ctx: &crate::table_designer::EditCtx,
+    schema: SchemaUi,
+    database: &str,
+) {
+    d.extensions.set(Vec::new());
+    if !ddl::supports_extensions(ctx.dialect) {
+        return;
+    }
+    let installed: Vec<schemaic_core::schema::ExtensionInfo> =
+        schema.db_nodes.with_untracked(|nodes| {
+            nodes
+                .iter()
+                .find(|n| n.database == database)
+                .and_then(|n| match n.schema.get_untracked() {
+                    crate::SchemaState::Loaded(s) => Some(s.extensions.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default()
+        });
+    let asked = d.session.get_untracked();
+    (extensions)(
+        ctx.conn_id,
+        database.to_string(),
+        Rc::new(move |available| {
+            if d.session.get_untracked() == asked {
+                d.extensions.set(
+                    schemaic_core::schema::installable_extensions(&available, &installed)
+                        .into_iter()
+                        .map(|x| x.name)
+                        .collect(),
+                );
+            }
+        }),
+    );
 }
 
 /// The container names already taken, so the form doesn't open on one of them.
@@ -162,6 +246,8 @@ fn names_in(nodes: &[crate::ConnNode], kind: ContainerKind, database: Option<&st
                 _ => Vec::new(),
             }
         }
+        // The picker proposes no name (`open_for_extension`), so nothing asks.
+        ContainerKind::Extension => Vec::new(),
     }
 }
 
@@ -219,6 +305,8 @@ pub(crate) fn change_of(kind: ContainerKind, draft: &DatabaseDraft) -> ddl::Chan
                 .map(|o| o.trim().to_string())
                 .filter(|o| !o.is_empty()),
         },
+        // The name alone: no owner, schema or version is offered.
+        ContainerKind::Extension => ddl::Change::CreateExtension { name },
     }
 }
 
@@ -305,28 +393,54 @@ fn form(
     ring: FocusRing,
 ) -> AnyView {
     let bound = ui.database_draft;
-    let name = form_setting(
-        "Name",
-        bound_field(
-            bound,
-            draft.name.clone(),
-            FieldCfg {
-                placeholder: match target.kind {
-                    ContainerKind::Database => "database_name",
-                    ContainerKind::Schema => "schema_name",
-                },
-                focus: Some((ring.clone(), 10)),
-                ..Default::default()
-            },
-            |d, v| d.name = v.trim().to_string(),
+    let name = if target.kind == ContainerKind::Extension {
+        // **The picker**: the name is free text with a chevron of what the
+        // server could still install — `optional_field`'s shape, for the
+        // reason its doc gives. The list is read when pressed, so a late reply
+        // needs no rebuild.
+        let offered = ui.extensions;
+        form_setting(
+            "Name",
+            optional_field(
+                bound,
+                overlay,
+                Some(draft.name.clone()).filter(|n| !n.is_empty()),
+                "extension_name",
+                move || offered.get_untracked(),
+                // Reachable: empty until the fetch lands, and for good where
+                // every extension the server ships is already installed.
+                "No extensions left to install",
+                &ring,
+                10,
+                |d, v| d.name = v.unwrap_or_default(),
+            ),
         )
-        .style(move |s| s.width(field_w())),
-    );
+    } else {
+        form_setting(
+            "Name",
+            bound_field(
+                bound,
+                draft.name.clone(),
+                FieldCfg {
+                    placeholder: match target.kind {
+                        ContainerKind::Database => "database_name",
+                        ContainerKind::Schema => "schema_name",
+                        ContainerKind::Extension => "extension_name",
+                    },
+                    focus: Some((ring.clone(), 10)),
+                    ..Default::default()
+                },
+                |d, v| d.name = v.trim().to_string(),
+            )
+            .style(move |s| s.width(field_w())),
+        )
+    };
 
     let mut rows: Vec<AnyView> = vec![
         form_section(match target.kind {
             ContainerKind::Database => "Database",
             ContainerKind::Schema => "Schema",
+            ContainerKind::Extension => "Extension",
         })
         .into_any(),
         name.into_any(),
@@ -340,7 +454,9 @@ fn form(
     // Capabilities rather than `dialect ==` tests: both of these were spelled as
     // engine comparisons first, which is the shape that compiles cleanly while
     // sorting a fourth engine onto whichever side it happens to fall.
-    let owns = ddl::supports_owners(target.dialect);
+    // An extension has no owner clause offered here: it belongs to whoever
+    // installs it, and the picker is a name and nothing else.
+    let owns = target.kind != ContainerKind::Extension && ddl::supports_owners(target.dialect);
     // A namespace takes no character set on any engine — it is a name in a
     // catalogue, not a store — so this asks the *kind* as well as the engine.
     let database = target.kind == ContainerKind::Database;
@@ -450,6 +566,7 @@ pub(crate) fn database_editor_overlay(d: DdlUi, overlay: OverlayUi) -> impl Into
             };
             let title = match (target.kind, target.database.as_deref()) {
                 (ContainerKind::Schema, Some(db)) => format!("Create schema in {db}"),
+                (ContainerKind::Extension, Some(db)) => format!("Create extension in {db}"),
                 (kind, _) => format!("Create {}", kind.label()),
             };
 
@@ -593,6 +710,37 @@ mod tests {
         );
     }
 
+    /// The picker asks for `CREATE EXTENSION` by the trimmed name and nothing
+    /// else, on the ordinary in-database path — composed through
+    /// `container_preview` the way Preview SQL does, so the statement that
+    /// reaches the preview is the one asserted.
+    #[test]
+    fn the_extension_picker_asks_for_create_extension_in_its_database() {
+        let mut d = draft("  pg_trgm ");
+        d.owner = Some("someone".into());
+        let c = change_of(ContainerKind::Extension, &d);
+        assert_eq!(
+            c,
+            ddl::Change::CreateExtension {
+                name: "pg_trgm".into()
+            }
+        );
+        assert!(!ddl::is_server_level(&c));
+        let on = crate::ddl_preview::PlanTarget {
+            conn_id: 1,
+            database: "shop".into(),
+            dialect: schemaic_core::intel::SqlDialect::Postgres,
+            read_only: false,
+        };
+        let p = crate::ddl_preview::container_preview(&on, "pg_trgm", c);
+        assert_eq!(p.database, "shop");
+        assert_eq!(
+            p.statements,
+            vec![r#"CREATE EXTENSION "pg_trgm";"#.to_string()]
+        );
+        assert!(p.withheld.is_empty());
+    }
+
     /// A name arrives from a text field, so it arrives with whatever whitespace
     /// was typed around it. Trimming at the change rather than in the emitter
     /// keeps `CREATE DATABASE " shop "` — a real, differently-named database on
@@ -684,6 +832,7 @@ mod tests {
                 match kind {
                     ContainerKind::Database => "new_database",
                     ContainerKind::Schema => "new_schema",
+                    ContainerKind::Extension => "new_extension",
                 },
             )
         };

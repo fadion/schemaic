@@ -384,7 +384,9 @@ fn table_node(t: &TableInfo) -> DiagramNode {
             // its counter columns are not a schema anyone opened the diagram to
             // read. Named rather than left to a `_`, so a fourth shape is a
             // compile error here too.
-            TableShape::Table | TableShape::Sequence => NodeKind::Table,
+            // A foreign table is drawn as the table it reads as: its columns
+            // are real, and a key elsewhere may point at nothing in it.
+            TableShape::Table | TableShape::Sequence | TableShape::ForeignTable => NodeKind::Table,
         },
         columns,
     }

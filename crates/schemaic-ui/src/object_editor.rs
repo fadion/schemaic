@@ -269,6 +269,11 @@ pub(crate) fn is_editable_object(item: &ObjectItem) -> bool {
     if let Some(r) = item.routine() {
         return r.is_editable();
     }
+    // An extension has no form (`ObjectDraft::from_item` is `None`): it is
+    // created from the picker and dropped from its row.
+    if item.extension().is_some() {
+        return false;
+    }
     !item.is_internal()
 }
 

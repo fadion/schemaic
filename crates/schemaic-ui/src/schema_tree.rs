@@ -24,7 +24,7 @@ use schemaic_core::favorite::FavoriteRule;
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::schema::{
     ColumnInfo, ColumnTypeClass, DbSchema, IndexInfo, ObjectItem, SchemaState, TableInfo,
-    TableSource, classify_column_type, db_visible, name_survives, object_name_matches,
+    TableShape, TableSource, classify_column_type, db_visible, name_survives, object_name_matches,
 };
 use schemaic_core::text::plural;
 
@@ -270,7 +270,11 @@ fn object_groups(schema: &DbSchema, scope: TableScope) -> Vec<(ObjectKind, Vec<O
         .filter_map(|k| {
             let items = match scope {
                 TableScope::Flat => schema.objects_all(k),
+                // A database-wide object carries no namespace, so this is
+                // empty for one — `TableScope::Database` lists it instead.
                 TableScope::Namespace(ns) => schema.objects_in(Some(ns), k),
+                TableScope::Database if k.is_database_wide() => schema.objects_all(k),
+                TableScope::Database => Vec::new(),
             };
             (!items.is_empty()).then_some((k, items))
         })
@@ -297,6 +301,19 @@ pub(crate) fn object_icon(kind: ObjectKind) -> &'static str {
         ObjectKind::Synonym => icons::COPY,
         ObjectKind::AliasType => icons::TYPE,
         ObjectKind::XmlSchemaCollection => icons::BRACES,
+        ObjectKind::Extension => icons::PUZZLE,
+    }
+}
+
+/// The glyph and tint for a table-shaped row — shared with the Find-Anywhere
+/// palette, so a foreign table looks the same in both. The tint is the colour
+/// **function**, for the theme-switch reason `table_node` gives.
+pub(crate) fn table_glyph(shape: TableShape) -> (&'static str, fn() -> Color) {
+    match shape {
+        TableShape::View => (icons::TABLE_CELLS_MERGE, theme::view_icon),
+        TableShape::ForeignTable => (icons::EXTERNAL_LINK, theme::table_icon),
+        // A MariaDB sequence has always worn the table's glyph.
+        TableShape::Table | TableShape::Sequence => (icons::TABLE, theme::table_icon),
     }
 }
 
@@ -548,6 +565,12 @@ enum TableScope<'a> {
     Flat,
     /// One PostgreSQL namespace's tables.
     Namespace(&'a str),
+    /// **The database's own level in a tree that has a schema level** — no
+    /// tables, only the folders of database-wide kinds
+    /// (`ObjectKind::is_database_wide`: PostgreSQL's Extensions), which sit
+    /// after the namespace rows rather than inside whichever one an extension
+    /// installed into. In a flat tree those folders are among `Flat`'s.
+    Database,
 }
 
 impl<'a> TableScope<'a> {
@@ -556,13 +579,14 @@ impl<'a> TableScope<'a> {
         match self {
             TableScope::Flat => true,
             TableScope::Namespace(ns) => table_schema == Some(ns),
+            TableScope::Database => false,
         }
     }
 
     /// The namespace name, for the search-term check (`Flat` has none to match).
     fn name(self) -> Option<&'a str> {
         match self {
-            TableScope::Flat => None,
+            TableScope::Flat | TableScope::Database => None,
             TableScope::Namespace(ns) => Some(ns),
         }
     }
@@ -764,6 +788,9 @@ fn nav_rows(
                 push_objects(&mut rows, &key, TableScope::Namespace(ns));
             }
         }
+        // The database's own folders (Extensions), after its namespaces —
+        // where `db_node` renders them.
+        push_objects(&mut rows, &db_key, TableScope::Database);
     }
     rows
 }
@@ -2054,20 +2081,40 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
                             .into_iter()
                             .filter(|ns| namespace_survives(&schema, ns, db_hit, &filt))
                             .collect();
+                        // The database's own folders (Extensions) after the
+                        // namespace rows, at their level — `nav_rows` walks
+                        // them in the same place. Rendered even when no
+                        // namespace survives the filter: an extension's name
+                        // can be the only match.
+                        let own = object_group_nodes(
+                            db.clone(),
+                            None,
+                            schema.clone(),
+                            db_hit,
+                            filt.clone(),
+                            child_ctx(0),
+                            true,
+                        );
                         if visible.is_empty() {
-                            return empty().into_any();
+                            return own.into_any();
                         }
                         // `schema` is already the `Arc` out of `SchemaState`.
-                        return v_stack_from_iter(visible.into_iter().map(move |ns| {
-                            schema_node(
-                                db.clone(),
-                                ns,
-                                schema.clone(),
-                                db_hit,
-                                filt.clone(),
-                                child_ctx(1),
-                            )
-                        }))
+                        let schema_rows = schema.clone();
+                        let filt_rows = filt.clone();
+                        return v_stack((
+                            v_stack_from_iter(visible.into_iter().map(move |ns| {
+                                schema_node(
+                                    db.clone(),
+                                    ns,
+                                    schema_rows.clone(),
+                                    db_hit,
+                                    filt_rows.clone(),
+                                    child_ctx(1),
+                                )
+                            }))
+                            .style(|s| s.flex_col()),
+                            own,
+                        ))
                         .style(|s| s.flex_col())
                         .into_any();
                     }
@@ -2084,6 +2131,7 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
                         db_hit,
                         filt.clone(),
                         child_ctx(0),
+                        false,
                     );
                     if tables.is_empty() {
                         // Hide the node's body entirely while filtering with no
@@ -2092,11 +2140,17 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
                         // tables" above a list of them would be a flat lie.
                         // Asked, not built: `object_groups` clones every object
                         // in the database to answer whether there is one.
+                        //
+                        // A database-wide folder (Extensions) does not count —
+                        // `has_objects_in` skips it, since every PostgreSQL
+                        // database has `plpgsql` — and renders under the hint.
                         let none = !schema.has_objects_in(None);
                         return if filtering {
                             objects.into_any()
                         } else if none {
-                            info_row("No tables", theme::text_muted).into_any()
+                            v_stack((info_row("No tables", theme::text_muted), objects))
+                                .style(|s| s.flex_col())
+                                .into_any()
                         } else {
                             objects.into_any()
                         };
@@ -2260,6 +2314,7 @@ fn schema_node(
                 db_hit || ns_hit,
                 filt.clone(),
                 ctx.clone(),
+                false,
             );
             if tables.is_empty() {
                 // Asked, not built — see the flat case above.
@@ -2304,10 +2359,14 @@ fn object_group_nodes(
     parent_hit: bool,
     filt: String,
     ctx: SchemaTreeCtx,
+    // The database's own folders under a tree with a schema level
+    // (`TableScope::Database`), rather than a level's own.
+    database_level: bool,
 ) -> impl IntoView {
-    let scope = || match &scope_ns {
-        Some(ns) => TableScope::Namespace(ns.as_str()),
-        None => TableScope::Flat,
+    let scope = || match (&scope_ns, database_level) {
+        (_, true) => TableScope::Database,
+        (Some(ns), false) => TableScope::Namespace(ns.as_str()),
+        (None, false) => TableScope::Flat,
     };
     let ns_hit = scope_ns
         .as_deref()
@@ -2781,11 +2840,11 @@ fn table_node(database: String, table: TableInfo, ctx: SchemaTreeCtx) -> impl In
     // when the expansion, schema or filter changes, none of which a theme switch
     // touches, so a `Color` resolved here would keep the old theme's tint until
     // something else forced a rebuild.
-    let (glyph, glyph_color): (&'static str, fn() -> Color) = if table.is_view {
-        (icons::TABLE_CELLS_MERGE, theme::view_icon)
-    } else {
-        (icons::TABLE, theme::table_icon)
-    };
+    //
+    // A PostgreSQL foreign table gets its own glyph in the table tint: it is
+    // listed and opened as a table, and the menus offer it less, so the row has
+    // to say why before the menu does (`table_glyph`).
+    let (glyph, glyph_color) = table_glyph(table.shape());
 
     let dbl_source = source.clone();
     let hl_source = source.clone();
@@ -4005,6 +4064,68 @@ mod tests {
                 "objgrp:shop::domain",
                 "objgrp:shop::sequence",
             ]
+        );
+    }
+
+    /// **An extension's folder is the database's**, after the namespace rows
+    /// where the tree has them and among the flat folders where it does not —
+    /// never inside the namespace it installed into — and a search for its
+    /// name reaches it.
+    #[test]
+    fn the_extensions_folder_hangs_off_the_database() {
+        let with_ext = |tables: Vec<TableInfo>| NavDb {
+            database: "shop".into(),
+            name: "shop".into(),
+            schema: Some(std::sync::Arc::new(DbSchema {
+                tables,
+                extensions: vec![schemaic_core::schema::ExtensionInfo {
+                    name: "citext".into(),
+                    version: "1.6".into(),
+                    schema: "sales".into(),
+                }],
+                ..Default::default()
+            })),
+        };
+        let keys = |dbs: &[NavDb], exp: &[&str], filter: &str| -> Vec<String> {
+            walk(dbs, exp, &[], filter)
+                .into_iter()
+                .map(|(k, _)| k)
+                .collect()
+        };
+        // Two namespaces: the folder follows them, at the database's level.
+        let grouped = vec![with_ext(vec![
+            tbl(Some("public"), "orders"),
+            tbl(Some("sales"), "leads"),
+        ])];
+        assert_eq!(
+            keys(&grouped, &["db:shop", "sch:shop:sales"], ""),
+            vec![
+                "db:shop",
+                "sch:shop:public",
+                "sch:shop:sales",
+                "tbl:shop:sales.leads",
+                "objgrp:shop::extension",
+            ]
+        );
+        let rows = walk(&grouped, &["db:shop", "objgrp:shop::extension"], &[], "");
+        assert!(
+            rows.contains(&(
+                "obj:shop::extension:citext".to_string(),
+                "objgrp:shop::extension".to_string()
+            )),
+            "{rows:?}"
+        );
+        // Filtering for it keeps the database and opens the folder.
+        let found = keys(&grouped, &[], "citext");
+        assert!(
+            found.contains(&"obj:shop::extension:citext".to_string()),
+            "{found:?}"
+        );
+        // Flat: one of the database's folders, after its tables.
+        let flat = vec![with_ext(vec![tbl(Some("public"), "orders")])];
+        assert_eq!(
+            keys(&flat, &["db:shop"], ""),
+            vec!["db:shop", "tbl:shop:orders", "objgrp:shop::extension"]
         );
     }
 

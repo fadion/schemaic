@@ -2279,6 +2279,10 @@ pub enum ObjectKind {
     AliasType,
     /// A SQL Server XML schema collection.
     XmlSchemaCollection,
+    /// A PostgreSQL extension (`CREATE EXTENSION`), browsed from
+    /// [`crate::schema::ExtensionInfo`]. The one kind that belongs to the
+    /// database rather than to a namespace in it ([`ObjectKind::is_database_wide`]).
+    Extension,
 }
 
 impl ObjectKind {
@@ -2289,7 +2293,7 @@ impl ObjectKind {
     /// spread across the tree's folder builder, its two filter predicates and
     /// Find-Anywhere — and a kind added to three of them is a kind the palette
     /// silently cannot find.
-    pub const ALL: [ObjectKind; 9] = [
+    pub const ALL: [ObjectKind; 10] = [
         ObjectKind::Enum,
         ObjectKind::Domain,
         ObjectKind::AliasType,
@@ -2299,7 +2303,34 @@ impl ObjectKind {
         ObjectKind::Function,
         ObjectKind::Procedure,
         ObjectKind::Event,
+        ObjectKind::Extension,
     ];
+
+    /// Does an object of this kind belong to the **database** rather than to a
+    /// namespace in it?
+    ///
+    /// A PostgreSQL extension does: its name is unique in the database and
+    /// `DROP EXTENSION` takes no schema, the namespace it installed into being
+    /// only where its objects went. So it carries no namespace
+    /// ([`crate::schema::ObjectItem::schema`]), the schema tree files its
+    /// folder under the database node even where the tree has a schema level,
+    /// and it does not count against the "No tables" hint
+    /// ([`crate::schema::DbSchema::has_objects_in`]). Exhaustive, so a new kind
+    /// answers for itself.
+    pub fn is_database_wide(self) -> bool {
+        match self {
+            ObjectKind::Extension => true,
+            ObjectKind::Enum
+            | ObjectKind::Domain
+            | ObjectKind::Sequence
+            | ObjectKind::Function
+            | ObjectKind::Procedure
+            | ObjectKind::Event
+            | ObjectKind::Synonym
+            | ObjectKind::AliasType
+            | ObjectKind::XmlSchemaCollection => false,
+        }
+    }
 
     /// What the object is called in a sentence a person reads.
     pub fn label(self) -> &'static str {
@@ -2313,6 +2344,7 @@ impl ObjectKind {
             ObjectKind::Synonym => "synonym",
             ObjectKind::AliasType => "alias type",
             ObjectKind::XmlSchemaCollection => "XML schema collection",
+            ObjectKind::Extension => "extension",
         }
     }
 
@@ -2330,6 +2362,7 @@ impl ObjectKind {
             ObjectKind::Synonym => "Synonyms",
             ObjectKind::AliasType => "Alias types",
             ObjectKind::XmlSchemaCollection => "XML schema collections",
+            ObjectKind::Extension => "Extensions",
         }
     }
 
@@ -2351,6 +2384,7 @@ impl ObjectKind {
             // T-SQL's `DROP TYPE`, as for any user-defined type there.
             ObjectKind::AliasType => "TYPE",
             ObjectKind::XmlSchemaCollection => "XML SCHEMA COLLECTION",
+            ObjectKind::Extension => "EXTENSION",
         }
     }
 
@@ -2374,6 +2408,9 @@ impl ObjectKind {
     ///
     /// SQL Server's three answer yes, for `DropObject` — which `tsql_supports`
     /// admits for them and a T-SQL sequence, and nothing else of the three.
+    /// So does a PostgreSQL extension, for `DropObject` (`DROP EXTENSION`) and
+    /// `SetObjectComment`; `supports_change` refuses its rename, PostgreSQL
+    /// having no `ALTER EXTENSION … RENAME`.
     pub fn uses_shared_changes(self) -> bool {
         match self {
             ObjectKind::Enum
@@ -2381,7 +2418,8 @@ impl ObjectKind {
             | ObjectKind::Sequence
             | ObjectKind::Synonym
             | ObjectKind::AliasType
-            | ObjectKind::XmlSchemaCollection => true,
+            | ObjectKind::XmlSchemaCollection
+            | ObjectKind::Extension => true,
             ObjectKind::Function | ObjectKind::Procedure | ObjectKind::Event => false,
         }
     }
@@ -2397,7 +2435,8 @@ impl ObjectKind {
             | ObjectKind::Event
             | ObjectKind::Synonym
             | ObjectKind::AliasType
-            | ObjectKind::XmlSchemaCollection => None,
+            | ObjectKind::XmlSchemaCollection
+            | ObjectKind::Extension => None,
         }
     }
 
@@ -2791,7 +2830,8 @@ impl TsqlObjectDraft {
             | ObjectKind::Domain
             | ObjectKind::Function
             | ObjectKind::Procedure
-            | ObjectKind::Event => return None,
+            | ObjectKind::Event
+            | ObjectKind::Extension => return None,
         };
         Some(TsqlObjectDraft {
             original: None,
@@ -3105,7 +3145,11 @@ impl ObjectDraft {
             crate::schema::ObjectItem::Tsql(t) => {
                 Some(ObjectDraft::Tsql(TsqlObjectDraft::from_info(t)))
             }
-            crate::schema::ObjectItem::Routine(_) | crate::schema::ObjectItem::Event(_) => None,
+            // An extension has no form: it is created from the picker and
+            // dropped from its row, and nothing about one is altered here.
+            crate::schema::ObjectItem::Routine(_)
+            | crate::schema::ObjectItem::Event(_)
+            | crate::schema::ObjectItem::Extension(_) => None,
         }
     }
 
@@ -3136,7 +3180,13 @@ impl ObjectDraft {
                 | ObjectKind::XmlSchemaCollection,
                 _,
             ) => TsqlObjectDraft::blank(kind, name, schema).map(ObjectDraft::Tsql),
-            (ObjectKind::Function | ObjectKind::Procedure | ObjectKind::Event, _) => None,
+            (
+                ObjectKind::Function
+                | ObjectKind::Procedure
+                | ObjectKind::Event
+                | ObjectKind::Extension,
+                _,
+            ) => None,
         }
     }
 
@@ -3224,6 +3274,12 @@ pub enum Change {
     /// drops the table in the middle.
     RebuildTable(Box<Rebuild>),
     DropTable,
+    /// `DROP FOREIGN TABLE` — PostgreSQL's drop of a foreign table
+    /// ([`crate::schema::TableShape::ForeignTable`]), which refuses `DROP
+    /// TABLE` on one (*"is not a table"*, measured on 16). It removes the
+    /// definition only: the rows it read stay wherever the wrapper read them
+    /// from.
+    DropForeignTable,
     TruncateTable,
     RenameTable {
         to: String,
@@ -3627,6 +3683,16 @@ pub enum Change {
     /// namespace, which is a far larger act than the one the menu asked for. Let
     /// the server refuse and name what is still in there.
     DropSchema {
+        name: String,
+    },
+    /// `CREATE EXTENSION <name>` — PostgreSQL's ([`create_extension`]), with no
+    /// `SCHEMA`, `VERSION` or `CASCADE`: the server installs its default
+    /// version into the first schema on the path, and an extension that needs
+    /// another one installed first is refused by name, which is the plan's
+    /// answer. It carries its name, as [`Change::CreateSchema`] does, so the
+    /// preview's line can say which. Its drop is the shared
+    /// [`Change::DropObject`] with [`ObjectKind::Extension`].
+    CreateExtension {
         name: String,
     },
     /// `CREATE USER` / `CREATE ROLE`.
@@ -4038,6 +4104,7 @@ impl Change {
                 r.current.name
             ),
             Change::DropTable => "Drop the table".to_string(),
+            Change::DropForeignTable => "Drop the foreign table".to_string(),
             Change::TruncateTable => "Delete every row".to_string(),
             Change::RenameTable { to } => format!("Rename the table to {to}"),
             Change::AddColumn { column, .. } => {
@@ -4401,6 +4468,9 @@ impl Change {
             Change::DropDatabase { name } => format!("Drop database {name}"),
             Change::CreateSchema { name, .. } => format!("Create schema {name}"),
             Change::DropSchema { name } => format!("Drop schema {name}"),
+            // Named for the reason a schema's create is: it was picked from a
+            // list, not right-clicked.
+            Change::CreateExtension { name } => format!("Create extension {name}"),
             // The account lines name the account for the same reason the
             // database ones name the database: the preview's subject was typed
             // into a form or picked out of a list, not right-clicked.
@@ -4513,6 +4583,14 @@ impl Change {
                 ),
             }],
             Change::DropTable => vec!["Drops the table and every row in it.".to_string()],
+            // Destructive all the same: the definition — its server, options
+            // and columns — is what goes, and nothing here can restate it.
+            Change::DropForeignTable => vec![
+                "Drops the foreign table: its definition goes, and the rows it reads stay where they are, \
+                 on the foreign server or in the file; a view or routine that names it fails \
+                 from then on."
+                    .to_string(),
+            ],
             Change::TruncateTable => {
                 vec!["Deletes every row in the table. This can't be undone.".to_string()]
             }
@@ -4937,6 +5015,14 @@ impl Change {
                 ObjectKind::Synonym => "Drops the synonym. Nothing refuses it: a view, \
                      routine or query that names it fails from then on, when it next \
                      runs."
+                    .to_string(),
+                // Measured on PostgreSQL 16: `file_fdw` with a server on it is
+                // refused, naming the server and the foreign table behind it.
+                // No `CASCADE` is sent, so that refusal is the answer.
+                ObjectKind::Extension => "Drops the extension and the functions, types and \
+                     operators it installed. The server refuses while anything of yours \
+                     still depends on them — a column of its type, an index or a server \
+                     on its wrapper — and names what does."
                     .to_string(),
                 k => format!(
                     "Drops the {}. The server refuses while a column still uses it, \
@@ -6627,6 +6713,9 @@ impl ChangeSet {
             match c {
                 Change::CreateTable(draft) => out.extend(create_table_sql(draft, d)),
                 Change::DropTable => out.push(format!("DROP TABLE {};", self.qname())),
+                Change::DropForeignTable => {
+                    out.push(format!("DROP FOREIGN TABLE {};", self.qname()))
+                }
                 Change::TruncateTable => out.push(format!("TRUNCATE TABLE {};", self.qname())),
                 _ => {}
             }
@@ -7421,6 +7510,9 @@ impl ChangeSet {
                 Change::CreateEnum(e) => out.push(e.create_sql(d)),
                 Change::CreateDomain(dom) => out.push(dom.create_sql(d)),
                 Change::CreateSequence(s) => out.push(s.create_sql(d)),
+                Change::CreateExtension { name } => {
+                    out.push(format!("CREATE EXTENSION {};", ddl_ident_in(name, d)))
+                }
                 Change::AddEnumValue {
                     value,
                     after,
@@ -12206,7 +12298,11 @@ pub fn supports_object_creation(dialect: SqlDialect, kind: ObjectKind) -> bool {
         | ObjectKind::Sequence
         | ObjectKind::Synonym
         | ObjectKind::AliasType
-        | ObjectKind::XmlSchemaCollection => {}
+        | ObjectKind::XmlSchemaCollection
+        // No blank form at all (`ObjectDraft::blank` is `None`), so the probe
+        // below answers no: an extension is created from its own picker,
+        // gated on `supports_extensions`.
+        | ObjectKind::Extension => {}
     }
     ObjectDraft::blank(kind, "probe", None, dialect).is_some_and(|d| {
         let plan = d.change_set(None, &[], dialect);
@@ -15739,6 +15835,41 @@ pub fn supports_change(dialect: SqlDialect, change: &Change) -> bool {
             SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => false,
         };
     }
+    // **An extension has no rename on any engine** — PostgreSQL's `ALTER
+    // EXTENSION` updates, moves and adds members, and names nothing new — so
+    // the shared rename arm, which its kind otherwise takes, is refused here.
+    if matches!(
+        change,
+        Change::RenameObject {
+            kind: ObjectKind::Extension,
+            ..
+        }
+    ) {
+        return false;
+    }
+    // **An extension and a foreign table are PostgreSQL's alone** — objects the
+    // other three engines cannot hold, not emitter arms they lack — so asked
+    // before the blanket "everything but SQLite" below, which would otherwise
+    // admit MySQL. The extension's drop and comment are the shared arms, asked
+    // by kind. SQL Server returned through `tsql_supports` above, which admits
+    // none of them. Exhaustive, so a fifth engine answers for itself.
+    if matches!(
+        change,
+        Change::CreateExtension { .. }
+            | Change::DropForeignTable
+            | Change::DropObject {
+                kind: ObjectKind::Extension
+            }
+            | Change::SetObjectComment {
+                kind: ObjectKind::Extension,
+                ..
+            }
+    ) {
+        return match dialect {
+            SqlDialect::Postgres => true,
+            SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+        };
+    }
     // **An account is a server's, and SQLite has no server.** Asked through the
     // capability rather than restated as a dialect comparison, so this and the
     // browser that offers the action cannot drift into disagreeing about which
@@ -17968,6 +18099,44 @@ pub fn drop_item(item: &crate::schema::ObjectItem, dialect: SqlDialect) -> Chang
         (_, Some(e)) => drop_event(e, dialect),
         _ => drop_object(item.kind(), item.name(), item.schema(), dialect),
     }
+}
+
+/// `CREATE EXTENSION <name>` — the Create extension picker's plan.
+///
+/// Against the extension's own name and no namespace, which is how its drop
+/// ([`drop_item`] → [`Change::DropObject`]) addresses it too: an extension is
+/// the database's ([`ObjectKind::is_database_wide`]). Callers ask
+/// [`supports_extensions`] first; on an engine without them the set's
+/// `unsupported()` names it and nothing is emitted.
+pub fn create_extension(name: &str, dialect: SqlDialect) -> ChangeSet {
+    object_set(
+        name,
+        None,
+        dialect,
+        Change::CreateExtension {
+            name: name.to_string(),
+        },
+    )
+}
+
+/// Can `dialect` create and drop **extensions**?
+///
+/// PostgreSQL alone: MySQL, SQLite and SQL Server have no such object. Computed
+/// from [`supports_change`] over the two statements the menus raise, as
+/// [`supports_namespace_editing`] is, so the entry and the plan cannot answer
+/// differently.
+pub fn supports_extensions(dialect: SqlDialect) -> bool {
+    supports_change(
+        dialect,
+        &Change::CreateExtension {
+            name: String::new(),
+        },
+    ) && supports_change(
+        dialect,
+        &Change::DropObject {
+            kind: ObjectKind::Extension,
+        },
+    )
 }
 
 /// A no-change set against a named object. See [`drop_object`] for why one is
@@ -36167,7 +36336,12 @@ mod database_tests {
         let mut sets: Vec<(String, SqlDialect, ChangeSet)> = Vec::new();
         for d in [MySql, Postgres, Sqlite, SqlDialect::MsSql] {
             let mut push = |label: String, cs: ChangeSet| sets.push((label, d, cs));
-            for shape in [TableShape::Table, TableShape::View, TableShape::Sequence] {
+            for shape in [
+                TableShape::Table,
+                TableShape::View,
+                TableShape::Sequence,
+                TableShape::ForeignTable,
+            ] {
                 for materialized in [false, true] {
                     let change = crate::stats::drop_change(shape, materialized);
                     push(format!("{shape:?}"), single("x", Some("s"), d, change));
@@ -36418,8 +36592,9 @@ mod database_tests {
     /// claimed set *equals* `0..count`, so a duplicated or skipped index fails
     /// it too, which a length could not see.
     ///
-    /// The fifty-three names on the `None` side are not noise: they are the cost
-    /// of the guarantee, and the compiler maintains them.
+    /// The names on the `None` side are not noise: they are the cost of the
+    /// guarantee, and the compiler maintains them. (Not counted here: a count
+    /// in a comment beside a list is a second copy of the list.)
     fn account_variant_index(change: &Change) -> Option<usize> {
         match change {
             Change::CreateAccount(_) => Some(0),
@@ -36432,6 +36607,8 @@ mod database_tests {
             Change::CreateTable(_)
             | Change::RebuildTable(_)
             | Change::DropTable
+            | Change::DropForeignTable
+            | Change::CreateExtension { .. }
             | Change::TruncateTable
             | Change::RenameTable { .. }
             | Change::RenameIndex { .. }
@@ -38729,5 +38906,112 @@ mod tsql_object_tests {
             assert!(!supports_object_creation(Postgres, kind), "{kind:?}");
         }
         assert!(supports_object_creation(MsSql, ObjectKind::Procedure));
+    }
+}
+
+#[cfg(test)]
+mod extension_tests {
+    use super::*;
+    use crate::intel::SqlDialect::{MsSql, MySql, Postgres, Sqlite};
+    use crate::schema::{ExtensionInfo, ObjectItem};
+
+    fn ext(name: &str) -> ObjectItem {
+        ObjectItem::Extension(ExtensionInfo {
+            name: name.into(),
+            version: "1.1".into(),
+            schema: "public".into(),
+        })
+    }
+
+    /// The row's Drop: `DROP EXTENSION` by the quoted name, unqualified, and
+    /// never `CASCADE` — what depends on it is the server's to name.
+    #[test]
+    fn an_extension_is_dropped_by_name_without_cascade() {
+        let cs = drop_item(&ext("uuid-ossp"), Postgres);
+        assert_eq!(
+            cs.emit(),
+            vec![r#"DROP EXTENSION "uuid-ossp";"#.to_string()]
+        );
+        assert!(cs.unsupported().is_empty());
+        assert_eq!(cs.changes[0].summary(), "Drop the extension");
+        let destructive = cs.destructive();
+        assert_eq!(destructive.len(), 1, "{destructive:?}");
+        assert!(
+            destructive[0].contains("extension")
+                && destructive[0].contains("refuses")
+                && !destructive[0].contains("change type first"),
+            "an extension's risk is its own, not a type's: {destructive:?}"
+        );
+    }
+
+    /// The picker's plan: `CREATE EXTENSION` by the quoted name, and nothing
+    /// the user did not choose.
+    #[test]
+    fn an_extension_is_created_by_name_alone() {
+        let cs = create_extension("pg_trgm", Postgres);
+        assert_eq!(
+            cs.emit(),
+            vec![r#"CREATE EXTENSION "pg_trgm";"#.to_string()]
+        );
+        assert!(cs.unsupported().is_empty());
+        assert!(cs.destructive().is_empty());
+        assert_eq!(cs.changes[0].summary(), "Create extension pg_trgm");
+    }
+
+    /// PostgreSQL's alone — and on the others the set is withheld and writes
+    /// nothing, rather than inheriting the blanket "everything but SQLite".
+    #[test]
+    fn extensions_are_postgresqls_alone() {
+        assert!(supports_extensions(Postgres));
+        for d in [MySql, Sqlite, MsSql] {
+            assert!(!supports_extensions(d), "{d:?}");
+            let create = create_extension("citext", d);
+            assert!(!create.unsupported().is_empty(), "{d:?}");
+            assert!(create.emit().is_empty(), "{d:?}: {:?}", create.emit());
+            let drop = drop_item(&ext("citext"), d);
+            assert!(!drop.unsupported().is_empty(), "{d:?}");
+            assert!(drop.emit().is_empty(), "{d:?}: {:?}", drop.emit());
+        }
+    }
+
+    /// No `ALTER EXTENSION … RENAME` exists, and the picker is not the object
+    /// editor's blank form: the folder's Create entry is its own.
+    #[test]
+    fn an_extension_has_no_rename_and_no_object_form() {
+        assert!(!supports_change(
+            Postgres,
+            &Change::RenameObject {
+                kind: ObjectKind::Extension,
+                to: "x".into(),
+            }
+        ));
+        assert!(!supports_object_creation(Postgres, ObjectKind::Extension));
+        assert!(ObjectKind::Extension.is_database_wide());
+        for k in ObjectKind::ALL {
+            assert_eq!(k.is_database_wide(), k == ObjectKind::Extension, "{k:?}");
+        }
+    }
+
+    /// A foreign table's Drop is `DROP FOREIGN TABLE` — PostgreSQL refuses
+    /// `DROP TABLE` on one — and only PostgreSQL has the object.
+    #[test]
+    fn a_foreign_table_is_dropped_as_one() {
+        let cs = single("ft", Some("public"), Postgres, Change::DropForeignTable);
+        assert_eq!(
+            cs.emit(),
+            vec![r#"DROP FOREIGN TABLE "public"."ft";"#.to_string()]
+        );
+        assert!(cs.unsupported().is_empty());
+        assert_eq!(cs.changes[0].summary(), "Drop the foreign table");
+        assert_eq!(cs.destructive().len(), 1);
+        for d in [MySql, Sqlite, MsSql] {
+            assert!(!supports_change(d, &Change::DropForeignTable), "{d:?}");
+            assert!(
+                single("ft", None, d, Change::DropForeignTable)
+                    .emit()
+                    .is_empty(),
+                "{d:?}"
+            );
+        }
     }
 }

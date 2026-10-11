@@ -726,6 +726,9 @@ impl SchemaComparison {
                     TableShape::View => "v:",
                     TableShape::Sequence => "q:",
                     TableShape::Table => "t:",
+                    // Its own key, so a foreign table never pairs with a
+                    // same-named table and is planned as one's alter.
+                    TableShape::ForeignTable => "f:",
                 },
                 display_name(t.schema.as_deref(), &t.name)
             )
@@ -733,7 +736,7 @@ impl SchemaComparison {
         let table_kind = |t: &TableInfo| match t.shape() {
             TableShape::View => CompareKind::View,
             TableShape::Sequence => CompareKind::Sequence,
-            TableShape::Table => CompareKind::Table,
+            TableShape::Table | TableShape::ForeignTable => CompareKind::Table,
         };
         for (l, r) in pair(
             names,
@@ -2614,7 +2617,8 @@ fn table_entry(
     let kind = match shape {
         TableShape::View => CompareKind::View,
         TableShape::Sequence => CompareKind::Sequence,
-        TableShape::Table => CompareKind::Table,
+        // Filed with the tables, which is where the tree shows it too.
+        TableShape::Table | TableShape::ForeignTable => CompareKind::Table,
     };
     // **A sequence's columns are its counter, not its definition.** MariaDB
     // reports `CREATE SEQUENCE sq1` as a base table whose columns are
@@ -2638,34 +2642,40 @@ fn table_entry(
         && r.and_then(|r| r.view_options.as_ref())
             .and_then(ddl::view_not_editable_reason)
             .is_some();
-    let changes = if shape == TableShape::Sequence || unread_source {
-        empty_set(&any.name, any.schema.as_deref(), dialect)
-    } else {
-        match (l, r) {
-            (Some(l), Some(r)) if is_view => match ViewDraft::from_table(r) {
-                Some(d) => ddl::diff_view(l, &d, dialect),
-                None => empty_set(&any.name, any.schema.as_deref(), dialect),
-            },
-            (Some(l), Some(r)) => ddl::diff(l, &TableDraft::from_table(r), target),
-            (None, Some(r)) if is_view => match ViewDraft::from_table(r) {
-                Some(d) => ddl::create_view(&d, dialect),
-                None => empty_set(&any.name, any.schema.as_deref(), dialect),
-            },
-            (None, Some(r)) => ddl::create(&TableDraft::from_table(r), dialect),
-            (Some(l), None) if is_view => ddl::single(
-                &l.name,
-                l.schema.as_deref(),
-                dialect,
-                Change::DropView {
-                    materialized: l.view_options.as_ref().is_some_and(|o| o.materialized),
+    // **A foreign table is unplannable for the sequence's reason, one step
+    // removed**: the model holds its columns and not its server or options, so
+    // the only statements these arms could write are a `CREATE TABLE` that
+    // makes an empty local table where the wrapper's rows were, and an `ALTER`
+    // or `DROP TABLE` the server refuses on one. Disclosed the same way.
+    let changes =
+        if matches!(shape, TableShape::Sequence | TableShape::ForeignTable) || unread_source {
+            empty_set(&any.name, any.schema.as_deref(), dialect)
+        } else {
+            match (l, r) {
+                (Some(l), Some(r)) if is_view => match ViewDraft::from_table(r) {
+                    Some(d) => ddl::diff_view(l, &d, dialect),
+                    None => empty_set(&any.name, any.schema.as_deref(), dialect),
                 },
-            ),
-            (Some(l), None) => {
-                ddl::single(&l.name, l.schema.as_deref(), dialect, Change::DropTable)
+                (Some(l), Some(r)) => ddl::diff(l, &TableDraft::from_table(r), target),
+                (None, Some(r)) if is_view => match ViewDraft::from_table(r) {
+                    Some(d) => ddl::create_view(&d, dialect),
+                    None => empty_set(&any.name, any.schema.as_deref(), dialect),
+                },
+                (None, Some(r)) => ddl::create(&TableDraft::from_table(r), dialect),
+                (Some(l), None) if is_view => ddl::single(
+                    &l.name,
+                    l.schema.as_deref(),
+                    dialect,
+                    Change::DropView {
+                        materialized: l.view_options.as_ref().is_some_and(|o| o.materialized),
+                    },
+                ),
+                (Some(l), None) => {
+                    ddl::single(&l.name, l.schema.as_deref(), dialect, Change::DropTable)
+                }
+                (None, None) => unreachable!("a pair holds at least one side"),
             }
-            (None, None) => unreachable!("a pair holds at least one side"),
-        }
-    };
+        };
     // An index the model only partly read compares equal whatever the server
     // holds, so a match over one is a match this cannot vouch for.
     let uncertain = match (l, r) {
@@ -3100,8 +3110,17 @@ mod tests {
         assert_eq!(Table.group_label(), "Tables");
         assert_eq!(View.group_label(), "Views");
         assert_eq!(Trigger.group_label(), "Triggers");
-        // Every object kind the tree files is one the comparison can meet.
+        // Every object kind the tree files is one the comparison can meet —
+        // but an extension, which is not compared: installing one is a
+        // server-side act (its control files must be on the target's disk),
+        // not a definition a plan can restate, and the comparison does not
+        // yet read the two sides' lists. Named, so the next kind cannot slip
+        // through the same door.
         for ok in ObjectKind::ALL {
+            if ok == ObjectKind::Extension {
+                assert!(!all.iter().any(|k| k.object_kind() == Some(ok)));
+                continue;
+            }
             assert!(all.iter().any(|k| k.object_kind() == Some(ok)), "{ok:?}");
         }
     }
@@ -3225,6 +3244,35 @@ mod tests {
             "{:?}",
             keys(&c)
         );
+    }
+
+    /// **A PostgreSQL foreign table is not planned as a table** — the model
+    /// holds its columns and not its server or options, so a create would make
+    /// an empty local table under its name and a drop is `DROP TABLE`, which
+    /// the server refuses on one. Disclosed through `omitted`, as a sequence is.
+    #[test]
+    fn a_foreign_table_is_disclosed_not_planned() {
+        let ft = TableInfo {
+            name: "ft".to_string(),
+            schema: Some("public".to_string()),
+            is_foreign: true,
+            columns: vec![col("a", "integer")],
+            ..Default::default()
+        };
+        let pg = |l: DbSchema, r: DbSchema| SchemaComparison::of(&l, &r, SqlDialect::Postgres);
+        for (left, right) in [
+            (schema_of(vec![]), schema_of(vec![ft.clone()])),
+            (schema_of(vec![ft.clone()]), schema_of(vec![])),
+        ] {
+            let plan = pg(left, right).plan(|_| true);
+            let sql = plan.emit().join("\n");
+            assert!(!sql.contains("TABLE"), "{sql}");
+            assert!(
+                plan.omitted.iter().any(|o| o.contains("ft")),
+                "{:?}",
+                plan.omitted
+            );
+        }
     }
 
     /// **A `Same` row can still have two different texts under it.** On SQLite

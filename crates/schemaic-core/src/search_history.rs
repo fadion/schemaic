@@ -41,6 +41,7 @@ pub enum ObjectTag {
     Synonym,
     AliasType,
     XmlSchemaCollection,
+    Extension,
     /// A kind this build doesn't know, preserved exactly as it was read.
     Unknown(String),
 }
@@ -58,6 +59,7 @@ impl ObjectTag {
             ObjectTag::Synonym => Some(crate::ddl::ObjectKind::Synonym),
             ObjectTag::AliasType => Some(crate::ddl::ObjectKind::AliasType),
             ObjectTag::XmlSchemaCollection => Some(crate::ddl::ObjectKind::XmlSchemaCollection),
+            ObjectTag::Extension => Some(crate::ddl::ObjectKind::Extension),
             ObjectTag::Unknown(_) => None,
         }
     }
@@ -74,6 +76,7 @@ impl ObjectTag {
             crate::ddl::ObjectKind::Synonym => ObjectTag::Synonym,
             crate::ddl::ObjectKind::AliasType => ObjectTag::AliasType,
             crate::ddl::ObjectKind::XmlSchemaCollection => ObjectTag::XmlSchemaCollection,
+            crate::ddl::ObjectKind::Extension => ObjectTag::Extension,
         }
     }
 
@@ -90,6 +93,7 @@ impl ObjectTag {
             ObjectTag::Synonym => "synonym",
             ObjectTag::AliasType => "alias_type",
             ObjectTag::XmlSchemaCollection => "xml_schema_collection",
+            ObjectTag::Extension => "extension",
             ObjectTag::Unknown(s) => s,
         }
     }
@@ -114,6 +118,7 @@ impl<'de> Deserialize<'de> for ObjectTag {
             "synonym" => ObjectTag::Synonym,
             "alias_type" => ObjectTag::AliasType,
             "xml_schema_collection" => ObjectTag::XmlSchemaCollection,
+            "extension" => ObjectTag::Extension,
             _ => ObjectTag::Unknown(s),
         })
     }
@@ -467,6 +472,7 @@ mod tests {
             K::Synonym => "synonym",
             K::AliasType => "alias_type",
             K::XmlSchemaCollection => "xml_schema_collection",
+            K::Extension => "extension",
         };
         for kind in K::ALL {
             let tag = ObjectTag::of(kind);

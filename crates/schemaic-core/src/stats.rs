@@ -980,6 +980,8 @@ pub fn drop_change(shape: TableShape, materialized: bool) -> crate::ddl::Change 
     match shape {
         TableShape::View => Change::DropView { materialized },
         TableShape::Sequence | TableShape::Table => Change::DropTable,
+        // PostgreSQL refuses `DROP TABLE` on one — "is not a table".
+        TableShape::ForeignTable => Change::DropForeignTable,
     }
 }
 
@@ -991,7 +993,7 @@ pub fn drop_change(shape: TableShape, materialized: bool) -> crate::ddl::Change 
 pub fn drop_summary(summary: String, shape: TableShape) -> String {
     match shape {
         TableShape::Sequence => "Drop the sequence".to_string(),
-        TableShape::Table | TableShape::View => summary,
+        TableShape::Table | TableShape::View | TableShape::ForeignTable => summary,
     }
 }
 
@@ -1028,7 +1030,8 @@ pub fn drop_warning(risks: Vec<String>, rows: Option<RowCount>, shape: TableShap
              draws from it fails."
                 .to_string(),
         ],
-        TableShape::View => risks,
+        // Its own change's risk, and no row figure: the rows are not here.
+        TableShape::View | TableShape::ForeignTable => risks,
     }
 }
 
@@ -1047,7 +1050,7 @@ pub fn drop_warning(risks: Vec<String>, rows: Option<RowCount>, shape: TableShap
 /// the user being told about "all N rows in it" about a counter.
 fn drop_scale(rows: Option<RowCount>, shape: TableShape) -> Option<String> {
     match shape {
-        TableShape::View | TableShape::Sequence => None,
+        TableShape::View | TableShape::Sequence | TableShape::ForeignTable => None,
         TableShape::Table => rows.filter(|&r| worth_naming(r)).map(|r| {
             format!(
                 "By the schema tree's statistics, that is {} rows.",
@@ -2264,7 +2267,12 @@ mod tests {
                 .trim()
                 .to_string()
         };
-        for shape in [TableShape::Table, TableShape::View, TableShape::Sequence] {
+        for shape in [
+            TableShape::Table,
+            TableShape::View,
+            TableShape::Sequence,
+            TableShape::ForeignTable,
+        ] {
             for materialized in [false, true] {
                 let change = drop_change(shape, materialized);
                 for d in [
