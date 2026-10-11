@@ -37916,7 +37916,7 @@ this bundle's.
   stages into `gs.dirty` and paints the cell `grid_edit_staged()`; **Ctrl+Enter** / toolbar ✓ calls
   `commit_grid` → a `GridWrite { updates, inserts, deletes }` → the app's `commit_edits`. On success
   the app re-runs the query; on failure the error shows in the toolbar and green edits stay. The
-  strip's copy icon between ✓ and ✗ (*Copy the changes as SQL*, `copy_staged_sql`) builds that same
+  strip's copy icon after the ✓/✗ pair (*Copy the changes as SQL*, `copy_staged_sql`) builds that same
   `GridWrite` after the same flush of an open in-cell edit and puts `edit::staged_sql` of it on the
   clipboard, with the confirmation on `commit_note` — readable SQL with literals, not the bound
   statements the commit runs (see `core::edit`). No global "Edit"

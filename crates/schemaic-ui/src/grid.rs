@@ -8576,8 +8576,8 @@ fn filter_bar(gs: GridState) -> impl IntoView {
 /// ring — it holds nothing else — and spaced by ten so a control can be added
 /// between two without renumbering.
 const TB_COMMIT: u32 = 10;
-const TB_COPY_SQL: u32 = 15;
 const TB_DISCARD: u32 = 20;
+const TB_COPY_SQL: u32 = 25;
 const TB_ADD: u32 = 30;
 const TB_DELETE: u32 = 40;
 const TB_CLONE: u32 = 50;
@@ -9047,7 +9047,8 @@ fn grid_toolbar(
             // not just the edited cells — the ✗ sits next to a count that reads
             // like it belongs to the ✓ alone.
             .tooltip(|| text("Discard all pending changes").style(crate::widgets::tooltip_style));
-            // Between the two it is about: what the tick would send, as text.
+            // After the commit/discard pair it is about, so the two stay
+            // side by side: what the tick would send, as text.
             let sql_hov = RwSignal::new(false);
             let copy_sql = container(
                 icons::icon(icons::COPY, crate::consts::TOOLBAR_ICON_BASE).style(move |s| {
@@ -9079,15 +9080,6 @@ fn grid_toolbar(
                     commit_grid(gs)
                 }),
                 in_strip_button(
-                    copy_sql,
-                    r3,
-                    TB_COPY_SQL,
-                    true,
-                    leave,
-                    panel_keys,
-                    move || copy_staged_sql(gs),
-                ),
-                in_strip_button(
                     discard,
                     r2,
                     TB_DISCARD,
@@ -9095,6 +9087,15 @@ fn grid_toolbar(
                     leave,
                     panel_keys,
                     move || discard_edits(gs),
+                ),
+                in_strip_button(
+                    copy_sql,
+                    r3,
+                    TB_COPY_SQL,
+                    true,
+                    leave,
+                    panel_keys,
+                    move || copy_staged_sql(gs),
                 ),
                 toolbar_sep(),
             ))
